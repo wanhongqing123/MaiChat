@@ -1,0 +1,112 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+dist/
+release/
+bin/aicli/
+*.dmg
+*.exe
+*.zip
+*.AppImage
+*.deb
+*.rpm
+*.blockmap
+*.apk
+*.ipa
+*.app/
+MaiChat/**/dist-*/
+**/.cache/
+**/__pycache__/
+
+# Optional upstream source trees copied by local dependency builds.
+MaiAgent/third_party/onnxruntime/onnxruntime/test/
+MaiAgent/third_party/onnxruntime/winml/test/
+
+# Generated icons (produced by scripts/build-icons.mjs)
+build/icon.png
+build/icon-256.png
+build/icon-512.png
+build/icon.icns
+build/icon.ico
+
+# Electron packaging cache
+.electron-vite/
+
+# Native builds
+*.node
+prebuilds/
+
+# TypeScript incremental
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Xcode / CocoaPods local generated state
+MaiChat/ios/**/Pods/
+MaiChat/ios/**/xcuserdata/
+MaiChat/ios/**/*.xcuserstate
+
+# Android / Gradle local generated state
+MaiChat/android/**/.gradle/
+MaiChat/android/**/build/
+MaiChat/android/**/*.iml
+MaiChat/android/**/local.properties
+
+# Env files
+.env
+.env.local
+.env.*.local
+
+# Claude Code local state
+.claude/
+
+# Codex local project config
+.codex/config.toml
+
+
+# Superpowers brainstorming / visual-companion session state
+.superpowers/
+
+# Local git worktrees
+.worktrees/
+
+# Multi-AI Code 已不再往目标仓库写任何东西（方案文档 / 仓库记忆 / 分析缓存 /
+# 系统提示词注入，四条链路都已删除）。保留这两条忽略规则只是兜底：万一有人跑
+# 旧版本安装包，生成的残留不会污染 git。
+.multi-ai-code/
+.injections/
+
+# Local Whisper runtime binaries are generated during packaging.
+# The shared Whisper model under resources/asr/models is tracked by Git LFS.
+models/whisper/*.bin
+resources/asr/**/bin/*
+resources/asr/**/lib/*
+resources/asr/**/licenses/*
+!resources/asr/README.md
+!resources/asr/**/.gitkeep
+
+# Optional local LaMa inference weight; fetch with MaiAgent/scripts/fetch-lama-model.sh.
+MaiAgent/models/lama_fp32.onnx
+
+# Playwright MCP 浏览器工具的临时产物（页面快照/控制台日志）
+.playwright-mcp/

@@ -1,0 +1,4 @@
+[submodule "third_party/aicli/codex"]
+	path = third_party/aicli/codex
+	url = https://github.com/wanhongqing123/codex
+	branch = multi-ai/im-bridge
