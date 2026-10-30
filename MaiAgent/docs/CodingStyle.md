@@ -51,7 +51,7 @@ cmake --build build && ctest --test-dir build   # 或直接跑 build/bin/Mai*Tes
 ## 0. agent 相关的看 codex
 
 **参照系是 codex，不是 opencode。** agent 的形状、命名、协议取值有疑问，
-先去 `third_party/aicli/codex/codex-rs` 里看它怎么做的。
+先去 [上游 Codex 源码](https://github.com/openai/codex/tree/main/codex-rs) 里看它怎么做的。
 
 （通用基础组件看另一个参照系，见下一节。）
 
@@ -81,7 +81,7 @@ cmake --build build && ctest --test-dir build   # 或直接跑 build/bin/Mai*Tes
 
 | 看哪个 | 管什么 |
 |---|---|
-| `third_party/aicli/codex/codex-rs` | agent 的形状、协议取值、词汇 |
+| [上游 Codex 源码](https://github.com/openai/codex/tree/main/codex-rs) | agent 的形状、协议取值、词汇 |
 | `E:\OpenSource\chromium\src\base` | 通用基础组件 |
 
 ### 为什么不能自由发挥

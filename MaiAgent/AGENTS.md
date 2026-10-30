@@ -19,7 +19,7 @@ Multi-AI Code 的 agent 核心，纯 C++，可移植。产物是 `maiagent` 这�
    narrow 字符串，中文路径会让进程直接挂掉。
 3. **`.h` 里不写函数实现**（模板和 `= default` 除外）。
 4. **通用基础组件先看 `E:\OpenSource\chromium\src\base` 怎么做的，
-   agent 相关的看 `third_party/aicli/codex/codex-rs`。** 不要自己发挥——
+   agent 相关的看 [上游 Codex 源码](https://github.com/openai/codex/tree/main/codex-rs)。** 不要自己发挥——
    这两处已经各让我翻过一次车，规范 0.5 节写着具体是哪两次。
 
 ## 改完之后

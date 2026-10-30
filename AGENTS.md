@@ -7,7 +7,7 @@
 - `services/`：账号、会话同步、云盘、临时凭据、法律文档和集成测试。按服务目录的 README 配置与测试。
 - `docs/`：设计、验收和排障记录。
 
-保持现有 `MaiChat/` 与 `MaiAgent/` 兄弟目录布局，除非同步修改并验证各平台构建及服务脚本。检查参考实现时，Agent 协议和词汇可参考上游 Codex；基础组件参考 Chromium `base`；图像和视频渲染参考 `MaiAgent/Graphics/README.md`、`UPSTREAM.md` 与 obs-studio `libobs`。
+保持现有 `MaiChat/` 与 `MaiAgent/` 兄弟目录布局，除非同步修改并验证各平台构建及服务脚本。检查参考实现时，Agent 协议和词汇以项目现有实现与协议测试为准；基础组件参考 Chromium `base`；图像和视频渲染参考 `MaiAgent/Graphics/README.md`、`UPSTREAM.md` 与 obs-studio `libobs`。
 
 ## 交付和排障
 
