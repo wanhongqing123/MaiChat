@@ -36,7 +36,8 @@ final class RealtimeAsrCredential {
             !(issued.opt("secret_key") instanceof String) || !(issued.opt("token") instanceof String) ||
             !(issued.opt("expires_at") instanceof Number) ||
             ((Number) issued.opt("expires_at")).doubleValue() != expiresAt ||
-            !appId.matches("[0-9]{5,20}") || !secretId.matches("[A-Za-z0-9]{8,128}") ||
+            // STS TmpSecretId 是不透明值，官方最长 1024；不能套长期 SecretId 的字母数字规则。
+            !appId.matches("[0-9]{5,20}") || !secretId.matches("[!-~]{8,1024}") ||
             !secretKey.matches("[!-~]{16,256}") || !token.matches("[!-~]{16,8192}") ||
             expiresAt <= now + 90 || expiresAt > now + 1860)
             throw new IOException("语音识别临时凭据无效");
@@ -67,16 +68,22 @@ final class RealtimeAsrCredential {
         parameters.put("voice_id", voiceId);
         StringBuilder canonical = new StringBuilder("asr.cloud.tencent.com/asr/v2/")
             .append(appId).append('?');
+        StringBuilder query = new StringBuilder();
         for (Map.Entry<String, String> entry : parameters.entrySet()) {
             if (canonical.charAt(canonical.length() - 1) != '?') canonical.append('&');
             canonical.append(entry.getKey()).append('=').append(entry.getValue());
+            // 官方 Java SDK 在原值签名后再编码 query；opaque ID 的 +、& 等不能改变字段边界。
+            if (query.length() > 0) query.append('&');
+            query.append(entry.getKey()).append('=')
+                .append(URLEncoder.encode(entry.getValue(), "UTF-8"));
         }
         try {
             Mac hmac = Mac.getInstance("HmacSHA1");
             hmac.init(new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA1"));
             String signature = Base64.getEncoder().encodeToString(
                 hmac.doFinal(canonical.toString().getBytes(StandardCharsets.UTF_8)));
-            String url = "wss://" + canonical + "&signature=" + URLEncoder.encode(signature, "UTF-8");
+            String url = "wss://asr.cloud.tencent.com/asr/v2/" + appId + "?" + query
+                + "&signature=" + URLEncoder.encode(signature, "UTF-8");
             return new MaiChatAuthClient.RealtimeAsrTicket(voiceId, url, token, expired);
         } catch (GeneralSecurityException error) {
             throw new IOException("语音识别签名生成失败");

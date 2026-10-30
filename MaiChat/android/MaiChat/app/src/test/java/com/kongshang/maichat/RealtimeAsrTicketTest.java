@@ -4,6 +4,10 @@ package com.kongshang.maichat;
 
 import static org.junit.Assert.*;
 import java.io.IOException;
+import java.net.URI;
+import java.net.URLDecoder;
+import java.util.Map;
+import java.util.TreeMap;
 import org.json.JSONObject;
 import org.junit.Test;
 
@@ -41,6 +45,44 @@ public final class RealtimeAsrTicketTest {
         String nextVoice = "00000000-0000-4000-8000-000000000001";
         assertTrue(credential.sign(NOW, nextVoice, 10).url.contains("nonce=10&"));
         assertTrue(credential.sign(NOW, nextVoice, 10).url.contains("voice_id=" + nextVoice + "&"));
+    }
+
+    @Test public void opaqueTemporaryIdUsesRawCanonicalValuesButEncodedQueryBoundaries() throws Exception {
+        String opaqueId = "AKID+/=one&two?three#four";
+        RealtimeAsrCredential credential = RealtimeAsrCredential.parse(
+            fixture(NOW).put("secret_id", opaqueId), NOW);
+        MaiChatAuthClient.RealtimeAsrTicket ticket = credential.sign(NOW, VOICE, 9);
+        assertTrue(ticket.url.contains("secretid=AKID%2B%2F%3Done%26two%3Fthree%23four&"));
+        URI endpoint = new URI(ticket.url);
+        assertNull(endpoint.getRawFragment());
+        TreeMap<String, String> decoded = new TreeMap<>();
+        for (String field : endpoint.getRawQuery().split("&")) {
+            String[] pair = field.split("=", 2);
+            assertEquals(2, pair.length);
+            assertNull(decoded.put(pair[0], URLDecoder.decode(pair[1], "UTF-8")));
+        }
+        assertEquals(10, decoded.size());
+        assertEquals(opaqueId, decoded.get("secretid"));
+        // 独立 Python HMAC fixture 对原始不透明 ID 签名，不能对 percent 编码后的值签名。
+        assertEquals("sp4A5MkguMyBjd40ccICXr/C/Vc=", decoded.remove("signature"));
+        StringBuilder canonical = new StringBuilder(endpoint.getHost()).append(endpoint.getPath()).append('?');
+        for (Map.Entry<String, String> field : decoded.entrySet()) {
+            if (canonical.charAt(canonical.length() - 1) != '?') canonical.append('&');
+            canonical.append(field.getKey()).append('=').append(field.getValue());
+        }
+        assertEquals("asr.cloud.tencent.com/asr/v2/1259220000?engine_model_type=16k_zh_en_2.0"
+            + "&expired=1780000300&needvad=1&nonce=9&result_mod=1&secretid=" + opaqueId
+            + "&timestamp=1780000000&voice_format=16&voice_id=" + VOICE, canonical.toString());
+    }
+
+    @Test public void opaqueTemporaryIdAllowsTheDocumentedLengthAndRejectsControls() throws Exception {
+        String maximum = new String(new char[1024]).replace('\0', '+');
+        RealtimeAsrCredential credential = RealtimeAsrCredential.parse(
+            fixture(NOW).put("secret_id", maximum), NOW);
+        assertTrue(credential.sign(NOW, VOICE, 9).url.length() < 4096);
+        reject(fixture(NOW).put("secret_id", maximum + "A"));
+        reject(fixture(NOW).put("secret_id", "opaque id"));
+        reject(fixture(NOW).put("secret_id", "opaque\r\nid"));
     }
 
     @Test public void signedUrlCannotOutliveStsAndRefreshMarginIsRequired() throws Exception {
