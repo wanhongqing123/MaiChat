@@ -1396,6 +1396,23 @@ endif()
 if(WIN32)
   # A raw build/bin/maichat.exe must be runnable before anyone starts a GUI
   # smoke test. Missing PE imports otherwise create a system dialog before main().
+  if(MAICHAT_TRTC_AVAILABLE)
+    # TRTC 是加载期依赖；先旁挂 DLL，再运行下面的 PE 导入检查。
+    # 干净构建不能依赖旧 bin 里碰巧残留的 liteav.dll。
+    set(MAICHAT_TRTC_RUNTIME_DLLS)
+    foreach(runtime liteav.dll liteav_screen.dll txffmpeg.dll txsoundtouch.dll)
+      set(runtime_path "${MAICHAT_TRTC_ROOT}/lib/x64/${runtime}")
+      if(NOT EXISTS "${runtime_path}")
+        message(FATAL_ERROR "Windows TRTC runtime missing: ${runtime_path}")
+      endif()
+      list(APPEND MAICHAT_TRTC_RUNTIME_DLLS "${runtime_path}")
+    endforeach()
+    add_custom_command(TARGET maichat POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${MAICHAT_TRTC_RUNTIME_DLLS} "$<TARGET_FILE_DIR:maichat>"
+      COMMENT "Copying MaiChat TRTC runtime before PE verification"
+      VERBATIM)
+  endif()
   get_filename_component(maichat_qt_bin "${Qt5_DIR}/../../../bin" ABSOLUTE)
   set(maichat_windeployqt "${maichat_qt_bin}/windeployqt.exe")
   get_filename_component(maichat_linker_bin "${CMAKE_LINKER}" DIRECTORY)
@@ -1622,15 +1639,12 @@ add_executable(video_cover_image_test tests/VideoCoverImageTest.cpp)
 target_link_libraries(video_cover_image_test PRIVATE remote_im_desktop_app remote_im_core Qt5::Gui Qt5::Test)
 
 if(MAICHAT_TRTC_AVAILABLE AND WIN32)
-  # TRTC 运行时 DLL 必须与 exe 同目录才能加载。构建后自动拷贝，
-  # 避免"链接通过但一运行就找不到 SDK"这类只在本地复现的问题。
-  file(GLOB MAICHAT_TRTC_RUNTIME_DLLS "${MAICHAT_TRTC_ROOT}/lib/x64/*.dll")
-  foreach(target maichat trtc_engine_test)
-    add_custom_command(TARGET ${target} POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              ${MAICHAT_TRTC_RUNTIME_DLLS} "$<TARGET_FILE_DIR:${target}>"
-      COMMENT "Copying TRTC runtime DLLs next to ${target}")
-  endforeach()
+  # 测试程序也需同一组运行库；maichat 的复制必须早于上面的 PE 验证。
+  add_custom_command(TARGET trtc_engine_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      ${MAICHAT_TRTC_RUNTIME_DLLS} "$<TARGET_FILE_DIR:trtc_engine_test>"
+    COMMENT "Copying TRTC runtime DLLs next to trtc_engine_test"
+    VERBATIM)
 endif()
 
 add_executable(remote_input_capture_test tests/RemoteInputCaptureTest.cpp)
