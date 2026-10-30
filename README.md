@@ -9,8 +9,6 @@ MaiChat 包含 iOS、Android 和 Qt 桌面客户端，以及账号、云盘和�
 - `services/`：账号、会话同步、云盘素材签名、模型凭据、法律文档与服务集成测试。各服务使用各自目录的 README 和环境变量配置。
 - `docs/`：设计、排障与验收记录。
 
-`third_party/aicli/codex` 是只读参考子模块；需要查看 Agent 协议实现时运行 `git submodule update --init third_party/aicli/codex`。
-
 这些目录的相对位置是当前构建和服务测试的约定：`MaiChat/desktop` 和 `MaiChat/MobileAgentAdapter` 从相邻的 `MaiAgent/` 读取核心和第三方源码；服务测试也使用 `services/` 内各目录之间的相对路径。
 
 ## 构建准备
