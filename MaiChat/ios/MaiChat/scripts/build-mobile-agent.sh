@@ -9,6 +9,17 @@ repo_dir="$(cd "$PROJECT_DIR/../../.." && pwd)"
 agent_arch="${ARCHS// /-}"
 # 隔离验收可指定独立构建目录，避免覆盖正在使用的产品构建缓存。
 agent_build="${MAICHAT_MOBILE_AGENT_BUILD_DIR:-$repo_dir/MaiAgent/build/vendor/mobile-agent-$PLATFORM_NAME-$agent_arch}"
+# CMake 缓存记录了源码绝对路径。仓库搬迁或复制后不能复用旧缓存，
+# 但旧构建和用户产物要保留；用当前源码路径生成稳定后缀，另建缓存。
+if [[ -z "${MAICHAT_MOBILE_AGENT_BUILD_DIR:-}" && -f "$agent_build/CMakeCache.txt" ]]; then
+  cached_source="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$agent_build/CMakeCache.txt")"
+  current_source="$repo_dir/MaiChat/MobileAgentAdapter"
+  if [[ -n "$cached_source" && "$cached_source" != "$current_source" ]]; then
+    source_hash="$(printf '%s' "$current_source" | shasum -a 256 | cut -c 1-12)"
+    agent_build="${agent_build}-${source_hash}"
+    echo "CMake cache belongs to another checkout; using $agent_build"
+  fi
+fi
 cmake -S "$repo_dir/MaiChat/MobileAgentAdapter" -B "$agent_build" -G Ninja \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$SDKROOT" \
