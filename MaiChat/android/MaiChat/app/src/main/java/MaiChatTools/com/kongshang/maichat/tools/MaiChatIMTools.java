@@ -58,6 +58,7 @@ final class MaiChatIMTools {
             case "maichat_list_contacts": return hostListContacts(arguments);
             case "maichat_request_friend": return hostRequestFriend(arguments);
             case "maichat_set_nickname": return hostSetNickname(arguments);
+            case "maichat_set_avatar": return hostSetAvatar(arguments);
             case "maichat_list_conversations": return hostListConversations(arguments);
             case "maichat_get_messages": return hostGetMessages(arguments);
             case "maichat_search_messages": return hostSearchMessages(arguments);
@@ -113,6 +114,31 @@ final class MaiChatIMTools {
             throw new IllegalArgumentException("昵称最多 32 个字符且不能超过 120 字节");
         session.setNickname(nickname, error -> {});
         return new JSONObject().put("queued", true).put("nickname", nickname);
+    }
+
+    private JSONObject hostSetAvatar(JSONObject arguments) throws Exception {
+        if (Looper.myLooper() == Looper.getMainLooper())
+            throw new IllegalStateException("头像更换不能阻塞界面线程");
+        Object raw = arguments.opt("file_path");
+        if (!(raw instanceof String) || ((String) raw).trim().isEmpty())
+            throw new IllegalArgumentException("file_path 必须是工作区图片路径");
+        String identity = session.avatarChangeIdentity();
+        File source = AIAssistantController.shared(activity).workspaceFile((String) raw);
+        if (source == null || !source.isFile()) throw new IllegalArgumentException("工作区图片不可用");
+        CountDownLatch finished = new CountDownLatch(1);
+        AtomicReference<String> failure = new AtomicReference<>();
+        AtomicReference<String> avatar = new AtomicReference<>();
+        new Handler(Looper.getMainLooper()).post(() -> session.uploadSelfAvatar(source, identity, error -> {
+            if (error == null && session.isAvatarChangeIdentityCurrent(identity))
+                avatar.set(session.selfProfile().avatarUrl());
+            else failure.set(error == null ? "登录账号已变化，请重试头像更换" : error);
+            finished.countDown();
+        }));
+        if (!finished.await(120, TimeUnit.SECONDS))
+            throw new IllegalStateException("头像更换状态尚未确认，请在个人资料中检查后再操作");
+        if (failure.get() != null) throw new IllegalStateException(failure.get());
+        // 只返回公开稳定头像地址；上传签名 URL 和账号 bearer 不进入工具回执。
+        return new JSONObject().put("updated", true).put("avatar_url", avatar.get());
     }
 
     private JSONObject hostListConversations(JSONObject arguments) throws JSONException {

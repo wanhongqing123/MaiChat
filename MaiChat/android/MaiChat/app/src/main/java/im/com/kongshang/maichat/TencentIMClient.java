@@ -63,6 +63,9 @@ public final class TencentIMClient {
         default void onVideoMediaUpdated(
                 String sender, String recipient, String remoteId, RemoteIMVideoAttachment attachment) {}
         void onProfilesUpdated(List<RemoteIMContact> contacts);
+        default void onProfilesUpdated(List<RemoteIMContact> contacts, long selfRevision) {
+            onProfilesUpdated(contacts);
+        }
         void onPresenceUpdated(Map<String, PresenceStatus> statuses);
         default void onGroupMembershipChanged() { }
         default void onIncomingGroupText(String ownerUserId, RemoteIMGroupMessage message) { }
@@ -204,6 +207,7 @@ public final class TencentIMClient {
     private volatile String currentUserId = "";
     private volatile boolean loginAcknowledged;
     private String profileRequestKey = "";
+    private final RemoteIMSelfProfileRevision selfProfileRevision = new RemoteIMSelfProfileRevision();
     private String presenceRequestKey = "";
     private boolean presenceUnsupported;
 
@@ -594,6 +598,43 @@ public final class TencentIMClient {
         );
     }
 
+    /** Only the expected logged-in identity may submit this SDK write, including queued calls. */
+    public void setSelfAvatar(String expectedOwner, String faceUrl, java.util.function.BooleanSupplier current,
+                              OperationCompletion completion) {
+        String owner = clean(expectedOwner);
+        if (closed || !loginAcknowledged || !owner.equals(currentUserId) || !current.getAsBoolean()) {
+            completion.onError(-1, "Avatar identity changed or IM is disconnected");
+            return;
+        }
+        if (android.os.Looper.myLooper() != sdkThread.getLooper()) {
+            sdkHandler.post(() -> setSelfAvatar(owner, faceUrl, current, completion)); return;
+        }
+        String url = clean(faceUrl);
+        try {
+            java.net.URI parsed = new java.net.URI(url);
+            if (url.length() > 4096 || parsed.getHost() == null || parsed.getUserInfo() != null
+                || !("https".equalsIgnoreCase(parsed.getScheme()) || "http".equalsIgnoreCase(parsed.getScheme())))
+                throw new IllegalArgumentException("Avatar URL is invalid");
+        } catch (java.net.URISyntaxException | IllegalArgumentException invalid) {
+            completion.onError(-1, "Avatar URL is invalid"); return;
+        }
+        V2TIMUserFullInfo profile = new V2TIMUserFullInfo();
+        profile.setFaceUrl(url);
+        V2TIMManager.getInstance().setSelfInfo(profile, new V2TIMCallback() {
+            @Override public void onSuccess() {
+                if (closed || !owner.equals(currentUserId) || !current.getAsBoolean()) {
+                    completion.onError(-1, "Avatar identity changed"); return;
+                }
+                // 已在途的旧资料查询不能把新头像刷回旧 URL；好友资料仍照常交付。
+                selfProfileRevision.avatarCommitted();
+                completion.onSuccess();
+            }
+            @Override public void onError(int code, String ignored) {
+                completion.onError(code, "Avatar update was not confirmed");
+            }
+        });
+    }
+
     public void refreshProfiles(List<String> userIds) {
         if (closed) return;
         if (android.os.Looper.myLooper() != sdkThread.getLooper()) {
@@ -602,6 +643,7 @@ public final class TencentIMClient {
         List<String> cleaned = cleanUserIds(userIds);
         if (cleaned.isEmpty()) return;
         String accountAtRequest = currentUserId;
+        long selfRevisionAtRequest = selfProfileRevision.snapshot();
         String requestKey = accountAtRequest + "\n" + String.join("\n", cleaned);
         synchronized (this) {
             if (requestKey.equals(profileRequestKey)) return;
@@ -621,6 +663,8 @@ public final class TencentIMClient {
                         for (V2TIMUserFullInfo user : users) {
                             String userId = clean(user.getUserID());
                             if (userId.isEmpty()) continue;
+                            if (!selfProfileRevision.accepts(accountAtRequest, userId, selfRevisionAtRequest))
+                                continue;
                             String nickname = clean(user.getNickName());
                             contacts.add(new RemoteIMContact(
                                 userId,
@@ -629,7 +673,7 @@ public final class TencentIMClient {
                             ));
                         }
                     }
-                    listener.onProfilesUpdated(contacts);
+                    listener.onProfilesUpdated(contacts, selfRevisionAtRequest);
                 }
 
                 @Override
@@ -641,6 +685,11 @@ public final class TencentIMClient {
                 }
             }
         );
+    }
+
+    public long selfProfileReadRevision() { return selfProfileRevision.snapshot(); }
+    public boolean isSelfProfileReadRevisionCurrent(long revision) {
+        return selfProfileRevision.snapshot() == revision;
     }
 
     public void refreshAndSubscribePresence(List<String> userIds) {

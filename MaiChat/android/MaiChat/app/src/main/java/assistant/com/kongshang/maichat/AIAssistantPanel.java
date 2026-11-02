@@ -203,6 +203,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         list.setDivider(null);
         list.setDividerHeight(dp(24));
         list.setPadding(dp(16), 0, dp(16), dp(24));
+        // 内容保留留白，滚动指示条独立贴视图边缘，与 iOS 的全宽滚动区域一致。
+        list.setScrollBarStyle(View.SCROLLBARS_OUTSIDE_OVERLAY);
         list.setClipToPadding(false);
         older = button("显示更早消息", "显示更早消息", v -> {
             visibleLimit += 30;

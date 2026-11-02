@@ -420,7 +420,7 @@ public final class AIAssistantController {
         // 私有 PDF 密码桥自行做短时 UI 调度；不让通用桥阻塞主线程等待用户输入。
         if (tool.startsWith("mobile_") || tool.equals("generate_pdf") || tool.equals("pdf_password_request")
             || tool.equals("maichat_create_group") || tool.equals("maichat_get_group_messages")
-            || tool.equals("maichat_send_group_text")) {
+            || tool.equals("maichat_send_group_text") || tool.equals("maichat_set_avatar")) {
             if (Looper.myLooper() == Looper.getMainLooper())
                 return hostToolFailure("此宿主工具不能在 UI 线程执行");
             invoke.run();

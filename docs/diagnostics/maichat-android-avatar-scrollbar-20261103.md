@@ -1,0 +1,39 @@
+# Android 头像更换和创作中心滚动条（2026-11-03）
+
+## 现场与预期
+
+- 基线 `f3a55b780be0ca74e6a95febe6dafcc0a26b4af6`，已装 OPPO PKD130 Android 15 的 2.2.7(239)。用户追加指出头像更换不可用，以及创作中心滚动条离屏幕边缘太远。
+- 复现：“我 → 个人资料”只有静态头像，没有选择图片的入口；现场 UI XML 的头像行不可点击，源码 `renderPersonalProfile` 未绑定操作。不是已上传头像刷新失败的证据。
+- 预期：点击头像选择一张图片，可拖动/缩放调整方形裁剪，明确确认后上传；取消选择/裁剪不改变当前头像。上传成功才刷新本人资料，失败可重新选择；账号变化时不能把旧图片提交到另一账号。
+- iOS 现行做法：允许照片编辑，再居中裁成512×512、JPEG88；通过既有 OSS `/sign-upload` 的 `purpose=im_avatar` 取得临时上传授权，客户端直传后由腾讯 IM 确认 `faceURL`。
+- 创作中心内容保留16dp留白，右侧滚动指示条在全宽列表的屏幕边缘。Android `SCROLLBARS_OUTSIDE_OVERLAY` 忽略内容 padding，依据为 [View 官方文档](https://developer.android.com/reference/android/view/View#SCROLLBARS_OUTSIDE_OVERLAY)。
+
+## 实施与验收计划
+
+1. 普通资料页和新的 Android `maichat_set_avatar{file_path}` 工具复用 Session 事务；不新增头像服务器，工具沿现有工作区文件授权与逐次审批。
+2. 图片核心有界解码、处理 EXIF、统一裁剪/编码；本地裁剪可取消，临时文件按所有权清理。
+3. 复用现有 native curl HTTP 实现增加有界 PUT，不另写 Java HTTP 栈；临时授权、签名 URL 和图片不进入日志或仓库。
+4. 上传前后、SDK提交前及回调都校验账号代际；主线程只处理页面状态，不等待上传。
+5. 用本地 fixture 验签发/PUT/响应与失败、切号、图像和裁剪几何；在正常真机 App 上亲看选图/裁剪/取消和贴边滚动条。实际头像图片由用户选择，不擅自用测试图改真实账号。
+6. 完成后构建同包名、同本机证书2.2.8(240)，原位升级，回拉 APK 核对指纹和运行进程，记录真实验证范围。
+
+## 最终构建和现场验证
+
+- 新增原生 PUT 入口和 Android 头像工具注册后，以 NDK27.3 的现有 ARM64 CMake 目录重建 `maichat_agent`，实际重新编译 AuthJni、移动工具注册并链接成功。新 JNI 二进制导出符号已核对，旧 auth 入口仍在。
+- JDK17 / Gradle7.5.1 完整 JVM 回归 **248/248**，失败/错误/跳过均为0；instrumentation 源码编译和 Release 组装通过。上传/图像6项、裁剪几何8项、事务及资料revision11项为本轮新增验证。
+- 独立交叉审查核对既有 OSS signer 合同、无 Bearer 的 PUT、JNI 构造签名、SDK/账号隔离及回调。审查发现“销毁后回调丢弃导致临时文件残留”，已修专用完成执行器，并由 Main 持有临时文件在销毁/切号时清理。
+- 实机原位升级 **2.2.8(240)** 成功，冷启动和登录恢复正常，进程 **PID9075**；该 PID crash buffer 无记录。
+- 亲看“个人资料”新增更换头像箭头；点击进入系统单图选择器，仅授权所选图片。使用本地四色测试图进入裁剪，实际拖动后选区变化，点“取消”回到资料页，原头像未改变。没有点击测试图的“使用此头像”，没有真实上传或 SDK 头像写入；测试图已从手机移除。
+- 亲看创作中心滚动过程截图 `scrollbar-final.png`，右侧指示条贴近屏幕最右边，卡片内容留白保留，末项可达。
+
+| 项目 | 证据 |
+|---|---|
+| APK 字节数 | 100179612 |
+| APK SHA256 | `2836dbd926179bd63cba6012073e49a471fbf978f6470e3a27d240a278966f4e` |
+| 实装回拉 | `pm path` 实际 `base.apk` 回拉，与上述产物字节完全相同 |
+| 源码差异 SHA256 | `d49d2cfb4e90bf14ca04e40c024fe982b8e22e184ac4da07c971ef413f08f57e`，相对本文件基线、含 Android 和移动工具注册的新文件，保留于本机 `source.patch` |
+| 本地证据 | `.cache/android-avatar-scroll/`，界面截图位于 `.cache/android-ui-parity/avatar-*.png`、`scrollbar-final.png`，不提交用户画面 |
+
+真实保存验证边界：图片选择应由用户决定，本轮仅验证选择、裁剪、取消及离线签发/PUT/SDK事务合同，尚未把真实账号头像换成测试图。已请用户自行选择想用的照片再确认保存；在此之前不宣称线上头像更新已实测成功。模型头像工具未发起真实调用；本轮未发布 Release、未安装其他包名的 MaiChat。
+
+SDK/工具事务详情另见 `maichat-android-avatar-change-20261103.md`。

@@ -69,6 +69,7 @@ import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.PopupWindow;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Space;
 import android.widget.TextView;
@@ -139,6 +140,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private static final int REQUEST_FRIEND_SCAN = 1011;
     private static final int REQUEST_SCREEN_SHARE = 1012;
     private static final int REQUEST_CLOUD_DRIVE_MEDIA = 1013;
+    private static final int REQUEST_PICK_AVATAR = 1014;
     private static final String TAG = "MaiChat.notify";
     private static final String MESSAGE_CHANNEL_ID = "maichat-new-messages";
     private static final String MESSAGE_GROUP_KEY = "maichat-private-messages";
@@ -170,6 +172,11 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private TextView selfNameLabel, selfAccountLabel, selfConnectionLabel;
     private FrameLayout selfAvatarContainer;
     private View selfConnectionDot;
+    private View selfAvatarRow;
+    private ProgressBar selfAvatarProgress;
+    private String pendingAvatarIdentity, avatarCropIdentity, avatarUploadIdentity;
+    private Dialog avatarCropDialog;
+    private File avatarUploadFile;
     private int selfAvatarSize = 64;
     private String renderedSelfAvatar = "";
     private View renderedTabBar;
@@ -443,6 +450,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     @Override
     protected void onDestroy() {
         destroyed = true;
+        clearAvatarSelection();
         passwordRequests.cancelActive("identity_changed");
         if (passwordDialog != null) passwordDialog.dismiss();
         if (cloudDriveDialog != null && cloudDriveDialog.isShowing()) cloudDriveDialog.dismiss();
@@ -596,6 +604,18 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_PICK_AVATAR) {
+            String identity = pendingAvatarIdentity;
+            pendingAvatarIdentity = null;
+            if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+            if (destroyed || identity == null || !session.isAvatarChangeIdentityCurrent(identity)) return;
+            avatarCropIdentity = identity;
+            avatarCropDialog = AvatarCropDialog.show(this, data.getData(), file -> {
+                avatarCropDialog = null; avatarCropIdentity = null;
+                uploadSelectedAvatar(file, identity);
+            }, () -> { avatarCropDialog = null; avatarCropIdentity = null; });
+            return;
+        }
         if (requestCode == REQUEST_SCREEN_SHARE) {
             Consumer<Boolean> completion = pendingScreenShare;
             pendingScreenShare = null;
@@ -900,6 +920,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             && activeChatUserId == null && !showInitialLogin && !session.requiresLogin();
         if (aiAssistant != null) aiAssistant.setForeground(showingAssistant);
         String owner = session.requiresLogin() ? "" : session.settings().loginUserId();
+        clearInvalidAvatarSelection();
         if (!owner.equals(displayedOwner)) {
             renderedPrimaryTab = null;
             mePage = MePage.HOME;
@@ -1010,6 +1031,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         conversationScroll = null;
         selfNameLabel = null; selfAccountLabel = null; selfConnectionLabel = null;
         selfAvatarContainer = null; selfConnectionDot = null; renderedSelfAvatar = "";
+        selfAvatarRow = null; selfAvatarProgress = null;
         renderedChatUserId = null;
         groupRows = null; groupScroll = null; groupDraftInput = null;
         renderedGroupId = null;
@@ -4060,9 +4082,19 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         avatarRow.setPadding(dp(16), dp(12), dp(16), dp(12));
         avatarRow.addView(MaiChatTheme.text(this, "头像", 16, MaiChatTheme.TEXT),
             new LinearLayout.LayoutParams(0, -2, 1));
+        selfAvatarRow = avatarRow;
+        avatarRow.setContentDescription("更换头像");
+        avatarRow.setOnClickListener(view -> chooseAvatar());
+        selfAvatarProgress = new ProgressBar(this);
+        LinearLayout.LayoutParams savingParams = new LinearLayout.LayoutParams(dp(20), dp(20));
+        savingParams.rightMargin = dp(12);
+        avatarRow.addView(selfAvatarProgress, savingParams);
         selfAvatarSize = 48;
         selfAvatarContainer = new FrameLayout(this);
         avatarRow.addView(selfAvatarContainer, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        LinearLayout.LayoutParams arrowParams = new LinearLayout.LayoutParams(dp(12), dp(18));
+        arrowParams.leftMargin = dp(10);
+        avatarRow.addView(settingsChevron(), arrowParams);
         View nickname = preferenceRow("昵称", session.nickname(), 0, this::showNicknameDialog);
         selfNameLabel = (TextView) nickname.findViewWithTag("preference-value");
         View account = preferenceRow("账号", session.accountId(), 0, this::copyOwnAccountId);
@@ -4095,6 +4127,11 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
 
     private void updateSelfProfilePresentation() {
         RemoteIMContact profile = session.selfProfile();
+        boolean savingAvatar = avatarUploadIdentity != null
+            && session.isAvatarChangeIdentityCurrent(avatarUploadIdentity);
+        if (selfAvatarProgress != null) selfAvatarProgress.setVisibility(savingAvatar ? View.VISIBLE : View.GONE);
+        if (selfAvatarRow != null) selfAvatarRow.setEnabled(!savingAvatar
+            && session.connectionState() == TencentIMClient.ConnectionState.CONNECTED);
         if (selfNameLabel != null) selfNameLabel.setText(mePage == MePage.PROFILE
             ? (session.nickname().isEmpty() ? "未设置" : session.nickname()) : profile.displayName());
         if (selfAccountLabel != null) selfAccountLabel.setText(session.accountId());
@@ -4174,6 +4211,82 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         }
         group.addView(card, matchWrap());
         return group;
+    }
+
+    /** 只申请用户选中的图片 URI，避免为换头像索取整个相册权限。 */
+    private void chooseAvatar() {
+        if (destroyed || avatarUploadIdentity != null) return;
+        if (session.connectionState() != TencentIMClient.ConnectionState.CONNECTED) {
+            toast("消息连接恢复后可更换头像");
+            return;
+        }
+        String identity = session.avatarChangeIdentity();
+        if (!session.isAvatarChangeIdentityCurrent(identity)) return;
+        pendingAvatarIdentity = identity;
+        Intent picker = Build.VERSION.SDK_INT >= 33
+            ? new Intent(MediaStore.ACTION_PICK_IMAGES).setType("image/*")
+            : avatarDocumentPicker();
+        try {
+            startActivityForResult(picker, REQUEST_PICK_AVATAR);
+        } catch (android.content.ActivityNotFoundException unavailable) {
+            try { startActivityForResult(avatarDocumentPicker(), REQUEST_PICK_AVATAR); }
+            catch (android.content.ActivityNotFoundException failure) {
+                pendingAvatarIdentity = null;
+                toast("无法打开相册，请稍后重试");
+            }
+        }
+    }
+
+    private Intent avatarDocumentPicker() {
+        return new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("image/*").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+    }
+
+    private void uploadSelectedAvatar(File file, String identity) {
+        if (file == null) return;
+        if (destroyed || !session.isAvatarChangeIdentityCurrent(identity)) { file.delete(); return; }
+        avatarUploadIdentity = identity;
+        avatarUploadFile = file;
+        updateSelfProfilePresentation();
+        // 普通资料页和工具共用同一 Session 事务；只有 SDK 确认成功后才显示新头像。
+        session.uploadSelfAvatar(file, identity, error -> {
+            file.delete();
+            if (avatarUploadFile == file) avatarUploadFile = null;
+            if (!identity.equals(avatarUploadIdentity)) return;
+            avatarUploadIdentity = null;
+            if (destroyed || !session.isAvatarChangeIdentityCurrent(identity)) return;
+            updateSelfProfilePresentation();
+            toast(error == null ? "头像已更新" : error);
+        });
+    }
+
+    private void clearInvalidAvatarSelection() {
+        if (pendingAvatarIdentity != null && !session.isAvatarChangeIdentityCurrent(pendingAvatarIdentity))
+            pendingAvatarIdentity = null;
+        if (avatarUploadIdentity != null && !session.isAvatarChangeIdentityCurrent(avatarUploadIdentity)) {
+            avatarUploadIdentity = null;
+            clearAvatarUploadFile();
+        }
+        if (avatarCropIdentity != null && !session.isAvatarChangeIdentityCurrent(avatarCropIdentity)) {
+            avatarCropIdentity = null;
+            Dialog stale = avatarCropDialog;
+            avatarCropDialog = null;
+            if (stale != null) stale.dismiss();
+        }
+    }
+
+    private void clearAvatarSelection() {
+        pendingAvatarIdentity = avatarCropIdentity = avatarUploadIdentity = null;
+        clearAvatarUploadFile();
+        Dialog stale = avatarCropDialog;
+        avatarCropDialog = null;
+        if (stale != null) stale.dismiss();
+    }
+
+    private void clearAvatarUploadFile() {
+        File stale = avatarUploadFile;
+        avatarUploadFile = null;
+        if (stale != null) stale.delete();
     }
 
     private void copyOwnAccountId() {

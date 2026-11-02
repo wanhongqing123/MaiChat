@@ -816,6 +816,16 @@ void registerMaiChatHostTools(MaiToolRegistry& tools,
         R"({"type":"object","properties":{"nickname":{"type":"string","maxLength":32}},)"
             R"("required":["nickname"]})",
         true);
+#if defined(__ANDROID__)
+    // Android 普通个人资料页与工具复用同一上传/SDK 核心；iOS 尚无此宿主工具入口。
+    add("maichat_set_avatar",
+        "Upload an image from the current Agent workspace and replace the current MaiChat "
+        "account's public avatar. Waits for the IM profile update to be confirmed. "
+        "Approval follows the Agent policy.",
+        R"({"type":"object","properties":{"file_path":{"type":"string","minLength":1}},)"
+            R"("required":["file_path"],"additionalProperties":false})",
+        true);
+#endif
     add("maichat_list_conversations",
         "List direct MaiChat conversations with contacts, ordered by latest message and unread "
         "count. Use maichat_list_groups for group conversations.",

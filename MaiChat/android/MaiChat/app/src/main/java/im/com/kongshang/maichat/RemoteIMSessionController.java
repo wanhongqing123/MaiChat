@@ -76,6 +76,8 @@ public final class RemoteIMSessionController {
     private final Map<String, Long> oldestLoadedCreatedAtByUserId = new HashMap<>();
     private final Map<String, String> oldestLoadedMessageIdByUserId = new HashMap<>();
     private final RemoteIMSelfProfileState selfProfileState = new RemoteIMSelfProfileState();
+    private final RemoteIMAvatarUpdate.Gate avatarUpdateGate = new RemoteIMAvatarUpdate.Gate();
+    private AccountCompletion avatarUpdateCompletion;
     private final boolean productionMode;
 
     private volatile RemoteIMSettings settings;
@@ -390,6 +392,73 @@ public final class RemoteIMSessionController {
     public RemoteIMContact selfProfile() {
         selfProfileState.activate(chatState.ownerUserId(), nickname());
         return selfProfileState.current();
+    }
+
+    /** Picker, crop UI and host tools bind the whole operation to this login generation. */
+    public String avatarChangeIdentity() {
+        return destroyed || !productionMode || requiresLogin() ? ""
+            : accountId() + "|" + accountGeneration + "|" + chatState.ownerUserId();
+    }
+    public boolean isAvatarChangeIdentityCurrent(String expectedIdentity) {
+        return expectedIdentity != null && !expectedIdentity.isEmpty()
+            && expectedIdentity.equals(avatarChangeIdentity());
+    }
+    /** Ordinary UI and model tools use the same upload, SDK commit and local profile update. */
+    public void uploadSelfAvatar(java.io.File image, String expectedIdentity, AccountCompletion completion) {
+        if (mainHandler != null && Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post(() -> uploadSelfAvatar(image, expectedIdentity, completion)); return;
+        }
+        if (!isAvatarChangeIdentityCurrent(expectedIdentity)) {
+            runAvatarCompletion(() -> completion.onFinished("登录账号已变化，请重新选择头像")); return;
+        }
+        if (client == null || connectionState != TencentIMClient.ConnectionState.CONNECTED) {
+            runAvatarCompletion(() -> completion.onFinished("请先连接 IM 后再更换头像")); return;
+        }
+        if (image == null || !image.isFile()) {
+            runAvatarCompletion(() -> completion.onFinished("头像图片不可用，请重新选择")); return;
+        }
+        // 界面和工具共用一个事务；不让较早的上传稍后覆盖用户更新的头像。
+        if (!avatarUpdateGate.tryAcquire()) {
+            runAvatarCompletion(() -> completion.onFinished("头像正在更换，请等待当前操作完成")); return;
+        }
+        java.util.concurrent.atomic.AtomicBoolean notified = new java.util.concurrent.atomic.AtomicBoolean();
+        AccountCompletion completionOnce = error -> {
+            if (!notified.compareAndSet(false, true)) return;
+            avatarUpdateCompletion = null;
+            avatarUpdateGate.release();
+            completion.onFinished(error);
+        };
+        avatarUpdateCompletion = completionOnce;
+        String owner = chatState.ownerUserId();
+        java.util.function.BooleanSupplier current = () -> isAvatarChangeIdentityCurrent(expectedIdentity);
+        RemoteIMAvatarUpdate operation = new RemoteIMAvatarUpdate(current,
+            (source, stillCurrent) -> {
+                MaiChatAuthClient.MediaServiceAccess access = authClient.mediaServiceAccess();
+                if (!stillCurrent.getAsBoolean()) throw new IOException("Avatar identity changed");
+                return MaiChatAvatarUploader.upload(source, access, stillCurrent);
+            },
+            (url, finished) -> client.setSelfAvatar(owner, url, current, new TencentIMClient.OperationCompletion() {
+                @Override public void onSuccess() { finished.finished(null); }
+                @Override public void onError(int code, String ignored) {
+                    finished.finished("头像保存尚未确认，请检查 IM 连接后重试");
+                }
+            }),
+            url -> {
+                selfProfileState.activate(owner, nickname());
+                RemoteIMContact previous = selfProfileState.current();
+                selfProfileState.accept(new RemoteIMContact(owner, previous.displayName(), url));
+                AvatarImageLoader.prefetch(url);
+                notifyStateChanged();
+            }, this::runAvatarCompletion);
+        try { ioExecutor.execute(() -> operation.start(image, completionOnce::onFinished)); }
+        catch (java.util.concurrent.RejectedExecutionException closed) {
+            runAvatarCompletion(() -> completionOnce.onFinished("页面已关闭，请重新选择头像"));
+        }
+    }
+    private void runAvatarCompletion(Runnable action) {
+        // 即使 Activity/Session 已销毁也交付清理回调；current 仍阻止资料安装和 SDK 写入。
+        if (mainHandler == null || Looper.myLooper() == Looper.getMainLooper()) action.run();
+        else mainHandler.post(action);
     }
 
     /** 安全表单绑定账号和本次登录代际；同账号重新登录也不得沿用旧密码页。 */
@@ -1849,6 +1918,9 @@ public final class RemoteIMSessionController {
         }
         if (remoteDesktop != null) remoteDesktop.destroy();
         destroyed = true;
+        AccountCompletion pendingAvatar = avatarUpdateCompletion;
+        if (pendingAvatar != null)
+            runAvatarCompletion(() -> pendingAvatar.onFinished("页面已关闭，头像更换已停止"));
         client.destroy();
         ioExecutor.execute(historyStore::close);
         ioExecutor.shutdown();
@@ -2263,6 +2335,11 @@ public final class RemoteIMSessionController {
 
         @Override
         public void onProfilesUpdated(List<RemoteIMContact> contacts) {
+            onProfilesUpdated(contacts, client == null ? -1 : client.selfProfileReadRevision());
+        }
+
+        @Override
+        public void onProfilesUpdated(List<RemoteIMContact> contacts, long selfRevision) {
             int generation = accountGeneration;
             String owner = chatState.ownerUserId();
             runOnMain(() -> {
@@ -2271,6 +2348,9 @@ public final class RemoteIMSessionController {
                     || !owner.equals(chatState.ownerUserId())) return;
                 selfProfileState.activate(owner, nickname());
                 for (RemoteIMContact contact : contacts) {
+                    // SDK 回调排队到 main 期间也可能完成头像写入，故应用前再次核对读代际。
+                    if (contact != null && owner.equals(contact.userId()) && client != null
+                        && !client.isSelfProfileReadRevisionCurrent(selfRevision)) continue;
                     if (selfProfileState.accept(contact)) {
                         if (connectionState == TencentIMClient.ConnectionState.CONNECTED)
                             AvatarImageLoader.prefetch(contact.avatarUrl());
