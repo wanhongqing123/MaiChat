@@ -48,14 +48,14 @@ public class CurlRealtimeSpeechWebSocketInstrumentedTest {
     private static final MaiChatAuthTransport.ProxyRoute DIRECT =
         new MaiChatAuthTransport.ProxyRoute(MaiChatAuthTransport.ProxyRoute.DIRECT, "", 0);
     private static final String PARTIAL =
-        "{\"code\":0,\"sentences\":{\"voice_text_str\":\"测试\"}}";
+        "{\"code\":0,\"result\":{\"index\":0,\"slice_type\":1,\"voice_text_str\":\"测试\"}}";
     private static final String FINAL =
-        "{\"code\":0,\"sentences\":{\"voice_text_str\":\"测试完成\"},\"final\":1}";
+        "{\"code\":0,\"result\":{\"index\":0,\"slice_type\":2,\"voice_text_str\":\"测试完成\"},\"final\":1}";
 
     // 用自签本机 WSS 服务走真实 JNI/curl：服务端拆分 JSON 帧，同时记录 AAC 到达间隔。
     // 断言转写回调只收到完整 JSON，且音频按录音节奏发送，而不是连接后一次倾倒。
     @Test public void localWssStreamsAacAtRealtimePaceAndReassemblesJsonFrames() throws Exception {
-        // 同一握手契约先拒绝缺失/错误 token，再用真实 Stream 验证固定头与 V2 final。
+        // 同一握手契约先拒绝缺失/错误 token，再用真实 Stream 验证普通协议的固定头与 final。
         for (String rejected : new String[] {"", "wrong-fixture-token"}) {
             try (MockWssServer server = new MockWssServer(STS_TOKEN, (input, output, request) -> {
                 throw new AssertionError("Unauthorized WebSocket was upgraded");
@@ -101,7 +101,7 @@ public class CurlRealtimeSpeechWebSocketInstrumentedTest {
                     }
                 } else if (frame.opcode == 1) {
                     assertEquals("{\"type\":\"end\"}", new String(frame.payload, StandardCharsets.UTF_8));
-                    // V2 结束时仍可修正文；超过旧的一秒超时后必须交付 final 而非 partial。
+                    // 最后一段可在结束时才稳定；超过一秒后仍必须等待 final 而非交付 partial。
                     SystemClock.sleep(1300);
                     sendText(output, FINAL);
                     return;

@@ -75,6 +75,7 @@ public final class RemoteIMSessionController {
     private final Map<String, Boolean> hasEarlierByUserId = new HashMap<>();
     private final Map<String, Long> oldestLoadedCreatedAtByUserId = new HashMap<>();
     private final Map<String, String> oldestLoadedMessageIdByUserId = new HashMap<>();
+    private final RemoteIMSelfProfileState selfProfileState = new RemoteIMSelfProfileState();
     private final boolean productionMode;
 
     private volatile RemoteIMSettings settings;
@@ -271,6 +272,7 @@ public final class RemoteIMSessionController {
         friendDisplayByIm.clear();
         friendRequestIdByIm.clear();
         chatState = new ChatState(next.requiresLogin() ? FALLBACK_OWNER_USER_ID : next.loginUserId());
+        selfProfileState.activate(chatState.ownerUserId(), nickname());
         unreadByUserId.clear(); presenceByUserId.clear(); hasEarlierByUserId.clear();
         oldestLoadedCreatedAtByUserId.clear(); oldestLoadedMessageIdByUserId.clear();
         loadingPeers.clear(); pageRequests.clear(); peerEpochs.clear(); pendingVideoMedia.clear(); mediaRevision++;
@@ -382,6 +384,12 @@ public final class RemoteIMSessionController {
 
     public String nickname() {
         return productionMode ? authClient.nickname() : "";
+    }
+
+    /** 本人身份使用 IM owner；账号昵称优先，头像未取得时由现有头像控件回退。 */
+    public RemoteIMContact selfProfile() {
+        selfProfileState.activate(chatState.ownerUserId(), nickname());
+        return selfProfileState.current();
     }
 
     /** 安全表单绑定账号和本次登录代际；同账号重新登录也不得沿用旧密码页。 */
@@ -953,6 +961,7 @@ public final class RemoteIMSessionController {
         settingsStore.save(settings);
         chatState = loadLegacyChatState();
         unreadByUserId.clear();
+        selfProfileState.activate(chatState.ownerUserId(), nickname());
         presenceByUserId.clear();
         hasEarlierByUserId.clear();
         oldestLoadedCreatedAtByUserId.clear();
@@ -990,6 +999,7 @@ public final class RemoteIMSessionController {
         } else {
             chatState = loadLegacyChatState();
         }
+        selfProfileState.activate(chatState.ownerUserId(), nickname());
         notifyStateChanged();
     }
 
@@ -1890,9 +1900,11 @@ public final class RemoteIMSessionController {
     }
 
     private void refreshContactMetadata() {
-        if (!productionMode || chatState.contacts().isEmpty()) return;
+        if (!productionMode || requiresLogin()) return;
         List<String> userIds = new ArrayList<>();
         for (RemoteIMContact contact : chatState.contacts()) userIds.add(contact.userId());
+        // 本人不是联系人；即使尚无好友，也必须加载资料卡使用的真实头像。
+        client.refreshProfiles(Collections.singletonList(chatState.ownerUserId()));
         refreshContactMetadata(userIds);
     }
 
@@ -2251,8 +2263,21 @@ public final class RemoteIMSessionController {
 
         @Override
         public void onProfilesUpdated(List<RemoteIMContact> contacts) {
+            int generation = accountGeneration;
+            String owner = chatState.ownerUserId();
             runOnMain(() -> {
+                // SDK 已核对请求所属账号；这里还要拒绝排队期间发生切号的回调。
+                if (destroyed || requiresLogin() || generation != accountGeneration
+                    || !owner.equals(chatState.ownerUserId())) return;
+                selfProfileState.activate(owner, nickname());
                 for (RemoteIMContact contact : contacts) {
+                    if (selfProfileState.accept(contact)) {
+                        if (connectionState == TencentIMClient.ConnectionState.CONNECTED)
+                            AvatarImageLoader.prefetch(contact.avatarUrl());
+                        continue;
+                    }
+                    // 资料只更新现有好友，不把旧账号本人或失效查询结果变成新联系人。
+                    if (contact == null || !contactExists(contact.userId())) continue;
                     chatState.upsertContact(contact);
                     String accountName = friendDisplayByIm.get(contact.userId());
                     RemoteIMContact current = accountName == null ? contact :

@@ -58,6 +58,7 @@ final class VoiceRecordingController {
     }
     boolean tryStart(Completion callback, AsrTicketProvider ticketProvider) {
         if (closed || !active.compareAndSet(false, true)) return false;
+        recordDiagnostic("asr-recorder-queued");
         worker.post(() -> {
             if (closed) { active.set(false); return; }
             try {
@@ -72,9 +73,11 @@ final class VoiceRecordingController {
                 recorder.setAudioEncodingBitRate(32000);
                 recorder.setOutputFile(clip.file.getAbsolutePath());
                 recorder.prepare(); recorder.start(); started = SystemClock.elapsedRealtime();
+                recordDiagnostic("asr-recorder-started");
                 if (ticketProvider != null) requestAsrTicket(clip, ticketProvider);
                 else clip.resultReady = true;
             } catch (Exception error) {
+                recordDiagnostic("asr-recorder-failed class=" + error.getClass().getSimpleName());
                 finishOnWorker(true);
                 main.post(() -> { if (!closed) callback.failed(); });
             }
@@ -82,11 +85,14 @@ final class VoiceRecordingController {
         return true;
     }
     private void requestAsrTicket(Clip clip, AsrTicketProvider provider) {
+        recordDiagnostic("asr-ticket-request");
         try {
             ticketWorker.execute(() -> {
                 MaiChatAuthClient.RealtimeAsrTicket ticket = null;
-                try { ticket = provider.issue(); }
-                catch (Exception error) { diagnostic.accept("asr-ticket-failed"); }
+                try { ticket = provider.issue(); recordDiagnostic("asr-ticket-ready"); }
+                catch (Exception error) {
+                    recordDiagnostic("asr-ticket-failed class=" + error.getClass().getSimpleName());
+                }
                 MaiChatAuthClient.RealtimeAsrTicket issued = ticket;
                 if (!worker.post(() -> {
                     if (closed || clip.cancelled || !clips.contains(clip)) return;
@@ -98,7 +104,7 @@ final class VoiceRecordingController {
                     try {
                         clip.stream = new TencentRealtimeSpeechStream(clip.file, issued,
                             new TencentRealtimeSpeechStream.Listener() {
-                                @Override public void diagnostic(String event) { diagnostic.accept(event); }
+                                @Override public void diagnostic(String event) { recordDiagnostic(event); }
                                 @Override public void partial(String text) {
                                     main.post(() -> {
                                         if (!closed && !clip.cancelled) clip.completion.partial(text);
@@ -120,11 +126,11 @@ final class VoiceRecordingController {
                             });
                         if (clip.released) clip.stream.endAudio();
                     } catch (RuntimeException error) {
-                        diagnostic.accept("asr-stream-start-failed");
+                        recordDiagnostic("asr-stream-start-failed class=" + error.getClass().getSimpleName());
                         clip.asrFailed = true; clip.resultReady = true;
                         deliver(clip);
                     }
-                })) diagnostic.accept("asr-worker-stopped");
+                })) recordDiagnostic("asr-worker-stopped");
             });
         } catch (RejectedExecutionException error) {
             clip.asrFailed = true; clip.resultReady = true;
@@ -132,6 +138,13 @@ final class VoiceRecordingController {
         }
     }
     void finish(boolean cancel) { if (!closed) worker.post(() -> finishOnWorker(cancel)); }
+    private void recordDiagnostic(String event) {
+        // Release 现场只记录固定阶段、数字码和异常类型；严禁响应原文、URL、凭据和转写文字。
+        if (event == null || !event.matches("asr-[a-z-]+(?: (?:curl|code|chars|samples)=-?[0-9]+| class=[A-Za-z0-9_$]+)?"))
+            return;
+        diagnostic.accept(event);
+        android.util.Log.i("MaiChatASR", event);
+    }
     private void finishOnWorker(boolean cancel) {
         Clip clip = recording;
         boolean succeeded = recorder != null;
@@ -144,6 +157,7 @@ final class VoiceRecordingController {
         clip.seconds = Math.max(1, (int) ((SystemClock.elapsedRealtime() - started) / 1000));
         clip.released = true;
         if (cancel || closed || !succeeded) {
+            recordDiagnostic(cancel || closed ? "asr-recording-cancelled" : "asr-recorder-stop-failed");
             clip.cancelled = true;
             if (clip.stream != null) clip.stream.cancel();
             clip.file.delete(); clips.remove(clip);

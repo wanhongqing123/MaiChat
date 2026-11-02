@@ -1,0 +1,8 @@
+<!-- Welcome capability symbols share a 24 point canvas and rounded two point outlines. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="@android:color/transparent" android:strokeColor="#0F8DDD"
+        android:strokeWidth="2" android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M2,5.5 H12 M17,5.5 H22 M2,12 H6 M11,12 H22 M2,18.5 H14 M19,18.5 H22 M14.5,3 A2.5,2.5 0,1 1,14.5 8 A2.5,2.5 0,1 1,14.5 3 Z M8.5,9.5 A2.5,2.5 0,1 1,8.5 14.5 A2.5,2.5 0,1 1,8.5 9.5 Z M16.5,16 A2.5,2.5 0,1 1,16.5 21 A2.5,2.5 0,1 1,16.5 16 Z" />
+</vector>

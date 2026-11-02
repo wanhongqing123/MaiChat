@@ -1,4 +1,4 @@
-// 文件作用：按实时节奏读取 AAC，直连腾讯 WebSocket 并接收 V2 语音识别结果。
+// 文件作用：按实时节奏读取 AAC，直连腾讯普通 16k_zh WebSocket 并接收逐段结果。
 // 主要入口：dispatch、receive、pump、finish。
 package com.kongshang.maichat;
 
@@ -31,7 +31,7 @@ final class TencentRealtimeSpeechStream {
     private CurlRealtimeSpeechWebSocket socket;
     private AdtsFrameReader reader;
     private ScheduledFuture<?> pumping;
-    private boolean ready, audioEnded, endSent, finished;
+    private boolean ready, audioEnded, endSent, finished, sentAudio;
     private long readyAt;
     private String previousText = "";
 
@@ -71,13 +71,19 @@ final class TencentRealtimeSpeechStream {
                     }
                     @Override public void closed() {
                         dispatch(() -> {
+                            listener.diagnostic("asr-socket-closed");
                             if (!finished)
                                 finish(null);
                         });
                     }
                 });
-                worker.schedule(() -> { if (!ready) finish(null); }, 6, TimeUnit.SECONDS);
-            } catch (Exception error) { finish(null); }
+                worker.schedule(() -> {
+                    if (!ready) { listener.diagnostic("asr-ready-timeout"); finish(null); }
+                }, 6, TimeUnit.SECONDS);
+            } catch (Exception error) {
+                listener.diagnostic("asr-setup-failed class=" + error.getClass().getSimpleName());
+                finish(null);
+            }
         });
     }
     private void dispatch(Runnable action) {
@@ -100,12 +106,19 @@ final class TencentRealtimeSpeechStream {
                 pumping = worker.scheduleAtFixedRate(this::pump, 0, 200, TimeUnit.MILLISECONDS);
             }
             String value = transcript.text();
-            if (!value.equals(previousText)) { previousText = value; listener.partial(value); }
+            if (!value.equals(previousText)) {
+                previousText = value;
+                listener.diagnostic("asr-partial chars=" + value.length());
+                listener.partial(value);
+            }
             if (transcript.complete()) {
                 listener.diagnostic("asr-server-final chars=" + value.length());
                 finish(endSent ? value : null);
             }
-        } catch (Exception error) { finish(null); }
+        } catch (Exception error) {
+            listener.diagnostic("asr-response-failed class=" + error.getClass().getSimpleName());
+            finish(null);
+        }
     }
     private void pump() {
         if (finished || !ready || endSent) return;
@@ -114,8 +127,13 @@ final class TencentRealtimeSpeechStream {
             long budget = ((System.nanoTime() - readyAt) / 1_000_000 + 200) * 16;
             byte[] packet = reader.readUntilSample(budget);
             if (packet.length > 0 && !socket.sendBinary(packet)) {
+                listener.diagnostic("asr-audio-send-failed");
                 finish(null);
                 return;
+            }
+            if (packet.length > 0 && !sentAudio) {
+                sentAudio = true;
+                listener.diagnostic("asr-audio-sent samples=" + reader.samples());
             }
             if (audioEnded && packet.length == 0 && !reader.atEnd() && budget - reader.samples() > 8192) {
                 finish(null);
@@ -130,12 +148,15 @@ final class TencentRealtimeSpeechStream {
                 }
                 pumping.cancel(false);
                 worker.schedule(() -> {
-                    // V2 可在结束时修正全文；没有 final 就不能把中间态当成功发送。
+                    // 普通协议也需等全部音频的 final；不能把中间态当成功发送。
                     listener.diagnostic("asr-end-timeout");
                     finish(null);
                 }, 10, TimeUnit.SECONDS);
             }
-        } catch (Exception error) { finish(null); }
+        } catch (Exception error) {
+            listener.diagnostic("asr-audio-failed class=" + error.getClass().getSimpleName());
+            finish(null);
+        }
     }
     void endAudio() { dispatch(() -> { audioEnded = true; pump(); }); }
     void cancel() { dispatch(() -> finish(null, false)); }
