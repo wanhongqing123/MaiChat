@@ -89,6 +89,7 @@ foreach ($curlProbe in @('old-eventfd', 'old-pipe', 'fixed-eventfd', 'fixed-pipe
 
 ## 正常 App 最终复验
 
+- curl修复提交 `e0feeefe`；最终Android应用源码提交 `30f32eec7f347c4556427219918d980d8102b236`，之后仅补充验收记录。
 - 新仓库ARM64 `maichat_agent` 重新编译 `asyn-thread.c.o`、`libcurl.a` 并重链共享库成功；新Build ID `951ef201cafd8bf0f8691572c5da0d76d8c5a4c4`。
 - 最终正常Release 2.2.9(241) APK SHA-256 `f864e6eafb4f2910cb3741e29306879d4eae7f81008c41322e730997a913492a`，100208340 B，09:41:36同包原位安装。手机拉回的base.apk哈希相同，确认不是仍运行出错候选。
 - 连续三次冷启动及随后正常启动、头像展示、页面切换和两家ASR复验，安装后crash buffer无新记录。最终PID9842，腾讯SDK09:45:48登录成功；09:47实际页面显示消息已连接，用户头像和聊天保留。
