@@ -389,7 +389,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         send.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE, 22, activity));
         send.setVisibility(GONE);
         LayoutParams sendParams = new LayoutParams(dp(44), dp(44));
-        sendParams.setMargins(dp(8), 0, 0, 0);
+        // 与加号/停止按钮互斥，输入区域的右边距已提供同一位置的间隔。
         inputRow.addView(send, sendParams);
         musicMiniBar = row();
         musicMiniBar.setGravity(Gravity.CENTER_VERTICAL);
@@ -665,7 +665,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             && !navigationPending && pendingMediaImports.getOrDefault(selected, 0) == 0 && hasDraft
             && !state.remoteCommandPending
             && (state.remoteSession == null || state.remoteSession.optBoolean("online"));
-        send.setVisibility(!voiceMode && hasDraft && !busy ? VISIBLE : GONE);
+        // 尾部只显示一个操作：忙碌时停止，有草稿时发送，其余显示加号。
+        // 两个原有回调保持独立，隐藏的按钮不占位，避免转写回填后挤窄编辑器。
+        boolean showSend = !voiceMode && hasDraft && !busy;
+        send.setVisibility(showSend ? VISIBLE : GONE);
+        attachmentOrStopButton.setVisibility(showSend ? GONE : VISIBLE);
         send.setEnabled(canSubmit);
         attachmentOrStopButton.setImageResource(busy ? R.drawable.ic_ai_stop : R.drawable.ic_ai_add);
         attachmentOrStopButton.setContentDescription(busy ? "停止" :
