@@ -443,7 +443,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
 
     var selectedGroupID: String? { chatState.selectedGroupID }
 
-#if targetEnvironment(simulator)
+#if DEBUG && targetEnvironment(simulator)
     func configureGroupUITestFixture() {
         let arguments = ProcessInfo.processInfo.arguments
         guard arguments.contains("--im-group-ui-test") ||
@@ -453,16 +453,13 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         groupUIFixtureActivationFailure = arguments.contains("--im-group-activation-fail-ui-test")
         historyAccountGeneration &+= 1
         chatHistorySDKAppID = nil
-        masterUserID = "sim-group-owner"
-        maiChatAccountID = "sim-group-owner"
-        maiChatNickname = "模拟器测试账号"
+        masterUserID = GroupChatUITestData.ownerID
+        maiChatAccountID = GroupChatUITestData.ownerID
+        maiChatNickname = GroupChatUITestData.nickname
         hasUnifiedAccount = true
         hasCompletedInitialLogin = true
         connectionState = .connected
-        let contacts = [
-            RemoteIMContact(userID: "sim-friend-a", displayName: "测试好友 A", relation: .friend),
-            RemoteIMContact(userID: "sim-friend-b", displayName: "测试好友 B", relation: .friend),
-        ]
+        let contacts = GroupChatUITestData.contacts
         chatState = MasterChatState(ownerUserID: masterUserID, contacts: contacts, messages: [])
         acceptedFriendIMIDs = Set(contacts.map(\.userID))
         friendDisplayByIMID = Dictionary(uniqueKeysWithValues: contacts.map { ($0.userID, $0.displayName) })
@@ -493,9 +490,9 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         groupUIFixtureGeneration &+= 1
         historyAccountGeneration &+= 1
         accountRebuildRequestGeneration &+= 1
-        masterUserID = "sim-group-owner-switched"
+        masterUserID = GroupChatUITestData.switchedOwnerID
         maiChatAccountID = masterUserID
-        maiChatNickname = "切换后的测试账号"
+        maiChatNickname = GroupChatUITestData.switchedNickname
         chatState = MasterChatState(ownerUserID: masterUserID)
         groups = []
         groupCreationRecovery = nil
@@ -993,6 +990,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     private func clearLocalAccountPresentation() async {
+        try? await AIMobileSMSInbox.shared.disableAndClear()
         AICloudCredentialSync.invalidateAccountModelCredentials()
         AIAssistantModel.resetForAccountSwitch()
         await disconnect()
@@ -1026,6 +1024,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         let previousUserID = masterUserID
         let wasConnected = connectionState == .connected
         if previousUserID != session.user.imUserId {
+            try? await AIMobileSMSInbox.shared.disableAndClear()
             AICloudCredentialSync.invalidateAccountModelCredentials()
             AIAssistantModel.resetForAccountSwitch()
         }

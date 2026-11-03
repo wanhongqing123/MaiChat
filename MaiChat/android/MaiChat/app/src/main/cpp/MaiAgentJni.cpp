@@ -2,6 +2,7 @@
 // 直接依赖：MaiMobileAgent.h、MaiImageFilter.h；实现与这些接口协作。
 #include "MaiMobileAgent.h"
 #include "MaiImageFilter.h"
+#include "MaiPortraitBridge.h"
 #include "MaiAndroidFileOperations.h"
 #ifndef NDEBUG
 #include "MaiDownloadFileTool.h"
@@ -337,7 +338,7 @@ Java_com_kongshang_maichat_DownloadPublishInstrumentedTest_nativePublishNewFile(
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_kongshang_maichat_AIAssistantController_nativeFilterBitmap(
     JNIEnv *env, jclass, jobject bitmap, jstring operation,
-    jintArray dimensions) {
+    jintArray dimensions, jobjectArray portraitMetadata, jbyteArray profileBytes, jbyteArray sourceBytes) {
   if (bitmap == nullptr || operation == nullptr || dimensions == nullptr ||
       env->GetArrayLength(dimensions) < 2)
     return nullptr;
@@ -356,9 +357,32 @@ Java_com_kongshang_maichat_AIAssistantController_nativeFilterBitmap(
     env->ReleaseStringUTFChars(operation, spec);
     return nullptr;
   }
-  MaiImageFilterResult result = maiImageFilterRgba(
-      static_cast<const unsigned char *>(input), static_cast<int>(info.width),
-      static_cast<int>(info.height), static_cast<int>(info.stride), spec);
+  MaiImageFilterResult result{};
+  if (profileBytes && sourceBytes) {
+    auto read = [env](jbyteArray value) {
+      std::string bytes(static_cast<size_t>(env->GetArrayLength(value)), '\0');
+      env->GetByteArrayRegion(value, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<jbyte*>(bytes.data()));
+      return bytes;
+    };
+    const auto profile = read(profileBytes), source = read(sourceBytes);
+    const auto edited = maiPortraitProcessRgba(static_cast<const unsigned char *>(input),
+        static_cast<int>(info.width), static_cast<int>(info.height), static_cast<int>(info.stride),
+        spec, profile.c_str(), source.c_str());
+    result = {edited.rgba, edited.width, edited.height, edited.error};
+    if (edited.metadata) {
+      if (portraitMetadata && env->GetArrayLength(portraitMetadata) > 0) {
+        const auto size = static_cast<jsize>(std::strlen(edited.metadata));
+        jbyteArray metadata = env->NewByteArray(size);
+        env->SetByteArrayRegion(metadata, 0, size, reinterpret_cast<const jbyte*>(edited.metadata));
+        env->SetObjectArrayElement(portraitMetadata, 0, metadata);
+        env->DeleteLocalRef(metadata);
+      }
+      maiPortraitFree(edited.metadata);
+    }
+  } else {
+    result = maiImageFilterRgba(static_cast<const unsigned char *>(input), static_cast<int>(info.width),
+                               static_cast<int>(info.height), static_cast<int>(info.stride), spec);
+  }
   AndroidBitmap_unlockPixels(env, bitmap);
   env->ReleaseStringUTFChars(operation, spec);
   if (result.error != nullptr) {
@@ -380,4 +404,32 @@ Java_com_kongshang_maichat_AIAssistantController_nativeFilterBitmap(
                             reinterpret_cast<const jbyte *>(result.rgba));
   maiImageFilterFree(result.rgba);
   return output;
+}
+
+namespace {
+std::string portraitUtf8(JNIEnv* env, jbyteArray input) {
+  if (!input) return {};
+  std::string result(static_cast<size_t>(env->GetArrayLength(input)), '\0');
+  env->GetByteArrayRegion(input, 0, static_cast<jsize>(result.size()), reinterpret_cast<jbyte*>(result.data()));
+  return result;
+}
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_kongshang_maichat_AIAssistantController_nativeConfigurePortrait(JNIEnv* env,jclass,jbyteArray directory,jbyteArray runtime) {
+  const auto models=portraitUtf8(env,directory),library=portraitUtf8(env,runtime);
+  maiPortraitConfigure(models.c_str(),library.c_str(),nullptr);
+}
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_kongshang_maichat_AIAssistantController_nativePortraitRequest(JNIEnv* env,jclass,jbyteArray directory,jbyteArray request,jbyteArray output,jint action) {
+  const auto profile=portraitUtf8(env,directory),arguments=portraitUtf8(env,request),path=portraitUtf8(env,output);
+  char* response=nullptr;
+  if(action==1)response=maiPortraitOriginalSource(profile.c_str(),arguments.c_str());
+  else if(action==2)response=maiPortraitCommitResult(profile.c_str(),arguments.c_str(),path.c_str());
+  else response=maiPortraitPersonalizationRequest(profile.c_str(),arguments.c_str());
+  if(!response)return nullptr;
+  const auto size=static_cast<jsize>(std::strlen(response));
+  jbyteArray result=env->NewByteArray(size);
+  if(result)env->SetByteArrayRegion(result,0,size,reinterpret_cast<const jbyte*>(response));
+  maiPortraitFree(response);
+  return result;
 }

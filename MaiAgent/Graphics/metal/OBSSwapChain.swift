@@ -38,6 +38,8 @@ class OBSSwapChain {
     private var view: OBSPlatformView?
 
     var colorRange: ColorRange
+    // 播放器显式选择的 HLG 模式不依赖 OBS 全局视频配置，避免独立播放窗口被重置为 SDR。
+    var playerHlgOutput: Bool = false
     var edrHeadroom: CGFloat = 0.0
     let layer: CAMetalLayer
     var renderTarget: MetalTexture?

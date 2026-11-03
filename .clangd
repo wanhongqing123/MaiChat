@@ -1,0 +1,10 @@
+# 子目录可能有旧数据库；统一使用本工作区根目录由真实构建生成的命令。
+CompileFlags:
+  CompilationDatabase: .
+---
+# NDK 默认 GNU C++17，CMake 因此省略 -std；本机 Apple clangd 默认 C++14。
+# 只对 Android C++ 文件补齐项目实际标准，避免 <optional> 被按 C++14 解析。
+If:
+  PathMatch: 'MaiChat/android/.*\.(cpp|cc|cxx|hpp|hh|h)'
+CompileFlags:
+  Add: [-std=gnu++17]

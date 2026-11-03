@@ -82,7 +82,7 @@ public final class MaiChatHostTools {
             return media.execute(tool, arguments);
         if (tool.startsWith("maichat_cloud_drive_"))
             return MaiCloudDriveAgentTools.execute(activity, tool, arguments);
-        if (tool.startsWith("mobile_")) return photos.execute(tool, arguments);
+        if (tool.startsWith("mobile_") || tool.equals("model_continue_training")) return photos.execute(tool, arguments);
         return im.execute(tool, arguments);
     }
 }

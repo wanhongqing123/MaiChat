@@ -4,6 +4,7 @@
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 repo_dir="$(cd "$PROJECT_DIR/../../.." && pwd)"
+python3 "$repo_dir/MaiChat/scripts/fetch-portrait-models.py" --check
 # OpenSSL、FFmpeg、OpenCV 和 MaiAgent 共用稳定的分平台构建目录。
 # Xcode 切换或清理 DerivedData 时，只重做最终归档和 App 链接，不重编第三方源码。
 agent_arch="${ARCHS// /-}"
@@ -104,6 +105,16 @@ if [[ -n "${TARGET_BUILD_DIR:-}" && -n "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}" 
   fi
   cp "$repo_dir/MaiAgent/models/lama_fp32.onnx" "$model_bundle/"
   cp "$repo_dir/MaiAgent/models/LaMa_LICENSE" "$model_bundle/"
+  portrait_bundle="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MaiPortraitModels"
+  mkdir -p "$portrait_bundle"
+  for portrait_file in face_landmarks.onnx selfie_multiclass.onnx person_detection.onnx pose_estimation.onnx MODELS.md LICENSE; do
+    test -f "$repo_dir/MaiChat/Portrait/models/$portrait_file"
+    cp "$repo_dir/MaiChat/Portrait/models/$portrait_file" "$portrait_bundle/"
+  done
+  if [[ "${CONFIGURATION:-}" == Debug ]]; then
+    cp "$repo_dir/MaiAgent/third_party/opencv/samples/data/lena.jpg" \
+      "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/portrait-test-face.jpg"
+  fi
   # iOS 的 OpenSSL libcurl 需要随 App 打包的受信任 CA，不能关闭证书校验。
   cert_bundle="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MaiAgentCertificates"
   mkdir -p "$cert_bundle"

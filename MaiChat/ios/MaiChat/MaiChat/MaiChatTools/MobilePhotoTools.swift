@@ -363,6 +363,9 @@ extension AIMobileHostToolProvider {
         }
         let workspace = URL(fileURLWithPath: workspacePath, isDirectory: true)
             .resolvingSymlinksInPath().standardizedFileURL
+        let portrait = ["beautify", "reshape_body"].contains(Self.string(arguments, key: "operation"))
+        let profileDirectory = workspace.deletingLastPathComponent()
+            .appendingPathComponent("PortraitPreferences", isDirectory: true).path
         do {
             let values = try source.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
             guard values.isRegularFile == true, let size = values.fileSize,
@@ -372,7 +375,19 @@ extension AIMobileHostToolProvider {
             let name = "edited-\(UUID().uuidString).png"
             let target = workspace.appendingPathComponent(name)
             let dimensions = try await Task.detached(priority: .userInitiated) {
-                guard let image = CIImage(contentsOf: source,
+                var original = source
+                if portrait {
+                    let restored = profileDirectory.withCString { profile in
+                        source.path.withCString { maiPortraitOriginalSource(profile, $0) }
+                    }
+                    guard let restored else { throw AIBackendError(message: "无法读取个人修图记录") }
+                    let originalPath = String(cString: restored)
+                    maiPortraitFree(restored)
+                    guard let resolved = AIAssistantPathPolicy.resolve(originalPath, workspacePath: workspacePath)
+                    else { throw AIBackendError(message: "原图不在当前 App 目录内") }
+                    original = resolved
+                }
+                guard let image = CIImage(contentsOf: original,
                                           options: [.applyOrientationProperty: true]) else {
                     throw AIBackendError(message: "无法读取图片")
                 }
@@ -386,11 +401,59 @@ extension AIMobileHostToolProvider {
                 pixels.withUnsafeMutableBytes { bytes in
                     context.render(image, toBitmap: bytes.baseAddress!, rowBytes: width * 4,
                                    bounds: extent, format: .RGBA8,
-                                   colorSpace: CGColorSpaceCreateDeviceRGB())
+                                   colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
                 }
+                var operationToRun = operation
+                if portrait {
+                    var specification = try JSONSerialization.jsonObject(with: Data(operation.utf8)) as! [String: Any]
+                    specification["_face_hints"] = []
+                    if specification["operation"] as? String == "beautify" {
+                        let request = VNDetectFaceLandmarksRequest()
+                        #if targetEnvironment(simulator)
+                        // 模拟器没有设备上的 Vision 加速上下文，定位使用 CPU 版本。
+                        request.usesCPUOnly = true
+                        request.revision = VNDetectFaceLandmarksRequestRevision2
+                        #endif
+                        try VNImageRequestHandler(ciImage: image, options: [:]).perform([request])
+                        specification["_face_hints"] = (request.results ?? []).map { face -> [String: Any] in
+                            let box = face.boundingBox
+                            func point(_ region: VNFaceLandmarkRegion2D?) -> [String: Double]? {
+                                guard let points = region?.normalizedPoints, !points.isEmpty else { return nil }
+                                let x = points.reduce(CGFloat.zero) { $0 + $1.x } / CGFloat(points.count)
+                                let y = points.reduce(CGFloat.zero) { $0 + $1.y } / CGFloat(points.count)
+                                return ["x": Double((box.minX + x * box.width) * CGFloat(width)),
+                                        "y": Double((1 - box.minY - y * box.height) * CGFloat(height))]
+                            }
+                            var landmarks: [String: Any] = [:]
+                            landmarks["left_eye"] = point(face.landmarks?.leftEye)
+                            landmarks["right_eye"] = point(face.landmarks?.rightEye)
+                            return ["box": ["x": Double(box.minX * CGFloat(width)),
+                                            "y": Double((1 - box.maxY) * CGFloat(height)),
+                                            "width": Double(box.width * CGFloat(width)),
+                                            "height": Double(box.height * CGFloat(height))],
+                                    "landmarks": landmarks]
+                        }
+                    }
+                    operationToRun = String(data: try JSONSerialization.data(withJSONObject: specification), encoding: .utf8)!
+                }
+                var portraitMetadata: String?
                 let result = pixels.withUnsafeBytes { bytes in
-                    operation.withCString { spec in
-                        maiImageFilterRgba(bytes.bindMemory(to: UInt8.self).baseAddress,
+                    operationToRun.withCString { spec in
+                        if portrait {
+                            let edited = profileDirectory.withCString { profile in
+                                original.path.withCString { path in
+                                    maiPortraitProcessRgba(bytes.bindMemory(to: UInt8.self).baseAddress,
+                                        Int32(width), Int32(height), Int32(width * 4), spec, profile, path)
+                                }
+                            }
+                            if let metadata = edited.metadata {
+                                portraitMetadata = String(cString: metadata)
+                                maiPortraitFree(metadata)
+                            }
+                            return MaiImageFilterResult(rgba: edited.rgba, width: edited.width,
+                                                        height: edited.height, error: edited.error)
+                        }
+                        return maiImageFilterRgba(bytes.bindMemory(to: UInt8.self).baseAddress,
                                            Int32(width), Int32(height), Int32(width * 4), spec)
                     }
                 }
@@ -409,8 +472,8 @@ extension AIMobileHostToolProvider {
                       let image = CGImage(
                         width: resultWidth, height: resultHeight, bitsPerComponent: 8,
                         bitsPerPixel: 32, bytesPerRow: resultWidth * 4,
-                        space: CGColorSpaceCreateDeviceRGB(),
-                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue)
                             .union(.byteOrder32Big),
                         provider: provider, decode: nil, shouldInterpolate: true,
                         intent: .defaultIntent),
@@ -423,15 +486,68 @@ extension AIMobileHostToolProvider {
                     try? FileManager.default.removeItem(at: target)
                     throw AIBackendError(message: "无法写入处理结果")
                 }
-                return (resultWidth, resultHeight)
+                var receipt: String?
+                if let portraitMetadata {
+                    let registered = profileDirectory.withCString { profile in
+                        portraitMetadata.withCString { metadata in
+                            target.path.withCString { maiPortraitCommitResult(profile, metadata, $0) }
+                        }
+                    }
+                    guard let registered else { throw AIBackendError(message: "无法保存个人修图记录") }
+                    receipt = String(cString: registered)
+                    maiPortraitFree(registered)
+                }
+                return (resultWidth, resultHeight, receipt)
             }.value
-            return Self.jsonSuccess([
+            guard workspacePath == AIAssistantModel.shared.workspacePath else {
+                return .failure(code: "canceled", message: "Account workspace changed during portrait processing")
+            }
+            var response: [String: Any] = [
                 "path": name, "mime_type": "image/png", "width": dimensions.0,
                 "height": dimensions.1, "next_tool": "mobile_preview_image",
-            ])
+            ]
+            if let receipt = dimensions.2,
+               let envelope = try JSONSerialization.jsonObject(with: Data(receipt.utf8)) as? [String: Any] {
+                guard envelope["ok"] as? Bool == true else {
+                    return .failure(code: "invalid_input", message: envelope["error"] as? String ?? "Portrait registration failed")
+                }
+                if let detail = envelope["output"] as? [String: Any] {
+                    response.merge(detail) { _, new in new }
+                }
+            }
+            return Self.jsonSuccess(response)
         } catch {
             return .failure(code: "internal", message: error.localizedDescription)
         }
+    }
+
+    /// 当前账号的修图反馈和有界个人模型训练；只在后台执行普通 C++ 服务。
+    func portraitPersonalization(_ arguments: [String: Any], feedback: Bool = false) async -> AIMaiChatHostToolExecution {
+        let workspace = AIAssistantModel.shared.workspacePath
+        guard !workspace.isEmpty else { return .failure(code: "not_configured", message: "Current account workspace is unavailable") }
+        let profile = URL(fileURLWithPath: workspace).deletingLastPathComponent()
+            .appendingPathComponent("PortraitPreferences", isDirectory: true).path
+        var request = arguments
+        if feedback { request["action"] = "record_feedback" }
+        do {
+            let encoded = String(data: try JSONSerialization.data(withJSONObject: request), encoding: .utf8)!
+            let response = try await Task.detached(priority: .utility) {
+                let result = profile.withCString { directory in
+                    encoded.withCString { maiPortraitPersonalizationRequest(directory, $0) }
+                }
+                guard let result else { throw AIBackendError(message: "个人模型服务没有返回结果") }
+                defer { maiPortraitFree(result) }
+                return String(cString: result)
+            }.value
+            guard workspace == AIAssistantModel.shared.workspacePath else {
+                return .failure(code: "canceled", message: "Account workspace changed during personalization")
+            }
+            let envelope = try JSONSerialization.jsonObject(with: Data(response.utf8)) as! [String: Any]
+            guard envelope["ok"] as? Bool == true else {
+                return .failure(code: "invalid_input", message: envelope["error"] as? String ?? "Personalization failed")
+            }
+            return Self.jsonSuccess(envelope["output"] as? [String: Any] ?? [:])
+        } catch { return .failure(code: "internal", message: error.localizedDescription) }
     }
 
     func addPhotosToAlbum(_ arguments: [String: Any]) async -> AIMaiChatHostToolExecution {

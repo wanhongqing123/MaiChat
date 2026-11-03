@@ -15,21 +15,22 @@
 #include <QColorSpace>
 #include <QCryptographicHash>
 #include <QDir>
-#include <QDialog>
-#include <QDialogButtonBox>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
 #include <QFutureWatcher>
 #include <QHBoxLayout>
-#include <QHash>
 #include <QImage>
 #include <QImageReader>
 #include <QJsonDocument>
 #include <QLabel>
+#include <QKeyEvent>
+#include <QMouseEvent>
 #include <QProgressBar>
 #include <QPalette>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPointer>
 #include <QPixmap>
 #include <QResource>
@@ -41,11 +42,9 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QUuid>
-#include <QTreeWidget>
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrentRun>
 
-#include <atomic>
 
 static QByteArray cloudDriveTrustedRoots(const DesktopVideoCircleAccess& access) {
     if (!access.caPem.isEmpty()) return access.caPem;
@@ -59,6 +58,82 @@ namespace {
 constexpr quint64 kMaxVideoBytes = 2'000'000'000ULL;
 constexpr quint64 kMaxImageBytes = 20'000'000ULL;
 constexpr quint64 kMaxThumbnailBytes = 5'000'000ULL;
+
+// 文件行负责双击和键盘打开；子按钮继续独立处理下载、删除，避免单击误开媒体。
+class CloudMediaRow final : public QFrame {
+public:
+    CloudMediaRow(std::function<void()> open, QWidget* parent)
+        : QFrame(parent), open_(std::move(open)) {
+        setFocusPolicy(Qt::StrongFocus);
+    }
+
+protected:
+    void mouseDoubleClickEvent(QMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton) {
+            event->accept();
+            open_();
+        } else {
+            QFrame::mouseDoubleClickEvent(event);
+        }
+    }
+
+    void keyPressEvent(QKeyEvent* event) override {
+        if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+            event->accept();
+            open_();
+        } else {
+            QFrame::keyPressEvent(event);
+        }
+    }
+
+private:
+    std::function<void()> open_;
+};
+
+// 沿用桌面 Tabler 的 24px 线条网格，避免平台图标把下载画成软盘、删除画成浅色表情。
+QIcon cloudActionIcon(QStyle::StandardPixmap action) {
+    QPixmap pixels(48, 48);
+    pixels.setDevicePixelRatio(2);
+    pixels.fill(Qt::transparent);
+    QPainter painter(&pixels);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(QColor(QStringLiteral("#0b67b7")), 1.8, Qt::SolidLine,
+                        Qt::RoundCap, Qt::RoundJoin));
+    QPainterPath path;
+    if (action == QStyle::SP_TrashIcon) {
+        path.moveTo(4, 6); path.lineTo(20, 6);
+        path.moveTo(8, 6); path.lineTo(8, 3); path.lineTo(16, 3); path.lineTo(16, 6);
+        path.moveTo(6, 6); path.lineTo(7, 21); path.lineTo(17, 21); path.lineTo(18, 6);
+        path.moveTo(10, 10); path.lineTo(10, 17);
+        path.moveTo(14, 10); path.lineTo(14, 17);
+    } else if (action == QStyle::SP_DialogSaveButton) {
+        path.moveTo(12, 3); path.lineTo(12, 16);
+        path.moveTo(7, 11); path.lineTo(12, 16); path.lineTo(17, 11);
+        path.moveTo(4, 16); path.lineTo(4, 21); path.lineTo(20, 21); path.lineTo(20, 16);
+    } else if (action == QStyle::SP_ArrowUp) {
+        path.moveTo(6, 11); path.lineTo(12, 5); path.lineTo(18, 11);
+        path.moveTo(12, 5); path.lineTo(12, 20);
+    } else if (action == QStyle::SP_BrowserReload) {
+        painter.drawArc(QRectF(4, 4, 16, 16), 40 * 16, 280 * 16);
+        path.moveTo(19, 4); path.lineTo(19, 10); path.lineTo(13, 10);
+    } else {
+        path.moveTo(3, 7); path.lineTo(3, 4); path.lineTo(9, 4); path.lineTo(12, 7);
+        path.lineTo(21, 7); path.lineTo(21, 20); path.lineTo(3, 20); path.closeSubpath();
+    }
+    painter.drawPath(path);
+    return QIcon(pixels);
+}
+
+// 图标保留明确的悬停和无障碍名称，文件列表不再重复铺满操作文字。
+void iconAction(QPushButton* button, QStyle::StandardPixmap icon, const QString& name) {
+    button->setText({});
+    button->setIcon(cloudActionIcon(icon));
+    button->setIconSize(QSize(20, 20));
+    button->setStyleSheet(QStringLiteral("padding:0;"));
+    button->setToolTip(name);
+    button->setAccessibleName(name);
+    button->setFixedSize(34, 34);
+}
 
 QString errorText(int status, long http) {
     if (http == 401) return QStringLiteral("登录已过期，请重新登录。");
@@ -121,18 +196,6 @@ QScrollArea* makeScroll(QVBoxLayout** rows, QWidget* parent) {
     (*rows)->setAlignment(Qt::AlignTop);
     scroll->setWidget(content);
     return scroll;
-}
-
-struct ProgressState {
-    std::atomic<quint64> uploaded{0};
-    std::atomic<quint64> total{0};
-};
-
-int uploadProgress(uint64_t uploaded, uint64_t total, void* context) {
-    auto* state = static_cast<ProgressState*>(context);
-    state->uploaded.store(uploaded, std::memory_order_relaxed);
-    state->total.store(total, std::memory_order_relaxed);
-    return 0;
 }
 
 QImage decodeCloudImage(const QString& path, int maxWidth, int maxHeight) {
@@ -269,7 +332,8 @@ CloudDriveDialog::CloudDriveDialog(AccessProvider access, AccountIdProvider acco
     newFolderButton_->setObjectName(QStringLiteral("cloudDriveNewFolder"));
     connect(newFolderButton_, &QPushButton::clicked, this, &CloudDriveDialog::createFolder);
     header->addWidget(newFolderButton_);
-    uploadButton_ = new QPushButton(QStringLiteral("上传图片或视频"), this);
+    uploadButton_ = new QPushButton(QStringLiteral("上传"), this);
+    uploadButton_->setToolTip(QStringLiteral("上传图片或视频：图片最多 20 MB，视频最多 2 GB"));
     uploadButton_->setObjectName(QStringLiteral("cloudDriveUpload"));
     connect(uploadButton_, &QPushButton::clicked, this, [this] {
         const QString file = QFileDialog::getOpenFileName(this, QStringLiteral("选择图片或视频"), {},
@@ -285,16 +349,10 @@ CloudDriveDialog::CloudDriveDialog(AccessProvider access, AccountIdProvider acco
 
     auto* quotaCard = new QFrame(this);
     quotaCard->setObjectName(QStringLiteral("cloudDriveQuotaCard"));
-    quotaCard->setStyleSheet(QStringLiteral(
-        "QFrame#cloudDriveQuotaCard{background:#f7fbfe;border:1px solid #e1edf6;"
-        "border-radius:12px;}"));
     auto* quotaLayout = new QVBoxLayout(quotaCard);
-    quotaLayout->setContentsMargins(16, 14, 16, 14);
-    quotaLayout->setSpacing(9);
+    quotaLayout->setContentsMargins(0, 0, 0, 0);
+    quotaLayout->setSpacing(5);
     auto* quotaHeading = new QHBoxLayout;
-    auto* quotaTitle = new QLabel(QStringLiteral("我的空间"), quotaCard);
-    quotaTitle->setStyleSheet(QStringLiteral("color:#172033;font-weight:650;"));
-    quotaHeading->addWidget(quotaTitle);
     quotaHeading->addStretch();
     quota_ = new QLabel(QStringLiteral("正在读取空间…"), quotaCard);
     quota_->setObjectName(QStringLiteral("cloudDriveQuota"));
@@ -308,9 +366,7 @@ CloudDriveDialog::CloudDriveDialog(AccessProvider access, AccountIdProvider acco
     quotaBar_->setTextVisible(false);
     quotaBar_->setFixedHeight(8);
     quotaLayout->addWidget(quotaBar_);
-    quotaCaption_ = new QLabel(QStringLiteral("仅自己可见 · 视频最多 2 GB · 图片最多 20 MB"), quotaCard);
-    quotaCaption_->setStyleSheet(QStringLiteral("color:#667085;font-size:12px;"));
-    quotaLayout->addWidget(quotaCaption_);
+    // 空间仅保留用量和进度；上传限制在入口悬停时说明，不再占一整张说明卡。
     root->addWidget(quotaCard);
     uploadScroll_ = makeScroll(&uploadRows_, this);
     // 待续传仅在有真实任务时占位；空区域不再把文件列表向下推，也无需重复分区标题。
@@ -320,10 +376,12 @@ CloudDriveDialog::CloudDriveDialog(AccessProvider access, AccountIdProvider acco
     navigation->setSpacing(6);
     rootFolderButton_ = new QPushButton(QStringLiteral("根目录"), this);
     rootFolderButton_->setObjectName(QStringLiteral("cloudDriveRootFolder"));
+    iconAction(rootFolderButton_, QStyle::SP_DirHomeIcon, QStringLiteral("根目录"));
     connect(rootFolderButton_, &QPushButton::clicked, this, [this] { navigateToFolder({}); });
     navigation->addWidget(rootFolderButton_);
     parentFolderButton_ = new QPushButton(QStringLiteral("上一级"), this);
     parentFolderButton_->setObjectName(QStringLiteral("cloudDriveParentFolder"));
+    iconAction(parentFolderButton_, QStyle::SP_ArrowUp, QStringLiteral("上一级"));
     connect(parentFolderButton_, &QPushButton::clicked, this, [this] {
         for (const auto& value : folders_) {
             const QJsonObject folder = value.toObject();
@@ -342,6 +400,7 @@ CloudDriveDialog::CloudDriveDialog(AccessProvider access, AccountIdProvider acco
     navigation->addWidget(folderPath_, 1);
     refreshButton_ = new QPushButton(QStringLiteral("刷新"), this);
     refreshButton_->setObjectName(QStringLiteral("cloudDriveRefresh"));
+    iconAction(refreshButton_, QStyle::SP_BrowserReload, QStringLiteral("刷新"));
     connect(refreshButton_, &QPushButton::clicked, this, [this] { refresh(); });
     navigation->addWidget(refreshButton_);
     root->addLayout(navigation);
@@ -350,25 +409,14 @@ CloudDriveDialog::CloudDriveDialog(AccessProvider access, AccountIdProvider acco
     moreButton_->setObjectName(QStringLiteral("cloudDriveMore"));
     connect(moreButton_, &QPushButton::clicked, this, [this] { refresh(true); });
     root->addWidget(moreButton_, 0, Qt::AlignHCenter);
-    progress_ = new QProgressBar(this);
-    progress_->setObjectName(QStringLiteral("cloudDriveProgress"));
-    progress_->setRange(0, 100);
-    progress_->hide();
-    root->addWidget(progress_);
-    auto* statusRow = new QHBoxLayout;
-    status_ = new QLabel(this);
-    status_->setObjectName(QStringLiteral("cloudDriveStatus"));
-    status_->setWordWrap(true);
-    statusRow->addWidget(status_, 1);
-    pauseButton_ = new QPushButton(QStringLiteral("暂停"), this);
-    pauseButton_->setObjectName(QStringLiteral("cloudDrivePause"));
-    pauseButton_->hide();
-    connect(pauseButton_, &QPushButton::clicked, this, &CloudDriveDialog::cancelPending);
-    statusRow->addWidget(pauseButton_);
-    root->addLayout(statusRow);
+    // 列表只保留内容；请求继续由取消句柄管理，不再放进度条、状态文字或通用暂停按钮。
 }
 
 CloudDriveDialog::~CloudDriveDialog() { cancelPending(); }
+
+void CloudDriveDialog::setErrorHandler(std::function<void(const QString&)> handler) {
+    errorHandler_ = std::move(handler);
+}
 
 bool CloudDriveDialog::sameAccount() const {
     return !openedAccountId_.isEmpty() && accountIdProvider_ && accessProvider_ &&
@@ -460,9 +508,8 @@ void CloudDriveDialog::closeEvent(QCloseEvent* event) {
 }
 
 void CloudDriveDialog::setStatus(const QString& message, bool error) {
-    status_->setText(message);
-    status_->setStyleSheet(error ? QStringLiteral("color:#c62b36;")
-                                 : QStringLiteral("color:#667085;"));
+    setProperty("cloudDriveError", error ? message : QString());
+    if (error && !message.isEmpty() && errorHandler_) errorHandler_(message);
 }
 
 void CloudDriveDialog::setBusy(bool busy, const QString& message) {
@@ -475,21 +522,14 @@ void CloudDriveDialog::setBusy(bool busy, const QString& message) {
     moreButton_->setEnabled(!busy && !nextCursor_.isEmpty());
     for (const QString& name : {QStringLiteral("cloudDriveResume"),
                                 QStringLiteral("cloudDriveDiscard"),
-                                QStringLiteral("cloudDrivePlay"),
-                                QStringLiteral("cloudDriveViewImage"),
+                                QStringLiteral("cloudDriveSaveVideo"),
                                 QStringLiteral("cloudDriveDelete"),
-                                QStringLiteral("cloudDriveRenameMedia"),
-                                QStringLiteral("cloudDriveMoveMedia"),
                                 QStringLiteral("cloudDriveFolderOpen"),
-                                QStringLiteral("cloudDriveFolderRename"),
-                                QStringLiteral("cloudDriveFolderMove"),
                                 QStringLiteral("cloudDriveFolderDelete")}) {
         for (QPushButton* action : findChildren<QPushButton*>(name))
             action->setEnabled(!busy);
     }
-    pauseButton_->setVisible(busy);
-    progress_->setVisible(busy);
-    if (!busy) progress_->setRange(0, 100);
+    setCursor(busy ? Qt::WaitCursor : Qt::ArrowCursor);
     if (!message.isEmpty()) setStatus(message);
 }
 
@@ -586,9 +626,8 @@ void CloudDriveDialog::refresh(bool append) {
         const quint64 limit = quint64(quota.value(QStringLiteral("limit_bytes")).toDouble());
         quota_->setText(QStringLiteral("已使用 %1 / %2")
             .arg(humanSize(used), humanSize(limit)));
-        quotaCaption_->setText(reserved ?
-            QStringLiteral("上传中预留 %1").arg(humanSize(reserved)) :
-            QStringLiteral("仅自己可见 · 视频最多 2 GB · 图片最多 20 MB"));
+        quota_->setToolTip(reserved ?
+            QStringLiteral("上传中预留 %1").arg(humanSize(reserved)) : QString());
         const quint64 occupied = qMin(limit, used + reserved);
         quotaBar_->setValue(limit == 0 ? 0 :
             occupied == 0 ? 0 : qMax(1, int((occupied * 1000) / limit)));
@@ -674,83 +713,12 @@ void CloudDriveDialog::createFolder() {
         {{QStringLiteral("name"), name}, {QStringLiteral("parent_id"), currentFolderId_}});
 }
 
-void CloudDriveDialog::renameFolder(const QString& folderId, const QString& name) {
-    if (busy_ || !sameAccount()) return;
-    AppTextInputDialog::Options options;
-    options.title = QStringLiteral("重命名文件夹");
-    options.initialText = name;
-    options.placeholder = QStringLiteral("文件夹名称");
-    bool accepted = false;
-    const QString renamed = AppTextInputDialog::getText(this, options, &accepted).trimmed();
-    if (!accepted || renamed == name) return;
-    if (renamed.isEmpty()) { setStatus(QStringLiteral("请输入文件夹名称。"), true); return; }
-    mutateFolder(MAI_CLOUD_DRIVE_UPDATE_FOLDER,
-        {{QStringLiteral("folder_id"), folderId}, {QStringLiteral("name"), renamed}});
-}
-
 void CloudDriveDialog::deleteFolder(const QString& folderId, const QString& name) {
     if (busy_ || !sameAccount()) return;
     if (!AppMessageDialog::confirm(this, QStringLiteral("删除文件夹"),
         QStringLiteral("删除“%1”？只能删除空文件夹，其中的文件不会被删除。")
             .arg(name), QStringLiteral("删除"), true)) return;
     mutateFolder(MAI_CLOUD_DRIVE_DELETE_FOLDER, {{QStringLiteral("folder_id"), folderId}});
-}
-
-void CloudDriveDialog::moveItem(const QString& itemId, const QString& name, bool folder) {
-    if (busy_ || !sameAccount()) return;
-    QDialog selection(this);
-    selection.setObjectName(QStringLiteral("cloudDriveMoveDialog"));
-    selection.setWindowTitle(QStringLiteral("移动到文件夹"));
-    selection.resize(470, 430);
-    auto* layout = new QVBoxLayout(&selection);
-    auto* prompt = new QLabel(QStringLiteral("将“%1”移动到：").arg(name), &selection);
-    prompt->setWordWrap(true);
-    layout->addWidget(prompt);
-    auto* tree = new QTreeWidget(&selection);
-    tree->setObjectName(QStringLiteral("cloudDriveMoveTree"));
-    tree->setHeaderHidden(true);
-    auto* root = new QTreeWidgetItem(tree, {QStringLiteral("我的云盘")});
-    root->setData(0, Qt::UserRole, QString());
-    root->setIcon(0, style()->standardIcon(QStyle::SP_DirIcon));
-    QHash<QString, QTreeWidgetItem*> items;
-    items.insert(QString(), root);
-    QJsonArray remaining = folders_;
-    while (!remaining.isEmpty()) {
-        QJsonArray next;
-        bool added = false;
-        for (const auto& value : remaining) {
-            const QJsonObject entry = value.toObject();
-            const QString id = entry.value(QStringLiteral("id")).toString();
-            const QString parentId = entry.value(QStringLiteral("parent_id")).toString();
-            if (folder && id == itemId) continue;
-            if (!items.contains(parentId)) { next.append(value); continue; }
-            auto* item = new QTreeWidgetItem(items.value(parentId),
-                {entry.value(QStringLiteral("name")).toString()});
-            item->setData(0, Qt::UserRole, id);
-            item->setIcon(0, style()->standardIcon(QStyle::SP_DirIcon));
-            items.insert(id, item);
-            added = true;
-        }
-        if (!added) break; // Excludes descendants of the folder being moved.
-        remaining = next;
-    }
-    tree->expandAll();
-    tree->setCurrentItem(items.value(currentFolderId_, root));
-    layout->addWidget(tree, 1);
-    auto* buttons = new QDialogButtonBox(&selection);
-    auto* cancel = buttons->addButton(QStringLiteral("取消"), QDialogButtonBox::RejectRole);
-    cancel->setObjectName(QStringLiteral("cloudDriveMoveCancel"));
-    auto* move = buttons->addButton(QStringLiteral("移动"), QDialogButtonBox::AcceptRole);
-    move->setObjectName(QStringLiteral("cloudDriveMoveConfirm"));
-    connect(buttons, &QDialogButtonBox::accepted, &selection, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &selection, &QDialog::reject);
-    layout->addWidget(buttons);
-    if (selection.exec() != QDialog::Accepted || !tree->currentItem()) return;
-    const QString destination = tree->currentItem()->data(0, Qt::UserRole).toString();
-    if (destination == currentFolderId_) return;
-    mutateFolder(folder ? MAI_CLOUD_DRIVE_UPDATE_FOLDER : MAI_CLOUD_DRIVE_MOVE_MEDIA,
-        {{folder ? QStringLiteral("folder_id") : QStringLiteral("media_id"), itemId},
-         {folder ? QStringLiteral("parent_id") : QStringLiteral("folder_id"), destination}});
 }
 
 void CloudDriveDialog::mutateFolder(int action, const QJsonObject& payload) {
@@ -793,23 +761,16 @@ void CloudDriveDialog::renderFolders() {
         auto* layout = new QHBoxLayout(row);
         auto* open = new QPushButton(name, row);
         open->setObjectName(QStringLiteral("cloudDriveFolderOpen"));
-        open->setIcon(style()->standardIcon(QStyle::SP_DirIcon));
+        open->setIcon(cloudActionIcon(QStyle::SP_DirIcon));
         open->setToolTip(name);
         open->setMinimumWidth(0);
         open->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
         open->setStyleSheet(QStringLiteral("text-align:left;font-weight:600;background:transparent;"));
         connect(open, &QPushButton::clicked, this, [this, id] { navigateToFolder(id); });
         layout->addWidget(open, 1);
-        auto* rename = new QPushButton(QStringLiteral("改名"), row);
-        rename->setObjectName(QStringLiteral("cloudDriveFolderRename"));
-        connect(rename, &QPushButton::clicked, this, [this, id, name] { renameFolder(id, name); });
-        layout->addWidget(rename);
-        auto* move = new QPushButton(QStringLiteral("移动"), row);
-        move->setObjectName(QStringLiteral("cloudDriveFolderMove"));
-        connect(move, &QPushButton::clicked, this, [this, id, name] { moveItem(id, name, true); });
-        layout->addWidget(move);
         auto* remove = new QPushButton(QStringLiteral("删除"), row);
         remove->setObjectName(QStringLiteral("cloudDriveFolderDelete"));
+        iconAction(remove, QStyle::SP_TrashIcon, QStringLiteral("删除文件夹"));
         connect(remove, &QPushButton::clicked, this, [this, id, name] { deleteFolder(id, name); });
         layout->addWidget(remove);
         videoRows_->addWidget(row);
@@ -903,10 +864,6 @@ void CloudDriveDialog::renderVideos(const QJsonArray& videos, bool append) {
         title->setAlignment(Qt::AlignCenter);
         title->setStyleSheet(QStringLiteral("color:#172033;font-size:17px;font-weight:650;"));
         layout->addWidget(title);
-        auto* detail = new QLabel(QStringLiteral("图片最多 20 MB，视频最多 2 GB"), empty);
-        detail->setAlignment(Qt::AlignCenter);
-        detail->setStyleSheet(QStringLiteral("color:#667085;font-size:13px;"));
-        layout->addWidget(detail);
         layout->addStretch();
         videoRows_->addWidget(empty);
     }
@@ -918,7 +875,14 @@ void CloudDriveDialog::renderVideos(const QJsonArray& videos, bool append) {
             QStringLiteral("image") ||
             video.value(QStringLiteral("content_type")).toString().startsWith(
                 QStringLiteral("image/"));
-        auto* row = new QFrame(this);
+        auto* row = new CloudMediaRow([this, id, name, image] {
+            if (image) startImagePreview(id);
+            else startPlayback(id, name);
+        }, this);
+        row->setObjectName(QStringLiteral("cloudDriveMediaRow"));
+        row->setProperty("mediaId", id);
+        row->setProperty("mediaType", image ? QStringLiteral("image") : QStringLiteral("video"));
+        row->setAccessibleName(name);
         row->setMinimumHeight(82);
         row->setMaximumHeight(88);
         row->setStyleSheet(QStringLiteral("QFrame{background:#fff;border:1px solid #e6ebf1;border-radius:9px;}"
@@ -938,39 +902,22 @@ void CloudDriveDialog::renderVideos(const QJsonArray& videos, bool append) {
         title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
         title->setStyleSheet(QStringLiteral("font-weight:600;"));
         labels->addWidget(title);
-        auto* size = new QLabel((image ? QStringLiteral("图片 · ") :
-            QStringLiteral("视频 · ")) +
+        auto* size = new QLabel(
             humanSize(quint64(video.value(QStringLiteral("size_bytes")).toDouble())), row);
         size->setStyleSheet(QStringLiteral("color:#667085;"));
         labels->addWidget(size);
         layout->addLayout(labels, 1);
-        auto* open = new QPushButton(image ? QStringLiteral("查看") : QStringLiteral("播放"), row);
-        open->setObjectName(image ? QStringLiteral("cloudDriveViewImage") :
-                                    QStringLiteral("cloudDrivePlay"));
-        connect(open, &QPushButton::clicked, this, [this, id, name, image] {
-            if (image) startImagePreview(id);
-            else startPlayback(id, name);
-        });
-        layout->addWidget(open);
         if (!image) {
             auto* save = new QPushButton(QStringLiteral("保存"), row);
             save->setObjectName(QStringLiteral("cloudDriveSaveVideo"));
+            iconAction(save, QStyle::SP_DialogSaveButton, QStringLiteral("下载视频"));
             connect(save, &QPushButton::clicked, this,
                     [this, id, name] { saveVideo(id, name); });
             layout->addWidget(save);
         }
-        auto* rename = new QPushButton(QStringLiteral("改名"), row);
-        rename->setObjectName(QStringLiteral("cloudDriveRenameMedia"));
-        connect(rename, &QPushButton::clicked, this,
-                [this, id, name] { renameMedia(id, name); });
-        layout->addWidget(rename);
-        auto* move = new QPushButton(QStringLiteral("移动"), row);
-        move->setObjectName(QStringLiteral("cloudDriveMoveMedia"));
-        connect(move, &QPushButton::clicked, this,
-                [this, id, name] { moveItem(id, name, false); });
-        layout->addWidget(move);
         auto* remove = new QPushButton(QStringLiteral("删除"), row);
         remove->setObjectName(QStringLiteral("cloudDriveDelete"));
+        iconAction(remove, QStyle::SP_TrashIcon, QStringLiteral("删除文件"));
         connect(remove, &QPushButton::clicked, this,
                 [this, id, name] { deleteVideo(id, name); });
         layout->addWidget(remove);
@@ -1013,33 +960,15 @@ void CloudDriveDialog::startUpload(const QString& sourcePath,
     const QString uploadFolderId = currentFolderId_;
     const auto cancel = std::shared_ptr<MaiCloudDriveCancel>(
         mai_cloud_drive_cancel_create(), mai_cloud_drive_cancel_destroy);
-    const auto progressState = std::make_shared<ProgressState>();
     requestCancel_ = cancel;
     const unsigned generation = ++generation_;
     setBusy(true, image ? QStringLiteral("正在校验图片并上传…") :
                           QStringLiteral("正在校验视频并上传…"));
-    progress_->setValue(0);
-    auto* timer = new QTimer(this);
-    timer->setInterval(150);
-    connect(timer, &QTimer::timeout, this, [this, progressState, generation] {
-        if (generation != generation_) return;
-        const quint64 total = progressState->total.load(std::memory_order_relaxed);
-        const quint64 done = progressState->uploaded.load(std::memory_order_relaxed);
-        if (total) {
-            progress_->setRange(0, 100);
-            progress_->setValue(int((done * 100) / total));
-            setStatus(QStringLiteral("已上传 %1 / %2")
-                .arg(humanSize(done), humanSize(total)));
-        }
-    });
-    timer->start();
     auto* watcher = new QFutureWatcher<Reply>(this);
     connect(watcher, &QFutureWatcher<Reply>::finished, this,
-            [this, watcher, timer, generation] {
+            [this, watcher, generation] {
         const Reply reply = watcher->result();
         watcher->deleteLater();
-        timer->stop();
-        timer->deleteLater();
         if (generation != generation_) return;
         requestCancel_.reset();
         setBusy(false);
@@ -1057,7 +986,7 @@ void CloudDriveDialog::startUpload(const QString& sourcePath,
     const QByteArray contentType(media.content_type_utf8);
     watcher->setFuture(QtConcurrent::run([access, sourcePath, checkpoint, name, contentType,
                                          uploadFolderId,
-                                         cancel, progressState] {
+                                         cancel] {
         Reply reply;
         const QByteArray base = access.authBaseUrl.toUtf8();
         const QByteArray token = access.accountToken.toUtf8();
@@ -1076,8 +1005,8 @@ void CloudDriveDialog::startUpload(const QString& sourcePath,
         options.signed_upload_host_suffix_utf8 = host.isEmpty() ? nullptr : host.constData();
         MaiCloudDriveResult result{};
         mai_cloud_drive_upload_resumable(&options, source.constData(), task.constData(),
-            display.constData(), contentType.constData(), cancel.get(), uploadProgress,
-            progressState.get(), &result);
+            display.constData(), contentType.constData(), cancel.get(), nullptr,
+            nullptr, &result);
         reply.status = result.status;
         reply.http = result.http_status;
         if (result.response_json_utf8)
@@ -1115,7 +1044,6 @@ void CloudDriveDialog::startPlayback(const QString& videoId, const QString& name
     vodCancel_ = vodCancel;
     const unsigned generation = ++generation_;
     setBusy(true, QStringLiteral("正在连接视频，获取开头片段…"));
-    progress_->setRange(0, 0);
     auto* watcher = new QFutureWatcher<Reply>(this);
     connect(watcher, &QFutureWatcher<Reply>::finished, this,
             [this, watcher, generation, name] {
@@ -1170,7 +1098,6 @@ void CloudDriveDialog::saveVideo(const QString& videoId, const QString& name) {
     downloadCancel_ = downloadCancel;
     const unsigned generation = ++generation_;
     setBusy(true, QStringLiteral("正在保存云盘视频…"));
-    progress_->setRange(0, 0);
     auto* watcher = new QFutureWatcher<Reply>(this);
     connect(watcher, &QFutureWatcher<Reply>::finished, this,
             [this, watcher, generation, target] {
@@ -1235,7 +1162,6 @@ void CloudDriveDialog::startImagePreview(const QString& mediaId) {
     downloadCancel_ = downloadCancel;
     const unsigned generation = ++generation_;
     setBusy(true, QStringLiteral("正在打开图片…"));
-    progress_->setRange(0, 0);
     auto* watcher = new QFutureWatcher<ImageReply>(this);
     connect(watcher, &QFutureWatcher<ImageReply>::finished, this,
             [this, watcher, generation] {
@@ -1278,28 +1204,6 @@ void CloudDriveDialog::startImagePreview(const QString& mediaId) {
         QFile::remove(target);
         return image;
     }));
-}
-
-void CloudDriveDialog::renameMedia(const QString& mediaId, const QString& name) {
-    if (busy_ || !sameAccount()) return;
-    AppTextInputDialog::Options options;
-    options.title = QStringLiteral("重命名文件");
-    options.initialText = name;
-    options.placeholder = QStringLiteral("完整文件名");
-    const QString extension = QFileInfo(name).suffix();
-    options.description = QStringLiteral("请保留文件扩展名 .%1").arg(extension);
-    bool accepted = false;
-    const QString renamed = AppTextInputDialog::getText(this, options, &accepted).trimmed();
-    if (!accepted || renamed == name) return;
-    const QByteArray encoded = renamed.toUtf8();
-    if (!mai_cloud_drive_folder_name_valid(encoded.constData()) ||
-        QFileInfo(renamed).suffix().compare(extension, Qt::CaseInsensitive) != 0) {
-        setStatus(QStringLiteral("请使用有效的完整文件名，并保留扩展名 .%1。")
-            .arg(extension), true);
-        return;
-    }
-    mutateFolder(MAI_CLOUD_DRIVE_RENAME_MEDIA,
-        {{QStringLiteral("media_id"), mediaId}, {QStringLiteral("name"), renamed}});
 }
 
 void CloudDriveDialog::deleteVideo(const QString& videoId, const QString& name) {

@@ -632,185 +632,6 @@ struct ChatView: View {
     }
 }
 
-#if targetEnvironment(simulator)
-@MainActor
-struct GroupChatUITestRoot: View {
-    @StateObject private var appState: RemoteIMAppState
-
-    init() {
-        let state = RemoteIMAppState(loadedSettings: StoredRemoteIMSettings(
-            sdkAppID: nil, masterUserID: "sim-group-owner",
-            contacts: [], reconnectOnLaunch: false
-        ))
-        state.configureGroupUITestFixture()
-        _appState = StateObject(wrappedValue: state)
-    }
-
-    var body: some View {
-        RootView()
-            .environmentObject(appState)
-            .overlay(alignment: .topLeading) {
-                VStack(spacing: 5) {
-                    Button("退群") {
-                        guard let groupID = appState.selectedGroupID ?? appState.groups.first?.groupID
-                        else { return }
-                        appState.dropGroupForUITest(groupID: groupID)
-                    }
-                    .accessibilityIdentifier("fixture-drop-group")
-                    Button("切号") { appState.switchOwnerForUITest() }
-                        .accessibilityIdentifier("fixture-switch-owner")
-                }
-                .font(.system(size: 11, weight: .semibold))
-                .padding(6)
-                .background(Color.yellow.opacity(0.9),
-                            in: RoundedRectangle(cornerRadius: 8))
-                .padding(.leading, 4)
-                .padding(.top, 100)
-            }
-    }
-}
-
-struct ChatAddFriendMenuUITestRoot: View {
-    @State private var activeContact: RemoteIMContact?
-    @State private var activeGroup: RemoteIMGroup?
-    @State private var isShowingAddContact = false
-    @State private var isShowingQRScanner = false
-    @State private var pendingScannedFriendID: String?
-    @StateObject private var appState = RemoteIMAppState(
-        loadedSettings: StoredRemoteIMSettings(
-            sdkAppID: nil, masterUserID: "im-add-friend-menu-test",
-            contacts: [], reconnectOnLaunch: false
-        )
-    )
-
-    var body: some View {
-        ZStack {
-            ChatView(
-                activeContact: $activeContact,
-                activeGroup: $activeGroup,
-                showRemoteDesktop: {},
-                showCreateGroup: {},
-                showAddContact: {
-                    appState.newContactUserID = ""
-                    isShowingAddContact = true
-                },
-                showScanQRCode: {
-                    isShowingQRScanner = true
-                },
-                bottomBar: AnyView(Text("消息页签").frame(height: 48))
-            )
-
-            if isShowingAddContact {
-                AddContactDialog(isPresented: $isShowingAddContact)
-                    .zIndex(10)
-            }
-        }
-        .environmentObject(appState)
-        .background(RemoteIMStyle.panelBackground, ignoresSafeAreaEdges: [])
-        .sheet(isPresented: $isShowingQRScanner, onDismiss: {
-            guard let pendingScannedFriendID else { return }
-            appState.newContactUserID = pendingScannedFriendID
-            self.pendingScannedFriendID = nil
-            isShowingAddContact = true
-        }) {
-            MaiChatQRScanSheet { userID in
-                pendingScannedFriendID = userID
-                isShowingQRScanner = false
-            }
-        }
-    }
-}
-
-struct ChatLandscapeUITestRoot: View {
-    @State private var activeContact: RemoteIMContact?
-    @State private var activeGroup: RemoteIMGroup?
-    @State private var installedLargeHistory = false
-    @State private var expandedHistoryReady = false
-    @State private var databaseHistoryReady = false
-    @StateObject private var appState = RemoteIMAppState(
-        loadedSettings: StoredRemoteIMSettings(
-            sdkAppID: nil, masterUserID: "im-layout-test",
-            contacts: [RemoteIMContact(userID: "im-test-peer", displayName: "横屏测试联系人")],
-            reconnectOnLaunch: false
-        )
-    )
-
-    var body: some View {
-        ChatView(activeContact: $activeContact, activeGroup: $activeGroup,
-                 showRemoteDesktop: {}, showCreateGroup: {},
-                 showAddContact: {},
-                 showScanQRCode: {},
-                 bottomBar: AnyView(Text("消息页签").frame(height: 48)))
-            .environmentObject(appState)
-            .overlay(alignment: .topLeading) {
-                if expandedHistoryReady {
-                    Text("IM 历史已就绪")
-                        .font(.caption2)
-                        .accessibilityIdentifier("im-history-expanded-ready")
-                }
-                if databaseHistoryReady {
-                    Text("IM 已加载 \(appState.visibleMessages(with: "im-test-peer").count) 条")
-                        .font(.caption2)
-                        .accessibilityIdentifier("im-history-page-count")
-                }
-            }
-            .onAppear {
-                let searchFocus = ProcessInfo.processInfo.arguments.contains("--im-search-focus-ui-test")
-                guard ProcessInfo.processInfo.arguments.contains("--im-large-history-ui-test") ||
-                        searchFocus,
-                      !installedLargeHistory else { return }
-                installedLargeHistory = true
-                // Each UI test owns fresh synthetic history; a previous SQLite
-                // run must not merge duplicate text rows into this fixture.
-                let store = LocalChatHistoryStore()
-                try? store.purgeAccount(ownerUserID: "im-layout-test")
-                let contact = RemoteIMContact(userID: "im-test-peer", displayName: "横屏测试联系人")
-                let messages = (0..<2544).map { index in
-                    RemoteIMMessage(
-                        fromUserID: contact.userID,
-                        toUserID: "im-layout-test",
-                        text: "IM 历史消息 \(index)\n第二行内容",
-                        direction: .incoming,
-                        status: .sent,
-                        createdAt: Date(timeIntervalSince1970: TimeInterval(index))
-                    )
-                }
-                appState.chatState = MasterChatState(
-                    ownerUserID: "im-layout-test", contacts: [contact],
-                    messages: ProcessInfo.processInfo.environment["MAICHAT_IM_HISTORY_DATABASE"] == "1"
-                        ? [] : messages)
-                if ProcessInfo.processInfo.environment["MAICHAT_IM_HISTORY_DATABASE"] == "1" {
-                    try? store.makePersistence().persist(mutations: [
-                        .upsert(messages, sdkAppID: nil, ownerUserID: "im-layout-test")
-                    ])
-                    Task {
-                        await appState.loadInitialMessages(with: contact.userID)
-                        databaseHistoryReady = true
-                    }
-                    return
-                }
-                if searchFocus {
-                    let hit = LocalChatHistorySearchHit(peerUserID: contact.userID,
-                                                        message: messages[100])
-                    _ = appState.openMessageSearchHit(hit)
-                    activeContact = contact
-                }
-            }
-            .onChange(of: activeContact?.userID) { userID in
-                guard ProcessInfo.processInfo.environment["MAICHAT_IM_HISTORY_EXPANDED_PAGES"] == "1",
-                      let userID else { return }
-                expandedHistoryReady = false
-                Task {
-                    for _ in 0..<8 {
-                        await appState.loadEarlierMessages(with: userID)
-                    }
-                    expandedHistoryReady = true
-                }
-            }
-    }
-}
-
-#endif
 
 struct RemoteIMContactAvatar: View {
     let contact: RemoteIMContact
@@ -1995,7 +1816,7 @@ enum MaiConversationMedia {
     }
 }
 
-private struct PresentedRemoteIMImage: Identifiable {
+struct PresentedRemoteIMImage: Identifiable {
     let item: RemoteIMImagePreviewItem
     let imageSize: CGSize
     let sourceSnapshot: WindowFrameSnapshot?
@@ -2005,83 +1826,36 @@ private struct PresentedRemoteIMImage: Identifiable {
     var id: UUID { item.id }
 }
 
-@MainActor
-private final class RemoteIMImageTransition: ObservableObject {
-    @Published private(set) var sourceFrame: CGRect = .zero
-    @Published private(set) var isReady = false
-    @Published var isExpanded = false
-
-    func start(from frame: CGRect) {
-        sourceFrame = frame
-        isReady = true
-        // 先绘制气泡位置的一帧，再放大；否则首帧和终点会在同一次布局中合并。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
-            guard let self, self.isReady else { return }
-            withAnimation(.interactiveSpring(response: 0.38, dampingFraction: 0.86,
-                                             blendDuration: 0.08)) {
-                self.isExpanded = true
-            }
-        }
-    }
-
-    func presentExpanded() {
-        sourceFrame = .zero
-        isReady = true
-        isExpanded = true
-    }
-}
-
-// 系统 fullScreenCover 自带从底部进入的转场；这里以不带系统动画的透明全屏
-// UIKit 页面承载 SwiftUI 图片，保留会话作为背景，再由图片自身完成放大/缩回。
-private struct RemoteIMImagePresentationHost: UIViewControllerRepresentable {
+// 透明全屏 UIKit 宿主保留会话背景；同一原生分页容器承担图片放大、回缩及混合浏览。
+struct RemoteIMImagePresentationHost: UIViewControllerRepresentable {
     @Binding var presentation: PresentedRemoteIMImage?
     let close: () -> Void
-    let navigate: (Int) -> Bool
 
     func makeUIViewController(context: Context) -> RemoteIMImagePresentationController {
         RemoteIMImagePresentationController()
     }
-
-    func updateUIViewController(_ controller: RemoteIMImagePresentationController,
-                                context: Context) {
+    func updateUIViewController(_ controller: RemoteIMImagePresentationController, context: Context) {
         controller.presentation = presentation
         controller.close = close
-        controller.navigate = navigate
         controller.scheduleUpdate()
     }
-
-    static func dismantleUIViewController(_ controller: RemoteIMImagePresentationController,
-                                          coordinator: ()) {
+    static func dismantleUIViewController(_ controller: RemoteIMImagePresentationController, coordinator: ()) {
         controller.dismissPreview()
     }
 }
 
-private final class RemoteIMImagePresentationController: UIViewController {
+final class RemoteIMImagePresentationController: UIViewController {
     var presentation: PresentedRemoteIMImage?
     var close: (() -> Void)?
-    var navigate: ((Int) -> Bool)?
-    private var previewController: RemoteIMImageHostingController?
-    private var presentedID: UUID?
+    private var previewController: MaiLocalMediaPagerController?
     private var updateScheduled = false
-    private var pendingDirection = 0
-
-    private func requestNavigation(_ direction: Int) -> Bool {
-        let accepted = navigate?(direction) ?? false
-        if accepted { pendingDirection = direction }
-        return accepted
-    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .clear
         view.isUserInteractionEnabled = false
     }
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        scheduleUpdate()
-    }
-
+    override func viewDidAppear(_ animated: Bool) { super.viewDidAppear(animated); scheduleUpdate() }
     func scheduleUpdate() {
         guard !updateScheduled else { return }
         updateScheduled = true
@@ -2091,78 +1865,31 @@ private final class RemoteIMImagePresentationController: UIViewController {
             self.updatePresentation()
         }
     }
-
-    /// 在窗口层呈现或切换全屏图片预览，并保留旧画面直到新画面准备好。
-    /// UIKit 容器持有过渡快照；SwiftUI 只更新预览内容，不直接改写其子视图树。
     private func updatePresentation() {
         guard isViewLoaded, view.window != nil else { return }
-        if let presentation {
-            guard presentedID != presentation.id else { return }
-            if let previewController {
-                // 快照放在 UIKit 呈现容器中，而非 UIHostingController.view 内部。
-                // SwiftUI 自己管理后者的子视图，外插快照会破坏层级。
-                let container = previewController.view.superview
-                let previousFrame = previewController.view.snapshotView(afterScreenUpdates: false)
-                if let container, let previousFrame {
-                    previousFrame.frame = previewController.view.convert(
-                        previewController.view.bounds, to: container)
-                    container.addSubview(previousFrame)
-                }
-                let transition = RemoteIMImageTransition()
-                transition.presentExpanded()
-                previewController.rootView = FullScreenImagePreviewView(
-                    presentation: presentation, transition: transition,
-                    close: { [weak self] in self?.close?() },
-                    navigate: { [weak self] direction in
-                        self?.requestNavigation(direction) ?? false
-                    })
-                presentedID = presentation.id
-                let offset = CGFloat(pendingDirection * 48)
-                pendingDirection = 0
-                UIView.animate(withDuration: 0.22, delay: 0,
-                               options: [.curveEaseOut, .allowUserInteraction]) {
-                    previousFrame?.transform = CGAffineTransform(translationX: -offset, y: 0)
-                    previousFrame?.alpha = 0
-                } completion: { _ in previousFrame?.removeFromSuperview() }
-                return
-            }
-            let transition = RemoteIMImageTransition()
-            let preview = RemoteIMImageHostingController(rootView:
-                FullScreenImagePreviewView(presentation: presentation,
-                                           transition: transition,
-                                           close: { [weak self] in self?.close?() },
-                                           navigate: { [weak self] direction in
-                                               self?.requestNavigation(direction) ?? false
-                                           }))
-            preview.modalPresentationStyle = .overFullScreen
-            preview.modalPresentationCapturesStatusBarAppearance = true
-            preview.view.backgroundColor = .clear
-            preview.view.isOpaque = false
-            previewController = preview
-            presentedID = presentation.id
-            present(preview, animated: false) { [weak self, weak preview] in
-                guard self?.presentedID == presentation.id, let preview else { return }
-                let sourceFrame = presentation.sourceSnapshot?.frame(in: preview.view) ?? .zero
-                transition.start(from: sourceFrame)
-            }
-        } else {
-            dismissPreview()
+        guard let presentation else { dismissPreview(); return }
+        let item = MaiMediaItem(kind: .image, path: presentation.item.localFilePath)
+        let sequence = presentation.sequence ?? MaiMediaSequence(selected: item, items: [item])
+        let frame: (UIView) -> CGRect? = { presentation.sourceSnapshot?.frame(in: $0) }
+        if let previewController {
+            previewController.update(sequence: sequence, sourceFrame: frame, selectionChanged: nil,
+                                     close: { [weak self] in self?.close?() })
+            return
         }
+        let preview = MaiLocalMediaPagerController(sequence: sequence,
+            imageIdentifier: "remote-im-image-preview", sourceFrame: frame,
+            thumbnail: presentation.thumbnailImage, close: { [weak self] in self?.close?() })
+        preview.modalPresentationStyle = .overFullScreen
+        preview.modalPresentationCapturesStatusBarAppearance = true
+        previewController = preview
+        present(preview, animated: false)
     }
-
     func dismissPreview() {
         guard let previewController else { return }
         self.previewController = nil
-        presentedID = nil
-        previewController.dismiss(animated: false) { [weak self] in
-            self?.scheduleUpdate()
-        }
+        previewController.dispose()
+        previewController.dismiss(animated: false)
     }
-}
-
-private final class RemoteIMImageHostingController: UIHostingController<FullScreenImagePreviewView> {
-    override var prefersStatusBarHidden: Bool { true }
-    override var prefersHomeIndicatorAutoHidden: Bool { true }
 }
 
 private struct PresentedMessageActions: Identifiable {
@@ -2465,8 +2192,7 @@ private struct ChatDetailView: View {
         .toolbar(.hidden, for: .navigationBar)
         .background {
             RemoteIMImagePresentationHost(presentation: $imagePreviewPresentation,
-                                          close: closeImagePreview,
-                                          navigate: navigateImagePreview)
+                                          close: closeImagePreview)
         }
         .sheet(item: $reportingMessage) { message in
             NavigationStack {
@@ -2618,25 +2344,6 @@ private struct ChatDetailView: View {
         )
     }
 
-    private func navigateImagePreview(_ direction: Int) -> Bool {
-        guard let current = imagePreviewPresentation,
-              let next = current.sequence?.adjacent(direction) else { return false }
-        if next.current.kind == .video {
-            imagePreviewPresentation = nil
-            appState.agentVideoPresentation = MaiFfplayPresentation(
-                sequence: next, entryDirection: direction)
-        } else {
-            imagePreviewPresentation = PresentedRemoteIMImage(
-                item: RemoteIMImagePreviewItem(id: UUID(),
-                                               localFilePath: next.current.path),
-                imageSize: MaiConversationMedia.imageSize(at: next.current.path),
-                sourceSnapshot: nil,
-                thumbnailImage: nil,
-                sequence: next)
-        }
-        return true
-    }
-
     private func closeImagePreview() {
         imagePreviewPresentation = nil
     }
@@ -2652,7 +2359,7 @@ struct VoiceActionFramesKey: PreferenceKey {
     }
 }
 
-private final class WindowFrameSnapshot {
+final class WindowFrameSnapshot {
     weak var window: UIWindow?
     let frame: CGRect
 
@@ -2936,211 +2643,6 @@ private struct VoiceTranscriptionHighlight: View {
 
 }
 
-#if targetEnvironment(simulator)
-// 设计审查专用：用真实播放器和创作中心消息列表呈现语音悬浮层，不调用收费服务。
-struct VoiceTranscriptionConversationPreviewRoot: View {
-    @StateObject private var presentation = VoiceTranscriptionPresentation()
-
-    var body: some View {
-        GeometryReader { viewport in
-            let dockHeight = min(max(viewport.size.height * 0.62, 320), 560)
-            ZStack { AIAssistantView() }
-                .padding(.top, dockHeight)
-                .overlay {
-                    GeometryReader { geometry in
-                        let previewVideo = ProcessInfo.processInfo.environment["MAICHAT_VOICE_DESIGN_VIDEO"]
-                            .flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : nil }
-                            ?? Bundle.main.url(forResource: "ffplay-sample", withExtension: "mp4")?.path
-                        if let previewVideo {
-                            MaiFfplayVideoScreen(path: previewVideo) {}
-                                .frame(width: geometry.size.width, height: dockHeight)
-                                .position(x: geometry.size.width / 2, y: dockHeight / 2)
-                        }
-                    }
-                }
-        }
-        .task {
-            AIAssistantModel.shared.installHistoryUITestFixture()
-            presentation.prepareForNewSession(account: "preview", peer: "preview")
-            presentation.onCancel = { presentation.reset() }
-            presentation.onEdit = { presentation.reset() }
-            presentation.target = .send
-            presentation.updateLiveText("我想从第十秒开始播放这个视频，再看一下人物动作。",
-                                        sessionID: 1)
-        }
-        .onDisappear { presentation.reset() }
-    }
-}
-
-struct RemoteIMImageFullscreenUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-    @State private var preview: PresentedRemoteIMImage?
-    @State private var video: MaiFfplayPresentation?
-    @State private var imagePath = ""
-    @State private var secondImagePath = ""
-    @State private var sourceFrameState = "尚未打开"
-
-    var body: some View {
-        ZStack {
-        ChatNavigationHost(
-            root: AnyView(Color.white),
-            detail: AnyView(
-                VStack(spacing: 0) {
-                    ScrollView {
-                        VStack {
-                            Color.clear.frame(height: 900)
-                            if !imagePath.isEmpty {
-                                ImageBubbleContent(
-                                    attachment: RemoteIMImageAttachment(localFilePath: imagePath,
-                                                                         width: 300, height: 500),
-                                    previewImage: { imageSize, sourceSnapshot, thumbnailImage in
-                                        sourceFrameState = sourceSnapshot?.frame.isEmpty == false
-                                            ? "有效" : "无效"
-                                        preview = PresentedRemoteIMImage(
-                                            item: RemoteIMImagePreviewItem(id: UUID(),
-                                                                           localFilePath: imagePath),
-                                            imageSize: imageSize,
-                                            sourceSnapshot: sourceSnapshot,
-                                            thumbnailImage: thumbnailImage,
-                                            sequence: testSequence()
-                                        )
-                                    }
-                                )
-                            }
-                            Color.clear.frame(height: 1000)
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    Text(sourceFrameState)
-                        .accessibilityIdentifier("im-source-frame-state")
-                }
-                .environmentObject(appState)
-                .background(Color.white)
-                .background {
-                    RemoteIMImagePresentationHost(presentation: $preview,
-                                                  close: closePreview,
-                                                  navigate: navigate)
-                }
-            ),
-            selectionID: "im-image-fullscreen-test",
-            onPop: {}
-        )
-        if let video {
-            MaiFfplayVideoScreen(path: video.path, navigate: navigate) {
-                self.video = nil
-            }
-            .id(video.id)
-            .ignoresSafeArea()
-            .overlay(alignment: .top) {
-                Text("\(video.index + 1)/\(video.sequence.items.count) · " +
-                     URL(fileURLWithPath: video.path).lastPathComponent)
-                    .foregroundStyle(.white).padding(.top, 70)
-            }
-        }
-        }
-        .task { prepareImage() }
-    }
-
-    private func testSequence() -> MaiMediaSequence? {
-        guard !imagePath.isEmpty, !secondImagePath.isEmpty,
-              let videoPath = Bundle.main.url(forResource: "ffplay-seek-sample",
-                                                  withExtension: "mp4")?.path else { return nil }
-        let first = MaiMediaItem(kind: .image, path: imagePath)
-        return MaiMediaSequence(selected: first, items: [
-            first,
-            MaiMediaItem(kind: .image, path: secondImagePath),
-            MaiMediaItem(kind: .video, path: videoPath)
-        ])
-    }
-
-    private func navigate(_ direction: Int) -> Bool {
-        let sequence = preview?.sequence ?? video?.sequence
-        guard let next = sequence?.adjacent(direction) else { return false }
-        if next.current.kind == .video {
-            preview = nil
-            video = MaiFfplayPresentation(sequence: next, entryDirection: direction)
-        } else {
-            video = nil
-            preview = PresentedRemoteIMImage(
-                item: RemoteIMImagePreviewItem(id: UUID(),
-                                               localFilePath: next.current.path),
-                imageSize: CGSize(width: 300, height: 500),
-                sourceSnapshot: nil, thumbnailImage: nil, sequence: next)
-        }
-        return true
-    }
-
-    private func prepareImage() {
-        guard imagePath.isEmpty else { return }
-        let image = UIGraphicsImageRenderer(size: CGSize(width: 300, height: 500))
-            .image { context in
-                UIColor.systemBlue.setFill()
-                context.fill(CGRect(x: 0, y: 0, width: 300, height: 500))
-            }
-        let file = FileManager.default.temporaryDirectory
-            .appendingPathComponent("im-image-fullscreen-ui-test.png")
-        guard let data = image.pngData(),
-              (try? data.write(to: file)) != nil else { return }
-        imagePath = file.path
-        let second = UIGraphicsImageRenderer(size: CGSize(width: 300, height: 500))
-            .image { context in
-                UIColor.systemOrange.setFill()
-                context.fill(CGRect(x: 0, y: 0, width: 300, height: 500))
-            }
-        let secondFile = FileManager.default.temporaryDirectory
-            .appendingPathComponent("im-image-fullscreen-ui-test-second.png")
-        guard let secondData = second.pngData(),
-              (try? secondData.write(to: secondFile)) != nil else { return }
-        secondImagePath = secondFile.path
-    }
-
-    private func closePreview() {
-        preview = nil
-    }
-}
-
-struct VoiceTranscriptionDockUITestRoot: View {
-    @StateObject private var presentation = VoiceTranscriptionPresentation()
-    @State private var inputTapped = false
-    @State private var actionTapped = ""
-
-    var body: some View {
-        GeometryReader { geometry in
-            VStack(spacing: 0) {
-                Color.black
-                    .frame(height: geometry.size.height * 0.56)
-                    .accessibilityIdentifier("voice-test-video")
-                VStack {
-                    Spacer()
-                    Text(actionTapped).accessibilityIdentifier("voice-test-action")
-                    Button(inputTapped ? "输入已触达" : "底部输入") {
-                        inputTapped = true
-                    }
-                    .accessibilityIdentifier("voice-test-input")
-                    .padding(.bottom, 24)
-                }
-                .frame(maxWidth: .infinity)
-                .frame(height: geometry.size.height * 0.44)
-                .background(Color.white)
-            }
-        }
-        .task {
-            presentation.onCancel = {
-                actionTapped = "已取消"
-                presentation.reset()
-            }
-            presentation.onEdit = {
-                actionTapped = "已编辑"
-                presentation.reset()
-            }
-            presentation.target = .send
-            presentation.updateLiveText(
-                String(repeating: "正在识别你说的话，文字应始终显示在视频下方。", count: 8),
-                sessionID: 1)
-        }
-    }
-}
-#endif
 
 private struct ChatDetailHeader: View {
     let contact: RemoteIMContact
@@ -4804,237 +4306,6 @@ struct ImagePreviewBackdrop: View {
     }
 }
 
-private struct FullScreenImagePreviewView: View {
-    let presentation: PresentedRemoteIMImage
-    @ObservedObject var transition: RemoteIMImageTransition
-    let close: () -> Void
-    let navigate: (Int) -> Bool
-    @State private var isSaving = false
-    @State private var saveResultText: String?
-    @State private var isZoomed = false
-    @State private var navigationStatus = ""
-
-    private var previewAnimation: Animation {
-        .interactiveSpring(response: 0.38, dampingFraction: 0.86, blendDuration: 0.08)
-    }
-
-    var body: some View {
-        GeometryReader { geometry in
-            let measuredSize = aspectFitSize(
-                imageSize: presentation.imageSize,
-                containerSize: geometry.size
-            )
-            let fittedSize = measuredSize.width > 0 && measuredSize.height > 0
-                ? measuredSize : geometry.size
-            let destinationFrame = CGRect(
-                x: (geometry.size.width - fittedSize.width) / 2,
-                y: (geometry.size.height - fittedSize.height) / 2,
-                width: fittedSize.width,
-                height: fittedSize.height
-            )
-            let imageFrame = transition.isExpanded || transition.sourceFrame.isEmpty
-                ? destinationFrame : transition.sourceFrame
-            ZStack(alignment: .bottomTrailing) {
-                Color.clear
-                if transition.isReady {
-                    Color.black
-                        .opacity(transition.isExpanded ? 1 : 0)
-                        .ignoresSafeArea()
-                        .onTapGesture(perform: shrinkAndClose)
-
-                    ImagePreviewBackdrop(
-                        filePath: presentation.item.localFilePath,
-                        viewportSize: geometry.size
-                    )
-                    .opacity(transition.isExpanded ? 1 : 0)
-
-                    previewImage(frame: imageFrame, fittedSize: fittedSize,
-                                 viewportSize: geometry.size)
-
-                    if let sequence = presentation.sequence, sequence.items.count > 1 {
-                        Text("\(sequence.index + 1)/\(sequence.items.count) · " +
-                             URL(fileURLWithPath: presentation.item.localFilePath).lastPathComponent)
-                            .font(.system(size: 12, weight: .medium))
-                            .lineLimit(1)
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 10).padding(.vertical, 7)
-                            .background(.black.opacity(0.58), in: Capsule())
-                            .frame(maxWidth: .infinity, maxHeight: .infinity,
-                                   alignment: .top)
-                            .padding(.top, 60).padding(.horizontal, 70)
-                            .allowsHitTesting(false)
-                    }
-
-                    VStack(alignment: .trailing, spacing: 14) {
-                        if !navigationStatus.isEmpty {
-                            Text(navigationStatus)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(.white)
-                                .padding(10)
-                                .background(.black.opacity(0.65), in: Capsule())
-                        }
-                        if let saveResultText {
-                            Text(saveResultText)
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 12)
-                                .frame(height: 34)
-                                .background(.black.opacity(0.62), in: Capsule())
-                                .transition(.opacity.combined(with: .move(edge: .bottom)))
-                        }
-
-                        HStack(spacing: 14) {
-                            ShareLink(item: URL(fileURLWithPath: presentation.item.localFilePath)) {
-                                imagePreviewActionIcon("arrowshape.turn.up.right.fill")
-                            }
-                            .accessibilityLabel("分享图片")
-
-                            Button(action: saveImageToPhotoLibrary) {
-                                imagePreviewActionIcon(isSaving ? "hourglass" : "arrow.down.to.line")
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(isSaving)
-                            .accessibilityLabel(isSaving ? "正在保存图片" : "保存图片")
-                        }
-                    }
-                    .padding(.trailing, 22)
-                    .padding(.bottom, 48)
-                    .opacity(transition.isExpanded ? 1 : 0)
-                    .allowsHitTesting(transition.isExpanded)
-                }
-            }
-            .frame(width: geometry.size.width, height: geometry.size.height)
-            .simultaneousGesture(DragGesture(minimumDistance: 50).onEnded { value in
-                guard transition.isExpanded, !isZoomed,
-                      abs(value.translation.width) > abs(value.translation.height) * 1.4
-                else { return }
-                let direction = value.translation.width < 0 ? 1 : -1
-                if !navigate(direction) {
-                    navigationStatus = direction > 0 ? "已经是最后一项" : "已经是第一项"
-                }
-            })
-        }
-        .ignoresSafeArea()
-        .accessibilityAction(.escape, shrinkAndClose)
-        .onChange(of: presentation.id) { _ in
-            isZoomed = false
-            navigationStatus = ""
-        }
-    }
-
-    private func shrinkAndClose() {
-        guard transition.isExpanded else { return }
-        withAnimation(previewAnimation) { transition.isExpanded = false }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
-            guard !transition.isExpanded else { return }
-            close()
-        }
-    }
-
-    private func imagePreviewActionIcon(_ systemName: String) -> some View {
-        Image(systemName: systemName)
-            .font(.system(size: 18, weight: .semibold))
-            .foregroundStyle(.white)
-            .frame(width: 48, height: 48)
-            .background(.black.opacity(0.56), in: Circle())
-            .overlay {
-                Circle().stroke(.white.opacity(0.12), lineWidth: 1)
-            }
-    }
-
-    private func previewImage(frame: CGRect, fittedSize: CGSize,
-                              viewportSize: CGSize) -> some View {
-        ZStack {
-            if let thumbnailImage = presentation.thumbnailImage {
-                Image(uiImage: thumbnailImage).resizable().scaledToFit()
-            }
-            RemoteIMAsyncImage(filePath: presentation.item.localFilePath,
-                               maximumPointSize: ImagePreviewZoomModifier.maximumDecodePointSize(
-                                for: viewportSize)) { image in
-                Image(uiImage: image).resizable().scaledToFit()
-            } placeholder: { failed in
-                if failed {
-                    Label("图片无法显示", systemImage: "photo")
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if presentation.thumbnailImage == nil {
-                    ProgressView().tint(.white)
-                }
-            }
-        }
-            .frame(width: frame.width, height: frame.height)
-            .clipShape(RoundedRectangle(cornerRadius: transition.isExpanded ? 0 : 8,
-                                        style: .continuous))
-            .modifier(ImagePreviewZoomModifier(enabled: transition.isExpanded,
-                                               imageSize: fittedSize,
-                                               viewportSize: viewportSize,
-                                               onScaleChanged: { isZoomed = $0 > 1.01 }))
-            .position(x: frame.midX, y: frame.midY)
-            .contentShape(Rectangle())
-            .onTapGesture(perform: shrinkAndClose)
-            .accessibilityLabel("图片预览")
-            .accessibilityIdentifier("remote-im-image-preview")
-    }
-
-    private func saveImageToPhotoLibrary() {
-        guard !isSaving else { return }
-        isSaving = true
-        saveResultText = nil
-        let fileURL = URL(fileURLWithPath: presentation.item.localFilePath)
-
-        Task { @MainActor in
-            guard await requestPhotoLibraryPermission() else {
-                isSaving = false
-                saveResultText = "请在系统设置中允许访问照片"
-                return
-            }
-            let saveError = await RemoteIMPhotoLibraryWriter.saveImage(at: fileURL)
-            if let saveError {
-                isSaving = false
-                withAnimation(.easeOut(duration: 0.2)) {
-                    saveResultText = saveError
-                }
-            } else {
-                isSaving = false
-                withAnimation(.easeOut(duration: 0.2)) {
-                    saveResultText = "已保存到相册"
-                }
-            }
-        }
-    }
-
-    private func requestPhotoLibraryPermission() async -> Bool {
-        switch PHPhotoLibrary.authorizationStatus(for: .readWrite) {
-        case .authorized, .limited:
-            return true
-        case .notDetermined:
-            let status = await withCheckedContinuation { continuation in
-                PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
-                    continuation.resume(returning: status)
-                }
-            }
-            return status == .authorized || status == .limited
-        case .denied, .restricted:
-            return false
-        @unknown default:
-            return false
-        }
-    }
-
-    private func aspectFitSize(imageSize: CGSize, containerSize: CGSize) -> CGSize {
-        guard imageSize.width > 0,
-              imageSize.height > 0,
-              containerSize.width > 0,
-              containerSize.height > 0
-        else { return .zero }
-        let scale = min(
-            containerSize.width / imageSize.width,
-            containerSize.height / imageSize.height
-        )
-        return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
-    }
-}
-
 private struct RemoteIMFilePreviewItem: Identifiable {
     let id: UUID
     let attachment: RemoteIMFileAttachment
@@ -5410,7 +4681,7 @@ private struct VideoBubbleContent: View {
     }
 }
 
-private struct ImageBubbleContent: View {
+struct ImageBubbleContent: View {
     let attachment: RemoteIMImageAttachment
     let previewImage: (CGSize, WindowFrameSnapshot?, UIImage?) -> Void
     @EnvironmentObject private var appState: RemoteIMAppState
@@ -5449,20 +4720,11 @@ private struct ImageBubbleContent: View {
             .frame(width: thumbnailSize.width, height: thumbnailSize.height)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay {
-                ZStack(alignment: .bottomTrailing) {
-                    WindowFrameActionButton { sourceSnapshot in
-                        previewImage(imageSize, sourceSnapshot, thumbnailImage)
-                    }
-                    .frame(width: thumbnailSize.width, height: thumbnailSize.height)
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 25, height: 25)
-                        .background(.black.opacity(0.52), in: Circle())
-                        .padding(7)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
+                // 整张缩略图都是点击区域，保留窗口坐标采集，不再叠加放大角标。
+                WindowFrameActionButton { sourceSnapshot in
+                    previewImage(imageSize, sourceSnapshot, thumbnailImage)
                 }
+                .frame(width: thumbnailSize.width, height: thumbnailSize.height)
             }
     }
 }

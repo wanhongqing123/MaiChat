@@ -37,6 +37,7 @@ extern "C" {
 
 #include "MaiGraphics.h"
 #include "MaiVideoColorParameters.h"
+#include "util/platform.h"
 #include "vec4.h"
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -256,6 +257,9 @@ public:
                          MaiGraphicsPresentCallback callback, void* userData)
         : mBackend(std::move(backend)),
           mEffectFile(effectDirectory + "/default.effect"),
+#if defined(__ANDROID__)
+          mSrgbOutputEffectFile(effectDirectory + "/MaiSrgbOutput.effect"),
+#endif
           mConversionEffectFile(effectDirectory + "/video_conversion.effect"),
           mP010HlgEffectFile(effectDirectory + "/MaiP010HlgConversion.effect"),
           mHdrConversionEffectFile(std::move(effectDirectory) + "/format_conversion.effect"),
@@ -289,6 +293,9 @@ public:
             if (mConversionEffect) gs_effect_destroy(mConversionEffect);
             if (mP010HlgEffect) gs_effect_destroy(mP010HlgEffect);
             if (mHdrConversionEffect) gs_effect_destroy(mHdrConversionEffect);
+#if defined(__ANDROID__)
+            if (mSrgbOutputEffect) gs_effect_destroy(mSrgbOutputEffect);
+#endif
             if (mEffect) {
                 gs_effect_destroy(mEffect);
                 mEffect = nullptr;
@@ -368,11 +375,10 @@ public:
         return mGraphicsRunner.post([this, view, enabled, ambientSize, copied] {
             if (!view->active || !view->swapchain) return;
             gs_enter_context(mGraphics);
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-            const bool configured = mai_metal_swapchain_set_hlg(
-                view->swapchain, enabled ? 1 : 0,
+#if defined(__APPLE__)
+            const bool configured = configureHlgOutput(view->swapchain, enabled,
                 enabled && ambientSize == copied.size() ? copied.data() : nullptr,
-                enabled ? ambientSize : 0) == 1;
+                enabled ? ambientSize : 0);
             view->hlgOutput = enabled && configured;
             if (enabled && configured)
                 std::fprintf(stderr, "[MaiVideoHDR] HLG EDR enabled ambient=%u\n",
@@ -389,6 +395,30 @@ public:
 #endif
             gs_leave_context();
         });
+    }
+
+    // iOS 静态链接 Metal，macOS 使用同一后端的动态模块扩展；复用 OBS 的模块加载器，
+    // 额外引用仅覆盖本次调用，主 Graphics 上下文负责实际模块生命周期。
+    bool configureHlgOutput(gs_swapchain_t* swapchain, bool enabled,
+                            const uint8_t* ambient, uint32_t ambientSize) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        return mai_metal_swapchain_set_hlg(swapchain, enabled ? 1 : 0, ambient, ambientSize) == 1;
+#elif defined(__APPLE__)
+        void* module = os_dlopen(mBackend.c_str());
+        if (!module) return false;
+        using SetHlg = int32_t (*)(const void*, int32_t, const uint8_t*, uint32_t);
+        auto setHlg = reinterpret_cast<SetHlg>(os_dlsym(module, "mai_metal_swapchain_set_hlg"));
+        const bool configured = setHlg && setHlg(swapchain, enabled ? 1 : 0,
+                                                ambient, ambientSize) == 1;
+        os_dlclose(module);
+        return configured;
+#else
+        (void)swapchain;
+        (void)enabled;
+        (void)ambient;
+        (void)ambientSize;
+        return false;
+#endif
     }
 
     bool showImage(uint64_t id, const char* path, bool fillView) {
@@ -603,6 +633,19 @@ private:
         return mConversionEffect != nullptr;
     }
 
+#if defined(__ANDROID__)
+    bool ensureSrgbOutputEffect() {
+        if (!mSrgbOutputEffectAttempted) {
+            mSrgbOutputEffectAttempted = true;
+            char* errors = nullptr;
+            mSrgbOutputEffect = gs_effect_create_from_file(mSrgbOutputEffectFile.c_str(), &errors);
+            if (errors) std::fprintf(stderr, "[MaiGraphics] sRGB output shader: %s\n", errors);
+            if (errors) bfree(errors);
+        }
+        return mSrgbOutputEffect != nullptr;
+    }
+#endif
+
     bool ensureP010HlgEffect() {
         if (!mP010HlgEffectAttempted) {
             mP010HlgEffectAttempted = true;
@@ -633,9 +676,29 @@ private:
         if (!view->swapchain || !texture || !ensureDrawEffect()) return false;
         gs_technique_t* drawTechnique = toneMap ? mDrawTonemapTechnique : mDrawTechnique;
         if (!drawTechnique) return false;
+        gs_technique_t* subtitleTechnique = mDrawTechnique;
+        gs_eparam_t* imageParameter = mImageParameter;
         const uint32_t width = view->width;
         const uint32_t height = view->height;
         gs_load_swapchain(view->swapchain);
+#if defined(__ANDROID__)
+        // OBS 的纹理采样输出为线性；GLES 线性窗口不自动写回 sRGB，需在最终一步编码。
+        // 根据实际附件编码选择，不能用“支持 sRGB 纹理”推断窗口也是 sRGB。
+        if (!gs_framebuffer_srgb_enabled()) {
+            if (!ensureSrgbOutputEffect()) {
+                gs_load_swapchain(nullptr);
+                return false;
+            }
+            imageParameter = gs_effect_get_param_by_name(mSrgbOutputEffect, "image");
+            subtitleTechnique = gs_effect_get_technique(mSrgbOutputEffect, "MaiSrgbOutput");
+            drawTechnique = toneMap ? gs_effect_get_technique(mSrgbOutputEffect, "MaiSrgbOutputTonemap")
+                                    : subtitleTechnique;
+            if (!imageParameter || !drawTechnique || !subtitleTechnique) {
+                gs_load_swapchain(nullptr);
+                return false;
+            }
+        }
+#endif
         gs_begin_scene();
         gs_set_viewport(0, 0, static_cast<int>(width), static_cast<int>(height));
         gs_ortho(0.0f, static_cast<float>(width), 0.0f, static_cast<float>(height), -100.0f,
@@ -645,8 +708,8 @@ private:
         gs_clear(GS_CLEAR_COLOR, &black, 1.0f, 0);
         gs_set_cull_mode(GS_NEITHER);
         gs_enable_blending(false);
-        if (linearSource) gs_effect_set_texture(mImageParameter, texture);
-        else gs_effect_set_texture_srgb(mImageParameter, texture);
+        if (linearSource) gs_effect_set_texture(imageParameter, texture);
+        else gs_effect_set_texture_srgb(imageParameter, texture);
         const float widthScale = static_cast<float>(width) / sourceWidth;
         const float heightScale = static_cast<float>(height) / sourceHeight;
         const float scale =
@@ -671,19 +734,19 @@ private:
             gs_blend_state_push();
             gs_enable_blending(true);
             gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
-            gs_effect_set_texture_srgb(mImageParameter, subtitle);
-            const size_t subtitlePasses = gs_technique_begin(mDrawTechnique);
+            gs_effect_set_texture_srgb(imageParameter, subtitle);
+            const size_t subtitlePasses = gs_technique_begin(subtitleTechnique);
             presented = subtitlePasses > 0;
             for (size_t pass = 0; pass < subtitlePasses; ++pass) {
-                if (!gs_technique_begin_pass(mDrawTechnique, pass)) {
+                if (!gs_technique_begin_pass(subtitleTechnique, pass)) {
                     presented = false;
                     break;
                 }
                 gs_draw_sprite(subtitle, 0, std::max<uint32_t>(1, drawWidth),
                                std::max<uint32_t>(1, drawHeight));
-                gs_technique_end_pass(mDrawTechnique);
+                gs_technique_end_pass(subtitleTechnique);
             }
-            gs_technique_end(mDrawTechnique);
+            gs_technique_end(subtitleTechnique);
             gs_blend_state_pop();
         }
         gs_matrix_pop();
@@ -885,8 +948,8 @@ private:
                               frame.colorSpace == MAI_VIDEO_COLOR_BT2020 &&
                               frame.colorTransfer == MAI_VIDEO_TRANSFER_HLG;
         if (view->hlgOutput && !hlgFrame) {
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-            mai_metal_swapchain_set_hlg(view->swapchain, 0, nullptr, 0);
+#if defined(__APPLE__)
+            configureHlgOutput(view->swapchain, false, nullptr, 0);
 #endif
             view->hlgOutput = false;
         }
@@ -929,6 +992,11 @@ private:
 
     std::string mBackend;
     std::string mEffectFile;
+#if defined(__ANDROID__)
+    std::string mSrgbOutputEffectFile;
+    gs_effect_t* mSrgbOutputEffect = nullptr;
+    bool mSrgbOutputEffectAttempted = false;
+#endif
     std::string mConversionEffectFile;
     std::string mP010HlgEffectFile;
     std::string mHdrConversionEffectFile;

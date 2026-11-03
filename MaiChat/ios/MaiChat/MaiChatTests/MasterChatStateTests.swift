@@ -6,7 +6,8 @@ import XCTest
 
 // 轻量测试目标编译消息布局，但不链接 App 的诊断服务。
 final class AppDiagnosticLog: @unchecked Sendable {
-    enum Level { case warning }
+    // 共用消息布局也写 debug 事件；替身保持正式日志级别的调用契约。
+    enum Level { case debug, warning }
     static let shared = AppDiagnosticLog()
     func record(level: Level, category: String, event: String, fields: [String: String]) {}
 }

@@ -180,12 +180,21 @@ int main(int argc, char** argv) {
             return readMetrics(base, argv[4], &current) &&
                 current.ranges > beforeSeek.ranges;
         }, 8);
-        const bool resumed = rangeAfterSeek &&
-            maiFfplaySendCommand("pause") == 1;
         MaiFfplayPlaybackStatus status{};
-        const bool laterFrame = resumed && waitUntil(finished, [&] {
+        // Range 请求先于 seek 解码/暂停逐帧完成。必须等实际目标画面和新 serial
+        // 时钟就绪再发送暂停切换，不能把请求开始当成 seek 已完成。
+        const bool targetFrame = rangeAfterSeek && waitUntil(finished, [&] {
             return session.frames.load() > framesBeforeSeek &&
                 session.drawn.load() > drawnBeforeSeek &&
+                maiFfplayGetPlaybackStatus(&status) && status.paused && !status.seeking &&
+                status.position_us >= 10'000'000;
+        }, 8);
+        const unsigned targetFrames = session.frames.load();
+        const unsigned targetDrawn = session.drawn.load();
+        const bool resumed = targetFrame && maiFfplaySendCommand("pause") == 1;
+        const bool laterFrame = resumed && waitUntil(finished, [&] {
+            return session.frames.load() > targetFrames &&
+                session.drawn.load() > targetDrawn &&
                 maiFfplayGetPlaybackStatus(&status) &&
                 status.position_us >= 10'000'000;
         }, 8);

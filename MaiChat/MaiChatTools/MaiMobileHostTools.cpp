@@ -484,13 +484,30 @@ public:
     explicit MaiMobileBrowserTool(std::shared_ptr<MaiMobileHostDispatcher> dispatcher)
         : mDispatcher(std::move(dispatcher)) {}
 
-    std::string name() const override { return "mobile_browser"; }
+    std::string name() const override {
+        return "mobile_browser";
+    }
     std::string description() const override {
+        // 普通网页正文优先使用 curl 的 text_only；浏览器用于脚本渲染、页面交互和截图。
+        // 网页属于当前会话，由宿主控制任务入口与展示。操作前读取快照，操作后再次读取验证，
+        // 密码由用户手动输入；不能控制 MaiChat 外的浏览器。
         return "Control one browser page owned by the current MaiChat Agent Session. "
-               "open shows a visible in-app page, observe returns bounded page text and "
+               "Prefer curl with text_only=true for ordinary web reading. Use this browser "
+               "when JavaScript rendering, page interaction or screenshots are needed. "
+               "open starts an in-app page; the host controls its presentation. "
+               "observe returns bounded page text and "
                "interactive elements, screenshot returns the current page image, and close "
                "ends the page. To click or type, first observe and use its snapshot_id, "
                "element_id, exact label and URL. Screenshot also needs that observed URL. "
+#if defined(MAICHAT_MOBILE_IOS)
+               "On iOS, observe waits up to wait_ms (default 5000, maximum 10000) for usable DOM, "
+               "then returns ready or loading with partial content. Snapshot and element IDs remain "
+               "usable for unchanged controls in the same document, including independent form "
+               "inputs; navigation or changed targets need a new observe. Target errors include "
+               "a specific reason such as snapshot_expired, element_detached or label_mismatch. "
+               "A file control returns file_selection_required; ask the user to open the page "
+               "and select the upload through the system picker, then observe again. "
+#endif
                "Password fields require manual user input. "
                "Opening a URL, screenshots, clicks and typing follow the Agent approval policy. "
                "A dispatched click or typing action does not prove the intended outcome; "
@@ -504,7 +521,11 @@ public:
                R"("expected_url":{"type":"string","maxLength":2048},)"
                R"("snapshot_id":{"type":"string"},"element_id":{"type":"string"},)"
                R"("expected_label":{"type":"string"},)"
-               R"("text":{"type":"string","maxLength":4000}},)"
+               R"("text":{"type":"string","maxLength":4000})"
+#if defined(MAICHAT_MOBILE_IOS)
+               R"(,"wait_ms":{"type":"integer","minimum":0,"maximum":10000})"
+#endif
+               R"(},)"
                R"("required":["action"],"additionalProperties":false})";
     }
     bool requiresApproval(const std::string& raw) const override {
@@ -536,55 +557,60 @@ public:
             return true;
         };
         if (action == "open") {
-            if (!hasOnly({"action", "url"}) ||
-                !args.value("url", Json{}).is_string() ||
+            if (!hasOnly({"action", "url"}) || !args.value("url", Json{}).is_string() ||
                 !validBrowserUrl(args["url"].get<std::string>()))
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                               "open needs one HTTP(S) URL without credentials");
-        } else if (action == "observe" || action == "close") {
+        }
+#if defined(MAICHAT_MOBILE_IOS)
+        else if (action == "observe") {
+            if (!hasOnly({"action", "wait_ms"}) ||
+                (args.contains("wait_ms") &&
+                 (!args["wait_ms"].is_number_integer() || args["wait_ms"].get<int64_t>() < 0 ||
+                  args["wait_ms"].get<int64_t>() > 10000)))
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "observe wait_ms must be an integer from 0 to 10000");
+        }
+#endif
+        else if (action == "observe" || action == "close") {
             if (!hasOnly({"action"}))
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                               "this browser action accepts no other parameters");
         } else if (action == "screenshot") {
-            if (!hasOnly({"action", "expected_url"}) ||
-                !args.value("expected_url", Json{}).is_string() ||
+            if (!hasOnly({"action", "expected_url"}) || !args.value("expected_url", Json{}).is_string() ||
                 args["expected_url"].get<std::string>().empty() ||
                 args["expected_url"].get<std::string>().size() > 2048)
-                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                              "screenshot needs the exact observed URL");
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "screenshot needs the exact observed URL");
         } else if (action == "click" || action == "type") {
             if (!hasOnly(action == "click"
-                             ? std::initializer_list<const char*>{"action", "snapshot_id",
-                                                                   "element_id", "expected_label",
-                                                                   "expected_url"}
-                             : std::initializer_list<const char*>{"action", "snapshot_id",
-                                                                   "element_id", "expected_label",
-                                                                   "expected_url", "text"}) ||
-                !args.value("snapshot_id", Json{}).is_string() ||
-                !args.value("element_id", Json{}).is_string() ||
-                !args.value("expected_label", Json{}).is_string() ||
-                !args.value("expected_url", Json{}).is_string() ||
+                             ? std::initializer_list<const char*>{"action", "snapshot_id", "element_id",
+                                                                  "expected_label", "expected_url"}
+                             : std::initializer_list<const char*>{"action", "snapshot_id", "element_id",
+                                                                  "expected_label", "expected_url", "text"}) ||
+                !args.value("snapshot_id", Json{}).is_string() || !args.value("element_id", Json{}).is_string() ||
+                !args.value("expected_label", Json{}).is_string() || !args.value("expected_url", Json{}).is_string() ||
                 (action == "type" && !args.value("text", Json{}).is_string()))
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                               "use a current browser snapshot and element label");
             for (const char* field : {"snapshot_id", "element_id", "expected_label"})
-                if (args[field].get<std::string>().empty() ||
-                    args[field].get<std::string>().size() > 200)
-                    return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                                  "browser target is empty or too long");
+                if (args[field].get<std::string>().empty() || args[field].get<std::string>().size() > 200)
+                    return MaiToolResult::failure(MaiErrorCode::InvalidInput, "browser target is empty or too long");
             if (args["expected_url"].get<std::string>().empty() ||
                 args["expected_url"].get<std::string>().size() > 2048)
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                               "browser action needs the exact observed URL");
             if (action == "type" && args["text"].get<std::string>().size() > 4000)
-                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                              "browser text is too long");
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "browser text is too long");
         } else {
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "unknown browser action");
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "unknown browser action");
         }
 
         args["session_id"] = context.sessionId;
+        if (action == "open") {
+            // 宿主用真实调用身份将网页入口插回消息流，不能由模型指定或按 URL 猜位置。
+            args["message_id"] = context.messageId;
+            args["part_id"] = context.partId;
+        }
         if (action != "screenshot") return mDispatcher->call(name(), args.dump());
         if (context.model == "glm-5.3")
             return MaiToolResult::failure(MaiErrorCode::NotSupported,
@@ -905,18 +931,18 @@ void registerMaiChatHostTools(MaiToolRegistry& tools,
         R"("maxItems":200},"text":{"type":"string"}},"required":["peer_ids","text"]})",
         true);
 #if defined(__ANDROID__)
-    // 电话号码和短信能力只在 Android 注册，iOS 没有等价的系统读取接口。
+    // 电话号码和系统短信权限只在 Android 注册；iOS 接收用户的快捷指令输入。
     // permission 只允许列出的系统能力；Android 比 iOS 多号码和短信两项。
     constexpr const char* permissionSchema =
         R"({"type":"object","properties":{"permission":{"type":"string","enum":["photos","camera","microphone",)"
-            R"("location","contacts","phone_call","calendar","notifications",)"
-            R"("phone_number","sms"]}},"required":["permission"],)"
-            R"("additionalProperties":false})";
+        R"("location","contacts","phone_call","calendar","notifications",)"
+        R"("phone_number","sms"]}},"required":["permission"],)"
+        R"("additionalProperties":false})";
 #else
     constexpr const char* permissionSchema =
         R"({"type":"object","properties":{"permission":{"type":"string","enum":["photos","camera","microphone",)"
-            R"("location","contacts","calendar","notifications"]}},"required":["permission"],)"
-            R"("additionalProperties":false})";
+        R"("location","contacts","calendar","notifications"]}},"required":["permission"],)"
+        R"("additionalProperties":false})";
 #endif
     // 先按任务所需申请单项 OS 权限；有限授权可继续读取被用户选中的媒体或联系人。
     add("mobile_request_permission",
@@ -934,15 +960,28 @@ void registerMaiChatHostTools(MaiToolRegistry& tools,
         "is granted. The carrier may provide no number, and a returned number is not verified.",
         // 无其他参数；先调用 mobile_request_permission(phone_number)。
         R"({"type":"object","properties":{},"additionalProperties":false})");
+#endif
+#if defined(__ANDROID__) || defined(MAICHAT_MOBILE_IOS)
     // 短信属于敏感数据：仅在用户明确要求且授权后读取，不为普通任务遍历短信。
     add("mobile_read_sms",
+#if defined(__ANDROID__)
         "Read up to 20 recent Android SMS inbox messages only when the user specifically asks, "
         "after sms permission is granted. READ_SMS is restricted by Android and may be unavailable "
         "depending on the installer. Do not use for OTP retrieval without an explicit user request.",
+#else
+        "Read up to 20 recent messages explicitly supplied by the user's Shortcuts message "
+        "automation on this iPhone, only when the user specifically asks. iOS does not allow "
+        "MaiChat to read the Messages inbox or its history. The user must enable SMS integration "
+        "in MaiChat Settings and configure a Message automation using the MaiChat SMS import "
+        "action in Shortcuts. Imported messages expire after 24 hours and are stored only on "
+        "this device; requested tool results enter the model task. No sms OS permission "
+        "exists on iOS. An empty result only means no imported messages match, not an empty "
+        "system inbox. Do not use for OTP retrieval without an explicit user request.",
+#endif
         // limit 最多 20 条；after_ms 只取该时间之后的消息。
-        // 读取需要用户明确请求和系统 sms 授权，不能把短信作为普通上下文抓取。
+        // Android 需要系统 sms 授权；iOS 只读取用户快捷指令交入的内容。
         R"({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":20},)"
-            R"("after_ms":{"type":"integer","minimum":0}},"additionalProperties":false})");
+        R"("after_ms":{"type":"integer","minimum":0}},"additionalProperties":false})");
 #endif
     // 定位工具只在前台读一次当前位置；没有权限先调用 mobile_request_permission。
     add("mobile_get_location",
@@ -960,7 +999,7 @@ void registerMaiChatHostTools(MaiToolRegistry& tools,
         "exposes only the selected contacts. Call mobile_request_permission first.",
         // query 可匹配姓名、号码、邮箱；offset/limit 分页，单页最多 50 人。
         R"({"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0,)"
-            R"("maximum":1000},"limit":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})");
+        R"("maximum":1000},"limit":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})");
     add("mobile_get_contact",
         "Read one accessible system contact by the id returned from mobile_list_contacts. "
         "Requires contacts permission and returns only name, phone numbers, and email addresses.",
@@ -1153,7 +1192,8 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         "(degrees 90/180/270 clockwise), resize (width,height), flip_horizontal, flip_vertical, "
         "grayscale, sharpen (amount 0..2), adjust (brightness -1..1, contrast 0..2, "
         "saturation 0..2), or beautify "
-        "(strength 0..1, mild whole-image smoothing and brightening, not face-aware). Call "
+        "(strength 0..1, local face-aware skin processing using the same portrait engine as "
+        "mobile_beautify_image). Call "
         "mobile_preview_image on the returned path, then mobile_save_image to add the result "
         "to the system gallery if requested.",
         // operation 每次只做一项裁剪、旋转、缩放、翻转、灰度、锐化、调色或轻度美化。
@@ -1167,12 +1207,59 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         dispatcher, false));
     tools.add(std::make_unique<MaiMobileHostTool>(
         "mobile_beautify_image",
-        "Make a NEW portrait-friendly image using mild whole-image smoothing, brightening, and "
-        "slightly richer colors. This is not face-aware skin retouching. Strength is 0..1. "
-        "The source remains unchanged; preview the returned path before saving it.",
-        // path 为输入；strength 取 0–1。结果是新图，属于整图轻度处理而非脸部识别。
-        R"({"type":"object","properties":{"path":{"type":"string"},"strength":{"type":"number","minimum":0,)"
-            R"("maximum":1}},"required":["path"]})",
+        "Create a NEW locally retouched portrait using dense face landmarks and a skin mask. "
+        "Smoothing, brightening, whitening, warmth, slimming and eye enlargement are independent. "
+        "whitening (default 0) lifts skin lightness and gently reduces skin chroma without an intentional "
+        "cool color shift; it affects the selected face skin, excluding eyes, brows and lips, not the entire image. "
+        "brightening is RGB gain, not whitening. For whitening-only use explicit smoothing=0, "
+        "brightening=0 and warmth=0; strength only controls smoothing and brightening. "
+        "Use original_path from prior results when refining; prior generated paths are also "
+        "resolved to their original. Explicit parameters override the validated personal model. "
+        "Unspecified shape changes default to zero. For multiple faces set subject_index "
+        "from left to right starting at 0. Return result_id for user feedback and preview "
+        "the path with mobile_preview_image. Never infer user preference from your own judgment.",
+        // 所有处理复用普通 C++ 核心；单独的几何参数默认关闭，strength 保留为旧调用映射。
+        R"({"type":"object","properties":{"path":{"type":"string"},"strength":{"type":"number","minimum":0,"maximum":1},)"
+        R"("smoothing":{"type":"number","minimum":0,"maximum":1},"brightening":{"type":"number","minimum":0,"maximum":1},)"
+        R"("whitening":{"type":"number","minimum":0,"maximum":1,"default":0,"description":"Independent skin lightness lift and gentle chroma reduction; not a warmth adjustment."},)"
+        R"("warmth":{"type":"number","minimum":-1,"maximum":1},"slim_face":{"type":"number","minimum":0,"maximum":1},)"
+        R"("enlarge_eyes":{"type":"number","minimum":0,"maximum":1},"subject_index":{"type":"integer","minimum":0},)"
+        R"("use_personal_model":{"type":"boolean"}},"required":["path"],"additionalProperties":false})",
+        dispatcher, false));
+    tools.add(std::make_unique<MaiMobileHostTool>(
+        "mobile_reshape_body",
+        "Create a NEW locally reshaped photo using body pose and person segmentation. "
+        "Supports mild waist slimming and leg proportion extension on clear upright standing "
+        "photos. Occluded joints, uncertain poses or no room below the feet return an error. "
+        "slim_waist and leg_length are bounded normalized strengths, not literal percentages. "
+        "For multiple people specify subject_index from left to right starting at 0. "
+        "Keep the original; preview the new path and use result_id for explicit user feedback.",
+        R"({"type":"object","properties":{"path":{"type":"string"},"slim_waist":{"type":"number","minimum":0,"maximum":1},)"
+        R"("leg_length":{"type":"number","minimum":0,"maximum":1},"subject_index":{"type":"integer","minimum":0},)"
+        R"("use_personal_model":{"type":"boolean"}},"required":["path"],"additionalProperties":false})",
+        dispatcher, false));
+    tools.add(std::make_unique<MaiMobileHostTool>(
+        "mobile_portrait_feedback",
+        "Record the user's explicit preference between two portrait results from the SAME "
+        "original photo. Use returned result_id values. Include ONLY the attributes the user "
+        "actually evaluated; unmentioned attributes remain unknown. This stores feedback, "
+        "not model training. Use model_continue_training afterward when requested.",
+        R"({"type":"object","properties":{"preferred_result_id":{"type":"string"},"rejected_result_id":{"type":"string"},)"
+        R"("attributes":{"type":"array","minItems":1,"maxItems":8,"uniqueItems":true,"items":{"type":"string",)"
+        R"("enum":["smoothing","brightening","warmth","slim_face","enlarge_eyes","slim_waist","leg_length","whitening"]}}},)"
+        R"("required":["preferred_result_id","rejected_result_id","attributes"],"additionalProperties":false})",
+        dispatcher, false));
+    tools.add(std::make_unique<MaiMobileHostTool>(
+        "model_continue_training",
+        "Train or inspect the CURRENT user's local portrait preference model using saved "
+        "explicit result-pair feedback. This updates small ranking weights; it does not train "
+        "MediaPipe base networks or implement album semantic search. train saves a checkpoint. "
+        "Fewer than three independent original photos produce candidate_only, not an activated "
+        "model. Activation requires held-out-photo validation improvement. status/versions "
+        "show active and saved versions. rollback with version=0 restores the baseline. "
+        "Report the actual returned activation and validation status to the user.",
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["train","status","versions","rollback"]},)"
+        R"("version":{"type":"integer","minimum":0}},"required":["action"],"additionalProperties":false})",
         dispatcher, false));
     tools.add(std::make_unique<MaiMobileHostTool>(
         "mobile_detect_faces",

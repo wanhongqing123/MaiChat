@@ -108,7 +108,7 @@ if(TARGET maichat_openssl_build)
   target_include_directories(libssh2_static PRIVATE "${mai_openssl_build}/include")
 endif()
 set(maichat_opencv_source "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/opencv")
-set(BUILD_LIST "core,imgproc,imgcodecs" CACHE STRING "" FORCE)
+set(BUILD_LIST "core,imgproc,imgcodecs,photo" CACHE STRING "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_PERF_TESTS OFF CACHE BOOL "" FORCE)
@@ -124,6 +124,22 @@ set(WITH_OPENCL OFF CACHE BOOL "" FORCE)
 set(WITH_IPP OFF CACHE BOOL "" FORCE)
 set(WITH_TBB OFF CACHE BOOL "" FORCE)
 add_subdirectory("${maichat_opencv_source}" opencv EXCLUDE_FROM_ALL)
+add_library(maichat_portrait STATIC
+  ../Portrait/MaiPortraitEngine.cpp
+  ../Portrait/MaiPortraitPersonalization.cpp
+  ../Portrait/MaiPortraitBridge.cpp)
+target_include_directories(maichat_portrait PUBLIC ../Portrait PRIVATE
+  "${CMAKE_BINARY_DIR}"
+  "${CMAKE_CURRENT_BINARY_DIR}"
+  ../../MaiAgent/include ../../MaiAgent/third_party/nlohmann ../../MaiAgent/third_party/sqlite
+  ../../MaiAgent/third_party/onnxruntime/include/onnxruntime/core/session
+  "${CMAKE_CURRENT_BINARY_DIR}/opencv"
+  "${maichat_opencv_source}/modules/core/include"
+  "${maichat_opencv_source}/modules/imgproc/include"
+  "${maichat_opencv_source}/modules/photo/include"
+  ${MAI_OPENSSL_INCLUDE_DIR})
+target_link_libraries(maichat_portrait PUBLIC maiagent mai_sqlite opencv_core opencv_imgproc opencv_photo
+  ${MAI_OPENSSL_CRYPTO_TARGET})
 set(ffmpeg_source "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/ffmpeg")
 if(NOT EXISTS "${ffmpeg_source}/configure")
   message(FATAL_ERROR "Vendored FFmpeg source is missing")
@@ -272,7 +288,7 @@ target_include_directories(maichat_mobile PUBLIC . ../MaiChatTools ../Media ../S
     ../../MaiAgent/third_party/asio/asio/include
     ${MAI_OPENSSL_INCLUDE_DIR})
 target_compile_definitions(maichat_mobile PRIVATE ASIO_STANDALONE _WEBSOCKETPP_CPP11_STRICT_)
-target_link_libraries(maichat_mobile PRIVATE maiagent mai_curl_download mai_video_circle_client
+target_link_libraries(maichat_mobile PRIVATE maichat_portrait maiagent mai_curl_download mai_video_circle_client
   mai_cloud_drive_client mai_cloud_vod
   ${MAI_OPENSSL_SSL_TARGET} ${MAI_OPENSSL_CRYPTO_TARGET}
   maiagent_cv_video_analysis

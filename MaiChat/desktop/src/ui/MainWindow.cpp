@@ -3002,9 +3002,12 @@ void MainWindow::buildUi() {
       [this](std::shared_ptr<MaiCloudVod> source, const QString& name) {
         const QString display = QFileInfo(name).fileName().isEmpty() ?
             QStringLiteral("云盘视频.mp4") : QFileInfo(name).fileName();
-        if (!openDockedVideo(display, {}, 0, std::move(source)))
+        if (!openCloudVideo(display, std::move(source)))
           showToast(QStringLiteral("视频无法播放"), 13, 3000);
       }, cloudDrivePage_, {}, true);
+  cloudDriveDialog_->setErrorHandler([this](const QString& error) {
+    showToast(error, 13, 4000);
+  });
   cloudDriveLayout->addWidget(cloudDriveDialog_);
 
   // 远程桌面页：画面在应用内展示，不弹独立窗口。
@@ -4751,8 +4754,7 @@ void MainWindow::rebuildAgentPage() {
                                  cloudPresenter.data(), [path] { QFile::remove(path); });
                 return true;
               }
-              if (!cloudPresenter->openDockedVideo(path, {}, 0,
-                                                    std::move(cloudSource))) return false;
+              if (!cloudPresenter->openCloudVideo(path, std::move(cloudSource))) return false;
               return true;
             },
             [cloudPresenter](const QString& session) {
@@ -4847,7 +4849,7 @@ void MainWindow::rebuildAgentPage() {
   if (sessionSync_) sessionSync_->setDefaultWorkspaceDirectory(defaultWorkspace);
 #if defined(MAICHAT_HAS_FFPLAY)
   agentPanel_->setOpenVideoCallback([this](const QString &path, const QStringList &paths) {
-    openDockedVideo(path, paths);
+    openVideoWindow(path, paths);
   });
 #endif
   agentPanel_->setForwardMediaCallback(
@@ -6292,38 +6294,21 @@ bool MainWindow::composerTextPrecedesFirstAttachment(
 }
 
 bool MainWindow::openDockedVideo(const QString &path, const QStringList &playlist,
-                                 int64_t startPositionUs,
-                                 std::shared_ptr<MaiCloudVod> cloudSource) {
+                                 int64_t startPositionUs) {
 #if defined(MAICHAT_HAS_FFPLAY)
-  if (!videoDockSlot_ || (!cloudSource && !QFileInfo(path).isFile())) return false;
-  const bool cloud = static_cast<bool>(cloudSource);
+  if (!videoDockSlot_ || !QFileInfo(path).isFile()) return false;
   if (auto active = MaiFfplayVideoDialog::activeDialog()) active->close();
-  auto *dialog = cloudSource ?
-      new MaiFfplayVideoDialog(path, std::move(cloudSource), this) :
-      new MaiFfplayVideoDialog(path, this, startPositionUs);
+  auto *dialog = new MaiFfplayVideoDialog(path, this, startPositionUs);
   dialog->setObjectName(QStringLiteral("dockedVideoPlayer"));
   dialog->setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
   dialog->setMinimumSize(0, 0);
   dialog->setDocked(true);
-  if (!cloud) {
-    dialog->setPlaylist(playlist);
-    dialog->setForwardAction([this](const QString &currentPath) {
-      forwardLocalVideo(currentPath);
-    });
-  }
+  dialog->setPlaylist(playlist);
+  dialog->setForwardAction([this](const QString &currentPath) {
+    forwardLocalVideo(currentPath);
+  });
   dialog->setAttribute(Qt::WA_DeleteOnClose);
   dialog->installEventFilter(this);
-  if (cloud && maiChatAccountIdProvider_) {
-    const QString ownerAccount = maiChatAccountIdProvider_();
-    auto* accountGuard = new QTimer(dialog);
-    accountGuard->setInterval(500);
-    connect(accountGuard, &QTimer::timeout, dialog,
-            [this, dialog, ownerAccount] {
-      if (!maiChatAccountIdProvider_ ||
-          maiChatAccountIdProvider_() != ownerAccount) dialog->close();
-    });
-    accountGuard->start();
-  }
   videoDialog_ = dialog;
   connect(dialog, &QObject::destroyed, this, [this] {
     if (!videoDialog_ && videoDockSlot_) videoDockSlot_->hide();
@@ -6340,7 +6325,72 @@ bool MainWindow::openDockedVideo(const QString &path, const QStringList &playlis
   Q_UNUSED(path);
   Q_UNUSED(playlist);
   Q_UNUSED(startPositionUs);
-  Q_UNUSED(cloudSource);
+  return false;
+#endif
+}
+
+bool MainWindow::openVideoWindow(const QString& path, const QStringList& playlist,
+                                 int64_t startPositionUs) {
+#if defined(MAICHAT_HAS_FFPLAY)
+  if (!QFileInfo(path).isFile()) return false;
+  if (auto active = MaiFfplayVideoDialog::activeDialog()) active->close();
+  // 保留父对象的生命周期管理，但使用 Window 类型和原生标题栏；不加入 videoDialog_
+  // 或 videoDockSlot_，主窗口导航、缩放和播放器全屏都不重新分配会话区域。
+  auto* dialog = new MaiFfplayVideoDialog(path, this, startPositionUs);
+  dialog->setObjectName(QStringLiteral("agentVideoPlayerWindow"));
+  dialog->setWindowFlags(Qt::Window | Qt::WindowCloseButtonHint |
+                        Qt::WindowMinMaxButtonsHint | Qt::WindowTitleHint);
+  dialog->setPlaylist(playlist);
+  dialog->setForwardAction([this](const QString& currentPath) {
+    forwardLocalVideo(currentPath);
+  });
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  const QString owner = app_.chatState().ownerUserId();
+  auto* ownerGuard = new QTimer(dialog);
+  ownerGuard->setInterval(500);
+  connect(ownerGuard, &QTimer::timeout, dialog, [this, dialog, owner] {
+    if (app_.chatState().ownerUserId() != owner) dialog->close();
+  });
+  ownerGuard->start();
+  dialog->show();
+  dialog->raise();
+  dialog->activateWindow();
+  if (dialog->isStarted()) return true;
+  dialog->close();
+  return false;
+#else
+  Q_UNUSED(path);
+  Q_UNUSED(playlist);
+  Q_UNUSED(startPositionUs);
+  return false;
+#endif
+}
+
+bool MainWindow::openCloudVideo(const QString& name, std::shared_ptr<MaiCloudVod> source) {
+#if defined(MAICHAT_HAS_FFPLAY)
+  if (!source || !maiChatAccountIdProvider_ || maiChatAccountIdProvider_().isEmpty()) return false;
+  if (auto active = MaiFfplayVideoDialog::activeDialog()) active->close();
+  // 不登记到 videoDialog_ 或 dock：播放、拖动和全屏不改变云盘列表的布局与滚动位置。
+  auto* dialog = new MaiFfplayVideoDialog(name, std::move(source), this);
+  dialog->setObjectName(QStringLiteral("cloudVideoPlayer"));
+  dialog->setWindowFlags(Qt::Window | Qt::WindowCloseButtonHint |
+                        Qt::WindowMinMaxButtonsHint | Qt::WindowTitleHint);
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  const QString owner = maiChatAccountIdProvider_();
+  auto* guard = new QTimer(dialog);
+  guard->setInterval(500);
+  connect(guard, &QTimer::timeout, dialog, [this, dialog, owner] {
+    if (!maiChatAccountIdProvider_ || maiChatAccountIdProvider_() != owner) dialog->close();
+  });
+  guard->start();
+  dialog->show();
+  dialog->raise();
+  if (dialog->isStarted()) return true;
+  dialog->close();
+  return false;
+#else
+  Q_UNUSED(name);
+  Q_UNUSED(source);
   return false;
 #endif
 }

@@ -14,6 +14,7 @@ add_library(maichat_agent SHARED MaiAgentJni.cpp MaiChatAuthJni.cpp
 target_include_directories(maichat_agent PRIVATE
   ../../../../../../Network
   ../../../../../../Media
+  ../../../../../../Portrait
   ../../../../../../Media/FfplayCompat
   ../../../../../../SessionSync
   ../../../../../../../MaiAgent/include)

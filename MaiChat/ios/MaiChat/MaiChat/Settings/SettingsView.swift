@@ -302,6 +302,10 @@ private struct AccountSettingsView: View {
             }
 
             Section("隐私与支持") {
+                NavigationLink("短信接入") {
+                    AIMobileSMSSettingsView(ownerID: appState.masterUserID)
+                }
+                .accessibilityIdentifier("sms-integration-entry")
                 Link("隐私政策", destination: URL(string: "https://ichat.life/legal/privacy.html")!)
                 Link("用户协议", destination: URL(string: "https://ichat.life/legal/terms.html")!)
                 Link("联系我们", destination: URL(string: "mailto:1925271463@kongshang.com")!)

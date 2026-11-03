@@ -231,6 +231,7 @@ final class AIMobileHostToolProvider {
         case "mobile_get_contact": return await getSystemContact(arguments)
         case "mobile_dial_phone": return await dialPhone(arguments)
         case "mobile_compose_sms": return composeSMS(arguments)
+        case "mobile_read_sms": return await readImportedSMS(arguments)
         case "mobile_decode_text": return decodeLegacyText(arguments)
         case "generate_pdf": return generatePDF(arguments)
         case "pdf_password_request": return pdfPasswordRequest(arguments)
@@ -254,6 +255,12 @@ final class AIMobileHostToolProvider {
             var edit = arguments
             edit["operation"] = "beautify"
             return await transformImage(edit)
+        case "mobile_reshape_body":
+            var edit = arguments
+            edit["operation"] = "reshape_body"
+            return await transformImage(edit)
+        case "mobile_portrait_feedback": return await portraitPersonalization(arguments, feedback: true)
+        case "model_continue_training": return await portraitPersonalization(arguments)
         case "mobile_detect_faces": return await detectFaces(arguments)
         case "mobile_segment_person": return await segmentPerson(arguments)
         case "mobile_preview_image": return previewImage(arguments)
@@ -744,6 +751,50 @@ final class AIMobileHostToolProvider {
     }
 
     /// 只预填系统短信编辑器；发送或取消始终由用户在系统界面决定。
+    func readImportedSMS(_ arguments: [String: Any]) async -> AIMaiChatHostToolExecution {
+        guard Set(arguments.keys).isSubset(of: ["limit", "after_ms"]) else {
+            return .failure(code: "invalid_input", message: "use limit and after_ms only")
+        }
+        func integer(_ key: String, fallback: Int64) -> Int64? {
+            guard let value = arguments[key] else { return fallback }
+            guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite, number.doubleValue >= 0,
+                  number.doubleValue < Double(Int64.max),
+                  Double(number.int64Value) == number.doubleValue else { return nil }
+            return number.int64Value
+        }
+        guard let limit = integer("limit", fallback: 10), (1...20).contains(limit),
+              let after = integer("after_ms", fallback: 0) else {
+            return .failure(code: "invalid_input", message: "limit must be 1–20 and after_ms a nonnegative integer")
+        }
+        guard UIApplication.shared.applicationState == .active,
+              let appState, appState.hasUnifiedAccount, !appState.masterUserID.isEmpty else {
+            return .failure(code: "not_configured", message: "请在前台打开 MaiChat 并登录后读取已接入的短信。")
+        }
+        let ownerID = appState.masterUserID
+        do {
+            let messages = try await AIMobileSMSInbox.shared.readRecent(
+                ownerID: ownerID, limit: Int(limit), afterMilliseconds: after)
+            guard self.appState?.masterUserID == ownerID,
+                  self.appState?.hasUnifiedAccount == true,
+                  UIApplication.shared.applicationState == .active else {
+                return .failure(code: "canceled", message: "短信读取期间账号或前台状态已变化。")
+            }
+            return Self.jsonSuccess(["source": "shortcuts_import", "inbox_access": false,
+                                     "retention_hours": 24, "count": messages.count,
+                                     "messages": messages.map { message in
+                ["id": message.id.uuidString, "sender": message.sender, "body": message.body,
+                 "timestamp_ms": message.timestampMilliseconds,
+                 "imported_at_ms": message.importedMilliseconds,
+                 "timestamp_source": message.timestampSource] as [String: Any]
+            }])
+        } catch AIMobileSMSInbox.InboxError.notEnabled {
+            return .failure(code: "not_configured", message: "请在“我的 → 设置 → 短信接入”开启接入，并配置“将短信交给 MaiChat”消息自动化。iOS 不能直接读取历史短信。")
+        } catch {
+            return .failure(code: "unavailable", message: "无法读取本机已接入的短信，请检查设备是否已解锁及短信接入设置。")
+        }
+    }
+
     func composeSMS(_ arguments: [String: Any]) -> AIMaiChatHostToolExecution {
         guard let recipients = arguments["recipients"] as? [String],
               (1...10).contains(recipients.count),

@@ -104,8 +104,12 @@ public:
     AgentController* activeAgentController() const { return agentController_; }
     void setSessionSyncCoordinator(DesktopSessionSyncCoordinator* coordinator);
     bool openDockedVideo(const QString& path, const QStringList& playlist = {},
-                         int64_t startPositionUs = 0,
-                         std::shared_ptr<MaiCloudVod> cloudSource = {});
+                         int64_t startPositionUs = 0);
+    // Agent 视频使用独立顶层窗口，不登记停靠状态，不改变聊天或创作中心布局。
+    bool openVideoWindow(const QString& path, const QStringList& playlist = {},
+                         int64_t startPositionUs = 0);
+    // 云盘界面与云盘工具复用独立窗口；换账号即关闭，点播源由播放器持有至退出。
+    bool openCloudVideo(const QString& name, std::shared_ptr<MaiCloudVod> source);
 
     // 把 IM 收/发的文件附件从本地缓存拷贝到 targetPath（存在则覆盖）。
     // 纯文件操作、不弹 UI，供右键「保存到本地」与单测复用；失败时经

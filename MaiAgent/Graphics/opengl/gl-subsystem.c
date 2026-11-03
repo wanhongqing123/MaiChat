@@ -979,23 +979,30 @@ void device_enable_framebuffer_srgb(gs_device_t *device, bool enable)
 #endif
 }
 
-bool device_framebuffer_srgb_enabled(gs_device_t *device)
-{
-	UNUSED_PARAMETER(device);
+bool device_framebuffer_srgb_enabled(gs_device_t* device) {
+    UNUSED_PARAMETER(device);
 
 #if defined(__ANDROID__)
-	return true;
+    // GLES 对 sRGB 附件自动编码，没有桌面 GL_FRAMEBUFFER_SRGB 开关。
+    // Android TextureView 的 EGL 默认表面可能为 LINEAR，不能无条件报告已启用。
+    GLint framebuffer = 0;
+    GLint encoding = GL_LINEAR;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
+                                          framebuffer ? GL_COLOR_ATTACHMENT0 : GL_BACK,
+                                          GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING, &encoding);
+    return gl_success("glGetFramebufferAttachmentParameteriv") && encoding == GL_SRGB;
 #else
-	const GLboolean enabled = glIsEnabled(GL_FRAMEBUFFER_SRGB);
-	gl_success("glIsEnabled");
-	return enabled == GL_TRUE;
+    const GLboolean enabled = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+    gl_success("glIsEnabled");
+    return enabled == GL_TRUE;
 #endif
 }
 
-void device_copy_texture_region(gs_device_t *device, gs_texture_t *dst, uint32_t dst_x, uint32_t dst_y,
-				gs_texture_t *src, uint32_t src_x, uint32_t src_y, uint32_t src_w, uint32_t src_h)
-{
-	struct gs_texture_2d *src2d = (struct gs_texture_2d *)src;
+void device_copy_texture_region(gs_device_t* device, gs_texture_t* dst, uint32_t dst_x,
+                                uint32_t dst_y, gs_texture_t* src, uint32_t src_x, uint32_t src_y,
+                                uint32_t src_w, uint32_t src_h) {
+    struct gs_texture_2d *src2d = (struct gs_texture_2d *)src;
 	struct gs_texture_2d *dst2d = (struct gs_texture_2d *)dst;
 
 	if (!src) {

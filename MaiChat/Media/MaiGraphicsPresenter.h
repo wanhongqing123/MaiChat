@@ -26,9 +26,10 @@ bool maiGraphicsPresenterStart(const char* backend, const char* effect_directory
 uint64_t maiGraphicsPresenterAttach(void* native_view, uint32_t width, uint32_t height,
                                     MaiGraphicsNativeViewCallback retain_view,
                                     MaiGraphicsNativeViewCallback release_view);
-// iOS only: switch this player's swapchain to system HLG/EDR tone mapping.
+// Apple platforms: switch this player's swapchain to system HLG/EDR tone mapping.
 // ambient is the eight-byte big-endian 'amve' payload, or NULL when absent.
 // Disable before presenting software SDR fallback frames in the same view.
+// A true return value means queued; platform availability is checked on the graphics thread.
 bool maiGraphicsPresenterSetHlgOutput(uint64_t view_id, bool enabled,
                                       const uint8_t* ambient, uint32_t ambient_size);
 bool maiGraphicsPresenterShowImage(uint64_t view_id, const char* file_path, bool fill_view);

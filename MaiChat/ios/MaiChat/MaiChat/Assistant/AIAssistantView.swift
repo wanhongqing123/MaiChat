@@ -1,4 +1,4 @@
-// 文件作用：展示创作中心的会话抽屉、消息时间线、附件预览、输入栏和语音交互。
+// 文件作用：组织会话目录与创作页面的联动侧滑，以及消息、附件、输入栏和语音交互。
 // 消息列表只渲染模型已经加载的页面；切 Session 后定位到新会话真实的最新消息。
 // 用户上滑阅读旧页时保留当前位置；新消息、键盘或播放器分屏只在需要跟随底部时校正。
 // 会话读写与 Agent 任务由 AIAssistantModel 管理；本文件负责视图生命周期和操作反馈。
@@ -14,8 +14,47 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-private enum AIImagePreviewLayout {
-    static let coordinateSpaceName = "ai-assistant-image-preview-space"
+struct AIImageSourceFramesKey: PreferenceKey {
+    static let defaultValue: [UUID: CGRect] = [:]
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+    }
+}
+
+@MainActor
+final class AIImageSourceFrameStore: ObservableObject {
+    @Published private(set) var frames: [UUID: CGRect] = [:]
+    func update(_ value: [UUID: CGRect]) {
+        if frames != value { frames = value }
+    }
+}
+
+struct AIImagePreviewVisibilityKey: PreferenceKey {
+    static let defaultValue = false
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
+}
+
+private struct AIImagePreviewSourceKey: EnvironmentKey {
+    static let defaultValue: UUID? = nil
+}
+
+private struct AIConversationActionsAllowedKey: EnvironmentKey {
+    // 仅媒体按钮读取实时检查；普通消息行不依赖此环境，避免拖动时重绘整段 Markdown。
+    static let defaultValue: @MainActor () -> Bool = { true }
+}
+
+private extension EnvironmentValues {
+    var aiImagePreviewSourceID: UUID? {
+        get { self[AIImagePreviewSourceKey.self] }
+        set { self[AIImagePreviewSourceKey.self] = newValue }
+    }
+}
+
+extension EnvironmentValues {
+    var aiConversationActionsAllowed: @MainActor () -> Bool {
+        get { self[AIConversationActionsAllowedKey.self] }
+        set { self[AIConversationActionsAllowedKey.self] = newValue }
+    }
 }
 
 private struct AIRemoteDeviceGroup: Identifiable {
@@ -26,9 +65,18 @@ private struct AIRemoteDeviceGroup: Identifiable {
     var sessions: [AIRemoteSession]
 }
 
+/// 单次侧滑的方向锁和连续位移；稳定状态必须保留到 onEnded 提交完成。
+private struct AISessionDrawerDrag {
+    var horizontal: Bool?
+    var translation: CGFloat = 0
+}
+
+
 struct AIAssistantView: View {
     @EnvironmentObject private var appState: RemoteIMAppState
     let isActive: Bool
+    let hostsImagePreview: Bool
+    private let bottomBar: AnyView?
     @ObservedObject private var model = AIAssistantModel.shared
     @ObservedObject private var videoCircle = MaiVideoCircleModel.shared
     @ObservedObject private var cloudDrive = MaiCloudDriveModel.shared
@@ -37,34 +85,31 @@ struct AIAssistantView: View {
     @State private var showSessions = false
     @State private var showActions = false
     @State private var confirmClear = false
+    @State private var imageSources = AIImageSourceFrameStore()
     @State private var confirmRemoteDelete = false
     @State private var remoteDeleteTarget: AIRemoteSession?
-    @State private var sessionDrawerOffset: CGFloat = 0
-    @State private var sessionDrawerWidth: CGFloat = 320
+    // GestureState 会在 onEnded 前清零，不能用它保存待提交的方向/位移。
+    // 仅用它通知中断；拖动数据保留到显式提交，取消时再归还稳定端点。
+    @State private var sessionDrawerDrag = AISessionDrawerDrag()
+    @GestureState private var sessionDrawerGestureActive = false
+    // 命中禁用不能阻止已经按下的行在松手时回调；动作本身也须读这个实时互锁。
+    @State private var sessionActionsLocked = false
+    @State private var sessionMotionGeneration: UInt64 = 0
     @State private var showsWideSidebar = true
     @State private var collapsedSessionDevices: Set<String> = []
     @State private var isAttachmentPanelPresented = false
     @State private var composerFocusController = AIComposerFocusController()
     @State private var transcriptionPresentation = VoiceTranscriptionPresentation()
-    @State private var galleryDirection = 0
 
-    init(isActive: Bool = true) {
+    init(isActive: Bool = true, hostsImagePreview: Bool = true, bottomBar: AnyView? = nil) {
         self.isActive = isActive
+        self.hostsImagePreview = hostsImagePreview
+        self.bottomBar = bottomBar
     }
 
     private var usesStandaloneUITestFixture: Bool {
-        #if targetEnvironment(simulator)
-        let arguments = ProcessInfo.processInfo.arguments
-        return arguments.contains("--app-bars-layout-ui-test") ||
-            arguments.contains("--ai-history-ui-test") ||
-            arguments.contains("--ai-welcome-ui-test") ||
-            arguments.contains("--ai-session-switch-ui-test") ||
-            arguments.contains("--ai-browser-ui-test") ||
-            arguments.contains("--ai-media-draft-ui-test") ||
-            arguments.contains("--ai-stream-typing-ui-test") ||
-            arguments.contains("--voice-conversation-preview") ||
-            arguments.contains("--ai-image-fullscreen-ui-test") ||
-            arguments.contains("--ai-image-mixed-ui-test")
+        #if DEBUG && targetEnvironment(simulator)
+        return AIAssistantUITestRouting.usesStandaloneFixture
         #else
         return false
         #endif
@@ -72,28 +117,55 @@ struct AIAssistantView: View {
 
     var body: some View {
         GeometryReader { viewport in
-            content(viewportSize: viewport.size)
+            content(viewportSize: viewport.size, safeAreaInsets: viewport.safeAreaInsets)
         }
     }
 
     /// 根据横竖屏尺寸装配标题、消息列表、输入栏和弹层。
     /// 视频分屏只改变可用视口；会话数据仍由原页面持有，弹层不参与消息区测量。
-    private func content(viewportSize: CGSize) -> some View {
+    private func content(viewportSize: CGSize, safeAreaInsets: EdgeInsets) -> some View {
         let wideLayout = viewportSize.width >= 700 && viewportSize.width > viewportSize.height
+        let width = min(360, viewportSize.width * 0.78)
+        let distance = wideLayout ? 0 : max(0, min(width,
+            (showSessions ? width : 0) + sessionDrawerDrag.translation))
+        let progress = width > 0 ? distance / width : 0
+        // 参考用户录屏：430 pt 窗口展开约 336 pt；原页面缩至约 95%，目录从左侧联动进入。
+        // 起拖时即显露大圆角，收回最后 12 pt 时才贴回窗口，避免交界一直像直角挡板。
+        let card = RoundedRectangle(cornerRadius: 50 * min(1, distance / 12), style: .circular)
+        let backdropOpacity = wideLayout ? 0 : 0.22 * (1 - progress)
         return ZStack(alignment: .topTrailing) {
+            if !wideLayout {
+                // 两页沿同一个位移联动；保持目录完整排版，只平移，不再按已揭示宽度裁切。
+                // 录屏中目录在展开途中逐渐变亮；轮廓与投影跟随右侧移动页面。
+                sessionList(wideLayout: false)
+                    .frame(width: width)
+                    .padding(.top, safeAreaInsets.top)
+                    .padding(.bottom, safeAreaInsets.bottom)
+                    .background(Color(uiColor: .systemBackground))
+                    .overlay {
+                        Color.black.opacity(backdropOpacity).allowsHitTesting(false)
+                    }
+                    .offset(x: distance - width)
+                    .padding(.top, -safeAreaInsets.top)
+                    .padding(.bottom, -safeAreaInsets.bottom)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    // 防止窄屏视频分区中的目录平移绘制到相邻播放器，竖向仍覆盖系统安全区。
+                    .mask {
+                        Rectangle().padding(.top, -safeAreaInsets.top)
+                            .padding(.bottom, -safeAreaInsets.bottom)
+                    }
+                    .allowsHitTesting(showSessions)
+                    .accessibilityHidden(!showSessions)
+                    .zIndex(0)
+            }
             HStack(spacing: 0) {
                 if wideLayout && showsWideSidebar {
-                    // 横屏固定展示会话列表；竖屏仍使用抽屉，避免遮住阅读区域。
+                    // 宽屏固定展示会话列表；窄屏在同一容器内连续平移两个页面。
                     sessionList(wideLayout: true)
                         .frame(width: min(280, viewportSize.width * 0.3))
                     Divider()
                 }
                 VStack(spacing: 0) {
-                    if browser.isOpen && browser.ownerSessionID == model.selected &&
-                        model.selectedRemote == nil {
-                        AIAssistantBrowserPane(browser: browser)
-                            .frame(height: min(340, max(180, viewportSize.height * 0.4)))
-                    }
                     // 首次准备期间显示明确进度；已有会话的刷新继续展示旧消息，
                     // 待读取完成后才在相同容器内更新可见页。
                     if !model.ready {
@@ -115,7 +187,10 @@ struct AIAssistantView: View {
                             model: model,
                             focusController: composerFocusController,
                             isAttachmentPanelPresented: $isAttachmentPanelPresented,
-                            isActive: isActive
+                            isActive: isActive,
+                            blocksVerticalScrolling: !wideLayout &&
+                                (showSessions || sessionActionsLocked ||
+                                 sessionDrawerDrag.horizontal == true)
                         )
                         .frame(maxWidth: 900)
                         .frame(maxWidth: .infinity)
@@ -130,11 +205,17 @@ struct AIAssistantView: View {
                             openSessionDrawer(wideLayout: wideLayout)
                         },
                         openActions: {
+                            #if DEBUG
+                            AISessionDrawerDiagnostics.menuTap(blocked: conversationActionsBlocked,
+                                                               shown: showActions)
+                            #endif
+                            guard !conversationActionsBlocked else { return }
                             composerFocusController.dismiss()
                             isAttachmentPanelPresented = false
                             showActions.toggle()
                         },
                         openVideoCircle: videoCircle.availability == .available ? {
+                            guard !conversationActionsBlocked else { return }
                             showActions = false
                             videoCircle.presentation = .circle
                         } : nil
@@ -185,84 +266,126 @@ struct AIAssistantView: View {
                 }
                 .background(Color(uiColor: .systemBackground), ignoresSafeAreaEdges: [])
             }
-            if showActions {
-                // 右上角操作面板只处理模型、权限与会话清理；
-                // 关闭时保留当前会话、消息和输入草稿。
-                Color.black.opacity(0.001).ignoresSafeArea().contentShape(Rectangle())
-                    .onTapGesture { showActions = false }
-                AIActionPanel(
-                    selectedEffort: model.settings.effectiveReasoningEffort,
-                    selectedPolicy: model.settings.policy,
-                    canChangeSettings: model.selectedRemote == nil && model.configured &&
-                        !model.busy && !model.isSubmitting,
-                    canClear: model.selectedRemote == nil && !model.busy &&
-                        !model.selected.isEmpty,
-                    selectEffort: { selected in
-                        guard selected != model.settings.effectiveReasoningEffort else { return }
-                        var next = model.settings
-                        next.reasoningEffort = selected
-                        Task { _ = await model.save(next) }
-                    },
-                    selectPolicy: { policy in
-                        guard policy != model.settings.policy else { return }
-                        var next = model.settings
-                        next.policy = policy
-                        Task { _ = await model.save(next) }
-                    },
-                    clear: { showActions = false; confirmClear = true }
-                )
-                .padding(.top, 54).padding(.trailing, 14)
-                .transition(.scale(scale: 0.96, anchor: .topTrailing).combined(with: .opacity))
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if let bottomBar { bottomBar }
             }
-            if !wideLayout {
-                // 竖屏抽屉常驻于视图树，通过位移和命中状态开合；
-                // 不销毁下方消息页，侧滑过程中才能持续看到原会话内容。
-                GeometryReader { geometry in
-                    let width = min(360, geometry.size.width * 0.86)
-                    let offset = sessionDrawerX(width: width)
-                    let progress = max(0, min(1, 1 + offset / width))
-                    ZStack(alignment: .leading) {
-                        Color.black.opacity(0.16 * progress)
-                            .ignoresSafeArea()
-                            .contentShape(Rectangle())
-                            .onTapGesture { closeSessionDrawer() }
-                        sessionList(wideLayout: false)
-                            .frame(width: width)
-                            .offset(x: offset)
-                            .shadow(color: Color.black.opacity(0.18 * progress), radius: 22, x: 8)
-                            .accessibilityHidden(!showSessions)
+            .overlay(alignment: .topTrailing) {
+                if showActions {
+                    // 右上角操作面板只处理模型、权限与会话清理；
+                    // 遮罩与面板共用明确的右上角容器，避免多根 overlay 的默认居中布局。
+                    // 容器跟随当前创作页面尺寸，分屏/旋转后仍紧贴该页标题栏。
+                    ZStack(alignment: .topTrailing) {
+                        Color.black.opacity(0.001).ignoresSafeArea().contentShape(Rectangle())
+                            .onTapGesture { showActions = false }
+                        AIActionPanel(
+                            selectedEffort: model.settings.effectiveReasoningEffort,
+                            selectedPolicy: model.settings.policy,
+                            canChangeSettings: model.selectedRemote == nil && model.configured &&
+                                !model.busy && !model.isSubmitting,
+                            canClear: model.selectedRemote == nil && !model.busy &&
+                                !model.selected.isEmpty,
+                            selectEffort: { selected in
+                                guard selected != model.settings.effectiveReasoningEffort else { return }
+                                var next = model.settings
+                                next.reasoningEffort = selected
+                                Task { _ = await model.save(next) }
+                            },
+                            selectPolicy: { policy in
+                                guard policy != model.settings.policy else { return }
+                                var next = model.settings
+                                next.policy = policy
+                                Task { _ = await model.save(next) }
+                            },
+                            clear: { showActions = false; confirmClear = true }
+                        )
+                        .padding(.top, 54).padding(.trailing, 14)
+                        .transition(.scale(scale: 0.96, anchor: .topTrailing).combined(with: .opacity))
                     }
-                    .onAppear { sessionDrawerWidth = width }
-                    .onChange(of: geometry.size.width) { _ in sessionDrawerWidth = width }
-                    .simultaneousGesture(sessionDrawerCloseGesture(width: width))
                 }
-                .allowsHitTesting(showSessions)
-                .accessibilityHidden(!showSessions)
-                .zIndex(3)
             }
-            if let preview = model.previewImage {
-                // 图片预览盖住整屏，媒体序列标识保持稳定；
-                // 关闭预览后原消息行和滚动位置仍属于同一个会话页面。
-                AIImagePreviewOverlay(preview: preview,
-                                      navigate: navigateImagePreview) {
-                    model.previewImage = nil
+            // 右页的消息、输入和底部入口共用互锁；返回目录的透明按钮在禁用范围之外。
+            // 这里只锁横向拖动、回弹及目录展开态，不能因普通纵向阅读而禁用 ScrollView。
+            .environment(\.aiConversationActionsAllowed, { !conversationActionsBlocked })
+            .disabled(!wideLayout && conversationActionsBlocked)
+            .allowsHitTesting(wideLayout || !conversationActionsBlocked)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("ai-conversation-card")
+            .accessibilityHidden(!wideLayout && showSessions)
+            .overlay {
+                if !wideLayout && showSessions {
+                    // 移出的创作页面仍保留原会话画面，点击只收起目录，不能误触发送或导航。
+                    Button {
+                        guard !sessionActionsBlocked else { return }
+                        closeSessionDrawer()
+                    } label: {
+                        Color.clear.contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("收起对话列表")
+                    .accessibilityIdentifier("ai-session-return")
                 }
-                .id(preview.id)
-                .transition(.opacity.combined(with:
-                    .offset(x: CGFloat(galleryDirection * 48))))
-                // 和 IM 图片预览一致，覆盖屏幕边缘并隐藏系统状态栏。
-                .ignoresSafeArea()
-                .zIndex(30)
+            }
+            // 录屏里的圆角轮廓属于移动页面；统一包住标题、消息、输入和导航再缩放，
+            // 不改变消息视口的排版尺寸，投影只由页面轮廓产生，不分散到原生子视图。
+            .padding(.top, safeAreaInsets.top)
+            .padding(.bottom, safeAreaInsets.bottom)
+            .background(Color(uiColor: .systemBackground))
+            .clipShape(card)
+            .compositingGroup()
+            .background {
+                card.fill(Color(uiColor: .systemBackground))
+                    .shadow(color: .black.opacity(0.15 * progress), radius: 18, x: -5, y: 0)
+            }
+            .scaleEffect(1 - 0.05 * progress, anchor: .leading)
+            .offset(x: distance)
+            .padding(.top, -safeAreaInsets.top)
+            .padding(.bottom, -safeAreaInsets.bottom)
+            .zIndex(10)
+            if hostsImagePreview {
+                // 独立宿主复用同一预览；正常 App 由 Root 放在底部导航和分屏之上。
+                AIAssistantImagePreviewLayer(sources: imageSources).zIndex(30)
             }
         }
-        .coordinateSpace(name: AIImagePreviewLayout.coordinateSpaceName)
-        .statusBarHidden(model.previewImage != nil)
+        .environment(\.aiImagePreviewSourceID, model.previewImage?.sourceID)
+        .onPreferenceChange(AIImageSourceFramesKey.self) { if hostsImagePreview { imageSources.update($0) } }
+        .statusBarHidden(hostsImagePreview && model.previewImage != nil)
         .onChange(of: model.previewImage?.filePath) { path in
             MaiCloudDriveAgentPlaybackCache.shared.previewChanged(to: path)
         }
-        .simultaneousGesture(sessionDrawerOpenGesture(wideLayout: wideLayout))
+        .background {
+            Color(uiColor: .systemBackground)
+                .overlay(Color.black.opacity(backdropOpacity))
+                .ignoresSafeArea()
+        }
+        .coordinateSpace(name: "ai-session-reveal")
+        // 网页在不遮挡聊天的背景宿主中保留渲染；只有明确点击任务入口才移交全屏页面。
+        .background {
+            AIBrowserWebContainer(browser: browser, presentation: false)
+                .allowsHitTesting(false).accessibilityHidden(true)
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { browser.isPresented },
+            set: { if !$0 { browser.dismissPage() } }
+        )) {
+            AIAssistantBrowserScreen(browser: browser)
+        }
+        .simultaneousGesture(sessionDrawerGesture(wideLayout: wideLayout, width: width))
+        .onChange(of: sessionDrawerGestureActive) { active in
+            if !active && sessionDrawerDrag.horizontal != nil {
+                if sessionDrawerDrag.horizontal == true {
+                    settleSessionDrawer(expanded: showSessions)
+                } else {
+                    sessionDrawerDrag = AISessionDrawerDrag()
+                }
+            }
+        }
         .onChange(of: wideLayout) { wide in
-            if wide { showSessions = false }
+            if wide {
+                sessionMotionGeneration &+= 1
+                sessionActionsLocked = false
+                sessionDrawerDrag = AISessionDrawerDrag()
+                showSessions = false
+            }
         }
         .confirmationDialog("清空当前对话的所有消息？", isPresented: $confirmClear, titleVisibility: .visible) {
             Button("清空消息", role: .destructive) { Task { await model.action("clear") } }
@@ -292,6 +415,7 @@ struct AIAssistantView: View {
         }
         .onChange(of: isActive) { active in
             browser.setPageVisible(active)
+            if !active { browser.dismissPage() }
             guard !usesStandaloneUITestFixture else { return }
             if active {
                 model.setPageActive(true)
@@ -303,9 +427,10 @@ struct AIAssistantView: View {
             }
         }
         .onDisappear {
-            browser.setPageVisible(false)
+            // 全屏网页仍属于当前会话；呈现它不应让工具误判为已经离开创作中心。
+            if !browser.isPresented { browser.setPageVisible(false) }
             logAIHistoryEvent("page-disappeared session=\(model.selected) active=\(isActive)")
-            if !usesStandaloneUITestFixture {
+            if !usesStandaloneUITestFixture && !browser.isPresented {
                 model.disappear()
             }
         }
@@ -316,107 +441,123 @@ struct AIAssistantView: View {
             else { model.disappear() }
         }
         .onChange(of: model.selected) { selected in
-            if browser.isOpen && browser.ownerSessionID != selected { browser.close() }
+            if browser.ownerSessionID != selected { browser.leaveSession() }
         }
         .onChange(of: model.selectedRemote?.id) { remote in
-            if remote != nil { browser.close() }
+            if remote != nil { browser.leaveSession() }
         }
         .onChange(of: appState.maiChatAccountID) { _ in
             browser.close()
         }
     }
 
-    private func navigateImagePreview(_ direction: Int) -> Bool {
-        guard let current = model.previewImage,
-              let next = current.sequence?.adjacent(direction) else { return false }
-        galleryDirection = direction
-        if next.current.kind == .video {
-            guard let appState = AIMobileHostToolProvider.shared.appState else { return false }
-            model.previewImage = nil
-            appState.agentVideoPresentation = MaiFfplayPresentation(
-                sequence: next, entryDirection: direction)
+    private static let drawerSettleDuration: Double = 0.24
+
+    private var sessionActionsBlocked: Bool {
+        sessionActionsLocked || sessionDrawerGestureActive || sessionDrawerDrag.horizontal == true
+    }
+
+    private var conversationActionsBlocked: Bool {
+        showSessions || sessionActionsLocked || sessionDrawerDrag.horizontal == true
+    }
+
+    /// 覆盖拖动、松手及回弹；代次检查防止旧动画完成时解除新一轮拖动的互锁。
+    private func settleSessionDrawer(expanded: Bool,
+                                     duration: Double = Self.drawerSettleDuration) {
+        #if DEBUG
+        AISessionDrawerDiagnostics.begin("settling")
+        #endif
+        sessionMotionGeneration &+= 1
+        let generation = sessionMotionGeneration
+        sessionActionsLocked = true
+        let updates = {
+            showSessions = expanded
+            sessionDrawerDrag = AISessionDrawerDrag()
+        }
+        // 跟手阶段仍是无动画的 1:1 位移；松手用有界减速收尾，不能等弹簧的长尾才恢复点击。
+        let animation = Animation.easeOut(duration: duration)
+        if #available(iOS 17.0, *) {
+            withAnimation(animation, completionCriteria: .removed, updates) {
+                releaseSessionActions(generation: generation)
+            }
         } else {
-            withAnimation(.easeOut(duration: 0.22)) {
-                model.previewImage = AIImagePreview(
-                    filePath: next.current.path,
-                    imageSize: MaiConversationMedia.imageSize(at: next.current.path),
-                    sequence: next)
+            withAnimation(animation, updates)
+            // iOS 16 没有完成回调；覆盖同一有限时长动画及两帧余量，再释放 touch-up 互锁。
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.04) {
+                releaseSessionActions(generation: generation)
             }
         }
-        return true
     }
 
-    private var drawerAnimation: Animation {
-        .interactiveSpring(response: 0.28, dampingFraction: 0.9)
+    private func releaseSessionActions(generation: UInt64) {
+        // 即使目标没变、动画立即结束，也等本轮 touch-up 回调处理完再恢复按钮。
+        DispatchQueue.main.async {
+            guard generation == sessionMotionGeneration else { return }
+            sessionActionsLocked = false
+            #if DEBUG
+            AISessionDrawerDiagnostics.finish()
+            #endif
+        }
     }
 
-    private func sessionDrawerOpenGesture(wideLayout: Bool) -> some Gesture {
-        DragGesture(minimumDistance: 12, coordinateSpace: .global)
+    /// 开合共用一个本地坐标手势。先锁定横/纵方向，纵向滚动目录或消息时不横移页面；
+    /// 反向拖回与系统取消均使用同一进度，避免两层分别动画导致交界跳开。
+    private func sessionDrawerGesture(wideLayout: Bool, width: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 12, coordinateSpace: .named("ai-session-reveal"))
+            .updating($sessionDrawerGestureActive) { _, active, _ in active = true }
             .onChanged { value in
-                guard !wideLayout, !showSessions,
-                      value.startLocation.x <= 32,
-                      value.translation.width > 0,
-                      abs(value.translation.width) > abs(value.translation.height)
-                else { return }
-                composerFocusController.dismiss()
-                showActions = false
-                sessionDrawerOffset = min(sessionDrawerWidth, value.translation.width)
-            }
-            .onEnded { value in
-                guard !showSessions, sessionDrawerOffset > 0 else { return }
-                let shouldOpen = value.translation.width >= 72
-                    || value.predictedEndTranslation.width >= sessionDrawerWidth * 0.45
-                withAnimation(drawerAnimation) {
-                    showSessions = shouldOpen
-                    sessionDrawerOffset = 0
+                guard !wideLayout, showSessions || value.startLocation.x <= 32 else { return }
+                if sessionDrawerDrag.horizontal == nil {
+                    sessionDrawerDrag.horizontal = abs(value.translation.width) > abs(value.translation.height)
+                    if sessionDrawerDrag.horizontal == true {
+                        #if DEBUG
+                        AISessionDrawerDiagnostics.begin("tracking")
+                        #endif
+                        sessionMotionGeneration &+= 1
+                        sessionActionsLocked = true
+                        // 页面准备只做一次；后续每帧只提交位移，避免反复调用 UIKit 收键盘。
+                        composerFocusController.dismiss()
+                        isAttachmentPanelPresented = false
+                        showActions = false
+                    }
+                }
+                guard sessionDrawerDrag.horizontal == true else { return }
+                #if DEBUG
+                AISessionDrawerDiagnostics.update()
+                #endif
+                let origin = showSessions ? width : 0
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    sessionDrawerDrag.translation = max(-origin, min(width - origin, value.translation.width))
                 }
             }
-    }
-
-    private func sessionDrawerCloseGesture(width: CGFloat) -> some Gesture {
-        DragGesture(minimumDistance: 12, coordinateSpace: .global)
-            .onChanged { value in
-                guard showSessions,
-                      value.translation.width < 0,
-                      abs(value.translation.width) > abs(value.translation.height)
-                else { return }
-                sessionDrawerOffset = max(-width, value.translation.width)
-            }
             .onEnded { value in
-                guard showSessions, sessionDrawerOffset < 0 else { return }
-                let shouldClose = value.translation.width <= -72
-                    || value.predictedEndTranslation.width <= -width * 0.45
-                if shouldClose {
-                    closeSessionDrawer()
-                } else {
-                    withAnimation(drawerAnimation) { sessionDrawerOffset = 0 }
-                }
+                guard !wideLayout, sessionDrawerDrag.horizontal == true else { return }
+                let origin = showSessions ? width : 0
+                let destination = origin + value.predictedEndTranslation.width
+                let expanded = destination > width * 0.5
+                let current = max(0, min(width, origin + sessionDrawerDrag.translation))
+                let remaining = abs((expanded ? width : 0) - current) / max(1, width)
+                // 已接近端点的松手只需短收尾，快速甩动仍按预计终点决定开合。
+                let duration = max(0.1, Self.drawerSettleDuration * remaining)
+                settleSessionDrawer(expanded: expanded, duration: duration)
             }
-    }
-
-    private func sessionDrawerX(width: CGFloat) -> CGFloat {
-        if showSessions { return min(0, sessionDrawerOffset) }
-        return -width + max(0, min(width, sessionDrawerOffset))
     }
 
     private func openSessionDrawer(wideLayout: Bool) {
+        guard !sessionActionsBlocked else { return }
         logAIHistoryEvent("drawer-open-request session=\(model.selected) wide=\(wideLayout)")
         if wideLayout {
             showsWideSidebar.toggle()
             return
         }
-        withAnimation(drawerAnimation) {
-            showSessions = true
-            sessionDrawerOffset = 0
-        }
+        settleSessionDrawer(expanded: true)
     }
 
     private func closeSessionDrawer() {
         logAIHistoryEvent("drawer-close-request session=\(model.selected)")
-        withAnimation(drawerAnimation) {
-            showSessions = false
-            sessionDrawerOffset = 0
-        }
+        settleSessionDrawer(expanded: false)
     }
 
     private var remoteDeviceGroups: [AIRemoteDeviceGroup] {
@@ -455,6 +596,7 @@ struct AIAssistantView: View {
         let status = online.map { $0 ? "在线" : "离线" }
         return HStack(spacing: 0) {
             Button {
+                guard !sessionActionsBlocked else { return }
                 withAnimation(.easeInOut(duration: 0.18)) {
                     if collapsed { collapsedSessionDevices.remove(id) }
                     else { collapsedSessionDevices.insert(id) }
@@ -488,6 +630,7 @@ struct AIAssistantView: View {
             .accessibilityIdentifier("ai-session-device-\(id)")
             if let device {
                 Button {
+                    guard !sessionActionsBlocked else { return }
                     Task {
                         if await model.createRemoteSession(on: device) != nil {
                             closeSessionDrawer()
@@ -510,6 +653,7 @@ struct AIAssistantView: View {
 
     private func emptyDraftRow() -> some View {
         Button {
+            guard !sessionActionsBlocked else { return }
             closeSessionDrawer()
             Task { await model.selectConversation("") }
         } label: {
@@ -537,6 +681,7 @@ struct AIAssistantView: View {
         let selected = model.selectedRemote == nil && session.id == model.selected
         return HStack(spacing: 4) {
             Button {
+                guard !sessionActionsBlocked else { return }
                 closeSessionDrawer()
                 Task { await model.selectConversation(session.id) }
             } label: {
@@ -555,6 +700,7 @@ struct AIAssistantView: View {
             .accessibilityIdentifier("ai-conversation-\(session.id)")
             Menu {
                 Button(role: .destructive) {
+                    guard !sessionActionsBlocked else { return }
                     Task {
                         guard !model.isSubmitting, !model.isCreatingConversation else { return }
                         await model.selectConversation(session.id)
@@ -584,6 +730,7 @@ struct AIAssistantView: View {
         let selected = model.selectedRemote?.id == session.id
         return HStack(spacing: 4) {
             Button {
+                guard !sessionActionsBlocked else { return }
                 closeSessionDrawer()
                 Task { await model.selectRemoteConversation(session) }
             } label: {
@@ -608,6 +755,7 @@ struct AIAssistantView: View {
             .accessibilityIdentifier("ai-remote-conversation-\(session.id)")
             Menu {
                 Button(role: .destructive) {
+                    guard !sessionActionsBlocked else { return }
                     remoteDeleteTarget = session
                     confirmRemoteDelete = true
                 } label: {
@@ -638,7 +786,7 @@ struct AIAssistantView: View {
     }
 
     /// 显示已存在的会话入口，并把点击操作交给模型先读取目标页再切换。
-    /// 横屏固定侧栏、竖屏抽屉共用同一列表，删除操作必须确认目标已选中。
+    /// 宽屏固定侧栏、窄屏联动目录共用同一列表，删除操作必须确认目标已选中。
     private func sessionList(wideLayout: Bool) -> some View {
             ScrollView {
                 LazyVStack(spacing: 16) {
@@ -689,12 +837,15 @@ struct AIAssistantView: View {
                     }
                 }
                 .padding(.horizontal, 12).padding(.vertical, 16)
+                // 只禁用目录控件，ScrollView 与外层侧滑识别仍保留，纵向浏览不会被中断。
+                .disabled(sessionActionsBlocked)
             }
             .safeAreaInset(edge: .top, spacing: 0) {
                 HStack(spacing: 16) {
                     Text("对话").font(.system(size: 20, weight: .bold))
                     Spacer()
                     Button {
+                        guard !sessionActionsBlocked else { return }
                         closeSessionDrawer()
                         Task { await model.create() }
                     } label: {
@@ -705,11 +856,15 @@ struct AIAssistantView: View {
                     .disabled(model.isSubmitting || model.isCreatingConversation)
                     .accessibilityLabel("新对话")
                     if wideLayout {
-                        Button("收起") { showsWideSidebar = false }
+                        Button("收起") {
+                            guard !sessionActionsBlocked else { return }
+                            showsWideSidebar = false
+                        }
                             .font(.system(size: 14, weight: .medium))
                     }
                 }
                 .buttonStyle(.plain)
+                .disabled(sessionActionsBlocked)
                 .foregroundStyle(.primary)
                 .padding(.horizontal, 20).frame(height: 60)
                 .remoteIMBarBackground(edges: .top, opacity: RemoteIMStyle.conversationBarOpacity)
@@ -765,9 +920,12 @@ private final class AIMessageViewportLog {
 private struct AIAssistantMessageList: View {
     @ObservedObject var model: AIAssistantModel
     @ObservedObject private var videoCircle = MaiVideoCircleModel.shared
+    @ObservedObject private var browser = AIMobileBrowserTools.shared
     let focusController: AIComposerFocusController
     @Binding var isAttachmentPanelPresented: Bool
     let isActive: Bool
+    // 横向侧滑只移动外层页面，消息列表不能同时消费手指的纵向分量或产生惯性滚动。
+    let blocksVerticalScrolling: Bool
     @State private var followsLatest = true
     @State private var prependAnchorID: String?
     @State private var viewportLog = AIMessageViewportLog()
@@ -776,12 +934,19 @@ private struct AIAssistantMessageList: View {
     @State private var bottomCorrectionRequest = 0
 
     var body: some View {
+        #if DEBUG
+        let _ = AISessionDrawerDiagnostics.listBody()
+        #endif
         GeometryReader { geometry in
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 24) {
                         if model.messages.isEmpty && model.historyLoaded {
                             welcome
+                        }
+                        if hasBrowserEntryInCurrentSession && browser.sourceMessageID.isEmpty {
+                            // 没有前置消息的普通 App 调用留在时间线起点，不随后来消息移动。
+                            browserEntry
                         }
                         if !model.messages.isEmpty {
                             if model.hasOlderVisibleMessages {
@@ -794,17 +959,32 @@ private struct AIAssistantMessageList: View {
                             // 只把已开放的一页交给视图，由真实行高决定可滚动范围。
                             VStack(alignment: .leading, spacing: 24) {
                                 ForEach(model.visibleMessages) { message in
-                                    AIMessageRow(message: message,
-                                                 workspacePath: model.workspacePath,
-                                                 quote: {
-                                                     model.quotedMessage = message
-                                                     focusController.focus()
-                                                 },
-                                                 canPublishVideo:
-                                                    videoCircle.availability == .available &&
-                                                    videoCircle.canPublishFromThisBuild)
-                                        .equatable()
-                                        .id(message.id)
+                                    let hasInlineBrowser = hasBrowserEntryInCurrentSession &&
+                                        browser.sourceMessageID == message.id && !browser.sourcePartID.isEmpty
+                                    VStack(alignment: .leading, spacing: 16) {
+                                        AIMessageRow(message: message,
+                                                     workspacePath: model.workspacePath,
+                                                     quote: {
+                                                         model.quotedMessage = message
+                                                         focusController.focus()
+                                                     },
+                                                     canPublishVideo:
+                                                        videoCircle.availability == .available &&
+                                                        videoCircle.canPublishFromThisBuild,
+                                                     imagePreviewSourceID: model.previewImage?.sourceID,
+                                                     browserSessionID: hasInlineBrowser ? model.selected : nil,
+                                                     browserPartID: hasInlineBrowser ? browser.sourcePartID : nil,
+                                                     browserNeedsConfirmation: hasInlineBrowser &&
+                                                        (!model.permissions.isEmpty || !model.questions.isEmpty),
+                                                     openBrowser: openBrowser)
+                                            .equatable()
+                                        if hasBrowserEntryInCurrentSession && browser.sourceMessageID == message.id &&
+                                            browser.sourcePartID.isEmpty {
+                                            // 普通 App 调用没有工具片段，挂在调用当时的消息之后。
+                                            browserEntry
+                                        }
+                                    }
+                                    .id(message.id)
                                 }
                             }
                         }
@@ -855,6 +1035,7 @@ private struct AIAssistantMessageList: View {
                         .frame(height: 1)
                     }
                 }
+                .scrollDisabled(blocksVerticalScrolling)
                 .modifier(MessageInitialScrollAnchor(
                     startsAtLatest: !model.messages.isEmpty))
                 .contentShape(Rectangle())
@@ -863,6 +1044,9 @@ private struct AIAssistantMessageList: View {
                     isAttachmentPanelPresented = false
                 }
                 .onAppear {
+                    if followsLatest && browser.isOpen && browser.ownerSessionID == model.selected {
+                        bottomCorrectionRequest += 1
+                    }
                     logAIHistoryEvent(
                         """
                         message-list appear session=\(model.selected) count=\(model.visibleMessages.count) \
@@ -870,6 +1054,13 @@ private struct AIAssistantMessageList: View {
                         last=\(model.visibleMessages.last?.id ?? "none")
                         """
                     )
+                }
+                .onChange(of: browser.isPresented) { presented in
+                    guard !presented, followsLatest, browser.isOpen,
+                          browser.ownerSessionID == model.selected else { return }
+                    // 全屏页返回后，按包含工具入口的完整消息高度重新布局。
+                    // 只在跟随最新时校正底部；阅读历史中的入口不改变原来的滚动意图。
+                    bottomCorrectionRequest += 1
                 }
                 .onChange(of: model.visibleMessages.first?.id) { _ in
                     if let anchor = prependAnchorID {
@@ -962,6 +1153,23 @@ private struct AIAssistantMessageList: View {
         }
     }
 
+    private var browserEntry: some View {
+        AIBrowserTaskEntry(sessionID: model.selected, isLocal: model.selectedRemote == nil,
+                           needsConfirmation: !model.permissions.isEmpty || !model.questions.isEmpty,
+                           open: openBrowser)
+        .id("ai-browser-task-entry-\(browser.sourceMessageID)-\(browser.sourcePartID)")
+    }
+
+    private func openBrowser() {
+        focusController.dismiss()
+        isAttachmentPanelPresented = false
+        browser.presentPage(sessionID: model.selected)
+    }
+
+    private var hasBrowserEntryInCurrentSession: Bool {
+        browser.isOpen && browser.ownerSessionID == model.selected && model.selectedRemote == nil
+    }
+
     private func position(at id: String, proxy: ScrollViewProxy, anchor: UnitPoint) {
         logAIHistoryEvent(
             """
@@ -1022,6 +1230,10 @@ private struct AIAssistantMessageList: View {
                 welcomeFeature("二维码生成", icon: "qrcode")
                 welcomeFeature("当前位置", icon: "location")
                 welcomeFeature("本地媒体处理", icon: "slider.horizontal.3")
+                // 空态只说明能力；实际处理和训练由用户在会话中提出需求。
+                welcomeFeature("人像美颜", icon: "face.smiling")
+                welcomeFeature("美体塑形", icon: "figure.stand")
+                welcomeFeature("个人模型训练", icon: "sparkles")
                 welcomeFeature("拍照", icon: "camera")
                 welcomeFeature("音乐播放", icon: "music.note")
                 welcomeFeature("相册管理", icon: "photo.on.rectangle")
@@ -1168,6 +1380,8 @@ private struct AIActionPanel: View {
         }.frame(width: 264).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.black.opacity(0.08)))
             .shadow(color: Color.black.opacity(0.14), radius: 20, y: 8)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("ai-action-panel")
     }
 
     private func expandableAction(
@@ -1269,13 +1483,20 @@ private struct AIActionPanel: View {
         }.buttonStyle(.plain)
     }
 }
-private struct AIMessageRow: View, Equatable {
+struct AIMessageRow: View, Equatable {
     @EnvironmentObject private var appState: RemoteIMAppState
     @ObservedObject private var cloudDrive = MaiCloudDriveModel.shared
     let message: AIMessage
     let workspacePath: String
     let quote: () -> Void
     var canPublishVideo = false
+    // 缩略图隐藏/恢复也是行的可见状态；不能再依赖逐帧更换环境闭包偶然使 equatable 行刷新。
+    var imagePreviewSourceID: UUID? = nil
+    // 活动网页属于创建它的工具片段，保留同一助手消息中工具前后正文的原有顺序。
+    var browserSessionID: String? = nil
+    var browserPartID: String? = nil
+    var browserNeedsConfirmation = false
+    var openBrowser: () -> Void = {}
     @State private var pdfPreview: AIPDFPreviewItem?
     @State private var pdfPreviewError = false
     @State private var videoPreview: AIVideoPreviewItem?
@@ -1286,9 +1507,15 @@ private struct AIMessageRow: View, Equatable {
     @State private var remoteDownloadError: String?
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message && lhs.workspacePath == rhs.workspacePath &&
-            lhs.canPublishVideo == rhs.canPublishVideo
+            lhs.canPublishVideo == rhs.canPublishVideo &&
+            lhs.imagePreviewSourceID == rhs.imagePreviewSourceID &&
+            lhs.browserSessionID == rhs.browserSessionID && lhs.browserPartID == rhs.browserPartID &&
+            lhs.browserNeedsConfirmation == rhs.browserNeedsConfirmation
     }
     var body: some View {
+        #if DEBUG
+        let _ = AISessionDrawerDiagnostics.rowBody()
+        #endif
         let inlineMedia = textMediaMentions
         return VStack(alignment: .leading, spacing: 14) {
             if message.role == "user" {
@@ -1312,8 +1539,8 @@ private struct AIMessageRow: View, Equatable {
                                             in: RoundedRectangle(cornerRadius: 18))
                         }
                         ForEach(Array(imagePaths.enumerated()), id: \.offset) { _, path in
-                            AIWorkspaceImage(filePath: path) { size, sourceFrame in
-                                openImage(path, imageSize: size, sourceFrame: sourceFrame)
+                            AIWorkspaceImage(filePath: path) { size, sourceFrame, sourceID in
+                                openImage(path, imageSize: size, sourceFrame: sourceFrame, sourceID: sourceID)
                             }
                         }
                         ForEach(videoPaths, id: \.self) { path in
@@ -1407,7 +1634,10 @@ private struct AIMessageRow: View, Equatable {
                     }
                 }
                 ForEach(message.parts) { part in
-                    if part.kind == "text", let text = part.text, !text.isEmpty {
+                    if part.kind == "tool", part.id == browserPartID, let sessionID = browserSessionID {
+                        AIBrowserTaskEntry(sessionID: sessionID, isLocal: true,
+                                           needsConfirmation: browserNeedsConfirmation, open: openBrowser)
+                    } else if part.kind == "text", let text = part.text, !text.isEmpty {
                         if let failure = specialistFailureText(text) {
                             Label(failure, systemImage: "exclamationmark.triangle.fill")
                                 .font(ChatTypography.body)
@@ -1430,9 +1660,9 @@ private struct AIMessageRow: View, Equatable {
                 ForEach(mediaArtifacts) { artifact in
                     VStack(alignment: .leading, spacing: 8) {
                         if artifact.type == "image" {
-                            AIWorkspaceImage(filePath: artifact.filePath) { size, sourceFrame in
+                            AIWorkspaceImage(filePath: artifact.filePath) { size, sourceFrame, sourceID in
                                 openImage(artifact.filePath, imageSize: size,
-                                          sourceFrame: sourceFrame)
+                                          sourceFrame: sourceFrame, sourceID: sourceID)
                             }
                         } else if artifact.type == "video" {
                             AIWorkspaceVideoCard(filePath: artifact.filePath) {
@@ -1557,8 +1787,8 @@ private struct AIMessageRow: View, Equatable {
             part.kind == "audio" ? "音频" : "文件"
         if let file = remoteDownloaded[part.id] {
             if part.kind == "image" {
-                AIWorkspaceImage(filePath: file.path) { size, frame in
-                    openImage(file.path, imageSize: size, sourceFrame: frame)
+                AIWorkspaceImage(filePath: file.path) { size, frame, sourceID in
+                    openImage(file.path, imageSize: size, sourceFrame: frame, sourceID: sourceID)
                 }
             } else if part.kind == "video" {
                 AIWorkspaceVideoCard(filePath: file.path) { openVideo(file.path) }
@@ -1664,7 +1894,7 @@ private struct AIMessageRow: View, Equatable {
         return items
     }
 
-    private func openImage(_ path: String, imageSize: CGSize, sourceFrame: CGRect) {
+    private func openImage(_ path: String, imageSize: CGSize, sourceFrame: CGRect, sourceID: UUID) {
         let model = AIAssistantModel.shared
         let session = model.selected
         let items = model.messages.flatMap {
@@ -1673,7 +1903,7 @@ private struct AIMessageRow: View, Equatable {
         let sequence = MaiMediaSequence(
             selected: MaiMediaItem(kind: .image, path: path), items: items)
         let initial = AIImagePreview(filePath: path, imageSize: imageSize,
-                                     sourceFrame: sourceFrame, sequence: sequence)
+                                     sourceFrame: sourceFrame, sourceID: sourceID, sequence: sequence)
         model.previewImage = initial
         Task {
             let allItems = await fullMediaItems(model: model, session: session)
@@ -1683,6 +1913,7 @@ private struct AIMessageRow: View, Equatable {
             model.previewImage = AIImagePreview(
                 filePath: current.filePath, imageSize: current.imageSize,
                 sourceFrame: current.sourceFrame,
+                sourceID: current.sourceID,
                 sequence: current.sequence?.updatingItems(allItems), id: current.id)
         }
     }
@@ -2023,8 +2254,11 @@ private struct AIPDFArtifactButton: View {
 
 private struct AIWorkspaceImage: View {
     let filePath: String
-    let openPreview: (CGSize, CGRect) -> Void
+    let openPreview: (CGSize, CGRect, UUID) -> Void
     @State private var decodedSize: CGSize?
+    @State private var sourceID = UUID()
+    @Environment(\.aiImagePreviewSourceID) private var previewSourceID
+    @Environment(\.aiConversationActionsAllowed) private var conversationActionsAllowed
 
     private var previewSize: CGSize {
         ImageBubbleSize.fitted(decodedSize ?? CGSize(width: 220, height: 180),
@@ -2034,10 +2268,11 @@ private struct AIWorkspaceImage: View {
     var body: some View {
         GeometryReader { geometry in
             Button {
-                let sourceFrame = geometry.frame(in: .named(
-                    AIImagePreviewLayout.coordinateSpaceName))
+                // 侧滑从图片内开始时，已按下的 Button 仍可能在 touch-up 回调；再次读实时互锁。
+                guard conversationActionsAllowed() else { return }
+                let sourceFrame = geometry.frame(in: .global)
                 guard sourceFrame.width > 0, sourceFrame.height > 0 else { return }
-                openPreview(decodedSize ?? previewSize, sourceFrame)
+                openPreview(decodedSize ?? previewSize, sourceFrame, sourceID)
             } label: {
                 RemoteIMAsyncImage(filePath: filePath,
                                    maximumPointSize: previewSize) { image in
@@ -2059,20 +2294,14 @@ private struct AIWorkspaceImage: View {
                 }
                 .frame(width: previewSize.width, height: previewSize.height)
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(alignment: .bottomTrailing) {
-                    Image(systemName: "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 25, height: 25)
-                        .background(.black.opacity(0.52), in: Circle())
-                        .padding(7)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
             }
             .buttonStyle(.plain)
             .accessibilityLabel("放大图片")
             .accessibilityIdentifier("agent-image-bubble")
+            // 保留原布局和位置测量，只隐藏源缩略图，避免动画中重影。
+            .opacity(previewSourceID == sourceID ? 0 : 1)
+            .preference(key: AIImageSourceFramesKey.self,
+                         value: [sourceID: geometry.frame(in: .global)])
         }
         .frame(width: previewSize.width, height: previewSize.height)
     }
@@ -2082,6 +2311,7 @@ private struct AIWorkspaceVideoCard: View {
     let filePath: String
     let identifier: String
     let open: () -> Void
+    @Environment(\.aiConversationActionsAllowed) private var conversationActionsAllowed
     @Environment(\.displayScale) private var displayScale
     @State private var cover: UIImage?
     @State private var videoSize: CGSize?
@@ -2098,7 +2328,10 @@ private struct AIWorkspaceVideoCard: View {
     }
 
     var body: some View {
-        Button(action: open) {
+        Button {
+            guard conversationActionsAllowed() else { return }
+            open()
+        } label: {
             ZStack {
                 if let cover {
                     Image(uiImage: cover).resizable().scaledToFit()
@@ -2248,431 +2481,34 @@ private struct AIWorkspaceAudioCard: View {
     }
 }
 
-#if targetEnvironment(simulator)
-struct AIVideoCircleUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-    @ObservedObject private var circle = MaiVideoCircleModel.shared
-    @State private var loginError = ""
-    @State private var sampleURL: URL?
 
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    if !loginError.isEmpty { Text(loginError).foregroundStyle(.red) }
-                    if let sample = sampleURL {
-                        AIMessageRow(message: sampleMessage(sample, sourced: true),
-                                     workspacePath: sample.deletingLastPathComponent().path,
-                                     quote: {},
-                                     canPublishVideo: circle.availability == .available &&
-                                        circle.canPublishFromThisBuild)
-                        AIMessageRow(message: sampleMessage(sample, sourced: false),
-                                     workspacePath: sample.deletingLastPathComponent().path,
-                                     quote: {},
-                                     canPublishVideo: circle.availability == .available &&
-                                        circle.canPublishFromThisBuild)
-                    }
-                }
-                .padding(20)
-            }
-            .navigationTitle("创作中心")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    if circle.availability == .available {
-                        Button("视频圈") { circle.presentation = .circle }
-                            .accessibilityIdentifier("ai-video-circle-entry")
-                    }
-                }
-            }
-            .sheet(item: $circle.presentation) { presentation in
-                switch presentation {
-                case .circle:
-                    MaiVideoCircleView { circle.presentation = nil }
-                case let .publish(source):
-                    MaiVideoCirclePublishView(source: source,
-                                              close: { circle.presentation = nil },
-                                              published: { circle.presentation = .circle })
-                }
-            }
-            .task {
-                let authPort = ProcessInfo.processInfo.environment[
-                    "MAICHAT_LOCAL_UI_AUTH_PORT"] ?? "18190"
-                guard let sourceEndpoint = URL(string: "http://127.0.0.1:\(authPort)/test/video-circle/source")
-                else { loginError = "本机测试地址无效"; return }
-                let localSample = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("video-circle-ui-sample.mp4")
-                do {
-                    let (data, response) = try await URLSession.shared.data(from: sourceEndpoint)
-                    guard (response as? HTTPURLResponse)?.statusCode == 200,
-                          !data.isEmpty else { throw URLError(.badServerResponse) }
-                    try data.write(to: localSample, options: .atomic)
-                    sampleURL = localSample
-                }
-                catch { loginError = "本机测试视频无法打开"; return }
-                guard let account = ProcessInfo.processInfo.environment["MAICHAT_LOCAL_UI_PHONE"],
-                      let password = ProcessInfo.processInfo.environment["MAICHAT_LOCAL_UI_PASSWORD"]
-                else { loginError = "本机测试账号未提供"; return }
-                do {
-                    let session = try await MaiChatAuthClient.shared.loginWithPassword(
-                        account: account, password: password, ageConfirmed: true)
-                    appState.maiChatAccountID = session.user.id
-                    appState.maiChatNickname = session.user.nickname ?? ""
-                    await circle.probe()
-                } catch { loginError = error.localizedDescription }
-            }
-        }
-        .environmentObject(appState)
-    }
-
-    private func sampleMessage(_ sample: URL, sourced: Bool) -> AIMessage {
-        var output: [String: Any] = [
-            "delivery": "current_ai_session", "path": sample.lastPathComponent,
-            "type": "video", "mime_type": "video/mp4", "caption": "本机测试视频"
-        ]
-        if sourced {
-            output["source_task_id"] = "fixture-video-task"
-            output["source_tool"] = "wan_video"
-        }
-        let json = (try? JSONSerialization.data(withJSONObject: output))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        let part = AIPart(id: sourced ? "circle-sourced" : "circle-legacy",
-                          kind: "tool", text: nil, tool: "agent_send_media",
-                          input: nil, output: json, error: nil, state: "completed",
-                          path: nil, mimeType: nil)
-        return AIMessage(id: part.id, role: "assistant", created: 1,
-                         completed: 2, active: false, parts: [part])
-    }
-}
-
-struct AIImageFullscreenUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-    var body: some View {
-        AIAssistantView()
-            .environmentObject(appState)
-            .onAppear {
-                let image = UIGraphicsImageRenderer(size: CGSize(width: 300, height: 500))
-                    .image { context in
-                        UIColor.systemBlue.setFill()
-                        context.fill(CGRect(x: 0, y: 0, width: 300, height: 500))
-                    }
-                let file = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("image-fullscreen-ui-test.png")
-                guard let data = image.pngData(),
-                      (try? data.write(to: file)) != nil else { return }
-                AIAssistantModel.shared.previewImage = AIImagePreview(
-                    filePath: file.path, imageSize: image.size)
-            }
-    }
-}
-
-struct AIImageMixedUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
+// 图片打开后在同一个原生容器中浏览所有相邻图片和视频；切换不再重建 Root 的播放器。
+struct AIAssistantImagePreviewLayer: View {
+    @ObservedObject private var model = AIAssistantModel.shared
+    @ObservedObject var sources: AIImageSourceFrameStore
 
     var body: some View {
         ZStack {
-            AIAssistantView()
-                .environmentObject(appState)
-            if let video = appState.agentVideoPresentation {
-                MaiFfplayVideoScreen(path: video.path, navigate: { direction in
-                    guard let next = video.sequence.adjacent(direction) else { return false }
-                    if next.current.kind == .image {
-                        appState.agentVideoPresentation = nil
-                        AIAssistantModel.shared.previewImage = AIImagePreview(
-                            filePath: next.current.path,
-                            imageSize: CGSize(width: 300, height: 500), sequence: next)
-                    } else {
-                        appState.agentVideoPresentation = MaiFfplayPresentation(
-                            sequence: next, entryDirection: direction)
+            if let preview = model.previewImage {
+                let selected = MaiMediaItem(kind: .image, path: preview.filePath)
+                MaiLocalMediaPager(
+                    sequence: preview.sequence ?? MaiMediaSequence(selected: selected, items: [selected]),
+                    imageIdentifier: "agent-image-preview", showsImageActions: false,
+                    sourceFrame: { view in
+                        guard let frame = preview.sourceID.flatMap({ sources.frames[$0] }) ?? preview.sourceFrame
+                        else { return nil }
+                        return view.convert(frame, from: nil)
+                    }) {
+                        model.previewImage = nil
+                        maiLocalMediaTrace("image-model-closed")
                     }
-                    return true
-                }) {
-                    appState.agentVideoPresentation = nil
-                }
-                .id(video.id)
-                .ignoresSafeArea()
-                .overlay(alignment: .top) {
-                    Text("\(video.index + 1)/\(video.sequence.items.count) · " +
-                         URL(fileURLWithPath: video.path).lastPathComponent)
-                        .foregroundStyle(.white).padding(.top, 70)
-                }
+                    .id(preview.id)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task {
-            AIMobileHostToolProvider.shared.appState = appState
-            guard let video = Bundle.main.url(forResource: "ffplay-seek-sample",
-                                                  withExtension: "mp4") else { return }
-            let image = UIGraphicsImageRenderer(size: CGSize(width: 300, height: 500))
-                .image { context in
-                    UIColor.systemBlue.setFill()
-                    context.fill(CGRect(x: 0, y: 0, width: 300, height: 500))
-                }
-            let file = FileManager.default.temporaryDirectory
-                .appendingPathComponent("ai-image-mixed-ui-test.png")
-            guard let data = image.pngData(),
-                  (try? data.write(to: file)) != nil else { return }
-            let first = MaiMediaItem(kind: .image, path: file.path)
-            let sequence = MaiMediaSequence(selected: first, items: [
-                first, MaiMediaItem(kind: .video, path: video.path)
-            ])
-            AIAssistantModel.shared.previewImage = AIImagePreview(
-                filePath: file.path, imageSize: image.size, sequence: sequence)
-        }
-    }
-}
-
-struct AITextMediaUITestRoot: View {
-    var body: some View {
-        if let video = Bundle.main.url(forResource: "ffplay-sample", withExtension: "mp4") {
-            let part = AIPart(id: "mention", kind: "text",
-                              text: "视频文件：`ffplay-sample.mp4`", tool: nil,
-                              input: nil, output: nil, error: nil, state: nil,
-                              path: nil, mimeType: nil)
-            let message = AIMessage(id: "text-media", role: "assistant", created: 0,
-                                    completed: 1, active: false, parts: [part])
-            AIMessageRow(message: message,
-                         workspacePath: video.deletingLastPathComponent().path, quote: {})
-                .padding(20)
-        }
-    }
-}
-
-struct AIVideoBubbleUITestRoot: View {
-    var body: some View {
-        if let video = Bundle.main.url(forResource: "ffplay-sample", withExtension: "mp4") {
-            let part = AIPart(id: "video", kind: "video", text: nil, tool: nil,
-                              input: nil, output: nil, error: nil, state: nil,
-                              path: video.lastPathComponent, mimeType: "video/mp4")
-            let message = AIMessage(id: "video-message", role: "user", created: 0,
-                                    completed: 1, active: false, parts: [part])
-            AIMessageRow(message: message,
-                         workspacePath: video.deletingLastPathComponent().path, quote: {})
-                .padding(20)
-        }
-    }
-}
-
-struct AITranscriptUITestRoot: View {
-    private func makeTestPart(_ id: String, kind: String, text: String? = nil,
-                      tool: String? = nil) -> AIPart {
-        AIPart(id: id, kind: kind, text: text, tool: tool,
-               input: tool == nil ? nil : "{}", output: tool == nil ? nil : "done",
-               error: nil, state: tool == nil ? nil : "completed",
-               path: nil, mimeType: nil)
-    }
-
-    var body: some View {
-        let parts = [makeTestPart("reasoning-1", kind: "reasoning", text: "检查视频"),
-                     makeTestPart("reasoning-2", kind: "reasoning", text: "检查视频")]
-            + (0..<4).map { makeTestPart("ffmpeg-\($0)", kind: "tool", tool: "ffmpeg") }
-            + (0..<4).map { makeTestPart("view-image-\($0)", kind: "tool", tool: "view_image") }
-            + [makeTestPart("answer", kind: "text", text: "处理完成，结果已经准备好。")]
-        let message = AIMessage(id: "transcript", role: "assistant", created: 0,
-                                completed: 1, active: false, parts: parts)
-        AIMessageRow(message: message, workspacePath: "", quote: {})
-            .padding(20)
-    }
-}
-
-struct AIHistoryUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-    var body: some View {
-        AIAssistantView()
-            .environmentObject(appState)
-            .onAppear { AIAssistantModel.shared.installHistoryUITestFixture() }
-    }
-}
-
-struct AIWelcomeUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-
-    var body: some View {
-        AIAssistantView()
-            .environmentObject(appState)
-            .onAppear { AIAssistantModel.shared.installWelcomeUITestFixture() }
-    }
-}
-
-struct AISessionSwitchUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-    var body: some View {
-        AIAssistantView()
-            .environmentObject(appState)
-            .onAppear { AIAssistantModel.shared.installSessionSwitchUITestFixture() }
-    }
-}
-
-#if DEBUG && targetEnvironment(simulator)
-struct AIBrowserUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-
-    var body: some View {
-        AIAssistantView()
-            .environmentObject(appState)
-            .onAppear {
-                AIAssistantModel.shared.installSessionSwitchUITestFixture()
-                Task { await AIMobileBrowserTools.shared.runUITestFixture() }
-            }
-    }
-}
-#endif
-
-struct AIMediaDraftUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-    var body: some View {
-        AIAssistantView()
-            .environmentObject(appState)
-            .onAppear { AIAssistantModel.shared.installMediaDraftUITestFixture() }
-    }
-}
-
-struct AIStreamTypingUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-    var body: some View {
-        AIAssistantView()
-            .environmentObject(appState)
-            .onAppear { AIAssistantModel.shared.installStreamingTypingUITestFixture() }
-    }
-}
-#endif
-
-private struct AIImagePreviewOverlay: View {
-    let preview: AIImagePreview
-    let navigate: (Int) -> Bool
-    let close: () -> Void
-    @State private var isExpanded = false
-    @State private var isZoomed = false
-    @State private var navigationStatus = ""
-
-    private var previewAnimation: Animation {
-        .interactiveSpring(response: 0.38, dampingFraction: 0.86, blendDuration: 0.08)
-    }
-
-    var body: some View {
-        GeometryReader { geometry in
-            let fittedSize = preview.imageSize.width > 0 && preview.imageSize.height > 0
-                ? aspectFitSize(imageSize: preview.imageSize, containerSize: geometry.size)
-                : geometry.size
-            let destinationFrame = CGRect(
-                x: (geometry.size.width - fittedSize.width) / 2,
-                y: (geometry.size.height - fittedSize.height) / 2,
-                width: fittedSize.width,
-                height: fittedSize.height)
-            let imageFrame = isExpanded ? destinationFrame
-                : (preview.sourceFrame ?? destinationFrame)
-
-            ZStack(alignment: .topTrailing) {
-                Color.black.opacity(isExpanded ? 1 : 0)
-                    .ignoresSafeArea()
-                    .onTapGesture(perform: shrinkAndClose)
-                if isExpanded {
-                    ImagePreviewBackdrop(
-                        filePath: preview.filePath,
-                        viewportSize: geometry.size
-                    )
-                }
-                RemoteIMAsyncImage(filePath: preview.filePath,
-                                   maximumPointSize: ImagePreviewZoomModifier.maximumDecodePointSize(
-                                    for: geometry.size)) { image in
-                    Image(uiImage: image).resizable().scaledToFit()
-                        .accessibilityLabel("Agent 处理后的图片预览")
-                } placeholder: { failed in
-                    if failed {
-                        Label("图片无法显示", systemImage: "photo")
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else {
-                        ProgressView().tint(.white)
-                    }
-                }
-                .frame(width: imageFrame.width, height: imageFrame.height)
-                .modifier(ImagePreviewZoomModifier(enabled: isExpanded,
-                                                   imageSize: fittedSize,
-                                                   viewportSize: geometry.size,
-                                                   onScaleChanged: { isZoomed = $0 > 1.01 }))
-                .position(x: imageFrame.midX, y: imageFrame.midY)
-                .contentShape(Rectangle())
-                .onTapGesture(perform: shrinkAndClose)
-                .accessibilityIdentifier("agent-image-preview")
-
-                if let sequence = preview.sequence, sequence.items.count > 1 {
-                    Text("\(sequence.index + 1)/\(sequence.items.count) · " +
-                         URL(fileURLWithPath: preview.filePath).lastPathComponent)
-                        .font(.system(size: 12, weight: .medium))
-                        .lineLimit(1)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 10).padding(.vertical, 7)
-                        .background(.black.opacity(0.58), in: Capsule())
-                        .frame(maxWidth: .infinity, maxHeight: .infinity,
-                               alignment: .top)
-                        .padding(.top, 20).padding(.horizontal, 70)
-                        .allowsHitTesting(false)
-                }
-
-                if !navigationStatus.isEmpty {
-                    Text(navigationStatus)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.white)
-                        .padding(10)
-                        .background(.black.opacity(0.65), in: Capsule())
-                        .frame(maxWidth: .infinity, maxHeight: .infinity,
-                               alignment: .bottom)
-                        .padding(.bottom, 85)
-                        .allowsHitTesting(false)
-                }
-
-                Button(action: shrinkAndClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 17, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 44, height: 44)
-                        .background(.black.opacity(0.5), in: Circle())
-                }
-                .accessibilityLabel("关闭图片预览")
-                .padding(20)
-                .opacity(isExpanded ? 1 : 0)
-                .allowsHitTesting(isExpanded)
-            }
-            .frame(width: geometry.size.width, height: geometry.size.height)
-            .simultaneousGesture(DragGesture(minimumDistance: 50).onEnded { value in
-                guard isExpanded, !isZoomed,
-                      abs(value.translation.width) > abs(value.translation.height) * 1.4
-                else { return }
-                let direction = value.translation.width < 0 ? 1 : -1
-                if !navigate(direction) {
-                    navigationStatus = direction > 0 ? "已经是最后一项" : "已经是第一项"
-                }
-            })
-        }
-        .onAppear {
-            if preview.sourceFrame == nil { isExpanded = true }
-            else {
-                DispatchQueue.main.async {
-                    withAnimation(previewAnimation) { isExpanded = true }
-                }
-            }
-        }
-        .accessibilityAction(.escape, shrinkAndClose)
-        .onChange(of: preview.id) { _ in
-            isZoomed = false
-            navigationStatus = ""
-        }
-    }
-
-    private func shrinkAndClose() {
-        guard isExpanded else { return }
-        withAnimation(previewAnimation) { isExpanded = false }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
-            guard !isExpanded else { return }
-            close()
-        }
-    }
-
-    private func aspectFitSize(imageSize: CGSize, containerSize: CGSize) -> CGSize {
-        guard imageSize.width > 0, imageSize.height > 0,
-              containerSize.width > 0, containerSize.height > 0 else { return .zero }
-        let scale = min(containerSize.width / imageSize.width,
-                        containerSize.height / imageSize.height)
-        return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+        .ignoresSafeArea()
+        .allowsHitTesting(model.previewImage != nil)
+        .preference(key: AIImagePreviewVisibilityKey.self, value: model.previewImage != nil)
     }
 }
 
@@ -2719,7 +2555,12 @@ private final class AIComposerFocusController {
     weak var textView: UITextView?
 
     func focus() { textView?.becomeFirstResponder() }
-    func dismiss() { textView?.resignFirstResponder() }
+    func dismiss() {
+        #if DEBUG
+        AISessionDrawerDiagnostics.dismissFocus()
+        #endif
+        textView?.resignFirstResponder()
+    }
 }
 
 private struct AIPickedVideoTransfer: Transferable, Sendable {
@@ -2748,6 +2589,7 @@ private struct AIPickedVideoTransfer: Transferable, Sendable {
 }
 
 private struct AIDraftAttachmentTile: View {
+    @Environment(\.aiConversationActionsAllowed) private var conversationActionsAllowed
     let file: AIImportedFile
     let position: Int
     let workspacePath: String
@@ -2778,7 +2620,10 @@ private struct AIDraftAttachmentTile: View {
     var body: some View {
         VStack(spacing: 3) {
             ZStack(alignment: .topTrailing) {
-                Button(action: open) {
+                Button {
+                    guard conversationActionsAllowed() else { return }
+                    open()
+                } label: {
                     ZStack {
                         if file.isImage {
                             RemoteIMAsyncImage(
@@ -2820,7 +2665,10 @@ private struct AIDraftAttachmentTile: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("预览\(typeName) \(fileName)")
-                Button(action: remove) {
+                Button {
+                    guard conversationActionsAllowed() else { return }
+                    remove()
+                } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 20, weight: .semibold))
                         .foregroundStyle(.white)
@@ -2918,7 +2766,6 @@ private struct AIComposer: View, Equatable {
     @State private var toolCameraRequestID: UUID?
     #if DEBUG && targetEnvironment(simulator)
     @State private var cameraFixtureInstalled = false
-    @State private var cameraOwnershipFixtureResult = ""
     #endif
     @State private var draftSession = ""
     @State private var draftImportTarget: AIAttachmentImportTarget?
@@ -3038,19 +2885,12 @@ private struct AIComposer: View, Equatable {
             screenFramesStrip
             cameraFramesStrip
             #if DEBUG && targetEnvironment(simulator)
-            if ProcessInfo.processInfo.arguments.contains("--agent-camera-ui-test") {
-                Button("模拟 Agent 打开相机") {
+            if AICameraUITestSupport.isRequested {
+                AICameraUITestControls {
                     do {
                         _ = try localMediaRequests.openCamera(in: model.selected,
                                                              workspacePath: model.workspacePath)
                     } catch { model.showTransientError(error.localizedDescription) }
-                }.accessibilityIdentifier("ai-camera-fixture-open")
-                Button("验证相机请求代次") {
-                    cameraOwnershipFixtureResult = AIMobileLocalMediaRequests.verifyCameraRequestOwnership()
-                        ? "相机请求代次通过" : "相机请求代次失败"
-                }.accessibilityIdentifier("ai-camera-fixture-race")
-                if !cameraOwnershipFixtureResult.isEmpty {
-                    Text(cameraOwnershipFixtureResult).accessibilityIdentifier("ai-camera-fixture-race-result")
                 }
             }
             #endif
@@ -3260,7 +3100,7 @@ private struct AIComposer: View, Equatable {
                     ZStack {
                         Color.black.ignoresSafeArea()
                         #if DEBUG && targetEnvironment(simulator)
-                        if ProcessInfo.processInfo.arguments.contains("--agent-camera-ui-test") {
+                        if AICameraUITestSupport.isRequested {
                             Color.blue.opacity(0.7).ignoresSafeArea()
                             Text("模拟相机画面").foregroundStyle(.white)
                         } else if let session = agentCamera.previewSession {
@@ -3497,18 +3337,14 @@ private struct AIComposer: View, Equatable {
             }
             .onAppear {
                 #if DEBUG && targetEnvironment(simulator)
-                if ProcessInfo.processInfo.arguments.contains("--agent-camera-ui-test"),
+                if AICameraUITestSupport.isRequested,
                    !cameraFixtureInstalled {
                     cameraFixtureInstalled = true
                     model.installHistoryUITestFixture()
                 }
                 #endif
-                #if targetEnvironment(simulator)
-                if ProcessInfo.processInfo.arguments.contains("--ai-music-mini-ui-test"),
-                   let sample = Bundle.main.url(forResource: "ffplay-seek-sample",
-                                                withExtension: "mp4") {
-                    try? music.openLocalFile(sample, title: "测试音乐")
-                }
+                #if DEBUG && targetEnvironment(simulator)
+                AICameraUITestSupport.prepareMusicMini(music)
                 #endif
                 localMediaRequests.presenterActive = true
                 draftSession = snapshot.selected
@@ -3749,7 +3585,7 @@ private struct AIComposer: View, Equatable {
 
     private func openToolCamera(requestID: UUID) async {
         #if DEBUG && targetEnvironment(simulator)
-        let simulated = ProcessInfo.processInfo.arguments.contains("--agent-camera-ui-test")
+        let simulated = AICameraUITestSupport.isRequested
         #else
         let simulated = false
         #endif
@@ -4387,7 +4223,7 @@ private struct AITranscriptionButton: View {
     }
 }
 
-private struct AIPermissionCard: View {
+struct AIPermissionCard: View {
     // 付费生成、普通工具授权和真人 H5 验证使用同一闸门，但展示不同的后果。
     // 付费生成每次都确认；H5 链接也只允许本次生成，不提供整会话放行。
     let permission: AIPermission
@@ -4670,24 +4506,6 @@ private struct AIPermissionCard: View {
     }
 }
 
-#if targetEnvironment(simulator)
-struct AIPermissionUITestRoot: View {
-    private let permission = AIPermission(
-        id: "preview", tool: "maichat_send_text",
-        input: "{\"peer_id\":\"demo-contact\",\"text\":\"" +
-            String(repeating: "A paragraph for approval.\\n", count: 60) + "\"}",
-        allowForSession: false, rememberOnApproval: false, fileCount: nil
-    )
-
-    var body: some View {
-        ScrollView {
-            AIPermissionCard(permission: permission, model: .shared)
-                .padding(16)
-        }
-        .background(Color(uiColor: .systemBackground))
-    }
-}
-#endif
 
 private struct AIQuestionCard: View {
     let question: AIQuestion
@@ -5030,7 +4848,7 @@ final class MaiLocalMusicPlayer: ObservableObject {
     }
 }
 
-private struct MaiLocalMusicPlayerView: View {
+struct MaiLocalMusicPlayerView: View {
     @ObservedObject var music: MaiLocalMusicPlayer
     @State private var scrubPosition: Double = 0
     @State private var isScrubbing = false
@@ -5129,36 +4947,7 @@ final class AIMobileLocalMediaRequests: ObservableObject {
     private var cameraFrameCount = 0
     private var musicCompletion: CheckedContinuation<String, Error>?
 
-    #if DEBUG && targetEnvironment(simulator)
-    /// 使用独立对象模拟旧授权与旧封存结果迟到，绝不接触当前相机或生产账号。
-    static func verifyCameraRequestOwnership() -> Bool {
-        let state = AIMobileLocalMediaRequests()
-        state.presenterActive = true
-        do {
-            _ = try state.openCamera(in: "fixture-a", workspacePath: "/tmp")
-            guard let first = state.cameraRequestID, state.beginCameraOpening(requestID: first),
-                  state.closeCamera(in: "fixture-a"), state.cameraState == "stopping" else { return false }
-            // 旧授权尚未返回前，不能开启另一轮。
-            do { _ = try state.openCamera(in: "fixture-b", workspacePath: "/tmp"); return false }
-            catch { }
-            state.finishCameraOpening(requestID: first)
-            _ = try state.openCamera(in: "fixture-b", workspacePath: "/tmp")
-            guard let second = state.cameraRequestID, state.beginCameraOpening(requestID: second) else { return false }
-            state.failCamera(.permissionDenied, requestID: first)
-            state.finishCameraOpening(requestID: first)
-            state.recordCameraBatch("stale-batch", requestID: first)
-            guard state.cameraRequestID == second, state.cameraState == "opening" else { return false }
-            state.recordCameraBatch("fixture-batch", requestID: second)
-            state.markCameraVisible(second, batchID: "fixture-batch")
-            state.finishCameraOpening(requestID: second)
-            guard state.closeCamera(in: "fixture-b"), state.cameraState == "stopping" else { return false }
-            state.finishCameraArchive(batchID: "stale-batch", count: 9)
-            guard state.cameraState == "stopping" else { return false }
-            state.finishCameraArchive(batchID: "fixture-batch", count: 2)
-            return state.cameraState == "captured" && state.cameraStatus(in: "fixture-b")["frame_count"] == "2"
-        } catch { return false }
-    }
-    #endif
+
 
     func openCamera(in sessionID: String, workspacePath: String) throws -> String {
         guard presenterActive, UIApplication.shared.applicationState == .active,
@@ -5319,42 +5108,3 @@ final class AIMobileLocalMediaRequests: ObservableObject {
         failMusic(.canceled)
     }
 }
-
-#if targetEnvironment(simulator)
-struct AILocalMusicUITestRoot: View {
-    @ObservedObject private var music = MaiLocalMusicPlayer.shared
-    @State private var showing = false
-
-    var body: some View {
-        Button("测试本地音乐") {
-            do {
-                let file = try makeSilentWav()
-                try music.openLocalFile(file, title: "测试静音音乐")
-                showing = true
-            } catch { assertionFailure(error.localizedDescription) }
-        }
-        .sheet(isPresented: $showing) { MaiLocalMusicPlayerView(music: music) }
-    }
-
-    private func makeSilentWav() throws -> URL {
-        let file = FileManager.default.temporaryDirectory
-            .appendingPathComponent("maichat-local-music-ui-test.wav")
-        let sampleBytes = 160_000
-        var data = Data("RIFF".utf8)
-        func append<T: FixedWidthInteger>(_ value: T) {
-            var littleEndian = value.littleEndian
-            withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
-        }
-        append(UInt32(36 + sampleBytes))
-        data.append(contentsOf: "WAVEfmt ".utf8)
-        append(UInt32(16)); append(UInt16(1)); append(UInt16(1))
-        append(UInt32(8_000)); append(UInt32(16_000))
-        append(UInt16(2)); append(UInt16(16))
-        data.append(contentsOf: "data".utf8)
-        append(UInt32(sampleBytes))
-        data.append(Data(repeating: 0, count: sampleBytes))
-        try data.write(to: file, options: .atomic)
-        return file
-    }
-}
-#endif

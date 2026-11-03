@@ -103,129 +103,6 @@ struct MaiFfplayPresentation: Identifiable {
     }
 }
 
-struct MaiGalleryImageScreen: View {
-    let sequence: MaiMediaSequence
-    let entryDirection: Int
-    let navigate: (Int) -> Bool
-    let close: () -> Void
-    @State private var isZoomed = false
-    @State private var status = ""
-    @State private var arrived = false
-
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                Color.black.ignoresSafeArea()
-                ImagePreviewBackdrop(filePath: sequence.current.path,
-                                     viewportSize: geometry.size)
-                    .offset(x: arrived ? 0 : CGFloat(entryDirection * 48))
-                    .opacity(arrived ? 1 : 0.48)
-                RemoteIMAsyncImage(filePath: sequence.current.path,
-                    maximumPointSize: ImagePreviewZoomModifier.maximumDecodePointSize(
-                        for: geometry.size)) { image in
-                    let fitted = fittedSize(image.size, inside: geometry.size)
-                    Image(uiImage: image).resizable().scaledToFit()
-                        .frame(width: fitted.width, height: fitted.height)
-                        .modifier(ImagePreviewZoomModifier(enabled: true,
-                            imageSize: fitted, viewportSize: geometry.size,
-                            onScaleChanged: { isZoomed = $0 > 1.01 }))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .contentShape(Rectangle())
-                        .onTapGesture(perform: close)
-                        .simultaneousGesture(DragGesture(minimumDistance: 50).onEnded { value in
-                            guard !isZoomed,
-                                  abs(value.translation.width) > abs(value.translation.height) * 1.4
-                            else { return }
-                            let direction = value.translation.width < 0 ? 1 : -1
-                            if !navigate(direction) {
-                                status = direction > 0 ? "已经是最后一项" : "已经是第一项"
-                            }
-                        })
-                } placeholder: { failed in
-                    if failed { Text("图片无法显示").foregroundStyle(.white) }
-                    else { ProgressView().tint(.white) }
-                }
-                .id(sequence.current.path)
-                .offset(x: arrived ? 0 : CGFloat(entryDirection * 48))
-                .opacity(arrived ? 1 : 0.48)
-
-                VStack {
-                    HStack(alignment: .top) {
-                        Button(action: close) {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 20, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .frame(width: 50, height: 50)
-                                .background(.black.opacity(0.58), in: Circle())
-                        }
-                        .accessibilityLabel("关闭图片预览")
-                        Spacer(minLength: 12)
-                        Text("\(sequence.index + 1)/\(sequence.items.count) · " +
-                             URL(fileURLWithPath: sequence.current.path).lastPathComponent)
-                            .font(.system(size: 12, weight: .medium))
-                            .lineLimit(1)
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 10).padding(.vertical, 7)
-                            .background(.black.opacity(0.58), in: Capsule())
-                        Spacer(minLength: 62)
-                    }
-                    Spacer()
-                    if !status.isEmpty {
-                        Text(status).font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.white)
-                            .padding(10).background(.black.opacity(0.65), in: Capsule())
-                    }
-                    HStack(spacing: 14) {
-                        ShareLink(item: URL(fileURLWithPath: sequence.current.path)) {
-                            Image(systemName: "square.and.arrow.up")
-                                .frame(width: 48, height: 48)
-                        }
-                        Button {
-                            Task {
-                                do {
-                                    guard await MaiPhotoLibraryMediaWriter.requestAddAccess() else {
-                                        status = "请允许保存到相册"
-                                        return
-                                    }
-                                    try await MaiPhotoLibraryMediaWriter.saveImage(
-                                        at: URL(fileURLWithPath: sequence.current.path),
-                                        createdAt: Date())
-                                    status = "已保存到相册"
-                                } catch { status = error.localizedDescription }
-                            }
-                        } label: {
-                            Image(systemName: "square.and.arrow.down")
-                                .frame(width: 48, height: 48)
-                        }
-                        .accessibilityLabel("保存图片")
-                    }
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .buttonStyle(.plain)
-                    .background(.black.opacity(0.58), in: Capsule())
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                }
-                .padding(.horizontal, 20).padding(.vertical, 54)
-            }
-            .frame(width: geometry.size.width, height: geometry.size.height)
-        }
-        .ignoresSafeArea()
-        .onAppear {
-            withAnimation(.easeOut(duration: 0.22)) { arrived = true }
-        }
-        .onChange(of: sequence.current.path) { _ in
-            isZoomed = false
-            status = ""
-        }
-    }
-
-    private func fittedSize(_ source: CGSize, inside viewport: CGSize) -> CGSize {
-        guard source.width > 0, source.height > 0 else { return viewport }
-        let factor = min(viewport.width / source.width, viewport.height / source.height)
-        return CGSize(width: source.width * factor, height: source.height * factor)
-    }
-}
-
 @MainActor
 enum MaiFfplayMobilePlayer {
     static var active: MaiFfplayVideoController?
@@ -397,6 +274,11 @@ private final class MaiFfplayMetalView: UIView {
         }
     }
 
+    func configureInitialSpeed(_ speed: Double) {
+        guard session == nil, viewID == 0 else { return }
+        playbackSpeed = speed
+    }
+
     func sendCommand(_ action: String) -> Bool {
         guard let session else { return false }
         return action.withCString { maiFfplayIosCommand(session, $0) == 1 }
@@ -480,13 +362,19 @@ private final class MaiFfplayMetalView: UIView {
     }
 
     func stop() {
-        if let session {
-            self.session = nil
-            maiFfplayIosStop(session)
-        }
+        freezeForPaging()
         if viewID != 0 {
             maiGraphicsPresenterDetach(viewID)
             viewID = 0
+        }
+    }
+
+    // 分页提交时只停止解码，保留已提交的 Metal 画面。整页滑出后再 detach，
+    // 避免唯一 FFplay 实例交接期间把仍在屏幕里的旧视频清成黑色。
+    func freezeForPaging() {
+        if let session {
+            self.session = nil
+            maiFfplayIosStop(session)
         }
     }
 
@@ -497,10 +385,8 @@ final class MaiFfplayVideoController: UIViewController {
     private let path: String
     private let vod: MaiCloudVodSession?
     private let startSeconds: Double
-    private let entryDirection: Int
     private let embeddedInMediaPager: Bool
     private let onClose: () -> Void
-    private var onNavigate: ((Int) -> Bool)?
     private var onPlaybackReady: (() -> Void)?
     var onPlaybackFailure: ((String) -> Void)?
     var controlsInteractionChanged: ((Bool) -> Void)?
@@ -517,11 +403,16 @@ final class MaiFfplayVideoController: UIViewController {
     private var playing = true
     private var playbackSpeed = 1.0
     private var saving = false
-    private var didAnimateEntry = false
     private var didReportPlaybackReady = false
+    private var controlViews: [UIView] = []
+    private var controlsVisible = true
+    private var controlsPlaying = true
+    private var controlsSeeking = false
+    private var controlTouches = 0
+    private var hostActive = false
+    private var controlsHideTask: Task<Void, Never>?
 
-    init(path: String, startSeconds: Double = 0,
-         entryDirection: Int = 0, navigate: ((Int) -> Bool)? = nil,
+    init(path: String, startSeconds: Double = 0, initialSpeed: Double = 1,
          onPlaybackReady: (() -> Void)? = nil,
          vod: MaiCloudVodSession? = nil,
          embeddedInMediaPager: Bool = false,
@@ -529,9 +420,8 @@ final class MaiFfplayVideoController: UIViewController {
         self.path = path
         self.vod = vod
         self.startSeconds = startSeconds
-        self.entryDirection = entryDirection
+        playbackSpeed = initialSpeed
         self.embeddedInMediaPager = embeddedInMediaPager
-        onNavigate = navigate
         self.onPlaybackReady = onPlaybackReady
         onClose = close
         super.init(nibName: nil, bundle: nil)
@@ -539,34 +429,34 @@ final class MaiFfplayVideoController: UIViewController {
 
     required init?(coder: NSCoder) { nil }
 
-    func setNavigation(_ navigate: ((Int) -> Bool)?) { onNavigate = navigate }
 
     /// 初始化播放器承载视图、播放控件与进度观察。
     /// 视图仅创建一次；重播和跳转复用同一播放实例，避免重建导致音频状态丢失。
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
+        // 媒体身份交给无障碍画面描述，供读屏和回归识别，不绘制文件名标题。
+        metalView.isAccessibilityElement = true
+        metalView.accessibilityTraits = .image
+        metalView.accessibilityLabel = "视频画面"
+        metalView.accessibilityValue = URL(fileURLWithPath: path).lastPathComponent
+        metalView.accessibilityIdentifier = "ffplay-video-surface"
         metalView.videoPath = path
+        metalView.configureInitialSpeed(playbackSpeed)
         metalView.vod = vod
         metalView.startPositionUs = Int64((startSeconds * 1_000_000).rounded())
         metalView.onError = { [weak self] message in
             self?.errorLabel.text = message
             self?.errorLabel.isHidden = false
             self?.onPlaybackFailure?(message)
+            self?.revealControls()
         }
         metalView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(metalView)
-        if onNavigate != nil {
-            for direction in [UISwipeGestureRecognizer.Direction.left,
-                              UISwipeGestureRecognizer.Direction.right] {
-                let gesture = UISwipeGestureRecognizer(target: self,
-                                                       action: #selector(videoSwiped(_:)))
-                gesture.direction = direction
-                metalView.addGestureRecognizer(gesture)
-            }
-        }
+        metalView.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(videoTapped)))
 
         errorLabel.textColor = .white
+        errorLabel.accessibilityIdentifier = "ffplay-error"
         errorLabel.textAlignment = .center
         errorLabel.isHidden = true
         errorLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -643,8 +533,13 @@ final class MaiFfplayVideoController: UIViewController {
         speedChoices.alignment = .fill
         speedChoices.distribution = .fillEqually
         speedChoices.spacing = 4
-        speedChoices.backgroundColor = UIColor.black.withAlphaComponent(0.82)
+        // 使用统一实色底，跨越视频画面与黑边时仍能看清完整菜单边界。
+        speedChoices.backgroundColor = UIColor(white: 0.15, alpha: 1)
         speedChoices.layer.cornerRadius = 18
+        speedChoices.layer.borderWidth = 1
+        speedChoices.layer.borderColor = UIColor.white.withAlphaComponent(0.16).cgColor
+        speedChoices.accessibilityIdentifier = "ffplay-speed-options"
+        speedChoices.insetsLayoutMarginsFromSafeArea = false
         speedChoices.layoutMargins = UIEdgeInsets(top: 6, left: 6, bottom: 6, right: 6)
         speedChoices.isLayoutMarginsRelativeArrangement = true
         speedChoices.isHidden = true
@@ -698,9 +593,10 @@ final class MaiFfplayVideoController: UIViewController {
             actions.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
             actions.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor,
                                            constant: -4),
-            speedChoices.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            speedChoices.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
-            speedChoices.heightAnchor.constraint(equalToConstant: 48),
+            speedChoices.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            speedChoices.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -18),
+            // 60 pt 面板减去上下各 6 pt 后，选项保持 48 pt 高度。
+            speedChoices.heightAnchor.constraint(equalToConstant: 60),
             speedChoices.bottomAnchor.constraint(equalTo: controls.topAnchor, constant: -10),
             saveStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             saveStatusLabel.bottomAnchor.constraint(equalTo: controls.topAnchor, constant: -18),
@@ -714,27 +610,20 @@ final class MaiFfplayVideoController: UIViewController {
             closeButton.widthAnchor.constraint(equalToConstant: 50),
             closeButton.heightAnchor.constraint(equalToConstant: 50),
         ])
-        if embeddedInMediaPager { observeControlTouches(in: view) }
+        controlViews = [controls, actions]
+        // 所有宿主复用触摸互锁；拖动及菜单操作期间不得把用户正在操作的控件隐藏。
+        observeControlTouches(in: view)
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        if !didAnimateEntry && entryDirection != 0 {
-            didAnimateEntry = true
-            view.transform = CGAffineTransform(translationX: CGFloat(entryDirection * 48), y: 0)
-            view.alpha = 0.48
-            UIView.animate(withDuration: 0.22, delay: 0,
-                           options: [.curveEaseOut, .allowUserInteraction]) {
-                self.view.transform = .identity
-                self.view.alpha = 1
-            }
-        }
         activateForVisibleHost()
     }
 
     // A selected page can embed this controller after its parent appeared.
     // Match the standalone SwiftUI host's ownership without starting neighbors.
     func activateForVisibleHost() {
+        hostActive = true
         MaiLocalMusicPlayer.shared.stop()
         if let previous = MaiFfplayMobilePlayer.active, previous !== self {
             previous.stop()
@@ -751,26 +640,27 @@ final class MaiFfplayVideoController: UIViewController {
         refreshPlayback()
     }
 
-    @objc private func videoSwiped(_ gesture: UISwipeGestureRecognizer) {
-        let direction = gesture.direction == .left ? 1 : -1
-        if onNavigate?(direction) == false {
-            showStatus(direction > 0 ? "已经是最后一个视频" : "已经是第一个视频")
-        }
-    }
-
     private func refreshPlayback() {
         metalView.checkPlayback()
         if !didReportPlaybackReady && metalView.hasFirstFrame {
             didReportPlaybackReady = true
             onPlaybackReady?()
+            revealControls()
         }
         guard let status = metalView.playbackStatus(), status.duration_us > 0 else { return }
-        let position = min(max(status.position_us, 0), status.duration_us)
+        // 手指松开后，云盘读取/解码尚未完成时沿用共享核心发布的目标反馈。
+        // 等本次新队列时钟生效再跟随真实进度，避免旧时钟把滑块拉回去。
+        let position = min(max(status.seeking != 0 ? status.seek_target_us : status.position_us, 0),
+                           status.duration_us)
         if !seekSlider.isTracking {
             seekSlider.value = Float(Double(position) / Double(status.duration_us))
         }
         timeLabel.text = "\(Self.timestamp(position)) / \(Self.timestamp(status.duration_us))"
-        playing = status.paused == 0
+        if status.seeking == 0 { playing = status.paused == 0 }
+        if controlsSeeking != (status.seeking != 0) {
+            controlsSeeking = status.seeking != 0
+            revealControls()
+        }
         playbackSpeed = Double(status.speed_percent) / 100.0
         speedButton.setTitle("\(playbackSpeed)×", for: .normal)
         speedButton.accessibilityLabel = "播放倍速 \(playbackSpeed)×"
@@ -783,12 +673,30 @@ final class MaiFfplayVideoController: UIViewController {
     }
 
     func stop() {
+        hostActive = false
+        controlTouches = 0
+        controlsHideTask?.cancel()
+        controlsHideTask = nil
         playbackTimer?.invalidate()
         playbackTimer = nil
         metalView.stop()
         controlsInteractionChanged?(false)
         if MaiFfplayMobilePlayer.active === self { MaiFfplayMobilePlayer.active = nil }
     }
+
+    func freezeForPaging() {
+        hostActive = false
+        controlTouches = 0
+        controlsHideTask?.cancel()
+        controlsHideTask = nil
+        playbackTimer?.invalidate()
+        playbackTimer = nil
+        metalView.freezeForPaging()
+        controlsInteractionChanged?(false)
+        if MaiFfplayMobilePlayer.active === self { MaiFfplayMobilePlayer.active = nil }
+    }
+
+    var speedForPaging: Double { playbackSpeed }
 
     var playbackUnavailableReason: String { metalView.unavailableReason }
 
@@ -812,14 +720,18 @@ final class MaiFfplayVideoController: UIViewController {
     }
 
     func seekPercent(_ fraction: Double) -> Bool {
-        metalView.seekPercent(fraction)
+        let accepted = metalView.seekPercent(fraction)
+        if accepted { revealControls() }
+        return accepted
     }
 
     func seekSeconds(_ seconds: Double) -> Bool {
         guard seconds.isFinite, seconds >= 0,
               let status = metalView.playbackStatus(), status.duration_us > 0,
               seconds * 1_000_000 <= Double(status.duration_us) else { return false }
-        return metalView.seekAbsoluteUs(Int64((seconds * 1_000_000).rounded()))
+        let accepted = metalView.seekAbsoluteUs(Int64((seconds * 1_000_000).rounded()))
+        if accepted { revealControls() }
+        return accepted
     }
 
     func replay() -> Bool {
@@ -841,6 +753,7 @@ final class MaiFfplayVideoController: UIViewController {
         speedButton.accessibilityLabel = "播放倍速 \(speed)×"
         playing = true
         refreshPlayButton()
+        revealControls()
         return true
     }
 
@@ -855,14 +768,72 @@ final class MaiFfplayVideoController: UIViewController {
         parent.subviews.forEach { observeControlTouches(in: $0) }
     }
 
-    @objc private func controlTouchBegan() { controlsInteractionChanged?(true) }
-    @objc private func controlTouchEnded() { controlsInteractionChanged?(false) }
+    @objc private func controlTouchBegan() {
+        controlTouches += 1
+        controlsInteractionChanged?(true)
+        revealControls()
+    }
+    @objc private func controlTouchEnded() {
+        controlTouches = max(0, controlTouches - 1)
+        controlsInteractionChanged?(controlTouches > 0)
+        scheduleControlsHide()
+    }
+
+    @objc private func videoTapped() {
+        if !speedChoices.isHidden {
+            speedChoices.isHidden = true
+            revealControls()
+        } else if controlsVisible && playing {
+            controlsHideTask?.cancel()
+            setControlsVisible(false)
+        } else { revealControls() }
+    }
+
+    private func revealControls() {
+        setControlsVisible(true)
+        scheduleControlsHide()
+    }
+
+    private func setControlsVisible(_ visible: Bool) {
+        controlsVisible = visible
+        for control in controlViews {
+            if visible { control.isHidden = false }
+            control.isUserInteractionEnabled = visible
+            control.accessibilityElementsHidden = !visible
+        }
+        UIView.animate(withDuration: 0.18, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
+            self.controlViews.forEach { $0.alpha = visible ? 1 : 0 }
+        } completion: { [weak self] _ in
+            guard let self, !self.controlsVisible else { return }
+            self.controlViews.forEach { $0.isHidden = true }
+        }
+    }
+
+    private func scheduleControlsHide() {
+        controlsHideTask?.cancel()
+        controlsHideTask = nil
+        guard hostActive, playing, !controlsSeeking, controlTouches == 0, speedChoices.isHidden, !saving,
+              presentedViewController == nil, errorLabel.isHidden else { return }
+        // 每次操作更新同一个任务；停止或翻页取消，旧播放器不能影响新一页的控件。
+        controlsHideTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: 2_500_000_000) }
+            catch { return }
+            guard let self, !Task.isCancelled, self.hostActive, self.playing, !self.controlsSeeking,
+                  self.controlTouches == 0, self.speedChoices.isHidden, !self.saving,
+                  self.presentedViewController == nil, self.errorLabel.isHidden else { return }
+            self.setControlsVisible(false)
+        }
+    }
 
     @objc private func togglePause() { _ = sendCommand("toggle_pause") }
     @objc private func seekReleased() { _ = seekPercent(Double(seekSlider.value)) }
     @objc private func closeTapped() { close() }
 
     private func refreshPlayButton() {
+        if controlsPlaying != playing {
+            controlsPlaying = playing
+            revealControls()
+        }
         pauseButton.setImage(UIImage(systemName: playing ? "pause.fill" : "play.fill"), for: .normal)
         pauseButton.accessibilityLabel = playing ? "暂停视频" : "播放视频"
     }
@@ -896,6 +867,9 @@ final class MaiFfplayVideoController: UIViewController {
         if vod != nil { showStatus("云盘视频正在点播，无法直接转发") ; return }
         let sheet = UIActivityViewController(activityItems: [URL(fileURLWithPath: path)],
                                              applicationActivities: nil)
+        sheet.completionWithItemsHandler = { [weak self] _, _, _, _ in
+            Task { @MainActor [weak self] in self?.revealControls() }
+        }
         sheet.popoverPresentationController?.sourceView = view
         sheet.popoverPresentationController?.sourceRect = CGRect(
             x: view.bounds.midX, y: view.bounds.maxY - 50, width: 1, height: 1)
@@ -913,6 +887,7 @@ final class MaiFfplayVideoController: UIViewController {
             defer {
                 saving = false
                 saveButton.isEnabled = true
+                revealControls()
             }
             do {
                 // 先检查真实文件和视频轨道；无效文件不应进入 Photos 的变更块。
@@ -937,6 +912,23 @@ final class MaiFfplayVideoController: UIViewController {
 
     @objc private func toggleSpeedChoices() {
         speedChoices.isHidden.toggle()
+        revealControls()
+        #if targetEnvironment(simulator)
+        if !speedChoices.isHidden && ProcessInfo.processInfo.arguments.contains("--ai-ui-test") {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                NSLog("[PlaybackSpeedLayout] host=%@ safe=%@ menu=%@ menuSafe=%@ margins=%@",
+                    String(describing: self.view.bounds), String(describing: self.view.safeAreaInsets),
+                    String(describing: self.speedChoices.frame), String(describing: self.speedChoices.safeAreaInsets),
+                    String(describing: self.speedChoices.layoutMargins))
+                for case let button as UIButton in self.speedChoices.arrangedSubviews {
+                    NSLog("[PlaybackSpeedLayout] choice=%@ frame=%@ title=%@ lineHeight=%.2f",
+                        button.currentTitle ?? "", String(describing: button.frame),
+                        String(describing: button.titleLabel?.frame), button.titleLabel?.font.lineHeight ?? 0)
+                }
+            }
+        }
+        #endif
     }
 
     @objc private func speedChoiceTapped(_ sender: UIButton) {
@@ -955,21 +947,16 @@ struct MaiFfplayVideoScreen: UIViewControllerRepresentable {
     let path: String
     let vod: MaiCloudVodSession?
     let startSeconds: Double
-    let entryDirection: Int
-    let navigate: ((Int) -> Bool)?
     let onPlaybackReady: (() -> Void)?
     let close: () -> Void
 
     init(path: String, startSeconds: Double = 0,
-         entryDirection: Int = 0, navigate: ((Int) -> Bool)? = nil,
          onPlaybackReady: (() -> Void)? = nil,
          vod: MaiCloudVodSession? = nil,
          close: @escaping () -> Void) {
         self.path = path
         self.vod = vod
         self.startSeconds = startSeconds
-        self.entryDirection = entryDirection
-        self.navigate = navigate
         self.onPlaybackReady = onPlaybackReady
         self.close = close
     }
@@ -978,7 +965,6 @@ struct MaiFfplayVideoScreen: UIViewControllerRepresentable {
         MaiLocalMusicPlayer.shared.stop()
         let controller = MaiFfplayVideoController(
             path: path, startSeconds: startSeconds,
-            entryDirection: entryDirection, navigate: navigate,
             onPlaybackReady: onPlaybackReady, vod: vod, close: close)
         // 嵌入式播放器不一定触发全屏控制器的 viewDidAppear；创建时先绑定 Agent 工具。
         if let previous = MaiFfplayMobilePlayer.active, previous !== controller {
@@ -989,7 +975,6 @@ struct MaiFfplayVideoScreen: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ controller: MaiFfplayVideoController, context _: Context) {
-        controller.setNavigation(navigate)
     }
 
     static func dismantleUIViewController(_ controller: MaiFfplayVideoController,
@@ -997,259 +982,3 @@ struct MaiFfplayVideoScreen: UIViewControllerRepresentable {
         controller.stop()
     }
 }
-
-#if targetEnvironment(simulator)
-struct MaiFfplayUITestRoot: View {
-    @State private var showingVideo = false
-
-    var body: some View {
-        AIAssistantView()
-            .fullScreenCover(isPresented: $showingVideo) {
-                if let file = Bundle.main.url(forResource: "ffplay-sample", withExtension: "mp4") {
-                    MaiFfplayVideoScreen(path: file.path) { showingVideo = false }
-                        .ignoresSafeArea()
-                        .statusBarHidden()
-                }
-            }
-            .task { showingVideo = true }
-    }
-}
-
-struct MaiFfplaySwipeUITestRoot: View {
-    @State private var showingVideo = false
-    @State private var index = 0
-
-    var body: some View {
-        Color.black
-            .fullScreenCover(isPresented: $showingVideo) {
-                if let first = Bundle.main.url(forResource: "ffplay-sample",
-                                               withExtension: "mp4"),
-                   let second = Bundle.main.url(forResource: "ffplay-seek-sample",
-                                                withExtension: "mp4") {
-                    let paths = [first.path, second.path]
-                    MaiFfplayVideoScreen(path: paths[index], navigate: { direction in
-                        guard paths.indices.contains(index + direction) else { return false }
-                        index += direction
-                        return true
-                    }) {
-                        showingVideo = false
-                    }
-                    .id(index)
-                    .ignoresSafeArea()
-                    .statusBarHidden()
-                    .overlay(alignment: .top) {
-                        Text(URL(fileURLWithPath: paths[index]).lastPathComponent)
-                            .accessibilityIdentifier("ffplay-current-video")
-                            .foregroundStyle(.white)
-                            .padding(.top, 70)
-                    }
-                }
-            }
-            .task { showingVideo = true }
-    }
-}
-
-struct MaiMixedGalleryUITestRoot: View {
-    @State private var video: MaiFfplayPresentation?
-    @State private var image: MaiMediaSequence?
-    @State private var direction = 0
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            if let video {
-                MaiFfplayVideoScreen(path: video.path, navigate: navigate) {
-                    self.video = nil
-                }
-                .id(video.id)
-                .ignoresSafeArea()
-                .overlay(alignment: .top) {
-                    Text("\(video.index + 1)/\(video.sequence.items.count) · " +
-                         URL(fileURLWithPath: video.path).lastPathComponent)
-                        .foregroundStyle(.white).padding(.top, 70)
-                }
-            }
-            if let image {
-                MaiGalleryImageScreen(sequence: image, entryDirection: direction,
-                                      navigate: navigate) {
-                    self.image = nil
-                }
-                .id(image.current.path)
-            }
-        }
-        .statusBarHidden()
-        .task {
-            guard let first = Bundle.main.url(forResource: "ffplay-seek-sample",
-                                                  withExtension: "mp4"),
-                  let last = Bundle.main.url(forResource: "ffplay-sample",
-                                                 withExtension: "mp4") else { return }
-            let sample = UIGraphicsImageRenderer(size: CGSize(width: 300, height: 500))
-                .image { context in
-                    UIColor.systemOrange.setFill()
-                    context.fill(CGRect(x: 0, y: 0, width: 300, height: 500))
-                }
-            let imageURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("mixed-gallery-sample.png")
-            guard let data = sample.pngData(),
-                  (try? data.write(to: imageURL)) != nil else { return }
-            let selected = MaiMediaItem(kind: .video, path: first.path)
-            let sequence = MaiMediaSequence(selected: selected, items: [
-                selected,
-                MaiMediaItem(kind: .image, path: imageURL.path),
-                MaiMediaItem(kind: .video, path: last.path)
-            ])
-            video = MaiFfplayPresentation(sequence: sequence)
-        }
-    }
-
-    private func navigate(_ direction: Int) -> Bool {
-        guard let next = (video?.sequence ?? image)?.adjacent(direction) else { return false }
-        self.direction = direction
-        if next.current.kind == .video {
-            image = nil
-            video = MaiFfplayPresentation(sequence: next, entryDirection: direction)
-        } else {
-            video = nil
-            image = next
-        }
-        return true
-    }
-}
-
-struct MaiFfplaySeekUITestRoot: View {
-    let startSeconds: Double
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-    @State private var showingVideo = false
-    @State private var commandResult = "尚未定位"
-
-    var body: some View {
-        Color.black
-            .fullScreenCover(isPresented: $showingVideo) {
-                if let file = Bundle.main.url(forResource: "ffplay-seek-sample", withExtension: "mp4") {
-                    MaiFfplayVideoScreen(path: file.path, startSeconds: startSeconds) {
-                        showingVideo = false
-                    }
-                    .ignoresSafeArea()
-                    .statusBarHidden()
-                    .overlay(alignment: .topTrailing) {
-                        Button(commandResult) {
-                            Task { @MainActor in
-                                let result = await AIMobileHostToolProvider.shared.execute(
-                                    name: "maichat_video_command",
-                                    argumentsJSON: #"{"action":"seek_seconds","seconds":6}"#)
-                                commandResult = result.errorCode == nil ? "定位已受理" : "定位失败"
-                            }
-                        }
-                        .accessibilityIdentifier("agent-seek-six-seconds")
-                        .padding(.top, 72)
-                        .padding(.trailing, 16)
-                    }
-                }
-            }
-            .task {
-                AIMobileHostToolProvider.shared.appState = appState
-                showingVideo = true
-            }
-    }
-}
-#endif
-
-#if DEBUG
-struct MaiFfplayAgentDockUITestRoot: View {
-    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
-    @State private var commandResult = "准备打开视频"
-
-    var body: some View {
-        GeometryReader { geometry in
-            VStack(spacing: 16) {
-                if let presentation = appState.agentVideoPresentation {
-                    MaiFfplayVideoScreen(path: presentation.path,
-                                         startSeconds: presentation.startSeconds) {
-                        appState.agentVideoPresentation = nil
-                    }
-                    .frame(height: geometry.size.height * 0.57)
-                }
-                HStack {
-                    Button("Agent 重播") {
-                        Task { await command(#"{"action":"replay"}"#) }
-                    }
-                    .accessibilityIdentifier("agent-replay")
-                    Button("Agent 从开头播放") {
-                        Task { await command(#"{"action":"seek_seconds","seconds":0}"#) }
-                    }
-                    .accessibilityIdentifier("agent-start-over")
-                }
-                HStack {
-                    Button("Agent 0.5×") {
-                        Task { await command(#"{"action":"set_speed","speed":0.5}"#) }
-                    }
-                    .accessibilityIdentifier("agent-speed-half")
-                    Button("Agent 2×") {
-                        Task { await command(#"{"action":"set_speed","speed":2}"#) }
-                    }
-                    .accessibilityIdentifier("agent-speed-double")
-                }
-                Text(commandResult).accessibilityIdentifier("agent-command-result")
-                Spacer()
-            }
-            .frame(maxWidth: .infinity)
-        }
-        .background(.black)
-        .foregroundStyle(.white)
-        .task { await openVideoThroughAgentTool() }
-    }
-
-    private func command(_ arguments: String) async {
-        let result = await AIMobileHostToolProvider.shared.execute(
-            name: "maichat_video_command", argumentsJSON: arguments)
-        commandResult = result.errorCode == nil ? "Agent 指令已执行" :
-            "Agent 指令失败：\(result.errorCode ?? "unknown")"
-    }
-
-    private func openVideoThroughAgentTool() async {
-        AppDiagnosticLog.shared.install()
-        AIMobileHostToolProvider.shared.appState = appState
-        if ProcessInfo.processInfo.arguments.contains("--ffplay-agent-real-video-test") {
-            let support = FileManager.default.urls(for: .applicationSupportDirectory,
-                                                   in: .userDomainMask)[0]
-            let workspace = support.appendingPathComponent("AIAssistant/Workspace",
-                                                           isDirectory: true)
-            let video = workspace.appendingPathComponent("out5-nowm.mp4")
-            guard FileManager.default.fileExists(atPath: video.path) else {
-                commandResult = "实际测试视频不存在"
-                return
-            }
-            AIAssistantModel.shared.installVideoToolTestWorkspace(workspace.path)
-            let result = await AIMobileHostToolProvider.shared.execute(
-                name: "maichat_play_video", argumentsJSON: #"{"path":"out5-nowm.mp4"}"#)
-            commandResult = result.errorCode == nil ? "Agent 已打开实际视频" :
-                "Agent 打开失败：\(result.errorCode ?? "unknown")"
-            return
-        }
-        guard let sample = Bundle.main.url(forResource: "ffplay-seek-sample",
-                                            withExtension: "mp4") else {
-            commandResult = "测试视频不存在"
-            return
-        }
-        let workspace = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ffplay-agent-dock-test", isDirectory: true)
-        let destination = workspace.appendingPathComponent(sample.lastPathComponent)
-        do {
-            try FileManager.default.createDirectory(at: workspace,
-                                                    withIntermediateDirectories: true)
-            if !FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.copyItem(at: sample, to: destination)
-            }
-        } catch {
-            commandResult = "无法准备测试视频：\(error.localizedDescription)"
-            return
-        }
-        AIAssistantModel.shared.installVideoToolTestWorkspace(workspace.path)
-        let result = await AIMobileHostToolProvider.shared.execute(
-            name: "maichat_play_video",
-            argumentsJSON: #"{"path":"ffplay-seek-sample.mp4"}"#)
-        commandResult = result.errorCode == nil ? "Agent 已打开视频" :
-            "Agent 打开失败：\(result.errorCode ?? "unknown")"
-    }
-}
-#endif
