@@ -1,6 +1,78 @@
 import XCTest
 
 final class ScreenFrameArchiveUITests: XCTestCase {
+    /// 正常 Root 的 +/拍摄入口必须先出现手动快门；显式 Agent 定时结束后也不能复用定时模式。
+    @MainActor
+    func testManualCameraHasShutterAndDoesNotReuseTimedCapture() async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test",
+            "--ai-manual-camera-ui-test", "--agent-camera-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let tab = app.buttons["创作中心"]
+        XCTAssertTrue(tab.waitForExistence(timeout: 12))
+        tab.tap()
+        XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 8))
+
+        func openManual(_ name: String) {
+            app.buttons["展开更多功能"].tap()
+            let entry = app.buttons["拍摄"]
+            XCTAssertTrue(entry.waitForExistence(timeout: 3))
+            entry.tap()
+            let shutter = app.buttons["ai-manual-camera-shutter"]
+            _ = shutter.waitForExistence(timeout: 4)
+            let shot = XCTAttachment(screenshot: app.screenshot())
+            shot.name = name; shot.lifetime = .keepAlways; add(shot)
+            XCTAssertTrue(shutter.isHittable, "手动拍摄必须呈现真实手动分支，不能将 nil target 当成定时模式")
+            XCTAssertFalse(app.buttons["ai-camera-stop"].exists)
+            XCTAssertFalse(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "每 2 秒拍摄")).firstMatch.exists)
+            XCTAssertEqual(app.staticTexts["ai-manual-camera-timed-state"].value as? String,
+                           "running:false;request:false")
+        }
+
+        openManual("manual-camera-first-open")
+        try await Task.sleep(for: .milliseconds(2200))
+        XCTAssertEqual(app.staticTexts["ai-manual-camera-timed-state"].value as? String,
+                       "running:false;request:false", "越过两秒后仍不能自动进入采样")
+        app.buttons["ai-manual-camera-cancel"].tap()
+        XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 4))
+        openManual("manual-camera-reopened-after-cancel")
+        app.buttons["ai-manual-camera-cancel"].tap()
+
+        // 这一操作才显式请求定时模式，保留原 Agent 能力；帧来自已 opt-in 的合成 sampler。
+        let timed = app.buttons["ai-camera-fixture-open"]
+        XCTAssertTrue(timed.waitForExistence(timeout: 4)); timed.tap()
+        let stop = app.buttons["ai-camera-stop"]
+        XCTAssertTrue(stop.waitForExistence(timeout: 8))
+        let sampled = app.staticTexts.matching(NSPredicate(format: "label MATCHES %@", ".*已拍摄 [1-9][0-9]* 张")).firstMatch
+        XCTAssertTrue(sampled.waitForExistence(timeout: 8))
+        stop.tap()
+        let close = app.buttons["ai-screen-frames-close"]
+        XCTAssertTrue(close.waitForExistence(timeout: 8)); close.tap()
+        openManual("manual-camera-after-timed-stop")
+        // 合成手动快门只添加一次照片到原草稿，不再次启动定时采样，也不接触真实相机。
+        app.buttons["ai-manual-camera-shutter"].tap()
+        let attachments = app.scrollViews["ai-pending-attachments"]
+        XCTAssertTrue(attachments.waitForExistence(timeout: 8))
+        let singlePhoto = XCTNSPredicateExpectation(predicate: NSPredicate(format: "count == 1"),
+            object: app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "ai-remove-attachment-")))
+        XCTAssertEqual(XCTWaiter.wait(for: [singlePhoto], timeout: 8), .completed,
+                       "手动快门必须将且仅将一张照片加到原会话草稿")
+        XCTAssertTrue(app.textViews["ai-composer"].exists)
+        XCTAssertFalse(app.buttons["ai-camera-stop"].exists)
+        let imported = XCTAttachment(screenshot: app.screenshot())
+        imported.name = "manual-camera-single-photo-in-original-draft"
+        imported.lifetime = .keepAlways
+        add(imported)
+        #else
+        throw XCTSkip("仅在 Debug 模拟器使用合成相机和独立内存会话")
+        #endif
+    }
+
     /// 本机假账号和模拟器合成帧验证 Agent 相机流程，不请求真实相机或模型服务。
     @MainActor
     func testAgentCameraAutomaticallySamplesAndAddsSelectionToOriginalDraft() async throws {

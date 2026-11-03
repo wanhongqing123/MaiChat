@@ -159,8 +159,12 @@ public:
     }
     std::string description() const override {
         // 这是受限的进程内 curl，不是任意命令行：只放行已列明的 HTTP 参数，
-        // 上传文件必须来自工作区；输出和日志都有上限。
-        return "Run the vendored curl command inside MaiChat without a subprocess. Supported "
+        // 上传文件必须来自工作区；输出和日志都有上限。用途是文件传输、API/自建后台通信、
+        // HTTP状态/响应头与连通性诊断；公开网页搜索改走专用web_search，不抓搜索引擎HTML。
+        return "Transfer files, call HTTP APIs (including the user's own backend), and inspect "
+               "connectivity, HTTP status and headers using the vendored in-process curl. "
+               "For web search use web_search; for article extraction use web_fetch. Do not use "
+               "curl to scrape search-engine result pages or bypass anti-bot challenges. Supported "
                "arguments: one HTTP(S) URL, -X/--request, -H/--header, -d/--data (literal text), "
                "-T/--upload-file (workspace file), -I/--head and --compressed. Other CLI "
                "options are rejected. Use output_path for a new downloaded file; otherwise "

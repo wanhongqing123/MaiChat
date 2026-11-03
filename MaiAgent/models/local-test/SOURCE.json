@@ -1,0 +1,30 @@
+{
+  "name": "TinyStories 260K English engine test fixture",
+  "production_model": false,
+  "distribution": "Debug builds only; Release ships the import UI without this CI fixture.",
+  "artifact_url": "https://huggingface.co/ggml-org/models/resolve/499bc8821c6b12b4e53c5bffcb21ec206f212d81/tinyllamas/stories260K.gguf",
+  "artifact_repository_revision": "499bc8821c6b12b4e53c5bffcb21ec206f212d81",
+  "bytes": 1185376,
+  "sha256": "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d",
+  "original_model": "https://huggingface.co/karpathy/tinyllamas/tree/0bd21da7698eaf29a0d7de3992de8a46ef624add/stories260K",
+  "original_model_license": "MIT (official karpathy/tinyllamas model card; full upstream llama2.c MIT notice retained)",
+  "upstream_ci_warning": "Various models to be used in llama.cpp CI workflow. Do not use it in production.",
+  "source_documents": [
+    {
+      "file": "LICENSE",
+      "url": "https://raw.githubusercontent.com/karpathy/llama2.c/master/LICENSE",
+      "sha256": "e87b912002f04cdfa837eaf7f70548ab79b9cb62a285495edf575f3da875aec4"
+    },
+    {
+      "file": "UPSTREAM_MODEL_CARD.md",
+      "url": "https://huggingface.co/karpathy/tinyllamas/raw/0bd21da7698eaf29a0d7de3992de8a46ef624add/README.md",
+      "sha256": "f5d36081d79fc18b2b8ee80fbf05f307c30ea8d6f3ce605c3f393be29f7d8863"
+    },
+    {
+      "file": "UPSTREAM_CI_README.md",
+      "url": "https://huggingface.co/ggml-org/models/raw/499bc8821c6b12b4e53c5bffcb21ec206f212d81/README.md",
+      "sha256": "7aa1be63e52243535d20a5125f3cd9d8bdab61895096b5fe57e2eb391c7ab01c"
+    }
+  ],
+  "verified_utc_date": "2026-11-03"
+}

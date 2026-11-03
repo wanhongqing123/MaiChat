@@ -13,6 +13,7 @@
 #include "MaiArkAssetTools.h"
 #include "MaiArkMediaTools.h"
 #include "MaiCurlTools.h"
+#include "MaiDeepSeekWebTools.h"
 #include "MaiCvImageTools.h"
 #include "MaiCvVideoAnalysis.h"
 #include "MaiCvVideoTools.h"
@@ -67,6 +68,14 @@
 using Json = nlohmann::json;
 
 namespace {
+
+// 保留核心错误类型给宿主队列判断“明确未受理”。不能把未知异常或附件错误猜成Busy后重播。
+class NativeOperationFailure final : public std::runtime_error {
+public:
+    explicit NativeOperationFailure(const MaiError& error)
+        : std::runtime_error(error.message()), code(error.code()) {}
+    MaiErrorCode code;
+};
 
 // 私有表单 token 只关联这一轮请求，不用作路径、账号或密码；与宿主 UUID 校验保持一致。
 std::string pdfPasswordRequestId() {
@@ -433,7 +442,7 @@ struct MaiMobileAgent {
     }
 
     static std::string result(MaiResult<std::string> value) {
-        if (!value) throw std::runtime_error(value.error().message());
+        if (!value) throw NativeOperationFailure(value.error());
         return value.value();
     }
 
@@ -526,6 +535,17 @@ struct MaiMobileAgent {
         registerMaiCurlTools(*tools, config.caBundlePath);
         // 与普通 C ABI 共用进程内的唯一驻留模型；主聊天仍直连原供应商。
         registerMaiLlamaTools(*tools);
+        // 检索由供应商API处理；凭据每次从所属账号读取，不用curl抓搜索引擎HTML。
+        MaiDeepSeekWebOptions webOptions;
+        webOptions.caBundlePath = config.caBundlePath;
+        webOptions.apiKey = [dispatcher = hostTools]() -> std::string {
+            const auto result = callMaiMobileHostTool(dispatcher, "deepseek_api_key", "{}");
+            if (result.hasError()) return {};
+            const auto response = Json::parse(result.output(), nullptr, false);
+            return response.is_object() && response.value("key", Json{}).is_string()
+                ? response["key"].get<std::string>() : std::string{};
+        };
+        registerMaiDeepSeekWebTools(*tools, std::move(webOptions));
         tools->add(makeMaiZlibCompressTool());
         tools->add(makeMaiZlibDecompressTool());
         tools->add(makeMaiOpenSslCliTool());
@@ -734,6 +754,21 @@ struct MaiMobileAgent {
             return result.output();
         };
         options.baseInstructions = kMarkdownBaseInstructions;
+        // 内置模型路径由原生宿主复制/校验后提供，只允许当前App容器中的现有文件。
+        // 提示词只介绍已知可用的英文测试权重，不改变主聊天供应商，也不让模型猜目录。
+        if (request.value("localTestModelPath", Json{}).is_string()) {
+            MaiToolContext localModelContext;
+            localModelContext.root = request.at("workspace").get<std::string>();
+            localModelContext.fileAccessRoot = options.fileAccessRoot;
+            const auto localModel = localModelContext.resolvePath(request["localTestModelPath"].get<std::string>());
+            if (!localModel.empty() && MaiFileSystem::exists(MaiFilePath::fromUtf8(localModel))) {
+                options.baseInstructions += "\nA tiny English CPU inference test model is available locally at " +
+                    localModel + ". Use the llama tool with -m pointing to this existing GGUF, "
+                    "-p 'Once upon a time', -c 256 -n 32 -t 2 --temp 0 --no-conversation to test "
+                    "the engine. It is an English continuation test model, with no OCR or image "
+                    "capability. Do not search directories or download models to run this test.";
+            }
+        }
         const auto policy = request.value("policy", "on-request");
         if (policy == "never")
             options.approvalPolicy = MaiApprovalPolicy::Never;
@@ -1169,8 +1204,11 @@ char* maiMobileAgentRequest(void* handle, const char* request) {
     try {
         if (!handle || !request) throw std::runtime_error("Invalid bridge handle.");
         response = static_cast<MaiMobileAgent*>(handle)->request(Json::parse(request)).dump();
+    } catch (const NativeOperationFailure& error) {
+        response = Json{{"ok", false}, {"errorCode", maiErrorCodeToString(error.code)},
+                        {"error", error.what()}}.dump();
     } catch (const std::exception& e) {
-        response = Json{{"ok", false}, {"error", e.what()}}.dump();
+        response = Json{{"ok", false}, {"errorCode", "internal"}, {"error", e.what()}}.dump();
     } catch (...) {
         response = "{\"ok\":false,\"error\":\"Native agent failure.\"}";
     }

@@ -303,24 +303,69 @@ struct AIWelcomeUITestRoot: View {
 private final class AISteeringUITestProbe: ObservableObject {
     @Published var status = "尚未补充"
     @Published var archiveStatus = "归档未检查"
+    @Published private(set) var acceptedByRequestID: [String: String] = [:]
+    @Published private(set) var acknowledgementGateWaiting = false
+    @Published private(set) var acknowledgementGateReleased = false
+    private var acknowledgementGate: CheckedContinuation<Void, Never>?
     private var requests: [AISteeringRequest] = []
     private var archiveUnknownRequests: Set<String> = []
 
+    var holdsFirstAcknowledgement: Bool {
+        ProcessInfo.processInfo.environment["MAICHAT_STEERING_HOLD_FIRST_ACK"] == "1"
+    }
+
+    func releaseAcknowledgementGate() {
+        acknowledgementGateReleased = true
+        acknowledgementGateWaiting = false
+        let waiting = acknowledgementGate
+        acknowledgementGate = nil
+        waiting?.resume()
+    }
+
+    var ledger: String {
+        let fields: [String: Any] = ["attempts": requests.count, "accepted": acceptedByRequestID.count,
+            "texts": requests.map(\.text), "request_ids": requests.map(\.requestId),
+            "turn_ids": requests.map(\.turnId),
+            "pending_entries": AIAssistantModel.shared.outgoingEntries.count,
+            "ack_gate_waiting": acknowledgementGateWaiting,
+            "ack_gate_released": acknowledgementGateReleased]
+        return (try? JSONSerialization.data(withJSONObject: fields, options: .sortedKeys))
+            .map { String(decoding: $0, as: UTF8.self) } ?? "invalid-fixture-ledger"
+    }
+
     func submit(_ request: AISteeringRequest) async throws -> String {
+        let capturedAccount = AIAssistantModel.shared.screenFrameCurrentAccountID
         requests.append(request)
         let previous = requests.dropLast().last
         status = "已提交 \(requests.count) · \(request.turnId)"
-        try await Task.sleep(for: .milliseconds(900))
+        if holdsFirstAcknowledgement && requests.count == 1 && !acknowledgementGateReleased {
+            // 只控制合成宿主回执，不改生产队列时序；XCTest 明确放行前不会产生首条 ACK。
+            acknowledgementGateWaiting = true
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if acknowledgementGateReleased { continuation.resume() }
+                    else { acknowledgementGate = continuation }
+                }
+            } onCancel: {
+                Task { @MainActor in self.releaseAcknowledgementGate() }
+            }
+            try Task.checkCancellation()
+        } else {
+            let requested = Int(ProcessInfo.processInfo.environment["MAICHAT_STEERING_ACK_DELAY_MS"] ?? "") ?? 900
+            try await Task.sleep(for: .milliseconds(max(200, min(3000, requested))))
+        }
         if request.text.contains("收尾拒绝") {
             status = "收尾拒绝，未启动新任务"
             throw AIBackendError(message: "当前任务正在收尾，补充内容未发送")
         }
+        let messageID = acceptedByRequestID[request.requestId] ?? "msg_fixture_user_\(acceptedByRequestID.count + 1)"
+        acceptedByRequestID[request.requestId] = messageID
         if request.text.contains("归档未知"), archiveUnknownRequests.insert(request.requestId).inserted {
             status = "归档回执未知"
             throw AIBackendError(message: "模拟归档回执丢失", definitive: false)
         }
         if request.text.contains("重试") && previous == nil {
-            status = "送达未知，草稿保留"
+            status = "送达未知，队列保留"
             throw AIBackendError(message: "模拟回执丢失", definitive: false)
         }
         if request.text.contains("重试") {
@@ -331,7 +376,14 @@ private final class AISteeringUITestProbe: ObservableObject {
             }
         }
         status = "已落库 \(requests.count) · \(request.turnId)"
-        return "msg_fixture_user_\(requests.count)"
+        let model = AIAssistantModel.shared
+        if model.screenFrameCurrentAccountID == capturedAccount && model.selected == request.session &&
+            !model.messages.contains(where: { $0.id == messageID }) {
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            model.messages.append(AIMessage(id: messageID, role: "user", created: now, completed: now,
+                active: false, parts: [AIPart(id: "part_" + messageID, kind: "text", text: request.text)]))
+        }
+        return messageID
     }
 
     func checkArchiveLifecycle() async {
@@ -353,21 +405,36 @@ private final class AISteeringUITestProbe: ObservableObject {
             model.applyUITestMutation(.attachments([session: [AIImportedFile(
                 relativePath: reference.relativePath, mimeType: "image/png", isImage: true,
                 archiveReference: reference)]], firstMessageSessionID: session))
-            guard !(await model.sendMessage("归档收尾拒绝", expectedSession: session)) else {
-                throw AIBackendError(message: "拒绝补充被误报成功")
+            guard await model.sendMessage("归档收尾拒绝", expectedSession: session) else {
+                throw AIBackendError(message: "拒绝测试未保存到本地队列")
             }
+            _ = try await waitForOutgoingState(.failed, text: "归档收尾拒绝")
             try await archive.discard(context: context)
             _ = try await archive.releaseSession(workspace: workspace, sessionID: session)
             guard FileManager.default.fileExists(atPath: reference.fileURL.path) else {
-                throw AIBackendError(message: "拒绝后仍在草稿的原图被清理")
+                throw AIBackendError(message: "拒绝后仍在本地队列的原图被清理")
             }
-            guard !(await model.sendMessage("归档未知", expectedSession: session)) else {
-                throw AIBackendError(message: "未知回执被误报成功")
+            let nextReferences = try await archive.retainSelected(frameIDs: [frame.id], context: context,
+                usageSessionID: "draft:" + UUID().uuidString)
+            guard let next = nextReferences.first else { throw AIBackendError(message: "下一条截图引用缺失") }
+            model.applyUITestMutation(.attachments([session: [AIImportedFile(
+                relativePath: next.relativePath, mimeType: "image/png", isImage: true,
+                archiveReference: next)]], firstMessageSessionID: session))
+            try await model.discardOutgoingMessages(for: session)
+            guard await model.sendMessage("归档未知", expectedSession: session) else {
+                throw AIBackendError(message: "未知回执测试未保存到本地队列")
             }
+            let unknown = try await waitForOutgoingState(.unknown, text: "归档未知")
             let manifest = reference.fileURL.deletingLastPathComponent().appendingPathComponent("manifest.json")
             let retained = try Data(contentsOf: manifest)
-            guard await model.sendMessage("归档未知", expectedSession: session) else {
-                throw AIBackendError(message: "原操作重试未接受")
+            model.retryOutgoingMessage(unknown.id)
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline && (model.outgoingEntries.contains(where: { $0.id == unknown.id }) ||
+                !status.hasPrefix("已落库")) {
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            guard !model.outgoingEntries.contains(where: { $0.id == unknown.id }) else {
+                throw AIBackendError(message: "原队列操作未确认接受")
             }
             guard try Data(contentsOf: manifest) == retained,
                   requests.suffix(2).allSatisfy({ $0.images.first?.relativePath == reference.relativePath }),
@@ -380,6 +447,19 @@ private final class AISteeringUITestProbe: ObservableObject {
             }
             archiveStatus = "归档引用与幂等通过"
         } catch { archiveStatus = "归档失败：" + error.localizedDescription }
+    }
+
+    private func waitForOutgoingState(_ state: AIOutgoingMessageQueueState,
+                                      text: String) async throws -> AIOutgoingMessageQueueEntry {
+        let deadline = Date().addingTimeInterval(6)
+        while Date() < deadline {
+            if let entry = AIAssistantModel.shared.outgoingEntries.first(where: {
+                $0.state == state && (try? JSONDecoder().decode(AIOutgoingMessagePayload.self,
+                    from: $0.payloadData).text) == text
+            }) { return entry }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw AIBackendError(message: "实际队列未进入预期状态")
     }
 
     /// Exercise the production policy at capacity, including unavailable owner
@@ -443,6 +523,7 @@ private final class AISteeringUITestProbe: ObservableObject {
 struct AISteeringUITestRoot: View {
     @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
     @StateObject private var probe = AISteeringUITestProbe()
+    @ObservedObject private var model = AIAssistantModel.shared
 
     var body: some View {
         RootView()
@@ -451,6 +532,18 @@ struct AISteeringUITestRoot: View {
                 VStack(spacing: 2) {
                     Text(probe.status).font(.caption)
                         .accessibilityIdentifier("steering-receipt")
+                    Text("任务状态").font(.caption)
+                        .accessibilityIdentifier("steering-task-state")
+                        .accessibilityValue("busy:\(model.busy);session:\(model.selected);turn:" +
+                            (model.sessions.first { $0.id == model.selected }?.turnId ?? ""))
+                    Text("发送记录").font(.caption)
+                        .accessibilityIdentifier("steering-ledger")
+                        .accessibilityValue(probe.ledger)
+                    if probe.holdsFirstAcknowledgement {
+                        Button("放行首条回执") { probe.releaseAcknowledgementGate() }
+                            .accessibilityIdentifier("steering-release-first-ack")
+                            .disabled(!probe.acknowledgementGateWaiting)
+                    }
                     HStack {
                         Button("原会话") {
                             Task { await AIAssistantModel.shared.selectConversation("switch-A") }

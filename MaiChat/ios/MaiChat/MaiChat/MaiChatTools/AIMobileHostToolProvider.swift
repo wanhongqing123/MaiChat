@@ -332,6 +332,8 @@ final class AIMobileHostToolProvider {
             return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("ark")])
         case "glm_api_key":
             return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("glm")])
+        case "deepseek_api_key":
+            return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("deepseek")])
         case "minimax_api_key":
             return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("minimax")])
         case "wan_credentials":

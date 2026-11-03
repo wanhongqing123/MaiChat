@@ -30,6 +30,12 @@ extension AIAssistantModel {
     func installSteeringUITestFixture(
         handler: @escaping (AISteeringRequest) async throws -> String
     ) {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("steering-outbox-" + ProcessInfo.processInfo.environment[
+                "MAICHAT_AI_TEST_ID", default: UUID().uuidString], isDirectory: true)
+            .appendingPathComponent("Workspace", isDirectory: true)
+        try? FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        applyUITestMutation(.workspace(workspace.path))
         uiTestSupport.sessionSwitchEnabled = true
         uiTestSupport.steeringHandler = handler
         uiTestSupport.screenFrameAccountID = "steering-fixture-owner"
