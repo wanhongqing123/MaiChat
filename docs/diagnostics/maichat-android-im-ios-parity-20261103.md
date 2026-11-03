@@ -44,15 +44,15 @@
 
 ### 合并最新远端、最终源码与产物
 
-装机验证期间远端新增 `d8a39b2f`、`83b76394`、`2c823e74`，包括移动端原生人像接口和固定源码 llama/ggml/mtmd 集成。已通过 `e5c22a39` 合并；唯一冲突是 Android 版本号，最终统一为 **2.2.16 (253)**，全部远端改动保留。本轮没有自行更改这些 C++ 功能的实现。
+装机验证期间远端新增 `d8a39b2f`、`83b76394`、`2c823e74`，包括移动端原生人像接口和固定源码 llama/ggml/mtmd 集成。先通过 `e5c22a39` 合并；唯一冲突是 Android 版本号，统一为 **2.2.16 (253)**。首次推送时远端又新增 `5216279a`，已通过 `6b94e16b7b11f567d72bac38ed247667454b4ecb` 合并并成功推送。最终安装包以该提交构建，全部远端改动保留；本轮没有自行更改这些 C++ 功能的实现。
 
-不能把旧 JNI 库配新 Java：已在同一 NDK 27.3 / ARM64 CMake 树从合并源码完成 230 项编译/链接，包含新增静态 llama/ggml/mtmd、移动层、人像和 JNI。复用的是本批提交未改动且此前验证过的 FFmpeg/OpenSSL 依赖缓存。实际新库 Build ID 为 `633bf84b2d6b1cc380866f1149d6dab89e1c70c7`，APK 内同 ID 且五个新增 `MaiPortraitImage_native*` 导出均存在。llama 第三方 notices 作为资产打包并与固定源码逐字节相等；没有模型权重下载或真实推理验证。
+不能把旧 JNI 库配新 Java：已在同一 NDK 27.3 / ARM64 CMake 树从首批合并源码完成 230 项编译/链接，包含新增静态 llama/ggml/mtmd、移动层、人像和 JNI；第二批合并再完成 11 项增量编译/链接。复用的是本批提交未改动且此前验证过的 FFmpeg/OpenSSL 依赖缓存。最终新库 Build ID 为 `b664ec66f552eb2bf0e6c930e90052d27e1bed4c`，APK 内同 ID 且五个新增 `MaiPortraitImage_native*` 导出均存在。llama 第三方 notices 作为资产打包并与固定源码逐字节相等；未调用运行时模型下载或执行本地推理，上游测试模型仅保留为源码夹具。
 
-- 最终 Gradle：367 项 JVM 测试 0 失败/错误/跳过，Android 测试 Java、测试 APK 及 Release APK 构建通过。日志 `.cache/android-im-parity-merged-build.log`。
+- 最终 Gradle：367 项 JVM 测试 0 失败/错误/跳过，Android 测试 Java 及 Release APK 构建通过。日志 `.cache/android-im-parity-final-build.log`；首批合并的测试 APK 构建记录在 `.cache/android-im-parity-merged-build.log`。
 - 包门禁：15 份 ARM64 库、6 份运行库哈希、8 项必需资产通过；普通非 testOnly APK，沿用同一安装证书。该包只面向当前 ARM64 手机，没有声明构建正式双 ABI Release。
-- APK `.cache/android-im-parity/MaiChat-Android-v2.2.16-local.apk`，SHA-256 `a7ff686731467fa269be4c61d940c91d410cc4f6f384b6cfedbfb3bfaba17e1a`。2026-11-03 23:22 原地安装到 OPPO PKD130 / Android 15，未卸载或清数据。
-- 从手机实际安装路径拉回 `base.apk` 哈希完全一致；实际进程 PID 32632，当前进程 crash buffer 无 fatal/fdsan。三项实际 JNI 头像/取消/图像准备测试通过，不启动 Activity、不读取账号、不使用有效网络地址；测试运行器随后已卸载。
-- 最终构建再次实际打开聊天面板、好友页、添加好友对话框后取消、云盘首次进入；本人查看 `merged-panel.png` 与 `merged-cloud-enter-0.png`。好友页无额外申请按钮，原好友与历史图片仍在；云盘只有转圈/真实容量，没有加载文字。实际截图已发回用户 IM。
+- APK `.cache/android-im-parity/MaiChat-Android-v2.2.16-local.apk`，最终 SHA-256 `fb9f4e6c733f3c4db0786313a1876c5228d3d2f003cd2dcb18f2bd75c44014b6`。2026-11-03 23:36 原地安装到 OPPO PKD130 / Android 15，未卸载或清数据。
+- 从手机实际安装路径拉回 `base.apk` 哈希完全一致；最终实际进程 PID 3824，当前进程 crash buffer 无 fatal/fdsan。首批合并原生库 `633bf84b2d6b1cc380866f1149d6dab89e1c70c7` 的三项实际 JNI 头像/取消/图像准备测试通过，不启动 Activity、不读取账号、不使用有效网络地址；测试运行器随后已卸载。第二批修改未改这些 JNI 函数，最终库重新核对导出与冷启动，没有重复计为新增 JNI 实测。
+- 合并构建再次实际打开聊天面板、好友页、添加好友对话框后取消、云盘首次进入；本人查看 `merged-panel.png` 与 `merged-cloud-enter-0.png`。好友页无额外申请按钮，原好友与历史图片仍在；云盘只有转圈/真实容量，没有加载文字。最终 `6b94e16b` 安装包又复核冷启动及 `final-verified-panel.png`，五格、顶栏和可见消息区域保持正常。实际截图已发回用户 IM。
 
 ### 未验证范围与清理
 
