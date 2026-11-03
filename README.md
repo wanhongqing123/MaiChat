@@ -2,6 +2,30 @@
 
 MaiChat 包含 iOS、Android 和 Qt 桌面客户端，以及账号、云盘和临时凭据等配套服务。
 
+## 运行截图
+
+以下为实际运行截图，使用本地示例素材和测试会话。iOS 来自模拟器，Android 来自
+模拟器中的隔离测试宿主；点击图片可查看原图。
+
+**macOS：我的云盘**
+
+[![macOS 我的云盘，展示本地测试目录和示例视频](docs/screenshots/desktop-cloud-drive.png)](docs/screenshots/desktop-cloud-drive.png)
+
+<table>
+  <tr>
+    <th>iOS：创作中心</th>
+    <th>iOS：独立网页任务</th>
+    <th>Android：创作中心</th>
+  </tr>
+  <tr>
+    <td><a href="docs/screenshots/ios-creation-center.png"><img src="docs/screenshots/ios-creation-center.png" width="250" alt="iOS 模拟器中的创作中心功能说明"></a></td>
+    <td><a href="docs/screenshots/ios-browser-task.png"><img src="docs/screenshots/ios-browser-task.png" width="250" alt="iOS 独立网页任务，使用本地演示网页"></a></td>
+    <td><a href="docs/screenshots/android-creation-center.png"><img src="docs/screenshots/android-creation-center.png" width="250" alt="Android 模拟器隔离测试宿主中的创作中心"></a></td>
+  </tr>
+</table>
+
+截图的构建来源和原图校验值见[运行截图记录](docs/diagnostics/maichat-readme-screenshots-20261103.md)。
+
 ## 仓库结构
 
 - `MaiChat/`：各端客户端、共享网络和媒体代码。先阅读 `MaiChat/AGENTS.md`。
