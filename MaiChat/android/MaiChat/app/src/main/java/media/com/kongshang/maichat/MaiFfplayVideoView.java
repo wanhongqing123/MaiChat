@@ -7,6 +7,7 @@ import android.content.Context;
 import android.graphics.Color;
 import android.graphics.Bitmap;
 import android.graphics.Typeface;
+import android.graphics.drawable.RippleDrawable;
 import android.content.res.ColorStateList;
 import android.os.Handler;
 import android.os.Looper;
@@ -161,10 +162,18 @@ public final class MaiFfplayVideoView extends FrameLayout {
         speedButton.setText("1×");
         speedButton.setTextSize(14);
         speedButton.setTextColor(Color.WHITE);
-        speedButton.setBackground(MaiChatTheme.rounded(
-            Color.argb(45, 255, 255, 255), 24, context));
+        // 倍速入口与时间信息保持相同视觉重量；只在按压时反馈，保留足够的触摸范围。
+        speedButton.setAllCaps(false);
+        speedButton.setSingleLine(true);
+        speedButton.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        speedButton.setMinWidth(0);
+        speedButton.setMinHeight(0);
+        speedButton.setPadding(0, 0, 0, 0);
+        speedButton.setBackground(new RippleDrawable(
+            ColorStateList.valueOf(Color.argb(35, 255, 255, 255)), null,
+            MaiChatTheme.rounded(Color.WHITE, 8, context)));
         speedButton.setContentDescription("播放倍速");
-        controls.addView(speedButton, new LinearLayout.LayoutParams(dp(64), dp(58)));
+        controls.addView(speedButton, new LinearLayout.LayoutParams(dp(56), dp(44)));
         controlsLayout = new LayoutParams(LayoutParams.MATCH_PARENT,
             LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
         controlsLayout.setMargins(dp(16), 0, dp(16), dp(4));
