@@ -129,7 +129,48 @@ void gl_clear_context(gs_device_t* device) {
 }
 
 void gl_update(gs_device_t* device) {
-    UNUSED_PARAMETER(device);
+    struct gs_swap_chain* swap = device->cur_swap;
+    if (!swap || !swap->wi || !swap->wi->window || !swap->info.cx || !swap->info.cy ||
+        swap->info.cx > INT32_MAX || swap->info.cy > INT32_MAX)
+        return;
+    struct gl_platform* platform = device->plat;
+    EGLint width = 0;
+    EGLint height = 0;
+    eglQuerySurface(platform->display, swap->wi->surface, EGL_WIDTH, &width);
+    eglQuerySurface(platform->display, swap->wi->surface, EGL_HEIGHT, &height);
+    if (width == (EGLint)swap->info.cx && height == (EGLint)swap->info.cy) return;
+
+    // TextureView can retain the previous EGL buffer dimensions after rotation.
+    // Recreate the window surface on the same context after changing buffer geometry;
+    // resizing only the viewport draws into a corner of that old buffer. Textures and
+    // playback state stay on the original context, so resizing does not reopen media.
+    if (!eglMakeCurrent(platform->display, platform->pbuffer, platform->pbuffer,
+                        platform->context)) {
+        blog(LOG_ERROR, "Android EGL resize could not unbind window: 0x%x", eglGetError());
+        return;
+    }
+    eglDestroySurface(platform->display, swap->wi->surface);
+    swap->wi->surface = EGL_NO_SURFACE;
+    if (ANativeWindow_setBuffersGeometry(swap->wi->window, (int32_t)swap->info.cx,
+                                         (int32_t)swap->info.cy, 0) != 0) {
+        blog(LOG_ERROR, "Android EGL resize could not update window buffers");
+        return;
+    }
+    swap->wi->surface =
+        eglCreateWindowSurface(platform->display, platform->config, swap->wi->window, NULL);
+    if (swap->wi->surface == EGL_NO_SURFACE ||
+        !eglMakeCurrent(platform->display, swap->wi->surface, swap->wi->surface,
+                        platform->context)) {
+        blog(LOG_ERROR, "Android EGL resize could not bind resized window: 0x%x", eglGetError());
+        if (swap->wi->surface != EGL_NO_SURFACE) {
+            eglMakeCurrent(platform->display, platform->pbuffer, platform->pbuffer,
+                           platform->context);
+            eglDestroySurface(platform->display, swap->wi->surface);
+            swap->wi->surface = EGL_NO_SURFACE;
+        }
+        return;
+    }
+    device_set_render_target(device, NULL, NULL);
 }
 
 void* device_get_device_obj(gs_device_t* device) {

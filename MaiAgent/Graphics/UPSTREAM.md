@@ -45,6 +45,13 @@ the final output encoding. It derives its sampling, color helpers and tonemappin
 from upstream `default.effect`; sRGB targets retain the original Draw technique.
 The Android portrait test compares actual TextureView pixels with the saved PNG.
 
+Android `gl_update` also recreates an EGL window surface when its buffer dimensions
+do not match the resized swapchain. The GLES context and textures remain alive.
+TextureView can otherwise retain the previous portrait/landscape buffer while the
+presenter draws with the new viewport, leaving a small image and black unused area.
+This is an Android adaptation of the upstream platform resize hook; see Android's
+`SurfaceTexture.setDefaultBufferSize` contract for EGL surface recreation requirements.
+
 The source files retain their original copyright notices. `COPYING` is the
 upstream GPLv2 license text. SIMDe is provided separately under
 `MaiAgent/third_party/simde`, matching the version used by OBS. The optional

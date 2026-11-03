@@ -1,0 +1,7 @@
+<!-- IM attachment action microphone; tint is supplied by MaiIMAttachmentPanel. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#000000"
+        android:pathData="M12,2 A3,3 0,0 0,9 5 V11 A3,3 0,0 0,15 11 V5 A3,3 0,0 0,12 2 Z M5,10 V11 A7,7 0,0 0,11 17.93 V20 H8 V22 H16 V20 H13 V17.93 A7,7 0,0 0,19 11 V10 H17 V11 A5,5 0,0 1,7 11 V10 Z" />
+</vector>

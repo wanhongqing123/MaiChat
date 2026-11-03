@@ -36,6 +36,7 @@ import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.InsetDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.media.MediaScannerConnection;
 import android.media.projection.MediaProjectionManager;
@@ -191,6 +192,12 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private Dialog imageDialog;
     private MaiGraphicsImageView galleryImageView;
     private String galleryImagePath;
+    private MaiImagePreviewOrigin galleryImageOrigin;
+    private MaiImagePreviewTransition galleryImageTransition;
+    private boolean galleryHandoff;
+    private String imagePreviewIdentity = "";
+    private int imagePreviewRotation;
+    private FrameLayout imagePreviewCoveredHost;
     private String pendingVideoSavePath;
     private Runnable pendingVideoSaveCompletion;
     private String pendingImageSavePath;
@@ -211,6 +218,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private boolean pendingStateRefresh;
     private GrowingMessageEditText messageInput;
     private View attachmentButton;
+    private View imAttachmentPanel;
+    private boolean imAttachmentPanelRequested;
     private TextView sendButton;
     private final Map<String, String> draftsByPeer = new HashMap<>();
     private String displayedOwner = "";
@@ -234,6 +243,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private String messageSearchTargetId;
     private boolean stickToLatestMessage = true;
     private ChatMessageList currentMessageList;
+    private ImageButton chatRemoteButton;
+    private ProgressBar chatRemoteProgress;
     private String renderedChatUserId;
     private View chatEmptyState;
     private View chatComposer;
@@ -393,6 +404,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     @Override
     public void onConfigurationChanged(Configuration configuration) {
         super.onConfigurationChanged(configuration);
+        if (galleryImageOrigin != null) galleryImageOrigin.configurationChanged();
         if (session != null && !destroyed) {
             ChatMessageList previous = currentMessageList;
             String anchor = previous == null ? null : previous.firstVisibleMessageId();
@@ -490,6 +502,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     public void onBackPressed() {
         if (videoDialog != null) {
             videoDialog.dismiss();
+            return;
+        }
+        if (imAttachmentPanelRequested) {
+            closeIMAttachmentPanel();
             return;
         }
         if (socialBindingVisible) {
@@ -886,6 +902,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         boolean canSend = !voiceMode && !draftText.trim().isEmpty();
         sendButton.setVisibility(canSend ? View.VISIBLE : View.GONE);
         attachmentButton.setVisibility(canSend ? View.GONE : View.VISIBLE);
+        if (canSend) closeIMAttachmentPanel();
     }
 
     private boolean useLandscapeImLayout() {
@@ -919,6 +936,9 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             passwordRequests.cancelActive("identity_changed");
             passwordDialog.dismiss();
         }
+        // A local image is private account content too; retire it on login generation changes.
+        if (imageDialog != null && !imagePreviewIdentity.equals(session.passwordChangeIdentity()))
+            imageDialog.dismiss();
         if (videoDialog != null && cloudPlayerStreams.containsKey(videoDialog) &&
             !cloudPlayerOwner.equals(MaiChatAuthClient.shared(this).accountId()))
             videoDialog.dismiss();
@@ -981,6 +1001,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             && currentMessageList != null && !showInitialLogin && !session.requiresLogin()) {
             // 同一会话的消息更新保留原列表实例、滚动位置和输入草稿。
             refreshChatMessages();
+            updateChatRemoteAction();
             if (landscapeIm && currentConversationRows != null) {
                 long fingerprint = conversationFingerprint();
                 if (fingerprint != renderedConversationFingerprint) {
@@ -1044,6 +1065,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         // 只有页面身份真的改变才重建导航容器；不能把每条新消息都当作换页。
         closeSettingsSubpages();
         currentMessageList = null;
+        chatRemoteButton = null;
+        chatRemoteProgress = null;
         renderedPrimaryTab = null;
         renderedTabBar = null;
         conversationScroll = null;
@@ -1055,6 +1078,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         groupRows = null; groupScroll = null; groupDraftInput = null;
         renderedGroupId = null;
         messageInput = null;
+        imAttachmentPanel = null;
+        imAttachmentPanelRequested = false;
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(MaiChatTheme.PAGE);
@@ -1111,6 +1136,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             }
             if (keyboardVisible != visible) navigation.post(this::updateLandscapeConversationLayout);
             keyboardVisible = visible;
+            updateIMAttachmentPanelVisibility();
             if (!imeAnimating) applyChatInsets(navigation, insets);
             return insets;
         });
@@ -1139,6 +1165,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                         imeAnimating = false;
                         if (latestInsets != null)
                             applyChatInsets(navigation, latestInsets);
+                        updateIMAttachmentPanelVisibility();
                         if (currentMessageList != null)
                             currentMessageList.endKeyboardReveal();
                     }
@@ -1227,6 +1254,12 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     private void applyChatInsets(FrameLayout target, androidx.core.view.WindowInsetsCompat insets) {
+        // The fullscreen image owns system bars. Keep the covered page at its original
+        // padding so its thumbnail does not jump under the return animation. Rotation
+        // still relayouts the page and invalidates the saved source coordinates.
+        if (imageDialog != null && imageDialog.isShowing()
+                && target == imagePreviewCoveredHost
+                && imagePreviewRotation == getWindowManager().getDefaultDisplay().getRotation()) return;
         androidx.core.graphics.Insets bars = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars()
                 | androidx.core.view.WindowInsetsCompat.Type.displayCutout());
         int bottom = Math.max(bars.bottom, insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime()).bottom);
@@ -2683,11 +2716,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         title.setEllipsize(TextUtils.TruncateAt.MIDDLE);
         header.addView(title, new LinearLayout.LayoutParams(0, dp(42), 1));
 
-        // 与创作中心及 iOS 标题操作使用同一矢量尺寸，避免手绘缩放令图标过小。
-        View remote = composerIcon(R.drawable.ic_nav_remote, MaiChatTheme.BLUE);
-        remote.setBackground(MaiChatTheme.rounded(MaiChatTheme.GROUPED_PAGE, 12, this));
-        remote.setContentDescription("查看远程桌面");
+        String identity = session.passwordChangeIdentity();
+        FrameLayout remoteAction = new FrameLayout(this);
+        ImageButton remote = chatHeaderAction(R.drawable.ic_nav_remote, "查看远程桌面");
+        chatRemoteButton = remote;
         remote.setOnClickListener(view -> {
+            if (!contact.userId().equals(activeChatUserId)
+                || !identity.equals(session.passwordChangeIdentity())) return;
             RemoteDesktopController controller = session.remoteDesktop();
             if (!controller.isActive()) {
                 if (session.currentSdkAppId() <= 0 || session.currentUserSig().isEmpty()) {
@@ -2698,12 +2733,79 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                 controller.requestView(contact.userId(), session.settings().loginUserId(),
                     session.currentSdkAppId(), session.currentUserSig());
             }
+            rememberDraft();
+            hideKeyboard();
             activeChatUserId = null;
             activeTab = RemoteIMTab.REMOTE;
             render();
         });
-        header.addView(remote, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        remoteAction.addView(remote, new FrameLayout.LayoutParams(-1, -1));
+        chatRemoteProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
+        chatRemoteProgress.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        remoteAction.addView(chatRemoteProgress, new FrameLayout.LayoutParams(dp(14), dp(14), Gravity.TOP | Gravity.END));
+        header.addView(remoteAction, new LinearLayout.LayoutParams(dp(44), dp(42)));
+        ImageButton more = chatHeaderAction(R.drawable.ic_ai_more, "更多聊天操作");
+        // iOS 的省略号为独立蓝色文字图标，只有显示器按钮保留浅色底。
+        more.setImageTintList(ColorStateList.valueOf(MaiChatTheme.BLUE));
+        more.setBackground(new RippleDrawable(ColorStateList.valueOf(Color.argb(25, 0, 142, 224)),
+            null, MaiChatTheme.rounded(Color.WHITE, 8, this)));
+        more.setOnClickListener(view -> {
+            if (!contact.userId().equals(activeChatUserId)
+                || !identity.equals(session.passwordChangeIdentity())) return;
+            hideKeyboard();
+            android.widget.PopupMenu menu = new android.widget.PopupMenu(this, more);
+            menu.getMenu().add("远程排障");
+            menu.setOnMenuItemClickListener(item -> {
+                if (!contact.userId().equals(activeChatUserId)
+                    || !identity.equals(session.passwordChangeIdentity())) return true;
+                // 与 iOS 同路由：这里只打开确认表单，收集和发送由排障模块显式确认后执行。
+                new MaiRemoteDiagnosticsDialog(this, session, contact).show();
+                return true;
+            });
+            menu.show();
+        });
+        LinearLayout.LayoutParams moreParams = new LinearLayout.LayoutParams(dp(44), dp(42));
+        moreParams.leftMargin = dp(4);
+        header.addView(more, moreParams);
+        updateChatRemoteAction();
         return header;
+    }
+
+    private ImageButton chatHeaderAction(int icon, String description) {
+        ImageButton button = new ImageButton(this);
+        button.setImageResource(icon);
+        button.setImageTintList(ColorStateList.valueOf(MaiChatTheme.SECONDARY));
+        button.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        button.setPadding(dp(10), dp(9), dp(10), dp(9));
+        button.setContentDescription(description);
+        // 44×42dp 点击区内保留 iOS 的 36×34dp、8dp 圆角浅底。
+        button.setBackground(new InsetDrawable(MaiChatTheme.rounded(MaiChatTheme.GROUPED_PAGE,
+            8, this), dp(4), dp(4), dp(4), dp(4)));
+        return button;
+    }
+
+    private void updateChatRemoteAction() {
+        if (chatRemoteButton == null || chatRemoteProgress == null) return;
+        RemoteDesktopController controller = session.remoteDesktop();
+        boolean connecting = controller.state() == RemoteDesktopController.State.INVITING
+            || controller.state() == RemoteDesktopController.State.CONNECTING;
+        boolean viewing = controller.state() == RemoteDesktopController.State.VIEWING;
+        boolean enabled = controller.isActive() || (session.connectionState() == TencentIMClient.ConnectionState.CONNECTED
+            && session.currentSdkAppId() > 0 && !session.currentUserSig().isEmpty());
+        int color = connecting ? Color.rgb(245, 158, 11)
+            : enabled ? MaiChatTheme.BLUE : MaiChatTheme.SECONDARY;
+        int background = connecting ? Color.rgb(255, 245, 225)
+            : viewing ? MaiChatTheme.BLUE_SOFT : MaiChatTheme.GROUPED_PAGE;
+        chatRemoteButton.setImageTintList(ColorStateList.valueOf(color));
+        chatRemoteButton.setImageAlpha(255);
+        chatRemoteButton.setContentDescription(connecting ? "查看远程连接进度"
+            : viewing ? "进入远程桌面" : "远程控制");
+        chatRemoteButton.setBackground(new InsetDrawable(MaiChatTheme.rounded(background,
+            8, this), dp(4), dp(4), dp(4), dp(4)));
+        chatRemoteButton.setEnabled(enabled);
+        chatRemoteButton.setAlpha(enabled ? 1f : 0.45f);
+        chatRemoteProgress.setIndeterminateTintList(ColorStateList.valueOf(color));
+        chatRemoteProgress.setVisibility(connecting ? View.VISIBLE : View.GONE);
     }
 
     // 按消息类型拼装同一气泡内的正文、媒体与审批状态；附件缺失时仍保留消息外壳。
@@ -3019,8 +3121,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     // 页面状态变化和用户操作在这里衔接；退出或失败时维持已显示内容。
     private View composer() {
         LinearLayout wrapper = new LinearLayout(this);
+        imAttachmentPanelRequested = false;
         wrapper.setOrientation(LinearLayout.VERTICAL);
         wrapper.setPadding(dp(16), dp(9), dp(16), dp(10));
+        wrapper.setClipToPadding(false);
         wrapper.setBackgroundColor(Color.WHITE);
 
         if (pendingQuote != null) {
@@ -3061,18 +3165,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             this
         ));
         voiceToggle.setContentDescription(voiceMode ? "切换键盘" : "切换语音");
-        voiceToggle.setOnClickListener(view -> {
-            voiceMode = !voiceMode;
-            if (!voiceMode) allowKeyboardLocation = true;
-            session.stopHumanTyping();
-            if (voiceMode) hideKeyboard();
-            render();
-            if (!voiceMode && messageInput != null) {
-                messageInput.requestFocus();
-                ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
-                        .showSoftInput(messageInput, InputMethodManager.SHOW_IMPLICIT);
-            }
-        });
+        voiceToggle.setOnClickListener(view -> setIMVoiceMode(!voiceMode));
         bar.addView(voiceToggle, new LinearLayout.LayoutParams(dp(44), dp(44)));
 
         if (voiceMode) {
@@ -3098,7 +3191,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             GrowingMessageEditText editor = messageInput;
             // 空框长按与 iOS 一样进入实时转写；有草稿时仍由系统处理选择、复制和粘贴。
             ComposerVoiceInput.attach(editor, new ComposerVoiceInput.Listener() {
-                @Override public void touched() { allowKeyboardLocation = true; }
+                @Override public void touched() {
+                    if (messageInput == editor) closeIMAttachmentPanel();
+                    allowKeyboardLocation = true;
+                }
                 @Override public boolean start(float rawX, float rawY) {
                     if (messageInput != editor) return false;
                     if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -3137,6 +3233,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                 return false;
             });
             messageInput.setOnFocusChangeListener((view, focused) -> {
+                if (focused && messageInput == editor) closeIMAttachmentPanel();
                 if (!focused && messageInput == editor)
                     session.stopHumanTyping();
             });
@@ -3163,7 +3260,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         View plus = composerIcon(R.drawable.ic_ai_add, MaiChatTheme.TEXT);
         plus.setBackground(MaiChatTheme.bordered(MaiChatTheme.GROUPED_PAGE,
             MaiChatTheme.BORDER, 22, this));
-        plus.setContentDescription("添加图片或文件");
+        plus.setContentDescription("添加附件");
         plus.setOnClickListener(this::showAttachmentMenu);
         attachmentButton = plus;
         FrameLayout action = new FrameLayout(this);
@@ -3177,7 +3274,41 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         bar.addView(action, new LinearLayout.LayoutParams(dp(44), dp(44)));
         updateComposerActions();
         wrapper.addView(bar, matchWrap());
+        String attachmentPeer = activeChatUserId;
+        String attachmentIdentity = session.passwordChangeIdentity();
+        imAttachmentPanel = MaiIMAttachmentPanel.create(this, selected -> {
+            if (chatComposer != wrapper || !java.util.Objects.equals(attachmentPeer, activeChatUserId)
+                || !attachmentIdentity.equals(session.passwordChangeIdentity())) return;
+            closeIMAttachmentPanel();
+            switch (selected) {
+                case ALBUM: openImagePicker(); break;
+                case CAMERA: requestCamera(); break;
+                case FILE: openFilePicker(); break;
+                case VOICE_INPUT: setIMVoiceMode(true); break;
+                case AI_REPLY: requestAiReplySuggestions(); break;
+            }
+        });
+        imAttachmentPanel.setVisibility(View.GONE);
+        LinearLayout.LayoutParams panelParams = matchWrap();
+        panelParams.setMargins(-dp(16), dp(10), -dp(16), -dp(10));
+        wrapper.addView(imAttachmentPanel, panelParams);
         return wrapper;
+    }
+
+    private void setIMVoiceMode(boolean enabled) {
+        closeIMAttachmentPanel();
+        cancelVoiceRecording();
+        rememberDraft();
+        voiceMode = enabled;
+        session.stopHumanTyping();
+        if (voiceMode) hideKeyboard();
+        else allowKeyboardLocation = true;
+        render();
+        if (!voiceMode && messageInput != null) {
+            messageInput.requestFocus();
+            ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
+                .showSoftInput(messageInput, InputMethodManager.SHOW_IMPLICIT);
+        }
     }
 
     private void renderAiReplySuggestions(LinearLayout container) {
@@ -3317,6 +3448,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         rows.setOrientation(LinearLayout.VERTICAL);
         rows.setPadding(dp(16), dp(8), dp(16), dp(16));
         content.addView(contactToolbar(rows), match(dp(54)));
+        LinearLayout requests = new LinearLayout(this);
+        requests.setOrientation(LinearLayout.VERTICAL);
+        requests.setVisibility(View.GONE);
+        rows.addView(requests, matchWrap());
+        LinearLayout friends = new LinearLayout(this);
+        friends.setOrientation(LinearLayout.VERTICAL);
+        rows.addView(friends, matchWrap());
         ScrollView scroll = new ScrollView(this);
         scroll.addView(rows, matchWrap());
         content.addView(scroll, new LinearLayout.LayoutParams(
@@ -3325,7 +3463,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             1
         ));
 
-        renderContactRows(rows);
+        renderContactRows(friends);
+        String identity = session.passwordChangeIdentity();
+        // 与 iOS 相同：申请只在列表顶部按需出现，不再占据标题栏；折叠好友分组不清空申请。
+        requests.post(() -> refreshContactRequests(requests, identity));
     }
 
     private void renderContactRows(LinearLayout rows) {
@@ -3379,10 +3520,6 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         toolbar.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         toolbar.setPadding(dp(12), dp(4), dp(12), dp(4));
         toolbar.setBackgroundColor(Color.WHITE);
-        TextView requests = iconButton("申请", 15, MaiChatTheme.BLUE_DARK);
-        requests.setContentDescription("查看好友申请");
-        requests.setOnClickListener(view -> showFriendRequestsDialog());
-        toolbar.addView(requests, new LinearLayout.LayoutParams(dp(52), dp(42)));
         TextView plus = iconButton("＋", 24, MaiChatTheme.BLUE_DARK);
         plus.setContentDescription("添加好友");
         plus.setOnClickListener(view -> showAddContactDialog());
@@ -3754,52 +3891,68 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         } catch (Exception failure) { toast("无法生成好友二维码"); }
     }
 
-    private void showFriendRequestsDialog() {
+    private boolean isContactRequestPageCurrent(LinearLayout list, String identity) {
+        return !destroyed && activeTab == RemoteIMTab.CONTACTS && activeChatUserId == null
+            && activeGroupId == null && activeFriendProfileUserId == null && list.isAttachedToWindow()
+            && !identity.isEmpty() && identity.equals(session.passwordChangeIdentity());
+    }
+
+    private void refreshContactRequests(LinearLayout list, String identity) {
+        if (!isContactRequestPageCurrent(list, identity)) return;
         session.friendRequests((requests, error) -> {
-            if (destroyed) return;
+            // 离页、页面重建、切号或同号重登后，旧读取不能把申请安装到新页面。
+            if (!isContactRequestPageCurrent(list, identity)) return;
             if (error != null) { toast(error); return; }
-            if (requests.isEmpty()) {
-                new AlertDialog.Builder(this).setTitle("好友申请")
-                    .setMessage("暂无待处理的好友申请")
-                    .setPositiveButton("完成", null).show();
-                return;
-            }
-            ScrollView scroll = new ScrollView(this);
-            LinearLayout list = new LinearLayout(this);
-            list.setOrientation(LinearLayout.VERTICAL);
-            list.setPadding(dp(18), dp(8), dp(18), dp(8));
-            scroll.addView(list);
-            AlertDialog dialog = new AlertDialog.Builder(this).setTitle("好友申请")
-                .setView(scroll).setNegativeButton("关闭", null).create();
+            list.removeAllViews();
+            list.setVisibility(requests.isEmpty() ? View.GONE : View.VISIBLE);
+            if (requests.isEmpty()) return;
+            TextView heading = MaiChatTheme.text(this, "好友申请", 13, MaiChatTheme.SECONDARY);
+            heading.setPadding(0, dp(8), 0, dp(4));
+            list.addView(heading, matchWrap());
             for (RemoteIMFriendRequest request : requests) {
                 LinearLayout row = new LinearLayout(this);
-                row.setOrientation(LinearLayout.VERTICAL);
-                row.setPadding(0, dp(8), 0, dp(12));
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(0, dp(10), 0, dp(10));
                 list.addView(row, matchWrap());
-                row.addView(MaiChatTheme.label(this, request.displayName, 16, MaiChatTheme.TEXT));
-                row.addView(MaiChatTheme.text(this,
+                row.addView(avatar(new RemoteIMContact(request.userId, request.displayName,
+                    request.avatarUrl), false, 38), new LinearLayout.LayoutParams(dp(38), dp(38)));
+                LinearLayout labels = new LinearLayout(this);
+                labels.setOrientation(LinearLayout.VERTICAL);
+                TextView name = MaiChatTheme.label(this, request.displayName, 15, MaiChatTheme.TEXT);
+                name.setSingleLine(true);
+                name.setEllipsize(TextUtils.TruncateAt.END);
+                labels.addView(name, matchWrap());
+                TextView message = MaiChatTheme.text(this,
                     request.message == null || request.message.isEmpty()
-                        ? "请求添加你为好友" : request.message, 13, MaiChatTheme.SECONDARY));
-                LinearLayout actions = new LinearLayout(this);
-                actions.setGravity(Gravity.END);
-                row.addView(actions, match(dp(44)));
+                        ? "请求添加你为好友" : request.message, 12, MaiChatTheme.SECONDARY);
+                message.setMaxLines(2);
+                labels.addView(message, matchWrap());
+                LinearLayout.LayoutParams labelParams = new LinearLayout.LayoutParams(0, -2, 1);
+                labelParams.setMargins(dp(12), 0, dp(8), 0);
+                row.addView(labels, labelParams);
                 Button refuse = secondaryButton("拒绝");
                 Button accept = primaryButton("同意");
-                actions.addView(refuse, new LinearLayout.LayoutParams(dp(76), dp(38)));
-                LinearLayout.LayoutParams acceptParams =
-                    new LinearLayout.LayoutParams(dp(76), dp(38));
-                acceptParams.setMargins(dp(8), 0, 0, 0);
-                actions.addView(accept, acceptParams);
-                refuse.setOnClickListener(view -> session.decideFriendRequest(
-                    request.userId, false, done -> {
-                        if (done) { dialog.dismiss(); showFriendRequestsDialog(); }
-                    }));
-                accept.setOnClickListener(view -> session.decideFriendRequest(
-                    request.userId, true, done -> {
-                        if (done) { dialog.dismiss(); showFriendRequestsDialog(); }
-                    }));
+                row.addView(accept, new LinearLayout.LayoutParams(dp(64), dp(38)));
+                LinearLayout.LayoutParams refuseParams = new LinearLayout.LayoutParams(dp(64), dp(38));
+                refuseParams.leftMargin = dp(8);
+                row.addView(refuse, refuseParams);
+                refuse.setOnClickListener(view -> decideContactRequest(list, identity,
+                    request.userId, false, accept, refuse));
+                accept.setOnClickListener(view -> decideContactRequest(list, identity,
+                    request.userId, true, accept, refuse));
             }
-            dialog.show();
+        });
+    }
+
+    private void decideContactRequest(LinearLayout list, String identity, String userId,
+                                      boolean accepted, Button accept, Button refuse) {
+        if (!isContactRequestPageCurrent(list, identity)) return;
+        accept.setEnabled(false);
+        refuse.setEnabled(false);
+        session.decideFriendRequest(userId, accepted, done -> {
+            if (!isContactRequestPageCurrent(list, identity)) return;
+            if (done) refreshContactRequests(list, identity);
+            else { accept.setEnabled(true); refuse.setEnabled(true); }
         });
     }
 
@@ -5062,32 +5215,25 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     private void showAttachmentMenu(View anchor) {
+        if (anchor != attachmentButton || imAttachmentPanel == null || activeChatUserId == null) return;
+        if (imAttachmentPanelRequested) { closeIMAttachmentPanel(); return; }
+        cancelVoiceRecording();
         allowKeyboardLocation = false;
-        LinearLayout menu = new LinearLayout(this);
-        menu.setOrientation(LinearLayout.VERTICAL);
-        menu.setPadding(dp(8), dp(8), dp(8), dp(8));
-        menu.setBackground(MaiChatTheme.bordered(Color.WHITE, MaiChatTheme.BORDER, 11, this));
-        PopupWindow popup = new PopupWindow(menu, dp(190), ViewGroup.LayoutParams.WRAP_CONTENT, true);
-        addPopupAction(menu, "▣  拍照发送", () -> {
-            popup.dismiss();
-            requestCamera();
-        });
-        addPopupAction(menu, "▧  从相册选择", () -> {
-            popup.dismiss();
-            openImagePicker();
-        });
-        addPopupAction(menu, "□  发送文件", () -> {
-            popup.dismiss();
-            openFilePicker();
-        });
-        addPopupAction(menu, "✨  AI 帮我回复", () -> {
-            popup.dismiss();
-            requestAiReplySuggestions();
-        });
-        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-        popup.setElevation(dp(10));
-        popup.setOutsideTouchable(true);
-        popup.showAsDropDown(anchor, -dp(146), -dp(216));
+        hideKeyboard();
+        imAttachmentPanelRequested = true;
+        // 等 IME 收起后再展示，不能把键盘高度和附件面板同时挤进消息区域。
+        updateIMAttachmentPanelVisibility();
+    }
+
+    private void closeIMAttachmentPanel() {
+        imAttachmentPanelRequested = false;
+        if (imAttachmentPanel != null) imAttachmentPanel.setVisibility(View.GONE);
+    }
+
+    private void updateIMAttachmentPanelVisibility() {
+        if (imAttachmentPanel == null) return;
+        imAttachmentPanel.setVisibility(imAttachmentPanelRequested && !keyboardVisible && !imeAnimating
+            ? View.VISIBLE : View.GONE);
     }
 
     private void addPopupAction(LinearLayout menu, String title, Runnable action) {
@@ -5298,20 +5444,19 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private View imageMessageContent(RemoteIMImageAttachment attachment) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        ImageView image = new ImageView(this);
-        image.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        image.setBackgroundColor(MaiChatTheme.PAGE);
+        // Keep the whole image and its aspect ratio, matching the iOS 220 x 180 bubble.
+        ImageView image = new MaiImageThumbnailView(this);
         image.setContentDescription("预览图片");
         image.setOnClickListener(view -> showFullScreenImage(
             attachment.localPath(), imMediaPlaylist(activeChatUserId), view));
         TextView imageMissing = MaiChatTheme.text(this, "图片暂不可预览", 14, MaiChatTheme.SECONDARY);
         imageMissing.setVisibility(View.GONE);
-        MessageImageLoader.load(attachment.localPath(), dp(260), dp(190), image, () -> {
+        MessageImageLoader.load(attachment.localPath(), dp(220), dp(180), image, () -> {
             image.setVisibility(View.GONE);
             imageMissing.setVisibility(View.VISIBLE);
         });
         box.addView(imageMissing, matchWrap());
-        LinearLayout.LayoutParams imageParams = match(dp(190));
+        LinearLayout.LayoutParams imageParams = new LinearLayout.LayoutParams(dp(220), dp(180));
         imageParams.setMargins(0, dp(7), 0, dp(4));
         box.addView(image, imageParams);
         return box;
@@ -5431,11 +5576,14 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private void openVideoPlayer(String path, long startPositionUs,
                                  List<GalleryItem> candidates, int entryDirection,
                                  MaiCloudVod.Session cloudVod) {
+        if (entryDirection == 0) galleryImageOrigin = null;
         if (videoDialog != null) videoDialog.dismiss();
         String previousImagePath = galleryImagePath;
         Bitmap handoffFrame = entryDirection != 0 && galleryImageView != null
             ? galleryImageView.snapshot() : null;
+        galleryHandoff = true;
         if (imageDialog != null) imageDialog.dismiss();
+        galleryHandoff = false;
         List<GalleryItem> playlist = normalizeGallery(path, true, candidates);
         final int[] selected = {galleryIndex(playlist, path, true)};
         final String[] currentPath = {path};
@@ -5931,9 +6079,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     public boolean openAgentMedia(String path, boolean video, List<GalleryItem> playlist) {
+        return openAgentMedia(path, video, playlist, null);
+    }
+
+    public boolean openAgentMedia(String path, boolean video, List<GalleryItem> playlist, View source) {
         if (destroyed || path == null || !new File(path).isFile()) return false;
         if (video) openVideoPlayer(path, 0, playlist);
-        else showFullScreenImage(path, playlist);
+        else showFullScreenImage(path, playlist, source);
         return true;
     }
 
@@ -5949,6 +6101,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     public boolean openCloudDriveImage(String path) {
+        return openCloudDriveImage(path, null);
+    }
+
+    public boolean openCloudDriveImage(String path, View thumbnail) {
         if (destroyed || path == null) return false;
         try {
             String account = MaiChatAuthClient.shared(this).accountId();
@@ -5957,7 +6113,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             File cache = new File(getCacheDir(), "cloud-drive-images").getCanonicalFile();
             if (!source.isFile() || !source.getParentFile().equals(cache)) return false;
             if (imageDialog != null) imageDialog.dismiss();
-            showFullScreenImage(source.getAbsolutePath());
+            showFullScreenImage(source.getAbsolutePath(), Collections.emptyList(), thumbnail);
             if (imageDialog == null) return false;
             cloudImageFiles.put(imageDialog, source);
             cloudImageOwner = account;
@@ -6024,10 +6180,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
 
     @SuppressLint("ClickableViewAccessibility")
     private void showFullScreenImage(String path, List<GalleryItem> candidates) {
+        galleryImageOrigin = null;
         showFullScreenImage(path, candidates, 0);
     }
 
     private void showFullScreenImage(String path, List<GalleryItem> candidates, View source) {
+        galleryImageOrigin = source == null ? null : new MaiImagePreviewOrigin(path, source,
+            session.passwordChangeIdentity(), getWindowManager().getDefaultDisplay().getRotation());
         showFullScreenImage(path, candidates, 0, source);
     }
 
@@ -6042,11 +6201,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private void showFullScreenImage(String path, List<GalleryItem> candidates,
                                      int entryDirection, View source) {
         boolean reuseDialog = imageDialog != null && imageDialog.isShowing();
-        Rect sourceBounds = new Rect();
-        Bitmap sourceBitmap = !reuseDialog && videoDialog == null && source != null
-            && source.getGlobalVisibleRect(sourceBounds)
-            ? snapshotPreviewSource(source) : null;
-        boolean bubbleEntry = sourceBitmap != null && !sourceBounds.isEmpty();
+        if (!reuseDialog) {
+            imagePreviewRotation = getWindowManager().getDefaultDisplay().getRotation();
+            imagePreviewCoveredHost = insetsHost;
+        }
+        MaiImagePreviewOrigin origin = galleryImageOrigin;
+        String identity = session.passwordChangeIdentity();
+        boolean bubbleEntry = !reuseDialog && entryDirection == 0 && source != null && origin != null;
         String previousPath = galleryImagePath;
         Bitmap previousFrame = reuseDialog && entryDirection != 0 && galleryImageView != null
             ? galleryImageView.snapshot() : null;
@@ -6055,273 +6216,205 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             if (previousVideo != null) previousFrame = previousVideo.snapshot();
         }
         if (videoDialog != null) videoDialog.dismiss();
+        if (galleryImageTransition != null) galleryImageTransition.dispose();
         List<GalleryItem> playlist = normalizeGallery(path, false, candidates);
         int selected = galleryIndex(playlist, path, false);
         Dialog dialog = reuseDialog ? imageDialog :
             new Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
-        if (Build.VERSION.SDK_INT >= 28 && dialog.getWindow() != null) {
-            // 全屏主题仍会避开默认刘海安全区；只扩展图片窗口，不改变透明气泡动画或导航边距。
-            WindowManager.LayoutParams imageWindow = dialog.getWindow().getAttributes();
-            imageWindow.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
-            dialog.getWindow().setAttributes(imageWindow);
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            WindowManager.LayoutParams attributes = window.getAttributes();
+            attributes.windowAnimations = 0;
+            if (Build.VERSION.SDK_INT >= 28)
+                attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            if (Build.VERSION.SDK_INT >= 30) attributes.setFitInsetsTypes(0);
+            window.setAttributes(attributes);
+            window.setNavigationBarColor(Color.BLACK);
+            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+                | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+            window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
         }
         FrameLayout frame = new FrameLayout(this);
-        frame.setBackgroundColor(bubbleEntry ? Color.TRANSPARENT : Color.BLACK);
-        View dim = new View(this);
-        dim.setBackgroundColor(Color.BLACK);
-        dim.setAlpha(bubbleEntry ? 0.68f : 1f);
-        frame.addView(dim, new FrameLayout.LayoutParams(-1, -1));
-        // 同一入口供 IM 与 AI 助手共用：背景铺满屏幕，前景仍完整显示原图。
+        FrameLayout page = new FrameLayout(this);
+        page.setBackgroundColor(Color.BLACK);
+        page.setAlpha(bubbleEntry ? 0f : 1f);
+        frame.addView(page, new FrameLayout.LayoutParams(-1, -1));
         MaiGraphicsImageView backdrop = new MaiGraphicsImageView(this);
         backdrop.showImage(path, true, () -> { });
-        backdrop.setAlpha(bubbleEntry ? 0f : 0.48f);
-        if (Build.VERSION.SDK_INT >= 31) {
+        backdrop.setAlpha(0.48f);
+        if (Build.VERSION.SDK_INT >= 31)
             backdrop.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(
                 dp(24), dp(24), android.graphics.Shader.TileMode.CLAMP));
-        }
-        frame.addView(backdrop, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        View previousPreview = previousFrame == null ? null : gallerySnapshot(previousFrame);
+        page.addView(backdrop, new FrameLayout.LayoutParams(-1, -1));
         MaiGraphicsImageView image = new MaiGraphicsImageView(this);
-        if (bubbleEntry) image.setAlpha(0f);
-        final ImageView[] entryOverlay = {null};
-        List<View> entryChrome = new ArrayList<>();
-        final boolean[] transitioned = {false};
+        page.addView(image, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        View previousPreview = previousFrame == null ? null : gallerySnapshot(previousFrame);
+        if (previousPreview != null) page.addView(previousPreview, new FrameLayout.LayoutParams(-1, -1));
+        MaiImagePreviewTransition transition = new MaiImagePreviewTransition(frame, page, image);
+        galleryImageTransition = transition;
+        Bitmap thumbnail = source instanceof ImageView
+            && ((ImageView) source).getDrawable() instanceof android.graphics.drawable.BitmapDrawable
+            ? ((android.graphics.drawable.BitmapDrawable) ((ImageView) source).getDrawable()).getBitmap() : null;
+        // The source drawable is already a complete image, like the iOS pager's initial thumbnail.
+        // It can start the transition while the larger shared decode is still queued.
+        final Bitmap[] fullImage = {thumbnail};
+        final boolean[] presented = {false}, opened = {false}, closing = {false};
+        List<View> controls = new ArrayList<>();
+        final Runnable[] tryOpen = {null};
+        final Runnable[] requestClose = {null};
+        MaiImagePreviewGestures gestures = new MaiImagePreviewGestures(frame, image, () -> {
+            requestClose[0].run();
+        }, direction -> {
+            if (opened[0] && !closing[0] && !transition.running())
+                showMediaNeighbor(playlist, selected, direction);
+        });
+        frame.setOnTouchListener(gestures);
+        frame.setContentDescription("图片预览，单击关闭，双击缩放");
+        Runnable close = () -> {
+            if (closing[0] || transition.running() || imageDialog != dialog || galleryImageView != image) return;
+            closing[0] = true;
+            gestures.setEnabled(false);
+            for (View control : controls) control.setEnabled(false);
+            android.graphics.RectF destination = origin == null ? null : origin.frame(path,
+                session.passwordChangeIdentity(),
+                getWindowManager().getDefaultDisplay().getRotation(), frame);
+            transition.close(fullImage[0], destination, dialog::dismiss);
+        };
+        requestClose[0] = close;
+        tryOpen[0] = () -> {
+            if (opened[0] || closing[0] || !presented[0] || fullImage[0] == null || frame.getWidth() <= 0
+                    || frame.getHeight() <= 0 || imageDialog != dialog || galleryImageView != image) return;
+            opened[0] = true;
+            android.graphics.RectF start = bubbleEntry ? origin.frame(path,
+                session.passwordChangeIdentity(),
+                getWindowManager().getDefaultDisplay().getRotation(), frame) : null;
+            if (bubbleEntry) {
+                gestures.setEnabled(false);
+                transition.open(fullImage[0], start, () -> {
+                    gestures.setEnabled(true);
+                    for (View control : controls) control.setEnabled(true);
+                });
+            } else {
+                animateGalleryEntry(image, entryDirection);
+                gestures.setEnabled(true);
+                for (View control : controls) control.setEnabled(true);
+            }
+            if (previousPreview != null)
+                previousPreview.animate().translationX(-entryDirection * dp(48)).alpha(0)
+                    .setDuration(220).withEndAction(() -> page.removeView(previousPreview)).start();
+        };
         image.setPresentationListener(success -> {
-            if (imageDialog != dialog || galleryImageView != image || transitioned[0]) return;
-            // 图片解码完成后才让实际画面滑入，避免只动了加载中的黑底。
-            if (success) {
-                transitioned[0] = true;
-                if (bubbleEntry) {
-                    dim.animate().alpha(1f).setDuration(260).start();
-                    backdrop.animate().alpha(0.48f).setStartDelay(100)
-                        .setDuration(160).start();
-                    image.animate().alpha(1f).setDuration(260).start();
-                    for (View chrome : entryChrome)
-                        chrome.animate().alpha(1f).setDuration(260).start();
-                    if (entryOverlay[0] != null) {
-                        ImageView snapshot = entryOverlay[0];
-                        snapshot.animate().scaleX(1f).scaleY(1f)
-                            .translationX(0f).translationY(0f).alpha(0f)
-                            .setDuration(260).withEndAction(() -> frame.removeView(snapshot)).start();
-                    }
-                } else animateGalleryEntry(image, entryDirection);
-                if (previousPreview != null) {
-                    previousPreview.animate().translationX(-entryDirection * dp(48))
-                        .alpha(0).setDuration(220)
-                        .withEndAction(() -> frame.removeView(previousPreview)).start();
-                }
+            if (success && !closing[0] && identity.equals(session.passwordChangeIdentity())) {
+                presented[0] = true; tryOpen[0].run();
             }
         });
-        // 全屏预览直接绑定自己的 TextureView，与气泡使用不同的渲染目标。
-        image.showImage(
-            path,
-            false,
-            () -> {
-                if (imageDialog != dialog || galleryImageView != image) return;
-                toast("图片暂不可预览");
-                if (entryDirection != 0 && previousPath != null && !previousPath.equals(path))
-                    showFullScreenImage(previousPath, candidates, 0);
-                else dialog.dismiss();
-            });
-        final float[] scale = {1f};
-        final float[] last = {0f, 0f};
-        ScaleGestureDetector zoom = new ScaleGestureDetector(this,
-            new ScaleGestureDetector.SimpleOnScaleGestureListener() {
-                @Override
-                public boolean onScale(ScaleGestureDetector detector) {
-                    scale[0] = Math.max(1f, Math.min(4f,
-                        scale[0] * detector.getScaleFactor()));
-                    image.setScaleX(scale[0]);
-                    image.setScaleY(scale[0]);
-                    float maxX = image.getWidth() * (scale[0] - 1f) / 2f;
-                    float maxY = image.getHeight() * (scale[0] - 1f) / 2f;
-                    image.setTranslationX(Math.max(-maxX,
-                        Math.min(maxX, image.getTranslationX())));
-                    image.setTranslationY(Math.max(-maxY,
-                        Math.min(maxY, image.getTranslationY())));
-                    return true;
-                }
-            });
-        image.setOnTouchListener((view, event) -> {
-            zoom.onTouchEvent(event);
-            if (event.getActionMasked() == MotionEvent.ACTION_POINTER_UP) {
-                last[0] = event.getX(0);
-                last[1] = event.getY(0);
-                return true;
-            }
-            if (event.getPointerCount() > 1) return true;
-            switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    last[0] = event.getX();
-                    last[1] = event.getY();
-                    return true;
-                case MotionEvent.ACTION_MOVE:
-                    if (scale[0] <= 1.01f) return true;
-                    float maxX = image.getWidth() * (scale[0] - 1f) / 2f;
-                    float maxY = image.getHeight() * (scale[0] - 1f) / 2f;
-                    image.setTranslationX(Math.max(-maxX,
-                        Math.min(maxX, image.getTranslationX() + event.getX() - last[0])));
-                    image.setTranslationY(Math.max(-maxY,
-                        Math.min(maxY, image.getTranslationY() + event.getY() - last[1])));
-                    last[0] = event.getX();
-                    last[1] = event.getY();
-                    return true;
-                case MotionEvent.ACTION_UP:
-                    if (scale[0] <= 1.01f) {
-                        float dx = event.getX() - last[0];
-                        float dy = event.getY() - last[1];
-                        if (Math.abs(dx) >= dp(72) && Math.abs(dx) > Math.abs(dy) * 1.4f)
-                            showMediaNeighbor(playlist, selected, dx < 0 ? 1 : -1);
-                    }
-                    return true;
-                default:
-                    return true;
-            }
+        image.showImage(path, false, () -> {
+            if (closing[0] || imageDialog != dialog || galleryImageView != image) return;
+            toast("图片暂不可预览");
+            if (entryDirection != 0 && previousPath != null && !previousPath.equals(path))
+                showFullScreenImage(previousPath, candidates, 0);
+            else dialog.dismiss();
         });
-        BitmapFactory.Options bounds = new BitmapFactory.Options();
-        bounds.inJustDecodeBounds = true;
-        BitmapFactory.decodeFile(path, bounds);
-        FrameLayout.LayoutParams imageParams;
-        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
-            android.util.DisplayMetrics display = getResources().getDisplayMetrics();
-            float fit = Math.min((float) display.widthPixels / bounds.outWidth,
-                (float) display.heightPixels / bounds.outHeight);
-            imageParams = new FrameLayout.LayoutParams(
-                Math.max(1, Math.round(bounds.outWidth * fit)),
-                Math.max(1, Math.round(bounds.outHeight * fit)), Gravity.CENTER);
-        } else {
-            imageParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT);
-        }
-        android.util.DisplayMetrics display = getResources().getDisplayMetrics();
-        int targetWidth = imageParams.width > 0 ? imageParams.width : display.widthPixels;
-        int targetHeight = imageParams.height > 0 ? imageParams.height : display.heightPixels;
-        frame.addView(image, imageParams);
-        if (previousPreview != null)
-            frame.addView(previousPreview, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        if (bubbleEntry) {
-            ImageView snapshot = new ImageView(this);
-            snapshot.setImageBitmap(sourceBitmap);
-            snapshot.setScaleType(ImageView.ScaleType.FIT_XY);
-            frame.addView(snapshot, new FrameLayout.LayoutParams(
-                targetWidth, targetHeight, Gravity.CENTER));
-            snapshot.setScaleX((float) sourceBounds.width() / targetWidth);
-            snapshot.setScaleY((float) sourceBounds.height() / targetHeight);
-            snapshot.setTranslationX(sourceBounds.exactCenterX() - display.widthPixels / 2f);
-            snapshot.setTranslationY(sourceBounds.exactCenterY() - display.heightPixels / 2f);
-            entryOverlay[0] = snapshot;
-        }
+        // The shared decoder supplies a bounded, oriented full image, never a cropped View screenshot.
+        // Its borrowed bitmap stays alive for both directions of the transition; Graphics renders the page.
+        ImageView decoded = new ImageView(this);
+        frame.setTag(decoded); // Keep the loader's weak target alive until this page is retired.
+        android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+        MessageImageLoader.load(path, Math.max(metrics.widthPixels, metrics.heightPixels),
+            Math.max(metrics.widthPixels, metrics.heightPixels), decoded, () -> {
+                if (!closing[0] && imageDialog == dialog && galleryImageView == image) {
+                    fullImage[0] = image.snapshot();
+                    if (fullImage[0] == null) dialog.dismiss();
+                    else { fitPreviewImage(frame, image, fullImage[0]); tryOpen[0].run(); }
+                }
+            }, bitmap -> {
+                if (closing[0] || imageDialog != dialog || galleryImageView != image
+                        || !identity.equals(session.passwordChangeIdentity())) return;
+                fullImage[0] = bitmap;
+                fitPreviewImage(frame, image, bitmap);
+                tryOpen[0].run();
+            });
+        frame.addOnLayoutChangeListener((view, l, t, r, b, oldL, oldT, oldR, oldB) -> {
+            if (r - l == oldR - oldL && b - t == oldB - oldT) return;
+            if (fullImage[0] != null) fitPreviewImage(frame, image, fullImage[0]);
+            gestures.reset();
+            tryOpen[0].run();
+        });
         if (playlist.size() > 1) {
             TextView mediaName = MaiChatTheme.text(this,
-                (selected + 1) + "/" + playlist.size() + " · " + new File(path).getName(),
-                12, Color.WHITE);
+                (selected + 1) + "/" + playlist.size() + " · " + new File(path).getName(), 12, Color.WHITE);
             mediaName.setGravity(Gravity.CENTER);
             mediaName.setSingleLine(true);
             mediaName.setEllipsize(TextUtils.TruncateAt.MIDDLE);
             mediaName.setBackground(MaiChatTheme.rounded(Color.argb(140, 0, 0, 0), 12, this));
-            FrameLayout.LayoutParams nameParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(32), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-            nameParams.setMargins(dp(80), dp(20), dp(80), 0);
-            frame.addView(mediaName, nameParams);
-            if (bubbleEntry) { mediaName.setAlpha(0f); entryChrome.add(mediaName); }
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-1, dp(32), Gravity.TOP);
+            params.setMargins(dp(80), dp(20), dp(80), 0);
+            page.addView(mediaName, params);
         }
-        TextView close = iconButton("×", 26, Color.WHITE);
-        close.setContentDescription("关闭图片预览");
-        close.setBackground(MaiChatTheme.rounded(Color.argb(160, 0, 0, 0), 20, this));
-        final boolean[] closing = {false};
-        close.setOnClickListener(view -> {
-            if (!bubbleEntry || !transitioned[0] || source == null || !source.isAttachedToWindow()
-                || imageDialog != dialog || galleryImageView != image) {
-                dialog.dismiss();
-                return;
-            }
-            Rect destination = new Rect();
-            if (closing[0] || !source.getGlobalVisibleRect(destination)) {
-                if (!closing[0]) dialog.dismiss();
-                return;
-            }
-            Bitmap current = image.snapshot();
-            if (current == null) current = sourceBitmap;
-            if (current == null) { dialog.dismiss(); return; }
-            closing[0] = true;
-            ImageView shrink = new ImageView(this);
-            shrink.setImageBitmap(current);
-            shrink.setScaleType(ImageView.ScaleType.FIT_XY);
-            frame.addView(shrink, new FrameLayout.LayoutParams(
-                targetWidth, targetHeight, Gravity.CENTER));
-            image.setAlpha(0f);
-            dim.animate().alpha(0f).setDuration(220).start();
-            backdrop.animate().alpha(0f).setDuration(220).start();
-            for (View chrome : entryChrome) chrome.animate().alpha(0f).setDuration(160).start();
-            shrink.animate()
-                .scaleX((float) destination.width() / targetWidth)
-                .scaleY((float) destination.height() / targetHeight)
-                .translationX(destination.exactCenterX() - display.widthPixels / 2f)
-                .translationY(destination.exactCenterY() - display.heightPixels / 2f)
-                .setDuration(220).withEndAction(dialog::dismiss).start();
-        });
-        FrameLayout.LayoutParams closeParams = new FrameLayout.LayoutParams(
-            dp(48), dp(48), Gravity.TOP | Gravity.START);
-        closeParams.setMargins(dp(20), dp(18), 0, 0);
-        frame.addView(close, closeParams);
-        if (bubbleEntry) { close.setAlpha(0f); entryChrome.add(close); }
         LinearLayout actions = new LinearLayout(this);
         actions.setGravity(Gravity.CENTER_VERTICAL);
         actions.setPadding(dp(6), 0, dp(6), 0);
         actions.setBackground(MaiChatTheme.rounded(Color.argb(170, 0, 0, 0), 26, this));
-        TextView share = iconButton("↗", 23, Color.WHITE);
-        share.setContentDescription("分享图片");
+        ImageButton share = videoAction(R.drawable.ic_ui_share, "分享图片");
+        share.setEnabled(false);
+        controls.add(share);
         share.setOnClickListener(view -> sharePreviewImage(path));
-        actions.addView(share, new LinearLayout.LayoutParams(dp(48), dp(48)));
-        TextView save = iconButton("↓", 25, Color.WHITE);
-        save.setContentDescription("保存图片");
+        actions.addView(share, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        ImageButton save = videoAction(R.drawable.ic_ui_download, "保存图片");
+        save.setEnabled(false);
+        controls.add(save);
         save.setOnClickListener(view -> savePreviewImage(path));
-        actions.addView(save, new LinearLayout.LayoutParams(dp(48), dp(48)));
-        FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, dp(52), Gravity.BOTTOM | Gravity.END);
-        actionParams.setMargins(0, 0, dp(20), dp(54));
-        frame.addView(actions, actionParams);
-        if (bubbleEntry) { actions.setAlpha(0f); entryChrome.add(actions); }
+        actions.addView(save, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(dp(112), dp(48),
+            Gravity.BOTTOM | Gravity.END);
+        actionParams.setMargins(0, 0, dp(20), dp(66));
+        page.addView(actions, actionParams);
         dialog.setContentView(frame);
-        if (bubbleEntry && dialog.getWindow() != null) {
-            dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            dialog.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-        }
-        if (bubbleEntry)
-            dialog.setOnKeyListener((ignored, key, event) -> {
-                if (key != KeyEvent.KEYCODE_BACK) return false;
-                if (event.getAction() == KeyEvent.ACTION_UP) close.performClick();
-                return true;
-            });
-        else dialog.setOnKeyListener(null);
+        dialog.setOnKeyListener((ignored, key, event) -> {
+            if (key != KeyEvent.KEYCODE_BACK) return false;
+            if (event.getAction() == KeyEvent.ACTION_UP) close.run();
+            return true;
+        });
         dialog.setOnDismissListener(ignored -> {
+            transition.dispose();
+            gestures.setEnabled(false);
             File cloudFile = cloudImageFiles.remove(dialog);
-            if (cloudFile != null) {
-                cloudFile.delete();
-                cloudImageOwner = "";
-            }
+            if (cloudFile != null) { cloudFile.delete(); cloudImageOwner = ""; }
             if (imageDialog == dialog) {
                 imageDialog = null;
                 galleryImageView = null;
                 galleryImagePath = null;
+                galleryImageTransition = null;
+                imagePreviewIdentity = "";
+                imagePreviewCoveredHost = null;
+                if (!galleryHandoff) galleryImageOrigin = null;
             }
         });
         allowKeyboardLocation = false;
         imageDialog = dialog;
         galleryImageView = image;
         galleryImagePath = path;
+        imagePreviewIdentity = identity;
         if (!reuseDialog) dialog.show();
+        if (window != null) window.setLayout(-1, -1);
     }
 
-    private Bitmap snapshotPreviewSource(View source) {
-        if (source.getWidth() <= 0 || source.getHeight() <= 0) return null;
-        Bitmap bitmap = Bitmap.createBitmap(
-            source.getWidth(), source.getHeight(), Bitmap.Config.ARGB_8888);
-        source.draw(new Canvas(bitmap));
-        return bitmap;
+    private void fitPreviewImage(FrameLayout frame, View image, Bitmap bitmap) {
+        if (frame.getWidth() <= 0 || frame.getHeight() <= 0) return;
+        android.graphics.RectF fit = MaiImagePreviewTransition.fitted(bitmap.getWidth(), bitmap.getHeight(),
+            frame.getWidth(), frame.getHeight());
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) image.getLayoutParams();
+        int width = Math.max(1, Math.round(fit.width())), height = Math.max(1, Math.round(fit.height()));
+        if (params.width == width && params.height == height) return;
+        params.width = width;
+        params.height = height;
+        params.gravity = Gravity.CENTER;
+        image.setLayoutParams(params);
     }
 
     private View gallerySnapshot(Bitmap bitmap) {
@@ -6998,6 +7091,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     private void hideKeyboard() {
+        closeIMAttachmentPanel();
         View focus = getCurrentFocus();
         if (focus == null) return;
         ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))

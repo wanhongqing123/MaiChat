@@ -24,6 +24,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 import java.io.File;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Locale;
@@ -226,7 +227,7 @@ final class MaiCloudDriveDialog {
         LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(0, -2, 1);
         titleParams.leftMargin = dp(9);
         heading.addView(title, titleParams);
-        quota = label("正在读取…", 14, MaiChatTheme.SECONDARY);
+        quota = label("", 14, MaiChatTheme.SECONDARY);
         quota.setGravity(Gravity.END);
         heading.addView(quota, new LinearLayout.LayoutParams(-2, -2));
         card.addView(heading, new LinearLayout.LayoutParams(-1, -2));
@@ -365,7 +366,7 @@ final class MaiCloudDriveDialog {
         loading = true;
         int requestGeneration = ++generation;
         String requestedCursor = cursor;
-        setStatus(media.isEmpty() && directory.children().isEmpty() ? "" : "正在读取云盘…");
+        setStatus("");
         next.setEnabled(false);
         renderMedia(requestGeneration);
         JSONObject payload = directory.payload(cursor);
@@ -377,7 +378,7 @@ final class MaiCloudDriveDialog {
                 listError = !directory.currentId().isEmpty() && result.httpStatus == 404 ?
                     "文件夹已不存在，请返回上级或根目录" : MaiCloudDrive.errorText(result);
                 setStatus(listError);
-                if ("正在读取…".contentEquals(quota.getText())) quota.setText("暂不可用");
+                if (quota.getText().length() == 0) quota.setText("暂不可用");
                 upload.setEnabled(result.httpStatus != 404 || !directory.currentId().isEmpty());
                 next.setText("重试");
                 // 根目录尚未开通时仍保留重试；加号会被禁用，不能依赖其中的刷新菜单恢复。
@@ -719,7 +720,7 @@ final class MaiCloudDriveDialog {
         }
         for (JSONObject folder : directory.children()) library.addView(folderRow(folder), row());
         for (JSONObject item : media) library.addView(mediaRow(item, requestGeneration), row());
-        // 空列表按用户要求留白；请求期间仍显示真实加载状态。
+        // 空列表按用户要求留白；请求期间只显示无文案的进度指示器。
         if (media.isEmpty() && directory.children().isEmpty() && listError.isEmpty()
                 && (loading || folderLoading)) {
             LinearLayout empty = new LinearLayout(activity);
@@ -728,10 +729,8 @@ final class MaiCloudDriveDialog {
             empty.setPadding(dp(12), dp(38), dp(12), dp(38));
             ProgressBar spinner = new ProgressBar(activity);
             spinner.setIndeterminateTintList(ColorStateList.valueOf(MaiChatTheme.BLUE));
+            spinner.setContentDescription("正在加载云盘");
             empty.addView(spinner, new LinearLayout.LayoutParams(dp(30), dp(30)));
-            TextView message = label("正在加载云盘", 14, MaiChatTheme.SECONDARY);
-            message.setPadding(0, dp(14), 0, 0);
-            empty.addView(message);
             library.addView(empty, new LinearLayout.LayoutParams(-1, -2));
         }
     }
@@ -745,7 +744,6 @@ final class MaiCloudDriveDialog {
         card.setOrientation(LinearLayout.HORIZONTAL);
         card.setGravity(Gravity.CENTER_VERTICAL);
         card.setContentDescription((image ? "查看图片：" : "播放视频：") + name);
-        card.setOnClickListener(ignored -> open(id, name, bytes, image));
         card.setOnLongClickListener(ignored -> { showMediaMenu(item); return true; });
         FrameLayout cover = new FrameLayout(activity);
         cover.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE_SOFT, 12, activity));
@@ -757,6 +755,7 @@ final class MaiCloudDriveDialog {
         thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
         thumbnail.setContentDescription(name + "缩略图");
         cover.addView(thumbnail, new FrameLayout.LayoutParams(-1, -1));
+        card.setOnClickListener(ignored -> open(id, name, bytes, image, thumbnail));
         if (!image) {
             FrameLayout play = new FrameLayout(activity);
             play.setBackground(MaiChatTheme.rounded(Color.argb(150, 0, 0, 0), 12, activity));
@@ -865,9 +864,9 @@ final class MaiCloudDriveDialog {
         thumbnailDirectory.delete();
     }
 
-    private void open(String id, String name, long bytes, boolean image) {
+    private void open(String id, String name, long bytes, boolean image, View sourceView) {
         if (id.isEmpty() || playing || uploading || saving) return;
-        if (loading || folderLoading) { setStatus("正在加载云盘，请稍候"); return; }
+        if (loading || folderLoading) return;
         MaiCloudDrive.MediaInfo info = MaiCloudDrive.mediaInfo(name);
         if (info == null || !info.mediaType.equals(image ? "image" : "video") ||
             bytes < 1 || bytes > info.maxBytes) {
@@ -878,6 +877,8 @@ final class MaiCloudDriveDialog {
             startVideoVod(id, name);
             return;
         }
+        // 下载可能跨过目录刷新；异步任务不持有旧卡片，来源离窗后交由普通淡入路径处理。
+        WeakReference<View> previewSource = new WeakReference<>(sourceView);
         File directory = new File(activity.getCacheDir(), "cloud-drive-images");
         if (!directory.isDirectory() && !directory.mkdirs()) {
             setStatus("无法准备预览缓存"); return;
@@ -914,7 +915,9 @@ final class MaiCloudDriveDialog {
                     playing = false;
                     if (!downloaded.ok()) { setStatus("下载失败，请重试"); return; }
                     setStatus("");
-                    if (!activity.openCloudDriveImage(target.getAbsolutePath())) target.delete();
+                    View source = previewSource.get();
+                    if (source != null && !source.isAttachedToWindow()) source = null;
+                    if (!activity.openCloudDriveImage(target.getAbsolutePath(), source)) target.delete();
                 }));
         });
     }
@@ -966,7 +969,7 @@ final class MaiCloudDriveDialog {
 
     private void saveVideo(String id, String name, long bytes) {
         if (id.isEmpty() || saving || playing || uploading) return;
-        if (loading || folderLoading) { setStatus("正在加载云盘，请稍候"); return; }
+        if (loading || folderLoading) return;
         MaiCloudDrive.MediaInfo info = MaiCloudDrive.mediaInfo(name);
         if (info == null || !"video".equals(info.mediaType) ||
             bytes < 1 || bytes > info.maxBytes) {

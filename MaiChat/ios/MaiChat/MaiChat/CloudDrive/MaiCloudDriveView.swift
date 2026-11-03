@@ -370,10 +370,12 @@ struct MaiCloudDriveView: View {
                                 .id("cloud-drive-directory-navigation-top")
                         }
                         if model.availability == .unknown && model.listError.isEmpty {
-                            ProgressView("正在连接云盘")
+                            ProgressView()
+                                .accessibilityLabel("正在连接云盘")
                                 .frame(maxWidth: .infinity, minHeight: 180)
                         } else if model.loading && model.videos.isEmpty {
-                            ProgressView("正在加载云盘")
+                            ProgressView()
+                                .accessibilityLabel("正在加载云盘")
                                 .frame(maxWidth: .infinity, minHeight: 180)
                         } else if model.videos.isEmpty && model.childFolders.isEmpty && model.listError.isEmpty {
                             VStack(spacing: 12) {
@@ -401,7 +403,7 @@ struct MaiCloudDriveView: View {
                             }
                         }
                         if model.nextCursor != nil {
-                            Button(model.loadingMore ? "加载中…" : "加载更多") {
+                            Button("加载更多") {
                                 Task { await model.loadMore() }
                             }
                             .disabled(model.loadingMore)
