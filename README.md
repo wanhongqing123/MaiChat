@@ -4,23 +4,21 @@ MaiChat 包含 iOS、Android 和 Qt 桌面客户端，以及账号、云盘和�
 
 ## 运行截图
 
-以下为实际运行截图，使用本地示例素材和测试会话。iOS 来自模拟器，Android 来自
-模拟器中的隔离测试宿主；点击图片可查看原图。
+以下为真实产品控件的运行截图，使用本地示例会话和测试素材；iOS 来自模拟器。
+点击图片可查看原图。
 
-**macOS：我的云盘**
+**macOS：消息、引用与文件（本地示例会话）**
 
-[![macOS 我的云盘，展示本地测试目录和示例视频](docs/screenshots/desktop-cloud-drive.png)](docs/screenshots/desktop-cloud-drive.png)
+[![macOS 消息界面，展示示例项目讨论、引用回复及文件卡片](docs/screenshots/desktop-messages.png)](docs/screenshots/desktop-messages.png)
 
 <table>
   <tr>
+    <th>macOS：我的云盘</th>
     <th>iOS：创作中心</th>
-    <th>iOS：独立网页任务</th>
-    <th>Android：创作中心</th>
   </tr>
   <tr>
-    <td><a href="docs/screenshots/ios-creation-center.png"><img src="docs/screenshots/ios-creation-center.png" width="250" alt="iOS 模拟器中的创作中心功能说明"></a></td>
-    <td><a href="docs/screenshots/ios-browser-task.png"><img src="docs/screenshots/ios-browser-task.png" width="250" alt="iOS 独立网页任务，使用本地演示网页"></a></td>
-    <td><a href="docs/screenshots/android-creation-center.png"><img src="docs/screenshots/android-creation-center.png" width="250" alt="Android 模拟器隔离测试宿主中的创作中心"></a></td>
+    <td valign="top"><a href="docs/screenshots/desktop-cloud-drive.png"><img src="docs/screenshots/desktop-cloud-drive.png" width="680" alt="macOS 我的云盘，展示本地测试目录和示例视频"></a></td>
+    <td valign="top"><a href="docs/screenshots/ios-creation-center.png"><img src="docs/screenshots/ios-creation-center.png" width="260" alt="iOS 模拟器中的创作中心功能说明"></a></td>
   </tr>
 </table>
 
