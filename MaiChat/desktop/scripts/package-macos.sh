@@ -126,6 +126,28 @@ case "$out_dir" in
 esac
 staging="$dist_root/MaiChat-macos-arm64"
 staged_app="$staging/$app_name"
+
+# 重打包已生成的 App 时，输入可能就在输出目录内；真实路径也要覆盖符号链接别名。
+# 删除或复制前拒绝双向包含，防止清空唯一输入，或把 App 递归复制进自身。
+mkdir -p "$dist_root"
+source_app_real="$(cd "$source_app" && pwd -P)"
+if [[ -d "$staging" ]]; then
+  staging_real="$(cd "$staging" && pwd -P)"
+else
+  staging_real="$(cd "$dist_root" && pwd -P)/MaiChat-macos-arm64"
+fi
+case "$source_app_real/" in
+  "$staging_real/"*)
+    echo "Input App overlaps output staging; choose a separate --out-dir." >&2
+    exit 1
+    ;;
+esac
+case "$staging_real/" in
+  "$source_app_real/"*)
+    echo "Output staging is inside the input App; choose a separate --out-dir." >&2
+    exit 1
+    ;;
+esac
 rm -rf "$staging"
 mkdir -p "$staging"
 
