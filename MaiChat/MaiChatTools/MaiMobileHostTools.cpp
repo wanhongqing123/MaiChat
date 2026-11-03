@@ -871,6 +871,22 @@ void registerMaiChatHostTools(MaiToolRegistry& tools,
         R"({"type":"object","properties":{"nickname":{"type":"string","maxLength":32}},)"
             R"("required":["nickname"]})",
         true);
+#if defined(__ANDROID__)
+    // 头像由上面的三端共用 factory 注册，Android 不再覆盖其 path/取消协议。
+    // 只打开设置页共用的注销安全表单；密码、验证码、账号与校验回执不经过模型工具。
+    // 真正注销必须由用户在本地验证身份并再次确认，宿主工具没有直接删除账号的入口。
+    add("maichat_request_account_deletion",
+        "Open the current MaiChat account's secure account deletion form. "
+        "The user must verify locally and confirm deletion in that form. This tool only opens "
+        "the form and accepts no passwords, verification codes, account identifiers or receipt tokens. "
+        "Approval follows the Agent policy.",
+        R"({"type":"object","properties":{},"additionalProperties":false})",
+        true);
+    // 只读报告与设置页复用同一账号服务；工具不创建另一条 HTTP 路径。
+    add("maichat_list_safety_reports",
+        "List safety reports for the current MaiChat account using the same service as Settings.",
+        R"({"type":"object","properties":{},"additionalProperties":false})");
+#endif
     add("maichat_list_conversations",
         "List direct MaiChat conversations with contacts, ordered by latest message and unread "
         "count. Use maichat_list_groups for group conversations.",

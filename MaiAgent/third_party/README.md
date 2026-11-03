@@ -86,6 +86,16 @@ SQLite 有个历史怪癖——双引号括起来的东西如果不是已知列�
 
     a889ac9dbba3644271bd9d1302b5c22a088893719b72be3487bc3d401e5c4e80
 
+`curl/lib/asyn-thread.c` 回移官方修复
+[`ff5091aa9f73802e894b1cbdf24ab84e103200e2`](https://github.com/curl/curl/commit/ff5091aa9f73802e894b1cbdf24ab84e103200e2)，
+修复 [CVE-2025-0665](https://curl.se/docs/CVE-2025-0665.html)：64 位 eventfd 的两个
+socket 槽位实际共享一个 fd，线程解析结束后只能由父线程关闭一次；pipe/socketpair
+仍分别关闭两个端点。本地同时在同步数据初始化时将两个槽位置为 `CURL_SOCKET_BAD`，
+避免分配失败的早期清理误关 fd 0。Android 确定性回归从实际源码抽取清理函数，覆盖
+正常结束、早期分配失败、hostname 分配失败与分离线程回收，并在首次 close 后用
+`dup2` 强制复用 fd 检查新所有者仍存活。验证记录见
+`docs/diagnostics/maichat-android-curl-eventfd-20261103.md`。
+
 曾经想过只留 `lib/` `include/`，把 29M 压到 7M。没这么做，因为裁剪过的
 依赖**就不再是"那个版本"了**：升级时要重新做一遍裁剪决定，出问题时也没法
 直接和上游比对；而且构建里哪天需要某个被删掉的文件，报错会离原因很远。

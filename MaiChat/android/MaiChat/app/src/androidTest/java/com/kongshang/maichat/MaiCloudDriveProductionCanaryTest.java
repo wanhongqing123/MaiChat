@@ -287,7 +287,7 @@ public final class MaiCloudDriveProductionCanaryTest {
             long deadline = System.currentTimeMillis() + 5000;
             do {
                 screen.onActivity(activity -> page.set(byDescription(
-                    activity.getWindow().getDecorView(), "云盘状态")));
+                activity.getWindow().getDecorView(), "云盘页面")));
                 if (page.get() != null && visible(page.get())) break;
                 Thread.sleep(100);
             } while (System.currentTimeMillis() < deadline);
@@ -298,7 +298,7 @@ public final class MaiCloudDriveProductionCanaryTest {
                 do {
                     AccessibilityNodeInfo root = InstrumentationRegistry.getInstrumentation()
                         .getUiAutomation().getRootInActiveWindow();
-                    if (root != null) play = textNode(root, "播放");
+                if (root != null) play = actionNode(root, "播放视频");
                     if (play != null) break;
                     Thread.sleep(100);
                 } while (System.currentTimeMillis() < deadline);
@@ -401,15 +401,16 @@ public final class MaiCloudDriveProductionCanaryTest {
         return true;
     }
 
-    private static AccessibilityNodeInfo textNode(AccessibilityNodeInfo root,
-                                                  String wanted) {
-        if (root.getText() != null && wanted.contentEquals(root.getText())) return root;
+    private static AccessibilityNodeInfo actionNode(AccessibilityNodeInfo root, String wanted) {
+        if (root == null) return null;
+        CharSequence description = root.getContentDescription();
+        if (description != null && description.toString().startsWith(wanted)) return root;
         for (int i = 0; i < root.getChildCount(); ++i) {
             AccessibilityNodeInfo child = root.getChild(i);
-            if (child == null) continue;
-            AccessibilityNodeInfo found = textNode(child, wanted);
+            AccessibilityNodeInfo found = actionNode(child, wanted);
             if (found != null) return found;
         }
         return null;
     }
+
 }

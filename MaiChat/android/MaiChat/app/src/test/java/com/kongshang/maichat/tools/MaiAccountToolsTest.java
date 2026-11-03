@@ -47,6 +47,12 @@ public class MaiAccountToolsTest {
         Path link = Files.createSymbolicLink(workspace.resolve("link.png"), other);
         assertThrows(IOException.class, () -> MaiChatIMTools.avatarWorkspaceFile(
             link.toString(), workspace.toString()));
+        Path ownLink = Files.createSymbolicLink(workspace.resolve("own-link.png"), own);
+        assertEquals(own.toRealPath().toFile(), MaiChatIMTools.avatarWorkspaceFile(
+            ownLink.toString(), workspace.toString()));
+        Path outsideDirectory = Files.createSymbolicLink(workspace.resolve("outside-directory"), sibling);
+        assertThrows(IOException.class, () -> MaiChatIMTools.avatarWorkspaceFile(
+            outsideDirectory.resolve("other.png").toString(), workspace.toString()));
     }
 
     @Test public void remembersCancelBeforeRequestAndBoundsPendingIds() throws Exception {

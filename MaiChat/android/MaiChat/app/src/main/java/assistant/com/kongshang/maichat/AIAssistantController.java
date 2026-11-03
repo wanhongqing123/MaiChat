@@ -27,6 +27,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.security.MessageDigest;
 import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -107,6 +108,7 @@ public final class AIAssistantController {
     private static AIAssistantController shared;
     private static String currentAccountUserId = "";
     private static Context applicationContext;
+    private static final Map<String, List<java.lang.ref.WeakReference<Thread>>> closingAccountWorkers = new HashMap<>();
     public static synchronized AIAssistantController shared(Context context) {
         applicationContext = context.getApplicationContext();
         if (shared == null)
@@ -145,6 +147,37 @@ public final class AIAssistantController {
             shared.nextWanRefreshAt = 0;
             shared.wanWorkspaceId = "";
         });
+    }
+
+    /** 注销清理必须等旧原生会话与 SQLite 句柄真正关闭，不能在异步 close 后立刻删除目录。 */
+    static synchronized CompletableFuture<Void> stopForAcceptedAccountDeletion(String owner) {
+        if (shared != null && owner.equals(shared.accountUserId)) {
+            shared.close(); shared = null;
+            if (owner.equals(currentAccountUserId)) currentAccountUserId = "";
+        }
+        List<Thread> closing = new ArrayList<>();
+        List<java.lang.ref.WeakReference<Thread>> registered = closingAccountWorkers.get(owner);
+        if (registered != null) for (java.lang.ref.WeakReference<Thread> reference : registered) {
+            Thread worker = reference.get(); if (worker != null && worker.isAlive()) closing.add(worker);
+        }
+        if (closing.isEmpty()) return CompletableFuture.completedFuture(null);
+        return CompletableFuture.runAsync(() -> {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            for (Thread worker : closing) {
+                long remaining = deadline - System.nanoTime();
+                try { if (remaining > 0) TimeUnit.NANOSECONDS.timedJoin(worker, remaining); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new java.util.concurrent.CompletionException(interrupted); }
+                if (worker.isAlive()) throw new java.util.concurrent.CompletionException(new IOException("AI account is still closing"));
+            }
+        });
+    }
+    static synchronized void registerClosingAccountWorker(String owner, Thread worker) {
+        closingAccountWorkers.entrySet().removeIf(entry -> {
+            entry.getValue().removeIf(reference -> { Thread previous = reference.get(); return previous == null || !previous.isAlive(); });
+            return entry.getValue().isEmpty();
+        });
+        // 快速 A→B→A 时保留 A 的每一代活跃线程，后一次 close 不能覆盖前一代的屏障。
+        closingAccountWorkers.computeIfAbsent(owner, ignored -> new ArrayList<>()).add(new java.lang.ref.WeakReference<>(worker));
     }
     private static native long nativeCreate();
     private static synchronized void onNativeSessionChanged(String sessionId) {
@@ -478,10 +511,11 @@ public final class AIAssistantController {
                 response[0] = hostToolFailure(safeMessage(failure));
             }
         };
-        // 私有 PDF 密码桥自行做短时 UI 调度；不让通用桥阻塞主线程等待用户输入。
+        // 私有 PDF 密码桥自行做短时 UI 调度；安全报告在 worker 复用账号服务，避免网络阻塞主线程。
         if (tool.startsWith("mobile_") || tool.equals("generate_pdf") || tool.equals("pdf_password_request")
             || tool.equals("maichat_create_group") || tool.equals("maichat_get_group_messages")
-            || tool.equals("maichat_send_group_text")) {
+            || tool.equals("maichat_send_group_text") || tool.equals("maichat_set_avatar")
+            || tool.equals("maichat_list_safety_reports")) {
             if (Looper.myLooper() == Looper.getMainLooper())
                 return hostToolFailure("此宿主工具不能在 UI 线程执行");
             invoke.run();
@@ -2599,6 +2633,8 @@ public final class AIAssistantController {
         return new String(bytes, StandardCharsets.UTF_8);
     }
     void close() {
+        if (closed) return;
+        registerClosingAccountWorker(accountUserId, thread);
         closed = true;
         if (sessionSync != null) sessionSync.close();
         listener = null;

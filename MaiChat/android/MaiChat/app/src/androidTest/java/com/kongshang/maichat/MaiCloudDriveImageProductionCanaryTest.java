@@ -122,7 +122,7 @@ public final class MaiCloudDriveImageProductionCanaryTest {
                 while (System.currentTimeMillis() < deadline && !opened.get()) {
                     screen.onActivity(activity -> {
                         View page = byDescription(activity.getWindow().getDecorView(),
-                            "云盘状态");
+                            "云盘页面");
                         if (page != null && page.isShown()) {
                             opened.set(true);
                         }
@@ -139,7 +139,7 @@ public final class MaiCloudDriveImageProductionCanaryTest {
                     decodedJpegs(thumbnailDirectory));
                 screenshot(context, "cloud-canary-normal-media-list.png");
 
-                clickText("查看");
+                clickAction("查看图片");
                 File preview = waitForFile(new File(context.getCacheDir(),
                     "cloud-drive-images"), ".png", 20_000);
                 assertNotNull("Image download did not finish", preview);
@@ -160,7 +160,7 @@ public final class MaiCloudDriveImageProductionCanaryTest {
                     Thread.sleep(100);
                 assertFalse("Private image cache survived viewer close", preview.exists());
 
-                clickText("播放");
+                clickAction("播放视频");
                 String playing = null;
                 deadline = System.currentTimeMillis() + 30_000;
                 while (System.currentTimeMillis() < deadline) {
@@ -395,23 +395,22 @@ public final class MaiCloudDriveImageProductionCanaryTest {
         return null;
     }
 
-    private static void clickText(String text) {
+    private static void clickAction(String description) {
         AccessibilityNodeInfo root = InstrumentationRegistry.getInstrumentation()
             .getUiAutomation().getRootInActiveWindow();
-        assertNotNull(root);
-        AccessibilityNodeInfo found = textNode(root, text);
-        assertNotNull(text + " button", found);
+        AccessibilityNodeInfo found = actionNode(root, description);
+        assertNotNull(description + " action", found);
         assertTrue(found.performAction(AccessibilityNodeInfo.ACTION_CLICK));
     }
 
-    private static AccessibilityNodeInfo textNode(AccessibilityNodeInfo root, String text) {
-        if (root.getText() != null && text.contentEquals(root.getText())) return root;
+    private static AccessibilityNodeInfo actionNode(AccessibilityNodeInfo root, String wanted) {
+        if (root == null) return null;
+        CharSequence description = root.getContentDescription();
+        if (description != null && description.toString().startsWith(wanted)) return root;
         for (int i = 0; i < root.getChildCount(); ++i) {
             AccessibilityNodeInfo child = root.getChild(i);
-            if (child != null) {
-                AccessibilityNodeInfo found = textNode(child, text);
-                if (found != null) return found;
-            }
+            AccessibilityNodeInfo found = actionNode(child, wanted);
+            if (found != null) return found;
         }
         return null;
     }

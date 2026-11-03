@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Same vector geometry as iOS NavAssistantFilled; keep both platforms in sync. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:pathData="M4 8h16a2 2 0 0 1 2 2v8.7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2zm6 3.8v6l4.7-3-4.7-3z" android:fillColor="#FF000000" android:fillType="evenOdd" />
+    <path android:pathData="M3.1 5.9a2 2 0 0 1 1.6-2.4L17.2 1a2 2 0 0 1 2.4 1.6l.6 2.7L3.6 8.6l-.5-2.7zM7.1 3l1.6-.3 3 4.2-1.6.3-3-4.2zM13.1 1.8l1.6-.3 3 4.2-1.6.3-3-4.2z" android:fillColor="#FF000000" android:fillType="evenOdd" />
+</vector>

@@ -157,7 +157,7 @@ public final class MaiCloudDriveInstrumentedTest {
                 AccessibilityNodeInfo window = InstrumentationRegistry.getInstrumentation()
                     .getUiAutomation().getRootInActiveWindow();
                 assertNotNull(window);
-                AccessibilityNodeInfo view = textNode(window, "查看");
+            AccessibilityNodeInfo view = actionNode(window, "查看图片");
                 assertNotNull("Image preview button", view);
                 assertTrue(view.performAction(AccessibilityNodeInfo.ACTION_CLICK));
                 deadline = System.currentTimeMillis() + 15_000;
@@ -376,7 +376,7 @@ public final class MaiCloudDriveInstrumentedTest {
             AccessibilityNodeInfo root = InstrumentationRegistry.getInstrumentation()
                 .getUiAutomation().getRootInActiveWindow();
             assertNotNull(root);
-            AccessibilityNodeInfo play = textNode(root, "播放");
+        AccessibilityNodeInfo play = actionNode(root, "播放视频");
             assertNotNull("Cloud video play button", play);
             assertTrue(play.performAction(AccessibilityNodeInfo.ACTION_CLICK));
             String playbackSource = null;
@@ -409,9 +409,9 @@ public final class MaiCloudDriveInstrumentedTest {
             screen.onActivity(activity -> assertTrue(activity.commandAgentVideo("close", 0, 0, 0)));
             int fullDownloadsBeforeSave = state().getInt("full_downloads");
             Set<Long> savedBefore = savedCloudVideoIds(context);
-            AccessibilityNodeInfo save = textNode(
+            AccessibilityNodeInfo save = actionNode(
                 InstrumentationRegistry.getInstrumentation().getUiAutomation()
-                    .getRootInActiveWindow(), "保存");
+                .getRootInActiveWindow(), "保存到相册");
             assertNotNull("Cloud list needs an explicit Save action", save);
             assertTrue(save.performAction(AccessibilityNodeInfo.ACTION_CLICK));
             deadline = System.currentTimeMillis() + 30_000;
@@ -1042,6 +1042,54 @@ public final class MaiCloudDriveInstrumentedTest {
         } finally { source.delete(); }
     }
 
+    @Test public void cloudFoldersBrowseBackAndSurviveRootTabSwitch() throws Exception {
+        requireFixture();
+        resetFixture();
+        Context context = ApplicationProvider.getApplicationContext();
+        MaiChatAuthClient.shared(context).loginWithPassword("sync-ui-test", PASSWORD, true);
+        MaiCloudDrive client = new MaiCloudDrive(context);
+        MaiCloudDrive.Result parent = request(client, MaiCloudDrive.CREATE_FOLDER,
+            new JSONObject().put("name", "UI trip").put("parent_id", ""));
+        assertTrue(parent.body, parent.ok());
+        String parentId = parent.json().getString("id");
+        MaiCloudDrive.Result child = request(client, MaiCloudDrive.CREATE_FOLDER,
+            new JSONObject().put("name", "UI day").put("parent_id", parentId));
+        assertTrue(child.body, child.ok());
+        String childId = child.json().getString("id");
+        try (ActivityScenario<MainActivity> screen = ActivityScenario.launch(MainActivity.class)) {
+            clickPageDescription(screen, "云盘");
+            clickPageDescription(screen, "UI trip，文件夹");
+            clickPageDescription(screen, "UI day，文件夹");
+            screen.onActivity(activity -> {
+                assertNotNull(byDescription(activity.getWindow().getDecorView(), "返回云盘根目录"));
+                assertTrue(activity.currentCloudDriveDialog().navigateBack());
+            });
+            waitPageDescription(screen, "UI day，文件夹", false);
+            clickPageDescription(screen, "消息");
+            clickPageDescription(screen, "云盘");
+            // The child row proves that the parent directory was restored;
+            // returning to root would expose UI trip instead.
+            waitPageDescription(screen, "UI day，文件夹", false);
+            clickPageDescription(screen, "云盘更多操作");
+            AccessibilityNodeInfo menu = InstrumentationRegistry.getInstrumentation()
+                .getUiAutomation().getRootInActiveWindow();
+            assertNotNull(menu);
+            assertNotNull(textNode(menu, "新建文件夹"));
+            assertNotNull(textNode(menu, "上传图片或视频到根目录"));
+            InstrumentationRegistry.getInstrumentation().getUiAutomation()
+                .performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
+            screen.onActivity(activity -> assertTrue(activity.currentCloudDriveDialog().navigateBack()));
+            waitPageDescription(screen, "UI trip，文件夹", false);
+            screen.onActivity(activity -> assertFalse(activity.currentCloudDriveDialog().navigateBack()));
+            screenshot(context, "cloud-drive-folder-navigation.png");
+        } finally {
+            assertTrue(request(client, MaiCloudDrive.DELETE_FOLDER,
+                new JSONObject().put("folder_id", childId)).ok());
+            assertTrue(request(client, MaiCloudDrive.DELETE_FOLDER,
+                new JSONObject().put("folder_id", parentId)).ok());
+        }
+    }
+
     @Test public void agentCloudDisabledMapsToNotConfigured() throws Exception {
         assertTrue(BuildConfig.DEBUG && BuildConfig.USE_LOCAL_UI_AUTH &&
             BuildConfig.APPLICATION_ID.endsWith(".isolated"));
@@ -1184,6 +1232,28 @@ public final class MaiCloudDriveInstrumentedTest {
         connection.disconnect();
     }
 
+    private static void clickPageDescription(ActivityScenario<MainActivity> screen,
+                                              String description) throws Exception {
+        waitPageDescription(screen, description, true);
+    }
+
+    private static void waitPageDescription(ActivityScenario<MainActivity> screen,
+                                            String description, boolean click) throws Exception {
+        AtomicBoolean found = new AtomicBoolean();
+        long deadline = System.currentTimeMillis() + 15_000;
+        while (!found.get() && System.currentTimeMillis() < deadline) {
+            screen.onActivity(activity -> {
+                View view = byDescription(activity.getWindow().getDecorView(), description);
+                if (view != null && view.isShown()) {
+                    if (click) view.performClick();
+                    found.set(true);
+                }
+            });
+            if (!found.get()) Thread.sleep(50);
+        }
+        assertTrue("Cloud page did not expose " + description, found.get());
+    }
+
     private static View byDescription(View root, String description) {
         if (root.getContentDescription() != null &&
             description.contentEquals(root.getContentDescription())) return root;
@@ -1193,6 +1263,18 @@ public final class MaiCloudDriveInstrumentedTest {
                 View found = byDescription(group.getChildAt(i), description);
                 if (found != null) return found;
             }
+        }
+        return null;
+    }
+
+    private static AccessibilityNodeInfo actionNode(AccessibilityNodeInfo root, String wanted) {
+        if (root == null) return null;
+        CharSequence description = root.getContentDescription();
+        if (description != null && description.toString().startsWith(wanted)) return root;
+        for (int i = 0; i < root.getChildCount(); ++i) {
+            AccessibilityNodeInfo child = root.getChild(i);
+            AccessibilityNodeInfo found = actionNode(child, wanted);
+            if (found != null) return found;
         }
         return null;
     }

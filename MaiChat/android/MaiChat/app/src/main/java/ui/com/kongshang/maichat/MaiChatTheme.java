@@ -11,6 +11,8 @@ import android.widget.TextView;
 
 public final class MaiChatTheme {
     public static final int PAGE = Color.rgb(246, 249, 252);
+    // 与 iOS inset-grouped 页面共用视觉层级；聊天正文继续使用自己的白色背景。
+    public static final int GROUPED_PAGE = Color.rgb(242, 242, 247);
     public static final int PANEL = Color.WHITE;
     public static final int BORDER = Color.rgb(218, 228, 240);
     public static final int TEXT = Color.rgb(14, 21, 37);

@@ -57,6 +57,8 @@ public:
     // 仅在 Graphics 接受保留 HLG/PQ 元数据的帧后成立，供宿主诊断实际播放链路。
     bool hasPresentedHdrFrame() const;
     void setForwardAction(std::function<void(const QString&)> action);
+    // Ordinary forwarding remains available independently of the compact UI.
+    void forwardVideo();
     void setDocked(bool docked) {
         docked_ = docked;
     }
@@ -80,9 +82,8 @@ private:
     bool startPlayback();
     void stopPlayback(bool cancelCloudSource = false);
     void saveCopy();
-    void forwardVideo();
     void updatePlayButton();
-    // 控制条随视口伸展；窄窗把次要动作移到更多菜单，保留拖动进度的空间。
+    // 进度条独占上排，图标动作位于下排；两行均随视口宽度伸展。
     void updateControlLayout();
     void revealControls();
     void scheduleControlHide();

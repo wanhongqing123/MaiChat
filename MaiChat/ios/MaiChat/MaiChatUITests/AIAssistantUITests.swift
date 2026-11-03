@@ -2806,7 +2806,7 @@ final class AIAssistantUITests: XCTestCase {
         add(returned)
     }
 
-    @MainActor func testAssistantMainTabsRemainVisibleWithDockedVideo() async throws {
+    @MainActor func testAssistantVideoCoversThePageAndRestoresTheOriginalTabsWhenClosed() async throws {
         let statusURL = URL(string: "http://127.0.0.1:18190/test/status")!
         guard let (_, response) = try? await URLSession.shared.data(from: statusURL),
               (response as? HTTPURLResponse)?.statusCode == 200 else {
@@ -2821,27 +2821,42 @@ final class AIAssistantUITests: XCTestCase {
         app.launch()
         let assistant = app.buttons["创作中心"]
         XCTAssertTrue(assistant.waitForExistence(timeout: 35))
+        let titles = ["消息", "云盘", "创作中心", "好友列表", "我的"]
+        let tabTops = Dictionary(uniqueKeysWithValues: titles.map { ($0, app.buttons[$0].frame.minY) })
         assistant.tap()
-        let expand = app.buttons["ffplay-expand"]
+        let video = app.images["ffplay-video-surface"]
+        let close = app.buttons["ffplay-close"]
         let editor = app.textViews["ai-composer"]
-        XCTAssertTrue(expand.waitForExistence(timeout: 20))
-        XCTAssertTrue(editor.waitForExistence(timeout: 20))
-        XCTAssertTrue(expand.isHittable)
+        XCTAssertTrue(video.waitForExistence(timeout: 20))
+        XCTAssertTrue(close.isHittable)
+        XCTAssertFalse(editor.isHittable, "视频模态不能把下面的输入栏留作另一块可操作区域")
+        XCTAssertFalse(app.buttons["ffplay-expand"].exists)
+        for title in titles {
+            XCTAssertFalse(app.buttons[title].isHittable, "播放时主标签不应穿透全屏模态：\(title)")
+        }
+        let modal = XCTAttachment(screenshot: app.screenshot())
+        modal.name = "assistant-video-fullscreen-modal"
+        modal.lifetime = .keepAlways
+        add(modal)
+        close.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: video)], timeout: 5), .completed)
+        XCTAssertTrue(editor.waitForExistence(timeout: 10))
         XCTAssertTrue(editor.isHittable)
-        XCTAssertGreaterThan(editor.frame.midY, app.frame.midY,
-                             "分屏播放时创作中心输入栏仍应在播放器下方")
-        for title in ["消息", "云盘", "创作中心", "好友列表", "我的"] {
-            XCTAssertTrue(app.buttons[title].isHittable,
-                          "分屏播放时应保留完整的主标签栏：\(title)")
+        for title in titles {
+            let tab = app.buttons[title]
+            XCTAssertTrue(tab.isHittable, "关闭视频后须恢复原主标签：\(title)")
+            XCTAssertEqual(tab.frame.minY, tabTops[title]!, accuracy: 1,
+                           "播放器不能给主页面遗留顶部或侧边占位")
         }
         XCTAssertFalse(app.buttons["返回主页面"].exists)
         let fixtureIMError = app.staticTexts.matching(
             NSPredicate(format: "label BEGINSWITH %@", "IM 操作失败")).firstMatch
         if fixtureIMError.exists { fixtureIMError.tap() }
-        let split = XCTAttachment(screenshot: app.screenshot())
-        split.name = "assistant-five-main-tabs-docked-video"
-        split.lifetime = .keepAlways
-        add(split)
+        let restored = XCTAttachment(screenshot: app.screenshot())
+        restored.name = "assistant-five-main-tabs-after-video-close"
+        restored.lifetime = .keepAlways
+        add(restored)
     }
 
     func testNormalAppKeepsConversationPageVisibleAcrossNavigation() throws {
@@ -2927,7 +2942,7 @@ final class AIAssistantUITests: XCTestCase {
             waitForPreview(app.images["ffplay-video-surface"], named: "ffplay-seek-sample.mp4")
             XCTAssertTrue(app.buttons["ffplay-pause"].exists)
             assertMediaHasNoTitle(app)
-            // 从全屏图片进入视频保持同一全屏容器，不跳回 Root 的分屏布局。
+            // 从全屏图片进入视频保持同一全屏容器，不改换宿主或重新打开文件。
             XCTAssertFalse(app.statusBars.firstMatch.exists)
             right.press(forDuration: 0.05, thenDragTo: left)
             let returned = app.images["agent-image-preview"]
@@ -2975,7 +2990,7 @@ final class AIAssistantUITests: XCTestCase {
         assertMediaHasNoTitle(app)
     }
 
-    func testDockedMediaPagerExpandsAndBrowsesWithoutReplayingCurrentVideo() throws {
+    func testFullScreenMediaPagerRotatesAndBrowsesWithoutReplayingCurrentVideo() throws {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
         let app = XCUIApplication()
@@ -2987,16 +3002,24 @@ final class AIAssistantUITests: XCTestCase {
         let video = app.images["ffplay-video-surface"]
         waitForPreview(video, named: "ffplay-seek-sample.mp4", timeout: 20)
         let tabs = ["消息", "云盘", "创作中心", "好友列表", "我的"].map { app.buttons[$0] }
-        for tab in tabs { XCTAssertTrue(tab.isHittable) }
-        XCTAssertTrue(app.textViews["ai-composer"].isHittable)
+        for tab in tabs { XCTAssertFalse(tab.isHittable) }
+        XCTAssertFalse(app.textViews["ai-composer"].isHittable)
+        XCTAssertFalse(app.buttons["ffplay-expand"].exists)
         let pause = app.buttons["ffplay-pause"]
         pause.tap()
         Thread.sleep(forTimeInterval: 0.6) // 等播放线程确认暂停，避免读取上一轮定时进度。
         let time = app.staticTexts["ffplay-time"].label
-        app.buttons["ffplay-expand"].tap()
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in app.frame.width > app.frame.height }, object: app)],
+            timeout: 8), .completed)
         XCTAssertEqual(pause.label, "播放视频")
         XCTAssertEqual(app.staticTexts["ffplay-time"].label, time,
-                       "全屏改变同一容器尺寸，不能重播当前视频")
+                       "旋转必须保持同一全屏容器，不能重播当前视频")
+        XCUIDevice.shared.orientation = .portrait
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in app.frame.height > app.frame.width }, object: app)],
+            timeout: 8), .completed)
         for tab in tabs { XCTAssertFalse(tab.isHittable) }
         let left = app.coordinate(withNormalizedOffset: CGVector(dx: 0.80, dy: 0.40))
         let right = app.coordinate(withNormalizedOffset: CGVector(dx: 0.20, dy: 0.40))
@@ -3006,28 +3029,24 @@ final class AIAssistantUITests: XCTestCase {
         for tab in tabs { XCTAssertFalse(tab.isHittable) }
         left.press(forDuration: 0.05, thenDragTo: right)
         waitForPreview(video, named: "ffplay-seek-sample.mp4")
-        app.buttons["ffplay-expand"].tap()
-        for tab in tabs {
-            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-                predicate: NSPredicate(format: "hittable == true"), object: tab)], timeout: 5), .completed)
-        }
-        XCTAssertTrue(app.textViews["ai-composer"].isHittable)
+        for tab in tabs { XCTAssertFalse(tab.isHittable) }
         app.buttons["ffplay-close"].tap()
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == false"), object: app.buttons["ffplay-expand"])],
+            predicate: NSPredicate(format: "exists == false"), object: video)],
             timeout: 5), .completed)
         for tab in tabs { XCTAssertTrue(tab.isHittable) }
+        XCTAssertTrue(app.textViews["ai-composer"].isHittable)
     }
 
-    func testDockedPlayerSpeedChoicesRemainFullyVisible() throws {
-        try checkDockedPlayerSpeedChoices(video: "speed-menu-widescreen-sdr.mp4")
+    func testFullScreenPlayerSpeedChoicesRemainFullyVisible() throws {
+        try checkFullScreenPlayerSpeedChoices(video: "speed-menu-widescreen-sdr.mp4")
     }
 
-    func testDockedHDRPlayerSpeedChoicesRemainFullyVisible() throws {
-        try checkDockedPlayerSpeedChoices(video: "speed-menu-widescreen-hlg.mp4")
+    func testFullScreenHDRPlayerSpeedChoicesRemainFullyVisible() throws {
+        try checkFullScreenPlayerSpeedChoices(video: "speed-menu-widescreen-hlg.mp4")
     }
 
-    private func checkDockedPlayerSpeedChoices(video: String) throws {
+    private func checkFullScreenPlayerSpeedChoices(video: String) throws {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
         let app = XCUIApplication()
@@ -3109,9 +3128,8 @@ final class AIAssistantUITests: XCTestCase {
                 predicate: NSPredicate(format: "label CONTAINS %@", rate),
                 object: app.buttons["ffplay-speed"])], timeout: 5), .completed)
         }
-        checkMenu("portrait-docked-ended", select: "0.5")
-        app.buttons["ffplay-expand"].tap()
-        checkMenu("portrait-fullscreen", select: "1.5")
+        XCTAssertFalse(app.buttons["ffplay-expand"].exists)
+        checkMenu("portrait-fullscreen-ended", select: "0.5")
         XCUIDevice.shared.orientation = .landscapeLeft
         var previousSpeedFrame = CGRect.null
         var stableLayoutSince = Date()
@@ -3128,8 +3146,11 @@ final class AIAssistantUITests: XCTestCase {
             }, object: app)], timeout: 8), .completed,
             "等待旋转后的控件位置稳定，不能按动画前的坐标点击")
         checkMenu("landscape-fullscreen", select: "2.0")
-        app.buttons["ffplay-expand"].tap()
-        checkMenu("landscape-docked", select: "1.0")
+        XCUIDevice.shared.orientation = .portrait
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in app.frame.height > app.frame.width }, object: app)],
+            timeout: 8), .completed)
+        checkMenu("portrait-fullscreen-returned", select: "1.0")
     }
 
     func testMediaPagerCancelledDragPreservesPausedVideoAndSpeed() throws {
@@ -4479,7 +4500,7 @@ final class AIAssistantUITests: XCTestCase {
         #endif
     }
 
-    @MainActor func testActionPanelAnchorsBelowDockedHeader() throws {
+    @MainActor func testActionPanelRestoresItsHeaderAnchorAfterClosingFullScreenVideo() throws {
         #if targetEnvironment(simulator)
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .portrait
@@ -4491,14 +4512,17 @@ final class AIAssistantUITests: XCTestCase {
         defer { app.terminate() }
         let video = app.images["ffplay-video-surface"]
         waitForPreview(video, named: "ffplay-seek-sample.mp4", timeout: 20)
-        app.buttons["ffplay-pause"].tap()
         let more = app.buttons["更多"]
+        XCTAssertFalse(more.isHittable, "视频模态不能留下可操作的底层创作菜单")
+        app.buttons["ffplay-close"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: video)], timeout: 5), .completed)
         XCTAssertTrue(more.isHittable)
         more.tap()
         let panel = app.descendants(matching: .any).matching(identifier: "ai-action-panel").firstMatch
         XCTAssertTrue(panel.waitForExistence(timeout: 5))
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
-        attachment.name = "action-panel-anchor-video-docked"
+        attachment.name = "action-panel-anchor-after-video-modal-close"
         attachment.lifetime = .keepAlways
         add(attachment)
         XCTAssertEqual(panel.frame.maxX, more.frame.maxX, accuracy: 20)
@@ -4509,8 +4533,8 @@ final class AIAssistantUITests: XCTestCase {
             CGVector(dx: 12, dy: panel.frame.midY)).tap()
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "exists == false"), object: panel)], timeout: 5), .completed)
-        XCTAssertTrue(video.exists)
-        XCTAssertEqual(app.buttons["ffplay-pause"].label, "播放视频", "菜单开合不能重播暂停的视频")
+        XCTAssertFalse(video.exists)
+        XCTAssertTrue(app.textViews["ai-composer"].isHittable)
         #else
         throw XCTSkip("仅模拟器本地视频，不改变用户会话")
         #endif

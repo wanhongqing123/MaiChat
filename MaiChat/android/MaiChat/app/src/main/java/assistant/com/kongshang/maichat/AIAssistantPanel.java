@@ -116,6 +116,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private boolean voiceMode, voiceRecording, cancelVoice, attachmentPanelVisible;
     private String voicePartialText = "";
     private int voiceGeneration;
+    private final ComposerVoiceResultGuard voiceResultGuard = new ComposerVoiceResultGuard();
+    private VoiceTranscriptionOverlay transcriptionOverlay;
+    private VoiceTranscriptionResult transcription;
     private final Runnable elapsed = new Runnable() {
         @Override
         public void run() {
@@ -160,11 +163,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         MarkdownRenderer.initialize(activity);
         FrameLayout header = new FrameLayout(activity);
         ImageButton sessionsButton = headerIcon(R.drawable.ic_ai_sidebar, "对话列表", v -> sessions());
-        FrameLayout.LayoutParams sessionsParams = new FrameLayout.LayoutParams(dp(34), dp(34),
+        FrameLayout.LayoutParams sessionsParams = new FrameLayout.LayoutParams(dp(44), dp(44),
             Gravity.START | Gravity.CENTER_VERTICAL);
         sessionsParams.setMarginStart(dp(16));
         header.addView(sessionsButton, sessionsParams);
-        TextView title = text("创作中心", 18, MaiChatTheme.TEXT);
+        TextView title = text("创作中心", 18, Color.BLACK);
         title.setTypeface(MaiChatTypography.semibold());
         title.setGravity(Gravity.CENTER);
         header.addView(title, new FrameLayout.LayoutParams(
@@ -178,11 +181,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         videoCircleEntry.setVisibility(GONE);
         FrameLayout.LayoutParams circleParams = new FrameLayout.LayoutParams(dp(58), dp(38),
             Gravity.END | Gravity.CENTER_VERTICAL);
-        circleParams.setMarginEnd(dp(56));
+        circleParams.setMarginEnd(dp(64));
         header.addView(videoCircleEntry, circleParams);
         ImageButton moreButton = headerIcon(R.drawable.ic_ai_more, "更多", null);
         moreButton.setOnClickListener(v -> menu(v));
-        FrameLayout.LayoutParams moreParams = new FrameLayout.LayoutParams(dp(34), dp(34),
+        FrameLayout.LayoutParams moreParams = new FrameLayout.LayoutParams(dp(44), dp(44),
             Gravity.END | Gravity.CENTER_VERTICAL);
         moreParams.setMarginEnd(dp(16));
         header.addView(moreButton, moreParams);
@@ -195,11 +198,14 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         browserHost.setVisibility(GONE);
         addView(browserHost, new LayoutParams(LayoutParams.MATCH_PARENT, dp(300)));
         list = new LatestMessageList();
-        list.setStackFromBottom(true);
+        list.setStackFromBottom(false);
         list.setTranscriptMode(ListView.TRANSCRIPT_MODE_NORMAL);
         list.setDivider(null);
+        list.setSelector(android.R.color.transparent);
         list.setDividerHeight(dp(24));
-        list.setPadding(dp(24), dp(18), dp(24), dp(24));
+        list.setPadding(dp(16), 0, dp(16), dp(24));
+        // 内容保留留白，滚动指示条独立贴视图边缘，与 iOS 的全宽滚动区域一致。
+        list.setScrollBarStyle(View.SCROLLBARS_OUTSIDE_OVERLAY);
         list.setClipToPadding(false);
         older = button("显示更早消息", "显示更早消息", v -> {
             visibleLimit += 30;
@@ -225,7 +231,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             if (following && b - t != ob - ot)
                 locateLatest();
         });
-        addView(list, new LayoutParams(LayoutParams.MATCH_PARENT, 0, 1));
+        ChatKeyboardDismissal messageSurface = new ChatKeyboardDismissal(activity, this::hideKeyboard);
+        messageSurface.addView(list, new FrameLayout.LayoutParams(-1, -1));
+        addView(messageSurface, new LayoutParams(LayoutParams.MATCH_PARENT, 0, 1));
         pending = column();
         pending.setPadding(dp(12), 0, dp(12), 0);
         addView(pending, matchWrap());
@@ -286,7 +294,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         inputRow.addView(voiceModeButton, new LayoutParams(dp(44), dp(44)));
 
         FrameLayout inputSurface = new FrameLayout(activity);
-        composer = new EditText(activity);
+        composer = new ComposerEditText(activity);
         composer.setTag("ai-composer");
         composer.setContentDescription("创作中心消息输入框");
         composer.setHint("可按住转文字");
@@ -295,7 +303,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         composer.setMaxLines(6);
         composer.setMinHeight(dp(44));
         composer.setPadding(dp(13), dp(9), dp(13), dp(9));
-        composer.setBackground(MaiChatTheme.bordered(Color.WHITE, MaiChatTheme.BLUE, 14, activity));
+        composer.setBackground(MaiChatTheme.bordered(MaiChatTheme.GROUPED_PAGE,
+            MaiChatTheme.BLUE, 14, activity));
         composer.setInputType(android.text.InputType.TYPE_CLASS_TEXT
             | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
             | android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
@@ -312,6 +321,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             public void beforeTextChanged(CharSequence s, int st, int c, int a) {}
             @Override
             public void onTextChanged(CharSequence s, int st, int before, int count) {
+                if (voiceResultGuard.edited() && transcriptionOverlay != null) invalidateVoiceTranscription();
                 updateSend();
             }
             @Override
@@ -324,32 +334,6 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 locateLatest();
             }
         });
-        int tapSlop = ViewConfiguration.get(activity).getScaledTouchSlop();
-        float[] touchDown = new float[2];
-        boolean[] singleTap = new boolean[1];
-        list.setOnTouchListener((view, event) -> {
-            switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    touchDown[0] = event.getX(); touchDown[1] = event.getY();
-                    singleTap[0] = true;
-                    break;
-                case MotionEvent.ACTION_MOVE:
-                    if (Math.abs(event.getX() - touchDown[0]) > tapSlop ||
-                        Math.abs(event.getY() - touchDown[1]) > tapSlop) singleTap[0] = false;
-                    break;
-                case MotionEvent.ACTION_POINTER_DOWN:
-                case MotionEvent.ACTION_CANCEL:
-                    singleTap[0] = false;
-                    break;
-                case MotionEvent.ACTION_UP:
-                    if (singleTap[0] && composer.hasFocus()) hideKeyboard();
-                    singleTap[0] = false;
-                    break;
-                default:
-                    break;
-            }
-            return false;
-        });
         inputSurface.addView(composer, new FrameLayout.LayoutParams(
             LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         voiceHoldButton = button("按住转文字", "按住转文字", null);
@@ -358,20 +342,46 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         voiceHoldButton.setSingleLine(true);
         voiceHoldButton.setEllipsize(android.text.TextUtils.TruncateAt.END);
         voiceHoldButton.setBackground(MaiChatTheme.bordered(
-            Color.WHITE, MaiChatTheme.BLUE, 14, activity));
+            MaiChatTheme.GROUPED_PAGE, MaiChatTheme.BLUE, 14, activity));
         voiceHoldButton.setOnTouchListener((view, event) -> voiceTouch(event));
         voiceHoldButton.setVisibility(GONE);
         inputSurface.addView(voiceHoldButton, new FrameLayout.LayoutParams(
             LayoutParams.MATCH_PARENT, dp(44)));
+        // 可见空编辑器与独立语音按钮复用同一录音器；短按和已有草稿保留系统编辑行为。
+        ComposerVoiceInput.attach(composer, new ComposerVoiceInput.Listener() {
+            @Override public boolean start(float rawX, float rawY) {
+                if (voiceRecorder == null || state == null || !state.ready || state.busy() || submitting)
+                    return false;
+                if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    activity.requestPermissions(new String[] {Manifest.permission.RECORD_AUDIO},
+                        REQUEST_AUDIO_PERMISSION);
+                    return false;
+                }
+                hideKeyboard();
+                return beginVoice(rawX, rawY);
+            }
+            @Override public void move(float rawX, float rawY) {
+                if (transcriptionOverlay != null) transcriptionOverlay.move(rawX, rawY);
+            }
+            @Override public void finish(float rawX, float rawY, boolean cancelled) {
+                if (transcriptionOverlay != null)
+                    finishTranscription(transcription, cancelled ? VoiceTranscriptionOverlay.Action.CANCEL
+                        : transcriptionOverlay.move(rawX, rawY));
+            }
+            @Override public void detached() { if (transcriptionOverlay != null) invalidateVoiceTranscription(); }
+        });
         LayoutParams inputParams = new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1);
         inputParams.setMargins(dp(8), 0, dp(8), 0);
         inputRow.addView(inputSurface, inputParams);
 
         attachmentOrStopButton = circularIcon(R.drawable.ic_ai_add, "展开更多功能", false,
             v -> {
-                if (state != null && state.busy())
+                if (state != null && state.busy()) {
+                    voiceResultGuard.submitted();
+                    if (transcriptionOverlay != null) invalidateVoiceTranscription();
                     controller.action("stop", value("session", selected), null);
-                else
+                } else
                     setAttachmentPanelVisible(!attachmentPanelVisible);
             });
         inputRow.addView(attachmentOrStopButton, new LayoutParams(dp(44), dp(44)));
@@ -379,7 +389,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         send.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE, 22, activity));
         send.setVisibility(GONE);
         LayoutParams sendParams = new LayoutParams(dp(44), dp(44));
-        sendParams.setMargins(dp(8), 0, 0, 0);
+        // 与加号/停止按钮互斥，输入区域的右边距已提供同一位置的间隔。
         inputRow.addView(send, sendParams);
         musicMiniBar = row();
         musicMiniBar.setGravity(Gravity.CENTER_VERTICAL);
@@ -441,6 +451,39 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         composerArea.addView(attachmentPanel, matchWrap());
         addView(composerArea, matchWrap());
     }
+
+    /** 按最终可用宽度测量草稿，连续 EDIT 不继承上次单行高度和内部滚动。 */
+    static final class ComposerEditText extends EditText {
+        ComposerEditText(Context context) { super(context); }
+
+        @Override protected void onTextChanged(CharSequence text, int start, int before, int count) {
+            super.onTextChanged(text, start, before, count);
+            // send 按钮会同步改变 weighted 输入区域宽度；即使字数相同，也须重新量高。
+            requestLayout();
+            if (text.length() == 0) scrollTo(0, 0);
+        }
+
+        @Override protected void onMeasure(int widthSpec, int heightSpec) {
+            super.onMeasure(widthSpec, heightSpec);
+            int width = getMeasuredWidth() - getCompoundPaddingLeft() - getCompoundPaddingRight();
+            if (width <= 0) return;
+            android.text.Layout textLayout = getLayout();
+            if (textLayout == null || textLayout.getWidth() != width) {
+                textLayout = android.text.StaticLayout.Builder.obtain(getText(), 0, length(), getPaint(), width)
+                    .setIncludePad(getIncludeFontPadding())
+                    .setLineSpacing(getLineSpacingExtra(), getLineSpacingMultiplier())
+                    .setBreakStrategy(getBreakStrategy()).setHyphenationFrequency(getHyphenationFrequency())
+                    .build();
+            }
+            int lines = Math.min(textLayout.getLineCount(), Math.max(1, getMaxLines()));
+            int desired = Math.max(getMinHeight(), textLayout.getLineTop(lines)
+                + getCompoundPaddingTop() + getCompoundPaddingBottom());
+            int height = resolveSize(desired, heightSpec);
+            setMeasuredDimension(getMeasuredWidth(), height);
+            // 超过六行仍保留原生光标滚动；能完整容纳的草稿不应被旧 viewport 裁顶。
+            if (length() == 0 || textLayout.getLineCount() <= lines && height >= desired) scrollTo(0, 0);
+        }
+    }
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
@@ -460,8 +503,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (browser != null) browser.setVisible(value);
         if (!value && sessionDrawerPopup != null) sessionDrawerPopup.dismiss();
         if (!value) {
-            if (voiceRecording) finishVoice(true);
-            else voiceGeneration++;
+            invalidateVoiceTranscription();
         }
         if (!value) updateHostVoiceOverlay(false, "");
         removeCallbacks(elapsed);
@@ -479,8 +521,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         boolean changedSession = !selected.equals(next.selected);
         if (changedSession) {
             // 切走后即使又切回同一会话，也不能接收旧录音的迟到 final。
-            if (voiceRecording) finishVoice(true);
-            else voiceGeneration++;
+            invalidateVoiceTranscription();
             String previous = selected;
             drafts.put(previous, composer.getText().toString());
             boolean firstSend = submitting && previous.isEmpty()
@@ -555,6 +596,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         List<JSONObject> next = new ArrayList<>();
         for (int i = Math.max(0, count - visibleLimit); i < count; i++) next.add(array.optJSONObject(i));
         messages = next;
+        // 欢迎能力目录从顶部阅读，消息仍保留底部跟随；两者共用同一滚动容器。
+        boolean welcome = next.isEmpty();
+        list.setStackFromBottom(!welcome);
+        list.setPadding(dp(welcome ? 16 : 24), dp(welcome ? 0 : 18),
+            dp(welcome ? 16 : 24), dp(24));
         renderedMessagesSession = selected;
         renderedVisibleLimit = visibleLimit;
         renderedMessageHash = state.messageHash;
@@ -591,12 +637,14 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         // 短消息使用系统的底部堆叠；当最后一条消息本身高于视口时，必须等真实行高
         // 可用后设置负偏移，才能看到该消息末尾，不能按字符数估算高度。
         void showLatestContent() {
+            // 空态不是聊天消息，不能把高于视口的能力目录自动定位到最后一行。
+            if (messages.isEmpty()) return;
             post(() -> {
-                if (!following || getCount() == 0) return;
+                if (!following || messages.isEmpty() || getCount() == 0) return;
                 int target = getCount() - 1;
                 setSelection(target);
                 postOnAnimation(() -> {
-                    if (!following || target != getCount() - 1) return;
+                    if (!following || messages.isEmpty() || target != getCount() - 1) return;
                     View last = getChildAt(target - getFirstVisiblePosition());
                     if (last == null) return;
                     int viewportHeight = getHeight() - getPaddingTop() - getPaddingBottom();
@@ -617,7 +665,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             && !navigationPending && pendingMediaImports.getOrDefault(selected, 0) == 0 && hasDraft
             && !state.remoteCommandPending
             && (state.remoteSession == null || state.remoteSession.optBoolean("online"));
-        send.setVisibility(!voiceMode && hasDraft && !busy ? VISIBLE : GONE);
+        // 尾部只显示一个操作：忙碌时停止，有草稿时发送，其余显示加号。
+        // 两个原有回调保持独立，隐藏的按钮不占位，避免转写回填后挤窄编辑器。
+        boolean showSend = !voiceMode && hasDraft && !busy;
+        send.setVisibility(showSend ? VISIBLE : GONE);
+        attachmentOrStopButton.setVisibility(showSend ? GONE : VISIBLE);
         send.setEnabled(canSubmit);
         attachmentOrStopButton.setImageResource(busy ? R.drawable.ic_ai_stop : R.drawable.ic_ai_add);
         attachmentOrStopButton.setContentDescription(busy ? "停止" :
@@ -625,7 +677,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         attachmentOrStopButton.setColorFilter(busy ? Color.WHITE : MaiChatTheme.TEXT);
         attachmentOrStopButton.setBackground(busy
             ? MaiChatTheme.rounded(Color.rgb(29, 32, 36), 22, activity)
-            : MaiChatTheme.bordered(Color.WHITE, MaiChatTheme.BORDER, 22, activity));
+            : MaiChatTheme.bordered(MaiChatTheme.GROUPED_PAGE, MaiChatTheme.BORDER, 22, activity));
         attachmentOrStopButton.setEnabled(state != null && state.ready && !submitting);
         voiceModeButton.setEnabled(state != null && state.ready && !busy && !submitting);
         voiceHoldButton.setEnabled(state != null && state.ready && !busy && !submitting);
@@ -673,6 +725,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private void send() {
         if (state == null || submitting || navigationPending)
             return;
+        // 手动发送或停止属于新操作；较早录音的 final 不得覆盖草稿或进入 busy 的 stop 分支。
+        voiceResultGuard.submitted();
+        if (transcriptionOverlay != null) invalidateVoiceTranscription();
         if (state.busy()) {
             controller.action("stop", value("session", selected), null);
             return;
@@ -1373,107 +1428,132 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     REQUEST_AUDIO_PERMISSION);
                 return true;
             }
-            beginVoice(); return true;
+            hideKeyboard();
+            beginVoice(event.getRawX(), event.getRawY()); return true;
         }
         if (!voiceRecording) return false;
         if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
-            cancelVoice = event.getY() < -dp(60);
-            voiceHoldButton.setText(cancelVoice ? "松开取消"
-                : voicePartialText.isEmpty() ? "正在听，请说话…" : voicePartialText);
-            updateHostVoiceOverlay(true, cancelVoice ? "松开取消" : voicePartialText);
+            if (transcriptionOverlay != null) transcriptionOverlay.move(event.getRawX(), event.getRawY());
             return true;
         }
         if (event.getActionMasked() == MotionEvent.ACTION_UP
             || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
-            finishVoice(cancelVoice || event.getActionMasked() == MotionEvent.ACTION_CANCEL);
+            if (transcriptionOverlay != null)
+                finishTranscription(transcription, event.getActionMasked() == MotionEvent.ACTION_CANCEL
+                    ? VoiceTranscriptionOverlay.Action.CANCEL
+                    : transcriptionOverlay.move(event.getRawX(), event.getRawY()));
             return true;
         }
         return true;
     }
     static final int REQUEST_AUDIO_PERMISSION = 7111;
-    private void beginVoice() {
+    private boolean beginVoice(float rawX, float rawY) {
+        if (transcriptionOverlay != null) invalidateVoiceTranscription();
         int generation = ++voiceGeneration;
+        long draftRevision = voiceResultGuard.snapshot();
         String voiceSession = selected;
         String voiceAccount = MaiChatAuthClient.shared(activity).accountId();
+        VoiceTranscriptionResult capture = new VoiceTranscriptionResult();
+        VoiceTranscriptionOverlay overlay = new VoiceTranscriptionOverlay(activity, true, rawX, rawY,
+            action -> finishTranscription(capture, action));
         VoiceRecordingController.AsrTicketProvider ticketProvider =
             activity instanceof MainActivity ?
                 () -> MaiChatAuthClient.shared(activity).realtimeAsrTicket() : null;
         boolean started = voiceRecorder.tryStart(new VoiceRecordingController.Completion() {
             @Override public void partial(String text) {
-                if (voiceRecording && currentVoiceResult(generation, voiceSession, voiceAccount)) {
+                if (voiceRecording && canApplyVoiceResult(generation, voiceSession, voiceAccount, draftRevision)) {
                     voicePartialText = text == null ? "" : text.trim();
-                    composer.setText(voicePartialText);
-                    updateHostVoiceOverlay(true, voicePartialText);
-                    if (!cancelVoice)
-                        voiceHoldButton.setText(voicePartialText.isEmpty()
-                            ? "正在听，请说话…" : voicePartialText);
+                    overlay.updateText(voicePartialText);
                 }
             }
             @Override public void recognized(String text, File file, int seconds) {
                 file.delete();
-                if (!currentVoiceResult(generation, voiceSession, voiceAccount)
-                    || text == null || text.trim().isEmpty()) return;
-                composer.setText(text.trim());
-                send();
+                deliverTranscription(capture, overlay, generation, voiceSession, voiceAccount, draftRevision, text);
             }
             @Override public void finished(File file, int seconds) {
-                if (!currentVoiceResult(generation, voiceSession, voiceAccount)) {
-                    file.delete();
-                    return;
-                }
-                if (speechRecognizer != null && speechRecognizer.isAvailable()) {
-                    speechRecognizer.transcribe(file, file.getName().endsWith(".aac") ? "aac" : "m4a",
-                        new SpeechRecognizer.Callback() {
-                            @Override public void onText(String text) {
-                                file.delete();
-                                if (!currentVoiceResult(generation, voiceSession, voiceAccount)) return;
-                                if (text == null || text.trim().isEmpty()) {
-                                    Toast.makeText(activity, "没有识别到文字", Toast.LENGTH_LONG).show();
-                                    return;
-                                }
-                                composer.setText(text.trim()); send();
-                            }
-                            @Override public void onError(String message) {
-                                file.delete();
-                                if (currentVoiceResult(generation, voiceSession, voiceAccount))
-                                    Toast.makeText(activity, message, Toast.LENGTH_LONG).show();
-                            }
-                        });
-                } else {
-                    file.delete();
-                    if (currentVoiceResult(generation, voiceSession, voiceAccount))
-                        Toast.makeText(activity, "没有识别到文字", Toast.LENGTH_LONG).show();
-                }
+                file.delete();
+                closeTranscription(capture);
+                if (canApplyVoiceResult(generation, voiceSession, voiceAccount, draftRevision))
+                    Toast.makeText(activity, "没有识别到文字", Toast.LENGTH_LONG).show();
             }
             @Override public void failed() {
                 if (!currentVoiceResult(generation, voiceSession, voiceAccount)) return;
+                closeTranscription(capture);
+                voiceRecording = false; cancelVoice = false; voicePartialText = "";
+                voiceHoldButton.setText("按住转文字");
+                voiceHoldButton.setVisibility(voiceMode ? VISIBLE : GONE);
                 updateHostVoiceOverlay(false, "");
-                Toast.makeText(activity, "语音转文字失败", Toast.LENGTH_LONG).show();
+                if (voiceResultGuard.accepts(draftRevision, true))
+                    Toast.makeText(activity, "语音转文字失败", Toast.LENGTH_LONG).show();
             }
         }, ticketProvider);
         if (!started) {
             Toast.makeText(activity, "麦克风正在被其他录音使用", Toast.LENGTH_LONG).show();
-            return;
+            return false;
         }
         voiceRecording = true; cancelVoice = false; voicePartialText = "";
-        voiceHoldButton.setText("正在听，请说话…");
-        updateHostVoiceOverlay(true, "");
+        voiceHoldButton.setText("按住转文字");
+        transcription = capture; transcriptionOverlay = overlay;
+        // 编辑器保持挂载，唯一转写反馈附在 decor，底部不再显示第二条实时文字。
+        overlay.show();
+        updateHostVoiceOverlay(false, "");
+        return true;
     }
     // 回调属于录音开始时的账号和创作会话，不能覆盖切换后的草稿或主动发送。
     private boolean currentVoiceResult(int generation, String voiceSession, String voiceAccount) {
         return generation == voiceGeneration && visibleToUser && selected.equals(voiceSession)
             && voiceAccount.equals(MaiChatAuthClient.shared(activity).accountId());
     }
-    private void finishVoice(boolean cancel) {
-        if (!voiceRecording) return;
-        voiceRecording = false; cancelVoice = false; voicePartialText = "";
+    private boolean canApplyVoiceResult(int generation, String voiceSession, String voiceAccount, long revision) {
+        return currentVoiceResult(generation, voiceSession, voiceAccount)
+            && voiceResultGuard.accepts(revision, state != null && state.ready && !state.busy()
+                && !submitting && !navigationPending);
+    }
+    private void finishTranscription(VoiceTranscriptionResult capture, VoiceTranscriptionOverlay.Action action) {
+        if (capture == null || capture != transcription || !capture.release(action)) return;
+        if (action == VoiceTranscriptionOverlay.Action.CANCEL) { invalidateVoiceTranscription(); return; }
+        voiceRecording = false;
+        transcriptionOverlay.finishing(action);
+        voiceRecorder.finish(false);
+    }
+    private void deliverTranscription(VoiceTranscriptionResult capture, VoiceTranscriptionOverlay overlay,
+                                      int generation, String voiceSession, String voiceAccount,
+                                      long revision, String text) {
+        boolean current = capture == transcription && canApplyVoiceResult(generation, voiceSession, voiceAccount, revision);
+        VoiceTranscriptionOverlay.Action action = capture.finalAction(text, current);
+        if (action == null) { closeTranscription(capture); return; }
+        String finalText = text.trim();
+        overlay.updateText(finalText);
+        postDelayed(() -> {
+            if (capture != transcription || !canApplyVoiceResult(generation, voiceSession, voiceAccount, revision)) {
+                closeTranscription(capture); return;
+            }
+            closeTranscription(capture);
+            voiceResultGuard.writeTranscript(() -> composer.setText(finalText));
+            if (action == VoiceTranscriptionOverlay.Action.EDIT) {
+                if (voiceMode) setVoiceMode(false);
+                composer.requestFocus(); composer.setSelection(composer.length());
+                ((android.view.inputmethod.InputMethodManager) activity.getSystemService(Context.INPUT_METHOD_SERVICE))
+                    .showSoftInput(composer, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+            } else send();
+        }, 240);
+    }
+    private void closeTranscription(VoiceTranscriptionResult capture) {
+        if (capture != transcription) return;
+        if (transcriptionOverlay != null) transcriptionOverlay.dismiss();
+        transcriptionOverlay = null; transcription = null;
+        voicePartialText = "";
         voiceHoldButton.setText("按住转文字");
+        voiceHoldButton.setVisibility(voiceMode ? VISIBLE : GONE);
         updateHostVoiceOverlay(false, "");
-        if (cancel) {
-            voiceGeneration++;
-            composer.setText("");
+    }
+    private void invalidateVoiceTranscription() {
+        voiceGeneration++;
+        if (transcription != null) {
+            transcription.invalidate(); closeTranscription(transcription);
         }
-        voiceRecorder.finish(cancel);
+        if (voiceRecording && voiceRecorder != null) voiceRecorder.finish(true);
+        voiceRecording = false; cancelVoice = false; voicePartialText = "";
     }
     private void updateHostVoiceOverlay(boolean active, String text) {
         if (activity instanceof MainActivity)
@@ -2032,6 +2112,114 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 Toast.LENGTH_LONG).show();
         });
     }
+    // 欢迎目录与 iOS 使用相同的能力顺序；卡片只填草稿，由用户补充要求后发送。
+    private LinearLayout welcomeContent() {
+        LinearLayout welcome = column();
+        welcome.setTag("ai-welcome");
+        welcome.setGravity(Gravity.CENTER_HORIZONTAL);
+        welcome.setPadding(0, dp(26), 0, dp(26));
+        ImageView sparkles = new ImageView(activity);
+        sparkles.setImageResource(R.drawable.ic_ai_sparkles);
+        sparkles.setColorFilter(MaiChatTheme.BLUE);
+        sparkles.setPadding(dp(12), dp(12), dp(12), dp(12));
+        sparkles.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE_SOFT, 15, activity));
+        sparkles.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+        welcome.addView(sparkles, new LayoutParams(dp(48), dp(48)));
+        TextView heading = text("从这里开始创作", 25, MaiChatTheme.TEXT);
+        heading.setTypeface(MaiChatTypography.semibold());
+        heading.setGravity(Gravity.CENTER);
+        LayoutParams headingParams = matchWrap();
+        headingParams.topMargin = dp(18);
+        welcome.addView(heading, headingParams);
+
+        LinearLayout grid = column();
+        AIAssistantWelcomeFeature[] features = AIAssistantWelcomeFeature.values();
+        for (int index = 0; index < features.length; index += 2) {
+            LinearLayout line = row();
+            line.setGravity(Gravity.CENTER_VERTICAL);
+            line.setBaselineAligned(false);
+            line.addView(welcomeFeature(features[index]),
+                new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
+            View gap = new View(activity);
+            line.addView(gap, new LayoutParams(dp(10), 1));
+            View right = index + 1 < features.length
+                ? welcomeFeature(features[index + 1]) : new View(activity);
+            line.addView(right, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
+            LayoutParams lineParams = matchWrap();
+            if (index > 0) lineParams.topMargin = dp(10);
+            grid.addView(line, lineParams);
+        }
+        LayoutParams gridParams = matchWrap();
+        gridParams.topMargin = dp(28);
+        welcome.addView(grid, gridParams);
+        if (state != null && !state.data.optBoolean("configured")) {
+            TextView accountHint = text("登录后会自动连接主聊天模型", 13,
+                MaiChatTheme.SECONDARY);
+            accountHint.setGravity(Gravity.CENTER);
+            LayoutParams hintParams = matchWrap();
+            hintParams.topMargin = dp(18);
+            welcome.addView(accountHint, hintParams);
+            Button retry = button("重试连接", "重试连接", v -> retryMainModelConnection());
+            retry.setTextColor(Color.WHITE);
+            retry.setTextSize(14);
+            retry.setTypeface(MaiChatTypography.semibold());
+            retry.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE, 10, activity));
+            LayoutParams retryParams = new LayoutParams(dp(104), dp(38));
+            retryParams.topMargin = dp(10);
+            welcome.addView(retry, retryParams);
+        }
+        return welcome;
+    }
+    private View welcomeFeature(AIAssistantWelcomeFeature feature) {
+        LinearLayout card = row();
+        card.setTag("ai-welcome-" + feature.name().toLowerCase(Locale.ROOT));
+        card.setGravity(Gravity.CENTER);
+        card.setMinimumHeight(dp(54));
+        card.setPadding(dp(10), dp(12), dp(10), dp(12));
+        card.setBackground(MaiChatTheme.bordered(Color.WHITE, Color.rgb(234, 240, 247), 13, activity));
+        // 能力卡片仅介绍创作中心，不承担输入或导航操作。
+        card.setContentDescription(feature.title);
+        card.setClickable(false);
+        card.setFocusable(false);
+        ImageView icon = new ImageView(activity);
+        icon.setImageResource(welcomeFeatureIcon(feature));
+        icon.setColorFilter(MaiChatTheme.BLUE);
+        icon.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+        card.addView(icon, new LayoutParams(dp(22), dp(22)));
+        TextView label = text(feature.title, 16, MaiChatTheme.TEXT);
+        label.setTypeface(MaiChatTypography.semibold());
+        // 保留完整标题，字体或窄屏导致空间不足时增加卡片高度，不省略能力名称。
+        label.setSingleLine(false);
+        label.setGravity(Gravity.CENTER_VERTICAL);
+        LayoutParams labelParams = new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
+        labelParams.setMarginStart(dp(10));
+        card.addView(label, labelParams);
+        return card;
+    }
+    private int welcomeFeatureIcon(AIAssistantWelcomeFeature feature) {
+        switch (feature) {
+            case ASK: return R.drawable.ic_feature_ask;
+            case IMAGE: return R.drawable.ic_feature_image;
+            case VIDEO: return R.drawable.ic_feature_video;
+            case FILE: return R.drawable.ic_feature_file;
+            case SCREEN: return R.drawable.ic_feature_screen;
+            case BROWSER: return R.drawable.ic_feature_browser;
+            case SCHEDULE: return R.drawable.ic_feature_schedule;
+            case CALENDAR: return R.drawable.ic_feature_calendar;
+            case QR: return R.drawable.ic_feature_qr;
+            case LOCATION: return R.drawable.ic_feature_location;
+            case MEDIA: return R.drawable.ic_feature_media;
+            case CAMERA: return R.drawable.ic_feature_camera;
+            case MUSIC: return R.drawable.ic_feature_music;
+            case GALLERY: return R.drawable.ic_feature_gallery;
+            case DRIVE: return R.drawable.ic_feature_drive;
+            case MESSAGES: return R.drawable.ic_feature_messages;
+            case CONTACTS: return R.drawable.ic_feature_contacts;
+            case PHONE: return R.drawable.ic_feature_phone;
+            case DEVICES: return R.drawable.ic_feature_devices;
+            default: throw new IllegalArgumentException("Unknown welcome capability");
+        }
+    }
     private void details(String title, String source) {
         TextView view = text(source, 12, MaiChatTheme.TEXT);
         view.setTextIsSelectable(true);
@@ -2102,53 +2290,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     status = null;
                     toolSummary = null;
                     toolDetails = null;
-                    setGravity(Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-                    LinearLayout welcome = column();
-                    welcome.setGravity(Gravity.CENTER_HORIZONTAL);
-                    welcome.setPadding(0, dp(70), 0, dp(70));
-                    ImageView sparkles = new ImageView(activity);
-                    sparkles.setImageResource(R.drawable.ic_ai_sparkles);
-                    sparkles.setContentDescription("创作中心");
-                    welcome.addView(sparkles, new LayoutParams(dp(40), dp(40)));
-                    TextView heading = text("有什么可以帮你？", 22, MaiChatTheme.TEXT);
-                    heading.setTypeface(MaiChatTypography.semibold());
-                    heading.setGravity(Gravity.CENTER);
-                    LayoutParams headingParams = matchWrap();
-                    headingParams.setMargins(0, dp(14), 0, 0);
-                    welcome.addView(heading, headingParams);
-                    TextView detail = text("问答、图片视频、文件、拍照、相册、音乐、云盘与 MaiChat 消息。", 16,
-                        MaiChatTheme.SECONDARY);
-                    detail.setGravity(Gravity.CENTER);
-                    LayoutParams detailParams = matchWrap();
-                    detailParams.setMargins(0, dp(12), 0, 0);
-                    welcome.addView(detail, detailParams);
-                    // 空态仅介绍能力，处理和训练继续从用户会话需求进入。
-                    TextView mobileTools = text(
-                        "整屏截屏、浏览器操作、会话定时任务、系统日历、二维码生成、当前位置、系统联系人、"
-                            + "电话短信（依系统权限）、人像美颜、美体塑形、个人模型训练、账号资料与头像、跨设备会话。",
-                        14, MaiChatTheme.SECONDARY);
-                    mobileTools.setGravity(Gravity.CENTER);
-                    LayoutParams mobileToolParams = matchWrap();
-                    mobileToolParams.setMargins(0, dp(8), 0, 0);
-                    welcome.addView(mobileTools, mobileToolParams);
-                    if (state != null && !state.data.optBoolean("configured")) {
-                        TextView accountHint = text("登录后会自动连接主聊天模型", 13,
-                            MaiChatTheme.SECONDARY);
-                        accountHint.setGravity(Gravity.CENTER);
-                        LayoutParams hintParams = matchWrap();
-                        hintParams.setMargins(0, dp(14), 0, 0);
-                        welcome.addView(accountHint, hintParams);
-                        Button retry = button("重试连接", "重试连接",
-                            v -> retryMainModelConnection());
-                        retry.setTextColor(Color.WHITE);
-                        retry.setTextSize(14);
-                        retry.setTypeface(MaiChatTypography.semibold());
-                        retry.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE, 10, activity));
-                        LayoutParams retryParams = new LayoutParams(dp(104), dp(38));
-                        retryParams.setMargins(0, dp(16), 0, 0);
-                        welcome.addView(retry, retryParams);
-                    }
-                    addView(welcome, matchWrap());
+                    setGravity(Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+                    addView(welcomeContent(), matchWrap());
                 }
                 return;
             }
@@ -3029,10 +3172,10 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private ImageButton headerIcon(int drawable, String description, OnClickListener action) {
         ImageButton button = new ImageButton(activity);
         button.setImageResource(drawable);
-        button.setColorFilter(MaiChatTheme.TEXT);
+        button.setColorFilter(Color.BLACK);
         button.setScaleType(ImageView.ScaleType.CENTER);
-        button.setPadding(dp(8), dp(8), dp(8), dp(8));
-        button.setBackground(MaiChatTheme.rounded(Color.rgb(246, 247, 250), 10, activity));
+        button.setPadding(dp(10), dp(10), dp(10), dp(10));
+        button.setBackground(MaiChatTheme.rounded(Color.rgb(242, 242, 247), 12, activity));
         button.setContentDescription(description);
         button.setOnClickListener(action);
         return button;

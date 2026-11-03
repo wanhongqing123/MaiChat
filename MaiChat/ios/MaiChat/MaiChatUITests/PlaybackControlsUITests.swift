@@ -33,7 +33,7 @@ final class PlaybackControlsUITests: XCTestCase {
         app.buttons["ffplay-close"].tap()
     }
 
-    @MainActor func testExpandedNormalAppPlayerHidesControlsAndWakesWithoutClosing() throws {
+    @MainActor func testFullScreenNormalAppPlayerHidesControlsAndWakesWithoutClosing() throws {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--ai-ui-test", "--ai-image-mixed-ui-test"]
@@ -42,19 +42,17 @@ final class PlaybackControlsUITests: XCTestCase {
         defer { app.terminate() }
         let video = app.images["ffplay-video-surface"]
         XCTAssertTrue(video.waitForExistence(timeout: 20))
-        let expand = app.buttons["ffplay-expand"]
-        XCTAssertTrue(expand.waitForExistence(timeout: 5))
-        expand.tap()
-        XCTAssertEqual(expand.label, "返回分屏")
+        XCTAssertFalse(app.buttons["ffplay-expand"].exists)
+        XCTAssertFalse(app.buttons["创作中心"].isHittable)
         waitForHidden(app.buttons["ffplay-pause"])
         XCTAssertTrue(video.exists, "隐藏控件不能关闭或替换当前视频")
         capture(app, "ios-normal-app-fullscreen-controls-hidden")
         video.tap()
         XCTAssertTrue(app.buttons["ffplay-pause"].waitForExistence(timeout: 3))
-        expand.tap()
-        XCTAssertEqual(expand.label, "放大视频")
         XCTAssertTrue(video.exists)
         app.buttons["ffplay-close"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: video)], timeout: 5), .completed)
     }
 
     @MainActor private func waitForHidden(_ control: XCUIElement) {

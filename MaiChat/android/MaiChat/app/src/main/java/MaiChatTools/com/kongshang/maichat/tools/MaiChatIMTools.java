@@ -61,6 +61,8 @@ final class MaiChatIMTools {
         switch (tool) {
             // 密码不经过宿主 JSON：只打开与设置页共用的表单，或读原账号绑定的状态。
             case "maichat_change_password": return activity.passwordChangeRequestForAgent(arguments);
+            case "maichat_request_account_deletion": return hostRequestAccountDeletion(arguments);
+            case "maichat_list_safety_reports": return hostListSafetyReports(arguments);
             case "maichat_list_contacts": return hostListContacts(arguments);
             case "maichat_request_friend": return hostRequestFriend(arguments);
             case "maichat_set_nickname": return hostSetNickname(arguments);
@@ -79,6 +81,26 @@ final class MaiChatIMTools {
             case "maichat_send_group_text": return hostSendGroupText(arguments);
             default: throw new IllegalArgumentException("未知 MaiChat 宿主工具：" + tool);
         }
+    }
+
+    private JSONObject hostRequestAccountDeletion(JSONObject arguments) throws Exception {
+        requireNoArguments(arguments);
+        if (Looper.myLooper() != Looper.getMainLooper())
+            throw new IllegalStateException("注销账号表单须在界面线程打开");
+        // 只打开与设置页相同的安全表单，不接收或返回密码、验证码和校验回执。
+        return activity.openAccountDeletionForAgent();
+    }
+
+    private JSONObject hostListSafetyReports(JSONObject arguments) throws Exception {
+        requireNoArguments(arguments);
+        if (Looper.myLooper() == Looper.getMainLooper())
+            throw new IllegalStateException("安全报告不能阻塞界面线程");
+        return activity.safetyReportsForAgent();
+    }
+
+    private static void requireNoArguments(JSONObject arguments) {
+        if (arguments == null || arguments.length() != 0)
+            throw new IllegalArgumentException("此工具不接受参数");
     }
 
     void onDestroy() { avatarRequests.cancelAll(); }
@@ -226,8 +248,9 @@ final class MaiChatIMTools {
 
     static File avatarWorkspaceFile(String path, String workspace) throws IOException {
         File input = new File(path);
-        File root = new File(workspace).getCanonicalFile();
-        File source = input.getCanonicalFile();
+        // canonicalFile 在 Windows 不保证解析符号链接；按实际文件归属判断，允许根内链接。
+        File root = new File(workspace).toPath().toRealPath().toFile();
+        File source = input.toPath().toRealPath().toFile();
         if (!input.isAbsolute() || !source.toPath().startsWith(root.toPath()) ||
                 !source.isFile() || !source.canRead())
             throw new IOException("头像必须是当前会话工作区内可读取的图片");

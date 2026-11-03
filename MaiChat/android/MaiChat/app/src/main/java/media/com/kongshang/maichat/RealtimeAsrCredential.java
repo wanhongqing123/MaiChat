@@ -1,4 +1,4 @@
-// 文件作用：校验内存中的 ASR STS 临时凭据，并按腾讯 V2 协议为每次录音独立签名。
+// 文件作用：校验内存 ASR STS 临时凭据，并为普通 16k_zh 每次录音独立签名。
 // SecretKey 和 token 不落盘、不进 URL/日志；token 由传输层放入固定 X-TC-Token 头。
 package com.kongshang.maichat;
 
@@ -56,12 +56,11 @@ final class RealtimeAsrCredential {
             throw new IOException("语音识别临时凭据或录音标识无效");
         long expired = Math.min(now + 300, expiresAt);
         TreeMap<String, String> parameters = new TreeMap<>();
-        parameters.put("engine_model_type", "16k_zh_en_2.0");
+        // 与 iOS 正式路径相同的普通引擎；大模型计费项和 result_mod 不属于此协议。
+        parameters.put("engine_model_type", "16k_zh");
         parameters.put("expired", Long.toString(expired));
         parameters.put("needvad", "1");
         parameters.put("nonce", Long.toString(nonce));
-        // 官方 V2 SDK 固定句子结果模式；不启用说话人分离等附加能力。
-        parameters.put("result_mod", "1");
         parameters.put("secretid", secretId);
         parameters.put("timestamp", Long.toString(now));
         parameters.put("voice_format", "16");

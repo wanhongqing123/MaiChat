@@ -1,4 +1,4 @@
-// 文件作用：用固定 STS 凭据/时钟及独立 HMAC 结果验证 V2 本地签名和五字段合同。
+// 文件作用：用固定 STS 凭据/时钟及独立 HMAC 验证普通 16k_zh 签名与五字段合同。
 // 所有凭据均为公开测试数据，不访问真实账号或腾讯服务。
 package com.kongshang.maichat;
 
@@ -25,11 +25,12 @@ public final class RealtimeAsrTicketTest {
     @Test public void signatureMatchesIndependentHmacAndTokenStaysOutOfUrl() throws Exception {
         RealtimeAsrCredential credential = RealtimeAsrCredential.parse(fixture(NOW), NOW);
         MaiChatAuthClient.RealtimeAsrTicket ticket = credential.sign(NOW, VOICE, 9);
-        // 预期值由 Python hmac/hashlib 独立生成，覆盖参数顺序以及 Base64 的 /、+、= 编码。
+        // 预期值由独立 .NET HMACSHA1 生成，覆盖普通引擎参数与签名转义。
         assertEquals("wss://asr.cloud.tencent.com/asr/v2/1259220000?"
-            + "engine_model_type=16k_zh_en_2.0&expired=1780000300&needvad=1&nonce=9&result_mod=1"
+            + "engine_model_type=16k_zh&expired=1780000300&needvad=1&nonce=9"
             + "&secretid=AKIDTempFixture123&timestamp=1780000000&voice_format=16&voice_id=" + VOICE
-            + "&signature=%2FP5sxVeA7ghE4Q%2Bull1FxrqhaSE%3D", ticket.url);
+            + "&signature=%2FeqPxpLmiDpZ2xlgt0y00URHZ48%3D", ticket.url);
+        assertFalse(ticket.url.contains("result_mod="));
         assertEquals(TOKEN, ticket.token);
         assertFalse(ticket.url.contains(TOKEN));
         assertFalse(ticket.url.contains("token="));
@@ -61,17 +62,17 @@ public final class RealtimeAsrTicketTest {
             assertEquals(2, pair.length);
             assertNull(decoded.put(pair[0], URLDecoder.decode(pair[1], "UTF-8")));
         }
-        assertEquals(10, decoded.size());
+        assertEquals(9, decoded.size());
         assertEquals(opaqueId, decoded.get("secretid"));
-        // 独立 Python HMAC fixture 对原始不透明 ID 签名，不能对 percent 编码后的值签名。
-        assertEquals("sp4A5MkguMyBjd40ccICXr/C/Vc=", decoded.remove("signature"));
+        // 独立 .NET HMAC fixture 对原始不透明 ID 签名，不能对 percent 编码后的值签名。
+        assertEquals("28eXQ2dMWUwodYuT6oR3Lj0tris=", decoded.remove("signature"));
         StringBuilder canonical = new StringBuilder(endpoint.getHost()).append(endpoint.getPath()).append('?');
         for (Map.Entry<String, String> field : decoded.entrySet()) {
             if (canonical.charAt(canonical.length() - 1) != '?') canonical.append('&');
             canonical.append(field.getKey()).append('=').append(field.getValue());
         }
-        assertEquals("asr.cloud.tencent.com/asr/v2/1259220000?engine_model_type=16k_zh_en_2.0"
-            + "&expired=1780000300&needvad=1&nonce=9&result_mod=1&secretid=" + opaqueId
+        assertEquals("asr.cloud.tencent.com/asr/v2/1259220000?engine_model_type=16k_zh"
+            + "&expired=1780000300&needvad=1&nonce=9&secretid=" + opaqueId
             + "&timestamp=1780000000&voice_format=16&voice_id=" + VOICE, canonical.toString());
     }
 

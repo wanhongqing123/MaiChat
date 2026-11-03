@@ -93,6 +93,7 @@ public final class RemoteIMSessionController {
     }
 
     private final LocalSettingsStore settingsStore;
+    private final Context appContext;
     private final MaiChatAuthClient authClient;
     private final LocalChatHistoryStore legacyHistoryStore;
     private final AndroidChatHistoryStore historyStore;
@@ -106,6 +107,7 @@ public final class RemoteIMSessionController {
     private final Map<String, Boolean> hasEarlierByUserId = new HashMap<>();
     private final Map<String, Long> oldestLoadedCreatedAtByUserId = new HashMap<>();
     private final Map<String, String> oldestLoadedMessageIdByUserId = new HashMap<>();
+    private final RemoteIMSelfProfileState selfProfileState = new RemoteIMSelfProfileState();
     private final boolean productionMode;
 
     private volatile RemoteIMSettings settings;
@@ -114,6 +116,7 @@ public final class RemoteIMSessionController {
     private volatile boolean destroyed;
     // 密码等账号绑定写入也会在 worker 开始前检查代际，切号必须对该线程立即可见。
     private volatile int accountGeneration;
+    private volatile MaiChatAcceptedAccountCleanup.Pending acceptedAccountDeletion;
     private final java.util.Set<AccountRequest> accountRequests = new java.util.HashSet<>();
     // 由主线程保留到 SDK 回执或超时；上传 worker 返回不代表头像资料写入已经结束。
     private AccountRequest avatarRequest;
@@ -195,6 +198,7 @@ public final class RemoteIMSessionController {
         LocalChatHistoryStore historyStore
     ) {
         this.settingsStore = settingsStore;
+        this.appContext = null;
         this.authClient = null;
         this.legacyHistoryStore = historyStore;
         this.historyStore = null;
@@ -211,6 +215,7 @@ public final class RemoteIMSessionController {
 
     public RemoteIMSessionController(Context context, Listener listener) {
         Context applicationContext = context.getApplicationContext();
+        this.appContext = applicationContext;
         this.settingsStore = new LocalSettingsStore(
             new java.io.File(applicationContext.getFilesDir(), "remote-im-settings/settings.properties")
         );
@@ -245,6 +250,16 @@ public final class RemoteIMSessionController {
         restoringAccount = true;
         int generation = ++accountGeneration;
         enqueueIO(() -> {
+            List<MaiChatAcceptedAccountCleanup.Pending> pendingDeletions;
+            try { pendingDeletions = MaiChatAcceptedAccountCleanup.pending(appContext.getNoBackupFilesDir()); }
+            catch (Exception invalidCleanupRecord) { pendingDeletions = Collections.emptyList(); }
+            // 已受理账号在恢复登录前离线清 token；另一个账号的设置和认证不能受影响。
+            RemoteIMSettings cachedBeforeRestore = loadSettings();
+            for (MaiChatAcceptedAccountCleanup.Pending pending : pendingDeletions)
+                if (pending.owner.equals(cachedBeforeRestore.loginUserId()) && pending.account.equals(authClient.accountId())) {
+                    authClient.discardLocalSession(); settingsStore.save(RemoteIMSettings.empty());
+                }
+            List<MaiChatAcceptedAccountCleanup.Pending> cleanupAfterPresentation = pendingDeletions;
             // 旧版只存 IM UserID 的设置不能代表已验证手机号；以服务端会话为准。
             RemoteIMSettings restoredSettings = RemoteIMSettings.empty();
             if (authClient.hasSession()) {
@@ -271,6 +286,9 @@ public final class RemoteIMSessionController {
                 notifyStateChanged();
                 if (!requiresLogin()) connect();
                 scheduleSessionValidation();
+                // 大目录和 SQLite 清理排在页面恢复之后，不延迟登录页展示。
+                for (MaiChatAcceptedAccountCleanup.Pending pending : cleanupAfterPresentation)
+                    ioExecutor.execute(() -> cleanAcceptedAccount(pending, null));
             });
         });
     }
@@ -314,6 +332,9 @@ public final class RemoteIMSessionController {
         friendDisplayByIm.clear();
         friendRequestIdByIm.clear();
         chatState = new ChatState(next.requiresLogin() ? FALLBACK_OWNER_USER_ID : next.loginUserId());
+        selfProfileState.activate(chatState.ownerUserId(), nickname());
+        // 同号重新登录也属于新代际，与公开头像缓存一起清除旧资料。
+        selfProfileState.accept(new RemoteIMContact(chatState.ownerUserId(), nickname(), ""));
         unreadByUserId.clear(); presenceByUserId.clear(); hasEarlierByUserId.clear();
         oldestLoadedCreatedAtByUserId.clear(); oldestLoadedMessageIdByUserId.clear();
         loadingPeers.clear(); pageRequests.clear(); peerEpochs.clear(); pendingVideoMedia.clear(); mediaRevision++;
@@ -425,6 +446,39 @@ public final class RemoteIMSessionController {
 
     public String nickname() {
         return productionMode ? authClient.nickname() : "";
+    }
+
+    /** 本人身份使用 IM owner；账号昵称优先，头像未取得时由现有头像控件回退。 */
+    public RemoteIMContact selfProfile() {
+        selfProfileState.activate(chatState.ownerUserId(), nickname());
+        return selfProfileState.current();
+    }
+
+    /** Picker, crop UI and host tools bind the whole operation to this login generation. */
+    public String avatarChangeIdentity() {
+        return destroyed || !productionMode || requiresLogin() ? ""
+            : accountId() + "|" + accountGeneration + "|" + authClient.accountSessionGeneration()
+                + "|" + chatState.ownerUserId();
+    }
+    public boolean isAvatarChangeIdentityCurrent(String expectedIdentity) {
+        return expectedIdentity != null && !expectedIdentity.isEmpty()
+            && expectedIdentity.equals(avatarChangeIdentity());
+    }
+    /** 普通照片选择只适配正式账号事务，和工具共用上传、SDK 确认及并发门禁。 */
+    public void uploadSelfAvatar(java.io.File image, String expectedIdentity, AccountCompletion completion) {
+        if (mainHandler != null && Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post(() -> uploadSelfAvatar(image, expectedIdentity, completion)); return;
+        }
+        if (!isAvatarChangeIdentityCurrent(expectedIdentity)) {
+            runAvatarCompletion(() -> completion.onFinished("登录账号已变化，请重新选择头像")); return;
+        }
+        setSelfAvatar(image, () -> isAvatarChangeIdentityCurrent(expectedIdentity),
+            (url, error) -> runAvatarCompletion(() -> completion.onFinished(error)));
+    }
+    private void runAvatarCompletion(Runnable action) {
+        // 即使 Activity/Session 已销毁也交付清理回调；current 仍阻止资料安装和 SDK 写入。
+        if (mainHandler == null || Looper.myLooper() == Looper.getMainLooper()) action.run();
+        else mainHandler.post(action);
     }
 
     private interface AccountFailure { void fail(String message); }
@@ -643,7 +697,7 @@ public final class RemoteIMSessionController {
                         new TencentIMClient.OperationCompletion() {
                             @Override public void onSuccess() {
                                 request.confirmAvatar(() -> {
-                                    selfAvatarUrl = confirmedUrl;
+                                    installSelfProfile(request.imUser, selfProfile().displayName(), confirmedUrl);
                                     notifyStateChanged();
                                     completion.onFinished(confirmedUrl, null);
                                 });
@@ -676,6 +730,14 @@ public final class RemoteIMSessionController {
                 return MaiAccountAvatar.upload(access, accountId, jpeg, upload);
             } finally { uploadScope.accept(null); }
         }
+    }
+
+    private void installSelfProfile(String owner, String displayName, String avatarUrl) {
+        selfAvatarUrl = avatarUrl;
+        selfProfileState.activate(owner, nickname());
+        selfProfileState.accept(new RemoteIMContact(owner, displayName, avatarUrl));
+        if (connectionState == TencentIMClient.ConnectionState.CONNECTED)
+            AvatarImageLoader.prefetch(avatarUrl);
     }
 
     /** 安全表单绑定账号和本次登录代际；同账号重新登录也不得沿用旧密码页。 */
@@ -1247,6 +1309,7 @@ public final class RemoteIMSessionController {
         settingsStore.save(settings);
         chatState = loadLegacyChatState();
         unreadByUserId.clear();
+        selfProfileState.activate(chatState.ownerUserId(), nickname());
         presenceByUserId.clear();
         hasEarlierByUserId.clear();
         oldestLoadedCreatedAtByUserId.clear();
@@ -1257,6 +1320,44 @@ public final class RemoteIMSessionController {
             ensureDefaultContactIfNeeded();
         }
         notifyStateChanged();
+    }
+
+    /** 仅由本地安全表单收到有效 202 回执后调用，固定原 IM owner 与认证代际。worker 调用。 */
+    void rememberAcceptedAccountDeletion(String owner, String account, String authIdentity, String requestId) throws Exception {
+        if (!productionMode || appContext == null) throw new IOException("Account deletion requires a production account");
+        acceptedAccountDeletion = new MaiChatAcceptedAccountCleanup.Pending(owner, account, authIdentity, requestId);
+        MaiChatAcceptedAccountCleanup.markPending(appContext.getNoBackupFilesDir(), owner, account, authIdentity, requestId);
+    }
+
+    /** 正常 UI 确认回执后的异步离线退出；不发送已失效账号 token 的远端 logout。 */
+    public void completeAcceptedAccountDeletion() {
+        MaiChatAcceptedAccountCleanup.Pending accepted = acceptedAccountDeletion;
+        if (!productionMode || destroyed || accepted == null) return;
+        acceptedAccountDeletion = null;
+        java.util.concurrent.CompletableFuture<Void> agentStopped = AIAssistantController.stopForAcceptedAccountDeletion(accepted.owner);
+        if (accepted.owner.equals(chatState.ownerUserId()) && !requiresLogin()) switchAccount(RemoteIMSettings.empty());
+        // Auth 清理和所有文件/数据库 I/O 都在原串行 worker；新登录不能越过该队列。
+        ioExecutor.execute(() -> {
+            authClient.discardAcceptedAccountSession(accepted.account, accepted.authIdentity);
+            cleanAcceptedAccount(accepted, agentStopped);
+        });
+        notifyStateChanged();
+    }
+
+    private void cleanAcceptedAccount(MaiChatAcceptedAccountCleanup.Pending accepted,
+                                     java.util.concurrent.CompletableFuture<Void> stopped) {
+        try {
+            MaiChatAcceptedAccountCleanup.markPending(appContext.getNoBackupFilesDir(), accepted.owner,
+                accepted.account, accepted.authIdentity, accepted.requestId);
+            java.util.concurrent.CompletableFuture<Void> barrier = stopped == null
+                ? AIAssistantController.stopForAcceptedAccountDeletion(accepted.owner) : stopped;
+            barrier.get(35, java.util.concurrent.TimeUnit.SECONDS);
+            historyStore.purgeAcceptedAccount(accepted.owner);
+            MaiChatAcceptedAccountCleanup.removeWorkspace(appContext.getNoBackupFilesDir(), accepted.owner);
+            MaiChatAcceptedAccountCleanup.finishPending(appContext.getNoBackupFilesDir(), accepted);
+        } catch (Exception failure) {
+            runOnMain(() -> { if (requiresLogin()) reportError("本机账号数据清理未完成；已保存的清理记录将在下次启动重试。"); });
+        }
     }
 
     public void logout() throws IOException {
@@ -1284,6 +1385,7 @@ public final class RemoteIMSessionController {
         } else {
             chatState = loadLegacyChatState();
         }
+        selfProfileState.activate(chatState.ownerUserId(), nickname());
         notifyStateChanged();
     }
 
@@ -2186,9 +2288,10 @@ public final class RemoteIMSessionController {
     }
 
     private void refreshContactMetadata() {
-        if (!productionMode || chatState.contacts().isEmpty()) return;
+        if (!productionMode || requiresLogin()) return;
         List<String> userIds = new ArrayList<>();
         for (RemoteIMContact contact : chatState.contacts()) userIds.add(contact.userId());
+        // 本人由 CONNECTED 的独立 getSelfProfile 加载；好友刷新不重复查询本人。
         refreshContactMetadata(userIds);
     }
 
@@ -2460,8 +2563,9 @@ public final class RemoteIMSessionController {
             final int generation = accountGeneration;
             runOnMain(() -> {
                 if (generation != accountGeneration || requiresLogin() ||
-                        !settings.loginUserId().equals(profile.imUserId)) return;
-                selfAvatarUrl = profile.avatarUrl;
+                        !settings.loginUserId().equals(profile.imUserId) ||
+                        !client.isSelfProfileReadCurrent(profile)) return;
+                installSelfProfile(profile.imUserId, profile.nickname, profile.avatarUrl);
                 notifyStateChanged();
             });
         }
@@ -2567,11 +2671,28 @@ public final class RemoteIMSessionController {
 
         @Override
         public void onProfilesUpdated(List<RemoteIMContact> contacts) {
-            final int generation = accountGeneration;
+            onProfilesUpdated(contacts, client == null ? -1 : client.selfProfileReadRevision());
+        }
+
+        @Override
+        public void onProfilesUpdated(List<RemoteIMContact> contacts, long selfRevision) {
+            int generation = accountGeneration;
+            String owner = chatState.ownerUserId();
             runOnMain(() -> {
-                if (generation != accountGeneration || requiresLogin()) return;
+                // SDK 已核对请求所属账号；这里还要拒绝排队期间发生切号的回调。
+                if (destroyed || requiresLogin() || generation != accountGeneration
+                    || !owner.equals(chatState.ownerUserId())) return;
+                selfProfileState.activate(owner, nickname());
                 for (RemoteIMContact contact : contacts) {
-                    if (settings.loginUserId().equals(contact.userId())) continue;
+                    // SDK 回调排队到 main 期间也可能完成头像写入，故应用前再次核对读代际。
+                    if (contact != null && owner.equals(contact.userId()) && client != null
+                        && !client.isSelfProfileReadRevisionCurrent(selfRevision)) continue;
+                    if (contact != null && owner.equals(contact.userId())) {
+                        installSelfProfile(owner, contact.displayName(), contact.avatarUrl());
+                        continue;
+                    }
+                    // 资料只更新现有好友，不把旧账号本人或失效查询结果变成新联系人。
+                    if (contact == null || !contactExists(contact.userId())) continue;
                     chatState.upsertContact(contact);
                     String accountName = friendDisplayByIm.get(contact.userId());
                     RemoteIMContact current = accountName == null ? contact :

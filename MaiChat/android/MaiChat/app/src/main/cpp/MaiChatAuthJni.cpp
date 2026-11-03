@@ -264,6 +264,23 @@ std::string proxyUrl(const std::string& host, jint port, jint type) {
     return url;
 }
 
+// 同步传输期间 JVM 线程不改变，局部引用保持有效；代际失效立即中止网络 I/O。
+struct RequestCancellation {
+    JNIEnv* env;
+    jobject current;
+    jmethodID getAsBoolean;
+
+    bool isCurrent() const {
+        const jboolean valid = env->CallBooleanMethod(current, getAsBoolean);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+        return valid == JNI_TRUE;
+    }
+};
+
+int checkTransferCurrent(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    return static_cast<RequestCancellation*>(opaque)->isCurrent() ? 0 : 1;
+}
+
 struct RequestOptions {
     size_t responseLimit = kMaxBodyBytes;
     size_t headerLimit = kMaxHeaderBytes;
@@ -272,6 +289,8 @@ struct RequestOptions {
     long lowSpeedSeconds = 20;
     bool captureRedirectLocation = false;
     bool accountHeaders = true;
+    std::string contentType;
+    RequestCancellation* cancellation = nullptr;
 };
 
 struct RequestResult {
@@ -289,6 +308,8 @@ RequestResult performCurl(const std::string& url, const std::string& method,
                           const std::vector<unsigned char>& ca, jint proxyType,
                           const std::string& proxyHost, jint proxyPort, const RequestOptions& options) {
     RequestResult output;
+    if (options.cancellation != nullptr && !options.cancellation->isCurrent())
+        return {0, CURLE_ABORTED_BY_CALLBACK, kNoFailure, {}};
     const CURLcode initial = initializeCurl();
     if (initial != CURLE_OK) return {0, initial, kSetup, {}};
     CurlHandle handle;
@@ -301,7 +322,8 @@ RequestResult performCurl(const std::string& url, const std::string& method,
             return {0, CURLE_OUT_OF_MEMORY, kSetup, {}};
     }
     if (!headers.append("Expect:")) return {0, CURLE_OUT_OF_MEMORY, kSetup, {}};
-    if (method == "POST" && !headers.append("Content-Type: application/json"))
+    const std::string contentType = options.contentType.empty() ? "application/json" : options.contentType;
+    if ((method == "POST" || method == "PUT") && !headers.append("Content-Type: " + contentType))
         return {0, CURLE_OUT_OF_MEMORY, kSetup, {}};
     if (!bearer.empty() && !headers.append("Authorization: Bearer " + bearer))
         return {0, CURLE_OUT_OF_MEMORY, kSetup, {}};
@@ -341,6 +363,11 @@ RequestResult performCurl(const std::string& url, const std::string& method,
     set(CURLOPT_LOW_SPEED_TIME, options.lowSpeedSeconds);
     set(CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(options.responseLimit));
     set(CURLOPT_ACCEPT_ENCODING, "identity");
+    if (options.cancellation != nullptr) {
+        set(CURLOPT_NOPROGRESS, 0L);
+        set(CURLOPT_XFERINFOFUNCTION, checkTransferCurrent);
+        set(CURLOPT_XFERINFODATA, options.cancellation);
+    }
     if (url.rfind("https://", 0) == 0) set(CURLOPT_CAINFO_BLOB, &caBlob);
     if (proxyType == 0) {
         set(CURLOPT_PROXY, "");
@@ -357,6 +384,11 @@ RequestResult performCurl(const std::string& url, const std::string& method,
         set(CURLOPT_READFUNCTION, readRequest);
         set(CURLOPT_READDATA, &transfer);
         set(CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(request.size()));
+    } else if (method == "PUT") {
+        set(CURLOPT_UPLOAD, 1L);
+        set(CURLOPT_READFUNCTION, readRequest);
+        set(CURLOPT_READDATA, &transfer);
+        set(CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(request.size()));
     } else {
         set(CURLOPT_HTTPGET, 1L);
     }
@@ -466,6 +498,59 @@ extern "C" JNIEXPORT jobject JNICALL Java_com_kongshang_maichat_MaiChatHttpTrans
         return nullptr;
     } catch (const std::exception&) {
         if (!env->ExceptionCheck()) throwIOException(env, "网络组件执行失败");
+        return nullptr;
+    }
+}
+
+// 有界二进制入口复用上述 HTTP 核心、系统 CA 和代理；旧账号/头像 GET 入口契约保持原样。
+extern "C" JNIEXPORT jobject JNICALL Java_com_kongshang_maichat_MaiChatBinaryHttpTransport_nativeExecute(
+    JNIEnv* env, jclass, jstring jurl, jstring jmethod, jbyteArray jrequest, jstring jbearer,
+    jstring jcontentType, jbyteArray jca, jint proxyType, jstring jproxyHost, jint proxyPort,
+    jobject current) {
+    try {
+        std::string url, method, bearer, contentType, proxyHost;
+        std::vector<unsigned char> request, ca;
+        if (!copyString(env, jurl, &url) || !copyString(env, jmethod, &method) ||
+            !copyString(env, jbearer, &bearer) || !copyString(env, jcontentType, &contentType) ||
+            !copyString(env, jproxyHost, &proxyHost) || !copyBytes(env, jca, kMaxCaBytes, &ca) ||
+            !copyBytes(env, jrequest, 2000000, &request) || current == nullptr) {
+            if (!env->ExceptionCheck()) throwIOException(env, "上传网络请求数据无效");
+            return nullptr;
+        }
+        const bool json = method == "POST" && contentType == "application/json" && request.size() <= 32768;
+        const bool image = method == "PUT" && contentType == "image/jpeg" && bearer.empty();
+        if ((!json && !image) || request.empty() || url.size() > 8192 || bearer.size() > 8192 ||
+            url.rfind("https://", 0) != 0 || ca.empty() || proxyHost.size() > 255 ||
+            (proxyType != 0 && proxyType != 1 && proxyType != 2) ||
+            (proxyType != 0 && (proxyHost.empty() || proxyPort <= 0 || proxyPort > 65535))) {
+            throwIOException(env, "上传网络请求数据无效");
+            return nullptr;
+        }
+        jclass predicate = env->FindClass("java/util/function/BooleanSupplier");
+        if (predicate == nullptr) return nullptr;
+        jmethodID check = env->GetMethodID(predicate, "getAsBoolean", "()Z");
+        const bool validPredicate = check != nullptr && env->IsInstanceOf(current, predicate);
+        env->DeleteLocalRef(predicate);
+        if (!validPredicate) {
+            if (!env->ExceptionCheck()) throwIOException(env, "上传取消状态无效");
+            return nullptr;
+        }
+        RequestCancellation cancellation{env, current, check};
+        RequestOptions options;
+        options.contentType = contentType;
+        options.cancellation = &cancellation;
+        options.responseLimit = 8192;
+        options.accountHeaders = false;
+        options.totalTimeoutMs = image ? 60000 : 30000;
+        const RequestResult result = performCurl(url, method, request, bearer, ca,
+                                                 proxyType, proxyHost, proxyPort, options);
+        return makeResult(env, "com/kongshang/maichat/MaiChatBinaryHttpTransport$Result",
+                          static_cast<jint>(result.status), result.body, result.code, result.failure);
+    } catch (const std::bad_alloc&) {
+        if (!env->ExceptionCheck()) throwIOException(env, "上传网络内存不足");
+        return nullptr;
+    } catch (const std::exception&) {
+        if (!env->ExceptionCheck()) throwIOException(env, "上传网络组件执行失败");
         return nullptr;
     }
 }

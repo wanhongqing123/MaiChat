@@ -63,6 +63,9 @@ public final class TencentIMClient {
         default void onVideoMediaUpdated(
                 String sender, String recipient, String remoteId, RemoteIMVideoAttachment attachment) {}
         void onProfilesUpdated(List<RemoteIMContact> contacts);
+        default void onProfilesUpdated(List<RemoteIMContact> contacts, long selfRevision) {
+            onProfilesUpdated(contacts);
+        }
         default void onSelfProfileUpdated(SelfProfile profile) { }
         void onPresenceUpdated(Map<String, PresenceStatus> statuses);
         default void onGroupMembershipChanged() { }
@@ -81,10 +84,13 @@ public final class TencentIMClient {
 
     public static final class SelfProfile {
         public final String imUserId, nickname, avatarUrl;
-        SelfProfile(String imUserId, String nickname, String avatarUrl) {
+        final long loginEpoch, readRevision;
+        SelfProfile(String imUserId, String nickname, String avatarUrl, long loginEpoch, long readRevision) {
             this.imUserId = imUserId;
             this.nickname = nickname;
             this.avatarUrl = avatarUrl;
+            this.loginEpoch = loginEpoch;
+            this.readRevision = readRevision;
         }
     }
 
@@ -228,10 +234,10 @@ public final class TencentIMClient {
         @Override public void onSelfInfoUpdated(V2TIMUserFullInfo info) {
             final long epoch = selfProfileEpoch.get();
             final String owner = currentUserId;
-            final SelfProfile profile = selfProfile(info);
+            final SelfProfile profile = selfProfile(info, epoch, selfProfileRevision.snapshot());
             sdkHandler.post(() -> {
                 if (profile != null && owner.equals(profile.imUserId) &&
-                        selfProfileIdentityMatches(owner, epoch))
+                        selfProfileIdentityMatches(owner, epoch) && isSelfProfileReadCurrent(profile))
                     listener.onSelfProfileUpdated(profile);
             });
         }
@@ -241,6 +247,7 @@ public final class TencentIMClient {
     private volatile String currentUserId = "";
     private volatile boolean loginAcknowledged;
     private String profileRequestKey = "";
+    private final RemoteIMSelfProfileRevision selfProfileRevision = new RemoteIMSelfProfileRevision();
     private String presenceRequestKey = "";
     private boolean presenceUnsupported;
 
@@ -391,16 +398,17 @@ public final class TencentIMClient {
             owner.equals(selfProfileSdk.loginUser());
     }
 
-    private static SelfProfile selfProfile(V2TIMUserFullInfo info) {
+    private static SelfProfile selfProfile(V2TIMUserFullInfo info, long epoch, long revision) {
         if (info == null || clean(info.getUserID()).isEmpty()) return null;
         return new SelfProfile(clean(info.getUserID()), clean(info.getNickName()),
-            clean(info.getFaceUrl()));
+            clean(info.getFaceUrl()), epoch, revision);
     }
 
     /** 查询本人走独立回调，绝不把 getUsersInfo 的自己资料并入好友列表。 */
     public void getSelfProfile(String owner, java.util.function.BooleanSupplier current,
                                SelfProfileCompletion completion) {
         final long epoch = selfProfileEpoch.get();
+        final long revision = selfProfileRevision.snapshot();
         sdkHandler.post(() -> {
             if (!current.getAsBoolean() || !selfProfileIdentityMatches(owner, epoch)) {
                 completion.onError(-1, "登录账号或 IM 身份已变化"); return;
@@ -408,11 +416,12 @@ public final class TencentIMClient {
             selfProfileSdk.get(Collections.singletonList(owner),
                 new V2TIMValueCallback<List<V2TIMUserFullInfo>>() {
                     @Override public void onSuccess(List<V2TIMUserFullInfo> users) {
-                        if (!current.getAsBoolean() || !selfProfileIdentityMatches(owner, epoch)) {
+                        if (!current.getAsBoolean() || !selfProfileIdentityMatches(owner, epoch) ||
+                                !isSelfProfileReadRevisionCurrent(revision)) {
                             completion.onError(-1, "登录账号或 IM 身份已变化"); return;
                         }
                         if (users != null) for (V2TIMUserFullInfo user : users) {
-                            SelfProfile profile = selfProfile(user);
+                            SelfProfile profile = selfProfile(user, epoch, revision);
                             if (profile != null && owner.equals(profile.imUserId)) {
                                 completion.onSuccess(profile); return;
                             }
@@ -440,8 +449,17 @@ public final class TencentIMClient {
                               Runnable beforeSend, OperationCompletion completion) {
         final long epoch = selfProfileEpoch.get();
         sdkHandler.post(() -> {
+            String url = clean(avatarUrl);
+            try {
+                java.net.URI parsed = new java.net.URI(url);
+                if (url.length() > 4096 || parsed.getHost() == null || parsed.getUserInfo() != null ||
+                        !("https".equalsIgnoreCase(parsed.getScheme()) || "http".equalsIgnoreCase(parsed.getScheme())))
+                    throw new IllegalArgumentException("Avatar URL is invalid");
+            } catch (java.net.URISyntaxException | IllegalArgumentException invalid) {
+                completion.onError(-1, "Avatar URL is invalid"); return;
+            }
             V2TIMUserFullInfo profile = new V2TIMUserFullInfo();
-            profile.setFaceUrl(avatarUrl);
+            profile.setFaceUrl(url);
             if (!current.getAsBoolean() || !selfProfileIdentityMatches(owner, epoch)) {
                 completion.onError(-1, "登录账号或 IM 身份已变化"); return;
             }
@@ -454,6 +472,8 @@ public final class TencentIMClient {
                     if (!identity.getAsBoolean() || !selfProfileIdentityMatches(owner, epoch)) {
                         completion.onError(-1, "登录账号或 IM 身份已变化"); return;
                     }
+                    // 同一次登录内，写入前已在途的本人读取也不能覆盖这次 SDK 确认。
+                    selfProfileRevision.avatarCommitted();
                     completion.onSuccess();
                 }
                 @Override public void onError(int code, String message) {
@@ -753,6 +773,7 @@ public final class TencentIMClient {
         List<String> cleaned = cleanUserIds(userIds);
         if (cleaned.isEmpty()) return;
         String accountAtRequest = currentUserId;
+        long selfRevisionAtRequest = selfProfileRevision.snapshot();
         long epoch = selfProfileEpoch.get();
         String requestKey = accountAtRequest + "\n" + String.join("\n", cleaned);
         synchronized (this) {
@@ -773,8 +794,10 @@ public final class TencentIMClient {
                         for (V2TIMUserFullInfo user : users) {
                             String userId = clean(user.getUserID());
                             if (userId.isEmpty()) continue;
+                            if (!selfProfileRevision.accepts(accountAtRequest, userId, selfRevisionAtRequest))
+                                continue;
                             if (userId.equals(accountAtRequest)) {
-                                SelfProfile own = selfProfile(user);
+                                SelfProfile own = selfProfile(user, epoch, selfRevisionAtRequest);
                                 if (own != null) listener.onSelfProfileUpdated(own);
                                 continue;
                             }
@@ -786,7 +809,7 @@ public final class TencentIMClient {
                             ));
                         }
                     }
-                    listener.onProfilesUpdated(contacts);
+                    listener.onProfilesUpdated(contacts, selfRevisionAtRequest);
                 }
 
                 @Override
@@ -798,6 +821,17 @@ public final class TencentIMClient {
                 }
             }
         );
+    }
+
+    public long selfProfileReadRevision() { return selfProfileRevision.snapshot(); }
+    public boolean isSelfProfileReadRevisionCurrent(long revision) {
+        return selfProfileRevision.snapshot() == revision;
+    }
+
+    // 资料回调还会排队到主线程；在那里再次核对登录和头像写入代际。
+    boolean isSelfProfileReadCurrent(SelfProfile profile) {
+        return profile != null && profile.loginEpoch == selfProfileEpoch.get() &&
+            isLoggedInAs(profile.imUserId) && isSelfProfileReadRevisionCurrent(profile.readRevision);
     }
 
     public void refreshAndSubscribePresence(List<String> userIds) {

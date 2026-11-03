@@ -27,6 +27,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.content.res.ColorStateList;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -35,6 +36,7 @@ import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.media.MediaScannerConnection;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
@@ -66,9 +68,11 @@ import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
+import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.PopupWindow;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Space;
 import android.widget.TextView;
@@ -139,6 +143,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private static final int REQUEST_FRIEND_SCAN = 1011;
     private static final int REQUEST_SCREEN_SHARE = 1012;
     private static final int REQUEST_CLOUD_DRIVE_MEDIA = 1013;
+    private static final int REQUEST_PICK_AVATAR = 1014;
     private static final String TAG = "MaiChat.notify";
     private static final String MESSAGE_CHANNEL_ID = "maichat-new-messages";
     private static final String MESSAGE_GROUP_KEY = "maichat-private-messages";
@@ -161,8 +166,28 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private final Map<Dialog, File> cloudImageFiles = new HashMap<>();
     private String cloudImageOwner = "";
     private MaiCloudDriveDialog cloudDriveDialog;
+    private final MaiCloudDriveDirectory cloudDirectoryState = new MaiCloudDriveDirectory();
+    private enum MePage { HOME, PROFILE, SETTINGS, ACCOUNT_DELETION, REPORTS }
+    private MePage mePage = MePage.HOME;
+    private MePage renderedMePage;
+    private RemoteIMTab renderedPrimaryTab;
+    private ScrollView conversationScroll;
+    private TextView selfNameLabel, selfAccountLabel, selfConnectionLabel;
+    private FrameLayout selfAvatarContainer;
+    private View selfConnectionDot;
+    private View selfAvatarRow;
+    private ProgressBar selfAvatarProgress;
+    private String pendingAvatarIdentity, avatarCropIdentity, avatarUploadIdentity;
+    private Dialog avatarCropDialog;
+    private File avatarUploadFile;
+    private int selfAvatarSize = 64;
+    private String renderedSelfAvatar = "";
+    private View renderedTabBar;
+    private MaiChatAccountDeletionPanel accountDeletionPanel;
+    private MaiChatSafetyReportsPanel safetyReportsPanel;
+    private String settingsPanelIdentity = "";
+    private TextView speechProviderValue;
     private TextView videoTranscriptOverlay;
-    private boolean videoExpanded;
     private Dialog imageDialog;
     private MaiGraphicsImageView galleryImageView;
     private String galleryImagePath;
@@ -226,6 +251,9 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private boolean voiceMode;
     private boolean holdingVoice;
     private long voiceUiGeneration;
+    private VoiceTranscriptionOverlay imTranscriptionOverlay;
+    private VoiceTranscriptionResult imTranscription;
+    private final ComposerVoiceResultGuard imVoiceResultGuard = new ComposerVoiceResultGuard();
     private String speechText = "";
     private TextView speechPreview;
     private boolean assistantVoiceActive;
@@ -322,8 +350,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         // 发出的媒体同样落持久目录，不放缓存：路径会进聊天记录并被长期引用。
         mediaStore = new RemoteIMMediaStore(RemoteIMMediaPaths.forApp(this));
         voiceRecorder = new VoiceRecordingController(mediaStore, diagnostics::record);
+        MaiChatAuthClient speechAuth = MaiChatAuthClient.shared(this);
+        speechAuth.setSpeechRecognitionProvider(SpeechRecognitionProvider.fromId(
+            getSharedPreferences("maichat.speech", MODE_PRIVATE)
+                .getString("maichat.speech.provider", "tencent")));
+        voiceRecorder.configureTranscription(speechAuth::speechRecognitionProvider, speechAuth::aliyunAsrCredential);
         voicePlayback = new VoicePlaybackController();
-        // 普通 IM 录音保留语音消息回退；创作中心使用账号签发的实时 ASR 地址。
+        // 两个空编辑器均使用账号签发的实时 ASR；独立语音模式直接发语音。
         speechRecognizer = null;
         session = new RemoteIMSessionController(this, this);
         maiChatHostTools = new MaiChatHostTools(this, session);
@@ -369,7 +402,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             if (previous != currentMessageList && currentMessageList != null && anchor != null)
                 currentMessageList.restoreMessage(anchor, offset);
         }
-        if (insetsHost != null) insetsHost.post(this::updateVideoDockLayout);
+        if (insetsHost != null) insetsHost.post(this::updateLandscapeConversationLayout);
     }
 
     @Override
@@ -428,6 +461,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     @Override
     protected void onDestroy() {
         destroyed = true;
+        clearAvatarSelection();
+        closeSettingsSubpages();
         passwordRequests.cancelActive("identity_changed");
         if (passwordDialog != null) passwordDialog.dismiss();
         if (cloudDriveDialog != null && cloudDriveDialog.isShowing()) cloudDriveDialog.dismiss();
@@ -462,6 +497,12 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             render();
             return;
         }
+        if (activeTab == RemoteIMTab.ME && mePage != MePage.HOME) {
+            leaveMeSubpage();
+            return;
+        }
+        if (activeTab == RemoteIMTab.CLOUD && cloudDriveDialog != null
+                && cloudDriveDialog.navigateBack()) return;
         if (activeFriendProfileUserId != null) {
             activeFriendProfileUserId = null;
             render();
@@ -574,6 +615,18 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_PICK_AVATAR) {
+            String identity = pendingAvatarIdentity;
+            pendingAvatarIdentity = null;
+            if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+            if (destroyed || identity == null || !session.isAvatarChangeIdentityCurrent(identity)) return;
+            avatarCropIdentity = identity;
+            avatarCropDialog = AvatarCropDialog.show(this, data.getData(), file -> {
+                avatarCropDialog = null; avatarCropIdentity = null;
+                uploadSelectedAvatar(file, identity);
+            }, () -> { avatarCropDialog = null; avatarCropIdentity = null; });
+            return;
+        }
         if (requestCode == REQUEST_SCREEN_SHARE) {
             Consumer<Boolean> completion = pendingScreenShare;
             pendingScreenShare = null;
@@ -878,7 +931,17 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             && activeChatUserId == null && !showInitialLogin && !session.requiresLogin();
         if (aiAssistant != null) aiAssistant.setForeground(showingAssistant);
         String owner = session.requiresLogin() ? "" : session.settings().loginUserId();
+        clearInvalidAvatarSelection();
+        if ((accountDeletionPanel != null || safetyReportsPanel != null)
+                && !settingsPanelIdentity.equals(session.passwordChangeIdentity())) {
+            closeSettingsSubpages();
+            mePage = MePage.SETTINGS;
+            renderedMePage = null;
+        }
         if (!owner.equals(displayedOwner)) {
+            renderedPrimaryTab = null;
+            mePage = MePage.HOME;
+            cloudDirectoryState.activate(owner);
             if (videoDialog != null) videoDialog.dismiss();
             if (cloudDriveDialog != null && cloudDriveDialog.isShowing())
                 cloudDriveDialog.dismiss();
@@ -953,10 +1016,41 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         if (activeTab == RemoteIMTab.CLOUD && activeChatUserId == null
                 && cloudDriveDialog != null && cloudDriveDialog.isEmbedded()
                 && !showInitialLogin && !session.requiresLogin()) return;
+        // 资料/回执更新只刷新当前页面的数据，保留滚动与导航对象。
+        // 页面身份或账号真的变化时才走下面的完整重建。
+        if (!landscapeIm && activeChatUserId == null && activeGroupId == null
+                && activeFriendProfileUserId == null && !showInitialLogin
+                && !session.requiresLogin() && renderedPrimaryTab == activeTab
+                && root != null && root.isAttachedToWindow()) {
+            if (activeTab == RemoteIMTab.MESSAGES && currentConversationRows != null) {
+                long fingerprint = conversationFingerprint();
+                if (fingerprint != renderedConversationFingerprint) {
+                    int oldScroll = conversationScroll == null ? 0 : conversationScroll.getScrollY();
+                    renderConversationRows(currentConversationRows, "", Collections.emptyList(), false);
+                    renderedConversationFingerprint = fingerprint;
+                    if (conversationScroll != null) conversationScroll.scrollTo(0, oldScroll);
+                }
+                refreshRootTabBar();
+                return;
+            }
+            if (activeTab == RemoteIMTab.ME && renderedMePage == mePage) {
+                updateSelfProfilePresentation();
+                refreshRootTabBar();
+                return;
+            }
+        }
         if (cloudDriveDialog != null && cloudDriveDialog.isEmbedded())
             cloudDriveDialog.dismiss();
         // 只有页面身份真的改变才重建导航容器；不能把每条新消息都当作换页。
+        closeSettingsSubpages();
         currentMessageList = null;
+        renderedPrimaryTab = null;
+        renderedTabBar = null;
+        conversationScroll = null;
+        selfNameLabel = null; selfAccountLabel = null; selfConnectionLabel = null;
+        selfAvatarContainer = null; selfConnectionDot = null; renderedSelfAvatar = "";
+        selfAvatarRow = null; selfAvatarProgress = null;
+        speechProviderValue = null;
         renderedChatUserId = null;
         groupRows = null; groupScroll = null; groupDraftInput = null;
         renderedGroupId = null;
@@ -980,7 +1074,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         // Debug 验收按钮随真实根容器重新附着；普通/Release 运行该字段为 null，不改变页面。
         com.kongshang.maichat.tools.MobilePdfSecurityAcceptance.reattach(this, pdfAcceptanceButton);
         renderedLandscapeIm = landscapeIm;
-        navigation.post(this::updateVideoDockLayout);
+        navigation.post(this::updateLandscapeConversationLayout);
         swipeBack = new ChatSwipeBack(new ChatSwipeBack.Host() {
             @Override public View page() { return root; }
             @Override public boolean canGoBack() {
@@ -1015,7 +1109,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                 && currentMessageList != null && messageInput != null && messageInput.hasFocus()) {
                 if (imeAnimating) currentMessageList.beginKeyboardReveal(); else currentMessageList.showLatest();
             }
-            if (keyboardVisible != visible) navigation.post(this::updateVideoDockLayout);
+            if (keyboardVisible != visible) navigation.post(this::updateLandscapeConversationLayout);
             keyboardVisible = visible;
             if (!imeAnimating) applyChatInsets(navigation, insets);
             return insets;
@@ -1090,7 +1184,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         } else {
             switch (activeTab) {
                 case CLOUD:
-                    cloudDriveDialog = new MaiCloudDriveDialog(this);
+                    cloudDriveDialog = new MaiCloudDriveDialog(this, cloudDirectoryState);
                     cloudDriveDialog.showEmbedded(content);
                     break;
                 case ASSISTANT:
@@ -1117,7 +1211,19 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
 
         boolean hideTabs = activeChatUserId != null || activeGroupId != null
             || (activeTab == RemoteIMTab.REMOTE && session.remoteDesktop().isActive());
-        if (!hideTabs) root.addView(bottomTabBar(), match(dp(64)));
+        if (!hideTabs) {
+            renderedTabBar = bottomTabBar();
+            root.addView(renderedTabBar, match(dp(66)));
+            renderedPrimaryTab = activeTab;
+        }
+    }
+
+    private void refreshRootTabBar() {
+        if (renderedTabBar == null || renderedTabBar.getParent() != root) return;
+        int position = root.indexOfChild(renderedTabBar);
+        root.removeView(renderedTabBar);
+        renderedTabBar = bottomTabBar();
+        root.addView(renderedTabBar, position, match(dp(66)));
     }
 
     private void applyChatInsets(FrameLayout target, androidx.core.view.WindowInsetsCompat insets) {
@@ -1287,6 +1393,14 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         LinearLayout.LayoutParams alternateParams = match(dp(42));
         alternateParams.setMargins(0, dp(14), 0, 0);
         form.addView(alternate, alternateParams);
+        if (MaiChatAccountDeletionPanel.hasSavedReceipt(this)) {
+            Button receipt = new Button(this);
+            receipt.setText("查看注销进度");
+            receipt.setTextColor(Color.rgb(42, 211, 142));
+            receipt.setBackgroundColor(Color.TRANSPARENT);
+            receipt.setOnClickListener(view -> MaiChatAccountDeletionPanel.showSavedReceipt(this, () -> {}));
+            form.addView(receipt, match(dp(42)));
+        }
 
         // 主按钮以手机号、验证码或密码以及两项确认共同决定可用性，避免触发无效请求。
         Runnable updateLoginAppearance = () -> {
@@ -1707,7 +1821,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER);
-        bar.setPadding(dp(16), dp(10), dp(16), dp(12));
+        bar.setPadding(dp(16), dp(9), dp(16), dp(11));
         outside.addView(bar, new LinearLayout.LayoutParams(-1, 0, 1));
         bar.addView(tabButton(RemoteIMTab.MESSAGES), weightMatch());
         bar.addView(tabButton(RemoteIMTab.CLOUD), weightMatch());
@@ -1726,33 +1840,25 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         button.setFocusable(true);
 
         ImageView icon = new ImageView(this);
-        icon.setImageResource(tabIconResource(tab));
-        icon.setColorFilter(selected ? tabAccentColor(tab) : MaiChatTheme.SECONDARY);
+        icon.setImageResource(tabIconResource(tab, selected));
+        icon.setColorFilter(selected ? tabAccentColor(tab) : Color.rgb(142, 142, 147));
         FrameLayout.LayoutParams iconParams = new FrameLayout.LayoutParams(
-            dp(23), dp(23), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        iconParams.topMargin = dp(1);
+            dp(23), dp(23), Gravity.CENTER);
         button.addView(icon, iconParams);
-
-        TextView title = new TextView(this);
-        title.setText(tab.title());
-        title.setTextSize(10);
-        title.setSingleLine(true);
-        title.setGravity(Gravity.CENTER);
-        title.setTextColor(selected ? tabAccentColor(tab) : MaiChatTheme.SECONDARY);
-        FrameLayout.LayoutParams titleParams = new FrameLayout.LayoutParams(-1, dp(17), Gravity.BOTTOM);
-        button.addView(title, titleParams);
 
         if (tab == RemoteIMTab.MESSAGES && session.totalUnreadCount() > 0) {
             View badge = new View(this);
             badge.setBackground(MaiChatTheme.rounded(Color.rgb(245, 60, 48), 4, this));
             FrameLayout.LayoutParams badgeParams =
-                    new FrameLayout.LayoutParams(dp(8), dp(8), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-            badgeParams.leftMargin = dp(13);
-            badgeParams.topMargin = dp(5);
+                    new FrameLayout.LayoutParams(dp(8), dp(8), Gravity.CENTER);
+            badgeParams.leftMargin = dp(23);
+            badgeParams.topMargin = -dp(18);
             button.addView(badge, badgeParams);
         }
         button.setOnClickListener(view -> {
+            if (settingsSubmissionInFlight()) return;
             cancelVoiceRecording();
+            if (tab == RemoteIMTab.ME && activeTab == RemoteIMTab.ME) mePage = MePage.HOME;
             activeTab = tab;
             activeChatUserId = null;
             if (activeGroupId != null) session.setGroupConversationVisible(activeGroupId, false);
@@ -1763,14 +1869,14 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         return button;
     }
 
-    private int tabIconResource(RemoteIMTab tab) {
+    private int tabIconResource(RemoteIMTab tab, boolean selected) {
         switch (tab) {
-            case MESSAGES: return R.drawable.ic_nav_messages;
-            case CLOUD: return R.drawable.ic_nav_cloud;
-            case ASSISTANT: return R.drawable.ic_nav_assistant;
-            case CONTACTS: return R.drawable.ic_nav_contacts;
+            case MESSAGES: return selected ? R.drawable.ic_nav_messages_filled : R.drawable.ic_nav_messages;
+            case CLOUD: return selected ? R.drawable.ic_nav_cloud_filled : R.drawable.ic_nav_cloud;
+            case ASSISTANT: return selected ? R.drawable.ic_nav_assistant_filled : R.drawable.ic_nav_assistant;
+            case CONTACTS: return selected ? R.drawable.ic_nav_contacts_filled : R.drawable.ic_nav_contacts;
             case REMOTE: return R.drawable.ic_nav_remote;
-            case ME: return R.drawable.ic_nav_profile;
+            case ME: return selected ? R.drawable.ic_nav_profile_filled : R.drawable.ic_nav_profile;
         }
         return R.drawable.ic_nav_messages;
     }
@@ -1788,19 +1894,18 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     private void renderConversationList() {
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(dp(18), dp(4), dp(12), dp(4));
-        header.setBackgroundColor(Color.WHITE);
-        TextView title = MaiChatTheme.label(this, "消息", 20, MaiChatTheme.TEXT);
-        header.addView(title, new LinearLayout.LayoutParams(0, dp(48), 1));
-        TextView plus = iconButton("＋", 26, MaiChatTheme.TEXT);
+        FrameLayout header = pageNavigation("消息", null);
+        View plus = navigationIcon(R.drawable.ic_ui_plus, "新建聊天");
         plus.setContentDescription("新建聊天");
         plus.setOnClickListener(this::showMessageActionMenu);
-        header.addView(plus, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        FrameLayout.LayoutParams plusParams = new FrameLayout.LayoutParams(dp(44), dp(44),
+            Gravity.END | Gravity.CENTER_VERTICAL);
+        plusParams.rightMargin = dp(16);
+        header.addView(plus, plusParams);
         content.addView(header, match(dp(56)));
         ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        conversationScroll = scroll;
         LinearLayout rows = new LinearLayout(this);
         rows.setOrientation(LinearLayout.VERTICAL);
         rows.setBackgroundColor(Color.WHITE);
@@ -1816,10 +1921,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     private long conversationFingerprint() {
-        long hash = 1;
+        // 连接成功会启用远端头像，在线状态会改变头像角标；它们也是列表内容的一部分。
+        long hash = session.connectionState().hashCode();
         for (RemoteIMContact contact : session.chatState().contacts()) {
             hash = hash * 31 + contact.userId().hashCode();
             hash = hash * 31 + contact.displayName().hashCode();
+            hash = hash * 31 + contact.avatarUrl().hashCode();
+            hash = hash * 31 + session.presenceStatus(contact.userId()).hashCode();
             RemoteIMMessage latest = latestMessage(contact.userId());
             if (latest != null) {
                 hash = hash * 31 + latest.id().hashCode();
@@ -1865,7 +1973,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         if (activeChatUserId != null) renderChatDetail(activeChatUserId);
         else if (activeGroupId != null) renderGroupDetail(activeGroupId);
         else detail.addView(emptyState("◇", "选择一个对话", "从左侧选择联系人开始聊天。"), matchMatch());
-        columns.post(this::updateVideoDockLayout);
+        columns.post(this::updateLandscapeConversationLayout);
     }
 
     // 用当前搜索条件生成会话列表行；搜索命中消息时保留其所属会话，避免打开错误联系人。
@@ -1942,7 +2050,25 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             String detail = query.isEmpty()
                 ? "到通讯录添加好友账号后即可开始聊天。"
                 : "换个关键词再试试。";
-            rows.addView(emptyState("○", title, detail), match(dp(260)));
+            LinearLayout empty = new LinearLayout(this);
+            empty.setOrientation(LinearLayout.VERTICAL);
+            empty.setGravity(Gravity.CENTER_HORIZONTAL);
+            empty.setPadding(dp(24), dp(96), dp(24), dp(30));
+            ImageView icon = new ImageView(this);
+            icon.setImageResource(R.drawable.ic_nav_messages);
+            icon.setColorFilter(Color.rgb(142, 142, 147));
+            empty.addView(icon, new LinearLayout.LayoutParams(dp(42), dp(42)));
+            TextView heading = MaiChatTheme.label(this, title, 17, MaiChatTheme.TEXT);
+            heading.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams headingParams = matchWrap();
+            headingParams.topMargin = dp(16);
+            empty.addView(heading, headingParams);
+            TextView explanation = MaiChatTheme.text(this, detail, 14, MaiChatTheme.SECONDARY);
+            explanation.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams explanationParams = matchWrap();
+            explanationParams.topMargin = dp(8);
+            empty.addView(explanation, explanationParams);
+            rows.addView(empty, matchWrap());
         }
     }
 
@@ -2277,7 +2403,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         if (messageSearchTargetId != null) currentMessageList.showMessage(messageSearchTargetId);
         else if (stickToLatestMessage) currentMessageList.requestLatestAfterUpdate();
         stickToLatestMessage = false;
-        FrameLayout stage = new FrameLayout(this);
+        FrameLayout stage = new ChatKeyboardDismissal(this, this::hideKeyboard);
         stage.setBackgroundColor(Color.WHITE);
         stage.addView(currentMessageList, new FrameLayout.LayoutParams(-1, -1));
         chatEmptyState = emptyState("◇", "暂无消息", "发送一条消息开始对话。");
@@ -2557,13 +2683,9 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         title.setEllipsize(TextUtils.TruncateAt.MIDDLE);
         header.addView(title, new LinearLayout.LayoutParams(0, dp(42), 1));
 
-        View remote = symbolButton(
-            MaiChatSymbolView.Symbol.REMOTE,
-            MaiChatTheme.BLUE_DARK,
-            25,
-            Color.TRANSPARENT,
-            0
-        );
+        // 与创作中心及 iOS 标题操作使用同一矢量尺寸，避免手绘缩放令图标过小。
+        View remote = composerIcon(R.drawable.ic_nav_remote, MaiChatTheme.BLUE);
+        remote.setBackground(MaiChatTheme.rounded(MaiChatTheme.GROUPED_PAGE, 12, this));
         remote.setContentDescription("查看远程桌面");
         remote.setOnClickListener(view -> {
             RemoteDesktopController controller = session.remoteDesktop();
@@ -2925,17 +3047,17 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.BOTTOM);
 
-        View voiceToggle = symbolButton(
+        View voiceToggle = voiceMode ? symbolButton(
             voiceMode ? MaiChatSymbolView.Symbol.KEYBOARD : MaiChatSymbolView.Symbol.SPEAKER,
-            MaiChatTheme.BLUE_DARK,
+            MaiChatTheme.BLUE,
             28,
             MaiChatTheme.BLUE_SOFT,
-            14
-        );
+            22
+        ) : composerIcon(R.drawable.ic_ai_voice, MaiChatTheme.BLUE);
         voiceToggle.setBackground(MaiChatTheme.bordered(
             MaiChatTheme.BLUE_SOFT,
             MaiChatTheme.BORDER,
-            14,
+            22,
             this
         ));
         voiceToggle.setContentDescription(voiceMode ? "切换键盘" : "切换语音");
@@ -2965,15 +3087,36 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             messageInput = new GrowingMessageEditText(this);
             messageInput.setText(draftText);
             messageInput.setSelection(messageInput.length());
-            messageInput.setHint("输入要发送给当前联系人的消息...");
-            messageInput.setTextSize(14);
+            messageInput.setHint("可按住转文字");
+            messageInput.setContentDescription("消息输入框，可按住转文字");
+            messageInput.setTextSize(16);
+            messageInput.setMinHeight(dp(44));
             messageInput.setTextColor(MaiChatTheme.TEXT);
             messageInput.setHintTextColor(MaiChatTheme.SECONDARY);
-            messageInput.setBackground(MaiChatTheme.bordered(Color.WHITE, MaiChatTheme.BORDER, 14, this));
+            messageInput.setBackground(MaiChatTheme.bordered(MaiChatTheme.GROUPED_PAGE,
+                MaiChatTheme.BORDER, 14, this));
             GrowingMessageEditText editor = messageInput;
-            editor.setOnTouchListener((view, event) -> {
-                if (event.getActionMasked() == MotionEvent.ACTION_DOWN) allowKeyboardLocation = true;
-                return false;
+            // 空框长按与 iOS 一样进入实时转写；有草稿时仍由系统处理选择、复制和粘贴。
+            ComposerVoiceInput.attach(editor, new ComposerVoiceInput.Listener() {
+                @Override public void touched() { allowKeyboardLocation = true; }
+                @Override public boolean start(float rawX, float rawY) {
+                    if (messageInput != editor) return false;
+                    if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                        requestPermissions(new String[] {Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+                        return false;
+                    }
+                    hideKeyboard();
+                    return startVoiceRecording(true, rawX, rawY);
+                }
+                @Override public void move(float rawX, float rawY) {
+                    if (imTranscriptionOverlay != null) imTranscriptionOverlay.move(rawX, rawY);
+                }
+                @Override public void finish(float rawX, float rawY, boolean cancelled) {
+                    if (imTranscriptionOverlay != null)
+                        finishIMTranscription(imTranscription, cancelled ? VoiceTranscriptionOverlay.Action.CANCEL
+                            : imTranscriptionOverlay.move(rawX, rawY));
+                }
+                @Override public void detached() { if (imTranscriptionOverlay != null) cancelVoiceRecording(); }
             });
             String editingPeer = activeChatUserId, editingOwner = displayedOwner;
             messageInput.setOnEditorActionListener((view, actionId, event) -> {
@@ -3003,6 +3146,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                     if (messageInput != editor || !java.util.Objects.equals(editingPeer, activeChatUserId)
                             || !editingOwner.equals(displayedOwner))
                         return;
+                    if (imVoiceResultGuard.edited() && imTranscriptionOverlay != null) cancelVoiceRecording();
                     draftText = editable.toString();
                     rememberDraft(); updateComposerActions();
                     session.updateHumanTyping(activeChatUserId, messageInput.hasFocus() && !draftText.isEmpty());
@@ -3016,14 +3160,9 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             renderCommandSuggestions(suggestions, draftText);
         }
 
-        View plus = symbolButton(
-            MaiChatSymbolView.Symbol.PLUS,
-            MaiChatTheme.TEXT,
-            28,
-            Color.WHITE,
-            14
-        );
-        plus.setBackground(MaiChatTheme.bordered(Color.WHITE, MaiChatTheme.BORDER, 14, this));
+        View plus = composerIcon(R.drawable.ic_ai_add, MaiChatTheme.TEXT);
+        plus.setBackground(MaiChatTheme.bordered(MaiChatTheme.GROUPED_PAGE,
+            MaiChatTheme.BORDER, 22, this));
         plus.setContentDescription("添加图片或文件");
         plus.setOnClickListener(this::showAttachmentMenu);
         attachmentButton = plus;
@@ -3857,86 +3996,477 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     private void renderSettings() {
+        renderedMePage = mePage;
+        content.setBackgroundColor(MaiChatTheme.GROUPED_PAGE);
+        String title = mePage == MePage.HOME ? "我"
+            : mePage == MePage.PROFILE ? "个人资料"
+            : mePage == MePage.ACCOUNT_DELETION ? "注销账号"
+            : mePage == MePage.REPORTS ? "我的举报" : "设置";
+        content.addView(pageNavigation(title, mePage == MePage.HOME ? null : this::leaveMeSubpage), match(dp(56)));
+        if (mePage == MePage.ACCOUNT_DELETION) {
+            settingsPanelIdentity = session.passwordChangeIdentity();
+            accountDeletionPanel = new MaiChatAccountDeletionPanel(this, session, this::finishAcceptedAccountDeletion);
+            content.addView(accountDeletionPanel, new LinearLayout.LayoutParams(-1, 0, 1));
+            return;
+        }
+        if (mePage == MePage.REPORTS) {
+            settingsPanelIdentity = session.passwordChangeIdentity();
+            safetyReportsPanel = new MaiChatSafetyReportsPanel(this, session);
+            content.addView(safetyReportsPanel, new LinearLayout.LayoutParams(-1, 0, 1));
+            return;
+        }
         ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setBackgroundColor(MaiChatTheme.GROUPED_PAGE);
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
-        page.setPadding(dp(16), dp(12), dp(16), dp(22));
+        page.setPadding(dp(18), dp(mePage == MePage.HOME ? 30 : 20), dp(18), dp(28));
         scroll.addView(page, matchWrap());
-        content.addView(scroll, matchMatch());
+        content.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        if (mePage == MePage.HOME) renderMeHome(page);
+        else if (mePage == MePage.PROFILE) renderPersonalProfile(page);
+        else renderAccountPreferences(page);
+        updateSelfProfilePresentation();
+    }
 
-        String accountId = session.accountId();
-        String accountLabel = compactAccountId(accountId);
-        String nickname = session.nickname();
-        LinearLayout accountSection = settingsSection("账号", new String[][]{
-            {"昵称", nickname.isEmpty() ? "未设置  ›" : nickname + "  ›"},
-            {"登录账号", accountLabel + "  复制"},
-            {"消息连接", connectionText()}
-        });
-        page.addView(accountSection, matchWrap());
-        ViewGroup accountCard = (ViewGroup) accountSection.getChildAt(1);
-        View nicknameRow = accountCard.getChildAt(0);
-        nicknameRow.setContentDescription("昵称 " + (nickname.isEmpty() ? "未设置" : nickname));
-        nicknameRow.setOnClickListener(view -> showNicknameDialog());
-        View accountRow = accountCard.getChildAt(1);
-        accountRow.setContentDescription("登录账号 " + accountLabel + "，点击复制完整账号 ID");
-        accountRow.setOnClickListener(view -> {
-            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-            clipboard.setPrimaryClip(ClipData.newPlainText("MaiChat account ID", accountId));
-            toast("完整账号 ID 已复制");
-        });
-        ViewGroup connectionRow = (ViewGroup) accountCard.getChildAt(2);
-        connectionRow.setContentDescription("消息连接状态：" + connectionText());
-        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(dp(8), dp(8));
-        statusParams.setMargins(dp(7), 0, 0, 0);
-        connectionRow.addView(statusDot(), statusParams);
-        Button password = secondaryButton("设置或修改登录密码");
-        LinearLayout.LayoutParams passwordParams = match(dp(48));
-        passwordParams.setMargins(0, dp(14), 0, 0);
-        page.addView(password, passwordParams);
-        password.setOnClickListener(view -> {
-            try { openAccountPasswordForm(); }
-            catch (Exception failure) { toast("请先登录后在前台打开密码页"); }
-        });
-        Button friendCode = secondaryButton("我的好友二维码");
-        LinearLayout.LayoutParams friendCodeParams = match(dp(48));
-        friendCodeParams.setMargins(0, dp(14), 0, 0);
-        page.addView(friendCode, friendCodeParams);
-        friendCode.setOnClickListener(view -> showMyFriendCodeDialog());
-        Button scanDesktopLogin = secondaryButton("扫码登录桌面端");
-        LinearLayout.LayoutParams scanParams = match(dp(48));
-        scanParams.setMargins(0, dp(18), 0, 0);
-        page.addView(scanDesktopLogin, scanParams);
-        scanDesktopLogin.setOnClickListener(view ->
-            startActivity(new Intent(this, DesktopLoginApprovalActivity.class)));
-        Button logout = secondaryButton("切换账号");
-        logout.setTextColor(MaiChatTheme.RED);
-        LinearLayout.LayoutParams logoutParams = match(dp(48));
-        logoutParams.setMargins(0, dp(22), 0, 0);
-        page.addView(logout, logoutParams);
-        logout.setOnClickListener(view -> {
-            try {
-                // 先清除旧账号的本机会话，再展示空白 MaiChat 登录页。
-                session.logout();
-                loginAcceptedTerms = false;
-                loginConfirmedAge = false;
-                loginUserDraft = "";
-                loginCodeDraft = "";
-                loginPasswordDraft = "";
-                loginChallengeId = "";
-                loginUsesPassword = false;
-                showInitialLogin = true;
-                activeTab = RemoteIMTab.MESSAGES;
-                activeChatUserId = null;
-                render();
-            } catch (IOException error) {
-                toast("切换账号失败");
+    /** 工具只能打开与普通设置相同的本地验证页，不能提交注销或读取输入内容。 */
+    public JSONObject openAccountDeletionForAgent() throws JSONException {
+        if (Looper.myLooper() != Looper.getMainLooper() || !isHostToolForeground() || session.requiresLogin())
+            throw new IllegalStateException("请先登录并回到 App 前台");
+        if (activeTab == RemoteIMTab.ME && mePage == MePage.ACCOUNT_DELETION
+                && accountDeletionPanel != null)
+            return new JSONObject().put("shown", true);
+        if (activeChatUserId != null) {
+            rememberDraft();
+            session.setConversationVisible(activeChatUserId, false);
+        }
+        if (activeGroupId != null) {
+            if (groupDraftInput != null)
+                groupDrafts.put(displayedOwner + "\0" + activeGroupId, groupDraftInput.getText().toString());
+            session.setGroupConversationVisible(activeGroupId, false);
+        }
+        cancelVoiceRecording();
+        activeChatUserId = null; activeGroupId = null; activeFriendProfileUserId = null;
+        activeTab = RemoteIMTab.ME;
+        mePage = MePage.ACCOUNT_DELETION;
+        render();
+        return new JSONObject().put("shown", true);
+    }
+
+    /** 普通举报页和工具共用同一只读服务；网络只允许在 worker 执行。 */
+    public JSONObject safetyReportsForAgent() throws Exception {
+        if (Looper.myLooper() == Looper.getMainLooper())
+            throw new IllegalStateException("举报记录不能阻塞界面线程");
+        String identity = session.passwordChangeIdentity();
+        String account = session.accountId();
+        java.util.function.BooleanSupplier current = () -> !destroyed && !session.requiresLogin()
+            && identity.equals(session.passwordChangeIdentity());
+        MaiChatAccountSettingsService service = new MaiChatAccountSettingsService(account, current,
+            (path, method, body) -> MaiChatAuthClient.shared(this).accountSettingsRequest(
+                path, method, body, account, current));
+        JSONArray reports = new JSONArray();
+        for (MaiChatAccountSettingsService.Report report : service.reports())
+            reports.put(new JSONObject().put("id", report.id).put("status", report.status)
+                .put("resolution", report.resolution).put("created_at", report.createdAt));
+        return new JSONObject().put("reports", reports).put("count", reports.length());
+    }
+
+    private MePage parentMePage() {
+        return mePage == MePage.ACCOUNT_DELETION || mePage == MePage.REPORTS
+            ? MePage.SETTINGS : MePage.HOME;
+    }
+
+    private boolean settingsSubmissionInFlight() {
+        if (accountDeletionPanel == null || !accountDeletionPanel.isSubmitting()) return false;
+        toast("正在提交注销申请，请稍候");
+        return true;
+    }
+
+    private void leaveMeSubpage() {
+        if (settingsSubmissionInFlight()) return;
+        mePage = parentMePage();
+        render();
+    }
+
+    private void closeSettingsSubpages() {
+        if (accountDeletionPanel != null) accountDeletionPanel.close();
+        if (safetyReportsPanel != null) safetyReportsPanel.close();
+        accountDeletionPanel = null; safetyReportsPanel = null;
+        settingsPanelIdentity = "";
+    }
+
+    /** 页面标题采用独立中心对齐，左右操作区域不会把标题推偏。 */
+    private FrameLayout pageNavigation(String title, Runnable back) {
+        FrameLayout header = new FrameLayout(this);
+        header.setBackgroundColor(Color.WHITE);
+        TextView heading = MaiChatTheme.label(this, title, 17, MaiChatTheme.TEXT);
+        heading.setGravity(Gravity.CENTER);
+        heading.setTypeface(MaiChatTypography.semibold());
+        heading.setSingleLine(true);
+        header.addView(heading, new FrameLayout.LayoutParams(-1, -1));
+        if (back != null) {
+            MaiChatSymbolView arrow = new MaiChatSymbolView(this, MaiChatSymbolView.Symbol.CHEVRON_LEFT);
+            arrow.setSymbolColor(MaiChatTheme.TEXT);
+            arrow.setContentDescription("返回");
+            arrow.setBackground(MaiChatTheme.bordered(Color.rgb(250, 250, 252),
+                Color.rgb(232, 232, 237), 22, this));
+            arrow.setOnClickListener(view -> back.run());
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(44), dp(44),
+                Gravity.START | Gravity.CENTER_VERTICAL);
+            params.leftMargin = dp(16);
+            header.addView(arrow, params);
+        }
+        View line = new View(this);
+        line.setBackgroundColor(Color.rgb(237, 237, 240));
+        header.addView(line, new FrameLayout.LayoutParams(-1, dp(0.5f), Gravity.BOTTOM));
+        return header;
+    }
+
+    private View navigationIcon(int resource, String description) {
+        FrameLayout button = new FrameLayout(this);
+        button.setContentDescription(description);
+        button.setClickable(true);
+        button.setFocusable(true);
+        button.setBackground(MaiChatTheme.bordered(Color.rgb(250, 250, 252),
+            Color.rgb(232, 232, 237), 22, this));
+        ImageView image = new ImageView(this);
+        image.setImageResource(resource);
+        image.setColorFilter(MaiChatTheme.TEXT);
+        button.addView(image, new FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER));
+        return button;
+    }
+
+    private void renderMeHome(LinearLayout page) {
+        LinearLayout profile = new LinearLayout(this);
+        profile.setGravity(Gravity.CENTER_VERTICAL);
+        profile.setPadding(dp(18), dp(24), dp(14), dp(24));
+        profile.setBackground(MaiChatTheme.rounded(Color.WHITE, 22, this));
+        profile.setContentDescription("个人资料");
+        profile.setOnClickListener(view -> { mePage = MePage.PROFILE; render(); });
+        selfAvatarSize = 64;
+        selfAvatarContainer = new FrameLayout(this);
+        profile.addView(selfAvatarContainer, new LinearLayout.LayoutParams(dp(64), dp(64)));
+        LinearLayout text = new LinearLayout(this);
+        text.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(0, -2, 1);
+        textParams.leftMargin = dp(18);
+        profile.addView(text, textParams);
+        selfNameLabel = MaiChatTheme.label(this, "", 20, MaiChatTheme.TEXT);
+        selfNameLabel.setTypeface(MaiChatTypography.semibold());
+        selfNameLabel.setSingleLine(true);
+        selfNameLabel.setEllipsize(TextUtils.TruncateAt.END);
+        text.addView(selfNameLabel, matchWrap());
+        selfAccountLabel = MaiChatTheme.text(this, "", 14, MaiChatTheme.SECONDARY);
+        selfAccountLabel.setSingleLine(true);
+        selfAccountLabel.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        LinearLayout.LayoutParams accountParams = matchWrap();
+        accountParams.topMargin = dp(6);
+        text.addView(selfAccountLabel, accountParams);
+        LinearLayout connection = new LinearLayout(this);
+        connection.setGravity(Gravity.CENTER_VERTICAL);
+        selfConnectionDot = statusDot();
+        connection.addView(selfConnectionDot, new LinearLayout.LayoutParams(dp(8), dp(8)));
+        selfConnectionLabel = MaiChatTheme.text(this, "", 12, MaiChatTheme.SECONDARY);
+        LinearLayout.LayoutParams statusParams = wrapWrap();
+        statusParams.leftMargin = dp(6);
+        connection.addView(selfConnectionLabel, statusParams);
+        LinearLayout.LayoutParams connectionParams = matchWrap();
+        connectionParams.topMargin = dp(6);
+        text.addView(connection, connectionParams);
+        profile.addView(settingsChevron(), new LinearLayout.LayoutParams(dp(14), dp(20)));
+        page.addView(profile, matchWrap());
+        View settings = preferenceRow("设置", "", R.drawable.ic_ui_gear,
+            () -> { mePage = MePage.SETTINGS; render(); });
+        settings.setBackground(MaiChatTheme.rounded(Color.WHITE, 24, this));
+        LinearLayout.LayoutParams settingsParams = match(dp(52));
+        settingsParams.topMargin = dp(32);
+        page.addView(settings, settingsParams);
+    }
+
+    private void renderPersonalProfile(LinearLayout page) {
+        LinearLayout avatarRow = new LinearLayout(this);
+        avatarRow.setGravity(Gravity.CENTER_VERTICAL);
+        avatarRow.setPadding(dp(16), dp(12), dp(16), dp(12));
+        avatarRow.addView(MaiChatTheme.text(this, "头像", 16, MaiChatTheme.TEXT),
+            new LinearLayout.LayoutParams(0, -2, 1));
+        selfAvatarRow = avatarRow;
+        avatarRow.setContentDescription("更换头像");
+        avatarRow.setOnClickListener(view -> chooseAvatar());
+        selfAvatarProgress = new ProgressBar(this);
+        LinearLayout.LayoutParams savingParams = new LinearLayout.LayoutParams(dp(20), dp(20));
+        savingParams.rightMargin = dp(12);
+        avatarRow.addView(selfAvatarProgress, savingParams);
+        selfAvatarSize = 48;
+        selfAvatarContainer = new FrameLayout(this);
+        avatarRow.addView(selfAvatarContainer, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        LinearLayout.LayoutParams arrowParams = new LinearLayout.LayoutParams(dp(12), dp(18));
+        arrowParams.leftMargin = dp(10);
+        avatarRow.addView(settingsChevron(), arrowParams);
+        View nickname = preferenceRow("昵称", session.nickname(), 0, this::showNicknameDialog);
+        selfNameLabel = (TextView) nickname.findViewWithTag("preference-value");
+        View account = preferenceRow("账号", session.accountId(), 0, this::copyOwnAccountId);
+        selfAccountLabel = (TextView) account.findViewWithTag("preference-value");
+        page.addView(preferenceGroup("", avatarRow, nickname, account,
+            preferenceRow("我的好友二维码", "", R.drawable.ic_ui_qr,
+                this::showMyFriendCodeDialog),
+            preferenceRow("扫码登录桌面端", "", R.drawable.ic_ui_scan,
+                () -> startActivity(new Intent(this, DesktopLoginApprovalActivity.class)))), matchWrap());
+    }
+
+    private void renderAccountPreferences(LinearLayout page) {
+        page.addView(preferenceGroup("账号",
+            preferenceRow("登录账号", session.accountId(), 0, this::copyOwnAccountId, false),
+            preferenceRow("切换账号", "", 0, this::switchAccountFromSettings, false),
+            preferenceRow("设置或修改登录密码", "", 0, () -> {
+                try { openAccountPasswordForm(); }
+                catch (Exception failure) { toast("请先登录后在前台打开密码页"); }
+            }),
+            preferenceRow("注销账号", "", 0,
+                () -> { mePage = MePage.ACCOUNT_DELETION; render(); })), matchWrap());
+        View provider = preferenceRow("语音识别服务",
+            MaiChatAuthClient.shared(this).speechRecognitionProvider().title(), 0,
+            this::chooseSpeechRecognitionProvider, false);
+        speechProviderValue = provider.findViewWithTag("preference-value");
+        ImageView selector = new ImageView(this);
+        selector.setImageResource(R.drawable.ic_ui_chevron_up_down);
+        selector.setColorFilter(Color.rgb(142, 142, 147));
+        LinearLayout.LayoutParams selectorParams = new LinearLayout.LayoutParams(dp(14), dp(20));
+        selectorParams.leftMargin = dp(7);
+        ((LinearLayout) provider).addView(selector, selectorParams);
+        page.addView(preferenceGroup("语音", provider), matchWrap());
+        page.addView(preferenceGroup("隐私与支持",
+            preferenceRow("隐私政策", "", 0,
+                () -> openLoginDocument("https://ichat.life/legal/privacy.html"), false),
+            preferenceRow("用户协议", "", 0,
+                () -> openLoginDocument("https://ichat.life/legal/terms.html"), false),
+            preferenceRow("联系我们", "", 0,
+                () -> openLoginDocument("mailto:1925271463@kongshang.com"), false),
+            preferenceRow("我的举报", "", 0,
+                () -> { mePage = MePage.REPORTS; render(); })), matchWrap());
+    }
+
+    private void chooseSpeechRecognitionProvider() {
+        SpeechRecognitionProvider[] providers = SpeechRecognitionProvider.values();
+        String[] titles = new String[providers.length];
+        SpeechRecognitionProvider selected = MaiChatAuthClient.shared(this).speechRecognitionProvider();
+        int checked = 0;
+        for (int index = 0; index < providers.length; index++) {
+            titles[index] = providers[index].title();
+            if (providers[index] == selected) checked = index;
+        }
+        new AlertDialog.Builder(this).setTitle("语音识别服务")
+            .setSingleChoiceItems(titles, checked, (dialog, which) -> {
+                SpeechRecognitionProvider provider = providers[which];
+                getSharedPreferences("maichat.speech", MODE_PRIVATE).edit()
+                    .putString("maichat.speech.provider", provider.id()).apply();
+                MaiChatAuthClient.shared(this).setSpeechRecognitionProvider(provider);
+                if (speechProviderValue != null) speechProviderValue.setText(provider.title());
+                dialog.dismiss();
+            }).setNegativeButton("取消", null).show();
+    }
+
+    private void updateSelfProfilePresentation() {
+        RemoteIMContact profile = session.selfProfile();
+        boolean savingAvatar = avatarUploadIdentity != null
+            && session.isAvatarChangeIdentityCurrent(avatarUploadIdentity);
+        if (selfAvatarProgress != null) selfAvatarProgress.setVisibility(savingAvatar ? View.VISIBLE : View.GONE);
+        if (selfAvatarRow != null) selfAvatarRow.setEnabled(!savingAvatar
+            && session.connectionState() == TencentIMClient.ConnectionState.CONNECTED);
+        if (selfNameLabel != null) selfNameLabel.setText(mePage == MePage.PROFILE
+            ? (session.nickname().isEmpty() ? "未设置" : session.nickname()) : profile.displayName());
+        if (selfAccountLabel != null) selfAccountLabel.setText(session.accountId());
+        if (selfConnectionLabel != null) selfConnectionLabel.setText("消息" + connectionText());
+        if (selfConnectionDot != null)
+            selfConnectionDot.setBackground(statusDot().getBackground());
+        String avatarKey = profile.userId() + "|" + profile.avatarUrl() + "|" + session.connectionState();
+        if (selfAvatarContainer != null && !avatarKey.equals(renderedSelfAvatar)) {
+            selfAvatarContainer.removeAllViews();
+            selfAvatarContainer.addView(avatar(profile, true, selfAvatarSize),
+                new FrameLayout.LayoutParams(-1, -1));
+            renderedSelfAvatar = avatarKey;
+        }
+    }
+
+    private ImageView settingsChevron() {
+        ImageView arrow = new ImageView(this);
+        arrow.setImageResource(R.drawable.ic_ui_chevron_right);
+        arrow.setColorFilter(Color.rgb(199, 199, 204));
+        return arrow;
+    }
+
+    private View preferenceRow(String title, String value, int iconResource, Runnable action) {
+        return preferenceRow(title, value, iconResource, action, true);
+    }
+
+    private View preferenceRow(String title, String value, int iconResource, Runnable action, boolean chevron) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16), dp(12), dp(16), dp(12));
+        row.setMinimumHeight(dp(52));
+        row.setContentDescription(title);
+        if (iconResource != 0) {
+            ImageView icon = new ImageView(this);
+            icon.setImageResource(iconResource);
+            icon.setColorFilter(MaiChatTheme.BLUE);
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(24), dp(24));
+            params.rightMargin = dp(16);
+            row.addView(icon, params);
+        }
+        TextView label = MaiChatTheme.text(this, title, 16,
+            title.equals("注销账号") ? MaiChatTheme.RED
+                : title.equals("切换账号") || title.equals("隐私政策") || title.equals("用户协议")
+                    || title.equals("联系我们") ? MaiChatTheme.BLUE : MaiChatTheme.TEXT);
+        row.addView(label, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView detail = MaiChatTheme.text(this, value, 14,
+            title.equals("登录账号") ? MaiChatTheme.TEXT : MaiChatTheme.SECONDARY);
+        detail.setTag("preference-value");
+        detail.setSingleLine(true);
+        detail.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        detail.setMaxWidth(dp(190));
+        row.addView(detail, wrapWrap());
+        if (action != null) {
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(12), dp(18));
+            params.leftMargin = dp(10);
+            if (chevron) row.addView(settingsChevron(), params);
+            row.setOnClickListener(view -> action.run());
+        }
+        return row;
+    }
+
+    private View preferenceGroup(String title, View... rows) {
+        LinearLayout group = new LinearLayout(this);
+        group.setOrientation(LinearLayout.VERTICAL);
+        group.setPadding(0, 0, 0, dp(24));
+        if (!title.isEmpty()) {
+            TextView heading = MaiChatTheme.text(this, title, 14, Color.rgb(142, 142, 147));
+            heading.setPadding(dp(16), 0, 0, dp(8));
+            group.addView(heading, matchWrap());
+        }
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(MaiChatTheme.rounded(Color.WHITE, 18, this));
+        card.setClipToOutline(true);
+        for (int index = 0; index < rows.length; index++) {
+            if (index > 0) {
+                View divider = new View(this);
+                divider.setBackgroundColor(Color.rgb(232, 232, 237));
+                LinearLayout.LayoutParams line = match(dp(0.5f));
+                line.leftMargin = dp(16);
+                card.addView(divider, line);
             }
+            card.addView(rows[index], matchWrap());
+        }
+        group.addView(card, matchWrap());
+        return group;
+    }
+
+    /** 只申请用户选中的图片 URI，避免为换头像索取整个相册权限。 */
+    private void chooseAvatar() {
+        if (destroyed || avatarUploadIdentity != null) return;
+        if (session.connectionState() != TencentIMClient.ConnectionState.CONNECTED) {
+            toast("消息连接恢复后可更换头像");
+            return;
+        }
+        String identity = session.avatarChangeIdentity();
+        if (!session.isAvatarChangeIdentityCurrent(identity)) return;
+        pendingAvatarIdentity = identity;
+        Intent picker = Build.VERSION.SDK_INT >= 33
+            ? new Intent(MediaStore.ACTION_PICK_IMAGES).setType("image/*")
+            : avatarDocumentPicker();
+        try {
+            startActivityForResult(picker, REQUEST_PICK_AVATAR);
+        } catch (android.content.ActivityNotFoundException unavailable) {
+            try { startActivityForResult(avatarDocumentPicker(), REQUEST_PICK_AVATAR); }
+            catch (android.content.ActivityNotFoundException failure) {
+                pendingAvatarIdentity = null;
+                toast("无法打开相册，请稍后重试");
+            }
+        }
+    }
+
+    private Intent avatarDocumentPicker() {
+        return new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("image/*").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+    }
+
+    private void uploadSelectedAvatar(File file, String identity) {
+        if (file == null) return;
+        if (destroyed || !session.isAvatarChangeIdentityCurrent(identity)) { file.delete(); return; }
+        avatarUploadIdentity = identity;
+        avatarUploadFile = file;
+        updateSelfProfilePresentation();
+        // 普通资料页和工具共用同一 Session 事务；只有 SDK 确认成功后才显示新头像。
+        session.uploadSelfAvatar(file, identity, error -> {
+            file.delete();
+            if (avatarUploadFile == file) avatarUploadFile = null;
+            if (!identity.equals(avatarUploadIdentity)) return;
+            avatarUploadIdentity = null;
+            if (destroyed || !session.isAvatarChangeIdentityCurrent(identity)) return;
+            updateSelfProfilePresentation();
+            toast(error == null ? "头像已更新" : error);
         });
+    }
+
+    private void clearInvalidAvatarSelection() {
+        if (pendingAvatarIdentity != null && !session.isAvatarChangeIdentityCurrent(pendingAvatarIdentity))
+            pendingAvatarIdentity = null;
+        if (avatarUploadIdentity != null && !session.isAvatarChangeIdentityCurrent(avatarUploadIdentity)) {
+            avatarUploadIdentity = null;
+            clearAvatarUploadFile();
+        }
+        if (avatarCropIdentity != null && !session.isAvatarChangeIdentityCurrent(avatarCropIdentity)) {
+            avatarCropIdentity = null;
+            Dialog stale = avatarCropDialog;
+            avatarCropDialog = null;
+            if (stale != null) stale.dismiss();
+        }
+    }
+
+    private void clearAvatarSelection() {
+        pendingAvatarIdentity = avatarCropIdentity = avatarUploadIdentity = null;
+        clearAvatarUploadFile();
+        Dialog stale = avatarCropDialog;
+        avatarCropDialog = null;
+        if (stale != null) stale.dismiss();
+    }
+
+    private void clearAvatarUploadFile() {
+        File stale = avatarUploadFile;
+        avatarUploadFile = null;
+        if (stale != null) stale.delete();
+    }
+
+    private void copyOwnAccountId() {
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        clipboard.setPrimaryClip(ClipData.newPlainText("MaiChat account ID", session.accountId()));
+        toast("完整账号 ID 已复制");
+    }
+
+    private void switchAccountFromSettings() {
+        try {
+            session.logout();
+            showLoginAfterAccountChange();
+        } catch (IOException error) { toast("切换账号失败"); }
+    }
+
+    private void finishAcceptedAccountDeletion() {
+        // 仅已受理的注销回执可进入；离线退出并按原 owner 清理，不再用失效凭据请求远端 logout。
+        session.completeAcceptedAccountDeletion();
+        showLoginAfterAccountChange();
+    }
+
+    private void showLoginAfterAccountChange() {
+        loginAcceptedTerms = false; loginConfirmedAge = false;
+        loginUserDraft = ""; loginCodeDraft = ""; loginPasswordDraft = "";
+        loginChallengeId = ""; loginUsesPassword = false;
+        showInitialLogin = true; activeTab = RemoteIMTab.MESSAGES;
+        activeChatUserId = null; mePage = MePage.HOME;
+        render();
     }
 
     private void showCloudDrive() {
         if (cloudDriveDialog != null && cloudDriveDialog.isShowing()) return;
-        cloudDriveDialog = new MaiCloudDriveDialog(this);
+        cloudDriveDialog = new MaiCloudDriveDialog(this, cloudDirectoryState);
         cloudDriveDialog.show();
     }
 
@@ -4297,6 +4827,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
 
     private void sendText() {
         if (messageInput == null) return;
+        imVoiceResultGuard.submitted();
+        if (imTranscriptionOverlay != null) cancelVoiceRecording();
         String text = messageInput.getText().toString().trim();
         if (text.isEmpty()) return;
         try {
@@ -4366,14 +4898,15 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
     private void updateSpeechPreview() {
         if (speechPreview != null) {
-            speechPreview.setText(speechText);
-            speechPreview.setVisibility(holdingVoice && videoDialog == null
+            speechPreview.setText(cancelRecording ? "松开取消" : speechText);
+            speechPreview.setVisibility(holdingVoice && imTranscriptionOverlay == null && videoDialog == null
                 ? View.VISIBLE : View.GONE);
         }
         if (videoTranscriptOverlay != null) {
-            String text = assistantVoiceActive ? assistantVoiceText : speechText;
+            String text = assistantVoiceActive ? assistantVoiceText
+                : cancelRecording ? "松开取消" : speechText;
             videoTranscriptOverlay.setText(text.isEmpty() ? "正在听，请说话…" : text);
-            videoTranscriptOverlay.setVisibility(holdingVoice || assistantVoiceActive
+            videoTranscriptOverlay.setVisibility((holdingVoice && imTranscriptionOverlay == null) || assistantVoiceActive
                 ? View.VISIBLE : View.GONE);
         }
     }
@@ -4383,82 +4916,130 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         assistantVoiceText = text == null ? "" : text;
         updateSpeechPreview();
     }
-    private void startVoiceRecording() {
+    private void startVoiceRecording() { startVoiceRecording(false, 0, 0); }
+
+    // 独立语音按钮直接发语音；空编辑框长按才领取账号临时凭据并直连 ASR。
+    private boolean startVoiceRecording(boolean transcribe, float rawX, float rawY) {
+        if (imTranscriptionOverlay != null) cancelVoiceRecording();
         SendTarget target = sendTarget();
-        if (!canSend(target)) return;
+        if (!canSend(target)) return false;
         stopAudioPlayback();
-        holdingVoice = true; speechText = "开始说话…";
         long uiGeneration = ++voiceUiGeneration;
-        updateSpeechPreview();
-        voiceRecorder.start(new VoiceRecordingController.Completion() {
+        long revision = imVoiceResultGuard.snapshot();
+        VoiceTranscriptionResult capture = transcribe ? new VoiceTranscriptionResult() : null;
+        VoiceTranscriptionOverlay overlay = transcribe ? new VoiceTranscriptionOverlay(this, false, rawX, rawY,
+            action -> finishIMTranscription(capture, action)) : null;
+        boolean started = voiceRecorder.tryStart(new VoiceRecordingController.Completion() {
             @Override public void partial(String text) {
                 if (uiGeneration != voiceUiGeneration || !holdingVoice || !canSend(target)) return;
-                speechText = text.length() > 200 ? text.substring(text.offsetByCodePoints(
-                                                           0, Math.max(0, text.codePointCount(0, text.length()) - 160)))
-                                                 : text;
+                // 统一由浮层按真实宽度保留末 180 字及末八行，宿主不提前截短结果。
+                speechText = text == null ? "" : text;
+                if (overlay != null) overlay.updateText(speechText);
                 updateSpeechPreview(); session.updateHumanTyping(target.peer, true);
             }
             @Override public void recognized(String text, File file, int seconds) {
-                if (!canSend(target)) return;
+                if (transcribe) {
+                    mediaExecutor.execute(file::delete);
+                    deliverIMTranscription(capture, overlay, target, uiGeneration, revision, text);
+                    return;
+                }
+                if (uiGeneration != voiceUiGeneration || !canSend(target)) {
+                    mediaExecutor.execute(file::delete);
+                    return;
+                }
                 try {
                     didSend(target, session.sendTextMessageTo(target.peer, text, target.quote));
                     mediaExecutor.execute(file::delete);
-                } catch (IOException | RuntimeException error) { sendVoiceFallback(file, seconds, target); }
+                } catch (IOException | RuntimeException error) {
+                    // 识别成功但发送失败保留文字供重试，不把转写手势改成发送语音。
+                    String draftKey = target.owner + "\0" + target.peer;
+                    String newerDraft = draftsByPeer.getOrDefault(draftKey, "");
+                    // 松手后用户可能已继续输入；失败恢复追加转写，不能覆盖后续草稿。
+                    String recovered = newerDraft.isEmpty() ? text : newerDraft + "\n" + text;
+                    draftsByPeer.put(draftKey, recovered);
+                    if (target.peer.equals(activeChatUserId) && target.owner.equals(displayedOwner)) {
+                        draftText = recovered;
+                        if (messageInput != null) messageInput.setText(recovered);
+                    }
+                    mediaExecutor.execute(file::delete);
+                    toast("文字发送失败，已保留草稿");
+                }
             }
-            @Override public void finished(File file, int seconds) { transcribeThenSend(file, seconds, target); }
+            @Override public void finished(File file, int seconds) {
+                if (uiGeneration != voiceUiGeneration || !canSend(target) || transcribe) {
+                    mediaExecutor.execute(file::delete);
+                    if (transcribe) closeIMTranscription(capture);
+                    if (transcribe && uiGeneration == voiceUiGeneration && canSend(target))
+                        toast("没有识别到文字");
+                    return;
+                }
+                sendVoiceFallback(file, seconds, target);
+            }
             @Override public void failed() {
-                if (destroyed) return;
-                if (uiGeneration == voiceUiGeneration) { holdingVoice = false; updateSpeechPreview(); }
-                toast("录音失败，请重试");
+                if (destroyed || uiGeneration != voiceUiGeneration) return;
+                if (transcribe) closeIMTranscription(capture);
+                holdingVoice = false; updateSpeechPreview();
+                toast(transcribe ? "语音转文字失败，请重试" : "录音失败，请重试");
             }
-        });
+        }, transcribe ? () -> MaiChatAuthClient.shared(this).realtimeAsrTicket() : null);
+        if (!started) {
+            toast("麦克风正在被其他录音使用");
+            return false;
+        }
+        holdingVoice = true; cancelRecording = false; speechText = "正在听，请说话…";
+        if (transcribe) {
+            imTranscription = capture; imTranscriptionOverlay = overlay;
+            overlay.show();
+        }
+        updateSpeechPreview();
+        return true;
     }
     private void finishVoiceRecording() {
+        if (!holdingVoice) return;
         holdingVoice = false; updateSpeechPreview(); session.stopHumanTyping();
         if (voiceRecorder != null) voiceRecorder.finish(false);
     }
 
-    /**
-     * 录完先转文字发文字；识别不可用或失败时回退成发语音消息——用户说过的话不能因为
-     * 识别这一环出问题就凭空消失。
-     */
-    private void transcribeThenSend(java.io.File audioFile, int duration, SendTarget target) {
-        if (!canSend(target)) return;
-        if (speechRecognizer == null || !speechRecognizer.isAvailable()) {
-            sendVoiceFallback(audioFile, duration, target);
-            return;
-        }
-        toast("正在识别…");
-        speechRecognizer.transcribe(
-                audioFile, audioFile.getName().endsWith(".aac") ? "aac" : "m4a", new SpeechRecognizer.Callback() {
-                    @Override
-                    public void onText(String text) {
-                        if (!canSend(target))
-                            return;
-                        if (text == null || text.trim().isEmpty()) {
-                            toast("没听清，已按语音发送");
-                            sendVoiceFallback(audioFile, duration, target);
-                            return;
-                        }
-                        try {
-                            RemoteIMMessage queued = session.sendTextMessageTo(target.peer, text.trim(), target.quote);
-                            didSend(target, queued);
-                        } catch (RuntimeException | IOException error) {
-                            toast("识别成功但发送失败，已按语音发送");
-                            sendVoiceFallback(audioFile, duration, target);
-                            return;
-                        }
-                        mediaExecutor.execute(audioFile::delete);
-                    }
-
-                    @Override
-                    public void onError(String message) {
-                        if (!canSend(target))
-                            return;
-                        toast(message == null || message.isEmpty() ? "语音识别失败，已按语音发送" : message);
-                        sendVoiceFallback(audioFile, duration, target);
-                    }
-                });
+    private void finishIMTranscription(VoiceTranscriptionResult capture, VoiceTranscriptionOverlay.Action action) {
+        if (capture == null || capture != imTranscription || !capture.release(action)) return;
+        if (action == VoiceTranscriptionOverlay.Action.CANCEL) { cancelVoiceRecording(); return; }
+        holdingVoice = false;
+        session.stopHumanTyping();
+        imTranscriptionOverlay.finishing(action);
+        updateSpeechPreview();
+        voiceRecorder.finish(false);
+    }
+    private boolean currentIMTranscription(VoiceTranscriptionResult capture, SendTarget target,
+                                           long generation, long revision) {
+        return capture == imTranscription && generation == voiceUiGeneration && canSend(target)
+            && target.peer.equals(activeChatUserId) && target.owner.equals(displayedOwner)
+            && messageInput != null && imVoiceResultGuard.accepts(revision, true);
+    }
+    private void deliverIMTranscription(VoiceTranscriptionResult capture, VoiceTranscriptionOverlay overlay,
+                                        SendTarget target, long generation, long revision, String text) {
+        boolean current = currentIMTranscription(capture, target, generation, revision);
+        VoiceTranscriptionOverlay.Action action = capture.finalAction(text, current);
+        if (action == null) { closeIMTranscription(capture); return; }
+        String finalText = text.trim();
+        overlay.updateText(finalText);
+        getWindow().getDecorView().postDelayed(() -> {
+            if (!currentIMTranscription(capture, target, generation, revision)) {
+                closeIMTranscription(capture); return;
+            }
+            closeIMTranscription(capture);
+            imVoiceResultGuard.writeTranscript(() -> messageInput.setText(finalText));
+            if (action == VoiceTranscriptionOverlay.Action.EDIT) {
+                messageInput.requestFocus();
+                messageInput.setSelection(messageInput.length());
+                ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
+                    .showSoftInput(messageInput, InputMethodManager.SHOW_IMPLICIT);
+            } else sendText();
+        }, 240);
+    }
+    private void closeIMTranscription(VoiceTranscriptionResult capture) {
+        if (capture != imTranscription) return;
+        if (imTranscriptionOverlay != null) imTranscriptionOverlay.dismiss();
+        imTranscriptionOverlay = null; imTranscription = null;
     }
 
     private void sendVoiceFallback(File audioFile, int duration, SendTarget target) {
@@ -4471,6 +5052,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         }
     }
     private void cancelVoiceRecording() {
+        if (imTranscription != null) {
+            imTranscription.invalidate();
+            closeIMTranscription(imTranscription);
+        }
         holdingVoice = false; voiceUiGeneration++; updateSpeechPreview();
         if (session != null) session.stopHumanTyping();
         if (voiceRecorder != null) voiceRecorder.finish(true);
@@ -4854,7 +5439,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         List<GalleryItem> playlist = normalizeGallery(path, true, candidates);
         final int[] selected = {galleryIndex(playlist, path, true)};
         final String[] currentPath = {path};
-        Dialog dialog = new Dialog(this, android.R.style.Theme_Black_NoTitleBar);
+        Dialog dialog = new MaiVideoPreviewDialog(this);
         LinearLayout rootView = new LinearLayout(this);
         rootView.setOrientation(LinearLayout.VERTICAL);
         rootView.setBackgroundColor(Color.BLACK);
@@ -4862,8 +5447,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         rootView.addView(frame, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
+        // 44dp 点击区加上下各 8dp；操作行与播放器预留使用同一高度，避免留下空白或遮挡。
+        final int actionsHeightDp = 60;
         MaiFfplayVideoView video = new MaiFfplayVideoView(this);
-        video.setControlsBottomInset(cloudVod == null ? 72 : 0);
+        video.setControlsBottomInset(cloudVod == null ? actionsHeightDp : 0);
         if (cloudVod != null) video.setCloudVodHandle(cloudVod.handle());
         video.setVideoPath(path, startPositionUs);
         TextView mediaName = MaiChatTheme.text(this, "", 12, Color.WHITE);
@@ -4938,47 +5525,33 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         closeParams.setMargins(dp(18), dp(16), 0, 0);
         frame.addView(close, closeParams);
 
-        TextView expand = iconButton("⤢", 25, Color.WHITE);
-        expand.setContentDescription("放大视频");
-        expand.setBackground(MaiChatTheme.rounded(Color.argb(175, 55, 55, 55), 25, this));
-        expand.setOnClickListener(view -> {
-            videoExpanded = !videoExpanded;
-            expand.setText(videoExpanded ? "⤡" : "⤢");
-            expand.setContentDescription(videoExpanded ? "返回分屏" : "放大视频");
-            updateVideoDockLayout();
-        });
-        FrameLayout.LayoutParams expandParams =
-            new FrameLayout.LayoutParams(dp(50), dp(50), Gravity.TOP | Gravity.END);
-        expandParams.setMargins(0, dp(16), dp(18), 0);
-        frame.addView(expand, expandParams);
-
         LinearLayout actions = new LinearLayout(this);
         actions.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        actions.setPadding(dp(16), 0, dp(18), dp(10));
-        TextView share = videoAction("↗", "转发或分享");
+        actions.setPadding(dp(12), dp(8), dp(12), dp(8));
+        ImageButton share = videoAction(R.drawable.ic_ui_share, "转发或分享");
         share.setOnClickListener(view -> {
             if (cloudVod != null) toast("云盘视频正在点播，无法直接转发");
             else sharePreviewVideo(currentPath[0]);
         });
-        actions.addView(share, new LinearLayout.LayoutParams(dp(50), dp(50)));
-        TextView save = videoAction("↓", "保存到相册");
+        actions.addView(share, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        ImageButton save = videoAction(R.drawable.ic_ui_download, "保存到相册");
         save.setOnClickListener(view -> {
             if (cloudVod != null) toast("云盘视频正在点播，未下载到相册");
             else savePreviewVideo(currentPath[0]);
         });
-        LinearLayout.LayoutParams actionSpacing = new LinearLayout.LayoutParams(dp(50), dp(50));
-        actionSpacing.leftMargin = dp(12);
+        LinearLayout.LayoutParams actionSpacing = new LinearLayout.LayoutParams(dp(44), dp(44));
+        actionSpacing.leftMargin = dp(6);
         actions.addView(save, actionSpacing);
-        TextView copyPath = videoAction("⧉", "复制文件路径");
+        ImageButton copyPath = videoAction(R.drawable.ic_ui_copy, "复制文件路径");
         copyPath.setOnClickListener(view -> {
             if (cloudVod != null) toast("云盘视频没有本地文件路径");
             else copyToClipboard(currentPath[0]);
         });
-        LinearLayout.LayoutParams copySpacing = new LinearLayout.LayoutParams(dp(50), dp(50));
-        copySpacing.leftMargin = dp(12);
+        LinearLayout.LayoutParams copySpacing = new LinearLayout.LayoutParams(dp(44), dp(44));
+        copySpacing.leftMargin = dp(6);
         actions.addView(copyPath, copySpacing);
         if (cloudVod == null) frame.addView(actions, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(72), Gravity.BOTTOM));
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(actionsHeightDp), Gravity.BOTTOM));
 
         dialog.setOnDismissListener(d -> {
             MaiCloudVod.Session stream = cloudPlayerStreams.remove(dialog);
@@ -4991,26 +5564,14 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             if (videoDialog == dialog) {
                 videoDialog = null;
                 videoTranscriptOverlay = null;
-                videoExpanded = false;
                 updateSpeechPreview();
-                updateVideoDockLayout();
             }
         });
         dialog.setContentView(rootView);
         allowKeyboardLocation = false;
-        videoExpanded = false;
         videoDialog = dialog;
         dialog.show();
         updateSpeechPreview();
-        Window window = dialog.getWindow();
-        if (window != null) {
-            window.setBackgroundDrawable(new ColorDrawable(Color.BLACK));
-            window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-            window.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN);
-        }
-        updateVideoDockLayout();
         if (handoffPreview != null) {
             Handler handler = new Handler(Looper.getMainLooper());
             long deadline = SystemClock.uptimeMillis() + 8000;
@@ -5036,28 +5597,18 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         animateGalleryEntry(rootView, entryDirection);
     }
 
-    // Keep one player instance while the conversation remains usable beneath its dock.
-    private void updateVideoDockLayout() {
-        if (root == null || insetsHost == null) return;
+    // 横屏会话只按宿主的完整宽度排版；媒体预览在独立窗口中，不占据页面空间。
+    private void updateLandscapeConversationLayout() {
+        if (insetsHost == null) return;
         int width = insetsHost.getWidth();
-        int height = insetsHost.getHeight();
-        if (width <= 0 || height <= 0) return;
-        boolean docked = videoDialog != null && videoDialog.isShowing() && !videoExpanded;
-        boolean landscape = width > height && width >= dp(600);
-        int dockHeight = docked && !landscape
-            ? (keyboardVisible ? dp(240) : Math.min(Math.max((int) (height * 0.62f), dp(320)), dp(560)))
-            : 0;
-        int dockWidth = docked && landscape
-            ? Math.min((int) (width * (keyboardVisible ? 0.42f : 0.52f)), width - dp(340))
-            : 0;
+        if (width <= 0) return;
         if (landscapeConversationPane != null) {
-            int availableWidth = width - dockWidth;
-            boolean showSidebar = activeChatUserId == null || availableWidth >= dp(700);
+            boolean showSidebar = activeChatUserId == null || width >= dp(700);
             landscapeConversationPane.setVisibility(showSidebar ? View.VISIBLE : View.GONE);
             if (landscapeConversationDivider != null)
                 landscapeConversationDivider.setVisibility(showSidebar ? View.VISIBLE : View.GONE);
             if (showSidebar) {
-                int paneDp = Math.min(Math.max((int) (availableWidth /
+                int paneDp = Math.min(Math.max((int) (width /
                     getResources().getDisplayMetrics().density * 0.32f), 280), 360);
                 ViewGroup.LayoutParams paneParams = landscapeConversationPane.getLayoutParams();
                 if (paneParams != null && paneParams.width != dp(paneDp)) {
@@ -5066,25 +5617,6 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                 }
             }
         }
-        FrameLayout.LayoutParams contentParams = (FrameLayout.LayoutParams) root.getLayoutParams();
-        if (contentParams != null && (contentParams.topMargin != dockHeight
-                || contentParams.leftMargin != dockWidth)) {
-            contentParams.topMargin = dockHeight;
-            contentParams.leftMargin = dockWidth;
-            root.setLayoutParams(contentParams);
-        }
-        if (videoDialog == null || !videoDialog.isShowing()) return;
-        Window window = videoDialog.getWindow();
-        if (window == null) return;
-        WindowManager.LayoutParams params = window.getAttributes();
-        params.gravity = Gravity.TOP | Gravity.START;
-        int[] origin = new int[2];
-        insetsHost.getLocationOnScreen(origin);
-        params.x = origin[0];
-        params.y = origin[1];
-        params.width = videoExpanded ? width : (landscape ? dockWidth : width);
-        params.height = videoExpanded ? height : (landscape ? height : dockHeight);
-        window.setAttributes(params);
     }
 
     private void animateGalleryEntry(View content, int direction) {
@@ -5094,25 +5626,76 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         content.animate().translationX(0).alpha(1).setDuration(220).start();
     }
 
-    private TextView videoAction(String icon, String label) {
-        TextView button = iconButton(icon, 26, Color.WHITE);
+    private ImageButton videoAction(int icon, String label) {
+        ImageButton button = new ImageButton(this);
+        button.setImageResource(icon);
+        button.setImageTintList(ColorStateList.valueOf(Color.WHITE));
+        button.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
         button.setContentDescription(label);
-        button.setBackground(MaiChatTheme.rounded(Color.argb(105, 255, 255, 255), 25, this));
+        // 44dp 按钮内绘制 24dp 矢量，只在按压时给轻反馈，不用大圆底抢占画面。
+        button.setBackground(new RippleDrawable(ColorStateList.valueOf(Color.argb(35, 255, 255, 255)),
+            null, MaiChatTheme.rounded(Color.WHITE, 8, this)));
+        button.setPadding(dp(10), dp(10), dp(10), dp(10));
         return button;
     }
 
     private void sharePreviewVideo(String path) {
         File source = new File(path);
         if (!source.isFile()) { toast("视频文件已丢失"); return; }
+        String shareOwner = displayedOwner;
+        int shareGeneration = session.accountGeneration();
         try {
-            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", source);
-            Intent share = new Intent(Intent.ACTION_SEND);
-            share.setType("video/*");
-            share.putExtra(Intent.EXTRA_STREAM, uri);
-            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivity(Intent.createChooser(share, "转发或分享视频"));
-        } catch (Exception error) {
-            toast("无法分享视频");
+            mediaExecutor.execute(() -> {
+                File exported = null;
+                try {
+                    if (destroyed || shareGeneration != session.accountGeneration()) return;
+                    // 创作附件可能位于 no_backup 工作区，FileProvider 只允许 files/cache；
+                    // 沿用创作媒体的缓存导出方式，不扩大共享根目录，也不改动原视频。
+                    String name = source.getName();
+                    int dot = name.lastIndexOf('.');
+                    String suffix = dot >= 0 && name.length() - dot <= 16 ? name.substring(dot) : ".video";
+                    exported = File.createTempFile("shared-video-", suffix, getCacheDir());
+                    try (InputStream input = new FileInputStream(source);
+                         OutputStream output = new FileOutputStream(exported)) {
+                        byte[] buffer = new byte[64 * 1024];
+                        int count;
+                        while ((count = input.read(buffer)) != -1) {
+                            if (destroyed || shareGeneration != session.accountGeneration()
+                                || Thread.currentThread().isInterrupted())
+                                throw new IOException("Video export canceled");
+                            output.write(buffer, 0, count);
+                        }
+                    }
+                    File ready = exported;
+                    runOnUiThread(() -> {
+                        // 同一 Activity 内切换账号也必须取消旧账号尚未完成的导出。
+                        if (destroyed || isFinishing() || shareGeneration != session.accountGeneration()
+                            || !java.util.Objects.equals(shareOwner, displayedOwner)) {
+                            ready.delete(); return;
+                        }
+                        try {
+                            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", ready);
+                            Intent share = new Intent(Intent.ACTION_SEND);
+                            share.setType("video/*");
+                            share.putExtra(Intent.EXTRA_STREAM, uri);
+                            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                            startActivity(Intent.createChooser(share, "转发或分享视频"));
+                            // 接收方会异步读取 URI；成功启动后保留缓存，交由系统按缓存策略回收。
+                        } catch (Exception error) {
+                            ready.delete();
+                            toast("无法分享视频");
+                        }
+                    });
+                } catch (Exception error) {
+                    if (exported != null) exported.delete();
+                    runOnUiThread(() -> {
+                        if (!destroyed && !isFinishing() && shareGeneration == session.accountGeneration())
+                            toast("无法分享视频");
+                    });
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            if (!destroyed && !isFinishing()) toast("无法分享视频");
         }
     }
 
@@ -5476,6 +6059,12 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         int selected = galleryIndex(playlist, path, false);
         Dialog dialog = reuseDialog ? imageDialog :
             new Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+        if (Build.VERSION.SDK_INT >= 28 && dialog.getWindow() != null) {
+            // 全屏主题仍会避开默认刘海安全区；只扩展图片窗口，不改变透明气泡动画或导航边距。
+            WindowManager.LayoutParams imageWindow = dialog.getWindow().getAttributes();
+            imageWindow.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            dialog.getWindow().setAttributes(imageWindow);
+        }
         FrameLayout frame = new FrameLayout(this);
         frame.setBackgroundColor(bubbleEntry ? Color.TRANSPARENT : Color.BLACK);
         View dim = new View(this);
@@ -6212,6 +6801,18 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         view.setClickable(true);
         view.setFocusable(true);
         return view;
+    }
+
+    /** 两个聊天输入条使用相同 24dp 图标，避免 Canvas 缩放与矢量图的视觉尺寸不一致。 */
+    private View composerIcon(int resource, int color) {
+        FrameLayout button = new FrameLayout(this);
+        button.setClickable(true);
+        button.setFocusable(true);
+        ImageView icon = new ImageView(this);
+        icon.setImageResource(resource);
+        icon.setColorFilter(color);
+        button.addView(icon, new FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER));
+        return button;
     }
 
     private View symbolButton(

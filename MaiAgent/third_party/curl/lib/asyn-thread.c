@@ -195,9 +195,11 @@ void destroy_thread_sync_data(struct thread_sync_data *tsd)
    * close one end of the socket pair (may be done in resolver thread);
    * the other end (for reading) is always closed in the parent thread.
    */
+#ifndef USE_EVENTFD
   if(tsd->sock_pair[1] != CURL_SOCKET_BAD) {
     wakeup_close(tsd->sock_pair[1]);
   }
+#endif
 #endif
   memset(tsd, 0, sizeof(*tsd));
 }
@@ -212,6 +214,12 @@ int init_thread_sync_data(struct thread_data *td,
   struct thread_sync_data *tsd = &td->tsd;
 
   memset(tsd, 0, sizeof(*tsd));
+
+#ifndef CURL_DISABLE_SOCKETPAIR
+  /* No descriptor is owned before wakeup_create succeeds. */
+  tsd->sock_pair[0] = CURL_SOCKET_BAD;
+  tsd->sock_pair[1] = CURL_SOCKET_BAD;
+#endif
 
   tsd->td = td;
   tsd->port = port;
