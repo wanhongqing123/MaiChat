@@ -590,12 +590,20 @@ struct AISessionRevealUITestRoot: View {
     var body: some View {
         RootView()
             .environmentObject(appState)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if AIPrimaryModelUITestSupport.isRequested { AIPrimaryModelUITestStatus() }
+            }
             .onAppear {
                 let owner = "session-reveal-ui-test"
                 appState.masterUserID = owner
                 appState.chatState = MasterChatState(ownerUserID: owner)
                 appState.hasCompletedInitialLogin = true
-                AIAssistantModel.shared.installSessionSwitchUITestFixture()
+                if AIPrimaryModelUITestSupport.isRequested {
+                    // session-reveal 路由会跳过普通页面 appear；这里显式进入真实准备与轮询链。
+                    // 不安装内存会话或生成替身，open/configure/send 仍由正式后端完成。
+                    AIAssistantModel.shared.uiTestSupport.screenFrameAccountID = owner
+                    AIAssistantModel.shared.appear()
+                } else { AIAssistantModel.shared.installSessionSwitchUITestFixture() }
             }
     }
 }

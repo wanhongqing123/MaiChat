@@ -84,7 +84,7 @@ struct AIAssistantView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSessions = false
     @State private var showActions = false
-    @State private var showingLocalModels = false
+    @State private var showingPrimaryModelSettings = false
     @State private var confirmClear = false
     @State private var imageSources = AIImageSourceFrameStore()
     @State private var confirmRemoteDelete = false
@@ -279,6 +279,7 @@ struct AIAssistantView: View {
                         Color.black.opacity(0.001).ignoresSafeArea().contentShape(Rectangle())
                             .onTapGesture { showActions = false }
                         AIActionPanel(
+                            selectedModel: model.settings.displayName,
                             selectedEffort: model.settings.effectiveReasoningEffort,
                             selectedPolicy: model.settings.policy,
                             canChangeSettings: model.selectedRemote == nil && model.configured &&
@@ -297,7 +298,7 @@ struct AIAssistantView: View {
                                 next.policy = policy
                                 Task { _ = await model.save(next) }
                             },
-                            localModels: { showActions = false; showingLocalModels = true },
+                            primaryModel: { showActions = false; showingPrimaryModelSettings = true },
                             clear: { showActions = false; confirmClear = true }
                         )
                         .padding(.top, 54).padding(.trailing, 14)
@@ -305,7 +306,7 @@ struct AIAssistantView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showingLocalModels) { AILocalModelsView() }
+            .sheet(isPresented: $showingPrimaryModelSettings) { AIPrimaryModelSettingsView(assistant: model) }
             // 右页的消息、输入和底部入口共用互锁；返回目录的透明按钮在禁用范围之外。
             // 这里只锁横向拖动、回弹及目录展开态，不能因普通纵向阅读而禁用 ScrollView。
             .environment(\.aiConversationActionsAllowed, { !conversationActionsBlocked })
@@ -1253,12 +1254,16 @@ private struct AIAssistantMessageList: View {
             }
             .padding(.top, 28)
             if !model.configured {
-                Text("登录后会自动连接主聊天模型")
+                Text(model.settings.isLocalModel
+                    ? "请在右上角“更多→主模型”中检查本地模型文件"
+                    : "登录后可使用云端主模型，也可在“更多→主模型”中选择本地 GGUF")
                     .font(.footnote).foregroundStyle(.secondary)
                     .padding(.top, 18)
                 Button("重试连接") {
                     Task {
-                        _ = try? await AICloudCredentialSync.refreshAccountModelKeysIfAvailable()
+                        if !model.settings.isLocalModel {
+                            _ = try? await AICloudCredentialSync.refreshAccountModelKeysIfAvailable()
+                        }
                         _ = await model.save(model.settings)
                     }
                 }
@@ -1333,13 +1338,14 @@ private struct AIHeaderButton: View {
 }
 
 private struct AIActionPanel: View {
+    let selectedModel: String
     let selectedEffort: String
     let selectedPolicy: String
     let canChangeSettings: Bool
     let canClear: Bool
     let selectEffort: (String) -> Void
     let selectPolicy: (String) -> Void
-    let localModels: () -> Void
+    let primaryModel: () -> Void
     let clear: () -> Void
     @State private var expandedSection: Section?
 
@@ -1350,6 +1356,22 @@ private struct AIActionPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            Button(action: primaryModel) {
+                HStack(spacing: 12) {
+                    Image(systemName: "cpu").frame(width: 18)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("主模型")
+                        Text(selectedModel).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption)
+                }
+                .padding(.horizontal, 14).padding(.vertical, 12)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("ai-primary-model-settings")
+            Divider().padding(.leading, 42)
             expandableAction(
                 title: "思考强度",
                 value: effortTitle(selectedEffort),
@@ -1383,9 +1405,6 @@ private struct AIActionPanel: View {
                         .padding(.bottom, 6)
                 }
             }
-            Divider().padding(.leading, 42)
-            action("本地模型", "cpu", Color.primary, localModels)
-                .accessibilityIdentifier("ai-local-models")
             Divider().padding(.leading, 42)
             action("清空当前对话", "trash", canClear ? Color.red : Color.secondary, clear)
                 .disabled(!canClear)
@@ -3039,29 +3058,27 @@ private struct AIComposer: View, Equatable {
                     .zIndex(composerEditMenuState == nil ? 0 : 20)
                 }
 
-                // 忙碌时通过发送补充/排队；输入栏不再挂载停止，也不另迁一个停止入口。
-                // idle 的附件按钮保留原行为，后端 stop API 仍供生命周期管理使用。
-                if !snapshot.busy {
-                    Button {
-                        composerEditMenuState = nil
-                        if isAttachmentPanelPresented {
-                            isAttachmentPanelPresented = false
-                        } else {
-                            focusController.dismiss()
-                            isAttachmentPanelPresented = true
-                        }
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(Color.primary)
-                            .frame(width: 44, height: 44)
-                            .background(Color(uiColor: .secondarySystemBackground), in: Circle())
-                            .overlay(Circle().stroke(RemoteIMStyle.border, lineWidth: 1))
+                // 只移除模型停止按钮。附件入口始终保留，前一条模型/上传/回执等待
+                // 不应阻止用户给下一条消息添加相册、拍摄或文件；新消息由同一队列接收。
+                Button {
+                    composerEditMenuState = nil
+                    if isAttachmentPanelPresented {
+                        isAttachmentPanelPresented = false
+                    } else {
+                        focusController.dismiss()
+                        isAttachmentPanelPresented = true
                     }
-                    .buttonStyle(.plain)
-                    .disabled(!snapshot.ready || snapshot.isSubmitting)
-                    .accessibilityLabel(isAttachmentPanelPresented ? "收起更多功能" : "展开更多功能")
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(Color.primary)
+                        .frame(width: 44, height: 44)
+                        .background(Color(uiColor: .secondarySystemBackground), in: Circle())
+                        .overlay(Circle().stroke(RemoteIMStyle.border, lineWidth: 1))
                 }
+                .buttonStyle(.plain)
+                .disabled(!snapshot.ready)
+                .accessibilityLabel(isAttachmentPanelPresented ? "收起更多功能" : "展开更多功能")
 
                 if hasDraftContent, snapshot.busy || !isVoiceMode {
                     Button { submitDraft() } label: {

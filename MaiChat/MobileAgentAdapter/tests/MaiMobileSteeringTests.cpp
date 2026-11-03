@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -43,12 +44,14 @@ struct HeldHost {
     bool entered = false;
     bool released = false;
     std::atomic<int> calls{0};
+    std::atomic<int> assetProbes{0};
     std::atomic<bool> destroyed{false};
 };
 
 const char* hostTool(void* context, const char* name, const char*) {
     auto& host = *static_cast<HeldHost*>(context);
     if (std::strcmp(name, "mobile_ark_service_config") == 0) {
+        ++host.assetProbes;
         // configure 只探测资产能力；合成宿主明确禁用它，不下发任何真实凭据。
         constexpr const char response[] = R"({"ok":false,"error":"Synthetic assets unavailable"})";
         auto* copied = static_cast<char*>(std::malloc(sizeof(response)));
@@ -130,6 +133,11 @@ int main() {
                           {"policy", "never"}});
         if (!configured.at("ok").get<bool>())
             throw std::runtime_error("configure failed: " + configured.value("error", std::string{}));
+        const Json cloudProbe = call(
+            handle,
+            {{"op", "local_model_probe"}, {"messages", Json::array({{{"role", "user"}, {"content", "Local only"}}})}});
+        check(!cloudProbe.at("ok") && cloudProbe.value("errorCode", "") == "not_configured",
+              "device probe could use a remote model instead of failing closed");
         const std::string session = call(handle, {{"op", "create"}}).at("id");
         const Json started =
             call(handle, {{"op", "send"}, {"session", session}, {"text", "Improve the current result"}});
@@ -212,6 +220,87 @@ int main() {
         check(host.calls.load() == 1, "steering restarted the completed host operation");
         std::puts(
             "PASS: real C ABI steering, persisted user, dedupe, stable turn, complete tool results, next model input");
+
+        // 配置检查不启动推理；真实 GGUF 生成与工具闭环由本地主模型专测/正常 App 另验。
+        // 这里独立证明参数不回绕、损坏文件不覆盖配置，失败不偷偷降级到 HTTP。
+        const int assetProbesBeforeLocal = host.assetProbes.load();
+        const auto localFile = workspace.append(MaiFilePath::fromUtf8("local-config-probe.gguf"));
+        check(!MaiFileSystem::writeFile(localFile, std::string("GGUF") + std::string(24, '\0')),
+              "local configuration probe creation failed");
+        Json localConfig{{"op", "configure"},
+                         {"database", workspace.append(MaiFilePath::fromUtf8("sessions.sqlite")).toUtf8()},
+                         {"workspace", workspace.toUtf8()},
+                         {"modelProvider", "llama"},
+                         {"wire", "local"},
+                         {"model", "local:configuration-probe"},
+                         {"localModelPath", localFile.toUtf8()},
+                         {"localContextSize", 32768},
+                         {"localMaximumTokens", 0},
+                         {"localThreads", 2},
+                         {"policy", "never"}};
+        auto invalid = localConfig;
+        invalid["localContextSize"] = std::uint64_t(-1);
+        const auto overflow = call(handle, invalid);
+        check(!overflow.at("ok") && overflow.value("errorCode", "") == "invalid_input",
+              "local context integer overflow was accepted");
+        invalid = localConfig;
+        invalid["localModelPath"] = workspace.append(MaiFilePath::fromUtf8("missing.gguf")).toUtf8();
+        const auto missing = call(handle, invalid);
+        check(!missing.at("ok") && missing.value("errorCode", "") == "not_found",
+              "missing local model was not explicitly rejected");
+        invalid = localConfig;
+        invalid["localModelPath"] = MaiFileSystem::temporaryDirectory().toUtf8();
+        const auto outside = call(handle, invalid);
+        check(!outside.at("ok") && outside.value("errorCode", "") == "invalid_input",
+              "local model escaped its application root");
+        const auto corrupt = call(handle, localConfig);
+        check(!corrupt.at("ok") && corrupt.value("errorCode", "") == "invalid_input",
+              "corrupt local GGUF replaced a valid configured Agent");
+        const auto retained = snapshot();
+        check(retained.at("configured") && retained.at("model") == "test-model",
+              "failed local configuration changed the original primary model");
+
+        // 可选的公开真实权重探针。显式复制到本测试 root 内，不放宽正式路径边界。
+        // 不设置该环境变量时只跑拒绝门禁，不宣称已验收真实模型配置。
+        if (const char* modelPath = std::getenv("MAI_LOCAL_PRIMARY_GGUF")) {
+            const auto validFile = workspace.append(MaiFilePath::fromUtf8("real-primary-model.gguf"));
+            std::error_code copyError;
+            std::filesystem::copy_file(std::filesystem::u8path(modelPath), std::filesystem::u8path(validFile.toUtf8()),
+                                       copyError);
+            check(!copyError, "public test GGUF could not be copied into the isolated workspace");
+            localConfig["localModelPath"] = validFile.toUtf8();
+            check(call(handle, localConfig).at("ok"), "valid local configuration required a cloud API key");
+            const std::string localSession = call(handle, {{"op", "create"}}).at("id");
+            check(call(handle, {{"op", "snapshot"}, {"session", localSession}, {"force", true}}).at("configured"),
+                  "local configured state still depended on an API key");
+            if (std::getenv("MAI_LOCAL_PRIMARY_RUN_PROBE")) {
+                const Json input{
+                    {"op", "local_model_probe"},
+                    {"timeout_ms", 120000},
+                    {"messages", Json::array({{{"role", "user"},
+                                               {"content", "Do not use tools. Reply with only: Hello from Qwen."}}})}};
+                const auto probe = call(handle, input);
+                check(
+                    probe.at("ok") && probe.at("tool_call_count") == 0 && !probe.at("text").get<std::string>().empty(),
+                    "real local non-executing client probe failed");
+                check(probe.at("wire") == "local", "device probe changed model execution mode");
+                const auto history = call(handle, {{"op", "messages_page"}, {"session", localSession}});
+                check(history.at("messages").empty(), "non-executing probe wrote session history");
+                auto invalidProbe = input;
+                invalidProbe["timeout_ms"] = std::uint64_t(-1);
+                check(!call(handle, invalidProbe).at("ok"), "probe deadline overflow was accepted");
+                invalidProbe = input;
+                invalidProbe["messages"][0]["role"] = "system";
+                check(!call(handle, invalidProbe).at("ok"), "probe allowed overriding model instructions");
+            }
+        }
+        check(host.assetProbes.load() == assetProbesBeforeLocal,
+              "local configuration unexpectedly probed cloud asset credentials");
+        {
+            std::lock_guard<std::mutex> lock(requestsMutex);
+            check(requests.size() == 2, "local configuration unexpectedly sent a remote model request");
+        }
+        std::puts("PASS: local C ABI configuration, no API key, limits, file boundary, no remote fallback");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         status = 1;

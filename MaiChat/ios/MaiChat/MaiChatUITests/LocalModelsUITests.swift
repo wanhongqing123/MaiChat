@@ -18,19 +18,31 @@ final class LocalModelsUITests: XCTestCase {
         tab.tap()
         XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 8))
         app.buttons["更多"].tap()
-        let entry = app.buttons["ai-local-models"]
+        let entry = app.buttons["ai-primary-model-settings"]
         XCTAssertTrue(entry.waitForExistence(timeout: 4))
         entry.tap()
+        app.buttons["primary-model-management"].tap()
+        let selfTest = app.buttons["primary-local-self-test"]
+        for _ in 0..<5 where !selfTest.isHittable { app.collectionViews.firstMatch.swipeUp() }
+        XCTAssertTrue(selfTest.isHittable)
+        selfTest.tap()
 
         let picker = app.buttons["local-model-picker"]
         XCTAssertTrue(picker.waitForExistence(timeout: 8))
+        // 主模型 QA 可能已经导入其他权重；自测显式选择 Tiny，不改账号主模型配置。
+        if !picker.label.contains("内置英文测试模型") {
+            picker.tap()
+            app.buttons["内置英文测试模型 · 1.2 MB"].tap()
+        }
         let builtinSelected = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "label CONTAINS %@", "内置英文测试模型"), object: picker)
         XCTAssertEqual(XCTWaiter.wait(for: [builtinSelected], timeout: 8), .completed,
-                       "Debug 正常页面应默认选中已随包安装的本地测试模型")
+                       "自测页应选中已随包安装的本地测试模型")
 
-        let form: XCUIElement = app.collectionViews.firstMatch.exists
-            ? app.collectionViews.firstMatch : app.tables.firstMatch
+        // 多层 sheet 的 Form 都保留在 AX 树；直接定位本页容器。
+        // Picker 滚出可见区域后会被系统回收，不能继续依赖其后代查询定位滚动容器。
+        let form = app.collectionViews["local-model-form"]
+        XCTAssertTrue(form.exists)
         func reveal(_ element: XCUIElement) {
             for _ in 0..<8 where !element.isHittable { form.swipeUp() }
             XCTAssertTrue(element.isHittable)
@@ -76,6 +88,10 @@ final class LocalModelsUITests: XCTestCase {
         emptyRuntime.lifetime = .keepAlways
         add(emptyRuntime)
         app.buttons["local-model-done"].tap()
+        XCTAssertTrue(app.buttons["primary-model-management-done"].waitForExistence(timeout: 4))
+        app.buttons["primary-model-management-done"].tap()
+        XCTAssertTrue(app.buttons["primary-model-done"].waitForExistence(timeout: 4))
+        app.buttons["primary-model-done"].tap()
         XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 4))
         #else
         throw XCTSkip("仅在 Debug 模拟器使用随包本地权重与独立内存会话")

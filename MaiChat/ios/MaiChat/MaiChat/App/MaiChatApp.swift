@@ -244,6 +244,9 @@ struct MaiChatApp: App {
             try? await AICloudCredentialSync.refreshBailianIfNeeded()
         }
         RemoteIMSystemNotificationCenter.shared.install()
+        #if DEBUG && !targetEnvironment(simulator)
+        AIPrimaryModelDeviceProbe.startIfRequested()
+        #endif
     }
 
     var body: some Scene {

@@ -486,9 +486,11 @@ extension AIMobileHostToolProvider {
             guard workspacePath == AIAssistantModel.shared.workspacePath else {
                 return .failure(code: "canceled", message: "Account workspace changed during portrait processing")
             }
+            // 图片处理只交付聊天成品；显式全屏预览仍由独立工具响应用户请求。
             var response: [String: Any] = [
                 "path": name, "mime_type": "image/png", "width": dimensions.0,
-                "height": dimensions.1, "next_tool": "mobile_preview_image",
+                "height": dimensions.1, "next_tool": "agent_send_media",
+                "delivery_hint": "Attach this path to the current AI conversation with agent_send_media (file_path=path, type=image). Open a full-screen preview only when the user explicitly requests it.",
             ]
             if let receipt = dimensions.2,
                let envelope = try JSONSerialization.jsonObject(with: Data(receipt.utf8)) as? [String: Any] {

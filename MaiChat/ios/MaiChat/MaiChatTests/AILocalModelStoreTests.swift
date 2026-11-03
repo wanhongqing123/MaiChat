@@ -31,6 +31,12 @@ final class AILocalModelStoreTests: XCTestCase {
         XCTAssertEqual(catalog.selectedModelID, second.id)
         let reopenedSelection = try await reopened.selection()
         XCTAssertEqual(try Data(contentsOf: reopenedSelection.modelURL), changed)
+        // 主模型保存的是明确 ID；自测选择切到第二份文件后仍应解析原来的第一份。
+        let pinnedPrimary = try await reopened.resolve(modelID: first.id, projectorID: nil)
+        XCTAssertEqual(pinnedPrimary.modelURL, firstURL)
+        XCTAssertEqual(try Data(contentsOf: pinnedPrimary.modelURL), original)
+        let afterResolve = try await reopened.snapshot()
+        XCTAssertEqual(afterResolve.selectedModelID, second.id)
         let encoded = try String(contentsOf: storage.appendingPathComponent("catalog.json"), encoding: .utf8)
         XCTAssertFalse(encoded.contains(source.path))
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: storage.path).contains { $0.hasPrefix(".import-") })

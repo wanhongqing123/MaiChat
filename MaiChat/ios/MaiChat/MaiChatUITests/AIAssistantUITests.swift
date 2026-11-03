@@ -51,7 +51,8 @@ final class AIAssistantUITests: XCTestCase {
         let send = app.buttons["ai-send-draft"]
         XCTAssertTrue(send.isEnabled)
         XCTAssertEqual(send.label, "补充当前任务")
-        XCTAssertFalse(app.buttons["停止"].exists, "忙且有草稿时右侧只保留补充按钮")
+        XCTAssertFalse(app.buttons["停止"].exists, "忙且有草稿时也不能恢复模型停止按钮")
+        XCTAssertTrue(app.buttons["展开更多功能"].isEnabled, "附件入口不能随模型忙碌消失")
         send.tap()
         let receipt = app.staticTexts["steering-receipt"]
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
@@ -63,7 +64,7 @@ final class AIAssistantUITests: XCTestCase {
         assertSteeringTaskRemainsBusy(app)
     }
 
-    @MainActor func testBusyComposerOmitsStopAndShowsOnlySupplementWhenDraftExists() {
+    @MainActor func testBusyComposerOmitsStopAndKeepsAttachmentsAndSending() {
         let app = launchSteeringFixture()
         defer { app.terminate() }
         let stop = app.buttons["停止"]
@@ -74,7 +75,13 @@ final class AIAssistantUITests: XCTestCase {
         emptyBefore.lifetime = .keepAlways
         add(emptyBefore)
         XCTAssertFalse(stop.exists, "忙且空草稿也不显示停止")
-        XCTAssertFalse(app.buttons["展开更多功能"].exists)
+        let attachments = app.buttons["展开更多功能"]
+        XCTAssertTrue(attachments.exists)
+        XCTAssertTrue(attachments.isEnabled)
+        attachments.tap()
+        XCTAssertTrue(app.buttons["拍摄"].waitForExistence(timeout: 3), "忙碌时仍能打开相册/拍摄面板")
+        XCTAssertTrue(app.buttons["相册"].exists)
+        app.buttons["收起更多功能"].tap()
         assertSteeringTaskRemainsBusy(app)
         XCTAssertFalse(send.exists)
         editor.tap()
@@ -82,7 +89,7 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertTrue(send.isEnabled)
         XCTAssertEqual(send.label, "补充当前任务")
         let draftScreenshot = XCTAttachment(screenshot: app.screenshot())
-        draftScreenshot.name = "busy-composer-draft-single-trailing-action"
+        draftScreenshot.name = "busy-composer-draft-send-and-attachments-without-stop"
         draftScreenshot.lifetime = .keepAlways
         add(draftScreenshot)
         // 旧产品在此同时挂载 stop+send；以真实 Root 的 AX/截图验证，不能只测按钮样式。
@@ -100,7 +107,8 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "exists == false"), object: send)], timeout: 3), .completed)
         XCTAssertFalse(stop.exists, "清空草稿不重新添加已移除的停止按钮")
-        XCTAssertFalse(app.buttons["展开更多功能"].exists)
+        XCTAssertTrue(app.buttons["展开更多功能"].exists)
+        XCTAssertTrue(app.buttons["展开更多功能"].isEnabled)
         assertSteeringTaskRemainsBusy(app)
         let emptyScreenshot = XCTAttachment(screenshot: app.screenshot())
         emptyScreenshot.name = "busy-composer-cleared-draft-without-stop"
@@ -141,6 +149,8 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertEqual(held["pending_entries"] as? Int, 5, "五条都必须已经真实持久入队")
         XCTAssertEqual(held["ack_gate_waiting"] as? Bool, true)
         XCTAssertTrue(app.staticTexts["排队中"].exists)
+        XCTAssertFalse(app.buttons["停止"].exists, "发送后等待确认也不能重新挂载模型停止按钮")
+        XCTAssertTrue(app.buttons["展开更多功能"].isEnabled, "连续发送及待确认时仍保留可用加号")
         let queued = XCTAttachment(screenshot: app.screenshot())
         queued.name = "five-outgoing-messages-queued-during-native-ack"
         queued.lifetime = .keepAlways

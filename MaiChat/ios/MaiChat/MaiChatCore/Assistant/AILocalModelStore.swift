@@ -158,6 +158,18 @@ public actor AILocalModelStore {
         return AILocalModelSelection(modelURL: model, projectorURL: projector, isBuiltin: builtin)
     }
 
+    /// 主模型按账号设置保存的稳定 ID 解析；独立自测的全局选择不能更改已应用的主模型。
+    /// 每次配置复查文件存在性，返回沙盒内文件，不保存旧进程的绝对路径。
+    public func resolve(modelID: String, projectorID: String?) throws -> AILocalModelSelection {
+        _ = try snapshot()
+        let builtin = modelID == Self.builtinID
+        let model: URL
+        if builtin, let builtinURL { model = builtinURL }
+        else { model = try url(for: modelID, role: .model) }
+        let projector = try projectorID.map { try url(for: $0, role: .projector) }
+        return AILocalModelSelection(modelURL: model, projectorURL: projector, isBuiltin: builtin)
+    }
+
     /// 64 KiB 流式复制和哈希不占 MainActor；取消必须等 worker 删除自己的临时文件后返回。
     /// security scope 覆盖完整复制阶段，目录只保存相对 UUID 文件名与导入时 SHA，不保存外部 URL。
     @discardableResult

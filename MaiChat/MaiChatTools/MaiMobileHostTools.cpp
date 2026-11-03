@@ -1231,16 +1231,18 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         dispatcher, false));
     tools.add(std::make_unique<MaiMobileHostTool>(
         "mobile_transform_image",
-        // 一次调用只做一种端侧处理；先预览结果，再按需保存或交给选定的视频模型。
+        // 一次调用只做一种端侧处理；成品交付聊天，用户明确要求后才打开全屏预览。
         "Create a NEW image in the Agent working directory using an on-device edit; the source "
         "is unchanged. Apply one operation per call: crop (top-left x,y,width,height), rotate "
         "(degrees 90/180/270 clockwise), resize (width,height), flip_horizontal, flip_vertical, "
         "grayscale, sharpen (amount 0..2), adjust (brightness -1..1, contrast 0..2, "
         "saturation 0..2), or beautify "
         "(strength 0..1, local face-aware skin processing using the same portrait engine as "
-        "mobile_beautify_image). Call "
-        "mobile_preview_image on the returned path, then mobile_save_image to add the result "
-        "to the system gallery if requested.",
+        "mobile_beautify_image). Deliver the returned path with agent_send_media "
+        "(file_path=path, type=image) in the current AI conversation. Do not open a full-screen "
+        "preview automatically; the user can tap the chat image to inspect it. Use "
+        "mobile_preview_image only when explicitly requested, and mobile_save_image to add "
+        "the result to the system gallery if requested.",
         // operation 每次只做一项裁剪、旋转、缩放、翻转、灰度、锐化、调色或轻度美化。
         // 其余坐标/强度字段只对所选操作有效，执行层逐项校验范围。
         R"({"type":"object","properties":{"path":{"type":"string"},"operation":{"type":"string","enum":["crop",)"
@@ -1261,8 +1263,10 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         "Use original_path from prior results when refining; prior generated paths are also "
         "resolved to their original. Explicit parameters override the validated personal model. "
         "Unspecified shape changes default to zero. For multiple faces set subject_index "
-        "from left to right starting at 0. Return result_id for user feedback and preview "
-        "the path with mobile_preview_image. The iOS host automatically processes a bounded face ROI "
+        "from left to right starting at 0. Return result_id for user feedback and deliver the "
+        "returned path with agent_send_media (file_path=path, type=image) in this AI conversation. "
+        "Do not open a full-screen preview automatically; the user can tap the chat image. "
+        "Use mobile_preview_image only when explicitly requested. The iOS host automatically processes a bounded face ROI "
         "and composites it at the original dimensions; returned mask is diagnostic, not another blend alpha. "
         "Use skin ROI L*/C* and reported mask coverage, not full-image threshold fractions, to assess changes. "
         "Unknown fields including action/delegate are rejected. Never infer user preference from your own judgment.",
@@ -1281,7 +1285,10 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         "photos. Occluded joints, uncertain poses or no room below the feet return an error. "
         "slim_waist and leg_length are bounded normalized strengths, not literal percentages. "
         "For multiple people specify subject_index from left to right starting at 0. "
-        "Keep the original; preview the new path and use result_id for explicit user feedback.",
+        "Keep the original and deliver the new path with agent_send_media (file_path=path, "
+        "type=image) in this AI conversation. Do not open a full-screen preview automatically; "
+        "the user can tap the chat image. Use mobile_preview_image only when explicitly "
+        "requested, and use result_id for explicit user feedback.",
         R"({"type":"object","properties":{"path":{"type":"string"},"slim_waist":{"type":"number","minimum":0,"maximum":1},)"
         R"("leg_length":{"type":"number","minimum":0,"maximum":1},"subject_index":{"type":"integer","minimum":0},)"
         R"("use_personal_model":{"type":"boolean"}},"required":["path"],"additionalProperties":false})",
@@ -1329,8 +1336,10 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         "mobile_preview_image",
         "Show an image from the Agent working directory to the user in a full-screen mobile "
         "preview. This does not require a vision-capable model and does not save or modify it. "
-        "Use after mobile_read_photo or mobile_transform_image so the user can inspect it.",
-        // path 为待展示图片；只全屏预览，不保存、不编辑。
+        "Use only when the user explicitly asks to open a full-screen preview. Deliver image "
+        "editing results in the chat with agent_send_media; do not call this tool automatically "
+        "after reading or editing an image.",
+        // path 为用户明确要求全屏查看的图片；普通成品交付使用聊天卡片，不自动打开本工具。
         R"({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})",
         dispatcher, false));
     registerPlatformPhotoAlbumTools(tools, dispatcher);

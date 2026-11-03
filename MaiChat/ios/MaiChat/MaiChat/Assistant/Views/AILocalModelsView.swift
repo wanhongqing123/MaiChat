@@ -121,6 +121,7 @@ struct AILocalModelsView: View {
                     } header: { Text("最近一次结果") }
                 }
             }
+            .accessibilityIdentifier("local-model-form")
             .navigationTitle("本地模型")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) {

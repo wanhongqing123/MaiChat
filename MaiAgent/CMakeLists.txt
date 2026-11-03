@@ -381,6 +381,8 @@ add_library(maiagent STATIC
   Agent/MaiSqliteStore.cpp
   Agent/MaiOpenAiClient.cpp
   Agent/MaiResponsesClient.cpp
+  Agent/MaiLlamaModelClient.cpp
+  Agent/MaiLlamaModelValidation.cpp
   # 路径与文件系统：不用 std::filesystem，走系统 API。
   # 纯词法的那一半（MaiFilePath.cpp）是可移植的；真正调系统调用的那一半
   # 按平台各一份。形状参考 chromium 的 base/files。
@@ -475,6 +477,8 @@ target_include_directories(maiagent
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann
           ${mai_curl_source}/src
           ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor
+          # 固定上游内部 model API 仅供实现统计实际 GPU 权重缓冲，不暴露到公开头。
+          ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/src
           # RVM 只使用 C API 头；运行库由各宿主平台打包。
           # 头文件取自仓库内的官方 ONNX Runtime 源码，避免和预编译包维护两份。
           ${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/include/onnxruntime/core/session
@@ -588,6 +592,7 @@ if(MAIAGENT_BUILD_TESTS)
       MaiTurnRunnerTests    # 一轮对话的完整生命周期
       MaiToolTests          # 路径边界 + 内置工具
       MaiLlamaToolsTests    # 本地推理生命周期、取消、参数与工作区边界
+      MaiLlamaModelClientTests # 本地主模型的完整消息、原生工具模板、流式与取消
       MaiDeepSeekWebToolsTests # 结构化检索、抓取、错误分类与有界重试
       MaiEditToolTests      # edit：唯一匹配、替换全部、拒绝的那几种情况
       MaiApplyPatchToolTests  # apply_patch：多处/多文件、全有或全无、换行原样

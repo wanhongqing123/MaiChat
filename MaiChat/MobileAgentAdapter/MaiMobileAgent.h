@@ -13,6 +13,9 @@ extern "C" {
 // 整轮稳定；requestId 由宿主生成且重试复用。成功 {ok:true,id:<已落库 user ID>}，
 // 只表示已接收，完整工具批次结束后、下一次模型请求前消费。idle/stop/收尾拒绝，
 // 不启动另一轮；失败须保留草稿，禁止自动回退 send。同轮相同请求有界幂等。
+// local_model_probe 仅测已配置本地客户端：messages 为最多10条 {role,content}，
+// role 仅 user/assistant，timeout_ms 为1..120000。复用同一完整工具声明，绝不执行工具、
+// 读写会话或调用宿主凭据；工具输出请求本身算失败。用于隔离设备验收，不代表Agent工具闭环。
 void* maiMobileAgentCreate(void);
 void maiMobileAgentDestroy(void* handle);
 char* maiMobileAgentRequest(void* handle, const char* request);

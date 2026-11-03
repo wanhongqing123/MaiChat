@@ -6,7 +6,10 @@ import Foundation
 public enum AIAssistantPathPolicy {
     public static func appRoot(workspacePath: String) -> String {
         #if targetEnvironment(simulator)
-        if ProcessInfo.processInfo.arguments.contains("--ai-ui-test") {
+        let arguments = ProcessInfo.processInfo.arguments
+        // 旧合成 fixture 的文件只在 tmp；真实 Primary QA 与产品一样还需访问本 App Documents。
+        // 仍以整个 App 沙盒为边界，不信任导入源目录或放宽 native 的路径守卫。
+        if arguments.contains("--ai-ui-test") && !arguments.contains("--ai-primary-model-ui-test") {
             return URL(fileURLWithPath: workspacePath, isDirectory: true)
                 .deletingLastPathComponent().deletingLastPathComponent().path
         }
