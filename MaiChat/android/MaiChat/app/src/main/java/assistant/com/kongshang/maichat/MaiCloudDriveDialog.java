@@ -24,6 +24,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 import java.io.File;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Locale;
@@ -743,7 +744,6 @@ final class MaiCloudDriveDialog {
         card.setOrientation(LinearLayout.HORIZONTAL);
         card.setGravity(Gravity.CENTER_VERTICAL);
         card.setContentDescription((image ? "查看图片：" : "播放视频：") + name);
-        card.setOnClickListener(ignored -> open(id, name, bytes, image));
         card.setOnLongClickListener(ignored -> { showMediaMenu(item); return true; });
         FrameLayout cover = new FrameLayout(activity);
         cover.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE_SOFT, 12, activity));
@@ -755,6 +755,7 @@ final class MaiCloudDriveDialog {
         thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
         thumbnail.setContentDescription(name + "缩略图");
         cover.addView(thumbnail, new FrameLayout.LayoutParams(-1, -1));
+        card.setOnClickListener(ignored -> open(id, name, bytes, image, thumbnail));
         if (!image) {
             FrameLayout play = new FrameLayout(activity);
             play.setBackground(MaiChatTheme.rounded(Color.argb(150, 0, 0, 0), 12, activity));
@@ -863,7 +864,7 @@ final class MaiCloudDriveDialog {
         thumbnailDirectory.delete();
     }
 
-    private void open(String id, String name, long bytes, boolean image) {
+    private void open(String id, String name, long bytes, boolean image, View sourceView) {
         if (id.isEmpty() || playing || uploading || saving) return;
         if (loading || folderLoading) return;
         MaiCloudDrive.MediaInfo info = MaiCloudDrive.mediaInfo(name);
@@ -876,6 +877,8 @@ final class MaiCloudDriveDialog {
             startVideoVod(id, name);
             return;
         }
+        // 下载可能跨过目录刷新；异步任务不持有旧卡片，来源离窗后交由普通淡入路径处理。
+        WeakReference<View> previewSource = new WeakReference<>(sourceView);
         File directory = new File(activity.getCacheDir(), "cloud-drive-images");
         if (!directory.isDirectory() && !directory.mkdirs()) {
             setStatus("无法准备预览缓存"); return;
@@ -912,7 +915,9 @@ final class MaiCloudDriveDialog {
                     playing = false;
                     if (!downloaded.ok()) { setStatus("下载失败，请重试"); return; }
                     setStatus("");
-                    if (!activity.openCloudDriveImage(target.getAbsolutePath())) target.delete();
+                    View source = previewSource.get();
+                    if (source != null && !source.isAttachedToWindow()) source = null;
+                    if (!activity.openCloudDriveImage(target.getAbsolutePath(), source)) target.delete();
                 }));
         });
     }

@@ -1,6 +1,6 @@
 // 文件作用：Android 设备集成测试；GraphicsDirectPresenterInstrumentedTest 负责覆盖对应界面或服务的设备行为，本文件给出其验证。
 // 运行边界：仅供自动化验证使用，不作为正式 App 或 Agent 的用户功能入口。
-// 覆盖场景：messagePreviewDecodesPngIntoNativeImageView、effectRendersStraightToTextureView。
+// 覆盖场景：图片解码、直接呈现及 resize；Graphics 宿主使用独立 Dialog，避免 Main 异步换页移除测试 View。
 package com.kongshang.maichat;
 
 import static org.junit.Assert.assertEquals;
@@ -8,6 +8,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 import android.app.Activity;
+import android.app.Dialog;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
@@ -29,6 +30,67 @@ import org.junit.runner.RunWith;
 
 @RunWith(AndroidJUnit4.class)
 public final class GraphicsDirectPresenterInstrumentedTest {
+    @Test public void resizingUsesTheNewBufferAndRetainsTheDecodedImage() throws Exception {
+        android.app.Instrumentation instrumentation = InstrumentationRegistry.getInstrumentation();
+        Context context = instrumentation.getTargetContext();
+        File source = File.createTempFile("graphics-resize-", ".png", context.getCacheDir());
+        Bitmap red = Bitmap.createBitmap(20, 20, Bitmap.Config.ARGB_8888);
+        red.eraseColor(Color.RED);
+        try (FileOutputStream output = new FileOutputStream(source)) {
+            assertTrue(red.compress(Bitmap.CompressFormat.PNG, 100, output));
+        }
+        red.recycle();
+        Intent intent = new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        Activity activity = instrumentation.startActivitySync(intent);
+        AtomicReference<MaiGraphicsImageView> image = new AtomicReference<>();
+        AtomicReference<Dialog> host = new AtomicReference<>();
+        CountDownLatch ready = new CountDownLatch(1);
+        try {
+            instrumentation.runOnMainSync(() -> {
+                MaiGraphicsImageView view = new MaiGraphicsImageView(activity);
+                view.setPresentationListener(success -> { if (success) ready.countDown(); });
+                view.showImage(source.getPath(), false, null);
+                image.set(view);
+                host.set(showGraphicsHost(activity, view));
+            });
+            boolean initialFrame = ready.await(10, TimeUnit.SECONDS);
+            assertTrue("Initial Graphics frame: " + surfaceState(image.get(), null), initialFrame);
+            // A resize must preserve the decoded texture/context, even when its input is gone.
+            assertTrue(source.delete());
+            for (int[] size : new int[][]{{160, 96}, {80, 160}, {160, 96}}) {
+                instrumentation.runOnMainSync(() -> image.get().setLayoutParams(
+                    new FrameLayout.LayoutParams(size[0], size[1])));
+                long deadline = System.currentTimeMillis() + 2500;
+                boolean correct = false;
+                String lastCapture = "no snapshot attempted";
+                while (!correct && System.currentTimeMillis() < deadline) {
+                    AtomicReference<Bitmap> captured = new AtomicReference<>();
+                    instrumentation.runOnMainSync(() -> captured.set(image.get().snapshot()));
+                    Bitmap bitmap = captured.get();
+                    lastCapture = surfaceState(image.get(), bitmap);
+                    if (bitmap != null && bitmap.getWidth() == size[0] && bitmap.getHeight() == size[1]) {
+                        int center = bitmap.getPixel(size[0] / 2, size[1] / 2);
+                        int edge = size[0] > size[1] ? bitmap.getPixel(2, size[1] / 2)
+                            : bitmap.getPixel(size[0] / 2, 2);
+                        correct = Color.red(center) >= 240 && Color.green(center) <= 10
+                            && Color.blue(center) <= 10 && Color.red(edge) <= 10
+                            && Color.green(edge) <= 10 && Color.blue(edge) <= 10;
+                    }
+                    if (bitmap != null) bitmap.recycle();
+                    if (!correct) Thread.sleep(40);
+                }
+                assertTrue("Resized viewport must center the red image with black letterboxing: "
+                    + size[0] + "x" + size[1] + "; " + lastCapture, correct);
+            }
+        } finally {
+            instrumentation.runOnMainSync(() -> {
+                if (host.get() != null) host.get().dismiss();
+                activity.finish();
+            });
+            source.delete();
+        }
+    }
+
     @Test public void messagePreviewDecodesPngIntoNativeImageView() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         File source = new File(context.getCacheDir(), "message-preview-red.png");
@@ -76,6 +138,7 @@ public final class GraphicsDirectPresenterInstrumentedTest {
         Activity activity = InstrumentationRegistry.getInstrumentation().startActivitySync(intent);
         CountDownLatch presented = new CountDownLatch(1);
         AtomicReference<MaiGraphicsImageView> surface = new AtomicReference<>();
+        AtomicReference<Dialog> host = new AtomicReference<>();
         AtomicReference<Boolean> success = new AtomicReference<>(false);
         try {
             InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
@@ -85,12 +148,12 @@ public final class GraphicsDirectPresenterInstrumentedTest {
                     presented.countDown();
                 });
                 view.showImage(source.getAbsolutePath(), false, null);
-                ((FrameLayout) activity.findViewById(android.R.id.content)).addView(view,
-                    new FrameLayout.LayoutParams(64, 64));
                 surface.set(view);
+                host.set(showGraphicsHost(activity, view));
             });
-            assertTrue(presented.await(10, TimeUnit.SECONDS));
-            assertTrue(success.get());
+            boolean initialFrame = presented.await(10, TimeUnit.SECONDS);
+            assertTrue("Initial Graphics frame: " + surfaceState(surface.get(), null), initialFrame);
+            assertTrue("Initial Graphics result: " + surfaceState(surface.get(), null), success.get());
             File effects = new File(context.getFilesDir(), "MaiAgentGraphics");
             assertTrue(new File(effects, "default.effect").isFile());
             assertTrue(new File(effects, "solid.effect").isFile());
@@ -99,8 +162,8 @@ public final class GraphicsDirectPresenterInstrumentedTest {
             InstrumentationRegistry.getInstrumentation().runOnMainSync(
                 () -> captured.set(((MaiGraphicsTextureView) surface.get().getChildAt(0))
                     .getBitmap()));
-            assertNotNull(captured.get());
-            assertEquals(Color.RED, captured.get().getPixel(32, 32));
+            assertSnapshotSize(surface.get(), captured.get());
+            assertEquals(surfaceState(surface.get(), captured.get()), Color.RED, captured.get().getPixel(32, 32));
 
             Bitmap png = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888);
             png.eraseColor(Color.RED);
@@ -139,7 +202,8 @@ public final class GraphicsDirectPresenterInstrumentedTest {
             InstrumentationRegistry.getInstrumentation().runOnMainSync(
                 () -> captured.set(((MaiGraphicsTextureView) surface.get().getChildAt(0))
                     .getBitmap()));
-            assertEquals(Color.GREEN, captured.get().getPixel(32, 32));
+            assertSnapshotSize(surface.get(), captured.get());
+            assertEquals(surfaceState(surface.get(), captured.get()), Color.GREEN, captured.get().getPixel(32, 32));
 
             File videoFile = new File(context.getCacheDir(), "graphics-direct-red.mp4");
             try (InputStream input = InstrumentationRegistry.getInstrumentation()
@@ -162,8 +226,10 @@ public final class GraphicsDirectPresenterInstrumentedTest {
             InstrumentationRegistry.getInstrumentation().runOnMainSync(
                 () -> captured.set(((MaiGraphicsTextureView) surface.get().getChildAt(0))
                     .getBitmap()));
+            assertSnapshotSize(surface.get(), captured.get());
             int videoPixel = captured.get().getPixel(32, 32);
-            assertTrue("video pixel: " + Integer.toHexString(videoPixel), Color.red(videoPixel) >= 240);
+            assertTrue("video pixel: " + Integer.toHexString(videoPixel) + "; "
+                + surfaceState(surface.get(), captured.get()), Color.red(videoPixel) >= 240);
             assertTrue(Color.green(videoPixel) <= 10);
             assertTrue(Color.blue(videoPixel) <= 10);
 
@@ -190,13 +256,40 @@ public final class GraphicsDirectPresenterInstrumentedTest {
             videoFile.delete();
         } finally {
             InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
-                if (surface.get() != null)
-                    ((FrameLayout) activity.findViewById(android.R.id.content))
-                        .removeView(surface.get());
+                if (host.get() != null) host.get().dismiss();
                 activity.finish();
             });
             source.delete();
             pngSource.delete();
         }
+    }
+
+    private static Dialog showGraphicsHost(Activity activity, MaiGraphicsImageView view) {
+        // Main 的认证/导航回调可以重建 Activity content，但不能移除另一个 Window 的测试 surface。
+        FrameLayout content = new FrameLayout(activity);
+        content.addView(view, new FrameLayout.LayoutParams(64, 64));
+        Dialog dialog = new Dialog(activity, android.R.style.Theme_Black_NoTitleBar);
+        dialog.setContentView(content);
+        dialog.show();
+        return dialog;
+    }
+
+    private static String surfaceState(MaiGraphicsImageView view, Bitmap bitmap) {
+        String state = view == null ? "view=null" : "attached=" + view.isAttachedToWindow()
+            + " view=" + view.getWidth() + "x" + view.getHeight();
+        if (bitmap == null) return state + " bitmap=null";
+        int width = bitmap.getWidth(), height = bitmap.getHeight();
+        int center = bitmap.getPixel(width / 2, height / 2);
+        int edge = width > height ? bitmap.getPixel(Math.min(2, width - 1), height / 2)
+            : bitmap.getPixel(width / 2, Math.min(2, height - 1));
+        return state + " bitmap=" + width + "x" + height
+            + " center=" + Integer.toHexString(center) + " edge=" + Integer.toHexString(edge);
+    }
+
+    private static void assertSnapshotSize(MaiGraphicsImageView view, Bitmap bitmap) {
+        String state = surfaceState(view, bitmap);
+        assertNotNull(state, bitmap);
+        assertEquals(state, 64, bitmap.getWidth());
+        assertEquals(state, 64, bitmap.getHeight());
     }
 }

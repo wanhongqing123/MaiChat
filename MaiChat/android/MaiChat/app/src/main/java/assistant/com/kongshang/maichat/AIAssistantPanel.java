@@ -895,7 +895,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 preview.setContentDescription("预览图片");
                 if (source != null)
                     MessageImageLoader.load(source.getPath(), dp(82), dp(58), preview, null);
-                preview.setOnClickListener(view -> previewAttachment(file));
+                preview.setOnClickListener(view -> previewAttachment(file, view));
                 top.addView(preview, new LayoutParams(dp(82), dp(58)));
             } else if (type.equals("视频")) {
                 FrameLayout preview = new FrameLayout(activity);
@@ -962,6 +962,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             attachmentCountValue > 0 || pendingCount > 0 ? VISIBLE : GONE);
     }
     private void previewAttachment(AIAssistantController.ImportedFile file) {
+        previewAttachment(file, null);
+    }
+    private void previewAttachment(AIAssistantController.ImportedFile file, View sourceView) {
         File source = controller.workspaceFile(file.relativePath);
         if (source != null && source.isFile() && !file.image &&
             !file.mimeType.startsWith("video/")) {
@@ -980,7 +983,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         }
         if (source == null || !source.isFile() || !(activity instanceof MainActivity)
             || !((MainActivity) activity).openAgentMedia(
-                source.getAbsolutePath(), !file.image, draftMediaPlaylist()))
+                source.getAbsolutePath(), !file.image, draftMediaPlaylist(), sourceView))
             Toast.makeText(activity, "媒体文件无法预览", Toast.LENGTH_SHORT).show();
     }
     private List<MainActivity.GalleryItem> draftMediaPlaylist() {
@@ -2542,7 +2545,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             image.setOnClickListener(view -> {
                                 if (activity instanceof MainActivity)
                                     ((MainActivity) activity).openAgentMedia(
-                                        file.getAbsolutePath(), false, mediaPlaylist());
+                                        file.getAbsolutePath(), false, mediaPlaylist(), view);
                             });
                         }
                     }
@@ -2963,9 +2966,10 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 });
             } else {
                 preview.setOnClickListener(view -> {
+                    // 传实际图像层而非带标题/操作的卡片，供全屏浮层取得内容和来源坐标。
                     if (activity instanceof MainActivity)
                         ((MainActivity) activity).openAgentMedia(
-                            file.getAbsolutePath(), false, mediaPlaylist());
+                            file.getAbsolutePath(), false, mediaPlaylist(), cover);
                 });
             }
             container.addView(preview, new LayoutParams(dp(initialSize[0]), dp(initialSize[1])));

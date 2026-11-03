@@ -192,6 +192,12 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private Dialog imageDialog;
     private MaiGraphicsImageView galleryImageView;
     private String galleryImagePath;
+    private MaiImagePreviewOrigin galleryImageOrigin;
+    private MaiImagePreviewTransition galleryImageTransition;
+    private boolean galleryHandoff;
+    private String imagePreviewIdentity = "";
+    private int imagePreviewRotation;
+    private FrameLayout imagePreviewCoveredHost;
     private String pendingVideoSavePath;
     private Runnable pendingVideoSaveCompletion;
     private String pendingImageSavePath;
@@ -398,6 +404,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     @Override
     public void onConfigurationChanged(Configuration configuration) {
         super.onConfigurationChanged(configuration);
+        if (galleryImageOrigin != null) galleryImageOrigin.configurationChanged();
         if (session != null && !destroyed) {
             ChatMessageList previous = currentMessageList;
             String anchor = previous == null ? null : previous.firstVisibleMessageId();
@@ -929,6 +936,9 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             passwordRequests.cancelActive("identity_changed");
             passwordDialog.dismiss();
         }
+        // A local image is private account content too; retire it on login generation changes.
+        if (imageDialog != null && !imagePreviewIdentity.equals(session.passwordChangeIdentity()))
+            imageDialog.dismiss();
         if (videoDialog != null && cloudPlayerStreams.containsKey(videoDialog) &&
             !cloudPlayerOwner.equals(MaiChatAuthClient.shared(this).accountId()))
             videoDialog.dismiss();
@@ -1244,6 +1254,12 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     private void applyChatInsets(FrameLayout target, androidx.core.view.WindowInsetsCompat insets) {
+        // The fullscreen image owns system bars. Keep the covered page at its original
+        // padding so its thumbnail does not jump under the return animation. Rotation
+        // still relayouts the page and invalidates the saved source coordinates.
+        if (imageDialog != null && imageDialog.isShowing()
+                && target == imagePreviewCoveredHost
+                && imagePreviewRotation == getWindowManager().getDefaultDisplay().getRotation()) return;
         androidx.core.graphics.Insets bars = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars()
                 | androidx.core.view.WindowInsetsCompat.Type.displayCutout());
         int bottom = Math.max(bars.bottom, insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.ime()).bottom);
@@ -5428,20 +5444,19 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private View imageMessageContent(RemoteIMImageAttachment attachment) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        ImageView image = new ImageView(this);
-        image.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        image.setBackgroundColor(MaiChatTheme.PAGE);
+        // Keep the whole image and its aspect ratio, matching the iOS 220 x 180 bubble.
+        ImageView image = new MaiImageThumbnailView(this);
         image.setContentDescription("预览图片");
         image.setOnClickListener(view -> showFullScreenImage(
             attachment.localPath(), imMediaPlaylist(activeChatUserId), view));
         TextView imageMissing = MaiChatTheme.text(this, "图片暂不可预览", 14, MaiChatTheme.SECONDARY);
         imageMissing.setVisibility(View.GONE);
-        MessageImageLoader.load(attachment.localPath(), dp(260), dp(190), image, () -> {
+        MessageImageLoader.load(attachment.localPath(), dp(220), dp(180), image, () -> {
             image.setVisibility(View.GONE);
             imageMissing.setVisibility(View.VISIBLE);
         });
         box.addView(imageMissing, matchWrap());
-        LinearLayout.LayoutParams imageParams = match(dp(190));
+        LinearLayout.LayoutParams imageParams = new LinearLayout.LayoutParams(dp(220), dp(180));
         imageParams.setMargins(0, dp(7), 0, dp(4));
         box.addView(image, imageParams);
         return box;
@@ -5561,11 +5576,14 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private void openVideoPlayer(String path, long startPositionUs,
                                  List<GalleryItem> candidates, int entryDirection,
                                  MaiCloudVod.Session cloudVod) {
+        if (entryDirection == 0) galleryImageOrigin = null;
         if (videoDialog != null) videoDialog.dismiss();
         String previousImagePath = galleryImagePath;
         Bitmap handoffFrame = entryDirection != 0 && galleryImageView != null
             ? galleryImageView.snapshot() : null;
+        galleryHandoff = true;
         if (imageDialog != null) imageDialog.dismiss();
+        galleryHandoff = false;
         List<GalleryItem> playlist = normalizeGallery(path, true, candidates);
         final int[] selected = {galleryIndex(playlist, path, true)};
         final String[] currentPath = {path};
@@ -6061,9 +6079,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     public boolean openAgentMedia(String path, boolean video, List<GalleryItem> playlist) {
+        return openAgentMedia(path, video, playlist, null);
+    }
+
+    public boolean openAgentMedia(String path, boolean video, List<GalleryItem> playlist, View source) {
         if (destroyed || path == null || !new File(path).isFile()) return false;
         if (video) openVideoPlayer(path, 0, playlist);
-        else showFullScreenImage(path, playlist);
+        else showFullScreenImage(path, playlist, source);
         return true;
     }
 
@@ -6079,6 +6101,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     public boolean openCloudDriveImage(String path) {
+        return openCloudDriveImage(path, null);
+    }
+
+    public boolean openCloudDriveImage(String path, View thumbnail) {
         if (destroyed || path == null) return false;
         try {
             String account = MaiChatAuthClient.shared(this).accountId();
@@ -6087,7 +6113,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             File cache = new File(getCacheDir(), "cloud-drive-images").getCanonicalFile();
             if (!source.isFile() || !source.getParentFile().equals(cache)) return false;
             if (imageDialog != null) imageDialog.dismiss();
-            showFullScreenImage(source.getAbsolutePath());
+            showFullScreenImage(source.getAbsolutePath(), Collections.emptyList(), thumbnail);
             if (imageDialog == null) return false;
             cloudImageFiles.put(imageDialog, source);
             cloudImageOwner = account;
@@ -6154,10 +6180,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
 
     @SuppressLint("ClickableViewAccessibility")
     private void showFullScreenImage(String path, List<GalleryItem> candidates) {
+        galleryImageOrigin = null;
         showFullScreenImage(path, candidates, 0);
     }
 
     private void showFullScreenImage(String path, List<GalleryItem> candidates, View source) {
+        galleryImageOrigin = source == null ? null : new MaiImagePreviewOrigin(path, source,
+            session.passwordChangeIdentity(), getWindowManager().getDefaultDisplay().getRotation());
         showFullScreenImage(path, candidates, 0, source);
     }
 
@@ -6172,11 +6201,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private void showFullScreenImage(String path, List<GalleryItem> candidates,
                                      int entryDirection, View source) {
         boolean reuseDialog = imageDialog != null && imageDialog.isShowing();
-        Rect sourceBounds = new Rect();
-        Bitmap sourceBitmap = !reuseDialog && videoDialog == null && source != null
-            && source.getGlobalVisibleRect(sourceBounds)
-            ? snapshotPreviewSource(source) : null;
-        boolean bubbleEntry = sourceBitmap != null && !sourceBounds.isEmpty();
+        if (!reuseDialog) {
+            imagePreviewRotation = getWindowManager().getDefaultDisplay().getRotation();
+            imagePreviewCoveredHost = insetsHost;
+        }
+        MaiImagePreviewOrigin origin = galleryImageOrigin;
+        String identity = session.passwordChangeIdentity();
+        boolean bubbleEntry = !reuseDialog && entryDirection == 0 && source != null && origin != null;
         String previousPath = galleryImagePath;
         Bitmap previousFrame = reuseDialog && entryDirection != 0 && galleryImageView != null
             ? galleryImageView.snapshot() : null;
@@ -6185,273 +6216,205 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             if (previousVideo != null) previousFrame = previousVideo.snapshot();
         }
         if (videoDialog != null) videoDialog.dismiss();
+        if (galleryImageTransition != null) galleryImageTransition.dispose();
         List<GalleryItem> playlist = normalizeGallery(path, false, candidates);
         int selected = galleryIndex(playlist, path, false);
         Dialog dialog = reuseDialog ? imageDialog :
             new Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
-        if (Build.VERSION.SDK_INT >= 28 && dialog.getWindow() != null) {
-            // 全屏主题仍会避开默认刘海安全区；只扩展图片窗口，不改变透明气泡动画或导航边距。
-            WindowManager.LayoutParams imageWindow = dialog.getWindow().getAttributes();
-            imageWindow.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
-            dialog.getWindow().setAttributes(imageWindow);
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            WindowManager.LayoutParams attributes = window.getAttributes();
+            attributes.windowAnimations = 0;
+            if (Build.VERSION.SDK_INT >= 28)
+                attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            if (Build.VERSION.SDK_INT >= 30) attributes.setFitInsetsTypes(0);
+            window.setAttributes(attributes);
+            window.setNavigationBarColor(Color.BLACK);
+            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+                | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
+            window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
         }
         FrameLayout frame = new FrameLayout(this);
-        frame.setBackgroundColor(bubbleEntry ? Color.TRANSPARENT : Color.BLACK);
-        View dim = new View(this);
-        dim.setBackgroundColor(Color.BLACK);
-        dim.setAlpha(bubbleEntry ? 0.68f : 1f);
-        frame.addView(dim, new FrameLayout.LayoutParams(-1, -1));
-        // 同一入口供 IM 与 AI 助手共用：背景铺满屏幕，前景仍完整显示原图。
+        FrameLayout page = new FrameLayout(this);
+        page.setBackgroundColor(Color.BLACK);
+        page.setAlpha(bubbleEntry ? 0f : 1f);
+        frame.addView(page, new FrameLayout.LayoutParams(-1, -1));
         MaiGraphicsImageView backdrop = new MaiGraphicsImageView(this);
         backdrop.showImage(path, true, () -> { });
-        backdrop.setAlpha(bubbleEntry ? 0f : 0.48f);
-        if (Build.VERSION.SDK_INT >= 31) {
+        backdrop.setAlpha(0.48f);
+        if (Build.VERSION.SDK_INT >= 31)
             backdrop.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(
                 dp(24), dp(24), android.graphics.Shader.TileMode.CLAMP));
-        }
-        frame.addView(backdrop, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        View previousPreview = previousFrame == null ? null : gallerySnapshot(previousFrame);
+        page.addView(backdrop, new FrameLayout.LayoutParams(-1, -1));
         MaiGraphicsImageView image = new MaiGraphicsImageView(this);
-        if (bubbleEntry) image.setAlpha(0f);
-        final ImageView[] entryOverlay = {null};
-        List<View> entryChrome = new ArrayList<>();
-        final boolean[] transitioned = {false};
+        page.addView(image, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        View previousPreview = previousFrame == null ? null : gallerySnapshot(previousFrame);
+        if (previousPreview != null) page.addView(previousPreview, new FrameLayout.LayoutParams(-1, -1));
+        MaiImagePreviewTransition transition = new MaiImagePreviewTransition(frame, page, image);
+        galleryImageTransition = transition;
+        Bitmap thumbnail = source instanceof ImageView
+            && ((ImageView) source).getDrawable() instanceof android.graphics.drawable.BitmapDrawable
+            ? ((android.graphics.drawable.BitmapDrawable) ((ImageView) source).getDrawable()).getBitmap() : null;
+        // The source drawable is already a complete image, like the iOS pager's initial thumbnail.
+        // It can start the transition while the larger shared decode is still queued.
+        final Bitmap[] fullImage = {thumbnail};
+        final boolean[] presented = {false}, opened = {false}, closing = {false};
+        List<View> controls = new ArrayList<>();
+        final Runnable[] tryOpen = {null};
+        final Runnable[] requestClose = {null};
+        MaiImagePreviewGestures gestures = new MaiImagePreviewGestures(frame, image, () -> {
+            requestClose[0].run();
+        }, direction -> {
+            if (opened[0] && !closing[0] && !transition.running())
+                showMediaNeighbor(playlist, selected, direction);
+        });
+        frame.setOnTouchListener(gestures);
+        frame.setContentDescription("图片预览，单击关闭，双击缩放");
+        Runnable close = () -> {
+            if (closing[0] || transition.running() || imageDialog != dialog || galleryImageView != image) return;
+            closing[0] = true;
+            gestures.setEnabled(false);
+            for (View control : controls) control.setEnabled(false);
+            android.graphics.RectF destination = origin == null ? null : origin.frame(path,
+                session.passwordChangeIdentity(),
+                getWindowManager().getDefaultDisplay().getRotation(), frame);
+            transition.close(fullImage[0], destination, dialog::dismiss);
+        };
+        requestClose[0] = close;
+        tryOpen[0] = () -> {
+            if (opened[0] || closing[0] || !presented[0] || fullImage[0] == null || frame.getWidth() <= 0
+                    || frame.getHeight() <= 0 || imageDialog != dialog || galleryImageView != image) return;
+            opened[0] = true;
+            android.graphics.RectF start = bubbleEntry ? origin.frame(path,
+                session.passwordChangeIdentity(),
+                getWindowManager().getDefaultDisplay().getRotation(), frame) : null;
+            if (bubbleEntry) {
+                gestures.setEnabled(false);
+                transition.open(fullImage[0], start, () -> {
+                    gestures.setEnabled(true);
+                    for (View control : controls) control.setEnabled(true);
+                });
+            } else {
+                animateGalleryEntry(image, entryDirection);
+                gestures.setEnabled(true);
+                for (View control : controls) control.setEnabled(true);
+            }
+            if (previousPreview != null)
+                previousPreview.animate().translationX(-entryDirection * dp(48)).alpha(0)
+                    .setDuration(220).withEndAction(() -> page.removeView(previousPreview)).start();
+        };
         image.setPresentationListener(success -> {
-            if (imageDialog != dialog || galleryImageView != image || transitioned[0]) return;
-            // 图片解码完成后才让实际画面滑入，避免只动了加载中的黑底。
-            if (success) {
-                transitioned[0] = true;
-                if (bubbleEntry) {
-                    dim.animate().alpha(1f).setDuration(260).start();
-                    backdrop.animate().alpha(0.48f).setStartDelay(100)
-                        .setDuration(160).start();
-                    image.animate().alpha(1f).setDuration(260).start();
-                    for (View chrome : entryChrome)
-                        chrome.animate().alpha(1f).setDuration(260).start();
-                    if (entryOverlay[0] != null) {
-                        ImageView snapshot = entryOverlay[0];
-                        snapshot.animate().scaleX(1f).scaleY(1f)
-                            .translationX(0f).translationY(0f).alpha(0f)
-                            .setDuration(260).withEndAction(() -> frame.removeView(snapshot)).start();
-                    }
-                } else animateGalleryEntry(image, entryDirection);
-                if (previousPreview != null) {
-                    previousPreview.animate().translationX(-entryDirection * dp(48))
-                        .alpha(0).setDuration(220)
-                        .withEndAction(() -> frame.removeView(previousPreview)).start();
-                }
+            if (success && !closing[0] && identity.equals(session.passwordChangeIdentity())) {
+                presented[0] = true; tryOpen[0].run();
             }
         });
-        // 全屏预览直接绑定自己的 TextureView，与气泡使用不同的渲染目标。
-        image.showImage(
-            path,
-            false,
-            () -> {
-                if (imageDialog != dialog || galleryImageView != image) return;
-                toast("图片暂不可预览");
-                if (entryDirection != 0 && previousPath != null && !previousPath.equals(path))
-                    showFullScreenImage(previousPath, candidates, 0);
-                else dialog.dismiss();
-            });
-        final float[] scale = {1f};
-        final float[] last = {0f, 0f};
-        ScaleGestureDetector zoom = new ScaleGestureDetector(this,
-            new ScaleGestureDetector.SimpleOnScaleGestureListener() {
-                @Override
-                public boolean onScale(ScaleGestureDetector detector) {
-                    scale[0] = Math.max(1f, Math.min(4f,
-                        scale[0] * detector.getScaleFactor()));
-                    image.setScaleX(scale[0]);
-                    image.setScaleY(scale[0]);
-                    float maxX = image.getWidth() * (scale[0] - 1f) / 2f;
-                    float maxY = image.getHeight() * (scale[0] - 1f) / 2f;
-                    image.setTranslationX(Math.max(-maxX,
-                        Math.min(maxX, image.getTranslationX())));
-                    image.setTranslationY(Math.max(-maxY,
-                        Math.min(maxY, image.getTranslationY())));
-                    return true;
-                }
-            });
-        image.setOnTouchListener((view, event) -> {
-            zoom.onTouchEvent(event);
-            if (event.getActionMasked() == MotionEvent.ACTION_POINTER_UP) {
-                last[0] = event.getX(0);
-                last[1] = event.getY(0);
-                return true;
-            }
-            if (event.getPointerCount() > 1) return true;
-            switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    last[0] = event.getX();
-                    last[1] = event.getY();
-                    return true;
-                case MotionEvent.ACTION_MOVE:
-                    if (scale[0] <= 1.01f) return true;
-                    float maxX = image.getWidth() * (scale[0] - 1f) / 2f;
-                    float maxY = image.getHeight() * (scale[0] - 1f) / 2f;
-                    image.setTranslationX(Math.max(-maxX,
-                        Math.min(maxX, image.getTranslationX() + event.getX() - last[0])));
-                    image.setTranslationY(Math.max(-maxY,
-                        Math.min(maxY, image.getTranslationY() + event.getY() - last[1])));
-                    last[0] = event.getX();
-                    last[1] = event.getY();
-                    return true;
-                case MotionEvent.ACTION_UP:
-                    if (scale[0] <= 1.01f) {
-                        float dx = event.getX() - last[0];
-                        float dy = event.getY() - last[1];
-                        if (Math.abs(dx) >= dp(72) && Math.abs(dx) > Math.abs(dy) * 1.4f)
-                            showMediaNeighbor(playlist, selected, dx < 0 ? 1 : -1);
-                    }
-                    return true;
-                default:
-                    return true;
-            }
+        image.showImage(path, false, () -> {
+            if (closing[0] || imageDialog != dialog || galleryImageView != image) return;
+            toast("图片暂不可预览");
+            if (entryDirection != 0 && previousPath != null && !previousPath.equals(path))
+                showFullScreenImage(previousPath, candidates, 0);
+            else dialog.dismiss();
         });
-        BitmapFactory.Options bounds = new BitmapFactory.Options();
-        bounds.inJustDecodeBounds = true;
-        BitmapFactory.decodeFile(path, bounds);
-        FrameLayout.LayoutParams imageParams;
-        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
-            android.util.DisplayMetrics display = getResources().getDisplayMetrics();
-            float fit = Math.min((float) display.widthPixels / bounds.outWidth,
-                (float) display.heightPixels / bounds.outHeight);
-            imageParams = new FrameLayout.LayoutParams(
-                Math.max(1, Math.round(bounds.outWidth * fit)),
-                Math.max(1, Math.round(bounds.outHeight * fit)), Gravity.CENTER);
-        } else {
-            imageParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT);
-        }
-        android.util.DisplayMetrics display = getResources().getDisplayMetrics();
-        int targetWidth = imageParams.width > 0 ? imageParams.width : display.widthPixels;
-        int targetHeight = imageParams.height > 0 ? imageParams.height : display.heightPixels;
-        frame.addView(image, imageParams);
-        if (previousPreview != null)
-            frame.addView(previousPreview, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        if (bubbleEntry) {
-            ImageView snapshot = new ImageView(this);
-            snapshot.setImageBitmap(sourceBitmap);
-            snapshot.setScaleType(ImageView.ScaleType.FIT_XY);
-            frame.addView(snapshot, new FrameLayout.LayoutParams(
-                targetWidth, targetHeight, Gravity.CENTER));
-            snapshot.setScaleX((float) sourceBounds.width() / targetWidth);
-            snapshot.setScaleY((float) sourceBounds.height() / targetHeight);
-            snapshot.setTranslationX(sourceBounds.exactCenterX() - display.widthPixels / 2f);
-            snapshot.setTranslationY(sourceBounds.exactCenterY() - display.heightPixels / 2f);
-            entryOverlay[0] = snapshot;
-        }
+        // The shared decoder supplies a bounded, oriented full image, never a cropped View screenshot.
+        // Its borrowed bitmap stays alive for both directions of the transition; Graphics renders the page.
+        ImageView decoded = new ImageView(this);
+        frame.setTag(decoded); // Keep the loader's weak target alive until this page is retired.
+        android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+        MessageImageLoader.load(path, Math.max(metrics.widthPixels, metrics.heightPixels),
+            Math.max(metrics.widthPixels, metrics.heightPixels), decoded, () -> {
+                if (!closing[0] && imageDialog == dialog && galleryImageView == image) {
+                    fullImage[0] = image.snapshot();
+                    if (fullImage[0] == null) dialog.dismiss();
+                    else { fitPreviewImage(frame, image, fullImage[0]); tryOpen[0].run(); }
+                }
+            }, bitmap -> {
+                if (closing[0] || imageDialog != dialog || galleryImageView != image
+                        || !identity.equals(session.passwordChangeIdentity())) return;
+                fullImage[0] = bitmap;
+                fitPreviewImage(frame, image, bitmap);
+                tryOpen[0].run();
+            });
+        frame.addOnLayoutChangeListener((view, l, t, r, b, oldL, oldT, oldR, oldB) -> {
+            if (r - l == oldR - oldL && b - t == oldB - oldT) return;
+            if (fullImage[0] != null) fitPreviewImage(frame, image, fullImage[0]);
+            gestures.reset();
+            tryOpen[0].run();
+        });
         if (playlist.size() > 1) {
             TextView mediaName = MaiChatTheme.text(this,
-                (selected + 1) + "/" + playlist.size() + " · " + new File(path).getName(),
-                12, Color.WHITE);
+                (selected + 1) + "/" + playlist.size() + " · " + new File(path).getName(), 12, Color.WHITE);
             mediaName.setGravity(Gravity.CENTER);
             mediaName.setSingleLine(true);
             mediaName.setEllipsize(TextUtils.TruncateAt.MIDDLE);
             mediaName.setBackground(MaiChatTheme.rounded(Color.argb(140, 0, 0, 0), 12, this));
-            FrameLayout.LayoutParams nameParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(32), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-            nameParams.setMargins(dp(80), dp(20), dp(80), 0);
-            frame.addView(mediaName, nameParams);
-            if (bubbleEntry) { mediaName.setAlpha(0f); entryChrome.add(mediaName); }
+            FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-1, dp(32), Gravity.TOP);
+            params.setMargins(dp(80), dp(20), dp(80), 0);
+            page.addView(mediaName, params);
         }
-        TextView close = iconButton("×", 26, Color.WHITE);
-        close.setContentDescription("关闭图片预览");
-        close.setBackground(MaiChatTheme.rounded(Color.argb(160, 0, 0, 0), 20, this));
-        final boolean[] closing = {false};
-        close.setOnClickListener(view -> {
-            if (!bubbleEntry || !transitioned[0] || source == null || !source.isAttachedToWindow()
-                || imageDialog != dialog || galleryImageView != image) {
-                dialog.dismiss();
-                return;
-            }
-            Rect destination = new Rect();
-            if (closing[0] || !source.getGlobalVisibleRect(destination)) {
-                if (!closing[0]) dialog.dismiss();
-                return;
-            }
-            Bitmap current = image.snapshot();
-            if (current == null) current = sourceBitmap;
-            if (current == null) { dialog.dismiss(); return; }
-            closing[0] = true;
-            ImageView shrink = new ImageView(this);
-            shrink.setImageBitmap(current);
-            shrink.setScaleType(ImageView.ScaleType.FIT_XY);
-            frame.addView(shrink, new FrameLayout.LayoutParams(
-                targetWidth, targetHeight, Gravity.CENTER));
-            image.setAlpha(0f);
-            dim.animate().alpha(0f).setDuration(220).start();
-            backdrop.animate().alpha(0f).setDuration(220).start();
-            for (View chrome : entryChrome) chrome.animate().alpha(0f).setDuration(160).start();
-            shrink.animate()
-                .scaleX((float) destination.width() / targetWidth)
-                .scaleY((float) destination.height() / targetHeight)
-                .translationX(destination.exactCenterX() - display.widthPixels / 2f)
-                .translationY(destination.exactCenterY() - display.heightPixels / 2f)
-                .setDuration(220).withEndAction(dialog::dismiss).start();
-        });
-        FrameLayout.LayoutParams closeParams = new FrameLayout.LayoutParams(
-            dp(48), dp(48), Gravity.TOP | Gravity.START);
-        closeParams.setMargins(dp(20), dp(18), 0, 0);
-        frame.addView(close, closeParams);
-        if (bubbleEntry) { close.setAlpha(0f); entryChrome.add(close); }
         LinearLayout actions = new LinearLayout(this);
         actions.setGravity(Gravity.CENTER_VERTICAL);
         actions.setPadding(dp(6), 0, dp(6), 0);
         actions.setBackground(MaiChatTheme.rounded(Color.argb(170, 0, 0, 0), 26, this));
-        TextView share = iconButton("↗", 23, Color.WHITE);
-        share.setContentDescription("分享图片");
+        ImageButton share = videoAction(R.drawable.ic_ui_share, "分享图片");
+        share.setEnabled(false);
+        controls.add(share);
         share.setOnClickListener(view -> sharePreviewImage(path));
-        actions.addView(share, new LinearLayout.LayoutParams(dp(48), dp(48)));
-        TextView save = iconButton("↓", 25, Color.WHITE);
-        save.setContentDescription("保存图片");
+        actions.addView(share, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        ImageButton save = videoAction(R.drawable.ic_ui_download, "保存图片");
+        save.setEnabled(false);
+        controls.add(save);
         save.setOnClickListener(view -> savePreviewImage(path));
-        actions.addView(save, new LinearLayout.LayoutParams(dp(48), dp(48)));
-        FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, dp(52), Gravity.BOTTOM | Gravity.END);
-        actionParams.setMargins(0, 0, dp(20), dp(54));
-        frame.addView(actions, actionParams);
-        if (bubbleEntry) { actions.setAlpha(0f); entryChrome.add(actions); }
+        actions.addView(save, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(dp(112), dp(48),
+            Gravity.BOTTOM | Gravity.END);
+        actionParams.setMargins(0, 0, dp(20), dp(66));
+        page.addView(actions, actionParams);
         dialog.setContentView(frame);
-        if (bubbleEntry && dialog.getWindow() != null) {
-            dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            dialog.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-        }
-        if (bubbleEntry)
-            dialog.setOnKeyListener((ignored, key, event) -> {
-                if (key != KeyEvent.KEYCODE_BACK) return false;
-                if (event.getAction() == KeyEvent.ACTION_UP) close.performClick();
-                return true;
-            });
-        else dialog.setOnKeyListener(null);
+        dialog.setOnKeyListener((ignored, key, event) -> {
+            if (key != KeyEvent.KEYCODE_BACK) return false;
+            if (event.getAction() == KeyEvent.ACTION_UP) close.run();
+            return true;
+        });
         dialog.setOnDismissListener(ignored -> {
+            transition.dispose();
+            gestures.setEnabled(false);
             File cloudFile = cloudImageFiles.remove(dialog);
-            if (cloudFile != null) {
-                cloudFile.delete();
-                cloudImageOwner = "";
-            }
+            if (cloudFile != null) { cloudFile.delete(); cloudImageOwner = ""; }
             if (imageDialog == dialog) {
                 imageDialog = null;
                 galleryImageView = null;
                 galleryImagePath = null;
+                galleryImageTransition = null;
+                imagePreviewIdentity = "";
+                imagePreviewCoveredHost = null;
+                if (!galleryHandoff) galleryImageOrigin = null;
             }
         });
         allowKeyboardLocation = false;
         imageDialog = dialog;
         galleryImageView = image;
         galleryImagePath = path;
+        imagePreviewIdentity = identity;
         if (!reuseDialog) dialog.show();
+        if (window != null) window.setLayout(-1, -1);
     }
 
-    private Bitmap snapshotPreviewSource(View source) {
-        if (source.getWidth() <= 0 || source.getHeight() <= 0) return null;
-        Bitmap bitmap = Bitmap.createBitmap(
-            source.getWidth(), source.getHeight(), Bitmap.Config.ARGB_8888);
-        source.draw(new Canvas(bitmap));
-        return bitmap;
+    private void fitPreviewImage(FrameLayout frame, View image, Bitmap bitmap) {
+        if (frame.getWidth() <= 0 || frame.getHeight() <= 0) return;
+        android.graphics.RectF fit = MaiImagePreviewTransition.fitted(bitmap.getWidth(), bitmap.getHeight(),
+            frame.getWidth(), frame.getHeight());
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) image.getLayoutParams();
+        int width = Math.max(1, Math.round(fit.width())), height = Math.max(1, Math.round(fit.height()));
+        if (params.width == width && params.height == height) return;
+        params.width = width;
+        params.height = height;
+        params.gravity = Gravity.CENTER;
+        image.setLayoutParams(params);
     }
 
     private View gallerySnapshot(Bitmap bitmap) {

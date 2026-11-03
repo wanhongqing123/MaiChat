@@ -32,9 +32,13 @@ public final class MessageImageLoader {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final AtomicLong IDS = new AtomicLong();
     public interface MissingHandler { void onMissing(); }
+    /** 主线程交付当前请求的完整、未裁切解码结果；Bitmap 由缓存共享，调用方不得 recycle。 */
+    public interface LoadedHandler { void onLoaded(Bitmap bitmap); }
     private static final class Tag {
-        final long id; final MissingHandler missing;
-        Tag(long id, MissingHandler missing) { this.id = id; this.missing = missing; }
+        final long id; final MissingHandler missing; final LoadedHandler loaded;
+        Tag(long id, MissingHandler missing, LoadedHandler loaded) {
+            this.id = id; this.missing = missing; this.loaded = loaded;
+        }
     }
     private static final class Request {
         final long id; final WeakReference<ImageView> view;
@@ -50,9 +54,13 @@ public final class MessageImageLoader {
         }
     }
     public static void load(String path, int width, int height, ImageView target, MissingHandler missing) {
+        load(path, width, height, target, missing, null);
+    }
+    public static void load(String path, int width, int height, ImageView target,
+                            MissingHandler missing, LoadedHandler loaded) {
         String clean = path == null ? "" : path.trim();
         long id = IDS.incrementAndGet();
-        target.setTag(new Tag(id, missing));
+        target.setTag(new Tag(id, missing, loaded));
         Request request = new Request(id, target);
         Bitmap previous = cached(clean, width, height);
         if (previous != null) target.setImageBitmap(previous);
@@ -90,6 +98,8 @@ public final class MessageImageLoader {
                 if (!(view.getDrawable() instanceof BitmapDrawable)
                         || ((BitmapDrawable) view.getDrawable()).getBitmap() != bitmap)
                     view.setImageBitmap(bitmap);
+                // setImageBitmap 的宿主回调也可能重新绑定；旧成功结果不能通知新请求。
+                if (view.getTag() == tag && tag.loaded != null) tag.loaded.onLoaded(bitmap);
             } else if (tag.missing != null) tag.missing.onMissing();
         });
     }
