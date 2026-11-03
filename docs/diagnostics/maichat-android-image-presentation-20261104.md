@@ -61,4 +61,5 @@
 - 以上 iOS 手势/几何参数来自当前仓库代码，没有新的 iOS 运行录像或实机验收。
 - 本轮真机覆盖 IM 单张图片、创作中心草稿图片、旋转、单/双击和系统返回；pinch 的范围/手势仲裁已实现，未单独完成双指实机动作验收。
 - 云盘接入和来源失效回退通过源码与编译检查，没有为验动画上传/下载真实云盘图片。生成图片入口与混合媒体翻页连续动画也不列入本轮新验收结果。
-- 运行源码提交与最终安装进程核对在提交后补记。
+- 运行实现源码提交：`78305e803dd2e090b350b68fdd4f81db756cfd4f`；后续补记仅更新本报告。安装后回拉的 `base.apk` 与上述最终 APK SHA-256 完全一致；正常启动进程 PID `22442`、进程名 `com.kongshang.maichat`、版本 2.2.17(254)，该进程 AndroidRuntime/libc fatal 检查无输出。
+- APK 中 GLES Build ID `5a401abee0a45797ab85b1f81a3fa47f6d18d825` 与本仓库新构建库一致。完整安装路径、版本、进程和哈希记录在 `.cache/android-image-transition/installed-final-verification.json`；测试包已移除，旋转为 `free`。
