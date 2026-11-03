@@ -9,6 +9,7 @@
 #include "MaiProcess.h"
 #include "MaiCurlTools.h"
 #include "MaiFileTools.h"
+#include "MaiLlamaTools.h"
 #include "MaiOpenSslTool.h"
 #include "MaiOpenSslCliTool.h"
 #include "MaiSystemResourcesTool.h"
@@ -197,6 +198,8 @@ void registerMaiBuiltinTools(MaiToolRegistry& registry) {
     registerMaiFileTools(registry);
     registry.add(makeMaiTodoWriteTool());
     registerMaiCurlTools(registry);
+    // 仅注册本地推理入口；不在注册阶段加载模型或访问网络。
+    registerMaiLlamaTools(registry);
     registry.add(makeMaiZlibCompressTool());
     registry.add(makeMaiZlibDecompressTool());
     registry.add(makeMaiSystemResourcesTool());

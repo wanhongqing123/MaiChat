@@ -7,6 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		7BE2BC4EA367B7517B6D286D /* LocalInferenceUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BCB5FFEB9C9B11BB747DE4D /* LocalInferenceUITests.swift */; };
+		122E240613E362BBF149EFFE /* AILocalInferenceUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAA6C971B5AE1B704B174CB5 /* AILocalInferenceUITestFixture.swift */; };
+		F8B3C2B1B42BAAE0624B9281 /* AILocalInferenceRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DB66B5A5984C9EF151C6F89 /* AILocalInferenceRuntime.swift */; };
 		6996899BF91F58CF5117B8A4 /* RealtimeSpeechRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 212C484CFEC8D824343ED193 /* RealtimeSpeechRecognizer.swift */; };
 		BC44715B7739C748E453B804 /* AliyunSpeechTranscript.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2EE8714FB985188F6A07079 /* AliyunSpeechTranscript.swift */; };
 		AC8A7F80F5634FA8F86FE5C8 /* AliyunRealtimeSpeechRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A146916AC8B530236EAA5708 /* AliyunRealtimeSpeechRecognizer.swift */; };
@@ -90,6 +93,7 @@
 		D153C2A4F2F5D6211CEB78B5 /* DesktopLoginScanView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D2095160132FC761449A82E /* DesktopLoginScanView.swift */; };
 		D24E6578A8A7EDF92BD0A9E4 /* video-circle-source.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 29ED9E52F55FF7B33F57D37C /* video-circle-source.mp4 */; };
 		D357B7A7100F4773EB0864A6 /* MobilePhotoTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54414E908C459EF659BD48AD /* MobilePhotoTools.swift */; };
+		25DE731960DD4652B35BF097 /* MaiPortraitPhotoProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE03536076A1485083AC78A8 /* MaiPortraitPhotoProcessor.swift */; };
 		D745B4CE59A50B7DD36C83E0 /* AIAssistantPathPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB30A9BB79A305FE900BF9E5 /* AIAssistantPathPolicy.swift */; };
 		D8890915CD794198A0332BB2 /* MaiChatCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 771AB137E6961E2B9187CFEB /* MaiChatCore.framework */; };
 		DD0212F81BF7429B14829650 /* MobileImageTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8888872A869DC80CF8DF58B6 /* MobileImageTools.swift */; };
@@ -186,6 +190,9 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		7BCB5FFEB9C9B11BB747DE4D /* LocalInferenceUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalInferenceUITests.swift; sourceTree = "<group>"; };
+		EAA6C971B5AE1B704B174CB5 /* AILocalInferenceUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AILocalInferenceUITestFixture.swift; sourceTree = "<group>"; };
+		6DB66B5A5984C9EF151C6F89 /* AILocalInferenceRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AILocalInferenceRuntime.swift; sourceTree = "<group>"; };
 		212C484CFEC8D824343ED193 /* RealtimeSpeechRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeSpeechRecognizer.swift; sourceTree = "<group>"; };
 		F2EE8714FB985188F6A07079 /* AliyunSpeechTranscript.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AliyunSpeechTranscript.swift; sourceTree = "<group>"; };
 		A146916AC8B530236EAA5708 /* AliyunRealtimeSpeechRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AliyunRealtimeSpeechRecognizer.swift; sourceTree = "<group>"; };
@@ -227,6 +234,7 @@
 		489905ADED5F3469B72DB261 /* MaiCloudDriveAgentPlaybackCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiCloudDriveAgentPlaybackCache.swift; sourceTree = "<group>"; };
 		4E3D9F697A1737B461CCB2EB /* MaiChatUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = MaiChatUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		54414E908C459EF659BD48AD /* MobilePhotoTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobilePhotoTools.swift; sourceTree = "<group>"; };
+		EE03536076A1485083AC78A8 /* MaiPortraitPhotoProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiPortraitPhotoProcessor.swift; sourceTree = "<group>"; };
 		5897033F54602274C5F58A4A /* RemoteDiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDiagnosticsView.swift; sourceTree = "<group>"; };
 		59C1F4DABEBD721F3CB32385 /* LocalChatHistoryStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalChatHistoryStoreTests.swift; sourceTree = "<group>"; };
 		5FFB5E24161F8E400C19FB64 /* CloudDriveDeviceReadOnlySmokeUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudDriveDeviceReadOnlySmokeUITests.swift; sourceTree = "<group>"; };
@@ -367,6 +375,7 @@
 			isa = PBXGroup;
 			children = (
 				89FDF5DC4F6DB91F2A1B3FD5 /* AIAssistantUITests.swift */,
+				7BCB5FFEB9C9B11BB747DE4D /* LocalInferenceUITests.swift */,
 				F72661B3076526C813462A35 /* BrowserUITests.swift */,
 				E7E870F1F61ED5F83EBA6082 /* PortraitUITests.swift */,
 				6A4165956D22773A034F0701 /* AccountToolsUITests.swift */,
@@ -450,6 +459,7 @@
 				8888872A869DC80CF8DF58B6 /* MobileImageTools.swift */,
 				E40A92474C9E88F01019EDA5 /* MobilePermissionTools.swift */,
 				54414E908C459EF659BD48AD /* MobilePhotoTools.swift */,
+				EE03536076A1485083AC78A8 /* MaiPortraitPhotoProcessor.swift */,
 			);
 			path = MaiChatTools;
 			sourceTree = "<group>";
@@ -560,6 +570,7 @@
 			children = (
 				24AF3608C85D5AE5D045283D /* AIAssistantModel.swift */,
 				C319AE871235F0F7386CF383 /* AIAssistantView.swift */,
+				6DB66B5A5984C9EF151C6F89 /* AILocalInferenceRuntime.swift */,
 			);
 			path = Assistant;
 			sourceTree = "<group>";
@@ -688,6 +699,7 @@
 			children = (
 				1D6AEEF497AF12C5AC0D8830 /* AIAssistantModel+UITesting.swift */,
 				F143E54A2E02B861C71B4912 /* AIAssistantUITestFixtures.swift */,
+				EAA6C971B5AE1B704B174CB5 /* AILocalInferenceUITestFixture.swift */,
 				92A6B87FA07CEFE77630E158 /* AISessionDrawerDiagnostics.swift */,
 				060E93A596039BFA991824E8 /* AppUITestSupport.swift */,
 				ABE03DA77EC93EB1EFACD5D9 /* GroupChatUITestData.swift */,
@@ -982,6 +994,7 @@
 				8329CA88A262F76CB2FA76F0 /* AccountToolsUITestFixture.swift in Sources */,
 				70467023ED27455C3F0D7F56 /* AIAssistantModel+UITesting.swift in Sources */,
 				CD33CAFFD2CCD150280DD669 /* AIAssistantUITestFixtures.swift in Sources */,
+				122E240613E362BBF149EFFE /* AILocalInferenceUITestFixture.swift in Sources */,
 				0A25E40C9A746E802631C408 /* AISessionDrawerDiagnostics.swift in Sources */,
 				418A1035153D6947FA4829F4 /* AppUITestSupport.swift in Sources */,
 				571FDABF48F306A08274F862 /* ChatUITestFixtures.swift in Sources */,
@@ -992,6 +1005,7 @@
 				26E07E6A677FDD3E7072C256 /* ScreenFramesUITestFixtures.swift in Sources */,
 				10E63571389FF61C9869CE9E /* AIAssistantModel.swift in Sources */,
 				91722667D29CD5A82A3A2E00 /* AIAssistantView.swift in Sources */,
+				F8B3C2B1B42BAAE0624B9281 /* AILocalInferenceRuntime.swift in Sources */,
 				F77BA084695F31C9AD6308A7 /* AIMobileScreenFramesView.swift in Sources */,
 				C4A881E263A97B3D41E6C001 /* AIMobileCameraCapture.swift in Sources */,
 				0329ABDC04BBAC38945C24FA /* AIMobileHostToolProvider.swift in Sources */,
@@ -1033,6 +1047,7 @@
 				DD0212F81BF7429B14829650 /* MobileImageTools.swift in Sources */,
 				565AD4A1181778D023B2900E /* MobilePermissionTools.swift in Sources */,
 				D357B7A7100F4773EB0864A6 /* MobilePhotoTools.swift in Sources */,
+				25DE731960DD4652B35BF097 /* MaiPortraitPhotoProcessor.swift in Sources */,
 				A0787EEE0051E9674B39C7C0 /* PhoneAccountLoginView.swift in Sources */,
 				EC4CC462A846C4BBBB877005 /* RemoteDesktopSession.swift in Sources */,
 				FEA124404840D00F968F232A /* RemoteDesktopView.swift in Sources */,
@@ -1058,6 +1073,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				194E338FF3D0DE993B165814 /* AIAssistantUITests.swift in Sources */,
+				7BE2BC4EA367B7517B6D286D /* LocalInferenceUITests.swift in Sources */,
 				97387C3DF0C593C94754987C /* BrowserUITests.swift in Sources */,
 				46DC2FB7BFD7AAAB22B1B0B7 /* PortraitUITests.swift in Sources */,
 				C2D5DF25D72C1E7A1610BE92 /* AccountToolsUITests.swift in Sources */,
@@ -1123,6 +1139,14 @@
 					CFNetwork,
 					"-framework",
 					SystemConfiguration,
+					"-framework",
+					Foundation,
+					"-framework",
+					Metal,
+					"-framework",
+					MetalKit,
+					"-framework",
+					Accelerate,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kongshang.maichat;
 				SDKROOT = iphoneos;
@@ -1165,7 +1189,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 172;
+				CURRENT_PROJECT_VERSION = 177;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1342,7 +1366,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 172;
+				CURRENT_PROJECT_VERSION = 177;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -1397,6 +1421,14 @@
 					CFNetwork,
 					"-framework",
 					SystemConfiguration,
+					"-framework",
+					Foundation,
+					"-framework",
+					Metal,
+					"-framework",
+					MetalKit,
+					"-framework",
+					Accelerate,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.kongshang.maichat;
 				SDKROOT = iphoneos;

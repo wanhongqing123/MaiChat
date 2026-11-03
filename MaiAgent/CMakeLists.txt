@@ -358,6 +358,16 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# 本地推理与普通宿主入口共用仓库内同一版本的 llama/ggml/mtmd；不下载预编译 SDK。
+# 权重不是构建资源，只有收到已授权的本地路径时才按需加载。
+# 必须在本目录作用域先启用 Objective-C 与 Objective-C++；Metal 的 .m 需要 C 语义，
+# 本目录的截图/PDF 使用 .mm，不能依赖子目录启用语言后留下的不完整规则。
+if(APPLE)
+  enable_language(OBJC OBJCXX)
+endif()
+include(third_party/MaiLlamaDependencies.cmake)
+mai_add_llama_dependencies()
+
 # ── 核心库：纯 C++，无 Qt，无 HTTP 服务端依赖 ────────────────────
 # 文件名一律大驼峰 + Mai 前缀，见 docs/CodingStyle.md。
 add_library(maiagent STATIC
@@ -378,6 +388,7 @@ add_library(maiagent STATIC
   Agent/MaiFilePath.cpp
   AgentTools/MaiPathGuard.cpp
   AgentTools/MaiTool.cpp
+  AgentTools/MaiLlamaTools.cpp
   AgentTools/MaiFfmpegTools.cpp
   AgentTools/MaiVideoGeometryTool.cpp
   AgentTools/MaiCvVideoTools.cpp
@@ -462,6 +473,7 @@ target_include_directories(maiagent
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann
           ${mai_curl_source}/src
+          ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor
           # RVM 只使用 C API 头；运行库由各宿主平台打包。
           # 头文件取自仓库内的官方 ONNX Runtime 源码，避免和预编译包维护两份。
           ${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/include/onnxruntime/core/session
@@ -470,7 +482,7 @@ target_include_directories(maiagent
 # 和适配器里的 cpp-httplib（HTTP **服务端**）是两回事，两个都要。
 # sqlite、libcurl 和 md4c 都是 PRIVATE：它们是实现细节，公开头里不出现。
 target_link_libraries(maiagent PUBLIC Threads::Threads PRIVATE CURL::libcurl mai_curl_cli zlibstatic
-  libssh2_static mai_sqlite mai_md4c ${CMAKE_DL_LIBS})
+  libssh2_static mai_sqlite mai_md4c mai_llama ${CMAKE_DL_LIBS})
 if(WIN32)
   # zlib.h 仅在 ZLIB_BUILD 下从 include 路径读取上述覆盖头。
   set_source_files_properties(AgentTools/MaiZlibTool.cpp PROPERTIES
@@ -574,6 +586,7 @@ if(MAIAGENT_BUILD_TESTS)
       MaiModelClientTests   # 流式解析 + 工具调用分片聚合
       MaiTurnRunnerTests    # 一轮对话的完整生命周期
       MaiToolTests          # 路径边界 + 内置工具
+      MaiLlamaToolsTests    # 本地推理生命周期、取消、参数与工作区边界
       MaiEditToolTests      # edit：唯一匹配、替换全部、拒绝的那几种情况
       MaiApplyPatchToolTests  # apply_patch：多处/多文件、全有或全无、换行原样
       MaiWebToolsTests      # webfetch 的 HTML 转文本和协议限制、todowrite 的校验

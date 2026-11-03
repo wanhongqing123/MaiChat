@@ -7,6 +7,7 @@
 #include <QDir>
 #include <QHBoxLayout>
 #include <QFileInfo>
+#include <QFileDialog>
 #include <QPointer>
 #include <QProcess>
 #include <QPushButton>
@@ -23,7 +24,9 @@
 #include <QTemporaryDir>
 #include <QTextEdit>
 #include <QTimer>
+#include <QToolButton>
 #include <QWidget>
+#include <QWindow>
 #include <QtTest>
 
 #include <algorithm>
@@ -49,11 +52,44 @@ void activateFfplayTestApplication();
 void activateFfplayTestWindow(QWidget* widget);
 bool ffplayTestWindowInteractive(QWidget* widget);
 QString ffplayTestNativeState(QWidget* widget);
+bool cancelFfplayTestNativePanel();
+void observeFfplayTestNativePanel();
+bool clickFfplayTestNativeButton(QWidget* widget);
+void* scheduleFfplayTestSaveCancel(bool* observed);
+void stopFfplayTestSaveCancel(void* token);
 #endif
 
 namespace {
 
 std::atomic<bool> sSawFiniteSeek{false};
+
+class VideoControlMoveProbe final : public QObject {
+public:
+    VideoControlMoveProbe(MaiFfplayVideoDialog& player, QWidget& panel)
+        : player_(player), panel_(panel) {}
+    int received = 0;
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (event->type() != QEvent::MouseMove) return false;
+        auto* widget = qobject_cast<QWidget*>(watched);
+        if ((!widget || (widget != &player_ && !player_.isAncestorOf(widget))) &&
+            watched != player_.windowHandle()) return false;
+        ++received;
+        const auto* mouse = static_cast<QMouseEvent*>(event);
+        QTimer* hideTimer = nullptr;
+        for (auto* timer : player_.findChildren<QTimer*>())
+            if (timer->interval() == 2500) hideTimer = timer;
+        qInfo() << "[controls-move-event]" << watched->metaObject()->className() << watched->objectName()
+                << "local" << mouse->localPos() << "global" << mouse->globalPos()
+                << "cursor" << QCursor::pos() << "spontaneous" << event->spontaneous()
+                << "hidden-before" << panel_.isHidden() << "playing" << player_.isPlaying()
+                << "timer-active" << bool(hideTimer && hideTimer->isActive())
+                << "remaining" << (hideTimer ? hideTimer->remainingTime() : -1);
+        return false;
+    }
+private:
+    MaiFfplayVideoDialog& player_;
+    QWidget& panel_;
+};
 
 void captureDiagnostic(void*, int, const char* line) {
     if (!line) return;
@@ -75,6 +111,7 @@ class MaiFfplayVideoDialogTest : public QObject {
 private slots:
     void initTestCase();
     void exposesSaveAndForwardActions();
+    void shareAndSaveIconsInvokeExistingDialogs();
     void opensControlsAndClosesVideoPopup_data();
     void opensControlsAndClosesVideoPopup();
     void opensAtRequestedSourceTime();
@@ -566,24 +603,36 @@ void MaiFfplayVideoDialogTest::agentVideoUsesIndependentWindow() {
 #endif
     auto* slider = player->findChild<QSlider*>(QStringLiteral("ffplaySeekSlider"));
     auto* more = player->findChild<QPushButton*>(QStringLiteral("videoMoreButton"));
+#if defined(Q_OS_MAC)
+    auto* share = player->findChild<QToolButton*>(QStringLiteral("videoShareButton"));
+    auto* save = player->findChild<QToolButton*>(QStringLiteral("videoSaveButton"));
+    QVERIFY(slider && share && save && !more);
+#else
     QVERIFY(slider && more);
+#endif
     QHBoxLayout* controlRow = nullptr;
     for (auto* row : player->findChildren<QHBoxLayout*>())
         if (row->indexOf(slider) >= 0) controlRow = row;
     QVERIFY(controlRow && controlRow->parentWidget());
     auto* controlsHost = controlRow->parentWidget();
+#if defined(Q_OS_MAC)
+    QTRY_VERIFY(slider->isVisible() && share->isVisible() && save->isVisible());
+#else
     QTRY_VERIFY(slider->isVisible() && more->isVisible());
+#endif
     // macOS overlays a panel on video; Windows lays the same real controls below the surface.
 #if defined(Q_OS_MAC)
     auto* panel = player->findChild<QWidget*>(QStringLiteral("ffplayControlPanel"));
     QVERIFY(panel && panel->isVisible());
     QTRY_VERIFY(panel->width() > player->width() * 0.85);
+    QTRY_VERIFY(slider->width() > panel->width() * 0.90);
+    QVERIFY(slider->mapToGlobal(slider->rect().bottomLeft()).y() < share->mapToGlobal(QPoint()).y());
 #endif
     QTRY_VERIFY(controlRow->geometry().width() > player->width() * 0.85);
     QTRY_VERIFY(slider->width() > player->width() * 0.5);
     const QString screenshot = qEnvironmentVariable("MAICHAT_AGENT_VIDEO_SCREENSHOT");
     if (!screenshot.isEmpty()) {
-        QVERIFY(controlsHost->grab(controlRow->geometry()).save(screenshot + QStringLiteral("-panel.png")));
+        QVERIFY(controlsHost->grab().save(screenshot + QStringLiteral("-panel.png")));
         // 原生视频层不参与 QWidget::grab；按窗口边框取屏幕区域，验收标题栏和实际画面。
         QTest::qWait(200);
         const QRect frame = player->frameGeometry();
@@ -593,6 +642,7 @@ void MaiFfplayVideoDialogTest::agentVideoUsesIndependentWindow() {
             QVERIFY(
                 player->screen()->grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(screenshot));
     }
+#if !defined(Q_OS_MAC)
     bool menuFitsPlatform = false;
     QTimer dismissMenu;
     dismissMenu.setSingleShot(true);
@@ -600,7 +650,12 @@ void MaiFfplayVideoDialogTest::agentVideoUsesIndependentWindow() {
         auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
         if (!menu) return;
 #if defined(Q_OS_MAC)
-        menuFitsPlatform = menu->isVisible() && menu->geometry().bottom() <= panel->mapToGlobal(QPoint()).y();
+        const auto actions = menu->actions();
+        menuFitsPlatform = menu->isVisible() && menu->geometry().bottom() <= panel->mapToGlobal(QPoint()).y() &&
+            actions.size() == 2 && actions.at(0)->text() == QStringLiteral("分享…") &&
+            actions.at(1)->text() == QStringLiteral("保存副本…") &&
+            !actions.at(0)->isSeparator() && !actions.at(1)->isSeparator() &&
+            !actions.at(0)->menu() && !actions.at(1)->menu();
 #else
         // The Windows menu uses the native below-button anchor with Qt's screen-edge adjustment.
         const auto actions = menu->actions();
@@ -627,9 +682,33 @@ void MaiFfplayVideoDialogTest::agentVideoUsesIndependentWindow() {
     QTest::mouseClick(more, Qt::LeftButton);
     dismissMenu.stop();
     QVERIFY(menuFitsPlatform);
+#endif
     player->resize(640, 420);
     QTRY_VERIFY(slider->width() > 160);
+#if defined(Q_OS_MAC)
+    QVERIFY(share->isVisible() && save->isVisible());
+    QTRY_VERIFY(slider->width() > panel->width() * 0.90);
+    if (!screenshot.isEmpty()) {
+        QTest::qWait(150);
+        const QRect frame = player->frameGeometry();
+        QVERIFY(player->screen()->grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height())
+            .save(screenshot + QStringLiteral("-compact.png")));
+    }
+    player->showFullScreen();
+    QTRY_VERIFY(player->isFullScreen());
+    QTRY_VERIFY(slider->width() > player->width() * 0.85);
+    QVERIFY(share->isVisible() && save->isVisible());
+    if (!screenshot.isEmpty()) {
+        QTest::qWait(650);
+        const QRect frame = player->frameGeometry();
+        QVERIFY(player->screen()->grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height())
+            .save(screenshot + QStringLiteral("-fullscreen.png")));
+    }
+    player->showNormal();
+    QTRY_VERIFY(!player->isFullScreen());
+#else
     QVERIFY(more->isVisible());
+#endif
     player->close();
     QTRY_VERIFY(!MaiFfplayVideoDialog::activeDialog());
     QVERIFY(window.isVisible());
@@ -792,8 +871,13 @@ void MaiFfplayVideoDialogTest::fullscreenControlsHideAndWake() {
     auto* panel = player.findChild<QWidget*>(QStringLiteral("ffplayControlPanel"));
     auto* pause = player.findChild<QPushButton*>(QStringLiteral("ffplayPauseButton"));
     QVERIFY(surface && panel && pause);
-    QCursor::setPos(surface->mapToGlobal(surface->rect().center()));
-    QTest::mouseMove(surface, surface->rect().center());
+    VideoControlMoveProbe moveProbe(player, *panel);
+    qApp->installEventFilter(&moveProbe);
+    // Qt 5's QWidget mouseMove only warps QCursor on macOS. Use the QWindow
+    // overload to deliver a real Qt MouseMove to the control event-filter path;
+    // this does not claim a physical mouse/CGEvent or change the timeout.
+    QTest::mouseMove(player.windowHandle(),
+        player.mapFromGlobal(surface->mapToGlobal(surface->rect().center())));
     QTRY_VERIFY_WITH_TIMEOUT(panel->isHidden(), 6000);
     const QString screenshot = qEnvironmentVariable("MAICHAT_AGENT_VIDEO_SCREENSHOT");
     if (!screenshot.isEmpty()) {
@@ -802,13 +886,17 @@ void MaiFfplayVideoDialogTest::fullscreenControlsHideAndWake() {
             ->grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height())
             .save(screenshot + QStringLiteral("-fullscreen-hidden.png"));
     }
-    QCursor::setPos(surface->mapToGlobal(surface->rect().center() + QPoint(20, 0)));
-    QTest::mouseMove(surface, surface->rect().center() + QPoint(20, 0));
+    const int movesBeforeWake = moveProbe.received;
+    QTest::mouseMove(player.windowHandle(),
+        player.mapFromGlobal(surface->mapToGlobal(surface->rect().center() + QPoint(20, 0))));
+    QTRY_VERIFY(moveProbe.received > movesBeforeWake);
     qInfo() << "[controls-wake]" << "pointer" << QCursor::pos() << "window" << player.frameGeometry() << "full"
             << player.isFullScreen() << "playing" << player.isPlaying() << "hidden" << panel->isHidden();
     qInfo() << "[controls-wake-native]" << ffplayTestNativeState(&player) << "surface" << surface->geometry()
             << "origin" << surface->mapToGlobal(QPoint());
     QTRY_VERIFY(!panel->isHidden());
+    qInfo() << "[controls-move-revealed]" << "received" << moveProbe.received
+            << "hidden" << panel->isHidden() << "playing" << player.isPlaying();
     QTest::mouseClick(pause, Qt::LeftButton);
     QTRY_VERIFY(!player.isPlaying());
     QTest::qWait(2800);
@@ -1053,14 +1141,73 @@ void MaiFfplayVideoDialogTest::imVideoUsesIndependentWindowAcrossNavigationAndFu
 
 void MaiFfplayVideoDialogTest::exposesSaveAndForwardActions() {
     MaiFfplayVideoDialog dialog(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE));
+#if defined(Q_OS_MAC)
+    auto* share = dialog.findChild<QToolButton*>(QStringLiteral("videoShareButton"));
+    auto* save = dialog.findChild<QToolButton*>(QStringLiteral("videoSaveButton"));
+    QVERIFY(share && save);
+    for (auto* button : {share, save}) {
+        QCOMPARE(button->toolButtonStyle(), Qt::ToolButtonIconOnly);
+        QVERIFY(button->text().isEmpty() && !button->icon().isNull());
+        QVERIFY(!button->toolTip().isEmpty() && button->accessibleName() == button->toolTip());
+    }
+    QVERIFY(!dialog.findChild<QWidget*>(QStringLiteral("videoMoreButton")));
+#else
     auto* forward = dialog.findChild<QPushButton*>(QStringLiteral("videoForwardButton"));
     auto* save = dialog.findChild<QPushButton*>(QStringLiteral("videoSaveButton"));
     QVERIFY(forward != nullptr);
     QVERIFY(save != nullptr);
+#endif
     bool forwarded = false;
     dialog.setForwardAction([&forwarded](const QString&) { forwarded = true; });
-    forward->click();
+    dialog.forwardVideo();
     QVERIFY(forwarded);
+}
+
+void MaiFfplayVideoDialogTest::shareAndSaveIconsInvokeExistingDialogs() {
+#if defined(Q_OS_MAC)
+    MaiFfplayVideoDialog dialog(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE));
+    dialog.show();
+    activateFfplayTestWindow(&dialog);
+    QTRY_VERIFY_WITH_TIMEOUT(dialog.presentedFrames() > 0, 10000);
+    auto* share = dialog.findChild<QToolButton*>(QStringLiteral("videoShareButton"));
+    auto* save = dialog.findChild<QToolButton*>(QStringLiteral("videoSaveButton"));
+    QVERIFY(share && save && share->isVisible() && save->isVisible());
+    QSignalSpy shared(share, &QToolButton::clicked);
+    observeFfplayTestNativePanel();
+    bool sharePickerObserved = false;
+    QTimer dismissShare;
+    connect(&dismissShare, &QTimer::timeout, [&] {
+        if (cancelFfplayTestNativePanel()) {
+            sharePickerObserved = true;
+            dismissShare.stop();
+        }
+    });
+    dismissShare.start(100);
+    // AppKit sharing requires the real native input context; QWidget synthetic
+    // clicks bypass NSEvent and cannot validate a system picker presentation.
+    QVERIFY(clickFfplayTestNativeButton(share));
+    QTRY_COMPARE(shared.count(), 1);
+    QTRY_VERIFY(sharePickerObserved);
+    dismissShare.stop();
+    QVERIFY(dialog.isVisible());
+    bool saveOpened = false;
+    QTemporaryDir saveDirectory;
+    QVERIFY(saveDirectory.isValid());
+    const QString originalDirectory = QDir::currentPath();
+    const auto restoreDirectory = qScopeGuard([&] { QDir::setCurrent(originalDirectory); });
+    QVERIFY(QDir::setCurrent(saveDirectory.path()));
+    // NSSavePanel runs its own modal loop; a Qt timer/widget scan does not
+    // reliably cancel it. Use a native modal-mode timer without choosing a file.
+    void* cancelToken = scheduleFfplayTestSaveCancel(&saveOpened);
+    const auto stopCancel = qScopeGuard([&] { stopFfplayTestSaveCancel(cancelToken); });
+    QVERIFY(clickFfplayTestNativeButton(save));
+    QTRY_VERIFY(saveOpened);
+    QVERIFY(saveOpened);
+    QVERIFY(dialog.isVisible());
+    dialog.close();
+#else
+    QSKIP("Native macOS sharing and save dialogs");
+#endif
 }
 
 void MaiFfplayVideoDialogTest::opensControlsAndClosesVideoPopup_data() {
@@ -1244,9 +1391,7 @@ void MaiFfplayVideoDialogTest::localVideoShowsPixels() {
         nextButton->click();
         QTRY_COMPARE_WITH_TIMEOUT(dialog.windowTitle(), QFileInfo(nextPath).fileName(), 3000);
         QTRY_VERIFY_WITH_TIMEOUT(dialog.presentedFrames() > 0, 5000);
-        auto* forwardButton = dialog.findChild<QPushButton*>(QStringLiteral("videoForwardButton"));
-        QVERIFY(forwardButton != nullptr);
-        forwardButton->click();
+        dialog.forwardVideo();
         QCOMPARE(QFileInfo(forwardedPath).canonicalFilePath(), QFileInfo(nextPath).canonicalFilePath());
         QCOMPARE(dialog.speed(), 1.5);
         QTRY_VERIFY_WITH_TIMEOUT(maiFfplayGetPlaybackStatus(&playback) && playback.speed_percent == 150, 3000);

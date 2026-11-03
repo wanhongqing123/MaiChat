@@ -2,6 +2,7 @@
 // 调用边界：由 MaiChat 媒体或 Agent 宿主调用；平台资源在停止或失败时须正确释放。
 #include "MaiMobileHostTools.h"
 #include "MaiChangePasswordTool.h"
+#include "MaiPortraitBridge.h"
 #include "MaiAccountTools.h"
 
 #include <cstdlib>
@@ -454,7 +455,22 @@ public:
     bool requiresApproval(const std::string&) const override { return mApproval; }
     bool requiresPerCallApproval(const std::string&) const override { return mApproval; }
     MaiToolResult execute(const std::string& argumentsJson,
-                          const MaiToolContext&) override {
+                          const MaiToolContext& context) override {
+        if (mName == "mobile_beautify_image" || mName == "mobile_reshape_body") {
+            if (context.isCanceled())
+                return MaiToolResult::failure(MaiErrorCode::Canceled, "Portrait edit was canceled");
+            const char* operation = mName == "mobile_beautify_image" ? "beautify" : "reshape_body";
+            char* invalid = maiPortraitValidateArguments(operation, argumentsJson.c_str(), 0);
+            if (invalid) {
+                const std::string detail(invalid);
+                maiPortraitFree(invalid);
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, detail);
+            }
+            auto request = Json::parse(argumentsJson);
+            if (!context.root.empty()) request["workspace_path"] = context.root;
+            if (!context.sessionId.empty()) request["session_id"] = context.sessionId;
+            return mDispatcher->call(mName, request.dump());
+        }
         return mDispatcher->call(mName, argumentsJson);
     }
 
@@ -1246,7 +1262,10 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         "resolved to their original. Explicit parameters override the validated personal model. "
         "Unspecified shape changes default to zero. For multiple faces set subject_index "
         "from left to right starting at 0. Return result_id for user feedback and preview "
-        "the path with mobile_preview_image. Never infer user preference from your own judgment.",
+        "the path with mobile_preview_image. The iOS host automatically processes a bounded face ROI "
+        "and composites it at the original dimensions; returned mask is diagnostic, not another blend alpha. "
+        "Use skin ROI L*/C* and reported mask coverage, not full-image threshold fractions, to assess changes. "
+        "Unknown fields including action/delegate are rejected. Never infer user preference from your own judgment.",
         // 所有处理复用普通 C++ 核心；单独的几何参数默认关闭，strength 保留为旧调用映射。
         R"({"type":"object","properties":{"path":{"type":"string"},"strength":{"type":"number","minimum":0,"maximum":1},)"
         R"("smoothing":{"type":"number","minimum":0,"maximum":1},"brightening":{"type":"number","minimum":0,"maximum":1},)"

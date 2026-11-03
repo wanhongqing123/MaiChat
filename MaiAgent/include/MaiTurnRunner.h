@@ -58,6 +58,13 @@ public:
         std::string fileAccessRoot;
         bool allowOutsideWorkingDirectory = false;
         std::function<MaiResult<std::string>(const std::string&, const std::string&)> decodeText;
+        // 内部输入闸门：只在完整工具批次之间调用。原子消费补充消息并把 assistant
+        // 切到新的持久化分段；closeIfEmpty 为真时，没有待消费输入便封闭本轮接收。
+        // 回调不得持锁广播事件；轮次和回调捕获对象均须活到 run 返回。
+        std::function<MaiResult<bool>(MaiMessage&, bool closeIfEmpty)> advanceSteering;
+        // 历史先读快照，再取这份 ID 列表，避免新到的待消费 user 提前进入模型请求。
+        std::function<std::vector<std::string>()> pendingSteering;
+        std::function<void()> closeSteering;
     };
 
     MaiTurnRunner(Dependencies dependencies, std::string sessionId, MaiMessage assistant);
@@ -65,6 +72,8 @@ public:
     // 阻塞跑完一轮。调用方负责把它放到自己的线程上。
     void run(const std::atomic<bool>& cancel);
     bool succeeded() const;
+    // 包括 steer 前后的全部 assistant 分段，用于确认专业任务的回复已经展示。
+    bool hasVisibleText() const;
 
 private:
     // run() 的实际工作。外层 run() 负责把任何未预期异常收敛成会话错误，不能让异常逃出
@@ -88,6 +97,7 @@ private:
 
     // 组装这一次要发给模型的请求。
     MaiModelRequest buildRequest(const std::string& modelName, bool requireFinalAnswer) const;
+    bool advanceSteering(bool closeIfEmpty);
 
     // 流式 part 刚冒头时：先在消息里占个位、落库，再广播。
     //
@@ -109,6 +119,9 @@ private:
 
     Dependencies mDependencies;
     std::string mSessionId;
+    std::string mInitialAssistantId;
+    // 专业通知可能重用较旧的消息 ID；不能按这个 ID 把既存的新用户历史移到回复之后。
+    std::set<std::string> mSpecialistHistoryIds;
     MaiMessage mAssistant;
     std::string mWorkingDirectory;
     std::string mModelName;
@@ -122,6 +135,7 @@ private:
     std::size_t mLastPersistedStreamBytes = 0;
 
     MaiError mError;
+    bool mHasVisibleText = false;
 
     // 这一轮里已经被拒绝过的 (工具名, 参数)。模型被拒之后经常原样再调一次，
     // 每次都弹一个框会把用户烦死；记下来直接回同样的拒绝，它才会换招。

@@ -6,6 +6,8 @@
 // 这是 agent 之所以是 agent 的地方，也是 M3 唯一真正需要证明的东西。
 // 假模型按脚本依次返回"要调工具"和"最终回答"，所以整个闭环是确定的。
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +22,7 @@
 #include "MaiMemoryStore.h"
 #include "MaiFileTools.h"
 #include "MaiFakeModelClient.h"
+#include "MaiIdGenerator.h"
 
 namespace fs = std::filesystem;
 
@@ -162,7 +165,7 @@ public:
         return MaiToolResult::failure(
             MaiErrorCode::Network,
             R"({"code":"provider_error","provider_code":1102,"http_status":429,)"
-                R"("message":"Account balance not enough"})");
+            R"("message":"Account balance not enough"})");
     }
 };
 
@@ -750,6 +753,333 @@ void test_model_exception_becomes_a_session_error() {
     CHECK(reported);
 }
 
+// 条件变量卡住真实工具边界，证明补充输入不会用 cancel 打断已开始的工具。
+class SteeringHeldTool final : public MaiTool {
+public:
+    std::string name() const override {
+        return "held_work";
+    }
+    std::string description() const override {
+        return "Wait for the local test gate.";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object"})";
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
+        std::unique_lock<std::mutex> lock(mutex);
+        ++calls;
+        entered.notify_all();
+        const bool released = wake.wait_for(lock, std::chrono::seconds(5), [&] { return ready; });
+        canceled = context.cancel && context.cancel->load(std::memory_order_relaxed);
+        return released ? MaiToolResult::success("current result")
+                        : MaiToolResult::failure(MaiErrorCode::Internal, "test gate timed out");
+    }
+    bool waitEntered() {
+        std::unique_lock<std::mutex> lock(mutex);
+        return entered.wait_for(lock, std::chrono::seconds(5), [&] { return calls > 0; });
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        ready = true;
+        wake.notify_all();
+    }
+    std::atomic<int> calls{0};
+    std::atomic<bool> canceled{false};
+
+private:
+    std::mutex mutex;
+    std::condition_variable entered;
+    std::condition_variable wake;
+    bool ready = false;
+};
+
+void test_steer_waits_for_all_tool_results_and_reaches_the_next_model_request() {
+    Workspace workspace;
+    MaiFakeModelClient::Turn batch;
+    batch.invocations = {{"held_1", "held_work", "{}"}, {"status_2", "status", "{}"}};
+    auto nextTurn = sayTurn("A new turn");
+    nextTurn.chunkDelayMilliseconds = 100;
+    auto model = std::make_unique<MaiFakeModelClient>(
+        std::vector<MaiFakeModelClient::Turn>{batch, callTurn("status", "{}", "after_steer"),
+                                              sayTurn("Here is the current result."), nextTurn});
+    MaiFakeModelClient* observed = model.get();
+    auto registry = std::make_unique<MaiToolRegistry>();
+    auto held = std::make_unique<SteeringHeldTool>();
+    SteeringHeldTool* gate = held.get();
+    registry->add(std::move(held));
+    registry->add(std::make_unique<TextResultTool>());
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(registry));
+    const std::string session =
+        agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    const auto started = agent.submit(MaiSendPrompt{session, "Improve this image"});
+    CHECK(started.isOk());
+    CHECK(gate->waitEntered());
+    CHECK(agent.activeTurnId(session) == started.value());
+    CHECK(agent.submit(MaiSendPrompt{session, "ordinary send remains busy"}).error().code() ==
+          MaiErrorCode::Busy);
+
+    std::atomic<bool> persistedBeforeBroadcast{false};
+    auto subscription = agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type != MaiEventType::MessageUpdated) return;
+        for (const MaiMessage& message : agent.listMessages(session)) {
+            if (message.id == event.messageId && message.text() == "Show the current result first")
+                persistedBeforeBroadcast = true;
+        }
+    });
+    const MaiSteerPrompt supplement{session, started.value(), "request-one",
+                                    "Show the current result first"};
+    const auto accepted = agent.submit(supplement);
+    CHECK(accepted.isOk());
+    CHECK(persistedBeforeBroadcast.load());
+    CHECK(agent.submit(supplement).value() == accepted.value());
+    MaiSteerPrompt conflicting = supplement;
+    conflicting.text = "different content";
+    CHECK(agent.submit(conflicting).error().code() == MaiErrorCode::InvalidInput);
+    CHECK(observed->requestCount() == 1);
+    CHECK(!gate->canceled.load());
+
+    const auto second = agent.submit(
+        MaiSteerPrompt{session, started.value(), "request-two", "Keep the original dimensions"});
+    CHECK(second.isOk());
+    gate->release();
+    agent.waitIdle();
+    CHECK(!gate->canceled.load());
+    CHECK(gate->calls.load() == 1);
+    CHECK(observed->requestCount() == 3);
+    if (observed->requestCount() < 3) return;
+
+    const auto request = observed->request(1);
+    CHECK(request.messages.size() == 6);
+    if (request.messages.size() == 6) {
+        CHECK(request.messages[1].role == MaiModelRole::Assistant);
+        CHECK(request.messages[1].invocations.size() == 2);
+        CHECK(request.messages[2].role == MaiModelRole::ToolResult);
+        CHECK(request.messages[2].toolCallId == "held_1");
+        CHECK(request.messages[3].role == MaiModelRole::ToolResult);
+        CHECK(request.messages[3].toolCallId == "status_2");
+        CHECK(request.messages[4].role == MaiModelRole::User);
+        CHECK(request.messages[4].content == supplement.text);
+        CHECK(request.messages[5].content == "Keep the original dimensions");
+    }
+    const auto last = observed->request(2);
+    CHECK(last.messages.size() == 8);
+    if (last.messages.size() == 8) {
+        CHECK(last.messages[5].role == MaiModelRole::User);
+        CHECK(last.messages[6].role == MaiModelRole::Assistant);
+        CHECK(last.messages[6].invocations.front().id == "after_steer");
+        CHECK(last.messages[7].role == MaiModelRole::ToolResult);
+    }
+    const auto history = agent.listMessages(session);
+    CHECK(history.size() == 5);
+    if (history.size() == 5) {
+        CHECK(history[1].id == started.value() && history[1].completed > 0);
+        CHECK(history[2].id == accepted.value());
+        CHECK(history[3].id == second.value());
+        CHECK(history[4].role == MaiRole::Assistant && history[4].completed > 0);
+        CHECK(history[4].text() == "Here is the current result.");
+    }
+    CHECK(agent.activeTurnId(session).empty());
+    CHECK(agent.submit(supplement).value() == accepted.value());
+    CHECK(agent.submit(MaiSteerPrompt{session, started.value(), "idle-request", "Too late"})
+              .error()
+              .code() == MaiErrorCode::NotFound);
+    const auto newTurn = agent.submit(MaiSendPrompt{session, "Start a different task"});
+    CHECK(newTurn.isOk());
+    CHECK(agent.activeTurnId(session) == newTurn.value());
+    CHECK(agent.submit(supplement).value() == accepted.value());
+    CHECK(agent.submit(MaiSteerPrompt{session, started.value(), "stale-turn", "Wrong task"})
+              .error()
+              .code() == MaiErrorCode::InvalidInput);
+    agent.waitIdle();
+    agent.eventBus().unsubscribe(subscription);
+}
+
+void test_steer_rejects_empty_wrong_turn_and_stopped_work_without_restarting() {
+    Workspace workspace;
+    auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+        callTurn("held_work", "{}"), sayTurn("must not be requested")});
+    MaiFakeModelClient* observed = model.get();
+    auto registry = std::make_unique<MaiToolRegistry>();
+    auto held = std::make_unique<SteeringHeldTool>();
+    SteeringHeldTool* gate = held.get();
+    registry->add(std::move(held));
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(registry));
+    const std::string session =
+        agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    const std::string other = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    const auto started = agent.submit(MaiSendPrompt{session, "Start"});
+    CHECK(gate->waitEntered());
+    CHECK(agent.submit(MaiSteerPrompt{session, started.value(), "empty", " \n\t"}).error().code() ==
+          MaiErrorCode::InvalidInput);
+    CHECK(agent.submit(MaiSteerPrompt{session, "old-turn", "wrong-turn", "New instructions"})
+              .error()
+              .code() == MaiErrorCode::InvalidInput);
+    CHECK(agent.submit(MaiSteerPrompt{other, started.value(), "other-session", "New instructions"})
+              .error()
+              .code() == MaiErrorCode::NotFound);
+    const MaiSteerPrompt acceptedInput{session, started.value(), "before-stop", "Keep this note"};
+    const auto accepted = agent.submit(acceptedInput);
+    CHECK(accepted.isOk());
+    CHECK(agent.submit(MaiInterrupt{session}).isOk());
+    CHECK(agent.submit(MaiSteerPrompt{session, started.value(), "after-stop", "Do not restart"})
+              .error()
+              .code() == MaiErrorCode::Canceled);
+    CHECK(agent.submit(acceptedInput).value() == accepted.value());
+    gate->release();
+    agent.waitIdle();
+    CHECK(gate->canceled.load());
+    CHECK(observed->requestCount() == 1);
+    CHECK(agent.listMessages(session).size() == 3);
+    CHECK(agent.listMessages(other).empty());
+}
+
+// 无工具的流即将结束时也必须 drain-or-close，不能成功收下输入后直接退出。
+void test_steer_during_final_text_is_consumed_before_turn_completion() {
+    class FinalTextGate final : public MaiModelClient {
+    public:
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                        const std::atomic<bool>& cancel) override {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                requests.push_back(request);
+            }
+            sink.onText(requests.size() == 1 ? "Original answer" : "Adjusted answer");
+            if (requests.size() == 1) {
+                std::unique_lock<std::mutex> lock(mutex);
+                entered = true;
+                wake.notify_all();
+                if (!wake.wait_for(lock, std::chrono::seconds(5), [&] { return ready; }))
+                    return MaiError::make(MaiErrorCode::Internal, "test gate timed out");
+            }
+            return cancel.load() ? MaiError::make(MaiErrorCode::Canceled, "canceled") : MaiError{};
+        }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
+        std::mutex mutex;
+        std::condition_variable wake;
+        bool entered = false;
+        bool ready = false;
+        std::vector<MaiModelRequest> requests;
+    };
+    Workspace workspace;
+    // 1 次预算额外覆盖：已经接受的补充也不能在最后一次普通请求后被吞掉。
+    auto model = std::make_unique<FinalTextGate>();
+    FinalTextGate* gate = model.get();
+    MaiAgent::Options options;
+    options.maxToolIterations = 1;
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), nullptr, options);
+    const std::string session =
+        agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    const auto started = agent.submit(MaiSendPrompt{session, "Start"});
+    {
+        std::unique_lock<std::mutex> lock(gate->mutex);
+        CHECK(gate->wake.wait_for(lock, std::chrono::seconds(5), [&] { return gate->entered; }));
+    }
+    CHECK(agent.submit(MaiSteerPrompt{session, started.value(), "stream-steer", "Adjust it now"})
+              .isOk());
+    std::atomic<bool> closedAtIdle{false};
+    auto subscription = agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type == MaiEventType::SessionIdle)
+            closedAtIdle =
+                !agent.submit(MaiSteerPrompt{session, started.value(), "at-idle", "Late"});
+    });
+    {
+        std::lock_guard<std::mutex> lock(gate->mutex);
+        gate->ready = true;
+        gate->wake.notify_all();
+    }
+    agent.waitIdle();
+    CHECK(closedAtIdle.load());
+    CHECK(gate->requests.size() == 2);
+    if (gate->requests.size() == 2) {
+        CHECK(gate->requests[1].messages.size() == 4);
+        CHECK(gate->requests[1].messages[2].role == MaiModelRole::User);
+        CHECK(gate->requests[1].messages[2].content == "Adjust it now");
+        CHECK(gate->requests[1].tools.empty());
+    }
+    CHECK(agent.listMessages(session).back().text() == "Adjusted answer");
+    agent.eventBus().unsubscribe(subscription);
+}
+
+void test_specialist_reply_keeps_existing_history_and_new_steering_in_order() {
+    Workspace workspace;
+    auto store = makeMaiMemoryStore();
+    MaiSessionStore* observedStore = store.get();
+    MaiSession session;
+    session.id = MaiIdGenerator::newSessionId();
+    session.directory = workspace.utf8Root();
+    session.created = MaiTime::getCurrentTime();
+    store->putSession(session);
+    MaiSpecialistTask task;
+    task.id = MaiIdGenerator::generate("spt_");
+    task.ownerSessionId = session.id;
+    task.specialistName = "synthetic_specialist";
+    task.intent = "Review the completed result";
+    task.created = session.created;
+    CHECK(!store->insertSpecialistTask(task));
+    CHECK(!store->finishSpecialistTask(task.id, session.id, MaiSpecialistTaskStatus::Succeeded,
+                                       "Synthetic specialist result", "", task.created + 1));
+    MaiMessage earlierNotice;
+    earlierNotice.id = MaiIdGenerator::newMessageId();
+    earlierNotice.role = MaiRole::Assistant;
+    earlierNotice.created = session.created;
+    earlierNotice.completed = session.created;
+    CHECK(store->reserveSpecialistNotification(task.id, session.id, earlierNotice.id, 1));
+    store->putMessage(session.id, earlierNotice);
+    MaiMessage laterUser;
+    laterUser.id = MaiIdGenerator::newMessageId();
+    laterUser.role = MaiRole::User;
+    laterUser.created = session.created;
+    laterUser.completed = session.created;
+    MaiMessagePart instruction;
+    instruction.id = MaiIdGenerator::newPartId();
+    instruction.created = session.created;
+    instruction.body = MaiTextPart{"Existing later user history"};
+    laterUser.parts.push_back(std::move(instruction));
+    store->putMessage(session.id, laterUser);
+    auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+        callTurn("held_work", "{}", "specialist-tool"), sayTurn("Delivered the current result.")});
+    MaiFakeModelClient* observed = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    auto held = std::make_unique<SteeringHeldTool>();
+    SteeringHeldTool* gate = held.get();
+    tools->add(std::move(held));
+    MaiAgent agent(std::move(store), std::move(model), std::move(tools));
+    CHECK(gate->waitEntered());
+    CHECK(agent.activeTurnId(session.id) == earlierNotice.id);
+    CHECK(agent.submit(
+        MaiSteerPrompt{session.id, earlierNotice.id, "specialist-steer", "Present it now"}));
+    gate->release();
+    agent.waitIdle();
+    CHECK(!gate->canceled.load());
+    CHECK(observed->requestCount() == 2);
+    if (observed->requestCount() == 2) {
+        const auto first = observed->request(0);
+        CHECK(first.messages.size() == 3);
+        if (first.messages.size() == 3) {
+            CHECK(first.messages[0].content == "Existing later user history");
+            CHECK(first.messages[2].content.find("Synthetic specialist result") !=
+                  std::string::npos);
+        }
+        const auto next = observed->request(1);
+        CHECK(next.messages.size() == 6);
+        if (next.messages.size() == 6) {
+            CHECK(next.messages[0].content == "Existing later user history");
+            CHECK(next.messages[2].content.find("Synthetic specialist result") !=
+                  std::string::npos);
+            CHECK(next.messages[3].role == MaiModelRole::Assistant);
+            CHECK(next.messages[4].toolCallId == "specialist-tool");
+            CHECK(next.messages[5].content == "Present it now");
+        }
+    }
+    MaiSpecialistTask delivered;
+    CHECK(observedStore->getSpecialistTask(task.id, session.id, delivered));
+    CHECK(delivered.notifiedAt > 0);
+    CHECK(delivered.notificationMessageId == earlierNotice.id);
+    CHECK(observedStore->listUnnotifiedSpecialistTasks(10).empty());
+}
+
 }  // namespace
 
 int main() {
@@ -769,6 +1099,10 @@ int main() {
     test_repeated_tool_results_stop_before_hard_limit();
     test_no_tools_means_no_tool_field();
     test_model_exception_becomes_a_session_error();
+    test_steer_waits_for_all_tool_results_and_reaches_the_next_model_request();
+    test_steer_rejects_empty_wrong_turn_and_stopped_work_without_restarting();
+    test_steer_during_final_text_is_consumed_before_turn_completion();
+    test_specialist_reply_keeps_existing_history_and_new_steering_in_order();
     if (failures == 0) std::printf("tool loop tests passed\n");
     return failures == 0 ? 0 : 1;
 }

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <mutex>
 #include <set>
@@ -53,13 +54,27 @@ MaiSendPrompt::MaiSendPrompt(std::string sessionIdValue, std::string textValue,
 
 namespace {
 
-// 一轮对话的在跑状态。MaiTurnRunner 负责跑，这个只负责"还在不在跑"和"叫停"。
+struct SteeringReceipt {
+    std::string sessionId;
+    std::string turnId;
+    std::string requestId;
+    std::string fingerprint;
+    std::string messageId;
+};
+
+// 一轮对话的在跑状态。输入闸门同时串行化补充落库、assistant 分段和收尾，
+// 不能用 cancel 替代它，否则“补充当前任务”会打断正在执行的真实工具。
 struct ActiveTurn {
     std::thread worker;
     std::atomic<bool> cancel{false};
     std::mutex startMutex;
     std::condition_variable startWake;
     bool ready = false;
+    std::mutex steeringMutex;
+    std::string id;
+    bool acceptingSteering = false;
+    std::vector<std::string> pendingSteering;
+    std::vector<SteeringReceipt> steeringReceipts;
 
     void waitReady() {
         std::unique_lock<std::mutex> lock(startMutex);
@@ -74,6 +89,19 @@ struct ActiveTurn {
         startWake.notify_one();
     }
 };
+
+std::string steeringFingerprint(const MaiSteerPrompt& prompt) {
+    using Json = nlohmann::json;
+    Json images = Json::array();
+    Json videos = Json::array();
+    for (const auto& image : prompt.images) images.push_back({image.path, image.mimeType});
+    for (const auto& video : prompt.videos) videos.push_back({video.path, video.mimeType});
+    return Json{{"text", prompt.text},
+                {"images", images},
+                {"videos", videos},
+                {"quote", prompt.quotedMessageId}}
+        .dump();
+}
 
 constexpr const char* kInterruptedToolError =
     "Tool execution was interrupted when the app stopped. Retry if needed.";
@@ -191,6 +219,8 @@ struct MaiAgent::Runtime {
     std::condition_variable workersFinished;
     size_t liveWorkers = 0;
     std::unordered_map<std::string, std::shared_ptr<ActiveTurn>> active;
+    // 结束后的请求仍能幂等重试，但凭据不能随聊天历史无限增长。
+    std::deque<SteeringReceipt> recentSteering;
     // 被 close_agent 收掉的子 Agent。只是不再占名额，消息一条不删。
     std::set<std::string> closedSubAgents;
     std::atomic<bool> stopSpecialists{false};
@@ -244,7 +274,8 @@ struct MaiAgent::Runtime {
         workersFinished.notify_all();
     }
 
-    MaiTurnRunner::Dependencies dependencies() {
+    MaiTurnRunner::Dependencies dependencies(const std::string& sessionId,
+                                             const std::shared_ptr<ActiveTurn>& turn) {
         MaiTurnRunner::Dependencies dependencies;
         dependencies.store = store.get();
         dependencies.model = model.get();
@@ -265,10 +296,61 @@ struct MaiAgent::Runtime {
         dependencies.fileAccessRoot = options.fileAccessRoot;
         dependencies.allowOutsideWorkingDirectory = options.allowOutsideWorkingDirectory;
         dependencies.decodeText = options.decodeText;
+        dependencies.pendingSteering = [turn] {
+            std::lock_guard<std::mutex> lock(turn->steeringMutex);
+            return turn->pendingSteering;
+        };
+        dependencies.closeSteering = [turn] {
+            std::lock_guard<std::mutex> lock(turn->steeringMutex);
+            turn->acceptingSteering = false;
+        };
+        dependencies.advanceSteering =
+            [this, sessionId, turn](MaiMessage& assistant, bool closeIfEmpty) -> MaiResult<bool> {
+            std::string completedId;
+            {
+                std::lock_guard<std::mutex> lock(turn->steeringMutex);
+                if (turn->cancel.load(std::memory_order_relaxed)) {
+                    turn->acceptingSteering = false;
+                    return false;
+                }
+                if (turn->pendingSteering.empty()) {
+                    if (closeIfEmpty) turn->acceptingSteering = false;
+                    return false;
+                }
+                MaiMessage completed = assistant;
+                completed.completed = MaiTime::getCurrentTime();
+                store->putMessage(sessionId, completed);
+                if (const MaiError error = store->lastWriteError()) {
+                    turn->acceptingSteering = false;
+                    return error;
+                }
+                MaiMessage next;
+                next.id = MaiIdGenerator::newMessageId();
+                next.role = MaiRole::Assistant;
+                next.created = MaiTime::getCurrentTime();
+                store->putMessage(sessionId, next);
+                if (const MaiError error = store->lastWriteError()) {
+                    turn->acceptingSteering = false;
+                    return error;
+                }
+                completedId = completed.id;
+                assistant = std::move(next);
+                // 新 assistant 的 ID 已在同一把锁内生成并落库。之后到来的 user
+                // 必定位于新段之后，下一次安全边界前仍由 pending 过滤。
+                turn->pendingSteering.clear();
+            }
+            emitter.emitMessage(MaiEventType::MessageUpdated, sessionId, completedId);
+            emitter.emitMessage(MaiEventType::MessageUpdated, sessionId, assistant.id);
+            return true;
+        };
         return dependencies;
     }
 
     void retire(const std::string& sessionId, const std::shared_ptr<ActiveTurn>& turn) {
+        {
+            std::lock_guard<std::mutex> lock(turn->steeringMutex);
+            turn->acceptingSteering = false;
+        }
         emitter.emitSession(MaiEventType::SessionIdle, sessionId);
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -532,7 +614,12 @@ void MaiAgent::forwardSpecialistReply(const MaiSpecialistTask& task) {
         {"output_path", task.outputPath},
         {"output_available",
          outputAvailable}}.dump();
-    auto dependencies = mRuntime->dependencies();
+    {
+        std::lock_guard<std::mutex> lock(turn->steeringMutex);
+        turn->id = assistant.id;
+        turn->acceptingSteering = true;
+    }
+    auto dependencies = mRuntime->dependencies(task.ownerSessionId, turn);
     dependencies.specialistReply = reply;
     try {
         turn->worker = std::thread([this, task, turn, dependencies, assistant, messageId] {
@@ -544,7 +631,7 @@ void MaiAgent::forwardSpecialistReply(const MaiSpecialistTask& task) {
                 const auto messages =
                     mRuntime->store->listMessagesPage(task.ownerSessionId, messageId + "~", 1);
                 if (!messages.empty() && messages.front().id == messageId &&
-                    !messages.front().text().empty())
+                    runner.hasVisibleText())
                     mRuntime->store->markSpecialistNotified(task.id, task.ownerSessionId, messageId,
                                                             MaiTime::getCurrentTime());
             } else if (!turn->cancel.load(std::memory_order_relaxed) &&
@@ -759,6 +846,14 @@ bool MaiAgent::isBusy(const std::string& sessionId) const {
     return mRuntime->active.count(sessionId) > 0;
 }
 
+std::string MaiAgent::activeTurnId(const std::string& sessionId) const {
+    std::lock_guard<std::mutex> runtimeLock(mRuntime->mutex);
+    const auto found = mRuntime->active.find(sessionId);
+    if (found == mRuntime->active.end()) return {};
+    std::lock_guard<std::mutex> steeringLock(found->second->steeringMutex);
+    return found->second->id;
+}
+
 bool MaiAgent::setApprovalPolicy(MaiApprovalPolicy policy) {
     std::lock_guard<std::mutex> lock(mRuntime->mutex);
     if (!mRuntime->active.empty()) return false;
@@ -885,6 +980,124 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                                               title);
                 return operation.sessionId;
 
+            } else if constexpr (std::is_same_v<T, MaiSteerPrompt>) {
+                if (operation.requestId.empty() || operation.requestId.size() > 128 ||
+                    !std::all_of(operation.requestId.begin(), operation.requestId.end(),
+                                 [](unsigned char byte) { return byte >= 0x21 && byte <= 0x7e; }))
+                    return {MaiErrorCode::InvalidInput, "requestId must be 1..128 ASCII bytes"};
+                if (operation.turnId.empty() || operation.turnId.size() > 128)
+                    return {MaiErrorCode::InvalidInput, "turnId is required"};
+                const bool hasText = std::any_of(
+                    operation.text.begin(), operation.text.end(), [](unsigned char byte) {
+                        return byte != ' ' && byte != '\t' && byte != '\n' && byte != '\r' &&
+                               byte != '\f' && byte != '\v';
+                    });
+                if (!hasText && operation.images.empty() && operation.videos.empty())
+                    return {MaiErrorCode::InvalidInput, "text or media is required"};
+                if (operation.text.size() > 64 * 1024 || operation.images.size() > 10 ||
+                    operation.videos.size() > 10)
+                    return {MaiErrorCode::InvalidInput, "steering input exceeds its size limit"};
+                const auto validMedia = [](const auto& media) {
+                    return !media.path.empty() && media.path.size() <= 8192 &&
+                           !media.mimeType.empty() && media.mimeType.size() <= 256;
+                };
+                if (!std::all_of(operation.images.begin(), operation.images.end(), validMedia) ||
+                    !std::all_of(operation.videos.begin(), operation.videos.end(), validMedia))
+                    return {MaiErrorCode::InvalidInput, "invalid steering media reference"};
+                MaiSession session;
+                if (!mRuntime->store->getSession(operation.sessionId, session))
+                    return {MaiErrorCode::NotFound, "session not found"};
+                MaiMessage quoted;
+                if (!operation.quotedMessageId.empty()) {
+                    if (operation.quotedMessageId.rfind("msg_", 0) != 0 ||
+                        operation.quotedMessageId.size() > 128)
+                        return {MaiErrorCode::InvalidInput, "invalid quoted message ID"};
+                    const auto page = mRuntime->store->listMessagesPage(
+                        operation.sessionId, operation.quotedMessageId + "~", 1);
+                    if (page.empty() || page.front().id != operation.quotedMessageId)
+                        return {MaiErrorCode::NotFound,
+                                "quoted message was not found in this conversation"};
+                    quoted = page.front();
+                }
+                const std::string fingerprint = steeringFingerprint(operation);
+                if (fingerprint.size() > 256 * 1024)
+                    return {MaiErrorCode::InvalidInput, "steering input exceeds its size limit"};
+                MaiMessage user;
+                {
+                    // 固定锁序 Runtime → turn。工作线程只取 turn 锁，广播永远在锁外，
+                    // 订阅者因此仍能重入查询和 submit，不会被同步事件总线锁死。
+                    std::lock_guard<std::mutex> runtimeLock(mRuntime->mutex);
+                    const auto matches = [&](const SteeringReceipt& receipt) {
+                        return receipt.sessionId == operation.sessionId &&
+                               receipt.turnId == operation.turnId &&
+                               receipt.requestId == operation.requestId;
+                    };
+                    const auto recent = std::find_if(mRuntime->recentSteering.begin(),
+                                                     mRuntime->recentSteering.end(), matches);
+                    if (recent != mRuntime->recentSteering.end()) {
+                        if (recent->fingerprint != fingerprint)
+                            return {MaiErrorCode::InvalidInput,
+                                    "requestId was already used for different steering input"};
+                        return recent->messageId;
+                    }
+                    const auto found = mRuntime->active.find(operation.sessionId);
+                    if (found == mRuntime->active.end())
+                        return {MaiErrorCode::NotFound, "no turn is running for this session"};
+                    ActiveTurn& turn = *found->second;
+                    std::lock_guard<std::mutex> steeringLock(turn.steeringMutex);
+                    const auto accepted = std::find_if(turn.steeringReceipts.begin(),
+                                                       turn.steeringReceipts.end(), matches);
+                    if (accepted != turn.steeringReceipts.end()) {
+                        if (accepted->fingerprint != fingerprint)
+                            return {MaiErrorCode::InvalidInput,
+                                    "requestId was already used for different steering input"};
+                        return accepted->messageId;
+                    }
+                    if (turn.id != operation.turnId)
+                        return {MaiErrorCode::InvalidInput, "the target turn is no longer active"};
+                    if (turn.cancel.load(std::memory_order_relaxed))
+                        return {MaiErrorCode::Canceled, "the target turn is stopping"};
+                    if (!turn.acceptingSteering)
+                        return {MaiErrorCode::Busy, "the target turn is finishing"};
+                    if (turn.steeringReceipts.size() >= 64)
+                        return {MaiErrorCode::Busy, "the target turn reached its steering limit"};
+                    user.id = MaiIdGenerator::newMessageId();
+                    user.role = MaiRole::User;
+                    user.created = MaiTime::getCurrentTime();
+                    user.completed = user.created;
+                    const auto addPart = [&](MaiMessagePartBody body) {
+                        MaiMessagePart part;
+                        part.id = MaiIdGenerator::newPartId();
+                        part.created = user.created;
+                        part.body = std::move(body);
+                        user.parts.push_back(std::move(part));
+                    };
+                    if (!operation.quotedMessageId.empty())
+                        addPart(MaiQuotePart{operation.quotedMessageId, quotedPreview(quoted)});
+                    if (!operation.text.empty()) addPart(MaiTextPart{operation.text});
+                    for (const auto& image : operation.images)
+                        addPart(MaiImagePart{image.path, image.mimeType});
+                    for (const auto& video : operation.videos) addPart(video);
+                    turn.pendingSteering.push_back(user.id);
+                    mRuntime->store->putMessage(operation.sessionId, user);
+                    mRuntime->store->mutateSession(operation.sessionId, [](MaiSession& value) {
+                        value.updated = MaiTime::getCurrentTime();
+                    });
+                    if (const MaiError error = mRuntime->store->lastWriteError()) {
+                        turn.acceptingSteering = false;
+                        return error;
+                    }
+                    SteeringReceipt receipt{operation.sessionId, operation.turnId,
+                                            operation.requestId, fingerprint, user.id};
+                    turn.steeringReceipts.push_back(receipt);
+                    mRuntime->recentSteering.push_back(std::move(receipt));
+                    if (mRuntime->recentSteering.size() > 128) mRuntime->recentSteering.pop_front();
+                }
+                mRuntime->emitter.emitMessage(MaiEventType::MessageUpdated, operation.sessionId,
+                                              user.id);
+                mRuntime->emitter.emitSession(MaiEventType::SessionUpdated, operation.sessionId);
+                return user.id;
+
             } else if constexpr (std::is_same_v<T, MaiSendPrompt>) {
                 if (operation.text.empty() && operation.images.empty() && operation.videos.empty())
                     return {MaiErrorCode::InvalidInput, "text or media is required"};
@@ -964,6 +1177,8 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 });
 
                 auto turn = std::make_shared<ActiveTurn>();
+                turn->id = assistant.id;
+                turn->acceptingSteering = true;
                 {
                     std::lock_guard<std::mutex> lock(mRuntime->mutex);
                     mRuntime->active[operation.sessionId] = turn;
@@ -971,7 +1186,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
 
                 // 单独线程跑，submit 立刻返回——同步等会让 HTTP 请求挂几十秒。
                 const std::string sessionId = operation.sessionId;
-                auto dependencies = mRuntime->dependencies();
+                auto dependencies = mRuntime->dependencies(sessionId, turn);
                 turn->worker = std::thread([this, sessionId, turn, dependencies, assistant] {
                     turn->waitReady();
                     // 给线程起名字。抓 dump 或者挂调试器时，

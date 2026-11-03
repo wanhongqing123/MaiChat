@@ -78,6 +78,26 @@ struct MaiSendPrompt {
                   std::vector<MaiVideoPart> videos, std::string quotedMessageId);
 };
 
+// 补充指定的正在运行轮次，不中断模型传输或当前工具，也不另起一轮。
+// turnId 必须是该轮最初的 assistant ID（activeTurnId），后续 assistant 分段不改变它。
+// requestId 是调用方生成的 1..128 字节 ASCII 标识，同一次提交重试必须复用。
+// 成功返回已落库的 user 消息 ID；完整工具批次结束后、下次模型调用前才消费这条消息。
+// 同 sessionId + turnId + requestId 的相同内容重试返回原 ID；改内容返回 InvalidInput。
+// 最近 128 份接收凭据在本 Agent 生命周期内保留，活动轮自身另保留全部凭据。
+// 每轮至多接受 64 条补充，文本至多 64 KiB，图片/视频各至多 10 项。
+// 空输入、失配的 turnId 返回 InvalidInput；idle 返回 NotFound；停止中返回 Canceled；
+// 已封闭输入的收尾阶段返回 Busy。拒绝时宿主须保留草稿，不得自动回退成 MaiSendPrompt。
+// 停止或模型失败后，已接受消息仍保留历史，但不会为它们自动再启动模型请求。
+struct MaiSteerPrompt {
+    std::string sessionId;
+    std::string turnId;
+    std::string requestId;
+    std::string text;
+    std::vector<MaiModelImage> images = {};
+    std::vector<MaiVideoPart> videos = {};
+    std::string quotedMessageId = {};
+};
+
 // 中断正在跑的那一轮。
 struct MaiInterrupt {
     std::string sessionId;
@@ -103,7 +123,7 @@ struct MaiReplyQuestion {
 
 using MaiOperation =
     std::variant<MaiCreateSession, MaiUpdateSession, MaiDeleteSession, MaiClearMessages,
-                 MaiSendPrompt, MaiInterrupt, MaiReplyPermission, MaiReplyQuestion>;
+                 MaiSendPrompt, MaiSteerPrompt, MaiInterrupt, MaiReplyPermission, MaiReplyQuestion>;
 
 // ── 核心的门面 ──────────────────────────────────────────────────
 //
@@ -230,6 +250,9 @@ public:
     // 这个会话现在有没有一轮在跑。注意这是**那一瞬间**的答案，
     // 拿它去做"没跑就发消息"的判断是有竞态的——直接 submit，忙的话会返回 Busy，那个判断在锁里做。
     bool isBusy(const std::string& sessionId) const;
+    // 正在运行轮次的稳定 ID；idle 返回空。捕获后仍须在 MaiSteerPrompt 中回传核对，
+    // 不能先查 isBusy 再把补充消息投给此后恰好开始的另一轮。
+    std::string activeTurnId(const std::string& sessionId) const;
     bool setApprovalPolicy(MaiApprovalPolicy policy);
     MaiApprovalPolicy approvalPolicy() const;
 

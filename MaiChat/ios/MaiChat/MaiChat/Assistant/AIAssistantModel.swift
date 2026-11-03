@@ -305,6 +305,7 @@ struct AISession: Codable, Identifiable, Sendable, Equatable {
     let id: String
     let title: String
     let busy: Bool
+    var turnId: String? = nil
     var displayTitle: String { title == "New session" ? "新对话" : title }
 }
 
@@ -312,19 +313,20 @@ struct AIRemoteSession: Decodable, Identifiable, Sendable, Equatable {
     let sessionID: String
     let title: String
     let updatedAt: Int64?
-    let busy: Bool
+    var busy: Bool
     let deviceSlot: String
     let deviceName: String
     let deviceID: String
     let loginSessionID: String
     let online: Bool
+    var turnId: String? = nil
 
     var id: String { "\(deviceSlot):\(deviceID):\(sessionID)" }
     var displayTitle: String { title == "New session" ? "新对话" : title }
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "id"
-        case title, busy, online
+        case title, busy, online, turnId
         case updatedAt = "updated_at"
         case deviceSlot = "device_slot"
         case deviceName = "device_name"
@@ -433,6 +435,9 @@ private actor AIRemoteSessionTransport {
         let text: String?
         let attachments: [AISessionAttachmentReference]?
         let requestID: String?
+        let turnId: String?
+        let steeringRequestId: String?
+        let quoteMessageId: String?
         let decision: String?
         let title: String?
         let workspacePath: String?
@@ -449,6 +454,8 @@ private actor AIRemoteSessionTransport {
             case dataBase64 = "data_base64"
             case before, limit, action, text, attachments, decision, title
             case requestID = "id"
+            case turnId, quoteMessageId
+            case steeringRequestId = "requestId"
             case workspacePath = "workspace_path"
             case targetSessionID = "target_session_id"
             case type
@@ -731,7 +738,7 @@ private actor AIRemoteSessionTransport {
             let safeTitle = String(String(item.title.prefix(120)).unicodeScalars.filter {
                 !CharacterSet.controlCharacters.contains($0)
             })
-            return ["id": item.id, "title": safeTitle,
+            return ["id": item.id, "title": safeTitle, "turnId": item.turnId ?? "",
                     "busy": item.busy, "updated_at": updated - Int64(index)]
         }
         let body: [String: Any] = [
@@ -991,16 +998,20 @@ struct AIImagePreview: Identifiable, Equatable {
     // 每个缩略图视图的稳定标识；同一文件可能出现在多条消息中，不能仅按路径返回。
     let sourceID: UUID?
     let sequence: MaiMediaSequence?
+    // 持有用户已看到的缩略图，让原生预览在冷解码原图期间也能连续放大显示。
+    // 生命周期仅限当前预览；不能依赖全图缓存一定命中，也不在点击时同步重读文件。
+    let thumbnail: UIImage?
 
     init(filePath: String, imageSize: CGSize = .zero, sourceFrame: CGRect? = nil,
          sourceID: UUID? = nil,
-         sequence: MaiMediaSequence? = nil, id: UUID = UUID()) {
+         sequence: MaiMediaSequence? = nil, thumbnail: UIImage? = nil, id: UUID = UUID()) {
         self.id = id
         self.filePath = filePath
         self.imageSize = imageSize
         self.sourceFrame = sourceFrame
         self.sourceID = sourceID
         self.sequence = sequence
+        self.thumbnail = thumbnail
     }
 }
 struct AIAssistantOpenResult: Sendable {
@@ -1022,6 +1033,7 @@ struct AIResponse: Codable, Sendable {
     var permissions: [AIPermission]?
     var questions: [AIQuestion]?
     var busy: Bool?
+    var turnId: String?
     var configured: Bool?
     var natural: String?
     var casual: String?
@@ -1029,7 +1041,67 @@ struct AIResponse: Codable, Sendable {
 }
 struct AIBackendError: LocalizedError {
     let message: String
+    // Unknown delivery may be retried with the original steering request ID.
+    var definitive = true
     var errorDescription: String? { message }
+}
+
+/// One supplemental message stays bound to the original task across retries.
+/// No model key or account credentials are included in this value.
+struct AISteeringRequest: Sendable {
+    let session: String
+    let turnId: String
+    let requestId: String
+    let text: String
+    let images: [AIImportedFile]
+    let videos: [AIImportedFile]
+    let quoteMessageId: String
+}
+
+struct AISteeringImportCacheIdentity {
+    let key: String
+    let session: String
+    let turnId: String
+    let order: UInt64
+    var acceptedOrder: UInt64? = nil
+}
+
+struct AISteeringImportRuntimeState {
+    let busy: Bool
+    let turnId: String
+}
+
+enum AISteeringImportCachePolicy {
+    static let activeCapacity = 128
+    static let receiptCapacity = 128
+    static let capacity = activeCapacity + receiptCapacity
+
+    static func protectedReceiptKeys(_ entries: [AISteeringImportCacheIdentity]) -> Set<String> {
+        Set(entries.filter { $0.acceptedOrder != nil }
+            .sorted { $0.acceptedOrder! > $1.acceptedOrder! }
+            .prefix(receiptCapacity).map(\.key))
+    }
+
+    static func activeCount(_ entries: [AISteeringImportCacheIdentity],
+                            states: [String: AISteeringImportRuntimeState]) -> Int {
+        entries.filter { entry in
+            guard let state = states[entry.session] else { return true }
+            return state.busy && (state.turnId.isEmpty || state.turnId == entry.turnId)
+        }.count
+    }
+
+    /// An unknown owner state protects the entry. Only an ended/replaced turn
+    /// can lose its host import receipt; an active turn keeps stable media paths.
+    static func evictableKey(_ entries: [AISteeringImportCacheIdentity],
+                             states: [String: AISteeringImportRuntimeState]) -> String? {
+        let recent = protectedReceiptKeys(entries)
+        return entries.filter { entry in
+            guard entry.acceptedOrder != nil else { return false }
+            guard !recent.contains(entry.key) else { return false }
+            guard let state = states[entry.session] else { return false }
+            return !state.busy || (!state.turnId.isEmpty && state.turnId != entry.turnId)
+        }.min { $0.order < $1.order }?.key
+    }
 }
 
 // 普通 actor 使用后台执行器。数据库、原生核心、Keychain 和文件都不在 MainActor。
@@ -1082,7 +1154,9 @@ actor AIAssistantBackend {
         let data = try JSONSerialization.data(withJSONObject: request)
         guard let text = String(data: data, encoding: .utf8),
             let response = text.withCString({ maiMobileAgentRequest(UnsafeMutableRawPointer(bitPattern: address), $0) })
-        else { throw AIBackendError(message: "创作中心初始化失败")
+        else { throw AIBackendError(
+            message: operation == "steer" ? "补充内容送达状态未知，草稿已保留；重试会复用原操作编号" :
+                "创作中心初始化失败", definitive: operation != "steer")
         }
         defer { maiMobileAgentFree(response) }
         let decoded = try JSONDecoder().decode(AIResponse.self, from: Data(String(cString: response).utf8))
@@ -1222,6 +1296,13 @@ actor AIAssistantBackend {
                                             "limit": limit]).messages ?? []
     }
 
+    /// Use the persisted receipt ID, rather than a moving latest-message window.
+    func userMessage(session: String, id: String) throws -> AIMessage? {
+        guard !id.isEmpty else { return nil }
+        return try messagesPage(session: session, beforeId: id + "~", limit: 1)
+            .first { $0.id == id && $0.role == "user" }
+    }
+
     func remoteSnapshot(session: String, beforeId: String = "", limit: Int) throws -> AIResponse {
         try requestAgentOperation("remote_snapshot", values: ["session": session,
                                                        "before": beforeId, "limit": limit])
@@ -1235,6 +1316,16 @@ actor AIAssistantBackend {
             "quoteMessageId": quoteMessageId,
             "images": images.map { ["path": $0.relativePath, "mimeType": $0.mimeType] },
             "videos": videos.map { ["path": $0.relativePath, "mimeType": $0.mimeType] }
+        ])
+    }
+
+    func steer(_ request: AISteeringRequest) throws -> AIResponse {
+        try requestAgentOperation("steer", values: [
+            "session": request.session, "turnId": request.turnId,
+            "requestId": request.requestId, "text": request.text,
+            "quoteMessageId": request.quoteMessageId,
+            "images": request.images.map { ["path": $0.relativePath, "mimeType": $0.mimeType] },
+            "videos": request.videos.map { ["path": $0.relativePath, "mimeType": $0.mimeType] }
         ])
     }
 
@@ -1362,6 +1453,7 @@ final class AIAssistantModel: ObservableObject {
     private static let lifecycleSessionID = "session_lifecycle"
 
     static func resetForAccountSwitch() {
+        shared.submissionGeneration &+= 1
         let pending = Array(shared.pendingAttachments.values).flatMap { $0 } +
             shared.remoteFilesByCommandID.values.flatMap { $0.files }
         shared.discardImportedFiles(pending)
@@ -1455,6 +1547,36 @@ final class AIAssistantModel: ObservableObject {
     private var pendingInitialPage: (session: String, newestID: String)?
     private var loadingOlderMessages = false
     private var selectionGeneration = 0
+    private var submissionGeneration = 0
+    private struct SteeringAttempt {
+        let turnId: String
+        let requestId: String
+        var acceptedMessageID: String?
+        var remoteReferences: [[String: String]]?
+    }
+    private var steeringAttempts: [String: SteeringAttempt] = [:]
+    private struct RemoteSteeringConfirmation {
+        let remote: AIRemoteSession
+        let continuation: CheckedContinuation<String, Error>
+    }
+    private var remoteSteeringConfirmations: [String: RemoteSteeringConfirmation] = [:]
+    // Re-delivery must resolve to the same local paths, not newly imported copies.
+    private struct RemoteSteeringImport {
+        var identity: AISteeringImportCacheIdentity
+        let references: [String]
+        let files: [AIImportedFile]
+        let names: [String]
+        let kinds: [String]
+        let mimeTypes: [String]
+    }
+    private var remoteSteeringImports: [String: RemoteSteeringImport] = [:]
+    private var remoteSteeringImportRevision: UInt64 = 0
+    private var remoteSteeringImportOrder: UInt64 = 0
+    private var remoteSteeringAcceptedOrder: UInt64 = 0
+    var composerSubmissionIdentity: String {
+        [screenFrameCurrentAccountID, String(submissionGeneration), String(selectionGeneration),
+         workspacePath].joined(separator: "\u{1f}")
+    }
     private var visible = false
     private var pageActive = true
     private var composerTyping = false
@@ -1488,6 +1610,7 @@ final class AIAssistantModel: ObservableObject {
             pendingAttachments.merge(files) { _, replacement in replacement }
             firstMessageSessionID = firstSession
         case .selectedHistory(let id, let page):
+            selectionGeneration &+= 1
             selected = id
             messages = page
             visibleMessageLimit = Self.recentMessageCount
@@ -1609,6 +1732,13 @@ final class AIAssistantModel: ObservableObject {
                 AIBackendError(message: "设备同步连接已关闭"))
         }
         pendingLifecycle.removeAll()
+        for request in remoteSteeringConfirmations.values {
+            request.continuation.resume(throwing: AIBackendError(
+                message: "设备同步连接已关闭，补充内容仍保留在草稿中", definitive: false))
+        }
+        remoteSteeringConfirmations.removeAll()
+        remoteSteeringImports.removeAll()
+        remoteSteeringImportRevision &+= 1
         lifecycleRetryIDs.removeAll()
         remoteSessionMutationInProgress = false
         remoteDevices = []
@@ -1657,7 +1787,8 @@ final class AIAssistantModel: ObservableObject {
         let permissions = value["permissions"] as? [[String: Any]] ?? []
         let questions = value["questions"] as? [[String: Any]] ?? []
         let stateBytes = try JSONSerialization.data(withJSONObject: [
-            "permissions": permissions, "questions": questions], options: .sortedKeys)
+            "permissions": permissions, "questions": questions,
+            "busy": state.busy ?? false, "turnId": state.turnId ?? ""], options: .sortedKeys)
         let stateDigest = SHA256.hash(data: stateBytes)
             .map { String(format: "%02x", $0) }.joined()
         var sentMessage = false
@@ -1671,7 +1802,8 @@ final class AIAssistantModel: ObservableObject {
             guard publishedRemoteMessageDigests[key] != messageDigest else { continue }
             let encoded = try JSONSerialization.data(withJSONObject: [
                 "messages": [message], "permissions": permissions,
-                "questions": questions], options: .sortedKeys)
+                "questions": questions, "busy": state.busy ?? false,
+                "turnId": state.turnId ?? ""], options: .sortedKeys)
             try await remoteTransport.publish(sessionID: sessionID, data: encoded)
             publishedRemoteMessageDigests[key] = messageDigest
             publishedRemoteStateDigests[sessionID] = stateDigest
@@ -1681,7 +1813,8 @@ final class AIAssistantModel: ObservableObject {
         if !sentMessage && publishedRemoteStateDigests[sessionID] != stateDigest {
             let encoded = try JSONSerialization.data(withJSONObject: [
                 "messages": [], "permissions": permissions,
-                "questions": questions], options: .sortedKeys)
+                "questions": questions, "busy": state.busy ?? false,
+                "turnId": state.turnId ?? ""], options: .sortedKeys)
             try await remoteTransport.publish(sessionID: sessionID, data: encoded)
             publishedRemoteStateDigests[sessionID] = stateDigest
         }
@@ -1976,6 +2109,28 @@ final class AIAssistantModel: ObservableObject {
 
     private func applyRemotePayload(_ data: Data,
                                     envelope: AIRemoteSessionTransport.Envelope) async {
+        // A receipt belongs to the captured room even when the user has switched
+        // conversations. Only the caller decides whether its draft may be cleared.
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           object["type"] as? String == "command_result",
+           let id = object["command_id"] as? String,
+           let pending = remoteSteeringConfirmations[id],
+           pending.remote.sessionID == envelope.sessionID,
+           pending.remote.deviceSlot == envelope.fromSlot,
+           pending.remote.loginSessionID == envelope.fromLoginSessionID {
+            let result = object["result"] as? [String: Any]
+            if result?["ok"] as? Bool == true,
+               let messageID = result?["user_message_id"] as? String, !messageID.isEmpty {
+                finishRemoteSteering(id, result: .success(messageID))
+            } else {
+                let acceptedWithoutReceipt = result?["ok"] as? Bool == true
+                finishRemoteSteering(id, result: .failure(AIBackendError(
+                    message: result?["error"] as? String ??
+                        "所属设备未确认补充内容；请更新所属设备后重试",
+                    definitive: !acceptedWithoutReceipt && result?["delivery_unknown"] as? Bool != true)))
+            }
+            return
+        }
         let source = pendingRemoteSelection ?? selectedRemote
         guard let source, source.sessionID == envelope.sessionID,
               source.deviceSlot == envelope.fromSlot,
@@ -2044,6 +2199,13 @@ final class AIAssistantModel: ObservableObject {
 
     private func applyRemotePage(_ page: AIResponse, source: AIRemoteSession,
                                  older: Bool) {
+        var source = source
+        if let busy = page.busy { source.busy = busy }
+        if let turnId = page.turnId { source.turnId = turnId }
+        if let index = remoteSessions.firstIndex(where: {
+            $0.id == source.id && $0.loginSessionID == source.loginSessionID
+        }) { remoteSessions[index] = source }
+        if selectedRemote?.id == source.id { selectedRemote = source }
         guard let received = page.messages else { return }
         let displayMessages = received.map(remoteDisplayMessage)
         if pendingRemoteSelection?.id == source.id {
@@ -2122,11 +2284,70 @@ final class AIAssistantModel: ObservableObject {
         let safePage = (state.messages ?? []).map(remoteHistoryMessage)
         let encoded = try JSONEncoder().encode(safePage)
         return ["ok": true,
+                "busy": state.busy ?? false, "turnId": state.turnId ?? "",
                 "messages": try JSONSerialization.jsonObject(with: encoded),
                 "permissions": try JSONSerialization.jsonObject(
                     with: JSONEncoder().encode(state.permissions ?? [])),
                 "questions": try JSONSerialization.jsonObject(
                     with: JSONEncoder().encode(state.questions ?? []))]
+    }
+
+    private func forgetRemoteSteeringImports(session: String) {
+        let previous = remoteSteeringImports.count
+        remoteSteeringImports = remoteSteeringImports.filter { $0.value.identity.session != session }
+        if previous != remoteSteeringImports.count { remoteSteeringImportRevision &+= 1 }
+    }
+
+    /// Admission is bounded and conservative. Snapshot reads are native owner
+    /// state, not the periodically refreshed UI session list. No file is deleted.
+    private func makeRoomForRemoteSteeringImport(ownerGeneration: Int,
+                                                 ownerAccount: String,
+                                                 ownerLogin: String) async throws {
+        for _ in 0..<3 {
+            guard submissionGeneration == ownerGeneration, screenFrameCurrentAccountID == ownerAccount else {
+                throw AIBackendError(message: "账号已变化，未导入补充附件")
+            }
+            // Only one not-yet-confirmed import may occupy space. Its existing
+            // request can retry; a different request cannot displace old receipts.
+            guard !remoteSteeringImports.values.contains(where: { $0.identity.acceptedOrder == nil }) else {
+                throw AIBackendError(message: "上一次附件补充尚未确认，请先重试原补充内容")
+            }
+            guard remoteSteeringImports.count >= AISteeringImportCachePolicy.activeCapacity else { return }
+            let revision = remoteSteeringImportRevision
+            let entries = remoteSteeringImports.values.map(\.identity)
+            var states: [String: AISteeringImportRuntimeState] = [:]
+            for session in Set(entries.map(\.session)).sorted() {
+                // Failed/missing snapshots cannot establish that a turn ended.
+                if let snapshot = try? await backend.remoteSnapshot(session: session, limit: 1),
+                   let busy = snapshot.busy, let turnId = snapshot.turnId {
+                    states[session] = AISteeringImportRuntimeState(busy: busy, turnId: turnId)
+                }
+                guard submissionGeneration == ownerGeneration, screenFrameCurrentAccountID == ownerAccount else {
+                    throw AIBackendError(message: "账号已变化，未导入补充附件")
+                }
+                if revision != remoteSteeringImportRevision { break }
+            }
+            guard revision == remoteSteeringImportRevision else { continue }
+            let currentLogin = await remoteTransport.currentLoginSessionID()
+            guard submissionGeneration == ownerGeneration, screenFrameCurrentAccountID == ownerAccount,
+                  currentLogin == ownerLogin else {
+                throw AIBackendError(message: "账号或所属设备登录状态已变化，未导入补充附件")
+            }
+            guard revision == remoteSteeringImportRevision else { continue }
+            guard AISteeringImportCachePolicy.activeCount(entries, states: states) <
+                    AISteeringImportCachePolicy.activeCapacity else {
+                throw AIBackendError(message: "当前仍有较多未结束的附件任务，请等待部分任务完成后重试")
+            }
+            if let key = AISteeringImportCachePolicy.evictableKey(entries, states: states) {
+                remoteSteeringImports.removeValue(forKey: key)
+                remoteSteeringImportRevision &+= 1
+            }
+            guard remoteSteeringImports.count < AISteeringImportCachePolicy.capacity else {
+                throw AIBackendError(message: "附件补充的确认状态尚未释放，请稍后重试")
+            }
+            return
+        }
+        throw AIBackendError(message: "所属设备任务状态正在变化，补充附件未发送，请稍后重试")
     }
 
     private func applyRemoteCommand(_ envelope: AIRemoteSessionTransport.Envelope) async {
@@ -2135,7 +2356,9 @@ final class AIAssistantModel: ObservableObject {
             return
         }
         guard sessions.contains(where: { $0.id == envelope.sessionID }) else { return }
-        let isPrompt = envelope.payload.action == "prompt"
+        let isPrompt = ["prompt", "steer"].contains(envelope.payload.action ?? "")
+        let ownerGeneration = submissionGeneration
+        let ownerAccount = screenFrameCurrentAccountID
         if isPrompt { remoteCommandsInProgress.insert(envelope.sessionID) }
         defer {
             if isPrompt {
@@ -2144,9 +2367,12 @@ final class AIAssistantModel: ObservableObject {
             }
         }
         var result: [String: Any] = ["ok": true]
+        var steeringImportKey: String?
+        var steeringDispatched = false
         do {
             switch envelope.payload.action {
-            case "prompt":
+            case "prompt", "steer":
+                let isSteering = envelope.payload.action == "steer"
                 guard let text = envelope.payload.text,
                       !text.isEmpty || !(envelope.payload.attachments ?? []).isEmpty,
                       text.utf8.count <= 16 * 1024 else {
@@ -2159,6 +2385,11 @@ final class AIAssistantModel: ObservableObject {
                 guard let ownLogin = await remoteTransport.currentLoginSessionID() else {
                     throw AIBackendError(message: "会话同步登录状态不可用")
                 }
+                let turnID = envelope.payload.turnId ?? ""
+                let requestID = envelope.payload.steeringRequestId ?? ""
+                if isSteering && (turnID.isEmpty || requestID.isEmpty) {
+                    throw AIBackendError(message: "补充内容缺少原任务编号，请更新发起设备")
+                }
                 let room = MaiCloudDriveClient.SessionRoom(
                     ownerSlot: syncDeviceSlot,
                     ownerLoginSessionID: ownLogin,
@@ -2168,7 +2399,27 @@ final class AIAssistantModel: ObservableObject {
                 var documents: [AIImportedFile] = []
                 var synced: [(id: String, name: String, kind: String,
                               mimeType: String, path: String)] = []
-                for reference in references {
+                let importKey = [ownLogin, envelope.sessionID, turnID, requestID].joined(separator: ":")
+                let referenceIDs = references.map(\.attachmentID)
+                let cached = isSteering ? remoteSteeringImports[importKey] : nil
+                if let cached, cached.references != referenceIDs {
+                    throw AIBackendError(message: "补充操作编号不能用于不同附件")
+                }
+                if isSteering && !references.isEmpty { steeringImportKey = importKey }
+                if isSteering && cached == nil && !references.isEmpty {
+                    try await makeRoomForRemoteSteeringImport(ownerGeneration: ownerGeneration,
+                        ownerAccount: ownerAccount, ownerLogin: ownLogin)
+                }
+                for (index, reference) in references.enumerated() {
+                    if let cached {
+                        let imported = cached.files[index]
+                        synced.append((reference.attachmentID, cached.names[index],
+                            cached.kinds[index], cached.mimeTypes[index], imported.relativePath))
+                        if imported.isImage { images.append(imported) }
+                        else if imported.mimeType.hasPrefix("video/") { videos.append(imported) }
+                        else { documents.append(imported) }
+                        continue
+                    }
                     let downloaded = try await MaiCloudDriveClient.shared
                         .downloadSessionAttachment(id: reference.attachmentID, room: room)
                     defer { try? FileManager.default.removeItem(at: downloaded.fileURL) }
@@ -2183,17 +2434,61 @@ final class AIAssistantModel: ObservableObject {
                     else if imported.mimeType.hasPrefix("video/") { videos.append(imported) }
                     else { documents.append(imported) }
                 }
+                if isSteering && cached == nil && !references.isEmpty {
+                    // An import awaited network/file work; recheck capacity and
+                    // owner identity before the single synchronous insertion.
+                    try await makeRoomForRemoteSteeringImport(ownerGeneration: ownerGeneration,
+                        ownerAccount: ownerAccount, ownerLogin: ownLogin)
+                    let allFiles = images + videos + documents
+                    remoteSteeringImportOrder &+= 1
+                    let identity = AISteeringImportCacheIdentity(key: importKey,
+                        session: envelope.sessionID, turnId: turnID, order: remoteSteeringImportOrder)
+                    remoteSteeringImports[importKey] = RemoteSteeringImport(identity: identity,
+                        references: referenceIDs,
+                        files: synced.compactMap { item in allFiles.first { $0.relativePath == item.path } },
+                        names: synced.map(\.name), kinds: synced.map(\.kind),
+                        mimeTypes: synced.map(\.mimeType))
+                    remoteSteeringImportRevision &+= 1
+                }
+                let currentOwnerLogin = await remoteTransport.currentLoginSessionID()
+                guard submissionGeneration == ownerGeneration,
+                      screenFrameCurrentAccountID == ownerAccount,
+                      currentOwnerLogin == ownLogin else {
+                    throw AIBackendError(message: "账号或所属设备登录状态已变化，未发送内容")
+                }
                 var prompt = text
                 if !documents.isEmpty {
                     prompt += "\n\n会话附件已保存到本机工作目录：\n" +
                         documents.map { "- \($0.relativePath)" }.joined(separator: "\n")
                 }
-                _ = try await backend.send(session: envelope.sessionID, text: prompt,
-                                           images: images, videos: videos,
-                                           quoteMessageId: "")
+                let sent: AIResponse
+                if isSteering {
+                    steeringDispatched = true
+                    sent = try await backend.steer(AISteeringRequest(
+                        session: envelope.sessionID, turnId: turnID, requestId: requestID,
+                        text: prompt, images: images, videos: videos,
+                        quoteMessageId: envelope.payload.quoteMessageId ?? ""))
+                    guard let id = sent.id, !id.isEmpty else {
+                        throw AIBackendError(message: "所属设备未返回补充内容落库编号")
+                    }
+                    result["user_message_id"] = id
+                    if let key = steeringImportKey,
+                       remoteSteeringImports[key]?.identity.acceptedOrder == nil {
+                        remoteSteeringAcceptedOrder &+= 1
+                        remoteSteeringImports[key]?.identity.acceptedOrder = remoteSteeringAcceptedOrder
+                        remoteSteeringImportRevision &+= 1
+                    }
+                } else {
+                    sent = try await backend.send(session: envelope.sessionID, text: prompt,
+                        images: images, videos: videos, quoteMessageId: "")
+                }
                 let latest = try? await backend.remoteSnapshot(
                     session: envelope.sessionID, limit: 2)
-                if let userMessage = latest?.messages?.first(where: { $0.role == "user" }) {
+                let receiptUser = isSteering ? try? await backend.userMessage(
+                    session: envelope.sessionID, id: sent.id ?? "") : nil
+                if let userMessage = receiptUser ?? latest?.messages?.first(where: {
+                    $0.role == "user" && !isSteering
+                }) {
                     result["user_message_id"] = userMessage.id
                     if !synced.isEmpty, let latest {
                         var parts = remoteHistoryMessage(userMessage).parts
@@ -2258,7 +2553,16 @@ final class AIAssistantModel: ObservableObject {
             default:
                 throw AIBackendError(message: "不支持的远端操作")
             }
-        } catch { result = ["ok": false, "error": error.localizedDescription] }
+        } catch {
+            let unknown = steeringDispatched && (error as? AIBackendError)?.definitive != true
+            if let key = steeringImportKey,
+               remoteSteeringImports[key]?.identity.acceptedOrder == nil, !unknown {
+                remoteSteeringImports.removeValue(forKey: key)
+                remoteSteeringImportRevision &+= 1
+            }
+            result = ["ok": false, "error": error.localizedDescription]
+            if unknown { result["delivery_unknown"] = true }
+        }
         try? await remoteTransport.sendPayload(
             to: envelope, kind: "event",
             value: ["type": "command_result", "command_id": envelope.clientMessageID,
@@ -2286,6 +2590,8 @@ final class AIAssistantModel: ObservableObject {
                 }
                 let archiveWorkspace = URL(fileURLWithPath: workspacePath, isDirectory: true)
                 _ = try await backend.request("delete", values: ["session": target])
+                // Native deletion invalidates the session's core receipts too.
+                forgetRemoteSteeringImports(session: target)
                 await releaseScreenFrameHistory(sessionID: target, workspace: archiveWorkspace)
                 deletedDraftSessions.insert(target)
                 discardImportedFiles(pendingAttachments.removeValue(forKey: target) ?? [])
@@ -2762,9 +3068,189 @@ final class AIAssistantModel: ObservableObject {
         }
         return id
     }
-    /// 提交文本及附件，并在核心落库后合并新快照、请求界面定位最新消息。
-    /// 输入不合法或任务忙碌时不改动草稿；新建会话也必须保持一个可见的加载状态。
+    private func finishRemoteSteering(_ id: String, result: Result<String, Error>) {
+        remoteSteeringConfirmations.removeValue(forKey: id)?.continuation.resume(with: result)
+    }
+
+    /// Transport acknowledgement is not owner acceptance. Each delivery attempt
+    /// uses a new envelope ID, while requestId stays stable for core deduplication.
+    private func sendRemoteSteering(to remote: AIRemoteSession,
+                                    payload: [String: Any]) async throws -> String {
+        let encoded = try JSONSerialization.data(withJSONObject: payload, options: .sortedKeys)
+        let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        return try await withCheckedThrowingContinuation { continuation in
+            remoteSteeringConfirmations[id] = RemoteSteeringConfirmation(
+                remote: remote, continuation: continuation)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    try await remoteTransport.sendCommand(to: remote, encodedPayload: encoded,
+                                                          messageID: id)
+                } catch {
+                    finishRemoteSteering(id, result: .failure(AIBackendError(
+                        message: error.localizedDescription, definitive: false)))
+                }
+            }
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(30))
+                self?.finishRemoteSteering(id, result: .failure(AIBackendError(
+                    message: "所属设备未确认补充内容，草稿已保留；重试会复用原任务编号",
+                    definitive: false)))
+            }
+        }
+    }
+
+    /// Busy submission supplements the captured turn, never cancels a tool or
+    /// silently starts another turn. Core success contains the persisted user ID.
+    private func supplementCurrentTask(_ text: String, expectedSession: String?) async -> Bool {
+        let session = selected
+        let remote = selectedRemote
+        let draftKey = remote.map(remoteDraftKey) ?? session
+        let files = pendingAttachments[draftKey] ?? []
+        let quote = quotedMessage?.id ?? ""
+        guard expectedSession == nil || expectedSession == session,
+              !session.isEmpty, !isSubmitting, !isCreatingConversation,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !files.isEmpty
+        else { return false }
+        let identity = composerSubmissionIdentity
+        let content = [draftKey, text, quote] + files.map { $0.attachmentIdentity + ":" + $0.mimeType }
+        let bytes = (try? JSONEncoder().encode(content)) ?? Data()
+        let key = [screenFrameCurrentAccountID, String(submissionGeneration), workspacePath,
+                   SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()]
+            .joined(separator: "\u{1f}")
+        let turn = remote?.turnId ?? sessions.first(where: { $0.id == session })?.turnId ?? ""
+        if steeringAttempts[key] == nil {
+            guard busy, !turn.isEmpty else {
+                showTransientError(remote == nil ? "当前任务已结束，草稿已保留" :
+                    "所属设备尚未提供当前任务编号，请更新所属设备后重试")
+                return false
+            }
+            guard steeringAttempts.count < 128 else {
+                showTransientError("还有较多补充内容等待确认，请先返回原草稿确认后再发送")
+                return false
+            }
+            steeringAttempts[key] = SteeringAttempt(turnId: turn,
+                requestId: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())
+        }
+        guard let attempt = steeringAttempts[key] else { return false }
+        isSubmitting = true
+        defer { isSubmitting = false; remoteUploadStatus = "" }
+        var preparedReferences: [AIMobileScreenArchiveReference] = []
+        var dispatched = false
+        do {
+            var messageID = attempt.acceptedMessageID
+            if messageID == nil {
+                if let remote {
+                    guard remoteIsOnline(remote) else {
+                        throw AIBackendError(message: "所属设备离线，补充内容仍保留在草稿中")
+                    }
+                    var references = attempt.remoteReferences ?? []
+                    if attempt.remoteReferences == nil {
+                        let room = MaiCloudDriveClient.SessionRoom(ownerSlot: remote.deviceSlot,
+                            ownerLoginSessionID: remote.loginSessionID, sessionID: session)
+                        for (index, file) in files.enumerated() {
+                            guard composerSubmissionIdentity == identity,
+                                  let path = AIAssistantPathPolicy.resolve(
+                                    file.relativePath, workspacePath: workspacePath) else {
+                                throw AIBackendError(message: "会话已切换，补充内容未发送")
+                            }
+                            remoteUploadStatus = "正在上传附件 \(index + 1)/\(files.count)…"
+                            let receipt = try await MaiCloudDriveClient.shared.uploadSessionAttachment(
+                                fileURL: path, displayName: path.lastPathComponent, room: room)
+                            references.append(["attachment_id": receipt.attachmentId])
+                        }
+                        steeringAttempts[key]?.remoteReferences = references
+                    }
+                    guard composerSubmissionIdentity == identity else {
+                        throw AIBackendError(message: "会话已切换，补充内容未发送")
+                    }
+                    var payload: [String: Any] = ["action": "steer", "text": text,
+                        "turnId": attempt.turnId, "requestId": attempt.requestId,
+                        "quoteMessageId": quote]
+                    if !references.isEmpty { payload["attachments"] = references }
+                    messageID = try await sendRemoteSteering(to: remote, payload: payload)
+                } else {
+                    // Archive-backed draft frames must become history references
+                    // before acceptance. Unknown receipts keep this pin on retry.
+                    let references = files.compactMap(\.archiveReference).filter {
+                        screenFrameHistoryPins[$0.referenceID] == nil
+                    }
+                    try await prepareScreenFrameHistory(references, sessionID: session)
+                    preparedReferences = references
+                    guard composerSubmissionIdentity == identity else {
+                        throw AIBackendError(message: "会话已切换，补充内容未发送")
+                    }
+                    let request = AISteeringRequest(session: session, turnId: attempt.turnId,
+                        requestId: attempt.requestId, text: text, images: files.filter(\.isImage),
+                        videos: files.filter { $0.mimeType.hasPrefix("video/") }, quoteMessageId: quote)
+                    dispatched = true
+                    #if DEBUG && targetEnvironment(simulator)
+                    if let handler = uiTestSupport.steeringHandler {
+                        messageID = try await handler(request)
+                    } else {
+                        messageID = try await backend.steer(request).id
+                    }
+                    #else
+                    messageID = try await backend.steer(request).id
+                    #endif
+                }
+                guard let messageID, !messageID.isEmpty else {
+                    throw AIBackendError(message: "补充内容未返回落库确认", definitive: false)
+                }
+                steeringAttempts[key]?.acceptedMessageID = messageID
+            }
+            // A successful receipt for an old selection is retained for retry,
+            // but it must not clear either the old or the newly selected draft.
+            guard composerSubmissionIdentity == identity else { return false }
+            let ids = Set(files.map(\.attachmentIdentity))
+            pendingAttachments[draftKey]?.removeAll { ids.contains($0.attachmentIdentity) }
+            if pendingAttachments[draftKey]?.isEmpty == true { pendingAttachments.removeValue(forKey: draftKey) }
+            if remote != nil { discardImportedFiles(files) }
+            if quotedMessage?.id == quote { quotedMessage = nil }
+            steeringAttempts.removeValue(forKey: key)
+            error = ""
+            if remote == nil {
+                #if DEBUG && targetEnvironment(simulator)
+                if uiTestSupport.steeringHandler == nil {
+                    await refresh(force: true)
+                    startPolling()
+                }
+                #else
+                await refresh(force: true)
+                startPolling()
+                #endif
+            }
+            scrollRequest += 1
+            return true
+        } catch {
+            if !dispatched || (error as? AIBackendError)?.definitive == true {
+                await restoreScreenFrameDraftAfterRejectedSteering(preparedReferences, sessionID: session)
+            }
+            if (error as? AIBackendError)?.definitive == true { steeringAttempts.removeValue(forKey: key) }
+            if composerSubmissionIdentity == identity {
+                showTransientError(error.localizedDescription, duration: .seconds(8))
+            }
+            return false
+        }
+    }
+
+    /// 提交文本及附件；忙碌时只走当前任务补充协议，失败保留草稿。
     func sendMessage(_ text: String, expectedSession: String? = nil) async -> Bool {
+        // Unknown/accepted delivery retries remain bound to their original turn
+        // even if the current snapshot becomes idle while awaiting a receipt.
+        if busy || !steeringAttempts.isEmpty {
+            let draftKey = selectedRemote.map(remoteDraftKey) ?? selected
+            let files = pendingAttachments[draftKey] ?? []
+            let content = [draftKey, text, quotedMessage?.id ?? ""] +
+                files.map { $0.attachmentIdentity + ":" + $0.mimeType }
+            let bytes = (try? JSONEncoder().encode(content)) ?? Data()
+            let key = [screenFrameCurrentAccountID, String(submissionGeneration), workspacePath,
+                SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()]
+                .joined(separator: "\u{1f}")
+            if busy || steeringAttempts[key] != nil {
+                return await supplementCurrentTask(text, expectedSession: expectedSession)
+            }
+        }
         if let remote = selectedRemote {
             let draftKey = remoteDraftKey(remote)
             let selectedFiles = pendingAttachments[draftKey] ?? []
@@ -2939,6 +3425,7 @@ final class AIAssistantModel: ObservableObject {
         do {
             var values = values; values["session"] = target
             _ = try await backend.request(op, values: values)
+            if op == "delete" { forgetRemoteSteeringImports(session: target) }
             if op == "delete" || op == "clear" {
                 await releaseScreenFrameHistory(sessionID: target, workspace: archiveWorkspace)
             }
@@ -3366,6 +3853,27 @@ final class AIAssistantModel: ObservableObject {
             let abandoned = pending.filter { self !== Self.shared || !stillPending.contains($0.referenceID) }
             try? await AIMobileScreenFrameArchive.shared.release(references: abandoned)
             throw error
+        }
+    }
+
+    /// Only a confirmed rejection may move newly prepared pins back to the draft.
+    /// An unknown native receipt could already be in history and must remain held.
+    private func restoreScreenFrameDraftAfterRejectedSteering(
+        _ references: [AIMobileScreenArchiveReference], sessionID: String
+    ) async {
+        let prepared = references.filter { screenFrameHistoryPins[$0.referenceID] == sessionID }
+        guard !prepared.isEmpty else { return }
+        do {
+            try await AIMobileScreenFrameArchive.shared.assignSession(references: prepared,
+                usageSessionID: "draft:" + UUID().uuidString.lowercased())
+            for reference in prepared { screenFrameHistoryPins.removeValue(forKey: reference.referenceID) }
+            let pending = Set(pendingAttachments.values.flatMap { $0 }
+                .compactMap { $0.archiveReference?.referenceID })
+            let abandoned = prepared.filter { self !== Self.shared || !pending.contains($0.referenceID) }
+            try? await AIMobileScreenFrameArchive.shared.release(references: abandoned)
+        } catch {
+            // Keep the history pin if rollback cannot be confirmed; never delete
+            // pixels which may still belong to an accepted or retained message.
         }
     }
 

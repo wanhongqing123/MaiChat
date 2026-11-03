@@ -2,7 +2,7 @@
 # 平台 SDK 和可选媒体能力由配置阶段检查；真实编译命令可导出给 clangd。
 cmake_minimum_required(VERSION 3.21)
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 2.2.34 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 2.2.36 LANGUAGES C CXX)
 if(MSVC AND CMAKE_CL_SHOWINCLUDES_PREFIX MATCHES "^娉")
   # Some CMake/VS2019 locale combinations double-decode /showIncludes. Ninja then
   # records no header dependencies, so changing a public header leaves stale objects.
@@ -11,7 +11,8 @@ if(MSVC AND CMAKE_CL_SHOWINCLUDES_PREFIX MATCHES "^娉")
   set(CMAKE_CL_SHOWINCLUDES_PREFIX "注意: 包含文件:  ")
 endif()
 if(APPLE)
-  enable_language(OBJCXX)
+  # Metal 使用 .m，桌面原生桥使用 .mm；先在宿主目录建立各自的语言规则。
+  enable_language(OBJC OBJCXX)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)

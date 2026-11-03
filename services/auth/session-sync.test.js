@@ -108,6 +108,90 @@ test('only the same account can list and address its active device sessions', as
   } finally { setup.db.close(); }
 });
 
+test('current-task supplements carry the owner turn and only owner receipts confirm acceptance', async () => {
+  const setup = fixture();
+  try {
+    await setup.macPresence();
+    await setup.phonePresence();
+    const published = await setup.call('mac-token', 'POST', '/v1/session-sync/publish', {
+      session_id: 'ses_mac_1', messages: [], permissions: [], questions: [],
+      busy: true, turnId: 'msg_initial_assistant'
+    });
+    assert.equal(published.statusCode, 200);
+    const catalog = await setup.call('phone-token', 'GET', '/v1/session-sync/sessions');
+    assert.equal(catalog.body.sessions[0].turnId, 'msg_initial_assistant');
+    const history = await setup.call('phone-token', 'GET',
+      '/v1/session-sync/history?owner_slot=mac&session_id=ses_mac_1');
+    assert.equal(history.body.busy, true);
+    assert.equal(history.body.turnId, 'msg_initial_assistant');
+
+    const command = {
+      to_slot: 'mac', to_login_session_id: 'mac-login-1', client_message_id: 'delivery-steer-1',
+      session_id: 'ses_mac_1', kind: 'command', payload: {
+        action: 'steer', text: 'Keep the original detail',
+        turnId: 'msg_initial_assistant', requestId: 'stable-supplement-request'
+      }
+    };
+    assert.equal((await setup.call('phone-token', 'POST', '/v1/session-sync/send', command)).statusCode, 200);
+    const inbox = await setup.call('mac-token', 'GET', '/v1/session-sync/poll');
+    assert.deepEqual(inbox.body.messages[0].payload, command.payload);
+    // The relay stores/routes control metadata; it cannot claim that the Agent
+    // accepted the text or initiate a model request itself.
+    const pending = await setup.call('phone-token', 'GET', '/v1/session-sync/poll');
+    assert.ok(pending.body.messages.every(item => item.payload.type !== 'command_result'));
+    const result = { type: 'command_result', command_id: command.client_message_id,
+      result: { ok: true, user_message_id: 'msg_persisted_user' } };
+    assert.equal((await setup.call('mac-token', 'POST', '/v1/session-sync/send', {
+      to_slot: 'ios_phone', to_login_session_id: 'phone-login', client_message_id: 'steer-result',
+      session_id: 'ses_mac_1', kind: 'event', payload: result
+    })).statusCode, 200);
+    const confirmed = await setup.call('phone-token', 'GET', '/v1/session-sync/poll');
+    assert.deepEqual(confirmed.body.messages.at(-1).payload, result);
+
+    for (const payload of [
+      { ...command.payload, turnId: '' },
+      { ...command.payload, requestId: '' },
+      { ...command.payload, text: ' ' },
+      { ...command.payload, attachments: 'invalid' }
+    ]) assert.equal((await setup.call('phone-token', 'POST', '/v1/session-sync/send', {
+      ...command, client_message_id: 'invalid-steering', payload
+    })).statusCode, 400);
+    // An old client may still report busy without a turn binding. The history
+    // must expose that absence so new clients reject rather than guess a turn.
+    await setup.macPresence();
+    const legacy = await setup.call('phone-token', 'GET',
+      '/v1/session-sync/history?owner_slot=mac&session_id=ses_mac_1');
+    assert.equal(legacy.body.turnId, '');
+    assert.equal((await setup.call('mac-token', 'POST', '/v1/session-sync/publish', {
+      session_id: 'ses_mac_1', messages: [], busy: false, turnId: ''
+    })).statusCode, 200);
+    const idle = await setup.call('phone-token', 'GET',
+      '/v1/session-sync/history?owner_slot=mac&session_id=ses_mac_1');
+    assert.equal(idle.body.busy, false);
+    assert.equal(idle.body.turnId, '');
+  } finally { setup.db.close(); }
+});
+
+test('turn binding migrates an existing session store without changing its rows', () => {
+  const Database = require('better-sqlite3');
+  const directory = mkdtempSync(join(tmpdir(), 'maichat-steering-migration-'));
+  const filename = join(directory, 'sync.sqlite');
+  try {
+    const old = new Database(filename);
+    old.exec(`CREATE TABLE sync_sessions (account_id TEXT NOT NULL,slot TEXT NOT NULL,
+      login_session_id TEXT NOT NULL,session_id TEXT NOT NULL,title TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,busy INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(account_id,slot,session_id));
+      INSERT INTO sync_sessions VALUES('fixture-owner','mac','fixture-login','ses_fixture','Existing',42,1);`);
+    old.close();
+    const migrated = openSessionSyncStore(filename);
+    try {
+      assert.deepEqual(migrated.prepare('SELECT title,busy,turn_id FROM sync_sessions').get(),
+        { title: 'Existing', busy: 1, turn_id: '' });
+    } finally { migrated.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('later owner snapshots retain durable Session attachment references', async () => {
   const setup = fixture();
   try {

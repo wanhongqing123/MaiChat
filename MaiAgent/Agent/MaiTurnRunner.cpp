@@ -239,6 +239,7 @@ MaiObservedToolBatch observeToolBatch(const std::vector<MaiMessagePart>& parts,
 MaiTurnRunner::MaiTurnRunner(Dependencies dependencies, std::string sessionId, MaiMessage assistant)
     : mDependencies(std::move(dependencies)),
       mSessionId(std::move(sessionId)),
+      mInitialAssistantId(assistant.id),
       mAssistant(std::move(assistant)) {}
 
 void MaiTurnRunner::run(const std::atomic<bool>& cancel) {
@@ -256,6 +257,20 @@ void MaiTurnRunner::run(const std::atomic<bool>& cancel) {
 
 bool MaiTurnRunner::succeeded() const {
     return !mError.hasError();
+}
+
+bool MaiTurnRunner::hasVisibleText() const {
+    return mHasVisibleText;
+}
+
+bool MaiTurnRunner::advanceSteering(bool closeIfEmpty) {
+    if (!mDependencies.advanceSteering) return false;
+    const auto advanced = mDependencies.advanceSteering(mAssistant, closeIfEmpty);
+    if (!advanced) {
+        mError = advanced.error();
+        return false;
+    }
+    return advanced.value();
 }
 
 // 执行单轮 Agent 工作：准备上下文、调用模型、处理工具并持久化事件。
@@ -276,6 +291,16 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
     mWorkingDirectory = session.directory;
 
     mModelName = session.model.empty() ? mDependencies.defaultModel : session.model;
+    if (!mDependencies.specialistReply.empty()) {
+        const auto history = mDependencies.store->listMessages(mSessionId);
+        const auto pending = mDependencies.pendingSteering ? mDependencies.pendingSteering()
+                                                           : std::vector<std::string>{};
+        for (const MaiMessage& message : history) {
+            if (message.id != mInitialAssistantId &&
+                std::find(pending.begin(), pending.end(), message.id) == pending.end())
+                mSpecialistHistoryIds.insert(message.id);
+        }
+    }
 
     // ── 工具循环 ──────────────────────────────────────────────────
     // 这是 agent 之所以是 agent 的地方：
@@ -286,8 +311,33 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
     bool hasToolResults = false;
     bool retriedMissingFinalAnswer = false;
     std::map<MaiObservedToolBatch, int> observedBatches;
+    const auto requestFinalAnswer = [&](const char* hint, const std::string& failure) {
+        // 最后的无工具请求先封闭接收，再消费已接受的补充，避免接受后再无模型调用。
+        if (mDependencies.closeSteering) mDependencies.closeSteering();
+        advanceSteering(false);
+        if (mError || cancel.load(std::memory_order_relaxed)) return;
+        MaiModelRequest finalRequest = buildRequest(mModelName, false);
+        finalRequest.tools.clear();
+        MaiModelMessage instruction;
+        instruction.role = MaiModelRole::System;
+        instruction.content = hint;
+        finalRequest.messages.push_back(std::move(instruction));
+        const auto finalCalls = requestCompletion(finalRequest, cancel);
+        const bool hasFinalText =
+            std::any_of(mText.begin(), mText.end(),
+                        [](unsigned char character) { return !std::isspace(character); });
+        commitStreamedParts();
+        if (!mError && !cancel.load(std::memory_order_relaxed) &&
+            (!finalCalls.empty() || !hasFinalText))
+            mError = MaiError::make(MaiErrorCode::Internal, failure);
+    };
     for (int iteration = 0; iteration < mDependencies.maxIterations; ++iteration) {
         if (cancel.load(std::memory_order_relaxed)) break;
+        if (advanceSteering(false)) {
+            observedBatches.clear();
+            retriedMissingFinalAnswer = false;
+        }
+        if (mError) break;
 
         const auto calls =
             requestCompletion(buildRequest(mModelName, retriedMissingFinalAnswer), cancel);
@@ -298,6 +348,19 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
 
         if (mError) break;
         if (calls.empty()) {
+            // 与接收方共用闸门，把“还有补充”与“结束接收”变成一次原子判断。
+            // 流中的最后一段正文出现并不意味着后来接受的用户消息已被模型看到。
+            if (advanceSteering(true)) {
+                if (iteration + 1 < mDependencies.maxIterations) {
+                    observedBatches.clear();
+                    retriedMissingFinalAnswer = false;
+                    continue;
+                }
+                requestFinalAnswer(kToolLimitFinalHint,
+                                   "The model did not answer the accepted steering input.");
+                break;
+            }
+            if (mError) break;
             if (hasToolResults && !producedVisibleText) {
                 if (!retriedMissingFinalAnswer && iteration + 1 < mDependencies.maxIterations) {
                     retriedMissingFinalAnswer = true;
@@ -323,28 +386,13 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         // 12 圈，但最终仍有硬上限。两种情况都要把结果交回模型作不带工具的收尾。
         if (repeatedWithoutProgress || reachedHardLimit) {
             if (!cancel.load(std::memory_order_relaxed)) {
-                MaiModelRequest finalRequest = buildRequest(mModelName, false);
-                finalRequest.tools.clear();
-                MaiModelMessage instruction;
-                instruction.role = MaiModelRole::System;
-                instruction.content =
-                    reachedHardLimit ? kToolLimitFinalHint : kRepeatedToolFinalHint;
-                finalRequest.messages.push_back(std::move(instruction));
-                const auto finalCalls = requestCompletion(finalRequest, cancel);
-                const bool hasFinalText =
-                    std::any_of(mText.begin(), mText.end(),
-                                [](unsigned char character) { return !std::isspace(character); });
-                commitStreamedParts();
-                if (!mError && !cancel.load(std::memory_order_relaxed) &&
-                    (!finalCalls.empty() || !hasFinalText)) {
-                    mError = MaiError::make(
-                        MaiErrorCode::Internal,
-                        reachedHardLimit ? "Stopped after reaching the tool-call limit of " +
-                                               std::to_string(mDependencies.maxIterations) +
-                                               " iterations without a final status from the model."
-                                         : "Stopped after repeated tool calls without a final "
-                                           "status from the model.");
-                }
+                requestFinalAnswer(reachedHardLimit ? kToolLimitFinalHint : kRepeatedToolFinalHint,
+                                   reachedHardLimit
+                                       ? "Stopped after reaching the tool-call limit of " +
+                                             std::to_string(mDependencies.maxIterations) +
+                                             " iterations without a final status from the model."
+                                       : "Stopped after repeated tool calls without a final "
+                                         "status from the model.");
             }
             break;
         }
@@ -369,6 +417,15 @@ MaiModelRequest MaiTurnRunner::buildRequest(const std::string& modelName,
     // 历史里那条正在写的 assistant 消息，
     // 要用内存中最新的版本——存储里的那份可能还没包含刚执行完的工具结果。
     auto history = mDependencies.store->listMessages(mSessionId);
+    if (mDependencies.pendingSteering) {
+        const auto pending = mDependencies.pendingSteering();
+        history.erase(std::remove_if(history.begin(), history.end(),
+                                     [&](const auto& message) {
+                                         return std::find(pending.begin(), pending.end(),
+                                                          message.id) != pending.end();
+                                     }),
+                      history.end());
+    }
     for (auto& message : history) {
         if (message.id == mAssistant.id) message = mAssistant;
     }
@@ -377,11 +434,15 @@ MaiModelRequest MaiTurnRunner::buildRequest(const std::string& modelName,
     } else {
         // 子模型回复应排在本轮工具调用之前。若每次迭代都把它追加在工具结果之后，
         // 主模型会把旧回复误认为用户刚刚发来的最新输入。
-        history.erase(
-            std::remove_if(history.begin(), history.end(),
-                           [this](const auto& message) { return message.id == mAssistant.id; }),
-            history.end());
-        request.messages = mDependencies.context->build(history);
+        std::vector<MaiMessage> earlier;
+        std::vector<MaiMessage> continuation;
+        for (const MaiMessage& message : history) {
+            if (mSpecialistHistoryIds.count(message.id))
+                earlier.push_back(message);
+            else
+                continuation.push_back(message);
+        }
+        request.messages = mDependencies.context->build(earlier);
         MaiModelMessage instruction;
         instruction.role = MaiModelRole::System;
         instruction.content =
@@ -405,10 +466,10 @@ MaiModelRequest MaiTurnRunner::buildRequest(const std::string& modelName,
         reply.role = MaiModelRole::User;
         reply.content = mDependencies.specialistReply;
         request.messages.push_back(std::move(reply));
-        if (!mAssistant.parts.empty()) {
-            const auto current = mDependencies.context->build({mAssistant});
-            request.messages.insert(request.messages.end(), current.begin(), current.end());
-        }
+        // steer 产生新 assistant 段时，旧专业回复仍固定在本轮最初分段之前，
+        // 不能越过新的用户指令重新变成“最新输入”。
+        const auto current = mDependencies.context->build(continuation);
+        request.messages.insert(request.messages.end(), current.begin(), current.end());
     }
     request.workingDirectory = mWorkingDirectory;
     if (requireFinalAnswer) {
@@ -439,6 +500,8 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
 
     MaiStreamSink sink;
     sink.onText = [&](std::string_view chunk) {
+        mHasVisibleText |= std::any_of(chunk.begin(), chunk.end(),
+                                       [](unsigned char byte) { return !std::isspace(byte); });
         if (!textStarted) {
             textStarted = true;
             beginStreamedPart(mTextPartId, MaiTextPart{});
@@ -744,6 +807,7 @@ void MaiTurnRunner::fillStreamedPart(const std::string& partId, const std::strin
 }
 
 void MaiTurnRunner::finish(const std::atomic<bool>& cancel) {
+    if (mDependencies.closeSteering) mDependencies.closeSteering();
     commitStreamedParts();  // 中断时可能还有没落库的半截内容
 
     mAssistant.completed = MaiTime::getCurrentTime();

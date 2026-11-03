@@ -24,6 +24,7 @@
 | `simde/` | https://github.com/simd-everywhere/simde | 0.8.2（OBS 使用的头文件与许可文件） |
 | `md4c/` | https://github.com/mity/md4c | release-0.5.2（MIT，供 PDF 与桌面 Markdown 共用） |
 | `qpdf/` | https://github.com/qpdf/qpdf | 12.2.0（Apache-2.0，C++17 进程内 PDF AES-256/R6 密码保护，见 `qpdf/MAI_UPSTREAM.md`） |
+| `llama.cpp/` | https://github.com/ggml-org/llama.cpp | b12065，固定提交 `ee17f293b638295651c6ff4752a4dce102c6b8e4`（MIT，完整源码及子依赖许可；见 `llama.cpp/MAI_UPSTREAM.md`） |
 | `websocketpp/` | https://github.com/zaphoyd/websocketpp | 0.8.2（BSD-3-Clause，MaiChat 多端 Session 通道） |
 | `asio/` | https://github.com/chriskohlhoff/asio | asio-1-30-2（Boost Software License 1.0，WebSocket++ 独立 Asio 传输） |
 
@@ -41,6 +42,14 @@ OpenCV 4.14.0 来自官方 tag 源码包
 
 SoundTouch 的来源、发布包 SHA-256 和本地构建调整见
 [`soundtouch/MAICHAT_SOURCE.md`](soundtouch/MAICHAT_SOURCE.md)。
+
+llama.cpp、ggml 和 mtmd 由同一固定源码树离线生成静态库，统一 CMake 入口为
+[`MaiLlamaDependencies.cmake`](MaiLlamaDependencies.cmake)。Apple 后端嵌入 Metal 源码，
+不下载 XCFramework；上游 CLI、server、示例、测试及外部子进程适配不进入产品构建。
+`MTMD_VIDEO=OFF` 仅关闭上游通过 PATH 启动 ffmpeg/ffprobe 的文件适配层；手机已有的
+进程内 FFmpeg 不受影响。视频帧应由已有 FFmpeg 能力提取后交 mtmd bitmap；这层连线
+尚未完成，不能据静态库可用宣称视频文件输入已接通。随树保留的 GGUF 都是零 tensor
+词表测试夹具，不是推理模型权重；模型文件继续单独管理。
 
 zlib 使用上游 CMake 目标生成静态库，编译时启用 `Z_PREFIX`，避免与 Qt 和
 FFmpeg 已链接的 zlib 符号冲突。OpenSSL 在上游源码上修改了 `apps` 的进程退出、

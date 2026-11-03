@@ -433,7 +433,8 @@ void DesktopSessionSyncCoordinator::handleEnvelope(const QJsonObject& envelope) 
     if (!current && kind == QStringLiteral("command")) return;
     if (kind == QStringLiteral("command")) {
         const QJsonObject payload = envelope.value(QStringLiteral("payload")).toObject();
-        if (payload.value(QStringLiteral("action")).toString() == QStringLiteral("prompt") &&
+        const QString action = payload.value(QStringLiteral("action")).toString();
+        if ((action == QStringLiteral("prompt") || action == QStringLiteral("steer")) &&
             !payload.value(QStringLiteral("attachments")).toArray().isEmpty()) {
             startAttachmentCommand(envelope);
             return;
@@ -517,15 +518,27 @@ void DesktopSessionSyncCoordinator::startAttachmentCommand(const QJsonObject& en
 #endif
     const DesktopSessionRoom room{slot, localLoginSession_, sessionId};
     const QString workspace = QString::fromUtf8(session.directory.c_str());
+    const QJsonObject command = envelope.value(QStringLiteral("payload")).toObject();
+    // The same core request must retain its imported media paths on a new
+    // transport delivery. Bind the namespace to this account/login/turn.
+    const QString retryNamespace = command.value(QStringLiteral("action")).toString() ==
+            QStringLiteral("steer")
+        ? QStringList{access.accountId, room.login, sessionId,
+            command.value(QStringLiteral("turnId")).toString(),
+            command.value(QStringLiteral("requestId")).toString()}.join(QLatin1Char(':'))
+        : QString();
     auto* watcher = new QFutureWatcher<QPair<QJsonArray, QString>>(this);
     QPointer<DesktopSessionSyncCoordinator> guard(this);
     connect(watcher, &QFutureWatcher<QPair<QJsonArray, QString>>::finished, this,
-            [guard, watcher, envelope, access, sessionId] {
+            [guard, watcher, envelope, access, sessionId, room,
+             owner = QPointer<AgentController>(controller)] {
         const auto resolved = watcher->result();
         watcher->deleteLater();
         if (!guard) return;
         if (!resolved.second.isEmpty() || !guard->attachmentAccessProvider_ ||
-            guard->attachmentAccessProvider_().accountId != access.accountId) {
+            guard->attachmentAccessProvider_().accountId != access.accountId ||
+            guard->localLoginSession_ != room.login ||
+            !owner || guard->agentProvider_() != owner) {
             guard->respondToCommand(envelope, {{QStringLiteral("ok"), false},
                 {QStringLiteral("error"), resolved.second.isEmpty() ?
                     QStringLiteral("账号已切换") : resolved.second}});
@@ -573,6 +586,8 @@ void DesktopSessionSyncCoordinator::startAttachmentCommand(const QJsonObject& en
                 guard->publishAttachmentHistory({
                     {QStringLiteral("session_id"), sessionId},
                     {QStringLiteral("messages"), QJsonArray{message}},
+                    {QStringLiteral("busy"), page.value(QStringLiteral("busy"))},
+                    {QStringLiteral("turnId"), page.value(QStringLiteral("turnId"))},
                     {QStringLiteral("permissions"), page.value(QStringLiteral("permissions"))},
                     {QStringLiteral("questions"), page.value(QStringLiteral("questions"))}}, 5);
                 break;
@@ -580,7 +595,7 @@ void DesktopSessionSyncCoordinator::startAttachmentCommand(const QJsonObject& en
         }
         guard->respondToCommand(envelope, result);
     });
-    watcher->setFuture(QtConcurrent::run([access, room, workspace, references] {
+    watcher->setFuture(QtConcurrent::run([access, room, workspace, references, retryNamespace] {
         QJsonArray resolved;
         const QString directory = QDir(workspace).filePath(
             QStringLiteral(".maichat/session-attachments"));
@@ -591,10 +606,25 @@ void DesktopSessionSyncCoordinator::startAttachmentCommand(const QJsonObject& en
             const auto downloaded = DesktopSessionAttachments::download(access, room, id);
             if (!downloaded.ok()) return QPair<QJsonArray, QString>{{}, downloaded.error};
             const QString name = downloaded.metadata.value(QStringLiteral("name")).toString();
-            const QString target = QDir(directory).filePath(
-                QUuid::createUuid().toString(QUuid::WithoutBraces).left(8) +
-                QLatin1Char('-') + name);
-            const bool copied = QFile::copy(downloaded.path, target);
+            const QString prefix = retryNamespace.isEmpty()
+                ? QUuid::createUuid().toString(QUuid::WithoutBraces).left(8)
+                : QString::fromLatin1(QCryptographicHash::hash(
+                    (retryNamespace + QLatin1Char(':') + id).toUtf8(),
+                    QCryptographicHash::Sha256).toHex().left(24));
+            const QString target = QDir(directory).filePath(prefix + QLatin1Char('-') + name);
+            bool copied = false;
+            if (!retryNamespace.isEmpty() && QFileInfo::exists(target)) {
+                QFile original(target);
+                QFile retry(downloaded.path);
+                QCryptographicHash originalHash(QCryptographicHash::Sha256);
+                QCryptographicHash retryHash(QCryptographicHash::Sha256);
+                copied = !QFileInfo(target).isSymLink() &&
+                    original.open(QIODevice::ReadOnly) && retry.open(QIODevice::ReadOnly) &&
+                    originalHash.addData(&original) && retryHash.addData(&retry) &&
+                    originalHash.result() == retryHash.result();
+            } else {
+                copied = QFile::copy(downloaded.path, target);
+            }
             QFile::remove(downloaded.path);
             if (!copied) return QPair<QJsonArray, QString>{{},
                 QStringLiteral("无法将会话附件保存到工作目录")};
@@ -798,6 +828,8 @@ void DesktopSessionSyncCoordinator::processBackfillPage() {
 void DesktopSessionSyncCoordinator::publishPage(const QString& sessionId, const QJsonObject& page) {
     const QJsonArray messages = page.value(QStringLiteral("messages")).toArray();
     const QJsonObject state{{QStringLiteral("permissions"), page.value(QStringLiteral("permissions"))},
+                            {QStringLiteral("busy"), page.value(QStringLiteral("busy"))},
+                            {QStringLiteral("turnId"), page.value(QStringLiteral("turnId"))},
                             {QStringLiteral("questions"), page.value(QStringLiteral("questions"))}};
     const QByteArray stateDigest = QCryptographicHash::hash(
         QJsonDocument(state).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256);
@@ -809,6 +841,8 @@ void DesktopSessionSyncCoordinator::publishPage(const QString& sessionId, const 
         requester_(QStringLiteral("session-sync/publish"), "POST",
                    {{QStringLiteral("session_id"), sessionId},
                     {QStringLiteral("messages"), batch},
+                    {QStringLiteral("busy"), page.value(QStringLiteral("busy"))},
+                    {QStringLiteral("turnId"), page.value(QStringLiteral("turnId"))},
                     {QStringLiteral("permissions"), page.value(QStringLiteral("permissions"))},
                     {QStringLiteral("questions"), page.value(QStringLiteral("questions"))}},
                    [guard, key, digest, sessionId, stateDigest](const QJsonObject&, const QString& error) {

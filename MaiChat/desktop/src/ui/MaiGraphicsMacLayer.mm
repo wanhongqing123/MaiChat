@@ -4,6 +4,8 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <QWidget>
+#include <QGuiApplication>
+#include <QDebug>
 
 extern "C" void *maiGraphicsCreateMacLayer(QWidget *widget) {
   widget->setAttribute(Qt::WA_NativeWindow);
@@ -34,7 +36,9 @@ extern "C" void maiGraphicsReleaseMacLayer(void *nativeLayer) {
 }
 
 extern "C" void maiGraphicsStyleMacVideoWindow(QWidget *widget) {
-  if (!widget)
+  // WId is platform-plugin opaque. Only cocoa supplies an NSView pointer;
+  // offscreen uses small integer handles that must never receive ObjC messages.
+  if (!widget || QGuiApplication::platformName() != QStringLiteral("cocoa"))
     return;
   NSView *view = reinterpret_cast<NSView *>(widget->winId());
   NSWindow *window = view.window;
@@ -50,10 +54,18 @@ extern "C" void maiGraphicsShareMacVideo(QWidget *anchor, const char *utf8Path) 
     return;
   NSView *view = reinterpret_cast<NSView *>(anchor->winId());
   NSString *path = [NSString stringWithUTF8String:utf8Path];
+  if (qEnvironmentVariableIntValue("MAICHAT_TRACE_VIDEO_CONTROLS") == 1)
+    qInfo() << "[native-share-anchor]" << "window" << bool(view.window)
+            << "active" << bool(NSApp.active) << "view" << QString::fromUtf8(NSStringFromClass(view.class).UTF8String)
+            << "bounds" << QString::fromUtf8(NSStringFromRect(view.bounds).UTF8String)
+            << "visible" << QString::fromUtf8(NSStringFromRect(view.visibleRect).UTF8String)
+            << "hidden" << bool(view.hiddenOrHasHiddenAncestor);
   if (!view.window || !path)
     return;
   NSURL *url = [NSURL fileURLWithPath:path];
   NSSharingServicePicker *picker = [[NSSharingServicePicker alloc] initWithItems:@[ url ]];
+  if (qEnvironmentVariableIntValue("MAICHAT_TRACE_VIDEO_CONTROLS") == 1)
+    qInfo() << "[native-share-services]" << [NSSharingService sharingServicesForItems:@[url]].count;
   [picker showRelativeToRect:view.bounds ofView:view preferredEdge:NSRectEdgeMinY];
   [picker release];
 }

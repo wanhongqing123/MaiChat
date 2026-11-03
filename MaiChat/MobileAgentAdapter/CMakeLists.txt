@@ -2,6 +2,10 @@
 # 构建边界：只暴露移动宿主所需的 C++ 接口，核心 Agent 仍由 MaiAgent 构建。
 cmake_minimum_required(VERSION 3.22)
 project(MaiChatMobileAgent LANGUAGES C CXX)
+# Apple 宿主、Graphics 和 Metal 同时有 .m/.mm，必须在最高共享目录初始化两种编译规则。
+if(APPLE)
+  enable_language(OBJC OBJCXX)
+endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(MAIAGENT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -126,6 +130,7 @@ set(WITH_TBB OFF CACHE BOOL "" FORCE)
 add_subdirectory("${maichat_opencv_source}" opencv EXCLUDE_FROM_ALL)
 add_library(maichat_portrait STATIC
   ../Portrait/MaiPortraitEngine.cpp
+  ../Portrait/MaiPortraitRegion.cpp
   ../Portrait/MaiPortraitPersonalization.cpp
   ../Portrait/MaiPortraitBridge.cpp)
 target_include_directories(maichat_portrait PUBLIC ../Portrait PRIVATE
@@ -251,6 +256,7 @@ if(TARGET maiagent_graphics)
 endif()
 add_library(maichat_mobile STATIC
   MaiMobileAgent.cpp
+  MaiLocalInference.cpp
   ../SessionSync/MaiSessionSyncSocket.cpp
   ../SessionSync/MaiSessionSyncC.cpp
   ../Media/MaiGraphicsPresenter.cpp
@@ -372,12 +378,36 @@ endif()
 option(MAICHAT_MOBILE_TESTS "Build mobile adapter integration tests" OFF)
 if(MAICHAT_MOBILE_TESTS)
   enable_testing()
+  add_executable(MaiLocalInferenceTests tests/MaiLocalInferenceTests.cpp)
+  target_link_libraries(MaiLocalInferenceTests PRIVATE maichat_mobile maiagent)
+  add_test(NAME MaiLocalInferenceTests COMMAND MaiLocalInferenceTests)
+  # 生命周期测试只替换 runtime 为确定性阻塞器，不与正式 maiagent 同名符号混链。
+  add_executable(MaiLocalInferenceLifecycleTests
+    MaiLocalInference.cpp tests/MaiLocalInferenceLifecycleTests.cpp
+    ../../MaiAgent/Agent/MaiError.cpp ../../MaiAgent/Agent/MaiFilePath.cpp
+    ../../MaiAgent/Agent/MaiBlockingCheck.cpp)
+  if(WIN32)
+    target_sources(MaiLocalInferenceLifecycleTests PRIVATE ../../MaiAgent/Agent/MaiFileSystemWindows.cpp)
+  else()
+    target_sources(MaiLocalInferenceLifecycleTests PRIVATE ../../MaiAgent/Agent/MaiFileSystemPosix.cpp)
+  endif()
+  target_include_directories(MaiLocalInferenceLifecycleTests PRIVATE . ../../MaiAgent/include)
+  find_package(Threads REQUIRED)
+  target_link_libraries(MaiLocalInferenceLifecycleTests PRIVATE Threads::Threads)
+  add_test(NAME MaiLocalInferenceLifecycleTests COMMAND MaiLocalInferenceLifecycleTests)
+  set_tests_properties(MaiLocalInferenceLifecycleTests PROPERTIES TIMEOUT 15)
   add_executable(MaiMobileAgentTests tests/MaiMobileAgentTests.cpp)
   target_include_directories(MaiMobileAgentTests PRIVATE ../../MaiAgent/third_party/httplib ../../MaiAgent/third_party/nlohmann)
   target_link_libraries(MaiMobileAgentTests PRIVATE maichat_mobile maiagent)
   add_test(NAME MaiMobileAgentTests COMMAND MaiMobileAgentTests)
+  add_executable(MaiMobileSteeringTests tests/MaiMobileSteeringTests.cpp)
+  target_include_directories(MaiMobileSteeringTests PRIVATE
+    ../../MaiAgent/third_party/httplib ../../MaiAgent/third_party/nlohmann)
+  target_link_libraries(MaiMobileSteeringTests PRIVATE maichat_mobile maiagent)
+  add_test(NAME MaiMobileSteeringTests COMMAND MaiMobileSteeringTests)
   if(ANDROID)
     target_link_libraries(MaiMobileAgentTests PRIVATE android log jnigraphics)
+    target_link_libraries(MaiMobileSteeringTests PRIVATE android log jnigraphics)
     add_executable(MaiCvVideoAnalysisTests
       ../../MaiAgent/tests/MaiCvVideoAnalysisTests.cpp)
     target_include_directories(MaiCvVideoAnalysisTests PRIVATE

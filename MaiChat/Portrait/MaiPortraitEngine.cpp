@@ -21,6 +21,7 @@
 #endif
 
 #include "MaiFilePath.h"
+#include "MaiPortraitRegion.h"
 
 namespace {
 constexpr float kPi = 3.14159265359f;
@@ -61,6 +62,42 @@ struct Detection {
 float overlap(const cv::Rect2f& first, const cv::Rect2f& second) {
     const float area = (first & second).area();
     return area / std::max(1.0f, first.area() + second.area() - area);
+}
+
+void skinStatistics(const cv::Mat& source, const cv::Mat& edited, const cv::Mat& mask, const cv::Rect& area,
+                    MaiPortraitOutput& result) {
+    for (int top = area.y; top < area.y + area.height; top += 64) {
+        const cv::Rect tile(area.x, top, area.width, std::min(64, area.y + area.height - top));
+        cv::Mat first, second, before, after;
+        cv::cvtColor(source(tile), first, cv::COLOR_RGBA2RGB);
+        cv::cvtColor(edited(tile), second, cv::COLOR_RGBA2RGB);
+        first.convertTo(first, CV_32F, 1.0 / 255);
+        second.convertTo(second, CV_32F, 1.0 / 255);
+        cv::cvtColor(first, before, cv::COLOR_RGB2Lab);
+        cv::cvtColor(second, after, cv::COLOR_RGB2Lab);
+        for (int y = 0; y < tile.height; ++y)
+            for (int x = 0; x < tile.width; ++x) {
+                const double weight = mask.at<unsigned char>(y + tile.y, x + tile.x) / 255.0;
+                if (weight <= 0) continue;
+                ++result.skinPixels;
+                result.skinWeight += weight;
+                const auto firstPixel = before.at<cv::Vec3f>(y, x), secondPixel = after.at<cv::Vec3f>(y, x);
+                result.skinLightness[0] += firstPixel[0] * weight;
+                result.skinLightness[1] += secondPixel[0] * weight;
+                result.skinChroma[0] += std::hypot(firstPixel[1], firstPixel[2]) * weight;
+                result.skinChroma[1] += std::hypot(secondPixel[1], secondPixel[2]) * weight;
+            }
+    }
+    if (result.skinWeight > 0)
+        for (int index = 0; index < 2; ++index) {
+            result.skinLightness[index] /= result.skinWeight;
+            result.skinChroma[index] /= result.skinWeight;
+        }
+    for (int y = 0; y < source.rows; ++y)
+        for (int x = 0; x < source.cols; ++x) {
+            const auto first = source.at<cv::Vec4b>(y, x), second = edited.at<cv::Vec4b>(y, x);
+            if (first[0] != second[0] || first[1] != second[1] || first[2] != second[2]) ++result.changedPixels;
+        }
 }
 }  // namespace
 
@@ -169,7 +206,8 @@ public:
         auto outputs = run("face_landmarks.onnx", input);
         if (outputs.size() < 2 || outputs[0].GetTensorTypeAndShapeInfo().GetElementCount() != 1434 ||
             sigmoid(outputs[1].GetTensorData<float>()[0]) < 0.5f)
-            throw std::runtime_error("Dense face landmarks are not reliable for this image");
+            throw MaiPortraitFailure("face_landmarks_failed",
+                                     "Dense face landmarks are not reliable for the selected region");
         cv::Mat inverse;
         cv::invertAffineTransform(transform, inverse);
         const float* points = outputs[0].GetTensorData<float>();
@@ -282,14 +320,20 @@ MaiPortraitEngine::~MaiPortraitEngine() = default;
 
 MaiPortraitOutput MaiPortraitEngine::apply(const unsigned char* rgba, int width, int height, int stride,
                                            const std::vector<MaiPortraitFaceHint>& faceHints,
-                                           const MaiPortraitParameters& parameters, bool body, int subjectIndex) {
-    if (!rgba || width < 1 || height < 1 || static_cast<int64_t>(width) * height > 12'000'000 ||
-        stride < static_cast<int64_t>(width) * 4)
-        throw std::runtime_error("Invalid portrait pixels or image exceeds 12 megapixels");
+                                           const MaiPortraitParameters& parameters, bool body, int subjectIndex,
+                                           const MaiPortraitRegionContext* context) {
+    if (!rgba || width < 1 || height < 1 || stride < static_cast<int64_t>(width) * 4)
+        throw MaiPortraitFailure("invalid_pixels", "Portrait pixels and row stride must be valid");
+    if (static_cast<int64_t>(width) * height > 12'000'000)
+        throw MaiPortraitFailure("image_too_large",
+                                 "Image exceeds the 12 MP full-raster budget; use a bounded face region");
+    if (context && (body || width > 2048 || height > 2048 || context->plan.region.width != width ||
+                    context->plan.region.height != height))
+        throw MaiPortraitFailure("roi_budget_exceeded", "Region pixels must match the bounded native face region");
     for (int index = 0; index < MaiPortraitParameters::kCount; ++index)
         if (!std::isfinite(parameters.values[index]) || parameters.values[index] > 1 ||
             parameters.values[index] < (index == 2 ? -1 : 0))
-            throw std::runtime_error("Portrait parameters are outside their allowed ranges");
+            throw MaiPortraitFailure("invalid_parameters", "Portrait parameters are outside their allowed ranges");
     cv::Mat source(height, width, CV_8UC4, const_cast<unsigned char*>(rgba), stride);
     cv::Mat destination = source.clone();
     MaiPortraitOutput result;
@@ -307,12 +351,17 @@ MaiPortraitOutput MaiPortraitEngine::apply(const unsigned char* rgba, int width,
                        std::min(2.0f, static_cast<float>(width) / height) * 0.5f,
                        0,
                        body ? 1.0f : 0.0f};
+    if (context) result.features = context->globalFeatures;
     const auto& values = parameters.values;
     if (!body) {
         auto faces = faceHints;
         std::sort(faces.begin(), faces.end(), [](const auto& a, const auto& b) { return a.x < b.x; });
-        result.faceCount = static_cast<int>(faces.size());
-        if (faces.empty()) throw std::runtime_error("No face was detected; choose a clear portrait");
+        result.faceAnalysisPerformed = true;
+        result.faceCount = context ? context->plan.faceCount : static_cast<int>(faces.size());
+        if (faces.empty())
+            throw MaiPortraitFailure(
+                "face_detection_failed",
+                "No reliable face was detected; use automatic tiled detection or choose a clearer portrait");
         if (subjectIndex < 0 && faces.size() > 1)
             throw std::runtime_error(
                 "Multiple faces detected; specify subject_index from left to right, starting at 0");
@@ -321,8 +370,24 @@ MaiPortraitOutput MaiPortraitEngine::apply(const unsigned char* rgba, int width,
             throw std::runtime_error("subject_index does not identify a detected face");
         const auto& face = faces[selected];
         const auto points = mImplementation->mesh(source, face);
-        result.features[6] = std::min(1.0f, face.width * face.height / (width * static_cast<float>(height)));
-        auto mask = mImplementation->skinMask(source);
+        if (!context)
+            result.features[6] = std::min(1.0f, face.width * face.height / (width * static_cast<float>(height)));
+        // 感知模型只看选中脸及上下文，避免大构图中的小脸在整图 256 输入中消失。
+        const auto contextArea = bounded({cvFloor(face.x - face.width * 0.75f), cvFloor(face.y - face.height * 0.75f),
+                                          cvCeil(face.width * 2.5f), cvCeil(face.height * 2.5f)},
+                                         width, height);
+        if (contextArea.empty()) throw MaiPortraitFailure("face_outside_source", "Face is outside the image");
+        cv::Mat mask = cv::Mat::zeros(height, width, CV_8U);
+        mImplementation->skinMask(source(contextArea)).copyTo(mask(contextArea));
+        // 外轮廓也需要软边；不能让矩形 ROI 的边界成为贴回原图时的可见接缝。
+        cv::Mat oval = cv::Mat::zeros(height, width, CV_8U);
+        std::vector<cv::Point> faceOval;
+        for (int index : {10,  338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377,
+                          152, 148, 176, 149, 150, 136, 172, 58,  132, 93,  234, 127, 162, 21,  54,  103, 67,  109})
+            faceOval.emplace_back(cvRound(points[index].x), cvRound(points[index].y));
+        cv::fillConvexPoly(oval, faceOval, cv::Scalar(255));
+        cv::GaussianBlur(oval, oval, {0, 0}, std::clamp(face.width * 0.015f, 1.0f, 12.0f));
+        cv::multiply(mask, oval, mask, 1.0 / 255.0);
         // 眼、眉、唇区域即使被低分辨率皮肤分类覆盖，也不能进入平滑／调色。
         for (const auto& indices : std::vector<std::vector<int>>{{33, 160, 158, 133, 153, 144},
                                                                  {362, 385, 387, 263, 373, 380},
@@ -338,6 +403,26 @@ MaiPortraitOutput MaiPortraitEngine::apply(const unsigned char* rgba, int width,
                                    cvCeil(face.width * 1.3f), cvCeil(face.height * 1.3f)},
                                   width, height);
         if (area.empty()) throw std::runtime_error("Face is outside the image");
+        result.processingRegion = {area.x, area.y, area.width, area.height};
+        const float feather = std::clamp(face.width * 0.025f, 2.0f, 16.0f);
+        for (int y = 0; y < mask.rows; ++y)
+            for (int x = 0; x < mask.cols; ++x) {
+                auto& value = mask.at<unsigned char>(y, x);
+                if (!area.contains(cv::Point(x, y))) {
+                    value = 0;
+                    continue;
+                }
+                const float edge = std::min({static_cast<float>(x - area.x), static_cast<float>(y - area.y),
+                                             static_cast<float>(area.x + area.width - 1 - x),
+                                             static_cast<float>(area.y + area.height - 1 - y)});
+                value = cv::saturate_cast<unsigned char>(value * smooth(edge / feather));
+            }
+        const bool colorRequested =
+            values[0] != 0 || values[1] != 0 || values[2] != 0 || values[MaiPortraitParameters::kWhiteningIndex] != 0;
+        if (colorRequested && cv::countNonZero(mask) == 0)
+            throw MaiPortraitFailure(
+                "skin_mask_empty",
+                "A face was found but skin segmentation was not reliable; no retouched result was created");
         cv::Mat faceRgb, reduced, filtered, resized;
         cv::cvtColor(source(area), faceRgb, cv::COLOR_RGBA2RGB);
         const double factor = std::min(1.0, 640.0 / std::max(area.width, area.height));
@@ -413,7 +498,14 @@ MaiPortraitOutput MaiPortraitEngine::apply(const unsigned char* rgba, int width,
                    face.width * 0.64f, face.height * 0.55f, values[3], false);
         warpRegion((points[33] + points[133]) * 0.5f, face.width * 0.16f, face.width * 0.12f, values[4], true);
         warpRegion((points[362] + points[263]) * 0.5f, face.width * 0.16f, face.width * 0.12f, values[4], true);
+        skinStatistics(source, destination, mask, area, result);
+        if (colorRequested && result.changedPixels == 0 && values[3] == 0 && values[4] == 0)
+            throw MaiPortraitFailure("no_visible_effect",
+                                     "The requested edit produced no byte-level RGB change; inspect the skin mask "
+                                     "instead of retrying stronger values blindly");
+        result.skinMask.assign(mask.datastart, mask.dataend);
     } else {
+        result.personAnalysisPerformed = true;
         auto people = mImplementation->detectPeople(source);
         result.personCount = static_cast<int>(people.size());
         if (people.empty()) throw std::runtime_error("No person was detected");

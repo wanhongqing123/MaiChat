@@ -7,7 +7,7 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     MARKETING_VERSION: "2.2.4"
-    CURRENT_PROJECT_VERSION: "172"
+    CURRENT_PROJECT_VERSION: "177"
 targets:
   MaiChat:
     type: application
@@ -34,6 +34,7 @@ targets:
           $(DERIVED_FILE_DIR)/MobileAgentAdapter-$(PLATFORM_NAME)-graphics/libmaichat_ffplay_hosted.dylib
           -lc++ -liconv -lz -framework Security -framework CoreFoundation
           -framework CFNetwork -framework SystemConfiguration
+          -framework Foundation -framework Metal -framework MetalKit -framework Accelerate
         ENABLE_USER_SCRIPT_SANDBOXING: NO
   MaiChatCore:
     type: framework

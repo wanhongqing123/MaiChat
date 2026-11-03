@@ -7,6 +7,8 @@ import UIKit
 final class AIAssistantModelUITestSupport {
     var sessionSwitchEnabled = false
     var screenFrameAccountID: String?
+    // Isolated composer fixtures confirm routing without contacting a model.
+    var steeringHandler: ((AISteeringRequest) async throws -> String)?
 }
 
 enum AIAssistantUITestMutation {
@@ -25,6 +27,22 @@ extension AIAssistantModel {
 
 #if targetEnvironment(simulator)
 extension AIAssistantModel {
+    func installSteeringUITestFixture(
+        handler: @escaping (AISteeringRequest) async throws -> String
+    ) {
+        uiTestSupport.sessionSwitchEnabled = true
+        uiTestSupport.steeringHandler = handler
+        uiTestSupport.screenFrameAccountID = "steering-fixture-owner"
+        sessions = [AISession(id: "switch-A", title: "正在整理素材", busy: true,
+                              turnId: "msg_fixture_turn_A"),
+                    AISession(id: "switch-B", title: "另一个对话", busy: false)]
+        selected = "switch-A"
+        messages = sessionSwitchUITestMessages("A")
+        configured = true
+        ready = true
+        historyLoaded = true
+    }
+
     func installScreenFrameUITestWorkspace(_ path: String, accountID: String) {
         guard ProcessInfo.processInfo.arguments.contains("--ai-screen-frames-ui-test") else { return }
         applyUITestMutation(.workspace(path))

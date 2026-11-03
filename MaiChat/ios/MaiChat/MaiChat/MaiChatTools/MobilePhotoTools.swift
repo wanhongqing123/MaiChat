@@ -2,6 +2,7 @@
 // 处理系统相册浏览、导入和保存照片／视频。
 // 相册变更在 Photos 自有队列执行，主线程只接收完成结果。
 import Foundation
+import Combine
 import AVFoundation
 import CoreFoundation
 import Darwin
@@ -363,7 +364,14 @@ extension AIMobileHostToolProvider {
         }
         let workspace = URL(fileURLWithPath: workspacePath, isDirectory: true)
             .resolvingSymlinksInPath().standardizedFileURL
-        let portrait = ["beautify", "reshape_body"].contains(Self.string(arguments, key: "operation"))
+        if Self.string(arguments, key: "operation") == "beautify" {
+            return await beautifyImage(arguments, encoded: operation, source: source, workspace: workspace)
+        }
+        let portrait = Self.string(arguments, key: "operation") == "reshape_body"
+        if portrait, let invalid = operation.withCString({ maiPortraitValidateArguments("reshape_body", $0, 1) }) {
+            defer { maiPortraitFree(invalid) }
+            return .failure(code: "invalid_input", message: String(cString: invalid))
+        }
         let profileDirectory = workspace.deletingLastPathComponent()
             .appendingPathComponent("PortraitPreferences", isDirectory: true).path
         do {
@@ -394,7 +402,10 @@ extension AIMobileHostToolProvider {
                 let extent = image.extent.integral
                 let width = Int(extent.width), height = Int(extent.height)
                 guard width > 0, height > 0, Int64(width) * Int64(height) <= 12_000_000 else {
-                    throw AIBackendError(message: "图片不能超过 1200 万像素")
+                    throw MaiPortraitHostFailure("image_too_large", stage: "budget",
+                        message: "Body or full-raster image exceeds 12 MP",
+                        hint: "Face beautification automatically uses bounded native regions; body reshaping currently requires at most 12 MP",
+                        width: width, height: height)
                 }
                 var pixels = Data(count: width * height * 4)
                 let context = CIContext()
@@ -407,33 +418,6 @@ extension AIMobileHostToolProvider {
                 if portrait {
                     var specification = try JSONSerialization.jsonObject(with: Data(operation.utf8)) as! [String: Any]
                     specification["_face_hints"] = []
-                    if specification["operation"] as? String == "beautify" {
-                        let request = VNDetectFaceLandmarksRequest()
-                        #if targetEnvironment(simulator)
-                        // 模拟器没有设备上的 Vision 加速上下文，定位使用 CPU 版本。
-                        request.usesCPUOnly = true
-                        request.revision = VNDetectFaceLandmarksRequestRevision2
-                        #endif
-                        try VNImageRequestHandler(ciImage: image, options: [:]).perform([request])
-                        specification["_face_hints"] = (request.results ?? []).map { face -> [String: Any] in
-                            let box = face.boundingBox
-                            func point(_ region: VNFaceLandmarkRegion2D?) -> [String: Double]? {
-                                guard let points = region?.normalizedPoints, !points.isEmpty else { return nil }
-                                let x = points.reduce(CGFloat.zero) { $0 + $1.x } / CGFloat(points.count)
-                                let y = points.reduce(CGFloat.zero) { $0 + $1.y } / CGFloat(points.count)
-                                return ["x": Double((box.minX + x * box.width) * CGFloat(width)),
-                                        "y": Double((1 - box.minY - y * box.height) * CGFloat(height))]
-                            }
-                            var landmarks: [String: Any] = [:]
-                            landmarks["left_eye"] = point(face.landmarks?.leftEye)
-                            landmarks["right_eye"] = point(face.landmarks?.rightEye)
-                            return ["box": ["x": Double(box.minX * CGFloat(width)),
-                                            "y": Double((1 - box.maxY) * CGFloat(height)),
-                                            "width": Double(box.width * CGFloat(width)),
-                                            "height": Double(box.height * CGFloat(height))],
-                                    "landmarks": landmarks]
-                        }
-                    }
                     operationToRun = String(data: try JSONSerialization.data(withJSONObject: specification), encoding: .utf8)!
                 }
                 var portraitMetadata: String?
@@ -516,8 +500,48 @@ extension AIMobileHostToolProvider {
                 }
             }
             return Self.jsonSuccess(response)
+        } catch let error as MaiPortraitHostFailure {
+            return .failure(code: "invalid_input", message: error.detail)
         } catch {
             return .failure(code: "internal", message: error.localizedDescription)
+        }
+    }
+
+    /// 普通服务完成有界处理后，在 MainActor 上再次核对账号域，再发布产物和训练记录。
+    /// 工作区切换会永久取消这一请求，即使之后又切回原账号，也不能继续旧请求。
+    private func beautifyImage(_ arguments: [String: Any], encoded: String,
+                              source: URL, workspace: URL) async -> AIMaiChatHostToolExecution {
+        let model = AIAssistantModel.shared
+        let workspacePath = model.workspacePath
+        if let expected = arguments["workspace_path"] as? String, expected != workspacePath {
+            return .failure(code: "canceled", message: "Account workspace changed before portrait processing")
+        }
+        let cancellation = MaiPortraitCancellation()
+        let observation = model.$workspacePath.dropFirst().sink { value in
+            if value != workspacePath { cancellation.cancel() }
+        }
+        defer { observation.cancel() }
+        let profile = workspace.deletingLastPathComponent().appendingPathComponent("PortraitPreferences", isDirectory: true).path
+        let allowedRoot = URL(fileURLWithPath: AIAssistantPathPolicy.appRoot(workspacePath: workspacePath), isDirectory: true)
+        do {
+            let prepared = try await withTaskCancellationHandler {
+                try await Task.detached(priority: .userInitiated) {
+                    try MaiPortraitPhotoProcessor.prepare(arguments: encoded, sourceURL: source,
+                        workspace: workspace, allowedRoot: allowedRoot, profile: profile, cancellation: cancellation)
+                }.value
+            } onCancel: { cancellation.cancel() }
+            guard model === AIAssistantModel.shared, model.workspacePath == workspacePath else {
+                cancellation.cancel()
+                throw CancellationError()
+            }
+            // 这段不能跨 await；否则校验之后账号仍可能改变，导致旧请求登记新账号。
+            return Self.jsonSuccess(try MaiPortraitPhotoProcessor.publish(prepared, cancellation: cancellation))
+        } catch is CancellationError {
+            return .failure(code: "canceled", message: "Portrait processing was canceled; no output was committed")
+        } catch let error as MaiPortraitHostFailure {
+            return .failure(code: "invalid_input", message: error.detail)
+        } catch {
+            return .failure(code: "internal", message: "Portrait processing failed; no output was committed")
         }
     }
 
