@@ -1568,13 +1568,21 @@ public final class TencentIMClient {
         String messageId = clean(message.getMsgID());
         if (messageId.isEmpty()) messageId = mediaId;
         String fileName = safeFileName(elem.getFileName(), "remote-im-file.bin");
+        // Diagnostic replies are metadata-only and have a separate 2 MiB
+        // protocol limit. Every other attachment keeps the existing file cap.
+        long maximumBytes = MaiRemoteDiagnosticsProtocol.attachmentLimit(fileName,
+            MaiChatAttachmentDownload.MAX_FILE_BYTES);
+        if (maximumBytes == MaiRemoteDiagnosticsProtocol.MAX_BYTES && elem.getFileSize() > maximumBytes) {
+            Log.w(TAG, "Diagnostic attachment exceeds the protocol size limit");
+            return;
+        }
         File target = mediaFile(RemoteIMMediaPaths.FILES, mediaId, extension(fileName, "bin"));
         String finalMessageId = messageId;
         MaiChatAttachmentDownload.Scope scope = mediaScope;
         elem.getUrl(new V2TIMValueCallback<String>() {
             @Override public void onSuccess(String url) {
                 if (!isCurrentDownload(recipientUserId, scope)) return;
-                downloadMedia(url, target, MaiChatAttachmentDownload.MAX_FILE_BYTES,
+                downloadMedia(url, target, maximumBytes,
                     recipientUserId, scope, result -> {
                         if (!result.ok()) {
                             logMediaFailure("file", result);

@@ -36,6 +36,7 @@ import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.InsetDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.media.MediaScannerConnection;
 import android.media.projection.MediaProjectionManager;
@@ -211,6 +212,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private boolean pendingStateRefresh;
     private GrowingMessageEditText messageInput;
     private View attachmentButton;
+    private View imAttachmentPanel;
+    private boolean imAttachmentPanelRequested;
     private TextView sendButton;
     private final Map<String, String> draftsByPeer = new HashMap<>();
     private String displayedOwner = "";
@@ -234,6 +237,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private String messageSearchTargetId;
     private boolean stickToLatestMessage = true;
     private ChatMessageList currentMessageList;
+    private ImageButton chatRemoteButton;
+    private ProgressBar chatRemoteProgress;
     private String renderedChatUserId;
     private View chatEmptyState;
     private View chatComposer;
@@ -490,6 +495,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     public void onBackPressed() {
         if (videoDialog != null) {
             videoDialog.dismiss();
+            return;
+        }
+        if (imAttachmentPanelRequested) {
+            closeIMAttachmentPanel();
             return;
         }
         if (socialBindingVisible) {
@@ -886,6 +895,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         boolean canSend = !voiceMode && !draftText.trim().isEmpty();
         sendButton.setVisibility(canSend ? View.VISIBLE : View.GONE);
         attachmentButton.setVisibility(canSend ? View.GONE : View.VISIBLE);
+        if (canSend) closeIMAttachmentPanel();
     }
 
     private boolean useLandscapeImLayout() {
@@ -981,6 +991,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             && currentMessageList != null && !showInitialLogin && !session.requiresLogin()) {
             // 同一会话的消息更新保留原列表实例、滚动位置和输入草稿。
             refreshChatMessages();
+            updateChatRemoteAction();
             if (landscapeIm && currentConversationRows != null) {
                 long fingerprint = conversationFingerprint();
                 if (fingerprint != renderedConversationFingerprint) {
@@ -1044,6 +1055,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         // 只有页面身份真的改变才重建导航容器；不能把每条新消息都当作换页。
         closeSettingsSubpages();
         currentMessageList = null;
+        chatRemoteButton = null;
+        chatRemoteProgress = null;
         renderedPrimaryTab = null;
         renderedTabBar = null;
         conversationScroll = null;
@@ -1055,6 +1068,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         groupRows = null; groupScroll = null; groupDraftInput = null;
         renderedGroupId = null;
         messageInput = null;
+        imAttachmentPanel = null;
+        imAttachmentPanelRequested = false;
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(MaiChatTheme.PAGE);
@@ -1111,6 +1126,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             }
             if (keyboardVisible != visible) navigation.post(this::updateLandscapeConversationLayout);
             keyboardVisible = visible;
+            updateIMAttachmentPanelVisibility();
             if (!imeAnimating) applyChatInsets(navigation, insets);
             return insets;
         });
@@ -1139,6 +1155,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                         imeAnimating = false;
                         if (latestInsets != null)
                             applyChatInsets(navigation, latestInsets);
+                        updateIMAttachmentPanelVisibility();
                         if (currentMessageList != null)
                             currentMessageList.endKeyboardReveal();
                     }
@@ -2683,11 +2700,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         title.setEllipsize(TextUtils.TruncateAt.MIDDLE);
         header.addView(title, new LinearLayout.LayoutParams(0, dp(42), 1));
 
-        // 与创作中心及 iOS 标题操作使用同一矢量尺寸，避免手绘缩放令图标过小。
-        View remote = composerIcon(R.drawable.ic_nav_remote, MaiChatTheme.BLUE);
-        remote.setBackground(MaiChatTheme.rounded(MaiChatTheme.GROUPED_PAGE, 12, this));
-        remote.setContentDescription("查看远程桌面");
+        String identity = session.passwordChangeIdentity();
+        FrameLayout remoteAction = new FrameLayout(this);
+        ImageButton remote = chatHeaderAction(R.drawable.ic_nav_remote, "查看远程桌面");
+        chatRemoteButton = remote;
         remote.setOnClickListener(view -> {
+            if (!contact.userId().equals(activeChatUserId)
+                || !identity.equals(session.passwordChangeIdentity())) return;
             RemoteDesktopController controller = session.remoteDesktop();
             if (!controller.isActive()) {
                 if (session.currentSdkAppId() <= 0 || session.currentUserSig().isEmpty()) {
@@ -2698,12 +2717,79 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                 controller.requestView(contact.userId(), session.settings().loginUserId(),
                     session.currentSdkAppId(), session.currentUserSig());
             }
+            rememberDraft();
+            hideKeyboard();
             activeChatUserId = null;
             activeTab = RemoteIMTab.REMOTE;
             render();
         });
-        header.addView(remote, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        remoteAction.addView(remote, new FrameLayout.LayoutParams(-1, -1));
+        chatRemoteProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
+        chatRemoteProgress.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        remoteAction.addView(chatRemoteProgress, new FrameLayout.LayoutParams(dp(14), dp(14), Gravity.TOP | Gravity.END));
+        header.addView(remoteAction, new LinearLayout.LayoutParams(dp(44), dp(42)));
+        ImageButton more = chatHeaderAction(R.drawable.ic_ai_more, "更多聊天操作");
+        // iOS 的省略号为独立蓝色文字图标，只有显示器按钮保留浅色底。
+        more.setImageTintList(ColorStateList.valueOf(MaiChatTheme.BLUE));
+        more.setBackground(new RippleDrawable(ColorStateList.valueOf(Color.argb(25, 0, 142, 224)),
+            null, MaiChatTheme.rounded(Color.WHITE, 8, this)));
+        more.setOnClickListener(view -> {
+            if (!contact.userId().equals(activeChatUserId)
+                || !identity.equals(session.passwordChangeIdentity())) return;
+            hideKeyboard();
+            android.widget.PopupMenu menu = new android.widget.PopupMenu(this, more);
+            menu.getMenu().add("远程排障");
+            menu.setOnMenuItemClickListener(item -> {
+                if (!contact.userId().equals(activeChatUserId)
+                    || !identity.equals(session.passwordChangeIdentity())) return true;
+                // 与 iOS 同路由：这里只打开确认表单，收集和发送由排障模块显式确认后执行。
+                new MaiRemoteDiagnosticsDialog(this, session, contact).show();
+                return true;
+            });
+            menu.show();
+        });
+        LinearLayout.LayoutParams moreParams = new LinearLayout.LayoutParams(dp(44), dp(42));
+        moreParams.leftMargin = dp(4);
+        header.addView(more, moreParams);
+        updateChatRemoteAction();
         return header;
+    }
+
+    private ImageButton chatHeaderAction(int icon, String description) {
+        ImageButton button = new ImageButton(this);
+        button.setImageResource(icon);
+        button.setImageTintList(ColorStateList.valueOf(MaiChatTheme.SECONDARY));
+        button.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        button.setPadding(dp(10), dp(9), dp(10), dp(9));
+        button.setContentDescription(description);
+        // 44×42dp 点击区内保留 iOS 的 36×34dp、8dp 圆角浅底。
+        button.setBackground(new InsetDrawable(MaiChatTheme.rounded(MaiChatTheme.GROUPED_PAGE,
+            8, this), dp(4), dp(4), dp(4), dp(4)));
+        return button;
+    }
+
+    private void updateChatRemoteAction() {
+        if (chatRemoteButton == null || chatRemoteProgress == null) return;
+        RemoteDesktopController controller = session.remoteDesktop();
+        boolean connecting = controller.state() == RemoteDesktopController.State.INVITING
+            || controller.state() == RemoteDesktopController.State.CONNECTING;
+        boolean viewing = controller.state() == RemoteDesktopController.State.VIEWING;
+        boolean enabled = controller.isActive() || (session.connectionState() == TencentIMClient.ConnectionState.CONNECTED
+            && session.currentSdkAppId() > 0 && !session.currentUserSig().isEmpty());
+        int color = connecting ? Color.rgb(245, 158, 11)
+            : enabled ? MaiChatTheme.BLUE : MaiChatTheme.SECONDARY;
+        int background = connecting ? Color.rgb(255, 245, 225)
+            : viewing ? MaiChatTheme.BLUE_SOFT : MaiChatTheme.GROUPED_PAGE;
+        chatRemoteButton.setImageTintList(ColorStateList.valueOf(color));
+        chatRemoteButton.setImageAlpha(255);
+        chatRemoteButton.setContentDescription(connecting ? "查看远程连接进度"
+            : viewing ? "进入远程桌面" : "远程控制");
+        chatRemoteButton.setBackground(new InsetDrawable(MaiChatTheme.rounded(background,
+            8, this), dp(4), dp(4), dp(4), dp(4)));
+        chatRemoteButton.setEnabled(enabled);
+        chatRemoteButton.setAlpha(enabled ? 1f : 0.45f);
+        chatRemoteProgress.setIndeterminateTintList(ColorStateList.valueOf(color));
+        chatRemoteProgress.setVisibility(connecting ? View.VISIBLE : View.GONE);
     }
 
     // 按消息类型拼装同一气泡内的正文、媒体与审批状态；附件缺失时仍保留消息外壳。
@@ -3019,8 +3105,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     // 页面状态变化和用户操作在这里衔接；退出或失败时维持已显示内容。
     private View composer() {
         LinearLayout wrapper = new LinearLayout(this);
+        imAttachmentPanelRequested = false;
         wrapper.setOrientation(LinearLayout.VERTICAL);
         wrapper.setPadding(dp(16), dp(9), dp(16), dp(10));
+        wrapper.setClipToPadding(false);
         wrapper.setBackgroundColor(Color.WHITE);
 
         if (pendingQuote != null) {
@@ -3061,18 +3149,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             this
         ));
         voiceToggle.setContentDescription(voiceMode ? "切换键盘" : "切换语音");
-        voiceToggle.setOnClickListener(view -> {
-            voiceMode = !voiceMode;
-            if (!voiceMode) allowKeyboardLocation = true;
-            session.stopHumanTyping();
-            if (voiceMode) hideKeyboard();
-            render();
-            if (!voiceMode && messageInput != null) {
-                messageInput.requestFocus();
-                ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
-                        .showSoftInput(messageInput, InputMethodManager.SHOW_IMPLICIT);
-            }
-        });
+        voiceToggle.setOnClickListener(view -> setIMVoiceMode(!voiceMode));
         bar.addView(voiceToggle, new LinearLayout.LayoutParams(dp(44), dp(44)));
 
         if (voiceMode) {
@@ -3098,7 +3175,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             GrowingMessageEditText editor = messageInput;
             // 空框长按与 iOS 一样进入实时转写；有草稿时仍由系统处理选择、复制和粘贴。
             ComposerVoiceInput.attach(editor, new ComposerVoiceInput.Listener() {
-                @Override public void touched() { allowKeyboardLocation = true; }
+                @Override public void touched() {
+                    if (messageInput == editor) closeIMAttachmentPanel();
+                    allowKeyboardLocation = true;
+                }
                 @Override public boolean start(float rawX, float rawY) {
                     if (messageInput != editor) return false;
                     if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -3137,6 +3217,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                 return false;
             });
             messageInput.setOnFocusChangeListener((view, focused) -> {
+                if (focused && messageInput == editor) closeIMAttachmentPanel();
                 if (!focused && messageInput == editor)
                     session.stopHumanTyping();
             });
@@ -3163,7 +3244,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         View plus = composerIcon(R.drawable.ic_ai_add, MaiChatTheme.TEXT);
         plus.setBackground(MaiChatTheme.bordered(MaiChatTheme.GROUPED_PAGE,
             MaiChatTheme.BORDER, 22, this));
-        plus.setContentDescription("添加图片或文件");
+        plus.setContentDescription("添加附件");
         plus.setOnClickListener(this::showAttachmentMenu);
         attachmentButton = plus;
         FrameLayout action = new FrameLayout(this);
@@ -3177,7 +3258,41 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         bar.addView(action, new LinearLayout.LayoutParams(dp(44), dp(44)));
         updateComposerActions();
         wrapper.addView(bar, matchWrap());
+        String attachmentPeer = activeChatUserId;
+        String attachmentIdentity = session.passwordChangeIdentity();
+        imAttachmentPanel = MaiIMAttachmentPanel.create(this, selected -> {
+            if (chatComposer != wrapper || !java.util.Objects.equals(attachmentPeer, activeChatUserId)
+                || !attachmentIdentity.equals(session.passwordChangeIdentity())) return;
+            closeIMAttachmentPanel();
+            switch (selected) {
+                case ALBUM: openImagePicker(); break;
+                case CAMERA: requestCamera(); break;
+                case FILE: openFilePicker(); break;
+                case VOICE_INPUT: setIMVoiceMode(true); break;
+                case AI_REPLY: requestAiReplySuggestions(); break;
+            }
+        });
+        imAttachmentPanel.setVisibility(View.GONE);
+        LinearLayout.LayoutParams panelParams = matchWrap();
+        panelParams.setMargins(-dp(16), dp(10), -dp(16), -dp(10));
+        wrapper.addView(imAttachmentPanel, panelParams);
         return wrapper;
+    }
+
+    private void setIMVoiceMode(boolean enabled) {
+        closeIMAttachmentPanel();
+        cancelVoiceRecording();
+        rememberDraft();
+        voiceMode = enabled;
+        session.stopHumanTyping();
+        if (voiceMode) hideKeyboard();
+        else allowKeyboardLocation = true;
+        render();
+        if (!voiceMode && messageInput != null) {
+            messageInput.requestFocus();
+            ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
+                .showSoftInput(messageInput, InputMethodManager.SHOW_IMPLICIT);
+        }
     }
 
     private void renderAiReplySuggestions(LinearLayout container) {
@@ -3317,6 +3432,13 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         rows.setOrientation(LinearLayout.VERTICAL);
         rows.setPadding(dp(16), dp(8), dp(16), dp(16));
         content.addView(contactToolbar(rows), match(dp(54)));
+        LinearLayout requests = new LinearLayout(this);
+        requests.setOrientation(LinearLayout.VERTICAL);
+        requests.setVisibility(View.GONE);
+        rows.addView(requests, matchWrap());
+        LinearLayout friends = new LinearLayout(this);
+        friends.setOrientation(LinearLayout.VERTICAL);
+        rows.addView(friends, matchWrap());
         ScrollView scroll = new ScrollView(this);
         scroll.addView(rows, matchWrap());
         content.addView(scroll, new LinearLayout.LayoutParams(
@@ -3325,7 +3447,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             1
         ));
 
-        renderContactRows(rows);
+        renderContactRows(friends);
+        String identity = session.passwordChangeIdentity();
+        // 与 iOS 相同：申请只在列表顶部按需出现，不再占据标题栏；折叠好友分组不清空申请。
+        requests.post(() -> refreshContactRequests(requests, identity));
     }
 
     private void renderContactRows(LinearLayout rows) {
@@ -3379,10 +3504,6 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         toolbar.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         toolbar.setPadding(dp(12), dp(4), dp(12), dp(4));
         toolbar.setBackgroundColor(Color.WHITE);
-        TextView requests = iconButton("申请", 15, MaiChatTheme.BLUE_DARK);
-        requests.setContentDescription("查看好友申请");
-        requests.setOnClickListener(view -> showFriendRequestsDialog());
-        toolbar.addView(requests, new LinearLayout.LayoutParams(dp(52), dp(42)));
         TextView plus = iconButton("＋", 24, MaiChatTheme.BLUE_DARK);
         plus.setContentDescription("添加好友");
         plus.setOnClickListener(view -> showAddContactDialog());
@@ -3754,52 +3875,68 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         } catch (Exception failure) { toast("无法生成好友二维码"); }
     }
 
-    private void showFriendRequestsDialog() {
+    private boolean isContactRequestPageCurrent(LinearLayout list, String identity) {
+        return !destroyed && activeTab == RemoteIMTab.CONTACTS && activeChatUserId == null
+            && activeGroupId == null && activeFriendProfileUserId == null && list.isAttachedToWindow()
+            && !identity.isEmpty() && identity.equals(session.passwordChangeIdentity());
+    }
+
+    private void refreshContactRequests(LinearLayout list, String identity) {
+        if (!isContactRequestPageCurrent(list, identity)) return;
         session.friendRequests((requests, error) -> {
-            if (destroyed) return;
+            // 离页、页面重建、切号或同号重登后，旧读取不能把申请安装到新页面。
+            if (!isContactRequestPageCurrent(list, identity)) return;
             if (error != null) { toast(error); return; }
-            if (requests.isEmpty()) {
-                new AlertDialog.Builder(this).setTitle("好友申请")
-                    .setMessage("暂无待处理的好友申请")
-                    .setPositiveButton("完成", null).show();
-                return;
-            }
-            ScrollView scroll = new ScrollView(this);
-            LinearLayout list = new LinearLayout(this);
-            list.setOrientation(LinearLayout.VERTICAL);
-            list.setPadding(dp(18), dp(8), dp(18), dp(8));
-            scroll.addView(list);
-            AlertDialog dialog = new AlertDialog.Builder(this).setTitle("好友申请")
-                .setView(scroll).setNegativeButton("关闭", null).create();
+            list.removeAllViews();
+            list.setVisibility(requests.isEmpty() ? View.GONE : View.VISIBLE);
+            if (requests.isEmpty()) return;
+            TextView heading = MaiChatTheme.text(this, "好友申请", 13, MaiChatTheme.SECONDARY);
+            heading.setPadding(0, dp(8), 0, dp(4));
+            list.addView(heading, matchWrap());
             for (RemoteIMFriendRequest request : requests) {
                 LinearLayout row = new LinearLayout(this);
-                row.setOrientation(LinearLayout.VERTICAL);
-                row.setPadding(0, dp(8), 0, dp(12));
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(0, dp(10), 0, dp(10));
                 list.addView(row, matchWrap());
-                row.addView(MaiChatTheme.label(this, request.displayName, 16, MaiChatTheme.TEXT));
-                row.addView(MaiChatTheme.text(this,
+                row.addView(avatar(new RemoteIMContact(request.userId, request.displayName,
+                    request.avatarUrl), false, 38), new LinearLayout.LayoutParams(dp(38), dp(38)));
+                LinearLayout labels = new LinearLayout(this);
+                labels.setOrientation(LinearLayout.VERTICAL);
+                TextView name = MaiChatTheme.label(this, request.displayName, 15, MaiChatTheme.TEXT);
+                name.setSingleLine(true);
+                name.setEllipsize(TextUtils.TruncateAt.END);
+                labels.addView(name, matchWrap());
+                TextView message = MaiChatTheme.text(this,
                     request.message == null || request.message.isEmpty()
-                        ? "请求添加你为好友" : request.message, 13, MaiChatTheme.SECONDARY));
-                LinearLayout actions = new LinearLayout(this);
-                actions.setGravity(Gravity.END);
-                row.addView(actions, match(dp(44)));
+                        ? "请求添加你为好友" : request.message, 12, MaiChatTheme.SECONDARY);
+                message.setMaxLines(2);
+                labels.addView(message, matchWrap());
+                LinearLayout.LayoutParams labelParams = new LinearLayout.LayoutParams(0, -2, 1);
+                labelParams.setMargins(dp(12), 0, dp(8), 0);
+                row.addView(labels, labelParams);
                 Button refuse = secondaryButton("拒绝");
                 Button accept = primaryButton("同意");
-                actions.addView(refuse, new LinearLayout.LayoutParams(dp(76), dp(38)));
-                LinearLayout.LayoutParams acceptParams =
-                    new LinearLayout.LayoutParams(dp(76), dp(38));
-                acceptParams.setMargins(dp(8), 0, 0, 0);
-                actions.addView(accept, acceptParams);
-                refuse.setOnClickListener(view -> session.decideFriendRequest(
-                    request.userId, false, done -> {
-                        if (done) { dialog.dismiss(); showFriendRequestsDialog(); }
-                    }));
-                accept.setOnClickListener(view -> session.decideFriendRequest(
-                    request.userId, true, done -> {
-                        if (done) { dialog.dismiss(); showFriendRequestsDialog(); }
-                    }));
+                row.addView(accept, new LinearLayout.LayoutParams(dp(64), dp(38)));
+                LinearLayout.LayoutParams refuseParams = new LinearLayout.LayoutParams(dp(64), dp(38));
+                refuseParams.leftMargin = dp(8);
+                row.addView(refuse, refuseParams);
+                refuse.setOnClickListener(view -> decideContactRequest(list, identity,
+                    request.userId, false, accept, refuse));
+                accept.setOnClickListener(view -> decideContactRequest(list, identity,
+                    request.userId, true, accept, refuse));
             }
-            dialog.show();
+        });
+    }
+
+    private void decideContactRequest(LinearLayout list, String identity, String userId,
+                                      boolean accepted, Button accept, Button refuse) {
+        if (!isContactRequestPageCurrent(list, identity)) return;
+        accept.setEnabled(false);
+        refuse.setEnabled(false);
+        session.decideFriendRequest(userId, accepted, done -> {
+            if (!isContactRequestPageCurrent(list, identity)) return;
+            if (done) refreshContactRequests(list, identity);
+            else { accept.setEnabled(true); refuse.setEnabled(true); }
         });
     }
 
@@ -5062,32 +5199,25 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     private void showAttachmentMenu(View anchor) {
+        if (anchor != attachmentButton || imAttachmentPanel == null || activeChatUserId == null) return;
+        if (imAttachmentPanelRequested) { closeIMAttachmentPanel(); return; }
+        cancelVoiceRecording();
         allowKeyboardLocation = false;
-        LinearLayout menu = new LinearLayout(this);
-        menu.setOrientation(LinearLayout.VERTICAL);
-        menu.setPadding(dp(8), dp(8), dp(8), dp(8));
-        menu.setBackground(MaiChatTheme.bordered(Color.WHITE, MaiChatTheme.BORDER, 11, this));
-        PopupWindow popup = new PopupWindow(menu, dp(190), ViewGroup.LayoutParams.WRAP_CONTENT, true);
-        addPopupAction(menu, "▣  拍照发送", () -> {
-            popup.dismiss();
-            requestCamera();
-        });
-        addPopupAction(menu, "▧  从相册选择", () -> {
-            popup.dismiss();
-            openImagePicker();
-        });
-        addPopupAction(menu, "□  发送文件", () -> {
-            popup.dismiss();
-            openFilePicker();
-        });
-        addPopupAction(menu, "✨  AI 帮我回复", () -> {
-            popup.dismiss();
-            requestAiReplySuggestions();
-        });
-        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-        popup.setElevation(dp(10));
-        popup.setOutsideTouchable(true);
-        popup.showAsDropDown(anchor, -dp(146), -dp(216));
+        hideKeyboard();
+        imAttachmentPanelRequested = true;
+        // 等 IME 收起后再展示，不能把键盘高度和附件面板同时挤进消息区域。
+        updateIMAttachmentPanelVisibility();
+    }
+
+    private void closeIMAttachmentPanel() {
+        imAttachmentPanelRequested = false;
+        if (imAttachmentPanel != null) imAttachmentPanel.setVisibility(View.GONE);
+    }
+
+    private void updateIMAttachmentPanelVisibility() {
+        if (imAttachmentPanel == null) return;
+        imAttachmentPanel.setVisibility(imAttachmentPanelRequested && !keyboardVisible && !imeAnimating
+            ? View.VISIBLE : View.GONE);
     }
 
     private void addPopupAction(LinearLayout menu, String title, Runnable action) {
@@ -6998,6 +7128,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     private void hideKeyboard() {
+        closeIMAttachmentPanel();
         View focus = getCurrentFocus();
         if (focus == null) return;
         ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
