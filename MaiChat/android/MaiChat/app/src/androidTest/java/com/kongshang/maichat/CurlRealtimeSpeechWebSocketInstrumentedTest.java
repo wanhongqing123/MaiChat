@@ -233,6 +233,30 @@ public class CurlRealtimeSpeechWebSocketInstrumentedTest {
         }
     }
 
+    @Test public void localWssUsesAliyunTokenHeaderWithoutPuttingTokenInUrl() throws Exception {
+        try (MockWssServer server = new MockWssServer(0, STS_TOKEN, "X-NLS-Token", (input, output, request) -> {
+            assertFalse(request.contains("token="));
+            sendText(output, "{\"header\":{\"status\":20000000}}");
+            sendFrame(output, 8, true, new byte[] {3, (byte) 232}, 0, 2);
+        })) {
+            CountDownLatch closed = new CountDownLatch(1);
+            AtomicReference<String> received = new AtomicReference<>();
+            AtomicInteger failure = new AtomicInteger();
+            CurlRealtimeSpeechWebSocket socket = new CurlRealtimeSpeechWebSocket(
+                "wss://localhost:" + server.port() + "/ws/v1", STS_TOKEN, ca(), DIRECT,
+                CurlRealtimeSpeechWebSocket.TokenHeader.ALIYUN, new CurlRealtimeSpeechWebSocket.Listener() {
+                    public void message(String text) { received.set(text); }
+                    public void failed(int code) { failure.set(code); closed.countDown(); }
+                    public void closed() { closed.countDown(); }
+                });
+            try {
+                assertTrue(closed.await(8, TimeUnit.SECONDS)); assertEquals(0, failure.get());
+                assertEquals("{\"header\":{\"status\":20000000}}", received.get());
+                server.assertSucceeded();
+            } finally { socket.cancel(); }
+        }
+    }
+
     private static byte[] ca() throws IOException {
         try (InputStream input = InstrumentationRegistry.getInstrumentation().getContext()
                 .getAssets().open(ASSET + "ca.pem")) {
@@ -326,6 +350,7 @@ public class CurlRealtimeSpeechWebSocketInstrumentedTest {
         private final Thread thread;
         private final AtomicReference<Throwable> failure = new AtomicReference<>();
         private final String requiredToken;
+        private final String requiredHeader;
 
         MockWssServer(ServerAction action) throws Exception { this(0, null, action); }
 
@@ -338,7 +363,11 @@ public class CurlRealtimeSpeechWebSocketInstrumentedTest {
         }
 
         MockWssServer(long handshakeDelayMs, String requiredToken, ServerAction action) throws Exception {
+            this(handshakeDelayMs, requiredToken, "X-TC-Token", action);
+        }
+        MockWssServer(long handshakeDelayMs, String requiredToken, String requiredHeader, ServerAction action) throws Exception {
             this.requiredToken = requiredToken;
+            this.requiredHeader = requiredHeader + ":";
             KeyStore store = KeyStore.getInstance("PKCS12");
             char[] password = "local-test-only".toCharArray();
             try (InputStream input = InstrumentationRegistry.getInstrumentation().getContext()
@@ -369,8 +398,8 @@ public class CurlRealtimeSpeechWebSocketInstrumentedTest {
                 for (String line; !(line = readLine(input)).isEmpty(); ) {
                     if (line.regionMatches(true, 0, "Sec-WebSocket-Key:", 0, 18))
                         key = line.substring(18).trim();
-                    if (line.regionMatches(true, 0, "X-TC-Token:", 0, 11))
-                        token = line.substring(11).trim();
+                    if (line.regionMatches(true, 0, requiredHeader, 0, requiredHeader.length()))
+                        token = line.substring(requiredHeader.length()).trim();
                 }
                 if (requiredToken != null && !requiredToken.equals(token)) {
                     output.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"

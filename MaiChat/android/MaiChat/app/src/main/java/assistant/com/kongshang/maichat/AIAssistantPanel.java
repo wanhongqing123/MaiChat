@@ -201,6 +201,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         list.setStackFromBottom(false);
         list.setTranscriptMode(ListView.TRANSCRIPT_MODE_NORMAL);
         list.setDivider(null);
+        list.setSelector(android.R.color.transparent);
         list.setDividerHeight(dp(24));
         list.setPadding(dp(16), 0, dp(16), dp(24));
         // 内容保留留白，滚动指示条独立贴视图边缘，与 iOS 的全宽滚动区域一致。
@@ -293,7 +294,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         inputRow.addView(voiceModeButton, new LayoutParams(dp(44), dp(44)));
 
         FrameLayout inputSurface = new FrameLayout(activity);
-        composer = new EditText(activity);
+        composer = new ComposerEditText(activity);
         composer.setTag("ai-composer");
         composer.setContentDescription("创作中心消息输入框");
         composer.setHint("可按住转文字");
@@ -449,6 +450,39 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         attachmentPanel.setVisibility(GONE);
         composerArea.addView(attachmentPanel, matchWrap());
         addView(composerArea, matchWrap());
+    }
+
+    /** 按最终可用宽度测量草稿，连续 EDIT 不继承上次单行高度和内部滚动。 */
+    static final class ComposerEditText extends EditText {
+        ComposerEditText(Context context) { super(context); }
+
+        @Override protected void onTextChanged(CharSequence text, int start, int before, int count) {
+            super.onTextChanged(text, start, before, count);
+            // send 按钮会同步改变 weighted 输入区域宽度；即使字数相同，也须重新量高。
+            requestLayout();
+            if (text.length() == 0) scrollTo(0, 0);
+        }
+
+        @Override protected void onMeasure(int widthSpec, int heightSpec) {
+            super.onMeasure(widthSpec, heightSpec);
+            int width = getMeasuredWidth() - getCompoundPaddingLeft() - getCompoundPaddingRight();
+            if (width <= 0) return;
+            android.text.Layout textLayout = getLayout();
+            if (textLayout == null || textLayout.getWidth() != width) {
+                textLayout = android.text.StaticLayout.Builder.obtain(getText(), 0, length(), getPaint(), width)
+                    .setIncludePad(getIncludeFontPadding())
+                    .setLineSpacing(getLineSpacingExtra(), getLineSpacingMultiplier())
+                    .setBreakStrategy(getBreakStrategy()).setHyphenationFrequency(getHyphenationFrequency())
+                    .build();
+            }
+            int lines = Math.min(textLayout.getLineCount(), Math.max(1, getMaxLines()));
+            int desired = Math.max(getMinHeight(), textLayout.getLineTop(lines)
+                + getCompoundPaddingTop() + getCompoundPaddingBottom());
+            int height = resolveSize(desired, heightSpec);
+            setMeasuredDimension(getMeasuredWidth(), height);
+            // 超过六行仍保留原生光标滚动；能完整容纳的草稿不应被旧 viewport 裁顶。
+            if (length() == 0 || textLayout.getLineCount() <= lines && height >= desired) scrollTo(0, 0);
+        }
     }
     @Override
     protected void onAttachedToWindow() {
@@ -2095,17 +2129,17 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         welcome.addView(heading, headingParams);
 
         LinearLayout grid = column();
-        AIAssistantWelcomeAction[] actions = AIAssistantWelcomeAction.values();
-        for (int index = 0; index < actions.length; index += 2) {
+        AIAssistantWelcomeFeature[] features = AIAssistantWelcomeFeature.values();
+        for (int index = 0; index < features.length; index += 2) {
             LinearLayout line = row();
             line.setGravity(Gravity.CENTER_VERTICAL);
             line.setBaselineAligned(false);
-            line.addView(welcomeFeature(actions[index]),
+            line.addView(welcomeFeature(features[index]),
                 new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
             View gap = new View(activity);
             line.addView(gap, new LayoutParams(dp(10), 1));
-            View right = index + 1 < actions.length
-                ? welcomeFeature(actions[index + 1]) : new View(activity);
+            View right = index + 1 < features.length
+                ? welcomeFeature(features[index + 1]) : new View(activity);
             line.addView(right, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
             LayoutParams lineParams = matchWrap();
             if (index > 0) lineParams.topMargin = dp(10);
@@ -2132,33 +2166,23 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         }
         return welcome;
     }
-    private View welcomeFeature(AIAssistantWelcomeAction action) {
+    private View welcomeFeature(AIAssistantWelcomeFeature feature) {
         LinearLayout card = row();
-        card.setTag("ai-welcome-" + action.name().toLowerCase(Locale.ROOT));
+        card.setTag("ai-welcome-" + feature.name().toLowerCase(Locale.ROOT));
         card.setGravity(Gravity.CENTER);
         card.setMinimumHeight(dp(54));
         card.setPadding(dp(10), dp(12), dp(10), dp(12));
         card.setBackground(MaiChatTheme.bordered(Color.WHITE, Color.rgb(234, 240, 247), 13, activity));
-        card.setContentDescription(action.title);
-        card.setFocusable(true);
-        card.setOnClickListener(view -> {
-            if (submitting || navigationPending || voiceRecording || state == null || state.busy()
-                || state.remoteSession != null) return;
-            setVoiceMode(false);
-            composer.setText(action.draft);
-            composer.setSelection(composer.length());
-            composer.requestFocus();
-            android.view.inputmethod.InputMethodManager input =
-                (android.view.inputmethod.InputMethodManager) activity.getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (input != null) input.showSoftInput(composer,
-                android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
-        });
+        // 能力卡片仅介绍创作中心，不承担输入或导航操作。
+        card.setContentDescription(feature.title);
+        card.setClickable(false);
+        card.setFocusable(false);
         ImageView icon = new ImageView(activity);
-        icon.setImageResource(welcomeFeatureIcon(action));
+        icon.setImageResource(welcomeFeatureIcon(feature));
         icon.setColorFilter(MaiChatTheme.BLUE);
         icon.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
         card.addView(icon, new LayoutParams(dp(22), dp(22)));
-        TextView label = text(action.title, 16, MaiChatTheme.TEXT);
+        TextView label = text(feature.title, 16, MaiChatTheme.TEXT);
         label.setTypeface(MaiChatTypography.semibold());
         // 保留完整标题，字体或窄屏导致空间不足时增加卡片高度，不省略能力名称。
         label.setSingleLine(false);
@@ -2168,8 +2192,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         card.addView(label, labelParams);
         return card;
     }
-    private int welcomeFeatureIcon(AIAssistantWelcomeAction action) {
-        switch (action) {
+    private int welcomeFeatureIcon(AIAssistantWelcomeFeature feature) {
+        switch (feature) {
             case ASK: return R.drawable.ic_feature_ask;
             case IMAGE: return R.drawable.ic_feature_image;
             case VIDEO: return R.drawable.ic_feature_video;

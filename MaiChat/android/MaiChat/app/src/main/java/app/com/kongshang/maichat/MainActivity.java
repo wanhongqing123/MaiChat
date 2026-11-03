@@ -164,7 +164,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private String cloudImageOwner = "";
     private MaiCloudDriveDialog cloudDriveDialog;
     private final MaiCloudDriveDirectory cloudDirectoryState = new MaiCloudDriveDirectory();
-    private enum MePage { HOME, PROFILE, SETTINGS }
+    private enum MePage { HOME, PROFILE, SETTINGS, ACCOUNT_DELETION, REPORTS }
     private MePage mePage = MePage.HOME;
     private MePage renderedMePage;
     private RemoteIMTab renderedPrimaryTab;
@@ -180,6 +180,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private int selfAvatarSize = 64;
     private String renderedSelfAvatar = "";
     private View renderedTabBar;
+    private MaiChatAccountDeletionPanel accountDeletionPanel;
+    private MaiChatSafetyReportsPanel safetyReportsPanel;
+    private String settingsPanelIdentity = "";
+    private TextView speechProviderValue;
     private TextView videoTranscriptOverlay;
     private boolean videoExpanded;
     private Dialog imageDialog;
@@ -344,6 +348,11 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         // 发出的媒体同样落持久目录，不放缓存：路径会进聊天记录并被长期引用。
         mediaStore = new RemoteIMMediaStore(RemoteIMMediaPaths.forApp(this));
         voiceRecorder = new VoiceRecordingController(mediaStore, diagnostics::record);
+        MaiChatAuthClient speechAuth = MaiChatAuthClient.shared(this);
+        speechAuth.setSpeechRecognitionProvider(SpeechRecognitionProvider.fromId(
+            getSharedPreferences("maichat.speech", MODE_PRIVATE)
+                .getString("maichat.speech.provider", "tencent")));
+        voiceRecorder.configureTranscription(speechAuth::speechRecognitionProvider, speechAuth::aliyunAsrCredential);
         voicePlayback = new VoicePlaybackController();
         // 两个空编辑器均使用账号签发的实时 ASR；独立语音模式直接发语音。
         speechRecognizer = null;
@@ -451,6 +460,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     protected void onDestroy() {
         destroyed = true;
         clearAvatarSelection();
+        closeSettingsSubpages();
         passwordRequests.cancelActive("identity_changed");
         if (passwordDialog != null) passwordDialog.dismiss();
         if (cloudDriveDialog != null && cloudDriveDialog.isShowing()) cloudDriveDialog.dismiss();
@@ -486,8 +496,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             return;
         }
         if (activeTab == RemoteIMTab.ME && mePage != MePage.HOME) {
-            mePage = MePage.HOME;
-            render();
+            leaveMeSubpage();
             return;
         }
         if (activeTab == RemoteIMTab.CLOUD && cloudDriveDialog != null
@@ -921,6 +930,12 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         if (aiAssistant != null) aiAssistant.setForeground(showingAssistant);
         String owner = session.requiresLogin() ? "" : session.settings().loginUserId();
         clearInvalidAvatarSelection();
+        if ((accountDeletionPanel != null || safetyReportsPanel != null)
+                && !settingsPanelIdentity.equals(session.passwordChangeIdentity())) {
+            closeSettingsSubpages();
+            mePage = MePage.SETTINGS;
+            renderedMePage = null;
+        }
         if (!owner.equals(displayedOwner)) {
             renderedPrimaryTab = null;
             mePage = MePage.HOME;
@@ -1025,6 +1040,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         if (cloudDriveDialog != null && cloudDriveDialog.isEmbedded())
             cloudDriveDialog.dismiss();
         // 只有页面身份真的改变才重建导航容器；不能把每条新消息都当作换页。
+        closeSettingsSubpages();
         currentMessageList = null;
         renderedPrimaryTab = null;
         renderedTabBar = null;
@@ -1032,6 +1048,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         selfNameLabel = null; selfAccountLabel = null; selfConnectionLabel = null;
         selfAvatarContainer = null; selfConnectionDot = null; renderedSelfAvatar = "";
         selfAvatarRow = null; selfAvatarProgress = null;
+        speechProviderValue = null;
         renderedChatUserId = null;
         groupRows = null; groupScroll = null; groupDraftInput = null;
         renderedGroupId = null;
@@ -1374,6 +1391,14 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         LinearLayout.LayoutParams alternateParams = match(dp(42));
         alternateParams.setMargins(0, dp(14), 0, 0);
         form.addView(alternate, alternateParams);
+        if (MaiChatAccountDeletionPanel.hasSavedReceipt(this)) {
+            Button receipt = new Button(this);
+            receipt.setText("查看注销进度");
+            receipt.setTextColor(Color.rgb(42, 211, 142));
+            receipt.setBackgroundColor(Color.TRANSPARENT);
+            receipt.setOnClickListener(view -> MaiChatAccountDeletionPanel.showSavedReceipt(this, () -> {}));
+            form.addView(receipt, match(dp(42)));
+        }
 
         // 主按钮以手机号、验证码或密码以及两项确认共同决定可用性，避免触发无效请求。
         Runnable updateLoginAppearance = () -> {
@@ -1829,6 +1854,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             button.addView(badge, badgeParams);
         }
         button.setOnClickListener(view -> {
+            if (settingsSubmissionInFlight()) return;
             cancelVoiceRecording();
             if (tab == RemoteIMTab.ME && activeTab == RemoteIMTab.ME) mePage = MePage.HOME;
             activeTab = tab;
@@ -3971,11 +3997,22 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         renderedMePage = mePage;
         content.setBackgroundColor(MaiChatTheme.GROUPED_PAGE);
         String title = mePage == MePage.HOME ? "我"
-            : mePage == MePage.PROFILE ? "个人资料" : "设置";
-        content.addView(pageNavigation(title, mePage == MePage.HOME ? null : () -> {
-            mePage = MePage.HOME;
-            render();
-        }), match(dp(56)));
+            : mePage == MePage.PROFILE ? "个人资料"
+            : mePage == MePage.ACCOUNT_DELETION ? "注销账号"
+            : mePage == MePage.REPORTS ? "我的举报" : "设置";
+        content.addView(pageNavigation(title, mePage == MePage.HOME ? null : this::leaveMeSubpage), match(dp(56)));
+        if (mePage == MePage.ACCOUNT_DELETION) {
+            settingsPanelIdentity = session.passwordChangeIdentity();
+            accountDeletionPanel = new MaiChatAccountDeletionPanel(this, session, this::finishAcceptedAccountDeletion);
+            content.addView(accountDeletionPanel, new LinearLayout.LayoutParams(-1, 0, 1));
+            return;
+        }
+        if (mePage == MePage.REPORTS) {
+            settingsPanelIdentity = session.passwordChangeIdentity();
+            safetyReportsPanel = new MaiChatSafetyReportsPanel(this, session);
+            content.addView(safetyReportsPanel, new LinearLayout.LayoutParams(-1, 0, 1));
+            return;
+        }
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(MaiChatTheme.GROUPED_PAGE);
@@ -3988,6 +4025,72 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         else if (mePage == MePage.PROFILE) renderPersonalProfile(page);
         else renderAccountPreferences(page);
         updateSelfProfilePresentation();
+    }
+
+    /** 工具只能打开与普通设置相同的本地验证页，不能提交注销或读取输入内容。 */
+    public JSONObject openAccountDeletionForAgent() throws JSONException {
+        if (Looper.myLooper() != Looper.getMainLooper() || !isHostToolForeground() || session.requiresLogin())
+            throw new IllegalStateException("请先登录并回到 App 前台");
+        if (activeTab == RemoteIMTab.ME && mePage == MePage.ACCOUNT_DELETION
+                && accountDeletionPanel != null)
+            return new JSONObject().put("shown", true);
+        if (activeChatUserId != null) {
+            rememberDraft();
+            session.setConversationVisible(activeChatUserId, false);
+        }
+        if (activeGroupId != null) {
+            if (groupDraftInput != null)
+                groupDrafts.put(displayedOwner + "\0" + activeGroupId, groupDraftInput.getText().toString());
+            session.setGroupConversationVisible(activeGroupId, false);
+        }
+        cancelVoiceRecording();
+        activeChatUserId = null; activeGroupId = null; activeFriendProfileUserId = null;
+        activeTab = RemoteIMTab.ME;
+        mePage = MePage.ACCOUNT_DELETION;
+        render();
+        return new JSONObject().put("shown", true);
+    }
+
+    /** 普通举报页和工具共用同一只读服务；网络只允许在 worker 执行。 */
+    public JSONObject safetyReportsForAgent() throws Exception {
+        if (Looper.myLooper() == Looper.getMainLooper())
+            throw new IllegalStateException("举报记录不能阻塞界面线程");
+        String identity = session.passwordChangeIdentity();
+        String account = session.accountId();
+        java.util.function.BooleanSupplier current = () -> !destroyed && !session.requiresLogin()
+            && identity.equals(session.passwordChangeIdentity());
+        MaiChatAccountSettingsService service = new MaiChatAccountSettingsService(account, current,
+            (path, method, body) -> MaiChatAuthClient.shared(this).accountSettingsRequest(
+                path, method, body, account, current));
+        JSONArray reports = new JSONArray();
+        for (MaiChatAccountSettingsService.Report report : service.reports())
+            reports.put(new JSONObject().put("id", report.id).put("status", report.status)
+                .put("resolution", report.resolution).put("created_at", report.createdAt));
+        return new JSONObject().put("reports", reports).put("count", reports.length());
+    }
+
+    private MePage parentMePage() {
+        return mePage == MePage.ACCOUNT_DELETION || mePage == MePage.REPORTS
+            ? MePage.SETTINGS : MePage.HOME;
+    }
+
+    private boolean settingsSubmissionInFlight() {
+        if (accountDeletionPanel == null || !accountDeletionPanel.isSubmitting()) return false;
+        toast("正在提交注销申请，请稍候");
+        return true;
+    }
+
+    private void leaveMeSubpage() {
+        if (settingsSubmissionInFlight()) return;
+        mePage = parentMePage();
+        render();
+    }
+
+    private void closeSettingsSubpages() {
+        if (accountDeletionPanel != null) accountDeletionPanel.close();
+        if (safetyReportsPanel != null) safetyReportsPanel.close();
+        accountDeletionPanel = null; safetyReportsPanel = null;
+        settingsPanelIdentity = "";
     }
 
     /** 页面标题采用独立中心对齐，左右操作区域不会把标题推偏。 */
@@ -4003,10 +4106,12 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             MaiChatSymbolView arrow = new MaiChatSymbolView(this, MaiChatSymbolView.Symbol.CHEVRON_LEFT);
             arrow.setSymbolColor(MaiChatTheme.TEXT);
             arrow.setContentDescription("返回");
+            arrow.setBackground(MaiChatTheme.bordered(Color.rgb(250, 250, 252),
+                Color.rgb(232, 232, 237), 22, this));
             arrow.setOnClickListener(view -> back.run());
             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(44), dp(44),
                 Gravity.START | Gravity.CENTER_VERTICAL);
-            params.leftMargin = dp(6);
+            params.leftMargin = dp(16);
             header.addView(arrow, params);
         }
         View line = new View(this);
@@ -4101,28 +4206,61 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         selfAccountLabel = (TextView) account.findViewWithTag("preference-value");
         page.addView(preferenceGroup("", avatarRow, nickname, account,
             preferenceRow("我的好友二维码", "", R.drawable.ic_ui_qr,
-                this::showMyFriendCodeDialog)), matchWrap());
+                this::showMyFriendCodeDialog),
+            preferenceRow("扫码登录桌面端", "", R.drawable.ic_ui_scan,
+                () -> startActivity(new Intent(this, DesktopLoginApprovalActivity.class)))), matchWrap());
     }
 
     private void renderAccountPreferences(LinearLayout page) {
         page.addView(preferenceGroup("账号",
-            preferenceRow("登录账号", session.accountId(), 0, this::copyOwnAccountId),
+            preferenceRow("登录账号", session.accountId(), 0, this::copyOwnAccountId, false),
+            preferenceRow("切换账号", "", 0, this::switchAccountFromSettings, false),
             preferenceRow("设置或修改登录密码", "", 0, () -> {
                 try { openAccountPasswordForm(); }
                 catch (Exception failure) { toast("请先登录后在前台打开密码页"); }
             }),
-            preferenceRow("扫码登录桌面端", "", R.drawable.ic_ui_scan,
-                () -> startActivity(new Intent(this, DesktopLoginApprovalActivity.class))),
-            preferenceRow("切换账号", "", 0, this::switchAccountFromSettings)), matchWrap());
-        page.addView(preferenceGroup("语音",
-            preferenceRow("语音识别服务", "腾讯实时转写", 0, null)), matchWrap());
+            preferenceRow("注销账号", "", 0,
+                () -> { mePage = MePage.ACCOUNT_DELETION; render(); })), matchWrap());
+        View provider = preferenceRow("语音识别服务",
+            MaiChatAuthClient.shared(this).speechRecognitionProvider().title(), 0,
+            this::chooseSpeechRecognitionProvider, false);
+        speechProviderValue = provider.findViewWithTag("preference-value");
+        ImageView selector = new ImageView(this);
+        selector.setImageResource(R.drawable.ic_ui_chevron_up_down);
+        selector.setColorFilter(Color.rgb(142, 142, 147));
+        LinearLayout.LayoutParams selectorParams = new LinearLayout.LayoutParams(dp(14), dp(20));
+        selectorParams.leftMargin = dp(7);
+        ((LinearLayout) provider).addView(selector, selectorParams);
+        page.addView(preferenceGroup("语音", provider), matchWrap());
         page.addView(preferenceGroup("隐私与支持",
             preferenceRow("隐私政策", "", 0,
-                () -> openLoginDocument("https://ichat.life/legal/privacy.html")),
+                () -> openLoginDocument("https://ichat.life/legal/privacy.html"), false),
             preferenceRow("用户协议", "", 0,
-                () -> openLoginDocument("https://ichat.life/legal/terms.html")),
+                () -> openLoginDocument("https://ichat.life/legal/terms.html"), false),
             preferenceRow("联系我们", "", 0,
-                () -> openLoginDocument("mailto:1925271463@kongshang.com"))), matchWrap());
+                () -> openLoginDocument("mailto:1925271463@kongshang.com"), false),
+            preferenceRow("我的举报", "", 0,
+                () -> { mePage = MePage.REPORTS; render(); })), matchWrap());
+    }
+
+    private void chooseSpeechRecognitionProvider() {
+        SpeechRecognitionProvider[] providers = SpeechRecognitionProvider.values();
+        String[] titles = new String[providers.length];
+        SpeechRecognitionProvider selected = MaiChatAuthClient.shared(this).speechRecognitionProvider();
+        int checked = 0;
+        for (int index = 0; index < providers.length; index++) {
+            titles[index] = providers[index].title();
+            if (providers[index] == selected) checked = index;
+        }
+        new AlertDialog.Builder(this).setTitle("语音识别服务")
+            .setSingleChoiceItems(titles, checked, (dialog, which) -> {
+                SpeechRecognitionProvider provider = providers[which];
+                getSharedPreferences("maichat.speech", MODE_PRIVATE).edit()
+                    .putString("maichat.speech.provider", provider.id()).apply();
+                MaiChatAuthClient.shared(this).setSpeechRecognitionProvider(provider);
+                if (speechProviderValue != null) speechProviderValue.setText(provider.title());
+                dialog.dismiss();
+            }).setNegativeButton("取消", null).show();
     }
 
     private void updateSelfProfilePresentation() {
@@ -4155,6 +4293,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     }
 
     private View preferenceRow(String title, String value, int iconResource, Runnable action) {
+        return preferenceRow(title, value, iconResource, action, true);
+    }
+
+    private View preferenceRow(String title, String value, int iconResource, Runnable action, boolean chevron) {
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(16), dp(12), dp(16), dp(12));
@@ -4169,9 +4311,12 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             row.addView(icon, params);
         }
         TextView label = MaiChatTheme.text(this, title, 16,
-            title.equals("切换账号") ? MaiChatTheme.RED : MaiChatTheme.TEXT);
+            title.equals("注销账号") ? MaiChatTheme.RED
+                : title.equals("切换账号") || title.equals("隐私政策") || title.equals("用户协议")
+                    || title.equals("联系我们") ? MaiChatTheme.BLUE : MaiChatTheme.TEXT);
         row.addView(label, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView detail = MaiChatTheme.text(this, value, 14, MaiChatTheme.SECONDARY);
+        TextView detail = MaiChatTheme.text(this, value, 14,
+            title.equals("登录账号") ? MaiChatTheme.TEXT : MaiChatTheme.SECONDARY);
         detail.setTag("preference-value");
         detail.setSingleLine(true);
         detail.setEllipsize(TextUtils.TruncateAt.MIDDLE);
@@ -4180,7 +4325,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         if (action != null) {
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(12), dp(18));
             params.leftMargin = dp(10);
-            row.addView(settingsChevron(), params);
+            if (chevron) row.addView(settingsChevron(), params);
             row.setOnClickListener(view -> action.run());
         }
         return row;
@@ -4191,7 +4336,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         group.setOrientation(LinearLayout.VERTICAL);
         group.setPadding(0, 0, 0, dp(24));
         if (!title.isEmpty()) {
-            TextView heading = MaiChatTheme.text(this, title, 13, MaiChatTheme.SECONDARY);
+            TextView heading = MaiChatTheme.text(this, title, 14, Color.rgb(142, 142, 147));
             heading.setPadding(dp(16), 0, 0, dp(8));
             group.addView(heading, matchWrap());
         }
@@ -4298,13 +4443,23 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private void switchAccountFromSettings() {
         try {
             session.logout();
-            loginAcceptedTerms = false; loginConfirmedAge = false;
-            loginUserDraft = ""; loginCodeDraft = ""; loginPasswordDraft = "";
-            loginChallengeId = ""; loginUsesPassword = false;
-            showInitialLogin = true; activeTab = RemoteIMTab.MESSAGES;
-            activeChatUserId = null; mePage = MePage.HOME;
-            render();
+            showLoginAfterAccountChange();
         } catch (IOException error) { toast("切换账号失败"); }
+    }
+
+    private void finishAcceptedAccountDeletion() {
+        // 仅已受理的注销回执可进入；离线退出并按原 owner 清理，不再用失效凭据请求远端 logout。
+        session.completeAcceptedAccountDeletion();
+        showLoginAfterAccountChange();
+    }
+
+    private void showLoginAfterAccountChange() {
+        loginAcceptedTerms = false; loginConfirmedAge = false;
+        loginUserDraft = ""; loginCodeDraft = ""; loginPasswordDraft = "";
+        loginChallengeId = ""; loginUsesPassword = false;
+        showInitialLogin = true; activeTab = RemoteIMTab.MESSAGES;
+        activeChatUserId = null; mePage = MePage.HOME;
+        render();
     }
 
     private void showCloudDrive() {

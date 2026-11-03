@@ -242,9 +242,10 @@ private:
 };
 
 int runSocket(JNIEnv* env, jobject owner, SocketState* state, const std::string& url,
-              const std::string& token, std::vector<unsigned char>& ca, jint proxyType,
+              const std::string& token, jint tokenHeader, std::vector<unsigned char>& ca, jint proxyType,
               const std::string& proxyHost, jint proxyPort) {
     if (state->cancelled.load()) return kCancelled;
+    if (tokenHeader != 0 && tokenHeader != 1) return kSetupFailed;
     bool secure = false;
     if (!validUrl(url, &secure) || !validProxy(proxyHost, proxyPort, proxyType) ||
         (secure && ca.empty())) return kSetupFailed;
@@ -267,7 +268,8 @@ int runSocket(JNIEnv* env, jobject owner, SocketState* state, const std::string&
     // 握手只允许 WS/WSS，不跟随重定向；WSS 同时验证 Android CA 与目标主机名。
     set(CURLOPT_URL, url.c_str());
     if (!token.empty()) {
-        std::string header = "X-TC-Token: " + token;
+        // 固定枚举不允许任意头注入；阿里官方 SDK 同样用 X-NLS-Token 进行 WSS 握手。
+        std::string header = (tokenHeader == 1 ? "X-NLS-Token: " : "X-TC-Token: ") + token;
         headers.value = curl_slist_append(nullptr, header.c_str());
         if (headers.value == nullptr) return kSetupFailed;
         set(CURLOPT_HTTPHEADER, headers.value);
@@ -442,7 +444,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_kongshang_maichat_CurlRealtimeSpeechW
 }
 
 extern "C" JNIEXPORT jint JNICALL Java_com_kongshang_maichat_CurlRealtimeSpeechWebSocket_nativeRun(
-    JNIEnv* env, jobject owner, jlong handle, jstring jurl, jstring jtoken, jbyteArray jca, jint proxyType,
+    JNIEnv* env, jobject owner, jlong handle, jstring jurl, jstring jtoken, jint tokenHeader, jbyteArray jca, jint proxyType,
     jstring jproxyHost, jint proxyPort) {
     auto* state = reinterpret_cast<SocketState*>(handle);
     if (state == nullptr) return kSetupFailed;
@@ -452,7 +454,7 @@ extern "C" JNIEXPORT jint JNICALL Java_com_kongshang_maichat_CurlRealtimeSpeechW
         if (!copyString(env, jurl, 4096, &url) || !copyString(env, jtoken, 8192, &token) ||
             !copyString(env, jproxyHost, 255, &proxyHost) ||
             !copyBytes(env, jca, kMaxCaBytes, &ca)) return kSetupFailed;
-        return runSocket(env, owner, state, url, token, ca, proxyType, proxyHost, proxyPort);
+        return runSocket(env, owner, state, url, token, tokenHeader, ca, proxyType, proxyHost, proxyPort);
     } catch (...) {
         return kSetupFailed;
     }

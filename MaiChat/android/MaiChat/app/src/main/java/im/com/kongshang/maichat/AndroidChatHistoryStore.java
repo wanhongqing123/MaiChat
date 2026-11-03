@@ -13,6 +13,11 @@ import android.util.Log;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.io.IOException;
 
 public final class AndroidChatHistoryStore extends SQLiteOpenHelper {
     private static final String DATABASE_NAME = "maichat-history.db";
@@ -47,6 +52,43 @@ public final class AndroidChatHistoryStore extends SQLiteOpenHelper {
         super(context.getApplicationContext(), databaseName, null, DATABASE_VERSION);
         // 媒体路径入库存相对形式，读出来再按当前根还原：数据目录换根时历史不会整片失效。
         this.mediaPaths = RemoteIMMediaPaths.forApp(context);
+    }
+
+    /** 已获注销回执后的本地清理；共享数据库保留其他 owner，受管媒体也先排除其他账号引用。 */
+    public void purgeAcceptedAccount(String ownerId) throws IOException {
+        String owner = clean(ownerId);
+        if (owner.isEmpty()) throw new IOException("Accepted account owner is required");
+        SQLiteDatabase database = getWritableDatabase();
+        database.beginTransaction();
+        try {
+            Map<String, String> owned = new HashMap<>(); Set<String> shared = new HashSet<>();
+            try (Cursor cursor = database.rawQuery("SELECT owner_id,image_path,voice_path,file_path,video_path,video_cover_path FROM messages", null)) {
+                while (cursor.moveToNext()) {
+                    boolean ours = owner.equals(cursor.getString(0));
+                    for (int column = 1; column <= 5; column++) {
+                        String relative = cursor.getString(column);
+                        // 旧绝对路径/越界字符串不属于 App 管理，不尝试删除其指向的用户文件。
+                        if (!eligibleMedia(relative)) continue;
+                        try {
+                            String identity = MaiChatAcceptedAccountCleanup.mediaIdentity(mediaPaths.root(), relative);
+                            if (ours) owned.put(identity, relative); else shared.add(identity);
+                        } catch (IOException unsafe) { if (ours) throw unsafe; }
+                    }
+                }
+            }
+            for (Map.Entry<String, String> item : owned.entrySet()) if (!shared.contains(item.getKey()))
+                MaiChatAcceptedAccountCleanup.deleteMedia(mediaPaths.root(), item.getValue());
+            for (String table : new String[]{"messages", "contacts", "contact_groups", "im_groups", "group_messages"})
+                database.delete(table, "owner_id=?", new String[]{owner});
+            database.setTransactionSuccessful();
+        } finally { database.endTransaction(); }
+    }
+
+    private static boolean eligibleMedia(String value) {
+        if (value == null || !value.matches("(?:Incoming|Outgoing)/(?:Images|Videos|VideoCovers|Voices|Files)/.+")) return false;
+        for (String part : value.replace('\\', '/').split("/", -1))
+            if (part.isEmpty() || part.equals(".") || part.equals("..")) return false;
+        return true;
     }
 
     @Override

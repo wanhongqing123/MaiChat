@@ -62,6 +62,7 @@ public final class RemoteIMSessionController {
     }
 
     private final LocalSettingsStore settingsStore;
+    private final Context appContext;
     private final MaiChatAuthClient authClient;
     private final LocalChatHistoryStore legacyHistoryStore;
     private final AndroidChatHistoryStore historyStore;
@@ -86,6 +87,7 @@ public final class RemoteIMSessionController {
     private volatile boolean destroyed;
     // 密码等账号绑定写入也会在 worker 开始前检查代际，切号必须对该线程立即可见。
     private volatile int accountGeneration;
+    private volatile MaiChatAcceptedAccountCleanup.Pending acceptedAccountDeletion;
     private final Map<String, RemoteIMVideoAttachment> pendingVideoMedia = new java.util.LinkedHashMap<>();
     private int mediaRevision;
     public int mediaRevision() { return mediaRevision; }
@@ -157,6 +159,7 @@ public final class RemoteIMSessionController {
         LocalChatHistoryStore historyStore
     ) {
         this.settingsStore = settingsStore;
+        this.appContext = null;
         this.authClient = null;
         this.legacyHistoryStore = historyStore;
         this.historyStore = null;
@@ -173,6 +176,7 @@ public final class RemoteIMSessionController {
 
     public RemoteIMSessionController(Context context, Listener listener) {
         Context applicationContext = context.getApplicationContext();
+        this.appContext = applicationContext;
         this.settingsStore = new LocalSettingsStore(
             new java.io.File(applicationContext.getFilesDir(), "remote-im-settings/settings.properties")
         );
@@ -207,6 +211,16 @@ public final class RemoteIMSessionController {
         restoringAccount = true;
         int generation = ++accountGeneration;
         enqueueIO(() -> {
+            List<MaiChatAcceptedAccountCleanup.Pending> pendingDeletions;
+            try { pendingDeletions = MaiChatAcceptedAccountCleanup.pending(appContext.getNoBackupFilesDir()); }
+            catch (Exception invalidCleanupRecord) { pendingDeletions = Collections.emptyList(); }
+            // 已受理账号在恢复登录前离线清 token；另一个账号的设置和认证不能受影响。
+            RemoteIMSettings cachedBeforeRestore = loadSettings();
+            for (MaiChatAcceptedAccountCleanup.Pending pending : pendingDeletions)
+                if (pending.owner.equals(cachedBeforeRestore.loginUserId()) && pending.account.equals(authClient.accountId())) {
+                    authClient.discardLocalSession(); settingsStore.save(RemoteIMSettings.empty());
+                }
+            List<MaiChatAcceptedAccountCleanup.Pending> cleanupAfterPresentation = pendingDeletions;
             // 旧版只存 IM UserID 的设置不能代表已验证手机号；以服务端会话为准。
             RemoteIMSettings restoredSettings = RemoteIMSettings.empty();
             if (authClient.hasSession()) {
@@ -233,6 +247,9 @@ public final class RemoteIMSessionController {
                 notifyStateChanged();
                 if (!requiresLogin()) connect();
                 scheduleSessionValidation();
+                // 大目录和 SQLite 清理排在页面恢复之后，不延迟登录页展示。
+                for (MaiChatAcceptedAccountCleanup.Pending pending : cleanupAfterPresentation)
+                    ioExecutor.execute(() -> cleanAcceptedAccount(pending, null));
             });
         });
     }
@@ -1041,6 +1058,44 @@ public final class RemoteIMSessionController {
             ensureDefaultContactIfNeeded();
         }
         notifyStateChanged();
+    }
+
+    /** 仅由本地安全表单收到有效 202 回执后调用，固定原 IM owner 与认证代际。worker 调用。 */
+    void rememberAcceptedAccountDeletion(String owner, String account, String authIdentity, String requestId) throws Exception {
+        if (!productionMode || appContext == null) throw new IOException("Account deletion requires a production account");
+        acceptedAccountDeletion = new MaiChatAcceptedAccountCleanup.Pending(owner, account, authIdentity, requestId);
+        MaiChatAcceptedAccountCleanup.markPending(appContext.getNoBackupFilesDir(), owner, account, authIdentity, requestId);
+    }
+
+    /** 正常 UI 确认回执后的异步离线退出；不发送已失效账号 token 的远端 logout。 */
+    public void completeAcceptedAccountDeletion() {
+        MaiChatAcceptedAccountCleanup.Pending accepted = acceptedAccountDeletion;
+        if (!productionMode || destroyed || accepted == null) return;
+        acceptedAccountDeletion = null;
+        java.util.concurrent.CompletableFuture<Void> agentStopped = AIAssistantController.stopForAcceptedAccountDeletion(accepted.owner);
+        if (accepted.owner.equals(chatState.ownerUserId()) && !requiresLogin()) switchAccount(RemoteIMSettings.empty());
+        // Auth 清理和所有文件/数据库 I/O 都在原串行 worker；新登录不能越过该队列。
+        ioExecutor.execute(() -> {
+            authClient.discardAcceptedAccountSession(accepted.account, accepted.authIdentity);
+            cleanAcceptedAccount(accepted, agentStopped);
+        });
+        notifyStateChanged();
+    }
+
+    private void cleanAcceptedAccount(MaiChatAcceptedAccountCleanup.Pending accepted,
+                                     java.util.concurrent.CompletableFuture<Void> stopped) {
+        try {
+            MaiChatAcceptedAccountCleanup.markPending(appContext.getNoBackupFilesDir(), accepted.owner,
+                accepted.account, accepted.authIdentity, accepted.requestId);
+            java.util.concurrent.CompletableFuture<Void> barrier = stopped == null
+                ? AIAssistantController.stopForAcceptedAccountDeletion(accepted.owner) : stopped;
+            barrier.get(35, java.util.concurrent.TimeUnit.SECONDS);
+            historyStore.purgeAcceptedAccount(accepted.owner);
+            MaiChatAcceptedAccountCleanup.removeWorkspace(appContext.getNoBackupFilesDir(), accepted.owner);
+            MaiChatAcceptedAccountCleanup.finishPending(appContext.getNoBackupFilesDir(), accepted);
+        } catch (Exception failure) {
+            runOnMain(() -> { if (requiresLogin()) reportError("本机账号数据清理未完成；已保存的清理记录将在下次启动重试。"); });
+        }
     }
 
     public void logout() throws IOException {

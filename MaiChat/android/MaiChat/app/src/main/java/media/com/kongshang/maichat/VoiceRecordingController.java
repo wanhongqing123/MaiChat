@@ -15,11 +15,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** One microphone and AAC file feed both realtime transcription and voice fallback. */
+/** One microphone per clip; Tencent/direct voice keep AAC, Aliyun transcription captures PCM. */
 final class VoiceRecordingController {
     interface AsrTicketProvider {
         MaiChatAuthClient.RealtimeAsrTicket issue() throws Exception;
     }
+    interface AliyunCredentialProvider { AliyunAsrCredential issue() throws Exception; }
     interface Completion {
         void finished(File file, int seconds);
         void failed();
@@ -28,11 +29,14 @@ final class VoiceRecordingController {
     }
     private static final class Clip {
         final File file; final Completion completion;
-        TencentRealtimeSpeechStream stream;
+        final SpeechRecordingPlan plan;
+        RealtimeSpeechStream stream;
         String text;
         int seconds;
         boolean released, resultReady, asrFailed, cancelled, delivered;
-        Clip(File file, Completion completion) { this.file = file; this.completion = completion; }
+        Clip(File file, Completion completion, SpeechRecordingPlan plan) {
+            this.file = file; this.completion = completion; this.plan = plan;
+        }
     }
     private final HandlerThread thread = new HandlerThread("MaiChat-audio");
     private final Handler worker;
@@ -45,6 +49,10 @@ final class VoiceRecordingController {
     private final Set<Clip> clips = new HashSet<>();
     private volatile boolean closed;
     private MediaRecorder recorder;
+    private PcmVoiceRecorder pcmRecorder;
+    private volatile java.util.function.Supplier<SpeechRecognitionProvider> providerSelection =
+        () -> SpeechRecognitionProvider.TENCENT;
+    private volatile AliyunCredentialProvider aliyunCredentials;
     private Clip recording;
     private long started;
     VoiceRecordingController(RemoteIMMediaStore store) { this(store, event -> { }); }
@@ -52,29 +60,53 @@ final class VoiceRecordingController {
         this.diagnostic = diagnostic;
         this.store = store; thread.start(); worker = new Handler(thread.getLooper());
     }
+    void configureTranscription(java.util.function.Supplier<SpeechRecognitionProvider> selection,
+                                AliyunCredentialProvider credentialProvider) {
+        providerSelection = selection == null ? () -> SpeechRecognitionProvider.TENCENT : selection;
+        aliyunCredentials = credentialProvider;
+    }
     void start(Completion callback) { tryStart(callback); }
     boolean tryStart(Completion callback) {
         return tryStart(callback, null);
     }
     boolean tryStart(Completion callback, AsrTicketProvider ticketProvider) {
+        // 快照属于这次按住；设置修改不会替换正在录音或等待final的服务。
+        SpeechRecordingPlan plan = new SpeechRecordingPlan(
+            ticketProvider == null ? SpeechRecognitionProvider.TENCENT : providerSelection.get(), ticketProvider != null);
+        AliyunCredentialProvider selectedAliyun = aliyunCredentials;
         if (closed || !active.compareAndSet(false, true)) return false;
         recordDiagnostic("asr-recorder-queued");
         worker.post(() -> {
             if (closed) { active.set(false); return; }
             try {
-                Clip clip = new Clip(store.createRealtimeVoiceRecordingFile(), callback);
+                Clip clip = new Clip(plan.usesPcm() ? store.createPcmVoiceRecordingFile()
+                    : store.createRealtimeVoiceRecordingFile(), callback, plan);
                 recording = clip; clips.add(clip);
-                recorder = new MediaRecorder();
-                recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-                recorder.setOutputFormat(MediaRecorder.OutputFormat.AAC_ADTS);
-                recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
-                recorder.setAudioSamplingRate(16000);
-                recorder.setAudioChannels(1);
-                recorder.setAudioEncodingBitRate(32000);
-                recorder.setOutputFile(clip.file.getAbsolutePath());
-                recorder.prepare(); recorder.start(); started = SystemClock.elapsedRealtime();
+                if (plan.usesPcm()) {
+                    pcmRecorder = new PcmVoiceRecorder(clip.file, () -> worker.post(() -> {
+                        if (closed || clip.cancelled || recording != clip) return;
+                        recordDiagnostic("asr-pcm-capture-failed");
+                        finishOnWorker(true);
+                        main.post(() -> { if (!closed) callback.failed(); });
+                    }));
+                    pcmRecorder.start();
+                } else {
+                    recorder = new MediaRecorder();
+                    recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+                    recorder.setOutputFormat(MediaRecorder.OutputFormat.AAC_ADTS);
+                    recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+                    recorder.setAudioSamplingRate(16000);
+                    recorder.setAudioChannels(1);
+                    recorder.setAudioEncodingBitRate(32000);
+                    recorder.setOutputFile(clip.file.getAbsolutePath());
+                    recorder.prepare(); recorder.start();
+                }
+                started = SystemClock.elapsedRealtime();
                 recordDiagnostic("asr-recorder-started");
-                if (ticketProvider != null) requestAsrTicket(clip, ticketProvider);
+                if (ticketProvider != null) {
+                    recordDiagnostic(plan.usesPcm() ? "asr-provider-aliyun" : "asr-provider-tencent");
+                    requestAsrTicket(clip, ticketProvider, selectedAliyun);
+                }
                 else clip.resultReady = true;
             } catch (Exception error) {
                 recordDiagnostic("asr-recorder-failed class=" + error.getClass().getSimpleName());
@@ -84,26 +116,33 @@ final class VoiceRecordingController {
         });
         return true;
     }
-    private void requestAsrTicket(Clip clip, AsrTicketProvider provider) {
+    private void requestAsrTicket(Clip clip, AsrTicketProvider provider, AliyunCredentialProvider aliyunProvider) {
         recordDiagnostic("asr-ticket-request");
         try {
             ticketWorker.execute(() -> {
                 MaiChatAuthClient.RealtimeAsrTicket ticket = null;
-                try { ticket = provider.issue(); recordDiagnostic("asr-ticket-ready"); }
+                AliyunAsrCredential aliyun = null;
+                try {
+                    if (clip.plan.usesPcm()) {
+                        if (aliyunProvider == null) throw new IllegalStateException("Aliyun credential provider is missing");
+                        aliyun = aliyunProvider.issue();
+                    } else ticket = provider.issue();
+                    recordDiagnostic("asr-ticket-ready");
+                }
                 catch (Exception error) {
                     recordDiagnostic("asr-ticket-failed class=" + error.getClass().getSimpleName());
                 }
                 MaiChatAuthClient.RealtimeAsrTicket issued = ticket;
+                AliyunAsrCredential issuedAliyun = aliyun;
                 if (!worker.post(() -> {
                     if (closed || clip.cancelled || !clips.contains(clip)) return;
-                    if (issued == null) {
+                    if (clip.plan.usesPcm() ? issuedAliyun == null : issued == null) {
                         clip.asrFailed = true; clip.resultReady = true;
                         deliver(clip);
                         return;
                     }
                     try {
-                        clip.stream = new TencentRealtimeSpeechStream(clip.file, issued,
-                            new TencentRealtimeSpeechStream.Listener() {
+                        TencentRealtimeSpeechStream.Listener listener = new TencentRealtimeSpeechStream.Listener() {
                                 @Override public void diagnostic(String event) { recordDiagnostic(event); }
                                 @Override public void partial(String text) {
                                     main.post(() -> {
@@ -123,7 +162,10 @@ final class VoiceRecordingController {
                                         clip.asrFailed = true; clip.resultReady = true; deliver(clip);
                                     });
                                 }
-                            });
+                            };
+                        clip.stream = clip.plan.usesPcm()
+                            ? new AliyunRealtimeSpeechStream(clip.file, issuedAliyun, listener)
+                            : new TencentRealtimeSpeechStream(clip.file, issued, listener);
                         if (clip.released) clip.stream.endAudio();
                     } catch (RuntimeException error) {
                         recordDiagnostic("asr-stream-start-failed class=" + error.getClass().getSimpleName());
@@ -147,7 +189,10 @@ final class VoiceRecordingController {
     }
     private void finishOnWorker(boolean cancel) {
         Clip clip = recording;
-        boolean succeeded = recorder != null;
+        boolean succeeded = recorder != null || pcmRecorder != null;
+        if (pcmRecorder != null) {
+            succeeded = pcmRecorder.finish(); pcmRecorder = null;
+        }
         if (recorder != null) {
             try { recorder.stop(); } catch (RuntimeException error) { succeeded = false; }
             recorder.release(); recorder = null;

@@ -719,33 +719,19 @@ final class MaiCloudDriveDialog {
         }
         for (JSONObject folder : directory.children()) library.addView(folderRow(folder), row());
         for (JSONObject item : media) library.addView(mediaRow(item, requestGeneration), row());
-        if (media.isEmpty() && directory.children().isEmpty() && listError.isEmpty()) {
+        // 空列表按用户要求留白；请求期间仍显示真实加载状态。
+        if (media.isEmpty() && directory.children().isEmpty() && listError.isEmpty()
+                && (loading || folderLoading)) {
             LinearLayout empty = new LinearLayout(activity);
             empty.setOrientation(LinearLayout.VERTICAL);
             empty.setGravity(Gravity.CENTER);
             empty.setPadding(dp(12), dp(38), dp(12), dp(38));
-            if (loading || folderLoading) {
-                ProgressBar spinner = new ProgressBar(activity);
-                spinner.setIndeterminateTintList(ColorStateList.valueOf(MaiChatTheme.BLUE));
-                empty.addView(spinner, new LinearLayout.LayoutParams(dp(30), dp(30)));
-                TextView message = label("正在加载云盘", 14, MaiChatTheme.SECONDARY);
-                message.setPadding(0, dp(14), 0, 0);
-                empty.addView(message);
-            } else {
-                empty.addView(new CloudIconView(CloudIconView.IMAGE, MaiChatTheme.BLUE),
-                    new LinearLayout.LayoutParams(dp(48), dp(48)));
-                TextView title = label(directory.currentId().isEmpty() ?
-                    "还没有图片或视频" : "文件夹是空的", 17, MaiChatTheme.TEXT);
-                title.setTypeface(MaiChatTypography.semibold());
-                title.setGravity(Gravity.CENTER);
-                title.setPadding(0, dp(14), 0, dp(8));
-                empty.addView(title);
-                TextView note = label("点右上角 + 上传，文件仅当前账号可见", 13,
-                    MaiChatTheme.SECONDARY);
-                note.setGravity(Gravity.CENTER);
-                empty.addView(note);
-                empty.setContentDescription("云盘空文件夹");
-            }
+            ProgressBar spinner = new ProgressBar(activity);
+            spinner.setIndeterminateTintList(ColorStateList.valueOf(MaiChatTheme.BLUE));
+            empty.addView(spinner, new LinearLayout.LayoutParams(dp(30), dp(30)));
+            TextView message = label("正在加载云盘", 14, MaiChatTheme.SECONDARY);
+            message.setPadding(0, dp(14), 0, 0);
+            empty.addView(message);
             library.addView(empty, new LinearLayout.LayoutParams(-1, -2));
         }
     }

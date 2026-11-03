@@ -11,13 +11,8 @@ import java.util.concurrent.TimeUnit;
 import org.json.JSONObject;
 
 /** Streams the same compressed AAC file retained for fallback, without a second microphone. */
-final class TencentRealtimeSpeechStream {
-    interface Listener {
-        void partial(String text);
-        void finished(String text);
-        void failed();
-        default void diagnostic(String event) {}
-    }
+final class TencentRealtimeSpeechStream implements RealtimeSpeechStream {
+    interface Listener extends RealtimeSpeechStream.Listener { }
     private interface SocketFactory {
         CurlRealtimeSpeechWebSocket open(String voiceId, CurlRealtimeSpeechWebSocket.Listener listener)
             throws Exception;
@@ -158,8 +153,8 @@ final class TencentRealtimeSpeechStream {
             finish(null);
         }
     }
-    void endAudio() { dispatch(() -> { audioEnded = true; pump(); }); }
-    void cancel() { dispatch(() -> finish(null, false)); }
+    @Override public void endAudio() { dispatch(() -> { audioEnded = true; pump(); }); }
+    @Override public void cancel() { dispatch(() -> finish(null, false)); }
     private void finish(String text) { finish(text, true); }
     private void finish(String text, boolean notify) {
         if (finished) return;
