@@ -146,32 +146,7 @@ private struct PersonalProfileView: View {
         isSaving = true
         Task { @MainActor in
             defer { isSaving = false }
-            let fileURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("avatar-\(UUID().uuidString).jpg")
-            defer { try? FileManager.default.removeItem(at: fileURL) }
-            do {
-                let format = UIGraphicsImageRendererFormat()
-                format.scale = 1
-                let renderer = UIGraphicsImageRenderer(
-                    size: CGSize(width: 512, height: 512), format: format
-                )
-                let scale = max(512 / max(image.size.width, 1),
-                                512 / max(image.size.height, 1))
-                let width = image.size.width * scale
-                let height = image.size.height * scale
-                let avatar = renderer.image { _ in
-                    image.draw(in: CGRect(x: (512 - width) / 2, y: (512 - height) / 2,
-                                          width: width, height: height))
-                }
-                guard let data = avatar.jpegData(compressionQuality: 0.88) else {
-                    appState.showTransientError("无法处理这张图片")
-                    return
-                }
-                try data.write(to: fileURL, options: .atomic)
-                _ = await appState.uploadSelfAvatar(fileURL: fileURL)
-            } catch {
-                appState.showTransientError(error.localizedDescription)
-            }
+            _ = await appState.uploadSelfAvatar(image: image)
         }
     }
 }
@@ -302,6 +277,10 @@ private struct AccountSettingsView: View {
             }
 
             Section("隐私与支持") {
+                NavigationLink("短信接入") {
+                    AIMobileSMSSettingsView(ownerID: appState.masterUserID)
+                }
+                .accessibilityIdentifier("sms-integration-entry")
                 Link("隐私政策", destination: URL(string: "https://ichat.life/legal/privacy.html")!)
                 Link("用户协议", destination: URL(string: "https://ichat.life/legal/terms.html")!)
                 Link("联系我们", destination: URL(string: "mailto:1925271463@kongshang.com")!)

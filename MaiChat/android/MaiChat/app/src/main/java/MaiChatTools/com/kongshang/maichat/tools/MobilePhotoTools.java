@@ -76,6 +76,13 @@ final class MobilePhotoTools {
             case "mobile_beautify_image":
                 arguments.put("operation", "beautify");
                 return agentTransformImage(arguments);
+            case "mobile_reshape_body":
+                arguments.put("operation", "reshape_body");
+                return agentTransformImage(arguments);
+            case "mobile_portrait_feedback":
+                return AIAssistantController.shared(activity).portraitPersonalizationForHost(arguments, true);
+            case "model_continue_training":
+                return AIAssistantController.shared(activity).portraitPersonalizationForHost(arguments, false);
             case "mobile_detect_faces": return agentDetectFaces(arguments);
             case "mobile_segment_person": return agentSegmentPerson(arguments);
             case "mobile_preview_image": return agentPreviewImage(arguments);
@@ -374,9 +381,13 @@ final class MobilePhotoTools {
         BitmapFactory.Options bounds = new BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
         BitmapFactory.decodeFile(result.getPath(), bounds);
-        return new JSONObject().put("path", file.relativePath)
+        JSONObject response = new JSONObject().put("path", file.relativePath)
             .put("mime_type", file.mimeType).put("width", bounds.outWidth)
             .put("height", bounds.outHeight).put("next_tool", "mobile_preview_image");
+        JSONObject receipt = AIAssistantController.shared(activity).portraitReceiptForHost(file.relativePath);
+        java.util.Iterator<String> keys = receipt.keys();
+        while (keys.hasNext()) { String key = keys.next(); response.put(key, receipt.get(key)); }
+        return response;
     }
 
     private JSONObject agentImageInfo(JSONObject arguments) throws Exception {

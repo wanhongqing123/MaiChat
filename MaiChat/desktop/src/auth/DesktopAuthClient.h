@@ -121,6 +121,7 @@ public:
     QString maiChatAccountId() const { return accountId_; }
     QString authenticatedSessionIdentity() const;
     QString nickname() const { return nickname_; }
+    QString phoneMasked() const { return phoneMasked_; }
     void setCredentialUpdatedHandler(std::function<void(const DesktopImCredential&)> handler);
     void setSessionInvalidatedHandler(std::function<void(const QString&)> handler);
 
@@ -163,6 +164,7 @@ private:
     QString userId_;
     QString accountId_;
     QString nickname_;
+    QString phoneMasked_;
     // 登录/退出推进代次；刷新同一登录不推进，密码请求不能随重试切到另一登录。
     quint64 accountGeneration_ = 1;
     QDateTime accessExpiresAt_;
@@ -173,6 +175,8 @@ private:
     QTimer modelCredentialTimer_;
     bool refreshInFlight_ = false;
     bool livenessInFlight_ = false;
+    // 旧 /auth/me 回复不能清除另一登录正在执行的检查，也不能回填旧号码。
+    quint64 livenessAccountGeneration_ = 0;
     bool monitoringSession_ = false;
     bool foregroundHookInstalled_ = false;
     bool loggingOut_ = false;

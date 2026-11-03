@@ -33,6 +33,21 @@ void FakeRemoteIMClient::joinedGroups(RemoteIMGroupsCompletion completion) {
     if (completion) completion(true, {}, groups_);
 }
 
+void FakeRemoteIMClient::setSelfAvatar(const QString &avatarUrl, RemoteIMCompletion completion,
+                                       std::function<bool()> canCommit) {
+    if (connectedUserId_.isEmpty() || (canCommit && !canCommit())) {
+        if (completion) completion(false, QStringLiteral("IM 未连接"));
+        return;
+    }
+    if (!nextError_.isEmpty()) {
+        complete(std::move(completion));
+        return;
+    }
+    lastAvatarUrl_ = avatarUrl;
+    emit selfProfileReceived(connectedUserId_, connectedUserId_, avatarUrl);
+    if (completion) completion(true, {});
+}
+
 void FakeRemoteIMClient::createGroup(const QString& name, const QStringList& memberIds,
                                      RemoteIMGroupCompletion completion) {
     if (!nextError_.isEmpty()) {

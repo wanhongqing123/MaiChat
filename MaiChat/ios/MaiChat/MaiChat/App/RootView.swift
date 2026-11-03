@@ -85,12 +85,19 @@ struct RootView: View {
     @ObservedObject private var pdfPasswordRequests = AIPdfPasswordRequests.shared
     @State private var selectedTab: AppTab = {
         #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ai-image-mixed-ui-test") { return .assistant }
+        if ProcessInfo.processInfo.arguments.contains("--ai-session-reveal-ui-test") { return .assistant }
+        if ProcessInfo.processInfo.arguments.contains("--ai-browser-ui-test") { return .assistant }
+        if ProcessInfo.processInfo.arguments.contains("--ai-portrait-ui-test") { return .assistant }
+        if ProcessInfo.processInfo.environment["MAICHAT_IMAGE_ZOOM_ANCHOR_TEST"] == "1" { return .assistant }
         if ProcessInfo.processInfo.arguments.contains(
             "--cloud-drive-production-canary-normal") { return .me }
         #endif
         return .messages
     }()
     @State private var hasOpenedAssistant = false
+    @State private var assistantImagePresented = false
+    @State private var assistantImageSources = AIImageSourceFrameStore()
     @State private var assistantOpenGeneration = 0
     #if DEBUG && targetEnvironment(simulator)
     @State private var installedAssistantVideoLayoutFixture = false
@@ -110,8 +117,6 @@ struct RootView: View {
     @State private var deletingContactGroup: String?
     @State private var isShowingNotificationPermissionPrompt = false
     @State private var isVideoExpanded = false
-    @State private var galleryImage: MaiMediaSequence?
-    @State private var galleryDirection = 0
     @State private var keyboardVisible = false
     @AppStorage("maichat.notification-preprompt-dismissed")
     private var notificationPermissionPromptDismissed = false
@@ -213,17 +218,14 @@ struct RootView: View {
             // 保留同一页面实例可避免回来时重新加载历史或遗失当前输入。
             if !appState.shouldShowInitialLogin &&
                 (selectedTab == .assistant || hasOpenedAssistant) {
-                AIAssistantView(isActive: selectedTab == .assistant)
+                // 主导航与创作页面一起移开，目录联动与圆角轮廓由内部同一容器管理。
+                AIAssistantView(isActive: selectedTab == .assistant, hostsImagePreview: false,
+                    bottomBar: AnyView(RootTabBar(
+                        selectedTab: $selectedTab,
+                        remoteDesktop: appState.remoteDesktop,
+                        openAssistant: openAssistant
+                    )))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .safeAreaInset(edge: .bottom, spacing: 0) {
-                        if selectedTab == .assistant {
-                            RootTabBar(
-                                selectedTab: $selectedTab,
-                                remoteDesktop: appState.remoteDesktop,
-                                openAssistant: openAssistant
-                            )
-                        }
-                    }
                     .opacity(selectedTab == .assistant ? 1 : 0)
                     .allowsHitTesting(selectedTab == .assistant)
                     .accessibilityHidden(selectedTab != .assistant)
@@ -294,24 +296,6 @@ struct RootView: View {
                 .zIndex(70)
             }
 
-            if let galleryImage {
-                MaiGalleryImageScreen(sequence: galleryImage,
-                                      entryDirection: galleryDirection,
-                                      navigate: { direction in
-                    guard let next = galleryImage.adjacent(direction) else { return false }
-                    galleryDirection = direction
-                    if next.current.kind == .video {
-                        self.galleryImage = nil
-                        appState.agentVideoPresentation = MaiFfplayPresentation(
-                            sequence: next, entryDirection: direction)
-                    } else {
-                        self.galleryImage = next
-                    }
-                    return true
-                }, close: { self.galleryImage = nil })
-                    .id(galleryImage.current.path)
-                    .zIndex(1000)
-            }
         }
         .onChange(of: selectedTab) { tab in
 #if DEBUG
@@ -339,28 +323,20 @@ struct RootView: View {
         .padding(.top, dockHeight)
         .padding(.leading, dockWidth)
         .background(Color(red: 0.966, green: 0.976, blue: 0.988).ignoresSafeArea())
+        // 全屏的触摸与读屏隔离统一由原生分页宿主负责，避免关闭后主页面残留遮蔽。
         // 竖屏上下分区，横屏左右分区；聊天或创作中心始终保留可触摸的输入区。
         // 全屏切换只改变同一个播放器的尺寸，不重新打开文件或重置播放位置。
         .overlay {
             if let presentation = appState.agentVideoPresentation {
                 GeometryReader { geometry in
-                    MaiFfplayVideoScreen(path: presentation.path,
-                                         startSeconds: presentation.startSeconds,
-                                         entryDirection: presentation.entryDirection,
-                                         navigate: { direction in
-                        guard let next = presentation.sequence.adjacent(direction) else {
-                            return false
-                        }
-                        if next.current.kind == .video {
+                    MaiLocalMediaPager(sequence: presentation.sequence,
+                        startSeconds: presentation.startSeconds, vod: presentation.vod,
+                        isModal: isVideoExpanded,
+                        selectionChanged: { sequence in
+                            // 浏览图片和视频始终保持同一宿主、尺寸和 presentation ID。
                             appState.agentVideoPresentation = MaiFfplayPresentation(
-                                sequence: next, entryDirection: direction)
-                        } else {
-                            appState.agentVideoPresentation = nil
-                            galleryDirection = direction
-                            galleryImage = next
-                        }
-                        return true
-                    }, vod: presentation.vod) {
+                                sequence: sequence, id: presentation.id, vod: presentation.vod)
+                        }) {
                         appState.agentVideoPresentation = nil
                     }
                     .id(presentation.id)
@@ -384,21 +360,7 @@ struct RootView: View {
                         .padding(.top, isVideoExpanded ? max(geometry.safeAreaInsets.top, 58) + 12 : 12)
                         .padding(.trailing, 12)
                     }
-                    .overlay(alignment: .top) {
-                        if presentation.playlist.count > 1 {
-                            Text("\(presentation.index + 1)/\(presentation.playlist.count) · " +
-                                 URL(fileURLWithPath: presentation.path).lastPathComponent)
-                                .font(.system(size: 12, weight: .medium))
-                                .lineLimit(1)
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(.black.opacity(0.55), in: Capsule())
-                                .padding(.horizontal, 76)
-                                .padding(.top, 22)
-                                .allowsHitTesting(false)
-                        }
-                    }
+                    // 文件名和序号不覆盖播放画面；切换媒体后也保持相同的简洁布局。
                     .position(x: isVideoExpanded || !landscape ?
                               geometry.size.width / 2 : dockWidth / 2,
                               y: isVideoExpanded || landscape ?
@@ -408,7 +370,18 @@ struct RootView: View {
                 .ignoresSafeArea(edges: isVideoExpanded ? .all : [])
             }
         }
-        .statusBarHidden(galleryImage != nil ||
+        // 在底部导航的 safeAreaInset 和视频分屏之后覆盖整窗，保持下面页面布局不变。
+        .overlay {
+            if !appState.shouldShowInitialLogin && selectedTab == .assistant {
+                AIAssistantImagePreviewLayer(sources: assistantImageSources)
+            }
+        }
+        .onPreferenceChange(AIImageSourceFramesKey.self) { assistantImageSources.update($0) }
+        .onPreferenceChange(AIImagePreviewVisibilityKey.self) {
+            assistantImagePresented = $0
+            maiLocalMediaTrace("root-image-visible=\($0)")
+        }
+        .statusBarHidden(assistantImagePresented ||
                          (isVideoExpanded && appState.agentVideoPresentation != nil))
         .onChange(of: appState.agentVideoPresentation?.groupID) { _ in
             isVideoExpanded = false
@@ -665,6 +638,9 @@ struct RootView: View {
     private func offerNotificationPermissionIfNeeded() async {
 #if targetEnvironment(simulator)
         if ProcessInfo.processInfo.arguments.contains("--app-bars-layout-ui-test") ||
+            ProcessInfo.processInfo.arguments.contains("--ai-session-reveal-ui-test") ||
+            ProcessInfo.processInfo.arguments.contains("--ai-image-mixed-ui-test") ||
+            ProcessInfo.processInfo.environment["MAICHAT_IMAGE_ZOOM_ANCHOR_TEST"] == "1" ||
             ProcessInfo.processInfo.arguments.contains("--im-group-ui-test") ||
             ProcessInfo.processInfo.arguments.contains("--im-group-activation-fail-ui-test") {
             return

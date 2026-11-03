@@ -30,7 +30,7 @@ android {
         applicationId "com.kongshang.maichat"
         minSdk 26
         targetSdk 34
-        versionCode 241
+        versionCode 246
         versionName "2.2.9"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
@@ -99,6 +99,10 @@ tasks.register("stageMaiAgentGraphicsEffects", Sync) {
         include "rvm_mobilenetv3_fp32.onnx", "RVM_LICENSE"
         into "MaiAgentModels"
     }
+    from(file("$projectDir/../../../../MaiChat/Portrait/models")) {
+        include "*.onnx", "MODELS.md", "LICENSE"
+        into "MaiPortraitModels"
+    }
     // PDF 核心静态链接 qpdf；许可与归属随 App 发布，不能只留在开发机源目录。
     from(file("$projectDir/../../../../MaiAgent/third_party/qpdf")) {
         include "LICENSE.txt", "NOTICE.md"
@@ -146,12 +150,24 @@ tasks.register("stageAttachmentTlsTestAssets") {
     }
 }
 android.sourceSets.androidTest.assets.srcDir(attachmentTlsTestAssets)
+def portraitTestAssets = file("$buildDir/generated/portrait-test-assets")
+tasks.register("stagePortraitTestAssets", Copy) {
+    from(file("$projectDir/../../../../MaiAgent/third_party/opencv/samples/data/lena.jpg")) {
+        rename { "portrait-test-face.jpg" }
+    }
+    from(file("$projectDir/../../../../MaiChat/Portrait/tests/fixtures/pose.jpg")) {
+        rename { "portrait-test-body.jpg" }
+    }
+    into portraitTestAssets
+}
+android.sourceSets.androidTest.assets.srcDir(portraitTestAssets)
 tasks.configureEach {
     if (name.startsWith("merge") && name.endsWith("Assets")) {
         dependsOn("stageMaiAgentGraphicsEffects")
     }
     if (name.startsWith("merge") && name.endsWith("AndroidTestAssets")) {
         dependsOn("stageAttachmentTlsTestAssets")
+        dependsOn("stagePortraitTestAssets")
     }
 }
 

@@ -8,10 +8,12 @@ usage() {
 Package the Qt Desktop IM app for macOS.
 
 Usage:
-  MaiChat/desktop/scripts/package-macos.sh [--build-dir build] [--out-dir dist] [--app-only] [--macdeployqt /path/to/macdeployqt]
+  MaiChat/desktop/scripts/package-macos.sh [--build-dir build] [--out-dir dist] [--app-only] [--macdeployqt /path/to/macdeployqt] [--python /path/to/python3]
 
 The script expects a built macOS bundle:
   <build-dir>/bin/MaiChat.app
+Build/output paths may be absolute or relative to MaiChat/desktop.
+DMG layout needs Python 3.10+ and scripts/requirements-dmg.txt; --app-only does not.
 
 Outputs:
   <out-dir>/MaiChat-macos-arm64/
@@ -22,6 +24,7 @@ USAGE
 build_dir="build"
 out_dir="dist"
 macdeployqt=""
+python="python3"
 app_only=false
 
 while [[ $# -gt 0 ]]; do
@@ -41,6 +44,10 @@ while [[ $# -gt 0 ]]; do
     --app-only)
       app_only=true
       ;;
+    --python)
+      python="${2:-}"
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -56,7 +63,10 @@ done
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 repo_root="$(git -C "$project_root" rev-parse --show-toplevel)"
-build_path="$project_root/$build_dir"
+case "$build_dir" in
+  /*) build_path="$build_dir" ;;
+  *) build_path="$project_root/$build_dir" ;;
+esac
 app_name="MaiChat.app"
 source_app="$build_path/bin/$app_name"
 if [[ ! -d "$source_app" && -d "$build_path/$app_name" ]]; then
@@ -96,9 +106,48 @@ if [[ -z "$macdeployqt" || ! -x "$macdeployqt" ]]; then
   exit 1
 fi
 
-dist_root="$project_root/$out_dir"
+if [[ "$app_only" != true ]] &&
+    ! "$python" -c 'import sys; assert sys.version_info >= (3, 10); from ds_store import DSStore' >/dev/null 2>&1; then
+  cat >&2 <<EOF
+DMG layout requires Python 3.10+ with the pinned packaging dependencies.
+Install them in a separate environment, then pass its interpreter:
+  python3 -m venv /private/tmp/maichat-dmg-tools
+  /private/tmp/maichat-dmg-tools/bin/python -m pip install -r "$project_root/scripts/requirements-dmg.txt"
+  $0 --python /private/tmp/maichat-dmg-tools/bin/python [other options]
+
+No staging files have been changed. --app-only does not need this dependency.
+EOF
+  exit 1
+fi
+
+case "$out_dir" in
+  /*) dist_root="$out_dir" ;;
+  *) dist_root="$project_root/$out_dir" ;;
+esac
 staging="$dist_root/MaiChat-macos-arm64"
 staged_app="$staging/$app_name"
+
+# 重打包已生成的 App 时，输入可能就在输出目录内；真实路径也要覆盖符号链接别名。
+# 删除或复制前拒绝双向包含，防止清空唯一输入，或把 App 递归复制进自身。
+mkdir -p "$dist_root"
+source_app_real="$(cd "$source_app" && pwd -P)"
+if [[ -d "$staging" ]]; then
+  staging_real="$(cd "$staging" && pwd -P)"
+else
+  staging_real="$(cd "$dist_root" && pwd -P)/MaiChat-macos-arm64"
+fi
+case "$source_app_real/" in
+  "$staging_real/"*)
+    echo "Input App overlaps output staging; choose a separate --out-dir." >&2
+    exit 1
+    ;;
+esac
+case "$staging_real/" in
+  "$source_app_real/"*)
+    echo "Output staging is inside the input App; choose a separate --out-dir." >&2
+    exit 1
+    ;;
+esac
 rm -rf "$staging"
 mkdir -p "$staging"
 
@@ -173,7 +222,6 @@ dmg_path="$dist_root/$dmg_name"
 rw_dmg="$dist_root/.${dmg_name%.dmg}-rw.dmg"
 mount_dir=""
 mounted_device=""
-dmgbuild_script="$repo_root/node_modules/dmg-builder/vendor/dmgbuild/core.py"
 
 cleanup() {
   if [[ -n "$mounted_device" ]]; then
@@ -200,24 +248,8 @@ if [[ -z "$mounted_device" || -z "$mount_dir" || ! -d "$mount_dir" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$dmgbuild_script" ]]; then
-  echo "Missing DMG layout helper: $dmgbuild_script" >&2
-  echo "Install the repository's Node dependencies before packaging." >&2
-  exit 1
-fi
-
 # 直接写入 Finder 元数据，避免安装布局依赖打包机器是否允许 Finder 保存 .DS_Store。
-env \
-  volumePath="$mount_dir" \
-  iconSize=96 \
-  iconTextSize=13 \
-  windowX=120 \
-  windowY=120 \
-  windowWidth=580 \
-  windowHeight=380 \
-  backgroundColor="#ffffff" \
-  iconLocations="'MaiChat.app': (150, 165), 'Applications': (430, 165)" \
-  python3 "$dmgbuild_script"
+"$python" "$project_root/scripts/create-dmg-layout.py" "$mount_dir"
 
 sync
 if [[ ! -f "$mount_dir/.DS_Store" ]]; then

@@ -186,6 +186,11 @@ public:
                                         {QStringLiteral("nickname"), profileNickname},
                                         {QStringLiteral("im_user_id"), QStringLiteral("im-auth-test")}}},
                                     {QStringLiteral("device_slot"), testPlatformName()}};
+                        if (!mePhoneMasked.isUndefined()) {
+                            QJsonObject user = response.value(QStringLiteral("user")).toObject();
+                            user.insert(QStringLiteral("phone_masked"), mePhoneMasked);
+                            response.insert(QStringLiteral("user"), user);
+                        }
                     } else if (status == 401) {
                         response = {{QStringLiteral("error"),
                                      QStringLiteral("Session replaced by another device")},
@@ -330,6 +335,7 @@ public:
     int credentialRequestCount = 0;
     int meStatus = 200;
     int meRequestCount = 0;
+    QJsonValue mePhoneMasked = QJsonValue(QJsonValue::Undefined);
     bool meRequestNoStore = false;
     int logoutRequestCount = 0;
     int cancelRequestCount = 0;
@@ -358,6 +364,7 @@ class LoginDialogTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void cachesMaskedPhoneAcrossMeRefreshAndAccountChanges();
     void liveProductionAuthHealthCheck();
     void liveProductionAccountPasswordLogin();
     void liveProductionMainModelKeyGate();
@@ -874,6 +881,86 @@ void LoginDialogTest::distinguishesRevokedApprovalFromExplicitDenial() {
     dialog.show();
     dialog.start();
     QTRY_COMPARE_WITH_TIMEOUT(status->text(), QStringLiteral("手机授权已失效"), 5000);
+}
+
+void LoginDialogTest::cachesMaskedPhoneAcrossMeRefreshAndAccountChanges() {
+    FakeQrServer server;
+    // 明确禁用安全存储；只访问回环假服务，不读取或覆盖真实登录/Keychain。
+    DesktopAuthClient auth(nullptr, server.url(), false);
+    bool done = false;
+    bool ok = false;
+    auto adopted = [&](bool success, const QString &) {
+        done = true;
+        ok = success;
+    };
+    auth.adoptApprovedSession(server.approvedSession(), adopted);
+    QTRY_VERIFY_WITH_TIMEOUT(done, 5000);
+    QVERIFY(ok);
+    QVERIFY(auth.phoneMasked().isEmpty());
+    server.mePhoneMasked = QStringLiteral("138****0000");
+    auth.startSessionMonitoring();
+    auth.checkSessionNow();
+    QTRY_COMPARE_WITH_TIMEOUT(auth.phoneMasked(), QStringLiteral("138****0000"), 5000);
+
+    // 真实 401→refresh→adoptSession 路径：refresh 的精简 user 没有 phone_masked。
+    server.firstCredentialUnauthorized = true;
+    done = false;
+    auth.fetchImCredential(adopted);
+    QTRY_VERIFY_WITH_TIMEOUT(done, 5000);
+    QVERIFY(ok);
+    QCOMPARE(server.refreshCount, 1);
+    QCOMPARE(auth.phoneMasked(), QStringLiteral("138****0000"));
+
+    server.mePhoneMasked = QStringLiteral("12345678901");
+    auth.checkSessionNow();
+    QTRY_VERIFY_WITH_TIMEOUT(auth.phoneMasked().isEmpty(), 5000);
+    server.mePhoneMasked = QStringLiteral("138****0000");
+    auth.checkSessionNow();
+    QTRY_COMPARE_WITH_TIMEOUT(auth.phoneMasked(), QStringLiteral("138****0000"), 5000);
+    server.mePhoneMasked = QJsonValue(QJsonValue::Null);
+    auth.checkSessionNow();
+    QTRY_VERIFY_WITH_TIMEOUT(auth.phoneMasked().isEmpty(), 5000);
+    server.mePhoneMasked = QStringLiteral("138****0000");
+    auth.checkSessionNow();
+    QTRY_COMPARE_WITH_TIMEOUT(auth.phoneMasked(), QStringLiteral("138****0000"), 5000);
+    done = false;
+    auth.logout(adopted);
+    QTRY_VERIFY_WITH_TIMEOUT(done, 5000);
+    QVERIFY(ok);
+    QVERIFY(auth.phoneMasked().isEmpty());
+
+    // 正式 App 退出登录后结束 AuthClient 生命周期；新登录使用新的普通客户端。
+    DesktopAuthClient replacement(nullptr, server.url(), false);
+    QJsonObject session = server.approvedSession();
+    QJsonObject user = session.value(QStringLiteral("user")).toObject();
+    user.insert(QStringLiteral("phone_masked"), QStringLiteral("139****1111"));
+    session.insert(QStringLiteral("user"), user);
+    done = false;
+    replacement.adoptApprovedSession(session, adopted);
+    QTRY_VERIFY_WITH_TIMEOUT(done, 5000);
+    QVERIFY(ok);
+    QCOMPARE(replacement.phoneMasked(), QStringLiteral("139****1111"));
+    user.insert(QStringLiteral("phone_masked"), QJsonValue(QJsonValue::Null));
+    session.insert(QStringLiteral("user"), user);
+    done = false;
+    replacement.adoptApprovedSession(session, adopted);
+    QTRY_VERIFY_WITH_TIMEOUT(done, 5000);
+    QVERIFY(replacement.phoneMasked().isEmpty());
+    user.insert(QStringLiteral("phone_masked"), QStringLiteral("139****1111"));
+    session.insert(QStringLiteral("user"), user);
+    done = false;
+    replacement.adoptApprovedSession(session, adopted);
+    QTRY_VERIFY_WITH_TIMEOUT(done, 5000);
+    QCOMPARE(replacement.phoneMasked(), QStringLiteral("139****1111"));
+    user.remove(QStringLiteral("phone_masked"));
+    user.insert(QStringLiteral("id"), QStringLiteral("m-another-test"));
+    session.insert(QStringLiteral("user"), user);
+    done = false;
+    replacement.adoptApprovedSession(session, adopted);
+    QVERIFY(replacement.phoneMasked().isEmpty());
+    QTRY_VERIFY_WITH_TIMEOUT(done, 5000);
+    QVERIFY(ok);
+    QCOMPARE(replacement.maiChatAccountId(), QStringLiteral("m-another-test"));
 }
 
 void LoginDialogTest::detectsReplacedSessionDuringForegroundCheck() {

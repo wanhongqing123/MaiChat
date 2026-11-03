@@ -46,3 +46,13 @@ Mac 构建的 FFmpeg 9.0.2 启用 VideoToolbox 和 AudioToolbox。独立 Graphic
 真实设备上的滚动、视图复用和色彩仍需验收。视频帧已能通过共用 Presenter
 呈现并在 macOS、iOS、Android 的测试中执行；音频输出、音画同步和现有
 播放器 UI 的切换仍未完成。
+
+Apple 播放器可按交换链显式启用系统 HLG/EDR，复用 FP16、扩展线性 BT.2020 和
+拍摄环境 AMVE；不依赖上述全局 SDR 配置。Mac 的显式播放器模式持续到调用方关闭，
+普通 OBS 预览仍跟随原来的全局配置。接口和平台差异见 `UPSTREAM.md`，实际像素回归
+见 `MaiChat/Media/tests/MaiGraphicsHlgMacTests.mm`。
+
+Android 检查实际目标附件的颜色编码，与 OBS 的 sRGB 纹理采样配对。
+默认 LINEAR 表面使用最终 sRGB 编码 effect，sRGB 表面保留原有 Draw，避免漏编码或重复编码。
+`PortraitInstrumentedTest` 同时检查处理 PNG 和实际 TextureView 的像素误差，
+不再以纯红主色像素或处理结果返回成功代替色彩验收。

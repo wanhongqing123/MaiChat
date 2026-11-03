@@ -938,6 +938,8 @@ int main(int argc, char** argv) {
     MaiToolContext browserContext;
     browserContext.sessionId = "ses_browser";
     browserContext.root = directory;
+    browserContext.messageId = "msg_browser_open";
+    browserContext.partId = "part_browser_open";
     CHECK(browser->execute(R"({"action":"open","url":"file:///private/test"})",
                            browserContext).hasError());
     CHECK(browserProbe.calls.load() == 0);
@@ -945,6 +947,10 @@ int main(int argc, char** argv) {
                             browserContext).hasError());
     CHECK(browserProbe.lastTool == "mobile_browser" &&
           Json::parse(browserProbe.lastArguments)["session_id"] == "ses_browser");
+    CHECK(Json::parse(browserProbe.lastArguments)["message_id"] == "msg_browser_open");
+    CHECK(Json::parse(browserProbe.lastArguments)["part_id"] == "part_browser_open");
+    CHECK(browser->execute(R"({"action":"open","url":"https://example.com","message_id":"forged"})",
+                           browserContext).hasError());
     clearMaiMobileHostToolHandler(browserDispatcher);
     CHECK(browserProbe.released.load());
     void* agent = maiMobileAgentCreate();

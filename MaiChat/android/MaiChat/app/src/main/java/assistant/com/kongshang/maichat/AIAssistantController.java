@@ -115,9 +115,12 @@ public final class AIAssistantController {
             shared = new AIAssistantController(context, null);
         return shared;
     }
+    /** 账号工具的只读归属检查不能顺带初始化另一个账号的 Agent 或触发凭据请求。 */
+    public static synchronized AIAssistantController initializedAccountToolOwner() { return shared; }
     public static synchronized void configureAccount(String userId) {
         String next = userId == null ? "" : userId.trim();
-        if (next.equals(currentAccountUserId)) return;
+        if (next.equals(currentAccountUserId) && (shared == null ||
+                shared.accountToolLoginGeneration == shared.accountAuth.accountSessionGeneration())) return;
         MaiCloudDriveAgentTools.cancelAll(applicationContext);
         String legacyOwner = currentAccountUserId.isEmpty() ? next : currentAccountUserId;
         if (applicationContext != null && !legacyOwner.isEmpty()) {
@@ -186,7 +189,10 @@ public final class AIAssistantController {
     static native byte[] nativeMatteVideo(byte[] arguments, byte[] workspace,
         byte[] modelPath, byte[] runtimePath);
     private static native boolean nativeSetHostToolHandler(long handle, AIAssistantController owner);
-    private static native byte[] nativeFilterBitmap(Bitmap bitmap, String operation, int[] dimensions);
+    private static native byte[] nativeFilterBitmap(Bitmap bitmap, String operation, int[] dimensions,
+        byte[][] metadata, byte[] profile, byte[] source);
+    private static native void nativeConfigurePortrait(byte[] models, byte[] runtime);
+    private static native byte[] nativePortraitRequest(byte[] profile, byte[] request, byte[] output, int action);
 
     private final Context context;
     private final HandlerThread thread = new HandlerThread("MaiChat-Agent");
@@ -195,6 +201,7 @@ public final class AIAssistantController {
     private final String testEndpoint;
     private final String accountUserId;
     private final MaiChatAuthClient accountAuth;
+    private final long accountToolLoginGeneration;
     private final AndroidSessionSyncCoordinator sessionSync;
     private volatile Listener listener;
     private volatile HostToolHandler hostToolHandler;
@@ -266,6 +273,7 @@ public final class AIAssistantController {
     AIAssistantController(Context context, String testEndpoint) {
         this.context = context.getApplicationContext();
         accountAuth = MaiChatAuthClient.shared(this.context);
+        accountToolLoginGeneration = accountAuth.accountSessionGeneration();
         if (testEndpoint != null && !BuildConfig.DEBUG)
             throw new IllegalArgumentException("Test endpoint in release build");
         this.testEndpoint = testEndpoint;
@@ -424,6 +432,36 @@ public final class AIAssistantController {
         if (target == null)
             return hostToolFailure("MaiChat 宿主工具尚未连接");
 
+        if (tool.equals("maichat_cancel_avatar")) {
+            try {
+                // 原生取消监视线程可并发进入；只投递给本地请求表，不等待主线程或网络。
+                Object output = target.execute(tool, new JSONObject(arguments));
+                return new JSONObject().put("ok", true).put("output", output)
+                    .toString().getBytes(StandardCharsets.UTF_8);
+            } catch (Throwable failure) {
+                return hostToolFailure("头像取消请求无效", "invalid_input");
+            }
+        }
+
+        if (tool.equals("maichat_get_current_account") || tool.equals("maichat_set_avatar")) {
+            if (Looper.myLooper() == Looper.getMainLooper())
+                return hostToolFailure("账号资料工具不能在 UI 线程执行", "internal");
+            try {
+                JSONObject input = new JSONObject(arguments);
+                if (!accountToolScopeMatches(accountUserId, accountToolLoginGeneration,
+                        input.optString("workspace_path"), input.optString("session_id")))
+                    return hostToolFailure("登录账号或工作区已变化，请重新操作", "canceled");
+                // 身份来自承载原生 Agent 的实例；模型参数和新 shared 实例都不能重绑旧调用。
+                input.put("_account_im_user_id", accountUserId)
+                    .put("_account_auth_generation", accountToolLoginGeneration);
+                Object output = target.execute(tool, input);
+                return new JSONObject().put("ok", true).put("output", output)
+                    .toString().getBytes(StandardCharsets.UTF_8);
+            } catch (Throwable failure) {
+                return hostToolFailure("账号资料操作尚未确认，请检查登录状态和网络");
+            }
+        }
+
         // Cloud callbacks post their result to MAIN. Calling the host on MAIN
         // and then waiting for that callback would deadlock every cloud tool.
         if (tool.startsWith("maichat_cloud_drive_")) {
@@ -505,6 +543,8 @@ public final class AIAssistantController {
                     "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828");
             }
             catch (Exception failure) { Log.w("MaiChatAgent", "Agent model staging failed", failure); }
+            try { preparePortraitModels(); }
+            catch (Exception failure) { Log.w("MaiChatAgent", "Portrait models are unavailable"); }
             // 本地仅读取非敏感设置；模型凭据和 Workspace ID 由当前账号领取。
             File settings = new File(root, "settings.json");
             if (settings.isFile()) {
@@ -653,6 +693,47 @@ public final class AIAssistantController {
         } finally {
             Files.deleteIfExists(staged.toPath());
         }
+    }
+
+    private void preparePortraitModels() throws Exception {
+        String[][] models = {
+            {"face_landmarks.onnx", "f38c3321ceffbc9e95103480ad38cc3f52e7e1bde2bcee7cd9355d0b9138ac0c"},
+            {"selfie_multiclass.onnx", "35ec1ecd9ee7f85073c99c00020b7f6751b69506eeacf683bc8665f6117f85b0"},
+            {"person_detection.onnx", "47fd5599d6fa17608f03e0eb0ae230baa6e597d7e8a2c8199fe00abea55a701f"},
+            {"pose_estimation.onnx", "9d89c599319a18fb7d2e28451a883476164543182bafca5f09eb2cf767ed2f3f"}
+        };
+        File directory = new File(root, "PortraitModels");
+        if (!directory.mkdirs() && !directory.isDirectory()) throw new IOException("Cannot create portrait model directory");
+        for (String[] model : models) {
+            File target = new File(directory, model[0]);
+            if (target.isFile() && sha256(target).equals(model[1])) continue;
+            File staged = new File(directory, model[0] + ".part");
+            try {
+                try (InputStream input = context.getAssets().open("MaiPortraitModels/" + model[0]);
+                     FileOutputStream output = new FileOutputStream(staged)) {
+                    byte[] buffer = new byte[1024 * 1024]; int count;
+                    while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                    output.getFD().sync();
+                }
+                if (!sha256(staged).equals(model[1])) throw new IOException("Portrait model checksum mismatch");
+                Files.move(staged.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            } finally { Files.deleteIfExists(staged.toPath()); }
+        }
+        nativeConfigurePortrait(directory.getPath().getBytes(StandardCharsets.UTF_8),
+            new File(context.getApplicationInfo().nativeLibraryDir, "libonnxruntime.so").getPath().getBytes(StandardCharsets.UTF_8));
+    }
+
+    public JSONObject portraitPersonalizationForHost(JSONObject arguments, boolean feedback) throws Exception {
+        JSONObject request = new JSONObject(arguments.toString());
+        if (feedback) request.put("action", "record_feedback");
+        return portraitEnvelope(nativePortraitRequest(new File(root, "PortraitPreferences").getPath().getBytes(StandardCharsets.UTF_8),
+            request.toString().getBytes(StandardCharsets.UTF_8), null, 0));
+    }
+    private static JSONObject portraitEnvelope(byte[] response) throws Exception {
+        if (response == null) throw new IOException("Portrait service returned no response");
+        JSONObject envelope = new JSONObject(new String(response, StandardCharsets.UTF_8));
+        if (!envelope.optBoolean("ok")) throw new IllegalArgumentException(envelope.optString("error", "Portrait operation failed"));
+        return envelope.getJSONObject("output");
     }
 
     private static String sha256(File file) throws Exception {
@@ -971,6 +1052,32 @@ public final class AIAssistantController {
             if (entry != null && sessionId.equals(entry.optString("id"))) return true;
         }
         return false;
+    }
+
+    /** Android 本机会话统一使用本账号 Workspace；可以验证任一本机会话，无需切换 UI 选择。
+     * 空上下文的普通资料查询仍由实例身份和登录代际绑定；有工作区时必须精确匹配。
+     */
+    public boolean accountToolScopeMatches(String expectedImUserId, long expectedGeneration,
+                                           String workspacePath, String sessionId) {
+        if (!accountToolIdentityMatches(expectedImUserId, expectedGeneration)) return false;
+        if (workspacePath != null && !workspacePath.isEmpty()) {
+            if (root == null) return false;
+            try {
+                if (!new File(root, "Workspace").getCanonicalFile()
+                        .equals(new File(workspacePath).getCanonicalFile())) return false;
+            } catch (IOException failure) { return false; }
+        }
+        return sessionId == null || sessionId.isEmpty() || hasLocalSession(sessionId);
+    }
+
+    /** SDK 已确认后的真实结果仍可读取；停止或删除发起 Session 不能撤回已发生的账号写入。 */
+    public boolean accountToolIdentityMatches(String expectedImUserId, long expectedGeneration) {
+        synchronized (AIAssistantController.class) {
+            if (shared != this || closed || !accountUserId.equals(expectedImUserId) ||
+                    expectedGeneration != accountToolLoginGeneration ||
+                    accountToolLoginGeneration != accountAuth.accountSessionGeneration()) return false;
+        }
+        return true;
     }
 
     void commandForSync(String sessionId, JSONObject action, Consumer<JSONObject> completion) {
@@ -2280,6 +2387,17 @@ public final class AIAssistantController {
     // 作用：校验工作区图片并执行宿主图片转换。
     public ImportedFile transformImageForHost(JSONObject arguments) throws Exception {
         File source = workspaceImageForHost(arguments.optString("path", ""));
+        boolean portrait = arguments.optString("operation").equals("beautify") || arguments.optString("operation").equals("reshape_body");
+        String profile = new File(root, "PortraitPreferences").getPath();
+        if (portrait) {
+            byte[] original = nativePortraitRequest(profile.getBytes(StandardCharsets.UTF_8),
+                source.getPath().getBytes(StandardCharsets.UTF_8), null, 1);
+            if (original == null) throw new IOException("Cannot resolve portrait original");
+            source = workspaceImageForHost(new String(original, StandardCharsets.UTF_8));
+            arguments = new JSONObject(arguments.toString());
+            arguments.put("_face_hints", arguments.optString("operation").equals("beautify")
+                ? com.kongshang.maichat.tools.MobileImageVision.detectFaces(source).getJSONArray("faces") : new JSONArray());
+        }
         if (source.length() < 1 || source.length() > 50L * 1024 * 1024)
             throw new IllegalArgumentException("源图片不能超过 50 MB");
         BitmapFactory.Options bounds = new BitmapFactory.Options();
@@ -2317,7 +2435,12 @@ public final class AIAssistantController {
                 upright = Bitmap.createBitmap(decoded, 0, 0, decoded.getWidth(), decoded.getHeight(),
                     orientation, true);
             int[] dimensions = new int[2];
-            byte[] pixels = nativeFilterBitmap(upright, arguments.toString(), dimensions);
+            byte[][] metadata = new byte[1][];
+            JSONObject specification = new JSONObject(arguments.toString());
+            specification.remove("path");
+            byte[] pixels = nativeFilterBitmap(upright, specification.toString(), dimensions, metadata,
+                portrait ? profile.getBytes(StandardCharsets.UTF_8) : null,
+                portrait ? source.getPath().getBytes(StandardCharsets.UTF_8) : null);
             if (pixels == null || dimensions[0] < 1 || dimensions[1] < 1)
                 throw new IllegalStateException("图片处理没有返回结果");
             edited = Bitmap.createBitmap(dimensions[0], dimensions[1], Bitmap.Config.ARGB_8888);
@@ -2330,6 +2453,14 @@ public final class AIAssistantController {
             }
             if (target.length() < 1 || target.length() > 50L * 1024 * 1024)
                 throw new IllegalArgumentException("处理结果超过 50 MB");
+            if (metadata[0] != null) {
+                JSONObject receipt = portraitEnvelope(nativePortraitRequest(profile.getBytes(StandardCharsets.UTF_8),
+                    metadata[0], target.getPath().getBytes(StandardCharsets.UTF_8), 2));
+                synchronized (portraitReceipts) {
+                    if (portraitReceipts.size() >= 32) portraitReceipts.remove(portraitReceipts.keySet().iterator().next());
+                    portraitReceipts.put(name, receipt);
+                }
+            }
             return new ImportedFile(name, "image/png", true);
         } catch (Exception error) {
             if (target != null) target.delete();
@@ -2338,6 +2469,13 @@ public final class AIAssistantController {
             if (edited != null) edited.recycle();
             if (upright != decoded) upright.recycle();
             decoded.recycle();
+        }
+    }
+    private final java.util.Map<String, JSONObject> portraitReceipts = new java.util.LinkedHashMap<>();
+    public JSONObject portraitReceiptForHost(String path) {
+        synchronized (portraitReceipts) {
+            JSONObject receipt = portraitReceipts.remove(path);
+            return receipt == null ? new JSONObject() : receipt;
         }
     }
     File workspaceDirectoryForPreview() {

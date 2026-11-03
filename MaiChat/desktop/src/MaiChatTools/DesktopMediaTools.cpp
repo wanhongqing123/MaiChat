@@ -16,7 +16,6 @@
 
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <string>
 
@@ -36,79 +35,152 @@ QJsonObject parseArguments(const std::string& value) {
     return QJsonDocument::fromJson(QByteArray(value.data(), static_cast<int>(value.size()))).object();
 }
 
+// 仅保存值类型的回合标识，不持有 MaiToolContext 或其中有生命周期的取消指针。
+// 全部访问都在 GUI 线程；打开与控制工具共享记录，不能把起播时间再次当成补偿 Seek。
+struct DesktopVideoNavigation {
+    QPointer<MaiFfplayVideoDialog> dialog;
+    std::string sessionId;
+    std::string messageId;
+    int64_t targetUs = 0;
+    uint64_t generation = 0;
+
+    bool matches(MaiFfplayVideoDialog* current, const MaiToolContext& context, int64_t target) const {
+        return current && current->isStarted() && dialog == current && !context.sessionId.empty() &&
+               !context.messageId.empty() && sessionId == context.sessionId && messageId == context.messageId &&
+               targetUs == target && generation == current->navigationGeneration();
+    }
+
+    void remember(MaiFfplayVideoDialog* current, const MaiToolContext& context, int64_t target) {
+        dialog = current;
+        sessionId = context.sessionId;
+        messageId = context.messageId;
+        targetUs = target;
+        generation = current->navigationGeneration();
+    }
+};
+
+// 与异步命令分开返回真实状态；尚未采到时间时用 null，不能用请求目标冒充实际位置。
+QJsonObject videoStatus(MaiFfplayVideoDialog* dialog) {
+    MaiFfplayPlaybackStatus status{};
+    const bool open = dialog && dialog->isStarted();
+    const bool sampled = open && maiFfplayGetPlaybackStatus(&status);
+    const bool ready = sampled && status.duration_us > 0 && dialog->presentedFrames() > 0;
+    const QString state =
+        !open ? QStringLiteral("closed")
+              : (!ready ? QStringLiteral("opening")
+                        : (status.seeking ? QStringLiteral("seeking")
+                                          : (status.paused ? QStringLiteral("paused") : QStringLiteral("playing"))));
+    QJsonObject result{{QStringLiteral("state"), state},
+                       {QStringLiteral("running"), sampled},
+                       {QStringLiteral("ready"), ready},
+                       {QStringLiteral("seeking"), sampled && status.seeking != 0},
+                       {QStringLiteral("position_seconds"), QJsonValue(QJsonValue::Null)},
+                       {QStringLiteral("duration_seconds"), QJsonValue(QJsonValue::Null)}};
+    if (sampled) {
+        result.insert(QStringLiteral("paused"), status.paused != 0);
+        result.insert(QStringLiteral("speed"), status.speed_percent / 100.0);
+        if (status.duration_us > 0) {
+            result.insert(QStringLiteral("position_seconds"), status.position_us / 1'000'000.0);
+            result.insert(QStringLiteral("duration_seconds"), status.duration_us / 1'000'000.0);
+        }
+        if (status.seeking) result.insert(QStringLiteral("seek_target_seconds"), status.seek_target_us / 1'000'000.0);
+    }
+    return result;
+}
+
+bool sourcePositionUs(double seconds, int64_t* output) {
+    const long double value = std::round(static_cast<long double>(seconds) * 1'000'000);
+    // arm64 的 long double 也可能只有 double 精度；用精确的 2^63 开区间避免 MAX 被上舍入。
+    if (!std::isfinite(seconds) || seconds < 0 || value >= 0x1p63L) return false;
+    *output = static_cast<int64_t>(value);
+    return true;
+}
+
 class DesktopPlayVideoTool final : public MaiTool {
 public:
-    explicit DesktopPlayVideoTool(QWidget* window) : window_(window) {}
-    std::string name() const override { return "maichat_play_video"; }
+    DesktopPlayVideoTool(QWidget* window, std::shared_ptr<DesktopVideoNavigation> navigation)
+        : window_(window), navigation_(std::move(navigation)) {}
+    std::string name() const override {
+        return "maichat_play_video";
+    }
     std::string description() const override {
         return "Open a local video in MaiChat's FFplay/Graphics player at optional "
                "start_seconds of source-media time. The Agent and IM message video use the "
-               "same player. Relative paths start in the Agent workspace.";
+               "same player in an independent window. Relative paths start in the Agent workspace. "
+               "opened confirms the window was created; ready and position_seconds report actual "
+               "playback state. start_seconds already positions playback: do not send another seek "
+               "to verify it. Use maichat_video_command action=status for read-only progress checks.";
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{"path":{"type":"string"},)"
-            R"("start_seconds":{"type":"number","minimum":0}},"required":["path"],)"
-            R"("additionalProperties":false})";
+               R"("start_seconds":{"type":"number","minimum":0}},"required":["path"],)"
+               R"("additionalProperties":false})";
     }
-    MaiToolResult execute(const std::string& argumentsJson,
-                          const MaiToolContext& context) override {
+    MaiToolResult execute(const std::string& argumentsJson, const MaiToolContext& context) override {
         const QJsonObject arguments = parseArguments(argumentsJson);
         const QString requested = arguments.value(QStringLiteral("path")).toString().trimmed();
         if (requested.isEmpty()) return invalid("path is required");
         double startSeconds = 0;
+        int64_t startPositionUs = 0;
         if (arguments.contains(QStringLiteral("start_seconds"))) {
             const QJsonValue value = arguments.value(QStringLiteral("start_seconds"));
             if (!value.isDouble()) return invalid("start_seconds must be a nonnegative source-media time");
             startSeconds = value.toDouble();
-            if (!std::isfinite(startSeconds) || startSeconds < 0 ||
-                startSeconds > static_cast<double>(std::numeric_limits<int64_t>::max()) / 1'000'000)
+            if (!sourcePositionUs(startSeconds, &startPositionUs))
                 return invalid("start_seconds must be a nonnegative source-media time");
         }
-        const int64_t startPositionUs = static_cast<int64_t>(startSeconds * 1'000'000);
         const QByteArray bytes = requested.toUtf8();
-        const std::string resolved = context.resolvePath(
-            std::string(bytes.constData(), static_cast<size_t>(bytes.size())));
+        const std::string resolved =
+            context.resolvePath(std::string(bytes.constData(), static_cast<size_t>(bytes.size())));
         if (resolved.empty()) return invalid("video path is outside the accessible area");
         const QString path = QString::fromUtf8(resolved.data(), static_cast<int>(resolved.size()));
         if (!QFileInfo(path).isFile())
             return MaiToolResult::failure(MaiErrorCode::NotFound, "video file does not exist");
-        if (window_.isNull())
-            return MaiToolResult::failure(MaiErrorCode::NotConfigured, "MaiChat window is closed");
+        if (window_.isNull()) return MaiToolResult::failure(MaiErrorCode::NotConfigured, "MaiChat window is closed");
         bool opened = false;
+        QJsonObject output;
         const auto show = [&] {
             if (window_.isNull()) return;
             if (auto* mainWindow = dynamic_cast<MainWindow*>(window_.data())) {
-                opened = mainWindow->openDockedVideo(path, {}, startPositionUs);
-                return;
+                opened = mainWindow->openVideoWindow(path, {}, startPositionUs);
+            } else {
+                if (auto existing = MaiFfplayVideoDialog::activeDialog()) existing->close();
+                auto* dialog = new MaiFfplayVideoDialog(path, window_.data(), startPositionUs);
+                dialog->setWindowFlags(Qt::Window | Qt::WindowCloseButtonHint | Qt::WindowMinMaxButtonsHint |
+                                       Qt::WindowTitleHint);
+                dialog->setAttribute(Qt::WA_DeleteOnClose);
+                dialog->show();
+                opened = dialog->isStarted();
+                if (!opened) dialog->close();
             }
-            if (auto existing = MaiFfplayVideoDialog::activeDialog()) existing->close();
-            auto* dialog = new MaiFfplayVideoDialog(path, window_.data(), startPositionUs);
-            dialog->setAttribute(Qt::WA_DeleteOnClose);
-            dialog->show();
-            opened = dialog->isStarted();
-            if (!opened) dialog->close();
+            if (opened) {
+                const auto dialog = MaiFfplayVideoDialog::activeDialog();
+                if (dialog) navigation_->remember(dialog, context, startPositionUs);
+                output = videoStatus(dialog);
+                output.insert(QStringLiteral("opened"), true);
+                output.insert(QStringLiteral("start_seconds"), startSeconds);
+            }
         };
-        if (QThread::currentThread() == window_->thread()) show();
+        if (QThread::currentThread() == window_->thread())
+            show();
         else if (!QMetaObject::invokeMethod(window_.data(), show, Qt::BlockingQueuedConnection))
-            return MaiToolResult::failure(MaiErrorCode::Internal,
-                                          "cannot dispatch video playback to MaiChat UI");
+            return MaiToolResult::failure(MaiErrorCode::Internal, "cannot dispatch video playback to MaiChat UI");
         if (!opened)
-            return MaiToolResult::failure(MaiErrorCode::Internal,
-                                          "FFplay or Graphics could not open the video player");
-        return MaiToolResult::success(
-            QJsonDocument(QJsonObject{{QStringLiteral("opened"), true},
-                                      {QStringLiteral("start_seconds"), startSeconds}})
-                .toJson(QJsonDocument::Compact).toStdString());
+            return MaiToolResult::failure(MaiErrorCode::Internal, "FFplay or Graphics could not open the video player");
+        return MaiToolResult::success(QJsonDocument(output).toJson(QJsonDocument::Compact).toStdString());
     }
 
 private:
     QPointer<QWidget> window_;
+    std::shared_ptr<DesktopVideoNavigation> navigation_;
 };
 
 class DesktopCameraCommandTool final : public MaiTool {
 public:
     explicit DesktopCameraCommandTool(QWidget* window) : window_(window) {}
-    std::string name() const override { return "maichat_camera_command"; }
+    std::string name() const override {
+        return "maichat_camera_command";
+    }
     std::string description() const override {
         return "Control the desktop camera preview without waiting for the shutter. open returns "
                "immediately; the user can take a JPEG photo in the current Agent workspace. "
@@ -118,24 +190,25 @@ public:
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{"action":{"type":"string",)"
-            R"("enum":["open","status","close"]}},"required":["action"],)"
-            R"("additionalProperties":false})";
+               R"("enum":["open","status","close"]}},"required":["action"],)"
+               R"("additionalProperties":false})";
     }
-    bool requiresApproval(const std::string&) const override { return false; }
-    bool requiresPerCallApproval(const std::string&) const override { return false; }
+    bool requiresApproval(const std::string&) const override {
+        return false;
+    }
+    bool requiresPerCallApproval(const std::string&) const override {
+        return false;
+    }
     MaiToolResult execute(const std::string& argumentsJson, const MaiToolContext& context) override {
-        if (window_.isNull())
-            return MaiToolResult::failure(MaiErrorCode::NotConfigured,
-                                          "MaiChat window is closed");
+        if (window_.isNull()) return MaiToolResult::failure(MaiErrorCode::NotConfigured, "MaiChat window is closed");
         const QString action = parseArguments(argumentsJson).value(QStringLiteral("action")).toString();
-        if (action != QStringLiteral("open") && action != QStringLiteral("status") &&
-            action != QStringLiteral("close")) return invalid("action must be open, status, or close");
+        if (action != QStringLiteral("open") && action != QStringLiteral("status") && action != QStringLiteral("close"))
+            return invalid("action must be open, status, or close");
         if (context.sessionId.empty()) return invalid("a Session is required");
         const QString sessionId = QString::fromStdString(context.sessionId);
         QString directory;
         if (action == QStringLiteral("open")) {
-            if (context.isCanceled())
-                return MaiToolResult::failure(MaiErrorCode::Canceled, "camera open was canceled");
+            if (context.isCanceled()) return MaiToolResult::failure(MaiErrorCode::Canceled, "camera open was canceled");
             const std::string resolved = context.resolvePath(".");
             if (resolved.empty()) return invalid("an accessible Agent workspace is required");
             directory = QString::fromUtf8(resolved.data(), static_cast<int>(resolved.size()));
@@ -145,8 +218,7 @@ public:
         const auto run = [&] {
             if (window_.isNull()) return;
             if (action == QStringLiteral("open")) {
-                const bool opened = DesktopCameraDialog::openPreview(
-                    window_.data(), sessionId, directory, &error);
+                const bool opened = DesktopCameraDialog::openPreview(window_.data(), sessionId, directory, &error);
                 output.insert(QStringLiteral("state"), opened ? QStringLiteral("open") : QStringLiteral("closed"));
             } else if (action == QStringLiteral("close")) {
                 const bool wasOpen = DesktopCameraDialog::closePreview(window_.data(), sessionId);
@@ -156,29 +228,29 @@ public:
                 const bool open = DesktopCameraDialog::isPreviewOpen(window_.data(), sessionId);
                 const QString cameraError = DesktopCameraDialog::previewError(window_.data(), sessionId);
                 const QString photo = DesktopCameraDialog::lastPreviewPhoto(window_.data(), sessionId);
-                const QString state = !cameraError.isEmpty() ? QStringLiteral("error") :
-                    (open ? QStringLiteral("open") :
-                     (photo.isEmpty() ? QStringLiteral("closed") : QStringLiteral("captured")));
+                const QString state =
+                    !cameraError.isEmpty()
+                        ? QStringLiteral("error")
+                        : (open ? QStringLiteral("open")
+                                : (photo.isEmpty() ? QStringLiteral("closed") : QStringLiteral("captured")));
                 output.insert(QStringLiteral("state"), state);
                 if (!cameraError.isEmpty()) output.insert(QStringLiteral("error"), cameraError);
                 if (!photo.isEmpty()) {
-                    const QString root = QFileInfo(QString::fromStdString(context.root))
-                        .canonicalFilePath();
+                    const QString root = QFileInfo(QString::fromStdString(context.root)).canonicalFilePath();
                     const QString captured = QFileInfo(photo).canonicalFilePath();
                     if (!root.isEmpty() && captured.startsWith(root + QLatin1Char('/')))
                         output.insert(QStringLiteral("path"), QDir(root).relativeFilePath(captured));
                 }
             }
         };
-        if (QThread::currentThread() == window_->thread()) run();
+        if (QThread::currentThread() == window_->thread())
+            run();
         else if (!QMetaObject::invokeMethod(window_.data(), run, Qt::BlockingQueuedConnection))
-            return MaiToolResult::failure(MaiErrorCode::Internal,
-                                          "cannot dispatch camera command to MaiChat UI");
-        if (!error.isEmpty())
-            return MaiToolResult::failure(MaiErrorCode::Internal, error.toStdString());
-        return MaiToolResult::success(
-            QJsonDocument(output).toJson(QJsonDocument::Compact).toStdString());
+            return MaiToolResult::failure(MaiErrorCode::Internal, "cannot dispatch camera command to MaiChat UI");
+        if (!error.isEmpty()) return MaiToolResult::failure(MaiErrorCode::Internal, error.toStdString());
+        return MaiToolResult::success(QJsonDocument(output).toJson(QJsonDocument::Compact).toStdString());
     }
+
 private:
     QPointer<QWidget> window_;
 };
@@ -186,7 +258,9 @@ private:
 class DesktopPlayLocalMusicTool final : public MaiTool {
 public:
     explicit DesktopPlayLocalMusicTool(QWidget* window) : window_(window) {}
-    std::string name() const override { return "maichat_play_local_music"; }
+    std::string name() const override {
+        return "maichat_play_local_music";
+    }
     std::string description() const override {
         return "Open MaiChat's FFplay music player for a local MP3, M4A, or WAV. Provide a path in the "
                "Agent workspace, or omit path to let the user choose a file. Never scan the "
@@ -194,15 +268,16 @@ public:
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{"path":{"type":"string"}},)"
-            R"("additionalProperties":false})";
+               R"("additionalProperties":false})";
     }
-    bool requiresApproval(const std::string&) const override { return false; }
-    bool requiresPerCallApproval(const std::string&) const override { return false; }
-    MaiToolResult execute(const std::string& argumentsJson,
-                          const MaiToolContext& context) override {
-        if (window_.isNull())
-            return MaiToolResult::failure(MaiErrorCode::NotConfigured,
-                                          "MaiChat window is closed");
+    bool requiresApproval(const std::string&) const override {
+        return false;
+    }
+    bool requiresPerCallApproval(const std::string&) const override {
+        return false;
+    }
+    MaiToolResult execute(const std::string& argumentsJson, const MaiToolContext& context) override {
+        if (window_.isNull()) return MaiToolResult::failure(MaiErrorCode::NotConfigured, "MaiChat window is closed");
         const QJsonObject arguments = parseArguments(argumentsJson);
         QString chosen;
         if (arguments.contains(QStringLiteral("path"))) {
@@ -210,8 +285,8 @@ public:
             if (!value.isString() || value.toString().trimmed().isEmpty())
                 return invalid("path must be a local audio file");
             const QByteArray bytes = value.toString().trimmed().toUtf8();
-            const std::string resolved = context.resolvePath(
-                std::string(bytes.constData(), static_cast<size_t>(bytes.size())));
+            const std::string resolved =
+                context.resolvePath(std::string(bytes.constData(), static_cast<size_t>(bytes.size())));
             if (resolved.empty()) return invalid("audio path is outside the accessible workspace");
             chosen = QString::fromUtf8(resolved.data(), static_cast<int>(resolved.size()));
         }
@@ -221,74 +296,111 @@ public:
             if (window_.isNull()) return;
             if (chosen.isEmpty())
                 chosen = QFileDialog::getOpenFileName(window_.data(), QStringLiteral("选择本地音乐"),
-                    QStandardPaths::writableLocation(QStandardPaths::MusicLocation),
-                    QStringLiteral("音频文件 (*.mp3 *.m4a *.wav)"));
-            if (!chosen.isEmpty())
-                opened = DesktopMusicPlayerDialog::openFile(window_.data(), chosen, &error);
+                                                      QStandardPaths::writableLocation(QStandardPaths::MusicLocation),
+                                                      QStringLiteral("音频文件 (*.mp3 *.m4a *.wav)"));
+            if (!chosen.isEmpty()) opened = DesktopMusicPlayerDialog::openFile(window_.data(), chosen, &error);
         };
-        if (QThread::currentThread() == window_->thread()) show();
+        if (QThread::currentThread() == window_->thread())
+            show();
         else if (!QMetaObject::invokeMethod(window_.data(), show, Qt::BlockingQueuedConnection))
-            return MaiToolResult::failure(MaiErrorCode::Internal,
-                                          "cannot dispatch music player to MaiChat UI");
-        if (!error.isEmpty())
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput, error.toStdString());
-        if (!opened)
-            return MaiToolResult::failure(MaiErrorCode::Canceled, "music selection was canceled");
+            return MaiToolResult::failure(MaiErrorCode::Internal, "cannot dispatch music player to MaiChat UI");
+        if (!error.isEmpty()) return MaiToolResult::failure(MaiErrorCode::InvalidInput, error.toStdString());
+        if (!opened) return MaiToolResult::failure(MaiErrorCode::Canceled, "music selection was canceled");
         return MaiToolResult::success(
             QJsonDocument(QJsonObject{{QStringLiteral("opened"), true},
                                       {QStringLiteral("file_name"), QFileInfo(chosen).fileName()}})
-                .toJson(QJsonDocument::Compact).toStdString());
+                .toJson(QJsonDocument::Compact)
+                .toStdString());
     }
+
 private:
     QPointer<QWidget> window_;
 };
 
 class DesktopVideoCommandTool final : public MaiTool {
 public:
-    explicit DesktopVideoCommandTool(QWidget* window) : window_(window) {}
-    std::string name() const override { return "maichat_video_command"; }
+    DesktopVideoCommandTool(QWidget* window, std::shared_ptr<DesktopVideoNavigation> navigation)
+        : window_(window), navigation_(std::move(navigation)) {}
+    std::string name() const override {
+        return "maichat_video_command";
+    }
     std::string description() const override {
         // set_speed 在当前弹窗内重启同一 FFplay 源文件并回到原片位置；
-        // atempo 保持音调，音画同步，不生成转码文件，但切速有短暂中断。
+        // SoundTouch 保持音调，音画同步，不生成转码文件，但切速有短暂中断。
         return "Control the currently open FFplay video player. set_speed accepts speed "
                "0.25, 0.5, 1, 1.5, or 2; it keeps audio in sync and preserves pitch through "
-               "FFmpeg atempo. Changing speed briefly restarts the same popup at its source "
+               "SoundTouch. Changing speed briefly restarts the same popup at its source "
                "position without creating a new media file. seek_seconds jumps to an absolute "
                "source-media time; seek_percent and the existing play, pause, step, relative "
                "or chapter seek, replay, previous_item, next_item, stream/filter cycling, "
                "mute, volume, fullscreen, and close "
-               "actions remain available.";
+               "actions remain available. status only reads actual position, readiness and pending "
+               "seek state; use it to check progress instead of seeking again. accepted means queued, "
+               "not completed. Repeating the same absolute target in one response is deduplicated; "
+               "set force_seek=true only when the user explicitly requests returning there again.";
     }
     std::string parametersSchema() const override {
-        return R"({"type":"object","properties":{"action":{"type":"string","enum":["play","pause","toggle_pause",)"
-            R"("step","replay","previous_item","next_item","seek_forward","seek_backward",)"
-            R"("seek_minute_forward","seek_minute_backward","next_chapter",)"
-            R"("previous_chapter","seek_percent","seek_seconds","set_speed","next_audio","next_video","next_subtitle",)"
-            R"("next_program","next_filter","mute","volume_up","volume_down","fullscreen","close"]},)"
-            R"("percent":{"type":"number","minimum":0,"maximum":100},"seconds":{"type":"number","minimum":0},)"
-            R"("speed":{"type":"number","enum":[0.25,0.5,1,1.5,2]}},"required":["action"],"additionalProperties":false)"
-            R"(})";
+        return R"({"type":"object","properties":{"action":{"type":"string","enum":["status","play","pause","toggle_pause",)"
+               R"("step","replay","previous_item","next_item","seek_forward","seek_backward",)"
+               R"("seek_minute_forward","seek_minute_backward","next_chapter",)"
+               R"("previous_chapter","seek_percent","seek_seconds","set_speed","next_audio","next_video","next_subtitle",)"
+               R"("next_program","next_filter","mute","volume_up","volume_down","fullscreen","close"]},)"
+               R"("percent":{"type":"number","minimum":0,"maximum":100},"seconds":{"type":"number","minimum":0},)"
+               R"("speed":{"type":"number","enum":[0.25,0.5,1,1.5,2]},"force_seek":{"type":"boolean",)"
+               R"("description":"Only for an explicitly requested repeated absolute seek, not status verification."}},)"
+               R"("required":["action"],"additionalProperties":false)"
+               R"(})";
     }
-    MaiToolResult execute(const std::string& argumentsJson,
-                          const MaiToolContext&) override {
+    MaiToolResult execute(const std::string& argumentsJson, const MaiToolContext& context) override {
         const QJsonObject arguments = parseArguments(argumentsJson);
         const QString action = arguments.value(QStringLiteral("action")).toString();
         if (action.isEmpty()) return invalid("action is required");
-        if (window_.isNull())
-            return MaiToolResult::failure(MaiErrorCode::NotConfigured, "MaiChat window is closed");
+        const bool absoluteSeek = action == QStringLiteral("seek_seconds") || action == QStringLiteral("seek_percent");
+        if (arguments.contains(QStringLiteral("force_seek")) &&
+            (!absoluteSeek || !arguments.value(QStringLiteral("force_seek")).isBool()))
+            return invalid("force_seek is a boolean for absolute seek actions only");
+        const bool force = arguments.value(QStringLiteral("force_seek")).toBool();
+        int64_t targetUs = 0;
+        double fraction = 0;
+        if (action == QStringLiteral("seek_seconds")) {
+            const auto value = arguments.value(QStringLiteral("seconds"));
+            if (!value.isDouble() || !sourcePositionUs(value.toDouble(), &targetUs))
+                return invalid("seconds must be a nonnegative source-media time");
+        } else if (action == QStringLiteral("seek_percent")) {
+            const auto value = arguments.value(QStringLiteral("percent"));
+            if (!value.isDouble() || !std::isfinite(value.toDouble()) || value.toDouble() < 0 || value.toDouble() > 100)
+                return invalid("percent must be between 0 and 100");
+            fraction = value.toDouble() / 100.0;
+        }
+        if (window_.isNull()) return MaiToolResult::failure(MaiErrorCode::NotConfigured, "MaiChat window is closed");
         bool found = false;
         bool accepted = false;
+        QJsonObject output;
         const auto send = [&] {
             auto dialog = MaiFfplayVideoDialog::activeDialog();
+            if (action == QStringLiteral("status")) {
+                // 不打开、定位或恢复播放器；关闭后查询仍可得到明确 closed 状态。
+                found = accepted = true;
+                output = videoStatus(dialog);
+                return;
+            }
             if (dialog.isNull()) return;
             found = true;
-            if (action == QStringLiteral("seek_percent")) {
-                const auto value = arguments.value(QStringLiteral("percent"));
-                if (value.isDouble() && value.toDouble() >= 0 && value.toDouble() <= 100)
-                    accepted = dialog->seekPercent(value.toDouble() / 100.0);
-            } else if (action == QStringLiteral("seek_seconds")) {
-                const auto value = arguments.value(QStringLiteral("seconds"));
-                if (value.isDouble()) accepted = dialog->seekSeconds(value.toDouble());
+            bool deduplicated = false;
+            if (absoluteSeek) {
+                MaiFfplayPlaybackStatus status{};
+                const bool sampled = maiFfplayGetPlaybackStatus(&status) != 0;
+                if (action == QStringLiteral("seek_percent")) {
+                    if (!sampled || status.duration_us <= 0) return;
+                    targetUs = static_cast<int64_t>(fraction * status.duration_us);
+                }
+                if (sampled && status.duration_us > 0 && targetUs > status.duration_us) return;
+                deduplicated = !force && navigation_->matches(dialog, context, targetUs);
+                accepted =
+                    deduplicated || (action == QStringLiteral("seek_percent")
+                                         ? dialog->seekPercent(fraction)
+                                         : dialog->seekSeconds(arguments.value(QStringLiteral("seconds")).toDouble()));
+                if (accepted && !deduplicated) navigation_->remember(dialog, context, targetUs);
             } else if (action == QStringLiteral("set_speed")) {
                 const auto value = arguments.value(QStringLiteral("speed"));
                 if (value.isDouble()) accepted = dialog->setSpeed(value.toDouble());
@@ -310,26 +422,32 @@ public:
             } else {
                 accepted = dialog->sendCommand(action);
             }
+            if (accepted) {
+                output = videoStatus(dialog);
+                output.insert(QStringLiteral("accepted"), true);
+                if (absoluteSeek) output.insert(QStringLiteral("deduplicated"), deduplicated);
+            }
         };
-        if (QThread::currentThread() == window_->thread()) send();
+        if (QThread::currentThread() == window_->thread())
+            send();
         else if (!QMetaObject::invokeMethod(window_.data(), send, Qt::BlockingQueuedConnection))
-            return MaiToolResult::failure(MaiErrorCode::Internal,
-                                          "cannot dispatch video command to MaiChat UI");
-        if (!found)
-            return MaiToolResult::failure(MaiErrorCode::NotFound, "no MaiChat video popup is open");
+            return MaiToolResult::failure(MaiErrorCode::Internal, "cannot dispatch video command to MaiChat UI");
+        if (!found) return MaiToolResult::failure(MaiErrorCode::NotFound, "no MaiChat video popup is open");
         if (!accepted) return invalid("invalid or unavailable video command");
-        return MaiToolResult::success(R"({"accepted":true})");
+        return MaiToolResult::success(QJsonDocument(output).toJson(QJsonDocument::Compact).toStdString());
     }
 
 private:
     QPointer<QWidget> window_;
+    std::shared_ptr<DesktopVideoNavigation> navigation_;
 };
 
 }  // namespace
 
 void registerDesktopMediaTools(MaiToolRegistry& registry, QWidget* window) {
-    registry.add(std::make_unique<DesktopPlayVideoTool>(window));
+    auto navigation = std::make_shared<DesktopVideoNavigation>();
+    registry.add(std::make_unique<DesktopPlayVideoTool>(window, navigation));
     registry.add(std::make_unique<DesktopCameraCommandTool>(window));
     registry.add(std::make_unique<DesktopPlayLocalMusicTool>(window));
-    registry.add(std::make_unique<DesktopVideoCommandTool>(window));
+    registry.add(std::make_unique<DesktopVideoCommandTool>(window, navigation));
 }

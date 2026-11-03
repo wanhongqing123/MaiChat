@@ -63,6 +63,35 @@ private final class DiagnosticAccountSnapshot: @unchecked Sendable {
     }
 }
 
+// SDK 工作队列不能读取 MainActor 的账号状态；同步镜像让排队中的旧头像写入立即失效。
+private final class IMProfileAccountSnapshot: @unchecked Sendable {
+    struct Session: Sendable, Equatable { let userID: String?; let generation: UUID }
+    private let lock = NSLock()
+    private var value = Session(userID: nil, generation: UUID())
+    func begin(userID: String?) {
+        lock.lock(); value = Session(userID: userID, generation: UUID()); lock.unlock()
+    }
+    func load() -> Session {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+}
+
+// SDK 可能晚回调或不回调；取消、超时及 SDK 完成只能恢复同一 continuation 一次。
+private final class AvatarSDKCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    init(_ continuation: CheckedContinuation<Void, Error>) { self.continuation = continuation }
+    @discardableResult func finish(_ result: Result<Void, Error>) -> Bool {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(with: result)
+        return pending != nil
+    }
+}
+
 final class TencentIMClient:
     NSObject,
     RemoteIMClient,
@@ -81,9 +110,11 @@ final class TencentIMClient:
     var onIncomingGroupText: ((IncomingRemoteIMGroupText) -> Void)?
     var onGroupMembershipChanged: (() -> Void)?
     var onPresenceStatusChanged: (([String: RemoteIMPresenceStatus]) -> Void)?
+    var onSelfProfileChanged: ((RemoteIMUserProfile) -> Void)?
     private nonisolated let lifecycleState = IMSDKLifecycleState()
     private nonisolated let applicationBadgeSnapshot = ApplicationBadgeSnapshot()
     private nonisolated let attachmentDownloads = MaiChatAttachmentDownloader()
+    private nonisolated let profileAccountSnapshot = IMProfileAccountSnapshot()
     private nonisolated static let diagnosticAccountSnapshot = DiagnosticAccountSnapshot()
     private nonisolated static let sdkQueue = DispatchQueue(label: "MaiChat.IMSDKWork", qos: .userInitiated)
     private nonisolated static let incomingQueue = DispatchQueue(label: "MaiChat.IMIncoming", qos: .userInitiated)
@@ -92,6 +123,7 @@ final class TencentIMClient:
     /// 连接阶段分别处理初始化、登录和回调注册，失败向上层返回可定位错误。
     func connect(sdkAppID: Int, userID: String, userSig: String) async throws {
         attachmentDownloads.cancelAll()
+        profileAccountSnapshot.begin(userID: userID)
         let diagnosticAccount = RemoteDiagnosticsProtocol.accountTag(sdkAppID: sdkAppID, ownerUserID: userID)
         Self.diagnosticAccountSnapshot.store(diagnosticAccount)
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -178,6 +210,7 @@ final class TencentIMClient:
 
     func disconnect() async {
         attachmentDownloads.cancelAll()
+        profileAccountSnapshot.begin(userID: nil)
         Self.diagnosticAccountSnapshot.store(nil)
         await withCheckedContinuation { continuation in
             let state = lifecycleState
@@ -286,19 +319,45 @@ final class TencentIMClient:
         }
     }
 
-    func setSelfAvatar(url: String) async throws {
+    func setSelfAvatar(url: String, expectedUserID: String, request: MaiAvatarMutationRequest) async throws {
+        try Task.checkCancellation()
+        try request.checkActive()
+        let session = profileAccountSnapshot.load()
+        guard session.userID == expectedUserID else { throw MaiChatAvatarError.accountChanged }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let completion = AvatarSDKCompletion(continuation)
+            request.whenCanceled { completion.finish(.failure(CancellationError())) }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) {
+                if completion.finish(.failure(MaiChatAvatarError.sdkRejected)) { request.cancel() }
+            }
             Self.sdkQueue.async {
+                guard request.isActive, self.profileAccountSnapshot.load() == session,
+                      V2TIMManager.sharedInstance().getLoginUser() == expectedUserID,
+                      request.beginSDKMutation() else {
+                    completion.finish(.failure(CancellationError()))
+                    return
+                }
                 let info = V2TIMUserFullInfo()
                 info.faceURL = url
                 V2TIMManager.sharedInstance().setSelfInfo(info: info, succ: {
-                    continuation.resume()
+                    // SDK 已接受并确认属于旧登录的写入；停止不能把真实成功改写为取消。
+                    request.confirmSDKMutation()
+                    completion.finish(.success(()))
                 }, fail: { code, description in
-                    continuation.resume(throwing: RemoteIMClientError.operationFailed(
+                    completion.finish(.failure(RemoteIMClientError.operationFailed(
                         code: code, description: description ?? "setSelfInfo failed"
-                    ))
+                    )))
                 })
             }
+        }
+    }
+
+    @objc nonisolated func onSelfInfoUpdated(info: V2TIMUserFullInfo) {
+        let session = profileAccountSnapshot.load()
+        guard let profile = Self.profile(from: info), profile.userID == session.userID else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.profileAccountSnapshot.load() == session else { return }
+            self.onSelfProfileChanged?(profile)
         }
     }
 

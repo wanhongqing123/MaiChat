@@ -5,6 +5,7 @@
 #include "ui/ImagePreviewDialog.h"
 
 #include "MaiCloudDriveClient.h"
+#include "MaiCloudVod.h"
 #include "MaiCurlDownload.h"
 
 #include <QApplication>
@@ -21,6 +22,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QResource>
 #include <QSaveFile>
@@ -380,13 +382,15 @@ int main(int argc, char** argv) {
             failure = QStringLiteral("cloud gate unavailable or test account is not empty");
     }
 
-    QString playedPath;
+    std::shared_ptr<MaiCloudVod> playedSource;
     QJsonArray mediaEvidence;
     bool workersStopped = true;
     if (failure.isEmpty()) {
         CloudDriveDialog dialog([&] { return access; },
             [&] { return credentials.accountId; },
-            [&](const QString& path) { playedPath = path; });
+            [&](std::shared_ptr<MaiCloudVod> source, const QString&) {
+                playedSource = std::move(source);
+            });
         dialog.openDrive();
         if (!waitFor([&] { return visibleText(dialog,
                 QStringLiteral("云盘里还没有图片或视频")); }, 20000))
@@ -429,11 +433,9 @@ int main(int argc, char** argv) {
                 .arg(fixture.kind);
             confirmations.start();
             dialog.openDrive(fixture.path);
-            const QString action = fixture.image ? QStringLiteral("cloudDriveViewImage") :
-                                                   QStringLiteral("cloudDrivePlay");
             if (!waitFor([&] {
                     QFrame* row = rowForName(dialog, fixture.name);
-                    return row && visibleButton(*row, action);
+                    return row && row->objectName() == QStringLiteral("cloudDriveMediaRow");
                 }, 60000))
                 failure = fixture.kind + QStringLiteral(" upload or UI list timed out");
             confirmations.stop();
@@ -479,12 +481,14 @@ int main(int argc, char** argv) {
                 break;
             }
             QFrame* row = rowForName(dialog, fixture.name);
-            auto* open = row ? visibleButton(*row, action) : nullptr;
+            auto* open = row ? row->findChild<QLabel*>(QStringLiteral("cloudDriveThumbnail")) : nullptr;
             if (!open) {
                 failure = fixture.kind + QStringLiteral(" open action disappeared");
                 break;
             }
-            open->click();
+            QMouseEvent doubleClick(QEvent::MouseButtonDblClick, open->rect().center(),
+                                    Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(open, &doubleClick);
             if (fixture.image) {
                 if (!waitFor([&] { return imagePreview(dialog) != nullptr; }, 60000)) {
                     failure = fixture.kind + QStringLiteral(" original preview timed out");
@@ -497,16 +501,24 @@ int main(int argc, char** argv) {
                     failure = fixture.kind + QStringLiteral(" original preview failed");
                 if (preview) preview->close();
             } else {
-                if (!waitFor([&] { return !playedPath.isEmpty(); }, 60000))
-                    failure = QStringLiteral("video playback download timed out");
+                if (!waitFor([&] { return bool(playedSource); }, 60000))
+                    failure = QStringLiteral("video playback source timed out");
                 else {
-                    QFile downloaded(playedPath);
-                    if (!downloaded.open(QIODevice::ReadOnly) ||
-                        QCryptographicHash::hash(downloaded.readAll(),
-                                                 QCryptographicHash::Sha256) != fixture.sha256)
+                    QCryptographicHash digest(QCryptographicHash::Sha256);
+                    uint64_t offset = 0;
+                    QByteArray buffer(256 * 1024, Qt::Uninitialized);
+                    while (offset < mai_cloud_vod_size(playedSource.get())) {
+                        size_t count = 0;
+                        MaiCloudVodResult result{};
+                        if (!mai_cloud_vod_read_at(playedSource.get(), offset,
+                                reinterpret_cast<uint8_t*>(buffer.data()), size_t(buffer.size()),
+                                &count, &result) || !count) break;
+                        digest.addData(buffer.constData(), int(count));
+                        offset += count;
+                    }
+                    if (offset != uint64_t(fixture.bytes) || digest.result() != fixture.sha256)
                         failure = QStringLiteral("video playback bytes differ from source");
-                    QFile::remove(playedPath);
-                    playedPath.clear();
+                    playedSource.reset();
                 }
             }
             if (!failure.isEmpty()) break;
@@ -579,7 +591,7 @@ int main(int argc, char** argv) {
                 quota.value(QStringLiteral("reserved_bytes")).toDouble() == 0;
         }, 30000);
     }
-    if (!playedPath.isEmpty()) QFile::remove(playedPath);
+    playedSource.reset();
     evidence.insert(QStringLiteral("account_id"), credentials.accountId);
     evidence.insert(QStringLiteral("test_data_directory"), appData);
     if (access.isValid()) {

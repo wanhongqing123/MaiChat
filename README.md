@@ -27,7 +27,48 @@ MaiChat 包含 iOS、Android 和 Qt 桌面客户端，以及账号、云盘和�
 
 Qt 目标由 `MaiChat/desktop/CMakeLists.txt` 配置。macOS 打包入口为 `MaiChat/desktop/scripts/package-macos.sh`；Windows 打包、依赖检查和运行时验证入口位于同一 `scripts/` 目录。应先准备匹配的 Qt 和平台依赖，按脚本说明构建和检查，不把仅完成编译当成完整包验收。
 
+## VS Code C++ 索引
+
+在仓库根目录打开 VS Code。根目录的 `compile_commands.json` 汇集真实桌面、MaiAgent
+和移动端构建命令，clangd 使用 `.clangd` 中的统一入口；本机 VS Code 配置同时指定了
+C/C++ 扩展的数据库位置，并隐藏构建、缓存、日志和临时目录。生成文件不提交到仓库。
+
+首次提供已有构建导出的数据库，顺序决定同一源文件优先使用哪套平台选项：
+
+```bash
+python3 MaiChat/scripts/generate-workspace-compile-commands.py \
+  --database <desktop-build>/compile_commands.json \
+  --database <agent-build>/compile_commands.json \
+  --database <mobile-build>/compile_commands.json \
+  --ios-fragments .cache/cpp-index/ios-fragments
+```
+
+输入位置会保存在本机 `.cache/cpp-index/inputs.json`。新增 C++ 源文件或调整 CMake 后，
+运行以下命令刷新已有构建配置与索引数据库，无需重新编译产品：
+
+```bash
+python3 MaiChat/scripts/generate-workspace-compile-commands.py --refresh
+```
+
+iOS Xcode 专有源文件通过 Clang 的 `-gen-cdb-fragment-path` 构建选项导出真实命令，
+片段目录沿用上述 `--ios-fragments`；修改 Xcode 编译选项后重新导出片段再运行汇集脚本。
+旧子目录数据库会替换为指向根数据库的相对链接，避免编辑器继续读取拆仓前的路径。
+
+## iOS Swift 测试代码
+
+正式页面和模型仍在 `MaiChat/ios/MaiChat/MaiChat/` 原有功能目录中。App 内的测试宿主、
+假会话、生成素材和本机验收逻辑集中在其中的 `DebugSupport/`，只在 Debug 编译，
+正式代码仅保留需要访问私有状态的短接入点。XCTest 断言和操作脚本继续放在同级
+`MaiChatUITests/` 独立 target；共享 scheme 的 Test 使用 Debug，正常 Run 使用 Release。
+
 ## 服务与凭据
+
+账号资料工具：`maichat_get_current_account` 读取当前登录账号的本机资料快照，返回公开
+MaiChat ID、IM ID、昵称、脱敏手机号及稳定头像地址；离线不等于退出，未知字段为 null。
+其中 `account_id` 对应「我 → 个人资料 → 账号」，用于添加好友；`im_user_id` 是内部聊天标识。
+`maichat_set_avatar` 接受 Agent 可访问的本地图片，规范化为 512×512 JPEG，经现有
+签名服务和客户端 OSS 直传后等待 IM 确认。它与普通头像服务共用实现，原图保留；
+昵称修改和安全密码入口继续使用已有工具。创作中心的能力列表仍是不可点击的说明。
 
 `services/auth`、`services/oss-media-signer`、`services/model-credentials`、`services/shared` 和 `services/integration` 共同实现并验证账号、素材及凭据流程，`services/legal` 提供法律文档。实际部署、证书、密钥、数据库和用户数据位于部署环境，迁移源码本身不会迁移或重启线上服务。发布或部署前分别阅读各服务的 README，验证环境配置、访问权限和已有客户端兼容性。
 

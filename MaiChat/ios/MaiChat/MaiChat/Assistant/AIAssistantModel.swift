@@ -988,14 +988,18 @@ struct AIImagePreview: Identifiable, Equatable {
     let filePath: String
     let imageSize: CGSize
     let sourceFrame: CGRect?
+    // 每个缩略图视图的稳定标识；同一文件可能出现在多条消息中，不能仅按路径返回。
+    let sourceID: UUID?
     let sequence: MaiMediaSequence?
 
     init(filePath: String, imageSize: CGSize = .zero, sourceFrame: CGRect? = nil,
+         sourceID: UUID? = nil,
          sequence: MaiMediaSequence? = nil, id: UUID = UUID()) {
         self.id = id
         self.filePath = filePath
         self.imageSize = imageSize
         self.sourceFrame = sourceFrame
+        self.sourceID = sourceID
         self.sequence = sequence
     }
 }
@@ -1044,6 +1048,10 @@ actor AIAssistantBackend {
         guard let pointer else { return }
         if let apiBase = OrtGetApiBase() {
             _ = maiMobileAgentSetOrtApiBase(pointer, UnsafeRawPointer(apiBase))
+            // 共用照片处理器延迟加载模型；这里仅登记宿主运行库和固定资源目录。
+            if let models = Bundle.main.resourceURL?.appendingPathComponent("MaiPortraitModels") {
+                models.path.withCString { maiPortraitConfigure($0, nil, UnsafeRawPointer(apiBase)) }
+            }
         }
         _ = maiMobileAgentSetChangeHandler(pointer, aiMobileAgentSessionChanged)
         let context = Unmanaged.passRetained(AIMaiChatHostToolCallbackContext()).toOpaque()
@@ -1093,7 +1101,7 @@ actor AIAssistantBackend {
             )
         }
         var directory = try AIAssistantWorkspaceLocator.directory(for: accountUserID)
-        #if targetEnvironment(simulator)
+        #if DEBUG && targetEnvironment(simulator)
         let uiTest = ProcessInfo.processInfo.arguments.contains("--ai-ui-test") ||
             ProcessInfo.processInfo.environment["MAICHAT_LOCAL_UI_MODEL"] == "1"
             if uiTest {
@@ -1114,7 +1122,7 @@ actor AIAssistantBackend {
         try? await AICloudCredentialSync.refreshSeedanceIfNeeded(force: true)
         try? await AICloudCredentialSync.refreshBailianIfNeeded(force: true)
         var key = storedKey(for: settings.model)
-        #if targetEnvironment(simulator)
+        #if DEBUG && targetEnvironment(simulator)
         if uiTest {
             // 独立验收账号使用配套的本机模型端口，避免把测试调用发送到其他正在运行的 fixture。
             let modelPort = Int(ProcessInfo.processInfo.environment["MAICHAT_LOCAL_UI_MODEL_PORT"] ?? "18189")
@@ -1126,7 +1134,7 @@ actor AIAssistantBackend {
         }
         #endif
         try configure(settings, key: key)
-        #if targetEnvironment(simulator)
+        #if DEBUG && targetEnvironment(simulator)
         if uiTest { _ = try requestAgentOperation("create") }
         #endif
         initialized = true
@@ -1169,7 +1177,7 @@ actor AIAssistantBackend {
     }
 
     func save(_ config: AIModelSettings) throws {
-        #if targetEnvironment(simulator)
+        #if DEBUG && targetEnvironment(simulator)
         // 与 open 的本地模型判定一致，让正常 Root 验收也能通过正式设置保存权限模式。
         let isLocalUITest = ProcessInfo.processInfo.arguments.contains("--ai-ui-test") ||
             ProcessInfo.processInfo.environment["MAICHAT_LOCAL_UI_MODEL"] == "1"
@@ -1450,9 +1458,6 @@ final class AIAssistantModel: ObservableObject {
     private var visible = false
     private var pageActive = true
     private var composerTyping = false
-    #if targetEnvironment(simulator)
-    private var sessionSwitchUITest = false
-    #endif
     var busy: Bool {
         if let selectedRemote {
             return remoteSessions.first {
@@ -1472,145 +1477,28 @@ final class AIAssistantModel: ObservableObject {
     }
 
     #if DEBUG
-    func installVideoToolTestWorkspace(_ path: String) { workspacePath = path }
-    #if targetEnvironment(simulator)
-    private var screenFrameUITestAccountID: String?
-    func installScreenFrameUITestWorkspace(_ path: String, accountID: String) {
-        guard ProcessInfo.processInfo.arguments.contains("--ai-screen-frames-ui-test") else { return }
-        workspacePath = path
-        screenFrameUITestAccountID = accountID
+    // DebugSupport 通过这一小型边界设置隔离状态，正式状态的 setter 继续保持私有。
+    let uiTestSupport = AIAssistantModelUITestSupport()
+    func applyUITestMutation(_ mutation: AIAssistantUITestMutation) {
+        switch mutation {
+        case .workspace(let path): workspacePath = path
+        case .remoteSessions(let values): remoteSessions = values
+        case .clearRemoteSelection: selectedRemote = nil
+        case .attachments(let files, let firstSession):
+            pendingAttachments.merge(files) { _, replacement in replacement }
+            firstMessageSessionID = firstSession
+        case .selectedHistory(let id, let page):
+            selected = id
+            messages = page
+            visibleMessageLimit = Self.recentMessageCount
+            historyLoaded = true
+            scrollRequest += 1
+        }
     }
-    #endif
     #endif
 
     func setComposerTyping(_ active: Bool) { composerTyping = active }
 
-    #if targetEnvironment(simulator)
-    func installHistoryUITestFixture() {
-        let session = "history-ui-test"
-        sessions = [AISession(id: session, title: "历史会话", busy: false)]
-        selected = session
-        messages = (0..<80).map { index in
-            let part = AIPart(id: "history-part-\(index)", kind: "text",
-                              text: "历史消息 \(index)\n第二行内容", tool: nil,
-                              input: nil, output: nil, error: nil, state: nil,
-                              path: nil, mimeType: nil)
-            return AIMessage(id: "history-message-\(index)", role: "assistant",
-                             created: Int64(index), completed: Int64(index + 1),
-                             active: false, parts: [part])
-        }
-        ready = true
-    }
-
-    func installStreamingTypingUITestFixture() {
-        let session = "stream-typing-ui-test"
-        sessions = [AISession(id: session, title: "流式输入测试", busy: true)]
-        selected = session
-        messages = (0..<30).map { index in
-            let part = AIPart(id: "stream-old-part-\(index)", kind: "text",
-                              text: "先前的消息 \(index)", tool: nil,
-                              input: nil, output: nil, error: nil, state: nil,
-                              path: nil, mimeType: nil)
-            return AIMessage(id: String(format: "stream-message-%02d", index),
-                             role: "assistant", created: Int64(index),
-                             completed: Int64(index + 1), active: false, parts: [part])
-        }
-        ready = true
-        historyLoaded = true
-        Task { @MainActor [weak self] in
-            for index in 0..<60 {
-                try? await Task.sleep(for: .milliseconds(100))
-                guard let self, self.selected == session else { return }
-                let part = AIPart(id: "stream-active-part", kind: "text",
-                                  text: String(repeating: "正在输出内容。", count: index + 1),
-                                  tool: nil, input: nil, output: nil, error: nil, state: nil,
-                                  path: nil, mimeType: nil)
-                let active = AIMessage(id: "stream-message-30", role: "assistant",
-                                       created: 30, completed: 0, active: true, parts: [part])
-                if self.messages.count == 30 { self.messages.append(active) }
-                else { self.messages[30] = active }
-            }
-        }
-    }
-
-    func installSessionSwitchUITestFixture() {
-        sessionSwitchUITest = true
-        sessions = ["A", "B", "C"].map {
-            AISession(id: "switch-\($0)", title: "对话 \($0)", busy: false)
-        }
-        remoteSessions = [AIRemoteSession(
-            sessionID: "remote-demo", title: "Mac 上的编译任务", updatedAt: nil, busy: false,
-            deviceSlot: "mac", deviceName: "工作 Mac", deviceID: "fixturemac",
-            loginSessionID: "fixturelogin", online: false)]
-        selected = "switch-A"
-        messages = sessionSwitchUITestMessages("A")
-        ready = true
-        historyLoaded = true
-    }
-
-    func installWelcomeUITestFixture() {
-        sessions = []
-        selected = ""
-        selectedRemote = nil
-        messages = []
-        configured = true
-        ready = true
-        historyLoaded = true
-    }
-
-    func installMediaDraftUITestFixture() {
-        installSessionSwitchUITestFixture()
-        let workspace = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ai-media-draft-ui-test", isDirectory: true)
-        guard let video = Bundle.main.url(forResource: "ffplay-sample", withExtension: "mp4"),
-              (try? FileManager.default.createDirectory(
-                at: workspace, withIntermediateDirectories: true
-              )) != nil else { return }
-        let image = UIGraphicsImageRenderer(size: CGSize(width: 220, height: 160))
-            .image { context in
-                UIColor.systemBlue.setFill()
-                context.fill(CGRect(x: 0, y: 0, width: 220, height: 160))
-                UIColor.white.setFill()
-                context.fill(CGRect(x: 45, y: 45, width: 130, height: 70))
-            }
-        let imageFile = workspace.appendingPathComponent("draft-image.png")
-        let emptyDraftImageFile = workspace.appendingPathComponent("empty-draft-image.png")
-        let videoFile = workspace.appendingPathComponent("draft-video.mp4")
-        guard let imageData = image.pngData(),
-              (try? imageData.write(to: imageFile, options: .atomic)) != nil,
-              (try? imageData.write(to: emptyDraftImageFile, options: .atomic)) != nil else {
-            return
-        }
-        if !FileManager.default.fileExists(atPath: videoFile.path) {
-            try? FileManager.default.copyItem(at: video, to: videoFile)
-        }
-        workspacePath = workspace.path
-        pendingAttachments[selected] = [
-            AIImportedFile(relativePath: imageFile.lastPathComponent,
-                           mimeType: "image/png", isImage: true),
-            AIImportedFile(relativePath: videoFile.lastPathComponent,
-                           mimeType: "video/mp4", isImage: false)
-        ]
-        pendingAttachments[""] = [
-            AIImportedFile(relativePath: emptyDraftImageFile.lastPathComponent,
-                           mimeType: "image/png", isImage: true)
-        ]
-        // 模拟过去的首发目标仍存在，检验手动回到空草稿再选 A 不会误迁移文字。
-        firstMessageSessionID = "switch-A"
-    }
-
-    private func sessionSwitchUITestMessages(_ title: String) -> [AIMessage] {
-        (0..<80).map { index in
-            let part = AIPart(id: "switch-part-\(title)-\(index)", kind: "text",
-                              text: "\(title) 历史消息 \(index)\n第二行内容", tool: nil,
-                              input: nil, output: nil, error: nil, state: nil,
-                              path: nil, mimeType: nil)
-            return AIMessage(id: "switch-\(title)-message-\(index)", role: "assistant",
-                             created: Int64(index), completed: Int64(index + 1),
-                             active: false, parts: [part])
-        }
-    }
-    #endif
 
     func suggestReplies(messages: [[String: String]]) async throws -> AIReplySuggestions {
         let owner = AIMobileHostToolProvider.shared.appState?.masterUserID ?? ""
@@ -2642,18 +2530,8 @@ final class AIAssistantModel: ObservableObject {
             scrollRequest += 1
             return
         }
-        #if targetEnvironment(simulator)
-        if sessionSwitchUITest {
-            // 测试入口也遵循正式逻辑：先准备完整页面，再一次性替换当前会话。
-            selected = id
-            let title = String(id.suffix(1))
-            let page = sessionSwitchUITestMessages(title)
-            messages = page
-            visibleMessageLimit = Self.recentMessageCount
-            historyLoaded = true
-            scrollRequest += 1
-            return
-        }
+        #if DEBUG && targetEnvironment(simulator)
+        if selectUITestConversationIfNeeded(id) { return }
         #endif
         if id == selected && selectedRemote == nil {
             scrollRequest += 1
@@ -3179,7 +3057,7 @@ final class AIAssistantModel: ObservableObject {
 
     var screenFrameCurrentAccountID: String {
         #if DEBUG && targetEnvironment(simulator)
-        if let screenFrameUITestAccountID { return screenFrameUITestAccountID }
+        if let accountID = uiTestSupport.screenFrameAccountID { return accountID }
         #endif
         guard let appState = AIMobileHostToolProvider.shared.appState else { return "" }
         return appState.maiChatAccountID.isEmpty ? appState.masterUserID : appState.maiChatAccountID

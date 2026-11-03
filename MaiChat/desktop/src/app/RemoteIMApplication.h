@@ -10,6 +10,7 @@
 #include <QString>
 #include <QSet>
 #include <memory>
+#include <atomic>
 #include <vector>
 
 #include "im/RemoteIMClient.h"
@@ -22,6 +23,29 @@ class RemoteIMApplication final : public QObject {
     Q_OBJECT
 
 public:
+    // 公开资料快照不携带鉴权响应；访问凭据由独立的上传 provider 提供。
+    struct AccountProfile {
+        bool loggedIn = false;
+        QString accountId;
+        QString imUserId;
+        QString nickname;
+        QString phoneMasked;
+        QString avatarUrl;
+    };
+    struct AvatarAccess {
+        QString accountId;
+        QString imUserId;
+        QString sessionIdentity;
+        QString mediaBaseUrl;
+        QString accountToken;
+    };
+    struct AvatarUpdateResult {
+        bool updated = false;
+        QString avatarUrl;
+        // 固定错误码，不返回供应商响应、签名地址或凭据。
+        QString errorCode;
+    };
+    using AvatarCompletion = std::function<void(const AvatarUpdateResult &)>;
     struct AccountFriend {
         QString accountId;
         QString nickname;
@@ -54,6 +78,15 @@ public:
     RemoteIMClient& client();
     bool isConnected() const;
     RemoteIMContact selfProfile() const;
+    void setAccountProfileProvider(std::function<AccountProfile()> provider);
+    AccountProfile currentAccountProfile() const;
+    void setAvatarAccessProvider(std::function<AvatarAccess()> provider);
+    // 普通页面和 Agent 共用：方向修正、中心裁切 512 JPEG，再上传并等待 IM 回执。
+    // 账号切换、取消或超时不发送迟到的 SDK 修改，也不发布旧账号资料。
+    void updateAvatar(const QString &path, std::shared_ptr<std::atomic_bool> canceled,
+                      AvatarCompletion completion);
+    // 普通头像预览可复用上传采用的同一裁切和编码；空字节表示不可安全解码。
+    static QByteArray prepareAvatarJpeg(const QString &path);
     RemoteIMActivitySignal activityForPeer(const QString& peerId) const;
 
     // 会话是否还有未加载进内存的更早消息（分页启动只载每会话最近一页）。
@@ -175,6 +208,11 @@ signals:
     void activityChanged(const QString& peerId);
 
 private:
+    std::function<AccountProfile()> accountProfileProvider_;
+    std::function<AvatarAccess()> avatarAccessProvider_;
+    quint64 connectionGeneration_ = 0;
+    quint64 avatarUpdateGeneration_ = 0;
+    bool avatarUpdateInFlight_ = false;
     void requestFriendById(const QString& userId, const QString& displayName);
     FriendAccountResolver friendAccountResolver_;
     AccountFriendOperations accountFriendOperations_;

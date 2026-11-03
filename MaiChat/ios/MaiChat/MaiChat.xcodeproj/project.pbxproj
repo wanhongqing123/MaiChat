@@ -19,6 +19,7 @@
 		751C9C7EC4D79C407AB8992A /* MaiCloudDriveImagePager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 751C9C7EC4D79C407AB8992B /* MaiCloudDriveImagePager.swift */; };
 		0329ABDC04BBAC38945C24FA /* AIMobileHostToolProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29776A2C7E5D525FFA6CED8D /* AIMobileHostToolProvider.swift */; };
 		F2D771B8A5334D159C238C01 /* AIMobileBrowserTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2D771B8A5334D159C238C02 /* AIMobileBrowserTools.swift */; };
+		0195E28DD186A948669EB9E1 /* AIAssistantBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9D2CD930801CFDC68ED81AB /* AIAssistantBrowserView.swift */; };
 		80A93D25352CFB7F9675EB89 /* AIMobileScreenCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7090E768648CE5F2D55AD135 /* AIMobileScreenCapture.swift */; };
 		060F9E4EA6E9FABAF30CF2E5 /* RemoteDiagnosticsCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 862125851990D87705405E68 /* RemoteDiagnosticsCoordinator.swift */; };
 		06A4AB7E2BF7C60D639D23CA /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C56C06620B6A4AB7289B13D /* SettingsView.swift */; };
@@ -82,6 +83,7 @@
 		BBD727996B6D9BF10BBB15FC /* MaiCloudDriveProductionCanaryCredential.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EFBEB437244CED3D8DC9B4D /* MaiCloudDriveProductionCanaryCredential.swift */; };
 		BE9564FF3CB798F45146F479 /* RemoteInputPacketTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 642E16B2EF5CA26E0EC53657 /* RemoteInputPacketTests.swift */; };
 		BF67EA97E4832C7CB516E18C /* SocialPhoneBindingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F69C36ED4BC53DE34F2D08CA /* SocialPhoneBindingView.swift */; };
+		94BDEAD66F18D3151E28ABCD /* MaiLocalMediaPager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94BDEAD66F18D3151E28ABCE /* MaiLocalMediaPager.swift */; };
 		C0AE3CB8A0041B5827EB9C52 /* MaiFfplayVideoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 749D3372E6EB0A110EDC7FB3 /* MaiFfplayVideoView.swift */; };
 		C46604FD176732DD945AB319 /* RemoteDesktopSignal.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBCF1B230D1ACE9CD4748EE4 /* RemoteDesktopSignal.swift */; };
 		CAE5C1AEEBE80B9A14E59DAE /* LocalSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4FD40D258B32299ADDF36C3 /* LocalSettingsStore.swift */; };
@@ -107,6 +109,31 @@
 		F5418DE3092242A1E77BD638 /* MaiCloudDriveClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F2675F0F73004CB0E64EF24 /* MaiCloudDriveClient.swift */; };
 		FD528D33CC1DD16F835A3DD2 /* RemoteDiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5897033F54602274C5F58A4A /* RemoteDiagnosticsView.swift */; };
 		FEA124404840D00F968F232A /* RemoteDesktopView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96C6084AAC26D9F252151972 /* RemoteDesktopView.swift */; };
+		70467023ED27455C3F0D7F56 /* AIAssistantModel+UITesting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D6AEEF497AF12C5AC0D8830 /* AIAssistantModel+UITesting.swift */; };
+		CD33CAFFD2CCD150280DD669 /* AIAssistantUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = F143E54A2E02B861C71B4912 /* AIAssistantUITestFixtures.swift */; };
+		0A25E40C9A746E802631C408 /* AISessionDrawerDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92A6B87FA07CEFE77630E158 /* AISessionDrawerDiagnostics.swift */; };
+		418A1035153D6947FA4829F4 /* AppUITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 060E93A596039BFA991824E8 /* AppUITestSupport.swift */; };
+		571FDABF48F306A08274F862 /* ChatUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3FE951D4732465CA3CD85159 /* ChatUITestFixtures.swift */; };
+		60933569B9940BDDC862CFEA /* CloudDriveUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06DCD7EBBC3080717AFCF449 /* CloudDriveUITestFixtures.swift */; };
+		88217EC402BB981B39276A5D /* CloudImagePagerUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 992582E5F167CA0BD3EC6D03 /* CloudImagePagerUITestFixtures.swift */; };
+		792E6D5DD3A20B1EBDF1A9A1 /* MediaUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB25AFEE3235DD2B37CBEF79 /* MediaUITestFixtures.swift */; };
+		42F9DE5FF6A82BBC45D6E256 /* ScreenCaptureUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A7E28CACF5B75E559765AC7 /* ScreenCaptureUITestFixtures.swift */; };
+		26E07E6A677FDD3E7072C256 /* ScreenFramesUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 516EF0EC77000EAD40764A61 /* ScreenFramesUITestFixtures.swift */; };
+		6ABDB5A748DDA42D015DFAFF /* BrowserUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1711F6A2BEE1F77400D9D4CF /* BrowserUITestFixture.swift */; };
+		E7F9F5D4B6C2F7336B696B41 /* PortraitUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 015A64746F062D22CF72E042 /* PortraitUITestFixture.swift */; };
+		445783157F33489E8359C10C /* CameraUITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBBF1467007387E21204EA62 /* CameraUITestSupport.swift */; };
+		0AD77A68A30DFE0DDE8E88F9 /* GroupChatUITestData.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABE03DA77EC93EB1EFACD5D9 /* GroupChatUITestData.swift */; };
+		97387C3DF0C593C94754987C /* BrowserUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F72661B3076526C813462A35 /* BrowserUITests.swift */; };
+		46DC2FB7BFD7AAAB22B1B0B7 /* PortraitUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7E870F1F61ED5F83EBA6082 /* PortraitUITests.swift */; };
+		E9B117C085EA4D2A90737A10 /* PlaybackControlsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9B117C085EA4D2A90737A11 /* PlaybackControlsUITests.swift */; };
+		72F672A2C1333661B56ED12E /* AIMobileSMSInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = F687FEACE78BB73932DD6F66 /* AIMobileSMSInbox.swift */; };
+		39ADA5737D5477155B335019 /* AIMobileSMSImportIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8935A1601510CD98F08B68AA /* AIMobileSMSImportIntent.swift */; };
+		0ADF7EC5D1BA22A4E635B1EC /* AIMobileSMSSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA84E515ED6BF4E3F07A80A8 /* AIMobileSMSSettingsView.swift */; };
+		1B2C1AB32D317000A4CC94E1 /* MobileSMSInboxTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A0AF163BF44D0E393F0584B /* MobileSMSInboxTests.swift */; };
+		62AB469886D80D2A01959EBD /* AIMobileSMSInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = F687FEACE78BB73932DD6F66 /* AIMobileSMSInbox.swift */; };
+		8C02CA83DF38277D733725E4 /* MaiAccountProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E9155CBA293213BCC861B8B /* MaiAccountProfile.swift */; };
+		8329CA88A262F76CB2FA76F0 /* AccountToolsUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = D90D7FACFE8BCCEA31D0BF20 /* AccountToolsUITestFixture.swift */; };
+		C2D5DF25D72C1E7A1610BE92 /* AccountToolsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A4165956D22773A034F0701 /* AccountToolsUITests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -180,6 +207,7 @@
 		24AF3608C85D5AE5D045283D /* AIAssistantModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIAssistantModel.swift; sourceTree = "<group>"; };
 		29776A2C7E5D525FFA6CED8D /* AIMobileHostToolProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileHostToolProvider.swift; sourceTree = "<group>"; };
 		F2D771B8A5334D159C238C02 /* AIMobileBrowserTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileBrowserTools.swift; sourceTree = "<group>"; };
+		C9D2CD930801CFDC68ED81AB /* AIAssistantBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIAssistantBrowserView.swift; sourceTree = "<group>"; };
 		7090E768648CE5F2D55AD135 /* AIMobileScreenCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileScreenCapture.swift; sourceTree = "<group>"; };
 		29ED9E52F55FF7B33F57D37C /* video-circle-source.mp4 */ = {isa = PBXFileReference; path = "video-circle-source.mp4"; sourceTree = "<group>"; };
 		2ABED4C39BFBF823F387BE75 /* RemoteDiagnosticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDiagnosticsTests.swift; sourceTree = "<group>"; };
@@ -207,6 +235,7 @@
 		66BE3D0F16E24A4DF136E427 /* MaiFfplayIosBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MaiFfplayIosBridge.h; sourceTree = "<group>"; };
 		6FF39890C4F255D9CCC67B03 /* ContactsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactsView.swift; sourceTree = "<group>"; };
 		73E259698A238F25ED2ED12E /* MaiChatApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiChatApp.swift; sourceTree = "<group>"; };
+		94BDEAD66F18D3151E28ABCE /* MaiLocalMediaPager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiLocalMediaPager.swift; sourceTree = "<group>"; };
 		749D3372E6EB0A110EDC7FB3 /* MaiFfplayVideoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiFfplayVideoView.swift; sourceTree = "<group>"; };
 		7702BC2F6BF7F9BF6571E11C /* ffplay-seek-sample.mp4 */ = {isa = PBXFileReference; path = "ffplay-seek-sample.mp4"; sourceTree = "<group>"; };
 		771AB137E6961E2B9187CFEB /* MaiChatCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = MaiChatCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -261,6 +290,30 @@
 		F91FF912AF9143D67795C97B /* DiagnosticLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticLog.swift; sourceTree = "<group>"; };
 		FBCF1B230D1ACE9CD4748EE4 /* RemoteDesktopSignal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDesktopSignal.swift; sourceTree = "<group>"; };
 		FBE546568A0B3FFA1551D803 /* SpeechRecognizing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechRecognizing.swift; sourceTree = "<group>"; };
+		1D6AEEF497AF12C5AC0D8830 /* AIAssistantModel+UITesting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIAssistantModel+UITesting.swift"; sourceTree = "<group>"; };
+		F143E54A2E02B861C71B4912 /* AIAssistantUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIAssistantUITestFixtures.swift"; sourceTree = "<group>"; };
+		92A6B87FA07CEFE77630E158 /* AISessionDrawerDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AISessionDrawerDiagnostics.swift"; sourceTree = "<group>"; };
+		060E93A596039BFA991824E8 /* AppUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppUITestSupport.swift"; sourceTree = "<group>"; };
+		3FE951D4732465CA3CD85159 /* ChatUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ChatUITestFixtures.swift"; sourceTree = "<group>"; };
+		06DCD7EBBC3080717AFCF449 /* CloudDriveUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudDriveUITestFixtures.swift"; sourceTree = "<group>"; };
+		992582E5F167CA0BD3EC6D03 /* CloudImagePagerUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudImagePagerUITestFixtures.swift"; sourceTree = "<group>"; };
+		EB25AFEE3235DD2B37CBEF79 /* MediaUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MediaUITestFixtures.swift"; sourceTree = "<group>"; };
+		2A7E28CACF5B75E559765AC7 /* ScreenCaptureUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ScreenCaptureUITestFixtures.swift"; sourceTree = "<group>"; };
+		516EF0EC77000EAD40764A61 /* ScreenFramesUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ScreenFramesUITestFixtures.swift"; sourceTree = "<group>"; };
+		1711F6A2BEE1F77400D9D4CF /* BrowserUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserUITestFixture.swift; sourceTree = "<group>"; };
+		015A64746F062D22CF72E042 /* PortraitUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortraitUITestFixture.swift; sourceTree = "<group>"; };
+		DBBF1467007387E21204EA62 /* CameraUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraUITestSupport.swift; sourceTree = "<group>"; };
+		ABE03DA77EC93EB1EFACD5D9 /* GroupChatUITestData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroupChatUITestData.swift; sourceTree = "<group>"; };
+		F72661B3076526C813462A35 /* BrowserUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserUITests.swift; sourceTree = "<group>"; };
+		E7E870F1F61ED5F83EBA6082 /* PortraitUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortraitUITests.swift; sourceTree = "<group>"; };
+		E9B117C085EA4D2A90737A11 /* PlaybackControlsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackControlsUITests.swift; sourceTree = "<group>"; };
+		F687FEACE78BB73932DD6F66 /* AIMobileSMSInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileSMSInbox.swift; sourceTree = "<group>"; };
+		8935A1601510CD98F08B68AA /* AIMobileSMSImportIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileSMSImportIntent.swift; sourceTree = "<group>"; };
+		DA84E515ED6BF4E3F07A80A8 /* AIMobileSMSSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileSMSSettingsView.swift; sourceTree = "<group>"; };
+		3A0AF163BF44D0E393F0584B /* MobileSMSInboxTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileSMSInboxTests.swift; sourceTree = "<group>"; };
+		8E9155CBA293213BCC861B8B /* MaiAccountProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiAccountProfile.swift; sourceTree = "<group>"; };
+		D90D7FACFE8BCCEA31D0BF20 /* AccountToolsUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountToolsUITestFixture.swift; sourceTree = "<group>"; };
+		6A4165956D22773A034F0701 /* AccountToolsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountToolsUITests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -297,6 +350,7 @@
 				A0A32D09BB00261D66B6FFF5 /* CloudDrive */,
 				A6173F234030B5DA148EA7AD /* Contacts */,
 				4AC8CEA89B065BE353A5549A /* Diagnostics */,
+				FC6CBF8F8032BA5889FFE7AE /* DebugSupport */,
 				54465CEE1C20AEE9267E6E5E /* IM */,
 				63816AD21B434C5107F93E78 /* MaiChatTools */,
 				CAA65B25C21A859CA5AD1D59 /* Media */,
@@ -313,6 +367,10 @@
 			isa = PBXGroup;
 			children = (
 				89FDF5DC4F6DB91F2A1B3FD5 /* AIAssistantUITests.swift */,
+				F72661B3076526C813462A35 /* BrowserUITests.swift */,
+				E7E870F1F61ED5F83EBA6082 /* PortraitUITests.swift */,
+				6A4165956D22773A034F0701 /* AccountToolsUITests.swift */,
+				E9B117C085EA4D2A90737A11 /* PlaybackControlsUITests.swift */,
 				5FFB5E24161F8E400C19FB64 /* CloudDriveDeviceReadOnlySmokeUITests.swift */,
 				6FA2296AE72440AA993F7C13 /* CloudDriveFolderBrowseUITests.swift */,
 				22A65816850A01D44D6F4A9F /* ScreenFrameArchiveUITests.swift */,
@@ -357,6 +415,7 @@
 				F4EB70A8DA823BB88C100094 /* MaiChatHttpTransport.h */,
 				E595B7644B6095C6A8A4E5CE /* MaiChatSystemProxy.h */,
 				E0F4570F9254D92809B25F35 /* RemoteIMAppState.swift */,
+				8E9155CBA293213BCC861B8B /* MaiAccountProfile.swift */,
 				0F156552A73C378980D11946 /* RemoteIMClient.swift */,
 				C74D63C0AABABA134584A252 /* TencentIMClient.swift */,
 			);
@@ -376,9 +435,12 @@
 		63816AD21B434C5107F93E78 /* MaiChatTools */ = {
 			isa = PBXGroup;
 			children = (
+				8935A1601510CD98F08B68AA /* AIMobileSMSImportIntent.swift */,
+				F687FEACE78BB73932DD6F66 /* AIMobileSMSInbox.swift */,
 				A66CCCBA03D225DD809F9F11 /* AgentDocumentTools.swift */,
 				29776A2C7E5D525FFA6CED8D /* AIMobileHostToolProvider.swift */,
 				F2D771B8A5334D159C238C02 /* AIMobileBrowserTools.swift */,
+				C9D2CD930801CFDC68ED81AB /* AIAssistantBrowserView.swift */,
 				7090E768648CE5F2D55AD135 /* AIMobileScreenCapture.swift */,
 				8BD3F9C5BD5EE3D987670129 /* AIMobileScreenFrameArchive.swift */,
 				699DD641EBF222F19503CD4B /* AIMobileScreenFramesView.swift */,
@@ -406,6 +468,7 @@
 				A781F92B5DE618E07394EA0C /* ChatView.swift */,
 				C846ED66C1F881705954E761 /* ComposerDraftState.swift */,
 				749D3372E6EB0A110EDC7FB3 /* MaiFfplayVideoView.swift */,
+				94BDEAD66F18D3151E28ABCE /* MaiLocalMediaPager.swift */,
 				8F61CFA51E87A9791A0ECB26 /* MarkdownInlineStyling.swift */,
 				3C5A4C74E12DC407146E1EBF /* MessageBubbleLayout.swift */,
 			);
@@ -504,6 +567,7 @@
 		ADC2F6FCAD23F0E348F57EFE /* Settings */ = {
 			isa = PBXGroup;
 			children = (
+				DA84E515ED6BF4E3F07A80A8 /* AIMobileSMSSettingsView.swift */,
 				8D2095160132FC761449A82E /* DesktopLoginScanView.swift */,
 				2FE19F9A1D05D98FE499F66B /* KeychainSecretStore.swift */,
 				A4FD40D258B32299ADDF36C3 /* LocalSettingsStore.swift */,
@@ -515,6 +579,7 @@
 		B10C14934159C0FF468D3AB1 /* MaiChatTests */ = {
 			isa = PBXGroup;
 			children = (
+				3A0AF163BF44D0E393F0584B /* MobileSMSInboxTests.swift */,
 				CB86796D266A41859B688E04 /* AccountCodeCooldownTests.swift */,
 				E85A5C5C020900B2D0178B0A /* DiagnosticLogTests.swift */,
 				59C1F4DABEBD721F3CB32385 /* LocalChatHistoryStoreTests.swift */,
@@ -616,6 +681,28 @@
 				7702BC2F6BF7F9BF6571E11C /* ffplay-seek-sample.mp4 */,
 			);
 			path = Resources;
+			sourceTree = "<group>";
+		};
+		FC6CBF8F8032BA5889FFE7AE /* DebugSupport */ = {
+			isa = PBXGroup;
+			children = (
+				1D6AEEF497AF12C5AC0D8830 /* AIAssistantModel+UITesting.swift */,
+				F143E54A2E02B861C71B4912 /* AIAssistantUITestFixtures.swift */,
+				92A6B87FA07CEFE77630E158 /* AISessionDrawerDiagnostics.swift */,
+				060E93A596039BFA991824E8 /* AppUITestSupport.swift */,
+				ABE03DA77EC93EB1EFACD5D9 /* GroupChatUITestData.swift */,
+				DBBF1467007387E21204EA62 /* CameraUITestSupport.swift */,
+				1711F6A2BEE1F77400D9D4CF /* BrowserUITestFixture.swift */,
+				015A64746F062D22CF72E042 /* PortraitUITestFixture.swift */,
+				D90D7FACFE8BCCEA31D0BF20 /* AccountToolsUITestFixture.swift */,
+				3FE951D4732465CA3CD85159 /* ChatUITestFixtures.swift */,
+				06DCD7EBBC3080717AFCF449 /* CloudDriveUITestFixtures.swift */,
+				992582E5F167CA0BD3EC6D03 /* CloudImagePagerUITestFixtures.swift */,
+				EB25AFEE3235DD2B37CBEF79 /* MediaUITestFixtures.swift */,
+				2A7E28CACF5B75E559765AC7 /* ScreenCaptureUITestFixtures.swift */,
+				516EF0EC77000EAD40764A61 /* ScreenFramesUITestFixtures.swift */,
+			);
+			path = DebugSupport;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -862,6 +949,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				62AB469886D80D2A01959EBD /* AIMobileSMSInbox.swift in Sources */,
+				1B2C1AB32D317000A4CC94E1 /* MobileSMSInboxTests.swift in Sources */,
 				CB86796D266A41859B688E03 /* AccountCodeCooldownTests.swift in Sources */,
 				0B2637847F5454F182126805 /* ComposerDraftState.swift in Sources */,
 				F0D9326831C7925F6C4FC5D6 /* DiagnosticLogTests.swift in Sources */,
@@ -883,12 +972,31 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0ADF7EC5D1BA22A4E635B1EC /* AIMobileSMSSettingsView.swift in Sources */,
+				39ADA5737D5477155B335019 /* AIMobileSMSImportIntent.swift in Sources */,
+				72F672A2C1333661B56ED12E /* AIMobileSMSInbox.swift in Sources */,
+				0AD77A68A30DFE0DDE8E88F9 /* GroupChatUITestData.swift in Sources */,
+				445783157F33489E8359C10C /* CameraUITestSupport.swift in Sources */,
+				6ABDB5A748DDA42D015DFAFF /* BrowserUITestFixture.swift in Sources */,
+				E7F9F5D4B6C2F7336B696B41 /* PortraitUITestFixture.swift in Sources */,
+				8329CA88A262F76CB2FA76F0 /* AccountToolsUITestFixture.swift in Sources */,
+				70467023ED27455C3F0D7F56 /* AIAssistantModel+UITesting.swift in Sources */,
+				CD33CAFFD2CCD150280DD669 /* AIAssistantUITestFixtures.swift in Sources */,
+				0A25E40C9A746E802631C408 /* AISessionDrawerDiagnostics.swift in Sources */,
+				418A1035153D6947FA4829F4 /* AppUITestSupport.swift in Sources */,
+				571FDABF48F306A08274F862 /* ChatUITestFixtures.swift in Sources */,
+				60933569B9940BDDC862CFEA /* CloudDriveUITestFixtures.swift in Sources */,
+				88217EC402BB981B39276A5D /* CloudImagePagerUITestFixtures.swift in Sources */,
+				792E6D5DD3A20B1EBDF1A9A1 /* MediaUITestFixtures.swift in Sources */,
+				42F9DE5FF6A82BBC45D6E256 /* ScreenCaptureUITestFixtures.swift in Sources */,
+				26E07E6A677FDD3E7072C256 /* ScreenFramesUITestFixtures.swift in Sources */,
 				10E63571389FF61C9869CE9E /* AIAssistantModel.swift in Sources */,
 				91722667D29CD5A82A3A2E00 /* AIAssistantView.swift in Sources */,
 				F77BA084695F31C9AD6308A7 /* AIMobileScreenFramesView.swift in Sources */,
 				C4A881E263A97B3D41E6C001 /* AIMobileCameraCapture.swift in Sources */,
 				0329ABDC04BBAC38945C24FA /* AIMobileHostToolProvider.swift in Sources */,
 				F2D771B8A5334D159C238C01 /* AIMobileBrowserTools.swift in Sources */,
+				0195E28DD186A948669EB9E1 /* AIAssistantBrowserView.swift in Sources */,
 				80A93D25352CFB7F9675EB89 /* AIMobileScreenCapture.swift in Sources */,
 				3CE9DB0AABBB106D926C907E /* AIMobileScreenFrameArchive.swift in Sources */,
 				4AF5DDAC5AC5B4962C55600B /* AIMobileSshTools.swift in Sources */,
@@ -916,6 +1024,7 @@
 				751C9C7EC4D79C407AB8992A /* MaiCloudDriveImagePager.swift in Sources */,
 				6247CB164955518ADFF0D16A /* MaiFfplayIosBridge.cpp in Sources */,
 				C0AE3CB8A0041B5827EB9C52 /* MaiFfplayVideoView.swift in Sources */,
+				94BDEAD66F18D3151E28ABCD /* MaiLocalMediaPager.swift in Sources */,
 				6526F8020603CE866D68BC78 /* MaiVideoCircleClient.swift in Sources */,
 				4D5C692662551DEA7F8CE433 /* MaiVideoCircleModel.swift in Sources */,
 				123CB40D5B6165E8A91352B1 /* MaiVideoCircleView.swift in Sources */,
@@ -930,6 +1039,7 @@
 				A96F037E371DD412156D6280 /* RemoteDiagnosticsCoordinator.swift in Sources */,
 				FD528D33CC1DD16F835A3DD2 /* RemoteDiagnosticsView.swift in Sources */,
 				9CEE6443CEA6DFF1F20AAF48 /* RemoteIMAppState.swift in Sources */,
+				8C02CA83DF38277D733725E4 /* MaiAccountProfile.swift in Sources */,
 				E6827C0322D4694D998F2551 /* RemoteIMClient.swift in Sources */,
 				0C3D673C246BAE33893EFDCD /* RootView.swift in Sources */,
 				06A4AB7E2BF7C60D639D23CA /* SettingsView.swift in Sources */,
@@ -948,6 +1058,10 @@
 			buildActionMask = 2147483647;
 			files = (
 				194E338FF3D0DE993B165814 /* AIAssistantUITests.swift in Sources */,
+				97387C3DF0C593C94754987C /* BrowserUITests.swift in Sources */,
+				46DC2FB7BFD7AAAB22B1B0B7 /* PortraitUITests.swift in Sources */,
+				C2D5DF25D72C1E7A1610BE92 /* AccountToolsUITests.swift in Sources */,
+				E9B117C085EA4D2A90737A10 /* PlaybackControlsUITests.swift in Sources */,
 				6F8A66D5F8344B2C0A738BE6 /* CloudDriveDeviceReadOnlySmokeUITests.swift in Sources */,
 				6FA2296AE72440AA993F7C12 /* CloudDriveFolderBrowseUITests.swift in Sources */,
 				6F03A9BA5D80FAE8B01671B8 /* ScreenFrameArchiveUITests.swift in Sources */,
@@ -1051,7 +1165,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 145;
+				CURRENT_PROJECT_VERSION = 172;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1228,7 +1342,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 145;
+				CURRENT_PROJECT_VERSION = 172;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;

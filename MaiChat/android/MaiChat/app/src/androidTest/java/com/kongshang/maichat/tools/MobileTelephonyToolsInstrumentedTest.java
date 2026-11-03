@@ -29,6 +29,31 @@ import org.junit.runner.RunWith;
 
 @RunWith(AndroidJUnit4.class)
 public final class MobileTelephonyToolsInstrumentedTest {
+    // Enable explicitly on a test device and accept the real OS permission dialog.
+    @Test public void requestsSmsPermissionAndReusesTheGrant() throws Exception {
+        Assume.assumeTrue("true".equals(InstrumentationRegistry.getArguments()
+            .getString("interactiveSmsPermission")));
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        Assume.assumeTrue(context.checkSelfPermission(Manifest.permission.READ_SMS)
+            != PackageManager.PERMISSION_GRANTED);
+        MainActivity activity = (MainActivity) InstrumentationRegistry.getInstrumentation()
+            .startActivitySync(new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        try {
+            Field field = MainActivity.class.getDeclaredField("maiChatHostTools");
+            field.setAccessible(true);
+            MaiChatHostTools tools = (MaiChatHostTools) field.get(activity);
+            JSONObject permission = requestPermission(tools, "sms");
+            assertEquals("granted", permission.getString("status"));
+            assertEquals(true, permission.getBoolean("prompted"));
+            assertEquals(false, requestPermission(tools, "sms").getBoolean("prompted"));
+            JSONObject result = runAsync(() -> (JSONObject) tools.execute("mobile_read_sms",
+                new JSONObject().put("limit", 1)));
+            assertEquals("android_sms_inbox", result.getString("source"));
+        } finally {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(activity::finish);
+        }
+    }
+
     // Run with -e interactiveCallPermission true and approve only the OS prompts.
     @Test public void contactsGrantDoesNotReplacePhoneCallGrant() throws Exception {
         Assume.assumeTrue("true".equals(InstrumentationRegistry.getArguments()
@@ -101,6 +126,7 @@ public final class MobileTelephonyToolsInstrumentedTest {
             JSONObject result = new MobileTelephonyTools(activity, permissions).readSms(
                 new JSONObject().put("limit", 1));
             assertTrue(result.toString(), result.has("messages"));
+            assertEquals("android_sms_inbox", result.getString("source"));
             assertTrue(result.getJSONArray("messages").length() <= 1);
             String expected = InstrumentationRegistry.getArguments().getString("expectedSmsBody");
             if (expected != null) {
@@ -108,6 +134,15 @@ public final class MobileTelephonyToolsInstrumentedTest {
                 assertEquals(expected, result.getJSONArray("messages")
                     .getJSONObject(0).getString("body"));
             }
+            JSONObject future = new MobileTelephonyTools(activity, permissions).readSms(
+                new JSONObject().put("after_ms", System.currentTimeMillis() + 86400000L));
+            assertEquals(0, future.getJSONArray("messages").length());
+            // The ordinary API uses the same implementation as the tool adapter.
+            assertTrue(new MobileSMSInbox(context, () -> true).readRecent(1, 0).size() <= 1);
+            try {
+                new MobileSMSInbox(context, () -> false).readRecent(1, 0);
+                throw new AssertionError("background SMS read succeeded");
+            } catch (IllegalStateException backgroundDenied) { }
         } finally {
             InstrumentationRegistry.getInstrumentation().runOnMainSync(activity::finish);
         }

@@ -39,6 +39,8 @@ public:
     static int availability(const DesktopVideoCircleAccess& access);
     void openDrive(const QString& suggestedVideo = {});
     void cancelPending();
+    // 错误交给宿主现有轻提示；云盘页面不再为请求状态占用底部区域。
+    void setErrorHandler(std::function<void(const QString&)> handler);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -54,9 +56,7 @@ private:
     void navigateToFolder(const QString& folderId);
     QString folderPath(const QString& folderId) const;
     void createFolder();
-    void renameFolder(const QString& folderId, const QString& name);
     void deleteFolder(const QString& folderId, const QString& name);
-    void moveItem(const QString& itemId, const QString& name, bool folder);
     void mutateFolder(int action, const QJsonObject& payload);
     void renderCheckpoints(const QJsonArray& uploads);
     void loadThumbnail(const QString& mediaId, QLabel* target);
@@ -66,7 +66,6 @@ private:
     void startPlayback(const QString& videoId, const QString& name);
     void saveVideo(const QString& videoId, const QString& name);
     void startImagePreview(const QString& mediaId);
-    void renameMedia(const QString& mediaId, const QString& name);
     void deleteVideo(const QString& videoId, const QString& name);
     void discardUpload(const QString& checkpointPath, const QString& name);
     void setBusy(bool busy, const QString& message = {});
@@ -89,18 +88,14 @@ private:
     unsigned thumbnailGeneration_ = 0;
     bool busy_ = false;
     QLabel* quota_ = nullptr;
-    QLabel* quotaCaption_ = nullptr;
     QProgressBar* quotaBar_ = nullptr;
     QScrollArea* uploadScroll_ = nullptr;
-    QLabel* status_ = nullptr;
-    QProgressBar* progress_ = nullptr;
     QPushButton* uploadButton_ = nullptr;
     QPushButton* newFolderButton_ = nullptr;
     QPushButton* parentFolderButton_ = nullptr;
     QPushButton* rootFolderButton_ = nullptr;
     QPushButton* refreshButton_ = nullptr;
     QLabel* folderPath_ = nullptr;
-    QPushButton* pauseButton_ = nullptr;
     QPushButton* moreButton_ = nullptr;
     QVBoxLayout* uploadRows_ = nullptr;
     QVBoxLayout* videoRows_ = nullptr;
@@ -111,4 +106,5 @@ private:
     std::shared_ptr<MaiDownloadCancel> thumbnailDownloadCancel_;
     std::shared_ptr<QTemporaryDir> thumbnailDirectory_;
     bool embedded_ = false;
+    std::function<void(const QString&)> errorHandler_;
 };

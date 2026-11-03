@@ -62,6 +62,7 @@ struct MaiChatAuthUser: Decodable, Sendable {
     let id: String
     let imUserId: String
     let nickname: String?
+    let phoneMasked: String?
 }
 
 struct MaiChatAuthSession: Decodable, Sendable {
@@ -464,16 +465,20 @@ actor MaiChatAuthClient {
 
     /// 前台检查本机槽位仍归当前账号；网络失败保留本机状态，稍后重试。
     func validateCurrentSession(expectedUserID: String) async throws -> MaiChatAuthUser {
+        let version = sessionVersion
         let token = try await currentAccessToken()
+        guard sessionVersion == version else { throw MaiChatAuthError.identityMismatch }
         let account: MaiChatCurrentAccount
         do {
             account = try await request("auth/me", method: "GET", bearer: token)
         } catch MaiChatAuthError.requestFailed("Authentication required") {
             // 访问令牌提前失效时刷新一次；同槽替换的专用错误会直接向上抛出。
+            guard sessionVersion == version else { throw MaiChatAuthError.identityMismatch }
             accessToken = nil
             let renewedToken = try await currentAccessToken()
             account = try await request("auth/me", method: "GET", bearer: renewedToken)
         }
+        guard sessionVersion == version else { throw MaiChatAuthError.identityMismatch }
         guard account.user.imUserId == expectedUserID else {
             throw MaiChatAuthError.identityMismatch
         }

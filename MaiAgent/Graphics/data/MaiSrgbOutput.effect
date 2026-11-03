@@ -1,0 +1,39 @@
+// Derived from OBS Studio libobs/data/default.effect, GPLv2; see ../COPYING.
+// Android 线性窗口的最终 sRGB 写出；复用 OBS default.effect 的采样、顶点和调色函数。
+// 仅在目标附件为 GL_LINEAR 时使用，sRGB 目标继续使用上游 Draw，避免重复编码。
+#include "default.effect"
+
+float4 PSMaiSrgbOutput(VertInOut vert_in) : TARGET
+{
+    float4 rgba = image.Sample(def_sampler, vert_in.uv);
+    rgba.rgb = srgb_linear_to_nonlinear(rgba.rgb);
+    return rgba;
+}
+
+float4 PSMaiSrgbOutputTonemap(VertInOut vert_in) : TARGET
+{
+    float4 rgba = image.Sample(def_sampler, vert_in.uv);
+    rgba.rgb = rec709_to_rec2020(rgba.rgb);
+    rgba.rgb = reinhard(rgba.rgb);
+    rgba.rgb = rec2020_to_rec709(rgba.rgb);
+    rgba.rgb = srgb_linear_to_nonlinear(rgba.rgb);
+    return rgba;
+}
+
+technique MaiSrgbOutput
+{
+    pass
+    {
+        vertex_shader = VSDefault(vert_in);
+        pixel_shader = PSMaiSrgbOutput(vert_in);
+    }
+}
+
+technique MaiSrgbOutputTonemap
+{
+    pass
+    {
+        vertex_shader = VSDefault(vert_in);
+        pixel_shader = PSMaiSrgbOutputTonemap(vert_in);
+    }
+}

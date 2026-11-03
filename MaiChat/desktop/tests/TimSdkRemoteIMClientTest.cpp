@@ -98,8 +98,10 @@ public:
 
     int modifySelfProfile(const QString& request, TimSdkCompletion completion) override {
         selfProfileRequest = request;
-        if (completion) completion(0, {}, {});
-        return 0;
+        ++selfProfileModificationCount;
+        if (deferProfileModification) deferredProfileModification = std::move(completion);
+        else if (completion) completion(profileModificationCode, {}, {});
+        return profileModificationReturn;
     }
 
     void setSelfInfoUpdatedCallback(TimSdkReceiveMessagesCallback callback) override {
@@ -108,6 +110,11 @@ public:
 
     QString profileRequest;
     QString selfProfileRequest;
+    int selfProfileModificationCount = 0;
+    int profileModificationCode = 0;
+    int profileModificationReturn = 0;
+    bool deferProfileModification = false;
+    TimSdkCompletion deferredProfileModification;
     QString profilePayload;
     TimSdkReceiveMessagesCallback selfInfoCallback;
     TimSdkConversationEventCallback conversationEventCallback;
@@ -239,6 +246,7 @@ class TimSdkRemoteIMClientTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void avatarUpdateWaitsForSdkAndRejectsOldLoginCallbacks();
     void loadsAndUpdatesOwnAvatarWithoutAddingSelfAsContact();
     void activityUsesOnlineCustomTransportWithoutHistory();
     void connectsThroughSdkAndSendsTextAndImage();
@@ -266,6 +274,73 @@ private slots:
     void pagesGroupTextHistoryBySequence();
     void reportsCreatedGroupWhenActivationFailsWithoutCreatingAgain();
 };
+
+void TimSdkRemoteIMClientTest::avatarUpdateWaitsForSdkAndRejectsOldLoginCallbacks() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto *fake = api.get();
+    TimSdkRemoteIMClient client(std::move(api));
+    client.connectToService(123456, QStringLiteral("owner"), QStringLiteral("test-sig"), {});
+    QSignalSpy profileChanges(&client, &RemoteIMClient::selfProfileReceived);
+    fake->deferProfileModification = true;
+    bool finished = false;
+    bool updated = false;
+    client.setSelfAvatar(QStringLiteral("https://example.invalid/avatars/new.jpg"),
+                         [&](bool ok, const QString &) {
+                             finished = true;
+                             updated = ok;
+                         });
+    QVERIFY(!finished);
+    QVERIFY(profileChanges.isEmpty());
+    const auto request = QJsonDocument::fromJson(fake->selfProfileRequest.toUtf8()).object();
+    QCOMPARE(request.size(), 1);
+    QCOMPARE(request.value(QStringLiteral("user_profile_item_face_url")).toString(),
+             QStringLiteral("https://example.invalid/avatars/new.jpg"));
+    auto commit = std::move(fake->deferredProfileModification);
+    commit(0, {}, {});
+    QVERIFY(finished && updated);
+    QCOMPARE(profileChanges.size(), 1);
+    commit(0, {}, {});
+    QCOMPARE(profileChanges.size(), 1);
+    finished = false;
+    updated = true;
+    client.setSelfAvatar(QStringLiteral("https://example.invalid/avatars/late.jpg"),
+                         [&](bool ok, const QString &) {
+                             finished = true;
+                             updated = ok;
+                         });
+    auto stale = std::move(fake->deferredProfileModification);
+    client.disconnectFromService({});
+    fake->deferProfileModification = false;
+    client.connectToService(123456, QStringLiteral("owner"), QStringLiteral("new-sig"), {});
+    const int beforeStale = profileChanges.size();
+    stale(0, {}, {});
+    QVERIFY(finished && !updated);
+    QCOMPARE(profileChanges.size(), beforeStale);
+    const int sent = fake->selfProfileModificationCount;
+    client.setSelfAvatar(QStringLiteral("https://example.invalid/avatar?signature=forbidden"),
+                         [&](bool ok, const QString &) { QVERIFY(!ok); });
+    QCOMPARE(fake->selfProfileModificationCount, sent);
+    bool accountStillCurrent = true;
+    fake->deferProfileModification = true;
+    finished = false;
+    client.setSelfAvatar(
+        QStringLiteral("https://example.invalid/avatars/guarded.jpg"),
+        [&](bool ok, const QString &) {
+            finished = true;
+            updated = ok;
+        },
+        [&] { return accountStillCurrent; });
+    auto guarded = std::move(fake->deferredProfileModification);
+    accountStillCurrent = false;
+    guarded(0, {}, {});
+    QVERIFY(finished && !updated);
+    QCOMPARE(profileChanges.size(), beforeStale);
+    const int beforeGuardedSend = fake->selfProfileModificationCount;
+    client.setSelfAvatar(
+        QStringLiteral("https://example.invalid/avatars/not-sent.jpg"),
+        [&](bool ok, const QString &) { QVERIFY(!ok); }, [] { return false; });
+    QCOMPARE(fake->selfProfileModificationCount, beforeGuardedSend);
+}
 
 void TimSdkRemoteIMClientTest::loadsAndUpdatesOwnAvatarWithoutAddingSelfAsContact() {
     auto api = std::make_unique<FakeTimSdkApi>();

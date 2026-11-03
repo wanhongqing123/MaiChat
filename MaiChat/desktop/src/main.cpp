@@ -177,6 +177,21 @@ int main(int argc, char* argv[]) {
     RemoteIMApplication remoteIM(credential.userId,
                                  createDesktopRemoteIMClient(),
                                  std::make_unique<LocalMessageDatabase>(messageDatabasePath(credential.userId)));
+    remoteIM.setAccountProfileProvider([&auth] {
+        RemoteIMApplication::AccountProfile profile;
+        profile.accountId = auth.maiChatAccountId();
+        profile.imUserId = auth.authenticatedUserId();
+        profile.loggedIn = !profile.accountId.isEmpty() && !profile.imUserId.isEmpty();
+        profile.nickname = auth.nickname();
+        profile.phoneMasked = auth.phoneMasked();
+        return profile;
+    });
+    remoteIM.setAvatarAccessProvider([&auth, access = auth.mediaServiceAccessProvider()] {
+        const auto media = access();
+        return RemoteIMApplication::AvatarAccess{
+            auth.maiChatAccountId(), auth.authenticatedUserId(),
+            auth.authenticatedSessionIdentity(), media.first, media.second};
+    });
     MainWindow window(remoteIM, credential.sdkAppId,
                       [&auth](const QString& userId) {
         const DesktopImCredential current = auth.imCredential();

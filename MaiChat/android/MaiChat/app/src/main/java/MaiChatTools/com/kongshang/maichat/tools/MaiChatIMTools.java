@@ -43,6 +43,7 @@ import org.json.JSONObject;
 final class MaiChatIMTools {
     private final MainActivity activity;
     private final RemoteIMSessionController session;
+    private final AvatarRequests avatarRequests = new AvatarRequests();
 
     MaiChatIMTools(MainActivity activity, RemoteIMSessionController session) {
         this.activity = activity;
@@ -50,6 +51,11 @@ final class MaiChatIMTools {
     }
 
     Object execute(String tool, JSONObject arguments) throws Exception {
+        if (tool.equals("maichat_cancel_avatar")) {
+            avatarRequests.cancel(arguments.getString("request_id"));
+            return new JSONObject().put("canceled", true);
+        }
+        if (tool.equals("maichat_get_current_account")) return hostCurrentAccount(arguments);
         if (session == null || session.requiresLogin())
             throw new IllegalStateException("MaiChat 尚未登录");
         switch (tool) {
@@ -97,6 +103,160 @@ final class MaiChatIMTools {
             throw new IllegalArgumentException("此工具不接受参数");
     }
 
+    void onDestroy() { avatarRequests.cancelAll(); }
+
+    /** 隐藏取消桥可能比原请求先到；有界墓碑防止取消丢失，也不永久保留过期请求 ID。 */
+    static final class AvatarRequests {
+        private final java.util.Map<String, AvatarRequest> active = new java.util.HashMap<>();
+        private final java.util.LinkedHashMap<String, Boolean> pending = new java.util.LinkedHashMap<>();
+
+        synchronized AvatarRequest begin(String id) throws IOException {
+            if (id == null || id.isEmpty() || id.length() > 256)
+                throw new IOException("头像请求标识无效");
+            if (pending.remove(id) != null) throw new IOException("头像更新已取消");
+            if (active.containsKey(id)) throw new IOException("头像请求已在处理");
+            AvatarRequest request = new AvatarRequest();
+            active.put(id, request);
+            return request;
+        }
+
+        void cancel(String id) throws IOException {
+            if (id == null || id.isEmpty() || id.length() > 256)
+                throw new IOException("头像请求标识无效");
+            AvatarRequest request;
+            synchronized (this) {
+                request = active.get(id);
+                if (request == null) {
+                    pending.put(id, true);
+                    while (pending.size() > 256) pending.remove(pending.keySet().iterator().next());
+                }
+            }
+            if (request != null) request.cancel();
+        }
+
+        synchronized void finish(String id, AvatarRequest request) {
+            if (active.get(id) == request) active.remove(id);
+        }
+
+        void cancelAll() {
+            List<AvatarRequest> requests;
+            synchronized (this) {
+                requests = new ArrayList<>(active.values());
+                active.clear(); pending.clear();
+            }
+            for (AvatarRequest request : requests) request.cancel();
+        }
+    }
+
+    static final class AvatarRequest {
+        private volatile boolean canceled;
+        private RemoteIMSessionController.AccountTask task;
+
+        boolean isCanceled() { return canceled; }
+
+        void bind(RemoteIMSessionController.AccountTask value) {
+            boolean cancel;
+            synchronized (this) { task = value; cancel = canceled; }
+            if (cancel) value.cancel();
+        }
+
+        void cancel() {
+            RemoteIMSessionController.AccountTask current;
+            synchronized (this) { canceled = true; current = task; }
+            if (current != null) current.cancel();
+        }
+    }
+
+    private java.util.function.BooleanSupplier accountScope(JSONObject arguments) {
+        AIAssistantController controller = AIAssistantController.initializedAccountToolOwner();
+        String owner = arguments.optString("_account_im_user_id");
+        long generation = arguments.optLong("_account_auth_generation", -1);
+        String workspace = arguments.optString("workspace_path");
+        String sessionId = arguments.optString("session_id");
+        return () -> controller != null &&
+            controller.accountToolScopeMatches(owner, generation, workspace, sessionId) &&
+            session != null && owner.equals(session.settings().loginUserId());
+    }
+
+    private boolean accountIdentityMatches(JSONObject arguments) {
+        String owner = arguments.optString("_account_im_user_id");
+        AIAssistantController controller = AIAssistantController.initializedAccountToolOwner();
+        return controller != null && controller.accountToolIdentityMatches(owner,
+            arguments.optLong("_account_auth_generation", -1)) && session != null &&
+            owner.equals(session.settings().loginUserId());
+    }
+
+    static JSONObject currentAccountJson(RemoteIMSessionController.CurrentAccount profile)
+            throws JSONException {
+        JSONObject output = new JSONObject().put("logged_in", profile.loggedIn);
+        if (!profile.loggedIn) return output;
+        return output.put("account_id", profile.accountId).put("im_user_id", profile.imUserId)
+            .put("nickname", profile.nickname == null ? JSONObject.NULL : profile.nickname)
+            .put("phone_masked", profile.phoneMasked == null ? JSONObject.NULL : profile.phoneMasked)
+            .put("avatar_url", profile.avatarUrl == null ? JSONObject.NULL : profile.avatarUrl);
+    }
+
+    private JSONObject hostCurrentAccount(JSONObject arguments) throws Exception {
+        if (Looper.myLooper() == Looper.getMainLooper())
+            throw new IllegalStateException("账号资料查询不能阻塞界面线程");
+        java.util.function.BooleanSupplier scope = accountScope(arguments);
+        if (!scope.getAsBoolean()) throw new IllegalStateException("登录账号或工作区已变化");
+        CountDownLatch complete = new CountDownLatch(1);
+        AtomicReference<RemoteIMSessionController.CurrentAccount> profile = new AtomicReference<>();
+        AtomicReference<String> error = new AtomicReference<>();
+        RemoteIMSessionController.AccountTask task = session.getCurrentAccount(scope, (value, failure) -> {
+            profile.set(value); error.set(failure); complete.countDown();
+        });
+        try {
+            if (!complete.await(60, TimeUnit.SECONDS))
+                throw new IllegalStateException("当前账号资料查询超时");
+            if (error.get() != null) throw new IllegalStateException(error.get());
+            if (!scope.getAsBoolean() || profile.get() == null)
+                throw new IllegalStateException("登录账号或工作区已变化");
+            return currentAccountJson(profile.get());
+        } finally { task.cancel(); }
+    }
+
+    private JSONObject hostSetAvatar(JSONObject arguments) throws Exception {
+        if (Looper.myLooper() == Looper.getMainLooper())
+            throw new IllegalStateException("头像更新不能阻塞界面线程");
+        java.util.function.BooleanSupplier scope = accountScope(arguments);
+        if (!scope.getAsBoolean()) throw new IllegalStateException("登录账号或工作区已变化");
+        String requestId = arguments.getString("request_id");
+        AvatarRequest request = avatarRequests.begin(requestId);
+        CountDownLatch complete = new CountDownLatch(1);
+        AtomicReference<String> avatar = new AtomicReference<>();
+        AtomicReference<String> error = new AtomicReference<>();
+        RemoteIMSessionController.AccountTask task = null;
+        try {
+            File source = avatarWorkspaceFile(arguments.getString("path"),
+                arguments.getString("workspace_path"));
+            task = session.setSelfAvatar(source, scope, request::isCanceled,
+                (value, failure) -> { avatar.set(value); error.set(failure); complete.countDown(); });
+            request.bind(task);
+            if (!complete.await(120, TimeUnit.SECONDS))
+                throw new IllegalStateException("头像更新尚未确认，请稍后查询当前头像");
+            if (error.get() != null) throw new IllegalStateException(error.get());
+            if (!accountIdentityMatches(arguments) || avatar.get() == null || avatar.get().isEmpty())
+                throw new IllegalStateException("登录账号或工作区已变化");
+            return new JSONObject().put("updated", true).put("avatar_url", avatar.get());
+        } finally {
+            avatarRequests.finish(requestId, request);
+            if (task != null) task.cancel();
+        }
+    }
+
+    static File avatarWorkspaceFile(String path, String workspace) throws IOException {
+        File input = new File(path);
+        // canonicalFile 在 Windows 不保证解析符号链接；按实际文件归属判断，允许根内链接。
+        File root = new File(workspace).toPath().toRealPath().toFile();
+        File source = input.toPath().toRealPath().toFile();
+        if (!input.isAbsolute() || !source.toPath().startsWith(root.toPath()) ||
+                !source.isFile() || !source.canRead())
+            throw new IOException("头像必须是当前会话工作区内可读取的图片");
+        return source;
+    }
+
     private JSONObject hostListContacts(JSONObject arguments) throws JSONException {
         String query = arguments.optString("query").trim().toLowerCase(Locale.ROOT);
         int limit = hostToolLimit(arguments);
@@ -136,31 +296,6 @@ final class MaiChatIMTools {
             throw new IllegalArgumentException("昵称最多 32 个字符且不能超过 120 字节");
         session.setNickname(nickname, error -> {});
         return new JSONObject().put("queued", true).put("nickname", nickname);
-    }
-
-    private JSONObject hostSetAvatar(JSONObject arguments) throws Exception {
-        if (Looper.myLooper() == Looper.getMainLooper())
-            throw new IllegalStateException("头像更换不能阻塞界面线程");
-        Object raw = arguments.opt("file_path");
-        if (!(raw instanceof String) || ((String) raw).trim().isEmpty())
-            throw new IllegalArgumentException("file_path 必须是工作区图片路径");
-        String identity = session.avatarChangeIdentity();
-        File source = AIAssistantController.shared(activity).workspaceFile((String) raw);
-        if (source == null || !source.isFile()) throw new IllegalArgumentException("工作区图片不可用");
-        CountDownLatch finished = new CountDownLatch(1);
-        AtomicReference<String> failure = new AtomicReference<>();
-        AtomicReference<String> avatar = new AtomicReference<>();
-        new Handler(Looper.getMainLooper()).post(() -> session.uploadSelfAvatar(source, identity, error -> {
-            if (error == null && session.isAvatarChangeIdentityCurrent(identity))
-                avatar.set(session.selfProfile().avatarUrl());
-            else failure.set(error == null ? "登录账号已变化，请重试头像更换" : error);
-            finished.countDown();
-        }));
-        if (!finished.await(120, TimeUnit.SECONDS))
-            throw new IllegalStateException("头像更换状态尚未确认，请在个人资料中检查后再操作");
-        if (failure.get() != null) throw new IllegalStateException(failure.get());
-        // 只返回公开稳定头像地址；上传签名 URL 和账号 bearer 不进入工具回执。
-        return new JSONObject().put("updated", true).put("avatar_url", avatar.get());
     }
 
     private JSONObject hostListConversations(JSONObject arguments) throws JSONException {

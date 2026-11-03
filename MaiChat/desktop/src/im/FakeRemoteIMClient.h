@@ -18,6 +18,9 @@ public:
     void disconnectFromService(RemoteIMCompletion completion) override;
     void deleteContact(const QString& userId, RemoteIMCompletion completion) override;
     void requestFriend(const QString& userId, RemoteIMCompletion completion) override;
+    void setSelfAvatar(const QString &avatarUrl, RemoteIMCompletion completion,
+                       std::function<bool()> canCommit = {}) override;
+    QString lastAvatarUrl() const { return lastAvatarUrl_; }
     void joinedGroups(RemoteIMGroupsCompletion completion) override;
     void createGroup(const QString& name, const QStringList& memberIds,
                      RemoteIMGroupCompletion completion) override;
@@ -96,6 +99,7 @@ private:
     QString lastVideoPeerId_;
     RemoteIMVideoPayload lastVideo_;
     QString nextError_;
+    QString lastAvatarUrl_;
     bool deferNextSend_ = false;
     RemoteIMSendCompletion deferredSendCompletion_;
     int sentSequence_ = 0;

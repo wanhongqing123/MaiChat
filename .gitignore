@@ -60,6 +60,8 @@ lerna-debug.log*
 .idea/
 *.swp
 *.swo
+# 本机真实构建命令含 SDK、NDK 和构建目录的绝对路径。
+/compile_commands.json
 
 # Xcode / CocoaPods local generated state
 MaiChat/ios/**/Pods/
@@ -110,3 +112,7 @@ MaiAgent/models/lama_fp32.onnx
 
 # Playwright MCP 浏览器工具的临时产物（页面快照/控制台日志）
 .playwright-mcp/
+# Fixed portrait weights are staged and checksum-verified by the fetch script.
+/MaiChat/Portrait/models/*.onnx
+/MaiChat/Portrait/models/*.download
+/MaiChat/Portrait/tests/fixtures/*.jpg

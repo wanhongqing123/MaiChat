@@ -23,10 +23,8 @@ import UIKit
 import Foundation
 import QuartzCore
 
-#if os(iOS)
-// The player owns this swapchain. Configure it on the graphics queue before
-// submitting the first HLG frame, rather than changing the process-wide OBS
-// video color space (other views can still be SDR).
+#if os(iOS) || os(macOS)
+// Apple 播放器在首帧前配置自己的交换链；不能改变其他图片或 SDR 播放视图的全局色彩状态。
 @_cdecl("mai_metal_swapchain_set_hlg")
 public func mai_metal_swapchain_set_hlg(
     swap: UnsafeRawPointer, enabled: Int32,
@@ -34,6 +32,7 @@ public func mai_metal_swapchain_set_hlg(
 ) -> Int32 {
     let swapChain: OBSSwapChain = unretained(swap)
     if enabled == 0 {
+        swapChain.playerHlgOutput = false
         swapChain.layer.pixelFormat = .bgra8Unorm_srgb
         swapChain.layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         swapChain.layer.wantsExtendedDynamicRangeContent = false
@@ -42,11 +41,11 @@ public func mai_metal_swapchain_set_hlg(
         swapChain.renderTarget = nil
         return 1
     }
-    guard CAEDRMetadata.isAvailable,
+    guard #available(macOS 13.0, iOS 16.0, *), CAEDRMetadata.isAvailable,
           let colorSpace = CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020)
     else { return 0 }
     let metadata: CAEDRMetadata
-    if #available(iOS 17.0, *), ambientCount == 8, let ambient {
+    if #available(macOS 14.0, iOS 17.0, *), ambientCount == 8, let ambient {
         metadata = CAEDRMetadata.hlg(
             ambientViewingEnvironment: Data(bytes: ambient, count: 8))
     } else {
@@ -56,6 +55,7 @@ public func mai_metal_swapchain_set_hlg(
     swapChain.layer.colorspace = colorSpace
     swapChain.layer.wantsExtendedDynamicRangeContent = true
     swapChain.layer.edrMetadata = metadata
+    swapChain.playerHlgOutput = true
     swapChain.colorRange = .hdrHLG
     swapChain.renderTarget = nil
     return 1
@@ -221,40 +221,52 @@ public func device_load_swapchain(device: UnsafeRawPointer, swap: UnsafeRawPoint
     let swapChain: OBSSwapChain = unretained(swap)
 
 #if os(macOS)
-    if swapChain.edrHeadroom > 1.0 {
-        var videoInfo: obs_video_info = obs_video_info()
-        obs_get_video_info(&videoInfo)
+    // 普通 OBS 预览仍跟随全局配置；播放器的 HLG/AMVE 选择持续到它显式关闭该模式。
+    if !swapChain.playerHlgOutput {
+        if swapChain.edrHeadroom > 1.0 {
+            var videoInfo: obs_video_info = obs_video_info()
+            obs_get_video_info(&videoInfo)
 
-        let videoColorSpace = videoInfo.colorspace
+            let videoColorSpace = videoInfo.colorspace
 
-        switch videoColorSpace {
-        case VIDEO_CS_2100_PQ:
-            if swapChain.colorRange != .hdrPQ {
-                // TODO: Investigate whether it's viable to use PQ or HLG tone mapping for the preview
-                // Use the following code to enable it for either:
-                // 2100 PQ:
-                //  let maxLuminance = obs_get_video_hdr_nominal_peak_level()
-                //  swapChain.layer.edrMetadata = .hdr10(
-                //    minLuminance: 0.0001, maxLuminance: maxLuminance, opticalOutputScale: 10000)
-                // HLG:
-                //  swapChain.layer.edrMetadata = .hlg
-                swapChain.layer.pixelFormat = .rgba16Float
-                swapChain.layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
-                swapChain.layer.wantsExtendedDynamicRangeContent = true
-                swapChain.layer.edrMetadata = nil
-                swapChain.colorRange = .hdrPQ
-                swapChain.renderTarget = nil
+            switch videoColorSpace {
+            case VIDEO_CS_2100_PQ:
+                if swapChain.colorRange != .hdrPQ {
+                    // TODO: Investigate whether it's viable to use PQ or HLG tone mapping for the preview
+                    // Use the following code to enable it for either:
+                    // 2100 PQ:
+                    //  let maxLuminance = obs_get_video_hdr_nominal_peak_level()
+                    //  swapChain.layer.edrMetadata = .hdr10(
+                    //    minLuminance: 0.0001, maxLuminance: maxLuminance, opticalOutputScale: 10000)
+                    // HLG:
+                    //  swapChain.layer.edrMetadata = .hlg
+                    swapChain.layer.pixelFormat = .rgba16Float
+                    swapChain.layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+                    swapChain.layer.wantsExtendedDynamicRangeContent = true
+                    swapChain.layer.edrMetadata = nil
+                    swapChain.colorRange = .hdrPQ
+                    swapChain.renderTarget = nil
+                }
+            case VIDEO_CS_2100_HLG:
+                if swapChain.colorRange != .hdrHLG {
+                    swapChain.layer.pixelFormat = .rgba16Float
+                    swapChain.layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+                    swapChain.layer.wantsExtendedDynamicRangeContent = true
+                    swapChain.layer.edrMetadata = nil
+                    swapChain.colorRange = .hdrHLG
+                    swapChain.renderTarget = nil
+                }
+            default:
+                if swapChain.colorRange != .sdr {
+                    swapChain.layer.pixelFormat = .bgra8Unorm_srgb
+                    swapChain.layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+                    swapChain.layer.wantsExtendedDynamicRangeContent = false
+                    swapChain.layer.edrMetadata = nil
+                    swapChain.colorRange = .sdr
+                    swapChain.renderTarget = nil
+                }
             }
-        case VIDEO_CS_2100_HLG:
-            if swapChain.colorRange != .hdrHLG {
-                swapChain.layer.pixelFormat = .rgba16Float
-                swapChain.layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
-                swapChain.layer.wantsExtendedDynamicRangeContent = true
-                swapChain.layer.edrMetadata = nil
-                swapChain.colorRange = .hdrHLG
-                swapChain.renderTarget = nil
-            }
-        default:
+        } else {
             if swapChain.colorRange != .sdr {
                 swapChain.layer.pixelFormat = .bgra8Unorm_srgb
                 swapChain.layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
@@ -263,15 +275,6 @@ public func device_load_swapchain(device: UnsafeRawPointer, swap: UnsafeRawPoint
                 swapChain.colorRange = .sdr
                 swapChain.renderTarget = nil
             }
-        }
-    } else {
-        if swapChain.colorRange != .sdr {
-            swapChain.layer.pixelFormat = .bgra8Unorm_srgb
-            swapChain.layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
-            swapChain.layer.wantsExtendedDynamicRangeContent = false
-            swapChain.layer.edrMetadata = nil
-            swapChain.colorRange = .sdr
-            swapChain.renderTarget = nil
         }
     }
 #else

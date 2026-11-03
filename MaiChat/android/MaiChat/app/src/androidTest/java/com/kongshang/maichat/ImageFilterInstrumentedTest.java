@@ -30,11 +30,11 @@ public final class ImageFilterInstrumentedTest {
         source.setPixel(0, 0, Color.RED);
         source.setPixel(1, 0, Color.GREEN);
         Method filter = AIAssistantController.class.getDeclaredMethod(
-            "nativeFilterBitmap", Bitmap.class, String.class, int[].class);
+            "nativeFilterBitmap", Bitmap.class, String.class, int[].class, byte[][].class, byte[].class, byte[].class);
         filter.setAccessible(true);
         int[] dimensions = new int[2];
         byte[] result = (byte[]) filter.invoke(null, source,
-            "{\"operation\":\"flip_horizontal\"}", dimensions);
+            "{\"operation\":\"flip_horizontal\"}", dimensions, new byte[1][], null, null);
         assertNotNull(result);
         assertEquals(2, dimensions[0]);
         assertEquals(1, dimensions[1]);

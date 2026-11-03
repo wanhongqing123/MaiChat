@@ -37,6 +37,14 @@ APIs. The Android shader generator emits GLSL ES 3.00 and omits the desktop
 `graphics-ffmpeg.c` outputs RGBA on Android for GLES uploads. Original
 copyright notices were preserved.
 
+Android queries the actual framebuffer attachment color encoding instead of
+assuming every EGL window is sRGB. GLES has no desktop `GL_FRAMEBUFFER_SRGB`
+switch, and some TextureView implementations reject sRGB window attributes.
+On a LINEAR target, MaiChat's shared presenter uses `MaiSrgbOutput.effect` for
+the final output encoding. It derives its sampling, color helpers and tonemapping
+from upstream `default.effect`; sRGB targets retain the original Draw technique.
+The Android portrait test compares actual TextureView pixels with the saved PNG.
+
 The source files retain their original copyright notices. `COPYING` is the
 upstream GPLv2 license text. SIMDe is provided separately under
 `MaiAgent/third_party/simde`, matching the version used by OBS. The optional
@@ -53,3 +61,10 @@ statically linked backend on iOS. Standalone
 application callbacks are isolated in `compat/`; device-reset signaling and
 HDR video information remain to be integrated with the host application.
 No other OBS directories were copied.
+
+MaiChat's per-player HLG extension in `metal-swapchain.swift` is shared by iOS
+and macOS. On macOS 13+ and iOS 16+ it selects FP16, extended linear BT.2020,
+and system HLG EDR metadata; macOS 14+/iOS 17+ also accept the source AMVE.
+The player's explicit selection takes precedence over the standalone OBS
+compatibility layer's global SDR default until that player disables HLG.
+Other OBS swapchains still follow the upstream global video configuration.

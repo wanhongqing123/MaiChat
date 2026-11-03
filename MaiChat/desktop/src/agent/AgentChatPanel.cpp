@@ -522,7 +522,8 @@ QWidget* makeWelcomeView(QWidget* parent) {
         {QStringLiteral("二维码生成"), QStringLiteral("码")},   {QStringLiteral("本地媒体处理"), QStringLiteral("媒")},
         {QStringLiteral("拍照"), QStringLiteral("拍")},         {QStringLiteral("音乐播放"), QStringLiteral("音")},
         {QStringLiteral("我的云盘"), QStringLiteral("云")},     {QStringLiteral("MaiChat 消息"), QStringLiteral("聊")},
-        {QStringLiteral("联系人"), QStringLiteral("人")},     {QStringLiteral("跨设备会话"), QStringLiteral("跨")},
+        {QStringLiteral("联系人"), QStringLiteral("人")},     {QStringLiteral("账号资料与头像"), QStringLiteral("像")},
+        {QStringLiteral("跨设备会话"), QStringLiteral("跨")},
     };
     for (int index = 0; index < features.size(); ++index) {
         auto* card = new QFrame(content);

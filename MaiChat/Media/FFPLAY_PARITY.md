@@ -39,6 +39,20 @@ Changing speed causes a brief pause. SoundTouch 2.3.3 source and its LGPL-2.1 li
 are kept under `MaiAgent/third_party/soundtouch`.
 The Agent `maichat_video_command` and player controls call the same path.
 
+Absolute, percentage and relative host seek controls use source-media time,
+independent of playback speed. The compatibility entry point asks the demuxer
+for a random-access point at or before the target, decodes the preroll, and
+discards frames before the frame interval containing that time. Audio is
+trimmed to the target sample before entering the filter graph. Targets are
+bound to packet serials, including initial `-ss`; the original `ffplay.c`
+queue invalidation, pause/step and subtitle scheduling remain in use.
+The desktop slider submits its actual click or drag-release position using
+millisecond resolution. A 100% target selects the final video frame.
+Timestamp-less streams retain FFplay's best-effort behavior. Mac long-GOP
+pixel tests cover paused, running, rapid repeated, HLG hardware, custom byte
+source and speed-adjusted seek. Other platforms have not been run for this
+change; this is not a cross-platform acceptance check mark.
+
 ## iOS picture quality: 2026-10-03 device evidence
 
 - On iPhone 14 Pro Max, the video popup initially requested a 430×839 Metal

@@ -8,10 +8,8 @@ import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
-import android.provider.Telephony;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 import com.kongshang.maichat.MainActivity;
@@ -161,39 +159,21 @@ final class MobileTelephonyTools {
         long afterMs = arguments.optLong("after_ms", 0);
         if (limit < 1 || limit > 20 || afterMs < 0)
             throw new IllegalArgumentException("limit must be 1-20 and after_ms must be nonnegative");
-        if (activity.checkSelfPermission(Manifest.permission.READ_SMS)
-                != PackageManager.PERMISSION_GRANTED)
-            return denied("sms");
-        if (!activity.isHostToolForeground())
-            return unavailable("Open MaiChat before reading SMS messages.");
-
-        String[] columns = {Telephony.Sms._ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY,
-            Telephony.Sms.DATE, Telephony.Sms.READ};
-        String selection = afterMs > 0 ? Telephony.Sms.DATE + " >= ?" : null;
-        String[] selectionArgs = afterMs > 0 ? new String[]{Long.toString(afterMs)} : null;
         JSONArray messages = new JSONArray();
-        try (Cursor cursor = activity.getContentResolver().query(Telephony.Sms.Inbox.CONTENT_URI,
-                 columns, selection, selectionArgs, Telephony.Sms.DATE + " DESC")) {
-            if (cursor == null) return unavailable("The SMS inbox is unavailable.");
-            int idIndex = cursor.getColumnIndexOrThrow(Telephony.Sms._ID);
-            int addressIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.ADDRESS);
-            int bodyIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.BODY);
-            int dateIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.DATE);
-            int readIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.READ);
-            while (messages.length() < limit && cursor.moveToNext()) {
-                String sender = cursor.getString(addressIndex);
-                String body = cursor.getString(bodyIndex);
+        try {
+            MobileSMSInbox inbox = new MobileSMSInbox(activity, activity::isHostToolForeground);
+            for (MobileSMSInbox.Message message : inbox.readRecent(limit, afterMs)) {
                 messages.put(new JSONObject()
-                    .put("id", cursor.getLong(idIndex))
-                    .put("sender", sender == null ? "" : sender)
-                    .put("body", body == null ? "" : body)
-                    .put("timestamp_ms", cursor.getLong(dateIndex))
-                    .put("read", cursor.getInt(readIndex) != 0));
+                    .put("id", message.id).put("sender", message.sender).put("body", message.body)
+                    .put("timestamp_ms", message.timestampMilliseconds).put("read", message.read));
             }
         } catch (SecurityException denied) {
             return denied("sms");
+        } catch (IllegalStateException unavailable) {
+            return unavailable(unavailable.getMessage());
         }
-        return new JSONObject().put("messages", messages).put("count", messages.length());
+        return new JSONObject().put("messages", messages).put("count", messages.length())
+            .put("source", "android_sms_inbox").put("inbox_access", true);
     }
 
     private static JSONObject denied(String permission) throws Exception {

@@ -1,0 +1,3 @@
+# Packaging-only, pure-Python Finder metadata support. Not included in the App.
+ds_store==1.3.3
+mac_alias==2.2.3

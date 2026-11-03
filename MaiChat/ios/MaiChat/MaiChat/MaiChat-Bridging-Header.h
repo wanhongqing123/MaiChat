@@ -4,6 +4,7 @@
 #include "../../../MobileAgentAdapter/MaiMobileAgent.h"
 #include <onnxruntime_c_api.h>
 #include "../../../MaiChatTools/MaiImageFilter.h"
+#include "../../../Portrait/MaiPortraitBridge.h"
 #include "../../../Media/MaiGraphicsPresenter.h"
 #include "../../../Media/MaiImageDecode.h"
 #include "../../../Media/FfplayCompat/MaiFfplayEntry.h"
@@ -14,6 +15,7 @@
 #include "../../../Network/MaiCurlDownload.h"
 #include "../../../Network/MaiCloudVod.h"
 #include "../../../Network/MaiVideoCircleClient.h"
+#include "../../../Network/MaiAvatarClient.h"
 #include "../../../Network/MaiCloudDriveClient.h"
 #include "../../../Network/MaiScreenFrameArchive.h"
 #include "../../../Media/MaiVideoCircleMark.h"

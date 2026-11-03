@@ -19,6 +19,7 @@ public final class RemoteIMSessionController {
     static final String FALLBACK_OWNER_USER_ID = "android-user";
     static final String DEFAULT_CONTACT_USER_ID = "mac-office";
     private static final long SESSION_CHECK_INTERVAL_MS = 30_000L;
+    static final long AVATAR_SDK_TIMEOUT_MS = 60_000L;
 
     public interface Listener {
         void onStateChanged();
@@ -39,6 +40,36 @@ public final class RemoteIMSessionController {
     public interface AccountCompletion {
         void onFinished(String error);
     }
+
+    /** 只有公开资料；accountId 是 MaiChat 账号 ID，imUserId 是独立的 IM 身份。 */
+    public static final class CurrentAccount {
+        public final boolean loggedIn;
+        public final String accountId, imUserId, nickname, phoneMasked, avatarUrl;
+
+        public CurrentAccount(boolean loggedIn, String accountId, String imUserId,
+                       String nickname, String phoneMasked, String avatarUrl) {
+            this.loggedIn = loggedIn;
+            this.accountId = accountId;
+            this.imUserId = imUserId;
+            this.nickname = nickname;
+            this.phoneMasked = phoneMasked;
+            this.avatarUrl = avatarUrl;
+        }
+
+        public static CurrentAccount loggedOut() {
+            return new CurrentAccount(false, null, null, null, null, null);
+        }
+    }
+
+    public interface AccountProfileCompletion {
+        void onFinished(CurrentAccount profile, String error);
+    }
+
+    public interface AvatarCompletion {
+        void onFinished(String avatarUrl, String error);
+    }
+
+    public interface AccountTask { void cancel(); }
 
     public interface CodeCompletion {
         void onFinished(String challengeId, String error);
@@ -77,8 +108,6 @@ public final class RemoteIMSessionController {
     private final Map<String, Long> oldestLoadedCreatedAtByUserId = new HashMap<>();
     private final Map<String, String> oldestLoadedMessageIdByUserId = new HashMap<>();
     private final RemoteIMSelfProfileState selfProfileState = new RemoteIMSelfProfileState();
-    private final RemoteIMAvatarUpdate.Gate avatarUpdateGate = new RemoteIMAvatarUpdate.Gate();
-    private AccountCompletion avatarUpdateCompletion;
     private final boolean productionMode;
 
     private volatile RemoteIMSettings settings;
@@ -88,6 +117,16 @@ public final class RemoteIMSessionController {
     // 密码等账号绑定写入也会在 worker 开始前检查代际，切号必须对该线程立即可见。
     private volatile int accountGeneration;
     private volatile MaiChatAcceptedAccountCleanup.Pending acceptedAccountDeletion;
+    private final java.util.Set<AccountRequest> accountRequests = new java.util.HashSet<>();
+    // 由主线程保留到 SDK 回执或超时；上传 worker 返回不代表头像资料写入已经结束。
+    private AccountRequest avatarRequest;
+    private volatile String selfAvatarUrl;
+    interface AvatarUploadOperation {
+        String upload(File source, String accountId, long authGeneration,
+                      java.util.function.BooleanSupplier current,
+                      java.util.function.Consumer<MaiAccountAvatar.Scope> uploadScope) throws Exception;
+    }
+    private AvatarUploadOperation avatarUploadOperation = this::prepareAndUploadAvatar;
     private final Map<String, RemoteIMVideoAttachment> pendingVideoMedia = new java.util.LinkedHashMap<>();
     private int mediaRevision;
     public int mediaRevision() { return mediaRevision; }
@@ -283,6 +322,8 @@ public final class RemoteIMSessionController {
         if (productionMode) AIAssistantController.configureAccount(next.loginUserId());
         resetActivities();
         int generation = ++accountGeneration;
+        cancelAccountRequests();
+        selfAvatarUrl = null;
         settings = next;
         imCredential = null;
         acceptedFriendUserIds.clear();
@@ -292,6 +333,8 @@ public final class RemoteIMSessionController {
         friendRequestIdByIm.clear();
         chatState = new ChatState(next.requiresLogin() ? FALLBACK_OWNER_USER_ID : next.loginUserId());
         selfProfileState.activate(chatState.ownerUserId(), nickname());
+        // 同号重新登录也属于新代际，与公开头像缓存一起清除旧资料。
+        selfProfileState.accept(new RemoteIMContact(chatState.ownerUserId(), nickname(), ""));
         unreadByUserId.clear(); presenceByUserId.clear(); hasEarlierByUserId.clear();
         oldestLoadedCreatedAtByUserId.clear(); oldestLoadedMessageIdByUserId.clear();
         loadingPeers.clear(); pageRequests.clear(); peerEpochs.clear(); pendingVideoMedia.clear(); mediaRevision++;
@@ -414,13 +457,14 @@ public final class RemoteIMSessionController {
     /** Picker, crop UI and host tools bind the whole operation to this login generation. */
     public String avatarChangeIdentity() {
         return destroyed || !productionMode || requiresLogin() ? ""
-            : accountId() + "|" + accountGeneration + "|" + chatState.ownerUserId();
+            : accountId() + "|" + accountGeneration + "|" + authClient.accountSessionGeneration()
+                + "|" + chatState.ownerUserId();
     }
     public boolean isAvatarChangeIdentityCurrent(String expectedIdentity) {
         return expectedIdentity != null && !expectedIdentity.isEmpty()
             && expectedIdentity.equals(avatarChangeIdentity());
     }
-    /** Ordinary UI and model tools use the same upload, SDK commit and local profile update. */
+    /** 普通照片选择只适配正式账号事务，和工具共用上传、SDK 确认及并发门禁。 */
     public void uploadSelfAvatar(java.io.File image, String expectedIdentity, AccountCompletion completion) {
         if (mainHandler != null && Looper.myLooper() != Looper.getMainLooper()) {
             mainHandler.post(() -> uploadSelfAvatar(image, expectedIdentity, completion)); return;
@@ -428,54 +472,272 @@ public final class RemoteIMSessionController {
         if (!isAvatarChangeIdentityCurrent(expectedIdentity)) {
             runAvatarCompletion(() -> completion.onFinished("登录账号已变化，请重新选择头像")); return;
         }
-        if (client == null || connectionState != TencentIMClient.ConnectionState.CONNECTED) {
-            runAvatarCompletion(() -> completion.onFinished("请先连接 IM 后再更换头像")); return;
-        }
-        if (image == null || !image.isFile()) {
-            runAvatarCompletion(() -> completion.onFinished("头像图片不可用，请重新选择")); return;
-        }
-        // 界面和工具共用一个事务；不让较早的上传稍后覆盖用户更新的头像。
-        if (!avatarUpdateGate.tryAcquire()) {
-            runAvatarCompletion(() -> completion.onFinished("头像正在更换，请等待当前操作完成")); return;
-        }
-        java.util.concurrent.atomic.AtomicBoolean notified = new java.util.concurrent.atomic.AtomicBoolean();
-        AccountCompletion completionOnce = error -> {
-            if (!notified.compareAndSet(false, true)) return;
-            avatarUpdateCompletion = null;
-            avatarUpdateGate.release();
-            completion.onFinished(error);
-        };
-        avatarUpdateCompletion = completionOnce;
-        String owner = chatState.ownerUserId();
-        java.util.function.BooleanSupplier current = () -> isAvatarChangeIdentityCurrent(expectedIdentity);
-        RemoteIMAvatarUpdate operation = new RemoteIMAvatarUpdate(current,
-            (source, stillCurrent) -> {
-                MaiChatAuthClient.MediaServiceAccess access = authClient.mediaServiceAccess();
-                if (!stillCurrent.getAsBoolean()) throw new IOException("Avatar identity changed");
-                return MaiChatAvatarUploader.upload(source, access, stillCurrent);
-            },
-            (url, finished) -> client.setSelfAvatar(owner, url, current, new TencentIMClient.OperationCompletion() {
-                @Override public void onSuccess() { finished.finished(null); }
-                @Override public void onError(int code, String ignored) {
-                    finished.finished("头像保存尚未确认，请检查 IM 连接后重试");
-                }
-            }),
-            url -> {
-                selfProfileState.activate(owner, nickname());
-                RemoteIMContact previous = selfProfileState.current();
-                selfProfileState.accept(new RemoteIMContact(owner, previous.displayName(), url));
-                AvatarImageLoader.prefetch(url);
-                notifyStateChanged();
-            }, this::runAvatarCompletion);
-        try { ioExecutor.execute(() -> operation.start(image, completionOnce::onFinished)); }
-        catch (java.util.concurrent.RejectedExecutionException closed) {
-            runAvatarCompletion(() -> completionOnce.onFinished("页面已关闭，请重新选择头像"));
-        }
+        setSelfAvatar(image, () -> isAvatarChangeIdentityCurrent(expectedIdentity),
+            (url, error) -> runAvatarCompletion(() -> completion.onFinished(error)));
     }
     private void runAvatarCompletion(Runnable action) {
         // 即使 Activity/Session 已销毁也交付清理回调；current 仍阻止资料安装和 SDK 写入。
         if (mainHandler == null || Looper.myLooper() == Looper.getMainLooper()) action.run();
         else mainHandler.post(action);
+    }
+
+    private interface AccountFailure { void fail(String message); }
+
+    // 一个请求同时绑定控制器代际、鉴权代际、公开账号和 IM 身份；同账号重登也不复用旧请求。
+    private final class AccountRequest implements AccountTask {
+        final int generation = accountGeneration;
+        final long authGeneration = authClient == null ? -1 : authClient.accountSessionGeneration();
+        final String account = accountId();
+        final String imUser = settings.loginUserId();
+        final java.util.function.BooleanSupplier scope;
+        final java.util.function.BooleanSupplier externalCancellation;
+        final AccountFailure failure;
+        final java.util.concurrent.atomic.AtomicBoolean finished =
+            new java.util.concurrent.atomic.AtomicBoolean();
+        private MaiAccountAvatar.Scope upload;
+        private volatile boolean cancellationRequested;
+        private volatile boolean sdkWriteStarted;
+        private Runnable sdkTimeout;
+
+        AccountRequest(java.util.function.BooleanSupplier scope, AccountFailure failure) {
+            this(scope, () -> false, failure);
+        }
+
+        AccountRequest(java.util.function.BooleanSupplier scope,
+                       java.util.function.BooleanSupplier externalCancellation, AccountFailure failure) {
+            this.scope = scope;
+            this.externalCancellation = externalCancellation;
+            this.failure = failure;
+        }
+
+        boolean isCurrent() {
+            return !finished.get() && !cancellationRequested &&
+                !externalCancellation.getAsBoolean() && identityIsCurrent();
+        }
+
+        boolean identityIsCurrent() {
+            return accountIdentityIsCurrent() && scope.getAsBoolean();
+        }
+
+        boolean accountIdentityIsCurrent() {
+            return !destroyed && productionMode && !requiresLogin() &&
+                generation == accountGeneration && authGeneration == authClient.accountSessionGeneration() &&
+                !account.isEmpty() && account.equals(accountId()) &&
+                imUser.equals(settings.loginUserId());
+        }
+
+        synchronized void attach(MaiAccountAvatar.Scope value) {
+            upload = value;
+            if (value != null && finished.get()) value.cancel();
+        }
+
+        void succeed(Runnable completion) {
+            runOnMain(() -> {
+                boolean current = isCurrent();
+                if (!finished.compareAndSet(false, true)) return;
+                accountRequests.remove(this);
+                if (!sdkWriteStarted) releaseAvatarRequest(this);
+                if (current) completion.run();
+                else failure.fail("登录账号或工作区已变化，请重新操作");
+            });
+        }
+
+        void reject(String message) {
+            runOnMain(() -> cancelOnMain(message, true));
+        }
+
+        void cancelOnMain(String message) {
+            cancelOnMain(message, true);
+        }
+
+        void cancelOnMain(String message, boolean identityChangedOrFailed) {
+            cancellationRequested = true;
+            // IM 写入一旦发送就无法撤回；普通停止等 SDK 回执，不能把已更新的头像报成未更新。
+            if (!identityChangedOrFailed && sdkWriteStarted && !finished.get()) return;
+            if (!finished.compareAndSet(false, true)) return;
+            synchronized (this) { if (upload != null) upload.cancel(); }
+            accountRequests.remove(this);
+            if (!sdkWriteStarted) releaseAvatarRequest(this);
+            failure.fail(message);
+        }
+
+        void sdkSending() {
+            sdkWriteStarted = true;
+            runOnMain(() -> {
+                if (avatarRequest != this) return;
+                sdkTimeout = () -> {
+                    releaseAvatarRequest(this);
+                    cancelOnMain("IM 头像更新回执超时，请先查询当前头像再操作", true);
+                };
+                mainHandler.postDelayed(sdkTimeout, AVATAR_SDK_TIMEOUT_MS);
+            });
+        }
+
+        void rejectSdk(String message) {
+            runOnMain(() -> {
+                releaseAvatarRequest(this);
+                cancelOnMain(message, true);
+            });
+        }
+
+        void confirmAvatar(Runnable completion) {
+            runOnMain(() -> {
+                releaseAvatarRequest(this);
+                boolean current = accountIdentityIsCurrent();
+                if (!finished.compareAndSet(false, true)) return;
+                accountRequests.remove(this);
+                if (current) completion.run();
+                else failure.fail("登录账号或工作区已变化，请重新操作");
+            });
+        }
+
+        @Override public void cancel() {
+            cancellationRequested = true;
+            synchronized (this) { if (upload != null) upload.cancel(); }
+            runOnMain(() -> cancelOnMain("账号资料操作已取消", false));
+        }
+    }
+
+    private void cancelAccountRequests() {
+        for (AccountRequest request : new ArrayList<>(accountRequests))
+            request.cancelOnMain("登录账号已变化，请重新操作");
+    }
+
+    private void releaseAvatarRequest(AccountRequest request) {
+        if (request.sdkTimeout != null) {
+            mainHandler.removeCallbacks(request.sdkTimeout);
+            request.sdkTimeout = null;
+        }
+        if (avatarRequest == request) avatarRequest = null;
+    }
+
+    public AccountTask getCurrentAccount(AccountProfileCompletion completion) {
+        return getCurrentAccount(() -> true, completion);
+    }
+
+    /** 普通资料入口与 Agent 共用；只读当前公开缓存，不发鉴权或 IM SDK 查询。
+     * 账号验证和 IM 本人资料监听按原流程刷新缓存，离线时仍可读取上次同步结果。
+     */
+    public AccountTask getCurrentAccount(java.util.function.BooleanSupplier scope,
+                                          AccountProfileCompletion completion) {
+        if (destroyed) {
+            completion.onFinished(null, "账号会话已关闭"); return () -> { };
+        }
+        if (requiresLogin()) {
+            completion.onFinished(CurrentAccount.loggedOut(), null); return () -> { };
+        }
+        if (!productionMode) {
+            completion.onFinished(new CurrentAccount(true, accountId(), settings.loginUserId(),
+                null, null, null), null);
+            return () -> { };
+        }
+        AccountRequest request = new AccountRequest(scope,
+            error -> completion.onFinished(null, error));
+        runOnMain(() -> {
+            if (!request.isCurrent()) {
+                request.cancelOnMain("登录账号或工作区已变化，请重新操作"); return;
+            }
+            accountRequests.add(request);
+            try {
+                MaiChatAuthClient.AccountProfile profile = authClient.currentAccountProfile(
+                    request.account, request.authGeneration);
+                // 升级前的公开缓存没有 IM 字段；本机会话已经绑定的 IM ID 可补足该字段，
+                // 但缓存明确属于其他 IM 身份时必须拒绝，不能把两份账号资料拼在一起。
+                if (!profile.imUserId.isEmpty() && !request.imUser.equals(profile.imUserId))
+                    throw new IOException("IM 身份不一致");
+                String avatar = selfAvatarUrl;
+                request.succeed(() -> completion.onFinished(new CurrentAccount(true,
+                    profile.accountId, request.imUser, profile.nickname, profile.phoneMasked,
+                    avatar == null || avatar.isEmpty() ? null : avatar), null));
+            } catch (Exception failure) {
+                request.reject("当前账号资料缓存不可用，请检查登录状态");
+            }
+        });
+        return request;
+    }
+
+    public AccountTask setSelfAvatar(File source, AvatarCompletion completion) {
+        return setSelfAvatar(source, () -> true, completion);
+    }
+
+    /** 图片准备、共享上传和 SDK 写入共用这一条路径；成功意味着 SDK 已确认 faceURL。 */
+    public AccountTask setSelfAvatar(File source, java.util.function.BooleanSupplier scope,
+                                      AvatarCompletion completion) {
+        return setSelfAvatar(source, scope, () -> false, completion);
+    }
+
+    public AccountTask setSelfAvatar(File source, java.util.function.BooleanSupplier scope,
+                                      java.util.function.BooleanSupplier canceled,
+                                      AvatarCompletion completion) {
+        if (destroyed || !productionMode || requiresLogin()) {
+            completion.onFinished(null, "请先登录 MaiChat 账号"); return () -> { };
+        }
+        AccountRequest request = new AccountRequest(scope, canceled,
+            error -> completion.onFinished(null, error));
+        runOnMain(() -> {
+            if (!request.isCurrent() || !client.isLoggedInAs(request.imUser)) {
+                request.cancelOnMain("请等待当前账号 IM 登录后再更新头像"); return;
+            }
+            if (avatarRequest != null) {
+                request.cancelOnMain("已有头像修改正在处理中，请等待回执后再操作"); return;
+            }
+            avatarRequest = request;
+            accountRequests.add(request);
+            ioExecutor.execute(() -> {
+                try {
+                    if (!request.isCurrent()) throw new IOException("账号已变化");
+                    String avatar = avatarUploadOperation.upload(source, request.account,
+                        request.authGeneration,
+                        () -> request.isCurrent() && client.isLoggedInAs(request.imUser), request::attach);
+                    if (!request.isCurrent() || !client.isLoggedInAs(request.imUser))
+                        throw new IOException("账号已变化");
+                    String confirmedUrl = avatar;
+                    client.setSelfAvatar(request.imUser, avatar, request::isCurrent,
+                        request::accountIdentityIsCurrent, request::sdkSending,
+                        new TencentIMClient.OperationCompletion() {
+                            @Override public void onSuccess() {
+                                request.confirmAvatar(() -> {
+                                    installSelfProfile(request.imUser, selfProfile().displayName(), confirmedUrl);
+                                    notifyStateChanged();
+                                    completion.onFinished(confirmedUrl, null);
+                                });
+                            }
+                            @Override public void onError(int code, String message) {
+                                request.rejectSdk("IM 尚未确认头像更新，请检查登录和网络");
+                            }
+                        });
+                } catch (Exception | LinkageError failure) {
+                    // 不转发签名 URL、鉴权响应或底层 HTTP 异常文本到 Agent。
+                    request.reject("头像尚未更新，请检查图片、登录状态和网络后重试");
+                }
+            });
+        });
+        return request;
+    }
+
+    // 正式传输仍只走图片准备和共享 C ABI；独立边界允许测试控制上传完成与 SDK 回执的次序。
+    private String prepareAndUploadAvatar(File source, String accountId, long authGeneration,
+            java.util.function.BooleanSupplier current,
+            java.util.function.Consumer<MaiAccountAvatar.Scope> uploadScope) throws Exception {
+        if (!current.getAsBoolean()) throw new IOException("账号已变化");
+        byte[] jpeg = MaiAccountAvatar.prepare(source);
+        if (!current.getAsBoolean()) throw new IOException("账号已变化");
+        MaiChatAuthClient.MediaServiceAccess access = authClient.avatarServiceAccess(accountId, authGeneration);
+        try (MaiAccountAvatar.Scope upload = new MaiAccountAvatar.Scope()) {
+            uploadScope.accept(upload);
+            try {
+                if (!current.getAsBoolean()) throw new IOException("账号已变化");
+                return MaiAccountAvatar.upload(access, accountId, jpeg, upload);
+            } finally { uploadScope.accept(null); }
+        }
+    }
+
+    private void installSelfProfile(String owner, String displayName, String avatarUrl) {
+        selfAvatarUrl = avatarUrl;
+        selfProfileState.activate(owner, nickname());
+        selfProfileState.accept(new RemoteIMContact(owner, displayName, avatarUrl));
+        if (connectionState == TencentIMClient.ConnectionState.CONNECTED)
+            AvatarImageLoader.prefetch(avatarUrl);
     }
 
     /** 安全表单绑定账号和本次登录代际；同账号重新登录也不得沿用旧密码页。 */
@@ -1963,6 +2225,8 @@ public final class RemoteIMSessionController {
 
     public void destroy() {
         if (!productionMode) return;
+        cancelAccountRequests();
+        selfAvatarUrl = null;
         authClient.setSessionTerminationListener(null);
         appForeground = false;
         mainHandler.removeCallbacks(sessionValidation);
@@ -1973,9 +2237,6 @@ public final class RemoteIMSessionController {
         }
         if (remoteDesktop != null) remoteDesktop.destroy();
         destroyed = true;
-        AccountCompletion pendingAvatar = avatarUpdateCompletion;
-        if (pendingAvatar != null)
-            runAvatarCompletion(() -> pendingAvatar.onFinished("页面已关闭，头像更换已停止"));
         client.destroy();
         ioExecutor.execute(historyStore::close);
         ioExecutor.shutdown();
@@ -2030,8 +2291,7 @@ public final class RemoteIMSessionController {
         if (!productionMode || requiresLogin()) return;
         List<String> userIds = new ArrayList<>();
         for (RemoteIMContact contact : chatState.contacts()) userIds.add(contact.userId());
-        // 本人不是联系人；即使尚无好友，也必须加载资料卡使用的真实头像。
-        client.refreshProfiles(Collections.singletonList(chatState.ownerUserId()));
+        // 本人由 CONNECTED 的独立 getSelfProfile 加载；好友刷新不重复查询本人。
         refreshContactMetadata(userIds);
     }
 
@@ -2299,6 +2559,16 @@ public final class RemoteIMSessionController {
     }
 
     private final class ClientListener implements TencentIMClient.Listener {
+        @Override public void onSelfProfileUpdated(TencentIMClient.SelfProfile profile) {
+            final int generation = accountGeneration;
+            runOnMain(() -> {
+                if (generation != accountGeneration || requiresLogin() ||
+                        !settings.loginUserId().equals(profile.imUserId) ||
+                        !client.isSelfProfileReadCurrent(profile)) return;
+                installSelfProfile(profile.imUserId, profile.nickname, profile.avatarUrl);
+                notifyStateChanged();
+            });
+        }
         @Override
         public void onConnectionStateChanged(
             TencentIMClient.ConnectionState state,
@@ -2319,6 +2589,17 @@ public final class RemoteIMSessionController {
                     return;
                 }
                 if (state == TencentIMClient.ConnectionState.CONNECTED) {
+                    final int generation = accountGeneration;
+                    final String owner = settings.loginUserId();
+                    client.getSelfProfile(owner,
+                        () -> !destroyed && generation == accountGeneration &&
+                            owner.equals(settings.loginUserId()),
+                        new TencentIMClient.SelfProfileCompletion() {
+                            @Override public void onSuccess(TencentIMClient.SelfProfile profile) {
+                                if (generation == accountGeneration) onSelfProfileUpdated(profile);
+                            }
+                            @Override public void onError(int code, String message) { }
+                        });
                     AvatarImageLoader.beginConnection();
                     for (RemoteIMContact contact : chatState.contacts())
                         AvatarImageLoader.prefetch(contact.avatarUrl());
@@ -2406,9 +2687,8 @@ public final class RemoteIMSessionController {
                     // SDK 回调排队到 main 期间也可能完成头像写入，故应用前再次核对读代际。
                     if (contact != null && owner.equals(contact.userId()) && client != null
                         && !client.isSelfProfileReadRevisionCurrent(selfRevision)) continue;
-                    if (selfProfileState.accept(contact)) {
-                        if (connectionState == TencentIMClient.ConnectionState.CONNECTED)
-                            AvatarImageLoader.prefetch(contact.avatarUrl());
+                    if (contact != null && owner.equals(contact.userId())) {
+                        installSelfProfile(owner, contact.displayName(), contact.avatarUrl());
                         continue;
                     }
                     // 资料只更新现有好友，不把旧账号本人或失效查询结果变成新联系人。
