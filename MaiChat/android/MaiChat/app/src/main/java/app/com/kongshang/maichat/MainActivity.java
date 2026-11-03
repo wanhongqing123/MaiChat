@@ -185,7 +185,6 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private String settingsPanelIdentity = "";
     private TextView speechProviderValue;
     private TextView videoTranscriptOverlay;
-    private boolean videoExpanded;
     private Dialog imageDialog;
     private MaiGraphicsImageView galleryImageView;
     private String galleryImagePath;
@@ -400,7 +399,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             if (previous != currentMessageList && currentMessageList != null && anchor != null)
                 currentMessageList.restoreMessage(anchor, offset);
         }
-        if (insetsHost != null) insetsHost.post(this::updateVideoDockLayout);
+        if (insetsHost != null) insetsHost.post(this::updateLandscapeConversationLayout);
     }
 
     @Override
@@ -1072,7 +1071,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         // Debug 验收按钮随真实根容器重新附着；普通/Release 运行该字段为 null，不改变页面。
         com.kongshang.maichat.tools.MobilePdfSecurityAcceptance.reattach(this, pdfAcceptanceButton);
         renderedLandscapeIm = landscapeIm;
-        navigation.post(this::updateVideoDockLayout);
+        navigation.post(this::updateLandscapeConversationLayout);
         swipeBack = new ChatSwipeBack(new ChatSwipeBack.Host() {
             @Override public View page() { return root; }
             @Override public boolean canGoBack() {
@@ -1107,7 +1106,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                 && currentMessageList != null && messageInput != null && messageInput.hasFocus()) {
                 if (imeAnimating) currentMessageList.beginKeyboardReveal(); else currentMessageList.showLatest();
             }
-            if (keyboardVisible != visible) navigation.post(this::updateVideoDockLayout);
+            if (keyboardVisible != visible) navigation.post(this::updateLandscapeConversationLayout);
             keyboardVisible = visible;
             if (!imeAnimating) applyChatInsets(navigation, insets);
             return insets;
@@ -1971,7 +1970,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         if (activeChatUserId != null) renderChatDetail(activeChatUserId);
         else if (activeGroupId != null) renderGroupDetail(activeGroupId);
         else detail.addView(emptyState("◇", "选择一个对话", "从左侧选择联系人开始聊天。"), matchMatch());
-        columns.post(this::updateVideoDockLayout);
+        columns.post(this::updateLandscapeConversationLayout);
     }
 
     // 用当前搜索条件生成会话列表行；搜索命中消息时保留其所属会话，避免打开错误联系人。
@@ -5437,7 +5436,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         List<GalleryItem> playlist = normalizeGallery(path, true, candidates);
         final int[] selected = {galleryIndex(playlist, path, true)};
         final String[] currentPath = {path};
-        Dialog dialog = new Dialog(this, android.R.style.Theme_Black_NoTitleBar);
+        Dialog dialog = new MaiVideoPreviewDialog(this);
         LinearLayout rootView = new LinearLayout(this);
         rootView.setOrientation(LinearLayout.VERTICAL);
         rootView.setBackgroundColor(Color.BLACK);
@@ -5521,20 +5520,6 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         closeParams.setMargins(dp(18), dp(16), 0, 0);
         frame.addView(close, closeParams);
 
-        TextView expand = iconButton("⤢", 25, Color.WHITE);
-        expand.setContentDescription("放大视频");
-        expand.setBackground(MaiChatTheme.rounded(Color.argb(175, 55, 55, 55), 25, this));
-        expand.setOnClickListener(view -> {
-            videoExpanded = !videoExpanded;
-            expand.setText(videoExpanded ? "⤡" : "⤢");
-            expand.setContentDescription(videoExpanded ? "返回分屏" : "放大视频");
-            updateVideoDockLayout();
-        });
-        FrameLayout.LayoutParams expandParams =
-            new FrameLayout.LayoutParams(dp(50), dp(50), Gravity.TOP | Gravity.END);
-        expandParams.setMargins(0, dp(16), dp(18), 0);
-        frame.addView(expand, expandParams);
-
         LinearLayout actions = new LinearLayout(this);
         actions.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         actions.setPadding(dp(16), 0, dp(18), dp(10));
@@ -5574,26 +5559,14 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
             if (videoDialog == dialog) {
                 videoDialog = null;
                 videoTranscriptOverlay = null;
-                videoExpanded = false;
                 updateSpeechPreview();
-                updateVideoDockLayout();
             }
         });
         dialog.setContentView(rootView);
         allowKeyboardLocation = false;
-        videoExpanded = false;
         videoDialog = dialog;
         dialog.show();
         updateSpeechPreview();
-        Window window = dialog.getWindow();
-        if (window != null) {
-            window.setBackgroundDrawable(new ColorDrawable(Color.BLACK));
-            window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-            window.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN);
-        }
-        updateVideoDockLayout();
         if (handoffPreview != null) {
             Handler handler = new Handler(Looper.getMainLooper());
             long deadline = SystemClock.uptimeMillis() + 8000;
@@ -5619,28 +5592,18 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         animateGalleryEntry(rootView, entryDirection);
     }
 
-    // Keep one player instance while the conversation remains usable beneath its dock.
-    private void updateVideoDockLayout() {
-        if (root == null || insetsHost == null) return;
+    // 横屏会话只按宿主的完整宽度排版；媒体预览在独立窗口中，不占据页面空间。
+    private void updateLandscapeConversationLayout() {
+        if (insetsHost == null) return;
         int width = insetsHost.getWidth();
-        int height = insetsHost.getHeight();
-        if (width <= 0 || height <= 0) return;
-        boolean docked = videoDialog != null && videoDialog.isShowing() && !videoExpanded;
-        boolean landscape = width > height && width >= dp(600);
-        int dockHeight = docked && !landscape
-            ? (keyboardVisible ? dp(240) : Math.min(Math.max((int) (height * 0.62f), dp(320)), dp(560)))
-            : 0;
-        int dockWidth = docked && landscape
-            ? Math.min((int) (width * (keyboardVisible ? 0.42f : 0.52f)), width - dp(340))
-            : 0;
+        if (width <= 0) return;
         if (landscapeConversationPane != null) {
-            int availableWidth = width - dockWidth;
-            boolean showSidebar = activeChatUserId == null || availableWidth >= dp(700);
+            boolean showSidebar = activeChatUserId == null || width >= dp(700);
             landscapeConversationPane.setVisibility(showSidebar ? View.VISIBLE : View.GONE);
             if (landscapeConversationDivider != null)
                 landscapeConversationDivider.setVisibility(showSidebar ? View.VISIBLE : View.GONE);
             if (showSidebar) {
-                int paneDp = Math.min(Math.max((int) (availableWidth /
+                int paneDp = Math.min(Math.max((int) (width /
                     getResources().getDisplayMetrics().density * 0.32f), 280), 360);
                 ViewGroup.LayoutParams paneParams = landscapeConversationPane.getLayoutParams();
                 if (paneParams != null && paneParams.width != dp(paneDp)) {
@@ -5649,25 +5612,6 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                 }
             }
         }
-        FrameLayout.LayoutParams contentParams = (FrameLayout.LayoutParams) root.getLayoutParams();
-        if (contentParams != null && (contentParams.topMargin != dockHeight
-                || contentParams.leftMargin != dockWidth)) {
-            contentParams.topMargin = dockHeight;
-            contentParams.leftMargin = dockWidth;
-            root.setLayoutParams(contentParams);
-        }
-        if (videoDialog == null || !videoDialog.isShowing()) return;
-        Window window = videoDialog.getWindow();
-        if (window == null) return;
-        WindowManager.LayoutParams params = window.getAttributes();
-        params.gravity = Gravity.TOP | Gravity.START;
-        int[] origin = new int[2];
-        insetsHost.getLocationOnScreen(origin);
-        params.x = origin[0];
-        params.y = origin[1];
-        params.width = videoExpanded ? width : (landscape ? dockWidth : width);
-        params.height = videoExpanded ? height : (landscape ? height : dockHeight);
-        window.setAttributes(params);
     }
 
     private void animateGalleryEntry(View content, int direction) {
@@ -6059,6 +6003,12 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         int selected = galleryIndex(playlist, path, false);
         Dialog dialog = reuseDialog ? imageDialog :
             new Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+        if (Build.VERSION.SDK_INT >= 28 && dialog.getWindow() != null) {
+            // 全屏主题仍会避开默认刘海安全区；只扩展图片窗口，不改变透明气泡动画或导航边距。
+            WindowManager.LayoutParams imageWindow = dialog.getWindow().getAttributes();
+            imageWindow.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            dialog.getWindow().setAttributes(imageWindow);
+        }
         FrameLayout frame = new FrameLayout(this);
         frame.setBackgroundColor(bubbleEntry ? Color.TRANSPARENT : Color.BLACK);
         View dim = new View(this);

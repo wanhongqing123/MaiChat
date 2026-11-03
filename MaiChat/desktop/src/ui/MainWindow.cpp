@@ -4479,17 +4479,19 @@ void MainWindow::openVideoCircle(const QString& completedCardJson, const QString
   if (!videoCircleDialog_) {
     videoCircleDialog_ = new VideoCircleDialog(videoCircleAccessProvider_, maiChatAccountIdProvider_,
         [this](const QString& path) {
-          if (!openDockedVideo(path)) {
+          if (!openVideoWindow(path)) {
             QFile::remove(path);
             showToast(QStringLiteral("视频无法播放"), 13, 3000);
             return;
           }
-          // The shared downloader owns the temporary file until the hosted
+          // The shared downloader owns the temporary file until the independent
           // ffplay dialog is fully destroyed; deleting it earlier can break
           // playback, especially on Windows.
-          if (videoDialog_)
-            connect(videoDialog_, &QObject::destroyed, this,
+#if defined(MAICHAT_HAS_FFPLAY)
+          if (auto player = MaiFfplayVideoDialog::activeDialog())
+            connect(player.data(), &QObject::destroyed, this,
                     [path] { QFile::remove(path); });
+#endif
         }, this);
   }
   if (completedCardJson.isEmpty()) videoCircleDialog_->openBrowse();
@@ -6293,49 +6295,13 @@ bool MainWindow::composerTextPrecedesFirstAttachment(
   return !before.trimmed().isEmpty();
 }
 
-bool MainWindow::openDockedVideo(const QString &path, const QStringList &playlist,
-                                 int64_t startPositionUs) {
-#if defined(MAICHAT_HAS_FFPLAY)
-  if (!videoDockSlot_ || !QFileInfo(path).isFile()) return false;
-  if (auto active = MaiFfplayVideoDialog::activeDialog()) active->close();
-  auto *dialog = new MaiFfplayVideoDialog(path, this, startPositionUs);
-  dialog->setObjectName(QStringLiteral("dockedVideoPlayer"));
-  dialog->setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
-  dialog->setMinimumSize(0, 0);
-  dialog->setDocked(true);
-  dialog->setPlaylist(playlist);
-  dialog->setForwardAction([this](const QString &currentPath) {
-    forwardLocalVideo(currentPath);
-  });
-  dialog->setAttribute(Qt::WA_DeleteOnClose);
-  dialog->installEventFilter(this);
-  videoDialog_ = dialog;
-  connect(dialog, &QObject::destroyed, this, [this] {
-    if (!videoDialog_ && videoDockSlot_) videoDockSlot_->hide();
-    if (!videoDialog_ && videoDockPane_) videoDockPane_->hide();
-  });
-  dialog->show();
-  dialog->raise();
-  syncVideoDock();
-  QTimer::singleShot(0, this, [this] { syncVideoDock(); });
-  if (dialog->isStarted()) return true;
-  dialog->close();
-  return false;
-#else
-  Q_UNUSED(path);
-  Q_UNUSED(playlist);
-  Q_UNUSED(startPositionUs);
-  return false;
-#endif
-}
-
 bool MainWindow::openVideoWindow(const QString& path, const QStringList& playlist,
                                  int64_t startPositionUs) {
 #if defined(MAICHAT_HAS_FFPLAY)
   if (!QFileInfo(path).isFile()) return false;
   if (auto active = MaiFfplayVideoDialog::activeDialog()) active->close();
-  // 保留父对象的生命周期管理，但使用 Window 类型和原生标题栏；不加入 videoDialog_
-  // 或 videoDockSlot_，主窗口导航、缩放和播放器全屏都不重新分配会话区域。
+  // 本地视频所有入口保留父对象的生命周期管理，但使用 Window 类型和原生标题栏；
+  // 不登记停靠状态，主窗口导航、缩放和播放器全屏都不重新分配会话区域。
   auto* dialog = new MaiFfplayVideoDialog(path, this, startPositionUs);
   dialog->setObjectName(QStringLiteral("agentVideoPlayerWindow"));
   dialog->setWindowFlags(Qt::Window | Qt::WindowCloseButtonHint |
@@ -6447,7 +6413,7 @@ void MainWindow::openVideoPreview(const RemoteIMVideoAttachment &attachment) {
     return;
   }
 #if defined(MAICHAT_HAS_FFPLAY)
-  if (!openDockedVideo(path))
+  if (!openVideoWindow(path))
     AppMessageDialog::show(this, AppMessageDialog::Kind::Warning,
                            QStringLiteral("无法播放"),
                            QStringLiteral("FFplay 渲染后端或视频文件不可用。"));

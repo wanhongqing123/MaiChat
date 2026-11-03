@@ -116,8 +116,6 @@ struct RootView: View {
     @State private var contactGroupRenameDraft = ""
     @State private var deletingContactGroup: String?
     @State private var isShowingNotificationPermissionPrompt = false
-    @State private var isVideoExpanded = false
-    @State private var keyboardVisible = false
     @AppStorage("maichat.notification-preprompt-dismissed")
     private var notificationPermissionPromptDismissed = false
 
@@ -126,23 +124,13 @@ struct RootView: View {
     }
 
     var body: some View {
-        GeometryReader { viewport in
-            content(viewportSize: viewport.size)
-        }
+        content
     }
 
-    /// 按窗口尺寸组装主界面，并在同一页面实例上为 Agent 视频留出分屏空间。
-    /// 登录页、主标签、创作中心和顶层弹层各有独立层级；播放器只覆盖自己的分区。
-    /// 键盘与横竖屏变化只改变提议尺寸，不清理任何消息或重建创作中心状态。
-    private func content(viewportSize: CGSize) -> some View {
-        let landscape = viewportSize.width > viewportSize.height && viewportSize.width >= 600
-        let hasDock = appState.agentVideoPresentation != nil && !isVideoExpanded
-        // 外层窗口尺寸直接决定分屏，不把子视图测量值写回状态，避免旋转时反复重排。
-        let dockHeight: CGFloat = hasDock && !landscape
-            ? (keyboardVisible ? 240 : min(max(viewportSize.height * 0.62, 320), 560)) : 0
-        let dockWidth: CGFloat = hasDock && landscape
-            ? min(viewportSize.width * (keyboardVisible ? 0.42 : 0.52), viewportSize.width - 340) : 0
-        return ZStack {
+    /// 主界面保持自己的布局和会话状态；视频在独立全屏模态中呈现，关闭后返回原页面。
+    /// IM、创作结果和工具播放复用同一个媒体分页宿主，旋转和图库切换不重建当前播放器。
+    private var content: some View {
+        ZStack {
             VStack(spacing: 0) {
                 if appState.shouldShowInitialLogin {
                     InitialLoginView()
@@ -319,58 +307,26 @@ struct RootView: View {
         .animation(.easeOut(duration: 0.18), value: contactGroupActionName)
         .animation(.easeOut(duration: 0.18), value: renamingContactGroup)
         .animation(.easeOut(duration: 0.18), value: deletingContactGroup)
-        // 内容区先得到扣除播放器后的尺寸，再把播放器单独叠在窗口上方。
-        .padding(.top, dockHeight)
-        .padding(.leading, dockWidth)
         .background(Color(red: 0.966, green: 0.976, blue: 0.988).ignoresSafeArea())
-        // 全屏的触摸与读屏隔离统一由原生分页宿主负责，避免关闭后主页面残留遮蔽。
-        // 竖屏上下分区，横屏左右分区；聊天或创作中心始终保留可触摸的输入区。
-        // 全屏切换只改变同一个播放器的尺寸，不重新打开文件或重置播放位置。
-        .overlay {
-            if let presentation = appState.agentVideoPresentation {
-                GeometryReader { geometry in
-                    MaiLocalMediaPager(sequence: presentation.sequence,
-                        startSeconds: presentation.startSeconds, vod: presentation.vod,
-                        isModal: isVideoExpanded,
-                        selectionChanged: { sequence in
-                            // 浏览图片和视频始终保持同一宿主、尺寸和 presentation ID。
-                            appState.agentVideoPresentation = MaiFfplayPresentation(
-                                sequence: sequence, id: presentation.id, vod: presentation.vod)
-                        }) {
-                        appState.agentVideoPresentation = nil
-                    }
-                    .id(presentation.id)
-                    .frame(width: isVideoExpanded ? geometry.size.width :
-                           (landscape ? dockWidth : geometry.size.width),
-                           height: isVideoExpanded ? geometry.size.height :
-                           (landscape ? geometry.size.height : dockHeight))
-                    .overlay(alignment: .topTrailing) {
-                        Button {
-                            isVideoExpanded.toggle()
-                        } label: {
-                            Image(systemName: isVideoExpanded ? "arrow.down.right.and.arrow.up.left" :
-                                  "arrow.up.left.and.arrow.down.right")
-                                .font(.system(size: 17, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .frame(width: 44, height: 44)
-                                .background(.black.opacity(0.55), in: Circle())
-                        }
-                        .accessibilityLabel(isVideoExpanded ? "返回分屏" : "放大视频")
-                        .accessibilityIdentifier("ffplay-expand")
-                        .padding(.top, isVideoExpanded ? max(geometry.safeAreaInsets.top, 58) + 12 : 12)
-                        .padding(.trailing, 12)
-                    }
-                    // 文件名和序号不覆盖播放画面；切换媒体后也保持相同的简洁布局。
-                    .position(x: isVideoExpanded || !landscape ?
-                              geometry.size.width / 2 : dockWidth / 2,
-                              y: isVideoExpanded || landscape ?
-                              geometry.size.height / 2 : dockHeight / 2)
-                    .zIndex(100)
-                }
-                .ignoresSafeArea(edges: isVideoExpanded ? .all : [])
+        // 系统模态覆盖主页面，不给主页面扣除宽高；原生宿主统一负责触摸和读屏隔离。
+        .fullScreenCover(item: $appState.agentVideoPresentation) { presentation in
+            MaiLocalMediaPager(sequence: presentation.sequence,
+                startSeconds: presentation.startSeconds, vod: presentation.vod,
+                isModal: true,
+                selectionChanged: { sequence in
+                    // 浏览图片和视频保持同一 presentation ID，暂停、倍速和当前播放位置不重建。
+                    appState.agentVideoPresentation = MaiFfplayPresentation(
+                        sequence: sequence, id: presentation.id, vod: presentation.vod)
+                }) {
+                appState.agentVideoPresentation = nil
             }
+            .id(presentation.id)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black)
+            .ignoresSafeArea()
+            .statusBarHidden()
         }
-        // 在底部导航的 safeAreaInset 和视频分屏之后覆盖整窗，保持下面页面布局不变。
+        // 图片覆盖整窗，保持下面页面布局不变；图视频分页继续复用相同原生容器。
         .overlay {
             if !appState.shouldShowInitialLogin && selectedTab == .assistant {
                 AIAssistantImagePreviewLayer(sources: assistantImageSources)
@@ -381,17 +337,7 @@ struct RootView: View {
             assistantImagePresented = $0
             maiLocalMediaTrace("root-image-visible=\($0)")
         }
-        .statusBarHidden(assistantImagePresented ||
-                         (isVideoExpanded && appState.agentVideoPresentation != nil))
-        .onChange(of: appState.agentVideoPresentation?.groupID) { _ in
-            isVideoExpanded = false
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
-            keyboardVisible = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            keyboardVisible = false
-        }
+        .statusBarHidden(assistantImagePresented)
         .task {
 #if DEBUG
             AIMobileScreenCapture.shared.startFrameAcceptanceIfRequested(

@@ -103,9 +103,7 @@ public:
         std::function<QString()> sessionIdentity);
     AgentController* activeAgentController() const { return agentController_; }
     void setSessionSyncCoordinator(DesktopSessionSyncCoordinator* coordinator);
-    bool openDockedVideo(const QString& path, const QStringList& playlist = {},
-                         int64_t startPositionUs = 0);
-    // Agent 视频使用独立顶层窗口，不登记停靠状态，不改变聊天或创作中心布局。
+    // IM、创作中心和视频圈共用独立顶层窗口，不改变原页面布局与会话状态。
     bool openVideoWindow(const QString& path, const QStringList& playlist = {},
                          int64_t startPositionUs = 0);
     // 云盘界面与云盘工具复用独立窗口；换账号即关闭，点播源由播放器持有至退出。

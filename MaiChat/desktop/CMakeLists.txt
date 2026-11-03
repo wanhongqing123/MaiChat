@@ -1378,6 +1378,10 @@ if(WIN32 AND MAICHAT_ENABLE_FFMPEG)
   add_custom_target(maichat_ffplay_test_runtime
     COMMAND ${CMAKE_COMMAND} -E make_directory
       $<TARGET_FILE_DIR:MaiFfplayVideoDialogTest>/MaiAgentGraphics
+    # Qt Test is a dependency of this executable, independent from the normal App runtime.
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      $<TARGET_FILE:Qt5::Test>
+      $<TARGET_FILE_DIR:MaiFfplayVideoDialogTest>
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       $<TARGET_FILE:maichat_ffplay_hosted>
       $<TARGET_FILE_DIR:MaiFfplayVideoDialogTest>

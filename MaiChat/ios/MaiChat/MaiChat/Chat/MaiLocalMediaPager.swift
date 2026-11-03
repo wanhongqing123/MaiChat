@@ -103,7 +103,7 @@ final class MaiLocalMediaPagerController: UIViewController, UIGestureRecognizerD
         view.backgroundColor = .clear
         view.clipsToBounds = true
         view.accessibilityIdentifier = "local-media-pager"
-        // 全屏宿主同时隔离无障碍焦点；分屏宿主仍允许操作下面的聊天输入和导航。
+        // 模态媒体宿主隔离无障碍焦点；关闭后由呈现层恢复原页面的输入和导航。
         view.accessibilityViewIsModal = isModal
         attach(current)
         current.view.frame = view.bounds

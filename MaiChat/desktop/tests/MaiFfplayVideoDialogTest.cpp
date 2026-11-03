@@ -1,9 +1,11 @@
 // 文件作用：验证桌面端视频弹窗控制、分享保存、倍速音频及关闭释放。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QElapsedTimer>
+#include <QAction>
 #include <QComboBox>
 #include <QCameraInfo>
 #include <QDir>
+#include <QHBoxLayout>
 #include <QFileInfo>
 #include <QPointer>
 #include <QProcess>
@@ -19,6 +21,7 @@
 #include <QSplitterHandle>
 #include <QStackedWidget>
 #include <QTemporaryDir>
+#include <QTextEdit>
 #include <QTimer>
 #include <QWidget>
 #include <QtTest>
@@ -76,6 +79,8 @@ private slots:
     void opensControlsAndClosesVideoPopup();
     void opensAtRequestedSourceTime();
     void agentVideoUsesIndependentWindow();
+    void imVideoUsesIndependentWindowAcrossNavigationAndFullscreen_data();
+    void imVideoUsesIndependentWindowAcrossNavigationAndFullscreen();
     void fullscreenControlsHideAndWake();
     void controlsHideAndKeepVisibleForPause();
     void agentRepeatedTargetDoesNotReplayFrames();
@@ -90,7 +95,6 @@ private slots:
     void agentCameraOpensAndClosesWithoutWaitingForShutter();
     void slowedPlaybackExtendsAudibleOutput();
     void localVideoShowsPixels();
-    void mainWindowDocksSamePlayerAcrossNavigationAndFullscreen();
     void hdrPlaybackKeepsTransferMetadata_data();
     void hdrPlaybackKeepsTransferMetadata();
 };
@@ -560,15 +564,26 @@ void MaiFfplayVideoDialogTest::agentVideoUsesIndependentWindow() {
     QTest::qWait(500);
     qInfo() << "[controls-window-native]" << ffplayTestNativeState(player);
 #endif
-    auto* panel = player->findChild<QWidget*>(QStringLiteral("ffplayControlPanel"));
     auto* slider = player->findChild<QSlider*>(QStringLiteral("ffplaySeekSlider"));
     auto* more = player->findChild<QPushButton*>(QStringLiteral("videoMoreButton"));
-    QVERIFY(panel && slider && more);
+    QVERIFY(slider && more);
+    QHBoxLayout* controlRow = nullptr;
+    for (auto* row : player->findChildren<QHBoxLayout*>())
+        if (row->indexOf(slider) >= 0) controlRow = row;
+    QVERIFY(controlRow && controlRow->parentWidget());
+    auto* controlsHost = controlRow->parentWidget();
+    QTRY_VERIFY(slider->isVisible() && more->isVisible());
+    // macOS overlays a panel on video; Windows lays the same real controls below the surface.
+#if defined(Q_OS_MAC)
+    auto* panel = player->findChild<QWidget*>(QStringLiteral("ffplayControlPanel"));
+    QVERIFY(panel && panel->isVisible());
     QTRY_VERIFY(panel->width() > player->width() * 0.85);
+#endif
+    QTRY_VERIFY(controlRow->geometry().width() > player->width() * 0.85);
     QTRY_VERIFY(slider->width() > player->width() * 0.5);
     const QString screenshot = qEnvironmentVariable("MAICHAT_AGENT_VIDEO_SCREENSHOT");
     if (!screenshot.isEmpty()) {
-        QVERIFY(panel->grab().save(screenshot + QStringLiteral("-panel.png")));
+        QVERIFY(controlsHost->grab(controlRow->geometry()).save(screenshot + QStringLiteral("-panel.png")));
         // 原生视频层不参与 QWidget::grab；按窗口边框取屏幕区域，验收标题栏和实际画面。
         QTest::qWait(200);
         const QRect frame = player->frameGeometry();
@@ -578,14 +593,24 @@ void MaiFfplayVideoDialogTest::agentVideoUsesIndependentWindow() {
             QVERIFY(
                 player->screen()->grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(screenshot));
     }
-    bool menuAboveControls = false;
+    bool menuFitsPlatform = false;
     QTimer dismissMenu;
     dismissMenu.setSingleShot(true);
     connect(&dismissMenu, &QTimer::timeout, [&] {
         auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
         if (!menu) return;
-        menuAboveControls = menu->geometry().bottom() <= panel->mapToGlobal(QPoint()).y();
-        qInfo() << "[controls-menu]" << menu->geometry() << "panel-origin" << panel->mapToGlobal(QPoint());
+#if defined(Q_OS_MAC)
+        menuFitsPlatform = menu->isVisible() && menu->geometry().bottom() <= panel->mapToGlobal(QPoint()).y();
+#else
+        // The Windows menu uses the native below-button anchor with Qt's screen-edge adjustment.
+        const auto actions = menu->actions();
+        menuFitsPlatform = menu->isVisible() && menu->screen() &&
+            menu->screen()->availableGeometry().contains(menu->geometry()) && actions.size() == 2 &&
+            actions.at(0)->text() == QStringLiteral("复制文件路径") &&
+            actions.at(1)->text() == QStringLiteral("打开所在文件夹");
+#endif
+        qInfo() << "[controls-menu]" << menu->geometry() << "controls-origin"
+                << controlsHost->mapToGlobal(controlRow->geometry().topLeft());
         if (!screenshot.isEmpty()) {
             menu->grab().save(screenshot + QStringLiteral("-menu-widget.png"));
             const QRect frame = player->frameGeometry();
@@ -601,7 +626,7 @@ void MaiFfplayVideoDialogTest::agentVideoUsesIndependentWindow() {
     dismissMenu.start(200);
     QTest::mouseClick(more, Qt::LeftButton);
     dismissMenu.stop();
-    QVERIFY(menuAboveControls);
+    QVERIFY(menuFitsPlatform);
     player->resize(640, 420);
     QTRY_VERIFY(slider->width() > 160);
     QVERIFY(more->isVisible());
@@ -886,113 +911,145 @@ void MaiFfplayVideoDialogTest::cameraActivePreviewClosesOnAgentCancellation() {
     QVERIFY(QDir(directory.path()).entryList(QStringList{QStringLiteral("*.jpg")}, QDir::Files).isEmpty());
 }
 
-void MaiFfplayVideoDialogTest::mainWindowDocksSamePlayerAcrossNavigationAndFullscreen() {
+void MaiFfplayVideoDialogTest::imVideoUsesIndependentWindowAcrossNavigationAndFullscreen_data() {
+    QTest::addColumn<QSize>("mainSize");
+    QTest::newRow("wide-main-window") << QSize(1500, 900);
+    QTest::newRow("narrow-main-window") << QSize(900, 800);
+}
+
+void MaiFfplayVideoDialogTest::imVideoUsesIndependentWindowAcrossNavigationAndFullscreen() {
+    QFETCH(QSize, mainSize);
+    const QString captureDirectory = qEnvironmentVariable("MAICHAT_VIDEO_PREVIEW_CAPTURE_DIR");
+    QScreen* captureScreen = nullptr;
+    if (!captureDirectory.isEmpty()) {
+        QVERIFY(QDir().mkpath(captureDirectory));
+        captureScreen = QGuiApplication::primaryScreen();
+        QVERIFY(captureScreen);
+        // Reserve room for the later main-window move/resize, keeping synthetic UI on screen.
+        mainSize = mainSize.boundedTo(captureScreen->availableGeometry().size() - QSize(104, 116));
+    }
     auto client = std::make_unique<FakeRemoteIMClient>();
-    RemoteIMApplication app(QStringLiteral("video-dock-test"), std::move(client));
+    RemoteIMApplication app(QStringLiteral("im-video-window-test"), std::move(client));
+    const QString peer = QStringLiteral("video-fixture-peer");
+    app.addContact(peer, QStringLiteral("Video fixture"));
+    app.selectPeer(peer);
+    RemoteIMMessage message;
+    message.id = QStringLiteral("local-video-fixture");
+    message.fromUserId = peer;
+    message.toUserId = app.chatState().ownerUserId();
+    message.hasVideo = true;
+    message.video.localPath = QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE);
+    app.chatState().appendMessageForRestore(message);
     MainWindow window(app);
-    window.resize(1500, 900);
+    window.resize(mainSize);
+    if (captureScreen) window.move(captureScreen->availableGeometry().topLeft() + QPoint(20, 32));
     window.show();
-    QVERIFY(window.openDockedVideo(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE)));
+    auto* stack = window.findChild<QStackedWidget*>(QStringLiteral("contentStack"));
+    auto* editor = window.findChild<QTextEdit*>(QStringLiteral("messageEditor"));
+    auto* videoButton = window.findChild<QPushButton*>(QStringLiteral("messageVideoButton"));
+    auto* slot = window.findChild<QWidget*>(QStringLiteral("videoDockSlot"));
+    auto* pane = window.findChild<QWidget*>(QStringLiteral("videoDockPane"));
+    QVERIFY(stack && editor && videoButton && slot && pane);
+    editor->setPlainText(QStringLiteral("Unsent local video fixture draft"));
+    QCoreApplication::processEvents();
+    const QRect contentBefore = stack->geometry();
+    const QSize windowBefore = window.size();
+    const QString draftBefore = editor->toPlainText();
+
+    // Exercise the actual IM message click, rather than testing only the Agent's already-correct opener.
+    videoButton->click();
     QPointer<MaiFfplayVideoDialog> player = MaiFfplayVideoDialog::activeDialog();
     QVERIFY(player);
-    auto* slot = window.findChild<QWidget*>(QStringLiteral("videoDockSlot"));
-    auto* stack = window.findChild<QStackedWidget*>(QStringLiteral("contentStack"));
-    QVERIFY(slot);
-    QVERIFY(stack);
-    QTRY_VERIFY(slot->isVisible());
-    QTRY_VERIFY(player->presentedFrames() > 0);
-    QVERIFY(player->isVisible());
-    player->raise();
-    QCoreApplication::processEvents();
-    QWidget* surface = player->findChild<QWidget*>(QStringLiteral("ffplayVideoSurface"));
-    QVERIFY(surface);
-    const auto visiblePixels = [surface] {
-        const QPoint position = surface->mapToGlobal(QPoint(0, 0));
-        const QImage pixels =
-            surface->screen()->grabWindow(0, position.x(), position.y(), surface->width(), surface->height()).toImage();
-        int low = 255;
-        int high = 0;
-        for (int y = pixels.height() / 4; y < pixels.height() * 3 / 4; y += 8)
-            for (int x = pixels.width() / 4; x < pixels.width() * 3 / 4; x += 8) {
-                const QColor color = pixels.pixelColor(x, y);
-                const int value = std::max({color.red(), color.green(), color.blue()});
-                low = std::min(low, value);
-                high = std::max(high, value);
+    QVERIFY(player->isWindow());
+    QVERIFY(!player->windowFlags().testFlag(Qt::FramelessWindowHint));
+    QVERIFY(player->windowFlags().testFlag(Qt::WindowTitleHint));
+    QTRY_COMPARE(stack->geometry(), contentBefore);
+    QCOMPARE(window.size(), windowBefore);
+    QVERIFY(!slot->isVisible() && !pane->isVisible());
+    QCOMPARE(editor->toPlainText(), draftBefore);
+    QCOMPARE(app.chatState().selectedPeerId(), peer);
+    QTRY_VERIFY_WITH_TIMEOUT(player->presentedFrames() > 0, 10000);
+    const auto captureStage = [&](const QString& stage) {
+        if (captureDirectory.isEmpty()) return true;
+        QScreen* screen = player ? player->screen() : window.screen();
+        if (!screen) return false;
+        window.raise();
+        if (player && player->isVisible()) {
+            if (!player->isFullScreen()) {
+                // Keep the popup within the synthetic MainWindow: its union must not expose other apps.
+                const QRect area = window.frameGeometry().intersected(screen->availableGeometry())
+                                       .adjusted(24, 48, -24, -24);
+                const QSize frame = player->frameGeometry().size() - player->size();
+                player->resize(player->size().boundedTo(area.size() - frame));
+                player->move(area.center() - QPoint(player->frameGeometry().width() / 2,
+                                                    player->frameGeometry().height() / 2));
             }
-        return high - low > 32;
+            player->raise();
+            player->activateWindow();
+        } else {
+            window.activateWindow();
+        }
+        if (stage == QStringLiteral("closed")) {
+            if (player && player->isVisible()) return false;
+            // Qt destruction precedes the Windows compositor's closing animation.
+            QTest::qWait(350);
+        } else {
+            QTest::qWait(80);
+        }
+        QCoreApplication::processEvents();
+        QRect region = window.frameGeometry();
+        if (player && player->isVisible()) region = region.united(player->frameGeometry());
+        region = region.intersected(screen->geometry());
+        if (region.isEmpty()) return false;
+        const QPixmap pixels = screen->grabWindow(0, region.x(), region.y(), region.width(), region.height());
+        const QString filename = QString::fromLatin1(QTest::currentDataTag()) + QLatin1Char('-')
+            + stage + QStringLiteral(".png");
+        return !pixels.isNull() && pixels.save(QDir(captureDirectory).filePath(filename));
     };
-    QTRY_VERIFY_WITH_TIMEOUT(visiblePixels(), 2000);
-    QTRY_COMPARE(player->pos(), slot->mapToGlobal(QPoint(0, 0)));
-    QCOMPARE(player->size(), slot->size());
-    QVERIFY2(slot->width() * 4 >= slot->height() * 5, "Desktop video dock must open as a landscape viewport");
-    auto* dockSplitter = window.findChild<QSplitter*>(QStringLiteral("videoContentSplitter"));
-    QVERIFY(dockSplitter && dockSplitter->handle(1)->isVisible());
-    auto* resizeHandle = dockSplitter->handle(1);
-    const int originalWidth = slot->width();
-    const QPoint handleCenter = resizeHandle->rect().center();
-    const QPoint finish = handleCenter - QPoint(40, 0);
-    QTest::mousePress(resizeHandle, Qt::LeftButton, Qt::NoModifier, handleCenter);
-    QMouseEvent move(QEvent::MouseMove, QPointF(finish), QPointF(resizeHandle->mapToGlobal(finish)), Qt::NoButton,
-                     Qt::LeftButton, Qt::NoModifier);
-    QApplication::sendEvent(resizeHandle, &move);
-    QTest::mouseRelease(resizeHandle, Qt::LeftButton, Qt::NoModifier, finish);
-    QTRY_VERIFY2(slot->width() < originalWidth,
-                 qPrintable(QStringLiteral("before=%1 after=%2").arg(originalWidth).arg(slot->width())));
-    QTRY_COMPARE(player->size(), slot->size());
-    const QByteArray capture = qgetenv("MAICHAT_TEST_CAPTURE_PATH");
-    if (!capture.isEmpty()) {
-        QTest::qWait(200);
-        QVERIFY(player->screen()
-                    ->grabWindow(0, window.x(), window.y(), window.width(), window.height())
-                    .save(QString::fromUtf8(capture)));
-    }
-    auto* fullscreen = player->findChild<QPushButton*>(QStringLiteral("ffplayFullscreenButton"));
-    auto* close = player->findChild<QPushButton*>(QStringLiteral("ffplayCloseButton"));
-#if defined(Q_OS_MAC)
-    QVERIFY(fullscreen);
-#else
-    QVERIFY(!fullscreen);
-#endif
-    QVERIFY(close);
-#if defined(Q_OS_MAC)
-    fullscreen->click();
+    QVERIFY(captureStage(QStringLiteral("popup")));
+
+    // Reopening closes the previous player without replacing any chat widgets or draft.
+    QPointer<MaiFfplayVideoDialog> previous = player;
+    videoButton->click();
+    player = MaiFfplayVideoDialog::activeDialog();
+    QVERIFY(player && player != previous);
+    QTRY_VERIFY(previous.isNull());
+    QTRY_COMPARE(stack->geometry(), contentBefore);
+    QCOMPARE(window.size(), windowBefore);
+    QCOMPARE(editor->toPlainText(), draftBefore);
+    QTRY_VERIFY_WITH_TIMEOUT(player->presentedFrames() > 0, 10000);
+    player->showFullScreen();
     QTRY_VERIFY(player->isFullScreen());
-    QTRY_VERIFY(!slot->isVisible());
-    fullscreen->click();
+    QTRY_COMPARE(stack->geometry(), contentBefore);
+    QVERIFY(!slot->isVisible() && !pane->isVisible());
+    player->showNormal();
     QTRY_VERIFY(!player->isFullScreen());
-    QTRY_VERIFY(slot->isVisible());
-#endif
+    QTRY_COMPARE(stack->geometry(), contentBefore);
+
     auto* contacts = window.findChild<QPushButton*>(QStringLiteral("contactsNavButton"));
-    QVERIFY(contacts);
+    auto* messages = window.findChild<QPushButton*>(QStringLiteral("messagesNavButton"));
+    QVERIFY(contacts && messages);
     contacts->click();
     QCOMPARE(MaiFfplayVideoDialog::activeDialog(), player);
-    QVERIFY(stack->isVisible());
-    window.resize(900, 800);
-    QTRY_VERIFY(slot->parentWidget()->layout()->geometry().width() < 1100);
-    QTRY_VERIFY(slot->height() < slot->parentWidget()->height());
-    QTRY_COMPARE(player->pos(), slot->mapToGlobal(QPoint(0, 0)));
-    QCOMPARE(MaiFfplayVideoDialog::activeDialog(), player);
+    const QPoint playerPosition = player->pos();
+    window.resize(mainSize + QSize(60, 40));
     window.move(window.pos() + QPoint(20, 15));
-    QTRY_COMPARE(player->pos(), slot->mapToGlobal(QPoint(0, 0)));
-    close->click();
+    QCoreApplication::processEvents();
+    QCOMPARE(player->pos(), playerPosition);
+    QVERIFY(!slot->isVisible() && !pane->isVisible());
+    messages->click();
+    QCOMPARE(editor->toPlainText(), draftBefore);
+    QCOMPARE(app.chatState().selectedPeerId(), peer);
+    const QRect contentAfterNavigation = stack->geometry();
+    player->close();
     QTRY_VERIFY(player.isNull());
-    QVERIFY(!slot->isVisible());
-    MaiToolRegistry registry;
-    registerDesktopMediaTools(registry, &window);
-    MaiToolContext context;
-    const QFileInfo fixture(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE));
-    context.root = fixture.dir().absolutePath().toStdString();
-    QVERIFY(!registry.find("maichat_play_video")
-                 ->execute(QStringLiteral("{\"path\":\"%1\"}").arg(fixture.fileName()).toStdString(), context)
-                 .hasError());
-    QTRY_VERIFY(slot->isVisible());
-    // 窗口显示先于工作线程的 HDR 探测/流信息准备；等新会话实际开始后测试控制。
-    QTRY_VERIFY_WITH_TIMEOUT(
-        MaiFfplayVideoDialog::activeDialog() && MaiFfplayVideoDialog::activeDialog()->presentedFrames() > 0, 5000);
-    QVERIFY(!registry.find("maichat_video_command")->execute(R"({"action":"pause"})", context).hasError());
-    QVERIFY(!registry.find("maichat_video_command")->execute(R"({"action":"close"})", context).hasError());
-    QTRY_VERIFY(!slot->isVisible());
+    QTRY_COMPARE(stack->geometry(), contentAfterNavigation);
+    QVERIFY(!slot->isVisible() && !pane->isVisible());
+    QCOMPARE(editor->toPlainText(), draftBefore);
+    QCOMPARE(app.chatState().selectedPeerId(), peer);
+    QVERIFY(captureStage(QStringLiteral("closed")));
 }
+
 
 void MaiFfplayVideoDialogTest::exposesSaveAndForwardActions() {
     MaiFfplayVideoDialog dialog(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE));

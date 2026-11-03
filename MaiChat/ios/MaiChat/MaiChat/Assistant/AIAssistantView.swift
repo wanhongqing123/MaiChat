@@ -1,6 +1,6 @@
 // 文件作用：组织会话目录与创作页面的联动侧滑，以及消息、附件、输入栏和语音交互。
 // 消息列表只渲染模型已经加载的页面；切 Session 后定位到新会话真实的最新消息。
-// 用户上滑阅读旧页时保留当前位置；新消息、键盘或播放器分屏只在需要跟随底部时校正。
+// 用户上滑阅读旧页时保留当前位置；新消息、键盘或旋转只在需要跟随底部时校正。
 // 会话读写与 Agent 任务由 AIAssistantModel 管理；本文件负责视图生命周期和操作反馈。
 import AVFoundation
 import CoreTransferable
@@ -122,7 +122,7 @@ struct AIAssistantView: View {
     }
 
     /// 根据横竖屏尺寸装配标题、消息列表、输入栏和弹层。
-    /// 视频分屏只改变可用视口；会话数据仍由原页面持有，弹层不参与消息区测量。
+    /// 会话数据仍由原页面持有；全屏视频不改变主页面尺寸，弹层不参与消息区测量。
     private func content(viewportSize: CGSize, safeAreaInsets: EdgeInsets) -> some View {
         let wideLayout = viewportSize.width >= 700 && viewportSize.width > viewportSize.height
         let width = min(360, viewportSize.width * 0.78)
@@ -273,7 +273,7 @@ struct AIAssistantView: View {
                 if showActions {
                     // 右上角操作面板只处理模型、权限与会话清理；
                     // 遮罩与面板共用明确的右上角容器，避免多根 overlay 的默认居中布局。
-                    // 容器跟随当前创作页面尺寸，分屏/旋转后仍紧贴该页标题栏。
+                    // 容器跟随当前创作页面尺寸，旋转后仍紧贴该页标题栏。
                     ZStack(alignment: .topTrailing) {
                         Color.black.opacity(0.001).ignoresSafeArea().contentShape(Rectangle())
                             .onTapGesture { showActions = false }
@@ -342,7 +342,7 @@ struct AIAssistantView: View {
             .padding(.bottom, -safeAreaInsets.bottom)
             .zIndex(10)
             if hostsImagePreview {
-                // 独立宿主复用同一预览；正常 App 由 Root 放在底部导航和分屏之上。
+                // 独立宿主复用同一预览；正常 App 由 Root 在主页面上方整窗覆盖。
                 AIAssistantImagePreviewLayer(sources: imageSources).zIndex(30)
             }
         }
@@ -1098,7 +1098,7 @@ private struct AIAssistantMessageList: View {
                     viewportLog.reset()
                 }
                 .onChange(of: geometry.size.height) { height in
-                    // 上方播放器进入分屏会缩小消息视口。保留用户主动上滑的阅读位置；
+                    // 键盘和旋转会改变消息视口。保留用户主动上滑的阅读位置；
                     // 原本跟随最新消息时，在新的可见高度完成布局后重新校正底部。
                     AppDiagnosticLog.shared.record(
                         level: .info,
@@ -1920,7 +1920,7 @@ struct AIMessageRow: View, Equatable {
     }
 
     private func openVideo(_ path: String) {
-        // 视频在上半屏播放时保留创作中心输入区，AI 才能接收“跳到第几秒”等后续指令。
+        // 与 IM 和工具播放使用同一个全屏模态；关闭后回到原创作会话和输入草稿。
         if let appState = AIMobileHostToolProvider.shared.appState {
             let model = AIAssistantModel.shared
             let session = model.selected
