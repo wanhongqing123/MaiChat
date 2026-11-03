@@ -56,3 +56,12 @@ QtWebSockets 存在检查及主程序哈希均通过。原生 cocoa 后端 `--sm
 本次打包使用分离路径，镜像未受影响；另增加真实路径解析及双向重叠拒绝，覆盖符号
 链接别名。三个实际 shell 用例（输入在输出内、输出在输入内、符号链接别名）都在
 删除前退出 1，原输入 sentinel 保留；语法与 diff 检查通过。该保护不改变 App 二进制。
+
+## 发布结果
+
+2026-11-03 11:40:49（Asia/Shanghai）已发布
+[MaiChat v2.2.34](https://github.com/wanhongqing123/MaiChat/releases/tag/v2.2.34)，
+tag 指向 `3c7a29272dc3c97cacb4d1ba0678801a9cf36b46`。
+先上传草稿，逐项核对 GitHub 返回的大小和 SHA-256 后再公开；最终回读确认
+draft=false、prerelease=false，且为 MaiChat 仓库 Latest Release。三个附件为上述 DMG、
+Android Debug APK 和 SHA256SUMS，远端摘要全部与本地一致；未向其他仓库发布。
