@@ -1,0 +1,110 @@
+{
+  "upstream_commit": "ee17f293b638295651c6ff4752a4dce102c6b8e4",
+  "upstream_git_tree": "625866e031a0127781b4805a4455f10ff3f50647",
+  "source_files": 4021,
+  "manifest_sha256": "c37eadaa3aae77a4655e7c670ab65775b84fe33369217a96304869a021fd0953",
+  "oversize_gt40MiB": [],
+  "private_key_headers": [],
+  "gguf_vocab_only_files": [
+    {
+      "path": "models/ggml-vocab-aquila.gguf",
+      "tensor_count": 0,
+      "bytes": 4825676
+    },
+    {
+      "path": "models/ggml-vocab-baichuan.gguf",
+      "tensor_count": 0,
+      "bytes": 1340998
+    },
+    {
+      "path": "models/ggml-vocab-bert-bge.gguf",
+      "tensor_count": 0,
+      "bytes": 627549
+    },
+    {
+      "path": "models/ggml-vocab-command-r.gguf",
+      "tensor_count": 0,
+      "bytes": 10874545
+    },
+    {
+      "path": "models/ggml-vocab-deepseek-coder.gguf",
+      "tensor_count": 0,
+      "bytes": 1156067
+    },
+    {
+      "path": "models/ggml-vocab-deepseek-llm.gguf",
+      "tensor_count": 0,
+      "bytes": 3970167
+    },
+    {
+      "path": "models/ggml-vocab-falcon.gguf",
+      "tensor_count": 0,
+      "bytes": 2287728
+    },
+    {
+      "path": "models/ggml-vocab-gemma-4.gguf",
+      "tensor_count": 0,
+      "bytes": 15776467
+    },
+    {
+      "path": "models/ggml-vocab-gpt-2.gguf",
+      "tensor_count": 0,
+      "bytes": 1766807
+    },
+    {
+      "path": "models/ggml-vocab-gpt-neox.gguf",
+      "tensor_count": 0,
+      "bytes": 1771431
+    },
+    {
+      "path": "models/ggml-vocab-llama-bpe.gguf",
+      "tensor_count": 0,
+      "bytes": 7818140
+    },
+    {
+      "path": "models/ggml-vocab-llama-spm.gguf",
+      "tensor_count": 0,
+      "bytes": 723869
+    },
+    {
+      "path": "models/ggml-vocab-mpt.gguf",
+      "tensor_count": 0,
+      "bytes": 1771393
+    },
+    {
+      "path": "models/ggml-vocab-nomic-bert-moe.gguf",
+      "tensor_count": 0,
+      "bytes": 6821877
+    },
+    {
+      "path": "models/ggml-vocab-phi-3.gguf",
+      "tensor_count": 0,
+      "bytes": 726019
+    },
+    {
+      "path": "models/ggml-vocab-qwen2.gguf",
+      "tensor_count": 0,
+      "bytes": 5928681
+    },
+    {
+      "path": "models/ggml-vocab-qwen35.gguf",
+      "tensor_count": 0,
+      "bytes": 5928682
+    },
+    {
+      "path": "models/ggml-vocab-refact.gguf",
+      "tensor_count": 0,
+      "bytes": 1720710
+    },
+    {
+      "path": "models/ggml-vocab-starcoder.gguf",
+      "tensor_count": 0,
+      "bytes": 1719346
+    }
+  ],
+  "source_files_removed": [],
+  "notes": [
+    "docs/development/llama-star/idea-arch.key is a Keynote ZIP document, not key material.",
+    "All upstream .gguf files have zero tensors and are tokenizer vocabulary fixtures. No inference weights were added."
+  ]
+}

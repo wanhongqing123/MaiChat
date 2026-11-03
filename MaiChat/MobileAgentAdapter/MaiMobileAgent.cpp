@@ -29,6 +29,7 @@
 #include "MaiOpenSslTool.h"
 #include "MaiPdfTool.h"
 #include "MaiIdGenerator.h"
+#include "MaiLlamaTools.h"
 #include "MaiQuestionTool.h"
 #include "MaiSessionTools.h"
 #include "MaiSqliteStore.h"
@@ -523,6 +524,8 @@ struct MaiMobileAgent {
         // 移动宿主的媒体与导出工具仍使用统一的默认工作目录，不能只切换 Agent 会话路径。
         registerMaiSessionTools(*tools, /*includeWorkspaceSwitch=*/false);
         registerMaiCurlTools(*tools, config.caBundlePath);
+        // 与普通 C ABI 共用进程内的唯一驻留模型；主聊天仍直连原供应商。
+        registerMaiLlamaTools(*tools);
         tools->add(makeMaiZlibCompressTool());
         tools->add(makeMaiZlibDecompressTool());
         tools->add(makeMaiOpenSslCliTool());

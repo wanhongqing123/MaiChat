@@ -66,6 +66,13 @@ OpenSSL 工具目前仅接受只读的 `version`、`dgst`（限定算法和单�
 
 ## 五、当前实现范围
 
+- `llama`：源码同时构建 llama.cpp、ggml 和 mtmd，普通入口与工具共用 `MaiLlamaRuntime`。
+  当前是有界的库 API 子集，不是完整 CLI 嵌入：固定版本的 `tools/cli/cli.cpp` 会安装
+  SIGINT/SIGTERM handler 并调用 `std::exit`，`tools/mtmd/mtmd-cli.cpp` 还包含 `_exit`、
+  `exit`、`atexit` 和 console 全局状态，尚不能直接在 App 工作线程反复执行这些入口。
+  因此本轮仅开放本地 GGUF 的 CPU 文本/单图生成、`--status` 和 `--unload`；拒绝下载、
+  stdin、视频路径、输出文件及未知参数。它不声明支持全部上游命令或模型训练。
+  来源与构建见 `third_party/llama.cpp/MAI_UPSTREAM.md`，普通接口见 `include/MaiLlamaTools.h`。
 - `curl`：复用上游 CLI 源码，经参数适配后提供有界的 HTTP(S) 请求、上传和下载。协议、路径、配置文件和响应大小均受工具层限制。
 - `openssl`：复用上游 `apps/openssl.c` 及 libapps/libssl。嵌入入口不再调用进程级 `exit` 或修改 SIGPIPE，BIO 在内存中收集；工具用互斥锁串行化，并只开放 `version`、`dgst`、`x509` 的只读子集。EVP/X509 类型化入口仍供程序内部复用。Mac 与移动端使用嵌入入口；Windows 目前仍保留原有类型化摘要和证书工具，尚未验证嵌入 CLI。
 - OpenCV 上游的 `apps/` 是版本、标注、训练级联分类器等**分散的专用程序**，不存在覆盖边缘检测、轮廓、模板匹配和视频分析的通用 `opencv` CLI。因此现有 11 个 `cv_*` 工具继续通过 OpenCV API 执行；不能把它们说成 CLI 嵌入。若以后要开放上游某个独立 CLI，逐个按本规范审计和注册。

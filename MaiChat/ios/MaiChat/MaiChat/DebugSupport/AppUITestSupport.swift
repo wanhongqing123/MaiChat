@@ -382,6 +382,8 @@ private struct MaiChatSimulatorUITestEntry: View {
         if ProcessInfo.processInfo.arguments.contains("--ai-ui-test") {
             if ProcessInfo.processInfo.arguments.contains("--ai-account-tools-ui-test") {
                 AccountToolsUITestRoot()
+            } else if ProcessInfo.processInfo.arguments.contains("--ai-local-inference-ui-test") {
+                AILocalInferenceUITestRoot()
             } else if ProcessInfo.processInfo.arguments.contains("--app-bars-layout-ui-test") {
                 AppBarsLayoutUITestRoot()
             } else if ProcessInfo.processInfo.arguments.contains("--ai-screen-frames-ui-test") {

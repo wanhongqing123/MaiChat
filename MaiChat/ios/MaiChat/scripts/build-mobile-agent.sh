@@ -90,6 +90,9 @@ if [[ -n "${TARGET_BUILD_DIR:-}" && -n "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}" 
   cp "$repo_dir/MaiAgent/third_party/ngtcp2/COPYING" "$pdf_licenses/NGTCP2_LICENSE.txt"
   cp "$repo_dir/MaiAgent/third_party/nghttp3/COPYING" "$pdf_licenses/NGHTTP3_LICENSE.txt"
   cp "$repo_dir/MaiAgent/third_party/curl-apple/COPYING" "$pdf_licenses/CURL_LICENSE.txt"
+  # llama/mtmd 与 ggml 后端由仓库源码静态链接；权重不随 App 打包。
+  cp "$repo_dir/MaiAgent/third_party/llama.cpp/MAI_THIRD_PARTY_NOTICES.txt" \
+    "$pdf_licenses/LLAMA_CPP_NOTICES.txt"
   effect_bundle="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MaiAgentGraphics"
   mkdir -p "$effect_bundle"
   cp "$repo_dir/MaiAgent/Graphics/data/"*.effect "$effect_bundle/"
