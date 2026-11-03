@@ -27,6 +27,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.content.res.ColorStateList;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -35,6 +36,7 @@ import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.media.MediaScannerConnection;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
@@ -66,6 +68,7 @@ import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
+import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.PopupWindow;
@@ -5444,8 +5447,10 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         rootView.addView(frame, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
+        // 44dp 点击区加上下各 8dp；操作行与播放器预留使用同一高度，避免留下空白或遮挡。
+        final int actionsHeightDp = 60;
         MaiFfplayVideoView video = new MaiFfplayVideoView(this);
-        video.setControlsBottomInset(cloudVod == null ? 72 : 0);
+        video.setControlsBottomInset(cloudVod == null ? actionsHeightDp : 0);
         if (cloudVod != null) video.setCloudVodHandle(cloudVod.handle());
         video.setVideoPath(path, startPositionUs);
         TextView mediaName = MaiChatTheme.text(this, "", 12, Color.WHITE);
@@ -5522,31 +5527,31 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
 
         LinearLayout actions = new LinearLayout(this);
         actions.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        actions.setPadding(dp(16), 0, dp(18), dp(10));
-        TextView share = videoAction("↗", "转发或分享");
+        actions.setPadding(dp(12), dp(8), dp(12), dp(8));
+        ImageButton share = videoAction(R.drawable.ic_ui_share, "转发或分享");
         share.setOnClickListener(view -> {
             if (cloudVod != null) toast("云盘视频正在点播，无法直接转发");
             else sharePreviewVideo(currentPath[0]);
         });
-        actions.addView(share, new LinearLayout.LayoutParams(dp(50), dp(50)));
-        TextView save = videoAction("↓", "保存到相册");
+        actions.addView(share, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        ImageButton save = videoAction(R.drawable.ic_ui_download, "保存到相册");
         save.setOnClickListener(view -> {
             if (cloudVod != null) toast("云盘视频正在点播，未下载到相册");
             else savePreviewVideo(currentPath[0]);
         });
-        LinearLayout.LayoutParams actionSpacing = new LinearLayout.LayoutParams(dp(50), dp(50));
-        actionSpacing.leftMargin = dp(12);
+        LinearLayout.LayoutParams actionSpacing = new LinearLayout.LayoutParams(dp(44), dp(44));
+        actionSpacing.leftMargin = dp(6);
         actions.addView(save, actionSpacing);
-        TextView copyPath = videoAction("⧉", "复制文件路径");
+        ImageButton copyPath = videoAction(R.drawable.ic_ui_copy, "复制文件路径");
         copyPath.setOnClickListener(view -> {
             if (cloudVod != null) toast("云盘视频没有本地文件路径");
             else copyToClipboard(currentPath[0]);
         });
-        LinearLayout.LayoutParams copySpacing = new LinearLayout.LayoutParams(dp(50), dp(50));
-        copySpacing.leftMargin = dp(12);
+        LinearLayout.LayoutParams copySpacing = new LinearLayout.LayoutParams(dp(44), dp(44));
+        copySpacing.leftMargin = dp(6);
         actions.addView(copyPath, copySpacing);
         if (cloudVod == null) frame.addView(actions, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(72), Gravity.BOTTOM));
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(actionsHeightDp), Gravity.BOTTOM));
 
         dialog.setOnDismissListener(d -> {
             MaiCloudVod.Session stream = cloudPlayerStreams.remove(dialog);
@@ -5621,25 +5626,76 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         content.animate().translationX(0).alpha(1).setDuration(220).start();
     }
 
-    private TextView videoAction(String icon, String label) {
-        TextView button = iconButton(icon, 26, Color.WHITE);
+    private ImageButton videoAction(int icon, String label) {
+        ImageButton button = new ImageButton(this);
+        button.setImageResource(icon);
+        button.setImageTintList(ColorStateList.valueOf(Color.WHITE));
+        button.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
         button.setContentDescription(label);
-        button.setBackground(MaiChatTheme.rounded(Color.argb(105, 255, 255, 255), 25, this));
+        // 44dp 按钮内绘制 24dp 矢量，只在按压时给轻反馈，不用大圆底抢占画面。
+        button.setBackground(new RippleDrawable(ColorStateList.valueOf(Color.argb(35, 255, 255, 255)),
+            null, MaiChatTheme.rounded(Color.WHITE, 8, this)));
+        button.setPadding(dp(10), dp(10), dp(10), dp(10));
         return button;
     }
 
     private void sharePreviewVideo(String path) {
         File source = new File(path);
         if (!source.isFile()) { toast("视频文件已丢失"); return; }
+        String shareOwner = displayedOwner;
+        int shareGeneration = session.accountGeneration();
         try {
-            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", source);
-            Intent share = new Intent(Intent.ACTION_SEND);
-            share.setType("video/*");
-            share.putExtra(Intent.EXTRA_STREAM, uri);
-            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivity(Intent.createChooser(share, "转发或分享视频"));
-        } catch (Exception error) {
-            toast("无法分享视频");
+            mediaExecutor.execute(() -> {
+                File exported = null;
+                try {
+                    if (destroyed || shareGeneration != session.accountGeneration()) return;
+                    // 创作附件可能位于 no_backup 工作区，FileProvider 只允许 files/cache；
+                    // 沿用创作媒体的缓存导出方式，不扩大共享根目录，也不改动原视频。
+                    String name = source.getName();
+                    int dot = name.lastIndexOf('.');
+                    String suffix = dot >= 0 && name.length() - dot <= 16 ? name.substring(dot) : ".video";
+                    exported = File.createTempFile("shared-video-", suffix, getCacheDir());
+                    try (InputStream input = new FileInputStream(source);
+                         OutputStream output = new FileOutputStream(exported)) {
+                        byte[] buffer = new byte[64 * 1024];
+                        int count;
+                        while ((count = input.read(buffer)) != -1) {
+                            if (destroyed || shareGeneration != session.accountGeneration()
+                                || Thread.currentThread().isInterrupted())
+                                throw new IOException("Video export canceled");
+                            output.write(buffer, 0, count);
+                        }
+                    }
+                    File ready = exported;
+                    runOnUiThread(() -> {
+                        // 同一 Activity 内切换账号也必须取消旧账号尚未完成的导出。
+                        if (destroyed || isFinishing() || shareGeneration != session.accountGeneration()
+                            || !java.util.Objects.equals(shareOwner, displayedOwner)) {
+                            ready.delete(); return;
+                        }
+                        try {
+                            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", ready);
+                            Intent share = new Intent(Intent.ACTION_SEND);
+                            share.setType("video/*");
+                            share.putExtra(Intent.EXTRA_STREAM, uri);
+                            share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                            startActivity(Intent.createChooser(share, "转发或分享视频"));
+                            // 接收方会异步读取 URI；成功启动后保留缓存，交由系统按缓存策略回收。
+                        } catch (Exception error) {
+                            ready.delete();
+                            toast("无法分享视频");
+                        }
+                    });
+                } catch (Exception error) {
+                    if (exported != null) exported.delete();
+                    runOnUiThread(() -> {
+                        if (!destroyed && !isFinishing() && shareGeneration == session.accountGeneration())
+                            toast("无法分享视频");
+                    });
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException closed) {
+            if (!destroyed && !isFinishing()) toast("无法分享视频");
         }
     }
 
