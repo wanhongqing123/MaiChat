@@ -7,6 +7,15 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		0EEE37DA59F5209F3B04CDFB /* LocalModelsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80EADE8B96704E502A286785 /* LocalModelsUITests.swift */; };
+		EDE2A4933AB84C43ECB16128 /* AIOutgoingMessageRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 973AD0DAC1EF76407EBA047E /* AIOutgoingMessageRowView.swift */; };
+		44EC63C4BA77196CD975052F /* AIOutgoingMessagePump.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54AFDD184FEAA7382DDC254D /* AIOutgoingMessagePump.swift */; };
+		932F788A269D48825AD0C797 /* AIOutgoingMessagePayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8958ED4FC332352057B46898 /* AIOutgoingMessagePayload.swift */; };
+		379C9247FD7652C65A375FAE /* AIOutgoingMessageQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C7AB4E0622930D4A056CBE0 /* AIOutgoingMessageQueueTests.swift */; };
+		379D03CAD642A70E76F3F795 /* AILocalModelStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D50A51C97C5A7381086D8241 /* AILocalModelStoreTests.swift */; };
+		9BB153E1210E2FB9D0038C46 /* AILocalModelsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD2318EB3EBD99CD0BBB6BD2 /* AILocalModelsView.swift */; };
+		698F33DD65C4A59DD221CFA8 /* AIOutgoingMessageQueue.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE78D1022E3334AA73A37B92 /* AIOutgoingMessageQueue.swift */; };
+		D526175AB40D14E9E37BBD39 /* AILocalModelStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F48E0D4E7D60AF8CD083F504 /* AILocalModelStore.swift */; };
 		7BE2BC4EA367B7517B6D286D /* LocalInferenceUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BCB5FFEB9C9B11BB747DE4D /* LocalInferenceUITests.swift */; };
 		122E240613E362BBF149EFFE /* AILocalInferenceUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAA6C971B5AE1B704B174CB5 /* AILocalInferenceUITestFixture.swift */; };
 		F8B3C2B1B42BAAE0624B9281 /* AILocalInferenceRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DB66B5A5984C9EF151C6F89 /* AILocalInferenceRuntime.swift */; };
@@ -190,6 +199,15 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		80EADE8B96704E502A286785 /* LocalModelsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatUITests/LocalModelsUITests.swift"; sourceTree = SOURCE_ROOT; };
+		973AD0DAC1EF76407EBA047E /* AIOutgoingMessageRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/Views/AIOutgoingMessageRowView.swift"; sourceTree = SOURCE_ROOT; };
+		54AFDD184FEAA7382DDC254D /* AIOutgoingMessagePump.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/AIOutgoingMessagePump.swift"; sourceTree = SOURCE_ROOT; };
+		8958ED4FC332352057B46898 /* AIOutgoingMessagePayload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/AIOutgoingMessagePayload.swift"; sourceTree = SOURCE_ROOT; };
+		5C7AB4E0622930D4A056CBE0 /* AIOutgoingMessageQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatTests/AIOutgoingMessageQueueTests.swift"; sourceTree = SOURCE_ROOT; };
+		D50A51C97C5A7381086D8241 /* AILocalModelStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatTests/AILocalModelStoreTests.swift"; sourceTree = SOURCE_ROOT; };
+		CD2318EB3EBD99CD0BBB6BD2 /* AILocalModelsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/Views/AILocalModelsView.swift"; sourceTree = SOURCE_ROOT; };
+		EE78D1022E3334AA73A37B92 /* AIOutgoingMessageQueue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatCore/Assistant/AIOutgoingMessageQueue.swift"; sourceTree = SOURCE_ROOT; };
+		F48E0D4E7D60AF8CD083F504 /* AILocalModelStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatCore/Assistant/AILocalModelStore.swift"; sourceTree = SOURCE_ROOT; };
 		7BCB5FFEB9C9B11BB747DE4D /* LocalInferenceUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalInferenceUITests.swift; sourceTree = "<group>"; };
 		EAA6C971B5AE1B704B174CB5 /* AILocalInferenceUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AILocalInferenceUITestFixture.swift; sourceTree = "<group>"; };
 		6DB66B5A5984C9EF151C6F89 /* AILocalInferenceRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AILocalInferenceRuntime.swift; sourceTree = "<group>"; };
@@ -679,6 +697,15 @@
 				963B8982A2C2F09901650272 /* MaiChatCore */,
 				B10C14934159C0FF468D3AB1 /* MaiChatTests */,
 				3CD4EF3DABF7B0B21E1E7C1C /* MaiChatUITests */,
+				80EADE8B96704E502A286785 /* LocalModelsUITests.swift */,
+				973AD0DAC1EF76407EBA047E /* AIOutgoingMessageRowView.swift */,
+				54AFDD184FEAA7382DDC254D /* AIOutgoingMessagePump.swift */,
+				8958ED4FC332352057B46898 /* AIOutgoingMessagePayload.swift */,
+				5C7AB4E0622930D4A056CBE0 /* AIOutgoingMessageQueueTests.swift */,
+				D50A51C97C5A7381086D8241 /* AILocalModelStoreTests.swift */,
+				CD2318EB3EBD99CD0BBB6BD2 /* AILocalModelsView.swift */,
+				EE78D1022E3334AA73A37B92 /* AIOutgoingMessageQueue.swift */,
+				F48E0D4E7D60AF8CD083F504 /* AILocalModelStore.swift */,
 				77FEC2B53DE369B0BBAE5A10 /* Products */,
 				4F333DE021D24CE09E117E27 /* Pods */,
 				B3BAC170BC2E5EB2948B300E /* Frameworks */,
@@ -951,6 +978,8 @@
 				7CA7F5C3C26143C75F69AC61 /* DiagnosticLogFileStore.swift in Sources */,
 				DF9681343308096189F53377 /* MarkdownPresentation.swift in Sources */,
 				3FB5135EF0A464E4798EE349 /* MasterChatState.swift in Sources */,
+				698F33DD65C4A59DD221CFA8 /* AIOutgoingMessageQueue.swift in Sources */,
+				D526175AB40D14E9E37BBD39 /* AILocalModelStore.swift in Sources */,
 				C46604FD176732DD945AB319 /* RemoteDesktopSignal.swift in Sources */,
 				DF3DC5AB29D30556D9094095 /* RemoteDiagnostics.swift in Sources */,
 				30346792F4FE7D73D6F24B87 /* RemoteInputPacket.swift in Sources */,
@@ -971,6 +1000,8 @@
 				E33E3494243A3DDB309C0D94 /* MarkdownInlineStyling.swift in Sources */,
 				3ED72F9BC221AED70A3677F5 /* MarkdownPresentationTests.swift in Sources */,
 				5BFEB4C291120FC8B8A03DBB /* MasterChatStateTests.swift in Sources */,
+				379C9247FD7652C65A375FAE /* AIOutgoingMessageQueueTests.swift in Sources */,
+				379D03CAD642A70E76F3F795 /* AILocalModelStoreTests.swift in Sources */,
 				19AC531DF862B4E8460E9AFC /* MessageBubbleLayout.swift in Sources */,
 				E5BF3394A45A4DA77030A3E9 /* RemoteDesktopSignalTests.swift in Sources */,
 				060F9E4EA6E9FABAF30CF2E5 /* RemoteDiagnosticsCoordinator.swift in Sources */,
@@ -1006,6 +1037,10 @@
 				10E63571389FF61C9869CE9E /* AIAssistantModel.swift in Sources */,
 				91722667D29CD5A82A3A2E00 /* AIAssistantView.swift in Sources */,
 				F8B3C2B1B42BAAE0624B9281 /* AILocalInferenceRuntime.swift in Sources */,
+				EDE2A4933AB84C43ECB16128 /* AIOutgoingMessageRowView.swift in Sources */,
+				44EC63C4BA77196CD975052F /* AIOutgoingMessagePump.swift in Sources */,
+				932F788A269D48825AD0C797 /* AIOutgoingMessagePayload.swift in Sources */,
+				9BB153E1210E2FB9D0038C46 /* AILocalModelsView.swift in Sources */,
 				F77BA084695F31C9AD6308A7 /* AIMobileScreenFramesView.swift in Sources */,
 				C4A881E263A97B3D41E6C001 /* AIMobileCameraCapture.swift in Sources */,
 				0329ABDC04BBAC38945C24FA /* AIMobileHostToolProvider.swift in Sources */,
@@ -1073,6 +1108,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				194E338FF3D0DE993B165814 /* AIAssistantUITests.swift in Sources */,
+				0EEE37DA59F5209F3B04CDFB /* LocalModelsUITests.swift in Sources */,
 				7BE2BC4EA367B7517B6D286D /* LocalInferenceUITests.swift in Sources */,
 				97387C3DF0C593C94754987C /* BrowserUITests.swift in Sources */,
 				46DC2FB7BFD7AAAB22B1B0B7 /* PortraitUITests.swift in Sources */,
@@ -1189,7 +1225,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 177;
+				CURRENT_PROJECT_VERSION = 178;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1366,7 +1402,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 177;
+				CURRENT_PROJECT_VERSION = 178;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;

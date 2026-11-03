@@ -174,3 +174,13 @@ Apple Metal后端已从源码编译/链接，但不据此声称GPU推理已验�
 
 主任务完整源/模拟器/真机边界回执：
 `/private/tmp/maichat-local-inference-final-receipt-20261103.json`。
+
+## 后续连接恢复与 178 更新
+
+上述 177 真机 4016 是当时真实失败，后续连接恢复后，已成功安装并正常启动 177（PID24663，
+`/private/tmp/maichat-local177-launched-user-20261103.json`），没有以失败收据冒充成功。
+随后 178 增加普通“本地模型”页面、Debug 内置 1.2 MB 英文测试权重及导入器；
+正常 App 的实际生成/卸载 UI case 已通过，真实 iPhone 已更新到 2.2.4(178) 并启动 PID25361。
+因此旧段“模型权重不随 App 打包”只描述 177：178 Debug 包含专门引擎测试权重，Release
+仍不默认带 CI 权重。当前不含正式 OCR/VLM 大权重，主聊天也尚未改成本地 Agent 主模型。
+最终验证、安装与明确边界见 [178 交付记录](maichat-batch178-validation-20261103.md)。

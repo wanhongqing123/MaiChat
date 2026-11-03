@@ -389,6 +389,7 @@ add_library(maiagent STATIC
   AgentTools/MaiPathGuard.cpp
   AgentTools/MaiTool.cpp
   AgentTools/MaiLlamaTools.cpp
+  AgentTools/MaiDeepSeekWebTools.cpp
   AgentTools/MaiFfmpegTools.cpp
   AgentTools/MaiVideoGeometryTool.cpp
   AgentTools/MaiCvVideoTools.cpp
@@ -587,6 +588,7 @@ if(MAIAGENT_BUILD_TESTS)
       MaiTurnRunnerTests    # 一轮对话的完整生命周期
       MaiToolTests          # 路径边界 + 内置工具
       MaiLlamaToolsTests    # 本地推理生命周期、取消、参数与工作区边界
+      MaiDeepSeekWebToolsTests # 结构化检索、抓取、错误分类与有界重试
       MaiEditToolTests      # edit：唯一匹配、替换全部、拒绝的那几种情况
       MaiApplyPatchToolTests  # apply_patch：多处/多文件、全有或全无、换行原样
       MaiWebToolsTests      # webfetch 的 HTML 转文本和协议限制、todowrite 的校验
@@ -632,6 +634,11 @@ if(MAIAGENT_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
   # 随库 OpenSSL 同时构建 SSL 和 Crypto；有 SSL 库的平台都运行本地 TLS 模拟测试。
   if(MAI_OPENSSL_SSL_TARGET)
+    target_compile_definitions(MaiDeepSeekWebToolsTests PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT
+      MAI_DEEPSEEK_WEB_TLS_TESTS)
+    target_include_directories(MaiDeepSeekWebToolsTests PRIVATE ${MAI_OPENSSL_INCLUDE_DIR})
+    target_link_libraries(MaiDeepSeekWebToolsTests PRIVATE ${MAI_OPENSSL_SSL_TARGET}
+      ${MAI_OPENSSL_CRYPTO_TARGET})
     # 模型重定向测试用真实 TLS 连接验证密钥和正文不降级到明文。
     target_compile_definitions(MaiModelClientTests PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT
       MAI_MODEL_CLIENT_TLS_TESTS MAI_AGENT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -645,6 +652,9 @@ if(MAIAGENT_BUILD_TESTS)
       ${MAI_OPENSSL_CRYPTO_TARGET})
   elseif(NOT WIN32 AND NOT ANDROID AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     find_package(OpenSSL REQUIRED COMPONENTS SSL)
+    target_compile_definitions(MaiDeepSeekWebToolsTests PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT
+      MAI_DEEPSEEK_WEB_TLS_TESTS)
+    target_link_libraries(MaiDeepSeekWebToolsTests PRIVATE OpenSSL::SSL)
     target_compile_definitions(MaiModelClientTests PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT
       MAI_MODEL_CLIENT_TLS_TESTS MAI_AGENT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(MaiModelClientTests PRIVATE OpenSSL::SSL)

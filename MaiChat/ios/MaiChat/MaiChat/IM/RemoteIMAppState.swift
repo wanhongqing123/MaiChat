@@ -918,6 +918,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         await disconnect()
         _ = await flushHistoryPersistence()
         pendingHistoryMutations.removeAll()
+        // 删除前等待旧输入队列和媒体任务永久失效，迟到的回执不能重建已删除的账号目录。
+        await AIAssistantModel.invalidateOutgoingForDeletedAccount()
         AIAssistantModel.resetForAccountSwitch()
         do {
             try await historyPersistence.purgeAccount(

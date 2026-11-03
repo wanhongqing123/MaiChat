@@ -1027,6 +1027,7 @@ struct AIResponse: Codable, Sendable {
     let ok: Bool
     var id: String?
     var error: String?
+    var errorCode: String?
     var changed: Bool?
     var sessions: [AISession]?
     var messages: [AIMessage]?
@@ -1043,6 +1044,7 @@ struct AIBackendError: LocalizedError {
     let message: String
     // Unknown delivery may be retried with the original steering request ID.
     var definitive = true
+    var code: String? = nil
     var errorDescription: String? { message }
 }
 
@@ -1108,8 +1110,23 @@ enum AISteeringImportCachePolicy {
 actor AIAssistantBackend {
     private let address: UInt
     private var settings = AIModelSettings()
+    private var agentEpoch = UUID().uuidString
+    func runtimeEpoch() -> String { agentEpoch }
     private var root: URL?
     private var initialized = false
+    #if DEBUG && targetEnvironment(simulator)
+    /// 合成手动快门仍走 importDocument；只给文件导入准备隔离目录，不初始化 Agent 或凭证。
+    func prepareManualCameraImportForUITesting(_ workspace: URL) throws {
+        let arguments = ProcessInfo.processInfo.arguments
+        let resolved = workspace.standardizedFileURL.resolvingSymlinksInPath()
+        let temporary = FileManager.default.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        guard arguments.contains("--ai-ui-test"), arguments.contains("--ai-manual-camera-ui-test"),
+              !initialized, workspace.isFileURL, resolved.lastPathComponent == "Workspace",
+              resolved.path.hasPrefix(temporary.path + "/"),
+              FileManager.default.fileExists(atPath: resolved.path) else { throw CancellationError() }
+        root = resolved.deletingLastPathComponent()
+    }
+    #endif
     private func storedKey(for model: String) -> String {
         AICloudCredentialStore.shared.apiKey(model == "deepseek-flash" ? "deepseek" : "glm")
     }
@@ -1155,12 +1172,12 @@ actor AIAssistantBackend {
         guard let text = String(data: data, encoding: .utf8),
             let response = text.withCString({ maiMobileAgentRequest(UnsafeMutableRawPointer(bitPattern: address), $0) })
         else { throw AIBackendError(
-            message: operation == "steer" ? "补充内容送达状态未知，草稿已保留；重试会复用原操作编号" :
-                "创作中心初始化失败", definitive: operation != "steer")
+            message: operation == "steer" || operation == "send" ? "内容送达状态未知，已保留原操作编号" :
+                "创作中心初始化失败", definitive: !["steer", "send"].contains(operation))
         }
         defer { maiMobileAgentFree(response) }
         let decoded = try JSONDecoder().decode(AIResponse.self, from: Data(String(cString: response).utf8))
-        guard decoded.ok else { throw AIBackendError(message: decoded.error ?? "操作失败") }
+        guard decoded.ok else { throw AIBackendError(message: decoded.error ?? "操作失败", code: decoded.errorCode) }
         return decoded
     }
 
@@ -1228,6 +1245,7 @@ actor AIAssistantBackend {
         let workspace = root.appendingPathComponent("Workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let appRootPath = AIAssistantPathPolicy.appRoot(workspacePath: workspace.path)
+        let localTestModelPath = AILocalModelStore.ensureBundledTestModel()?.path ?? ""
         _ = try requestAgentOperation(
             "configure",
             values: [
@@ -1236,6 +1254,7 @@ actor AIAssistantBackend {
             "scheduleDeviceName": UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone",
             "wire": config.effectiveWire,
             "model": config.model, "policy": config.policy, "appRoot": appRootPath,
+            "localTestModelPath": localTestModelPath,
             "supportsScreenCapture": aiSupportsWholeDeviceScreenCapture(),
             "reasoningEffort": config.effectiveReasoningEffort,
             "caBundle": caBundle.path,
@@ -1248,6 +1267,7 @@ actor AIAssistantBackend {
             "lamaModelPath": Bundle.main.url(
                 forResource: "lama_fp32", withExtension: "onnx",
                 subdirectory: "MaiAgentModels")?.path ?? ""])
+        agentEpoch = UUID().uuidString
     }
 
     func save(_ config: AIModelSettings) throws {
@@ -1454,6 +1474,7 @@ final class AIAssistantModel: ObservableObject {
 
     static func resetForAccountSwitch() {
         shared.submissionGeneration &+= 1
+        shared.outgoingPump?.stop()
         let pending = Array(shared.pendingAttachments.values).flatMap { $0 } +
             shared.remoteFilesByCommandID.values.flatMap { $0.files }
         shared.discardImportedFiles(pending)
@@ -1466,6 +1487,22 @@ final class AIAssistantModel: ObservableObject {
         shared.hostStartup?.cancel()
         shared.transientErrorTask?.cancel()
         shared = AIAssistantModel()
+    }
+
+    /// 删除账号专用屏障；普通换号只 stop，不撤销旧账号已经接受的持久收据。
+    /// 必须 await 此方法后才移除工作区，防迟到 ACK/附件准备重建已删除账号目录。
+    static func invalidateOutgoingForDeletedAccount() async {
+        let model = shared
+        model.outgoingPermanentlyInvalidated = true
+        model.outgoingPump?.stop()
+        for pending in model.remoteSteeringConfirmations.values {
+            pending.continuation.resume(throwing: AIBackendError(message: "账号已删除", definitive: false))
+        }
+        model.remoteSteeringConfirmations.removeAll()
+        await model.outgoingQueue?.invalidatePermanently()
+        await model.outgoingPump?.invalidateAndWait()
+        await model.outgoingIntakeTask?.value
+        for cleanup in Array(model.outgoingCleanupTasks.values) { await cleanup.value }
     }
     @Published var sessions: [AISession] = []
     @Published private(set) var remoteSessions: [AIRemoteSession] = []
@@ -1494,6 +1531,32 @@ final class AIAssistantModel: ObservableObject {
     @Published var quotedMessage: AIMessage?
     var drafts: [String: String] = [:]
     @Published private(set) var pendingAttachments: [String: [AIImportedFile]] = [:]
+    @Published private(set) var outgoingEntries: [AIOutgoingMessageQueueEntry] = []
+    private var outgoingQueue: AIOutgoingMessageQueue?
+    private(set) var outgoingPump: AIOutgoingMessagePump?
+    private var outgoingPermanentlyInvalidated = false
+    private var outgoingCleanupTasks: [UUID: Task<Void, Never>] = [:]
+    private var outgoingCurrentEpoch = ""
+    private var outgoingQueueIdentity = ""
+    private var outgoingDeliveryCount = 0
+    private var outgoingProtectedPaths: Set<String> = []
+    private var outgoingProtectedReferenceIDs: Set<String> = []
+    private var outgoingPreparedPins: [UUID: [AIMobileScreenArchiveReference]] = [:]
+    private var outgoingIntakeProtection: [String: Int] = [:]
+    private struct OutgoingIntake {
+        let id: UUID
+        let account: String
+        let workspace: String
+        let session: String
+        let remote: AIRemoteSession?
+        let emptyToken: UUID
+        let text: String
+        let quote: String
+        let files: [AIImportedFile]
+        let result: AsyncStream<Bool>.Continuation
+    }
+    private var outgoingIntakes: [OutgoingIntake] = []
+    private var outgoingIntakeTask: Task<Void, Never>?
     // Once submitted to the native sender, the token can also protect a
     // persisted user message. A draft cleanup must not release that history.
     private var screenFrameHistoryPins: [String: String] = [:]
@@ -1548,13 +1611,6 @@ final class AIAssistantModel: ObservableObject {
     private var loadingOlderMessages = false
     private var selectionGeneration = 0
     private var submissionGeneration = 0
-    private struct SteeringAttempt {
-        let turnId: String
-        let requestId: String
-        var acceptedMessageID: String?
-        var remoteReferences: [[String: String]]?
-    }
-    private var steeringAttempts: [String: SteeringAttempt] = [:]
     private struct RemoteSteeringConfirmation {
         let remote: AIRemoteSession
         let continuation: CheckedContinuation<String, Error>
@@ -1601,6 +1657,11 @@ final class AIAssistantModel: ObservableObject {
     #if DEBUG
     // DebugSupport 通过这一小型边界设置隔离状态，正式状态的 setter 继续保持私有。
     let uiTestSupport = AIAssistantModelUITestSupport()
+    #if targetEnvironment(simulator)
+    func prepareManualCameraImportForUITesting(_ workspace: URL) async throws {
+        try await backend.prepareManualCameraImportForUITesting(workspace)
+    }
+    #endif
     func applyUITestMutation(_ mutation: AIAssistantUITestMutation) {
         switch mutation {
         case .workspace(let path): workspacePath = path
@@ -1663,6 +1724,7 @@ final class AIAssistantModel: ObservableObject {
                     configured = summary.configured ?? false
                     selected = sessions.first?.id ?? ""
                 }
+                await restoreOutgoingMessages()
                 logAIHistoryEvent("prepare selected=\(selected) sessions=\(sessions.count)")
                 guard !selected.isEmpty else { historyLoaded = true; return }
                 let session = selected
@@ -3100,299 +3162,407 @@ final class AIAssistantModel: ObservableObject {
         }
     }
 
-    /// Busy submission supplements the captured turn, never cancels a tool or
-    /// silently starts another turn. Core success contains the persisted user ID.
-    private func supplementCurrentTask(_ text: String, expectedSession: String?) async -> Bool {
-        let session = selected
-        let remote = selectedRemote
-        let draftKey = remote.map(remoteDraftKey) ?? session
-        let files = pendingAttachments[draftKey] ?? []
-        let quote = quotedMessage?.id ?? ""
-        guard expectedSession == nil || expectedSession == session,
-              !session.isEmpty, !isSubmitting, !isCreatingConversation,
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !files.isEmpty
-        else { return false }
-        let identity = composerSubmissionIdentity
-        let content = [draftKey, text, quote] + files.map { $0.attachmentIdentity + ":" + $0.mimeType }
-        let bytes = (try? JSONEncoder().encode(content)) ?? Data()
-        let key = [screenFrameCurrentAccountID, String(submissionGeneration), workspacePath,
-                   SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()]
-            .joined(separator: "\u{1f}")
-        let turn = remote?.turnId ?? sessions.first(where: { $0.id == session })?.turnId ?? ""
-        if steeringAttempts[key] == nil {
-            guard busy, !turn.isEmpty else {
-                showTransientError(remote == nil ? "当前任务已结束，草稿已保留" :
-                    "所属设备尚未提供当前任务编号，请更新所属设备后重试")
-                return false
-            }
-            guard steeringAttempts.count < 128 else {
-                showTransientError("还有较多补充内容等待确认，请先返回原草稿确认后再发送")
-                return false
-            }
-            steeringAttempts[key] = SteeringAttempt(turnId: turn,
-                requestId: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())
+    private func outgoingConversationID(session: String, remote: AIRemoteSession?) -> String {
+        if let remote {
+            let data = (try? JSONEncoder().encode([remote.deviceSlot, remote.loginSessionID, remote.sessionID])) ?? Data()
+            return "remote:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         }
-        guard let attempt = steeringAttempts[key] else { return false }
-        isSubmitting = true
-        defer { isSubmitting = false; remoteUploadStatus = "" }
-        var preparedReferences: [AIMobileScreenArchiveReference] = []
-        var dispatched = false
-        do {
-            var messageID = attempt.acceptedMessageID
-            if messageID == nil {
-                if let remote {
-                    guard remoteIsOnline(remote) else {
-                        throw AIBackendError(message: "所属设备离线，补充内容仍保留在草稿中")
-                    }
-                    var references = attempt.remoteReferences ?? []
-                    if attempt.remoteReferences == nil {
-                        let room = MaiCloudDriveClient.SessionRoom(ownerSlot: remote.deviceSlot,
-                            ownerLoginSessionID: remote.loginSessionID, sessionID: session)
-                        for (index, file) in files.enumerated() {
-                            guard composerSubmissionIdentity == identity,
-                                  let path = AIAssistantPathPolicy.resolve(
-                                    file.relativePath, workspacePath: workspacePath) else {
-                                throw AIBackendError(message: "会话已切换，补充内容未发送")
-                            }
-                            remoteUploadStatus = "正在上传附件 \(index + 1)/\(files.count)…"
-                            let receipt = try await MaiCloudDriveClient.shared.uploadSessionAttachment(
-                                fileURL: path, displayName: path.lastPathComponent, room: room)
-                            references.append(["attachment_id": receipt.attachmentId])
-                        }
-                        steeringAttempts[key]?.remoteReferences = references
-                    }
-                    guard composerSubmissionIdentity == identity else {
-                        throw AIBackendError(message: "会话已切换，补充内容未发送")
-                    }
-                    var payload: [String: Any] = ["action": "steer", "text": text,
-                        "turnId": attempt.turnId, "requestId": attempt.requestId,
-                        "quoteMessageId": quote]
-                    if !references.isEmpty { payload["attachments"] = references }
-                    messageID = try await sendRemoteSteering(to: remote, payload: payload)
-                } else {
-                    // Archive-backed draft frames must become history references
-                    // before acceptance. Unknown receipts keep this pin on retry.
-                    let references = files.compactMap(\.archiveReference).filter {
-                        screenFrameHistoryPins[$0.referenceID] == nil
-                    }
-                    try await prepareScreenFrameHistory(references, sessionID: session)
-                    preparedReferences = references
-                    guard composerSubmissionIdentity == identity else {
-                        throw AIBackendError(message: "会话已切换，补充内容未发送")
-                    }
-                    let request = AISteeringRequest(session: session, turnId: attempt.turnId,
-                        requestId: attempt.requestId, text: text, images: files.filter(\.isImage),
-                        videos: files.filter { $0.mimeType.hasPrefix("video/") }, quoteMessageId: quote)
-                    dispatched = true
-                    #if DEBUG && targetEnvironment(simulator)
-                    if let handler = uiTestSupport.steeringHandler {
-                        messageID = try await handler(request)
-                    } else {
-                        messageID = try await backend.steer(request).id
-                    }
-                    #else
-                    messageID = try await backend.steer(request).id
-                    #endif
-                }
-                guard let messageID, !messageID.isEmpty else {
-                    throw AIBackendError(message: "补充内容未返回落库确认", definitive: false)
-                }
-                steeringAttempts[key]?.acceptedMessageID = messageID
-            }
-            // A successful receipt for an old selection is retained for retry,
-            // but it must not clear either the old or the newly selected draft.
-            guard composerSubmissionIdentity == identity else { return false }
-            let ids = Set(files.map(\.attachmentIdentity))
-            pendingAttachments[draftKey]?.removeAll { ids.contains($0.attachmentIdentity) }
-            if pendingAttachments[draftKey]?.isEmpty == true { pendingAttachments.removeValue(forKey: draftKey) }
-            if remote != nil { discardImportedFiles(files) }
-            if quotedMessage?.id == quote { quotedMessage = nil }
-            steeringAttempts.removeValue(forKey: key)
-            error = ""
-            if remote == nil {
-                #if DEBUG && targetEnvironment(simulator)
-                if uiTestSupport.steeringHandler == nil {
-                    await refresh(force: true)
-                    startPolling()
-                }
-                #else
-                await refresh(force: true)
-                startPolling()
-                #endif
-            }
-            scrollRequest += 1
-            return true
-        } catch {
-            if !dispatched || (error as? AIBackendError)?.definitive == true {
-                await restoreScreenFrameDraftAfterRejectedSteering(preparedReferences, sessionID: session)
-            }
-            if (error as? AIBackendError)?.definitive == true { steeringAttempts.removeValue(forKey: key) }
-            if composerSubmissionIdentity == identity {
-                showTransientError(error.localizedDescription, duration: .seconds(8))
-            }
-            return false
+        return "local:" + session
+    }
+
+    var visibleOutgoingRows: [AIOutgoingMessageRow] {
+        let conversation = outgoingConversationID(session: selected, remote: selectedRemote)
+        return outgoingEntries.compactMap { entry in
+            guard entry.owner.accountID == screenFrameCurrentAccountID,
+                  entry.owner.conversationID == conversation,
+                  !(entry.state == .accepted && messages.contains { $0.id == entry.acceptedMessageID }),
+                  let payload = try? JSONDecoder().decode(AIOutgoingMessagePayload.self, from: entry.payloadData)
+            else { return nil }
+            let sameEpoch = entry.binding == nil || entry.binding?.hostEpoch == outgoingCurrentEpoch
+            let retry = sameEpoch && (entry.state == .failed ||
+                (entry.state == .unknown && entry.binding?.mode == .steer))
+            return AIOutgoingMessageRow(entry: entry, payload: payload, allowsRetry: retry)
         }
     }
 
-    /// 提交文本及附件；忙碌时只走当前任务补充协议，失败保留草稿。
+    /// 在点击的 MainActor 调用栈中捕获目标和顺序；收据只确认本地已持久入队，不冒充模型接收。
+    func enqueueMessage(_ text: String, expectedSession: String? = nil) -> Task<Bool, Never> {
+        let session = selected
+        let files = pendingAttachments[selectedRemote.map(remoteDraftKey) ?? session] ?? []
+        guard !outgoingPermanentlyInvalidated, ready, expectedSession == nil || expectedSession == session,
+              !screenFrameCurrentAccountID.isEmpty, !workspacePath.isEmpty,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !files.isEmpty else {
+            return Task { false }
+        }
+        var answer: AsyncStream<Bool>.Continuation!
+        let stream = AsyncStream<Bool>(bufferingPolicy: .bufferingNewest(1)) { answer = $0 }
+        for file in files { outgoingIntakeProtection[file.relativePath, default: 0] += 1 }
+        outgoingIntakes.append(OutgoingIntake(id: UUID(), account: screenFrameCurrentAccountID,
+            workspace: workspacePath, session: session, remote: selectedRemote, emptyToken: emptyDraftToken,
+            text: text, quote: quotedMessage?.id ?? "", files: files, result: answer))
+        if outgoingIntakeTask == nil {
+            outgoingIntakeTask = Task { @MainActor [weak self] in await self?.receiveOutgoingIntakes() }
+        }
+        return Task { for await value in stream { return value }; return false }
+    }
+
+    /// 普通调用复用同一个队列；UI 直接用同步 enqueueMessage 保持点击顺序。
     func sendMessage(_ text: String, expectedSession: String? = nil) async -> Bool {
-        // Unknown/accepted delivery retries remain bound to their original turn
-        // even if the current snapshot becomes idle while awaiting a receipt.
-        if busy || !steeringAttempts.isEmpty {
-            let draftKey = selectedRemote.map(remoteDraftKey) ?? selected
-            let files = pendingAttachments[draftKey] ?? []
-            let content = [draftKey, text, quotedMessage?.id ?? ""] +
-                files.map { $0.attachmentIdentity + ":" + $0.mimeType }
-            let bytes = (try? JSONEncoder().encode(content)) ?? Data()
-            let key = [screenFrameCurrentAccountID, String(submissionGeneration), workspacePath,
-                SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()]
-                .joined(separator: "\u{1f}")
-            if busy || steeringAttempts[key] != nil {
-                return await supplementCurrentTask(text, expectedSession: expectedSession)
-            }
-        }
-        if let remote = selectedRemote {
-            let draftKey = remoteDraftKey(remote)
-            let selectedFiles = pendingAttachments[draftKey] ?? []
-            guard expectedSession == nil || expectedSession == remote.sessionID,
-                  remoteIsOnline(remote), !busy, !isSubmitting,
-                  pendingRemoteCommands.isEmpty,
-                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                    !selectedFiles.isEmpty else { return false }
-            guard quotedMessage == nil else {
-                showTransientError("跨设备会话暂不支持引用消息")
-                return false
-            }
-            isSubmitting = true
-            defer { isSubmitting = false; remoteUploadStatus = "" }
-            let room = MaiCloudDriveClient.SessionRoom(
-                ownerSlot: remote.deviceSlot,
-                ownerLoginSessionID: remote.loginSessionID,
-                sessionID: remote.sessionID)
-            var references: [[String: String]] = []
+        await enqueueMessage(text, expectedSession: expectedSession).value
+    }
+
+    private func receiveOutgoingIntakes() async {
+        defer { outgoingIntakeTask = nil }
+        while !outgoingIntakes.isEmpty {
+            let intake = outgoingIntakes.removeFirst()
+            var accepted = false
             do {
-                for (index, file) in selectedFiles.enumerated() {
-                    remoteUploadStatus = "正在上传附件 \(index + 1)/\(selectedFiles.count)…"
-                    guard let path = AIAssistantPathPolicy.resolve(
-                        file.relativePath, workspacePath: workspacePath),
-                        FileManager.default.fileExists(atPath: path.path) else {
-                        throw AIBackendError(message: "附件文件已丢失，请移除后重新选择")
+                guard !outgoingPermanentlyInvalidated, self === Self.shared, intake.account == screenFrameCurrentAccountID,
+                      intake.workspace == workspacePath else { throw AIBackendError(message: "原账号已切换，内容未发送") }
+                var session = intake.session
+                if intake.remote == nil && session.isEmpty {
+                    if let created = createdEmptyDraftSessions[intake.emptyToken] { session = created }
+                    else {
+                        let created = try await backend.request("create")
+                        guard let id = created.id, !id.isEmpty else { throw AIBackendError(message: "会话尚未建立") }
+                        session = id
+                        createdEmptyDraftSessions[intake.emptyToken] = id
+                        if selected.isEmpty && emptyDraftToken == intake.emptyToken {
+                            migrateEmptyDraft(to: id)
+                            selected = id
+                            historyLoaded = true
+                        }
                     }
-                    let name = file.archiveReference?.fileURL.lastPathComponent ??
-                        (file.relativePath.count > 9 &&
-                        file.relativePath[file.relativePath.index(
-                            file.relativePath.startIndex, offsetBy: 8)] == "-"
-                        ? String(file.relativePath.dropFirst(9)) : file.relativePath)
-                    let receipt = try await MaiCloudDriveClient.shared
-                        .uploadSessionAttachment(fileURL: path,
-                                                 displayName: name, room: room)
-                    references.append(["attachment_id": receipt.attachmentId])
                 }
+                guard !deletedDraftSessions.contains(session), self === Self.shared,
+                      intake.account == screenFrameCurrentAccountID else { throw AIBackendError(message: "原会话已关闭") }
+                let pump = try await ensureOutgoingPump()
+                let owner = AIOutgoingMessageQueueOwner(accountID: intake.account, workspaceID: "assistant",
+                    conversationID: outgoingConversationID(session: session, remote: intake.remote))
+                let remote = intake.remote.map { AIOutgoingMessagePayload.RemoteOwner(
+                    slot: $0.deviceSlot, login: $0.loginSessionID, session: $0.sessionID) }
+                let payload = AIOutgoingMessagePayload(text: intake.text, quotedMessageID: intake.quote,
+                    files: intake.files.map(AIOutgoingMessagePayload.File.init), localSession: session,
+                    emptyDraftToken: nil, remote: remote)
+                _ = try await pump.queue.enqueue(owner: owner, payloadData: JSONEncoder().encode(payload), id: intake.id)
+                // 拥有原文件/截图引用的队列先落盘，才从该次草稿分离附件；不删除实际像素。
+                await pump.publish()
+                let draftKey = intake.remote.map(remoteDraftKey) ?? session
+                let identities = Set(intake.files.map(\.attachmentIdentity))
+                pendingAttachments[draftKey]?.removeAll { identities.contains($0.attachmentIdentity) }
+                if pendingAttachments[draftKey]?.isEmpty == true { pendingAttachments.removeValue(forKey: draftKey) }
+                if quotedMessage?.id == intake.quote && selected == session { quotedMessage = nil }
+                accepted = true
+                scrollRequest += 1
+                pump.wake(owner)
             } catch {
-                showTransientError("附件上传失败：" + error.localizedDescription,
-                                   duration: .seconds(8))
-                return false
+                if self === Self.shared, intake.account == screenFrameCurrentAccountID {
+                    showTransientError("内容尚未保存到发送队列，请保留草稿后重试", duration: .seconds(8))
+                }
             }
-            let temporaryID = "msg_z_pending_" + UUID().uuidString
-            let created = Int64(Date().timeIntervalSince1970 * 1_000)
-            mergeMessages([AIMessage(id: temporaryID, role: "user", created: created,
-                completed: created, active: false,
-                parts: [AIPart(id: "part_" + UUID().uuidString, kind: "text",
-                    text: text.isEmpty ? "已发送\(references.count)个附件" : text,
-                    tool: nil, input: nil, output: nil, error: nil,
-                    state: nil, path: nil, mimeType: nil)])])
+            for file in intake.files {
+                let remaining = (outgoingIntakeProtection[file.relativePath] ?? 1) - 1
+                if remaining > 0 { outgoingIntakeProtection[file.relativePath] = remaining }
+                else { outgoingIntakeProtection.removeValue(forKey: file.relativePath) }
+            }
+            intake.result.yield(accepted)
+            intake.result.finish()
+        }
+    }
+
+    private func ensureOutgoingPump() async throws -> AIOutgoingMessagePump {
+        let account = screenFrameCurrentAccountID
+        let workspace = workspacePath
+        guard !outgoingPermanentlyInvalidated, self === Self.shared, !account.isEmpty, !workspace.isEmpty else {
+            throw AIBackendError(message: "原账号或工作区不可用")
+        }
+        let epoch = await backend.runtimeEpoch()
+        let identity = account + "\u{1f}" + workspace
+        guard !outgoingPermanentlyInvalidated, self === Self.shared, account == screenFrameCurrentAccountID, workspace == workspacePath else {
+            throw AIBackendError(message: "原账号已切换")
+        }
+        if let pump = outgoingPump, outgoingQueueIdentity == identity {
+            outgoingCurrentEpoch = epoch
+            try await pump.queue.updateHostEpoch(epoch)
+            return pump
+        }
+        let url = URL(fileURLWithPath: workspace, isDirectory: true)
+            .deletingLastPathComponent().appendingPathComponent("outgoing-messages.json")
+        let queue = try AIOutgoingMessageQueue(fileURL: url, accountID: account, workspaceID: "assistant", hostEpoch: epoch)
+        let pump = AIOutgoingMessagePump(queue: queue,
+            prepare: { [weak self] entry in
+                guard let self else { throw CancellationError() }
+                return try await self.prepareOutgoing(entry)
+            }, bind: { [weak self] entry in
+                guard let self else { throw CancellationError() }
+                return try await self.bindOutgoing(entry)
+            }, deliver: { [weak self] entry in
+                guard let self else { throw CancellationError() }
+                return try await self.deliverOutgoing(entry)
+            }, failure: { [weak self] entry, error in
+                guard let self else { return .unknown }
+                return await self.outgoingFailure(entry, error: error)
+            }, changed: { [weak self] entries in
+                guard let self, !self.outgoingPermanentlyInvalidated, self === Self.shared, self.screenFrameCurrentAccountID == account,
+                      self.workspacePath == workspace else { return }
+                self.publishOutgoingEntries(entries)
+            }, accepted: { [weak self] entry in
+                guard let self, !self.outgoingPermanentlyInvalidated, self === Self.shared, self.screenFrameCurrentAccountID == account,
+                      self.workspacePath == workspace else { return }
+                if self === Self.shared, self.screenFrameCurrentAccountID == account {
+                    #if DEBUG && targetEnvironment(simulator)
+                    if self.uiTestSupport.steeringHandler == nil { await self.refresh(force: true) }
+                    #else
+                    await self.refresh(force: true)
+                    #endif
+                    self.scrollRequest += 1
+                }
+                _ = try? await queue.removeAccepted(id: entry.id, expectedRevision: entry.revision)
+                if let current = self.outgoingPump { await current.publish() }
+            })
+        outgoingQueueIdentity = identity
+        outgoingCurrentEpoch = epoch
+        outgoingQueue = queue
+        outgoingPump = pump
+        _ = try await queue.load()
+        await pump.publish()
+        return pump
+    }
+
+    private func checkedOutgoingPayload(_ entry: AIOutgoingMessageQueueEntry) throws -> AIOutgoingMessagePayload {
+        guard !outgoingPermanentlyInvalidated, self === Self.shared, entry.owner.accountID == screenFrameCurrentAccountID,
+              entry.owner.workspaceID == "assistant", !workspacePath.isEmpty else { throw CancellationError() }
+        let payload = try JSONDecoder().decode(AIOutgoingMessagePayload.self, from: entry.payloadData)
+        if let remote = payload.remote {
+            guard let target = remoteSessions.first(where: { $0.deviceSlot == remote.slot && $0.loginSessionID == remote.login &&
+                $0.sessionID == remote.session }),
+                  entry.owner.conversationID == outgoingConversationID(session: target.sessionID, remote: target)
+            else { throw AIBackendError(message: "原设备或登录状态已变化") }
+        } else if deletedDraftSessions.contains(payload.localSession) {
+            throw AIBackendError(message: "原会话已关闭", code: "not_found")
+        } else if entry.owner.conversationID != outgoingConversationID(session: payload.localSession, remote: nil) {
+            throw AIBackendError(message: "发送队列与原会话不匹配")
+        }
+        return payload
+    }
+
+    private func publishOutgoingEntries(_ entries: [AIOutgoingMessageQueueEntry]) {
+        let old = outgoingEntries.flatMap {
+            (try? JSONDecoder().decode(AIOutgoingMessagePayload.self, from: $0.payloadData)
+                .importedFiles(workspace: workspacePath)) ?? []
+        }
+        let files = entries.flatMap {
+            (try? JSONDecoder().decode(AIOutgoingMessagePayload.self, from: $0.payloadData)
+                .importedFiles(workspace: workspacePath)) ?? []
+        }
+        outgoingEntries = entries
+        outgoingProtectedPaths = Set(files.map(\.relativePath))
+        outgoingProtectedReferenceIDs = Set(files.compactMap { $0.archiveReference?.referenceID })
+        for (id, pins) in outgoingPreparedPins where
+            Set(pins.map(\.referenceID)).isSubset(of: outgoingProtectedReferenceIDs) {
+            outgoingPreparedPins.removeValue(forKey: id)
+        }
+        let stillDraft = Set(pendingAttachments.values.flatMap { $0 }.compactMap { $0.archiveReference?.referenceID })
+        let released = old.compactMap(\.archiveReference).filter {
+            !outgoingProtectedReferenceIDs.contains($0.referenceID) && !stillDraft.contains($0.referenceID) &&
+                screenFrameHistoryPins[$0.referenceID] == nil
+        }
+        if !released.isEmpty {
+            let id = UUID()
+            outgoingCleanupTasks[id] = Task { @MainActor [weak self] in
+                try? await AIMobileScreenFrameArchive.shared.release(references: released)
+                self?.outgoingCleanupTasks.removeValue(forKey: id)
+            }
+        }
+    }
+
+    private func persistPreparedOutgoing(_ entry: AIOutgoingMessageQueueEntry,
+                                          payload: AIOutgoingMessagePayload) async throws {
+        guard let pump = outgoingPump,
+              let latest = try await pump.queue.allEntries().first(where: { $0.id == entry.id }) else {
+            throw AIBackendError(message: "原发送队列不可用")
+        }
+        _ = try await pump.queue.transition(id: entry.id, expectedRevision: latest.revision,
+                                           to: .updatePayload(JSONEncoder().encode(payload)))
+        await pump.publish()
+    }
+
+    private func prepareOutgoing(_ entry: AIOutgoingMessageQueueEntry) async throws -> Data {
+        var payload = try checkedOutgoingPayload(entry)
+        var files = try payload.importedFiles(workspace: workspacePath)
+        if !payload.archivePinsPrepared {
+            var owned: [AIMobileScreenArchiveReference] = []
             do {
-                var payload: [String: Any] = ["action": "prompt", "text": text]
-                if !references.isEmpty { payload["attachments"] = references }
-                let id = try await enqueueRemoteCommand(
-                    to: remote, payload: payload,
-                    optimisticID: temporaryID)
-                pendingAttachments.removeValue(forKey: draftKey)
-                if let confirmed = remoteResultByCommandID.removeValue(forKey: id) {
-                    if confirmed { discardImportedFiles(selectedFiles) }
-                    else { pendingAttachments[draftKey] = selectedFiles }
-                    return confirmed
+                for (index, file) in files.enumerated() {
+                    guard let reference = file.archiveReference else { continue }
+                    guard let retained = try await AIMobileScreenFrameArchive.shared.retainSelected(
+                        frameIDs: [reference.frame.id], context: reference.context,
+                        usageSessionID: "outbox:" + entry.requestID).first else {
+                        throw AIBackendError(message: "截图引用不可读取")
+                    }
+                    owned.append(retained)
+                    files[index] = AIImportedFile(relativePath: file.relativePath, mimeType: file.mimeType,
+                                                  isImage: file.isImage, archiveReference: retained)
                 }
-                if !selectedFiles.isEmpty {
-                    remoteFilesByCommandID[id] = (draftKey, selectedFiles)
-                }
-                return true
             } catch {
-                messages.removeAll { $0.id == temporaryID }
-                showTransientError("送达状态未知；再次发送相同内容会复用操作编号。\n" +
-                    error.localizedDescription, duration: .seconds(8))
-                return false
+                try? await AIMobileScreenFrameArchive.shared.release(references: owned)
+                throw error
+            }
+            payload.files = files.map(AIOutgoingMessagePayload.File.init)
+            payload.archivePinsPrepared = true
+            outgoingPreparedPins[entry.id] = owned
+            try await persistPreparedOutgoing(entry, payload: payload)
+        }
+        if let remote = payload.remote {
+            guard let owner = remoteSessions.first(where: { $0.deviceSlot == remote.slot &&
+                $0.loginSessionID == remote.login && $0.sessionID == remote.session }), remoteIsOnline(owner) else {
+                throw AIBackendError(message: "原设备离线，内容已在本地排队", code: "owner_offline")
+            }
+            let room = MaiCloudDriveClient.SessionRoom(ownerSlot: remote.slot,
+                ownerLoginSessionID: remote.login, sessionID: remote.session)
+            while payload.remoteAttachmentIDs.count < files.count {
+                let file = files[payload.remoteAttachmentIDs.count]
+                guard let url = AIAssistantPathPolicy.resolve(file.relativePath, workspacePath: workspacePath),
+                      FileManager.default.fileExists(atPath: url.path) else {
+                    throw AIBackendError(message: "排队附件已丢失")
+                }
+                let uploaded = try await MaiCloudDriveClient.shared.uploadSessionAttachment(
+                    fileURL: url, displayName: url.lastPathComponent, room: room)
+                payload.remoteAttachmentIDs.append(uploaded.attachmentId)
+                try await persistPreparedOutgoing(entry, payload: payload)
             }
         }
-        guard configured else {
-            error = "请先登录已开通模型服务的账号"
-            return false
+        return try JSONEncoder().encode(payload)
+    }
+
+    private func bindOutgoing(_ entry: AIOutgoingMessageQueueEntry) async throws -> AIOutgoingMessageQueueBinding {
+        let payload = try checkedOutgoingPayload(entry)
+        let epoch = await backend.runtimeEpoch()
+        var running: Bool
+        var turn: String
+        if let remote = payload.remote {
+            guard let owner = remoteSessions.first(where: { $0.deviceSlot == remote.slot &&
+                $0.loginSessionID == remote.login && $0.sessionID == remote.session }), remoteIsOnline(owner) else {
+                throw AIBackendError(message: "原设备离线", code: "owner_offline")
+            }
+            running = owner.busy
+            turn = owner.turnId ?? ""
+        } else {
+            #if DEBUG && targetEnvironment(simulator)
+            if uiTestSupport.steeringHandler != nil {
+                guard let state = sessions.first(where: { $0.id == payload.localSession }) else {
+                    throw AIBackendError(message: "原会话已关闭", code: "not_found")
+                }
+                running = state.busy; turn = state.turnId ?? ""
+            } else {
+                let snapshot = try await backend.snapshot(session: payload.localSession, limit: 0, force: true)
+                guard let state = snapshot.sessions?.first(where: { $0.id == payload.localSession }) else {
+                    throw AIBackendError(message: "原会话已关闭", code: "not_found")
+                }
+                running = state.busy; turn = state.turnId ?? ""
+            }
+            #else
+            let snapshot = try await backend.snapshot(session: payload.localSession, limit: 0, force: true)
+            guard let state = snapshot.sessions?.first(where: { $0.id == payload.localSession }) else {
+                throw AIBackendError(message: "原会话已关闭", code: "not_found")
+            }
+            running = state.busy; turn = state.turnId ?? ""
+            #endif
         }
-        let draftSession = selected
-        let quoteMessageId = quotedMessage?.id ?? ""
-        guard expectedSession == nil || expectedSession == draftSession else { return false }
-        let attachments = pendingAttachments[draftSession, default: []]
-        guard !isSubmitting, !isCreatingConversation, !busy,
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty else {
-            return false
+        if running && turn.isEmpty { throw AIBackendError(message: "所属设备需更新后才能接收补充") }
+        _ = try checkedOutgoingPayload(entry)
+        return AIOutgoingMessageQueueBinding(mode: running ? .steer : .send, turnID: running ? turn : "", hostEpoch: epoch)
+    }
+
+    private func deliverOutgoing(_ entry: AIOutgoingMessageQueueEntry) async throws -> String {
+        let payload = try checkedOutgoingPayload(entry)
+        guard let binding = entry.binding else { throw AIBackendError(message: "排队请求尚未绑定任务") }
+        let files = try payload.importedFiles(workspace: workspacePath)
+        outgoingDeliveryCount += 1; isSubmitting = true
+        defer { outgoingDeliveryCount -= 1; isSubmitting = outgoingDeliveryCount > 0 }
+        if let remote = payload.remote {
+            guard let owner = remoteSessions.first(where: { $0.deviceSlot == remote.slot &&
+                $0.loginSessionID == remote.login && $0.sessionID == remote.session }), remoteIsOnline(owner) else {
+                throw AIBackendError(message: "原设备未确认接收", definitive: false)
+            }
+            var command: [String: Any] = ["action": binding.mode == .steer ? "steer" : "prompt",
+                "text": payload.text, "requestId": entry.requestID, "quoteMessageId": payload.quotedMessageID]
+            if binding.mode == .steer { command["turnId"] = binding.turnID }
+            if !payload.remoteAttachmentIDs.isEmpty {
+                command["attachments"] = payload.remoteAttachmentIDs.map { ["attachment_id": $0] }
+            }
+            return try await sendRemoteSteering(to: owner, payload: command)
         }
-        isSubmitting = true
-        defer { isSubmitting = false }
-        try? await AICloudCredentialSync.refreshSeedanceIfNeeded(force: true)
-        try? await AICloudCredentialSync.refreshBailianIfNeeded(force: true)
-        if attachments.contains(where: \.isImage),
-           settings.model.trimmingCharacters(in: .whitespacesAndNewlines)
-               .caseInsensitiveCompare("glm-5.3") == .orderedSame {
-            showTransientError("glm-5.3 仅支持文本，请先切换到 glm-5.3-flash")
-            return false
+        try await prepareScreenFrameHistory(files.compactMap(\.archiveReference).filter {
+            screenFrameHistoryPins[$0.referenceID] != payload.localSession
+        }, sessionID: payload.localSession)
+        _ = try checkedOutgoingPayload(entry)
+        let response: AIResponse
+        if binding.mode == .steer {
+            let request = AISteeringRequest(session: payload.localSession, turnId: binding.turnID,
+                requestId: entry.requestID, text: payload.text, images: files.filter(\.isImage),
+                videos: files.filter { $0.mimeType.hasPrefix("video/") }, quoteMessageId: payload.quotedMessageID)
+            #if DEBUG && targetEnvironment(simulator)
+            if let handler = uiTestSupport.steeringHandler { return try await handler(request) }
+            #endif
+            response = try await backend.steer(request)
+        } else {
+            response = try await backend.send(session: payload.localSession, text: payload.text,
+                images: files.filter(\.isImage), videos: files.filter { $0.mimeType.hasPrefix("video/") },
+                quoteMessageId: payload.quotedMessageID)
         }
-        var targetSession = draftSession
-        if targetSession.isEmpty {
+        guard let id = response.id, !id.isEmpty else { throw AIBackendError(message: "接收状态待确认", definitive: false) }
+        return id
+    }
+
+    private func outgoingFailure(_ entry: AIOutgoingMessageQueueEntry, error: Error) async -> AIOutgoingMessagePump.FailureDecision {
+        if let unused = outgoingPreparedPins.removeValue(forKey: entry.id) {
+            try? await AIMobileScreenFrameArchive.shared.release(references: unused)
+        }
+        if entry.state == .queued {
+            return self !== Self.shared || (error as? AIBackendError)?.code == "owner_offline" ? .wait : .failed
+        }
+        if entry.everUnknown || (error as? AIBackendError)?.definitive != true { return .unknown }
+        if let payload = try? checkedOutgoingPayload(entry), payload.remote == nil,
+           let files = try? payload.importedFiles(workspace: workspacePath) {
+            let pins = files.compactMap(\.archiveReference).filter {
+                screenFrameHistoryPins[$0.referenceID] == payload.localSession
+            }
             do {
-                let created = try await backend.request("create")
-                targetSession = created.id ?? ""
-                guard !targetSession.isEmpty else { return false }
-                migrateEmptyDraft(to: targetSession)
-                if selected == draftSession {
-                    selected = targetSession
-                    messages = []
-                    permissions = []
-                    questions = []
-                    // 新建空会话时显示欢迎态；不让首次发送期间出现无内容白屏。
-                    historyLoaded = true
-                    hasOlderMessages = false
-                }
-            } catch {
-                self.error = error.localizedDescription
-                return false
-            }
+                try await AIMobileScreenFrameArchive.shared.assignSession(references: pins,
+                    usageSessionID: "outbox:" + entry.requestID)
+                for pin in pins { screenFrameHistoryPins.removeValue(forKey: pin.referenceID) }
+            } catch { /* 无法确认回退则保守持有，不删除可能已在历史中的像素。 */ }
         }
-        do {
-            let references = attachments.compactMap(\.archiveReference)
-            try await prepareScreenFrameHistory(references, sessionID: targetSession)
-            _ = try await backend.send(
-                session: targetSession,
-                text: text,
-                images: attachments.filter(\.isImage),
-                videos: attachments.filter { $0.mimeType.hasPrefix("video/") },
-                quoteMessageId: quoteMessageId
-            )
-            let sentIDs = Set(attachments.map(\.attachmentIdentity))
-            pendingAttachments[targetSession]?.removeAll { sentIDs.contains($0.attachmentIdentity) }
-            if pendingAttachments[targetSession]?.isEmpty == true {
-                pendingAttachments.removeValue(forKey: targetSession)
+        if (error as? AIBackendError)?.code == "busy" { return .requeueRejected }
+        if let code = (error as? AIBackendError)?.code, code == "not_found",
+           let fresh = try? await bindOutgoing(entry), fresh != entry.binding {
+            return .requeueRejected
+        }
+        return .failed
+    }
+
+    func retryOutgoingMessage(_ id: UUID) { Task { await outgoingPump?.retry(id) } }
+
+    /// 普通会话清理入口复用队列 actor；先让该 owner 的迟到准备结果失效，再移除本地记录。
+    func discardOutgoingMessages(for session: String) async throws {
+        guard let pump = outgoingPump else { return }
+        let owner = AIOutgoingMessageQueueOwner(accountID: screenFrameCurrentAccountID,
+            workspaceID: "assistant", conversationID: outgoingConversationID(session: session, remote: nil))
+        pump.pause(owner)
+        _ = try await pump.queue.removeAll(for: owner)
+        await pump.publish()
+    }
+
+    private func restoreOutgoingMessages() async {
+        guard let pump = try? await ensureOutgoingPump() else { return }
+        if let entries = try? await pump.queue.allEntries() {
+            for accepted in entries where accepted.state == .accepted {
+                _ = try? await pump.queue.removeAccepted(id: accepted.id, expectedRevision: accepted.revision)
             }
-            if selected == targetSession, quotedMessage?.id == quoteMessageId { quotedMessage = nil }
-            lastBackendError = ""
-            error = ""
-            await refresh(force: true)
-            // 发送成功后即使快照暂未返回新消息，也保留可显示的已加载状态。
-            // 把空快照解释为“历史未加载”会隐藏欢迎态，形成整块白屏。
-            historyLoaded = true
-            scrollRequest += 1
-            startPolling()
-            return true
-        } catch { self.error = error.localizedDescription; return false }
+            await pump.publish()
+            for owner in Set(entries.filter { $0.state == .queued }.map(\.owner)) { pump.wake(owner) }
+        }
     }
 
     func action(_ op: String, values: [String: String] = [:]) async {
@@ -3422,11 +3592,17 @@ final class AIAssistantModel: ObservableObject {
         let target = selected
         let closeCamera = op == "stop" && AIMobileLocalMediaRequests.shared.cameraSessionID == target
         let archiveWorkspace = URL(fileURLWithPath: workspacePath, isDirectory: true)
+        let clearingOwner = AIOutgoingMessageQueueOwner(accountID: screenFrameCurrentAccountID,
+            workspaceID: "assistant", conversationID: outgoingConversationID(session: target, remote: nil))
+        if op == "delete" || op == "clear" { outgoingPump?.pause(clearingOwner) }
+        var nativeCleared = false
         do {
             var values = values; values["session"] = target
             _ = try await backend.request(op, values: values)
+            nativeCleared = op == "delete" || op == "clear"
             if op == "delete" { forgetRemoteSteeringImports(session: target) }
             if op == "delete" || op == "clear" {
+                try await discardOutgoingMessages(for: target)
                 await releaseScreenFrameHistory(sessionID: target, workspace: archiveWorkspace)
             }
             if closeCamera { AIMobileLocalMediaRequests.shared.closeCamera(in: target) }
@@ -3449,6 +3625,7 @@ final class AIAssistantModel: ObservableObject {
             }
             await refresh(force: true)
         } catch {
+            if (op == "delete" || op == "clear") && !nativeCleared { outgoingPump?.wake(clearingOwner) }
             if closeCamera { AIMobileLocalMediaRequests.shared.closeCamera(in: target) }
             self.error = error.localizedDescription
         }
@@ -3816,12 +3993,15 @@ final class AIAssistantModel: ObservableObject {
     private func discardImportedFiles(_ files: [AIImportedFile]) {
         let references = files.compactMap(\.archiveReference).filter {
             screenFrameHistoryPins[$0.referenceID] == nil &&
-                !screenFrameSubmissionPins.contains($0.referenceID)
+                !screenFrameSubmissionPins.contains($0.referenceID) &&
+                !outgoingProtectedReferenceIDs.contains($0.referenceID) &&
+                outgoingIntakeProtection[$0.relativePath] == nil
         }
         let archiveRoot = URL(fileURLWithPath: workspacePath, isDirectory: true)
             .appendingPathComponent(".maichat/screen-frame-archive", isDirectory: true)
             .standardizedFileURL.resolvingSymlinksInPath().path + "/"
-        let urls = files.filter { $0.archiveReference == nil }.compactMap {
+        let urls = files.filter { $0.archiveReference == nil &&
+            !outgoingProtectedPaths.contains($0.relativePath) && outgoingIntakeProtection[$0.relativePath] == nil }.compactMap {
             AIAssistantPathPolicy.resolve($0.relativePath, workspacePath: workspacePath)
         }.filter { !$0.path.hasPrefix(archiveRoot) }
         Task.detached(priority: .utility) {
@@ -3850,7 +4030,8 @@ final class AIAssistantModel: ObservableObject {
             screenFrameSubmissionPins.subtract(pending.map(\.referenceID))
             let stillPending = Set(pendingAttachments.values.flatMap { $0 }
                 .compactMap { $0.archiveReference?.referenceID })
-            let abandoned = pending.filter { self !== Self.shared || !stillPending.contains($0.referenceID) }
+            let abandoned = pending.filter { !outgoingProtectedReferenceIDs.contains($0.referenceID) &&
+                (self !== Self.shared || !stillPending.contains($0.referenceID)) }
             try? await AIMobileScreenFrameArchive.shared.release(references: abandoned)
             throw error
         }

@@ -4,8 +4,36 @@ import SwiftUI
 import UIKit
 
 enum AICameraUITestSupport {
+    static var isManualRequested: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ai-ui-test") &&
+            ProcessInfo.processInfo.arguments.contains("--ai-manual-camera-ui-test")
+    }
+
     static var isRequested: Bool {
         ProcessInfo.processInfo.arguments.contains("--agent-camera-ui-test")
+    }
+
+    @MainActor static func prepareManualFixture(_ model: AIAssistantModel) {
+        guard isManualRequested else { return }
+        let token = ProcessInfo.processInfo.environment["MAICHAT_AI_TEST_ID"].flatMap(UUID.init(uuidString:)) ?? UUID()
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("manual-camera-ui-" + token.uuidString, isDirectory: true)
+            .appendingPathComponent("Workspace", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+            model.installSessionSwitchUITestFixture()
+            model.ready = false
+            model.installVideoToolTestWorkspace(workspace.path)
+            model.uiTestSupport.screenFrameAccountID = "manual-camera-ui-fixture-owner"
+            // 模式测试不启动 native Agent；异步准备真实文件导入后才开放普通拍摄入口。
+            Task { @MainActor in
+                do {
+                    try await model.prepareManualCameraImportForUITesting(workspace)
+                    guard model === AIAssistantModel.shared else { return }
+                    model.ready = true
+                } catch { model.showTransientError("合成相机测试导入目录不可用") }
+            }
+        } catch { model.showTransientError("合成相机测试目录不可用") }
     }
 
     @MainActor static func prepareMusicMini(_ music: MaiLocalMusicPlayer) {
@@ -13,6 +41,34 @@ enum AICameraUITestSupport {
               let sample = Bundle.main.url(forResource: "ffplay-seek-sample", withExtension: "mp4")
         else { return }
         try? music.openLocalFile(sample, title: "测试音乐")
+    }
+}
+
+/// 只显示合成色块和显式快门；没有 AVCaptureSession、定时器或真人画面。
+struct AIManualCameraUITestPreview: View {
+    let onCapture: (UIImage) -> Void
+    let onCancel: () -> Void
+    @ObservedObject private var capture = AIMobileCameraCapture.shared
+    @ObservedObject private var requests = AIMobileLocalMediaRequests.shared
+
+    var body: some View {
+        ZStack {
+            Color.blue.ignoresSafeArea()
+            VStack(spacing: 24) {
+                Text("手动快门合成画面").foregroundStyle(.white)
+                Text("定时状态")
+                    .accessibilityIdentifier("ai-manual-camera-timed-state")
+                    .accessibilityValue("running:\(capture.isRunning);request:\(requests.cameraRequestID != nil)")
+                Button("拍照") {
+                    let image = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 240)).image { context in
+                        UIColor.blue.setFill(); context.fill(CGRect(x: 0, y: 0, width: 320, height: 240))
+                    }
+                    onCapture(image)
+                }.accessibilityIdentifier("ai-manual-camera-shutter")
+                Button("取消", action: onCancel).accessibilityIdentifier("ai-manual-camera-cancel")
+            }
+            .font(.headline).foregroundStyle(.white)
+        }
     }
 }
 

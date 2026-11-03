@@ -353,6 +353,15 @@ public final class AIAssistantController {
                 return hostToolFailure("GLM key is unavailable", "not_configured");
             }
         }
+        if (tool.equals("deepseek_api_key")) {
+            try {
+                return new JSONObject().put("ok", true)
+                    .put("output", new JSONObject().put("key", deepseekApiKey))
+                    .toString().getBytes(StandardCharsets.UTF_8);
+            } catch (Exception failure) {
+                return hostToolFailure("DeepSeek key is unavailable", "not_configured");
+            }
+        }
         if (tool.equals("wan_credentials")) {
             try {
                 return new JSONObject().put("ok", true)

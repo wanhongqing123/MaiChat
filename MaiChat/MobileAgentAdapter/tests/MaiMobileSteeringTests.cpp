@@ -190,7 +190,9 @@ int main() {
               "exact receipt cursor lost the accepted user behind newer assistant messages");
         Json late = steer;
         late["requestId"] = "synthetic-idle-input";
-        check(!call(handle, late).at("ok"), "idle steering started another turn");
+        const Json idleRejection = call(handle, late);
+        check(!idleRejection.at("ok") && idleRejection.value("errorCode", std::string{}) == "not_found",
+              "idle steering did not preserve the typed not_found rejection");
         {
             std::lock_guard<std::mutex> lock(requestsMutex);
             check(requests.size() == 2, "accepted steering did not reach exactly one follow-up model request");

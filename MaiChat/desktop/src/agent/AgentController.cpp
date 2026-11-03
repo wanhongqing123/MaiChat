@@ -21,6 +21,7 @@
 #include "MaiTime.h"
 #if defined(MAICHAT_CV_VIDEO_ANALYSIS)
 #include "MaiCvImageTools.h"
+#include "MaiDeepSeekWebTools.h"
 #include "MaiCvVideoAnalysis.h"
 #include "MaiCvVideoTools.h"
 #include "MaiVideoMatting.h"
@@ -47,6 +48,7 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QHash>
 #include <QMetaType>
@@ -238,6 +240,15 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     // 要不要把工具声明给模型看是 MaiContextBuilder 的事，不是这里的。
     auto tools = std::make_unique<MaiToolRegistry>();
     registerMaiBuiltinTools(*tools);
+    // 搜索/文章抓取走固定供应商API，复用账号控制面下发的DeepSeek凭据。
+    MaiDeepSeekWebOptions webOptions;
+    QFile webCertificates(QStringLiteral(":/maichat/auth/cacert.pem"));
+    if (webCertificates.open(QIODevice::ReadOnly)) webOptions.caPem = toUtf8(QString::fromUtf8(webCertificates.readAll()));
+    webOptions.apiKey = [provider = credentials.accountModelKeyProvider,
+                        key = toUtf8(credentials.deepseekApiKey)] {
+        return provider ? toUtf8(provider(QStringLiteral("deepseek"))) : key;
+    };
+    registerMaiDeepSeekWebTools(*tools, std::move(webOptions));
     registerMaiQrCodeTools(*tools);
 #if defined(Q_OS_MAC)
     registerMaiSessionScheduleTools(*tools, scheduleStore, "Mac");

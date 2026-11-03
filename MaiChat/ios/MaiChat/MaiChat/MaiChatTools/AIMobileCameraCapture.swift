@@ -302,3 +302,22 @@ struct AIMobileAgentCameraPreview: UIViewRepresentable {
         }
     }
 }
+
+/// 普通手动快门始终交给系统相机；仅显式 Debug 模拟器回归可替换为合成快门。
+/// 此入口不创建 AIMobileCameraStream，也不启动任何定时采样。
+struct AIMobileManualCameraPicker: View {
+    let onCapture: (UIImage) -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        #if DEBUG && targetEnvironment(simulator)
+        if AICameraUITestSupport.isManualRequested {
+            AIManualCameraUITestPreview(onCapture: onCapture, onCancel: onCancel)
+        } else {
+            RemoteIMCameraPicker(onCapture: onCapture, onCancel: onCancel)
+        }
+        #else
+        RemoteIMCameraPicker(onCapture: onCapture, onCancel: onCancel)
+        #endif
+    }
+}

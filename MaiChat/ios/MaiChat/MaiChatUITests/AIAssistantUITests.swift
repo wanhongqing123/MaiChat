@@ -5,7 +5,8 @@ import XCTest
 import UIKit
 
 final class AIAssistantUITests: XCTestCase {
-    @MainActor private func launchSteeringFixture(archive: Bool = false) -> XCUIApplication {
+    @MainActor private func launchSteeringFixture(archive: Bool = false, acknowledgementDelay: Int? = nil,
+                                                 holdsFirstAcknowledgement: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         // Root's first-launch notification preprompt can cover a tab that still
@@ -15,6 +16,8 @@ final class AIAssistantUITests: XCTestCase {
             "-maichat.notification-preprompt-dismissed", "YES"]
         if archive { app.launchArguments.append("--ai-steering-archive-ui-test") }
         app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        if let acknowledgementDelay { app.launchEnvironment["MAICHAT_STEERING_ACK_DELAY_MS"] = String(acknowledgementDelay) }
+        if holdsFirstAcknowledgement { app.launchEnvironment["MAICHAT_STEERING_HOLD_FIRST_ACK"] = "1" }
         app.launch()
         let tab = app.buttons["创作中心"]
         XCTAssertTrue(tab.waitForExistence(timeout: 12))
@@ -39,7 +42,8 @@ final class AIAssistantUITests: XCTestCase {
     @MainActor func testBusyComposerSupplementsCapturedTurnAfterReceipt() {
         let app = launchSteeringFixture()
         defer { app.terminate() }
-        XCTAssertTrue(app.buttons["停止"].exists)
+        XCTAssertFalse(app.buttons["停止"].exists, "用户最新要求输入栏移除停止")
+        assertSteeringTaskRemainsBusy(app)
         XCTAssertFalse(app.buttons["ai-send-draft"].exists)
         let editor = app.textViews["ai-composer"]
         editor.tap()
@@ -47,7 +51,7 @@ final class AIAssistantUITests: XCTestCase {
         let send = app.buttons["ai-send-draft"]
         XCTAssertTrue(send.isEnabled)
         XCTAssertEqual(send.label, "补充当前任务")
-        XCTAssertTrue(app.buttons["停止"].exists)
+        XCTAssertFalse(app.buttons["停止"].exists, "忙且有草稿时右侧只保留补充按钮")
         send.tap()
         let receipt = app.staticTexts["steering-receipt"]
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
@@ -55,10 +59,114 @@ final class AIAssistantUITests: XCTestCase {
             object: receipt)], timeout: 5), .completed)
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "exists == false"), object: send)], timeout: 5), .completed)
-        XCTAssertTrue(app.buttons["停止"].exists, "补充不能结束当前任务")
+        XCTAssertFalse(app.buttons["停止"].exists)
+        assertSteeringTaskRemainsBusy(app)
     }
 
-    @MainActor func testSteeringUnknownDeliveryReusesRequestAndRejectionKeepsDraft() {
+    @MainActor func testBusyComposerOmitsStopAndShowsOnlySupplementWhenDraftExists() {
+        let app = launchSteeringFixture()
+        defer { app.terminate() }
+        let stop = app.buttons["停止"]
+        let send = app.buttons["ai-send-draft"]
+        let editor = app.textViews["ai-composer"]
+        let emptyBefore = XCTAttachment(screenshot: app.screenshot())
+        emptyBefore.name = "busy-composer-empty-without-stop"
+        emptyBefore.lifetime = .keepAlways
+        add(emptyBefore)
+        XCTAssertFalse(stop.exists, "忙且空草稿也不显示停止")
+        XCTAssertFalse(app.buttons["展开更多功能"].exists)
+        assertSteeringTaskRemainsBusy(app)
+        XCTAssertFalse(send.exists)
+        editor.tap()
+        editor.typeText("补充细节")
+        XCTAssertTrue(send.isEnabled)
+        XCTAssertEqual(send.label, "补充当前任务")
+        let draftScreenshot = XCTAttachment(screenshot: app.screenshot())
+        draftScreenshot.name = "busy-composer-draft-single-trailing-action"
+        draftScreenshot.lifetime = .keepAlways
+        add(draftScreenshot)
+        // 旧产品在此同时挂载 stop+send；以真实 Root 的 AX/截图验证，不能只测按钮样式。
+        XCTAssertFalse(stop.exists, "有草稿时不能同时显示停止与发送两个右侧按钮")
+        XCTAssertEqual(editor.value as? String, "补充细节")
+        editor.tap()
+        for remaining in ["补充细", "补充", "补", ""] {
+            editor.typeText(XCUIKeyboardKey.delete.rawValue)
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "value == %@", remaining), object: editor)], timeout: 3), .completed,
+                "每次删除必须真实减少一个字，不能按预期字数盲发聚合退格")
+            XCTAssertEqual(editor.value as? String, remaining)
+        }
+        XCTAssertEqual(editor.value as? String, "")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: send)], timeout: 3), .completed)
+        XCTAssertFalse(stop.exists, "清空草稿不重新添加已移除的停止按钮")
+        XCTAssertFalse(app.buttons["展开更多功能"].exists)
+        assertSteeringTaskRemainsBusy(app)
+        let emptyScreenshot = XCTAttachment(screenshot: app.screenshot())
+        emptyScreenshot.name = "busy-composer-cleared-draft-without-stop"
+        emptyScreenshot.lifetime = .keepAlways
+        add(emptyScreenshot)
+    }
+
+    @MainActor private func assertSteeringTaskRemainsBusy(_ app: XCUIApplication) {
+        let state = app.staticTexts["steering-task-state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 3))
+        XCTAssertEqual(state.value as? String,
+                       "busy:true;session:switch-A;turn:msg_fixture_turn_A",
+                       "任务/轮次必须保持原状态，不能以是否显示停止图标判断 busy")
+    }
+
+    @MainActor func testOutgoingQueueAcceptsFiveMessagesBeforeAcknowledgementsAndKeepsFIFO() throws {
+        let app = launchSteeringFixture(holdsFirstAcknowledgement: true)
+        defer { app.terminate() }
+        let editor = app.textViews["ai-composer"]
+        let texts = ["第一条", "第二条", "第三条", "重复", "重复"]
+        for (index, text) in texts.enumerated() {
+            editor.tap()
+            editor.typeText(text)
+            XCTAssertTrue(app.buttons["ai-send-draft"].isEnabled, "前一条等待回执不能阻止再次发送")
+            app.buttons["ai-send-draft"].tap()
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "value == %@", ""), object: editor)], timeout: 1.5), .completed,
+                "持久入队后即清稿，不能等待尚未放行的native回执")
+            if index == 1 {
+                let ledger = try steeringLedger(app)
+                XCTAssertEqual(ledger["accepted"] as? Int, 0, "第二条必须在第一条确认前已经本地收纳")
+                XCTAssertEqual(ledger["ack_gate_waiting"] as? Bool, true)
+            }
+        }
+        let held = try steeringLedger(app)
+        XCTAssertEqual(held["accepted"] as? Int, 0, "明确放行前不应有接收确认")
+        XCTAssertEqual(held["attempts"] as? Int, 1, "首条等待确认时不能越序投递后四条")
+        XCTAssertEqual(held["pending_entries"] as? Int, 5, "五条都必须已经真实持久入队")
+        XCTAssertEqual(held["ack_gate_waiting"] as? Bool, true)
+        XCTAssertTrue(app.staticTexts["排队中"].exists)
+        let queued = XCTAttachment(screenshot: app.screenshot())
+        queued.name = "five-outgoing-messages-queued-during-native-ack"
+        queued.lifetime = .keepAlways
+        add(queued)
+        let release = app.buttons["steering-release-first-ack"]
+        XCTAssertTrue(release.isEnabled)
+        release.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "已落库 5 · msg_fixture_turn_A"),
+            object: app.staticTexts["steering-receipt"])], timeout: 25), .completed)
+        let ledger = try steeringLedger(app)
+        XCTAssertEqual(ledger["texts"] as? [String], texts)
+        XCTAssertEqual(ledger["accepted"] as? Int, 5)
+        XCTAssertEqual(Set(try XCTUnwrap(ledger["request_ids"] as? [String])).count, 5,
+                       "同文两次点击必须是两个独立消息")
+        XCTAssertEqual(Set(try XCTUnwrap(ledger["turn_ids"] as? [String])), ["msg_fixture_turn_A"])
+        assertSteeringTaskRemainsBusy(app)
+        XCTAssertFalse(app.buttons["停止"].exists)
+    }
+
+    @MainActor private func steeringLedger(_ app: XCUIApplication) throws -> [String: Any] {
+        let raw = try XCTUnwrap(app.staticTexts["steering-ledger"].value as? String)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+    }
+
+    @MainActor func testOutgoingQueueUnknownReceiptRetriesSameIDAndKeepsRejectedMessage() throws {
         let app = launchSteeringFixture()
         defer { app.terminate() }
         let editor = app.textViews["ai-composer"]
@@ -67,17 +175,23 @@ final class AIAssistantUITests: XCTestCase {
         app.buttons["ai-send-draft"].tap()
         let receipt = app.staticTexts["steering-receipt"]
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "label == %@", "送达未知，草稿保留"),
+            predicate: NSPredicate(format: "label == %@", "送达未知，队列保留"),
             object: receipt)], timeout: 5), .completed)
-        XCTAssertEqual(editor.value as? String, "重试补充")
-        XCTAssertTrue(app.buttons["ai-send-draft"].isEnabled)
-        app.buttons["ai-send-draft"].tap()
+        XCTAssertEqual(editor.value as? String, "")
+        let retry = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "outgoing-retry-")).firstMatch
+        XCTAssertTrue(retry.waitForExistence(timeout: 5))
+        retry.tap()
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "label == %@", "已落库 2 · msg_fixture_turn_A"),
             object: receipt)], timeout: 5), .completed)
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "exists == false"),
             object: app.buttons["ai-send-draft"])], timeout: 5), .completed)
+        let ledger = try steeringLedger(app)
+        let ids = try XCTUnwrap(ledger["request_ids"] as? [String])
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertEqual(ids.first, ids.last)
+        XCTAssertEqual(ledger["accepted"] as? Int, 1, "未知回执重试不能产生第二条用户消息")
         XCTAssertTrue(editor.waitForExistence(timeout: 2))
         editor.tap()
         editor.typeText("收尾拒绝")
@@ -85,26 +199,30 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "label == %@", "收尾拒绝，未启动新任务"),
             object: receipt)], timeout: 5), .completed)
-        XCTAssertEqual(editor.value as? String, "收尾拒绝")
+        XCTAssertEqual(editor.value as? String, "")
+        XCTAssertTrue(app.staticTexts["发送失败，内容已保留"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["收尾拒绝"].exists)
     }
 
-    @MainActor func testSteeringSelectionAndAccountChangesKeepOriginalDraft() {
-        let app = launchSteeringFixture()
+    @MainActor func testOutgoingQueueKeepsNewDraftAndAccountIsolatedAfterSelectionChanges() {
+        let app = launchSteeringFixture(acknowledgementDelay: 1800)
         defer { app.terminate() }
         let editor = app.textViews["ai-composer"]
         editor.tap()
         editor.typeText("切会话保留")
         app.buttons["ai-send-draft"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", ""), object: editor)], timeout: 1.5), .completed)
         app.buttons["steering-other"].tap()
+        editor.tap()
+        editor.typeText("另一个会话的新草稿")
         let receipt = app.staticTexts["steering-receipt"]
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "label == %@", "已落库 1 · msg_fixture_turn_A"),
             object: receipt)], timeout: 5), .completed)
+        XCTAssertEqual(editor.value as? String, "另一个会话的新草稿")
         app.buttons["steering-current"].tap()
-        XCTAssertEqual(editor.value as? String, "切会话保留")
-        // The accepted old receipt can clear only after an explicit retry on the
-        // original selection; the second send must not invoke the fixture twice.
-        app.buttons["ai-send-draft"].tap()
+        XCTAssertEqual(editor.value as? String, "")
         XCTAssertEqual(receipt.label, "已落库 1 · msg_fixture_turn_A")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "exists == false"),
@@ -112,11 +230,16 @@ final class AIAssistantUITests: XCTestCase {
         editor.tap()
         editor.typeText("切账号保留")
         app.buttons["ai-send-draft"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", ""), object: editor)], timeout: 1.5), .completed)
         app.buttons["steering-account"].tap()
+        editor.tap()
+        editor.typeText("新账号的新草稿")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "label == %@", "已落库 2 · msg_fixture_turn_A"),
             object: receipt)], timeout: 5), .completed)
-        XCTAssertEqual(editor.value as? String, "切账号保留")
+        XCTAssertEqual(editor.value as? String, "新账号的新草稿")
+        XCTAssertFalse(app.staticTexts["切账号保留"].exists)
     }
 
     // 依靠真实媒体视图的无障碍身份确认切换，不再为测试往画面添加文件名标题。
