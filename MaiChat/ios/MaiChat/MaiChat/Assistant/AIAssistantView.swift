@@ -1540,8 +1540,8 @@ struct AIMessageRow: View, Equatable {
                                             in: RoundedRectangle(cornerRadius: 18))
                         }
                         ForEach(Array(imagePaths.enumerated()), id: \.offset) { _, path in
-                            AIWorkspaceImage(filePath: path) { size, sourceFrame, sourceID in
-                                openImage(path, imageSize: size, sourceFrame: sourceFrame, sourceID: sourceID)
+                            AIWorkspaceImage(filePath: path) { image, sourceFrame, sourceID in
+                                openImage(path, thumbnail: image, sourceFrame: sourceFrame, sourceID: sourceID)
                             }
                         }
                         ForEach(videoPaths, id: \.self) { path in
@@ -1661,8 +1661,8 @@ struct AIMessageRow: View, Equatable {
                 ForEach(mediaArtifacts) { artifact in
                     VStack(alignment: .leading, spacing: 8) {
                         if artifact.type == "image" {
-                            AIWorkspaceImage(filePath: artifact.filePath) { size, sourceFrame, sourceID in
-                                openImage(artifact.filePath, imageSize: size,
+                            AIWorkspaceImage(filePath: artifact.filePath) { image, sourceFrame, sourceID in
+                                openImage(artifact.filePath, thumbnail: image,
                                           sourceFrame: sourceFrame, sourceID: sourceID)
                             }
                         } else if artifact.type == "video" {
@@ -1788,8 +1788,8 @@ struct AIMessageRow: View, Equatable {
             part.kind == "audio" ? "音频" : "文件"
         if let file = remoteDownloaded[part.id] {
             if part.kind == "image" {
-                AIWorkspaceImage(filePath: file.path) { size, frame, sourceID in
-                    openImage(file.path, imageSize: size, sourceFrame: frame, sourceID: sourceID)
+                AIWorkspaceImage(filePath: file.path) { image, frame, sourceID in
+                    openImage(file.path, thumbnail: image, sourceFrame: frame, sourceID: sourceID)
                 }
             } else if part.kind == "video" {
                 AIWorkspaceVideoCard(filePath: file.path) { openVideo(file.path) }
@@ -1895,7 +1895,7 @@ struct AIMessageRow: View, Equatable {
         return items
     }
 
-    private func openImage(_ path: String, imageSize: CGSize, sourceFrame: CGRect, sourceID: UUID) {
+    private func openImage(_ path: String, thumbnail: UIImage, sourceFrame: CGRect, sourceID: UUID) {
         let model = AIAssistantModel.shared
         let session = model.selected
         let items = model.messages.flatMap {
@@ -1903,8 +1903,9 @@ struct AIMessageRow: View, Equatable {
         }
         let sequence = MaiMediaSequence(
             selected: MaiMediaItem(kind: .image, path: path), items: items)
-        let initial = AIImagePreview(filePath: path, imageSize: imageSize,
-                                     sourceFrame: sourceFrame, sourceID: sourceID, sequence: sequence)
+        let initial = AIImagePreview(filePath: path, imageSize: thumbnail.size,
+                                     sourceFrame: sourceFrame, sourceID: sourceID, sequence: sequence,
+                                     thumbnail: thumbnail)
         model.previewImage = initial
         Task {
             let allItems = await fullMediaItems(model: model, session: session)
@@ -1915,7 +1916,8 @@ struct AIMessageRow: View, Equatable {
                 filePath: current.filePath, imageSize: current.imageSize,
                 sourceFrame: current.sourceFrame,
                 sourceID: current.sourceID,
-                sequence: current.sequence?.updatingItems(allItems), id: current.id)
+                sequence: current.sequence?.updatingItems(allItems), thumbnail: current.thumbnail,
+                id: current.id)
         }
     }
 
@@ -2255,8 +2257,10 @@ private struct AIPDFArtifactButton: View {
 
 private struct AIWorkspaceImage: View {
     let filePath: String
-    let openPreview: (CGSize, CGRect, UUID) -> Void
+    let openPreview: (UIImage, CGRect, UUID) -> Void
     @State private var decodedSize: CGSize?
+    @State private var decodedImage: UIImage?
+    @State private var decodedImagePath: String?
     @State private var sourceID = UUID()
     @Environment(\.aiImagePreviewSourceID) private var previewSourceID
     @Environment(\.aiConversationActionsAllowed) private var conversationActionsAllowed
@@ -2270,15 +2274,19 @@ private struct AIWorkspaceImage: View {
         GeometryReader { geometry in
             Button {
                 // 侧滑从图片内开始时，已按下的 Button 仍可能在 touch-up 回调；再次读实时互锁。
-                guard conversationActionsAllowed() else { return }
+                guard conversationActionsAllowed(), decodedImagePath == filePath,
+                      let decodedImage else { return }
                 let sourceFrame = geometry.frame(in: .global)
                 guard sourceFrame.width > 0, sourceFrame.height > 0 else { return }
-                openPreview(decodedSize ?? previewSize, sourceFrame, sourceID)
+                openPreview(decodedImage, sourceFrame, sourceID)
             } label: {
                 RemoteIMAsyncImage(filePath: filePath,
                                    maximumPointSize: previewSize) { image in
                     Image(uiImage: image).resizable().scaledToFit()
-                        .task(id: image.size) {
+                        .task(id: ObjectIdentifier(image)) {
+                            // 与当前可见像素绑定，不只按尺寸更新：相同尺寸的新图片也要替换来源。
+                            decodedImage = image
+                            decodedImagePath = filePath
                             if let pixels = image.cgImage {
                                 decodedSize = CGSize(width: pixels.width, height: pixels.height)
                             }
@@ -2499,7 +2507,7 @@ struct AIAssistantImagePreviewLayer: View {
                         guard let frame = preview.sourceID.flatMap({ sources.frames[$0] }) ?? preview.sourceFrame
                         else { return nil }
                         return view.convert(frame, from: nil)
-                    }) {
+                    }, thumbnail: preview.thumbnail) {
                         model.previewImage = nil
                         maiLocalMediaTrace("image-model-closed")
                     }
@@ -3024,7 +3032,7 @@ private struct AIComposer: View, Equatable {
                         .overlay(Circle().stroke(RemoteIMStyle.border, lineWidth: snapshot.busy ? 0 : 1))
                 }
                 .buttonStyle(.plain)
-                .disabled(!snapshot.ready || snapshot.isSubmitting)
+                .disabled(!snapshot.ready || (!snapshot.busy && snapshot.isSubmitting))
                 .accessibilityLabel(
                     snapshot.busy ? "停止" : (isAttachmentPanelPresented ? "收起更多功能" : "展开更多功能")
                 )
@@ -3039,7 +3047,8 @@ private struct AIComposer: View, Equatable {
                     }
                     .buttonStyle(.plain)
                     .disabled(!canSubmitDraft)
-                    .accessibilityLabel("发送给 AI")
+                    .accessibilityLabel(snapshot.busy ? "补充当前任务" : "发送给 AI")
+                    .accessibilityHint(snapshot.busy ? "当前工具执行完后继续处理补充内容" : "")
                     .accessibilityIdentifier("ai-send-draft")
                 }
             }
@@ -3985,7 +3994,7 @@ private struct AIComposer: View, Equatable {
     }
 
     private var canSubmitDraft: Bool {
-        snapshot.ready && !snapshot.busy && !snapshot.isSubmitting &&
+        snapshot.ready && !snapshot.isSubmitting &&
             !snapshot.isCreatingConversation &&
             !isImportingCurrentSession && hasDraftContent
     }
@@ -4002,8 +4011,10 @@ private struct AIComposer: View, Equatable {
         let sourceSession = draftSession
         let sourceTarget = draftImportTarget
         let restorationGeneration = model.remoteRestoreGeneration
+        let submissionIdentity = model.composerSubmissionIdentity
         Task {
             guard await model.sendMessage(sent, expectedSession: sourceSession) else { return }
+            guard model.composerSubmissionIdentity == submissionIdentity else { return }
             let destination: String? = sourceSession.isEmpty
                 ? sourceTarget.flatMap { model.attachmentSession(for: $0) }
                 : sourceSession

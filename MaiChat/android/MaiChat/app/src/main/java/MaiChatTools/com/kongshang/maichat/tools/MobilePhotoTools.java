@@ -375,19 +375,7 @@ final class MobilePhotoTools {
     }
 
     private JSONObject agentTransformImage(JSONObject arguments) throws Exception {
-        AIAssistantController.ImportedFile file = AIAssistantController.shared(activity)
-            .transformImageForHost(arguments);
-        File result = AIAssistantController.shared(activity).workspaceImageForHost(file.relativePath);
-        BitmapFactory.Options bounds = new BitmapFactory.Options();
-        bounds.inJustDecodeBounds = true;
-        BitmapFactory.decodeFile(result.getPath(), bounds);
-        JSONObject response = new JSONObject().put("path", file.relativePath)
-            .put("mime_type", file.mimeType).put("width", bounds.outWidth)
-            .put("height", bounds.outHeight).put("next_tool", "mobile_preview_image");
-        JSONObject receipt = AIAssistantController.shared(activity).portraitReceiptForHost(file.relativePath);
-        java.util.Iterator<String> keys = receipt.keys();
-        while (keys.hasNext()) { String key = keys.next(); response.put(key, receipt.get(key)); }
-        return response;
+        return AIAssistantController.shared(activity).transformImageResultForHost(arguments);
     }
 
     private JSONObject agentImageInfo(JSONObject arguments) throws Exception {

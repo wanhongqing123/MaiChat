@@ -90,6 +90,7 @@
 		D153C2A4F2F5D6211CEB78B5 /* DesktopLoginScanView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D2095160132FC761449A82E /* DesktopLoginScanView.swift */; };
 		D24E6578A8A7EDF92BD0A9E4 /* video-circle-source.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 29ED9E52F55FF7B33F57D37C /* video-circle-source.mp4 */; };
 		D357B7A7100F4773EB0864A6 /* MobilePhotoTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54414E908C459EF659BD48AD /* MobilePhotoTools.swift */; };
+		25DE731960DD4652B35BF097 /* MaiPortraitPhotoProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE03536076A1485083AC78A8 /* MaiPortraitPhotoProcessor.swift */; };
 		D745B4CE59A50B7DD36C83E0 /* AIAssistantPathPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB30A9BB79A305FE900BF9E5 /* AIAssistantPathPolicy.swift */; };
 		D8890915CD794198A0332BB2 /* MaiChatCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 771AB137E6961E2B9187CFEB /* MaiChatCore.framework */; };
 		DD0212F81BF7429B14829650 /* MobileImageTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8888872A869DC80CF8DF58B6 /* MobileImageTools.swift */; };
@@ -227,6 +228,7 @@
 		489905ADED5F3469B72DB261 /* MaiCloudDriveAgentPlaybackCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiCloudDriveAgentPlaybackCache.swift; sourceTree = "<group>"; };
 		4E3D9F697A1737B461CCB2EB /* MaiChatUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = MaiChatUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		54414E908C459EF659BD48AD /* MobilePhotoTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobilePhotoTools.swift; sourceTree = "<group>"; };
+		EE03536076A1485083AC78A8 /* MaiPortraitPhotoProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiPortraitPhotoProcessor.swift; sourceTree = "<group>"; };
 		5897033F54602274C5F58A4A /* RemoteDiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDiagnosticsView.swift; sourceTree = "<group>"; };
 		59C1F4DABEBD721F3CB32385 /* LocalChatHistoryStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalChatHistoryStoreTests.swift; sourceTree = "<group>"; };
 		5FFB5E24161F8E400C19FB64 /* CloudDriveDeviceReadOnlySmokeUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudDriveDeviceReadOnlySmokeUITests.swift; sourceTree = "<group>"; };
@@ -450,6 +452,7 @@
 				8888872A869DC80CF8DF58B6 /* MobileImageTools.swift */,
 				E40A92474C9E88F01019EDA5 /* MobilePermissionTools.swift */,
 				54414E908C459EF659BD48AD /* MobilePhotoTools.swift */,
+				EE03536076A1485083AC78A8 /* MaiPortraitPhotoProcessor.swift */,
 			);
 			path = MaiChatTools;
 			sourceTree = "<group>";
@@ -1033,6 +1036,7 @@
 				DD0212F81BF7429B14829650 /* MobileImageTools.swift in Sources */,
 				565AD4A1181778D023B2900E /* MobilePermissionTools.swift in Sources */,
 				D357B7A7100F4773EB0864A6 /* MobilePhotoTools.swift in Sources */,
+				25DE731960DD4652B35BF097 /* MaiPortraitPhotoProcessor.swift in Sources */,
 				A0787EEE0051E9674B39C7C0 /* PhoneAccountLoginView.swift in Sources */,
 				EC4CC462A846C4BBBB877005 /* RemoteDesktopSession.swift in Sources */,
 				FEA124404840D00F968F232A /* RemoteDesktopView.swift in Sources */,
@@ -1165,7 +1169,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 172;
+				CURRENT_PROJECT_VERSION = 175;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1342,7 +1346,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 172;
+				CURRENT_PROJECT_VERSION = 175;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;

@@ -13,6 +13,19 @@ import UIKit
 import UniformTypeIdentifiers
 
 #if targetEnvironment(simulator)
+enum AIImagePreviewUITestSupport {
+    static var isRequested: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ai-ui-test") &&
+            ProcessInfo.processInfo.environment["MAICHAT_IMAGE_PREVIEW_DELAY_TEST"] == "1"
+    }
+
+    // 只延迟显式要求的模拟器回归，放大冷全图解码窗口，不影响缩略图管线和普通 App。
+    static func waitForFullImageIfRequested() async {
+        guard isRequested else { return }
+        try? await Task.sleep(for: .seconds(3))
+    }
+}
+
 struct AIVideoCircleUITestRoot: View {
     @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
     @ObservedObject private var circle = MaiVideoCircleModel.shared
@@ -121,11 +134,28 @@ struct AIImageFullscreenUITestRoot: View {
             .environmentObject(appState)
             .onAppear {
                 let anchorTest = ProcessInfo.processInfo.environment["MAICHAT_IMAGE_ZOOM_ANCHOR_TEST"] == "1"
-                let imageSize = anchorTest ? CGSize(width: 600, height: 240) : CGSize(width: 300, height: 500)
-                let image = UIGraphicsImageRenderer(size: imageSize)
+                let delayedDecode = anchorTest && AIImagePreviewUITestSupport.isRequested
+                let imageSize = delayedDecode ? CGSize(width: 4032, height: 3024) :
+                    anchorTest ? CGSize(width: 600, height: 240) : CGSize(width: 300, height: 500)
+                let renderer: UIGraphicsImageRenderer
+                if delayedDecode {
+                    let format = UIGraphicsImageRendererFormat()
+                    format.scale = 1
+                    renderer = UIGraphicsImageRenderer(size: imageSize, format: format)
+                } else {
+                    renderer = UIGraphicsImageRenderer(size: imageSize)
+                }
+                let image = renderer
                     .image { context in
-                        UIColor.systemBlue.setFill()
+                        if delayedDecode {
+                            UIColor(red: 0.04, green: 0.30, blue: 0.94, alpha: 1).setFill()
+                        } else { UIColor.systemBlue.setFill() }
                         context.fill(CGRect(origin: .zero, size: imageSize))
+                        if delayedDecode {
+                            UIColor(red: 1, green: 0.84, blue: 0.02, alpha: 1).setFill()
+                            context.fill(CGRect(x: imageSize.width * 0.43, y: 0,
+                                                width: imageSize.width * 0.14, height: imageSize.height))
+                        }
                     }
                 let file = FileManager.default.temporaryDirectory
                     .appendingPathComponent("image-fullscreen-ui-test.png")
@@ -264,6 +294,190 @@ struct AIWelcomeUITestRoot: View {
         AIAssistantView()
             .environmentObject(appState)
             .onAppear { AIAssistantModel.shared.installWelcomeUITestFixture() }
+    }
+}
+
+/// Normal Root/composer, isolated owner and deterministic backend receipt. No
+/// paid provider is contacted; native tool-batch ordering has separate C ABI tests.
+@MainActor
+private final class AISteeringUITestProbe: ObservableObject {
+    @Published var status = "尚未补充"
+    @Published var archiveStatus = "归档未检查"
+    private var requests: [AISteeringRequest] = []
+    private var archiveUnknownRequests: Set<String> = []
+
+    func submit(_ request: AISteeringRequest) async throws -> String {
+        requests.append(request)
+        let previous = requests.dropLast().last
+        status = "已提交 \(requests.count) · \(request.turnId)"
+        try await Task.sleep(for: .milliseconds(900))
+        if request.text.contains("收尾拒绝") {
+            status = "收尾拒绝，未启动新任务"
+            throw AIBackendError(message: "当前任务正在收尾，补充内容未发送")
+        }
+        if request.text.contains("归档未知"), archiveUnknownRequests.insert(request.requestId).inserted {
+            status = "归档回执未知"
+            throw AIBackendError(message: "模拟归档回执丢失", definitive: false)
+        }
+        if request.text.contains("重试") && previous == nil {
+            status = "送达未知，草稿保留"
+            throw AIBackendError(message: "模拟回执丢失", definitive: false)
+        }
+        if request.text.contains("重试") {
+            guard previous?.requestId == request.requestId,
+                  previous?.turnId == request.turnId else {
+                status = "重试编号错误"
+                throw AIBackendError(message: "重试编号错误")
+            }
+        }
+        status = "已落库 \(requests.count) · \(request.turnId)"
+        return "msg_fixture_user_\(requests.count)"
+    }
+
+    func checkArchiveLifecycle() async {
+        archiveStatus = "归档检查中"
+        let model = AIAssistantModel.shared
+        let archive = AIMobileScreenFrameArchive.shared
+        let session = model.selected
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("steering-archive-" + UUID().uuidString, isDirectory: true)
+        do {
+            try checkImportCachePolicy()
+            let context = try await archive.prepareScreenArchiveUITest(workspace: workspace, sessionID: session)
+            let listing = try await archive.list(workspace: workspace, sessionID: session, batchID: context.batchID)
+            guard let frame = listing.frames.first else { throw AIBackendError(message: "真实采样帧缺失") }
+            let references = try await archive.retainSelected(frameIDs: [frame.id], context: context,
+                usageSessionID: "draft:" + UUID().uuidString)
+            guard let reference = references.first else { throw AIBackendError(message: "原图引用缺失") }
+            model.applyUITestMutation(.workspace(workspace.path))
+            model.applyUITestMutation(.attachments([session: [AIImportedFile(
+                relativePath: reference.relativePath, mimeType: "image/png", isImage: true,
+                archiveReference: reference)]], firstMessageSessionID: session))
+            guard !(await model.sendMessage("归档收尾拒绝", expectedSession: session)) else {
+                throw AIBackendError(message: "拒绝补充被误报成功")
+            }
+            try await archive.discard(context: context)
+            _ = try await archive.releaseSession(workspace: workspace, sessionID: session)
+            guard FileManager.default.fileExists(atPath: reference.fileURL.path) else {
+                throw AIBackendError(message: "拒绝后仍在草稿的原图被清理")
+            }
+            guard !(await model.sendMessage("归档未知", expectedSession: session)) else {
+                throw AIBackendError(message: "未知回执被误报成功")
+            }
+            let manifest = reference.fileURL.deletingLastPathComponent().appendingPathComponent("manifest.json")
+            let retained = try Data(contentsOf: manifest)
+            guard await model.sendMessage("归档未知", expectedSession: session) else {
+                throw AIBackendError(message: "原操作重试未接受")
+            }
+            guard try Data(contentsOf: manifest) == retained,
+                  requests.suffix(2).allSatisfy({ $0.images.first?.relativePath == reference.relativePath }),
+                  requests.suffix(2).first?.requestId == requests.last?.requestId else {
+                throw AIBackendError(message: "幂等重试改了引用、导入路径或操作编号")
+            }
+            _ = try await archive.releaseSession(workspace: workspace, sessionID: session)
+            guard !FileManager.default.fileExists(atPath: reference.fileURL.path) else {
+                throw AIBackendError(message: "接受后原图未归属正式会话，清理漏释放")
+            }
+            archiveStatus = "归档引用与幂等通过"
+        } catch { archiveStatus = "归档失败：" + error.localizedDescription }
+    }
+
+    /// Exercise the production policy at capacity, including unavailable owner
+    /// state. The native snapshot/identity checks stay in the ordinary model path.
+    private func checkImportCachePolicy() throws {
+        let entries = (0..<AISteeringImportCachePolicy.capacity).map {
+            AISteeringImportCacheIdentity(key: "fixture_\($0)", session: "session_\($0 % 4)",
+                turnId: "turn_\($0 % 4)", order: UInt64($0), acceptedOrder: UInt64($0))
+        }
+        var states = Dictionary(uniqueKeysWithValues: (0..<4).map {
+            ("session_\($0)", AISteeringImportRuntimeState(busy: true, turnId: "turn_\($0)"))
+        })
+        guard AISteeringImportCachePolicy.evictableKey(entries, states: states) == nil,
+              AISteeringImportCachePolicy.evictableKey(entries, states: [:]) == nil else {
+            throw AIBackendError(message: "活动或未知轮次的导入收据被淘汰")
+        }
+        states["session_1"] = AISteeringImportRuntimeState(busy: false, turnId: "")
+        guard AISteeringImportCachePolicy.evictableKey(entries, states: states) == "fixture_1" else {
+            throw AIBackendError(message: "未选择最旧的已结束附件轮次")
+        }
+        states["session_0"] = AISteeringImportRuntimeState(busy: true, turnId: "replacement_turn")
+        guard AISteeringImportCachePolicy.evictableKey(entries, states: states) == "fixture_0" else {
+            throw AIBackendError(message: "未区分同会话的新旧轮次")
+        }
+        states["session_0"] = AISteeringImportRuntimeState(busy: true, turnId: "")
+        guard AISteeringImportCachePolicy.evictableKey(entries, states: states) == "fixture_1" else {
+            throw AIBackendError(message: "未确认轮次的忙会话丢失导入收据")
+        }
+        let recent = (0..<128).map {
+            AISteeringImportCacheIdentity(key: "receipt_\($0)", session: "ended", turnId: "ended_turn",
+                order: UInt64($0), acceptedOrder: UInt64($0))
+        }
+        let ended = ["ended": AISteeringImportRuntimeState(busy: false, turnId: "")]
+        guard AISteeringImportCachePolicy.evictableKey(recent, states: ended) == nil else {
+            throw AIBackendError(message: "新请求尚未接受就淘汰了最近128条收据")
+        }
+        let unknown = AISteeringImportCacheIdentity(key: "unknown", session: "ended", turnId: "ended_turn",
+            order: 128)
+        guard AISteeringImportCachePolicy.evictableKey(recent + [unknown], states: ended) == nil else {
+            throw AIBackendError(message: "未确认的新请求挤掉已接受收据")
+        }
+        let accepted = AISteeringImportCacheIdentity(key: "accepted", session: "ended", turnId: "ended_turn",
+            order: 128, acceptedOrder: 128)
+        guard AISteeringImportCachePolicy.evictableKey(recent + [accepted], states: ended) == "receipt_0" else {
+            throw AIBackendError(message: "新接受请求后未保留最近128条窗口")
+        }
+        let activeOld = AISteeringImportCacheIdentity(key: "active_old", session: "running", turnId: "running_turn",
+            order: 0, acceptedOrder: 0)
+        let later = (1...128).map {
+            AISteeringImportCacheIdentity(key: "later_\($0)", session: "ended", turnId: "ended_turn",
+                order: UInt64($0), acceptedOrder: UInt64($0))
+        }
+        var combined = ended
+        combined["running"] = AISteeringImportRuntimeState(busy: true, turnId: "running_turn")
+        guard AISteeringImportCachePolicy.evictableKey([activeOld] + later, states: combined) == nil else {
+            throw AIBackendError(message: "旧活动轮或最近128收据丢失")
+        }
+    }
+}
+
+struct AISteeringUITestRoot: View {
+    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
+    @StateObject private var probe = AISteeringUITestProbe()
+
+    var body: some View {
+        RootView()
+            .environmentObject(appState)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                VStack(spacing: 2) {
+                    Text(probe.status).font(.caption)
+                        .accessibilityIdentifier("steering-receipt")
+                    HStack {
+                        Button("原会话") {
+                            Task { await AIAssistantModel.shared.selectConversation("switch-A") }
+                        }.accessibilityIdentifier("steering-current")
+                        Button("切会话") {
+                            Task { await AIAssistantModel.shared.selectConversation("switch-B") }
+                        }.accessibilityIdentifier("steering-other")
+                        Button("切测试账号") {
+                            AIAssistantModel.shared.uiTestSupport.screenFrameAccountID = "fixture-other-owner"
+                        }.accessibilityIdentifier("steering-account")
+                    }.font(.caption)
+                    if ProcessInfo.processInfo.arguments.contains("--ai-steering-archive-ui-test") {
+                        Button("验证归档补充") { Task { await probe.checkArchiveLifecycle() } }
+                            .accessibilityIdentifier("steering-archive-check")
+                        Text(probe.archiveStatus).font(.caption)
+                            .accessibilityIdentifier("steering-archive-result")
+                    }
+                }.padding(4).frame(maxWidth: .infinity).background(.regularMaterial)
+            }
+            .onAppear {
+                appState.masterUserID = "steering-fixture-owner"
+                appState.chatState = MasterChatState(ownerUserID: "steering-fixture-owner")
+                appState.hasCompletedInitialLogin = true
+                AIAssistantModel.shared.installSteeringUITestFixture { request in
+                    try await probe.submit(request)
+                }
+            }
     }
 }
 
@@ -446,6 +660,7 @@ enum AIAssistantUITestRouting {
         return arguments.contains("--app-bars-layout-ui-test") ||
             arguments.contains("--ai-history-ui-test") ||
             arguments.contains("--ai-welcome-ui-test") ||
+            arguments.contains("--ai-steering-ui-test") ||
             arguments.contains("--ai-session-reveal-ui-test") ||
             arguments.contains("--ai-session-switch-ui-test") ||
             arguments.contains("--ai-browser-ui-test") ||

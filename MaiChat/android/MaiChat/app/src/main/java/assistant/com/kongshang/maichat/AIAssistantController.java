@@ -399,6 +399,29 @@ public final class AIAssistantController {
         if (target == null)
             return hostToolFailure("MaiChat 宿主工具尚未连接");
 
+        if (tool.equals("mobile_transform_image") || tool.equals("mobile_beautify_image")
+                || tool.equals("mobile_reshape_body")) {
+            if (Looper.myLooper() == Looper.getMainLooper())
+                return hostToolFailure("图片处理不能在 UI 线程执行", "internal");
+            try {
+                // 使用承载本次 native Agent 的实例，不能在账号切换后重新查 shared 并改新号文件。
+                JSONObject input = new JSONObject(arguments);
+                String workspace = input.optString("workspace_path"), session = input.optString("session_id");
+                if (root == null || (!workspace.isEmpty() && !new File(root, "Workspace").getCanonicalFile()
+                        .equals(new File(workspace).getCanonicalFile())) || (!session.isEmpty() && !hasLocalSession(session)))
+                    return hostToolFailure("图片所属账号或会话已变化，请重新操作", "canceled");
+                // 这些字段由共享 factory 注入，不属于模型修饰参数。
+                input.remove("workspace_path");
+                input.remove("session_id");
+                if (tool.equals("mobile_beautify_image")) input.put("operation", "beautify");
+                if (tool.equals("mobile_reshape_body")) input.put("operation", "reshape_body");
+                return new JSONObject().put("ok", true).put("output", transformImageResultForHost(input))
+                    .toString().getBytes(StandardCharsets.UTF_8);
+            } catch (Throwable failure) {
+                return hostToolFailure(safeMessage(failure));
+            }
+        }
+
         if (tool.equals("maichat_cancel_avatar")) {
             try {
                 // 原生取消监视线程可并发进入；只投递给本地请求表，不等待主线程或网络。
@@ -2352,6 +2375,9 @@ public final class AIAssistantController {
     }
     // 作用：校验工作区图片并执行宿主图片转换。
     public ImportedFile transformImageForHost(JSONObject arguments) throws Exception {
+        final File ownerRoot = root;
+        if (ownerRoot == null || closed || accountToolLoginGeneration != accountAuth.accountSessionGeneration())
+            throw new IOException("The portrait account or workspace changed");
         File source = workspaceImageForHost(arguments.optString("path", ""));
         boolean portrait = arguments.optString("operation").equals("beautify") || arguments.optString("operation").equals("reshape_body");
         String profile = new File(root, "PortraitPreferences").getPath();
@@ -2360,6 +2386,22 @@ public final class AIAssistantController {
                 source.getPath().getBytes(StandardCharsets.UTF_8), null, 1);
             if (original == null) throw new IOException("Cannot resolve portrait original");
             source = workspaceImageForHost(new String(original, StandardCharsets.UTF_8));
+            if (arguments.optString("operation").equals("beautify")) {
+                final File preferences = new File(ownerRoot, "PortraitPreferences");
+                MaiPortraitImage.Result result = MaiPortraitImage.process(source, preferences,
+                    new File(ownerRoot, "Workspace"), arguments,
+                    () -> !closed && root == ownerRoot
+                        && accountToolLoginGeneration == accountAuth.accountSessionGeneration(),
+                    (metadata, output) -> portraitEnvelope(nativePortraitRequest(
+                        preferences.getPath().getBytes(StandardCharsets.UTF_8), metadata,
+                        output.getPath().getBytes(StandardCharsets.UTF_8), 2)));
+                String name = result.file.getName();
+                synchronized (portraitReceipts) {
+                    if (portraitReceipts.size() >= 32) portraitReceipts.remove(portraitReceipts.keySet().iterator().next());
+                    portraitReceipts.put(name, result.receipt);
+                }
+                return new ImportedFile(name, "image/png", true);
+            }
             arguments = new JSONObject(arguments.toString());
             arguments.put("_face_hints", arguments.optString("operation").equals("beautify")
                 ? com.kongshang.maichat.tools.MobileImageVision.detectFaces(source).getJSONArray("faces") : new JSONArray());
@@ -2438,6 +2480,21 @@ public final class AIAssistantController {
         }
     }
     private final java.util.Map<String, JSONObject> portraitReceipts = new java.util.LinkedHashMap<>();
+    /** 普通调用与模型工具使用同一处理/登记入口，响应仅在输出已原子发布后构造。 */
+    public JSONObject transformImageResultForHost(JSONObject arguments) throws Exception {
+        ImportedFile file = transformImageForHost(arguments);
+        File output = workspaceImageForHost(file.relativePath);
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(output.getPath(), bounds);
+        JSONObject response = new JSONObject().put("path", file.relativePath)
+            .put("mime_type", file.mimeType).put("width", bounds.outWidth).put("height", bounds.outHeight)
+            .put("next_tool", "mobile_preview_image");
+        JSONObject receipt = portraitReceiptForHost(file.relativePath);
+        java.util.Iterator<String> keys = receipt.keys();
+        while (keys.hasNext()) { String key = keys.next(); response.put(key, receipt.get(key)); }
+        return response;
+    }
     public JSONObject portraitReceiptForHost(String path) {
         synchronized (portraitReceipts) {
             JSONObject receipt = portraitReceipts.remove(path);

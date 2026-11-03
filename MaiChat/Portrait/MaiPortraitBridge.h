@@ -15,6 +15,33 @@ typedef struct MaiPortraitImageResult {
     char* metadata;
     char* error;
 } MaiPortraitImageResult;
+typedef struct MaiPortraitRegionResult {
+    unsigned char* rgba;
+    unsigned char* mask;
+    int width;
+    int height;
+    char* metadata;
+    char* error;
+} MaiPortraitRegionResult;
+
+// 统一校验模型字段；hostFields=1 时额外接受宿主 operation/_face_hints。
+// 合法时返回 NULL，失败返回不含路径的 JSON {code,stage,message,hint}，用 maiPortraitFree 释放。
+char* maiPortraitValidateArguments(const char* operation, const char* arguments, int hostFields);
+// 宿主全图/窗口检测结果合并，返回 {ok,output:{faces:[...]}}，坐标与输入一致。
+char* maiPortraitMergeFaceHints(const char* hints);
+// 以原图坐标规划有界 ROI。hints 为宿主检测的 {_face_hints:[...]}；proxy 是 <=256 的全图 RGBA。
+// 返回 {ok,output|error}，output 是可交给 region 处理的上下文；宿主须补入 source_fingerprint。
+char* maiPortraitPlanFaceRegion(int sourceWidth, int sourceHeight, const char* hints, int subjectIndex,
+                                const unsigned char* proxyRgba, int proxyWidth, int proxyHeight, int proxyStride);
+// ROI 像素为原生尺寸，不是缩小后的原图；context 来自 plan，不得由模型构造。
+// rgba 已完成软边合成，应原位替换同尺寸 ROI；mask 是皮肤编辑 alpha 的诊断输出，不能再混一次。
+// mask 为 width*height 灰度8位，metadata 中的坐标均为原图左上像素。每个非NULL指针单独 free。
+MaiPortraitRegionResult maiPortraitProcessRegionRgba(const unsigned char* rgba, int width, int height, int stride,
+                                                     const char* arguments, const char* profileDirectory,
+                                                     const char* sourcePath, const char* regionContext);
+// 只发布同目录已经编码、关闭并由宿主校验的完整文件，不替换已有目标。
+// 失败仍由调用者清理临时文件；返回 {ok,output|error}，不包含输入路径。
+char* maiPortraitPublishOutput(const char* temporaryPath, const char* outputPath);
 // profileDirectory 和 sourcePath 由宿主当前账号提供，不接受模型指定。
 // arguments 包含业务参数及宿主附加的人脸定位提示。像素为已转正 sRGB RGBA8。
 // 成功时返回新像素与待登记元数据；宿主完整保存输出后必须调用 commit，

@@ -38,7 +38,26 @@ iOS 和 Android 共用本目录的普通 C++ 服务。平台负责照片授权�
 `L' = L + 10w(1 − L/100)`、`a' = a(1 − 0.3w)`、`b' = b(1 − 0.3w)`。
 相同比例收缩色度，避免用负暖度来近似美白；高亮处提升自然收敛，保留局部纹理。
 眼、眉、唇排除在遮罩外，背景不参与调色。此版本是局部调色算法，不是生成式修肤网络，
-也不对身体全身皮肤作美白。最大输入为 1200 万像素，Lab 按 64 行分块处理以限制临时内存。
+也不对身体全身皮肤作美白。Lab 按 64 行分块处理以限制临时内存。
+
+移动端美颜通过全图分析与重叠窗口定位小脸，共用核心规划最长边不超过 2048 的原生
+人脸 ROI，在原图中局部处理后输出同尺寸新 PNG，不要求用户裁图再贴回。完整光栅的旧
+核心入口及美体仍限制 1200 万像素；iOS 原尺寸文件解码／编码暂限制 3200 万像素，
+超限明确报 `output_budget_exceeded`，不隐式缩小图片。单个近距离大脸使原生 ROI 超限时
+报 `roi_budget_exceeded`，此时需要明确选择更小输入。普通照片处理同进程只允许一个请求，
+并发请求返回 `busy`，避免原尺寸编码工作内存叠加。
+
+美颜额外返回同尺寸灰度 `mask_path`、原图坐标 `roi`／`processing_bbox`、实际参数、
+mask 内加权 `skin_L_before/after` 和 `skin_C_before/after` 以及改变的 RGB 像素数。
+这个 mask 是皮肤调色覆盖诊断；RGBA 结果已经完成软边合成，不得再乘 mask 混一次，
+几何修饰也不能只靠皮肤 mask 合回原图。美颜不执行人体检测，因此返回
+`person_count:null`、`person_analysis_performed:false`；这不表示图片里没有人。
+全图阈值差异占比小也不表示皮肤没有美白，应优先看同一 mask 内的 L*/C*。
+
+失败诊断使用 `code`、`stage`、`message`、`hint` 和实际尺寸。不存在／空／未写完文件、
+定位失败、mesh 失败和皮肤分割为空分别报告，不把 I/O 失败包装成 `faces:[]`。
+`action:delegate` 不属于修图参数，未知键和错误类型会被运行时拒绝。
+生产文件和消费文件必须有明确先后依赖，不能将 FFmpeg 与读取其输出的工具并行提交。
 
 `whitening=0` 完全跳过新增调色；所有参数均为 0 时输出像素与原图一致。
 `strength` 是旧调用的磨皮／提亮映射，不控制美白。已验证的个人模型只补充未显式指定的
@@ -78,3 +97,17 @@ python3 MaiChat/scripts/fetch-portrait-models.py --test-fixtures
 `docs/diagnostics/maichat-local-retouch-integration-20261102.md`。
 `MaiPortraitTests.mm` 当前由本机原生 QA runner 编译执行，尚未注册为 CMake 测试目标；
 iOS UI 与 Android instrumented 测试使用各平台工程中的正式测试 target。
+
+可复现的 macOS 普通服务回归入口为 `tests/run-native-tests.py`：
+
+```bash
+python3 MaiChat/Portrait/tests/run-native-tests.py \
+  --build-cache <native-desktop-build> --opencv-config <matching-opencv-generated-headers> \
+  --runtime <bundled-macos-ort-library> --output <new-temporary-directory>
+```
+
+该脚本只读取已经构建的原生 MaiAgent/OpenCV 静态库，在新的临时目录编译人像核心、
+已有真实模型回归和 `MaiPortraitRegionTests.swift`。新回归实际调用 iOS 共用的普通
+`prepare/detectFaces/publish` 服务，以公开人脸图生成 5712×4284 的角落小脸构图，
+验证同尺寸 image/mask、遮罩外 RGB 保持、皮肤 L*/C*、未知参数、缺失／未完成输入与取消。
+这是 macOS Vision/CoreImage 验证，不能替代 iOS 安装产物和真机验收。

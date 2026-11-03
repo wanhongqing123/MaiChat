@@ -861,7 +861,10 @@ struct MaiMobileAgent {
             if (!session.isRoot()) continue;
             const bool active = agent->isBusy(session.id);
             busy |= active;
-            sessions.push_back({{"id", session.id}, {"title", session.title}, {"busy", active}});
+            sessions.push_back({{"id", session.id},
+                                {"title", session.title},
+                                {"busy", active},
+                                {"turnId", agent->activeTurnId(session.id)}});
         }
         // 增量期间复用消息结构，避免每个批次重新读整段 SQLite 历史。
         if (reload) {
@@ -909,6 +912,7 @@ struct MaiMobileAgent {
                 {"permissions", permissions},
                 {"questions", questions},
                 {"busy", busy},
+                {"turnId", agent->activeTurnId(selected)},
                 {"configured", configured},
                 {"error", errorCopy[selected]}};
     }
@@ -936,7 +940,8 @@ struct MaiMobileAgent {
                 {"messages", serializeMessages(page, before.empty() && busy)},
                 {"permissions", permissions},
                 {"questions", questions},
-                {"busy", busy}};
+                {"busy", busy},
+                {"turnId", agent->activeTurnId(sessionId)}};
     }
 
     Json request(const Json& r) {
@@ -1008,12 +1013,12 @@ struct MaiMobileAgent {
         std::string id;
         if (op == "create")
             id = result(agent->submit(MaiCreateSession{workspace, "", model}));
-        else if (op == "send") {
+        else if (op == "send" || op == "steer") {
             if (!configured) throw std::runtime_error("Configure a model and API key first.");
             // iOS 在升级或恢复后可能给同一数据容器分配新的绝对路径。图片片段只保存
             // 工作区相对路径，所以每轮发送前都把会话根目录迁到当前容器位置。
-            result(agent->submit(MaiUpdateSession{session, "", model, "", workspace}));
-            {
+            if (op == "send") {
+                result(agent->submit(MaiUpdateSession{session, "", model, "", workspace}));
                 std::lock_guard<std::mutex> lock(mutex);
                 errors.erase(session);
             }
@@ -1041,8 +1046,18 @@ struct MaiMobileAgent {
             }
             if (r.contains("quoteMessageId") && !r["quoteMessageId"].is_string())
                 throw std::runtime_error("quoteMessageId must be a string.");
-            id = result(agent->submit(MaiSendPrompt{session, r.at("text"), std::move(images), std::move(videos),
-                                                    r.value("quoteMessageId", std::string{})}));
+            if (op == "steer") {
+                if (!r.contains("turnId") || !r["turnId"].is_string() || !r.contains("requestId") ||
+                    !r["requestId"].is_string())
+                    throw std::runtime_error("Steering requires turnId and requestId strings.");
+                // 指定现有轮次，不改模型或工作区，也不在 idle 时隐式回退为新 send。
+                id = result(
+                    agent->submit(MaiSteerPrompt{session, r["turnId"], r["requestId"], r.at("text"), std::move(images),
+                                                 std::move(videos), r.value("quoteMessageId", std::string{})}));
+            } else {
+                id = result(agent->submit(MaiSendPrompt{session, r.at("text"), std::move(images), std::move(videos),
+                                                        r.value("quoteMessageId", std::string{})}));
+            }
         } else if (op == "stop") {
             result(agent->submit(MaiInterrupt{session}));
             if (scheduleRunner) scheduleRunner->finish(session, "Interrupted by user");

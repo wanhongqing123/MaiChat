@@ -230,6 +230,18 @@ Android 模拟器完成 JNI/WSS 握手及远端会话界面测试；Mac 和 Wind
 可见事件在确认前可重投。
 服务重启后所有设备先显示离线，直到重新上报心跳。
 
+当前任务补充使用 `send` 的 `action:"steer"`，包含原 `turnId`、稳定 `requestId`、
+`text` 和可选 `attachments` / `quoteMessageId`。`presence`、`publish`、`history`
+和 Session 目录携带 `busy` 与 `turnId`；旧客户端缺少编号时不能猜测当前任务。
+所属设备通过共用 Agent 核心校验原轮次，在完整工具批次结束后消费补充；已经停止、
+收尾或结束的任务明确拒绝，不回退为新任务。成功回执必须含
+`result:{ok:true,user_message_id:"…"}`，客户端收到后才清草稿。
+投递回执丢失可使用新的信箱消息 ID 重发，但复用原 `requestId` 与相同内容；
+核心按 Session/轮次/操作编号在运行时有界去重。携带附件的重试应复用原附件引用和
+所属设备的导入路径。服务仅转送这些控制字段，不调模型或代转模型字节。
+本协议需要同步服务与所属端统一升级；服务数据库会自动增加空默认值的 `turn_id` 列，
+现有历史不变。本次仅本地验证，生产部署须单独执行。
+
 远端创建、删除和切换 Session Workspace 复用 `send` 的设备信箱。客户端在 `catalog.devices`
 选择在线的所属设备，使用其 `device_slot` 与 `login_session_id` 作为 `to_slot`
 和 `to_login_session_id`。三种命令都使用保留的

@@ -12,10 +12,13 @@
 #include "MaiTool.h"
 #endif
 #include <android/bitmap.h>
+#include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <jni.h>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -564,4 +567,187 @@ Java_com_kongshang_maichat_AIAssistantController_nativePortraitRequest(JNIEnv* e
   if(result)env->SetByteArrayRegion(result,0,size,reinterpret_cast<const jbyte*>(response));
   maiPortraitFree(response);
   return result;
+}
+
+// Android owns one full-sized mutable sRGB Bitmap. These entries only borrow its pixels;
+// the portrait core receives a bounded straight-RGBA ROI and never a full Java byte array.
+namespace {
+struct PortraitBitmapLock {
+    JNIEnv* env;
+    jobject bitmap;
+    AndroidBitmapInfo info{};
+    void* pixels = nullptr;
+    bool premultiplied = true;
+    bool mutablePixels = false;
+    PortraitBitmapLock(JNIEnv* environment, jobject image) : env(environment), bitmap(image) {
+        if (!bitmap || AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+            info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || info.width == 0 || info.height == 0 ||
+            static_cast<uint64_t>(info.width) * info.height > 32'000'000 ||
+            info.stride < static_cast<uint64_t>(info.width) * 4)
+            return;
+        jclass type = env->GetObjectClass(bitmap);
+        jmethodID method = type ? env->GetMethodID(type, "isPremultiplied", "()Z") : nullptr;
+        if (method) premultiplied = env->CallBooleanMethod(bitmap, method) == JNI_TRUE;
+        jmethodID mutableMethod = type ? env->GetMethodID(type, "isMutable", "()Z") : nullptr;
+        if (mutableMethod) mutablePixels = env->CallBooleanMethod(bitmap, mutableMethod) == JNI_TRUE;
+        if (type) env->DeleteLocalRef(type);
+        if (env->ExceptionCheck()) return;
+        if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) pixels = nullptr;
+    }
+    ~PortraitBitmapLock() {
+        if (pixels) AndroidBitmap_unlockPixels(env, bitmap);
+    }
+};
+
+struct PortraitRegionOwner {
+    MaiPortraitRegionResult value{};
+    ~PortraitRegionOwner() {
+        maiPortraitFree(value.rgba);
+        maiPortraitFree(value.mask);
+        maiPortraitFree(value.metadata);
+        maiPortraitFree(value.error);
+    }
+};
+
+jbyteArray portraitBytes(JNIEnv* env, const char* value) {
+    if (!value) return nullptr;
+    const auto size = static_cast<jsize>(std::strlen(value));
+    jbyteArray result = env->NewByteArray(size);
+    if (result) env->SetByteArrayRegion(result, 0, size, reinterpret_cast<const jbyte*>(value));
+    return result;
+}
+jbyteArray ownedPortraitBytes(JNIEnv* env, char* value) {
+    std::unique_ptr<char, decltype(&maiPortraitFree)> owned(value, &maiPortraitFree);
+    return portraitBytes(env, value);
+}
+jbyteArray portraitHostFailure(JNIEnv* env) {
+    return portraitBytes(
+        env,
+        R"({"code":"invalid_host_pixels","stage":"android_region","message":"Portrait pixels or region bounds are invalid","hint":"Retry with a supported source and enough device memory"})");
+}
+
+// Never reinterpret premultiplied PNG memory as straight color. Opaque photo regions avoid
+// this copy; translucent regions get one bounded ROI copy, then are premultiplied on writeback.
+const unsigned char* straightPortraitPixels(const unsigned char* input, int width, int height, int stride,
+                                            bool premultiplied, std::vector<unsigned char>& straight) {
+    if (!premultiplied) return input;
+    bool translucent = false;
+    for (int y = 0; y < height && !translucent; ++y)
+        for (int x = 0; x < width; ++x)
+            if (input[static_cast<size_t>(y) * stride + x * 4 + 3] != 255) {
+                translucent = true;
+                break;
+            }
+    if (!translucent) return input;
+    straight.resize(static_cast<size_t>(width) * height * 4);
+    for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x) {
+            const auto* pixel = input + static_cast<size_t>(y) * stride + x * 4;
+            auto* output = straight.data() + (static_cast<size_t>(y) * width + x) * 4;
+            const unsigned alpha = pixel[3];
+            for (int channel = 0; channel < 3; ++channel)
+                output[channel] = alpha ? static_cast<unsigned char>(std::min(
+                                              255U, (static_cast<unsigned>(pixel[channel]) * 255 + alpha / 2) / alpha))
+                                        : 0;
+            output[3] = static_cast<unsigned char>(alpha);
+        }
+    return straight.data();
+}
+}  // namespace
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_kongshang_maichat_MaiPortraitImage_nativeValidate(JNIEnv* env, jclass, jbyteArray arguments) {
+    try {
+        const auto encoded = portraitUtf8(env, arguments);
+        return ownedPortraitBytes(env, maiPortraitValidateArguments("beautify", encoded.c_str(), 1));
+    } catch (...) {
+        return portraitHostFailure(env);
+    }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativeMergeFaces(JNIEnv* env,
+                                                                                                     jclass,
+                                                                                                     jbyteArray hints) {
+    try {
+        const auto encoded = portraitUtf8(env, hints);
+        return ownedPortraitBytes(env, maiPortraitMergeFaceHints(encoded.c_str()));
+    } catch (...) {
+        return portraitHostFailure(env);
+    }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativePlan(
+    JNIEnv* env, jclass, jobject proxy, jint width, jint height, jbyteArray hints, jint subject) {
+    try {
+        PortraitBitmapLock image(env, proxy);
+        if (!image.pixels || image.info.width > 256 || image.info.height > 256) return portraitHostFailure(env);
+        std::vector<unsigned char> straight;
+        const auto* input = straightPortraitPixels(
+            static_cast<const unsigned char*>(image.pixels), static_cast<int>(image.info.width),
+            static_cast<int>(image.info.height), static_cast<int>(image.info.stride), image.premultiplied, straight);
+        const auto encoded = portraitUtf8(env, hints);
+        return ownedPortraitBytes(
+            env, maiPortraitPlanFaceRegion(
+                     width, height, encoded.c_str(), subject, input, static_cast<int>(image.info.width),
+                     static_cast<int>(image.info.height),
+                     straight.empty() ? static_cast<int>(image.info.stride) : static_cast<int>(image.info.width) * 4));
+    } catch (...) {
+        return portraitHostFailure(env);
+    }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativeApply(
+    JNIEnv* env, jclass, jobject source, jint x, jint y, jint width, jint height, jbyteArray arguments,
+    jbyteArray profile, jbyteArray original, jbyteArray context) {
+    try {
+        PortraitBitmapLock image(env, source);
+        if (!image.pixels || !image.mutablePixels || x < 0 || y < 0 || width < 1 || height < 1 || width > 2048 ||
+            height > 2048 || static_cast<int64_t>(x) + width > image.info.width ||
+            static_cast<int64_t>(y) + height > image.info.height)
+            return portraitHostFailure(env);
+        auto* target = static_cast<unsigned char*>(image.pixels) + static_cast<size_t>(y) * image.info.stride + x * 4;
+        std::vector<unsigned char> straight;
+        const auto* input = straightPortraitPixels(target, width, height, static_cast<int>(image.info.stride),
+                                                   image.premultiplied, straight);
+        const auto specification = portraitUtf8(env, arguments), directory = portraitUtf8(env, profile),
+                   path = portraitUtf8(env, original), region = portraitUtf8(env, context);
+        PortraitRegionOwner edited;
+        edited.value = maiPortraitProcessRegionRgba(
+            input, width, height, straight.empty() ? static_cast<int>(image.info.stride) : width * 4,
+            specification.c_str(), directory.c_str(), path.c_str(), region.c_str());
+        if (edited.value.error) return portraitBytes(env, edited.value.error);
+        if (!edited.value.rgba || !edited.value.metadata || edited.value.width != width ||
+            edited.value.height != height)
+            return portraitHostFailure(env);
+        for (int row = 0; row < height; ++row) {
+            auto* output = target + static_cast<size_t>(row) * image.info.stride;
+            const auto* pixels = edited.value.rgba + static_cast<size_t>(row) * width * 4;
+            if (!image.premultiplied) {
+                std::memcpy(output, pixels, static_cast<size_t>(width) * 4);
+            } else {
+                for (int column = 0; column < width; ++column) {
+                    const auto* pixel = pixels + column * 4;
+                    for (int channel = 0; channel < 3; ++channel)
+                        output[column * 4 + channel] =
+                            static_cast<unsigned char>((pixel[channel] * pixel[3] + 127) / 255);
+                    output[column * 4 + 3] = pixel[3];
+                }
+            }
+        }
+        // Core output already contains the soft-edge blend. The skin mask is diagnostic only.
+        return portraitBytes(env, edited.value.metadata);
+    } catch (...) {
+        return portraitHostFailure(env);
+    }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativePublish(JNIEnv* env, jclass,
+                                                                                                  jbyteArray temporary,
+                                                                                                  jbyteArray target) {
+    try {
+        const auto from = portraitUtf8(env, temporary), to = portraitUtf8(env, target);
+        return ownedPortraitBytes(env, maiPortraitPublishOutput(from.c_str(), to.c_str()));
+    } catch (...) {
+        return portraitHostFailure(env);
+    }
 }

@@ -8,6 +8,11 @@ extern "C" {
 // 进程内 C ABI。宿主必须从同一条后台串行队列调用，包括销毁。
 // create 仅分配句柄；configure 才打开库。request 返回拥有的 UTF-8 JSON，必须
 // free。 密钥只进 configure，不从响应/事件返回。异常不能跨语言边界传播。
+// request 的 steer 操作为 {op:"steer",session,turnId,requestId,text,images?,videos?,
+// quoteMessageId?}，媒体字段形状同 send。turnId 取该 session 的 snapshot.turnId，
+// 整轮稳定；requestId 由宿主生成且重试复用。成功 {ok:true,id:<已落库 user ID>}，
+// 只表示已接收，完整工具批次结束后、下一次模型请求前消费。idle/stop/收尾拒绝，
+// 不启动另一轮；失败须保留草稿，禁止自动回退 send。同轮相同请求有界幂等。
 void* maiMobileAgentCreate(void);
 void maiMobileAgentDestroy(void* handle);
 char* maiMobileAgentRequest(void* handle, const char* request);

@@ -19,7 +19,9 @@
 #include <QtConcurrent>
 
 #include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "MaiTool.h"
@@ -57,6 +59,23 @@ private:
     int calls_ = 0;
 };
 
+// The owner stays busy without any network or paid model call. The native
+// Agent receives the supplement while this first model operation is held.
+class HeldSteeringModel final : public MaiModelClient {
+public:
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
+                    const std::atomic<bool>& cancel) override {
+        entered.store(true);
+        while (!release.load() && !cancel.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (!cancel.load() && sink.onText) sink.onText("Owner completed the task");
+        return {};
+    }
+    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+};
+
 }  // namespace
 
 class DesktopSessionSyncHostTest : public QObject {
@@ -64,6 +83,7 @@ class DesktopSessionSyncHostTest : public QObject {
 
 private slots:
     void appliesRemotePromptToTheExistingLocalSession();
+    void remoteSteeringBindsToTheOriginalOwnerTurn();
     void remotePromptCreatesScheduledTaskOnItsOwner();
     void resolvedSessionFileStaysInsideItsOwnerWorkspace();
     void omitsLocalMediaPathsFromRemoteHistory();
@@ -591,6 +611,57 @@ void DesktopSessionSyncHostTest::remotePromptCreatesScheduledTaskOnItsOwner() {
              QStringLiteral("scheduled"));
     QCOMPARE(QString::fromStdString(tasks.value().front().instruction),
              QStringLiteral("检查桌面构建并总结"));
+}
+
+void DesktopSessionSyncHostTest::remoteSteeringBindsToTheOriginalOwnerTurn() {
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    auto model = std::make_unique<HeldSteeringModel>();
+    auto* held = model.get();
+    AgentController controller(std::move(model), {});
+    const QString session = controller.createSession(workspace.path());
+    DesktopSessionSyncHost host(controller);
+    QVERIFY(host.applyCommand(session, {{QStringLiteral("action"), QStringLiteral("prompt")},
+        {QStringLiteral("text"), QStringLiteral("Prepare an image report")}})
+        .value(QStringLiteral("ok")).toBool());
+    QTRY_VERIFY_WITH_TIMEOUT(held->entered.load(), 3000);
+    const QJsonObject busyPage = host.historyPage(session, {}, 20);
+    QVERIFY(busyPage.value(QStringLiteral("busy")).toBool());
+    const QString turn = busyPage.value(QStringLiteral("turnId")).toString();
+    QVERIFY(!turn.isEmpty());
+    QCOMPARE(host.rootSessions().first().toObject().value(QStringLiteral("turnId")).toString(), turn);
+    const QJsonObject supplement{{QStringLiteral("action"), QStringLiteral("steer")},
+        {QStringLiteral("text"), QStringLiteral("Keep the original detail")},
+        {QStringLiteral("turnId"), turn},
+        {QStringLiteral("requestId"), QStringLiteral("fixture_supplement_request")}};
+    const QJsonObject accepted = host.applyCommand(session, supplement);
+    QVERIFY2(accepted.value(QStringLiteral("ok")).toBool(),
+             qPrintable(accepted.value(QStringLiteral("error")).toString()));
+    const QString user = accepted.value(QStringLiteral("user_message_id")).toString();
+    QVERIFY(!user.isEmpty());
+    QCOMPARE(host.applyCommand(session, supplement).value(QStringLiteral("user_message_id")).toString(), user);
+    QCOMPARE(host.historyPage(session, {}, 20).value(QStringLiteral("turnId")).toString(), turn);
+    QVERIFY(controller.agent().isBusy(session.toStdString()));
+    QVERIFY(!host.applyCommand(session, {{QStringLiteral("action"), QStringLiteral("prompt")},
+        {QStringLiteral("text"), QStringLiteral("Must not replace the running task")}})
+        .value(QStringLiteral("ok")).toBool());
+    QJsonObject invalid = supplement;
+    invalid.insert(QStringLiteral("requestId"), QStringLiteral("fixture_wrong_turn"));
+    invalid.insert(QStringLiteral("turnId"), QStringLiteral("msg_other_turn"));
+    QVERIFY(!host.applyCommand(session, invalid).value(QStringLiteral("ok")).toBool());
+    held->release.store(true);
+    controller.agent().waitIdle();
+    QVERIFY(!host.historyPage(session, {}, 20).value(QStringLiteral("busy")).toBool());
+    // A lost receipt can be retried after completion, but a new request must not
+    // silently create another task on the now-idle owner.
+    QCOMPARE(host.applyCommand(session, supplement).value(QStringLiteral("user_message_id")).toString(), user);
+    QJsonObject idle = supplement;
+    idle.insert(QStringLiteral("requestId"), QStringLiteral("fixture_new_idle_request"));
+    QVERIFY(!host.applyCommand(session, idle).value(QStringLiteral("ok")).toBool());
+    int matches = 0;
+    for (const MaiMessage& message : controller.agent().listMessages(session.toStdString()))
+        if (message.id == user.toStdString()) ++matches;
+    QCOMPARE(matches, 1);
 }
 
 void DesktopSessionSyncHostTest::resolvedSessionFileStaysInsideItsOwnerWorkspace() {

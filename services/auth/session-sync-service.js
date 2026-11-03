@@ -111,7 +111,7 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
       principal.accountId, body.to_slot, body.to_login_session_id, principal.slot,
       principal.loginSessionId, body.client_message_id, body.session_id, body.kind,
       payload, now(), now() +
-        (body.kind === 'command' && body.payload?.action === 'prompt' &&
+        (body.kind === 'command' && ['prompt', 'steer'].includes(body.payload?.action) &&
          body.payload.attachments?.length ? ATTACHMENT_COMMAND_LIFETIME_MS :
          ENVELOPE_LIFETIME_MS));
     const id = Number(inserted.lastInsertRowid);
@@ -138,14 +138,25 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
     db.prepare('DELETE FROM sync_sessions WHERE account_id=? AND slot=?')
       .run(principal.accountId, principal.slot);
     const insert = db.prepare(`INSERT INTO sync_sessions(account_id,slot,login_session_id,
-      session_id,title,updated_at,busy) VALUES(?,?,?,?,?,?,?)`);
+      session_id,title,updated_at,busy,turn_id) VALUES(?,?,?,?,?,?,?,?)`);
     for (const session of body.sessions) insert.run(principal.accountId, principal.slot,
       principal.loginSessionId, session.id, session.title, session.updated_at,
-      session.busy === true ? 1 : 0);
+      session.busy === true ? 1 : 0, session.turnId || '');
     return previous?.login_session_id;
   });
 
-  const publishMessages = db.transaction((principal, sessionId, messages, permissions, questions) => {
+  const publishMessages = db.transaction((principal, sessionId, messages, permissions, questions, runtime) => {
+    const previousRuntime = db.prepare(`SELECT busy,turn_id FROM sync_sessions
+      WHERE account_id=? AND slot=? AND session_id=?`).get(principal.accountId, principal.slot, sessionId);
+    const nextRuntime = {
+      busy: runtime.busy === undefined ? previousRuntime.busy === 1 : runtime.busy,
+      turnId: runtime.turnId === undefined ? previousRuntime.turn_id : runtime.turnId
+    };
+    const runtimeChanged = previousRuntime.busy !== (nextRuntime.busy ? 1 : 0) ||
+      previousRuntime.turn_id !== nextRuntime.turnId;
+    if (runtimeChanged) db.prepare(`UPDATE sync_sessions SET busy=?,turn_id=?
+      WHERE account_id=? AND slot=? AND session_id=?`).run(nextRuntime.busy ? 1 : 0,
+      nextRuntime.turnId, principal.accountId, principal.slot, sessionId);
     const upsert = db.prepare(`INSERT INTO sync_room_messages(account_id,owner_slot,session_id,
       message_id,payload,payload_hash,updated_at) VALUES(?,?,?,?,?,?,?)
       ON CONFLICT(account_id,owner_slot,session_id,message_id) DO UPDATE SET
@@ -165,7 +176,7 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
     const previousState = db.prepare(`SELECT permissions,questions FROM sync_room_state
       WHERE account_id=? AND owner_slot=? AND session_id=?`).get(
       principal.accountId, principal.slot, sessionId);
-    const stateChanged = previousState?.permissions !== encodedPermissions ||
+    const stateChanged = runtimeChanged || previousState?.permissions !== encodedPermissions ||
       previousState?.questions !== encodedQuestions;
     if (stateChanged) db.prepare(`INSERT INTO sync_room_state(account_id,owner_slot,session_id,
       permissions,questions,updated_at) VALUES(?,?,?,?,?,?)
@@ -208,7 +219,7 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
     if (!updates.length && stateChanged) updates.push([]);
     for (const update of updates) {
       const bytes = Buffer.from(JSON.stringify({ ok: true, messages: update,
-        permissions, questions }));
+        permissions, questions, busy: nextRuntime.busy, turnId: nextRuntime.turnId }));
       const transferID = randomUUID().replaceAll('-', '');
       const digest = createHash('sha256').update(bytes).digest('hex');
       const chunks = Math.ceil(bytes.length / (24 * 1024));
@@ -265,7 +276,8 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
             session.id === SESSION_LIFECYCLE_ID ||
             !validTitle(session?.title) || !Number.isSafeInteger(session?.updated_at) ||
             session.updated_at < 0 ||
-            (session.busy !== undefined && typeof session.busy !== 'boolean')))
+            (session.busy !== undefined && typeof session.busy !== 'boolean') ||
+            (session.turnId !== undefined && session.turnId !== '' && !validId(session.turnId))))
         return reply(400, { error: 'Invalid device presence' });
       if (new Set(body.sessions.map(session => session.id)).size !== body.sessions.length)
         return reply(400, { error: 'Duplicate Session ID' });
@@ -280,7 +292,8 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
         device_id,login_session_id,last_seen FROM sync_devices WHERE account_id=?
         ORDER BY slot`).all(principal.accountId);
       const rows = db.prepare(`SELECT sessions.session_id AS id,sessions.title,
-        sessions.updated_at,sessions.busy,sessions.slot AS device_slot,devices.name AS device_name,
+        sessions.updated_at,sessions.busy,sessions.turn_id AS turnId,
+        sessions.slot AS device_slot,devices.name AS device_name,
         devices.device_id,devices.login_session_id,devices.last_seen
         FROM sync_sessions AS sessions JOIN sync_devices AS devices
         ON devices.account_id=sessions.account_id AND devices.slot=sessions.slot
@@ -300,7 +313,7 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
           (before && !validId(before)) || !Number.isSafeInteger(limit) ||
           limit < 1 || limit > 20)
         return reply(400, { error: 'Invalid history page' });
-      const owner = db.prepare(`SELECT 1 FROM sync_sessions WHERE account_id=? AND slot=?
+      const owner = db.prepare(`SELECT busy,turn_id FROM sync_sessions WHERE account_id=? AND slot=?
         AND session_id=?`).get(principal.accountId, slot, sessionId);
       if (!owner) return reply(404, { error: 'Session is unavailable' });
       const rows = db.prepare(`SELECT payload FROM sync_room_messages WHERE account_id=?
@@ -309,7 +322,8 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
         sessionId, before || '\uffff', limit);
       const state = db.prepare(`SELECT permissions,questions FROM sync_room_state WHERE
         account_id=? AND owner_slot=? AND session_id=?`).get(principal.accountId, slot, sessionId);
-      return reply(200, { ok: true, messages: rows.map(row => JSON.parse(row.payload)),
+      return reply(200, { ok: true, busy: owner.busy === 1, turnId: owner.turn_id,
+        messages: rows.map(row => JSON.parse(row.payload)),
         permissions: state ? JSON.parse(state.permissions) : [],
         questions: state ? JSON.parse(state.questions) : [] });
     }
@@ -319,6 +333,8 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
           body.messages.length > 20 ||
           (body.permissions !== undefined && !Array.isArray(body.permissions)) ||
           (body.questions !== undefined && !Array.isArray(body.questions)) ||
+          (body.busy !== undefined && typeof body.busy !== 'boolean') ||
+          (body.turnId !== undefined && body.turnId !== '' && !validId(body.turnId)) ||
           Buffer.byteLength(JSON.stringify(body.permissions || [])) > 16 * 1024 ||
           Buffer.byteLength(JSON.stringify(body.questions || [])) > 16 * 1024 ||
           body.messages.some(message => !message || typeof message !== 'object' ||
@@ -334,7 +350,7 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
       let changed, members, stateChanged;
       try {
         ({ changed, members, stateChanged } = publishMessages(principal,
-          body.session_id, body.messages, body.permissions || [], body.questions || []));
+          body.session_id, body.messages, body.permissions || [], body.questions || [], body));
       } catch (error) {
         if (error.code === 'ROOM_MESSAGE_TOO_LARGE')
           return reply(413, { error:'Room message is too large' });
@@ -343,6 +359,7 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
       for (const member of members)
         if (changed.length || stateChanged)
           wake(principal.accountId, member.slot, member.login_session_id);
+      if (stateChanged) publishCatalog(principal.accountId);
       return reply(200, { published: changed.length });
     }
     if (method === 'POST' && url.pathname === '/v1/session-sync/room-delete') {
@@ -439,7 +456,12 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
           ? body.to_login_session_id : principal.loginSessionId;
         if (!currentSession.get(principal.accountId, ownerSlot, ownerLogin, body.session_id))
           return reply(404, { error: 'Session is unavailable' });
-        if (body.kind === 'command' && body.payload.action === 'prompt' &&
+        if (body.kind === 'command' && body.payload.action === 'steer' &&
+            (!validId(body.payload.turnId) || !validId(body.payload.requestId, 96) ||
+             typeof body.payload.text !== 'string' || Buffer.byteLength(body.payload.text) > 16 * 1024 ||
+             (!body.payload.text.trim() && !body.payload.attachments?.length)))
+          return reply(400, { error: 'Invalid current-task supplement' });
+        if (body.kind === 'command' && ['prompt', 'steer'].includes(body.payload.action) &&
             body.payload.attachments !== undefined) {
           const attachments = body.payload.attachments;
           if (!Array.isArray(attachments) || attachments.length > 10 ||

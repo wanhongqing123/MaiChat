@@ -126,6 +126,7 @@ set(WITH_TBB OFF CACHE BOOL "" FORCE)
 add_subdirectory("${maichat_opencv_source}" opencv EXCLUDE_FROM_ALL)
 add_library(maichat_portrait STATIC
   ../Portrait/MaiPortraitEngine.cpp
+  ../Portrait/MaiPortraitRegion.cpp
   ../Portrait/MaiPortraitPersonalization.cpp
   ../Portrait/MaiPortraitBridge.cpp)
 target_include_directories(maichat_portrait PUBLIC ../Portrait PRIVATE
@@ -376,8 +377,14 @@ if(MAICHAT_MOBILE_TESTS)
   target_include_directories(MaiMobileAgentTests PRIVATE ../../MaiAgent/third_party/httplib ../../MaiAgent/third_party/nlohmann)
   target_link_libraries(MaiMobileAgentTests PRIVATE maichat_mobile maiagent)
   add_test(NAME MaiMobileAgentTests COMMAND MaiMobileAgentTests)
+  add_executable(MaiMobileSteeringTests tests/MaiMobileSteeringTests.cpp)
+  target_include_directories(MaiMobileSteeringTests PRIVATE
+    ../../MaiAgent/third_party/httplib ../../MaiAgent/third_party/nlohmann)
+  target_link_libraries(MaiMobileSteeringTests PRIVATE maichat_mobile maiagent)
+  add_test(NAME MaiMobileSteeringTests COMMAND MaiMobileSteeringTests)
   if(ANDROID)
     target_link_libraries(MaiMobileAgentTests PRIVATE android log jnigraphics)
+    target_link_libraries(MaiMobileSteeringTests PRIVATE android log jnigraphics)
     add_executable(MaiCvVideoAnalysisTests
       ../../MaiAgent/tests/MaiCvVideoAnalysisTests.cpp)
     target_include_directories(MaiCvVideoAnalysisTests PRIVATE

@@ -2,6 +2,7 @@
 // 提供工作区图片分析、转换和输出文件处理。
 // 输入与输出路径分离，图片处理失败不覆盖原文件。
 import Foundation
+import Combine
 import CoreFoundation
 import Darwin
 import CoreImage
@@ -44,58 +45,31 @@ extension AIMobileHostToolProvider {
     /// 对授权图片执行本地人脸检测并返回边界框。
     /// 输入路径和图片尺寸先验证，检测失败返回原因而不写回源文件。
     func detectFaces(_ arguments: [String: Any]) async -> AIMaiChatHostToolExecution {
+        let model = AIAssistantModel.shared
+        let workspace = model.workspacePath
+        guard let source = AIAssistantPathPolicy.resolve(Self.string(arguments, key: "path"), workspacePath: workspace) else {
+            return .failure(code: "invalid_input", message: "Image must be inside the current account file domain")
+        }
+        let cancellation = MaiPortraitCancellation()
+        let observation = model.$workspacePath.dropFirst().sink { value in
+            if value != workspace { cancellation.cancel() }
+        }
+        defer { observation.cancel() }
         do {
-            let source = try workspaceImageMetadata(arguments).url
-            let output = try await Task.detached(priority: .userInitiated) { () -> String in
-                guard let image = CIImage(contentsOf: source,
-                                          options: [.applyOrientationProperty: true]) else {
-                    throw AIBackendError(message: "无法读取图片")
-                }
-                let width = Int(image.extent.width), height = Int(image.extent.height)
-                guard width > 0, height > 0, width <= 20_000, height <= 20_000 else {
-                    throw AIBackendError(message: "图片尺寸无效")
-                }
-                let scale = min(1.0, 2048.0 / max(image.extent.width, image.extent.height))
-                let analysis = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-                let request = VNDetectFaceLandmarksRequest()
-                try VNImageRequestHandler(ciImage: analysis, options: [:]).perform([request])
-                let faces: [[String: Any]] = (request.results ?? []).map { face in
-                    let box = face.boundingBox
-                    let x = Int((box.minX * CGFloat(width)).rounded())
-                    let y = Int(((1 - box.maxY) * CGFloat(height)).rounded())
-                    let faceWidth = Int((box.width * CGFloat(width)).rounded())
-                    let faceHeight = Int((box.height * CGFloat(height)).rounded())
-                    func center(_ region: VNFaceLandmarkRegion2D?) -> [String: Int]? {
-                        guard let region, !region.normalizedPoints.isEmpty else { return nil }
-                        let points = region.normalizedPoints
-                        let averageX = points.reduce(CGFloat.zero) { $0 + $1.x } / CGFloat(points.count)
-                        let averageY = points.reduce(CGFloat.zero) { $0 + $1.y } / CGFloat(points.count)
-                        return [
-                            "x": Int(((box.minX + averageX * box.width) * CGFloat(width)).rounded()),
-                            "y": Int(((1 - box.minY - averageY * box.height) * CGFloat(height)).rounded()),
-                        ]
-                    }
-                    var landmarks: [String: [String: Int]] = [:]
-                    if let point = center(face.landmarks?.leftEye) { landmarks["left_eye"] = point }
-                    if let point = center(face.landmarks?.rightEye) { landmarks["right_eye"] = point }
-                    if let point = center(face.landmarks?.outerLips) { landmarks["mouth"] = point }
-                    return [
-                        "box": ["x": x, "y": y, "width": faceWidth, "height": faceHeight],
-                        "confidence": Double(face.confidence), "landmarks": landmarks,
-                    ]
-                }
-                let data = try JSONSerialization.data(withJSONObject: [
-                    "source_width": width, "source_height": height,
-                    "coordinate_origin": "top_left", "faces": faces,
-                ])
-                guard let value = String(data: data, encoding: .utf8) else {
-                    throw AIBackendError(message: "无法编码人脸位置")
-                }
-                return value
-            }.value
+            let output = try await withTaskCancellationHandler {
+                try await Task.detached(priority: .userInitiated) {
+                    try MaiPortraitPhotoProcessor.detectFaces(sourceURL: source, cancellation: cancellation)
+                }.value
+            } onCancel: { cancellation.cancel() }
+            try cancellation.check()
+            guard model === AIAssistantModel.shared, model.workspacePath == workspace else { throw CancellationError() }
             return .success(output)
+        } catch is CancellationError {
+            return .failure(code: "canceled", message: "Face detection was canceled")
+        } catch let error as MaiPortraitHostFailure {
+            return .failure(code: "invalid_input", message: error.detail)
         } catch {
-            return .failure(code: "internal", message: error.localizedDescription)
+            return .failure(code: "internal", message: "Face detection could not read or analyze the source image")
         }
     }
 

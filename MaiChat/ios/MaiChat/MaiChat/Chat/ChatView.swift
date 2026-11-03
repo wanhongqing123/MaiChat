@@ -240,6 +240,10 @@ private struct RemoteIMImageLoadKey: Hashable, Sendable {
 @MainActor
 enum MaiPreviewImageLoader {
     static func image(at url: URL, maximumPixelSize: Int = 4096) async -> UIImage? {
+        #if DEBUG && targetEnvironment(simulator)
+        // 冷解码的界面回归必须观察等待中的真实画面；延迟宿主只存在于 DebugSupport。
+        await AIImagePreviewUITestSupport.waitForFullImageIfRequested()
+        #endif
         guard let request = try? await RemoteIMBackgroundWork.metadata({
             RemoteIMImageRequest(filePath: url.path,
                                  maximumPixelSize: CGFloat(maximumPixelSize))

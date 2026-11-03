@@ -29,6 +29,7 @@ function openSessionSyncStore(filename) {
       title TEXT NOT NULL,
       updated_at INTEGER NOT NULL,
       busy INTEGER NOT NULL DEFAULT 0,
+      turn_id TEXT NOT NULL DEFAULT '',
       PRIMARY KEY(account_id, slot, session_id)
     );
     CREATE INDEX IF NOT EXISTS sync_sessions_account_updated
@@ -96,6 +97,9 @@ function openSessionSyncStore(filename) {
   const sessionColumns = new Set(db.pragma('table_info(sync_sessions)').map(row => row.name));
   if (!sessionColumns.has('busy'))
     db.exec('ALTER TABLE sync_sessions ADD COLUMN busy INTEGER NOT NULL DEFAULT 0');
+  // Runtime turn binding is control-plane metadata, not a persisted model request.
+  if (!sessionColumns.has('turn_id'))
+    db.exec("ALTER TABLE sync_sessions ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''");
   // 进程重启后，旧心跳不能证明设备仍连着新进程；等待它重新上报。
   db.prepare('UPDATE sync_devices SET last_seen=0').run();
   // 未确认的事件可在新连接上立即重发；命令仍保持首次投递语义。

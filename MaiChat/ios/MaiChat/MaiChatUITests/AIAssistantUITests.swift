@@ -5,6 +5,120 @@ import XCTest
 import UIKit
 
 final class AIAssistantUITests: XCTestCase {
+    @MainActor private func launchSteeringFixture(archive: Bool = false) -> XCUIApplication {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        // Root's first-launch notification preprompt can cover a tab that still
+        // exists in AX. Override only this launch's argument domain: these tests
+        // exercise steering, independently of the simulator's saved onboarding.
+        app.launchArguments = ["--ai-ui-test", "--ai-steering-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        if archive { app.launchArguments.append("--ai-steering-archive-ui-test") }
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        let tab = app.buttons["创作中心"]
+        XCTAssertTrue(tab.waitForExistence(timeout: 12))
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hittable == true"), object: tab)], timeout: 8), .completed,
+            "创作中心必须能实际命中，不能把AX存在当作已进入页面")
+        tab.tap()
+        XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 8))
+        return app
+    }
+
+    @MainActor func testSteeringArchivePinsSurviveRejectionAndReleaseWithHistory() {
+        let app = launchSteeringFixture(archive: true)
+        defer { app.terminate() }
+        app.buttons["steering-archive-check"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "归档引用与幂等通过"),
+            object: app.staticTexts["steering-archive-result"])], timeout: 40), .completed,
+            "必须用真实C++归档验证拒绝恢复草稿、未知回执幂等及接受后会话清理")
+    }
+
+    @MainActor func testBusyComposerSupplementsCapturedTurnAfterReceipt() {
+        let app = launchSteeringFixture()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["停止"].exists)
+        XCTAssertFalse(app.buttons["ai-send-draft"].exists)
+        let editor = app.textViews["ai-composer"]
+        editor.tap()
+        editor.typeText("保留原图细节")
+        let send = app.buttons["ai-send-draft"]
+        XCTAssertTrue(send.isEnabled)
+        XCTAssertEqual(send.label, "补充当前任务")
+        XCTAssertTrue(app.buttons["停止"].exists)
+        send.tap()
+        let receipt = app.staticTexts["steering-receipt"]
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "已落库 1 · msg_fixture_turn_A"),
+            object: receipt)], timeout: 5), .completed)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: send)], timeout: 5), .completed)
+        XCTAssertTrue(app.buttons["停止"].exists, "补充不能结束当前任务")
+    }
+
+    @MainActor func testSteeringUnknownDeliveryReusesRequestAndRejectionKeepsDraft() {
+        let app = launchSteeringFixture()
+        defer { app.terminate() }
+        let editor = app.textViews["ai-composer"]
+        editor.tap()
+        editor.typeText("重试补充")
+        app.buttons["ai-send-draft"].tap()
+        let receipt = app.staticTexts["steering-receipt"]
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "送达未知，草稿保留"),
+            object: receipt)], timeout: 5), .completed)
+        XCTAssertEqual(editor.value as? String, "重试补充")
+        XCTAssertTrue(app.buttons["ai-send-draft"].isEnabled)
+        app.buttons["ai-send-draft"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "已落库 2 · msg_fixture_turn_A"),
+            object: receipt)], timeout: 5), .completed)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"),
+            object: app.buttons["ai-send-draft"])], timeout: 5), .completed)
+        XCTAssertTrue(editor.waitForExistence(timeout: 2))
+        editor.tap()
+        editor.typeText("收尾拒绝")
+        app.buttons["ai-send-draft"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "收尾拒绝，未启动新任务"),
+            object: receipt)], timeout: 5), .completed)
+        XCTAssertEqual(editor.value as? String, "收尾拒绝")
+    }
+
+    @MainActor func testSteeringSelectionAndAccountChangesKeepOriginalDraft() {
+        let app = launchSteeringFixture()
+        defer { app.terminate() }
+        let editor = app.textViews["ai-composer"]
+        editor.tap()
+        editor.typeText("切会话保留")
+        app.buttons["ai-send-draft"].tap()
+        app.buttons["steering-other"].tap()
+        let receipt = app.staticTexts["steering-receipt"]
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "已落库 1 · msg_fixture_turn_A"),
+            object: receipt)], timeout: 5), .completed)
+        app.buttons["steering-current"].tap()
+        XCTAssertEqual(editor.value as? String, "切会话保留")
+        // The accepted old receipt can clear only after an explicit retry on the
+        // original selection; the second send must not invoke the fixture twice.
+        app.buttons["ai-send-draft"].tap()
+        XCTAssertEqual(receipt.label, "已落库 1 · msg_fixture_turn_A")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"),
+            object: app.buttons["ai-send-draft"])], timeout: 5), .completed)
+        editor.tap()
+        editor.typeText("切账号保留")
+        app.buttons["ai-send-draft"].tap()
+        app.buttons["steering-account"].tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "已落库 2 · msg_fixture_turn_A"),
+            object: receipt)], timeout: 5), .completed)
+        XCTAssertEqual(editor.value as? String, "切账号保留")
+    }
+
     // 依靠真实媒体视图的无障碍身份确认切换，不再为测试往画面添加文件名标题。
     private func waitForPreview(_ preview: XCUIElement, named name: String,
                                 timeout: TimeInterval = 8,
@@ -3709,6 +3823,122 @@ final class AIAssistantUITests: XCTestCase {
             returned.lifetime = .keepAlways
             add(returned)
         }
+    }
+
+    @MainActor func testImagePreviewShowsThumbnailWhileFullImageDecodeIsDelayed() throws {
+        #if targetEnvironment(simulator)
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-image-fullscreen-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launchEnvironment["MAICHAT_IMAGE_ZOOM_ANCHOR_TEST"] = "1"
+        app.launchEnvironment["MAICHAT_IMAGE_PREVIEW_DELAY_TEST"] = "1"
+        app.launch()
+        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
+        let bubble = app.buttons["agent-image-bubble"].firstMatch
+        XCTAssertTrue(bubble.waitForExistence(timeout: 20))
+
+        func attach(_ screenshot: XCUIScreenshot, _ name: String) {
+            let attachment = XCTAttachment(screenshot: screenshot)
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+
+        // 和现有播放器像素回归一样先按窗口点坐标归一化截图，再明确处理 RGBA/BGRA。
+        // UIImageView 的 AX 元素即使没有 image 仍可 exists，不能把它当作图片已显示的证据。
+        func coverage(_ screenshot: XCUIScreenshot, rect: CGRect) throws -> (blue: Double, yellow: Double) {
+            let window = app.frame
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.preferredRange = .standard
+            let normalized = UIGraphicsImageRenderer(size: window.size, format: format).image { _ in
+                screenshot.image.draw(in: CGRect(origin: .zero, size: window.size))
+            }
+            let image = try XCTUnwrap(normalized.cgImage)
+            let raw = try XCTUnwrap(image.dataProvider?.data)
+            XCTAssertEqual(image.bitsPerComponent, 8)
+            XCTAssertEqual(image.bitsPerPixel, 32)
+            let littleEndian = image.bitmapInfo.contains(.byteOrder32Little)
+            let alphaFirst = image.alphaInfo == .premultipliedFirst || image.alphaInfo == .first ||
+                image.alphaInfo == .noneSkipFirst
+            let red = alphaFirst ? (littleEndian ? 2 : 1) : (littleEndian ? 3 : 0)
+            let green = alphaFirst ? (littleEndian ? 1 : 2) : (littleEndian ? 2 : 1)
+            let blue = alphaFirst ? (littleEndian ? 0 : 3) : (littleEndian ? 1 : 2)
+            let pixels = raw as Data
+            let left = max(0, Int((rect.minX - window.minX) * CGFloat(image.width) / window.width))
+            let right = min(image.width, Int((rect.maxX - window.minX) * CGFloat(image.width) / window.width))
+            let top = max(0, Int((rect.minY - window.minY) * CGFloat(image.height) / window.height))
+            let bottom = min(image.height, Int((rect.maxY - window.minY) * CGFloat(image.height) / window.height))
+            guard left < right, top < bottom else {
+                XCTFail("像素采样区域必须位于窗口内"); return (0, 0)
+            }
+            var samples = 0, blueSamples = 0, yellowSamples = 0
+            for y in stride(from: top, to: bottom, by: 3) {
+                for x in stride(from: left, to: right, by: 3) {
+                    let offset = y * image.bytesPerRow + x * 4
+                    guard offset + 3 < pixels.count else { continue }
+                    let r = Int(pixels[offset + red]), g = Int(pixels[offset + green])
+                    let b = Int(pixels[offset + blue])
+                    samples += 1
+                    if b > 150, b - r > 80, b - g > 60 { blueSamples += 1 }
+                    if r > 180, g > 130, b < 100 { yellowSamples += 1 }
+                }
+            }
+            return (Double(blueSamples) / Double(max(samples, 1)),
+                    Double(yellowSamples) / Double(max(samples, 1)))
+        }
+
+        // 只等待原消息缩略图，不等待全图 loader；否则无法覆盖首次冷读的黑屏窗口。
+        let thumbnailDeadline = Date().addingTimeInterval(8)
+        var thumbnailCapture = app.screenshot()
+        var thumbnailPixels = try coverage(thumbnailCapture, rect: bubble.frame.insetBy(
+            dx: bubble.frame.width * 0.12, dy: bubble.frame.height * 0.12))
+        while thumbnailPixels.blue < 0.55 && Date() < thumbnailDeadline {
+            Thread.sleep(forTimeInterval: 0.1)
+            thumbnailCapture = app.screenshot()
+            thumbnailPixels = try coverage(thumbnailCapture, rect: bubble.frame.insetBy(
+                dx: bubble.frame.width * 0.12, dy: bubble.frame.height * 0.12))
+        }
+        attach(thumbnailCapture, "image-preview-source-thumbnail")
+        XCTAssertGreaterThan(thumbnailPixels.blue, 0.55, "先确认消息里真实显示了蓝底缩略图")
+        XCTAssertGreaterThan(thumbnailPixels.yellow, 0.05, "合成原图的黄色竖条应进入消息缩略图")
+
+        let preview = app.images["agent-image-preview"]
+        let pager = app.otherElements["local-media-pager"]
+        for attempt in 1...2 {
+            XCTAssertTrue(bubble.isHittable)
+            let openingStarted = ProcessInfo.processInfo.systemUptime
+            bubble.tap()
+            // 等待容器而不是已解码图片；否则会跳过要检测的黑底冷加载窗口。
+            XCTAssertTrue(pager.waitForExistence(timeout: 1))
+            let cold = app.screenshot()
+            let elapsed = ProcessInfo.processInfo.systemUptime - openingStarted
+            attach(cold, "image-preview-cold-decode-\(attempt)")
+            let timing = XCTAttachment(string: "attempt=\(attempt) captureSeconds=\(elapsed) window=\(app.frame)")
+            timing.name = "image-preview-cold-timing-\(attempt)"
+            timing.lifetime = .keepAlways
+            add(timing)
+            XCTAssertLessThan(elapsed, 2.8, "必须在三秒全图延迟结束前采样，不能等待清晰图掩盖黑屏")
+            let center = CGRect(x: app.frame.minX + app.frame.width * 0.15,
+                                y: app.frame.midY - app.frame.height * 0.08,
+                                width: app.frame.width * 0.7, height: app.frame.height * 0.16)
+            let pixels = try coverage(cold, rect: center)
+            XCTAssertGreaterThan(pixels.blue, 0.55, "冷解码期间必须实际显示原消息缩略图，不能只有黑屏 UIImageView")
+            XCTAssertGreaterThan(pixels.yellow, 0.05, "冷解码期间保留同一张合成图片的黄色竖条")
+            XCTAssertFalse(app.activityIndicators.allElementsBoundByIndex.contains { $0.exists && $0.isHittable },
+                           "已有缩略图时不应覆盖黑屏 spinner")
+            XCTAssertTrue(preview.exists)
+            preview.tap()
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "exists == false"), object: preview)], timeout: 5), .completed)
+            XCTAssertTrue(bubble.isHittable)
+            attach(app.screenshot(), "image-preview-returned-to-thumbnail-\(attempt)")
+        }
+        #else
+        throw XCTSkip("仅模拟器合成图片和显式解码延迟，不读取真实图片或请求网络")
+        #endif
     }
 
     func testImagePreviewUsesTheWholeScreen() throws {

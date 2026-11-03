@@ -621,10 +621,10 @@ int main(int argc, char** argv) {
 #endif
 
     httplib::Server server;
+    std::atomic<bool> sawSteeringInput{false};
     // 本地假模型端点核对 Agent 发出的请求体，并返回可控的流式事件。
     // 测试只连环回地址，不会向真实模型供应商提交任务。
-    server.Post("/chat/completions", [](const httplib::Request& request,
-                                        httplib::Response& response) {
+    server.Post("/chat/completions", [&](const httplib::Request& request, httplib::Response& response) {
         const Json body = Json::parse(request.body);
         CHECK(request.get_header_value("Authorization") == "Bearer test-key");
         CHECK(body["messages"].front()["role"] == "system");
@@ -704,7 +704,8 @@ int main(int argc, char** argv) {
                 hasMaiChatBroadcast = true;
             if (tool["function"]["name"] == "mobile_list_photos") hasMobilePhotos = true;
             if (tool["function"]["name"] == "mobile_take_photo" ||
-                tool["function"]["name"] == "maichat_camera_command") hasCamera = true;
+                tool["function"]["name"] == "maichat_camera_command")
+                hasCamera = true;
             if (tool["function"]["name"] == "mobile_play_local_music") hasLocalMusic = true;
             if (tool["function"]["name"] == "mobile_list_albums") hasMobileAlbums = true;
             if (tool["function"]["name"] == "mobile_read_photo") hasMobilePhotoRead = true;
@@ -792,6 +793,7 @@ int main(int argc, char** argv) {
             response.set_content(R"({"error":{"message":"quota exhausted"}})", "application/json");
             return;
         }
+        if (input == "steer-adjustment") sawSteeringInput = true;
         if (input == "file_write") {
             Json invocation = {
                 {"index", 0},
@@ -1166,6 +1168,38 @@ int main(int argc, char** argv) {
         });
         CHECK(call(agent, {{"op", "stop"}, {"session", session}})["ok"] == true);
         wait([](const Json& s) { return s["busy"] == false; });
+
+        // 真正经过 C ABI、SQLite 和本地假 HTTP 模型，不能只断言按钮或请求被接收。
+        const auto steerStarted = call(agent, {{"op", "send"}, {"session", session}, {"text", "stop"}});
+        CHECK(steerStarted["ok"] == true);
+        const std::string targetTurn = steerStarted.at("id");
+        const auto steeringBusy =
+            wait([](const Json& s) { return s["busy"] == true && !s["messages"].back()["parts"].empty(); });
+        CHECK(steeringBusy.at("turnId") == targetTurn);
+        CHECK(call(agent, {{"op", "remote_snapshot"}, {"session", session}}).at("turnId") == targetTurn);
+        CHECK(call(agent, {{"op", "send"}, {"session", session}, {"text", "busy-send"}})["ok"] == false);
+        const Json steerRequest{{"op", "steer"},
+                                {"session", session},
+                                {"turnId", targetTurn},
+                                {"requestId", "cabi-steer-one"},
+                                {"text", "steer-adjustment"}};
+        const auto acceptedSteering = call(agent, steerRequest);
+        CHECK(acceptedSteering.at("ok") == true);
+        CHECK(call(agent, steerRequest).at("id") == acceptedSteering.at("id"));
+        Json changedSteering = steerRequest;
+        changedSteering["text"] = "different payload";
+        CHECK(call(agent, changedSteering).at("ok") == false);
+        auto steered = wait([](const Json& s) { return s["busy"] == false; });
+        CHECK(sawSteeringInput.load());
+        CHECK(steered.at("turnId") == "");
+        CHECK(call(agent, steerRequest).at("id") == acceptedSteering.at("id"));
+        Json idleSteering = steerRequest;
+        idleSteering["requestId"] = "cabi-steer-idle";
+        CHECK(call(agent, idleSteering).at("ok") == false);
+        int acceptedUsers = 0;
+        for (const auto& message : steered.at("messages"))
+            if (message.at("id") == acceptedSteering.at("id")) ++acceptedUsers;
+        CHECK(acceptedUsers == 1);
         CHECK(call(agent, {{"op", "send"}, {"session", session}, {"text", "error"}})["ok"] == true);
         auto failure = wait([](const Json& s) { return s["busy"] == false; });
         CHECK(failure["error"].get<std::string>().find("quota exhausted") != std::string::npos);
