@@ -24,6 +24,7 @@
 #include <QStandardPaths>
 #include <QThread>
 #include <QUrl>
+#include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include "im/DynamicTimSdkApi.h"
@@ -545,6 +546,8 @@ void TimSdkRemoteIMClient::connectToService(int sdkAppId, const QString& userId,
     mai_download_cancel_request(downloadsCanceled_.get());
     downloadsCanceled_.reset(mai_download_cancel_create(), mai_download_cancel_destroy);
     currentUserId_ = userId.trimmed();
+    selfDisplayName_.clear();
+    selfAvatarUrl_.clear();
     sdkAppId_ = static_cast<quint64>(sdkAppId);
     const quint64 profileSession = ++profileSession_;
 
@@ -634,6 +637,59 @@ void TimSdkRemoteIMClient::disconnectFromService(RemoteIMCompletion completion) 
             complete(std::move(completion), code, description);
             emit disconnected();
         });
+}
+
+void TimSdkRemoteIMClient::setSelfAvatar(const QString &avatarUrl, RemoteIMCompletion completion,
+                                         std::function<bool()> canCommit) {
+    const QUrl url(avatarUrl);
+    if (!connected_ || !api_ || currentUserId_.isEmpty() || !url.isValid() ||
+        url.scheme() != QStringLiteral("https") || url.host().isEmpty() ||
+        !url.userInfo().isEmpty() || !url.query().isEmpty() || !url.fragment().isEmpty() ||
+        (canCommit && !canCommit())) {
+        if (completion) completion(false, QStringLiteral("头像地址无效或 IM 未连接"));
+        return;
+    }
+    const QPointer<TimSdkRemoteIMClient> self(this);
+    const auto account = currentAccount();
+    const quint64 session = profileSession_;
+    if (!completion) completion = [](bool, const QString &) {};
+    auto callback = std::make_shared<RemoteIMCompletion>(std::move(completion));
+    // 同步返回、异步回执与超时只能完成一次；旧登录的回执不能发布到新资料。
+    auto finish = [self, account, session, avatarUrl, callback, canCommit](int code) {
+        if (!self) return;
+        QMetaObject::invokeMethod(
+            self,
+            [self, account, session, avatarUrl, callback, canCommit, code] {
+                if (!self || !*callback) return;
+                auto done = std::move(*callback);
+                *callback = {};
+                if (!self->connected_ || self->currentAccount() != account ||
+                    self->profileSession_ != session || (canCommit && !canCommit())) {
+                    done(false, QStringLiteral("账号已变化，头像更新结果未发布"));
+                    return;
+                }
+                if (code != 0) {
+                    done(false, QStringLiteral("IM 头像更新失败或超时"));
+                    return;
+                }
+                ++self->selfProfileRevision_;
+                self->selfAvatarUrl_ = avatarUrl;
+                emit self->selfProfileReceived(self->currentUserId_,
+                                               self->selfDisplayName_.isEmpty()
+                                                   ? self->currentUserId_
+                                                   : self->selfDisplayName_,
+                                               avatarUrl);
+                done(true, {});
+            },
+            Qt::AutoConnection);
+    };
+    QJsonObject profile;
+    profile[QStringLiteral("user_profile_item_face_url")] = avatarUrl;
+    const int accepted =
+        api_->modifySelfProfile(compactJson(profile), [finish](int code, const QString &,
+                                                               const QString &) { finish(code); });
+    if (accepted != 0) finish(accepted);
+    QTimer::singleShot(15000, this, [finish] { finish(-1); });
 }
 
 void TimSdkRemoteIMClient::deleteContact(const QString& userId, RemoteIMCompletion completion) {
@@ -1373,11 +1429,15 @@ void TimSdkRemoteIMClient::handleSelfProfilePayload(const QString& payload) {
         const QJsonObject profile = value.toObject();
         const QString userId = profile.value(QStringLiteral("user_profile_identifier")).toString();
         if (userId != currentUserId_) continue;
-        const QString name = profile.value(QStringLiteral("user_profile_nick_name")).toString();
+        // 自资料推送可能只含变化字段；头像变化不能顺便清空昵称，反之亦然。
+        if (profile.contains(QStringLiteral("user_profile_nick_name")))
+            selfDisplayName_ = profile.value(QStringLiteral("user_profile_nick_name")).toString();
+        if (profile.contains(QStringLiteral("user_profile_face_url")))
+            selfAvatarUrl_ = profile.value(QStringLiteral("user_profile_face_url")).toString();
         qInfo() << "[im] self profile updated; has avatar:"
                 << !profile.value(QStringLiteral("user_profile_face_url")).toString().isEmpty();
-        emit selfProfileReceived(userId, name.isEmpty() ? userId : name,
-                                 profile.value(QStringLiteral("user_profile_face_url")).toString());
+        emit selfProfileReceived(userId, selfDisplayName_.isEmpty() ? userId : selfDisplayName_,
+                                 selfAvatarUrl_);
     }
 }
 

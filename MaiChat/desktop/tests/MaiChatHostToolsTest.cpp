@@ -21,6 +21,7 @@ class MaiChatHostToolsTest : public QObject {
 private slots:
   void registersMaiChatReadAndWriteTools();
   void nicknameToolUsesTheAccountUpdater();
+  void accountToolsExposeOnlyPublicProfileAndGateAvatarWrites();
   void readsContactsMessagesSearchAndUnreadState();
   void sendsAndRepliesOnlyThroughApprovalGatedTools();
   void sendsAgentImageAsPersistentMediaMessage();
@@ -36,9 +37,9 @@ void MaiChatHostToolsTest::registersMaiChatReadAndWriteTools() {
   registerMaiChatHostTools(registry, app);
 
   for (const char *name :
-       {"maichat_list_contacts", "maichat_request_friend", "maichat_set_nickname", "maichat_change_password",
-        "maichat_list_conversations",
-        "maichat_get_messages", "maichat_search_messages",
+       {"maichat_list_contacts", "maichat_request_friend", "maichat_set_nickname",
+        "maichat_change_password", "maichat_get_current_account", "maichat_set_avatar",
+        "maichat_list_conversations", "maichat_get_messages", "maichat_search_messages",
         "maichat_get_unread_summary", "maichat_send_text", "maichat_send_media",
         "maichat_reply_message", "maichat_broadcast_text", "maichat_list_groups",
         "maichat_create_group", "maichat_get_group_messages", "maichat_send_group_text"}) {
@@ -67,6 +68,56 @@ void MaiChatHostToolsTest::registersMaiChatReadAndWriteTools() {
   QVERIFY(!registry.find("maichat_get_group_messages")->requiresApproval("{}"));
   QVERIFY(registry.find("maichat_create_group")->requiresPerCallApproval("{}"));
   QVERIFY(registry.find("maichat_send_group_text")->requiresPerCallApproval("{}"));
+}
+
+void MaiChatHostToolsTest::accountToolsExposeOnlyPublicProfileAndGateAvatarWrites() {
+  auto client = std::make_unique<FakeRemoteIMClient>();
+  auto *fake = client.get();
+  RemoteIMApplication app(QStringLiteral("owner"), std::move(client));
+  MaiToolRegistry registry;
+  registerMaiChatHostTools(registry, app);
+  MaiToolContext context;
+  auto *get = registry.find("maichat_get_current_account");
+  auto *set = registry.find("maichat_set_avatar");
+  QVERIFY(get && set);
+  QVERIFY(!get->requiresApproval("{}"));
+  QVERIFY(set->requiresApproval(R"({"path":"avatar.png"})"));
+  QVERIFY(set->requiresPerCallApproval(R"({"path":"avatar.png"})"));
+  const auto loggedOut = get->execute("{}", context);
+  QVERIFY(!loggedOut.hasError());
+  const auto empty =
+      QJsonDocument::fromJson(QByteArray::fromStdString(loggedOut.output())).object();
+  QCOMPARE(empty.size(), 1);
+  QCOMPARE(empty.value(QStringLiteral("logged_in")).toBool(), false);
+  app.setAccountProfileProvider([] {
+    return RemoteIMApplication::AccountProfile{true,
+                                               QStringLiteral("public-account"),
+                                               QStringLiteral("owner"),
+                                               QStringLiteral("Account name"),
+                                               QStringLiteral("138****0000"),
+                                               {}};
+  });
+  app.connectToService(123456, QStringLiteral("synthetic-im-credential"));
+  fake->setSelfAvatar(QStringLiteral("https://example.invalid/avatar/immutable.jpg"), {});
+  const auto response = get->execute("{}", context);
+  QVERIFY(!response.hasError());
+  const auto profile =
+      QJsonDocument::fromJson(QByteArray::fromStdString(response.output())).object();
+  QCOMPARE(profile.size(), 6);
+  QCOMPARE(profile.value(QStringLiteral("account_id")).toString(),
+           QStringLiteral("public-account"));
+  QCOMPARE(profile.value(QStringLiteral("im_user_id")).toString(), QStringLiteral("owner"));
+  QCOMPARE(profile.value(QStringLiteral("nickname")).toString(), QStringLiteral("Account name"));
+  QCOMPARE(profile.value(QStringLiteral("phone_masked")).toString(), QStringLiteral("138****0000"));
+  QCOMPARE(profile.value(QStringLiteral("avatar_url")).toString(), fake->lastAvatarUrl());
+  QVERIFY(!QByteArray::fromStdString(response.output()).contains("synthetic-im-credential"));
+  app.setAccountProfileProvider([] {
+    return RemoteIMApplication::AccountProfile{
+        true, QStringLiteral("another-account"), QStringLiteral("other-im-user"), {}, {}, {}};
+  });
+  const auto switched = get->execute("{}", context);
+  QCOMPARE(QJsonDocument::fromJson(QByteArray::fromStdString(switched.output())).object().size(),
+           1);
 }
 
 void MaiChatHostToolsTest::groupToolsUseTheSameApplicationFlowAndApprovalRules() {

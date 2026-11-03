@@ -39,6 +39,7 @@ public final class MaiChatHostTools {
     }
 
     public void onDestroy() {
+        im.onDestroy();
         pdfPasswords.onDestroy();
         MaiCloudDriveAgentTools.cancelAll(activity);
         browser.onDestroy();

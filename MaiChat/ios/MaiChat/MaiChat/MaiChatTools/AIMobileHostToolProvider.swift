@@ -36,6 +36,9 @@ final class AIMobileHostToolProvider {
 
     weak var appState: RemoteIMAppState?
     private var smsDelegate: AITextMessageDelegate?
+    // 取消通知可先于上传 Task 到达；唯一请求 ID 的有界墓碑避免随后开始副作用。
+    private var canceledAvatarIDs = Set<String>()
+    private var canceledAvatarOrder: [String] = []
 
     /// 校验 Agent 工具名与参数，再分派到对应 iOS 宿主能力。
     /// 所有失败分支返回明确错误码；播放器和媒体工具不得把仅受理误报为完成。
@@ -52,6 +55,66 @@ final class AIMobileHostToolProvider {
         }
 
         switch name {
+        case "maichat_cancel_avatar":
+            guard let id = arguments["request_id"] as? String, !id.isEmpty, id.count <= 160 else {
+                return .failure(code: "invalid_input", message: "avatar cancellation requires its internal request ID")
+            }
+            if appState?.cancelAvatarMutation(requestID: id) != true {
+                if canceledAvatarIDs.insert(id).inserted { canceledAvatarOrder.append(id) }
+                while canceledAvatarOrder.count > 128 {
+                    canceledAvatarIDs.remove(canceledAvatarOrder.removeFirst())
+                }
+            }
+            return Self.jsonSuccess(["accepted": true])
+        case "maichat_get_current_account":
+            guard Set(arguments.keys).isSubset(of: ["workspace_path", "session_id"]) else {
+                return .failure(code: "invalid_input", message: "current account query takes no model arguments")
+            }
+            guard Self.accountWorkspaceMatches(arguments) else {
+                return .failure(code: "canceled", message: "account workspace changed")
+            }
+            return Self.jsonSuccess(appState?.currentAccountProfile().toolOutput ?? ["logged_in": false])
+        case "maichat_set_avatar":
+            guard Set(arguments.keys).isSubset(of: ["path", "workspace_path", "session_id", "request_id"]),
+                  let path = arguments["path"] as? String, !path.isEmpty else {
+                return .failure(code: "invalid_input", message: "provide one workspace image path")
+            }
+            let requestID = arguments["request_id"] as? String
+            if arguments["request_id"] != nil && (requestID == nil || requestID!.isEmpty || requestID!.count > 160) {
+                return .failure(code: "invalid_input", message: "invalid internal avatar request ID")
+            }
+            if let requestID, canceledAvatarIDs.contains(requestID) {
+                return .failure(code: "canceled", message: "avatar update was canceled before it started")
+            }
+            guard Self.accountWorkspaceMatches(arguments), let appState, appState.hasUnifiedAccount else {
+                return .failure(code: "not_configured", message: "sign in to the account that owns this workspace")
+            }
+            guard let source = AIAssistantPathPolicy.resolve(path,
+                    workspacePath: AIAssistantModel.shared.workspacePath),
+                  source.path.hasPrefix(URL(fileURLWithPath: AIAssistantModel.shared.workspacePath)
+                    .resolvingSymlinksInPath().standardizedFileURL.path + "/"),
+                  FileManager.default.fileExists(atPath: source.path) else {
+                return .failure(code: "not_found", message: "avatar image must exist inside the current workspace")
+            }
+            do {
+                let url = try await appState.changeSelfAvatar(fileURL: source, requestID: requestID)
+                return Self.jsonSuccess(["updated": true, "avatar_url": url])
+            } catch is CancellationError {
+                return .failure(code: "canceled", message: "avatar update was canceled")
+            } catch let error as MaiChatAvatarError {
+                let code: String
+                switch error {
+                case .signInRequired, .imUnavailable: code = "not_configured"
+                case .accountChanged: code = "canceled"
+                case .busy: code = "busy"
+                case .invalidImage, .inputTooLarge: code = "invalid_input"
+                case .network: code = "network"
+                case .invalidResponse, .sdkRejected: code = "internal"
+                }
+                return .failure(code: code, message: error.localizedDescription)
+            } catch {
+                return .failure(code: "invalid_input", message: "avatar image could not be prepared")
+            }
         case "maichat_change_password":
             // 密码不属于 Agent 参数/历史：宿主只打开本地安全页或查询无凭据状态。
             guard Set(arguments.keys).isSubset(of: ["action", "request_id"]),
@@ -660,6 +723,15 @@ final class AIMobileHostToolProvider {
               let object = try? JSONSerialization.jsonObject(with: data),
               let arguments = object as? [String: Any] else { return nil }
         return arguments
+    }
+
+    // 工具上下文来自 C++ factory，而不是模型参数；旧账号的延迟回调不能读取新账号资料。
+    private static func accountWorkspaceMatches(_ arguments: [String: Any]) -> Bool {
+        guard let supplied = arguments["workspace_path"] else { return true }
+        guard let path = supplied as? String, !path.isEmpty,
+              !AIAssistantModel.shared.workspacePath.isEmpty else { return false }
+        return URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL ==
+            URL(fileURLWithPath: AIAssistantModel.shared.workspacePath).resolvingSymlinksInPath().standardizedFileURL
     }
 
     private static func cloudDriveFailure(_ error: Error) -> AIMaiChatHostToolExecution {

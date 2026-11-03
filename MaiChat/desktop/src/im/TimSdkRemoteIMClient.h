@@ -29,6 +29,8 @@ public:
     void deleteContact(const QString& userId, RemoteIMCompletion completion) override;
     void requestFriend(const QString& userId, RemoteIMCompletion completion) override;
     void refreshFriendList() override;
+    void setSelfAvatar(const QString &avatarUrl, RemoteIMCompletion completion,
+                       std::function<bool()> canCommit = {}) override;
     void joinedGroups(RemoteIMGroupsCompletion completion) override;
     void createGroup(const QString& name, const QStringList& memberIds,
                      RemoteIMGroupCompletion completion) override;
@@ -120,6 +122,8 @@ private:
     QByteArray attachmentCaPem_;
     std::shared_ptr<MaiDownloadCancel> downloadsCanceled_;
     QString currentUserId_;
+    QString selfDisplayName_;
+    QString selfAvatarUrl_;
     // AccountTag 的另一半。以前没存过——只有连接日志里出现过一次。
     quint64 sdkAppId_ = 0;
     QHash<QString, qint64> orderedSecondByPeer_;

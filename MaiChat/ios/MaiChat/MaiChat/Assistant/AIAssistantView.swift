@@ -1239,6 +1239,7 @@ private struct AIAssistantMessageList: View {
                 welcomeFeature("相册管理", icon: "photo.on.rectangle")
                 welcomeFeature("我的云盘", icon: "icloud")
                 welcomeFeature("MaiChat 消息", icon: "bubble.left.and.bubble.right")
+                welcomeFeature("账号资料与头像", icon: "person.crop.circle")
                 welcomeFeature("手机通讯录", icon: "person.2")
                 welcomeFeature("拨号与发短信", icon: "phone.arrow.up.right")
                 welcomeFeature("跨设备会话", icon: "iphone.and.arrow.forward")

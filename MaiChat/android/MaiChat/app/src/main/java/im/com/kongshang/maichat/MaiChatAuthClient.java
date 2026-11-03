@@ -81,6 +81,30 @@ public final class MaiChatAuthClient {
         }
     }
 
+    /** 公开账号资料快照；不携带手机号原文、令牌或 IM 签名。 */
+    public static final class AccountProfile {
+        public final String accountId, imUserId, nickname, phoneMasked;
+        private final boolean includesPhoneMasked;
+
+        AccountProfile(JSONObject user) throws Exception {
+            accountId = user.getString("id");
+            imUserId = user.getString("im_user_id");
+            nickname = optionalProfileString(user, "nickname");
+            phoneMasked = optionalProfileString(user, "phone_masked");
+            includesPhoneMasked = user.has("phone_masked");
+            if (accountId.isEmpty() || imUserId.isEmpty())
+                throw new IOException("账号资料无效");
+        }
+
+        private AccountProfile(String accountId, String imUserId, String nickname, String phoneMasked) {
+            this.accountId = accountId;
+            this.imUserId = imUserId;
+            this.nickname = nickname == null || nickname.isEmpty() ? null : nickname;
+            this.phoneMasked = phoneMasked == null || phoneMasked.isEmpty() ? null : phoneMasked;
+            includesPhoneMasked = true;
+        }
+    }
+
     public static final class FriendInfo {
         public final String accountId;
         public final String nickname;
@@ -242,9 +266,13 @@ public final class MaiChatAuthClient {
     private static final String STORED_REFRESH = "refresh";
     private static final String STORED_ACCOUNT_ID = "account_id";
     private static final String STORED_NICKNAME = "nickname";
+    private static final String STORED_PHONE_MASKED = "phone_masked";
+    private static final String STORED_IM_USER_ID = "im_user_id";
     private final SharedPreferences preferences;
     private String accessToken = "";
     private long accessExpiresAt;
+    // 刷新 access token 保持代际；退出或重新登录（包括同账号）立即使旧头像任务失效。
+    private volatile long accountSessionGeneration;
     private volatile SessionTerminationListener terminationListener;
     private final boolean tablet;
     private long asrLoginGeneration;
@@ -274,12 +302,68 @@ public final class MaiChatAuthClient {
         return preferences.getString(STORED_NICKNAME, "");
     }
 
+    public String phoneMasked() { return preferences.getString(STORED_PHONE_MASKED, null); }
+    public long accountSessionGeneration() { return accountSessionGeneration; }
+
+    /** 纯本地快照，不刷新令牌、不请求 auth/me，也不要求网络可用。 */
+    public synchronized AccountProfile currentAccountProfile(
+            String expectedAccountId, long expectedGeneration) throws Exception {
+        requireAccountIdentity(expectedAccountId, expectedGeneration);
+        return new AccountProfile(accountId(), preferences.getString(STORED_IM_USER_ID, ""),
+            nickname(), phoneMasked());
+    }
+
+    /** 上传凭据仅供普通头像服务使用，调用方不得序列化到工具结果。 */
+    public synchronized MediaServiceAccess avatarServiceAccess(
+            String expectedAccountId, long expectedGeneration) throws Exception {
+        requireAccountSession(expectedAccountId, expectedGeneration);
+        MediaServiceAccess access = mediaServiceAccess();
+        requireAccountSession(expectedAccountId, expectedGeneration);
+        if (access == null) throw new IOException("请先登录 MaiChat 账号");
+        return access;
+    }
+
+    private void requireAccountSession(String expectedAccountId, long expectedGeneration)
+            throws IOException {
+        requireAccountIdentity(expectedAccountId, expectedGeneration);
+        if (!hasSession()) throw new IOException("登录账号已变化，请重新操作");
+    }
+
+    private void requireAccountIdentity(String expectedAccountId, long expectedGeneration)
+            throws IOException {
+        if (expectedGeneration != accountSessionGeneration || expectedAccountId == null ||
+                expectedAccountId.isEmpty() || !expectedAccountId.equals(accountId()))
+            throw new IOException("登录账号已变化，请重新操作");
+    }
+
+    static String optionalProfileString(JSONObject user, String key) {
+        Object value = user.opt(key);
+        return value instanceof String && !((String) value).isEmpty() ? (String) value : null;
+    }
+
+    private void cacheAccountProfile(AccountProfile profile) {
+        cacheAccountProfile(profile, false);
+    }
+
+    // 仅接收已鉴权响应中的公开字段。refresh 的 publicUser 不含 phone_masked，不应删除
+    // auth/me 已同步的遮罩；显式 null、新登录或账号/IM 身份变化则清除上一份缓存。
+    synchronized void cacheAccountProfile(AccountProfile profile, boolean newLogin) {
+        String previousImUserId = preferences.getString(STORED_IM_USER_ID, "");
+        boolean sameOwner = profile.accountId.equals(accountId()) &&
+            (previousImUserId.isEmpty() || profile.imUserId.equals(previousImUserId));
+        String phoneMasked = !newLogin && sameOwner && !profile.includesPhoneMasked
+            ? phoneMasked() : profile.phoneMasked;
+        preferences.edit().putString(STORED_ACCOUNT_ID, profile.accountId)
+            .putString(STORED_IM_USER_ID, profile.imUserId)
+            .putString(STORED_NICKNAME, profile.nickname == null ? "" : profile.nickname)
+            .putString(STORED_PHONE_MASKED, phoneMasked).apply();
+    }
+
     public synchronized String refreshAccountId() throws Exception {
         JSONObject response = authenticatedRequest("auth/me", "GET", null);
         String id = response.getJSONObject("user").getString("id");
         if (id.isEmpty()) throw new IOException("MaiChat 账号 ID 不可用");
-        preferences.edit().putString(STORED_ACCOUNT_ID, id)
-            .putString(STORED_NICKNAME, nicknameFromUser(response.getJSONObject("user"))).apply();
+        cacheAccountProfile(new AccountProfile(response.getJSONObject("user")));
         return id;
     }
 
@@ -668,13 +752,14 @@ public final class MaiChatAuthClient {
     }
 
     private void clearLocalSession() {
+        accountSessionGeneration++;
         asrSession = null;
         asrLoginGeneration++;
         asrCredentials.activate("");
         accessToken = "";
         accessExpiresAt = 0;
         preferences.edit().remove(STORED_REFRESH).remove(STORED_ACCOUNT_ID)
-            .remove(STORED_NICKNAME).commit();
+            .remove(STORED_NICKNAME).remove(STORED_PHONE_MASKED).remove(STORED_IM_USER_ID).commit();
     }
 
     private String adopt(JSONObject session) throws Exception {
@@ -689,12 +774,12 @@ public final class MaiChatAuthClient {
         String accountId = user.getString("id");
         if (refresh.isEmpty() || access.isEmpty() || userId.isEmpty() || accountId.isEmpty())
             throw new IOException("登录服务返回的账号数据无效");
+        if (newLogin || !accountId.equals(accountId())) accountSessionGeneration++;
         writeRefreshToken(refresh);
         accessToken = access;
         accessExpiresAt = System.currentTimeMillis()
             + Math.max(0, session.getLong("expires_in") - 30) * 1000;
-        preferences.edit().putString(STORED_ACCOUNT_ID, accountId)
-            .putString(STORED_NICKNAME, nicknameFromUser(user)).apply();
+        cacheAccountProfile(new AccountProfile(user), newLogin);
         AsrSession previous = asrSession;
         boolean changed = newLogin || previous == null ||
             !previous.identity.startsWith(accountId + ":");
@@ -763,8 +848,7 @@ public final class MaiChatAuthClient {
 
     public synchronized void validateSession() throws Exception {
         JSONObject user = authenticatedRequest("auth/me", "GET", null).getJSONObject("user");
-        preferences.edit().putString(STORED_ACCOUNT_ID, user.getString("id"))
-            .putString(STORED_NICKNAME, nicknameFromUser(user)).apply();
+        cacheAccountProfile(new AccountProfile(user));
         prefetchRealtimeAsrCredential();
     }
 

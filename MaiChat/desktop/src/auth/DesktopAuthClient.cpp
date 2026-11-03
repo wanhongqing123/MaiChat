@@ -170,10 +170,19 @@ bool DesktopAuthClient::adoptSession(const QJsonObject& body, QString* error) {
     }
     accessToken_ = access;
     refreshToken_ = refresh;
+    const bool sameAccount = userId_ == userId && accountId_ == accountId;
     if (!userId_.isEmpty() && userId_ != userId) clearModelCredentials();
     userId_ = userId;
     accountId_ = accountId;
     nickname_ = nickname;
+    const QJsonObject user = body.value(QStringLiteral("user")).toObject();
+    if (!sameAccount) phoneMasked_.clear();
+    // login/refresh 的精简 user 通常省略手机号；同账号保留 /auth/me 已取到的遮罩。
+    // 明确 null、无效值或新账号则清除，不能把旧账号的号码附到新资料上。
+    if (user.contains(QStringLiteral("phone_masked"))) {
+        const QString phone = user.value(QStringLiteral("phone_masked")).toString();
+        phoneMasked_ = phone.contains(QLatin1Char('*')) ? phone : QString();
+    }
     accessExpiresAt_ = QDateTime::currentDateTimeUtc().addSecs(expiresIn);
     {
         QMutexLocker lock(&accountAccess_->mutex);
@@ -227,6 +236,7 @@ void DesktopAuthClient::clearLocalSession() {
     userId_.clear();
     accountId_.clear();
     nickname_.clear();
+    phoneMasked_.clear();
     imCredential_ = {};
     clearModelCredentials();
 }
@@ -492,36 +502,51 @@ void DesktopAuthClient::startSessionMonitoring() {
 void DesktopAuthClient::checkSessionNow() {
     if (!monitoringSession_ || livenessInFlight_ || userId_.isEmpty()) return;
     livenessInFlight_ = true;
+    const quint64 generation = accountGeneration_;
+    livenessAccountGeneration_ = generation;
     if (accessToken_.isEmpty() ||
         accessExpiresAt_ <= QDateTime::currentDateTimeUtc().addSecs(60)) {
-        refresh([this](bool ok, const QString&) {
-            livenessInFlight_ = false;
-            if (ok) checkSessionNow();
+        refresh([this, generation](bool ok, const QString &) {
+            if (livenessAccountGeneration_ == generation) livenessInFlight_ = false;
+            if (accountGeneration_ == generation && ok) checkSessionNow();
         });
         return;
     }
     const QString token = accessToken_;
     const QString userId = userId_;
     request(QStringLiteral("auth/me"), "GET", {}, token,
-            [this, token, userId](const HttpResult& result) {
-        livenessInFlight_ = false;
-        if (!monitoringSession_ || userId_ != userId || accessToken_ != token) return;
-        if (result.status == 401) {
-            invalidateSession(responseError(result));
-            return;
-        }
-        if (result.status != 200) return;
-        const QString checkedUserId = result.body.value(QStringLiteral("user"))
-                                          .toObject().value(QStringLiteral("im_user_id"))
-                                          .toString();
-        if (checkedUserId != userId_ ||
-            result.body.value(QStringLiteral("device_slot")).toString() != platformName()) {
-            invalidateSession(QStringLiteral("账号身份校验失败，请重新扫码登录"));
-            return;
-        }
-        nickname_ = result.body.value(QStringLiteral("user")).toObject()
-                        .value(QStringLiteral("nickname")).toString();
-    });
+            [this, token, userId, generation](const HttpResult &result) {
+                if (livenessAccountGeneration_ == generation) livenessInFlight_ = false;
+                if (accountGeneration_ != generation) return;
+                if (!monitoringSession_ || userId_ != userId || accessToken_ != token) return;
+                if (result.status == 401) {
+                    invalidateSession(responseError(result));
+                    return;
+                }
+                if (result.status != 200) return;
+                const QString checkedUserId = result.body.value(QStringLiteral("user"))
+                                                  .toObject()
+                                                  .value(QStringLiteral("im_user_id"))
+                                                  .toString();
+                if (checkedUserId != userId_ ||
+                    result.body.value(QStringLiteral("user"))
+                            .toObject()
+                            .value(QStringLiteral("id"))
+                            .toString() != accountId_ ||
+                    result.body.value(QStringLiteral("device_slot")).toString() != platformName()) {
+                    invalidateSession(QStringLiteral("账号身份校验失败，请重新扫码登录"));
+                    return;
+                }
+                nickname_ = result.body.value(QStringLiteral("user"))
+                                .toObject()
+                                .value(QStringLiteral("nickname"))
+                                .toString();
+                const QJsonObject user = result.body.value(QStringLiteral("user")).toObject();
+                if (user.contains(QStringLiteral("phone_masked"))) {
+                    const QString phone = user.value(QStringLiteral("phone_masked")).toString();
+                    phoneMasked_ = phone.contains(QLatin1Char('*')) ? phone : QString();
+                }
+            });
 }
 
 void DesktopAuthClient::restore(Completion completion) {

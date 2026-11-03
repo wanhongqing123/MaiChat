@@ -28,6 +28,7 @@
 
 #include "MaiTool.h"
 #include "MaiChangePasswordTool.h"
+#include "MaiAccountTools.h"
 #include "app/RemoteIMApplication.h"
 #include "model/MessageQuote.h"
 #include "model/MessageSearch.h"
@@ -762,6 +763,79 @@ void addTool(MaiToolRegistry &registry, HostToolKind kind, const char *name,
 // 桌面宿主工具按读写能力注册；有外部副作用的工具必须经过审批，名称与 Schema 供模型发现。
 void registerMaiChatHostTools(MaiToolRegistry &registry,
                               RemoteIMApplication &app) {
+  const QPointer<RemoteIMApplication> accountHost(&app);
+  registry.add(
+      makeMaiCurrentAccountTool([accountHost](const std::string &, const MaiToolContext &context) {
+        return onApplicationThread(accountHost, [&](RemoteIMApplication &application) {
+          if (context.isCanceled())
+            return MaiToolResult::failure(MaiErrorCode::Canceled, "account query was canceled");
+          const auto profile = application.currentAccountProfile();
+          if (!profile.loggedIn) return jsonResult({{QStringLiteral("logged_in"), false}});
+          auto nullable = [](const QString &value) {
+            return value.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(value);
+          };
+          return jsonResult({{QStringLiteral("logged_in"), true},
+                             {QStringLiteral("account_id"), profile.accountId},
+                             {QStringLiteral("im_user_id"), profile.imUserId},
+                             {QStringLiteral("nickname"), nullable(profile.nickname)},
+                             {QStringLiteral("phone_masked"), nullable(profile.phoneMasked)},
+                             {QStringLiteral("avatar_url"), nullable(profile.avatarUrl)}});
+        });
+      }));
+  registry.add(makeMaiSetAvatarTool([accountHost](const std::string &args,
+                                                  const MaiToolContext &context) {
+    QJsonObject arguments;
+    if (!parseObject(args, &arguments, nullptr))
+      return invalidInput(QStringLiteral("invalid avatar request"));
+    const QString path = arguments.value(QStringLiteral("path")).toString();
+    return onApplicationThread(accountHost, [&](RemoteIMApplication &application) {
+      struct Outcome {
+        bool done = false;
+        RemoteIMApplication::AvatarUpdateResult result;
+      };
+      auto outcome = std::make_shared<Outcome>();
+      auto canceled = std::make_shared<std::atomic_bool>(context.isCanceled());
+      QEventLoop loop;
+      const QPointer<QEventLoop> waiting(&loop);
+      application.updateAvatar(path, canceled, [outcome, waiting](const auto &result) {
+        outcome->done = true;
+        outcome->result = result;
+        if (waiting) waiting->quit();
+      });
+      if (!outcome->done) {
+        QTimer cancellation;
+        QObject::connect(&cancellation, &QTimer::timeout, &loop, [&] {
+          if (context.isCanceled()) canceled->store(true);
+        });
+        QObject::connect(&application, &QObject::destroyed, &loop, &QEventLoop::quit);
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        QObject::connect(&timeout, &QTimer::timeout, &loop, [&] {
+          canceled->store(true);
+          loop.quit();
+        });
+        cancellation.start(25);
+        timeout.start(92000);
+        loop.exec();
+      }
+      if (!outcome->done)
+        return MaiToolResult::failure(
+            MaiErrorCode::Internal,
+            "avatar update timed out; query the current account before retrying");
+      const auto &result = outcome->result;
+      if (result.updated)
+        return jsonResult(
+            {{QStringLiteral("updated"), true}, {QStringLiteral("avatar_url"), result.avatarUrl}});
+      const MaiErrorCode code =
+          result.errorCode == QStringLiteral("canceled")            ? MaiErrorCode::Canceled
+          : result.errorCode == QStringLiteral("invalid_image")     ? MaiErrorCode::InvalidInput
+          : result.errorCode == QStringLiteral("not_authenticated") ? MaiErrorCode::NotConfigured
+          : result.errorCode == QStringLiteral("busy")              ? MaiErrorCode::Busy
+                                                                    : MaiErrorCode::Internal;
+      return MaiToolResult::failure(code,
+                                    "avatar update failed: " + result.errorCode.toStdString());
+    });
+  }));
   registry.add(makeMaiChangePasswordTool(
       [host = QPointer<RemoteIMApplication>(&app)](const std::string& args, const MaiToolContext& context) {
         if (context.isCanceled())

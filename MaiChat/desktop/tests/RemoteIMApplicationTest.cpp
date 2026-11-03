@@ -2,6 +2,8 @@
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QFile>
 #include <QSignalSpy>
+#include <QImage>
+#include <QPainter>
 #include <QTemporaryDir>
 #include <QTest>
 #include <algorithm>
@@ -15,6 +17,8 @@ class RemoteIMApplicationTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void avatarPreparationCropsWithoutChangingOriginalAndRejectsOversizedInput();
+    void avatarUpdateRejectsCanceledOrInvalidAccountBeforeSdk();
     void friendRequestWaitsForRemoteAcceptance();
     void maiChatFriendListFiltersHistoryAndDeletionKeepsMessages();
     void activityIsIndependentFromContentAndExplicitStopClosesIt();
@@ -49,6 +53,93 @@ private slots:
     void mixedLocalAndServerGroupSequencesHaveStableOrder();
     void groupUnreadAndPreviewArriveBeforeLazyHistoryAndClearOnOpen();
 };
+
+void RemoteIMApplicationTest::
+    avatarPreparationCropsWithoutChangingOriginalAndRejectsOversizedInput() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("original.png"));
+    QImage original(1200, 600, QImage::Format_ARGB32);
+    original.fill(Qt::transparent);
+    {
+        QPainter painter(&original);
+        painter.fillRect(QRect(0, 0, 300, 600), Qt::red);
+        painter.fillRect(QRect(300, 0, 600, 600), Qt::green);
+        painter.fillRect(QRect(900, 0, 300, 600), Qt::blue);
+    }
+    QVERIFY(original.save(path, "PNG"));
+    QFile source(path);
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    const QByteArray before = source.readAll();
+    source.close();
+    const QByteArray prepared = RemoteIMApplication::prepareAvatarJpeg(path);
+    QVERIFY(prepared.startsWith(QByteArray::fromHex("ffd8")));
+    QVERIFY(prepared.size() < 2000000);
+    const QImage avatar = QImage::fromData(prepared, "JPEG");
+    QCOMPARE(avatar.size(), QSize(512, 512));
+    QVERIFY(!avatar.hasAlphaChannel());
+    for (const QPoint point : {QPoint(4, 4), QPoint(256, 256), QPoint(507, 507)}) {
+        const QColor color = avatar.pixelColor(point);
+        QVERIFY(color.green() > 240);
+        QVERIFY(color.red() < 15 && color.blue() < 15);
+    }
+    QVERIFY(source.open(QIODevice::ReadOnly));
+    QCOMPARE(source.readAll(), before);
+    source.close();
+    const QString large = directory.filePath(QStringLiteral("too-large.png"));
+    QFile oversized(large);
+    QVERIFY(oversized.open(QIODevice::WriteOnly));
+    QVERIFY(oversized.resize(20LL * 1024 * 1024 + 1));
+    oversized.close();
+    QVERIFY(RemoteIMApplication::prepareAvatarJpeg(large).isEmpty());
+    QVERIFY(RemoteIMApplication::prepareAvatarJpeg(directory.filePath(QStringLiteral("missing")))
+                .isEmpty());
+}
+
+void RemoteIMApplicationTest::avatarUpdateRejectsCanceledOrInvalidAccountBeforeSdk() {
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    auto *fake = client.get();
+    RemoteIMApplication app(QStringLiteral("owner"), std::move(client));
+    app.setAccountProfileProvider([] {
+        return RemoteIMApplication::AccountProfile{
+            true, QStringLiteral("public-account"), QStringLiteral("owner"), {}, {}, {}};
+    });
+    app.setAvatarAccessProvider([] {
+        return RemoteIMApplication::AvatarAccess{
+            QStringLiteral("public-account"), QStringLiteral("other-owner"),
+            QStringLiteral("test-generation"), QStringLiteral("invalid-local-fixture"),
+            QStringLiteral("test-token")};
+    });
+    app.connectToService(123456, QStringLiteral("test-sig"));
+    bool finished = false;
+    app.updateAvatar(QStringLiteral("missing.png"), {}, [&](const auto &result) {
+        finished = true;
+        QVERIFY(!result.updated);
+        QCOMPARE(result.errorCode, QStringLiteral("not_authenticated"));
+    });
+    QVERIFY(finished);
+    app.setAvatarAccessProvider([] {
+        return RemoteIMApplication::AvatarAccess{
+            QStringLiteral("public-account"), QStringLiteral("owner"),
+            QStringLiteral("test-generation"), QStringLiteral("invalid-local-fixture"),
+            QStringLiteral("test-token")};
+    });
+    finished = false;
+    app.updateAvatar(QStringLiteral("missing.png"), std::make_shared<std::atomic_bool>(true),
+                     [&](const auto &result) {
+                         finished = true;
+                         QVERIFY(!result.updated);
+                         QCOMPARE(result.errorCode, QStringLiteral("canceled"));
+                     });
+    QVERIFY(finished);
+    finished = false;
+    app.updateAvatar(QStringLiteral("missing.png"), {}, [&](const auto &result) {
+        finished = true;
+        QVERIFY(!result.updated);
+        QCOMPARE(result.errorCode, QStringLiteral("invalid_image"));
+    });
+    QTRY_VERIFY(finished);
+    QVERIFY(fake->lastAvatarUrl().isEmpty());
+}
 
 void RemoteIMApplicationTest::groupChatIsSeparateFromDirectMessagesAndSurvivesRestart() {
     QTemporaryDir dir;

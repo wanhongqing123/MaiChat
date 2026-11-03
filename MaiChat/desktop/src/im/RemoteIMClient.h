@@ -82,6 +82,14 @@ public:
         if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持好友申请"));
     }
     virtual void refreshFriendList() {}
+    // 普通资料更新入口；成功必须来自 SDK 回执，不能把排队当作已修改。
+    // canCommit 在 SDK 派发前及发布回执前检查原账号代际，不持有工具上下文裸指针。
+    virtual void setSelfAvatar(const QString &avatarUrl, RemoteIMCompletion completion,
+                               std::function<bool()> canCommit = {}) {
+        Q_UNUSED(avatarUrl);
+        Q_UNUSED(canCommit);
+        if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持修改头像"));
+    }
     virtual void joinedGroups(RemoteIMGroupsCompletion completion) {
         if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持群聊"), {});
     }

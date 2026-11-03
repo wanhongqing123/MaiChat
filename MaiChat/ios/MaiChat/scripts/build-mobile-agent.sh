@@ -31,6 +31,7 @@ cmake --build "$agent_build" --target maichat_mobile --parallel 6
 # The Swift C bridge calls this archive directly; ensure the dependency exists
 # before the complete set of static libraries is merged into the App archive.
 test -f "$agent_build/mai_network/libmai_screen_frame_archive.a"
+test -f "$agent_build/mai_network/libmai_avatar_client.a"
 cmake --build "$agent_build" --target maichat_ffplay_hosted --parallel 6
 hosted_source="$agent_build/libmaichat_ffplay_hosted.dylib"
 # OTHER_LDFLAGS 使用 DERIVED_FILE_DIR 下的链接路径；只更新 App Frameworks

@@ -11,9 +11,19 @@
 #include <memory>
 
 #include <QDir>
+#include <QBuffer>
+#include <QColorSpace>
+#include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
+#include <QFutureWatcher>
+#include <QImageReader>
 #include <QMimeDatabase>
+#include <QNetworkProxyFactory>
+#include <QNetworkProxyQuery>
+#include <QPainter>
 #include <QStandardPaths>
+#include <QtConcurrent/QtConcurrentRun>
 #include <stdexcept>
 #include <utility>
 #include <algorithm>
@@ -22,8 +32,84 @@
 #include "app/VideoCoverImage.h"
 #include "im/VideoFileMetadata.h"
 #include "remote/RemoteDesktopSignal.h"
+#include "MaiAvatarClient.h"
 
 namespace {
+
+struct AvatarUploadOutcome {
+    QString url;
+    QString error;
+};
+
+struct AvatarProxy {
+    QByteArray url;
+    QByteArray username;
+    QByteArray password;
+};
+
+// 只适配系统代理；签名、TLS、边界检查、取消与 PUT 均由三端共享上传核心实现。
+int resolveAvatarProxy(const char *location, void *context, MaiDownloadProxy *result) {
+    if (!location || !context || !result) return 0;
+    auto *storage = static_cast<AvatarProxy *>(context);
+    const QUrl url = QUrl::fromEncoded(QByteArray(location));
+    const auto proxies = QNetworkProxyFactory::systemProxyForQuery(QNetworkProxyQuery(url));
+    for (const auto &proxy : proxies) {
+        if (proxy.type() == QNetworkProxy::NoProxy) {
+            result->url_utf8 = "";
+            result->username_utf8 = nullptr;
+            result->password_utf8 = nullptr;
+            return 1;
+        }
+        if (proxy.type() != QNetworkProxy::HttpProxy && proxy.type() != QNetworkProxy::Socks5Proxy)
+            continue;
+        QUrl address;
+        address.setScheme(proxy.type() == QNetworkProxy::HttpProxy ? QStringLiteral("http")
+                                                                   : QStringLiteral("socks5h"));
+        address.setHost(proxy.hostName());
+        address.setPort(proxy.port());
+        storage->url = address.toEncoded();
+        storage->username = proxy.user().toUtf8();
+        storage->password = proxy.password().toUtf8();
+        result->url_utf8 = storage->url.constData();
+        result->username_utf8 = storage->username.constData();
+        result->password_utf8 = storage->password.constData();
+        return 1;
+    }
+    return 0;
+}
+
+AvatarUploadOutcome uploadAvatar(const QString &path,
+                                 const RemoteIMApplication::AvatarAccess &access,
+                                 const QByteArray &caPem,
+                                 const std::shared_ptr<MaiAvatarCancel> &canceled) {
+    const QByteArray bytes = RemoteIMApplication::prepareAvatarJpeg(path);
+    if (bytes.isEmpty()) return {{}, QStringLiteral("invalid_image")};
+    const QByteArray base = access.mediaBaseUrl.toUtf8();
+    const QByteArray token = access.accountToken.toUtf8();
+    const QByteArray account = access.accountId.toUtf8();
+    MaiAvatarOptions options{};
+    options.media_base_url_utf8 = base.constData();
+    options.account_token_utf8 = token.constData();
+    options.account_id_utf8 = account.constData();
+    options.ca_pem = caPem.isEmpty() ? nullptr : caPem.constData();
+    options.ca_pem_length = static_cast<size_t>(caPem.size());
+    options.connect_timeout_ms = 10000;
+    options.transfer_timeout_ms = 60000;
+    AvatarProxy proxy;
+    options.proxy_resolver = resolveAvatarProxy;
+    options.proxy_context = &proxy;
+    MaiAvatarResult response{};
+    mai_avatar_upload(&options, reinterpret_cast<const unsigned char *>(bytes.constData()),
+                      static_cast<size_t>(bytes.size()), "image/jpeg", canceled.get(), &response);
+    AvatarUploadOutcome result;
+    if (response.status == MAI_AVATAR_OK && response.avatar_url_utf8)
+        result.url = QString::fromUtf8(response.avatar_url_utf8);
+    else
+        result.error = response.status == MAI_AVATAR_CANCELED ? QStringLiteral("canceled")
+                                                              : QStringLiteral("upload_failed");
+    mai_avatar_result_free(&response);
+    return result;
+}
 
 // 分页启动：每会话只载最近一页，避免大历史全量进内存/上屏。
 constexpr int kMessagesPageSize = 200;
@@ -54,6 +140,46 @@ QString forwardedCaption(const RemoteIMMessage& message) {
 }
 
 }  // namespace
+
+QByteArray RemoteIMApplication::prepareAvatarJpeg(const QString &path) {
+    QFile source(path);
+    if (!source.open(QIODevice::ReadOnly) || source.size() <= 0 ||
+        source.size() > 20LL * 1024 * 1024)
+        return {};
+    QByteArray input = source.read(20LL * 1024 * 1024 + 1);
+    if (input.isEmpty() || input.size() > 20LL * 1024 * 1024) return {};
+    QBuffer inputBuffer(&input);
+    if (!inputBuffer.open(QIODevice::ReadOnly)) return {};
+    QImageReader reader(&inputBuffer);
+    reader.setAutoTransform(true);
+    const QSize size = reader.size();
+    // 解码前约束像素；在支持原生缩放的插件中直接解到头像尺寸，避免超大图驻留。
+    if (!size.isValid() || qint64(size.width()) * size.height() > 100LL * 1000 * 1000) return {};
+    QSize decodeSize = size.scaled(QSize(2048, 2048), Qt::KeepAspectRatio);
+    decodeSize.setWidth(qMax(1, decodeSize.width()));
+    decodeSize.setHeight(qMax(1, decodeSize.height()));
+    reader.setScaledSize(decodeSize);
+    QImage decoded = reader.read();
+    if (decoded.isNull()) return {};
+    if (decoded.colorSpace().isValid()) decoded.convertToColorSpace(QColorSpace::SRgb);
+    QImage image(QSize(512, 512), QImage::Format_RGB32);
+    image.setColorSpace(QColorSpace::SRgb);
+    image.fill(Qt::white);
+    {
+        QPainter painter(&image);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform);
+        // 先裁切再缩放，极宽/极高图片也不会产生庞大的中间放大图。
+        const int side = qMin(decoded.width(), decoded.height());
+        const QRect crop((decoded.width() - side) / 2, (decoded.height() - side) / 2, side, side);
+        painter.drawImage(image.rect(), decoded, crop);
+    }
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "JPEG", 88) || bytes.isEmpty() ||
+        bytes.size() > 2000000)
+        return {};
+    return bytes;
+}
 
 RemoteIMContact RemoteIMApplication::selfProfile() const {
     if (selfProfile_.userId == state_.ownerUserId()) return selfProfile_;
@@ -567,6 +693,7 @@ int RemoteIMApplication::loadEarlierMessages(const QString& peerId) {
 }
 
 void RemoteIMApplication::connectToService(int sdkAppId, const QString& userSig) {
+    ++connectionGeneration_;
     client_->connectToService(sdkAppId, state_.ownerUserId(), userSig, [this](bool ok, const QString& error) {
         connected_ = ok;
         emit connectionChanged(connected_);
@@ -581,6 +708,7 @@ void RemoteIMApplication::disconnectFromService(RemoteIMCompletion completion) {
     if (completion) disconnectCallbacks_.push_back(std::move(completion));
     if (disconnecting_) return;
     disconnecting_ = true;
+    ++connectionGeneration_;
     const QPointer<RemoteIMApplication> self(this);
     client_->disconnectFromService([self](bool ok, const QString& error) {
         if (!self) return;
@@ -650,6 +778,156 @@ void RemoteIMApplication::setAccountFriendOperations(AccountFriendOperations ope
 void RemoteIMApplication::setNicknameUpdater(
     std::function<void(const QString&, RemoteIMCompletion)> updater) {
     nicknameUpdater_ = std::move(updater);
+}
+
+void RemoteIMApplication::setAccountProfileProvider(std::function<AccountProfile()> provider) {
+    accountProfileProvider_ = std::move(provider);
+}
+
+RemoteIMApplication::AccountProfile RemoteIMApplication::currentAccountProfile() const {
+    AccountProfile result = accountProfileProvider_ ? accountProfileProvider_() : AccountProfile{};
+    if (!result.loggedIn || result.accountId.isEmpty() || result.imUserId != state_.ownerUserId())
+        return {};
+    // SDK 自资料推送同时覆盖本机修改与其它设备修改；不从鉴权响应臆造 faceURL。
+    result.avatarUrl = selfProfile_.avatarUrl;
+    return result;
+}
+
+void RemoteIMApplication::setAvatarAccessProvider(std::function<AvatarAccess()> provider) {
+    avatarAccessProvider_ = std::move(provider);
+}
+
+void RemoteIMApplication::updateAvatar(const QString &path,
+                                       std::shared_ptr<std::atomic_bool> canceled,
+                                       AvatarCompletion completion) {
+    const AccountProfile profile = currentAccountProfile();
+    const AvatarAccess access = avatarAccessProvider_ ? avatarAccessProvider_() : AvatarAccess{};
+    if (!profile.loggedIn || !connected_ || access.accountId != profile.accountId ||
+        access.imUserId != profile.imUserId || access.sessionIdentity.isEmpty() ||
+        access.mediaBaseUrl.isEmpty() || access.accountToken.isEmpty()) {
+        if (completion) completion({false, {}, QStringLiteral("not_authenticated")});
+        return;
+    }
+    if (!canceled) canceled = std::make_shared<std::atomic_bool>(false);
+    if (canceled->load()) {
+        if (completion) completion({false, {}, QStringLiteral("canceled")});
+        return;
+    }
+    // 一个账号宿主串行发布头像，避免两个已派发的 SDK 写入按相反顺序完成。
+    if (avatarUpdateInFlight_) {
+        if (completion) completion({false, {}, QStringLiteral("busy")});
+        return;
+    }
+    avatarUpdateInFlight_ = true;
+    struct Request {
+        std::shared_ptr<MaiAvatarCancel> uploadCancel{mai_avatar_cancel_create(),
+                                                      mai_avatar_cancel_destroy};
+        std::shared_ptr<std::atomic_bool> canceled;
+        AvatarCompletion completion;
+        QMetaObject::Connection destructionConnection;
+        QElapsedTimer elapsed;
+        bool finished = false;
+        bool sdkDispatched = false;
+    };
+    auto request = std::make_shared<Request>();
+    request->canceled = std::move(canceled);
+    request->completion = std::move(completion);
+    request->elapsed.start();
+    const quint64 connection = connectionGeneration_;
+    const quint64 update = ++avatarUpdateGeneration_;
+    const QPointer<RemoteIMApplication> self(this);
+    auto *poll = new QTimer(this);
+    const QPointer<QTimer> polling(poll);
+    auto identityMatches = [self, access, connection, update] {
+        if (!self || !self->connected_ || self->disconnecting_ ||
+            self->connectionGeneration_ != connection || self->avatarUpdateGeneration_ != update ||
+            !self->avatarAccessProvider_)
+            return false;
+        const AvatarAccess current = self->avatarAccessProvider_();
+        return current.accountId == access.accountId && current.imUserId == access.imUserId &&
+               current.sessionIdentity == access.sessionIdentity;
+    };
+    auto finish = [self, request, polling, update](const AvatarUpdateResult &result) {
+        if (request->finished) return;
+        request->finished = true;
+        QObject::disconnect(request->destructionConnection);
+        if (self && self->avatarUpdateGeneration_ == update) self->avatarUpdateInFlight_ = false;
+        mai_avatar_cancel_request(request->uploadCancel.get());
+        if (polling) {
+            polling->stop();
+            polling->deleteLater();
+        }
+        auto done = std::move(request->completion);
+        if (done) done(result);
+    };
+    connect(poll, &QTimer::timeout, this, [request, identityMatches, finish] {
+        if (!identityMatches()) finish({false, {}, QStringLiteral("identity_changed")});
+        else if (request->canceled->load() && !request->sdkDispatched)
+            finish({false, {}, QStringLiteral("canceled")});
+        else if (request->elapsed.elapsed() >= 90000)
+            finish({false, {}, QStringLiteral("timeout")});
+    });
+    poll->start(50);
+    // 句柄活到工作线程结束；App 销毁也先取消，后台任务不能持有 Qt 宿主裸指针。
+    request->destructionConnection = connect(this, &QObject::destroyed, [request] {
+        request->finished = true;
+        request->completion = {};
+        mai_avatar_cancel_request(request->uploadCancel.get());
+    });
+    QFile certificates(QStringLiteral(":/maichat/auth/cacert.pem"));
+    const QByteArray ca =
+        certificates.open(QIODevice::ReadOnly) ? certificates.readAll() : QByteArray{};
+    auto *watcher = new QFutureWatcher<AvatarUploadOutcome>(this);
+    connect(watcher, &QFutureWatcher<AvatarUploadOutcome>::finished, this,
+            [self, watcher, request, identityMatches, finish] {
+                const AvatarUploadOutcome uploaded = watcher->result();
+                watcher->deleteLater();
+                if (!self || request->finished) return;
+                if (!identityMatches()) {
+                    finish({false, {}, QStringLiteral("identity_changed")});
+                    return;
+                }
+                if (request->canceled->load()) {
+                    finish({false, {}, QStringLiteral("canceled")});
+                    return;
+                }
+                if (uploaded.url.isEmpty()) {
+                    finish({false, {}, uploaded.error});
+                    return;
+                }
+                // 最后一刻在 SDK 所属 GUI 线程再次检查原账号；上传成功不等于资料已发布。
+                self->client_->setSelfAvatar(
+                    uploaded.url,
+                    [self, request, identityMatches, finish, url = uploaded.url](bool ok,
+                                                                                 const QString &) {
+                        if (!self || request->finished) return;
+                        QMetaObject::invokeMethod(
+                            self,
+                            [request, identityMatches, finish, url, ok] {
+                                if (request->finished) return;
+                                if (!identityMatches())
+                                    finish({false, {}, QStringLiteral("identity_changed")});
+                                else
+                                    finish(ok ? AvatarUpdateResult{true, url, {}}
+                                              : AvatarUpdateResult{
+                                                    false,
+                                                    {},
+                                                    QStringLiteral("profile_update_failed")});
+                            },
+                            Qt::AutoConnection);
+                    },
+                    [request, identityMatches] {
+                        if (request->finished || !identityMatches() ||
+                            (!request->sdkDispatched && request->canceled->load()))
+                            return false;
+                        // SDK 派发后不能撤回远端资料修改；等待实际回执，避免成功后因取消改报失败。
+                        request->sdkDispatched = true;
+                        return true;
+                    });
+            });
+    watcher->setFuture(QtConcurrent::run([path, access, ca, request] {
+        return uploadAvatar(path, access, ca, request->uploadCancel);
+    }));
 }
 
 bool RemoteIMApplication::updateNickname(const QString& nickname,

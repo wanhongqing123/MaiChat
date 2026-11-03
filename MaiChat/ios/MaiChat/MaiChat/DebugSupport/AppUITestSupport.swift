@@ -380,7 +380,9 @@ enum MaiChatUITestSupport {
 private struct MaiChatSimulatorUITestEntry: View {
     var body: some View {
         if ProcessInfo.processInfo.arguments.contains("--ai-ui-test") {
-            if ProcessInfo.processInfo.arguments.contains("--app-bars-layout-ui-test") {
+            if ProcessInfo.processInfo.arguments.contains("--ai-account-tools-ui-test") {
+                AccountToolsUITestRoot()
+            } else if ProcessInfo.processInfo.arguments.contains("--app-bars-layout-ui-test") {
                 AppBarsLayoutUITestRoot()
             } else if ProcessInfo.processInfo.arguments.contains("--ai-screen-frames-ui-test") {
                 #if DEBUG

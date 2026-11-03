@@ -2125,7 +2125,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     // 空态仅介绍能力，处理和训练继续从用户会话需求进入。
                     TextView mobileTools = text(
                         "整屏截屏、浏览器操作、会话定时任务、系统日历、二维码生成、当前位置、系统联系人、"
-                            + "电话短信（依系统权限）、人像美颜、美体塑形、个人模型训练与跨设备会话。",
+                            + "电话短信（依系统权限）、人像美颜、美体塑形、个人模型训练、账号资料与头像、跨设备会话。",
                         14, MaiChatTheme.SECONDARY);
                     mobileTools.setGravity(Gravity.CENTER);
                     LayoutParams mobileToolParams = matchWrap();

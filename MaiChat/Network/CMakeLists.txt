@@ -31,6 +31,13 @@ target_include_directories(mai_video_circle_client PUBLIC "${CMAKE_CURRENT_SOURC
 target_link_libraries(mai_video_circle_client PUBLIC CURL::libcurl)
 set_target_properties(mai_video_circle_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(mai_avatar_client STATIC MaiAvatarClient.cpp)
+target_compile_features(mai_avatar_client PUBLIC cxx_std_17)
+target_include_directories(mai_avatar_client PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
+  PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party")
+target_link_libraries(mai_avatar_client PUBLIC CURL::libcurl)
+set_target_properties(mai_avatar_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 if(NOT MAI_OPENSSL_CRYPTO_TARGET)
   find_package(OpenSSL REQUIRED COMPONENTS Crypto)
   set(MAI_OPENSSL_CRYPTO_TARGET OpenSSL::Crypto)
@@ -83,6 +90,14 @@ if(MAICHAT_NETWORK_BUILD_TESTS)
     COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_video_circle_local_tls.py"
       "$<TARGET_FILE:mai_video_circle_client_test>")
+
+  add_executable(mai_avatar_client_test tests/MaiAvatarClientTest.cpp)
+  target_link_libraries(mai_avatar_client_test PRIVATE mai_avatar_client)
+  add_test(NAME mai_avatar_local_tls
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_avatar_local_tls.py"
+      "$<TARGET_FILE:mai_avatar_client_test>")
+  set_tests_properties(mai_avatar_local_tls PROPERTIES TIMEOUT 45)
 
   add_executable(mai_cloud_drive_client_test tests/MaiCloudDriveClientTest.cpp)
   target_include_directories(mai_cloud_drive_client_test PRIVATE

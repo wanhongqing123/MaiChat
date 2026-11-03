@@ -19,7 +19,7 @@ target_include_directories(maichat_agent PRIVATE
   ../../../../../../SessionSync
   ../../../../../../../MaiAgent/include)
 target_link_libraries(maichat_agent PRIVATE maichat_mobile mai_curl_download
-  mai_video_circle_client mai_cloud_drive_client mai_cloud_vod CURL::libcurl maichat_ffplay_hosted
+  mai_video_circle_client mai_cloud_drive_client mai_cloud_vod mai_avatar_client CURL::libcurl maichat_ffplay_hosted
   jnigraphics android log)
 if(TARGET maiagent_obs_gles)
   add_dependencies(maichat_agent maiagent_obs_gles)

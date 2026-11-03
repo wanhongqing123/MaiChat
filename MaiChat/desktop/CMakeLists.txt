@@ -2,7 +2,7 @@
 # 平台 SDK 和可选媒体能力由配置阶段检查；真实编译命令可导出给 clangd。
 cmake_minimum_required(VERSION 3.21)
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 2.2.33 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 2.2.34 LANGUAGES C CXX)
 if(MSVC AND CMAKE_CL_SHOWINCLUDES_PREFIX MATCHES "^娉")
   # Some CMake/VS2019 locale combinations double-decode /showIncludes. Ninja then
   # records no header dependencies, so changing a public header leaves stale objects.
@@ -471,6 +471,8 @@ add_library(remote_im_desktop_app
   src/MaiChatTools/MaiChatHostTools.cpp
   ../MaiChatTools/MaiChangePasswordTool.h
   ../MaiChatTools/MaiChangePasswordTool.cpp
+  ../MaiChatTools/MaiAccountTools.h
+  ../MaiChatTools/MaiAccountTools.cpp
   src/app/VideoCoverImage.h
   src/app/VideoCoverImage.cpp
 )
@@ -479,7 +481,7 @@ target_include_directories(remote_im_desktop_app PUBLIC src PRIVATE ../MaiChatTo
 # Qt5::Gui：视频封面要用 QImage/QPainter 画（并在 Windows 上把系统缩略图的 HBITMAP
 # 转成 QImage）。remote_im_core 保持无 GUI 依赖，封面这层留在应用层。
 target_link_libraries(remote_im_desktop_app PUBLIC remote_im_core Qt5::Gui maiagent
-  PRIVATE Qt5::Concurrent CURL::libcurl)
+  PRIVATE Qt5::Concurrent CURL::libcurl mai_avatar_client)
 if(WIN32)
   # IShellItemImageFactory（资源管理器的缩略图提供程序）取视频首帧。
   target_link_libraries(remote_im_desktop_app PRIVATE shell32 ole32 Advapi32
@@ -1097,6 +1099,14 @@ target_include_directories(change_password_tool_test PRIVATE
   ../MaiChatTools ../../MaiAgent/include ../../MaiAgent/third_party/nlohmann)
 target_link_libraries(change_password_tool_test PRIVATE maiagent)
 add_test(NAME change_password_tool COMMAND change_password_tool_test)
+
+add_executable(account_tools_test
+  ../MaiChatTools/tests/MaiAccountToolsTest.cpp
+  ../MaiChatTools/MaiAccountTools.cpp)
+target_include_directories(account_tools_test PRIVATE
+  ../MaiChatTools ../../MaiAgent/include ../../MaiAgent/third_party/nlohmann)
+target_link_libraries(account_tools_test PRIVATE maiagent)
+add_test(NAME account_tools COMMAND account_tools_test)
 
 add_executable(mai_qr_code_test
   ../MaiChatTools/tests/MaiQrCodeTest.cpp

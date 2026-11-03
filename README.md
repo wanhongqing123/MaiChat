@@ -63,6 +63,13 @@ iOS Xcode 专有源文件通过 Clang 的 `-gen-cdb-fragment-path` 构建选项�
 
 ## 服务与凭据
 
+账号资料工具：`maichat_get_current_account` 读取当前登录账号的本机资料快照，返回公开
+MaiChat ID、IM ID、昵称、脱敏手机号及稳定头像地址；离线不等于退出，未知字段为 null。
+其中 `account_id` 对应「我 → 个人资料 → 账号」，用于添加好友；`im_user_id` 是内部聊天标识。
+`maichat_set_avatar` 接受 Agent 可访问的本地图片，规范化为 512×512 JPEG，经现有
+签名服务和客户端 OSS 直传后等待 IM 确认。它与普通头像服务共用实现，原图保留；
+昵称修改和安全密码入口继续使用已有工具。创作中心的能力列表仍是不可点击的说明。
+
 `services/auth`、`services/oss-media-signer`、`services/model-credentials`、`services/shared` 和 `services/integration` 共同实现并验证账号、素材及凭据流程，`services/legal` 提供法律文档。实际部署、证书、密钥、数据库和用户数据位于部署环境，迁移源码本身不会迁移或重启线上服务。发布或部署前分别阅读各服务的 README，验证环境配置、访问权限和已有客户端兼容性。
 
 模型和媒体请求由客户端直接访问供应商；服务端只承担账号鉴权、配置和临时凭据等控制面职责。长期密钥保存在服务端受控环境中，不写入客户端源码、安装包或日志。

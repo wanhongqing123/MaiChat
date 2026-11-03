@@ -1,9 +1,10 @@
 // 文件作用：Android JNI 桥接层；MaiAgentJni 负责 Java 与原生引擎之间的参数和生命周期转换，本文件给出其实现。
-// 直接依赖：MaiMobileAgent.h、MaiImageFilter.h；实现与这些接口协作。
+// 直接依赖：MaiMobileAgent.h、MaiImageFilter.h、MaiAvatarClient.h；头像 HTTP 上传复用共享 C ABI。
 #include "MaiMobileAgent.h"
 #include "MaiImageFilter.h"
 #include "MaiPortraitBridge.h"
 #include "MaiAndroidFileOperations.h"
+#include "MaiAvatarClient.h"
 #ifndef NDEBUG
 #include "MaiDownloadFileTool.h"
 #include "MaiFilePath.h"
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <jni.h>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -165,6 +167,136 @@ void hostToolContextRelease(void *opaque) {
 }
 
 } // namespace
+
+namespace {
+
+bool readAvatarBytes(JNIEnv* env, jbyteArray input, std::size_t maximum,
+                     std::vector<unsigned char>* output) {
+    if (input == nullptr) return false;
+    const jsize length = env->GetArrayLength(input);
+    if (length < 0 || static_cast<std::size_t>(length) > maximum) return false;
+    output->resize(static_cast<std::size_t>(length));
+    if (length > 0)
+        env->GetByteArrayRegion(input, 0, length, reinterpret_cast<jbyte*>(output->data()));
+    return !env->ExceptionCheck();
+}
+
+bool readAvatarText(JNIEnv* env, jbyteArray input, std::size_t maximum, std::string* output) {
+    std::vector<unsigned char> bytes;
+    if (!readAvatarBytes(env, input, maximum, &bytes) || bytes.empty()) return false;
+    output->assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    return output->find('\0') == std::string::npos;
+}
+
+void avatarFailure(JNIEnv* env, const char* message) {
+    if (env->ExceptionCheck()) return;
+    jclass type = env->FindClass("java/io/IOException");
+    if (type != nullptr) {
+        env->ThrowNew(type, message);
+        env->DeleteLocalRef(type);
+    }
+}
+
+struct AvatarProxyContext {
+    JNIEnv* env = nullptr;
+    jclass owner = nullptr;
+    jmethodID select = nullptr;
+    std::string route;
+};
+
+int resolveAvatarProxy(const char* url, void* opaque, MaiDownloadProxy* output) {
+    auto* proxy = static_cast<AvatarProxyContext*>(opaque);
+    jstring address = proxy->env->NewStringUTF(url);
+    if (address == nullptr) return 0;
+    auto selected = static_cast<jstring>(proxy->env->CallStaticObjectMethod(
+        proxy->owner, proxy->select, address));
+    proxy->env->DeleteLocalRef(address);
+    if (proxy->env->ExceptionCheck()) {
+        // 系统代理异常可能包含请求 URL；统一在头像入口返回固定错误，不向工具转发原文。
+        proxy->env->ExceptionClear();
+        return 0;
+    }
+    if (selected == nullptr) return 0;
+    const char* route = proxy->env->GetStringUTFChars(selected, nullptr);
+    if (route == nullptr) {
+        proxy->env->DeleteLocalRef(selected);
+        return 0;
+    }
+    proxy->route = route;
+    proxy->env->ReleaseStringUTFChars(selected, route);
+    proxy->env->DeleteLocalRef(selected);
+    output->url_utf8 = proxy->route.c_str();
+    output->username_utf8 = nullptr;
+    output->password_utf8 = nullptr;
+    return 1;
+}
+
+} // namespace
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_kongshang_maichat_MaiAccountAvatar_nativeCreateCancel(JNIEnv*, jclass) {
+    return reinterpret_cast<jlong>(mai_avatar_cancel_create());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_kongshang_maichat_MaiAccountAvatar_nativeRequestCancel(JNIEnv*, jclass, jlong handle) {
+    if (handle != 0) mai_avatar_cancel_request(reinterpret_cast<MaiAvatarCancel*>(handle));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_kongshang_maichat_MaiAccountAvatar_nativeDestroyCancel(JNIEnv*, jclass, jlong handle) {
+    if (handle != 0) mai_avatar_cancel_destroy(reinterpret_cast<MaiAvatarCancel*>(handle));
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_kongshang_maichat_MaiAccountAvatar_nativeUpload(
+    JNIEnv* env, jclass owner, jbyteArray base, jbyteArray token, jbyteArray accountId,
+    jbyteArray caPem, jbyteArray jpeg, jlong cancel) {
+    std::string baseText, tokenText, accountText;
+    std::vector<unsigned char> pemBytes, imageBytes;
+    if (cancel == 0 || !readAvatarText(env, base, 4096, &baseText) ||
+        !readAvatarText(env, token, 16 * 1024, &tokenText) ||
+        !readAvatarText(env, accountId, 256, &accountText) ||
+        !readAvatarBytes(env, caPem, 2 * 1024 * 1024, &pemBytes) ||
+        !readAvatarBytes(env, jpeg, 2'000'000, &imageBytes) ||
+        pemBytes.empty() || imageBytes.empty()) {
+        avatarFailure(env, "Avatar upload input is invalid");
+        return nullptr;
+    }
+    AvatarProxyContext proxy;
+    proxy.env = env;
+    proxy.owner = owner;
+    proxy.select = env->GetStaticMethodID(owner, "proxyForUrl",
+        "(Ljava/lang/String;)Ljava/lang/String;");
+    if (proxy.select == nullptr) return nullptr;
+    MaiAvatarOptions options{};
+    options.media_base_url_utf8 = baseText.c_str();
+    options.account_token_utf8 = tokenText.c_str();
+    options.account_id_utf8 = accountText.c_str();
+    options.ca_pem = reinterpret_cast<const char*>(pemBytes.data());
+    options.ca_pem_length = pemBytes.size();
+    options.proxy_resolver = resolveAvatarProxy;
+    options.proxy_context = &proxy;
+    options.connect_timeout_ms = 10'000;
+    options.transfer_timeout_ms = 60'000;
+    MaiAvatarResult result{};
+    mai_avatar_upload(&options, imageBytes.data(), imageBytes.size(), "image/jpeg",
+        reinterpret_cast<const MaiAvatarCancel*>(cancel), &result);
+    jbyteArray output = nullptr;
+    if (result.status == MAI_AVATAR_OK && result.avatar_url_utf8 != nullptr) {
+        const std::size_t length = std::strlen(result.avatar_url_utf8);
+        if (length > 0 && length <= 8192) {
+            output = env->NewByteArray(static_cast<jsize>(length));
+            if (output != nullptr) env->SetByteArrayRegion(output, 0, static_cast<jsize>(length),
+                reinterpret_cast<const jbyte*>(result.avatar_url_utf8));
+        }
+    }
+    const bool canceled = result.status == MAI_AVATAR_CANCELED;
+    mai_avatar_result_free(&result);
+    if (output == nullptr)
+        avatarFailure(env, canceled ? "Avatar upload canceled" : "Avatar upload was not confirmed");
+    return output;
+}
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;

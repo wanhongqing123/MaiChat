@@ -113,9 +113,12 @@ public final class AIAssistantController {
             shared = new AIAssistantController(context, null);
         return shared;
     }
+    /** 账号工具的只读归属检查不能顺带初始化另一个账号的 Agent 或触发凭据请求。 */
+    public static synchronized AIAssistantController initializedAccountToolOwner() { return shared; }
     public static synchronized void configureAccount(String userId) {
         String next = userId == null ? "" : userId.trim();
-        if (next.equals(currentAccountUserId)) return;
+        if (next.equals(currentAccountUserId) && (shared == null ||
+                shared.accountToolLoginGeneration == shared.accountAuth.accountSessionGeneration())) return;
         MaiCloudDriveAgentTools.cancelAll(applicationContext);
         String legacyOwner = currentAccountUserId.isEmpty() ? next : currentAccountUserId;
         if (applicationContext != null && !legacyOwner.isEmpty()) {
@@ -165,6 +168,7 @@ public final class AIAssistantController {
     private final String testEndpoint;
     private final String accountUserId;
     private final MaiChatAuthClient accountAuth;
+    private final long accountToolLoginGeneration;
     private final AndroidSessionSyncCoordinator sessionSync;
     private volatile Listener listener;
     private volatile HostToolHandler hostToolHandler;
@@ -236,6 +240,7 @@ public final class AIAssistantController {
     AIAssistantController(Context context, String testEndpoint) {
         this.context = context.getApplicationContext();
         accountAuth = MaiChatAuthClient.shared(this.context);
+        accountToolLoginGeneration = accountAuth.accountSessionGeneration();
         if (testEndpoint != null && !BuildConfig.DEBUG)
             throw new IllegalArgumentException("Test endpoint in release build");
         this.testEndpoint = testEndpoint;
@@ -393,6 +398,36 @@ public final class AIAssistantController {
         }
         if (target == null)
             return hostToolFailure("MaiChat 宿主工具尚未连接");
+
+        if (tool.equals("maichat_cancel_avatar")) {
+            try {
+                // 原生取消监视线程可并发进入；只投递给本地请求表，不等待主线程或网络。
+                Object output = target.execute(tool, new JSONObject(arguments));
+                return new JSONObject().put("ok", true).put("output", output)
+                    .toString().getBytes(StandardCharsets.UTF_8);
+            } catch (Throwable failure) {
+                return hostToolFailure("头像取消请求无效", "invalid_input");
+            }
+        }
+
+        if (tool.equals("maichat_get_current_account") || tool.equals("maichat_set_avatar")) {
+            if (Looper.myLooper() == Looper.getMainLooper())
+                return hostToolFailure("账号资料工具不能在 UI 线程执行", "internal");
+            try {
+                JSONObject input = new JSONObject(arguments);
+                if (!accountToolScopeMatches(accountUserId, accountToolLoginGeneration,
+                        input.optString("workspace_path"), input.optString("session_id")))
+                    return hostToolFailure("登录账号或工作区已变化，请重新操作", "canceled");
+                // 身份来自承载原生 Agent 的实例；模型参数和新 shared 实例都不能重绑旧调用。
+                input.put("_account_im_user_id", accountUserId)
+                    .put("_account_auth_generation", accountToolLoginGeneration);
+                Object output = target.execute(tool, input);
+                return new JSONObject().put("ok", true).put("output", output)
+                    .toString().getBytes(StandardCharsets.UTF_8);
+            } catch (Throwable failure) {
+                return hostToolFailure("账号资料操作尚未确认，请检查登录状态和网络");
+            }
+        }
 
         // Cloud callbacks post their result to MAIN. Calling the host on MAIN
         // and then waiting for that callback would deadlock every cloud tool.
@@ -983,6 +1018,32 @@ public final class AIAssistantController {
             if (entry != null && sessionId.equals(entry.optString("id"))) return true;
         }
         return false;
+    }
+
+    /** Android 本机会话统一使用本账号 Workspace；可以验证任一本机会话，无需切换 UI 选择。
+     * 空上下文的普通资料查询仍由实例身份和登录代际绑定；有工作区时必须精确匹配。
+     */
+    public boolean accountToolScopeMatches(String expectedImUserId, long expectedGeneration,
+                                           String workspacePath, String sessionId) {
+        if (!accountToolIdentityMatches(expectedImUserId, expectedGeneration)) return false;
+        if (workspacePath != null && !workspacePath.isEmpty()) {
+            if (root == null) return false;
+            try {
+                if (!new File(root, "Workspace").getCanonicalFile()
+                        .equals(new File(workspacePath).getCanonicalFile())) return false;
+            } catch (IOException failure) { return false; }
+        }
+        return sessionId == null || sessionId.isEmpty() || hasLocalSession(sessionId);
+    }
+
+    /** SDK 已确认后的真实结果仍可读取；停止或删除发起 Session 不能撤回已发生的账号写入。 */
+    public boolean accountToolIdentityMatches(String expectedImUserId, long expectedGeneration) {
+        synchronized (AIAssistantController.class) {
+            if (shared != this || closed || !accountUserId.equals(expectedImUserId) ||
+                    expectedGeneration != accountToolLoginGeneration ||
+                    accountToolLoginGeneration != accountAuth.accountSessionGeneration()) return false;
+        }
+        return true;
     }
 
     void commandForSync(String sessionId, JSONObject action, Consumer<JSONObject> completion) {

@@ -2,6 +2,7 @@
 // 调用边界：由 MaiChat 媒体或 Agent 宿主调用；平台资源在停止或失败时须正确释放。
 #include "MaiMobileHostTools.h"
 #include "MaiChangePasswordTool.h"
+#include "MaiAccountTools.h"
 
 #include <cstdlib>
 #include <chrono>
@@ -88,6 +89,7 @@ public:
                 const std::string code = parsed.value("errorCode", "internal");
                 MaiErrorCode errorCode = MaiErrorCode::Internal;
                 if (code == "invalid_input") errorCode = MaiErrorCode::InvalidInput;
+                else if (code == "busy") errorCode = MaiErrorCode::Busy;
                 else if (code == "not_found") errorCode = MaiErrorCode::NotFound;
                 else if (code == "not_configured") errorCode = MaiErrorCode::NotConfigured;
                 else if (code == "not_supported") errorCode = MaiErrorCode::NotSupported;
@@ -796,6 +798,17 @@ void addMaiMobileHostTool(MaiToolRegistry& tools, const char* name, const char* 
 // 具有外部副作用的入口要求审批，注册时不能因同组只读工具而放宽权限。
 void registerMaiChatHostTools(MaiToolRegistry& tools,
                               const std::shared_ptr<MaiMobileHostDispatcher>& dispatcher) {
+    tools.add(makeMaiCurrentAccountTool([dispatcher](const std::string& arguments, const MaiToolContext&) {
+        return callMaiMobileHostTool(dispatcher, "maichat_get_current_account", arguments);
+    }));
+    tools.add(makeMaiSetAvatarTool(
+        [dispatcher](const std::string& arguments, const MaiToolContext&) {
+            return callMaiMobileHostTool(dispatcher, "maichat_set_avatar", arguments);
+        },
+        [dispatcher](const std::string& requestId) {
+            // 仅由执行上下文取消触发，不注册为模型工具，不携带账号凭据。
+            callMaiMobileHostTool(dispatcher, "maichat_cancel_avatar", Json{{"request_id", requestId}}.dump());
+        }));
     // 密码工具只传递安全表单的无凭据状态；三端使用同一个 factory 拒绝密码参数及结果泄漏。
     tools.add(makeMaiChangePasswordTool([dispatcher](const std::string& arguments,
                                                     const MaiToolContext&) {

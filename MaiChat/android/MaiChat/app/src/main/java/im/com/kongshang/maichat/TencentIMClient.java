@@ -63,6 +63,7 @@ public final class TencentIMClient {
         default void onVideoMediaUpdated(
                 String sender, String recipient, String remoteId, RemoteIMVideoAttachment attachment) {}
         void onProfilesUpdated(List<RemoteIMContact> contacts);
+        default void onSelfProfileUpdated(SelfProfile profile) { }
         void onPresenceUpdated(Map<String, PresenceStatus> statuses);
         default void onGroupMembershipChanged() { }
         default void onIncomingGroupText(String ownerUserId, RemoteIMGroupMessage message) { }
@@ -76,6 +77,28 @@ public final class TencentIMClient {
     public interface OperationCompletion {
         void onSuccess();
         void onError(int code, String message);
+    }
+
+    public static final class SelfProfile {
+        public final String imUserId, nickname, avatarUrl;
+        SelfProfile(String imUserId, String nickname, String avatarUrl) {
+            this.imUserId = imUserId;
+            this.nickname = nickname;
+            this.avatarUrl = avatarUrl;
+        }
+    }
+
+    public interface SelfProfileCompletion {
+        void onSuccess(SelfProfile profile);
+        void onError(int code, String message);
+    }
+
+    // 测试替身只替换 IM SDK 边界；普通资料入口和发送前身份检查仍走正式路径。
+    interface SelfProfileSdk {
+        String loginUser();
+        int loginStatus();
+        void get(List<String> users, V2TIMValueCallback<List<V2TIMUserFullInfo>> callback);
+        void set(V2TIMUserFullInfo profile, V2TIMCallback callback);
     }
 
     public interface FriendRequestsCompletion {
@@ -137,6 +160,9 @@ public final class TencentIMClient {
     private final MaiChatAttachmentDownload.Transport mediaDownloader;
     private volatile MaiChatAttachmentDownload.Scope mediaScope = new MaiChatAttachmentDownload.Scope();
     private final Listener listener;
+    private final SelfProfileSdk selfProfileSdk;
+    private final java.util.concurrent.atomic.AtomicLong selfProfileEpoch =
+        new java.util.concurrent.atomic.AtomicLong();
     private final V2TIMAdvancedMsgListener messageListener = new V2TIMAdvancedMsgListener() {
         @Override
         public void onRecvNewMessage(V2TIMMessage message) {
@@ -198,6 +224,17 @@ public final class TencentIMClient {
         public void onUserStatusChanged(List<V2TIMUserStatus> statusList) {
             listener.onPresenceUpdated(statusMap(statusList));
         }
+
+        @Override public void onSelfInfoUpdated(V2TIMUserFullInfo info) {
+            final long epoch = selfProfileEpoch.get();
+            final String owner = currentUserId;
+            final SelfProfile profile = selfProfile(info);
+            sdkHandler.post(() -> {
+                if (profile != null && owner.equals(profile.imUserId) &&
+                        selfProfileIdentityMatches(owner, epoch))
+                    listener.onSelfProfileUpdated(profile);
+            });
+        }
     };
 
     private Integer initializedSdkAppId;
@@ -213,9 +250,25 @@ public final class TencentIMClient {
 
     TencentIMClient(Context context, Listener listener,
                     MaiChatAttachmentDownload.Transport mediaDownloader) {
+        this(context, listener, mediaDownloader, new SelfProfileSdk() {
+            @Override public String loginUser() { return V2TIMManager.getInstance().getLoginUser(); }
+            @Override public int loginStatus() { return V2TIMManager.getInstance().getLoginStatus(); }
+            @Override public void get(List<String> users,
+                    V2TIMValueCallback<List<V2TIMUserFullInfo>> callback) {
+                V2TIMManager.getInstance().getUsersInfo(users, callback);
+            }
+            @Override public void set(V2TIMUserFullInfo profile, V2TIMCallback callback) {
+                V2TIMManager.getInstance().setSelfInfo(profile, callback);
+            }
+        });
+    }
+
+    TencentIMClient(Context context, Listener listener,
+                    MaiChatAttachmentDownload.Transport mediaDownloader, SelfProfileSdk profileSdk) {
         sdkThread.start(); sdkHandler = new android.os.Handler(sdkThread.getLooper());
         this.context = context.getApplicationContext();
         this.listener = listener;
+        this.selfProfileSdk = profileSdk;
         this.mediaDownloader = mediaDownloader;
         // 收到的媒体必须落在持久目录：放缓存目录的话，系统清缓存或用户手动清除之后，
         // 聊天记录里的图片视频就永远打不开了。
@@ -224,9 +277,16 @@ public final class TencentIMClient {
 
     public void connect(int sdkAppId, String userId, String userSig) {
         if (closed) return;
+        final long epoch = selfProfileEpoch.incrementAndGet();
+        loginAcknowledged = false;
         if (android.os.Looper.myLooper() != sdkThread.getLooper()) {
-            sdkHandler.post(() -> connect(sdkAppId, userId, userSig)); return;
+            sdkHandler.post(() -> connectOnSdk(sdkAppId, userId, userSig, epoch)); return;
         }
+        connectOnSdk(sdkAppId, userId, userSig, epoch);
+    }
+
+    private void connectOnSdk(int sdkAppId, String userId, String userSig, long epoch) {
+        if (closed || epoch != selfProfileEpoch.get()) return;
         String cleanUserId = clean(userId);
         loginAcknowledged = false;
         mediaScope.cancel();
@@ -259,7 +319,8 @@ public final class TencentIMClient {
         V2TIMManager.getInstance().login(cleanUserId, userSig, new V2TIMCallback() {
             @Override
             public void onSuccess() {
-                if (!cleanUserId.equals(currentUserId)) return;
+                if (closed || epoch != selfProfileEpoch.get() ||
+                        !cleanUserId.equals(currentUserId)) return;
                 loginAcknowledged = true;
                 Log.i(TAG, "login ok: " + cleanUserId);
                 V2TIMUserFullInfo profile = new V2TIMUserFullInfo();
@@ -275,6 +336,7 @@ public final class TencentIMClient {
 
             @Override
             public void onError(int code, String description) {
+                if (closed || epoch != selfProfileEpoch.get()) return;
                 loginAcknowledged = false;
                 Log.w(TAG, "login failed: code=" + code + " " + description);
                 listener.onConnectionStateChanged(
@@ -287,16 +349,23 @@ public final class TencentIMClient {
 
     public void disconnect(OperationCompletion completion) {
         if (closed) return;
+        selfProfileEpoch.incrementAndGet();
         loginAcknowledged = false;
         mediaScope.cancel();
         if (android.os.Looper.myLooper() != sdkThread.getLooper()) {
-            sdkHandler.post(() -> disconnect(completion)); return;
+            sdkHandler.post(() -> disconnectOnSdk(completion)); return;
         }
+        disconnectOnSdk(completion);
+    }
+
+    private void disconnectOnSdk(OperationCompletion completion) {
+        if (closed) return;
         V2TIMManager.getInstance().logout(callback(completion));
         currentUserId = "";
     }
 
     public void destroy() {
+        selfProfileEpoch.incrementAndGet();
         closed = true; currentUserId = "";
         loginAcknowledged = false;
         mediaScope.cancel();
@@ -311,6 +380,88 @@ public final class TencentIMClient {
     }
 
     public boolean isLoggedIn() { return loginAcknowledged; }
+
+    public boolean isLoggedInAs(String userId) {
+        return !closed && loginAcknowledged && !userId.isEmpty() && userId.equals(currentUserId);
+    }
+
+    private boolean selfProfileIdentityMatches(String owner, long epoch) {
+        return epoch == selfProfileEpoch.get() && isLoggedInAs(owner) &&
+            selfProfileSdk.loginStatus() == V2TIMManager.V2TIM_STATUS_LOGINED &&
+            owner.equals(selfProfileSdk.loginUser());
+    }
+
+    private static SelfProfile selfProfile(V2TIMUserFullInfo info) {
+        if (info == null || clean(info.getUserID()).isEmpty()) return null;
+        return new SelfProfile(clean(info.getUserID()), clean(info.getNickName()),
+            clean(info.getFaceUrl()));
+    }
+
+    /** 查询本人走独立回调，绝不把 getUsersInfo 的自己资料并入好友列表。 */
+    public void getSelfProfile(String owner, java.util.function.BooleanSupplier current,
+                               SelfProfileCompletion completion) {
+        final long epoch = selfProfileEpoch.get();
+        sdkHandler.post(() -> {
+            if (!current.getAsBoolean() || !selfProfileIdentityMatches(owner, epoch)) {
+                completion.onError(-1, "登录账号或 IM 身份已变化"); return;
+            }
+            selfProfileSdk.get(Collections.singletonList(owner),
+                new V2TIMValueCallback<List<V2TIMUserFullInfo>>() {
+                    @Override public void onSuccess(List<V2TIMUserFullInfo> users) {
+                        if (!current.getAsBoolean() || !selfProfileIdentityMatches(owner, epoch)) {
+                            completion.onError(-1, "登录账号或 IM 身份已变化"); return;
+                        }
+                        if (users != null) for (V2TIMUserFullInfo user : users) {
+                            SelfProfile profile = selfProfile(user);
+                            if (profile != null && owner.equals(profile.imUserId)) {
+                                completion.onSuccess(profile); return;
+                            }
+                        }
+                        completion.onError(-1, "本人 IM 资料不可用");
+                    }
+                    @Override public void onError(int code, String message) {
+                        completion.onError(code, "本人 IM 资料暂时不可用");
+                    }
+                });
+        });
+    }
+
+    /** faceURL 只在 SDK 确认后成功；队列等待期间切号时，不会向新账号发送旧头像。 */
+    public void setSelfAvatar(String owner, String avatarUrl,
+                              java.util.function.BooleanSupplier current,
+                              OperationCompletion completion) {
+        setSelfAvatar(owner, avatarUrl, current, current, () -> { }, completion);
+    }
+
+    // 停止请求只阻止尚未发出的写入；SDK 已发送后仍保留真实确认，账号身份则始终重新检查。
+    public void setSelfAvatar(String owner, String avatarUrl,
+                              java.util.function.BooleanSupplier current,
+                              java.util.function.BooleanSupplier identity,
+                              Runnable beforeSend, OperationCompletion completion) {
+        final long epoch = selfProfileEpoch.get();
+        sdkHandler.post(() -> {
+            V2TIMUserFullInfo profile = new V2TIMUserFullInfo();
+            profile.setFaceUrl(avatarUrl);
+            if (!current.getAsBoolean() || !selfProfileIdentityMatches(owner, epoch)) {
+                completion.onError(-1, "登录账号或 IM 身份已变化"); return;
+            }
+            beforeSend.run();
+            if (!current.getAsBoolean() || !selfProfileIdentityMatches(owner, epoch)) {
+                completion.onError(-1, "登录账号或 IM 身份已变化"); return;
+            }
+            selfProfileSdk.set(profile, new V2TIMCallback() {
+                @Override public void onSuccess() {
+                    if (!identity.getAsBoolean() || !selfProfileIdentityMatches(owner, epoch)) {
+                        completion.onError(-1, "登录账号或 IM 身份已变化"); return;
+                    }
+                    completion.onSuccess();
+                }
+                @Override public void onError(int code, String message) {
+                    completion.onError(code, "IM 尚未确认头像更新");
+                }
+            });
+        });
+    }
 
     public void sendText(
         String peerId,
@@ -602,12 +753,13 @@ public final class TencentIMClient {
         List<String> cleaned = cleanUserIds(userIds);
         if (cleaned.isEmpty()) return;
         String accountAtRequest = currentUserId;
+        long epoch = selfProfileEpoch.get();
         String requestKey = accountAtRequest + "\n" + String.join("\n", cleaned);
         synchronized (this) {
             if (requestKey.equals(profileRequestKey)) return;
             profileRequestKey = requestKey;
         }
-        V2TIMManager.getInstance().getUsersInfo(
+        selfProfileSdk.get(
             cleaned,
             new V2TIMValueCallback<List<V2TIMUserFullInfo>>() {
                 @Override
@@ -615,12 +767,17 @@ public final class TencentIMClient {
                     synchronized (TencentIMClient.this) {
                         if (requestKey.equals(profileRequestKey)) profileRequestKey = "";
                     }
-                    if (!accountAtRequest.equals(currentUserId)) return;
+                    if (epoch != selfProfileEpoch.get() || !accountAtRequest.equals(currentUserId)) return;
                     List<RemoteIMContact> contacts = new ArrayList<>();
                     if (users != null) {
                         for (V2TIMUserFullInfo user : users) {
                             String userId = clean(user.getUserID());
                             if (userId.isEmpty()) continue;
+                            if (userId.equals(accountAtRequest)) {
+                                SelfProfile own = selfProfile(user);
+                                if (own != null) listener.onSelfProfileUpdated(own);
+                                continue;
+                            }
                             String nickname = clean(user.getNickName());
                             contacts.add(new RemoteIMContact(
                                 userId,

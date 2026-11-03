@@ -62,3 +62,34 @@ local video player. A hidden or withdrawn post no longer receives new links.
 `MAICHAT_VIDEO_CIRCLE_ENABLED` remains off in production. The local TLS fixture
 uses two disposable account tokens, a fake OSS endpoint, and an admin review
 step; it does not use production credentials or upload real media.
+
+## Account avatar upload
+
+`MaiAvatarClient.h` provides the single avatar upload path for Desktop, iOS and
+Android. Hosts prepare a square JPEG and supply bytes, the media service base,
+the public account ID, a captured account token, trust and proxy callbacks.
+`mai_avatar_upload` calls the existing `sign-upload` route with `im_avatar`, then
+PUTs at most 2,000,000 bytes directly to the signed OSS URL. It validates the
+owner's object prefix, stable public avatar origin, exact signed object path,
+MIME header and HTTPS host. Redirects are refused and the Bearer is sent only
+to the signer. Raw replies and temporary signatures never enter its result.
+
+The synchronous call belongs on a worker thread. `MaiAvatarResult` owns only
+the stable `avatar_url_utf8`; release it with `mai_avatar_result_free`. A shared
+`MaiAvatarCancel` may interrupt signing or PUT; destroy it after the call exits.
+The host also binds the account/login generation and checks it immediately
+before writing the IM profile. Successful upload alone is not a successful
+avatar change: only a confirmed IM SDK callback permits `updated:true`.
+
+Agent factories in `MaiChat/MaiChatTools/MaiAccountTools.cpp` share argument and
+result filtering across all hosts. Reads use current local profile caches;
+avatar writes use the same ordinary services as native settings. Concurrent
+avatar changes are rejected as busy. Before SDK dispatch, cancel can stop the
+write; after dispatch it cannot undo the remote request and a confirmed success
+must remain a success. No actual user avatar is changed by local TLS tests.
+
+Run the avatar transport contract after the normal Network test build:
+
+```sh
+ctest --test-dir /tmp/maichat-network-test -R '^mai_avatar_local_tls$' --output-on-failure
+```

@@ -111,7 +111,7 @@ struct RemoteIMSendReceipt: Equatable {
     let createdAt: Date?
 }
 
-struct RemoteIMUserProfile: Equatable {
+struct RemoteIMUserProfile: Equatable, Sendable {
     let userID: String
     let displayName: String
     let avatarURL: String?
@@ -179,6 +179,7 @@ protocol RemoteIMClient: AnyObject {
     var onIncomingGroupText: ((IncomingRemoteIMGroupText) -> Void)? { get set }
     var onGroupMembershipChanged: (() -> Void)? { get set }
     var onPresenceStatusChanged: (([String: RemoteIMPresenceStatus]) -> Void)? { get set }
+    var onSelfProfileChanged: ((RemoteIMUserProfile) -> Void)? { get set }
 
     func connect(sdkAppID: Int, userID: String, userSig: String) async throws
     func disconnect() async
@@ -219,7 +220,7 @@ protocol RemoteIMClient: AnyObject {
     func blockedUserIDs() async throws -> [String]
     func clearHistory(userID: String) async throws
     func refreshUserProfiles(userIDs: [String]) async throws -> [RemoteIMUserProfile]
-    func setSelfAvatar(url: String) async throws
+    func setSelfAvatar(url: String, expectedUserID: String, request: MaiAvatarMutationRequest) async throws
     func requestFriend(userID: String) async throws
     func friendUserIDs() async throws -> [String]
     func pendingFriendRequests() async throws -> [RemoteIMFriendRequest]
@@ -231,6 +232,10 @@ protocol RemoteIMClient: AnyObject {
 }
 
 extension RemoteIMClient {
+    var onSelfProfileChanged: ((RemoteIMUserProfile) -> Void)? {
+        get { nil }
+        set {}
+    }
     var onIncomingGroupText: ((IncomingRemoteIMGroupText) -> Void)? {
         get { nil }
         set {}
@@ -289,7 +294,7 @@ extension RemoteIMClient {
         throw RemoteIMClientError.sdkNotIntegrated
     }
 
-    func setSelfAvatar(url: String) async throws {
+    func setSelfAvatar(url: String, expectedUserID: String, request: MaiAvatarMutationRequest) async throws {
         throw RemoteIMClientError.sdkNotIntegrated
     }
 

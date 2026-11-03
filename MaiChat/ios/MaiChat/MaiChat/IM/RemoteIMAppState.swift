@@ -6,76 +6,6 @@ import MaiChatCore
 import UIKit
 import UniformTypeIdentifiers
 
-private struct MaiChatSignedAvatarUpload: Decodable, Sendable {
-    let uploadUrl: String
-    let uploadHeaders: [String: String]
-    let avatarUrl: String
-}
-
-private enum MaiChatAvatarUploadError: LocalizedError {
-    case accountRequired
-    case tooLarge
-    case invalidResponse
-    case uploadFailed
-
-    var errorDescription: String? {
-        switch self {
-        case .accountRequired: return "请先登录 MaiChat 账号"
-        case .tooLarge: return "头像图片不能超过 2 MB"
-        case .invalidResponse: return "头像上传地址无效"
-        case .uploadFailed: return "头像上传失败，请稍后重试"
-        }
-    }
-}
-
-private func uploadAvatarToOss(fileURL: URL) async throws -> (url: String, data: Data) {
-    let data = try Data(contentsOf: fileURL)
-    guard !data.isEmpty, data.count <= 2_000_000 else {
-        throw MaiChatAvatarUploadError.tooLarge
-    }
-    guard let access = try await MaiChatAuthClient.shared.mediaServiceAccessIfAvailable(),
-          let signURL = URL(string: access.baseURL + "/sign-upload") else {
-        throw MaiChatAvatarUploadError.accountRequired
-    }
-    let contentType = fileURL.pathExtension.lowercased() == "png" ? "image/png" : "image/jpeg"
-    let requestBody = try JSONSerialization.data(withJSONObject: [
-        "filename": fileURL.lastPathComponent,
-        "size_bytes": data.count,
-        "purpose": "im_avatar"
-    ])
-    let signedResponse = try await MaiChatHttpClient.request(
-        url: signURL, method: "POST", bearer: access.accountToken,
-        contentType: "application/json", body: requestBody,
-        maximumResponseBytes: 8 * 1024
-    )
-    guard signedResponse.statusCode == 200 else {
-        throw MaiChatAvatarUploadError.uploadFailed
-    }
-    let decoder = JSONDecoder()
-    decoder.keyDecodingStrategy = .convertFromSnakeCase
-    let signed = try decoder.decode(MaiChatSignedAvatarUpload.self, from: signedResponse.body)
-    guard let uploadURL = URL(string: signed.uploadUrl),
-          let upload = URLComponents(url: uploadURL, resolvingAgainstBaseURL: false),
-          upload.scheme == "https", upload.host?.hasSuffix(".aliyuncs.com") == true,
-          upload.user == nil, upload.password == nil, upload.fragment == nil,
-          let avatarURL = URL(string: signed.avatarUrl),
-          avatarURL.scheme == "https", avatarURL.host == "ichat.life",
-          avatarURL.path.hasPrefix("/maichat/avatars/"),
-          upload.path == String(avatarURL.path.dropFirst("/maichat".count)),
-          signed.uploadHeaders["Content-Type"] == contentType else {
-        throw MaiChatAvatarUploadError.invalidResponse
-    }
-    let uploadResponse = try await MaiChatHttpClient.request(
-        url: uploadURL, method: "PUT", contentType: contentType,
-        body: data, maximumResponseBytes: 8 * 1024,
-        timeoutMilliseconds: 60_000
-    )
-    guard (200..<300).contains(uploadResponse.statusCode) else {
-        throw MaiChatAvatarUploadError.uploadFailed
-    }
-    return (signed.avatarUrl, data)
-}
-
 nonisolated func makeRemoteIMImageFile(
     data: Data,
     contentTypes: [UTType],
@@ -145,9 +75,12 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     @Published var sdkAppIDText = ""
-    @Published var masterUserID = ""
+    @Published var masterUserID = "" {
+        didSet { if oldValue != masterUserID { cancelAvatarMutations() } }
+    }
     @Published var maiChatAccountID = "" {
         didSet {
+            if oldValue != maiChatAccountID { cancelAvatarMutations() }
             if oldValue != maiChatAccountID,
                MaiCloudDriveAgentPlaybackCache.shared.accountChanged(to: maiChatAccountID) {
                 agentVideoPresentation = nil
@@ -159,6 +92,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         }
     }
     @Published var maiChatNickname = ""
+    @Published var maiChatPhoneMasked: String?
     @Published var newContactUserID = ""
     @Published var newContactRelation: RemoteIMContactRelation = .friend
     @Published var errorMessage: String?
@@ -280,16 +214,20 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     private var closedActivityIDs: [String] = []
     private var activitySequence: [String: Int] = [:]
     private var transientErrorTask: Task<Void, Never>?
+    private let avatarUploader: any MaiAccountAvatarUploading
+    private var avatarMutations: [UUID: MaiAvatarMutationRequest] = [:]
     private let messagePageSize = 20
 
     init(
         settingsStore: LocalSettingsStore = LocalSettingsStore(),
         historyStore: LocalChatHistoryStore = LocalChatHistoryStore(),
         client: RemoteIMClient = TencentIMClient(),
+        avatarUploader: any MaiAccountAvatarUploading = MaiAccountAvatarUploader(),
         loadedSettings: StoredRemoteIMSettings
     ) {
         self.settingsStore = settingsStore
         self.client = client
+        self.avatarUploader = avatarUploader
         self.remoteDesktop = RemoteDesktopSession(client: client)
 
         var settings = loadedSettings
@@ -313,6 +251,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         self.masterUserID = settings.masterUserID
         self.maiChatAccountID = hasAccountSession ? settings.maiChatAccountID : ""
         self.maiChatNickname = hasAccountSession ? settings.maiChatNickname : ""
+        self.maiChatPhoneMasked = hasAccountSession ? settings.maiChatPhoneMasked : nil
         self.chatHistorySDKAppID = settings.sdkAppID
         self.accountDeletionReceipt = settingsStore.loadDeletionReceipt()
         if hasAccountSession {
@@ -395,6 +334,11 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
             Task { @MainActor in
                 self?.applyPresenceStatusUpdates(updates)
             }
+        }
+        self.client.onSelfProfileChanged = { [weak self] profile in
+            guard let self, self.hasUnifiedAccount, profile.userID == self.masterUserID else { return }
+            self.userProfileByUserID[profile.userID] = profile
+            _ = self.settingsStore.saveImmediately(self.currentStoredSettings())
         }
         let sessionReplacedToken = NotificationCenter.default.addObserver(
             forName: .maiChatAccountSessionReplaced, object: nil, queue: .main
@@ -543,52 +487,80 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
             displayName: accountName ?? userID, avatarURL: nil)
     }
 
-    func setSelfAvatar(url: String) async -> Bool {
-        let cleanURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let parsed = URL(string: cleanURL),
-              ["https", "http"].contains(parsed.scheme?.lowercased() ?? ""),
-              parsed.host != nil else {
-            showTransientError("头像地址无效")
-            return false
+    // 本机账号快照不等同于在线校验；断网仍能读已登录账号，不伪造实时验证结果。
+    func currentAccountProfile() -> MaiChatCurrentAccountProfile {
+        guard hasUnifiedAccount, !maiChatAccountID.isEmpty, !masterUserID.isEmpty else {
+            return MaiChatCurrentAccountProfile(loggedIn: false)
         }
-        guard connectionState == .connected else {
-            showTransientError("请先连接 IM")
-            return false
-        }
-        let identity = remoteDiagnosticsIdentity
-        let userID = masterUserID
+        return MaiChatCurrentAccountProfile(loggedIn: true, accountID: maiChatAccountID,
+            imUserID: masterUserID, nickname: maiChatNickname.isEmpty ? nil : maiChatNickname,
+            phoneMasked: maiChatPhoneMasked, avatarURL: profile(for: masterUserID).avatarURL)
+    }
+
+    func changeSelfAvatar(fileURL: URL, requestID: String? = nil) async throws -> String {
+        try await changeSelfAvatar(requestID: requestID) { try MaiAvatarImagePreparation.jpeg(fileURL: fileURL) }
+    }
+
+    // 普通设置页与工具只在图片来源上有区别；后续上传、账号保护和 SDK 提交共用此方法。
+    func uploadSelfAvatar(image: UIImage) async -> Bool {
         do {
-            try await client.setSelfAvatar(url: cleanURL)
-            guard remoteDiagnosticsIdentity == identity else { return false }
-            let current = profile(for: userID)
-            userProfileByUserID[userID] = RemoteIMUserProfile(
-                userID: userID, displayName: current.displayName, avatarURL: cleanURL
-            )
-            _ = settingsStore.saveImmediately(currentStoredSettings())
+            _ = try await changeSelfAvatar { try MaiAvatarImagePreparation.jpeg(image: image) }
             return true
+        } catch is CancellationError {
+            return false
         } catch {
-            guard remoteDiagnosticsIdentity == identity else { return false }
-            showTransientError(error.localizedDescription)
+            showTransientError((error as? MaiChatAvatarError)?.localizedDescription ?? "头像修改失败，请重试")
             return false
         }
     }
 
-    func uploadSelfAvatar(fileURL: URL) async -> Bool {
-        guard connectionState == .connected else {
-            showTransientError("请先连接 IM")
-            return false
+    private func cancelAvatarMutations() {
+        for request in avatarMutations.values { request.cancel() }
+    }
+
+    @discardableResult func cancelAvatarMutation(requestID: String) -> Bool {
+        let matching = avatarMutations.values.filter { $0.externalID == requestID }
+        for request in matching { request.cancel() }
+        return !matching.isEmpty
+    }
+
+    private func changeSelfAvatar(requestID: String? = nil,
+                                  prepare: @escaping @Sendable () throws -> Data) async throws -> String {
+        guard hasUnifiedAccount, !maiChatAccountID.isEmpty, !masterUserID.isEmpty else {
+            throw MaiChatAvatarError.signInRequired
         }
-        let identity = remoteDiagnosticsIdentity
-        do {
-            let uploaded = try await uploadAvatarToOss(fileURL: fileURL)
-            guard remoteDiagnosticsIdentity == identity else { return false }
-            RemoteIMAvatarImageStore.shared.store(uploaded.data, for: uploaded.url)
-            return await setSelfAvatar(url: uploaded.url)
-        } catch {
-            guard remoteDiagnosticsIdentity == identity else { return false }
-            showTransientError(error.localizedDescription)
-            return false
-        }
+        guard connectionState == .connected else { throw MaiChatAvatarError.imUnavailable }
+        // 普通设置页与不同 Agent Session 共用同一闸门；不能让旧 SDK 回调覆盖较新的头像。
+        // 取消只标记请求，直到上传结束或已派发 SDK 回调确认/超时后才在 defer 释放。
+        guard avatarMutations.isEmpty else { throw MaiChatAvatarError.busy }
+        guard let request = MaiAvatarMutationRequest(externalID: requestID) else { throw MaiChatAvatarError.invalidResponse }
+        let identity = remoteDiagnosticsIdentity, accountID = maiChatAccountID, userID = masterUserID
+        avatarMutations[request.id] = request
+        defer { avatarMutations[request.id] = nil }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let jpeg = try await Task.detached(priority: .userInitiated, operation: prepare).value
+            try request.checkActive()
+            guard remoteDiagnosticsIdentity == identity else { throw MaiChatAvatarError.accountChanged }
+            let url = try await avatarUploader.upload(jpeg: jpeg, accountID: accountID, request: request)
+            try request.checkActive()
+            guard remoteDiagnosticsIdentity == identity, connectionState == .connected else {
+                throw MaiChatAvatarError.accountChanged
+            }
+            do {
+                try await client.setSelfAvatar(url: url, expectedUserID: userID, request: request)
+            } catch is CancellationError { throw CancellationError() }
+            catch { throw MaiChatAvatarError.sdkRejected }
+            guard request.wasConfirmedBySDK else { throw MaiChatAvatarError.sdkRejected }
+            // SDK 已确认旧账号写入时，真实结果仍是成功；新账号的界面和缓存保持隔离。
+            guard remoteDiagnosticsIdentity == identity else { return url }
+            let current = profile(for: userID)
+            userProfileByUserID[userID] = RemoteIMUserProfile(userID: userID,
+                displayName: current.displayName, avatarURL: url)
+            RemoteIMAvatarImageStore.shared.store(jpeg, for: url)
+            _ = settingsStore.saveImmediately(currentStoredSettings())
+            return url
+        } onCancel: { request.cancel() }
     }
 
     var shouldShowInitialLogin: Bool {
@@ -820,23 +792,29 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         guard hasUnifiedAccount, hasCompletedInitialLogin,
               !masterUserID.isEmpty else { return }
         let expectedUserID = masterUserID
+        let identity = remoteDiagnosticsIdentity
         do {
             let user = try await accountAuth.validateCurrentSession(
                 expectedUserID: expectedUserID
             )
-            guard hasUnifiedAccount, masterUserID == expectedUserID else { return }
+            guard hasUnifiedAccount, masterUserID == expectedUserID,
+                  remoteDiagnosticsIdentity == identity else { return }
             prefetchASRCredentialAfterLogin()
-            if maiChatAccountID != user.id || maiChatNickname != (user.nickname ?? "") {
+            if maiChatAccountID != user.id || maiChatNickname != (user.nickname ?? "") ||
+                maiChatPhoneMasked != user.phoneMasked {
                 maiChatAccountID = user.id
                 maiChatNickname = user.nickname ?? ""
+                maiChatPhoneMasked = user.phoneMasked
                 _ = settingsStore.saveImmediately(currentStoredSettings())
             }
         } catch MaiChatAuthError.sessionReplaced, MaiChatAuthError.deviceSlotRequired {
             // 账号客户端已经通知统一的退出流程。
         } catch MaiChatAuthError.sessionExpired {
+            guard remoteDiagnosticsIdentity == identity else { return }
             await endInvalidAccountSession(
                 expectedUserID: expectedUserID, error: .sessionExpired)
         } catch MaiChatAuthError.identityMismatch {
+            guard remoteDiagnosticsIdentity == identity else { return }
             await endInvalidAccountSession(
                 expectedUserID: expectedUserID, error: .identityMismatch)
         } catch {
@@ -865,6 +843,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
 
     @discardableResult
     func switchPhoneAccount() async -> Bool {
+        cancelAvatarMutations()
         // 先落盘旧账号消息，再撤销本机登录。这样进程中途结束也不会自动回到旧账号。
         guard await flushHistoryPersistence() else {
             showTransientError("保存当前账号消息失败，请稍后重试")
@@ -990,6 +969,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     private func clearLocalAccountPresentation() async {
+        cancelAvatarMutations()
         try? await AIMobileSMSInbox.shared.disableAndClear()
         AICloudCredentialSync.invalidateAccountModelCredentials()
         AIAssistantModel.resetForAccountSwitch()
@@ -997,6 +977,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         masterUserID = ""
         maiChatAccountID = ""
         maiChatNickname = ""
+        maiChatPhoneMasked = nil
         acceptedFriendIMIDs = []
         pendingFriendSyncIMIDs = []
         blockedIMUserIDs = []
@@ -1014,6 +995,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     private func finishAccountLogin(_ session: MaiChatAuthSession) async throws {
         // 所有调用点均在 password/SMS/social/bind/reset 成功 adopt 后进入，普通 refresh 不调用此处。
         // 在首次 await 前推进，让旧账号密码/PDF request 即刻失效；不触发整套聊天状态重置。
+        cancelAvatarMutations()
         accountAuthenticationGeneration &+= 1
         let credential = try await accountAuth.credentialIfAvailable(
             expectedUserID: session.user.imUserId
@@ -1042,6 +1024,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         masterUserID = session.user.imUserId
         maiChatAccountID = session.user.id
         maiChatNickname = session.user.nickname ?? ""
+        maiChatPhoneMasked = session.user.phoneMasked
         sdkAppIDText = String(credential.sdkAppId)
         accountInvalidationReason = nil
         errorMessage = nil
@@ -1238,6 +1221,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     func disconnect() async {
+        cancelAvatarMutations()
         let startedAt = ProcessInfo.processInfo.systemUptime
         // 在异步断开前先保存用户意图；即使 iOS 此刻终止进程，
         // 下次启动也应保持断开，而不是撤销用户刚点击的操作。
@@ -3414,6 +3398,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
             masterUserID: masterUserID.trimmingCharacters(in: .whitespacesAndNewlines),
             maiChatAccountID: hasUnifiedAccount ? maiChatAccountID : "",
             maiChatNickname: hasUnifiedAccount ? maiChatNickname : "",
+            maiChatPhoneMasked: hasUnifiedAccount ? maiChatPhoneMasked : nil,
             selfAvatarURL: userProfileByUserID[masterUserID]?.avatarURL,
             friendUserIDs: chatState.contacts
                 .map(\.userID),
@@ -3447,12 +3432,14 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
             settings.unreadCountByUserID = [:]
             settings.maiChatAccountID = ""
             settings.maiChatNickname = ""
+            settings.maiChatPhoneMasked = nil
             settings.selfAvatarURL = nil
         }
         settings.sdkAppID = currentSDKAppID()
         settings.masterUserID = cleanMasterUserID
         settings.maiChatAccountID = maiChatAccountID
         settings.maiChatNickname = maiChatNickname
+        settings.maiChatPhoneMasked = maiChatPhoneMasked
         settings.selfAvatarURL = userProfileByUserID[cleanMasterUserID]?.avatarURL
         settings.reconnectOnLaunch = value
         settingsStore.save(settings)
