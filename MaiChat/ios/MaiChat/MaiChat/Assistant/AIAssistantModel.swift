@@ -1175,7 +1175,8 @@ actor AIAssistantBackend {
         let arguments = ProcessInfo.processInfo.arguments
         let resolved = workspace.standardizedFileURL.resolvingSymlinksInPath()
         let temporary = FileManager.default.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
-        guard arguments.contains("--ai-ui-test"), arguments.contains("--ai-manual-camera-ui-test"),
+        guard arguments.contains("--ai-ui-test"),
+              arguments.contains("--ai-manual-camera-ui-test") || arguments.contains("--ai-manual-camera-tool-ui-test"),
               !initialized, workspace.isFileURL, resolved.lastPathComponent == "Workspace",
               resolved.path.hasPrefix(temporary.path + "/"),
               FileManager.default.fileExists(atPath: resolved.path) else { throw CancellationError() }

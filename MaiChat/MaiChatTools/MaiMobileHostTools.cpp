@@ -287,7 +287,45 @@ private:
     std::shared_ptr<MaiMobileHostDispatcher> mDispatcher;
 };
 
-// The native host binds the camera owner to the account and originating Session.
+// Manual capture waits for the user's shutter and confirmation. It must not
+// share the automatic preview command's repeated frame collection lifecycle.
+class MaiMobileTakePhotoTool final : public MaiTool {
+public:
+    explicit MaiMobileTakePhotoTool(std::shared_ptr<MaiMobileHostDispatcher> dispatcher)
+        : mDispatcher(std::move(dispatcher)) {}
+    std::string name() const override {
+        return "mobile_take_photo";
+    }
+    std::string description() const override {
+        return "Open the camera and wait for the user to press the shutter and confirm one photo. "
+               "Use this when the user asks to open the camera or take a photo. Save the confirmed "
+               "photo in the current Agent workspace. Cancel creates no file and never sends a message. "
+               "This does not start automatic repeated capture.";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object","properties":{},"additionalProperties":false})";
+    }
+    bool requiresApproval(const std::string&) const override {
+        return false;
+    }
+    MaiToolResult execute(const std::string& arguments, const MaiToolContext& context) override {
+        const Json args = Json::parse(arguments, nullptr, false);
+        if (!args.is_object() || !args.empty())
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "mobile_take_photo expects an empty object");
+        if (context.isCanceled()) return MaiToolResult::failure(MaiErrorCode::Canceled, "photo capture canceled");
+        if (context.root.empty() || context.sessionId.empty())
+            return MaiToolResult::failure(MaiErrorCode::NotConfigured, "camera Session workspace is unavailable");
+        // A manual capture must remain bound to its originating Session while
+        // the user operates the camera; model arguments cannot choose its owner.
+        return callMaiMobileHostTool(mDispatcher, name(),
+                                     Json{{"workspace_path", context.root}, {"session_id", context.sessionId}}.dump());
+    }
+
+private:
+    std::shared_ptr<MaiMobileHostDispatcher> mDispatcher;
+};
+
+// The native host binds the archive owner to the account and originating Session.
 // The model supplies only opaque batch/frame IDs, never the archive owner or path.
 class MaiMobileCameraFramesTool final : public MaiTool {
 public:
@@ -295,23 +333,60 @@ public:
         : mDispatcher(std::move(dispatcher)) {}
     std::string name() const override { return "mobile_camera_frames"; }
     std::string description() const override {
-        return "List images sampled every 2 seconds during iOS camera preview, including capture times. "
-               "After closing the camera, ask which image the user wants and open only that image. "
+        return "Inspect images already saved by automatic iOS camera capture. This tool never opens "
+               "the camera or takes a photo. To open the camera for a user-taken photo, call mobile_take_photo "
+               "with {}. Pass a request object, for example {\"request\":{\"action\":\"list\"}}. "
+               "list returns saved batches, frame IDs and capture times. After capture stops, "
+               "ask which image the user wants; open requires batch_id and frame_id from list and opens "
+               "only that saved image. "
                "delete_batch clears unreferenced images from a stopped batch on request. "
                "Images retained by a draft or message keep the original file.";
     }
     std::string parametersSchema() const override {
-        return R"({"type":"object","properties":{"action":{"type":"string","enum":["list","open","delete_batch"]},)"
-               R"("batch_id":{"type":"string","minLength":1,"maxLength":100},)"
-               R"("frame_id":{"type":"string","minLength":1,"maxLength":100}},"required":["action"],"additionalProperties":false})";
+        // The XML tool grammar enumerates root properties, so keep the complete
+        // conditional variants inside a required JSON-valued request parameter.
+        // Opening an archived frame requires both IDs; it never opens the camera.
+        const Json identifier{{"type", "string"}, {"minLength", 1}, {"maxLength", 100}};
+        const auto variant = [&](const char* action, bool batchRequired, bool frameRequired) {
+            Json properties{{"action", {{"type", "string"}, {"enum", Json::array({action})}}},
+                            {"batch_id", identifier}};
+            Json required = Json::array({"action"});
+            if (batchRequired) required.push_back("batch_id");
+            if (frameRequired) {
+                properties["frame_id"] = identifier;
+                required.push_back("frame_id");
+            }
+            return Json{{"type", "object"},
+                        {"properties", properties},
+                        {"required", required},
+                        {"additionalProperties", false}};
+        };
+        const Json request{{"type", "object"},
+                           {"oneOf", Json::array({variant("list", false, false), variant("open", true, true),
+                                                  variant("delete_batch", true, false)})}};
+        return Json{{"type", "object"},
+                    {"properties", {{"request", request}}},
+                    {"required", Json::array({"request"})},
+                    {"additionalProperties", false}}
+            .dump();
     }
     bool requiresApproval(const std::string& arguments) const override {
         const Json parsed = Json::parse(arguments, nullptr, false);
-        return parsed.is_object() && parsed.value("action", Json{}) == "delete_batch";
+        return parsed.is_object() && parsed.contains("request") && parsed["request"].is_object() &&
+               parsed["request"].value("action", Json{}) == "delete_batch";
     }
     MaiToolResult execute(const std::string& argumentsJson, const MaiToolContext& context) override {
-        Json args = Json::parse(argumentsJson, nullptr, false);
-        if (!args.is_object() || !args.contains("action") || !args["action"].is_string())
+        const Json envelope = Json::parse(argumentsJson, nullptr, false);
+        if (!envelope.is_object() || envelope.size() != 1 || !envelope.contains("request") ||
+            !envelope["request"].is_object())
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "mobile_camera_frames expects only a request object, for example {\"request\":{\"action\":\"list\"}}. "
+                "To open the camera for a user-taken photo, call mobile_take_photo with {}.");
+        // Only the tool's model-facing schema uses this envelope. The ordinary
+        // archive host API retains flat arguments and trusted Session context.
+        Json args = envelope["request"];
+        if (!args.contains("action") || !args["action"].is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "a camera frame action is required");
         for (auto field = args.begin(); field != args.end(); ++field) {
             if ((field.key() != "action" && field.key() != "batch_id" && field.key() != "frame_id") ||
@@ -320,11 +395,19 @@ public:
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "invalid camera frame argument");
         }
         const std::string action = args["action"].get<std::string>();
-        if ((action != "list" && action != "open" && action != "delete_batch") ||
-            (action != "list" && !args.contains("batch_id")) ||
-            (action == "open" && !args.contains("frame_id")) ||
-            (action != "open" && args.contains("frame_id")))
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "invalid camera frame action or identifiers");
+        if (action != "list" && action != "open" && action != "delete_batch")
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "mobile_camera_frames action must be list, open, or delete_batch");
+        if (action == "open" && (!args.contains("batch_id") || !args.contains("frame_id")))
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "mobile_camera_frames open inspects a saved image and requires batch_id and frame_id from list. "
+                "To open the camera for a user-taken photo, call mobile_take_photo with {}.");
+        if (action == "delete_batch" && !args.contains("batch_id"))
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "delete_batch requires batch_id from list");
+        if (action != "open" && args.contains("frame_id"))
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "frame_id is only valid for opening a saved image");
         if (context.root.empty() || context.sessionId.empty())
             return MaiToolResult::failure(MaiErrorCode::NotConfigured, "camera Session workspace is unavailable");
         if (context.isCanceled()) return MaiToolResult::failure(MaiErrorCode::Canceled, "camera request canceled");
@@ -412,11 +495,14 @@ public:
         : mDispatcher(std::move(dispatcher)) {}
     std::string name() const override { return "maichat_camera_command"; }
     std::string description() const override {
-        return "Open or close the iPhone camera preview. While open, a frame is saved every 2 seconds "
+        return "Control automatic repeated camera capture only when the user explicitly requests it. "
+               "For an ordinary request to open the camera or take a photo, use mobile_take_photo with {}. "
+               "open starts an iPhone camera preview that saves a frame every 2 seconds "
                "in the app sandbox, without adding it to the system photo library. status reports progress. "
-        "close may return stopping while saved frames are being finalized. Call status until it reports "
-        "captured before using mobile_camera_frames to list timestamps and inspect only the user's selected image. "
-        "If status reports unavailable or permission_denied, report the failure.";
+               "close may return stopping while saved frames are being finalized. Call status until it reports "
+               "captured before using mobile_camera_frames to list timestamps and inspect only the user's selected "
+               "image. "
+               "If status reports unavailable or permission_denied, report the failure.";
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{"action":{"type":"string","enum":["open","status","close"]}},"required":["action"],"additionalProperties":false})";
@@ -1145,6 +1231,7 @@ void registerMobileBrowserTools(
 void registerMobilePhotoTools(MaiToolRegistry& tools,
                               const std::shared_ptr<MaiMobileHostDispatcher>& dispatcher) {
 #if defined(MAICHAT_MOBILE_IOS)
+    tools.add(std::make_unique<MaiMobileTakePhotoTool>(dispatcher));
     tools.add(std::make_unique<MaiMobileCameraFramesTool>(dispatcher));
     tools.add(std::make_unique<MaiMobileCameraCommandTool>(dispatcher));
 #else

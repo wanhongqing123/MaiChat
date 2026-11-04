@@ -142,6 +142,8 @@ final class AIMobileHostToolProvider {
             return await retainScreenFrame(arguments)
         case "mobile_camera_archive":
             return await cameraArchive(arguments)
+        case "mobile_take_photo":
+            return await takeManualPhoto(arguments)
         case "mobile_start_screen_share", "mobile_stop_screen_share", "mobile_capture_screen":
             return await executeScreenCapture(name: name, arguments: arguments)
         case "mobile_browser":
@@ -905,6 +907,70 @@ final class AIMobileHostToolProvider {
               var view = window.rootViewController else { return nil }
         while let presented = view.presentedViewController { view = presented }
         return view
+    }
+
+    /// The native Agent supplies the owner; the picker only completes after the
+    /// user presses its shutter. The resulting file stays in that workspace and
+    /// is neither attached to a draft nor opened as a vision input.
+    private func takeManualPhoto(_ arguments: [String: Any]) async -> AIMaiChatHostToolExecution {
+        guard Set(arguments.keys) == ["workspace_path", "session_id"],
+              let workspace = arguments["workspace_path"] as? String,
+              (workspace as NSString).isAbsolutePath,
+              let session = arguments["session_id"] as? String, !session.isEmpty else {
+            return .failure(code: "invalid_input", message: "manual camera requires its Session context")
+        }
+        let model = AIAssistantModel.shared
+        let camera = AIMobileLocalMediaRequests.shared
+        let lifecycle = camera.manualPhotoLifecycleGeneration
+        var pendingFile: URL?
+        do {
+            let snapshot = try model.makeCameraFrameImportSnapshot()
+            guard snapshot.importTarget.sessionID == session,
+                  snapshot.workspace == URL(fileURLWithPath: workspace, isDirectory: true)
+                    .standardizedFileURL.resolvingSymlinksInPath() else {
+                return .failure(code: "invalid_input", message: "camera belongs to another Session or workspace")
+            }
+            func validate() throws {
+                guard !Task.isCancelled, UIApplication.shared.applicationState == .active,
+                      model === AIAssistantModel.shared,
+                      camera.manualPhotoLifecycleGeneration == lifecycle,
+                      try model.makeCameraFrameImportSnapshot() == snapshot else { throw CancellationError() }
+            }
+            try validate()
+            let data = try await camera.requestManualPhoto(
+                in: session, workspacePath: snapshot.workspace.path)
+            try validate()
+            let name = "photo-" + UUID().uuidString.lowercased() + ".jpg"
+            let destination = snapshot.workspace.appendingPathComponent(name)
+            pendingFile = destination
+            try await RemoteIMBackgroundWork.file {
+                // Never recreate an account workspace that was removed while the
+                // picker was open, or follow a changed workspace symlink.
+                var directory: ObjCBool = false
+                guard snapshot.workspace.resolvingSymlinksInPath().standardizedFileURL == snapshot.workspace,
+                      FileManager.default.fileExists(atPath: snapshot.workspace.path, isDirectory: &directory),
+                      directory.boolValue else { throw CancellationError() }
+                try data.write(to: destination, options: .atomic)
+            }
+            try validate()
+            return Self.jsonSuccess(["path": name, "mime_type": "image/jpeg"])
+        } catch {
+            if let pendingFile {
+                // Cleanup must survive cancellation of the tool Task itself.
+                await Task.detached {
+                    _ = try? await RemoteIMBackgroundWork.file {
+                        try FileManager.default.removeItem(at: pendingFile)
+                    }
+                }.value
+            }
+            if error is CancellationError {
+                return .failure(code: "canceled", message: "manual photo was canceled or its Session changed")
+            }
+            if let error = error as? AIMobileLocalMediaRequestError {
+                return .failure(code: Self.localMediaErrorCode(error), message: error.localizedDescription)
+            }
+            return .failure(code: "internal", message: "manual photo could not be saved")
+        }
     }
 
     // Context fields originate from the native Agent, not the model. Resolve the

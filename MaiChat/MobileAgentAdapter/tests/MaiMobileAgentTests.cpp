@@ -34,17 +34,13 @@
 using Json = nlohmann::json;
 #if defined(__APPLE__)
 static const char* kPhotoAlbumTool = "mobile_photos_add_to_album";
-static const char* kCameraTool = "maichat_camera_command";
-static const char* kCameraArguments = "{\"action\":\"open\"}";
 #elif defined(__ANDROID__)
 static const char* kPhotoAlbumTool = "mobile_photos_copy_to_album";
-static const char* kCameraTool = "mobile_take_photo";
-static const char* kCameraArguments = "{}";
 #else
 static const char* kPhotoAlbumTool = nullptr;
+#endif
 static const char* kCameraTool = "mobile_take_photo";
 static const char* kCameraArguments = "{}";
-#endif
 #define CHECK(x)                                                      \
     do {                                                              \
         if (!(x)) {                                                   \
@@ -87,6 +83,94 @@ static void freeHostToolResponse(void*, const char* response) {
 static void releaseHostToolContext(void* context) {
     static_cast<HostToolProbe*>(context)->released = true;
 }
+
+// Exercise the actual registered tools without invoking camera hardware. Opening
+// an archived image must never dispatch a camera preview or a manual capture.
+static void cameraRoutingContract() {
+    HostToolProbe probe;
+    auto dispatcher = makeMaiMobileHostDispatcher();
+    CHECK(
+        setMaiMobileHostToolHandler(dispatcher, &probe, hostToolHandler, freeHostToolResponse, releaseHostToolContext));
+    MaiToolRegistry registry;
+    registerMobilePhotoTools(registry, dispatcher);
+    MaiTool* photo = registry.findForModel("mobile_take_photo");
+    CHECK(photo != nullptr);
+    const Json schema = Json::parse(photo->parametersSchema());
+    CHECK(schema.at("properties").empty() && schema.at("additionalProperties") == false);
+    CHECK(!photo->requiresApproval("{}"));
+    MaiToolContext context;
+    context.root = "/camera-routing-contract-workspace";
+    context.sessionId = "camera-routing-contract-session";
+    std::atomic<bool> canceled{false};
+    context.cancel = &canceled;
+#if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    MaiTool* frames = registry.findForModel("mobile_camera_frames");
+    MaiTool* preview = registry.findForModel("maichat_camera_command");
+    CHECK(frames && preview);
+    CHECK(frames->description().find("mobile_take_photo") != std::string::npos);
+    CHECK(preview->description().find("mobile_take_photo") != std::string::npos);
+    const Json frameSchema = Json::parse(frames->parametersSchema());
+    CHECK(frameSchema.at("type") == "object" && frameSchema.at("additionalProperties") == false);
+    CHECK(frameSchema.at("required") == Json::array({"request"}));
+    CHECK(frameSchema.at("properties").size() == 1);
+    const Json requestSchema = frameSchema.at("properties").at("request");
+    CHECK(requestSchema.at("type") == "object" && requestSchema.at("oneOf").size() == 3);
+    for (const auto& variant : requestSchema.at("oneOf")) {
+        CHECK(variant.at("type") == "object" && variant.at("additionalProperties") == false);
+        const Json actions = variant.at("properties").at("action").at("enum");
+        CHECK(actions.size() == 1);
+        if (actions.at(0) == "open") {
+            CHECK(variant.at("required") == Json::array({"action", "batch_id", "frame_id"}));
+        } else {
+            CHECK(!variant.at("properties").contains("frame_id"));
+            CHECK(variant.at("required") ==
+                  (actions.at(0) == "list" ? Json::array({"action"}) : Json::array({"action", "batch_id"})));
+        }
+    }
+    const auto flatRequest = frames->execute(R"({"action":"open"})", context);
+    CHECK(flatRequest.hasError() && flatRequest.error().message().find("request") != std::string::npos);
+    CHECK(frames->execute(R"({"request":{"action":"list"},"action":"list"})", context).hasError());
+    const auto missingFrame = frames->execute(R"({"request":{"action":"open"}})", context);
+    CHECK(missingFrame.hasError() && missingFrame.error().code() == MaiErrorCode::InvalidInput);
+    CHECK(missingFrame.error().message().find("batch_id") != std::string::npos &&
+          missingFrame.error().message().find("frame_id") != std::string::npos &&
+          missingFrame.error().message().find("mobile_take_photo") != std::string::npos);
+    CHECK(probe.calls.load() == 0);
+    const auto unknownAction = frames->execute(R"({"request":{"action":"start"}})", context);
+    CHECK(unknownAction.hasError() && unknownAction.error().code() == MaiErrorCode::InvalidInput);
+    CHECK(unknownAction.error().message().find("list, open, or delete_batch") != std::string::npos);
+    CHECK(frames->execute(R"({"request":{"action":"list","frame_id":"frame-example"}})", context).hasError());
+    CHECK(frames->execute(R"({"request":{"action":"delete_batch"}})", context).hasError());
+    CHECK(frames->requiresApproval(R"({"request":{"action":"delete_batch","batch_id":"batch-example"}})"));
+    CHECK(!frames->requiresApproval(R"({"request":{"action":"list"}})"));
+    CHECK(!frames->requiresApproval(R"({"action":"delete_batch","batch_id":"batch-example"})"));
+    CHECK(probe.calls.load() == 0);
+#endif
+    CHECK(!photo->execute("{}", context).hasError());
+    CHECK(probe.calls.load() == 1 && probe.lastTool == "mobile_take_photo");
+#if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    CHECK(Json::parse(probe.lastArguments) ==
+          Json({{"workspace_path", context.root}, {"session_id", context.sessionId}}));
+    CHECK(photo->execute(R"({"action":"open"})", context).hasError());
+    CHECK(photo->execute("[]", context).hasError());
+    canceled.store(true);
+    const auto canceledPhoto = photo->execute("{}", context);
+    CHECK(canceledPhoto.hasError() && canceledPhoto.error().code() == MaiErrorCode::Canceled);
+    canceled.store(false);
+    context.sessionId.clear();
+    CHECK(photo->execute("{}", context).hasError());
+    context.sessionId = "camera-routing-contract-session";
+    context.root.clear();
+    CHECK(photo->execute("{}", context).hasError());
+    CHECK(probe.calls.load() == 1);
+#else
+    CHECK(Json::parse(probe.lastArguments).empty());
+#endif
+    clearMaiMobileHostToolHandler(dispatcher);
+    CHECK(probe.released.load());
+    std::puts("PASS: registered camera tools keep manual capture separate from archived frames");
+}
+
 static std::atomic<int> localSessionChanges{0};
 static void localSessionChanged(const char* sessionId) {
     if (sessionId != nullptr && std::strncmp(sessionId, "ses_", 4) == 0)
@@ -119,7 +203,9 @@ static const char* captureHostHandler(void* context, const char* tool, const cha
                                         std::string("\x89PNG\r\n\x1a\n", 8)).hasError());
     }
     Json output{{"captured", true}};
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+// 与 HostTools 编译开关一致，使 macOS 的 iOS 宿主测试也验证完整捕获协议。
+// 保留真实 iOS 目标判定，不改变通用宿主断言。
+#if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
     if (probe->expectedTool == "mobile_retain_screen_frame") {
         const std::string root = probe->arguments.at("workspace_path");
         const std::string owner = probe->arguments.at("session_id");
@@ -151,7 +237,7 @@ static void releaseCaptureContext(void* context) {
     static_cast<ScreenCaptureProbe*>(context)->released = true;
 }
 
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
 struct CameraArchiveProbe {
     std::string root;
     std::string session;
@@ -263,7 +349,7 @@ static void cameraArchiveContract() {
     CHECK(command->execute(R"({"action":"status"})", context).hasError());
     CHECK(probe.arguments.at("workspace_path") == context.root);
     context.root = probe.root;
-    CHECK(frames->execute(R"({"action":"list","session_id":"camera-session-B"})", context).hasError());
+    CHECK(frames->execute(R"({"request":{"action":"list","session_id":"camera-session-B"}})", context).hasError());
 
     const auto archive = [&](const std::string& owner, const Json& request, const std::string& png = std::string()) {
         char* encoded = mai_screen_frame_archive_request(probe.root.c_str(), owner.c_str(), request.dump().c_str(),
@@ -298,23 +384,30 @@ static void cameraArchiveContract() {
         CHECK(archive(other, {{"action", "list"}}).at("output").at("batches").empty());
         CHECK(!archive(other, {{"action", "get"}, {"batch_id", batch}, {"frame_id", id}}).value("ok", true));
     }
-    const auto listed = frames->execute(Json{{"action", "list"}, {"batch_id", batch}}.dump(), context);
+    const auto listed = frames->execute(Json{{"request", {{"action", "list"}, {"batch_id", batch}}}}.dump(), context);
     CHECK(!listed.hasError() && Json::parse(listed.output()).at("frames").size() == 1);
+    CHECK(
+        probe.arguments ==
+        Json({{"action", "list"}, {"batch_id", batch}, {"workspace_path", probe.root}, {"session_id", probe.session}}));
     context.sessionId = "camera-session-B";
-    CHECK(frames->execute(Json{{"action", "open"}, {"batch_id", batch}, {"frame_id", id}}.dump(), context).hasError());
+    CHECK(
+        frames->execute(Json{{"request", {{"action", "open"}, {"batch_id", batch}, {"frame_id", id}}}}.dump(), context)
+            .hasError());
     context.sessionId = probe.session;
-    const auto opened = frames->execute(Json{{"action", "open"}, {"batch_id", batch}, {"frame_id", id}}.dump(), context);
+    const auto opened =
+        frames->execute(Json{{"request", {{"action", "open"}, {"batch_id", batch}, {"frame_id", id}}}}.dump(), context);
     CHECK(!opened.hasError() && opened.images().size() == 1);
     CHECK(opened.images()[0].path == original.at("path").get<std::string>());
     const auto file = workspace.path.append(MaiFilePath::fromUtf8(opened.images()[0].path));
     CHECK(!Json::parse(opened.output()).contains("archive_owner"));
     probe.cancelOnReturn = true;
-    const auto canceled = frames->execute(Json{{"action", "open"}, {"batch_id", batch}, {"frame_id", id}}.dump(), context);
+    const auto canceled =
+        frames->execute(Json{{"request", {{"action", "open"}, {"batch_id", batch}, {"frame_id", id}}}}.dump(), context);
     CHECK(canceled.hasError() && canceled.error().code() == MaiErrorCode::Canceled);
     cancel.store(false); probe.cancelOnReturn = false;
     CHECK(archive(probe.owner, {{"action", "release"}, {"batch_id", batch}, {"frame_id", id},
         {"reference_id", probe.reference}}).at("output").at("released") == false);
-    const Json discard{{"action", "delete_batch"}, {"batch_id", batch}};
+    const Json discard{{"request", {{"action", "delete_batch"}, {"batch_id", batch}}}};
     CHECK(frames->requiresApproval(discard.dump()));
     CHECK(!frames->execute(discard.dump(), context).hasError());
     std::string saved;
@@ -350,7 +443,7 @@ static void captureContract() {
     context.cancel = &cancel;
     context.sessionId = "capture-contract-owner";
 
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
     CHECK(schema["properties"]["target"]["enum"] ==
           Json::array({"current_app", "last_external"}));
     CHECK(schema["properties"]["delay_ms"]["type"] == "integer");
@@ -426,7 +519,7 @@ static void captureContract() {
     auto normal = capture->execute("{}", context);
     CHECK(!normal.hasError() && normal.images().size() == 1);
     CHECK(!probe.arguments.contains("target"));
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
     CHECK(probe.arguments["delay_ms"] == 0);
 #else
     CHECK(!probe.arguments.contains("delay_ms"));
@@ -458,7 +551,7 @@ static void captureContract() {
     auto alreadyCanceled = capture->execute("{}", context);
     CHECK(alreadyCanceled.hasError() && alreadyCanceled.error().code() == MaiErrorCode::Canceled);
     CHECK(probe.calls.load() == callsBeforeCancel + 1);
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
     cancel.store(false);
     probe.cancelOnReturn = false;
     context.sessionId = "capture-contract-owner";
@@ -546,15 +639,18 @@ static void captureContract() {
 // 按真实调用顺序检查输入和可观察结果，失败时保留定位所需的上下文。
 int main(int argc, char** argv) {
     const bool captureOnly = argc == 2 && std::strcmp(argv[1], "--capture-contract-only") == 0;
-    if (argc != 1 && !captureOnly) {
-        std::fputs("usage: MaiMobileAgentTests [--capture-contract-only]\n", stderr);
+    const bool cameraOnly = argc == 2 && std::strcmp(argv[1], "--camera-routing-contract-only") == 0;
+    if (argc != 1 && !captureOnly && !cameraOnly) {
+        std::fputs("usage: MaiMobileAgentTests [--capture-contract-only|--camera-routing-contract-only]\n", stderr);
         return 2;
     }
     try {
-        captureContract();
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+        cameraRoutingContract();
+#if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
         cameraArchiveContract();
 #endif
+        if (cameraOnly) return 0;
+        captureContract();
     }
     catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: capture contract: %s\n", error.what());
@@ -703,9 +799,7 @@ int main(int argc, char** argv) {
             if (tool["function"]["name"] == "maichat_broadcast_text")
                 hasMaiChatBroadcast = true;
             if (tool["function"]["name"] == "mobile_list_photos") hasMobilePhotos = true;
-            if (tool["function"]["name"] == "mobile_take_photo" ||
-                tool["function"]["name"] == "maichat_camera_command")
-                hasCamera = true;
+            if (tool["function"]["name"] == "mobile_take_photo") hasCamera = true;
             if (tool["function"]["name"] == "mobile_play_local_music") hasLocalMusic = true;
             if (tool["function"]["name"] == "mobile_list_albums") hasMobileAlbums = true;
             if (tool["function"]["name"] == "mobile_read_photo") hasMobilePhotoRead = true;
@@ -739,7 +833,7 @@ int main(int argc, char** argv) {
         CHECK(hasRemoteSessionList && hasRemoteSessionCreate && hasRemoteSessionDelete);
         CHECK(hasRemoteSessionWorkspace);
         CHECK(hasMobileBrowser);
-#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+#if defined(__ANDROID__) || defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
         CHECK(hasScreenShareStart && hasScreenShareStop && hasScreenCapture);
 #else
         CHECK(!hasScreenShareStart && !hasScreenShareStop && !hasScreenCapture);
@@ -973,7 +1067,7 @@ int main(int argc, char** argv) {
             {"apiKey", "test-key"},   {"model", "test"},
             {"workspace", directory}, {"database", directory + "/sessions.db"},
             {"rvmModelPath", modelPath}};
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
         config["supportsScreenCapture"] = true;
 #endif
         CHECK(call(agent, config)["ok"] == true);

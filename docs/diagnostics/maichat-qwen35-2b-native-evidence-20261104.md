@@ -2,6 +2,8 @@
 
 本记录只覆盖 macOS 27.2 arm64 的原生客户端、真实工具回灌及明确标注的本机检索 fixture，不能替代正常 App、Simulator 或 iPhone 验收。本分工没有操作设备、访问用户数据库或凭据，也没有请求线上检索/推理厂商 API。公开模型下载和 `127.0.0.1` 合成检索服务是网络范围。
 
+185 相机实机回归后的范围更正：本文 119 目录来自 Mac 条件编译的 Mobile C ABI；提交 `34936e47` 的 iOS 分支实际没有注册 `mobile_take_photo`。表中相机行仅证明这份 119 目录下的模型选择，不能证明 185 具有 iOS 手动拍照能力。后续独立捕获了启用 iOS 宏、屏幕支持及 RVM/LaMa 资源条件的旧 128/修复候选 129 目录，见 [相机目录与原生 grammar 证据](/private/tmp/maichat-ios185-camera-routing-20261104-fkcpbbm0/camera-routing-evidence.json)。原九步相关输入、输出和严格判分均保留，未通过改写旧结果掩盖该缺口。
+
 复现输入使用正式 Mobile C ABI 的公开合成工具目录：完整 system、119 个原始工具声明、截图中已知的 assistant/user 历史，末问原样为“我要看今天的新闻”。截图顶部未显示完整的首问没有补写。预期是实际生成检索调用；普通“你好”应无宿主动作，相机仅观察选择，文件读取须一次真实读取并准确消费匹配 ID 的结果。
 
 源码 HEAD 为 `b7560a61ddc03d054ac3a6f70128dd1ed88c85da` 加当时原生工作区改动；具体源文件 SHA、实际链接命令和产物 SHA 见下列证据。运行 profile 为 **32768 context、temperature 0、seed 0、maximumTokens 0、非思考、原生 AUTO**。最终代表复测重新编译、链接生产 archive，`extra_objects=[]`，没有私有 validator/runtime 覆盖，没有强制路由、关键词分流或脚本回答。

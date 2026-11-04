@@ -131,3 +131,18 @@ Android 2.2.22/259 在专用 emulator-5580 安装、冷启动，PID5226；两个
 
 剩余已知模型限制为很长随机绝对路径复制不可靠、metadata 声明过选造成额外开销。
 本次修复不等于所有模型任务均可靠，也不包含尚未解决的美颜肤质/全身皮肤覆盖问题。
+
+## 最终产品提交绑定
+
+2026-11-04 对产品提交 `34936e476f5cc43e73b9a3c7fd9d577f7310253d` 完成只读绑定：
+平台冻结输入 942 项、原生输入 9 项及 iOS 输入 29 项，共 960 个唯一文件，其原始 Git
+blob 的 SHA-256 均与构建时冻结输入一致。重新计算两个 Android APK、Desktop App 全部
+242 个普通文件，以及 iOS 11 个 Mach-O 和 1396198496 字节模型，均与原冻结哈希一致。
+
+既有 Simulator 185 的 xcresult 回读为 4/4 通过；真机安装、启动、版本与进程回执绑定到
+2.2.4/185、bundle UUID `4C80399A-6598-424F-A467-2A4AA192C8D7`、PID27276。本次仅
+读取既有回执，没有重新构建、签名、运行测试或操作设备，不新增真机模型体验验收结论。
+
+Android、Desktop、iOS 冻结目录及原生证据目录各新增 `final-source-binding.json`。
+中央绑定为 `/private/tmp/maichat-local-platform259242-20261104-acymy8tu/final-source-binding.json`，
+SHA-256 为 `6bd8c7dfab47c6277a05ffb2551e15d540d662a95b534f5711097d9f0f1bf047`。

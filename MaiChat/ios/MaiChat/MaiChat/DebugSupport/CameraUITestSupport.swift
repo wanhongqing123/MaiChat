@@ -4,10 +4,17 @@ import SwiftUI
 import UIKit
 
 enum AICameraUITestSupport {
+    static var isManualToolRequested: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ai-ui-test") &&
+            ProcessInfo.processInfo.arguments.contains("--ai-manual-camera-tool-ui-test")
+    }
+
     static var isManualRequested: Bool {
         ProcessInfo.processInfo.arguments.contains("--ai-ui-test") &&
-            ProcessInfo.processInfo.arguments.contains("--ai-manual-camera-ui-test")
+            (ProcessInfo.processInfo.arguments.contains("--ai-manual-camera-ui-test") || isManualToolRequested)
     }
+
+    @MainActor private(set) static var manualFixtureWorkspace: URL?
 
     static var isRequested: Bool {
         ProcessInfo.processInfo.arguments.contains("--agent-camera-ui-test")
@@ -21,6 +28,7 @@ enum AICameraUITestSupport {
             .appendingPathComponent("Workspace", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+            manualFixtureWorkspace = workspace
             model.installSessionSwitchUITestFixture()
             model.ready = false
             model.installVideoToolTestWorkspace(workspace.path)
@@ -66,8 +74,134 @@ struct AIManualCameraUITestPreview: View {
                     onCapture(image)
                 }.accessibilityIdentifier("ai-manual-camera-shutter")
                 Button("取消", action: onCancel).accessibilityIdentifier("ai-manual-camera-cancel")
+                if AICameraUITestSupport.isManualToolRequested {
+                    AICameraManualToolUITestPreviewControls()
+                }
             }
             .font(.headline).foregroundStyle(.white)
+        }
+    }
+}
+
+/// 只在双重 opt-in 的独立工作区内调用正式宿主；不生成模型回复，也不修改生产草稿。
+@MainActor
+private final class AICameraManualToolUITestState: ObservableObject {
+    static let shared = AICameraManualToolUITestState()
+    @Published private(set) var result = "idle"
+    @Published private(set) var path = ""
+    @Published private(set) var mimeType = ""
+    @Published private(set) var fileCount = 0
+    @Published private(set) var verified = false
+    private var task: Task<Void, Never>?
+
+    func start() {
+        let model = AIAssistantModel.shared
+        guard AICameraUITestSupport.isManualToolRequested, task == nil, model.ready,
+              let workspace = AICameraUITestSupport.manualFixtureWorkspace,
+              model.workspacePath == workspace.path,
+              model.uiTestSupport.screenFrameAccountID == "manual-camera-ui-fixture-owner",
+              model.selected.hasPrefix("switch-") else { return }
+        let context = ["workspace_path": workspace.path, "session_id": model.selected]
+        guard let data = try? JSONSerialization.data(withJSONObject: context) else { return }
+        result = "pending"
+        path = ""
+        mimeType = ""
+        verified = false
+        refreshFiles()
+        task = Task { @MainActor in
+            let receipt = await AIMobileHostToolProvider.shared.execute(name: "mobile_take_photo",
+                argumentsJSON: String(decoding: data, as: UTF8.self))
+            defer { task = nil; refreshFiles() }
+            if let code = receipt.errorCode { result = code; return }
+            guard let output = receipt.output?.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: output) as? [String: Any],
+                  let returnedPath = object["path"] as? String,
+                  let returnedMime = object["mime_type"] as? String else {
+                result = "invalid_receipt"; return
+            }
+            path = returnedPath
+            mimeType = returnedMime
+            let image = workspace.appendingPathComponent(returnedPath).standardizedFileURL
+                .resolvingSymlinksInPath()
+            let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path + "/"
+            verified = !returnedPath.hasPrefix("/") && image.path.hasPrefix(root) &&
+                returnedMime == "image/jpeg" && UIImage(contentsOfFile: image.path) != nil
+            result = "succeeded"
+        }
+    }
+
+    func cancelTask() {
+        guard AICameraUITestSupport.isManualToolRequested else { return }
+        task?.cancel()
+    }
+
+    func switchSession() {
+        guard AICameraUITestSupport.isManualToolRequested, task != nil else { return }
+        let model = AIAssistantModel.shared
+        _ = model.selectUITestConversationIfNeeded(model.selected == "switch-A" ? "switch-B" : "switch-A")
+    }
+
+    /// 显式刷新而非定时轮询，保证越过两秒后的文件断言来自当前磁盘。
+    func refreshFiles() {
+        guard AICameraUITestSupport.isManualToolRequested,
+              let workspace = AICameraUITestSupport.manualFixtureWorkspace,
+              let files = FileManager.default.enumerator(at: workspace,
+                includingPropertiesForKeys: [.isRegularFileKey]) else { fileCount = 0; return }
+        fileCount = files.compactMap { $0 as? URL }.filter {
+            ["jpg", "jpeg", "png", "heic"].contains($0.pathExtension.lowercased()) &&
+                (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        }.count
+    }
+}
+
+private struct AICameraManualToolUITestStatus: View {
+    let prefix: String
+    @ObservedObject private var state = AICameraManualToolUITestState.shared
+    @ObservedObject private var model = AIAssistantModel.shared
+    @ObservedObject private var requests = AIMobileLocalMediaRequests.shared
+
+    var body: some View {
+        HStack {
+            Text("工具状态").accessibilityIdentifier(prefix + "-state")
+                .accessibilityValue("result:\(state.result);files:\(state.fileCount);attachments:\(model.pendingAttachments.values.flatMap { $0 }.count);request:\(requests.manualPhotoRequestID != nil);verified:\(state.verified)")
+            Text("返回路径").accessibilityIdentifier(prefix + "-path").accessibilityValue(state.path)
+            Text("返回类型").accessibilityIdentifier(prefix + "-mime").accessibilityValue(state.mimeType)
+            Text("会话").accessibilityIdentifier(prefix + "-session").accessibilityValue(model.selected)
+        }.font(.caption)
+    }
+}
+
+struct AICameraManualToolUITestControls: View {
+    @ObservedObject private var state = AICameraManualToolUITestState.shared
+    @ObservedObject private var model = AIAssistantModel.shared
+
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack {
+                Button("执行手动拍照工具") { state.start() }
+                    .disabled(!model.ready || state.result == "pending")
+                    .accessibilityIdentifier("ai-manual-camera-tool-open")
+                Button("刷新工具状态") { state.refreshFiles() }
+                    .accessibilityIdentifier("ai-manual-camera-tool-refresh")
+            }
+            AICameraManualToolUITestStatus(prefix: "ai-manual-camera-tool")
+        }
+    }
+}
+
+/// 覆盖层中的取消按钮操作持有正式工具执行的 Task，切会话走现有隔离会话接口。
+private struct AICameraManualToolUITestPreviewControls: View {
+    @ObservedObject private var state = AICameraManualToolUITestState.shared
+
+    var body: some View {
+        VStack(spacing: 12) {
+            AICameraManualToolUITestStatus(prefix: "ai-manual-camera-tool-preview")
+            Button("刷新工具状态") { state.refreshFiles() }
+                .accessibilityIdentifier("ai-manual-camera-tool-preview-refresh")
+            Button("取消工具 Task") { state.cancelTask() }
+                .accessibilityIdentifier("ai-manual-camera-tool-cancel-task")
+            Button("切换测试会话") { state.switchSession() }
+                .accessibilityIdentifier("ai-manual-camera-tool-switch-session")
         }
     }
 }

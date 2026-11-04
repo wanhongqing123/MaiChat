@@ -1032,6 +1032,8 @@ struct MaiMobileAgent {
         const double total =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         const auto state = getSharedMaiLlamaRuntime()->status();
+        Json advertised = Json::array();
+        for (const auto& tool : input.tools) advertised.push_back(tool.name);
         // 完整原生调用也是有效的测量结果，但它不代表工具已执行。
         // 回传实际名称、参数和 ID，避免把“返回了文本”误当成任务质量验收。
         Json response{{"ok", !error && (!calls.empty() || !output.empty())},
@@ -1039,6 +1041,7 @@ struct MaiMobileAgent {
                       {"tool_call_count", calls.size()},
                       {"tool_calls", std::move(calls)},
                       {"tools_executed", false},
+                      {"advertised_tool_names", std::move(advertised)},
                       {"first_token_ms", firstToken},
                       {"total_ms", total},
                       {"wire", maiWireApiToString(primaryWire)},

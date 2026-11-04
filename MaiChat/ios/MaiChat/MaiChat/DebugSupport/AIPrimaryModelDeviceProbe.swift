@@ -101,7 +101,14 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
                 "appRoot": temporary.path, "modelProvider": "llama", "wire": "local",
                 "model": "local-device-probe-qwen3.5", "localModelPath": model.path,
                 "localProjectorPath": "", "localContextSize": 32768, "localMaximumTokens": 0,
-                "localThreads": 2, "policy": "on-request", "supportsScreenCapture": false])
+                "localThreads": 2, "policy": "on-request",
+                "supportsScreenCapture": aiSupportsWholeDeviceScreenCapture(),
+                "temporaryDirectory": temporary.appendingPathComponent("Temporary").path,
+                "cacheDirectory": temporary.appendingPathComponent("Cache").path,
+                "rvmModelPath": Bundle.main.url(forResource: "rvm_mobilenetv3_fp32", withExtension: "onnx",
+                    subdirectory: "MaiAgentModels")?.path ?? "",
+                "lamaModelPath": Bundle.main.url(forResource: "lama_fp32", withExtension: "onnx",
+                    subdirectory: "MaiAgentModels")?.path ?? ""])
             let prompts = ["Reply with one short sentence: Hello from Qwen. Do not call any tools.",
                 "What exact phrase did you just say? Reply briefly. Do not call any tools."]
             var messages: [[String: String]] = []
@@ -115,6 +122,7 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
                 // 超时由 C++ 当前调用自己的取消 token 控制，不中断普通 Root 或其他 handle。
                 let output = try request(created, ["op": "local_model_probe",
                     "messages": messages, "timeout_ms": 120000], requireSuccess: false)
+                report["advertised_tool_names"] = output["advertised_tool_names"]
                 ownedGeneration = mai_local_inference_status().model_generation
                 let success = output["ok"] as? Bool == true
                 let text = output["text"] as? String ?? ""
@@ -163,7 +171,7 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
                     ["role": "assistant", "content": "抱歉，我可能理解错了。请告诉我你接下来需要什么帮助？"],
                     ["role": "user", "content": "我要看今天的新闻"]], "web_search"),
                 ("fresh_news", [["role": "user", "content": "我要看今天的新闻"]], "web_search"),
-                ("camera_selection", [["role": "user", "content": "打开相机"]], "mobile_take_photo")
+                ("camera_selection", [["role": "user", "content": "打开相机拍照"]], "mobile_take_photo")
             ]
             var selections: [[String: Any]] = []
             for (name, input, expectedTool) in selectionCases {

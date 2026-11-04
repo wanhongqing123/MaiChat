@@ -424,6 +424,7 @@ struct AIAssistantView: View {
         .onChange(of: isActive) { active in
             browser.setPageVisible(active)
             if !active { browser.dismissPage() }
+            if !active { AIMobileLocalMediaRequests.shared.invalidateManualPhoto() }
             guard !usesStandaloneUITestFixture else { return }
             if active {
                 model.setPageActive(true)
@@ -2776,6 +2777,7 @@ private struct AIComposerSnapshot: Equatable {
 private struct AICameraPresentation: Identifiable {
     enum Mode {
         case manual(AIAttachmentImportTarget)
+        case manualTool(UUID)
         case timed(UUID)
     }
 
@@ -2784,6 +2786,11 @@ private struct AICameraPresentation: Identifiable {
 
     var timedRequestID: UUID? {
         if case .timed(let requestID) = mode { return requestID }
+        return nil
+    }
+
+    var manualToolRequestID: UUID? {
+        if case .manualTool(let requestID) = mode { return requestID }
         return nil
     }
 }
@@ -2816,6 +2823,7 @@ private struct AIComposer: View, Equatable {
     @State private var isPhotoPickerPresented = false
     @State private var cameraPresentation: AICameraPresentation?
     @State private var manualCameraOpening = false
+    @State private var manualToolPresentationRequestID: UUID?
     @State private var selectedMediaItems: [PhotosPickerItem] = []
     @State private var libraryTarget: AIAttachmentImportTarget?
     @State private var fileTarget: AIAttachmentImportTarget?
@@ -2949,6 +2957,9 @@ private struct AIComposer: View, Equatable {
             screenFramesStrip
             cameraFramesStrip
             #if DEBUG && targetEnvironment(simulator)
+            if AICameraUITestSupport.isManualToolRequested {
+                AICameraManualToolUITestControls()
+            }
             if AICameraUITestSupport.isRequested {
                 AICameraUITestControls {
                     do {
@@ -3140,6 +3151,10 @@ private struct AIComposer: View, Equatable {
                 photoLibrary: .shared()
             )
             .fullScreenCover(item: $cameraPresentation, onDismiss: {
+                if let id = manualToolPresentationRequestID {
+                    manualToolPresentationRequestID = nil
+                    localMediaRequests.failManualPhoto(.canceled, requestID: id)
+                }
                 if let binding = cameraReviewAfterDismiss {
                     cameraReviewAfterDismiss = nil
                     cameraFrameSelection = binding
@@ -3193,6 +3208,17 @@ private struct AIComposer: View, Equatable {
                     }
                 )
                     .ignoresSafeArea()
+                case .manualTool(let requestID):
+                    AIMobileManualCameraPicker(onCapture: { image in
+                        guard cameraPresentation?.id == presentation.id,
+                              localMediaRequests.manualPhotoRequestID == requestID else { return }
+                        cameraPresentation = nil
+                        localMediaRequests.finishManualPhoto(image, requestID: requestID)
+                    }, onCancel: {
+                        guard cameraPresentation?.id == presentation.id else { return }
+                        cameraPresentation = nil
+                        localMediaRequests.failManualPhoto(.canceled, requestID: requestID)
+                    }).ignoresSafeArea()
                 }
             }
             .fullScreenCover(item: $draftVideoPreview) { item in
@@ -3218,6 +3244,7 @@ private struct AIComposer: View, Equatable {
                 if status == "stopped" { presentFinishedScreenFrames() }
             }
             .onChange(of: snapshot.screenFrameAccountID) { _ in
+                localMediaRequests.invalidateManualPhoto()
                 screenFrameSelection = nil
                 cameraFrameSelection = nil
                 cameraReviewAfterDismiss = nil
@@ -3233,6 +3260,7 @@ private struct AIComposer: View, Equatable {
                 Task { await finishToolCamera(reason: "camera_error", requestID: id) }
             }
             .onChange(of: scenePhase) { phase in
+                if phase == .background { localMediaRequests.invalidateManualPhoto() }
                 if phase == .background, let id = toolCameraRequestID {
                     Task { await finishToolCamera(reason: "interrupted", requestID: id) }
                 }
@@ -3342,6 +3370,13 @@ private struct AIComposer: View, Equatable {
                 }
                 Task { await openToolCamera(requestID: request) }
             }
+            .onChange(of: localMediaRequests.manualPhotoRequestID) { request in
+                guard let request else {
+                    if cameraPresentation?.manualToolRequestID != nil { cameraPresentation = nil }
+                    return
+                }
+                Task { await openManualToolCamera(requestID: request) }
+            }
             .onChange(of: localMediaRequests.musicRequestID) { request in
                 guard request != nil else { return }
                 musicSelectionReceived = false
@@ -3422,6 +3457,7 @@ private struct AIComposer: View, Equatable {
             .onChange(of: appState.remoteDiagnosticsIdentity) { _ in
                 // 当前页面即使复用相同 Session，也不能沿用上一轮账号认证的识别会话。
                 cancelVoiceTranscription(restoresDraft: true)
+                localMediaRequests.invalidateManualPhoto()
                 cameraFrameSelection = nil
                 if let id = toolCameraRequestID {
                     Task { await finishToolCamera(reason: "interrupted", requestID: id) }
@@ -3429,6 +3465,7 @@ private struct AIComposer: View, Equatable {
             }
             .onDisappear {
                 music.stop()
+                if cameraPresentation == nil { localMediaRequests.invalidateManualPhoto() }
                 if cameraPresentation == nil, let id = toolCameraRequestID {
                     Task { await finishToolCamera(reason: "interrupted", requestID: id) }
                 }
@@ -3452,6 +3489,7 @@ private struct AIComposer: View, Equatable {
             }
             .onChange(of: snapshot.selected) { selected in
                 cancelVoiceTranscription(restoresDraft: true)
+                localMediaRequests.invalidateManualPhoto()
                 if let id = toolCameraRequestID {
                     Task { await finishToolCamera(reason: "interrupted", requestID: id) }
                 }
@@ -3467,6 +3505,9 @@ private struct AIComposer: View, Equatable {
                 draftImportTarget = selected.isEmpty ? model.importTarget() : nil
                 if storageSession != selected { draft = model.drafts[selected] ?? "" }
                 if !snapshot.attachments.isEmpty { isVoiceMode = false }
+            }
+            .onChange(of: snapshot.workspacePath) { _ in
+                localMediaRequests.invalidateManualPhoto()
             }
             .onChange(of: snapshot.remoteRestoreGeneration) { _ in
                 guard model.selectedRemote != nil, draftSession == model.selected,
@@ -3613,7 +3654,8 @@ private struct AIComposer: View, Equatable {
 
     private func openCamera() async {
         guard cameraPresentation == nil, !manualCameraOpening, !cameraFinishing,
-              toolCameraRequestID == nil, localMediaRequests.cameraRequestID == nil else {
+              toolCameraRequestID == nil, localMediaRequests.cameraRequestID == nil,
+              localMediaRequests.manualPhotoRequestID == nil else {
             model.showTransientError("相机正在使用中，请先结束当前拍摄")
             return
         }
@@ -3639,7 +3681,49 @@ private struct AIComposer: View, Equatable {
                 return
             }
         }
+        guard model.importTarget() == target,
+              UIApplication.shared.applicationState == .active else { return }
         cameraPresentation = AICameraPresentation(mode: .manual(target))
+    }
+
+    /// Manual tool capture shares the normal shutter presentation. Its request
+    /// identity remains separate from periodic capture and never owns a draft.
+    private func openManualToolCamera(requestID: UUID) async {
+        guard localMediaRequests.beginManualPhotoOpening(requestID: requestID) else { return }
+        defer { localMediaRequests.finishManualPhotoOpening(requestID: requestID) }
+        guard cameraPresentation == nil, !manualCameraOpening, !cameraFinishing,
+              toolCameraRequestID == nil, localMediaRequests.cameraRequestID == nil else {
+            localMediaRequests.failManualPhoto(.unavailable, requestID: requestID)
+            return
+        }
+        manualCameraOpening = true
+        defer { manualCameraOpening = false }
+        #if DEBUG && targetEnvironment(simulator)
+        let simulated = AICameraUITestSupport.isManualRequested
+        #else
+        let simulated = false
+        #endif
+        guard simulated || UIImagePickerController.isSourceTypeAvailable(.camera) else {
+            localMediaRequests.failManualPhoto(.unavailable, requestID: requestID)
+            return
+        }
+        if !simulated {
+            let granted = await requestCameraPermission()
+            guard localMediaRequests.manualPhotoRequestID == requestID else { return }
+            guard granted else {
+                localMediaRequests.failManualPhoto(.permissionDenied, requestID: requestID)
+                return
+            }
+        }
+        guard localMediaRequests.manualPhotoRequestID == requestID,
+              model.selected == localMediaRequests.manualPhotoSessionID,
+              (try? model.makeCameraFrameImportSnapshot().workspace.path) == localMediaRequests.manualPhotoWorkspacePath,
+              UIApplication.shared.applicationState == .active else {
+            localMediaRequests.failManualPhoto(.canceled, requestID: requestID)
+            return
+        }
+        manualToolPresentationRequestID = requestID
+        cameraPresentation = AICameraPresentation(mode: .manualTool(requestID))
     }
 
     private func openToolCamera(requestID: UUID) async {
@@ -3654,7 +3738,7 @@ private struct AIComposer: View, Equatable {
         defer { localMediaRequests.finishCameraOpening(requestID: requestID) }
         // 手动快门包括授权过程都独占自己的 presentation；Agent 请求不能改写它的模式。
         guard cameraPresentation == nil, !manualCameraOpening, !cameraFinishing,
-              toolCameraRequestID == nil else {
+              toolCameraRequestID == nil, localMediaRequests.manualPhotoRequestID == nil else {
             localMediaRequests.failCamera(.unavailable, requestID: requestID)
             return
         }
@@ -4975,10 +5059,14 @@ final class AIMobileLocalMediaRequests: ObservableObject {
     static let shared = AIMobileLocalMediaRequests()
 
     @Published private(set) var cameraRequestID: UUID?
+    @Published private(set) var manualPhotoRequestID: UUID?
     @Published private(set) var musicRequestID: UUID?
     @Published private(set) var musicPresentationID: UUID?
     private(set) var cameraSessionID = ""
     private(set) var cameraWorkspacePath = ""
+    private(set) var manualPhotoSessionID = ""
+    private(set) var manualPhotoWorkspacePath = ""
+    private(set) var manualPhotoLifecycleGeneration: UInt64 = 0
     private(set) var cameraState = "closed"
     var presenterActive = false
     private var lastCameraSessionID = ""
@@ -4989,12 +5077,15 @@ final class AIMobileLocalMediaRequests: ObservableObject {
     private var cameraStartInFlight = false
     private var cameraFrameCount = 0
     private var musicCompletion: CheckedContinuation<String, Error>?
+    private var manualPhotoCompletion: CheckedContinuation<Data, Error>?
+    private var manualPhotoOpeningID: UUID?
 
 
 
     func openCamera(in sessionID: String, workspacePath: String) throws -> String {
         guard presenterActive, UIApplication.shared.applicationState == .active,
               cameraRequestID == nil, cameraState != "stopping",
+              manualPhotoRequestID == nil, manualPhotoOpeningID == nil,
               !sessionID.isEmpty, !workspacePath.isEmpty else {
             throw AIMobileLocalMediaRequestError.unavailable
         }
@@ -5015,6 +5106,73 @@ final class AIMobileLocalMediaRequests: ObservableObject {
             if cameraRequestID == id { closeCamera(in: sessionID) }
         }
         return cameraState
+    }
+
+    /// A single completion belongs to one manual shutter. Cancellation and late
+    /// UIKit callbacks use that identity so they cannot finish a later request.
+    func requestManualPhoto(in sessionID: String, workspacePath: String) async throws -> Data {
+        try Task.checkCancellation()
+        guard presenterActive, UIApplication.shared.applicationState == .active,
+              cameraRequestID == nil, cameraState != "stopping",
+              manualPhotoRequestID == nil, manualPhotoOpeningID == nil,
+              !sessionID.isEmpty, !workspacePath.isEmpty else {
+            throw AIMobileLocalMediaRequestError.unavailable
+        }
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                manualPhotoCompletion = continuation
+                manualPhotoSessionID = sessionID
+                manualPhotoWorkspacePath = workspacePath
+                manualPhotoRequestID = id
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(120))
+                    failManualPhoto(.canceled, requestID: id)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in self.failManualPhoto(.canceled, requestID: id) }
+        }
+    }
+
+    func beginManualPhotoOpening(requestID: UUID) -> Bool {
+        guard manualPhotoRequestID == requestID, manualPhotoOpeningID == nil else { return false }
+        manualPhotoOpeningID = requestID
+        return true
+    }
+
+    func finishManualPhotoOpening(requestID: UUID) {
+        if manualPhotoOpeningID == requestID { manualPhotoOpeningID = nil }
+    }
+
+    func finishManualPhoto(_ image: UIImage, requestID: UUID) {
+        guard manualPhotoRequestID == requestID, let completion = manualPhotoCompletion else { return }
+        guard let data = image.jpegData(compressionQuality: 0.9), !data.isEmpty else {
+            failManualPhoto(.failed, requestID: requestID)
+            return
+        }
+        manualPhotoCompletion = nil
+        manualPhotoRequestID = nil
+        manualPhotoSessionID = ""
+        manualPhotoWorkspacePath = ""
+        completion.resume(returning: data)
+    }
+
+    func failManualPhoto(_ error: AIMobileLocalMediaRequestError, requestID: UUID? = nil) {
+        if let requestID, manualPhotoRequestID != requestID { return }
+        guard let completion = manualPhotoCompletion else { return }
+        manualPhotoCompletion = nil
+        manualPhotoRequestID = nil
+        manualPhotoSessionID = ""
+        manualPhotoWorkspacePath = ""
+        completion.resume(throwing: error)
+    }
+
+    /// Also invalidates the short save interval after the shutter completed, so
+    /// leaving and returning to the same owner cannot revive a canceled result.
+    func invalidateManualPhoto() {
+        manualPhotoLifecycleGeneration &+= 1
+        failManualPhoto(.canceled)
     }
 
     func markCameraVisible(_ requestID: UUID, batchID: String) {
@@ -5148,6 +5306,7 @@ final class AIMobileLocalMediaRequests: ObservableObject {
         presenterActive = false
         // 退出页面与工具关闭共享同一封存流程，不能把仍在异步启动的请求直接标成已关闭。
         if cameraRequestID != nil { _ = closeCamera(in: cameraSessionID) }
+        invalidateManualPhoto()
         failMusic(.canceled)
     }
 }
