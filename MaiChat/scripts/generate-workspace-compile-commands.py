@@ -119,6 +119,7 @@ def main() -> None:
     output = WORKSPACE / "compile_commands.json"
     atomic_json(output, [commands[p] for p in sorted(commands)])
     for alias in [WORKSPACE / "MaiChat/compile_commands.json",
+                  WORKSPACE / "MaiChat/MobileAgentAdapter/compile_commands.json",
                   WORKSPACE / "MaiChat/ios/MaiChat/compile_commands.json",
                   WORKSPACE / "MaiAgent/compile_commands.json"]:
         install_alias(alias, output)

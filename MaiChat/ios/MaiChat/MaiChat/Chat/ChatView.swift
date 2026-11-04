@@ -7215,6 +7215,8 @@ struct ComposerTextView: UIViewRepresentable {
     let onVoiceLongPressChanged: (CGSize, CGPoint) -> Void
     let onVoiceLongPressEnded: (CGSize, CGPoint) -> Void
     let onVoiceLongPressCancelled: () -> Void
+    // 创作中心用键盘发送附件时可能没有文字；其他 IM 输入框维持原自动禁用空回车行为。
+    var allowsEmptySubmit = false
     var registerTextView: (UITextView?) -> Void = { _ in }
     var accessibilityIdentifier = "message-composer-text-view"
     var accessibilityLabel = "消息输入框，长按语音转文字"
@@ -7255,7 +7257,7 @@ struct ComposerTextView: UIViewRepresentable {
             ]
         )
         textView.returnKeyType = .send
-        textView.enablesReturnKeyAutomatically = true
+        textView.enablesReturnKeyAutomatically = !allowsEmptySubmit
         textView.textContainerInset = UIEdgeInsets(
             top: verticalInset,
             left: 13,
@@ -7317,6 +7319,10 @@ struct ComposerTextView: UIViewRepresentable {
         let started = ProcessInfo.processInfo.systemUptime
         defer { AppDiagnosticLog.shared.recordDuration(.composerUpdate, since: started) }
         context.coordinator.parent = self
+        if textView.enablesReturnKeyAutomatically == allowsEmptySubmit {
+            textView.enablesReturnKeyAutomatically = !allowsEmptySubmit
+            if textView.isFirstResponder { textView.reloadInputViews() }
+        }
         editingController.textView = textView
         registerTextView(textView)
         if textView.text != text {

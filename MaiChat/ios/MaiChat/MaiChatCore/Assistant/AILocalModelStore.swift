@@ -1,5 +1,5 @@
-// 文件作用：持久化本机 GGUF 目录，供普通推理界面和 Agent 共用真实的沙盒文件。
-// 导入只创建新 UUID 文件；没有替换/删除 API，避免改写共享 runtime 正在 mmap 的模型。
+// 文件作用：安装随 App 分发的固定主模型，并保留普通调用和 Agent 共用的 GGUF 沙盒目录。
+// 内置文件以内容版本命名，导入只创建新 UUID；不替换已被共享 runtime mmap 的文件。
 import Foundation
 import CryptoKit
 
@@ -32,6 +32,7 @@ public struct AILocalModelSelection: Sendable {
 
 public enum AILocalModelStoreError: Error, LocalizedError {
     case invalidFile, invalidGGUF, tooLarge, catalogFull, invalidCatalog, unavailable, busy
+    case bundledResourceMissing, bundledResourceInvalid
 
     public var errorDescription: String? {
         switch self {
@@ -42,12 +43,18 @@ public enum AILocalModelStoreError: Error, LocalizedError {
         case .invalidCatalog: "本地模型目录不可读取，现有文件已保留"
         case .unavailable: "模型文件不可用，请重新导入；已有文件不会被覆盖"
         case .busy: "正在导入模型，请稍后再试"
+        case .bundledResourceMissing: "App 内置本地模型资源缺失，请重新安装完整版本"
+        case .bundledResourceInvalid: "App 内置本地模型校验失败，请重新安装完整版本"
         }
     }
 }
 
 public actor AILocalModelStore {
     public static let shared = AILocalModelStore()
+    public static let bundledPrimaryID = "builtin-qwen3.5-2b-q4_k_m"
+    public static let bundledPrimaryBytes: UInt64 = 1_396_198_496
+    public static let bundledPrimarySHA256 = "57a1085840f497d764a7fc5d346922dbde961efb54cc792ea81d694fd846a1d8"
+    // Tiny 只保留给已有 Debug 引擎自检；正常 App 的默认主模型始终是上面的 Qwen。
     public static let builtinID = "builtin-stories260K"
     public static let builtinBytes: UInt64 = 1_185_376
     public static let builtinSHA256 = "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d"
@@ -56,28 +63,144 @@ public actor AILocalModelStore {
     private struct StoredCatalog: Codable {
         var version = 1
         var entries: [AILocalModelEntry] = []
-        var selectedModelID: String? = AILocalModelStore.builtinID
+        var selectedModelID: String? = AILocalModelStore.bundledPrimaryID
         var selectedProjectorID: String?
     }
 
     private let directory: URL
     private let builtinSource: URL?
+    private let bundledPrimaryDirectory: URL?
+    private let bundledPrimaryDescriptor: BundledPrimaryDescriptor
     private var catalog = StoredCatalog()
     private var loaded = false
     private var importing = false
     private var builtinURL: URL?
+    private var bundledPrimaryURL: URL?
+
+    /// 运行时清单必须与编译时固定身份完全相同，不能借修改清单选择另一份权重。
+    /// 内部描述注入只给小文件 Foundation 测试使用，不向 App 暴露可变生产模型入口。
+    struct BundledPrimaryDescriptor: Codable, Equatable, Sendable {
+        let version: Int
+        let id: String
+        let name: String
+        let filename: String
+        let bytes: UInt64
+        let sha256: String
+        let revision: String
+
+        var installedFilename: String {
+            String(filename.dropLast(5)) + "-" + sha256 + ".gguf"
+        }
+    }
+
+    private static let primaryDescriptor = BundledPrimaryDescriptor(version: 1,
+        id: bundledPrimaryID, name: "Qwen3.5 2B · Q4_K_M",
+        filename: "Qwen_Qwen3.5-2B-Q4_K_M.gguf", bytes: bundledPrimaryBytes,
+        sha256: bundledPrimarySHA256, revision: "7d26695454df6de5fbcce2e58681e62dae06ce43")
+
+    // 升级只迁移旧内置模型的选择 ID，不覆盖仍可能被 mmap 的内容版本文件，
+    // 也不把普通导入模型或 projector 当成新的内置模型。
+    private static func currentPrimaryID(_ id: String) -> String {
+        id == "builtin-qwen2.5-0.5b-instruct-q4_k_m" ? bundledPrimaryID : id
+    }
 
     /// 自定义目录只用于隔离的普通 Foundation 测试；正式文件位于 App Documents 下，
     /// 不在只读 Bundle 中，因此 Agent 的 NSHomeDirectory 文件边界也能访问同一份模型。
-    public init(directory: URL? = nil, builtinSource: URL? = nil) {
+    public init(directory: URL? = nil, builtinSource: URL? = nil, bundle: Bundle = .main) {
         self.directory = directory ?? Self.defaultDirectory
-        self.builtinSource = builtinSource ?? Bundle.main.url(
+        self.builtinSource = builtinSource ?? bundle.url(
             forResource: "stories260K", withExtension: "gguf", subdirectory: "MaiLocalModels")
+        self.bundledPrimaryDirectory = bundle.url(forResource: "manifest", withExtension: "json",
+            subdirectory: "MaiLocalModels/Primary")?.deletingLastPathComponent()
+        self.bundledPrimaryDescriptor = Self.primaryDescriptor
+    }
+
+    init(directory: URL, bundledPrimaryDirectory: URL?, descriptor: BundledPrimaryDescriptor) {
+        self.directory = directory
+        self.builtinSource = nil
+        self.bundledPrimaryDirectory = bundledPrimaryDirectory
+        self.bundledPrimaryDescriptor = descriptor
     }
 
     private static var defaultDirectory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MaiLocalModels", isDirectory: true)
+    }
+
+    /// 首次使用在 actor 工作队列把 App 内资源复制到 Agent 可访问的沙盒内。
+    /// 不读取导入目录的选择、不下载、不附加 projector；每次解析核对实际文件 SHA。
+    public func bundledPrimarySelection() throws -> AILocalModelSelection {
+        guard let sourceDirectory = bundledPrimaryDirectory else {
+            throw AILocalModelStoreError.bundledResourceMissing
+        }
+        let descriptor = bundledPrimaryDescriptor
+        let manifest = sourceDirectory.appendingPathComponent("manifest.json")
+        guard FileManager.default.fileExists(atPath: manifest.path) else {
+            throw AILocalModelStoreError.bundledResourceMissing
+        }
+        let values = try Self.uncachedValues(manifest, keys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true,
+              let size = values.fileSize, size > 0, size <= 16 * 1024 else {
+            throw AILocalModelStoreError.bundledResourceInvalid
+        }
+        let handle = try FileHandle(forReadingFrom: manifest)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: 16 * 1024 + 1) ?? Data()
+        guard data.count <= 16 * 1024,
+              let actual = try? JSONDecoder().decode(BundledPrimaryDescriptor.self, from: data),
+              actual == descriptor else { throw AILocalModelStoreError.bundledResourceInvalid }
+        let source = sourceDirectory.appendingPathComponent(descriptor.filename)
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            throw AILocalModelStoreError.bundledResourceMissing
+        }
+        let installed: URL
+        do {
+            installed = try Self.installPinnedModel(source: source, directory: directory,
+                filename: descriptor.installedFilename, bytes: descriptor.bytes, sha256: descriptor.sha256)
+        } catch let error as AILocalModelStoreError {
+            switch error {
+            // 内置资源的错误不能提示用户导入文件；普通导入路径仍使用原来的细分错误。
+            case .invalidFile, .invalidGGUF, .tooLarge, .unavailable:
+                throw AILocalModelStoreError.bundledResourceInvalid
+            default: throw error
+            }
+        }
+        bundledPrimaryURL = installed
+        return AILocalModelSelection(modelURL: installed, projectorURL: nil, isBuiltin: true)
+    }
+
+    public func bundledPrimaryEntry() throws -> AILocalModelEntry {
+        let selection = try bundledPrimarySelection()
+        return primaryEntry(filename: selection.modelURL.lastPathComponent)
+    }
+
+    private func primaryEntry(filename: String) -> AILocalModelEntry {
+        let descriptor = bundledPrimaryDescriptor
+        return AILocalModelEntry(id: descriptor.id, name: descriptor.name, filename: filename,
+            bytes: descriptor.bytes, sha256: descriptor.sha256, role: .model, isBuiltin: true)
+    }
+
+    private static func installPinnedModel(source: URL, directory: URL, filename: String,
+                                            bytes: UInt64, sha256: String) throws -> URL {
+        try prepareDirectory(directory)
+        let destination = directory.appendingPathComponent(filename)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            let existing = try fingerprint(destination)
+            guard existing.bytes == bytes, existing.hash == sha256 else {
+                throw AILocalModelStoreError.bundledResourceInvalid
+            }
+            return destination
+        }
+        do {
+            _ = try copyValidatedFile(source: source, directory: directory, filename: filename,
+                                     expected: (bytes, sha256))
+        } catch {
+            // 并发安装只复用另一调用已经发布的同一身份；绝不覆盖旧的 mmap 文件。
+            if let existing = try? fingerprint(destination), existing.bytes == bytes,
+               existing.hash == sha256 { return destination }
+            throw error
+        }
+        return destination
     }
 
     /// 后端配置可在自己的文件工作队列调用。仅复制固定 1.2 MB 测试资源并核 SHA；
@@ -121,20 +244,26 @@ public actor AILocalModelStore {
         if builtinURL == nil, let builtinSource {
             builtinURL = try? Self.installBundledTestModel(source: builtinSource, directory: directory)
         }
-        return AILocalModelCatalog(entries: (builtinEntry.map { [$0] } ?? []) + catalog.entries,
+        if bundledPrimaryURL == nil { _ = try? bundledPrimarySelection() }
+        let primary = bundledPrimaryURL.map { [primaryEntry(filename: $0.lastPathComponent)] } ?? []
+        return AILocalModelCatalog(entries: primary + (builtinEntry.map { [$0] } ?? []) + catalog.entries,
             selectedModelID: catalog.selectedModelID,
-            selectedProjectorID: catalog.selectedProjectorID, builtinAvailable: builtinURL != nil)
+            selectedProjectorID: catalog.selectedProjectorID,
+            builtinAvailable: bundledPrimaryURL != nil || builtinURL != nil)
     }
 
     public func selectModel(id: String) throws {
         try loadIfNeeded()
-        guard (id == Self.builtinID && builtinURL != nil) ||
+        let id = Self.currentPrimaryID(id)
+        if id == Self.bundledPrimaryID { _ = try bundledPrimarySelection() }
+        guard (id == Self.bundledPrimaryID && bundledPrimaryURL != nil) ||
+                (id == Self.builtinID && builtinURL != nil) ||
                 catalog.entries.contains(where: { $0.id == id && $0.role == .model }) else {
             throw AILocalModelStoreError.unavailable
         }
         var next = catalog
         next.selectedModelID = id
-        if id == Self.builtinID { next.selectedProjectorID = nil }
+        if id == Self.builtinID || id == Self.bundledPrimaryID { next.selectedProjectorID = nil }
         try save(next)
     }
 
@@ -150,11 +279,29 @@ public actor AILocalModelStore {
 
     public func selection() throws -> AILocalModelSelection {
         try loadIfNeeded()
+        if catalog.selectedModelID == Self.bundledPrimaryID { return try bundledPrimarySelection() }
         let model: URL
         let builtin = catalog.selectedModelID == Self.builtinID
         if builtin, let builtinURL { model = builtinURL }
         else { model = try url(for: catalog.selectedModelID, role: .model) }
         let projector = try catalog.selectedProjectorID.map { try url(for: $0, role: .projector) }
+        return AILocalModelSelection(modelURL: model, projectorURL: projector, isBuiltin: builtin)
+    }
+
+    /// 主模型按账号设置保存的稳定 ID 解析；独立自测的全局选择不能更改已应用的主模型。
+    /// 每次配置复查文件存在性，返回沙盒内文件，不保存旧进程的绝对路径。
+    public func resolve(modelID: String, projectorID: String?) throws -> AILocalModelSelection {
+        let modelID = Self.currentPrimaryID(modelID)
+        if modelID == Self.bundledPrimaryID {
+            guard projectorID == nil else { throw AILocalModelStoreError.unavailable }
+            return try bundledPrimarySelection()
+        }
+        _ = try snapshot()
+        let builtin = modelID == Self.builtinID
+        let model: URL
+        if builtin, let builtinURL { model = builtinURL }
+        else { model = try url(for: modelID, role: .model) }
+        let projector = try projectorID.map { try url(for: $0, role: .projector) }
         return AILocalModelSelection(modelURL: model, projectorURL: projector, isBuiltin: builtin)
     }
 
@@ -238,6 +385,13 @@ public actor AILocalModelStore {
                       entry.sha256.allSatisfy({ $0.isHexDigit && $0.isASCII })
                   }) else { throw AILocalModelStoreError.invalidCatalog }
             catalog = decoded
+            if let selected = catalog.selectedModelID,
+               Self.currentPrimaryID(selected) != selected {
+                // 普通读取仅归一化内存选择；下次明确保存时再写新 ID。
+                // 已有导入条目、目录文件和磁盘上的旧清单均保留。
+                catalog.selectedModelID = Self.currentPrimaryID(selected)
+                catalog.selectedProjectorID = nil
+            }
         }
         if let builtinSource {
             builtinURL = try? Self.installBundledTestModel(source: builtinSource, directory: directory)
@@ -281,14 +435,17 @@ public actor AILocalModelStore {
         return (count, hash.finalize().map { String(format: "%02x", $0) }.joined())
     }
 
-    private static func copyValidatedFile(source: URL, directory: URL,
-                                          filename: String) throws -> (bytes: UInt64, hash: String) {
+    private static func copyValidatedFile(source: URL, directory: URL, filename: String,
+        expected: (bytes: UInt64, hash: String)? = nil) throws -> (bytes: UInt64, hash: String) {
         guard source.isFileURL else { throw AILocalModelStoreError.invalidFile }
         let values = try uncachedValues(source, keys: [.isRegularFileKey, .isSymbolicLinkKey,
                                                        .fileSizeKey, .contentModificationDateKey])
         guard source.isFileURL, values.isRegularFile == true, values.isSymbolicLink != true,
               let size = values.fileSize, size >= 32 else { throw AILocalModelStoreError.invalidFile }
         guard UInt64(size) <= maximumFileBytes else { throw AILocalModelStoreError.tooLarge }
+        if let expected, UInt64(size) != expected.bytes {
+            throw AILocalModelStoreError.bundledResourceInvalid
+        }
         try validateGGUF(source, size: UInt64(size))
         try prepareDirectory(directory)
         let staging = directory.appendingPathComponent(".import-" + UUID().uuidString, isDirectory: true)
@@ -320,6 +477,11 @@ public actor AILocalModelStore {
         }
         try validateGGUF(temporary, size: bytes)
         let digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
+        if let expected {
+            guard bytes == expected.bytes, digest == expected.hash else {
+                throw AILocalModelStoreError.bundledResourceInvalid
+            }
+        }
         if filename == "stories260K.gguf" {
             guard bytes == builtinBytes, digest == builtinSHA256 else {
                 throw AILocalModelStoreError.unavailable

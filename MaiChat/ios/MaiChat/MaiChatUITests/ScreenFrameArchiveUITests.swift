@@ -1,6 +1,285 @@
 import XCTest
 
 final class ScreenFrameArchiveUITests: XCTestCase {
+    /// Consume the persisted snapshot from an actual native local-model Agent
+    /// turn. The App must show its real delivery receipt in the latest reply,
+    /// independently of the older capture card, without opening fullscreen.
+    @MainActor
+    func testNativeAgentPhotoDisplayAppearsInCurrentReply() async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        guard let rawID = ProcessInfo.processInfo.environment["MAICHAT_NATIVE_PHOTO_REPLY_TEST_ID"],
+              let token = UUID(uuidString: rawID) else {
+            throw XCTSkip("Requires the explicitly staged real native Agent snapshot and public JPEG")
+        }
+        let caption = try XCTUnwrap(ProcessInfo.processInfo.environment["MAICHAT_NATIVE_PHOTO_REPLY_CAPTION"])
+        let capturePrompt = try XCTUnwrap(ProcessInfo.processInfo.environment["MAICHAT_NATIVE_PHOTO_REPLY_CAPTURE_PROMPT"])
+        XCTAssertFalse(caption.isEmpty)
+        XCTAssertFalse(capturePrompt.isEmpty)
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-image-fullscreen-ui-test",
+            "--ai-native-photo-reply-ui-test", "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = token.uuidString
+        app.launch()
+        defer { app.terminate() }
+
+        func currentCard() -> XCUIElement {
+            let cards = app.buttons.matching(identifier: "agent-image-bubble")
+            return cards.element(boundBy: max(0, cards.count - 1))
+        }
+        func openAssistant() {
+            let tab = app.buttons["创作中心"]
+            XCTAssertTrue(tab.waitForExistence(timeout: 12))
+            tab.tap()
+            XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 8))
+        }
+        func assertInlineReply() {
+            let card = currentCard()
+            XCTAssertTrue(card.waitForExistence(timeout: 15), "当前真实交付回执应显示图片卡片")
+            XCTAssertTrue(card.isHittable, "当前回复的图片应直接可见，无需用户向上寻找旧卡片")
+            XCTAssertTrue(app.staticTexts[caption].isHittable, "当前真实交付回执的说明应直接可见")
+            XCTAssertFalse(app.images["agent-image-preview"].exists, "普通展示不得自动弹出全屏")
+            XCTAssertTrue(app.textViews["ai-composer"].exists)
+            let draft = app.textViews["ai-composer"].value as? String ?? ""
+            XCTAssertTrue(draft.isEmpty || draft == "可按住转文字", "展示结果不能填入未发送草稿")
+            XCTAssertFalse(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@",
+                "ai-remove-attachment-")).firstMatch.exists, "工具交付不能追加到用户输入草稿")
+        }
+        openAssistant()
+        assertInlineReply()
+        let inline = XCTAttachment(screenshot: app.screenshot())
+        inline.name = "native-agent-current-reply-photo-inline"
+        inline.lifetime = .keepAlways
+        add(inline)
+
+        try await Task.sleep(for: .milliseconds(500))
+        currentCard().tap()
+        let preview = app.images["agent-image-preview"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 8))
+        let expanded = XCTAttachment(screenshot: app.screenshot())
+        expanded.name = "native-agent-current-reply-photo-explicit-enlargement"
+        expanded.lifetime = .keepAlways
+        add(expanded)
+        preview.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: preview)], timeout: 8), .completed)
+        assertInlineReply()
+
+        // Lazy history rows may leave the accessibility tree when offscreen.
+        // Visit the older real capture separately so both messages are checked
+        // without requiring all history thumbnails to remain allocated at once.
+        let scroll = try XCTUnwrap(app.scrollViews.allElementsBoundByIndex.first {
+            $0.isHittable && $0.identifier != "ai-session-drawer" &&
+                $0.frame.width > 100 && $0.frame.height > 100
+        }, "使用当前可交互的消息视口，不能选中保留在视图树中的隐藏会话抽屉")
+        for _ in 0..<8 where !app.staticTexts[capturePrompt].isHittable { scroll.swipeDown() }
+        XCTAssertTrue(app.staticTexts[capturePrompt].isHittable)
+        XCTAssertTrue(app.buttons.matching(identifier: "agent-image-bubble").firstMatch.isHittable,
+                      "当前再次展示不能移除旧拍照消息中的图片卡片")
+        XCTAssertFalse(app.images["agent-image-preview"].exists)
+        let older = XCTAttachment(screenshot: app.screenshot())
+        older.name = "native-agent-earlier-capture-card-preserved"
+        older.lifetime = .keepAlways
+        add(older)
+        for _ in 0..<8 where !app.staticTexts[caption].isHittable { scroll.swipeUp() }
+        assertInlineReply()
+
+        // Relaunch re-decodes the same unmodified persisted C ABI snapshot. No
+        // completed part or assistant answer is synthesized by this fixture.
+        app.terminate()
+        app.launch()
+        openAssistant()
+        assertInlineReply()
+        let restored = XCTAttachment(screenshot: app.screenshot())
+        restored.name = "native-agent-current-reply-photo-restored-snapshot"
+        restored.lifetime = .keepAlways
+        add(restored)
+        #else
+        throw XCTSkip("Only the explicitly staged Debug Simulator fixture may import this snapshot")
+        #endif
+    }
+
+    /// A real completed host receipt becomes an inline card immediately. Loading
+    /// the same persisted part must not launch a viewer or pollute the draft.
+    @MainActor
+    func testManualPhotoResultShowsInlineAndRestoredHistoryOnlyOpensOnTap() async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        let app = launchManualCameraToolFixture()
+        defer { app.terminate() }
+        XCTAssertFalse(app.buttons["agent-image-bubble"].exists)
+        app.buttons["ai-manual-camera-tool-open"].tap()
+        let shutter = app.buttons["ai-manual-camera-shutter"]
+        XCTAssertTrue(shutter.waitForExistence(timeout: 8))
+        XCTAssertFalse(app.buttons["agent-image-bubble"].exists)
+        shutter.tap()
+        assertManualToolState(app, result: "succeeded", files: 1, pending: false, verified: true)
+        assertManualToolDidNotAttachToComposer(app)
+
+        let bubble = app.buttons["agent-image-bubble"].firstMatch
+        XCTAssertTrue(bubble.waitForExistence(timeout: 8), "拍照回执必须直接显示缩略图，不依赖模型再调用工具")
+        XCTAssertEqual(app.buttons.matching(identifier: "agent-image-bubble").count, 1)
+        XCTAssertFalse(app.images["agent-image-preview"].exists, "完成拍照不能自动打开全屏")
+        let inline = XCTAttachment(screenshot: app.screenshot())
+        inline.name = "manual-photo-completed-receipt-inline-card"
+        inline.lifetime = .keepAlways
+        add(inline)
+
+        app.buttons["ai-manual-camera-tool-restore"].tap()
+        XCTAssertTrue(bubble.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.images["agent-image-preview"].exists, "历史回执重载也不能自动打开全屏")
+        try await Task.sleep(for: .milliseconds(500))
+        bubble.tap()
+        let preview = app.images["agent-image-preview"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 8))
+        let expanded = XCTAttachment(screenshot: app.screenshot())
+        expanded.name = "manual-photo-result-viewer-after-explicit-tap"
+        expanded.lifetime = .keepAlways
+        add(expanded)
+        preview.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: preview)], timeout: 8), .completed)
+        XCTAssertTrue(bubble.isHittable)
+        assertManualToolDidNotAttachToComposer(app)
+        let returned = XCTAttachment(screenshot: app.screenshot())
+        returned.name = "manual-photo-result-returned-to-inline-card"
+        returned.lifetime = .keepAlways
+        add(returned)
+        #else
+        throw XCTSkip("仅 Debug 模拟器使用独立工作区与合成手动快门")
+        #endif
+    }
+
+    /// 真正调用 mobile_take_photo；超过采样间隔仍等待快门，返回单张文件而不改 composer。
+    @MainActor
+    func testManualCameraToolWaitsForShutterAndReturnsExactlyOnePhoto() async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        let app = launchManualCameraToolFixture()
+        defer { app.terminate() }
+        assertManualToolState(app, result: "idle", files: 0, pending: false, verified: false)
+        app.buttons["ai-manual-camera-tool-open"].tap()
+        let shutter = app.buttons["ai-manual-camera-shutter"]
+        XCTAssertTrue(shutter.waitForExistence(timeout: 8))
+        assertManualToolState(app, preview: true, result: "pending", files: 0, pending: true, verified: false)
+
+        try await Task.sleep(for: .milliseconds(2200))
+        app.buttons["ai-manual-camera-tool-preview-refresh"].tap()
+        XCTAssertTrue(shutter.isHittable, "工具请求必须继续等待显式快门")
+        assertManualToolState(app, preview: true, result: "pending", files: 0, pending: true, verified: false)
+        XCTAssertEqual(app.staticTexts["ai-manual-camera-timed-state"].value as? String,
+                       "running:false;request:false")
+        XCTAssertFalse(app.buttons["ai-camera-stop"].exists)
+        let waiting = XCTAttachment(screenshot: app.screenshot())
+        waiting.name = "manual-camera-tool-still-waiting-after-two-seconds"
+        waiting.lifetime = .keepAlways
+        add(waiting)
+
+        shutter.tap()
+        assertManualToolState(app, result: "succeeded", files: 1, pending: false, verified: true)
+        let path = try XCTUnwrap(app.staticTexts["ai-manual-camera-tool-path"].value as? String)
+        XCTAssertTrue(path.hasPrefix("photo-") && path.hasSuffix(".jpg"),
+                      "正式宿主应返回工作区中的单张 JPEG 相对路径")
+        XCTAssertEqual(app.staticTexts["ai-manual-camera-tool-mime"].value as? String, "image/jpeg")
+        assertManualToolDidNotAttachToComposer(app)
+        app.buttons["ai-manual-camera-tool-refresh"].tap()
+        assertManualToolState(app, result: "succeeded", files: 1, pending: false, verified: true)
+        #else
+        throw XCTSkip("手动工具验收仅在 Debug 模拟器使用合成画面和独立工作区")
+        #endif
+    }
+
+    /// 用户取消必须结束正式工具等待，重试后的快门只产生新的一张文件。
+    @MainActor
+    func testManualCameraToolCancelExitsAndAllowsRetry() async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        let app = launchManualCameraToolFixture()
+        defer { app.terminate() }
+        app.buttons["ai-manual-camera-tool-open"].tap()
+        XCTAssertTrue(app.buttons["ai-manual-camera-cancel"].waitForExistence(timeout: 8))
+        app.buttons["ai-manual-camera-cancel"].tap()
+        assertManualToolState(app, result: "canceled", files: 0, pending: false, verified: false)
+        assertManualToolDidNotAttachToComposer(app)
+
+        app.buttons["ai-manual-camera-tool-open"].tap()
+        XCTAssertTrue(app.buttons["ai-manual-camera-shutter"].waitForExistence(timeout: 8))
+        XCTAssertEqual(app.staticTexts["ai-manual-camera-timed-state"].value as? String,
+                       "running:false;request:false")
+        app.buttons["ai-manual-camera-shutter"].tap()
+        assertManualToolState(app, result: "succeeded", files: 1, pending: false, verified: true)
+        assertManualToolDidNotAttachToComposer(app)
+        #else
+        throw XCTSkip("手动工具验收仅在 Debug 模拟器使用合成画面和独立工作区")
+        #endif
+    }
+
+    /// 停止工具 Task 与切换原会话均取消等待；旧请求不能写文件或占用后续拍摄。
+    @MainActor
+    func testManualCameraToolTaskCancellationAndSessionSwitchDiscardPendingPhoto() async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        let app = launchManualCameraToolFixture()
+        defer { app.terminate() }
+        for cancellation in ["ai-manual-camera-tool-cancel-task", "ai-manual-camera-tool-switch-session"] {
+            app.buttons["ai-manual-camera-tool-open"].tap()
+            XCTAssertTrue(app.buttons["ai-manual-camera-shutter"].waitForExistence(timeout: 8))
+            assertManualToolState(app, preview: true, result: "pending", files: 0, pending: true, verified: false)
+            app.buttons[cancellation].tap()
+            assertManualToolState(app, result: "canceled", files: 0, pending: false, verified: false)
+            assertManualToolDidNotAttachToComposer(app)
+            XCTAssertFalse(app.buttons["ai-manual-camera-shutter"].exists)
+        }
+        XCTAssertEqual(app.staticTexts["ai-manual-camera-tool-session"].value as? String, "switch-B")
+        app.buttons["ai-manual-camera-tool-open"].tap()
+        XCTAssertTrue(app.buttons["ai-manual-camera-shutter"].waitForExistence(timeout: 8))
+        app.buttons["ai-manual-camera-shutter"].tap()
+        assertManualToolState(app, result: "succeeded", files: 1, pending: false, verified: true)
+        assertManualToolDidNotAttachToComposer(app)
+        #else
+        throw XCTSkip("手动工具验收仅在 Debug 模拟器使用合成画面和独立工作区")
+        #endif
+    }
+
+    #if DEBUG && targetEnvironment(simulator)
+    @MainActor
+    private func launchManualCameraToolFixture() -> XCUIApplication {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test",
+            "--ai-manual-camera-tool-ui-test", "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        let tab = app.buttons["创作中心"]
+        XCTAssertTrue(tab.waitForExistence(timeout: 12))
+        tab.tap()
+        let open = app.buttons["ai-manual-camera-tool-open"]
+        XCTAssertTrue(open.waitForExistence(timeout: 8))
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: open)
+        XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 8), .completed)
+        return app
+    }
+
+    @MainActor
+    private func assertManualToolState(_ app: XCUIApplication, preview: Bool = false,
+                                       result: String, files: Int, pending: Bool, verified: Bool,
+                                       file: StaticString = #filePath, line: UInt = #line) {
+        let prefix = preview ? "ai-manual-camera-tool-preview" : "ai-manual-camera-tool"
+        let state = app.staticTexts[prefix + "-state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 8), file: file, line: line)
+        let expected = "result:\(result);files:\(files);attachments:0;request:\(pending);verified:\(verified)"
+        let settled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", expected), object: state)
+        XCTAssertEqual(XCTWaiter.wait(for: [settled], timeout: 8), .completed,
+                       "宿主工具状态应为 \(expected)，实际 \(String(describing: state.value))", file: file, line: line)
+    }
+
+    @MainActor
+    private func assertManualToolDidNotAttachToComposer(_ app: XCUIApplication,
+                                                      file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(app.textViews["ai-composer"].exists, file: file, line: line)
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@",
+            "ai-remove-attachment-")).firstMatch.exists, file: file, line: line)
+        XCTAssertFalse(app.buttons["ai-camera-stop"].exists, file: file, line: line)
+    }
+    #endif
+
     /// 正常 Root 的 +/拍摄入口必须先出现手动快门；显式 Agent 定时结束后也不能复用定时模式。
     @MainActor
     func testManualCameraHasShutterAndDoesNotReuseTimedCapture() async throws {

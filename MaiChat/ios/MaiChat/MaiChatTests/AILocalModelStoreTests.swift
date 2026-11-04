@@ -2,9 +2,175 @@
 import Foundation
 import XCTest
 import CryptoKit
-import MaiChatCore
+@testable import MaiChatCore
 
 final class AILocalModelStoreTests: XCTestCase {
+    func testFormerBundledSelectionMigratesWithoutChangingImportsOrMappedFiles() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try bundledFixture(root: root)
+        let storage = root.appendingPathComponent("models")
+        let initial = AILocalModelStore(directory: storage, bundledPrimaryDirectory: fixture.directory,
+            descriptor: fixture.descriptor)
+        let imported = try await initial.importModel(from: fixture.source, role: .projector)
+        let oldModel = storage.appendingPathComponent("old-content-version.gguf")
+        let oldBytes = gguf(payloadBytes: 1024, fill: 19)
+        try oldBytes.write(to: oldModel)
+        let catalogURL = storage.appendingPathComponent("catalog.json")
+        var legacy = try JSONSerialization.jsonObject(with: Data(contentsOf: catalogURL)) as! [String: Any]
+        legacy["selectedModelID"] = "builtin-qwen2.5-0.5b-instruct-q4_k_m"
+        legacy["selectedProjectorID"] = imported.id
+        let legacyData = try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys])
+        try legacyData.write(to: catalogURL)
+
+        let reopened = AILocalModelStore(directory: storage, bundledPrimaryDirectory: fixture.directory,
+            descriptor: fixture.descriptor)
+        let snapshot = try await reopened.snapshot()
+        XCTAssertEqual(snapshot.selectedModelID, AILocalModelStore.bundledPrimaryID)
+        XCTAssertNil(snapshot.selectedProjectorID)
+        XCTAssertTrue(snapshot.entries.contains(imported))
+        let selection = try await reopened.selection()
+        let resolved = try await reopened.resolve(modelID: "builtin-qwen2.5-0.5b-instruct-q4_k_m", projectorID: nil)
+        XCTAssertEqual(selection.modelURL, resolved.modelURL)
+        XCTAssertTrue(selection.isBuiltin)
+        XCTAssertNil(selection.projectorURL)
+        XCTAssertEqual(try Data(contentsOf: oldModel), oldBytes)
+        XCTAssertEqual(try Data(contentsOf: catalogURL), legacyData)
+    }
+
+    func testBundledPrimaryMissingResourcesReportPackagingFailureWithoutPublishing() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try bundledFixture(root: root)
+        let storage = root.appendingPathComponent("models")
+        let missingBundle = AILocalModelStore(directory: storage, bundledPrimaryDirectory: nil,
+            descriptor: fixture.descriptor)
+        do { _ = try await missingBundle.bundledPrimarySelection(); XCTFail("Missing bundle accepted") }
+        catch AILocalModelStoreError.bundledResourceMissing { }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.path))
+
+        try FileManager.default.removeItem(at: fixture.source)
+        let missingWeights = AILocalModelStore(directory: storage, bundledPrimaryDirectory: fixture.directory,
+            descriptor: fixture.descriptor)
+        do { _ = try await missingWeights.bundledPrimarySelection(); XCTFail("Missing weights accepted") }
+        catch AILocalModelStoreError.bundledResourceMissing { }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.path))
+    }
+
+    func testBundledPrimaryRejectsChangedManifestAndHashBeforePublishing() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try bundledFixture(root: root)
+        let storage = root.appendingPathComponent("models")
+        let store = AILocalModelStore(directory: storage, bundledPrimaryDirectory: fixture.directory,
+            descriptor: fixture.descriptor)
+        let manifest = fixture.directory.appendingPathComponent("manifest.json")
+        let originalManifest = try Data(contentsOf: manifest)
+        var changed = try JSONSerialization.jsonObject(with: originalManifest) as! [String: Any]
+        changed["filename"] = "../outside.gguf"
+        try JSONSerialization.data(withJSONObject: changed).write(to: manifest)
+        do { _ = try await store.bundledPrimarySelection(); XCTFail("Changed manifest accepted") }
+        catch AILocalModelStoreError.bundledResourceInvalid { }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.path))
+
+        try originalManifest.write(to: manifest)
+        try gguf(payloadBytes: 1024, fill: 99).write(to: fixture.source)
+        do { _ = try await store.bundledPrimarySelection(); XCTFail("Wrong hash accepted") }
+        catch AILocalModelStoreError.bundledResourceInvalid { }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: storage.path).isEmpty)
+    }
+
+    func testBundledPrimaryFirstUseAndRestartResolveVerifiedIdentityWithoutChangingImports() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try bundledFixture(root: root)
+        let storage = root.appendingPathComponent("models")
+        let store = AILocalModelStore(directory: storage, bundledPrimaryDirectory: fixture.directory,
+            descriptor: fixture.descriptor)
+        let imported = try await store.importModel(from: fixture.source, role: .model)
+        let importedURL = try await store.selection().modelURL
+        let catalogBefore = try Data(contentsOf: storage.appendingPathComponent("catalog.json"))
+        let selection = try await store.bundledPrimarySelection()
+        let entry = try await store.bundledPrimaryEntry()
+        XCTAssertEqual(entry.id, AILocalModelStore.bundledPrimaryID)
+        XCTAssertEqual(entry.sha256, fixture.descriptor.sha256)
+        XCTAssertEqual(entry.bytes, fixture.descriptor.bytes)
+        XCTAssertEqual(selection.modelURL.lastPathComponent, fixture.descriptor.installedFilename)
+        XCTAssertNotEqual(selection.modelURL, importedURL)
+        XCTAssertEqual(try Data(contentsOf: selection.modelURL), try Data(contentsOf: fixture.source))
+        XCTAssertTrue(selection.isBuiltin)
+        XCTAssertNil(selection.projectorURL)
+        XCTAssertEqual(try Data(contentsOf: storage.appendingPathComponent("catalog.json")), catalogBefore)
+
+        let reopened = AILocalModelStore(directory: storage, bundledPrimaryDirectory: fixture.directory,
+            descriptor: fixture.descriptor)
+        let resolved = try await reopened.resolve(modelID: AILocalModelStore.bundledPrimaryID, projectorID: nil)
+        XCTAssertEqual(resolved.modelURL, selection.modelURL)
+        let catalog = try await reopened.snapshot()
+        XCTAssertEqual(catalog.selectedModelID, imported.id)
+        XCTAssertEqual(try Data(contentsOf: importedURL), try Data(contentsOf: fixture.source))
+        do {
+            _ = try await reopened.resolve(modelID: AILocalModelStore.bundledPrimaryID, projectorID: imported.id)
+            XCTFail("Text-only primary accepted a projector")
+        } catch AILocalModelStoreError.unavailable { }
+    }
+
+    func testBundledPrimaryConcurrentResolutionNeverOverwritesCorruptedMappedFile() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try bundledFixture(root: root)
+        let storage = root.appendingPathComponent("models")
+        let descriptor = fixture.descriptor
+        let sourceDirectory = fixture.directory
+        let urls = try await withThrowingTaskGroup(of: URL.self, returning: [URL].self) { group in
+            for _ in 0..<4 {
+                group.addTask {
+                    let store = AILocalModelStore(directory: storage, bundledPrimaryDirectory: sourceDirectory,
+                        descriptor: descriptor)
+                    return try await store.bundledPrimarySelection().modelURL
+                }
+            }
+            var result: [URL] = []
+            for try await url in group { result.append(url) }
+            return result
+        }
+        XCTAssertEqual(Set(urls).count, 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: storage.path), [descriptor.installedFilename])
+        let installed = try XCTUnwrap(urls.first)
+        let sentinel = gguf(payloadBytes: 1024, fill: 88)
+        try sentinel.write(to: installed)
+        let reopened = AILocalModelStore(directory: storage, bundledPrimaryDirectory: fixture.directory,
+            descriptor: descriptor)
+        do { _ = try await reopened.bundledPrimarySelection(); XCTFail("Changed installed file accepted") }
+        catch AILocalModelStoreError.bundledResourceInvalid { }
+        XCTAssertEqual(try Data(contentsOf: installed), sentinel)
+    }
+
+    func testBundledPrimaryContentVersionUsesANewPathAndPreservesOldModel() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let oldFixture = try bundledFixture(root: root, name: "old", fill: 16)
+        let newFixture = try bundledFixture(root: root, name: "new", fill: 17)
+        let storage = root.appendingPathComponent("models")
+        let oldStore = AILocalModelStore(directory: storage, bundledPrimaryDirectory: oldFixture.directory,
+            descriptor: oldFixture.descriptor)
+        let oldURL = try await oldStore.bundledPrimarySelection().modelURL
+        let newStore = AILocalModelStore(directory: storage, bundledPrimaryDirectory: newFixture.directory,
+            descriptor: newFixture.descriptor)
+        let newURL = try await newStore.bundledPrimarySelection().modelURL
+        XCTAssertNotEqual(oldURL, newURL)
+        XCTAssertEqual(try Data(contentsOf: oldURL), try Data(contentsOf: oldFixture.source))
+        XCTAssertEqual(try Data(contentsOf: newURL), try Data(contentsOf: newFixture.source))
+        // 损坏的旧导入目录不应该阻止正常 App 解析内置模型，也不能被偷偷重写。
+        let badCatalog = Data("preserve unrelated legacy catalog".utf8)
+        try badCatalog.write(to: storage.appendingPathComponent("catalog.json"))
+        let reopened = AILocalModelStore(directory: storage, bundledPrimaryDirectory: newFixture.directory,
+            descriptor: newFixture.descriptor)
+        let resolved = try await reopened.bundledPrimarySelection()
+        XCTAssertEqual(resolved.modelURL, newURL)
+        XCTAssertEqual(try Data(contentsOf: storage.appendingPathComponent("catalog.json")), badCatalog)
+    }
+
     func testImportsIndependentCopiesPersistsSelectionAndPreservesSource() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -31,6 +197,12 @@ final class AILocalModelStoreTests: XCTestCase {
         XCTAssertEqual(catalog.selectedModelID, second.id)
         let reopenedSelection = try await reopened.selection()
         XCTAssertEqual(try Data(contentsOf: reopenedSelection.modelURL), changed)
+        // 主模型保存的是明确 ID；自测选择切到第二份文件后仍应解析原来的第一份。
+        let pinnedPrimary = try await reopened.resolve(modelID: first.id, projectorID: nil)
+        XCTAssertEqual(pinnedPrimary.modelURL, firstURL)
+        XCTAssertEqual(try Data(contentsOf: pinnedPrimary.modelURL), original)
+        let afterResolve = try await reopened.snapshot()
+        XCTAssertEqual(afterResolve.selectedModelID, second.id)
         let encoded = try String(contentsOf: storage.appendingPathComponent("catalog.json"), encoding: .utf8)
         XCTAssertFalse(encoded.contains(source.path))
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: storage.path).contains { $0.hasPrefix(".import-") })
@@ -191,6 +363,23 @@ final class AILocalModelStoreTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("maichat-local-model-store-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
         return url
+    }
+
+    // 固定生产 SHA 不可由公开 API 覆盖；这里只用内部注入验证同一安装逻辑和磁盘边界。
+    private func bundledFixture(root: URL, name: String = "bundle", fill: UInt8 = 17) throws ->
+        (directory: URL, source: URL, descriptor: AILocalModelStore.BundledPrimaryDescriptor) {
+        let directory = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let bytes = gguf(payloadBytes: 1024, fill: fill)
+        let descriptor = AILocalModelStore.BundledPrimaryDescriptor(version: 1,
+            id: AILocalModelStore.bundledPrimaryID, name: "Small container fixture",
+            filename: "fixture.gguf", bytes: UInt64(bytes.count),
+            sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined(),
+            revision: "fixture-only")
+        let source = directory.appendingPathComponent(descriptor.filename)
+        try bytes.write(to: source)
+        try JSONEncoder().encode(descriptor).write(to: directory.appendingPathComponent("manifest.json"))
+        return (directory, source, descriptor)
     }
 
     // 最小合法容器不是可运行权重；这些测试检查宿主复制/目录边界，推理由独立真实权重测试负责。

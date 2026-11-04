@@ -12,6 +12,8 @@ struct AIPortraitUITestRoot: View {
     @State private var prepared = false
     @State private var status = "准备照片"
     @State private var resultPath = ""
+    // 直接暴露真实处理结果的交付指引，不在 fixture 中替工具填充预期值。
+    @State private var resultNextTool = ""
     @State private var busy = true
     @State private var qaJSON = ""
     private var isLargeTest: Bool { ProcessInfo.processInfo.environment["MAICHAT_PORTRAIT_LARGE_TEST"] == "1" }
@@ -31,6 +33,9 @@ struct AIPortraitUITestRoot: View {
             .overlay(alignment: .bottomTrailing) {
                 VStack(alignment: .trailing) {
                     Text(status).accessibilityIdentifier("portrait-fixture-status")
+                    if !resultNextTool.isEmpty {
+                        Text(resultNextTool).accessibilityIdentifier("portrait-fixture-next-tool")
+                    }
                     Button("预览修图结果") {
                         Task { _ = await call(
                             "mobile_preview_image", arguments: ["path": resultPath]) }
@@ -192,6 +197,7 @@ struct AIPortraitUITestRoot: View {
             try FileManager.default.createDirectory(at: qaDirectory, withIntermediateDirectories: true)
             try Data(qaJSON.utf8).write(to: qaDirectory.appendingPathComponent("qa.json"), options: .atomic)
             resultPath = result["path"] as! String
+            resultNextTool = result["next_tool"] as? String ?? ""
             AIAssistantModel.shared.installImageZoomUITestFixture(directory.appendingPathComponent(resultPath).path)
             let beforeL = (result["skin_L_before"] as! NSNumber).doubleValue, afterL = (result["skin_L_after"] as! NSNumber).doubleValue
             let beforeC = (result["skin_C_before"] as! NSNumber).doubleValue, afterC = (result["skin_C_after"] as! NSNumber).doubleValue
@@ -218,7 +224,8 @@ struct AIPortraitUITestRoot: View {
                 throw AIBackendError(message: "修图缺少图片或结果编号")
             }
             resultPath = path
-            // 助手图片使用真实 agent_send_media 交付片段，复用既有消息缩略图和全屏预览。
+            resultNextTool = result["next_tool"] as? String ?? ""
+            // 旧 fixture 手拼媒体消息，仅复用生产缩略图与点按预览；不是实际 Agent 发送或持久化验收。
             AIAssistantModel.shared.installImageZoomUITestFixture(directory.appendingPathComponent(path).path)
             status = "PASS：本地美白已生成新图"
         } catch { status = "FAIL：" + error.localizedDescription }

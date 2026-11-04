@@ -480,7 +480,7 @@ MaiModelRequest MaiTurnRunner::buildRequest(const std::string& modelName,
     }
 
     if (mDependencies.tools && !mDependencies.tools->isEmpty())
-        request.tools = mDependencies.tools->specs();
+        request.tools = mDependencies.tools->specs(mModelName);
     return request;
 }
 
@@ -566,8 +566,9 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         body.input = call.arguments;
         // 要审批的工具先挂在 Pending：界面靠这个状态显示"等待授权"，
         // 不用另外对着 permission.asked 事件维护一张表。
-        MaiTool* tool =
-            mDependencies.tools ? mDependencies.tools->findForModel(call.name) : nullptr;
+        MaiTool* tool = mDependencies.tools
+                            ? mDependencies.tools->findForModel(call.name, mModelName)
+                            : nullptr;
         const bool needsApproval = toolNeedsApproval(call);
         body.state = needsApproval ? MaiToolState::Pending : MaiToolState::Running;
         part.body = body;
@@ -586,8 +587,15 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         if (!tool) {
             // 模型有时会编一个不存在的工具名。告诉它事实，它下一圈通常会改对；
             // 直接失败整轮反而更糟。
-            result = MaiToolResult::failure(MaiErrorCode::NotFound,
-                                            "no tool named \"" + call.name + "\" is registered");
+            MaiTool* publicTool =
+                mDependencies.tools ? mDependencies.tools->findForModel(call.name) : nullptr;
+            result =
+                publicTool && !publicTool->isAvailableForModel(mModelName)
+                    ? MaiToolResult::failure(
+                          MaiErrorCode::NotSupported,
+                          "tool \"" + call.name + "\" is unavailable for the current primary model")
+                    : MaiToolResult::failure(MaiErrorCode::NotFound,
+                                             "no tool named \"" + call.name + "\" is registered");
         } else if (context.root.empty()) {
             result = MaiToolResult::failure(
                 MaiErrorCode::InvalidInput,
@@ -662,7 +670,8 @@ MaiToolResult MaiTurnRunner::checkPermission(const MaiToolInvocation& call,
                                              const MaiToolContext& context, bool& allowed,
                                              const std::atomic<bool>& cancel) {
     allowed = true;
-    MaiTool* tool = mDependencies.tools ? mDependencies.tools->findForModel(call.name) : nullptr;
+    MaiTool* tool =
+        mDependencies.tools ? mDependencies.tools->findForModel(call.name, mModelName) : nullptr;
     if (!tool || !toolNeedsApproval(call)) return {};
 
     // 模型被拒之后经常原样再试一次。第二次不再弹框，直接回同样的话。
@@ -743,7 +752,8 @@ MaiToolResult MaiTurnRunner::checkPermission(const MaiToolInvocation& call,
 }
 
 bool MaiTurnRunner::toolNeedsApproval(const MaiToolInvocation& call) const {
-    MaiTool* tool = mDependencies.tools ? mDependencies.tools->findForModel(call.name) : nullptr;
+    MaiTool* tool =
+        mDependencies.tools ? mDependencies.tools->findForModel(call.name, mModelName) : nullptr;
     if (tool == nullptr) return false;
     if (tool->requiresPaidApproval(call.arguments)) return true;
     if (mDependencies.approvalPolicy == MaiApprovalPolicy::Never) return false;

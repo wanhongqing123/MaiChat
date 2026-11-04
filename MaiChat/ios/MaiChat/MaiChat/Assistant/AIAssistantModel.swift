@@ -51,6 +51,38 @@ struct AIModelSettings: Codable, Sendable, Equatable {
 
     var baseUrl = AIModelSettings.deepSeekUrl
     var model = "deepseek-flash"
+    // 可选字段兼容已有账号设置；本地只持久化目录 ID，沙盒路径在配置时重新解析。
+    var modelProvider: String? = nil
+    var cloudModel: String? = nil
+    var localModelID: String? = nil
+    var localProjectorID: String? = nil
+    var localContextSize: Int? = nil
+    var localMaximumTokens: Int? = nil
+    var localThreads: Int? = nil
+    var isLocalModel: Bool { modelProvider == "llama" }
+    // 旧字段只用于兼容解码；普通主模型自动管理预算，不沿用早期 QA 的短输出限制。
+    // 完整移动工具目录首问已超过 23k；输出 0 由核心使用剩余上下文生成到模型结束。
+    var effectiveLocalContextSize: Int { 32768 }
+    var effectiveLocalMaximumTokens: Int { 0 }
+    var effectiveLocalThreads: Int { 2 }
+    var effectiveCloudModel: String {
+        let saved = cloudModel ?? (isLocalModel ? "deepseek-flash" : model)
+        return ["deepseek-flash", "glm-5.3", "glm-5.3-flash"].contains(saved) ? saved : "deepseek-flash"
+    }
+    var displayName: String { isLocalModel ? "本地模型" : "云端模型" }
+
+    /// 普通选择只区分云端和随包本地模型；旧文件 ID 仅保留兼容解码，不再要求用户管理文件。
+    mutating func selectModelSource(local: Bool) {
+        if local {
+            if !isLocalModel { cloudModel = effectiveCloudModel }
+            modelProvider = "llama"
+            localModelID = AILocalModelStore.bundledPrimaryID
+            localProjectorID = nil
+            model = "local:" + AILocalModelStore.bundledPrimaryID
+        } else {
+            selectModel(effectiveCloudModel)
+        }
+    }
     // Optional so settings written before this field existed still decode.
     var reasoningEffort: String? = nil
     var effectiveReasoningEffort: String {
@@ -58,12 +90,15 @@ struct AIModelSettings: Codable, Sendable, Equatable {
         return ["low", "high", "max"].contains(value) ? value : "high"
     }
     var policy = "on-request"
-    var effectiveWire: String { "responses" }
+    var effectiveWire: String { isLocalModel ? "local" : "responses" }
 
     mutating func selectModel(_ selected: String) {
         model = selected
-        if selected == "deepseek-flash" { baseUrl = Self.deepSeekUrl }
-        else if selected.hasPrefix("glm-") { baseUrl = Self.glmResponsesUrl }
+        if selected == "deepseek-flash" {
+            cloudModel = selected; modelProvider = "remote"; baseUrl = Self.deepSeekUrl
+        } else if selected.hasPrefix("glm-") {
+            cloudModel = selected; modelProvider = "remote"; baseUrl = Self.glmResponsesUrl
+        }
     }
 
 }
@@ -1017,6 +1052,7 @@ struct AIImagePreview: Identifiable, Equatable {
 struct AIAssistantOpenResult: Sendable {
     let settings: AIModelSettings
     let workspacePath: String
+    var configurationError: String? = nil
 }
 struct AIReplySuggestions: Codable, Sendable, Equatable {
     let natural: String
@@ -1036,6 +1072,11 @@ struct AIResponse: Codable, Sendable {
     var busy: Bool?
     var turnId: String?
     var configured: Bool?
+    var model: String?
+    var wire: String?
+    var localGpuSelected: Bool?
+    var localGpuModelBytes: UInt64?
+    var localGpuBackend: String?
     var natural: String?
     var casual: String?
     var professional: String?
@@ -1114,13 +1155,28 @@ actor AIAssistantBackend {
     func runtimeEpoch() -> String { agentEpoch }
     private var root: URL?
     private var initialized = false
+    private var configurationInProgress = false
+    private var permanentlyInvalidated = false
+
+    // 账号删除只影响此实例；普通换号不调用它，旧账号已接受的发送收据仍可正常落盘。
+    func invalidatePermanently() {
+        permanentlyInvalidated = true
+    }
+
+    private func checkLifecycle() throws {
+        guard !permanentlyInvalidated else {
+            throw AIBackendError(message: "原账号已删除，创作中心已关闭", code: "account_deleted")
+        }
+        try Task.checkCancellation()
+    }
     #if DEBUG && targetEnvironment(simulator)
     /// 合成手动快门仍走 importDocument；只给文件导入准备隔离目录，不初始化 Agent 或凭证。
     func prepareManualCameraImportForUITesting(_ workspace: URL) throws {
         let arguments = ProcessInfo.processInfo.arguments
         let resolved = workspace.standardizedFileURL.resolvingSymlinksInPath()
         let temporary = FileManager.default.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
-        guard arguments.contains("--ai-ui-test"), arguments.contains("--ai-manual-camera-ui-test"),
+        guard arguments.contains("--ai-ui-test"),
+              arguments.contains("--ai-manual-camera-ui-test") || arguments.contains("--ai-manual-camera-tool-ui-test"),
               !initialized, workspace.isFileURL, resolved.lastPathComponent == "Workspace",
               resolved.path.hasPrefix(temporary.path + "/"),
               FileManager.default.fileExists(atPath: resolved.path) else { throw CancellationError() }
@@ -1165,6 +1221,7 @@ actor AIAssistantBackend {
     private func requestAgentOperation(_ operation: String, values: [String: Any] = [:], force: Bool = false) throws
         -> AIResponse
     {
+        try checkLifecycle()
         var request: [String: Any] = values
         request["op"] = operation
         request["force"] = force
@@ -1185,12 +1242,16 @@ actor AIAssistantBackend {
     /// 已初始化时复用同一后端，避免页面反复进入时重建数据库连接和任务状态。
     /// 任一必需目录或配置失败时抛错，由页面保留原画面并显示可恢复的错误。
     func open(accountUserID: String) async throws -> AIAssistantOpenResult {
+        try checkLifecycle()
         if initialized {
             return AIAssistantOpenResult(
                 settings: settings,
                 workspacePath: root!.appendingPathComponent("Workspace", isDirectory: true).path
             )
         }
+        guard !configurationInProgress else { throw AIBackendError(message: "模型配置正在准备，请稍后重试") }
+        configurationInProgress = true
+        defer { configurationInProgress = false }
         var directory = try AIAssistantWorkspaceLocator.directory(for: accountUserID)
         #if DEBUG && targetEnvironment(simulator)
         let uiTest = ProcessInfo.processInfo.arguments.contains("--ai-ui-test") ||
@@ -1206,15 +1267,26 @@ actor AIAssistantBackend {
         if FileManager.default.fileExists(atPath: file.path) {
             settings = try JSONDecoder().decode(AIModelSettings.self, from: Data(contentsOf: file))
         }
-        // 先恢复已选主模型，再从服务器刷新仅驻内存的密钥，最后初始化 C++ Agent。
-        if settings.model != "deepseek-flash" { settings.model = "deepseek-flash" }
-        settings.selectModel(settings.model)
-        _ = try? await AICloudCredentialSync.refreshAccountModelKeysIfAvailable()
-        try? await AICloudCredentialSync.refreshSeedanceIfNeeded(force: true)
-        try? await AICloudCredentialSync.refreshBailianIfNeeded(force: true)
-        var key = storedKey(for: settings.model)
+        // 恢复原供应商；本地选择统一迁到随包版本，不再依赖用户上次导入的文件。
+        if settings.isLocalModel { settings.selectModelSource(local: true) }
+        else { settings.selectModel(settings.model) }
+        var key = ""
         #if DEBUG && targetEnvironment(simulator)
-        if uiTest {
+        let primaryModelUITest = AIPrimaryModelUITestSupport.isRequested
+        #else
+        let primaryModelUITest = false
+        #endif
+        if !settings.isLocalModel && !primaryModelUITest {
+            _ = try? await AICloudCredentialSync.refreshAccountModelKeysIfAvailable()
+            try checkLifecycle()
+            try? await AICloudCredentialSync.refreshSeedanceIfNeeded(force: true)
+            try checkLifecycle()
+            try? await AICloudCredentialSync.refreshBailianIfNeeded(force: true)
+            try checkLifecycle()
+            key = storedKey(for: settings.model)
+        }
+        #if DEBUG && targetEnvironment(simulator)
+        if uiTest && !settings.isLocalModel {
             // 独立验收账号使用配套的本机模型端口，避免把测试调用发送到其他正在运行的 fixture。
             let modelPort = Int(ProcessInfo.processInfo.environment["MAICHAT_LOCAL_UI_MODEL_PORT"] ?? "18189")
                 .flatMap { (1...65535).contains($0) ? $0 : nil } ?? 18189
@@ -1224,9 +1296,20 @@ actor AIAssistantBackend {
             key = "test-key"
         }
         #endif
-        try configure(settings, key: key)
+        do {
+            let local = try await resolveLocalConfiguration(settings)
+            try checkLifecycle()
+            try configure(settings, key: key, local: local)
+        } catch {
+            try checkLifecycle()
+            guard settings.isLocalModel else { throw error }
+            // 包内模型异常保留当前来源；不静默改用云端，也不要求用户修复文件目录。
+            return AIAssistantOpenResult(settings: settings,
+                workspacePath: directory.appendingPathComponent("Workspace", isDirectory: true).path,
+                configurationError: "内置本地模型暂时不可用，请重试；若仍失败，请更新 App。")
+        }
         #if DEBUG && targetEnvironment(simulator)
-        if uiTest { _ = try requestAgentOperation("create") }
+        if uiTest && !settings.isLocalModel { _ = try requestAgentOperation("create") }
         #endif
         initialized = true
         return AIAssistantOpenResult(
@@ -1235,17 +1318,23 @@ actor AIAssistantBackend {
         )
     }
 
-    private func configure(_ config: AIModelSettings, key: String) throws {
+    private func resolveLocalConfiguration(_ config: AIModelSettings) async throws -> AILocalModelSelection? {
+        guard config.isLocalModel else { return nil }
+        return try await AILocalModelStore.shared.bundledPrimarySelection()
+    }
+
+    private func configure(_ config: AIModelSettings, key: String, local: AILocalModelSelection? = nil) throws {
+        try checkLifecycle()
         // Swift 只负责应用目录、云端密钥和线协议选择；工具调用规则在共享 C++ 层。
         guard let root else { throw AIBackendError(message: "创作中心尚未准备好") }
-        guard let caBundle = Bundle.main.url(forResource: "cacert", withExtension: "pem",
-                                             subdirectory: "MaiAgentCertificates") else {
+        let caBundle = Bundle.main.url(forResource: "cacert", withExtension: "pem",
+                                      subdirectory: "MaiAgentCertificates")
+        guard config.isLocalModel || caBundle != nil else {
             throw AIBackendError(message: "HTTPS 根证书文件缺失")
         }
         let workspace = root.appendingPathComponent("Workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let appRootPath = AIAssistantPathPolicy.appRoot(workspacePath: workspace.path)
-        let localTestModelPath = AILocalModelStore.ensureBundledTestModel()?.path ?? ""
         _ = try requestAgentOperation(
             "configure",
             values: [
@@ -1254,10 +1343,16 @@ actor AIAssistantBackend {
             "scheduleDeviceName": UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone",
             "wire": config.effectiveWire,
             "model": config.model, "policy": config.policy, "appRoot": appRootPath,
-            "localTestModelPath": localTestModelPath,
+            "modelProvider": config.isLocalModel ? "llama" : "remote",
+            "localModelPath": local?.modelURL.path ?? "",
+            "localProjectorPath": local?.projectorURL?.path ?? "",
+            "localContextSize": config.effectiveLocalContextSize,
+            "localMaximumTokens": config.effectiveLocalMaximumTokens,
+            "localThreads": config.effectiveLocalThreads,
+            "localTestModelPath": local?.modelURL.path ?? "",
             "supportsScreenCapture": aiSupportsWholeDeviceScreenCapture(),
             "reasoningEffort": config.effectiveReasoningEffort,
-            "caBundle": caBundle.path,
+            "caBundle": caBundle?.path ?? "",
             "temporaryDirectory": FileManager.default.temporaryDirectory.path,
             "cacheDirectory": try FileManager.default.url(for: .cachesDirectory,
                 in: .userDomainMask, appropriateFor: nil, create: true).path,
@@ -1270,7 +1365,12 @@ actor AIAssistantBackend {
         agentEpoch = UUID().uuidString
     }
 
-    func save(_ config: AIModelSettings) throws {
+    func save(_ config: AIModelSettings) async throws -> AIModelSettings {
+        try checkLifecycle()
+        // 解析本地文件和领云 Key 都会 await；只允许一个配置事务跨越这些挂起点。
+        guard !configurationInProgress else { throw AIBackendError(message: "模型配置正在准备，请稍后重试") }
+        configurationInProgress = true
+        defer { configurationInProgress = false }
         #if DEBUG && targetEnvironment(simulator)
         // 与 open 的本地模型判定一致，让正常 Root 验收也能通过正式设置保存权限模式。
         let isLocalUITest = ProcessInfo.processInfo.arguments.contains("--ai-ui-test") ||
@@ -1278,29 +1378,55 @@ actor AIAssistantBackend {
         #else
         let isLocalUITest = false
         #endif
-        let testModel = isLocalUITest && config.model == "test-model"
-        guard ["glm-5.3", "glm-5.3-flash", "deepseek-flash"].contains(config.model) || testModel else {
+        #if DEBUG && targetEnvironment(simulator)
+        let primaryModelUITest = AIPrimaryModelUITestSupport.isRequested
+        #else
+        let primaryModelUITest = false
+        #endif
+        // QA 的云端回切仍使用原合成端点；不能为测试内联选项获取账号凭据或请求供应商。
+        let testModel = isLocalUITest && !config.isLocalModel &&
+            (config.model == "test-model" || primaryModelUITest)
+        guard config.modelProvider == nil || ["remote", "llama"].contains(config.modelProvider ?? "") else {
+            throw AIBackendError(message: "请选择受支持的模型来源")
+        }
+        guard config.isLocalModel || ["glm-5.3", "glm-5.3-flash", "deepseek-flash"].contains(config.model) || testModel else {
             throw AIBackendError(message: "请选择受支持的主模型")
         }
         var normalized = config
-        if testModel { normalized.baseUrl = settings.baseUrl }
+        if config.isLocalModel {
+            normalized.selectModelSource(local: true)
+        } else if testModel {
+            normalized.model = "test-model"
+            normalized.baseUrl = settings.baseUrl
+        }
         else { normalized.selectModel(config.model) }
-        let effectiveKey = testModel ? "test-key" : storedKey(for: normalized.model)
-        guard !effectiveKey.isEmpty || isLocalUITest else {
+        if !normalized.isLocalModel && !testModel && storedKey(for: normalized.model).isEmpty {
+            _ = try? await AICloudCredentialSync.refreshAccountModelKeysIfAvailable()
+            try checkLifecycle()
+        }
+        let effectiveKey = normalized.isLocalModel ? "" : (testModel ? "test-key" : storedKey(for: normalized.model))
+        guard normalized.isLocalModel || !effectiveKey.isEmpty || isLocalUITest else {
             throw AIBackendError(message: "请先登录已开通模型服务的账号")
         }
         let previous = settings
         let previousKey = isLocalUITest && previous.model == "test-model"
-            ? "test-key" : storedKey(for: previous.model)
-        try configure(normalized, key: effectiveKey) // 正在工作时核心拒绝，不能先覆盖已保存配置。
+            ? "test-key" : (previous.isLocalModel ? "" : storedKey(for: previous.model))
+        let local = try await resolveLocalConfiguration(normalized)
+        try checkLifecycle()
+        let previousLocal = try? await resolveLocalConfiguration(previous)
+        try checkLifecycle()
+        try configure(normalized, key: effectiveKey, local: local) // 核心拒绝忙碌切换后才可覆盖配置。
         do {
+            try checkLifecycle()
             try JSONEncoder().encode(normalized).write(
                 to: root!.appendingPathComponent("settings.json"), options: .atomic)
             settings = normalized
+            initialized = true
         } catch {
-            try? configure(previous, key: previousKey)
+            try? configure(previous, key: previousKey, local: previousLocal)
             throw error
         }
+        return settings
     }
 
     func request(_ operation: String, values: [String: String] = [:], force: Bool = false) throws -> AIResponse {
@@ -1495,6 +1621,8 @@ final class AIAssistantModel: ObservableObject {
         let model = shared
         model.outgoingPermanentlyInvalidated = true
         model.outgoingPump?.stop()
+        // actor 屏障覆盖正在等待模型文件/凭据的 open/save；删除目录后不能迟到重建。
+        await model.backend.invalidatePermanently()
         for pending in model.remoteSteeringConfirmations.values {
             pending.continuation.resume(throwing: AIBackendError(message: "账号已删除", definitive: false))
         }
@@ -1514,6 +1642,13 @@ final class AIAssistantModel: ObservableObject {
     @Published var questions: [AIQuestion] = []
     @Published var selected = ""
     @Published var settings = AIModelSettings()
+    @Published private(set) var changingModelSource = false
+    @Published private(set) var actualModelID = ""
+    @Published private(set) var actualWire = ""
+    @Published private(set) var actualGPUSelected = false
+    @Published private(set) var actualGPUModelBytes: UInt64 = 0
+    @Published private(set) var actualGPUBackend = ""
+    @Published private(set) var actualBackendHasError = false
     @Published var configured = false
     @Published var error = ""
     @Published private(set) var remoteRestoreText = ""
@@ -1717,11 +1852,23 @@ final class AIAssistantModel: ObservableObject {
                 settings = opened.settings
                 workspacePath = opened.workspacePath
                 ready = true
+                if let configurationError = opened.configurationError {
+                    configured = false
+                    historyLoaded = true
+                    error = configurationError
+                    return
+                }
                 if selected.isEmpty {
                     let summary = try await backend.snapshot(session: "", limit: 0,
                                                              force: true)
                     sessions = summary.sessions ?? []
                     configured = summary.configured ?? false
+                    actualModelID = summary.model ?? ""
+                    actualWire = summary.wire ?? ""
+                    actualGPUSelected = summary.localGpuSelected ?? false
+                    actualGPUModelBytes = summary.localGpuModelBytes ?? 0
+                    actualGPUBackend = summary.localGpuBackend ?? ""
+                    actualBackendHasError = !(summary.error ?? "").isEmpty
                     selected = sessions.first?.id ?? ""
                 }
                 await restoreOutgoingMessages()
@@ -2709,14 +2856,29 @@ final class AIAssistantModel: ObservableObject {
     }
     private func refresh(force: Bool) async {
         if selectedRemote != nil { return }
-        try? await AICloudCredentialSync.refreshSeedanceIfNeeded()
-        try? await AICloudCredentialSync.refreshBailianIfNeeded()
+        #if DEBUG && targetEnvironment(simulator)
+        let primaryModelUITest = AIPrimaryModelUITestSupport.isRequested
+        #else
+        let primaryModelUITest = false
+        #endif
+        if !settings.isLocalModel && !primaryModelUITest {
+            try? await AICloudCredentialSync.refreshSeedanceIfNeeded()
+            try? await AICloudCredentialSync.refreshBailianIfNeeded()
+        }
         let target = selected
         do {
             // 轮询只同步最近几条；旧消息由用户上滑时单独分页读取，避免又把首屏扩成 30 条。
             let result = try await backend.snapshot(session: target,
                                                     limit: Self.recentMessageCount, force: force)
-            guard target == selected, result.changed == true else { return }
+            guard target == selected else { return }
+            if let model = result.model { actualModelID = model }
+            if let wire = result.wire { actualWire = wire }
+            if let selected = result.localGpuSelected { actualGPUSelected = selected }
+            if let bytes = result.localGpuModelBytes { actualGPUModelBytes = bytes }
+            if let backend = result.localGpuBackend { actualGPUBackend = backend }
+            if let error = result.error { actualBackendHasError = !error.isEmpty }
+            else if result.changed == true { actualBackendHasError = false }
+            guard result.changed == true else { return }
             if let value = result.sessions, value != sessions { sessions = value }
             if let value = result.messages {
                 let knownIDs = Set(messages.map(\.id))
@@ -3639,12 +3801,28 @@ final class AIAssistantModel: ObservableObject {
             ownerLoginSessionID: login, sessionID: session)
         try await MaiCloudDriveClient.shared.cleanupSessionRoom(room)
     }
+    /// 与思考强度相同，点选立即提交；成功前保留原来源和原会话，不创建设置弹窗。
+    func selectPrimaryModelSource(local: Bool) async {
+        guard ready, selectedRemote == nil, !busy, !isSubmitting, !changingModelSource,
+              settings.isLocalModel != local else { return }
+        changingModelSource = true
+        defer { changingModelSource = false }
+        var next = settings
+        next.selectModelSource(local: local)
+        _ = await save(next)
+    }
+
     func save(_ config: AIModelSettings) async -> Bool {
+        guard self === Self.shared, !outgoingPermanentlyInvalidated else { return false }
         do {
             var normalized = config
             normalized.selectModel(config.model)
-            try await backend.save(normalized)
-            settings = normalized; error = ""
+            settings = try await backend.save(normalized)
+            guard self === Self.shared, !outgoingPermanentlyInvalidated else { return false }
+            ready = true
+            error = ""
+            // configure 换了 native epoch；更新重试门禁，unknown 保留原绑定且不自动重放。
+            await restoreOutgoingMessages()
             await refresh(force: true)
             return true
         } catch { self.error = error.localizedDescription; return false }

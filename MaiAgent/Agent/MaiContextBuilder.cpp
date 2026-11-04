@@ -259,8 +259,9 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
         note.role = MaiModelRole::System;
         note.content =
             "[Omitted " + std::to_string(omittedImages) +
-            " older image observations to keep this request bounded. The files remain available; "
-            "use view_image on a relevant path again if its pixels are needed.]";
+            " older image observations to keep this request bounded. The files remain available, "
+            "but their omitted pixels were not provided to this request. Do not infer their visual "
+            "contents from filenames or metadata.]";
         out.insert(out.begin(), std::move(note));
         if (currentUserOutputIndex != std::numeric_limits<std::size_t>::max())
             ++currentUserOutputIndex;

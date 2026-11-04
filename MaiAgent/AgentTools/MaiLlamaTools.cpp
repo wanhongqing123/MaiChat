@@ -4,10 +4,13 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -15,14 +18,22 @@
 #include <vector>
 
 #include <json.hpp>
+#include <chat.h>
+#include <sampling.h>
+#include <ggml-cpp.h>
 #include <llama-cpp.h>
 #include <llama.h>
+#include <llama-model.h>
 #include <mtmd-helper.h>
 #include <mtmd.h>
 #include <stb/stb_image.h>
 
 #include "MaiBlockingCheck.h"
 #include "MaiFileSystem.h"
+#include "MaiIdGenerator.h"
+#include "MaiLlamaChatSupport.h"
+#include "MaiLlamaModelCapabilities.h"
+#include "MaiLlamaModelClient.h"
 #include "MaiTool.h"
 
 namespace {
@@ -34,6 +45,7 @@ constexpr std::uint64_t kMaximumImagePixels = 8'000'000;
 constexpr std::uint64_t kMaximumModelBytes = 32ULL * 1024 * 1024 * 1024;
 constexpr std::uint32_t kMaximumContext = 32768;
 constexpr std::uint32_t kMaximumTokens = 4096;
+constexpr std::size_t kMaximumChatBytes = 2 * 1024 * 1024;
 
 bool isCanceled(const std::atomic<bool>* cancel) {
     return cancel && cancel->load(std::memory_order_relaxed);
@@ -240,6 +252,158 @@ const char* stopReasonName(MaiLlamaStopReason reason) {
     }
     return "token_limit";
 }
+
+// 使用中立消息映射上游结构；工具结果必须保留原始调用 ID 和名称，不能摊平成 user 文本。
+MaiResult<common_chat_templates_inputs> chatInputs(const MaiModelRequest& request) {
+    common_chat_templates_inputs input;
+    input.use_jinja = true;
+    input.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    // 本地主模型固定为非思考模式，与模板预检和验收配置一致；保留原生 parser 的思考/工具
+    // 分流。远端 reasoningEffort 目前不映射到本地模板，不能借同名设置悄悄打开另一种模式。
+    input.enable_thinking = false;
+    input.parallel_tool_calls = true;
+    std::size_t bytes = 0;
+    const auto valid = [&](const std::string& value) {
+        if (value.size() > kMaximumChatBytes - bytes || value.find('\0') != std::string::npos ||
+            !isValidUtf8(value))
+            return false;
+        bytes += value.size();
+        return true;
+    };
+    const auto appendSystemText = [&](std::string& target, const std::string& source) {
+        if (source.empty()) return true;
+        if (!target.empty()) {
+            if (!valid("\n\n")) return false;
+            target += "\n\n";
+        }
+        target += source;
+        return true;
+    };
+    if (!valid(request.baseInstructions) || request.messages.empty() ||
+        request.messages.size() > 4096 || request.tools.size() > 512)
+        return {MaiErrorCode::InvalidInput, "Local chat requires bounded UTF-8 messages"};
+    if (!request.baseInstructions.empty()) {
+        common_chat_msg system;
+        system.role = "system";
+        system.content = request.baseInstructions;
+        input.messages.push_back(std::move(system));
+    }
+    std::map<std::string, std::string> callNames;
+    std::set<std::string> results;
+    for (const auto& message : request.messages) {
+        if (!message.images.empty())
+            return {MaiErrorCode::NotSupported, "Local primary model image input is not supported"};
+        if (!valid(message.content) || !valid(message.reasoning))
+            return {MaiErrorCode::InvalidInput, "Local chat requires bounded UTF-8 messages"};
+        common_chat_msg mapped;
+        switch (message.role) {
+            case MaiModelRole::System: mapped.role = "system"; break;
+            case MaiModelRole::User: mapped.role = "user"; break;
+            case MaiModelRole::Assistant: mapped.role = "assistant"; break;
+            case MaiModelRole::ToolResult: mapped.role = "tool"; break;
+            default: return {MaiErrorCode::InvalidInput, "Local chat message role is invalid"};
+        }
+        mapped.content = message.content;
+        mapped.reasoning_content = message.reasoning;
+        if (message.invocations.size() > 256)
+            return {MaiErrorCode::InvalidInput, "Local chat history has too many tool calls"};
+        for (const auto& call : message.invocations) {
+            if (message.role != MaiModelRole::Assistant || call.id.empty() || call.name.empty() ||
+                !valid(call.id) || !valid(call.name) || !valid(call.arguments) ||
+                !Json::parse(call.arguments, nullptr, false).is_object() ||
+                !callNames.emplace(call.id, call.name).second)
+                return {MaiErrorCode::InvalidInput, "Local chat history has an invalid tool call"};
+            mapped.tool_calls.push_back({call.name, call.arguments, call.id});
+        }
+        if (message.role == MaiModelRole::ToolResult) {
+            const auto found = callNames.find(message.toolCallId);
+            if (found == callNames.end() || !results.insert(message.toolCallId).second)
+                return {MaiErrorCode::InvalidInput, "Local chat tool result has no matching call"};
+            mapped.tool_call_id = message.toolCallId;
+            mapped.tool_name = found->second;
+        }
+        // 严格模板只允许首条 System；基础指令、历史裁剪说明和本轮收尾指令仍同属可信
+        // System，按原先顺序并入同一首条消息。其余角色及调用/回执的顺序和内容完全保留，
+        // 不能为修复模板渲染而丢历史工具、补造声明或把工具结果改写成新用户请求。
+        if (mapped.role == "system") {
+            if (input.messages.empty() || input.messages.front().role != "system") {
+                input.messages.insert(input.messages.begin(), std::move(mapped));
+            } else if (!appendSystemText(input.messages.front().content, mapped.content) ||
+                       !appendSystemText(input.messages.front().reasoning_content,
+                                         mapped.reasoning_content)) {
+                return {MaiErrorCode::InvalidInput, "Local chat requires bounded UTF-8 messages"};
+            }
+        } else {
+            input.messages.push_back(std::move(mapped));
+        }
+    }
+    std::set<std::string> names;
+    for (const auto& tool : request.tools) {
+        if (tool.name.empty() || !valid(tool.name) || !valid(tool.description) ||
+            !valid(tool.parametersJson) || !names.insert(tool.name).second ||
+            !Json::parse(tool.parametersJson, nullptr, false).is_object())
+            return {MaiErrorCode::InvalidInput, "Local chat tool definitions are invalid"};
+        input.tools.push_back({tool.name, tool.description, tool.parametersJson});
+    }
+    return input;
+}
+
+// 仅保留上游采样器的工具语法部分；不引入 common_sampler 的 CLI、下载或进程配置。
+llama_sampler_ptr chatSampler(const llama_vocab* vocabulary, common_params_sampling& parameters,
+                              float temperature, std::uint32_t seed) {
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    const auto& grammar = parameters.grammar.grammar;
+    if (!grammar.empty()) {
+        std::vector<std::string> patterns;
+        std::vector<llama_token> tokens;
+        for (const auto& trigger : parameters.grammar_triggers) {
+            switch (trigger.type) {
+                case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN: tokens.push_back(trigger.token); break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+                    patterns.push_back(escapeMaiLlamaGrammarWord(trigger.value));
+                    break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN: patterns.push_back(trigger.value); break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL:
+                    patterns.push_back(
+                        (trigger.value.empty() || trigger.value.front() != '^' ? "^" : "") +
+                        trigger.value +
+                        (trigger.value.empty() || trigger.value.back() != '$' ? "$" : ""));
+                    break;
+            }
+        }
+        std::vector<const char*> expressions;
+        for (const auto& pattern : patterns) expressions.push_back(pattern.c_str());
+        llama_sampler* sampler =
+            parameters.grammar_lazy
+                ? llama_sampler_init_grammar_lazy_patterns(vocabulary, grammar.c_str(), "root",
+                                                           expressions.data(), expressions.size(),
+                                                           tokens.data(), tokens.size())
+                : llama_sampler_init_grammar(vocabulary, grammar.c_str(), "root");
+        if (!sampler) throw std::runtime_error("Local tool grammar initialization failed");
+        llama_sampler_ptr owned(sampler);
+        if (!parameters.grammar_lazy && common_grammar_needs_prefill(parameters.grammar)) {
+            const auto prefill =
+                common_tokenize(vocabulary, parameters.generation_prompt, false, true);
+            for (std::size_t index = 0; index < prefill.size(); ++index) {
+                const auto piece = common_token_to_piece(vocabulary, prefill[index], true);
+                // 某些 tokenizer 自动在首个特殊 token 前增加空格；与上游 common_sampler 一致。
+                if (index == 0 && !piece.empty() && !parameters.generation_prompt.empty() &&
+                    std::isspace(static_cast<unsigned char>(piece.front())) &&
+                    !std::isspace(static_cast<unsigned char>(parameters.generation_prompt.front())))
+                    continue;
+                llama_sampler_accept(sampler, prefill[index]);
+            }
+        }
+        llama_sampler_chain_add(chain.get(), owned.release());
+    }
+    if (temperature == 0) {
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+    } else {
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(temperature));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(seed));
+    }
+    return chain;
+}
 }  // namespace
 
 class MaiLlamaRuntime::Implementation {
@@ -279,7 +443,8 @@ public:
             if (isCanceled(cancel)) return canceledError();
             if (!mContext || !sameIdentity(mModelIdentity, modelFile.value()) ||
                 !sameIdentity(mProjectorIdentity, projector) ||
-                mContextSize != request.contextSize || mThreads != request.threads) {
+                mContextSize != request.contextSize || mThreads != request.threads ||
+                mPreferHardwareAcceleration) {
                 const MaiError loaded = load(request, modelFile.value(), projector);
                 if (loaded.hasError()) return loaded;
             }
@@ -301,6 +466,132 @@ public:
         } catch (...) {
             resetResident();
             return {MaiErrorCode::Internal, "Local inference failed"};
+        }
+    }
+
+    MaiError streamChat(const MaiLlamaModelConfig& config, const MaiModelRequest& request,
+                        const MaiStreamSink& sink, const std::atomic<bool>& cancel) {
+        maiAssertBlockingAllowed("MaiLlamaRuntime::streamChat");
+        if (isCanceled(&cancel)) return canceledError();
+        if (!config.projectorPath.isEmpty())
+            return {MaiErrorCode::NotSupported, "Local primary model vision is not supported"};
+        if (config.contextSize < 128 || config.contextSize > kMaximumContext ||
+            config.maximumTokens >= config.contextSize || config.threads < 1 ||
+            config.threads > 64 || !std::isfinite(config.temperature) || config.temperature < 0 ||
+            config.temperature > 2 || config.maximumOutputBytes < 1 ||
+            config.maximumOutputBytes > 4 * 1024 * 1024)
+            return {MaiErrorCode::InvalidInput,
+                    "Local primary model inference limits are out of range"};
+        const bool automaticTokens = config.maximumTokens == 0;
+        MaiLlamaRequest generation;
+        generation.modelPath = config.modelPath;
+        generation.prompt = "chat";
+        generation.contextSize = config.contextSize;
+        generation.maximumTokens = automaticTokens ? 1 : config.maximumTokens;
+        generation.threads = config.threads;
+        generation.temperature = config.temperature;
+        generation.seed = config.seed;
+        generation.maximumOutputBytes = config.maximumOutputBytes;
+        if (!std::isfinite(request.temperature) || request.temperature > 2)
+            return {MaiErrorCode::InvalidInput, "Local chat temperature is invalid"};
+        if (request.temperature >= 0)
+            generation.temperature = static_cast<float>(request.temperature);
+        const auto input = chatInputs(request);
+        if (!input) return input.error();
+        std::unique_lock<std::timed_mutex> operation(mOperationMutex, std::defer_lock);
+        while (!operation.try_lock_for(std::chrono::milliseconds(10)))
+            if (isCanceled(&cancel)) return canceledError();
+        if (isCanceled(&cancel)) return canceledError();
+        RequestScope scope(*this);
+        mActiveCancel = &cancel;
+        try {
+            const auto identity = inspectFile(config.modelPath, true);
+            if (!identity) return identity.error();
+            const bool needsLoad = !mContext || !sameIdentity(mModelIdentity, identity.value()) ||
+                                   mProjector || mContextSize != config.contextSize ||
+                                   mThreads != config.threads ||
+                                   mPreferHardwareAcceleration != config.preferHardwareAcceleration;
+            if (needsLoad || !mChatTemplates) {
+                // 普通入口与宿主配置复用同一预检；不能通过先运行 llama 工具绕过主模型门禁。
+                const auto checked = validateMaiLlamaModelConfig(config);
+                if (checked) return checked;
+            }
+            if (needsLoad) {
+                const auto loaded =
+                    load(generation, identity.value(), {}, config.preferHardwareAcceleration);
+                if (loaded) return loaded;
+            }
+            if (!mChatTemplates) {
+                // 上游允许缺模板时默认为 ChatML；主模型不能把原始续写权重伪装为聊天模型。
+                const char* ordinary = llama_model_chat_template(mModel.get(), nullptr);
+                const char* tools = llama_model_chat_template(mModel.get(), "tool_use");
+                if ((!ordinary || !*ordinary) && (!tools || !*tools))
+                    return {MaiErrorCode::NotSupported,
+                            "Local primary model requires an explicit GGUF chat template"};
+                try {
+                    mChatTemplates = common_chat_templates_init(mModel.get(), {});
+                } catch (...) {
+                    return {MaiErrorCode::NotSupported,
+                            "Local model chat template cannot be initialized"};
+                }
+            }
+            if (!input.value().tools.empty()) {
+                const auto caps = common_chat_templates_get_caps(mChatTemplates.get());
+                if (!caps.at("supports_tools").get<bool>() ||
+                    !caps.at("supports_tool_calls").get<bool>())
+                    return {MaiErrorCode::NotSupported,
+                            "Local model template does not support native tool calls"};
+            }
+            const auto* vocabulary = llama_model_get_vocab(mModel.get());
+            std::unique_ptr<common_chat_session> chat;
+            try {
+                chat = std::make_unique<common_chat_session>(mChatTemplates.get(), vocabulary,
+                                                             input.value());
+            } catch (...) {
+                return {MaiErrorCode::NotSupported,
+                        "Local model cannot render the complete chat and tool history"};
+            }
+            if (!input.value().tools.empty() &&
+                (chat->parser().empty() || chat->format() == COMMON_CHAT_FORMAT_CONTENT_ONLY))
+                return {MaiErrorCode::NotSupported, "Local model tool parser is unavailable"};
+            if (isCanceled(&cancel)) return canceledError();
+            std::vector<llama_token> tokens;
+            if (llama_vocab_get_add_bos(vocabulary)) tokens.push_back(llama_vocab_bos(vocabulary));
+            std::size_t promptBytes = 0;
+            for (const auto& part : chat->prompt().parts) {
+                if (part.text.size() > kMaximumChatBytes - promptBytes)
+                    return {MaiErrorCode::InvalidInput,
+                            "Formatted local chat exceeds the byte budget"};
+                promptBytes += part.text.size();
+                // Jinja 区分模板控制文本与用户/工具数据；数据中的特殊 token 不能变成角色边界。
+                const auto encoded = common_tokenize(vocabulary, part.text, false, !part.is_input);
+                tokens.insert(tokens.end(), encoded.begin(), encoded.end());
+                if (tokens.size() + generation.maximumTokens > generation.contextSize)
+                    return {MaiErrorCode::InvalidInput,
+                            "Local chat needs at least " +
+                                std::to_string(tokens.size() + generation.maximumTokens) +
+                                " tokens including " + std::to_string(generation.maximumTokens) +
+                                " output tokens; configured context is " +
+                                std::to_string(generation.contextSize) +
+                                ". Increase context or shorten the conversation."};
+            }
+            if (llama_vocab_get_add_eos(vocabulary)) tokens.push_back(llama_vocab_eos(vocabulary));
+            if (automaticTokens) {
+                if (tokens.size() >= generation.contextSize)
+                    return {MaiErrorCode::InvalidInput,
+                            "Complete local chat has no remaining context for a response"};
+                generation.maximumTokens =
+                    generation.contextSize - static_cast<std::uint32_t>(tokens.size());
+            }
+            MaiLlamaResponse bookkeeping;
+            const auto evaluated = prefillTokens(tokens, generation, bookkeeping);
+            if (evaluated) return evaluated;
+            return sampleChat(generation, request, *chat, sink, automaticTokens);
+        } catch (...) {
+            resetResident();
+            return isCanceled(&cancel)
+                       ? canceledError()
+                       : MaiError(MaiErrorCode::Internal, "Local chat inference failed");
         }
     }
 
@@ -344,8 +635,21 @@ private:
                 if (memory) llama_memory_clear(memory, true);
             }
             mOwner.mActiveCancel = nullptr;
-            std::lock_guard<std::mutex> lock(mOwner.mStatusMutex);
-            mOwner.mStatus.busy = false;
+            std::uint64_t generation = 0;
+            {
+                std::lock_guard<std::mutex> lock(mOwner.mStatusMutex);
+                mOwner.mStatus.busy = false;
+                if (mOwner.mStatus.hasModel) generation = mOwner.mStatus.modelGeneration;
+            }
+            if (generation && generation != mOwner.mExitCleanupGeneration) {
+                // Metal 的静态设备清理要求权重资源已释放。首次实际使用新驻留配置后才
+                // 登记，使最新清理先于本配置初始化的后端静态对象；旧处理器幂等清空。
+                // 所有者本身不参与静态析构，避免 CPU registry 先析构的另一种退出崩溃。
+                if (std::atexit([] { getSharedMaiLlamaRuntime()->unload(); }) == 0)
+                    mOwner.mExitCleanupGeneration = generation;
+                else
+                    mOwner.resetResident();
+            }
         }
         Implementation& mOwner;
     };
@@ -353,6 +657,7 @@ private:
     void resetResident() {
         // model_free 与 mtmd_free 均不释放 llama_context；后两者还引用 model。
         // 必须先销毁投影器、decoder 及其 KV/scheduler，再释放权重。
+        mChatTemplates.reset();
         mProjector.reset();
         mContext.reset();
         mModel.reset();
@@ -360,25 +665,55 @@ private:
         mProjectorIdentity = {};
         mContextSize = 0;
         mThreads = 0;
+        mPreferHardwareAcceleration = false;
         std::lock_guard<std::mutex> lock(mStatusMutex);
         mStatus.hasModel = false;
         mStatus.hasProjector = false;
         mStatus.contextSize = 0;
+        mStatus.gpuSelected = false;
+        mStatus.gpuModelBytes = 0;
+        mStatus.gpuBackend.clear();
     }
 
     MaiError load(const MaiLlamaRequest& request, const MaiLlamaFileIdentity& modelFile,
-                  const MaiLlamaFileIdentity& projectorFile) {
+                  const MaiLlamaFileIdentity& projectorFile,
+                  bool preferHardwareAcceleration = false) {
         resetResident();
         static std::once_flag initialized;
         std::call_once(initialized, [] {
             // 固定日志接收器避免上游元数据和路径进入宿主 stderr 或工具结果。
-            // 静态 CPU 后端自行注册，不扫描任意插件目录。
+            // 仓库静态后端自行注册，不扫描任意插件目录。
             llama_log_set(quietLog, nullptr);
             mtmd_helper_log_set(quietLog, nullptr);
             llama_backend_init();
         });
         auto modelParameters = llama_model_default_params();
         modelParameters.n_gpu_layers = 0;
+        ggml_backend_dev_t selectedDevices[] = {nullptr, nullptr};
+        // nullptr 表示上游自动枚举 GPU，不能用于纯 CPU 回退；显式空列表才禁止 GPU 后端。
+        modelParameters.devices = selectedDevices;
+        bool useGpu = false;
+#if defined(__APPLE__)
+        if (preferHardwareAcceleration) {
+            for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+                auto* device = ggml_backend_dev_get(index);
+                const auto type = ggml_backend_dev_type(device);
+                const auto registry = ggml_backend_dev_backend_reg(device);
+                if ((type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                     type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                    registry && registry == ggml_backend_reg_by_name("MTL") &&
+                    supportsMaiLlamaModelOperations(
+                        modelFile.path, request.contextSize, [device](const ggml_tensor* op) {
+                            return ggml_backend_dev_supports_op(device, op);
+                        })) {
+                    selectedDevices[0] = device;
+                    modelParameters.n_gpu_layers = -1;
+                    useGpu = true;
+                    break;
+                }
+            }
+        }
+#endif
         modelParameters.progress_callback = modelProgress;
         modelParameters.progress_callback_user_data = this;
         mModel.reset(llama_model_load_from_file(modelFile.path.toUtf8().c_str(), modelParameters));
@@ -418,10 +753,10 @@ private:
         contextParameters.n_threads_batch = static_cast<int32_t>(request.threads);
         contextParameters.type_k = GGML_TYPE_F16;
         contextParameters.type_v = GGML_TYPE_F16;
-        // 仅设 n_gpu_layers=0 仍保留上游默认的运算/KQV offload。
-        // 首版让 decoder 全部使用 CPU，确保公开的 abort 取消边界成立。
-        contextParameters.offload_kqv = false;
-        contextParameters.op_offload = false;
+        // 独立 generate 保持固定 CPU；主模型的长上下文注意力可随完整权重层走 Metal。
+        // Flash Attention 仍用上游 AUTO 探测；GPU 的取消边界是批次完成/同步之后。
+        contextParameters.offload_kqv = useGpu;
+        contextParameters.op_offload = useGpu;
         contextParameters.abort_callback = abortEvaluation;
         contextParameters.abort_callback_data = this;
         mContext.reset(llama_init_from_model(mModel.get(), contextParameters));
@@ -436,10 +771,26 @@ private:
         mProjectorIdentity = projectorFile;
         mContextSize = request.contextSize;
         mThreads = request.threads;
+        mPreferHardwareAcceleration = preferHardwareAcceleration;
+        std::uint64_t gpuBytes = 0;
+        std::string gpuBackend;
+        for (const auto& allocation : mModel->memory_breakdown()) {
+            const auto device = ggml_backend_buft_get_device(allocation.first);
+            if (!device) continue;
+            const auto type = ggml_backend_dev_type(device);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU)
+                continue;
+            gpuBytes += allocation.second;
+            const auto registry = ggml_backend_dev_backend_reg(device);
+            if (registry) gpuBackend = ggml_backend_reg_name(registry);
+        }
         std::lock_guard<std::mutex> lock(mStatusMutex);
         mStatus.hasModel = true;
         mStatus.hasProjector = static_cast<bool>(mProjector);
         mStatus.contextSize = request.contextSize;
+        mStatus.gpuSelected = gpuBytes != 0;
+        mStatus.gpuModelBytes = gpuBytes;
+        mStatus.gpuBackend = gpuBytes ? std::move(gpuBackend) : std::string{};
         ++mStatus.modelGeneration;
         return {};
     }
@@ -456,20 +807,149 @@ private:
                          MaiLlamaResponse& response) {
         auto tokens = tokenize(mModel.get(), prompt);
         if (!tokens) return tokens.error();
-        if (tokens.value().size() + request.maximumTokens > llama_n_ctx(mContext.get()))
+        return prefillTokens(tokens.value(), request, response);
+    }
+
+    MaiError prefillTokens(const std::vector<llama_token>& tokens, const MaiLlamaRequest& request,
+                           MaiLlamaResponse& response) {
+        if (tokens.empty() || tokens.size() + request.maximumTokens > llama_n_ctx(mContext.get()))
             return {MaiErrorCode::InvalidInput,
-                    "Prompt and output token budgets exceed the decoder context"};
-        response.promptTokens = static_cast<std::uint32_t>(tokens.value().size());
-        for (std::size_t offset = 0; offset < tokens.value().size();) {
+                    "Local inference needs " +
+                        std::to_string(tokens.size() + request.maximumTokens) +
+                        " tokens including output; configured context is " +
+                        std::to_string(llama_n_ctx(mContext.get())) +
+                        ". Increase context or shorten the conversation."};
+        response.promptTokens = static_cast<std::uint32_t>(tokens.size());
+        for (std::size_t offset = 0; offset < tokens.size();) {
             if (isCanceled(mActiveCancel)) return canceledError();
-            const auto count = static_cast<int32_t>(std::min<std::size_t>(
-                llama_n_batch(mContext.get()), tokens.value().size() - offset));
+            const auto count = static_cast<int32_t>(
+                std::min<std::size_t>(llama_n_batch(mContext.get()), tokens.size() - offset));
             const int decoded = llama_decode(
-                mContext.get(), llama_batch_get_one(tokens.value().data() + offset, count));
+                mContext.get(),
+                llama_batch_get_one(const_cast<llama_token*>(tokens.data() + offset), count));
             if (decoded != 0) return decodeFailure(decoded);
+            // Metal 无公开的 kernel 抢占 abort；等待当前有界批次结束再报告取消。
+            llama_synchronize(mContext.get());
+            if (isCanceled(mActiveCancel)) return canceledError();
             offset += static_cast<std::size_t>(count);
         }
         return {};
+    }
+
+    MaiError sampleChat(const MaiLlamaRequest& generation, const MaiModelRequest& request,
+                        common_chat_session& chat, const MaiStreamSink& sink,
+                        bool automaticTokens) {
+        const auto* vocabulary = llama_model_get_vocab(mModel.get());
+        common_params_sampling parameters;
+        chat.apply_sampling(parameters);
+        auto sampler = chatSampler(vocabulary, parameters, generation.temperature, generation.seed);
+        common_chat_msg previous;
+        previous.role = "assistant";
+        common_chat_input pending;
+        std::size_t producedBytes = 0;
+        std::size_t stopHold = 0;
+        for (const auto& stop : chat.additional_stops()) {
+            if (stop.empty() || stop.size() > 4096)
+                return {MaiErrorCode::NotSupported, "Local model stop sequence is unsupported"};
+            stopHold = std::max(stopHold, stop.size() - 1);
+        }
+        const auto emit = [&](const common_chat_msg& message) {
+            const auto differences = common_chat_msg_diff::compute_diffs(previous, message);
+            for (const auto& difference : differences) {
+                if (!difference.content_delta.empty() && sink.onText)
+                    sink.onText(difference.content_delta);
+                if (!difference.reasoning_content_delta.empty() && sink.onReasoning)
+                    sink.onReasoning(difference.reasoning_content_delta);
+            }
+            previous = message;
+        };
+        const auto finish = [&](const common_chat_input& final) -> MaiError {
+            try {
+                // 整个响应先严格完成解析和调用校验，再一次性交付调用，防止半批工具执行。
+                const auto& message = chat.finish(final);
+                std::vector<MaiToolInvocation> calls;
+                std::set<std::string> ids;
+                for (const auto& call : message.tool_calls) {
+                    const auto known =
+                        std::find_if(request.tools.begin(), request.tools.end(),
+                                     [&](const auto& tool) { return tool.name == call.name; });
+                    if (known == request.tools.end() ||
+                        !Json::parse(call.arguments, nullptr, false).is_object())
+                        return {MaiErrorCode::Protocol,
+                                "Local model returned an invalid tool call"};
+                    std::string id = call.id.empty() ? MaiIdGenerator::generate("call") : call.id;
+                    if (!ids.insert(id).second)
+                        return {MaiErrorCode::Protocol,
+                                "Local model returned duplicate tool call IDs"};
+                    calls.push_back({std::move(id), call.name, call.arguments});
+                }
+                emit(message);
+                if (isCanceled(mActiveCancel)) return canceledError();
+                for (const auto& call : calls)
+                    if (sink.onToolCall) sink.onToolCall(call);
+                return isCanceled(mActiveCancel) ? canceledError() : MaiError{};
+            } catch (...) {
+                return {MaiErrorCode::Protocol,
+                        "Local model response does not match its chat template"};
+            }
+        };
+        for (std::uint32_t index = 0; index < generation.maximumTokens; ++index) {
+            if (isCanceled(mActiveCancel)) return canceledError();
+            if (!llama_get_logits_ith(mContext.get(), -1))
+                return {MaiErrorCode::Internal, "Local decoder returned no sampling logits"};
+            const auto token = llama_sampler_sample(sampler.get(), mContext.get(), -1);
+            if (token < 0 || token >= llama_vocab_n_tokens(vocabulary))
+                return {MaiErrorCode::Internal, "Local decoder returned an invalid token"};
+            if (llama_vocab_is_eog(vocabulary, token)) {
+                if (!isValidUtf8(pending.text))
+                    return {MaiErrorCode::Protocol, "Local model ended inside a UTF-8 character"};
+                return finish(pending);
+            }
+            // 工具/思考控制 token 必须交给原生 parser，而不能先过滤或直接显示给用户。
+            const auto piece = common_token_to_piece(vocabulary, token, true);
+            if (piece.size() > generation.maximumOutputBytes - producedBytes)
+                return {MaiErrorCode::Protocol, "Local model reached its output byte limit"};
+            producedBytes += piece.size();
+            pending.append(piece, token);
+            std::size_t stopAt = std::string::npos;
+            for (const auto& stop : chat.additional_stops())
+                stopAt = std::min(stopAt, pending.text.find(stop));
+            if (stopAt != std::string::npos) {
+                const auto final = pending.substr(0, stopAt);
+                if (!isValidUtf8(final.text))
+                    return {MaiErrorCode::Protocol, "Local model stop split a UTF-8 character"};
+                return finish(final);
+            }
+            const auto available = pending.size() > stopHold ? pending.size() - stopHold : 0;
+            std::size_t complete = 0;
+            while (complete < available) {
+                const auto width = utf8Width(pending.text, complete);
+                if (width == 0)
+                    return {MaiErrorCode::Protocol, "Local model produced invalid UTF-8"};
+                if (width < 0 || complete + static_cast<std::size_t>(width) > available) break;
+                complete += static_cast<std::size_t>(width);
+            }
+            if (complete) {
+                try {
+                    emit(chat.feed(pending.substr(0, complete)));
+                } catch (...) {
+                    return {MaiErrorCode::Protocol,
+                            "Local model stream does not match its chat template"};
+                }
+                pending = pending.substr(complete);
+            }
+            if (index + 1 < generation.maximumTokens) {
+                llama_token next = token;
+                const int decoded = llama_decode(mContext.get(), llama_batch_get_one(&next, 1));
+                if (decoded) return decodeFailure(decoded);
+            }
+        }
+        // 预算耗尽时即使已看见完整 JSON 也不能猜测模型结束，更不能运行工具。
+        return {automaticTokens ? MaiErrorCode::InvalidInput : MaiErrorCode::Protocol,
+                automaticTokens
+                    ? "Local model reached context capacity before ending its response. Start a "
+                      "new conversation or choose a model with a larger context."
+                    : "Local model reached its explicit output token limit"};
     }
 
     MaiError prefillImage(const std::string& prompt, const std::string& bytes,
@@ -572,9 +1052,12 @@ private:
     MaiLlamaFileIdentity mProjectorIdentity;
     std::uint32_t mContextSize = 0;
     std::uint32_t mThreads = 0;
+    bool mPreferHardwareAcceleration = false;
+    std::uint64_t mExitCleanupGeneration = 0;
     llama_model_ptr mModel;
     llama_context_ptr mContext;
     mtmd::context_ptr mProjector;
+    common_chat_templates_ptr mChatTemplates;
 };
 
 MaiLlamaRuntime::MaiLlamaRuntime() : mImplementation(std::make_unique<Implementation>()) {}
@@ -583,6 +1066,11 @@ MaiResult<MaiLlamaResponse> MaiLlamaRuntime::generate(const MaiLlamaRequest& req
                                                       const std::atomic<bool>* cancel) {
     return mImplementation->generate(request, cancel);
 }
+MaiError MaiLlamaRuntime::streamChat(const MaiLlamaModelConfig& config,
+                                     const MaiModelRequest& request, const MaiStreamSink& sink,
+                                     const std::atomic<bool>& cancel) {
+    return mImplementation->streamChat(config, request, sink, cancel);
+}
 MaiLlamaStatus MaiLlamaRuntime::status() const {
     return mImplementation->status();
 }
@@ -590,8 +1078,11 @@ MaiError MaiLlamaRuntime::unload() {
     return mImplementation->unload();
 }
 std::shared_ptr<MaiLlamaRuntime> getSharedMaiLlamaRuntime() {
-    static const auto runtime = std::shared_ptr<MaiLlamaRuntime>(new MaiLlamaRuntime());
-    return runtime;
+    // 参照 Chromium NoDestructor 的进程级所有者。后端 registry 在首次加载权重时才创建，
+    // 普通静态 shared_ptr 会晚于它析构，导致 model_free 调用已经销毁的后端函数表。
+    // 显式 unload 仍正常释放权重；RequestScope 在后端就绪后登记有序退出清理。
+    static const auto* runtime = new std::shared_ptr<MaiLlamaRuntime>(new MaiLlamaRuntime());
+    return *runtime;
 }
 
 namespace {
@@ -673,6 +1164,9 @@ public:
                 {"has_model", state.hasModel},
                 {"has_projector", state.hasProjector},
                 {"context_size", state.contextSize},
+                {"gpu_selected", state.gpuSelected},
+                {"gpu_model_bytes", state.gpuModelBytes},
+                {"gpu_backend", state.gpuBackend},
                 {"model_generation",
                  state.modelGeneration}}.dump());
         }

@@ -42,11 +42,20 @@ public:
     }
 
     std::string description() const override {
-        // 查看现有图片并生成有界预览供模型理解；用户消息附件已有视觉输入时无需重复调用。
-        return "View an existing PNG, JPEG, WebP, or GIF file accessible to this host. "
-               "MaiChat prepares a bounded JPEG preview for model analysis. "
+        // 本工具把像素交给有视觉能力的主模型；用户展示入口不依赖模型理解图片。
+        return "Analyze an existing PNG, JPEG, WebP, or GIF file with an image-capable primary "
+               "model. "
+               "MaiChat prepares a bounded JPEG preview for model analysis. To display a file to "
+               "the "
+               "user, use mobile_preview_image when available. "
                "Images attached by the user are already in the current prompt; inspect them "
                "directly instead of calling this tool for paths mentioned in a screenshot.";
+    }
+
+    bool isAvailableForModel(const std::string& model) const override {
+        // 当前本地主模型传输只接受文本。按实际 local: 模型标识拒绝，不能因为
+        // 底层架构可能支持视觉就宣称已经接入图像输入。
+        return model != "glm-5.3" && model.compare(0, 6, "local:") != 0;
     }
 
     std::string parametersSchema() const override {
@@ -66,7 +75,13 @@ public:
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                           "view_image requires one string parameter named path");
         }
-        if (context.model == "glm-5.3") {
+        if (!isAvailableForModel(context.model)) {
+            if (context.model != "glm-5.3")
+                return MaiToolResult::failure(
+                    MaiErrorCode::NotSupported,
+                    "The current local primary model accepts text only and cannot analyze image "
+                    "pixels. To display this file to the user, use mobile_preview_image when "
+                    "available. Do not claim that the image was analyzed.");
             return MaiToolResult::failure(
                 MaiErrorCode::NotSupported,
                 "The current glm-5.3 model accepts text only. Ask the user to switch to "

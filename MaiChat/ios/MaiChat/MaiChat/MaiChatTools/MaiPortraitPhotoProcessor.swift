@@ -428,11 +428,13 @@ enum MaiPortraitPhotoProcessor {
                     try prepared.imageOutput.path.withCString { try output(take(maiPortraitCommitResult(profile, metadata, $0))) }
                 }
             }
+            // 成品留在聊天中供用户点开；处理完成不应引导 Agent 自动打开全屏预览。
             response.merge(["path": prepared.imageOutput.lastPathComponent, "mime_type": "image/png",
                 "width": prepared.width, "height": prepared.height,
                 "mask_path": prepared.maskOutput.lastPathComponent, "mask_width": prepared.width,
                 "mask_height": prepared.height, "mask_coordinate_origin": "top_left",
-                "next_tool": "mobile_preview_image"]) { _, new in new }
+                "next_tool": "agent_send_media",
+                "delivery_hint": "Attach this path to the current AI conversation with agent_send_media (file_path=path, type=image). Open a full-screen preview only when the user explicitly requests it."]) { _, new in new }
             return response
         } catch {
             for url in published { try? FileManager.default.removeItem(at: url) }

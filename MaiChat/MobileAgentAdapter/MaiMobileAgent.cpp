@@ -31,6 +31,8 @@
 #include "MaiPdfTool.h"
 #include "MaiIdGenerator.h"
 #include "MaiLlamaTools.h"
+#include "MaiLlamaModelClient.h"
+#include "MaiLlamaModelValidation.h"
 #include "MaiQuestionTool.h"
 #include "MaiSessionTools.h"
 #include "MaiSqliteStore.h"
@@ -56,6 +58,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <json.hpp>
 #include <memory>
 #include <mutex>
@@ -64,6 +67,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using Json = nlohmann::json;
 
@@ -72,9 +76,39 @@ namespace {
 // 保留核心错误类型给宿主队列判断“明确未受理”。不能把未知异常或附件错误猜成Busy后重播。
 class NativeOperationFailure final : public std::runtime_error {
 public:
-    explicit NativeOperationFailure(const MaiError& error)
-        : std::runtime_error(error.message()), code(error.code()) {}
+    explicit NativeOperationFailure(const MaiError& error) : std::runtime_error(error.message()), code(error.code()) {}
     MaiErrorCode code;
+};
+
+// 普通本地客户端测量只取消自己的 stream；任何返回/异常都先唤醒并回收截止线程。
+// 不调用 Agent::stop，不接触主界面已有任务，也不把工具回调交给执行器。
+class LocalModelProbeDeadline {
+public:
+    explicit LocalModelProbeDeadline(std::uint32_t milliseconds)
+        : mThread([this, milliseconds] {
+              MaiThread::setCurrentName("mai-probe-time");
+              std::unique_lock<std::mutex> lock(mMutex);
+              if (!mWake.wait_for(lock, std::chrono::milliseconds(milliseconds), [this] { return mFinished; }))
+                  mCanceled.store(true);
+          }) {}
+    ~LocalModelProbeDeadline() {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mFinished = true;
+        }
+        mWake.notify_all();
+        if (mThread.joinable()) mThread.join();
+    }
+    const std::atomic<bool>& canceled() const {
+        return mCanceled;
+    }
+
+private:
+    std::mutex mMutex;
+    std::condition_variable mWake;
+    bool mFinished = false;
+    std::atomic<bool> mCanceled{false};
+    std::thread mThread;
 };
 
 // 私有表单 token 只关联这一轮请求，不用作路径、账号或密码；与宿主 UUID 校验保持一致。
@@ -415,7 +449,11 @@ struct MaiMobileAgent {
     std::unordered_map<std::string, std::string> errors;
     std::string workspace;
     std::string model;
-    MaiModelConfig suggestionConfig;
+    MaiWireApi primaryWire = MaiWireApi::ChatCompletions;
+    // 普通建议与 Agent 使用同一种已配置客户端；本地模式不能绕回云端生成。
+    std::function<std::unique_ptr<MaiModelClient>()> modelClientFactory;
+    std::vector<MaiToolSpec> modelProbeTools;
+    std::string modelProbeInstructions;
     bool configured = false;
     const void* ortApiBase = nullptr;
     std::shared_ptr<MaiMobileHostDispatcher> hostTools = makeMaiMobileHostDispatcher();
@@ -512,13 +550,25 @@ struct MaiMobileAgent {
             databasePath == ":memory:" ? databasePath : databasePath + ".schedule.sqlite");
         const auto nextScheduleStore =
             scheduleOpened.isOk() ? scheduleOpened.value() : std::shared_ptr<MaiSessionScheduleStore>();
+        if (request.contains("modelProvider") && !request["modelProvider"].is_string())
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::InvalidInput, "Model provider must be a string."));
+        const std::string provider = request.value("modelProvider", std::string("remote"));
+        if (provider != "remote" && provider != "llama")
+            throw NativeOperationFailure(MaiError::make(MaiErrorCode::InvalidInput, "Unsupported model provider."));
+        const bool isLocal = provider == "llama";
         MaiModelConfig config;
-        config.baseUrl = request.at("baseUrl").get<std::string>();
+        config.baseUrl = isLocal ? std::string{} : request.at("baseUrl").get<std::string>();
+        if (!isLocal && config.baseUrl.empty())
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::InvalidInput, "A remote model endpoint is required."));
         config.apiKey = request.value("apiKey", "");
         config.caBundlePath = request.value("caBundle", "");
         // Responses/Chat 是主模型线协议，和 Seedance 等专业工具的供应商 API 无关。
         const std::string wire = request.value("wire", std::string{});
-        if (wire == "responses" || (wire.empty() && request.value("model", std::string{}) == "deepseek-flash"))
+        if (isLocal)
+            config.wire = MaiWireApi::Local;
+        else if (wire == "responses" || (wire.empty() && request.value("model", std::string{}) == "deepseek-flash"))
             config.wire = MaiWireApi::Responses;
         else if (!wire.empty() && wire != "chat_completions")
             throw std::runtime_error("Unsupported model wire protocol.");
@@ -526,7 +576,75 @@ struct MaiMobileAgent {
                                      mai_ffprobe_execute,      mai_ffprobe_set_cancel_check,
                                      mai_fftools_set_log_sink, mai_fftools_error_string};
         config.prepareImage = makeMaiFfmpegModelImagePreparer(ffmpegEngine);
-        suggestionConfig = config;
+        std::function<std::unique_ptr<MaiModelClient>()> nextModelClientFactory;
+        if (isLocal) {
+            MaiLlamaModelConfig local;
+            MaiToolContext paths;
+            paths.root = request.at("workspace").get<std::string>();
+            paths.fileAccessRoot = request.value("appRoot", paths.root);
+            const auto authorizedModelFile = [&](const char* field, bool optional) -> MaiFilePath {
+                if (!request.contains(field)) {
+                    if (optional) return {};
+                    throw NativeOperationFailure(
+                        MaiError::make(MaiErrorCode::InvalidInput, "A local GGUF file is required."));
+                }
+                if (!request[field].is_string())
+                    throw NativeOperationFailure(
+                        MaiError::make(MaiErrorCode::InvalidInput, "Local model paths must be strings."));
+                const auto raw = request[field].get<std::string>();
+                if (raw.empty() && optional) return {};
+                const auto path = paths.resolvePath(raw);
+                if (path.empty())
+                    throw NativeOperationFailure(MaiError::make(MaiErrorCode::InvalidInput,
+                                                                "Local model file is outside the application root."));
+                const auto file = MaiFilePath::fromUtf8(path);
+                std::uint64_t size = 0;
+                if (!MaiFileSystem::fileSize(file, size) || MaiFileSystem::isDirectory(file) || size < 24)
+                    throw NativeOperationFailure(
+                        MaiError::make(MaiErrorCode::NotFound, "Local GGUF file is missing or unavailable."));
+                return file;
+            };
+            const auto boundedNumber = [&](const char* field, std::uint32_t fallback, std::uint32_t lower,
+                                           std::uint32_t upper) -> std::uint32_t {
+                if (!request.contains(field)) return fallback;
+                const auto& value = request[field];
+                std::uint64_t parsed = 0;
+                if (value.is_number_unsigned())
+                    parsed = value.get<std::uint64_t>();
+                else if (value.is_number_integer() && value.get<std::int64_t>() >= 0)
+                    parsed = static_cast<std::uint64_t>(value.get<std::int64_t>());
+                else
+                    throw NativeOperationFailure(
+                        MaiError::make(MaiErrorCode::InvalidInput, "Local inference limits must be integers."));
+                if (parsed < lower || parsed > upper)
+                    throw NativeOperationFailure(
+                        MaiError::make(MaiErrorCode::InvalidInput, "Local inference limit is out of range."));
+                return static_cast<std::uint32_t>(parsed);
+            };
+            local.modelPath = authorizedModelFile("localModelPath", false);
+            local.projectorPath = authorizedModelFile("localProjectorPath", true);
+            if (!local.projectorPath.isEmpty())
+                throw NativeOperationFailure(MaiError::make(
+                    MaiErrorCode::NotSupported,
+                    "Local primary models currently support text and tools; use the local inference test for images."));
+            // 完整移动工具目录的首轮模板实测已超过 23k token；默认 8k 会在第一轮必然失败。
+            // 保留显式较小预算的严格错误，不裁历史/工具来伪装适配。
+            local.contextSize = boundedNumber("localContextSize", 32768, 128, 32768);
+            // 0 交由模型自然结束，最大只受实际上下文余量约束；保留显式预算供普通调用/测试。
+            local.maximumTokens = boundedNumber("localMaximumTokens", 0, 0, 4096);
+            local.threads = boundedNumber("localThreads", 2, 1, 64);
+            if (local.maximumTokens >= local.contextSize)
+                throw NativeOperationFailure(MaiError::make(
+                    MaiErrorCode::InvalidInput, "Generation tokens must be smaller than local context size."));
+            // 有界预检 GGUF 元数据和原生工具模板；失败时旧 Agent/设置仍保持有效。
+            // 不加载张量，也不把预检通过当作权重质量、内存或实际推理成功保证。
+            const auto checked = validateMaiLlamaModelConfig(local);
+            if (checked) throw NativeOperationFailure(checked);
+            // 每个 stream 从完整对话构建原生模板；这里仅绑定配置，不预加载大权重或触发推理。
+            nextModelClientFactory = [local] { return makeMaiLlamaModelClient(local); };
+        } else {
+            nextModelClientFactory = [config] { return makeMaiModelClient(config); };
+        }
         auto tools = std::make_unique<MaiToolRegistry>();
         // 两个移动端只提供真实可用的本地文件和网络工具，不暴露桌面 shell。
         registerMaiFileTools(*tools);
@@ -543,7 +661,8 @@ struct MaiMobileAgent {
             if (result.hasError()) return {};
             const auto response = Json::parse(result.output(), nullptr, false);
             return response.is_object() && response.value("key", Json{}).is_string()
-                ? response["key"].get<std::string>() : std::string{};
+                       ? response["key"].get<std::string>()
+                       : std::string{};
         };
         registerMaiDeepSeekWebTools(*tools, std::move(webOptions));
         tools->add(makeMaiZlibCompressTool());
@@ -628,8 +747,10 @@ struct MaiMobileAgent {
                 return {MaiErrorCode::Protocol, "Ark Assets service configuration is invalid"};
             return MaiArkAssetServiceSettings{value["base_url"].get<std::string>(), value["token"].get<std::string>()};
         };
-        // 各模型复用同一套私有 OSS 直传实现，但必须写入各自的明确目录。
-        const bool assetsConfigured = static_cast<bool>(assetSettings());
+        // 本地主模型初始化不探测云端账号或刷新令牌。只绑定现有延迟回调，
+        // 用户随后明确调用云媒体工具时才按所属账号查询凭据/审批；素材仍由客户端直传。
+        // 远端模型保留原有能力探测，各模型仍写入自己的明确 OSS 目录。
+        const bool assetsConfigured = isLocal || static_cast<bool>(assetSettings());
         const auto modelUploadMedia = [&](MaiOssUploadPurpose purpose) {
             return assetsConfigured ? makeMaiPrivateOssMediaUploader(assetSettings, config.caBundlePath, purpose)
                                     : MaiCreativeMediaUploadProvider{};
@@ -754,16 +875,27 @@ struct MaiMobileAgent {
             return result.output();
         };
         options.baseInstructions = kMarkdownBaseInstructions;
+        if (isLocal) {
+            // 当前本地主模型未加载视觉投影器；展示工具产物和向模型送入图片是两种能力。
+            // 明确边界，不能把成功拍照或界面显示误称为已经理解了照片内容。
+            options.baseInstructions +=
+                "\nYour primary model runs locally in this App through in-process GGUF inference. "
+                "Use the same registered tools and approval rules as other primary models. "
+                "This local configuration accepts text only and cannot analyze image contents. "
+                "Displaying an image to the user does not mean you have visually inspected it. "
+                "Do not claim that your text responses came from a cloud model.";
+        }
         // 内置模型路径由原生宿主复制/校验后提供，只允许当前App容器中的现有文件。
         // 提示词只介绍已知可用的英文测试权重，不改变主聊天供应商，也不让模型猜目录。
-        if (request.value("localTestModelPath", Json{}).is_string()) {
+        if (!isLocal && request.value("localTestModelPath", Json{}).is_string()) {
             MaiToolContext localModelContext;
             localModelContext.root = request.at("workspace").get<std::string>();
             localModelContext.fileAccessRoot = options.fileAccessRoot;
             const auto localModel = localModelContext.resolvePath(request["localTestModelPath"].get<std::string>());
             if (!localModel.empty() && MaiFileSystem::exists(MaiFilePath::fromUtf8(localModel))) {
-                options.baseInstructions += "\nA tiny English CPU inference test model is available locally at " +
-                    localModel + ". Use the llama tool with -m pointing to this existing GGUF, "
+                options.baseInstructions +=
+                    "\nA tiny English CPU inference test model is available locally at " + localModel +
+                    ". Use the llama tool with -m pointing to this existing GGUF, "
                     "-p 'Once upon a time', -c 256 -n 32 -t 2 --temp 0 --no-conversation to test "
                     "the engine. It is an English continuation test model, with no OCR or image "
                     "capability. Do not search directories or download models to run this test.";
@@ -776,8 +908,11 @@ struct MaiMobileAgent {
             options.approvalPolicy = MaiApprovalPolicy::UnlessTrusted;
         else if (policy != "on-request")
             throw std::runtime_error("Unknown approval policy.");
+        // QA 与正式 Agent 必须使用相同的模型能力过滤，不能用更宽的工具清单验收本地模型。
+        const auto nextProbeTools = tools->specs(options.defaultModel);
+        const auto nextProbeInstructions = options.baseInstructions;
         auto replacement =
-            std::make_unique<MaiAgent>(std::move(store.value()), makeMaiModelClient(config), std::move(tools), options);
+            std::make_unique<MaiAgent>(std::move(store.value()), nextModelClientFactory(), std::move(tools), options);
         stopSchedulePolling();
         if (anyBusy()) {
             startSchedulePolling();
@@ -794,9 +929,13 @@ struct MaiMobileAgent {
         liveParts.clear();
         errors.clear();
         agent = std::move(replacement);
+        modelClientFactory = std::move(nextModelClientFactory);
+        modelProbeTools = nextProbeTools;
+        modelProbeInstructions = nextProbeInstructions;
         workspace = request.at("workspace").get<std::string>();
         model = options.defaultModel;
-        configured = !config.apiKey.empty() && !model.empty();
+        primaryWire = config.wire;
+        configured = (isLocal || !config.apiKey.empty()) && !model.empty();
         dirty = true;
         structureChanged = true;
         cachedSession.clear();
@@ -823,6 +962,103 @@ struct MaiMobileAgent {
             }
         });
         startSchedulePolling();
+    }
+
+    // 测量同一个已配置本地主模型及完整工具模板，始终不执行工具、不落库、不读会话历史。
+    // 供宿主在隔离实例中做设备验收；调用者须自己准备已授权的测试文件/工作区。
+    Json localModelProbe(const Json& request) {
+        for (const auto& item : request.items())
+            if (item.key() != "op" && item.key() != "messages" && item.key() != "timeout_ms")
+                throw NativeOperationFailure(MaiError::make(MaiErrorCode::InvalidInput, "Unknown local probe field."));
+        if (!configured || primaryWire != MaiWireApi::Local || !modelClientFactory)
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::NotConfigured, "A local primary model is required for this probe."));
+        if (anyBusy())
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::Busy, "The configured Agent is busy; its task was preserved."));
+        if (!request.contains("messages") || !request["messages"].is_array() || request["messages"].empty() ||
+            request["messages"].size() > 10)
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::InvalidInput, "Probe messages must contain one to ten text messages."));
+        MaiModelRequest input;
+        input.model = model;
+        input.workingDirectory = workspace;
+        input.baseInstructions = modelProbeInstructions;
+        input.tools = modelProbeTools;
+        std::size_t bytes = 0;
+        for (const auto& message : request["messages"]) {
+            if (!message.is_object() || message.size() != 2 || !message.value("role", Json{}).is_string() ||
+                !message.value("content", Json{}).is_string())
+                throw NativeOperationFailure(
+                    MaiError::make(MaiErrorCode::InvalidInput, "Probe messages need role and content strings only."));
+            const auto role = message["role"].get<std::string>();
+            if (role != "user" && role != "assistant")
+                throw NativeOperationFailure(
+                    MaiError::make(MaiErrorCode::InvalidInput, "Only user and assistant probe text is accepted."));
+            MaiModelMessage item;
+            item.role = role == "user" ? MaiModelRole::User : MaiModelRole::Assistant;
+            item.content = message["content"].get<std::string>();
+            if (item.content.size() > 65536 - bytes)
+                throw NativeOperationFailure(
+                    MaiError::make(MaiErrorCode::InvalidInput, "Probe text exceeds its memory budget."));
+            bytes += item.content.size();
+            input.messages.push_back(std::move(item));
+        }
+        std::uint64_t timeout = 120000;
+        if (request.contains("timeout_ms")) {
+            const auto& value = request["timeout_ms"];
+            if (value.is_number_unsigned())
+                timeout = value.get<std::uint64_t>();
+            else if (value.is_number_integer() && value.get<std::int64_t>() > 0)
+                timeout = static_cast<std::uint64_t>(value.get<std::int64_t>());
+            else
+                timeout = 0;
+        }
+        if (timeout == 0 || timeout > 120000)
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::InvalidInput, "Probe deadline must be 1 to 120000 milliseconds."));
+        LocalModelProbeDeadline deadline(static_cast<std::uint32_t>(timeout));
+        const auto start = std::chrono::steady_clock::now();
+        double firstToken = -1;
+        std::string output;
+        Json calls = Json::array();
+        MaiStreamSink sink;
+        sink.onText = [&](std::string_view text) {
+            if (firstToken < 0 && !text.empty())
+                firstToken =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            output.append(text.data(), text.size());
+        };
+        // 绝不能在这里执行工具、回写用户会话或请求宿主凭据。
+        sink.onToolCall = [&](const MaiToolInvocation& call) {
+            calls.push_back({{"id", call.id}, {"name", call.name}, {"arguments", call.arguments}});
+        };
+        const auto error = modelClientFactory()->stream(input, sink, deadline.canceled());
+        const double total =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        const auto state = getSharedMaiLlamaRuntime()->status();
+        Json advertised = Json::array();
+        for (const auto& tool : input.tools) advertised.push_back(tool.name);
+        // 完整原生调用也是有效的测量结果，但它不代表工具已执行。
+        // 回传实际名称、参数和 ID，避免把“返回了文本”误当成任务质量验收。
+        Json response{{"ok", !error && (!calls.empty() || !output.empty())},
+                      {"text", output},
+                      {"tool_call_count", calls.size()},
+                      {"tool_calls", std::move(calls)},
+                      {"tools_executed", false},
+                      {"advertised_tool_names", std::move(advertised)},
+                      {"first_token_ms", firstToken},
+                      {"total_ms", total},
+                      {"wire", maiWireApiToString(primaryWire)},
+                      {"model", model},
+                      {"localGpuSelected", state.gpuSelected},
+                      {"localGpuModelBytes", state.gpuModelBytes},
+                      {"localGpuBackend", state.gpuBackend}};
+        if (error)
+            response.update({{"errorCode", maiErrorCodeToString(error.code())}, {"error", error.message()}});
+        else if (!response["ok"].get<bool>())
+            response.update({{"errorCode", "protocol"}, {"error", "The probe returned no text or tool calls."}});
+        return response;
     }
 
     // 将持久化消息转为移动端可读快照，并保留最新消息和未完成任务的状态。
@@ -943,6 +1179,8 @@ struct MaiMobileAgent {
             if (q.sessionId == selected)
                 questions.push_back({{"id", q.id}, {"question", q.question}, {"options", q.options}});
         if (!busy) liveParts.clear();
+        const auto localStatus =
+            primaryWire == MaiWireApi::Local ? getSharedMaiLlamaRuntime()->status() : MaiLlamaStatus{};
         return {{"ok", true},
                 {"changed", true},
                 {"sessions", sessions},
@@ -951,6 +1189,11 @@ struct MaiMobileAgent {
                 {"questions", questions},
                 {"busy", busy},
                 {"turnId", agent->activeTurnId(selected)},
+                {"model", model},
+                {"wire", maiWireApiToString(primaryWire)},
+                {"localGpuSelected", localStatus.gpuSelected},
+                {"localGpuModelBytes", localStatus.gpuModelBytes},
+                {"localGpuBackend", localStatus.gpuBackend},
                 {"configured", configured},
                 {"error", errorCopy[selected]}};
     }
@@ -989,6 +1232,7 @@ struct MaiMobileAgent {
             return {{"ok", true}};
         }
         if (!agent) throw std::runtime_error("Agent is not initialized.");
+        if (op == "local_model_probe") return localModelProbe(r);
         const std::string session = r.value("session", "");
         if (op == "snapshot") {
             const int limit = r.value("messageLimit", -1);
@@ -1008,7 +1252,7 @@ struct MaiMobileAgent {
             return {{"ok", true}, {"messages", serializeMessages(page, before.empty() && agent->isBusy(session))}};
         }
         if (op == "suggest_replies") {
-            if (!configured) throw std::runtime_error("Configure a model and API key first.");
+            if (!configured) throw std::runtime_error("Configure an available primary model first.");
             if (!r.contains("messages") || !r["messages"].is_array() || r["messages"].empty() ||
                 r["messages"].size() > 30)
                 throw std::runtime_error("Messages must contain between 1 and 30 items.");
@@ -1031,7 +1275,7 @@ struct MaiMobileAgent {
             MaiStreamSink sink;
             sink.onText = [&](std::string_view delta) { response.append(delta.data(), delta.size()); };
             std::atomic<bool> cancel{false};
-            const MaiError error = makeMaiModelClient(suggestionConfig)->stream(modelRequest, sink, cancel);
+            const MaiError error = modelClientFactory()->stream(modelRequest, sink, cancel);
             if (error) throw std::runtime_error(error.message());
             std::string clean = response;
             const auto firstLine = clean.find('\n');
@@ -1052,7 +1296,7 @@ struct MaiMobileAgent {
         if (op == "create")
             id = result(agent->submit(MaiCreateSession{workspace, "", model}));
         else if (op == "send" || op == "steer") {
-            if (!configured) throw std::runtime_error("Configure a model and API key first.");
+            if (!configured) throw std::runtime_error("Configure an available primary model first.");
             // iOS 在升级或恢复后可能给同一数据容器分配新的绝对路径。图片片段只保存
             // 工作区相对路径，所以每轮发送前都把会话根目录迁到当前容器位置。
             if (op == "send") {
@@ -1205,8 +1449,7 @@ char* maiMobileAgentRequest(void* handle, const char* request) {
         if (!handle || !request) throw std::runtime_error("Invalid bridge handle.");
         response = static_cast<MaiMobileAgent*>(handle)->request(Json::parse(request)).dump();
     } catch (const NativeOperationFailure& error) {
-        response = Json{{"ok", false}, {"errorCode", maiErrorCodeToString(error.code)},
-                        {"error", error.what()}}.dump();
+        response = Json{{"ok", false}, {"errorCode", maiErrorCodeToString(error.code)}, {"error", error.what()}}.dump();
     } catch (const std::exception& e) {
         response = Json{{"ok", false}, {"errorCode", "internal"}, {"error", e.what()}}.dump();
     } catch (...) {

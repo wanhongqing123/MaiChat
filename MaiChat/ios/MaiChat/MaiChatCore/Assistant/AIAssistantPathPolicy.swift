@@ -6,7 +6,10 @@ import Foundation
 public enum AIAssistantPathPolicy {
     public static func appRoot(workspacePath: String) -> String {
         #if targetEnvironment(simulator)
-        if ProcessInfo.processInfo.arguments.contains("--ai-ui-test") {
+        let arguments = ProcessInfo.processInfo.arguments
+        // 旧合成 fixture 的文件只在 tmp；真实 Primary QA 与产品一样还需访问本 App Documents。
+        // 仍以整个 App 沙盒为边界，不信任导入源目录或放宽 native 的路径守卫。
+        if arguments.contains("--ai-ui-test") && !arguments.contains("--ai-primary-model-ui-test") {
             return URL(fileURLWithPath: workspacePath, isDirectory: true)
                 .deletingLastPathComponent().deletingLastPathComponent().path
         }
@@ -39,6 +42,28 @@ public enum AIAssistantPathPolicy {
             return nil
         }
         return candidate
+    }
+}
+
+/// A completed manual capture is display metadata, not image input for a model.
+/// Resolve it from the persisted tool receipt so both live and restored messages
+/// show the same thumbnail without opening a viewer or changing the composer.
+public enum AIAssistantPhotoArtifactPolicy {
+    public static func photoURL(tool: String?, state: String?, output: String?,
+                                workspacePath: String) -> URL? {
+        guard tool == "mobile_take_photo", state == "completed",
+              let output, output.utf8.count <= 100_000,
+              let data = output.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              object["mime_type"] as? String == "image/jpeg",
+              let path = object["path"] as? String,
+              !path.isEmpty, !(path as NSString).isAbsolutePath,
+              ["jpg", "jpeg"].contains((path as NSString).pathExtension.lowercased())
+        else { return nil }
+        // Capture receipts belong to this workspace. The broader App-container
+        // policy used by imported media must not admit a sibling or symlink escape.
+        return AIAssistantPathPolicy.resolve(path, workspacePath: workspacePath,
+                                             appRootPath: workspacePath)
     }
 }
 

@@ -1,84 +1,93 @@
 import XCTest
 
 final class LocalModelsUITests: XCTestCase {
-    /// 从正常 Root 菜单运行随 Debug 包提供的小模型；不发起 Agent、网络或付费模型请求。
+    /// 与思考强度共用“更多”的内联展开层级；切换走真实配置，不发起推理或付费请求。
     @MainActor
-    func testBuiltinModelGeneratesTextAndUnloadsFromCreationCenter() throws {
+    func testPrimaryModelSwitchesInlineToBundledLocalAndBackToCloud() throws {
         #if DEBUG && targetEnvironment(simulator)
         continueAfterFailure = false
         let app = XCUIApplication()
-        app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test",
+        app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test", "--ai-primary-model-ui-test",
             "-maichat.notification-preprompt-dismissed", "YES"]
         app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
         app.launch()
         defer { app.terminate() }
 
-        let tab = app.buttons["创作中心"]
-        XCTAssertTrue(tab.waitForExistence(timeout: 12))
-        tab.tap()
-        XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 8))
-        app.buttons["更多"].tap()
-        let entry = app.buttons["ai-local-models"]
-        XCTAssertTrue(entry.waitForExistence(timeout: 4))
-        entry.tap()
-
-        let picker = app.buttons["local-model-picker"]
-        XCTAssertTrue(picker.waitForExistence(timeout: 8))
-        let builtinSelected = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "label CONTAINS %@", "内置英文测试模型"), object: picker)
-        XCTAssertEqual(XCTWaiter.wait(for: [builtinSelected], timeout: 8), .completed,
-                       "Debug 正常页面应默认选中已随包安装的本地测试模型")
-
-        let form: XCUIElement = app.collectionViews.firstMatch.exists
-            ? app.collectionViews.firstMatch : app.tables.firstMatch
-        func reveal(_ element: XCUIElement) {
-            for _ in 0..<8 where !element.isHittable { form.swipeUp() }
-            XCTAssertTrue(element.isHittable)
+        let state = app.staticTexts["primary-ui-model-state"]
+        XCTAssertTrue(state.waitForExistence(timeout: 20))
+        XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 20))
+        func waitForConfiguration(provider: String, wire: String, model: String) {
+            let configured = XCTNSPredicateExpectation(predicate: NSPredicate(format:
+                "value CONTAINS %@ AND value CONTAINS %@ AND value CONTAINS %@ AND value CONTAINS %@ AND value CONTAINS %@ AND value CONTAINS %@",
+                "provider:\(provider);", ";configured:true;", ";busy:false;assistant-text-count:0;",
+                ";native-wire:\(wire);", ";native-model:\(model);", ";error-empty:true;"), object: state)
+            XCTAssertEqual(XCTWaiter.wait(for: [configured], timeout: 30), .completed,
+                           "主模型切换必须等待真实 native 配置完成；实际状态：\(state.value ?? "missing")")
         }
-        let run = app.buttons["local-model-run"]
-        reveal(run)
-        XCTAssertTrue(run.isEnabled)
-        run.tap()
-        // 向下露出完成状态；不靠按钮尚未来得及变灰时的瞬时状态判断推理完成。
-        form.swipeUp()
-        form.swipeUp()
-        let completion = app.staticTexts["local-model-notice"]
-        XCTAssertTrue(completion.waitForExistence(timeout: 30))
-        XCTAssertEqual(completion.label, "本次本地测试已完成")
+        // 现有独立 QA 账号的云端指向本机 test-model；这里只配置，不提交任何模型请求。
+        waitForConfiguration(provider: "remote", wire: "responses", model: "test-model")
+        app.buttons["更多"].tap()
+        let panel = app.descendants(matching: .any).matching(identifier: "ai-action-panel").firstMatch
+        XCTAssertTrue(panel.waitForExistence(timeout: 5))
+        let settings = panel.buttons["ai-primary-model-settings"]
+        XCTAssertTrue(settings.isHittable)
+        XCTAssertEqual(settings.label, "主模型")
+        XCTAssertEqual(settings.value as? String, "云端模型")
 
-        let result = app.staticTexts["local-model-result"]
-        reveal(result)
-        let generatedText = result.label.trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertFalse(generatedText.isEmpty)
-        XCTAssertNotEqual(generatedText, "（模型未返回文本）")
-        let tokens = app.staticTexts.matching(NSPredicate(format: "label MATCHES %@",
-            "输入 [1-9][0-9]* · 生成 [1-9][0-9]* token · .*")).firstMatch
-        XCTAssertTrue(tokens.exists, "结果必须显示实际大于零的输入和生成 token 数")
-        let generated = XCTAttachment(screenshot: app.screenshot())
-        generated.name = "local-model-real-generated-text"
-        generated.lifetime = .keepAlways
-        add(generated)
+        let effort = panel.buttons["思考强度"]
+        effort.tap()
+        let effortMenu = panel.descendants(matching: .any).matching(identifier: "ai-effort-menu").firstMatch
+        XCTAssertTrue(effortMenu.waitForExistence(timeout: 4))
+        settings.tap()
+        let menu = panel.descendants(matching: .any).matching(identifier: "ai-primary-model-menu").firstMatch
+        XCTAssertTrue(menu.waitForExistence(timeout: 4))
+        XCTAssertFalse(effortMenu.exists, "主模型应复用思考强度的同一个展开层级")
+        let cloud = menu.buttons["ai-primary-model-cloud"]
+        let local = menu.buttons["ai-primary-model-local"]
+        XCTAssertEqual(cloud.label, "云端模型")
+        XCTAssertEqual(local.label, "本地模型")
+        XCTAssertTrue(cloud.isHittable)
+        XCTAssertTrue(local.isHittable)
 
-        // 结果位于 runtime 区下方；向下滚回同一页面，验证卸载的是本机已驻留模型。
-        let unload = app.buttons["local-model-unload"]
-        for _ in 0..<6 where !unload.isHittable { form.swipeDown() }
-        XCTAssertTrue(unload.isHittable)
-        let status = app.staticTexts["local-model-runtime-status"]
-        XCTAssertTrue(status.label.contains("模型已驻留"))
-        XCTAssertTrue(unload.isEnabled)
-        unload.tap()
-        let unloaded = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "label CONTAINS %@", "未加载模型"), object: status)
-        XCTAssertEqual(XCTWaiter.wait(for: [unloaded], timeout: 8), .completed)
-        XCTAssertFalse(unload.isEnabled)
-        let emptyRuntime = XCTAttachment(screenshot: app.screenshot())
-        emptyRuntime.name = "local-model-runtime-unloaded"
-        emptyRuntime.lifetime = .keepAlways
-        add(emptyRuntime)
-        app.buttons["local-model-done"].tap()
-        XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 4))
+        func assertInlineSelection(_ expected: String, capture name: String) {
+            XCTAssertTrue(panel.exists)
+            XCTAssertTrue(menu.exists, "主模型选项必须位于当前更多面板内")
+            XCTAssertEqual(settings.value as? String, expected)
+            XCTAssertGreaterThanOrEqual(menu.frame.minY, settings.frame.maxY - 1)
+            XCTAssertGreaterThanOrEqual(menu.frame.minX, panel.frame.minX)
+            XCTAssertLessThanOrEqual(menu.frame.maxX, panel.frame.maxX)
+            XCTAssertLessThanOrEqual(menu.frame.maxY, panel.frame.maxY)
+            XCTAssertFalse(app.navigationBars["主模型"].exists)
+            XCTAssertFalse(app.navigationBars["本机模型"].exists)
+            for identifier in ["primary-model-provider", "primary-model-current", "primary-model-apply",
+                "primary-model-management", "primary-model-done", "primary-local-add",
+                "primary-local-model-import", "primary-local-self-test", "local-model-form",
+                "local-model-picker", "local-model-run"] {
+                XCTAssertFalse(app.descendants(matching: .any).matching(identifier: identifier).firstMatch.exists,
+                               "内联主模型切换不得出现旧设置、管理、导入或自测控件：\(identifier)")
+            }
+            let capture = XCTAttachment(screenshot: app.screenshot())
+            capture.name = name
+            capture.lifetime = .keepAlways
+            add(capture)
+        }
+        assertInlineSelection("云端模型", capture: "primary-model-inline-cloud-options")
+
+        local.tap()
+        // 随包真实权重由普通 Store 解析；configured/native-wire 成功后才能继续切回云端。
+        waitForConfiguration(provider: "llama", wire: "local",
+                             model: "local:builtin-qwen3.5-2b-q4_k_m")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"), object: cloud)], timeout: 5), .completed)
+        assertInlineSelection("本地模型", capture: "primary-model-inline-bundled-local-selected")
+
+        cloud.tap()
+        waitForConfiguration(provider: "remote", wire: "responses", model: "test-model")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"), object: local)], timeout: 5), .completed)
+        assertInlineSelection("云端模型", capture: "primary-model-inline-cloud-restored")
         #else
-        throw XCTSkip("仅在 Debug 模拟器使用随包本地权重与独立内存会话")
+        throw XCTSkip("仅在 Debug 模拟器使用随包 Qwen、独立账号和真实配置链")
         #endif
     }
 }

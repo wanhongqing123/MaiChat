@@ -26,6 +26,54 @@ final class PortraitUITests: XCTestCase {
         }
     }
 
+    @MainActor func testPortraitResultStaysInChatUntilImageIsTapped() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-portrait-ui-test"]
+        app.launch()
+        let status = app.staticTexts["portrait-fixture-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 25))
+        expectation(for: NSPredicate(format: "label BEGINSWITH 'PASS' OR label BEGINSWITH 'FAIL'"),
+                    evaluatedWith: status)
+        waitForExpectations(timeout: 40)
+        XCTAssertTrue(status.label.contains("PASS：本地美白"), status.label)
+
+        // 真实美颜工具结果决定下一步指引；消息卡片仍沿用既有渲染 fixture，未启动模型。
+        let nextTool = app.staticTexts["portrait-fixture-next-tool"]
+        XCTAssertTrue(nextTool.waitForExistence(timeout: 5))
+        XCTAssertEqual(nextTool.label, "agent_send_media")
+        let preview = app.images["agent-image-preview"]
+        XCTAssertFalse(preview.exists, "修图完成后应停留在聊天中")
+        let thumbnail = app.buttons["agent-image-bubble"].firstMatch
+        XCTAssertTrue(thumbnail.waitForExistence(timeout: 5))
+        XCTAssertTrue(thumbnail.isHittable)
+        let before = XCTAttachment(screenshot: app.screenshot())
+        before.name = "portrait-result-in-chat-before-tap"
+        before.lifetime = .keepAlways
+        add(before)
+
+        thumbnail.tap()
+        XCTAssertTrue(preview.waitForExistence(timeout: 15))
+        let opened = XCTAttachment(screenshot: app.screenshot())
+        opened.name = "portrait-result-preview-after-tap"
+        opened.lifetime = .keepAlways
+        add(opened)
+        preview.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: preview)], timeout: 10), .completed)
+        XCTAssertTrue(thumbnail.waitForExistence(timeout: 5))
+        XCTAssertTrue(thumbnail.isHittable)
+        XCTAssertTrue(status.label.contains("PASS：本地美白"), status.label)
+
+        // 明确要求预览时仍执行原来的宿主工具，不用聊天交付策略屏蔽它。
+        app.buttons["预览修图结果"].tap()
+        XCTAssertTrue(preview.waitForExistence(timeout: 15))
+        preview.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: preview)], timeout: 10), .completed)
+        XCTAssertTrue(thumbnail.waitForExistence(timeout: 5))
+    }
+
     @MainActor func testLocalPortraitPreviewAndTrainingCandidate() throws {
         continueAfterFailure = false
         let app = XCUIApplication()

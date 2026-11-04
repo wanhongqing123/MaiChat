@@ -1,4 +1,4 @@
-// 文件作用：用 loopback 假服务验证普通检索客户端和付费工具的协议、边界、重试及 TLS。
+// 文件作用：用 loopback 假服务验证普通检索客户端、只读工具的协议、权限、边界、重试及 TLS。
 // 所有请求均为本地合成 JSON；凭据仅为进程内假值，不访问官方服务或真实账号。
 #include "MaiDeepSeekWebTools.h"
 
@@ -27,8 +27,12 @@
 #include <openssl/x509v3.h>
 #endif
 
+#include "MaiAgent.h"
+#include "MaiArkMediaTools.h"
+#include "MaiFakeModelClient.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
+#include "MaiMemoryStore.h"
 #include "MaiThread.h"
 #include "MaiTool.h"
 
@@ -280,6 +284,68 @@ void test_invalid_typed_inputs_never_read_credentials_or_send_requests() {
     CHECK(server.requests().empty());
 }
 
+void test_localization_uses_a_known_ip_or_is_omitted() {
+    MaiDeepSeekFakeProvider server;
+    MaiDeepSeekWebClient ordinary(server.options());
+    MaiToolRegistry tools;
+    registerMaiDeepSeekWebTools(tools, server.options());
+    auto* search = tools.find("web_search");
+    CHECK(search != nullptr);
+    if (!search) return;
+    const auto schema = Json::parse(search->parametersSchema());
+    const auto& localization = schema["properties"]["localization"];
+    CHECK(localization.value("maxLength", 0) == 45);
+    const auto description = localization.value("description", std::string{});
+    CHECK(description.find("IPv4") != std::string::npos &&
+          description.find("IPv6") != std::string::npos);
+    CHECK(description.find("language or region code") != std::string::npos);
+    CHECK(description.find("Omit") != std::string::npos &&
+          description.find("Never guess or look up") != std::string::npos);
+
+    // 地域、语言标签不能悄悄当 IP，也不能在提示修复前取凭据或发送 HTTP。
+    for (const auto& invalid : {"zh-CN", "China", "en", "256.1.1.1", "[2001:db8::1]"}) {
+        auto request = searchRequest("public news");
+        request.localization = invalid;
+        const auto direct = ordinary.search(request);
+        CHECK(direct.error.code == "INVALID_INPUT" && direct.error.attempts == 0);
+        CHECK(direct.error.reason.find("IPv4 or IPv6") != std::string::npos &&
+              direct.error.reason.find("omit") != std::string::npos);
+        const auto result =
+            search->execute(Json{{"query", request.query}, {"localization", invalid}}.dump(), {});
+        CHECK(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput);
+        if (result.hasError()) {
+            const auto detail = Json::parse(result.error().message());
+            CHECK(detail["code"] == "INVALID_INPUT" && detail["attempts"] == 0);
+            CHECK(detail["reason"] == direct.error.reason);
+        }
+    }
+    CHECK(server.requests().empty() && server.keyReads() == 0);
+
+    // 普通入口和工具入口保留同一协议：两种 IP 原样传递，未提供时不补造定位。
+    for (const auto& ip : {"192.0.2.1", "2001:db8::1"}) {
+        auto request = searchRequest("public news");
+        request.localization = ip;
+        CHECK(ordinary.search(request).error.code.empty());
+        CHECK(!search->execute(Json{{"query", request.query}, {"localization", ip}}.dump(), {})
+                   .hasError());
+        const auto sent = server.requests();
+        CHECK(sent.size() >= 2);
+        if (sent.size() >= 2) {
+            CHECK(sent[sent.size() - 2].body["localization"] == ip);
+            CHECK(sent.back().body["localization"] == ip);
+        }
+    }
+    CHECK(ordinary.search(searchRequest("public news")).error.code.empty());
+    CHECK(!search->execute(R"({"query":"public news"})", {}).hasError());
+    CHECK(!search->execute(R"({"query":"public news","localization":""})", {}).hasError());
+    const auto sent = server.requests();
+    CHECK(sent.size() == 7 && server.keyReads() == 7);
+    if (sent.size() == 7) {
+        for (std::size_t index = 4; index < sent.size(); ++index)
+            CHECK(!sent[index].body.contains("localization"));
+    }
+}
+
 void test_response_schema_numeric_ranges_and_fetch_markdown_failures() {
     MaiDeepSeekFakeProvider server;
     MaiDeepSeekWebClient client(server.options());
@@ -384,7 +450,7 @@ void test_cancellation_and_response_byte_limit() {
     CHECK(!oversized.error.retryable && oversized.content.empty());
 }
 
-void test_tools_share_the_client_contract_and_strict_paid_protocol() {
+void test_tools_share_the_client_contract_and_strict_read_only_protocol() {
     MaiDeepSeekFakeProvider server;
     const auto options = server.options();
     MaiDeepSeekWebClient ordinary(options);
@@ -394,8 +460,10 @@ void test_tools_share_the_client_contract_and_strict_paid_protocol() {
     auto* fetch = registry.find("web_fetch");
     CHECK(search && fetch && server.keyReads() == 0);
     if (!search || !fetch) return;
-    CHECK(search->requiresApproval("{}") && search->requiresPaidApproval("{}"));
-    CHECK(fetch->requiresApproval("{}") && fetch->requiresPaidApproval("{}"));
+    CHECK(!search->requiresApproval(R"({"query":"public news","count":15})"));
+    CHECK(!search->requiresPaidApproval(R"({"query":"public news","count":15})"));
+    CHECK(!fetch->requiresApproval(R"({"url":"https://example.invalid/page"})"));
+    CHECK(!fetch->requiresPaidApproval(R"({"url":"https://example.invalid/page"})"));
     CHECK(Json::parse(search->parametersSchema())["additionalProperties"] == false);
     const auto direct = ordinary.search(searchRequest("same contract"));
     server.rotateCredential();
@@ -449,6 +517,97 @@ void test_tools_share_the_client_contract_and_strict_paid_protocol() {
     CHECK(detail["code"] == "FETCH_UNAVAILABLE" && detail["http_status"] == 404);
     CHECK(detail["http_stage"] == "provider_api" && detail["attempts"] == 1 &&
           detail["retryable"] == false);
+}
+
+void test_read_only_retrieval_runs_without_approval_under_every_policy() {
+    // 走实际 Agent 权限链并观察发出的请求，避免只验证工具元数据而漏掉闸门调用。
+    // 每种模式都连续搜索、抓取、再搜索；超时只用于旧实现红灯时防止测试无限等待。
+    for (const auto policy : {MaiApprovalPolicy::Never, MaiApprovalPolicy::UnlessTrusted,
+                              MaiApprovalPolicy::OnRequest}) {
+        MaiDeepSeekFakeProvider server;
+        auto tools = std::make_unique<MaiToolRegistry>();
+        registerMaiDeepSeekWebTools(*tools, server.options());
+        std::vector<MaiFakeModelClient::Turn> script;
+        const auto call = [&](const std::string& name, const std::string& arguments) {
+            MaiFakeModelClient::Turn turn;
+            turn.invocations.push_back({"call_" + std::to_string(script.size()), name, arguments});
+            script.push_back(std::move(turn));
+        };
+        // 现场查询“今日新闻 头条 要闻”及 count=15；保持原始 Unicode 字节。
+        call("web_search",
+             Json{{"query", "\u4eca\u65e5\u65b0\u95fb \u5934\u6761 \u8981\u95fb"}, {"count", 15}}
+                 .dump());
+        call("web_fetch", R"({"url":"https://example.invalid/page"})");
+        call("web_search", R"({"query":"follow-up public news"})");
+        MaiFakeModelClient::Turn done;
+        done.textChunks = {"Done."};
+        script.push_back(std::move(done));
+
+        auto model = std::make_unique<MaiFakeModelClient>(std::move(script));
+        const auto* observer = model.get();
+        std::atomic<unsigned> approvalRequests{0};
+        MaiAgent::Options options;
+        options.defaultModel = "test-model";
+        options.approvalPolicy = policy;
+        options.permissionTimeoutMs = 30;
+        MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools), options);
+        agent.eventBus().subscribe([&](const MaiEvent& event) {
+            if (event.type == MaiEventType::PermissionAsked) ++approvalRequests;
+        });
+        const auto session =
+            agent.submit(MaiCreateSession{MaiFileSystem::temporaryDirectory().toUtf8(), "", ""});
+        CHECK(session.isOk());
+        if (!session.isOk()) continue;
+        CHECK(agent.submit(MaiSendPrompt{session.value(), "Read current public news."}).isOk());
+        agent.waitIdle();
+
+        CHECK(approvalRequests == 0 && agent.listPendingPermissions().empty());
+        CHECK(server.requests().size() == 3 && server.keyReads() == 3);
+        CHECK(observer->requestCount() == 4);
+        const auto requests = server.requests();
+        if (requests.size() == 3) {
+            CHECK(requests[0].path == "/v1/tools/search" && requests[0].body["count"] == 15);
+            CHECK(requests[1].path == "/v1/tools/fetch");
+            CHECK(requests[2].path == "/v1/tools/search");
+        }
+    }
+}
+
+void test_full_access_keeps_paid_media_confirmation() {
+    // 使用实际媒体工具和空凭据，确认只读检索的修复没有放宽付费提交闸门。
+    // 在权限事件中直接拒绝；即使回归使闸门失效，空凭据也保证不会发送真实付费请求。
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(makeMaiSeedreamImageTool([] { return std::string(); }));
+    MaiFakeModelClient::Turn submit;
+    submit.invocations.push_back(
+        {"call_paid", "seedream_image", R"({"action":"delegate","message":"Create an image"})"});
+    MaiFakeModelClient::Turn done;
+    done.textChunks = {"Skipped."};
+    auto model = std::make_unique<MaiFakeModelClient>(
+        std::vector<MaiFakeModelClient::Turn>{std::move(submit), std::move(done)});
+    std::atomic<unsigned> approvalRequests{0};
+    MaiAgent::Options options;
+    options.defaultModel = "test-model";
+    options.approvalPolicy = MaiApprovalPolicy::Never;
+    options.permissionTimeoutMs = 30;
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools), options);
+    agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type != MaiEventType::PermissionAsked) return;
+        ++approvalRequests;
+        const auto pending = agent.listPendingPermissions();
+        CHECK(pending.size() == 1);
+        if (pending.empty()) return;
+        CHECK(pending[0].toolName == "seedream_image" && !pending[0].allowForSession);
+        CHECK(
+            agent.submit(MaiReplyPermission{pending[0].id, MaiPermissionDecision::Denied}).isOk());
+    });
+    const auto session =
+        agent.submit(MaiCreateSession{MaiFileSystem::temporaryDirectory().toUtf8(), "", ""});
+    CHECK(session.isOk());
+    if (!session.isOk()) return;
+    CHECK(agent.submit(MaiSendPrompt{session.value(), "Create an image."}).isOk());
+    agent.waitIdle();
+    CHECK(approvalRequests == 1 && agent.listPendingPermissions().empty());
 }
 
 void test_redirect_never_forwards_authorization() {
@@ -582,10 +741,13 @@ int main() {
 #endif
     test_unicode_operators_unknown_metadata_and_empty_results();
     test_invalid_typed_inputs_never_read_credentials_or_send_requests();
+    test_localization_uses_a_known_ip_or_is_omitted();
     test_response_schema_numeric_ranges_and_fetch_markdown_failures();
     test_bounded_retries_http_stage_and_recovery();
     test_cancellation_and_response_byte_limit();
-    test_tools_share_the_client_contract_and_strict_paid_protocol();
+    test_tools_share_the_client_contract_and_strict_read_only_protocol();
+    test_read_only_retrieval_runs_without_approval_under_every_policy();
+    test_full_access_keeps_paid_media_confirmation();
     test_redirect_never_forwards_authorization();
 #if defined(MAI_DEEPSEEK_WEB_TLS_TESTS)
     test_tls_peer_hostname_and_https_to_http_redirect();

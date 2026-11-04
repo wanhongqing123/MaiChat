@@ -34,7 +34,8 @@ struct MaiWebRetrievalError {
 };
 
 // query/oriQuestion 最多128个Unicode字符；query原样发送，保留site/lang/日期等操作符。
-// localization 是可选IP，不自动读取或上送设备IP；needContent默认关闭以控制正文大小。
+// localization 只接受用户已提供的 IPv4/IPv6，不是语言或地区代码；未知时留空，不能猜造或查 IP。
+// 不自动读取或上送设备 IP；needContent 默认关闭以控制正文大小。
 struct MaiWebSearchRequest {
     std::string query;
     unsigned count = 10;
@@ -87,6 +88,7 @@ private:
     MaiDeepSeekWebOptions mOptions;
 };
 
-// web_search/web_fetch薄包装普通客户端。均可能产生供应商请求费，按既有付费审批协议标记。
+// web_search/web_fetch 薄包装普通客户端，沿用普通只读工具的权限策略。
+// 供应商按次收取 API 使用费，但检索不属于需逐次确认的购买或媒体任务提交。
 // 注册不会发网或取密钥。模型参数无API Key、host、代理设置；未知字段严格拒绝。
 void registerMaiDeepSeekWebTools(MaiToolRegistry& registry, MaiDeepSeekWebOptions options);

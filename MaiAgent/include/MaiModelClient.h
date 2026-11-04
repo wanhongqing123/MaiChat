@@ -13,8 +13,8 @@
 
 // ── 中立的模型抽象 ──────────────────────────────────────────────
 // 这里的结构**不是** OpenAI 的线格式，是我们自己的中间表示。
-// 各个 wire 实现（Chat Completions / Responses / Anthropic）负责把它翻译成自家的请求、
-// 把自家的响应翻译回这里的回调。
+// 网络 wire 实现（Chat Completions / Responses）负责翻译供应商请求/响应，
+// 本地实现负责 GGUF 原生聊天模板与输出解析；它们共享完整历史、流式和工具调用契约。
 //
 // 之前这一层直接长成了 OpenAI 的形状（tool_calls 原样照搬），那样加第二个供应商时要么污染这个头，
 // 要么在上层写一堆 if。
@@ -22,6 +22,9 @@
 enum class MaiWireApi {
     ChatCompletions,
     Responses,
+    // 进程内模型复用同一消息/流式/工具契约，没有 HTTP 端点或 API Key。
+    // 宿主必须通过 makeMaiLlamaModelClient 装配本地文件配置，远端工厂拒绝此项。
+    Local,
 };
 
 const char* maiWireApiToString(MaiWireApi wire);
@@ -134,8 +137,9 @@ struct MaiModelRequest {
 
 // ── 流式回调 ────────────────────────────────────────────────────
 //
-// 线程契约（重要）：这些回调**在网络读线程上同步调用**——具体说就是 libcurl 的写回调里面。
-// 实现方不要在里面做慢活（写 socket、落盘、等锁），否则会直接拖慢模型吐字。需要慢处理就自己塞队列，
+// 线程契约（重要）：这些回调在 stream 调用线程同步调用。网络实现来自 libcurl 写回调，
+// 本地实现来自推理解码循环；不要在里面做慢活（写 socket、落盘、等锁），否则会直接拖慢模型吐字。
+// 需要慢处理就自己塞队列，
 // 控制台的渲染线程就是这么做的（见 cli/MaiConsoleMain.cpp）。
 //
 // 回调可以为空，实现方调用前要判。比如只关心最终文本的调用方可以不设 onReasoning。

@@ -203,6 +203,13 @@ public:
     // 跑得久的实现要定期查 context.isCanceled()，否则用户按了停还得等。
     virtual MaiToolResult execute(const std::string& argumentsJson,
                                   const MaiToolContext& context) = 0;
+
+    // 当前实际主模型是否支持该工具的结果契约，默认 true。
+    // 注册表用同一查询过滤模型声明与按名调用；工具仍须在直接 execute 时执行相同能力检查。
+    // 这里只描述接收工具结果所需的模型能力，不替代参数、权限、路径或宿主接线检查。
+    // model 为空时保留宿主的完整目录，不表示某个实际模型已经支持全部结果类型。
+    // 查询可跨会话并发调用，不得读取文件、加载模型、访问网络或改变工具状态。
+    virtual bool isAvailableForModel(const std::string& model) const;
 };
 
 // 工具注册表。
@@ -213,12 +220,14 @@ public:
     void addInternal(std::unique_ptr<MaiTool> tool);
     // 内部任务恢复使用，可读取内部工具。
     MaiTool* find(const std::string& name) const;
-    // 模型调用只允许公开工具；未公开的名字即使从历史文本中出现也不能执行。
-    MaiTool* findForModel(const std::string& name) const;
+    // 模型调用只允许公开且支持实际主模型的工具；隐藏或不支持的历史名字也不能执行。
+    // model 为空时只检查公开性，供未选定模型的宿主查询完整目录。
+    MaiTool* findForModel(const std::string& name, const std::string& model = {}) const;
     bool isEmpty() const;
 
-    // 给模型的工具清单。
-    std::vector<MaiToolSpec> specs() const;
+    // 给实际主模型的工具清单，与 findForModel 使用相同能力门禁。
+    // model 为空时返回全部公开工具；正式模型请求必须传当前会话的实际模型名。
+    std::vector<MaiToolSpec> specs(const std::string& model = {}) const;
     // 在工作线程汇总带模型工具的能力快照。它可能读取宿主中的密钥配置状态，
     // 但不得把密钥值放进返回结果；该清单目前不会自动拼入主模型请求。
     std::vector<MaiSpecialistInfo> specialists() const;

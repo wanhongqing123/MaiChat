@@ -7,6 +7,8 @@
 #include <memory>
 #include <string>
 
+#include "MaiFilePath.h"
+#include "MaiFileSystem.h"
 #include "MaiTool.h"
 #include "MaiViewImageTool.h"
 
@@ -95,6 +97,44 @@ void test_rejects_text_only_models() {
     CHECK(result.error().message().find("glm-5.3-flash") != std::string::npos);
 }
 
+void test_local_primary_rejects_pixels_before_preview_work() {
+    Workspace workspace;
+    const fs::path image = workspace.root / "photo.png";
+    CHECK(!MaiFileSystem::writeFile(MaiFilePath::fromUtf8(image.u8string()),
+                                    std::string("\x89PNG\r\n\x1a\n", 8))
+               .hasError());
+    int previewCalls = 0;
+    auto tool = makeMaiViewImageTool([&](const std::string& path, const MaiToolContext&) {
+        ++previewCalls;
+        return MaiResult<std::string>(path);
+    });
+    for (const char* model : {"local:qa", "local:qwen3.5-2b-instruct-q4_k_m"}) {
+        MaiToolContext context;
+        context.root = workspace.root.u8string();
+        context.model = model;
+        const auto result = tool->execute(R"({"path":"photo.png"})", context);
+        CHECK(result.hasError() && result.error().code() == MaiErrorCode::NotSupported);
+        CHECK(result.images().empty());
+        CHECK(result.error().message().find("text only") != std::string::npos);
+        CHECK(result.error().message().find("mobile_preview_image") != std::string::npos);
+    }
+    CHECK(previewCalls == 0);
+}
+
+void test_registry_filters_the_same_model_capability_as_direct_execution() {
+    MaiToolRegistry registry;
+    registry.add(makeMaiViewImageTool());
+    CHECK(registry.find("view_image") != nullptr);
+    for (const char* model : {"local:qa", "local:qwen3.5-2b-instruct-q4_k_m", "glm-5.3"}) {
+        CHECK(registry.findForModel("view_image", model) == nullptr);
+        CHECK(registry.specs(model).empty());
+    }
+    for (const char* model : {"glm-5.3-flash", ""}) {
+        CHECK(registry.findForModel("view_image", model) != nullptr);
+        CHECK(registry.specs(model).size() == 1);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -102,6 +142,8 @@ int main() {
     test_rejects_invalid_images_and_escaped_paths();
     test_desktop_can_view_image_outside_session_directory();
     test_rejects_text_only_models();
+    test_local_primary_rejects_pixels_before_preview_work();
+    test_registry_filters_the_same_model_capability_as_direct_execution();
     if (failures == 0) std::printf("view image tool tests passed\n");
     return failures == 0 ? 0 : 1;
 }

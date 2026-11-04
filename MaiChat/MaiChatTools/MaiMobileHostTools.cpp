@@ -179,6 +179,7 @@ public:
     std::string name() const override { return "mobile_screen_frames"; }
     std::string description() const override {
         return "List screenshots saved automatically every 2 seconds during iOS screen sharing. "
+               "Pass a request object, for example {\"request\":{\"action\":\"list\"}}. "
                "After sharing stops, list the batch and ask which numbered/timestamped images the "
                "user needs. Listing returns metadata without sending all images to the model. "
                "Open only the requested frame with batch_id and frame_id from that list. "
@@ -187,18 +188,49 @@ public:
                "This tool does not start or restart sharing, and stopped batches remain available.";
     }
     std::string parametersSchema() const override {
-        return R"({"type":"object","properties":{"action":{"type":"string","enum":["list","open","delete_batch"]},)"
-               R"("batch_id":{"type":"string","minLength":1,"maxLength":100},)"
-               R"("frame_id":{"type":"string","minLength":1,"maxLength":100}},"required":["action"],"additionalProperties":false})";
+        // XML tool grammars enumerate root properties. A JSON-valued request
+        // keeps action-specific required IDs inside complete schema alternatives.
+        const Json identifier{{"type", "string"}, {"minLength", 1}, {"maxLength", 100}};
+        const auto variant = [&](const char* action, bool batchRequired, bool frameRequired) {
+            Json properties{{"action", {{"type", "string"}, {"enum", Json::array({action})}}},
+                            {"batch_id", identifier}};
+            Json required = Json::array({"action"});
+            if (batchRequired) required.push_back("batch_id");
+            if (frameRequired) {
+                properties["frame_id"] = identifier;
+                required.push_back("frame_id");
+            }
+            return Json{{"type", "object"},
+                        {"properties", properties},
+                        {"required", required},
+                        {"additionalProperties", false}};
+        };
+        const Json request{{"type", "object"},
+                           {"oneOf", Json::array({variant("list", false, false), variant("open", true, true),
+                                                  variant("delete_batch", true, false)})}};
+        return Json{{"type", "object"},
+                    {"properties", {{"request", request}}},
+                    {"required", Json::array({"request"})},
+                    {"additionalProperties", false}}
+            .dump();
     }
     bool requiresApproval(const std::string& arguments) const override {
         const Json parsed = Json::parse(arguments, nullptr, false);
-        return parsed.is_object() && parsed.value("action", Json{}) == "delete_batch";
+        return parsed.is_object() && parsed.contains("request") && parsed["request"].is_object() &&
+               parsed["request"].value("action", Json{}) == "delete_batch";
     }
     MaiToolResult execute(const std::string& argumentsJson,
                           const MaiToolContext& context) override {
-        Json args = Json::parse(argumentsJson, nullptr, false);
-        if (!args.is_object() || !args.contains("action") || !args["action"].is_string())
+        const Json envelope = Json::parse(argumentsJson, nullptr, false);
+        if (!envelope.is_object() || envelope.size() != 1 || !envelope.contains("request") ||
+            !envelope["request"].is_object())
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "mobile_screen_frames expects only a request object, for example {\"request\":{\"action\":\"list\"}}");
+        // The archive's ordinary API remains flat; the model cannot supply its
+        // workspace or Session owner through either level of the tool envelope.
+        Json args = envelope["request"];
+        if (!args.contains("action") || !args["action"].is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "a screen frame action is required");
         for (auto field = args.begin(); field != args.end(); ++field) {
             if (field.key() != "action" && field.key() != "batch_id" && field.key() != "frame_id")
@@ -287,7 +319,52 @@ private:
     std::shared_ptr<MaiMobileHostDispatcher> mDispatcher;
 };
 
-// The native host binds the camera owner to the account and originating Session.
+// Manual capture waits for the user's shutter and confirmation. It must not
+// share the automatic preview command's repeated frame collection lifecycle.
+class MaiMobileTakePhotoTool final : public MaiTool {
+public:
+    explicit MaiMobileTakePhotoTool(std::shared_ptr<MaiMobileHostDispatcher> dispatcher)
+        : mDispatcher(std::move(dispatcher)) {}
+    std::string name() const override {
+        return "mobile_take_photo";
+    }
+    std::string description() const override {
+        // 快门确认后返回工作区文件路径，不自动创建系统相册资产；后续展示复用聊天卡片。
+        return "Open the camera and wait for the user to press the shutter and confirm one "
+               "photo. Use this when the user asks to open the camera or take a photo. Save "
+               "the confirmed photo in the current Agent workspace and return its relative "
+               "path and mime_type. The returned path is a workspace file, not a "
+               "Photos-library asset ID; this capture does not add the photo to the system "
+               "Photos library. When the user later asks to see this photo in the "
+               "conversation, use agent_send_media with file_path set to that exact returned "
+               "path and type=image to show a thumbnail in the CURRENT reply. Cancel creates "
+               "no file. This does not start automatic repeated capture or send the photo to a "
+               "contact.";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object","properties":{},"additionalProperties":false})";
+    }
+    bool requiresApproval(const std::string&) const override {
+        return false;
+    }
+    MaiToolResult execute(const std::string& arguments, const MaiToolContext& context) override {
+        const Json args = Json::parse(arguments, nullptr, false);
+        if (!args.is_object() || !args.empty())
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "mobile_take_photo expects an empty object");
+        if (context.isCanceled()) return MaiToolResult::failure(MaiErrorCode::Canceled, "photo capture canceled");
+        if (context.root.empty() || context.sessionId.empty())
+            return MaiToolResult::failure(MaiErrorCode::NotConfigured, "camera Session workspace is unavailable");
+        // A manual capture must remain bound to its originating Session while
+        // the user operates the camera; model arguments cannot choose its owner.
+        return callMaiMobileHostTool(mDispatcher, name(),
+                                     Json{{"workspace_path", context.root}, {"session_id", context.sessionId}}.dump());
+    }
+
+private:
+    std::shared_ptr<MaiMobileHostDispatcher> mDispatcher;
+};
+
+// The native host binds the archive owner to the account and originating Session.
 // The model supplies only opaque batch/frame IDs, never the archive owner or path.
 class MaiMobileCameraFramesTool final : public MaiTool {
 public:
@@ -295,23 +372,60 @@ public:
         : mDispatcher(std::move(dispatcher)) {}
     std::string name() const override { return "mobile_camera_frames"; }
     std::string description() const override {
-        return "List images sampled every 2 seconds during iOS camera preview, including capture times. "
-               "After closing the camera, ask which image the user wants and open only that image. "
+        return "Inspect images already saved by automatic iOS camera capture. This tool never opens "
+               "the camera or takes a photo. To open the camera for a user-taken photo, call mobile_take_photo "
+               "with {}. Pass a request object, for example {\"request\":{\"action\":\"list\"}}. "
+               "list returns saved batches, frame IDs and capture times. After capture stops, "
+               "ask which image the user wants; open requires batch_id and frame_id from list and opens "
+               "only that saved image. "
                "delete_batch clears unreferenced images from a stopped batch on request. "
                "Images retained by a draft or message keep the original file.";
     }
     std::string parametersSchema() const override {
-        return R"({"type":"object","properties":{"action":{"type":"string","enum":["list","open","delete_batch"]},)"
-               R"("batch_id":{"type":"string","minLength":1,"maxLength":100},)"
-               R"("frame_id":{"type":"string","minLength":1,"maxLength":100}},"required":["action"],"additionalProperties":false})";
+        // The XML tool grammar enumerates root properties, so keep the complete
+        // conditional variants inside a required JSON-valued request parameter.
+        // Opening an archived frame requires both IDs; it never opens the camera.
+        const Json identifier{{"type", "string"}, {"minLength", 1}, {"maxLength", 100}};
+        const auto variant = [&](const char* action, bool batchRequired, bool frameRequired) {
+            Json properties{{"action", {{"type", "string"}, {"enum", Json::array({action})}}},
+                            {"batch_id", identifier}};
+            Json required = Json::array({"action"});
+            if (batchRequired) required.push_back("batch_id");
+            if (frameRequired) {
+                properties["frame_id"] = identifier;
+                required.push_back("frame_id");
+            }
+            return Json{{"type", "object"},
+                        {"properties", properties},
+                        {"required", required},
+                        {"additionalProperties", false}};
+        };
+        const Json request{{"type", "object"},
+                           {"oneOf", Json::array({variant("list", false, false), variant("open", true, true),
+                                                  variant("delete_batch", true, false)})}};
+        return Json{{"type", "object"},
+                    {"properties", {{"request", request}}},
+                    {"required", Json::array({"request"})},
+                    {"additionalProperties", false}}
+            .dump();
     }
     bool requiresApproval(const std::string& arguments) const override {
         const Json parsed = Json::parse(arguments, nullptr, false);
-        return parsed.is_object() && parsed.value("action", Json{}) == "delete_batch";
+        return parsed.is_object() && parsed.contains("request") && parsed["request"].is_object() &&
+               parsed["request"].value("action", Json{}) == "delete_batch";
     }
     MaiToolResult execute(const std::string& argumentsJson, const MaiToolContext& context) override {
-        Json args = Json::parse(argumentsJson, nullptr, false);
-        if (!args.is_object() || !args.contains("action") || !args["action"].is_string())
+        const Json envelope = Json::parse(argumentsJson, nullptr, false);
+        if (!envelope.is_object() || envelope.size() != 1 || !envelope.contains("request") ||
+            !envelope["request"].is_object())
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "mobile_camera_frames expects only a request object, for example {\"request\":{\"action\":\"list\"}}. "
+                "To open the camera for a user-taken photo, call mobile_take_photo with {}.");
+        // Only the tool's model-facing schema uses this envelope. The ordinary
+        // archive host API retains flat arguments and trusted Session context.
+        Json args = envelope["request"];
+        if (!args.contains("action") || !args["action"].is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "a camera frame action is required");
         for (auto field = args.begin(); field != args.end(); ++field) {
             if ((field.key() != "action" && field.key() != "batch_id" && field.key() != "frame_id") ||
@@ -320,11 +434,19 @@ public:
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "invalid camera frame argument");
         }
         const std::string action = args["action"].get<std::string>();
-        if ((action != "list" && action != "open" && action != "delete_batch") ||
-            (action != "list" && !args.contains("batch_id")) ||
-            (action == "open" && !args.contains("frame_id")) ||
-            (action != "open" && args.contains("frame_id")))
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "invalid camera frame action or identifiers");
+        if (action != "list" && action != "open" && action != "delete_batch")
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "mobile_camera_frames action must be list, open, or delete_batch");
+        if (action == "open" && (!args.contains("batch_id") || !args.contains("frame_id")))
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "mobile_camera_frames open inspects a saved image and requires batch_id and frame_id from list. "
+                "To open the camera for a user-taken photo, call mobile_take_photo with {}.");
+        if (action == "delete_batch" && !args.contains("batch_id"))
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "delete_batch requires batch_id from list");
+        if (action != "open" && args.contains("frame_id"))
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "frame_id is only valid for opening a saved image");
         if (context.root.empty() || context.sessionId.empty())
             return MaiToolResult::failure(MaiErrorCode::NotConfigured, "camera Session workspace is unavailable");
         if (context.isCanceled()) return MaiToolResult::failure(MaiErrorCode::Canceled, "camera request canceled");
@@ -412,11 +534,14 @@ public:
         : mDispatcher(std::move(dispatcher)) {}
     std::string name() const override { return "maichat_camera_command"; }
     std::string description() const override {
-        return "Open or close the iPhone camera preview. While open, a frame is saved every 2 seconds "
+        return "Control automatic repeated camera capture only when the user explicitly requests it. "
+               "For an ordinary request to open the camera or take a photo, use mobile_take_photo with {}. "
+               "open starts an iPhone camera preview that saves a frame every 2 seconds "
                "in the app sandbox, without adding it to the system photo library. status reports progress. "
-        "close may return stopping while saved frames are being finalized. Call status until it reports "
-        "captured before using mobile_camera_frames to list timestamps and inspect only the user's selected image. "
-        "If status reports unavailable or permission_denied, report the failure.";
+               "close may return stopping while saved frames are being finalized. Call status until it reports "
+               "captured before using mobile_camera_frames to list timestamps and inspect only the user's selected "
+               "image. "
+               "If status reports unavailable or permission_denied, report the failure.";
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{"action":{"type":"string","enum":["open","status","close"]}},"required":["action"],"additionalProperties":false})";
@@ -510,6 +635,7 @@ public:
         // 网页属于当前会话，由宿主控制任务入口与展示。操作前读取快照，操作后再次读取验证，
         // 密码由用户手动输入；不能控制 MaiChat 外的浏览器。
         return "Control one browser page owned by the current MaiChat Agent Session. "
+               "Pass a request object, for example {\"request\":{\"action\":\"observe\"}}. "
                "Prefer curl with text_only=true for ordinary web reading. Use this browser "
                "when JavaScript rendering, page interaction or screenshots are needed. "
                "open starts an in-app page; the host controls its presentation. "
@@ -533,25 +659,60 @@ public:
                "other apps outside MaiChat.";
     }
     std::string parametersSchema() const override {
-        return R"({"type":"object","properties":{)"
-               R"("action":{"type":"string","enum":["open","observe","screenshot","click","type","close"]},)"
-               R"("url":{"type":"string","maxLength":2048},)"
-               R"("expected_url":{"type":"string","maxLength":2048},)"
-               R"("snapshot_id":{"type":"string"},"element_id":{"type":"string"},)"
-               R"("expected_label":{"type":"string"},)"
-               R"("text":{"type":"string","maxLength":4000})"
+        // Root-level oneOf loses parameters in XML tool grammars. The request
+        // value holds complete branches matching the existing native action gate.
+        const Json url{{"type", "string"},
+                       {"minLength", 1},
+                       {"maxLength", 2048},
+                       {"description", "One HTTP(S) URL without embedded credentials."}};
+        const Json observedURL{{"type", "string"},
+                               {"minLength", 1},
+                               {"maxLength", 2048},
+                               {"description", "The exact URL returned by the current observe snapshot."}};
+        const Json target{{"type", "string"}, {"minLength", 1}, {"maxLength", 200}};
+        const auto variant = [](const char* action, Json properties, const Json& fields) {
+            properties["action"] = {{"type", "string"}, {"enum", Json::array({action})}};
+            Json required = Json::array({"action"});
+            for (const auto& field : fields) required.push_back(field);
+            return Json{{"type", "object"},
+                        {"properties", properties},
+                        {"required", required},
+                        {"additionalProperties", false}};
+        };
+        Json observe = Json::object();
 #if defined(MAICHAT_MOBILE_IOS)
-               R"(,"wait_ms":{"type":"integer","minimum":0,"maximum":10000})"
+        observe["wait_ms"] = {{"type", "integer"}, {"minimum", 0}, {"maximum", 10000}};
 #endif
-               R"(},)"
-               R"("required":["action"],"additionalProperties":false})";
+        const Json click{
+            {"snapshot_id", target}, {"element_id", target}, {"expected_label", target}, {"expected_url", observedURL}};
+        Json typing = click;
+        typing["text"] = {{"type", "string"}, {"maxLength", 4000}};
+        const Json request{
+            {"type", "object"},
+            {"oneOf",
+             Json::array(
+                 {variant("open", {{"url", url}}, Json::array({"url"})), variant("observe", observe, Json::array()),
+                  variant("screenshot", {{"expected_url", observedURL}}, Json::array({"expected_url"})),
+                  variant("click", click, Json::array({"snapshot_id", "element_id", "expected_label", "expected_url"})),
+                  variant("type", typing,
+                          Json::array({"snapshot_id", "element_id", "expected_label", "expected_url", "text"})),
+                  variant("close", Json::object(), Json::array())})}};
+        return Json{{"type", "object"},
+                    {"properties", {{"request", request}}},
+                    {"required", Json::array({"request"})},
+                    {"additionalProperties", false}}
+            .dump();
     }
     bool requiresApproval(const std::string& raw) const override {
         return requiresPerCallApproval(raw);
     }
     bool requiresPerCallApproval(const std::string& raw) const override {
-        const Json args = Json::parse(raw, nullptr, false);
-        if (!args.is_object() || !args.value("action", Json{}).is_string()) return true;
+        const Json envelope = Json::parse(raw, nullptr, false);
+        if (!envelope.is_object() || envelope.size() != 1 || !envelope.contains("request") ||
+            !envelope["request"].is_object())
+            return true;
+        const Json& args = envelope["request"];
+        if (!args.value("action", Json{}).is_string()) return true;
         const std::string action = args["action"].get<std::string>();
         return action != "observe" && action != "close";
     }
@@ -562,8 +723,16 @@ public:
         if (context.sessionId.empty() || context.root.empty())
             return MaiToolResult::failure(MaiErrorCode::NotConfigured,
                                           "an Agent Session workspace is required for the browser");
-        Json args = Json::parse(raw, nullptr, false);
-        if (!args.is_object() || !args.value("action", Json{}).is_string())
+        const Json envelope = Json::parse(raw, nullptr, false);
+        if (!envelope.is_object() || envelope.size() != 1 || !envelope.contains("request") ||
+            !envelope["request"].is_object())
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "mobile_browser expects only a request object, for example {\"request\":{\"action\":\"observe\"}}");
+        // Only the model-facing tool uses an envelope. Native browser handlers
+        // retain flat action arguments plus the real calling Session identity.
+        Json args = envelope["request"];
+        if (!args.value("action", Json{}).is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "browser action is required");
         const std::string action = args["action"].get<std::string>();
         const auto hasOnly = [&args](std::initializer_list<const char*> allowed) {
@@ -1145,6 +1314,7 @@ void registerMobileBrowserTools(
 void registerMobilePhotoTools(MaiToolRegistry& tools,
                               const std::shared_ptr<MaiMobileHostDispatcher>& dispatcher) {
 #if defined(MAICHAT_MOBILE_IOS)
+    tools.add(std::make_unique<MaiMobileTakePhotoTool>(dispatcher));
     tools.add(std::make_unique<MaiMobileCameraFramesTool>(dispatcher));
     tools.add(std::make_unique<MaiMobileCameraCommandTool>(dispatcher));
 #else
@@ -1231,16 +1401,18 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         dispatcher, false));
     tools.add(std::make_unique<MaiMobileHostTool>(
         "mobile_transform_image",
-        // 一次调用只做一种端侧处理；先预览结果，再按需保存或交给选定的视频模型。
+        // 一次调用只做一种端侧处理；成品交付聊天，用户明确要求后才打开全屏预览。
         "Create a NEW image in the Agent working directory using an on-device edit; the source "
         "is unchanged. Apply one operation per call: crop (top-left x,y,width,height), rotate "
         "(degrees 90/180/270 clockwise), resize (width,height), flip_horizontal, flip_vertical, "
         "grayscale, sharpen (amount 0..2), adjust (brightness -1..1, contrast 0..2, "
         "saturation 0..2), or beautify "
         "(strength 0..1, local face-aware skin processing using the same portrait engine as "
-        "mobile_beautify_image). Call "
-        "mobile_preview_image on the returned path, then mobile_save_image to add the result "
-        "to the system gallery if requested.",
+        "mobile_beautify_image). Deliver the returned path with agent_send_media "
+        "(file_path=path, type=image) in the current AI conversation. Do not open a full-screen "
+        "preview automatically; the user can tap the chat image to inspect it. Use "
+        "mobile_preview_image only when explicitly requested, and mobile_save_image to add "
+        "the result to the system gallery if requested.",
         // operation 每次只做一项裁剪、旋转、缩放、翻转、灰度、锐化、调色或轻度美化。
         // 其余坐标/强度字段只对所选操作有效，执行层逐项校验范围。
         R"({"type":"object","properties":{"path":{"type":"string"},"operation":{"type":"string","enum":["crop",)"
@@ -1261,8 +1433,10 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         "Use original_path from prior results when refining; prior generated paths are also "
         "resolved to their original. Explicit parameters override the validated personal model. "
         "Unspecified shape changes default to zero. For multiple faces set subject_index "
-        "from left to right starting at 0. Return result_id for user feedback and preview "
-        "the path with mobile_preview_image. The iOS host automatically processes a bounded face ROI "
+        "from left to right starting at 0. Return result_id for user feedback and deliver the "
+        "returned path with agent_send_media (file_path=path, type=image) in this AI conversation. "
+        "Do not open a full-screen preview automatically; the user can tap the chat image. "
+        "Use mobile_preview_image only when explicitly requested. The iOS host automatically processes a bounded face ROI "
         "and composites it at the original dimensions; returned mask is diagnostic, not another blend alpha. "
         "Use skin ROI L*/C* and reported mask coverage, not full-image threshold fractions, to assess changes. "
         "Unknown fields including action/delegate are rejected. Never infer user preference from your own judgment.",
@@ -1281,7 +1455,10 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         "photos. Occluded joints, uncertain poses or no room below the feet return an error. "
         "slim_waist and leg_length are bounded normalized strengths, not literal percentages. "
         "For multiple people specify subject_index from left to right starting at 0. "
-        "Keep the original; preview the new path and use result_id for explicit user feedback.",
+        "Keep the original and deliver the new path with agent_send_media (file_path=path, "
+        "type=image) in this AI conversation. Do not open a full-screen preview automatically; "
+        "the user can tap the chat image. Use mobile_preview_image only when explicitly "
+        "requested, and use result_id for explicit user feedback.",
         R"({"type":"object","properties":{"path":{"type":"string"},"slim_waist":{"type":"number","minimum":0,"maximum":1},)"
         R"("leg_length":{"type":"number","minimum":0,"maximum":1},"subject_index":{"type":"integer","minimum":0},)"
         R"("use_personal_model":{"type":"boolean"}},"required":["path"],"additionalProperties":false})",
@@ -1327,10 +1504,15 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         dispatcher, false));
     tools.add(std::make_unique<MaiMobileHostTool>(
         "mobile_preview_image",
-        "Show an image from the Agent working directory to the user in a full-screen mobile "
-        "preview. This does not require a vision-capable model and does not save or modify it. "
-        "Use after mobile_read_photo or mobile_transform_image so the user can inspect it.",
-        // path 为待展示图片；只全屏预览，不保存、不编辑。
+        // 首句即限定用户明确要求的全屏或放大，普通“展示”应在当前回复交付缩略图。
+        "Open a FULL-SCREEN image viewer ONLY when the user explicitly asks for full-screen "
+        "viewing or enlargement. For ordinary requests to show, display, or re-show an "
+        "existing photo/image in the current reply, use agent_send_media to present an inline "
+        "thumbnail/card instead. This viewer reads an image from the current Agent workspace, "
+        "does not require a vision-capable model, and does not save or modify the file. Do not "
+        "automatically open this viewer after capture, reading, or editing; the user can tap "
+        "an inline chat image to enlarge it.",
+        // path 为用户明确要求全屏查看的图片；普通成品交付使用聊天卡片，不自动打开本工具。
         R"({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})",
         dispatcher, false));
     registerPlatformPhotoAlbumTools(tools, dispatcher);

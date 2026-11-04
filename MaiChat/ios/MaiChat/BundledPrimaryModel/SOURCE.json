@@ -1,0 +1,23 @@
+{
+  "publisher": "Qwen / Alibaba Cloud",
+  "repository": "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF",
+  "revision": "7d26695454df6de5fbcce2e58681e62dae06ce43",
+  "model_url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/7d26695454df6de5fbcce2e58681e62dae06ce43/Qwen_Qwen3.5-2B-Q4_K_M.gguf",
+  "bytes": 1396198496,
+  "sha256": "57a1085840f497d764a7fc5d346922dbde961efb54cc792ea81d694fd846a1d8",
+  "license": "Apache-2.0",
+  "quantizer": "bartowski",
+  "original_repository": "https://huggingface.co/Qwen/Qwen3.5-2B",
+  "original_revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+  "license_url": "https://huggingface.co/Qwen/Qwen3.5-2B/raw/15852e8c16360a2fea060d615a32b45270f8a8fc/LICENSE",
+  "license_sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+  "model_card_url": "https://huggingface.co/Qwen/Qwen3.5-2B/raw/15852e8c16360a2fea060d615a32b45270f8a8fc/README.md",
+  "model_card_sha256": "c0e83a849c776e6fa843d011f023132d942a0f0140d903205bf1c363adad2275",
+  "architecture": "qwen35",
+  "quantization": "Q4_K_M",
+  "product_modality": "text",
+  "model_weights_modified": false,
+  "native_chat_template_bytes": 7755,
+  "native_chat_template_sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+  "distribution": "Bundled in every normal iOS Debug and Release App; never downloaded by the running App."
+}

@@ -12,6 +12,9 @@
 
 class MaiTool;
 class MaiToolRegistry;
+struct MaiLlamaModelConfig;
+struct MaiModelRequest;
+struct MaiStreamSink;
 
 // 一次独立推理；路径必须是已经由宿主授权的本地绝对路径，核心再核对文件类型与可读性。
 // Agent 工具会先用 MaiToolContext::resolvePath 处理每条路径；普通调用不经过工具协议。
@@ -58,10 +61,15 @@ struct MaiLlamaStatus {
     bool hasProjector = false;
     std::uint32_t contextSize = 0;
     std::uint64_t modelGeneration = 0;
+    // 根据实际 GPU 设备权重缓冲统计，不把请求偏好或系统存在 GPU 当成已使用 GPU。
+    // 这些字段不保证每个算子均在 GPU 执行；无实际 GPU 权重时为 false/0/空。
+    bool gpuSelected = false;
+    std::uint64_t gpuModelBytes = 0;
+    std::string gpuBackend;
 };
 
 // 全进程只有 getSharedMaiLlamaRuntime() 创建的一个实例，普通入口与工具必须共用它。
-// generate/unload 互斥串行，切换配置先释放 mtmd、llama_context、model，再载入新配置。
+// generate/streamChat/unload 互斥串行，切换配置先释放 mtmd、llama_context、model，再载入新配置。
 // generate 是阻塞调用，只能在允许阻塞的工作线程执行；不在内部新建线程或调用进程 CLI。
 // cancel 可为空；非空时由调用方持有到 generate 返回。加载进度、prefill 与逐 token 解码
 // 都检查取消，CPU decode 使用真实 abort callback，清理完成后才返回 Canceled。
@@ -78,6 +86,12 @@ public:
 
     MaiResult<MaiLlamaResponse> generate(const MaiLlamaRequest& request,
                                          const std::atomic<bool>* cancel = nullptr);
+    // 主模型入口：完整消息/工具声明通过 GGUF 原生模板，正文/思考分别增量交付。
+    // 复用 generate 的驻留锁和请求清理；Apple 可用时用 Metal，缓存区分 CPU/GPU 偏好。
+    // CPU 支持 abort；GPU 仅在每个批次前后/同步后合作取消，不承诺立即抢占。
+    // 不执行工具、不截掉历史，不支持的模板/媒体明确返回 NotSupported。
+    MaiError streamChat(const MaiLlamaModelConfig& config, const MaiModelRequest& request,
+                        const MaiStreamSink& sink, const std::atomic<bool>& cancel);
     MaiLlamaStatus status() const;
     MaiError unload();
 
@@ -89,6 +103,8 @@ private:
 };
 
 // 返回同一个进程驻留实例；调用者释放 shared_ptr 不会绕过其他宿主的使用权。
+// 所有者保留到进程退出，避免在上游后端静态析构之后释放模型；新驻留配置实际使用后登记
+// 有序退出清理，Metal 设备析构前会先 unload。调用方主动释放资源仍使用 unload。
 std::shared_ptr<MaiLlamaRuntime> getSharedMaiLlamaRuntime();
 
 // 工具名为 llama；仅接受 arguments 字符串数组。支持本地模型、prompt、生成长度、上下文、

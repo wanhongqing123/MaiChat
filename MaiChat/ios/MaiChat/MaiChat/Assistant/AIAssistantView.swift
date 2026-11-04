@@ -84,7 +84,6 @@ struct AIAssistantView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSessions = false
     @State private var showActions = false
-    @State private var showingLocalModels = false
     @State private var confirmClear = false
     @State private var imageSources = AIImageSourceFrameStore()
     @State private var confirmRemoteDelete = false
@@ -279,10 +278,15 @@ struct AIAssistantView: View {
                         Color.black.opacity(0.001).ignoresSafeArea().contentShape(Rectangle())
                             .onTapGesture { showActions = false }
                         AIActionPanel(
+                            selectedModel: model.settings.displayName,
+                            isLocalModel: model.settings.isLocalModel,
+                            changingModelSource: model.changingModelSource,
                             selectedEffort: model.settings.effectiveReasoningEffort,
                             selectedPolicy: model.settings.policy,
+                            canChangeModel: model.selectedRemote == nil && model.ready &&
+                                !model.busy && !model.isSubmitting && !model.changingModelSource,
                             canChangeSettings: model.selectedRemote == nil && model.configured &&
-                                !model.busy && !model.isSubmitting,
+                                !model.busy && !model.isSubmitting && !model.changingModelSource,
                             canClear: model.selectedRemote == nil && !model.busy &&
                                 !model.selected.isEmpty,
                             selectEffort: { selected in
@@ -297,7 +301,9 @@ struct AIAssistantView: View {
                                 next.policy = policy
                                 Task { _ = await model.save(next) }
                             },
-                            localModels: { showActions = false; showingLocalModels = true },
+                            selectModelSource: { local in
+                                Task { await model.selectPrimaryModelSource(local: local) }
+                            },
                             clear: { showActions = false; confirmClear = true }
                         )
                         .padding(.top, 54).padding(.trailing, 14)
@@ -305,7 +311,6 @@ struct AIAssistantView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showingLocalModels) { AILocalModelsView() }
             // 右页的消息、输入和底部入口共用互锁；返回目录的透明按钮在禁用范围之外。
             // 这里只锁横向拖动、回弹及目录展开态，不能因普通纵向阅读而禁用 ScrollView。
             .environment(\.aiConversationActionsAllowed, { !conversationActionsBlocked })
@@ -419,6 +424,7 @@ struct AIAssistantView: View {
         .onChange(of: isActive) { active in
             browser.setPageVisible(active)
             if !active { browser.dismissPage() }
+            if !active { AIMobileLocalMediaRequests.shared.invalidateManualPhoto() }
             guard !usesStandaloneUITestFixture else { return }
             if active {
                 model.setPageActive(true)
@@ -1253,12 +1259,16 @@ private struct AIAssistantMessageList: View {
             }
             .padding(.top, 28)
             if !model.configured {
-                Text("登录后会自动连接主聊天模型")
+                Text(model.settings.isLocalModel
+                    ? "内置本地模型暂时不可用，请重试；若仍失败，请更新 App"
+                    : "登录后可使用云端主模型，也可在“更多→主模型”中选择本地 GGUF")
                     .font(.footnote).foregroundStyle(.secondary)
                     .padding(.top, 18)
                 Button("重试连接") {
                     Task {
-                        _ = try? await AICloudCredentialSync.refreshAccountModelKeysIfAvailable()
+                        if !model.settings.isLocalModel {
+                            _ = try? await AICloudCredentialSync.refreshAccountModelKeysIfAvailable()
+                        }
                         _ = await model.save(model.settings)
                     }
                 }
@@ -1333,23 +1343,43 @@ private struct AIHeaderButton: View {
 }
 
 private struct AIActionPanel: View {
+    let selectedModel: String
+    let isLocalModel: Bool
+    let changingModelSource: Bool
     let selectedEffort: String
     let selectedPolicy: String
+    let canChangeModel: Bool
     let canChangeSettings: Bool
     let canClear: Bool
     let selectEffort: (String) -> Void
     let selectPolicy: (String) -> Void
-    let localModels: () -> Void
+    let selectModelSource: (Bool) -> Void
     let clear: () -> Void
     @State private var expandedSection: Section?
 
     private enum Section: Equatable {
+        case model
         case effort
         case policy
     }
 
     var body: some View {
         VStack(spacing: 0) {
+            // 模型来源与思考强度使用同一内联展开交互，点选后直接保存。
+            // 本地权重随包提供；此入口不再创建设置 sheet、文件管理或应用确认页。
+            expandableAction(title: "主模型", value: changingModelSource ? "正在切换…" : selectedModel,
+                             image: "cpu", section: .model, enabled: canChangeModel)
+            .accessibilityIdentifier("ai-primary-model-settings")
+            if expandedSection == .model {
+                optionGroup(identifier: "ai-primary-model-menu") {
+                    option("云端模型", selected: !isLocalModel) { selectModelSource(false) }
+                        .accessibilityIdentifier("ai-primary-model-cloud")
+                    option("本地模型", selected: isLocalModel) { selectModelSource(true) }
+                        .accessibilityIdentifier("ai-primary-model-local")
+                }
+                .disabled(!canChangeModel)
+            }
+            Divider().padding(.leading, 42)
             expandableAction(
                 title: "思考强度",
                 value: effortTitle(selectedEffort),
@@ -1384,9 +1414,6 @@ private struct AIActionPanel: View {
                 }
             }
             Divider().padding(.leading, 42)
-            action("本地模型", "cpu", Color.primary, localModels)
-                .accessibilityIdentifier("ai-local-models")
-            Divider().padding(.leading, 42)
             action("清空当前对话", "trash", canClear ? Color.red : Color.secondary, clear)
                 .disabled(!canClear)
         }.frame(width: 264).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
@@ -1400,7 +1427,8 @@ private struct AIActionPanel: View {
         title: String,
         value: String,
         image: String,
-        section: Section
+        section: Section,
+        enabled: Bool? = nil
     ) -> some View {
         Button {
             withAnimation(.easeOut(duration: 0.14)) {
@@ -1425,8 +1453,8 @@ private struct AIActionPanel: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!canChangeSettings)
-        .opacity(canChangeSettings ? 1 : 0.5)
+        .disabled(!(enabled ?? canChangeSettings))
+        .opacity((enabled ?? canChangeSettings) ? 1 : 0.5)
         .accessibilityLabel(title)
         .accessibilityValue(value)
     }
@@ -1438,6 +1466,7 @@ private struct AIActionPanel: View {
         VStack(spacing: 0) { content() }
             .padding(.vertical, 4)
             .background(Color(uiColor: .secondarySystemBackground))
+            .accessibilityElement(children: .contain)
             .accessibilityIdentifier(identifier)
     }
 
@@ -1863,10 +1892,29 @@ struct AIMessageRow: View, Equatable {
         }
     }
     private var toolParts: [AIPart] {
-        message.parts.filter { $0.kind == "tool" && mediaArtifact(for: $0) == nil }
+        // Captures keep their execution receipt in the disclosure even when an
+        // image card is present. agent_send_media retains its existing card-only UI.
+        message.parts.filter {
+            $0.kind == "tool" && !($0.tool == "agent_send_media" && mediaArtifact(for: $0) != nil)
+        }
     }
     private var mediaArtifacts: [AIAgentMediaArtifact] {
-        message.parts.compactMap(mediaArtifact)
+        var result: [AIAgentMediaArtifact] = []
+        var imageIndexes: [String: Int] = [:]
+        for part in message.parts {
+            guard let artifact = mediaArtifact(for: part) else { continue }
+            if artifact.type == "image" {
+                // A model may explicitly deliver the photo after capture. Keep
+                // one canonical image card and prefer that delivery's caption.
+                if let index = imageIndexes[artifact.filePath] {
+                    if part.tool == "agent_send_media" { result[index] = artifact }
+                    continue
+                }
+                imageIndexes[artifact.filePath] = result.count
+            }
+            result.append(artifact)
+        }
+        return result
     }
     private var textMediaMentions: [AIAssistantMediaMention] {
         guard message.role != "assistant" || (!message.active && message.completed > 0) else {
@@ -1971,6 +2019,14 @@ struct AIMessageRow: View, Equatable {
         }
     }
     private func mediaArtifact(for part: AIPart) -> AIAgentMediaArtifact? {
+        if part.kind == "tool",
+           let fileURL = AIAssistantPhotoArtifactPolicy.photoURL(
+            tool: part.tool, state: part.state, output: part.output, workspacePath: workspacePath) {
+            // The camera result already exists on disk. Rendering this card does
+            // not attach image bytes to the model or automatically open fullscreen.
+            return AIAgentMediaArtifact(id: part.id, filePath: fileURL.path, type: "image",
+                caption: "", sourceTaskID: nil, sourceTool: nil, outputJSON: part.output ?? "")
+        }
         guard part.kind == "tool", part.tool == "agent_send_media",
               part.state == "completed",
               let output = part.output?.data(using: .utf8),
@@ -2748,6 +2804,7 @@ private struct AIComposerSnapshot: Equatable {
 private struct AICameraPresentation: Identifiable {
     enum Mode {
         case manual(AIAttachmentImportTarget)
+        case manualTool(UUID)
         case timed(UUID)
     }
 
@@ -2756,6 +2813,11 @@ private struct AICameraPresentation: Identifiable {
 
     var timedRequestID: UUID? {
         if case .timed(let requestID) = mode { return requestID }
+        return nil
+    }
+
+    var manualToolRequestID: UUID? {
+        if case .manualTool(let requestID) = mode { return requestID }
         return nil
     }
 }
@@ -2788,6 +2850,7 @@ private struct AIComposer: View, Equatable {
     @State private var isPhotoPickerPresented = false
     @State private var cameraPresentation: AICameraPresentation?
     @State private var manualCameraOpening = false
+    @State private var manualToolPresentationRequestID: UUID?
     @State private var selectedMediaItems: [PhotosPickerItem] = []
     @State private var libraryTarget: AIAttachmentImportTarget?
     @State private var fileTarget: AIAttachmentImportTarget?
@@ -2921,6 +2984,9 @@ private struct AIComposer: View, Equatable {
             screenFramesStrip
             cameraFramesStrip
             #if DEBUG && targetEnvironment(simulator)
+            if AICameraUITestSupport.isManualToolRequested {
+                AICameraManualToolUITestControls()
+            }
             if AICameraUITestSupport.isRequested {
                 AICameraUITestControls {
                     do {
@@ -3002,6 +3068,7 @@ private struct AIComposer: View, Equatable {
                             onVoiceLongPressCancelled: {
                                 cancelVoiceTranscription(restoresDraft: true)
                             },
+                            allowsEmptySubmit: !snapshot.attachments.isEmpty,
                             registerTextView: { focusController.textView = $0 },
                             accessibilityIdentifier: "ai-composer",
                             accessibilityLabel: "创作中心输入框，可按住转文字"
@@ -3039,44 +3106,28 @@ private struct AIComposer: View, Equatable {
                     .zIndex(composerEditMenuState == nil ? 0 : 20)
                 }
 
-                // 忙碌时通过发送补充/排队；输入栏不再挂载停止，也不另迁一个停止入口。
-                // idle 的附件按钮保留原行为，后端 stop API 仍供生命周期管理使用。
-                if !snapshot.busy {
-                    Button {
-                        composerEditMenuState = nil
-                        if isAttachmentPanelPresented {
-                            isAttachmentPanelPresented = false
-                        } else {
-                            focusController.dismiss()
-                            isAttachmentPanelPresented = true
-                        }
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(Color.primary)
-                            .frame(width: 44, height: 44)
-                            .background(Color(uiColor: .secondarySystemBackground), in: Circle())
-                            .overlay(Circle().stroke(RemoteIMStyle.border, lineWidth: 1))
+                // 右侧只保留附件加号；发送统一走编辑框的键盘发送动作，不另画发送或停止按钮。
+                // 前一条模型/上传/回执等待不阻止继续添加附件，新消息由同一队列接收。
+                Button {
+                    composerEditMenuState = nil
+                    if isAttachmentPanelPresented {
+                        isAttachmentPanelPresented = false
+                    } else {
+                        focusController.dismiss()
+                        isAttachmentPanelPresented = true
                     }
-                    .buttonStyle(.plain)
-                    .disabled(!snapshot.ready || snapshot.isSubmitting)
-                    .accessibilityLabel(isAttachmentPanelPresented ? "收起更多功能" : "展开更多功能")
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(Color.primary)
+                        .frame(width: 44, height: 44)
+                        .background(Color(uiColor: .secondarySystemBackground), in: Circle())
+                        .overlay(Circle().stroke(RemoteIMStyle.border, lineWidth: 1))
                 }
+                .buttonStyle(.plain)
+                .disabled(!snapshot.ready)
+                .accessibilityLabel(isAttachmentPanelPresented ? "收起更多功能" : "展开更多功能")
 
-                if hasDraftContent, snapshot.busy || !isVoiceMode {
-                    Button { submitDraft() } label: {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 17, weight: .bold))
-                            .foregroundStyle(Color.white)
-                            .frame(width: 44, height: 44)
-                            .background(RemoteIMStyle.blue, in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canSubmitDraft)
-                    .accessibilityLabel(snapshot.busy ? "补充当前任务" : "发送给 AI")
-                    .accessibilityHint(snapshot.busy ? "当前工具执行完后继续处理补充内容" : "")
-                    .accessibilityIdentifier("ai-send-draft")
-                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
@@ -3127,6 +3178,10 @@ private struct AIComposer: View, Equatable {
                 photoLibrary: .shared()
             )
             .fullScreenCover(item: $cameraPresentation, onDismiss: {
+                if let id = manualToolPresentationRequestID {
+                    manualToolPresentationRequestID = nil
+                    localMediaRequests.failManualPhoto(.canceled, requestID: id)
+                }
                 if let binding = cameraReviewAfterDismiss {
                     cameraReviewAfterDismiss = nil
                     cameraFrameSelection = binding
@@ -3180,6 +3235,17 @@ private struct AIComposer: View, Equatable {
                     }
                 )
                     .ignoresSafeArea()
+                case .manualTool(let requestID):
+                    AIMobileManualCameraPicker(onCapture: { image in
+                        guard cameraPresentation?.id == presentation.id,
+                              localMediaRequests.manualPhotoRequestID == requestID else { return }
+                        cameraPresentation = nil
+                        localMediaRequests.finishManualPhoto(image, requestID: requestID)
+                    }, onCancel: {
+                        guard cameraPresentation?.id == presentation.id else { return }
+                        cameraPresentation = nil
+                        localMediaRequests.failManualPhoto(.canceled, requestID: requestID)
+                    }).ignoresSafeArea()
                 }
             }
             .fullScreenCover(item: $draftVideoPreview) { item in
@@ -3205,6 +3271,7 @@ private struct AIComposer: View, Equatable {
                 if status == "stopped" { presentFinishedScreenFrames() }
             }
             .onChange(of: snapshot.screenFrameAccountID) { _ in
+                localMediaRequests.invalidateManualPhoto()
                 screenFrameSelection = nil
                 cameraFrameSelection = nil
                 cameraReviewAfterDismiss = nil
@@ -3220,6 +3287,7 @@ private struct AIComposer: View, Equatable {
                 Task { await finishToolCamera(reason: "camera_error", requestID: id) }
             }
             .onChange(of: scenePhase) { phase in
+                if phase == .background { localMediaRequests.invalidateManualPhoto() }
                 if phase == .background, let id = toolCameraRequestID {
                     Task { await finishToolCamera(reason: "interrupted", requestID: id) }
                 }
@@ -3329,6 +3397,13 @@ private struct AIComposer: View, Equatable {
                 }
                 Task { await openToolCamera(requestID: request) }
             }
+            .onChange(of: localMediaRequests.manualPhotoRequestID) { request in
+                guard let request else {
+                    if cameraPresentation?.manualToolRequestID != nil { cameraPresentation = nil }
+                    return
+                }
+                Task { await openManualToolCamera(requestID: request) }
+            }
             .onChange(of: localMediaRequests.musicRequestID) { request in
                 guard request != nil else { return }
                 musicSelectionReceived = false
@@ -3409,6 +3484,7 @@ private struct AIComposer: View, Equatable {
             .onChange(of: appState.remoteDiagnosticsIdentity) { _ in
                 // 当前页面即使复用相同 Session，也不能沿用上一轮账号认证的识别会话。
                 cancelVoiceTranscription(restoresDraft: true)
+                localMediaRequests.invalidateManualPhoto()
                 cameraFrameSelection = nil
                 if let id = toolCameraRequestID {
                     Task { await finishToolCamera(reason: "interrupted", requestID: id) }
@@ -3416,6 +3492,7 @@ private struct AIComposer: View, Equatable {
             }
             .onDisappear {
                 music.stop()
+                if cameraPresentation == nil { localMediaRequests.invalidateManualPhoto() }
                 if cameraPresentation == nil, let id = toolCameraRequestID {
                     Task { await finishToolCamera(reason: "interrupted", requestID: id) }
                 }
@@ -3439,6 +3516,7 @@ private struct AIComposer: View, Equatable {
             }
             .onChange(of: snapshot.selected) { selected in
                 cancelVoiceTranscription(restoresDraft: true)
+                localMediaRequests.invalidateManualPhoto()
                 if let id = toolCameraRequestID {
                     Task { await finishToolCamera(reason: "interrupted", requestID: id) }
                 }
@@ -3454,6 +3532,9 @@ private struct AIComposer: View, Equatable {
                 draftImportTarget = selected.isEmpty ? model.importTarget() : nil
                 if storageSession != selected { draft = model.drafts[selected] ?? "" }
                 if !snapshot.attachments.isEmpty { isVoiceMode = false }
+            }
+            .onChange(of: snapshot.workspacePath) { _ in
+                localMediaRequests.invalidateManualPhoto()
             }
             .onChange(of: snapshot.remoteRestoreGeneration) { _ in
                 guard model.selectedRemote != nil, draftSession == model.selected,
@@ -3600,7 +3681,8 @@ private struct AIComposer: View, Equatable {
 
     private func openCamera() async {
         guard cameraPresentation == nil, !manualCameraOpening, !cameraFinishing,
-              toolCameraRequestID == nil, localMediaRequests.cameraRequestID == nil else {
+              toolCameraRequestID == nil, localMediaRequests.cameraRequestID == nil,
+              localMediaRequests.manualPhotoRequestID == nil else {
             model.showTransientError("相机正在使用中，请先结束当前拍摄")
             return
         }
@@ -3626,7 +3708,49 @@ private struct AIComposer: View, Equatable {
                 return
             }
         }
+        guard model.importTarget() == target,
+              UIApplication.shared.applicationState == .active else { return }
         cameraPresentation = AICameraPresentation(mode: .manual(target))
+    }
+
+    /// Manual tool capture shares the normal shutter presentation. Its request
+    /// identity remains separate from periodic capture and never owns a draft.
+    private func openManualToolCamera(requestID: UUID) async {
+        guard localMediaRequests.beginManualPhotoOpening(requestID: requestID) else { return }
+        defer { localMediaRequests.finishManualPhotoOpening(requestID: requestID) }
+        guard cameraPresentation == nil, !manualCameraOpening, !cameraFinishing,
+              toolCameraRequestID == nil, localMediaRequests.cameraRequestID == nil else {
+            localMediaRequests.failManualPhoto(.unavailable, requestID: requestID)
+            return
+        }
+        manualCameraOpening = true
+        defer { manualCameraOpening = false }
+        #if DEBUG && targetEnvironment(simulator)
+        let simulated = AICameraUITestSupport.isManualRequested
+        #else
+        let simulated = false
+        #endif
+        guard simulated || UIImagePickerController.isSourceTypeAvailable(.camera) else {
+            localMediaRequests.failManualPhoto(.unavailable, requestID: requestID)
+            return
+        }
+        if !simulated {
+            let granted = await requestCameraPermission()
+            guard localMediaRequests.manualPhotoRequestID == requestID else { return }
+            guard granted else {
+                localMediaRequests.failManualPhoto(.permissionDenied, requestID: requestID)
+                return
+            }
+        }
+        guard localMediaRequests.manualPhotoRequestID == requestID,
+              model.selected == localMediaRequests.manualPhotoSessionID,
+              (try? model.makeCameraFrameImportSnapshot().workspace.path) == localMediaRequests.manualPhotoWorkspacePath,
+              UIApplication.shared.applicationState == .active else {
+            localMediaRequests.failManualPhoto(.canceled, requestID: requestID)
+            return
+        }
+        manualToolPresentationRequestID = requestID
+        cameraPresentation = AICameraPresentation(mode: .manualTool(requestID))
     }
 
     private func openToolCamera(requestID: UUID) async {
@@ -3641,7 +3765,7 @@ private struct AIComposer: View, Equatable {
         defer { localMediaRequests.finishCameraOpening(requestID: requestID) }
         // 手动快门包括授权过程都独占自己的 presentation；Agent 请求不能改写它的模式。
         guard cameraPresentation == nil, !manualCameraOpening, !cameraFinishing,
-              toolCameraRequestID == nil else {
+              toolCameraRequestID == nil, localMediaRequests.manualPhotoRequestID == nil else {
             localMediaRequests.failCamera(.unavailable, requestID: requestID)
             return
         }
@@ -4962,10 +5086,14 @@ final class AIMobileLocalMediaRequests: ObservableObject {
     static let shared = AIMobileLocalMediaRequests()
 
     @Published private(set) var cameraRequestID: UUID?
+    @Published private(set) var manualPhotoRequestID: UUID?
     @Published private(set) var musicRequestID: UUID?
     @Published private(set) var musicPresentationID: UUID?
     private(set) var cameraSessionID = ""
     private(set) var cameraWorkspacePath = ""
+    private(set) var manualPhotoSessionID = ""
+    private(set) var manualPhotoWorkspacePath = ""
+    private(set) var manualPhotoLifecycleGeneration: UInt64 = 0
     private(set) var cameraState = "closed"
     var presenterActive = false
     private var lastCameraSessionID = ""
@@ -4976,12 +5104,15 @@ final class AIMobileLocalMediaRequests: ObservableObject {
     private var cameraStartInFlight = false
     private var cameraFrameCount = 0
     private var musicCompletion: CheckedContinuation<String, Error>?
+    private var manualPhotoCompletion: CheckedContinuation<Data, Error>?
+    private var manualPhotoOpeningID: UUID?
 
 
 
     func openCamera(in sessionID: String, workspacePath: String) throws -> String {
         guard presenterActive, UIApplication.shared.applicationState == .active,
               cameraRequestID == nil, cameraState != "stopping",
+              manualPhotoRequestID == nil, manualPhotoOpeningID == nil,
               !sessionID.isEmpty, !workspacePath.isEmpty else {
             throw AIMobileLocalMediaRequestError.unavailable
         }
@@ -5002,6 +5133,73 @@ final class AIMobileLocalMediaRequests: ObservableObject {
             if cameraRequestID == id { closeCamera(in: sessionID) }
         }
         return cameraState
+    }
+
+    /// A single completion belongs to one manual shutter. Cancellation and late
+    /// UIKit callbacks use that identity so they cannot finish a later request.
+    func requestManualPhoto(in sessionID: String, workspacePath: String) async throws -> Data {
+        try Task.checkCancellation()
+        guard presenterActive, UIApplication.shared.applicationState == .active,
+              cameraRequestID == nil, cameraState != "stopping",
+              manualPhotoRequestID == nil, manualPhotoOpeningID == nil,
+              !sessionID.isEmpty, !workspacePath.isEmpty else {
+            throw AIMobileLocalMediaRequestError.unavailable
+        }
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                manualPhotoCompletion = continuation
+                manualPhotoSessionID = sessionID
+                manualPhotoWorkspacePath = workspacePath
+                manualPhotoRequestID = id
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(120))
+                    failManualPhoto(.canceled, requestID: id)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in self.failManualPhoto(.canceled, requestID: id) }
+        }
+    }
+
+    func beginManualPhotoOpening(requestID: UUID) -> Bool {
+        guard manualPhotoRequestID == requestID, manualPhotoOpeningID == nil else { return false }
+        manualPhotoOpeningID = requestID
+        return true
+    }
+
+    func finishManualPhotoOpening(requestID: UUID) {
+        if manualPhotoOpeningID == requestID { manualPhotoOpeningID = nil }
+    }
+
+    func finishManualPhoto(_ image: UIImage, requestID: UUID) {
+        guard manualPhotoRequestID == requestID, let completion = manualPhotoCompletion else { return }
+        guard let data = image.jpegData(compressionQuality: 0.9), !data.isEmpty else {
+            failManualPhoto(.failed, requestID: requestID)
+            return
+        }
+        manualPhotoCompletion = nil
+        manualPhotoRequestID = nil
+        manualPhotoSessionID = ""
+        manualPhotoWorkspacePath = ""
+        completion.resume(returning: data)
+    }
+
+    func failManualPhoto(_ error: AIMobileLocalMediaRequestError, requestID: UUID? = nil) {
+        if let requestID, manualPhotoRequestID != requestID { return }
+        guard let completion = manualPhotoCompletion else { return }
+        manualPhotoCompletion = nil
+        manualPhotoRequestID = nil
+        manualPhotoSessionID = ""
+        manualPhotoWorkspacePath = ""
+        completion.resume(throwing: error)
+    }
+
+    /// Also invalidates the short save interval after the shutter completed, so
+    /// leaving and returning to the same owner cannot revive a canceled result.
+    func invalidateManualPhoto() {
+        manualPhotoLifecycleGeneration &+= 1
+        failManualPhoto(.canceled)
     }
 
     func markCameraVisible(_ requestID: UUID, batchID: String) {
@@ -5135,6 +5333,7 @@ final class AIMobileLocalMediaRequests: ObservableObject {
         presenterActive = false
         // 退出页面与工具关闭共享同一封存流程，不能把仍在异步启动的请求直接标成已关闭。
         if cameraRequestID != nil { _ = closeCamera(in: cameraSessionID) }
+        invalidateManualPhoto()
         failMusic(.canceled)
     }
 }

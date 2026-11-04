@@ -10,4 +10,6 @@
 //
 // Chat Completions 与 Responses 各有独立实现；此工厂按 MaiModelConfig::wire 分发。
 // GLM 等兼容前者，DeepSeek 等兼容后者；调用方只使用中立的 MaiModelClient 接口。
+// Local 不含本地文件配置，因此返回明确 NotConfigured 的客户端且绝不发网络；
+// 本地推理应使用 MaiLlamaModelClient.h 中的独立配置和工厂。
 std::unique_ptr<MaiModelClient> makeMaiModelClient(MaiModelConfig config);

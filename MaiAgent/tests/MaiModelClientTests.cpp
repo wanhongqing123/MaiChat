@@ -1688,6 +1688,31 @@ void test_responses_proxy_direct_and_cancel() {
     CHECK(destination.received().size() == 1);
 }
 
+void test_local_mode_never_falls_back_to_a_remote_request() {
+    FakeModelProxy destination;
+    destination.start();
+    MaiModelConfig config;
+    config.baseUrl = destination.address();
+    config.apiKey = "synthetic-never-forwarded";
+    config.wire = MaiWireApi::Local;
+    auto client = makeMaiModelClient(config);
+    CHECK(client != nullptr);
+    CHECK(client->wireApi() == MaiWireApi::Local);
+    CHECK(std::string(maiWireApiToString(client->wireApi())) == "local");
+    MaiModelRequest request;
+    request.model = "local:synthetic";
+    bool callbackDelivered = false;
+    MaiStreamSink sink;
+    sink.onText = [&](std::string_view) { callbackDelivered = true; };
+    sink.onToolCall = [&](const MaiToolInvocation&) { callbackDelivered = true; };
+    std::atomic<bool> cancel{false};
+    CHECK(client->stream(request, sink, cancel).code() == MaiErrorCode::NotConfigured);
+    cancel.store(true);
+    CHECK(client->stream(request, sink, cancel).code() == MaiErrorCode::Canceled);
+    CHECK(!callbackDelivered);
+    CHECK(destination.received().empty());
+}
+
 }  // namespace
 
 int main() {
@@ -1755,6 +1780,7 @@ int main() {
     test_responses_proxy_rejects_tls_downgrade();
 #endif
     test_responses_proxy_direct_and_cancel();
+    test_local_mode_never_falls_back_to_a_remote_request();
     if (failures == 0) std::printf("llm tests passed\n");
     return failures == 0 ? 0 : 1;
 }

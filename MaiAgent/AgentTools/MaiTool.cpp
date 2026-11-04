@@ -117,6 +117,11 @@ std::optional<MaiSpecialistInfo> MaiTool::specialistInfo() const {
     return std::nullopt;
 }
 
+bool MaiTool::isAvailableForModel(const std::string& model) const {
+    (void)model;
+    return true;
+}
+
 const char* maiSpecialistCapabilityStatusToString(MaiSpecialistCapabilityStatus status) {
     // 能力状态是给主模型的可执行性信号：available 已验证可用；
     // implemented_unverified 已接线待实测；not_configured 缺账号配置；
@@ -163,19 +168,20 @@ MaiTool* MaiToolRegistry::find(const std::string& name) const {
     return hit == mTools.end() ? nullptr : hit->get();
 }
 
-MaiTool* MaiToolRegistry::findForModel(const std::string& name) const {
-    return mInternalNames.count(name) == 0 ? find(name) : nullptr;
+MaiTool* MaiToolRegistry::findForModel(const std::string& name, const std::string& model) const {
+    MaiTool* tool = mInternalNames.count(name) == 0 ? find(name) : nullptr;
+    return tool && tool->isAvailableForModel(model) ? tool : nullptr;
 }
 
 bool MaiToolRegistry::isEmpty() const {
     return mTools.size() == mInternalNames.size();
 }
 
-std::vector<MaiToolSpec> MaiToolRegistry::specs() const {
+std::vector<MaiToolSpec> MaiToolRegistry::specs(const std::string& model) const {
     std::vector<MaiToolSpec> out;
     out.reserve(mTools.size());
     for (const auto& tool : mTools) {
-        if (mInternalNames.count(tool->name()) > 0) continue;
+        if (mInternalNames.count(tool->name()) > 0 || !tool->isAvailableForModel(model)) continue;
         MaiToolSpec spec;
         spec.name = tool->name();
         spec.description = tool->description();

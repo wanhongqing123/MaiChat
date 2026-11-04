@@ -665,9 +665,28 @@ struct CurlGlobal {
     }
 };
 
+// 本地推理需要已经授权的 GGUF 配置。错误地送入远端工厂时保持失败关闭，
+// 不能把 Local 当作默认 Chat Completions，从而意外访问供应商或 localhost。
+class LocalConfigurationRequiredClient final : public MaiModelClient {
+public:
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink&,
+                    const std::atomic<bool>& cancel) override {
+        return cancel.load() ? MaiError::make(MaiErrorCode::Canceled, "Local request canceled.")
+                             : MaiError::make(
+                                   MaiErrorCode::NotConfigured,
+                                   "Local models require makeMaiLlamaModelClient and a GGUF file.");
+    }
+
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::Local;
+    }
+};
+
 }  // namespace
 
 std::unique_ptr<MaiModelClient> makeMaiModelClient(MaiModelConfig config) {
+    if (config.wire == MaiWireApi::Local)
+        return std::make_unique<LocalConfigurationRequiredClient>();
     // curl_global_init 不是线程安全的，用函数内静态保证只跑一次。
     static CurlGlobal once;
     (void)once;
@@ -675,6 +694,7 @@ std::unique_ptr<MaiModelClient> makeMaiModelClient(MaiModelConfig config) {
         case MaiWireApi::ChatCompletions:
             return std::make_unique<ChatCompletionsClient>(std::move(config));
         case MaiWireApi::Responses: return makeMaiResponsesClient(std::move(config));
+        case MaiWireApi::Local: return std::make_unique<LocalConfigurationRequiredClient>();
     }
     return nullptr;
 }
@@ -683,6 +703,7 @@ const char* maiWireApiToString(MaiWireApi wireApi) {
     switch (wireApi) {
         case MaiWireApi::ChatCompletions: return "chat_completions";
         case MaiWireApi::Responses: return "responses";
+        case MaiWireApi::Local: return "local";
     }
     return "chat_completions";
 }
