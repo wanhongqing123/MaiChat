@@ -1354,6 +1354,51 @@ final class ComposerDraftStateTests: XCTestCase {
 }
 
 final class AIAssistantPathPolicyTests: XCTestCase {
+    func testCompletedPhotoReceiptIsDisplayableWithoutModelImageParts() throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ai-photo-artifact-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let output = #"{"path":"photo-synthetic.jpg","mime_type":"image/jpeg"}"#
+        let expected = workspace.appendingPathComponent("photo-synthetic.jpg").path
+        XCTAssertEqual(AIAssistantPhotoArtifactPolicy.photoURL(
+            tool: "mobile_take_photo", state: "completed", output: output,
+            workspacePath: workspace.path)?.path, expected)
+        // Missing/deleted files still get the existing recoverable image-error
+        // card. A pending or failed execution must never advertise a result.
+        for state in ["pending", "running", "error", "canceled", ""] {
+            XCTAssertNil(AIAssistantPhotoArtifactPolicy.photoURL(
+                tool: "mobile_take_photo", state: state, output: output, workspacePath: workspace.path))
+        }
+        XCTAssertNil(AIAssistantPhotoArtifactPolicy.photoURL(
+            tool: "view_image", state: "completed", output: output, workspacePath: workspace.path))
+        for invalid in [#"{"path":"photo.jpg","mime_type":"text/plain"}"#,
+                        #"{"path":"movie.mp4","mime_type":"image/jpeg"}"#,
+                        #"{"path":"photo.jpg"}"#, #"{"mime_type":"image/jpeg"}"#, "{"] {
+            XCTAssertNil(AIAssistantPhotoArtifactPolicy.photoURL(
+                tool: "mobile_take_photo", state: "completed", output: invalid, workspacePath: workspace.path))
+        }
+    }
+
+    func testPhotoReceiptRejectsAbsoluteTraversalAndSymlinkEscape() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ai-photo-boundary-\(UUID().uuidString)", isDirectory: true)
+        let workspace = root.appendingPathComponent("Workspace", isDirectory: true)
+        let sibling = root.appendingPathComponent("OtherSession", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: workspace.appendingPathComponent("escape"),
+                                                  withDestinationURL: sibling)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for path in [sibling.appendingPathComponent("photo.jpg").path,
+                     "../OtherSession/photo.jpg", "escape/photo.jpg", ""] {
+            let data = try JSONSerialization.data(withJSONObject: ["path": path, "mime_type": "image/jpeg"])
+            XCTAssertNil(AIAssistantPhotoArtifactPolicy.photoURL(
+                tool: "mobile_take_photo", state: "completed", output: String(decoding: data, as: UTF8.self),
+                workspacePath: workspace.path))
+        }
+    }
+
     func testAppContainerSiblingIsAllowedAndOtherContainerIsDenied() throws {
         let temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent("ai-path-test-\(UUID().uuidString)", isDirectory: true)

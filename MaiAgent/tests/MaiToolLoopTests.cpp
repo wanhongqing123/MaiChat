@@ -18,11 +18,13 @@
 #include <vector>
 
 #include "MaiAgent.h"
+#include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiMemoryStore.h"
 #include "MaiFileTools.h"
 #include "MaiFakeModelClient.h"
 #include "MaiIdGenerator.h"
+#include "MaiViewImageTool.h"
 
 namespace fs = std::filesystem;
 
@@ -127,6 +129,28 @@ public:
     MaiToolResult execute(const std::string&, const MaiToolContext&) override {
         return MaiToolResult::success("ready");
     }
+};
+
+class UserImagePreviewTool final : public MaiTool {
+public:
+    explicit UserImagePreviewTool(std::atomic<int>& calls) : mCalls(calls) {}
+    std::string name() const override {
+        return "mobile_preview_image";
+    }
+    std::string description() const override {
+        return "Display an image to the user without model vision.";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object"})";
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext&) override {
+        ++mCalls;
+        return MaiToolResult::success(
+            "Displayed the image to the user; image pixels were not analyzed.");
+    }
+
+private:
+    std::atomic<int>& mCalls;
 };
 
 class InternalVideoTool final : public MaiTool {
@@ -572,6 +596,59 @@ void test_internal_tool_is_not_visible_or_callable_by_model() {
                 rejected = tool->state == MaiToolState::Error &&
                            tool->error.find("no tool named") != std::string::npos;
     CHECK(rejected);
+}
+
+void test_local_primary_blocks_vision_tool_but_keeps_user_display() {
+    Workspace workspace;
+    CHECK(
+        !MaiFileSystem::writeFile(
+             MaiFilePath::fromUtf8(workspace.utf8Root()).append(MaiFilePath::fromUtf8("photo.png")),
+             std::string("\x89PNG\r\n\x1a\n", 8))
+             .hasError());
+    int analysisCalls = 0;
+    std::atomic<int> displayCalls{0};
+    auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+        callTurn("view_image", R"({"path":"photo.png"})", "call_analysis"),
+        callTurn("mobile_preview_image", R"({"path":"photo.png"})", "call_display"),
+        sayTurn("The photo is displayed. Image analysis is unavailable.")});
+    auto* observer = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(makeMaiViewImageTool([&](const std::string& path, const MaiToolContext&) {
+        ++analysisCalls;
+        return MaiResult<std::string>(path);
+    }));
+    tools->add(std::make_unique<UserImagePreviewTool>(displayCalls));
+    MaiAgent::Options options;
+    options.defaultModel = "glm-5.3-flash";
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools), options);
+    const std::string sessionId =
+        agent.submit(MaiCreateSession{workspace.utf8Root(), "", "local:qa"}).value();
+    agent.submit(MaiSendPrompt{sessionId, "Show the photo"});
+    agent.waitIdle();
+    CHECK(observer->requestCount() == 3);
+    CHECK(analysisCalls == 0 && displayCalls.load() == 1);
+    for (std::size_t index = 0; index < observer->requestCount(); ++index) {
+        const auto request = observer->request(index);
+        CHECK(request.model == "local:qa");
+        CHECK(request.tools.size() == 1 && request.tools.front().name == "mobile_preview_image");
+        for (const auto& message : request.messages) CHECK(message.images.empty());
+    }
+    bool rejectedAnalysis = false;
+    bool displayed = false;
+    for (const auto& message : agent.listMessages(sessionId)) {
+        for (const auto& part : message.parts) {
+            if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
+                if (tool->tool == "view_image")
+                    rejectedAnalysis =
+                        tool->state == MaiToolState::Error &&
+                        tool->error.find("unavailable for the current primary model") !=
+                            std::string::npos;
+                if (tool->tool == "mobile_preview_image")
+                    displayed = tool->state == MaiToolState::Completed;
+            }
+        }
+    }
+    CHECK(rejectedAnalysis && displayed);
 }
 
 void test_path_escape_through_model() {
@@ -1092,6 +1169,7 @@ int main() {
     test_tool_error_is_fed_back();
     test_unknown_tool_does_not_kill_the_turn();
     test_internal_tool_is_not_visible_or_callable_by_model();
+    test_local_primary_blocks_vision_tool_but_keeps_user_display();
     test_path_escape_through_model();
     test_iteration_cap();
     test_iteration_cap_provides_a_final_status();

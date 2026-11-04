@@ -270,6 +270,15 @@ MaiResult<common_chat_templates_inputs> chatInputs(const MaiModelRequest& reques
         bytes += value.size();
         return true;
     };
+    const auto appendSystemText = [&](std::string& target, const std::string& source) {
+        if (source.empty()) return true;
+        if (!target.empty()) {
+            if (!valid("\n\n")) return false;
+            target += "\n\n";
+        }
+        target += source;
+        return true;
+    };
     if (!valid(request.baseInstructions) || request.messages.empty() ||
         request.messages.size() > 4096 || request.tools.size() > 512)
         return {MaiErrorCode::InvalidInput, "Local chat requires bounded UTF-8 messages"};
@@ -313,7 +322,20 @@ MaiResult<common_chat_templates_inputs> chatInputs(const MaiModelRequest& reques
             mapped.tool_call_id = message.toolCallId;
             mapped.tool_name = found->second;
         }
-        input.messages.push_back(std::move(mapped));
+        // 严格模板只允许首条 System；基础指令、历史裁剪说明和本轮收尾指令仍同属可信
+        // System，按原先顺序并入同一首条消息。其余角色及调用/回执的顺序和内容完全保留，
+        // 不能为修复模板渲染而丢历史工具、补造声明或把工具结果改写成新用户请求。
+        if (mapped.role == "system") {
+            if (input.messages.empty() || input.messages.front().role != "system") {
+                input.messages.insert(input.messages.begin(), std::move(mapped));
+            } else if (!appendSystemText(input.messages.front().content, mapped.content) ||
+                       !appendSystemText(input.messages.front().reasoning_content,
+                                         mapped.reasoning_content)) {
+                return {MaiErrorCode::InvalidInput, "Local chat requires bounded UTF-8 messages"};
+            }
+        } else {
+            input.messages.push_back(std::move(mapped));
+        }
     }
     std::set<std::string> names;
     for (const auto& tool : request.tools) {

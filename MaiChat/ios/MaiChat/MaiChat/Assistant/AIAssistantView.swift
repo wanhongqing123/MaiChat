@@ -1892,10 +1892,29 @@ struct AIMessageRow: View, Equatable {
         }
     }
     private var toolParts: [AIPart] {
-        message.parts.filter { $0.kind == "tool" && mediaArtifact(for: $0) == nil }
+        // Captures keep their execution receipt in the disclosure even when an
+        // image card is present. agent_send_media retains its existing card-only UI.
+        message.parts.filter {
+            $0.kind == "tool" && !($0.tool == "agent_send_media" && mediaArtifact(for: $0) != nil)
+        }
     }
     private var mediaArtifacts: [AIAgentMediaArtifact] {
-        message.parts.compactMap(mediaArtifact)
+        var result: [AIAgentMediaArtifact] = []
+        var imageIndexes: [String: Int] = [:]
+        for part in message.parts {
+            guard let artifact = mediaArtifact(for: part) else { continue }
+            if artifact.type == "image" {
+                // A model may explicitly deliver the photo after capture. Keep
+                // one canonical image card and prefer that delivery's caption.
+                if let index = imageIndexes[artifact.filePath] {
+                    if part.tool == "agent_send_media" { result[index] = artifact }
+                    continue
+                }
+                imageIndexes[artifact.filePath] = result.count
+            }
+            result.append(artifact)
+        }
+        return result
     }
     private var textMediaMentions: [AIAssistantMediaMention] {
         guard message.role != "assistant" || (!message.active && message.completed > 0) else {
@@ -2000,6 +2019,14 @@ struct AIMessageRow: View, Equatable {
         }
     }
     private func mediaArtifact(for part: AIPart) -> AIAgentMediaArtifact? {
+        if part.kind == "tool",
+           let fileURL = AIAssistantPhotoArtifactPolicy.photoURL(
+            tool: part.tool, state: part.state, output: part.output, workspacePath: workspacePath) {
+            // The camera result already exists on disk. Rendering this card does
+            // not attach image bytes to the model or automatically open fullscreen.
+            return AIAgentMediaArtifact(id: part.id, filePath: fileURL.path, type: "image",
+                caption: "", sourceTaskID: nil, sourceTool: nil, outputJSON: part.output ?? "")
+        }
         guard part.kind == "tool", part.tool == "agent_send_media",
               part.state == "completed",
               let output = part.output?.data(using: .utf8),

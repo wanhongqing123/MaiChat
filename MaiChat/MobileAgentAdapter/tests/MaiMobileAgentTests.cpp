@@ -84,6 +84,166 @@ static void releaseHostToolContext(void* context) {
     static_cast<HostToolProbe*>(context)->released = true;
 }
 
+struct BrowserToolProbe {
+    int calls = 0;
+    bool released = false;
+    bool rejectObservedURL = false;
+    Json arguments;
+};
+
+static const char* browserToolHandler(void* context, const char* tool, const char* arguments) {
+    auto& probe = *static_cast<BrowserToolProbe*>(context);
+    CHECK(tool && std::strcmp(tool, "mobile_browser") == 0);
+    probe.arguments = Json::parse(arguments);
+    ++probe.calls;
+    Json response;
+    if (probe.rejectObservedURL) {
+        response = {{"ok", false},
+                    {"errorCode", "invalid_input"},
+                    {"error", "the observed URL no longer matches the current browser page"}};
+    } else {
+        if (probe.arguments.at("action") == "screenshot") {
+            CHECK(!MaiFileSystem::writeFile(MaiFilePath::fromUtf8(probe.arguments.at("output_path").get<std::string>()),
+                                            std::string("\x89PNG\r\n\x1a\n", 8))
+                       .hasError());
+        }
+        response = {{"ok", true}, {"output", {{"action", probe.arguments.at("action")}}}};
+    }
+    const std::string bytes = response.dump();
+    auto* owned = static_cast<char*>(std::malloc(bytes.size() + 1));
+    CHECK(owned != nullptr);
+    std::memcpy(owned, bytes.c_str(), bytes.size() + 1);
+    return owned;
+}
+
+static void releaseBrowserToolContext(void* context) {
+    static_cast<BrowserToolProbe*>(context)->released = true;
+}
+
+// The fake host records the ordinary flat API and produces only a temporary PNG.
+// It never opens a browser; URL freshness errors still come from the host boundary.
+static void browserContract() {
+    struct Workspace {
+        MaiFilePath path = MaiFileSystem::temporaryDirectory().append(
+            MaiFilePath::fromUtf8("mai-mobile-browser-test-" + MaiIdGenerator::newEventId()));
+        ~Workspace() {
+            MaiFileSystem::removeRecursively(path);
+        }
+    } workspace;
+    CHECK(!MaiFileSystem::createDirectories(workspace.path).hasError());
+    BrowserToolProbe probe;
+    auto dispatcher = makeMaiMobileHostDispatcher();
+    CHECK(setMaiMobileHostToolHandler(dispatcher, &probe, browserToolHandler, freeHostToolResponse,
+                                      releaseBrowserToolContext));
+    MaiToolRegistry registry;
+    registerMobileBrowserTools(registry, dispatcher);
+    MaiTool* browser = registry.findForModel("mobile_browser");
+    CHECK(browser != nullptr);
+    const Json schema = Json::parse(browser->parametersSchema());
+    CHECK(schema.at("required") == Json::array({"request"}) && schema.at("additionalProperties") == false);
+    CHECK(schema.at("properties").size() == 1);
+    const Json variants = schema.at("properties").at("request").at("oneOf");
+    CHECK(variants.size() == 6);
+    for (const Json& variant : variants) {
+        CHECK(variant.at("additionalProperties") == false);
+        const Json& properties = variant.at("properties");
+        const std::string action = properties.at("action").at("enum").at(0);
+        if (action == "open") {
+            CHECK(variant.at("required") == Json::array({"action", "url"}));
+            CHECK(!properties.contains("wait_ms"));
+        } else if (action == "screenshot") {
+            CHECK(variant.at("required") == Json::array({"action", "expected_url"}));
+        } else if (action != "observe") {
+            CHECK(!properties.contains("wait_ms"));
+        }
+    }
+    for (const char* action : {"open", "screenshot", "click", "type"}) {
+        const std::string request = Json{{"request", {{"action", action}}}}.dump();
+        CHECK(browser->requiresApproval(request) && browser->requiresPerCallApproval(request));
+    }
+    CHECK(!browser->requiresApproval(R"({"request":{"action":"observe"}})"));
+    CHECK(!browser->requiresPerCallApproval(R"({"request":{"action":"close"}})"));
+    CHECK(browser->requiresPerCallApproval(R"({"action":"observe"})"));
+    MaiToolContext context;
+    context.root = workspace.path.toUtf8();
+    context.sessionId = "ses_browser";
+    context.messageId = "msg_browser_open";
+    context.partId = "part_browser_open";
+    std::atomic<bool> canceled{false};
+    context.cancel = &canceled;
+    for (
+        const char* invalid :
+        {R"({"action":"open","url":"https://example.com"})",
+         R"({"request":{"action":"open","url":"https://example.com"},"session_id":"forged"})",
+         R"({"request":{"action":"open","url":"https://example.com","wait_ms":5000}})",
+         R"({"request":{"action":"open","url":"file:///private/test"}})",
+         R"({"request":{"action":"open","url":"https://user:password@example.com"}})",
+         R"({"request":{"action":"open","url":"https://example.com","message_id":"forged"}})",
+         R"({"request":{"action":"screenshot"}})",
+         R"({"request":{"action":"click","snapshot_id":"s","element_id":"e","expected_label":"go"}})",
+         R"({"request":{"action":"type","snapshot_id":"s","element_id":"e","expected_label":"go","expected_url":"https://example.com"}})",
+         R"({"request":{"action":"close","expected_url":"https://example.com"}})",
+         R"({"request":{"action":"observe","wait_ms":10001}})"}) {
+        const auto rejected = browser->execute(invalid, context);
+        CHECK(rejected.hasError() && rejected.error().code() == MaiErrorCode::InvalidInput);
+    }
+    CHECK(probe.calls == 0);
+    CHECK(!browser->execute(R"({"request":{"action":"open","url":"https://example.com"}})", context).hasError());
+    CHECK(probe.arguments == Json({{"action", "open"},
+                                   {"url", "https://example.com"},
+                                   {"session_id", context.sessionId},
+                                   {"message_id", context.messageId},
+                                   {"part_id", context.partId}}));
+#if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    CHECK(!browser->execute(R"({"request":{"action":"observe","wait_ms":5000}})", context).hasError());
+    CHECK(probe.arguments == Json({{"action", "observe"}, {"wait_ms", 5000}, {"session_id", context.sessionId}}));
+#else
+    CHECK(browser->execute(R"({"request":{"action":"observe","wait_ms":5000}})", context).hasError());
+    CHECK(!browser->execute(R"({"request":{"action":"observe"}})", context).hasError());
+#endif
+    const Json target{{"action", "click"},
+                      {"snapshot_id", "snapshot-current"},
+                      {"element_id", "element-current"},
+                      {"expected_label", "Continue"},
+                      {"expected_url", "https://example.com/current"}};
+    CHECK(!browser->execute(Json{{"request", target}}.dump(), context).hasError());
+    CHECK(probe.arguments.at("expected_url") == target.at("expected_url") &&
+          probe.arguments.at("session_id") == context.sessionId && !probe.arguments.contains("request"));
+    Json typing = target;
+    typing["action"] = "type";
+    typing["text"] = "";
+    CHECK(!browser->execute(Json{{"request", typing}}.dump(), context).hasError());
+    CHECK(probe.arguments.at("text") == "");
+    typing["text"] = std::string(4001, 'x');
+    CHECK(browser->execute(Json{{"request", typing}}.dump(), context).hasError());
+    const auto screenshot = browser->execute(
+        R"({"request":{"action":"screenshot","expected_url":"https://example.com/current"}})", context);
+    CHECK(!screenshot.hasError() && screenshot.images().size() == 1);
+    CHECK(probe.arguments.at("expected_url") == target.at("expected_url") &&
+          probe.arguments.at("session_id") == context.sessionId && probe.arguments.contains("output_path"));
+    CHECK(MaiFileSystem::exists(MaiFilePath::fromUtf8(screenshot.images().at(0).path)));
+    CHECK(!browser->execute(R"({"request":{"action":"close"}})", context).hasError());
+    const int validCalls = probe.calls;
+    canceled.store(true);
+    const auto canceledResult = browser->execute(R"({"request":{"action":"observe"}})", context);
+    CHECK(canceledResult.hasError() && canceledResult.error().code() == MaiErrorCode::Canceled);
+    canceled.store(false);
+    context.sessionId.clear();
+    CHECK(browser->execute(R"({"request":{"action":"observe"}})", context).hasError());
+    context.sessionId = "ses_browser";
+    context.root.clear();
+    CHECK(browser->execute(R"({"request":{"action":"observe"}})", context).hasError());
+    CHECK(probe.calls == validCalls);
+    context.root = workspace.path.toUtf8();
+    probe.rejectObservedURL = true;
+    const auto staleURL = browser->execute(Json{{"request", target}}.dump(), context);
+    CHECK(staleURL.hasError() && staleURL.error().code() == MaiErrorCode::InvalidInput);
+    CHECK(staleURL.error().message().find("observed URL") != std::string::npos);
+    clearMaiMobileHostToolHandler(dispatcher);
+    CHECK(probe.released);
+    std::puts("PASS: browser action schema, approval, trusted context, URL guards and flat host dispatch");
+}
+
 // Exercise the actual registered tools without invoking camera hardware. Opening
 // an archived image must never dispatch a camera preview or a manual capture.
 static void cameraRoutingContract() {
@@ -592,33 +752,54 @@ static void captureContract() {
     archive({{"action", "finish"}, {"batch_id", batch}, {"reason", "user_stopped"}});
     auto* frames = registry.findForModel("mobile_screen_frames");
     CHECK(frames != nullptr);
-    const auto listed = frames->execute(Json{{"action", "list"}, {"batch_id", batch}}.dump(), context);
+    const Json frameSchema = Json::parse(frames->parametersSchema());
+    CHECK(frameSchema.at("required") == Json::array({"request"}) && frameSchema.at("additionalProperties") == false);
+    CHECK(frameSchema.at("properties").at("request").at("oneOf").size() == 3);
+    const int callsBeforeInvalidFrames = probe.calls.load();
+    for (const char* invalid :
+         {R"({"action":"open"})", R"({"request":{"action":"open"}})", R"({"request":{"action":"delete_batch"}})",
+          R"({"request":{"action":"list","frame_id":"f"}})", R"({"request":{"action":"list","session_id":"forged"}})",
+          R"({"request":{"action":"list"},"batch_id":"forged"})"}) {
+        const auto rejected = frames->execute(invalid, context);
+        CHECK(rejected.hasError() && rejected.error().code() == MaiErrorCode::InvalidInput);
+    }
+    context.sessionId.clear();
+    const auto missingOwner = frames->execute(R"({"request":{"action":"list"}})", context);
+    CHECK(missingOwner.hasError() && missingOwner.error().code() == MaiErrorCode::NotConfigured);
+    context.sessionId = "capture-contract-owner";
+    CHECK(probe.calls.load() == callsBeforeInvalidFrames);
+    CHECK(!frames->requiresApproval(R"({"request":{"action":"list"}})"));
+    const auto listed = frames->execute(Json{{"request", {{"action", "list"}, {"batch_id", batch}}}}.dump(), context);
     CHECK(!listed.hasError() && listed.images().empty());
     const Json listing = Json::parse(listed.output());
     CHECK(listing.at("frames").size() == 1);
     CHECK(listing.at("batches").at(0).at("status") == "stopped");
     const std::string id = listing.at("frames").at(0).at("id").get<std::string>();
     probe.expectedTool = "mobile_retain_screen_frame";
-    const auto opened = frames->execute(Json{{"action", "open"}, {"batch_id", batch},
-                                             {"frame_id", id}}.dump(), context);
+    const auto opened =
+        frames->execute(Json{{"request", {{"action", "open"}, {"batch_id", batch}, {"frame_id", id}}}}.dump(), context);
     CHECK(!opened.hasError() && opened.images().size() == 1);
+    CHECK(probe.arguments == Json({{"workspace_path", context.root},
+                                   {"session_id", context.sessionId},
+                                   {"batch_id", batch},
+                                   {"frame_id", id}}));
     const auto openedPath = workspace.path.append(MaiFilePath::fromUtf8(opened.images()[0].path));
     CHECK(MaiFileSystem::exists(openedPath));
     CHECK(opened.images()[0].path == listing.at("frames").at(0).at("path").get<std::string>());
     probe.cancelOnReturn = true;
-    auto canceledSelection = frames->execute(Json{{"action", "open"}, {"batch_id", batch},
-                                                  {"frame_id", id}}.dump(), context);
+    auto canceledSelection =
+        frames->execute(Json{{"request", {{"action", "open"}, {"batch_id", batch}, {"frame_id", id}}}}.dump(), context);
     CHECK(canceledSelection.hasError() && canceledSelection.error().code() == MaiErrorCode::Canceled);
     cancel.store(false);
     probe.cancelOnReturn = false;
     CHECK(archive({{"action", "release"}, {"batch_id", batch}, {"frame_id", id},
                    {"reference_id", probe.referenceID}}).at("released") == false);
     context.sessionId = "another-session";
-    auto rejected = frames->execute(Json{{"action", "open"}, {"batch_id", batch},
-                                         {"frame_id", id}}.dump(), context);
+    auto rejected =
+        frames->execute(Json{{"request", {{"action", "open"}, {"batch_id", batch}, {"frame_id", id}}}}.dump(), context);
     CHECK(rejected.hasError() && rejected.error().code() == MaiErrorCode::NotFound);
     context.sessionId = "capture-contract-owner";
-    const Json discard{{"action", "delete_batch"}, {"batch_id", batch}};
+    const Json discard{{"request", {{"action", "delete_batch"}, {"batch_id", batch}}}};
     CHECK(frames->requiresApproval(discard.dump()));
     CHECK(!frames->execute(discard.dump(), context).hasError());
     CHECK(MaiFileSystem::exists(retained));
@@ -645,6 +826,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
+        browserContract();
         cameraRoutingContract();
 #if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)
         cameraArchiveContract();
@@ -1019,36 +1201,6 @@ int main(int argc, char** argv) {
         MaiFilePath::fromUtf8("mai-mobile-test-" + MaiIdGenerator::newEventId()));
     CHECK(!MaiFileSystem::createDirectories(testRoot).hasError());
     const std::string directory = testRoot.toUtf8();
-    HostToolProbe browserProbe;
-    auto browserDispatcher = makeMaiMobileHostDispatcher();
-    CHECK(setMaiMobileHostToolHandler(browserDispatcher, &browserProbe,
-        hostToolHandler, freeHostToolResponse, releaseHostToolContext));
-    MaiToolRegistry browserRegistry;
-    registerMobileBrowserTools(browserRegistry, browserDispatcher);
-    MaiTool* browser = browserRegistry.findForModel("mobile_browser");
-    CHECK(browser != nullptr);
-    CHECK(browser->requiresPerCallApproval(R"({"action":"open"})"));
-    CHECK(browser->requiresPerCallApproval(R"({"action":"click"})"));
-    CHECK(browser->requiresPerCallApproval(R"({"action":"screenshot"})"));
-    CHECK(!browser->requiresApproval(R"({"action":"observe"})"));
-    MaiToolContext browserContext;
-    browserContext.sessionId = "ses_browser";
-    browserContext.root = directory;
-    browserContext.messageId = "msg_browser_open";
-    browserContext.partId = "part_browser_open";
-    CHECK(browser->execute(R"({"action":"open","url":"file:///private/test"})",
-                           browserContext).hasError());
-    CHECK(browserProbe.calls.load() == 0);
-    CHECK(!browser->execute(R"({"action":"open","url":"https://example.com"})",
-                            browserContext).hasError());
-    CHECK(browserProbe.lastTool == "mobile_browser" &&
-          Json::parse(browserProbe.lastArguments)["session_id"] == "ses_browser");
-    CHECK(Json::parse(browserProbe.lastArguments)["message_id"] == "msg_browser_open");
-    CHECK(Json::parse(browserProbe.lastArguments)["part_id"] == "part_browser_open");
-    CHECK(browser->execute(R"({"action":"open","url":"https://example.com","message_id":"forged"})",
-                           browserContext).hasError());
-    clearMaiMobileHostToolHandler(browserDispatcher);
-    CHECK(browserProbe.released.load());
     void* agent = maiMobileAgentCreate();
     int fakeOrtApi = 0;
     HostToolProbe hostProbe;

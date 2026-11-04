@@ -64,3 +64,41 @@ Android 2.2.23/260 已在自有 emulator-5580 安装、冷启动，PID5737；两
 各平台和完整宿主测试目录已写入 `final-source-binding.json`。中央绑定位于
 `/private/tmp/maichat-camera-platform260243-20261104-bhk9fze9/final-source-binding.json`，
 SHA-256 为 `687472d53a25acaa50a911c7e5b4855669be936413fe24c2e10bf5952ccfb4a4`。
+
+## 后续实机安装与有限 QA（同日）
+
+上文“186 尚未安装”描述的是最初 CoreDevice 4016 尝试，作为历史失败保留。设备恢复连接后，
+[重试安装回执](/private/tmp/maichat-camera186-device-install-retry-20261104.json)为 `success`，
+[实际安装信息](/private/tmp/maichat-camera186-device-appinfo-20261104.json)读回正常包
+`com.kongshang.maichat`、版本 **2.2.4/186**。安装的是上述冻结 App，未把后续 187 候选源码
+改动算入 186。
+
+实机独立探针第二次启动使用 run ID `1F669696-C3D9-455C-9B64-57E2A6E4E8D2`，
+[启动回执](/private/tmp/maichat-camera186-device-qa-20261104/launch-attempt2.json)对应 PID27861；
+[最终报告 report-4](/private/tmp/maichat-camera186-device-qa-20261104/report-4.json)为
+`stage=finished/status=passed`，总耗时 **160.324s**。旧 attempt1 的 run ID 与中间报告保留，
+不能混为同一轮完成结果。最终报告 SHA256 为
+`dcdf3db63466e0d1efcc74e2f8bebd299885bd63525fc6797b5b9d397d6ffe85`。
+
+| 实际设备验证 | 结果与边界 |
+| --- | --- |
+| 随包模型与 GPU | 模型复制后校验通过，SHA 与冻结包一致；两轮实际推理均选择 `MTL`，设备为 Apple A16 GPU，`gpu_model_bytes=1320574208`（约 1.32 GB）；这是模型 GPU 字节数，不是进程峰值内存 |
+| 两轮文本调用 | 均返回非空文本、无错误、0 工具调用，原生耗时 15.211s / 9.559s |
+| 已知重复答复历史后的新闻 | 实际选择 `web_search({"query":"今天新闻","count":5,"need_content":true})`，32.375s |
+| 无历史新闻 | 实际选择同一检索参数，32.809s |
+| 打开相机拍照 | 实际选择 `mobile_take_photo({})`，41.055s |
+
+该报告读回实际声明的 **129 个不重复工具名**，包括 `mobile_take_photo`；配置使用正式的
+屏幕支持判定及同样的可选注册条件。五项结果证明本轮文本推理和三个指定输入的工具选择通过，
+不能外推为全部工具质量保证。报告明确 `host_handler_installed=false`、`tools_executed=false`、
+`agent_loop_exercised=false`：没有执行相机、DeepSeek 检索或完整 Agent 工具循环。它使用独立
+内存数据库，不读取或写入用户会话，不请求云凭据；临时模型资源及自有句柄均已释放。
+
+探针完成后，[无探针参数的正常启动](/private/tmp/maichat-camera186-device-normal-launch-20261104.json)
+成功，PID 为 **27865**；[进程读回](/private/tmp/maichat-camera186-device-normal-processes-20261104.json)
+核对为同一已安装 Bundle 路径。此前 4016 的安装状态已被这些后续回执更新，但没有因此签收
+开发者亲自完成的实机手动传感器拍摄。
+
+随后用户报告：186 正常会话中的 `mobile_take_photo` 已成功，但聊天只显示路径文本；再次请求
+“看下拍摄照片”时 `view_image` 标为完成，却没有图片或最终正文。用户截图中的拍摄成功是单独的
+用户现场证据，不替代我们的传感器 QA；本条也不宣称照片卡片或本地模型视觉能力问题已修复。

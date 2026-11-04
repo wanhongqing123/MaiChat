@@ -27,6 +27,21 @@ extension AIAssistantModel {
 
 #if targetEnvironment(simulator)
 extension AIAssistantModel {
+    /// The host receipt comes from the real manual-photo execution. Round-trip
+    /// the persisted part representation so a restored result uses the same row.
+    @discardableResult
+    func installManualPhotoToolReceiptForUITesting(_ output: String, in sessionID: String) -> Bool {
+        guard AICameraUITestSupport.isManualToolRequested, selected == sessionID else { return false }
+        let part = AIPart(id: "manual-photo-result-part", kind: "tool", tool: "mobile_take_photo",
+                          input: "{}", output: output, state: "completed")
+        let completed = AIMessage(id: "manual-photo-result-message", role: "assistant", created: 1,
+                                  completed: 2, active: false, parts: [part])
+        guard let data = try? JSONEncoder().encode(completed),
+              let restored = try? JSONDecoder().decode(AIMessage.self, from: data) else { return false }
+        applyUITestMutation(.selectedHistory(sessionID, [restored]))
+        return restored == completed
+    }
+
     func installSteeringUITestFixture(
         handler: @escaping (AISteeringRequest) async throws -> String
     ) {

@@ -34,7 +34,8 @@ struct MaiWebRetrievalError {
 };
 
 // query/oriQuestion 最多128个Unicode字符；query原样发送，保留site/lang/日期等操作符。
-// localization 是可选IP，不自动读取或上送设备IP；needContent默认关闭以控制正文大小。
+// localization 只接受用户已提供的 IPv4/IPv6，不是语言或地区代码；未知时留空，不能猜造或查 IP。
+// 不自动读取或上送设备 IP；needContent 默认关闭以控制正文大小。
 struct MaiWebSearchRequest {
     std::string query;
     unsigned count = 10;

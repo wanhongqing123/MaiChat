@@ -1,6 +1,56 @@
 import XCTest
 
 final class ScreenFrameArchiveUITests: XCTestCase {
+    /// A real completed host receipt becomes an inline card immediately. Loading
+    /// the same persisted part must not launch a viewer or pollute the draft.
+    @MainActor
+    func testManualPhotoResultShowsInlineAndRestoredHistoryOnlyOpensOnTap() async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        let app = launchManualCameraToolFixture()
+        defer { app.terminate() }
+        XCTAssertFalse(app.buttons["agent-image-bubble"].exists)
+        app.buttons["ai-manual-camera-tool-open"].tap()
+        let shutter = app.buttons["ai-manual-camera-shutter"]
+        XCTAssertTrue(shutter.waitForExistence(timeout: 8))
+        XCTAssertFalse(app.buttons["agent-image-bubble"].exists)
+        shutter.tap()
+        assertManualToolState(app, result: "succeeded", files: 1, pending: false, verified: true)
+        assertManualToolDidNotAttachToComposer(app)
+
+        let bubble = app.buttons["agent-image-bubble"].firstMatch
+        XCTAssertTrue(bubble.waitForExistence(timeout: 8), "拍照回执必须直接显示缩略图，不依赖模型再调用工具")
+        XCTAssertEqual(app.buttons.matching(identifier: "agent-image-bubble").count, 1)
+        XCTAssertFalse(app.images["agent-image-preview"].exists, "完成拍照不能自动打开全屏")
+        let inline = XCTAttachment(screenshot: app.screenshot())
+        inline.name = "manual-photo-completed-receipt-inline-card"
+        inline.lifetime = .keepAlways
+        add(inline)
+
+        app.buttons["ai-manual-camera-tool-restore"].tap()
+        XCTAssertTrue(bubble.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.images["agent-image-preview"].exists, "历史回执重载也不能自动打开全屏")
+        try await Task.sleep(for: .milliseconds(500))
+        bubble.tap()
+        let preview = app.images["agent-image-preview"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 8))
+        let expanded = XCTAttachment(screenshot: app.screenshot())
+        expanded.name = "manual-photo-result-viewer-after-explicit-tap"
+        expanded.lifetime = .keepAlways
+        add(expanded)
+        preview.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: preview)], timeout: 8), .completed)
+        XCTAssertTrue(bubble.isHittable)
+        assertManualToolDidNotAttachToComposer(app)
+        let returned = XCTAttachment(screenshot: app.screenshot())
+        returned.name = "manual-photo-result-returned-to-inline-card"
+        returned.lifetime = .keepAlways
+        add(returned)
+        #else
+        throw XCTSkip("仅 Debug 模拟器使用独立工作区与合成手动快门")
+        #endif
+    }
+
     /// 真正调用 mobile_take_photo；超过采样间隔仍等待快门，返回单张文件而不改 composer。
     @MainActor
     func testManualCameraToolWaitsForShutterAndReturnsExactlyOnePhoto() async throws {

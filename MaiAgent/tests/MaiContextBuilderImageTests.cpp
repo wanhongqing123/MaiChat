@@ -62,7 +62,8 @@ void testCurrentRequestKeepsOnlyRecentToolPixels() {
         CHECK(images[index + 1] == "frame-" + std::to_string(index + 31) + ".jpg");
     CHECK(request.front().role == MaiModelRole::System);
     CHECK(request.front().content.find("Omitted 35 older image observations") != std::string::npos);
-    CHECK(request.front().content.find("view_image") != std::string::npos);
+    CHECK(request.front().content.find("view_image") == std::string::npos);
+    CHECK(request.front().content.find("Do not infer their visual contents") != std::string::npos);
     CHECK(request[2].content.find("Analyze this video") != std::string::npos);
     CHECK(request[2].content.find("current-user.jpg") != std::string::npos);
     CHECK(request.back().images.front().path == "frame-38.jpg");
@@ -76,6 +77,38 @@ void testSmallCurrentRequestKeepsEveryImage() {
     for (const auto& message : request) imageCount += static_cast<int>(message.images.size());
     CHECK(imageCount == 4);
     CHECK(request.back().images.front().path == "frame-3.jpg");
+}
+
+void testNewUserTurnKeepsOldImageReceiptWithoutReinjectingPixels() {
+    MaiMessage assistant;
+    assistant.role = MaiRole::Assistant;
+    MaiToolPart viewed;
+    viewed.tool = "view_image";
+    viewed.callId = "call_old_photo";
+    viewed.input = R"({"path":"camera/photo.jpg"})";
+    viewed.output = "Loaded the image from camera/photo.jpg.";
+    viewed.state = MaiToolState::Completed;
+    MaiMessagePart receipt;
+    receipt.body = viewed;
+    assistant.parts.push_back(receipt);
+    MaiMessagePart pixels;
+    pixels.body = MaiImagePart{"camera/photo.jpg", "image/jpeg"};
+    assistant.parts.push_back(pixels);
+    const std::vector<MaiMessage> history = {userMessage("Inspect the photo", {}), assistant,
+                                             userMessage("Show that photo to me", {})};
+    const auto request = MaiContextBuilder().build(history);
+    bool keptReceipt = false;
+    bool keptCall = false;
+    for (const auto& message : request) {
+        CHECK(message.images.empty());
+        for (const auto& call : message.invocations)
+            keptCall |= call.id == viewed.callId && call.arguments == viewed.input;
+        keptReceipt |= message.role == MaiModelRole::ToolResult &&
+                       message.toolCallId == viewed.callId && message.content == viewed.output;
+    }
+    CHECK(keptCall && keptReceipt);
+    CHECK(std::get<MaiToolPart>(history[1].parts[0].body).state == MaiToolState::Completed);
+    CHECK(std::get<MaiImagePart>(history[1].parts[1].body).path == "camera/photo.jpg");
 }
 
 void testVideoAttachmentUsesAFileReferenceInsteadOfImagePixels() {
@@ -245,6 +278,7 @@ void testStoredReasoningDoesNotEnterDefaultHistory() {
 int main() {
     testCurrentRequestKeepsOnlyRecentToolPixels();
     testSmallCurrentRequestKeepsEveryImage();
+    testNewUserTurnKeepsOldImageReceiptWithoutReinjectingPixels();
     testVideoAttachmentUsesAFileReferenceInsteadOfImagePixels();
     testCurrentImagesHaveExactPathAndAttachmentIdentity();
     testRecentPreviousImagePathsRemainAvailableWithoutOldPixels();

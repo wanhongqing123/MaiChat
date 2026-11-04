@@ -876,9 +876,13 @@ struct MaiMobileAgent {
         };
         options.baseInstructions = kMarkdownBaseInstructions;
         if (isLocal) {
+            // 当前本地主模型未加载视觉投影器；展示工具产物和向模型送入图片是两种能力。
+            // 明确边界，不能把成功拍照或界面显示误称为已经理解了照片内容。
             options.baseInstructions +=
                 "\nYour primary model runs locally in this App through in-process GGUF inference. "
                 "Use the same registered tools and approval rules as other primary models. "
+                "This local configuration accepts text only and cannot analyze image contents. "
+                "Displaying an image to the user does not mean you have visually inspected it. "
                 "Do not claim that your text responses came from a cloud model.";
         }
         // 内置模型路径由原生宿主复制/校验后提供，只允许当前App容器中的现有文件。
@@ -904,7 +908,8 @@ struct MaiMobileAgent {
             options.approvalPolicy = MaiApprovalPolicy::UnlessTrusted;
         else if (policy != "on-request")
             throw std::runtime_error("Unknown approval policy.");
-        const auto nextProbeTools = tools->specs();
+        // QA 与正式 Agent 必须使用相同的模型能力过滤，不能用更宽的工具清单验收本地模型。
+        const auto nextProbeTools = tools->specs(options.defaultModel);
         const auto nextProbeInstructions = options.baseInstructions;
         auto replacement =
             std::make_unique<MaiAgent>(std::move(store.value()), nextModelClientFactory(), std::move(tools), options);

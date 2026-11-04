@@ -91,6 +91,8 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
         var handle: UnsafeMutableRawPointer?
         var retainedTemporary = false
         var ownedGeneration: UInt64?
+        // 能力过滤使用正式 local: 标识；独立 QA 不能以另一个名字声明更宽的工具目录。
+        let primaryModel = "local:" + AILocalModelStore.bundledPrimaryID
         do {
             try publish(stage: "configuring_real_local_client")
             guard let created = maiMobileAgentCreate() else { throw ProbeFailure("native_create_failed") }
@@ -99,7 +101,7 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
             try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: false)
             _ = try request(created, ["op": "configure", "database": ":memory:", "workspace": workspace.path,
                 "appRoot": temporary.path, "modelProvider": "llama", "wire": "local",
-                "model": "local-device-probe-qwen3.5", "localModelPath": model.path,
+                "model": primaryModel, "localModelPath": model.path,
                 "localProjectorPath": "", "localContextSize": 32768, "localMaximumTokens": 0,
                 "localThreads": 2, "policy": "on-request",
                 "supportsScreenCapture": aiSupportsWholeDeviceScreenCapture(),
@@ -146,7 +148,7 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
                     metrics["native_total_seconds"] = total.doubleValue / 1000
                 }
                 let passed = success && toolCalls == 0 && !(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) &&
-                    output["wire"] as? String == "local" && output["model"] as? String == "local-device-probe-qwen3.5" &&
+                    output["wire"] as? String == "local" && output["model"] as? String == primaryModel &&
                     output["localGpuSelected"] as? Bool == true &&
                     ((output["localGpuModelBytes"] as? NSNumber)?.uint64Value ?? 0) > 0 &&
                     (output["error"] as? String ?? "").isEmpty

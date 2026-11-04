@@ -45,6 +45,28 @@ public enum AIAssistantPathPolicy {
     }
 }
 
+/// A completed manual capture is display metadata, not image input for a model.
+/// Resolve it from the persisted tool receipt so both live and restored messages
+/// show the same thumbnail without opening a viewer or changing the composer.
+public enum AIAssistantPhotoArtifactPolicy {
+    public static func photoURL(tool: String?, state: String?, output: String?,
+                                workspacePath: String) -> URL? {
+        guard tool == "mobile_take_photo", state == "completed",
+              let output, output.utf8.count <= 100_000,
+              let data = output.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              object["mime_type"] as? String == "image/jpeg",
+              let path = object["path"] as? String,
+              !path.isEmpty, !(path as NSString).isAbsolutePath,
+              ["jpg", "jpeg"].contains((path as NSString).pathExtension.lowercased())
+        else { return nil }
+        // Capture receipts belong to this workspace. The broader App-container
+        // policy used by imported media must not admit a sibling or symlink escape.
+        return AIAssistantPathPolicy.resolve(path, workspacePath: workspacePath,
+                                             appRootPath: workspacePath)
+    }
+}
+
 public struct AIAssistantMediaMention: Hashable, Identifiable {
     public enum Kind: Hashable { case video, audio }
 

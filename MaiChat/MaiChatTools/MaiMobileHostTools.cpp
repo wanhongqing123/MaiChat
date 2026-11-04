@@ -179,6 +179,7 @@ public:
     std::string name() const override { return "mobile_screen_frames"; }
     std::string description() const override {
         return "List screenshots saved automatically every 2 seconds during iOS screen sharing. "
+               "Pass a request object, for example {\"request\":{\"action\":\"list\"}}. "
                "After sharing stops, list the batch and ask which numbered/timestamped images the "
                "user needs. Listing returns metadata without sending all images to the model. "
                "Open only the requested frame with batch_id and frame_id from that list. "
@@ -187,18 +188,49 @@ public:
                "This tool does not start or restart sharing, and stopped batches remain available.";
     }
     std::string parametersSchema() const override {
-        return R"({"type":"object","properties":{"action":{"type":"string","enum":["list","open","delete_batch"]},)"
-               R"("batch_id":{"type":"string","minLength":1,"maxLength":100},)"
-               R"("frame_id":{"type":"string","minLength":1,"maxLength":100}},"required":["action"],"additionalProperties":false})";
+        // XML tool grammars enumerate root properties. A JSON-valued request
+        // keeps action-specific required IDs inside complete schema alternatives.
+        const Json identifier{{"type", "string"}, {"minLength", 1}, {"maxLength", 100}};
+        const auto variant = [&](const char* action, bool batchRequired, bool frameRequired) {
+            Json properties{{"action", {{"type", "string"}, {"enum", Json::array({action})}}},
+                            {"batch_id", identifier}};
+            Json required = Json::array({"action"});
+            if (batchRequired) required.push_back("batch_id");
+            if (frameRequired) {
+                properties["frame_id"] = identifier;
+                required.push_back("frame_id");
+            }
+            return Json{{"type", "object"},
+                        {"properties", properties},
+                        {"required", required},
+                        {"additionalProperties", false}};
+        };
+        const Json request{{"type", "object"},
+                           {"oneOf", Json::array({variant("list", false, false), variant("open", true, true),
+                                                  variant("delete_batch", true, false)})}};
+        return Json{{"type", "object"},
+                    {"properties", {{"request", request}}},
+                    {"required", Json::array({"request"})},
+                    {"additionalProperties", false}}
+            .dump();
     }
     bool requiresApproval(const std::string& arguments) const override {
         const Json parsed = Json::parse(arguments, nullptr, false);
-        return parsed.is_object() && parsed.value("action", Json{}) == "delete_batch";
+        return parsed.is_object() && parsed.contains("request") && parsed["request"].is_object() &&
+               parsed["request"].value("action", Json{}) == "delete_batch";
     }
     MaiToolResult execute(const std::string& argumentsJson,
                           const MaiToolContext& context) override {
-        Json args = Json::parse(argumentsJson, nullptr, false);
-        if (!args.is_object() || !args.contains("action") || !args["action"].is_string())
+        const Json envelope = Json::parse(argumentsJson, nullptr, false);
+        if (!envelope.is_object() || envelope.size() != 1 || !envelope.contains("request") ||
+            !envelope["request"].is_object())
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "mobile_screen_frames expects only a request object, for example {\"request\":{\"action\":\"list\"}}");
+        // The archive's ordinary API remains flat; the model cannot supply its
+        // workspace or Session owner through either level of the tool envelope.
+        Json args = envelope["request"];
+        if (!args.contains("action") || !args["action"].is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "a screen frame action is required");
         for (auto field = args.begin(); field != args.end(); ++field) {
             if (field.key() != "action" && field.key() != "batch_id" && field.key() != "frame_id")
@@ -596,6 +628,7 @@ public:
         // 网页属于当前会话，由宿主控制任务入口与展示。操作前读取快照，操作后再次读取验证，
         // 密码由用户手动输入；不能控制 MaiChat 外的浏览器。
         return "Control one browser page owned by the current MaiChat Agent Session. "
+               "Pass a request object, for example {\"request\":{\"action\":\"observe\"}}. "
                "Prefer curl with text_only=true for ordinary web reading. Use this browser "
                "when JavaScript rendering, page interaction or screenshots are needed. "
                "open starts an in-app page; the host controls its presentation. "
@@ -619,25 +652,60 @@ public:
                "other apps outside MaiChat.";
     }
     std::string parametersSchema() const override {
-        return R"({"type":"object","properties":{)"
-               R"("action":{"type":"string","enum":["open","observe","screenshot","click","type","close"]},)"
-               R"("url":{"type":"string","maxLength":2048},)"
-               R"("expected_url":{"type":"string","maxLength":2048},)"
-               R"("snapshot_id":{"type":"string"},"element_id":{"type":"string"},)"
-               R"("expected_label":{"type":"string"},)"
-               R"("text":{"type":"string","maxLength":4000})"
+        // Root-level oneOf loses parameters in XML tool grammars. The request
+        // value holds complete branches matching the existing native action gate.
+        const Json url{{"type", "string"},
+                       {"minLength", 1},
+                       {"maxLength", 2048},
+                       {"description", "One HTTP(S) URL without embedded credentials."}};
+        const Json observedURL{{"type", "string"},
+                               {"minLength", 1},
+                               {"maxLength", 2048},
+                               {"description", "The exact URL returned by the current observe snapshot."}};
+        const Json target{{"type", "string"}, {"minLength", 1}, {"maxLength", 200}};
+        const auto variant = [](const char* action, Json properties, const Json& fields) {
+            properties["action"] = {{"type", "string"}, {"enum", Json::array({action})}};
+            Json required = Json::array({"action"});
+            for (const auto& field : fields) required.push_back(field);
+            return Json{{"type", "object"},
+                        {"properties", properties},
+                        {"required", required},
+                        {"additionalProperties", false}};
+        };
+        Json observe = Json::object();
 #if defined(MAICHAT_MOBILE_IOS)
-               R"(,"wait_ms":{"type":"integer","minimum":0,"maximum":10000})"
+        observe["wait_ms"] = {{"type", "integer"}, {"minimum", 0}, {"maximum", 10000}};
 #endif
-               R"(},)"
-               R"("required":["action"],"additionalProperties":false})";
+        const Json click{
+            {"snapshot_id", target}, {"element_id", target}, {"expected_label", target}, {"expected_url", observedURL}};
+        Json typing = click;
+        typing["text"] = {{"type", "string"}, {"maxLength", 4000}};
+        const Json request{
+            {"type", "object"},
+            {"oneOf",
+             Json::array(
+                 {variant("open", {{"url", url}}, Json::array({"url"})), variant("observe", observe, Json::array()),
+                  variant("screenshot", {{"expected_url", observedURL}}, Json::array({"expected_url"})),
+                  variant("click", click, Json::array({"snapshot_id", "element_id", "expected_label", "expected_url"})),
+                  variant("type", typing,
+                          Json::array({"snapshot_id", "element_id", "expected_label", "expected_url", "text"})),
+                  variant("close", Json::object(), Json::array())})}};
+        return Json{{"type", "object"},
+                    {"properties", {{"request", request}}},
+                    {"required", Json::array({"request"})},
+                    {"additionalProperties", false}}
+            .dump();
     }
     bool requiresApproval(const std::string& raw) const override {
         return requiresPerCallApproval(raw);
     }
     bool requiresPerCallApproval(const std::string& raw) const override {
-        const Json args = Json::parse(raw, nullptr, false);
-        if (!args.is_object() || !args.value("action", Json{}).is_string()) return true;
+        const Json envelope = Json::parse(raw, nullptr, false);
+        if (!envelope.is_object() || envelope.size() != 1 || !envelope.contains("request") ||
+            !envelope["request"].is_object())
+            return true;
+        const Json& args = envelope["request"];
+        if (!args.value("action", Json{}).is_string()) return true;
         const std::string action = args["action"].get<std::string>();
         return action != "observe" && action != "close";
     }
@@ -648,8 +716,16 @@ public:
         if (context.sessionId.empty() || context.root.empty())
             return MaiToolResult::failure(MaiErrorCode::NotConfigured,
                                           "an Agent Session workspace is required for the browser");
-        Json args = Json::parse(raw, nullptr, false);
-        if (!args.is_object() || !args.value("action", Json{}).is_string())
+        const Json envelope = Json::parse(raw, nullptr, false);
+        if (!envelope.is_object() || envelope.size() != 1 || !envelope.contains("request") ||
+            !envelope["request"].is_object())
+            return MaiToolResult::failure(
+                MaiErrorCode::InvalidInput,
+                "mobile_browser expects only a request object, for example {\"request\":{\"action\":\"observe\"}}");
+        // Only the model-facing tool uses an envelope. Native browser handlers
+        // retain flat action arguments plus the real calling Session identity.
+        Json args = envelope["request"];
+        if (!args.value("action", Json{}).is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "browser action is required");
         const std::string action = args["action"].get<std::string>();
         const auto hasOnly = [&args](std::initializer_list<const char*> allowed) {

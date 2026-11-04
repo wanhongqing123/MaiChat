@@ -14,6 +14,7 @@
 #include <json.hpp>
 
 #include "MaiAgent.h"
+#include "MaiContextBuilder.h"
 #include "MaiFileSystem.h"
 #include "MaiFileTools.h"
 #include "MaiIdGenerator.h"
@@ -79,6 +80,92 @@ void test_preflight_without_model_io() {
     config.projectorPath = MaiFilePath::fromUtf8("not-opened.gguf");
     CHECK(makeMaiLlamaModelClient(config)->stream(simpleRequest(), {}, canceled).code() ==
           MaiErrorCode::NotSupported);
+}
+
+void test_system_instruction_utf8_and_separator_budget() {
+    auto client = makeMaiLlamaModelClient({});
+    std::atomic<bool> cancel{false};
+    auto request = simpleRequest();
+    MaiModelMessage note;
+    note.role = MaiModelRole::System;
+    note.content = std::string(1, char(0xff));
+    request.messages.insert(request.messages.begin(), note);
+    CHECK(client->stream(request, {}, cancel).message() ==
+          "Local chat requires bounded UTF-8 messages");
+
+    // 原文恰好 2 MiB 时，合并新增的两个换行也必须计入，不能绕过输入内存边界。
+    request.baseInstructions = std::string(2 * 1024 * 1024 - 2, 'x');
+    request.messages[0].content = "s";
+    request.messages[1].content = "u";
+    CHECK(client->stream(request, {}, cancel).message() ==
+          "Local chat requires bounded UTF-8 messages");
+    request.baseInstructions.resize(2 * 1024 * 1024 - 4);
+    CHECK(client->stream(request, {}, cancel).message() ==
+          "Local inference requires authorized absolute file paths");
+}
+
+void test_real_system_messages_and_old_image_followup(const MaiLlamaModelConfig& config) {
+    auto initial = simpleRequest();
+    initial.messages[0].content = "\u4f60\u597d";
+    MaiModelMessage firstNote;
+    firstNote.role = MaiModelRole::System;
+    firstNote.content = "This is a trusted runtime note. Follow the latest user request.";
+    MaiModelMessage finalNote = firstNote;
+    finalNote.content = "Give the user a concise final response.";
+    MaiModelMessage emptyNote;
+    emptyNote.role = MaiModelRole::System;
+    std::vector<MaiModelRequest> requests{initial};
+    auto leading = initial;
+    leading.messages.insert(leading.messages.begin(), firstNote);
+    leading.messages.insert(leading.messages.begin() + 1, emptyNote);
+    requests.push_back(leading);
+    auto middle = leading;
+    MaiModelMessage previous;
+    previous.role = MaiModelRole::Assistant;
+    previous.content = "Hello.";
+    middle.messages.push_back(previous);
+    middle.messages.push_back(firstNote);
+    middle.messages.push_back(initial.messages[0]);
+    middle.messages.push_back(finalNote);
+    requests.push_back(middle);
+    leading.baseInstructions.clear();
+    requests.push_back(leading);
+
+    MaiMessage user;
+    user.role = MaiRole::User;
+    MaiMessagePart text;
+    text.body = MaiTextPart{"\u770b\u4e0b\u62cd\u6444\u7167\u7247"};
+    user.parts.push_back(text);
+    MaiMessage assistant;
+    assistant.role = MaiRole::Assistant;
+    MaiToolPart viewed;
+    viewed.tool = "view_image";
+    viewed.callId = "call_historical_photo";
+    viewed.input = R"({"path":"own-synthetic-photo.jpg"})";
+    viewed.output = "Loaded the image from own-synthetic-photo.jpg.";
+    viewed.state = MaiToolState::Completed;
+    MaiMessagePart receipt;
+    receipt.body = viewed;
+    assistant.parts.push_back(receipt);
+    MaiMessagePart image;
+    image.body = MaiImagePart{"own-synthetic-photo.jpg", "image/jpeg"};
+    assistant.parts.push_back(image);
+    MaiMessage followup = user;
+    followup.parts[0].body = MaiTextPart{"\u600e\u4e48\u6ca1\u6709\u4efb\u4f55\u7ed3\u679c"};
+    auto historical = initial;
+    historical.messages = MaiContextBuilder().build({user, assistant, followup});
+    for (const auto& message : historical.messages) CHECK(message.images.empty());
+    requests.push_back(historical);
+    auto client = makeMaiLlamaModelClient(config);
+    std::atomic<bool> cancel{false};
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        std::string text;
+        MaiStreamSink sink;
+        sink.onText = [&](std::string_view delta) { text += delta; };
+        const auto error = client->stream(requests[index], sink, cancel);
+        if (error) std::printf("System/history case %zu: %s\n", index, error.message().c_str());
+        CHECK(!error && !text.empty() && validUtf8(text));
+    }
 }
 
 void test_bounded_model_validation() {
@@ -373,7 +460,20 @@ int main(int argc, char** argv) {
         std::printf("Real inference finished; exiting normally with the model still resident\n");
         return 0;
     }
+    if (argc == 2 && std::string(argv[1]) == "--system-normalization-only") {
+        const char* model = std::getenv("MAI_LLAMA_CHAT_TEST_MODEL");
+        if (!model || !*model) return 1;
+        MaiLlamaModelConfig config;
+        config.modelPath = MaiFilePath::fromUtf8(model);
+        config.contextSize = 32768;
+        test_system_instruction_utf8_and_separator_budget();
+        test_real_system_messages_and_old_image_followup(config);
+        CHECK(!getSharedMaiLlamaRuntime()->unload());
+        std::printf("System/history normalization: %d failure(s)\n", failures);
+        return failures ? 1 : 0;
+    }
     test_preflight_without_model_io();
+    test_system_instruction_utf8_and_separator_budget();
     test_bounded_model_validation();
     const char* model = std::getenv("MAI_LLAMA_CHAT_TEST_MODEL");
     if (model && *model) {
@@ -387,6 +487,7 @@ int main(int argc, char** argv) {
         CHECK(!validated);
         CHECK(before.modelGeneration == getSharedMaiLlamaRuntime()->status().modelGeneration);
         test_real_stream_limits_and_cancel(config);
+        test_real_system_messages_and_old_image_followup(config);
         test_real_execution_profile_isolation(config);
         test_real_agent_tool_loop(config);
         CHECK(!getSharedMaiLlamaRuntime()->unload());

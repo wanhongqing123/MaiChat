@@ -92,6 +92,7 @@ private final class AICameraManualToolUITestState: ObservableObject {
     @Published private(set) var mimeType = ""
     @Published private(set) var fileCount = 0
     @Published private(set) var verified = false
+    private var completedOutput: String?
     private var task: Task<Void, Never>?
 
     func start() {
@@ -107,7 +108,9 @@ private final class AICameraManualToolUITestState: ObservableObject {
         path = ""
         mimeType = ""
         verified = false
+        completedOutput = nil
         refreshFiles()
+        let originalSession = model.selected
         task = Task { @MainActor in
             let receipt = await AIMobileHostToolProvider.shared.execute(name: "mobile_take_photo",
                 argumentsJSON: String(decoding: data, as: UTF8.self))
@@ -126,8 +129,20 @@ private final class AICameraManualToolUITestState: ObservableObject {
             let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path + "/"
             verified = !returnedPath.hasPrefix("/") && image.path.hasPrefix(root) &&
                 returnedMime == "image/jpeg" && UIImage(contentsOfFile: image.path) != nil
+            // The ordinary App row receives the actual completed host receipt,
+            // rather than a fabricated model reply or an imported draft image.
+            if verified, let output = receipt.output,
+               model.installManualPhotoToolReceiptForUITesting(output, in: originalSession) {
+                completedOutput = output
+            } else { verified = false }
             result = "succeeded"
         }
+    }
+
+    func restoreCompletedReceipt() {
+        guard AICameraUITestSupport.isManualToolRequested, let completedOutput else { return }
+        let model = AIAssistantModel.shared
+        verified = model.installManualPhotoToolReceiptForUITesting(completedOutput, in: model.selected)
     }
 
     func cancelTask() {
@@ -183,6 +198,8 @@ struct AICameraManualToolUITestControls: View {
                     .accessibilityIdentifier("ai-manual-camera-tool-open")
                 Button("刷新工具状态") { state.refreshFiles() }
                     .accessibilityIdentifier("ai-manual-camera-tool-refresh")
+                Button("还原拍照历史") { state.restoreCompletedReceipt() }
+                    .accessibilityIdentifier("ai-manual-camera-tool-restore")
             }
             AICameraManualToolUITestStatus(prefix: "ai-manual-camera-tool")
         }

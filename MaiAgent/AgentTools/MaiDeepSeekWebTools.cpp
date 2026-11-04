@@ -372,14 +372,21 @@ MaiWebSearchResponse MaiDeepSeekWebClient::search(const MaiWebSearchRequest& req
     unsigned char address[16];
     if (!validText(request.query, 128, true) ||
         !validText(request.oriQuestion, 128, !request.oriQuestion.empty()) || request.count < 1 ||
-        request.count > 50 ||
-        (!request.localization.empty() &&
-         (!validText(request.localization, 45, true) ||
-          (inet_pton(AF_INET, request.localization.c_str(), address) != 1 &&
-           inet_pton(AF_INET6, request.localization.c_str(), address) != 1)))) {
+        request.count > 50) {
+        result.error =
+            failure("INVALID_INPUT", "Search needs a 1..128 character query and count 1..50");
+        return result;
+    }
+    // 官方字段是可选 IP 而非地区标签；错误要指导省略未知值，不能诱导模型猜造或查询用户 IP。
+    if (!request.localization.empty() &&
+        (!validText(request.localization, 45, true) ||
+         (inet_pton(AF_INET, request.localization.c_str(), address) != 1 &&
+          inet_pton(AF_INET6, request.localization.c_str(), address) != 1))) {
         result.error = failure(
             "INVALID_INPUT",
-            "Search needs a 1..128 character query, count 1..50 and an optional localization IP");
+            "localization must be a known end-user IPv4 or IPv6 address, not a language or region "
+            "code. If the user has not supplied that IP, omit localization; never guess or look up "
+            "an IP just for this field.");
         return result;
     }
     Json body{
@@ -515,8 +522,13 @@ public:
     std::string parametersSchema() const override {
         // 模型不能设置API地址或凭据。query/原问题按Unicode限长，count最多50；正文默认不拉取。
         // fetch字符上限限制给模型的Markdown体积；未知字段在execute再严格校验。
+        // 当前原生 XML 解析器不强制 string 的 format；IP 合法性仍由普通客户端严格校验。
         return mSearch
-                   ? R"({"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":128},"count":{"type":"integer","minimum":1,"maximum":50},"ori_question":{"type":["string","null"],"minLength":1,"maxLength":128},"localization":{"type":"string"},"need_content":{"type":"boolean"}},"required":["query"],"additionalProperties":false})"
+                   ? R"({"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":128},"count":{"type":"integer","minimum":1,"maximum":50},"ori_question":{"type":["string","null"],"minLength":1,"maxLength":128},)"
+                     R"("localization":{"type":"string","maxLength":45,"description":")"
+                     R"(Optional known end-user IPv4 or IPv6 address. Omit unless the user supplied the IP. )"
+                     R"(This is not a language or region code. Never guess or look up an IP just for this field."},)"
+                     R"("need_content":{"type":"boolean"}},"required":["query"],"additionalProperties":false})"
                    : R"({"type":"object","properties":{"url":{"type":"string","maxLength":8192},"max_characters":{"type":"integer","minimum":1,"maximum":64000}},"required":["url"],"additionalProperties":false})";
     }
     // 检索是只读调用，供应商的按次 API 使用费不属于购买或媒体任务提交。

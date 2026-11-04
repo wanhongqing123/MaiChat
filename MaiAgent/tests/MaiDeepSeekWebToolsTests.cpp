@@ -284,6 +284,68 @@ void test_invalid_typed_inputs_never_read_credentials_or_send_requests() {
     CHECK(server.requests().empty());
 }
 
+void test_localization_uses_a_known_ip_or_is_omitted() {
+    MaiDeepSeekFakeProvider server;
+    MaiDeepSeekWebClient ordinary(server.options());
+    MaiToolRegistry tools;
+    registerMaiDeepSeekWebTools(tools, server.options());
+    auto* search = tools.find("web_search");
+    CHECK(search != nullptr);
+    if (!search) return;
+    const auto schema = Json::parse(search->parametersSchema());
+    const auto& localization = schema["properties"]["localization"];
+    CHECK(localization.value("maxLength", 0) == 45);
+    const auto description = localization.value("description", std::string{});
+    CHECK(description.find("IPv4") != std::string::npos &&
+          description.find("IPv6") != std::string::npos);
+    CHECK(description.find("language or region code") != std::string::npos);
+    CHECK(description.find("Omit") != std::string::npos &&
+          description.find("Never guess or look up") != std::string::npos);
+
+    // 地域、语言标签不能悄悄当 IP，也不能在提示修复前取凭据或发送 HTTP。
+    for (const auto& invalid : {"zh-CN", "China", "en", "256.1.1.1", "[2001:db8::1]"}) {
+        auto request = searchRequest("public news");
+        request.localization = invalid;
+        const auto direct = ordinary.search(request);
+        CHECK(direct.error.code == "INVALID_INPUT" && direct.error.attempts == 0);
+        CHECK(direct.error.reason.find("IPv4 or IPv6") != std::string::npos &&
+              direct.error.reason.find("omit") != std::string::npos);
+        const auto result =
+            search->execute(Json{{"query", request.query}, {"localization", invalid}}.dump(), {});
+        CHECK(result.hasError() && result.error().code() == MaiErrorCode::InvalidInput);
+        if (result.hasError()) {
+            const auto detail = Json::parse(result.error().message());
+            CHECK(detail["code"] == "INVALID_INPUT" && detail["attempts"] == 0);
+            CHECK(detail["reason"] == direct.error.reason);
+        }
+    }
+    CHECK(server.requests().empty() && server.keyReads() == 0);
+
+    // 普通入口和工具入口保留同一协议：两种 IP 原样传递，未提供时不补造定位。
+    for (const auto& ip : {"192.0.2.1", "2001:db8::1"}) {
+        auto request = searchRequest("public news");
+        request.localization = ip;
+        CHECK(ordinary.search(request).error.code.empty());
+        CHECK(!search->execute(Json{{"query", request.query}, {"localization", ip}}.dump(), {})
+                   .hasError());
+        const auto sent = server.requests();
+        CHECK(sent.size() >= 2);
+        if (sent.size() >= 2) {
+            CHECK(sent[sent.size() - 2].body["localization"] == ip);
+            CHECK(sent.back().body["localization"] == ip);
+        }
+    }
+    CHECK(ordinary.search(searchRequest("public news")).error.code.empty());
+    CHECK(!search->execute(R"({"query":"public news"})", {}).hasError());
+    CHECK(!search->execute(R"({"query":"public news","localization":""})", {}).hasError());
+    const auto sent = server.requests();
+    CHECK(sent.size() == 7 && server.keyReads() == 7);
+    if (sent.size() == 7) {
+        for (std::size_t index = 4; index < sent.size(); ++index)
+            CHECK(!sent[index].body.contains("localization"));
+    }
+}
+
 void test_response_schema_numeric_ranges_and_fetch_markdown_failures() {
     MaiDeepSeekFakeProvider server;
     MaiDeepSeekWebClient client(server.options());
@@ -679,6 +741,7 @@ int main() {
 #endif
     test_unicode_operators_unknown_metadata_and_empty_results();
     test_invalid_typed_inputs_never_read_credentials_or_send_requests();
+    test_localization_uses_a_known_ip_or_is_omitted();
     test_response_schema_numeric_ranges_and_fetch_markdown_failures();
     test_bounded_retries_http_stage_and_recovery();
     test_cancellation_and_response_byte_limit();
