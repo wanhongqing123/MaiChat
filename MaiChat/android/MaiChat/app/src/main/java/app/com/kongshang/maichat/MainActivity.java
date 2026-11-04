@@ -2816,15 +2816,20 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         RemoteIMApprovalDisplayPolicy.State approvalState
     ) {
         boolean outgoing = message.direction() == RemoteIMMessage.Direction.OUTGOING;
-        LinearLayout outer = new LinearLayout(this);
+        boolean imageMessage = message.imageAttachment() != null;
+        LinearLayout outer = imageMessage ? new MaiImageMessageRow(this) : new LinearLayout(this);
         outer.setOrientation(LinearLayout.HORIZONTAL);
         outer.setGravity((outgoing ? Gravity.END : Gravity.START) | Gravity.BOTTOM);
         outer.setPadding(0, dp(7), 0, dp(7));
 
         LinearLayout bubble = new LinearLayout(this);
         bubble.setOrientation(LinearLayout.VERTICAL);
-        bubble.setPadding(dp(13), dp(11), dp(13), dp(11));
-        bubble.setBackground(MaiChatTheme.rounded(outgoing ? Color.rgb(234, 244, 255) : Color.TRANSPARENT, 10, this));
+        // Images use their own fitted content and rounded corners, as on iOS. Text keeps
+        // its existing bubble; captions and quotes may use real space without a blue image shell.
+        bubble.setPadding(imageMessage ? 0 : dp(13), imageMessage ? 0 : dp(11),
+            imageMessage ? 0 : dp(13), imageMessage ? 0 : dp(11));
+        bubble.setBackground(imageMessage ? null : MaiChatTheme.rounded(
+            outgoing ? Color.rgb(234, 244, 255) : Color.TRANSPARENT, 10, this));
 
         if (message.quote() != null) {
             bubble.addView(quoteBlock(message.quote(), peer), matchWrap());
@@ -2838,7 +2843,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         }
 
         if (message.imageAttachment() != null) {
-            bubble.addView(imageMessageContent(message.imageAttachment()), matchWrap());
+            bubble.addView(imageMessageContent(message.imageAttachment()), wrapWrap());
         } else if (message.voiceAttachment() != null) {
             TextView voice = MaiChatTheme.label(
                 this,
@@ -2874,7 +2879,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         bubble.setOnLongClickListener(view -> { showMessageCopyDialog(message); return true; });
         boolean compact =
                 outgoing && usesInlineDate(message) && !message.text().contains("\n") && message.text().length() < 100;
-        LinearLayout.LayoutParams bubbleParams = compact
+        LinearLayout.LayoutParams bubbleParams = imageMessage || compact
             ? new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             : new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
         outer.addView(bubble, bubbleParams);
@@ -5457,7 +5462,6 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         });
         box.addView(imageMissing, matchWrap());
         LinearLayout.LayoutParams imageParams = new LinearLayout.LayoutParams(dp(220), dp(180));
-        imageParams.setMargins(0, dp(7), 0, dp(4));
         box.addView(image, imageParams);
         return box;
     }
@@ -6244,13 +6248,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         page.setBackgroundColor(Color.BLACK);
         page.setAlpha(bubbleEntry ? 0f : 1f);
         frame.addView(page, new FrameLayout.LayoutParams(-1, -1));
-        MaiGraphicsImageView backdrop = new MaiGraphicsImageView(this);
-        backdrop.showImage(path, true, () -> { });
-        backdrop.setAlpha(0.48f);
-        if (Build.VERSION.SDK_INT >= 31)
-            backdrop.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(
-                dp(24), dp(24), android.graphics.Shader.TileMode.CLAMP));
-        page.addView(backdrop, new FrameLayout.LayoutParams(-1, -1));
+        // Preserve the complete image. Any aspect-ratio remainder stays pure black,
+        // rather than exposing a blurred copy as gray bands above/below the image.
         MaiGraphicsImageView image = new MaiGraphicsImageView(this);
         page.addView(image, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
         View previousPreview = previousFrame == null ? null : gallerySnapshot(previousFrame);
@@ -6420,14 +6419,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
     private View gallerySnapshot(Bitmap bitmap) {
         FrameLayout snapshot = new FrameLayout(this);
         snapshot.setBackgroundColor(Color.BLACK);
-        ImageView backdrop = new ImageView(this);
-        backdrop.setImageBitmap(bitmap);
-        backdrop.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        backdrop.setAlpha(0.48f);
-        if (Build.VERSION.SDK_INT >= 31)
-            backdrop.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(
-                dp(24), dp(24), android.graphics.Shader.TileMode.CLAMP));
-        snapshot.addView(backdrop, new FrameLayout.LayoutParams(-1, -1));
+        // Neighbor handoffs use the same black letterboxing as the final preview.
         ImageView foreground = new ImageView(this);
         foreground.setImageBitmap(bitmap);
         foreground.setScaleType(ImageView.ScaleType.FIT_CENTER);

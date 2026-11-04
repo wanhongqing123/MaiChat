@@ -13,6 +13,7 @@ import android.widget.ImageView;
 public final class MaiImageThumbnailView extends ImageView {
     private final int maximumWidth;
     private final int maximumHeight;
+    private int availableWidth = Integer.MAX_VALUE;
 
     public MaiImageThumbnailView(Context context) { this(context, 220, 180); }
 
@@ -44,18 +45,38 @@ public final class MaiImageThumbnailView extends ImageView {
     @Override public void setLayoutParams(ViewGroup.LayoutParams params) {
         // RECENT 缓存可能在 addView 之前先交图；父容器随后提供边距时也不能盖回固定裁切尺寸。
         if (params != null && maximumWidth > 0 && maximumHeight > 0) {
-            Bitmap bitmap = getDrawable() instanceof BitmapDrawable
-                ? ((BitmapDrawable) getDrawable()).getBitmap() : null;
-            if (bitmap != null && !bitmap.isRecycled()) {
-                float scale = Math.min((float) maximumWidth / bitmap.getWidth(),
-                    (float) maximumHeight / bitmap.getHeight());
-                params.width = Math.max(1, Math.round(bitmap.getWidth() * scale));
-                params.height = Math.max(1, Math.round(bitmap.getHeight() * scale));
-            } else {
-                params.width = maximumWidth;
-                params.height = maximumHeight;
-            }
+            fitLayoutParams(params);
         }
         super.setLayoutParams(params);
+    }
+
+    // The enclosing media row calls this during measure, after reserving metadata. Mutate the
+    // existing dimensions synchronously: posting/requesting another layout would leave one
+    // oversized frame visible and could loop while the window changes orientation or width.
+    void setAvailableWidth(int pixels) {
+        int next = Math.max(0, pixels);
+        if (availableWidth == next) return;
+        availableWidth = next;
+        ViewGroup.LayoutParams params = getLayoutParams();
+        if (params != null) fitLayoutParams(params);
+        invalidateOutline();
+    }
+
+    private void fitLayoutParams(ViewGroup.LayoutParams params) {
+        int width = Math.min(maximumWidth, availableWidth);
+        Bitmap bitmap = getDrawable() instanceof BitmapDrawable
+            ? ((BitmapDrawable) getDrawable()).getBitmap() : null;
+        if (width == 0) {
+            params.width = 0;
+            params.height = 0;
+        } else if (bitmap != null && !bitmap.isRecycled()) {
+            float scale = Math.min((float) width / bitmap.getWidth(),
+                (float) maximumHeight / bitmap.getHeight());
+            params.width = Math.max(1, Math.round(bitmap.getWidth() * scale));
+            params.height = Math.max(1, Math.round(bitmap.getHeight() * scale));
+        } else {
+            params.width = width;
+            params.height = maximumHeight;
+        }
     }
 }
