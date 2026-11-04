@@ -126,6 +126,14 @@ SHA 与冻结包 `80b3b6013a9f540f82d5e815a52d91d1f359614f385a9f4120edfc1f428b10
 重写。新旧哈希及两目标重跑记录独立保留于
 `/private/tmp/maichat-test-style-only-20261104-wi68syj5`，不得冒称测试源码与旧输入完全相同。
 
+最终产品提交为 `490c6f0c0157b3eafad7b15c4ec924eccbedb007`，分支 `main`。只读核验该提交的
+Git 原始 blob 后，715 项原冻结输入匹配，另外两项匹配最终测试源码；11 项 Mach-O 和
+随包模型重哈希均不变。测试写入方式修正后的两个目标也通过（60.71s），核心归档未变化。
+`/private/tmp/maichat-photo187-device-final-artifacts-20261104/final-source-binding.json`
+SHA256 为 `cd7086dec3579a6d72649d12aa91c5fe3bf1b647bf653dc955d50063c842a8c0`。
+该产品提交已推送到 `wanhongqing123/MaiChat` 的 `main`；本段后续仅补齐验收绑定，
+没有改动或重新构建产品。
+
 证据目录：`/private/tmp/maichat-photo187-20261104`；原始输入冻结于 `source-freeze.json`。
 Swift 针对性检查位于 `/private/tmp/maichat-photo-artifact-187-20261104`；核心旧实现红灯位于
 `/private/tmp/maichat-local-view-image-capability-20261104-wh4u8n7e/red.log`。
