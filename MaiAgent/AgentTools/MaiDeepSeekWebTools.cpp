@@ -519,12 +519,8 @@ public:
                    ? R"({"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":128},"count":{"type":"integer","minimum":1,"maximum":50},"ori_question":{"type":["string","null"],"minLength":1,"maxLength":128},"localization":{"type":"string"},"need_content":{"type":"boolean"}},"required":["query"],"additionalProperties":false})"
                    : R"({"type":"object","properties":{"url":{"type":"string","maxLength":8192},"max_characters":{"type":"integer","minimum":1,"maximum":64000}},"required":["url"],"additionalProperties":false})";
     }
-    bool requiresApproval(const std::string&) const override {
-        return true;
-    }
-    bool requiresPaidApproval(const std::string&) const override {
-        return true;
-    }
+    // 检索是只读调用，供应商的按次 API 使用费不属于购买或媒体任务提交。
+    // 沿用普通只读工具的权限默认值，避免完全访问模式仍被逐次付费审批阻断。
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
         if (raw.size() > 40000)
             return toolError(failure("INVALID_INPUT", "Retrieval arguments are too large"));
