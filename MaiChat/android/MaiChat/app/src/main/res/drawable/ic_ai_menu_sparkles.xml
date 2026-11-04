@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Menu sparkles keep their taller intrinsic shape rather than using the welcome tile icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="18dp" android:height="22dp" android:viewportWidth="18" android:viewportHeight="22">
+    <path android:fillColor="#FF000000" android:pathData="M11.2,6.9C11.8,11.4 13.4,13 17,13.6C13.4,14.2 11.8,15.8 11.2,20.4C10.6,15.8 9,14.2 5.4,13.6C9,13 10.6,11.4 11.2,6.9ZM4.4,2.4C4.7,5.1 5.6,6 7.7,6.4C5.6,6.8 4.7,7.7 4.4,10.4C4.1,7.7 3.2,6.8 1.1,6.4C3.2,6 4.1,5.1 4.4,2.4ZM9,0.9C9.2,2.3 9.7,2.8 10.8,3C9.7,3.2 9.2,3.7 9,5.1C8.8,3.7 8.3,3.2 7.2,3C8.3,2.8 8.8,2.3 9,0.9Z" />
+</vector>

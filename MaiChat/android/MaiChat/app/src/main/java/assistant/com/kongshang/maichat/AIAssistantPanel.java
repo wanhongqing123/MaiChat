@@ -2024,13 +2024,15 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         ScrollView scroll = new ScrollView(activity);
         scroll.setFillViewport(false);
         scroll.setClipToPadding(false);
-        scroll.setBackground(MaiChatTheme.bordered(Color.WHITE, Color.rgb(232, 235, 240), 14, activity));
         PopupWindow popup = new PopupWindow(scroll, dp(264), LayoutParams.WRAP_CONTENT, true);
-        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        // One rounded material surface supplies both the backdrop and the native shadow outline.
+        // Capture once before showing; inline expansion reveals more of the same background.
+        popup.setBackgroundDrawable(AIAssistantMenuBackdrop.capture(activity, anchor,
+            dp(264), dp(2), dp(6)));
         popup.setOutsideTouchable(true);
         popup.setInputMethodMode(PopupWindow.INPUT_METHOD_NOT_NEEDED);
         popup.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING);
-        popup.setElevation(dp(14));
+        popup.setElevation(dp(20));
         actionPopup = popup;
         actionScroll = scroll;
         popup.setOnDismissListener(() -> {
@@ -2066,7 +2068,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             updateActionMenu();
         }
         popup.setHeight(actionMenuHeight(scroll, anchor));
-        popup.showAsDropDown(anchor, anchor.getWidth() - dp(264), dp(6));
+        popup.showAsDropDown(anchor, anchor.getWidth() - dp(264) + dp(2), dp(6));
+        if (scroll.getParent() instanceof View) {
+            // Scrolling a tall landscape menu must also respect the outer material's corners.
+            ((View) scroll.getParent()).setClipToOutline(true);
+        }
         // Layout changes include rotation and IME dismissal. Recompute this same popup's height
         // instead of clipping its expanded choices or replacing it with a second window.
         scroll.addOnLayoutChangeListener((view, l, t, r, b, oldL, oldT, oldR, oldB) -> {
@@ -2091,7 +2097,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (popup == null || scroll == null || anchor == null || !popup.isShowing()) return;
         int height = actionMenuHeight(scroll, anchor);
         if (popup.getHeight() != height)
-            popup.update(anchor, anchor.getWidth() - dp(264), dp(6), dp(264), height);
+            popup.update(anchor, anchor.getWidth() - dp(264) + dp(2), dp(6), dp(264), height);
     }
     private boolean ownsActionMenu() {
         return actionPopup != null && visibleToUser && state != null && !actionRemote
