@@ -76,7 +76,7 @@ final class LocalModelsUITests: XCTestCase {
         local.tap()
         // 随包真实权重由普通 Store 解析；configured/native-wire 成功后才能继续切回云端。
         waitForConfiguration(provider: "llama", wire: "local",
-                             model: "local:builtin-qwen2.5-0.5b-instruct-q4_k_m")
+                             model: "local:builtin-qwen3.5-2b-q4_k_m")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "enabled == true"), object: cloud)], timeout: 5), .completed)
         assertInlineSelection("本地模型", capture: "primary-model-inline-bundled-local-selected")

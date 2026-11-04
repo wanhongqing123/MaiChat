@@ -5,6 +5,39 @@ import CryptoKit
 @testable import MaiChatCore
 
 final class AILocalModelStoreTests: XCTestCase {
+    func testFormerBundledSelectionMigratesWithoutChangingImportsOrMappedFiles() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try bundledFixture(root: root)
+        let storage = root.appendingPathComponent("models")
+        let initial = AILocalModelStore(directory: storage, bundledPrimaryDirectory: fixture.directory,
+            descriptor: fixture.descriptor)
+        let imported = try await initial.importModel(from: fixture.source, role: .projector)
+        let oldModel = storage.appendingPathComponent("old-content-version.gguf")
+        let oldBytes = gguf(payloadBytes: 1024, fill: 19)
+        try oldBytes.write(to: oldModel)
+        let catalogURL = storage.appendingPathComponent("catalog.json")
+        var legacy = try JSONSerialization.jsonObject(with: Data(contentsOf: catalogURL)) as! [String: Any]
+        legacy["selectedModelID"] = "builtin-qwen2.5-0.5b-instruct-q4_k_m"
+        legacy["selectedProjectorID"] = imported.id
+        let legacyData = try JSONSerialization.data(withJSONObject: legacy, options: [.sortedKeys])
+        try legacyData.write(to: catalogURL)
+
+        let reopened = AILocalModelStore(directory: storage, bundledPrimaryDirectory: fixture.directory,
+            descriptor: fixture.descriptor)
+        let snapshot = try await reopened.snapshot()
+        XCTAssertEqual(snapshot.selectedModelID, AILocalModelStore.bundledPrimaryID)
+        XCTAssertNil(snapshot.selectedProjectorID)
+        XCTAssertTrue(snapshot.entries.contains(imported))
+        let selection = try await reopened.selection()
+        let resolved = try await reopened.resolve(modelID: "builtin-qwen2.5-0.5b-instruct-q4_k_m", projectorID: nil)
+        XCTAssertEqual(selection.modelURL, resolved.modelURL)
+        XCTAssertTrue(selection.isBuiltin)
+        XCTAssertNil(selection.projectorURL)
+        XCTAssertEqual(try Data(contentsOf: oldModel), oldBytes)
+        XCTAssertEqual(try Data(contentsOf: catalogURL), legacyData)
+    }
+
     func testBundledPrimaryMissingResourcesReportPackagingFailureWithoutPublishing() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

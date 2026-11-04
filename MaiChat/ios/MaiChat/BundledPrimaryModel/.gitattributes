@@ -1,2 +1,3 @@
-# Retain the pinned upstream model card byte-for-byte, including published line-end spaces.
-UPSTREAM_MODEL_CARD.md -whitespace
+# Retain pinned upstream notices byte-for-byte, including CRLF and published spaces.
+UPSTREAM_MODEL_CARD.md -text -whitespace
+LICENSE -text -whitespace

@@ -76,8 +76,7 @@ namespace {
 // 保留核心错误类型给宿主队列判断“明确未受理”。不能把未知异常或附件错误猜成Busy后重播。
 class NativeOperationFailure final : public std::runtime_error {
 public:
-    explicit NativeOperationFailure(const MaiError& error)
-        : std::runtime_error(error.message()), code(error.code()) {}
+    explicit NativeOperationFailure(const MaiError& error) : std::runtime_error(error.message()), code(error.code()) {}
     MaiErrorCode code;
 };
 
@@ -662,7 +661,8 @@ struct MaiMobileAgent {
             if (result.hasError()) return {};
             const auto response = Json::parse(result.output(), nullptr, false);
             return response.is_object() && response.value("key", Json{}).is_string()
-                ? response["key"].get<std::string>() : std::string{};
+                       ? response["key"].get<std::string>()
+                       : std::string{};
         };
         registerMaiDeepSeekWebTools(*tools, std::move(webOptions));
         tools->add(makeMaiZlibCompressTool());
@@ -889,8 +889,9 @@ struct MaiMobileAgent {
             localModelContext.fileAccessRoot = options.fileAccessRoot;
             const auto localModel = localModelContext.resolvePath(request["localTestModelPath"].get<std::string>());
             if (!localModel.empty() && MaiFileSystem::exists(MaiFilePath::fromUtf8(localModel))) {
-                options.baseInstructions += "\nA tiny English CPU inference test model is available locally at " +
-                    localModel + ". Use the llama tool with -m pointing to this existing GGUF, "
+                options.baseInstructions +=
+                    "\nA tiny English CPU inference test model is available locally at " + localModel +
+                    ". Use the llama tool with -m pointing to this existing GGUF, "
                     "-p 'Once upon a time', -c 256 -n 32 -t 2 --temp 0 --no-conversation to test "
                     "the engine. It is an English continuation test model, with no OCR or image "
                     "capability. Do not search directories or download models to run this test.";
@@ -1015,7 +1016,7 @@ struct MaiMobileAgent {
         const auto start = std::chrono::steady_clock::now();
         double firstToken = -1;
         std::string output;
-        std::size_t calls = 0;
+        Json calls = Json::array();
         MaiStreamSink sink;
         sink.onText = [&](std::string_view text) {
             if (firstToken < 0 && !text.empty())
@@ -1024,14 +1025,20 @@ struct MaiMobileAgent {
             output.append(text.data(), text.size());
         };
         // 绝不能在这里执行工具、回写用户会话或请求宿主凭据。
-        sink.onToolCall = [&](const MaiToolInvocation&) { ++calls; };
+        sink.onToolCall = [&](const MaiToolInvocation& call) {
+            calls.push_back({{"id", call.id}, {"name", call.name}, {"arguments", call.arguments}});
+        };
         const auto error = modelClientFactory()->stream(input, sink, deadline.canceled());
         const double total =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         const auto state = getSharedMaiLlamaRuntime()->status();
-        Json response{{"ok", !error && calls == 0 && !output.empty()},
+        // 完整原生调用也是有效的测量结果，但它不代表工具已执行。
+        // 回传实际名称、参数和 ID，避免把“返回了文本”误当成任务质量验收。
+        Json response{{"ok", !error && (!calls.empty() || !output.empty())},
                       {"text", output},
-                      {"tool_call_count", calls},
+                      {"tool_call_count", calls.size()},
+                      {"tool_calls", std::move(calls)},
+                      {"tools_executed", false},
                       {"first_token_ms", firstToken},
                       {"total_ms", total},
                       {"wire", maiWireApiToString(primaryWire)},
@@ -1041,10 +1048,8 @@ struct MaiMobileAgent {
                       {"localGpuBackend", state.gpuBackend}};
         if (error)
             response.update({{"errorCode", maiErrorCodeToString(error.code())}, {"error", error.message()}});
-        else if (calls || output.empty())
-            response.update({{"errorCode", "protocol"},
-                             {"error", calls ? "The probe requested tools; no tools were executed."
-                                             : "The probe returned no visible text."}});
+        else if (!response["ok"].get<bool>())
+            response.update({{"errorCode", "protocol"}, {"error", "The probe returned no text or tool calls."}});
         return response;
     }
 
@@ -1436,8 +1441,7 @@ char* maiMobileAgentRequest(void* handle, const char* request) {
         if (!handle || !request) throw std::runtime_error("Invalid bridge handle.");
         response = static_cast<MaiMobileAgent*>(handle)->request(Json::parse(request)).dump();
     } catch (const NativeOperationFailure& error) {
-        response = Json{{"ok", false}, {"errorCode", maiErrorCodeToString(error.code)},
-                        {"error", error.what()}}.dump();
+        response = Json{{"ok", false}, {"errorCode", maiErrorCodeToString(error.code)}, {"error", error.what()}}.dump();
     } catch (const std::exception& e) {
         response = Json{{"ok", false}, {"errorCode", "internal"}, {"error", e.what()}}.dump();
     } catch (...) {

@@ -29,7 +29,7 @@ final class PrimaryModelsUITests: XCTestCase {
         let selected = XCTNSPredicateExpectation(predicate: NSPredicate(format:
             "value CONTAINS %@ AND value CONTAINS %@ AND value CONTAINS %@ AND value CONTAINS %@",
             "provider:llama;", "configured:true;", ";native-wire:local;",
-            ";native-model:local:builtin-qwen2.5-0.5b-instruct-q4_k_m;"), object: state)
+            ";native-model:local:builtin-qwen3.5-2b-q4_k_m;"), object: state)
         XCTAssertEqual(XCTWaiter.wait(for: [selected], timeout: 30), .completed)
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "value == %@ AND enabled == true", "本地模型"), object: settings)], timeout: 5), .completed)
@@ -48,13 +48,12 @@ final class PrimaryModelsUITests: XCTestCase {
         }
         dismissPanel()
         let supportsGPU = (state.value as? String ?? "").contains("qwen-gpu-ops-supported:true")
-        // 真实 Sim archive/probe 已确认 Apple2 设备拒绝 Q4_K matmul 与 F16 FA，
-        // 完整 119 工具首字 CPU 实测 190.70 秒。这里明确验证 CPU 功能，不能虚报 GPU。
+        // Simulator 的 Apple2 不支持随包模型所需的 SIMD 算子，只能验证纯 CPU 功能。
         // 真机相同 client 的 GPU/耗时另由正常 App 隔离设备探针测量；不更改产品超时。
         let replyTimeout: TimeInterval = supportsGPU ? 180 : 360
         let capability = XCTAttachment(string: supportsGPU
             ? "Device supports required Qwen GPU operations; require actual GPU buffers."
-            : "Simulator lacks required SIMD operations; validate actual CPU replies. Baseline: 190.70s first token for 119 tools. Physical GPU is validated separately.")
+            : "Simulator lacks required SIMD operations; validate actual CPU replies. Physical GPU is validated separately.")
         capability.name = "actual-qwen-compute-capability"
         capability.lifetime = .keepAlways
         add(capability)
@@ -84,8 +83,12 @@ final class PrimaryModelsUITests: XCTestCase {
                            "真实本地主模型必须生成非空、无错误的回复并完成轮次；实际状态：\(state.value ?? "missing")")
             XCTAssertTrue(app.buttons["复制回复"].firstMatch.exists, "回复应实际显示在聊天消息区")
         }
-        send("Reply with one short sentence: Hello from Qwen.", atLeast: 1)
-        send("What exact phrase did you just say? Reply briefly.", atLeast: 2)
+        send("请记住本次代号是「松柏」，只用一句话确认。", atLeast: 1)
+        send("刚才我告诉你的代号是什么？", atLeast: 2)
+        let output = app.staticTexts["primary-ui-model-output"]
+        XCTAssertTrue(output.exists)
+        XCTAssertTrue((output.value as? String ?? "").contains("松柏"),
+                      "必须正确使用真实上一轮内容，非空套话不能算质量通过：\(output.value ?? "missing")")
         let generated = XCTAttachment(screenshot: app.screenshot())
         generated.name = "local-primary-real-two-turn-conversation"; generated.lifetime = .keepAlways; add(generated)
 

@@ -44,7 +44,7 @@ import Foundation
 __SETTINGS__
 __OPENED__
 __ERROR__
-enum AILocalModelStore { static let bundledPrimaryID = "builtin-qwen2.5-0.5b-instruct-q4_k_m" }
+enum AILocalModelStore { static let bundledPrimaryID = "builtin-qwen3.5-2b-q4_k_m" }
 struct AILocalModelSelection { let modelURL: URL }
 enum AICloudCredentialSync {
  static func refreshAccountModelKeysIfAvailable() async throws -> Bool { false }

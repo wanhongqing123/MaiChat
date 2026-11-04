@@ -982,7 +982,7 @@
 				"$(PROJECT_DIR)/BundledPrimaryModel/LICENSE",
 				"$(PROJECT_DIR)/BundledPrimaryModel/SOURCE.json",
 				"$(PROJECT_DIR)/BundledPrimaryModel/UPSTREAM_MODEL_CARD.md",
-				"$(PROJECT_DIR)/BundledPrimaryModel/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+				"$(PROJECT_DIR)/BundledPrimaryModel/Qwen_Qwen3.5-2B-Q4_K_M.gguf",
 			);
 			name = "Bundle Primary Model";
 			outputPaths = (
@@ -990,7 +990,7 @@
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/LICENSE",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/SOURCE.json",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/UPSTREAM_MODEL_CARD.md",
-				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/Qwen_Qwen3.5-2B-Q4_K_M.gguf",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
@@ -1260,7 +1260,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 184;
+				CURRENT_PROJECT_VERSION = 185;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1437,7 +1437,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 184;
+				CURRENT_PROJECT_VERSION = 185;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;

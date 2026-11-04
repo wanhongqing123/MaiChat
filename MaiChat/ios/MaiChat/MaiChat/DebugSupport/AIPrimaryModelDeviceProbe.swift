@@ -21,7 +21,7 @@ enum AIPrimaryModelDeviceProbe {
 
 /// setup 与 worker 串行衔接；所有 native handle 调用（含销毁）只在专用串行队列执行。
 private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
-    private let expectedSHA = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+    private let expectedSHA = "57a1085840f497d764a7fc5d346922dbde961efb54cc792ea81d694fd846a1d8"
     private let runID: UUID
     private let temporary: URL
     private let reportURL: URL
@@ -38,7 +38,7 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
             .appendingPathComponent("MaiChatLocalPrimaryQA", isDirectory: true)
             .appendingPathComponent("report-" + runID.uuidString + ".json")
         report = ["run_id": runID.uuidString, "format": 1, "status": "starting",
-            "model": "Qwen2.5-0.5B-Instruct-Q4_K_M", "source_sha256": expectedSHA,
+            "model": "Qwen3.5-2B-Q4_K_M", "source_sha256": expectedSHA,
             "source": "packaged_primary_model",
             "database": "memory", "host_handler_installed": false, "rounds": [],
             "scope": "configured_local_client_full_tools_without_tool_execution",
@@ -70,7 +70,7 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
             let store = AILocalModelStore(directory: temporary.appendingPathComponent("Models", isDirectory: true))
             try publish(stage: "importing_public_model")
             let imported = try await store.importModel(from: source, role: .model)
-            guard imported.sha256 == expectedSHA, imported.bytes == 491_400_032 else { throw ProbeFailure("source_fingerprint_mismatch") }
+            guard imported.sha256 == expectedSHA, imported.bytes == 1_396_198_496 else { throw ProbeFailure("source_fingerprint_mismatch") }
             let selection = try await store.resolve(modelID: imported.id, projectorID: nil)
             report["copied_model_verified"] = true
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -99,7 +99,7 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
             try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: false)
             _ = try request(created, ["op": "configure", "database": ":memory:", "workspace": workspace.path,
                 "appRoot": temporary.path, "modelProvider": "llama", "wire": "local",
-                "model": "local-device-probe-qwen2.5", "localModelPath": model.path,
+                "model": "local-device-probe-qwen3.5", "localModelPath": model.path,
                 "localProjectorPath": "", "localContextSize": 32768, "localMaximumTokens": 0,
                 "localThreads": 2, "policy": "on-request", "supportsScreenCapture": false])
             let prompts = ["Reply with one short sentence: Hello from Qwen. Do not call any tools.",
@@ -138,7 +138,7 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
                     metrics["native_total_seconds"] = total.doubleValue / 1000
                 }
                 let passed = success && toolCalls == 0 && !(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) &&
-                    output["wire"] as? String == "local" && output["model"] as? String == "local-device-probe-qwen2.5" &&
+                    output["wire"] as? String == "local" && output["model"] as? String == "local-device-probe-qwen3.5" &&
                     output["localGpuSelected"] as? Bool == true &&
                     ((output["localGpuModelBytes"] as? NSNumber)?.uint64Value ?? 0) > 0 &&
                     (output["error"] as? String ?? "").isEmpty
@@ -151,6 +151,52 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
                 guard passed else { throw ProbeFailure(success ? "round_not_completed_on_gpu" :
                     safe(output["error"] as? String ?? "native_probe_failed")) }
                 messages.append(["role": "assistant", "content": text])
+            }
+            // 同现场自然问题核对真实调用，而非仅检查“回复非空”。这里只记录选择，
+            // 不装宿主 handler、不调用搜索供应商，也不打开相机或读取用户会话。
+            let selectionCases: [(String, [[String: String]], String)] = [
+                ("news_after_repeated_replies", [
+                    ["role": "assistant", "content": "好的，请告诉我你接下来需要什么帮助？"],
+                    ["role": "user", "content": "新闻"],
+                    ["role": "assistant", "content": "好的，请告诉我你接下来需要什么帮助？"],
+                    ["role": "user", "content": "妈的 听不懂话吗"],
+                    ["role": "assistant", "content": "抱歉，我可能理解错了。请告诉我你接下来需要什么帮助？"],
+                    ["role": "user", "content": "我要看今天的新闻"]], "web_search"),
+                ("fresh_news", [["role": "user", "content": "我要看今天的新闻"]], "web_search"),
+                ("camera_selection", [["role": "user", "content": "打开相机"]], "mobile_take_photo")
+            ]
+            var selections: [[String: Any]] = []
+            for (name, input, expectedTool) in selectionCases {
+                report["current_case"] = name
+                try publish(stage: "tool_selection_running")
+                let output = try request(created, ["op": "local_model_probe",
+                    "messages": input, "timeout_ms": 120000], requireSuccess: false)
+                ownedGeneration = mai_local_inference_status().model_generation
+                let calls = output["tool_calls"] as? [[String: Any]] ?? []
+                let correct = calls.contains { call in
+                    guard call["name"] as? String == expectedTool,
+                          let arguments = call["arguments"] as? String,
+                          let data = arguments.data(using: .utf8),
+                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+                    if expectedTool == "web_search" {
+                        guard let query = object["query"] as? String else { return false }
+                        return query.contains("新闻") && !query.contains("X月") && !query.contains("2024") && !query.contains("2025")
+                    }
+                    return true
+                }
+                let passed = output["ok"] as? Bool == true && correct &&
+                    output["tools_executed"] as? Bool == false &&
+                    output["localGpuSelected"] as? Bool == true
+                selections.append(["case": name, "expected_tool": expectedTool,
+                    "passed": passed, "tools_executed": false,
+                    "native_total_ms": output["total_ms"] ?? -1,
+                    "calls": calls.map { call in ["id": safe(call["id"] as? String ?? ""),
+                        "name": safe(call["name"] as? String ?? ""),
+                        "arguments": safe(call["arguments"] as? String ?? "")] }])
+                report["tool_selection_cases"] = selections
+                report.removeValue(forKey: "current_case")
+                try publish(stage: "tool_selection_finished")
+                guard passed else { throw ProbeFailure("native_tool_selection_failed_" + name) }
             }
             report["status"] = "passed"
         } catch {

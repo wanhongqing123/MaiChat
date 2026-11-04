@@ -27,10 +27,18 @@ struct AIPrimaryModelUITestStatus: View {
                 $0.kind == "text" && !($0.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
         }.count
-        Text("实际主模型状态")
-            .font(.caption2)
-            .accessibilityIdentifier("primary-ui-model-state")
-            .accessibilityValue("provider:\(model.settings.isLocalModel ? "llama" : "remote");configured:\(model.configured);busy:\(model.busy);assistant-text-count:\(count);session:\(model.selected);native-wire:\(model.actualWire);native-model:\(model.actualModelID);gpu-selected:\(model.actualGPUSelected);gpu-bytes:\(model.actualGPUModelBytes);gpu-backend:\(model.actualGPUBackend);error-empty:\(model.error.isEmpty && !model.actualBackendHasError);qwen-gpu-ops-supported:\(AIPrimaryModelUITestSupport.supportsQwenGPUOperations)")
+        let latest = model.messages.last(where: { $0.role == "assistant" })?.parts
+            .filter { $0.kind == "text" }.compactMap(\.text).joined(separator: "\n") ?? ""
+        VStack(spacing: 0) {
+            Text("实际主模型状态")
+                .font(.caption2)
+                .accessibilityIdentifier("primary-ui-model-state")
+                .accessibilityValue("provider:\(model.settings.isLocalModel ? "llama" : "remote");configured:\(model.configured);busy:\(model.busy);assistant-text-count:\(count);session:\(model.selected);native-wire:\(model.actualWire);native-model:\(model.actualModelID);gpu-selected:\(model.actualGPUSelected);gpu-bytes:\(model.actualGPUModelBytes);gpu-backend:\(model.actualGPUBackend);error-empty:\(model.error.isEmpty && !model.actualBackendHasError);qwen-gpu-ops-supported:\(AIPrimaryModelUITestSupport.supportsQwenGPUOperations)")
+            Text("实际回复内容")
+                .font(.caption2)
+                .accessibilityIdentifier("primary-ui-model-output")
+                .accessibilityValue(String(latest.prefix(2000)))
+        }
     }
 }
 #endif

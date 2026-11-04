@@ -51,9 +51,9 @@ public enum AILocalModelStoreError: Error, LocalizedError {
 
 public actor AILocalModelStore {
     public static let shared = AILocalModelStore()
-    public static let bundledPrimaryID = "builtin-qwen2.5-0.5b-instruct-q4_k_m"
-    public static let bundledPrimaryBytes: UInt64 = 491_400_032
-    public static let bundledPrimarySHA256 = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+    public static let bundledPrimaryID = "builtin-qwen3.5-2b-q4_k_m"
+    public static let bundledPrimaryBytes: UInt64 = 1_396_198_496
+    public static let bundledPrimarySHA256 = "57a1085840f497d764a7fc5d346922dbde961efb54cc792ea81d694fd846a1d8"
     // Tiny 只保留给已有 Debug 引擎自检；正常 App 的默认主模型始终是上面的 Qwen。
     public static let builtinID = "builtin-stories260K"
     public static let builtinBytes: UInt64 = 1_185_376
@@ -94,9 +94,15 @@ public actor AILocalModelStore {
     }
 
     private static let primaryDescriptor = BundledPrimaryDescriptor(version: 1,
-        id: bundledPrimaryID, name: "Qwen2.5 0.5B Instruct · Q4_K_M",
-        filename: "qwen2.5-0.5b-instruct-q4_k_m.gguf", bytes: bundledPrimaryBytes,
-        sha256: bundledPrimarySHA256, revision: "9217f5db79a29953eb74d5343926648285ec7e67")
+        id: bundledPrimaryID, name: "Qwen3.5 2B · Q4_K_M",
+        filename: "Qwen_Qwen3.5-2B-Q4_K_M.gguf", bytes: bundledPrimaryBytes,
+        sha256: bundledPrimarySHA256, revision: "7d26695454df6de5fbcce2e58681e62dae06ce43")
+
+    // 升级只迁移旧内置模型的选择 ID，不覆盖仍可能被 mmap 的内容版本文件，
+    // 也不把普通导入模型或 projector 当成新的内置模型。
+    private static func currentPrimaryID(_ id: String) -> String {
+        id == "builtin-qwen2.5-0.5b-instruct-q4_k_m" ? bundledPrimaryID : id
+    }
 
     /// 自定义目录只用于隔离的普通 Foundation 测试；正式文件位于 App Documents 下，
     /// 不在只读 Bundle 中，因此 Agent 的 NSHomeDirectory 文件边界也能访问同一份模型。
@@ -248,6 +254,7 @@ public actor AILocalModelStore {
 
     public func selectModel(id: String) throws {
         try loadIfNeeded()
+        let id = Self.currentPrimaryID(id)
         if id == Self.bundledPrimaryID { _ = try bundledPrimarySelection() }
         guard (id == Self.bundledPrimaryID && bundledPrimaryURL != nil) ||
                 (id == Self.builtinID && builtinURL != nil) ||
@@ -284,6 +291,7 @@ public actor AILocalModelStore {
     /// 主模型按账号设置保存的稳定 ID 解析；独立自测的全局选择不能更改已应用的主模型。
     /// 每次配置复查文件存在性，返回沙盒内文件，不保存旧进程的绝对路径。
     public func resolve(modelID: String, projectorID: String?) throws -> AILocalModelSelection {
+        let modelID = Self.currentPrimaryID(modelID)
         if modelID == Self.bundledPrimaryID {
             guard projectorID == nil else { throw AILocalModelStoreError.unavailable }
             return try bundledPrimarySelection()
@@ -377,6 +385,13 @@ public actor AILocalModelStore {
                       entry.sha256.allSatisfy({ $0.isHexDigit && $0.isASCII })
                   }) else { throw AILocalModelStoreError.invalidCatalog }
             catalog = decoded
+            if let selected = catalog.selectedModelID,
+               Self.currentPrimaryID(selected) != selected {
+                // 普通读取仅归一化内存选择；下次明确保存时再写新 ID。
+                // 已有导入条目、目录文件和磁盘上的旧清单均保留。
+                catalog.selectedModelID = Self.currentPrimaryID(selected)
+                catalog.selectedProjectorID = nil
+            }
         }
         if let builtinSource {
             builtinURL = try? Self.installBundledTestModel(source: builtinSource, directory: directory)

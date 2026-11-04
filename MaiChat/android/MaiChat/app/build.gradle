@@ -30,8 +30,8 @@ android {
         applicationId "com.kongshang.maichat"
         minSdk 26
         targetSdk 34
-        versionCode 258
-        versionName "2.2.21"
+        versionCode 259
+        versionName "2.2.22"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 

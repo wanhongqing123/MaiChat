@@ -32,6 +32,7 @@
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
 #include "MaiLlamaChatSupport.h"
+#include "MaiLlamaModelCapabilities.h"
 #include "MaiLlamaModelClient.h"
 #include "MaiTool.h"
 
@@ -55,33 +56,6 @@ MaiError canceledError() {
 }
 
 void quietLog(ggml_log_level, const char*, void*) {}
-
-// Metal 设备存在不代表它能执行本地主模型的关键算子。Simulator 只支持部分简单算子，
-// 仍能卸载少量 norm 权重；其余量化层与注意力在 CPU/GPU 间反复搬运，并可产生错误 logits。
-// 只查询合法形状的算子元数据，不分配权重/KV 数据，也不执行 kernel 或限制模型输出。
-bool supportsLocalPrimaryMetal(ggml_backend_dev_t device) {
-    if (!device) return false;
-    ggml_init_params parameters{};
-    parameters.mem_size = 32 * ggml_tensor_overhead();
-    parameters.no_alloc = true;
-    ggml_context_ptr context(ggml_init(parameters));
-    if (!context) return false;
-    // 官方 Qwen2.5 0.5B 的 FFN 行宽符合 Q4_K 的 256 元素块边界；896 是输出维度。
-    auto* weights = ggml_new_tensor_2d(context.get(), GGML_TYPE_Q4_K, 4864, 896);
-    auto* keys = ggml_new_tensor_4d(context.get(), GGML_TYPE_F16, 64, 32768, 2, 1);
-    auto* values = ggml_new_tensor_4d(context.get(), GGML_TYPE_F16, 64, 32768, 2, 1);
-    for (const std::int64_t batch : {std::int64_t{1}, std::int64_t{512}}) {
-        auto* input = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, 4864, batch);
-        auto* multiply = ggml_mul_mat(context.get(), weights, input);
-        auto* queries = ggml_new_tensor_4d(context.get(), GGML_TYPE_F32, 64, batch, 14, 1);
-        auto* attention =
-            ggml_flash_attn_ext(context.get(), queries, keys, values, nullptr, 0.125f, 0.0f, 0.0f);
-        if (!ggml_backend_dev_supports_op(device, multiply) ||
-            !ggml_backend_dev_supports_op(device, attention))
-            return false;
-    }
-    return true;
-}
 
 // 与已有文件工具一致地拒绝过长、过短编码和代理项。返回 0 表示无效，负数表示字节尚未齐全。
 int utf8Width(const std::string& text, std::size_t offset) {
@@ -284,6 +258,9 @@ MaiResult<common_chat_templates_inputs> chatInputs(const MaiModelRequest& reques
     common_chat_templates_inputs input;
     input.use_jinja = true;
     input.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    // 本地主模型固定为非思考模式，与模板预检和验收配置一致；保留原生 parser 的思考/工具
+    // 分流。远端 reasoningEffort 目前不映射到本地模板，不能借同名设置悄悄打开另一种模式。
+    input.enable_thinking = false;
     input.parallel_tool_calls = true;
     std::size_t bytes = 0;
     const auto valid = [&](const std::string& value) {
@@ -703,7 +680,10 @@ private:
                 if ((type == GGML_BACKEND_DEVICE_TYPE_GPU ||
                      type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
                     registry && registry == ggml_backend_reg_by_name("MTL") &&
-                    supportsLocalPrimaryMetal(device)) {
+                    supportsMaiLlamaModelOperations(
+                        modelFile.path, request.contextSize, [device](const ggml_tensor* op) {
+                            return ggml_backend_dev_supports_op(device, op);
+                        })) {
                     selectedDevices[0] = device;
                     modelParameters.n_gpu_layers = -1;
                     useGpu = true;

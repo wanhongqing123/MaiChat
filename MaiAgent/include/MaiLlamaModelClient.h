@@ -16,7 +16,8 @@ class MaiLlamaRuntime;
 // Apple 默认优先已编入且支持量化矩阵/注意力关键算子的 Metal；能力不足时使用纯 CPU。
 // 不能因设备存在或只卸载少量简单层而进入混合后端；其他平台当前使用 CPU。
 // GPU 只在解码批次前后、同步与请求清理边界合作取消，不承诺中途抢占 GPU kernel。
-// 首版仅接受 validateMaiLlamaModelConfig 核准的官方 Qwen2.5 工具模板，其他模板明确拒绝。
+// 仅接受 validateMaiLlamaModelConfig 核准的 Qwen2.5/Qwen3.5 原始工具模板，其他明确拒绝。
+// 本地固定关闭模板思考模式，远端 reasoningEffort 暂不映射到本地；仍独立解析模型思考片段。
 // 完整 system/历史按模型模板渲染；工具名称目录先交给同一真实模型，所需原始声明按需载入。
 // 发现只查询本地 metadata，不执行用户操作；最终调用仍交现有 Agent 审批/执行。
 // 内部声明选择不追加或修改用户历史。任一真实推理的 token 数超出 contextSize 时返回

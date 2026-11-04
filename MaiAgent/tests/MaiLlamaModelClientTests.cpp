@@ -133,6 +133,8 @@ void test_bounded_model_validation() {
             CHECK(!MaiFileSystem::writeFile(config.modelPath, header));
         };
         // 加一个无害注释保持模板语义可执行，确保拒绝来自精确摘要，而非语法/工具能力失败。
+        writeTemplates(approved, approved);
+        CHECK(!validateMaiLlamaModelConfig(config));
         const auto modified = approved + "\n{# unapproved template revision #}";
         writeTemplates(approved, modified);
         CHECK(validateMaiLlamaModelConfig(config).code() == MaiErrorCode::NotSupported);

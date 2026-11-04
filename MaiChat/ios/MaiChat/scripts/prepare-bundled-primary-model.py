@@ -14,20 +14,27 @@ import urllib.request
 RESOURCE_DIRECTORY = Path(__file__).resolve().parent.parent / "BundledPrimaryModel"
 EXPECTED = {
     "version": 1,
-    "id": "builtin-qwen2.5-0.5b-instruct-q4_k_m",
-    "name": "Qwen2.5 0.5B Instruct · Q4_K_M",
-    "filename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-    "bytes": 491400032,
-    "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
-    "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+    "id": "builtin-qwen3.5-2b-q4_k_m",
+    "name": "Qwen3.5 2B · Q4_K_M",
+    "filename": "Qwen_Qwen3.5-2B-Q4_K_M.gguf",
+    "bytes": 1396198496,
+    "sha256": "57a1085840f497d764a7fc5d346922dbde961efb54cc792ea81d694fd846a1d8",
+    "revision": "7d26695454df6de5fbcce2e58681e62dae06ce43",
 }
 MODEL_URL = (
-    "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/"
+    "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/"
     + EXPECTED["revision"] + "/" + EXPECTED["filename"]
 )
 ATTRIBUTION_HASHES = {
-    "LICENSE": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
-    "UPSTREAM_MODEL_CARD.md": "fa1fede7f775a20f111cc098c00900092020572ce78976970a5b0ad9ca211999",
+    "LICENSE": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+    "UPSTREAM_MODEL_CARD.md": "c0e83a849c776e6fa843d011f023132d942a0f0140d903205bf1c363adad2275",
+}
+# Only exact former product resources can be retired from an incremental build.
+# Runtime Documents and unrelated files are never cleanup targets.
+RETIRED_MODELS = {
+    "qwen2.5-0.5b-instruct-q4_k_m.gguf": (
+        491400032, "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+    ),
 }
 
 
@@ -121,6 +128,17 @@ def acquire_model(destination, source=None):
 def package_model(destination):
     """Build artifacts can be replaced; runtime sandbox model files never are."""
     destination.mkdir(parents=True, exist_ok=True)
+    retired = []
+    for name, (size, fingerprint) in RETIRED_MODELS.items():
+        path = destination / name
+        if path.exists() or path.is_symlink():
+            if digest(path, size) != fingerprint:
+                raise RuntimeError(f"Superseded build resource changed; preserved for inspection: {name}")
+            retired.append(path)
+    unexpected = [path.name for path in destination.glob("*.gguf")
+                  if path.name != EXPECTED["filename"] and path not in retired]
+    if unexpected:
+        raise RuntimeError("Unmanaged weight in primary build resources; preserved: " + ", ".join(sorted(unexpected)))
     for name in (EXPECTED["filename"], "manifest.json", "LICENSE", "SOURCE.json", "UPSTREAM_MODEL_CARD.md"):
         source = RESOURCE_DIRECTORY / name
         target = destination / name
@@ -140,6 +158,13 @@ def package_model(destination):
                 os.replace(temporary, target)
             finally:
                 temporary.unlink(missing_ok=True)
+    # Publish and verify the replacement first. A failed copy retains the old resource.
+    verify_model(destination / EXPECTED["filename"])
+    for path in retired:
+        size, fingerprint = RETIRED_MODELS[path.name]
+        if digest(path, size) != fingerprint:
+            raise RuntimeError(f"Superseded build resource changed during packaging: {path.name}")
+        path.unlink()
 
 
 def main():

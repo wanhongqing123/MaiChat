@@ -385,6 +385,7 @@ add_library(maiagent STATIC
   Agent/MaiLlamaToolCatalog.cpp
   Agent/MaiLlamaToolDiscoveryClient.cpp
   Agent/MaiLlamaModelValidation.cpp
+  Agent/MaiLlamaModelCapabilities.cpp
   # 路径与文件系统：不用 std::filesystem，走系统 API。
   # 纯词法的那一半（MaiFilePath.cpp）是可移植的；真正调系统调用的那一半
   # 按平台各一份。形状参考 chromium 的 base/files。
@@ -595,6 +596,7 @@ if(MAIAGENT_BUILD_TESTS)
       MaiToolTests          # 路径边界 + 内置工具
       MaiLlamaToolsTests    # 本地推理生命周期、取消、参数与工作区边界
       MaiLlamaModelClientTests # 本地主模型的完整消息、原生工具模板、流式与取消
+      MaiLlamaModelCapabilitiesTests # 实际 GGUF 矩阵/混合注意力元数据与后端拒绝边界
       MaiLlamaToolCatalogTests # 延迟声明的普通 metadata 查询和严格参数边界
       MaiLlamaToolDiscoveryClientTests # 完整历史、两阶段选择和操作批次安全边界
       MaiDeepSeekWebToolsTests # 结构化检索、抓取、错误分类与有界重试
@@ -637,6 +639,7 @@ if(MAIAGENT_BUILD_TESTS)
     endif()
     add_test(NAME ${test_name} COMMAND ${test_name})
   endforeach()
+  target_link_libraries(MaiLlamaModelCapabilitiesTests PRIVATE mai_llama)
   target_include_directories(MaiStoreTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
   target_include_directories(MaiSessionRenameTests PRIVATE

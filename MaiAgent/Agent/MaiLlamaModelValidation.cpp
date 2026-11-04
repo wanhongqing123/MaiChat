@@ -29,12 +29,19 @@ constexpr std::uint64_t kMaximumArrayItems = 1000000;
 constexpr std::uint64_t kMaximumStringBytes = 1024 * 1024;
 
 // 只执行已审阅的实际模型模板，不能把输入大小限制当成 Jinja 执行预算。
-// 原作者权重：https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/tree/
+// Qwen2.5 原作者权重：https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/tree/
 // 9217f5db79a29953eb74d5343926648285ec7e67；q4_k_m.gguf 中完整模板为 2509 字节，
 // SHA256 d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4。
-constexpr std::array<unsigned char, 32> kApprovedTemplateDigest{
+constexpr std::array<unsigned char, 32> kQwen25TemplateDigest{
     0xd5, 0x49, 0x5a, 0x1e, 0x5d, 0xb0, 0x61, 0x11, 0x32, 0xa9, 0x7e, 0x46, 0xa6, 0x5d, 0xbb, 0x64,
     0xa6, 0x42, 0xa4, 0x99, 0x42, 0x12, 0x28, 0xb9, 0xc8, 0xb9, 0x32, 0x29, 0x09, 0x7f, 0xa9, 0xa4};
+
+// Qwen/Qwen3.5-2B revision 15852e8c16360a2fea060d615a32b45270f8a8fc 的完整原始模板，
+// 共 7755 字节；bartowski GGUF revision 7d26695454df6de5fbcce2e58681e62dae06ce43
+// 保留同一原文。这里只核准已审阅的执行/解析契约，不代表候选权重质量或设备验收通过。
+constexpr std::array<unsigned char, 32> kQwen35TemplateDigest{
+    0x27, 0x3d, 0x8e, 0x0e, 0x68, 0x3b, 0x88, 0x50, 0x71, 0xfb, 0x17, 0xe0, 0x8d, 0x71, 0xe5, 0xf2,
+    0xa5, 0xdd, 0xfb, 0x53, 0x09, 0x75, 0x61, 0x81, 0x68, 0x1d, 0xe4, 0xf5, 0xa1, 0x82, 0x2d, 0x80};
 
 MaiError validateApprovedTemplate(const std::string& source) {
     std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
@@ -42,10 +49,15 @@ MaiError validateApprovedTemplate(const std::string& source) {
     if (EVP_Digest(source.data(), source.size(), digest.data(), &length, EVP_sha256(), nullptr) !=
         1)
         return {MaiErrorCode::Internal, "Local chat template verification is unavailable."};
-    if (source.size() != 2509 || length != kApprovedTemplateDigest.size() ||
-        !std::equal(kApprovedTemplateDigest.begin(), kApprovedTemplateDigest.end(), digest.begin()))
+    const bool qwen25 =
+        source.size() == 2509 && length == kQwen25TemplateDigest.size() &&
+        std::equal(kQwen25TemplateDigest.begin(), kQwen25TemplateDigest.end(), digest.begin());
+    const bool qwen35 =
+        source.size() == 7755 && length == kQwen35TemplateDigest.size() &&
+        std::equal(kQwen35TemplateDigest.begin(), kQwen35TemplateDigest.end(), digest.begin());
+    if (!qwen25 && !qwen35)
         return {MaiErrorCode::NotSupported,
-                "This local Agent version requires the verified official Qwen2.5 tool template."};
+                "This local Agent version requires a verified Qwen2.5 or Qwen3.5 tool template."};
     return {};
 }
 
