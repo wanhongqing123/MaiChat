@@ -104,6 +104,13 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private String pendingMediaSession, pendingFileSession, pendingCameraSession, submittingSession = "";
     private String firstSentSession = "";
     private PopupWindow sessionDrawerPopup;
+    private PopupWindow actionPopup;
+    private AIAssistantActionMenu actionMenu;
+    private ScrollView actionScroll;
+    private View actionAnchor;
+    private String actionOwner = "", actionEffort = "high", actionPolicy = "on-request";
+    private boolean actionRemote, settingsSavePending;
+    private long actionAccountGeneration;
     private LinearLayout sessionDrawerList;
     private ScrollView sessionDrawerScroll;
     private String sessionDrawerSignature = "";
@@ -502,6 +509,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         visibleToUser = value;
         if (browser != null) browser.setVisible(value);
         if (!value && sessionDrawerPopup != null) sessionDrawerPopup.dismiss();
+        if (!value) dismissActionMenu();
         if (!value) {
             invalidateVoiceTranscription();
         }
@@ -519,6 +527,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (browser != null) browser.sessionChanged(next.selected, next.remoteSession != null);
         if (next.remoteSession != null) remoteAttachmentTargets.add(next.selected);
         boolean changedSession = !selected.equals(next.selected);
+        if (actionPopup != null && (changedSession || actionRemote != (next.remoteSession != null)
+                || actionAccountGeneration != MaiChatAuthClient.shared(activity).accountSessionGeneration()))
+            dismissActionMenu();
         if (changedSession) {
             // 切走后即使又切回同一会话，也不能接收旧录音的迟到 final。
             invalidateVoiceTranscription();
@@ -570,6 +581,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         updateMessages();
         updatePending();
         refreshSessionDrawer();
+        updateActionMenu();
     }
     private void probeVideoCircle() {
         videoCircleAccount = MaiChatAuthClient.shared(activity).accountId();
@@ -1373,54 +1385,6 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             }
         });
     }
-    private void reasoningMenu() {
-        if (state == null) return;
-        String[] titles = {"简单", "标准", "深度"};
-        String[] values = {"low", "high", "max"};
-        new AlertDialog.Builder(activity).setTitle("思考强度")
-            .setSingleChoiceItems(titles, java.util.Arrays.asList(values)
-                .indexOf(controller.reasoningEffort()), (dialog, which) -> {
-            if (state.busy()) {
-                Toast.makeText(activity, "请先停止当前任务再调整思考强度", Toast.LENGTH_LONG).show();
-                return;
-            }
-            dialog.dismiss();
-            controller.save(state.model, state.policy, values[which], success -> {
-                if (!success) Toast.makeText(activity, controller.state.error,
-                    Toast.LENGTH_LONG).show();
-            });
-        }).setNegativeButton("取消", null).show();
-    }
-    private void policyMenu() {
-        if (state == null) return;
-        String[] titles = {"请求批准", "帮我批准", "完全访问"};
-        String[] values = {"on-request", "unless-trusted", "never"};
-        int checked = state.policy.equals("never") ? 2
-            : state.policy.equals("unless-trusted") ? 1 : 0;
-        TextView explanation = text("完全访问免除一般操作审批；付费任务仍需确认。",
-            14, MaiChatTheme.SECONDARY);
-        explanation.setPadding(dp(24), dp(8), dp(24), dp(8));
-        new AlertDialog.Builder(activity)
-            .setTitle("操作权限")
-            .setView(explanation)
-            .setSingleChoiceItems(titles, checked, (dialog, which) -> {
-                if (state.busy()) {
-                    Toast.makeText(activity, "请先停止当前任务再修改权限", Toast.LENGTH_LONG).show();
-                    return;
-                }
-                dialog.dismiss();
-                controller.save(state.model, values[which], success -> {
-                    if (!success) Toast.makeText(activity, controller.state.error,
-                        Toast.LENGTH_LONG).show();
-                });
-            })
-            .setNegativeButton("取消", null)
-            .show();
-    }
-    private String policyTitle(String policy) {
-        return policy.equals("never") ? "完全访问"
-            : policy.equals("unless-trusted") ? "帮我批准" : "请求批准";
-    }
     private boolean voiceTouch(MotionEvent event) {
         if (voiceRecorder == null || state == null || state.busy() || submitting
             || (!voiceRecording && !composer.getText().toString().trim().isEmpty())) return false;
@@ -2047,41 +2011,128 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private void menu(View anchor) {
         if (submitting || navigationPending) return;
         if (state == null) return;
-        LinearLayout panel = column();
-        panel.setPadding(0, dp(4), 0, dp(4));
-        panel.setBackground(MaiChatTheme.bordered(Color.WHITE, Color.rgb(232, 235, 240), 14, activity));
-        PopupWindow popup = new PopupWindow(panel, dp(264), LayoutParams.WRAP_CONTENT, true);
-        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-        popup.setOutsideTouchable(true);
-        if (state.remoteSession != null) {
-            panel.addView(actionPanelRow("所属设备", state.remoteSession.optString("device_name"),
-                MaiChatTheme.TEXT, v -> popup.dismiss()), matchWrap());
-            popup.setElevation(dp(14));
-            popup.showAsDropDown(anchor, anchor.getWidth() - dp(264), dp(6));
+        if (actionPopup != null && actionPopup.isShowing()) {
+            dismissActionMenu();
             return;
         }
-        String effort = controller.reasoningEffort();
-        String effortTitle = effort.equals("low") ? "简单" : effort.equals("max") ? "深度" : "标准";
-        panel.addView(actionPanelRow("思考强度", effortTitle, MaiChatTheme.TEXT, v -> {
-            popup.dismiss();
-            reasoningMenu();
-        }), matchWrap());
-        panel.addView(actionPanelDivider(), new LayoutParams(LayoutParams.MATCH_PARENT, dp(1)));
-        panel.addView(actionPanelRow("操作权限", policyTitle(state.policy), MaiChatTheme.TEXT, v -> {
-            popup.dismiss();
-            policyMenu();
-        }), matchWrap());
-        panel.addView(actionPanelDivider(), new LayoutParams(LayoutParams.MATCH_PARENT, dp(1)));
-        View clear = actionPanelRow("清空当前对话", "",
-            selected.isEmpty() || state.busy() ? MaiChatTheme.SECONDARY : MaiChatTheme.RED, v -> {
-            popup.dismiss();
-            confirmClearConversation();
-        });
-        clear.setEnabled(!selected.isEmpty() && !state.busy());
-        panel.addView(clear, matchWrap());
-        panel.measure(MeasureSpec.UNSPECIFIED, MeasureSpec.UNSPECIFIED);
+        hideKeyboard();
+        hideAttachmentPanel();
+        actionOwner = selected;
+        actionRemote = state.remoteSession != null;
+        actionAccountGeneration = MaiChatAuthClient.shared(activity).accountSessionGeneration();
+        actionAnchor = anchor;
+        ScrollView scroll = new ScrollView(activity);
+        scroll.setFillViewport(false);
+        scroll.setClipToPadding(false);
+        scroll.setBackground(MaiChatTheme.bordered(Color.WHITE, Color.rgb(232, 235, 240), 14, activity));
+        PopupWindow popup = new PopupWindow(scroll, dp(264), LayoutParams.WRAP_CONTENT, true);
+        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        popup.setOutsideTouchable(true);
+        popup.setInputMethodMode(PopupWindow.INPUT_METHOD_NOT_NEEDED);
+        popup.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING);
         popup.setElevation(dp(14));
+        actionPopup = popup;
+        actionScroll = scroll;
+        popup.setOnDismissListener(() -> {
+            if (actionPopup != popup) return;
+            actionPopup = null;
+            actionMenu = null;
+            actionScroll = null;
+            actionAnchor = null;
+        });
+        if (actionRemote) {
+            LinearLayout panel = column();
+            panel.addView(actionPanelRow("所属设备", state.remoteSession.optString("device_name"),
+                MaiChatTheme.TEXT, v -> popup.dismiss()), matchWrap());
+            scroll.addView(panel, new ScrollView.LayoutParams(-1, -2));
+        } else {
+            actionMenu = new AIAssistantActionMenu(activity, new AIAssistantActionMenu.Listener() {
+                @Override public void selectEffort(String effort) {
+                    if (actionPopup != popup || !popup.isShowing()) return;
+                    saveActionSettings(effort, state == null ? "" : state.policy);
+                }
+                @Override public void selectPolicy(String policy) {
+                    if (actionPopup != popup || !popup.isShowing()) return;
+                    saveActionSettings(controller.reasoningEffort(), policy);
+                }
+                @Override public void clearConversation() {
+                    if (actionPopup != popup || !popup.isShowing()) return;
+                    if (!canClearFromActionMenu()) return;
+                    dismissActionMenu();
+                    confirmClearConversation();
+                }
+            }, this::resizeActionMenu);
+            scroll.addView(actionMenu, new ScrollView.LayoutParams(-1, -2));
+            updateActionMenu();
+        }
+        popup.setHeight(actionMenuHeight(scroll, anchor));
         popup.showAsDropDown(anchor, anchor.getWidth() - dp(264), dp(6));
+        // Layout changes include rotation and IME dismissal. Recompute this same popup's height
+        // instead of clipping its expanded choices or replacing it with a second window.
+        scroll.addOnLayoutChangeListener((view, l, t, r, b, oldL, oldT, oldR, oldB) -> {
+            if (r - l != oldR - oldL || b - t != oldB - oldT) resizeActionMenu();
+        });
+    }
+    private int actionMenuHeight(ScrollView scroll, View anchor) {
+        android.graphics.Rect visible = new android.graphics.Rect();
+        anchor.getWindowVisibleDisplayFrame(visible);
+        int[] location = new int[2];
+        anchor.getLocationOnScreen(location);
+        int available = Math.max(dp(44), visible.bottom - location[1] - anchor.getHeight() - dp(12));
+        View content = scroll.getChildAt(0);
+        content.measure(MeasureSpec.makeMeasureSpec(dp(264), MeasureSpec.EXACTLY),
+            MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+        return Math.min(available, content.getMeasuredHeight());
+    }
+    private void resizeActionMenu() {
+        PopupWindow popup = actionPopup;
+        ScrollView scroll = actionScroll;
+        View anchor = actionAnchor;
+        if (popup == null || scroll == null || anchor == null || !popup.isShowing()) return;
+        int height = actionMenuHeight(scroll, anchor);
+        if (popup.getHeight() != height)
+            popup.update(anchor, anchor.getWidth() - dp(264), dp(6), dp(264), height);
+    }
+    private boolean ownsActionMenu() {
+        return actionPopup != null && visibleToUser && state != null && !actionRemote
+            && state.remoteSession == null && actionOwner.equals(selected)
+            && actionAccountGeneration == MaiChatAuthClient.shared(activity).accountSessionGeneration();
+    }
+    private boolean canChangeActionSettings() {
+        return ownsActionMenu() && state.ready && !state.busy() && !submitting
+            && !navigationPending && !settingsSavePending;
+    }
+    private boolean canClearFromActionMenu() {
+        return ownsActionMenu() && !selected.isEmpty() && !state.busy() && !submitting
+            && !navigationPending && !settingsSavePending;
+    }
+    private void updateActionMenu() {
+        if (actionMenu == null || state == null) return;
+        // Controller's worker updates reasoningEffort while configuring. Keep the last committed
+        // labels until its completion; unrelated state publication must not enable a second save.
+        if (!settingsSavePending) {
+            actionEffort = controller.reasoningEffort();
+            actionPolicy = state.policy;
+        }
+        actionMenu.update(actionEffort, actionPolicy, canChangeActionSettings(), canClearFromActionMenu());
+    }
+    private void saveActionSettings(String effort, String policy) {
+        if (!canChangeActionSettings()) return;
+        if (effort.equals(controller.reasoningEffort()) && policy.equals(state.policy)) return;
+        final long ownerGeneration = actionAccountGeneration;
+        final String owner = actionOwner;
+        settingsSavePending = true;
+        updateActionMenu();
+        controller.save(state.model, policy, effort, success -> {
+            settingsSavePending = false;
+            updateActionMenu();
+            if (!success && visibleToUser && isAttachedToWindow() && owner.equals(selected)
+                    && ownerGeneration == MaiChatAuthClient.shared(activity).accountSessionGeneration())
+                Toast.makeText(activity, controller.state.error, Toast.LENGTH_LONG).show();
+        });
+    }
+    private void dismissActionMenu() {
+        if (actionPopup != null) actionPopup.dismiss();
     }
     private void confirmClearConversation() {
         if (state == null || state.busy() || selected.isEmpty()) return;
@@ -3272,11 +3323,6 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             row.addView(detail, matchWrap());
         }
         return row;
-    }
-    private View actionPanelDivider() {
-        View divider = new View(activity);
-        divider.setBackgroundColor(Color.rgb(239, 242, 246));
-        return divider;
     }
     private TextView text(String source, int size, int color) {
         return MaiChatTheme.text(activity, source, size, color);
