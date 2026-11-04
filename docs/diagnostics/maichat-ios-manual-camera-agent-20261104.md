@@ -48,3 +48,19 @@ Android 2.2.23/260 已在自有 emulator-5580 安装、冷启动，PID5737；两
 设备检查已读取当前 metadata：iPhone15,3、iOS **27.2**；早期用户报告的 18.7 不能继续作为当前系统版本。186 设备探针改为复用正式 `aiSupportsWholeDeviceScreenCapture()` 及同样的 temp/cache/RVM/LaMa 注册条件，并回传本次实际声明的工具名称。下一步只读取这次独立 probe 的报告，不读取用户会话或凭据；其中选择测试仍不会执行相机或联网工具。
 
 实机 186 操作、截图/录屏、运行进程及最终源码/安装产物绑定由根任务后续追加。原 185 失败与此前严格判分不回写为通过。
+
+## 最终产品提交绑定
+
+对产品提交 `bec74c0ec1a2c8514077011435cd7f62109d910d` 完成只读核对：950 项产品冻结
+输入、最终测试源码和 iOS 12 项输入的原始 Git blob SHA-256 全部匹配。旧 as-built 951 项
+中的测试文件仍明确记录为 `de94d175...`，不与提交中的 `e72a6e76...` 冒称相同；两套完整
+宿主测试的冻结二进制及 green 日志已绑定到后者。没有重新构建 App 或修改产品文件。
+
+两个 Android 260 APK、Desktop 243 全部 242 个普通文件、iOS 186 的 11 个 Mach-O 及
+1396198496 字节模型重哈希均与冻结回执一致。既有 xcresult metadata 回读为 6/6 通过；
+真机安装回执仍为失败 4016，**186 尚未安装、启动或完成实机相机 QA**，等待用户连接设备。
+本次未操作应用、设备或用户数据。
+
+各平台和完整宿主测试目录已写入 `final-source-binding.json`。中央绑定位于
+`/private/tmp/maichat-camera-platform260243-20261104-bhk9fze9/final-source-binding.json`，
+SHA-256 为 `687472d53a25acaa50a911c7e5b4855669be936413fe24c2e10bf5952ccfb4a4`。
