@@ -19,6 +19,9 @@ ImagePreviewDialog::ImagePreviewDialog(const QString& imagePath, QWidget* parent
 ImagePreviewDialog::ImagePreviewDialog(const QPixmap& image, QWidget* parent)
     : QDialog(parent), image_(image) {
     setWindowTitle(QStringLiteral("图片预览"));
+    // 图片使用独立的内容窗口；两种桌面平台都不展示系统标题栏及窗口按钮。
+    // 保留尺寸拖柄、图片点击和 Esc/Enter 关闭，不把媒体嵌回原会话。
+    setWindowFlag(Qt::FramelessWindowHint);
     setModal(true);
     setSizeGripEnabled(true);
     setStyleSheet(QStringLiteral("QDialog { background: #08090b; } QLabel { color: white; }"));

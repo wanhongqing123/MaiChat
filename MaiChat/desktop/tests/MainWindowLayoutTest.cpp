@@ -34,6 +34,7 @@
 #include <QStackedWidget>
 #include <QDir>
 #include <QDropEvent>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QFontMetrics>
@@ -59,6 +60,7 @@
 #include <QUrl>
 #include <QUuid>
 #include <QVBoxLayout>
+#include <QVector>
 #include <QWidget>
 #include <memory>
 
@@ -196,6 +198,8 @@ private slots:
     void imageBubbleOffersContextMenu();
     void imageBubbleUsesNativePixmapPreview();
     void maximizedImageBubbleOpensOnlyOnePreview();
+    void imagePreviewKeepsConversationBackgroundStable_data();
+    void imagePreviewKeepsConversationBackgroundStable();
     void copyAttachmentToPathCopiesOverwritesAndReportsErrors();
     void ctrlShortcutsZoomWholeUi();
     void settingsPanelBorderIsNotCoveredByRows();
@@ -3955,7 +3959,7 @@ void MainWindowLayoutTest::maximizedImageBubbleOpensOnlyOnePreview() {
     QVERIFY(preview != nullptr);
     QTRY_VERIFY(preview->isVisible());
     QVERIFY(!(preview->windowState() & Qt::WindowFullScreen));
-    QVERIFY(!preview->windowFlags().testFlag(Qt::FramelessWindowHint));
+    QVERIFY(preview->windowFlags().testFlag(Qt::FramelessWindowHint));
     QCOMPARE(preview->size(), originalSize);
 
     const QSize resizedPreview(420, 260);
@@ -3980,6 +3984,153 @@ void MainWindowLayoutTest::maximizedImageBubbleOpensOnlyOnePreview() {
     reopened->close();
     QTRY_VERIFY(window.findChildren<ImagePreviewDialog*>().isEmpty());
     QTRY_VERIFY(imageLabel->graphicsEffect() == nullptr);
+}
+
+void MainWindowLayoutTest::imagePreviewKeepsConversationBackgroundStable_data() {
+    QTest::addColumn<bool>("maximized");
+    QTest::newRow("normal") << false;
+    QTest::newRow("maximized") << true;
+}
+
+void MainWindowLayoutTest::imagePreviewKeepsConversationBackgroundStable() {
+    QFETCH(bool, maximized);
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("chat-photo.png"));
+    const QSize originalSize(320, 180);
+    QImage image(originalSize, QImage::Format_RGB32);
+    image.fill(Qt::red);
+    QVERIFY(image.save(path));
+
+    RemoteIMApplication app(QStringLiteral("desktop-user"),
+                            std::make_unique<FakeRemoteIMClient>());
+    app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
+    app.chatState().receiveImage(QStringLiteral("phone-user"), path,
+                                 originalSize.width(), originalSize.height(), 100);
+    MainWindow window(app);
+    window.resize(1280, 800);
+    if (maximized) window.showMaximized();
+    else window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    window.activateWindow();
+    auto* label = window.findChild<QLabel*>(QStringLiteral("messageImageLabel"));
+    auto* scroll = window.findChild<QScrollArea*>(QStringLiteral("messageScroll"));
+    QVERIFY(label && scroll);
+    QTRY_VERIFY(label->pixmap() && !label->pixmap()->isNull());
+    QTest::qWait(100);
+
+    // Observe rendered conversation pixels, away from both image endpoints and
+    // native title/navigation chrome. Ordinary window activation may change the
+    // chrome, but opening an image must not darken and brighten the conversation.
+    const QRect viewport(scroll->viewport()->mapTo(&window, QPoint()),
+                         scroll->viewport()->size());
+    const QRect source(label->mapTo(&window, QPoint()), label->size());
+    const QRect target(window.rect().center() - QPoint(originalSize.width() / 2,
+                                                       originalSize.height() / 2),
+                       originalSize);
+    const QRect imageMotionBounds = source.united(target).adjusted(-48, -48, 48, 48);
+    const QPixmap baseline = window.grab();
+    const QImage baselinePixels = baseline.toImage();
+    const qreal dpr = baseline.devicePixelRatioF();
+    QVector<QPoint> samples;
+    QVector<QColor> colors;
+    for (int yPercent : {20, 50, 80}) {
+        for (int xPercent : {20, 50, 80}) {
+            const QPoint point(viewport.left() + viewport.width() * xPercent / 100,
+                               viewport.top() + viewport.height() * yPercent / 100);
+            const QRect patch(point - QPoint(6, 6), QSize(12, 12));
+            if (!viewport.contains(patch) ||
+                imageMotionBounds.intersects(patch)) continue;
+            const QColor center = baselinePixels.pixelColor(qRound(point.x() * dpr),
+                                                            qRound(point.y() * dpr));
+            if (center.red() < 180 || center.green() < 180 || center.blue() < 180) continue;
+            bool uniform = true;
+            for (int dy : {-5, 0, 5}) {
+                for (int dx : {-5, 0, 5}) {
+                    const QColor pixel = baselinePixels.pixelColor(
+                        qRound((point.x() + dx) * dpr), qRound((point.y() + dy) * dpr));
+                    if (qAbs(pixel.red() - center.red()) > 2 ||
+                        qAbs(pixel.green() - center.green()) > 2 ||
+                        qAbs(pixel.blue() - center.blue()) > 2) uniform = false;
+                }
+            }
+            if (uniform) {
+                samples.append(point);
+                colors.append(center);
+            }
+        }
+    }
+    QVERIFY2(samples.size() >= 2, "Need two unobscured, plain conversation background patches");
+
+    const QString capturePrefix = QString::fromUtf8(qgetenv("MAICHAT_TEST_CAPTURE_PATH"));
+    QStringList failures;
+    QVector<QPair<QString, QPixmap>> captures;
+    const auto captureScreen = [&](const QString& phase) {
+        if (capturePrefix.isEmpty()) return;
+        const QPoint origin = window.mapToGlobal(QPoint());
+        const QString file = capturePrefix + QLatin1Char('.') +
+            QString::fromLatin1(QTest::currentDataTag()) + QLatin1Char('.') + phase +
+            QStringLiteral(".png");
+        captures.append(qMakePair(file, window.screen()->grabWindow(
+            0, origin.x(), origin.y(), window.width(), window.height())));
+    };
+    captureScreen(QStringLiteral("before"));
+    const auto sampleFrame = [&](const QString& phase) {
+        // QWidget::grab composites actual child painting, including translucent
+        // overlays, without depending on another application's screen position.
+        const QPixmap frame = window.grab();
+        const QImage pixels = frame.toImage();
+        const qreal frameDpr = frame.devicePixelRatioF();
+        for (int i = 0; i < samples.size(); ++i) {
+            const QPoint point = samples.at(i);
+            const QColor actual = pixels.pixelColor(qRound(point.x() * frameDpr),
+                                                     qRound(point.y() * frameDpr));
+            const QColor expected = colors.at(i);
+            if (qAbs(actual.red() - expected.red()) > 3 ||
+                qAbs(actual.green() - expected.green()) > 3 ||
+                qAbs(actual.blue() - expected.blue()) > 3) {
+                failures.append(QStringLiteral("%1 at (%2,%3): background %4 became %5")
+                    .arg(phase).arg(point.x()).arg(point.y())
+                    .arg(expected.name(), actual.name()));
+            }
+        }
+        captureScreen(phase);
+    };
+    const auto sampleTransition = [&](const QString& phase, QElapsedTimer& clock) {
+        for (int time : {0, 50, 100, 150, 250, 400}) {
+            const int wait = time - static_cast<int>(clock.elapsed());
+            if (wait > 0) QTest::qWait(wait);
+            sampleFrame(QStringLiteral("%1-%2ms-actual-%3ms")
+                .arg(phase).arg(time).arg(clock.elapsed()));
+        }
+    };
+
+    QElapsedTimer opening;
+    opening.start();
+    QTest::mouseClick(label, Qt::LeftButton);
+    sampleTransition(QStringLiteral("opening"), opening);
+    auto* preview = window.findChild<ImagePreviewDialog*>(QStringLiteral("imagePreviewDialog"));
+    QVERIFY(preview);
+    QTRY_VERIFY(preview->isVisible());
+    if (!preview->windowFlags().testFlag(Qt::FramelessWindowHint))
+        failures.append(QStringLiteral("Image preview exposes native window title and buttons"));
+    sampleFrame(QStringLiteral("preview-visible"));
+
+    QElapsedTimer closing;
+    closing.start();
+    QTest::mouseClick(preview, Qt::LeftButton);
+    sampleTransition(QStringLiteral("closing"), closing);
+    QTRY_VERIFY(window.findChildren<ImagePreviewDialog*>().isEmpty());
+    sampleFrame(QStringLiteral("closed"));
+    // PNG compression is deferred until after the gestures so saving evidence
+    // cannot consume an animation's sampling interval.
+    for (const auto& capture : captures) {
+        if (!capture.second.save(capture.first))
+            failures.append(QStringLiteral("Could not save screen capture: ") + capture.first);
+    }
+    // Collect both directions before asserting so a failing entrance still
+    // yields closing frames and useful evidence for the same reproduction.
+    QVERIFY2(failures.isEmpty(), qPrintable(failures.join(QLatin1Char('\n'))));
 }
 
 void MainWindowLayoutTest::copyAttachmentToPathCopiesOverwritesAndReportsErrors() {

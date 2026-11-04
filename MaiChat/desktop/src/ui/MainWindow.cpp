@@ -6501,15 +6501,13 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
       const QPoint imageInset((dialog->width() - visibleImage.width()) / 2,
                               (dialog->height() - visibleImage.height()) / 2);
       const QRect start(mapFromGlobal(dialog->mapToGlobal(imageInset)), visibleImage);
-      auto *scrim = new QWidget(this);
-      scrim->setObjectName(QStringLiteral("imagePreviewTransitionScrim"));
-      scrim->setGeometry(rect());
-      scrim->setStyleSheet(QStringLiteral("background:#08090b;"));
-      auto *opacity = new QGraphicsOpacityEffect(scrim);
-      opacity->setOpacity(0.62);
-      scrim->setGraphicsEffect(opacity);
-      scrim->show();
-      scrim->raise();
+      // 只让图片本身缩回来源。原会话不参与遮罩/亮度过渡，避免整窗暗亮闪动。
+      // 透明层只拦截动画期间的底页点击，保留原来的模态操作边界。
+      auto *inputBlocker = new QWidget(this);
+      inputBlocker->setGeometry(rect());
+      inputBlocker->setStyleSheet(QStringLiteral("background:transparent;border:none;"));
+      inputBlocker->show();
+      inputBlocker->raise();
       auto *snapshot = new QLabel(this);
       snapshot->setObjectName(QStringLiteral("imagePreviewTransitionSnapshot"));
       snapshot->setPixmap(dialog->sourceImage());
@@ -6519,10 +6517,6 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
       snapshot->raise();
       dialog->setWindowOpacity(0.0);
       dialog->hide();
-      auto *fade = new QPropertyAnimation(opacity, "opacity", scrim);
-      fade->setDuration(220);
-      fade->setStartValue(0.62);
-      fade->setEndValue(0.0);
       auto *shrink = new QPropertyAnimation(snapshot, "geometry", snapshot);
       shrink->setDuration(220);
       shrink->setEasingCurve(QEasingCurve::OutCubic);
@@ -6530,8 +6524,8 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
       shrink->setEndValue(destination);
       QPointer<ImagePreviewDialog> previewGuard(dialog);
       connect(shrink, &QPropertyAnimation::finished, this,
-              [previewGuard, sourceOpacity, scrim, snapshot] {
-                scrim->deleteLater();
+              [previewGuard, sourceOpacity, inputBlocker, snapshot] {
+                inputBlocker->deleteLater();
                 snapshot->deleteLater();
                 if (*sourceOpacity) (*sourceOpacity)->setOpacity(1.0);
                 if (previewGuard) {
@@ -6539,15 +6533,14 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
                   previewGuard->accept();
                 }
               });
-      QTimer::singleShot(50, this, [fade, shrink] {
-        fade->start(QAbstractAnimation::DeleteWhenStopped);
+      QTimer::singleShot(50, this, [shrink] {
         shrink->start(QAbstractAnimation::DeleteWhenStopped);
       });
       return true;
     });
   }
 
-  // 保留普通可缩放窗口；气泡点击时在主窗口里用原缩略图过渡到预览位置。
+  // 独立无系统边框窗口；仅图片从来源过渡，主窗内容及亮度保持不变。
   if (source && source->isVisible() && !source->size().isEmpty()) {
     QPixmap thumbnail;
     QRect start;
@@ -6568,15 +6561,11 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
                          rect().center().y() - dialog->height() / 2,
                          dialog->width(), dialog->height());
       dialog->move(mapToGlobal(target.topLeft()));
-      auto *scrim = new QWidget(this);
-      scrim->setObjectName(QStringLiteral("imagePreviewTransitionScrim"));
-      scrim->setGeometry(rect());
-      scrim->setStyleSheet(QStringLiteral("background:#08090b;"));
-      auto *opacity = new QGraphicsOpacityEffect(scrim);
-      opacity->setOpacity(0);
-      scrim->setGraphicsEffect(opacity);
-      scrim->show();
-      scrim->raise();
+      auto *inputBlocker = new QWidget(this);
+      inputBlocker->setGeometry(rect());
+      inputBlocker->setStyleSheet(QStringLiteral("background:transparent;border:none;"));
+      inputBlocker->show();
+      inputBlocker->raise();
       auto *snapshot = new QLabel(this);
       snapshot->setObjectName(QStringLiteral("imagePreviewTransitionSnapshot"));
       snapshot->setPixmap(thumbnail);
@@ -6588,25 +6577,20 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
       effect->setOpacity(0.0);
       source->setGraphicsEffect(effect);
       *sourceOpacity = effect;
-      auto *fade = new QPropertyAnimation(opacity, "opacity", scrim);
-      fade->setDuration(220);
-      fade->setStartValue(0.0);
-      fade->setEndValue(0.62);
-      fade->start(QAbstractAnimation::DeleteWhenStopped);
       auto *expand = new QPropertyAnimation(snapshot, "geometry", snapshot);
       expand->setDuration(220);
       expand->setEasingCurve(QEasingCurve::OutCubic);
       expand->setStartValue(start);
       expand->setEndValue(target);
       connect(expand, &QPropertyAnimation::finished, this,
-              [this, dialog, scrim, snapshot] {
+              [this, dialog, inputBlocker, snapshot] {
                 if (imagePreviewDialog_ == dialog) {
                   dialog->show();
                   dialog->raise();
                   dialog->activateWindow();
                 }
-                QTimer::singleShot(100, this, [scrim, snapshot] {
-                  scrim->deleteLater();
+                QTimer::singleShot(100, this, [inputBlocker, snapshot] {
+                  inputBlocker->deleteLater();
                   snapshot->deleteLater();
                 });
               });

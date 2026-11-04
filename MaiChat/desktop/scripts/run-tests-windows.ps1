@@ -3,6 +3,7 @@
 param(
     [string]$BuildDirectory = "build-agent",
     [string]$TestRegex = "",
+    [string[]]$TestFunction = @(),
     [switch]$VerboseOutput
 )
 
@@ -50,6 +51,30 @@ public static class MaiChatTestErrorMode {
 }
 '@
 [void][MaiChatTestErrorMode]::SetErrorMode(0x8003)
+
+# Focused UI regressions still enter through the deployed-runtime/error-mode gate above.
+# Resolve the executable from CTest rather than assuming a build layout or bypassing this wrapper.
+if ($TestFunction.Count -gt 0) {
+    $catalogArguments = @("--test-dir", $buildPath, "-C", "Release", "--show-only=json-v1")
+    if (-not [string]::IsNullOrWhiteSpace($TestRegex)) {
+        $catalogArguments += @("-R", $TestRegex)
+    }
+    $catalogText = & ctest @catalogArguments
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $catalog = ($catalogText -join [Environment]::NewLine) | ConvertFrom-Json
+    if (@($catalog.tests).Count -ne 1) {
+        throw "TestFunction requires TestRegex to select exactly one registered Qt test"
+    }
+    $testCommand = @($catalog.tests[0].command)
+    if ($testCommand.Count -eq 0) { throw "Selected CTest has no executable command" }
+    $testArguments = @($testCommand | Select-Object -Skip 1) + $TestFunction
+    Push-Location -LiteralPath $buildPath
+    try {
+        & $testCommand[0] @testArguments
+        $testExit = $LASTEXITCODE
+    } finally { Pop-Location }
+    exit $testExit
+}
 
 $arguments = @("--test-dir", $buildPath, "-C", "Release", "--output-on-failure")
 if ($VerboseOutput) {
