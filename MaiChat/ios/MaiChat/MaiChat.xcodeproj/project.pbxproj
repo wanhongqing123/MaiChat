@@ -10,14 +10,12 @@
 		CBAF828A4376CD76871EC9B4 /* AIPrimaryModelDeviceProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE69F2012EFB4FC038D2D699 /* AIPrimaryModelDeviceProbe.swift */; };
 		E79E75F7D90E3EDE3A1CBCDE /* PrimaryModelsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 170122169934D4AB42F45741 /* PrimaryModelsUITests.swift */; };
 		225101CA9971BD78067D4B27 /* AIPrimaryModelUITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77CF7376E440B653788B306C /* AIPrimaryModelUITestSupport.swift */; };
-		606E36338D399A93C425617A /* AIPrimaryModelSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 23883049D45173CDC34AF59C /* AIPrimaryModelSettingsView.swift */; };
 		0EEE37DA59F5209F3B04CDFB /* LocalModelsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80EADE8B96704E502A286785 /* LocalModelsUITests.swift */; };
 		EDE2A4933AB84C43ECB16128 /* AIOutgoingMessageRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 973AD0DAC1EF76407EBA047E /* AIOutgoingMessageRowView.swift */; };
 		44EC63C4BA77196CD975052F /* AIOutgoingMessagePump.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54AFDD184FEAA7382DDC254D /* AIOutgoingMessagePump.swift */; };
 		932F788A269D48825AD0C797 /* AIOutgoingMessagePayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8958ED4FC332352057B46898 /* AIOutgoingMessagePayload.swift */; };
 		379C9247FD7652C65A375FAE /* AIOutgoingMessageQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C7AB4E0622930D4A056CBE0 /* AIOutgoingMessageQueueTests.swift */; };
 		379D03CAD642A70E76F3F795 /* AILocalModelStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D50A51C97C5A7381086D8241 /* AILocalModelStoreTests.swift */; };
-		9BB153E1210E2FB9D0038C46 /* AILocalModelsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD2318EB3EBD99CD0BBB6BD2 /* AILocalModelsView.swift */; };
 		698F33DD65C4A59DD221CFA8 /* AIOutgoingMessageQueue.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE78D1022E3334AA73A37B92 /* AIOutgoingMessageQueue.swift */; };
 		D526175AB40D14E9E37BBD39 /* AILocalModelStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F48E0D4E7D60AF8CD083F504 /* AILocalModelStore.swift */; };
 		7BE2BC4EA367B7517B6D286D /* LocalInferenceUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BCB5FFEB9C9B11BB747DE4D /* LocalInferenceUITests.swift */; };
@@ -206,14 +204,12 @@
 		CE69F2012EFB4FC038D2D699 /* AIPrimaryModelDeviceProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/DebugSupport/AIPrimaryModelDeviceProbe.swift"; sourceTree = SOURCE_ROOT; };
 		170122169934D4AB42F45741 /* PrimaryModelsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatUITests/PrimaryModelsUITests.swift"; sourceTree = SOURCE_ROOT; };
 		77CF7376E440B653788B306C /* AIPrimaryModelUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/DebugSupport/AIPrimaryModelUITestSupport.swift"; sourceTree = SOURCE_ROOT; };
-		23883049D45173CDC34AF59C /* AIPrimaryModelSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/Views/AIPrimaryModelSettingsView.swift"; sourceTree = SOURCE_ROOT; };
 		80EADE8B96704E502A286785 /* LocalModelsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatUITests/LocalModelsUITests.swift"; sourceTree = SOURCE_ROOT; };
 		973AD0DAC1EF76407EBA047E /* AIOutgoingMessageRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/Views/AIOutgoingMessageRowView.swift"; sourceTree = SOURCE_ROOT; };
 		54AFDD184FEAA7382DDC254D /* AIOutgoingMessagePump.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/AIOutgoingMessagePump.swift"; sourceTree = SOURCE_ROOT; };
 		8958ED4FC332352057B46898 /* AIOutgoingMessagePayload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/AIOutgoingMessagePayload.swift"; sourceTree = SOURCE_ROOT; };
 		5C7AB4E0622930D4A056CBE0 /* AIOutgoingMessageQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatTests/AIOutgoingMessageQueueTests.swift"; sourceTree = SOURCE_ROOT; };
 		D50A51C97C5A7381086D8241 /* AILocalModelStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatTests/AILocalModelStoreTests.swift"; sourceTree = SOURCE_ROOT; };
-		CD2318EB3EBD99CD0BBB6BD2 /* AILocalModelsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/Views/AILocalModelsView.swift"; sourceTree = SOURCE_ROOT; };
 		EE78D1022E3334AA73A37B92 /* AIOutgoingMessageQueue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatCore/Assistant/AIOutgoingMessageQueue.swift"; sourceTree = SOURCE_ROOT; };
 		F48E0D4E7D60AF8CD083F504 /* AILocalModelStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatCore/Assistant/AILocalModelStore.swift"; sourceTree = SOURCE_ROOT; };
 		7BCB5FFEB9C9B11BB747DE4D /* LocalInferenceUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalInferenceUITests.swift; sourceTree = "<group>"; };
@@ -712,10 +708,8 @@
 				8958ED4FC332352057B46898 /* AIOutgoingMessagePayload.swift */,
 				5C7AB4E0622930D4A056CBE0 /* AIOutgoingMessageQueueTests.swift */,
 				D50A51C97C5A7381086D8241 /* AILocalModelStoreTests.swift */,
-				23883049D45173CDC34AF59C /* AIPrimaryModelSettingsView.swift */,
 				CE69F2012EFB4FC038D2D699 /* AIPrimaryModelDeviceProbe.swift */,
 				77CF7376E440B653788B306C /* AIPrimaryModelUITestSupport.swift */,
-				CD2318EB3EBD99CD0BBB6BD2 /* AILocalModelsView.swift */,
 				EE78D1022E3334AA73A37B92 /* AIOutgoingMessageQueue.swift */,
 				F48E0D4E7D60AF8CD083F504 /* AILocalModelStore.swift */,
 				77FEC2B53DE369B0BBAE5A10 /* Products */,
@@ -818,6 +812,7 @@
 				FF8236E8DE97989BDFBD9493 /* Build MaiAgent */,
 				AC6ECB119E2A73D2BBDAE0EC /* Sources */,
 				3D122CAA634FBFB42F650CDF /* Resources */,
+				C9D11D36D9F9496A96B77B41 /* Bundle Primary Model */,
 				8E103EF7F186558DF147E3F6 /* Frameworks */,
 				FF4A677DEFE40393506C34EC /* Embed Frameworks */,
 				B2AFD5CF0348E3A7B0A41273 /* [CP] Embed Pods Frameworks */,
@@ -976,6 +971,32 @@
 			shellPath = /bin/sh;
 			shellScript = "bash \"$PROJECT_DIR/scripts/build-mobile-agent.sh\"";
 		};
+		C9D11D36D9F9496A96B77B41 /* Bundle Primary Model */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputPaths = (
+				"$(PROJECT_DIR)/scripts/prepare-bundled-primary-model.py",
+				"$(PROJECT_DIR)/BundledPrimaryModel/manifest.json",
+				"$(PROJECT_DIR)/BundledPrimaryModel/LICENSE",
+				"$(PROJECT_DIR)/BundledPrimaryModel/SOURCE.json",
+				"$(PROJECT_DIR)/BundledPrimaryModel/UPSTREAM_MODEL_CARD.md",
+				"$(PROJECT_DIR)/BundledPrimaryModel/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+			);
+			name = "Bundle Primary Model";
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/manifest.json",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/LICENSE",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/SOURCE.json",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/UPSTREAM_MODEL_CARD.md",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "python3 \"$PROJECT_DIR/scripts/prepare-bundled-primary-model.py\" --bundle-directory \"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MaiLocalModels/Primary\"";
+			showEnvVarsInLog = 0;
+		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -1052,10 +1073,8 @@
 				EDE2A4933AB84C43ECB16128 /* AIOutgoingMessageRowView.swift in Sources */,
 				44EC63C4BA77196CD975052F /* AIOutgoingMessagePump.swift in Sources */,
 				932F788A269D48825AD0C797 /* AIOutgoingMessagePayload.swift in Sources */,
-				606E36338D399A93C425617A /* AIPrimaryModelSettingsView.swift in Sources */,
 				CBAF828A4376CD76871EC9B4 /* AIPrimaryModelDeviceProbe.swift in Sources */,
 				225101CA9971BD78067D4B27 /* AIPrimaryModelUITestSupport.swift in Sources */,
-				9BB153E1210E2FB9D0038C46 /* AILocalModelsView.swift in Sources */,
 				F77BA084695F31C9AD6308A7 /* AIMobileScreenFramesView.swift in Sources */,
 				C4A881E263A97B3D41E6C001 /* AIMobileCameraCapture.swift in Sources */,
 				0329ABDC04BBAC38945C24FA /* AIMobileHostToolProvider.swift in Sources */,
@@ -1241,7 +1260,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 180;
+				CURRENT_PROJECT_VERSION = 183;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1418,7 +1437,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 180;
+				CURRENT_PROJECT_VERSION = 183;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;

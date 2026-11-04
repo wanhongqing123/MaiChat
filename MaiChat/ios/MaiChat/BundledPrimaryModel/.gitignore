@@ -1,0 +1,3 @@
+# Pinned public weights are verified and staged locally; they are packaged in the App, not Git.
+*.gguf
+.primary-model-*

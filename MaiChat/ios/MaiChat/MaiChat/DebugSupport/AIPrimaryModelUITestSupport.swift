@@ -1,4 +1,4 @@
-// 文件作用：正常 Root 的本地主模型 QA 使用显式公共 GGUF 文件；不替换推理或生成内容。
+// 文件作用：观察正常 Root 随包本地主模型的实际配置、推理与生成内容，不替换模型结果。
 #if DEBUG && targetEnvironment(simulator)
 import SwiftUI
 import Metal
@@ -15,15 +15,6 @@ enum AIPrimaryModelUITestSupport {
         return arguments.contains("--ai-ui-test") && arguments.contains("--ai-primary-model-ui-test")
     }
 
-    static var modelSource: URL? {
-        guard isRequested,
-              let path = ProcessInfo.processInfo.environment["MAICHAT_PRIMARY_MODEL_FIXTURE_PATH"],
-              (path as NSString).isAbsolutePath else { return nil }
-        let url = URL(fileURLWithPath: path).standardizedFileURL
-        guard url.pathExtension.lowercased() == "gguf",
-              FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return url
-    }
 }
 
 /// 只观察真实配置和已持久化消息，绝不安装 handler 或生成测试回复。

@@ -70,6 +70,19 @@ struct AIModelSettings: Codable, Sendable, Equatable {
         return ["deepseek-flash", "glm-5.3", "glm-5.3-flash"].contains(saved) ? saved : "deepseek-flash"
     }
     var displayName: String { isLocalModel ? "本地模型" : "云端模型" }
+
+    /// 普通选择只区分云端和随包本地模型；旧文件 ID 仅保留兼容解码，不再要求用户管理文件。
+    mutating func selectModelSource(local: Bool) {
+        if local {
+            if !isLocalModel { cloudModel = effectiveCloudModel }
+            modelProvider = "llama"
+            localModelID = AILocalModelStore.bundledPrimaryID
+            localProjectorID = nil
+            model = "local:" + AILocalModelStore.bundledPrimaryID
+        } else {
+            selectModel(effectiveCloudModel)
+        }
+    }
     // Optional so settings written before this field existed still decode.
     var reasoningEffort: String? = nil
     var effectiveReasoningEffort: String {
@@ -1253,8 +1266,9 @@ actor AIAssistantBackend {
         if FileManager.default.fileExists(atPath: file.path) {
             settings = try JSONDecoder().decode(AIModelSettings.self, from: Data(contentsOf: file))
         }
-        // 恢复原供应商；本地配置直接解析已有权重，不等待云端模型 Key 或媒体凭据。
-        if !settings.isLocalModel { settings.selectModel(settings.model) }
+        // 恢复原供应商；本地选择统一迁到随包版本，不再依赖用户上次导入的文件。
+        if settings.isLocalModel { settings.selectModelSource(local: true) }
+        else { settings.selectModel(settings.model) }
         var key = ""
         #if DEBUG && targetEnvironment(simulator)
         let primaryModelUITest = AIPrimaryModelUITestSupport.isRequested
@@ -1288,10 +1302,10 @@ actor AIAssistantBackend {
         } catch {
             try checkLifecycle()
             guard settings.isLocalModel else { throw error }
-            // 缺失或不兼容的权重保留已存选择，允许用户从主模型页重新导入或改选。
+            // 包内模型异常保留当前来源；不静默改用云端，也不要求用户修复文件目录。
             return AIAssistantOpenResult(settings: settings,
                 workspacePath: directory.appendingPathComponent("Workspace", isDirectory: true).path,
-                configurationError: "本地模型无法打开，请在“更多→主模型”中检查模型文件。")
+                configurationError: "内置本地模型暂时不可用，请重试；若仍失败，请更新 App。")
         }
         #if DEBUG && targetEnvironment(simulator)
         if uiTest && !settings.isLocalModel { _ = try requestAgentOperation("create") }
@@ -1305,17 +1319,7 @@ actor AIAssistantBackend {
 
     private func resolveLocalConfiguration(_ config: AIModelSettings) async throws -> AILocalModelSelection? {
         guard config.isLocalModel else { return nil }
-        guard let id = config.localModelID, !id.isEmpty,
-              (128...32768).contains(config.effectiveLocalContextSize),
-              (0...4096).contains(config.effectiveLocalMaximumTokens),
-              config.effectiveLocalMaximumTokens < config.effectiveLocalContextSize,
-              (1...64).contains(config.effectiveLocalThreads) else {
-            throw AIBackendError(message: "请选择本地 GGUF，并检查上下文、生成长度和 CPU 线程参数")
-        }
-        guard config.localProjectorID?.isEmpty != false else {
-            throw AIBackendError(message: "本地主模型当前支持文本和工具；图片与 mmproj 请使用独立本地测试")
-        }
-        return try await AILocalModelStore.shared.resolve(modelID: id, projectorID: nil)
+        return try await AILocalModelStore.shared.bundledPrimarySelection()
     }
 
     private func configure(_ config: AIModelSettings, key: String, local: AILocalModelSelection? = nil) throws {
@@ -1330,7 +1334,6 @@ actor AIAssistantBackend {
         let workspace = root.appendingPathComponent("Workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let appRootPath = AIAssistantPathPolicy.appRoot(workspacePath: workspace.path)
-        let localTestModelPath = AILocalModelStore.ensureBundledTestModel()?.path ?? ""
         _ = try requestAgentOperation(
             "configure",
             values: [
@@ -1345,7 +1348,7 @@ actor AIAssistantBackend {
             "localContextSize": config.effectiveLocalContextSize,
             "localMaximumTokens": config.effectiveLocalMaximumTokens,
             "localThreads": config.effectiveLocalThreads,
-            "localTestModelPath": localTestModelPath,
+            "localTestModelPath": local?.modelURL.path ?? "",
             "supportsScreenCapture": aiSupportsWholeDeviceScreenCapture(),
             "reasoningEffort": config.effectiveReasoningEffort,
             "caBundle": caBundle?.path ?? "",
@@ -1374,7 +1377,14 @@ actor AIAssistantBackend {
         #else
         let isLocalUITest = false
         #endif
-        let testModel = isLocalUITest && config.model == "test-model"
+        #if DEBUG && targetEnvironment(simulator)
+        let primaryModelUITest = AIPrimaryModelUITestSupport.isRequested
+        #else
+        let primaryModelUITest = false
+        #endif
+        // QA 的云端回切仍使用原合成端点；不能为测试内联选项获取账号凭据或请求供应商。
+        let testModel = isLocalUITest && !config.isLocalModel &&
+            (config.model == "test-model" || primaryModelUITest)
         guard config.modelProvider == nil || ["remote", "llama"].contains(config.modelProvider ?? "") else {
             throw AIBackendError(message: "请选择受支持的模型来源")
         }
@@ -1383,9 +1393,11 @@ actor AIAssistantBackend {
         }
         var normalized = config
         if config.isLocalModel {
-            guard let id = config.localModelID, !id.isEmpty else { throw AIBackendError(message: "请先选择本地模型") }
-            normalized.model = "local:" + id
-        } else if testModel { normalized.baseUrl = settings.baseUrl }
+            normalized.selectModelSource(local: true)
+        } else if testModel {
+            normalized.model = "test-model"
+            normalized.baseUrl = settings.baseUrl
+        }
         else { normalized.selectModel(config.model) }
         if !normalized.isLocalModel && !testModel && storedKey(for: normalized.model).isEmpty {
             _ = try? await AICloudCredentialSync.refreshAccountModelKeysIfAvailable()
@@ -1629,6 +1641,7 @@ final class AIAssistantModel: ObservableObject {
     @Published var questions: [AIQuestion] = []
     @Published var selected = ""
     @Published var settings = AIModelSettings()
+    @Published private(set) var changingModelSource = false
     @Published private(set) var actualModelID = ""
     @Published private(set) var actualWire = ""
     @Published private(set) var actualGPUSelected = false
@@ -3787,6 +3800,17 @@ final class AIAssistantModel: ObservableObject {
             ownerLoginSessionID: login, sessionID: session)
         try await MaiCloudDriveClient.shared.cleanupSessionRoom(room)
     }
+    /// 与思考强度相同，点选立即提交；成功前保留原来源和原会话，不创建设置弹窗。
+    func selectPrimaryModelSource(local: Bool) async {
+        guard ready, selectedRemote == nil, !busy, !isSubmitting, !changingModelSource,
+              settings.isLocalModel != local else { return }
+        changingModelSource = true
+        defer { changingModelSource = false }
+        var next = settings
+        next.selectModelSource(local: local)
+        _ = await save(next)
+    }
+
     func save(_ config: AIModelSettings) async -> Bool {
         guard self === Self.shared, !outgoingPermanentlyInvalidated else { return false }
         do {

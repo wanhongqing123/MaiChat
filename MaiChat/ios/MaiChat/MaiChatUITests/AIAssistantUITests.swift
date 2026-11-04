@@ -29,6 +29,19 @@ final class AIAssistantUITests: XCTestCase {
         return app
     }
 
+    /// 空稿、有稿和等待回执时右侧都只保留附件加号；发送统一由真实键盘回车触发。
+    @MainActor private func assertComposerShowsOnlyPlus(_ app: XCUIApplication,
+                                                       file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertFalse(app.buttons["停止"].exists, file: file, line: line)
+        XCTAssertFalse(app.buttons["ai-send-draft"].exists, file: file, line: line)
+        XCTAssertFalse(app.buttons["发送给 AI"].exists, file: file, line: line)
+        XCTAssertFalse(app.buttons["补充当前任务"].exists, file: file, line: line)
+        let attachments = app.buttons["展开更多功能"]
+        XCTAssertTrue(attachments.exists, file: file, line: line)
+        XCTAssertTrue(attachments.isEnabled, file: file, line: line)
+        XCTAssertTrue(attachments.isHittable, file: file, line: line)
+    }
+
     @MainActor func testSteeringArchivePinsSurviveRejectionAndReleaseWithHistory() {
         let app = launchSteeringFixture(archive: true)
         defer { app.terminate() }
@@ -42,39 +55,32 @@ final class AIAssistantUITests: XCTestCase {
     @MainActor func testBusyComposerSupplementsCapturedTurnAfterReceipt() {
         let app = launchSteeringFixture()
         defer { app.terminate() }
-        XCTAssertFalse(app.buttons["停止"].exists, "用户最新要求输入栏移除停止")
+        assertComposerShowsOnlyPlus(app)
         assertSteeringTaskRemainsBusy(app)
-        XCTAssertFalse(app.buttons["ai-send-draft"].exists)
         let editor = app.textViews["ai-composer"]
         editor.tap()
         editor.typeText("保留原图细节")
-        let send = app.buttons["ai-send-draft"]
-        XCTAssertTrue(send.isEnabled)
-        XCTAssertEqual(send.label, "补充当前任务")
-        XCTAssertFalse(app.buttons["停止"].exists, "忙且有草稿时也不能恢复模型停止按钮")
-        XCTAssertTrue(app.buttons["展开更多功能"].isEnabled, "附件入口不能随模型忙碌消失")
-        send.tap()
+        assertComposerShowsOnlyPlus(app)
+        editor.typeText("\n")
         let receipt = app.staticTexts["steering-receipt"]
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "label == %@", "已落库 1 · msg_fixture_turn_A"),
             object: receipt)], timeout: 5), .completed)
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == false"), object: send)], timeout: 5), .completed)
-        XCTAssertFalse(app.buttons["停止"].exists)
+            predicate: NSPredicate(format: "value == %@", ""), object: editor)], timeout: 5), .completed)
+        assertComposerShowsOnlyPlus(app)
         assertSteeringTaskRemainsBusy(app)
     }
 
     @MainActor func testBusyComposerOmitsStopAndKeepsAttachmentsAndSending() {
         let app = launchSteeringFixture()
         defer { app.terminate() }
-        let stop = app.buttons["停止"]
-        let send = app.buttons["ai-send-draft"]
         let editor = app.textViews["ai-composer"]
         let emptyBefore = XCTAttachment(screenshot: app.screenshot())
-        emptyBefore.name = "busy-composer-empty-without-stop"
+        emptyBefore.name = "busy-composer-empty-only-plus"
         emptyBefore.lifetime = .keepAlways
         add(emptyBefore)
-        XCTAssertFalse(stop.exists, "忙且空草稿也不显示停止")
+        assertComposerShowsOnlyPlus(app)
         let attachments = app.buttons["展开更多功能"]
         XCTAssertTrue(attachments.exists)
         XCTAssertTrue(attachments.isEnabled)
@@ -83,17 +89,15 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertTrue(app.buttons["相册"].exists)
         app.buttons["收起更多功能"].tap()
         assertSteeringTaskRemainsBusy(app)
-        XCTAssertFalse(send.exists)
+        assertComposerShowsOnlyPlus(app)
         editor.tap()
         editor.typeText("补充细节")
-        XCTAssertTrue(send.isEnabled)
-        XCTAssertEqual(send.label, "补充当前任务")
+        assertComposerShowsOnlyPlus(app)
         let draftScreenshot = XCTAttachment(screenshot: app.screenshot())
-        draftScreenshot.name = "busy-composer-draft-send-and-attachments-without-stop"
+        draftScreenshot.name = "busy-composer-nonempty-draft-only-plus"
         draftScreenshot.lifetime = .keepAlways
         add(draftScreenshot)
-        // 旧产品在此同时挂载 stop+send；以真实 Root 的 AX/截图验证，不能只测按钮样式。
-        XCTAssertFalse(stop.exists, "有草稿时不能同时显示停止与发送两个右侧按钮")
+        // 以真实 Root 的 AX 和非空草稿截图验证右侧只保留加号。
         XCTAssertEqual(editor.value as? String, "补充细节")
         editor.tap()
         for remaining in ["补充细", "补充", "补", ""] {
@@ -104,16 +108,82 @@ final class AIAssistantUITests: XCTestCase {
             XCTAssertEqual(editor.value as? String, remaining)
         }
         XCTAssertEqual(editor.value as? String, "")
-        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == false"), object: send)], timeout: 3), .completed)
-        XCTAssertFalse(stop.exists, "清空草稿不重新添加已移除的停止按钮")
-        XCTAssertTrue(app.buttons["展开更多功能"].exists)
-        XCTAssertTrue(app.buttons["展开更多功能"].isEnabled)
+        assertComposerShowsOnlyPlus(app)
         assertSteeringTaskRemainsBusy(app)
         let emptyScreenshot = XCTAttachment(screenshot: app.screenshot())
-        emptyScreenshot.name = "busy-composer-cleared-draft-without-stop"
+        emptyScreenshot.name = "busy-composer-cleared-draft-only-plus"
         emptyScreenshot.lifetime = .keepAlways
         add(emptyScreenshot)
+    }
+
+    /// 复用真实手动快门导入；空文字仍须开放键盘发送，并把照片交给普通持久队列。
+    @MainActor func testAttachmentOnlyDraftEnqueuesUsingKeyboardSend() throws {
+        #if DEBUG && targetEnvironment(simulator)
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-session-reveal-ui-test", "--ai-manual-camera-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let tab = app.buttons["创作中心"]
+        XCTAssertTrue(tab.waitForExistence(timeout: 12))
+        tab.tap()
+        let editor = app.textViews["ai-composer"]
+        XCTAssertTrue(editor.waitForExistence(timeout: 8))
+        let plus = app.buttons["展开更多功能"]
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"), object: plus)], timeout: 8), .completed)
+        plus.tap()
+        let camera = app.buttons["拍摄"]
+        XCTAssertTrue(camera.waitForExistence(timeout: 3))
+        camera.tap()
+        let shutter = app.buttons["ai-manual-camera-shutter"]
+        XCTAssertTrue(shutter.waitForExistence(timeout: 4))
+        shutter.tap()
+        let pending = app.scrollViews["ai-pending-attachments"]
+        XCTAssertTrue(pending.waitForExistence(timeout: 8))
+        XCTAssertTrue(pending.buttons.matching(NSPredicate(
+            format: "label BEGINSWITH %@", "预览图片")).firstMatch.exists)
+        let removals = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "ai-remove-attachment-"))
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "count == 1"), object: removals)], timeout: 8), .completed)
+        let relativePath = String(removals.firstMatch.identifier.dropFirst("ai-remove-attachment-".count))
+        let filename = (relativePath as NSString).lastPathComponent
+        XCTAssertFalse(filename.isEmpty)
+        XCTAssertEqual(editor.value as? String, "", "只有实际导入的照片，不填写说明文字")
+        assertComposerShowsOnlyPlus(app)
+
+        editor.tap()
+        let keyboardSend = app.keyboards.buttons.matching(NSPredicate(
+            format: "label ==[c] %@ OR label == %@ OR identifier ==[c] %@", "send", "发送", "send")).firstMatch
+        XCTAssertTrue(keyboardSend.waitForExistence(timeout: 5))
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"), object: keyboardSend)], timeout: 5), .completed,
+            "空文字但有附件时，系统键盘发送键必须可用")
+        let draft = XCTAttachment(screenshot: app.screenshot())
+        draft.name = "attachment-only-draft-enabled-keyboard-send"
+        draft.lifetime = .keepAlways
+        add(draft)
+        keyboardSend.tap()
+
+        // 该现有 fixture 只准备导入目录，不配置 Agent；验证本地入队，不冒充模型接收或回复。
+        let outgoing = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "outgoing-message-")).firstMatch
+        XCTAssertTrue(outgoing.waitForExistence(timeout: 8), "键盘发送必须生成真实持久队列消息")
+        XCTAssertTrue(outgoing.staticTexts[filename].exists, "队列消息必须保留实际导入照片的文件名")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: pending)], timeout: 8), .completed,
+            "本地持久入队后，照片应从输入草稿转移到队列消息")
+        XCTAssertEqual(editor.value as? String, "")
+        assertComposerShowsOnlyPlus(app)
+        let queued = XCTAttachment(screenshot: app.screenshot())
+        queued.name = "attachment-only-keyboard-send-persisted-queue"
+        queued.lifetime = .keepAlways
+        add(queued)
+        #else
+        throw XCTSkip("仅在 Debug 模拟器使用现有合成快门、真实导入和本地持久队列")
+        #endif
     }
 
     @MainActor private func assertSteeringTaskRemainsBusy(_ app: XCUIApplication) {
@@ -132,8 +202,9 @@ final class AIAssistantUITests: XCTestCase {
         for (index, text) in texts.enumerated() {
             editor.tap()
             editor.typeText(text)
-            XCTAssertTrue(app.buttons["ai-send-draft"].isEnabled, "前一条等待回执不能阻止再次发送")
-            app.buttons["ai-send-draft"].tap()
+            assertComposerShowsOnlyPlus(app)
+            XCTAssertTrue(editor.isEnabled, "前一条等待回执不能阻止键盘再次发送")
+            editor.typeText("\n")
             XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
                 predicate: NSPredicate(format: "value == %@", ""), object: editor)], timeout: 1.5), .completed,
                 "持久入队后即清稿，不能等待尚未放行的native回执")
@@ -149,8 +220,7 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertEqual(held["pending_entries"] as? Int, 5, "五条都必须已经真实持久入队")
         XCTAssertEqual(held["ack_gate_waiting"] as? Bool, true)
         XCTAssertTrue(app.staticTexts["排队中"].exists)
-        XCTAssertFalse(app.buttons["停止"].exists, "发送后等待确认也不能重新挂载模型停止按钮")
-        XCTAssertTrue(app.buttons["展开更多功能"].isEnabled, "连续发送及待确认时仍保留可用加号")
+        assertComposerShowsOnlyPlus(app)
         let queued = XCTAttachment(screenshot: app.screenshot())
         queued.name = "five-outgoing-messages-queued-during-native-ack"
         queued.lifetime = .keepAlways
@@ -165,10 +235,10 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertEqual(ledger["texts"] as? [String], texts)
         XCTAssertEqual(ledger["accepted"] as? Int, 5)
         XCTAssertEqual(Set(try XCTUnwrap(ledger["request_ids"] as? [String])).count, 5,
-                       "同文两次点击必须是两个独立消息")
+                       "同文两次键盘发送必须是两个独立消息")
         XCTAssertEqual(Set(try XCTUnwrap(ledger["turn_ids"] as? [String])), ["msg_fixture_turn_A"])
         assertSteeringTaskRemainsBusy(app)
-        XCTAssertFalse(app.buttons["停止"].exists)
+        assertComposerShowsOnlyPlus(app)
     }
 
     @MainActor private func steeringLedger(_ app: XCUIApplication) throws -> [String: Any] {
@@ -182,7 +252,8 @@ final class AIAssistantUITests: XCTestCase {
         let editor = app.textViews["ai-composer"]
         editor.tap()
         editor.typeText("重试补充")
-        app.buttons["ai-send-draft"].tap()
+        assertComposerShowsOnlyPlus(app)
+        editor.typeText("\n")
         let receipt = app.staticTexts["steering-receipt"]
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "label == %@", "送达未知，队列保留"),
@@ -195,8 +266,8 @@ final class AIAssistantUITests: XCTestCase {
             predicate: NSPredicate(format: "label == %@", "已落库 2 · msg_fixture_turn_A"),
             object: receipt)], timeout: 5), .completed)
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == false"),
-            object: app.buttons["ai-send-draft"])], timeout: 5), .completed)
+            predicate: NSPredicate(format: "value == %@", ""), object: editor)], timeout: 5), .completed)
+        assertComposerShowsOnlyPlus(app)
         let ledger = try steeringLedger(app)
         let ids = try XCTUnwrap(ledger["request_ids"] as? [String])
         XCTAssertEqual(ids.count, 2)
@@ -205,7 +276,8 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertTrue(editor.waitForExistence(timeout: 2))
         editor.tap()
         editor.typeText("收尾拒绝")
-        app.buttons["ai-send-draft"].tap()
+        assertComposerShowsOnlyPlus(app)
+        editor.typeText("\n")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "label == %@", "收尾拒绝，未启动新任务"),
             object: receipt)], timeout: 5), .completed)
@@ -220,7 +292,8 @@ final class AIAssistantUITests: XCTestCase {
         let editor = app.textViews["ai-composer"]
         editor.tap()
         editor.typeText("切会话保留")
-        app.buttons["ai-send-draft"].tap()
+        assertComposerShowsOnlyPlus(app)
+        editor.typeText("\n")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "value == %@", ""), object: editor)], timeout: 1.5), .completed)
         app.buttons["steering-other"].tap()
@@ -235,11 +308,12 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertEqual(editor.value as? String, "")
         XCTAssertEqual(receipt.label, "已落库 1 · msg_fixture_turn_A")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == false"),
-            object: app.buttons["ai-send-draft"])], timeout: 5), .completed)
+            predicate: NSPredicate(format: "value == %@", ""), object: editor)], timeout: 5), .completed)
+        assertComposerShowsOnlyPlus(app)
         editor.tap()
         editor.typeText("切账号保留")
-        app.buttons["ai-send-draft"].tap()
+        assertComposerShowsOnlyPlus(app)
+        editor.typeText("\n")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "value == %@", ""), object: editor)], timeout: 1.5), .completed)
         app.buttons["steering-account"].tap()
@@ -368,7 +442,7 @@ final class AIAssistantUITests: XCTestCase {
         app.buttons["新对话"].tap()
         composer.tap()
         composer.typeText("second-session " + token)
-        app.buttons["发送"].tap()
+        composer.typeText("\n")
         XCTAssertTrue(app.staticTexts["收到"].waitForExistence(timeout: 25))
         openDrawer()
         XCTAssertTrue(app.buttons[originalIdentifier].label.contains(title))
@@ -1948,9 +2022,8 @@ final class AIAssistantUITests: XCTestCase {
             app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.7)).tap()
             composer.tap()
             composer.typeText("请只回复这个字符串：\(marker)")
-            let send = app.buttons["ai-send-draft"]
-            XCTAssertTrue(send.waitForExistence(timeout: 10))
-            send.tap()
+            assertComposerShowsOnlyPlus(app)
+            composer.typeText("\n")
             let answer = app.staticTexts[marker]
             let responded = answer.waitForExistence(timeout: 150)
             let capture = XCTAttachment(screenshot: app.screenshot())
@@ -2074,9 +2147,8 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertTrue(composer.waitForExistence(timeout: 10))
         composer.tap()
         composer.typeText("从 iPhone 请求本机假 Mac")
-        let send = app.buttons["ai-send-draft"]
-        XCTAssertTrue(send.waitForExistence(timeout: 10))
-        send.tap()
+        assertComposerShowsOnlyPlus(app)
+        composer.typeText("\n")
         let echoed = app.staticTexts.matching(
             NSPredicate(format: "label CONTAINS %@", "从 iPhone 请求本机假 Mac")
         ).firstMatch
@@ -2084,8 +2156,8 @@ final class AIAssistantUITests: XCTestCase {
 
         composer.tap()
         composer.typeText("请拒绝此操作")
-        XCTAssertTrue(send.waitForExistence(timeout: 10))
-        send.tap()
+        assertComposerShowsOnlyPlus(app)
+        composer.typeText("\n")
         XCTAssertTrue(app.staticTexts["所属设备拒绝了操作"].waitForExistence(timeout: 30))
         XCTAssertEqual(composer.value as? String, "请拒绝此操作")
         let rejected = XCTAttachment(screenshot: app.screenshot())
@@ -2251,7 +2323,7 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertTrue(composer.waitForExistence(timeout: 10))
         composer.tap()
         composer.typeText("remote-session-create-tool")
-        app.buttons["ai-send-draft"].tap()
+        composer.typeText("\n")
         XCTAssertTrue(app.staticTexts["REMOTE_CREATE_TOOL_DONE"].waitForExistence(timeout: 30))
         let (data, _) = try await URLSession.shared.data(from: statusURL)
         let status = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -2287,7 +2359,7 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertTrue(composer.waitForExistence(timeout: 20))
         composer.tap()
         composer.typeText("remote-session-delete-tool")
-        app.buttons["ai-send-draft"].tap()
+        composer.typeText("\n")
         let approve = app.buttons["允许一次"]
         XCTAssertTrue(approve.waitForExistence(timeout: 30),
                       "远端删除工具应要求本次批准")
@@ -2336,7 +2408,7 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertTrue(composer.waitForExistence(timeout: 20))
         composer.tap()
         composer.typeText("remote-session-workspace-tool")
-        app.buttons["ai-send-draft"].tap()
+        composer.typeText("\n")
         let approve = app.buttons["允许一次"]
         XCTAssertTrue(approve.waitForExistence(timeout: 30),
                       "远端 Workspace 工具应要求本次批准")
@@ -2736,12 +2808,11 @@ final class AIAssistantUITests: XCTestCase {
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.375, dy: 0.93)).tap()
         let composer = app.textViews["ai-composer"]
         XCTAssertTrue(composer.waitForExistence(timeout: 20))
-        let send = app.buttons["ai-send-draft"]
         for (command, answer) in [("camera-open", "CAMERA_OPEN_DONE")] {
             composer.tap()
             composer.typeText(command)
-            XCTAssertTrue(send.waitForExistence(timeout: 10))
-            send.tap()
+            assertComposerShowsOnlyPlus(app)
+            composer.typeText("\n")
             XCTAssertTrue(app.staticTexts[answer].waitForExistence(timeout: 15),
                           "相机工具 \(command) 阻塞了后续 Agent 回答")
         }
@@ -2777,8 +2848,8 @@ final class AIAssistantUITests: XCTestCase {
         add(closed)
         composer.tap()
         composer.typeText("camera-status")
-        XCTAssertTrue(send.waitForExistence(timeout: 10))
-        send.tap()
+        assertComposerShowsOnlyPlus(app)
+        composer.typeText("\n")
         XCTAssertTrue(app.staticTexts["CAMERA_STATUS_DONE"].waitForExistence(timeout: 15))
         let (data, _) = try await URLSession.shared.data(from: statusURL)
         let status = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -3555,16 +3626,18 @@ final class AIAssistantUITests: XCTestCase {
         let video = app.buttons.matching(
             NSPredicate(format: "label BEGINSWITH %@", "预览视频")
         ).firstMatch
-        let send = app.buttons["ai-send-draft"]
+        let attachments = app.buttons["展开更多功能"]
         XCTAssertTrue(image.waitForExistence(timeout: 10))
         XCTAssertTrue(video.exists)
-        XCTAssertTrue(send.isEnabled, "只有媒体、未写说明时也能发送")
+        XCTAssertFalse(app.buttons["ai-send-draft"].exists, "只有媒体、未写说明时也只保留加号")
+        XCTAssertTrue(attachments.isEnabled)
         XCTAssertFalse(app.buttons["关闭设置"].exists, "导入媒体不应自动发消息")
 
         let composer = app.textViews["ai-composer"]
         composer.tap()
         composer.typeText("请分析这张图片和视频")
-        XCTAssertTrue(send.exists)
+        XCTAssertFalse(app.buttons["ai-send-draft"].exists, "媒体附带非空文字也不能恢复发送箭头")
+        XCTAssertTrue(attachments.isEnabled)
         XCTAssertTrue(image.exists)
         XCTAssertTrue(video.exists)
         let draft = XCTAttachment(screenshot: app.screenshot())
@@ -3575,7 +3648,8 @@ final class AIAssistantUITests: XCTestCase {
         app.buttons["对话列表"].tap()
         app.buttons["ai-conversation-switch-B"].tap()
         XCTAssertFalse(image.exists, "其他会话不应显示原附件")
-        XCTAssertFalse(send.exists, "空草稿不应显示发送按钮")
+        XCTAssertFalse(app.buttons["ai-send-draft"].exists)
+        XCTAssertTrue(attachments.isEnabled, "切换到空草稿后仍保留可用加号")
         app.buttons["对话列表"].tap()
         app.buttons["ai-conversation-empty-draft"].tap()
         XCTAssertTrue(app.buttons["预览图片 empty-draft-image.png"].waitForExistence(timeout: 5))
@@ -4431,6 +4505,8 @@ final class AIAssistantUITests: XCTestCase {
         XCTAssertFalse(app.buttons["发送"].exists)
         editor.tap()
         editor.typeText("UI composer check")
+        XCTAssertFalse(app.buttons["ai-send-draft"].exists, "输入文字后也不显示发送箭头")
+        XCTAssertTrue(app.buttons["展开更多功能"].isEnabled)
         app.buttons["对话列表"].tap()
         XCTAssertTrue(app.staticTexts["对话"].waitForExistence(timeout: 3))
         XCTAssertFalse(app.buttons["完成"].exists)

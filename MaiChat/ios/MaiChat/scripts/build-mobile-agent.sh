@@ -90,24 +90,16 @@ if [[ -n "${TARGET_BUILD_DIR:-}" && -n "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}" 
   cp "$repo_dir/MaiAgent/third_party/ngtcp2/COPYING" "$pdf_licenses/NGTCP2_LICENSE.txt"
   cp "$repo_dir/MaiAgent/third_party/nghttp3/COPYING" "$pdf_licenses/NGHTTP3_LICENSE.txt"
   cp "$repo_dir/MaiAgent/third_party/curl-apple/COPYING" "$pdf_licenses/CURL_LICENSE.txt"
-  # llama/mtmd 与 ggml 后端由仓库源码静态链接；正式模型由用户导入。
+  # llama/mtmd 与 ggml 源码静态链接；正式 Qwen 权重由 Bundle Primary Model 阶段随包提供。
   cp "$repo_dir/MaiAgent/third_party/llama.cpp/MAI_THIRD_PARTY_NOTICES.txt" \
     "$pdf_licenses/LLAMA_CPP_NOTICES.txt"
-  # 上游 CI GGUF 只供 Debug 包的英文引擎自检，不能作为生产聊天/OCR 模型分发。
-  # Release 不含该权重；普通导入页面仍可使用用户提供的 GGUF。
+  # 清理旧 Debug 版本留在增量构建目录的 Tiny 自测资源，不能把它误当聊天主模型。
   local_test_bundle="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MaiLocalModels"
-  if [[ "${CONFIGURATION:-}" == Debug ]]; then
-    local_test_source="$repo_dir/MaiAgent/models/local-test"
-    local_test_sha="$(shasum -a 256 "$local_test_source/stories260K.gguf")"
-    if [[ "${local_test_sha%% *}" != 270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d ]]; then
-      echo "Bundled local inference test model checksum mismatch" >&2
-      exit 1
+  for local_test_file in stories260K.gguf README.md LICENSE SOURCE.json UPSTREAM_MODEL_CARD.md UPSTREAM_CI_README.md; do
+    if [[ -f "$local_test_bundle/$local_test_file" ]]; then
+      /bin/rm "$local_test_bundle/$local_test_file"
     fi
-    mkdir -p "$local_test_bundle"
-    for local_test_file in stories260K.gguf README.md LICENSE SOURCE.json UPSTREAM_MODEL_CARD.md UPSTREAM_CI_README.md; do
-      cp "$local_test_source/$local_test_file" "$local_test_bundle/"
-    done
-  fi
+  done
   effect_bundle="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MaiAgentGraphics"
   mkdir -p "$effect_bundle"
   cp "$repo_dir/MaiAgent/Graphics/data/"*.effect "$effect_bundle/"

@@ -84,7 +84,6 @@ struct AIAssistantView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var showSessions = false
     @State private var showActions = false
-    @State private var showingPrimaryModelSettings = false
     @State private var confirmClear = false
     @State private var imageSources = AIImageSourceFrameStore()
     @State private var confirmRemoteDelete = false
@@ -280,10 +279,14 @@ struct AIAssistantView: View {
                             .onTapGesture { showActions = false }
                         AIActionPanel(
                             selectedModel: model.settings.displayName,
+                            isLocalModel: model.settings.isLocalModel,
+                            changingModelSource: model.changingModelSource,
                             selectedEffort: model.settings.effectiveReasoningEffort,
                             selectedPolicy: model.settings.policy,
+                            canChangeModel: model.selectedRemote == nil && model.ready &&
+                                !model.busy && !model.isSubmitting && !model.changingModelSource,
                             canChangeSettings: model.selectedRemote == nil && model.configured &&
-                                !model.busy && !model.isSubmitting,
+                                !model.busy && !model.isSubmitting && !model.changingModelSource,
                             canClear: model.selectedRemote == nil && !model.busy &&
                                 !model.selected.isEmpty,
                             selectEffort: { selected in
@@ -298,7 +301,9 @@ struct AIAssistantView: View {
                                 next.policy = policy
                                 Task { _ = await model.save(next) }
                             },
-                            primaryModel: { showActions = false; showingPrimaryModelSettings = true },
+                            selectModelSource: { local in
+                                Task { await model.selectPrimaryModelSource(local: local) }
+                            },
                             clear: { showActions = false; confirmClear = true }
                         )
                         .padding(.top, 54).padding(.trailing, 14)
@@ -306,7 +311,6 @@ struct AIAssistantView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showingPrimaryModelSettings) { AIPrimaryModelSettingsView(assistant: model) }
             // 右页的消息、输入和底部入口共用互锁；返回目录的透明按钮在禁用范围之外。
             // 这里只锁横向拖动、回弹及目录展开态，不能因普通纵向阅读而禁用 ScrollView。
             .environment(\.aiConversationActionsAllowed, { !conversationActionsBlocked })
@@ -1255,7 +1259,7 @@ private struct AIAssistantMessageList: View {
             .padding(.top, 28)
             if !model.configured {
                 Text(model.settings.isLocalModel
-                    ? "请在右上角“更多→主模型”中检查本地模型文件"
+                    ? "内置本地模型暂时不可用，请重试；若仍失败，请更新 App"
                     : "登录后可使用云端主模型，也可在“更多→主模型”中选择本地 GGUF")
                     .font(.footnote).foregroundStyle(.secondary)
                     .padding(.top, 18)
@@ -1339,38 +1343,41 @@ private struct AIHeaderButton: View {
 
 private struct AIActionPanel: View {
     let selectedModel: String
+    let isLocalModel: Bool
+    let changingModelSource: Bool
     let selectedEffort: String
     let selectedPolicy: String
+    let canChangeModel: Bool
     let canChangeSettings: Bool
     let canClear: Bool
     let selectEffort: (String) -> Void
     let selectPolicy: (String) -> Void
-    let primaryModel: () -> Void
+    let selectModelSource: (Bool) -> Void
     let clear: () -> Void
     @State private var expandedSection: Section?
 
     private enum Section: Equatable {
+        case model
         case effort
         case policy
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            Button(action: primaryModel) {
-                HStack(spacing: 12) {
-                    Image(systemName: "cpu").frame(width: 18)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("主模型")
-                        Text(selectedModel).font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.caption)
-                }
-                .padding(.horizontal, 14).padding(.vertical, 12)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
+            // 模型来源与思考强度使用同一内联展开交互，点选后直接保存。
+            // 本地权重随包提供；此入口不再创建设置 sheet、文件管理或应用确认页。
+            expandableAction(title: "主模型", value: changingModelSource ? "正在切换…" : selectedModel,
+                             image: "cpu", section: .model, enabled: canChangeModel)
             .accessibilityIdentifier("ai-primary-model-settings")
+            if expandedSection == .model {
+                optionGroup(identifier: "ai-primary-model-menu") {
+                    option("云端模型", selected: !isLocalModel) { selectModelSource(false) }
+                        .accessibilityIdentifier("ai-primary-model-cloud")
+                    option("本地模型", selected: isLocalModel) { selectModelSource(true) }
+                        .accessibilityIdentifier("ai-primary-model-local")
+                }
+                .disabled(!canChangeModel)
+            }
             Divider().padding(.leading, 42)
             expandableAction(
                 title: "思考强度",
@@ -1419,7 +1426,8 @@ private struct AIActionPanel: View {
         title: String,
         value: String,
         image: String,
-        section: Section
+        section: Section,
+        enabled: Bool? = nil
     ) -> some View {
         Button {
             withAnimation(.easeOut(duration: 0.14)) {
@@ -1444,8 +1452,8 @@ private struct AIActionPanel: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!canChangeSettings)
-        .opacity(canChangeSettings ? 1 : 0.5)
+        .disabled(!(enabled ?? canChangeSettings))
+        .opacity((enabled ?? canChangeSettings) ? 1 : 0.5)
         .accessibilityLabel(title)
         .accessibilityValue(value)
     }
@@ -1457,6 +1465,7 @@ private struct AIActionPanel: View {
         VStack(spacing: 0) { content() }
             .padding(.vertical, 4)
             .background(Color(uiColor: .secondarySystemBackground))
+            .accessibilityElement(children: .contain)
             .accessibilityIdentifier(identifier)
     }
 
@@ -3021,6 +3030,7 @@ private struct AIComposer: View, Equatable {
                             onVoiceLongPressCancelled: {
                                 cancelVoiceTranscription(restoresDraft: true)
                             },
+                            allowsEmptySubmit: !snapshot.attachments.isEmpty,
                             registerTextView: { focusController.textView = $0 },
                             accessibilityIdentifier: "ai-composer",
                             accessibilityLabel: "创作中心输入框，可按住转文字"
@@ -3058,8 +3068,8 @@ private struct AIComposer: View, Equatable {
                     .zIndex(composerEditMenuState == nil ? 0 : 20)
                 }
 
-                // 只移除模型停止按钮。附件入口始终保留，前一条模型/上传/回执等待
-                // 不应阻止用户给下一条消息添加相册、拍摄或文件；新消息由同一队列接收。
+                // 右侧只保留附件加号；发送统一走编辑框的键盘发送动作，不另画发送或停止按钮。
+                // 前一条模型/上传/回执等待不阻止继续添加附件，新消息由同一队列接收。
                 Button {
                     composerEditMenuState = nil
                     if isAttachmentPanelPresented {
@@ -3080,20 +3090,6 @@ private struct AIComposer: View, Equatable {
                 .disabled(!snapshot.ready)
                 .accessibilityLabel(isAttachmentPanelPresented ? "收起更多功能" : "展开更多功能")
 
-                if hasDraftContent, snapshot.busy || !isVoiceMode {
-                    Button { submitDraft() } label: {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 17, weight: .bold))
-                            .foregroundStyle(Color.white)
-                            .frame(width: 44, height: 44)
-                            .background(RemoteIMStyle.blue, in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canSubmitDraft)
-                    .accessibilityLabel(snapshot.busy ? "补充当前任务" : "发送给 AI")
-                    .accessibilityHint(snapshot.busy ? "当前工具执行完后继续处理补充内容" : "")
-                    .accessibilityIdentifier("ai-send-draft")
-                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)

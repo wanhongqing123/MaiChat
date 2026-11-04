@@ -382,6 +382,8 @@ add_library(maiagent STATIC
   Agent/MaiOpenAiClient.cpp
   Agent/MaiResponsesClient.cpp
   Agent/MaiLlamaModelClient.cpp
+  Agent/MaiLlamaToolCatalog.cpp
+  Agent/MaiLlamaToolDiscoveryClient.cpp
   Agent/MaiLlamaModelValidation.cpp
   # 路径与文件系统：不用 std::filesystem，走系统 API。
   # 纯词法的那一半（MaiFilePath.cpp）是可移植的；真正调系统调用的那一半
@@ -593,6 +595,8 @@ if(MAIAGENT_BUILD_TESTS)
       MaiToolTests          # 路径边界 + 内置工具
       MaiLlamaToolsTests    # 本地推理生命周期、取消、参数与工作区边界
       MaiLlamaModelClientTests # 本地主模型的完整消息、原生工具模板、流式与取消
+      MaiLlamaToolCatalogTests # 延迟声明的普通 metadata 查询和严格参数边界
+      MaiLlamaToolDiscoveryClientTests # 完整历史、两阶段选择和操作批次安全边界
       MaiDeepSeekWebToolsTests # 结构化检索、抓取、错误分类与有界重试
       MaiEditToolTests      # edit：唯一匹配、替换全部、拒绝的那几种情况
       MaiApplyPatchToolTests  # apply_patch：多处/多文件、全有或全无、换行原样

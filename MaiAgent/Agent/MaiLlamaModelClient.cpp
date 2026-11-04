@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "MaiLlamaTools.h"
+#include "MaiLlamaToolDiscoveryClient.h"
 
 namespace {
 class MaiLlamaModelClient final : public MaiModelClient {
@@ -29,5 +30,6 @@ private:
 std::unique_ptr<MaiModelClient> makeMaiLlamaModelClient(MaiLlamaModelConfig config,
                                                         std::shared_ptr<MaiLlamaRuntime> runtime) {
     if (!runtime) runtime = getSharedMaiLlamaRuntime();
-    return std::make_unique<MaiLlamaModelClient>(std::move(config), std::move(runtime));
+    return makeMaiLlamaToolDiscoveryClient(
+        std::make_unique<MaiLlamaModelClient>(std::move(config), std::move(runtime)));
 }

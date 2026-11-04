@@ -14,8 +14,7 @@ enum AIPrimaryModelDeviceProbe {
         started = true
         let environment = ProcessInfo.processInfo.environment
         let runID = environment["MAICHAT_PRIMARY_DEVICE_RUN_ID"].flatMap(UUID.init(uuidString:)) ?? UUID()
-        let sourceID = environment["MAICHAT_PRIMARY_DEVICE_MODEL_ID"] ?? ""
-        let probe = AIPrimaryDeviceProbeRun(runID: runID, sourceID: sourceID)
+        let probe = AIPrimaryDeviceProbeRun(runID: runID)
         Task.detached(priority: .utility) { await probe.run() }
     }
 }
@@ -24,7 +23,6 @@ enum AIPrimaryModelDeviceProbe {
 private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
     private let expectedSHA = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
     private let runID: UUID
-    private let sourceID: String
     private let temporary: URL
     private let reportURL: URL
     private let queue = DispatchQueue(label: "com.kongshang.maichat.primary-device-probe", qos: .utility)
@@ -32,9 +30,8 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
     private var report: [String: Any]
     private var createdTemporary = false
 
-    init(runID: UUID, sourceID: String) {
+    init(runID: UUID) {
         self.runID = runID
-        self.sourceID = sourceID
         temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent("MaiChatLocalPrimaryQA-" + runID.uuidString, isDirectory: true)
         reportURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -42,6 +39,7 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
             .appendingPathComponent("report-" + runID.uuidString + ".json")
         report = ["run_id": runID.uuidString, "format": 1, "status": "starting",
             "model": "Qwen2.5-0.5B-Instruct-Q4_K_M", "source_sha256": expectedSHA,
+            "source": "packaged_primary_model",
             "database": "memory", "host_handler_installed": false, "rounds": [],
             "scope": "configured_local_client_full_tools_without_tool_execution",
             "agent_loop_exercised": false, "user_sessions_read_or_written": false,
@@ -59,11 +57,9 @@ private final class AIPrimaryDeviceProbeRun: @unchecked Sendable {
             guard !FileManager.default.fileExists(atPath: reportURL.path) else { return }
             try FileManager.default.createDirectory(at: reportURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try publish(stage: "source_validation")
-            guard let parsed = UUID(uuidString: sourceID),
-                  parsed.uuidString.caseInsensitiveCompare(sourceID) == .orderedSame else { throw ProbeFailure("invalid_source_id") }
-            let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            let source = documents.appendingPathComponent("MaiLocalModels", isDirectory: true)
-                .appendingPathComponent(sourceID + ".gguf")
+            // 与菜单切换复用普通随包模型入口，不依赖开发机预置文件或用户导入目录。
+            let bundled = try await AILocalModelStore.shared.bundledPrimarySelection()
+            let source = bundled.modelURL
             let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).resolvingSymlinksInPath().path + "/"
             guard source.resolvingSymlinksInPath().path.hasPrefix(home),
                   !FileManager.default.fileExists(atPath: temporary.path) else { throw ProbeFailure("invalid_source_or_existing_run") }

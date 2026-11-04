@@ -6,16 +6,16 @@
 
 - 仅编译于 `DEBUG && !targetEnvironment(simulator)`。正常 `MaiChatApp.init` 只增加一行 opt-in 启动 hook；不替换 RootView，不创建新 Demo 页面，不显示全屏或测试消息。
 - 显式启动参数 `--ai-primary-model-device-probe`。
-- `MAICHAT_PRIMARY_DEVICE_MODEL_ID=<UUID>`：只接受 UUID，不接受路径。读取的已知源是本 App `Documents/MaiLocalModels/<UUID>.gguf`，文件名大小写与传入值相同。
+- 183 起不再接受外部模型路径或用户导入 ID：与普通菜单共用 `AILocalModelStore.shared.bundledPrimarySelection()`，校验 App 随包 manifest 和正式 Qwen 后自动准备沙盒文件。
 - 可选 `MAICHAT_PRIMARY_DEVICE_RUN_ID=<新 UUID>`，否则生成新 ID。重复 run ID 不覆盖既有报告或临时目录。
 - 报告为本 App `Documents/MaiChatLocalPrimaryQA/report-<RUN-ID大写UUID>.json`，按来源检查、导入、配置、每轮开始/结束、销毁与最终阶段原子更新。Root 只需提取该报告；探针不向全局日志输出路径或生成文本。
 - 另记录实际 `MTLDevice` 的可用性、名称与 `supportsFamily(.apple7/.metal3)` 结果，供模拟器/真机差异对照；这些硬件族事实不代表任意算子都在 GPU 执行。
 
 ## 实际路径与隔离
 
-1. 只读已知源，通过普通 `AILocalModelStore` 导入到新建 `tmp/MaiChatLocalPrimaryQA-<runid>/Models`。核对完整 SHA-256 `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db` 和 491400032 bytes，仅接受固定官方 Qwen2.5-0.5B-Instruct-Q4_K_M 候选。
+1. 只读随包入口解析的固定公共模型，通过普通 `AILocalModelStore` 导入到新建 `tmp/MaiChatLocalPrimaryQA-<runid>/Models`。核对完整 SHA-256 `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db` 和 491400032 bytes，仅接受固定官方 Qwen2.5-0.5B-Instruct-Q4_K_M 候选。
 2. 新建独立 `MaiMobileAgent` handle，所有 handle 调用与销毁在专用串行工作队列。configure 的数据库为 `:memory:`，workspace/appRoot/模型副本均在本次新临时目录内。使用真正 `modelProvider=llama`、主模型 client、自动输出、32k、默认硬件选择；不安装 host handler，不请求账号凭据。
-3. 运行两次 `op=local_model_probe`。第二次明确带上第一问、真实第一答和第二问。该私有 C ABI 使用配置时同一 baseInstructions、完整 public 工具目录和相同 modelClientFactory；sink 只收集文本与工具调用计数，绝不执行工具。不依赖提示词作为安全闸门，不执行外部工具、网络或付费任务。
+3. 运行两次 `op=local_model_probe`。第二次明确带上第一问、真实第一答和第二问。该私有 C ABI 使用配置时同一 baseInstructions、完整 public 工具目录和相同 modelClientFactory；本地 wrapper 内部按需取得原始声明，sink 只收集文本与最终操作调用计数，绝不执行宿主工具。不依赖提示词作为安全闸门，不执行外部工具、网络或付费任务。
 4. 每次 `timeout_ms=120000`，C++ 当前调用自身的取消 token 执行软截止，不发普通会话的 stop，不影响用户 handle。报告保存实际首字/总耗时、文本、native model/wire、GPU 是否实际采用、GPU 模型字节与 backend、错误及工具调用数。成功必须两轮文本非空、零工具调用、local ID/wire 正确且 GPU 已采用、驻留字节大于零。
 5. 结束销毁本次 handle。共享 runtime 空闲且 generation 仍属于本次测量时才卸载，确认可释放后删除本次临时目录。busy、状态未知或驻留已换代时保留临时文件，避免删除仍可能 mmap 的权重。源文件不改动。
 
@@ -24,4 +24,17 @@
 - `scope=configured_local_client_full_tools_without_tool_execution`，`agent_loop_exercised=false`。没有创建或读取任何实际用户会话，不能称为“真机 Agent 工具闭环通过”。这是正常 App 目标下、完整工具模板输入、真实主模型 client/GPU 的专门测量。
 - 文本只来自两条固定合成英文及其真实模型回复。报告清除可能回显的 App/临时绝对路径，错误仅保留有界安全说明；不含用户聊天、账号令牌或模型源路径。
 - 正常 App 的既有 Root/账号生命周期保持原样；本探针没有对整个 App 的其他既有活动作网络零请求证明。探针自身无凭据获取、host handler 或工具执行路径。
-- 本子任务只完成源码、device SDK parse 及实际 Store 模块/C ABI 头的独立 typecheck，没有操作设备、构建/安装 App 或运行真实 GPU。实际报告与 iPhone 型号/运行产物由 Root 随后取证。
+- 初始记录阶段仅做独立 typecheck；183 最终已在 iPhone14ProMax / Apple A16 GPU 运行两轮，报告路径及边界见下方实际结果。
+
+## 183 实际真机结果
+
+2026-11-04，正常App 2.2.4/183，bundle E44E6A14-07AA-4AE1-9A44-2135514D82D2，
+探针进程PID26657；报告/private/tmp/maichat-inline183-device-probe-report-20261104.json。
+随包模型SHA核对通过，两个round均真实使用MTL、GPU模型391859712 bytes、零宿主工具调用。
+首轮首字5.38885s/总6.73482s，第二轮首字2.83424s/总2.99809s，status=passed。
+这不是用户中文“你好”的同条件复现，也不证明复杂任务正确率。输出确有小模型复述/
+指令回声不够准确的表现；passed只检查本机执行、非空、GPU、无错误及隔离契约。
+
+agent_loop_exercised=false，没读写用户会话，不能称为真机工具闭环通过。工具真实
+执行及结果回灌只在原生Core闭环验收；模拟器正常App验证普通两轮和重开。probe结束已销毁自己的
+handle和临时副本，重新以普通参数启动App，正常PID26712；没有留下QA启动参数。
