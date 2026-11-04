@@ -20,7 +20,8 @@ Android 对 932 个相关生产及测试文件保存哈希，构建、冻结、�
 Desktop 在构建、冻结和 smoke 前后核对该 10 文件及 smoke 调用链源码。
 
 构建时基准 HEAD 为 `387683b937edb734e6af549421c8100b044b8b68`，生产变更尚未提交。
-最终生产提交绑定待根任务提供精确提交后核对补记；当前不把基准 HEAD 宣称为产物源码。
+随后已将冻结产物绑定到生产提交 `89df221f095bea4ae86d3720f1709c292ba44563`，
+逐文件核对见下文“最终提交绑定”；基准 HEAD 不是这批产物的源码提交。
 
 根任务放行本轮 Android 运行时已回执：正常 iOS183 模拟器 7 项 UI 全通过，包含真实
 两轮回复和重启；正确 CPU 回退下总耗时 70.260 秒。183 真机包的 11 个 Mach-O strict、
@@ -121,3 +122,31 @@ smoke 前后全部冻结 App 文件哈希及 10 个冻结源码哈希相同。
 - Desktop240：`/private/tmp/maichat-desktop240-validation-20261104/`，包含冻结
   `artifacts/MaiChat.app`、`evidence.json`、`artifact-file-sha256.json`、签名日志、
   隔离路径探针、sandbox 规则、smoke 日志及 `validation-summary.txt`。
+
+## 最终提交绑定与后续真机回执
+
+生产提交为 **`89df221f095bea4ae86d3720f1709c292ba44563`**。提交后使用 Git 原始
+blob 的 SHA-256 核对 Android 全部 **932** 个冻结输入，以及 Desktop 的 **15** 个
+冻结核心/已审查 smoke 调用链输入，均与构建前快照精确相同，工作区对应文件也相同。
+另核对 Desktop 版本 CMake 文件与该提交相同，版本仍为 2.2.40。
+
+重新计算两个冻结 APK 的完整 SHA，仍精确匹配上表；重新计算 Desktop 冻结 App
+全部 **242** 个普通文件，逐项匹配既有清单，未新增、缺失或改变文件。绑定过程中没有
+重新构建或运行测试。原始构建/运行回执保留不变，新增绑定回执分别位于：
+
+- `/private/tmp/maichat-android257-final-artifacts-20261104/final-source-binding.json`
+- `/private/tmp/maichat-desktop240-validation-20261104/final-source-binding.json`
+
+根任务随后完成并回收真实 iPhone183 的 GPU probe 报告，本记录执行者已读取其最终 JSON：
+`/private/tmp/maichat-inline183-device-probe-report-20261104.json`，SHA-256 为
+`739568bb0e26b19e5710c4338a31b9ef3e324ffcee419dc69f70becfc5349aae`。
+报告 `status=passed`、`source=packaged_primary_model`，模型 SHA 与随包固定值一致；
+Apple A16 GPU 的 MTL 后端实际选中，GPU 权重 **391859712 字节**。两轮首字/原生总耗时
+分别为 **5.3888/6.7348 秒**、**2.8342/2.9981 秒**，两轮均无错误。
+
+这份真机回执范围是配置了完整工具目录的原生客户端两轮推理；
+`host_handler_installed=false`、`agent_loop_exercised=false`，两轮工具调用数均为 0，
+不能说成真实 Agent 工具操作闭环通过。报告同时记明未请求云端凭据、未读写用户会话。
+根任务另回执：183 已用无 QA 参数的正常入口重新启动，PID26712，版本2.2.4/183。
+这些后续回执补足上文“放行时 JSON 尚未完成”的时间边界，不扩大 Android 或 Desktop
+本轮验收范围。

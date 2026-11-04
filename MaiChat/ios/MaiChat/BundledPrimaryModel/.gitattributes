@@ -1,0 +1,2 @@
+# Retain the pinned upstream model card byte-for-byte, including published line-end spaces.
+UPSTREAM_MODEL_CARD.md -whitespace
