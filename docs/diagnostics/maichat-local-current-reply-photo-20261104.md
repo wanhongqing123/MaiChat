@@ -166,3 +166,23 @@ SSM 状态，当前没有账号/会话缓存身份字段，不能直接保留全
 SHA256 为 `f929c1cd6f0093f2e0cb61e88e3f970b427203378883c857753c3db32fd432bb`。
 它明确记录 `installed=false`、最后已核验手机版本 187 和连接恢复后待重试安装；
 后续本段仅补充提交元数据，不改产品或重新构建。
+
+## 重新连接后的真机安装
+
+用户确认手机重新连接后，设备恢复为 paired、wired、booted，仍是 iOS 27.2。重新核对
+同一冻结包的 11 项 Mach-O、随包模型哈希及签名，均未变化；没有重新构建或替换代码。
+再次安装返回成功，设备应用查询确认 **2.2.4/188**。安装目录 UUID 为
+`88E44CF8-380D-4FA5-B9F0-78FB2D9A2C05`，正常重新启动进程 **28474**，参数为空，
+与设备进程查询的可执行路径完全一致。
+
+原始回执位于 `/private/tmp/maichat-photo188-device-install-reconnected-20261104.json`、
+`/private/tmp/maichat-photo188-device-normal-launch-20261104.json`、
+`/private/tmp/maichat-photo188-device-appinfo-20261104.json` 和
+`/private/tmp/maichat-photo188-device-processes-20261104.json`。安装运行绑定另存
+`/private/tmp/maichat-photo188-device-final-artifacts-20261104/runtime-evidence.json`。
+先前失败的 4016 与当时 `installed=false` 的源码绑定记录保留为历史；本次安装成功
+由新回执补充，不回写旧尝试。
+
+没有删除用户会话或照片，也没有读取用户数据库、原图，或代用户按快门。本次真机核验
+范围是同一已验证产物的安装和正常启动；实际工具投递由真实 Mac 本地 Agent 回归，
+界面由正常模拟器 RootView 回归，不能混称完整真实手机照片会话或传感器验收。
