@@ -108,6 +108,19 @@ Qt 探针显示 AppData/cache/config 已指向隔离目录，但 `QDir::homePath
 
 Desktop 构建日志：`/tmp/maichat-desktop241-permission-build-20261104.log`。冻结目录内包含 `evidence.json`、签名日志、`artifact-file-sha256.json`、Qt 探针日志、sandbox 规则和 `normal-smoke.log`。源码快照为 `/tmp/maichat-permission-platform-source-freeze-20261104.json`，939 文件内容集合 SHA-256 为 `d4e33b0f8bf55f6ebe47a2b40c71f13411ab8671b5a0ffd3cccf18eb0b08b915`。本阶段证明正常目标构建、签名及隔离启动，不代表已安装发布包、notarization 或主模型 UI 闭环验收。
 
+## 最终提交绑定
+
+权限修复检查点已提交为 **`35dbe2a853d6b8a48b0bfce65e761b093c90c701`**。直接读取该提交的 Git blob 并计算 SHA-256，与冻结平台的 **939** 项源码输入、iOS184 的 **5** 项输入逐个精确匹配，共 **941** 个不同文件。原 `404768de` 是排查与构建基线，不是最终产物源码提交。
+
+重新计算两个 Android258 冻结 APK、Desktop241 全部 **242** 个普通文件与 **9** 个 Mach-O、iOS184 的 **11** 个 Mach-O 和完整随包模型，均与原冻结哈希精确相同；同时核对冻结 App 的实际版本与 iOS dylib UUID。没有重新构建、重签、运行 App 或操作设备，原构建与运行回执保持不变。独立绑定回执为：
+
+- `/tmp/maichat-permission-final-source-binding-35dbe2a8-20261104.json`
+- `/private/tmp/maichat-webapproval184-device-final-artifacts-20261104/final-source-binding.json`
+- `/private/tmp/maichat-android258-permission-artifacts-20261104/final-source-binding.json`
+- `/private/tmp/maichat-desktop241-permission-validation-20261104/final-source-binding.json`
+
+iOS184 的真机安装仍停留在 CoreDevice4016、设备不可用状态，提交绑定不扩大实机验证结论。
+
 ## 验证边界
 
 核心搜索、抓取响应均来自 loopback 合成服务，凭据只使用进程内假值；没有访问付费供应商或使用真实 API Key。产品阶段执行了正常 iOS 模拟器 UI、Android 自有模拟器安装与登录入口查看、Desktop 隔离 smoke；iOS 真机安装仍受设备不可用阻断。本记录证明当前源码中的权限分类、核心执行链、产品构建和上述入口回归通过，未验证真实模型自行规划检索、实际供应商联网检索或该修复的手机闭环体验，不宣称已完成真机验收。
