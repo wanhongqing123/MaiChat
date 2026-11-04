@@ -329,10 +329,17 @@ public:
         return "mobile_take_photo";
     }
     std::string description() const override {
-        return "Open the camera and wait for the user to press the shutter and confirm one photo. "
-               "Use this when the user asks to open the camera or take a photo. Save the confirmed "
-               "photo in the current Agent workspace. Cancel creates no file and never sends a message. "
-               "This does not start automatic repeated capture.";
+        // 快门确认后返回工作区文件路径，不自动创建系统相册资产；后续展示复用聊天卡片。
+        return "Open the camera and wait for the user to press the shutter and confirm one "
+               "photo. Use this when the user asks to open the camera or take a photo. Save "
+               "the confirmed photo in the current Agent workspace and return its relative "
+               "path and mime_type. The returned path is a workspace file, not a "
+               "Photos-library asset ID; this capture does not add the photo to the system "
+               "Photos library. When the user later asks to see this photo in the "
+               "conversation, use agent_send_media with file_path set to that exact returned "
+               "path and type=image to show a thumbnail in the CURRENT reply. Cancel creates "
+               "no file. This does not start automatic repeated capture or send the photo to a "
+               "contact.";
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{},"additionalProperties":false})";
@@ -1497,11 +1504,14 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         dispatcher, false));
     tools.add(std::make_unique<MaiMobileHostTool>(
         "mobile_preview_image",
-        "Show an image from the Agent working directory to the user in a full-screen mobile "
-        "preview. This does not require a vision-capable model and does not save or modify it. "
-        "Use only when the user explicitly asks to open a full-screen preview. Deliver image "
-        "editing results in the chat with agent_send_media; do not call this tool automatically "
-        "after reading or editing an image.",
+        // 首句即限定用户明确要求的全屏或放大，普通“展示”应在当前回复交付缩略图。
+        "Open a FULL-SCREEN image viewer ONLY when the user explicitly asks for full-screen "
+        "viewing or enlargement. For ordinary requests to show, display, or re-show an "
+        "existing photo/image in the current reply, use agent_send_media to present an inline "
+        "thumbnail/card instead. This viewer reads an image from the current Agent workspace, "
+        "does not require a vision-capable model, and does not save or modify the file. Do not "
+        "automatically open this viewer after capture, reading, or editing; the user can tap "
+        "an inline chat image to enlarge it.",
         // path 为用户明确要求全屏查看的图片；普通成品交付使用聊天卡片，不自动打开本工具。
         R"({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})",
         dispatcher, false));

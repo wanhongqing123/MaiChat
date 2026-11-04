@@ -2,6 +2,7 @@
 #if DEBUG
 import AVFoundation
 import CoreTransferable
+import CryptoKit
 import MaiChatCore
 import MediaPlayer
 import Photos
@@ -23,6 +24,97 @@ enum AIImagePreviewUITestSupport {
     static func waitForFullImageIfRequested() async {
         guard isRequested else { return }
         try? await Task.sleep(for: .seconds(3))
+    }
+}
+
+/// Explicit Simulator-only staging for real native Agent output. Inputs live
+/// under a test UUID in this App's tmp directory; no user Session or photo is read.
+enum AINativePhotoReplyUITestSupport {
+    static var isRequested: Bool {
+        let arguments = ProcessInfo.processInfo.arguments
+        return arguments.contains("--ai-ui-test") &&
+            arguments.contains("--ai-image-fullscreen-ui-test") &&
+            arguments.contains("--ai-native-photo-reply-ui-test")
+    }
+
+    private struct Manifest: Decodable {
+        let testID: UUID
+        let sessionID: String
+        let photoPath: String
+        let snapshotSHA256: String
+        let imageSHA256: String
+
+        enum CodingKeys: String, CodingKey {
+            case testID = "test_id", sessionID = "session_id", photoPath = "photo_path"
+            case snapshotSHA256 = "snapshot_sha256", imageSHA256 = "image_sha256"
+        }
+    }
+
+    @MainActor static func install(appState: RemoteIMAppState) -> Bool {
+        guard isRequested,
+              let rawID = ProcessInfo.processInfo.environment["MAICHAT_AI_TEST_ID"],
+              let token = UUID(uuidString: rawID) else { return false }
+        let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        let directory = home.appendingPathComponent("tmp", isDirectory: true)
+            .appendingPathComponent("maichat-native-photo-reply-" + token.uuidString, isDirectory: true)
+        guard directory.resolvingSymlinksInPath().standardizedFileURL == directory else { return false }
+        func read(_ name: String, maximum: Int) -> Data? {
+            let url = directory.appendingPathComponent(name)
+            guard url.resolvingSymlinksInPath().standardizedFileURL == url,
+                  let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+                  values.isRegularFile == true, let size = values.fileSize,
+                  size > 0, size <= maximum else { return nil }
+            return try? Data(contentsOf: url)
+        }
+        func hash(_ data: Data) -> String {
+            SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+        guard let manifestData = read("manifest.json", maximum: 8_192),
+              let manifest = try? JSONDecoder().decode(Manifest.self, from: manifestData),
+              manifest.testID == token,
+              let snapshot = read("snapshot.json", maximum: 2 * 1024 * 1024),
+              let jpeg = read("source.jpg", maximum: 20 * 1024 * 1024),
+              hash(snapshot) == manifest.snapshotSHA256, hash(jpeg) == manifest.imageSHA256,
+              UIImage(data: jpeg) != nil,
+              let response = try? JSONDecoder().decode(AIResponse.self, from: snapshot), response.ok,
+              let messages = response.messages, !messages.isEmpty else { return false }
+        let workspace = directory.appendingPathComponent("Workspace", isDirectory: true)
+        do { try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true) }
+        catch { return false }
+        func payload(_ part: AIPart) -> [String: Any]? {
+            guard let data = part.output?.data(using: .utf8) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }
+        let ordered = messages.sorted { $0.id < $1.id }
+        guard let capture = ordered.first(where: { message in
+            message.role == "assistant" && message.parts.contains {
+                $0.kind == "tool" && $0.tool == "mobile_take_photo" && $0.state == "completed" &&
+                    payload($0)?["path"] as? String == manifest.photoPath
+            }
+        }), let capturePart = capture.parts.first(where: { $0.tool == "mobile_take_photo" }),
+              let target = AIAssistantPhotoArtifactPolicy.photoURL(
+                tool: capturePart.tool, state: capturePart.state, output: capturePart.output,
+                workspacePath: workspace.path),
+              let current = ordered.last, current.role == "assistant", current.id != capture.id,
+              current.parts.contains(where: { part in
+                  guard part.kind == "tool", part.tool == "agent_send_media", part.state == "completed",
+                        let receipt = payload(part) else { return false }
+                  return receipt["delivery"] as? String == "current_ai_session" &&
+                      receipt["path"] as? String == manifest.photoPath &&
+                      receipt["type"] as? String == "image" && receipt["mime_type"] as? String == "image/jpeg"
+              }) else { return false }
+        do {
+            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try jpeg.write(to: target, options: .atomic)
+        } catch { return false }
+        let owner = "native-photo-reply-" + token.uuidString
+        appState.masterUserID = owner
+        appState.chatState = MasterChatState(ownerUserID: owner)
+        appState.hasCompletedInitialLogin = true
+        return AIAssistantModel.shared.installNativePhotoReplySnapshotForUITesting(
+            snapshot, sessionID: manifest.sessionID, workspacePath: workspace.path)
     }
 }
 
@@ -125,7 +217,8 @@ struct AIImageFullscreenUITestRoot: View {
     @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
     var body: some View {
         Group {
-            if ProcessInfo.processInfo.environment["MAICHAT_IMAGE_ZOOM_ANCHOR_TEST"] == "1" {
+            if ProcessInfo.processInfo.environment["MAICHAT_IMAGE_ZOOM_ANCHOR_TEST"] == "1" ||
+                AINativePhotoReplyUITestSupport.isRequested {
                 RootView()
             } else {
                 AIAssistantView()
@@ -133,6 +226,12 @@ struct AIImageFullscreenUITestRoot: View {
         }
             .environmentObject(appState)
             .onAppear {
+                if AINativePhotoReplyUITestSupport.isRequested {
+                    if !AINativePhotoReplyUITestSupport.install(appState: appState) {
+                        AIAssistantModel.shared.showTransientError("真实照片回复测试输入不可用")
+                    }
+                    return
+                }
                 let anchorTest = ProcessInfo.processInfo.environment["MAICHAT_IMAGE_ZOOM_ANCHOR_TEST"] == "1"
                 let delayedDecode = anchorTest && AIImagePreviewUITestSupport.isRequested
                 let imageSize = delayedDecode ? CGSize(width: 4032, height: 3024) :

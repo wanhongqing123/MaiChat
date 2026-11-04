@@ -18,13 +18,13 @@ class MaiLlamaRuntime;
 // GPU 只在解码批次前后、同步与请求清理边界合作取消，不承诺中途抢占 GPU kernel。
 // 仅接受 validateMaiLlamaModelConfig 核准的 Qwen2.5/Qwen3.5 原始工具模板，其他明确拒绝。
 // 本地固定关闭模板思考模式，远端 reasoningEffort 暂不映射到本地；仍独立解析模型思考片段。
-// 完整 system/历史按模型模板渲染；工具名称目录先交给同一真实模型，所需原始声明按需载入。
-// 发现只查询本地 metadata，不执行用户操作；最终调用仍交现有 Agent 审批/执行。
-// 内部声明选择不追加或修改用户历史。任一真实推理的 token 数超出 contextSize 时返回
-// InvalidInput，不静默裁掉历史或工具。模型须自带聊天模板，工具请求还须模板支持工具协议。
+// 完整 system/历史及全部可用工具的原始描述、参数声明一起按模型模板渲染。
+// 每次 stream 只调用一次本地推理，不预选工具、不隐藏声明；最终调用仍交现有 Agent 审批/执行。
+// 任一真实推理的 token 数超出 contextSize 时返回 InvalidInput，不静默裁掉历史或工具。
+// 模型须自带聊天模板，工具请求还须模板支持工具协议。
 // 单个请求最多 2 MiB 文本、4096 条消息和 512 个工具；不支持的输入不会被静默省略。
 // maximumOutputBytes 限制每次实际推理的原始生成字节，包含思考和工具块；截断不能交付工具调用。
-// 声明选择与任务推理分别使用该内部内存边界，整个 stream 的耗时和已交付文本包含两次推理。
+// 整个 stream 的耗时和已交付文本对应这一次真实推理，不另计声明选择阶段。
 struct MaiLlamaModelConfig {
     MaiFilePath modelPath;
     MaiFilePath projectorPath;
@@ -42,7 +42,7 @@ struct MaiLlamaModelConfig {
 
 // 构造不做 I/O；stream 在调用线程阻塞执行，增量回调也在该线程同步触发。
 // 默认与普通本地推理/llama 工具共用唯一驻留实例；请求结束清除 KV，不跨账号保存对话。
-// 主模型只产生工具调用，由现有 MaiTurnRunner 执行、审批和回灌；客户端只做只读 metadata 查找。
+// 主模型只产生工具调用，由现有 MaiTurnRunner 执行、审批和回灌；客户端不自行执行工具。
 // cancel 返回 Canceled，已交付文本仍有效；解析失败、未完成工具块和取消均不交付工具。
 std::unique_ptr<MaiModelClient> makeMaiLlamaModelClient(
     MaiLlamaModelConfig config, std::shared_ptr<MaiLlamaRuntime> runtime = {});

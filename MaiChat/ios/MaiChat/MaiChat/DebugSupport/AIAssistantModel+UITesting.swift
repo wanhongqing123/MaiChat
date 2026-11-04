@@ -27,6 +27,28 @@ extension AIAssistantModel {
 
 #if targetEnvironment(simulator)
 extension AIAssistantModel {
+    /// Load the unmodified C ABI snapshot exported after a real native Agent
+    /// turn. Only the isolated workspace changes; message IDs, text, and tool
+    /// receipts come from the snapshot and survive the normal Codable round-trip.
+    @discardableResult
+    func installNativePhotoReplySnapshotForUITesting(_ data: Data, sessionID: String,
+                                                     workspacePath: String) -> Bool {
+        guard AINativePhotoReplyUITestSupport.isRequested,
+              let response = try? JSONDecoder().decode(AIResponse.self, from: data), response.ok,
+              let sourceSessions = response.sessions, sourceSessions.contains(where: { $0.id == sessionID }),
+              let sourceMessages = response.messages, !sourceMessages.isEmpty,
+              let stored = try? JSONEncoder().encode(sourceMessages),
+              let restored = try? JSONDecoder().decode([AIMessage].self, from: stored),
+              restored == sourceMessages else { return false }
+        applyUITestMutation(.workspace(workspacePath))
+        applyUITestMutation(.clearRemoteSelection)
+        sessions = sourceSessions
+        applyUITestMutation(.selectedHistory(sessionID, restored.sorted { $0.id < $1.id }))
+        configured = true
+        ready = true
+        return true
+    }
+
     /// The host receipt comes from the real manual-photo execution. Round-trip
     /// the persisted part representation so a restored result uses the same row.
     @discardableResult

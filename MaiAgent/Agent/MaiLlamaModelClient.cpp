@@ -4,7 +4,6 @@
 #include <utility>
 
 #include "MaiLlamaTools.h"
-#include "MaiLlamaToolDiscoveryClient.h"
 
 namespace {
 class MaiLlamaModelClient final : public MaiModelClient {
@@ -30,6 +29,6 @@ private:
 std::unique_ptr<MaiModelClient> makeMaiLlamaModelClient(MaiLlamaModelConfig config,
                                                         std::shared_ptr<MaiLlamaRuntime> runtime) {
     if (!runtime) runtime = getSharedMaiLlamaRuntime();
-    return makeMaiLlamaToolDiscoveryClient(
-        std::make_unique<MaiLlamaModelClient>(std::move(config), std::move(runtime)));
+    // 与其他主模型共用完整声明和同一执行循环，不另加只看工具名的预选推理。
+    return std::make_unique<MaiLlamaModelClient>(std::move(config), std::move(runtime));
 }

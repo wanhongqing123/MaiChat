@@ -1,6 +1,105 @@
 import XCTest
 
 final class ScreenFrameArchiveUITests: XCTestCase {
+    /// Consume the persisted snapshot from an actual native local-model Agent
+    /// turn. The App must show its real delivery receipt in the latest reply,
+    /// independently of the older capture card, without opening fullscreen.
+    @MainActor
+    func testNativeAgentPhotoDisplayAppearsInCurrentReply() async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        guard let rawID = ProcessInfo.processInfo.environment["MAICHAT_NATIVE_PHOTO_REPLY_TEST_ID"],
+              let token = UUID(uuidString: rawID) else {
+            throw XCTSkip("Requires the explicitly staged real native Agent snapshot and public JPEG")
+        }
+        let caption = try XCTUnwrap(ProcessInfo.processInfo.environment["MAICHAT_NATIVE_PHOTO_REPLY_CAPTION"])
+        let capturePrompt = try XCTUnwrap(ProcessInfo.processInfo.environment["MAICHAT_NATIVE_PHOTO_REPLY_CAPTURE_PROMPT"])
+        XCTAssertFalse(caption.isEmpty)
+        XCTAssertFalse(capturePrompt.isEmpty)
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-image-fullscreen-ui-test",
+            "--ai-native-photo-reply-ui-test", "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = token.uuidString
+        app.launch()
+        defer { app.terminate() }
+
+        func currentCard() -> XCUIElement {
+            let cards = app.buttons.matching(identifier: "agent-image-bubble")
+            return cards.element(boundBy: max(0, cards.count - 1))
+        }
+        func openAssistant() {
+            let tab = app.buttons["创作中心"]
+            XCTAssertTrue(tab.waitForExistence(timeout: 12))
+            tab.tap()
+            XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 8))
+        }
+        func assertInlineReply() {
+            let card = currentCard()
+            XCTAssertTrue(card.waitForExistence(timeout: 15), "当前真实交付回执应显示图片卡片")
+            XCTAssertTrue(card.isHittable, "当前回复的图片应直接可见，无需用户向上寻找旧卡片")
+            XCTAssertTrue(app.staticTexts[caption].isHittable, "当前真实交付回执的说明应直接可见")
+            XCTAssertFalse(app.images["agent-image-preview"].exists, "普通展示不得自动弹出全屏")
+            XCTAssertTrue(app.textViews["ai-composer"].exists)
+            let draft = app.textViews["ai-composer"].value as? String ?? ""
+            XCTAssertTrue(draft.isEmpty || draft == "可按住转文字", "展示结果不能填入未发送草稿")
+            XCTAssertFalse(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@",
+                "ai-remove-attachment-")).firstMatch.exists, "工具交付不能追加到用户输入草稿")
+        }
+        openAssistant()
+        assertInlineReply()
+        let inline = XCTAttachment(screenshot: app.screenshot())
+        inline.name = "native-agent-current-reply-photo-inline"
+        inline.lifetime = .keepAlways
+        add(inline)
+
+        try await Task.sleep(for: .milliseconds(500))
+        currentCard().tap()
+        let preview = app.images["agent-image-preview"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 8))
+        let expanded = XCTAttachment(screenshot: app.screenshot())
+        expanded.name = "native-agent-current-reply-photo-explicit-enlargement"
+        expanded.lifetime = .keepAlways
+        add(expanded)
+        preview.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: preview)], timeout: 8), .completed)
+        assertInlineReply()
+
+        // Lazy history rows may leave the accessibility tree when offscreen.
+        // Visit the older real capture separately so both messages are checked
+        // without requiring all history thumbnails to remain allocated at once.
+        let scroll = try XCTUnwrap(app.scrollViews.allElementsBoundByIndex.first {
+            $0.isHittable && $0.identifier != "ai-session-drawer" &&
+                $0.frame.width > 100 && $0.frame.height > 100
+        }, "使用当前可交互的消息视口，不能选中保留在视图树中的隐藏会话抽屉")
+        for _ in 0..<8 where !app.staticTexts[capturePrompt].isHittable { scroll.swipeDown() }
+        XCTAssertTrue(app.staticTexts[capturePrompt].isHittable)
+        XCTAssertTrue(app.buttons.matching(identifier: "agent-image-bubble").firstMatch.isHittable,
+                      "当前再次展示不能移除旧拍照消息中的图片卡片")
+        XCTAssertFalse(app.images["agent-image-preview"].exists)
+        let older = XCTAttachment(screenshot: app.screenshot())
+        older.name = "native-agent-earlier-capture-card-preserved"
+        older.lifetime = .keepAlways
+        add(older)
+        for _ in 0..<8 where !app.staticTexts[caption].isHittable { scroll.swipeUp() }
+        assertInlineReply()
+
+        // Relaunch re-decodes the same unmodified persisted C ABI snapshot. No
+        // completed part or assistant answer is synthesized by this fixture.
+        app.terminate()
+        app.launch()
+        openAssistant()
+        assertInlineReply()
+        let restored = XCTAttachment(screenshot: app.screenshot())
+        restored.name = "native-agent-current-reply-photo-restored-snapshot"
+        restored.lifetime = .keepAlways
+        add(restored)
+        #else
+        throw XCTSkip("Only the explicitly staged Debug Simulator fixture may import this snapshot")
+        #endif
+    }
+
     /// A real completed host receipt becomes an inline card immediately. Loading
     /// the same persisted part must not launch a viewer or pollute the draft.
     @MainActor
