@@ -156,3 +156,13 @@ Desktop **2.2.45** 的 9 项 Mach-O、外层签名和无网络独立 AppData smo
 主要代价确实在重复 prefill。后续若做前缀加速，Qwen3.5 Hybrid 必须一起保存注意力和
 SSM 状态，当前没有账号/会话缓存身份字段，不能直接保留全局 KV 或在生成后简单裁剪。
 这属于需要独立设计、验证内存及归属失效规则的工作，本次没有擅自引入。
+
+## 产品提交绑定
+
+产品提交 `49dae2da` 已推送 `wanhongqing123/MaiChat` 的 `main`。按 Git 原始 blob 核对，
+711 项最终输入全部匹配，6 个旧发现层路径在提交中不存在；11 项冻结 Mach-O 和随包
+模型重哈希不变。绑定文件
+`/private/tmp/maichat-photo188-device-final-artifacts-20261104/final-source-binding.json`
+SHA256 为 `f929c1cd6f0093f2e0cb61e88e3f970b427203378883c857753c3db32fd432bb`。
+它明确记录 `installed=false`、最后已核验手机版本 187 和连接恢复后待重试安装；
+后续本段仅补充提交元数据，不改产品或重新构建。
