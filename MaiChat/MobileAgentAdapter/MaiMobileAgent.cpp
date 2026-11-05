@@ -8,6 +8,7 @@
 #include "MaiCalendarTools.h"
 
 #include "MaiAgent.h"
+#include "MaiAgentProgressInstructions.h"
 #include "MaiAgentSendMediaTool.h"
 #include "MaiAppStorageTool.h"
 #include "MaiArkAssetTools.h"
@@ -874,7 +875,8 @@ struct MaiMobileAgent {
             if (result.hasError()) return result.error();
             return result.output();
         };
-        options.baseInstructions = kMarkdownBaseInstructions;
+        // 与桌面端共用可见正文进度约定，后续本地模型能力边界仍按当前配置追加。
+        options.baseInstructions = kMarkdownBaseInstructions + maiAgentProgressInstructions();
         if (isLocal) {
             // 当前本地主模型未加载视觉投影器；展示工具产物和向模型送入图片是两种能力。
             // 明确边界，不能把成功拍照或界面显示误称为已经理解了照片内容。

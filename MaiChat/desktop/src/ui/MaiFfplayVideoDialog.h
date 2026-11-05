@@ -24,6 +24,8 @@ class QLabel;
 class QTimer;
 class QWidget;
 class QEvent;
+class QAction;
+class QToolButton;
 struct MaiCloudVod;
 
 class MaiFfplayVideoDialog final : public QDialog {
@@ -87,6 +89,11 @@ private:
     void updateControlLayout();
     void revealControls();
     void scheduleControlHide();
+    void updateWindowChrome();
+    void syncAudioControls();
+    void applyFullscreen(bool enabled);
+    void toggleFullscreen();
+    bool handleFrameMouse(QObject* watched, QEvent* event);
 
     QString path_;
     std::shared_ptr<MaiCloudVod> cloudSource_;
@@ -94,6 +101,13 @@ private:
     int playlistIndex_ = 0;
     QWidget* surface_ = nullptr;
     QWidget* overlay_ = nullptr;
+    QWidget* titleBar_ = nullptr;
+    QLabel* titleLabel_ = nullptr;
+    QLabel* durationLabel_ = nullptr;
+    QPushButton* maximizeButton_ = nullptr;
+    QToolButton* volumeButton_ = nullptr;
+    QSlider* volumeSlider_ = nullptr;
+    QAction* muteAction_ = nullptr;
     QPushButton* pauseButton_ = nullptr;
     QPushButton* previousButton_ = nullptr;
     QPushButton* nextButton_ = nullptr;
@@ -113,6 +127,26 @@ private:
     bool controlsSeeking_ = false;
     bool docked_ = false;
     double playbackSpeed_ = 1.0;
+    int volumePercent_ = 100;
+    bool audioMuted_ = false;
+    // 未入队的准备期意图持续重试直到成功；已入队只等 FIFO 序号回执，
+    // 不用超时/数值相等猜测完成，避免覆盖后续键盘或 Agent 的音量命令。
+    bool volumeRequestPending_ = false;
+    bool muteRequestPending_ = false;
+    uint64_t volumeRequestReceipt_ = 0;
+    uint64_t muteRequestReceipt_ = 0;
+    uint64_t audioIntentRevision_ = 0;
+    uint64_t volumeIntentRevision_ = 0;
+    uint64_t muteIntentRevision_ = 0;
+    // 低 8 位为设置，高位为意图版本。启动线程一次读取并回报消费版本，
+    // GUI 不重发已经作为初始参数生效的设置，以免覆盖随后的工具命令。
+    std::atomic<uint64_t> audioStartupSettings_{200};
+    std::atomic<uint64_t> audioStartupConsumedRevision_{0};
+    bool movingFrame_ = false;
+    bool windowWasMaximized_ = false;
+    Qt::Edges resizingFrame_;
+    QPoint framePressGlobal_;
+    QRect framePressGeometry_;
     int64_t startPositionUs_ = 0;
     uint64_t navigationGeneration_ = 0;
     std::atomic<bool> playbackFinished_{false};

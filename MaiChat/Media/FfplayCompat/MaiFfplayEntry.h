@@ -16,6 +16,38 @@ MAI_FFPLAY_EXPORT int maiFfplayRun(const MaiFfplayHost* host, int argc, char** a
 // 不创建输出文件。支持 0.25、0.5、1、1.5、2 倍速；上游 ffplay.c 保持原样。
 MAI_FFPLAY_EXPORT int maiFfplayRunAtSpeed(const MaiFfplayHost* host, int argc, char** argv, double speed,
                                           int64_t start_position_us);
+// 单独扩展音量接口，保留旧 Host/PlaybackStatus 的二进制大小与调用约定。
+// struct_size 至少包含自身；缺失的完整字段按 100% / 未静音处理。
+typedef struct MaiFfplayAudioOptions {
+    uint32_t struct_size;
+    int volume_percent;
+    int muted;
+} MaiFfplayAudioOptions;
+// options 可为 NULL，此时沿用 argv 的 -volume 或 upstream 默认值。
+// 合法值为 0..100 和 0/1；非法结构或值返回 -1。
+// 在创建解复用/音频线程前恢复设置，首个音频回调不会短暂使用默认音量。
+MAI_FFPLAY_EXPORT int maiFfplayRunAtSpeedWithAudio(const MaiFfplayHost* host, int argc, char** argv,
+                                                   double speed, int64_t start_position_us,
+                                                   const MaiFfplayAudioOptions* options);
+
+typedef struct MaiFfplayAudioStatus {
+    uint32_t struct_size;
+    int volume_percent;
+    int muted;
+    // 与音量/静音来自同一原子快照；0 表示本会话尚未执行音量命令。
+    uint64_t applied_serial;
+} MaiFfplayAudioStatus;
+// 初始化 struct_size 后调用；仅写入调用方大小覆盖到的完整字段，保留 struct_size。
+// 返回 1 表示运行中，0 表示未运行，-1 表示非法结构；数值来自事件线程实际设置。
+MAI_FFPLAY_EXPORT int maiFfplayGetAudioStatus(MaiFfplayAudioStatus* status);
+// 线程安全、按队列顺序执行；返回 1 仅表示入队、0 未运行、-1 非法值。
+// 设置音量不改变静音状态；设置静音是幂等操作，原 mute 命令仍切换静音。
+MAI_FFPLAY_EXPORT int maiFfplaySetVolumePercent(int volume_percent);
+MAI_FFPLAY_EXPORT int maiFfplaySetMuted(int muted);
+// 成功入队后写入唯一序号，失败写 0。回执字段可为 NULL；旧 setter 语义不变。
+// status.applied_serial >= receipt 即已执行，也允许后续工具命令已覆盖该设置。
+MAI_FFPLAY_EXPORT int maiFfplaySetVolumePercentWithReceipt(int volume_percent, uint64_t* receipt);
+MAI_FFPLAY_EXPORT int maiFfplaySetMutedWithReceipt(int muted, uint64_t* receipt);
 MAI_FFPLAY_EXPORT void maiFfplayRequestQuit(void);
 // 将 Agent/MaiChat 指令映射到 ffplay 现有控制逻辑。
 // 入队返回 1，播放器未运行返回 0，未知指令返回 -1。

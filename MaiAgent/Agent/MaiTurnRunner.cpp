@@ -323,9 +323,7 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         instruction.content = hint;
         finalRequest.messages.push_back(std::move(instruction));
         const auto finalCalls = requestCompletion(finalRequest, cancel);
-        const bool hasFinalText =
-            std::any_of(mText.begin(), mText.end(),
-                        [](unsigned char character) { return !std::isspace(character); });
+        const bool hasFinalText = mResponseHasVisibleText;
         commitStreamedParts();
         if (!mError && !cancel.load(std::memory_order_relaxed) &&
             (!finalCalls.empty() || !hasFinalText))
@@ -341,9 +339,7 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
 
         const auto calls =
             requestCompletion(buildRequest(mModelName, retriedMissingFinalAnswer), cancel);
-        const bool producedVisibleText =
-            std::any_of(mText.begin(), mText.end(),
-                        [](unsigned char character) { return !std::isspace(character); });
+        const bool producedVisibleText = mResponseHasVisibleText;
         commitStreamedParts();
 
         if (mError) break;
@@ -491,17 +487,47 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     mText.clear();
     mReasoning.clear();
     mLastPersistedStreamBytes = 0;
+    mResponseHasVisibleText = false;
     mTextPartId = MaiIdGenerator::newPartId();
     mReasoningPartId = MaiIdGenerator::newPartId();
 
     bool textStarted = false;
     bool reasoningStarted = false;
     std::vector<MaiToolInvocation> calls;
+    std::map<int, std::string> textItemParts;
 
     MaiStreamSink sink;
+    const auto selectTextItem = [&](const MaiModelTextItem& item) {
+        auto& partId = textItemParts[item.index];
+        if (partId.empty()) partId = MaiIdGenerator::newPartId();
+        if (mTextPartId == partId) return;
+        checkpointStreamedParts(true);
+        mText.clear();
+        mLastPersistedStreamBytes = mReasoning.size();
+        textStarted = false;
+        mTextPartId = partId;
+        for (const auto& part : mAssistant.parts) {
+            if (part.id != partId) continue;
+            if (const auto* text = std::get_if<MaiTextPart>(&part.body)) {
+                mText = text->text;
+                textStarted = true;
+                mLastPersistedStreamBytes += mText.size();
+            }
+            break;
+        }
+    };
+    // 同一次 Responses 请求也可包含多条可见发言。每个 item 独立落成 part，
+    // 不把 commentary 和后续正文粘在一起；Chat/local 省略边界时保留原行为。
+    sink.onTextItemStarted = selectTextItem;
+    sink.onTextItemCompleted = [&](const MaiModelTextItem& item) {
+        selectTextItem(item);
+        checkpointStreamedParts(true);
+    };
     sink.onText = [&](std::string_view chunk) {
-        mHasVisibleText |= std::any_of(chunk.begin(), chunk.end(),
-                                       [](unsigned char byte) { return !std::isspace(byte); });
+        const bool visible = std::any_of(chunk.begin(), chunk.end(),
+                                         [](unsigned char byte) { return !std::isspace(byte); });
+        mResponseHasVisibleText |= visible;
+        mHasVisibleText |= visible;
         if (!textStarted) {
             textStarted = true;
             beginStreamedPart(mTextPartId, MaiTextPart{});
@@ -509,6 +535,11 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
         mText.append(chunk);
         checkpointStreamedParts(false);
         mDependencies.emitter->emitDelta(mSessionId, mAssistant.id, mTextPartId, "text", chunk);
+    };
+    // 终止快照可补足较早的 item，不能把它的后缀写进当前最后一段正文。
+    sink.onTextItemDelta = [&](const MaiModelTextItem& item, std::string_view chunk) {
+        selectTextItem(item);
+        sink.onText(chunk);
     };
     sink.onReasoning = [&](std::string_view chunk) {
         if (!reasoningStarted) {

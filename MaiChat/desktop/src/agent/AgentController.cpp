@@ -3,6 +3,7 @@
 // 直接依赖：MaiAgentSendMediaTool.h、MaiAppStorageTool.h、MaiArkAssetTools.h、MaiArkMediaTools.h；实现与这些接口协作。
 #include "agent/AgentController.h"
 #include "agent/DesktopAccountModelClient.h"
+#include "MaiAgentProgressInstructions.h"
 #include "MaiAgentSendMediaTool.h"
 #include "MaiAppStorageTool.h"
 #include "MaiArkAssetTools.h"
@@ -396,7 +397,8 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     options.permissionTimeoutMs = 0;
     options.approvalPolicy = approvalPolicy;
     options.allowOutsideWorkingDirectory = true;
-    options.baseInstructions = kDesktopSystemPrompt;
+    // 与移动端共用可见正文进度约定，使工具执行前后的说明保持一致。
+    options.baseInstructions = kDesktopSystemPrompt + maiAgentProgressInstructions();
 
     return std::make_unique<MaiAgent>(std::move(store), std::move(model), std::move(tools), options);
 }

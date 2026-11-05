@@ -17,6 +17,7 @@
 #include <QPoint>
 #include <QPointer>
 #include <QPushButton>
+#include <QRect>
 #include <QScrollArea>
 #include <QStackedWidget>
 #include <QTextEdit>
@@ -122,9 +123,15 @@ protected:
     void closeEvent(QCloseEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void showEvent(QShowEvent* event) override;
+#ifdef Q_OS_WIN
+    bool nativeEvent(const QByteArray& eventType, void* message, long* result) override;
+#endif
 
 private:
     void updateWindowChromeBackground(bool active);
+    // Windows caption shares the active page's title row; the page keeps its own lifetime.
+    void updateWindowCaptionControls();
+    void toggleWindowMaximized();
     void wireRemoteAgentPanel();
     void buildUi();
     void applyStyle();
@@ -347,6 +354,12 @@ private:
     QPushButton* moreButton_ = nullptr;
     QPushButton* selfProfileButton_ = nullptr;
     QWidget* navRail_ = nullptr;
+    QWidget* windowCaptionControls_ = nullptr;
+    QPushButton* windowMinimizeButton_ = nullptr;
+    QPushButton* windowMaximizeButton_ = nullptr;
+    QPushButton* windowCloseButton_ = nullptr;
+    QRect windowCaptionDragRect_;
+    bool windowMaximizePressed_ = false;
     QLineEdit* navSearchInput_ = nullptr;
     QLineEdit* contactsSearchInput_ = nullptr;
     QSystemTrayIcon* trayIcon_ = nullptr;

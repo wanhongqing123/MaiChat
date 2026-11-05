@@ -113,6 +113,9 @@ private slots:
     void messageTextUsesNativeResolutionAndRegularBodyFont();
     void exposesDesktopChatLayoutControls();
     void mainWindowUsesRoomierIconFreeTitleArea();
+    void windowsCaptionFollowsContentHeadersWithoutCoveringActions();
+    void windowsCaptionStaysVisibleWhileSettingsScrolls();
+    void windowsCaptionPreservesNativeWindowActions();
     void conversationSidebarUsesLighterBackground();
     void conversationPreviewUsesPlainMarkdown_data();
     void conversationPreviewUsesPlainMarkdown();
@@ -1195,15 +1198,178 @@ void MainWindowLayoutTest::mainWindowUsesRoomierIconFreeTitleArea() {
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     const HWND handle = reinterpret_cast<HWND>(window.winId());
-    QVERIFY(window.property("nativeTitleBarIconHidden").toBool());
-    QVERIFY(SendMessageW(handle, WM_GETICON, ICON_SMALL, 0) != 0);
+    QVERIFY(window.windowFlags().testFlag(Qt::FramelessWindowHint));
     QVERIFY(!(GetWindowLongPtrW(handle, GWL_EXSTYLE) & WS_EX_DLGMODALFRAME));
-    QVERIFY(window.windowFlags().testFlag(Qt::WindowSystemMenuHint));
-    QVERIFY(window.windowFlags().testFlag(Qt::WindowMinimizeButtonHint));
-    QVERIFY(window.windowFlags().testFlag(Qt::WindowMaximizeButtonHint));
-    QVERIFY(window.windowFlags().testFlag(Qt::WindowCloseButtonHint));
+    const LONG_PTR nativeStyle = GetWindowLongPtrW(handle, GWL_STYLE);
+    QVERIFY(nativeStyle & WS_THICKFRAME);
+    QVERIFY(nativeStyle & WS_SYSMENU);
+    QVERIFY(nativeStyle & WS_MINIMIZEBOX);
+    QVERIFY(nativeStyle & WS_MAXIMIZEBOX);
 #else
     QVERIFY(inset == nullptr);
+#endif
+}
+
+void MainWindowLayoutTest::windowsCaptionFollowsContentHeadersWithoutCoveringActions() {
+#ifdef Q_OS_WIN
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    RemoteIMApplication app(QStringLiteral("desktop-caption-layout"), std::move(client));
+    MainWindow window(app);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* controls = window.findChild<QWidget*>(QStringLiteral("windowCaptionControls"));
+    auto* minimize = window.findChild<QPushButton*>(QStringLiteral("windowMinimizeButton"));
+    auto* maximize = window.findChild<QPushButton*>(QStringLiteral("windowMaximizeButton"));
+    auto* close = window.findChild<QPushButton*>(QStringLiteral("windowCloseButton"));
+    QVERIFY(controls && minimize && maximize && close);
+    QVERIFY(minimize->isVisible() && maximize->isVisible() && close->isVisible());
+    QCOMPARE(minimize->accessibleName(), QStringLiteral("最小化"));
+    QCOMPARE(maximize->accessibleName(), QStringLiteral("最大化"));
+    QCOMPARE(close->accessibleName(), QStringLiteral("关闭"));
+    const auto mapped = [&window](QWidget* widget) {
+        return QRect(widget->mapTo(&window, QPoint()), widget->size());
+    };
+    auto* chatHeader = window.findChild<QWidget*>(QStringLiteral("chatHeader"));
+    auto* chatMore = window.findChild<QPushButton*>(QStringLiteral("moreButton"));
+    QVERIFY(chatHeader && chatMore);
+    QTRY_VERIFY(qAbs(mapped(controls).center().y() - mapped(chatHeader).center().y()) <= 1);
+    QVERIFY(mapped(chatMore).right() < mapped(controls).left());
+
+    window.findChild<QPushButton*>(QStringLiteral("agentNavButton"))->click();
+    auto* title = window.findChild<QLabel*>(QStringLiteral("agentHeaderTitle"));
+    auto* more = window.findChild<QPushButton*>(QStringLiteral("agentMoreActions"));
+    QVERIFY(title && more);
+    QTRY_VERIFY(title->isVisible());
+    QTRY_VERIFY(qAbs(mapped(controls).center().y() - mapped(title).center().y()) <= 1);
+    QVERIFY(mapped(more).right() < mapped(controls).left());
+    // A narrower window must retain the existing More action and a full caption hit target.
+    window.resize(window.minimumWidth(), window.height());
+    QTRY_VERIFY(mapped(more).right() < mapped(controls).left());
+    QVERIFY(mapped(controls).right() < window.width());
+    QVERIFY(mapped(controls).top() >= UiZoom::s(16));
+    const QByteArray capture = qgetenv("MAICHAT_CAPTURE_MAIN_CAPTION");
+    if (!capture.isEmpty()) QVERIFY(window.grab().save(QString::fromUtf8(capture)));
+
+    window.findChild<QPushButton*>(QStringLiteral("cloudNavButton"))->click();
+    auto* upload = window.findChild<QPushButton*>(QStringLiteral("cloudDriveUpload"));
+    QVERIFY(upload);
+    QTRY_VERIFY(upload->isVisible());
+    QTRY_VERIFY(mapped(upload).right() < mapped(controls).left());
+    QTRY_VERIFY(qAbs(mapped(controls).center().y() - mapped(upload).center().y()) <= 1);
+    window.findChild<QPushButton*>(QStringLiteral("contactsNavButton"))->click();
+    auto* directory = window.findChild<QListWidget*>(QStringLiteral("contactsList"));
+    QVERIFY(directory);
+    QTRY_VERIFY(directory->isVisible());
+    QTRY_VERIFY(mapped(controls).bottom() < mapped(directory).top());
+#else
+    QSKIP("Windows custom caption; other platforms retain their native title bar.");
+#endif
+}
+
+void MainWindowLayoutTest::windowsCaptionStaysVisibleWhileSettingsScrolls() {
+#ifdef Q_OS_WIN
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    RemoteIMApplication app(QStringLiteral("desktop-caption-settings-scroll"), std::move(client));
+    MainWindow window(app);
+    window.resize(window.minimumSize());
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* settings = window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"));
+    auto* scroll = window.findChild<QScrollArea*>(QStringLiteral("settingsScroll"));
+    auto* controls = window.findChild<QWidget*>(QStringLiteral("windowCaptionControls"));
+    QVERIFY(settings && scroll && controls);
+    settings->click();
+    QTRY_VERIFY(scroll->isVisible());
+    QTRY_VERIFY(scroll->verticalScrollBar()->maximum() > 0);
+    QCoreApplication::processEvents();
+    const auto captionRect = [&] {
+        return QRect(controls->mapTo(&window, QPoint()), controls->size());
+    };
+    const int captionCenter = captionRect().center().y();
+    // The settings body really moves through its QScrollArea. A later native
+    // resize must not reposition window actions using that scrolled title.
+    scroll->verticalScrollBar()->setValue(scroll->verticalScrollBar()->maximum());
+    QTRY_VERIFY(scroll->verticalScrollBar()->value() > 0);
+    window.resize(window.width() + UiZoom::s(80), window.height() + UiZoom::s(40));
+    QCoreApplication::processEvents();
+    QTRY_COMPARE(captionRect().center().y(), captionCenter);
+    QVERIFY(window.rect().contains(captionRect()));
+    QVERIFY(captionRect().bottom() < scroll->mapTo(&window, QPoint()).y());
+    for (const char* name : {"windowMinimizeButton", "windowMaximizeButton", "windowCloseButton"}) {
+        auto* button = window.findChild<QPushButton*>(QString::fromLatin1(name));
+        QVERIFY(button && button->isVisible() && button->isEnabled());
+        QVERIFY(window.rect().contains(QRect(button->mapTo(&window, QPoint()), button->size())));
+    }
+#else
+    QSKIP("Windows custom caption; other platforms retain their native title bar.");
+#endif
+}
+
+void MainWindowLayoutTest::windowsCaptionPreservesNativeWindowActions() {
+#ifdef Q_OS_WIN
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    RemoteIMApplication app(QStringLiteral("desktop-caption-actions"), std::move(client));
+    MainWindow window(app);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* minimize = window.findChild<QPushButton*>(QStringLiteral("windowMinimizeButton"));
+    auto* maximize = window.findChild<QPushButton*>(QStringLiteral("windowMaximizeButton"));
+    auto* close = window.findChild<QPushButton*>(QStringLiteral("windowCloseButton"));
+    auto* header = window.findChild<QWidget*>(QStringLiteral("chatHeader"));
+    QVERIFY(minimize && maximize && close && header);
+    const HWND handle = reinterpret_cast<HWND>(window.winId());
+    const auto nativePoint = [&window, handle](QPoint local) {
+        const qreal ratio = window.devicePixelRatioF();
+        POINT point{qRound(local.x() * ratio), qRound(local.y() * ratio)};
+        ClientToScreen(handle, &point);
+        return MAKELPARAM(point.x, point.y);
+    };
+    const auto maximizePoint = [&] {
+        return nativePoint(maximize->mapTo(&window, maximize->rect().center()));
+    };
+    QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0, maximizePoint()), LRESULT(HTMAXBUTTON));
+    QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0, nativePoint(QPoint(1, 1))),
+             LRESULT(HTTOPLEFT));
+    QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0,
+                         nativePoint(header->mapTo(&window, QPoint(12, header->height() / 2)))),
+             LRESULT(HTCAPTION));
+
+    // Snap hover uses HTMAXBUTTON, so actual mouse clicks arrive as non-client messages.
+    SendMessageW(handle, WM_NCLBUTTONDOWN, HTMAXBUTTON, maximizePoint());
+    SendMessageW(handle, WM_NCLBUTTONUP, HTMAXBUTTON, maximizePoint());
+    QTRY_VERIFY(window.isMaximized());
+    QTRY_COMPARE(maximize->accessibleName(), QStringLiteral("还原"));
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    QVERIFY(GetMonitorInfoW(MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST), &monitorInfo));
+    RECT bounds{};
+    QVERIFY(GetWindowRect(handle, &bounds));
+    QVERIFY(bounds.left >= monitorInfo.rcWork.left && bounds.top >= monitorInfo.rcWork.top);
+    QVERIFY(bounds.right <= monitorInfo.rcWork.right && bounds.bottom <= monitorInfo.rcWork.bottom);
+    SendMessageW(handle, WM_NCLBUTTONDOWN, HTMAXBUTTON, maximizePoint());
+    SendMessageW(handle, WM_NCLBUTTONUP, HTMAXBUTTON, maximizePoint());
+    QTRY_VERIFY(!window.isMaximized());
+    SendMessageW(handle, WM_NCLBUTTONDOWN, HTMAXBUTTON, maximizePoint());
+    SendMessageW(handle, WM_LBUTTONUP, 0, MAKELPARAM(20, 100));
+    QVERIFY(!window.isMaximized());
+    QVERIFY(!maximize->property("captionPressed").toBool());
+    SendMessageW(handle, WM_NCLBUTTONDBLCLK, HTCAPTION,
+                 nativePoint(header->mapTo(&window, QPoint(12, header->height() / 2))));
+    QTRY_VERIFY(window.isMaximized());
+    window.showNormal();
+    QTRY_VERIFY(!window.isMaximized());
+    QTest::mouseClick(maximize, Qt::LeftButton);
+    QTRY_VERIFY(window.isMaximized());
+    QTest::mouseClick(maximize, Qt::LeftButton);
+    QTRY_VERIFY(!window.isMaximized());
+    QTest::mouseClick(minimize, Qt::LeftButton);
+    QTRY_VERIFY(window.isMinimized());
+    window.showNormal();
+    QTRY_VERIFY(!window.isMinimized());
+    QTest::mouseClick(close, Qt::LeftButton);
+    QTRY_VERIFY(!window.isVisible());
+#else
+    QSKIP("Windows custom caption; other platforms retain their native title bar.");
 #endif
 }
 

@@ -1737,22 +1737,67 @@ QString agentDatabasePath(const QString &ownerUserId) {
 }
 
 #ifdef Q_OS_WIN
-void hideNativeTitleBarIcon(QWidget *window) {
-  if (window->property("nativeTitleBarIconHidden").toBool())
-    return;
+// Caption glyphs remain vector lines at any UiZoom/DPI. The maximize button also
+// receives native hover/press feedback when Windows recognizes its Snap target.
+class WindowCaptionButton final : public QPushButton {
+public:
+  enum class Action { Minimize, Maximize, Close };
+  WindowCaptionButton(Action action, QWidget* parent)
+      : QPushButton(parent), action_(action) {
+    setFocusPolicy(Qt::NoFocus);
+    setCursor(Qt::ArrowCursor);
+  }
+
+protected:
+  void paintEvent(QPaintEvent*) override {
+    QPainter painter(this);
+    const bool hovered = underMouse() || property("captionHovered").toBool();
+    const bool pressed = isDown() || property("captionPressed").toBool();
+    if (hovered || pressed) {
+      painter.fillRect(rect(), action_ == Action::Close
+          ? QColor(pressed ? "#c42b35" : "#e5484d")
+          : QColor(pressed ? "#dce3eb" : "#edf2f7"));
+    }
+    painter.setRenderHint(QPainter::Antialiasing);
+    const qreal glyph = UiZoom::s(10);
+    const QRectF mark((width() - glyph) / 2.0, (height() - glyph) / 2.0,
+                      glyph, glyph);
+    painter.setPen(QPen(action_ == Action::Close && (hovered || pressed)
+                            ? QColor(Qt::white) : QColor("#4c5866"),
+                        qMax(1.0, UiZoom::factor())));
+    if (action_ == Action::Minimize) {
+      painter.drawLine(QPointF(mark.left(), mark.center().y()),
+                       QPointF(mark.right(), mark.center().y()));
+    } else if (action_ == Action::Close) {
+      painter.drawLine(mark.topLeft(), mark.bottomRight());
+      painter.drawLine(mark.topRight(), mark.bottomLeft());
+    } else if (window()->isMaximized()) {
+      const qreal offset = UiZoom::s(2);
+      const QRectF front = mark.adjusted(0, offset, -offset, 0);
+      painter.drawLine(mark.topLeft() + QPointF(offset, 0), mark.topRight());
+      painter.drawLine(mark.topRight(), mark.bottomRight() - QPointF(0, offset));
+      painter.drawLine(mark.topLeft() + QPointF(offset, 0), front.topLeft() + QPointF(offset, 0));
+      painter.drawRect(front);
+    } else {
+      painter.drawRect(mark);
+    }
+  }
+
+private:
+  Action action_;
+};
+
+void configureWindowsContentCaption(QWidget* window) {
   const HWND handle = reinterpret_cast<HWND>(window->winId());
-  static HICON transparentSmallIcon = [] {
-    unsigned char andMask[64];
-    unsigned char xorMask[16 * 16 * 4];
-    std::fill_n(andMask, sizeof(andMask), 0xff);
-    std::fill_n(xorMask, sizeof(xorMask), 0x00);
-    return CreateIcon(nullptr, 16, 16, 1, 32, andMask, xorMask);
-  }();
-  SendMessageW(handle, WM_SETICON, ICON_SMALL,
-               reinterpret_cast<LPARAM>(transparentSmallIcon));
-  SendMessageW(handle, WM_SETICON, ICON_SMALL2,
-               reinterpret_cast<LPARAM>(transparentSmallIcon));
-  window->setProperty("nativeTitleBarIconHidden", true);
+  const LONG_PTR before = GetWindowLongPtrW(handle, GWL_STYLE);
+  const LONG_PTR after = (before | WS_THICKFRAME | WS_SYSMENU |
+                          WS_MINIMIZEBOX | WS_MAXIMIZEBOX) & ~WS_CAPTION;
+  if (before == after) return;
+  // Keep the system move/size loop and Snap semantics while NCCALCSIZE removes
+  // the native top strip. Maximized bounds are constrained below to rcWork.
+  SetWindowLongPtrW(handle, GWL_STYLE, after);
+  SetWindowPos(handle, nullptr, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 #endif
 
@@ -1854,6 +1899,8 @@ bool MainWindow::event(QEvent *event) {
   if (event->type() == QEvent::Move)
     QTimer::singleShot(0, this, [this] { syncVideoDock(); });
 #ifdef Q_OS_WIN
+  if (event->type() == QEvent::WindowStateChange)
+    updateWindowCaptionControls();
   if (event->type() == QEvent::WindowActivate) {
     updateWindowChromeBackground(true);
   } else if (event->type() == QEvent::WindowDeactivate) {
@@ -1862,6 +1909,183 @@ bool MainWindow::event(QEvent *event) {
 #endif
   return handled;
 }
+
+void MainWindow::toggleWindowMaximized() {
+  if (isMaximized()) showNormal();
+  else showMaximized();
+}
+
+void MainWindow::updateWindowCaptionControls() {
+#ifdef Q_OS_WIN
+  if (!windowCaptionControls_ || !contentStack_) return;
+  // Pages with no product header reserve one caption row rather than covering
+  // contact rows or a remote desktop card. Full screen returns that space.
+  for (QWidget* page : {contactsPage_, remotePage_}) {
+    if (page && page->layout()) {
+      const int top = isFullScreen() ? 0 : UiZoom::s(54);
+      if (page->layout()->contentsMargins().top() != top)
+        page->layout()->setContentsMargins(0, top, 0, 0);
+    }
+  }
+  windowCaptionControls_->setVisible(!isFullScreen());
+  if (isFullScreen()) return;
+  const int buttonWidth = UiZoom::s(36);
+  const int buttonHeight = UiZoom::s(30);
+  for (auto* button : {windowMinimizeButton_, windowMaximizeButton_, windowCloseButton_})
+    button->setFixedSize(buttonWidth, buttonHeight);
+  const QString maximizeText = isMaximized() ? QStringLiteral("还原") : QStringLiteral("最大化");
+  windowMaximizeButton_->setAccessibleName(maximizeText);
+  windowMaximizeButton_->setToolTip(maximizeText);
+  windowMaximizeButton_->update();
+
+  QWidget* header = nullptr;
+  QLayout* row = nullptr;
+  if (contentStack_->currentWidget() == agentPage_) {
+    header = agentPage_->findChild<QWidget*>(QStringLiteral("agentHeader"));
+  } else if (contentStack_->currentWidget() == messagesPage_) {
+    header = chatConversationStack_->currentWidget() == groupConversationPane_
+        ? groupTitleLabel_->parentWidget()
+        : findChild<QWidget*>(QStringLiteral("chatHeader"));
+  } else if (contentStack_->currentWidget() == cloudDrivePage_ && cloudDriveDialog_) {
+    header = cloudDriveDialog_;
+    if (header->layout() && header->layout()->count() > 0)
+      row = header->layout()->itemAt(0)->layout();
+  } else if (contentStack_->currentWidget() == settingsPage_) {
+    header = settingsPage_->findChild<QWidget*>(QStringLiteral("settingsHeader"));
+  }
+  if (header && !row) row = header->layout();
+  // Reserve only the title row's trailing space. Existing actions and every
+  // conversation/media surface keep their current container and state.
+  if (row) {
+    const QMargins margins = row->contentsMargins();
+    const int right = UiZoom::s(3 * 36 + 16);
+    if (margins.right() != right)
+      row->setContentsMargins(margins.left(), margins.top(), right, margins.bottom());
+    // 页面切换时立即让原有动作让出空间，避免等待下一次 LayoutRequest 时短暂被窗口按钮覆盖。
+    row->activate();
+    header->installEventFilter(this);
+  }
+  QRect titleRect(contentStack_->mapTo(this, QPoint()), QSize(contentStack_->width(), UiZoom::s(54)));
+  if (header) {
+    titleRect = QRect(header->mapTo(this, QPoint()), header->size());
+    if (row && header == cloudDriveDialog_)
+      titleRect = QRect(header->mapTo(this, row->geometry().topLeft()), row->geometry().size());
+    else if (header == groupTitleLabel_->parentWidget())
+      titleRect = QRect(groupTitleLabel_->mapTo(this, QPoint()), groupTitleLabel_->size());
+  }
+  windowCaptionDragRect_ = titleRect;
+  const QPoint captionTop(width() - UiZoom::s(8) - buttonWidth * 3,
+                          titleRect.center().y() - buttonHeight / 2);
+  QWidget* captionParent = windowCaptionControls_->parentWidget();
+  windowCaptionControls_->setGeometry(QRect(captionParent->mapFrom(this, captionTop),
+                                            QSize(buttonWidth * 3, buttonHeight)));
+  windowCaptionControls_->raise();
+#endif
+}
+
+#ifdef Q_OS_WIN
+bool MainWindow::nativeEvent(const QByteArray& eventType, void* message, long* result) {
+  auto* native = static_cast<MSG*>(message);
+  if (native->message == WM_NCCALCSIZE && !isFullScreen()) {
+    *result = 0;
+    return true;
+  }
+  if (native->message == WM_GETMINMAXINFO && !isFullScreen()) {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(MonitorFromWindow(native->hwnd, MONITOR_DEFAULTTONEAREST), &info)) {
+      auto* bounds = reinterpret_cast<MINMAXINFO*>(native->lParam);
+      bounds->ptMaxPosition = {info.rcWork.left - info.rcMonitor.left,
+                               info.rcWork.top - info.rcMonitor.top};
+      bounds->ptMaxSize = {info.rcWork.right - info.rcWork.left,
+                           info.rcWork.bottom - info.rcWork.top};
+      bounds->ptMinTrackSize = {qRound(minimumWidth() * devicePixelRatioF()),
+                                qRound(minimumHeight() * devicePixelRatioF())};
+      *result = 0;
+      return true;
+    }
+  }
+  const auto nativeClientPoint = [&] {
+    POINT point{static_cast<short>(LOWORD(native->lParam)),
+                 static_cast<short>(HIWORD(native->lParam))};
+    if (native->message != WM_LBUTTONUP)
+      ScreenToClient(native->hwnd, &point);
+    const qreal ratio = devicePixelRatioF();
+    return QPoint(qRound(point.x / ratio), qRound(point.y / ratio));
+  };
+  if (native->message == WM_NCHITTEST && !isFullScreen() && windowCaptionControls_) {
+    const QPoint point = nativeClientPoint();
+    if (!isMaximized()) {
+      const int edge = UiZoom::s(6);
+      const bool left = point.x() < edge;
+      const bool right = point.x() >= width() - edge;
+      const bool top = point.y() < edge;
+      const bool bottom = point.y() >= height() - edge;
+      const int hit = top ? (left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP)
+          : bottom ? (left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM)
+          : left ? HTLEFT : right ? HTRIGHT : HTCLIENT;
+      if (hit != HTCLIENT) { *result = hit; return true; }
+    }
+    const QRect maximizeRect(windowMaximizeButton_->mapTo(this, QPoint()),
+                              windowMaximizeButton_->size());
+    if (maximizeRect.contains(point)) {
+      *result = HTMAXBUTTON;
+      return true;
+    }
+    QWidget* child = childAt(point);
+    const bool passive = !child || child == centralWidget() || child == contentStack_ ||
+        qobject_cast<QLabel*>(child) ||
+        (child->metaObject() == &QWidget::staticMetaObject && child != windowCaptionControls_);
+    auto* inset = findChild<QWidget*>(QStringLiteral("windowTopInset"));
+    const bool inTopInset = inset && QRect(inset->mapTo(this, QPoint()), inset->size()).contains(point);
+    if (passive && (windowCaptionDragRect_.contains(point) || inTopInset)) {
+      // Native HTCAPTION keeps double-click maximize, drag restore and Snap move.
+      *result = HTCAPTION;
+      return true;
+    }
+  }
+  if (windowMaximizeButton_) {
+    if (native->message == WM_NCMOUSEMOVE) {
+      const bool hovered = native->wParam == HTMAXBUTTON;
+      windowMaximizeButton_->setProperty("captionHovered", hovered);
+      windowMaximizeButton_->update();
+      TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT), TME_LEAVE | TME_NONCLIENT,
+                               native->hwnd, 0};
+      TrackMouseEvent(&tracking);
+    } else if (native->message == WM_NCMOUSELEAVE) {
+      windowMaximizeButton_->setProperty("captionHovered", false);
+      windowMaximizeButton_->update();
+    } else if ((native->message == WM_NCLBUTTONDOWN || native->message == WM_NCLBUTTONDBLCLK) &&
+               native->wParam == HTMAXBUTTON) {
+      windowMaximizePressed_ = true;
+      windowMaximizeButton_->setProperty("captionPressed", true);
+      windowMaximizeButton_->update();
+      // Capture gives us the release even if the pointer leaves the Snap hit
+      // target; releasing outside cancels instead of leaving a pressed glyph.
+      SetCapture(native->hwnd);
+      *result = 0;
+      return true;
+    } else if ((native->message == WM_NCLBUTTONUP || native->message == WM_LBUTTONUP) &&
+               windowMaximizePressed_) {
+      windowMaximizePressed_ = false;
+      windowMaximizeButton_->setProperty("captionPressed", false);
+      windowMaximizeButton_->update();
+      const QRect maximizeRect(windowMaximizeButton_->mapTo(this, QPoint()),
+                                windowMaximizeButton_->size());
+      const bool activate = maximizeRect.contains(nativeClientPoint());
+      if (GetCapture() == native->hwnd) ReleaseCapture();
+      if (activate) toggleWindowMaximized();
+      *result = 0;
+      return true;
+    } else if (native->message == WM_CANCELMODE || native->message == WM_CAPTURECHANGED) {
+      windowMaximizePressed_ = false;
+      windowMaximizeButton_->setProperty("captionPressed", false);
+      windowMaximizeButton_->update();
+    }
+  }
+  return QMainWindow::nativeEvent(eventType, message, result);
+}
+#endif
 
 void MainWindow::updateWindowChromeBackground(bool active) {
 #ifdef Q_OS_WIN
@@ -1932,6 +2156,12 @@ void MainWindow::setLogoutHandler(std::function<void()> handler) {
 }
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event) {
+#ifdef Q_OS_WIN
+  if (windowCaptionControls_ && (event->type() == QEvent::Resize ||
+      event->type() == QEvent::Move || event->type() == QEvent::LayoutRequest ||
+      event->type() == QEvent::Show))
+    QTimer::singleShot(0, this, [this] { updateWindowCaptionControls(); });
+#endif
   if (watched == videoDockSlot_ &&
       (event->type() == QEvent::Resize || event->type() == QEvent::Move))
     QTimer::singleShot(0, this, [this] { syncVideoDock(); });
@@ -2050,7 +2280,10 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event) {
 
 void MainWindow::resizeEvent(QResizeEvent *event) {
   QMainWindow::resizeEvent(event);
+  // 先按新的客户区宽度收回窗口按钮；内容布局完成后再校准标题行高度。
+  updateWindowCaptionControls();
   QTimer::singleShot(0, this, [this] {
+    updateWindowCaptionControls();
     updateMessageBubbleWidths();
     // 结果面板是按搜索框位置摆的浮层，不在布局里，窗口一变它就得重新对位。
     layoutGlobalSearchResults();
@@ -2061,12 +2294,18 @@ void MainWindow::resizeEvent(QResizeEvent *event) {
 void MainWindow::showEvent(QShowEvent *event) {
   QMainWindow::showEvent(event);
 #ifdef Q_OS_WIN
-  hideNativeTitleBarIcon(this);
+  if (!isFullScreen()) configureWindowsContentCaption(this);
 #endif
+  updateWindowCaptionControls();
   QTimer::singleShot(0, this, [this] { updateMessageBubbleWidths(); });
 }
 
 void MainWindow::buildUi() {
+#ifdef Q_OS_WIN
+  // Caption buttons belong to the page title row, rather than a second strip
+  // above it. Native hit testing below retains Windows move/resize behavior.
+  setWindowFlag(Qt::FramelessWindowHint);
+#endif
   // 单个空格而不是空串：空标题时 Qt 会回退显示 applicationDisplayName
   // （"MaiChat"），飞书风格的标题栏不显示文字。
   setWindowTitle(QStringLiteral(" "));
@@ -2083,8 +2322,8 @@ void MainWindow::buildUi() {
   setCentralWidget(root);
 
 #ifdef Q_OS_WIN
-// 扩大系统原生标题栏的视觉高度，不替换为自绘标题栏。
-// 自绘会破坏窗口缩放、贴边吸附和 Windows 11 贴靠布局菜单。
+  // A small draggable inset keeps the page title away from the screen edge;
+  // caption buttons are aligned with the actual page header below this inset.
   auto *windowTopInset = new QWidget(root);
   windowTopInset->setObjectName(QStringLiteral("windowTopInset"));
   windowTopInset->setFixedHeight(UiZoom::s(16));
@@ -2827,6 +3066,16 @@ void MainWindow::buildUi() {
   auto *settingsPageLayout = new QVBoxLayout(settingsPage_);
   settingsPageLayout->setContentsMargins(0, 0, 0, 0);
   settingsPageLayout->setSpacing(0);
+#ifdef Q_OS_WIN
+  // Window actions share a fixed title row. Anchoring them to pageTitle inside
+  // settingsScroll would move them outside the window after scroll + resize.
+  auto *settingsHeader = new QWidget(settingsPage_);
+  settingsHeader->setObjectName(QStringLiteral("settingsHeader"));
+  settingsHeader->setFixedHeight(UiZoom::s(54));
+  auto *settingsHeaderLayout = new QHBoxLayout(settingsHeader);
+  settingsHeaderLayout->setContentsMargins(UiZoom::s(36), 0, UiZoom::s(36), 0);
+  settingsPageLayout->addWidget(settingsHeader);
+#endif
   auto *settingsScroll = new QScrollArea(settingsPage_);
   settingsScroll->setObjectName(QStringLiteral("settingsScroll"));
   settingsScroll->setWidgetResizable(true);
@@ -2841,7 +3090,12 @@ void MainWindow::buildUi() {
   settingsLayout->setContentsMargins(36, 30, 36, 30);
   settingsLayout->setSpacing(18);
 
+#ifdef Q_OS_WIN
+  auto *settingsTitle = new QLabel(QStringLiteral("设置"), settingsHeader);
+  settingsHeaderLayout->addWidget(settingsTitle);
+#else
   auto *settingsTitle = new QLabel(QStringLiteral("设置"), settingsContent);
+#endif
   settingsTitle->setObjectName(QStringLiteral("pageTitle"));
   auto *settingsSubtitle =
       new QLabel(QStringLiteral("管理 MaiChat 账号和这台电脑的登录。"),
@@ -2981,7 +3235,9 @@ void MainWindow::buildUi() {
   });
   settingsPanelLayout->addWidget(logoutRow);
 
+#ifndef Q_OS_WIN
   settingsLayout->addWidget(settingsTitle);
+#endif
   settingsLayout->addWidget(settingsSubtitle);
   settingsLayout->addWidget(profileCard);
   settingsLayout->addWidget(settingsPanel);
@@ -3060,6 +3316,40 @@ void MainWindow::buildUi() {
   // 收窄成纯图标条之后，多出来的那截就成了导航栏和内容之间一条空白列。
   rootNavigationSplitter->setSizes(QList<int>() << UiZoom::s(64) << 1100);
   rootLayout->addWidget(rootNavigationSplitter, 1);
+#ifdef Q_OS_WIN
+  windowCaptionControls_ = new QWidget(root);
+  windowCaptionControls_->setObjectName(QStringLiteral("windowCaptionControls"));
+  auto* captionRow = new QHBoxLayout(windowCaptionControls_);
+  captionRow->setContentsMargins(0, 0, 0, 0);
+  captionRow->setSpacing(0);
+  const auto makeCaptionButton = [&](WindowCaptionButton::Action action, const char* name,
+                                      const QString& title) {
+    auto* button = new WindowCaptionButton(action, windowCaptionControls_);
+    button->setObjectName(QString::fromLatin1(name));
+    button->setAccessibleName(title);
+    button->setToolTip(title);
+    captionRow->addWidget(button);
+    return button;
+  };
+  windowMinimizeButton_ = makeCaptionButton(WindowCaptionButton::Action::Minimize,
+      "windowMinimizeButton", QStringLiteral("最小化"));
+  windowMaximizeButton_ = makeCaptionButton(WindowCaptionButton::Action::Maximize,
+      "windowMaximizeButton", QStringLiteral("最大化"));
+  windowCloseButton_ = makeCaptionButton(WindowCaptionButton::Action::Close,
+      "windowCloseButton", QStringLiteral("关闭"));
+  connect(windowMinimizeButton_, &QPushButton::clicked, this, &MainWindow::showMinimized);
+  connect(windowMaximizeButton_, &QPushButton::clicked, this, &MainWindow::toggleWindowMaximized);
+  connect(windowCloseButton_, &QPushButton::clicked, this, &MainWindow::close);
+  connect(contentStack_, &QStackedWidget::currentChanged, this, [this] {
+    updateWindowCaptionControls();
+    QTimer::singleShot(0, this, [this] { updateWindowCaptionControls(); });
+  });
+  connect(chatConversationStack_, &QStackedWidget::currentChanged, this,
+          [this] { updateWindowCaptionControls(); });
+  root->installEventFilter(this);
+  rootContent->installEventFilter(this);
+  updateWindowCaptionControls();
+#endif
 }
 
 void MainWindow::applyStyle() {
@@ -6300,12 +6590,12 @@ bool MainWindow::openVideoWindow(const QString& path, const QStringList& playlis
 #if defined(MAICHAT_HAS_FFPLAY)
   if (!QFileInfo(path).isFile()) return false;
   if (auto active = MaiFfplayVideoDialog::activeDialog()) active->close();
-  // 本地视频所有入口保留父对象的生命周期管理，但使用 Window 类型和原生标题栏；
+  // 本地视频所有入口保留父对象的生命周期管理；Window 类型保留非模态独立窗口，
+  // 标题栏和窗口操作由播放器统一绘制，不再叠加系统标题栏。
   // 不登记停靠状态，主窗口导航、缩放和播放器全屏都不重新分配会话区域。
   auto* dialog = new MaiFfplayVideoDialog(path, this, startPositionUs);
   dialog->setObjectName(QStringLiteral("agentVideoPlayerWindow"));
-  dialog->setWindowFlags(Qt::Window | Qt::WindowCloseButtonHint |
-                        Qt::WindowMinMaxButtonsHint | Qt::WindowTitleHint);
+  dialog->setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
   dialog->setPlaylist(playlist);
   dialog->setForwardAction([this](const QString& currentPath) {
     forwardLocalVideo(currentPath);
@@ -6336,11 +6626,11 @@ bool MainWindow::openCloudVideo(const QString& name, std::shared_ptr<MaiCloudVod
 #if defined(MAICHAT_HAS_FFPLAY)
   if (!source || !maiChatAccountIdProvider_ || maiChatAccountIdProvider_().isEmpty()) return false;
   if (auto active = MaiFfplayVideoDialog::activeDialog()) active->close();
-  // 不登记到 videoDialog_ 或 dock：播放、拖动和全屏不改变云盘列表的布局与滚动位置。
+  // 播放器绘制统一标题栏，Window 类型保留非模态独立窗口；不登记到
+  // videoDialog_ 或 dock，播放、拖动和全屏不改变云盘列表的布局与滚动位置。
   auto* dialog = new MaiFfplayVideoDialog(name, std::move(source), this);
   dialog->setObjectName(QStringLiteral("cloudVideoPlayer"));
-  dialog->setWindowFlags(Qt::Window | Qt::WindowCloseButtonHint |
-                        Qt::WindowMinMaxButtonsHint | Qt::WindowTitleHint);
+  dialog->setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
   dialog->setAttribute(Qt::WA_DeleteOnClose);
   const QString owner = maiChatAccountIdProvider_();
   auto* guard = new QTimer(dialog);
@@ -7819,6 +8109,12 @@ void MainWindow::applyScaledFixedGeometry() {
     header->layout()->setContentsMargins(UiZoom::s(28), UiZoom::s(8),
                                          UiZoom::s(28), UiZoom::s(8));
   }
+#ifdef Q_OS_WIN
+  if (auto *header = findChild<QWidget *>(QStringLiteral("settingsHeader"))) {
+    header->setFixedHeight(UiZoom::s(54));
+    header->layout()->setContentsMargins(UiZoom::s(36), 0, UiZoom::s(36), 0);
+  }
+#endif
   // 必须和构造时一致地定宽。这里原先放的是 160~260（同样是带文字时代的遗留），
   // 会把构造时的 setFixedWidth(64) 顶掉——缩放一次导航栏就胖回去。
   if (navRail_)
@@ -7875,6 +8171,7 @@ void MainWindow::applyScaledFixedGeometry() {
     if (label->property("settingsRowValue").toBool())
       label->setMinimumWidth(UiZoom::s(180));
   }
+  updateWindowCaptionControls();
 }
 
 void MainWindow::showZoomToast() {

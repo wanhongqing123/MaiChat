@@ -1607,176 +1607,39 @@ struct AIMessageRow: View, Equatable {
                     }
                 }
             } else {
-                if !toolParts.isEmpty {
-                    if let stage = seedanceStage {
-                        Label {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(stage.title).font(.system(size: 14, weight: .semibold))
-                                if !stage.detail.isEmpty {
-                                    Text(stage.detail).font(.system(size: 12))
-                                }
-                            }
-                        } icon: {
-                            Image(systemName: stage.failed
-                                  ? "exclamationmark.triangle.fill" : "person.crop.rectangle")
-                        }
-                        .foregroundStyle(stage.failed ? Color.red : Color.blue)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .background((stage.failed ? Color.red : Color.blue).opacity(0.08),
-                                    in: RoundedRectangle(cornerRadius: 12))
-                    }
-                    AIExpandableBlock(title: toolDisclosureTitle) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            ForEach(toolParts) { tool in
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text("\(tool.tool ?? "工具") · \(toolStatus(tool.state))")
-                                        .font(AssistantMessageFont.detail.weight(.semibold))
-                                    Text(tool.input ?? "")
-                                        .font(AssistantMessageFont.detailMonospaced)
-                                    if let output = tool.output, !output.isEmpty {
-                                        Text(output)
-                                            .font(AssistantMessageFont.detailMonospaced)
-                                    }
-                                    if let error = tool.error, !error.isEmpty {
-                                        Text(error).font(AssistantMessageFont.detail).foregroundStyle(.red)
-                                    }
-                                }
-                                if tool.id != toolParts.last?.id { Divider() }
-                            }
-                        }
-                        .textSelection(.enabled).padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(uiColor: .secondarySystemBackground),
-                                    in: RoundedRectangle(cornerRadius: 8))
-                    }
-                    ForEach(toolParts) { tool in
-                        if let path = pdfArtifactPath(for: tool) {
-                            AIPDFArtifactButton(path: path) {
-                                if let url = validatedPDFURL(path: path) {
-                                    pdfPreview = AIPDFPreviewItem(url: url)
-                                } else {
-                                    pdfPreviewError = true
-                                }
-                            }
-                        }
-                        if let url = diagnosticArtifactURL(for: tool) {
-                            ShareLink(item: url) {
-                                Label("分享排障日志 · \(url.lastPathComponent)",
-                                      systemImage: "doc.text")
-                                    .font(.system(size: 14, weight: .medium))
+                // Each stable segment stays at its original position as streaming parts grow.
+                let artifacts = mediaArtifacts
+                ForEach(orderedPartGroups) { group in
+                    if group.isToolGroup { toolGroup(group.parts) }
+                    ForEach(group.parts) { part in
+                        if part.kind == "tool", part.id == browserPartID, let sessionID = browserSessionID {
+                            AIBrowserTaskEntry(sessionID: sessionID, isLocal: true,
+                                               needsConfirmation: browserNeedsConfirmation, open: openBrowser)
+                        } else if part.kind == "text", let text = part.text, !text.isEmpty {
+                            if let failure = specialistFailureText(text) {
+                                Label(failure, systemImage: "exclamationmark.triangle.fill")
+                                    .font(ChatTypography.body)
+                                    .foregroundStyle(.red)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(12)
-                                    .background(Color.blue.opacity(0.07),
-                                                in: RoundedRectangle(cornerRadius: 10))
+                                    .background(Color.red.opacity(0.08),
+                                                in: RoundedRectangle(cornerRadius: 12))
+                                    .textSelection(.enabled)
+                            } else {
+                                MarkdownLikeText(text, retainsPreviousWhilePreparing: true,
+                                                 bodyFont: ChatTypography.body, assistantTypography: true)
+                                    .foregroundStyle(RemoteIMStyle.textPrimary)
                             }
-                            .accessibilityIdentifier("agentDiagnosticShareButton")
                         }
                     }
-                }
-                ForEach(message.parts) { part in
-                    if part.kind == "tool", part.id == browserPartID, let sessionID = browserSessionID {
-                        AIBrowserTaskEntry(sessionID: sessionID, isLocal: true,
-                                           needsConfirmation: browserNeedsConfirmation, open: openBrowser)
-                    } else if part.kind == "text", let text = part.text, !text.isEmpty {
-                        if let failure = specialistFailureText(text) {
-                            Label(failure, systemImage: "exclamationmark.triangle.fill")
-                                .font(ChatTypography.body)
-                                .foregroundStyle(.red)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(12)
-                                .background(Color.red.opacity(0.08),
-                                            in: RoundedRectangle(cornerRadius: 12))
-                                .textSelection(.enabled)
-                        } else {
-                            MarkdownLikeText(text, retainsPreviousWhilePreparing: true,
-                                             bodyFont: ChatTypography.body, assistantTypography: true)
-                                .foregroundStyle(RemoteIMStyle.textPrimary)
-                        }
+                    ForEach(mediaArtifacts(in: group.parts, from: artifacts)) { artifact in
+                        mediaArtifactView(artifact)
                     }
                 }
                 ForEach(inlineMedia) { mention in
                     fileMentionCard(mention)
                 }
-                ForEach(mediaArtifacts) { artifact in
-                    VStack(alignment: .leading, spacing: 8) {
-                        if artifact.type == "image" {
-                            AIWorkspaceImage(filePath: artifact.filePath) { image, sourceFrame, sourceID in
-                                openImage(artifact.filePath, thumbnail: image,
-                                          sourceFrame: sourceFrame, sourceID: sourceID)
-                            }
-                        } else if artifact.type == "video" {
-                            AIWorkspaceVideoCard(filePath: artifact.filePath) {
-                                openVideo(artifact.filePath)
-                            }
-                        } else {
-                            AIWorkspaceAudioCard(filePath: artifact.filePath)
-                        }
-                        if !artifact.caption.isEmpty {
-                            Text(artifact.caption)
-                                .font(ChatTypography.body)
-                                .foregroundStyle(RemoteIMStyle.textPrimary)
-                        }
-                        if canPublishVideo, let source = publishSource(for: artifact) {
-                            Button {
-                                MaiVideoCircleModel.shared.presentation = .publish(source)
-                            } label: {
-                                Label("发布到视频圈", systemImage: "square.and.arrow.up")
-                                    .font(.system(size: 13, weight: .semibold))
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(RemoteIMStyle.blue)
-                            .accessibilityIdentifier("ai-video-circle-publish-\(artifact.id)")
-                        }
-                        if cloudDrive.availability == .available,
-                           artifact.type == "video",
-                           FileManager.default.fileExists(atPath: artifact.filePath) {
-                            Button {
-                                let account = appState.maiChatAccountID
-                                guard !account.isEmpty else {
-                                    cloudUploadNotice = "请先登录 MaiChat"
-                                    return
-                                }
-                                let drive = MaiCloudDriveModel.shared
-                                drive.activate(accountID: account)
-                                Task {
-                                    await drive.addAgentVideo(
-                                        URL(fileURLWithPath: artifact.filePath),
-                                        expectedAccountID: account)
-                                    cloudUploadNotice = drive.localTasks.contains {
-                                        $0.sourcePath == artifact.filePath
-                                    } ? "已加入云盘上传" : drive.notice
-                                }
-                            } label: {
-                                Label("保存到云盘", systemImage: "icloud.and.arrow.up")
-                                    .font(.system(size: 13, weight: .semibold))
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(RemoteIMStyle.blue)
-                            .accessibilityIdentifier("ai-cloud-drive-save-\(artifact.id)")
-                        }
-                        if let cloudUploadNotice {
-                            Text(cloudUploadNotice).font(.caption)
-                                .foregroundStyle(RemoteIMStyle.textSecondary)
-                        }
-                    }
-                    .contextMenu {
-                        Button(action: quote) {
-                            Label("引用这条消息", systemImage: "arrowshape.turn.up.left")
-                        }
-                        if artifact.type != "audio" {
-                            Button {
-                                Task { await saveMediaArtifact(artifact) }
-                            } label: {
-                                Label("保存到相册", systemImage: "square.and.arrow.down")
-                            }
-                        }
-                        ShareLink(item: URL(fileURLWithPath: artifact.filePath)) {
-                            Label("转发或分享", systemImage: "square.and.arrow.up")
-                        }
-                    }
-                }
-                if message.active && toolParts.isEmpty && mediaArtifacts.isEmpty &&
+                if message.active && toolParts.isEmpty && artifacts.isEmpty &&
                     !hasVisibleAnswerText {
                     AIThinkingIndicator()
                 }
@@ -1819,6 +1682,153 @@ struct AIMessageRow: View, Equatable {
             } message: {
                 Text(mediaSaveError ?? "请检查相册权限与媒体文件。")
             }
+    }
+
+    @ViewBuilder private func toolGroup(_ toolParts: [AIPart]) -> some View {
+        if let stage = seedanceStage(in: toolParts) {
+            Label {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(stage.title).font(.system(size: 14, weight: .semibold))
+                    if !stage.detail.isEmpty {
+                        Text(stage.detail).font(.system(size: 12))
+                    }
+                }
+            } icon: {
+                Image(systemName: stage.failed
+                      ? "exclamationmark.triangle.fill" : "person.crop.rectangle")
+            }
+            .foregroundStyle(stage.failed ? Color.red : Color.blue)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background((stage.failed ? Color.red : Color.blue).opacity(0.08),
+                        in: RoundedRectangle(cornerRadius: 12))
+        }
+        AIExpandableBlock(title: toolDisclosureTitle(for: toolParts)) {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(toolParts) { tool in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("\(tool.tool ?? "工具") · \(toolStatus(tool.state))")
+                            .font(AssistantMessageFont.detail.weight(.semibold))
+                        Text(tool.input ?? "")
+                            .font(AssistantMessageFont.detailMonospaced)
+                        if let output = tool.output, !output.isEmpty {
+                            Text(output)
+                                .font(AssistantMessageFont.detailMonospaced)
+                        }
+                        if let error = tool.error, !error.isEmpty {
+                            Text(error).font(AssistantMessageFont.detail).foregroundStyle(.red)
+                        }
+                    }
+                    if tool.id != toolParts.last?.id { Divider() }
+                }
+            }
+            .textSelection(.enabled).padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(uiColor: .secondarySystemBackground),
+                        in: RoundedRectangle(cornerRadius: 8))
+        }
+        ForEach(toolParts) { tool in
+            if let path = pdfArtifactPath(for: tool) {
+                AIPDFArtifactButton(path: path) {
+                    if let url = validatedPDFURL(path: path) {
+                        pdfPreview = AIPDFPreviewItem(url: url)
+                    } else {
+                        pdfPreviewError = true
+                    }
+                }
+            }
+            if let url = diagnosticArtifactURL(for: tool) {
+                ShareLink(item: url) {
+                    Label("分享排障日志 · \(url.lastPathComponent)",
+                          systemImage: "doc.text")
+                        .font(.system(size: 14, weight: .medium))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(Color.blue.opacity(0.07),
+                                    in: RoundedRectangle(cornerRadius: 10))
+                }
+                .accessibilityIdentifier("agentDiagnosticShareButton")
+            }
+        }
+    }
+
+    @ViewBuilder private func mediaArtifactView(_ artifact: AIAgentMediaArtifact) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if artifact.type == "image" {
+                AIWorkspaceImage(filePath: artifact.filePath) { image, sourceFrame, sourceID in
+                    openImage(artifact.filePath, thumbnail: image,
+                              sourceFrame: sourceFrame, sourceID: sourceID)
+                }
+            } else if artifact.type == "video" {
+                AIWorkspaceVideoCard(filePath: artifact.filePath) {
+                    openVideo(artifact.filePath)
+                }
+            } else {
+                AIWorkspaceAudioCard(filePath: artifact.filePath)
+            }
+            if !artifact.caption.isEmpty {
+                Text(artifact.caption)
+                    .font(ChatTypography.body)
+                    .foregroundStyle(RemoteIMStyle.textPrimary)
+            }
+            if canPublishVideo, let source = publishSource(for: artifact) {
+                Button {
+                    MaiVideoCircleModel.shared.presentation = .publish(source)
+                } label: {
+                    Label("发布到视频圈", systemImage: "square.and.arrow.up")
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RemoteIMStyle.blue)
+                .accessibilityIdentifier("ai-video-circle-publish-\(artifact.id)")
+            }
+            if cloudDrive.availability == .available,
+               artifact.type == "video",
+               FileManager.default.fileExists(atPath: artifact.filePath) {
+                Button {
+                    let account = appState.maiChatAccountID
+                    guard !account.isEmpty else {
+                        cloudUploadNotice = "请先登录 MaiChat"
+                        return
+                    }
+                    let drive = MaiCloudDriveModel.shared
+                    drive.activate(accountID: account)
+                    Task {
+                        await drive.addAgentVideo(
+                            URL(fileURLWithPath: artifact.filePath),
+                            expectedAccountID: account)
+                        cloudUploadNotice = drive.localTasks.contains {
+                            $0.sourcePath == artifact.filePath
+                        } ? "已加入云盘上传" : drive.notice
+                    }
+                } label: {
+                    Label("保存到云盘", systemImage: "icloud.and.arrow.up")
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(RemoteIMStyle.blue)
+                .accessibilityIdentifier("ai-cloud-drive-save-\(artifact.id)")
+            }
+            if let cloudUploadNotice {
+                Text(cloudUploadNotice).font(.caption)
+                    .foregroundStyle(RemoteIMStyle.textSecondary)
+            }
+        }
+        .contextMenu {
+            Button(action: quote) {
+                Label("引用这条消息", systemImage: "arrowshape.turn.up.left")
+            }
+            if artifact.type != "audio" {
+                Button {
+                    Task { await saveMediaArtifact(artifact) }
+                } label: {
+                    Label("保存到相册", systemImage: "square.and.arrow.down")
+                }
+            }
+            ShareLink(item: URL(fileURLWithPath: artifact.filePath)) {
+                Label("转发或分享", systemImage: "square.and.arrow.up")
+            }
+        }
     }
 
     @ViewBuilder private func remoteAttachmentCard(_ part: AIPart) -> some View {
@@ -1886,6 +1896,38 @@ struct AIMessageRow: View, Equatable {
         }
         return nil
     }
+    private struct PartGroup: Identifiable {
+        let id: String
+        let isToolGroup: Bool
+        let canJoinNextTool: Bool
+        var parts: [AIPart]
+    }
+    // Adjacent tools share a disclosure; text and media end the run. The first
+    // part's identity keeps a disclosure expanded while later stream parts arrive.
+    private var orderedPartGroups: [PartGroup] {
+        var groups: [PartGroup] = []
+        for part in message.parts {
+            if part.kind == "reasoning" { continue }
+            let hasArtifact = mediaArtifact(for: part) != nil
+            let isTool = part.kind == "tool" &&
+                !(part.tool == "agent_send_media" && hasArtifact)
+            // A capture keeps its receipt, but its visible card ends the run.
+            let canJoinNextTool = isTool && !hasArtifact
+            if canJoinNextTool, let last = groups.indices.last, groups[last].canJoinNextTool {
+                groups[last].parts.append(part)
+            } else {
+                groups.append(PartGroup(id: part.id, isToolGroup: isTool,
+                                        canJoinNextTool: canJoinNextTool, parts: [part]))
+            }
+        }
+        return groups
+    }
+    // Keep the existing canonical media deduplication, while displaying each card
+    // next to its owning tool instead of moving all cards below the final text.
+    private func mediaArtifacts(in parts: [AIPart], from artifacts: [AIAgentMediaArtifact]) -> [AIAgentMediaArtifact] {
+        let ids = Set(parts.map(\.id))
+        return artifacts.filter { ids.contains($0.id) }
+    }
     private var hasVisibleAnswerText: Bool {
         message.parts.contains { part in
             part.kind == "text" && !(part.text ?? "").isEmpty
@@ -1914,7 +1956,14 @@ struct AIMessageRow: View, Equatable {
             }
             result.append(artifact)
         }
-        return result
+        // A later delivery owns the canonical card. Keep the row and its media
+        // playlist in that owner's original part order after capture deduplication.
+        let partOrder = Dictionary(uniqueKeysWithValues: message.parts.enumerated().map {
+            ($0.element.id, $0.offset)
+        })
+        return result.sorted {
+            (partOrder[$0.id] ?? Int.max) < (partOrder[$1.id] ?? Int.max)
+        }
     }
     private var textMediaMentions: [AIAssistantMediaMention] {
         guard message.role != "assistant" || (!message.active && message.completed > 0) else {
@@ -1934,13 +1983,14 @@ struct AIMessageRow: View, Equatable {
                 + videoPaths.map { MaiMediaItem(kind: .video, path: $0) }
                 + mentions
         }
-        return mentions + mediaArtifacts.compactMap { artifact in
+        let artifacts: [MaiMediaItem] = mediaArtifacts.compactMap { artifact in
             let kind: MaiMediaKind
             if artifact.type == "image" { kind = .image }
             else if artifact.type == "video" { kind = .video }
             else { return nil }
             return MaiMediaItem(kind: kind, path: artifact.filePath)
         }
+        return artifacts + mentions
     }
     private func fullMediaItems(model: AIAssistantModel,
                                 session: String) async -> [MaiMediaItem] {
@@ -2079,7 +2129,7 @@ struct AIMessageRow: View, Equatable {
             mediaSaveError = error.localizedDescription
         }
     }
-    private var toolSummary: String {
+    private func toolSummary(for toolParts: [AIPart]) -> String {
         var counts: [(name: String, count: Int)] = []
         for part in toolParts {
             let name = part.tool ?? "工具"
@@ -2091,11 +2141,12 @@ struct AIMessageRow: View, Equatable {
         }
         return counts.map { "\($0.name) ×\($0.count)" }.joined(separator: " · ")
     }
-    private var toolDisclosureTitle: String {
-        let summary = "工具调用 \(toolParts.count) 次，\(toolGroupStatus)"
-        return toolSummary.isEmpty ? summary : "\(summary) · \(toolSummary)"
+    private func toolDisclosureTitle(for toolParts: [AIPart]) -> String {
+        let summary = "工具调用 \(toolParts.count) 次，\(toolGroupStatus(for: toolParts))"
+        let details = toolSummary(for: toolParts)
+        return details.isEmpty ? summary : "\(summary) · \(details)"
     }
-    private var toolGroupStatus: String {
+    private func toolGroupStatus(for toolParts: [AIPart]) -> String {
         let states = toolParts.map(\.state)
         if states.contains("running") { return "运行中" }
         if states.contains("pending") { return "等待授权" }
@@ -2104,7 +2155,7 @@ struct AIMessageRow: View, Equatable {
         if states.contains("canceled") { return "部分取消" }
         return "已完成"
     }
-    private var seedanceStage: (title: String, detail: String, failed: Bool)? {
+    private func seedanceStage(in toolParts: [AIPart]) -> (title: String, detail: String, failed: Bool)? {
         guard let part = toolParts.last(where: { $0.tool == "seedance_video" }),
               let inputText = part.input, let inputData = inputText.data(using: .utf8),
               let input = try? JSONSerialization.jsonObject(with: inputData) as? [String: Any]

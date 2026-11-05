@@ -20,6 +20,8 @@
 #include <json.hpp>
 
 #include "MaiModelClient.h"
+#include "MaiAgent.h"
+#include "MaiMemoryStore.h"
 #include "MaiOpenAiClient.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
@@ -168,6 +170,8 @@ struct Collected {
     std::string text;
     std::string reasoning;
     std::vector<MaiToolInvocation> calls;
+    std::vector<MaiModelTextItem> startedItems;
+    std::vector<MaiModelTextItem> completedItems;
     std::string error;
     MaiErrorCode code = MaiErrorCode::Ok;
     bool done = false;
@@ -183,6 +187,12 @@ Collected runAgainst(FakeServer& fake, const MaiModelRequest& request,
 
     Collected collected;
     MaiStreamSink sink;
+    sink.onTextItemStarted = [&](const MaiModelTextItem& item) {
+        collected.startedItems.push_back(item);
+    };
+    sink.onTextItemCompleted = [&](const MaiModelTextItem& item) {
+        collected.completedItems.push_back(item);
+    };
     sink.onText = [&collected](std::string_view text) { collected.text.append(text); };
     sink.onReasoning = [&collected](std::string_view text) { collected.reasoning.append(text); };
     sink.onToolCall = [&collected](const MaiToolInvocation& invocation) {
@@ -1180,6 +1190,163 @@ void test_responses_streams_reasoning_text_and_function_calls() {
     }
 }
 
+// item.done 的完整正文也是可见输出；不能依赖供应商重复发送终止 output，
+// 已经流出的前缀则不能因 done 快照再次显示。
+void test_responses_item_done_recovers_missing_text_without_duplicates() {
+    FakeServer fake;
+    const json first{{"id", "msg_progress"},
+                     {"type", "message"},
+                     {"role", "assistant"},
+                     {"phase", "commentary"},
+                     {"content", json::array({json{{"type", "output_text"}, {"text", "ABC"}}})}};
+    const json second{{"id", "msg_final"},
+                      {"type", "message"},
+                      {"role", "assistant"},
+                      {"phase", "final_answer"},
+                      {"content", json::array({json{{"type", "output_text"}, {"text", "Done"}}})}};
+    fake.script =
+        sse(json{{"type", "response.output_item.added"},
+                 {"output_index", 0},
+                 {"item", json{{"id", "msg_progress"},
+                               {"type", "message"},
+                               {"role", "assistant"},
+                               {"phase", "commentary"}}}}) +
+        sse(json{{"type", "response.output_text.delta"},
+                 {"output_index", 0},
+                 {"content_index", 0},
+                 {"delta", "A"}}) +
+        sse(json{{"type", "response.output_text.done"},
+                 {"output_index", 0},
+                 {"content_index", 0},
+                 {"text", "AB"}}) +
+        sse(json{{"type", "response.output_item.done"}, {"output_index", 0}, {"item", first}}) +
+        sse(json{{"type", "response.output_item.done"}, {"output_index", 1}, {"item", second}}) +
+        sse(json{{"type", "response.completed"}});
+    fake.start();
+    MaiModelRequest request;
+    request.model = "fake";
+    const Collected result = runAgainst(fake, request, MaiWireApi::Responses);
+    CHECK(result.done);
+    CHECK(result.text == "ABCDone");
+    CHECK(result.reasoning.empty());
+    CHECK(result.startedItems.size() == 2);
+    CHECK(result.completedItems.size() == 2);
+    if (result.startedItems.size() == 2) {
+        CHECK(result.startedItems[0].id == "msg_progress");
+        CHECK(result.startedItems[0].phase == MaiModelTextPhase::Commentary);
+        CHECK(result.startedItems[1].phase == MaiModelTextPhase::FinalAnswer);
+    }
+}
+
+// 同一个 HTTP 响应里的两条 assistant message 仍是两段发言，
+// 重复的完成快照不得把它们拼成一个 part 或重复正文。
+void test_responses_message_items_remain_distinct_in_agent_history() {
+    FakeServer fake;
+    const json first{{"id", "msg_a"},
+                     {"type", "message"},
+                     {"role", "assistant"},
+                     {"phase", "commentary"},
+                     {"content", json::array({json{{"type", "output_text"}, {"text", "A"}}})}};
+    const json second{{"id", "msg_b"},
+                      {"type", "message"},
+                      {"role", "assistant"},
+                      {"phase", "final_answer"},
+                      {"content", json::array({json{{"type", "output_text"}, {"text", "B"}}})}};
+    fake.script =
+        sse(json{{"type", "response.output_item.added"},
+                 {"output_index", 0},
+                 {"item", json{{"id", "msg_a"},
+                               {"type", "message"},
+                               {"role", "assistant"},
+                               {"phase", "commentary"},
+                               {"content", json::array()}}}}) +
+        sse(json{{"type", "response.output_text.delta"},
+                 {"output_index", 0},
+                 {"content_index", 0},
+                 {"delta", "A"}}) +
+        sse(json{{"type", "response.output_item.done"}, {"output_index", 0}, {"item", first}}) +
+        sse(json{{"type", "response.output_item.added"},
+                 {"output_index", 1},
+                 {"item", json{{"id", "msg_b"},
+                               {"type", "message"},
+                               {"role", "assistant"},
+                               {"phase", "final_answer"},
+                               {"content", json::array()}}}}) +
+        sse(json{{"type", "response.output_text.delta"},
+                 {"output_index", 1},
+                 {"content_index", 0},
+                 {"delta", "B"}}) +
+        sse(json{{"type", "response.output_item.done"}, {"output_index", 1}, {"item", second}}) +
+        sse(json{{"type", "response.completed"},
+                 {"response", {{"output", json::array({first, second})}}}});
+    fake.start();
+    MaiModelConfig config;
+    config.baseUrl = fake.base();
+    config.apiKey = "test-key";
+    config.wire = MaiWireApi::Responses;
+    MaiAgent agent(makeMaiMemoryStore(), makeMaiModelClient(config));
+    const std::string session = agent.submit(MaiCreateSession{"/tmp", "", ""}).value();
+    agent.submit(MaiSendPrompt{session, "check"});
+    agent.waitIdle();
+    const auto messages = agent.listMessages(session);
+    CHECK(messages.size() == 2);
+    if (messages.size() != 2) return;
+    CHECK(messages[1].parts.size() == 2);
+    if (messages[1].parts.size() != 2) return;
+    const auto* a = std::get_if<MaiTextPart>(&messages[1].parts[0].body);
+    const auto* b = std::get_if<MaiTextPart>(&messages[1].parts[1].body);
+    CHECK(a && a->text == "A");
+    CHECK(b && b->text == "B");
+    CHECK(messages[1].parts[0].id != messages[1].parts[1].id);
+}
+
+// 兼容服务可能只在 terminal 提供最终快照；补尾必须归还原来的 item，
+// 包括 item.done 中正文缺失以及多条消息未发送 item.done 的情况。
+void test_responses_terminal_snapshots_update_their_original_items() {
+    const auto item = [](const char* id, const char* text) {
+        return json{{"id", id},
+                    {"type", "message"},
+                    {"role", "assistant"},
+                    {"content", json::array({json{{"type", "output_text"}, {"text", text}}})}};
+    };
+    const auto runCase = [&](const std::string& prefix, const json& output,
+                             const std::vector<std::string>& expected) {
+        FakeServer fake;
+        fake.script =
+            prefix + sse(json{{"type", "response.completed"}, {"response", {{"output", output}}}});
+        fake.start();
+        MaiModelConfig config;
+        config.baseUrl = fake.base();
+        config.apiKey = "test-key";
+        config.wire = MaiWireApi::Responses;
+        MaiAgent agent(makeMaiMemoryStore(), makeMaiModelClient(config));
+        const std::string session = agent.submit(MaiCreateSession{"/tmp", "", ""}).value();
+        agent.submit(MaiSendPrompt{session, "check terminal recovery"});
+        agent.waitIdle();
+        std::vector<std::string> actual;
+        for (const auto& message : agent.listMessages(session))
+            if (message.role == MaiRole::Assistant)
+                for (const auto& part : message.parts)
+                    if (const auto* text = std::get_if<MaiTextPart>(&part.body))
+                        actual.push_back(text->text);
+        CHECK(actual == expected);
+    };
+    runCase(
+        sse(json{{"type", "response.output_item.done"},
+                 {"output_index", 0},
+                 {"item", json{{"id", "msg_a"}, {"type", "message"}, {"content", json::array()}}}}),
+        json::array({item("msg_a", "AA")}), {"AA"});
+    const std::string deltas = sse(json{{"type", "response.output_text.delta"},
+                                        {"output_index", 0},
+                                        {"content_index", 0},
+                                        {"delta", "A"}}) +
+                               sse(json{{"type", "response.output_text.delta"},
+                                        {"output_index", 1},
+                                        {"content_index", 0},
+                                        {"delta", "B"}});
+    runCase(deltas, json::array({item("msg_a", "AA"), item("msg_b", "BB")}), {"AA", "BB"});
+}
+
 // 验证历史图片和扁平工具定义被序列化为供应商要求的 Responses 结构。
 // 与假服务器收到的请求体比较，避免只对照本地构造函数自证正确。
 void test_responses_serializes_history_images_and_flat_tools() {
@@ -1768,6 +1935,9 @@ int main() {
     test_missing_current_image_is_reported();
     test_invalid_utf8_history_is_replaced_before_serialization();
     test_responses_streams_reasoning_text_and_function_calls();
+    test_responses_item_done_recovers_missing_text_without_duplicates();
+    test_responses_message_items_remain_distinct_in_agent_history();
+    test_responses_terminal_snapshots_update_their_original_items();
     test_responses_serializes_history_images_and_flat_tools();
     test_deepseek_effort_levels_reach_responses_wire();
     test_responses_needs_terminal_event_and_reports_incomplete();

@@ -146,8 +146,8 @@ public:
             } else {
                 if (auto existing = MaiFfplayVideoDialog::activeDialog()) existing->close();
                 auto* dialog = new MaiFfplayVideoDialog(path, window_.data(), startPositionUs);
-                dialog->setWindowFlags(Qt::Window | Qt::WindowCloseButtonHint | Qt::WindowMinMaxButtonsHint |
-                                       Qt::WindowTitleHint);
+                // 工具调用的备用宿主也使用播放器自绘标题栏，与 IM/云盘入口保持一致。
+                dialog->setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
                 dialog->setAttribute(Qt::WA_DeleteOnClose);
                 dialog->show();
                 opened = dialog->isStarted();

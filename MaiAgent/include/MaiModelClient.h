@@ -135,6 +135,18 @@ struct MaiModelRequest {
     double temperature = -1.0;
 };
 
+// 可见 assistant 发言的阶段，和不可见的推理内容无关。
+// Unspecified 用于未提供阶段的 Chat Completions、本地模型和兼容供应商。
+enum class MaiModelTextPhase { Unspecified, Commentary, PartialAnswer, FinalAnswer };
+
+struct MaiModelTextItem {
+    // 供应商给出的不透明 ID，只在当前请求内定位发言；缺失时允许为空。
+    std::string id;
+    MaiModelTextPhase phase = MaiModelTextPhase::Unspecified;
+    // 本次响应内的稳定位置，ID 缺失或晚到时仍能把快照补尾交还原片段。
+    int index = -1;
+};
+
 // ── 流式回调 ────────────────────────────────────────────────────
 //
 // 线程契约（重要）：这些回调在 stream 调用线程同步调用。网络实现来自 libcurl 写回调，
@@ -162,6 +174,18 @@ struct MaiStreamSink {
     // 不同服务端分片时机不一样，有的整块给，有的一个字符一个字符给。中途交付会是半截 JSON，
     // 所以攒到流结束再一次性给。
     std::function<void(const MaiToolInvocation&)> onToolCall;
+
+    // 可选的可见发言边界。Responses 的每个 message 独立开始/完成，
+    // 完成发言不等于完成整个 Agent 回合；推理事件绝不使用这两个回调。
+    // 未提供 item 生命周期的实现可以省略回调，调用方沿用每次响应一个正文片段。
+    // 元信息的引用只在同步回调期间有效，phase 不改变正文的可见性。
+    // 追加在原回调之后，保留现有三字段聚合初始化的含义。
+    std::function<void(const MaiModelTextItem&)> onTextItemStarted;
+    std::function<void(const MaiModelTextItem&)> onTextItemCompleted;
+    // 需要保留 item 身份的调用方可接此增量；实现方有 item 时优先调用它，
+    // 否则调用原 onText。两者不重复交付同一正文，Chat/local 仍可只用 onText。
+    // 完成快照可能为此前 item 补尾，调用方必须按 index 定位原片段。
+    std::function<void(const MaiModelTextItem&, std::string_view)> onTextItemDelta;
 };
 
 using MaiModelImagePreparer =

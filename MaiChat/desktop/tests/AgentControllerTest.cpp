@@ -185,6 +185,7 @@ private slots:
     void separates_reasoning_from_text();
     void reports_a_missing_model_instead_of_hanging();
     void sends_selected_images_as_multimodal_input();
+    void registers_a_screenshot_tool_that_requires_approval_data();
     void registers_a_screenshot_tool_that_requires_approval();
     void registers_host_tools_after_builtin_tools();
     void desktopSessionToolUsesAccountDefaultWhenPathOmitted();
@@ -576,7 +577,25 @@ void AgentControllerTest::sends_selected_images_as_multimodal_input() {
              QStringLiteral("image/png"));
 }
 
+void AgentControllerTest::registers_a_screenshot_tool_that_requires_approval_data() {
+    QTest::addColumn<QString>("selectedModel");
+    QTest::addColumn<QString>("expectedModel");
+    QTest::addColumn<bool>("expectedViewImage");
+    // 注册实例不等于对所有主模型开放。与核心的实际能力门禁保持一致，
+    // 默认 glm-5.3 和 local:* 不能接收像素，glm-5.3-flash 可以。
+    QTest::newRow("default-text-only") << QString() << QStringLiteral("glm-5.3") << false;
+    QTest::newRow("explicit-text-only")
+        << QStringLiteral("glm-5.3") << QStringLiteral("glm-5.3") << false;
+    QTest::newRow("image-capable")
+        << QStringLiteral("glm-5.3-flash") << QStringLiteral("glm-5.3-flash") << true;
+    QTest::newRow("local-text-only")
+        << QStringLiteral("local:qa") << QStringLiteral("local:qa") << false;
+}
+
 void AgentControllerTest::registers_a_screenshot_tool_that_requires_approval() {
+    QFETCH(QString, selectedModel);
+    QFETCH(QString, expectedModel);
+    QFETCH(bool, expectedViewImage);
     std::unique_ptr<MaiTool> screenshot = makeMaiScreenshotTool();
     QCOMPARE(QString::fromStdString(screenshot->name()), QStringLiteral("screenshot"));
     QVERIFY(screenshot->requiresApproval(QStringLiteral("{}").toStdString()));
@@ -592,6 +611,7 @@ void AgentControllerTest::registers_a_screenshot_tool_that_requires_approval() {
     ScriptedModel* scripted = model.get();
     AgentController controller(std::move(model), QString());
     const QString sessionId = controller.createSession(QDir::currentPath());
+    if (!selectedModel.isEmpty()) QVERIFY(controller.setModel(sessionId, selectedModel));
     QSignalSpy finished(&controller, &AgentController::turnFinished);
     QVERIFY(controller.sendPrompt(sessionId, QStringLiteral("inspect the screen")));
     QVERIFY(finished.wait(15000));
@@ -599,13 +619,15 @@ void AgentControllerTest::registers_a_screenshot_tool_that_requires_approval() {
     bool foundScreenshot = false;
     bool foundViewImage = false;
     bool foundListWindows = false;
-    for (const MaiToolSpec& tool : scripted->lastRequest().tools) {
+    const MaiModelRequest request = scripted->lastRequest();
+    QCOMPARE(QString::fromStdString(request.model), expectedModel);
+    for (const MaiToolSpec& tool : request.tools) {
         if (tool.name == "screenshot") foundScreenshot = true;
         if (tool.name == "view_image") foundViewImage = true;
         if (tool.name == "list_windows") foundListWindows = true;
     }
     QCOMPARE(foundScreenshot, maiIsScreenshotSupported());
-    QVERIFY(foundViewImage);
+    QCOMPARE(foundViewImage, expectedViewImage);
     QCOMPARE(foundListWindows, maiIsScreenshotSupported());
 }
 

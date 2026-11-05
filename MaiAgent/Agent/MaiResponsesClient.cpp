@@ -275,7 +275,13 @@ struct StreamContext {
     const std::atomic<bool>* cancel = nullptr;
     LineBuffer lines;
     std::map<int, PendingCall> calls;
-    std::set<std::pair<int, int>> textSeen;
+    struct TextItem {
+        MaiModelTextItem info;
+        std::map<int, std::string> content;
+        bool started = false;
+        bool completed = false;
+    };
+    std::map<int, TextItem> textItems;
     std::set<std::pair<int, int>> reasoningSeen;
     std::string rawBody;
     std::string terminalError;
@@ -325,6 +331,64 @@ void mergeCall(PendingCall& call, const Json& item) {
     }
 }
 
+void updateTextItem(StreamContext::TextItem& state, const Json& item) {
+    const std::string id = stringField(item, "id");
+    if (!id.empty()) state.info.id = id;
+    const std::string phase = stringField(item, "phase");
+    if (phase == "commentary")
+        state.info.phase = MaiModelTextPhase::Commentary;
+    else if (phase == "partial_answer")
+        state.info.phase = MaiModelTextPhase::PartialAnswer;
+    else if (phase == "final_answer")
+        state.info.phase = MaiModelTextPhase::FinalAnswer;
+}
+
+void beginTextItem(StreamContext& context, int index) {
+    auto& state = context.textItems[index];
+    state.info.index = index;
+    if (state.started || state.completed) return;
+    state.started = true;
+    if (context.sink->onTextItemStarted) context.sink->onTextItemStarted(state.info);
+}
+
+void completeTextItem(StreamContext& context, int index) {
+    auto& state = context.textItems[index];
+    if (state.completed) return;
+    beginTextItem(context, index);
+    state.completed = true;
+    if (context.sink->onTextItemCompleted) context.sink->onTextItemCompleted(state.info);
+}
+
+// done/terminal 快照可能补足未发送的增量，只交付尚未看到的后缀。
+// 若快照与已显示前缀冲突，不重复或改写用户已经看过的正文。
+void emitTextSnapshot(StreamContext& context, int index, int contentIndex,
+                      const std::string& text) {
+    auto& state = context.textItems[index];
+    if (text.empty()) return;
+    std::string& delivered = state.content[contentIndex];
+    if (text.size() <= delivered.size() || text.compare(0, delivered.size(), delivered) != 0)
+        return;
+    beginTextItem(context, index);
+    const std::string suffix = text.substr(delivered.size());
+    delivered = text;
+    context.sawOutput = true;
+    if (context.sink->onTextItemDelta)
+        context.sink->onTextItemDelta(state.info, suffix);
+    else if (context.sink->onText)
+        context.sink->onText(suffix);
+}
+
+void emitMessageSnapshot(StreamContext& context, int index, const Json& item) {
+    auto& state = context.textItems[index];
+    updateTextItem(state, item);
+    if (!item.value("content", Json{}).is_array()) return;
+    const auto& parts = item["content"];
+    for (std::size_t part = 0; part < parts.size(); ++part) {
+        if (stringField(parts[part], "type") != "output_text") continue;
+        emitTextSnapshot(context, index, static_cast<int>(part), stringField(parts[part], "text"));
+    }
+}
+
 void emitFullOutput(StreamContext& context, const Json& response) {
     if (!response.is_object() || !response.value("output", Json{}).is_array()) return;
     const Json& output = response["output"];
@@ -336,6 +400,11 @@ void emitFullOutput(StreamContext& context, const Json& response) {
             context.calls[static_cast<int>(index)].complete = true;
             continue;
         }
+        if (type == "message") {
+            emitMessageSnapshot(context, static_cast<int>(index), item);
+            completeTextItem(context, static_cast<int>(index));
+            continue;
+        }
         if ((type != "message" && type != "reasoning") || !item.value("content", Json{}).is_array())
             continue;
         const Json& parts = item["content"];
@@ -343,10 +412,7 @@ void emitFullOutput(StreamContext& context, const Json& response) {
             const std::string text = stringField(parts[partIndex], "text");
             if (text.empty()) continue;
             const auto key = std::make_pair(static_cast<int>(index), static_cast<int>(partIndex));
-            if (type == "message" && context.textSeen.insert(key).second) {
-                context.sawOutput = true;
-                if (context.sink->onText) context.sink->onText(text);
-            } else if (type == "reasoning" && context.reasoningSeen.insert(key).second) {
+            if (type == "reasoning" && context.reasoningSeen.insert(key).second) {
                 context.sawOutput = true;
                 if (context.sink->onReasoning) context.sink->onReasoning(text);
             }
@@ -395,8 +461,14 @@ void handleEvent(StreamContext& context, const Json& event) {
         context.sawOutput = true;
         context.lastModelProgress = std::chrono::steady_clock::now();
         if (type == "response.output_text.delta") {
-            context.textSeen.insert(key);
-            if (context.sink->onText) context.sink->onText(delta);
+            auto& state = context.textItems[outputIndex];
+            if (state.completed) return;
+            beginTextItem(context, outputIndex);
+            state.content[contentIndex] += delta;
+            if (context.sink->onTextItemDelta)
+                context.sink->onTextItemDelta(state.info, delta);
+            else if (context.sink->onText)
+                context.sink->onText(delta);
         } else {
             context.reasoningSeen.insert(key);
             if (context.sink->onReasoning) context.sink->onReasoning(delta);
@@ -406,9 +478,8 @@ void handleEvent(StreamContext& context, const Json& event) {
     if (type == "response.output_text.done" || type == "response.reasoning_text.done") {
         const std::string text = stringField(event, "text");
         if (text.empty()) return;
-        if (type == "response.output_text.done" && context.textSeen.insert(key).second) {
-            context.sawOutput = true;
-            if (context.sink->onText) context.sink->onText(text);
+        if (type == "response.output_text.done") {
+            emitTextSnapshot(context, outputIndex, contentIndex, text);
         } else if (type == "response.reasoning_text.done" &&
                    context.reasoningSeen.insert(key).second) {
             context.sawOutput = true;
@@ -429,6 +500,11 @@ void handleEvent(StreamContext& context, const Json& event) {
             mergeCall(call, item);
             if (type == "response.output_item.done") call.complete = true;
             context.sawOutput = true;
+        } else if (itemType == "message" && outputIndex >= 0) {
+            updateTextItem(context.textItems[outputIndex], item);
+            beginTextItem(context, outputIndex);
+            emitMessageSnapshot(context, outputIndex, item);
+            if (type == "response.output_item.done") completeTextItem(context, outputIndex);
         }
         return;
     }
@@ -461,6 +537,9 @@ void handleEvent(StreamContext& context, const Json& event) {
         type == "response.failed") {
         const Json response = event.value("response", Json::object());
         emitFullOutput(context, response);
+        // 有些兼容服务只发送正文增量而不发送 item.done 或终止 output。
+        // 仍须关闭已开始的可见发言，让调用方持久化尾部。
+        for (const auto& entry : context.textItems) completeTextItem(context, entry.first);
         if (type != "response.completed") {
             const Json error = response.value("error", Json::object());
             const Json details = response.value("incomplete_details", Json::object());

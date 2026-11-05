@@ -151,8 +151,10 @@ private:
     // 流式期间按 partId 找（或建）对应的部件，只追加不重画。
     void startPendingThinking();
     void clearPendingThinking();
-    ToolCard* toolCardFor(const QString& partId, const QString& messageId);
-    ToolGroupCard* toolGroupFor(const QString& messageId);
+    // 同一消息里的工具只在连续片段内合组；迟到状态仍按 partId 回填原组。
+    // 调用方借出已经读取的所属消息，只在本次同步调用期间使用，不再重复读取整段历史。
+    ToolCard* toolCardFor(const QString& partId, const MaiMessage& message);
+    ToolGroupCard* toolGroupFor(const QString& partId, const MaiMessage& message);
     void refreshToolCard(const QString& messageId, const QString& partId);
     void appendPdfPreview(const QString& partId, const QString& output,
                           const QString& workspace);

@@ -24,6 +24,7 @@
 #include "MaiMemoryStore.h"
 #include "MaiSqliteStore.h"
 #include "MaiFakeModelClient.h"
+#include "MaiTool.h"
 
 static int failures = 0;
 #define CHECK(cond)                                                     \
@@ -99,9 +100,9 @@ public:
             return MaiToolResult::failure(
                 MaiErrorCode::InvalidInput,
                 R"({"code":"invalid_input","message":"unsupported media parameter: message"})");
-        return MaiToolResult::success(nlohmann::json{{"status", "SUCCEEDED"},
-                                                      {"path", mPath},
-                                                      {"reply", "Video ready"}}.dump());
+        return MaiToolResult::success(
+            nlohmann::json{{"status", "SUCCEEDED"}, {"path", mPath}, {"reply", "Video ready"}}
+                .dump());
     }
 
 private:
@@ -533,6 +534,99 @@ void test_streamed_text_is_checkpointed_before_network_finishes() {
     if (opened.isOk()) runCase(std::move(opened.value()));
 }
 
+// 工具故意停在两个可观察阶段，验证前面的正文在工具尚未完成时已经显示和保存。
+class GatedProgressTool final : public MaiTool {
+public:
+    std::atomic<int> entered{0};
+    std::atomic<int> released{0};
+    std::string name() const override {
+        return "progress_probe";
+    }
+    std::string description() const override {
+        return "Read-only progress test";
+    }
+    std::string parametersSchema() const override {
+        return "{}";
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
+        const int stage = ++entered;
+        while (released.load() < stage && !context.cancel->load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return MaiToolResult::success("observed " + std::to_string(stage));
+    }
+};
+
+std::vector<std::string> progressSequence(const std::vector<MaiMessage>& messages) {
+    std::vector<std::string> sequence;
+    for (const auto& message : messages) {
+        if (message.role != MaiRole::Assistant) continue;
+        for (const auto& part : message.parts) {
+            if (const auto* text = std::get_if<MaiTextPart>(&part.body))
+                sequence.push_back(text->text);
+            else if (const auto* tool = std::get_if<MaiToolPart>(&part.body))
+                sequence.push_back(tool->callId);
+        }
+    }
+    return sequence;
+}
+
+void test_intermediate_text_survives_tool_waits_and_sqlite_reopen() {
+    const auto runCase = [](std::unique_ptr<MaiSessionStore> store) {
+        MaiFakeModelClient::Turn first;
+        first.textChunks = {"A"};
+        first.invocations.push_back({"X", "progress_probe", "{}"});
+        MaiFakeModelClient::Turn second;
+        second.textChunks = {"B"};
+        second.invocations.push_back({"Y", "progress_probe", "{}"});
+        MaiFakeModelClient::Turn final;
+        final.textChunks = {"C"};
+        auto tools = std::make_unique<MaiToolRegistry>();
+        auto gate = std::make_unique<GatedProgressTool>();
+        auto* observed = gate.get();
+        tools->add(std::move(gate));
+        auto model = std::make_unique<MaiFakeModelClient>(
+            std::vector<MaiFakeModelClient::Turn>{first, second, final});
+        MaiAgent agent(std::move(store), std::move(model), std::move(tools));
+        Recorder recorder;
+        recorder.attach(agent);
+        const auto root = MaiFileSystem::temporaryDirectory().toUtf8();
+        const std::string session = agent.submit(MaiCreateSession{root, "", ""}).value();
+        agent.submit(MaiSendPrompt{session, "observe two steps"});
+        for (int stage = 1; stage <= 2; ++stage) {
+            for (int wait = 0; wait < 400 && observed->entered.load() < stage; ++wait)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            CHECK(observed->entered.load() == stage);
+            const auto expected = stage == 1 ? std::vector<std::string>{"A", "X"}
+                                             : std::vector<std::string>{"A", "X", "B", "Y"};
+            CHECK(progressSequence(agent.listMessages(session)) == expected);
+            std::string visible;
+            for (const auto& event : recorder.snapshot())
+                if (event.type == MaiEventType::MessagePartDelta) visible += event.delta;
+            CHECK(visible == (stage == 1 ? "A" : "AB"));
+            observed->released.store(stage);
+        }
+        agent.waitIdle();
+        CHECK(progressSequence(agent.listMessages(session)) ==
+              (std::vector<std::string>{"A", "X", "B", "Y", "C"}));
+        return session;
+    };
+    runCase(makeMaiMemoryStore());
+    const auto database = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8("mai-progress-" + MaiIdGenerator::newSessionId() + ".db"));
+    auto opened = makeMaiSqliteStore(database.toUtf8());
+    CHECK(opened.isOk());
+    if (!opened) return;
+    const std::string session = runCase(std::move(opened.value()));
+    auto reopened = makeMaiSqliteStore(database.toUtf8());
+    CHECK(reopened.isOk());
+    if (reopened) {
+        CHECK(progressSequence(reopened.value()->listMessages(session)) ==
+              (std::vector<std::string>{"A", "X", "B", "Y", "C"}));
+        reopened.value().reset();
+    }
+    MaiFileSystem::removeFile(database);
+}
+
 // 验证子任务只有文本回复、没有媒体文件时也能回到父 Agent。
 // 回灌内容必须来自真实子任务结果，不能凭空生成文件路径。
 void test_specialist_text_reply_reaches_parent_without_a_file() {
@@ -799,6 +893,7 @@ int main() {
     test_concurrent_sessions();
     test_tool_completion_is_stored_before_update_event();
     test_streamed_text_is_checkpointed_before_network_finishes();
+    test_intermediate_text_survives_tool_waits_and_sqlite_reopen();
     test_specialist_text_reply_reaches_parent_without_a_file();
     test_completed_video_is_forwarded_without_a_user_poll();
     test_status_check_error_keeps_accepted_task_active();

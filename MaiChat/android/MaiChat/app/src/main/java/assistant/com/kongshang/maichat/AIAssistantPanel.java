@@ -2357,8 +2357,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         final Map<String, Button> diagnosticCards = new HashMap<>();
         final Map<String, LinearLayout> mediaCards = new HashMap<>();
         TextView status;
-        TextView toolSummary;
-        LinearLayout toolDetails;
+        final Map<String, TextView> toolSummaries = new HashMap<>();
+        final Map<String, LinearLayout> toolGroups = new HashMap<>();
         MessageRow() {
             super(activity);
             setOrientation(VERTICAL);
@@ -2377,8 +2377,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     diagnosticCards.clear();
                     mediaCards.clear();
                     status = null;
-                    toolSummary = null;
-                    toolDetails = null;
+                    toolSummaries.clear();
+                    toolGroups.clear();
                     setGravity(Gravity.TOP | Gravity.CENTER_HORIZONTAL);
                     addView(welcomeContent(), matchWrap());
                 }
@@ -2389,9 +2389,33 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             JSONArray array = value.optJSONArray("parts");
             if (array == null)
                 array = new JSONArray();
-            String toolGroupId = "tools:" + value.optString("id");
+            // Only adjacent tools share a disclosure. Text/media keep their original
+            // positions, and a group's first stable part ID owns its expanded state.
+            String[] kinds = new String[array.length()];
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject part = array.optJSONObject(i);
+                String kind = part == null ? "" : part.optString("kind");
+                kinds[i] = kind.equals("tool") && mediaFromToolOutput(part) != null ? "media" : kind;
+            }
+            int[] groupStarts = AIAssistantPartGroups.starts(kinds);
+            String[] toolGroupIds = new String[array.length()];
+            Map<String, JSONArray> groupParts = new LinkedHashMap<>();
+            for (int i = 0; i < array.length(); i++) {
+                if (groupStarts[i] < 0) continue;
+                String groupId = "tools:" + value.optString("id") + ":"
+                    + array.optJSONObject(groupStarts[i]).optString("id");
+                toolGroupIds[i] = groupId;
+                JSONArray grouped = groupParts.get(groupId);
+                if (grouped == null) {
+                    grouped = new JSONArray();
+                    groupParts.put(groupId, grouped);
+                }
+                grouped.put(array.optJSONObject(i));
+            }
             StringBuilder structure = new StringBuilder(value.optString("id"));
-            structure.append(expanded.contains(toolGroupId)).append(videoCircleAvailable);
+            structure.append(videoCircleAvailable);
+            for (String groupId : groupParts.keySet())
+                structure.append(groupId).append(expanded.contains(groupId));
             for (int i = 0; i < array.length(); i++) {
                 JSONObject part = array.optJSONObject(i);
                 if (part == null || part.optString("kind").equals("reasoning")) continue;
@@ -2416,8 +2440,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 diagnosticCards.clear();
                 mediaCards.clear();
                 status = null;
-                toolSummary = null;
-                toolDetails = null;
+                toolSummaries.clear();
+                toolGroups.clear();
                 if (outgoing) {
                     LinearLayout bubble = column();
                     TextView body = MaiChatTypography.body(activity);
@@ -2508,11 +2532,13 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                         // 思考正文不创建视图；本行底部的状态文字已足够提示进度。
                         if (kind.equals("reasoning"))
                             continue;
-                        if (kind.equals("tool") && !deliveredMedia && toolDetails == null) {
-                            toolSummary = text("", 12, MaiChatTheme.SECONDARY);
+                        String toolGroupId = toolGroupIds[i];
+                        LinearLayout toolDetails = toolGroups.get(toolGroupId);
+                        if (kind.equals("tool") && !deliveredMedia && !toolGroups.containsKey(toolGroupId)) {
+                            TextView toolSummary = text("", 12, MaiChatTheme.SECONDARY);
                             toolSummary.setSingleLine(true);
                             toolSummary.setEllipsize(android.text.TextUtils.TruncateAt.END);
-                            toolSummary.setContentDescription(toolGroupTitle(array));
+                            toolSummary.setContentDescription(toolGroupTitle(groupParts.get(toolGroupId)));
                             toolSummary.setPadding(0, dp(4), 0, dp(4));
                             toolSummary.setOnClickListener(v -> {
                                 if (!expanded.add(toolGroupId)) expanded.remove(toolGroupId);
@@ -2525,6 +2551,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             toolDetails.setPadding(dp(12), 0, 0, 0);
                             toolDetails.setVisibility(expanded.contains(toolGroupId) ? VISIBLE : GONE);
                             addView(toolDetails, matchWrap());
+                            toolSummaries.put(toolGroupId, toolSummary);
+                            toolGroups.put(toolGroupId, toolDetails);
                         }
                         TextView view = kind.equals("text") ? MaiChatTypography.body(activity)
                                                             : text("", 12, MaiChatTheme.SECONDARY);
@@ -2612,8 +2640,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 }
                 addInlineMediaCards(inlineMedia);
             }
-            if (toolSummary != null) {
-                String title = toolGroupTitle(array);
+            for (Map.Entry<String, JSONArray> group : groupParts.entrySet()) {
+                String toolGroupId = group.getKey();
+                TextView toolSummary = toolSummaries.get(toolGroupId);
+                if (toolSummary == null) continue;
+                String title = toolGroupTitle(group.getValue());
                 toolSummary.setText("⌘  " + title + (expanded.contains(toolGroupId) ? "  ⌄" : "  ›"));
                 toolSummary.setContentDescription(title);
             }

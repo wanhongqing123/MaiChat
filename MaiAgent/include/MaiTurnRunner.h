@@ -133,6 +133,8 @@ private:
     std::string mTextPartId;
     std::string mReasoningPartId;
     std::size_t mLastPersistedStreamBytes = 0;
+    // item 切换会更换当前正文缓冲，整次响应是否有可见正文须独立记录。
+    bool mResponseHasVisibleText = false;
 
     MaiError mError;
     bool mHasVisibleText = false;

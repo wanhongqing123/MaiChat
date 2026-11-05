@@ -437,6 +437,7 @@ add_library(maiagent STATIC
   AgentTools/MaiPdfDocumentTools.cpp
   AgentTools/MaiWindowListTool.cpp
   Agent/MaiAgent.cpp
+  Agent/MaiAgentProgressInstructions.cpp
   Agent/MaiTurnRunner.cpp
   Agent/MaiContextBuilder.cpp
   Agent/MaiEventEmitter.cpp

@@ -3,6 +3,7 @@
 #include "MaiFfplayEntry.h"
 
 #include <setjmp.h>
+#include <stddef.h>
 #include <math.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -16,6 +17,7 @@
 #define MAI_FFPLAY_NORETURN __declspec(noreturn)
 #else
 #include <stdatomic.h>
+#include <pthread.h>
 #define MAI_FFPLAY_THREAD_LOCAL _Thread_local
 #define MAI_FFPLAY_NORETURN _Noreturn
 #endif
@@ -40,6 +42,9 @@ static volatile LONG64 sSeekFeedbackUs = -1;
 static volatile LONG sPaused;
 static volatile LONG sPendingPauseToggles;
 static volatile LONG sPlaybackSpeedPercent = 100;
+static volatile LONG64 sAudioSettings = 200;
+static volatile LONG sFirstAudioCallback;
+static SRWLOCK sAudioCommandLock = SRWLOCK_INIT;
 #define MAI_STATUS_STORE64(field, value) InterlockedExchange64(&(field), (value))
 #define MAI_STATUS_LOAD64(field) InterlockedCompareExchange64(&(field), 0, 0)
 #define MAI_STATUS_EXCHANGE64(field, value) InterlockedExchange64(&(field), (value))
@@ -57,6 +62,9 @@ static atomic_int_fast64_t sSeekFeedbackUs = -1;
 static atomic_int sPaused;
 static atomic_int sPendingPauseToggles;
 static atomic_int sPlaybackSpeedPercent = 100;
+static atomic_int_fast64_t sAudioSettings = 200;
+static atomic_int sFirstAudioCallback;
+static pthread_mutex_t sAudioCommandLock = PTHREAD_MUTEX_INITIALIZER;
 #define MAI_STATUS_STORE64(field, value) atomic_store(&(field), (value))
 #define MAI_STATUS_LOAD64(field) atomic_load(&(field))
 #define MAI_STATUS_EXCHANGE64(field, value) atomic_exchange(&(field), (value))
@@ -64,9 +72,14 @@ static atomic_int sPlaybackSpeedPercent = 100;
 #define MAI_STATUS_LOAD(field) atomic_load(&(field))
 #define MAI_STATUS_EXCHANGE(field, value) atomic_exchange(&(field), (value))
 #endif
+// 序号分配与 SDL 入队放在同一临界区，防止并发调用的序号与 FIFO 次序相反。
+static uint64_t sAudioIssuedSerial;
 static MAI_FFPLAY_THREAD_LOCAL jmp_buf sExitPoint;
 static MAI_FFPLAY_THREAD_LOCAL int sExitReady;
 static MAI_FFPLAY_THREAD_LOCAL int sDidCleanUp;
+// 只有会话的播放线程读取初始设置；read_thread 创建前即复制进 VideoState。
+static MAI_FFPLAY_THREAD_LOCAL int sInitialVolumePercent = -1;
+static MAI_FFPLAY_THREAD_LOCAL int sInitialMuted;
 static void (*sDiagnosticSink)(void* user_data, int level, const char* line);
 static void* sDiagnosticUserData;
 static int sObservedAudioSerial = -1;
@@ -102,6 +115,10 @@ static int maiFfplaySeekFile(struct VideoState* state, AVFormatContext* context,
 static int maiFfplayAddFrameAfterSeek(struct VideoState* state, AVFilterContext* source, AVFrame* frame);
 static int maiFfplayPeepEventsWithStatus(struct VideoState* state, SDL_Event* events, int count, int action,
                                          Uint32 min_type, Uint32 max_type);
+static SDL_Thread* maiFfplayCreateThreadWithAudio(int (*function)(void*), const char* name, void* data);
+static SDL_AudioDeviceID maiFfplayOpenAudioWithStatus(const char* device, int capture,
+                                                     const SDL_AudioSpec* wanted, SDL_AudioSpec* obtained,
+                                                     int allowed_changes);
 
 static void (*maiFfplaySignal(int signal_number, void (*handler)(int)))(int) {
     (void)signal_number;
@@ -131,7 +148,14 @@ static MAI_FFPLAY_NORETURN void maiFfplayExit(int status) {
 #define avformat_seek_file(context, stream, minimum, timestamp, maximum, flags) \
     maiFfplaySeekFile(is, context, stream, minimum, timestamp, maximum, flags)
 #define av_buffersrc_add_frame(source, frame) maiFfplayAddFrameAfterSeek(is, source, frame)
+// 在 upstream 创建 read_thread 之前恢复音量；返回 stream_open 后再恢复会与
+// 解复用线程开启音频设备竞争，导致首批音频使用默认音量或未静音状态。
+#define SDL_CreateThread(function, name, data) maiFfplayCreateThreadWithAudio(function, name, data)
+#define SDL_OpenAudioDevice(device, capture, wanted, obtained, changes) \
+    maiFfplayOpenAudioWithStatus(device, capture, wanted, obtained, changes)
 #include "../ffplay.c"
+#undef SDL_OpenAudioDevice
+#undef SDL_CreateThread
 #undef av_buffersrc_add_frame
 #undef avformat_seek_file
 #undef SDL_PeepEvents
@@ -139,6 +163,73 @@ static MAI_FFPLAY_NORETURN void maiFfplayExit(int status) {
 #undef signal
 #undef exit
 #undef main
+
+enum MaiFfplayAudioCommand {
+    MAI_AUDIO_SET_VOLUME = 1,
+    MAI_AUDIO_SET_MUTED,
+    MAI_AUDIO_TOGGLE_MUTED,
+    MAI_AUDIO_VOLUME_UP,
+    MAI_AUDIO_VOLUME_DOWN
+};
+
+static void publishAudioSettings(const VideoState* state, uint64_t serial) {
+    const int percent = (state->audio_volume * 100 + SDL_MIX_MAXVOLUME / 2) / SDL_MIX_MAXVOLUME;
+    // 一次原子发布两个字段，避免读取到不属于同一设置时刻的音量和静音组合。
+    MAI_STATUS_STORE64(sAudioSettings, (int64_t)((serial << 8) | (percent * 2 + !!state->muted)));
+}
+
+static SDL_Thread* maiFfplayCreateThreadWithAudio(int (*function)(void*), const char* name, void* data) {
+    if (function == read_thread && data) {
+        VideoState* state = data;
+        if (sInitialVolumePercent >= 0)
+            state->audio_volume = (sInitialVolumePercent * SDL_MIX_MAXVOLUME + 50) / 100;
+        state->muted = sInitialMuted;
+        publishAudioSettings(state, 0);
+    }
+    return SDL_CreateThread(function, name, data);
+}
+
+static void maiFfplayAudioCallbackWithStatus(void* opaque, Uint8* stream, int length) {
+    VideoState* state = opaque;
+    const int first = MAI_STATUS_EXCHANGE(sFirstAudioCallback, 0);
+    const int volume = first ? state->audio_volume : 0;
+    const int muted = first ? state->muted : 0;
+    sdl_audio_callback(opaque, stream, length);
+    if (first) {
+        int non_silent = 0;
+        for (int index = 0; index < length && !non_silent; ++index) non_silent = stream[index] != 0;
+        // 仅首批 PCM 记录真实回调设置和是否有声，用于验证恢复状态没有音量突发。
+        // 不记录媒体字节；音量修改仍全部由 FFplay 事件线程执行。
+        av_log(NULL, AV_LOG_VERBOSE, "Initial audio callback volume=%d muted=%d non_silent=%d\n",
+               (volume * 100 + SDL_MIX_MAXVOLUME / 2) / SDL_MIX_MAXVOLUME, muted, non_silent);
+    }
+}
+
+static SDL_AudioDeviceID maiFfplayOpenAudioWithStatus(const char* device, int capture,
+                                                     const SDL_AudioSpec* wanted, SDL_AudioSpec* obtained,
+                                                     int allowed_changes) {
+    if (!wanted || wanted->callback != sdl_audio_callback)
+        return SDL_OpenAudioDevice(device, capture, wanted, obtained, allowed_changes);
+    SDL_AudioSpec spec = *wanted;
+    spec.callback = maiFfplayAudioCallbackWithStatus;
+    return SDL_OpenAudioDevice(device, capture, &spec, obtained, allowed_changes);
+}
+
+static void applyAudioCommand(VideoState* state, int operation, int value, uint64_t serial) {
+    // 只有 FFplay 事件线程修改运行中的 VideoState。原有音量步进沿用 upstream
+    // 对数增益，精确百分比则用四舍五入映射到 SDL 的 0..128 混音刻度。
+    if (operation == MAI_AUDIO_SET_VOLUME)
+        state->audio_volume = (value * SDL_MIX_MAXVOLUME + 50) / 100;
+    else if (operation == MAI_AUDIO_SET_MUTED)
+        state->muted = value;
+    else if (operation == MAI_AUDIO_TOGGLE_MUTED)
+        toggle_mute(state);
+    else if (operation == MAI_AUDIO_VOLUME_UP)
+        update_volume(state, 1, SDL_VOLUME_STEP);
+    else if (operation == MAI_AUDIO_VOLUME_DOWN)
+        update_volume(state, -1, SDL_VOLUME_STEP);
+    publishAudioSettings(state, serial);
+}
 
 static int maiFfplaySeekFile(VideoState* state, AVFormatContext* context, int stream_index, int64_t minimum,
                              int64_t timestamp, int64_t maximum, int flags) {
@@ -287,8 +378,19 @@ static int maiFfplayPeepEventsWithStatus(VideoState* state, SDL_Event* events, i
         if (MAI_STATUS_LOAD(sPlaybackEnded) && length > 0) MAI_STATUS_STORE64(sPositionUs, length);
         MAI_STATUS_STORE64(sDurationUs, length > 0 ? length : 0);
         MAI_STATUS_STORE(sPaused, state->paused ? 1 : 0);
+        // 原生键盘事件也可能进入 upstream 的音量分支；快照始终反映实际状态。
+        publishAudioSettings(state, (uint64_t)MAI_STATUS_LOAD64(sAudioSettings) >> 8);
     }
-    return SDL_PeepEvents(events, count, action, min_type, max_type);
+    int received;
+    while ((received = SDL_PeepEvents(events, count, action, min_type, max_type)) > 0) {
+        // upstream 每次取一个事件。音量事件在同一 FIFO 内消费，既不跨线程
+        // 裸写 VideoState，也不依赖只在存在视频窗口时处理的键盘分支。
+        if (!state || count != 1 || events[0].type != SDL_USEREVENT + 3) return received;
+        const uint64_t serial = (uint32_t)(uintptr_t)events[0].user.data1 |
+                                ((uint64_t)(uint32_t)(uintptr_t)events[0].user.data2 << 32);
+        applyAudioCommand(state, events[0].user.code / 128, events[0].user.code % 128, serial);
+    }
+    return received;
 }
 
 int maiFfplayGetPlaybackStatus(MaiFfplayPlaybackStatus* status) {
@@ -303,6 +405,69 @@ int maiFfplayGetPlaybackStatus(MaiFfplayPlaybackStatus* status) {
     status->seeking = feedback >= 0;
     status->seek_target_us = feedback >= 0 ? feedback : 0;
     return status->running;
+}
+
+int maiFfplayGetAudioStatus(MaiFfplayAudioStatus* status) {
+    if (!status || status->struct_size < sizeof(status->struct_size)) return -1;
+    const uint64_t snapshot = (uint64_t)MAI_STATUS_LOAD64(sAudioSettings);
+    const int settings = snapshot & 255;
+    if (status->struct_size >= offsetof(MaiFfplayAudioStatus, volume_percent) + sizeof(status->volume_percent))
+        status->volume_percent = settings / 2;
+    if (status->struct_size >= offsetof(MaiFfplayAudioStatus, muted) + sizeof(status->muted))
+        status->muted = settings % 2;
+    if (status->struct_size >= offsetof(MaiFfplayAudioStatus, applied_serial) + sizeof(status->applied_serial))
+        status->applied_serial = snapshot >> 8;
+    return MAI_STATUS_LOAD(sPlaybackActive);
+}
+
+static int queueAudioCommand(int operation, int value, uint64_t* receipt) {
+    if (receipt) *receipt = 0;
+#if defined(_WIN32)
+    AcquireSRWLockExclusive(&sAudioCommandLock);
+#else
+    pthread_mutex_lock(&sAudioCommandLock);
+#endif
+    int result = 0;
+    SDL_Event event = {0};
+    event.type = SDL_USEREVENT + 3;
+    event.user.code = operation * 128 + value;
+    // 低 8 位存音量和静音，其余正值位存回执；耗尽时明确拒绝而不回绕。
+    if (MAI_STATUS_LOAD(sPlaybackActive) && sAudioIssuedSerial < ((uint64_t)INT64_MAX >> 8)) {
+        const uint64_t serial = sAudioIssuedSerial + 1;
+        event.user.data1 = (void*)(uintptr_t)(uint32_t)serial;
+        event.user.data2 = (void*)(uintptr_t)(uint32_t)(serial >> 32);
+        if (SDL_PushEvent(&event) > 0) {
+            sAudioIssuedSerial = serial;
+            if (receipt) *receipt = serial;
+            result = 1;
+        }
+    }
+#if defined(_WIN32)
+    ReleaseSRWLockExclusive(&sAudioCommandLock);
+#else
+    pthread_mutex_unlock(&sAudioCommandLock);
+#endif
+    return result;
+}
+
+int maiFfplaySetVolumePercent(int volume_percent) {
+    return maiFfplaySetVolumePercentWithReceipt(volume_percent, NULL);
+}
+
+int maiFfplaySetVolumePercentWithReceipt(int volume_percent, uint64_t* receipt) {
+    if (receipt) *receipt = 0;
+    if (volume_percent < 0 || volume_percent > 100) return -1;
+    return queueAudioCommand(MAI_AUDIO_SET_VOLUME, volume_percent, receipt);
+}
+
+int maiFfplaySetMuted(int muted) {
+    return maiFfplaySetMutedWithReceipt(muted, NULL);
+}
+
+int maiFfplaySetMutedWithReceipt(int muted, uint64_t* receipt) {
+    if (receipt) *receipt = 0;
+    if (muted != 0 && muted != 1) return -1;
+    return queueAudioCommand(MAI_AUDIO_SET_MUTED, muted, receipt);
 }
 
 static void maiFfplayLogCallback(void* context, int level, const char* format, va_list arguments) {
@@ -367,7 +532,8 @@ static void resetFfplayOptions(void) {
     vk_renderer = NULL;
 }
 
-int maiFfplayRun(const MaiFfplayHost* host, int argc, char** argv) {
+static int runWithAudio(const MaiFfplayHost* host, int argc, char** argv,
+                        const MaiFfplayAudioOptions* options) {
     if (!host || !host->graphics_view_id || argc < 2 || !argv) return -1;
 #if defined(_WIN32)
     if (InterlockedCompareExchange(&sRunning, 1, 0) != 0) return -1;
@@ -375,6 +541,8 @@ int maiFfplayRun(const MaiFfplayHost* host, int argc, char** argv) {
     if (atomic_flag_test_and_set(&sRunning)) return -1;
 #endif
     resetFfplayOptions();
+    sInitialVolumePercent = options ? options->volume_percent : -1;
+    sInitialMuted = options ? options->muted : 0;
     sSeekMutex = SDL_CreateMutex();
     if (!sSeekMutex) {
 #if defined(_WIN32)
@@ -396,6 +564,8 @@ int maiFfplayRun(const MaiFfplayHost* host, int argc, char** argv) {
     MAI_STATUS_STORE(sPaused, 0);
     MAI_STATUS_STORE(sPlaybackEnded, 0);
     MAI_STATUS_STORE(sPendingPauseToggles, 0);
+    MAI_STATUS_STORE64(sAudioSettings, (options ? options->volume_percent : 100) * 2 + sInitialMuted);
+    MAI_STATUS_STORE(sFirstAudioCallback, 1);
     MAI_STATUS_STORE(sPlaybackActive, 1);
     maiFfplayBindHost(host);
     sExitReady = 1;
@@ -425,7 +595,26 @@ int maiFfplayRun(const MaiFfplayHost* host, int argc, char** argv) {
     return result;
 }
 
+int maiFfplayRun(const MaiFfplayHost* host, int argc, char** argv) {
+    return runWithAudio(host, argc, argv, NULL);
+}
+
 int maiFfplayRunAtSpeed(const MaiFfplayHost* host, int argc, char** argv, double speed, int64_t start_position_us) {
+    return maiFfplayRunAtSpeedWithAudio(host, argc, argv, speed, start_position_us, NULL);
+}
+
+int maiFfplayRunAtSpeedWithAudio(const MaiFfplayHost* host, int argc, char** argv, double speed,
+                                int64_t start_position_us, const MaiFfplayAudioOptions* audio_options) {
+    MaiFfplayAudioOptions audio = {sizeof(MaiFfplayAudioOptions), 100, 0};
+    if (audio_options) {
+        if (audio_options->struct_size < sizeof(audio_options->struct_size)) return -1;
+        if (audio_options->struct_size >=
+            offsetof(MaiFfplayAudioOptions, volume_percent) + sizeof(audio_options->volume_percent))
+            audio.volume_percent = audio_options->volume_percent;
+        if (audio_options->struct_size >= offsetof(MaiFfplayAudioOptions, muted) + sizeof(audio_options->muted))
+            audio.muted = audio_options->muted;
+        if (audio.volume_percent < 0 || audio.volume_percent > 100 || (audio.muted != 0 && audio.muted != 1)) return -1;
+    }
     const char* rate = NULL;
     int percent = 100;
     if (fabs(speed - 0.25) < 0.0001) {
@@ -468,7 +657,8 @@ int maiFfplayRunAtSpeed(const MaiFfplayHost* host, int argc, char** argv, double
     }
     options[count++] = argv[argc - 1];
     MAI_STATUS_STORE(sPlaybackSpeedPercent, percent);
-    const int result = maiFfplayRun(host, count, options);
+    // 未提供扩展设置时保留原 argv 的 -volume；不能用默认 100% 覆盖旧 API。
+    const int result = runWithAudio(host, count, options, audio_options ? &audio : NULL);
     MAI_STATUS_STORE(sPlaybackSpeedPercent, 100);
     return result;
 }
@@ -482,6 +672,9 @@ void maiFfplayRequestQuit(void) {
 int maiFfplaySendCommand(const char* command) {
     if (!command) return -1;
     if (!strcmp(command, "pause")) return maiFfplayRequestPauseToggle();
+    if (!strcmp(command, "mute")) return queueAudioCommand(MAI_AUDIO_TOGGLE_MUTED, 0, NULL);
+    if (!strcmp(command, "volume_up")) return queueAudioCommand(MAI_AUDIO_VOLUME_UP, 0, NULL);
+    if (!strcmp(command, "volume_down")) return queueAudioCommand(MAI_AUDIO_VOLUME_DOWN, 0, NULL);
     int64_t relative_us = 0;
     if (!strcmp(command, "seek_forward"))
         relative_us = 10 * (int64_t)AV_TIME_BASE;
@@ -511,8 +704,7 @@ int maiFfplaySendCommand(const char* command) {
     } keys[] = {
         {"step", SDLK_s},         {"next_chapter", SDLK_PAGEUP}, {"previous_chapter", SDLK_PAGEDOWN},
         {"next_audio", SDLK_a},   {"next_video", SDLK_v},        {"next_subtitle", SDLK_t},
-        {"next_program", SDLK_c}, {"next_filter", SDLK_w},       {"mute", SDLK_m},
-        {"volume_up", SDLK_0},    {"volume_down", SDLK_9},       {"fullscreen", SDLK_f},
+        {"next_program", SDLK_c}, {"next_filter", SDLK_w},       {"fullscreen", SDLK_f},
     };
     for (size_t index = 0; index < sizeof(keys) / sizeof(keys[0]); ++index) {
         if (strcmp(command, keys[index].command)) continue;

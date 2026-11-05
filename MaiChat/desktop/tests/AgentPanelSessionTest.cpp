@@ -15,6 +15,7 @@
 #include <QSemaphore>
 #include <QScrollBar>
 #include <QScrollArea>
+#include <QSet>
 #include <QSignalSpy>
 #include <QSplitter>
 #include <QSplitterHandle>
@@ -264,6 +265,93 @@ public:
     MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
 };
 
+// 只生成固定的可见发言；门控工具阻塞期间，Qt 事件循环继续渲染真实面板。
+// 不经过任何供应商、用户账号或付费任务。
+struct IntermediateProgressState {
+    std::atomic<int> entered{0};
+    std::atomic<int> released{0};
+};
+
+class IntermediateProgressModel final : public MaiModelClient {
+public:
+    explicit IntermediateProgressModel(bool consecutiveTools = false) : consecutiveTools_(consecutiveTools) {}
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
+                    const std::atomic<bool>&) override {
+        const int step = calls_++;
+        const bool finished = step >= (consecutiveTools_ ? 1 : 2);
+        const std::string text = step == 0 ? "Progress A: inspect local inputs."
+                               : !finished ? "Progress B: validate observed results."
+                                           : "Final C: both local checks completed.";
+        MaiModelTextItem item;
+        item.id = "fixture-message-" + std::to_string(step);
+        item.index = 0;
+        item.phase = finished ? MaiModelTextPhase::FinalAnswer : MaiModelTextPhase::Commentary;
+        if (sink.onTextItemStarted) sink.onTextItemStarted(item);
+        if (sink.onTextItemDelta) sink.onTextItemDelta(item, text);
+        else if (sink.onText) sink.onText(text);
+        if (sink.onTextItemCompleted) sink.onTextItemCompleted(item);
+        if (!finished && sink.onToolCall) {
+            sink.onToolCall(MaiToolInvocation{step == 0 ? "X" : "Y",
+                                               step == 0 ? "progress_probe_x" : "progress_probe_y",
+                                               "{}"});
+            if (consecutiveTools_)
+                sink.onToolCall(MaiToolInvocation{"Y", "progress_probe_y", "{}"});
+        }
+        return {};
+    }
+    MaiWireApi wireApi() const override { return MaiWireApi::Responses; }
+
+private:
+    int calls_ = 0;
+    bool consecutiveTools_ = false;
+};
+
+class IntermediateProgressTool final : public MaiTool {
+public:
+    IntermediateProgressTool(std::shared_ptr<IntermediateProgressState> state, int stage)
+        : state_(std::move(state)), stage_(stage) {}
+    std::string name() const override {
+        return stage_ == 1 ? "progress_probe_x" : "progress_probe_y";
+    }
+    std::string description() const override { return "Read-only deterministic UI check."; }
+    std::string parametersSchema() const override { return R"({"type":"object"})"; }
+    MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
+        state_->entered.store(stage_);
+        while (state_->released.load() < stage_ && !context.cancel->load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return MaiToolResult::success("Observed local fixture stage " + std::to_string(stage_));
+    }
+
+private:
+    std::shared_ptr<IntermediateProgressState> state_;
+    int stage_;
+};
+
+QString selectedDocumentText(MarkdownView& view) {
+    view.selectAll();
+    const QString result = view.selectedText();
+    view.clearSelection();
+    return result;
+}
+
+QWidget* progressToolGroup(AgentChatPanel& panel, const QString& tool) {
+    for (QPushButton* disclosure : panel.findChildren<QPushButton*>(
+             QStringLiteral("agentToolGroupDisclosure"))) {
+        QWidget* group = disclosure->parentWidget();
+        for (QLabel* label : group->findChildren<QLabel*>())
+            if (label->text().contains(tool)) return group;
+    }
+    return nullptr;
+}
+
+// QWidget::grab 只渲染本测试创建的 Qt 子树，不裁剪桌面，因此不会带入被覆盖的用户窗口。
+bool captureProgressFixture(AgentChatPanel& panel, const QString& name) {
+    const QString directory = qEnvironmentVariable("MAICHAT_AGENT_PROGRESS_EVIDENCE_DIR");
+    if (directory.isEmpty()) return true;
+    if (!QDir().mkpath(directory)) return false;
+    return panel.grab().save(QDir(directory).filePath(name + QStringLiteral(".png")));
+}
+
 }  // namespace
 
 class AgentPanelSessionTest : public QObject {
@@ -291,6 +379,8 @@ private slots:
     void waitingIndicatorSurvivesSwitchingAwayAndBack();
     void reasoningStatusSurvivesSwitchBeforeCheckpoint();
     void thinkingContentNeverRendersLiveOrAfterRestore();
+    void intermediateProgressStaysVisibleAcrossToolsAndHistoryRestore();
+    void consecutiveToolsShareDisclosureWithoutChangingReceipts();
     void waitingIndicatorAppearsBeforeFirstModelChunk();
     void waitingIndicatorClearsWhenModelHasNoReasoning();
     void unconfiguredModelOpensConfigurationInsteadOfFailingTurn();
@@ -1434,6 +1524,204 @@ void AgentPanelSessionTest::thinkingContentNeverRendersLiveOrAfterRestore() {
     view->selectAll();
     QVERIFY(view->selectedText().contains(QStringLiteral("回答完了")));
     QVERIFY(!view->selectedText().contains(QStringLiteral("想一想")));
+}
+
+void AgentPanelSessionTest::intermediateProgressStaysVisibleAcrossToolsAndHistoryRestore() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString database = directory.filePath(QStringLiteral("progress-fixture.db"));
+    QString session;
+    QStringList textPartIds;
+    const QStringList expectedText{QStringLiteral("Progress A: inspect local inputs."),
+                                   QStringLiteral("Progress B: validate observed results."),
+                                   QStringLiteral("Final C: both local checks completed.")};
+    const auto sequence = [](AgentController& controller, const QString& id) {
+        QStringList result;
+        for (const MaiMessage& message : controller.agent().listMessages(id.toStdString())) {
+            if (message.role != MaiRole::Assistant) continue;
+            for (const MaiMessagePart& part : message.parts) {
+                if (const auto* text = std::get_if<MaiTextPart>(&part.body))
+                    result.append(QString::fromStdString(text->text));
+                else if (const auto* tool = std::get_if<MaiToolPart>(&part.body))
+                    result.append(QString::fromStdString(tool->callId));
+            }
+        }
+        return result;
+    };
+    const auto allExpectedParts = [&] {
+        return QStringList{expectedText[0], QStringLiteral("X"), expectedText[1],
+                           QStringLiteral("Y"), expectedText[2]};
+    };
+    {
+        auto state = std::make_shared<IntermediateProgressState>();
+        AgentController controller(std::make_unique<IntermediateProgressModel>(), database,
+                                   [state](MaiToolRegistry& tools) {
+                                       tools.add(std::make_unique<IntermediateProgressTool>(state, 1));
+                                       tools.add(std::make_unique<IntermediateProgressTool>(state, 2));
+                                   });
+        QVERIFY2(controller.openError().isEmpty(), qPrintable(controller.openError()));
+        // 断言中途返回时也释放门控，防止测试清理被未完成的工具阻塞。
+        struct ReleaseOnExit {
+            std::shared_ptr<IntermediateProgressState> state;
+            ~ReleaseOnExit() { state->released.store(2); }
+        } releaseOnExit{state};
+        AgentChatPanel panel(controller);
+        panel.resize(1000, 800);
+        panel.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&panel));
+        session = controller.createSession(directory.path(), QStringLiteral("Intermediate progress fixture"));
+        panel.openSession(session);
+        auto* view = panel.findChild<MarkdownView*>();
+        QVERIFY(view != nullptr);
+        QVERIFY(controller.sendPrompt(session, QStringLiteral("Run two local fixture checks.")));
+
+        QTRY_COMPARE_WITH_TIMEOUT(state->entered.load(), 1, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(selectedDocumentText(*view).contains(expectedText[0]), 5000);
+        QVERIFY(controller.agent().isBusy(session.toStdString()));
+        QCOMPARE(state->released.load(), 0);
+        QCOMPARE(sequence(controller, session), (QStringList{expectedText[0], QStringLiteral("X")}));
+        QVERIFY(!selectedDocumentText(*view).contains(expectedText[1]));
+        QVERIFY(captureProgressFixture(panel, QStringLiteral("01-tool-x-waiting")));
+
+        state->released.store(1);
+        QTRY_COMPARE_WITH_TIMEOUT(state->entered.load(), 2, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(selectedDocumentText(*view).contains(expectedText[1]), 5000);
+        QVERIFY(controller.agent().isBusy(session.toStdString()));
+        QCOMPARE(sequence(controller, session),
+                 (QStringList{expectedText[0], QStringLiteral("X"), expectedText[1], QStringLiteral("Y")}));
+        QWidget* firstGroup = nullptr;
+        QWidget* secondGroup = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT((firstGroup = progressToolGroup(panel, QStringLiteral("progress_probe_x"))) != nullptr,
+                                 5000);
+        QTRY_VERIFY_WITH_TIMEOUT((secondGroup = progressToolGroup(panel, QStringLiteral("progress_probe_y"))) != nullptr,
+                                 5000);
+        // 工具 Y 不能折叠进 X 的旧组，跨过已显示的中间正文 B。
+        QVERIFY2(firstGroup != secondGroup, "Tool groups must not cross intermediate assistant text.");
+        for (QWidget* group : {firstGroup, secondGroup}) {
+            auto* summary = group->findChild<QPushButton*>(QStringLiteral("agentToolGroupDisclosure"));
+            QVERIFY(summary != nullptr);
+            QVERIFY(summary->text().contains(QStringLiteral("工具调用 1 次")));
+        }
+        for (const MaiMessage& message : controller.agent().listMessages(session.toStdString()))
+            if (message.role == MaiRole::Assistant)
+                for (const MaiMessagePart& part : message.parts)
+                    if (std::holds_alternative<MaiTextPart>(part.body))
+                        textPartIds.append(QString::fromStdString(part.id));
+        QCOMPARE(textPartIds.size(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(view->itemRect(textPartIds[0]).height() > 0 &&
+                                     view->itemRect(textPartIds[1]).height() > 0, 5000);
+        const auto groupTop = [view](QWidget* group) {
+            return group->mapTo(view->viewport(), QPoint()).y() + view->verticalScrollBar()->value();
+        };
+        QVERIFY(view->itemRect(textPartIds[0]).bottom() <= groupTop(firstGroup));
+        QVERIFY(groupTop(firstGroup) + firstGroup->height() <= view->itemRect(textPartIds[1]).top());
+        QVERIFY(view->itemRect(textPartIds[1]).bottom() <= groupTop(secondGroup));
+        QVERIFY(captureProgressFixture(panel, QStringLiteral("02-tool-y-waiting")));
+
+        const QString other = controller.createSession(directory.path(), QStringLiteral("Empty fixture session"));
+        panel.openSession(other);
+        panel.openSession(session);
+        QTRY_VERIFY_WITH_TIMEOUT(selectedDocumentText(*view).contains(expectedText[0]) &&
+                                     selectedDocumentText(*view).contains(expectedText[1]), 5000);
+        firstGroup = progressToolGroup(panel, QStringLiteral("progress_probe_x"));
+        secondGroup = progressToolGroup(panel, QStringLiteral("progress_probe_y"));
+        QVERIFY(firstGroup != nullptr && secondGroup != nullptr && firstGroup != secondGroup);
+
+        state->released.store(2);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(selectedDocumentText(*view).contains(expectedText[2]), 5000);
+        QCOMPARE(sequence(controller, session), allExpectedParts());
+        textPartIds.clear();
+        for (const MaiMessage& message : controller.agent().listMessages(session.toStdString()))
+            if (message.role == MaiRole::Assistant)
+                for (const MaiMessagePart& part : message.parts)
+                    if (std::holds_alternative<MaiTextPart>(part.body))
+                        textPartIds.append(QString::fromStdString(part.id));
+        QCOMPARE(textPartIds.size(), 3);
+        QCOMPARE(QSet<QString>(textPartIds.begin(), textPartIds.end()).size(), 3);
+        const QString visible = selectedDocumentText(*view);
+        int previous = -1;
+        for (const QString& text : expectedText) {
+            QCOMPARE(visible.count(text), 1);
+            QVERIFY(visible.indexOf(text) > previous);
+            previous = visible.indexOf(text);
+        }
+        QVERIFY(captureProgressFixture(panel, QStringLiteral("03-completed")));
+    }
+    // 重新构造 controller 和面板，确保恢复的是已关闭重开的 SQLite 数据，非旧视图缓存。
+    AgentController restored(std::make_unique<SilentModel>(), database);
+    QVERIFY2(restored.openError().isEmpty(), qPrintable(restored.openError()));
+    AgentChatPanel panel(restored);
+    panel.resize(1000, 800);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    panel.openSession(session);
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view != nullptr);
+    QCOMPARE(sequence(restored, session), allExpectedParts());
+    QTRY_VERIFY_WITH_TIMEOUT(selectedDocumentText(*view).contains(expectedText[2]), 5000);
+    const QString visible = selectedDocumentText(*view);
+    for (int i = 0; i < expectedText.size(); ++i) {
+        QCOMPARE(visible.count(expectedText[i]), 1);
+        QVERIFY(view->contains(textPartIds[i]));
+        QVERIFY(view->itemRect(textPartIds[i]).height() > 0);
+        if (i > 0) QVERIFY(view->itemRect(textPartIds[i - 1]).bottom() <= view->itemRect(textPartIds[i]).top());
+    }
+    QWidget* firstGroup = progressToolGroup(panel, QStringLiteral("progress_probe_x"));
+    QWidget* secondGroup = progressToolGroup(panel, QStringLiteral("progress_probe_y"));
+    QVERIFY(firstGroup != nullptr && secondGroup != nullptr && firstGroup != secondGroup);
+    const int firstTop = firstGroup->mapTo(view->viewport(), QPoint()).y() + view->verticalScrollBar()->value();
+    const int secondTop = secondGroup->mapTo(view->viewport(), QPoint()).y() + view->verticalScrollBar()->value();
+    QVERIFY(view->itemRect(textPartIds[0]).bottom() <= firstTop);
+    QVERIFY(firstTop + firstGroup->height() <= view->itemRect(textPartIds[1]).top());
+    QVERIFY(view->itemRect(textPartIds[1]).bottom() <= secondTop);
+    QVERIFY(secondTop + secondGroup->height() <= view->itemRect(textPartIds[2]).top());
+    QVERIFY(captureProgressFixture(panel, QStringLiteral("04-sqlite-restored")));
+}
+
+void AgentPanelSessionTest::consecutiveToolsShareDisclosureWithoutChangingReceipts() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto state = std::make_shared<IntermediateProgressState>();
+    AgentController controller(std::make_unique<IntermediateProgressModel>(true), QString(),
+                               [state](MaiToolRegistry& tools) {
+                                   tools.add(std::make_unique<IntermediateProgressTool>(state, 1));
+                                   tools.add(std::make_unique<IntermediateProgressTool>(state, 2));
+                               });
+    struct ReleaseOnExit {
+        std::shared_ptr<IntermediateProgressState> state;
+        ~ReleaseOnExit() { state->released.store(2); }
+    } releaseOnExit{state};
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 800);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(directory.path());
+    panel.openSession(session);
+    QVERIFY(controller.sendPrompt(session, QStringLiteral("Run adjacent local checks.")));
+    QTRY_COMPARE_WITH_TIMEOUT(state->entered.load(), 1, 5000);
+    state->released.store(1);
+    QTRY_COMPARE_WITH_TIMEOUT(state->entered.load(), 2, 5000);
+    QWidget* firstGroup = nullptr;
+    QWidget* secondGroup = nullptr;
+    QTRY_VERIFY_WITH_TIMEOUT((firstGroup = progressToolGroup(panel, QStringLiteral("progress_probe_x"))) != nullptr,
+                             5000);
+    QTRY_VERIFY_WITH_TIMEOUT((secondGroup = progressToolGroup(panel, QStringLiteral("progress_probe_y"))) != nullptr,
+                             5000);
+    QCOMPARE(firstGroup, secondGroup);
+    auto* summary = firstGroup->findChild<QPushButton*>(QStringLiteral("agentToolGroupDisclosure"));
+    QVERIFY(summary != nullptr);
+    QVERIFY(summary->text().contains(QStringLiteral("工具调用 2 次")));
+    state->released.store(2);
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+    QStringList receipts;
+    for (const MaiMessage& message : controller.agent().listMessages(session.toStdString()))
+        for (const MaiMessagePart& part : message.parts)
+            if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
+                QCOMPARE(tool->state, MaiToolState::Completed);
+                receipts.append(QString::fromStdString(tool->callId));
+            }
+    QCOMPARE(receipts, (QStringList{QStringLiteral("X"), QStringLiteral("Y")}));
 }
 
 void AgentPanelSessionTest::pastedImageUsesTheSharedComposerAndReachesTheModel() {

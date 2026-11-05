@@ -1056,7 +1056,7 @@ private:
 
 class AgentChatPanel::ToolGroupCard final : public QFrame {
 public:
-    explicit ToolGroupCard(QWidget* parent = nullptr) : QFrame(parent) {
+    explicit ToolGroupCard(const QString& id, QWidget* parent = nullptr) : QFrame(parent), id_(id) {
         setObjectName(QStringLiteral("agentToolGroup"));
         setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
         auto* column = new QVBoxLayout(this);
@@ -1091,6 +1091,7 @@ public:
     }
 
     int cardCount() const { return detailsLayout_->count(); }
+    const QString& id() const { return id_; }
 
     void setExpanded(bool expanded) {
         details_->setVisible(expanded);
@@ -1110,7 +1111,9 @@ public:
         bool canceled = false;
         for (const MaiMessagePart& part : message.parts) {
             const auto* tool = std::get_if<MaiToolPart>(&part.body);
-            if (!tool || !visibleCards.contains(fromUtf8(part.id))) continue;
+            // 同一 assistant 消息可以有多个连续工具组，摘要只统计本组所属卡片。
+            ToolCard* card = visibleCards.value(fromUtf8(part.id), nullptr);
+            if (!tool || !card || !isAncestorOf(card)) continue;
             ++count;
             running |= tool->state == MaiToolState::Running;
             pending |= tool->state == MaiToolState::Pending;
@@ -1140,6 +1143,7 @@ private:
     QWidget* details_ = nullptr;
     QVBoxLayout* detailsLayout_ = nullptr;
     QString title_;
+    QString id_;
     bool autoExpanded_ = false;
 };
 
@@ -1198,6 +1202,7 @@ struct AgentChatPanel::Runtime {
     QString pendingThinkingItemId;
     QHash<QString, ToolCard*> toolCards;
     QHash<QString, ToolGroupCard*> toolGroups;
+    QHash<QString, ToolGroupCard*> toolCardGroups;
     // 子会话 id -> 那张子任务卡。
     QHash<QString, SubAgentCard*> subAgentCards;
 
@@ -1827,7 +1832,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
                 if (!isCurrentSession(sessionId)) {
                     if (!runtime_->controller->isChildOf(sessionId, runtime_->sessionId)) return;
                     ToolCard* card = runtime_->toolCards.value(partId, nullptr);
-                    ToolGroupCard* group = runtime_->toolGroups.value(messageId, nullptr);
+                    ToolGroupCard* group = runtime_->toolCardGroups.value(partId, nullptr);
                     if (!card || !group) return;
                     for (const MaiMessage& message : runtime_->controller->agent().listMessages(toUtf8(sessionId))) {
                         if (fromUtf8(message.id) != messageId) continue;
@@ -2202,6 +2207,7 @@ void AgentChatPanel::reloadFromStore() {
     runtime_->dirtyAnswers.clear();
     runtime_->toolCards.clear();
     runtime_->toolGroups.clear();
+    runtime_->toolCardGroups.clear();
     runtime_->subAgentCards.clear();
     runtime_->pendingQuestionId.clear();
     runtime_->editor->setPlaceholderText(QStringLiteral("交给它做点什么…"));
@@ -2239,7 +2245,7 @@ void AgentChatPanel::reloadFromStore() {
                 if (tool->tool == "agent_send_media" && tool->state == MaiToolState::Completed &&
                     appendAgentMediaCard(partId, fromUtf8(tool->output), fromUtf8(selectedSession.directory)))
                     continue;
-                ToolCard* card = toolCardFor(partId, fromUtf8(message.id));
+                ToolCard* card = toolCardFor(partId, message);
                 card->setCall(fromUtf8(tool->tool), fromUtf8(tool->input));
                 card->apply(tool->state, false);
                 card->setDetail(tool->state == MaiToolState::Error ? fromUtf8(tool->error) : fromUtf8(tool->output));
@@ -2247,8 +2253,11 @@ void AgentChatPanel::reloadFromStore() {
                     appendPdfPreview(partId, fromUtf8(tool->output), fromUtf8(selectedSession.directory));
             }
         }
-        if (ToolGroupCard* group = runtime_->toolGroups.value(fromUtf8(message.id), nullptr))
-            group->setSummary(message, runtime_->toolCards);
+        QSet<ToolGroupCard*> groups;
+        for (const MaiMessagePart& part : message.parts)
+            if (ToolGroupCard* group = runtime_->toolCardGroups.value(fromUtf8(part.id), nullptr))
+                groups.insert(group);
+        for (ToolGroupCard* group : groups) group->setSummary(message, runtime_->toolCards);
         if (message.completed != 0)
             appendTextMediaCards(fromUtf8(message.id), textFragments.join(QLatin1Char('\n')),
                                  fromUtf8(selectedSession.directory));
@@ -2435,24 +2444,47 @@ void AgentChatPanel::clearPendingThinking() {
     runtime_->pendingThinkingItemId.clear();
 }
 
-AgentChatPanel::ToolGroupCard* AgentChatPanel::toolGroupFor(const QString& messageId) {
-    auto found = runtime_->toolGroups.constFind(messageId);
+AgentChatPanel::ToolGroupCard* AgentChatPanel::toolGroupFor(const QString& partId, const MaiMessage& message) {
+    if (ToolGroupCard* group = runtime_->toolCardGroups.value(partId, nullptr)) return group;
+    QString groupId = partId;
+    // 首个工具 part.id 是稳定的组身份。正文与有独立可见产物的工具断组，
+    // 隐藏 reasoning 不断组；流式更新和重新加载历史使用同一个判定。
+    // 消息由外层已有查询借入，避免历史重放时每张工具卡再次加载整个会话。
+    QString firstTool;
+    for (const MaiMessagePart& part : message.parts) {
+        if (std::holds_alternative<MaiReasoningPart>(part.body)) continue;
+        const auto* tool = std::get_if<MaiToolPart>(&part.body);
+        if (!tool) {
+            firstTool.clear();
+            continue;
+        }
+        // 这两种工具完成后在正文流中插入媒体/PDF 卡，后续工具不能越过它。
+        const bool separateArtifact = tool->tool == "agent_send_media" || tool->tool == "generate_pdf";
+        if (separateArtifact || firstTool.isEmpty()) firstTool = fromUtf8(part.id);
+        if (fromUtf8(part.id) == partId) {
+            groupId = firstTool;
+            break;
+        }
+        if (separateArtifact) firstTool.clear();
+    }
+    auto found = runtime_->toolGroups.constFind(groupId);
     if (found != runtime_->toolGroups.constEnd()) return found.value();
-    auto* group = new ToolGroupCard;
-    runtime_->view->addWidget(QStringLiteral("tool-group-") + messageId, group);
-    runtime_->toolGroups.insert(messageId, group);
+    auto* group = new ToolGroupCard(groupId);
+    runtime_->view->addWidget(QStringLiteral("tool-group-") + groupId, group);
+    runtime_->toolGroups.insert(groupId, group);
     return group;
 }
 
-AgentChatPanel::ToolCard* AgentChatPanel::toolCardFor(const QString& partId, const QString& messageId) {
+AgentChatPanel::ToolCard* AgentChatPanel::toolCardFor(const QString& partId, const MaiMessage& message) {
     auto found = runtime_->toolCards.constFind(partId);
     if (found != runtime_->toolCards.constEnd()) return found.value();
 
-    ToolGroupCard* group = toolGroupFor(messageId);
+    ToolGroupCard* group = toolGroupFor(partId, message);
     auto* card = new ToolCard(group);
     card->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
     group->addCard(card);
     runtime_->toolCards.insert(partId, card);
+    runtime_->toolCardGroups.insert(partId, group);
 
     connect(card->allowButton(), &QPushButton::clicked, this, [this, partId] { replyForPart(partId, false, true); });
     connect(card->alwaysButton(), &QPushButton::clicked, this, [this, partId] { replyForPart(partId, true, true); });
@@ -2489,11 +2521,11 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
                 if (runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), session) &&
                     appendAgentMediaCard(partId, fromUtf8(tool->output), fromUtf8(session.directory))) {
                     ToolCard* existing = runtime_->toolCards.take(partId);
-                    ToolGroupCard* group = runtime_->toolGroups.value(messageId, nullptr);
+                    ToolGroupCard* group = runtime_->toolCardGroups.take(partId);
                     if (existing && group) group->removeCard(existing);
                     if (group && group->cardCount() == 0) {
-                        runtime_->toolGroups.remove(messageId);
-                        runtime_->view->removeItem(QStringLiteral("tool-group-") + messageId);
+                        runtime_->toolGroups.remove(group->id());
+                        runtime_->view->removeItem(QStringLiteral("tool-group-") + group->id());
                     } else if (group) {
                         group->setSummary(message, runtime_->toolCards);
                     }
@@ -2502,7 +2534,7 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
                 }
             }
 
-            ToolCard* card = toolCardFor(partId, messageId);
+            ToolCard* card = toolCardFor(partId, message);
             card->setCall(fromUtf8(tool->tool), fromUtf8(tool->input));
             // 还在等人点头的话，卡片保持授权态——那个状态由 permissionAsked 打开，
             // 这里不要把它关掉。
@@ -2518,7 +2550,7 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
             } else if (tool->state == MaiToolState::Error || tool->state == MaiToolState::Canceled) {
                 card->setDetail(fromUtf8(tool->error));
             }
-            runtime_->toolGroups.value(messageId)->setSummary(message, runtime_->toolCards);
+            runtime_->toolCardGroups.value(partId)->setSummary(message, runtime_->toolCards);
             scrollToBottom();
             return;
         }
@@ -2894,8 +2926,12 @@ void AgentChatPanel::showApproval(const QString& permissionId) {
         if (fromUtf8(pending.id) != permissionId) continue;
         const QString owner = fromUtf8(pending.sessionId);
         if (owner != runtime_->sessionId && !runtime_->controller->isChildOf(owner, runtime_->sessionId)) return;
-        const QString messageId = fromUtf8(pending.messageId);
-        ToolCard* card = toolCardFor(fromUtf8(pending.partId), messageId);
+        const auto messages = runtime_->controller->agent().listMessages(pending.sessionId);
+        const auto message = std::find_if(messages.begin(), messages.end(), [&](const MaiMessage& value) {
+            return value.id == pending.messageId;
+        });
+        if (message == messages.end()) return;
+        ToolCard* card = toolCardFor(fromUtf8(pending.partId), *message);
         card->setCall(fromUtf8(pending.toolName), fromUtf8(pending.arguments));
         const int fileCount = !pending.approvalKeys.empty() && pending.approvalKeys.front().rfind("file:", 0) == 0
                                   ? static_cast<int>(pending.approvalKeys.size())
@@ -2903,13 +2939,8 @@ void AgentChatPanel::showApproval(const QString& permissionId) {
         card->setApprovalBehavior(pending.allowForSession, pending.rememberOnApproval, fileCount);
         card->setDetail(QString());
         card->apply(MaiToolState::Pending, true);
-        ToolGroupCard* group = runtime_->toolGroups.value(messageId);
-        for (const MaiMessage& message : runtime_->controller->agent().listMessages(pending.sessionId)) {
-            if (fromUtf8(message.id) == messageId) {
-                group->setSummary(message, runtime_->toolCards);
-                break;
-            }
-        }
+        ToolGroupCard* group = runtime_->toolCardGroups.value(fromUtf8(pending.partId));
+        group->setSummary(*message, runtime_->toolCards);
         group->showApproval();
         scrollToBottom();
         return;
