@@ -51,6 +51,11 @@ public:
     // 当前宽度下的内容高度。宿主拿它去 setFixedHeight。
     int contentHeight() const;
 
+    // Natural rendered width capped to a host's available content width,
+    // including trailing notes. Reuses measurement caches without changing the
+    // current painted width, selection or the default sizeHint contract.
+    int naturalWidthForWidth(int maximumWidth) const;
+
     bool hasHeightForWidth() const override;
     int heightForWidth(int width) const override;
     QSize sizeHint() const override;
@@ -76,6 +81,7 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void wheelEvent(QWheelEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
 
 private:

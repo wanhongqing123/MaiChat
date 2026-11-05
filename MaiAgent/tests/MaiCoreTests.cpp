@@ -3,6 +3,7 @@
 // test_media_only_prompt_has_no_placeholder_text、test_mixed_media_prompt_is_one_message。
 // 检查可观察结果而非实现细节。
 #include <cassert>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -22,6 +23,7 @@
 #include "MaiFakeModelClient.h"
 #include "MaiFileSystem.h"
 #include "MaiSessionTools.h"
+#include "MaiQuestionTool.h"
 
 static int failures = 0;
 #define CHECK(cond)                                                     \
@@ -467,7 +469,277 @@ static void test_unsubscribe() {
     CHECK(agent.eventBus().subscriberCount() == 0);
 }
 
+static void test_exact_message_query_uses_the_requested_session() {
+    auto store = makeMaiMemoryStore();
+    MaiSession owner;
+    owner.id = "ses_query_owner";
+    MaiSession other;
+    other.id = "ses_query_other";
+    store->putSession(owner);
+    store->putSession(other);
+    MaiMessage saved;
+    saved.id = "msg_exact_query";
+    saved.role = MaiRole::Assistant;
+    MaiMessagePart part;
+    part.id = "prt_exact_query";
+    part.body = MaiTextPart{"stored snapshot"};
+    saved.parts.push_back(part);
+    store->putMessage(owner.id, saved);
+    MaiAgent agent(std::move(store), nullptr, nullptr);
+    MaiMessage loaded;
+    CHECK(agent.getMessage(owner.id, saved.id, loaded));
+    CHECK(loaded.id == saved.id);
+    CHECK(loaded.text() == "stored snapshot");
+    CHECK(!agent.getMessage(other.id, saved.id, loaded));
+    CHECK(loaded.id == saved.id);
+    CHECK(loaded.text() == "stored snapshot");
+}
+
+// 每个模型调用停在独立门控上，精确留出 Stop 与下一轮启动之间的窗口。
+// 只等待内存标记；没有模型供应商、网络、文件写入或真实授权动作。
+struct MaiInterruptTestGate {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> released{false};
+    std::atomic<bool> canceled{false};
+};
+
+class MaiInterruptTestModel final : public MaiModelClient {
+public:
+    explicit MaiInterruptTestModel(std::vector<std::shared_ptr<MaiInterruptTestGate>> gates)
+        : mGates(std::move(gates)) {}
+
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
+                    const std::atomic<bool>& cancel) override {
+        const std::size_t index = mNext.fetch_add(1);
+        if (index >= mGates.size()) return {MaiErrorCode::Internal, "Unexpected fixture request"};
+        const auto& gate = mGates[index];
+        gate->entered.store(true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!gate->released.load() && !cancel.load()) {
+            if (std::chrono::steady_clock::now() >= deadline)
+                return {MaiErrorCode::Internal, "Fixture gate timed out"};
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (cancel.load()) {
+            gate->canceled.store(true);
+            return {MaiErrorCode::Canceled, "Fixture canceled"};
+        }
+        if (sink.onText) sink.onText("Fixture completed");
+        return {};
+    }
+
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
+
+private:
+    std::vector<std::shared_ptr<MaiInterruptTestGate>> mGates;
+    std::atomic<std::size_t> mNext{0};
+};
+
+// 失败也须退出测试：门控自身有上限，调用者在断言后仍释放门控并走原有 Stop 清理。
+template <typename Predicate>
+static bool wait_for_interrupt_test(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+static void test_interrupt_turn_rejects_wrong_target_and_cancels_the_matching_stream() {
+    auto gate = std::make_shared<MaiInterruptTestGate>();
+    MaiAgent agent(makeMaiMemoryStore(),
+                   std::make_unique<MaiInterruptTestModel>(
+                       std::vector<std::shared_ptr<MaiInterruptTestGate>>{gate}),
+                   nullptr);
+    const std::string session =
+        agent.submit(MaiCreateSession{"", "Stop fixture", "fixture"}).value();
+    CHECK(agent.submit(MaiSendPrompt{session, "Hold the first turn"}));
+    CHECK(wait_for_interrupt_test([&] { return gate->entered.load(); }));
+    const std::string turn = agent.activeTurnId(session);
+    CHECK(!turn.empty());
+    const auto wrong = agent.interruptTurn(session, "msg_wrong_turn");
+    CHECK(!wrong);
+    CHECK(wrong.error().code() == MaiErrorCode::NotFound);
+    CHECK(agent.activeTurnId(session) == turn);
+    CHECK(agent.isBusy(session));
+    // 错轮不能暗中设置取消标记；同轮补充仍应被正常受理。
+    CHECK(agent.submit(MaiSteerPrompt{session, turn, "fixture_after_wrong_stop", "Still running"}));
+    const auto stopped = agent.interruptTurn(session, turn);
+    CHECK(stopped);
+    CHECK(wait_for_interrupt_test([&] { return !agent.isBusy(session); }));
+    CHECK(gate->canceled.load());
+    gate->released.store(true);
+    agent.submit(MaiInterrupt{session});
+    agent.waitIdle();
+    CHECK(agent.activeTurnId(session).empty());
+}
+
+static void test_interrupt_of_completed_turn_does_not_stop_its_successor() {
+    auto first = std::make_shared<MaiInterruptTestGate>();
+    auto second = std::make_shared<MaiInterruptTestGate>();
+    MaiAgent agent(makeMaiMemoryStore(),
+                   std::make_unique<MaiInterruptTestModel>(
+                       std::vector<std::shared_ptr<MaiInterruptTestGate>>{first, second}),
+                   nullptr);
+    const std::string session =
+        agent.submit(MaiCreateSession{"", "Successor fixture", "fixture"}).value();
+    CHECK(agent.submit(MaiSendPrompt{session, "First turn completes normally"}));
+    CHECK(wait_for_interrupt_test([&] { return first->entered.load(); }));
+    const std::string oldTurn = agent.activeTurnId(session);
+    CHECK(!oldTurn.empty());
+    first->released.store(true);
+    agent.waitIdle();
+    CHECK(!first->canceled.load());
+    CHECK(agent.submit(MaiSendPrompt{session, "Keep the successor running"}));
+    CHECK(wait_for_interrupt_test([&] { return second->entered.load(); }));
+    const std::string newTurn = agent.activeTurnId(session);
+    CHECK(!newTurn.empty());
+    CHECK(oldTurn != newTurn);
+    const auto stale = agent.interruptTurn(session, oldTurn);
+    CHECK(!stale);
+    CHECK(stale.error().code() == MaiErrorCode::NotFound);
+    CHECK(agent.activeTurnId(session) == newTurn);
+    CHECK(
+        agent.submit(MaiSteerPrompt{session, newTurn, "fixture_successor_alive", "Continue here"}));
+    CHECK(!second->canceled.load());
+    CHECK(agent.interruptTurn(session, newTurn));
+    CHECK(wait_for_interrupt_test([&] { return !agent.isBusy(session); }));
+    CHECK(second->canceled.load());
+    second->released.store(true);
+    agent.submit(MaiInterrupt{session});
+    agent.waitIdle();
+}
+
+class MaiInterruptTestApprovalTool final : public MaiTool {
+public:
+    explicit MaiInterruptTestApprovalTool(std::shared_ptr<std::atomic<int>> executions)
+        : mExecutions(std::move(executions)) {}
+    std::string name() const override {
+        return "fixture_approval";
+    }
+    std::string description() const override {
+        return "A memory-only approval fixture";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object"})";
+    }
+    bool requiresApproval(const std::string&) const override {
+        return true;
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext&) override {
+        mExecutions->fetch_add(1);
+        return MaiToolResult::success("Fixture executed");
+    }
+
+private:
+    std::shared_ptr<std::atomic<int>> mExecutions;
+};
+
+static void test_interrupt_turn_preserves_wrong_permission_and_wakes_matching_permission() {
+    auto executions = std::make_shared<std::atomic<int>>(0);
+    MaiFakeModelClient::Turn invocation;
+    invocation.invocations.push_back({"call_approval_fixture", "fixture_approval", "{}"});
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(std::make_unique<MaiInterruptTestApprovalTool>(executions));
+    MaiAgent agent(
+        makeMaiMemoryStore(),
+        std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{invocation}),
+        std::move(tools));
+    const std::string workspace = MaiFileSystem::resolve(MaiFilePath::fromUtf8(".")).toUtf8();
+    CHECK(!workspace.empty());
+    const std::string session =
+        agent.submit(MaiCreateSession{workspace, "Permission fixture", "fixture"}).value();
+    CHECK(agent.submit(MaiSendPrompt{session, "Request fixture approval"}));
+    CHECK(wait_for_interrupt_test([&] { return !agent.listPendingPermissions().empty(); }));
+    const auto pending = agent.listPendingPermissions();
+    const std::string turn = agent.activeTurnId(session);
+    CHECK(!turn.empty());
+    CHECK(pending.size() == 1);
+    const auto wrong = agent.interruptTurn(session, "msg_wrong_permission_turn");
+    CHECK(!wrong);
+    CHECK(wrong.error().code() == MaiErrorCode::NotFound);
+    const auto stillPending = agent.listPendingPermissions();
+    CHECK(stillPending.size() == 1);
+    if (!pending.empty() && !stillPending.empty()) {
+        CHECK(stillPending.front().id == pending.front().id);
+        CHECK(stillPending.front().sessionId == session);
+    }
+    CHECK(agent.submit(MaiSteerPrompt{session, turn, "fixture_permission_alive", "Keep waiting"}));
+    CHECK(executions->load() == 0);
+    CHECK(agent.interruptTurn(session, turn));
+    CHECK(wait_for_interrupt_test([&] { return !agent.isBusy(session); }));
+    CHECK(agent.listPendingPermissions().empty());
+    CHECK(executions->load() == 0);
+    agent.submit(MaiInterrupt{session});
+    agent.waitIdle();
+}
+
+static void test_interrupt_turn_preserves_wrong_question_and_wakes_matching_question() {
+    MaiFakeModelClient::Turn invocation;
+    invocation.invocations.push_back(
+        {"call_question_fixture", "question",
+         R"({"question":"Choose a fixture option","options":["one","two"]})"});
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(makeMaiQuestionTool());
+    MaiAgent agent(
+        makeMaiMemoryStore(),
+        std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{invocation}),
+        std::move(tools));
+    const std::string workspace = MaiFileSystem::resolve(MaiFilePath::fromUtf8(".")).toUtf8();
+    CHECK(!workspace.empty());
+    const std::string session =
+        agent.submit(MaiCreateSession{workspace, "Question fixture", "fixture"}).value();
+    CHECK(agent.submit(MaiSendPrompt{session, "Ask the fixture question"}));
+    CHECK(wait_for_interrupt_test([&] { return !agent.listPendingQuestions().empty(); }));
+    const auto pending = agent.listPendingQuestions();
+    const std::string turn = agent.activeTurnId(session);
+    CHECK(!turn.empty());
+    CHECK(pending.size() == 1);
+    const auto wrong = agent.interruptTurn(session, "msg_wrong_question_turn");
+    CHECK(!wrong);
+    CHECK(wrong.error().code() == MaiErrorCode::NotFound);
+    const auto stillPending = agent.listPendingQuestions();
+    CHECK(stillPending.size() == 1);
+    if (!pending.empty() && !stillPending.empty()) {
+        CHECK(stillPending.front().id == pending.front().id);
+        CHECK(stillPending.front().question == "Choose a fixture option");
+    }
+    CHECK(agent.submit(MaiSteerPrompt{session, turn, "fixture_question_alive", "Keep waiting"}));
+    CHECK(agent.interruptTurn(session, turn));
+    CHECK(wait_for_interrupt_test([&] { return !agent.isBusy(session); }));
+    CHECK(agent.listPendingQuestions().empty());
+    agent.submit(MaiInterrupt{session});
+    agent.waitIdle();
+}
+
+static void test_interrupt_turn_empty_target_keeps_legacy_session_stop() {
+    auto gate = std::make_shared<MaiInterruptTestGate>();
+    MaiAgent agent(makeMaiMemoryStore(),
+                   std::make_unique<MaiInterruptTestModel>(
+                       std::vector<std::shared_ptr<MaiInterruptTestGate>>{gate}),
+                   nullptr);
+    const std::string session =
+        agent.submit(MaiCreateSession{"", "Legacy Stop fixture", "fixture"}).value();
+    CHECK(agent.submit(MaiSendPrompt{session, "Use legacy stop"}));
+    CHECK(wait_for_interrupt_test([&] { return gate->entered.load(); }));
+    CHECK(agent.interruptTurn(session, ""));
+    CHECK(wait_for_interrupt_test([&] { return !agent.isBusy(session); }));
+    CHECK(gate->canceled.load());
+    gate->released.store(true);
+    agent.submit(MaiInterrupt{session});
+    agent.waitIdle();
+}
+
 int main() {
+    test_interrupt_turn_rejects_wrong_target_and_cancels_the_matching_stream();
+    test_interrupt_of_completed_turn_does_not_stop_its_successor();
+    test_interrupt_turn_preserves_wrong_permission_and_wakes_matching_permission();
+    test_interrupt_turn_preserves_wrong_question_and_wakes_matching_question();
+    test_interrupt_turn_empty_target_keeps_legacy_session_stop();
+    test_exact_message_query_uses_the_requested_session();
     test_id_prefix_and_monotonic();
     test_session_crud_and_events();
     test_model_session_tools_use_the_existing_session_operations();

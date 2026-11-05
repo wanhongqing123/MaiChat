@@ -108,6 +108,8 @@ private:
     // 把整个对话从存储里重画一遍。用在打开会话和清空之后——
     // 流式期间**不要**调它，那会把正在长的正文整个换掉，界面会闪。
     void reloadFromStore();
+    void loadEarlierMessages();
+    bool appendStoredMessage(const MaiMessage& message, const MaiSession& session);
     void appendStoredUserMessage(const MaiMessage& message, const MaiSession& session);
 
     // 这条事件是不是当前这个会话的。
@@ -140,12 +142,13 @@ private:
     void refreshComposerMediaTray();
     void removeComposerMedia(const QString& resourceName);
     void updateComposerPlaceholder();
-    void appendUserImages(const QStringList& paths);
-    void appendUserVideos(const QStringList& paths);
+    void appendUserImages(const QString& messageId, const QStringList& paths);
+    void appendUserVideos(const QString& messageId, const QStringList& paths);
 
     // 流式期间往某条回答后面追加。攒一小会儿再刷进视图，
     // 每个 delta 都重排是 O(n^2)。
-    void appendAnswerDelta(const QString& partId, const QString& delta);
+    void appendAnswerDelta(const QString& messageId, const QString& partId, const QString& delta);
+    void recordMessageItem(const QString& messageId, const QString& itemId);
     void flushAnswers();
 
     // 流式期间按 partId 找（或建）对应的部件，只追加不重画。
@@ -156,9 +159,9 @@ private:
     ToolCard* toolCardFor(const QString& partId, const MaiMessage& message);
     ToolGroupCard* toolGroupFor(const QString& partId, const MaiMessage& message);
     void refreshToolCard(const QString& messageId, const QString& partId);
-    void appendPdfPreview(const QString& partId, const QString& output,
+    void appendPdfPreview(const QString& messageId, const QString& partId, const QString& output,
                           const QString& workspace);
-    bool appendAgentMediaCard(const QString& partId, const QString& output,
+    bool appendAgentMediaCard(const QString& messageId, const QString& partId, const QString& output,
                               const QString& workspace);
     void appendTextMediaCards(const QString& messageId, const QString& text,
                               const QString& workspace);

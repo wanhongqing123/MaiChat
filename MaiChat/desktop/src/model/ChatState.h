@@ -90,6 +90,9 @@ public:
     // 据此去重）。新 id 已存在（漫游先到）时删除旧临时消息，返回 false。
     bool adoptMessageId(const QString& oldId, const QString& newId);
     void appendMessageForRestore(const RemoteIMMessage& message);
+    // Database pages have a stable (time, id) order even when a preview arrived
+    // first. Live messages retain arrival order after restored ties.
+    void appendDatabaseHistoryPage(const QList<RemoteIMMessage>& messages);
     // 实时推送入口（liveMessagesReceived 通道）：复用恢复通道的 id 去重/时间校正，
     // 区别是真正的新入站消息会计未读红点。返回是否为新消息。
     bool appendLiveMessage(const RemoteIMMessage& message);
@@ -100,6 +103,7 @@ private:
     void appendTracked(const RemoteIMMessage& message);
     QString peerIdForMessage(const RemoteIMMessage& message) const;
     void insertMessageIntoConversation(const QString& messageId);
+    bool messageComesBefore(const QString& leftId, const QString& rightId) const;
     void rebuildMessageIndexes();
     // 实时收到 peer 的消息时计未读：会话未处于选中态才 +1（选中即视为已读）。
     void bumpUnreadIfBackground(const QString& peerId);
@@ -113,6 +117,7 @@ private:
     QStringList contactGroups_;
     QList<RemoteIMMessage> messages_;
     QSet<QString> messageIds_;
+    QSet<QString> databaseHistoryMessageIds_;
     // 全局消息仅保存一份；会话索引保存按时间排好的 id，切换好友时无需扫描、复制并排序全部消息。
     QHash<QString, QList<QString>> messageIdsByPeer_;
     QHash<QString, int> messageIndexById_;

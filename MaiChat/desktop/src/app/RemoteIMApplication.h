@@ -241,6 +241,12 @@ private:
     ChatState state_;
     RemoteIMContact selfProfile_;
     QHash<QString, bool> hasEarlierMessages_;
+    // Preview-only conversations are hydrated once when opened; switching reuses the page.
+    QSet<QString> recentHistoryLoadedPeers_;
+    // Only contiguous database pages advance this cursor. Roaming can add older
+    // isolated records without making the intervening local history unreachable.
+    QHash<QString, QPair<qint64, QString>> historyPageCursors_;
+    bool loadRecentPeerHistory(const QString& peerId);
     QList<RemoteIMGroup> groups_;
     QHash<QString, QList<RemoteIMGroupMessage>> groupMessages_;
     QHash<QString, RemoteIMGroupMessage> pendingGroupPreviews_;

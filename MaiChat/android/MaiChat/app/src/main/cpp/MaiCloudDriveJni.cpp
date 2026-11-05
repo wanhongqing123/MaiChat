@@ -278,39 +278,47 @@ Java_com_kongshang_maichat_MaiSessionAttachments_nativeMediaInfo(
     return value;
 }
 
-extern "C" JNIEXPORT jobject JNICALL
-Java_com_kongshang_maichat_MaiSessionAttachments_nativeUploadFile(
-    JNIEnv* env, jclass, jstring base, jstring token, jbyteArray pem,
-    jstring source, jstring checkpoint, jstring name, jstring type,
-    jstring slot, jstring login, jstring session) {
+extern "C" JNIEXPORT jobject JNICALL Java_com_kongshang_maichat_MaiSessionAttachments_nativeUploadFile(
+    JNIEnv* env, jclass, jstring base, jstring token, jbyteArray pem, jstring source, jstring checkpoint, jstring name,
+    jstring type, jstring slot, jstring login, jstring session, jlong handle) {
     MaiCloudDriveResult result{};
     result.status = MAI_CLOUD_DRIVE_INVALID_ARGUMENT;
     Call call;
-    if (!readCall(env, base, token, pem, nullptr, &call) ||
-        !readSessionRoom(env, slot, login, session, &call) ||
-        !readString(env, source, &call.path) ||
-        !readString(env, checkpoint, &call.checkpoint) ||
-        !readString(env, name, &call.name) ||
-        !readString(env, type, &call.type)) return complete(env, &call, &result);
-    MaiCloudDriveCancel* cancel = mai_cloud_drive_cancel_create();
+    if (!readCall(env, base, token, pem, nullptr, &call) || !readSessionRoom(env, slot, login, session, &call) ||
+        !readString(env, source, &call.path) || !readString(env, checkpoint, &call.checkpoint) ||
+        !readString(env, name, &call.name) || !readString(env, type, &call.type))
+        return complete(env, &call, &result);
+    // Java Scope 保持句柄到本次调用返回；取消不占用 Agent 控制线程，不能在这里提前释放。
+    auto* cancel = reinterpret_cast<MaiCloudDriveCancel*>(handle);
     if (cancel) {
-        mai_cloud_drive_upload_resumable(&call.options, call.path.c_str(),
-            call.checkpoint.c_str(), call.name.c_str(), call.type.c_str(),
-            cancel, nullptr, nullptr, &result);
-        mai_cloud_drive_cancel_destroy(cancel);
+        mai_cloud_drive_upload_resumable(&call.options, call.path.c_str(), call.checkpoint.c_str(), call.name.c_str(),
+                                         call.type.c_str(), cancel, nullptr, nullptr, &result);
     }
     return complete(env, &call, &result);
 }
 
-extern "C" JNIEXPORT jobject JNICALL
-Java_com_kongshang_maichat_MaiSessionAttachments_nativeReadLink(
-    JNIEnv* env, jclass, jstring base, jstring token, jbyteArray pem,
-    jstring attachmentId, jstring slot, jstring login, jstring session) {
+extern "C" JNIEXPORT jlong JNICALL Java_com_kongshang_maichat_MaiSessionAttachments_nativeCreateCancel(JNIEnv*,
+                                                                                                       jclass) {
+    return reinterpret_cast<jlong>(mai_cloud_drive_cancel_create());
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_kongshang_maichat_MaiSessionAttachments_nativeRequestCancel(JNIEnv*, jclass,
+                                                                                                       jlong handle) {
+    mai_cloud_drive_cancel_request(reinterpret_cast<MaiCloudDriveCancel*>(handle));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_kongshang_maichat_MaiSessionAttachments_nativeDestroyCancel(JNIEnv*, jclass,
+                                                                                                       jlong handle) {
+    mai_cloud_drive_cancel_destroy(reinterpret_cast<MaiCloudDriveCancel*>(handle));
+}
+
+extern "C" JNIEXPORT jobject JNICALL Java_com_kongshang_maichat_MaiSessionAttachments_nativeReadLink(
+    JNIEnv* env, jclass, jstring base, jstring token, jbyteArray pem, jstring attachmentId, jstring slot, jstring login,
+    jstring session) {
     MaiCloudDriveResult result{};
     result.status = MAI_CLOUD_DRIVE_INVALID_ARGUMENT;
     Call call;
-    if (!readCall(env, base, token, pem, nullptr, &call) ||
-        !readSessionRoom(env, slot, login, session, &call) ||
+    if (!readCall(env, base, token, pem, nullptr, &call) || !readSessionRoom(env, slot, login, session, &call) ||
         !readString(env, attachmentId, &call.payload) ||
         call.payload.find_first_not_of("0123456789abcdef-") != std::string::npos)
         return complete(env, &call, &result);

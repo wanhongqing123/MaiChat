@@ -57,4 +57,34 @@ public class SessionSyncPayloadAssemblerTest {
         assertNotEquals(AndroidSessionSyncCoordinator.fingerprint(remote, first),
             AndroidSessionSyncCoordinator.fingerprint(remote, different));
     }
+
+    // 同一段补充文字可以属于不同轮次或不同点击；跨设备重试只能复用同一次操作的编号。
+    @Test public void steeringFingerprintKeepsTheTurnAndRequestIdentity() throws Exception {
+        JSONObject remote = new JSONObject().put("device_slot", "mac")
+            .put("login_session_id", "owner-login").put("id", "ses_remote");
+        JSONObject first = new JSONObject().put("action", "steer").put("text", "continue")
+            .put("turnId", "turn-one").put("requestId", "request-one");
+        JSONObject nextTurn = new JSONObject(first.toString()).put("turnId", "turn-two");
+        JSONObject nextClick = new JSONObject(first.toString()).put("requestId", "request-two");
+        assertNotEquals("Another turn must never reuse an old steering envelope",
+            AndroidSessionSyncCoordinator.fingerprint(remote, first),
+            AndroidSessionSyncCoordinator.fingerprint(remote, nextTurn));
+        assertNotEquals("Two intentional equal-text submissions are distinct operations",
+            AndroidSessionSyncCoordinator.fingerprint(remote, first),
+            AndroidSessionSyncCoordinator.fingerprint(remote, nextClick));
+        assertEquals(AndroidSessionSyncCoordinator.fingerprint(remote, first),
+            AndroidSessionSyncCoordinator.fingerprint(remote, new JSONObject(first.toString())));
+    }
+
+    @Test public void commandFingerprintKeepsTheQuotedMessageIdentity() throws Exception {
+        JSONObject remote = new JSONObject().put("device_slot", "mac")
+            .put("login_session_id", "owner-login").put("id", "ses_remote");
+        JSONObject first = new JSONObject().put("action", "steer").put("text", "explain this")
+            .put("turnId", "turn-one").put("requestId", "request-one")
+            .put("quoteMessageId", "message-one");
+        JSONObject different = new JSONObject(first.toString()).put("quoteMessageId", "message-two");
+        assertNotEquals("A changed quote changes the accepted operation payload",
+            AndroidSessionSyncCoordinator.fingerprint(remote, first),
+            AndroidSessionSyncCoordinator.fingerprint(remote, different));
+    }
 }

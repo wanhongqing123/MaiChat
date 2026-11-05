@@ -129,7 +129,7 @@ protected:
 
 private:
     void updateWindowChromeBackground(bool active);
-    // Windows caption shares the active page's title row; the page keeps its own lifetime.
+    // Windows 窗口控制固定在独立顶部标题栏，与业务页标题及滚动区域分开。
     void updateWindowCaptionControls();
     void toggleWindowMaximized();
     void wireRemoteAgentPanel();

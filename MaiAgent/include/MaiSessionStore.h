@@ -71,6 +71,13 @@ public:
     // 让存储层在锁内做读-改-写，调用方就碰不到这个窗口。返回 false 表示会话不存在。
     virtual bool mutateSession(const std::string& id,
                                const std::function<void(MaiSession&)>& mutator) = 0;
+
+    // 精确读取指定会话中的一条消息及其已落库片段；不使用游标或 ID 前缀推算。
+    // 消息/会话不存在、归属不符或查询失败时返回 false，out 保持原值。
+    // 与写入共用后端锁，允许活动轮次期间并发读取；返回快照归调用方持有。
+    // 标准 SQLite 后端仅查询该消息，不加载同会话的其他消息/工具载荷。
+    virtual bool getMessage(const std::string& sessionId, const std::string& messageId,
+                            MaiMessage& out) const = 0;
 };
 
 // 两个实现的工厂在各自的头里：MaiMemoryStore.h / MaiSqliteStore.h。

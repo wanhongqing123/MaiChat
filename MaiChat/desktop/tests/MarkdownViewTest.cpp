@@ -1,11 +1,17 @@
 // 文件作用：验证桌面端Markdown 选择、链接、滚动定位和内容更新。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QLabel>
+#include <QClipboard>
+#include <QLineEdit>
+#include <QPointer>
 #include <QScrollBar>
 #include <QSignalSpy>
+#include <QWindow>
 #include <QtTest>
+#include <QtMath>
 
 #include "markdown/MarkdownView.h"
+#include "markdown/MarkdownLayout.h"
 
 // 消息展示区的测试。
 //
@@ -36,6 +42,12 @@ private slots:
     void readingColumnStaysCenteredAndCapped();
     void embeddedWidgetGrowingPushesTheRestDown();
     void batchedHistoryMatchesImmediateLayout();
+    void movingExistingItemsPreservesWidgetsSelectionAndScroll();
+    void movingItemsSupportsBatchingAndRejectsMissingIds();
+    void draggingSecondTableCellCopiesVisibleText();
+    void scrollingCodeKeepsSelectionAndCopiesVisibleTail();
+    void streamingEarlierItemsKeepsLaterSelection_data();
+    void streamingEarlierItemsKeepsLaterSelection();
 
 private:
     void prepare(MarkdownView& view);
@@ -72,6 +84,235 @@ void MarkdownViewTest::selectsAcrossMessages() {
 
     view.clearSelection();
     QVERIFY(view.selectedText().isEmpty());
+}
+
+void MarkdownViewTest::streamingEarlierItemsKeepsLaterSelection_data() {
+    QTest::addColumn<bool>("upsert");
+    QTest::addColumn<bool>("batched");
+    QTest::newRow("update") << false << false;
+    QTest::newRow("upsert-existing") << true << false;
+    QTest::newRow("batched-update") << false << true;
+    QTest::newRow("batched-upsert-existing") << true << true;
+}
+
+void MarkdownViewTest::streamingEarlierItemsKeepsLaterSelection() {
+    QFETCH(bool, upsert);
+    QFETCH(bool, batched);
+    MarkdownView view;
+    prepare(view);
+    const QString firstId = QStringLiteral("streaming-assistant");
+    const QString selectedId = QStringLiteral("submitted-user");
+    const QString original = QStringLiteral("Earlier assistant");
+    const QString later = QStringLiteral("Later selected text");
+    view.addItem(firstId, MarkdownView::Style::Document, original);
+    view.addItem(selectedId, MarkdownView::Style::Document, later);
+    auto* editor = new QLineEdit(QStringLiteral("Retained widget draft"));
+    editor->setFixedHeight(30);
+    view.addWidget(QStringLiteral("quote-footer"), editor);
+    QPointer<QLineEdit> retained = editor;
+    QSignalSpy destroyed(editor, &QObject::destroyed);
+
+    MarkdownLayout reference;
+    reference.layout(MarkdownDocument::parse(later), testTheme(), view.itemRect(selectedId).width());
+    const QString expected = QStringLiteral("selected");
+    const int start = reference.selectableText().indexOf(expected);
+    QVERIFY(start >= 0);
+    const auto pointerForPosition = [&](int position) {
+        for (int y = 0; y <= qCeil(reference.height()); ++y)
+            for (int x = 0; x <= qCeil(reference.width()); ++x)
+                if (reference.positionAt(QPointF(x, y)) == position) return QPoint(x, y);
+        return QPoint(-1, -1);
+    };
+    const QPoint first = pointerForPosition(start), last = pointerForPosition(start + expected.size());
+    QVERIFY(first.x() >= 0 && last.x() >= 0);
+    auto* window = view.windowHandle();
+    QVERIFY(window);
+    const auto windowPoint = [&](QPoint local) {
+        const QPoint viewportPoint = (QPointF(local) + view.itemRect(selectedId).topLeft()
+            - QPointF(0, view.verticalScrollBar()->value())).toPoint();
+        return window->mapFromGlobal(view.viewport()->mapToGlobal(viewportPoint));
+    };
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, windowPoint(first));
+    QTest::mouseMove(window, windowPoint(last));
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, windowPoint(last));
+    QCOMPARE(view.selectedText(), expected);
+
+    // Busy input can already be below a still-streaming assistant. Growing an
+    // earlier item changes the later item's global textStart, not its selection.
+    const auto append = [&](const QString& source) {
+        if (upsert) view.addItem(firstId, MarkdownView::Style::Document, source);
+        else view.updateItem(firstId, source);
+    };
+    if (batched) view.beginBatchUpdates();
+    append(original + QStringLiteral(" appended context").repeated(12));
+    if (batched) {
+        append(original + QStringLiteral(" appended context").repeated(16));
+        view.endBatchUpdates();
+    }
+    QCOMPARE(view.selectedText(), expected);
+    QTest::keySequence(&view, QKeySequence(QKeySequence::Copy));
+    QCOMPARE(QApplication::clipboard()->text(), expected);
+    QVERIFY(retained && retained == editor);
+    QCOMPARE(destroyed.count(), 0);
+    QCOMPARE(editor->text(), QStringLiteral("Retained widget draft"));
+    QCOMPARE(editor->parentWidget(), view.viewport());
+}
+
+void MarkdownViewTest::scrollingCodeKeepsSelectionAndCopiesVisibleTail() {
+    MarkdownView view;
+    prepare(view);
+    const QString source = QStringLiteral("Body before\n\n```text\nHEAD_")
+        + QStringLiteral("0123456789").repeated(16) + QStringLiteral("_TAIL_MARKER\n```\n\nBody after");
+    view.addItem(QStringLiteral("code"), MarkdownView::Style::Document, source);
+    MarkdownLayout reference;
+    reference.layout(MarkdownDocument::parse(source), testTheme(), view.itemRect(QStringLiteral("code")).width());
+    QCOMPARE(reference.codeBlocks().size(), 1);
+    const auto code = reference.codeBlocks().first();
+    QVERIFY(code.maximumOffset() > 0);
+    const auto viewportPoint = [&](QPointF local) {
+        return (local + view.itemRect(QStringLiteral("code")).topLeft()
+            - QPointF(0, view.verticalScrollBar()->value())).toPoint();
+    };
+    auto* window = view.windowHandle();
+    QVERIFY(window);
+    const auto windowPoint = [&](QPointF local) {
+        return window->mapFromGlobal(view.viewport()->mapToGlobal(viewportPoint(local)));
+    };
+    view.selectAll();
+    const QString all = view.selectedText();
+    const QPointF track(qFloor(code.scrollTrack().right()), code.scrollTrack().center().y());
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, windowPoint(track));
+    QCOMPARE(view.selectedText(), all);
+    const QHash<int, qreal> offsets{{0, code.maximumOffset()}};
+    const int start = reference.selectableText().indexOf(QStringLiteral("TAIL_MARKER"));
+    const auto pointFor = [&](int position) {
+        for (int y = qCeil(code.viewport.top()); y <= qFloor(code.viewport.bottom()); ++y)
+            for (int x = qCeil(code.viewport.left()); x <= qFloor(code.viewport.right()); ++x)
+                if (reference.positionAt(QPointF(x, y), offsets) == position) return QPoint(x, y);
+        return QPoint(-1, -1);
+    };
+    const QPoint from = pointFor(start), to = pointFor(start + 11);
+    QVERIFY(from.x() >= 0 && to.x() >= 0);
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, windowPoint(from));
+    QTest::mouseMove(window, windowPoint(to));
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, windowPoint(to));
+    QCOMPARE(view.selectedText(), QStringLiteral("TAIL_MARKER"));
+    QTest::keySequence(&view, QKeySequence(QKeySequence::Copy));
+    QCOMPARE(QApplication::clipboard()->text(), QStringLiteral("TAIL_MARKER"));
+    view.updateItem(QStringLiteral("code"), source + QStringLiteral("\n\nStreaming body"));
+    QCOMPARE(view.selectedText(), QStringLiteral("TAIL_MARKER"));
+    QVERIFY(view.horizontalScrollBar()->maximum() == 0); // Only code moves, never the message column.
+}
+
+void MarkdownViewTest::movingExistingItemsPreservesWidgetsSelectionAndScroll() {
+    MarkdownView view;
+    prepare(view);
+    view.addItem(QStringLiteral("start"), MarkdownView::Style::Document, QStringLiteral("Beginning"));
+    auto* editor = new QLineEdit(QStringLiteral("Unsent widget draft"));
+    editor->setFixedHeight(36);
+    view.addWidget(QStringLiteral("footer"), editor);
+    QPointer<QLineEdit> kept = editor;
+    QSignalSpy destroyed(editor, &QObject::destroyed);
+    for (int index = 0; index < 20; ++index)
+        view.addItem(QStringLiteral("body-%1").arg(index), MarkdownView::Style::Document,
+                     QStringLiteral("Body paragraph %1").arg(index));
+    editor->setSelection(7, 6);
+    view.selectAll();
+    const QString selected = view.selectedText();
+    view.verticalScrollBar()->setValue(view.verticalScrollBar()->maximum() / 2);
+    const int offset = view.verticalScrollBar()->value();
+    QVERIFY(!view.isAtBottom());
+
+    QVERIFY(view.moveItemAfter(QStringLiteral("footer"), QStringLiteral("body-19")));
+    QVERIFY(kept && kept == editor);
+    QCOMPARE(destroyed.count(), 0);
+    QCOMPARE(editor->parentWidget(), view.viewport());
+    QCOMPARE(editor->text(), QStringLiteral("Unsent widget draft"));
+    QCOMPARE(editor->selectedText(), QStringLiteral("widget"));
+    QCOMPARE(view.selectedText(), selected);
+    QCOMPARE(view.verticalScrollBar()->value(), offset);
+    QVERIFY(!view.isAtBottom());
+    QVERIFY(view.itemRect(QStringLiteral("footer")).top() > view.itemRect(QStringLiteral("body-19")).bottom());
+    QCOMPARE(view.itemCount(), 22);
+
+    view.scrollToBottom();
+    QVERIFY(view.moveItemAfter(QStringLiteral("footer"), QStringLiteral("body-18")));
+    QVERIFY(view.isAtBottom());
+    QVERIFY(view.itemRect(QStringLiteral("footer")).bottom() < view.itemRect(QStringLiteral("body-19")).top());
+}
+
+void MarkdownViewTest::movingItemsSupportsBatchingAndRejectsMissingIds() {
+    MarkdownView view;
+    prepare(view);
+    view.addItem(QStringLiteral("a"), MarkdownView::Style::Document, QStringLiteral("Alpha"));
+    view.addItem(QStringLiteral("b"), MarkdownView::Style::Document, QStringLiteral("Bravo"));
+    view.addItem(QStringLiteral("c"), MarkdownView::Style::Document, QStringLiteral("Charlie"));
+    const QRectF before = view.itemRect(QStringLiteral("b"));
+    QVERIFY(!view.moveItemAfter(QStringLiteral("missing"), QStringLiteral("a")));
+    QVERIFY(!view.moveItemAfter(QStringLiteral("b"), QStringLiteral("missing")));
+    QVERIFY(view.moveItemAfter(QStringLiteral("b"), QStringLiteral("b")));
+    QVERIFY(view.moveItemAfter(QStringLiteral("b"), QStringLiteral("a")));
+    QCOMPARE(view.itemRect(QStringLiteral("b")), before);
+
+    view.selectAll();
+    view.beginBatchUpdates();
+    QVERIFY(view.moveItemAfter(QStringLiteral("a"), QStringLiteral("c")));
+    QCOMPARE(view.itemRect(QStringLiteral("b")), before);
+    view.endBatchUpdates();
+    QVERIFY(view.itemRect(QStringLiteral("b")).top() < view.itemRect(QStringLiteral("c")).top());
+    QVERIFY(view.itemRect(QStringLiteral("c")).top() < view.itemRect(QStringLiteral("a")).top());
+    const QString selected = view.selectedText();
+    QVERIFY(selected.contains(QStringLiteral("Alpha")) && selected.contains(QStringLiteral("Bravo")) &&
+            selected.contains(QStringLiteral("Charlie")));
+    QVERIFY(selected.indexOf(QStringLiteral("Bravo")) < selected.indexOf(QStringLiteral("Charlie")));
+    QVERIFY(selected.indexOf(QStringLiteral("Charlie")) < selected.indexOf(QStringLiteral("Alpha")));
+}
+
+void MarkdownViewTest::draggingSecondTableCellCopiesVisibleText() {
+    MarkdownView view;
+    prepare(view);
+    view.resize(1220, 260);
+    QVERIFY(QTest::qWaitForWindowExposed(&view));
+    const QString markdown = QStringLiteral(
+        "| 尝试 | 结果 |\n| --- | --- |\n"
+        "| PowerShell + `System.Drawing` | 失败：PowerShell处于受限语言模式，`Add-Type`被拒绝 |\n");
+    const QString expected = QStringLiteral("失败：PowerShell处于受限语言模式，Add-Type被拒绝");
+    view.addItem(QStringLiteral("table"), MarkdownView::Style::Document, markdown);
+    const QRectF frame = view.itemRect(QStringLiteral("table"));
+    MarkdownLayout reference;
+    reference.layout(MarkdownDocument::parse(markdown), testTheme(), frame.width());
+    const int start = reference.selectableText().indexOf(expected);
+    QVERIFY(start >= 0);
+    const auto pointerForPosition = [&](int position) {
+        for (int y = 0; y <= qCeil(reference.height()); ++y)
+            for (int x = 0; x <= qFloor(frame.width()); ++x)
+                if (reference.positionAt(QPointF(x, y)) == position)
+                    return QPoint(qRound(frame.left()) + x,
+                                  qRound(frame.top()) + y - view.verticalScrollBar()->value());
+        return QPoint(-1, -1);
+    };
+    const QPoint first = pointerForPosition(start);
+    const QPoint last = pointerForPosition(start + expected.size());
+    QVERIFY(first.x() >= 0 && last.x() >= 0);
+    for (bool reverse : {false, true}) {
+        // Keep press/move/release in the same QPA event stream. The QWidget
+        // mouseMove overload merely moves the OS cursor on Qt 5 and is not a
+        // reliable drag when another owned fixture is in the foreground.
+        auto* window = view.windowHandle();
+        QVERIFY(window);
+        const QPoint from = reverse ? last : first;
+        const QPoint to = reverse ? first : last;
+        const QPoint windowFrom = window->mapFromGlobal(view.viewport()->mapToGlobal(from));
+        const QPoint windowTo = window->mapFromGlobal(view.viewport()->mapToGlobal(to));
+        qInfo() << "table-view drag" << view.viewport()->size() << frame << from << to
+                << windowFrom << windowTo;
+        QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, windowFrom);
+        QTest::mouseMove(window, windowTo);
+        QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, windowTo);
+        QCOMPARE(view.selectedText(), expected);
+        QTest::keySequence(&view, QKeySequence(QKeySequence::Copy));
+        QCOMPARE(QApplication::clipboard()->text(), expected);
+    }
 }
 
 void MarkdownViewTest::shortBubbleIsNarrowerThanLongOne() {

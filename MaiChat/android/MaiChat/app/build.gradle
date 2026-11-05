@@ -123,6 +123,9 @@ tasks.register("stageMaiAgentGraphicsEffects", Sync) {
     into graphicsEffectsOutput
 }
 android.sourceSets.main.assets.srcDir(graphicsEffectsOutput)
+// One verified original font and its OFL notice are shared with Qt and iOS.
+// Preserve the fonts/ asset path; this changes code typography only.
+android.sourceSets.main.assets.srcDir(file("$projectDir/../../../Resources"))
 
 // Android and iOS package exactly the same pinned model, manifest and upstream attribution.
 // Preparation is local-only during a build; missing or changed weights fail instead of producing

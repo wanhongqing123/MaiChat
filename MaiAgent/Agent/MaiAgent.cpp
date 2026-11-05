@@ -837,6 +837,11 @@ std::vector<MaiPermissionRequest> MaiAgent::listPendingPermissions() const {
     return mRuntime->permissions->listPending();
 }
 
+bool MaiAgent::getMessage(const std::string& sessionId, const std::string& messageId,
+                          MaiMessage& out) const {
+    return mRuntime->store->getMessage(sessionId, messageId, out);
+}
+
 std::vector<MaiQuestionRequest> MaiAgent::listPendingQuestions() const {
     return mRuntime->questions->listPending();
 }
@@ -844,6 +849,29 @@ std::vector<MaiQuestionRequest> MaiAgent::listPendingQuestions() const {
 bool MaiAgent::isBusy(const std::string& sessionId) const {
     std::lock_guard<std::mutex> lock(mRuntime->mutex);
     return mRuntime->active.count(sessionId) > 0;
+}
+
+MaiResult<std::string> MaiAgent::interruptTurn(const std::string& sessionId,
+                                               const std::string& expectedTurnId) {
+    std::lock_guard<std::mutex> runtimeLock(mRuntime->mutex);
+    const auto found = mRuntime->active.find(sessionId);
+    if (found == mRuntime->active.end())
+        return {MaiErrorCode::NotFound, "no turn is running for this session"};
+    if (!expectedTurnId.empty()) {
+        // 专用模型回复先在 Runtime 预占空轮次，再持 steeringMutex 初始化 id；
+        // 因而 Runtime 锁单独不能保护此字段。沿 activeTurnId 的 Runtime → steering 锁序读取，
+        // 初始化完成后 id 才保持不变。旧无目标 Stop 不读取 id，仍能取消预占中的轮次。
+        std::lock_guard<std::mutex> steeringLock(found->second->steeringMutex);
+        if (found->second->id != expectedTurnId)
+            return {MaiErrorCode::NotFound, "the original turn is no longer active"};
+    }
+    found->second->cancel.store(true, std::memory_order_relaxed);
+    // Keep gate wakeups inside the same Runtime critical section. Their own
+    // cancelSession methods only settle entries and notify; they invoke no user
+    // callback. A replacement turn cannot enter until both old-turn gates wake.
+    mRuntime->permissions->cancelSession(sessionId);
+    mRuntime->questions->cancelSession(sessionId);
+    return sessionId;
 }
 
 std::string MaiAgent::activeTurnId(const std::string& sessionId) const {
@@ -1203,20 +1231,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 return assistant.id;
 
             } else if constexpr (std::is_same_v<T, MaiInterrupt>) {
-                {
-                    std::lock_guard<std::mutex> lock(mRuntime->mutex);
-                    auto it = mRuntime->active.find(operation.sessionId);
-                    if (it == mRuntime->active.end())
-                        return {MaiErrorCode::NotFound, "no turn is running for this session"};
-                    it->second->cancel.store(true, std::memory_order_relaxed);
-                }
-                // 光置 cancel 叫不醒卡在等授权的那个线程——它睡在闸门的 condition_variable 上，
-                // 看不见这个标志，必须显式敲一下。（闸门那边还有个 250ms 的兜底轮询，但那是安全网，
-                // 不是主路径。）
-                mRuntime->permissions->cancelSession(operation.sessionId);
-                // 等回答的那一轮也睡在自己的 condition_variable 上，同样要敲一下。
-                mRuntime->questions->cancelSession(operation.sessionId);
-                return operation.sessionId;
+                return interruptTurn(operation.sessionId, {});
 
             } else if constexpr (std::is_same_v<T, MaiReplyQuestion>) {
                 if (operation.questionId.empty())

@@ -584,6 +584,32 @@ public:
         return out;
     }
 
+    bool getMessage(const std::string& sessionId, const std::string& messageId,
+                    MaiMessage& out) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        sqlite3_stmt* statement = prepareLocked(
+            "SELECT id, role, created, completed FROM messages "
+            "WHERE session_id = ?1 AND id = ?2");
+        if (!statement) return false;
+        MaiMessage message;
+        {
+            Reset guard(statement);
+            bindText(statement, 1, sessionId);
+            bindText(statement, 2, messageId);
+            if (sqlite3_step(statement) != SQLITE_ROW) return false;
+            message.id = textColumn(statement, 0);
+            message.role = columnToRole(sqlite3_column_int(statement, 1));
+            message.created = sqlite3_column_int64(statement, 2);
+            message.completed = sqlite3_column_int64(statement, 3);
+        }
+        // 仅对精确命中的消息加载片段；失败路径不修改调用方原有快照。
+        bool partsRead = false;
+        message.parts = readPartsLocked(message.id, &partsRead);
+        if (!partsRead) return false;
+        out = std::move(message);
+        return true;
+    }
+
     std::vector<MaiMessage> listMessagesPage(const std::string& sessionId,
                                              const std::string& beforeId,
                                              std::size_t limit) const override {
@@ -829,7 +855,9 @@ private:
         executePreparedStatement(statement);
     }
 
-    std::vector<MaiMessagePart> readPartsLocked(const std::string& messageId) const {
+    std::vector<MaiMessagePart> readPartsLocked(const std::string& messageId,
+                                                bool* succeeded = nullptr) const {
+        if (succeeded) *succeeded = false;
         std::vector<MaiMessagePart> out;
         sqlite3_stmt* statement = prepareLocked(
             "SELECT id, kind, created, text, tool, call_id, input, output, error, state "
@@ -837,7 +865,8 @@ private:
         if (!statement) return out;
         Reset guard(statement);
         bindText(statement, 1, messageId);
-        while (sqlite3_step(statement) == SQLITE_ROW) {
+        int result;
+        while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
             MaiMessagePart part;
             part.id = textColumn(statement, 0);
             const int kind = sqlite3_column_int(statement, 1);
@@ -864,6 +893,7 @@ private:
             }
             out.push_back(std::move(part));
         }
+        if (succeeded) *succeeded = result == SQLITE_DONE;
         return out;
     }
 

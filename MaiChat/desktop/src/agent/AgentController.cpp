@@ -223,8 +223,7 @@ std::unique_ptr<MaiSessionStore> openStore(const QString& databasePath, QString&
 }
 
 std::shared_ptr<MaiSessionScheduleStore> openScheduleStore(const QString& databasePath) {
-    const std::string path = databasePath.isEmpty() ? ":memory:" :
-        toUtf8(databasePath) + ".schedule.sqlite";
+    const std::string path = databasePath.isEmpty() ? ":memory:" : toUtf8(databasePath) + ".schedule.sqlite";
     const auto opened = MaiSessionScheduleStore::open(path);
     return opened ? opened.value() : nullptr;
 }
@@ -244,9 +243,9 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     // 搜索/文章抓取走固定供应商API，复用账号控制面下发的DeepSeek凭据。
     MaiDeepSeekWebOptions webOptions;
     QFile webCertificates(QStringLiteral(":/maichat/auth/cacert.pem"));
-    if (webCertificates.open(QIODevice::ReadOnly)) webOptions.caPem = toUtf8(QString::fromUtf8(webCertificates.readAll()));
-    webOptions.apiKey = [provider = credentials.accountModelKeyProvider,
-                        key = toUtf8(credentials.deepseekApiKey)] {
+    if (webCertificates.open(QIODevice::ReadOnly))
+        webOptions.caPem = toUtf8(QString::fromUtf8(webCertificates.readAll()));
+    webOptions.apiKey = [provider = credentials.accountModelKeyProvider, key = toUtf8(credentials.deepseekApiKey)] {
         return provider ? toUtf8(provider(QStringLiteral("deepseek"))) : key;
     };
     registerMaiDeepSeekWebTools(*tools, std::move(webOptions));
@@ -256,14 +255,13 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
 #else
     registerMaiSessionScheduleTools(*tools, scheduleStore, "Windows");
 #endif
-    registerMaiCalendarTools(*tools,
-        [](const MaiCalendarEventInput& event, const MaiToolContext& context) {
-            return prepareDesktopCalendarImport(event, context);
-        });
-    const QString defaultWorkspace = databasePath.isEmpty() ? QString() :
-        QDir(QFileInfo(databasePath).absolutePath()).filePath(QStringLiteral("Workspace"));
-    tools->add(makeMaiCreateSessionTool(MaiSessionCreateMode::DefaultOrExplicitDirectory,
-                                        toUtf8(defaultWorkspace)));
+    registerMaiCalendarTools(*tools, [](const MaiCalendarEventInput& event, const MaiToolContext& context) {
+        return prepareDesktopCalendarImport(event, context);
+    });
+    const QString defaultWorkspace =
+        databasePath.isEmpty() ? QString()
+                               : QDir(QFileInfo(databasePath).absolutePath()).filePath(QStringLiteral("Workspace"));
+    tools->add(makeMaiCreateSessionTool(MaiSessionCreateMode::DefaultOrExplicitDirectory, toUtf8(defaultWorkspace)));
     registerDesktopProcessTools(*tools, std::make_shared<DesktopProcessManager>());
     registerDesktopBrowserTools(*tools, std::make_shared<DesktopBrowserManager>());
     registerDesktopComputerTools(*tools, std::make_shared<DesktopComputerController>());
@@ -288,8 +286,8 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     const auto arkKey = [provider = credentials.arkApiKeyProvider, key = toUtf8(credentials.arkApiKey)] {
         return provider ? toUtf8(provider()) : key;
     };
-    const auto assetSettings = [provider = credentials.mediaServiceAccessProvider]()
-        -> MaiResult<MaiArkAssetServiceSettings> {
+    const auto assetSettings = [provider =
+                                    credentials.mediaServiceAccessProvider]() -> MaiResult<MaiArkAssetServiceSettings> {
         if (!provider) return {MaiErrorCode::NotConfigured, "Account login is required"};
         const auto access = provider();
         if (access.first.isEmpty() || access.second.isEmpty())
@@ -315,13 +313,11 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     else
         tools->addInternal(makeMaiArkAssetTool());
     tools->addInternal(makeMaiSeedreamImageTool(arkKey, {}, seedreamUploadMedia));
-    const auto glmKey = [provider = credentials.glmApiKeyProvider,
-                         key = toUtf8(credentials.glmApiKey)] {
+    const auto glmKey = [provider = credentials.glmApiKeyProvider, key = toUtf8(credentials.glmApiKey)] {
         return provider ? toUtf8(provider()) : key;
     };
     tools->add(makeMaiGlmImageTool(glmKey));
-    const auto miniMaxKey = [provider = credentials.miniMaxApiKeyProvider,
-                             key = toUtf8(credentials.miniMaxApiKey)] {
+    const auto miniMaxKey = [provider = credentials.miniMaxApiKeyProvider, key = toUtf8(credentials.miniMaxApiKey)] {
         return provider ? toUtf8(provider()) : key;
     };
     tools->add(makeMaiMiniMaxVideoTool(miniMaxKey, {}, miniMaxUploadMedia));
@@ -389,8 +385,8 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     if (credentials.reasoningEffortProvider) {
         options.reasoningEffortProvider = [provider = credentials.reasoningEffortProvider] {
             const QString value = provider();
-            return toUtf8(value == QStringLiteral("low") || value == QStringLiteral("max")
-                              ? value : QStringLiteral("high"));
+            return toUtf8(value == QStringLiteral("low") || value == QStringLiteral("max") ? value
+                                                                                           : QStringLiteral("high"));
         };
     }
     // 0 = 无限等。桌面端有人盯着，超时自动拒绝等于替用户做决定。
@@ -417,8 +413,8 @@ AgentController::AgentController(std::unique_ptr<MaiModelClient> model, const QS
 
     runtime_->scheduleStore = openScheduleStore(databasePath);
     runtime_->agent = buildAgent(std::move(model), openStore(databasePath, runtime_->openError), QString(),
-                                 MaiApprovalPolicy::OnRequest, hostTools, AgentController::ModelConfig{},
-                                 databasePath, runtime_->scheduleStore);
+                                 MaiApprovalPolicy::OnRequest, hostTools, AgentController::ModelConfig{}, databasePath,
+                                 runtime_->scheduleStore);
 
     // **显式 QueuedConnection，不用 Auto。**
     //
@@ -476,8 +472,7 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
 
     runtime_->modelName = model.modelName;
     runtime_->agent = buildAgent(std::move(client), openStore(databasePath, runtime_->openError), model.modelName,
-                                 model.approvalPolicy, hostTools, model, databasePath,
-                                 runtime_->scheduleStore);
+                                 model.approvalPolicy, hostTools, model, databasePath, runtime_->scheduleStore);
 
     connect(this, &AgentController::eventQueued, this, &AgentController::onEventQueued, Qt::QueuedConnection);
     runtime_->token = runtime_->agent->eventBus().subscribe([this](const MaiEvent& event) { rawEvent(event); });
@@ -494,14 +489,12 @@ void AgentController::startScheduledTasks() {
             return runtime_->agent->getSession(id, session) && session.isRoot();
         },
         [this](const std::string& id) { return runtime_->agent->isBusy(id); },
-        [this](const std::string& id, const std::string& instruction)
-            -> MaiResult<std::string> {
+        [this](const std::string& id, const std::string& instruction) -> MaiResult<std::string> {
             return runtime_->agent->submit(MaiSendPrompt{id, instruction});
         });
     runtime_->scheduleTimer.setInterval(1000);
     connect(&runtime_->scheduleTimer, &QTimer::timeout, this, [this] {
-        if (runtime_->scheduleRunner)
-            runtime_->scheduleRunner->poll(MaiTime::getCurrentTime());
+        if (runtime_->scheduleRunner) runtime_->scheduleRunner->poll(MaiTime::getCurrentTime());
     });
     runtime_->scheduleTimer.start();
 }
@@ -579,14 +572,29 @@ bool AgentController::sendPrompt(const QString& sessionId, const QString& text, 
     return sendPrompt(sessionId, text, imagePaths, QString());
 }
 
-bool AgentController::sendPrompt(const QString& sessionId, const QString& text,
-                                 const QStringList& imagePaths, const QString& quotedMessageId) {
+bool AgentController::sendPrompt(const QString& sessionId, const QString& text, const QStringList& imagePaths,
+                                 const QString& quotedMessageId) {
     return sendPrompt(sessionId, text, imagePaths, {}, quotedMessageId);
 }
 
-bool AgentController::sendPrompt(const QString& sessionId, const QString& text,
-                                 const QStringList& imagePaths, const QStringList& videoPaths,
-                                 const QString& quotedMessageId) {
+bool AgentController::sendPrompt(const QString& sessionId, const QString& text, const QStringList& imagePaths,
+                                 const QStringList& videoPaths, const QString& quotedMessageId) {
+    return submitPrompt(sessionId, text, imagePaths, videoPaths, quotedMessageId, {}, {});
+}
+
+bool AgentController::steerPrompt(const QString& sessionId, const QString& turnId, const QString& requestId,
+                                  const QString& text, const QStringList& imagePaths, const QStringList& videoPaths,
+                                  const QString& quotedMessageId) {
+    if (turnId.isEmpty() || requestId.isEmpty()) {
+        runtime_->lastError = QStringLiteral("补充消息需要绑定原任务与请求编号，内容已保留。");
+        return false;
+    }
+    return submitPrompt(sessionId, text, imagePaths, videoPaths, quotedMessageId, turnId, requestId);
+}
+
+bool AgentController::submitPrompt(const QString& sessionId, const QString& text, const QStringList& imagePaths,
+                                   const QStringList& videoPaths, const QString& quotedMessageId, const QString& turnId,
+                                   const QString& requestId) {
     if (imagePaths.size() + videoPaths.size() > 10) {
         runtime_->lastError = QStringLiteral("每条消息最多添加 10 项图片或视频。");
         return false;
@@ -613,19 +621,26 @@ bool AgentController::sendPrompt(const QString& sessionId, const QString& text,
         }
         QString mimeType = mimeDatabase.mimeTypeForFile(path).name().toLower();
         const QString suffix = file.suffix().toLower();
-        if (suffix == QStringLiteral("mp4")) mimeType = QStringLiteral("video/mp4");
-        else if (suffix == QStringLiteral("mov")) mimeType = QStringLiteral("video/quicktime");
-        else if (suffix == QStringLiteral("webm")) mimeType = QStringLiteral("video/webm");
+        if (suffix == QStringLiteral("mp4"))
+            mimeType = QStringLiteral("video/mp4");
+        else if (suffix == QStringLiteral("mov"))
+            mimeType = QStringLiteral("video/quicktime");
+        else if (suffix == QStringLiteral("webm"))
+            mimeType = QStringLiteral("video/webm");
         if (!mimeType.startsWith(QStringLiteral("video/"))) {
             runtime_->lastError = QStringLiteral("暂不支持这种视频格式：%1").arg(mimeType);
             return false;
         }
         videos.push_back({toUtf8(file.absoluteFilePath()), toUtf8(mimeType)});
     }
-    if (!runtime_->modelName.isEmpty() && !setModel(sessionId, runtime_->modelName)) return false;
+    // 活动轮次保留原模型与授权；补充不是重开任务，也不能在失败后改为 Send。
+    if (turnId.isEmpty() && !runtime_->modelName.isEmpty() && !setModel(sessionId, runtime_->modelName)) return false;
     MaiResult<std::string> sent =
-        runtime_->agent->submit(MaiSendPrompt{toUtf8(sessionId), toUtf8(text), std::move(images),
-                                             std::move(videos), toUtf8(quotedMessageId)});
+        turnId.isEmpty()
+            ? runtime_->agent->submit(MaiSendPrompt{toUtf8(sessionId), toUtf8(text), std::move(images),
+                                                    std::move(videos), toUtf8(quotedMessageId)})
+            : runtime_->agent->submit(MaiSteerPrompt{toUtf8(sessionId), toUtf8(turnId), toUtf8(requestId), toUtf8(text),
+                                                     std::move(images), std::move(videos), toUtf8(quotedMessageId)});
     if (!sent) {
         runtime_->lastError = fromUtf8(sent.error().message());
         return false;
@@ -660,13 +675,16 @@ bool AgentController::setDefaultModel(const QString& model) {
 }
 
 bool AgentController::interrupt(const QString& sessionId) {
-    MaiResult<std::string> stopped = runtime_->agent->submit(MaiInterrupt{toUtf8(sessionId)});
+    return interrupt(sessionId, {});
+}
+
+bool AgentController::interrupt(const QString& sessionId, const QString& expectedTurn) {
+    MaiResult<std::string> stopped = runtime_->agent->interruptTurn(toUtf8(sessionId), toUtf8(expectedTurn));
     if (!stopped) {
         runtime_->lastError = fromUtf8(stopped.error().message());
         return false;
     }
-    if (runtime_->scheduleRunner)
-        runtime_->scheduleRunner->finish(toUtf8(sessionId), "Interrupted by user");
+    if (runtime_->scheduleRunner) runtime_->scheduleRunner->finish(toUtf8(sessionId), "Interrupted by user");
     return true;
 }
 
@@ -749,8 +767,7 @@ void AgentController::onEventQueued(const MaiEvent& event) {
     const QString sessionId = fromUtf8(event.sessionId);
     const QString messageId = fromUtf8(event.messageId);
     const QString partId = fromUtf8(event.partId);
-    if (event.type == MaiEventType::SessionCreated ||
-        event.type == MaiEventType::SessionDeleted) {
+    if (event.type == MaiEventType::SessionCreated || event.type == MaiEventType::SessionDeleted) {
         if (event.type == MaiEventType::SessionDeleted && runtime_->scheduleStore)
             runtime_->scheduleStore->cancelSession(event.sessionId);
         emit sessionStructureChanged();
@@ -759,8 +776,8 @@ void AgentController::onEventQueued(const MaiEvent& event) {
 
     switch (event.type) {
         case MaiEventType::MessageUpdated:
-            for (const MaiMessage& message : runtime_->agent->listMessagesPage(
-                     event.sessionId, event.messageId + "~", 1)) {
+            for (const MaiMessage& message :
+                 runtime_->agent->listMessagesPage(event.sessionId, event.messageId + "~", 1)) {
                 if (message.id == event.messageId && message.role == MaiRole::User)
                     emit userMessageAdded(sessionId, messageId);
             }
@@ -820,15 +837,13 @@ void AgentController::onEventQueued(const MaiEvent& event) {
         case MaiEventType::SessionIdle:
             // 一轮结束，这一轮的片段表可以丢了。不丢的话长会话会一直涨。
             runtime_->partKindsBySession.remove(sessionId);
-            if (runtime_->scheduleRunner)
-                runtime_->scheduleRunner->finish(event.sessionId);
+            if (runtime_->scheduleRunner) runtime_->scheduleRunner->finish(event.sessionId);
             emit turnFinished(sessionId);
             runtime_->livePartTextBySession.remove(sessionId);
             return;
 
         case MaiEventType::SessionError:
-            if (runtime_->scheduleRunner)
-                runtime_->scheduleRunner->finish(event.sessionId, event.detail);
+            if (runtime_->scheduleRunner) runtime_->scheduleRunner->finish(event.sessionId, event.detail);
             emit turnFailed(sessionId, fromUtf8(event.detail));
             return;
 

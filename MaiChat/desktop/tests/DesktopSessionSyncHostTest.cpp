@@ -42,17 +42,17 @@ class ScheduledToolModel final : public MaiModelClient {
 public:
     explicit ScheduledToolModel(std::string arguments) : arguments_(std::move(arguments)) {}
 
-    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
-                    const std::atomic<bool>&) override {
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
         if (calls_++ == 0 && sink.onToolCall)
-            sink.onToolCall(MaiToolInvocation{"remote-schedule-create",
-                "maichat_session_task_create", arguments_});
+            sink.onToolCall(MaiToolInvocation{"remote-schedule-create", "maichat_session_task_create", arguments_});
         else if (sink.onText)
             sink.onText("Scheduled on the owner device");
         return {};
     }
 
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
 
 private:
     std::string arguments_;
@@ -65,15 +65,15 @@ class HeldSteeringModel final : public MaiModelClient {
 public:
     std::atomic<bool> entered{false};
     std::atomic<bool> release{false};
-    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
-                    const std::atomic<bool>& cancel) override {
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>& cancel) override {
         entered.store(true);
-        while (!release.load() && !cancel.load())
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        while (!release.load() && !cancel.load()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
         if (!cancel.load() && sink.onText) sink.onText("Owner completed the task");
         return {};
     }
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
 };
 
 }  // namespace
@@ -93,6 +93,12 @@ private slots:
     void coordinatorDeletesRoomWhenLocalSessionIsRemoved();
     void coordinatorReadsRemoteHistoryWithVerifiedChunks();
     void remotePanelShowsHistoryAndRoutesTextToOwner();
+    void remoteBusyComposerQueuesSteeringAndStopSeparately();
+    void remoteTransportCompletionPreservesNewDraft();
+    void remoteQueueMatchesOwnerReceiptAndRetainsPrivateRecovery();
+    void remoteIdleConsecutiveSendsBindToAcknowledgedOriginalTurn();
+    void remoteQueueStorageFailureRetainsDraft();
+    void remoteLateSteerReceiptDoesNotReplaceNewerOwnerTurn();
     void remotePanelRoutesAttachmentLinkToVerifiedDownload();
     void remotePanelDoesNotRepeatPendingHistory();
     void remotePanelReconcilesAfterReconnect();
@@ -113,10 +119,9 @@ void DesktopSessionSyncHostTest::remoteLifecycleCreatesAndDeletesInRequestedWork
     QVERIFY(workspace.isValid());
     AgentController controller(AgentController::ModelConfig{}, {});
     DesktopSessionSyncHost host(controller);
-    const QJsonObject created = host.applyCommand(
-        QStringLiteral("session_lifecycle"),
-        {{QStringLiteral("action"), QStringLiteral("session_create")},
-         {QStringLiteral("workspace_path"), workspace.path()}});
+    const QJsonObject created = host.applyCommand(QStringLiteral("session_lifecycle"),
+                                                  {{QStringLiteral("action"), QStringLiteral("session_create")},
+                                                   {QStringLiteral("workspace_path"), workspace.path()}});
     QVERIFY2(created.value(QStringLiteral("ok")).toBool(),
              qPrintable(created.value(QStringLiteral("error")).toString()));
     const QString id = created.value(QStringLiteral("session_id")).toString();
@@ -126,33 +131,29 @@ void DesktopSessionSyncHostTest::remoteLifecycleCreatesAndDeletesInRequestedWork
     QCOMPARE(QString::fromStdString(session.directory), QDir(workspace.path()).canonicalPath());
     const QJsonObject removed = host.applyCommand(
         QStringLiteral("session_lifecycle"),
-        {{QStringLiteral("action"), QStringLiteral("session_delete")},
-         {QStringLiteral("target_session_id"), id}});
+        {{QStringLiteral("action"), QStringLiteral("session_delete")}, {QStringLiteral("target_session_id"), id}});
     QVERIFY2(removed.value(QStringLiteral("ok")).toBool(),
              qPrintable(removed.value(QStringLiteral("error")).toString()));
     QVERIFY(!controller.agent().getSession(id.toStdString(), session));
     const QJsonObject invalid = host.applyCommand(
-        QStringLiteral("session_lifecycle"),
-        {{QStringLiteral("action"), QStringLiteral("session_create")},
-         {QStringLiteral("workspace_path"), QStringLiteral("relative/path")}});
+        QStringLiteral("session_lifecycle"), {{QStringLiteral("action"), QStringLiteral("session_create")},
+                                              {QStringLiteral("workspace_path"), QStringLiteral("relative/path")}});
     QVERIFY(!invalid.value(QStringLiteral("ok")).toBool());
     QTemporaryDir defaultWorkspace;
     QVERIFY(defaultWorkspace.isValid());
     host.setDefaultWorkspaceDirectory(defaultWorkspace.path());
     const QJsonObject defaultCreated = host.applyCommand(
-        QStringLiteral("session_lifecycle"),
-        {{QStringLiteral("action"), QStringLiteral("session_create")}});
+        QStringLiteral("session_lifecycle"), {{QStringLiteral("action"), QStringLiteral("session_create")}});
     QVERIFY(defaultCreated.value(QStringLiteral("ok")).toBool());
     const QString defaultId = defaultCreated.value(QStringLiteral("session_id")).toString();
     QVERIFY(controller.agent().getSession(defaultId.toStdString(), session));
     QCOMPARE(QString::fromStdString(session.directory), QDir(defaultWorkspace.path()).canonicalPath());
     QTemporaryDir otherWorkspace;
     QVERIFY(otherWorkspace.isValid());
-    const QJsonObject switched = host.applyCommand(
-        QStringLiteral("session_lifecycle"),
-        {{QStringLiteral("action"), QStringLiteral("session_set_workspace")},
-         {QStringLiteral("target_session_id"), defaultId},
-         {QStringLiteral("workspace_path"), otherWorkspace.path()}});
+    const QJsonObject switched = host.applyCommand(QStringLiteral("session_lifecycle"),
+                                                   {{QStringLiteral("action"), QStringLiteral("session_set_workspace")},
+                                                    {QStringLiteral("target_session_id"), defaultId},
+                                                    {QStringLiteral("workspace_path"), otherWorkspace.path()}});
     QVERIFY2(switched.value(QStringLiteral("ok")).toBool(),
              qPrintable(switched.value(QStringLiteral("error")).toString()));
     QCOMPARE(switched.value(QStringLiteral("session_id")).toString(), defaultId);
@@ -160,10 +161,9 @@ void DesktopSessionSyncHostTest::remoteLifecycleCreatesAndDeletesInRequestedWork
     QCOMPARE(QString::fromStdString(session.directory), QDir(otherWorkspace.path()).canonicalPath());
     QCOMPARE(controller.agent().listSessions().size(), size_t(1));
     const QJsonObject badWorkspace = host.applyCommand(
-        QStringLiteral("session_lifecycle"),
-        {{QStringLiteral("action"), QStringLiteral("session_set_workspace")},
-         {QStringLiteral("target_session_id"), defaultId},
-         {QStringLiteral("workspace_path"), QStringLiteral("relative/path")}});
+        QStringLiteral("session_lifecycle"), {{QStringLiteral("action"), QStringLiteral("session_set_workspace")},
+                                              {QStringLiteral("target_session_id"), defaultId},
+                                              {QStringLiteral("workspace_path"), QStringLiteral("relative/path")}});
     QVERIFY(!badWorkspace.value(QStringLiteral("ok")).toBool());
 }
 
@@ -180,27 +180,28 @@ void DesktopSessionSyncHostTest::coordinatorCreatesFirstRemoteSessionAndMatchesL
             if (path == QStringLiteral("session-sync/send") &&
                 body.value(QStringLiteral("kind")) == QStringLiteral("command"))
                 sent = body;
-            QTimer::singleShot(0, &controller,
-                               [completion = std::move(completion)] { completion({}, {}); });
+            QTimer::singleShot(0, &controller, [completion = std::move(completion)] { completion({}, {}); });
         },
         [&] { return &controller; }, nullptr, QStringLiteral("mac-install"), QStringLiteral("Mac"));
     coordinator.start();
     coordinator.acceptDevices(QJsonArray{device});
     QJsonObject completed;
     QString error;
-    coordinator.sendRemoteLifecycle(
-        device, {{QStringLiteral("action"), QStringLiteral("session_create")}},
-        [&](const QJsonObject& value, const QString& failure) { completed = value; error = failure; });
+    coordinator.sendRemoteLifecycle(device, {{QStringLiteral("action"), QStringLiteral("session_create")}},
+                                    [&](const QJsonObject& value, const QString& failure) {
+                                        completed = value;
+                                        error = failure;
+                                    });
     QCOMPARE(sent.value(QStringLiteral("session_id")).toString(), QStringLiteral("session_lifecycle"));
     QCOMPARE(sent.value(QStringLiteral("to_slot")).toString(), QStringLiteral("ios_phone"));
     QVERIFY(!sent.value(QStringLiteral("payload")).toObject().contains(QStringLiteral("workspace_path")));
     const QString commandId = sent.value(QStringLiteral("client_message_id")).toString();
     QVERIFY(!commandId.isEmpty());
-    const QJsonObject result{{QStringLiteral("type"), QStringLiteral("command_result")},
-                             {QStringLiteral("command_id"), commandId},
-                             {QStringLiteral("result"), QJsonObject{
-                                 {QStringLiteral("ok"), true},
-                                 {QStringLiteral("session_id"), QStringLiteral("ses_new")}}}};
+    const QJsonObject result{
+        {QStringLiteral("type"), QStringLiteral("command_result")},
+        {QStringLiteral("command_id"), commandId},
+        {QStringLiteral("result"),
+         QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("session_id"), QStringLiteral("ses_new")}}}};
     const QJsonObject envelope{{QStringLiteral("id"), 7},
                                {QStringLiteral("kind"), QStringLiteral("event")},
                                {QStringLiteral("session_id"), QStringLiteral("session_lifecycle")},
@@ -224,8 +225,7 @@ void DesktopSessionSyncHostTest::coordinatorAppliesPhoneLifecycleToDesktop() {
             if (path == QStringLiteral("session-sync/send")) sent.append(body);
             if (path == QStringLiteral("session-sync/presence"))
                 latestPresenceCount = body.value(QStringLiteral("sessions")).toArray().size();
-            QTimer::singleShot(0, &controller,
-                               [completion = std::move(completion)] { completion({}, {}); });
+            QTimer::singleShot(0, &controller, [completion = std::move(completion)] { completion({}, {}); });
         },
         [&] { return &controller; }, nullptr, QStringLiteral("mac-install"), QStringLiteral("Mac"));
     coordinator.setDefaultWorkspaceDirectory(workspace.path());
@@ -238,15 +238,13 @@ void DesktopSessionSyncHostTest::coordinatorAppliesPhoneLifecycleToDesktop() {
         {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
         {QStringLiteral("from_login_session_id"), QStringLiteral("phone-login")},
         {QStringLiteral("client_message_id"), QStringLiteral("create-1")},
-        {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"),
-                                                  QStringLiteral("session_create")}}}}});
+        {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"), QStringLiteral("session_create")}}}}});
     QTRY_VERIFY_WITH_TIMEOUT(latestPresenceCount == 1 && !sent.isEmpty(), 5000);
-    QCOMPARE(sent.first().value(QStringLiteral("session_id")).toString(),
-             QStringLiteral("session_lifecycle"));
+    QCOMPARE(sent.first().value(QStringLiteral("session_id")).toString(), QStringLiteral("session_lifecycle"));
     const QJsonObject created = sent.first().value(QStringLiteral("payload")).toObject();
     QCOMPARE(created.value(QStringLiteral("command_id")).toString(), QStringLiteral("create-1"));
-    const QString id = created.value(QStringLiteral("result")).toObject()
-        .value(QStringLiteral("session_id")).toString();
+    const QString id =
+        created.value(QStringLiteral("result")).toObject().value(QStringLiteral("session_id")).toString();
     QVERIFY(!id.isEmpty());
     MaiSession session;
     QVERIFY(controller.agent().getSession(id.toStdString(), session));
@@ -260,16 +258,14 @@ void DesktopSessionSyncHostTest::coordinatorAppliesPhoneLifecycleToDesktop() {
         {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
         {QStringLiteral("from_login_session_id"), QStringLiteral("phone-login")},
         {QStringLiteral("client_message_id"), QStringLiteral("workspace-1")},
-        {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"),
-                                                  QStringLiteral("session_set_workspace")},
-                                                 {QStringLiteral("target_session_id"), id},
-                                                 {QStringLiteral("workspace_path"),
-                                                  otherWorkspace.path()}}}}});
+        {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"), QStringLiteral("session_set_workspace")},
+                                                {QStringLiteral("target_session_id"), id},
+                                                {QStringLiteral("workspace_path"), otherWorkspace.path()}}}}});
     QTRY_VERIFY_WITH_TIMEOUT(sent.size() >= 2, 5000);
     QVERIFY(controller.agent().getSession(id.toStdString(), session));
     QCOMPARE(QString::fromStdString(session.directory), QDir(otherWorkspace.path()).canonicalPath());
-    QCOMPARE(sent.last().value(QStringLiteral("payload")).toObject()
-                 .value(QStringLiteral("command_id")).toString(), QStringLiteral("workspace-1"));
+    QCOMPARE(sent.last().value(QStringLiteral("payload")).toObject().value(QStringLiteral("command_id")).toString(),
+             QStringLiteral("workspace-1"));
     coordinator.acceptInbox(QJsonArray{QJsonObject{
         {QStringLiteral("id"), 2},
         {QStringLiteral("kind"), QStringLiteral("command")},
@@ -277,15 +273,13 @@ void DesktopSessionSyncHostTest::coordinatorAppliesPhoneLifecycleToDesktop() {
         {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
         {QStringLiteral("from_login_session_id"), QStringLiteral("phone-login")},
         {QStringLiteral("client_message_id"), QStringLiteral("delete-1")},
-        {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"),
-                                                  QStringLiteral("session_delete")},
-                                                 {QStringLiteral("target_session_id"), id}}}}});
+        {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"), QStringLiteral("session_delete")},
+                                                {QStringLiteral("target_session_id"), id}}}}});
     QTRY_VERIFY_WITH_TIMEOUT(latestPresenceCount == 0 && sent.size() >= 3, 5000);
     QVERIFY(!controller.agent().getSession(id.toStdString(), session));
     const QJsonObject deleted = sent.last().value(QStringLiteral("payload")).toObject();
     QCOMPARE(deleted.value(QStringLiteral("command_id")).toString(), QStringLiteral("delete-1"));
-    QCOMPARE(deleted.value(QStringLiteral("result")).toObject()
-                 .value(QStringLiteral("session_id")).toString(), id);
+    QCOMPARE(deleted.value(QStringLiteral("result")).toObject().value(QStringLiteral("session_id")).toString(), id);
 }
 
 void DesktopSessionSyncHostTest::sessionListOffersLifecycleActionsForRemoteDevice() {
@@ -319,15 +313,13 @@ void DesktopSessionSyncHostTest::sessionListOffersLifecycleActionsForRemoteDevic
     QCOMPARE(list->count(), 2);
     QSignalSpy remove(&sessions, &AgentSessionList::remoteDeleteRequested);
     const QRect row = list->visualItemRect(list->item(1));
-    QTest::mouseClick(list->viewport(), Qt::LeftButton, {},
-                      QPoint(row.right() - UiZoom::s(25), row.center().y()));
+    QTest::mouseClick(list->viewport(), Qt::LeftButton, {}, QPoint(row.right() - UiZoom::s(25), row.center().y()));
     auto* menu = sessions.findChild<QMenu*>(QStringLiteral("agentRemoteSessionMenu"));
     QVERIFY(menu);
     QVERIFY(menu->actions().size() == 1);
     menu->actions().first()->trigger();
     QCOMPARE(remove.size(), 1);
-    QCOMPARE(remove.first().first().toJsonObject().value(QStringLiteral("id")).toString(),
-             QStringLiteral("ses_phone"));
+    QCOMPARE(remove.first().first().toJsonObject().value(QStringLiteral("id")).toString(), QStringLiteral("ses_phone"));
 }
 
 void DesktopSessionSyncHostTest::agentToolsReuseRemoteLifecycleCoordinator() {
@@ -474,30 +466,29 @@ void DesktopSessionSyncHostTest::remotePermissionButtonsUseSharedWireDecisions()
                              {QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
                              {QStringLiteral("login_session_id"), QStringLiteral("phone-login")},
                              {QStringLiteral("online"), true}};
-    const QJsonArray permissions{QJsonObject{
-        {QStringLiteral("id"), QStringLiteral("per_one")},
-        {QStringLiteral("tool"), QStringLiteral("file_write")},
-        {QStringLiteral("allowForSession"), true}}};
-    const QList<QPair<QString, QString>> cases{
-        {QStringLiteral("允许一次"), QStringLiteral("approved")},
-        {QStringLiteral("本次会话允许"), QStringLiteral("approved_for_session")},
-        {QStringLiteral("拒绝"), QStringLiteral("denied")}};
+    const QJsonArray permissions{QJsonObject{{QStringLiteral("id"), QStringLiteral("per_one")},
+                                             {QStringLiteral("tool"), QStringLiteral("file_write")},
+                                             {QStringLiteral("allowForSession"), true}}};
+    const QList<QPair<QString, QString>> cases{{QStringLiteral("允许一次"), QStringLiteral("approved")},
+                                               {QStringLiteral("本次会话允许"), QStringLiteral("approved_for_session")},
+                                               {QStringLiteral("拒绝"), QStringLiteral("denied")}};
     for (const auto& test : cases) {
-        RemoteAgentPanel panel;
+        QTemporaryDir spool;
+        QVERIFY(spool.isValid());
+        RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
         QJsonObject sent;
-        panel.setHistoryHandler([&](const QJsonObject&, const QString&, int,
-                                    RemoteAgentPanel::Completion completion) {
+        panel.setHistoryHandler([&](const QJsonObject&, const QString&, int, RemoteAgentPanel::Completion completion) {
             panel.receivePayload(remote, QStringLiteral("history_page"),
                                  {{QStringLiteral("ok"), true},
                                   {QStringLiteral("messages"), QJsonArray{}},
                                   {QStringLiteral("permissions"), permissions}});
             completion({});
         });
-        panel.setCommandHandler([&](const QJsonObject&, const QJsonObject& payload,
-                                    RemoteAgentPanel::Completion completion) {
-            sent = payload;
-            completion({});
-        });
+        panel.setCommandHandler(
+            [&](const QJsonObject&, const QJsonObject& payload, RemoteAgentPanel::Completion completion) {
+                sent = payload;
+                completion({});
+            });
         panel.show();
         panel.openSession(remote);
         QPushButton* decision = nullptr;
@@ -512,10 +503,10 @@ void DesktopSessionSyncHostTest::remotePermissionButtonsUseSharedWireDecisions()
     const QString sessionId = controller.createSession({}, QStringLiteral("权限测试"));
     DesktopSessionSyncHost host(controller);
     for (const auto& test : cases) {
-        const QJsonObject result = host.applyCommand(
-            sessionId, {{QStringLiteral("action"), QStringLiteral("permission")},
-                        {QStringLiteral("id"), QStringLiteral("per_missing")},
-                        {QStringLiteral("decision"), test.second}});
+        const QJsonObject result =
+            host.applyCommand(sessionId, {{QStringLiteral("action"), QStringLiteral("permission")},
+                                          {QStringLiteral("id"), QStringLiteral("per_missing")},
+                                          {QStringLiteral("decision"), test.second}});
         QVERIFY(!result.value(QStringLiteral("ok")).toBool());
         QVERIFY(result.value(QStringLiteral("error")).toString() != QStringLiteral("权限决定无效"));
     }
@@ -565,52 +556,44 @@ void DesktopSessionSyncHostTest::remotePromptCreatesScheduledTaskOnItsOwner() {
     QTemporaryDir workspace;
     QVERIFY(workspace.isValid());
     const QString database = QDir(workspace.path()).filePath(QStringLiteral("sessions.sqlite"));
-    const QString when = QDateTime::currentDateTimeUtc().addSecs(300)
-        .toString(QStringLiteral("yyyy-MM-dd'T'HH:mm:ss'Z'"));
+    const QString when =
+        QDateTime::currentDateTimeUtc().addSecs(300).toString(QStringLiteral("yyyy-MM-dd'T'HH:mm:ss'Z'"));
     const QJsonObject arguments{{QStringLiteral("title"), QStringLiteral("远程定时检查")},
-        {QStringLiteral("instruction"), QStringLiteral("检查桌面构建并总结")},
-        {QStringLiteral("execute_at"), when}};
+                                {QStringLiteral("instruction"), QStringLiteral("检查桌面构建并总结")},
+                                {QStringLiteral("execute_at"), when}};
     const QByteArray encoded = QJsonDocument(arguments).toJson(QJsonDocument::Compact);
-    auto model = std::make_unique<ScheduledToolModel>(
-        std::string(encoded.constData(), std::size_t(encoded.size())));
+    auto model = std::make_unique<ScheduledToolModel>(std::string(encoded.constData(), std::size_t(encoded.size())));
     AgentController controller(std::move(model), database);
     const QString sessionId = controller.createSession(workspace.path());
     QVERIFY(!sessionId.isEmpty());
     DesktopSessionSyncHost host(controller);
-    const auto opened = MaiSessionScheduleStore::open(
-        database.toUtf8().toStdString() + ".schedule.sqlite");
+    const auto opened = MaiSessionScheduleStore::open(database.toUtf8().toStdString() + ".schedule.sqlite");
     QVERIFY(opened.isOk());
 
-    const QJsonObject sent = host.applyCommand(sessionId,
-        {{QStringLiteral("action"), QStringLiteral("prompt")},
-         {QStringLiteral("text"), QStringLiteral("五分钟后检查桌面构建")}});
-    QVERIFY2(sent.value(QStringLiteral("ok")).toBool(),
-             qPrintable(sent.value(QStringLiteral("error")).toString()));
-    QTRY_COMPARE_WITH_TIMEOUT(controller.agent().listPendingPermissions().size(),
-                              std::size_t(1), 5000);
-    const QJsonArray permissions = host.historyPage(sessionId, {}, 20)
-        .value(QStringLiteral("permissions")).toArray();
+    const QJsonObject sent =
+        host.applyCommand(sessionId, {{QStringLiteral("action"), QStringLiteral("prompt")},
+                                      {QStringLiteral("text"), QStringLiteral("五分钟后检查桌面构建")}});
+    QVERIFY2(sent.value(QStringLiteral("ok")).toBool(), qPrintable(sent.value(QStringLiteral("error")).toString()));
+    QTRY_COMPARE_WITH_TIMEOUT(controller.agent().listPendingPermissions().size(), std::size_t(1), 5000);
+    const QJsonArray permissions = host.historyPage(sessionId, {}, 20).value(QStringLiteral("permissions")).toArray();
     QCOMPARE(permissions.size(), 1);
     QCOMPARE(permissions.first().toObject().value(QStringLiteral("tool")).toString(),
              QStringLiteral("maichat_session_task_create"));
     QVERIFY(opened.value()->list(sessionId.toStdString()).value().empty());
-    const QString permissionId = permissions.first().toObject()
-        .value(QStringLiteral("id")).toString();
+    const QString permissionId = permissions.first().toObject().value(QStringLiteral("id")).toString();
     QVERIFY(!permissionId.isEmpty());
-    const QJsonObject approved = host.applyCommand(sessionId,
-        {{QStringLiteral("action"), QStringLiteral("permission")},
-         {QStringLiteral("id"), permissionId},
-         {QStringLiteral("decision"), QStringLiteral("approved")}});
+    const QJsonObject approved =
+        host.applyCommand(sessionId, {{QStringLiteral("action"), QStringLiteral("permission")},
+                                      {QStringLiteral("id"), permissionId},
+                                      {QStringLiteral("decision"), QStringLiteral("approved")}});
     QVERIFY2(approved.value(QStringLiteral("ok")).toBool(),
              qPrintable(approved.value(QStringLiteral("error")).toString()));
     controller.agent().waitIdle();
     const auto tasks = opened.value()->list(sessionId.toStdString());
     QVERIFY(tasks.isOk());
     QCOMPARE(tasks.value().size(), std::size_t(1));
-    QCOMPARE(QString::fromStdString(tasks.value().front().status),
-             QStringLiteral("scheduled"));
-    QCOMPARE(QString::fromStdString(tasks.value().front().instruction),
-             QStringLiteral("检查桌面构建并总结"));
+    QCOMPARE(QString::fromStdString(tasks.value().front().status), QStringLiteral("scheduled"));
+    QCOMPARE(QString::fromStdString(tasks.value().front().instruction), QStringLiteral("检查桌面构建并总结"));
 }
 
 void DesktopSessionSyncHostTest::remoteSteeringBindsToTheOriginalOwnerTurn() {
@@ -622,8 +605,9 @@ void DesktopSessionSyncHostTest::remoteSteeringBindsToTheOriginalOwnerTurn() {
     const QString session = controller.createSession(workspace.path());
     DesktopSessionSyncHost host(controller);
     QVERIFY(host.applyCommand(session, {{QStringLiteral("action"), QStringLiteral("prompt")},
-        {QStringLiteral("text"), QStringLiteral("Prepare an image report")}})
-        .value(QStringLiteral("ok")).toBool());
+                                        {QStringLiteral("text"), QStringLiteral("Prepare an image report")}})
+                .value(QStringLiteral("ok"))
+                .toBool());
     QTRY_VERIFY_WITH_TIMEOUT(held->entered.load(), 3000);
     const QJsonObject busyPage = host.historyPage(session, {}, 20);
     QVERIFY(busyPage.value(QStringLiteral("busy")).toBool());
@@ -631,9 +615,9 @@ void DesktopSessionSyncHostTest::remoteSteeringBindsToTheOriginalOwnerTurn() {
     QVERIFY(!turn.isEmpty());
     QCOMPARE(host.rootSessions().first().toObject().value(QStringLiteral("turnId")).toString(), turn);
     const QJsonObject supplement{{QStringLiteral("action"), QStringLiteral("steer")},
-        {QStringLiteral("text"), QStringLiteral("Keep the original detail")},
-        {QStringLiteral("turnId"), turn},
-        {QStringLiteral("requestId"), QStringLiteral("fixture_supplement_request")}};
+                                 {QStringLiteral("text"), QStringLiteral("Keep the original detail")},
+                                 {QStringLiteral("turnId"), turn},
+                                 {QStringLiteral("requestId"), QStringLiteral("fixture_supplement_request")}};
     const QJsonObject accepted = host.applyCommand(session, supplement);
     QVERIFY2(accepted.value(QStringLiteral("ok")).toBool(),
              qPrintable(accepted.value(QStringLiteral("error")).toString()));
@@ -643,8 +627,9 @@ void DesktopSessionSyncHostTest::remoteSteeringBindsToTheOriginalOwnerTurn() {
     QCOMPARE(host.historyPage(session, {}, 20).value(QStringLiteral("turnId")).toString(), turn);
     QVERIFY(controller.agent().isBusy(session.toStdString()));
     QVERIFY(!host.applyCommand(session, {{QStringLiteral("action"), QStringLiteral("prompt")},
-        {QStringLiteral("text"), QStringLiteral("Must not replace the running task")}})
-        .value(QStringLiteral("ok")).toBool());
+                                         {QStringLiteral("text"), QStringLiteral("Must not replace the running task")}})
+                 .value(QStringLiteral("ok"))
+                 .toBool());
     QJsonObject invalid = supplement;
     invalid.insert(QStringLiteral("requestId"), QStringLiteral("fixture_wrong_turn"));
     invalid.insert(QStringLiteral("turnId"), QStringLiteral("msg_other_turn"));
@@ -673,30 +658,30 @@ void DesktopSessionSyncHostTest::resolvedSessionFileStaysInsideItsOwnerWorkspace
     const QString sessionId = controller.createSession(workspace.path());
     QVERIFY(!sessionId.isEmpty());
     DesktopSessionSyncHost host(controller);
-    const QString folder = QDir(workspace.path()).filePath(
-        QStringLiteral(".maichat/session-attachments"));
+    const QString folder = QDir(workspace.path()).filePath(QStringLiteral(".maichat/session-attachments"));
     QVERIFY(QDir().mkpath(folder));
     const QString path = QDir(folder).filePath(QStringLiteral("report.txt"));
     QFile file(path);
     QVERIFY(file.open(QIODevice::WriteOnly));
     QCOMPARE(file.write("session attachment"), qint64(18));
     file.close();
-    const QJsonObject valid{{QStringLiteral("action"), QStringLiteral("prompt")},
+    const QJsonObject valid{
+        {QStringLiteral("action"), QStringLiteral("prompt")},
         {QStringLiteral("text"), QString()},
-        {QStringLiteral("resolved_attachments"), QJsonArray{QJsonObject{
-            {QStringLiteral("path"), path},
-            {QStringLiteral("kind"), QStringLiteral("file")}}}}};
+        {QStringLiteral("resolved_attachments"),
+         QJsonArray{QJsonObject{{QStringLiteral("path"), path}, {QStringLiteral("kind"), QStringLiteral("file")}}}}};
     const QJsonObject accepted = host.applyCommand(sessionId, valid);
     QVERIFY2(accepted.value(QStringLiteral("ok")).toBool(),
              qPrintable(accepted.value(QStringLiteral("error")).toString()));
-    const QJsonArray history = host.historyPage(sessionId, {}, 2)
-        .value(QStringLiteral("messages")).toArray();
+    const QJsonArray history = host.historyPage(sessionId, {}, 2).value(QStringLiteral("messages")).toArray();
     QVERIFY(!history.isEmpty());
     bool found = false;
     for (const QJsonValue& value : history) {
         for (const QJsonValue& part : value.toObject().value(QStringLiteral("parts")).toArray())
-            found |= part.toObject().value(QStringLiteral("text")).toString()
-                .contains(QStringLiteral(".maichat/session-attachments/report.txt"));
+            found |= part.toObject()
+                         .value(QStringLiteral("text"))
+                         .toString()
+                         .contains(QStringLiteral(".maichat/session-attachments/report.txt"));
     }
     QVERIFY(found);
     QFile foreign(QDir(outside.path()).filePath(QStringLiteral("private.txt")));
@@ -704,9 +689,9 @@ void DesktopSessionSyncHostTest::resolvedSessionFileStaysInsideItsOwnerWorkspace
     foreign.write("private");
     foreign.close();
     QJsonObject invalid = valid;
-    invalid.insert(QStringLiteral("resolved_attachments"), QJsonArray{QJsonObject{
-        {QStringLiteral("path"), foreign.fileName()},
-        {QStringLiteral("kind"), QStringLiteral("file")}}});
+    invalid.insert(QStringLiteral("resolved_attachments"),
+                   QJsonArray{QJsonObject{{QStringLiteral("path"), foreign.fileName()},
+                                          {QStringLiteral("kind"), QStringLiteral("file")}}});
     QCOMPARE(host.applyCommand(sessionId, invalid).value(QStringLiteral("error")).toString(),
              QStringLiteral("会话附件路径无效"));
 }
@@ -764,16 +749,15 @@ void DesktopSessionSyncHostTest::coordinatorRoutesPhoneCommandToTheExistingDeskt
         [&] { return &controller; }, nullptr, QStringLiteral("desktop-test-install-id"), QStringLiteral("Test Mac"));
     coordinator.start();
     coordinator.connectionReady();
-    coordinator.acceptInbox(QJsonArray{
-        QJsonObject{{QStringLiteral("id"), 1},
-                    {QStringLiteral("kind"), QStringLiteral("command")},
-                    {QStringLiteral("session_id"), sessionId},
-                    {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
-                    {QStringLiteral("from_login_session_id"), QStringLiteral("phone-login")},
-                    {QStringLiteral("client_message_id"), QStringLiteral("command-1")},
-                    {QStringLiteral("payload"),
-                     QJsonObject{{QStringLiteral("action"), QStringLiteral("prompt")},
-                                 {QStringLiteral("text"), QStringLiteral("检查编译错误")}}}}});
+    coordinator.acceptInbox(QJsonArray{QJsonObject{
+        {QStringLiteral("id"), 1},
+        {QStringLiteral("kind"), QStringLiteral("command")},
+        {QStringLiteral("session_id"), sessionId},
+        {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
+        {QStringLiteral("from_login_session_id"), QStringLiteral("phone-login")},
+        {QStringLiteral("client_message_id"), QStringLiteral("command-1")},
+        {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"), QStringLiteral("prompt")},
+                                                {QStringLiteral("text"), QStringLiteral("检查编译错误")}}}}});
     QTRY_VERIFY_WITH_TIMEOUT(presenceUpdates > 0 && acknowledgements >= 1 && sent.size() >= 1, 5000);
     bool sawResult = false;
     for (const QJsonObject& message : sent) {
@@ -798,22 +782,20 @@ void DesktopSessionSyncHostTest::coordinatorPublishesLocalMessagesToSharedRoom()
         [&](const QString& path, const QByteArray&, const QJsonObject& body,
             DesktopSessionSyncCoordinator::Completion completion) {
             if (path == QStringLiteral("session-sync/publish")) published.append(body);
-            QTimer::singleShot(0, &controller, [completion = std::move(completion)] {
-                completion({}, {});
-            });
+            QTimer::singleShot(0, &controller, [completion = std::move(completion)] { completion({}, {}); });
         },
         [&] { return &controller; }, nullptr, QStringLiteral("test-install"), QStringLiteral("Mac"));
     coordinator.start();
     coordinator.connectionReady();
-    coordinator.acceptInbox(QJsonArray{QJsonObject{
-        {QStringLiteral("id"), 1},
-        {QStringLiteral("kind"), QStringLiteral("command")},
-        {QStringLiteral("session_id"), sessionId},
-        {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
-        {QStringLiteral("from_login_session_id"), QStringLiteral("ios-login")},
-        {QStringLiteral("client_message_id"), QStringLiteral("test-command")},
-        {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"), QStringLiteral("prompt")},
-                                                   {QStringLiteral("text"), QStringLiteral("你好")}}}}});
+    coordinator.acceptInbox(QJsonArray{
+        QJsonObject{{QStringLiteral("id"), 1},
+                    {QStringLiteral("kind"), QStringLiteral("command")},
+                    {QStringLiteral("session_id"), sessionId},
+                    {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
+                    {QStringLiteral("from_login_session_id"), QStringLiteral("ios-login")},
+                    {QStringLiteral("client_message_id"), QStringLiteral("test-command")},
+                    {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"), QStringLiteral("prompt")},
+                                                            {QStringLiteral("text"), QStringLiteral("你好")}}}}});
     QTRY_VERIFY_WITH_TIMEOUT(published.size() >= 2, 5000);
     bool sawUser = false;
     bool sawAssistant = false;
@@ -835,8 +817,8 @@ void DesktopSessionSyncHostTest::coordinatorBackfillsOlderMessagesIntoSharedRoom
     QVERIFY(!sessionId.isEmpty());
     for (int index = 0; index < 11; ++index) {
         QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(sessionId.toStdString()), 3000);
-        const auto result = controller.agent().submit(MaiSendPrompt{
-            sessionId.toStdString(), "prompt " + std::to_string(index)});
+        const auto result =
+            controller.agent().submit(MaiSendPrompt{sessionId.toStdString(), "prompt " + std::to_string(index)});
         QVERIFY(result);
     }
     QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(sessionId.toStdString()), 3000);
@@ -850,8 +832,7 @@ void DesktopSessionSyncHostTest::coordinatorBackfillsOlderMessagesIntoSharedRoom
             if (path == QStringLiteral("session-sync/publish"))
                 for (const QJsonValue& value : body.value(QStringLiteral("messages")).toArray())
                     published.insert(value.toObject().value(QStringLiteral("id")).toString());
-            QTimer::singleShot(0, &controller,
-                               [completion = std::move(completion)] { completion({}, {}); });
+            QTimer::singleShot(0, &controller, [completion = std::move(completion)] { completion({}, {}); });
         },
         [&] { return &controller; }, nullptr, QStringLiteral("test-install"), QStringLiteral("Mac"));
     coordinator.start();
@@ -870,8 +851,7 @@ void DesktopSessionSyncHostTest::coordinatorDeletesRoomWhenLocalSessionIsRemoved
             DesktopSessionSyncCoordinator::Completion completion) {
             if (path == QStringLiteral("session-sync/room-delete"))
                 removedRoom = body.value(QStringLiteral("session_id")).toString();
-            QTimer::singleShot(0, &controller,
-                               [completion = std::move(completion)] { completion({}, {}); });
+            QTimer::singleShot(0, &controller, [completion = std::move(completion)] { completion({}, {}); });
         },
         [&] { return &controller; }, nullptr, QStringLiteral("test-install"), QStringLiteral("Mac"));
     coordinator.start();
@@ -909,8 +889,8 @@ void DesktopSessionSyncHostTest::coordinatorReadsRemoteHistoryWithVerifiedChunks
                 ++historyCalls;
                 historyRequest = body;
                 response = {{QStringLiteral("ok"), true},
-                            {QStringLiteral("messages"), QJsonArray{QJsonObject{
-                                 {QStringLiteral("id"), QStringLiteral("msg_remote")}}}}};
+                            {QStringLiteral("messages"),
+                             QJsonArray{QJsonObject{{QStringLiteral("id"), QStringLiteral("msg_remote")}}}}};
             } else if (path == QStringLiteral("session-sync/ack")) {
                 ++acknowledgements;
                 response = {{QStringLiteral("acknowledged"), true}};
@@ -932,57 +912,373 @@ void DesktopSessionSyncHostTest::coordinatorReadsRemoteHistoryWithVerifiedChunks
     QTRY_VERIFY_WITH_TIMEOUT(received.value(QStringLiteral("ok")).toBool(), 5000);
     QVERIFY(error.isEmpty());
     QCOMPARE(historyRequest.value(QStringLiteral("owner_slot")).toString(), QStringLiteral("ios_phone"));
-    QCOMPARE(received.value(QStringLiteral("messages")).toArray().first().toObject()
-                 .value(QStringLiteral("id")).toString(), QStringLiteral("msg_remote"));
+    QCOMPARE(
+        received.value(QStringLiteral("messages")).toArray().first().toObject().value(QStringLiteral("id")).toString(),
+        QStringLiteral("msg_remote"));
     QJsonObject offline = remote;
     offline.insert(QStringLiteral("online"), false);
     coordinator.acceptCatalog(QJsonArray{offline});
-    coordinator.requestRemoteHistory(offline, {}, 10,
-                                     [&](const QJsonObject&, const QString& value) { error = value; });
+    coordinator.requestRemoteHistory(offline, {}, 10, [&](const QJsonObject&, const QString& value) { error = value; });
     QTRY_VERIFY_WITH_TIMEOUT(historyCalls == 2 && error.isEmpty(), 5000);
     coordinator.acceptCatalog(QJsonArray{remote});
-    const QJsonObject update{{QStringLiteral("ok"), true},
-                             {QStringLiteral("messages"), QJsonArray{QJsonObject{
-                                  {QStringLiteral("id"), QStringLiteral("msg_pushed")}}}}};
+    const QJsonObject update{
+        {QStringLiteral("ok"), true},
+        {QStringLiteral("messages"), QJsonArray{QJsonObject{{QStringLiteral("id"), QStringLiteral("msg_pushed")}}}}};
     const QByteArray bytes = QJsonDocument(update).toJson(QJsonDocument::Compact);
-    const QString digest = QString::fromLatin1(QCryptographicHash::hash(
-        bytes, QCryptographicHash::Sha256).toHex());
-    coordinator.acceptInbox(QJsonArray{QJsonObject{
-        {QStringLiteral("id"), 2}, {QStringLiteral("kind"), QStringLiteral("event")},
-        {QStringLiteral("session_id"), QStringLiteral("ses_phone")},
-        {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
-        {QStringLiteral("from_login_session_id"), QStringLiteral("phone-login")},
-        {QStringLiteral("payload"), QJsonObject{
-            {QStringLiteral("transfer_id"), QStringLiteral("transfer-1")},
-            {QStringLiteral("chunk_index"), 0}, {QStringLiteral("chunk_count"), 1},
-            {QStringLiteral("sha256"), digest},
-            {QStringLiteral("data_base64"), QString::fromLatin1(bytes.toBase64())}}}}});
+    const QString digest = QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+    coordinator.acceptInbox(
+        QJsonArray{QJsonObject{{QStringLiteral("id"), 2},
+                               {QStringLiteral("kind"), QStringLiteral("event")},
+                               {QStringLiteral("session_id"), QStringLiteral("ses_phone")},
+                               {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
+                               {QStringLiteral("from_login_session_id"), QStringLiteral("phone-login")},
+                               {QStringLiteral("payload"),
+                                QJsonObject{{QStringLiteral("transfer_id"), QStringLiteral("transfer-1")},
+                                            {QStringLiteral("chunk_index"), 0},
+                                            {QStringLiteral("chunk_count"), 1},
+                                            {QStringLiteral("sha256"), digest},
+                                            {QStringLiteral("data_base64"), QString::fromLatin1(bytes.toBase64())}}}}});
     QTRY_VERIFY_WITH_TIMEOUT(acknowledgements > 0, 5000);
-    coordinator.sendRemoteCommand(catalog.first().toObject(),
-                                  {{QStringLiteral("action"), QStringLiteral("prompt")},
-                                   {QStringLiteral("text"), QStringLiteral("继续")}},
-                                  [&](const QJsonObject&, const QString& value) { error = value; });
+    coordinator.sendRemoteCommand(
+        catalog.first().toObject(),
+        {{QStringLiteral("action"), QStringLiteral("prompt")}, {QStringLiteral("text"), QStringLiteral("继续")}},
+        [&](const QJsonObject&, const QString& value) { error = value; });
     QTRY_VERIFY_WITH_TIMEOUT(!sentCommand.isEmpty(), 5000);
     QVERIFY(error.isEmpty());
     QCOMPARE(sentCommand.value(QStringLiteral("to_slot")).toString(), QStringLiteral("ios_phone"));
-    QCOMPARE(sentCommand.value(QStringLiteral("payload")).toObject()
-                 .value(QStringLiteral("text")).toString(), QStringLiteral("继续"));
+    QCOMPARE(sentCommand.value(QStringLiteral("payload")).toObject().value(QStringLiteral("text")).toString(),
+             QStringLiteral("继续"));
     const QString firstCommandId = sentCommand.value(QStringLiteral("client_message_id")).toString();
     bool retryFinished = false;
-    coordinator.sendRemoteCommand(catalog.first().toObject(),
-                                  {{QStringLiteral("action"), QStringLiteral("prompt")},
-                                   {QStringLiteral("text"), QStringLiteral("继续")}},
-                                  [&](const QJsonObject&, const QString& value) {
-                                      error = value;
-                                      retryFinished = true;
-                                  });
+    coordinator.sendRemoteCommand(
+        catalog.first().toObject(),
+        {{QStringLiteral("action"), QStringLiteral("prompt")}, {QStringLiteral("text"), QStringLiteral("继续")}},
+        [&](const QJsonObject&, const QString& value) {
+            error = value;
+            retryFinished = true;
+        });
     QCOMPARE(sentCommand.value(QStringLiteral("client_message_id")).toString(), firstCommandId);
     QTRY_VERIFY_WITH_TIMEOUT(retryFinished, 5000);
     QVERIFY(error.isEmpty());
 }
 
+void DesktopSessionSyncHostTest::remoteBusyComposerQueuesSteeringAndStopSeparately() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
+    const QJsonObject remote{{QStringLiteral("id"), QStringLiteral("ses_remote_busy_fixture")},
+                             {QStringLiteral("device_slot"), QStringLiteral("ios_fixture")},
+                             {QStringLiteral("login_session_id"), QStringLiteral("fixture_login")},
+                             {QStringLiteral("online"), true},
+                             {QStringLiteral("busy"), true},
+                             {QStringLiteral("turnId"), QStringLiteral("msg_original_turn")}};
+    QList<QJsonObject> sent;
+    panel.setCommandHandler(
+        [&](const QJsonObject& owner, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            QCOMPARE(owner.value(QStringLiteral("id")), remote.value(QStringLiteral("id")));
+            sent.append(action);
+            completion({});
+        });
+    panel.openSession(remote);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+    QVERIFY(editor && editor->isEnabled() && !editor->isReadOnly());
+    editor->setPlainText(QStringLiteral("First fixture supplement."));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QCOMPARE(sent.size(), 1);
+    QCOMPARE(sent[0].value(QStringLiteral("action")).toString(), QStringLiteral("steer"));
+    QCOMPARE(sent[0].value(QStringLiteral("turnId")).toString(), QStringLiteral("msg_original_turn"));
+    const QString firstRequest = sent[0].value(QStringLiteral("requestId")).toString();
+    QVERIFY(!firstRequest.isEmpty());
+    editor->setPlainText(QStringLiteral("Second fixture supplement."));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QCOMPARE(editor->toPlainText(), QString());
+    QCOMPARE(sent.size(), 1);
+    panel.receivePayload(remote, QStringLiteral("event"),
+                         {{QStringLiteral("type"), QStringLiteral("command_result")},
+                          {QStringLiteral("command_id"), firstRequest},
+                          {QStringLiteral("result"),
+                           QJsonObject{{QStringLiteral("ok"), true},
+                                       {QStringLiteral("user_message_id"), QStringLiteral("msg_accepted_fixture")}}}});
+    QTRY_COMPARE(sent.size(), 2);
+    QCOMPARE(sent[1].value(QStringLiteral("action")).toString(), QStringLiteral("steer"));
+    QCOMPARE(sent[1].value(QStringLiteral("turnId")).toString(), QStringLiteral("msg_original_turn"));
+    QVERIFY(sent[1].value(QStringLiteral("requestId")).toString() != firstRequest);
+    editor->setPlainText(QStringLiteral("Unsent text survives Stop."));
+    auto* stop = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentStopButton"));
+    QVERIFY(stop);
+    stop->click();
+    QCOMPARE(sent.size(), 3);
+    QCOMPARE(sent.last().value(QStringLiteral("action")).toString(), QStringLiteral("stop"));
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Unsent text survives Stop."));
+    QJsonObject idle = remote;
+    idle.insert(QStringLiteral("busy"), false);
+    idle.insert(QStringLiteral("turnId"), QString());
+    panel.updateSession(idle);
+    QTest::qWait(40);
+    QCOMPARE(sent.size(), 3);
+}
+
+void DesktopSessionSyncHostTest::remoteTransportCompletionPreservesNewDraft() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
+    const QJsonObject remote{{QStringLiteral("id"), QStringLiteral("ses_remote_draft_fixture")},
+                             {QStringLiteral("device_slot"), QStringLiteral("ios_fixture")},
+                             {QStringLiteral("login_session_id"), QStringLiteral("fixture_login")},
+                             {QStringLiteral("online"), true},
+                             {QStringLiteral("busy"), false}};
+    RemoteAgentPanel::Completion delivered;
+    panel.setCommandHandler([&](const QJsonObject&, const QJsonObject&, RemoteAgentPanel::Completion completion) {
+        delivered = std::move(completion);
+    });
+    panel.openSession(remote);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+    QVERIFY(editor);
+    editor->setPlainText(QStringLiteral("First fixture message."));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QVERIFY(bool(delivered));
+    editor->setPlainText(QStringLiteral("New draft while transport waits."));
+    delivered({});
+    QCOMPARE(editor->toPlainText(), QStringLiteral("New draft while transport waits."));
+}
+
+void DesktopSessionSyncHostTest::remoteQueueMatchesOwnerReceiptAndRetainsPrivateRecovery() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    const QString file = spool.filePath(QStringLiteral("outbox.json"));
+    const QJsonObject owner{{QStringLiteral("id"), QStringLiteral("ses_owner_a")},
+                            {QStringLiteral("device_slot"), QStringLiteral("fixture_a")},
+                            {QStringLiteral("login_session_id"), QStringLiteral("login_a")},
+                            {QStringLiteral("online"), true},
+                            {QStringLiteral("busy"), true},
+                            {QStringLiteral("turnId"), QStringLiteral("msg_original")}};
+    QJsonObject other = owner;
+    other.insert(QStringLiteral("id"), QStringLiteral("ses_owner_b"));
+    QList<QJsonObject> sent;
+    QString firstRequest;
+    {
+        RemoteAgentPanel panel(nullptr, file);
+        panel.setCommandHandler(
+            [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+                sent.append(action);
+                completion({});
+            });
+        panel.openSession(owner);
+        auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+        editor->setPlainText(QStringLiteral("Retained fixture one"));
+        QTest::keyClick(editor, Qt::Key_Return);
+        editor->setPlainText(QStringLiteral("Retained fixture two"));
+        QTest::keyClick(editor, Qt::Key_Return);
+        QCOMPARE(sent.size(), 1);
+        firstRequest = sent.first().value(QStringLiteral("requestId")).toString();
+        const auto acknowledge = [&](const QJsonObject& source, const QString& id) {
+            panel.receivePayload(source, QStringLiteral("event"),
+                                 {{QStringLiteral("type"), QStringLiteral("command_result")},
+                                  {QStringLiteral("command_id"), id},
+                                  {QStringLiteral("result"), QJsonObject{{QStringLiteral("ok"), true},
+                                                                         {QStringLiteral("user_message_id"),
+                                                                          QStringLiteral("msg_accepted_fixture")}}}});
+        };
+        acknowledge(owner, QStringLiteral("unrelated-request"));
+        acknowledge(other, firstRequest);
+        QCOMPARE(sent.size(), 1);
+        panel.openSession(other);
+        editor->setPlainText(QStringLiteral("Other owner's unsent draft"));
+        acknowledge(owner, firstRequest);
+        QCOMPARE(sent.size(), 2);
+        QCOMPARE(editor->toPlainText(), QStringLiteral("Other owner's unsent draft"));
+        panel.openSession(owner);
+        QTRY_COMPARE(sent.size(), 2);
+        QCOMPARE(sent.last().value(QStringLiteral("text")).toString(), QStringLiteral("Retained fixture two"));
+    }
+    const int dispatched = sent.size();
+    RemoteAgentPanel restored(nullptr, file);
+    restored.setCommandHandler(
+        [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            sent.append(action);
+            completion({});
+        });
+    restored.openSession(owner);
+    QCOMPARE(sent.size(), dispatched);  // A restart never blindly replays an unknown delivery.
+    auto* editor = restored.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+    auto* recover = restored.findChild<QPushButton*>(QStringLiteral("remoteAgentRecoverDraftButton"));
+    QVERIFY(recover && !recover->isHidden());
+    editor->setPlainText(QStringLiteral("New draft survives recovery"));
+    recover->click();
+    QCOMPARE(editor->toPlainText(), QStringLiteral("New draft survives recovery"));
+    editor->clear();
+    recover->click();
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Retained fixture two"));
+    QCOMPARE(sent.size(), dispatched);
+    restored.openSession(other);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Other owner's unsent draft"));
+}
+
+void DesktopSessionSyncHostTest::remoteIdleConsecutiveSendsBindToAcknowledgedOriginalTurn() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
+    const QJsonObject owner{{QStringLiteral("id"), QStringLiteral("ses_idle_queue")},
+                            {QStringLiteral("device_slot"), QStringLiteral("fixture")},
+                            {QStringLiteral("login_session_id"), QStringLiteral("login")},
+                            {QStringLiteral("online"), true},
+                            {QStringLiteral("busy"), false}};
+    QList<QJsonObject> sent;
+    panel.setCommandHandler(
+        [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            sent.append(action);
+            completion({});
+        });
+    panel.openSession(owner);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+    editor->setPlainText(QStringLiteral("Start original fixture"));
+    QTest::keyClick(editor, Qt::Key_Return);
+    editor->setPlainText(QStringLiteral("Supplement before presence arrives"));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QCOMPARE(sent.size(), 1);
+    panel.receivePayload(owner, QStringLiteral("event"),
+                         {{QStringLiteral("type"), QStringLiteral("command_result")},
+                          {QStringLiteral("command_id"), sent.first().value(QStringLiteral("requestId"))},
+                          {QStringLiteral("result"),
+                           QJsonObject{{QStringLiteral("ok"), true},
+                                       {QStringLiteral("user_message_id"), QStringLiteral("msg_initial_fixture")},
+                                       {QStringLiteral("turnId"), QStringLiteral("msg_owner_ack_turn")}}}});
+    QTRY_COMPARE(sent.size(), 2);
+    QCOMPARE(sent.last().value(QStringLiteral("action")).toString(), QStringLiteral("steer"));
+    QCOMPARE(sent.last().value(QStringLiteral("turnId")).toString(), QStringLiteral("msg_owner_ack_turn"));
+    QVERIFY(!sent.last().contains(QStringLiteral("afterRequest")));
+}
+
+void DesktopSessionSyncHostTest::remoteQueueStorageFailureRetainsDraft() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    // A directory is deliberately not a writable spool file.
+    RemoteAgentPanel panel(nullptr, spool.path());
+    const QJsonObject owner{{QStringLiteral("id"), QStringLiteral("ses_storage_fixture")},
+                            {QStringLiteral("device_slot"), QStringLiteral("fixture")},
+                            {QStringLiteral("login_session_id"), QStringLiteral("login")},
+                            {QStringLiteral("online"), true}};
+    int sent = 0;
+    panel.setCommandHandler([&](const QJsonObject&, const QJsonObject&, RemoteAgentPanel::Completion) { ++sent; });
+    panel.openSession(owner);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+    editor->setPlainText(QStringLiteral("No data loss on storage failure"));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("No data loss on storage failure"));
+    QCOMPARE(sent, 0);
+}
+
+void DesktopSessionSyncHostTest::remoteLateSteerReceiptDoesNotReplaceNewerOwnerTurn() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
+    QJsonObject owner{{QStringLiteral("id"), QStringLiteral("ses_late_receipt_fixture")},
+                      {QStringLiteral("device_slot"), QStringLiteral("fixture")},
+                      {QStringLiteral("login_session_id"), QStringLiteral("login")},
+                      {QStringLiteral("online"), true},
+                      {QStringLiteral("busy"), true},
+                      {QStringLiteral("turnId"), QStringLiteral("msg_original_turn")}};
+    QList<QJsonObject> sent;
+    panel.setCommandHandler(
+        [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            sent.append(action);
+            completion({});
+        });
+    panel.openSession(owner);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+    editor->setPlainText(QStringLiteral("Old turn supplement"));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QCOMPARE(sent.size(), 1);
+    owner.insert(QStringLiteral("turnId"), QStringLiteral("msg_newer_turn"));
+    panel.updateSession(owner);
+    panel.receivePayload(owner, QStringLiteral("event"),
+                         {{QStringLiteral("type"), QStringLiteral("command_result")},
+                          {QStringLiteral("command_id"), sent.first().value(QStringLiteral("requestId"))},
+                          {QStringLiteral("result"),
+                           QJsonObject{{QStringLiteral("ok"), true},
+                                       {QStringLiteral("user_message_id"), QStringLiteral("msg_old_accepted_user")},
+                                       {QStringLiteral("turnId"), QStringLiteral("msg_original_turn")}}}});
+    QCOMPARE(panel.session().value(QStringLiteral("turnId")).toString(), QStringLiteral("msg_newer_turn"));
+    editor->setPlainText(QStringLiteral("New turn supplement"));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QCOMPARE(sent.size(), 2);
+    QCOMPARE(sent.last().value(QStringLiteral("turnId")).toString(), QStringLiteral("msg_newer_turn"));
+    editor->setPlainText(QStringLiteral("Queued original turn tail"));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QCOMPARE(sent.size(), 2);
+    QJsonObject visibleOwner = owner;
+    visibleOwner.insert(QStringLiteral("id"), QStringLiteral("ses_visible_other_owner"));
+    panel.openSession(visibleOwner);
+    editor->setPlainText(QStringLiteral("Visible owner's draft"));
+    auto* status = panel.findChild<QLabel*>(QStringLiteral("remoteAgentStatus"));
+    QVERIFY(status);
+    const QString visibleStatus = status->text();
+    owner.insert(QStringLiteral("turnId"), QStringLiteral("msg_owner_replaced_again"));
+    panel.updateSession(owner);  // An inactive owner's catalog still updates its own dispatch guard.
+    panel.receivePayload(owner, QStringLiteral("event"),
+                         {{QStringLiteral("type"), QStringLiteral("command_result")},
+                          {QStringLiteral("command_id"), sent.last().value(QStringLiteral("requestId"))},
+                          {QStringLiteral("result"),
+                           QJsonObject{{QStringLiteral("ok"), true},
+                                       {QStringLiteral("user_message_id"), QStringLiteral("msg_second_accepted")},
+                                       {QStringLiteral("turnId"), QStringLiteral("msg_newer_turn")}}}});
+    QCOMPARE(sent.size(), 2);  // The original queued tail targets the old turn and stays held.
+    QCOMPARE(status->text(), visibleStatus);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Visible owner's draft"));
+    panel.openSession(owner);
+    auto* recover = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentRecoverDraftButton"));
+    QVERIFY(recover && !recover->isHidden());
+    recover->click();
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Queued original turn tail"));
+    editor->clear();
+    editor->setPlainText(QStringLiteral("Malformed receipt capture"));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QCOMPARE(sent.size(), 3);
+    panel.receivePayload(owner, QStringLiteral("event"),
+                         {{QStringLiteral("type"), QStringLiteral("command_result")},
+                          {QStringLiteral("command_id"), sent.last().value(QStringLiteral("requestId"))},
+                          {QStringLiteral("result"), QJsonObject{{QStringLiteral("ok"), QStringLiteral("true")}}}});
+    QVERIFY(editor->toPlainText().isEmpty());  // Unknown is never treated as confirmed rejection/retry.
+    QVERIFY(!recover->isHidden());
+    QFile saved(spool.filePath(QStringLiteral("outbox.json")));
+    QVERIFY(saved.open(QIODevice::ReadOnly));
+    const QJsonArray retained =
+        QJsonDocument::fromJson(saved.readAll()).object().value(QStringLiteral("outbox")).toArray();
+    QCOMPARE(retained.size(), 1);
+    QCOMPARE(retained.first().toObject().value(QStringLiteral("state")).toString(), QStringLiteral("unknown"));
+    QCOMPARE(retained.first().toObject().value(QStringLiteral("requestId")),
+             sent.last().value(QStringLiteral("requestId")));
+    saved.close();
+    // An explicit late successful receipt can settle unknown without a new request.
+    panel.receivePayload(owner, QStringLiteral("event"),
+                         {{QStringLiteral("type"), QStringLiteral("command_result")},
+                          {QStringLiteral("command_id"), sent.last().value(QStringLiteral("requestId"))},
+                          {QStringLiteral("result"),
+                           QJsonObject{{QStringLiteral("ok"), true},
+                                       {QStringLiteral("user_message_id"), QStringLiteral("msg_late_confirmed_user")},
+                                       {QStringLiteral("turnId"), owner.value(QStringLiteral("turnId"))}}}});
+    editor->setPlainText(QStringLiteral("Explicit unknown flag fixture"));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QCOMPARE(sent.size(), 4);
+    panel.receivePayload(
+        owner, QStringLiteral("event"),
+        {{QStringLiteral("type"), QStringLiteral("command_result")},
+         {QStringLiteral("command_id"), sent.last().value(QStringLiteral("requestId"))},
+         {QStringLiteral("result"), QJsonObject{{QStringLiteral("ok"), false}, {QStringLiteral("unknown"), true}}}});
+    QVERIFY(editor->toPlainText().isEmpty());
+    QVERIFY(saved.open(QIODevice::ReadOnly));
+    const QJsonArray unknown =
+        QJsonDocument::fromJson(saved.readAll()).object().value(QStringLiteral("outbox")).toArray();
+    QCOMPARE(unknown.size(), 1);
+    QCOMPARE(unknown.first().toObject().value(QStringLiteral("state")).toString(), QStringLiteral("unknown"));
+    QCOMPARE(unknown.first().toObject().value(QStringLiteral("requestId")),
+             sent.last().value(QStringLiteral("requestId")));
+}
+
 void DesktopSessionSyncHostTest::remotePanelShowsHistoryAndRoutesTextToOwner() {
-    RemoteAgentPanel panel;
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
     panel.resize(900, 680);
     const QJsonObject remote{{QStringLiteral("id"), QStringLiteral("ses_remote")},
                              {QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
@@ -991,25 +1287,24 @@ void DesktopSessionSyncHostTest::remotePanelShowsHistoryAndRoutesTextToOwner() {
                              {QStringLiteral("online"), true},
                              {QStringLiteral("busy"), false}};
     QJsonObject sent;
-    panel.setHistoryHandler([&](const QJsonObject& session, const QString&, int,
-                                RemoteAgentPanel::Completion completion) {
-        QCOMPARE(session.value(QStringLiteral("id")).toString(), QStringLiteral("ses_remote"));
-        const QJsonObject part{{QStringLiteral("kind"), QStringLiteral("text")},
-                               {QStringLiteral("text"), QStringLiteral("所属手机的历史")}};
-        const QJsonObject message{{QStringLiteral("id"), QStringLiteral("msg_1")},
-                                  {QStringLiteral("role"), QStringLiteral("assistant")},
-                                  {QStringLiteral("parts"), QJsonArray{part}}};
-        panel.receivePayload(remote, QStringLiteral("history_page"),
-                             {{QStringLiteral("ok"), true},
-                              {QStringLiteral("messages"), QJsonArray{message}}});
-        completion({});
-    });
-    panel.setCommandHandler([&](const QJsonObject& session, const QJsonObject& action,
-                                RemoteAgentPanel::Completion completion) {
-        QCOMPARE(session.value(QStringLiteral("id")).toString(), QStringLiteral("ses_remote"));
-        sent = action;
-        completion({});
-    });
+    panel.setHistoryHandler(
+        [&](const QJsonObject& session, const QString&, int, RemoteAgentPanel::Completion completion) {
+            QCOMPARE(session.value(QStringLiteral("id")).toString(), QStringLiteral("ses_remote"));
+            const QJsonObject part{{QStringLiteral("kind"), QStringLiteral("text")},
+                                   {QStringLiteral("text"), QStringLiteral("所属手机的历史")}};
+            const QJsonObject message{{QStringLiteral("id"), QStringLiteral("msg_1")},
+                                      {QStringLiteral("role"), QStringLiteral("assistant")},
+                                      {QStringLiteral("parts"), QJsonArray{part}}};
+            panel.receivePayload(remote, QStringLiteral("history_page"),
+                                 {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+            completion({});
+        });
+    panel.setCommandHandler(
+        [&](const QJsonObject& session, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            QCOMPARE(session.value(QStringLiteral("id")).toString(), QStringLiteral("ses_remote"));
+            sent = action;
+            completion({});
+        });
     panel.show();
     panel.openSession(remote);
     auto* transcript = panel.findChild<MarkdownView*>();
@@ -1031,7 +1326,10 @@ void DesktopSessionSyncHostTest::remotePanelShowsHistoryAndRoutesTextToOwner() {
     QCOMPARE(composer->toPlainText(), QString());
     panel.receivePayload(remote, QStringLiteral("event"),
                          {{QStringLiteral("type"), QStringLiteral("command_result")},
-                          {QStringLiteral("result"), QJsonObject{{QStringLiteral("ok"), true}}}});
+                          {QStringLiteral("command_id"), sent.value(QStringLiteral("requestId"))},
+                          {QStringLiteral("result"),
+                           QJsonObject{{QStringLiteral("ok"), true},
+                                       {QStringLiteral("user_message_id"), QStringLiteral("msg_accepted_fixture")}}}});
     QVERIFY(transcript->contains(QStringLiteral("remote-thinking")));
     auto* status = panel.findChild<QLabel*>(QStringLiteral("remoteAgentStatus"));
     QVERIFY(status && !status->isVisible());
@@ -1042,46 +1340,51 @@ void DesktopSessionSyncHostTest::remotePanelShowsHistoryAndRoutesTextToOwner() {
                              {QStringLiteral("active"), true},
                              {QStringLiteral("parts"), QJsonArray{}}};
     panel.receivePayload(remote, QStringLiteral("history_page"),
-                         {{QStringLiteral("ok"), true},
-                          {QStringLiteral("messages"), QJsonArray{active}}});
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{active}}});
     QVERIFY(transcript->contains(QStringLiteral("remote-thinking")));
     QJsonObject completed = active;
     completed.insert(QStringLiteral("active"), false);
-    completed.insert(QStringLiteral("parts"), QJsonArray{QJsonObject{
-        {QStringLiteral("kind"), QStringLiteral("text")},
-        {QStringLiteral("text"), QStringLiteral("已完成")}}});
+    completed.insert(QStringLiteral("parts"),
+                     QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")},
+                                            {QStringLiteral("text"), QStringLiteral("已完成")}}});
     panel.receivePayload(remote, QStringLiteral("history_page"),
-                         {{QStringLiteral("ok"), true},
-                          {QStringLiteral("messages"), QJsonArray{completed}}});
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{completed}}});
     QVERIFY(!transcript->contains(QStringLiteral("remote-thinking")));
     composer->setPlainText(QStringLiteral("请保留草稿"));
     QTest::mouseClick(send, Qt::LeftButton);
     QCOMPARE(composer->toPlainText(), QString());
-    panel.receivePayload(remote, QStringLiteral("event"),
-                         {{QStringLiteral("type"), QStringLiteral("command_result")},
-                          {QStringLiteral("result"), QJsonObject{{QStringLiteral("ok"), false},
-                                                                   {QStringLiteral("error"),
-                                                                    QStringLiteral("所属设备拒绝")}}}});
+    panel.receivePayload(
+        remote, QStringLiteral("event"),
+        {{QStringLiteral("type"), QStringLiteral("command_result")},
+         {QStringLiteral("command_id"), sent.value(QStringLiteral("requestId"))},
+         {QStringLiteral("result"),
+          QJsonObject{{QStringLiteral("ok"), false}, {QStringLiteral("error"), QStringLiteral("所属设备拒绝")}}}});
     QCOMPARE(composer->toPlainText(), QStringLiteral("请保留草稿"));
-    panel.setCommandHandler([&](const QJsonObject&, const QJsonObject&,
-                                RemoteAgentPanel::Completion completion) {
-        panel.receivePayload(remote, QStringLiteral("event"),
-                             {{QStringLiteral("type"), QStringLiteral("command_result")},
-                              {QStringLiteral("result"), QJsonObject{{QStringLiteral("ok"), false},
-                                                                       {QStringLiteral("error"),
-                                                                        QStringLiteral("立即拒绝")}}}});
-        completion({});
-    });
+    panel.setCommandHandler(
+        [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            sent = action;
+            panel.receivePayload(
+                remote, QStringLiteral("event"),
+                {{QStringLiteral("type"), QStringLiteral("command_result")},
+                 {QStringLiteral("command_id"), sent.value(QStringLiteral("requestId"))},
+                 {QStringLiteral("result"),
+                  QJsonObject{{QStringLiteral("ok"), false}, {QStringLiteral("error"), QStringLiteral("立即拒绝")}}}});
+            completion({});
+        });
     composer->setPlainText(QStringLiteral("快速拒绝也保留"));
     QTest::mouseClick(send, Qt::LeftButton);
     QCOMPARE(composer->toPlainText(), QStringLiteral("快速拒绝也保留"));
-    panel.setCommandHandler([&](const QJsonObject&, const QJsonObject&,
-                                RemoteAgentPanel::Completion completion) {
-        panel.receivePayload(remote, QStringLiteral("event"),
-                             {{QStringLiteral("type"), QStringLiteral("command_result")},
-                              {QStringLiteral("result"), QJsonObject{{QStringLiteral("ok"), true}}}});
-        completion({});
-    });
+    panel.setCommandHandler(
+        [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            sent = action;
+            panel.receivePayload(remote, QStringLiteral("event"),
+                                 {{QStringLiteral("type"), QStringLiteral("command_result")},
+                                  {QStringLiteral("command_id"), sent.value(QStringLiteral("requestId"))},
+                                  {QStringLiteral("result"), QJsonObject{{QStringLiteral("ok"), true},
+                                                                         {QStringLiteral("user_message_id"),
+                                                                          QStringLiteral("msg_accepted_fixture")}}}});
+            completion({});
+        });
     composer->setPlainText(QStringLiteral("快速确认应清空"));
     QTest::mouseClick(send, Qt::LeftButton);
     QCOMPARE(composer->toPlainText(), QString());
@@ -1090,31 +1393,34 @@ void DesktopSessionSyncHostTest::remotePanelShowsHistoryAndRoutesTextToOwner() {
 }
 
 void DesktopSessionSyncHostTest::remotePanelRoutesAttachmentLinkToVerifiedDownload() {
-    RemoteAgentPanel panel;
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
     const QString id = QStringLiteral("123e4567-e89b-42d3-a456-426614174000");
     const QJsonObject remote{{QStringLiteral("id"), QStringLiteral("ses_remote")},
                              {QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
                              {QStringLiteral("login_session_id"), QStringLiteral("login_phone")},
                              {QStringLiteral("online"), true}};
-    panel.setHistoryHandler([&](const QJsonObject&, const QString&, int,
-                                RemoteAgentPanel::Completion completion) {
-        panel.receivePayload(remote, QStringLiteral("history_page"),
+    panel.setHistoryHandler([&](const QJsonObject&, const QString&, int, RemoteAgentPanel::Completion completion) {
+        panel.receivePayload(
+            remote, QStringLiteral("history_page"),
             {{QStringLiteral("ok"), true},
-             {QStringLiteral("messages"), QJsonArray{QJsonObject{
-                 {QStringLiteral("id"), QStringLiteral("msg_attached")},
-                 {QStringLiteral("role"), QStringLiteral("user")},
-                 {QStringLiteral("parts"), QJsonArray{QJsonObject{
-                     {QStringLiteral("kind"), QStringLiteral("file")},
-                     {QStringLiteral("attachment_id"), id},
-                     {QStringLiteral("name"), QStringLiteral("notes.pdf")}}}}}}}});
+             {QStringLiteral("messages"),
+              QJsonArray{
+                  QJsonObject{{QStringLiteral("id"), QStringLiteral("msg_attached")},
+                              {QStringLiteral("role"), QStringLiteral("user")},
+                              {QStringLiteral("parts"),
+                               QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("file")},
+                                                      {QStringLiteral("attachment_id"), id},
+                                                      {QStringLiteral("name"), QStringLiteral("notes.pdf")}}}}}}}});
         completion({});
     });
     QString requested;
-    panel.setDownloadHandler([&](const QJsonObject&, const QString& attachment,
-                                 RemoteAgentPanel::DownloadCompletion completion) {
-        requested = attachment;
-        completion({}, QStringLiteral("隔离测试无下载文件"));
-    });
+    panel.setDownloadHandler(
+        [&](const QJsonObject&, const QString& attachment, RemoteAgentPanel::DownloadCompletion completion) {
+            requested = attachment;
+            completion({}, QStringLiteral("隔离测试无下载文件"));
+        });
     panel.show();
     panel.openSession(remote);
     auto* view = panel.findChild<MarkdownView*>();
@@ -1127,18 +1433,20 @@ void DesktopSessionSyncHostTest::remotePanelRoutesAttachmentLinkToVerifiedDownlo
 }
 
 void DesktopSessionSyncHostTest::remotePanelDoesNotRepeatPendingHistory() {
-    RemoteAgentPanel panel;
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
     const QJsonObject remote{{QStringLiteral("id"), QStringLiteral("ses_remote")},
                              {QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
                              {QStringLiteral("login_session_id"), QStringLiteral("phone_login")},
                              {QStringLiteral("online"), true}};
     int requests = 0;
-    panel.setHistoryHandler([&](const QJsonObject&, const QString&, int limit,
-                                RemoteAgentPanel::Completion completion) {
-        ++requests;
-        QCOMPARE(limit, 10);
-        completion({});
-    });
+    panel.setHistoryHandler(
+        [&](const QJsonObject&, const QString&, int limit, RemoteAgentPanel::Completion completion) {
+            ++requests;
+            QCOMPARE(limit, 10);
+            completion({});
+        });
     panel.show();
     panel.openSession(remote);
     QCOMPARE(requests, 1);
@@ -1147,7 +1455,9 @@ void DesktopSessionSyncHostTest::remotePanelDoesNotRepeatPendingHistory() {
 }
 
 void DesktopSessionSyncHostTest::remotePanelReconcilesAfterReconnect() {
-    RemoteAgentPanel panel;
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
     const QJsonObject remote{{QStringLiteral("id"), QStringLiteral("ses_remote")},
                              {QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
                              {QStringLiteral("login_session_id"), QStringLiteral("phone_login")},
@@ -1161,19 +1471,16 @@ void DesktopSessionSyncHostTest::remotePanelReconcilesAfterReconnect() {
             messages.append(QJsonObject{
                 {QStringLiteral("id"), QStringLiteral("msg_assistant")},
                 {QStringLiteral("role"), QStringLiteral("assistant")},
-                {QStringLiteral("parts"), QJsonArray{QJsonObject{
-                    {QStringLiteral("kind"), QStringLiteral("text")},
-                    {QStringLiteral("text"), QStringLiteral("收到")}}}}});
+                {QStringLiteral("parts"), QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")},
+                                                                 {QStringLiteral("text"), QStringLiteral("收到")}}}}});
             messages.append(QJsonObject{
                 {QStringLiteral("id"), QStringLiteral("msg_user")},
                 {QStringLiteral("role"), QStringLiteral("user")},
-                {QStringLiteral("parts"), QJsonArray{QJsonObject{
-                    {QStringLiteral("kind"), QStringLiteral("text")},
-                    {QStringLiteral("text"), QStringLiteral("你好")}}}}});
+                {QStringLiteral("parts"), QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")},
+                                                                 {QStringLiteral("text"), QStringLiteral("你好")}}}}});
         }
         panel.receivePayload(remote, QStringLiteral("history_page"),
-                             {{QStringLiteral("ok"), true},
-                              {QStringLiteral("messages"), messages}});
+                             {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), messages}});
         completion({});
     });
     panel.show();
@@ -1192,22 +1499,27 @@ void DesktopSessionSyncHostTest::remotePanelReconcilesAfterReconnect() {
 }
 
 void DesktopSessionSyncHostTest::remotePanelKeepsOwnPromptWhenRoomBroadcastsCanonicalMessage() {
-    RemoteAgentPanel panel;
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
     const QJsonObject remote{{QStringLiteral("id"), QStringLiteral("ses_remote")},
                              {QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
                              {QStringLiteral("login_session_id"), QStringLiteral("phone_login")},
                              {QStringLiteral("online"), true}};
     QList<int> limits;
-    panel.setHistoryHandler([&](const QJsonObject&, const QString&, int limit,
-                                RemoteAgentPanel::Completion completion) {
-        limits.append(limit);
-        panel.receivePayload(remote, QStringLiteral("history_page"),
-                             {{QStringLiteral("ok"), true},
-                              {QStringLiteral("messages"), QJsonArray{}}});
-        completion({});
-    });
-    panel.setCommandHandler([&](const QJsonObject&, const QJsonObject&,
-                                RemoteAgentPanel::Completion completion) { completion({}); });
+    panel.setHistoryHandler(
+        [&](const QJsonObject&, const QString&, int limit, RemoteAgentPanel::Completion completion) {
+            limits.append(limit);
+            panel.receivePayload(remote, QStringLiteral("history_page"),
+                                 {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{}}});
+            completion({});
+        });
+    QString sentRequest;
+    panel.setCommandHandler(
+        [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            sentRequest = action.value(QStringLiteral("requestId")).toString();
+            completion({});
+        });
     panel.show();
     panel.openSession(remote);
     QCOMPARE(limits, QList<int>{10});
@@ -1220,29 +1532,29 @@ void DesktopSessionSyncHostTest::remotePanelKeepsOwnPromptWhenRoomBroadcastsCano
     QTest::mouseClick(send, Qt::LeftButton);
     QCOMPARE(transcript->itemCount(), 1);
     QCOMPARE(composer->toPlainText(), QString());
-    panel.receivePayload(remote, QStringLiteral("event"),
-                         {{QStringLiteral("type"), QStringLiteral("command_result")},
-                          {QStringLiteral("result"), QJsonObject{{QStringLiteral("ok"), true},
-                                                                   {QStringLiteral("user_message_id"),
-                                                                    QStringLiteral("msg_user")}}}});
+    panel.receivePayload(
+        remote, QStringLiteral("event"),
+        {{QStringLiteral("type"), QStringLiteral("command_result")},
+         {QStringLiteral("command_id"), sentRequest},
+         {QStringLiteral("result"),
+          QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("user_message_id"), QStringLiteral("msg_user")}}}});
     QVERIFY(transcript->contains(QStringLiteral("msg_user")));
-    QCOMPARE(transcript->itemCount(), 2); // The second item is the pending assistant indicator.
+    QCOMPARE(transcript->itemCount(), 2);  // The second item is the pending assistant indicator.
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    const QJsonObject user{{QStringLiteral("id"), QStringLiteral("msg_user")},
-                           {QStringLiteral("role"), QStringLiteral("user")},
-                           {QStringLiteral("created"), double(now)},
-                           {QStringLiteral("parts"), QJsonArray{QJsonObject{
-                               {QStringLiteral("kind"), QStringLiteral("text")},
-                               {QStringLiteral("text"), QStringLiteral("你好")}}}}};
-    const QJsonObject assistant{{QStringLiteral("id"), QStringLiteral("msg_assistant")},
-                                {QStringLiteral("role"), QStringLiteral("assistant")},
-                                {QStringLiteral("created"), double(now + 1)},
-                                {QStringLiteral("parts"), QJsonArray{QJsonObject{
-                                    {QStringLiteral("kind"), QStringLiteral("text")},
-                                    {QStringLiteral("text"), QStringLiteral("收到")}}}}};
+    const QJsonObject user{
+        {QStringLiteral("id"), QStringLiteral("msg_user")},
+        {QStringLiteral("role"), QStringLiteral("user")},
+        {QStringLiteral("created"), double(now)},
+        {QStringLiteral("parts"), QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")},
+                                                         {QStringLiteral("text"), QStringLiteral("你好")}}}}};
+    const QJsonObject assistant{
+        {QStringLiteral("id"), QStringLiteral("msg_assistant")},
+        {QStringLiteral("role"), QStringLiteral("assistant")},
+        {QStringLiteral("created"), double(now + 1)},
+        {QStringLiteral("parts"), QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")},
+                                                         {QStringLiteral("text"), QStringLiteral("收到")}}}}};
     panel.receivePayload(remote, QStringLiteral("event"),
-                         {{QStringLiteral("ok"), true},
-                          {QStringLiteral("messages"), QJsonArray{assistant, user}}});
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{assistant, user}}});
     QCOMPARE(limits, QList<int>{10});
     QCOMPARE(transcript->itemCount(), 2);
     QVERIFY(transcript->contains(QStringLiteral("msg_user")));
@@ -1250,42 +1562,41 @@ void DesktopSessionSyncHostTest::remotePanelKeepsOwnPromptWhenRoomBroadcastsCano
 }
 
 void DesktopSessionSyncHostTest::remotePanelPushCanArriveBeforeInitialPage() {
-    RemoteAgentPanel panel;
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
     const QJsonObject remote{{QStringLiteral("id"), QStringLiteral("ses_remote")},
                              {QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
                              {QStringLiteral("login_session_id"), QStringLiteral("phone_login")},
                              {QStringLiteral("online"), true}};
     QList<int> limits;
-    panel.setHistoryHandler([&](const QJsonObject&, const QString&, int limit,
-                                RemoteAgentPanel::Completion completion) {
-        Q_UNUSED(completion);
-        limits.append(limit);
-    });
+    panel.setHistoryHandler(
+        [&](const QJsonObject&, const QString&, int limit, RemoteAgentPanel::Completion completion) {
+            Q_UNUSED(completion);
+            limits.append(limit);
+        });
     panel.show();
     panel.openSession(remote);
     QCOMPARE(limits, QList<int>{10});
-    const QJsonObject user{{QStringLiteral("id"), QStringLiteral("msg_user")},
-                           {QStringLiteral("role"), QStringLiteral("user")},
-                           {QStringLiteral("parts"), QJsonArray{QJsonObject{
-                               {QStringLiteral("kind"), QStringLiteral("text")},
-                               {QStringLiteral("text"), QStringLiteral("你好")}}}}};
+    const QJsonObject user{
+        {QStringLiteral("id"), QStringLiteral("msg_user")},
+        {QStringLiteral("role"), QStringLiteral("user")},
+        {QStringLiteral("parts"), QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")},
+                                                         {QStringLiteral("text"), QStringLiteral("你好")}}}}};
     panel.receivePayload(remote, QStringLiteral("event"),
-                         {{QStringLiteral("ok"), true},
-                          {QStringLiteral("messages"), QJsonArray{user}}});
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{user}}});
     auto* transcript = panel.findChild<MarkdownView*>();
     QVERIFY(transcript && transcript->contains(QStringLiteral("msg_user")));
     panel.receivePayload(remote, QStringLiteral("event"),
-                         {{QStringLiteral("ok"), true},
-                          {QStringLiteral("messages"), QJsonArray{user}}});
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{user}}});
     QCOMPARE(transcript->itemCount(), 1);
-    const QJsonObject older{{QStringLiteral("id"), QStringLiteral("msg_older")},
-                            {QStringLiteral("role"), QStringLiteral("assistant")},
-                            {QStringLiteral("parts"), QJsonArray{QJsonObject{
-                                {QStringLiteral("kind"), QStringLiteral("text")},
-                                {QStringLiteral("text"), QStringLiteral("旧消息")}}}}};
+    const QJsonObject older{
+        {QStringLiteral("id"), QStringLiteral("msg_older")},
+        {QStringLiteral("role"), QStringLiteral("assistant")},
+        {QStringLiteral("parts"), QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")},
+                                                         {QStringLiteral("text"), QStringLiteral("旧消息")}}}}};
     panel.receivePayload(remote, QStringLiteral("history_page"),
-                         {{QStringLiteral("ok"), true},
-                          {QStringLiteral("messages"), QJsonArray{older}}});
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{older}}});
     QCOMPARE(limits, QList<int>{10});
     QCOMPARE(transcript->itemCount(), 2);
     QVERIFY(transcript->contains(QStringLiteral("msg_older")));
@@ -1299,14 +1610,14 @@ void DesktopSessionSyncHostTest::sessionListKeepsLocalAndRemoteSelectionsSeparat
     QVERIFY(!local.isEmpty());
     AgentSessionList sessions(controller);
     sessions.resize(300, 500);
-    sessions.setRemoteSessions(QJsonArray{QJsonObject{
-        {QStringLiteral("id"), QStringLiteral("ses_remote")},
-        {QStringLiteral("title"), QStringLiteral("远端会话")},
-        {QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
-        {QStringLiteral("device_name"), QStringLiteral("iPhone 14 Pro Max")},
-        {QStringLiteral("device_id"), QStringLiteral("phone-install")},
-        {QStringLiteral("login_session_id"), QStringLiteral("phone-login")},
-        {QStringLiteral("online"), true}}});
+    sessions.setRemoteSessions(
+        QJsonArray{QJsonObject{{QStringLiteral("id"), QStringLiteral("ses_remote")},
+                               {QStringLiteral("title"), QStringLiteral("远端会话")},
+                               {QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
+                               {QStringLiteral("device_name"), QStringLiteral("iPhone 14 Pro Max")},
+                               {QStringLiteral("device_id"), QStringLiteral("phone-install")},
+                               {QStringLiteral("login_session_id"), QStringLiteral("phone-login")},
+                               {QStringLiteral("online"), true}}});
     sessions.show();
     auto* list = sessions.findChild<QListWidget*>();
     QVERIFY(list != nullptr);

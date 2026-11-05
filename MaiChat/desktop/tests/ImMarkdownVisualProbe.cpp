@@ -2,6 +2,8 @@
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QApplication>
 #include <QFont>
+#include <QFontDatabase>
+#include <QFile>
 #include <QImage>
 #include <QTest>
 
@@ -50,7 +52,18 @@ layout.paint(&painter, origin, clip);
 }  // namespace
 
 int main(int argc, char** argv) {
+    QGuiApplication::setHighDpiScaleFactorRoundingPolicy(Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
+    QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+    QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
     QApplication app(argc, argv);
+    // Product main registers this same shared face; probes must do so as well.
+    if (QFontDatabase::addApplicationFont(QStringLiteral(MAICHAT_CODE_FONT_FILE)) < 0) return 2;
+    QString fixture;
+    if (argc > 2) {
+        QFile file(QString::fromLocal8Bit(argv[2]));
+        if (!file.open(QIODevice::ReadOnly)) return 2;
+        fixture = QString::fromUtf8(file.readAll());
+    }
 #ifdef Q_OS_WIN
     // 和 main.cpp 设的应用字体保持一致，否则中文落到宋体、字距被整像素提示打乱，
     // 截图不代表真机。见 main.cpp 里 setHintingPreference 那段注释。
@@ -68,8 +81,8 @@ int main(int argc, char** argv) {
     imApplication.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
     imApplication.selectPeer(QStringLiteral("phone-user"));
     imApplication.chatState().receiveText(QStringLiteral("phone-user"),
-                                          QString::fromUtf8(kIncoming));
-    imApplication.chatState().receiveText(
+                                          fixture.isEmpty() ? QString::fromUtf8(kIncoming) : fixture);
+    if (fixture.isEmpty()) imApplication.chatState().receiveText(
         QStringLiteral("phone-user"),
         QStringLiteral("顺手看一眼 [链接](https://example.com) 和 ~~删除线~~，还有短消息贴时间戳的样子。"));
 
@@ -79,9 +92,7 @@ int main(int argc, char** argv) {
     QTest::qWaitForWindowExposed(&window);
     QTest::qWait(400);
 
-    QImage image(window.size(), QImage::Format_ARGB32);
-    image.fill(Qt::white);
-    window.render(&image);
+    const QImage image = window.grab().toImage();
     if (!image.save(output)) {
         qWarning("failed to save %s", qPrintable(output));
         return 1;

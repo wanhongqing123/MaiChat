@@ -205,6 +205,18 @@ foreach ($licenseName in 'QUIRC_LICENSE', 'QPDF_LICENSE.txt', 'QPDF_NOTICE.md') 
         throw "第三方许可复制校验失败：$licenseTarget"
     }
 }
+# The shared code face is embedded in Qt resources; keep its original OFL and
+# copyright human-readable beside the other third-party notices as well.
+$codeFontLicenseSource = Join-Path $repositoryRoot 'MaiChat\Resources\fonts\LICENSE-SarasaFixedSC.txt'
+$codeFontLicenseTarget = Join-Path $licenseTargetDir 'LICENSE-SarasaFixedSC.txt'
+if (-not (Test-Path -LiteralPath $codeFontLicenseSource -PathType Leaf)) {
+    throw "Shared code font license is missing: $codeFontLicenseSource"
+}
+Copy-Item -LiteralPath $codeFontLicenseSource -Destination $codeFontLicenseTarget -Force
+if ((Get-FileHash -LiteralPath $codeFontLicenseTarget -Algorithm SHA256).Hash -ne
+    (Get-FileHash -LiteralPath $codeFontLicenseSource -Algorithm SHA256).Hash) {
+    throw 'Shared code font license copy hash mismatch'
+}
 $rvmSourceModel = Join-Path $repositoryRoot 'MaiAgent\models\rvm_mobilenetv3_fp32.onnx'
 $ortSourceRuntime = Join-Path $repositoryRoot 'MaiAgent\build\vendor\onnxruntime-windows-x64\onnxruntime.dll'
 $ortSourceProvider = Join-Path $repositoryRoot 'MaiAgent\build\vendor\onnxruntime-windows-x64\onnxruntime_providers_shared.dll'

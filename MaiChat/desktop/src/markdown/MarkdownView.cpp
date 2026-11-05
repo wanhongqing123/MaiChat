@@ -14,11 +14,14 @@
 #include <QPaintEvent>
 #include <QResizeEvent>
 #include <QScrollBar>
+#include <QWheelEvent>
+#include <algorithm>
 #include <memory>
 #include <vector>
 
 #include "markdown/MarkdownDocument.h"
 #include "markdown/MarkdownLayout.h"
+#include "markdown/MarkdownCodeScrollState.h"
 
 // 一条内容。位置都在**内容坐标系**里：y 从整片的顶上算起，和滚动位置无关。
 struct MarkdownViewItem {
@@ -27,6 +30,7 @@ struct MarkdownViewItem {
     QString source;
     MarkdownDocument document;
     MarkdownLayout layout;
+    MarkdownCodeScrollState codeScroll;
 
     // 外框（气泡的底、整行的范围）和里面文字的左上角。
     QRectF frame;
@@ -81,6 +85,7 @@ struct MarkdownView::Runtime {
     int maxContentWidth = 0;
     int batchDepth = 0;
     bool layoutDirty = false;
+    QString draggingCodeItem;
 
     // 贴底跟随。用户自己往上滚过就停掉——正在看历史却被拽回底部很烦。
     bool stickToBottom = true;
@@ -91,16 +96,68 @@ struct MarkdownView::Runtime {
     bool selecting = false;
     QPoint pressPosition;
 
+    // Global character offsets change when items move or earlier text grows.
+    // Keep endpoints by stable item ID until the next real layout, including
+    // batched changes; selection in a later item must not migrate into a stream.
+    struct SelectionPoint {
+        QString id;
+        int offset = 0;
+        bool valid = false;
+    };
+    bool selectionReorderPending = false;
+    bool reorderedSelectionWasAll = false;
+    bool reorderedSelectionReversed = false;
+    SelectionPoint reorderedAnchor;
+    SelectionPoint reorderedCursor;
+
     Item* find(const QString& id) const {
         for (const std::unique_ptr<Item>& item : items) {
             if (item->id == id) return item.get();
         }
         return nullptr;
     }
+
+    void rememberSelectionForReorder() {
+        if (selectionReorderPending || anchor == cursor) return;
+        int total = 0;
+        for (const auto& item : items) total += item->textLength();
+        reorderedSelectionWasAll = qMin(anchor, cursor) == 0 && qMax(anchor, cursor) == total;
+        reorderedSelectionReversed = anchor > cursor;
+        const auto locate = [this](int position, bool preferPrevious) {
+            SelectionPoint point;
+            int start = 0;
+            for (const auto& item : items) {
+                const int length = item->textLength();
+                if (length <= 0) continue;
+                point = {item->id, qBound(0, position - start, length), true};
+                if (position < start + length || (preferPrevious && position == start + length)) break;
+                start += length;
+            }
+            return point;
+        };
+        reorderedAnchor = locate(anchor, anchor > cursor);
+        reorderedCursor = locate(cursor, cursor > anchor);
+        selectionReorderPending = true;
+    }
+
+    void restoreSelectionAfterReorder(int total) {
+        if (!selectionReorderPending) return;
+        selectionReorderPending = false;
+        if (reorderedSelectionWasAll) {
+            anchor = reorderedSelectionReversed ? total : 0;
+            cursor = reorderedSelectionReversed ? 0 : total;
+            return;
+        }
+        const auto locate = [this, total](const SelectionPoint& point, int fallback) {
+            const Item* item = point.valid ? find(point.id) : nullptr;
+            return item ? item->textStart + qBound(0, point.offset, item->textLength()) : qBound(0, fallback, total);
+        };
+        anchor = locate(reorderedAnchor, anchor);
+        cursor = locate(reorderedCursor, cursor);
+    }
 };
 
-MarkdownView::MarkdownView(QWidget* parent)
-    : QAbstractScrollArea(parent), runtime_(std::make_unique<Runtime>()) {
+MarkdownView::MarkdownView(QWidget* parent) : QAbstractScrollArea(parent), runtime_(std::make_unique<Runtime>()) {
     setFrameShape(QFrame::NoFrame);
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
@@ -110,9 +167,8 @@ MarkdownView::MarkdownView(QWidget* parent)
     setFocusPolicy(Qt::StrongFocus);
 
     applyScrollBarStyle();
-    connect(verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int value) {
-        runtime_->stickToBottom = value >= verticalScrollBar()->maximum() - 2;
-    });
+    connect(verticalScrollBar(), &QScrollBar::valueChanged, this,
+            [this](int value) { runtime_->stickToBottom = value >= verticalScrollBar()->maximum() - 2; });
 }
 
 MarkdownView::~MarkdownView() = default;
@@ -132,20 +188,19 @@ void MarkdownView::setTheme(const MarkdownTheme& theme) {
 // 原生那两个箭头正是这么来的。
 void MarkdownView::applyScrollBarStyle() {
     const MarkdownTheme& theme = runtime_->theme;
-    verticalScrollBar()->setStyleSheet(
-        QStringLiteral("QScrollBar:vertical{background:transparent;width:%1px;margin:0;}"
-                       "QScrollBar::handle:vertical{background:%2;border-radius:%3px;"
-                       "min-height:%4px;}"
-                       "QScrollBar::handle:vertical:hover{background:%5;}"
-                       "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{"
-                       "height:0;border:0;background:transparent;}"
-                       "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{"
-                       "background:transparent;}")
-            .arg(theme.scrollBarWidth)
-            .arg(theme.scrollBarHandle.name())
-            .arg(theme.scrollBarWidth / 2)
-            .arg(theme.scrollBarWidth * 3)
-            .arg(theme.scrollBarHandleHover.name()));
+    verticalScrollBar()->setStyleSheet(QStringLiteral("QScrollBar:vertical{background:transparent;width:%1px;margin:0;}"
+                                                      "QScrollBar::handle:vertical{background:%2;border-radius:%3px;"
+                                                      "min-height:%4px;}"
+                                                      "QScrollBar::handle:vertical:hover{background:%5;}"
+                                                      "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{"
+                                                      "height:0;border:0;background:transparent;}"
+                                                      "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{"
+                                                      "background:transparent;}")
+                                           .arg(theme.scrollBarWidth)
+                                           .arg(theme.scrollBarHandle.name())
+                                           .arg(theme.scrollBarWidth / 2)
+                                           .arg(theme.scrollBarWidth * 3)
+                                           .arg(theme.scrollBarHandleHover.name()));
 }
 
 const MarkdownTheme& MarkdownView::theme() const {
@@ -160,6 +215,8 @@ void MarkdownView::setMaxContentWidth(int width) {
 
 void MarkdownView::addItem(const QString& id, Style style, const QString& markdown) {
     if (Item* existing = runtime_->find(id)) {
+        runtime_->rememberSelectionForReorder();
+        if (!markdown.startsWith(existing->source)) existing->codeScroll.clear();
         existing->style = style;
         existing->source = markdown;
         existing->document = MarkdownDocument::parse(markdown);
@@ -179,6 +236,8 @@ void MarkdownView::updateItem(const QString& id, const QString& markdown) {
     Item* item = runtime_->find(id);
     if (item == nullptr) return;
     if (item->source == markdown) return;
+    runtime_->rememberSelectionForReorder();
+    if (!markdown.startsWith(item->source)) item->codeScroll.clear();
     item->source = markdown;
     item->document = MarkdownDocument::parse(markdown);
     relayoutAll();
@@ -196,6 +255,43 @@ void MarkdownView::removeItem(const QString& id) {
         relayoutAll();
         return;
     }
+}
+
+bool MarkdownView::moveItemAfter(const QString& id, const QString& anchorId) {
+    auto& items = runtime_->items;
+    const auto item = std::find_if(items.begin(), items.end(), [&](const auto& value) { return value->id == id; });
+    const auto anchor =
+        std::find_if(items.begin(), items.end(), [&](const auto& value) { return value->id == anchorId; });
+    if (item == items.end() || anchor == items.end()) return false;
+    if (item == anchor || item == anchor + 1) return true;
+
+    runtime_->rememberSelectionForReorder();
+    // Rotate unique_ptr entries only: the item, widget parent, child controls,
+    // draft and signal connections all keep their original lifetime.
+    if (item < anchor)
+        std::rotate(item, item + 1, anchor + 1);
+    else
+        std::rotate(anchor + 1, item, item + 1);
+    relayoutAll();
+    return true;
+}
+
+bool MarkdownView::moveItemBefore(const QString& id, const QString& anchorId) {
+    auto& items = runtime_->items;
+    const auto item = std::find_if(items.begin(), items.end(), [&](const auto& value) { return value->id == id; });
+    const auto anchor =
+        std::find_if(items.begin(), items.end(), [&](const auto& value) { return value->id == anchorId; });
+    if (item == items.end() || anchor == items.end()) return false;
+    if (item == anchor || item + 1 == anchor) return true;
+    runtime_->rememberSelectionForReorder();
+    // Prepending older pages preserves original widgets and their interaction
+    // state. Recreating the view here would lose selection and reading position.
+    if (item < anchor)
+        std::rotate(item, item + 1, anchor);
+    else
+        std::rotate(anchor, item, item + 1);
+    relayoutAll();
+    return true;
 }
 
 void MarkdownView::addWidget(const QString& id, QWidget* widget) {
@@ -234,8 +330,10 @@ void MarkdownView::clear() {
         item->widget->deleteLater();
     }
     runtime_->items.clear();
+    runtime_->draggingCodeItem.clear();
     runtime_->anchor = 0;
     runtime_->cursor = 0;
+    runtime_->selectionReorderPending = false;
     runtime_->stickToBottom = true;
     relayoutAll();
 }
@@ -308,8 +406,7 @@ void MarkdownView::relayoutAll() {
             case Style::Bubble: {
                 // 先按最大宽度排一遍，再按实际需要的宽度收窄。短消息不该占满一行，
                 // 而**宽度只能量出来不能估**——估窄了字会被提前折断。
-                const qreal maximum =
-                    qMax<qreal>(available * theme.bubbleMaxWidthRatio - 2 * theme.bubblePadding, 1);
+                const qreal maximum = qMax<qreal>(available * theme.bubbleMaxWidthRatio - 2 * theme.bubblePadding, 1);
                 item->layout.layout(item->document, theme, maximum);
                 const qreal natural = qMin(item->layout.naturalWidth(), maximum);
                 if (natural > 0 && natural < maximum) {
@@ -318,8 +415,7 @@ void MarkdownView::relayoutAll() {
                 const qreal width = item->layout.width() + 2 * theme.bubblePadding;
                 const qreal height = item->layout.height() + 2 * theme.bubblePadding;
                 item->frame = QRectF(left + available - width, y, width, height);
-                item->origin =
-                    item->frame.topLeft() + QPointF(theme.bubblePadding, theme.bubblePadding);
+                item->origin = item->frame.topLeft() + QPointF(theme.bubblePadding, theme.bubblePadding);
                 break;
             }
             case Style::Notice:
@@ -332,18 +428,19 @@ void MarkdownView::relayoutAll() {
                 item->layout.layout(item->document, muted, available);
                 const qreal width = qMin(item->layout.naturalWidth(), available);
                 item->layout.layout(item->document, muted, qMax<qreal>(width, 1));
-                item->frame =
-                    QRectF(left + (available - item->layout.width()) / 2, y,
-                           item->layout.width(), item->layout.height());
+                item->frame = QRectF(left + (available - item->layout.width()) / 2, y, item->layout.width(),
+                                     item->layout.height());
                 item->origin = item->frame.topLeft();
                 break;
             }
         }
+        item->codeScroll.synchronize(item->layout);
         y = item->frame.bottom();
         textStart += item->textLength();
     }
 
     runtime_->contentHeight = y + margin;
+    runtime_->restoreSelectionAfterReorder(textStart);
     updateScrollRange();
     applySelectionToItems();
     positionWidgets();
@@ -351,8 +448,7 @@ void MarkdownView::relayoutAll() {
 }
 
 void MarkdownView::updateScrollRange() {
-    const int overflow =
-        qMax(0, qRound(runtime_->contentHeight) - viewport()->height());
+    const int overflow = qMax(0, qRound(runtime_->contentHeight) - viewport()->height());
     QScrollBar* bar = verticalScrollBar();
     const bool wasAtBottom = runtime_->stickToBottom;
     bar->setRange(0, overflow);
@@ -393,7 +489,7 @@ void MarkdownView::paintEvent(QPaintEvent* event) {
             painter.setBrush(theme.bubbleBackground);
             painter.drawRoundedRect(frame, theme.bubbleRadius, theme.bubbleRadius);
         }
-        item->layout.paint(&painter, item->origin - QPointF(0, offset), visible);
+        item->layout.paint(&painter, item->origin - QPointF(0, offset), visible, item->codeScroll.offsets);
     }
 }
 
@@ -409,13 +505,11 @@ bool MarkdownView::eventFilter(QObject* watched, QEvent* event) {
     if (event->type() == QEvent::LayoutRequest || event->type() == QEvent::Resize) {
         for (const std::unique_ptr<Item>& item : runtime_->items) {
             if (item->widget != watched) continue;
-            const qreal full = qMax<qreal>(
-                viewport()->width() - 2 * runtime_->theme.viewMargin, 1);
-            const qreal available = runtime_->maxContentWidth > 0
-                ? qMin<qreal>(full, runtime_->maxContentWidth) : full;
+            const qreal full = qMax<qreal>(viewport()->width() - 2 * runtime_->theme.viewMargin, 1);
+            const qreal available = runtime_->maxContentWidth > 0 ? qMin<qreal>(full, runtime_->maxContentWidth) : full;
             const int width = widgetSlotWidth(item->widget, qRound(available));
-            if (width == qRound(item->frame.width()) &&
-                widgetSlotHeight(item->widget, width) == item->widgetHeight) break;
+            if (width == qRound(item->frame.width()) && widgetSlotHeight(item->widget, width) == item->widgetHeight)
+                break;
             relayoutAll();
             break;
         }
@@ -460,7 +554,7 @@ int MarkdownView::positionAt(const QPoint& viewportPoint) const {
     QPointF local;
     const Item* item = itemAt(viewportPoint, &local);
     if (item == nullptr) return 0;
-    return item->textStart + item->layout.positionAt(local);
+    return item->textStart + item->layout.positionAt(local, item->codeScroll.offsets);
 }
 
 void MarkdownView::applySelectionToItems() {
@@ -484,6 +578,17 @@ void MarkdownView::mousePressEvent(QMouseEvent* event) {
         return;
     }
     runtime_->pressPosition = event->pos();
+    QPointF local;
+    const Item* hit = itemAt(event->pos(), &local);
+    Item* codeItem = hit == nullptr ? nullptr : runtime_->find(hit->id);
+    if (codeItem != nullptr && codeItem->codeScroll.press(codeItem->layout, local)) {
+        runtime_->draggingCodeItem = codeItem->id;
+        runtime_->selecting = false;
+        viewport()->update();
+        event->accept();
+        return;
+    }
+    runtime_->selectionReorderPending = false;
     runtime_->anchor = positionAt(event->pos());
     runtime_->cursor = runtime_->anchor;
     runtime_->selecting = true;
@@ -492,6 +597,16 @@ void MarkdownView::mousePressEvent(QMouseEvent* event) {
 }
 
 void MarkdownView::mouseMoveEvent(QMouseEvent* event) {
+    if (!runtime_->draggingCodeItem.isEmpty()) {
+        Item* item = runtime_->find(runtime_->draggingCodeItem);
+        if (item != nullptr) {
+            const QPointF local = QPointF(event->pos()) + QPointF(0, verticalScrollBar()->value()) - item->origin;
+            item->codeScroll.move(item->layout, local);
+        }
+        viewport()->update();
+        event->accept();
+        return;
+    }
     if (runtime_->selecting) {
         runtime_->cursor = positionAt(event->pos());
         applySelectionToItems();
@@ -509,6 +624,12 @@ void MarkdownView::mouseReleaseEvent(QMouseEvent* event) {
         QAbstractScrollArea::mouseReleaseEvent(event);
         return;
     }
+    if (!runtime_->draggingCodeItem.isEmpty()) {
+        if (Item* item = runtime_->find(runtime_->draggingCodeItem)) item->codeScroll.release();
+        runtime_->draggingCodeItem.clear();
+        event->accept();
+        return;
+    }
     runtime_->selecting = false;
     // 拖过一段距离的是在选文字，不是在点链接。
     const int moved = (event->pos() - runtime_->pressPosition).manhattanLength();
@@ -519,6 +640,19 @@ void MarkdownView::mouseReleaseEvent(QMouseEvent* event) {
     if (item == nullptr) return;
     const QString href = item->layout.linkAt(local);
     if (!href.isEmpty()) emit linkActivated(href);
+}
+
+void MarkdownView::wheelEvent(QWheelEvent* event) {
+    QPointF local;
+    const Item* hit = itemAt(event->position().toPoint(), &local);
+    Item* item = hit == nullptr ? nullptr : runtime_->find(hit->id);
+    if (item != nullptr && item->codeScroll.wheel(item->layout, local, event->pixelDelta(),
+                                                 event->angleDelta(), event->modifiers())) {
+        viewport()->update();
+        event->accept();
+        return;
+    }
+    QAbstractScrollArea::wheelEvent(event);
 }
 
 void MarkdownView::keyPressEvent(QKeyEvent* event) {
@@ -574,6 +708,7 @@ QString MarkdownView::selectedText() const {
 }
 
 void MarkdownView::selectAll() {
+    runtime_->selectionReorderPending = false;
     int total = 0;
     for (const std::unique_ptr<Item>& item : runtime_->items) total += item->textLength();
     runtime_->anchor = 0;
@@ -583,6 +718,7 @@ void MarkdownView::selectAll() {
 }
 
 void MarkdownView::clearSelection() {
+    runtime_->selectionReorderPending = false;
     runtime_->anchor = 0;
     runtime_->cursor = 0;
     applySelectionToItems();

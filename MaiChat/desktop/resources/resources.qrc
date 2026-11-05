@@ -2,8 +2,8 @@
   <qresource prefix="/maichat">
     <file alias="app-icon.png">macos/AppIcon-1024.png</file>
   </qresource>
-  <!-- 桌面端字体栈：Inter（拉丁）+ Noto Sans SC（中文）+ JetBrains Mono（等宽）。
-       许可均为 SIL OFL 1.1，文本在 fonts/ 下随包分发。 -->
+  <!-- 正文字体维持 Inter + Noto Sans SC；代码使用三端共用的 Sarasa Fixed SC，
+       ASCII/线框为一格、CJK 为两格。各字体均为 SIL OFL 1.1。 -->
   <qresource prefix="/maichat/fonts">
     <file alias="Inter-latin-400.ttf">fonts/Inter-latin-400.ttf</file>
     <file alias="Inter-latin-500.ttf">fonts/Inter-latin-500.ttf</file>
@@ -14,6 +14,8 @@
     <file alias="NotoSansSC-Bold.otf">fonts/NotoSansSC-Bold.otf</file>
     <file alias="JetBrainsMono-latin-400.ttf">fonts/JetBrainsMono-latin-400.ttf</file>
     <file alias="JetBrainsMono-latin-700.ttf">fonts/JetBrainsMono-latin-700.ttf</file>
+    <file alias="SarasaFixedSC-Regular.ttf">../../Resources/fonts/SarasaFixedSC-Regular.ttf</file>
+    <file alias="LICENSE-SarasaFixedSC.txt">../../Resources/fonts/LICENSE-SarasaFixedSC.txt</file>
   </qresource>
   <qresource prefix="/maichat/avatars">
     <file alias="chibi-atlas-v3.png">avatars/chibi-atlas-v3.png</file>

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -143,6 +144,26 @@ int main() {
             call(handle, {{"op", "send"}, {"session", session}, {"text", "Improve the current result"}});
         check(started.at("ok"), "send failed");
         const std::string turn = started.at("id");
+        check(started.value("turnId", "") == turn, "send receipt did not identify its original assistant turn");
+        const std::string initialUser = started.value("user_message_id", "");
+        check(!initialUser.empty() && initialUser != turn, "send receipt confused assistant and user identities");
+        const Json initialRows =
+            call(handle, {{"op", "messages_page"}, {"session", session}, {"before", turn}, {"limit", 1}});
+        check(initialRows.at("messages").size() == 1 && initialRows.at("messages").front().at("role") == "user" &&
+                  initialRows.at("messages").front().at("id") == initialUser,
+              "send receipt user identity was not the actual persisted predecessor");
+        const Json exactUser = call(handle, {{"op", "message"}, {"session", session}, {"id", initialUser}});
+        check(exactUser.at("ok") && exactUser.at("messages").size() == 1 &&
+                  exactUser.at("messages").front().at("id") == initialUser &&
+                  exactUser.at("messages").front().at("role") == "user",
+              "exact receipt query did not return the persisted user");
+        const std::string otherSession = call(handle, {{"op", "create"}}).at("id");
+        const Json wrongOwner = call(handle, {{"op", "message"}, {"session", otherSession}, {"id", initialUser}});
+        check(!wrongOwner.at("ok") && wrongOwner.value("errorCode", "") == "not_found",
+              "exact receipt query crossed conversation ownership");
+        const Json absentUser = call(handle, {{"op", "message"}, {"session", session}, {"id", "msg_absent_fixture"}});
+        check(!absentUser.at("ok") && absentUser.value("errorCode", "") == "not_found",
+              "exact receipt query returned a neighboring row for a missing id");
         {
             std::unique_lock<std::mutex> lock(host.mutex);
             check(host.wake.wait_for(lock, std::chrono::seconds(5), [&] { return host.entered; }),
@@ -150,10 +171,36 @@ int main() {
         }
         const auto snapshot = [&] { return call(handle, {{"op", "snapshot"}, {"session", session}, {"force", true}}); };
         check(snapshot().at("turnId") == turn, "snapshot changed the stable turn identity");
+        // 带轮次的 Stop 是点击时的取消目标，旧消息不能取消已经替换的新任务。
+        const auto wrongStop = call(handle, {{"op", "stop"}, {"session", session}, {"turnId", "old-turn"}});
+        check(!wrongStop.at("ok") && wrongStop.value("errorCode", "") == "not_found",
+              "wrong-turn stop was not rejected before interrupting the active task");
+        check(snapshot().at("turnId") == turn, "wrong-turn stop interrupted the active task");
         check(call(handle, {{"op", "remote_snapshot"}, {"session", session}}).at("turnId") == turn,
               "remote snapshot lost the target turn identity");
         check(!call(handle, {{"op", "send"}, {"session", session}, {"text", "Busy send"}}).at("ok"),
               "ordinary send no longer rejects busy work");
+        const auto boundedSnapshot = [&] {
+            return call(handle, {{"op", "snapshot"},
+                                 {"session", session},
+                                 {"force", true},
+                                 {"messageLimit", 8},
+                                 {"includeMessageUpdates", true}});
+        };
+        check(boundedSnapshot().at("messages").size() <= 8, "initial mobile snapshot read unbounded history");
+        // 把仍在运行的 assistant 推出最新八条；后续完成状态必须通过精确更新通道送回。
+        for (int index = 0; index < 10; ++index)
+            check(call(handle, {{"op", "steer"},
+                                {"session", session},
+                                {"turnId", turn},
+                                {"requestId", "synthetic-page-" + std::to_string(index)},
+                                {"text", "Synthetic queued supplement " + std::to_string(index)}})
+                      .at("ok"),
+                  "synthetic pagination supplement was rejected");
+        const Json busyPage = boundedSnapshot();
+        check(busyPage.at("messages").size() == 8, "latest mobile page was not bounded to eight messages");
+        for (const auto& message : busyPage.at("messages"))
+            check(message.at("id") != turn, "fixture failed to move the active assistant outside the latest window");
         const Json steer{{"op", "steer"},
                          {"session", session},
                          {"turnId", turn},
@@ -161,6 +208,9 @@ int main() {
                          {"text", "Show the current result first"}};
         const Json accepted = call(handle, steer);
         check(accepted.at("ok"), "steering was not accepted");
+        check(accepted.value("user_message_id", "") == accepted.at("id").get<std::string>(),
+              "steer receipt did not identify the accepted user message");
+        check(accepted.value("turnId", "") == turn, "steer receipt changed its original task identity");
         int persistedUsers = 0;
         const Json acceptedSnapshot = snapshot();
         for (const auto& message : acceptedSnapshot.at("messages"))
@@ -188,14 +238,42 @@ int main() {
         }
         check(!completed.at("busy").get<bool>(), "steered turn did not finish");
         check(completed.at("turnId") == "", "idle snapshot retained an active turn");
-        check(call(handle, steer).at("id") == accepted.at("id"), "completed-turn retry lost its receipt");
+        const Json finishedPage = boundedSnapshot();
+        check(finishedPage.at("messageUpdates").size() <= 20, "mobile update metadata exceeded one old page");
+        bool oldAssistantCompleted = false;
+        for (const auto& message : finishedPage.at("messageUpdates"))
+            if (message.at("id") == turn && message.at("completed").get<std::int64_t>() != 0)
+                oldAssistantCompleted = true;
+        check(oldAssistantCompleted, "active assistant completion was lost outside the latest mobile window");
+        std::set<std::string> loaded;
+        std::string before;
+        for (const auto& message : finishedPage.at("messages")) {
+            loaded.insert(message.at("id").get<std::string>());
+            before = message.at("id").get<std::string>();
+        }
+        while (!before.empty()) {
+            const Json page =
+                call(handle, {{"op", "messages_page"}, {"session", session}, {"before", before}, {"limit", 20}});
+            check(page.at("ok") && page.at("messages").size() <= 20, "old mobile page exceeded its query limit");
+            if (page.at("messages").empty()) break;
+            for (const auto& message : page.at("messages")) {
+                const std::string id = message.at("id").get<std::string>();
+                check(id < before && loaded.insert(id).second, "old page cursor repeated or skipped its boundary");
+            }
+            before = page.at("messages").back().at("id").get<std::string>();
+        }
+        check(loaded.size() == completed.at("messages").size(), "native mobile pages did not reach the earliest row");
+        const Json completedRetry = call(handle, steer);
+        check(completedRetry.at("id") == accepted.at("id"), "completed-turn retry lost its receipt");
+        check(completedRetry.value("turnId", "") == turn &&
+                  completedRetry.value("user_message_id", "") == accepted.at("id").get<std::string>(),
+              "idle steering retry lost the original task/user receipt");
         const std::string acceptedUserId = accepted.at("id").get<std::string>();
-        const Json receiptPage = call(
-            handle, {{"op", "messages_page"}, {"session", session}, {"before", acceptedUserId + "~"}, {"limit", 1}});
+        const Json receiptPage = call(handle, {{"op", "message"}, {"session", session}, {"id", acceptedUserId}});
         check(receiptPage.at("ok") && receiptPage.at("messages").size() == 1 &&
                   receiptPage.at("messages")[0].at("id") == acceptedUserId &&
                   receiptPage.at("messages")[0].at("role") == "user",
-              "exact receipt cursor lost the accepted user behind newer assistant messages");
+              "exact receipt lookup lost the accepted user behind newer assistant messages");
         Json late = steer;
         late["requestId"] = "synthetic-idle-input";
         const Json idleRejection = call(handle, late);
@@ -210,12 +288,39 @@ int main() {
             check(
                 messages[last].at("role") == "user" && messages[last].at("content") == "Show the current result first",
                 "model did not read the accepted user input");
-            check(
-                messages[last - 1].at("role") == "tool" && messages[last - 1].at("tool_call_id") == "synthetic-profile",
-                "user input split a tool call/result pair");
-            check(messages[last - 2].at("role") == "assistant" &&
-                      messages[last - 2].at("tool_calls")[0].at("id") == "synthetic-profile",
-                  "tool invocation was not preserved");
+            std::size_t invocationIndex = messages.size(), resultIndex = messages.size();
+            std::vector<std::string> observedInputs;
+            std::vector<std::string> expectedInputs;
+            for (int index = 0; index < 10; ++index)
+                expectedInputs.push_back("Synthetic queued supplement " + std::to_string(index));
+            expectedInputs.push_back("Show the current result first");
+            std::printf("Synthetic follow-up roles:");
+            for (std::size_t index = 0; index < messages.size(); ++index) {
+                const Json& message = messages[index];
+                const std::string role = message.value("role", "");
+                std::printf(" %zu:%s", index, role.c_str());
+                if (role == "assistant" && message.contains("tool_calls"))
+                    for (const auto& tool : message.at("tool_calls"))
+                        if (tool.value("id", "") == "synthetic-profile") {
+                            check(invocationIndex == messages.size(), "tool invocation was duplicated");
+                            invocationIndex = index;
+                        }
+                if (role == "tool" && message.value("tool_call_id", "") == "synthetic-profile") {
+                    check(resultIndex == messages.size(), "tool result was duplicated");
+                    resultIndex = index;
+                }
+                if (role == "user" && message.value("content", Json{}).is_string()) {
+                    const std::string text = message.at("content");
+                    if (text.rfind("Synthetic queued supplement ", 0) == 0 || text == "Show the current result first") {
+                        check(resultIndex < index, "user input appeared before the complete tool call/result pair");
+                        observedInputs.push_back(text);
+                    }
+                }
+            }
+            std::puts("");
+            check(invocationIndex < messages.size() && resultIndex == invocationIndex + 1,
+                  "user input split a tool call/result pair");
+            check(observedInputs == expectedInputs, "accepted supplemental inputs were reordered or lost");
         }
         check(host.calls.load() == 1, "steering restarted the completed host operation");
         std::puts(

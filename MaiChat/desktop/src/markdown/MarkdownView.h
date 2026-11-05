@@ -70,6 +70,13 @@ public:
     bool contains(const QString& id) const;
     void removeItem(const QString& id);
 
+    // Reorder an existing item without replacing it or its embedded widget.
+    // Retains selection endpoints and scroll-follow state; batched updates
+    // defer geometry as usual. Missing IDs return false; existing no-ops true.
+    bool moveItemAfter(const QString& id, const QString& anchorId);
+    // The same stable-object/selection contract, immediately before an existing anchor.
+    bool moveItemBefore(const QString& id, const QString& anchorId);
+
     // 嵌一个部件。所有权转给视图。
     void addWidget(const QString& id, QWidget* widget);
 
@@ -108,6 +115,7 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void wheelEvent(QWheelEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void contextMenuEvent(QContextMenuEvent* event) override;
     void scrollContentsBy(int dx, int dy) override;

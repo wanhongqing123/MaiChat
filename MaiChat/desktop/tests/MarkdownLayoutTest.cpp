@@ -1,10 +1,17 @@
 // 文件作用：验证桌面端Markdown 标题、代码块和列表在不同宽度下的实际排版。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QImage>
+#include <QDir>
+#include <QFileInfo>
+#include <QFontDatabase>
+#include <QFontMetricsF>
 #include <QPainter>
+#include <QScopeGuard>
+#include <QtMath>
 #include <QtTest>
 
 #include "markdown/MarkdownLayout.h"
+#include "markdown/MarkdownCodeScrollState.h"
 
 // 排版层的测试。
 //
@@ -40,6 +47,11 @@ private slots:
     void quoteIsTallerThanItsContent();
     void linkHitTestingFindsHref();
     void selectionReadsBackTheText();
+    void tableSelectionReachesEveryColumn_data();
+    void tableSelectionReachesEveryColumn();
+    void codeFontUsesCompatibleLatinCjkAndBoxAdvances();
+    void narrowCodeKeepsSourceLinesWithoutChangingBodyWrap();
+    void codeViewportScrollsLocallyAndPreservesSourceOffsets();
     void paintsWithoutTouchingOutsideTheClip();
     void listMarkersStayOutOfTheCopiedText();
     void deepIndentStopsGrowing();
@@ -110,6 +122,80 @@ void MarkdownLayoutTest::codeBlockKeepsEveryLine() {
     // 复制出来的要是原文，一个字符都不改。
     QVERIFY(dense.selectableText().contains(QStringLiteral("a")));
     QVERIFY(dense.selectableText().contains(QStringLiteral("b")));
+}
+
+void MarkdownLayoutTest::narrowCodeKeepsSourceLinesWithoutChangingBodyWrap() {
+    const QString first = QStringLiteral("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
+    const QString second = QStringLiteral("    缓冲区检查：保持代码行与原始空格，不因视口收窄拆成不同的行");
+    const QString code = first + QLatin1Char('\n') + second + QLatin1Char('\n');
+    const QString markdown = QStringLiteral("```text\n") + code + QStringLiteral("```");
+    const auto wide = laidOut(markdown, 1200);
+    const auto narrow = laidOut(markdown, 200);
+    QCOMPARE(wide.selectableText(), code);
+    QCOMPARE(narrow.selectableText(), code);
+    // Horizontal overflow belongs to the code viewport. Narrowing the body
+    // column must not add visual code rows or rewrite the copied source.
+    QCOMPARE(narrow.height(), wide.height());
+
+    const QString body = QStringLiteral("普通正文仍然需要按可用宽度折行，").repeated(12);
+    QVERIFY(laidOut(body, 200).height() > laidOut(body, 1200).height());
+}
+
+void MarkdownLayoutTest::codeViewportScrollsLocallyAndPreservesSourceOffsets() {
+    const QString code = QStringLiteral("HEAD_") + QStringLiteral("0123456789").repeated(12)
+        + QStringLiteral("_TAIL_MARKER\n    preserved spaces\n");
+    auto layout = laidOut(QStringLiteral("Body before\n\n```text\n") + code
+        + QStringLiteral("```\n\nBody after"), 240);
+    QCOMPARE(layout.codeBlocks().size(), 1);
+    const auto block = layout.codeBlocks().first();
+    QVERIFY(block.maximumOffset() > 0);
+    QVERIFY(block.viewport.width() < block.contentWidth);
+    MarkdownCodeScrollState state, independent;
+    const QPointF inside = block.viewport.center();
+    QVERIFY(!state.wheel(layout, inside, {}, QPoint(0, -120), Qt::NoModifier));
+    QVERIFY(!state.wheel(layout, QPointF(0, 0), {}, QPoint(-120, 0), Qt::NoModifier));
+    QVERIFY(state.offsets.isEmpty());
+    QVERIFY(state.wheel(layout, inside, {}, QPoint(0, -120), Qt::ShiftModifier));
+    QVERIFY(state.offsets.value(0) > 0);
+    QVERIFY(independent.offsets.isEmpty());
+    // Drag beyond either edge clamps to the source bounds and never modifies
+    // the shared layout or another host's offset.
+    const QRectF thumb = block.scrollThumb(state.offsets.value(0));
+    QVERIFY(state.press(layout, thumb.center()));
+    QVERIFY(state.move(layout, thumb.center() + QPointF(10000, 0)));
+    QVERIFY(state.release());
+    QCOMPARE(state.offsets.value(0), block.maximumOffset());
+    const int tail = layout.selectableText().indexOf(QStringLiteral("TAIL_MARKER"));
+    int reachableStart = -1, reachableEnd = -1;
+    for (int x = qCeil(block.viewport.left()); x <= qFloor(block.viewport.right()); ++x) {
+        const int position = layout.positionAt(QPointF(x, block.viewport.top() + 5), state.offsets);
+        if (position == tail) reachableStart = x;
+        if (position == tail + 11) reachableEnd = x;
+    }
+    QVERIFY(reachableStart >= 0 && reachableEnd >= 0);
+    layout.setSelection(tail, tail + 11);
+    QCOMPARE(layout.selectedText(), QStringLiteral("TAIL_MARKER"));
+
+    const auto render = [&](const QHash<int, qreal>& offsets) {
+        QImage image(280, qCeil(layout.height()) + 20, QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::white);
+        QPainter painter(&image);
+        layout.paint(&painter, QPointF(12, 10), image.rect(), offsets);
+        return image;
+    };
+    const QImage initial = render({});
+    const QImage shifted = render(state.offsets);
+    QVERIFY(initial != shifted);
+    const QRect changed = block.bounds.translated(12, 10).toAlignedRect().adjusted(-1, -1, 1, 1);
+    for (int y = 0; y < initial.height(); ++y)
+        for (int x = 0; x < initial.width(); ++x)
+            if (!changed.contains(x, y)) QCOMPARE(initial.pixel(x, y), shifted.pixel(x, y));
+    layout.setSelection(0, layout.textLength());
+    QVERIFY(layout.selectedText().contains(code));
+    QVERIFY(state.press(layout, block.scrollThumb(state.offsets.value(0)).center()));
+    QVERIFY(state.move(layout, QPointF(-10000, thumb.center().y())));
+    QVERIFY(state.release());
+    QCOMPARE(state.offsets.value(0), qreal(0));
 }
 
 void MarkdownLayoutTest::listIndentsByDepth() {
@@ -208,6 +294,81 @@ void MarkdownLayoutTest::selectionReadsBackTheText() {
     // 越界的位置要被夹住，不能崩。
     layout.setSelection(-100, 100000);
     QCOMPARE(layout.selectedText(), all);
+}
+
+void MarkdownLayoutTest::tableSelectionReachesEveryColumn_data() {
+    QTest::addColumn<QString>("markdown");
+    QTest::newRow("plain-cells")
+        << QStringLiteral("| 尝试 | 结果 |\n| --- | --- |\n"
+                          "| PowerShell + System.Drawing | 失败：PowerShell处于受限语言模式，Add-Type被拒绝 |\n");
+    QTest::newRow("mixed-inline-code")
+        << QStringLiteral("| 尝试 | 结果 |\n| --- | --- |\n"
+                          "| PowerShell + `System.Drawing` | 失败：PowerShell处于受限语言模式，`Add-Type`被拒绝 |\n");
+}
+
+void MarkdownLayoutTest::tableSelectionReachesEveryColumn() {
+    QFETCH(QString, markdown);
+    // A wide table keeps both body cells on the same visual line. Picking the
+    // first run with a matching y makes the entire second column unreachable.
+    auto layout = laidOut(markdown, 1200);
+    const QString first = QStringLiteral("PowerShell + System.Drawing");
+    const QString second = QStringLiteral("失败：PowerShell处于受限语言模式，Add-Type被拒绝");
+    const QString text = layout.selectableText();
+    for (const QString& cell : {first, second}) {
+        const int start = text.indexOf(cell);
+        QVERIFY(start >= 0);
+        bool firstEdgeReached = false;
+        bool lastEdgeReached = false;
+        for (int y = 0; y <= qCeil(layout.height()); ++y) {
+            for (int x = 0; x <= 1200; ++x) {
+                const int position = layout.positionAt(QPointF(x, y));
+                firstEdgeReached |= position == start;
+                lastEdgeReached |= position == start + cell.size();
+            }
+        }
+        QVERIFY2(firstEdgeReached && lastEdgeReached,
+                 qPrintable(QStringLiteral("Table cell cannot be selected by pointer: %1").arg(cell)));
+        layout.setSelection(start, start + cell.size());
+        QCOMPARE(layout.selectedText(), cell);
+        layout.setSelection(start + cell.size(), start);
+        QCOMPARE(layout.selectedText(), cell);
+    }
+}
+
+void MarkdownLayoutTest::codeFontUsesCompatibleLatinCjkAndBoxAdvances() {
+    const QString latinFont = QFINDTESTDATA("../resources/fonts/JetBrainsMono-latin-400.ttf");
+    QVERIFY(!latinFont.isEmpty());
+    const QDir fonts = QFileInfo(latinFont).dir();
+    QList<int> registrations;
+    const auto restoreFonts = qScopeGuard([&] {
+        for (int id : registrations) QFontDatabase::removeApplicationFont(id);
+    });
+    for (const QString& path : {latinFont, fonts.filePath(QStringLiteral("NotoSansSC-Regular.otf")),
+                               fonts.filePath(QStringLiteral("../../../Resources/fonts/SarasaFixedSC-Regular.ttf"))}) {
+        if (!QFileInfo::exists(path)) continue;
+        const int id = QFontDatabase::addApplicationFont(path);
+        QVERIFY2(id >= 0, qPrintable(path));
+        registrations.append(id);
+    }
+    const MarkdownTheme theme = MarkdownTheme::standard(1.0);
+    QFont code;
+    code.setFamilies({theme.codeFamily, QStringLiteral("Noto Sans SC")});
+    code.setFamily(theme.codeFamily);
+    code.setPixelSize(20);
+    code.setHintingPreference(QFont::PreferNoHinting);
+    const QFontMetricsF metrics(code);
+    const qreal cell = metrics.horizontalAdvance(QStringLiteral("M"));
+    QVERIFY(cell > 0);
+    for (const QString& glyph : {QStringLiteral(" "), QStringLiteral("-"), QStringLiteral("|"),
+                                 QStringLiteral("┌"), QStringLiteral("─"), QStringLiteral("│"),
+                                 QStringLiteral("┐"), QStringLiteral("┴"), QStringLiteral("┘"),
+                                 QStringLiteral("▼"), QStringLiteral("►"), QStringLiteral("◄")}) {
+        QVERIFY2(qAbs(metrics.horizontalAdvance(glyph) - cell) < 0.25,
+                 qPrintable(QStringLiteral("Code glyph %1 advance=%2, cell=%3, family=%4")
+                                .arg(glyph).arg(metrics.horizontalAdvance(glyph)).arg(cell).arg(theme.codeFamily)));
+    }
+    QVERIFY(qAbs(metrics.horizontalAdvance(QStringLiteral("中")) - 2 * cell) < 0.25);
+    QVERIFY(qAbs(metrics.horizontalAdvance(QStringLiteral("路径")) - 4 * cell) < 0.25);
 }
 
 void MarkdownLayoutTest::paintsWithoutTouchingOutsideTheClip() {

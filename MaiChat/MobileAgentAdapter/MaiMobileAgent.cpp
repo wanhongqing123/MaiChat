@@ -445,6 +445,9 @@ struct MaiMobileAgent {
     std::string cachedSession;
     int cachedLimit = -1;
     std::vector<MaiMessage> cachedMessages;
+    // Android 有限页的更新游标独立于 latest 缓存；summary/iOS 查询不能消费旧页增量。
+    bool trackMessageUpdates = false;
+    std::unordered_map<std::string, std::unordered_set<std::string>> pendingMessageUpdates;
     std::unordered_map<std::string, std::string> pendingDeltas;
     std::unordered_map<std::string, std::string> liveParts;
     std::unordered_map<std::string, std::string> errors;
@@ -943,11 +946,15 @@ struct MaiMobileAgent {
         cachedSession.clear();
         cachedLimit = -1;
         cachedMessages.clear();
+        trackMessageUpdates = false;
+        pendingMessageUpdates.clear();
         agent->eventBus().subscribe([this](const MaiEvent& event) {
             // 网络线程只合并增量，不读数据库、不解析 Markdown、不调用 UI。
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 dirty = true;
+                if (trackMessageUpdates && !event.messageId.empty())
+                    pendingMessageUpdates[event.sessionId].insert(event.messageId);
                 if (event.type == MaiEventType::MessagePartDelta)
                     pendingDeltas[event.partId] += event.delta;
                 else
@@ -1114,13 +1121,18 @@ struct MaiMobileAgent {
     }
 
     // 作用：读取指定会话的有限消息快照和任务状态。
-    Json snapshot(const std::string& selected, bool force, int limit) {
+    Json snapshot(const std::string& selected, bool force, int limit, bool includeMessageUpdates = false) {
         std::unordered_map<std::string, std::string> errorCopy;
         std::unordered_set<std::string> changedParts;
+        std::vector<std::string> updatedIds;
         bool reload = force || cachedSession != selected || cachedLimit != limit;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (!dirty && !force) return {{"ok", true}, {"changed", false}};
+            if (includeMessageUpdates) trackMessageUpdates = true;
+            auto pending = pendingMessageUpdates.find(selected);
+            const bool hasUpdates = includeMessageUpdates && limit > 0 && pending != pendingMessageUpdates.end() &&
+                                    !pending->second.empty();
+            if (!dirty && !reload && !hasUpdates) return {{"ok", true}, {"changed", false}};
             dirty = false;
             reload |= structureChanged;
             structureChanged = false;
@@ -1130,6 +1142,13 @@ struct MaiMobileAgent {
             }
             pendingDeltas.clear();
             errorCopy = errors;
+            if (hasUpdates) {
+                // 每次最多一旧页；未消费的 ID 留到下次，不把全部已加载历史 ID 带在线上。
+                auto& ids = pending->second;
+                for (auto id = ids.begin(); id != ids.end() && updatedIds.size() < 20;)
+                    updatedIds.push_back(*id), id = ids.erase(id);
+                if (ids.empty()) pendingMessageUpdates.erase(pending);
+            }
         }
         Json sessions = Json::array();
         bool busy = false;
@@ -1168,6 +1187,12 @@ struct MaiMobileAgent {
         } else {
             messages = serializeMessages(cachedMessages, sessionBusy);
         }
+        std::vector<MaiMessage> updatedMessages;
+        for (const auto& id : updatedIds) {
+            MaiMessage message;
+            if (agent->getMessage(selected, id, message)) updatedMessages.push_back(std::move(message));
+        }
+        Json messageUpdates = serializeMessages(updatedMessages, sessionBusy);
         Json permissions = Json::array(), questions = Json::array();
         for (const auto& p : agent->listPendingPermissions())
             if (p.sessionId == selected)
@@ -1187,6 +1212,8 @@ struct MaiMobileAgent {
                 {"changed", true},
                 {"sessions", sessions},
                 {"messages", messages},
+                {"messageUpdates", std::move(messageUpdates)},
+                {"hasOlderMessages", limit > 0 && cachedMessages.size() >= static_cast<std::size_t>(limit)},
                 {"permissions", permissions},
                 {"questions", questions},
                 {"busy", busy},
@@ -1239,12 +1266,25 @@ struct MaiMobileAgent {
         if (op == "snapshot") {
             const int limit = r.value("messageLimit", -1);
             if (limit < -1 || limit > 100) throw std::runtime_error("messageLimit must be between 0 and 100.");
-            return snapshot(session, r.value("force", false), limit);
+            return snapshot(session, r.value("force", false), limit, r.value("includeMessageUpdates", false));
         }
         if (op == "remote_snapshot") {
             const int limit = r.value("limit", 10);
             if (limit < 1 || limit > 20) throw std::runtime_error("limit must be between 1 and 20.");
             return remoteSnapshot(session, r.value("before", std::string{}), limit);
+        }
+        if (op == "message") {
+            if (!r.contains("id") || !r["id"].is_string())
+                throw NativeOperationFailure(
+                    MaiError::make(MaiErrorCode::InvalidInput, "Message id must be a string."));
+            const std::string messageId = r["id"];
+            if (messageId.empty() || messageId.size() > 128)
+                throw NativeOperationFailure(MaiError::make(MaiErrorCode::InvalidInput, "Message id is invalid."));
+            MaiMessage message;
+            if (!agent->getMessage(session, messageId, message))
+                throw NativeOperationFailure(
+                    MaiError::make(MaiErrorCode::NotFound, "Message was not found in this conversation."));
+            return {{"ok", true}, {"messages", serializeMessages({message}, agent->isBusy(session))}};
         }
         if (op == "messages_page") {
             const int limit = r.value("limit", 30);
@@ -1295,6 +1335,8 @@ struct MaiMobileAgent {
                     {"professional", suggestions["professional"]}};
         }
         std::string id;
+        std::string acceptedUserId;
+        std::string acceptedTurnId;
         if (op == "create")
             id = result(agent->submit(MaiCreateSession{workspace, "", model}));
         else if (op == "send" || op == "steer") {
@@ -1338,12 +1380,25 @@ struct MaiMobileAgent {
                 id = result(
                     agent->submit(MaiSteerPrompt{session, r["turnId"], r["requestId"], r.at("text"), std::move(images),
                                                  std::move(videos), r.value("quoteMessageId", std::string{})}));
+                acceptedUserId = id;
+                acceptedTurnId = r["turnId"];
             } else {
                 id = result(agent->submit(MaiSendPrompt{session, r.at("text"), std::move(images), std::move(videos),
                                                         r.value("quoteMessageId", std::string{})}));
+                acceptedTurnId = id;
+                // Send returns the initial assistant ID. Its immediately preceding
+                // row in the same conversation is the submitted user; a strict
+                // before cursor stays tied to this receipt even after new output.
+                const auto previous = agent->listMessagesPage(session, id, 1);
+                if (!previous.empty() && previous.front().role == MaiRole::User) acceptedUserId = previous.front().id;
             }
         } else if (op == "stop") {
-            result(agent->submit(MaiInterrupt{session}));
+            // 可选轮次来自点击时的所有者快照；兼容旧调用，但不能让迟到取消影响新任务。
+            if (r.contains("turnId") && !r["turnId"].is_string())
+                throw NativeOperationFailure(
+                    MaiError::make(MaiErrorCode::InvalidInput, "Stop turnId must be a string."));
+            const auto expectedTurn = r.value("turnId", std::string{});
+            result(agent->interruptTurn(session, expectedTurn));
             if (scheduleRunner) scheduleRunner->finish(session, "Interrupted by user");
         } else if (op == "delete")
             result(agent->submit(MaiDeleteSession{session}));
@@ -1360,7 +1415,12 @@ struct MaiMobileAgent {
             result(agent->submit(MaiReplyQuestion{r.at("id"), r.at("text")}));
         else
             throw std::runtime_error("Unknown operation.");
-        return {{"ok", true}, {"id", id}};
+        Json response{{"ok", true}, {"id", id}};
+        if (op == "send" || op == "steer") {
+            response["user_message_id"] = acceptedUserId;
+            response["turnId"] = acceptedTurnId;
+        }
+        return response;
     }
 };
 

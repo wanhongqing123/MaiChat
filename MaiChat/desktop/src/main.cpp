@@ -112,12 +112,14 @@ int main(int argc, char* argv[]) {
 
     // 桌面端字体栈使用 "Inter", "Noto Sans SC", "PingFang SC", "Microsoft YaHei"。
     //
-    // Inter/Noto/JetBrains Mono 都随包打进资源（:/maichat/fonts/，SIL OFL 1.1），
+    // Inter/Noto/JetBrains Mono/Sarasa Fixed SC 随包打进资源（:/maichat/fonts/，SIL OFL 1.1），
     // 不依赖系统装没装：Inter 拉丁字形的现代感是 Electron 观感的主要来源，
     // Noto Sans SC 补上中文的 Medium(500)——雅黑只有 400/700 两档，500 会触发
     // 假粗体；Noto 有真 Medium/Bold，QSS 与代码里设的字重都落在真实字面上。
     // Inter/JetBrains Mono 是 latin 子集，缺的字形（箭头、全角标点等）由列表
     // 后面的中文字体接住；雅黑/苹方垫底，字体注册万一失败也不至于开天窗。
+    // 代码单独使用完整 Sarasa Fixed SC：同一字面覆盖 ASCII、中文、线框和箭头，
+    // 避免 Latin 子集与 CJK 回退字面的 advance 不兼容；正文的字体列表不改变。
     const QString bundledFonts[] = {
         QStringLiteral(":/maichat/fonts/Inter-latin-400.ttf"),
         QStringLiteral(":/maichat/fonts/Inter-latin-500.ttf"),
@@ -128,6 +130,7 @@ int main(int argc, char* argv[]) {
         QStringLiteral(":/maichat/fonts/NotoSansSC-Bold.otf"),
         QStringLiteral(":/maichat/fonts/JetBrainsMono-latin-400.ttf"),
         QStringLiteral(":/maichat/fonts/JetBrainsMono-latin-700.ttf"),
+        QStringLiteral(":/maichat/fonts/SarasaFixedSC-Regular.ttf"),
     };
     for (const QString& path : bundledFonts) {
         if (QFontDatabase::addApplicationFont(path) < 0) {

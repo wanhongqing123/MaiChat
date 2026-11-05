@@ -488,11 +488,12 @@ bool ChatState::adoptMessageId(const QString& oldId, const QString& newId) {
     message.id = newId;
     messageIds_.remove(oldId);
     messageIds_.insert(newId);
+    if (databaseHistoryMessageIds_.remove(oldId)) databaseHistoryMessageIds_.insert(newId);
     messageIndexById_.remove(oldId);
     messageIndexById_.insert(newId, index);
     QList<QString>& conversation = messageIdsByPeer_[peerId];
-    const int conversationIndex = conversation.indexOf(oldId);
-    if (conversationIndex >= 0) conversation[conversationIndex] = newId;
+    conversation.removeAll(oldId);
+    insertMessageIntoConversation(newId);
     return true;
 }
 
@@ -510,6 +511,27 @@ void ChatState::appendMessageForRestore(const RemoteIMMessage& message) {
         restored.text = incomingDisplayText(restored.text);
     }
     appendTracked(restored);
+}
+
+void ChatState::appendDatabaseHistoryPage(const QList<RemoteIMMessage>& page) {
+    QSet<QString> peers;
+    QSet<QString> newHistoryIds;
+    // Keep the old comparator valid during insertion; publish the new history
+    // category only after the complete page has been merged and deduplicated.
+    for (const RemoteIMMessage& message : page) {
+        if (!messageIds_.contains(message.id)) newHistoryIds.insert(message.id);
+        appendMessageForRestore(message);
+        peers.insert(peerIdForMessage(message));
+    }
+    // A live record may already have been persisted before its first page is
+    // opened. Loading that duplicate must not rewrite its live arrival order.
+    databaseHistoryMessageIds_.unite(newHistoryIds);
+    for (const QString& peer : peers) {
+        QList<QString>& conversation = messageIdsByPeer_[peer];
+        std::sort(conversation.begin(), conversation.end(), [this](const QString& left, const QString& right) {
+            return messageComesBefore(left, right);
+        });
+    }
 }
 
 bool ChatState::appendLiveMessage(const RemoteIMMessage& message) {
@@ -547,17 +569,24 @@ void ChatState::insertMessageIntoConversation(const QString& messageId) {
     const auto insertionPoint = std::lower_bound(
         conversation.begin(), conversation.end(), messageIndex,
         [this](const QString& existingId, int candidateIndex) {
-            const int existingIndex = messageIndexById_.value(existingId, -1);
-            if (existingIndex < 0 || existingIndex >= messages_.size()) return true;
-            const RemoteIMMessage& existing = messages_.at(existingIndex);
-            const RemoteIMMessage& candidate = messages_.at(candidateIndex);
-            if (existing.createdAtMillis != candidate.createdAtMillis) {
-                return existing.createdAtMillis < candidate.createdAtMillis;
-            }
-            // 与原来的 stable_sort 一致：同一毫秒按进入内存的先后顺序展示。
-            return existingIndex < candidateIndex;
+            return messageComesBefore(existingId, messages_.at(candidateIndex).id);
         });
     conversation.insert(insertionPoint, messageId);
+}
+
+bool ChatState::messageComesBefore(const QString& leftId, const QString& rightId) const {
+    const int leftIndex = messageIndexById_.value(leftId, -1);
+    const int rightIndex = messageIndexById_.value(rightId, -1);
+    if (leftIndex < 0 || rightIndex < 0) return leftIndex < rightIndex;
+    const RemoteIMMessage& left = messages_.at(leftIndex);
+    const RemoteIMMessage& right = messages_.at(rightIndex);
+    if (left.createdAtMillis != right.createdAtMillis) return left.createdAtMillis < right.createdAtMillis;
+    const bool leftHistory = databaseHistoryMessageIds_.contains(leftId);
+    const bool rightHistory = databaseHistoryMessageIds_.contains(rightId);
+    // A category before its local key keeps this comparator transitive when
+    // late pages and newly received live messages share the same timestamp.
+    if (leftHistory != rightHistory) return leftHistory;
+    return leftHistory ? leftId < rightId : leftIndex < rightIndex;
 }
 
 void ChatState::rebuildMessageIndexes() {
@@ -570,6 +599,7 @@ void ChatState::rebuildMessageIndexes() {
         messageIndexById_.insert(messageId, index);
         insertMessageIntoConversation(messageId);
     }
+    databaseHistoryMessageIds_.intersect(messageIds_);
 }
 
 void ChatState::bumpUnreadIfBackground(const QString& peerId) {

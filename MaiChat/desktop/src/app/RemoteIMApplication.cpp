@@ -111,8 +111,9 @@ AvatarUploadOutcome uploadAvatar(const QString &path,
     return result;
 }
 
-// 分页启动：每会话只载最近一页，避免大历史全量进内存/上屏。
-constexpr int kMessagesPageSize = 200;
+// 登录先恢复会话预览；打开会话后才读取最近一页，更早正文按需分页。
+constexpr int kConversationPreviewSize = 1;
+constexpr int kMessagesPageSize = 40;
 constexpr int kGroupPageSize = 20;
 
 bool groupMessageLess(const RemoteIMGroupMessage& lhs, const RemoteIMGroupMessage& rhs) {
@@ -209,13 +210,13 @@ RemoteIMApplication::RemoteIMApplication(QString ownerUserId,
                                                      true, 12000, ++typingSequence_}, {});
     });
     bindClientSignals();
-    // 登录前先把本地库的全部历史恢复进内存：消息列表不再依赖 SDK 漫游
-    //（只有几条），漫游随后按 id 去重合并进来。
+    // 本地库提供完整历史，但启动只取列表所需的一条预览，SDK 漫游按 id 去重合并。
+    // 首次打开会话再取最近一页，避免扫码登录同步解析所有会话正文。
     if (database_ && database_->isOpen()) {
         // 分组要在联系人之前恢复：联系人带着分组名进来，分组列表先就位，
         // 内存里才不会出现「指向还不存在的分组」这种中间态。
         state_.setContactGroups(database_->contactGroups());
-        hasEarlierMessages_ = database_->loadRecentInto(state_, kMessagesPageSize);
+        hasEarlierMessages_ = database_->loadRecentInto(state_, kConversationPreviewSize);
         groups_ = database_->groups();
         for (const RemoteIMGroup& group : groups_) {
             groupMessages_[group.groupId] = database_->groupMessagesBefore(
@@ -676,18 +677,40 @@ bool RemoteIMApplication::hasEarlierMessages(const QString& peerId) const {
     return hasEarlierMessages_.value(peerId.trimmed(), false);
 }
 
+bool RemoteIMApplication::loadRecentPeerHistory(const QString& peerId) {
+    if (recentHistoryLoadedPeers_.contains(peerId) || !database_ || !database_->isOpen()) return false;
+    recentHistoryLoadedPeers_.insert(peerId);
+    QList<RemoteIMMessage> recent = database_->loadRecentMessages(peerId, kMessagesPageSize + 1);
+    const bool hasEarlier = recent.size() > kMessagesPageSize;
+    if (hasEarlier) recent.removeFirst();
+    const int previousCount = state_.messagesWith(peerId).size();
+    state_.appendDatabaseHistoryPage(recent);
+    if (!recent.isEmpty())
+        historyPageCursors_.insert(peerId, {recent.first().createdAtMillis, recent.first().id});
+    hasEarlierMessages_.insert(peerId, hasEarlier);
+    return state_.messagesWith(peerId).size() != previousCount;
+}
+
 int RemoteIMApplication::loadEarlierMessages(const QString& peerId) {
     const QString peer = peerId.trimmed();
-    if (peer.isEmpty() || !database_ || !hasEarlierMessages_.value(peer, false)) return 0;
-    const QList<RemoteIMMessage> visible = state_.messagesWith(peer);
-    if (visible.isEmpty()) return 0;
-    const RemoteIMMessage& oldest = visible.first();
-    const QList<RemoteIMMessage> earlier =
-        database_->loadMessagesBefore(peer, oldest.createdAtMillis, oldest.id, kMessagesPageSize);
-    for (const RemoteIMMessage& message : earlier) {
-        state_.appendMessageForRestore(message);  // 展示顺序由 messagesWith 排序保证
+    if (peer.isEmpty() || !database_) return 0;
+    const int previousCount = state_.messagesWith(peer).size();
+    if (loadRecentPeerHistory(peer)) {
+        // Direct callers may open a preview-only conversation through this
+        // entry point. Publish that first page even when no older page exists.
+        emit stateChanged();
+        return state_.messagesWith(peer).size() - previousCount;
     }
-    hasEarlierMessages_.insert(peer, earlier.size() == kMessagesPageSize);
+    if (!hasEarlierMessages_.value(peer, false) || !historyPageCursors_.contains(peer)) return 0;
+    const auto cursor = historyPageCursors_.value(peer);
+    QList<RemoteIMMessage> earlier =
+        database_->loadMessagesBefore(peer, cursor.first, cursor.second, kMessagesPageSize + 1);
+    const bool hasEarlier = earlier.size() > kMessagesPageSize;
+    if (hasEarlier) earlier.removeFirst();
+    state_.appendDatabaseHistoryPage(earlier);
+    if (!earlier.isEmpty())
+        historyPageCursors_.insert(peer, {earlier.first().createdAtMillis, earlier.first().id});
+    hasEarlierMessages_.insert(peer, hasEarlier);
     if (!earlier.isEmpty()) emit stateChanged();
     return earlier.size();
 }
@@ -726,6 +749,7 @@ void RemoteIMApplication::disconnectFromService(RemoteIMCompletion completion) {
 
 void RemoteIMApplication::addContact(const QString& userId, const QString& displayName) {
     state_.upsertContact(RemoteIMContact{userId, displayName});
+    loadRecentPeerHistory(userId);
     state_.selectPeer(userId);
     if (database_) database_->upsertContact(RemoteIMContact{userId, displayName});
     emit stateChanged();
@@ -1111,6 +1135,10 @@ void RemoteIMApplication::deleteContact(const QString& userId) {
         }
         state_.removeContactAndMessages(cleanUserId);
         if (database_) database_->removeContactCascade(cleanUserId);
+        recentHistoryLoadedPeers_.remove(cleanUserId);
+        historyPageCursors_.remove(cleanUserId);
+        hasEarlierMessages_.remove(cleanUserId);
+        loadRecentPeerHistory(state_.selectedPeerId());
         emit stateChanged();
     });
 }
@@ -1122,6 +1150,7 @@ void RemoteIMApplication::clearMessagesWith(const QString& userId) {
     if (database_) database_->removeMessagesForPeer(peerId);
     // 本地库已清空，该会话不再有「更早的消息」可翻。
     hasEarlierMessages_[peerId] = false;
+    historyPageCursors_.remove(peerId);
     emit stateChanged();
 }
 
@@ -1139,11 +1168,12 @@ void RemoteIMApplication::selectPeer(const QString& userId) {
         }
     }
 
+    const bool loadedHistory = loadRecentPeerHistory(peerId);
     state_.selectPeer(peerId);
     if (!knownContact) {
         // selectPeer 会为未知账号补联系人，此时仍需刷新列表结构。
         emit stateChanged();
-    } else if (previousPeerId != peerId || previousUnreadCount > 0) {
+    } else if (previousPeerId != peerId || previousUnreadCount > 0 || loadedHistory) {
         emit selectionChanged(peerId);
     }
 }
@@ -1614,6 +1644,7 @@ void RemoteIMApplication::bindClientSignals() {
             if (database_) database_->upsertContact(current);
         }
         if (shouldSelectFirstContact && !contacts.isEmpty()) {
+            loadRecentPeerHistory(contacts.first().userId);
             state_.selectPeer(contacts.first().userId);
         }
         emit stateChanged();
@@ -1730,6 +1761,9 @@ void RemoteIMApplication::ingestMessages(const QList<RemoteIMMessage>& messages,
             state_.appendMessageForRestore(message);
         }
     }
-    if (shouldSelectFirstPeer && !firstPeerId.isEmpty()) state_.selectPeer(firstPeerId);
+    if (shouldSelectFirstPeer && !firstPeerId.isEmpty()) {
+        loadRecentPeerHistory(firstPeerId);
+        state_.selectPeer(firstPeerId);
+    }
     emit stateChanged();
 }

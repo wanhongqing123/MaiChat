@@ -32,6 +32,8 @@ public:
     // 分页启动加载：联系人 + 每个会话最近 perPeerLimit 条。返回各会话是否还有
     // 更早的消息（供 UI 决定是否显示「加载更早」）。大历史下避免全量进内存。
     QHash<QString, bool> loadRecentInto(ChatState& state, int perPeerLimit) const;
+    // 按覆盖索引读取单个会话的最近 limit 条，按时间和 id 升序返回。
+    QList<RemoteIMMessage> loadRecentMessages(const QString& peer, int limit) const;
     // 键集分页取更早的消息：严格早于 (beforeCreatedAt, beforeId)，按时间升序返回，
     // 最多 limit 条。
     QList<RemoteIMMessage> loadMessagesBefore(const QString& peer,

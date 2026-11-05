@@ -1787,7 +1787,7 @@ private:
   Action action_;
 };
 
-void configureWindowsContentCaption(QWidget* window) {
+void configureWindowsTitleBar(QWidget* window) {
   const HWND handle = reinterpret_cast<HWND>(window->winId());
   const LONG_PTR before = GetWindowLongPtrW(handle, GWL_STYLE);
   const LONG_PTR after = (before | WS_THICKFRAME | WS_SYSMENU |
@@ -1917,18 +1917,17 @@ void MainWindow::toggleWindowMaximized() {
 
 void MainWindow::updateWindowCaptionControls() {
 #ifdef Q_OS_WIN
-  if (!windowCaptionControls_ || !contentStack_) return;
-  // Pages with no product header reserve one caption row rather than covering
-  // contact rows or a remote desktop card. Full screen returns that space.
-  for (QWidget* page : {contactsPage_, remotePage_}) {
-    if (page && page->layout()) {
-      const int top = isFullScreen() ? 0 : UiZoom::s(54);
-      if (page->layout()->contentsMargins().top() != top)
-        page->layout()->setContentsMargins(0, top, 0, 0);
-    }
-  }
+  if (!windowCaptionControls_) return;
+  QWidget* titleBar = windowCaptionControls_->parentWidget();
+  // 窗口控制始终留在独立标题栏；业务页的投屏、更多、上传等动作在下一行。
+  // 不按当前页面或滚动位置移动窗口按钮，也不占用业务标题行的尾部空间。
+  titleBar->setFixedHeight(UiZoom::s(36));
+  titleBar->setVisible(!isFullScreen());
   windowCaptionControls_->setVisible(!isFullScreen());
-  if (isFullScreen()) return;
+  if (isFullScreen()) {
+    windowCaptionDragRect_ = QRect();
+    return;
+  }
   const int buttonWidth = UiZoom::s(36);
   const int buttonHeight = UiZoom::s(30);
   for (auto* button : {windowMinimizeButton_, windowMaximizeButton_, windowCloseButton_})
@@ -1938,47 +1937,10 @@ void MainWindow::updateWindowCaptionControls() {
   windowMaximizeButton_->setToolTip(maximizeText);
   windowMaximizeButton_->update();
 
-  QWidget* header = nullptr;
-  QLayout* row = nullptr;
-  if (contentStack_->currentWidget() == agentPage_) {
-    header = agentPage_->findChild<QWidget*>(QStringLiteral("agentHeader"));
-  } else if (contentStack_->currentWidget() == messagesPage_) {
-    header = chatConversationStack_->currentWidget() == groupConversationPane_
-        ? groupTitleLabel_->parentWidget()
-        : findChild<QWidget*>(QStringLiteral("chatHeader"));
-  } else if (contentStack_->currentWidget() == cloudDrivePage_ && cloudDriveDialog_) {
-    header = cloudDriveDialog_;
-    if (header->layout() && header->layout()->count() > 0)
-      row = header->layout()->itemAt(0)->layout();
-  } else if (contentStack_->currentWidget() == settingsPage_) {
-    header = settingsPage_->findChild<QWidget*>(QStringLiteral("settingsHeader"));
-  }
-  if (header && !row) row = header->layout();
-  // Reserve only the title row's trailing space. Existing actions and every
-  // conversation/media surface keep their current container and state.
-  if (row) {
-    const QMargins margins = row->contentsMargins();
-    const int right = UiZoom::s(3 * 36 + 16);
-    if (margins.right() != right)
-      row->setContentsMargins(margins.left(), margins.top(), right, margins.bottom());
-    // 页面切换时立即让原有动作让出空间，避免等待下一次 LayoutRequest 时短暂被窗口按钮覆盖。
-    row->activate();
-    header->installEventFilter(this);
-  }
-  QRect titleRect(contentStack_->mapTo(this, QPoint()), QSize(contentStack_->width(), UiZoom::s(54)));
-  if (header) {
-    titleRect = QRect(header->mapTo(this, QPoint()), header->size());
-    if (row && header == cloudDriveDialog_)
-      titleRect = QRect(header->mapTo(this, row->geometry().topLeft()), row->geometry().size());
-    else if (header == groupTitleLabel_->parentWidget())
-      titleRect = QRect(groupTitleLabel_->mapTo(this, QPoint()), groupTitleLabel_->size());
-  }
-  windowCaptionDragRect_ = titleRect;
-  const QPoint captionTop(width() - UiZoom::s(8) - buttonWidth * 3,
-                          titleRect.center().y() - buttonHeight / 2);
-  QWidget* captionParent = windowCaptionControls_->parentWidget();
-  windowCaptionControls_->setGeometry(QRect(captionParent->mapFrom(this, captionTop),
-                                            QSize(buttonWidth * 3, buttonHeight)));
+  windowCaptionDragRect_ = QRect(titleBar->mapTo(this, QPoint()), titleBar->size());
+  // 36px 标题栏保留完整高度，按钮顶部留 5px，视觉中心比栏中心略低。
+  windowCaptionControls_->setGeometry(titleBar->width() - UiZoom::s(8) - buttonWidth * 3,
+                                      UiZoom::s(5), buttonWidth * 3, buttonHeight);
   windowCaptionControls_->raise();
 #endif
 }
@@ -2036,9 +1998,7 @@ bool MainWindow::nativeEvent(const QByteArray& eventType, void* message, long* r
     const bool passive = !child || child == centralWidget() || child == contentStack_ ||
         qobject_cast<QLabel*>(child) ||
         (child->metaObject() == &QWidget::staticMetaObject && child != windowCaptionControls_);
-    auto* inset = findChild<QWidget*>(QStringLiteral("windowTopInset"));
-    const bool inTopInset = inset && QRect(inset->mapTo(this, QPoint()), inset->size()).contains(point);
-    if (passive && (windowCaptionDragRect_.contains(point) || inTopInset)) {
+    if (passive && windowCaptionDragRect_.contains(point)) {
       // Native HTCAPTION keeps double-click maximize, drag restore and Snap move.
       *result = HTCAPTION;
       return true;
@@ -2294,7 +2254,7 @@ void MainWindow::resizeEvent(QResizeEvent *event) {
 void MainWindow::showEvent(QShowEvent *event) {
   QMainWindow::showEvent(event);
 #ifdef Q_OS_WIN
-  if (!isFullScreen()) configureWindowsContentCaption(this);
+  if (!isFullScreen()) configureWindowsTitleBar(this);
 #endif
   updateWindowCaptionControls();
   QTimer::singleShot(0, this, [this] { updateMessageBubbleWidths(); });
@@ -2302,8 +2262,7 @@ void MainWindow::showEvent(QShowEvent *event) {
 
 void MainWindow::buildUi() {
 #ifdef Q_OS_WIN
-  // Caption buttons belong to the page title row, rather than a second strip
-  // above it. Native hit testing below retains Windows move/resize behavior.
+  // 自绘完整的窗口标题栏；窗口控制与下方业务标题分行，保留 Windows 原生拖动/缩放。
   setWindowFlag(Qt::FramelessWindowHint);
 #endif
   // 单个空格而不是空串：空标题时 Qt 会回退显示 applicationDisplayName
@@ -2322,11 +2281,11 @@ void MainWindow::buildUi() {
   setCentralWidget(root);
 
 #ifdef Q_OS_WIN
-  // A small draggable inset keeps the page title away from the screen edge;
-  // caption buttons are aligned with the actual page header below this inset.
+  // 完整标题栏横贯窗口，窗口控制属于这里，不随当前业务页面切换位置。
   auto *windowTopInset = new QWidget(root);
   windowTopInset->setObjectName(QStringLiteral("windowTopInset"));
-  windowTopInset->setFixedHeight(UiZoom::s(16));
+  windowTopInset->setFixedHeight(UiZoom::s(36));
+  windowTopInset->installEventFilter(this);
   setSolidWindowBackground(windowTopInset, kInactiveWindowChromeBackground);
   rootColumn->addWidget(windowTopInset);
 #endif
@@ -2596,8 +2555,9 @@ void MainWindow::buildUi() {
 
   messageEditor_ = new ComposerTextEdit(composer);
   messageEditor_->setObjectName(QStringLiteral("messageEditor"));
-  messageEditor_->setPlaceholderText(
-      QStringLiteral("输入消息（可拖入文件，或 Ctrl+V 粘贴图片/文件）"));
+  messageEditor_->setAccessibleName(QStringLiteral("消息输入"));
+  // 输入框保持干净；隐藏内部滚动条仍保留光标导航、滚轮及多行编辑。
+  messageEditor_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   messageEditor_->setAcceptRichText(false);
   messageEditor_->setMinimumHeight(UiZoom::s(64));
   messageEditor_->installEventFilter(this);
@@ -3316,7 +3276,7 @@ void MainWindow::buildUi() {
   rootNavigationSplitter->setSizes(QList<int>() << UiZoom::s(64) << 1100);
   rootLayout->addWidget(rootNavigationSplitter, 1);
 #ifdef Q_OS_WIN
-  windowCaptionControls_ = new QWidget(root);
+  windowCaptionControls_ = new QWidget(windowTopInset);
   windowCaptionControls_->setObjectName(QStringLiteral("windowCaptionControls"));
   auto* captionRow = new QHBoxLayout(windowCaptionControls_);
   captionRow->setContentsMargins(0, 0, 0, 0);
@@ -5127,7 +5087,10 @@ void MainWindow::rebuildAgentPage() {
   agentSessions_ = new AgentSessionList(*agentController_, agentSplitter);
   agentPanelStack_ = new QStackedWidget(agentSplitter);
   agentPanel_ = new AgentChatPanel(*agentController_, agentPanelStack_);
-  agentRemotePanel_ = new RemoteAgentPanel(agentPanelStack_);
+  // 远端待发内容与本地 Agent 使用同一账号私有目录，避免账号切换共享出站记录。
+  agentRemotePanel_ = new RemoteAgentPanel(agentPanelStack_,
+      QDir(accountAgentDirectory(app_.chatState().ownerUserId()))
+          .filePath(QStringLiteral("remote-agent-outbox.json")));
   agentPanelStack_->addWidget(agentPanel_);
   agentPanelStack_->addWidget(agentRemotePanel_);
   agentSessions_->setRemoteSessions(remoteAgentSessions_);
@@ -7246,6 +7209,11 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
                                  : QStringLiteral("messageBubbleIncoming"));
   bubble->setProperty("fullWidthBody", fullWidthBody);
   bubble->setProperty("expandedTextBubble", expandedTextBubble);
+  // 普通发送正文按真实排版收窄；字数和换行并不代表它一定需要占满整行。
+  // 带引用或交互卡片的气泡继续由其完整子布局决定尺寸。
+  bubble->setProperty("compactTextBubble", outgoing && !message.hasQuote &&
+      !message.hasApprovalRequest && !message.hasImage && !message.hasFile &&
+      !message.hasVideo && !message.hasVoice);
   applyMessageBubbleWidth(bubble, expandedTextBubble);
   bubble->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
   // 取消消息外框；发送仍用浅蓝底区分，接收正文融入聊天背景。
@@ -7848,6 +7816,17 @@ void MainWindow::applyMessageBubbleWidth(QWidget *bubble, bool expanded) const {
       qMax(0, maximumWidth - bubble->property("trailingMetadataWidth").toInt());
   if (!bubble->property("fullWidthBody").toBool())
     maximumWidth = qMin(maximumWidth, 1280);
+  if (bubble->property("compactTextBubble").toBool()) {
+    if (auto* body = bubble->findChild<MarkdownLabel*>(QStringLiteral("messageMarkdownView"))) {
+      const QMargins padding = bubble->layout()->contentsMargins();
+      const int horizontalPadding = padding.left() + padding.right();
+      const int available = qMax(1, maximumWidth - horizontalPadding);
+      const int actual = qMin(maximumWidth, body->naturalWidthForWidth(available) + horizontalPadding);
+      bubble->setMinimumWidth(actual);
+      bubble->setMaximumWidth(actual);
+      return;
+    }
+  }
   bubble->setMaximumWidth(maximumWidth);
   bubble->setMinimumWidth(expanded ? maximumWidth : 0);
 }

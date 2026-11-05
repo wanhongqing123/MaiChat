@@ -15,11 +15,12 @@ QColor hex(const char* value) {
     return QColor(QString::fromLatin1(value));
 }
 
-// 等宽字体用随包注册的 JetBrains Mono（main.cpp 从 :/maichat/fonts/ 注册），
-// 与 Electron 端一致，跨平台同一副面孔，不随系统装的字体漂移。
+// 代码使用三端共用的完整 Sarasa Fixed SC（main.cpp 从资源注册）：
+// ASCII、线框与箭头一格，中文两格，且 Fixed 不含编程连字。
+// 不再用 Latin 子集与 CJK 回退字面混排，否则名义 advance 无法组成统一网格。
 // 写成浏览器式的回退列表没用——QFont 不解析那种写法，Qt 只认单个族名。
 QString monospaceFamily() {
-    return QStringLiteral("JetBrains Mono");
+    return QStringLiteral("Sarasa Fixed SC");
 }
 
 }  // namespace

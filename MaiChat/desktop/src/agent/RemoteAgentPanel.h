@@ -15,7 +15,8 @@ public:
     using DownloadCompletion = std::function<void(const QString&, const QString&)>;
     using DownloadHandler = std::function<void(const QJsonObject&, const QString&, DownloadCompletion)>;
 
-    explicit RemoteAgentPanel(QWidget* parent = nullptr);
+    // outboxFile may select a private embedding/test store; empty uses app-local data.
+    explicit RemoteAgentPanel(QWidget* parent = nullptr, const QString& outboxFile = {});
     ~RemoteAgentPanel() override;
 
     void setCommandHandler(CommandHandler handler);
@@ -32,6 +33,11 @@ private:
     void refreshHistory();
     void requestHistory(const QString& before, int limit);
     void sendOrStop();
+    bool persistOutbox();
+    void dispatchQueued(const QString& ownerKey = {});
+    void finishQueued(const QString& requestId, const QJsonObject& result, bool unknown = false);
+    void recoverQueuedDraft();
+    void refreshAttachments();
     void sendAction(const QJsonObject& action, bool clearDraft);
     void removeOptimisticMessage(const QString& id);
     void renderMessages();

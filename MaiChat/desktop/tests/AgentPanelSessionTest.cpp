@@ -12,6 +12,7 @@
 #include <QMenu>
 #include <QMimeData>
 #include <QPushButton>
+#include <QPointer>
 #include <QSemaphore>
 #include <QScrollBar>
 #include <QScrollArea>
@@ -35,6 +36,7 @@
 #include <thread>
 #include <variant>
 
+#include "MaiSqliteStore.h"
 #include "agent/AgentChatPanel.h"
 #include "agent/AgentController.h"
 #include "agent/AgentSessionList.h"
@@ -56,6 +58,15 @@
 // 滤掉的话它会永远挂在闸门上等一个不会来的点头。
 
 namespace {
+
+// Capture only isolated local fixtures; no user history or model request is involved.
+bool captureAgentFixture(QWidget& panel, const QString& name) {
+    const QString output = qEnvironmentVariable("MAICHAT_AGENT_EVIDENCE_DIR");
+    if (output.isEmpty()) return true;
+    if (!QDir().mkpath(output)) return false;
+    QTest::qWait(80);
+    return panel.grab().save(QDir(output).filePath(name + QStringLiteral(".png")));
+}
 
 // 一个什么都不说的模型。这份用例不需要真跑起来的回答——
 // 事件是直接往总线上发的，那才是要测的路径。
@@ -85,7 +96,9 @@ public:
         if (sink.onText) sink.onText("done");
         return {};
     }
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
     MaiModelRequest request() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return request_;
@@ -98,18 +111,19 @@ private:
 
 class PdfGeneratingModel final : public MaiModelClient {
 public:
-    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
-                    const std::atomic<bool>&) override {
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
         if (calls_++ == 0) {
-            if (sink.onToolCall) sink.onToolCall(MaiToolInvocation{
-                "pdf-call", "generate_pdf",
-                R"({"content":"# Preview test","output_path":"preview.pdf"})"});
+            if (sink.onToolCall)
+                sink.onToolCall(MaiToolInvocation{"pdf-call", "generate_pdf",
+                                                  R"({"content":"# Preview test","output_path":"preview.pdf"})"});
         } else if (sink.onText) {
             sink.onText("PDF created");
         }
         return {};
     }
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
 
 private:
     std::atomic<int> calls_{0};
@@ -117,23 +131,22 @@ private:
 
 class MediaDeliveringModel final : public MaiModelClient {
 public:
-    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
-                    const std::atomic<bool>&) override {
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
         if (calls_++ == 0) {
             if (sink.onToolCall) {
-                sink.onToolCall(MaiToolInvocation{
-                    "media-call-1", "agent_send_media",
-                    R"({"file_path":"sample.mp4","type":"video"})"});
-                sink.onToolCall(MaiToolInvocation{
-                    "media-call-2", "agent_send_media",
-                    R"({"file_path":"second.mp4","type":"video"})"});
+                sink.onToolCall(MaiToolInvocation{"media-call-1", "agent_send_media",
+                                                  R"({"file_path":"sample.mp4","type":"video"})"});
+                sink.onToolCall(MaiToolInvocation{"media-call-2", "agent_send_media",
+                                                  R"({"file_path":"second.mp4","type":"video"})"});
             }
         } else if (sink.onText) {
             sink.onText("Video delivered");
         }
         return {};
     }
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
 
 private:
     std::atomic<int> calls_{0};
@@ -141,18 +154,19 @@ private:
 
 class AudioDeliveringModel final : public MaiModelClient {
 public:
-    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
-                    const std::atomic<bool>&) override {
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
         if (calls_++ == 0) {
-            if (sink.onToolCall) sink.onToolCall(MaiToolInvocation{
-                "audio-call", "agent_send_media",
-                R"({"file_path":"sample.wav","type":"audio"})"});
+            if (sink.onToolCall)
+                sink.onToolCall(MaiToolInvocation{"audio-call", "agent_send_media",
+                                                  R"({"file_path":"sample.wav","type":"audio"})"});
         } else if (sink.onText) {
             sink.onText("Audio delivered");
         }
         return {};
     }
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
 
 private:
     std::atomic<int> calls_{0};
@@ -163,8 +177,7 @@ public:
     explicit DelayedFirstChunkModel(bool reasoning, int warmupCalls = 0)
         : reasoning_(reasoning), warmupCalls_(warmupCalls) {}
 
-    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
-                    const std::atomic<bool>& cancel) override {
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>& cancel) override {
         if (calls_.fetch_add(1) < warmupCalls_) {
             std::string answer;
             for (int i = 0; i < 500; ++i) answer += "previous answer ";
@@ -179,9 +192,15 @@ public:
         return {};
     }
 
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
-    void release() { gate_.release(); }
-    bool entered() const { return entered_.load(); }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
+    void release() {
+        gate_.release();
+    }
+    bool entered() const {
+        return entered_.load();
+    }
 
 private:
     QSemaphore gate_;
@@ -193,20 +212,20 @@ private:
 
 class ApprovalModel final : public MaiModelClient {
 public:
-    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
-                    const std::atomic<bool>&) override {
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
         if (calls_++ == 0) {
             if (sink.onToolCall)
-                sink.onToolCall(MaiToolInvocation{
-                    "call-send", "maichat_send_text",
-                    R"({"peer_id":"house-multi-ai-code","text":"hello"})"});
+                sink.onToolCall(MaiToolInvocation{"call-send", "maichat_send_text",
+                                                  R"({"peer_id":"house-multi-ai-code","text":"hello"})"});
         } else if (sink.onText) {
             sink.onText("done");
         }
         return {};
     }
 
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
 
 private:
     std::atomic<int> calls_{0};
@@ -215,11 +234,21 @@ private:
 class ApprovalTool final : public MaiTool {
 public:
     explicit ApprovalTool(std::atomic<int>& executed) : executed_(executed) {}
-    std::string name() const override { return "maichat_send_text"; }
-    std::string description() const override { return "Send a test message."; }
-    std::string parametersSchema() const override { return R"({"type":"object"})"; }
-    bool requiresApproval(const std::string&) const override { return true; }
-    bool requiresPerCallApproval(const std::string&) const override { return true; }
+    std::string name() const override {
+        return "maichat_send_text";
+    }
+    std::string description() const override {
+        return "Send a test message.";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object"})";
+    }
+    bool requiresApproval(const std::string&) const override {
+        return true;
+    }
+    bool requiresPerCallApproval(const std::string&) const override {
+        return true;
+    }
     MaiToolResult execute(const std::string&, const MaiToolContext&) override {
         ++executed_;
         return MaiToolResult::success("queued");
@@ -231,19 +260,19 @@ private:
 
 class QuestionModel final : public MaiModelClient {
 public:
-    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
-                    const std::atomic<bool>&) override {
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
         if (calls_++ == 0) {
             if (sink.onToolCall)
-                sink.onToolCall(MaiToolInvocation{
-                    "call-question", "question", R"({"question":"Choose A or B"})"});
+                sink.onToolCall(MaiToolInvocation{"call-question", "question", R"({"question":"Choose A or B"})"});
         } else if (sink.onText) {
             sink.onText("answered");
         }
         return {};
     }
 
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
 
 private:
     std::atomic<int> calls_{0};
@@ -253,16 +282,16 @@ class PartialReasoningModel final : public MaiModelClient {
 public:
     std::atomic<bool> release{false};
 
-    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
-                    const std::atomic<bool>& cancel) override {
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>& cancel) override {
         if (sink.onReasoning) sink.onReasoning("partial reasoning");
-        while (!release.load() && !cancel.load())
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        while (!release.load() && !cancel.load()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         if (sink.onReasoning && !cancel.load()) sink.onReasoning(" completed");
         return {};
     }
 
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
 };
 
 // 只生成固定的可见发言；门控工具阻塞期间，Qt 事件循环继续渲染真实面板。
@@ -275,31 +304,32 @@ struct IntermediateProgressState {
 class IntermediateProgressModel final : public MaiModelClient {
 public:
     explicit IntermediateProgressModel(bool consecutiveTools = false) : consecutiveTools_(consecutiveTools) {}
-    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
-                    const std::atomic<bool>&) override {
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
         const int step = calls_++;
         const bool finished = step >= (consecutiveTools_ ? 1 : 2);
-        const std::string text = step == 0 ? "Progress A: inspect local inputs."
-                               : !finished ? "Progress B: validate observed results."
-                                           : "Final C: both local checks completed.";
+        const std::string text = step == 0   ? "Progress A: inspect local inputs."
+                                 : !finished ? "Progress B: validate observed results."
+                                             : "Final C: both local checks completed.";
         MaiModelTextItem item;
         item.id = "fixture-message-" + std::to_string(step);
         item.index = 0;
         item.phase = finished ? MaiModelTextPhase::FinalAnswer : MaiModelTextPhase::Commentary;
         if (sink.onTextItemStarted) sink.onTextItemStarted(item);
-        if (sink.onTextItemDelta) sink.onTextItemDelta(item, text);
-        else if (sink.onText) sink.onText(text);
+        if (sink.onTextItemDelta)
+            sink.onTextItemDelta(item, text);
+        else if (sink.onText)
+            sink.onText(text);
         if (sink.onTextItemCompleted) sink.onTextItemCompleted(item);
         if (!finished && sink.onToolCall) {
-            sink.onToolCall(MaiToolInvocation{step == 0 ? "X" : "Y",
-                                               step == 0 ? "progress_probe_x" : "progress_probe_y",
-                                               "{}"});
-            if (consecutiveTools_)
-                sink.onToolCall(MaiToolInvocation{"Y", "progress_probe_y", "{}"});
+            sink.onToolCall(
+                MaiToolInvocation{step == 0 ? "X" : "Y", step == 0 ? "progress_probe_x" : "progress_probe_y", "{}"});
+            if (consecutiveTools_) sink.onToolCall(MaiToolInvocation{"Y", "progress_probe_y", "{}"});
         }
         return {};
     }
-    MaiWireApi wireApi() const override { return MaiWireApi::Responses; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::Responses;
+    }
 
 private:
     int calls_ = 0;
@@ -313,8 +343,12 @@ public:
     std::string name() const override {
         return stage_ == 1 ? "progress_probe_x" : "progress_probe_y";
     }
-    std::string description() const override { return "Read-only deterministic UI check."; }
-    std::string parametersSchema() const override { return R"({"type":"object"})"; }
+    std::string description() const override {
+        return "Read-only deterministic UI check.";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object"})";
+    }
     MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
         state_->entered.store(stage_);
         while (state_->released.load() < stage_ && !context.cancel->load())
@@ -327,6 +361,54 @@ private:
     int stage_;
 };
 
+struct StoppingComposerState {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> canceled{false};
+    std::atomic<bool> release{false};
+};
+
+class StoppingComposerModel final : public MaiModelClient {
+public:
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
+        if (calls_++ == 0 && sink.onToolCall)
+            sink.onToolCall(MaiToolInvocation{"composer-hold", "composer_hold", "{}"});
+        else if (sink.onText)
+            sink.onText("Completed fixture work.");
+        return {};
+    }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
+
+private:
+    int calls_ = 0;
+};
+
+class StoppingComposerTool final : public MaiTool {
+public:
+    explicit StoppingComposerTool(std::shared_ptr<StoppingComposerState> state) : state_(std::move(state)) {}
+    std::string name() const override {
+        return "composer_hold";
+    }
+    std::string description() const override {
+        return "Hold a local composer fixture.";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object"})";
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
+        state_->entered = true;
+        while (!state_->release.load()) {
+            if (context.cancel->load()) state_->canceled = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return MaiToolResult::success("Fixture released.");
+    }
+
+private:
+    std::shared_ptr<StoppingComposerState> state_;
+};
+
 QString selectedDocumentText(MarkdownView& view) {
     view.selectAll();
     const QString result = view.selectedText();
@@ -335,8 +417,7 @@ QString selectedDocumentText(MarkdownView& view) {
 }
 
 QWidget* progressToolGroup(AgentChatPanel& panel, const QString& tool) {
-    for (QPushButton* disclosure : panel.findChildren<QPushButton*>(
-             QStringLiteral("agentToolGroupDisclosure"))) {
+    for (QPushButton* disclosure : panel.findChildren<QPushButton*>(QStringLiteral("agentToolGroupDisclosure"))) {
         QWidget* group = disclosure->parentWidget();
         for (QLabel* label : group->findChildren<QLabel*>())
             if (label->text().contains(tool)) return group;
@@ -381,6 +462,11 @@ private slots:
     void thinkingContentNeverRendersLiveOrAfterRestore();
     void intermediateProgressStaysVisibleAcrossToolsAndHistoryRestore();
     void consecutiveToolsShareDisclosureWithoutChangingReceipts();
+    void busyComposerAcceptsOrderedSteeringWithoutStopping();
+    void historyOpensLatestPageAndPrependsWithoutMovingReadingAnchor();
+    void collapsedToolDetailsAreFormattedOnlyOnDisclosure();
+    void stopKeepsUnacceptedDraftAndInputEditable();
+    void quoteActionFollowsStreamedOwnerAfterSessionRestore();
     void waitingIndicatorAppearsBeforeFirstModelChunk();
     void waitingIndicatorClearsWhenModelHasNoReasoning();
     void unconfiguredModelOpensConfigurationInsteadOfFailingTurn();
@@ -524,9 +610,8 @@ void AgentPanelSessionTest::remotePromptAppearsInOpenOwnerSession() {
 
     // Same entry point used when an iPhone sends into a Mac-owned Session.
     DesktopSessionSyncHost host(controller);
-    const QJsonObject result = host.applyCommand(sessionId,
-        {{QStringLiteral("action"), QStringLiteral("prompt")},
-         {QStringLiteral("text"), QStringLiteral("你好")}});
+    const QJsonObject result = host.applyCommand(sessionId, {{QStringLiteral("action"), QStringLiteral("prompt")},
+                                                             {QStringLiteral("text"), QStringLiteral("你好")}});
     QVERIFY(result.value(QStringLiteral("ok")).toBool());
     const QString userId = result.value(QStringLiteral("user_message_id")).toString();
     QVERIFY(!userId.isEmpty());
@@ -557,7 +642,7 @@ void AgentPanelSessionTest::localPromptKeepsOneBubbleAfterUserMessageEvent() {
     const QString userId = QString::fromStdString(messages.back().id);
     QCOMPARE(messages.back().role, MaiRole::User);
     QTRY_VERIFY_WITH_TIMEOUT(view->contains(userId), 3000);
-    QCoreApplication::processEvents(); // Deliver queued MessageUpdated after the local button path.
+    QCoreApplication::processEvents();  // Deliver queued MessageUpdated after the local button path.
     QVERIFY(view->contains(userId + QStringLiteral("-quote-action")));
     QVERIFY(!view->contains(QStringLiteral("local-1")));
     view->selectAll();
@@ -587,33 +672,26 @@ void AgentPanelSessionTest::completedPdfToolShowsPreviewCardAfterRestore() {
     const auto pending = controller.agent().listPendingPermissions();
     QVERIFY(controller.approvePermission(QString::fromStdString(pending.front().id)));
     controller.agent().waitIdle();
-    QTRY_VERIFY_WITH_TIMEOUT(
-        panel.findChild<QPushButton*>(QStringLiteral("agentPdfPreviewButton")) != nullptr,
-        5000);
+    QTRY_VERIFY_WITH_TIMEOUT(panel.findChild<QPushButton*>(QStringLiteral("agentPdfPreviewButton")) != nullptr, 5000);
     auto* toolSummary = panel.findChild<QPushButton*>(QStringLiteral("agentToolGroupDisclosure"));
     QVERIFY(toolSummary != nullptr);
     QVERIFY(toolSummary->text().contains(QStringLiteral("工具调用 1 次")));
     const QString capturePath = qEnvironmentVariable("MAICHAT_AGENT_TOOL_CAPTURE");
     if (!capturePath.isEmpty()) QVERIFY(panel.grab().save(capturePath));
-    for (QWidget* card : panel.findChildren<QWidget*>(QStringLiteral("agentToolCard")))
-        QVERIFY(!card->isVisible());
+    for (QWidget* card : panel.findChildren<QWidget*>(QStringLiteral("agentToolCard"))) QVERIFY(!card->isVisible());
     toolSummary->click();
     QTRY_VERIFY(!panel.findChildren<QWidget*>(QStringLiteral("agentToolCard")).isEmpty());
     QVERIFY(QFile::exists(workspace.filePath(QStringLiteral("preview.pdf"))));
 
     panel.openSession(session);
-    QTRY_VERIFY_WITH_TIMEOUT(
-        panel.findChild<QPushButton*>(QStringLiteral("agentPdfPreviewButton")) != nullptr,
-        5000);
+    QTRY_VERIFY_WITH_TIMEOUT(panel.findChild<QPushButton*>(QStringLiteral("agentPdfPreviewButton")) != nullptr, 5000);
 }
 
 void AgentPanelSessionTest::videoArtifactUsesCompactPlayBadge() {
     QTemporaryDir workspace;
     QVERIFY(workspace.isValid());
-    QVERIFY(QFile::copy(QStringLiteral(MAICHAT_AGENT_VIDEO_FIXTURE),
-                        workspace.filePath(QStringLiteral("sample.mp4"))));
-    QVERIFY(QFile::copy(QStringLiteral(MAICHAT_AGENT_VIDEO_FIXTURE),
-                        workspace.filePath(QStringLiteral("second.mp4"))));
+    QVERIFY(QFile::copy(QStringLiteral(MAICHAT_AGENT_VIDEO_FIXTURE), workspace.filePath(QStringLiteral("sample.mp4"))));
+    QVERIFY(QFile::copy(QStringLiteral(MAICHAT_AGENT_VIDEO_FIXTURE), workspace.filePath(QStringLiteral("second.mp4"))));
     AgentController controller(std::make_unique<MediaDeliveringModel>(), QString());
     AgentChatPanel panel(controller);
     panel.resize(700, 550);
@@ -629,8 +707,7 @@ void AgentPanelSessionTest::videoArtifactUsesCompactPlayBadge() {
     panel.openSession(session);
     QVERIFY(controller.sendPrompt(session, QStringLiteral("Show the video")));
     controller.agent().waitIdle();
-    QTRY_COMPARE_WITH_TIMEOUT(
-        panel.findChildren<QPushButton*>(QStringLiteral("agentMediaVideoPlay")).size(), 2, 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(panel.findChildren<QPushButton*>(QStringLiteral("agentMediaVideoPlay")).size(), 2, 5000);
     auto* play = panel.findChildren<QPushButton*>(QStringLiteral("agentMediaVideoPlay")).first();
     QCOMPARE(play->size(), QSize(48, 48));
     QVERIFY(play->styleSheet().contains(QStringLiteral("border-radius:24px")));
@@ -642,8 +719,8 @@ void AgentPanelSessionTest::videoArtifactUsesCompactPlayBadge() {
              QFileInfo(workspace.filePath(QStringLiteral("sample.mp4"))).canonicalFilePath());
     QVERIFY(videoPlaylist.contains(openedVideo));
     QCOMPARE(videoPlaylist.size(), 2);
-    QTRY_VERIFY_WITH_TIMEOUT(
-        panel.findChild<QPushButton*>(QStringLiteral("agentToolGroupDisclosure")) == nullptr, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(panel.findChild<QPushButton*>(QStringLiteral("agentToolGroupDisclosure")) == nullptr,
+                             5000);
     const QString capturePath = qEnvironmentVariable("MAICHAT_AGENT_VIDEO_CAPTURE");
     if (!capturePath.isEmpty()) QVERIFY(panel.grab().save(capturePath));
 }
@@ -651,8 +728,7 @@ void AgentPanelSessionTest::videoArtifactUsesCompactPlayBadge() {
 void AgentPanelSessionTest::audioArtifactUsesCompactPlaybackCard() {
     QTemporaryDir workspace;
     QVERIFY(workspace.isValid());
-    QVERIFY(QFile::copy(QStringLiteral(MAICHAT_AGENT_AUDIO_FIXTURE),
-                        workspace.filePath(QStringLiteral("sample.wav"))));
+    QVERIFY(QFile::copy(QStringLiteral(MAICHAT_AGENT_AUDIO_FIXTURE), workspace.filePath(QStringLiteral("sample.wav"))));
     AgentController controller(std::make_unique<AudioDeliveringModel>(), QString());
     AgentChatPanel panel(controller);
     panel.resize(700, 500);
@@ -662,8 +738,7 @@ void AgentPanelSessionTest::audioArtifactUsesCompactPlaybackCard() {
     panel.openSession(session);
     QVERIFY(controller.sendPrompt(session, QStringLiteral("Show the audio")));
     controller.agent().waitIdle();
-    QTRY_VERIFY_WITH_TIMEOUT(
-        panel.findChild<QPushButton*>(QStringLiteral("agentMediaAudioPlay")) != nullptr, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(panel.findChild<QPushButton*>(QStringLiteral("agentMediaAudioPlay")) != nullptr, 5000);
     auto* play = panel.findChild<QPushButton*>(QStringLiteral("agentMediaAudioPlay"));
     QCOMPARE(play->size(), QSize(240, 58));
     QCOMPARE(play->accessibleName(), QStringLiteral("播放音频"));
@@ -687,8 +762,7 @@ void AgentPanelSessionTest::quotedMessageIsSentAndShownInTheComposer() {
     send->click();
     controller.agent().waitIdle();
     QTRY_COMPARE(send->toolTip(), QStringLiteral("发送消息"));
-    QTRY_VERIFY_WITH_TIMEOUT(
-        !panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")).isEmpty(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(!panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")).isEmpty(), 3000);
     auto* quote = panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")).first();
     const QString quotedId = quote->property("messageId").toString();
     QVERIFY(!quotedId.isEmpty());
@@ -713,7 +787,9 @@ void AgentPanelSessionTest::quotedMessageIsSentAndShownInTheComposer() {
 void AgentPanelSessionTest::newSessionAvoidsFilesystemRoot() {
     struct RestoreCurrentDirectory {
         QString original = QDir::currentPath();
-        ~RestoreCurrentDirectory() { QDir::setCurrent(original); }
+        ~RestoreCurrentDirectory() {
+            QDir::setCurrent(original);
+        }
     } restore;
     QVERIFY(QDir::setCurrent(QDir::rootPath()));
 
@@ -757,8 +833,7 @@ void AgentPanelSessionTest::newAgentOutputDoesNotInterruptReadingHistory() {
 void AgentPanelSessionTest::switchingSessionsShowsLatestMessage() {
     Harness harness;
     QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
-    QVERIFY(harness.controller->sendPrompt(
-        harness.mine, QStringLiteral("历史消息\n").repeated(250)));
+    QVERIFY(harness.controller->sendPrompt(harness.mine, QStringLiteral("历史消息\n").repeated(250)));
     harness.controller->agent().waitIdle();
     harness.panel->openSession(harness.mine);
     auto* view = harness.view();
@@ -777,25 +852,28 @@ void AgentPanelSessionTest::switchingSessionsShowsLatestMessage() {
 void AgentPanelSessionTest::inlineMediaBubblesRespectMessageBoundary() {
     class ListingModel final : public MaiModelClient {
     public:
-        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
-                        const std::atomic<bool>&) override {
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink, const std::atomic<bool>&) override {
             std::string prompt;
             for (auto it = request.messages.rbegin(); it != request.messages.rend(); ++it)
-                if (it->role == MaiModelRole::User) { prompt = it->content; break; }
-            const char* reply = prompt == "first" ? "clip.mp4 voice.wav"
-                : prompt == "second" ? "third.mp4 fourth.mp4 fifth.mp4"
-                                     : "clip.mp4 voice.wav third.mp4 fourth.mp4 fifth.mp4";
+                if (it->role == MaiModelRole::User) {
+                    prompt = it->content;
+                    break;
+                }
+            const char* reply = prompt == "first"    ? "clip.mp4 voice.wav"
+                                : prompt == "second" ? "third.mp4 fourth.mp4 fifth.mp4"
+                                                     : "clip.mp4 voice.wav third.mp4 fourth.mp4 fifth.mp4";
             if (sink.onText) sink.onText(reply);
             return {};
         }
-        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
     };
 
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
-    for (const QString& name : {QStringLiteral("clip.mp4"), QStringLiteral("voice.wav"),
-                                QStringLiteral("third.mp4"), QStringLiteral("fourth.mp4"),
-                                QStringLiteral("fifth.mp4")}) {
+    for (const QString& name : {QStringLiteral("clip.mp4"), QStringLiteral("voice.wav"), QStringLiteral("third.mp4"),
+                                QStringLiteral("fourth.mp4"), QStringLiteral("fifth.mp4")}) {
         QFile file(directory.filePath(name));
         QVERIFY(file.open(QIODevice::WriteOnly));
         QVERIFY(file.write("test", 4) == 4);
@@ -815,27 +893,22 @@ void AgentPanelSessionTest::inlineMediaBubblesRespectMessageBoundary() {
     panel.openSession(session);
     QVERIFY(controller.sendPrompt(session, QStringLiteral("first")));
     controller.agent().waitIdle();
-    QTRY_COMPARE(panel.findChildren<QPushButton*>(
-        QStringLiteral("agentTextMediaBubble")).size(), 2);
-    for (QPushButton* bubble : panel.findChildren<QPushButton*>(
-             QStringLiteral("agentTextMediaBubble"))) {
-        if (bubble->text().contains(QStringLiteral("clip.mp4")))
-            QTest::mouseClick(bubble, Qt::LeftButton);
+    QTRY_COMPARE(panel.findChildren<QPushButton*>(QStringLiteral("agentTextMediaBubble")).size(), 2);
+    for (QPushButton* bubble : panel.findChildren<QPushButton*>(QStringLiteral("agentTextMediaBubble"))) {
+        if (bubble->text().contains(QStringLiteral("clip.mp4"))) QTest::mouseClick(bubble, Qt::LeftButton);
     }
     QCOMPARE(QDir::fromNativeSeparators(openedVideo),
              QDir::fromNativeSeparators(directory.filePath(QStringLiteral("clip.mp4"))));
     QVERIFY(videoPlaylist.contains(openedVideo));
     QVERIFY(controller.sendPrompt(session, QStringLiteral("second")));
     controller.agent().waitIdle();
-    QTRY_COMPARE(panel.findChildren<QPushButton*>(
-        QStringLiteral("agentTextMediaBubble")).size(), 5);
+    QTRY_COMPARE(panel.findChildren<QPushButton*>(QStringLiteral("agentTextMediaBubble")).size(), 5);
 
     const QString listing = controller.createSession(directory.path());
     panel.openSession(listing);
     QVERIFY(controller.sendPrompt(listing, QStringLiteral("listing")));
     controller.agent().waitIdle();
-    QTRY_VERIFY(panel.findChildren<QPushButton*>(
-        QStringLiteral("agentTextMediaBubble")).isEmpty());
+    QTRY_VERIFY(panel.findChildren<QPushButton*>(QStringLiteral("agentTextMediaBubble")).isEmpty());
 }
 
 void AgentPanelSessionTest::answerFromAnotherSessionDoesNotLeakIn() {
@@ -845,8 +918,7 @@ void AgentPanelSessionTest::answerFromAnotherSessionDoesNotLeakIn() {
     QVERIFY(view != nullptr);
     const int before = view->itemCount();
 
-    harness.publishFromOther(MaiEventType::MessagePartDelta,
-                             QStringLiteral("这是子 Agent 说的话"));
+    harness.publishFromOther(MaiEventType::MessagePartDelta, QStringLiteral("这是子 Agent 说的话"));
 
     // 一条都不该多出来。多出来的话用户会以为 AI 自己说了些没问过的东西。
     QCOMPARE(view->itemCount(), before);
@@ -892,8 +964,7 @@ void AgentPanelSessionTest::actionPanelMatchesMobileModelAndPolicyFlow() {
         QVERIFY(harness.panel->grab().save(capturePath));
         QVERIFY(actions->grab().save(capturePath + QStringLiteral(".popup.png")));
     }
-    auto* option = actions->findChild<QPushButton*>(
-        QStringLiteral("agentEffortOption-max"));
+    auto* option = actions->findChild<QPushButton*>(QStringLiteral("agentEffortOption-max"));
     QVERIFY(option && option->isVisible());
     auto* selectedOption = actions->findChild<QPushButton*>(QStringLiteral("agentEffortOption-high"));
     QVERIFY(selectedOption && selectedOption->isChecked());
@@ -964,8 +1035,8 @@ void AgentPanelSessionTest::anotherSessionTitleDoesNotRenameTheHeader() {
 
 void AgentPanelSessionTest::currentSessionTitleStaysInTheSessionList() {
     Harness harness;
-    const QString titled = harness.controller->createSession(
-        QDir::currentPath(), QStringLiteral("A named conversation"));
+    const QString titled =
+        harness.controller->createSession(QDir::currentPath(), QStringLiteral("A named conversation"));
     QVERIFY(!titled.isEmpty());
     harness.panel->openSession(titled);
     auto* title = harness.panel->findChild<QLabel*>(QStringLiteral("agentHeaderTitle"));
@@ -980,8 +1051,8 @@ void AgentPanelSessionTest::subAgentCardsKeepTaskAndStreamedLatestLineVisible() 
     harness.controller->agent().waitIdle();
     harness.panel->openSession(harness.mine);
     const QString task = QStringLiteral("logic-func-reviewer");
-    const auto spawned = harness.controller->agent().spawnSubAgent(
-        harness.mine.toStdString(), task.toStdString(), "Read-only fixture task");
+    const auto spawned = harness.controller->agent().spawnSubAgent(harness.mine.toStdString(), task.toStdString(),
+                                                                   "Read-only fixture task");
     QVERIFY(spawned);
     harness.controller->agent().waitIdle();
     const auto publish = [&](const QString& delta, const char* partId = "prt_sub_card_layout") {
@@ -1094,8 +1165,7 @@ void AgentPanelSessionTest::newSessionOffersWorkspaceChoice() {
     if (!capturePath.isEmpty()) QVERIFY(actionPanel->grab().save(capturePath));
     MaiSession session;
     QVERIFY(harness.controller->agent().getSession(harness.mine.toStdString(), session));
-    QVERIFY(workspace->toolTip().contains(
-        QDir::toNativeSeparators(QString::fromStdString(session.directory))));
+    QVERIFY(workspace->toolTip().contains(QDir::toNativeSeparators(QString::fromStdString(session.directory))));
     QVERIFY(!workspace->text().startsWith(QStringLiteral("工作目录 ·")));
     QCOMPARE(openWorkspace->accessibleName(), QStringLiteral("打开当前工作目录"));
     QVERIFY(openWorkspace->width() < workspace->width());
@@ -1195,8 +1265,8 @@ void AgentPanelSessionTest::sessionToolEventsRefreshListAndRecoverDeletedSelecti
     panel.openSession(current);
     QSignalSpy changed(&panel, &AgentChatPanel::sessionListChanged);
 
-    const auto created = controller.agent().submit(
-        MaiCreateSession{directory.path().toStdString(), "Another topic", ""});
+    const auto created =
+        controller.agent().submit(MaiCreateSession{directory.path().toStdString(), "Another topic", ""});
     QVERIFY(created);
     QTRY_VERIFY(changed.count() >= 1);
     QCOMPARE(panel.sessionId(), current);
@@ -1228,8 +1298,7 @@ void AgentPanelSessionTest::localSessionMenuOffersDelete() {
     QVERIFY(rows != nullptr);
     QListWidgetItem* sessionRow = nullptr;
     for (int index = 0; index < rows->count(); ++index) {
-        if (rows->item(index)->data(Qt::UserRole).toString() == anotherId)
-            sessionRow = rows->item(index);
+        if (rows->item(index)->data(Qt::UserRole).toString() == anotherId) sessionRow = rows->item(index);
     }
     QVERIFY(sessionRow != nullptr);
     if (qEnvironmentVariableIsSet("MAICHAT_SESSION_LIST_SCREENSHOT"))
@@ -1255,11 +1324,9 @@ void AgentPanelSessionTest::localSessionMenuOffersDelete() {
 // 待审批操作切换会话后仍需绑定原会话；返回时显示原请求而非重新发起操作。
 void AgentPanelSessionTest::pendingApprovalIsRestoredAfterSessionSwitch() {
     std::atomic<int> executed{0};
-    AgentController controller(
-        std::make_unique<ApprovalModel>(), QString(),
-        [&executed](MaiToolRegistry& tools) {
-            tools.add(std::make_unique<ApprovalTool>(executed));
-        });
+    AgentController controller(std::make_unique<ApprovalModel>(), QString(), [&executed](MaiToolRegistry& tools) {
+        tools.add(std::make_unique<ApprovalTool>(executed));
+    });
     AgentChatPanel panel(controller);
     panel.resize(800, 550);
     panel.show();
@@ -1273,7 +1340,11 @@ void AgentPanelSessionTest::pendingApprovalIsRestoredAfterSessionSwitch() {
     editor->setPlainText(QStringLiteral("send the report"));
     send->click();
     QTRY_COMPARE(controller.agent().listPendingPermissions().size(), std::size_t(1));
-    QCOMPARE(send->toolTip(), QStringLiteral("停止任务"));
+    // 审批等待期间继续受理输入；取消任务由独立 Stop 控件负责。
+    QCOMPARE(send->toolTip(), QStringLiteral("发送消息"));
+    QVERIFY(send->isEnabled());
+    auto* stop = panel.findChild<QPushButton*>(QStringLiteral("agentStopButton"));
+    QVERIFY(stop != nullptr && stop->isVisible() && stop->isEnabled());
 
     auto approvalIsVisible = [&panel] {
         for (QLabel* label : panel.findChildren<QLabel*>()) {
@@ -1285,6 +1356,8 @@ void AgentPanelSessionTest::pendingApprovalIsRestoredAfterSessionSwitch() {
 
     panel.openSession(controller.createSession(QDir::currentPath()));
     QCOMPARE(send->toolTip(), QStringLiteral("发送消息"));
+    QVERIFY(send->isEnabled());
+    QVERIFY(stop->isHidden());
     auto unrelatedApprovalIsVisible = [&panel] {
         for (QWidget* card : panel.findChildren<QWidget*>(QStringLiteral("agentToolCard"))) {
             if (card->isVisible()) return true;
@@ -1293,7 +1366,9 @@ void AgentPanelSessionTest::pendingApprovalIsRestoredAfterSessionSwitch() {
     };
     QTRY_VERIFY(!unrelatedApprovalIsVisible());
     panel.openSession(session);
-    QCOMPARE(send->toolTip(), QStringLiteral("停止任务"));
+    QCOMPARE(send->toolTip(), QStringLiteral("发送消息"));
+    QVERIFY(send->isEnabled());
+    QVERIFY(stop->isVisible() && stop->isEnabled());
     QTRY_VERIFY2(approvalIsVisible(), "A pending send must not become an unapprovable queue item");
     QPushButton* allow = nullptr;
     for (QPushButton* button : panel.findChildren<QPushButton*>()) {
@@ -1486,13 +1561,14 @@ void AgentPanelSessionTest::thinkingContentNeverRendersLiveOrAfterRestore() {
             (void)request;
             (void)cancel;
             if (sink.onReasoning) {
-                for (int i = 0; i < 20; ++i)
-                    sink.onReasoning("想一想，这段思考内容不应进入界面布局。");
+                for (int i = 0; i < 20; ++i) sink.onReasoning("想一想，这段思考内容不应进入界面布局。");
             }
             if (sink.onText) sink.onText("回答完了。");
             return {};
         }
-        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
     };
 
     AgentController controller(std::make_unique<ReasoningModel>(), QString());
@@ -1549,8 +1625,7 @@ void AgentPanelSessionTest::intermediateProgressStaysVisibleAcrossToolsAndHistor
         return result;
     };
     const auto allExpectedParts = [&] {
-        return QStringList{expectedText[0], QStringLiteral("X"), expectedText[1],
-                           QStringLiteral("Y"), expectedText[2]};
+        return QStringList{expectedText[0], QStringLiteral("X"), expectedText[1], QStringLiteral("Y"), expectedText[2]};
     };
     {
         auto state = std::make_shared<IntermediateProgressState>();
@@ -1563,7 +1638,9 @@ void AgentPanelSessionTest::intermediateProgressStaysVisibleAcrossToolsAndHistor
         // 断言中途返回时也释放门控，防止测试清理被未完成的工具阻塞。
         struct ReleaseOnExit {
             std::shared_ptr<IntermediateProgressState> state;
-            ~ReleaseOnExit() { state->released.store(2); }
+            ~ReleaseOnExit() {
+                state->released.store(2);
+            }
         } releaseOnExit{state};
         AgentChatPanel panel(controller);
         panel.resize(1000, 800);
@@ -1593,8 +1670,8 @@ void AgentPanelSessionTest::intermediateProgressStaysVisibleAcrossToolsAndHistor
         QWidget* secondGroup = nullptr;
         QTRY_VERIFY_WITH_TIMEOUT((firstGroup = progressToolGroup(panel, QStringLiteral("progress_probe_x"))) != nullptr,
                                  5000);
-        QTRY_VERIFY_WITH_TIMEOUT((secondGroup = progressToolGroup(panel, QStringLiteral("progress_probe_y"))) != nullptr,
-                                 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            (secondGroup = progressToolGroup(panel, QStringLiteral("progress_probe_y"))) != nullptr, 5000);
         // 工具 Y 不能折叠进 X 的旧组，跨过已显示的中间正文 B。
         QVERIFY2(firstGroup != secondGroup, "Tool groups must not cross intermediate assistant text.");
         for (QWidget* group : {firstGroup, secondGroup}) {
@@ -1608,8 +1685,8 @@ void AgentPanelSessionTest::intermediateProgressStaysVisibleAcrossToolsAndHistor
                     if (std::holds_alternative<MaiTextPart>(part.body))
                         textPartIds.append(QString::fromStdString(part.id));
         QCOMPARE(textPartIds.size(), 2);
-        QTRY_VERIFY_WITH_TIMEOUT(view->itemRect(textPartIds[0]).height() > 0 &&
-                                     view->itemRect(textPartIds[1]).height() > 0, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            view->itemRect(textPartIds[0]).height() > 0 && view->itemRect(textPartIds[1]).height() > 0, 5000);
         const auto groupTop = [view](QWidget* group) {
             return group->mapTo(view->viewport(), QPoint()).y() + view->verticalScrollBar()->value();
         };
@@ -1622,7 +1699,8 @@ void AgentPanelSessionTest::intermediateProgressStaysVisibleAcrossToolsAndHistor
         panel.openSession(other);
         panel.openSession(session);
         QTRY_VERIFY_WITH_TIMEOUT(selectedDocumentText(*view).contains(expectedText[0]) &&
-                                     selectedDocumentText(*view).contains(expectedText[1]), 5000);
+                                     selectedDocumentText(*view).contains(expectedText[1]),
+                                 5000);
         firstGroup = progressToolGroup(panel, QStringLiteral("progress_probe_x"));
         secondGroup = progressToolGroup(panel, QStringLiteral("progress_probe_y"));
         QVERIFY(firstGroup != nullptr && secondGroup != nullptr && firstGroup != secondGroup);
@@ -1690,7 +1768,9 @@ void AgentPanelSessionTest::consecutiveToolsShareDisclosureWithoutChangingReceip
                                });
     struct ReleaseOnExit {
         std::shared_ptr<IntermediateProgressState> state;
-        ~ReleaseOnExit() { state->released.store(2); }
+        ~ReleaseOnExit() {
+            state->released.store(2);
+        }
     } releaseOnExit{state};
     AgentChatPanel panel(controller);
     panel.resize(1000, 800);
@@ -1757,8 +1837,7 @@ void AgentPanelSessionTest::pastedImageUsesTheSharedComposerAndReachesTheModel()
     panel.openSession(sessionId);
     QVERIFY(editor->toPlainText().contains(QChar(0xFFFC)));
 
-    QPushButton* send =
-        panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    QPushButton* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
     QVERIFY(send != nullptr);
     QSignalSpy finished(&controller, &AgentController::turnFinished);
     QTest::mouseClick(send, Qt::LeftButton);
@@ -1798,9 +1877,9 @@ void AgentPanelSessionTest::pastedVideoDraftSurvivesSessionSwitchAndReachesModel
     QVERIFY(attach->menu());
     const auto actions = attach->menu()->actions();
     QVERIFY(std::any_of(actions.cbegin(), actions.cend(),
-        [](const QAction* action) { return action->text() == QStringLiteral("打开摄像头拍照"); }));
+                        [](const QAction* action) { return action->text() == QStringLiteral("打开摄像头拍照"); }));
     QVERIFY(std::any_of(actions.cbegin(), actions.cend(),
-        [](const QAction* action) { return action->text() == QStringLiteral("播放本地音乐"); }));
+                        [](const QAction* action) { return action->text() == QStringLiteral("播放本地音乐"); }));
     auto* mime = new QMimeData;
     mime->setUrls({QUrl::fromLocalFile(videoPath)});
     QApplication::clipboard()->setMimeData(mime);
@@ -1821,9 +1900,7 @@ void AgentPanelSessionTest::pastedVideoDraftSurvivesSessionSwitchAndReachesModel
     QTRY_VERIFY(tray->isVisible());
     QTRY_VERIFY(editor->mapTo(&panel, QPoint(0, editor->height())).y() <= panel.height());
     QString previewed;
-    panel.setOpenVideoCallback([&previewed](const QString& path, const QStringList&) {
-        previewed = path;
-    });
+    panel.setOpenVideoCallback([&previewed](const QString& path, const QStringList&) { previewed = path; });
     auto* preview = tray->findChild<QPushButton*>(QStringLiteral("agentDraftVideoPreview"));
     QVERIFY(preview);
     QTest::mouseClick(preview, Qt::LeftButton);
@@ -1852,8 +1929,7 @@ void AgentPanelSessionTest::pastedVideoDraftSurvivesSessionSwitchAndReachesModel
     QVERIFY(finished.wait(15000));
     const MaiModelRequest request = captured->request();
     QVERIFY(!request.messages.empty());
-    QVERIFY(QString::fromStdString(request.messages.back().content).contains(
-        QStringLiteral("请处理这个视频")));
+    QVERIFY(QString::fromStdString(request.messages.back().content).contains(QStringLiteral("请处理这个视频")));
     const auto messages = controller.agent().listMessages(sessionId.toStdString());
     QString storedPath;
     for (const MaiMessage& message : messages)
@@ -1916,8 +1992,10 @@ void AgentPanelSessionTest::videoImportFinishesInItsOriginalSession() {
     panel.openSession(second);
     QCOMPARE(panel.sessionId(), second);
     QVERIFY(!editor->toPlainText().contains(QChar(0xFFFC)));
-    QTRY_VERIFY_WITH_TIMEOUT(QDir(directory.filePath(QStringLiteral("ComposerMedia")))
-        .entryList(QDir::Dirs | QDir::NoDotAndDotDot).size() == 1, 15000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        QDir(directory.filePath(QStringLiteral("ComposerMedia"))).entryList(QDir::Dirs | QDir::NoDotAndDotDot).size() ==
+            1,
+        15000);
     QTest::qWait(100);
     panel.openSession(first);
     QTRY_VERIFY_WITH_TIMEOUT(editor->toPlainText().contains(QChar(0xFFFC)), 15000);
@@ -1970,10 +2048,8 @@ void AgentPanelSessionTest::composerMatchesImLayoutAndUsesEmbeddedSendAction() {
 
     auto* editor = harness.panel->findChild<ComposerTextEdit*>();
     auto* card = harness.panel->findChild<QWidget*>(QStringLiteral("agentComposerCard"));
-    auto* directory =
-        harness.panel->findChild<QLabel*>(QStringLiteral("agentWorkingDirectory"));
-    auto* policy =
-        harness.panel->findChild<QPushButton*>(QStringLiteral("agentApprovalPolicy"));
+    auto* directory = harness.panel->findChild<QLabel*>(QStringLiteral("agentWorkingDirectory"));
+    auto* policy = harness.panel->findChild<QPushButton*>(QStringLiteral("agentApprovalPolicy"));
     auto* model = harness.panel->findChild<QPushButton*>(QStringLiteral("agentModelChip"));
     auto* more = harness.panel->findChild<QPushButton*>(QStringLiteral("agentMoreActions"));
     auto* send = harness.panel->findChild<QPushButton*>(QStringLiteral("agentSendButton"));
@@ -2009,7 +2085,6 @@ void AgentPanelSessionTest::composerMatchesImLayoutAndUsesEmbeddedSendAction() {
     QCOMPARE(policy->menu()->actions()[0]->text(), QStringLiteral("请求批准"));
     QCOMPARE(policy->menu()->actions()[1]->text(), QStringLiteral("帮我批准"));
     QCOMPARE(policy->menu()->actions()[2]->text(), QStringLiteral("完全访问"));
-
 }
 
 void AgentPanelSessionTest::conversationAndComposerUseResizableSplitter() {
@@ -2017,8 +2092,7 @@ void AgentPanelSessionTest::conversationAndComposerUseResizableSplitter() {
     harness.panel->resize(1200, 800);
     QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
 
-    auto* splitter =
-        harness.panel->findChild<QSplitter*>(QStringLiteral("agentMessageComposerSplitter"));
+    auto* splitter = harness.panel->findChild<QSplitter*>(QStringLiteral("agentMessageComposerSplitter"));
     QVERIFY(splitter != nullptr);
     QCOMPARE(splitter->orientation(), Qt::Vertical);
     QCOMPARE(splitter->count(), 2);
@@ -2037,8 +2111,8 @@ void AgentPanelSessionTest::conversationAndComposerUseResizableSplitter() {
     const QPoint start = handle->rect().center();
     const QPoint finish = start + QPoint(0, -60);
     QTest::mousePress(handle, Qt::LeftButton, Qt::NoModifier, start);
-    QMouseEvent move(QEvent::MouseMove, QPointF(finish), QPointF(handle->mapToGlobal(finish)),
-                     Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QMouseEvent move(QEvent::MouseMove, QPointF(finish), QPointF(handle->mapToGlobal(finish)), Qt::NoButton,
+                     Qt::LeftButton, Qt::NoModifier);
     QApplication::sendEvent(handle, &move);
     QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, finish);
     QVERIFY(splitter->sizes().at(0) != before);
@@ -2049,8 +2123,7 @@ void AgentPanelSessionTest::composerResizeHandleAlignsWithEditorBorder() {
     Harness harness;
     harness.panel->resize(1200, 800);
     QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
-    auto* splitter =
-        harness.panel->findChild<QSplitter*>(QStringLiteral("agentMessageComposerSplitter"));
+    auto* splitter = harness.panel->findChild<QSplitter*>(QStringLiteral("agentMessageComposerSplitter"));
     auto* editor = harness.panel->findChild<ComposerTextEdit*>();
     QVERIFY(splitter != nullptr);
     QVERIFY(editor != nullptr);
@@ -2067,21 +2140,19 @@ void AgentPanelSessionTest::composerPlaceholderFitsAtMinimumHeight() {
     Harness harness;
     harness.panel->resize(1200, 700);
     QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
-    auto* splitter =
-        harness.panel->findChild<QSplitter*>(QStringLiteral("agentMessageComposerSplitter"));
+    auto* splitter = harness.panel->findChild<QSplitter*>(QStringLiteral("agentMessageComposerSplitter"));
     auto* editor = harness.panel->findChild<ComposerTextEdit*>();
     QVERIFY(splitter != nullptr);
     QVERIFY(editor != nullptr);
     splitter->setSizes({10000, 0});
     QApplication::processEvents();
 
-    const qreal requiredHeight = editor->fontMetrics().lineSpacing()
-        + 2 * editor->document()->documentMargin();
+    const qreal requiredHeight = editor->fontMetrics().lineSpacing() + 2 * editor->document()->documentMargin();
     QVERIFY2(editor->viewport()->height() >= requiredHeight,
              qPrintable(QStringLiteral("placeholder viewport %1px, one line needs %2px")
-                            .arg(editor->viewport()->height()).arg(requiredHeight)));
-    QVERIFY2(!editor->verticalScrollBar()->isVisible(),
-             "An empty composer must not expose a scroll bar or its corner");
+                            .arg(editor->viewport()->height())
+                            .arg(requiredHeight)));
+    QVERIFY2(!editor->verticalScrollBar()->isVisible(), "An empty composer must not expose a scroll bar or its corner");
     QVERIFY2(!editor->horizontalScrollBar()->isVisible(),
              "An empty composer must not expose a horizontal scroll bar corner");
 }
@@ -2096,9 +2167,274 @@ void AgentPanelSessionTest::conversationUsesAvailableWidth() {
     view->addItem(QStringLiteral("wide-document"), MarkdownView::Style::Document,
                   QStringLiteral("内容应该使用窗口可用宽度"));
     QTRY_COMPARE(qRound(view->itemRect(QStringLiteral("wide-document")).left()), UiZoom::s(48));
-    QCOMPARE(qRound(view->viewport()->width() -
-                    view->itemRect(QStringLiteral("wide-document")).right()),
+    QCOMPARE(qRound(view->viewport()->width() - view->itemRect(QStringLiteral("wide-document")).right()),
              UiZoom::s(48));
+}
+
+void AgentPanelSessionTest::historyOpensLatestPageAndPrependsWithoutMovingReadingAnchor() {
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    const QString database = storage.filePath(QStringLiteral("paged-history.db"));
+    const std::string sessionId = "ses_paged_fixture";
+    {
+        auto opened = makeMaiSqliteStore(database.toUtf8().toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        MaiSession session;
+        session.id = sessionId;
+        session.directory = storage.path().toUtf8().toStdString();
+        session.created = session.updated = 1;
+        store->putSession(session);
+        for (int i = 0; i < 121; ++i) {
+            MaiMessage message;
+            message.id = QStringLiteral("msg_page_%1").arg(i, 4, 10, QLatin1Char('0')).toStdString();
+            message.created = i + 1;
+            message.completed = i + 1;
+            message.parts.push_back(
+                {"prt_" + message.id,
+                 MaiTextPart{"Fixture history line " + std::to_string(i) + "\nMore fixture lines\nThird fixture line"},
+                 i + 1});
+            store->putMessage(sessionId, message);
+        }
+        QVERIFY(!store->lastWriteError().hasError());
+    }
+    AgentController controller(std::make_unique<SilentModel>(), database);
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 700);
+    panel.show();
+    panel.openSession(QString::fromStdString(sessionId));
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    QVERIFY(view->contains(QStringLiteral("msg_page_0120")));
+    QVERIFY(!view->contains(QStringLiteral("msg_page_0080")));
+    QCOMPARE(panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")).size(), 40);
+    auto* older = panel.findChild<QPushButton*>(QStringLiteral("agentLoadEarlierButton"));
+    QVERIFY(older && !older->isHidden());
+    QCoreApplication::processEvents();
+    auto* bar = view->verticalScrollBar();
+    const QString anchor = QStringLiteral("msg_page_0090");
+    bar->setValue(qMax(0, int(view->itemRect(anchor).top()) - 50));
+    const qreal viewportOffset = view->itemRect(anchor).top() - bar->value();
+    QPointer<QPushButton> existingFooter;
+    for (QPushButton* quote : panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")))
+        if (quote->property("messageId").toString() == anchor) existingFooter = quote;
+    QVERIFY(existingFooter);
+    older->click();
+    QTRY_VERIFY(view->contains(QStringLiteral("msg_page_0041")));
+    QVERIFY(!view->contains(QStringLiteral("msg_page_0040")));
+    QCOMPARE(panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")).size(), 80);
+    QTRY_VERIFY(qAbs(view->itemRect(anchor).top() - bar->value() - viewportOffset) <= 2.0);
+    QVERIFY(existingFooter);  // Prepending must not recreate existing quote controls.
+    older->click();
+    QTRY_VERIFY(view->contains(QStringLiteral("msg_page_0001")));
+    older->click();
+    QTRY_VERIFY(view->contains(QStringLiteral("msg_page_0000")));
+    QVERIFY(older->isHidden());
+    QCOMPARE(panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")).size(), 121);
+}
+
+void AgentPanelSessionTest::collapsedToolDetailsAreFormattedOnlyOnDisclosure() {
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    const QString database = storage.filePath(QStringLiteral("large-tools.db"));
+    const std::string sessionId = "ses_tool_detail_fixture";
+    {
+        auto opened = makeMaiSqliteStore(database.toUtf8().toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        MaiSession session;
+        session.id = sessionId;
+        session.directory = storage.path().toUtf8().toStdString();
+        session.created = session.updated = 1;
+        store->putSession(session);
+        MaiMessage message;
+        message.id = "msg_many_tools_fixture";
+        message.role = MaiRole::Assistant;
+        message.created = message.completed = 1;
+        for (int i = 0; i < 55; ++i) {
+            MaiToolPart tool;
+            tool.tool = "read";
+            tool.callId = "call_fixture_" + std::to_string(i);
+            tool.input = "{\"path\":\"fixture.txt\"}";
+            tool.output = "<fixture-literal>" + std::string(200000, 'x');
+            tool.state = MaiToolState::Completed;
+            message.parts.push_back({"prt_fixture_" + std::to_string(i), std::move(tool), i + 1});
+        }
+        store->putMessage(sessionId, message);
+        QVERIFY(!store->lastWriteError().hasError());
+    }
+    AgentController controller(std::make_unique<SilentModel>(), database);
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 700);
+    panel.show();
+    panel.openSession(QString::fromStdString(sessionId));
+    const auto labels = panel.findChildren<QLabel*>(QStringLiteral("agentToolDetail"));
+    QCOMPARE(labels.size(), 55);
+    for (QLabel* detail : labels) {
+        QVERIFY(detail->text().isEmpty());
+        QCOMPARE(detail->textFormat(), Qt::PlainText);
+    }
+    auto* disclosure = labels.first()->parentWidget()->findChild<QPushButton*>(QStringLiteral("agentToolDisclosure"));
+    QVERIFY(disclosure);
+    disclosure->click();
+    QVERIFY(labels.first()->text().contains(QStringLiteral("<fixture-literal>")));
+    QVERIFY(labels.first()->text().size() < 12500);
+    for (int i = 1; i < labels.size(); ++i) QVERIFY(labels[i]->text().isEmpty());
+}
+
+void AgentPanelSessionTest::busyComposerAcceptsOrderedSteeringWithoutStopping() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto state = std::make_shared<IntermediateProgressState>();
+    AgentController controller(std::make_unique<IntermediateProgressModel>(),
+                               directory.filePath(QStringLiteral("busy-input.sqlite")),
+                               [state](MaiToolRegistry& tools) {
+                                   tools.add(std::make_unique<IntermediateProgressTool>(state, 1));
+                                   tools.add(std::make_unique<IntermediateProgressTool>(state, 2));
+                               });
+    struct ReleaseOnExit {
+        std::shared_ptr<IntermediateProgressState> state;
+        ~ReleaseOnExit() {
+            state->released = 2;
+        }
+    } releaseOnExit{state};
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 800);
+    panel.show();
+    const QString session = controller.createSession(directory.path(), QStringLiteral("Busy input fixture"));
+    panel.openSession(session);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    QVERIFY(editor);
+    editor->setPlainText(QStringLiteral("Initial fixture request."));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QTRY_COMPARE_WITH_TIMEOUT(state->entered.load(), 1, 5000);
+    const std::string turn = controller.agent().activeTurnId(session.toStdString());
+    QVERIFY(!turn.empty());
+    QVERIFY(editor->isEnabled() && !editor->isReadOnly());
+    for (const QString& text : {QStringLiteral("Supplement B."), QStringLiteral("Supplement C.")}) {
+        editor->setPlainText(text);
+        QTest::keyClick(editor, Qt::Key_Return);
+        QCOMPARE(editor->toPlainText(), QString());
+    }
+    QStringList users;
+    for (const MaiMessage& message : controller.agent().listMessages(session.toStdString()))
+        if (message.role == MaiRole::User) users.append(QString::fromStdString(message.text()));
+    QCOMPARE(users, (QStringList{QStringLiteral("Initial fixture request."), QStringLiteral("Supplement B."),
+                                 QStringLiteral("Supplement C.")}));
+    QCOMPARE(controller.agent().activeTurnId(session.toStdString()), turn);
+    QVERIFY(controller.agent().isBusy(session.toStdString()));
+    QCOMPARE(state->released.load(), 0);
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("busy-ordered-input")));
+    state->released = 2;
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+}
+
+void AgentPanelSessionTest::stopKeepsUnacceptedDraftAndInputEditable() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto state = std::make_shared<StoppingComposerState>();
+    AgentController controller(
+        std::make_unique<StoppingComposerModel>(), directory.filePath(QStringLiteral("stopping-input.sqlite")),
+        [state](MaiToolRegistry& tools) { tools.add(std::make_unique<StoppingComposerTool>(state)); });
+    struct ReleaseOnExit {
+        std::shared_ptr<StoppingComposerState> state;
+        ~ReleaseOnExit() {
+            state->release = true;
+        }
+    } releaseOnExit{state};
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 800);
+    panel.show();
+    const QString session = controller.createSession(directory.path(), QStringLiteral("Stopping input fixture"));
+    panel.openSession(session);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    QVERIFY(editor);
+    editor->setPlainText(QStringLiteral("Initial fixture request."));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QTRY_VERIFY_WITH_TIMEOUT(state->entered.load(), 5000);
+    auto* stop = panel.findChild<QPushButton*>(QStringLiteral("agentStopButton"));
+    QVERIFY2(stop, "Stop must be a separate action; submitting text must never interrupt the task.");
+    editor->setPlainText(QStringLiteral("Keep this unsent draft."));
+    stop->click();
+    QTRY_VERIFY_WITH_TIMEOUT(state->canceled.load(), 2000);
+    QVERIFY(controller.agent().isBusy(session.toStdString()));
+    QTest::keyClick(editor, Qt::Key_Return);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Keep this unsent draft."));
+    QVERIFY(editor->isEnabled() && !editor->isReadOnly());
+    editor->moveCursor(QTextCursor::End);
+    QTest::keyClicks(editor, " More input.");
+    const QString preserved = editor->toPlainText();
+    QVERIFY(preserved.endsWith(QStringLiteral(" More input.")));
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("stop-preserved-draft")));
+    state->release = true;
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+    QTest::qWait(100);
+    QCOMPARE(editor->toPlainText(), preserved);
+    int users = 0;
+    for (const MaiMessage& message : controller.agent().listMessages(session.toStdString()))
+        if (message.role == MaiRole::User) ++users;
+    QCOMPARE(users, 1);
+}
+
+void AgentPanelSessionTest::quoteActionFollowsStreamedOwnerAfterSessionRestore() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto state = std::make_shared<IntermediateProgressState>();
+    AgentController controller(std::make_unique<IntermediateProgressModel>(),
+                               directory.filePath(QStringLiteral("quote-order.sqlite")),
+                               [state](MaiToolRegistry& tools) {
+                                   tools.add(std::make_unique<IntermediateProgressTool>(state, 1));
+                                   tools.add(std::make_unique<IntermediateProgressTool>(state, 2));
+                               });
+    struct ReleaseOnExit {
+        std::shared_ptr<IntermediateProgressState> state;
+        ~ReleaseOnExit() {
+            state->released = 2;
+        }
+    } releaseOnExit{state};
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 800);
+    panel.show();
+    const QString session = controller.createSession(directory.path(), QStringLiteral("Quote order fixture"));
+    panel.openSession(session);
+    QVERIFY(controller.sendPrompt(session, QStringLiteral("Run local fixture checks.")));
+    QTRY_COMPARE_WITH_TIMEOUT(state->entered.load(), 1, 5000);
+    QString assistantId;
+    for (const MaiMessage& message : controller.agent().listMessages(session.toStdString()))
+        if (message.role == MaiRole::Assistant && !message.parts.empty())
+            assistantId = QString::fromStdString(message.id);
+    QVERIFY(!assistantId.isEmpty());
+    const QString other = controller.createSession(directory.path(), QStringLiteral("Other fixture session"));
+    panel.openSession(other);
+    panel.openSession(session);
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    const QString footerId = assistantId + QStringLiteral("-quote-action");
+    QTRY_VERIFY(view->contains(footerId));
+    QPointer<QPushButton> footer;
+    for (auto* button : panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")))
+        if (button->property("messageId").toString() == assistantId) footer = button;
+    QVERIFY(footer);
+    state->released = 1;
+    QTRY_COMPARE_WITH_TIMEOUT(state->entered.load(), 2, 5000);
+    QWidget* group = nullptr;
+    QTRY_VERIFY((group = progressToolGroup(panel, QStringLiteral("progress_probe_y"))) != nullptr);
+    const auto groupBottom = [&] {
+        return group->mapTo(view->viewport(), QPoint()).y() + view->verticalScrollBar()->value() + group->height();
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(view->itemRect(footerId).top() >= groupBottom(), 3000);
+    QVERIFY(footer);
+    state->released = 2;
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+    QString lastTextPart;
+    for (const MaiMessage& message : controller.agent().listMessages(session.toStdString()))
+        if (QString::fromStdString(message.id) == assistantId)
+            for (const MaiMessagePart& part : message.parts)
+                if (std::holds_alternative<MaiTextPart>(part.body)) lastTextPart = QString::fromStdString(part.id);
+    QVERIFY(!lastTextPart.isEmpty());
+    QTRY_VERIFY_WITH_TIMEOUT(view->itemRect(footerId).top() >= view->itemRect(lastTextPart).bottom(), 3000);
+    QVERIFY(footer);
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("quote-after-owner")));
 }
 
 QTEST_MAIN(AgentPanelSessionTest)

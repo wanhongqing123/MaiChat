@@ -49,162 +49,161 @@
 //   agent->createSession(QDir::currentPath()); agent->sendPrompt(sid, "你好");
 //   // 立刻返回，回答从信号里来
 class AgentController final : public QObject {
-  Q_OBJECT
+    Q_OBJECT
 
 public:
-  using ToolRegistrar = std::function<void(MaiToolRegistry &)>;
+    using ToolRegistrar = std::function<void(MaiToolRegistry&)>;
 
-  struct ModelConfig {
-    // 不带末尾斜杠，也不带具体路径。例如：
-    //   https://open.bigmodel.cn/api/coding/paas/v4   GLM 编程套餐
-    //   http://127.0.0.1:11434/v1                     Ollama
-    QString baseUrl;
-    QString apiKey;
-// 即使主模型选 DeepSeek，媒体专用模型仍使用 GLM 凭据。
-    QString glmApiKey;
-    QString deepseekApiKey;
-    QString arkApiKey;
-    QString miniMaxApiKey;
-    // 模型工作线程在每次请求前读取当前账号 Key；由宿主保证线程安全。
-    std::function<QString(const QString&)> accountModelKeyProvider;
-    std::function<QString()> glmApiKeyProvider;
-    std::function<QString()> miniMaxApiKeyProvider;
-    QString glmBaseUrl;
-    QString deepseekBaseUrl;
-    QString wanApiKey;
-    QString wanWorkspaceId;
-    // 短期 Ark/百炼凭据由账号会话提供；工具执行时实时读取，不捕获构造时的旧密钥。
-    std::function<QString()> arkApiKeyProvider;
-    std::function<QPair<QString, QString>()> wanCredentialsProvider;
-    std::function<QPair<QString, QString>()> mediaServiceAccessProvider;
-    QString modelName = QStringLiteral("deepseek-flash");
-    QString reasoningEffort = QStringLiteral("high");
-    std::function<QString()> reasoningEffortProvider;
-    MaiWireApi wire = MaiWireApi::Responses;
-    MaiApprovalPolicy approvalPolicy = MaiApprovalPolicy::OnRequest;
-  };
+    struct ModelConfig {
+        // 不带末尾斜杠，也不带具体路径。例如：
+        //   https://open.bigmodel.cn/api/coding/paas/v4   GLM 编程套餐
+        //   http://127.0.0.1:11434/v1                     Ollama
+        QString baseUrl;
+        QString apiKey;
+        // 即使主模型选 DeepSeek，媒体专用模型仍使用 GLM 凭据。
+        QString glmApiKey;
+        QString deepseekApiKey;
+        QString arkApiKey;
+        QString miniMaxApiKey;
+        // 模型工作线程在每次请求前读取当前账号 Key；由宿主保证线程安全。
+        std::function<QString(const QString&)> accountModelKeyProvider;
+        std::function<QString()> glmApiKeyProvider;
+        std::function<QString()> miniMaxApiKeyProvider;
+        QString glmBaseUrl;
+        QString deepseekBaseUrl;
+        QString wanApiKey;
+        QString wanWorkspaceId;
+        // 短期 Ark/百炼凭据由账号会话提供；工具执行时实时读取，不捕获构造时的旧密钥。
+        std::function<QString()> arkApiKeyProvider;
+        std::function<QPair<QString, QString>()> wanCredentialsProvider;
+        std::function<QPair<QString, QString>()> mediaServiceAccessProvider;
+        QString modelName = QStringLiteral("deepseek-flash");
+        QString reasoningEffort = QStringLiteral("high");
+        std::function<QString()> reasoningEffortProvider;
+        MaiWireApi wire = MaiWireApi::Responses;
+        MaiApprovalPolicy approvalPolicy = MaiApprovalPolicy::OnRequest;
+    };
 
-  // databasePath 为空表示纯内存：进程退出后会话和消息都不留。
-  //
-  // model.baseUrl 为空表示空转——建会话、翻历史照常，发消息会以"没有配置模型"
-  // 收场。 界面还没配好模型时是这个状态。
-  AgentController(const ModelConfig &model, const QString &databasePath,
-                  QObject *parent = nullptr);
-  AgentController(const ModelConfig &model, const QString &databasePath,
-                  ToolRegistrar hostTools, QObject *parent = nullptr);
+    // databasePath 为空表示纯内存：进程退出后会话和消息都不留。
+    //
+    // model.baseUrl 为空表示空转——建会话、翻历史照常，发消息会以"没有配置模型"
+    // 收场。 界面还没配好模型时是这个状态。
+    AgentController(const ModelConfig& model, const QString& databasePath, QObject* parent = nullptr);
+    AgentController(const ModelConfig& model, const QString& databasePath, ToolRegistrar hostTools,
+                    QObject* parent = nullptr);
 
-  // 自己塞一个模型实现进来。给测试用，也给以后接别的供应商留的口子。
-  AgentController(std::unique_ptr<MaiModelClient> model,
-                  const QString &databasePath, QObject *parent = nullptr);
-  AgentController(std::unique_ptr<MaiModelClient> model,
-                  const QString &databasePath, ToolRegistrar hostTools,
-                  QObject *parent = nullptr);
+    // 自己塞一个模型实现进来。给测试用，也给以后接别的供应商留的口子。
+    AgentController(std::unique_ptr<MaiModelClient> model, const QString& databasePath, QObject* parent = nullptr);
+    AgentController(std::unique_ptr<MaiModelClient> model, const QString& databasePath, ToolRegistrar hostTools,
+                    QObject* parent = nullptr);
 
-  ~AgentController() override;
+    ~AgentController() override;
 
-  // 打开数据库失败时非空，此时这个对象仍然可用（退化成纯内存）。
-  QString openError() const;
+    // 打开数据库失败时非空，此时这个对象仍然可用（退化成纯内存）。
+    QString openError() const;
 
-  // 底层核心。
-  // 查询类操作（listMessages / listSessions /
-  // listPendingPermissions）直接用它——**在主线程上查没
-  // 有任何限制**，那条"不许做慢活"的契约只管事件处理函数。
-  MaiAgent &agent();
+    // 底层核心。
+    // 查询类操作（listMessages / listSessions /
+    // listPendingPermissions）直接用它——**在主线程上查没
+    // 有任何限制**，那条"不许做慢活"的契约只管事件处理函数。
+    MaiAgent& agent();
 
-  // ---- 变更 ----都是立刻返回的。失败时返回空串 / false，错误文本从
-  // lastError() 取。
+    // ---- 变更 ----都是立刻返回的。失败时返回空串 / false，错误文本从
+    // lastError() 取。
 
-  QString createSession(const QString &directory,
-                        const QString &title = QString());
-  bool setSessionDirectory(const QString &sessionId, const QString &directory);
-  bool sendPrompt(const QString &sessionId, const QString &text);
-  bool sendPrompt(const QString &sessionId, const QString &text,
-                  const QStringList &imagePaths);
-  bool sendPrompt(const QString &sessionId, const QString &text,
-                  const QStringList &imagePaths, const QString &quotedMessageId);
-  bool sendPrompt(const QString &sessionId, const QString &text,
-                  const QStringList &imagePaths, const QStringList &videoPaths,
-                  const QString &quotedMessageId);
-  bool setModel(const QString &sessionId, const QString &model);
-  bool setDefaultModel(const QString &model);
-  bool interrupt(const QString &sessionId);
-  bool setApprovalPolicy(MaiApprovalPolicy policy);
-  MaiApprovalPolicy approvalPolicy() const;
+    QString createSession(const QString& directory, const QString& title = QString());
+    bool setSessionDirectory(const QString& sessionId, const QString& directory);
+    bool sendPrompt(const QString& sessionId, const QString& text);
+    bool sendPrompt(const QString& sessionId, const QString& text, const QStringList& imagePaths);
+    bool sendPrompt(const QString& sessionId, const QString& text, const QStringList& imagePaths,
+                    const QString& quotedMessageId);
+    bool sendPrompt(const QString& sessionId, const QString& text, const QStringList& imagePaths,
+                    const QStringList& videoPaths, const QString& quotedMessageId);
+    // 补充明确绑定的活动轮次。requestId 在重试中保持不变，由核心去重；
+    // 目标轮已结束/停止时返回 false，绝不自动转成新一轮发送。
+    bool steerPrompt(const QString& sessionId, const QString& turnId, const QString& requestId, const QString& text,
+                     const QStringList& imagePaths = {}, const QStringList& videoPaths = {},
+                     const QString& quotedMessageId = QString());
+    bool setModel(const QString& sessionId, const QString& model);
+    bool setDefaultModel(const QString& model);
+    bool interrupt(const QString& sessionId);
+    // Reject stale owner-turn controls; empty expectedTurn preserves the ordinary API.
+    bool interrupt(const QString& sessionId, const QString& expectedTurn);
+    bool setApprovalPolicy(MaiApprovalPolicy policy);
+    MaiApprovalPolicy approvalPolicy() const;
 
-  // approveForSession = true 表示"这个会话里这个工具以后别再问"。
-  bool approvePermission(const QString &permissionId,
-                         bool approveForSession = false);
-  bool denyPermission(const QString &permissionId);
+    // approveForSession = true 表示"这个会话里这个工具以后别再问"。
+    bool approvePermission(const QString& permissionId, bool approveForSession = false);
+    bool denyPermission(const QString& permissionId);
 
-  // 回答模型中途问的那句话。
-  //
-  // **一定要接。** 不接的话 question 工具会一直等下去：用户看到的是「卡住了」，
-  // 而那一轮其实好好地停在闸门上。宁可不给模型这个工具，也不要给一个没人应答的。
-  bool answerQuestion(const QString &questionId, const QString &answer);
+    // 回答模型中途问的那句话。
+    //
+    // **一定要接。** 不接的话 question 工具会一直等下去：用户看到的是「卡住了」，
+    // 而那一轮其实好好地停在闸门上。宁可不给模型这个工具，也不要给一个没人应答的。
+    bool answerQuestion(const QString& questionId, const QString& answer);
 
-  // 还在等回答的提问。界面重开后靠它把输入框摆回去。
-  std::vector<MaiQuestionRequest> pendingQuestions() const;
+    // 还在等回答的提问。界面重开后靠它把输入框摆回去。
+    std::vector<MaiQuestionRequest> pendingQuestions() const;
 
-  // 这个会话起过哪些子 Agent，含已经收掉的。界面靠它把子任务摆出来。
-  std::vector<MaiSubAgentInfo> subAgents(const QString &parentSessionId) const;
+    // 这个会话起过哪些子 Agent，含已经收掉的。界面靠它把子任务摆出来。
+    std::vector<MaiSubAgentInfo> subAgents(const QString& parentSessionId) const;
 
-  // 这个会话是不是那个会话的孩子。事件是按会话来的，面板拿它分辨
-  // 「这条是子任务在动」还是「这条不关我事」。
-  bool isChildOf(const QString &sessionId,
-                 const QString &parentSessionId) const;
+    // 这个会话是不是那个会话的孩子。事件是按会话来的，面板拿它分辨
+    // 「这条是子任务在动」还是「这条不关我事」。
+    bool isChildOf(const QString& sessionId, const QString& parentSessionId) const;
 
-// 存储层按批次为活动流做检查点。切换视图时保留已收到的增量，
-// 使尚未落盘的最新文字仍显示在所属会话中。
-  QString livePartText(const QString &sessionId, const QString &partId) const;
+    // 存储层按批次为活动流做检查点。切换视图时保留已收到的增量，
+    // 使尚未落盘的最新文字仍显示在所属会话中。
+    QString livePartText(const QString& sessionId, const QString& partId) const;
 
-  QString lastError() const;
+    QString lastError() const;
 
 signals:
-  // 本地或远端入口落库了一条用户消息。界面按消息 ID 呈现，同一条只画一次。
-  void userMessageAdded(const QString &sessionId, const QString &messageId);
+    // 本地或远端入口落库了一条用户消息。界面按消息 ID 呈现，同一条只画一次。
+    void userMessageAdded(const QString& sessionId, const QString& messageId);
 
-  // 模型说给用户听的话，一次一小段。**不带全量**，界面自己往后追加。
-  void textDelta(const QString &sessionId, const QString &messageId,
-                 const QString &partId, const QString &delta);
+    // 模型说给用户听的话，一次一小段。**不带全量**，界面自己往后追加。
+    void textDelta(const QString& sessionId, const QString& messageId, const QString& partId, const QString& delta);
 
-  // 模型的思考过程。界面通常折叠显示，或者干脆不显示——但**至少要让用户知道它在想**：
-  // 真实的推理模型思考期能有十几秒，这段时间里一个正文字符都不会来，屏幕上没反应和卡死分不开。
-  void reasoningDelta(const QString &sessionId, const QString &messageId,
-                      const QString &partId, const QString &delta);
+    // 模型的思考过程。界面通常折叠显示，或者干脆不显示——但**至少要让用户知道它在想**：
+    // 真实的推理模型思考期能有十几秒，这段时间里一个正文字符都不会来，屏幕上没反应和卡死分不开。
+    void reasoningDelta(const QString& sessionId, const QString& messageId, const QString& partId,
+                        const QString& delta);
 
-  // 某个工具片段的状态变了（建卡 / 放行 / 跑完）。事件只带 id，工具名、参数、
-  // 输出要拿 partId 去 agent().listMessages() 里取——主线程查，随便查。
-  void toolPartChanged(const QString &sessionId, const QString &messageId,
-                       const QString &partId);
+    // 某个工具片段的状态变了（建卡 / 放行 / 跑完）。事件只带 id，工具名、参数、
+    // 输出要拿 partId 去 agent().listMessages() 里取——主线程查，随便查。
+    void toolPartChanged(const QString& sessionId, const QString& messageId, const QString& partId);
 
-  // 有一次工具调用在等用户点头。详情同样去查：agent().listPendingPermissions()。
-  void permissionAsked(const QString &permissionId, const QString &sessionId);
+    // 有一次工具调用在等用户点头。详情同样去查：agent().listPendingPermissions()。
+    void permissionAsked(const QString& permissionId, const QString& sessionId);
 
-  // partId 指向那次 question 工具调用，界面据此知道把输入框摆在哪条下面。
-  void questionAsked(const QString &questionId, const QString &sessionId,
-                     const QString &partId);
-  void questionAnswered(const QString &questionId, const QString &sessionId);
-  // 裁决落地了。**包括不是本界面发起的那次**——多端同时开着时这是唯一的同步手段。
-  void permissionReplied(const QString &permissionId, const QString &decision);
+    // partId 指向那次 question 工具调用，界面据此知道把输入框摆在哪条下面。
+    void questionAsked(const QString& questionId, const QString& sessionId, const QString& partId);
+    void questionAnswered(const QString& questionId, const QString& sessionId);
+    // 裁决落地了。**包括不是本界面发起的那次**——多端同时开着时这是唯一的同步手段。
+    void permissionReplied(const QString& permissionId, const QString& decision);
 
-  // 这一轮结束了。界面据此收起"正在输入"，并把输入框解锁。
-  void turnFinished(const QString &sessionId);
-  // 这一轮出错了。**用户主动中断不会走这里**——那不是故障。
-  void turnFailed(const QString &sessionId, const QString &message);
-  // 会话标题变了（第一轮结束后会用用户那句话自动填上）。
-  void sessionTitleChanged(const QString &sessionId, const QString &title);
-  void sessionStructureChanged();
+    // 这一轮结束了。界面据此收起"正在输入"，并把输入框解锁。
+    void turnFinished(const QString& sessionId);
+    // 这一轮出错了。**用户主动中断不会走这里**——那不是故障。
+    void turnFailed(const QString& sessionId, const QString& message);
+    // 会话标题变了（第一轮结束后会用用户那句话自动填上）。
+    void sessionTitleChanged(const QString& sessionId, const QString& title);
+    void sessionStructureChanged();
 
 private:
-  // 事件从核心的线程过来，经这个信号排队到主线程。私有：界面不该直接连它，
-  // 它带的是未经分类的原始事件。
-  void rawEvent(const MaiEvent &event);
-  void startScheduledTasks();
-  Q_SIGNAL void eventQueued(const MaiEvent &event);
-  Q_SLOT void onEventQueued(const MaiEvent &event);
+    bool submitPrompt(const QString& sessionId, const QString& text, const QStringList& imagePaths,
+                      const QStringList& videoPaths, const QString& quotedMessageId, const QString& turnId,
+                      const QString& requestId);
+    // 事件从核心的线程过来，经这个信号排队到主线程。私有：界面不该直接连它，
+    // 它带的是未经分类的原始事件。
+    void rawEvent(const MaiEvent& event);
+    void startScheduledTasks();
+    Q_SIGNAL void eventQueued(const MaiEvent& event);
+    Q_SLOT void onEventQueued(const MaiEvent& event);
 
-  struct Runtime;
-  std::unique_ptr<Runtime> runtime_;
+    struct Runtime;
+    std::unique_ptr<Runtime> runtime_;
 };
 
 // 跨线程排队投递必须知道怎么拷贝这个类型。少了这一行，

@@ -312,6 +312,19 @@ public:
         return it->second;
     }
 
+    bool getMessage(const std::string& sessionId, const std::string& messageId,
+                    MaiMessage& out) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto session = mMessages.find(sessionId);
+        if (session == mMessages.end()) return false;
+        const auto message =
+            std::find_if(session->second.begin(), session->second.end(),
+                         [&](const MaiMessage& value) { return value.id == messageId; });
+        if (message == session->second.end()) return false;
+        out = *message;
+        return true;
+    }
+
     std::vector<MaiMessage> listMessagesPage(const std::string& sessionId,
                                              const std::string& beforeId,
                                              std::size_t limit) const override {

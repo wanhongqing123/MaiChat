@@ -2,7 +2,7 @@
 # 平台 SDK 和可选媒体能力由配置阶段检查；真实编译命令可导出给 clangd。
 cmake_minimum_required(VERSION 3.21)
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 2.2.47 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 2.2.48 LANGUAGES C CXX)
 if(MSVC AND CMAKE_CL_SHOWINCLUDES_PREFIX MATCHES "^娉")
   # Some CMake/VS2019 locale combinations double-decode /showIncludes. Ninja then
   # records no header dependencies, so changing a public header leaves stale objects.
@@ -1583,6 +1583,12 @@ target_link_libraries(agent_page_visual_probe PRIVATE remote_im_desktop_ui remot
 add_executable(im_markdown_visual_probe tests/ImMarkdownVisualProbe.cpp)
 target_link_libraries(im_markdown_visual_probe PRIVATE remote_im_desktop_ui remote_im_desktop_app
   remote_im_core maichat_markdown Qt5::Widgets Qt5::Test)
+
+# Visual probes load the product code face even though they bypass product main.
+foreach(probe agent_page_visual_probe im_markdown_visual_probe)
+  target_compile_definitions(${probe} PRIVATE
+    MAICHAT_CODE_FONT_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../Resources/fonts/SarasaFixedSC-Regular.ttf")
+endforeach()
 
 add_executable(im_stress_probe tests/ImStressProbe.cpp)
 target_link_libraries(im_stress_probe PRIVATE remote_im_desktop_ui remote_im_desktop_app

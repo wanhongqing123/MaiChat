@@ -4916,7 +4916,7 @@ enum ChatTypography {
     static let emphasizedBody = Font.system(size: bodyPointSize, weight: .semibold)
     static let heading = Font.system(size: 18, weight: .semibold)
     static let detail = Font.system(size: 14)
-    static let detailMonospaced = Font.system(size: 14, design: .monospaced)
+    static let detailMonospaced = MarkdownCodeTypography.font(size: 14)
     static let metadata = Font.system(size: 12)
     static let conversationTitle = Font.system(size: 16, weight: .semibold)
     static let conversationPreview = Font.system(size: 14)
@@ -5268,7 +5268,7 @@ private struct MarkdownCodeBlock: View {
             ScrollView(.horizontal, showsIndicators: true) {
                 Text(code.isEmpty ? " " : code)
                     .font(assistantTypography ? AssistantMessageFont.detailMonospaced
-                                              : .system(size: 12, weight: .regular, design: .monospaced))
+                                              : MarkdownCodeTypography.font(size: 12))
                     .lineSpacing(4)
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .fixedSize(horizontal: true, vertical: true)

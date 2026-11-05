@@ -16,6 +16,8 @@
 #include <QUuid>
 #include <QVariant>
 
+#include <limits>
+
 namespace {
 
 // 联系人读取统一走这一句：LEFT JOIN 让「指向已不存在的分组」在读取时自动降级成
@@ -215,8 +217,11 @@ void LocalMessageDatabase::migrate() {
                        .arg(column.first, column.second));
     }
 
-    query.exec(QStringLiteral(
-        "CREATE INDEX IF NOT EXISTS idx_messages_peer_time ON messages(peer, created_at)"));
+    // The page index covers timestamp ties. Keep the old index if migration fails.
+    if (query.exec(QStringLiteral(
+            "CREATE INDEX IF NOT EXISTS idx_messages_peer_page ON messages(peer, created_at, id)"))) {
+        query.exec(QStringLiteral("DROP INDEX IF EXISTS idx_messages_peer_time"));
+    }
     query.exec(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS im_groups ("
         "group_id TEXT PRIMARY KEY, name TEXT NOT NULL, member_count INTEGER NOT NULL,"
@@ -269,26 +274,34 @@ QHash<QString, bool> LocalMessageDatabase::loadRecentInto(ChatState& state, int 
         });
     }
 
-    // 每会话总量：> perPeerLimit 即还有更早消息可翻。
-    QSqlQuery countQuery(db_);
-    countQuery.exec(QStringLiteral("SELECT peer, COUNT(*) FROM messages GROUP BY peer"));
-    while (countQuery.next()) {
-        hasEarlier.insert(countQuery.value(0).toString(), countQuery.value(1).toInt() > perPeerLimit);
-    }
-
-    // 窗口函数按会话取最近 N 条（Qt 内置 SQLite ≥3.25 支持）。
-    QSqlQuery messageQuery(db_);
-    messageQuery.prepare(QStringLiteral(
-        "SELECT * FROM ("
-        "  SELECT m.*, ROW_NUMBER() OVER (PARTITION BY peer ORDER BY created_at DESC, id DESC) AS rn"
-        "  FROM messages m"
-        ") WHERE rn <= ? ORDER BY created_at, id"));
-    messageQuery.addBindValue(perPeerLimit);
-    messageQuery.exec();
-    while (messageQuery.next()) {
-        state.appendMessageForRestore(messageFromQuery(messageQuery));
+    // Enumerate only peer keys from the covering index. Reading full rows through a
+    // window function would parse every historical payload before applying LIMIT.
+    QSqlQuery peerQuery(db_);
+    peerQuery.exec(QStringLiteral("SELECT DISTINCT peer FROM messages"));
+    while (peerQuery.next()) {
+        const QString peer = peerQuery.value(0).toString();
+        const int readLimit = perPeerLimit < std::numeric_limits<int>::max() ? perPeerLimit + 1 : perPeerLimit;
+        QList<RemoteIMMessage> recent = loadRecentMessages(peer, readLimit);
+        const bool hasMore = recent.size() > perPeerLimit;
+        if (hasMore) recent.removeFirst();
+        hasEarlier.insert(peer, hasMore);
+        state.appendDatabaseHistoryPage(recent);
     }
     return hasEarlier;
+}
+
+QList<RemoteIMMessage> LocalMessageDatabase::loadRecentMessages(const QString& peer, int limit) const {
+    RemoteDiagnostics::PerformanceSpan performance("history-load");
+    QList<RemoteIMMessage> result;
+    if (!db_.isOpen() || peer.isEmpty() || limit <= 0) return result;
+    QSqlQuery query(db_);
+    query.prepare(QStringLiteral(
+        "SELECT * FROM messages WHERE peer = ? ORDER BY created_at DESC, id DESC LIMIT ?"));
+    query.addBindValue(peer);
+    query.addBindValue(limit);
+    query.exec();
+    while (query.next()) result.prepend(messageFromQuery(query));
+    return result;
 }
 
 QList<RemoteIMMessage> LocalMessageDatabase::loadMessagesBefore(const QString& peer,

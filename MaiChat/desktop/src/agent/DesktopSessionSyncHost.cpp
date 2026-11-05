@@ -93,13 +93,12 @@ QJsonObject DesktopSessionSyncHost::historyPage(const QString& sessionId, const 
     QJsonArray permissions;
     for (const MaiPermissionRequest& request : controller_.agent().listPendingPermissions()) {
         if (request.sessionId != session.id) continue;
-        permissions.append(QJsonObject{
-            {QStringLiteral("id"), text(request.id)},
-            {QStringLiteral("tool"), text(request.toolName)},
-            {QStringLiteral("input"), text(request.arguments)},
-            {QStringLiteral("allowForSession"), request.allowForSession},
-            {QStringLiteral("rememberOnApproval"), request.rememberOnApproval},
-            {QStringLiteral("fileCount"), int(request.approvalKeys.size())}});
+        permissions.append(QJsonObject{{QStringLiteral("id"), text(request.id)},
+                                       {QStringLiteral("tool"), text(request.toolName)},
+                                       {QStringLiteral("input"), text(request.arguments)},
+                                       {QStringLiteral("allowForSession"), request.allowForSession},
+                                       {QStringLiteral("rememberOnApproval"), request.rememberOnApproval},
+                                       {QStringLiteral("fileCount"), int(request.approvalKeys.size())}});
     }
     QJsonArray questions;
     for (const MaiQuestionRequest& request : controller_.agent().listPendingQuestions()) {
@@ -132,8 +131,7 @@ QJsonObject DesktopSessionSyncHost::applyCommand(const QString& sessionId, const
             }
             const QFileInfo directory(path);
             const QString canonical = directory.canonicalFilePath();
-            if (!directory.isDir() || canonical.isEmpty())
-                return failure(QStringLiteral("工作目录不存在或不可访问"));
+            if (!directory.isDir() || canonical.isEmpty()) return failure(QStringLiteral("工作目录不存在或不可访问"));
             const QString id = controller_.createSession(canonical);
             if (id.isEmpty()) return failure(controller_.lastError());
             return {{QStringLiteral("ok"), true}, {QStringLiteral("session_id"), id}};
@@ -157,11 +155,10 @@ QJsonObject DesktopSessionSyncHost::applyCommand(const QString& sessionId, const
                 return failure(QStringLiteral("会话不存在"));
             const QFileInfo directory(path);
             const QString canonical = directory.canonicalFilePath();
-            if (path.isEmpty() || path.toUtf8().size() > 4096 || !directory.isAbsolute() ||
-                !directory.isDir() || canonical.isEmpty())
+            if (path.isEmpty() || path.toUtf8().size() > 4096 || !directory.isAbsolute() || !directory.isDir() ||
+                canonical.isEmpty())
                 return failure(QStringLiteral("工作目录必须是已存在的绝对路径"));
-            if (!controller_.setSessionDirectory(target, canonical))
-                return failure(controller_.lastError());
+            if (!controller_.setSessionDirectory(target, canonical)) return failure(controller_.lastError());
             return {{QStringLiteral("ok"), true},
                     {QStringLiteral("session_id"), target},
                     {QStringLiteral("workspace_path"), canonical}};
@@ -177,75 +174,72 @@ QJsonObject DesktopSessionSyncHost::applyCommand(const QString& sessionId, const
         const QString request = payload.value(QStringLiteral("requestId")).toString();
         const QString quote = payload.value(QStringLiteral("quoteMessageId")).toString();
         static const QRegularExpression id(QStringLiteral("^[A-Za-z0-9_-]{1,128}$"));
-        if (steering && (!id.match(turn).hasMatch() || !id.match(request).hasMatch() ||
-                         request.size() > 96 || (!quote.isEmpty() && !id.match(quote).hasMatch())))
+        if (steering && (!id.match(turn).hasMatch() || !id.match(request).hasMatch() || request.size() > 96 ||
+                         (!quote.isEmpty() && !id.match(quote).hasMatch())))
             return failure(QStringLiteral("当前任务标识无效，请重新读取会话"));
         const QString message = payload.value(QStringLiteral("text")).toString();
         const QJsonArray attachments = payload.value(QStringLiteral("resolved_attachments")).toArray();
         if ((message.isEmpty() && attachments.isEmpty()) || message.toUtf8().size() > 16 * 1024 ||
-            attachments.size() > 10) return failure(QStringLiteral("消息为空或过长"));
+            attachments.size() > 10)
+            return failure(QStringLiteral("消息为空或过长"));
         QStringList images;
         QStringList videos;
         QStringList documents;
         std::vector<MaiModelImage> steeringImages;
         std::vector<MaiVideoPart> steeringVideos;
-        const QString root = QFileInfo(QString::fromUtf8(session.directory.c_str()))
-            .canonicalFilePath();
-        const QString attachmentRoot = QDir::fromNativeSeparators(QDir(root).filePath(
-            QStringLiteral(".maichat/session-attachments"))) + QLatin1Char('/');
+        const QString root = QFileInfo(QString::fromUtf8(session.directory.c_str())).canonicalFilePath();
+        const QString attachmentRoot =
+            QDir::fromNativeSeparators(QDir(root).filePath(QStringLiteral(".maichat/session-attachments"))) +
+            QLatin1Char('/');
         for (const QJsonValue& value : attachments) {
             const QJsonObject item = value.toObject();
             const QString path = QDir::fromNativeSeparators(
                 QFileInfo(item.value(QStringLiteral("path")).toString()).canonicalFilePath());
-            if (root.isEmpty() || path.isEmpty() || !path.startsWith(attachmentRoot) ||
-                !QFileInfo(path).isFile())
+            if (root.isEmpty() || path.isEmpty() || !path.startsWith(attachmentRoot) || !QFileInfo(path).isFile())
                 return failure(QStringLiteral("会话附件路径无效"));
             const QString kind = item.value(QStringLiteral("kind")).toString();
             const QString mime = item.value(QStringLiteral("content_type")).toString();
             if (kind == QStringLiteral("image") &&
-                (mime == QStringLiteral("image/jpeg") ||
-                 mime == QStringLiteral("image/png") ||
-                 mime == QStringLiteral("image/webp") ||
-                 mime == QStringLiteral("image/gif"))) {
+                (mime == QStringLiteral("image/jpeg") || mime == QStringLiteral("image/png") ||
+                 mime == QStringLiteral("image/webp") || mime == QStringLiteral("image/gif"))) {
                 images.append(path);
                 steeringImages.push_back({path.toStdString(), mime.toStdString()});
-            }
-            else if (kind == QStringLiteral("image"))
+            } else if (kind == QStringLiteral("image"))
                 documents.append(QDir(root).relativeFilePath(path));
             else if (kind == QStringLiteral("video")) {
                 videos.append(path);
                 steeringVideos.push_back({path.toStdString(), mime.toStdString()});
-            }
-            else if (kind == QStringLiteral("audio") || kind == QStringLiteral("file"))
+            } else if (kind == QStringLiteral("audio") || kind == QStringLiteral("file"))
                 documents.append(QDir(root).relativeFilePath(path));
-            else return failure(QStringLiteral("会话附件类型无效"));
+            else
+                return failure(QStringLiteral("会话附件类型无效"));
         }
         QString prompt = message;
         if (!documents.isEmpty())
-            prompt += QStringLiteral("\n\n会话附件已保存到本机工作目录：\n- ") +
-                      documents.join(QStringLiteral("\n- "));
+            prompt += QStringLiteral("\n\n会话附件已保存到本机工作目录：\n- ") + documents.join(QStringLiteral("\n- "));
         if (steering) {
             // The owner validates the original turn atomically. Never retry this
             // as a new prompt if that turn ended while attachments were copied.
-            const auto accepted = controller_.agent().submit(MaiSteerPrompt{
-                sessionId.toStdString(), turn.toStdString(), request.toStdString(),
-                prompt.toStdString(), std::move(steeringImages), std::move(steeringVideos),
-                quote.toStdString()});
+            const auto accepted = controller_.agent().submit(
+                MaiSteerPrompt{sessionId.toStdString(), turn.toStdString(), request.toStdString(), prompt.toStdString(),
+                               std::move(steeringImages), std::move(steeringVideos), quote.toStdString()});
             if (!accepted) return failure(text(accepted.error().message()));
             return {{QStringLiteral("ok"), true},
-                    {QStringLiteral("user_message_id"), text(accepted.value())}};
+                    {QStringLiteral("user_message_id"), text(accepted.value())},
+                    {QStringLiteral("turnId"), turn}};
         }
-        if (!controller_.sendPrompt(sessionId, prompt, images, videos, {}))
-            return failure(controller_.lastError());
+        if (!controller_.sendPrompt(sessionId, prompt, images, videos, {})) return failure(controller_.lastError());
         const QJsonArray recent = historyPage(sessionId, {}, 2).value(QStringLiteral("messages")).toArray();
         for (const QJsonValue& value : recent) {
             const QJsonObject candidate = value.toObject();
             if (candidate.value(QStringLiteral("role")).toString() == QStringLiteral("user"))
                 return {{QStringLiteral("ok"), true},
-                        {QStringLiteral("user_message_id"), candidate.value(QStringLiteral("id"))}};
+                        {QStringLiteral("user_message_id"), candidate.value(QStringLiteral("id"))},
+                        {QStringLiteral("turnId"), text(controller_.agent().activeTurnId(sessionId.toStdString()))}};
         }
     } else if (action == QStringLiteral("stop")) {
-        if (!controller_.interrupt(sessionId)) return failure(controller_.lastError());
+        if (!controller_.interrupt(sessionId, payload.value(QStringLiteral("turnId")).toString()))
+            return failure(controller_.lastError());
     } else if (action == QStringLiteral("permission")) {
         const QString id = payload.value(QStringLiteral("id")).toString();
         const QString decision = payload.value(QStringLiteral("decision")).toString();
@@ -253,10 +247,10 @@ QJsonObject DesktopSessionSyncHost::applyCommand(const QString& sessionId, const
         if (decision != QStringLiteral("denied") && decision != QStringLiteral("approved") &&
             decision != QStringLiteral("approved_for_session"))
             return failure(QStringLiteral("权限决定无效"));
-        const bool ok = decision == QStringLiteral("denied") ? controller_.denyPermission(id)
-                        : decision == QStringLiteral("approved") ? controller_.approvePermission(id)
-                        : decision == QStringLiteral("approved_for_session")
-                            ? controller_.approvePermission(id, true) : false;
+        const bool ok = decision == QStringLiteral("denied")                 ? controller_.denyPermission(id)
+                        : decision == QStringLiteral("approved")             ? controller_.approvePermission(id)
+                        : decision == QStringLiteral("approved_for_session") ? controller_.approvePermission(id, true)
+                                                                             : false;
         if (!ok) return failure(controller_.lastError());
     } else if (action == QStringLiteral("answer")) {
         const QString id = payload.value(QStringLiteral("id")).toString();

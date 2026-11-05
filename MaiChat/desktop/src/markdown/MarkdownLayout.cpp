@@ -20,7 +20,11 @@ namespace {
 struct TextRun {
     std::unique_ptr<QTextLayout> layout;
     QPointF position;
+    // Table cells share a y range but have distinct content rectangles. Keep
+    // the width supplied to QTextLayout for pointer and link hit testing.
+    qreal width = 0;
     qreal height = 0;
+    int codeBlock = -1;
     // 这段文字在 selectableText 里的起点，选区和复制都按这个换算。
     int textStart = 0;
     struct Link {
@@ -110,6 +114,7 @@ struct MarkdownLayout::Impl {
     qreal height = 0;
     std::vector<TextRun> runs;
     QVector<Shape> shapes;
+    QVector<MarkdownCodeBlockViewport> codeBlocks;
     QString text;
     int selectionFrom = 0;
     int selectionTo = 0;
@@ -172,6 +177,9 @@ private:
         font.setStyleName(QString());
         font.setWeight(QFont::Normal);
         font.setItalic(false);
+        // The shared Fixed face has no programming ligatures. Disable pair
+        // kerning as well so code columns keep their verified cell advances.
+        font.setKerning(false);
         font.setPixelSize(theme_.bodyPixelSize);
         return tuned(font);
     }
@@ -238,6 +246,7 @@ private:
                 font.setFamilies(mono.families());
                 font.setFamily(mono.family());
                 font.setPixelSize(theme_.codePixelSize);
+                font.setKerning(false);
             }
             if (span.styles.testFlag(MarkdownStyle::Bold)) font.setWeight(QFont::Bold);
             if (span.styles.testFlag(MarkdownStyle::Italic)) font.setItalic(true);
@@ -301,7 +310,7 @@ private:
     // 不是内容。收进去的话复制一段列表，每个符号会单占一行。
     RunMetrics addPlainText(const QString& text, const QFont& font, const QColor& color, qreal x,
                             qreal y, qreal avail, Qt::Alignment alignment = Qt::AlignLeft,
-                            bool selectable = true) {
+                            bool selectable = true, bool wrap = true) {
         if (text.isEmpty()) return {};
         QTextCharFormat format;
         format.setFont(font);
@@ -310,13 +319,13 @@ private:
         range.start = 0;
         range.length = text.size();
         range.format = format;
-        return addLaidOutText(text, font, {range}, {}, x, y, avail, alignment, selectable);
+        return addLaidOutText(text, font, {range}, {}, x, y, avail, alignment, selectable, wrap);
     }
 
     RunMetrics addLaidOutText(const QString& text, const QFont& base,
                               const QVector<QTextLayout::FormatRange>& formats,
                               const QVector<TextRun::Link>& links, qreal x, qreal y, qreal avail,
-                              Qt::Alignment alignment, bool selectable = true) {
+                              Qt::Alignment alignment, bool selectable = true, bool wrap = true) {
         TextRun run;
         // QTextLayout 是单段排版器，段内强制断行使用 U+2028，而不是原文的 LF。
         // 只转换布局副本且等长替换，原文复制、格式与链接的 UTF-16 偏移仍保持不变。
@@ -324,12 +333,13 @@ private:
         layoutText.replace(QLatin1Char('\n'), QChar(QChar::LineSeparator));
         run.layout = std::make_unique<QTextLayout>(layoutText, base);
         run.position = QPointF(x, y);
+        run.width = qMax<qreal>(avail, 1);
         run.textStart = out_.text.size();
         run.links = links;
 
         QTextOption option;
         // 长 URL、长代码 token 没有词边界，只按词断会把它整条甩出可视区。
-        option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+        option.setWrapMode(wrap ? QTextOption::WrapAtWordBoundaryOrAnywhere : QTextOption::NoWrap);
         option.setAlignment(alignment);
         run.layout->setTextOption(option);
         run.layout->setFormats(formats);
@@ -368,6 +378,7 @@ private:
                 font.setFamilies({theme_.codeFamily});
                 font.setFamily(theme_.codeFamily);
                 font.setPixelSize(theme_.codePixelSize);
+                font.setKerning(false);
             }
             if (span.styles.testFlag(MarkdownStyle::Bold)) font.setWeight(QFont::Bold);
             // 宽度用 horizontalAdvance，不用 boundingRect——后者会少算，
@@ -523,6 +534,7 @@ private:
         out_.shapes.push_back(Shape{});
 
         const qreal top = y;
+        const auto firstRun = out_.runs.size();
         const qreal innerX = x + theme_.codePadding;
         const qreal innerAvail = qMax<qreal>(avail - 2 * theme_.codePadding, 1);
         y += theme_.codePadding;
@@ -541,7 +553,8 @@ private:
                 y += emptyLineHeight;
                 continue;
             }
-            y += addPlainText(line, font, theme_.codeText, innerX, y, innerAvail).height;
+            y += addPlainText(line, font, theme_.codeText, innerX, y, innerAvail,
+                              Qt::AlignLeft, true, false).height;
         }
         y += theme_.codePadding;
 
@@ -553,6 +566,15 @@ private:
         // 圆角——QTextDocument 的 CSS 子集画不出来，这是换掉它最直观的那一项。
         background.radius = theme_.codeRadius;
         out_.shapes[backgroundIndex] = background;
+        const int index = out_.codeBlocks.size();
+        qreal contentWidth = 0;
+        for (auto run = firstRun; run < out_.runs.size(); ++run) {
+            out_.runs[run].codeBlock = index;
+            contentWidth = qMax(contentWidth, out_.runs[run].layout->maximumWidth());
+        }
+        out_.codeBlocks.push_back({background.rect,
+            QRectF(innerX, top + theme_.codePadding, innerAvail, y - top - 2 * theme_.codePadding),
+            contentWidth, theme_.zoom});
         return y;
     }
 
@@ -774,6 +796,7 @@ void MarkdownLayout::layout(const MarkdownDocument& document, const MarkdownThem
     impl_->height = 0;
     impl_->runs.clear();
     impl_->shapes.clear();
+    impl_->codeBlocks.clear();
     impl_->text.clear();
     impl_->selectionFrom = 0;
     impl_->selectionTo = 0;
@@ -805,12 +828,21 @@ qreal MarkdownLayout::naturalWidth() const {
     return widest;
 }
 
+const QVector<MarkdownCodeBlockViewport>& MarkdownLayout::codeBlocks() const {
+    return impl_->codeBlocks;
+}
+
 bool MarkdownLayout::isEmpty() const {
     return impl_->runs.empty() && impl_->shapes.isEmpty();
 }
 
 // 作用：根据已排版行的真实几何位置绘制 Markdown 内容。
 void MarkdownLayout::paint(QPainter* painter, const QPointF& origin, const QRectF& clip) const {
+    paint(painter, origin, clip, {});
+}
+
+void MarkdownLayout::paint(QPainter* painter, const QPointF& origin, const QRectF& clip,
+                           const QHash<int, qreal>& codeOffsets) const {
     if (painter == nullptr) return;
     const bool clipped = clip.isValid();
 
@@ -849,9 +881,13 @@ void MarkdownLayout::paint(QPainter* painter, const QPointF& origin, const QRect
 
     painter->setPen(impl_->theme.text);
     for (const TextRun& run : impl_->runs) {
-        const QPointF position = origin + run.position;
-        const QRectF bounds(position, QSizeF(impl_->width, run.height));
-        if (clipped && !clip.intersects(bounds)) continue;
+        const bool code = run.codeBlock >= 0;
+        const qreal offset = code ? qBound<qreal>(0, codeOffsets.value(run.codeBlock),
+            impl_->codeBlocks[run.codeBlock].maximumOffset()) : 0;
+        const QPointF position = origin + run.position - QPointF(offset, 0);
+        const QRectF bounds(position, QSizeF(run.width, run.height));
+        const QRectF codeClip = code ? impl_->codeBlocks[run.codeBlock].viewport.translated(origin) : QRectF();
+        if (clipped && !clip.intersects(code ? codeClip : bounds)) continue;
 
         QVector<QTextLayout::FormatRange> selections;
         if (to > from) {
@@ -867,7 +903,23 @@ void MarkdownLayout::paint(QPainter* painter, const QPointF& origin, const QRect
                 selections.push_back(range);
             }
         }
+        if (code) {
+            painter->save();
+            painter->setClipRect(codeClip, Qt::IntersectClip);
+        }
         run.layout->draw(painter, position, selections);
+        if (code) painter->restore();
+    }
+    for (int index = 0; index < impl_->codeBlocks.size(); ++index) {
+        const auto& code = impl_->codeBlocks[index];
+        const QRectF track = code.scrollTrack().translated(origin);
+        if (track.isEmpty()) continue;
+        painter->setPen(Qt::NoPen);
+        painter->setBrush(QColor(QStringLiteral("#d9dfe6")));
+        painter->drawRoundedRect(track, track.height() / 2, track.height() / 2);
+        painter->setBrush(QColor(QStringLiteral("#8d99a8")));
+        painter->drawRoundedRect(code.scrollThumb(codeOffsets.value(index)).translated(origin),
+                                 track.height() / 2, track.height() / 2);
     }
     painter->restore();
 }
@@ -875,7 +927,7 @@ void MarkdownLayout::paint(QPainter* painter, const QPointF& origin, const QRect
 QString MarkdownLayout::linkAt(const QPointF& point) const {
     for (const TextRun& run : impl_->runs) {
         if (run.links.isEmpty()) continue;
-        const QRectF bounds(run.position, QSizeF(impl_->width, run.height));
+        const QRectF bounds(run.position, QSizeF(run.width, run.height));
         if (!bounds.contains(point)) continue;
         const QPointF local = point - run.position;
 
@@ -895,24 +947,31 @@ QString MarkdownLayout::linkAt(const QPointF& point) const {
 }
 
 int MarkdownLayout::positionAt(const QPointF& point) const {
+    return positionAt(point, {});
+}
+
+int MarkdownLayout::positionAt(const QPointF& point, const QHash<int, qreal>& codeOffsets) const {
     const TextRun* best = nullptr;
     qreal bestDistance = 0;
     for (const TextRun& run : impl_->runs) {
-        const qreal top = run.position.y();
-        const qreal bottom = top + run.height;
-        if (point.y() >= top && point.y() <= bottom) {
-            best = &run;
-            break;
-        }
-        const qreal distance = point.y() < top ? top - point.y() : point.y() - bottom;
+        // Selecting by y alone sends every column of a table row to its first
+        // cell. Use the nearest content rectangle in both axes; blank space
+        // between rows still selects the nearest text instead of losing a drag.
+        const QRectF bounds(run.position, QSizeF(run.width, run.height));
+        const qreal dx = qMax<qreal>(0, qMax(bounds.left() - point.x(), point.x() - bounds.right()));
+        const qreal dy = qMax<qreal>(0, qMax(bounds.top() - point.y(), point.y() - bounds.bottom()));
+        const qreal distance = dx * dx + dy * dy;
         if (best == nullptr || distance < bestDistance) {
             best = &run;
             bestDistance = distance;
         }
+        if (distance == 0) break;
     }
     if (best == nullptr) return 0;
 
-    const QPointF local = point - best->position;
+    const qreal offset = best->codeBlock >= 0 ? qBound<qreal>(0, codeOffsets.value(best->codeBlock),
+        impl_->codeBlocks[best->codeBlock].maximumOffset()) : 0;
+    const QPointF local = point - best->position + QPointF(offset, 0);
     for (int index = 0; index < best->layout->lineCount(); ++index) {
         const QTextLine line = best->layout->lineAt(index);
         const bool last = index == best->layout->lineCount() - 1;

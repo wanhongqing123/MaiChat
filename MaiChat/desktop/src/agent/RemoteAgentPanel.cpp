@@ -8,6 +8,10 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFile>
+#include <QSaveFile>
+#include <QStandardPaths>
+#include <QJsonDocument>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QJsonArray>
@@ -43,9 +47,9 @@ QString sessionKey(const QJsonObject& value) {
 QString attachmentSummary(const QStringList& paths) {
     QStringList names;
     for (const QString& path : paths.mid(0, 3)) names.append(QFileInfo(path).fileName());
-    return QStringLiteral("待发送 %1 项：%2%3").arg(paths.size()).arg(
-        names.join(QStringLiteral("、")),
-        paths.size() > 3 ? QStringLiteral(" 等") : QString());
+    return QStringLiteral("待发送 %1 项：%2%3")
+        .arg(paths.size())
+        .arg(names.join(QStringLiteral("、")), paths.size() > 3 ? QStringLiteral(" 等") : QString());
 }
 
 QString messageText(const QJsonObject& message) {
@@ -56,32 +60,31 @@ QString messageText(const QJsonObject& message) {
     for (const QJsonValue& value : message.value(QStringLiteral("parts")).toArray()) {
         const QJsonObject part = value.toObject();
         const QString kind = part.value(QStringLiteral("kind")).toString();
-        if (kind == QStringLiteral("text")) text.append(part.value(QStringLiteral("text")).toString());
+        if (kind == QStringLiteral("text"))
+            text.append(part.value(QStringLiteral("text")).toString());
         else if (kind == QStringLiteral("tool")) {
             ++toolCount;
             lastTool = part.value(QStringLiteral("tool")).toString();
             lastState = part.value(QStringLiteral("state")).toString();
         } else if (!part.value(QStringLiteral("attachment_id")).toString().isEmpty()) {
             const QString id = part.value(QStringLiteral("attachment_id")).toString();
-            QString name = part.value(QStringLiteral("name")).toString(
-                QStringLiteral("附件"));
+            QString name = part.value(QStringLiteral("name")).toString(QStringLiteral("附件"));
             name.replace(QLatin1Char('['), QLatin1Char(' '));
             name.replace(QLatin1Char(']'), QLatin1Char(' '));
             name.replace(QLatin1Char('\n'), QLatin1Char(' '));
             text.append(QStringLiteral("[下载%1 · %2](maichat-attachment:%3)")
-                .arg(kind == QStringLiteral("image") ? QStringLiteral("图片") :
-                     kind == QStringLiteral("video") ? QStringLiteral("视频") :
-                     kind == QStringLiteral("audio") ? QStringLiteral("音频") :
-                     QStringLiteral("文件"), name, id));
+                            .arg(kind == QStringLiteral("image")   ? QStringLiteral("图片")
+                                 : kind == QStringLiteral("video") ? QStringLiteral("视频")
+                                 : kind == QStringLiteral("audio") ? QStringLiteral("音频")
+                                                                   : QStringLiteral("文件"),
+                                 name, id));
         } else if (kind == QStringLiteral("image") || kind == QStringLiteral("video")) {
-            text.append(kind == QStringLiteral("image")
-                            ? QStringLiteral("[图片在所属设备，暂不可跨设备预览]")
-                            : QStringLiteral("[视频在所属设备，暂不可跨设备预览]"));
+            text.append(kind == QStringLiteral("image") ? QStringLiteral("[图片在所属设备，暂不可跨设备预览]")
+                                                        : QStringLiteral("[视频在所属设备，暂不可跨设备预览]"));
         }
     }
     if (toolCount > 0) {
-        text.append(QStringLiteral("工具调用 %1 次 · %2 · %3")
-                        .arg(toolCount).arg(lastTool, lastState));
+        text.append(QStringLiteral("工具调用 %1 次 · %2 · %3").arg(toolCount).arg(lastTool, lastState));
     }
     return text.join(QStringLiteral("\n\n"));
 }
@@ -129,37 +132,78 @@ struct RemoteAgentPanel::Runtime {
     MarkdownView* view = nullptr;
     RemotePromptEdit* editor = nullptr;
     QPushButton* send = nullptr;
+    QPushButton* stop = nullptr;
+    QPushButton* recover = nullptr;
+    QString outboxFile;
+    QJsonArray outbox;
+    QHash<QString, QString> controlRequests;
+    QHash<QString, QJsonObject> owners;
+    bool restoringDraft = false;
+    bool storageUsable = true;
     QPushButton* older = nullptr;
     QLabel* attachmentsLabel = nullptr;
     QPushButton* clearAttachments = nullptr;
     QWidget* requests = nullptr;
     QVBoxLayout* requestsLayout = nullptr;
     QTimer historyTimeout;
-    QTimer commandTimeout;
     QMap<QString, QJsonObject> messages;
     QMap<QString, QString> rendered;
     QSet<QString> optimisticMessages;
-    QString pendingOptimisticId;
     QHash<QString, QString> drafts;
     QHash<QString, QStringList> attachmentDrafts;
+    QHash<QString, QString> copiedUnknownRequests;
     QStringList attachments;
     QString oldest;
-    QString pendingDraft;
-    QStringList pendingAttachmentPaths;
     bool pendingCommand = false;
-    bool lastCommandRejected = false;
     bool historyInFlight = false;
     quint64 historyGeneration = 0;
     bool awaitingResponse = false;
     bool observedBusy = false;
     qint64 commandSentAt = 0;
-    QString pendingAction;
     CommandHandler command;
     HistoryHandler history;
     DownloadHandler download;
 };
 
-RemoteAgentPanel::RemoteAgentPanel(QWidget* parent) : QWidget(parent), runtime_(std::make_unique<Runtime>()) {
+RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
+    : QWidget(parent), runtime_(std::make_unique<Runtime>()) {
+    runtime_->outboxFile = outboxFile.isEmpty()
+                               ? QDir(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation))
+                                     .filePath(QStringLiteral("remote-agent-outbox.json"))
+                               : outboxFile;
+    QFile saved(runtime_->outboxFile);
+    if (saved.exists() && (!saved.open(QIODevice::ReadOnly) || saved.size() > 4 * 1024 * 1024))
+        runtime_->storageUsable = false;
+    if (saved.isOpen() && runtime_->storageUsable) {
+        QJsonParseError parse;
+        const QJsonDocument document = QJsonDocument::fromJson(saved.readAll(), &parse);
+        runtime_->storageUsable = parse.error == QJsonParseError::NoError && document.isObject();
+        const QJsonObject state = document.object();
+        // A process restart cannot prove delivery. Retain original identities and
+        // require explicit draft recovery instead of replaying an old turn.
+        for (const QJsonValue& value : state.value(QStringLiteral("outbox")).toArray()) {
+            QJsonObject entry = value.toObject();
+            if (entry.value(QStringLiteral("requestId")).toString().isEmpty() ||
+                entry.value(QStringLiteral("owner")).toObject().isEmpty())
+                continue;
+            const QString state = entry.value(QStringLiteral("state")).toString();
+            entry.insert(QStringLiteral("state"),
+                         state == QStringLiteral("sending") || state == QStringLiteral("unknown")
+                             ? QStringLiteral("unknown")
+                             : QStringLiteral("held"));
+            runtime_->outbox.append(entry);
+        }
+        const QJsonObject drafts = state.value(QStringLiteral("drafts")).toObject();
+        for (auto it = drafts.begin(); it != drafts.end(); ++it) {
+            runtime_->drafts.insert(it.key(), it.value().toObject().value(QStringLiteral("text")).toString());
+            const QString copied = it.value().toObject().value(QStringLiteral("copied_unknown_request")).toString();
+            if (!copied.isEmpty()) runtime_->copiedUnknownRequests.insert(it.key(), copied);
+            QStringList paths;
+            for (const QJsonValue& path : it.value().toObject().value(QStringLiteral("files")).toArray())
+                paths.append(path.toString());
+            runtime_->attachmentDrafts.insert(it.key(), paths);
+        }
+    }
     setObjectName(QStringLiteral("remoteAgentPanel"));
     setStyleSheet(QStringLiteral("background:#ffffff;"));
     auto* layout = new QVBoxLayout(this);
@@ -184,8 +228,7 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent) : QWidget(parent), runtime_(
     auto* divider = new QWidget(this);
     divider->setObjectName(QStringLiteral("remoteAgentHeaderDivider"));
     divider->setFixedHeight(qMax(1, UiZoom::s(1)));
-    divider->setStyleSheet(QStringLiteral(
-        "QWidget#remoteAgentHeaderDivider{background:#e2e8f0;}"));
+    divider->setStyleSheet(QStringLiteral("QWidget#remoteAgentHeaderDivider{background:#e2e8f0;}"));
     layout->addWidget(divider);
 
     runtime_->older = new QPushButton(QStringLiteral("查看更早消息"), this);
@@ -211,41 +254,39 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent) : QWidget(parent), runtime_(
     auto* composer = new QWidget(this);
     composer->setObjectName(QStringLiteral("remoteAgentComposerPanel"));
     auto* composerLayout = new QVBoxLayout(composer);
-    composerLayout->setContentsMargins(UiZoom::s(12), UiZoom::s(2),
-                                       UiZoom::s(12), UiZoom::s(8));
+    composerLayout->setContentsMargins(UiZoom::s(12), UiZoom::s(2), UiZoom::s(12), UiZoom::s(8));
     runtime_->editor = new RemotePromptEdit(composer);
     runtime_->editor->setObjectName(QStringLiteral("remoteAgentComposer"));
     runtime_->editor->setAcceptRichText(false);
     runtime_->editor->setPlaceholderText(QStringLiteral("向所属设备发送消息…"));
     runtime_->editor->setFixedHeight(UiZoom::s(136));
-    runtime_->editor->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
-        "QTextEdit#remoteAgentComposer{border:1px solid #d1d5db;border-radius:14px;"
-        "background:#ffffff;color:#172033;padding:10px 52px 10px 13px;}"
-        "QTextEdit#remoteAgentComposer:focus{border-color:#b5bbc4;}")));
+    runtime_->editor->setStyleSheet(
+        UiZoom::scaleQss(QStringLiteral("QTextEdit#remoteAgentComposer{border:1px solid #d1d5db;border-radius:14px;"
+                                        "background:#ffffff;color:#172033;padding:10px 52px 10px 13px;}"
+                                        "QTextEdit#remoteAgentComposer:focus{border-color:#b5bbc4;}")));
     QFont editorFont = runtime_->editor->font();
     editorFont.setPixelSize(UiZoom::s(14));
     runtime_->editor->setFont(editorFont);
-    runtime_->editor->setMimeHandler([](const QMimeData* mime) {
-        return mime && (mime->hasImage() || mime->hasUrls());
-    });
+    runtime_->editor->setMimeHandler(
+        [](const QMimeData* mime) { return mime && (mime->hasImage() || mime->hasUrls()); });
     runtime_->editor->submit = [this] { sendOrStop(); };
     auto* attachment = new QPushButton(QStringLiteral("+"), runtime_->editor);
     attachment->setObjectName(QStringLiteral("remoteAgentAttachButton"));
     attachment->setAccessibleName(QStringLiteral("添加会话附件"));
     attachment->setToolTip(attachment->accessibleName());
     attachment->setFixedSize(UiZoom::s(36), UiZoom::s(36));
-    attachment->setStyleSheet(QStringLiteral(
-        "QPushButton{border:0;border-radius:18px;background:#f1f5f9;"
-        "color:#0b67b7;font-size:24px;}"));
+    attachment->setStyleSheet(
+        QStringLiteral("QPushButton{border:0;border-radius:18px;background:#f1f5f9;"
+                       "color:#0b67b7;font-size:24px;}"));
     connect(attachment, &QPushButton::clicked, this, [this] {
-        const QStringList picked = QFileDialog::getOpenFileNames(this,
-            QStringLiteral("选择会话附件"), QDir::homePath());
+        const QStringList picked =
+            QFileDialog::getOpenFileNames(this, QStringLiteral("选择会话附件"), QDir::homePath());
         for (const QString& path : picked) {
             const QFileInfo file(path);
             const QByteArray name = file.fileName().toUtf8();
             MaiCloudDriveMediaInfo media{};
-            if (!file.isFile() || !mai_session_attachment_media_info(name.constData(), &media) ||
-                file.size() < 1 || quint64(file.size()) > media.max_size_bytes) {
+            if (!file.isFile() || !mai_session_attachment_media_info(name.constData(), &media) || file.size() < 1 ||
+                quint64(file.size()) > media.max_size_bytes) {
                 showStatus(QStringLiteral("附件格式或大小无效：%1").arg(file.fileName()), true);
                 continue;
             }
@@ -263,6 +304,38 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent) : QWidget(parent), runtime_(
         updateControls();
     });
     runtime_->editor->setLeadingAction(attachment);
+    runtime_->stop = new QPushButton(runtime_->editor);
+    runtime_->stop->setObjectName(QStringLiteral("remoteAgentStopButton"));
+    runtime_->stop->setFixedSize(UiZoom::s(36), UiZoom::s(36));
+    runtime_->stop->setIconSize(QSize(UiZoom::s(18), UiZoom::s(18)));
+    runtime_->stop->setIcon(actionIcon(true, QColor(QStringLiteral("#c24131"))));
+    runtime_->stop->setToolTip(QStringLiteral("\u505c\u6b62\u5f53\u524d\u4efb\u52a1"));
+    runtime_->stop->setAccessibleName(runtime_->stop->toolTip());
+    runtime_->stop->setStyleSheet(
+        QStringLiteral("QPushButton{background:#fff5f3;border:1px solid #f0c3bd;border-radius:18px;}"));
+    runtime_->editor->setSecondaryLeadingAction(runtime_->stop);
+    connect(runtime_->stop, &QPushButton::clicked, this, [this] {
+        const QString turn = runtime_->session.value(QStringLiteral("turnId")).toString();
+        if (turn.isEmpty()) {
+            showStatus(
+                QStringLiteral("\u5f53\u524d\u4efb\u52a1\u5df2\u53d8\u5316\uff0c\u8bf7\u5237\u65b0\u540e\u91cd\u8bd5"),
+                true);
+            return;
+        }
+        // Stop has its own receipt and bypasses attachment/message FIFO. Never
+        // consume or clear the editor, queued supplement or its pending receipt.
+        sendAction({{QStringLiteral("action"), QStringLiteral("stop")}, {QStringLiteral("turnId"), turn}}, false);
+        for (int i = 0; i < runtime_->outbox.size(); ++i) {
+            QJsonObject entry = runtime_->outbox[i].toObject();
+            if (sessionKey(entry.value(QStringLiteral("owner")).toObject()) == sessionKey(runtime_->session) &&
+                entry.value(QStringLiteral("state")) == QStringLiteral("queued")) {
+                entry.insert(QStringLiteral("state"), QStringLiteral("held"));
+                runtime_->outbox[i] = entry;
+            }
+        }
+        persistOutbox();
+        updateControls();
+    });
     composerLayout->addWidget(runtime_->editor, 1);
     auto* attachmentsRow = new QWidget(composer);
     auto* attachmentsLayout = new QHBoxLayout(attachmentsRow);
@@ -280,6 +353,11 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent) : QWidget(parent), runtime_(
         updateControls();
     });
     composerLayout->addWidget(attachmentsRow);
+    runtime_->recover = new QPushButton(QStringLiteral("\u53d6\u56de\u5f85\u53d1\u8349\u7a3f"), composer);
+    runtime_->recover->setObjectName(QStringLiteral("remoteAgentRecoverDraftButton"));
+    runtime_->recover->hide();
+    composerLayout->addWidget(runtime_->recover);
+    connect(runtime_->recover, &QPushButton::clicked, this, &RemoteAgentPanel::recoverQueuedDraft);
     runtime_->send = new QPushButton(runtime_->editor);
     runtime_->send->setObjectName(QStringLiteral("remoteAgentSendButton"));
     runtime_->send->setCursor(Qt::PointingHandCursor);
@@ -288,7 +366,13 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent) : QWidget(parent), runtime_(
     runtime_->editor->setCornerAction(runtime_->send);
     layout->addWidget(composer);
     connect(runtime_->send, &QPushButton::clicked, this, [this] { sendOrStop(); });
-    connect(runtime_->editor, &QTextEdit::textChanged, this, [this] { updateControls(); });
+    connect(runtime_->editor, &QTextEdit::textChanged, this, [this] {
+        if (!runtime_->restoringDraft && !runtime_->session.isEmpty())
+            runtime_->drafts.insert(sessionKey(runtime_->session), runtime_->editor->toPlainText());
+        if (!runtime_->restoringDraft && runtime_->editor->toPlainText().isEmpty())
+            runtime_->copiedUnknownRequests.remove(sessionKey(runtime_->session));
+        updateControls();
+    });
     connect(runtime_->older, &QPushButton::clicked, this, [this] {
         if (!runtime_->oldest.isEmpty()) requestHistory(runtime_->oldest, 20);
     });
@@ -296,19 +380,21 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent) : QWidget(parent), runtime_(
         const QString prefix = QStringLiteral("maichat-attachment:");
         if (!href.startsWith(prefix) || !runtime_->download) return;
         const QString id = href.mid(prefix.size());
-        static const QRegularExpression valid(
-            QStringLiteral("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"));
+        static const QRegularExpression valid(QStringLiteral("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"));
         if (!valid.match(id).hasMatch()) return;
         const QJsonObject session = runtime_->session;
         showStatus(QStringLiteral("正在下载会话附件…"));
         QPointer<RemoteAgentPanel> guard(this);
-        runtime_->download(session, id, [guard, session](const QString& path,
-                                                          const QString& error) {
+        runtime_->download(session, id, [guard, session](const QString& path, const QString& error) {
             if (!guard || sessionKey(session) != sessionKey(guard->runtime_->session)) return;
-            if (!error.isEmpty()) { guard->showStatus(error, true); return; }
+            if (!error.isEmpty()) {
+                guard->showStatus(error, true);
+                return;
+            }
             if (!QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
                 guard->showStatus(QStringLiteral("已下载到 %1，无法自动打开").arg(path));
-            else guard->showStatus({});
+            else
+                guard->showStatus({});
         });
     });
     runtime_->historyTimeout.setSingleShot(true);
@@ -321,40 +407,30 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent) : QWidget(parent), runtime_(
             showStatus(QStringLiteral("会话读取超时，可重新进入会话重试"), true);
         }
     });
-    runtime_->commandTimeout.setSingleShot(true);
-    runtime_->commandTimeout.setInterval(30'000);
-    connect(&runtime_->commandTimeout, &QTimer::timeout, this, [this] {
-        if (!runtime_->pendingCommand) return;
-        runtime_->pendingCommand = false;
-        runtime_->lastCommandRejected = false;
-        runtime_->awaitingResponse = false;
-        removeOptimisticMessage(runtime_->pendingOptimisticId);
-        runtime_->pendingOptimisticId.clear();
-        runtime_->pendingAction.clear();
-        updateThinking();
-        if (runtime_->editor->toPlainText().isEmpty() && !runtime_->pendingDraft.isEmpty())
-            runtime_->editor->setPlainText(runtime_->pendingDraft);
-        runtime_->pendingDraft.clear();
-        if (!runtime_->pendingAttachmentPaths.isEmpty()) {
-            runtime_->attachments = runtime_->pendingAttachmentPaths;
-            runtime_->attachmentsLabel->setText(attachmentSummary(runtime_->attachments));
-            runtime_->attachmentsLabel->setVisible(true);
-            runtime_->clearAttachments->setVisible(true);
-        }
-        runtime_->pendingAttachmentPaths.clear();
-        showStatus(QStringLiteral("是否执行成功尚未确定，请先查看所属设备的会话记录，不要直接重复发送"), true);
-        updateControls();
-    });
     updateControls();
 }
 
-RemoteAgentPanel::~RemoteAgentPanel() = default;
+RemoteAgentPanel::~RemoteAgentPanel() {
+    if (!runtime_->session.isEmpty()) {
+        runtime_->drafts.insert(sessionKey(runtime_->session), runtime_->editor->toPlainText());
+        runtime_->attachmentDrafts.insert(sessionKey(runtime_->session), runtime_->attachments);
+    }
+    persistOutbox();
+}
 
-void RemoteAgentPanel::setCommandHandler(CommandHandler handler) { runtime_->command = std::move(handler); }
-void RemoteAgentPanel::setHistoryHandler(HistoryHandler handler) { runtime_->history = std::move(handler); }
-void RemoteAgentPanel::setDownloadHandler(DownloadHandler handler) { runtime_->download = std::move(handler); }
+void RemoteAgentPanel::setCommandHandler(CommandHandler handler) {
+    runtime_->command = std::move(handler);
+}
+void RemoteAgentPanel::setHistoryHandler(HistoryHandler handler) {
+    runtime_->history = std::move(handler);
+}
+void RemoteAgentPanel::setDownloadHandler(DownloadHandler handler) {
+    runtime_->download = std::move(handler);
+}
 
-QJsonObject RemoteAgentPanel::session() const { return runtime_->session; }
+QJsonObject RemoteAgentPanel::session() const {
+    return runtime_->session;
+}
 
 void RemoteAgentPanel::openSession(const QJsonObject& remote) {
     const QString previous = sessionKey(runtime_->session);
@@ -365,11 +441,11 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
         runtime_->historyTimeout.stop();
         if (!previous.isEmpty()) {
             runtime_->drafts.insert(previous, runtime_->editor->toPlainText());
-            runtime_->attachmentDrafts.insert(previous,
-                runtime_->attachments.isEmpty() && !runtime_->pendingAttachmentPaths.isEmpty()
-                    ? runtime_->pendingAttachmentPaths : runtime_->attachments);
+            runtime_->attachmentDrafts.insert(previous, runtime_->attachments);
         }
+        runtime_->restoringDraft = true;
         runtime_->editor->setPlainText(runtime_->drafts.value(next));
+        runtime_->restoringDraft = false;
         runtime_->attachments = runtime_->attachmentDrafts.value(next);
         runtime_->attachmentsLabel->setText(attachmentSummary(runtime_->attachments));
         runtime_->attachmentsLabel->setToolTip(runtime_->attachments.join(QLatin1Char('\n')));
@@ -378,36 +454,32 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
         runtime_->messages.clear();
         runtime_->rendered.clear();
         runtime_->optimisticMessages.clear();
-        runtime_->pendingOptimisticId.clear();
         runtime_->view->clear();
         runtime_->thinking = nullptr;
         runtime_->oldest.clear();
         runtime_->older->hide();
         runtime_->pendingCommand = false;
-        runtime_->lastCommandRejected = false;
-        runtime_->pendingDraft.clear();
-        runtime_->pendingAttachmentPaths.clear();
         runtime_->awaitingResponse = false;
         runtime_->observedBusy = false;
-        runtime_->pendingAction.clear();
-        runtime_->commandTimeout.stop();
     }
     runtime_->session = remote;
+    runtime_->owners.insert(next, remote);
+    dispatchQueued();
     updateControls();
     if (previous == next && !runtime_->messages.isEmpty()) return;
-    showStatus(remote.value(QStringLiteral("online")).toBool()
-                   ? QStringLiteral("正在读取所属设备的会话…")
-                   : QStringLiteral("所属设备离线；输入保留为草稿"));
+    showStatus(remote.value(QStringLiteral("online")).toBool() ? QStringLiteral("正在读取所属设备的会话…")
+                                                               : QStringLiteral("所属设备离线；输入保留为草稿"));
     requestHistory({}, 10);
 }
 
 void RemoteAgentPanel::updateSession(const QJsonObject& remote) {
+    runtime_->owners.insert(sessionKey(remote), remote);
     if (sessionKey(remote) != sessionKey(runtime_->session)) return;
     const bool wasOnline = runtime_->session.value(QStringLiteral("online")).toBool();
     runtime_->session = remote;
+    runtime_->owners.insert(sessionKey(remote), remote);
     updateControls();
-    if (remote.value(QStringLiteral("busy")).toBool() && runtime_->awaitingResponse)
-        runtime_->observedBusy = true;
+    if (remote.value(QStringLiteral("busy")).toBool() && runtime_->awaitingResponse) runtime_->observedBusy = true;
     if (!remote.value(QStringLiteral("busy")).toBool() && runtime_->observedBusy) {
         runtime_->awaitingResponse = false;
         runtime_->observedBusy = false;
@@ -429,8 +501,8 @@ void RemoteAgentPanel::refreshHistory() {
 }
 
 void RemoteAgentPanel::requestHistory(const QString& before, int limit) {
-    if (!runtime_->history || runtime_->historyInFlight ||
-        !runtime_->session.value(QStringLiteral("online")).toBool()) return;
+    if (!runtime_->history || runtime_->historyInFlight || !runtime_->session.value(QStringLiteral("online")).toBool())
+        return;
     runtime_->historyInFlight = true;
     runtime_->older->setEnabled(false);
     runtime_->historyTimeout.start();
@@ -439,8 +511,9 @@ void RemoteAgentPanel::requestHistory(const QString& before, int limit) {
     QPointer<RemoteAgentPanel> guard(this);
     runtime_->history(current, before, limit, [guard, current, generation](const QString& error) {
         if (!guard || generation != guard->runtime_->historyGeneration ||
-            sessionKey(current) != sessionKey(guard->runtime_->session) ||
-            error.isEmpty() || !guard->runtime_->historyInFlight) return;
+            sessionKey(current) != sessionKey(guard->runtime_->session) || error.isEmpty() ||
+            !guard->runtime_->historyInFlight)
+            return;
         guard->runtime_->historyInFlight = false;
         guard->runtime_->historyTimeout.stop();
         guard->runtime_->older->setEnabled(true);
@@ -448,65 +521,297 @@ void RemoteAgentPanel::requestHistory(const QString& before, int limit) {
     });
 }
 
-void RemoteAgentPanel::sendAction(const QJsonObject& action, bool clearDraft) {
-    if (!runtime_->command || runtime_->pendingCommand) return;
-    const QJsonObject current = runtime_->session;
-    runtime_->pendingCommand = true;
-    runtime_->commandTimeout.setInterval(
-        action.value(QStringLiteral("local_files")).toArray().isEmpty() ?
-            30'000 : 2 * 60 * 60 * 1000);
-    runtime_->lastCommandRejected = false;
-    runtime_->pendingAction = action.value(QStringLiteral("action")).toString();
-    runtime_->commandSentAt = QDateTime::currentMSecsSinceEpoch();
-    if (runtime_->pendingAction != QStringLiteral("prompt")) runtime_->awaitingResponse = false;
-    runtime_->pendingDraft = clearDraft ? runtime_->editor->toPlainText() : QString();
-    runtime_->pendingAttachmentPaths = clearDraft ? runtime_->attachments : QStringList();
-    QString optimisticId;
-    if (clearDraft && runtime_->pendingAction == QStringLiteral("prompt")) {
-        optimisticId = QStringLiteral("msg_z_pending_%1").arg(
-            QUuid::createUuid().toString(QUuid::WithoutBraces));
-        QString text = action.value(QStringLiteral("text")).toString();
-        if (text.isEmpty()) text = QStringLiteral("已发送%1个附件").arg(runtime_->attachments.size());
-        runtime_->optimisticMessages.insert(optimisticId);
-        runtime_->pendingOptimisticId = optimisticId;
-        runtime_->messages.insert(optimisticId,
-            {{QStringLiteral("id"), optimisticId},
-             {QStringLiteral("role"), QStringLiteral("user")},
-             {QStringLiteral("created"), double(runtime_->commandSentAt)},
-             {QStringLiteral("parts"), QJsonArray{QJsonObject{
-                 {QStringLiteral("kind"), QStringLiteral("text")},
-                 {QStringLiteral("text"), text}}}}});
-        runtime_->editor->clear();
-        renderMessages();
+bool RemoteAgentPanel::persistOutbox() {
+    if (!runtime_->storageUsable) return false;
+    QJsonObject drafts;
+    for (auto it = runtime_->drafts.begin(); it != runtime_->drafts.end(); ++it) {
+        QJsonArray files;
+        for (const QString& path : runtime_->attachmentDrafts.value(it.key())) files.append(path);
+        drafts.insert(it.key(), QJsonObject{{QStringLiteral("text"), it.value()},
+                                            {QStringLiteral("files"), files},
+                                            {QStringLiteral("copied_unknown_request"),
+                                             runtime_->copiedUnknownRequests.value(it.key())}});
     }
+    const QByteArray data =
+        QJsonDocument(QJsonObject{{QStringLiteral("outbox"), runtime_->outbox}, {QStringLiteral("drafts"), drafts}})
+            .toJson(QJsonDocument::Compact);
+    if (data.size() > 4 * 1024 * 1024 || !QDir().mkpath(QFileInfo(runtime_->outboxFile).absolutePath())) return false;
+    QSaveFile file(runtime_->outboxFile);
+    if (!file.open(QIODevice::WriteOnly)) return false;
+    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    return file.write(data) == data.size() && file.commit();
+}
+
+void RemoteAgentPanel::refreshAttachments() {
+    runtime_->attachmentsLabel->setText(attachmentSummary(runtime_->attachments));
+    runtime_->attachmentsLabel->setToolTip(runtime_->attachments.join(QLatin1Char('\n')));
+    runtime_->attachmentsLabel->setVisible(!runtime_->attachments.isEmpty());
+    runtime_->clearAttachments->setVisible(!runtime_->attachments.isEmpty());
+}
+
+void RemoteAgentPanel::sendAction(const QJsonObject& requested, bool clearDraft) {
+    if (!runtime_->command) return;
+    const QJsonObject owner = runtime_->session;
+    if (!owner.value(QStringLiteral("online")).toBool()) return;
+    QJsonObject action = requested;
+    const QString requestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    action.insert(QStringLiteral("requestId"), requestId);
+    if (!clearDraft) {
+        runtime_->controlRequests.insert(requestId, sessionKey(owner));
+        QPointer<RemoteAgentPanel> guard(this);
+        runtime_->command(owner, action, [guard, owner, requestId](const QString& error) {
+            if (!guard || error.isEmpty()) return;
+            guard->runtime_->controlRequests.remove(requestId);
+            if (sessionKey(owner) == sessionKey(guard->runtime_->session)) guard->showStatus(error, true);
+        });
+        return;
+    }
+    if (runtime_->outbox.size() >= 128) {
+        showStatus(QStringLiteral("\u5f85\u53d1\u6d88\u606f\u8fc7\u591a\uff0c\u8bf7\u5148\u53d6\u56de\u672a\u786e\u8ba4"
+                                  "\u7684\u8349\u7a3f"),
+                   true);
+        return;
+    }
+    const QString key = sessionKey(owner);
+    const QJsonArray old = runtime_->outbox;
+    const QString oldDraft = runtime_->drafts.value(key);
+    const QStringList oldFiles = runtime_->attachmentDrafts.value(key);
+    QJsonObject entry{{QStringLiteral("owner"), owner},
+                      {QStringLiteral("action"), action},
+                      {QStringLiteral("requestId"), requestId},
+                      {QStringLiteral("draft"), runtime_->editor->toPlainText()},
+                      {QStringLiteral("state"), QStringLiteral("queued")}};
+    runtime_->outbox.append(entry);
+    runtime_->drafts.insert(key, {});
+    runtime_->attachmentDrafts.insert(key, {});
+    // Durable capture precedes clearing any live draft. A storage error leaves
+    // the editor and attachments intact and sends nothing.
+    if (!persistOutbox()) {
+        runtime_->outbox = old;
+        runtime_->drafts.insert(key, oldDraft);
+        runtime_->attachmentDrafts.insert(key, oldFiles);
+        showStatus(
+            QStringLiteral("\u65e0\u6cd5\u4fdd\u5b58\u5f85\u53d1\u6d88\u606f\uff0c\u8349\u7a3f\u5df2\u4fdd\u7559"),
+            true);
+        return;
+    }
+    const QString optimisticId = QStringLiteral("msg_z_pending_%1").arg(requestId);
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    QString text = action.value(QStringLiteral("text")).toString();
+    if (text.isEmpty()) text = QStringLiteral("\u5df2\u53d1\u9001\u9644\u4ef6");
+    runtime_->optimisticMessages.insert(optimisticId);
+    runtime_->messages.insert(
+        optimisticId,
+        {{QStringLiteral("id"), optimisticId},
+         {QStringLiteral("role"), QStringLiteral("user")},
+         {QStringLiteral("created"), double(now)},
+         {QStringLiteral("parts"),
+          QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")}, {QStringLiteral("text"), text}}}}});
+    runtime_->editor->clear();
+    runtime_->attachments.clear();
+    refreshAttachments();
+    renderMessages();
+    dispatchQueued();
     updateControls();
-    runtime_->command(current, action, [this, current, clearDraft, optimisticId](const QString& error) {
-        if (sessionKey(current) != sessionKey(runtime_->session)) return;
-        if (!error.isEmpty()) {
-            runtime_->pendingCommand = false;
-            runtime_->pendingAttachmentPaths.clear();
-            removeOptimisticMessage(optimisticId);
-            if (clearDraft && runtime_->editor->toPlainText().isEmpty())
-                runtime_->editor->setPlainText(runtime_->pendingDraft);
-            runtime_->pendingDraft.clear();
-            runtime_->pendingOptimisticId.clear();
-            runtime_->pendingAction.clear();
-            runtime_->awaitingResponse = false;
-            updateThinking();
-            showStatus(error, true);
-            updateControls();
+}
+
+void RemoteAgentPanel::dispatchQueued(const QString& requestedOwner) {
+    if (!runtime_->command) return;
+    const QString ownerKey = requestedOwner.isEmpty() ? sessionKey(runtime_->session) : requestedOwner;
+    const bool visible = ownerKey == sessionKey(runtime_->session);
+    for (int i = 0; i < runtime_->outbox.size(); ++i) {
+        QJsonObject entry = runtime_->outbox[i].toObject();
+        if (sessionKey(entry.value(QStringLiteral("owner")).toObject()) != ownerKey) continue;
+        if (entry.value(QStringLiteral("state")) != QStringLiteral("queued")) return;
+        const QJsonObject current = runtime_->owners.value(ownerKey);
+        if (!current.value(QStringLiteral("online")).toBool()) return;
+        const QJsonObject action = entry.value(QStringLiteral("action")).toObject();
+        const QString turn = action.value(QStringLiteral("turnId")).toString();
+        if (action.value(QStringLiteral("action")) == QStringLiteral("steer") && turn.isEmpty()) return;
+        if ((!turn.isEmpty() && turn != current.value(QStringLiteral("turnId")).toString()) ||
+            (turn.isEmpty() && current.value(QStringLiteral("busy")).toBool())) {
+            entry.insert(QStringLiteral("state"), QStringLiteral("held"));
+            runtime_->outbox[i] = entry;
+            persistOutbox();
+            if (visible) {
+                showStatus(QStringLiteral("原任务已变化，待发草稿已保留"), true);
+                updateControls();
+            }
             return;
         }
-        if (!runtime_->pendingCommand) return;
-        if (clearDraft && !runtime_->lastCommandRejected) {
-            runtime_->editor->clear();
-            runtime_->attachments.clear();
-            runtime_->attachmentsLabel->hide();
-            runtime_->clearAttachments->hide();
+        entry.insert(QStringLiteral("state"), QStringLiteral("sending"));
+        runtime_->outbox[i] = entry;
+        if (!persistOutbox()) {
+            entry.insert(QStringLiteral("state"), QStringLiteral("queued"));
+            runtime_->outbox[i] = entry;
+            if (visible) showStatus(QStringLiteral("无法保存发送状态，草稿已保留"), true);
+            return;
         }
-        showStatus(QStringLiteral("已送达所属设备，等待确认执行"));
-        runtime_->commandTimeout.start();
-    });
+        const QString requestId = entry.value(QStringLiteral("requestId")).toString();
+        if (visible) {
+            runtime_->pendingCommand = true;
+            runtime_->commandSentAt = QDateTime::currentMSecsSinceEpoch();
+        }
+        QPointer<RemoteAgentPanel> guard(this);
+        runtime_->command(current, action, [guard, requestId, current](const QString& error) {
+            if (!guard) return;
+            if (!error.isEmpty()) {
+                guard->finishQueued(requestId, {{QStringLiteral("error"), error}}, true);
+                return;
+            }
+            bool stillPending = false;
+            for (const QJsonValue& value : guard->runtime_->outbox)
+                stillPending |= value.toObject().value(QStringLiteral("requestId")) == requestId &&
+                                value.toObject().value(QStringLiteral("state")) == QStringLiteral("sending");
+            if (stillPending && sessionKey(current) == sessionKey(guard->runtime_->session))
+                guard->showStatus(QStringLiteral(
+                    "\u5df2\u9001\u8fbe\u6240\u5c5e\u8bbe\u5907\uff0c\u7b49\u5f85\u786e\u8ba4\u6267\u884c"));
+        });
+        const int timeout =
+            action.value(QStringLiteral("local_files")).toArray().isEmpty() ? 30000 : 2 * 60 * 60 * 1000;
+        QTimer::singleShot(timeout, this, [guard, requestId] {
+            if (guard)
+                guard->finishQueued(
+                    requestId,
+                    {{QStringLiteral("error"),
+                      QStringLiteral(
+                          "\u6267\u884c\u72b6\u6001\u672a\u786e\u8ba4\uff0c\u8bf7\u5148\u67e5\u770b\u6240\u5c5e\u8bbe"
+                          "\u5907\u4f1a\u8bdd\uff1b\u5f85\u53d1\u8349\u7a3f\u5df2\u4fdd\u7559")}},
+                    true);
+        });
+        return;
+    }
+}
+
+void RemoteAgentPanel::finishQueued(const QString& requestId, const QJsonObject& result, bool unknown) {
+    for (int i = 0; i < runtime_->outbox.size(); ++i) {
+        QJsonObject entry = runtime_->outbox[i].toObject();
+        if (entry.value(QStringLiteral("requestId")) != requestId) continue;
+        if (unknown && entry.value(QStringLiteral("state")) != QStringLiteral("sending")) return;
+        const QString key = sessionKey(entry.value(QStringLiteral("owner")).toObject());
+        const bool visible = key == sessionKey(runtime_->session);
+        unknown |= result.value(QStringLiteral("unknown")).toBool() ||
+                   result.value(QStringLiteral("delivery_unknown")).toBool();
+        if (!result.value(QStringLiteral("ok")).isBool()) unknown = true;
+        if (!unknown && result.value(QStringLiteral("ok")).toBool() &&
+            result.value(QStringLiteral("user_message_id")).toString().isEmpty())
+            unknown = true;
+        const bool accepted = !unknown && result.value(QStringLiteral("ok")).toBool();
+        const QString optimisticId = QStringLiteral("msg_z_pending_%1").arg(requestId);
+        if (accepted) {
+            const QString acceptedTurn = result.value(QStringLiteral("turnId")).toString();
+            for (int j = i + 1; j < runtime_->outbox.size(); ++j) {
+                QJsonObject tail = runtime_->outbox[j].toObject();
+                QJsonObject action = tail.value(QStringLiteral("action")).toObject();
+                if (sessionKey(tail.value(QStringLiteral("owner")).toObject()) == key &&
+                    action.value(QStringLiteral("afterRequest")) == requestId) {
+                    action.remove(QStringLiteral("afterRequest"));
+                    action.insert(QStringLiteral("turnId"), acceptedTurn);
+                    tail.insert(QStringLiteral("action"), action);
+                    if (acceptedTurn.isEmpty()) tail.insert(QStringLiteral("state"), QStringLiteral("held"));
+                    runtime_->outbox[j] = tail;
+                }
+            }
+            if (!acceptedTurn.isEmpty() &&
+                entry.value(QStringLiteral("action")).toObject().value(QStringLiteral("action")) ==
+                    QStringLiteral("prompt") &&
+                runtime_->owners.value(key).value(QStringLiteral("turnId")).toString().isEmpty()) {
+                QJsonObject owner = runtime_->owners.value(key);
+                owner.insert(QStringLiteral("turnId"), acceptedTurn);
+                owner.insert(QStringLiteral("busy"), true);
+                runtime_->owners.insert(key, owner);
+                if (visible) runtime_->session = owner;
+            }
+            runtime_->outbox.removeAt(i);
+            if (visible) {
+                const QString canonical = result.value(QStringLiteral("user_message_id")).toString();
+                QJsonObject message = runtime_->messages.value(optimisticId);
+                if (!canonical.isEmpty()) {
+                    removeOptimisticMessage(optimisticId);
+                    if (!runtime_->messages.contains(canonical)) {
+                        message.insert(QStringLiteral("id"), canonical);
+                        runtime_->messages.insert(canonical, message);
+                    }
+                }
+                runtime_->awaitingResponse = true;
+                runtime_->observedBusy = false;
+                renderMessages();
+            }
+        } else {
+            entry.insert(QStringLiteral("state"), unknown ? QStringLiteral("unknown") : QStringLiteral("rejected"));
+            runtime_->outbox[i] = entry;
+            // A failed head freezes its owner's tail. Stop/finishing or uncertain
+            // delivery must never turn a supplement into a later new task.
+            for (int j = i + 1; j < runtime_->outbox.size(); ++j) {
+                QJsonObject tail = runtime_->outbox[j].toObject();
+                if (sessionKey(tail.value(QStringLiteral("owner")).toObject()) == key &&
+                    tail.value(QStringLiteral("state")) == QStringLiteral("queued")) {
+                    tail.insert(QStringLiteral("state"), QStringLiteral("held"));
+                    runtime_->outbox[j] = tail;
+                }
+            }
+            if (visible) {
+                removeOptimisticMessage(optimisticId);
+                showStatus(result.value(QStringLiteral("error"))
+                               .toString(unknown ? QStringLiteral("接收结果未确认，原请求和草稿已保留")
+                                                 : QStringLiteral("所属设备未受理，草稿已保留")),
+                           true);
+            }
+        }
+        persistOutbox();
+        if (visible) {
+            runtime_->pendingCommand = false;
+            if (!accepted && !unknown && runtime_->editor->toPlainText().isEmpty() && runtime_->attachments.isEmpty())
+                recoverQueuedDraft();
+            updateThinking();
+            updateControls();
+            if (accepted) showStatus({});
+        }
+        if (accepted) dispatchQueued(key);
+        return;
+    }
+}
+
+void RemoteAgentPanel::recoverQueuedDraft() {
+    if (!runtime_->editor->toPlainText().isEmpty() || !runtime_->attachments.isEmpty()) {
+        showStatus(QStringLiteral("\u8bf7\u5148\u4fdd\u5b58\u6216\u53d1\u9001\u5f53\u524d\u8349\u7a3f\uff0c\u518d\u53d6"
+                                  "\u56de\u5f85\u53d1\u7a3f"),
+                   true);
+        return;
+    }
+    const QString key = sessionKey(runtime_->session);
+    for (int i = 0; i < runtime_->outbox.size(); ++i) {
+        const QJsonObject entry = runtime_->outbox[i].toObject();
+        if (sessionKey(entry.value(QStringLiteral("owner")).toObject()) != key) continue;
+        if (entry.value(QStringLiteral("state")) == QStringLiteral("sending") ||
+            entry.value(QStringLiteral("state")) == QStringLiteral("queued"))
+            return;
+        const QJsonArray before = runtime_->outbox;
+        runtime_->drafts.insert(key, entry.value(QStringLiteral("draft")).toString());
+        QStringList paths;
+        for (const QJsonValue& path :
+             entry.value(QStringLiteral("action")).toObject().value(QStringLiteral("local_files")).toArray())
+            paths.append(path.toString());
+        runtime_->attachmentDrafts.insert(key, paths);
+        // Unknown delivery retains its original request and blocks this owner's
+        // FIFO even after copying text. A copied draft is not proof of rejection
+        // and must not permit a new-ID retry of a possibly accepted operation.
+        const bool unknown = entry.value(QStringLiteral("state")) == QStringLiteral("unknown");
+        if (unknown) runtime_->copiedUnknownRequests.insert(key, entry.value(QStringLiteral("requestId")).toString());
+        if (!unknown) runtime_->outbox.removeAt(i);
+        if (!persistOutbox()) {
+            runtime_->outbox = before;
+            return;
+        }
+        runtime_->editor->setPlainText(runtime_->drafts.value(key));
+        runtime_->attachments = paths;
+        refreshAttachments();
+        if (unknown) showStatus(QStringLiteral("发送结果未确认，请先核对所属设备；原请求仍已保留。"), true);
+        removeOptimisticMessage(
+            QStringLiteral("msg_z_pending_%1").arg(entry.value(QStringLiteral("requestId")).toString()));
+        updateControls();
+        return;
+    }
 }
 
 void RemoteAgentPanel::removeOptimisticMessage(const QString& id) {
@@ -518,67 +823,69 @@ void RemoteAgentPanel::removeOptimisticMessage(const QString& id) {
 }
 
 void RemoteAgentPanel::sendOrStop() {
-    if (runtime_->session.value(QStringLiteral("busy")).toBool()) {
-        sendAction({{QStringLiteral("action"), QStringLiteral("stop")}}, false);
+    if (runtime_->copiedUnknownRequests.contains(sessionKey(runtime_->session))) {
+        showStatus(QStringLiteral("这份取回稿可能已经发送，请先核对所属设备，再清空并编写新消息。"), true);
         return;
     }
     const QString text = runtime_->editor->toPlainText().trimmed();
     if ((text.isEmpty() && runtime_->attachments.isEmpty()) || text.toUtf8().size() > 16 * 1024) return;
+    const bool busy = runtime_->session.value(QStringLiteral("busy")).toBool();
+    const QString turn = runtime_->session.value(QStringLiteral("turnId")).toString();
+    if (busy && turn.isEmpty()) {
+        showStatus(
+            QStringLiteral("\u6b63\u5728\u540c\u6b65\u5f53\u524d\u4efb\u52a1\uff0c\u8349\u7a3f\u5df2\u4fdd\u7559"),
+            true);
+        return;
+    }
     QJsonArray localFiles;
     for (const QString& path : runtime_->attachments) localFiles.append(path);
-    sendAction({{QStringLiteral("action"), QStringLiteral("prompt")},
-                {QStringLiteral("text"), text},
-                {QStringLiteral("local_files"), localFiles}}, true);
+    QJsonObject action{{QStringLiteral("action"), busy ? QStringLiteral("steer") : QStringLiteral("prompt")},
+                       {QStringLiteral("text"), text},
+                       {QStringLiteral("local_files"), localFiles}};
+    if (busy)
+        action.insert(QStringLiteral("turnId"), turn);
+    else {
+        // A second Enter may precede the first prompt's owner presence update.
+        // Bind to that exact pending request, then resolve its acknowledged turn;
+        // never dispatch a stale idle capture as a new task after the first one.
+        for (int i = runtime_->outbox.size() - 1; i >= 0; --i) {
+            const QJsonObject entry = runtime_->outbox[i].toObject();
+            if (sessionKey(entry.value(QStringLiteral("owner")).toObject()) != sessionKey(runtime_->session)) continue;
+            const QJsonObject previous = entry.value(QStringLiteral("action")).toObject();
+            action.insert(QStringLiteral("action"), QStringLiteral("steer"));
+            const QString bound = previous.value(QStringLiteral("turnId")).toString();
+            if (!bound.isEmpty())
+                action.insert(QStringLiteral("turnId"), bound);
+            else
+                action.insert(QStringLiteral("afterRequest"),
+                              previous.value(QStringLiteral("afterRequest"))
+                                  .toString(entry.value(QStringLiteral("requestId")).toString()));
+            break;
+        }
+    }
+    sendAction(action, true);
 }
 
 void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& kind, const QJsonObject& payload) {
-    if (sessionKey(remote) != sessionKey(runtime_->session)) return;
     if (kind == QStringLiteral("event") &&
         payload.value(QStringLiteral("type")).toString() == QStringLiteral("command_result")) {
-        runtime_->pendingCommand = false;
-        runtime_->commandTimeout.stop();
-        const QJsonObject result = payload.value(QStringLiteral("result")).toObject();
-        runtime_->lastCommandRejected = !result.value(QStringLiteral("ok")).toBool();
-        runtime_->awaitingResponse = !runtime_->lastCommandRejected &&
-            runtime_->pendingAction == QStringLiteral("prompt");
-        runtime_->observedBusy = false;
-        runtime_->pendingAction.clear();
-        if (runtime_->lastCommandRejected) {
-            removeOptimisticMessage(runtime_->pendingOptimisticId);
-            if (!runtime_->pendingAttachmentPaths.isEmpty()) {
-                runtime_->attachments = runtime_->pendingAttachmentPaths;
-                runtime_->attachmentsLabel->setText(attachmentSummary(runtime_->attachments));
-                runtime_->attachmentsLabel->setVisible(true);
-                runtime_->clearAttachments->setVisible(true);
-            }
-        } else if (runtime_->optimisticMessages.contains(runtime_->pendingOptimisticId)) {
-            const QString canonicalId = result.value(QStringLiteral("user_message_id")).toString();
-            if (!canonicalId.isEmpty()) {
-                QJsonObject message = runtime_->messages.value(runtime_->pendingOptimisticId);
-                removeOptimisticMessage(runtime_->pendingOptimisticId);
-                if (!runtime_->messages.contains(canonicalId)) {
-                    message.insert(QStringLiteral("id"), canonicalId);
-                    runtime_->messages.insert(canonicalId, message);
-                }
-                renderMessages();
+        QString id = payload.value(QStringLiteral("command_id")).toString();
+        if (runtime_->controlRequests.value(id) == sessionKey(remote)) {
+            runtime_->controlRequests.remove(id);
+            return;
+        }
+        if (id.isEmpty()) return;
+        for (const QJsonValue& value : runtime_->outbox) {
+            const QJsonObject entry = value.toObject();
+            if (entry.value(QStringLiteral("requestId")) == id &&
+                sessionKey(entry.value(QStringLiteral("owner")).toObject()) == sessionKey(remote)) {
+                finishQueued(id, payload.value(QStringLiteral("result")).toObject());
+                return;
             }
         }
-        runtime_->pendingOptimisticId.clear();
-        if (!runtime_->lastCommandRejected && !runtime_->pendingDraft.isEmpty() &&
-            runtime_->editor->toPlainText() == runtime_->pendingDraft)
-            runtime_->editor->clear();
-        if (runtime_->lastCommandRejected && runtime_->editor->toPlainText().isEmpty() &&
-            !runtime_->pendingDraft.isEmpty())
-            runtime_->editor->setPlainText(runtime_->pendingDraft);
-        runtime_->pendingDraft.clear();
-        runtime_->pendingAttachmentPaths.clear();
-        showStatus(runtime_->lastCommandRejected ?
-                       result.value(QStringLiteral("error")).toString() : QString(),
-                   runtime_->lastCommandRejected);
-        updateThinking();
-        updateControls();
         return;
     }
+    if (sessionKey(remote) != sessionKey(runtime_->session)) return;
     if (kind == QStringLiteral("history_page")) {
         runtime_->historyInFlight = false;
         runtime_->historyTimeout.stop();
@@ -586,8 +893,8 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
     }
     if (!payload.value(QStringLiteral("ok")).toBool()) {
         if (kind == QStringLiteral("history_page"))
-            showStatus(payload.value(QStringLiteral("error")).toString(
-                           QStringLiteral("所属设备无法读取这段会话")), true);
+            showStatus(payload.value(QStringLiteral("error")).toString(QStringLiteral("所属设备无法读取这段会话")),
+                       true);
         return;
     }
     const QJsonArray received = payload.value(QStringLiteral("messages")).toArray();
@@ -597,8 +904,7 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
         if (!id.isEmpty()) runtime_->messages.insert(id, message);
         if (runtime_->awaitingResponse &&
             message.value(QStringLiteral("role")).toString() == QStringLiteral("assistant") &&
-            message.value(QStringLiteral("created")).toVariant().toLongLong() >=
-                runtime_->commandSentAt - 1000 &&
+            message.value(QStringLiteral("created")).toVariant().toLongLong() >= runtime_->commandSentAt - 1000 &&
             (!message.value(QStringLiteral("active")).toBool() || !messageText(message).isEmpty()))
             runtime_->awaitingResponse = false;
     }
@@ -618,8 +924,7 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
 void RemoteAgentPanel::renderMessages() {
     const QStringList ids = runtime_->messages.keys();
     const bool followedLatest = runtime_->view->isAtBottom();
-    bool prepend = !runtime_->rendered.isEmpty() && !ids.isEmpty() &&
-                   ids.first() < runtime_->rendered.firstKey();
+    bool prepend = !runtime_->rendered.isEmpty() && !ids.isEmpty() && ids.first() < runtime_->rendered.firstKey();
     if (!prepend && !runtime_->rendered.isEmpty()) {
         const QString lastRendered = runtime_->rendered.lastKey();
         for (const QString& id : ids)
@@ -651,8 +956,8 @@ void RemoteAgentPanel::renderMessages() {
         const QString content = messageText(message);
         if (content.isEmpty() || runtime_->rendered.value(id) == content) continue;
         const MarkdownView::Style style = message.value(QStringLiteral("role")).toString() == QStringLiteral("user")
-                                               ? MarkdownView::Style::Bubble
-                                               : MarkdownView::Style::Document;
+                                              ? MarkdownView::Style::Bubble
+                                              : MarkdownView::Style::Document;
         runtime_->view->addItem(id, style, content);
         runtime_->rendered.insert(id, content);
     }
@@ -664,10 +969,11 @@ void RemoteAgentPanel::renderMessages() {
 void RemoteAgentPanel::updateThinking() {
     const QJsonObject last = runtime_->messages.isEmpty() ? QJsonObject{} : runtime_->messages.last();
     const bool assistantActive = last.value(QStringLiteral("role")).toString() == QStringLiteral("assistant") &&
-        last.value(QStringLiteral("active")).toBool();
+                                 last.value(QStringLiteral("active")).toBool();
     const bool visibleAnswer = assistantActive && !messageText(last).trimmed().isEmpty();
-    const bool show = (runtime_->awaitingResponse || runtime_->session.value(QStringLiteral("busy")).toBool() ||
-                       assistantActive) && !visibleAnswer;
+    const bool show =
+        (runtime_->awaitingResponse || runtime_->session.value(QStringLiteral("busy")).toBool() || assistantActive) &&
+        !visibleAnswer;
     if (show && !runtime_->thinking) {
         const bool followedLatest = runtime_->view->isAtBottom();
         runtime_->thinking = new QLabel(QStringLiteral("正在思考…"));
@@ -694,14 +1000,17 @@ void RemoteAgentPanel::renderRequests(const QJsonObject& payload) {
         if (id.isEmpty()) continue;
         auto* row = new QWidget(runtime_->requests);
         auto* line = new QHBoxLayout(row);
-        line->addWidget(new QLabel(QStringLiteral("请求批准 · %1")
-                                       .arg(permission.value(QStringLiteral("tool")).toString()), row), 1);
+        line->addWidget(
+            new QLabel(QStringLiteral("请求批准 · %1").arg(permission.value(QStringLiteral("tool")).toString()), row),
+            1);
         const auto addDecision = [&](const QString& title, const QString& decision) {
             auto* button = new QPushButton(title, row);
             line->addWidget(button);
             connect(button, &QPushButton::clicked, this, [this, id, decision] {
                 sendAction({{QStringLiteral("action"), QStringLiteral("permission")},
-                            {QStringLiteral("id"), id}, {QStringLiteral("decision"), decision}}, false);
+                            {QStringLiteral("id"), id},
+                            {QStringLiteral("decision"), decision}},
+                           false);
             });
         };
         addDecision(QStringLiteral("允许一次"), QStringLiteral("approved"));
@@ -726,7 +1035,8 @@ void RemoteAgentPanel::renderRequests(const QJsonObject& payload) {
             if (answer->text().trimmed().isEmpty()) return;
             sendAction({{QStringLiteral("action"), QStringLiteral("answer")},
                         {QStringLiteral("id"), id},
-                        {QStringLiteral("text"), answer->text().trimmed()}}, false);
+                        {QStringLiteral("text"), answer->text().trimmed()}},
+                       false);
         });
         runtime_->requestsLayout->addWidget(row);
     }
@@ -737,22 +1047,28 @@ void RemoteAgentPanel::updateControls() {
     const bool online = runtime_->session.value(QStringLiteral("online")).toBool();
     const bool busy = runtime_->session.value(QStringLiteral("busy")).toBool();
     runtime_->send->setText({});
-    runtime_->send->setIcon(actionIcon(busy, busy ? QColor(QStringLiteral("#c24131")) :
-                                                QColor(Qt::white)));
-    runtime_->send->setToolTip(busy ? QStringLiteral("停止所属设备任务") :
-                                     QStringLiteral("发送到所属设备"));
+    runtime_->send->setIcon(actionIcon(false, QColor(Qt::white)));
+    runtime_->send->setToolTip(QStringLiteral("\u53d1\u9001\u5230\u6240\u5c5e\u8bbe\u5907"));
     runtime_->send->setAccessibleName(runtime_->send->toolTip());
     runtime_->send->setStyleSheet(UiZoom::scaleQss(
-        busy ? QStringLiteral("QPushButton#remoteAgentSendButton{background:#fff5f3;"
-                              "border:1px solid #f0c3bd;border-radius:18px;padding:0;}"
-                              "QPushButton#remoteAgentSendButton:hover{background:#fee4e2;}")
-             : QStringLiteral("QPushButton#remoteAgentSendButton{background:#0b67b7;"
-                              "border:none;border-radius:18px;padding:0;}"
-                              "QPushButton#remoteAgentSendButton:hover{background:#095a9f;}"
-                              "QPushButton#remoteAgentSendButton:disabled{background:#b8d3e8;}")));
-    runtime_->send->setEnabled(online && !runtime_->pendingCommand &&
-                               (busy || !runtime_->editor->toPlainText().trimmed().isEmpty() ||
-                                !runtime_->attachments.isEmpty()));
+        QStringLiteral("QPushButton#remoteAgentSendButton{background:#0b67b7;border:none;border-radius:18px;padding:0;}"
+                       "QPushButton#remoteAgentSendButton:hover{background:#095a9f;}"
+                       "QPushButton#remoteAgentSendButton:disabled{background:#b8d3e8;}")));
+    runtime_->send->setEnabled(
+        online && (!runtime_->editor->toPlainText().trimmed().isEmpty() || !runtime_->attachments.isEmpty()));
+    runtime_->stop->setVisible(busy);
+    runtime_->stop->setEnabled(online && busy);
+    runtime_->editor->positionCornerAction();
+    bool recovery = false;
+    runtime_->pendingCommand = false;
+    for (const QJsonValue& value : runtime_->outbox) {
+        const QJsonObject entry = value.toObject();
+        if (sessionKey(entry.value(QStringLiteral("owner")).toObject()) != sessionKey(runtime_->session)) continue;
+        const QString state = entry.value(QStringLiteral("state")).toString();
+        runtime_->pendingCommand |= state == QStringLiteral("sending");
+        recovery |= state != QStringLiteral("sending") && state != QStringLiteral("queued");
+    }
+    runtime_->recover->setVisible(recovery);
 }
 
 void RemoteAgentPanel::showStatus(const QString& message, bool failure) {

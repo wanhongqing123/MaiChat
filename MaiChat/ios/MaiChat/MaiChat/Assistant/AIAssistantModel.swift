@@ -1062,6 +1062,7 @@ struct AIReplySuggestions: Codable, Sendable, Equatable {
 struct AIResponse: Codable, Sendable {
     let ok: Bool
     var id: String?
+    var userMessageID: String?
     var error: String?
     var errorCode: String?
     var changed: Bool?
@@ -1080,6 +1081,14 @@ struct AIResponse: Codable, Sendable {
     var natural: String?
     var casual: String?
     var professional: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, id, error, errorCode, changed, sessions, messages, permissions, questions
+        case busy, turnId, configured, model, wire, localGpuSelected, localGpuModelBytes, localGpuBackend
+        case natural, casual, professional
+        case userMessageID = "user_message_id"
+    }
+
 }
 struct AIBackendError: LocalizedError {
     let message: String
@@ -1445,8 +1454,8 @@ actor AIAssistantBackend {
     /// Use the persisted receipt ID, rather than a moving latest-message window.
     func userMessage(session: String, id: String) throws -> AIMessage? {
         guard !id.isEmpty else { return nil }
-        return try messagesPage(session: session, beforeId: id + "~", limit: 1)
-            .first { $0.id == id && $0.role == "user" }
+        return try requestAgentOperation("message", values: ["session": session, "id": id])
+            .messages?.first { $0.id == id && $0.role == "user" }
     }
 
     func remoteSnapshot(session: String, beforeId: String = "", limit: Int) throws -> AIResponse {
@@ -2328,15 +2337,16 @@ final class AIAssistantModel: ObservableObject {
            pending.remote.deviceSlot == envelope.fromSlot,
            pending.remote.loginSessionID == envelope.fromLoginSessionID {
             let result = object["result"] as? [String: Any]
-            if result?["ok"] as? Bool == true,
+            let unknownDelivery = result?["unknown"] as? Bool == true ||
+                result?["delivery_unknown"] as? Bool == true
+            if !unknownDelivery, result?["ok"] as? Bool == true,
                let messageID = result?["user_message_id"] as? String, !messageID.isEmpty {
                 finishRemoteSteering(id, result: .success(messageID))
             } else {
-                let acceptedWithoutReceipt = result?["ok"] as? Bool == true
                 finishRemoteSteering(id, result: .failure(AIBackendError(
                     message: result?["error"] as? String ??
                         "所属设备未确认补充内容；请更新所属设备后重试",
-                    definitive: !acceptedWithoutReceipt && result?["delivery_unknown"] as? Bool != true)))
+                    definitive: result?["ok"] as? Bool == false && !unknownDelivery)))
             }
             return
         }
@@ -2677,10 +2687,6 @@ final class AIAssistantModel: ObservableObject {
                         session: envelope.sessionID, turnId: turnID, requestId: requestID,
                         text: prompt, images: images, videos: videos,
                         quoteMessageId: envelope.payload.quoteMessageId ?? ""))
-                    guard let id = sent.id, !id.isEmpty else {
-                        throw AIBackendError(message: "所属设备未返回补充内容落库编号")
-                    }
-                    result["user_message_id"] = id
                     if let key = steeringImportKey,
                        remoteSteeringImports[key]?.identity.acceptedOrder == nil {
                         remoteSteeringAcceptedOrder &+= 1
@@ -2691,14 +2697,18 @@ final class AIAssistantModel: ObservableObject {
                     sent = try await backend.send(session: envelope.sessionID, text: prompt,
                         images: images, videos: videos, quoteMessageId: "")
                 }
-                let latest = try? await backend.remoteSnapshot(
-                    session: envelope.sessionID, limit: 2)
-                let receiptUser = isSteering ? try? await backend.userMessage(
-                    session: envelope.sessionID, id: sent.id ?? "") : nil
-                if let userMessage = receiptUser ?? latest?.messages?.first(where: {
-                    $0.role == "user" && !isSteering
-                }) {
-                    result["user_message_id"] = userMessage.id
+                // The native receipt separates the accepted user row from its
+                // immutable task. Never infer either from a later moving window.
+                if let userID = sent.userMessageID, !userID.isEmpty,
+                   let receiptTurn = sent.turnId, !receiptTurn.isEmpty,
+                   !isSteering || receiptTurn == turnID {
+                    result["user_message_id"] = userID
+                    result["turnId"] = isSteering ? turnID : receiptTurn
+                }
+                let latest = try? await backend.remoteSnapshot(session: envelope.sessionID, limit: 1)
+                let receiptUser = try? await backend.userMessage(
+                    session: envelope.sessionID, id: sent.userMessageID ?? "")
+                if let userMessage = receiptUser {
                     if !synced.isEmpty, let latest {
                         var parts = remoteHistoryMessage(userMessage).parts
                         for item in synced {
@@ -2742,7 +2752,10 @@ final class AIAssistantModel: ObservableObject {
             case "stop":
                 let closeCamera = AIMobileLocalMediaRequests.shared.cameraSessionID == envelope.sessionID
                 do {
-                    _ = try await backend.request("stop", values: ["session": envelope.sessionID])
+                    // 原任务编号交给共享桥接校验；网络迟到的 Stop 不取消后续任务。
+                    var values = ["session": envelope.sessionID]
+                    if let turn = envelope.payload.turnId, !turn.isEmpty { values["turnId"] = turn }
+                    _ = try await backend.request("stop", values: values)
                 } catch {
                     if closeCamera {
                         AIMobileLocalMediaRequests.shared.closeCamera(in: envelope.sessionID)

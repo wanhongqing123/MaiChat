@@ -2,6 +2,8 @@
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QApplication>
 #include <QFont>
+#include <QFontDatabase>
+#include <QFile>
 #include <QImage>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -12,6 +14,7 @@
 #include <QTimer>
 
 #include "app/RemoteIMApplication.h"
+#include "agent/AgentChatPanel.h"
 #include "im/FakeRemoteIMClient.h"
 #include "markdown/MarkdownView.h"
 #include "ui/MainWindow.h"
@@ -60,7 +63,18 @@ layout.paint(&painter, origin, clip);
 
 // 启动真实创作中心窗口供人工核对布局；这类视觉探针不能替代用户交互测试。
 int main(int argc, char** argv) {
+    QGuiApplication::setHighDpiScaleFactorRoundingPolicy(Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
+    QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+    QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
     QApplication app(argc, argv);
+    // Product main registers this same shared face; probes must do so as well.
+    if (QFontDatabase::addApplicationFont(QStringLiteral(MAICHAT_CODE_FONT_FILE)) < 0) return 2;
+    QString fixture;
+    if (argc > 2) {
+        QFile file(QString::fromLocal8Bit(argv[2]));
+        if (!file.open(QIODevice::ReadOnly)) return 2;
+        fixture = QString::fromUtf8(file.readAll());
+    }
 #ifdef Q_OS_WIN
     // 和 main.cpp 设的应用字体保持一致，否则中文落到宋体，截图不代表真机。
     QFont appFont;
@@ -87,11 +101,15 @@ int main(int argc, char** argv) {
     nav->click();
     QTest::qWait(300);
 
-    auto* view = window.findChild<MarkdownView*>();
+    auto* panel = window.findChild<AgentChatPanel*>();
+    auto* view = panel ? panel->findChild<MarkdownView*>() : nullptr;
     if (view == nullptr) {
         qWarning("MarkdownView not found on the agent page");
         return 1;
     }
+    if (!fixture.isEmpty()) {
+        view->addItem(QStringLiteral("a1"), MarkdownView::Style::Document, fixture);
+    } else {
     view->addItem(QStringLiteral("u1"), MarkdownView::Style::Bubble,
                   QStringLiteral("markdown 现在是自己画的了？给我看看效果"));
     view->addItem(QStringLiteral("a1"), MarkdownView::Style::Document,
@@ -137,11 +155,15 @@ int main(int argc, char** argv) {
 
     view->addItem(QStringLiteral("n2"), MarkdownView::Style::Notice,
                   QStringLiteral("要我顺手把这三处的注释也补了吗？\n\n补 · 先不补"));
+    }
     QTest::qWait(300);
 
-    QImage image(window.size(), QImage::Format_ARGB32);
-    image.fill(Qt::white);
-    window.render(&image);
+    // This probe injects presentation items directly instead of emitting an
+    // Agent event, so update the empty-state overlay explicitly as well.
+    if (auto* welcome = window.findChild<QWidget*>(QStringLiteral("agentWelcomeView")))
+        welcome->hide();
+
+    const QImage image = window.grab().toImage();
     if (!image.save(output)) {
         qWarning("failed to save %s", qPrintable(output));
         return 1;

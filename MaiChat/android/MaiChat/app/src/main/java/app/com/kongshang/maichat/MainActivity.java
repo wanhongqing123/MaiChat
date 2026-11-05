@@ -2860,7 +2860,7 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
         } else if (message.fileAttachment() != null) {
             bubble.addView(fileMessageContent(message.fileAttachment()), matchWrap());
         } else {
-            TextView body = MaiChatTypography.body(this);
+            MarkdownContentView body = new MarkdownContentView(this);
             MarkdownRenderer.bind(body, message.text(), usesInlineDate(message) ? message.createdAtMillis() : null);
             bubble.addView(body, matchWrap());
         }
@@ -2912,8 +2912,8 @@ public final class MainActivity extends Activity implements RemoteIMSessionContr
                 && message.approvalRequest() == null;
     }
 
-    private TextView attachmentCaptionView(String caption) {
-        TextView body = MaiChatTypography.body(this);
+    private View attachmentCaptionView(String caption) {
+        MarkdownContentView body = new MarkdownContentView(this);
         body.setPadding(0, dp(4), 0, dp(4));
         MarkdownRenderer.bind(body, caption);
         return body;

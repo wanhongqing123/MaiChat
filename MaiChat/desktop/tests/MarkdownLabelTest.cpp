@@ -1,8 +1,12 @@
 // 文件作用：验证桌面端Markdown 标签的宽度测量、复用缓存和纯文本提取。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QCoreApplication>
+#include <QApplication>
+#include <QClipboard>
 #include <QTest>
 #include <QWidget>
+#include <QWindow>
+#include <QtMath>
 
 #include "markdown/MarkdownLabel.h"
 #include "markdown/MarkdownDocument.h"
@@ -25,6 +29,11 @@ private slots:
     void reusesTheLayoutOfAnIdenticalMessage();
     void neverServesAnotherMessagesLayout();
     void comparesKeysNotJustHashes();
+    void naturalWidthIncludesTrailingNoteAndKeepsCurrentLayout();
+    void changingInputsKeepsCachedLayoutsUnderTheirOriginalIdentity();
+    void draggingTableCellCopiesVisibleMixedText_data();
+    void draggingTableCellCopiesVisibleMixedText();
+    void scrollingCodeKeepsSelectionAndCopiesVisibleTail();
 };
 
 namespace {
@@ -47,6 +56,171 @@ void MarkdownLabelTest::reportsTallerWhenNarrower() {
     label.setTheme(theme());
     label.setMarkdown(longText());
     QVERIFY(label.heightForWidth(200) > label.heightForWidth(600));
+}
+
+void MarkdownLabelTest::scrollingCodeKeepsSelectionAndCopiesVisibleTail() {
+    const QString markdown = QStringLiteral("Body before\n\n```text\nHEAD_")
+        + QStringLiteral("0123456789").repeated(12) + QStringLiteral("_TAIL_MARKER\n```\n\nBody after");
+    MarkdownLabel label;
+    label.setTheme(theme());
+    label.setMarkdown(markdown);
+    label.resize(260, label.heightForWidth(260));
+    label.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&label));
+    MarkdownLayout reference;
+    reference.layout(MarkdownDocument::parse(markdown), theme(), label.width());
+    QCOMPARE(reference.codeBlocks().size(), 1);
+    const auto code = reference.codeBlocks().first();
+    QVERIFY(code.maximumOffset() > 0);
+    auto* window = label.windowHandle();
+    QVERIFY(window);
+    const auto windowPoint = [&](QPoint point) { return window->mapFromGlobal(label.mapToGlobal(point)); };
+    label.selectAll();
+    const QString all = label.selectedText();
+    const QPoint track(qFloor(code.scrollTrack().right()), qRound(code.scrollTrack().center().y()));
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, windowPoint(track));
+    QCOMPARE(label.selectedText(), all); // Scrolling is separate from selection.
+    const QHash<int, qreal> offsets{{0, code.maximumOffset()}};
+    const int start = reference.selectableText().indexOf(QStringLiteral("TAIL_MARKER"));
+    const auto pointFor = [&](int position) {
+        for (int y = qCeil(code.viewport.top()); y <= qFloor(code.viewport.bottom()); ++y)
+            for (int x = qCeil(code.viewport.left()); x <= qFloor(code.viewport.right()); ++x)
+                if (reference.positionAt(QPointF(x, y), offsets) == position) return QPoint(x, y);
+        return QPoint(-1, -1);
+    };
+    const QPoint from = pointFor(start), to = pointFor(start + 11);
+    QVERIFY(from.x() >= 0 && to.x() >= 0);
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, windowPoint(from));
+    QTest::mouseMove(window, windowPoint(to));
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, windowPoint(to));
+    QCOMPARE(label.selectedText(), QStringLiteral("TAIL_MARKER"));
+    QTest::keySequence(&label, QKeySequence(QKeySequence::Copy));
+    QCOMPARE(QApplication::clipboard()->text(), QStringLiteral("TAIL_MARKER"));
+    QCOMPARE(label.markdown(), markdown);
+    QCOMPARE(label.contentHeight(), label.heightForWidth(1200));
+}
+
+void MarkdownLabelTest::naturalWidthIncludesTrailingNoteAndKeepsCurrentLayout() {
+    MarkdownLabel label;
+    label.setTheme(theme());
+    label.setMarkdown(QStringLiteral("a\nb"));
+    label.resize(600, 100);
+    const int originalHeight = label.contentHeight();
+    const int shortWidth = label.naturalWidthForWidth(900);
+    QVERIFY(shortWidth > 0 && shortWidth < 100);
+    QCOMPARE(label.contentHeight(), originalHeight);
+    QCOMPARE(label.sizeHint().width(), 360); // Other hosts retain their existing size-hint contract.
+
+    label.setTrailingNote(QStringLiteral("  · 16:13"), QColor(QStringLiteral("#0f8ddd")), 11);
+    const int notedWidth = label.naturalWidthForWidth(900);
+    QVERIFY(notedWidth > shortWidth);
+    QVERIFY(notedWidth < 200);
+    const QString selectedText = label.plainText();
+    label.selectAll();
+    QCOMPARE(label.selectedText().trimmed(), selectedText);
+    QCOMPARE(label.naturalWidthForWidth(900), notedWidth);
+    QCOMPARE(label.selectedText().trimmed(), selectedText);
+
+    label.setMarkdown(longText());
+    QVERIFY(label.naturalWidthForWidth(120) <= 120);
+    QVERIFY(label.naturalWidthForWidth(900) > label.naturalWidthForWidth(120));
+    QCOMPARE(label.naturalWidthForWidth(0), 0);
+}
+
+void MarkdownLabelTest::changingInputsKeepsCachedLayoutsUnderTheirOriginalIdentity() {
+    MarkdownLayoutCache::clear();
+    MarkdownLabel label;
+    const QString original = QStringLiteral("Original cached text");
+    label.setTheme(theme());
+    label.setMarkdown(original);
+    label.resize(600, 100);
+    const int normalHeight = label.contentHeight();
+    const int normalWidth = label.naturalWidthForWidth(900); // Also warm the probe.
+
+    label.setTrailingNote(QStringLiteral("  · 16:13"), QColor(QStringLiteral("#0f8ddd")), 11);
+    QVERIFY(label.naturalWidthForWidth(900) > normalWidth);
+    QVERIFY(label.plainText().endsWith(QStringLiteral("16:13")));
+    label.setTrailingNote(QString(), QColor(), 0);
+    QCOMPARE(label.naturalWidthForWidth(900), normalWidth);
+    QCOMPARE(label.plainText(), original);
+
+    const QString replacement = QStringLiteral("Different source with its own cached geometry");
+    label.setMarkdown(replacement);
+    QVERIFY(label.naturalWidthForWidth(900) > normalWidth);
+    QCOMPARE(label.plainText(), replacement);
+    label.setMarkdown(original);
+    QCOMPARE(label.plainText(), original);
+    QCOMPARE(label.naturalWidthForWidth(900), normalWidth);
+
+    label.setTheme(MarkdownTheme::standard(2.0));
+    QVERIFY(label.contentHeight() > normalHeight);
+    QVERIFY(label.naturalWidthForWidth(900) > normalWidth);
+    label.setTheme(theme());
+    QCOMPARE(label.contentHeight(), normalHeight);
+    QCOMPARE(label.naturalWidthForWidth(900), normalWidth);
+    // A second host can still reuse the original no-note layout correctly.
+    MarkdownLabel reused;
+    reused.setTheme(theme());
+    reused.setMarkdown(original);
+    reused.resize(600, 100);
+    QCOMPARE(reused.plainText(), original);
+    QCOMPARE(reused.contentHeight(), normalHeight);
+}
+
+void MarkdownLabelTest::draggingTableCellCopiesVisibleMixedText_data() {
+    QTest::addColumn<QString>("markdown");
+    QTest::newRow("plain-cells")
+        << QStringLiteral("| 尝试 | 结果 |\n| --- | --- |\n"
+                          "| PowerShell + System.Drawing | 失败：PowerShell处于受限语言模式，Add-Type被拒绝 |\n");
+    QTest::newRow("mixed-inline-code")
+        << QStringLiteral("| 尝试 | 结果 |\n| --- | --- |\n"
+                          "| PowerShell + `System.Drawing` | 失败：PowerShell处于受限语言模式，`Add-Type`被拒绝 |\n");
+}
+
+void MarkdownLabelTest::draggingTableCellCopiesVisibleMixedText() {
+    QFETCH(QString, markdown);
+    MarkdownLabel label;
+    label.setTheme(theme());
+    label.setMarkdown(markdown);
+    label.resize(1200, 180);
+    label.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&label));
+
+    MarkdownLayout reference;
+    reference.layout(MarkdownDocument::parse(markdown), theme(), label.width());
+    const QString visible = reference.selectableText();
+    const auto pointerForPosition = [&](int position) {
+        for (int y = 0; y <= qCeil(reference.height()); ++y)
+            for (int x = 0; x <= label.width(); ++x)
+                if (reference.positionAt(QPointF(x, y)) == position) return QPoint(x, y);
+        return QPoint(-1, -1);
+    };
+    for (const QString& cell : {QStringLiteral("PowerShell + System.Drawing"),
+                               QStringLiteral("失败：PowerShell处于受限语言模式，Add-Type被拒绝")}) {
+        const int start = visible.indexOf(cell);
+        QVERIFY(start >= 0);
+        const QPoint first = pointerForPosition(start);
+        const QPoint last = pointerForPosition(start + cell.size());
+        QVERIFY(first.x() >= 0 && last.x() >= 0);
+        for (bool reverse : {false, true}) {
+            const QPoint from = reverse ? last : first;
+            const QPoint to = reverse ? first : last;
+            // Qt 5's QWidget mouseMove only moves the OS cursor, so it can be
+            // delivered to another foreground window while press/release were
+            // injected into this label. Use one QPA path for the entire drag.
+            auto* window = label.windowHandle();
+            QVERIFY(window);
+            const QPoint windowFrom = window->mapFromGlobal(label.mapToGlobal(from));
+            const QPoint windowTo = window->mapFromGlobal(label.mapToGlobal(to));
+            qInfo() << "table-label drag" << label.size() << from << to << windowFrom << windowTo;
+            QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, windowFrom);
+            QTest::mouseMove(window, windowTo);
+            QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, windowTo);
+            QCOMPARE(label.selectedText(), cell);
+            QTest::keySequence(&label, QKeySequence(QKeySequence::Copy));
+            QCOMPARE(QApplication::clipboard()->text(), cell);
+        }
+    }
 }
 
 void MarkdownLabelTest::measuringAnotherWidthDoesNotStickToIt() {

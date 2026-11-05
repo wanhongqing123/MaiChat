@@ -3,11 +3,21 @@
 // 属性修改前先固定文本区间，避免遍历中改变富文本 run 边界。
 import SwiftUI
 
+// The original shared face is registered by UIAppFonts. Keep code separate from
+// body typography: ASCII/box drawing use one cell, CJK two, without ligatures.
+enum MarkdownCodeTypography {
+    static let postScriptName = "Sarasa-Fixed-SC-Regular"
+
+    static func font(size: CGFloat) -> Font {
+        .custom(postScriptName, fixedSize: size)
+    }
+}
+
 enum MarkdownInlineStyling {
     // 这些颜色用于固定的浅色消息底板，不跟随系统外观变化。
     // 若加入深色消息底板，须把配色参数纳入 MarkdownRenderCache 的键，或改用动态颜色。
     static let codeForeground = Color(red: 0.42, green: 0.23, blue: 0.59)
-    static let codeFont = Font.system(size: 13, design: .monospaced)
+    static let codeFont = MarkdownCodeTypography.font(size: 13)
 
     static func apply(to source: AttributedString) -> AttributedString {
         var styled = source

@@ -49,7 +49,8 @@ import java.util.function.Consumer;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/** Stable composer + recycled message rows. No native calls, disk I/O or parsing on UI. */
+/** Stable composer + recycled rows. Only bounded private intake commits precede editor clearing;
+ * native calls, media I/O and delivery work stay on the controller worker. */
 final class AIAssistantPanel extends LinearLayout implements AIAssistantController.Listener {
     private static final int MAX_MEDIA_ATTACHMENTS = 10;
     static final int REQUEST_FILE = 7107;
@@ -85,7 +86,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private AIAssistantController.State state;
     private String selected = "", pendingSignature = "";
     private String renderedMessagesSession = "", pendingLatestSession = "";
-    private int renderedMessageHash, renderedMessageLength, renderedVisibleLimit = -1;
+    private int renderedMessageHash, renderedMessageLength;
     private int lastRemoteRestoreGeneration;
     private final Map<String, String> drafts = new HashMap<>();
     private final Map<String, List<AIAssistantController.ImportedFile>> attachments = new HashMap<>();
@@ -93,16 +94,19 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private final Set<String> deletedSessions = new HashSet<>();
     private final Set<String> remoteAttachmentTargets = new HashSet<>();
     private final Set<String> expanded = new HashSet<>();
+    // 只供只读的卡片/阶段元数据使用；折叠工具的原始输入输出不会在 bind 时反复解 JSON。
+    private static final AIAssistantToolJsonCache toolJson =
+        new AIAssistantToolJsonCache(256 * 1024, JSONObject::new);
     private List<JSONObject> messages = Collections.emptyList();
-    private boolean following = true, submitting;
-    private int visibleLimit = 30;
+    private boolean following = true;
+    private String olderAnchorId = "";
+    private int olderAnchorTop;
     private final Button older;
     private boolean visibleToUser = true;
     private File pendingCameraFile;
     private Consumer<String> pendingAgentCamera, pendingAgentMusic;
     private boolean agentCameraRequestActive, agentMusicRequestActive;
-    private String pendingMediaSession, pendingFileSession, pendingCameraSession, submittingSession = "";
-    private String firstSentSession = "";
+    private String pendingMediaSession, pendingFileSession, pendingCameraSession;
     private PopupWindow sessionDrawerPopup;
     private PopupWindow actionPopup;
     private AIAssistantActionMenu actionMenu;
@@ -123,6 +127,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private boolean voiceMode, voiceRecording, cancelVoice, attachmentPanelVisible;
     private String voicePartialText = "";
     private int voiceGeneration;
+    private String restoredOutgoingId = "";
     private final ComposerVoiceResultGuard voiceResultGuard = new ComposerVoiceResultGuard();
     private VoiceTranscriptionOverlay transcriptionOverlay;
     private VoiceTranscriptionResult transcription;
@@ -215,8 +220,18 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         list.setScrollBarStyle(View.SCROLLBARS_OUTSIDE_OVERLAY);
         list.setClipToPadding(false);
         older = button("显示更早消息", "显示更早消息", v -> {
-            visibleLimit += 30;
-            updateMessages();
+            if (state == null || state.data.optBoolean("loadingOlder")) return;
+            int first = list.getFirstVisiblePosition();
+            int index = Math.max(0, first - list.getHeaderViewsCount());
+            int child = Math.max(0, list.getHeaderViewsCount() - first);
+            View row = list.getChildAt(child);
+            olderAnchorId = index < messages.size() ? messages.get(index).optString("id") : "";
+            olderAnchorTop = row == null ? 0 : row.getTop() - list.getPaddingTop();
+            following = false; pendingLatestSession = "";
+            String owner = messageOwner(state);
+            controller.loadOlder(success -> {
+                if (owner.equals(messageOwner(state)) && !success) olderAnchorId = "";
+            });
         });
         // 首次快照尚未返回时不能显示历史入口；只在确认有更早消息后再露出。
         older.setVisibility(GONE);
@@ -357,7 +372,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         // 可见空编辑器与独立语音按钮复用同一录音器；短按和已有草稿保留系统编辑行为。
         ComposerVoiceInput.attach(composer, new ComposerVoiceInput.Listener() {
             @Override public boolean start(float rawX, float rawY) {
-                if (voiceRecorder == null || state == null || !state.ready || state.busy() || submitting)
+                if (voiceRecorder == null || state == null || !state.ready)
                     return false;
                 if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                     != android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -526,7 +541,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     public void onState(AIAssistantController.State next) {
         if (browser != null) browser.sessionChanged(next.selected, next.remoteSession != null);
         if (next.remoteSession != null) remoteAttachmentTargets.add(next.selected);
-        boolean changedSession = !selected.equals(next.selected);
+        boolean changedSession = !messageOwner(state).equals(messageOwner(next));
         if (actionPopup != null && (changedSession || actionRemote != (next.remoteSession != null)
                 || actionAccountGeneration != MaiChatAuthClient.shared(activity).accountSessionGeneration()))
             dismissActionMenu();
@@ -535,11 +550,10 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             invalidateVoiceTranscription();
             String previous = selected;
             drafts.put(previous, composer.getText().toString());
-            boolean firstSend = submitting && previous.isEmpty()
-                && previous.equals(submittingSession);
+            boolean firstSend = previous.isEmpty() && !next.selected.isEmpty()
+                && next.selected.equals(next.data.optString("emptyDraftSession"));
             selected = next.selected;
             if (firstSend) {
-                firstSentSession = selected;
                 if (attachments.containsKey(previous))
                     attachments.put(selected, attachments.remove(previous));
                 drafts.put(selected, drafts.remove(previous));
@@ -550,12 +564,13 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 quotedMessage = null;
                 quoteSession = "";
             }
-            visibleLimit = 30;
+            olderAnchorId = "";
             expanded.clear();
             following = true;
             pendingLatestSession = selected;
         }
         state = next;
+        applyOutgoingRecovery();
         String account = MaiChatAuthClient.shared(activity).accountId();
         if (!account.equals(videoCircleAccount)) probeVideoCircle();
         if (next.restoreGeneration != lastRemoteRestoreGeneration &&
@@ -599,26 +614,38 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private void updateMessages() {
         if (state == null)
             return;
-        if (renderedMessagesSession.equals(selected) && renderedVisibleLimit == visibleLimit
+        older.setVisibility(state.data.optBoolean("hasOlderMessages") ? VISIBLE : GONE);
+        older.setEnabled(!state.data.optBoolean("loadingOlder"));
+        if (renderedMessagesSession.equals(messageOwner(state))
             && renderedMessageHash == state.messageHash
-            && renderedMessageLength == state.messageLength)
+            && renderedMessageLength == state.messageLength
+            && (olderAnchorId.isEmpty() || state.data.optBoolean("loadingOlder")))
             return;
         JSONArray array = state.data.optJSONArray("messages");
         int count = array == null ? 0 : array.length();
         List<JSONObject> next = new ArrayList<>();
-        for (int i = Math.max(0, count - visibleLimit); i < count; i++) next.add(array.optJSONObject(i));
+        for (int i = 0; i < count; i++) next.add(array.optJSONObject(i));
         messages = next;
         // 欢迎能力目录从顶部阅读，消息仍保留底部跟随；两者共用同一滚动容器。
         boolean welcome = next.isEmpty();
         list.setStackFromBottom(!welcome);
         list.setPadding(dp(welcome ? 16 : 24), dp(welcome ? 0 : 18),
             dp(welcome ? 16 : 24), dp(24));
-        renderedMessagesSession = selected;
-        renderedVisibleLimit = visibleLimit;
+        renderedMessagesSession = messageOwner(state);
         renderedMessageHash = state.messageHash;
         renderedMessageLength = state.messageLength;
-        older.setVisibility(count > visibleLimit ? VISIBLE : GONE);
         adapter.notifyDataSetChanged();
+        // 按稳定消息 ID 与行内像素位置还原前插锚点，不能把用户拉回最新消息。
+        if (!olderAnchorId.isEmpty() && !state.data.optBoolean("loadingOlder")) {
+            String anchor = olderAnchorId, owner = messageOwner(state);
+            int top = olderAnchorTop;
+            olderAnchorId = "";
+            for (int i = 0; i < next.size(); i++) if (anchor.equals(next.get(i).optString("id"))) {
+                final int position = i + list.getHeaderViewsCount();
+                list.post(() -> { if (owner.equals(messageOwner(state))) list.setSelectionFromTop(position, top); });
+                break;
+            }
+        }
         if (following)
             locateLatest();
         if (!next.isEmpty() && selected.equals(pendingLatestSession)) {
@@ -631,6 +658,12 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 locateLatest();
             });
         }
+    }
+    private static String messageOwner(AIAssistantController.State value) {
+        if (value == null) return "";
+        if (value.remoteSession == null) return "local:" + value.selected;
+        return new JSONArray().put(value.remoteSession.optString("device_slot"))
+            .put(value.remoteSession.optString("login_session_id")).put(value.selected).toString();
     }
     private boolean atBottom() {
         if (list.getCount() == 0)
@@ -673,16 +706,14 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         boolean busy = state != null && state.busy();
         boolean hasDraft = !composer.getText().toString().trim().isEmpty()
             || !currentAttachments().isEmpty();
-        boolean canSubmit = state != null && state.ready && !busy && !submitting
+        boolean canSubmit = state != null && state.ready
             && (state.remoteSession != null || controller.modelSettingsReady())
             && !navigationPending && pendingMediaImports.getOrDefault(selected, 0) == 0 && hasDraft
-            && !state.remoteCommandPending
             && (state.remoteSession == null || state.remoteSession.optBoolean("online"));
-        // 尾部只显示一个操作：忙碌时停止，有草稿时发送，其余显示加号。
-        // 两个原有回调保持独立，隐藏的按钮不占位，避免转写回填后挤窄编辑器。
-        boolean showSend = !voiceMode && hasDraft && !busy;
+        // 发送和停止为独立动作；忙碌时有新稿仍可发送，键盘发送绝不借用 Stop。
+        boolean showSend = !voiceMode && hasDraft;
         send.setVisibility(showSend ? VISIBLE : GONE);
-        attachmentOrStopButton.setVisibility(showSend ? GONE : VISIBLE);
+        attachmentOrStopButton.setVisibility(showSend && !busy ? GONE : VISIBLE);
         send.setEnabled(canSubmit);
         attachmentOrStopButton.setImageResource(busy ? R.drawable.ic_ai_stop : R.drawable.ic_ai_add);
         attachmentOrStopButton.setContentDescription(busy ? "停止" :
@@ -691,9 +722,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         attachmentOrStopButton.setBackground(busy
             ? MaiChatTheme.rounded(Color.rgb(29, 32, 36), 22, activity)
             : MaiChatTheme.bordered(MaiChatTheme.GROUPED_PAGE, MaiChatTheme.BORDER, 22, activity));
-        attachmentOrStopButton.setEnabled(state != null && state.ready && !submitting);
-        voiceModeButton.setEnabled(state != null && state.ready && !busy && !submitting);
-        voiceHoldButton.setEnabled(state != null && state.ready && !busy && !submitting);
+        attachmentOrStopButton.setEnabled(state != null && state.ready);
+        voiceModeButton.setEnabled(state != null && state.ready);
+        voiceHoldButton.setEnabled(state != null && state.ready);
         // 提交期间保持原生编辑器焦点；禁用控件会让输入法意外收起。
     }
     private void setVoiceMode(boolean enabled) {
@@ -736,15 +767,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         requestFocus();
     }
     private void send() {
-        if (state == null || submitting || navigationPending)
+        if (state == null || !state.ready || navigationPending)
             return;
         // 手动发送或停止属于新操作；较早录音的 final 不得覆盖草稿或进入 busy 的 stop 分支。
         voiceResultGuard.submitted();
         if (transcriptionOverlay != null) invalidateVoiceTranscription();
-        if (state.busy()) {
-            controller.action("stop", value("session", selected), null);
-            return;
-        }
         // Keep keyboard-submit and the ordinary API aligned while a source is being prepared.
         // The draft remains editable; it is never queued against a source still being changed.
         if (state.remoteSession == null && !controller.modelSettingsReady()) return;
@@ -765,50 +792,22 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 Toast.LENGTH_LONG).show();
             return;
         }
-        String submittedText = source;
-        int restorationGeneration = state.restoreGeneration;
         String quotedMessageId = quotedMessage != null && quoteSession.equals(origin)
             ? quotedMessage.optString("id") : "";
-        submitting = true;
-        submittingSession = origin;
-        firstSentSession = "";
-        updateAttachments();
-        updateSend();
+        // 私有队列的同步收据先于清稿；之后的上传、native 和远端确认不占用编辑器。
+        if (!controller.enqueue(origin, source, sending, quotedMessageId)) return;
+        composer.setText("");
+        drafts.put(origin, "");
+        List<AIAssistantController.ImportedFile> current = attachments.get(origin);
+        if (current != null) {
+            current.removeAll(sending);
+            if (current.isEmpty()) attachments.remove(origin);
+        }
+        quotedMessage = null; quoteSession = "";
         following = true;
-        controller.send(origin, source, sending, quotedMessageId, success -> {
-            submitting = false;
-            String target = origin.isEmpty() && !firstSentSession.isEmpty()
-                ? firstSentSession : origin;
-            if (success) {
-                if (selected.equals(target) && composer.getText().toString().equals(submittedText))
-                    composer.setText("");
-                if (submittedText.equals(drafts.get(target))) drafts.put(target, "");
-                if (state != null && state.restoreGeneration != restorationGeneration &&
-                    selected.equals(target) && submittedText.equals(state.restoreDraft) &&
-                    composer.getText().toString().isEmpty()) {
-                    composer.setText(submittedText);
-                    drafts.put(target, submittedText);
-                }
-                if (!quotedMessageId.isEmpty() && selected.equals(target) &&
-                    quotedMessage != null && quotedMessageId.equals(quotedMessage.optString("id"))) {
-                    quotedMessage = null;
-                    quoteSession = "";
-                    updateQuote();
-                }
-                List<AIAssistantController.ImportedFile> values = attachments.get(target);
-                if (values != null) {
-                    values.removeAll(sending);
-                    if (values.isEmpty()) attachments.remove(target);
-                }
-            }
-            submittingSession = "";
-            firstSentSession = "";
-            updateAttachments();
-            updateSend();
-            if (success)
-                locateLatest();
-        });
+        updateAttachments(); updateQuote(); updateSend();
     }
+
     void importFile(Uri uri) {
         importFile(uri, selected);
     }
@@ -951,7 +950,6 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 }
                 updateAttachments(); updateSend();
             });
-            remove.setEnabled(!submitting);
             top.addView(remove, new LayoutParams(dp(48), dp(58)));
             chip.addView(top, matchWrap());
             TextView name = text(type + " " + ordinal
@@ -1393,7 +1391,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         });
     }
     private boolean voiceTouch(MotionEvent event) {
-        if (voiceRecorder == null || state == null || state.busy() || submitting
+        if (voiceRecorder == null || state == null || !state.ready
             || (!voiceRecording && !composer.getText().toString().trim().isEmpty())) return false;
         if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
             if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
@@ -1480,8 +1478,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     }
     private boolean canApplyVoiceResult(int generation, String voiceSession, String voiceAccount, long revision) {
         return currentVoiceResult(generation, voiceSession, voiceAccount)
-            && voiceResultGuard.accepts(revision, state != null && state.ready && !state.busy()
-                && !submitting && !navigationPending);
+            && voiceResultGuard.accepts(revision, state != null && state.ready && !navigationPending);
     }
     private void finishTranscription(VoiceTranscriptionResult capture, VoiceTranscriptionOverlay.Action action) {
         if (capture == null || capture != transcription || !capture.release(action)) return;
@@ -1678,11 +1675,54 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private void updatePending() {
         JSONArray permissions = state.data.optJSONArray("permissions"),
                   questions = state.data.optJSONArray("questions");
-        String signature = String.valueOf(permissions) + String.valueOf(questions);
+        String signature = selected + String.valueOf(state.remoteSession) + String.valueOf(permissions)
+            + String.valueOf(questions) + String.valueOf(state.data.optJSONArray("outgoing"));
         if (signature.equals(pendingSignature))
             return;
         pendingSignature = signature;
         pending.removeAllViews();
+        LinearLayout outgoingRows = column();
+        JSONArray outgoing = state.data.optJSONArray("outgoing");
+        if (outgoing != null) for (int i = 0; i < outgoing.length(); i++) {
+            JSONObject entry = outgoing.optJSONObject(i);
+            if (entry == null) continue;
+            JSONObject payload = entry.optJSONObject("payload");
+            if (payload == null) continue;
+            JSONObject owner = payload.optJSONObject("remote");
+            boolean sameOwner = state.remoteSession == null ? owner == null
+                && (selected.equals(payload.optString("session")) || payload.optString("session").isEmpty()
+                    && selected.equals(state.data.optString("emptyDraftSession")))
+                : owner != null && owner.optString("id").equals(state.remoteSession.optString("id"))
+                    && owner.optString("device_slot").equals(state.remoteSession.optString("device_slot"))
+                    && owner.optString("login_session_id").equals(state.remoteSession.optString("login_session_id"));
+            if (!sameOwner) continue;
+            String phase = entry.optString("state");
+            String label = phase.equals("unknown") ? "送达待确认，内容已保留" : phase.equals("failed")
+                ? "未受理，内容已保留" : phase.equals("dispatching") ? "正在发送"
+                : phase.equals("preparing") ? "正在准备附件" : "排队中";
+            TextView retained = text(label + "\n" + payload.optString("text"), 12, MaiChatTheme.SECONDARY);
+            retained.setMaxLines(4); retained.setTextIsSelectable(true);
+            retained.setPadding(0, dp(4), 0, dp(4));
+            outgoingRows.addView(retained, matchWrap());
+            if (phase.equals("failed")) {
+                Button restore = button("恢复草稿", "恢复未受理的内容", view -> {
+                    if (composer.length() > 0 || !currentAttachments().isEmpty()) {
+                        Toast.makeText(activity, "请先处理当前草稿，原内容仍已保留", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    controller.restoreOutgoing(entry.optString("id"));
+                });
+                outgoingRows.addView(restore, matchWrap());
+            }
+        }
+        if (outgoingRows.getChildCount() > 0) {
+            // 队列容量不等于页面高度；连续发送也必须始终留出消息视口和可编辑输入栏。
+            ScrollView retainedMessages = new ScrollView(activity);
+            retainedMessages.setFillViewport(false);
+            retainedMessages.addView(outgoingRows);
+            pending.addView(retainedMessages, new LayoutParams(LayoutParams.MATCH_PARENT,
+                dp(Math.min(132, outgoingRows.getChildCount() * 44))));
+        }
         if (permissions != null)
             for (int i = 0; i < permissions.length(); i++) {
                 JSONObject permission = permissions.optJSONObject(i);
@@ -1811,8 +1851,31 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 pending.addView(answer, matchWrap());
             }
     }
+    private void applyOutgoingRecovery() {
+        JSONObject recovery = state.data.optJSONObject("outgoingRecovery");
+        if (recovery == null || recovery.optString("id").isEmpty()
+            || recovery.optString("id").equals(restoredOutgoingId)
+            || !recovery.optString("owner").equals(AIAssistantController.outgoingOwner(selected, state.remoteSession))
+            || composer.length() > 0 || !currentAttachments().isEmpty()) return;
+        JSONObject payload = recovery.optJSONObject("payload");
+        if (payload == null) return;
+        restoredOutgoingId = recovery.optString("id");
+        composer.setText(payload.optString("text")); drafts.put(selected, payload.optString("text"));
+        JSONArray files = payload.optJSONArray("files");
+        if (files != null) for (int i = 0; i < files.length(); i++) {
+            JSONObject file = files.optJSONObject(i);
+            if (file != null) attachments.computeIfAbsent(selected, ignored -> new ArrayList<>()).add(
+                new AIAssistantController.ImportedFile(file.optString("path"), file.optString("mimeType"),
+                    file.optBoolean("image"), file.optString("name")));
+        }
+        String quote = payload.optString("quoteMessageId");
+        if (!quote.isEmpty()) {
+            quotedMessage = value("id", quote); quoteSession = selected;
+            for (JSONObject message : messages) if (quote.equals(message.optString("id"))) quotedMessage = message;
+        }
+    }
     private void sessions() {
-        if (submitting || navigationPending) return;
+        if (navigationPending) return;
         if (state == null) return;
         if (sessionDrawerPopup != null && sessionDrawerPopup.isShowing()) return;
         FrameLayout overlay = new FrameLayout(activity);
@@ -1930,7 +1993,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         });
     }
     private void requestNewConversation() {
-        if (submitting || navigationPending) return;
+        if (navigationPending) return;
         following = true;
         navigationPending = true;
         int generation = ++navigationGeneration;
@@ -1995,7 +2058,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             .show();
     }
     private void requestConversation(String target) {
-        if (submitting || navigationPending) return;
+        if (navigationPending) return;
         following = true;
         navigationPending = true;
         int generation = ++navigationGeneration;
@@ -2003,7 +2066,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         controller.select(target, success -> finishNavigation(generation));
     }
     private void requestRemoteConversation(JSONObject remote) {
-        if (submitting || navigationPending) return;
+        if (navigationPending) return;
         following = true;
         navigationPending = true;
         int generation = ++navigationGeneration;
@@ -2016,7 +2079,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         updateSend();
     }
     private void menu(View anchor) {
-        if (submitting || navigationPending) return;
+        if (navigationPending) return;
         if (state == null) return;
         if (actionPopup != null && actionPopup.isShowing()) {
             dismissActionMenu();
@@ -2116,16 +2179,16 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             && actionAccountGeneration == MaiChatAuthClient.shared(activity).accountSessionGeneration();
     }
     private boolean canChangeActionSettings() {
-        return ownsActionMenu() && state.ready && !state.busy() && !submitting
+        return ownsActionMenu() && state.ready && !state.busy()
             && !navigationPending && !settingsSavePending && !controller.changingModelSource();
     }
     private boolean canChangeActionModel() {
         // A failed local restore must still allow an explicit return to a usable cloud source.
-        return ownsActionMenu() && controller.modelSettingsReady() && !state.busy() && !submitting
+        return ownsActionMenu() && controller.modelSettingsReady() && !state.busy()
             && !navigationPending && !settingsSavePending && !controller.changingModelSource();
     }
     private boolean canClearFromActionMenu() {
-        return ownsActionMenu() && !selected.isEmpty() && !state.busy() && !submitting
+        return ownsActionMenu() && !selected.isEmpty() && !state.busy()
             && !navigationPending && !settingsSavePending && !controller.changingModelSource();
     }
     private void updateActionMenu() {
@@ -2351,6 +2414,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         JSONObject message;
         String key = "";
         final Map<String, TextView> parts = new HashMap<>();
+        // 正文独立保留混排容器；用户气泡、工具摘要和展开详情继续使用既有 TextView 路径。
+        final Map<String, MarkdownContentView> markdownParts = new HashMap<>();
         final Map<String, ImageView> imageParts = new HashMap<>();
         final Map<String, LinearLayout> videoParts = new HashMap<>();
         final Map<String, Button> pdfCards = new HashMap<>();
@@ -2371,6 +2436,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     key = "empty";
                     removeAllViews();
                     parts.clear();
+                    markdownParts.clear();
                     imageParts.clear();
                     videoParts.clear();
                     pdfCards.clear();
@@ -2434,6 +2500,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 key = structure.toString();
                 removeAllViews();
                 parts.clear();
+                markdownParts.clear();
                 imageParts.clear();
                 videoParts.clear();
                 pdfCards.clear();
@@ -2554,8 +2621,15 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             toolSummaries.put(toolGroupId, toolSummary);
                             toolGroups.put(toolGroupId, toolDetails);
                         }
-                        TextView view = kind.equals("text") ? MaiChatTypography.body(activity)
-                                                            : text("", 12, MaiChatTheme.SECONDARY);
+                        if (kind.equals("text")) {
+                            MarkdownContentView content = new MarkdownContentView(activity);
+                            markdownParts.put(id, content);
+                            LayoutParams contentLayout = matchWrap();
+                            contentLayout.bottomMargin = dp(12);
+                            addView(content, contentLayout);
+                            continue;
+                        }
+                        TextView view = text("", 12, MaiChatTheme.SECONDARY);
                         parts.put(id, view);
                         LayoutParams lp = matchWrap();
                         lp.bottomMargin = kind.equals("tool") && !deliveredMedia ? dp(4) : dp(12);
@@ -2691,19 +2765,18 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 for (int i = 0; i < array.length(); i++) {
                     JSONObject part = array.optJSONObject(i);
                     String id = part.optString("id"), kind = part.optString("kind");
-                    TextView view = parts.get(id);
-                    if (view == null)
-                        continue;
                     if (kind.equals("text")) {
+                        MarkdownContentView content = markdownParts.get(id);
+                        if (content == null) continue;
                         String source = part.optString("text");
-                        view.setTextColor(MaiChatTheme.TEXT);
-                        view.setAlpha(1f);
-                        view.setVisibility(source.isEmpty() ? GONE : VISIBLE);
-                        if (!source.equals(view.getContentDescription())) {
-                            view.setContentDescription(source);
-                            MarkdownRenderer.bindStreaming(view, source);
+                        content.setVisibility(source.isEmpty() ? GONE : VISIBLE);
+                        if (!source.equals(content.getContentDescription())) {
+                            content.setContentDescription(source);
+                            MarkdownRenderer.bindStreaming(content, source);
                         }
                     } else {
+                        TextView view = parts.get(id);
+                        if (view == null) continue;
                         String stage = seedanceToolStage(part);
                         view.setText(stage == null ? toolStatus(part.optString("state")) + " "
                             + part.optString("tool") + "  ›" : stage + "  ›");
@@ -2838,9 +2911,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (!part.optString("tool").equals("seedance_video")) return null;
         JSONObject input;
         JSONObject output;
-        try { input = new JSONObject(part.optString("input", "{}")); }
+        try { input = toolJson.read(part.optString("input", "{}")); }
         catch (Exception ignored) { input = new JSONObject(); }
-        try { output = new JSONObject(part.optString("output", "{}")); }
+        try { output = toolJson.read(part.optString("output", "{}")); }
         catch (Exception ignored) { output = new JSONObject(); }
         if (part.optString("state").equals("error")) return "人物替换 · 当前阶段失败";
         String action = input.optString("action");
@@ -2874,7 +2947,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             || !part.optString("state").equals("completed")) return null;
         String output = part.optString("output");
         try {
-            JSONObject artifact = new JSONObject(output);
+            JSONObject artifact = toolJson.read(output);
             String path = artifact.optString("path");
             if (artifact.optString("mime_type").equals("application/pdf")
                 && path.toLowerCase(Locale.ROOT).endsWith(".pdf")) return path;
@@ -2890,7 +2963,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (!part.optString("tool").equals("mobile_export_diagnostics")
             || !part.optString("state").equals("completed")) return null;
         try {
-            JSONObject artifact = new JSONObject(part.optString("output"));
+            JSONObject artifact = toolJson.read(part.optString("output"));
             String path = artifact.optString("path");
             if (artifact.optString("mime_type").equals("text/plain")
                 && path.equals(new File(path).getName())
@@ -2916,7 +2989,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (!part.optString("tool").equals("agent_send_media")
             || !part.optString("state").equals("completed")) return null;
         try {
-            JSONObject artifact = new JSONObject(part.optString("output"));
+            JSONObject artifact = toolJson.read(part.optString("output"));
             String type = artifact.optString("type");
             if (artifact.optString("delivery").equals("current_ai_session")
                 && !artifact.optString("path").isEmpty()

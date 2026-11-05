@@ -4,14 +4,41 @@
 #pragma once
 
 #include <QPointF>
+#include <QHash>
 #include <QRectF>
 #include <QString>
+#include <QVector>
 #include <memory>
 
 #include "markdown/MarkdownDocument.h"
 #include "markdown/MarkdownTheme.h"
 
 class QPainter;
+
+// Geometry is cached with a document; horizontal offsets belong to each host
+// instance and are deliberately not retained in the shared layout cache.
+struct MarkdownCodeBlockViewport {
+    QRectF bounds;
+    QRectF viewport;
+    qreal contentWidth = 0;
+    qreal zoom = 1;
+
+    qreal maximumOffset() const { return qMax<qreal>(0, contentWidth - viewport.width()); }
+    QRectF scrollTrack() const {
+        if (maximumOffset() <= 0) return {};
+        return QRectF(viewport.left(), bounds.bottom() - 5 * zoom,
+                      viewport.width(), qMax<qreal>(2, 3 * zoom));
+    }
+    QRectF scrollThumb(qreal offset) const {
+        const QRectF track = scrollTrack();
+        if (track.isEmpty()) return {};
+        const qreal width = qMin(track.width(), qMax<qreal>(24 * zoom,
+            track.width() * viewport.width() / contentWidth));
+        const qreal left = track.left() + (track.width() - width) *
+            qBound<qreal>(0, offset, maximumOffset()) / maximumOffset();
+        return QRectF(left, track.top(), width, track.height());
+    }
+};
 
 // 把块树排到像素上：**一次排版，多次绘制**。
 //
@@ -62,11 +89,14 @@ public:
     // 不折行时这篇内容需要多宽。气泡要「短消息就窄一点」，得先知道这个。
     // **不要用 QFontMetrics 去估**——上一版气泡就是估窄了，字被提前折断。
     qreal naturalWidth() const;
+    const QVector<MarkdownCodeBlockViewport>& codeBlocks() const;
     bool isEmpty() const;
 
     // origin 是内容左上角在 painter 坐标系里的位置；clip 是同一坐标系下的可见区域。
     // 传一个空的 clip 表示全画。
     void paint(QPainter* painter, const QPointF& origin, const QRectF& clip = QRectF()) const;
+    void paint(QPainter* painter, const QPointF& origin, const QRectF& clip,
+               const QHash<int, qreal>& codeOffsets) const;
 
     // 命中测试。point 相对于**内容左上角**。没命中链接时返回空串。
     QString linkAt(const QPointF& point) const;
@@ -76,6 +106,7 @@ public:
     // 位置是全篇的字符偏移，坐标系就是 selectableText()。**块之间补了换行**，
     // 所以复制出来的东西保持分段，不会糊成一坨。
     int positionAt(const QPointF& point) const;
+    int positionAt(const QPointF& point, const QHash<int, qreal>& codeOffsets) const;
     int textLength() const;
     const QString& selectableText() const;
     // from/to 不分先后，内部会排好。from == to 表示没有选区。

@@ -4,6 +4,7 @@
 #include "ui/MaiFfplayVideoDialog.h"
 #include "ui/MaiVideoSpeedSelector.h"
 #include "ui/MaiVideoHud.h"
+#include "ui/MaiVideoVolumePopup.h"
 #include "MaiCloudVod.h"
 #include "ui/DesktopMusicPlayerDialog.h"
 
@@ -230,8 +231,9 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     // 所有桌面入口共用自绘窗口；原生 surface 只负责画面，不再决定播放器外观。
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
     setWindowTitle(QFileInfo(path).fileName());
-    setMinimumSize(640, 420);
-    setStyleSheet(QStringLiteral("QDialog { background:#101010; }"));
+    // 最小尺寸只保证控件可操作，不锁定宽高比；自由拉伸后仍由 Presenter 等比完整显示。
+    setMinimumSize(480, 270);
+    setStyleSheet(QStringLiteral("QDialog { background:#000000; }"));
     titleBar_ = new MaiVideoHud(this);
     titleBar_->setObjectName(QStringLiteral("ffplayTitleBar"));
     titleBar_->setStyleSheet(QStringLiteral("QWidget#ffplayTitleBar {background:#101010;}"));
@@ -337,7 +339,7 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     surface_->setAttribute(Qt::WA_PaintOnScreen);
     surface_->setAttribute(Qt::WA_NoSystemBackground);
     // 持久的 owner HUD 使用 Qt 顶层透明合成；不重建控件，也不让 Qt 擦写 D3D 视频。
-    // 普通窗口是视频外的黑色 footer，全屏才把渐变背景覆盖到视频上。
+    // 窗口态和全屏共用同一真实渐变浮层，不能为栏位从视频视口扣除高度。
     overlay_ = new MaiVideoHud(this);
     overlay_->setObjectName(QStringLiteral("ffplayOverlay"));
     overlay_->setStyleSheet(QStringLiteral("QWidget#ffplayOverlay {background:#000000;}"));
@@ -404,28 +406,9 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     volumeButton_->setStyleSheet(flatButton);
     volumeButton_->setIconSize(QSize(24, 24));
     volumeButton_->setPopupMode(QToolButton::InstantPopup);
-    auto* volumeMenu = new QMenu(volumeButton_);
-    volumeMenu->setObjectName(QStringLiteral("ffplayVolumeMenu"));
-    volumeMenu->setStyleSheet(
-        QStringLiteral("QMenu {color:#eeeeee;background:#202020;border:1px solid #414141;padding:8px;}"
-                       "QMenu::item {padding:7px 12px;} QMenu::item:selected {background:#373737;}"));
-    auto* volumeWidget = new QWidget(volumeMenu);
-    auto* volumeLayout = new QHBoxLayout(volumeWidget);
-    volumeLayout->setContentsMargins(8, 6, 8, 6);
-    volumeSlider_ = new QSlider(Qt::Horizontal, volumeWidget);
-    volumeSlider_->setObjectName(QStringLiteral("ffplayVolumeSlider"));
-    volumeSlider_->setAccessibleName(QStringLiteral("音量"));
-    volumeSlider_->setRange(0, 100);
-    volumeSlider_->setValue(100);
-    volumeSlider_->setFixedWidth(128);
-    volumeSlider_->setStyleSheet(seekSlider_->styleSheet());
-    volumeLayout->addWidget(volumeSlider_);
-    auto* widgetAction = new QWidgetAction(volumeMenu);
-    widgetAction->setDefaultWidget(volumeWidget);
-    volumeMenu->addAction(widgetAction);
-    muteAction_ = volumeMenu->addAction(QStringLiteral("静音"));
-    muteAction_->setObjectName(QStringLiteral("ffplayMuteAction"));
-    muteAction_->setCheckable(true);
+    auto* volumeMenu = new MaiVideoVolumePopup(volumeButton_);
+    volumeSlider_ = volumeMenu->slider();
+    muteAction_ = volumeMenu->muteAction();
     volumeButton_->setMenu(volumeMenu);
     row->addWidget(volumeButton_);
     auto* fullscreen = button(panel, "ffplayFullscreenButton", "fullscreen", QStringLiteral("进入全屏"));
@@ -581,32 +564,26 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& displayName, std::shar
 
 void MaiFfplayVideoDialog::updateControlLayout() {
     if (!overlay_ || !titleBar_ || !surface_) return;
-    const int titleHeight = isFullScreen() ? 0 : 46;
     const int controlsHeight = 84;
-    // 全屏上下栏同时覆盖在视频上，显隐不改变视频几何；窗口态保留各自的固定区域。
+    // 普通窗口与全屏均覆盖完整视频，控件显隐不改变画面比例或引入固定黑色 footer。
     const bool shown = isVisible() && !isMinimized() && hudOwnerActive_ && (!isFullScreen() || controlsVisible_);
     const QPoint origin = mapToGlobal(QPoint());
     titleBar_->setGeometry(QRect(origin, QSize(width(), 46)));
-    titleBar_->setStyleSheet(isFullScreen()
-        ? QStringLiteral("QWidget#ffplayTitleBar {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-                         "stop:0 rgba(0,0,0,210),stop:1 rgba(0,0,0,15));}")
-        : QStringLiteral("QWidget#ffplayTitleBar {background:#101010;}"));
-    // 控件隐藏不参与几何计算，全屏视频不会跟着控制栏出现/收起而跳动。
-    surface_->setGeometry(0, titleHeight, width(),
-                          std::max(1, height() - titleHeight - (isFullScreen() ? 0 : controlsHeight)));
+    titleBar_->setStyleSheet(QStringLiteral(
+        "QWidget#ffplayTitleBar {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+        "stop:0 rgba(0,0,0,210),stop:1 rgba(0,0,0,15));}"));
+    // 保持 Graphics 自己的 fit 规则：任意窗口比例下只保留必要的 letterbox，不裁剪或拉伸视频。
+    surface_->setGeometry(rect());
     overlay_->setGeometry(QRect(origin + QPoint(0, height() - controlsHeight), QSize(width(), controlsHeight)));
-    overlay_->setStyleSheet(isFullScreen()
-        ? QStringLiteral("QWidget#ffplayOverlay {background:transparent;}")
-        : QStringLiteral("QWidget#ffplayOverlay {background:#000000;}"));
+    overlay_->setStyleSheet(QStringLiteral("QWidget#ffplayOverlay {background:transparent;}"));
     if (auto* panel = findChild<QWidget*>(QStringLiteral("ffplayControlPanel")))
-        panel->setStyleSheet(isFullScreen()
-            ? QStringLiteral("QWidget#ffplayControlPanel {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-                             "stop:0 rgba(0,0,0,0),stop:1 rgba(0,0,0,190));}")
-            : QStringLiteral("QWidget#ffplayControlPanel {background:#000000;}"));
+        panel->setStyleSheet(QStringLiteral(
+            "QWidget#ffplayControlPanel {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            "stop:0 rgba(0,0,0,0),stop:1 rgba(0,0,0,190));}"));
     titleBar_->setVisible(shown);
     overlay_->setVisible(shown);
     // 原生 owner 关系保证 HUD 位于播放器之上；不反复 raise，否则会把 Popup 压回 owner 后面。
-    errorLabel_->setGeometry(40, titleHeight + std::max(0, (surface_->height() - 64) / 2), std::max(1, width() - 80),
+    errorLabel_->setGeometry(40, std::max(0, (surface_->height() - 64) / 2), std::max(1, width() - 80),
                              64);
     if (errorLabel_->isVisible()) errorLabel_->raise();
     if (auto* more = findChild<QWidget*>(QStringLiteral("videoMoreButton"))) more->setVisible(!cloudSource_);
@@ -660,6 +637,8 @@ void MaiFfplayVideoDialog::syncAudioControls() {
         muteAction_->setChecked(audioMuted_);
     }
     if (volumeButton_) {
+        // 核心回显在 QSignalBlocker 内同步 slider/action，百分比和可达静音状态也需显式刷新。
+        if (auto* menu = volumeButton_->menu()) static_cast<MaiVideoVolumePopup*>(menu)->refreshReadout();
         volumeButton_->setIcon(videoControlIcon(audioMuted_ || volumePercent_ == 0 ? "muted" : "volume"));
         volumeButton_->setToolTip(audioMuted_ ? QStringLiteral("已静音")
                                               : QStringLiteral("音量 %1%").arg(volumePercent_));
@@ -693,8 +672,8 @@ void MaiFfplayVideoDialog::revealControls() {
     if (overlay_) {
         overlay_->setVisible(shown);
     }
-    unsetCursor();
-    if (surface_) surface_->unsetCursor();
+    for (QWidget* widget : {static_cast<QWidget*>(this), surface_, titleBar_, overlay_})
+        if (widget) widget->unsetCursor();
     scheduleControlHide();
 }
 
@@ -811,6 +790,13 @@ bool MaiFfplayVideoDialog::presentVideo(void* userData, const MaiVideoFrame* fra
         maiGraphicsPresenterSetHlgOutput(dialog->viewId_, false, nullptr, 0);
     }
     const bool shown = maiGraphicsPresenterShowVideoFrameWithSubtitle(dialog->viewId_, frame, subtitle, false);
+    // SDL 的初始 SIZE_CHANGED 可能使 video_open 不再调用 host.set_size；直接取首个被接受的
+    // 视频帧尺寸作为可靠默认比例。只跨线程排队一次，不在每帧或换速时重新调整用户窗口。
+    if (shown && frame && frame->width > 0 && frame->height > 0 &&
+        frame->width <= uint32_t(std::numeric_limits<int>::max()) &&
+        frame->height <= uint32_t(std::numeric_limits<int>::max()) &&
+        !dialog->initialVideoSizeQueued_.exchange(true))
+        setSize(dialog, int(frame->width), int(frame->height));
     if (shown && frame && frame->color_transfer != MAI_VIDEO_TRANSFER_SDR) dialog->presentedHdrFrame_ = true;
     return shown;
 }
@@ -845,16 +831,24 @@ void MaiFfplayVideoDialog::setSize(void* userData, int width, int height) {
     QMetaObject::invokeMethod(
         dialog,
         [dialog, width, height] {
-            if (dialog->docked_ || dialog->isFullScreen()) return;
-            // 自动尺寸按同一标题栏 46px 和控制栏 84px 计算，保留源画面比例。
-            QSize size(std::max(width, 640), std::max(height + 130, 420));
-            // 原始 4K 或竖屏尺寸不能把独立窗口的关闭/播放控件推到屏幕外。
-            if (const auto* screen = dialog->screen()) {
-                const QSize available = screen->availableGeometry().size() * 0.85;
-                if (size.width() > available.width() || size.height() > available.height())
-                    size.scale(available, Qt::KeepAspectRatio);
-            }
+            if (width <= 0 || height <= 0 || dialog->initialVideoSizeApplied_) return;
+            dialog->initialVideoSizeApplied_ = true;
+            if (dialog->docked_ || dialog->isFullScreen() || dialog->isMaximized() ||
+                dialog->windowGeometryCustomized_) return;
+            const QScreen* screen = dialog->screen();
+            if (!screen) screen = QGuiApplication::primaryScreen();
+            const QRect available = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 800);
+            const QSize limit = available.size() * 0.85;
+            // 用同一个比例因子满足普通素材的最小尺寸与屏幕上限，不分别拉宽/拉高源比例。
+            // 极端长宽比受控件最小宽高约束时仍由 Presenter fit，绝不裁剪或变形内容。
+            const double minimumScale = std::max(double(dialog->minimumWidth()) / width,
+                                                  double(dialog->minimumHeight()) / height);
+            const double maximumScale = std::min(double(limit.width()) / width,
+                                                  double(limit.height()) / height);
+            const double scale = std::min(std::max(1.0, minimumScale), maximumScale);
+            const QSize size(qRound(width * scale), qRound(height * scale));
             dialog->resize(size.expandedTo(dialog->minimumSize()));
+            dialog->move(available.center() - QPoint(dialog->width() / 2, dialog->height() / 2));
         },
         Qt::QueuedConnection);
 }
@@ -864,7 +858,12 @@ void MaiFfplayVideoDialog::setPosition(void* userData, int x, int y) {
     QMetaObject::invokeMethod(
         dialog,
         [dialog, x, y] {
-            if (!dialog->docked_) dialog->move(x, y);
+            if (dialog->docked_ || dialog->isFullScreen() || dialog->isMaximized() ||
+                dialog->initialPositionApplied_ || dialog->windowGeometryCustomized_) return;
+            dialog->initialPositionApplied_ = true;
+            // 兼容层 SDL_WINDOWPOS_CENTERED/UNDEFINED 都为 (0,0)；默认位置由首次定尺寸居中。
+            // 后续重播/切速不能把用户已移动的窗口重新移到屏幕原点。
+            if (x != 0 || y != 0) dialog->move(x, y);
         },
         Qt::QueuedConnection);
 }
@@ -1276,6 +1275,7 @@ bool MaiFfplayVideoDialog::handleFrameMouse(QObject* watched, QEvent* event) {
         framePressGlobal_ = mouse->globalPos();
         framePressGeometry_ = geometry();
         if (movingFrame_ || resizingFrame_) {
+            windowGeometryCustomized_ = true;
             grabMouse();
             return true;
         }
@@ -1306,17 +1306,21 @@ bool MaiFfplayVideoDialog::handleFrameMouse(QObject* watched, QEvent* event) {
         releaseMouse();
         return true;
     }
-    if (type == QEvent::MouseMove && !isFullScreen() && !isMaximized()) {
+    if (type == QEvent::MouseMove) {
+        Qt::CursorShape cursor = Qt::ArrowCursor;
         if (edges == (Qt::LeftEdge | Qt::TopEdge) || edges == (Qt::RightEdge | Qt::BottomEdge))
-            setCursor(Qt::SizeFDiagCursor);
+            cursor = Qt::SizeFDiagCursor;
         else if (edges == (Qt::RightEdge | Qt::TopEdge) || edges == (Qt::LeftEdge | Qt::BottomEdge))
-            setCursor(Qt::SizeBDiagCursor);
+            cursor = Qt::SizeBDiagCursor;
         else if (edges & (Qt::LeftEdge | Qt::RightEdge))
-            setCursor(Qt::SizeHorCursor);
+            cursor = Qt::SizeHorCursor;
         else if (edges & (Qt::TopEdge | Qt::BottomEdge))
-            setCursor(Qt::SizeVerCursor);
-        else
-            unsetCursor();
+            cursor = Qt::SizeVerCursor;
+        // native surface 与两个 owned HUD 是不同的原生窗口；仅给 owner 设置不会可靠继承。
+        for (QWidget* widget : {static_cast<QWidget*>(this), surface_, titleBar_, overlay_}) {
+            if (cursor == Qt::ArrowCursor) widget->unsetCursor();
+            else widget->setCursor(cursor);
+        }
     }
     return false;
 }

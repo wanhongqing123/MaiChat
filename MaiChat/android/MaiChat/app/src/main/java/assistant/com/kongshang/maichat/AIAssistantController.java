@@ -62,7 +62,9 @@ public final class AIAssistantController {
               String restoreDraft, int restoreGeneration, boolean remoteCommandPending,
               boolean ready) {
             this.data = data;
-            this.remoteSession = remoteSession;
+            // State 交给主线程后不再共享可变目录对象，避免点击捕获过程中轮次被后台改写。
+            try { this.remoteSession = remoteSession == null ? null : new JSONObject(remoteSession.toString()); }
+            catch (Exception invalid) { throw new IllegalArgumentException("Invalid remote owner snapshot", invalid); }
             this.selected = selected;
             this.baseUrl = baseUrl;
             this.model = model;
@@ -78,6 +80,15 @@ public final class AIAssistantController {
             String encoded = messages == null ? "" : messages.toString();
             this.messageHash = encoded.hashCode();
             this.messageLength = encoded.length();
+        }
+        JSONObject runtime(String session) {
+            if (remoteSession != null && session.equals(remoteSession.optString("id"))) return remoteSession;
+            JSONArray sessions = data.optJSONArray("sessions");
+            if (sessions != null) for (int i = 0; i < sessions.length(); i++) {
+                JSONObject item = sessions.optJSONObject(i);
+                if (item != null && session.equals(item.optString("id"))) return item;
+            }
+            return new JSONObject();
         }
         boolean busy() {
             if (remoteSession != null) return remoteSession.optBoolean("busy");
@@ -110,6 +121,7 @@ public final class AIAssistantController {
     private static String currentAccountUserId = "";
     private static Context applicationContext;
     private static final Map<String, List<java.lang.ref.WeakReference<Thread>>> closingAccountWorkers = new HashMap<>();
+    private static final Map<String, List<CompletableFuture<Void>>> closingAttachmentJobs = new HashMap<>();
     public static synchronized AIAssistantController shared(Context context) {
         applicationContext = context.getApplicationContext();
         if (shared == null)
@@ -161,8 +173,10 @@ public final class AIAssistantController {
         if (registered != null) for (java.lang.ref.WeakReference<Thread> reference : registered) {
             Thread worker = reference.get(); if (worker != null && worker.isAlive()) closing.add(worker);
         }
-        if (closing.isEmpty()) return CompletableFuture.completedFuture(null);
-        return CompletableFuture.runAsync(() -> {
+        List<CompletableFuture<Void>> attachments = new ArrayList<>(
+            closingAttachmentJobs.getOrDefault(owner, java.util.Collections.emptyList()));
+        CompletableFuture<Void> barrier = closing.isEmpty() && attachments.isEmpty() ? CompletableFuture.completedFuture(null)
+            : CompletableFuture.runAsync(() -> {
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
             for (Thread worker : closing) {
                 long remaining = deadline - System.nanoTime();
@@ -170,6 +184,19 @@ public final class AIAssistantController {
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new java.util.concurrent.CompletionException(interrupted); }
                 if (worker.isAlive()) throw new java.util.concurrent.CompletionException(new IOException("AI account is still closing"));
             }
+            for (CompletableFuture<Void> preparation : attachments) {
+                long remaining = deadline - System.nanoTime();
+                try {
+                    if (remaining <= 0) throw new java.util.concurrent.TimeoutException("Attachment cleanup is still running");
+                    preparation.get(remaining, TimeUnit.NANOSECONDS);
+                } catch (Exception failure) { throw new java.util.concurrent.CompletionException(failure); }
+            }
+        });
+        return barrier.thenRun(() -> {
+            // 仅服务端已接受的注销清私有待发正文；普通换号保留原账号队列。
+            if (applicationContext != null && !applicationContext.getSharedPreferences(
+                "maichat-agent-outgoing-" + owner, Context.MODE_PRIVATE).edit().clear().commit())
+                throw new java.util.concurrent.CompletionException(new IOException("AI 待发内容清理失败"));
         });
     }
     static synchronized void registerClosingAccountWorker(String owner, Thread worker) {
@@ -179,6 +206,10 @@ public final class AIAssistantController {
         });
         // 快速 A→B→A 时保留 A 的每一代活跃线程，后一次 close 不能覆盖前一代的屏障。
         closingAccountWorkers.computeIfAbsent(owner, ignored -> new ArrayList<>()).add(new java.lang.ref.WeakReference<>(worker));
+    }
+    static synchronized void registerClosingAttachmentJobs(String owner, CompletableFuture<Void> finished) {
+        closingAttachmentJobs.values().forEach(jobs -> jobs.removeIf(CompletableFuture::isDone));
+        closingAttachmentJobs.computeIfAbsent(owner, ignored -> new ArrayList<>()).add(finished);
     }
     private static native long nativeCreate();
     private static synchronized void onNativeSessionChanged(String sessionId) {
@@ -198,9 +229,24 @@ public final class AIAssistantController {
     private final Context context;
     private final HandlerThread thread = new HandlerThread("MaiChat-Agent");
     private final Handler worker;
+    private final AIAssistantPreparationJobs preparations;
+    private long nativeEpoch;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final String testEndpoint;
     private final String accountUserId;
+    private AIAssistantOutgoingQueue outgoingQueue;
+    private android.content.SharedPreferences outgoingPreferences;
+    private final Set<String> outgoingActiveOwners = new HashSet<>();
+    private final Map<String, OutgoingReceipt> outgoingReceipts = new HashMap<>();
+    private final Map<String, String> remoteSteeringInputs = new java.util.LinkedHashMap<>();
+    private String outgoingEmptySession = "";
+    private static final class OutgoingReceipt {
+        final JSONObject owner;
+        final Consumer<JSONObject> completion;
+        OutgoingReceipt(JSONObject owner, Consumer<JSONObject> completion) {
+            this.owner = owner; this.completion = completion;
+        }
+    }
     private final MaiChatAuthClient accountAuth;
     private final long accountToolLoginGeneration;
     private final AndroidSessionSyncCoordinator sessionSync;
@@ -233,6 +279,8 @@ public final class AIAssistantController {
     private volatile String wanWorkspaceId = "";
     private volatile String miniMaxApiKey = "";
     private volatile JSONObject data = new JSONObject();
+    private final AIAssistantMessagePages localPages = new AIAssistantMessagePages();
+    private final AIAssistantMessagePages remotePages = new AIAssistantMessagePages();
     private JSONArray remoteSessions = new JSONArray();
     private JSONArray remoteDevices = new JSONArray();
     private final Map<String, Long> remoteCreatePendingUntil = new HashMap<>();
@@ -283,8 +331,34 @@ public final class AIAssistantController {
             throw new IllegalArgumentException("Test endpoint in release build");
         this.testEndpoint = testEndpoint;
         accountUserId = testEndpoint == null ? currentAccountUserId : "";
+        try {
+            android.content.SharedPreferences saved = this.context.getSharedPreferences(
+                "maichat-agent-outgoing-" + accountUserId, Context.MODE_PRIVATE);
+            outgoingPreferences = saved;
+            outgoingQueue = new AIAssistantOutgoingQueue(new AIAssistantOutgoingQueue.Storage() {
+                public String read() { return saved.getString("entries", ""); }
+                public boolean write(String value) {
+                    android.content.SharedPreferences.Editor edit = saved.edit().putString("entries", value);
+                    try {
+                        JSONObject recovery = new JSONObject(saved.getString("recovery", "{}"));
+                        JSONArray next = new JSONArray(value);
+                        for (int i = 0; i < next.length(); i++) {
+                            JSONObject payload = next.getJSONObject(i).getJSONObject("payload");
+                            if (!recovery.optString("id").isEmpty()
+                                && recovery.optString("id").equals(payload.optString("recoveryId")))
+                                edit.remove("recovery");
+                        }
+                    } catch (Exception invalid) { return false; }
+                    // 新 capture 和恢复稿的移交在同一次私有 prefs 事务完成，避免重启后重复恢复。
+                    return edit.commit();
+                }
+            });
+        } catch (IOException failure) { error = safeMessage(failure); }
         thread.start();
         worker = new Handler(thread.getLooper());
+        preparations = new AIAssistantPreparationJobs(command -> {
+            if (!worker.post(command)) throw new java.util.concurrent.RejectedExecutionException("Agent control queue closed");
+        }, java.util.concurrent.Executors.newFixedThreadPool(2, command -> new Thread(command, "MaiChat-AttachmentIO")));
         worker.post(this::initialize);
         sessionSync = testEndpoint == null && !accountUserId.isEmpty()
             ? new AndroidSessionSyncCoordinator(this.context, this, accountAuth) : null;
@@ -663,6 +737,9 @@ public final class AIAssistantController {
         }
         return new File(new File(base, "Accounts"), folder.toString());
     }
+    private static final class NativeAgentFailure extends IOException {
+        NativeAgentFailure(String message) { super(message); }
+    }
     private JSONObject invokeNativeAgent(JSONObject request) throws Exception {
         if (Looper.myLooper() == Looper.getMainLooper())
             throw new IllegalStateException("Native agent on UI thread");
@@ -673,7 +750,8 @@ public final class AIAssistantController {
             throw new IllegalStateException("AI 核心未返回结果");
         JSONObject result = new JSONObject(new String(response, StandardCharsets.UTF_8));
         if (!result.optBoolean("ok"))
-            throw new IllegalStateException(result.optString("error", "操作失败"));
+            throw new NativeAgentFailure(result.optString("error", "操作失败"));
+        if (request.optString("op").equals("configure")) nativeEpoch++;
         return result;
     }
     private JSONObject makeOperationRequest(String operationName) throws Exception {
@@ -827,10 +905,17 @@ public final class AIAssistantController {
     }
     private void refresh(boolean force) {
         try {
-            JSONObject result = invokeNativeAgent(makeOperationRequest("snapshot").put("force", force));
+            AIAssistantMessagePages.Ticket page = localPages.select("local:" + selected);
+            JSONObject result = invokeNativeAgent(localPages.snapshotRequest(selected, force));
             if (result.optBoolean("changed")) {
                 hideReasoningText(result);
                 attachMediaMentions(result);
+                JSONObject updates = new JSONObject().put("messages", result.optJSONArray("messageUpdates"));
+                hideReasoningText(updates);
+                attachMediaMentions(updates);
+                localPages.acceptSnapshot(page, result);
+                applyMessagePages(result, localPages);
+                result.remove("messageUpdates");
                 data = result;
                 if (!result.optString("error").isEmpty())
                     error = result.optString("error");
@@ -840,6 +925,67 @@ public final class AIAssistantController {
             error = safeMessage(e);
             publishState();
         }
+    }
+    private static void applyMessagePages(JSONObject target, AIAssistantMessagePages pages)
+            throws org.json.JSONException {
+        target.put("messages", pages.messages()).put("hasOlderMessages", pages.hasOlder())
+            .put("loadingOlder", pages.loading());
+    }
+    private static String pageOwner(JSONObject remote) {
+        return new JSONArray().put(remote.optString("device_slot"))
+            .put(remote.optString("login_session_id")).put(remote.optString("id")).toString();
+    }
+    /** Existing history read APIs provide actual earlier rows; a failed read keeps its cursor and rows. */
+    void loadOlder(Consumer<Boolean> completion) {
+        final State clicked = state;
+        worker.post(() -> {
+            boolean remote = clicked.remoteSession != null;
+            String owner = remote ? pageOwner(clicked.remoteSession)
+                : "local:" + clicked.selected;
+            if (closed || !clicked.selected.equals(state.selected)
+                || (remote && !sameRemote(clicked.remoteSession, selectedRemote))
+                || (!remote && selectedRemote != null)) {
+                main.post(() -> completion.accept(false)); return;
+            }
+            AIAssistantMessagePages pages = remote ? remotePages : localPages;
+            pages.select(owner);
+            AIAssistantMessagePages.Ticket ticket = pages.beginOlder();
+            if (ticket == null) { main.post(() -> completion.accept(false)); return; }
+            try {
+                applyMessagePages(remote ? remoteData : data, pages);
+                publishState();
+                if (remote) {
+                    int selection = remoteSelectionGeneration;
+                    sessionSync.readRemoteHistory(clicked.remoteSession, ticket.before,
+                        AIAssistantMessagePages.OLDER_LIMIT, (page, failure) -> worker.post(() -> {
+                        boolean accepted = false;
+                        if (!closed && selection == remoteSelectionGeneration
+                            && sameRemote(clicked.remoteSession, selectedRemote) && pages.matches(ticket)) {
+                            try {
+                                if (!failure.isEmpty() || page == null || !page.optBoolean("ok"))
+                                    throw new IOException(failure.isEmpty() ? "读取历史消息失败" : failure);
+                                sanitizeRemoteMedia(page.optJSONArray("messages"));
+                                accepted = pages.acceptOlder(ticket, page.optJSONArray("messages"));
+                                error = "";
+                            } catch (Exception problem) { pages.failOlder(ticket); error = safeMessage(problem); }
+                            try { applyMessagePages(remoteData, pages); } catch (Exception ignored) { }
+                            publishState();
+                        }
+                        boolean result = accepted; main.post(() -> completion.accept(result));
+                    }));
+                    return;
+                }
+                JSONObject result = invokeNativeAgent(pages.pageRequest(clicked.selected, ticket));
+                hideReasoningText(result); attachMediaMentions(result);
+                boolean accepted = pages.acceptOlder(ticket, result.optJSONArray("messages"));
+                applyMessagePages(data, pages); error = ""; publishState();
+                main.post(() -> completion.accept(accepted));
+            } catch (Exception problem) {
+                pages.failOlder(ticket); error = safeMessage(problem);
+                try { applyMessagePages(remote ? remoteData : data, pages); } catch (Exception ignored) { }
+                publishState(); main.post(() -> completion.accept(false));
+            }
+        });
     }
     private static void hideReasoningText(JSONObject snapshot) {
         JSONArray messages = snapshot.optJSONArray("messages");
@@ -918,10 +1064,24 @@ public final class AIAssistantController {
             for (int i = 0; i < remoteSessions.length(); i++) combined.put(remoteSessions.get(i));
             visible.put("sessions", combined);
             visible.put("devices", new JSONArray(remoteDevices.toString()));
+            visible.put("outgoing", outgoingQueue == null ? new JSONArray() : outgoingQueue.entries());
+            visible.put("emptyDraftSession", outgoingEmptySession);
+            visible.put("outgoingRecovery", outgoingPreferences == null ? new JSONObject()
+                : new JSONObject(outgoingPreferences.getString("recovery", "{}")));
         } catch (Exception ignored) { visible = data; }
         String status = pendingRemoteSelection != null
             ? "正在读取 " + pendingRemoteSelection.optString("device_name") + " 的对话…"
             : selectedRemote == null ? "" : remoteCommandStatus;
+        if (ready && outgoingQueue != null) try {
+            JSONArray queued = outgoingQueue.entries();
+            Set<String> owners = new HashSet<>();
+            for (int i = 0; i < queued.length(); i++) {
+                // 发布状态不改写私有队列；异常条目保留，且不能因 Android 的 checked JSON API 卡住刷新。
+                JSONObject entry = queued.optJSONObject(i);
+                if (entry != null && !entry.optString("owner").isEmpty()) owners.add(entry.optString("owner"));
+            }
+            for (String owner : owners) worker.post(() -> drainOutgoing(owner));
+        } catch (IOException ignored) { /* 保留私有记录，不能因发布界面而清除内容。 */ }
         State next = new State(visible, selectedRemote, shown, baseUrl, model, policy,
             error, status, remoteRestoreDraft, remoteRestoreGeneration,
             selectedRemote != null && !pendingRemoteCommandIds.isEmpty(), ready);
@@ -1155,127 +1315,216 @@ public final class AIAssistantController {
         return true;
     }
 
+    private JSONObject prepareIncomingInput(String sessionId, JSONObject action,
+                                             AIAssistantPreparationJobs.Cancellation cancel) throws Exception {
+        cancel.check();
+        String operation = action.optString("action");
+        JSONObject request = new JSONObject(action.toString()).put("session", sessionId);
+        JSONArray synced = new JSONArray();
+        String text = action.optString("text");
+        JSONArray attachments = action.optJSONArray("attachments");
+        if ((text.isEmpty() && (attachments == null || attachments.length() == 0)) ||
+            text.getBytes(StandardCharsets.UTF_8).length > 16 * 1024 ||
+            (attachments != null && attachments.length() > 10))
+            throw new IOException("消息为空或过长");
+        JSONArray images = new JSONArray();
+        JSONArray videos = new JSONArray();
+        StringBuilder documents = new StringBuilder();
+        if (attachments != null && attachments.length() > 0) {
+            String login = sessionSync == null ? "" :
+                sessionSync.localLoginSessionId();
+            if (login.isEmpty()) throw new IOException("会话同步登录状态不可用");
+            MaiSessionAttachments transfer = new MaiSessionAttachments(context, accountUserId);
+            MaiSessionAttachments.Room room = new MaiSessionAttachments.Room(
+                sessionSync.localSlot(),login,sessionId);
+            for (int i = 0; i < attachments.length(); i++) {
+                cancel.check();
+                JSONObject reference = attachments.optJSONObject(i);
+                if (reference == null || reference.optString("attachment_id").isEmpty())
+                    throw new IOException("会话附件引用无效");
+                MaiSessionAttachments.Downloaded downloaded = transfer.download(
+                    reference.optString("attachment_id"),room,cancel);
+                ImportedFile file;
+                try { file = importDownloadedSessionFile(downloaded); }
+                finally { downloaded.file.delete(); }
+                // 随机导入副本尚未交给 Core；只清理被取消任务的副本，原附件引用保持可用。
+                File preparedFile = workspaceFile(file.relativePath);
+                if (preparedFile != null) cancel.onCancel(() -> preparedFile.delete());
+                cancel.check();
+                JSONObject record = new JSONObject()
+                    .put("attachment_id",reference.optString("attachment_id"))
+                    .put("name",downloaded.name)
+                    .put("kind",downloaded.mediaType)
+                    .put("mimeType",downloaded.contentType)
+                    .put("path",file.relativePath);
+                synced.put(record);
+                if (file.image) images.put(new JSONObject()
+                    .put("path",file.relativePath).put("mimeType",file.mimeType));
+                else if (file.mimeType.startsWith("video/"))
+                    videos.put(new JSONObject().put("path",file.relativePath)
+                        .put("mimeType",file.mimeType));
+                else documents.append("\n- ").append(file.relativePath);
+            }
+        }
+        if (documents.length() > 0)
+            text += "\n\n会话附件已保存到本机工作目录：" + documents;
+        request.put("op", operation.equals("steer") ? "steer" : "send").put("text",text)
+            .put("images", images).put("videos", videos)
+            .put("quoteMessageId", action.optString("quoteMessageId"));
+        cancel.check();
+        return new JSONObject().put("request", request).put("synced", synced);
+    }
+    private static JSONObject rejectedPreparation(Exception failure) {
+        JSONObject result = new JSONObject();
+        try { result.put("ok", false).put("error", safeMessage(failure)); }
+        catch (Exception ignored) { }
+        return result;
+    }
     void commandForSync(String sessionId, JSONObject action, Consumer<JSONObject> completion) {
         worker.post(() -> {
-            JSONObject result = new JSONObject();
             try {
-                if (closed) throw new IOException("账号已切换");
-                if (!hasLocalSession(sessionId)) throw new IOException("本机会话不存在");
-                if (action == null) throw new IOException("远端操作无效");
-                String operation = action.optString("action");
-                JSONObject request = new JSONObject(action.toString()).put("op", operation)
-                    .put("session", sessionId);
-                JSONArray synced = new JSONArray();
-                if (operation.equals("prompt")) {
-                    String text = action.optString("text");
-                    JSONArray attachments = action.optJSONArray("attachments");
-                    if ((text.isEmpty() && (attachments == null || attachments.length() == 0)) ||
-                        text.getBytes(StandardCharsets.UTF_8).length > 16 * 1024 ||
-                        (attachments != null && attachments.length() > 10))
-                        throw new IOException("消息为空或过长");
-                    JSONArray images = new JSONArray();
-                    JSONArray videos = new JSONArray();
-                    StringBuilder documents = new StringBuilder();
-                    if (attachments != null && attachments.length() > 0) {
-                        String login = sessionSync == null ? "" :
-                            sessionSync.localLoginSessionId();
-                        if (login.isEmpty()) throw new IOException("会话同步登录状态不可用");
-                        MaiSessionAttachments transfer = new MaiSessionAttachments(context);
-                        MaiSessionAttachments.Room room = new MaiSessionAttachments.Room(
-                            sessionSync.localSlot(),login,sessionId);
-                        for (int i = 0; i < attachments.length(); i++) {
-                            JSONObject reference = attachments.optJSONObject(i);
-                            if (reference == null || reference.optString("attachment_id").isEmpty())
-                                throw new IOException("会话附件引用无效");
-                            MaiSessionAttachments.Downloaded downloaded = transfer.download(
-                                reference.optString("attachment_id"),room);
-                            ImportedFile file;
-                            try { file = importDownloadedSessionFile(downloaded); }
-                            finally { downloaded.file.delete(); }
-                            JSONObject record = new JSONObject()
-                                .put("attachment_id",reference.optString("attachment_id"))
-                                .put("name",downloaded.name)
-                                .put("kind",downloaded.mediaType)
-                                .put("mimeType",downloaded.contentType)
-                                .put("path",file.relativePath);
-                            synced.put(record);
-                            if (file.image) images.put(new JSONObject()
-                                .put("path",file.relativePath).put("mimeType",file.mimeType));
-                            else if (file.mimeType.startsWith("video/"))
-                                videos.put(new JSONObject().put("path",file.relativePath)
-                                    .put("mimeType",file.mimeType));
-                            else documents.append("\n- ").append(file.relativePath);
-                        }
+                JSONObject captured = new JSONObject(action.toString());
+                String operation = captured.optString("action");
+                if (operation.equals("stop")) {
+                    String turn = captured.optString("turnId");
+                    if (!turn.isEmpty()) {
+                        JSONObject runtime = outgoingRuntime(sessionId, null);
+                        if (!runtime.optBoolean("busy") || !turn.equals(runtime.optString("turnId")))
+                            throw new IOException("原任务已结束或改变，没有停止新的任务");
                     }
-                    if (documents.length() > 0)
-                        text += "\n\n会话附件已保存到本机工作目录：" + documents;
-                    request.put("op", "send").put("text",text)
-                        .put("images", images).put("videos", videos)
-                        .put("quoteMessageId", "");
-                } else if (!operation.equals("stop") && !operation.equals("permission") &&
-                    !operation.equals("answer") && !operation.equals("rename")) {
-                    throw new IOException("不支持的远端操作");
+                    cancelPreparationsForSession(sessionId, null);
                 }
-                invokeNativeAgent(request);
-                result.put("ok", true);
-                if (operation.equals("prompt")) {
-                    try {
-                        JSONObject latest = invokeNativeAgent(new JSONObject()
-                            .put("op", "remote_snapshot").put("session", sessionId)
-                            .put("limit", 2));
-                        JSONArray recent = latest.optJSONArray("messages");
-                        if (recent != null) for (int i = 0; i < recent.length(); i++) {
-                            JSONObject message = recent.optJSONObject(i);
-                            if (message != null && message.optString("role").equals("user")) {
-                                result.put("user_message_id", message.optString("id"));
-                                if (synced.length() > 0 && sessionSync != null) {
-                                    JSONObject decorated = new JSONObject(message.toString());
-                                    JSONArray parts = decorated.optJSONArray("parts");
-                                    if (parts == null) parts = new JSONArray();
-                                    for (int j = 0; j < synced.length(); j++) {
-                                        JSONObject record = synced.getJSONObject(j);
-                                        JSONObject matching = null;
-                                        for (int k = 0; k < parts.length(); k++) {
-                                            JSONObject part = parts.optJSONObject(k);
-                                            if (part != null &&
-                                                record.optString("path").equals(part.optString("path")) &&
-                                                record.optString("kind").equals(part.optString("kind"))) {
-                                                matching = part;
-                                                break;
-                                            }
-                                        }
-                                        if (matching != null) matching
-                                            .put("attachment_id",record.optString("attachment_id"))
-                                            .put("name",record.optString("name"));
-                                        else parts.put(new JSONObject()
-                                            .put("id","session_attachment_" +
-                                                record.optString("attachment_id"))
-                                            .put("kind",record.optString("kind"))
-                                            .put("mimeType",record.optString("mimeType"))
-                                            .put("attachment_id",record.optString("attachment_id"))
-                                            .put("name",record.optString("name")));
-                                    }
+                if (operation.equals("steer") && (!(captured.opt("turnId") instanceof String)
+                    || !(captured.opt("requestId") instanceof String) || captured.optString("turnId").isEmpty()
+                    || captured.optString("requestId").isEmpty()))
+                    throw new IOException("补充需要原任务和请求编号，内容未派发");
+                JSONArray files = captured.optJSONArray("attachments");
+                String key = sessionId + "\u001f" + captured.optString("turnId") + "\u001f" + captured.optString("requestId");
+                if ((operation.equals("prompt") || operation.equals("steer")) && files != null && files.length() > 0
+                    && !(operation.equals("steer") && remoteSteeringInputs.containsKey(key))) {
+                    if (closed || !hasLocalSession(sessionId)) throw new IOException("原会话不可用，附件未派发");
+                    if (!preparations.start("incoming:" + sessionId, nativeEpoch, () -> nativeEpoch,
+                        cancel -> prepareIncomingInput(sessionId, captured, cancel), (prepared, failure) -> {
+                            if (failure != null) { completion.accept(rejectedPreparation(failure)); return; }
+                            if (closed || accountAuth.accountSessionGeneration() != accountToolLoginGeneration
+                                || !hasLocalSession(sessionId)) {
+                                completion.accept(rejectedPreparation(new IOException("原会话已改变，附件未派发")));
+                                return;
+                            }
+                            executeCommandForSync(sessionId, captured, prepared, completion);
+                        })) throw new IOException("原会话已有附件准备任务，内容未派发");
+                } else executeCommandForSync(sessionId, captured, null, completion);
+            } catch (Exception failure) { completion.accept(rejectedPreparation(failure)); }
+        });
+    }
+    private void executeCommandForSync(String sessionId, JSONObject action, JSONObject preparedOverride,
+                                       Consumer<JSONObject> completion) {
+        JSONObject result = new JSONObject();
+        try {
+            if (closed) throw new IOException("账号已切换");
+            if (!hasLocalSession(sessionId)) throw new IOException("本机会话不存在");
+            if (action == null) throw new IOException("远端操作无效");
+            String operation = action.optString("action");
+            JSONObject request = new JSONObject(action.toString()).put("op", operation)
+                .put("session", sessionId);
+            JSONArray synced = new JSONArray();
+            String importKey = sessionId + "\u001f" + action.optString("turnId")
+                + "\u001f" + action.optString("requestId");
+            String fingerprint = operation.equals("steer") ? AndroidSessionSyncCoordinator.fingerprint(
+                new JSONObject().put("id", sessionId), action) : "";
+            JSONObject prepared = remoteSteeringInputs.containsKey(importKey)
+                ? new JSONObject(remoteSteeringInputs.get(importKey)) : null;
+            if (operation.equals("steer") && prepared != null) {
+                if (!fingerprint.equals(prepared.getString("fingerprint")))
+                    throw new IOException("同一补充编号的内容已改变，未重复执行");
+                request = prepared.getJSONObject("request");
+                synced = prepared.getJSONArray("synced");
+            } else if (operation.equals("prompt") || operation.equals("steer")) {
+                JSONObject input = preparedOverride == null
+                    ? prepareIncomingInput(sessionId, action, new AIAssistantPreparationJobs.Cancellation())
+                    : preparedOverride;
+                request = input.getJSONObject("request");
+                synced = input.getJSONArray("synced");
+                if (operation.equals("steer")) {
+                    // Core 按完整输入去重；同编号重试必须复用第一次导入路径，不能再生成随机副本。
+                    if (action.optString("turnId").isEmpty() || action.optString("requestId").isEmpty())
+                        throw new IOException("补充缺少原任务和请求编号");
+                    remoteSteeringInputs.put(importKey, new JSONObject().put("fingerprint", fingerprint)
+                        .put("request", request).put("synced", synced).toString());
+                    while (remoteSteeringInputs.size() > 128)
+                        remoteSteeringInputs.remove(remoteSteeringInputs.keySet().iterator().next());
+                }
+            } else if (!operation.equals("stop") && !operation.equals("permission") &&
+                !operation.equals("answer") && !operation.equals("rename")) {
+                throw new IOException("不支持的远端操作");
+            }
+            if (operation.equals("stop") && !action.optString("turnId").isEmpty()) {
+                JSONObject runtime = outgoingRuntime(sessionId, null);
+                if (!runtime.optBoolean("busy") || !action.optString("turnId").equals(runtime.optString("turnId")))
+                    throw new IOException("原任务已结束或改变，没有停止新的任务");
+            }
+            JSONObject accepted = invokeNativeAgent(request);
+            result = AndroidSessionSyncCoordinator.commandReceipt(action, accepted);
+            if (result.optBoolean("ok") && (operation.equals("prompt") || operation.equals("steer"))) {
+                try {
+                    JSONObject latest = invokeNativeAgent(new JSONObject()
+                        .put("op", "remote_snapshot").put("session", sessionId)
+                        .put("limit", 1));
+                    // 收据的 user 可能已离开最新窗口；使用共享核心的普通精读入口，不拼造分页游标。
+                    JSONObject exact = invokeNativeAgent(new JSONObject().put("op", "message")
+                        .put("session", sessionId).put("id", result.getString("user_message_id")));
+                    JSONArray recent = exact.optJSONArray("messages");
+                    if (recent != null) for (int i = 0; i < recent.length(); i++) {
+                        JSONObject message = recent.optJSONObject(i);
+                        if (message != null && message.optString("id").equals(result.optString("user_message_id"))) {
+                            if (synced.length() > 0 && sessionSync != null) {
+                                JSONObject decorated = new JSONObject(message.toString());
+                                JSONArray parts = decorated.optJSONArray("parts");
+                                if (parts == null) parts = new JSONArray();
+                                for (int j = 0; j < synced.length(); j++) {
+                                    JSONObject record = synced.getJSONObject(j);
+                                    JSONObject matching = null;
                                     for (int k = 0; k < parts.length(); k++) {
                                         JSONObject part = parts.optJSONObject(k);
-                                        if (part != null) part.remove("path");
+                                        if (part != null &&
+                                            record.optString("path").equals(part.optString("path")) &&
+                                            record.optString("kind").equals(part.optString("kind"))) {
+                                            matching = part;
+                                            break;
+                                        }
                                     }
-                                    decorated.put("parts",parts);
-                                    sessionSync.publishAttachedMessage(sessionId,decorated,
-                                        latest.optJSONArray("permissions"),
-                                        latest.optJSONArray("questions"));
+                                    if (matching != null) matching
+                                        .put("attachment_id",record.optString("attachment_id"))
+                                        .put("name",record.optString("name"));
+                                    else parts.put(new JSONObject()
+                                        .put("id","session_attachment_" +
+                                            record.optString("attachment_id"))
+                                        .put("kind",record.optString("kind"))
+                                        .put("mimeType",record.optString("mimeType"))
+                                        .put("attachment_id",record.optString("attachment_id"))
+                                        .put("name",record.optString("name")));
                                 }
-                                break;
+                                for (int k = 0; k < parts.length(); k++) {
+                                    JSONObject part = parts.optJSONObject(k);
+                                    if (part != null) part.remove("path");
+                                }
+                                decorated.put("parts",parts);
+                                sessionSync.publishAttachedMessage(sessionId,decorated,
+                                    latest.optJSONArray("permissions"),
+                                    latest.optJSONArray("questions"), latest.optBoolean("busy"),
+                                    latest.optString("turnId"));
                             }
+                            break;
                         }
-                    } catch (Exception ignored) { /* The send already succeeded. */ }
-                }
-                refresh(true);
-            } catch (Exception failure) {
-                try { result.put("ok", false).put("error", safeMessage(failure)); }
-                catch (Exception ignored) { /* JSONObject has no external input here. */ }
+                    }
+                } catch (Exception ignored) { /* The send already succeeded. */ }
             }
-            completion.accept(result);
-        });
+            refresh(true);
+        } catch (Exception failure) {
+            try { result.put("ok", false).put("error", safeMessage(failure)); }
+            catch (Exception ignored) { /* JSONObject has no external input here. */ }
+        }
+        completion.accept(result);
     }
 
     void lifecycleForSync(JSONObject action, Consumer<JSONObject> completion) {
@@ -1296,6 +1545,7 @@ public final class AIAssistantController {
                     String id = action.optString("target_session_id");
                     if (id.isEmpty() || !hasLocalSession(id))
                         throw new IOException("所属设备的会话不存在");
+                    cancelPreparationsForSession(id, null);
                     invokeNativeAgent(new JSONObject().put("op", "delete").put("session", id));
                     if (id.equals(selected)) selected = "";
                     result.put("ok", true).put("session_id", id);
@@ -1551,6 +1801,16 @@ public final class AIAssistantController {
 
     void acceptRemotePayload(JSONObject envelope, JSONObject payload) {
         worker.post(() -> {
+            if (payload.optString("type").equals("command_result")) {
+                String command = payload.optString("command_id");
+                OutgoingReceipt receipt = outgoingReceipts.get(command);
+                if (receipt != null && receipt.owner.optString("id").equals(envelope.optString("session_id"))
+                    && receipt.owner.optString("device_slot").equals(envelope.optString("from_slot"))
+                    && receipt.owner.optString("login_session_id").equals(envelope.optString("from_login_session_id"))) {
+                    JSONObject result = payload.optJSONObject("result");
+                    completeOutgoingReceipt(command, result == null ? new JSONObject() : result, result == null);
+                }
+            }
             JSONObject owner = pendingRemoteSelection != null ? pendingRemoteSelection : selectedRemote;
             if (owner == null || !owner.optString("id").equals(envelope.optString("session_id")) ||
                 !owner.optString("device_slot").equals(envelope.optString("from_slot")) ||
@@ -1583,26 +1843,19 @@ public final class AIAssistantController {
             }
             JSONArray received = payload.optJSONArray("messages");
             if (!payload.optBoolean("ok") || received == null) return;
-            for (int i = 0; i < received.length(); i++) {
-                JSONObject message = received.optJSONObject(i);
-                JSONArray parts = message == null ? null : message.optJSONArray("parts");
-                if (parts == null) continue;
-                int originalCount = parts.length();
-                for (int j = 0; j < originalCount; j++) {
-                    JSONObject part = parts.optJSONObject(j);
-                    if (part == null) continue;
-                    String kind = part.optString("kind");
-                    if (!kind.equals("image") && !kind.equals("video")) continue;
-                    part.remove("path");
-                    if (!part.optString("attachment_id").isEmpty()) continue;
-                    try {
-                        parts.put(new JSONObject().put("id", part.optString("id") + "-remote-placeholder")
-                            .put("kind", "text").put("text", kind.equals("image")
-                                ? "[图片在所属设备，暂不可跨设备预览]" :
-                                  "[视频在所属设备，暂不可跨设备预览]"));
-                    } catch (Exception ignored) { /* Already decoded JSON. */ }
+            // 群历史/状态事件比 15 秒 presence 更新更快；busy 与 turnId 必须一起更新所有者快照。
+            try {
+                for (int i = 0; i < remoteSessions.length(); i++) {
+                    JSONObject candidate = remoteSessions.optJSONObject(i);
+                    if (candidate != null && sameRemote(candidate, owner)) {
+                        if (payload.has("busy")) candidate.put("busy", payload.optBoolean("busy"));
+                        if (payload.has("turnId")) candidate.put("turnId", payload.optString("turnId"));
+                    }
                 }
-            }
+                if (payload.has("busy")) owner.put("busy", payload.optBoolean("busy"));
+                if (payload.has("turnId")) owner.put("turnId", payload.optString("turnId"));
+            } catch (Exception ignored) { /* 原快照继续由目录更新，不猜测轮次。 */ }
+            sanitizeRemoteMedia(received);
             if (pendingRemoteSelection != null) {
                 if (!sameRemote(selectedRemote, pendingRemoteSelection)) {
                     pendingRemoteCommandIds.clear();
@@ -1616,39 +1869,41 @@ public final class AIAssistantController {
                 pendingRemoteSelection = null;
                 remoteSelectionGeneration++;
                 remoteData = payload;
-                Map<String, JSONObject> ordered = new java.util.TreeMap<>();
-                for (int i = 0; i < received.length(); i++) {
-                    JSONObject message = received.optJSONObject(i);
-                    if (message != null) ordered.put(message.optString("id"), message);
-                }
-                JSONArray chronological = new JSONArray();
-                for (JSONObject message : ordered.values()) chronological.put(message);
-                try { remoteData.put("messages", chronological); }
-                catch (Exception ignored) { /* Already decoded JSON. */ }
-            } else {
-                Map<String, JSONObject> merged = new java.util.TreeMap<>();
-                JSONArray current = remoteData.optJSONArray("messages");
-                if (current != null) for (int i = 0; i < current.length(); i++) {
-                    JSONObject message = current.optJSONObject(i);
-                    if (message != null) merged.put(message.optString("id"), message);
-                }
-                for (int i = 0; i < received.length(); i++) {
-                    JSONObject message = received.optJSONObject(i);
-                    if (message != null) merged.put(message.optString("id"), message);
-                }
-                JSONArray combined = new JSONArray();
-                for (JSONObject message : merged.values()) combined.put(message);
-                try {
-                    remoteData.put("messages", combined);
-                    if (payload.has("permissions"))
-                        remoteData.put("permissions", payload.optJSONArray("permissions"));
-                    if (payload.has("questions"))
-                        remoteData.put("questions", payload.optJSONArray("questions"));
-                } catch (Exception ignored) { /* Already decoded JSON. */ }
             }
+            try {
+                AIAssistantMessagePages.Ticket ticket = remotePages.select(pageOwner(owner));
+                remotePages.acceptSnapshot(ticket, payload);
+                applyMessagePages(remoteData, remotePages);
+                if (payload.has("permissions")) remoteData.put("permissions", payload.optJSONArray("permissions"));
+                if (payload.has("questions")) remoteData.put("questions", payload.optJSONArray("questions"));
+            } catch (Exception failure) { error = safeMessage(failure); publishState(); return; }
             error = "";
             publishState();
         });
+    }
+
+    private static void sanitizeRemoteMedia(JSONArray received) {
+        if (received == null) return;
+        for (int i = 0; i < received.length(); i++) {
+            JSONObject message = received.optJSONObject(i);
+            JSONArray parts = message == null ? null : message.optJSONArray("parts");
+            if (parts == null) continue;
+            int originalCount = parts.length();
+            for (int j = 0; j < originalCount; j++) {
+                JSONObject part = parts.optJSONObject(j);
+                if (part == null) continue;
+                String kind = part.optString("kind");
+                if (!kind.equals("image") && !kind.equals("video")) continue;
+                part.remove("path");
+                if (!part.optString("attachment_id").isEmpty()) continue;
+                try {
+                    parts.put(new JSONObject().put("id", part.optString("id") + "-remote-placeholder")
+                        .put("kind", "text").put("text", kind.equals("image")
+                            ? "[图片在所属设备，暂不可跨设备预览]" :
+                              "[视频在所属设备，暂不可跨设备预览]"));
+                } catch (Exception ignored) { /* Already decoded JSON. */ }
+            }
+        }
     }
 
     private void beginRemoteCommand(String id, String draft) {
@@ -1759,6 +2014,7 @@ public final class AIAssistantController {
                 selectedRemote = null;
                 pendingRemoteSelection = null;
                 remoteSelectionGeneration++;
+                remotePages.reset();
                 pendingRemoteCommandIds.clear();
                 remoteDeliveryPendingIds.clear();
                 pendingRemoteDraftById.clear();
@@ -1789,6 +2045,7 @@ public final class AIAssistantController {
             }
             pendingRemoteSelection = remote;
             int generation = ++remoteSelectionGeneration;
+            remotePages.reset();
             publishState();
             worker.postDelayed(() -> {
                 if (generation != remoteSelectionGeneration || pendingRemoteSelection == null) return;
@@ -1797,14 +2054,21 @@ public final class AIAssistantController {
                 publishState();
             }, 20000);
             try {
-                sessionSync.readRemoteHistory(remote, "", 10, (page, failure) -> {
+                sessionSync.readRemoteHistory(remote, "", AIAssistantMessagePages.LATEST_LIMIT, (page, failure) -> {
                     worker.post(() -> {
+                        boolean selectedByBroadcast = generation + 1 == remoteSelectionGeneration
+                            && pendingRemoteSelection == null && sameRemote(selectedRemote, remote);
+                        if ((generation != remoteSelectionGeneration && !selectedByBroadcast) || closed) {
+                            main.post(() -> completion.accept(false)); return;
+                        }
                         if (!failure.isEmpty() && sameRemote(pendingRemoteSelection, remote)) {
                             pendingRemoteSelection = null;
                             error = failure;
                             publishState();
                         }
                         if (failure.isEmpty() && page != null) {
+                            try { page.put("initialHistoryPage", true); }
+                            catch (Exception ignored) { /* Only the first history response sets its old-page boundary. */ }
                             JSONObject envelope = new JSONObject();
                             try { envelope.put("session_id", remote.optString("id"))
                                 .put("from_slot", remote.optString("device_slot"))
@@ -1856,148 +2120,226 @@ public final class AIAssistantController {
               Consumer<Boolean> completion) {
         send(intendedSession, text, attachments, "", completion);
     }
+    // 返回值只确认账号私有队列已持久接收，不是模型执行或远端接收的确认。
+    boolean enqueue(String intendedSession, String text, java.util.List<ImportedFile> attachments,
+                    String quotedMessageId) {
+        State visible = state;
+        try {
+            if (closed || !visible.ready || outgoingQueue == null) throw new IOException("发送队列尚未准备好");
+            JSONObject remote = visible.remoteSession != null
+                && intendedSession.equals(visible.remoteSession.optString("id")) ? visible.remoteSession : null;
+            if (remote == null && modelSettingsChange.get()) throw new IOException("主模型正在切换，草稿已保留");
+            if (text.getBytes(StandardCharsets.UTF_8).length > 64 * 1024 || attachments.size() > 10
+                || text.trim().isEmpty() && attachments.isEmpty()) throw new IOException("消息为空或过长，草稿已保留");
+            JSONObject runtime = visible.runtime(intendedSession);
+            if (runtime.optBoolean("busy") && runtime.optString("turnId").isEmpty())
+                throw new IOException("任务编号尚未就绪，草稿已保留");
+            JSONArray files = new JSONArray();
+            for (ImportedFile file : attachments) files.put(new JSONObject().put("path", file.relativePath)
+                .put("mimeType", file.mimeType).put("image", file.image).put("name", file.displayName));
+            JSONObject payload = new JSONObject().put("session", intendedSession).put("text", text)
+                .put("quoteMessageId", quotedMessageId).put("files", files)
+                .put("operation", runtime.optBoolean("busy") ? "steer" : "")
+                .put("turnId", runtime.optString("turnId"));
+            payload.put("model", visible.model);
+            if (remote != null) payload.put("remote", new JSONObject(remote.toString()));
+            String owner = outgoingOwner(intendedSession, remote);
+            JSONObject recovery = new JSONObject(outgoingPreferences.getString("recovery", "{}"));
+            if (owner.equals(recovery.optString("owner"))) payload.put("recoveryId", recovery.optString("id"));
+            outgoingQueue.enqueue(owner, payload);
+            worker.post(() -> { publishState(); drainOutgoing(owner); });
+            return true;
+        } catch (Exception failure) {
+            error = safeMessage(failure); worker.post(this::publishState); return false;
+        }
+    }
     void send(String intendedSession, String text, java.util.List<ImportedFile> attachments,
               String quotedMessageId, Consumer<Boolean> completion) {
-        State visible = state;
-        boolean remoteTarget = visible.remoteSession != null
-            && intendedSession.equals(visible.remoteSession.optString("id"));
-        // Do not queue a local draft behind a configuration transaction and then silently send
-        // it through the newly selected source. Remote conversations use their owning device.
-        if (!remoteTarget && modelSettingsChange.get()) {
-            if (completion != null) main.post(() -> completion.accept(false));
-            return;
+        boolean accepted = enqueue(intendedSession, text, attachments, quotedMessageId);
+        if (completion != null) main.post(() -> completion.accept(accepted));
+    }
+    static String outgoingOwner(String session, JSONObject remote) {
+        return remote == null ? "local:" + session : "remote:" + remote.optString("device_slot")
+            + "\u001f" + remote.optString("login_session_id") + "\u001f" + session;
+    }
+    private void cancelPreparationsForSession(String session, JSONObject remote) {
+        preparations.cancel(outgoingOwner(session, remote));
+        if (remote == null) preparations.cancel("incoming:" + session);
+    }
+    private JSONObject outgoingRuntime(String target, JSONObject remote) throws Exception {
+        if (remote == null) return invokeNativeAgent(new JSONObject().put("op", "remote_snapshot")
+            .put("session", target).put("limit", 1));
+        for (int i = 0; i < remoteSessions.length(); i++) {
+            JSONObject candidate = remoteSessions.optJSONObject(i);
+            if (candidate != null && sameRemote(candidate, remote) && candidate.optBoolean("online")) return candidate;
         }
-        java.util.List<ImportedFile> intendedAttachments = new java.util.ArrayList<>(attachments);
-        worker.post(() -> {
-            if (selectedRemote != null && intendedSession.equals(selectedRemote.optString("id"))) {
-                if (!pendingRemoteCommandIds.isEmpty()) {
-                    error = "请等待所属设备确认上一条消息";
-                    publishState();
-                    main.post(() -> completion.accept(false));
-                    return;
-                }
-                if (sessionSync == null || !selectedRemote.optBoolean("online") ||
-                    !quotedMessageId.isEmpty() ||
-                    (text.trim().isEmpty() && intendedAttachments.isEmpty())) {
-                    error = "远端设备离线，或消息包含暂不支持的引用";
-                    publishState();
-                    main.post(() -> completion.accept(false));
-                    return;
-                }
-                JSONObject destination = selectedRemote;
-                String temporaryId = "msg_z_pending_" + UUID.randomUUID();
-                try {
-                    JSONObject request = new JSONObject().put("action", "prompt").put("text", text);
-                    if (!intendedAttachments.isEmpty()) {
-                        MaiSessionAttachments transfer = new MaiSessionAttachments(context);
-                        MaiSessionAttachments.Room room = new MaiSessionAttachments.Room(
-                            destination.optString("device_slot"),
-                            destination.optString("login_session_id"),
-                            destination.optString("id"));
-                        JSONArray references = new JSONArray();
-                        remoteCommandStatus = "正在上传会话附件…";
-                        publishState();
-                        for (ImportedFile attachment : intendedAttachments) {
-                            File file = workspaceFile(attachment.relativePath);
-                            if (file == null || !file.isFile())
-                                throw new IOException("附件文件已丢失，请重新选择");
-                            JSONObject receipt = transfer.upload(file,attachment.displayName,room);
-                            references.put(new JSONObject().put("attachment_id",
-                                receipt.getString("attachment_id")));
-                        }
-                        request.put("attachments",references);
-                    }
-                    appendRemoteOptimistic(temporaryId,text.isEmpty()
-                        ? "已发送" + intendedAttachments.size() + "个附件" : text);
-                    String id = sessionSync.sendToRemote(destination, "command", request,
-                        (messageId, failure) -> {
-                        worker.post(() -> {
-                            if (!sameRemote(selectedRemote, destination)) {
-                                main.post(() -> completion.accept(false));
-                                return;
-                            }
-                            boolean resultArrived = remoteCommandResultsById.containsKey(messageId);
-                            boolean accepted = settleRemoteDelivery(messageId, failure);
-                            if (failure.isEmpty() && !resultArrived) {
-                                error = "";
-                                remoteCommandStatus = "已送达所属设备，等待确认执行";
-                            }
-                            publishState();
-                            main.post(() -> completion.accept(accepted));
-                        });
-                    });
-                    remoteOptimisticByCommandId.put(id, temporaryId);
-                    if (!intendedAttachments.isEmpty())
-                        pendingRemoteFilesById.put(id,
-                            new PendingRemoteFiles(intendedSession,intendedAttachments));
-                    beginRemoteCommand(id, text,
-                        intendedAttachments.isEmpty() ? 30000 : 2L * 60 * 60 * 1000);
-                    publishState();
-                } catch (Exception failure) {
-                    remoteCommandStatus = "";
-                    JSONArray current = remoteData.optJSONArray("messages");
-                    if (current != null) {
-                        JSONArray kept = new JSONArray();
-                        for (int index = 0; index < current.length(); index++) {
-                            JSONObject message = current.optJSONObject(index);
-                            if (message != null && !temporaryId.equals(message.optString("id")))
-                                kept.put(message);
-                        }
-                        try { remoteData.put("messages", kept); }
-                        catch (Exception ignored) { /* Keep the remote history. */ }
-                    }
-                    error = safeMessage(failure);
-                    publishState();
-                    main.post(() -> completion.accept(false));
-                }
-                return;
-            }
-            boolean success = false;
-            try {
+        throw new IOException("原设备离线，内容保留在发送队列");
+    }
+    private void finishOutgoing(String owner, String id, JSONObject receipt) {
+        try {
+            JSONObject head = outgoingQueue.head(owner);
+            if (head == null || !id.equals(head.optString("id"))) return;
+            JSONObject payload = head.getJSONObject("payload");
+            receipt = AIAssistantSubmission.receipt(receipt, payload.optString("operation"), payload.optString("turnId"));
+            if (receipt.optBoolean("ok") && !receipt.optString("user_message_id").isEmpty())
+                outgoingQueue.accept(id, receipt.getString("user_message_id"), receipt.getString("turnId"));
+            else outgoingQueue.transition(id, receipt.optBoolean("unknown") || receipt.optBoolean("ok")
+                ? "unknown" : "failed", null);
+        } catch (Exception failure) { error = safeMessage(failure); }
+        outgoingActiveOwners.remove(owner);
+        refresh(true); publishState();
+        drainOutgoing(owner);
+    }
+    private void drainOutgoing(String owner) {
+        if (closed || !ready || outgoingQueue == null || outgoingActiveOwners.contains(owner)) return;
+        String id = "";
+        try {
+            JSONObject entry = outgoingQueue.head(owner);
+            if (entry == null || !entry.optString("state").equals("queued")) return;
+            id = entry.getString("id");
+            JSONObject payload = entry.getJSONObject("payload");
+            String target = payload.optString("session");
+            JSONObject remote = payload.optJSONObject("remote");
+            if (remote == null) {
                 requireModelOwner();
-                boolean containsVisualInput = false;
-                for (ImportedFile file : intendedAttachments) {
-                    if (file.image || file.mimeType.startsWith("video/")) {
-                        containsVisualInput = true;
-                        break;
-                    }
-                }
-                // Reject new unsupported input before creating a session or accepting a turn.
-                // completion(false) keeps the existing composer text and attachments; older
-                // history is untouched and the core still reports its actual capability errors.
-                if (containsVisualInput && !AIAssistantMediaPolicy.supportsImages(model))
-                    throw new IOException(primarySettings.isLocal()
-                        ? "本地主模型当前仅支持文字和工具，请切换到云端模型后发送图片或视频。"
-                        : "当前主模型仅支持文字，请选择支持图片或视频的云端模型。");
-                refreshSeedanceCredential(true);
-                refreshBailianCredential(true);
-                String target = intendedSession;
+                if (!model.equals(payload.optString("model", model)))
+                    throw new IOException("原主模型已改变，内容保留在发送队列");
                 if (target.isEmpty()) {
-                    target = invokeNativeAgent(makeOperationRequest("create")).getString("id");
-                    selected = target;
+                    if (outgoingEmptySession.isEmpty()) {
+                        outgoingEmptySession = invokeNativeAgent(new JSONObject().put("op", "create")).getString("id");
+                        if (selected.isEmpty()) selected = outgoingEmptySession;
+                    }
+                    String createdOwner = outgoingOwner(outgoingEmptySession, null);
+                    outgoingQueue.retarget(owner, createdOwner, outgoingEmptySession);
+                    publishState(); drainOutgoing(createdOwner); return;
                 }
-                JSONArray images = new JSONArray();
-                JSONArray videos = new JSONArray();
-                for (ImportedFile file : intendedAttachments) if (file.image) {
-                    images.put(new JSONObject().put("path", file.relativePath)
-                        .put("mimeType", file.mimeType));
-                } else if (file.mimeType.startsWith("video/")) {
-                    videos.put(new JSONObject().put("path", file.relativePath)
-                        .put("mimeType", file.mimeType));
-                }
-                invokeNativeAgent(makeOperationRequest("send").put("session", target).put("text", text)
-                    .put("images", images).put("videos", videos)
-                    .put("quoteMessageId", quotedMessageId));
-                error = "";
-                success = true;
-                refresh(true);
-            } catch (Exception e) {
-                error = safeMessage(e);
-                publishState();
             }
-            boolean sent = success;
-            main.post(() -> completion.accept(sent));
-        });
+            final String captureId = id;
+            outgoingQueue.transition(id, "preparing", payload);
+            outgoingActiveOwners.add(owner);
+            final boolean supportsVisual = AIAssistantMediaPolicy.supportsImages(model);
+            if (!preparations.start(owner, nativeEpoch, () -> nativeEpoch,
+                cancel -> prepareOutgoing(payload, supportsVisual, cancel), (prepared, failure) -> {
+                    if (failure != null) failOutgoingPreparation(owner, captureId, failure);
+                    else dispatchPreparedOutgoing(owner, captureId, prepared);
+                })) throw new IOException("原会话已有附件准备任务，内容已保留");
+            publishState();
+        } catch (Exception failure) { failOutgoingPreparation(owner, id, failure); }
+    }
+    private JSONObject prepareOutgoing(JSONObject source, boolean supportsVisual,
+                                       AIAssistantPreparationJobs.Cancellation cancel) throws Exception {
+        JSONObject payload = new JSONObject(source.toString());
+        JSONObject remote = payload.optJSONObject("remote");
+        JSONArray files = payload.getJSONArray("files"), references = new JSONArray();
+        MaiSessionAttachments.Scope scope = new MaiSessionAttachments.Scope();
+        cancel.onCancel(scope::cancel);
+        for (int i = 0; i < files.length(); i++) {
+            cancel.check();
+            JSONObject file = files.getJSONObject(i);
+            File actual = workspaceFile(file.getString("path"));
+            if (actual == null || !actual.isFile()) throw new IOException("附件已丢失，内容保留在发送队列");
+            if (remote != null) {
+                MaiSessionAttachments.Room room = new MaiSessionAttachments.Room(remote.optString("device_slot"),
+                    remote.optString("login_session_id"), payload.getString("session"));
+                JSONObject uploaded = new MaiSessionAttachments(context, accountUserId).upload(actual, file.optString("name"), room, scope);
+                references.put(new JSONObject().put("attachment_id", uploaded.getString("attachment_id")));
+            } else if ((file.optBoolean("image") || file.optString("mimeType").startsWith("video/")) && !supportsVisual)
+                throw new IOException("当前主模型不支持图片或视频");
+        }
+        cancel.check();
+        return payload.put("preparedAttachments", references);
+    }
+    private void failOutgoingPreparation(String owner, String id, Exception failure) {
+        error = safeMessage(failure);
+        if (!id.isEmpty()) try {
+            JSONObject head = outgoingQueue.head(owner);
+            if (head != null && id.equals(head.optString("id"))
+                && (head.optString("state").equals("queued") || head.optString("state").equals("preparing")))
+                outgoingQueue.transition(id, "failed", null);
+        } catch (Exception retained) { error = safeMessage(retained); }
+        outgoingActiveOwners.remove(owner); publishState();
+    }
+    private void dispatchPreparedOutgoing(String owner, String id, JSONObject payload) {
+        boolean dispatched = false;
+        try {
+            if (closed || accountAuth.accountSessionGeneration() != accountToolLoginGeneration)
+                throw new IOException("原账号已改变，内容保留在发送队列");
+            JSONObject head = outgoingQueue.head(owner);
+            if (head == null || !id.equals(head.optString("id")) || !head.optString("state").equals("preparing"))
+                throw new IOException("原发送条目已改变，未派发");
+            String target = payload.getString("session");
+            JSONObject remote = payload.optJSONObject("remote");
+            JSONObject captured = new JSONObject().put("busy", payload.optString("operation").equals("steer"))
+                .put("turnId", payload.optString("turnId"));
+            AIAssistantSubmission binding = AIAssistantSubmission.capture(target, remote, captured);
+            String operation = binding.bind(outgoingRuntime(target, remote));
+            payload.put("operation", operation).put("turnId", binding.turnId());
+            JSONObject request = new JSONObject().put("text", payload.getString("text"))
+                .put("requestId", id).put("quoteMessageId", payload.optString("quoteMessageId"));
+            if (operation.equals("steer")) request.put("turnId", binding.turnId());
+            outgoingQueue.transition(id, "dispatching", payload);
+            dispatched = true; publishState();
+            final String acceptedId = id;
+            if (remote == null) {
+                request = AIAssistantSubmission.localRequest(payload, operation, binding.turnId(), id);
+                JSONObject accepted = invokeNativeAgent(request);
+                finishOutgoing(owner, id, accepted);
+            } else {
+                request.put("action", operation.equals("steer") ? "steer" : "prompt");
+                JSONArray references = payload.getJSONArray("preparedAttachments");
+                if (references.length() > 0) request.put("attachments", references);
+                JSONObject destination = new JSONObject(remote.toString());
+                String envelope = sessionSync.sendToRemote(destination, "command", request, (message, failure) -> {
+                    if (!failure.isEmpty()) worker.post(() -> completeOutgoingReceipt(message,
+                        new JSONObject(), true));
+                });
+                outgoingReceipts.put(envelope, new OutgoingReceipt(destination,
+                    receipt -> finishOutgoing(owner, acceptedId, receipt)));
+                worker.postDelayed(() -> completeOutgoingReceipt(envelope, new JSONObject(), true), 30000);
+            }
+        } catch (Exception failure) {
+            error = safeMessage(failure);
+            if (!id.isEmpty()) try {
+                outgoingQueue.transition(id, dispatched && !(failure instanceof NativeAgentFailure)
+                    ? "unknown" : "failed", null);
+            } catch (Exception retained) { error = safeMessage(retained); }
+            outgoingActiveOwners.remove(owner); publishState();
+        }
+    }
+    private void completeOutgoingReceipt(String id, JSONObject result, boolean unknown) {
+        OutgoingReceipt pending = outgoingReceipts.remove(id);
+        if (pending == null) return;
+        try { if (unknown) result.put("unknown", true); }
+        catch (Exception ignored) { }
+        pending.completion.accept(result);
+    }
+    JSONObject restoreOutgoing(String id) {
+        try {
+            if (outgoingPreferences == null || !outgoingPreferences.getString("recovery", "").isEmpty())
+                throw new IOException("已有恢复草稿，请先处理该草稿");
+            JSONObject found = null;
+            JSONArray entries = outgoingQueue.entries();
+            for (int i = 0; i < entries.length(); i++) {
+                JSONObject item = entries.getJSONObject(i);
+                if (id.equals(item.getString("id"))) found = item;
+            }
+            String currentOwner = outgoingOwner(state.selected, state.remoteSession);
+            boolean sameOwner = found != null && (found.getString("owner").equals(currentOwner)
+                || found.getString("owner").equals("local:") && state.remoteSession == null
+                    && state.selected.equals(outgoingEmptySession));
+            if (found == null || !found.getString("state").equals("failed") || !sameOwner)
+                throw new IOException("只能恢复当前会话明确未受理的内容");
+            JSONObject payload = found.getJSONObject("payload");
+            if (payload.optString("session").isEmpty()) payload.put("session", state.selected);
+            payload.put("recoveryId", id);
+            // 先把恢复稿另存，再移除失败队首；UI 尚未回填时进程退出也不会丢失。
+            if (!outgoingPreferences.edit().putString("recovery", new JSONObject().put("id", id)
+                .put("owner", currentOwner).put("payload", payload).toString()).commit())
+                throw new IOException("恢复稿保存失败，原内容已保留");
+            outgoingQueue.restore(id);
+            worker.post(this::publishState);
+            return payload;
+        } catch (Exception failure) { error = safeMessage(failure); worker.post(this::publishState); return null; }
     }
     void switchModel(String name, Consumer<Boolean> completion) {
         save(name, policy, completion);
@@ -2007,10 +2349,27 @@ public final class AIAssistantController {
     }
     private void actionWithResult(String operation, JSONObject values, Runnable completion,
                                   Consumer<Boolean> settled) {
-        String target = values.optString("session", state.selected);
+        State clicked = state;
+        String target = values.optString("session", clicked.selected);
+        AIAssistantSubmission stopBinding = AIAssistantSubmission.capture(target,
+            clicked.remoteSession, clicked.runtime(target));
+        JSONObject clickedRemote = stopBinding.remoteOwner();
         worker.post(() -> {
-            if (selectedRemote != null && !operation.equals("create")) {
-                if (sessionSync == null || !selectedRemote.optBoolean("online") ||
+            if (operation.equals("delete") || operation.equals("clear"))
+                cancelPreparationsForSession(target, clickedRemote);
+            if (operation.equals("stop")) {
+                try {
+                    if (!stopBinding.canStop(outgoingRuntime(target, clickedRemote)))
+                        throw new IOException("原任务已结束或改变，没有停止新的任务");
+                } catch (Exception failure) {
+                    error = safeMessage(failure); publishState();
+                    if (settled != null) main.post(() -> settled.accept(false));
+                    return;
+                }
+                cancelPreparationsForSession(target, clickedRemote);
+            }
+            if (clickedRemote != null && !operation.equals("create")) {
+                if (sessionSync == null || !clickedRemote.optBoolean("online") ||
                     !(operation.equals("stop") || operation.equals("permission") ||
                       operation.equals("answer") || operation.equals("rename"))) {
                     error = "所属设备离线或不支持此操作";
@@ -2018,9 +2377,10 @@ public final class AIAssistantController {
                     if (settled != null) main.post(() -> settled.accept(false));
                     return;
                 }
-                JSONObject destination = selectedRemote;
+                JSONObject destination = clickedRemote;
                 try {
                     JSONObject request = new JSONObject(values.toString()).put("action", operation);
+                    if (operation.equals("stop")) request.put("turnId", stopBinding.turnId());
                     String id = sessionSync.sendToRemote(destination, "command", request,
                         (messageId, failure) -> {
                         worker.post(() -> {
@@ -2053,7 +2413,9 @@ public final class AIAssistantController {
             try {
                 JSONObject request =
                     new JSONObject(values.toString()).put("op", operation).put("session", target);
+                if (operation.equals("stop")) request.put("turnId", stopBinding.turnId());
                 JSONObject result = invokeNativeAgent(request);
+                if (operation.equals("clear") && selected.equals(target)) localPages.reset();
                 if (operation.equals("create"))
                     selected = result.getString("id");
                 if (operation.equals("delete") && selected.equals(target))
@@ -2305,25 +2667,39 @@ public final class AIAssistantController {
     void downloadRemoteAttachment(JSONObject part,
                                   Consumer<MaiSessionAttachments.Downloaded> completion) {
         worker.post(() -> {
-            MaiSessionAttachments.Downloaded value = null;
             try {
-                JSONObject remote = selectedRemote;
+                JSONObject remote = selectedRemote == null ? null : new JSONObject(selectedRemote.toString());
                 String id = part == null ? "" : part.optString("attachment_id");
                 if (remote == null || id.isEmpty()) throw new IOException("会话附件已不可用");
                 MaiSessionAttachments.Room room = new MaiSessionAttachments.Room(
                     remote.optString("device_slot"),remote.optString("login_session_id"),
                     remote.optString("id"));
-                value = new MaiSessionAttachments(context).download(id,room);
-                if (!sameRemote(remote,selectedRemote)) {
-                    value.file.delete();
-                    throw new IOException("会话已切换");
-                }
+                if (!preparations.start("preview:" + outgoingOwner(remote.optString("id"), remote),
+                    nativeEpoch, () -> nativeEpoch, cancel -> {
+                        MaiSessionAttachments.Downloaded value = new MaiSessionAttachments(context, accountUserId)
+                            .download(id, room, cancel);
+                        cancel.onCancel(() -> value.file.delete()); cancel.check();
+                        return new JSONObject().put("path", value.file.getAbsolutePath()).put("name", value.name)
+                            .put("contentType", value.contentType).put("mediaType", value.mediaType);
+                    }, (prepared, failure) -> {
+                        MaiSessionAttachments.Downloaded value = null;
+                        try {
+                            if (failure != null) throw failure;
+                            if (!sameRemote(remote, selectedRemote)) {
+                                new File(prepared.getString("path")).delete();
+                                throw new IOException("会话已切换");
+                            }
+                            value = new MaiSessionAttachments.Downloaded(new File(prepared.getString("path")),
+                                prepared.getString("name"), prepared.getString("contentType"), prepared.getString("mediaType"));
+                        } catch (Exception failed) { error = safeMessage(failed); publishState(); }
+                        MaiSessionAttachments.Downloaded shown = value;
+                        main.post(() -> completion.accept(shown));
+                    })) throw new IOException("原会话附件正在准备，请稍候");
             } catch (Exception failure) {
                 error = safeMessage(failure);
                 publishState();
+                main.post(() -> completion.accept(null));
             }
-            MaiSessionAttachments.Downloaded result = value;
-            main.post(() -> completion.accept(result));
         });
     }
 
@@ -2754,6 +3130,7 @@ public final class AIAssistantController {
         if (closed) return;
         registerClosingAccountWorker(accountUserId, thread);
         closed = true;
+        registerClosingAttachmentJobs(accountUserId, preparations.close());
         if (sessionSync != null) sessionSync.close();
         listener = null;
         worker.post(() -> {

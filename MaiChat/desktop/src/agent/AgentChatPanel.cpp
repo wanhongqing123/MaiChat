@@ -37,6 +37,7 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QPointer>
+#include <QMap>
 #include <QPolygonF>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -44,8 +45,10 @@
 #include <QSaveFile>
 #include <QScreen>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSet>
 #include <QSettings>
+#include <QUuid>
 #include <QSplitter>
 #include <QStackedLayout>
 #include <QStandardPaths>
@@ -804,6 +807,7 @@ public:
         detail_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
         detail_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
         detail_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        detail_->setTextFormat(Qt::PlainText);
         QFont detailFont = detail_->font();
         detailFont.setStyleHint(QFont::Monospace);
         detailFont.setFamily(QStringLiteral("Menlo"));
@@ -846,6 +850,7 @@ public:
 
         QObject::connect(expand_, &QPushButton::clicked, this, [this] {
             expanded_ = !expanded_;
+            if (expanded_) ensureDetail();
             detail_->setVisible(expanded_ && !detailText_.isEmpty());
             expand_->setText(expanded_ ? QStringLiteral("⌄") : QStringLiteral("›"));
         });
@@ -856,6 +861,7 @@ public:
     void setCall(const QString& tool, const QString& arguments) {
         tool_ = tool;
         arguments_ = arguments;
+        detailDirty_ = true;
         primaryArgument_ = toolPrimaryArgument(tool, arguments);
         refreshSummary();
     }
@@ -902,6 +908,7 @@ public:
         always_->setVisible(waitingForUser && allowForSession_ && !rememberOnApproval_ && !isVideoTaskManagement());
         if (waitingForUser && !allowForSession_) {
             expanded_ = true;
+            ensureDetail();
             detail_->setVisible(!detailText_.isEmpty());
             expand_->setText(QStringLiteral("⌄"));
         }
@@ -934,6 +941,19 @@ public:
     }
 
     void setDetail(const QString& text) {
+        // Bound the hidden preview without trimming or concatenating the full
+        // output. Core retains the complete receipt; UI formatting is deferred.
+        detailSource_ = text.left(12000);
+        detailTruncated_ = text.size() > 12000;
+        detailDirty_ = true;
+        expand_->setVisible(!detailSource_.isEmpty() || !arguments_.isEmpty());
+        if (expanded_) ensureDetail();
+    }
+
+    void ensureDetail() {
+        if (!detailDirty_) return;
+        detailDirty_ = false;
+        const QString& text = detailSource_;
         QString rendered;
         if (tool_ == QStringLiteral("shell") && !primaryArgument_.isEmpty()) {
             rendered = QStringLiteral("$ ") + primaryArgument_;
@@ -974,11 +994,12 @@ public:
             if (!text.trimmed().isEmpty()) rendered += QStringLiteral("\n\n") + text.trimmed();
         }
         constexpr int kMaxDetailCharacters = 12000;
-        if (rendered.size() > kMaxDetailCharacters) {
+        if (rendered.size() > kMaxDetailCharacters || detailTruncated_) {
             rendered = rendered.left(kMaxDetailCharacters) + QStringLiteral("\n\n…（输出过长，已截断显示）");
         }
         detailText_ = rendered;
         detail_->setText(detailText_);
+        detail_->setVisible(expanded_ && !detailText_.isEmpty());
         expand_->setVisible(!detailText_.isEmpty());
     }
 
@@ -1047,6 +1068,9 @@ private:
     QString arguments_;
     QString primaryArgument_;
     QString detailText_;
+    QString detailSource_;
+    bool detailDirty_ = true;
+    bool detailTruncated_ = false;
     MaiToolState stateValue_ = MaiToolState::Pending;
     bool waiting_ = false;
     bool expanded_ = false;
@@ -1171,6 +1195,11 @@ struct AgentChatPanel::Runtime {
     QList<QPushButton*> modelOptionButtons;
     QList<QPushButton*> policyOptionButtons;
     MarkdownView* view = nullptr;
+    QPushButton* olderMessages = nullptr;
+    QString oldestMessage;
+    quint64 historyGeneration = 0;
+    QSet<QString> loadedMessageIds;
+    QHash<QString, int> userTextCharacters;
     QWidget* welcomeView = nullptr;
     PromptEdit* editor = nullptr;
     QWidget* composerHost = nullptr;
@@ -1188,6 +1217,7 @@ struct AgentChatPanel::Runtime {
     QHash<QString, int> pendingMediaImports;
     int visiblePendingImports = -1;
     QPushButton* send = nullptr;
+    QPushButton* stop = nullptr;
     QPushButton* hint = nullptr;
     QPushButton* chooseWorkspace = nullptr;
     QWidget* quoteStrip = nullptr;
@@ -1209,6 +1239,9 @@ struct AgentChatPanel::Runtime {
     // partId -> 已经攒到的 Markdown 原文。正文没有部件了，源在这儿。
     QHash<QString, QString> answers;
     QSet<QString> renderedUserMessages;
+    // 消息内的可见条目顺序独立于到达时机；引用跟随最后一个所属条目，
+    // 新片段插回所属消息，不越过期间已显示的下一条用户消息。
+    QMap<QString, QStringList> messageItems;
     // 攒着还没刷进视图的那些。
     QSet<QString> dirtyAnswers;
     // 每来一个 delta 就重排一次是 O(n^2)：一段 3000 字的回答会重排几百次。
@@ -1296,7 +1329,19 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     auto* conversationLayers = new QStackedLayout(conversationSurface);
     conversationLayers->setContentsMargins(0, 0, 0, 0);
     conversationLayers->setStackingMode(QStackedLayout::StackAll);
-    conversationLayers->addWidget(runtime_->view);
+    auto* conversationContent = new QWidget(conversationSurface);
+    auto* conversationColumn = new QVBoxLayout(conversationContent);
+    conversationColumn->setContentsMargins(0, 0, 0, 0);
+    conversationColumn->setSpacing(0);
+    runtime_->olderMessages =
+        new QPushButton(QStringLiteral("\u52a0\u8f7d\u66f4\u65e9\u6d88\u606f"), conversationContent);
+    runtime_->olderMessages->setObjectName(QStringLiteral("agentLoadEarlierButton"));
+    runtime_->olderMessages->setFlat(true);
+    runtime_->olderMessages->hide();
+    connect(runtime_->olderMessages, &QPushButton::clicked, this, &AgentChatPanel::loadEarlierMessages);
+    conversationColumn->addWidget(runtime_->olderMessages);
+    conversationColumn->addWidget(runtime_->view, 1);
+    conversationLayers->addWidget(conversationContent);
     runtime_->welcomeView = makeWelcomeView(conversationSurface);
     conversationLayers->addWidget(runtime_->welcomeView);
 
@@ -1722,6 +1767,26 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     runtime_->send->setFixedSize(UiZoom::s(36), UiZoom::s(36));
     runtime_->send->setIconSize(QSize(UiZoom::s(18), UiZoom::s(18)));
     runtime_->editor->setCornerAction(runtime_->send);
+    runtime_->stop = new QPushButton(runtime_->editor);
+    runtime_->stop->setObjectName(QStringLiteral("agentStopButton"));
+    runtime_->stop->setAccessibleName(QStringLiteral("停止当前任务"));
+    runtime_->stop->setToolTip(QStringLiteral("停止当前任务"));
+    runtime_->stop->setCursor(Qt::PointingHandCursor);
+    runtime_->stop->setFixedSize(UiZoom::s(36), UiZoom::s(36));
+    runtime_->stop->setIconSize(QSize(UiZoom::s(18), UiZoom::s(18)));
+    runtime_->stop->setIcon(makeComposerActionIcon(true, QColor(QString::fromLatin1(kDanger))));
+    runtime_->stop->setStyleSheet(UiZoom::scaleQss(
+        QStringLiteral("QPushButton#agentStopButton{background:#fff5f3;border:1px solid #f0c3bd;border-radius:18px;}"
+                       "QPushButton#agentStopButton:hover{background:#fee4e2;}")));
+    runtime_->stop->hide();
+    runtime_->editor->setSecondaryLeadingAction(runtime_->stop);
+    connect(runtime_->stop, &QPushButton::clicked, this, [this] {
+        // Stop 只触及点击时的会话，不清理正在编辑的内容或附件。
+        const QString session = runtime_->sessionId;
+        const QString turn = fromUtf8(runtime_->controller->agent().activeTurnId(toUtf8(session)));
+        if (!session.isEmpty() && !runtime_->controller->interrupt(session, turn))
+            appendNotice(runtime_->controller->lastError(), true);
+    });
 
     runtime_->chooseWorkspace = new QPushButton(workspaceRow);
     runtime_->chooseWorkspace->setObjectName(QStringLiteral("agentChooseWorkspaceButton"));
@@ -1806,26 +1871,23 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     //
     // 以前只有一个会话在跑，忽略 sessionId 是无害的；现在不是了。
     connect(&controller, &AgentController::textDelta, this,
-            [this](const QString& sessionId, const QString&, const QString& partId, const QString& delta) {
+            [this](const QString& sessionId, const QString& messageId, const QString& partId, const QString& delta) {
                 if (!isCurrentSession(sessionId)) {
                     noteOtherSession(sessionId, delta, partId);
                     return;
                 }
                 clearPendingThinking();
-                appendAnswerDelta(partId, delta);
+                appendAnswerDelta(messageId, partId, delta);
             });
     connect(&controller, &AgentController::userMessageAdded, this,
             [this](const QString& sessionId, const QString& messageId) {
                 if (!isCurrentSession(sessionId) || runtime_->renderedUserMessages.contains(messageId)) return;
                 MaiSession session;
                 if (!runtime_->controller->agent().getSession(toUtf8(sessionId), session)) return;
-                for (const MaiMessage& message : runtime_->controller->agent().listMessagesPage(
-                         toUtf8(sessionId), toUtf8(messageId) + "~", 1)) {
-                    if (fromUtf8(message.id) != messageId) return;
-                    appendStoredUserMessage(message, session);
-                    scrollToBottom();
-                    return;
-                }
+                MaiMessage message;
+                if (!runtime_->controller->agent().getMessage(toUtf8(sessionId), toUtf8(messageId), message)) return;
+                appendStoredUserMessage(message, session);
+                scrollToBottom();
             });
     connect(&controller, &AgentController::toolPartChanged, this,
             [this](const QString& sessionId, const QString& messageId, const QString& partId) {
@@ -1834,8 +1896,10 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
                     ToolCard* card = runtime_->toolCards.value(partId, nullptr);
                     ToolGroupCard* group = runtime_->toolCardGroups.value(partId, nullptr);
                     if (!card || !group) return;
-                    for (const MaiMessage& message : runtime_->controller->agent().listMessages(toUtf8(sessionId))) {
-                        if (fromUtf8(message.id) != messageId) continue;
+                    MaiMessage message;
+                    if (!runtime_->controller->agent().getMessage(toUtf8(sessionId), toUtf8(messageId), message))
+                        return;
+                    {
                         for (const MaiMessagePart& part : message.parts) {
                             if (fromUtf8(part.id) != partId) continue;
                             const auto* tool = std::get_if<MaiToolPart>(&part.body);
@@ -1879,16 +1943,11 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         flushAnswers();
         MaiSession current;
         if (runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), current)) {
-            const auto messages = runtime_->controller->agent().listMessages(toUtf8(runtime_->sessionId));
-            for (const MaiMessage& message : messages)
-                if (message.role == MaiRole::Assistant && message.completed != 0)
-                    appendQuoteAction(fromUtf8(message.id));
-            for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
-                if (it->role == MaiRole::Assistant && it->completed != 0) {
-                    appendTextMediaCards(fromUtf8(it->id), fromUtf8(it->text()), fromUtf8(current.directory));
-                    break;
-                }
-            }
+            for (const QString& id : runtime_->loadedMessageIds) appendQuoteAction(id);
+            const auto recent = runtime_->controller->agent().listMessagesPage(toUtf8(runtime_->sessionId), {}, 1);
+            if (!recent.empty() && recent.front().role == MaiRole::Assistant && recent.front().completed != 0)
+                appendTextMediaCards(fromUtf8(recent.front().id), fromUtf8(recent.front().text()),
+                                     fromUtf8(current.directory));
         }
         refreshContextSize();
         scrollToBottom();
@@ -2197,6 +2256,11 @@ void AgentChatPanel::createSessionInDirectory(const QString& directory) {
 
 void AgentChatPanel::reloadFromStore() {
     // 视图自己会把嵌进去的部件删掉，这儿只要把索引清干净。
+    ++runtime_->historyGeneration;
+    runtime_->oldestMessage.clear();
+    runtime_->loadedMessageIds.clear();
+    runtime_->userTextCharacters.clear();
+    runtime_->olderMessages->hide();
     runtime_->flushTimer->stop();
     runtime_->view->beginBatchUpdates();
     runtime_->view->clear();
@@ -2204,6 +2268,7 @@ void AgentChatPanel::reloadFromStore() {
     runtime_->pendingThinkingItemId.clear();
     runtime_->answers.clear();
     runtime_->renderedUserMessages.clear();
+    runtime_->messageItems.clear();
     runtime_->dirtyAnswers.clear();
     runtime_->toolCards.clear();
     runtime_->toolGroups.clear();
@@ -2217,52 +2282,12 @@ void AgentChatPanel::reloadFromStore() {
     const bool sessionBusy = runtime_->controller->agent().isBusy(toUtf8(runtime_->sessionId));
     bool activeAssistantHasVisibleActivity = false;
 
-    for (const MaiMessage& message : runtime_->controller->agent().listMessages(toUtf8(runtime_->sessionId))) {
-        if (message.role == MaiRole::User) {
-            appendStoredUserMessage(message, selectedSession);
-            continue;
-        }
-        QStringList textFragments;
-        for (const MaiMessagePart& part : message.parts) {
-            const QString partId = fromUtf8(part.id);
-            if (const auto* text = std::get_if<MaiTextPart>(&part.body)) {
-                const QString stored = fromUtf8(text->text);
-                const QString live = message.completed == 0
-                                         ? runtime_->controller->livePartText(runtime_->sessionId, partId)
-                                         : QString();
-                const QString content = live.isEmpty() ? stored : live;
-                textFragments.push_back(content);
-                if (message.completed == 0 && !content.isEmpty()) activeAssistantHasVisibleActivity = true;
-                runtime_->answers.insert(partId, content);
-                runtime_->view->addItem(partId, MarkdownView::Style::Document, content);
-            } else if (std::get_if<MaiReasoningPart>(&part.body)) {
-                // 历史思考正文不进入界面；仍在执行的会话统一显示短状态。
-                continue;
-            } else if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
-                if (message.completed == 0 &&
-                    (tool->state == MaiToolState::Pending || tool->state == MaiToolState::Running))
-                    activeAssistantHasVisibleActivity = true;
-                if (tool->tool == "agent_send_media" && tool->state == MaiToolState::Completed &&
-                    appendAgentMediaCard(partId, fromUtf8(tool->output), fromUtf8(selectedSession.directory)))
-                    continue;
-                ToolCard* card = toolCardFor(partId, message);
-                card->setCall(fromUtf8(tool->tool), fromUtf8(tool->input));
-                card->apply(tool->state, false);
-                card->setDetail(tool->state == MaiToolState::Error ? fromUtf8(tool->error) : fromUtf8(tool->output));
-                if (tool->state == MaiToolState::Completed && tool->tool == "generate_pdf")
-                    appendPdfPreview(partId, fromUtf8(tool->output), fromUtf8(selectedSession.directory));
-            }
-        }
-        QSet<ToolGroupCard*> groups;
-        for (const MaiMessagePart& part : message.parts)
-            if (ToolGroupCard* group = runtime_->toolCardGroups.value(fromUtf8(part.id), nullptr))
-                groups.insert(group);
-        for (ToolGroupCard* group : groups) group->setSummary(message, runtime_->toolCards);
-        if (message.completed != 0)
-            appendTextMediaCards(fromUtf8(message.id), textFragments.join(QLatin1Char('\n')),
-                                 fromUtf8(selectedSession.directory));
-        appendQuoteAction(fromUtf8(message.id));
-    }
+    auto page = runtime_->controller->agent().listMessagesPage(toUtf8(runtime_->sessionId), {}, 40);
+    runtime_->oldestMessage = page.empty() ? QString() : fromUtf8(page.back().id);
+    runtime_->olderMessages->setVisible(page.size() == 40);
+    for (auto it = page.rbegin(); it != page.rend(); ++it)
+        activeAssistantHasVisibleActivity |= appendStoredMessage(*it, selectedSession);
+
     runtime_->view->endBatchUpdates();
     setRunning(sessionBusy);
     // 权限事件只交付一次。切换会话后从审批闸门恢复可操作状态，
@@ -2289,11 +2314,107 @@ void AgentChatPanel::reloadFromStore() {
     });
 }
 
+bool AgentChatPanel::appendStoredMessage(const MaiMessage& message, const MaiSession& selectedSession) {
+    const QString messageId = fromUtf8(message.id);
+    runtime_->loadedMessageIds.insert(messageId);
+    bool activeAssistantHasVisibleActivity = false;
+
+    if (message.role == MaiRole::User) {
+        appendStoredUserMessage(message, selectedSession);
+        return false;
+    }
+    QStringList textFragments;
+    for (const MaiMessagePart& part : message.parts) {
+        const QString partId = fromUtf8(part.id);
+        if (const auto* text = std::get_if<MaiTextPart>(&part.body)) {
+            const QString stored = fromUtf8(text->text);
+            const QString live =
+                message.completed == 0 ? runtime_->controller->livePartText(runtime_->sessionId, partId) : QString();
+            const QString content = live.isEmpty() ? stored : live;
+            textFragments.push_back(content);
+            if (message.completed == 0 && !content.isEmpty()) activeAssistantHasVisibleActivity = true;
+            runtime_->answers.insert(partId, content);
+            if (!runtime_->view->contains(partId))
+                runtime_->view->addItem(partId, MarkdownView::Style::Document, content);
+            recordMessageItem(fromUtf8(message.id), partId);
+        } else if (std::get_if<MaiReasoningPart>(&part.body)) {
+            // 历史思考正文不进入界面；仍在执行的会话统一显示短状态。
+            continue;
+        } else if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
+            if (message.completed == 0 &&
+                (tool->state == MaiToolState::Pending || tool->state == MaiToolState::Running))
+                activeAssistantHasVisibleActivity = true;
+            if (tool->tool == "agent_send_media" && tool->state == MaiToolState::Completed &&
+                appendAgentMediaCard(fromUtf8(message.id), partId, fromUtf8(tool->output),
+                                     fromUtf8(selectedSession.directory)))
+                continue;
+            ToolCard* card = toolCardFor(partId, message);
+            card->setCall(fromUtf8(tool->tool), fromUtf8(tool->input));
+            card->apply(tool->state, false);
+            card->setDetail(tool->state == MaiToolState::Error ? fromUtf8(tool->error) : fromUtf8(tool->output));
+            if (tool->state == MaiToolState::Completed && tool->tool == "generate_pdf")
+                appendPdfPreview(fromUtf8(message.id), partId, fromUtf8(tool->output),
+                                 fromUtf8(selectedSession.directory));
+        }
+    }
+    QSet<ToolGroupCard*> groups;
+    for (const MaiMessagePart& part : message.parts)
+        if (ToolGroupCard* group = runtime_->toolCardGroups.value(fromUtf8(part.id), nullptr)) groups.insert(group);
+    for (ToolGroupCard* group : groups) group->setSummary(message, runtime_->toolCards);
+    if (message.completed != 0)
+        appendTextMediaCards(fromUtf8(message.id), textFragments.join(QLatin1Char('\n')),
+                             fromUtf8(selectedSession.directory));
+    appendQuoteAction(fromUtf8(message.id));
+    return activeAssistantHasVisibleActivity;
+}
+
+void AgentChatPanel::loadEarlierMessages() {
+    if (runtime_->sessionId.isEmpty() || runtime_->oldestMessage.isEmpty()) return;
+    flushAnswers();
+    const QString sessionId = runtime_->sessionId;
+    const quint64 generation = runtime_->historyGeneration;
+    auto* bar = runtime_->view->verticalScrollBar();
+    QString anchor;
+    qreal offset = 0;
+    for (auto message = runtime_->messageItems.cbegin(); message != runtime_->messageItems.cend() && anchor.isEmpty();
+         ++message)
+        for (const QString& id : message.value()) {
+            const QRectF frame = runtime_->view->itemRect(id);
+            if (runtime_->view->contains(id) && frame.bottom() > bar->value()) {
+                anchor = id;
+                offset = frame.top() - bar->value();
+                break;
+            }
+        }
+    MaiSession session;
+    if (!runtime_->controller->agent().getSession(toUtf8(sessionId), session)) return;
+    const auto page =
+        runtime_->controller->agent().listMessagesPage(toUtf8(sessionId), toUtf8(runtime_->oldestMessage), 40);
+    runtime_->view->beginBatchUpdates();
+    for (auto it = page.rbegin(); it != page.rend(); ++it) appendStoredMessage(*it, session);
+    if (!page.empty()) runtime_->oldestMessage = fromUtf8(page.back().id);
+    runtime_->olderMessages->setVisible(page.size() == 40);
+    runtime_->view->endBatchUpdates();
+    refreshContextSize();
+    // Keep the actual visible item's offset, not a raw scroll value which changes
+    // when older rows are inserted. A new session invalidates the deferred layout.
+    const auto restore = [this, sessionId, generation, anchor, offset] {
+        if (runtime_->sessionId != sessionId || runtime_->historyGeneration != generation || anchor.isEmpty() ||
+            !runtime_->view->contains(anchor))
+            return;
+        runtime_->view->verticalScrollBar()->setValue(qRound(runtime_->view->itemRect(anchor).top() - offset));
+    };
+    restore();
+    QTimer::singleShot(0, this, restore);
+}
+
 void AgentChatPanel::appendStoredUserMessage(const MaiMessage& message, const MaiSession& session) {
     if (message.role != MaiRole::User) return;
     const QString messageId = fromUtf8(message.id);
     if (runtime_->renderedUserMessages.contains(messageId)) return;
     runtime_->renderedUserMessages.insert(messageId);
+    runtime_->loadedMessageIds.insert(messageId);
+    runtime_->userTextCharacters.insert(messageId, fromUtf8(message.text()).size());
     QStringList images;
     QStringList videos;
     for (const MaiMessagePart& part : message.parts) {
@@ -2314,10 +2435,12 @@ void AgentChatPanel::appendStoredUserMessage(const MaiMessage& message, const Ma
             userText = QStringLiteral("> ↩ %1\n\n%2")
                            .arg(fromUtf8(quote->preview).simplified(), userText);
     if (!images.isEmpty() && userText.trimmed() == QStringLiteral("请查看这些图片。")) userText.clear();
-    if (!userText.isEmpty())
+    if (!userText.isEmpty()) {
         runtime_->view->addItem(messageId, MarkdownView::Style::Bubble, userText);
-    appendUserImages(images);
-    appendUserVideos(videos);
+        recordMessageItem(messageId, messageId);
+    }
+    appendUserImages(messageId, images);
+    appendUserVideos(messageId, videos);
     appendTextMediaCards(messageId, sourceText, fromUtf8(session.directory));
     appendQuoteAction(messageId);
     updateWelcomeVisibility();
@@ -2325,12 +2448,13 @@ void AgentChatPanel::appendStoredUserMessage(const MaiMessage& message, const Ma
 
 // 流式期间往某条回答后面追加。第一段到的时候先把条目建出来，
 // 用户立刻看得见有东西在长；后面的靠定时器攒着批量刷。
-void AgentChatPanel::appendAnswerDelta(const QString& partId, const QString& delta) {
+void AgentChatPanel::appendAnswerDelta(const QString& messageId, const QString& partId, const QString& delta) {
     QString& source = runtime_->answers[partId];
     const bool isNew = source.isEmpty() && !runtime_->view->contains(partId);
     source += delta;
     if (isNew) {
         runtime_->view->addItem(partId, MarkdownView::Style::Document, source);
+        recordMessageItem(messageId, partId);
         updateWelcomeVisibility();
         scrollToBottom();
         return;
@@ -2368,8 +2492,20 @@ void AgentChatPanel::appendUserBubble(const QString& text, const QString& quoted
 
 void AgentChatPanel::appendQuoteAction(const QString& messageId) {
     if (messageId.isEmpty()) return;
+    const auto items = runtime_->messageItems.value(messageId);
+    QString anchor;
+    for (auto it = items.crbegin(); it != items.crend(); ++it)
+        if (runtime_->view->contains(*it)) {
+            anchor = *it;
+            break;
+        }
+    // 还没有可见正文/工具的 assistant 不显示空引用占位。
+    if (anchor.isEmpty()) return;
     const QString id = messageId + QStringLiteral("-quote-action");
-    if (runtime_->view->contains(id)) return;
+    if (runtime_->view->contains(id)) {
+        runtime_->view->moveItemAfter(id, anchor);
+        return;
+    }
     auto* button = new QPushButton(QStringLiteral("↩  引用"));
     button->setObjectName(QStringLiteral("agentQuoteAction"));
     button->setProperty("messageId", messageId);
@@ -2382,11 +2518,63 @@ void AgentChatPanel::appendQuoteAction(const QString& messageId) {
         "QPushButton:hover{color:#0b67b7;}")));
     connect(button, &QPushButton::clicked, this, [this, messageId] { beginQuote(messageId); });
     runtime_->view->addWidget(id, button);
+    runtime_->view->moveItemAfter(id, anchor);
+}
+
+void AgentChatPanel::recordMessageItem(const QString& messageId, const QString& itemId) {
+    if (messageId.isEmpty() || !runtime_->view->contains(itemId)) return;
+    runtime_->loadedMessageIds.insert(messageId);
+    auto& items = runtime_->messageItems[messageId];
+    if (!items.contains(itemId)) {
+        QString anchor;
+        for (auto it = items.crbegin(); it != items.crend(); ++it)
+            if (runtime_->view->contains(*it)) {
+                anchor = *it;
+                break;
+            }
+        if (anchor.isEmpty()) {
+            // 消息 ID 按核心存储的时间序排序。所属消息尚无可见条目时，
+            // 以前一条已显示消息的末尾为锚，避免迟到首片段落到新用户消息之后。
+            auto previous = runtime_->messageItems.lowerBound(messageId);
+            while (previous != runtime_->messageItems.begin() && anchor.isEmpty()) {
+                --previous;
+                const QString footer = previous.key() + QStringLiteral("-quote-action");
+                if (runtime_->view->contains(footer))
+                    anchor = footer;
+                else
+                    for (auto it = previous.value().crbegin(); it != previous.value().crend(); ++it)
+                        if (runtime_->view->contains(*it)) {
+                            anchor = *it;
+                            break;
+                        }
+            }
+        }
+        if (!anchor.isEmpty())
+            runtime_->view->moveItemAfter(itemId, anchor);
+        else {
+            auto successor = runtime_->messageItems.upperBound(messageId);
+            QString next;
+            while (successor != runtime_->messageItems.end() && next.isEmpty()) {
+                for (const QString& id : successor.value())
+                    if (runtime_->view->contains(id)) {
+                        next = id;
+                        break;
+                    }
+                ++successor;
+            }
+            if (next.isEmpty() && !runtime_->pendingThinkingItemId.isEmpty()) next = runtime_->pendingThinkingItemId;
+            if (!next.isEmpty()) runtime_->view->moveItemBefore(itemId, next);
+        }
+        items.append(itemId);
+    }
+    const QString footer = messageId + QStringLiteral("-quote-action");
+    if (runtime_->view->contains(footer)) appendQuoteAction(messageId);
 }
 
 void AgentChatPanel::beginQuote(const QString& messageId) {
-    for (const MaiMessage& message : runtime_->controller->agent().listMessages(toUtf8(runtime_->sessionId))) {
-        if (fromUtf8(message.id) != messageId) continue;
+    MaiMessage message;
+    if (!runtime_->controller->agent().getMessage(toUtf8(runtime_->sessionId), toUtf8(messageId), message)) return;
+    {
         QStringList media;
         for (const MaiMessagePart& part : message.parts) {
             if (std::get_if<MaiImagePart>(&part.body)) media << QStringLiteral("图片");
@@ -2471,6 +2659,7 @@ AgentChatPanel::ToolGroupCard* AgentChatPanel::toolGroupFor(const QString& partI
     if (found != runtime_->toolGroups.constEnd()) return found.value();
     auto* group = new ToolGroupCard(groupId);
     runtime_->view->addWidget(QStringLiteral("tool-group-") + groupId, group);
+    recordMessageItem(fromUtf8(message.id), QStringLiteral("tool-group-") + groupId);
     runtime_->toolGroups.insert(groupId, group);
     return group;
 }
@@ -2509,8 +2698,9 @@ void AgentChatPanel::replyForPart(const QString& partId, bool forSession, bool a
 }
 
 void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& partId) {
-    for (const MaiMessage& message : runtime_->controller->agent().listMessages(toUtf8(runtime_->sessionId))) {
-        if (fromUtf8(message.id) != messageId) continue;
+    MaiMessage message;
+    if (!runtime_->controller->agent().getMessage(toUtf8(runtime_->sessionId), toUtf8(messageId), message)) return;
+    {
         for (const MaiMessagePart& part : message.parts) {
             if (fromUtf8(part.id) != partId) continue;
             const auto* tool = std::get_if<MaiToolPart>(&part.body);
@@ -2519,7 +2709,7 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
             if (tool->tool == "agent_send_media" && tool->state == MaiToolState::Completed) {
                 MaiSession session;
                 if (runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), session) &&
-                    appendAgentMediaCard(partId, fromUtf8(tool->output), fromUtf8(session.directory))) {
+                    appendAgentMediaCard(messageId, partId, fromUtf8(tool->output), fromUtf8(session.directory))) {
                     ToolCard* existing = runtime_->toolCards.take(partId);
                     ToolGroupCard* group = runtime_->toolCardGroups.take(partId);
                     if (existing && group) group->removeCard(existing);
@@ -2545,7 +2735,7 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
                 if (tool->tool == "generate_pdf") {
                     MaiSession session;
                     if (runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), session))
-                        appendPdfPreview(partId, fromUtf8(tool->output), fromUtf8(session.directory));
+                        appendPdfPreview(messageId, partId, fromUtf8(tool->output), fromUtf8(session.directory));
                 }
             } else if (tool->state == MaiToolState::Error || tool->state == MaiToolState::Canceled) {
                 card->setDetail(fromUtf8(tool->error));
@@ -2558,7 +2748,8 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
     }
 }
 
-void AgentChatPanel::appendPdfPreview(const QString& partId, const QString& output, const QString& workspace) {
+void AgentChatPanel::appendPdfPreview(const QString& messageId, const QString& partId, const QString& output,
+                                      const QString& workspace) {
     const QString id = partId + QStringLiteral("-pdf-preview");
     if (runtime_->view->contains(id)) return;
     const QJsonObject artifact = QJsonDocument::fromJson(output.toUtf8()).object();
@@ -2586,10 +2777,12 @@ void AgentChatPanel::appendPdfPreview(const QString& partId, const QString& outp
         showPdfPreview(this, path, QFileInfo(relative).fileName());
     });
     runtime_->view->addWidget(id, button);
+    recordMessageItem(messageId, id);
     scrollToBottom();
 }
 
-bool AgentChatPanel::appendAgentMediaCard(const QString& partId, const QString& output, const QString& workspace) {
+bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QString& partId, const QString& output,
+                                          const QString& workspace) {
     const QString id = partId + QStringLiteral("-agent-media");
     if (runtime_->view->contains(id)) return true;
     const QJsonObject artifact = QJsonDocument::fromJson(output.toUtf8()).object();
@@ -2804,6 +2997,7 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& partId, const QString& 
         }
     });
     runtime_->view->addWidget(id, card);
+    recordMessageItem(messageId, id);
     scrollToBottom();
     return true;
 }
@@ -2849,6 +3043,7 @@ void AgentChatPanel::appendTextMediaCards(const QString& messageId, const QStrin
                     });
         }
         runtime_->view->addWidget(id, button);
+        recordMessageItem(messageId, id);
         scrollToBottom();
     }
 }
@@ -2926,12 +3121,9 @@ void AgentChatPanel::showApproval(const QString& permissionId) {
         if (fromUtf8(pending.id) != permissionId) continue;
         const QString owner = fromUtf8(pending.sessionId);
         if (owner != runtime_->sessionId && !runtime_->controller->isChildOf(owner, runtime_->sessionId)) return;
-        const auto messages = runtime_->controller->agent().listMessages(pending.sessionId);
-        const auto message = std::find_if(messages.begin(), messages.end(), [&](const MaiMessage& value) {
-            return value.id == pending.messageId;
-        });
-        if (message == messages.end()) return;
-        ToolCard* card = toolCardFor(fromUtf8(pending.partId), *message);
+        MaiMessage message;
+        if (!runtime_->controller->agent().getMessage(pending.sessionId, pending.messageId, message)) return;
+        ToolCard* card = toolCardFor(fromUtf8(pending.partId), message);
         card->setCall(fromUtf8(pending.toolName), fromUtf8(pending.arguments));
         const int fileCount = !pending.approvalKeys.empty() && pending.approvalKeys.front().rfind("file:", 0) == 0
                                   ? static_cast<int>(pending.approvalKeys.size())
@@ -2940,7 +3132,7 @@ void AgentChatPanel::showApproval(const QString& permissionId) {
         card->setDetail(QString());
         card->apply(MaiToolState::Pending, true);
         ToolGroupCard* group = runtime_->toolCardGroups.value(fromUtf8(pending.partId));
-        group->setSummary(*message, runtime_->toolCards);
+        group->setSummary(message, runtime_->toolCards);
         group->showApproval();
         scrollToBottom();
         return;
@@ -3292,7 +3484,7 @@ void AgentChatPanel::updateComposerPlaceholder() {
         ? QStringLiteral("交给它做点什么…") : QStringLiteral("添加说明（可选）"));
 }
 
-void AgentChatPanel::appendUserImages(const QStringList& paths) {
+void AgentChatPanel::appendUserImages(const QString& messageId, const QStringList& paths) {
     for (const QString& path : paths) {
         QPixmap pixmap(path);
         if (pixmap.isNull()) continue;
@@ -3302,11 +3494,13 @@ void AgentChatPanel::appendUserImages(const QStringList& paths) {
         preview->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         preview->setStyleSheet(QStringLiteral("background:transparent;border:none;"));
         preview->setToolTip(QFileInfo(path).fileName());
-        runtime_->view->addWidget(QStringLiteral("local-image-%1").arg(++runtime_->noticeSerial), preview);
+        const QString id = QStringLiteral("local-image-%1").arg(++runtime_->noticeSerial);
+        runtime_->view->addWidget(id, preview);
+        recordMessageItem(messageId, id);
     }
 }
 
-void AgentChatPanel::appendUserVideos(const QStringList& paths) {
+void AgentChatPanel::appendUserVideos(const QString& messageId, const QStringList& paths) {
     for (const QString& path : paths) {
         if (!QFileInfo(path).isFile()) continue;
         auto* card = new QWidget;
@@ -3343,15 +3537,16 @@ void AgentChatPanel::appendUserVideos(const QStringList& paths) {
         name->setText(name->fontMetrics().elidedText(name->text(), Qt::ElideMiddle, 238));
         name->setToolTip(path);
         layout->addWidget(name);
-        runtime_->view->addWidget(QStringLiteral("local-video-%1").arg(++runtime_->noticeSerial), card);
+        const QString id = QStringLiteral("local-video-%1").arg(++runtime_->noticeSerial);
+        runtime_->view->addWidget(id, card);
+        recordMessageItem(messageId, id);
     }
 }
 
 void AgentChatPanel::onSend() {
     // 正在等回答时，**先把这一句当答案送出去**。
     //
-    // 这个判断要放在"跑着就是停止"前面：等回答的时候那一轮确实还在跑，
-    // 但用户按回车的意思显然是回答，不是中断。
+    // 提问的答案仍优先路由到该问题；一般发送和 Stop 始终是不同动作。
     if (!runtime_->pendingQuestionId.isEmpty()) {
         const QString answer = runtime_->editor->toPlainText().trimmed();
         if (answer.isEmpty()) return;
@@ -3366,11 +3561,6 @@ void AgentChatPanel::onSend() {
         return;
     }
 
-    // 跑着的时候这个按钮是"停止"。
-    if (runtime_->running) {
-        runtime_->controller->interrupt(runtime_->sessionId);
-        return;
-    }
     if (runtime_->pendingMediaImports.value(runtime_->sessionId) > 0) {
         appendNotice(QStringLiteral("媒体还在导入，请稍候再发送。"), false);
         return;
@@ -3392,8 +3582,16 @@ void AgentChatPanel::onSend() {
     }
 
     const QString quotedMessageId = runtime_->quotedMessageId;
-    if (!runtime_->controller->sendPrompt(runtime_->sessionId, text, imagePaths,
-                                          videoPaths, quotedMessageId)) {
+    const QString turnId = fromUtf8(runtime_->controller->agent().activeTurnId(toUtf8(runtime_->sessionId)));
+    // 发送时绑定当前轮次；此提交的 ID 不会被内部重试重建。核心同步受理并保存
+    // 成功后才分离草稿，结束/停止窗口的拒绝不得降级为另一轮 Send。
+    const QString requestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const bool accepted =
+        turnId.isEmpty()
+            ? runtime_->controller->sendPrompt(runtime_->sessionId, text, imagePaths, videoPaths, quotedMessageId)
+            : runtime_->controller->steerPrompt(runtime_->sessionId, turnId, requestId, text, imagePaths, videoPaths,
+                                                quotedMessageId);
+    if (!accepted) {
         appendNotice(runtime_->controller->lastError(), true);
         return;
     }
@@ -3402,16 +3600,8 @@ void AgentChatPanel::onSend() {
     clearQuote();
     runtime_->editor->clear();
     updateComposerPlaceholder();
-    MaiSession current;
-    runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), current);
-    const auto messages = runtime_->controller->agent().listMessages(toUtf8(runtime_->sessionId));
-    for (auto it = messages.rbegin(); it != messages.rend(); ++it)
-        if (it->role == MaiRole::User) {
-            appendStoredUserMessage(*it, current);
-            break;
-        }
     setRunning(true);
-    startPendingThinking();
+    if (turnId.isEmpty()) startPendingThinking();
     runtime_->view->scrollToBottom();
 }
 
@@ -3430,26 +3620,21 @@ void AgentChatPanel::onClear() {
 
 void AgentChatPanel::setRunning(bool running) {
     runtime_->running = running;
-    const bool stopping = running && runtime_->pendingQuestionId.isEmpty();
     runtime_->send->setText(QString());
-    runtime_->send->setIcon(
-        makeComposerActionIcon(stopping, QColor(QString::fromLatin1(stopping ? kDanger : "#ffffff"))));
+    runtime_->send->setIcon(makeComposerActionIcon(false, QColor(QStringLiteral("#ffffff"))));
     runtime_->send->setToolTip(!runtime_->pendingQuestionId.isEmpty() ? QStringLiteral("回答问题")
-                               : stopping                             ? QStringLiteral("停止任务")
                                                                       : QStringLiteral("发送消息"));
     runtime_->send->setAccessibleName(runtime_->send->toolTip());
     runtime_->send->setStyleSheet(
-        UiZoom::scaleQss(stopping ? QStringLiteral("QPushButton#agentSendButton{background:#fff5f3;color:%1;"
-                                                   "border:1px solid #f0c3bd;border-radius:18px;padding:0;}"
-                                                   "QPushButton#agentSendButton:hover{background:#fee4e2;}")
-                                        .arg(kDanger)
-                                  : QStringLiteral("QPushButton#agentSendButton{background:%1;color:#ffffff;"
-                                                   "border:none;border-radius:18px;padding:0;}"
-                                                   "QPushButton#agentSendButton:hover{background:#095a9f;}"
-                                                   "QPushButton#agentSendButton:pressed{background:#084d87;}"
-                                                   "QPushButton#agentSendButton:disabled{background:#b8d3e8;"
-                                                   "color:#eef6ff;}")
-                                        .arg(kAccent)));
+        UiZoom::scaleQss(QStringLiteral("QPushButton#agentSendButton{background:%1;color:#ffffff;"
+                                        "border:none;border-radius:18px;padding:0;}"
+                                        "QPushButton#agentSendButton:hover{background:#095a9f;}"
+                                        "QPushButton#agentSendButton:pressed{background:#084d87;}"
+                                        "QPushButton#agentSendButton:disabled{background:#b8d3e8;"
+                                        "color:#eef6ff;}")
+                             .arg(kAccent)));
+    runtime_->stop->setVisible(running);
+    runtime_->editor->positionCornerAction();
     runtime_->hint->setEnabled(!running);
     runtime_->modelChip->setEnabled(!running && runtime_->modelConfigured);
     if (runtime_->moreButton) runtime_->moreButton->setEnabled(!running);
@@ -3475,10 +3660,13 @@ void AgentChatPanel::scrollToBottom() {
 
 void AgentChatPanel::refreshContextSize() {
     int characters = 0;
-    for (const MaiMessage& message : runtime_->controller->agent().listMessages(toUtf8(runtime_->sessionId))) {
-        characters += fromUtf8(message.text()).size();
-    }
-    // 这是个**估数**，不是 token 数：核心现在不往外报 usage。
-    // 给用户的信号是"越来越长"，这一点估数就够了。
-    runtime_->contextSize->setText(characters == 0 ? QString() : QStringLiteral("已攒约 %1 字").arg(characters));
+    for (int count : runtime_->userTextCharacters) characters += count;
+    for (const QString& answer : runtime_->answers) characters += answer.size();
+    // This describes only material loaded by the UI. Paging never changes the
+    // complete conversation used by Core when constructing model context.
+    runtime_->contextSize->setText(runtime_->loadedMessageIds.isEmpty()
+                                       ? QString()
+                                       : QStringLiteral("\u5df2\u52a0\u8f7d %1 \u6761\uff0c\u7ea6 %2 \u5b57")
+                                             .arg(runtime_->loadedMessageIds.size())
+                                             .arg(characters));
 }

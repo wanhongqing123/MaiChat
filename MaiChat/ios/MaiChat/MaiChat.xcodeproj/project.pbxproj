@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		5C9BAD2A6133B9BAA1909A97 /* SarasaFixedSC-Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = CC8F75C8DBC53FFF4453A944 /* SarasaFixedSC-Regular.ttf */; };
+		17912663BF5879F20D835AF8 /* LICENSE-SarasaFixedSC.txt in Resources */ = {isa = PBXBuildFile; fileRef = CEE6F50BE9878D57B82966E1 /* LICENSE-SarasaFixedSC.txt */; };
 		CBAF828A4376CD76871EC9B4 /* AIPrimaryModelDeviceProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE69F2012EFB4FC038D2D699 /* AIPrimaryModelDeviceProbe.swift */; };
 		E79E75F7D90E3EDE3A1CBCDE /* PrimaryModelsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 170122169934D4AB42F45741 /* PrimaryModelsUITests.swift */; };
 		225101CA9971BD78067D4B27 /* AIPrimaryModelUITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77CF7376E440B653788B306C /* AIPrimaryModelUITestSupport.swift */; };
@@ -201,6 +203,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		CC8F75C8DBC53FFF4453A944 /* SarasaFixedSC-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = "SarasaFixedSC-Regular.ttf"; path = "../../Resources/fonts/SarasaFixedSC-Regular.ttf"; sourceTree = SOURCE_ROOT; };
+		CEE6F50BE9878D57B82966E1 /* LICENSE-SarasaFixedSC.txt */ = {isa = PBXFileReference; lastKnownFileType = text; name = "LICENSE-SarasaFixedSC.txt"; path = "../../Resources/fonts/LICENSE-SarasaFixedSC.txt"; sourceTree = SOURCE_ROOT; };
 		CE69F2012EFB4FC038D2D699 /* AIPrimaryModelDeviceProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/DebugSupport/AIPrimaryModelDeviceProbe.swift"; sourceTree = SOURCE_ROOT; };
 		170122169934D4AB42F45741 /* PrimaryModelsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatUITests/PrimaryModelsUITests.swift"; sourceTree = SOURCE_ROOT; };
 		77CF7376E440B653788B306C /* AIPrimaryModelUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/DebugSupport/AIPrimaryModelUITestSupport.swift"; sourceTree = SOURCE_ROOT; };
@@ -721,6 +725,8 @@
 		EE8ECD3A4C1B1963704B4FD5 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
+				CC8F75C8DBC53FFF4453A944 /* SarasaFixedSC-Regular.ttf */,
+				CEE6F50BE9878D57B82966E1 /* LICENSE-SarasaFixedSC.txt */,
 				8C7043E7ADEC49D3648291AF /* ffplay-sample.mp4 */,
 				7702BC2F6BF7F9BF6571E11C /* ffplay-seek-sample.mp4 */,
 			);
@@ -878,6 +884,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5C9BAD2A6133B9BAA1909A97 /* SarasaFixedSC-Regular.ttf in Resources */,
+				17912663BF5879F20D835AF8 /* LICENSE-SarasaFixedSC.txt in Resources */,
 				DEBCE768E14C523F47FC7CC5 /* Assets.xcassets in Resources */,
 				1505F33A923B571D5EF10FAD /* PrivacyInfo.xcprivacy in Resources */,
 				2A55E61AA07338C31386DE07 /* ffplay-sample.mp4 in Resources */,

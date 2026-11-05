@@ -153,6 +153,18 @@ mkdir -p "$staging"
 
 ditto "$source_app" "$staged_app"
 
+# The font itself is in Qt resources; distribute the original OFL/copyright as
+# a readable file in the application bundle, just as Android and iOS do.
+code_font_license="$repo_root/MaiChat/Resources/fonts/LICENSE-SarasaFixedSC.txt"
+code_font_licenses_dir="$staged_app/Contents/Resources/ThirdPartyLicenses"
+if [[ ! -f "$code_font_license" ]]; then
+  echo "Missing shared code font license: $code_font_license" >&2
+  exit 1
+fi
+mkdir -p "$code_font_licenses_dir"
+cp "$code_font_license" "$code_font_licenses_dir/LICENSE-SarasaFixedSC.txt"
+cmp "$code_font_license" "$code_font_licenses_dir/LICENSE-SarasaFixedSC.txt"
+
 trtc_root="$project_root/vendor/tencent-trtc/macos/TXLiteAVSDK_TRTC_Mac"
 trtc_slice="macos-arm64_x86_64"
 trtc_target_dir="$staged_app/Contents/Frameworks"

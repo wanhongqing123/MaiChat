@@ -49,6 +49,10 @@
 	<array>
 		<string>screen-capture</string>
 	</array>
+	<key>UIAppFonts</key>
+	<array>
+		<string>SarasaFixedSC-Regular.ttf</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -9,6 +9,21 @@ import UniformTypeIdentifiers
 @testable import MaiChatCore
 
 final class MarkdownPresentationTests: XCTestCase {
+    @MainActor
+    func testBundledCodeFaceUsesCompatibleLatinCjkAndBoxWidths() throws {
+        let face = try XCTUnwrap(UIFont(name: "Sarasa-Fixed-SC-Regular", size: 20))
+        let width: (String) -> CGFloat = { text in
+            (text as NSString).size(withAttributes: [.font: face]).width
+        }
+        let cell = width("M")
+        XCTAssertGreaterThan(cell, 0)
+        for glyph in [" ", "-", "|", "┌", "─", "│", "┐", "┴", "┘", "▼", "►", "◄"] {
+            XCTAssertEqual(width(glyph), cell, accuracy: 0.25, "Code advance: \(glyph)")
+        }
+        XCTAssertEqual(width("中"), cell * 2, accuracy: 0.25)
+        XCTAssertEqual(width("路径"), cell * 4, accuracy: 0.25)
+    }
+
     func testScreenshotRecencyRejectsOldOrMissingPhotoAssets() {
         let screenshotDate = Date(timeIntervalSince1970: 1_000)
         XCTAssertTrue(RemoteIMScreenshotRecencyPolicy.accepts(

@@ -13,6 +13,26 @@
 #include "im/FakeRemoteIMClient.h"
 #include "storage/LocalMessageDatabase.h"
 
+namespace {
+bool seedPagedHistory(const QString& path) {
+    LocalMessageDatabase database(path);
+    if (!database.isOpen()) return false;
+    database.upsertContact(RemoteIMContact{QStringLiteral("phone-user"), QStringLiteral("Phone")});
+    for (int i = 1; i <= 85; ++i) {
+        RemoteIMMessage message;
+        message.id = QStringLiteral("m%1").arg(i);
+        message.fromUserId = QStringLiteral("phone-user");
+        message.toUserId = QStringLiteral("desktop-user");
+        message.direction = RemoteIMMessageDirection::Incoming;
+        message.status = RemoteIMMessageStatus::Received;
+        message.createdAtMillis = i;
+        message.text = QStringLiteral("message-%1").arg(i);
+        if (!database.insertMessageIfAbsent(message, message.fromUserId)) return false;
+    }
+    return true;
+}
+}  // namespace
+
 class RemoteIMApplicationTest : public QObject {
     Q_OBJECT
 
@@ -36,6 +56,11 @@ private slots:
     void cascadesLocalHistoryOnContactDeletion();
     void adoptsSentRemoteIdSoRoamingDoesNotDuplicate();
     void loadsRecentPageOnStartAndPagesEarlier();
+    void initialRoamingSelectionLoadsRecentLocalPage();
+    void olderRoamingMessageDoesNotSkipUnloadedLocalHistory();
+    void contactDeletionHydratesAutomaticallySelectedConversation();
+    void sameTimeHistoryKeepsDatabaseOrderAndLiveArrivalOrder();
+    void liveTiesKeepArrivalOrderDuringFirstHydration();
     void liveChannelCountsUnreadRoamingDoesNot();
     void clearMessagesKeepsContactAndPersists();
     void selectingKnownPeerUsesLocalRefreshSignal();
@@ -688,6 +713,7 @@ void RemoteIMApplicationTest::persistsMessagesAcrossRestart() {
     // 重启：新 app + 同一库文件，历史（含消息状态）应完整恢复。
     RemoteIMApplication restarted(QStringLiteral("desktop-user"), std::make_unique<FakeRemoteIMClient>(),
                                   std::make_unique<LocalMessageDatabase>(dbPath));
+    restarted.selectPeer(QStringLiteral("phone-user"));
     const QList<RemoteIMMessage> messages = restarted.chatState().messagesWith(QStringLiteral("phone-user"));
     QCOMPARE(messages.size(), 2);
     const auto sent = std::find_if(messages.cbegin(), messages.cend(), [](const RemoteIMMessage& message) {
@@ -792,39 +818,179 @@ void RemoteIMApplicationTest::loadsRecentPageOnStartAndPagesEarlier() {
     QTemporaryDir dir;
     const QString dbPath = dir.filePath("messages.db");
     {
-        // 预置 450 条历史（超过一页 200）。
         LocalMessageDatabase db(dbPath);
-        db.upsertContact(RemoteIMContact{"phone-user", "iPhone"});
-        for (int i = 1; i <= 450; ++i) {
-            RemoteIMMessage message;
-            message.id = QStringLiteral("m%1").arg(i);
-            message.fromUserId = "phone-user";
-            message.toUserId = "desktop-user";
-            message.direction = RemoteIMMessageDirection::Incoming;
-            message.status = RemoteIMMessageStatus::Received;
-            message.createdAtMillis = i;
-            message.text = QStringLiteral("msg-%1").arg(i);
-            db.insertMessageIfAbsent(message, "phone-user");
+        for (const QString& peer : {QStringLiteral("phone-user"), QStringLiteral("background-user")}) {
+            db.upsertContact(RemoteIMContact{peer, peer});
+            const int count = peer == QStringLiteral("phone-user") ? 450 : 60;
+            for (int i = 1; i <= count; ++i) {
+                RemoteIMMessage message;
+                message.id = peer + QStringLiteral("-m%1").arg(i);
+                message.fromUserId = peer;
+                message.toUserId = QStringLiteral("desktop-user");
+                message.direction = RemoteIMMessageDirection::Incoming;
+                message.status = RemoteIMMessageStatus::Received;
+                message.createdAtMillis = i;
+                message.text = QStringLiteral("msg-%1").arg(i);
+                QVERIFY(db.insertMessageIfAbsent(message, peer));
+            }
         }
     }
 
-    RemoteIMApplication app(QStringLiteral("desktop-user"), std::make_unique<FakeRemoteIMClient>(),
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    auto* fakeClient = client.get();
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client),
                             std::make_unique<LocalMessageDatabase>(dbPath));
-    // 启动只载最近一页 200 条（m251..m450）。
-    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 200);
-    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).first().id, QStringLiteral("m251"));
+    // 登录时每个未打开会话只恢复最后一条预览，不解析所有会话的历史正文。
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 1);
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("background-user")).size(), 1);
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).first().id,
+             QStringLiteral("phone-user-m450"));
     QVERIFY(app.hasEarlierMessages(QStringLiteral("phone-user")));
 
-    // 翻一页：+200（m51..m250）。
-    QCOMPARE(app.loadEarlierMessages(QStringLiteral("phone-user")), 200);
-    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 400);
-    QVERIFY(app.hasEarlierMessages(QStringLiteral("phone-user")));
+    app.selectPeer(QStringLiteral("phone-user"));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 40);
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).first().id,
+             QStringLiteral("phone-user-m411"));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("background-user")).size(), 1);
+    // 漫游重复最后一条不增加消息；反复切换复用已加载页，不叠加或重置历史。
+    const RemoteIMMessage last = app.chatState().messagesWith(QStringLiteral("phone-user")).last();
+    emit fakeClient->messagesReceived({last});
+    app.selectPeer(QStringLiteral("background-user"));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("background-user")).size(), 40);
+    app.selectPeer(QStringLiteral("phone-user"));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 40);
 
-    // 再翻：只剩 50，翻完后没有更早了。
-    QCOMPARE(app.loadEarlierMessages(QStringLiteral("phone-user")), 50);
-    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 450);
-    QVERIFY(!app.hasEarlierMessages(QStringLiteral("phone-user")));
+    int total = 40;
+    while (app.hasEarlierMessages(QStringLiteral("phone-user"))) {
+        const int loaded = app.loadEarlierMessages(QStringLiteral("phone-user"));
+        QVERIFY(loaded > 0 && loaded <= 40);
+        total += loaded;
+        QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), total);
+    }
+    QCOMPARE(total, 450);
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).first().id,
+             QStringLiteral("phone-user-m1"));
     QCOMPARE(app.loadEarlierMessages(QStringLiteral("phone-user")), 0);
+    app.selectPeer(QStringLiteral("background-user"));
+    app.selectPeer(QStringLiteral("phone-user"));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 450);
+}
+
+void RemoteIMApplicationTest::initialRoamingSelectionLoadsRecentLocalPage() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("messages.db"));
+    QVERIFY(seedPagedHistory(path));
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    auto* fake = client.get();
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client),
+                            std::make_unique<LocalMessageDatabase>(path));
+    const auto preview = app.chatState().messagesWith(QStringLiteral("phone-user"));
+    QCOMPARE(preview.size(), 1);
+    emit fake->messagesReceived(preview);
+    QCOMPARE(app.chatState().selectedPeerId(), QStringLiteral("phone-user"));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 40);
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).first().id, QStringLiteral("m46"));
+}
+
+void RemoteIMApplicationTest::olderRoamingMessageDoesNotSkipUnloadedLocalHistory() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("messages.db"));
+    QVERIFY(seedPagedHistory(path));
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    auto* fake = client.get();
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client),
+                            std::make_unique<LocalMessageDatabase>(path));
+    app.selectPeer(QStringLiteral("phone-user"));
+    LocalMessageDatabase database(path);
+    const auto oldest = database.loadMessagesBefore(QStringLiteral("phone-user"), 2, QStringLiteral("m2"), 1);
+    QCOMPARE(oldest.size(), 1);
+    emit fake->messagesReceived(oldest);
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 41);
+    // A separately received old item is not the continuation cursor of the loaded DB page.
+    QCOMPARE(app.loadEarlierMessages(QStringLiteral("phone-user")), 40);
+    QVERIFY(app.hasEarlierMessages(QStringLiteral("phone-user")));
+    QCOMPARE(app.loadEarlierMessages(QStringLiteral("phone-user")), 5);
+    QVERIFY(!app.hasEarlierMessages(QStringLiteral("phone-user")));
+    const auto all = app.chatState().messagesWith(QStringLiteral("phone-user"));
+    QCOMPARE(all.size(), 85);
+    for (int i = 0; i < all.size(); ++i) QCOMPARE(all.at(i).id, QStringLiteral("m%1").arg(i + 1));
+}
+
+void RemoteIMApplicationTest::contactDeletionHydratesAutomaticallySelectedConversation() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("messages.db"));
+    QVERIFY(seedPagedHistory(path));
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::make_unique<FakeRemoteIMClient>(),
+                            std::make_unique<LocalMessageDatabase>(path));
+    app.addContact(QStringLiteral("temporary-peer"), QStringLiteral("Temporary"));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 1);
+    app.deleteContact(QStringLiteral("temporary-peer"));
+    QCOMPARE(app.chatState().selectedPeerId(), QStringLiteral("phone-user"));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).size(), 40);
+}
+
+void RemoteIMApplicationTest::sameTimeHistoryKeepsDatabaseOrderAndLiveArrivalOrder() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("messages.db"));
+    LocalMessageDatabase database(path);
+    database.upsertContact(RemoteIMContact{QStringLiteral("phone-user"), QStringLiteral("Phone")});
+    RemoteIMMessage message;
+    message.fromUserId = QStringLiteral("phone-user");
+    message.toUserId = QStringLiteral("desktop-user");
+    message.direction = RemoteIMMessageDirection::Incoming;
+    message.status = RemoteIMMessageStatus::Received;
+    message.createdAtMillis = 100;
+    message.text = QStringLiteral("Same-time history fixture");
+    for (int i = 1; i <= 60; ++i) {
+        message.id = QStringLiteral("m%1").arg(i, 4, 10, QLatin1Char('0'));
+        QVERIFY(database.insertMessageIfAbsent(message, message.fromUserId));
+    }
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    auto* fake = client.get();
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client),
+                            std::make_unique<LocalMessageDatabase>(path));
+    app.selectPeer(QStringLiteral("phone-user"));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).first().id, QStringLiteral("m0021"));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).last().id, QStringLiteral("m0060"));
+    QCOMPARE(app.loadEarlierMessages(QStringLiteral("phone-user")), 20);
+    auto all = app.chatState().messagesWith(QStringLiteral("phone-user"));
+    for (int i = 0; i < 60; ++i)
+        QCOMPARE(all.at(i).id, QStringLiteral("m%1").arg(i + 1, 4, 10, QLatin1Char('0')));
+    // The database's deterministic tie order must not replace live arrival order.
+    for (const QString& id : {QStringLiteral("z-live"), QStringLiteral("a-live")}) {
+        message.id = id;
+        emit fake->liveMessagesReceived({message});
+    }
+    all = app.chatState().messagesWith(QStringLiteral("phone-user"));
+    QCOMPARE(all.at(60).id, QStringLiteral("z-live"));
+    QCOMPARE(all.at(61).id, QStringLiteral("a-live"));
+    QVERIFY(app.chatState().updateMessageTime(QStringLiteral("m0001"), 101));
+    QVERIFY(app.chatState().updateMessageTime(QStringLiteral("m0001"), 100));
+    QCOMPARE(app.chatState().messagesWith(QStringLiteral("phone-user")).first().id, QStringLiteral("m0001"));
+}
+
+void RemoteIMApplicationTest::liveTiesKeepArrivalOrderDuringFirstHydration() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("messages.db"));
+    QVERIFY(seedPagedHistory(path));
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    auto* fake = client.get();
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client),
+                            std::make_unique<LocalMessageDatabase>(path));
+    RemoteIMMessage message;
+    message.fromUserId = QStringLiteral("phone-user");
+    message.toUserId = QStringLiteral("desktop-user");
+    message.direction = RemoteIMMessageDirection::Incoming;
+    message.status = RemoteIMMessageStatus::Received;
+    message.createdAtMillis = 1000;
+    message.text = QStringLiteral("Live arrival fixture");
+    message.id = QStringLiteral("z-live");
+    RemoteIMMessage next = message;
+    next.id = QStringLiteral("a-live");
+    emit fake->liveMessagesReceived({message, next});
+    const auto all = app.chatState().messagesWith(QStringLiteral("phone-user"));
+    QCOMPARE(all.at(all.size() - 2).id, QStringLiteral("z-live"));
+    QCOMPARE(all.last().id, QStringLiteral("a-live"));
 }
 
 void RemoteIMApplicationTest::liveChannelCountsUnreadRoamingDoesNot() {

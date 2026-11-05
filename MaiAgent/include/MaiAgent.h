@@ -247,6 +247,11 @@ public:
     // 并发调用；返回值归调用方持有。只用于界面分页，不改变模型轮次读取完整历史。
     std::vector<MaiMessage> listMessagesPage(const std::string& sessionId,
                                              const std::string& beforeId, std::size_t limit) const;
+    // 精确读取所属会话的一条已落库消息。纯读、可与活动轮次并发；
+    // 不存在、归属不符或读取失败返回 false 且 out 不动，成功结果由调用方持有。
+    // 不改变模型上下文，也不生成操作、事件或新的模型请求。
+    bool getMessage(const std::string& sessionId, const std::string& messageId,
+                    MaiMessage& out) const;
     // 这个会话现在有没有一轮在跑。注意这是**那一瞬间**的答案，
     // 拿它去做"没跑就发消息"的判断是有竞态的——直接 submit，忙的话会返回 Busy，那个判断在锁里做。
     bool isBusy(const std::string& sessionId) const;
@@ -292,6 +297,15 @@ public:
     // 失败时带错误码，调用方据此分支：NotFound（会话不存在）、Busy（这个会话已经有一轮在跑）、
     // InvalidInput（空 prompt 等）。界面据此决定是弹错误、还是提示"先等这一轮跑完"。
     MaiResult<std::string> submit(const MaiOperation& operation);
+
+    // 中断指定活动轮次。非空 expectedTurnId 必须等于该会话最初的 assistant ID；
+    // 查找、比较、设置取消及唤醒审批/提问在同一 Runtime 锁内完成，避免旧 Stop 误取消新轮。
+    // 空 expectedTurnId 保留 MaiInterrupt 的“中断当前轮”语义；两入口共用同一实现。
+    // 会话无活动轮次或轮次已变化返回 NotFound，不改其他轮次的取消/审批/提问状态。
+    // 线程安全、同步受理后返回 sessionId；不等待模型、工具或网络工作线程退出。
+    // 与普通操作相同，调用方须保证 MaiAgent 生命周期覆盖本次调用；不改公开 C ABI。
+    MaiResult<std::string> interruptTurn(const std::string& sessionId,
+                                         const std::string& expectedTurnId);
 
     // 等所有在跑的轮次结束。给测试和优雅退出用。
     void waitIdle();

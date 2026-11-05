@@ -35,6 +35,10 @@ import org.json.JSONObject;
 final class AndroidSessionSyncCoordinator {
     private static final String TAG = "MaiChatSessionSync";
     private static final String LIFECYCLE_SESSION = "session_lifecycle";
+    // 所属设备回传与本机队列消费同一明确收据；保留原 id，但不能把它冒充 user_message_id。
+    static JSONObject commandReceipt(JSONObject action, JSONObject accepted) throws Exception {
+        return AIAssistantSubmission.receipt(accepted, action.optString("action"), action.optString("turnId"));
+    }
     private static final class PendingLifecycle {
         final String slot;
         final String login;
@@ -290,6 +294,7 @@ final class AndroidSessionSyncCoordinator {
                         entries.put(new JSONObject().put("id", session.optString("id"))
                             .put("title", session.optString("title").replaceAll("[\\p{Cntrl}]", ""))
                             .put("busy", session.optBoolean("busy"))
+                            .put("turnId", session.optString("turnId"))
                             .put("updated_at", System.currentTimeMillis() - i));
                     }
                     String refreshed = auth.sessionSyncAccessToken();
@@ -485,7 +490,8 @@ final class AndroidSessionSyncCoordinator {
         if (permissions == null) permissions = new JSONArray();
         if (questions == null) questions = new JSONArray();
         String stateDigest = hex(MessageDigest.getInstance("SHA-256").digest(
-            (permissions.toString() + questions.toString()).getBytes(StandardCharsets.UTF_8)));
+            (permissions.toString() + questions.toString() + page.optBoolean("busy")
+                + ":" + page.optString("turnId")).getBytes(StandardCharsets.UTF_8)));
         boolean sentMessage = false;
         for (int i = 0; i < messages.length(); i++) {
             JSONObject message = messages.optJSONObject(i);
@@ -496,7 +502,8 @@ final class AndroidSessionSyncCoordinator {
             if (digest.equals(publishedMessageDigests.get(key))) continue;
             request("publish", new JSONObject().put("session_id", sessionId)
                 .put("messages", new JSONArray().put(message))
-                .put("permissions", permissions).put("questions", questions), 15000);
+                .put("permissions", permissions).put("questions", questions)
+                .put("busy", page.optBoolean("busy")).put("turnId", page.optString("turnId")), 15000);
             publishedMessageDigests.put(key, digest);
             publishedStateDigests.put(sessionId, stateDigest);
             sentMessage = true;
@@ -504,7 +511,8 @@ final class AndroidSessionSyncCoordinator {
         if (!sentMessage && !stateDigest.equals(publishedStateDigests.get(sessionId))) {
             request("publish", new JSONObject().put("session_id", sessionId)
                 .put("messages", new JSONArray())
-                .put("permissions", permissions).put("questions", questions), 15000);
+                .put("permissions", permissions).put("questions", questions)
+                .put("busy", page.optBoolean("busy")).put("turnId", page.optString("turnId")), 15000);
             publishedStateDigests.put(sessionId, stateDigest);
         }
         JSONObject oldest = messages.optJSONObject(messages.length() - 1);
@@ -515,7 +523,7 @@ final class AndroidSessionSyncCoordinator {
     String localLoginSessionId() { return localLoginSessionId; }
 
     void publishAttachedMessage(String sessionId, JSONObject message,
-                                JSONArray permissions, JSONArray questions) {
+                                JSONArray permissions, JSONArray questions, boolean busy, String turnId) {
         if (closed) return;
         outbound.execute(() -> {
             for (int attempt = 0; attempt < 5 && !closed; attempt++) {
@@ -523,7 +531,8 @@ final class AndroidSessionSyncCoordinator {
                     request("publish",new JSONObject().put("session_id",sessionId)
                         .put("messages",new JSONArray().put(message))
                         .put("permissions",permissions == null ? new JSONArray() : permissions)
-                        .put("questions",questions == null ? new JSONArray() : questions),15000);
+                        .put("questions",questions == null ? new JSONArray() : questions)
+                        .put("busy",busy).put("turnId",turnId),15000);
                     return;
                 } catch (Exception failure) {
                     if (attempt == 4) Log.w(TAG,"Session attachment history sync failed");
@@ -572,6 +581,8 @@ final class AndroidSessionSyncCoordinator {
             remote.optString("login_session_id"), remote.optString("id"),
             action.optString("action"), action.optString("text"),
             action.optString("id"), action.optString("decision"), action.optString("title"),
+            // 同文的连续点击和不同轮次必须分开；仅网络重试复用同一 requestId。
+            action.optString("turnId"), action.optString("requestId"), action.optString("quoteMessageId"),
             action.optJSONArray("attachments") == null ? "" :
                 action.optJSONArray("attachments").toString()})
             canonical.append(value.length()).append(':').append(value);

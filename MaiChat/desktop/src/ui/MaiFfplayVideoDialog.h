@@ -87,7 +87,7 @@ private:
     void stopPlayback(bool cancelCloudSource = false);
     void saveCopy();
     void updatePlayButton();
-    // 进度条独占上排，图标动作位于下排；两行均随视口宽度伸展。
+    // 标题与两行控制栏始终浮在完整视频视口上，不改变视频几何。
     void updateControlLayout();
     void revealControls();
     void scheduleControlHide();
@@ -151,6 +151,11 @@ private:
     std::atomic<uint64_t> audioStartupConsumedRevision_{0};
     bool movingFrame_ = false;
     bool windowWasMaximized_ = false;
+    // 解码线程只排队一次真实帧尺寸；GUI 只做一次默认定尺寸，重播/切速不覆盖用户窗口。
+    std::atomic<bool> initialVideoSizeQueued_{false};
+    bool initialVideoSizeApplied_ = false;
+    bool initialPositionApplied_ = false;
+    bool windowGeometryCustomized_ = false;
     Qt::Edges resizingFrame_;
     QPoint framePressGlobal_;
     QRect framePressGeometry_;

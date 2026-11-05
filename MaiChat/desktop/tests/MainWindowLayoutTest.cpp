@@ -82,7 +82,7 @@
 
 namespace {
 
-// 仅消息顶栏可视回归使用正常 App 随包字体；作用域结束恢复，避免影响其他套件。
+// 消息及窗口标题栏可视回归使用正常 App 随包字体；结束后恢复，避免影响其他套件。
 class ScopedMessageHeaderFont {
 public:
     ScopedMessageHeaderFont() : previous_(QApplication::font()) {
@@ -139,9 +139,11 @@ private slots:
     void videoCoverRetainsPhysicalPixels();
     void renamedHeaderButtonsKeepTheirCompactAppearance();
     void messageTextUsesNativeResolutionAndRegularBodyFont();
+    void outgoingTextBubbleDoesNotReserveUnusedLineWidth_data();
+    void outgoingTextBubbleDoesNotReserveUnusedLineWidth();
     void exposesDesktopChatLayoutControls();
     void mainWindowUsesRoomierIconFreeTitleArea();
-    void windowsCaptionFollowsContentHeadersWithoutCoveringActions();
+    void windowsCaptionStaysInTitleBarAbovePageActions();
     void windowsCaptionStaysVisibleWhileSettingsScrolls();
     void windowsCaptionPreservesNativeWindowActions();
     void conversationSidebarUsesLighterBackground();
@@ -1206,8 +1208,8 @@ void MainWindowLayoutTest::mainWindowUsesRoomierIconFreeTitleArea() {
     auto* navRail = window.findChild<QWidget*>(QStringLiteral("navRail"));
     QVERIFY(inset != nullptr);
     QVERIFY(navRail != nullptr);
-    QCOMPARE(inset->minimumHeight(), UiZoom::s(16));
-    QCOMPARE(inset->maximumHeight(), UiZoom::s(16));
+    QVERIFY(inset->minimumHeight() >= UiZoom::s(32));
+    QCOMPARE(inset->maximumHeight(), inset->minimumHeight());
     QCOMPARE(inset->palette().color(QPalette::Window), QColor(QStringLiteral("#f3f3f3")));
     QCOMPARE(navRail->palette().color(QPalette::Window),
              inset->palette().color(QPalette::Window));
@@ -1239,8 +1241,9 @@ void MainWindowLayoutTest::mainWindowUsesRoomierIconFreeTitleArea() {
 #endif
 }
 
-void MainWindowLayoutTest::windowsCaptionFollowsContentHeadersWithoutCoveringActions() {
+void MainWindowLayoutTest::windowsCaptionStaysInTitleBarAbovePageActions() {
 #ifdef Q_OS_WIN
+    ScopedMessageHeaderFont font;
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-caption-layout"), std::move(client));
     MainWindow window(app);
@@ -1258,24 +1261,31 @@ void MainWindowLayoutTest::windowsCaptionFollowsContentHeadersWithoutCoveringAct
     const auto mapped = [&window](QWidget* widget) {
         return QRect(widget->mapTo(&window, QPoint()), widget->size());
     };
+    auto* titleBar = window.findChild<QWidget*>(QStringLiteral("windowTopInset"));
+    QVERIFY(titleBar);
+    QTRY_VERIFY(mapped(titleBar).contains(mapped(controls)));
+    QVERIFY(titleBar->isAncestorOf(controls));
+    QVERIFY(mapped(controls).top() > mapped(titleBar).top());
+    const QRect originalCaption = mapped(controls);
     auto* chatHeader = window.findChild<QWidget*>(QStringLiteral("chatHeader"));
     auto* chatMore = window.findChild<QPushButton*>(QStringLiteral("moreButton"));
     QVERIFY(chatHeader && chatMore);
-    QTRY_VERIFY(qAbs(mapped(controls).center().y() - mapped(chatHeader).center().y()) <= 1);
-    QVERIFY(mapped(chatMore).right() < mapped(controls).left());
+    QTRY_VERIFY(mapped(chatHeader).top() > mapped(controls).bottom());
+    QVERIFY(mapped(chatMore).top() > mapped(titleBar).bottom());
 
     window.findChild<QPushButton*>(QStringLiteral("agentNavButton"))->click();
     auto* title = window.findChild<QLabel*>(QStringLiteral("agentHeaderTitle"));
     auto* more = window.findChild<QPushButton*>(QStringLiteral("agentMoreActions"));
     QVERIFY(title && more);
     QTRY_VERIFY(title->isVisible());
-    QTRY_VERIFY(qAbs(mapped(controls).center().y() - mapped(title).center().y()) <= 1);
-    QVERIFY(mapped(more).right() < mapped(controls).left());
-    // A narrower window must retain the existing More action and a full caption hit target.
+    QTRY_COMPARE(mapped(controls), originalCaption);
+    QVERIFY(mapped(more).top() > mapped(titleBar).bottom());
+    // Narrowing the content must keep two independent rows instead of moving
+    // caption controls into whichever page header happens to be active.
     window.resize(window.minimumWidth(), window.height());
-    QTRY_VERIFY(mapped(more).right() < mapped(controls).left());
+    QTRY_VERIFY(mapped(more).top() > mapped(titleBar).bottom());
     QVERIFY(mapped(controls).right() < window.width());
-    QVERIFY(mapped(controls).top() >= UiZoom::s(16));
+    QVERIFY(mapped(titleBar).contains(mapped(controls)));
     const QByteArray capture = qgetenv("MAICHAT_CAPTURE_MAIN_CAPTION");
     if (!capture.isEmpty()) QVERIFY(window.grab().save(QString::fromUtf8(capture)));
 
@@ -1283,13 +1293,17 @@ void MainWindowLayoutTest::windowsCaptionFollowsContentHeadersWithoutCoveringAct
     auto* upload = window.findChild<QPushButton*>(QStringLiteral("cloudDriveUpload"));
     QVERIFY(upload);
     QTRY_VERIFY(upload->isVisible());
-    QTRY_VERIFY(mapped(upload).right() < mapped(controls).left());
-    QTRY_VERIFY(qAbs(mapped(controls).center().y() - mapped(upload).center().y()) <= 1);
+    QTRY_VERIFY(mapped(upload).top() > mapped(titleBar).bottom());
     window.findChild<QPushButton*>(QStringLiteral("contactsNavButton"))->click();
     auto* directory = window.findChild<QListWidget*>(QStringLiteral("contactsList"));
     QVERIFY(directory);
     QTRY_VERIFY(directory->isVisible());
     QTRY_VERIFY(mapped(controls).bottom() < mapped(directory).top());
+    window.showFullScreen();
+    QTRY_VERIFY(!titleBar->isVisible() && !controls->isVisible());
+    window.showNormal();
+    QTRY_VERIFY(titleBar->isVisible() && controls->isVisible());
+    QVERIFY(mapped(titleBar).contains(mapped(controls)));
 #else
     QSKIP("Windows custom caption; other platforms retain their native title bar.");
 #endif
@@ -1345,7 +1359,8 @@ void MainWindowLayoutTest::windowsCaptionPreservesNativeWindowActions() {
     auto* maximize = window.findChild<QPushButton*>(QStringLiteral("windowMaximizeButton"));
     auto* close = window.findChild<QPushButton*>(QStringLiteral("windowCloseButton"));
     auto* header = window.findChild<QWidget*>(QStringLiteral("chatHeader"));
-    QVERIFY(minimize && maximize && close && header);
+    auto* titleBar = window.findChild<QWidget*>(QStringLiteral("windowTopInset"));
+    QVERIFY(minimize && maximize && close && header && titleBar);
     const HWND handle = reinterpret_cast<HWND>(window.winId());
     const auto nativePoint = [&window, handle](QPoint local) {
         const qreal ratio = window.devicePixelRatioF();
@@ -1360,8 +1375,11 @@ void MainWindowLayoutTest::windowsCaptionPreservesNativeWindowActions() {
     QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0, nativePoint(QPoint(1, 1))),
              LRESULT(HTTOPLEFT));
     QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0,
-                         nativePoint(header->mapTo(&window, QPoint(12, header->height() / 2)))),
+                         nativePoint(titleBar->mapTo(&window, QPoint(12, titleBar->height() / 2)))),
              LRESULT(HTCAPTION));
+    QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0,
+                         nativePoint(header->mapTo(&window, QPoint(12, header->height() / 2)))),
+             LRESULT(HTCLIENT));
 
     // Snap hover uses HTMAXBUTTON, so actual mouse clicks arrive as non-client messages.
     SendMessageW(handle, WM_NCLBUTTONDOWN, HTMAXBUTTON, maximizePoint());
@@ -1383,7 +1401,7 @@ void MainWindowLayoutTest::windowsCaptionPreservesNativeWindowActions() {
     QVERIFY(!window.isMaximized());
     QVERIFY(!maximize->property("captionPressed").toBool());
     SendMessageW(handle, WM_NCLBUTTONDBLCLK, HTCAPTION,
-                 nativePoint(header->mapTo(&window, QPoint(12, header->height() / 2))));
+                 nativePoint(titleBar->mapTo(&window, QPoint(12, titleBar->height() / 2))));
     QTRY_VERIFY(window.isMaximized());
     window.showNormal();
     QTRY_VERIFY(!window.isMaximized());
@@ -4680,6 +4698,52 @@ void MainWindowLayoutTest::messageTextUsesNativeResolutionAndRegularBodyFont() {
             << "body px" << browser->theme().bodyPixelSize;
 }
 
+void MainWindowLayoutTest::outgoingTextBubbleDoesNotReserveUnusedLineWidth_data() {
+    QTest::addColumn<QString>("text");
+    QTest::newRow("short") << QStringLiteral("Hello");
+    QTest::newRow("more-than-fifty-characters")
+        << QStringLiteral("Please compare the tool execution limits and intermediate messages with the reference implementation.");
+}
+
+// Measure the actual painted body and inline timestamp, rather than assuming
+// that a default QWidget size hint is the width of the visible message.
+void MainWindowLayoutTest::outgoingTextBubbleDoesNotReserveUnusedLineWidth() {
+    QFETCH(QString, text);
+    ScopedMessageHeaderFont font;
+    RemoteIMApplication app("compact-message-user", std::make_unique<FakeRemoteIMClient>());
+    app.addContact("phone-user", "Phone");
+    app.selectPeer("phone-user");
+    MainWindow window(app);
+    window.resize(1280, 820);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* editor = window.findChild<QTextEdit*>(QStringLiteral("messageEditor"));
+    auto* send = window.findChild<QPushButton*>(QStringLiteral("sendButton"));
+    QVERIFY(editor && send);
+    editor->setPlainText(text);
+    QTest::mouseClick(send, Qt::LeftButton);
+    // Fake transport acceptance and delivery each refresh the row. Let both
+    // finish before keeping widget pointers for the paint measurement.
+    QTest::qWait(100);
+    auto* bubble = window.findChild<QWidget*>(QStringLiteral("messageBubbleOutgoing"));
+    QVERIFY(bubble);
+    auto* body = bubble->findChild<MarkdownLabel*>(QStringLiteral("messageMarkdownView"));
+    QVERIFY(body);
+    QTRY_VERIFY(body->isVisible() && body->height() > 0);
+    const QImage image = body->grab().toImage().convertToFormat(QImage::Format_RGB32);
+    int lastInk = -1;
+    for (int y = 0; y < image.height(); ++y)
+        for (int x = 0; x < image.width(); ++x) {
+            const QColor pixel = image.pixelColor(x, y);
+            if (pixel.red() < 180 && pixel.green() < 200) lastInk = qMax(lastInk, x);
+        }
+    QVERIFY(lastInk >= 0);
+    const qreal emptyRight = body->width() - (lastInk + 1) / image.devicePixelRatioF();
+    QVERIFY2(emptyRight <= UiZoom::s(20), qPrintable(QStringLiteral("Unused blue width: %1").arg(emptyRight)));
+    const QByteArray capture = qgetenv("MAICHAT_CAPTURE_COMPACT_IM");
+    if (!capture.isEmpty()) QVERIFY(window.grab().save(QString::fromUtf8(capture) + QLatin1Char('-') + QString::fromLatin1(QTest::currentDataTag()) + QStringLiteral(".png")));
+}
+
 void MainWindowLayoutTest::renamedHeaderButtonsKeepTheirCompactAppearance() {
     RemoteIMApplication app("preview-user", std::make_unique<FakeRemoteIMClient>());
     app.addContact("phone-user", "Phone");
@@ -4698,5 +4762,15 @@ void MainWindowLayoutTest::renamedHeaderButtonsKeepTheirCompactAppearance() {
     }
 }
 
-QTEST_MAIN(MainWindowLayoutTest)
+// 实际标题栏取证与正常 App 使用相同 DPI 配置，避免默认 QtTest 的 96 DPI/1x 图标路径。
+int main(int argc, char* argv[]) {
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+    QApplication::setHighDpiScaleFactorRoundingPolicy(Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
+    QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+    QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
+#endif
+    QApplication application(argc, argv);
+    MainWindowLayoutTest test;
+    return QTest::qExec(&test, argc, argv);
+}
 #include "MainWindowLayoutTest.moc"

@@ -13,6 +13,13 @@ extern "C" {
 // 整轮稳定；requestId 由宿主生成且重试复用。成功 {ok:true,id:<已落库 user ID>}，
 // 只表示已接收，完整工具批次结束后、下一次模型请求前消费。idle/stop/收尾拒绝，
 // 不启动另一轮；失败须保留草稿，禁止自动回退 send。同轮相同请求有界幂等。
+// send/steer 成功另附 user_message_id 与 turnId：前者明确指向真实用户消息，
+// 后者是原任务最初的 assistant ID，即使任务已完成或重试也不改为后来活动轮次。
+// 原 id 语义不变（send 是 assistant、steer 是 user）；宿主不得用它猜 canonical user。
+// 若成功响应缺明确收据字段，应保留未知状态，不新建编号盲重发。
+// message 操作为 {op:"message",session,id}，只读精确查询该会话的一条记录；
+// 成功 {ok:true,messages:[记录]}，找不到/归属不符 {ok:false,errorCode:"not_found"}。
+// 不用 ID 前缀或游标模拟精读，不消费 snapshot 的增量状态，也不触发模型请求。
 // local_model_probe 仅测已配置本地客户端：messages 为最多10条 {role,content}，
 // role 仅 user/assistant，timeout_ms 为1..120000。复用同一完整工具声明，绝不执行工具、
 // 读写会话或调用宿主凭据；工具输出请求本身算失败。用于隔离设备验收，不代表Agent工具闭环。

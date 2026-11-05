@@ -3,6 +3,7 @@
 package com.kongshang.maichat;
 
 import android.content.Context;
+import android.graphics.Typeface;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.Spanned;
@@ -25,6 +26,7 @@ public final class MarkdownRenderer {
     private static final ExecutorService worker = Executors.newSingleThreadExecutor();
     private static final Handler main = new Handler(Looper.getMainLooper());
     private static volatile Markwon markwon;
+    private static volatile Typeface codeFace;
     private static float density, scaledDensity;
     static final class Presentation {
         final String text; final Long timestamp;
@@ -43,11 +45,21 @@ public final class MarkdownRenderer {
         }
     };
     private MarkdownRenderer() { }
+    static synchronized Typeface codeTypeface(Context context) {
+        if (codeFace == null) {
+            // Fixed has no programming ligatures and covers ASCII/box drawing
+            // at one cell and CJK at two, without device-dependent fallback.
+            codeFace = Typeface.createFromAsset(context.getApplicationContext().getAssets(),
+                    "fonts/SarasaFixedSC-Regular.ttf");
+        }
+        return codeFace;
+    }
     public static synchronized void initialize(Context context) {
         float nextDensity = context.getResources().getDisplayMetrics().density;
         float nextScale = context.getResources().getDisplayMetrics().scaledDensity;
         if (markwon != null && density == nextDensity && scaledDensity == nextScale) return;
         density = nextDensity; scaledDensity = nextScale; cache.evictAll();
+        Typeface fixedCode = codeTypeface(context);
         markwon = Markwon.builder(context.getApplicationContext())
             .usePlugin(new io.noties.markwon.AbstractMarkwonPlugin() {
                 @Override public void configureTheme(io.noties.markwon.core.MarkwonTheme.Builder theme) {
@@ -59,11 +71,11 @@ public final class MarkdownRenderer {
                             .headingTypeface(MaiChatTypography.semibold())
                             .headingBreakHeight(0)
                             .headingTextSizeMultipliers(new float[] {22f / 14, 18f / 14, 16f / 14, 1, 1, 1})
-                            .codeTypeface(android.graphics.Typeface.MONOSPACE)
+                            .codeTypeface(fixedCode)
                             .codeTextSize(Math.round(13 * scaledDensity))
                             .codeTextColor(MaiChatTypography.CODE_COLOR)
                             .codeBackgroundColor(MaiChatTypography.CODE_BACKGROUND)
-                            .codeBlockTypeface(android.graphics.Typeface.MONOSPACE)
+                            .codeBlockTypeface(fixedCode)
                             .codeBlockTextSize(Math.round(12 * scaledDensity))
                             .codeBlockTextColor(MaiChatTheme.TEXT)
                             .codeBlockBackgroundColor(android.graphics.Color.rgb(244, 246, 249))
@@ -157,6 +169,19 @@ public final class MarkdownRenderer {
         });
     }
     public static void bind(TextView view, String value) { bind(view, value, null); }
+    // Mixed messages use local code viewports. Legacy TextView callers remain
+    // suitable for bounded detail/summary text without changing their hosts.
+    public static void bind(MarkdownContentView view, String value) { bind(view, value, null); }
+    static void bindStreaming(MarkdownContentView view, String value) { bind(view, value, null); }
+    static void bind(MarkdownContentView view, String value, Long timestamp) {
+        Object token = view.beginPresentation(value);
+        Spanned ready = cache.get(cacheKey(value, timestamp));
+        if (ready != null) { view.applyPresentation(token, ready, markwon); return; }
+        worker.execute(() -> {
+            Spanned parsed = prepare(value, timestamp);
+            main.post(() -> view.applyPresentation(token, parsed, markwon));
+        });
+    }
     static void bindStreaming(TextView view, String value) { bind(view, value, null, true); }
     static void bind(TextView view, String value, Long timestamp) { bind(view, value, timestamp, false); }
     private static void bind(TextView view, String value, Long timestamp, boolean retainPrevious) {

@@ -8,15 +8,18 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QWheelEvent>
 #include <QtMath>
 
 #include "markdown/MarkdownDocument.h"
 #include "markdown/MarkdownLayout.h"
 #include "markdown/MarkdownLayoutCache.h"
+#include "markdown/MarkdownCodeScrollState.h"
 
 struct MarkdownLabel::Runtime {
     MarkdownTheme theme = MarkdownTheme::standard(1.0);
     MarkdownDocument document;
+    MarkdownCodeScrollState codeScroll;
 
     QString noteText;
     QColor noteColor;
@@ -72,6 +75,9 @@ MarkdownLabel::~MarkdownLabel() {
 }
 
 void MarkdownLabel::setTheme(const MarkdownTheme& theme) {
+    // Return both layouts under the inputs that actually produced them. Doing
+    // this after changing source/note/zoom would relabel stale geometry in cache.
+    returnLayoutToCache();
     runtime_->theme = theme;
     invalidate();
 }
@@ -81,6 +87,8 @@ const MarkdownTheme& MarkdownLabel::theme() const {
 }
 
 void MarkdownLabel::setMarkdown(const QString& markdown) {
+    returnLayoutToCache();
+    runtime_->codeScroll.clear();
     runtime_->document = MarkdownDocument::parse(markdown);
     runtime_->anchor = 0;
     runtime_->cursor = 0;
@@ -93,6 +101,7 @@ const QString& MarkdownLabel::markdown() const {
 }
 
 void MarkdownLabel::setTrailingNote(const QString& text, const QColor& color, int pixelSize) {
+    returnLayoutToCache();
     runtime_->noteText = text;
     runtime_->noteColor = color;
     runtime_->notePixelSize = pixelSize;
@@ -196,6 +205,19 @@ int MarkdownLabel::heightForWidth(int width) const {
     return qCeil(runtime.probe.height());
 }
 
+int MarkdownLabel::naturalWidthForWidth(int maximumWidth) const {
+    if (maximumWidth <= 0) return 0;
+    // heightForWidth already owns the current/probe cache choice. Query that
+    // same measured layout instead of reparsing source or borrowing the paint
+    // layout at a different width, which would disturb selection and wrapping.
+    heightForWidth(maximumWidth);
+    const qreal target = qMax(maximumWidth, kMinimumLayoutWidth);
+    const Runtime& runtime = *runtime_;
+    const MarkdownLayout& measured = qFuzzyCompare(runtime.laidOutWidth, target)
+        ? runtime.layout : runtime.probe;
+    return qBound(0, qCeil(measured.naturalWidth()), maximumWidth);
+}
+
 QSize MarkdownLabel::sizeHint() const {
     // 宽度这一项沿用原来 QTextBrowser 版本给的 360：气泡是按行布局的拉伸位
     // 摆的，这个值只在「一行里怎么分」时起作用，换成按内容算会改动现有气泡宽度。
@@ -274,6 +296,7 @@ void MarkdownLabel::ensureLayout(qreal width) {
     }
     runtime_->layout.setSelection(runtime_->anchor, runtime_->cursor);
     runtime_->laidOutWidth = width;
+    runtime_->codeScroll.synchronize(runtime_->layout);
     runtime_->layoutWorthCaching = true;
 }
 
@@ -288,7 +311,7 @@ void MarkdownLabel::paintEvent(QPaintEvent* event) {
 
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
-    runtime_->layout.paint(&painter, QPointF(0, 0), QRectF(event->rect()));
+    runtime_->layout.paint(&painter, QPointF(0, 0), QRectF(event->rect()), runtime_->codeScroll.offsets);
 }
 
 void MarkdownLabel::resizeEvent(QResizeEvent* event) {
@@ -311,7 +334,13 @@ void MarkdownLabel::mousePressEvent(QMouseEvent* event) {
     }
     runtime_->pressPosition = event->pos();
     ensureCurrentLayout();
-    runtime_->anchor = runtime_->layout.positionAt(QPointF(event->pos()));
+    if (runtime_->codeScroll.press(runtime_->layout, event->pos())) {
+        runtime_->selecting = false;
+        update();
+        event->accept();
+        return;
+    }
+    runtime_->anchor = runtime_->layout.positionAt(QPointF(event->pos()), runtime_->codeScroll.offsets);
     runtime_->cursor = runtime_->anchor;
     runtime_->selecting = true;
     runtime_->layout.setSelection(runtime_->anchor, runtime_->cursor);
@@ -319,8 +348,13 @@ void MarkdownLabel::mousePressEvent(QMouseEvent* event) {
 }
 
 void MarkdownLabel::mouseMoveEvent(QMouseEvent* event) {
+    if (runtime_->codeScroll.move(runtime_->layout, event->pos())) {
+        update();
+        event->accept();
+        return;
+    }
     if (runtime_->selecting) {
-        runtime_->cursor = runtime_->layout.positionAt(QPointF(event->pos()));
+        runtime_->cursor = runtime_->layout.positionAt(QPointF(event->pos()), runtime_->codeScroll.offsets);
         runtime_->layout.setSelection(runtime_->anchor, runtime_->cursor);
         update();
         return;
@@ -333,6 +367,10 @@ void MarkdownLabel::mouseReleaseEvent(QMouseEvent* event) {
         QWidget::mouseReleaseEvent(event);
         return;
     }
+    if (runtime_->codeScroll.release()) {
+        event->accept();
+        return;
+    }
     runtime_->selecting = false;
     // 拖过一段距离的是在选字，不是在点链接。
     if ((event->pos() - runtime_->pressPosition).manhattanLength()
@@ -341,6 +379,17 @@ void MarkdownLabel::mouseReleaseEvent(QMouseEvent* event) {
     }
     const QString href = linkAt(event->pos());
     if (!href.isEmpty()) emit linkActivated(href);
+}
+
+void MarkdownLabel::wheelEvent(QWheelEvent* event) {
+    ensureCurrentLayout();
+    if (runtime_->codeScroll.wheel(runtime_->layout, event->position(), event->pixelDelta(),
+                                    event->angleDelta(), event->modifiers())) {
+        update();
+        event->accept();
+        return;
+    }
+    QWidget::wheelEvent(event);
 }
 
 void MarkdownLabel::keyPressEvent(QKeyEvent* event) {

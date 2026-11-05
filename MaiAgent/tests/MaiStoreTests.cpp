@@ -282,6 +282,49 @@ void contract_message_pages(MaiSessionStore& store, const char* which) {
     if (afterAppend.size() == 2) CHECK(afterAppend[0].id == ids[2]);
 }
 
+void contract_exact_message_lookup(MaiSessionStore& store, const char* which) {
+    std::printf("   [%s] exact message lookup preserves session and output boundaries\n", which);
+    const std::string owner = MaiIdGenerator::newSessionId();
+    const std::string other = MaiIdGenerator::newSessionId();
+    store.putSession(makeSession(owner, "lookup owner", 1));
+    store.putSession(makeSession(other, "lookup other", 1));
+    const std::vector<std::string> keys{"msg_lookup_A", "msg_lookup_AA", "msg_lookup_A~"};
+    for (const auto& key : keys) {
+        MaiMessage value = makeMessage(key, MaiRole::Assistant);
+        value.parts.push_back(textPart(MaiIdGenerator::newPartId(), "exact payload " + key));
+        store.putMessage(owner, value);
+    }
+    MaiMessage foreign = makeMessage("msg_lookup_B", MaiRole::User);
+    foreign.parts.push_back(textPart(MaiIdGenerator::newPartId(), "other session payload"));
+    store.putMessage(other, foreign);
+    for (const auto& key : keys) {
+        MaiMessage loaded;
+        CHECK(store.getMessage(owner, key, loaded));
+        CHECK(loaded.id == key);
+        CHECK(loaded.role == MaiRole::Assistant);
+        CHECK(loaded.completed == 2001);
+        CHECK(loaded.parts.size() == 1);
+        CHECK(loaded.text() == "exact payload " + key);
+    }
+    MaiMessage untouched = makeMessage("sentinel", MaiRole::User);
+    untouched.parts.push_back(textPart("sentinel_part", "do not modify output"));
+    CHECK(!store.getMessage(owner, foreign.id, untouched));
+    CHECK(!store.getMessage(owner, "msg_lookup_A_missing", untouched));
+    CHECK(!store.getMessage("missing_session", keys.front(), untouched));
+    CHECK(untouched.id == "sentinel");
+    CHECK(untouched.text() == "do not modify output");
+    CHECK(untouched.parts.size() == 1);
+    MaiMessage revised = makeMessage(keys.front(), MaiRole::Assistant);
+    revised.parts.push_back(textPart(MaiIdGenerator::newPartId(), "new snapshot"));
+    store.putMessage(owner, revised);
+    MaiMessage loaded;
+    CHECK(store.getMessage(owner, revised.id, loaded));
+    CHECK(loaded.text() == "new snapshot");
+    CHECK(store.removeSession(owner));
+    CHECK(!store.getMessage(owner, revised.id, untouched));
+    CHECK(untouched.id == "sentinel");
+}
+
 // 复用同一存储契约验证中断后的工具调用能恢复为明确状态。
 // 重启后不得把半完成的工具片段当成已成功结果。
 void contract_recovers_interrupted_tools(MaiSessionStore& store, const char* which) {
@@ -659,6 +702,7 @@ void runContract(MaiSessionStore& store, const char* which) {
     contract_list_sessions_ordering(store, which);
     contract_messages_and_parts(store, which);
     contract_message_pages(store, which);
+    contract_exact_message_lookup(store, which);
     contract_recovers_interrupted_tools(store, which);
     contract_put_message_replaces_parts(store, which);
     contract_remove_session_takes_messages(store, which);
