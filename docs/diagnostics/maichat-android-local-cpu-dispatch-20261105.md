@@ -203,3 +203,22 @@ Windows 发布另见 `maichat-windows-release-245-20261105.md`。
 
 每轮请求仍按现有实现清空 KV/SSM 后完整 prefill，未新增跨轮前缀缓存。动态 CPU 模块的实际收益和
 完整工具/历史条件下的可用速度，需要上述实机测量，不能由构建成功推定。
+
+## 2.2.30 签名安装与模型完整性实机结果
+
+封版源码 `a2dc0aba88813973ec610879bccb030b22c50428` 对应的 `2.2.30`（267）已原位安装到同一
+OPPO Android 15 真机；未清理生产数据或更换包名。显式使用 `adb install --no-incremental -r`，
+避免本次验证依赖主机的增量文件服务；这不证明此前挂起的根因就是 IncFS。
+
+- 最终签名 APK 与从设备回拉的 `base.apk` SHA-256 完全一致：
+  `267c7ea87a3639b5e652be970d3ad5a18d0324132f07f65dd6b1cc3780144efd`。
+- 安装版本、同一证书、26 个 ARM64 库和未打包 `libz.so` 均核对；主库 BuildID
+  `32b1a13dd001164f9784bc3e8dca3d8f9d97bbd0` 与当前 native 输出一致。
+- 唯一完整性 instrument 用例 **1/1 PASS，6.481s**。私有模型文件实际读完
+  `1396198496` 字节，SHA-256 为固定的 `57a10858…846a1d8`；独立复核耗时 `6.446s`。
+  回执明确 `private_app_file=true`、`inference_exercised=false`，并记录本次测试进程/线程身份，
+  不复用旧回执。测试包随后卸载，仅保留生产 App。
+
+本机证据为 `.cache/android-primary-v230-integrity/qa-result.json`、`installed-verification.json`、
+`installed-model-integrity.json`、`integrity-instrumentation.log` 与 `uninstall-test.log`。
+上述 GREEN 仅说明安装产物和模型文件完整性；普通界面的推理、记忆及工具验收仍需独立完成。

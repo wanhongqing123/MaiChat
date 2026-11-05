@@ -145,3 +145,40 @@ computer native input verified: own pid=20756 hwnd=1508442 text=computer OK
 结构化证据为 `.cache/windows-release-245/computer-debugger-evidence.json`，完整测试输出在
 `computer-debugger-catalog/Testing/Temporary/LastTest.log`；CDB 模块日志单独保留，均不作为发布资产。
 正常会话的明确跳过与本次正向输入验证分开记录，不能将前者改写成普通会话交互通过。
+
+## 封版产物与 GitHub Release
+
+最终发布源码为干净 `main` 的 `a2dc0aba88813973ec610879bccb030b22c50428`，已推送到
+`wanhongqing123/MaiChat`。最终输出目录为：
+
+```text
+.cache/windows-release-245/out/v2.2.45-a2dc0aba88813973ec610879bccb030b22c50428-20261105T102820-9aeb2a42/
+```
+
+- 重新配置、默认全部目标、95 项 PE/Qt 插件门禁、打包和安装器编译均退出 **0**。
+- 七项桌面 CTest 实际结果为 **6 PASS + 1 SKIP**，computer 仍明确记录普通后台会话的前台限制。
+  对最终测试 EXE 另行在已有 CDB 中启动自有进程，原生点击和键入断言通过（`2.61s`，
+  `PID=27544`、`HWND=2099570`）；没有把普通会话的跳过改写为通过。
+- 同一核心源码指纹的八项核心回归 **8 PASS**，已在 manifest 记录身份关联。
+- 完整 portable staging 与真实 ZIP 解压目录分别以
+  `PATH=C:\Windows\System32;C:\Windows` 运行 `--smoke`，退出 **0**；进程分别为
+  `PID=1568/5580`，均核对实际 EXE 路径、版本 `2.2.45`、Qt `5.15.2`。
+- build、portable staging、真实 ZIP 解压和 installer 输入的 App EXE 均为 `100881920` 字节，
+  SHA-256 `0125c61811d786829853478de6aaa70082d01b7cb8e6c44511f01bc4a266c785`。
+- 安装器仅编译，没有运行，没有替换用户已安装的桌面 App。真实账号和付费模型路径不在此次验收范围。
+
+| 发布文件 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| `MaiChat-win64-v2.2.45-20261105-a2dc0aba.zip` | 170807614 | `a6480524d1ecb95860aeaeb4e3bee929214a7cfff66ef32043ecde3510d7dd07` |
+| `MaiChat-Setup-win64-v2.2.45-a2dc0aba.exe` | 140687109 | `c38cbf6d692e6b802f9b9a58db2d2898d855d5f2d9f607c7b4bf25bdc8a2a9b2` |
+| `release-manifest.json` | 10308 | `d8de8934e908fddbd3476291dced4a2b1db8f121b4593a0eee51d58ab7f39042` |
+| `SHA256SUMS` | 308 | `149a41fd94b3860148ad2ac6fd5d1d0d2381444ed82c106c878c025602061ced` |
+
+先创建 draft 并校验四个远端资产均为 `uploaded`、大小和 GitHub 返回的 SHA-256 digest 与本机一致，
+随后按用户明确授权公开发布：
+[MaiChat v2.2.45 · Windows x64](https://github.com/wanhongqing123/MaiChat/releases/tag/v2.2.45)。
+
+发布后重新核对 `draft=false`、标签指向上述完整源码提交、四个资产哈希，并用无登录凭据的公开
+GitHub API GET 确认 Release 可读。Release ID 为 `434713156`。
+证据为最终输出目录的 `github-draft-verification.json`、`github-published-verification.json`；
+原始本机账号日志、测试截图和编译日志均未作为 Release 资产上传。
