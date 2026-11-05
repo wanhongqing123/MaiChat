@@ -38,6 +38,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFontMetrics>
+#include <QFontDatabase>
 #include <QImage>
 #include <QHostAddress>
 #include <QInputMethodEvent>
@@ -80,6 +81,33 @@
 #include "ui/UiZoom.h"
 
 namespace {
+
+// 仅消息顶栏可视回归使用正常 App 随包字体；作用域结束恢复，避免影响其他套件。
+class ScopedMessageHeaderFont {
+public:
+    ScopedMessageHeaderFont() : previous_(QApplication::font()) {
+        const QDir fonts(QFINDTESTDATA("../resources/fonts"));
+        for (const QString& file : fonts.entryList(
+                 {QStringLiteral("Inter-*.ttf"), QStringLiteral("NotoSansSC-*.otf")}, QDir::Files)) {
+            const int id = QFontDatabase::addApplicationFont(fonts.filePath(file));
+            if (id >= 0) fontIds_.append(id);
+        }
+        QFont font;
+        font.setFamilies({QStringLiteral("Inter"), QStringLiteral("Noto Sans SC"),
+                          QStringLiteral("Microsoft YaHei UI"), QStringLiteral("Microsoft YaHei"),
+                          QStringLiteral("PingFang SC")});
+        font.setHintingPreference(QFont::PreferNoHinting);
+        font.setPixelSize(13);
+        QApplication::setFont(font);
+    }
+    ~ScopedMessageHeaderFont() {
+        QApplication::setFont(previous_);
+        for (int id : fontIds_) QFontDatabase::removeApplicationFont(id);
+    }
+private:
+    QFont previous_;
+    QList<int> fontIds_;
+};
 
 // 确认弹窗是模态的，exec() 会挡住测试线程；用定时器在其嵌套事件循环里点掉。
 // 删除类确认的主按钮是 appMessageDanger（红色），普通确认是 appMessageConfirm。
@@ -178,6 +206,7 @@ private slots:
     void copiesOriginalMarkdownFromMessageContextMenu();
     void addContactButtonRemainsVisibleWithoutSearch();
     void conversationHeaderNamesActions();
+    void conversationAddMenuKeepsActionsAndAnchorsToButton();
     void selfAvatarOpensProfileSettings();
     void navigationTextIsLeftAlignedAndContactsDoNotShowMessagePreview();
     void sectionTitleFollowsSelectedNavigation();
@@ -3447,6 +3476,7 @@ void MainWindowLayoutTest::addContactButtonRemainsVisibleWithoutSearch() {
 }
 
 void MainWindowLayoutTest::conversationHeaderNamesActions() {
+    ScopedMessageHeaderFont font;
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
     app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
@@ -3456,14 +3486,108 @@ void MainWindowLayoutTest::conversationHeaderNamesActions() {
 
     auto* pane = window.findChild<QWidget*>(QStringLiteral("conversationPane"));
     auto* title = window.findChild<QLabel*>(QStringLiteral("conversationSectionTitle"));
-    auto* requests = window.findChild<QPushButton*>(QStringLiteral("friendRequestsButton"));
     auto* add = window.findChild<QPushButton*>(QStringLiteral("addConversationButton"));
-    QVERIFY(pane && title && requests && add);
+    QVERIFY(pane && title && add);
+    QVERIFY(window.findChild<QPushButton*>(QStringLiteral("friendRequestsButton")) == nullptr);
     QCOMPARE(title->text(), QStringLiteral("消息"));
-    QVERIFY(title->mapTo(pane, QPoint()).x() < requests->mapTo(pane, QPoint()).x());
-    QVERIFY(requests->mapTo(pane, QPoint()).x() < add->mapTo(pane, QPoint()).x());
+    QVERIFY(title->mapTo(pane, QPoint()).x() < add->mapTo(pane, QPoint()).x());
+    QCOMPARE(add->accessibleName(), QStringLiteral("添加会话或好友"));
+    QVERIFY(add->accessibleDescription().contains(QStringLiteral("好友申请")));
+    QVERIFY(add->text().isEmpty());
+    QVERIFY(!add->icon().isNull());
     const QByteArray capture = qgetenv("MAICHAT_CAPTURE_CONVERSATION_HEADER");
-    if (!capture.isEmpty()) QVERIFY(pane->grab().save(QString::fromUtf8(capture)));
+    if (!capture.isEmpty()) {
+        const QRect header(0, 0, pane->width(), add->mapTo(pane, QPoint(0, add->height())).y() + UiZoom::s(12));
+        QVERIFY(pane->grab(header).save(QString::fromUtf8(capture)));
+    }
+}
+
+void MainWindowLayoutTest::conversationAddMenuKeepsActionsAndAnchorsToButton() {
+    ScopedMessageHeaderFont font;
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
+    app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
+    app.selectPeer(QStringLiteral("phone-user"));
+    int requestLoads = 0;
+    QString decidedId;
+    bool accepted = false;
+    RemoteIMApplication::AccountFriendOperations operations;
+    operations.list = [](auto completion) {
+        completion({RemoteIMApplication::AccountFriend{QStringLiteral("m_friend"),
+                    QStringLiteral("iPhone"), QStringLiteral("phone-user")}}, {});
+    };
+    operations.requests = [&requestLoads](auto completion) {
+        ++requestLoads;
+        completion({RemoteIMApplication::AccountFriendRequest{QStringLiteral("request-id"),
+                    QStringLiteral("m_pending"), QStringLiteral("待处理好友"),
+                    QStringLiteral("pending-user")}}, {});
+    };
+    operations.decide = [&decidedId, &accepted](const QString& id, bool allow, auto completion) {
+        decidedId = id;
+        accepted = allow;
+        completion(true, {});
+    };
+    app.setAccountFriendOperations(std::move(operations));
+    MainWindow window(app);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* add = window.findChild<QPushButton*>(QStringLiteral("addConversationButton"));
+    auto* pane = window.findChild<QWidget*>(QStringLiteral("conversationPane"));
+    QVERIFY(add && pane);
+    QTest::mouseClick(add, Qt::LeftButton);
+    auto visibleMenu = [add]() -> QMenu* {
+        for (auto* menu : add->findChildren<QMenu*>(QStringLiteral("conversationAddMenu")))
+            if (menu->isVisible()) return menu;
+        return nullptr;
+    };
+    QMenu* menu = nullptr;
+    QTRY_VERIFY((menu = visibleMenu()) != nullptr);
+    QVERIFY(menu->windowFlags().testFlag(Qt::FramelessWindowHint));
+    QVERIFY(menu->testAttribute(Qt::WA_TranslucentBackground));
+    QCOMPARE(menu->accessibleName(), add->accessibleName());
+    auto* create = menu->findChild<QAction*>(QStringLiteral("createGroupAction"));
+    auto* friendAction = menu->findChild<QAction*>(QStringLiteral("addFriendAction"));
+    auto* requests = menu->findChild<QAction*>(QStringLiteral("friendRequestsAction"));
+    QVERIFY(create && friendAction && requests);
+    QVERIFY(!create->icon().isNull() && !friendAction->icon().isNull() && !requests->icon().isNull());
+    const QPoint buttonBottomRight = add->mapToGlobal(QPoint(add->width() - 1, add->height()));
+    const QRect available = add->screen()->availableGeometry();
+    const int expectedRight = qMin(buttonBottomRight.x(), available.right());
+    QVERIFY(qAbs(menu->geometry().right() - expectedRight) <= 2);
+    QVERIFY(menu->geometry().top() >= buttonBottomRight.y());
+    QVERIFY(menu->geometry().top() < buttonBottomRight.y() + add->height());
+    QVERIFY(menu->actionGeometry(requests).height() > menu->fontMetrics().height());
+    const QString capture = qEnvironmentVariable("MAICHAT_CAPTURE_MESSAGE_ADD_MENU");
+    if (!capture.isEmpty()) {
+        // 两张截图均抓取本测试自己的 Qt 子树，不使用桌面截屏混入其他运行中的 App。
+        QVERIFY(menu->grab().save(capture));
+        const QFileInfo file(capture);
+        const QRect header(0, 0, pane->width(), add->mapTo(pane, QPoint(0, add->height())).y() + UiZoom::s(12));
+        QVERIFY(pane->grab(header).save(file.dir().filePath(file.completeBaseName() + QStringLiteral("-header.png"))));
+    }
+    QTest::keyClick(menu, Qt::Key_Escape);
+    QTRY_VERIFY(visibleMenu() == nullptr);
+    QCOMPARE(app.chatState().selectedPeerId(), QStringLiteral("phone-user"));
+    QTRY_VERIFY(add->hasFocus());
+
+    // 键盘也可打开同一菜单；审批从菜单进入后仍调用真实业务路径，不丢掉必要能力。
+    QTest::keyClick(add, Qt::Key_Space);
+    QTRY_VERIFY((menu = visibleMenu()) != nullptr);
+    requests = menu->findChild<QAction*>(QStringLiteral("friendRequestsAction"));
+    QVERIFY(requests);
+    QTest::mouseClick(menu, Qt::LeftButton, Qt::NoModifier, menu->actionGeometry(requests).center());
+    QTRY_COMPARE(requestLoads, 1);
+    auto* dialog = window.findChild<QDialog*>(QStringLiteral("friendRequestsDialog"));
+    QVERIFY(dialog && dialog->isVisible());
+    QPushButton* accept = nullptr;
+    for (auto* button : dialog->findChildren<QPushButton*>())
+        if (button->text() == QStringLiteral("同意")) accept = button;
+    QVERIFY(accept);
+    QTest::mouseClick(accept, Qt::LeftButton);
+    QCOMPARE(decidedId, QStringLiteral("request-id"));
+    QVERIFY(accepted);
+    QCOMPARE(app.chatState().selectedPeerId(), QStringLiteral("phone-user"));
+    dialog->close();
 }
 
 void MainWindowLayoutTest::selfAvatarOpensProfileSettings() {

@@ -2,6 +2,8 @@
 // 主要入口：setForwardAction、forwardVideo、saveCopy、activeDialog。
 // 直接依赖：MaiGraphicsPresenter.h；实现与这些接口协作。
 #include "ui/MaiFfplayVideoDialog.h"
+#include "ui/MaiVideoSpeedSelector.h"
+#include "ui/MaiVideoHud.h"
 #include "MaiCloudVod.h"
 #include "ui/DesktopMusicPlayerDialog.h"
 
@@ -20,6 +22,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFont>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QLabel>
@@ -27,6 +30,8 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QMoveEvent>
+#include <QHideEvent>
 #include <QMenu>
 #include <QPushButton>
 #include <QPainter>
@@ -83,9 +88,10 @@ QIcon videoControlIcon(const char* name) {
     QByteArray path;
     const QByteArray key(name);
     if (key == "play")
-        path = "<path d='M8 5l11 7-11 7z' fill='#f4f6fa' stroke='none'/>";
+        path = "<path d='M6 3l15 9-15 9z' fill='#f4f6fa' stroke='none'/>";
     else if (key == "pause")
-        path = "<path d='M8 6v12m8-12v12' stroke-width='3'/>";
+        path = "<rect x='5' y='3' width='5' height='18' rx='1.5' fill='#f4f6fa' stroke='none'/>"
+               "<rect x='14' y='3' width='5' height='18' rx='1.5' fill='#f4f6fa' stroke='none'/>";
     else if (key == "replay")
         path = "<path d='M3 10a9 9 0 1 1 2.8 8.5M3 4v6h6'/>";
     else if (key == "fullscreen")
@@ -115,9 +121,9 @@ QIcon videoControlIcon(const char* name) {
     else if (key == "save")
         path = "<path d='M12 3v12m-4-4l4 4 4-4M4 15v6h16v-6'/>";
     else if (key == "previous")
-        path = "<path d='M14 6l-6 6 6 6'/>";
+        path = "<path d='M18 4L6 12l12 8z' fill='#f4f6fa' stroke='none'/><path d='M4 4v16' stroke-width='3'/>";
     else if (key == "next")
-        path = "<path d='M10 6l6 6-6 6'/>";
+        path = "<path d='M6 4l12 8-12 8z' fill='#f4f6fa' stroke='none'/><path d='M20 4v16' stroke-width='3'/>";
     else
         path =
             "<circle cx='5' cy='12' r='1' fill='#f4f6fa'/><circle cx='12' cy='12' r='1' fill='#f4f6fa'/><circle "
@@ -126,11 +132,11 @@ QIcon videoControlIcon(const char* name) {
         QByteArray("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='#f4f6fa' "
                    "stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'>") +
         path + "</svg>");
-    QPixmap pixels(40, 40);
+    QPixmap pixels(48, 48);
     pixels.setDevicePixelRatio(2);
     pixels.fill(Qt::transparent);
     QPainter painter(&pixels);
-    renderer.render(&painter, QRectF(0, 0, 20, 20));
+    renderer.render(&painter, QRectF(0, 0, 24, 24));
     return QIcon(pixels);
 }
 
@@ -231,9 +237,9 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     setWindowTitle(QFileInfo(path).fileName());
     setMinimumSize(640, 420);
     setStyleSheet(QStringLiteral("QDialog { background:#101010; }"));
-    titleBar_ = new QWidget(this);
+    titleBar_ = new MaiVideoHud(this);
     titleBar_->setObjectName(QStringLiteral("ffplayTitleBar"));
-    titleBar_->setStyleSheet(QStringLiteral("QWidget#ffplayTitleBar { background:#111111; }"));
+    titleBar_->setStyleSheet(QStringLiteral("QWidget#ffplayTitleBar {background:#101010;}"));
     auto* header = new QHBoxLayout(titleBar_);
     header->setContentsMargins(18, 0, 10, 0);
     header->setSpacing(4);
@@ -255,42 +261,57 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
         button->setToolTip(tip);
         button->setAccessibleName(tip);
         button->setIcon(videoControlIcon(icon));
-        button->setIconSize(QSize(20, 20));
+        button->setIconSize(QSize(24, 24));
         button->setToolButtonStyle(Qt::ToolButtonIconOnly);
         button->setFixedSize(34, 34);
         button->setStyleSheet(flatButton);
         header->addWidget(button);
         return button;
     };
+    auto* more = tool("videoMoreButton", "more", QStringLiteral("更多操作"));
+    auto* moreMenu = new QMenu(this);
+    moreMenu->setObjectName(QStringLiteral("ffplayMoreMenu"));
+    moreMenu->setWindowFlags(Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
+    moreMenu->setAttribute(Qt::WA_TranslucentBackground);
+    moreMenu->setMinimumWidth(112);
+    moreMenu->setStyleSheet(QStringLiteral(
+        "QMenu {color:#eeeeee;background:#202020;border:1px solid #383838;border-radius:8px;padding:3px;}"
+        "QMenu::item {padding:7px 12px 7px 10px;border-radius:5px;}"
+        "QMenu::item:selected {background:#373737;} QMenu::item:disabled {color:#777777;}"
+        "QMenu::separator {height:1px;background:#393939;margin:5px;}"));
+    auto* save = moreMenu->addAction(videoControlIcon("save"), QStringLiteral("下载"));
+    save->setObjectName(QStringLiteral("videoSaveAction"));
+    save->setToolTip(QStringLiteral("保存视频副本"));
+    connect(save, &QAction::triggered, this, &MaiFfplayVideoDialog::saveCopy);
+    auto* forward = moreMenu->addAction(videoControlIcon("share"), QStringLiteral("分享"));
 #if defined(Q_OS_MAC)
-    auto* forward = tool("videoShareButton", "share", QStringLiteral("分享视频"));
-    connect(forward, &QToolButton::clicked, this, [this, forward] {
+    forward->setObjectName(QStringLiteral("videoShareAction"));
+    connect(forward, &QAction::triggered, this, [this, more] {
         const QByteArray utf8 = path_.toUtf8();
-        maiGraphicsShareMacVideo(forward, utf8.constData());
+        maiGraphicsShareMacVideo(more, utf8.constData());
     });
 #else
-    auto* forward = tool("videoForwardButton", "forward", QStringLiteral("转发视频"));
-    connect(forward, &QToolButton::clicked, this, &MaiFfplayVideoDialog::forwardVideo);
+    forward->setObjectName(QStringLiteral("videoForwardAction"));
+    connect(forward, &QAction::triggered, this, &MaiFfplayVideoDialog::forwardVideo);
 #endif
-    auto* save = tool("videoSaveButton", "save", QStringLiteral("保存视频副本"));
-    connect(save, &QToolButton::clicked, this, &MaiFfplayVideoDialog::saveCopy);
-    auto* more = tool("videoMoreButton", "more", QStringLiteral("更多操作"));
-    connect(more, &QToolButton::clicked, this, [this, more] {
-        QMenu menu(this);
-        menu.setObjectName(QStringLiteral("ffplayMoreMenu"));
-        menu.setStyleSheet(
-            QStringLiteral("QMenu {color:#f4f4f4;background:#202020;border:1px solid #414141;"
-                           "padding:5px;} QMenu::item {padding:8px 18px;}"
-                           "QMenu::item:selected {background:#373737;}"));
-        auto* copy = menu.addAction(QStringLiteral("复制文件路径"));
-        auto* folder = menu.addAction(QStringLiteral("打开所在文件夹"));
-        const auto chosen = menu.exec(more->mapToGlobal(more->rect().bottomLeft()));
-        if (chosen == copy)
-            QApplication::clipboard()->setText(path_);
-        else if (chosen == folder)
-            QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(path_).absolutePath()));
-        revealControls();
+    auto* previousAction = moreMenu->addAction(videoControlIcon("previous"), QStringLiteral("上一段"));
+    previousItemAction_ = previousAction;
+    previousAction->setObjectName(QStringLiteral("ffplayPreviousItemAction"));
+    previousAction->setVisible(false);
+    connect(previousAction, &QAction::triggered, this, [this] { navigateVideo(-1); });
+    connect(more, &QToolButton::clicked, this, [this, more, moreMenu] {
+        // 与参考播放器一样把文件操作收进同一弹层，右边缘对齐省略号按钮。
+        const QSize size = moreMenu->sizeHint();
+        const QPointer<MaiFfplayVideoDialog> alive(this);
+        moreMenu->exec(more->mapToGlobal(QPoint(more->width() - size.width(), more->height() + 6)));
+        if (alive) alive->revealControls();
     });
+    auto* divider = new QFrame(titleBar_);
+    divider->setObjectName(QStringLiteral("ffplayTitleDivider"));
+    divider->setFixedSize(1, 18);
+    divider->setStyleSheet(QStringLiteral("background:#555555;border:0;"));
+    header->addSpacing(8);
+    header->addWidget(divider);
     header->addSpacing(8);
     const auto button = [&](QWidget* parentWidget, const char* name, const char* icon, const QString& tip) {
         auto* value = new QPushButton(parentWidget);
@@ -298,8 +319,8 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
         value->setToolTip(tip);
         value->setAccessibleName(tip);
         value->setIcon(videoControlIcon(icon));
-        value->setIconSize(QSize(20, 20));
-        value->setFixedSize(34, 34);
+        value->setIconSize(QSize(24, 24));
+        value->setFixedSize(36, 36);
         value->setStyleSheet(flatButton);
         value->setAutoDefault(false);
         value->setDefault(false);
@@ -320,63 +341,62 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     surface_->setAttribute(Qt::WA_NativeWindow);
     surface_->setAttribute(Qt::WA_PaintOnScreen);
     surface_->setAttribute(Qt::WA_NoSystemBackground);
-    // 常态为视频外的黑色 footer；全屏为同级原生叠层，收起时不挤压/重建视频视口。
-    overlay_ = new QWidget(this);
+    // 持久的 owner HUD 使用 Qt 顶层透明合成；不重建控件，也不让 Qt 擦写 D3D 视频。
+    // 普通窗口是视频外的黑色 footer，全屏才把渐变背景覆盖到视频上。
+    overlay_ = new MaiVideoHud(this);
     overlay_->setObjectName(QStringLiteral("ffplayOverlay"));
-    overlay_->setAttribute(Qt::WA_NativeWindow);
-    overlay_->setStyleSheet(QStringLiteral("QWidget#ffplayOverlay {background:#101010;}"));
+    overlay_->setStyleSheet(QStringLiteral("QWidget#ffplayOverlay {background:#000000;}"));
     auto* overlayLayout = new QVBoxLayout(overlay_);
     overlayLayout->setContentsMargins(0, 0, 0, 0);
     auto* panel = new QWidget(overlay_);
     panel->setObjectName(QStringLiteral("ffplayControlPanel"));
-    panel->setStyleSheet(QStringLiteral("QWidget#ffplayControlPanel {background:#101010;}"));
+    panel->setStyleSheet(QStringLiteral("QWidget#ffplayControlPanel {background:#000000;}"));
     overlayLayout->addWidget(panel);
     auto* panelLayout = new QVBoxLayout(panel);
-    panelLayout->setContentsMargins(20, 7, 20, 9);
+    panelLayout->setContentsMargins(16, 7, 16, 9);
     panelLayout->setSpacing(4);
     auto* timeline = new QHBoxLayout();
     timeline->setObjectName(QStringLiteral("ffplayTimelineRow"));
-    timeline->setSpacing(12);
+    timeline->setSpacing(8);
     timeLabel_ = new QLabel(QStringLiteral("0:00"), panel);
     timeLabel_->setObjectName(QStringLiteral("ffplayTimeLabel"));
     durationLabel_ = new QLabel(QStringLiteral("0:00"), panel);
     durationLabel_->setObjectName(QStringLiteral("ffplayDurationLabel"));
     for (auto* label : {timeLabel_, durationLabel_}) {
         label->setStyleSheet(QStringLiteral("color:#eeeeee;font-size:12px;"));
-        label->setMinimumWidth(34);
+        label->setMinimumWidth(30);
     }
     seekSlider_ = new MaiVideoSeekSlider(panel);
     seekSlider_->setObjectName(QStringLiteral("ffplaySeekSlider"));
     seekSlider_->setRange(0, 1000);
     seekSlider_->setMinimumWidth(80);
     seekSlider_->setStyleSheet(QStringLiteral(
-        "QSlider::groove:horizontal {height:4px;background:#4b4b4b;border-radius:2px;}"
+        "QSlider::groove:horizontal {height:2px;background:#4b4b4b;border-radius:1px;}"
         "QSlider::sub-page:horizontal {background:#f4f4f4;border-radius:2px;}"
-        "QSlider::handle:horizontal {width:10px;margin:-3px 0;background:white;border:0;border-radius:5px;}"));
+        "QSlider::handle:horizontal {width:8px;margin:-3px 0;background:transparent;border:0;border-radius:4px;}"
+        "QSlider::handle:horizontal:hover,QSlider::handle:horizontal:pressed {background:white;}"));
     timeline->addWidget(timeLabel_);
     timeline->addWidget(seekSlider_, 1);
     timeline->addWidget(durationLabel_);
     panelLayout->addLayout(timeline);
     auto* row = new QHBoxLayout();
     row->setObjectName(QStringLiteral("ffplayButtonRow"));
-    row->setSpacing(10);
-    previousButton_ = button(panel, "ffplayPreviousItemButton", "previous", QStringLiteral("上一段视频"));
+    row->setSpacing(14);
     pauseButton_ = button(panel, "ffplayPauseButton", "pause", QStringLiteral("暂停视频"));
     nextButton_ = button(panel, "ffplayNextItemButton", "next", QStringLiteral("下一段视频"));
-    pauseButton_->setFixedSize(32, 32);
-    row->addWidget(previousButton_);
+    pauseButton_->setFixedSize(36, 36);
+    // 上一段留在更多菜单及原快捷键中，底栏与参考一致保留播放/下一段一组。
     row->addWidget(pauseButton_);
     row->addWidget(nextButton_);
-    previousButton_->hide();
     nextButton_->hide();
     row->addStretch(1);
-    speedSelector_ = new QComboBox(panel);
+    speedSelector_ = new MaiVideoSpeedSelector(panel);
     speedSelector_->setObjectName(QStringLiteral("ffplaySpeedSelector"));
     speedSelector_->setToolTip(QStringLiteral("播放倍速"));
     speedSelector_->setAccessibleName(QStringLiteral("播放倍速"));
     for (double rate : {0.25, 0.5, 1.0, 1.5, 2.0}) speedSelector_->addItem(QStringLiteral("%1×").arg(rate), rate);
     speedSelector_->setCurrentIndex(2);
-    speedSelector_->setFixedSize(56, 32);
+    speedSelector_->setFixedSize(44, 36);
     speedSelector_->setStyleSheet(QStringLiteral(
         "QComboBox {color:#f4f4f4;background:transparent;border:0;border-radius:5px;padding:4px 8px;font-size:13px;}"
         "QComboBox:hover {background:#2b2b2b;} QComboBox::drop-down {border:0;width:0;}"
@@ -385,9 +405,9 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     row->addWidget(speedSelector_);
     volumeButton_ = new QToolButton(panel);
     volumeButton_->setObjectName(QStringLiteral("ffplayVolumeButton"));
-    volumeButton_->setFixedSize(34, 34);
+    volumeButton_->setFixedSize(36, 36);
     volumeButton_->setStyleSheet(flatButton);
-    volumeButton_->setIconSize(QSize(21, 21));
+    volumeButton_->setIconSize(QSize(24, 24));
     volumeButton_->setPopupMode(QToolButton::InstantPopup);
     auto* volumeMenu = new QMenu(volumeButton_);
     volumeMenu->setObjectName(QStringLiteral("ffplayVolumeMenu"));
@@ -432,6 +452,21 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
             errorLabel_->hide();
         MaiFfplayPlaybackStatus status{};
         if (!maiFfplayGetPlaybackStatus(&status) || status.duration_us <= 0) return;
+        if (pauseAfterFirstFrame_) {
+            // Graphics 的成功回执来自本次启动（startPlayback 会清零计数）。
+            // 让 FFplay 先建立真实视频时钟，旧表面像素不算首帧就绪证据。
+            if (status.paused) {
+                pauseAfterFirstFrame_ = false;
+                firstFramePauseQueued_ = false;
+            } else if (!firstFramePauseQueued_ && sPresentedFrames.load() > 0 && !status.seeking &&
+                       maiFfplaySendCommand("pause") == 1) {
+                // 入队后仍保持暂停意图，直到核心回执；不能把未消费命令当作已生效。
+                firstFramePauseQueued_ = true;
+            }
+            playing_ = false;
+        } else if (!status.seeking) {
+            playing_ = status.paused == 0;
+        }
         // 松手后 seek 仍可能在等待云盘读取/解码，旧时钟不能拉回用户选中的滑块。
         const auto position =
             std::clamp(status.seeking ? status.seek_target_us : status.position_us, int64_t{0}, status.duration_us);
@@ -452,7 +487,6 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
         timeLabel_->setText(clockText(position));
         durationLabel_->setText(clockText(status.duration_us));
         timeLabel_->setToolTip(clockText(position) + QStringLiteral(" / ") + clockText(status.duration_us));
-        if (!status.seeking) playing_ = status.paused == 0;
         if (controlsSeeking_ != (status.seeking != 0)) {
             controlsSeeking_ = status.seeking != 0;
             revealControls();
@@ -472,7 +506,6 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
         if (index >= 0) setSpeed(speedSelector_->itemData(index).toDouble());
     });
 
-    connect(previousButton_, &QPushButton::clicked, this, [this] { navigateVideo(-1); });
     connect(nextButton_, &QPushButton::clicked, this, [this] { navigateVideo(1); });
     connect(fullscreen, &QPushButton::clicked, this, &MaiFfplayVideoDialog::toggleFullscreen);
     connect(volumeSlider_, &QSlider::valueChanged, this, [this](int value) {
@@ -501,13 +534,15 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     controlsHideTimer_->setInterval(2500);
     connect(controlsHideTimer_, &QTimer::timeout, this, [this, panel] {
         if (!isFullScreen() || !playing_) return;
-        if (seekSlider_->isSliderDown() || controlsSeeking_ || panel->underMouse() ||
+        if (seekSlider_->isSliderDown() || controlsSeeking_ || panel->underMouse() || titleBar_->underMouse() ||
             QApplication::activePopupWidget() || errorLabel_->isVisible() || sPresentedFrames.load() == 0) {
             controlsHideTimer_->start();
             return;
         }
         panel->hide();
+        controlsVisible_ = false;
         overlay_->hide();
+        titleBar_->hide();
         setCursor(Qt::BlankCursor);
         surface_->setCursor(Qt::BlankCursor);
     });
@@ -517,6 +552,24 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
         child->setMouseTracking(true);
         child->installEventFilter(this);
     }
+    connect(qApp, &QGuiApplication::focusWindowChanged, this, [this] {
+        QTimer::singleShot(0, this, [this] {
+            // Mac Tool 面板可在同一 App 内浮在其它窗口上方；只跟随本播放器窗口组。
+            // 临时无 focus 的全屏切换不改变状态，避免原生状态变更过程中的一帧显隐。
+            QWidget* active = QApplication::activeWindow();
+            if (!active) return;
+            bool owned = false;
+            for (QObject* item = active; item; item = item->parent())
+                if (item == this) { owned = true; break; }
+            const bool wasOwned = hudOwnerActive_;
+            hudOwnerActive_ = owned;
+            if (owned && !wasOwned) revealControls();
+            else if (!owned) {
+                titleBar_->hide();
+                overlay_->hide();
+            }
+        });
+    });
     updateControlLayout();
     updatePlayButton();
     syncAudioControls();
@@ -527,9 +580,7 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& displayName, std::shar
     : MaiFfplayVideoDialog(displayName, parent, 0) {
     cloudSource_ = std::move(source);
     setWindowTitle(QFileInfo(displayName).fileName());
-    for (const char* name : {"videoForwardButton", "videoShareButton", "videoSaveButton", "videoMoreButton"}) {
-        if (auto* button = findChild<QWidget*>(QString::fromLatin1(name))) button->hide();
-    }
+    if (auto* more = findChild<QWidget*>(QStringLiteral("videoMoreButton"))) more->hide();
     updateControlLayout();
 }
 
@@ -537,22 +588,34 @@ void MaiFfplayVideoDialog::updateControlLayout() {
     if (!overlay_ || !titleBar_ || !surface_) return;
     const int titleHeight = isFullScreen() ? 0 : 46;
     const int controlsHeight = 84;
-    titleBar_->setVisible(!isFullScreen());
-    titleBar_->setGeometry(0, 0, width(), titleHeight);
+    // 全屏上下栏同时覆盖在视频上，显隐不改变视频几何；窗口态保留各自的固定区域。
+    const bool shown = isVisible() && !isMinimized() && hudOwnerActive_ && (!isFullScreen() || controlsVisible_);
+    const QPoint origin = mapToGlobal(QPoint());
+    titleBar_->setGeometry(QRect(origin, QSize(width(), 46)));
+    titleBar_->setStyleSheet(isFullScreen()
+        ? QStringLiteral("QWidget#ffplayTitleBar {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                         "stop:0 rgba(0,0,0,210),stop:1 rgba(0,0,0,15));}")
+        : QStringLiteral("QWidget#ffplayTitleBar {background:#101010;}"));
     // 控件隐藏不参与几何计算，全屏视频不会跟着控制栏出现/收起而跳动。
     surface_->setGeometry(0, titleHeight, width(),
                           std::max(1, height() - titleHeight - (isFullScreen() ? 0 : controlsHeight)));
-    overlay_->setGeometry(0, height() - controlsHeight, width(), controlsHeight);
-    // 构造阶段尚未最终设置窗口 flags，提前 raise 原生子窗会迫使顶层 HWND 过早创建。
-    if (isVisible()) {
-        overlay_->raise();
-        titleBar_->raise();
-    }
+    overlay_->setGeometry(QRect(origin + QPoint(0, height() - controlsHeight), QSize(width(), controlsHeight)));
+    overlay_->setStyleSheet(isFullScreen()
+        ? QStringLiteral("QWidget#ffplayOverlay {background:transparent;}")
+        : QStringLiteral("QWidget#ffplayOverlay {background:#000000;}"));
+    if (auto* panel = findChild<QWidget*>(QStringLiteral("ffplayControlPanel")))
+        panel->setStyleSheet(isFullScreen()
+            ? QStringLiteral("QWidget#ffplayControlPanel {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                             "stop:0 rgba(0,0,0,0),stop:1 rgba(0,0,0,190));}")
+            : QStringLiteral("QWidget#ffplayControlPanel {background:#000000;}"));
+    titleBar_->setVisible(shown);
+    overlay_->setVisible(shown);
+    // 原生 owner 关系保证 HUD 位于播放器之上；不反复 raise，否则会把 Popup 压回 owner 后面。
     errorLabel_->setGeometry(40, titleHeight + std::max(0, (surface_->height() - 64) / 2), std::max(1, width() - 80),
                              64);
     if (errorLabel_->isVisible()) errorLabel_->raise();
-    for (const char* name : {"videoForwardButton", "videoShareButton", "videoSaveButton", "videoMoreButton"})
-        if (auto* value = findChild<QWidget*>(QString::fromLatin1(name))) value->setVisible(!cloudSource_);
+    if (auto* more = findChild<QWidget*>(QStringLiteral("videoMoreButton"))) more->setVisible(!cloudSource_);
+    if (auto* divider = findChild<QWidget*>(QStringLiteral("ffplayTitleDivider"))) divider->setVisible(!cloudSource_);
     updateWindowChrome();
 }
 
@@ -620,16 +683,20 @@ void MaiFfplayVideoDialog::updatePlayButton() {
     }
     pauseButton_->setText({});
     pauseButton_->setIcon(videoControlIcon(playing_ ? "pause" : "play"));
-    pauseButton_->setIconSize(QSize(20, 20));
+    pauseButton_->setIconSize(QSize(24, 24));
     pauseButton_->setToolTip(playing_ ? QStringLiteral("暂停视频") : QStringLiteral("播放视频"));
     pauseButton_->setAccessibleName(pauseButton_->toolTip());
 }
 
 void MaiFfplayVideoDialog::revealControls() {
+    controlsVisible_ = true;
+    const bool shown = isVisible() && !isMinimized() && hudOwnerActive_;
+    if (titleBar_) {
+        titleBar_->setVisible(shown);
+    }
     if (auto* panel = findChild<QWidget*>(QStringLiteral("ffplayControlPanel"))) panel->show();
     if (overlay_) {
-        overlay_->show();
-        overlay_->raise();
+        overlay_->setVisible(shown);
     }
     unsetCursor();
     if (surface_) surface_->unsetCursor();
@@ -666,7 +733,10 @@ void MaiFfplayVideoDialog::forwardVideo() {
         return;
     }
     if (forwardAction_) {
-        forwardAction_(path_);
+        // 接收方选择器可运行嵌套事件循环，先持有调用数据，避免 owner 被关闭后悬空。
+        const auto action = forwardAction_;
+        const QString path = path_;
+        action(path);
         return;
     }
     auto* media = new QMimeData();
@@ -680,11 +750,22 @@ void MaiFfplayVideoDialog::saveCopy() {
         QMessageBox::information(this, QStringLiteral("云盘视频"), QStringLiteral("请使用云盘列表的视频下载按钮。"));
         return;
     }
-    const QString target = QFileDialog::getSaveFileName(this, QStringLiteral("保存视频"), QFileInfo(path_).fileName(),
-                                                        QStringLiteral("视频文件 (*.mp4 *.mov *.m4v);;所有文件 (*)"));
+    const QPointer<MaiFfplayVideoDialog> alive(this);
+    const QString sourcePath = path_;
+    QPointer<QFileDialog> picker = new QFileDialog(this, QStringLiteral("保存视频"), QString(),
+        QStringLiteral("视频文件 (*.mp4 *.mov *.m4v);;所有文件 (*)"));
+    picker->setAcceptMode(QFileDialog::AcceptSave);
+    picker->setFileMode(QFileDialog::AnyFile);
+    picker->selectFile(QFileInfo(sourcePath).fileName());
+    const int result = picker->exec();
+    if (!picker) return;
+    const QString target = result == QDialog::Accepted ? picker->selectedFiles().value(0) : QString();
+    picker->deleteLater();
+    // 账号守卫可能在选择器内关闭播放器；取消后不继续访问成员或写入文件。
+    if (!alive || !alive->isVisible()) return;
     if (target.isEmpty()) return;
-    if (QFileInfo(target).absoluteFilePath() == QFileInfo(path_).absoluteFilePath()) return;
-    QFile source(path_);
+    if (QFileInfo(target).absoluteFilePath() == QFileInfo(sourcePath).absoluteFilePath()) return;
+    QFile source(sourcePath);
     QSaveFile output(target);
     if (!source.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly)) {
         QMessageBox::warning(this, QStringLiteral("保存失败"), QStringLiteral("无法读取或写入视频文件。"));
@@ -804,8 +885,9 @@ void MaiFfplayVideoDialog::setFullscreen(void* userData, int enabled) {
 }
 
 void MaiFfplayVideoDialog::showWindow(void* userData) {
-    auto* dialog = static_cast<MaiFfplayVideoDialog*>(userData);
-    QMetaObject::invokeMethod(dialog, [dialog] { dialog->raise(); }, Qt::QueuedConnection);
+    // 宿主在 showEvent 中创建播放会话；解码线程的 SDL_ShowWindow 不能重新排列
+    // owner/HUD/Popup 的 Z 序，也不能把用户切走的播放器抢回其它窗口上方。
+    Q_UNUSED(userData);
 }
 
 // 作用：验证文件并启动 FFplay，同时同步播放控件状态。
@@ -858,7 +940,6 @@ bool MaiFfplayVideoDialog::startPlayback() {
         if (sPresenterUsers == 0) maiGraphicsPresenterStop();
         return false;
     }
-    if (overlay_) overlay_->raise();
     host_.user_data = this;
     host_.graphics_view_id = viewId_;
     host_.present_video = presentVideo;
@@ -943,6 +1024,8 @@ bool MaiFfplayVideoDialog::startPlayback() {
 
 void MaiFfplayVideoDialog::stopPlayback(bool cancelCloudSource) {
     stopRequested_ = true;
+    pauseAfterFirstFrame_ = false;
+    firstFramePauseQueued_ = false;
     if (!started_) return;
     syncAudioControls();
     MaiFfplayAudioStatus finalAudio{sizeof(MaiFfplayAudioStatus), 100, 0};
@@ -985,6 +1068,14 @@ void MaiFfplayVideoDialog::stopPlayback(bool cancelCloudSource) {
 }
 
 bool MaiFfplayVideoDialog::sendCommand(const QString& command) {
+    // 暂停意图等待首帧期间，播放按钮的再次点击意味着恢复播放；
+    // 核心此时已在准备首帧，取消待办即可，不能再切换成暂停。
+    if (command == QStringLiteral("pause") && pauseAfterFirstFrame_ && !firstFramePauseQueued_) {
+        pauseAfterFirstFrame_ = false;
+        playing_ = true;
+        updatePlayButton();
+        return true;
+    }
     // 窗口状态由 Qt 维护；GUI 与工具不能分别切换两个不同的全屏布尔值。
     if (command == QStringLiteral("fullscreen")) {
         if (!started_) return false;
@@ -994,6 +1085,9 @@ bool MaiFfplayVideoDialog::sendCommand(const QString& command) {
     const QByteArray utf8 = command.toUtf8();
     const bool accepted = maiFfplaySendCommand(utf8.constData()) == 1;
     if (accepted && command == QStringLiteral("pause")) {
+        // 若恢复暂停的命令已经入队，再次点击需追加同一 FIFO 中的抵消切换。
+        pauseAfterFirstFrame_ = false;
+        firstFramePauseQueued_ = false;
         playing_ = !playing_;
         updatePlayButton();
     }
@@ -1035,7 +1129,8 @@ bool MaiFfplayVideoDialog::setSpeed(double speed) {
         status.position_us = startPositionUs_;
     }
     const bool wasPlaying = playing_;
-    const int64_t sourcePositionUs = std::max<int64_t>(0, status.position_us);
+    const int64_t sourcePositionUs = std::max<int64_t>(0, status.seeking ? status.seek_target_us :
+        (pauseAfterFirstFrame_ && sPresentedFrames.load() == 0 ? startPositionUs_ : status.position_us));
     stopPlayback();
     playbackSpeed_ = speed;
     startPositionUs_ = sourcePositionUs;
@@ -1050,10 +1145,11 @@ bool MaiFfplayVideoDialog::setSpeed(double speed) {
             }
         }
     }
-    if (!wasPlaying)
-        QTimer::singleShot(150, this, [this] {
-            if (started_ && playing_) sendCommand(QStringLiteral("pause"));
-        });
+    if (!wasPlaying) {
+        pauseAfterFirstFrame_ = true;
+        playing_ = false;
+        updatePlayButton();
+    }
     return true;
 }
 
@@ -1074,9 +1170,9 @@ void MaiFfplayVideoDialog::setPlaylist(const QStringList& paths) {
     if (!playlist_.contains(path_)) playlist_.prepend(path_);
     playlistIndex_ = playlist_.indexOf(path_);
     const bool hasAdjacent = playlist_.size() > 1;
-    if (previousButton_) previousButton_->setVisible(hasAdjacent);
+    if (previousItemAction_) previousItemAction_->setVisible(hasAdjacent && playlistIndex_ > 0);
     if (nextButton_) nextButton_->setVisible(hasAdjacent);
-    if (previousButton_) previousButton_->setEnabled(playlistIndex_ > 0);
+    if (previousItemAction_) previousItemAction_->setEnabled(playlistIndex_ > 0);
     if (nextButton_) nextButton_->setEnabled(playlistIndex_ + 1 < playlist_.size());
 }
 
@@ -1108,7 +1204,8 @@ bool MaiFfplayVideoDialog::navigateVideo(int direction) {
         errorLabel_->show();
         return false;
     }
-    if (previousButton_) previousButton_->setEnabled(playlistIndex_ > 0);
+    if (previousItemAction_) previousItemAction_->setEnabled(playlistIndex_ > 0);
+    if (previousItemAction_) previousItemAction_->setVisible(playlistIndex_ > 0);
     if (nextButton_) nextButton_->setEnabled(playlistIndex_ + 1 < playlist_.size());
     return true;
 }
@@ -1140,6 +1237,19 @@ void MaiFfplayVideoDialog::resizeEvent(QResizeEvent* event) {
     maiGraphicsPresenterResize(viewId_, std::max(surface_->width(), 1), std::max(surface_->height(), 1));
 }
 
+void MaiFfplayVideoDialog::moveEvent(QMoveEvent* event) {
+    QDialog::moveEvent(event);
+    updateControlLayout();
+}
+
+void MaiFfplayVideoDialog::hideEvent(QHideEvent* event) {
+    // owner 的最小化、切换全屏和关闭都不能留下独立浮层；对象继续保留供恢复时复用。
+    if (controlsHideTimer_) controlsHideTimer_->stop();
+    if (titleBar_) titleBar_->hide();
+    if (overlay_) overlay_->hide();
+    QDialog::hideEvent(event);
+}
+
 bool MaiFfplayVideoDialog::handleFrameMouse(QObject* watched, QEvent* event) {
     const auto type = event->type();
     if (type != QEvent::MouseButtonPress && type != QEvent::MouseMove && type != QEvent::MouseButtonRelease &&
@@ -1149,7 +1259,8 @@ bool MaiFfplayVideoDialog::handleFrameMouse(QObject* watched, QEvent* event) {
     const QPoint local = mapFromGlobal(mouse->globalPos());
     const bool titleHit = watched == titleBar_ || watched == titleLabel_;
     if (type == QEvent::MouseButtonDblClick && titleHit && mouse->button() == Qt::LeftButton) {
-        isMaximized() ? showNormal() : showMaximized();
+        if (isFullScreen()) applyFullscreen(false);
+        else isMaximized() ? showNormal() : showMaximized();
         return true;
     }
     Qt::Edges edges;
@@ -1160,7 +1271,7 @@ bool MaiFfplayVideoDialog::handleFrameMouse(QObject* watched, QEvent* event) {
         if (local.y() >= height() - 6) edges |= Qt::BottomEdge;
     }
     if (type == QEvent::MouseButtonPress && mouse->button() == Qt::LeftButton && (edges || titleHit)) {
-        if (titleHit && isMaximized()) {
+        if (titleHit && isMaximized() && !isFullScreen()) {
             const double fraction = local.x() / double(std::max(1, width()));
             showNormal();
             move(mouse->globalPos() - QPoint(int(width() * fraction), 20));

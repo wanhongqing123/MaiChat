@@ -497,7 +497,6 @@ private:
     QString messageSearchHighlightedId_;
     bool renderedEmptyView_ = false;
     QPushButton* addContactButton_ = nullptr;
-    QPushButton* friendRequestsButton_ = nullptr;
     QPushButton* sendButton_ = nullptr;
     QPushButton* aiReplyButton_ = nullptr;
     QLabel* aiReplyHint_ = nullptr;

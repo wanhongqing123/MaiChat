@@ -2508,15 +2508,14 @@ void MainWindow::buildUi() {
   addContactButton_->setIcon(
       makeLineIcon(LineIconKind::Add, QColor(QStringLiteral("#4c5866"))));
   addContactButton_->setIconSize(QSize(kNavIconPixels, kNavIconPixels));
-  addContactButton_->setToolTip(QStringLiteral("添加联系人"));
+  addContactButton_->setToolTip(QStringLiteral("添加"));
+  addContactButton_->setAccessibleName(QStringLiteral("添加会话或好友"));
+  addContactButton_->setAccessibleDescription(
+      QStringLiteral("发起群聊、添加朋友或处理好友申请"));
   addContactButton_->setCursor(Qt::PointingHandCursor);
-  friendRequestsButton_ = new QPushButton(QStringLiteral("好友申请"), conversationPane);
-  friendRequestsButton_->setObjectName(QStringLiteral("friendRequestsButton"));
-  friendRequestsButton_->setToolTip(QStringLiteral("查看好友申请"));
-  friendRequestsButton_->setCursor(Qt::PointingHandCursor);
+  // 消息顶栏只保留一个加号，好友申请在同一菜单中处理，避免重复占用标题空间。
   conversationHeader->addWidget(conversationTitle);
   conversationHeader->addStretch(1);
-  conversationHeader->addWidget(friendRequestsButton_, 0);
   conversationHeader->addWidget(addContactButton_, 0);
 
   conversationList_ = new QListWidget(conversationPane);
@@ -3374,19 +3373,6 @@ void MainWindow::applyStyle() {
             background: transparent;
             border: 0;
         }
-        #addConversationButton {
-            min-width: 30px;
-            max-width: 30px;
-            min-height: 30px;
-            border: 1px solid #dbe4ef;
-            border-radius: 8px;
-            background: #ffffff;
-            padding: 0;
-        }
-        #addConversationButton:hover {
-            border-color: #8ed0ff;
-            background: #f2f9ff;
-        }
         #globalSearchBox, #contactsSearchBox {
             min-height: 34px;
             border: 1px solid #dbe6f3;
@@ -3455,16 +3441,6 @@ void MainWindow::applyStyle() {
             font-size: 17px;
             font-weight: 600;
         }
-        #friendRequestsButton {
-            min-height: 30px;
-            border: 1px solid #d8e5f1;
-            border-radius: 8px;
-            background: #ffffff;
-            color: #45627f;
-            font-size: 12px;
-            padding: 0 10px;
-        }
-        #friendRequestsButton:hover { background: #e9f2fb; }
         #pageTitle {
             color: #101828;
             font-size: 16px;
@@ -3485,12 +3461,15 @@ void MainWindow::applyStyle() {
             min-height: 34px;
             max-height: 34px;
             border: 0;
-            border-radius: 17px;
+            border-radius: 8px;
             background: transparent;
+            padding: 0;
         }
         QPushButton[chatHeaderIcon="true"]:hover, #addConversationButton:hover {
             background: #e9eef5;
         }
+        #addConversationButton:pressed { background: #dfe7f0; }
+        #addConversationButton:focus { border: 1px solid #b9cde1; }
         #conversationList {
             background: transparent;
             outline: 0;
@@ -3808,17 +3787,37 @@ void MainWindow::bindSignals() {
   });
   connect(addContactButton_, &QPushButton::clicked, this, [this] {
     auto *menu = new QMenu(addContactButton_);
-    QAction* create = menu->addAction(QStringLiteral("发起群聊"));
-    QAction* addFriend = menu->addAction(QStringLiteral("添加朋友"));
+    menu->setObjectName(QStringLiteral("conversationAddMenu"));
+    menu->setAccessibleName(QStringLiteral("添加会话或好友"));
+    applyMessageContextMenuStyle(*menu);
+    menu->setMinimumWidth(UiZoom::s(192));
+    QAction* create = menu->addAction(
+        makeLineIcon(LineIconKind::Contacts, kMenuIconColor), QStringLiteral("发起群聊"));
+    create->setObjectName(QStringLiteral("createGroupAction"));
+    QAction* addFriend = menu->addAction(
+        makeLineIcon(LineIconKind::Add, kMenuIconColor), QStringLiteral("添加朋友"));
+    addFriend->setObjectName(QStringLiteral("addFriendAction"));
+    menu->addSeparator();
+    QAction* requests = menu->addAction(
+        makeLineIcon(LineIconKind::Messages, kMenuIconColor), QStringLiteral("好友申请"));
+    requests->setObjectName(QStringLiteral("friendRequestsAction"));
     connect(create, &QAction::triggered, this, [this] { openCreateGroupDialog(); });
     connect(addFriend, &QAction::triggered, this, [this] { openAddContactDialog(); });
+    connect(requests, &QAction::triggered, this, [this] { openFriendRequestsDialog(); });
+    // 使用与消息右键菜单一致的圆角卡片。先定稿菜单尺寸，再把右边缘对齐加号；
+    // QMenu::popup 继续处理屏幕边缘避让，Esc 收起后回到加号而不改变当前会话。
+    connect(menu, &QMenu::aboutToHide, addContactButton_, [this] {
+      addContactButton_->setDown(false);
+      addContactButton_->setFocus(Qt::PopupFocusReason);
+    });
     connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
+    menu->ensurePolished();
+    const int menuWidth = menu->sizeHint().expandedTo(menu->minimumSize()).width();
+    addContactButton_->setDown(true);
     menu->popup(addContactButton_->mapToGlobal(
-        QPoint(addContactButton_->width() - menu->sizeHint().width(),
-               addContactButton_->height())));
+        QPoint(addContactButton_->width() - menuWidth,
+               addContactButton_->height() + UiZoom::s(6))));
   });
-  connect(friendRequestsButton_, &QPushButton::clicked, this,
-          [this] { openFriendRequestsDialog(); });
   connect(groupLoadEarlierButton_, &QPushButton::clicked, this, [this] {
     if (!activeGroupId_.isEmpty()) app_.loadEarlierGroupMessages(activeGroupId_);
   });
@@ -6320,6 +6319,7 @@ void MainWindow::openAddContactDialog() {
 
 void MainWindow::openFriendRequestsDialog() {
   auto* dialog = new QDialog(this);
+  dialog->setObjectName(QStringLiteral("friendRequestsDialog"));
   dialog->setAttribute(Qt::WA_DeleteOnClose);
   dialog->setWindowTitle(QStringLiteral("好友申请"));
   dialog->resize(UiZoom::s(500), UiZoom::s(420));

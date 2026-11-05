@@ -69,6 +69,8 @@ protected:
     void showEvent(QShowEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
+    void moveEvent(QMoveEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
 
@@ -109,7 +111,7 @@ private:
     QSlider* volumeSlider_ = nullptr;
     QAction* muteAction_ = nullptr;
     QPushButton* pauseButton_ = nullptr;
-    QPushButton* previousButton_ = nullptr;
+    QAction* previousItemAction_ = nullptr;
     QPushButton* nextButton_ = nullptr;
     QComboBox* speedSelector_ = nullptr;
     QSlider* seekSlider_ = nullptr;
@@ -123,8 +125,13 @@ private:
     uint64_t viewId_ = 0;
     bool started_ = false;
     bool playing_ = true;
+    // 倍速重建后须等新会话实际呈现首帧，再恢复暂停，不能按固定延时冻结未初始化的时钟。
+    bool pauseAfterFirstFrame_ = false;
+    bool firstFramePauseQueued_ = false;
     bool controlsPlaying_ = true;
     bool controlsSeeking_ = false;
+    bool controlsVisible_ = true;
+    bool hudOwnerActive_ = true;
     bool docked_ = false;
     double playbackSpeed_ = 1.0;
     int volumePercent_ = 100;
