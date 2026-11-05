@@ -36,6 +36,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -215,8 +216,12 @@ public final class AIAssistantController {
     private File root;
     private File rvmModelFile;
     private volatile String selected = "", baseUrl = state.baseUrl, model = state.model, policy = state.policy,
-                   error = "", apiKey = "", wire = "responses";
+                   error = "";
     private volatile String reasoningEffort = "high";
+    private volatile AIAssistantModelSettings primarySettings = AIAssistantModelSettings.defaults();
+    private volatile boolean changingModelSource, modelConfigurationAvailable;
+    private final AtomicBoolean modelSettingsChange = new AtomicBoolean(true);
+    private JSONObject committedModelConfiguration;
     private volatile String deepseekApiKey = "";
     private volatile String glmApiKey = "";
     private volatile String arkApiKey = "";
@@ -562,6 +567,7 @@ public final class AIAssistantController {
     // 作用：初始化控制器依赖、回调和原生 Agent 会话。
     private void initialize() {
         try {
+            requireModelOwner();
             System.loadLibrary("maichat_agent");
             handle = nativeCreate();
             if (!nativeSetHostToolHandler(handle, this))
@@ -570,6 +576,7 @@ public final class AIAssistantController {
                 : new File(context.getNoBackupFilesDir(), "AIAssistantTest-" + UUID.randomUUID());
             if (!root.mkdirs() && !root.isDirectory())
                 throw new IllegalStateException("无法创建 AI 工作区");
+            requireModelOwner();
             try {
                 rvmModelFile = prepareBundledModel("rvm_mobilenetv3_fp32.onnx",
                     "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828");
@@ -577,41 +584,34 @@ public final class AIAssistantController {
             catch (Exception failure) { Log.w("MaiChatAgent", "Agent model staging failed", failure); }
             try { preparePortraitModels(); }
             catch (Exception failure) { Log.w("MaiChatAgent", "Portrait models are unavailable"); }
-            // 本地仅读取非敏感设置；模型凭据和 Workspace ID 由当前账号领取。
+            exportSystemCertificates();
+            modelConfigurationAvailable = true;
+            // Restore the source before resolving credentials. A persisted local model must not
+            // become the default cloud model, or require a cloud key merely to reopen the app.
             File settings = new File(root, "settings.json");
             if (settings.isFile()) {
                 JSONObject saved =
                     new JSONObject(new String(Files.readAllBytes(settings.toPath()), StandardCharsets.UTF_8));
-                baseUrl = saved.optString("baseUrl", baseUrl);
-                model = saved.optString("model", model);
-                reasoningEffort = normalizeReasoningEffort(
-                    saved.optString("reasoningEffort", reasoningEffort));
-                policy = saved.optString("policy", policy);
+                primarySettings = AIAssistantModelSettings.fromJson(saved);
             }
-            // Existing conversations continue to load, but new turns use the current main model.
-            if (testEndpoint == null) model = DEFAULT_MODEL;
-            else model = supportedModelOrDefault(model);
-            wire = "responses";
-            if (model.equals("deepseek-flash")) baseUrl = DEEPSEEK_URL;
-            else baseUrl = GLM_RESPONSES_URL;
-            if (testEndpoint == null) {
+            bindPrimarySettings(primarySettings, null);
+            changingModelSource = primarySettings.isLocal();
+            publishState();
+            File localFile = resolvePrimaryModel(primarySettings);
+            if (!primarySettings.isLocal() && testEndpoint == null) {
                 try {
                     refreshAccountModelKeys();
                 } catch (Exception failure) {
                     Log.w("MaiChatAgent", "Account model keys are unavailable");
                 }
             }
-            refreshSeedanceCredential(true);
-            refreshBailianCredential(true);
-            apiKey = model.equals("deepseek-flash") ? deepseekApiKey : glmApiKey;
-            if (testEndpoint != null) {
-                baseUrl = testEndpoint;
-                model = "test-model";
-                wire = "chat_completions";
-                apiKey = "test-key";
-            }
-            exportSystemCertificates();
-            configure(baseUrl, model, policy, apiKey, wire);
+            requireModelOwner();
+            JSONObject configuration = primaryModelConfiguration(primarySettings, localFile,
+                primarySettings.isLocal() ? "" : cloudKey(primarySettings));
+            invokeNativeAgent(configuration);
+            requireModelOwner();
+            committedModelConfiguration = configuration;
+            bindPrimarySettings(primarySettings, configuration);
             ready = true;
             refresh(true);
             JSONArray sessions = data.optJSONArray("sessions");
@@ -619,9 +619,16 @@ public final class AIAssistantController {
                 selected = sessions.getJSONObject(0).getString("id");
                 refresh(true);
             }
+            // These are existing media-tool credentials, independent of the primary model.
+            // Local model selection and configuration themselves never fetch model API keys.
+            refreshSeedanceCredential(true);
+            refreshBailianCredential(true);
         } catch (Throwable failure) {
             error = safeMessage(failure);
-            publishState();
+        } finally {
+            changingModelSource = false;
+            modelSettingsChange.set(false);
+            if (!closed) publishState();
         }
     }
     static String supportedModelOrDefault(String selected) {
@@ -672,20 +679,20 @@ public final class AIAssistantController {
     private JSONObject makeOperationRequest(String operationName) throws Exception {
         return new JSONObject().put("op", operationName).put("session", selected);
     }
-    private void configure(String url, String name, String approval, String key,
-                           String selectedWire) throws Exception {
+    private JSONObject primaryModelConfiguration(AIAssistantModelSettings settings, File localFile,
+                                                 String key) throws Exception {
+        requireModelOwner();
         File workspace = new File(root, "Workspace");
         if (!workspace.mkdirs() && !workspace.isDirectory())
             throw new IllegalStateException("无法创建工作区");
         File runtime = new File(context.getApplicationInfo().nativeLibraryDir,
             "libonnxruntime.so");
-        invokeNativeAgent(makeOperationRequest("configure")
-                .put("baseUrl", url)
-                .put("apiKey", key)
-                .put("wire", selectedWire)
-                .put("model", name)
-                .put("reasoningEffort", reasoningEffort)
-                .put("policy", approval)
+        JSONObject request = settings.configuration(localFile, key);
+        if (testEndpoint != null && !settings.isLocal()) {
+            request.put("baseUrl", testEndpoint).put("model", "test-model")
+                .put("wire", "chat_completions").put("apiKey", "test-key");
+        }
+        return request.put("op", "configure").put("session", selected)
                 .put("database", new File(root, "sessions.sqlite").getPath())
                 .put("scheduleDeviceName",
                     context.getResources().getConfiguration().smallestScreenWidthDp >= 600
@@ -694,7 +701,43 @@ public final class AIAssistantController {
                 .put("appRoot", context.getFilesDir().getParentFile().getCanonicalPath())
                 .put("rvmModelPath", rvmModelFile != null ? rvmModelFile.getPath() : "")
                 .put("ortRuntimePath", runtime.isFile() ? runtime.getPath() : "")
-                .put("caBundle", new File(root, "trusted-roots.pem").getPath()));
+                .put("caBundle", new File(root, "trusted-roots.pem").getPath());
+    }
+
+    private File resolvePrimaryModel(AIAssistantModelSettings settings) throws Exception {
+        requireModelOwner();
+        if (!settings.isLocal()) return null;
+        if (!AIAssistantModelSettings.LOCAL_MODEL_ID.equals(MaiBundledPrimaryModel.MODEL_ID))
+            throw new IOException("内置主模型身份不一致，请更新完整 App");
+        File localFile = MaiBundledPrimaryModel.resolve(context);
+        // Hashing/copying the immutable public weight can outlive a login or account deletion.
+        // It must never proceed to the old account's native handle or settings after that point.
+        requireModelOwner();
+        return localFile;
+    }
+
+    private String cloudKey(AIAssistantModelSettings settings) {
+        if (testEndpoint != null) return "test-key";
+        return settings.cloudModel.equals("deepseek-flash") ? deepseekApiKey : glmApiKey;
+    }
+
+    private void bindPrimarySettings(AIAssistantModelSettings settings, JSONObject configuration) {
+        primarySettings = settings;
+        model = configuration == null ? settings.model() : configuration.optString("model");
+        baseUrl = configuration == null ? settings.baseUrl() : configuration.optString("baseUrl");
+        policy = settings.policy;
+        reasoningEffort = settings.effort;
+    }
+
+    private boolean ownsModelConfiguration() {
+        synchronized (AIAssistantController.class) {
+            return !closed && (testEndpoint != null || (accountUserId.equals(currentAccountUserId)
+                && accountToolLoginGeneration == accountAuth.accountSessionGeneration()));
+        }
+    }
+
+    private void requireModelOwner() throws IOException {
+        if (!ownsModelConfiguration()) throw new IOException("账号已切换，未修改主模型");
     }
 
     private File prepareBundledModel(String name, String expected) throws Exception {
@@ -1815,6 +1858,15 @@ public final class AIAssistantController {
     }
     void send(String intendedSession, String text, java.util.List<ImportedFile> attachments,
               String quotedMessageId, Consumer<Boolean> completion) {
+        State visible = state;
+        boolean remoteTarget = visible.remoteSession != null
+            && intendedSession.equals(visible.remoteSession.optString("id"));
+        // Do not queue a local draft behind a configuration transaction and then silently send
+        // it through the newly selected source. Remote conversations use their owning device.
+        if (!remoteTarget && modelSettingsChange.get()) {
+            if (completion != null) main.post(() -> completion.accept(false));
+            return;
+        }
         java.util.List<ImportedFile> intendedAttachments = new java.util.ArrayList<>(attachments);
         worker.post(() -> {
             if (selectedRemote != null && intendedSession.equals(selectedRemote.optString("id"))) {
@@ -1902,6 +1954,21 @@ public final class AIAssistantController {
             }
             boolean success = false;
             try {
+                requireModelOwner();
+                boolean containsVisualInput = false;
+                for (ImportedFile file : intendedAttachments) {
+                    if (file.image || file.mimeType.startsWith("video/")) {
+                        containsVisualInput = true;
+                        break;
+                    }
+                }
+                // Reject new unsupported input before creating a session or accepting a turn.
+                // completion(false) keeps the existing composer text and attachments; older
+                // history is untouched and the core still reports its actual capability errors.
+                if (containsVisualInput && !AIAssistantMediaPolicy.supportsImages(model))
+                    throw new IOException(primarySettings.isLocal()
+                        ? "本地主模型当前仅支持文字和工具，请切换到云端模型后发送图片或视频。"
+                        : "当前主模型仅支持文字，请选择支持图片或视频的云端模型。");
                 refreshSeedanceCredential(true);
                 refreshBailianCredential(true);
                 String target = intendedSession;
@@ -2007,73 +2074,116 @@ public final class AIAssistantController {
         });
     }
     String reasoningEffort() { return reasoningEffort; }
+    boolean isLocalModel() { return primarySettings.isLocal(); }
+    boolean changingModelSource() { return changingModelSource; }
+    String primaryModelTitle() { return isLocalModel() ? "本地模型" : "云端模型"; }
+    // Configuration availability is separate from configured/ready: a failed local restore must
+    // still allow the ordinary source menu to recover by selecting a valid cloud configuration.
+    boolean modelSettingsReady() { return modelConfigurationAvailable && !closed && !modelSettingsChange.get(); }
 
-    private static String normalizeReasoningEffort(String value) {
-        return "low".equals(value) || "high".equals(value) || "max".equals(value)
-            ? value : "high";
-    }
 
     void save(String name, String approval, Consumer<Boolean> completion) {
         save(name, approval, reasoningEffort, completion);
     }
 
     void save(String name, String approval, String effort, Consumer<Boolean> completion) {
+        if (!beginModelSettingsChange(false, completion)) return;
         worker.post(() -> {
             boolean success = false;
-            String previousEffort = reasoningEffort;
             try {
-                if (!effort.equals(normalizeReasoningEffort(effort)))
-                    throw new IllegalArgumentException("思考强度只支持 low、high、max");
-                reasoningEffort = effort;
-                String selectedName = name.trim();
-                boolean localTestModel = testEndpoint != null &&
-                    selectedName.equals("test-model");
-                if (!selectedName.equals("glm-5.3") && !selectedName.equals("glm-5.3-flash") &&
-                    !selectedName.equals("deepseek-flash") && !localTestModel)
-                    throw new IllegalArgumentException("请选择受支持的主模型");
-                String effectiveUrl = localTestModel ? testEndpoint :
-                    selectedName.equals("deepseek-flash") ? DEEPSEEK_URL : GLM_RESPONSES_URL;
-                String selectedWire = localTestModel ? "chat_completions" : "responses";
-                if (testEndpoint == null && (glmApiKey.isEmpty() || deepseekApiKey.isEmpty()))
-                    refreshAccountModelKeys();
-                String key = localTestModel ? "test-key" :
-                    selectedName.equals("deepseek-flash") ? deepseekApiKey : glmApiKey;
-                if (testEndpoint == null && key.isEmpty())
-                    throw new IOException("请先登录已开通模型服务的账号");
-                configure(effectiveUrl, selectedName, approval, key, selectedWire);
-                byte[] config = new JSONObject().put("baseUrl", effectiveUrl)
-                    .put("model", selectedName).put("policy", approval)
-                    .put("reasoningEffort", effort)
-                    .put("wire", selectedWire)
-                    .toString().getBytes(StandardCharsets.UTF_8);
-                android.util.AtomicFile file =
-                    new android.util.AtomicFile(new File(root, "settings.json"));
-                FileOutputStream out = file.startWrite();
-                try {
-                    out.write(config);
-                    file.finishWrite(out);
-                } catch (Exception failure) {
-                    file.failWrite(out);
-                    reasoningEffort = previousEffort;
-                    configure(baseUrl, model, policy, apiKey, wire);
-                    throw failure;
-                }
-                baseUrl = effectiveUrl;
-                model = selectedName;
-                policy = approval;
-                apiKey = key;
-                wire = selectedWire;
-                error = "";
+                String selectedName = testEndpoint != null && "test-model".equals(name)
+                    ? primarySettings.cloudModel : name;
+                applyPrimarySettings(primarySettings.withOptions(selectedName, approval, effort));
                 success = true;
-                refresh(true);
             } catch (Exception failure) {
-                reasoningEffort = previousEffort;
-                error = safeMessage(failure);
-                publishState();
+                reportModelSettingsFailure(failure);
+            } finally {
+                finishModelSettingsChange(success, completion);
             }
-            boolean saved = success;
-            main.post(() -> completion.accept(saved));
         });
+    }
+
+    /** Ordinary source selection shares the same configure/persist transaction as option saves. */
+    void selectModelSource(boolean local, Consumer<Boolean> completion) {
+        if (primarySettings.isLocal() == local && state.ready && !modelSettingsChange.get()
+                && ownsModelConfiguration()) {
+            if (completion != null) main.post(() -> completion.accept(true));
+            return;
+        }
+        if (!beginModelSettingsChange(true, completion)) return;
+        worker.post(() -> {
+            boolean success = false;
+            publishState();
+            try {
+                applyPrimarySettings(primarySettings.selectSource(local));
+                success = true;
+            } catch (Exception failure) {
+                reportModelSettingsFailure(failure);
+            } finally {
+                finishModelSettingsChange(success, completion);
+            }
+        });
+    }
+
+    private boolean beginModelSettingsChange(boolean source, Consumer<Boolean> completion) {
+        if (!ownsModelConfiguration() || !modelConfigurationAvailable || state.remoteSession != null
+                || state.busy() || !modelSettingsChange.compareAndSet(false, true)) {
+            if (completion != null) main.post(() -> completion.accept(false));
+            return false;
+        }
+        changingModelSource = source;
+        return true;
+    }
+
+    private void applyPrimarySettings(AIAssistantModelSettings proposed) throws Exception {
+        requireModelOwner();
+        if (selectedRemote != null) throw new IOException("远程会话不能修改本机主模型");
+        File localFile = resolvePrimaryModel(proposed);
+        String key = "";
+        if (!proposed.isLocal()) {
+            if (testEndpoint == null && cloudKey(proposed).isEmpty()) refreshAccountModelKeys();
+            requireModelOwner();
+            key = cloudKey(proposed);
+            if (key.isEmpty()) throw new IOException("请先登录已开通模型服务的账号");
+        }
+        JSONObject next = primaryModelConfiguration(proposed, localFile, key);
+        JSONObject previous = committedModelConfiguration;
+        // The core's configure operation rejects any running session, then validates before
+        // replacing the Agent. Persist only after that gate; preserve the exact previous request
+        // in memory so a disk failure rolls back local paths and provider as well as policy.
+        AIAssistantModelSettingsStore.apply(new File(root, "settings.json"), proposed,
+            this::ownsModelConfiguration, () -> invokeNativeAgent(next), () -> {
+                requireModelOwner();
+                if (previous != null) invokeNativeAgent(previous);
+                else {
+                    // A failed initial restore had no valid previous core. Retire the proposed
+                    // instance instead of retaining an unpersisted source behind the old label.
+                    nativeDestroy(handle);
+                    handle = nativeCreate();
+                    if (handle == 0 || !nativeSetHostToolHandler(handle, this))
+                        throw new IOException("无法恢复未配置的 AI 核心");
+                    ready = false;
+                }
+            });
+        requireModelOwner();
+        committedModelConfiguration = next;
+        bindPrimarySettings(proposed, next);
+        ready = true;
+        error = "";
+        refresh(true);
+    }
+
+    private void reportModelSettingsFailure(Exception failure) {
+        if (failure.getSuppressed().length > 0) ready = false;
+        error = safeMessage(failure);
+    }
+
+    private void finishModelSettingsChange(boolean success, Consumer<Boolean> completion) {
+        changingModelSource = false;
+        modelSettingsChange.set(false);
+        if (!closed) publishState();
+        boolean saved = success && ownsModelConfiguration();
+        if (completion != null) main.post(() -> completion.accept(saved));
     }
     static String endpointFor(String name, String selectedWire, String url, String chatUrl) {
         if (name.equals("deepseek-flash")) return DEEPSEEK_URL;
@@ -2088,7 +2198,6 @@ public final class AIAssistantController {
         glmApiKey = keys.glm;
         deepseekApiKey = keys.deepseek;
         miniMaxApiKey = keys.minimax;
-        apiKey = model.equals("deepseek-flash") ? deepseekApiKey : glmApiKey;
     }
 
     private void refreshSeedanceCredential(boolean force) {

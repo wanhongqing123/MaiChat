@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify and package the pinned iOS local primary model; network is opt-in only."""
+"""Verify and package the pinned bundled local primary model; network is opt-in only."""
 import argparse
 import hashlib
 import json
@@ -116,12 +116,15 @@ def acquire_model(destination, source=None):
                         output.write(chunk)
             output.flush()
             os.fsync(output.fileno())
+            # Windows cannot rename/unlink this named file while its writer is open.
+            output.close()
             verify_model(temporary)
             try:
                 os.link(temporary, destination)
             except FileExistsError:
                 verify_model(destination)
         finally:
+            output.close()
             temporary.unlink(missing_ok=True)
 
 
@@ -152,11 +155,14 @@ def package_model(destination):
                     shutil.copyfileobj(input_stream, output, length=1024 * 1024)
                 output.flush()
                 os.fsync(output.fileno())
+                # Keep the same verified publication semantics on Windows build hosts.
+                output.close()
                 if digest(temporary) != source_hash:
                     raise RuntimeError(f"File changed while packaging: {name}")
                 os.chmod(temporary, 0o644)
                 os.replace(temporary, target)
             finally:
+                output.close()
                 temporary.unlink(missing_ok=True)
     # Publish and verify the replacement first. A failed copy retains the old resource.
     verify_model(destination / EXPECTED["filename"])
@@ -173,7 +179,7 @@ def main():
     acquisition.add_argument("--download", action="store_true", help="Explicitly fetch the pinned public weight")
     acquisition.add_argument("--source", type=Path, help="Stage an existing exact weight without network access")
     acquisition.add_argument("--check", action="store_true", help="Verify local files only (also the default)")
-    parser.add_argument("--bundle-directory", type=Path, help="Copy verified resources into an Xcode App bundle")
+    parser.add_argument("--bundle-directory", type=Path, help="Copy verified resources into an App bundle or asset directory")
     arguments = parser.parse_args()
     verify_metadata()
     model = RESOURCE_DIRECTORY / EXPECTED["filename"]

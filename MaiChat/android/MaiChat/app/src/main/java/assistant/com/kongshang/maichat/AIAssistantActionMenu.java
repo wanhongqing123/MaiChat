@@ -23,7 +23,9 @@ final class AIAssistantActionMenu extends LinearLayout {
     private static final int SECONDARY = Color.rgb(132, 132, 133);
     private static final int DESTRUCTIVE = Color.rgb(255, 59, 48);
     private static final int CHECK = Color.rgb(0, 122, 255);
+    private static final int MODEL_SECTION = 1, EFFORT_SECTION = 2, POLICY_SECTION = 3;
     interface Listener {
+        void selectModelSource(boolean local);
         void selectEffort(String effort);
         void selectPolicy(String policy);
         void clearConversation();
@@ -31,16 +33,19 @@ final class AIAssistantActionMenu extends LinearLayout {
 
     private final Listener listener;
     private final Runnable sizeChanged;
-    private final LinearLayout effortGroup, policyGroup;
-    private final View effortHeading, policyHeading, clear;
-    private final TextView effortValue, policyValue;
-    private final ImageView effortChevron, policyChevron;
+    private final LinearLayout modelGroup, effortGroup, policyGroup;
+    private final View modelHeading, effortHeading, policyHeading, clear;
+    private final TextView modelValue, effortValue, policyValue;
+    private final ImageView modelChevron, effortChevron, policyChevron;
+    private final List<View> modelChoices = new ArrayList<>();
+    private final List<ImageView> modelChecks = new ArrayList<>();
     private final List<View> effortChoices = new ArrayList<>(), policyChoices = new ArrayList<>();
     private final List<ImageView> effortChecks = new ArrayList<>(), policyChecks = new ArrayList<>();
     private static final String[] EFFORTS = {"low", "high", "max"};
     private static final String[] POLICIES = {"on-request", "unless-trusted", "never"};
+    private static final String[] MODEL_SOURCES = {"cloud", "llama"};
     private String effort = "high", policy = "on-request";
-    private boolean changeAllowed, clearAllowed;
+    private boolean localModel, changingModelSource, changeModelAllowed, changeAllowed, clearAllowed;
     private int expandedSection;
 
     AIAssistantActionMenu(Context context, Listener listener, Runnable sizeChanged) {
@@ -52,23 +57,33 @@ final class AIAssistantActionMenu extends LinearLayout {
         // background here would hide its frost and make expanded groups look like flat blocks.
         setContentDescription("创作中心操作菜单");
 
+        modelValue = text("", 11, SECONDARY);
+        modelChevron = icon(R.drawable.ic_ai_menu_chevron, PRIMARY);
+        modelHeading = heading("主模型", R.drawable.ic_ai_menu_cpu, modelValue, modelChevron,
+            ignored -> toggle(MODEL_SECTION));
+        addView(modelHeading, match(dp(52)));
+        modelGroup = options(new String[]{"云端模型", "本地模型"}, MODEL_SOURCES,
+            modelChoices, modelChecks, MODEL_SECTION);
+        addView(modelGroup, match(LayoutParams.WRAP_CONTENT));
+        addDivider();
+
         effortValue = text("", 11, SECONDARY);
         effortChevron = icon(R.drawable.ic_ai_menu_chevron, PRIMARY);
         effortHeading = heading("思考强度", R.drawable.ic_ai_menu_sparkles, effortValue, effortChevron,
-            ignored -> toggle(1));
+            ignored -> toggle(EFFORT_SECTION));
         addView(effortHeading, match(dp(52)));
         effortGroup = options(new String[]{"简单", "标准", "深度"}, EFFORTS,
-            effortChoices, effortChecks, true);
+            effortChoices, effortChecks, EFFORT_SECTION);
         addView(effortGroup, match(LayoutParams.WRAP_CONTENT));
         addDivider();
 
         policyValue = text("", 11, SECONDARY);
         policyChevron = icon(R.drawable.ic_ai_menu_chevron, PRIMARY);
         policyHeading = heading("操作权限", R.drawable.ic_ai_menu_shield, policyValue, policyChevron,
-            ignored -> toggle(2));
+            ignored -> toggle(POLICY_SECTION));
         addView(policyHeading, match(dp(52)));
         policyGroup = options(new String[]{"请求批准", "帮我批准", "完全访问"}, POLICIES,
-            policyChoices, policyChecks, false);
+            policyChoices, policyChecks, POLICY_SECTION);
         TextView explanation = text("完全访问免除一般操作确认；付费任务仍需批准。", 11,
             SECONDARY);
         explanation.setPadding(dp(14), 0, dp(14), dp(6));
@@ -83,16 +98,20 @@ final class AIAssistantActionMenu extends LinearLayout {
         render();
     }
 
-    void update(String effort, String policy, boolean changeAllowed, boolean clearAllowed) {
+    void update(boolean localModel, boolean changingModelSource, String effort, String policy,
+                boolean changeAllowed, boolean changeModelAllowed, boolean clearAllowed) {
+        this.localModel = localModel;
+        this.changingModelSource = changingModelSource;
         this.effort = effort;
         this.policy = policy;
         this.changeAllowed = changeAllowed;
+        this.changeModelAllowed = changeModelAllowed;
         this.clearAllowed = clearAllowed;
         render();
     }
 
     private void toggle(int section) {
-        if (!changeAllowed) return;
+        if (!(section == MODEL_SECTION ? changeModelAllowed : changeAllowed)) return;
         // Match the iOS panel's small inline expansion; keep this content and PopupWindow alive.
         if (isLaidOut()) {
             AutoTransition transition = new AutoTransition();
@@ -106,34 +125,43 @@ final class AIAssistantActionMenu extends LinearLayout {
     }
 
     private void render() {
+        // Preserve the committed source/check until the controller finishes preparing and saving.
+        modelValue.setText(changingModelSource ? "正在切换…" : localModel ? "本地模型" : "云端模型");
         effortValue.setText(effort.equals("low") ? "简单" : effort.equals("max") ? "深度" : "标准");
         policyValue.setText(policy.equals("never") ? "完全访问"
             : policy.equals("unless-trusted") ? "帮我批准" : "请求批准");
+        modelHeading.setEnabled(changeModelAllowed);
+        modelHeading.setAlpha(changeModelAllowed ? 1f : .5f);
         effortHeading.setEnabled(changeAllowed);
         policyHeading.setEnabled(changeAllowed);
         effortHeading.setAlpha(changeAllowed ? 1f : .5f);
         policyHeading.setAlpha(changeAllowed ? 1f : .5f);
-        effortChevron.setRotation(expandedSection == 1 ? 90f : 0f);
-        policyChevron.setRotation(expandedSection == 2 ? 90f : 0f);
-        effortGroup.setVisibility(expandedSection == 1 ? VISIBLE : GONE);
-        policyGroup.setVisibility(expandedSection == 2 ? VISIBLE : GONE);
-        refreshChoices(effortChoices, effortChecks, EFFORTS, effort);
-        refreshChoices(policyChoices, policyChecks, POLICIES, policy);
+        modelChevron.setRotation(expandedSection == MODEL_SECTION ? 90f : 0f);
+        effortChevron.setRotation(expandedSection == EFFORT_SECTION ? 90f : 0f);
+        policyChevron.setRotation(expandedSection == POLICY_SECTION ? 90f : 0f);
+        modelGroup.setVisibility(expandedSection == MODEL_SECTION ? VISIBLE : GONE);
+        effortGroup.setVisibility(expandedSection == EFFORT_SECTION ? VISIBLE : GONE);
+        policyGroup.setVisibility(expandedSection == POLICY_SECTION ? VISIBLE : GONE);
+        refreshChoices(modelChoices, modelChecks, MODEL_SOURCES, localModel ? "llama" : "cloud",
+            changeModelAllowed);
+        refreshChoices(effortChoices, effortChecks, EFFORTS, effort, changeAllowed);
+        refreshChoices(policyChoices, policyChecks, POLICIES, policy, changeAllowed);
         clear.setEnabled(clearAllowed);
         clear.setAlpha(clearAllowed ? 1f : .5f);
     }
 
-    private void refreshChoices(List<View> choices, List<ImageView> checks, String[] values, String selected) {
+    private void refreshChoices(List<View> choices, List<ImageView> checks, String[] values,
+                                String selected, boolean allowed) {
         for (int i = 0; i < values.length; i++) {
-            choices.get(i).setEnabled(changeAllowed);
+            choices.get(i).setEnabled(allowed);
             choices.get(i).setSelected(values[i].equals(selected));
-            choices.get(i).setAlpha(changeAllowed ? 1f : .5f);
+            choices.get(i).setAlpha(allowed ? 1f : .5f);
             checks.get(i).setVisibility(values[i].equals(selected) ? VISIBLE : INVISIBLE);
         }
     }
 
     private LinearLayout options(String[] titles, String[] values, List<View> choices,
-                                 List<ImageView> checks, boolean forEffort) {
+                                 List<ImageView> checks, int section) {
         LinearLayout group = new LinearLayout(getContext());
         group.setOrientation(VERTICAL);
         group.setPadding(0, dp(4), 0, dp(4));
@@ -153,8 +181,14 @@ final class AIAssistantActionMenu extends LinearLayout {
             ImageView check = icon(R.drawable.ic_ai_menu_check, CHECK);
             row.addView(check, new LayoutParams(dp(12), dp(12)));
             row.setOnClickListener(ignored -> {
+                if (section == MODEL_SECTION) {
+                    boolean nextLocal = value.equals("llama");
+                    if (changeModelAllowed && nextLocal != localModel)
+                        listener.selectModelSource(nextLocal);
+                    return;
+                }
                 if (!changeAllowed) return;
-                if (forEffort) {
+                if (section == EFFORT_SECTION) {
                     if (!value.equals(effort)) listener.selectEffort(value);
                 } else if (!value.equals(policy)) listener.selectPolicy(value);
             });

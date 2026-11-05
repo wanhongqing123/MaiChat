@@ -30,8 +30,8 @@ android {
         applicationId "com.kongshang.maichat"
         minSdk 26
         targetSdk 34
-        versionCode 265
-        versionName "2.2.28"
+        versionCode 266
+        versionName "2.2.29"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
@@ -77,6 +77,10 @@ android {
         unitTests.includeAndroidResources = true
     }
 
+    // GGUF is streamed into a verified private file before mmap; storing it uncompressed avoids
+    // a second decompression of a 1.4 GB entry on first use in both normal Debug and Release.
+    aaptOptions { noCompress "gguf" }
+
     packagingOptions {
         pickFirst "lib/**/libc++_shared.so"
         jniLibs {
@@ -108,7 +112,7 @@ tasks.register("stageMaiAgentGraphicsEffects", Sync) {
         include "LICENSE.txt", "NOTICE.md"
         into "MaiPdfLicenses"
     }
-    // 本地推理库静态链接进 JNI，完整许可随 APK 提供；权重由用户另行提供。
+    // 本地推理库静态链接进 JNI，完整许可随 APK 提供；固定主模型另由共用准备脚本完整校验打包。
     from(file("$projectDir/../../../../MaiAgent/third_party/llama.cpp")) {
         include "MAI_THIRD_PARTY_NOTICES.txt"
         into "MaiLlamaLicenses"
@@ -116,6 +120,32 @@ tasks.register("stageMaiAgentGraphicsEffects", Sync) {
     into graphicsEffectsOutput
 }
 android.sourceSets.main.assets.srcDir(graphicsEffectsOutput)
+
+// Android and iOS package exactly the same pinned model, manifest and upstream attribution.
+// Preparation is local-only during a build; missing or changed weights fail instead of producing
+// an APK that advertises a local model without its bytes. Download remains an explicit CLI action.
+def bundledPrimaryResources = file("$projectDir/../../../ios/MaiChat/BundledPrimaryModel")
+def bundledPrimaryScript = file("$projectDir/../../../ios/MaiChat/scripts/prepare-bundled-primary-model.py")
+def bundledPrimaryAssets = file("$buildDir/generated/bundled-primary-model-assets")
+def bundledPrimaryPython = providers.gradleProperty("maichatPythonExecutable")
+    .orElse(providers.environmentVariable("PYTHON"))
+    .orElse(System.getProperty("os.name").toLowerCase(java.util.Locale.ROOT).contains("windows")
+        ? "python" : "python3")
+tasks.register("stageMaiBundledPrimaryModel", Exec) {
+    inputs.file(bundledPrimaryScript)
+    for (def name : ["manifest.json", "SOURCE.json", "LICENSE", "UPSTREAM_MODEL_CARD.md",
+                    "Qwen_Qwen3.5-2B-Q4_K_M.gguf"]) {
+        inputs.file(new File(bundledPrimaryResources, name))
+    }
+    outputs.dir(bundledPrimaryAssets)
+    // Recheck the pinned hashes even when an incremental build would otherwise reuse output.
+    outputs.upToDateWhen { false }
+    environment "PYTHONUTF8", "1"
+    commandLine bundledPrimaryPython.get(), bundledPrimaryScript.absolutePath,
+        "--bundle-directory", new File(bundledPrimaryAssets, "MaiLocalModels/Primary").absolutePath
+}
+android.sourceSets.main.assets.srcDir(bundledPrimaryAssets)
+
 android.sourceSets.main.jniLibs.srcDir(localOrtJniLibs)
 // Each feature is a Java source root; package names stay stable across feature directories.
 android.sourceSets.main.java.setSrcDirs([
@@ -169,6 +199,7 @@ android.sourceSets.androidTest.assets.srcDir(portraitTestAssets)
 tasks.configureEach {
     if (name.startsWith("merge") && name.endsWith("Assets")) {
         dependsOn("stageMaiAgentGraphicsEffects")
+        dependsOn("stageMaiBundledPrimaryModel")
     }
     if (name.startsWith("merge") && name.endsWith("AndroidTestAssets")) {
         dependsOn("stageAttachmentTlsTestAssets")

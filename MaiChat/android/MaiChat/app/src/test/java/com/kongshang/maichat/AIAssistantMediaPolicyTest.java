@@ -25,4 +25,10 @@ public class AIAssistantMediaPolicyTest {
         assertEquals(20 * 1024 * 1024, AIAssistantMediaPolicy.maximumBytes(true));
         assertEquals(5 * 1024 * 1024, AIAssistantMediaPolicy.maximumBytes(false));
     }
+
+    @Test public void bundledPrimaryTextModelDoesNotAcceptVisualInput() {
+        assertFalse(AIAssistantMediaPolicy.supportsImages("local:builtin-qwen3.5-2b-q4_k_m"));
+        assertFalse(AIAssistantMediaPolicy.supportsImages("local:another-text-model"));
+        assertTrue(AIAssistantMediaPolicy.supportsImages("glm-5.3-flash"));
+    }
 }

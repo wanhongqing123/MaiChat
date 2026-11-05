@@ -674,6 +674,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         boolean hasDraft = !composer.getText().toString().trim().isEmpty()
             || !currentAttachments().isEmpty();
         boolean canSubmit = state != null && state.ready && !busy && !submitting
+            && (state.remoteSession != null || controller.modelSettingsReady())
             && !navigationPending && pendingMediaImports.getOrDefault(selected, 0) == 0 && hasDraft
             && !state.remoteCommandPending
             && (state.remoteSession == null || state.remoteSession.optBoolean("online"));
@@ -744,6 +745,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             controller.action("stop", value("session", selected), null);
             return;
         }
+        // Keep keyboard-submit and the ordinary API aligned while a source is being prepared.
+        // The draft remains editable; it is never queued against a source still being changed.
+        if (state.remoteSession == null && !controller.modelSettingsReady()) return;
         if (pendingMediaImports.getOrDefault(selected, 0) > 0) return;
         if (state.remoteSession == null && !state.data.optBoolean("configured")) {
             retryMainModelConnection();
@@ -752,9 +756,12 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         String source = composer.getText().toString(), origin = selected;
         List<AIAssistantController.ImportedFile> sending = new ArrayList<>(currentAttachments());
         if (source.trim().isEmpty() && sending.isEmpty()) return;
-        if (state.remoteSession == null && sending.stream().anyMatch(file -> file.image) &&
+        if (state.remoteSession == null && sending.stream().anyMatch(file ->
+                file.image || file.mimeType.startsWith("video/")) &&
             !AIAssistantMediaPolicy.supportsImages(state.model)) {
-            Toast.makeText(activity, "glm-5.3 仅支持文本，请先切换到 glm-5.3-flash。",
+            Toast.makeText(activity, controller.isLocalModel()
+                ? "本地主模型当前仅支持文字和工具，请切换到云端模型后发送图片或视频。"
+                : "当前主模型仅支持文字，请选择支持图片或视频的云端模型。",
                 Toast.LENGTH_LONG).show();
             return;
         }
@@ -2049,6 +2056,10 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             scroll.addView(panel, new ScrollView.LayoutParams(-1, -2));
         } else {
             actionMenu = new AIAssistantActionMenu(activity, new AIAssistantActionMenu.Listener() {
+                @Override public void selectModelSource(boolean local) {
+                    if (actionPopup != popup || !popup.isShowing()) return;
+                    saveActionModelSource(local);
+                }
                 @Override public void selectEffort(String effort) {
                     if (actionPopup != popup || !popup.isShowing()) return;
                     saveActionSettings(effort, state == null ? "" : state.policy);
@@ -2106,11 +2117,16 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     }
     private boolean canChangeActionSettings() {
         return ownsActionMenu() && state.ready && !state.busy() && !submitting
-            && !navigationPending && !settingsSavePending;
+            && !navigationPending && !settingsSavePending && !controller.changingModelSource();
+    }
+    private boolean canChangeActionModel() {
+        // A failed local restore must still allow an explicit return to a usable cloud source.
+        return ownsActionMenu() && controller.modelSettingsReady() && !state.busy() && !submitting
+            && !navigationPending && !settingsSavePending && !controller.changingModelSource();
     }
     private boolean canClearFromActionMenu() {
         return ownsActionMenu() && !selected.isEmpty() && !state.busy() && !submitting
-            && !navigationPending && !settingsSavePending;
+            && !navigationPending && !settingsSavePending && !controller.changingModelSource();
     }
     private void updateActionMenu() {
         if (actionMenu == null || state == null) return;
@@ -2120,7 +2136,17 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             actionEffort = controller.reasoningEffort();
             actionPolicy = state.policy;
         }
-        actionMenu.update(actionEffort, actionPolicy, canChangeActionSettings(), canClearFromActionMenu());
+        actionMenu.update(controller.isLocalModel(), controller.changingModelSource(), actionEffort,
+            actionPolicy, canChangeActionSettings(), canChangeActionModel(), canClearFromActionMenu());
+    }
+    private void saveActionModelSource(boolean local) {
+        if (!canChangeActionModel() || local == controller.isLocalModel() && state.ready) return;
+        final long ownerGeneration = actionAccountGeneration;
+        final String owner = actionOwner;
+        settingsSavePending = true;
+        updateActionMenu();
+        controller.selectModelSource(local, success -> finishActionSettingsSave(owner,
+            ownerGeneration, success));
     }
     private void saveActionSettings(String effort, String policy) {
         if (!canChangeActionSettings()) return;
@@ -2130,12 +2156,15 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         settingsSavePending = true;
         updateActionMenu();
         controller.save(state.model, policy, effort, success -> {
-            settingsSavePending = false;
-            updateActionMenu();
-            if (!success && visibleToUser && isAttachedToWindow() && owner.equals(selected)
-                    && ownerGeneration == MaiChatAuthClient.shared(activity).accountSessionGeneration())
-                Toast.makeText(activity, controller.state.error, Toast.LENGTH_LONG).show();
+            finishActionSettingsSave(owner, ownerGeneration, success);
         });
+    }
+    private void finishActionSettingsSave(String owner, long ownerGeneration, boolean success) {
+        settingsSavePending = false;
+        updateActionMenu();
+        if (!success && visibleToUser && isAttachedToWindow() && owner.equals(selected)
+                && ownerGeneration == MaiChatAuthClient.shared(activity).accountSessionGeneration())
+            Toast.makeText(activity, controller.state.error, Toast.LENGTH_LONG).show();
     }
     private void dismissActionMenu() {
         if (actionPopup != null) actionPopup.dismiss();

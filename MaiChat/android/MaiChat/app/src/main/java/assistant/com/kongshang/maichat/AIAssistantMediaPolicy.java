@@ -10,7 +10,10 @@ final class AIAssistantMediaPolicy {
     private AIAssistantMediaPolicy() { }
 
     static boolean supportsImages(String model) {
-        return model != null && !model.equalsIgnoreCase("glm-5.3");
+        // The bundled primary model has no vision projector. Reject new visual input before
+        // accepting a turn, so the ordinary API and composer retain its text and attachments.
+        return model != null && !model.equalsIgnoreCase("glm-5.3")
+            && !model.toLowerCase(java.util.Locale.ROOT).startsWith("local:");
     }
 
     static boolean isSupportedImageMime(String mimeType) {

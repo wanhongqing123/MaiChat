@@ -20,6 +20,7 @@ import org.robolectric.shadows.ShadowAlertDialog;
 @Config(sdk = 34, manifest = Config.NONE)
 public final class AIAssistantActionMenuTest {
     private final List<String> efforts = new ArrayList<>(), policies = new ArrayList<>();
+    private final List<Boolean> modelSelections = new ArrayList<>();
     private int clears;
 
     private AIAssistantActionMenu menu() {
@@ -28,13 +29,52 @@ public final class AIAssistantActionMenuTest {
         activity.setContentView(host);
         AIAssistantActionMenu menu = new AIAssistantActionMenu(activity,
             new AIAssistantActionMenu.Listener() {
+                @Override public void selectModelSource(boolean local) { modelSelections.add(local); }
                 @Override public void selectEffort(String effort) { efforts.add(effort); }
                 @Override public void selectPolicy(String policy) { policies.add(policy); }
                 @Override public void clearConversation() { clears++; }
             }, () -> { });
         host.addView(menu);
-        menu.update("high", "on-request", true, true);
+        menu.update(false, false, "high", "on-request", true, true, true);
         return menu;
+    }
+
+    @Test public void primaryModelIsTheFirstSectionAndSharesTheExistingInlineMenu() {
+        AIAssistantActionMenu menu = menu();
+        View primary = heading(menu, "主模型");
+        assertNotNull("The first action must be the real primary-model source", primary);
+        assertSame(menu.getChildAt(0), primary);
+        click(menu, "主模型");
+        assertNotNull(option(menu, "云端模型"));
+        assertNotNull(option(menu, "本地模型"));
+        assertTrue(option(menu, "云端模型").isSelected());
+        option(menu, "云端模型").performClick();
+        assertTrue("Selecting the current source must be a no-op", modelSelections.isEmpty());
+        option(menu, "本地模型").performClick();
+        assertEquals(List.of(true), modelSelections);
+        assertNotNull("Choosing a source must keep its options in this menu", option(menu, "云端模型"));
+        click(menu, "思考强度");
+        assertNull(option(menu, "本地模型"));
+        assertNotNull(option(menu, "简单"));
+    }
+
+    @Test public void preparingKeepsTheCommittedSourceAndFailedRestoreStillAllowsRecovery() {
+        AIAssistantActionMenu menu = menu();
+        click(menu, "主模型");
+        menu.update(false, true, "high", "on-request", false, false, false);
+        assertTrue(option(menu, "云端模型").isSelected());
+        assertFalse(option(menu, "本地模型").isSelected());
+        assertFalse(option(menu, "本地模型").isEnabled());
+        option(menu, "本地模型").performClick();
+        assertTrue(modelSelections.isEmpty());
+
+        menu.update(true, false, "high", "on-request", false, true, false);
+        assertTrue(option(menu, "本地模型").isSelected());
+        assertTrue(heading(menu, "主模型").isEnabled());
+        assertFalse(heading(menu, "思考强度").isEnabled());
+        option(menu, "云端模型").performClick();
+        assertEquals(List.of(false), modelSelections);
+        assertNotNull(option(menu, "本地模型"));
     }
 
     @Test public void headingsExpandInsideOneContentAndOnlyOneSectionRemainsOpen() {
@@ -64,7 +104,7 @@ public final class AIAssistantActionMenuTest {
         option(menu, "深度").performClick();
         assertEquals(List.of("max"), efforts);
         assertNotNull("Selection must keep this popup section open", option(menu, "简单"));
-        menu.update("max", "on-request", true, true);
+        menu.update(false, false, "max", "on-request", true, true, true);
         assertTrue(option(menu, "深度").isSelected());
         assertFalse(option(menu, "标准").isSelected());
         click(menu, "操作权限");
@@ -79,7 +119,7 @@ public final class AIAssistantActionMenuTest {
     @Test public void stateChangesDisableOpenOptionsAndDoNotApplyAStaleSelection() {
         AIAssistantActionMenu menu = menu();
         click(menu, "操作权限");
-        menu.update("high", "on-request", false, false);
+        menu.update(false, false, "high", "on-request", false, false, false);
         View choice = option(menu, "完全访问");
         assertNotNull(choice);
         assertFalse(choice.isEnabled());
@@ -88,7 +128,7 @@ public final class AIAssistantActionMenuTest {
         assertFalse(heading(menu, "思考强度").isEnabled());
         click(menu, "清空当前对话");
         assertEquals(0, clears);
-        menu.update("high", "unless-trusted", true, true);
+        menu.update(false, false, "high", "unless-trusted", true, true, true);
         assertTrue(option(menu, "帮我批准").isSelected());
         option(menu, "请求批准").performClick();
         assertEquals(List.of("on-request"), policies);
