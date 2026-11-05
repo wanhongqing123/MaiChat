@@ -59,3 +59,9 @@
 - 覆盖真实字形 advance、窄代码一行不软折行、正文仍换行、滚到尾部、完整空白/TAIL 原生 Copy、流式 append 保持 child/offset/选区，以及 pending 布局不覆盖后到的新 scroll（80→180）。
 - 桌面实际图示截图已分别查看 Agent/IM；首版视觉探针取到了隐藏远程 View，已改按实际 AgentChatPanel 归属取 View 后重新截图。此为测试探针错误，未据此修改产品导航。
 - 真实安装包 `com.kongshang.maichat` 未被替换，独立包不初始化 Agent 或账号；原生 Agent 合成回归在私有 temp 路径单独执行。
+
+### 发布门禁中发现的测试时序
+
+首轮 16 CTests 中主窗口一项失败，原始记录完整保留在 v2.2.48 第一次输出目录（379.88 秒）。相同程序在 CDB 下 153 PASS/1 SKIP；不附调试器并显式输出 QtTest 日志后，稳定定位到 composerResizeKeepsLatestMessageVisible 初始 `scrollBar.maximum()>0` 抢在首次 posted layout 前断言。测试只改为最多 2 秒等待真实 overflow，全部后续拖拽/最新消息可见断言不变，非调试全套结果 153 PASS、0 FAIL、1 SKIP（22.450 秒）。产品代码不作推测性修改，最终发布使用后续完整门禁。
+
+Android 软件 Canvas 不能作为已挂载硬件 ScrollView 的窗口像素证据；追加私有 PixelCopy 探针，仅复制独立测试 Activity 的 Window surface。实际原图示绘制清晰，已自行查看 `.cache/android-agent-steering-tests-20261105/markdown-owned-window-pixelcopy.png`，探针 1/1 PASS。该探针位于缓存目录，不修改产品或已提交源码，也不捕获其他窗口/剪贴板。

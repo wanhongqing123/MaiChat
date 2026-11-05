@@ -2301,7 +2301,9 @@ void MainWindowLayoutTest::composerResizeKeepsLatestMessageVisible() {
     auto* scroll = window.findChild<QScrollArea*>(QStringLiteral("messageScroll"));
     QVERIFY(splitter && scroll);
     QScrollBar* bar = scroll->verticalScrollBar();
-    QVERIFY(bar->maximum() > 0);
+    // Showing the window posts its first content-layout pass. A debugger used
+    // to hide this timing gap; exercise dragging only after that pass finished.
+    QTRY_VERIFY_WITH_TIMEOUT(bar->maximum() > 0, 2000);
     bar->setValue(bar->maximum());
     const int oldHeight = scroll->height();
     QSplitterHandle* handle = splitter->handle(1);
