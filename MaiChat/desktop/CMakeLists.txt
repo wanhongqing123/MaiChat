@@ -1152,6 +1152,7 @@ target_link_libraries(desktop_computer_tools_test PRIVATE maichat_agent Qt5::Wid
 target_include_directories(desktop_computer_tools_test PRIVATE
   src ../../MaiAgent/third_party/nlohmann)
 add_test(NAME desktop_computer_tools COMMAND desktop_computer_tools_test)
+set_tests_properties(desktop_computer_tools PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(desktop_calendar_events_test
   tests/DesktopCalendarEventsTest.cpp
@@ -1490,7 +1491,10 @@ if(WIN32 AND MAICHAT_ENABLE_OPENCV)
     maichat_agent Qt5::Widgets Qt5::Test)
 endif()
 
-add_executable(reply_suggestion_controller_test tests/ReplySuggestionControllerTest.cpp)
+# maichat_agent's PDF password prompt uses UiZoom; this isolated test does not link the desktop UI.
+add_executable(reply_suggestion_controller_test
+  tests/ReplySuggestionControllerTest.cpp
+  src/ui/UiZoom.cpp)
 target_link_libraries(reply_suggestion_controller_test PRIVATE maichat_agent Qt5::Test)
 
 add_executable(remote_diagnostics_controller_test tests/RemoteDiagnosticsControllerTest.cpp)

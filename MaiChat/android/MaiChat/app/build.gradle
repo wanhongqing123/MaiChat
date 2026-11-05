@@ -30,8 +30,8 @@ android {
         applicationId "com.kongshang.maichat"
         minSdk 26
         targetSdk 34
-        versionCode 266
-        versionName "2.2.29"
+        versionCode 267
+        versionName "2.2.30"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
@@ -85,6 +85,9 @@ android {
         pickFirst "lib/**/libc++_shared.so"
         jniLibs {
             useLegacyPackaging true
+            // AGP may collect the NDK's link-only zlib stub from CMake runtimeFiles.
+            // Android supplies the real public libz.so; shipping that stub breaks zlib calls.
+            excludes += ["**/libz.so"]
         }
     }
 }

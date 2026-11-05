@@ -372,12 +372,14 @@ void AgentPanelSessionTest::emptySessionShowsWelcomeAndFirstMessageHidesIt() {
     QVERIFY(welcome != nullptr && heading != nullptr && editor != nullptr);
     QCOMPARE(heading->text(), QStringLiteral("从这里开始创作"));
     const auto welcomeCards = harness.panel->findChildren<QFrame*>(QStringLiteral("agentWelcomeFeature"));
-    QCOMPARE(welcomeCards.size(), 18);
+    // 账号资料与头像已加入正式能力展示，数量和明确条目一起覆盖，避免保留旧欢迎页预期。
+    QCOMPARE(welcomeCards.size(), 19);
     QList<QString> titles;
     for (const QFrame* card : welcomeCards) titles.append(card->accessibleName());
     QVERIFY(titles.contains(QStringLiteral("终端与进程")));
     QVERIFY(titles.contains(QStringLiteral("电脑操作")));
     QVERIFY(titles.contains(QStringLiteral("日历导入")));
+    QVERIFY(titles.contains(QStringLiteral("账号资料与头像")));
     QVERIFY(!titles.contains(QStringLiteral("当前位置")));
     QVERIFY(welcome->isVisibleTo(harness.panel.get()));
     QVERIFY(harness.view()->isEmpty());

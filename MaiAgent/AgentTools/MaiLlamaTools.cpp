@@ -17,10 +17,16 @@
 #include <utility>
 #include <vector>
 
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+#include <android/log.h>
+#include <dlfcn.h>
+#endif
+
 #include <json.hpp>
 #include <chat.h>
 #include <sampling.h>
 #include <ggml-cpp.h>
+#include <ggml-backend.h>
 #include <llama-cpp.h>
 #include <llama.h>
 #include <llama-model.h>
@@ -56,6 +62,88 @@ MaiError canceledError() {
 }
 
 void quietLog(ggml_log_level, const char*, void*) {}
+
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+constexpr const char* kAndroidInferenceLog = "MaiLlamaPerf";
+
+long long elapsedMilliseconds(std::chrono::steady_clock::time_point started) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                 started)
+        .count();
+}
+
+MaiError initializeAndroidCpuBackends() {
+    // 只使用已加载 ggml 所在的签名安装目录，不接受环境覆盖或 executable/cwd 插件搜索。
+    // 上游 load_all_from_path 仍会读取该环境变量，因此必须在调用前拒绝它。
+    const char* overridePath = std::getenv("GGML_BACKEND_PATH");
+    if (overridePath && *overridePath)
+        return {MaiErrorCode::NotConfigured, "Android local backend search cannot be overridden"};
+
+    Dl_info information{};
+    if (!dladdr(reinterpret_cast<const void*>(&ggml_backend_reg_count), &information) ||
+        !information.dli_fname || !*information.dli_fname)
+        return {MaiErrorCode::NotConfigured, "The bundled ggml library location is unavailable"};
+
+    // Chromium 的路径规则保留 POSIX 原生字节，再解析父目录。旧 Android 的 dladdr 可能
+    // 只给文件名；这种情况明确失败，不能拼 cwd 或把 APK 内路径当成普通文件系统目录。
+    const MaiFilePath reportedPath(std::string(information.dli_fname));
+    if (!reportedPath.isAbsolute())
+        return {MaiErrorCode::NotConfigured, "The bundled ggml library path must be absolute"};
+    const MaiFilePath library = MaiFileSystem::resolve(reportedPath);
+    const MaiFilePath directory = library.dirName();
+    if (library.isEmpty() || library.baseName() != MaiFilePath("libggml.so") ||
+        !MaiFileSystem::exists(library) || MaiFileSystem::isDirectory(library) ||
+        !directory.isAbsolute() || !MaiFileSystem::isDirectory(directory))
+        return {MaiErrorCode::NotConfigured,
+                "The bundled ggml installation directory is unavailable"};
+
+    const MaiFilePath baseline = directory.append(MaiFilePath("libggml-cpu-android_armv8.0_1.so"));
+    const MaiFilePath resolvedBaseline = MaiFileSystem::resolve(baseline);
+    if (resolvedBaseline.isEmpty() || resolvedBaseline.dirName() != directory ||
+        !MaiFileSystem::exists(resolvedBaseline) || MaiFileSystem::isDirectory(resolvedBaseline))
+        return {MaiErrorCode::NotConfigured, "The bundled baseline Android CPU backend is missing"};
+
+    // 官方独立基线 score 对象通过 HWCAP 拒绝不支持的 ISA，旧机保留 ARMv8.0。
+    // 路径来自已加载的只读 App 库；不从用户工作区、下载目录或配置中装载任意模块。
+    ggml_backend_load_all_from_path(directory.value().c_str());
+    auto* cpu = ggml_backend_reg_by_name("CPU");
+    if (!cpu || !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU))
+        return {MaiErrorCode::NotConfigured,
+                "No compatible bundled Android CPU backend is available"};
+
+    // 只记录实际 registry 的模块文件名和固定功能位，不恢复上游可能包含路径/正文的日志。
+    const auto getFeatures = reinterpret_cast<ggml_backend_get_features_t>(
+        ggml_backend_reg_get_proc_address(cpu, "ggml_backend_get_features"));
+    std::string module = "unknown";
+    Dl_info selected{};
+    if (getFeatures && dladdr(reinterpret_cast<const void*>(getFeatures), &selected) &&
+        selected.dli_fname) {
+        const auto name = MaiFilePath(std::string(selected.dli_fname)).baseName().value();
+        for (const char* variant :
+             {"android_armv8.0_1", "android_armv8.2_1", "android_armv8.2_2", "android_armv8.6_1",
+              "android_armv9.0_1", "android_armv9.2_1", "android_armv9.2_2"}) {
+            if (name == std::string("libggml-cpu-") + variant + ".so") module = name;
+        }
+    }
+    bool neon = false, dotprod = false, fp16 = false;
+    if (getFeatures) {
+        for (const auto* feature = getFeatures(cpu); feature && feature->name; ++feature) {
+            const bool enabled = feature->value && std::string(feature->value) == "1";
+            const std::string name = feature->name;
+            if (name == "NEON")
+                neon = enabled;
+            else if (name == "DOTPROD")
+                dotprod = enabled;
+            else if (name == "FP16_VA")
+                fp16 = enabled;
+        }
+    }
+    __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                        "cpu_backend module=%s neon=%d dotprod=%d fp16=%d", module.c_str(), neon,
+                        dotprod, fp16);
+    return {};
+}
+#endif
 
 // 与已有文件工具一致地拒绝过长、过短编码和代理项。返回 0 表示无效，负数表示字节尚未齐全。
 int utf8Width(const std::string& text, std::size_t offset) {
@@ -521,6 +609,9 @@ public:
                     load(generation, identity.value(), {}, config.preferHardwareAcceleration);
                 if (loaded) return loaded;
             }
+            // RequestScope 退出时撤销 callback；复用驻留 context 的下一轮也须重新安装，
+            // 否则 CPU 长 prefill 只能在整个批次结束后响应取消。
+            llama_set_abort_callback(mContext.get(), abortEvaluation, this);
             if (!mChatTemplates) {
                 // 上游允许缺模板时默认为 ChatML；主模型不能把原始续写权重伪装为聊天模型。
                 const char* ordinary = llama_model_chat_template(mModel.get(), nullptr);
@@ -624,8 +715,14 @@ private:
         explicit RequestScope(Implementation& owner) : mOwner(owner) {
             std::lock_guard<std::mutex> lock(mOwner.mStatusMutex);
             mOwner.mStatus.busy = true;
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+            __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog, "request_begin");
+#endif
         }
         ~RequestScope() {
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+            const bool canceled = isCanceled(mOwner.mActiveCancel);
+#endif
             if (mOwner.mContext) {
                 llama_synchronize(mOwner.mContext.get());
                 llama_set_abort_callback(mOwner.mContext.get(), nullptr, nullptr);
@@ -650,8 +747,16 @@ private:
                 else
                     mOwner.resetResident();
             }
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+            __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                                "request_end canceled=%d elapsed_ms=%lld", canceled,
+                                elapsedMilliseconds(mStarted));
+#endif
         }
         Implementation& mOwner;
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+        std::chrono::steady_clock::time_point mStarted = std::chrono::steady_clock::now();
+#endif
     };
 
     void resetResident() {
@@ -679,14 +784,26 @@ private:
                   const MaiLlamaFileIdentity& projectorFile,
                   bool preferHardwareAcceleration = false) {
         resetResident();
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+        const auto loadStarted = std::chrono::steady_clock::now();
+        __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                            "model_load_begin context=%u threads=%u", request.contextSize,
+                            request.threads);
+#endif
         static std::once_flag initialized;
+        static MaiError backendInitializationError;
         std::call_once(initialized, [] {
             // 固定日志接收器避免上游元数据和路径进入宿主 stderr 或工具结果。
-            // 仓库静态后端自行注册，不扫描任意插件目录。
+            // 非 Android arm64 的静态后端自行注册；动态变体只取已加载 App 库的安装目录。
             llama_log_set(quietLog, nullptr);
             mtmd_helper_log_set(quietLog, nullptr);
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+            backendInitializationError = initializeAndroidCpuBackends();
+            if (backendInitializationError) return;
+#endif
             llama_backend_init();
         });
+        if (backendInitializationError) return backendInitializationError;
         auto modelParameters = llama_model_default_params();
         modelParameters.n_gpu_layers = 0;
         ggml_backend_dev_t selectedDevices[] = {nullptr, nullptr};
@@ -792,6 +909,10 @@ private:
         mStatus.gpuModelBytes = gpuBytes;
         mStatus.gpuBackend = gpuBytes ? std::move(gpuBackend) : std::string{};
         ++mStatus.modelGeneration;
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+        __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                            "model_load_end elapsed_ms=%lld", elapsedMilliseconds(loadStarted));
+#endif
         return {};
     }
 
@@ -820,6 +941,13 @@ private:
                         std::to_string(llama_n_ctx(mContext.get())) +
                         ". Increase context or shorten the conversation."};
         response.promptTokens = static_cast<std::uint32_t>(tokens.size());
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+        const auto prefillStarted = std::chrono::steady_clock::now();
+        std::uint32_t batches = 0;
+        __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                            "prefill_begin tokens=%zu batch=%u threads=%u", tokens.size(),
+                            llama_n_batch(mContext.get()), request.threads);
+#endif
         for (std::size_t offset = 0; offset < tokens.size();) {
             if (isCanceled(mActiveCancel)) return canceledError();
             const auto count = static_cast<int32_t>(
@@ -832,7 +960,17 @@ private:
             llama_synchronize(mContext.get());
             if (isCanceled(mActiveCancel)) return canceledError();
             offset += static_cast<std::size_t>(count);
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+            if (++batches % 4 == 0 || offset == tokens.size())
+                __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                                    "prefill_progress done=%zu total=%zu elapsed_ms=%lld", offset,
+                                    tokens.size(), elapsedMilliseconds(prefillStarted));
+#endif
         }
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+        __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog, "prefill_end elapsed_ms=%lld",
+                            elapsedMilliseconds(prefillStarted));
+#endif
         return {};
     }
 
@@ -847,6 +985,12 @@ private:
         previous.role = "assistant";
         common_chat_input pending;
         std::size_t producedBytes = 0;
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+        const auto decodeStarted = std::chrono::steady_clock::now();
+        bool firstTextReported = false;
+        __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                            "decode_begin maximum_tokens=%u", generation.maximumTokens);
+#endif
         std::size_t stopHold = 0;
         for (const auto& stop : chat.additional_stops()) {
             if (stop.empty() || stop.size() > 4096)
@@ -856,8 +1000,17 @@ private:
         const auto emit = [&](const common_chat_msg& message) {
             const auto differences = common_chat_msg_diff::compute_diffs(previous, message);
             for (const auto& difference : differences) {
-                if (!difference.content_delta.empty() && sink.onText)
+                if (!difference.content_delta.empty() && sink.onText) {
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+                    if (!firstTextReported) {
+                        firstTextReported = true;
+                        __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                                            "first_text decode_elapsed_ms=%lld",
+                                            elapsedMilliseconds(decodeStarted));
+                    }
+#endif
                     sink.onText(difference.content_delta);
+                }
                 if (!difference.reasoning_content_delta.empty() && sink.onReasoning)
                     sink.onReasoning(difference.reasoning_content_delta);
             }
@@ -903,6 +1056,11 @@ private:
             if (llama_vocab_is_eog(vocabulary, token)) {
                 if (!isValidUtf8(pending.text))
                     return {MaiErrorCode::Protocol, "Local model ended inside a UTF-8 character"};
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+                __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                                    "decode_end eog=1 generated_tokens=%u elapsed_ms=%lld", index,
+                                    elapsedMilliseconds(decodeStarted));
+#endif
                 return finish(pending);
             }
             // 工具/思考控制 token 必须交给原生 parser，而不能先过滤或直接显示给用户。
@@ -911,6 +1069,12 @@ private:
                 return {MaiErrorCode::Protocol, "Local model reached its output byte limit"};
             producedBytes += piece.size();
             pending.append(piece, token);
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+            if ((index + 1) % 128 == 0)
+                __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                                    "decode_progress generated_tokens=%u elapsed_ms=%lld",
+                                    index + 1, elapsedMilliseconds(decodeStarted));
+#endif
             std::size_t stopAt = std::string::npos;
             for (const auto& stop : chat.additional_stops())
                 stopAt = std::min(stopAt, pending.text.find(stop));
@@ -918,6 +1082,11 @@ private:
                 const auto final = pending.substr(0, stopAt);
                 if (!isValidUtf8(final.text))
                     return {MaiErrorCode::Protocol, "Local model stop split a UTF-8 character"};
+#if defined(__ANDROID__) && defined(__aarch64__) && defined(GGML_BACKEND_DL)
+                __android_log_print(ANDROID_LOG_INFO, kAndroidInferenceLog,
+                                    "decode_end eog=0 generated_tokens=%u elapsed_ms=%lld",
+                                    index + 1, elapsedMilliseconds(decodeStarted));
+#endif
                 return finish(final);
             }
             const auto available = pending.size() > stopHold ? pending.size() - stopHold : 0;
