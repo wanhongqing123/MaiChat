@@ -1,0 +1,7 @@
+<!-- The rounded triangle and short bar have matching height and a visible gap. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="#fff">
+  <g transform="translate(-1.5 0)">
+    <path d="M5.5 5.8 16.5 12 5.5 18.2Z" stroke="#fff" stroke-width="4" stroke-linejoin="round"/>
+    <rect x="21" y="4" width="2.5" height="16" rx="1.25"/>
+  </g>
+</svg>

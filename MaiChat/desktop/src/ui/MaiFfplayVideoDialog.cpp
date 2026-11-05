@@ -83,27 +83,24 @@ protected:
     }
 };
 
-// 与应用现有 24px 线条图标保持一致，避免用字体符号造成粗细和基线不齐。
+// 统一使用 24px 图标画布，播放组保留参考的实心轮廓，其他动作用线条图形。
 QIcon videoControlIcon(const char* name) {
     QByteArray path;
     const QByteArray key(name);
-    if (key == "play")
-        path = "<path d='M6 3l15 9-15 9z' fill='#f4f6fa' stroke='none'/>";
-    else if (key == "pause")
-        path = "<rect x='5' y='3' width='5' height='18' rx='1.5' fill='#f4f6fa' stroke='none'/>"
-               "<rect x='14' y='3' width='5' height='18' rx='1.5' fill='#f4f6fa' stroke='none'/>";
-    else if (key == "replay")
+    // 参考播放器的播放控件采用圆润实心轮廓和两角全屏标记；使用 SVG 引擎
+    // 按实际设备比例绘制，避免固定 2 倍位图在 1.25/1.5 倍屏幕上再次缩放。
+    if (key == "play" || key == "pause" || key == "next")
+        return QIcon(QStringLiteral(":/maichat/icons/player-%1.svg").arg(QString::fromLatin1(key)));
+    if (key == "fullscreen" || key == "fullscreen-exit")
+        return QIcon(QStringLiteral(":/maichat/icons/player-fullscreen.svg"));
+    if (key == "replay")
         path = "<path d='M3 10a9 9 0 1 1 2.8 8.5M3 4v6h6'/>";
-    else if (key == "fullscreen")
-        path = "<path d='M8 4H4v4m12-4h4v4M4 16v4h4m12-4v4h-4'/>";
     else if (key == "minimize")
         path = "<path d='M5 12h14'/>";
     else if (key == "maximize")
         path = "<rect x='5' y='5' width='14' height='14' rx='2'/>";
     else if (key == "restore")
         path = "<path d='M8 7V4h12v12h-3'/><rect x='4' y='8' width='12' height='12' rx='1'/>";
-    else if (key == "fullscreen-exit")
-        path = "<path d='M4 8h4V4m8 0v4h4M4 16h4v4m8 0v-4h4'/>";
     else if (key == "volume")
         path = "<path d='M11 5L6 9H3v6h3l5 4zM15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14'/>";
     else if (key == "muted")
@@ -122,8 +119,6 @@ QIcon videoControlIcon(const char* name) {
         path = "<path d='M12 3v12m-4-4l4 4 4-4M4 15v6h16v-6'/>";
     else if (key == "previous")
         path = "<path d='M18 4L6 12l12 8z' fill='#f4f6fa' stroke='none'/><path d='M4 4v16' stroke-width='3'/>";
-    else if (key == "next")
-        path = "<path d='M6 4l12 8-12 8z' fill='#f4f6fa' stroke='none'/><path d='M20 4v16' stroke-width='3'/>";
     else
         path =
             "<circle cx='5' cy='12' r='1' fill='#f4f6fa'/><circle cx='12' cy='12' r='1' fill='#f4f6fa'/><circle "

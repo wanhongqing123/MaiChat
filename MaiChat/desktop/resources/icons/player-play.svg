@@ -1,0 +1,4 @@
+<!-- Rounded transport silhouette shared by the Windows and macOS player. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <path d="M6 3.8 20.3 12 6 20.2Z" fill="#fff" stroke="#fff" stroke-width="3.6" stroke-linejoin="round"/>
+</svg>

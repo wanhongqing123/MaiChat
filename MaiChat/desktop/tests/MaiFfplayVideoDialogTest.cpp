@@ -2403,5 +2403,16 @@ void MaiFfplayVideoDialogTest::localVideoShowsPixels() {
     dialog.close();
 }
 
-QTEST_MAIN(MaiFfplayVideoDialogTest)
+// 与正常 App 使用相同的分数缩放和矢量图标设置；QtTest 默认 main 不开启
+// HighDpiPixmaps，会把 1x 图标放大，不能用于判断 125%/150% 实际产品画面。
+int main(int argc, char* argv[]) {
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+    QApplication::setHighDpiScaleFactorRoundingPolicy(Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
+    QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+    QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
+#endif
+    QApplication application(argc, argv);
+    MaiFfplayVideoDialogTest test;
+    return QTest::qExec(&test, argc, argv);
+}
 #include "MaiFfplayVideoDialogTest.moc"

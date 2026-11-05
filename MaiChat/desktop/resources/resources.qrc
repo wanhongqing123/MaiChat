@@ -22,7 +22,7 @@
     <file alias="face_detection_yunet_2023mar.onnx">../../MobileAgentAdapter/models/face_detection_yunet_2023mar.onnx</file>
     <file alias="human_segmentation_pphumanseg_2023mar.onnx">../../MobileAgentAdapter/models/human_segmentation_pphumanseg_2023mar.onnx</file>
   </qresource>
-  <!-- Tabler Icons v3.x (MIT) plus MaiChat's creative-studio icon. -->
+  <!-- Tabler Icons v3.x (MIT) plus MaiChat's creative-studio and player icons. -->
   <qresource prefix="/maichat/icons">
     <file alias="message-circle.svg">icons/tabler/message-circle.svg</file>
     <file alias="creative-studio.svg">icons/creative-studio.svg</file>
@@ -36,6 +36,10 @@
     <file alias="settings-filled.svg">icons/tabler/settings-filled.svg</file>
     <file alias="arrow-up.svg">icons/tabler/arrow-up.svg</file>
     <file alias="terminal-2.svg">icons/tabler/terminal-2.svg</file>
+    <file alias="player-play.svg">icons/player-play.svg</file>
+    <file alias="player-pause.svg">icons/player-pause.svg</file>
+    <file alias="player-next.svg">icons/player-next.svg</file>
+    <file alias="player-fullscreen.svg">icons/player-fullscreen.svg</file>
     <file alias="user-circle.svg">icons/tabler/user-circle.svg</file>
     <file alias="tabler-license.txt">icons/tabler/LICENSE.txt</file>
   </qresource>
