@@ -168,3 +168,15 @@ peer 最终报告平台为 Apple M3 Pro / arm64、macOS 27.2（26B123）、Apple
 - 最终交付判断：代码与已完成的编译/确定性回归可以交接；系统键鼠能力尚未验收，不能宣称已让 Agent 完整操作用户电脑。未安装或发布本轮源码对应的新版本。
 
 下一次 Windows 原生验收选择 `desktop_computer_creation_native`，设置 `MAICHAT_COMPUTER_NATIVE_WAIT_FOCUS_SECONDS=120`，从正式 Windows 测试脚本启动。用户实际点击独立的 `MaiChat Creation Native` 编辑器并释放键鼠后才继续；必须同时核对 17 次工具调用、真实文本读回和子进程 Enter 状态。Mac 在解锁后先核对实际接收进程的 AX/捕获授权，再执行同一自有窗口验收。若条件未就绪，保持失败或明确 skip，不重复尝试输入。
+
+## 提交后 Windows 私有封装回执
+
+实现提交 `7417a008ec74717f7ea5326e4d0875c95bcc5c6f` 已推送并通过 `git ls-remote` 回读。2026-11-07 04:18:54 +08:00 完成该提交的私有封装；本节后续仅补文档，产品/Core tree 不变。
+
+- ZIP：`MaiChat-win64-v2.2.52-20261107-7417a008.zip`，244290264 bytes，SHA256 `208a8733be7f2d2bd86e0ee099e4d083a6e4e614653ddac5949c87394597de01`。
+- 完整 staging 与实际 ZIP 提取目录分别通过 119 PE imports 依赖检查、四模型 SHA 校验和 ONNX Runtime 存在检查。
+- 两处均用纯系统 PATH 执行真实 `--smoke`，退出 0；独立进程 PID 分别为 3196、26432，版本 2.2.52，实际运行路径与各自包目录一致。
+- 构建、staging、ZIP 提取主程序三方 SHA256 均为 `745e8f955d79aee171e8d3f00c29ead8f3ed820bb9a84e223b62d0bf0f3edf38`。
+- 本机证据：`.cache/computer-control-20261107/private-7417a008-20261107T041828/delivery-proof.json` 和相邻 `logs/`；状态为 `PACKAGING_PASS_NATIVE_ACCEPTANCE_PENDING`。
+
+这只证明私有包完整、可独立启动；Windows 3 项原生测试仍跳过、Mac 原生测试仍待解锁后执行。未运行安装器、未替换现装 PID 584、未发布或覆盖公开 v2.2.52。
