@@ -583,6 +583,9 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
     context.announceQuestion = [emitter, sessionId](const MaiQuestionRequest& request) {
         if (emitter != nullptr) emitter->emitQuestion(sessionId, request);
     };
+    context.questionAnswered = [emitter](const MaiQuestionRequest& request) {
+        if (emitter != nullptr) emitter->emitQuestionAnswered(request);
+    };
     std::vector<MaiToolImage> resultImages;
 
     for (const auto& call : calls) {

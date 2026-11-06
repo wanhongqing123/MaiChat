@@ -72,6 +72,9 @@ struct MaiToolContext {
     MaiQuestionGate* questions = nullptr;
     // 提问登记好之后拿它广播出去。空的话界面看不见这次提问，等于没问。
     MaiQuestionGate::Announce announceQuestion;
+    // question 工具在等待线程消费到实际回答后同步调用一次，使各宿主收起同一个提问。
+    // 可为空；用户提交空回答也会调用，取消或超时不调用。回调不能保留 request 的引用。
+    std::function<void(const MaiQuestionRequest&)> questionAnswered;
 
     // 指向这一轮的取消标志。**可能为空**，用 isCanceled() 别直接解引用。
     //

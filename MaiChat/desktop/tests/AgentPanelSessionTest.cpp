@@ -456,6 +456,9 @@ private slots:
     void approvalFromAnotherSessionIsStillShown();
     void pendingApprovalIsRestoredAfterSessionSwitch();
     void pendingQuestionIsRestoredOnlyInItsSession();
+    void stoppedQuestionReleasesComposerWithoutLosingDraft();
+    void externalQuestionAnswerReleasesComposerWithoutLosingDraft();
+    void expiredQuestionKeepsDraftUntilExplicitResend();
     void composerDraftsStayInTheirSessions();
     void waitingIndicatorSurvivesSwitchingAwayAndBack();
     void reasoningStatusSurvivesSwitchBeforeCheckpoint();
@@ -1411,6 +1414,114 @@ void AgentPanelSessionTest::pendingQuestionIsRestoredOnlyInItsSession() {
     send->click();
     controller.agent().waitIdle();
     QTRY_VERIFY(controller.pendingQuestions().empty());
+}
+
+// A resolved question must release the ordinary composer. Keep a draft written
+// while waiting, and exercise the actual Stop/Send controls without a provider.
+void AgentPanelSessionTest::stoppedQuestionReleasesComposerWithoutLosingDraft() {
+    AgentController controller(std::make_unique<QuestionModel>(), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 650);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(QDir::currentPath());
+    panel.openSession(session);
+    auto* editor = panel.findChild<QTextEdit*>();
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    auto* stop = panel.findChild<QPushButton*>(QStringLiteral("agentStopButton"));
+    QVERIFY(editor && send && stop);
+    editor->setPlainText(QStringLiteral("ask me"));
+    send->click();
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    QTRY_COMPARE(send->toolTip(), QStringLiteral("回答问题"));
+    editor->setPlainText(QStringLiteral("Which workspace is active now?"));
+    stop->click();
+    controller.agent().waitIdle();
+    QVERIFY(controller.pendingQuestions().empty());
+    QTRY_COMPARE(send->toolTip(), QStringLiteral("发送消息"));
+    QCOMPARE(editor->placeholderText(), QStringLiteral("交给它做点什么…"));
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Which workspace is active now?"));
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("question-stopped-draft-preserved")));
+    send->click();
+    controller.agent().waitIdle();
+    QCOMPARE(editor->toPlainText(), QString());
+    int userMessages = 0;
+    for (const auto& message : controller.agent().listMessages(session.toStdString()))
+        if (message.role == MaiRole::User) ++userMessages;
+    QCOMPARE(userMessages, 2);
+}
+
+// Answers may come from another endpoint. Core events must clear this panel's
+// stale route even though this panel did not submit or consume the answer draft.
+void AgentPanelSessionTest::externalQuestionAnswerReleasesComposerWithoutLosingDraft() {
+    AgentController controller(std::make_unique<QuestionModel>(), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 650);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(QDir::currentPath());
+    panel.openSession(session);
+    auto* editor = panel.findChild<QTextEdit*>();
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    QVERIFY(editor && send);
+    QSignalSpy answered(&controller, &AgentController::questionAnswered);
+    editor->setPlainText(QStringLiteral("ask me"));
+    send->click();
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    QTRY_COMPARE(send->toolTip(), QStringLiteral("回答问题"));
+    const auto question = controller.pendingQuestions().front();
+    editor->setPlainText(QStringLiteral("Keep this unsent draft"));
+    QVERIFY(controller.agent().submit(MaiReplyQuestion{question.id, "A"}));
+    controller.agent().waitIdle();
+    QTRY_COMPARE(answered.count(), 1);
+    QTRY_COMPARE(send->toolTip(), QStringLiteral("发送消息"));
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Keep this unsent draft"));
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("question-external-answer-draft-preserved")));
+}
+
+// Resolve in Core before queued GUI events arrive. An expired answer must stay
+// a draft; it must neither repeat raw NotFound notices nor become a new prompt
+// implicitly. A deliberate subsequent Send is the ordinary message action.
+void AgentPanelSessionTest::expiredQuestionKeepsDraftUntilExplicitResend() {
+    AgentController controller(std::make_unique<QuestionModel>(), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 650);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(QDir::currentPath());
+    panel.openSession(session);
+    auto* editor = panel.findChild<QTextEdit*>();
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(editor && send && view);
+    editor->setPlainText(QStringLiteral("ask me"));
+    send->click();
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    QTRY_COMPARE(send->toolTip(), QStringLiteral("回答问题"));
+    const auto question = controller.pendingQuestions().front();
+    editor->setPlainText(QStringLiteral("My answer draft"));
+    QVERIFY(controller.agent().submit(MaiReplyQuestion{question.id, "A"}));
+    controller.agent().waitIdle();
+    // No processEvents/QTRY between settlement and this click: it is a real
+    // submission against a panel whose cached question has just become stale.
+    send->click();
+    QCOMPARE(editor->toPlainText(), QStringLiteral("My answer draft"));
+    view->selectAll();
+    QVERIFY(!view->selectedText().contains(QStringLiteral("question is no longer pending")));
+    view->clearSelection();
+    QCOMPARE(send->toolTip(), QStringLiteral("发送消息"));
+    int userMessages = 0;
+    for (const auto& message : controller.agent().listMessages(session.toStdString()))
+        if (message.role == MaiRole::User) ++userMessages;
+    QCOMPARE(userMessages, 1);
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("question-expired-draft-preserved")));
+    send->click();
+    controller.agent().waitIdle();
+    QCOMPARE(editor->toPlainText(), QString());
+    userMessages = 0;
+    for (const auto& message : controller.agent().listMessages(session.toStdString()))
+        if (message.role == MaiRole::User) ++userMessages;
+    QCOMPARE(userMessages, 2);
 }
 
 void AgentPanelSessionTest::composerDraftsStayInTheirSessions() {

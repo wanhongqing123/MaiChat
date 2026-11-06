@@ -48,10 +48,10 @@ public:
         // question 用用户语言表述；options 只是建议选项，用户仍可自由作答。
         return R"({"type":"object","properties":{)"
                R"("question":{"type":"string","description":"The question, in the user's language")"
-                   R"(},)"
+               R"(},)"
                R"("options":{"type":"array","items":{"type":"string"},)"
                R"("description":"Suggested answers, if there are a few obvious ones. The user can )"
-                   R"(still answer with anything."}},)"
+               R"(still answer with anything."}},)"
                R"("required":["question"]})";
     }
 
@@ -99,6 +99,9 @@ public:
                 MaiErrorCode::Canceled,
                 "the user did not answer (the turn was interrupted or the question timed out)");
         }
+        // 由等待线程确认回答已消费后再广播，取消和超时不能伪装成用户作答。
+        // 此时闸门已移除这个请求，多端收起旧提问时查询也不会再看到它。
+        if (context.questionAnswered) context.questionAnswered(request);
         return MaiToolResult::success(answer);
     }
 };

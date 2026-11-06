@@ -26,6 +26,12 @@
 namespace {
 using Json = nlohmann::json;
 
+std::atomic<int> mobileSessionChanges{0};
+
+void localSessionChanged(const char* sessionId) {
+    if (sessionId != nullptr && sessionId[0] != '\0') ++mobileSessionChanges;
+}
+
 void check(bool condition, const char* detail) {
     if (!condition) throw std::runtime_error(detail);
 }
@@ -105,6 +111,13 @@ int main() {
                             {"type", "function"},
                             {"function", {{"name", "maichat_get_current_account"}, {"arguments", "{}"}}}};
             response.set_content(frame({{"tool_calls", Json::array({tool})}}, "tool_calls"), "text/event-stream");
+        } else if (index == 2) {
+            const Json tool{
+                {"index", 0},
+                {"id", "synthetic-question"},
+                {"type", "function"},
+                {"function", {{"name", "question"}, {"arguments", R"({"question":"Which result should be kept?"})"}}}};
+            response.set_content(frame({{"tool_calls", Json::array({tool})}}, "tool_calls"), "text/event-stream");
         } else {
             response.set_content(frame({{"content", "Current result ready."}}, "stop"), "text/event-stream");
         }
@@ -122,6 +135,8 @@ int main() {
     try {
         check(handle != nullptr, "create failed");
         check(!MaiFileSystem::createDirectories(workspace).hasError(), "workspace creation failed");
+        check(maiMobileAgentSetChangeHandler(handle, localSessionChanged) == 1,
+              "change notification registration failed");
         check(maiMobileAgentSetHostToolHandler(handle, &host, hostTool, freeHost, releaseHost) == 1,
               "host registration failed");
         const Json configured =
@@ -326,6 +341,48 @@ int main() {
         std::puts(
             "PASS: real C ABI steering, persisted user, dedupe, stable turn, complete tool results, next model input");
 
+        // 真实 question 闸门经 C ABI 结算后，移动宿主必须收到通知并读到权威空列表。
+        // 通知不暴露事件类型，专属 QuestionAnswered 事件由核心测试单独验证。
+        check(call(handle, {{"op", "send"}, {"session", session}, {"text", "Ask which result to keep"}}).at("ok"),
+              "question turn did not start");
+        Json pending;
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            pending = snapshot();
+            if (!pending.at("questions").empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(pending.at("questions").size() == 1, "synthetic question did not become pending");
+        const std::string questionId = pending.at("questions").front().at("id");
+        check(call(handle, {{"op", "remote_snapshot"}, {"session", session}}).at("questions").size() == 1,
+              "remote snapshot did not expose the pending question");
+        const int changesBeforeAnswer = mobileSessionChanges.load();
+        check(call(handle, {{"op", "answer"}, {"session", session}, {"id", questionId}, {"text", "Keep this result"}})
+                  .at("ok"),
+              "pending question answer was not accepted");
+        bool clearedByNotification = false;
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            const Json update = call(handle, {{"op", "snapshot"}, {"session", session}});
+            if (update.value("changed", false) && update.at("questions").empty() &&
+                mobileSessionChanges.load() > changesBeforeAnswer) {
+                clearedByNotification = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(clearedByNotification, "settled question did not notify the mobile consumer with cleared pending state");
+        check(call(handle, {{"op", "remote_snapshot"}, {"session", session}}).at("questions").empty(),
+              "remote snapshot retained the consumed question");
+        const Json staleAnswer =
+            call(handle, {{"op", "answer"}, {"session", session}, {"id", questionId}, {"text", "Repeated answer"}});
+        check(!staleAnswer.at("ok") && staleAnswer.value("errorCode", "") == "not_found",
+              "consumed question did not preserve its typed stale-answer rejection");
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            if (!snapshot().at("busy").get<bool>()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(!snapshot().at("busy").get<bool>(), "answered question turn did not finish");
+        std::puts("PASS: mobile question answer notification, authoritative pending clear, stale-answer rejection");
+
         // 配置检查不启动推理；真实 GGUF 生成与工具闭环由本地主模型专测/正常 App 另验。
         // 这里独立证明参数不回绕、损坏文件不覆盖配置，失败不偷偷降级到 HTTP。
         const int assetProbesBeforeLocal = host.assetProbes.load();
@@ -403,7 +460,7 @@ int main() {
               "local configuration unexpectedly probed cloud asset credentials");
         {
             std::lock_guard<std::mutex> lock(requestsMutex);
-            check(requests.size() == 2, "local configuration unexpectedly sent a remote model request");
+            check(requests.size() == 4, "local configuration unexpectedly sent a remote model request");
         }
         std::puts("PASS: local C ABI configuration, no API key, limits, file boundary, no remote fallback");
     } catch (const std::exception& error) {

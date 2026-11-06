@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <set>
@@ -715,6 +716,133 @@ static void test_interrupt_turn_preserves_wrong_question_and_wakes_matching_ques
     agent.waitIdle();
 }
 
+static void test_answered_question_emits_one_owner_event_and_rejects_duplicates() {
+    MaiFakeModelClient::Turn invocation;
+    invocation.invocations.push_back({"call_answered_question_fixture", "question",
+                                      R"({"question":"Choose a fixture option"})"});
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(makeMaiQuestionTool());
+    MaiAgent agent(
+        makeMaiMemoryStore(),
+        std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{invocation}),
+        std::move(tools));
+    std::mutex eventsMutex;
+    std::vector<MaiEvent> asked;
+    std::vector<MaiEvent> answered;
+    const auto subscription = agent.eventBus().subscribe([&](const MaiEvent& event) {
+        std::lock_guard<std::mutex> lock(eventsMutex);
+        if (event.type == MaiEventType::QuestionAsked) asked.push_back(event);
+        if (event.type == MaiEventType::QuestionAnswered) answered.push_back(event);
+    });
+    const std::string workspace = MaiFileSystem::resolve(MaiFilePath::fromUtf8(".")).toUtf8();
+    const std::string session =
+        agent.submit(MaiCreateSession{workspace, "Answered question fixture", "fixture"}).value();
+    const auto started = agent.submit(MaiSendPrompt{session, "Ask the fixture question"});
+    CHECK(started);
+    CHECK(wait_for_interrupt_test([&] { return agent.listPendingQuestions().size() == 1; }));
+    const auto pending = agent.listPendingQuestions();
+    CHECK(pending.size() == 1);
+    if (pending.size() == 1) {
+        const MaiQuestionRequest& request = pending.front();
+        const auto reply = agent.submit(MaiReplyQuestion{request.id, "second option"});
+        CHECK(reply);
+        const auto duplicate = agent.submit(MaiReplyQuestion{request.id, "second option"});
+        CHECK(!duplicate);
+        CHECK(duplicate.error().code() == MaiErrorCode::NotFound);
+        if (!reply) agent.submit(MaiInterrupt{session});
+        agent.waitIdle();
+        CHECK(agent.listPendingQuestions().empty());
+        CHECK(asked.size() == 1);
+        CHECK(answered.size() == 1);
+        if (answered.size() == 1) {
+            const MaiEvent& event = answered.front();
+            CHECK(event.questionId == request.id);
+            CHECK(event.sessionId == session);
+            CHECK(event.messageId == request.messageId);
+            CHECK(event.partId == request.partId);
+            CHECK(!event.messageId.empty());
+            CHECK(!event.partId.empty());
+            if (started) CHECK(event.messageId == started.value());
+        }
+    } else {
+        agent.submit(MaiInterrupt{session});
+        agent.waitIdle();
+    }
+    agent.eventBus().unsubscribe(subscription);
+}
+
+static void test_canceling_one_question_emits_no_answer_and_preserves_the_other_session() {
+    MaiFakeModelClient::Turn invocation;
+    invocation.invocations.push_back({"call_isolated_question_fixture", "question",
+                                      R"({"question":"Choose for this session"})"});
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(makeMaiQuestionTool());
+    MaiAgent agent(makeMaiMemoryStore(),
+                   std::make_unique<MaiFakeModelClient>(
+                       std::vector<MaiFakeModelClient::Turn>{invocation, invocation}),
+                   std::move(tools));
+    std::mutex eventsMutex;
+    std::vector<MaiEvent> answered;
+    const auto subscription = agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type != MaiEventType::QuestionAnswered) return;
+        std::lock_guard<std::mutex> lock(eventsMutex);
+        answered.push_back(event);
+    });
+    const std::string workspace = MaiFileSystem::resolve(MaiFilePath::fromUtf8(".")).toUtf8();
+    const std::string first =
+        agent.submit(MaiCreateSession{workspace, "Canceled question fixture", "fixture"}).value();
+    const std::string second =
+        agent.submit(MaiCreateSession{workspace, "Surviving question fixture", "fixture"}).value();
+    CHECK(agent.submit(MaiSendPrompt{first, "Ask the first question"}));
+    CHECK(wait_for_interrupt_test([&] { return agent.listPendingQuestions().size() == 1; }));
+    CHECK(agent.submit(MaiSendPrompt{second, "Ask the second question"}));
+    CHECK(wait_for_interrupt_test([&] { return agent.listPendingQuestions().size() == 2; }));
+    MaiQuestionRequest canceled;
+    MaiQuestionRequest surviving;
+    for (const auto& request : agent.listPendingQuestions()) {
+        if (request.sessionId == first) canceled = request;
+        if (request.sessionId == second) surviving = request;
+    }
+    CHECK(!canceled.id.empty());
+    CHECK(!surviving.id.empty());
+    CHECK(canceled.id != surviving.id);
+    if (!canceled.id.empty() && !surviving.id.empty()) {
+        CHECK(agent.interruptTurn(first, agent.activeTurnId(first)));
+        CHECK(wait_for_interrupt_test([&] { return !agent.isBusy(first); }));
+        const auto pending = agent.listPendingQuestions();
+        CHECK(pending.size() == 1);
+        if (pending.size() == 1) {
+            CHECK(pending.front().id == surviving.id);
+            CHECK(pending.front().sessionId == second);
+        }
+        const auto stale = agent.submit(MaiReplyQuestion{canceled.id, "late answer"});
+        CHECK(!stale);
+        CHECK(stale.error().code() == MaiErrorCode::NotFound);
+        {
+            std::lock_guard<std::mutex> lock(eventsMutex);
+            CHECK(answered.empty());
+        }
+        // 空回答是明确提交过的回答，也必须关闭正确会话的提问，不能与取消混同。
+        const auto reply = agent.submit(MaiReplyQuestion{surviving.id, ""});
+        CHECK(reply);
+        if (!reply) agent.submit(MaiInterrupt{second});
+        agent.waitIdle();
+        CHECK(agent.listPendingQuestions().empty());
+        CHECK(answered.size() == 1);
+        if (answered.size() == 1) {
+            CHECK(answered.front().questionId == surviving.id);
+            CHECK(answered.front().sessionId == second);
+            CHECK(answered.front().messageId == surviving.messageId);
+            CHECK(answered.front().partId == surviving.partId);
+        }
+    } else {
+        agent.submit(MaiInterrupt{first});
+        agent.submit(MaiInterrupt{second});
+        agent.waitIdle();
+    }
+    agent.eventBus().unsubscribe(subscription);
+}
+
 static void test_interrupt_turn_empty_target_keeps_legacy_session_stop() {
     auto gate = std::make_shared<MaiInterruptTestGate>();
     MaiAgent agent(makeMaiMemoryStore(),
@@ -738,6 +866,8 @@ int main() {
     test_interrupt_of_completed_turn_does_not_stop_its_successor();
     test_interrupt_turn_preserves_wrong_permission_and_wakes_matching_permission();
     test_interrupt_turn_preserves_wrong_question_and_wakes_matching_question();
+    test_answered_question_emits_one_owner_event_and_rejects_duplicates();
+    test_canceling_one_question_emits_no_answer_and_preserves_the_other_session();
     test_interrupt_turn_empty_target_keeps_legacy_session_stop();
     test_exact_message_query_uses_the_requested_session();
     test_id_prefix_and_monotonic();

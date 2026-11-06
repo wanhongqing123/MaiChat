@@ -175,6 +175,8 @@ private:
     // 而不是新的 prompt。
     void showQuestion(const QString& questionId);
     void clearQuestion();
+    // 核心待回答列表是权威状态；协调迟到的回答/取消事件，不消费输入草稿。
+    bool reconcileQuestion();
 
     // 按钮按下时才去查 permissionId。存一份在卡片上的话，
     // 多端同时开着时别人先裁决了，这里存的就是个过期的 id。

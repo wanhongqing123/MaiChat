@@ -1891,6 +1891,10 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
             });
     connect(&controller, &AgentController::toolPartChanged, this,
             [this](const QString& sessionId, const QString& messageId, const QString& partId) {
+                // 问题也可能因取消或超时结束，并没有真实的用户回答事件。
+                // 工具状态落库后检查权威列表；子任务仍由父页面处理提问。
+                if (isCurrentSession(sessionId) || runtime_->controller->isChildOf(sessionId, runtime_->sessionId))
+                    reconcileQuestion();
                 if (!isCurrentSession(sessionId)) {
                     if (!runtime_->controller->isChildOf(sessionId, runtime_->sessionId)) return;
                     ToolCard* card = runtime_->toolCards.value(partId, nullptr);
@@ -1933,6 +1937,8 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         if (runtime_->pendingQuestionId == questionId) clearQuestion();
     });
     connect(&controller, &AgentController::turnFinished, this, [this](const QString& sessionId) {
+        if (isCurrentSession(sessionId) || runtime_->controller->isChildOf(sessionId, runtime_->sessionId))
+            reconcileQuestion();
         if (!isCurrentSession(sessionId)) {
             noteOtherSession(sessionId, QString());
             return;
@@ -1953,6 +1959,8 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         scrollToBottom();
     });
     connect(&controller, &AgentController::turnFailed, this, [this](const QString& sessionId, const QString& message) {
+        if (isCurrentSession(sessionId) || runtime_->controller->isChildOf(sessionId, runtime_->sessionId))
+            reconcileQuestion();
         if (!isCurrentSession(sessionId)) {
             noteOtherSession(sessionId, message);
             return;
@@ -3111,9 +3119,21 @@ void AgentChatPanel::showQuestion(const QString& questionId) {
 void AgentChatPanel::clearQuestion() {
     if (runtime_->pendingQuestionId.isEmpty()) return;
     runtime_->pendingQuestionId.clear();
-    runtime_->editor->setPlaceholderText(QStringLiteral("交给它做点什么…"));
+    updateComposerPlaceholder();
     // 按钮和提示交回给 setRunning 管：那一轮多半还在跑，回答完接着跑。
     setRunning(runtime_->running);
+}
+
+bool AgentChatPanel::reconcileQuestion() {
+    if (runtime_->pendingQuestionId.isEmpty()) return false;
+    for (const MaiQuestionRequest& pending : runtime_->controller->pendingQuestions()) {
+        if (fromUtf8(pending.id) != runtime_->pendingQuestionId) continue;
+        const QString owner = fromUtf8(pending.sessionId);
+        if (owner == runtime_->sessionId || runtime_->controller->isChildOf(owner, runtime_->sessionId)) return true;
+    }
+    // 只解除旧路由。草稿和附件属于用户，不能因问题在其它入口结束而清空。
+    clearQuestion();
+    return false;
 }
 
 void AgentChatPanel::showApproval(const QString& permissionId) {
@@ -3550,8 +3570,21 @@ void AgentChatPanel::onSend() {
     if (!runtime_->pendingQuestionId.isEmpty()) {
         const QString answer = runtime_->editor->toPlainText().trimmed();
         if (answer.isEmpty()) return;
-        if (!runtime_->controller->answerQuestion(runtime_->pendingQuestionId, answer)) {
-            appendNotice(runtime_->controller->lastError(), true);
+        const QString questionId = runtime_->pendingQuestionId;
+        // GUI 队列可能还没收到另一入口的回答/取消通知。失效答案不自动降级成
+        // 新 prompt；保留草稿，下一次明确发送才按普通消息处理。
+        const QString expiredNotice = QStringLiteral("这个问题已结束。输入内容已保留，可再次发送为新消息。");
+        if (!reconcileQuestion()) {
+            appendNotice(expiredNotice, false);
+            return;
+        }
+        if (!runtime_->controller->answerQuestion(questionId, answer)) {
+            // 校验和提交之间仍可能发生结算；以核心当前状态判断，不能重复报
+            // 同一个旧 questionId 的 NotFound，也不能吞掉真正的其它失败。
+            if (!reconcileQuestion())
+                appendNotice(expiredNotice, false);
+            else
+                appendNotice(runtime_->controller->lastError(), true);
             return;
         }
         runtime_->editor->clear();
