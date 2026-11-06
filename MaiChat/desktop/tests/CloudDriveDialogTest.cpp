@@ -333,7 +333,17 @@ int main(int argc, char** argv) {
         if (!player->hasPresentedFrame()) {
             require(buffering->isVisible(), "first-frame loading indicator was missing");
             // 只记录实际加载控件，避开 QWidget::grab 中不可靠的原生视频 backingstore。
-            require(buffering->grab().save(screenshots + QStringLiteral("/cloud-buffering-icon.png")),
+            const QImage icon = buffering->grab().toImage();
+            int darkest = 255;
+            int lightest = 0;
+            for (int y = 0; y < icon.height(); ++y)
+                for (int x = 0; x < icon.width(); ++x) {
+                    const int gray = qGray(icon.pixel(x, y));
+                    darkest = qMin(darkest, gray);
+                    lightest = qMax(lightest, gray);
+                }
+            require(lightest - darkest > 100, "loading icon has no visible contrast");
+            require(icon.save(screenshots + QStringLiteral("/cloud-buffering-icon.png")),
                     "could not capture cloud loading indicator");
         }
         auto* dock = window.findChild<QWidget*>(QStringLiteral("videoDockSlot"));

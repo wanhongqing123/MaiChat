@@ -26,6 +26,9 @@ protected:
     void hideEvent(QHideEvent* event) override { timer_.stop(); QWidget::hideEvent(event); }
     void paintEvent(QPaintEvent*) override {
         QPainter painter(this);
+        // 原生子窗口不能依赖应用的浅色 Window 调色板；加载期与黑色视频视口一致，
+        // 否则白色旋转环在独立重绘/截图时会落到白底上，实际没有可见对比。
+        painter.fillRect(rect(), Qt::black);
         painter.setRenderHint(QPainter::Antialiasing);
         const QRectF ring = QRectF(rect()).adjusted(7, 7, -7, -7);
         painter.setPen(QPen(QColor(255, 255, 255, 55), 3));
