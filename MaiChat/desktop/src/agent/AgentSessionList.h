@@ -48,12 +48,13 @@ signals:
     void deleteSessionRequested(const QString& sessionId);
     void remoteCreateRequested(const QJsonObject& device);
     void remoteDeleteRequested(const QJsonObject& session);
-    // 用户按了"新对话"。**这里不建会话**——建在哪个目录是面板的事，
+    // 用户按了本机设备标题中的 +。**这里不建会话**——建在哪个目录是面板的事，
     // 列表只负责说"用户想开一个新的"。
     void newSessionRequested();
 
 private:
     bool eventFilter(QObject* watched, QEvent* event) override;
+    void updateLocalCreateButton();
     void showLocalSessionMenu(const QString& sessionId, const QPoint& position);
     void showRemoteSessionMenu(const QJsonObject& session, const QPoint& position);
     void showRemoteDeviceMenu(const QJsonObject& device, const QPoint& position);

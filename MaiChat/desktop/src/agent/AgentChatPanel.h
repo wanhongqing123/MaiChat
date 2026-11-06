@@ -131,6 +131,10 @@ private:
     void noteOtherSession(const QString& sessionId, const QString& text,
                           const QString& partId = QString());
     SubAgentCard* subAgentCardFor(const QString& sessionId);
+    // Persisted spawn receipts own a child card's location, including replay
+    // and child events delivered after following parent text was rendered.
+    void recordSubAgentSpawn(const QString& messageId, const MaiMessagePart& part);
+    void positionSubAgentCard(const QString& sessionId);
 
     void onSend();
     void onClear();

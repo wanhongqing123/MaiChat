@@ -454,6 +454,9 @@ private slots:
     void currentSessionTitleStaysInTheSessionList();
     void subAgentCardsKeepTaskAndStreamedLatestLineVisible();
     void subAgentCardsUseConsistentWidthAndExpandableSummary();
+    void subAgentCardsStayBesideTheirSpawnPartsAcrossReplay_data();
+    void subAgentCardsStayBesideTheirSpawnPartsAcrossReplay();
+    void subAgentCardsWaitForTheirHistoryPage();
     void approvalFromAnotherSessionIsStillShown();
     void pendingApprovalIsRestoredAfterSessionSwitch();
     void approvedChildToolCompletesWhileParentPageIsCached();
@@ -1195,6 +1198,315 @@ void AgentPanelSessionTest::subAgentCardsUseConsistentWidthAndExpandableSummary(
     QTRY_VERIFY(summary->width() > 600);
     QTest::mouseClick(disclosure, Qt::LeftButton);
     QTRY_COMPARE(cards[1]->height(), collapsedHeight);
+}
+
+// Child event delivery can lag behind the parent stream. Persisted spawn receipts,
+// rather than the arrival time of child output, own the cards' transcript position.
+void AgentPanelSessionTest::subAgentCardsStayBesideTheirSpawnPartsAcrossReplay_data() {
+    QTest::addColumn<bool>("receiptInitiallyReady");
+    QTest::newRow("receipt-before-child") << true;
+    QTest::newRow("child-output-and-question-before-receipt") << false;
+}
+
+void AgentPanelSessionTest::subAgentCardsStayBesideTheirSpawnPartsAcrossReplay() {
+    QFETCH(bool, receiptInitiallyReady);
+    const QString evidenceSuffix = receiptInitiallyReady ? QString() : QStringLiteral("-late-receipt");
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    const QString database = storage.filePath(QStringLiteral("sub-agent-timeline.db"));
+    const QString root = QStringLiteral("ses_timeline_root");
+    const QStringList children{QStringLiteral("ses_timeline_child_a"), QStringLiteral("ses_timeline_child_b"),
+                               QStringLiteral("ses_timeline_child_c"), QStringLiteral("ses_timeline_child_d")};
+    const QStringList tasks{QStringLiteral("first-code-review"), QStringLiteral("first-spec-review"),
+                            QStringLiteral("second-code-review"), QStringLiteral("second-spec-review")};
+    const QStringList before{QStringLiteral("prt_timeline_001_before"), QStringLiteral("prt_timeline_011_before")};
+    const QStringList spawn{QStringLiteral("prt_timeline_002_spawn"), QStringLiteral("prt_timeline_003_spawn"),
+                            QStringLiteral("prt_timeline_012_spawn"), QStringLiteral("prt_timeline_013_spawn")};
+    const QStringList after{QStringLiteral("prt_timeline_004_after"), QStringLiteral("prt_timeline_014_after")};
+    {
+        auto opened = makeMaiSqliteStore(database.toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        MaiSession session;
+        session.id = root.toStdString();
+        session.directory = storage.path().toStdString();
+        session.created = session.updated = 1;
+        store->putSession(session);
+        for (int batch = 0; batch < 2; ++batch) {
+            MaiMessage message;
+            message.id = "msg_timeline_" + std::to_string(batch + 1);
+            message.role = MaiRole::Assistant;
+            message.created = 100 * (batch + 1);
+            // A receipt still in flight belongs to an unfinished parent turn;
+            // changing an already terminal message would intentionally replace
+            // its retained page and would test history edits instead of delivery.
+            message.completed = receiptInitiallyReady ? message.created + 10 : 0;
+            message.parts.push_back({before[batch].toStdString(),
+                                     MaiTextPart{batch == 0 ? "阶段一：派发第一批子任务" : "阶段二：派发第二批子任务"},
+                                     message.created});
+            for (int index = 2 * batch; index < 2 * batch + 2; ++index) {
+                MaiToolPart tool;
+                tool.tool = "spawn_agent";
+                tool.callId = "call_" + spawn[index].toStdString();
+                tool.input = "{\"task_name\":\"" + tasks[index].toStdString() +
+                             "\",\"prompt\":\"Local timeline fixture\"}";
+                if (receiptInitiallyReady) tool.output = "Started sub-agent " + children[index].toStdString() + " for \"" +
+                              tasks[index].toStdString() +
+                              "\". Use wait_agent with that id when you need its answer.";
+                tool.state = receiptInitiallyReady ? MaiToolState::Completed : MaiToolState::Running;
+                message.parts.push_back({spawn[index].toStdString(), std::move(tool), message.created + index + 1});
+            }
+            message.parts.push_back({after[batch].toStdString(),
+                                     MaiTextPart{batch == 0 ? "阶段一：整理第一批结果" : "阶段二：整理第二批结果"},
+                                     message.created + 9});
+            store->putMessage(session.id, message);
+        }
+        QVERIFY(!store->lastWriteError().hasError());
+    }
+    QStringList expectedOrder;
+    for (int batch = 0; batch < 2; ++batch)
+        expectedOrder << before[batch] << QStringLiteral("tool-group-") + spawn[2 * batch]
+                      << QStringLiteral("sub-") + children[2 * batch]
+                      << QStringLiteral("sub-") + children[2 * batch + 1] << after[batch];
+    const auto orderFailure = [&expectedOrder](MarkdownView* view) {
+        QString previous;
+        for (const QString& id : expectedOrder) {
+            if (!view->contains(id) || view->itemRect(id).height() <= 0)
+                return QStringLiteral("Missing timeline item: %1").arg(id);
+            if (!previous.isEmpty() && view->itemRect(previous).bottom() > view->itemRect(id).top())
+                return QStringLiteral("%1 at %2 must precede %3 at %4")
+                    .arg(previous).arg(view->itemRect(previous).bottom()).arg(id).arg(view->itemRect(id).top());
+            previous = id;
+        }
+        return QString();
+    };
+    {
+        AgentController controller(std::make_unique<SilentModel>(), database);
+        QVERIFY2(controller.openError().isEmpty(), qPrintable(controller.openError()));
+        if (!receiptInitiallyReady) {
+            // Startup correctly recovers tools left Running by a previous
+            // process. This case represents a current in-flight parent instead,
+            // so publish its active checkpoint after the controller is alive.
+            auto opened = makeMaiSqliteStore(database.toStdString());
+            QVERIFY(opened);
+            auto store = std::move(opened.value());
+            for (int batch = 0; batch < 2; ++batch) {
+                MaiMessage message;
+                QVERIFY(store->getMessage(root.toStdString(), "msg_timeline_" + std::to_string(batch + 1), message));
+                message.completed = 0;
+                for (auto& part : message.parts)
+                    if (auto* tool = std::get_if<MaiToolPart>(&part.body)) {
+                        tool->state = MaiToolState::Running;
+                        tool->output.clear();
+                        tool->error.clear();
+                    }
+                store->putMessage(root.toStdString(), message);
+            }
+            QVERIFY(!store->lastWriteError().hasError());
+        }
+        AgentChatPanel panel(controller);
+        panel.resize(1100, 1000);
+        panel.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&panel));
+        panel.openSession(root);
+        auto* view = panel.findChild<MarkdownView*>();
+        QVERIFY(view);
+        QVERIFY(view->contains(after.last()));
+        // Metadata and first output arrive after both parent batches were rendered.
+        // This is an external store writer, not a paid model or an in-memory child mock.
+        {
+            auto opened = makeMaiSqliteStore(database.toStdString());
+            QVERIFY(opened);
+            auto store = std::move(opened.value());
+            for (int index = 0; index < children.size(); ++index) {
+                MaiSession child;
+                child.id = children[index].toStdString();
+                child.title = tasks[index].toStdString();
+                child.directory = storage.path().toStdString();
+                child.parentId = root.toStdString();
+                child.depth = 1;
+                child.created = child.updated = 1000 + index;
+                store->putSession(child);
+                MaiMessage report;
+                report.id = "msg_" + child.id;
+                report.role = MaiRole::Assistant;
+                report.created = report.completed = 2000 + index;
+                report.parts.push_back({"prt_" + child.id, MaiTextPart{"本地子任务检查结果"}, report.created});
+                if (!receiptInitiallyReady && index == 0) {
+                    MaiToolPart question;
+                    question.tool = "question";
+                    question.input = R"({"question":"Which local fixture should I inspect?"})";
+                    question.output = "The current fixture";
+                    question.state = MaiToolState::Completed;
+                    report.parts.push_back({"prt_timeline_002x_question", std::move(question), 103});
+                }
+                store->putMessage(child.id, report);
+            }
+            QVERIFY(!store->lastWriteError().hasError());
+        }
+        QCOMPARE(controller.subAgents(root).size(), std::size_t(4));
+        const auto publish = [&](int index, const std::string& text) {
+            MaiEvent event;
+            event.id = "evt_timeline_" + std::to_string(index);
+            event.type = MaiEventType::MessagePartDelta;
+            event.sessionId = children[index].toStdString();
+            event.messageId = "msg_" + event.sessionId;
+            event.partId = "prt_" + event.sessionId;
+            event.field = "text";
+            event.delta = text;
+            controller.agent().eventBus().publish(event);
+        };
+        // Reverse arrival order must not reverse either batch or move batch one
+        // below the later parent message and its independent batch two.
+        for (int index = children.size() - 1; index >= 0; --index) publish(index, "本地子任务检查结果");
+        QTRY_VERIFY_WITH_TIMEOUT(view->contains(QStringLiteral("sub-") + children.front()), 3000);
+        if (!receiptInitiallyReady) {
+            MaiEvent question;
+            question.type = MaiEventType::MessagePartUpdated;
+            question.sessionId = children.front().toStdString();
+            question.messageId = "msg_" + question.sessionId;
+            question.partId = "prt_timeline_002x_question";
+            controller.agent().eventBus().publish(question);
+            QTRY_VERIFY(view->contains(QStringLiteral("prt_timeline_002x_question-question")));
+            auto opened = makeMaiSqliteStore(database.toStdString());
+            QVERIFY(opened);
+            auto store = std::move(opened.value());
+            for (int batch = 0; batch < 2; ++batch) {
+                MaiMessage message;
+                QVERIFY(store->getMessage(root.toStdString(), "msg_timeline_" + std::to_string(batch + 1), message));
+                for (int index = 2 * batch; index < 2 * batch + 2; ++index) {
+                    auto* tool = std::get_if<MaiToolPart>(&message.parts[1 + index % 2].body);
+                    QVERIFY(tool);
+                    tool->output = "Started sub-agent " + children[index].toStdString() + " for \"" +
+                                   tasks[index].toStdString() +
+                                   "\". Use wait_agent with that id when you need its answer.";
+                    tool->state = MaiToolState::Completed;
+                }
+                store->putMessage(root.toStdString(), message);
+                for (int index = 2 * batch; index < 2 * batch + 2; ++index) {
+                    MaiEvent updated;
+                    updated.type = MaiEventType::MessagePartUpdated;
+                    updated.sessionId = root.toStdString();
+                    updated.messageId = message.id;
+                    updated.partId = spawn[index].toStdString();
+                    controller.agent().eventBus().publish(updated);
+                }
+            }
+            QVERIFY(!store->lastWriteError().hasError());
+        }
+        QTRY_VERIFY2_WITH_TIMEOUT(orderFailure(view).isEmpty(), qPrintable(orderFailure(view)), 3000);
+        if (!receiptInitiallyReady) {
+            const QString question = QStringLiteral("prt_timeline_002x_question-question");
+            QTRY_VERIFY(view->itemRect(QStringLiteral("sub-") + children.front()).bottom() <= view->itemRect(question).top());
+            QTRY_VERIFY(view->itemRect(question).bottom() <= view->itemRect(QStringLiteral("tool-group-") + spawn[1]).top());
+        }
+        QVERIFY(captureAgentFixture(panel, QStringLiteral("sub-agent-timeline-live") + evidenceSuffix));
+        const auto originalCards = panel.findChildren<QFrame*>(QStringLiteral("agentSubTaskCard"));
+        QCOMPARE(originalCards.size(), 4);
+        const QPointer<QFrame> retained = originalCards.front();
+        const QString other = controller.createSession(storage.path(), QStringLiteral("Timeline warm page"));
+        panel.openSession(other);
+        publish(0, " late status while cached");
+        QCoreApplication::processEvents();
+        panel.openSession(root);
+        QTRY_VERIFY2_WITH_TIMEOUT(orderFailure(view).isEmpty(), qPrintable(orderFailure(view)), 3000);
+        QVERIFY(retained);
+        QTRY_VERIFY(retained && retained->isVisible());
+        publish(0, " final status");
+        QTRY_VERIFY2_WITH_TIMEOUT(orderFailure(view).isEmpty(), qPrintable(orderFailure(view)), 3000);
+        QCOMPARE(panel.findChildren<QFrame*>(QStringLiteral("agentSubTaskCard")).size(), 4);
+        QVERIFY(captureAgentFixture(panel, QStringLiteral("sub-agent-timeline-warm") + evidenceSuffix));
+    }
+    // New controller and panel reopen the actual SQLite file, with no retained
+    // page, live child event cache, or active sub-agent process to preserve order.
+    AgentController restored(std::make_unique<SilentModel>(), database);
+    QVERIFY2(restored.openError().isEmpty(), qPrintable(restored.openError()));
+    AgentChatPanel panel(restored);
+    panel.resize(1100, 1000);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    panel.openSession(root);
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    QTRY_VERIFY2_WITH_TIMEOUT(orderFailure(view).isEmpty(), qPrintable(orderFailure(view)), 3000);
+    QCOMPARE(panel.findChildren<QFrame*>(QStringLiteral("agentSubTaskCard")).size(), 4);
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("sub-agent-timeline-cold") + evidenceSuffix));
+}
+
+void AgentPanelSessionTest::subAgentCardsWaitForTheirHistoryPage() {
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    const QString database = storage.filePath(QStringLiteral("sub-agent-paging.db"));
+    const std::string root = "ses_sub_agent_paging_root";
+    const QString childId = QStringLiteral("ses_sub_agent_paging_child");
+    const QString before = QStringLiteral("prt_paging_000_before");
+    const QString spawn = QStringLiteral("prt_paging_001_spawn");
+    const QString after = QStringLiteral("prt_paging_002_after");
+    {
+        auto opened = makeMaiSqliteStore(database.toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        MaiSession session;
+        session.id = root;
+        session.directory = storage.path().toStdString();
+        session.created = session.updated = 1;
+        store->putSession(session);
+        MaiSession child = session;
+        child.id = childId.toStdString();
+        child.parentId = root;
+        child.title = "Earlier-page child";
+        child.depth = 1;
+        // An old assistant can spawn after >40 later steering inputs. Its
+        // child's newer creation time must not fabricate a visible tail anchor.
+        child.created = child.updated = 10000;
+        store->putSession(child);
+        for (int index = 0; index < 45; ++index) {
+            MaiMessage message;
+            message.id = QStringLiteral("msg_sub_agent_paging_%1").arg(index, 4, 10, QLatin1Char('0')).toStdString();
+            message.role = index == 0 ? MaiRole::Assistant : MaiRole::User;
+            message.created = index + 1;
+            message.completed = index == 0 ? 0 : message.created;
+            if (index == 0) {
+                MaiToolPart tool;
+                tool.tool = "spawn_agent";
+                tool.callId = "call_earlier_spawn";
+                tool.input = R"({"task_name":"Earlier-page child","prompt":"Local fixture"})";
+                tool.output = "Started sub-agent " + child.id +
+                              " for \"Earlier-page child\". Use wait_agent with that id when you need its answer.";
+                tool.state = MaiToolState::Completed;
+                message.parts.push_back({before.toStdString(), MaiTextPart{"Earlier parent before spawn"}, 1});
+                message.parts.push_back({spawn.toStdString(), std::move(tool), 2});
+                message.parts.push_back({after.toStdString(), MaiTextPart{"Earlier parent after spawn"}, 3});
+            } else {
+                message.parts.push_back({"prt_" + message.id, MaiTextPart{"Later parent message"}, index + 1});
+            }
+            store->putMessage(root, message);
+        }
+        QVERIFY(!store->lastWriteError().hasError());
+    }
+    AgentController controller(std::make_unique<SilentModel>(), database);
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 700);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    panel.openSession(QString::fromStdString(root));
+    auto* view = panel.findChild<MarkdownView*>();
+    auto* older = panel.findChild<QPushButton*>(QStringLiteral("agentLoadEarlierButton"));
+    QVERIFY(view && older && !older->isHidden());
+    const QString card = QStringLiteral("sub-") + childId;
+    QVERIFY(!view->contains(before));
+    QVERIFY2(!view->contains(card), "A child whose spawn is outside the loaded history must not appear at the tail");
+    older->click();
+    QTRY_VERIFY(view->contains(before));
+    QTRY_VERIFY(view->contains(card));
+    const QString group = QStringLiteral("tool-group-") + spawn;
+    QTRY_VERIFY(view->contains(group));
+    QTRY_VERIFY(view->itemRect(before).bottom() <= view->itemRect(group).top());
+    QTRY_VERIFY(view->itemRect(group).bottom() <= view->itemRect(card).top());
+    QTRY_VERIFY(view->itemRect(card).bottom() <= view->itemRect(after).top());
+    QTRY_VERIFY(view->itemRect(after).bottom() <= view->itemRect(QStringLiteral("msg_sub_agent_paging_0001")).top());
+    view->verticalScrollBar()->setValue(qMax(0, qRound(view->itemRect(before).top()) - 20));
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("sub-agent-timeline-paged")));
 }
 
 void AgentPanelSessionTest::approvalFromAnotherSessionIsStillShown() {

@@ -5,7 +5,6 @@
 
 #include <QDir>
 #include <QHash>
-#include <QHBoxLayout>
 #include <QLabel>
 #include <QListWidget>
 #include <QMenu>
@@ -23,7 +22,6 @@
 namespace {
 
 // 配色取自 MainWindow.cpp，别在这儿另起一套。
-const char* const kInk = "#172033";
 const char* const kInkFaint = "#98a2b3";
 const char* const kLine = "#e2e8f0";
 const char* const kAccent = "#0b67b7";
@@ -109,6 +107,8 @@ public:
                                   online ? QStringLiteral("在线") : QStringLiteral("离线"));
                 textRight = status.left() - UiZoom::s(5);
                 if (online) textRight = deviceCreateRect(option.rect).left() - UiZoom::s(5);
+            } else {
+                textRight = deviceCreateRect(option.rect).left() - UiZoom::s(5);
             }
             const QRect title(card.left() + UiZoom::s(28), card.top(),
                               textRight - card.left() - UiZoom::s(28), card.height());
@@ -207,6 +207,7 @@ struct DeviceGroup {
 struct AgentSessionList::Runtime {
     AgentController* controller = nullptr;
     QListWidget* list = nullptr;
+    QPushButton* localCreate = nullptr;
     QString current;
     QString currentRemote;
     QJsonArray remoteSessions;
@@ -227,23 +228,6 @@ AgentSessionList::AgentSessionList(AgentController& controller, QWidget* parent)
     column->setContentsMargins(0, 0, 0, 0);
     column->setSpacing(0);
 
-    // ---- 新对话 ----
-    auto* head = new QWidget(this);
-    head->setStyleSheet(QStringLiteral("QWidget{background:transparent;border:none;}"));
-    auto* headRow = new QHBoxLayout(head);
-    headRow->setContentsMargins(UiZoom::s(12), UiZoom::s(12), UiZoom::s(12), UiZoom::s(8));
-    auto* newButton = new QPushButton(QStringLiteral("＋  新对话"));
-    newButton->setCursor(Qt::PointingHandCursor);
-    UiZoom::setStyle(newButton,
-        QStringLiteral("QPushButton{background:#ffffff;color:%1;border:1px solid %2;"
-                       "border-radius:8px;padding:7px 10px;text-align:left;}"
-                       "QPushButton:hover{background:%3;border-color:%4;color:%4;}")
-            .arg(kInk, kLine, kAccentWash, kAccent));
-    QFont newFont = newButton->font();
-    UiZoom::setFont(newButton, UiZoom::TextRole::Body, newFont);
-    headRow->addWidget(newButton);
-    column->addWidget(head);
-
     // ---- 会话 ----
     runtime_->list = new QListWidget(this);
     runtime_->list->setFrameShape(QFrame::NoFrame);
@@ -258,8 +242,25 @@ AgentSessionList::AgentSessionList(AgentController& controller, QWidget* parent)
         "QListWidget::item{background:transparent;}"));
     column->addWidget(runtime_->list, 1);
 
-    connect(newButton, &QPushButton::clicked, this,
+    // 本机与远端的新建入口都放在设备标题中。使用真实按钮保留键盘与辅助功能，
+    // 但它跟随 viewport 内的标题位置，不再占据列表上方的独立一行。
+    runtime_->localCreate = new QPushButton(QStringLiteral("+"), runtime_->list->viewport());
+    runtime_->localCreate->setObjectName(QStringLiteral("agentLocalCreateSessionButton"));
+    runtime_->localCreate->setAccessibleName(QStringLiteral("在此电脑新建对话"));
+    runtime_->localCreate->setToolTip(QStringLiteral("新建对话"));
+    runtime_->localCreate->setCursor(Qt::PointingHandCursor);
+    UiZoom::setFont(runtime_->localCreate, UiZoom::TextRole::Title, runtime_->localCreate->font());
+    UiZoom::setStyle(runtime_->localCreate, QStringLiteral(
+        "QPushButton{background:transparent;border:none;padding:0;color:%1;border-radius:4px;}"
+        "QPushButton:hover,QPushButton:focus{background:%2;}"
+        "QPushButton:pressed{background:#dbe7f1;}").arg(kAccent, kAccentWash));
+    runtime_->localCreate->hide();
+    connect(runtime_->localCreate, &QPushButton::clicked, this,
             [this] { emit newSessionRequested(); });
+    connect(runtime_->list->verticalScrollBar(), &QScrollBar::valueChanged, this,
+            [this] { updateLocalCreateButton(); });
+    connect(runtime_->list->verticalScrollBar(), &QScrollBar::rangeChanged, this,
+            [this] { updateLocalCreateButton(); });
     connect(runtime_->list->viewport(), &QWidget::customContextMenuRequested, this,
             [this](const QPoint& position) {
                 QListWidgetItem* item = runtime_->list->itemAt(position);
@@ -302,7 +303,23 @@ AgentSessionList::AgentSessionList(AgentController& controller, QWidget* parent)
 
 AgentSessionList::~AgentSessionList() = default;
 
+void AgentSessionList::updateLocalCreateButton() {
+    if (!runtime_->localCreate) return;
+    QListWidgetItem* header = runtime_->list->item(0);
+    if (!header || header->data(Qt::UserRole + 3).toString() != QStringLiteral("local")) {
+        runtime_->localCreate->hide();
+        return;
+    }
+    // 与远端标题复用同一命中矩形；滚动出视口时隐藏，避免按钮浮在别的会话上。
+    const QRect geometry = deviceCreateRect(runtime_->list->visualItemRect(header));
+    runtime_->localCreate->setGeometry(geometry);
+    runtime_->localCreate->setVisible(runtime_->list->viewport()->rect().intersects(geometry));
+}
+
 bool AgentSessionList::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == runtime_->list->viewport() &&
+        (event->type() == QEvent::Resize || event->type() == QEvent::Show || event->type() == QEvent::Paint))
+        updateLocalCreateButton();
     if (watched == runtime_->list->viewport() &&
         (event->type() == QEvent::MouseButtonPress ||
          event->type() == QEvent::MouseButtonRelease)) {
@@ -400,7 +417,7 @@ void AgentSessionList::refresh() {
         item->setData(Qt::UserRole + 7, remote);
         item->setData(Qt::UserRole + 8, collapsed);
         item->setData(Qt::UserRole + 9, device);
-        if (remote && online) item->setToolTip(QStringLiteral("点 + 可在此设备新建对话"));
+        if (!remote || online) item->setToolTip(QStringLiteral("点 + 可在此设备新建对话"));
         item->setFlags(Qt::ItemIsEnabled);
         item->setSizeHint(QSize(0, UiZoom::s(42)));
         runtime_->list->addItem(item);
@@ -408,13 +425,12 @@ void AgentSessionList::refresh() {
     // listSessions 已经按 updated 倒序，最近动过的在最上面——和 IM 那边的会话列表一致。
     const auto localSessions = runtime_->controller->agent().listSessions();
     const QString localGroup = QStringLiteral("local");
-    if (!localSessions.empty()) {
+    // 空账户也保留本机标题和 +，首次新建与已有会话使用同一个入口。
 #ifdef Q_OS_WIN
-        addHeader(localGroup, QStringLiteral("这台 Windows 电脑"), int(localSessions.size()), false);
+    addHeader(localGroup, QStringLiteral("这台 Windows 电脑"), int(localSessions.size()), false);
 #else
-        addHeader(localGroup, QStringLiteral("这台 Mac"), int(localSessions.size()), false);
+    addHeader(localGroup, QStringLiteral("这台 Mac"), int(localSessions.size()), false);
 #endif
-    }
     if (!runtime_->collapsedDevices.contains(localGroup)) {
         for (const MaiSession& session : localSessions) {
             const QString sessionId = fromUtf8(session.id);
@@ -481,13 +497,14 @@ void AgentSessionList::refresh() {
         }
     }
 
-    if (runtime_->list->count() == 0) {
+    if (localSessions.empty() && groups.isEmpty() && !runtime_->collapsedDevices.contains(localGroup)) {
         auto* empty = new QListWidgetItem(QStringLiteral("还没有对话"));
         empty->setFlags(Qt::NoItemFlags);
         empty->setForeground(QColor(kInkFaint));
         runtime_->list->addItem(empty);
     }
     runtime_->list->verticalScrollBar()->setValue(scroll);
+    updateLocalCreateButton();
 }
 
 void AgentSessionList::setRemoteDevices(const QJsonArray& devices) {

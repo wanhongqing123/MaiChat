@@ -732,12 +732,14 @@ void DesktopSessionSyncHostTest::sessionListOffersLifecycleActionsForRemoteDevic
     sessions.show();
     auto* list = sessions.findChild<QListWidget*>();
     QVERIFY(list);
-    QCOMPARE(list->count(), 1);
-    QVERIFY(list->item(0)->text().contains(QStringLiteral("0")));
+    // The empty local device keeps its + entry; the remote header follows it.
+    QCOMPARE(list->count(), 2);
+    QVERIFY(list->item(0)->text().contains(QStringLiteral("这台")));
+    QVERIFY(list->item(1)->text().contains(QStringLiteral("0")));
     if (qEnvironmentVariableIsSet("MAICHAT_REMOTE_SESSION_SCREENSHOT"))
         QVERIFY(sessions.grab().save(qEnvironmentVariable("MAICHAT_REMOTE_SESSION_SCREENSHOT")));
     QSignalSpy create(&sessions, &AgentSessionList::remoteCreateRequested);
-    const QRect header = list->visualItemRect(list->item(0));
+    const QRect header = list->visualItemRect(list->item(1));
     QTest::mouseClick(list->viewport(), Qt::LeftButton, {},
                       QPoint(header.right() - UiZoom::s(100), header.center().y()));
     QCOMPARE(create.size(), 1);
@@ -747,9 +749,9 @@ void DesktopSessionSyncHostTest::sessionListOffersLifecycleActionsForRemoteDevic
     remote.insert(QStringLiteral("id"), QStringLiteral("ses_phone"));
     remote.insert(QStringLiteral("title"), QStringLiteral("手机对话"));
     sessions.setRemoteSessions(QJsonArray{remote});
-    QCOMPARE(list->count(), 2);
+    QCOMPARE(list->count(), 3);
     QSignalSpy remove(&sessions, &AgentSessionList::remoteDeleteRequested);
-    const QRect row = list->visualItemRect(list->item(1));
+    const QRect row = list->visualItemRect(list->item(2));
     QTest::mouseClick(list->viewport(), Qt::LeftButton, {}, QPoint(row.right() - UiZoom::s(25), row.center().y()));
     auto* menu = sessions.findChild<QMenu*>(QStringLiteral("agentRemoteSessionMenu"));
     QVERIFY(menu);
@@ -2257,9 +2259,10 @@ void DesktopSessionSyncHostTest::sessionListSeparatesDevicesWithTheSameModel() {
     sessions.show();
     auto* list = sessions.findChild<QListWidget*>();
     QVERIFY(list);
-    QCOMPARE(list->count(), 4);
-    QVERIFY(list->item(0)->text().contains(QStringLiteral("设备 1")));
-    QVERIFY(list->item(2)->text().contains(QStringLiteral("设备 2")));
+    QCOMPARE(list->count(), 5);
+    QVERIFY(list->item(0)->text().contains(QStringLiteral("这台")));
+    QVERIFY(list->item(1)->text().contains(QStringLiteral("设备 1")));
+    QVERIFY(list->item(3)->text().contains(QStringLiteral("设备 2")));
 }
 
 void DesktopSessionSyncHostTest::remoteQuestionUsesNormalComposerAndExplicitAnswerReceipt() {

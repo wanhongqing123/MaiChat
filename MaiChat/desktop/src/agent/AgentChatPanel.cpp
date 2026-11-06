@@ -1347,6 +1347,9 @@ struct AgentChatPanel::ConversationState {
     QHash<QString, ToolGroupCard*> toolGroups;
     QHash<QString, ToolGroupCard*> toolCardGroups;
     QHash<QString, SubAgentCard*> subAgentCards;
+    // child session -> (parent message, spawn part). Keep receipts even when
+    // the child metadata arrives later, and retain them with the same page.
+    QHash<QString, QPair<QString, QString>> subAgentSpawns;
     // Accumulated Markdown and stable ordering move with their visible items.
     QHash<QString, QString> answers;
     QSet<QString> renderedUserMessages;
@@ -2650,10 +2653,12 @@ void AgentChatPanel::restoreConversationControls(bool activeAssistantHasVisibleA
     for (const MaiSubAgentInfo& info : runtime_->controller->subAgents(runtime_->sessionId)) {
         const QString childId = fromUtf8(info.sessionId);
         noteOtherSession(childId, QString());
+        // A child outside this history page has no displayed spawn receipt.
+        // Do not read its report while restoring only the current page's cards.
+        SubAgentCard* card = runtime_->subAgentCards.value(childId, nullptr);
+        if (!card) continue;
         const auto latest = runtime_->controller->agent().listMessagesPage(info.sessionId, {}, 1);
         if (!latest.empty() && latest.front().role == MaiRole::Assistant) {
-            SubAgentCard* card = runtime_->subAgentCards.value(childId, nullptr);
-            if (!card) continue;
             for (auto part = latest.front().parts.crbegin(); part != latest.front().parts.crend(); ++part) {
                 const auto* text = std::get_if<MaiTextPart>(&part->body);
                 if (!text) continue;
@@ -2733,6 +2738,7 @@ bool AgentChatPanel::appendStoredMessage(const MaiMessage& message, const MaiSes
             card->setCall(fromUtf8(tool->tool), fromUtf8(tool->input));
             card->apply(tool->state, false);
             card->setDetail(tool->state == MaiToolState::Error ? fromUtf8(tool->error) : fromUtf8(tool->output));
+            recordSubAgentSpawn(messageId, part);
             if (tool->state == MaiToolState::Completed && tool->tool == "generate_pdf")
                 appendPdfPreview(fromUtf8(message.id), partId, fromUtf8(tool->output),
                                  fromUtf8(selectedSession.directory));
@@ -3089,7 +3095,8 @@ AgentChatPanel::ToolGroupCard* AgentChatPanel::toolGroupFor(const QString& partI
         }
         // 这些工具在正文流中插入问答或独立产物，后续工具不能跨过它合组。
         const bool separateArtifact =
-            tool->tool == "agent_send_media" || tool->tool == "generate_pdf" || tool->tool == "question";
+            tool->tool == "agent_send_media" || tool->tool == "generate_pdf" || tool->tool == "question" ||
+            tool->tool == "spawn_agent";
         if (separateArtifact || firstTool.isEmpty()) firstTool = fromUtf8(part.id);
         if (fromUtf8(part.id) == partId) {
             groupId = firstTool;
@@ -3187,6 +3194,7 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
                 card->setDetail(fromUtf8(tool->error));
             }
             runtime_->toolCardGroups.value(partId)->setSummary(message, runtime_->toolCards);
+            recordSubAgentSpawn(messageId, part);
             scrollToBottom();
             return;
         }
@@ -3514,12 +3522,57 @@ AgentChatPanel::SubAgentCard* AgentChatPanel::subAgentCardFor(const QString& ses
     auto found = runtime_->subAgentCards.constFind(sessionId);
     if (found != runtime_->subAgentCards.constEnd()) return found.value();
 
+    // A paged transcript must not pull old children below its newest messages.
+    // Visible spawn receipts bypass this guard. Even a newly created child can
+    // belong to an old assistant outside this page after many steering inputs.
+    // A direct host/API spawn without a receipt retains its tail fallback only
+    // when the parent transcript is fully loaded; creation time is not an anchor.
+    if (!runtime_->subAgentSpawns.contains(sessionId) && !runtime_->olderMessages->isHidden()) return nullptr;
+
     auto* card = new SubAgentCard;
     runtime_->view->addWidget(QStringLiteral("sub-") + sessionId, card);
     runtime_->subAgentCards.insert(sessionId, card);
+    positionSubAgentCard(sessionId);
     updateWelcomeVisibility();
     scrollToBottom();
     return card;
+}
+
+void AgentChatPanel::recordSubAgentSpawn(const QString& messageId, const MaiMessagePart& part) {
+    const auto* tool = std::get_if<MaiToolPart>(&part.body);
+    if (!tool || tool->tool != "spawn_agent" || tool->state != MaiToolState::Completed) return;
+    // This is the persisted success contract of MaiSubAgentTools, not a name
+    // guessed from the task prompt or the child's latest completion time.
+    const QString prefix = QStringLiteral("Started sub-agent ");
+    const QString output = fromUtf8(tool->output);
+    if (!output.startsWith(prefix)) return;
+    const QString childId = output.mid(prefix.size()).section(QLatin1Char(' '), 0, 0);
+    if (childId.isEmpty()) return;
+    runtime_->subAgentSpawns.insert(childId, qMakePair(messageId, fromUtf8(part.id)));
+    // noteOtherSession still verifies parent ownership before creating a card.
+    // Metadata can arrive after a replayed receipt, so preserve the association
+    // even when this call cannot create the child widget yet.
+    if (!runtime_->subAgentCards.contains(childId)) noteOtherSession(childId, QString());
+    positionSubAgentCard(childId);
+}
+
+void AgentChatPanel::positionSubAgentCard(const QString& sessionId) {
+    const auto spawn = runtime_->subAgentSpawns.constFind(sessionId);
+    if (spawn == runtime_->subAgentSpawns.constEnd()) return;
+    ToolGroupCard* group = runtime_->toolCardGroups.value(spawn->second, nullptr);
+    const QString cardId = QStringLiteral("sub-") + sessionId;
+    if (!group || !runtime_->view->contains(cardId)) return;
+    const QString anchor = QStringLiteral("tool-group-") + group->id();
+    auto& items = runtime_->messageItems[spawn->first];
+    if (!items.contains(anchor)) return;
+    items.removeAll(cardId);
+    items.insert(items.indexOf(anchor) + 1, cardId);
+    runtime_->view->moveItemAfter(cardId, anchor);
+    // Child questions share the same part timeline. Treat the card as the end
+    // of this spawn without changing following parent text or the quote footer.
+    runtime_->questionTimeline[spawn->second] = QStringList{anchor, cardId};
+    positionQuestionTranscript();
+    if (runtime_->view->contains(spawn->first + QStringLiteral("-quote-action"))) appendQuoteAction(spawn->first);
 }
 
 bool AgentChatPanel::appendQuestionPart(const QString& owner, const QString& messageId, const MaiMessagePart& part) {

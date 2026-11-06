@@ -155,6 +155,8 @@ private slots:
     void aiReplySuggestionOnlyFillsComposer();
     void exposesResizableSplitters();
     void agentConversationListUsesResizableSplitter();
+    void localSessionCreationLivesInTheDeviceHeader_data();
+    void localSessionCreationLivesInTheDeviceHeader();
     void agentAccountsUseDistinctDefaultStorage();
     void agentSessionDeletionUsesChineseProductDialog();
     void remoteSessionLifecycleUsesProductDialogsAndOwnerRoute();
@@ -1812,6 +1814,112 @@ void MainWindowLayoutTest::agentSessionSwitchReusesTheExistingPage() {
     const QString allowed = QDir(dataRoot).canonicalPath() + QStringLiteral("/Agent/Accounts/");
     QVERIFY(!canonical.isEmpty() && canonical.startsWith(allowed) && QFileInfo(canonical).fileName() == accountHash);
     QVERIFY(QDir(canonical).removeRecursively());
+}
+
+void MainWindowLayoutTest::localSessionCreationLivesInTheDeviceHeader_data() {
+    QTest::addColumn<qreal>("zoom");
+    for (const qreal zoom : {0.8, 1.0, 1.5, 2.0})
+        QTest::newRow(qPrintable(QString::number(zoom))) << zoom;
+}
+
+void MainWindowLayoutTest::localSessionCreationLivesInTheDeviceHeader() {
+    QFETCH(qreal, zoom);
+    struct RestoreZoom {
+        qreal previous = UiZoom::factor();
+        ~RestoreZoom() { UiZoom::setFactor(previous); }
+    } restore;
+    UiZoom::setFactor(zoom);
+    AgentController controller(AgentController::ModelConfig{}, QString());
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    AgentSessionList sidebar(controller);
+    sidebar.resize(UiZoom::s(320), UiZoom::s(350));
+    sidebar.refresh();
+    sidebar.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&sidebar));
+    auto* rows = sidebar.findChild<QListWidget*>();
+    auto* create = sidebar.findChild<QPushButton*>(QStringLiteral("agentLocalCreateSessionButton"));
+    QVERIFY(rows && create);
+    // There is one list, with no detached full-width new-conversation row above it.
+    QCOMPARE(sidebar.layout()->count(), 1);
+    QCOMPARE(create->parentWidget(), rows->viewport());
+    QCOMPARE(rows->geometry().top(), 0);
+    QCOMPARE(rows->item(0)->data(Qt::UserRole + 3).toString(), QStringLiteral("local"));
+    QCOMPARE(rows->item(0)->data(Qt::UserRole + 5).toInt(), 0);
+    QCOMPARE(create->text(), QStringLiteral("+"));
+    QVERIFY(!create->accessibleName().isEmpty());
+    QVERIFY(!create->toolTip().isEmpty());
+    const auto verifyPosition = [&] {
+        const QRect header = rows->visualItemRect(rows->item(0));
+        const QRect card = header.adjusted(UiZoom::s(7), UiZoom::s(3), -UiZoom::s(7), -UiZoom::s(3));
+        const QRect expected(card.right() - UiZoom::s(110), card.center().y() - UiZoom::s(13),
+                             UiZoom::s(24), UiZoom::s(27));
+        QCOMPARE(create->geometry(), expected);
+        QVERIFY(header.contains(create->geometry()));
+        QVERIFY(create->isVisible());
+    };
+    verifyPosition();
+    QSignalSpy localRequests(&sidebar, &AgentSessionList::newSessionRequested);
+    QSignalSpy remoteRequests(&sidebar, &AgentSessionList::remoteCreateRequested);
+    QTest::mouseClick(create, Qt::LeftButton);
+    QCOMPARE(localRequests.count(), 1);
+    QCOMPARE(remoteRequests.count(), 0);
+    QVERIFY(!rows->item(0)->data(Qt::UserRole + 8).toBool());
+    create->setFocus();
+    QTest::keyClick(create, Qt::Key_Space);
+    QCOMPARE(localRequests.count(), 2);
+
+    // New local sessions, collapse/expand and catalog refresh reuse the header action.
+    const QString id = controller.createSession(workspace.path());
+    QVERIFY(!id.isEmpty());
+    QPointer<QPushButton> original(create);
+    sidebar.refresh();
+    QCOMPARE(sidebar.findChild<QPushButton*>(QStringLiteral("agentLocalCreateSessionButton")), original.data());
+    QTest::mouseClick(rows->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      rows->visualItemRect(rows->item(0)).topLeft() + QPoint(UiZoom::s(35), UiZoom::s(21)));
+    QVERIFY(rows->item(0)->data(Qt::UserRole + 8).toBool());
+    QTest::mouseClick(create, Qt::LeftButton);
+    QCOMPARE(localRequests.count(), 3);
+    QVERIFY(rows->item(0)->data(Qt::UserRole + 8).toBool());
+    verifyPosition();
+    sidebar.resize(UiZoom::s(400), UiZoom::s(350));
+    QCoreApplication::processEvents();
+    verifyPosition();
+
+    const QJsonObject remote{{QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
+                             {QStringLiteral("device_id"), QStringLiteral("header-test-phone")},
+                             {QStringLiteral("device_name"), QStringLiteral("iPhone")},
+                             {QStringLiteral("online"), true}};
+    sidebar.setRemoteDevices(QJsonArray{remote});
+    QListWidgetItem* remoteHeader = nullptr;
+    for (int row = 0; row < rows->count(); ++row)
+        if (rows->item(row)->data(Qt::UserRole + 7).toBool()) remoteHeader = rows->item(row);
+    QVERIFY(remoteHeader);
+    const QRect remoteCard = rows->visualItemRect(remoteHeader).adjusted(
+        UiZoom::s(7), UiZoom::s(3), -UiZoom::s(7), -UiZoom::s(3));
+    const QPoint remotePlus(remoteCard.right() - UiZoom::s(110) + UiZoom::s(12), remoteCard.center().y());
+    QTest::mouseClick(rows->viewport(), Qt::LeftButton, Qt::NoModifier, remotePlus);
+    QCOMPARE(remoteRequests.count(), 1);
+    QCOMPARE(localRequests.count(), 3);
+    QVERIFY(!remoteHeader->data(Qt::UserRole + 8).toBool());
+    // A scrolled-out local header must not leave its floating action over remote rows.
+    for (int index = 0; index < 12; ++index) QVERIFY(!controller.createSession(workspace.path()).isEmpty());
+    QTest::mouseClick(rows->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      rows->visualItemRect(rows->item(0)).topLeft() + QPoint(UiZoom::s(35), UiZoom::s(21)));
+    QVERIFY(!rows->item(0)->data(Qt::UserRole + 8).toBool());
+    sidebar.refresh();
+    rows->verticalScrollBar()->setValue(rows->verticalScrollBar()->maximum());
+    QTRY_VERIFY(!create->isVisible());
+    rows->verticalScrollBar()->setValue(0);
+    QTRY_VERIFY(create->isVisible());
+    verifyPosition();
+    QCOMPARE(localRequests.count(), 3);
+    QCOMPARE(remoteRequests.count(), 1);
+    const QString output = qEnvironmentVariable("MAICHAT_SESSION_HEADER_CAPTURE_DIR");
+    if (!output.isEmpty()) {
+        QVERIFY(QDir().mkpath(output));
+        QVERIFY(sidebar.grab().save(QDir(output).filePath(QStringLiteral("session-header-%1.png").arg(zoom))));
+    }
 }
 
 void MainWindowLayoutTest::agentAccountsUseDistinctDefaultStorage() {
