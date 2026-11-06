@@ -71,3 +71,15 @@ house-maichat 使用冻结源码和原 cl 命令作 RED/GREEN：原文件 exit 2
 使 YuNet / 人体分割资源确实存在，Mac Vision 的通过结论不能替代 Windows 资源入口。
 上述修正统一进入最终冻结提交；Windows 保留输入未变化的编译缓存，在新 HEAD 下继续
 增量构建及首次完整门禁，正式安装包、草稿目标与两端 manifest 均采用最终完整 SHA。
+
+Windows 继续完整目标构建又实际复现独立 PDF 测试的 UiZoom::setStyle 链接缺失。
+只加 UiZoom 对象仍缺六个 Markdown 符号；house-maichat 用冻结目标的原参数加
+UiZoom + maichat_markdown + 其传递依赖 mai_md4c 后链接 exit 0。收到 673B 补丁并
+核对 SHA256 6559a2383eb446065f3c2465c61b731dabc6c819f97c0139ea3e88c4fa29361c 后，
+仅在 WIN32 分支补全独立测试依赖；运行结果仍以最终 Windows 门禁为准。
+图像引擎恢复无关格式，最终相对 0277 仅保留顶部 Windows 宏保护，不改变处理算法。
+
+Mac 另用私有 Qt 解码探针读取合成 2×2 WebP，在纯系统 PATH 下成功；实际动态加载记录
+确认 Qt imageformats/WebP/SharpYUV 全从部署 App 内加载，未加载 Homebrew 库。该探针
+只用于打包验收，不进入产品，也不使用用户素材；此前 ffmpeg 缺编码器及探针首次头文件
+路径错误已修正，未将这两次准备失败算作成功验证。

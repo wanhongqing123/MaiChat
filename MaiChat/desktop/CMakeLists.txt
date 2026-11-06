@@ -1506,7 +1506,9 @@ endif()
 add_executable(pdf_preview_dialog_test tests/PdfPreviewDialogTest.cpp)
 target_link_libraries(pdf_preview_dialog_test PRIVATE maichat_pdf_preview Qt5::Test)
 if(WIN32)
-  target_link_libraries(pdf_preview_dialog_test PRIVATE Qt5::Concurrent)
+  # 独立 Windows PDF 测试也需 UiZoom 及其文本刷新依赖；与产品使用同一 Markdown 实现。
+  target_sources(pdf_preview_dialog_test PRIVATE src/ui/UiZoom.cpp)
+  target_link_libraries(pdf_preview_dialog_test PRIVATE Qt5::Concurrent maichat_markdown)
 endif()
 
 if(WIN32 AND MAICHAT_ENABLE_FFMPEG)
