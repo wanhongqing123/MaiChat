@@ -77,6 +77,7 @@
 #include "MaiPathGuard.h"
 #include "MaiQuestionTranscript.h"
 #include "agent/AgentController.h"
+#include "agent/AgentToolGroupWidget.h"
 #include "markdown/MarkdownView.h"
 #include "ui/ComposerResizeSplitter.h"
 #include "ui/ComposerTextEdit.h"
@@ -1231,54 +1232,20 @@ private:
     bool rememberOnApproval_ = false;
 };
 
-class AgentChatPanel::ToolGroupCard final : public QFrame {
+class AgentChatPanel::ToolGroupCard final : public AgentToolGroupWidget {
 public:
-    explicit ToolGroupCard(const QString& id, QWidget* parent = nullptr) : QFrame(parent), id_(id) {
-        setObjectName(QStringLiteral("agentToolGroup"));
-        setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
-        auto* column = new QVBoxLayout(this);
-        column->setContentsMargins(0, 0, 0, 0);
-        column->setSpacing(UiZoom::s(4));
-        summary_ = new QPushButton(this);
-        summary_->setObjectName(QStringLiteral("agentToolGroupDisclosure"));
-        summary_->setCursor(Qt::PointingHandCursor);
-        UiZoom::setStyle(summary_,
-                         QStringLiteral("QPushButton#agentToolGroupDisclosure{background:transparent;border:none;"
-                                        "color:#667085;font-size: @metadata;text-align:left;padding:3px 0;}"
-                                        "QPushButton#agentToolGroupDisclosure:hover{color:#0b67b7;}"));
-        column->addWidget(summary_);
-        details_ = new QWidget(this);
-        detailsLayout_ = new QVBoxLayout(details_);
-        detailsLayout_->setContentsMargins(UiZoom::s(12), 0, 0, 0);
-        detailsLayout_->setSpacing(UiZoom::s(2));
-        details_->hide();
-        column->addWidget(details_);
-        QObject::connect(summary_, &QPushButton::clicked, this, [this] {
-            autoExpanded_ = false;
-            setExpanded(!details_->isVisible());
-        });
-    }
+    explicit ToolGroupCard(const QString& id, QWidget* parent = nullptr) : AgentToolGroupWidget(id, parent) {}
 
     void addCard(ToolCard* card) {
-        detailsLayout_->addWidget(card);
+        addDetail(card);
     }
 
     void removeCard(ToolCard* card) {
-        detailsLayout_->removeWidget(card);
-        card->hide();
-        card->deleteLater();
+        removeDetail(card);
     }
 
     int cardCount() const {
-        return detailsLayout_->count();
-    }
-    const QString& id() const {
-        return id_;
-    }
-
-    void setExpanded(bool expanded) {
-        details_->setVisible(expanded);
-        refreshTitle();
+        return detailCount();
     }
 
     void showApproval() {
@@ -1287,46 +1254,31 @@ public:
     }
 
     void setSummary(const MaiMessage& message, const QHash<QString, ToolCard*>& visibleCards) {
-        int count = 0;
+        QStringList states;
         bool running = false;
         bool pending = false;
-        bool failed = false;
-        bool canceled = false;
         for (const MaiMessagePart& part : message.parts) {
             const auto* tool = std::get_if<MaiToolPart>(&part.body);
             // 同一 assistant 消息可以有多个连续工具组，摘要只统计本组所属卡片。
             ToolCard* card = visibleCards.value(fromUtf8(part.id), nullptr);
             if (!tool || !card || !isAncestorOf(card)) continue;
-            ++count;
+            states.append(QString::fromLatin1(maiToolStateToString(tool->state)));
             running |= tool->state == MaiToolState::Running;
             pending |= tool->state == MaiToolState::Pending;
-            failed |= tool->state == MaiToolState::Error;
-            canceled |= tool->state == MaiToolState::Canceled;
         }
-        const QString state = running    ? QStringLiteral("运行中")
-                              : pending  ? QStringLiteral("等待授权")
-                              : failed   ? QStringLiteral("有失败")
-                              : canceled ? QStringLiteral("部分取消")
-                                         : QStringLiteral("已完成");
-        title_ = QStringLiteral("工具调用 %1 次 · %2").arg(count).arg(state);
+        setTitle(agentToolGroupTitle(states));
         if (!running && !pending && autoExpanded_) {
             autoExpanded_ = false;
             setExpanded(false);
         }
-        refreshTitle();
+    }
+
+protected:
+    void disclosureClicked() override {
+        autoExpanded_ = false;
     }
 
 private:
-    void refreshTitle() {
-        summary_->setText(
-            QStringLiteral("⌘  %1  %2").arg(title_, details_->isVisible() ? QStringLiteral("⌄") : QStringLiteral("›")));
-    }
-
-    QPushButton* summary_ = nullptr;
-    QWidget* details_ = nullptr;
-    QVBoxLayout* detailsLayout_ = nullptr;
-    QString title_;
-    QString id_;
     bool autoExpanded_ = false;
 };
 

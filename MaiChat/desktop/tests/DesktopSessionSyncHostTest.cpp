@@ -5,6 +5,9 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QAbstractButton>
+#include <QDir>
+#include <QFrame>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -13,11 +16,13 @@
 #include <QQueue>
 #include <QSet>
 #include <QScopeGuard>
+#include <QScrollBar>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTextEdit>
 #include <QTest>
 #include <QTimer>
+#include <QWindow>
 #include <QtConcurrent>
 
 #include <atomic>
@@ -187,6 +192,11 @@ private slots:
     void remoteRejectedQuestionRecoveryKeepsItsQuestionBinding();
     void remoteQuestionPartsInterleaveWithLaterParentProgress();
     void remoteOldOwnerUpdatesStayOutsideRootHistoryCursor();
+    void remoteToolGroupsKeepMetadataOutsideOrdinaryText();
+    void remoteToolGroupsRetainExpandedObjectsDuringUpdatesAndPrepend();
+    void remoteLegacyToolSnapshotsSplitAtQuestionsAndMediaWithoutLeakingDetails();
+    void remoteQuestionAppendRetainsExistingTextSelectionAndToolGroup();
+    void remoteChildQuestionProjectionRetainsLaterTextIdentityAndToolGroups();
 };
 
 void DesktopSessionSyncHostTest::ownerQuestionAnswersRequireMatchingConversationAndReceipt() {
@@ -2599,6 +2609,464 @@ void DesktopSessionSyncHostTest::remoteOldOwnerUpdatesStayOutsideRootHistoryCurs
     view->selectAll();
     QCOMPARE(view->selectedText().count(QStringLiteral("New progress from old owner")), 1);
     QCOMPARE(view->selectedText().count(QStringLiteral("Older half stays paged out")), 1);
+}
+
+void DesktopSessionSyncHostTest::remoteToolGroupsKeepMetadataOutsideOrdinaryText() {
+    // Exercise the real remote transcript renderer using only an owner snapshot;
+    // tools have no locally available arguments/results and must stay separate
+    // from selectable answer text, with the same compact disclosure as local runs.
+    QTemporaryDir spool;
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
+    panel.resize(1000, 740);
+    const QJsonObject owner{{QStringLiteral("id"), QStringLiteral("ses_remote_tool_style")},
+                           {QStringLiteral("device_slot"), QStringLiteral("remote_tool_owner")},
+                           {QStringLiteral("login_session_id"), QStringLiteral("tool_style_login")},
+                           {QStringLiteral("online"), true}};
+    panel.openSession(owner);
+    const auto textPart = [](const QString& id, const QString& text, int created) {
+        return QJsonObject{{QStringLiteral("id"), id},
+                           {QStringLiteral("kind"), QStringLiteral("text")},
+                           {QStringLiteral("created"), created},
+                           {QStringLiteral("text"), text}};
+    };
+    const auto toolPart = [](const QString& id, const QString& tool, const QString& state, int created) {
+        return QJsonObject{{QStringLiteral("id"), id},
+                           {QStringLiteral("kind"), QStringLiteral("tool")},
+                           {QStringLiteral("created"), created},
+                           {QStringLiteral("tool"), tool},
+                           {QStringLiteral("state"), state}};
+    };
+    const QJsonObject message{
+        {QStringLiteral("id"), QStringLiteral("msg_remote_tool_style")},
+        {QStringLiteral("role"), QStringLiteral("assistant")},
+        {QStringLiteral("created"), 1000},
+        {QStringLiteral("parts"),
+         QJsonArray{textPart(QStringLiteral("part_style_a"), QStringLiteral("开始检查工作区。"), 1001),
+                    toolPart(QStringLiteral("part_style_shell"), QStringLiteral("shell"), QStringLiteral("running"),
+                             1002),
+                    QJsonObject{{QStringLiteral("id"), QStringLiteral("part_private_reasoning")},
+                                {QStringLiteral("kind"), QStringLiteral("reasoning")},
+                                {QStringLiteral("created"), 1003},
+                                {QStringLiteral("text"), QStringLiteral("Private reasoning must not become a row")}},
+                    toolPart(QStringLiteral("part_style_search"), QStringLiteral("file_grep"),
+                             QStringLiteral("completed"), 1004),
+                    textPart(QStringLiteral("part_style_b"), QStringLiteral("工作区干净，继续核对分支。"), 1005),
+                    toolPart(QStringLiteral("part_style_last"), QStringLiteral("shell"), QStringLiteral("completed"),
+                             1006),
+                    textPart(QStringLiteral("part_style_c"), QStringLiteral("分支已核对完成。"), 1007)}}};
+    panel.receivePayload(owner, QStringLiteral("history_page"),
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+    panel.show();
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    const auto groups = panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup"));
+    QCOMPARE(groups.size(), 2);
+    QVERIFY(view->contains(QStringLiteral("remote-tool-group:part_style_shell")));
+    QVERIFY(view->contains(QStringLiteral("remote-tool-group:part_style_last")));
+    auto* first = groups.first()->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure"));
+    auto* second = groups.last()->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure"));
+    QVERIFY(first && second);
+    QVERIFY(first->text().contains(QStringLiteral("工具调用 2 次")));
+    QVERIFY(first->text().contains(QStringLiteral("运行中")));
+    QVERIFY(second->text().contains(QStringLiteral("工具调用 1 次")));
+    QVERIFY(second->text().contains(QStringLiteral("已完成")));
+    QCOMPARE(first->font().pixelSize(), UiZoom::textPixels(UiZoom::TextRole::Metadata));
+    QVERIFY(first->font().pixelSize() < UiZoom::textPixels(UiZoom::TextRole::Body));
+    QTRY_VERIFY(first->palette().color(QPalette::ButtonText).lightness() > 100);
+    const auto details = groups.first()->findChildren<QLabel*>(QStringLiteral("remoteAgentToolDetail"));
+    QCOMPARE(details.size(), 2);
+    for (QLabel* detail : details) QVERIFY(!detail->isVisibleTo(groups.first()));
+    const QString capture = qEnvironmentVariable("MAICHAT_REMOTE_TOOLS_CAPTURE_DIR");
+    if (!capture.isEmpty()) {
+        QCoreApplication::processEvents();
+        QVERIFY(QDir().mkpath(capture));
+        QVERIFY(panel.grab().save(QDir(capture).filePath(QStringLiteral("remote-tool-groups-collapsed.png"))));
+    }
+    first->click();
+    for (QLabel* detail : details) QVERIFY(detail->isVisibleTo(groups.first()));
+    QVERIFY(details.first()->text().contains(QStringLiteral("shell")));
+    QVERIFY(details.last()->text().contains(QStringLiteral("file_grep")));
+    const QStringList rows{QStringLiteral("msg_remote_tool_style"),
+                           QStringLiteral("remote-tool-group:part_style_shell"),
+                           QStringLiteral("msg_remote_tool_style:segment:part_style_b"),
+                           QStringLiteral("remote-tool-group:part_style_last"),
+                           QStringLiteral("msg_remote_tool_style:segment:part_style_c")};
+    for (int index = 0; index < rows.size(); ++index) {
+        QVERIFY2(view->contains(rows[index]), qPrintable(rows[index]));
+        if (index > 0) QVERIFY(view->itemRect(rows[index - 1]).bottom() <= view->itemRect(rows[index]).top());
+    }
+    view->selectAll();
+    const QString ordinaryText = view->selectedText();
+    const int firstText = ordinaryText.indexOf(QStringLiteral("开始检查工作区。"));
+    const int secondText = ordinaryText.indexOf(QStringLiteral("工作区干净，继续核对分支。"));
+    const int finalText = ordinaryText.indexOf(QStringLiteral("分支已核对完成。"));
+    QVERIFY(firstText >= 0 && secondText > firstText && finalText > secondText);
+    QVERIFY(!ordinaryText.contains(QStringLiteral("工具调用")));
+    QVERIFY(!ordinaryText.contains(QStringLiteral("running")));
+    QVERIFY(!ordinaryText.contains(QStringLiteral("completed")));
+    QVERIFY(!ordinaryText.contains(QStringLiteral("Private reasoning")));
+    view->clearSelection();
+    QCoreApplication::processEvents();
+    if (!capture.isEmpty()) {
+        QVERIFY(QDir().mkpath(capture));
+        QVERIFY(panel.grab().save(QDir(capture).filePath(QStringLiteral("remote-tool-groups-expanded.png"))));
+    }
+}
+
+void DesktopSessionSyncHostTest::remoteToolGroupsRetainExpandedObjectsDuringUpdatesAndPrepend() {
+    // Streaming state and pagination may change geometry but cannot replace an
+    // expanded tool group, discard its disclosure choice or move it to the tail.
+    QTemporaryDir spool;
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
+    panel.resize(1000, 740);
+    const QJsonObject owner{{QStringLiteral("id"), QStringLiteral("ses_tool_update")},
+                           {QStringLiteral("device_slot"), QStringLiteral("tool_update_owner")},
+                           {QStringLiteral("login_session_id"), QStringLiteral("tool_update_login")},
+                           {QStringLiteral("online"), true}};
+    panel.openSession(owner);
+    QJsonObject tool{{QStringLiteral("id"), QStringLiteral("part_stable_tool")},
+                     {QStringLiteral("kind"), QStringLiteral("tool")},
+                     {QStringLiteral("created"), 1002},
+                     {QStringLiteral("tool"), QStringLiteral("shell")},
+                     {QStringLiteral("state"), QStringLiteral("running")}};
+    const QJsonObject before{{QStringLiteral("id"), QStringLiteral("part_stable_before")},
+                             {QStringLiteral("kind"), QStringLiteral("text")},
+                             {QStringLiteral("created"), 1001},
+                             {QStringLiteral("text"), QStringLiteral("准备检查工作区。")}};
+    const QJsonObject after{{QStringLiteral("id"), QStringLiteral("part_stable_after")},
+                            {QStringLiteral("kind"), QStringLiteral("text")},
+                            {QStringLiteral("created"), 1003},
+                            {QStringLiteral("text"), QStringLiteral("工作区检查完成。")}};
+    QJsonObject message{{QStringLiteral("id"), QStringLiteral("msg_stable_tool")},
+                         {QStringLiteral("role"), QStringLiteral("assistant")},
+                         {QStringLiteral("created"), 1000},
+                         {QStringLiteral("parts"), QJsonArray{before, tool, after}}};
+    panel.receivePayload(owner, QStringLiteral("history_page"),
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+    panel.show();
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    const auto groups = panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup"));
+    QCOMPARE(groups.size(), 1);
+    QFrame* group = groups.first();
+    auto* disclosure = group->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure"));
+    QVERIFY(disclosure);
+    disclosure->click();
+    auto* detail = group->findChild<QLabel*>(QStringLiteral("remoteAgentToolDetail"));
+    QVERIFY(detail && detail->isVisibleTo(group));
+    tool.insert(QStringLiteral("state"), QStringLiteral("completed"));
+    message.insert(QStringLiteral("parts"), QJsonArray{before, tool, after});
+    const QJsonObject update{{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}};
+    panel.receivePayload(owner, QStringLiteral("event"), update);
+    QCOMPARE(panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup")), groups);
+    QCOMPARE(group->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure")), disclosure);
+    QVERIFY(disclosure->text().contains(QStringLiteral("已完成")));
+    QVERIFY(detail->isVisibleTo(group));
+    // Replayed state is a no-op for the selected answer and embedded widgets.
+    view->selectAll();
+    const QString selected = view->selectedText();
+    panel.receivePayload(owner, QStringLiteral("event"), update);
+    QCOMPARE(view->selectedText(), selected);
+    QCOMPARE(panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup")), groups);
+    const QJsonObject older{{QStringLiteral("id"), QStringLiteral("msg_older_tool_history")},
+                            {QStringLiteral("role"), QStringLiteral("assistant")},
+                            {QStringLiteral("created"), 500},
+                            {QStringLiteral("parts"),
+                             QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")},
+                                                    {QStringLiteral("text"), QStringLiteral("这是更早的会话记录。")}}}}};
+    panel.receivePayload(owner, QStringLiteral("history_page"),
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{older}}});
+    QCOMPARE(panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup")), groups);
+    QCOMPARE(group->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure")), disclosure);
+    QVERIFY(detail->isVisibleTo(group));
+    const QStringList rows{QStringLiteral("msg_older_tool_history"), QStringLiteral("msg_stable_tool"),
+                           QStringLiteral("remote-tool-group:part_stable_tool"),
+                           QStringLiteral("msg_stable_tool:segment:part_stable_after")};
+    for (int index = 0; index < rows.size(); ++index) {
+        QVERIFY(view->contains(rows[index]));
+        if (index > 0) QVERIFY(view->itemRect(rows[index - 1]).bottom() <= view->itemRect(rows[index]).top());
+    }
+    view->selectAll();
+    QCOMPARE(view->selectedText().count(QStringLiteral("准备检查工作区。")), 1);
+    QCOMPARE(view->selectedText().count(QStringLiteral("工作区检查完成。")), 1);
+    view->clearSelection();
+    QCoreApplication::processEvents();
+    const QString capture = qEnvironmentVariable("MAICHAT_REMOTE_TOOLS_CAPTURE_DIR");
+    if (!capture.isEmpty()) {
+        QVERIFY(QDir().mkpath(capture));
+        QVERIFY(panel.grab().save(QDir(capture).filePath(QStringLiteral("remote-tool-groups-updated.png"))));
+    }
+    // A correction can join two formerly separate runs. Removing the obsolete
+    // group must hide it in this event, before deferred deletion can run.
+    QJsonObject lastTool = tool;
+    lastTool.insert(QStringLiteral("id"), QStringLiteral("part_merge_tool"));
+    lastTool.insert(QStringLiteral("created"), 1004);
+    QJsonObject lastText = after;
+    lastText.insert(QStringLiteral("id"), QStringLiteral("part_merge_after"));
+    lastText.insert(QStringLiteral("created"), 1005);
+    lastText.insert(QStringLiteral("text"), QStringLiteral("两项检查均已完成。"));
+    message.insert(QStringLiteral("parts"), QJsonArray{before, tool, after, lastTool, lastText});
+    panel.receivePayload(owner, QStringLiteral("event"),
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+    const auto splitGroups = panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup"));
+    QCOMPARE(splitGroups.size(), 2);
+    QFrame* obsoleteGroup = splitGroups.last();
+    QVERIFY(obsoleteGroup != group);
+    QVERIFY(!obsoleteGroup->isHidden());
+    message.insert(QStringLiteral("parts"), QJsonArray{before, tool, lastTool, lastText});
+    panel.receivePayload(owner, QStringLiteral("event"),
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+    QVERIFY(obsoleteGroup->isHidden());  // Deliberately no processEvents after the merge.
+    QVERIFY(!view->contains(QStringLiteral("remote-tool-group:part_merge_tool")));
+    QVERIFY(view->contains(QStringLiteral("remote-tool-group:part_stable_tool")));
+    QCOMPARE(group->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure")), disclosure);
+    QVERIFY(detail->isVisibleTo(group));
+}
+
+void DesktopSessionSyncHostTest::remoteLegacyToolSnapshotsSplitAtQuestionsAndMediaWithoutLeakingDetails() {
+    // Old snapshots do not have part IDs/timestamps. Array order still defines
+    // the visible transcript; absent or future enum values cannot imply success,
+    // and non-question tool internals must never surface in the remote viewer.
+    QTemporaryDir spool;
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
+    panel.resize(1000, 740);
+    const QJsonObject owner{{QStringLiteral("id"), QStringLiteral("ses_legacy_tool")},
+                           {QStringLiteral("device_slot"), QStringLiteral("legacy_tool_owner")},
+                           {QStringLiteral("login_session_id"), QStringLiteral("legacy_tool_login")},
+                           {QStringLiteral("online"), true}};
+    panel.openSession(owner);
+    const QJsonObject first{{QStringLiteral("kind"), QStringLiteral("tool")},
+                            {QStringLiteral("tool"), QStringLiteral("shell")},
+                            {QStringLiteral("state"), QStringLiteral("future_tool_state")},
+                            {QStringLiteral("input"), QStringLiteral("PRIVATE_COMMAND_TOKEN")},
+                            {QStringLiteral("output"), QStringLiteral("PRIVATE_RESULT_TOKEN")}};
+    const QJsonObject second{{QStringLiteral("kind"), QStringLiteral("tool")},
+                             {QStringLiteral("tool"), QStringLiteral("file_grep")}};
+    const QJsonObject third{{QStringLiteral("kind"), QStringLiteral("tool")},
+                            {QStringLiteral("tool"), QStringLiteral("shell")},
+                            {QStringLiteral("state"), QStringLiteral("completed")}};
+    const QJsonObject question{
+        {QStringLiteral("kind"), QStringLiteral("tool")},
+        {QStringLiteral("tool"), QStringLiteral("question")},
+        {QStringLiteral("state"), QStringLiteral("running")},
+        {QStringLiteral("input"), QJsonObject{{QStringLiteral("question"), QStringLiteral("保留这份检查结果吗？")},
+                                            {QStringLiteral("options"), QJsonArray{QStringLiteral("继续")}}}}};
+    const QJsonObject message{
+        {QStringLiteral("id"), QStringLiteral("msg_legacy_tool")},
+        {QStringLiteral("role"), QStringLiteral("assistant")},
+        {QStringLiteral("parts"),
+         QJsonArray{QJsonObject{{QStringLiteral("id"), QString()},
+                                {QStringLiteral("kind"), QStringLiteral("text")},
+                                {QStringLiteral("text"), QStringLiteral("开始读取旧版会话记录。")}},
+                    first, question, second,
+                    QJsonObject{{QStringLiteral("id"), QString()},
+                                {QStringLiteral("kind"), QStringLiteral("image")},
+                                {QStringLiteral("path"), QStringLiteral("C:/PRIVATE_LOCAL_IMAGE.png")}},
+                    third,
+                    QJsonObject{{QStringLiteral("id"), QString()},
+                                {QStringLiteral("kind"), QStringLiteral("text")},
+                                {QStringLiteral("text"), QStringLiteral("旧版会话记录已读取。")}}}}};
+    const QJsonObject page{{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}};
+    panel.receivePayload(owner, QStringLiteral("history_page"), page);
+    panel.show();
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    QCOMPARE(view->itemCount(), 7);  // Three ordinary rows, one question and three tool groups.
+    const auto groups = panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup"));
+    QCOMPARE(groups.size(), 3);
+    for (int index = 0; index < groups.size(); ++index) {
+        auto* disclosure = groups[index]->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure"));
+        QVERIFY(disclosure);
+        QVERIFY(disclosure->text().contains(index == 2 ? QStringLiteral("已完成") : QStringLiteral("状态未知")));
+        QVERIFY(!disclosure->text().contains(QStringLiteral("future_tool_state")));
+        disclosure->click();
+        const auto details = groups[index]->findChildren<QLabel*>(QStringLiteral("remoteAgentToolDetail"));
+        QCOMPARE(details.size(), 1);
+        QVERIFY(details.first()->isVisibleTo(groups[index]));
+        QVERIFY(!details.first()->text().contains(QStringLiteral("future_tool_state")));
+        QVERIFY(!details.first()->text().contains(QStringLiteral("PRIVATE_")));
+    }
+    view->selectAll();
+    const QString selected = view->selectedText();
+    const int before = selected.indexOf(QStringLiteral("开始读取旧版会话记录。"));
+    const int questionAt = selected.indexOf(QStringLiteral("保留这份检查结果吗？"));
+    const int image = selected.indexOf(QStringLiteral("图片在所属设备"));
+    const int after = selected.indexOf(QStringLiteral("旧版会话记录已读取。"));
+    QVERIFY(before >= 0 && questionAt > before && image > questionAt && after > image);
+    QCOMPARE(selected.count(QStringLiteral("开始读取旧版会话记录。")), 1);
+    QCOMPARE(selected.count(QStringLiteral("图片在所属设备")), 1);
+    QCOMPARE(selected.count(QStringLiteral("旧版会话记录已读取。")), 1);
+    QVERIFY(!selected.contains(QStringLiteral("PRIVATE_")));
+    QVERIFY(!selected.contains(QStringLiteral("工具调用")));
+    QVERIFY(!selected.contains(QStringLiteral("future_tool_state")));
+    panel.receivePayload(owner, QStringLiteral("event"), page);
+    QCOMPARE(panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup")), groups);
+    QCOMPARE(view->selectedText(), selected);
+}
+
+void DesktopSessionSyncHostTest::remoteQuestionAppendRetainsExistingTextSelectionAndToolGroup() {
+    // A late question changes neither the identity of already selected prose
+    // nor the lifetime/expanded state of the tool row immediately after it.
+    QTemporaryDir spool;
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
+    panel.resize(1000, 740);
+    const QJsonObject owner{{QStringLiteral("id"), QStringLiteral("ses_append_question")},
+                           {QStringLiteral("device_slot"), QStringLiteral("append_question_owner")},
+                           {QStringLiteral("login_session_id"), QStringLiteral("append_question_login")},
+                           {QStringLiteral("online"), true}};
+    panel.openSession(owner);
+    const QJsonObject text{{QStringLiteral("id"), QStringLiteral("part_append_text")},
+                           {QStringLiteral("kind"), QStringLiteral("text")},
+                           {QStringLiteral("created"), 1001},
+                           {QStringLiteral("text"), QStringLiteral("工作区检查完成，等待你的补充。")}};
+    const QJsonObject tool{{QStringLiteral("id"), QStringLiteral("part_append_tool")},
+                           {QStringLiteral("kind"), QStringLiteral("tool")},
+                           {QStringLiteral("created"), 1002},
+                           {QStringLiteral("tool"), QStringLiteral("shell")},
+                           {QStringLiteral("state"), QStringLiteral("completed")}};
+    QJsonObject message{{QStringLiteral("id"), QStringLiteral("msg_append_question")},
+                         {QStringLiteral("role"), QStringLiteral("assistant")},
+                         {QStringLiteral("created"), 1000},
+                         {QStringLiteral("parts"), QJsonArray{text, tool}}};
+    panel.receivePayload(owner, QStringLiteral("history_page"),
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+    panel.show();
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    QVERIFY(view->contains(QStringLiteral("msg_append_question")));
+    const auto groups = panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup"));
+    QCOMPARE(groups.size(), 1);
+    QFrame* group = groups.first();
+    auto* disclosure = group->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure"));
+    QVERIFY(disclosure);
+    disclosure->click();
+    auto* detail = group->findChild<QLabel*>(QStringLiteral("remoteAgentToolDetail"));
+    QVERIFY(detail && detail->isVisibleTo(group));
+    view->selectAll();
+    const QString selected = view->selectedText();
+    QCOMPARE(selected.trimmed(), text.value(QStringLiteral("text")).toString());
+    const QJsonObject question{
+        {QStringLiteral("id"), QStringLiteral("part_appended_question")},
+        {QStringLiteral("kind"), QStringLiteral("tool")},
+        {QStringLiteral("created"), 1003},
+        {QStringLiteral("tool"), QStringLiteral("question")},
+        {QStringLiteral("state"), QStringLiteral("running")},
+        {QStringLiteral("input"), QJsonObject{{QStringLiteral("question"), QStringLiteral("接下来检查哪个分支？")},
+                                            {QStringLiteral("options"), QJsonArray{QStringLiteral("当前分支")}}}}};
+    message.insert(QStringLiteral("parts"), QJsonArray{text, tool, question});
+    panel.receivePayload(owner, QStringLiteral("event"),
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+    QVERIFY(view->contains(QStringLiteral("msg_append_question")));
+    QCOMPARE(view->selectedText(), selected);
+    QCOMPARE(panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup")), groups);
+    QCOMPARE(group->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure")), disclosure);
+    QVERIFY(detail->isVisibleTo(group));
+    const QStringList rows{QStringLiteral("msg_append_question"),
+                           QStringLiteral("remote-tool-group:part_append_tool"),
+                           QStringLiteral("remote-question:part_appended_question")};
+    for (int index = 0; index < rows.size(); ++index) {
+        QVERIFY(view->contains(rows[index]));
+        if (index > 0) QVERIFY(view->itemRect(rows[index - 1]).bottom() <= view->itemRect(rows[index]).top());
+    }
+}
+
+void DesktopSessionSyncHostTest::remoteChildQuestionProjectionRetainsLaterTextIdentityAndToolGroups() {
+    // The source assistant becomes two chronological fragments when a child
+    // question arrives in its middle. IDs must still refer to the source
+    // message/part, rather than nesting an extra ':segment:' prefix on C.
+    QTemporaryDir spool;
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
+    panel.resize(1000, 740);
+    const QJsonObject owner{{QStringLiteral("id"), QStringLiteral("ses_projected_tool_question")},
+                           {QStringLiteral("device_slot"), QStringLiteral("projected_question_owner")},
+                           {QStringLiteral("login_session_id"), QStringLiteral("projected_question_login")},
+                           {QStringLiteral("online"), true}};
+    panel.openSession(owner);
+    const auto textPart = [](const QString& id, const QString& text, int created) {
+        return QJsonObject{{QStringLiteral("id"), id},
+                           {QStringLiteral("kind"), QStringLiteral("text")},
+                           {QStringLiteral("created"), created},
+                           {QStringLiteral("text"), text}};
+    };
+    const auto toolPart = [](const QString& id, int created) {
+        return QJsonObject{{QStringLiteral("id"), id},
+                           {QStringLiteral("kind"), QStringLiteral("tool")},
+                           {QStringLiteral("created"), created},
+                           {QStringLiteral("tool"), QStringLiteral("shell")},
+                           {QStringLiteral("state"), QStringLiteral("completed")}};
+    };
+    const QString finalText = QStringLiteral("分支与工作区均已核对完成。");
+    const QJsonObject message{
+        {QStringLiteral("id"), QStringLiteral("msg_parent_projected_question")},
+        {QStringLiteral("role"), QStringLiteral("assistant")},
+        {QStringLiteral("created"), 1000},
+        {QStringLiteral("parts"),
+         QJsonArray{textPart(QStringLiteral("part_projected_a"), QStringLiteral("开始检查工作区。"), 1001),
+                    toolPart(QStringLiteral("part_projected_tool1"), 1002),
+                    textPart(QStringLiteral("part_projected_b"), QStringLiteral("工作区正常，继续检查分支。"), 1004),
+                    toolPart(QStringLiteral("part_projected_tool2"), 1005),
+                    textPart(QStringLiteral("part_projected_c"), finalText, 1006)}}};
+    panel.receivePayload(owner, QStringLiteral("history_page"),
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+    panel.show();
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    const auto groups = panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup"));
+    QCOMPARE(groups.size(), 2);
+    auto* disclosure = groups.last()->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure"));
+    QVERIFY(disclosure);
+    disclosure->click();
+    auto* detail = groups.last()->findChild<QLabel*>(QStringLiteral("remoteAgentToolDetail"));
+    QVERIFY(detail && detail->isVisibleTo(groups.last()));
+    const QString finalId = QStringLiteral("msg_parent_projected_question:segment:part_projected_c");
+    QVERIFY(view->contains(finalId));
+    QCoreApplication::processEvents();
+    const QRectF finalRect = view->itemRect(finalId);
+    const QPoint from(qRound(finalRect.left()) + 1,
+                      qRound(finalRect.center().y()) - view->verticalScrollBar()->value());
+    const QPoint to(qRound(finalRect.right()) - 1, from.y());
+    auto* window = panel.windowHandle();
+    QVERIFY(window);
+    const QPoint windowFrom = window->mapFromGlobal(view->viewport()->mapToGlobal(from));
+    const QPoint windowTo = window->mapFromGlobal(view->viewport()->mapToGlobal(to));
+    // Use the same QPA press/move/release stream as MarkdownView's selection
+    // regressions; the QWidget move overload need not deliver a drag on Qt 5.
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, windowFrom);
+    QTest::mouseMove(window, windowTo);
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, windowTo);
+    QCOMPARE(view->selectedText(), finalText);
+    const QJsonObject questionInput{{QStringLiteral("question"), QStringLiteral("子任务需要保留哪些结果？")},
+                                    {QStringLiteral("options"), QJsonArray{QStringLiteral("全部保留")}}};
+    const QJsonObject questionPart{{QStringLiteral("id"), QStringLiteral("part_child_projected_question")},
+                                   {QStringLiteral("kind"), QStringLiteral("tool")},
+                                   {QStringLiteral("created"), 1003},
+                                   {QStringLiteral("tool"), QStringLiteral("question")},
+                                   {QStringLiteral("state"), QStringLiteral("running")},
+                                   {QStringLiteral("input"), questionInput}};
+    const QJsonObject child{{QStringLiteral("id"), QStringLiteral("msg_child_projected_question")},
+                            {QStringLiteral("sessionId"), QStringLiteral("ses_child_projected_question")},
+                            {QStringLiteral("questionProjection"), true},
+                            {QStringLiteral("role"), QStringLiteral("assistant")},
+                            {QStringLiteral("created"), 1000},
+                            {QStringLiteral("parts"), QJsonArray{questionPart}}};
+    panel.receivePayload(owner, QStringLiteral("event"),
+                         {{QStringLiteral("ok"), true},
+                          {QStringLiteral("messages"), QJsonArray{message}},
+                          {QStringLiteral("questionMessages"), QJsonArray{child}}});
+    QVERIFY(view->contains(finalId));
+    QCOMPARE(view->selectedText(), finalText);
+    QCOMPARE(panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup")), groups);
+    QCOMPARE(groups.last()->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure")), disclosure);
+    QVERIFY(detail->isVisibleTo(groups.last()));
+    const QStringList rows{QStringLiteral("msg_parent_projected_question"),
+                           QStringLiteral("remote-tool-group:part_projected_tool1"),
+                           QStringLiteral("remote-question:part_child_projected_question"),
+                           QStringLiteral("msg_parent_projected_question:segment:part_projected_b"),
+                           QStringLiteral("remote-tool-group:part_projected_tool2"), finalId};
+    for (int index = 0; index < rows.size(); ++index) {
+        QVERIFY2(view->contains(rows[index]), qPrintable(rows[index]));
+        if (index > 0) QVERIFY(view->itemRect(rows[index - 1]).bottom() <= view->itemRect(rows[index]).top());
+    }
 }
 
 QTEST_MAIN(DesktopSessionSyncHostTest)

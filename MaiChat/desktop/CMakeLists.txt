@@ -870,6 +870,8 @@ add_library(maichat_agent
   src/MaiChatTools/DesktopPdfPasswordPrompt.cpp
   src/agent/AgentChatPanel.h
   src/agent/AgentChatPanel.cpp
+  src/agent/AgentToolGroupWidget.h
+  src/agent/AgentToolGroupWidget.cpp
   src/agent/RemoteAgentPanel.h
   src/agent/RemoteAgentPanel.cpp
   src/agent/AgentSessionList.h

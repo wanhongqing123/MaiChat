@@ -33,6 +33,7 @@
 
 #include <algorithm>
 
+#include "agent/AgentToolGroupWidget.h"
 #include "markdown/MarkdownView.h"
 #include "ui/ComposerTextEdit.h"
 #include "ui/UiZoom.h"
@@ -166,9 +167,6 @@ QList<QJsonObject> questionDisplayTimeline(const QMap<QString, QJsonObject>& sou
 
 QString messageText(const QJsonObject& message) {
     QStringList text;
-    int toolCount = 0;
-    QString lastTool;
-    QString lastState;
     for (const QJsonValue& value : message.value(QStringLiteral("parts")).toArray()) {
         const QJsonObject part = value.toObject();
         const QString kind = part.value(QStringLiteral("kind")).toString();
@@ -180,9 +178,6 @@ QString messageText(const QJsonObject& message) {
                 text.append(question);
                 continue;
             }
-            ++toolCount;
-            lastTool = part.value(QStringLiteral("tool")).toString();
-            lastState = part.value(QStringLiteral("state")).toString();
         } else if (!part.value(QStringLiteral("attachment_id")).toString().isEmpty()) {
             const QString id = part.value(QStringLiteral("attachment_id")).toString();
             QString name = part.value(QStringLiteral("name")).toString(QStringLiteral("附件"));
@@ -200,11 +195,59 @@ QString messageText(const QJsonObject& message) {
                                                         : QStringLiteral("[视频在所属设备，暂不可跨设备预览]"));
         }
     }
-    if (toolCount > 0) {
-        text.append(QStringLiteral("工具调用 %1 次 · %2 · %3").arg(toolCount).arg(lastTool, lastState));
-    }
     return text.join(QStringLiteral("\n\n"));
 }
+
+bool hasVisibleActivity(const QJsonObject& message) {
+    if (!messageText(message).trimmed().isEmpty()) return true;
+    // Ordinary tools are now embedded widgets rather than answer text. They
+    // still acknowledge visible activity and must suppress a second thinking row.
+    for (const auto& value : message.value(QStringLiteral("parts")).toArray())
+        if (value.toObject().value(QStringLiteral("kind")) == QStringLiteral("tool")) return true;
+    return false;
+}
+
+class RemoteToolGroupCard final : public AgentToolGroupWidget {
+public:
+    explicit RemoteToolGroupCard(const QString& id) : AgentToolGroupWidget(id) {
+        setObjectName(QStringLiteral("remoteAgentToolGroup"));
+        disclosureButton()->setObjectName(QStringLiteral("remoteAgentToolGroupDisclosure"));
+    }
+
+    void setTools(const QJsonArray& tools) {
+        QStringList states;
+        QSet<QString> wanted;
+        for (const auto& value : tools) {
+            const QJsonObject tool = value.toObject();
+            const QString id = tool.value(QStringLiteral("id")).toString();
+            wanted.insert(id);
+            const QString state = tool.value(QStringLiteral("state")).toString();
+            states.append(state);
+            QLabel* row = rows_.value(id, nullptr);
+            if (!row) {
+                row = new QLabel;
+                row->setObjectName(QStringLiteral("remoteAgentToolDetail"));
+                row->setTextFormat(Qt::PlainText);
+                row->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+                row->setWordWrap(true);
+                UiZoom::setFont(row, UiZoom::TextRole::Detail, row->font());
+                UiZoom::setStyle(row, QStringLiteral("QLabel{background:transparent;color:#667085;font-size:@detail;}"));
+                addDetail(row);
+                rows_.insert(id, row);
+            }
+            QString name = tool.value(QStringLiteral("tool")).toString().trimmed();
+            if (name.isEmpty()) name = QStringLiteral("工具");
+            row->setText(name + QStringLiteral(" · ") + agentToolStateText(state));
+        }
+        for (const QString& id : rows_.keys())
+            if (!wanted.contains(id)) removeDetail(rows_.take(id));
+        setTitle(agentToolGroupTitle(states));
+        updateGeometry();
+    }
+
+private:
+    QHash<QString, QLabel*> rows_;
+};
 
 QIcon actionIcon(bool stop, const QColor& color) {
     QPixmap pixmap(48, 48);
@@ -294,6 +337,7 @@ struct RemoteAgentPanel::Runtime {
         while (acceptedAnswerOrder.size() > 64) acceptedAnswerEchoes.remove(acceptedAnswerOrder.takeFirst());
     }
     QMap<QString, QString> rendered;
+    QHash<QString, RemoteToolGroupCard*> toolGroups;
     QSet<QString> optimisticMessages;
     QHash<QString, QString> drafts;
     QHash<QString, QStringList> attachmentDrafts;
@@ -615,6 +659,7 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
         runtime_->questionMessages.clear();
         runtime_->questions = {};
         runtime_->rendered.clear();
+        runtime_->toolGroups.clear();
         runtime_->optimisticMessages.clear();
         runtime_->view->clear();
         runtime_->thinking = nullptr;
@@ -1208,7 +1253,7 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
         if (runtime_->awaitingResponse &&
             message.value(QStringLiteral("role")).toString() == QStringLiteral("assistant") &&
             message.value(QStringLiteral("created")).toVariant().toLongLong() >= runtime_->commandSentAt - 1000 &&
-            (!message.value(QStringLiteral("active")).toBool() || !messageText(message).isEmpty()))
+            (!message.value(QStringLiteral("active")).toBool() || hasVisibleActivity(message)))
             runtime_->awaitingResponse = false;
     }
     if (!received.isEmpty() && kind == QStringLiteral("history_page")) {
@@ -1263,6 +1308,7 @@ void RemoteAgentPanel::renderMessages() {
         QString id;
         QString text;
         MarkdownView::Style style;
+        QJsonArray tools;
     };
     const QString ownerKey = sessionKey(runtime_->session);
     QMap<QString, QJsonObject> displayed = runtime_->messages;
@@ -1349,6 +1395,7 @@ void RemoteAgentPanel::renderMessages() {
     QSet<QString> renderedQuestions;
     for (const QJsonObject& message : ordered) {
         const QString messageId = message.value(QStringLiteral("id")).toString();
+        const QString sourceId = message.value(QStringLiteral("source_message_id")).toString(messageId);
         const QJsonArray parts = message.value(QStringLiteral("parts")).toArray();
         const bool projection = message.value(QStringLiteral("questionProjection")).toBool();
         const auto style = message.value(QStringLiteral("role")) == QStringLiteral("user")
@@ -1356,31 +1403,77 @@ void RemoteAgentPanel::renderMessages() {
                                : MarkdownView::Style::Document;
         bool hasQuestion = false;
         for (const QJsonValue& value : parts) hasQuestion |= !questionPartText(value.toObject()).isEmpty();
-        if (!hasQuestion && !projection) {
+        bool hasTools = false;
+        for (const QJsonValue& value : parts)
+            hasTools |= value.toObject().value(QStringLiteral("kind")) == QStringLiteral("tool");
+        if (!hasQuestion && !projection && !hasTools) {
             const QString text = messageText(message);
             if (!text.isEmpty()) segments.append({messageId, text, style});
             continue;
         }
         QJsonArray ordinary;
+        QJsonArray tools;
         int run = 0;
+        bool firstOrdinary = true;
+        const auto partIdentity = [&](const QJsonObject& part, int index) {
+            const QString id = part.value(QStringLiteral("id")).toString();
+            return id.isEmpty() ? messageId + QStringLiteral(":part:") + QString::number(index) : id;
+        };
         const auto flush = [&] {
             if (ordinary.isEmpty()) return;
             QJsonObject chunk = message;
             chunk.insert(QStringLiteral("parts"), ordinary);
             const QString text = messageText(chunk);
-            const QString first =
-                ordinary.first().toObject().value(QStringLiteral("id")).toString(QString::number(run));
-            if (!text.isEmpty()) segments.append({messageId + QStringLiteral(":segment:") + first, text, style});
+            const QString firstPartId = ordinary.first().toObject().value(QStringLiteral("id")).toString();
+            const QString first = firstPartId.isEmpty() ? QString::number(run) : firstPartId;
+            if (!text.isEmpty()) {
+                // A question can arrive after the prose, or split its owner
+                // into chronological fragments. Keep real part identities tied
+                // to that source, so selections survive either update. Legacy
+                // parts without IDs retain the fragment prefix: local run
+                // numbers alone would collide across separate fragments.
+                const QString prefix = firstPartId.isEmpty() ? messageId : sourceId;
+                const QString id = firstOrdinary && messageId == sourceId && !projection
+                                       ? sourceId : prefix + QStringLiteral(":segment:") + first;
+                segments.append({id, text, style});
+                firstOrdinary = false;
+            }
             ordinary = {};
             ++run;
         };
-        for (const QJsonValue& value : parts) {
-            const QJsonObject part = value.toObject();
+        const auto flushTools = [&] {
+            if (tools.isEmpty()) return;
+            const QString id = QStringLiteral("remote-tool-group:") +
+                               tools.first().toObject().value(QStringLiteral("id")).toString();
+            const QString fingerprint = QString::fromUtf8(QJsonDocument(tools).toJson(QJsonDocument::Compact));
+            segments.append({id, fingerprint, MarkdownView::Style::Document, tools});
+            tools = {};
+        };
+        for (int index = 0; index < parts.size(); ++index) {
+            const QJsonObject part = parts[index].toObject();
+            const QString kind = part.value(QStringLiteral("kind")).toString();
+            if (kind == QStringLiteral("reasoning")) continue;
             const QString question = questionPartText(part);
             if (question.isEmpty()) {
-                if (!projection) ordinary.append(value);
+                if (projection) continue;
+                if (kind == QStringLiteral("tool")) {
+                    flush();
+                    // This remote projection intentionally contains only real
+                    // synchronized names/states, never tool parameters/results.
+                    tools.append(QJsonObject{{QStringLiteral("id"), partIdentity(part, index)},
+                                              {QStringLiteral("tool"), part.value(QStringLiteral("tool"))},
+                                              {QStringLiteral("state"), part.value(QStringLiteral("state"))}});
+                } else {
+                    flushTools();
+                    // Media is a separate visible artifact, so a later tool or
+                    // text run cannot be merged across it.
+                    if (kind != QStringLiteral("text")) flush();
+                    ordinary.append(part);
+                    if (kind != QStringLiteral("text")) flush();
+                }
                 continue;
             }
+            flushTools();
             flush();
             const QString partId = part.value(QStringLiteral("id")).toString(messageId + QStringLiteral(":question"));
             if (renderedQuestions.contains(partId)) continue;
@@ -1392,6 +1485,7 @@ void RemoteAgentPanel::renderMessages() {
             if (!answer.isEmpty())
                 segments.append({QStringLiteral("remote-answer:") + partId, answer, MarkdownView::Style::Bubble});
         }
+        flushTools();
         flush();
     }
     const bool followedLatest = runtime_->view->isAtBottom();
@@ -1411,11 +1505,22 @@ void RemoteAgentPanel::renderMessages() {
     }
     for (const QString& old : runtime_->rendered.keys()) {
         if (wanted.contains(old)) continue;
+        // MarkdownView defers widget destruction. A merged/split group must
+        // stop painting and receiving input during this update immediately.
+        if (RemoteToolGroupCard* group = runtime_->toolGroups.take(old)) group->hide();
         runtime_->view->removeItem(old);
         runtime_->rendered.remove(old);
     }
     for (const Segment& segment : segments) {
-        if (!runtime_->rendered.contains(segment.id))
+        if (!segment.tools.isEmpty()) {
+            RemoteToolGroupCard* group = runtime_->toolGroups.value(segment.id, nullptr);
+            if (!group) {
+                group = new RemoteToolGroupCard(segment.id);
+                runtime_->view->addWidget(segment.id, group);
+                runtime_->toolGroups.insert(segment.id, group);
+            }
+            if (runtime_->rendered.value(segment.id) != segment.text) group->setTools(segment.tools);
+        } else if (!runtime_->rendered.contains(segment.id))
             runtime_->view->addItem(segment.id, segment.style, segment.text);
         else if (runtime_->rendered.value(segment.id) != segment.text)
             runtime_->view->updateItem(segment.id, segment.text);
@@ -1434,7 +1539,7 @@ void RemoteAgentPanel::updateThinking() {
     const QJsonObject last = runtime_->messages.isEmpty() ? QJsonObject{} : runtime_->messages.last();
     const bool assistantActive = last.value(QStringLiteral("role")).toString() == QStringLiteral("assistant") &&
                                  last.value(QStringLiteral("active")).toBool();
-    const bool visibleAnswer = assistantActive && !messageText(last).trimmed().isEmpty();
+    const bool visibleAnswer = assistantActive && hasVisibleActivity(last);
     const bool show =
         (runtime_->awaitingResponse || runtime_->session.value(QStringLiteral("busy")).toBool() || assistantActive) &&
         !visibleAnswer && runtime_->questions.isEmpty();
