@@ -21,6 +21,7 @@ struct MaiScreenshot {
 enum class MaiScreenshotTarget {
     DisplayUnderPointer,  // 鼠标指针所在的显示器。
     WindowByTitle,        // 一个位于当前交互桌面的可见顶层窗口。
+    WindowById,           // 按平台原生标识选择可见、未最小化的顶层窗口。
 };
 
 struct MaiScreenshotRequest {
@@ -28,6 +29,10 @@ struct MaiScreenshotRequest {
     // WindowByTitle 时必填，UTF-8。平台实现先找标题完全相同的可见顶层窗口；没有完全匹配时，
     // 仅在子串匹配唯一时使用它，避免模型含糊指定后截错窗口。
     std::string windowTitle;
+    // WindowById 时必填且非 0；Windows 为经 uintptr_t 转换的 HWND，macOS 为 CGWindowID。
+    // 此模式忽略 windowTitle；标识无效、目标不可见或最小化时返回错误，不回退到标题或显示器。
+    // 原生标识可能被系统回收重用，调用方须在截图前后核对窗口所属进程和边界。
+    std::uint64_t windowId = 0;
 };
 
 // 当前平台是否提供原生屏幕捕获。调用方只有在返回 true 时才应把 screenshot 工具暴露给模型；

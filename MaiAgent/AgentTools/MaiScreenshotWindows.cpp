@@ -24,6 +24,7 @@
 #include <cstring>
 #include <cwctype>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -406,10 +407,7 @@ MaiError captureDisplay(MaiScreenshot& screenshot) {
     }
 }
 
-MaiError captureWindow(const std::string& title, MaiScreenshot& screenshot) {
-    HWND window = nullptr;
-    MaiError error = findWindow(title, window);
-    if (error.hasError()) return error;
+MaiError captureWindow(HWND window, MaiScreenshot& screenshot) {
     try {
         MaiWinRtApartment apartment;
         using winrt::Windows::Graphics::Capture::GraphicsCaptureItem;
@@ -431,6 +429,29 @@ MaiError captureWindow(const std::string& title, MaiScreenshot& screenshot) {
     }
 }
 
+MaiError captureWindow(const std::string& title, MaiScreenshot& screenshot) {
+    HWND window = nullptr;
+    const MaiError error = findWindow(title, window);
+    if (error.hasError()) return error;
+    return captureWindow(window, screenshot);
+}
+
+MaiError captureWindowById(std::uint64_t windowId, MaiScreenshot& screenshot) {
+    if (windowId == 0 || windowId > std::numeric_limits<std::uintptr_t>::max()) {
+        return MaiError::make(MaiErrorCode::InvalidInput,
+                              "windowId must be a non-zero native window identifier");
+    }
+    const HWND window = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(windowId));
+    // 句柄路径不能借标题查找或整屏兜底，否则同名窗口和已关闭目标会被替换成别的内容。
+    if (!::IsWindow(window) || !::IsWindowVisible(window) || ::IsIconic(window) ||
+        ::GetAncestor(window, GA_ROOT) != window) {
+        return MaiError::make(
+            MaiErrorCode::NotFound,
+            "windowId does not identify a visible non-minimized top-level window");
+    }
+    return captureWindow(window, screenshot);
+}
+
 }  // namespace
 
 bool maiIsScreenshotSupported() {
@@ -442,6 +463,9 @@ MaiError maiCaptureScreenshot(const MaiScreenshotRequest& request, MaiScreenshot
     screenshot = MaiScreenshot{};
     if (request.target == MaiScreenshotTarget::WindowByTitle) {
         return captureWindow(request.windowTitle, screenshot);
+    }
+    if (request.target == MaiScreenshotTarget::WindowById) {
+        return captureWindowById(request.windowId, screenshot);
     }
     return captureDisplay(screenshot);
 }

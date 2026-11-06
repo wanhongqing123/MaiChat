@@ -849,6 +849,9 @@ add_library(maichat_agent
   src/MaiChatTools/DesktopBrowserTools.h
   src/MaiChatTools/DesktopBrowserTools.cpp
   src/MaiChatTools/DesktopComputerPlatform.h
+  src/MaiChatTools/DesktopComputerBackend.h
+  src/MaiChatTools/DesktopComputerKeys.h
+  src/MaiChatTools/DesktopComputerKeys.cpp
   src/MaiChatTools/DesktopComputerTools.h
   src/MaiChatTools/DesktopComputerTools.cpp
   ../third_party/qrcodegen/qrcodegen.c
@@ -1188,6 +1191,34 @@ target_include_directories(desktop_computer_tools_test PRIVATE
   src ../../MaiAgent/third_party/nlohmann)
 add_test(NAME desktop_computer_tools COMMAND desktop_computer_tools_test)
 set_tests_properties(desktop_computer_tools PROPERTIES SKIP_RETURN_CODE 77)
+
+# Pure controller/tool contracts run without sending input to the desktop.
+add_executable(desktop_computer_contracts_test tests/DesktopComputerContractsTest.cpp)
+target_link_libraries(desktop_computer_contracts_test PRIVATE maichat_agent Qt5::Core)
+target_include_directories(desktop_computer_contracts_test PRIVATE ../../MaiAgent/third_party/nlohmann)
+add_test(NAME desktop_computer_contracts COMMAND desktop_computer_contracts_test)
+
+add_executable(desktop_computer_agent_integration_test tests/DesktopComputerAgentIntegrationTest.cpp)
+target_link_libraries(desktop_computer_agent_integration_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
+  remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
+target_include_directories(desktop_computer_agent_integration_test PRIVATE ../../MaiAgent/third_party/nlohmann)
+# Keep deterministic conversation coverage independent of interactive desktop readiness.
+add_test(NAME desktop_computer_agent_integration COMMAND desktop_computer_agent_integration_test
+  chinesePromptTraversesRealAgentAndReadsBackEditor -o -,txt)
+
+add_executable(desktop_computer_native_integration_test tests/DesktopComputerNativeIntegrationTest.cpp)
+target_link_libraries(desktop_computer_native_integration_test PRIVATE maichat_agent Qt5::Widgets)
+target_include_directories(desktop_computer_native_integration_test PRIVATE ../../MaiAgent/third_party/nlohmann)
+add_test(NAME desktop_computer_native_integration COMMAND desktop_computer_native_integration_test)
+set_tests_properties(desktop_computer_native_integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+
+# This separate entry uses the same Creation Center UI and real native backend against
+# an owned editor process. A missing foreground/OS permission is visible as a CTest skip.
+add_dependencies(desktop_computer_agent_integration_test desktop_computer_native_integration_test)
+add_test(NAME desktop_computer_creation_native COMMAND desktop_computer_agent_integration_test
+  nativePromptTraversesRealAgentAndReadsBackOwnedProcess -o -,txt)
+set_tests_properties(desktop_computer_creation_native PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 240)
 
 add_executable(desktop_calendar_events_test
   tests/DesktopCalendarEventsTest.cpp

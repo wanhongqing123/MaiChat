@@ -70,8 +70,16 @@ int main(int argc, char** argv) {
     auto* result = new QLabel(QStringLiteral("Waiting"), &window);
     auto* input = new QLineEdit(&window);
     input->setAccessibleName(QStringLiteral("Fixture input"));
+    // Keep right-click delivery inside this fixture without opening a menu
+    // that could take focus from the following controlled input checks.
+    input->setContextMenuPolicy(Qt::CustomContextMenu);
+    int contextRequests = 0;
+    QObject::connect(input, &QLineEdit::customContextMenuRequested, &window,
+                     [&contextRequests](const QPoint&) { ++contextRequests; });
     auto* button = new QPushButton(QStringLiteral("Confirm"), &window);
     QObject::connect(button, &QPushButton::clicked, &window,
+                     [result, input] { result->setText(input->text()); });
+    QObject::connect(input, &QLineEdit::returnPressed, &window,
                      [result, input] { result->setText(input->text()); });
     layout->addWidget(result);
     layout->addWidget(input);
@@ -162,17 +170,11 @@ int main(int argc, char** argv) {
     const MaiError clicked = controller->act("owner", "click",
         snapshot["snapshot_id"], native.id, inputX, inputY, "", "", 0);
     if (clicked) {
-        std::fprintf(stderr, "computer click unavailable: %s\n", clicked.message().c_str());
-#if defined(Q_OS_WIN)
-        if (clicked.code() == MaiErrorCode::Busy && clicked.message() == foregroundDenied) {
-            CHECK(GetForegroundWindow() != fixtureHandle);
-            CHECK(input->text().isEmpty());
-            return unavailable("verified fixture lost foreground before mouse injection");
-        }
-#endif
-        CHECK(clicked.code() == MaiErrorCode::NotConfigured);
-        return unavailable("native click is not configured");
+        std::fprintf(stderr, "computer native click failed: %s\n", clicked.message().c_str());
     }
+    // An input-capable call may partially dispatch before reporting failure.
+    // Readiness skips end before this first native mouse attempt.
+    CHECK(!clicked);
     QThread::msleep(150);
     app.processEvents();
     const auto selected = controller->observe("owner", native.title,
@@ -182,16 +184,9 @@ int main(int argc, char** argv) {
     const MaiError typed = controller->act("owner", "type",
         second["snapshot_id"], native.id, 0, 0, "computer OK", "", 0);
     if (typed) {
-        std::fprintf(stderr, "computer type unavailable: %s\n", typed.message().c_str());
-#if defined(Q_OS_WIN)
-        if (typed.code() == MaiErrorCode::Busy && typed.message() == foregroundDenied) {
-            CHECK(GetForegroundWindow() != fixtureHandle);
-            return unavailable("verified fixture lost foreground before text injection");
-        }
-#endif
-        CHECK(typed.code() == MaiErrorCode::NotConfigured);
-        return unavailable("native typing is not configured");
+        std::fprintf(stderr, "computer native type failed: %s\n", typed.message().c_str());
     }
+    CHECK(!typed);
     QEventLoop inputDelivery;
     QObject::connect(input, &QLineEdit::textChanged, &inputDelivery,
                      [&inputDelivery](const QString& text) {
@@ -200,8 +195,87 @@ int main(int argc, char** argv) {
     QTimer::singleShot(2000, &inputDelivery, &QEventLoop::quit);
     if (input->text() != QStringLiteral("computer OK")) inputDelivery.exec();
     CHECK(input->text() == QStringLiteral("computer OK"));
+
+    // Every operation observes this exact self-owned ID again. The production
+    // controller and native backend perform the actual Unicode/key/gesture
+    // dispatch; direct widget state is used only to check what was delivered.
+    const QString chineseDraft = QStringLiteral("电脑操作中文草稿");
+    const QString selectedReplacement = QStringLiteral("组合键替换中文");
+    const QString finalText = QStringLiteral("已验证中文输入与替换");
+    const std::vector<std::string> actions = {
+        "replace_text", "key", "type", "replace_text", "replace_text",
+        "double_click", "right_click", "drag", "key", "verify"};
+    for (std::size_t step = 0; step < actions.size(); ++step) {
+        const auto fresh = controller->observe("owner", "",
+            workspace.path().toUtf8().toStdString(), false, native.id);
+        CHECK(fresh);
+        const auto freshSnapshot = nlohmann::json::parse(fresh.value().json);
+        DesktopComputerAction action;
+        action.action = actions[step];
+        action.snapshotId = freshSnapshot["snapshot_id"];
+        action.windowId = native.id;
+        action.xRatio = inputX;
+        action.yRatio = inputY;
+        if (step == 0) action.text = chineseDraft.toUtf8().toStdString();
+        else if (step == 1) {
+#if defined(Q_OS_MAC)
+            action.key = "Cmd+A";
+#else
+            action.key = "Ctrl+A";
+#endif
+        }
+        else if (step == 2) action.text = selectedReplacement.toUtf8().toStdString();
+        else if (step == 4) action.text = finalText.toUtf8().toStdString();
+        else if (step == 8) action.key = "Enter";
+        else if (step == 9) action.expectedText = finalText.toUtf8().toStdString();
+        if (step == 5 || step == 6 || step == 7) {
+            const QPoint start = input->mapToGlobal(QPoint(12, input->height() / 2));
+            const QPoint end = input->mapToGlobal(QPoint(130, input->height() / 2));
+            action.xRatio = (start.x() - native.x) / native.width;
+            action.yRatio = (start.y() - native.y) / native.height;
+            action.toXRatio = (end.x() - native.x) / native.width;
+            action.toYRatio = (end.y() - native.y) / native.height;
+            action.durationMs = 100;
+        }
+        const auto performed = controller->perform("owner", action);
+        if (!performed) {
+            const auto& error = performed.error();
+            std::fprintf(stderr, "computer native step %zu %s failed: %s\n",
+                         step, action.action.c_str(), error.message().c_str());
+        }
+        CHECK(performed);
+        QElapsedTimer delivery;
+        delivery.start();
+        while (delivery.elapsed() < 180) {
+            app.processEvents(QEventLoop::AllEvents, 25);
+            QThread::msleep(5);
+        }
+        if (step == 0 || step == 1) CHECK(input->text() == chineseDraft);
+        if (step == 1) CHECK(input->selectedText() == chineseDraft);
+        if (step == 2) CHECK(input->text() == selectedReplacement);
+        if (step == 3) CHECK(input->text().isEmpty());
+        if (step >= 4) CHECK(input->text() == finalText);
+        if (step == 5 || step == 7) CHECK(!input->selectedText().isEmpty());
+        if (step == 6) CHECK(contextRequests == 1);
+        if (step >= 8) CHECK(result->text() == finalText);
+        if (step == 9) {
+            CHECK(performed.value().verified);
+            CHECK(!performed.value().dispatched);
+            CHECK(performed.value().actualText == finalText.toUtf8().toStdString());
+        } else {
+            CHECK(performed.value().dispatched);
+            CHECK(!performed.value().verified);
+        }
+    }
+    const auto finalObservation = controller->observe("owner", "",
+        workspace.path().toUtf8().toStdString(), true, native.id);
+    CHECK(finalObservation);
+    if (!copy.isEmpty()) {
+        QFile::remove(copy);
+        CHECK(QFile::copy(QString::fromStdString(finalObservation.value().imagePath), copy));
+    }
     CHECK(!controller->clear("owner"));
-    std::fprintf(stderr, "computer native input verified: own pid=%llu hwnd=%llu text=computer OK\n",
+    std::fprintf(stderr, "computer native input verified: own pid=%llu hwnd=%llu Unicode/shortcuts/empty replacement/gestures/Enter/readback\n",
                  static_cast<unsigned long long>(native.processId),
                  static_cast<unsigned long long>(native.id));
     return 0;

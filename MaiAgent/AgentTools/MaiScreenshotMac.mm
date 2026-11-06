@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -134,6 +135,18 @@ SCWindow* windowWithTitle(SCShareableContent* content, const std::string& utf8, 
     return matches.firstObject;
 }
 
+SCWindow* windowWithId(SCShareableContent* content, std::uint64_t windowId, MaiError& error) {
+    // 原生标识独立于标题；仅使用当前可见的普通窗口，关闭或最小化时直接失败。
+    for (SCWindow* window in content.windows) {
+        if (window.windowID == windowId && window.isOnScreen && window.windowLayer == 0) {
+            return window;
+        }
+    }
+    error = MaiError::make(MaiErrorCode::NotFound,
+                           "windowId does not identify a visible non-minimized top-level window");
+    return nil;
+}
+
 SCStreamConfiguration* screenshotConfiguration(SCContentFilter* filter) {
     const double scale = std::max(1.0, double(filter.pointPixelScale));
     const double width = CGRectGetWidth(filter.contentRect) * scale;
@@ -148,7 +161,8 @@ SCStreamConfiguration* screenshotConfiguration(SCContentFilter* filter) {
 }
 
 void requestShareableContent(const std::shared_ptr<MaiCaptureState>& state,
-                             MaiScreenshotTarget target, std::string title) {
+                             MaiScreenshotTarget target, std::string title,
+                             std::uint64_t windowId) {
     [SCShareableContent
         getShareableContentExcludingDesktopWindows:NO
                                onScreenWindowsOnly:YES
@@ -164,10 +178,13 @@ void requestShareableContent(const std::shared_ptr<MaiCaptureState>& state,
                                            return;
                                        }
                                        SCContentFilter* filter = nil;
-                                       if (target == MaiScreenshotTarget::WindowByTitle) {
+                                       if (target == MaiScreenshotTarget::WindowByTitle ||
+                                           target == MaiScreenshotTarget::WindowById) {
                                            MaiError lookupError;
                                            SCWindow* window =
-                                               windowWithTitle(content, title, lookupError);
+                                               target == MaiScreenshotTarget::WindowById
+                                                   ? windowWithId(content, windowId, lookupError)
+                                                   : windowWithTitle(content, title, lookupError);
                                            if (!window) {
                                                finishCapture(state, std::move(lookupError));
                                                return;
@@ -232,6 +249,11 @@ MaiError maiCaptureScreenshot(const MaiScreenshotRequest& request, MaiScreenshot
         return MaiError::make(MaiErrorCode::NotSupported,
                               "ScreenCaptureKit requires macOS 14 or later");
     }
+    if (request.target == MaiScreenshotTarget::WindowById &&
+        (request.windowId == 0 || request.windowId > std::numeric_limits<CGWindowID>::max())) {
+        return MaiError::make(MaiErrorCode::InvalidInput,
+                              "windowId must be a non-zero native window identifier");
+    }
     if (!CGPreflightScreenCaptureAccess()) {
         CGRequestScreenCaptureAccess();
         return MaiError::make(
@@ -239,7 +261,7 @@ MaiError maiCaptureScreenshot(const MaiScreenshotRequest& request, MaiScreenshot
             "Allow Screen & System Audio Recording for MaiChat, restart it, and retry");
     }
     const auto state = std::make_shared<MaiCaptureState>();
-    requestShareableContent(state, request.target, request.windowTitle);
+    requestShareableContent(state, request.target, request.windowTitle, request.windowId);
     return waitForCapture(state, screenshot);
 }
 
