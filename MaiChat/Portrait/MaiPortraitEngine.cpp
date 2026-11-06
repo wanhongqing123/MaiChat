@@ -1,5 +1,15 @@
 // 文件作用：运行固定版本的 MediaPipe ONNX 感知模型并执行局部照片修饰。
 // 设计边界：学习偏好不改变感知模型；低置信度定位不能替代为猜测的人体比例。
+#if defined(_WIN32)
+// ORT 加载只需精简 Windows API；排除 min/max 和 RPC small 宏，避免污染图像代码。
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#endif
+
 #include "MaiPortraitEngine.h"
 
 #define ORT_API_MANUAL_INIT
@@ -66,8 +76,8 @@ float overlap(const cv::Rect2f& first, const cv::Rect2f& second) {
     return area / std::max(1.0f, first.area() + second.area() - area);
 }
 
-std::array<float, 3> sampleSkinField(const std::vector<std::array<float, 3>>& field,
-                                  const MaiPortraitSkinPlan& plan, float gx, float gy) {
+std::array<float, 3> sampleSkinField(const std::vector<std::array<float, 3>>& field, const MaiPortraitSkinPlan& plan,
+                                     float gx, float gy) {
     const auto& domain = plan.analysisSourceRegion;
     const float px = (gx + .5f - domain[0]) * plan.proxyWidth / domain[2] - .5f,
                 py = (gy + .5f - domain[1]) * plan.proxyHeight / domain[3] - .5f;
@@ -111,8 +121,7 @@ std::array<float, 3> whiteningLinearRgb(float L, float a, float b) {
     };
     const float fy = (L + 16) / 116;
     const float X = .950456f * inverse(fy + a / 500), Y = inverse(fy), Z = 1.088754f * inverse(fy - b / 200);
-    return {3.240479f * X - 1.53715f * Y - .498535f * Z,
-            -.969256f * X + 1.875991f * Y + .041556f * Z,
+    return {3.240479f * X - 1.53715f * Y - .498535f * Z, -.969256f * X + 1.875991f * Y + .041556f * Z,
             .055648f * X - .204043f * Y + 1.057311f * Z};
 }
 
@@ -121,15 +130,15 @@ bool whiteningInGamut(const std::array<float, 3>& rgb) {
 }
 
 void skinColor(const cv::Mat& source, cv::Mat& destination, const cv::Mat& mask, const cv::Rect& area,
-               const MaiPortraitParameters::Values& values, const MaiPortraitSkinPlan* plan,
-               int sourceX = 0, int sourceY = 0) {
+               const MaiPortraitParameters::Values& values, const MaiPortraitSkinPlan* plan, int sourceX = 0,
+               int sourceY = 0) {
     const bool clean = plan && plan->cleanApplied;
     if (!clean && values[0] == 0 && values[1] == 0 && values[2] == 0 && values[7] == 0) return;
     if (clean) {
         for (int y = area.y; y < area.y + area.height; ++y)
             for (int x = area.x; x < area.x + area.width; ++x) {
                 const float alpha = plan->cleanStrength * std::min(mask.at<unsigned char>(y, x) / 255.f,
-                    sampleBodyAlpha(*plan, x + sourceX, y + sourceY));
+                                                                   sampleBodyAlpha(*plan, x + sourceX, y + sourceY));
                 if (alpha == 0) continue;
                 const auto work = sampleSkinField(plan->materialOriginal, *plan, x + sourceX, y + sourceY);
                 const auto target = sampleSkinField(plan->materialTarget, *plan, x + sourceX, y + sourceY);
@@ -154,8 +163,8 @@ void skinColor(const cv::Mat& source, cv::Mat& destination, const cv::Mat& mask,
                 const float alpha = mask.at<unsigned char>(y + area.y, x + area.x) / 255.f;
                 if (alpha == 0) continue;
                 const auto original = base.at<cv::Vec4b>(y, x);
-                const auto softened = values[0] > 0 ? blurred.at<cv::Vec3b>(y, x) :
-                    cv::Vec3b(original[0], original[1], original[2]);
+                const auto softened =
+                    values[0] > 0 ? blurred.at<cv::Vec3b>(y, x) : cv::Vec3b(original[0], original[1], original[2]);
                 auto& output = destination.at<cv::Vec4b>(y + area.y, x + area.x);
                 for (int c = 0; c < 3; ++c) {
                     float value = original[c] + (softened[c] - original[c]) * values[0] * .65f;
@@ -191,8 +200,8 @@ void skinColor(const cv::Mat& source, cv::Mat& destination, const cv::Mat& mask,
                     {input[0], input[1], input[2]}, {target[0], target[1], target[2]}, values[7]);
                 for (int c = 0; c < 3; ++c) row[x * 4 + c] = cv::saturate_cast<unsigned char>(255 * guarded[c]);
                 for (int c = 0; c < 3; ++c)
-                    pixels[x * 4 + c] = cv::saturate_cast<unsigned char>(
-                        pixels[x * 4 + c] + (row[x * 4 + c] - pixels[x * 4 + c]) * alpha);
+                    pixels[x * 4 + c] = cv::saturate_cast<unsigned char>(pixels[x * 4 + c] +
+                                                                         (row[x * 4 + c] - pixels[x * 4 + c]) * alpha);
             }
         }
     }
@@ -536,8 +545,10 @@ public:
                                     gx < face.x + 1.15f * face.width && gy >= face.y - .15f * face.height &&
                                     gy < face.y + 1.15f * face.height;
                 // 净肤只接受真实class2 + 可靠人物归属，绝不以combined-face mask去除纹理。
-                body.at<unsigned char>(y, x) = selectedPerson >= 0 && !onFace && owner >= .75f
-                    ? cv::saturate_cast<unsigned char>(body.at<unsigned char>(y, x) * owner) : 0;
+                body.at<unsigned char>(y, x) =
+                    selectedPerson >= 0 && !onFace && owner >= .75f
+                        ? cv::saturate_cast<unsigned char>(body.at<unsigned char>(y, x) * owner)
+                        : 0;
                 if (body.at<unsigned char>(y, x) >= 128) ++plan.bodyConfidencePixels;
             }
         plan.skinProxyRegion = {semanticRegion.x, semanticRegion.y, semanticRegion.width, semanticRegion.height};
@@ -603,7 +614,7 @@ float MaiPortraitEngine::whiteningShadowLightness(float lightness, float strengt
 }
 
 std::array<float, 3> MaiPortraitEngine::whiteningTargetLab(const std::array<float, 3>& inputLab,
-                                                         const std::array<float, 3>& lutLab, float strength) {
+                                                           const std::array<float, 3>& lutLab, float strength) {
     whiteningShaderStrength(strength);
     for (const auto* lab : {&inputLab, &lutLab}) {
         for (float value : *lab)
@@ -619,19 +630,20 @@ std::array<float, 3> MaiPortraitEngine::whiteningTargetLab(const std::array<floa
 }
 
 std::array<float, 3> MaiPortraitEngine::whiteningTargetRgb(const std::array<float, 3>& inputLab,
-                                                         const std::array<float, 3>& lutLab, float strength) {
+                                                           const std::array<float, 3>& lutLab, float strength) {
     const auto target = whiteningTargetLab(inputLab, lutLab, strength);
     auto rgb = whiteningLinearRgb(target[0], target[1], target[2]);
     if (!whiteningInGamut(rgb)) {
         const float inputChroma = std::hypot(inputLab[1], inputLab[2]);
         const float lutChroma = std::hypot(lutLab[1], lutLab[2]);
-        float low = 0, high = strength == 0 ? 1.f :
-            (inputChroma > 1e-4f ? std::min(1.f, lutChroma / inputChroma) : 0);
+        float low = 0, high = strength == 0 ? 1.f : (inputChroma > 1e-4f ? std::min(1.f, lutChroma / inputChroma) : 0);
         // 只沿目标Lab的a/b方向减色度；L和色相不变，20次覆盖远低于RGB8量化格的边界。
         for (int i = 0; i < 20; ++i) {
             const float middle = (low + high) * .5f;
-            if (whiteningInGamut(whiteningLinearRgb(target[0], inputLab[1] * middle, inputLab[2] * middle))) low = middle;
-            else high = middle;
+            if (whiteningInGamut(whiteningLinearRgb(target[0], inputLab[1] * middle, inputLab[2] * middle)))
+                low = middle;
+            else
+                high = middle;
         }
         rgb = whiteningLinearRgb(target[0], inputLab[1] * low, inputLab[2] * low);
     }
@@ -717,7 +729,8 @@ MaiPortraitOutput MaiPortraitEngine::apply(const unsigned char* rgba, int width,
     if (body && parameters.removeBodyHair.has_value())
         throw MaiPortraitFailure("invalid_parameters", "Body-hair removal is a beautify option, not body geometry");
     if (context && parameters.removeBodyHair.value_or(false))
-        throw MaiPortraitFailure("body_skin_unavailable", "A face-only native ROI cannot establish body skin for explicit removal");
+        throw MaiPortraitFailure("body_skin_unavailable",
+                                 "A face-only native ROI cannot establish body skin for explicit removal");
     cv::Mat source(height, width, CV_8UC4, const_cast<unsigned char*>(rgba), stride);
     cv::Mat destination = source.clone();
     MaiPortraitOutput result;
@@ -1285,7 +1298,8 @@ void MaiPortraitEngine::protectSkinFace(MaiPortraitSkinPlan& plan, const unsigne
 
 void MaiPortraitEngine::prepareSkinMaterial(MaiPortraitSkinPlan& plan, const MaiPortraitParameters& parameters) {
     if (!plan.faceProtected || plan.materialPrepared)
-        throw MaiPortraitFailure("invalid_skin_sequence", "Prepare the shared body material once after face protection");
+        throw MaiPortraitFailure("invalid_skin_sequence",
+                                 "Prepare the shared body material once after face protection");
     const size_t count = static_cast<size_t>(plan.proxyWidth) * plan.proxyHeight;
     const auto& domain = plan.analysisSourceRegion;
     if (plan.proxyWidth < 1 || plan.proxyHeight < 1 || plan.proxyWidth > 1024 || plan.proxyHeight > 1024 ||
@@ -1294,8 +1308,9 @@ void MaiPortraitEngine::prepareSkinMaterial(MaiPortraitSkinPlan& plan, const Mai
         domain[0] < 0 || domain[1] < 0 || domain[2] < 1 || domain[3] < 1 ||
         static_cast<int64_t>(domain[0]) + domain[2] > plan.sourceWidth ||
         static_cast<int64_t>(domain[1]) + domain[3] > plan.sourceHeight ||
-        (!plan.globalForeignVeto.empty() && (plan.foreignProxyWidth < 1 || plan.foreignProxyHeight < 1 ||
-         plan.globalForeignVeto.size() != static_cast<size_t>(plan.foreignProxyWidth) * plan.foreignProxyHeight)))
+        (!plan.globalForeignVeto.empty() &&
+         (plan.foreignProxyWidth < 1 || plan.foreignProxyHeight < 1 ||
+          plan.globalForeignVeto.size() != static_cast<size_t>(plan.foreignProxyWidth) * plan.foreignProxyHeight)))
         throw MaiPortraitFailure("invalid_region_context", "Body material requires its owned source workplane");
     for (int i = 0; i < 8; ++i)
         if (!std::isfinite(parameters.values[i]) || parameters.values[i] > 1 ||
@@ -1304,15 +1319,13 @@ void MaiPortraitEngine::prepareSkinMaterial(MaiPortraitSkinPlan& plan, const Mai
     plan.whiteningShaderStrength = whiteningShaderStrength(parameters.values[7]);
     plan.whiteningBlendGate = whiteningBlendGate(parameters.values[7]);
     plan.whiteningShadowAmount = whiteningShadowAmount(parameters.values[7]);
-    plan.cleanStrength = parameters.removeBodyHair ? (*parameters.removeBodyHair ? 1.f : 0.f) :
-        smooth(std::max(parameters.values[0], parameters.values[7]) / .2f);
+    plan.cleanStrength = parameters.removeBodyHair ? (*parameters.removeBodyHair ? 1.f : 0.f)
+                                                   : smooth(std::max(parameters.values[0], parameters.values[7]) / .2f);
     plan.cleanScope = "none";
     cv::Mat scope(plan.proxyHeight, plan.proxyWidth, CV_8U);
-    for (size_t i = 0; i < count; ++i)
-        scope.data[i] = plan.hasPersonOwnership && plan.bodyAlpha[i] > 96 ? 255 : 0;
+    for (size_t i = 0; i < count; ++i) scope.data[i] = plan.hasPersonOwnership && plan.bodyAlpha[i] > 96 ? 255 : 0;
     // 与已看原型一致的内区成熟过程；只修补小孔，腐蚀保护衣服/身体轮廓边缘。
-    cv::morphologyEx(scope, scope, cv::MORPH_CLOSE,
-                    cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
+    cv::morphologyEx(scope, scope, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
     cv::erode(scope, scope, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9)));
     for (int y = 0; y < plan.proxyHeight; ++y)
         for (int x = 0; x < plan.proxyWidth; ++x) {
@@ -1322,15 +1335,17 @@ void MaiPortraitEngine::prepareSkinMaterial(MaiPortraitSkinPlan& plan, const Mai
             bool forbidden = !plan.hasPersonOwnership || plan.ownership[i] < 192;
             const auto& face = plan.selectedFace;
             if (plan.faceCount > 0 && gx >= face.x - .15f * face.width && gx < face.x + 1.15f * face.width &&
-                gy >= face.y - .15f * face.height && gy < face.y + 1.15f * face.height) forbidden = true;
+                gy >= face.y - .15f * face.height && gy < face.y + 1.15f * face.height)
+                forbidden = true;
             for (const auto& excluded : plan.excludedFaces)
                 if (gx >= excluded[0] && gx < excluded[0] + excluded[2] && gy >= excluded[1] &&
-                    gy < excluded[1] + excluded[3]) forbidden = true;
+                    gy < excluded[1] + excluded[3])
+                    forbidden = true;
             if (!plan.globalForeignVeto.empty()) {
                 const int vx = std::clamp(static_cast<int>(gx * plan.foreignProxyWidth / plan.sourceWidth), 0,
-                                           plan.foreignProxyWidth - 1);
+                                          plan.foreignProxyWidth - 1);
                 const int vy = std::clamp(static_cast<int>(gy * plan.foreignProxyHeight / plan.sourceHeight), 0,
-                                           plan.foreignProxyHeight - 1);
+                                          plan.foreignProxyHeight - 1);
                 if (plan.globalForeignVeto[static_cast<size_t>(vy) * plan.foreignProxyWidth + vx]) forbidden = true;
             }
             if (forbidden) scope.data[i] = 0;
@@ -1339,25 +1354,29 @@ void MaiPortraitEngine::prepareSkinMaterial(MaiPortraitSkinPlan& plan, const Mai
     plan.cleanApplied = plan.cleanStrength > 0 && bodyPixels >= 64;
     if (plan.cleanApplied) {
         // 全 ROI 一次 Telea/连通组件/低通引导，峰值场大小受1024²约束，与32MP源大小无关。
-        const auto material = MaiBodySkinRetouch::buildMaterial(plan.proxyRgba.data(), plan.proxyWidth,
-            plan.proxyHeight, plan.proxyWidth * 4, scope.data, plan.proxyWidth);
+        const auto material = MaiBodySkinRetouch::buildMaterial(
+            plan.proxyRgba.data(), plan.proxyWidth, plan.proxyHeight, plan.proxyWidth * 4, scope.data, plan.proxyWidth);
         plan.materialTarget = material.target;
         plan.bodyAlpha = material.alpha;
         plan.materialOriginal.resize(count);
         for (size_t i = 0; i < count; ++i)
             plan.materialOriginal[i] = {static_cast<float>(plan.proxyRgba[i * 4]),
-                static_cast<float>(plan.proxyRgba[i * 4 + 1]), static_cast<float>(plan.proxyRgba[i * 4 + 2])};
+                                        static_cast<float>(plan.proxyRgba[i * 4 + 1]),
+                                        static_cast<float>(plan.proxyRgba[i * 4 + 2])};
         plan.cleanScope = "selected_person_class2_body_interior";
     } else {
         cv::Mat distance;
         cv::distanceTransform(scope, distance, cv::DIST_L2, cv::DIST_MASK_PRECISE);
         for (size_t i = 0; i < count; ++i)
-            plan.bodyAlpha[i] = bodyPixels >= 64 && scope.data[i] ? cv::saturate_cast<unsigned char>(
-                255 * smooth(distance.ptr<float>()[i] / 6.f)) : 0;
-        plan.cleanSkipReason = plan.cleanStrength == 0 ?
-            (parameters.removeBodyHair ? "disabled_by_parameter" : "zero_auto_strength") : "body_skin_unavailable";
+            plan.bodyAlpha[i] = bodyPixels >= 64 && scope.data[i]
+                                    ? cv::saturate_cast<unsigned char>(255 * smooth(distance.ptr<float>()[i] / 6.f))
+                                    : 0;
+        plan.cleanSkipReason = plan.cleanStrength == 0
+                                   ? (parameters.removeBodyHair ? "disabled_by_parameter" : "zero_auto_strength")
+                                   : "body_skin_unavailable";
         if (parameters.removeBodyHair.value_or(false))
-            throw MaiPortraitFailure("body_skin_unavailable", "Explicit body-hair removal requires reliable class2 body skin");
+            throw MaiPortraitFailure("body_skin_unavailable",
+                                     "Explicit body-hair removal requires reliable class2 body skin");
     }
     plan.materialPrepared = true;
 }
@@ -1365,7 +1384,8 @@ void MaiPortraitEngine::prepareSkinMaterial(MaiPortraitSkinPlan& plan, const Mai
 MaiPortraitOutput MaiPortraitEngine::applySkinTile(const unsigned char* rgba, int width, int height, int stride,
                                                    const MaiPortraitSkinPlan& plan, int tileIndex,
                                                    const MaiPortraitParameters& parameters) {
-    if (!plan.faceProtected || !plan.materialPrepared || tileIndex < 0 || tileIndex >= static_cast<int>(plan.tiles.size()))
+    if (!plan.faceProtected || !plan.materialPrepared || tileIndex < 0 ||
+        tileIndex >= static_cast<int>(plan.tiles.size()))
         throw MaiPortraitFailure("invalid_skin_sequence", "Prepare face protection before processing planned tiles");
     const auto& tile = plan.tiles[tileIndex];
     if (!rgba || width != tile.sample[2] || height != tile.sample[3] || stride < width * 4 || width > 1040 ||
@@ -1395,7 +1415,8 @@ MaiPortraitOutput MaiPortraitEngine::applySkinTile(const unsigned char* rgba, in
     if (plan.proxyWidth < 1 || plan.proxyWidth > 1024 || plan.proxyHeight < 1 || plan.proxyHeight > 1024 ||
         plan.sourceWidth < 1 || plan.sourceHeight < 1 || plan.alpha.size() != proxyPixels ||
         plan.proxyRgba.size() != proxyPixels * 4 || plan.bodyAlpha.size() != proxyPixels ||
-        (plan.cleanApplied && (plan.materialOriginal.size() != proxyPixels || plan.materialTarget.size() != proxyPixels)) ||
+        (plan.cleanApplied &&
+         (plan.materialOriginal.size() != proxyPixels || plan.materialTarget.size() != proxyPixels)) ||
         (plan.hasPersonOwnership && plan.ownership.size() != proxyPixels) ||
         (plan.faceCount > 0 && !plan.faceColorSkipped &&
          (plan.faceProtection.size() != facePixels || plan.faceBlend.size() != facePixels ||
@@ -1441,8 +1462,8 @@ MaiPortraitOutput MaiPortraitEngine::applySkinTile(const unsigned char* rgba, in
                 if (!plan.faceColorSkipped && nativeX >= 0 && nativeY >= 0 && nativeX < plan.faceRegion[2] &&
                     nativeY < plan.faceRegion[3]) {
                     const size_t i = static_cast<size_t>(nativeY) * plan.faceRegion[2] + nativeX;
-                    mask.at<unsigned char>(y, x) = cv::saturate_cast<unsigned char>(
-                        plan.faceProtection[i] * (plan.faceExclusion[i] / 255.f));
+                    mask.at<unsigned char>(y, x) =
+                        cv::saturate_cast<unsigned char>(plan.faceProtection[i] * (plan.faceExclusion[i] / 255.f));
                 }
                 continue;
             }
@@ -1483,8 +1504,9 @@ MaiPortraitOutput MaiPortraitEngine::applySkinTile(const unsigned char* rgba, in
             mask.at<unsigned char>(y, x) = cv::saturate_cast<unsigned char>(alpha);
         }
     const bool hasSkin = cv::countNonZero(mask) > 0;
-    if (hasSkin) skinColor(source, destination, mask, {0, 0, width, height}, parameters.values,
-                           &plan, tile.sample[0], tile.sample[1]);
+    if (hasSkin)
+        skinColor(source, destination, mask, {0, 0, width, height}, parameters.values, &plan, tile.sample[0],
+                  tile.sample[1]);
     MaiPortraitOutput result;
     result.analysisVersion = "mediapipe-onnx-skin-20261104-v3";
     result.cleanApplied = plan.cleanApplied;

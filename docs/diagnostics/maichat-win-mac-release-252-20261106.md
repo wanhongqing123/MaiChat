@@ -49,3 +49,25 @@ fast-forward 到上述远端基线后，恢复安全 stash
 
 冻结后的完整 SHA 由 Release 目标提交及各平台 manifest 记录；实际打包、解压/挂载、
 签名和公开发布回读的最终证据保存在验收目录，并随 Release 提供脱敏后的平台清单。
+
+## 发布包审计及 Windows 编译补充
+
+首个候选 0277cda6 已由双方通过 Git bundle 校验同一 SHA；本机大包 Git 推送遇到 TLS
+传输中断，house-maichat 从 bundle fast-forward 后代为成功推送，双方均回读 origin/main。
+共同草稿 Release ID 436491882，没有提前公开或上传旧候选安装包。
+
+Mac 完整 staging、只读 DMG 挂载、ZIP 实际解压的签名和纯系统 PATH smoke 均通过，
+但真实 Mach-O 依赖审计发现 libwebp 的 @rpath/libsharpyuv.0.dylib 未随 Qt 5 部署器带入。
+不能把主程序启动成功当作所有图片插件可用。新打包流程从同一 WebP 安装目录复制
+匹配 arm64 的 SharpYUV，改用同目录 loader_path，并在签名前检查实际加载命令、依赖
+闭包及 App 架构。原包验证器退出 1，新包退出 0，缺口为三个 WebP 消费者；
+LC_ID_DYLIB 和 universal 架构标题均不算运行时加载依赖。
+SDK 附带而未被 App 加载的另一架构 CoreAudio driver 资源单独记录，不宣称它支持 arm64。
+
+Windows 在真实 MSVC2019 编译发现 windows.h 的 min/max 及 RPC small 宏污染图像代码。
+house-maichat 使用冻结源码和原 cl 命令作 RED/GREEN：原文件 exit 2 / 102 错误，
+仅增加 NOMINMAX、WIN32_LEAN_AND_MEAN 后 exit 0 / 0 错误。收到并核对补丁 SHA256 后
+合入同一 main；这不是美颜算法调整。另给 Windows 人像测试链接与产品同一份 qrc，
+使 YuNet / 人体分割资源确实存在，Mac Vision 的通过结论不能替代 Windows 资源入口。
+上述修正统一进入最终冻结提交；Windows 保留输入未变化的编译缓存，在新 HEAD 下继续
+增量构建及首次完整门禁，正式安装包、草稿目标与两端 manifest 均采用最终完整 SHA。

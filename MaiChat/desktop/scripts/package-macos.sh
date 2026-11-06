@@ -184,6 +184,46 @@ if [[ ! -f "$staged_app/Contents/Frameworks/QtWebSockets.framework/Versions/5/Qt
   exit 1
 fi
 
+# Qt 5 的部署器会复制 WebP，但可能漏掉新版 WebP 的 @rpath SharpYUV 依赖。
+# 将同一安装包的依赖放到库旁边，显式使用 loader_path，避免只在有 Homebrew 的打包机上能解码。
+webp_needs_sharpyuv=false
+for webp_library in "$trtc_target_dir"/libwebp*.dylib; do
+  if [[ -f "$webp_library" ]] && otool -L "$webp_library" | grep -Fq '@rpath/libsharpyuv.0.dylib'; then
+    webp_needs_sharpyuv=true
+  fi
+done
+if [[ "$webp_needs_sharpyuv" == true ]]; then
+  webp_runtime_dir="${MAICHAT_WEBP_RUNTIME_DIR:-}"
+  webp_prefix=""
+  if [[ -z "$webp_runtime_dir" ]] && command -v brew >/dev/null 2>&1; then
+    webp_prefix="$(brew --prefix webp)"
+    webp_runtime_dir="$webp_prefix/lib"
+  fi
+  sharpyuv_source="$webp_runtime_dir/libsharpyuv.0.dylib"
+  if [[ ! -f "$sharpyuv_source" ]]; then
+    echo "Missing WebP dependency libsharpyuv.0.dylib; set MAICHAT_WEBP_RUNTIME_DIR to its matching WebP lib directory." >&2
+    exit 1
+  fi
+  lipo -verify_arch arm64 "$sharpyuv_source"
+  cp -pL "$sharpyuv_source" "$trtc_target_dir/libsharpyuv.0.dylib"
+  install_name_tool -id '@rpath/libsharpyuv.0.dylib' "$trtc_target_dir/libsharpyuv.0.dylib"
+  for webp_library in "$trtc_target_dir"/libwebp*.dylib; do
+    if [[ -f "$webp_library" ]] && otool -L "$webp_library" | grep -Fq '@rpath/libsharpyuv.0.dylib'; then
+      install_name_tool -change '@rpath/libsharpyuv.0.dylib' '@loader_path/libsharpyuv.0.dylib' "$webp_library"
+    fi
+  done
+  if [[ -n "$webp_prefix" ]]; then
+    for notice in COPYING PATENTS; do
+      for notice_source in "$webp_prefix/$notice" "$webp_prefix/share/doc/webp/$notice"; do
+        if [[ -f "$notice_source" ]]; then
+          cp "$notice_source" "$code_font_licenses_dir/libwebp-$notice.txt"
+          break
+        fi
+      done
+    done
+  fi
+fi
+
 sdk_source="$project_root/vendor/tencent-im/macos/ImSDKForMac_Plus.framework"
 if [[ ! -d "$sdk_source" ]]; then
   echo "Missing native IM SDK framework: $sdk_source" >&2
@@ -193,6 +233,10 @@ fi
 sdk_target_dir="$staged_app/Contents/MacOS/vendor/tencent-im/macos"
 mkdir -p "$sdk_target_dir"
 ditto "$sdk_source" "$sdk_target_dir/ImSDKForMac_Plus.framework"
+
+# 仅启动主程序不足以覆盖延迟加载的图片插件。签名前核对加载依赖及 App 所需架构，额外 SDK 驱动单列。
+"$python" "$project_root/scripts/verify-macos-runtime.py" "$staged_app" \
+  --json-output "$dist_root/macos-runtime-audit.json"
 
 # 使用标准拖拽安装布局，用户可把 App 拖进“应用程序”。
 ln -s /Applications "$staging/Applications"
