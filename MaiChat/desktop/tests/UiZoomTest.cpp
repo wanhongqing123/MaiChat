@@ -51,7 +51,10 @@ void UiZoomTest::fontFamilyUpdatesExistingControlsAndMarkdown() {
         QCOMPARE(editor.selectionStart(), 1);
         QCOMPARE(editor.selectedText().size(), 4);
         QCOMPARE(markdown.theme().bodyFamily, UiZoom::fontFamilies().first());
-        QCOMPARE(QFontInfo(editor.font()).family(), UiZoom::fontFamilies().first());
+        // Windows 同一字体可能以 SimSun / 宋体等别名返回；比较实际解析字体，仍检出未刷新为所选字体。
+        QFont expectedFont = editor.font();
+        expectedFont.setFamily(UiZoom::fontFamilies().first());
+        QCOMPARE(QFontInfo(editor.font()).family(), QFontInfo(expectedFont).family());
         QCOMPARE(markdown.theme().bodyPixelSize, 16);
         QVERIFY(markdown.theme().codeFamily != markdown.theme().bodyFamily);
     }

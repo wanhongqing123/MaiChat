@@ -828,6 +828,20 @@ qreal MarkdownLayout::naturalWidth() const {
     return widest;
 }
 
+qreal MarkdownLayout::laidOutWidth() const {
+    qreal widest = 0;
+    for (const TextRun& run : impl_->runs) {
+        for (int index = 0; index < run.layout->lineCount(); ++index) {
+            const QTextLine line = run.layout->lineAt(index);
+            // naturalTextRect 包含当前行的对齐位置；只看文字宽度会丢失右对齐标记。
+            widest = qMax(widest, run.position.x() + line.naturalTextRect().right());
+        }
+    }
+    // 代码、引用和表格等整块背景仍决定占用范围，不能只按其中的文字收窄。
+    for (const Shape& shape : impl_->shapes) widest = qMax(widest, shape.rect.right());
+    return widest;
+}
+
 const QVector<MarkdownCodeBlockViewport>& MarkdownLayout::codeBlocks() const {
     return impl_->codeBlocks;
 }

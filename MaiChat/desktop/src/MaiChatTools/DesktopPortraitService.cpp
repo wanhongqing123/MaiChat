@@ -76,12 +76,18 @@ struct NewFiles {
 void savePng(const QImage& image, const QString& temporary, const QString& output,
              const DesktopPortraitRequest& request, NewFiles& files) {
     checkCanceled(request);
-    QImageWriter writer(temporary, "png");
-    if (!writer.write(image)) throw std::runtime_error("Cannot encode complete portrait PNG");
+    // Qt 读写器析构时才关闭文件；写入和验证各自结束后释放句柄，
+    // Windows 才能对完整的同目录临时文件执行不覆盖的原子发布。
+    {
+        QImageWriter writer(temporary, "png");
+        if (!writer.write(image)) throw std::runtime_error("Cannot encode complete portrait PNG");
+    }
     // Decoder validation precedes no-replace publication; no partial file becomes a result.
-    QImageReader verify(temporary, "png");
-    if (!verify.canRead() || verify.size() != image.size() || verify.read().isNull())
-        throw std::runtime_error("Encoded portrait PNG failed validation");
+    {
+        QImageReader verify(temporary, "png");
+        if (!verify.canRead() || verify.size() != image.size() || verify.read().isNull())
+            throw std::runtime_error("Encoded portrait PNG failed validation");
+    }
     checkCanceled(request);
     takeOutput(maiPortraitPublishOutput(temporary.toUtf8().constData(), output.toUtf8().constData()));
     files.paths.append(output);

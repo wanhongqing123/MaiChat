@@ -102,7 +102,9 @@ int main(int argc, char** argv) {
         const QImage mask(QDir(workspace).filePath(result.value(QStringLiteral("mask_path")).toString()));
         require(edited.size() == source.size() && mask.size() == source.size(), "native dimensions were lost");
         require(!result.value(QStringLiteral("result_id")).toString().isEmpty(), "result was not registered");
-        require(result.value(QStringLiteral("original_path")).toString() == QFileInfo(input).canonicalFilePath(),
+        // C++ 输出使用宿主分隔符；路径身份不应因 Windows 的反斜杠表示而误判。
+        require(QDir::fromNativeSeparators(result.value(QStringLiteral("original_path")).toString()) ==
+                    QFileInfo(input).canonicalFilePath(),
                 "original lineage was lost");
         require(read(input) == original, "source bytes changed");
         require(QFile::exists(QDir(profile).filePath(QStringLiteral("portrait.sqlite3"))), "account ledger missing");
@@ -169,7 +171,8 @@ int main(int argc, char** argv) {
                                     .object()
                                     .value(QStringLiteral("output"))
                                     .toObject();
-        require(toolOutput.value(QStringLiteral("original_path")).toString() == QFileInfo(input).canonicalFilePath(),
+        require(QDir::fromNativeSeparators(toolOutput.value(QStringLiteral("original_path")).toString()) ==
+                    QFileInfo(input).canonicalFilePath(),
                 "tool re-edited generated pixels instead of original");
         if (argc == 5) {
             require(QDir(workspace).entryList({QStringLiteral("*.partial")}, QDir::Files).isEmpty(),

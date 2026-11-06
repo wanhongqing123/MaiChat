@@ -135,7 +135,9 @@ public:
             const int railX = option.rect.left() + UiZoom::s(22);
             painter->drawLine(railX, option.rect.top(), railX, option.rect.bottom());
             QFont font = option.font;
-            font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Detail));
+            // 会话名称是主要内容，与聊天正文共用字体和字号基准，不能套次要说明角色。
+            font.setFamilies(UiZoom::fontFamilies());
+            font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
             font.setBold(selected);
             painter->setFont(font);
             painter->setPen(QColor(selected ? QStringLiteral("#0b466f") :
@@ -238,8 +240,7 @@ AgentSessionList::AgentSessionList(AgentController& controller, QWidget* parent)
                        "QPushButton:hover{background:%3;border-color:%4;color:%4;}")
             .arg(kInk, kLine, kAccentWash, kAccent));
     QFont newFont = newButton->font();
-    newFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Detail));
-    UiZoom::setFont(newButton, UiZoom::TextRole::Detail, newFont);
+    UiZoom::setFont(newButton, UiZoom::TextRole::Body, newFont);
     headRow->addWidget(newButton);
     column->addWidget(head);
 

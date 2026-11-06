@@ -89,6 +89,9 @@ public:
     // 不折行时这篇内容需要多宽。气泡要「短消息就窄一点」，得先知道这个。
     // **不要用 QFontMetrics 去估**——上一版气泡就是估窄了，字被提前折断。
     qreal naturalWidth() const;
+    // 当前换行结果实际占用的最右边界，包含缩进、尾注和块背景；不重新排版。
+    // 宿主收窄已换行气泡时用它，避免把未折行的整段宽度截成整列宽度。
+    qreal laidOutWidth() const;
     const QVector<MarkdownCodeBlockViewport>& codeBlocks() const;
     bool isEmpty() const;
 

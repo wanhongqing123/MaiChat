@@ -214,7 +214,8 @@ int MarkdownLabel::naturalWidthForWidth(int maximumWidth) const {
     const Runtime& runtime = *runtime_;
     const MarkdownLayout& measured = qFuzzyCompare(runtime.laidOutWidth, target)
         ? runtime.layout : runtime.probe;
-    return qBound(0, qCeil(measured.naturalWidth()), maximumWidth);
+    // 当前约束已决定断行；向上取整实际行边界，避免分数像素向下取整造成再次换行。
+    return qBound(0, qCeil(measured.laidOutWidth()), maximumWidth);
 }
 
 QSize MarkdownLabel::sizeHint() const {

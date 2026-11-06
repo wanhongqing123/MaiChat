@@ -83,3 +83,38 @@ Mac 另用私有 Qt 解码探针读取合成 2×2 WebP，在纯系统 PATH 下�
 确认 Qt imageformats/WebP/SharpYUV 全从部署 App 内加载，未加载 Homebrew 库。该探针
 只用于打包验收，不进入产品，也不使用用户素材；此前 ffmpeg 缺编码器及探针首次头文件
 路径错误已修正，未将这两次准备失败算作成功验证。
+
+## Windows 完整门禁发现及最终候选修正
+
+fa95f72e 首轮 26 组为 18 通过、7 失败、1 前台环境跳过；不能把这轮报成全通过。
+两组云盘 fixture 的自有进程 CDB 栈停在 QApplication 的平台插件初始化错误框，未到
+TLS 请求。错误框只列出 windows，环境却请求 offscreen；为本地测试显式设置同版本
+SDK 的 QT_PLUGIN_PATH 后，GUI/Agent TLS 实际生命周期分别恢复通过。两个 Network
+目标虽已注册，但子目录 EXCLUDE_FROM_ALL，需要显式构建；构建后下载/云盘 TLS 通过。
+没有为此改动 HTTP 代理或产品网络策略。Mac 最终源对照的云盘对话框 4.54 秒通过，
+下载和云盘 TLS 两项 37.12 秒通过，不能拿 Mac 结果替代 Windows 现场。
+
+Windows 人像 ordinary edit 实际失败 output_commit_failed。最小 Win32 现场显示读写器
+均存活时 MoveFileExW 返回 ERROR_SHARING_VIOLATION(32)，只销毁 writer 仍失败，全部
+关闭后同路径成功。修复仅缩短 Qt PNG writer/reader 的作用域：写完关闭、解码验证后
+关闭，再按原 no-replace 接口发布；取消和回滚规则不变。补丁通过哈希核对后合入。
+人像测试另将两处 native separator 转成统一斜杠，继续核对原图 lineage；没有放宽
+原图保护、取消、授权、32MP PNG/mask 等断言。Windows 私有真实服务完整通过，
+Mac 同一服务修复后完整回归通过（13.52 秒）。
+
+UiZoom 测试的请求名 SimSun 与实际字体名 宋体属于 Windows 同一字体的别名；改为
+比较相同参数下 QFontInfo 解析出的实际字体，保留草稿、选区、Markdown 字号和代码字体
+隔离断言。Windows 修正前 7 通过/1 失败，修正后两种 QPA 均 8/8；Mac 全套通过。
+
+长文本发送气泡另有真实量宽问题：Windows body 宽 778px，实际最长排版行 680px，
+右侧空白 98.67px。QTextLayout::maximumWidth 是未折行宽度，不能截成当前列宽当作
+实际行宽。保留原 naturalWidth API，新增 laidOutWidth 量实际行、缩进、尾注与块背景，
+仅 Label 的气泡量宽改用它；原 20px 阈值不改，Windows 私有修复后空白 0.67px，长短
+句、Layout、Label 回归通过。最终 Mac/Windows 包以再次冻结后的提交为准，fa95 草稿
+二进制不是最终发布产物。
+
+用户 22:02 的当前 Mac 截图再次指出创作中心列表字号偏小。已核对运行中
+/Applications/MaiChat.app 为 fa95 的 2.2.52（主二进制 SHA 与已验包一致，进程 34276），
+不是仍运行旧 2.2.34。列表名称和新对话按钮错误使用 Detail=14px，正文 Body=16px；
+统一为 Body 并给自绘名称显式使用共同字体族，时间/数量等辅助信息继续使用相对角色。
+不停止或替换用户当前程序，待发布包与在用构建分开核对。
