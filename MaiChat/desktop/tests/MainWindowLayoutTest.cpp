@@ -51,6 +51,7 @@
 #include "agent/AgentController.h"
 #include "agent/AgentSessionList.h"
 #include "agent/DesktopSessionSyncCoordinator.h"
+#include "MaiSqliteStore.h"
 #include "markdown/MarkdownView.h"
 #include <QTextBlock>
 #include <QTextList>
@@ -132,6 +133,7 @@ class MainWindowLayoutTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void agentSessionSwitchReusesTheExistingPage();
     void groupMenuCreatesAndOpensTextConversation();
     void transientActivityFollowsOnlyActivityEventsAcrossConversationSwitches();
     void transientActivityStaysAfterNewOutgoingMessage();
@@ -1718,6 +1720,113 @@ void MainWindowLayoutTest::agentConversationListUsesResizableSplitter() {
     QApplication::sendEvent(handle, &move);
     QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, finish);
     QVERIFY(splitter->sizes().at(0) != before);
+}
+
+void MainWindowLayoutTest::agentSessionSwitchReusesTheExistingPage() {
+    ScopedMessageHeaderFont productFonts;
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    const QString owner = QStringLiteral("switch-fixture-%1")
+                              .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const QString dataRoot = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    const QString accountHash = QString::fromLatin1(
+        QCryptographicHash::hash(owner.toUtf8(), QCryptographicHash::Sha256).toHex());
+    const QString accountRoot = QDir(dataRoot).filePath(QStringLiteral("Agent/Accounts/%1").arg(accountHash));
+    QVERIFY(QDir().mkpath(accountRoot));
+    const QStringList ids{QStringLiteral("ses_window_switch_a"), QStringLiteral("ses_window_switch_b"),
+                          QStringLiteral("ses_window_switch_c")};
+    {
+        auto opened = makeMaiSqliteStore(QDir(accountRoot).filePath(QStringLiteral("agent.db")).toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        for (int sessionIndex = 0; sessionIndex < ids.size(); ++sessionIndex) {
+            MaiSession session;
+            session.id = ids[sessionIndex].toStdString();
+            session.title = QStringLiteral("本地回归会话 %1").arg(sessionIndex + 1).toStdString();
+            session.directory = workspace.path().toStdString();
+            session.created = session.updated = 100 + sessionIndex;
+            store->putSession(session);
+            for (int index = 0; index < 40; ++index) {
+                MaiMessage message;
+                message.id = QStringLiteral("msg_%1_%2").arg(ids[sessionIndex])
+                                 .arg(index, 4, 10, QLatin1Char('0')).toStdString();
+                message.role = index % 2 ? MaiRole::Assistant : MaiRole::User;
+                message.created = message.completed = index + 1;
+                const QString body = message.role == MaiRole::User
+                    ? QStringLiteral("请查看这个本地回归结果 %1").arg(index)
+                    : QStringLiteral("## 已完成检查 %1\n\n").arg(index) +
+                      QStringLiteral("这段长正文用于检查会话切换，包含 **格式化文字** 与 `code`。\n\n").repeated(8) +
+                      QStringLiteral("| 检查项 | 结果 |\n| --- | --- |\n| 消息隔离 | 通过 |\n| 历史内容 | 保留 |\n");
+                message.parts.push_back({"prt_" + message.id, MaiTextPart{body.toStdString()}, index + 1});
+                if (message.role == MaiRole::Assistant)
+                    for (int toolIndex = 0; toolIndex < 12; ++toolIndex) {
+                        MaiToolPart tool;
+                        tool.callId = "call_" + message.id + "_" + std::to_string(toolIndex);
+                        tool.tool = "shell";
+                        tool.input = R"({"command":"local fixture"})";
+                        tool.output = std::string(4096, 'x');
+                        tool.state = MaiToolState::Completed;
+                        message.parts.push_back({tool.callId, std::move(tool), index + 1});
+                    }
+                store->putMessage(session.id, message);
+            }
+        }
+        QVERIFY(!store->lastWriteError().hasError());
+    }
+    {
+        RemoteIMApplication app(owner, std::make_unique<FakeRemoteIMClient>());
+        MainWindow window(app);
+        window.resize(1300, 850);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+        auto* navigation = window.findChild<QPushButton*>(QStringLiteral("agentNavButton"));
+        auto* panel = window.findChild<AgentChatPanel*>();
+        auto* sessionList = window.findChild<AgentSessionList*>();
+        auto* rows = sessionList ? sessionList->findChild<QListWidget*>() : nullptr;
+        QVERIFY(navigation && panel && rows);
+        navigation->click();
+        const auto clickSession = [&](const QString& id) {
+            for (int row = 0; row < rows->count(); ++row) {
+                auto* item = rows->item(row);
+                if (item->data(Qt::UserRole).toString() != id) continue;
+                rows->scrollToItem(item);
+                QTest::mouseClick(rows->viewport(), Qt::LeftButton, Qt::NoModifier,
+                                  rows->visualItemRect(item).center(), 0);
+                return true;
+            }
+            return false;
+        };
+        QVERIFY(clickSession(ids[0]));
+        QCoreApplication::processEvents();
+        QPointer<QPushButton> original;
+        const QString lastId = QStringLiteral("msg_%1_0039").arg(ids[0]);
+        for (QPushButton* quote : panel->findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")))
+            if (quote->isVisible() && quote->property("messageId").toString() == lastId) original = quote;
+        QVERIFY(original);
+        QVERIFY(clickSession(ids[1]));
+        QCoreApplication::processEvents();
+        QVERIFY(clickSession(ids[2]));
+        QCoreApplication::processEvents();
+        QElapsedTimer timer;
+        timer.start();
+        QVERIFY(clickSession(ids[0]));
+        const qint64 clickUs = timer.nsecsElapsed() / 1000;
+        QCoreApplication::processEvents();
+        qInfo("main_window_switch_fixture click_us=%lld first_paint_us=%lld", clickUs,
+              timer.nsecsElapsed() / 1000);
+        QCOMPARE(panel->sessionId(), ids[0]);
+        QVERIFY(original && original->isVisible());
+        const QString output = qEnvironmentVariable("MAICHAT_SESSION_SWITCH_CAPTURE_DIR");
+        if (!output.isEmpty()) {
+            QVERIFY(QDir().mkpath(output));
+            QVERIFY(window.grab().save(QDir(output).filePath(QStringLiteral("session-switch-main-window.png"))));
+        }
+    }
+    // Delete only this freshly generated, canonical fixture account directory.
+    const QString canonical = QFileInfo(accountRoot).canonicalFilePath();
+    const QString allowed = QDir(dataRoot).canonicalPath() + QStringLiteral("/Agent/Accounts/");
+    QVERIFY(!canonical.isEmpty() && canonical.startsWith(allowed) && QFileInfo(canonical).fileName() == accountHash);
+    QVERIFY(QDir(canonical).removeRecursively());
 }
 
 void MainWindowLayoutTest::agentAccountsUseDistinctDefaultStorage() {

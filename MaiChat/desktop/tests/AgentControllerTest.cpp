@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -29,7 +30,9 @@
 #include "MaiScreenshot.h"
 #include "MaiScreenshotTool.h"
 #include "MaiSessionSchedule.h"
+#include "MaiSqliteStore.h"
 #include "MaiTime.h"
+#include "../../../MaiAgent/third_party/sqlite/sqlite3.h"
 
 // AgentController 的活儿只有一件：把 MaiAgent 的事件从**核心的线程**搬到 Qt 主线程。
 // 所以这份用例的重点不是"信号发出来了没有"，而是"它们到达的时候人在哪个线程上"。
@@ -37,6 +40,49 @@
 // 光断言"收到了信号"是验不到东西的：即使一行排队代码都没有、直接在网络线程上 emit，
 // QSignalSpy 照样能记到（它就是个槽）。必须比对线程 id 才算数。
 namespace {
+
+// Observe the real temporary store rather than adding a store-injection API to
+// the controller. Row counts make history-size regressions deterministic and do
+// not depend on the speed of the machine running this test.
+struct ControllerReadProbe {
+    explicit ControllerReadProbe(QString path)
+        : databasePath(QDir::cleanPath(QDir::fromNativeSeparators(path))) {
+        active = this;
+        installed = sqlite3_auto_extension(reinterpret_cast<void (*)()>(attach)) == SQLITE_OK;
+    }
+    ~ControllerReadProbe() {
+        sqlite3_cancel_auto_extension(reinterpret_cast<void (*)()>(attach));
+        active = nullptr;
+    }
+
+    static int attach(sqlite3* database, char**, const sqlite3_api_routines*) {
+        const QString path = QDir::cleanPath(QDir::fromNativeSeparators(
+            QString::fromUtf8(sqlite3_db_filename(database, "main"))));
+        if (active && path == active->databasePath) {
+            ++active->attachedConnections;
+            sqlite3_trace_v2(database, SQLITE_TRACE_ROW, recordRow, active);
+        }
+        return SQLITE_OK;
+    }
+    static int recordRow(unsigned, void* context, void* statement, void*) {
+        auto* probe = static_cast<ControllerReadProbe*>(context);
+        if (QThread::currentThread() != QCoreApplication::instance()->thread() || !probe->enabled) return 0;
+        const char* sql = sqlite3_sql(static_cast<sqlite3_stmt*>(statement));
+        if (sql && std::strstr(sql, "FROM messages ")) ++probe->messageRows;
+        if (sql && std::strstr(sql, "FROM parts ")) ++probe->partRows;
+        return 0;
+    }
+
+    static ControllerReadProbe* active;
+    QString databasePath;
+    bool installed = false;
+    bool enabled = false;
+    int attachedConnections = 0;
+    int messageRows = 0;
+    int partRows = 0;
+};
+
+ControllerReadProbe* ControllerReadProbe::active = nullptr;
 
 // 把一段 UTF-8 切成一个个完整字符。首字节的高位决定这个字符占几个字节。
 std::vector<std::string_view> splitUtf8(const std::string& text) {
@@ -191,6 +237,7 @@ private slots:
     void desktopSessionToolUsesAccountDefaultWhenPathOmitted();
     void desktopSessionToolConfirmsExplicitDirectory();
     void finishingAnotherSessionDoesNotReclassifyReasoning();
+    void messagePartEventsReadOnlyTheirOwner();
     void desktopReadsOutsideSessionWorkingDirectory();
     void desktopWriteOutsideWaitsForApproval();
     void accountModelClientRoutesBySelectedModelAndFreshKey();
@@ -798,6 +845,110 @@ void AgentControllerTest::finishingAnotherSessionDoesNotReclassifyReasoning() {
     for (const QList<QVariant>& args : text) {
         QVERIFY(args.first().toString() != firstSession);
     }
+}
+
+void AgentControllerTest::messagePartEventsReadOnlyTheirOwner() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString database = directory.filePath(QStringLiteral("event-owner.sqlite"));
+    const std::string owner = "ses_event_owner";
+    const std::string target = "msg_history_0031";
+    {
+        auto opened = makeMaiSqliteStore(database.toUtf8().toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        MaiSession session;
+        session.id = owner;
+        session.directory = directory.path().toUtf8().toStdString();
+        session.created = session.updated = 1;
+        store->putSession(session);
+        for (int index = 0; index < 32; ++index) {
+            MaiMessage message;
+            message.id = QStringLiteral("msg_history_%1").arg(index, 4, 10, QLatin1Char('0')).toStdString();
+            message.role = MaiRole::Assistant;
+            message.created = message.completed = index + 1;
+            message.parts.push_back({"prt_" + message.id, MaiTextPart{"stored answer"}, index + 1});
+            if (message.id == target) {
+                message.parts.push_back({"prt_reasoning", MaiReasoningPart{"private reasoning"}, index + 2});
+                MaiToolPart tool;
+                tool.tool = "read";
+                tool.state = MaiToolState::Completed;
+                tool.output = "done";
+                message.parts.push_back({"prt_tool", std::move(tool), index + 3});
+            }
+            store->putMessage(owner, message);
+        }
+        QVERIFY(!store->lastWriteError().hasError());
+    }
+    ControllerReadProbe reads(database);
+    QVERIFY(reads.installed);
+    AgentController controller(std::make_unique<ScriptedModel>("", ""), database);
+    QVERIFY2(controller.openError().isEmpty(), qPrintable(controller.openError()));
+    QCOMPARE(reads.attachedConnections, 1);
+    MaiMessage stored;
+    reads.enabled = true;
+    const bool found = controller.agent().getMessage(owner, target, stored);
+    reads.enabled = false;
+    QVERIFY(found);
+    QCOMPARE(reads.messageRows, 1);  // Prove the probe sees the real connection before testing event cost.
+    QCOMPARE(reads.partRows, 3);
+    QSignalSpy tools(&controller, &AgentController::toolPartChanged);
+    QSignalSpy reasoning(&controller, &AgentController::reasoningDelta);
+    QSignalSpy text(&controller, &AgentController::textDelta);
+
+    // Run the actual queued event path, with the corresponding parts already
+    // persisted as required by the Core event contract. Both first classification
+    // and later tool-state refreshes must read only that event's owning message.
+    for (const std::string& part : {"prt_" + target, std::string("prt_reasoning"),
+                                    std::string("prt_tool"), std::string("prt_tool")}) {
+        MaiEvent updated;
+        updated.type = MaiEventType::MessagePartUpdated;
+        updated.sessionId = owner;
+        updated.messageId = target;
+        updated.partId = part;
+        reads.messageRows = reads.partRows = 0;
+        reads.enabled = true;
+        controller.agent().eventBus().publish(updated);
+        QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+        reads.enabled = false;
+        QCOMPARE(reads.messageRows, 1);
+        QCOMPARE(reads.partRows, 3);
+    }
+    QCOMPARE(tools.size(), 2);
+    for (const QList<QVariant>& arguments : tools) {
+        QCOMPARE(arguments.at(0).toString(), QString::fromStdString(owner));
+        QCOMPARE(arguments.at(1).toString(), QString::fromStdString(target));
+        QCOMPARE(arguments.at(2).toString(), QStringLiteral("prt_tool"));
+    }
+
+    for (const std::string& part : {"prt_" + target, std::string("prt_reasoning")}) {
+        MaiEvent delta;
+        delta.type = MaiEventType::MessagePartDelta;
+        delta.sessionId = owner;
+        delta.messageId = target;
+        delta.partId = part;
+        delta.field = "text";
+        delta.delta = "continued";
+        controller.agent().eventBus().publish(delta);
+    }
+    QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+    QCOMPARE(text.size(), 1);
+    QCOMPARE(reasoning.size(), 1);
+
+    // A foreign session cannot claim a valid message/part ID from this store.
+    MaiEvent foreign;
+    foreign.type = MaiEventType::MessagePartUpdated;
+    foreign.sessionId = "ses_other_owner";
+    foreign.messageId = target;
+    foreign.partId = "prt_tool";
+    reads.messageRows = reads.partRows = 0;
+    reads.enabled = true;
+    controller.agent().eventBus().publish(foreign);
+    QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+    reads.enabled = false;
+    QCOMPARE(reads.messageRows, 0);
+    QCOMPARE(reads.partRows, 0);
+    QCOMPARE(tools.size(), 2);
 }
 
 QTEST_MAIN(AgentControllerTest)

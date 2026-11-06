@@ -763,7 +763,8 @@ void AgentController::rawEvent(const MaiEvent& event) {
 }
 
 void AgentController::onEventQueued(const MaiEvent& event) {
-    // 这里已经在主线程上了：查存储、刷界面都随意。
+    // 这里已经在主线程上，可以交付界面事件；查存储仍只读取事件所属消息，
+    // 避免后台会话的工具更新把整段历史扫描带到前台交互路径。
     const QString sessionId = fromUtf8(event.sessionId);
     const QString messageId = fromUtf8(event.messageId);
     const QString partId = fromUtf8(event.partId);
@@ -775,13 +776,13 @@ void AgentController::onEventQueued(const MaiEvent& event) {
     }
 
     switch (event.type) {
-        case MaiEventType::MessageUpdated:
-            for (const MaiMessage& message :
-                 runtime_->agent->listMessagesPage(event.sessionId, event.messageId + "~", 1)) {
-                if (message.id == event.messageId && message.role == MaiRole::User)
-                    emit userMessageAdded(sessionId, messageId);
-            }
+        case MaiEventType::MessageUpdated: {
+            MaiMessage message;
+            if (runtime_->agent->getMessage(event.sessionId, event.messageId, message) &&
+                message.role == MaiRole::User)
+                emit userMessageAdded(sessionId, messageId);
             return;
+        }
 
         case MaiEventType::MessagePartUpdated: {
             // 片段第一次出现，或者工具卡状态变了。查一次存储看它是什么。
@@ -792,19 +793,17 @@ void AgentController::onEventQueued(const MaiEvent& event) {
             const auto known = partKinds.constFind(partId);
             if (known != partKinds.constEnd() && known.value() != PartKind::Tool) return;
 
+            MaiMessage message;
+            if (!runtime_->agent->getMessage(event.sessionId, event.messageId, message)) return;
             PartKind kind = PartKind::Unknown;
-            for (const MaiMessage& message : runtime_->agent->listMessages(event.sessionId)) {
-                if (message.id != event.messageId) continue;
-                for (const MaiMessagePart& part : message.parts) {
-                    if (part.id != event.partId) continue;
-                    if (std::get_if<MaiTextPart>(&part.body) != nullptr) {
-                        kind = PartKind::Text;
-                    } else if (std::get_if<MaiReasoningPart>(&part.body) != nullptr) {
-                        kind = PartKind::Reasoning;
-                    } else {
-                        kind = PartKind::Tool;
-                    }
-                    break;
+            for (const MaiMessagePart& part : message.parts) {
+                if (part.id != event.partId) continue;
+                if (std::get_if<MaiTextPart>(&part.body) != nullptr) {
+                    kind = PartKind::Text;
+                } else if (std::get_if<MaiReasoningPart>(&part.body) != nullptr) {
+                    kind = PartKind::Reasoning;
+                } else {
+                    kind = PartKind::Tool;
                 }
                 break;
             }

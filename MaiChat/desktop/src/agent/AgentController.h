@@ -103,9 +103,9 @@ public:
     QString openError() const;
 
     // 底层核心。
-    // 查询类操作（listMessages / listSessions /
-    // listPendingPermissions）直接用它——**在主线程上查没
-    // 有任何限制**，那条"不许做慢活"的契约只管事件处理函数。
+    // 查询类操作直接用它；事件消费使用 getMessage 精确读取所属消息，
+    // 历史显示使用 listMessagesPage 有界分页，避免在主线程扫描整个会话。
+    // 核心事件回调本身只允许排队，查询在 Qt 主线程接收后进行。
     MaiAgent& agent();
 
     // ---- 变更 ----都是立刻返回的。失败时返回空串 / false，错误文本从
@@ -171,7 +171,7 @@ signals:
                         const QString& delta);
 
     // 某个工具片段的状态变了（建卡 / 放行 / 跑完）。事件只带 id，工具名、参数、
-    // 输出要拿 partId 去 agent().listMessages() 里取——主线程查，随便查。
+    // 输出用 agent().getMessage(sessionId, messageId) 读取所属消息，再按 partId 定位。
     void toolPartChanged(const QString& sessionId, const QString& messageId, const QString& partId);
 
     // 有一次工具调用在等用户点头。详情同样去查：agent().listPendingPermissions()。

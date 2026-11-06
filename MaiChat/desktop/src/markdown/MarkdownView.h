@@ -30,8 +30,8 @@
 // ── 嵌部件 ──────────────────────────────────────────────────────
 //
 // 工具卡那种带按钮的东西画不出来（要能点），所以留了 addWidget：视图负责
-// 摆位置、跟着滚、滚出去就隐藏，部件自己管交互。iOS 那边 UITableView 里
-// 混自定义 cell 是一样的做法。
+// 摆位置、跟着滚、滚出去就隐藏，部件自己管交互。保留页面时这些部件随页
+// 隐藏并复用，不能为了切换会话而丢失输入、展开状态或信号连接。
 //
 // 线程：只在界面线程用。
 
@@ -84,6 +84,14 @@ public:
     void beginBatchUpdates();
     void endBatchUpdates();
 
+    // Retained pages belong to this view and are GUI-thread-only. takePage
+    // detaches the current content immediately; restorePage consumes a saved
+    // page once, preserving widgets, selection and reading position. Current
+    // view theme/column settings apply when the page returns.
+    class PageState;
+    std::shared_ptr<PageState> takePage();
+    void restorePage(const std::shared_ptr<PageState>& page);
+
     void clear();
     bool isEmpty() const;
     int itemCount() const;
@@ -123,8 +131,9 @@ protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
-    // 整片重排。**每次都整片**：条目之间的 y 是连着的，改一条后面全要挪。
-    // 流式输出时靠调用方节流；真成瓶颈再改成只重排变了的那条加后面的偏移。
+    // Recompute connected row positions, retaining text layouts whenever its
+    // source/style, available width and owning view theme remain unchanged.
+    // Tool-card resize events must not reshape an entire retained conversation.
     void relayoutAll();
     void updateScrollRange();
     void positionWidgets();

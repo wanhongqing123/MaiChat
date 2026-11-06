@@ -5286,6 +5286,11 @@ void MainWindow::rebuildAgentPage() {
           });
   if (!sessionToRestore.isEmpty())
     agentPanel_->openSession(sessionToRestore);
+  // Opening a retained page only changes selection; it no longer rebuilds the
+  // directory. Populate it once at initialization, including persisted sessions
+  // which emit no new-session event during this process.
+  agentSessions_->refresh();
+  agentSessions_->setCurrent(agentPanel_->sessionId());
   if (!remoteToRestore.isEmpty()) {
     agentPanelStack_->setCurrentWidget(agentRemotePanel_);
     agentRemotePanel_->openSession(remoteToRestore);

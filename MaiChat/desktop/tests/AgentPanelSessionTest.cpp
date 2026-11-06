@@ -453,8 +453,10 @@ private slots:
     void anotherSessionTitleDoesNotRenameTheHeader();
     void currentSessionTitleStaysInTheSessionList();
     void subAgentCardsKeepTaskAndStreamedLatestLineVisible();
+    void subAgentCardsUseConsistentWidthAndExpandableSummary();
     void approvalFromAnotherSessionIsStillShown();
     void pendingApprovalIsRestoredAfterSessionSwitch();
+    void approvedChildToolCompletesWhileParentPageIsCached();
     void pendingQuestionIsRestoredOnlyInItsSession();
     void stoppedQuestionReleasesComposerWithoutLosingDraft();
     void externalQuestionAnswerReleasesComposerWithoutLosingDraft();
@@ -467,6 +469,13 @@ private slots:
     void consecutiveToolsShareDisclosureWithoutChangingReceipts();
     void busyComposerAcceptsOrderedSteeringWithoutStopping();
     void historyOpensLatestPageAndPrependsWithoutMovingReadingAnchor();
+    void sessionSwitchRetainsUnchangedRenderedMessages();
+    void cachedSessionAddsBackgroundMessagesWithoutReplacingHistory();
+    void clearedCachedSessionDoesNotRestoreRemovedHistory();
+    void boundedSessionPagesPreserveComposerDrafts();
+    void answeredCachedQuestionDoesNotReclaimComposer();
+    void emptyCachedSessionCanLoadEarlierBackgroundHistory();
+    void changedCompletedMessageRefreshesItsCachedPage();
     void collapsedToolDetailsAreFormattedOnlyOnDisclosure();
     void stopKeepsUnacceptedDraftAndInputEditable();
     void quoteActionFollowsStreamedOwnerAfterSessionRestore();
@@ -911,7 +920,14 @@ void AgentPanelSessionTest::inlineMediaBubblesRespectMessageBoundary() {
     panel.openSession(listing);
     QVERIFY(controller.sendPrompt(listing, QStringLiteral("listing")));
     controller.agent().waitIdle();
-    QTRY_VERIFY(panel.findChildren<QPushButton*>(QStringLiteral("agentTextMediaBubble")).isEmpty());
+    // Retained pages keep their media controls alive. Only controls belonging
+    // to the selected page may be visible over this five-file text listing.
+    const auto noVisibleMediaBubble = [&panel] {
+        for (QPushButton* bubble : panel.findChildren<QPushButton*>(QStringLiteral("agentTextMediaBubble")))
+            if (bubble->isVisible()) return false;
+        return true;
+    };
+    QTRY_VERIFY(noVisibleMediaBubble());
 }
 
 void AgentPanelSessionTest::answerFromAnotherSessionDoesNotLeakIn() {
@@ -1094,6 +1110,86 @@ void AgentPanelSessionTest::subAgentCardsKeepTaskAndStreamedLatestLineVisible() 
     publish(QStringLiteral("新的检查开始"), "prt_sub_card_next");
     publish(QStringLiteral("。"), "prt_sub_card_next");
     QTRY_COMPARE(latest->text(), QStringLiteral("新的检查开始。"));
+}
+
+void AgentPanelSessionTest::subAgentCardsUseConsistentWidthAndExpandableSummary() {
+    struct RestoreFont {
+        QFont previous = QApplication::font();
+        ~RestoreFont() { QApplication::setFont(previous); }
+    } restoreFont;
+    QFont font;
+    font.setFamilies({QStringLiteral("Segoe UI"), QStringLiteral("Microsoft YaHei UI")});
+    font.setPixelSize(13);
+    QApplication::setFont(font);
+    Harness harness;
+    harness.panel->resize(1050, 760);
+    QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
+    const QStringList tasks{QStringLiteral("code-spec-reviewer"), QStringLiteral("code-safety-reviewer"),
+                            QStringLiteral("logic-func-reviewer")};
+    QStringList childIds;
+    for (int index = 0; index < tasks.size(); ++index) {
+        const auto child = harness.controller->agent().spawnSubAgent(
+            harness.mine.toStdString(), tasks[index].toStdString(), "Read-only local fixture");
+        QVERIFY(child);
+        childIds << QString::fromStdString(child.value());
+        harness.controller->agent().waitIdle();
+        MaiEvent delta;
+        delta.id = "evt_child_style_" + std::to_string(index);
+        delta.type = MaiEventType::MessagePartDelta;
+        delta.sessionId = child.value();
+        delta.messageId = "msg_child_style_" + std::to_string(index);
+        delta.partId = "prt_child_style_" + std::to_string(index);
+        delta.field = "text";
+        const QString text = index == 0 ? QStringLiteral("规范检查完成。")
+            : QStringLiteral("审查已完成，以下是最近的检查进展。\n") +
+              QStringLiteral("已核对任务归属、后台状态和长内容展示，没有访问外部服务。\n").repeated(7) +
+              QStringLiteral("最终摘要：当前检查项已完成，可展开查看保留的进展内容。");
+        delta.delta = text.toStdString();
+        harness.controller->agent().eventBus().publish(delta);
+        QCoreApplication::processEvents();
+    }
+    const auto cards = harness.panel->findChildren<QFrame*>(QStringLiteral("agentSubTaskCard"));
+    QCOMPARE(cards.size(), 3);
+    QTRY_COMPARE(cards[0]->width(), cards[1]->width());
+    QTRY_COMPARE(cards[1]->width(), cards[2]->width());
+    QVERIFY(cards[0]->width() >= harness.view()->viewport()->width() - 2 * UiZoom::s(48) - 2);
+    auto* summary = cards[1]->findChild<QLabel*>(QStringLiteral("agentSubTaskSummary"));
+    auto* disclosure = cards[1]->findChild<QPushButton*>(QStringLiteral("agentSubTaskDisclosure"));
+    auto* title = cards[1]->findChild<QLabel*>(QStringLiteral("agentSubTaskTitle"));
+    auto* state = cards[1]->findChild<QLabel*>(QStringLiteral("agentSubTaskState"));
+    QVERIFY(summary && disclosure && title && state);
+    auto* welcome = harness.panel->findChild<QWidget*>(QStringLiteral("agentWelcomeView"));
+    QVERIFY(welcome);
+    QTRY_VERIFY(!welcome->isVisible());
+    QTRY_VERIFY(disclosure->isVisible());
+    QVERIFY(title->geometry().right() < state->geometry().left());
+    const int collapsedHeight = cards[1]->height();
+    QVERIFY(summary->height() <= summary->fontMetrics().lineSpacing() * 3);
+    QVERIFY(captureAgentFixture(*harness.panel, QStringLiteral("sub-task-cards-collapsed")));
+    QTest::mouseClick(disclosure, Qt::LeftButton);
+    QTRY_VERIFY(cards[1]->height() > collapsedHeight);
+    QVERIFY(summary->text().contains(QStringLiteral("审查已完成")));
+    QVERIFY(summary->text().contains(QStringLiteral("最终摘要")));
+    QCOMPARE(summary->textFormat(), Qt::PlainText);
+    QVERIFY(summary->textInteractionFlags() & Qt::TextSelectableByMouse);
+    QVERIFY(captureAgentFixture(*harness.panel, QStringLiteral("sub-task-card-expanded")));
+    harness.panel->resize(650, 760);
+    // Offscreen controls intentionally keep their old physical geometry until
+    // visible again. The view's content frames are authoritative for all rows.
+    const auto frame = [&](int index) {
+        return harness.view()->itemRect(QStringLiteral("sub-") + childIds[index]);
+    };
+    QTRY_COMPARE(frame(0).width(), frame(1).width());
+    QTRY_VERIFY(summary->width() < 600);
+    if (summary->hasHeightForWidth())
+        QTRY_VERIFY(summary->height() >= summary->heightForWidth(summary->width()));
+    QTRY_VERIFY(frame(0).bottom() < frame(1).top());
+    QTRY_VERIFY(frame(1).bottom() < frame(2).top());
+    QVERIFY(captureAgentFixture(*harness.panel, QStringLiteral("sub-task-card-expanded-narrow")));
+    harness.panel->resize(1050, 760);
+    QTRY_VERIFY(summary->width() > 600);
+    QTest::mouseClick(disclosure, Qt::LeftButton);
+    QTRY_COMPARE(cards[1]->height(), collapsedHeight);
 }
 
 void AgentPanelSessionTest::approvalFromAnotherSessionIsStillShown() {
@@ -1381,6 +1477,75 @@ void AgentPanelSessionTest::pendingApprovalIsRestoredAfterSessionSwitch() {
     allow->click();
     controller.agent().waitIdle();
     QCOMPARE(executed.load(), 1);
+}
+
+void AgentPanelSessionTest::approvedChildToolCompletesWhileParentPageIsCached() {
+    struct Gate {
+        std::atomic<bool> entered{false};
+        std::atomic<bool> released{false};
+    };
+    class ChildApprovalTool final : public MaiTool {
+    public:
+        explicit ChildApprovalTool(std::shared_ptr<Gate> gate) : gate_(std::move(gate)) {}
+        std::string name() const override { return "maichat_send_text"; }
+        std::string description() const override { return "Local child approval fixture"; }
+        std::string parametersSchema() const override { return R"({"type":"object"})"; }
+        bool requiresApproval(const std::string&) const override { return true; }
+        bool requiresPerCallApproval(const std::string&) const override { return true; }
+        MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
+            gate_->entered.store(true);
+            while (!gate_->released.load() && !context.isCanceled())
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            return context.isCanceled() ? MaiToolResult::failure(MaiErrorCode::Canceled, "Fixture canceled")
+                                        : MaiToolResult::success("Child fixture completed");
+        }
+    private:
+        std::shared_ptr<Gate> gate_;
+    };
+    auto gate = std::make_shared<Gate>();
+    AgentController controller(std::make_unique<ApprovalModel>(), QString(), [gate](MaiToolRegistry& tools) {
+        tools.add(std::make_unique<ChildApprovalTool>(gate));
+    });
+    struct ReleaseOnExit {
+        std::shared_ptr<Gate> gate;
+        ~ReleaseOnExit() { gate->released.store(true); }
+    } release{gate};
+    AgentChatPanel panel(controller);
+    panel.resize(900, 650);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString parent = controller.createSession(QDir::currentPath());
+    const QString other = controller.createSession(QDir::currentPath());
+    panel.openSession(parent);
+    const auto child = controller.agent().spawnSubAgent(parent.toStdString(), "approval-reviewer", "Fixture task");
+    QVERIFY(child);
+    QTRY_COMPARE(controller.agent().listPendingPermissions().size(), std::size_t(1));
+    QPushButton* allow = nullptr;
+    const auto approvalIsVisible = [&] {
+        for (QPushButton* button : panel.findChildren<QPushButton*>())
+            if (button->isVisible() && button->text() == QStringLiteral("允许")) {
+                allow = button;
+                return true;
+            }
+        return false;
+    };
+    QTRY_VERIFY(approvalIsVisible());
+    allow->click();
+    QTRY_VERIFY(gate->entered.load());
+    QPointer<QPushButton> summary = panel.findChild<QPushButton*>(QStringLiteral("agentToolGroupDisclosure"));
+    QVERIFY(summary);
+    panel.openSession(other);
+    gate->released.store(true);
+    controller.agent().waitIdle();
+    QCoreApplication::processEvents();
+    panel.openSession(parent);
+    QTRY_VERIFY(summary && summary->isVisible());
+    QTRY_VERIFY(summary->text().contains(QStringLiteral("已完成")));
+    QTest::mouseClick(summary, Qt::LeftButton);
+    bool foundOutput = false;
+    for (QLabel* label : panel.findChildren<QLabel*>(QStringLiteral("agentToolDetail")))
+        foundOutput |= label->text().contains(QStringLiteral("Child fixture completed"));
+    QVERIFY(foundOutput);
 }
 
 void AgentPanelSessionTest::pendingQuestionIsRestoredOnlyInItsSession() {
@@ -2342,6 +2507,282 @@ void AgentPanelSessionTest::historyOpensLatestPageAndPrependsWithoutMovingReadin
     QTRY_VERIFY(view->contains(QStringLiteral("msg_page_0000")));
     QVERIFY(older->isHidden());
     QCOMPARE(panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")).size(), 121);
+}
+
+// A rich latest page is bounded by messages, yet contains hundreds of tool
+// controls. Revisiting it must retain those controls instead of recreating them.
+void AgentPanelSessionTest::sessionSwitchRetainsUnchangedRenderedMessages() {
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    const QString database = storage.filePath(QStringLiteral("switch-history.db"));
+    const QStringList sessions{QStringLiteral("ses_switch_a"), QStringLiteral("ses_switch_b")};
+    {
+        auto opened = makeMaiSqliteStore(database.toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        for (const QString& id : sessions) {
+            MaiSession session;
+            session.id = id.toStdString();
+            session.directory = storage.path().toStdString();
+            session.created = session.updated = 1;
+            store->putSession(session);
+            for (int index = 0; index < 80; ++index) {
+                MaiMessage message;
+                message.id = QStringLiteral("msg_%1_%2").arg(id).arg(index, 4, 10, QLatin1Char('0')).toStdString();
+                message.role = index % 2 == 0 ? MaiRole::User : MaiRole::Assistant;
+                message.created = message.completed = index + 1;
+                const QString text = message.role == MaiRole::User
+                    ? QStringLiteral("Fixture request %1").arg(index)
+                    : QStringLiteral("## Fixture result %1\n\n").arg(index) +
+                      QStringLiteral("The stable result contains **formatted text**, `code`, and a table.\n\n").repeated(8) +
+                      QStringLiteral("| Check | Result |\n| --- | --- |\n| Desktop | Ready |\n| Shared core | Ready |\n\n") +
+                      QStringLiteral("```cpp\nfor (int item = 0; item < 10; ++item) {\n    consume(item);\n}\n```\n");
+                message.parts.push_back({"prt_" + message.id, MaiTextPart{text.toStdString()}, index + 1});
+                if (message.role == MaiRole::Assistant) {
+                    for (int toolIndex = 0; toolIndex < 12; ++toolIndex) {
+                        MaiToolPart tool;
+                        tool.callId = "call_" + message.id + "_" + std::to_string(toolIndex);
+                        tool.tool = "shell";
+                        tool.input = R"({"command":"fixture only"})";
+                        tool.output = std::string(4096, 'x');
+                        tool.state = MaiToolState::Completed;
+                        message.parts.push_back({tool.callId, std::move(tool), index + 1});
+                    }
+                }
+                store->putMessage(session.id, message);
+            }
+        }
+        QVERIFY(!store->lastWriteError().hasError());
+    }
+    AgentController controller(std::make_unique<SilentModel>(), database);
+    AgentChatPanel panel(controller);
+    panel.resize(1100, 750);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    QElapsedTimer timer;
+    timer.start();
+    const auto page = controller.agent().listMessagesPage(sessions[0].toStdString(), {}, 40);
+    const qint64 readUs = timer.nsecsElapsed() / 1000;
+    QCOMPARE(page.size(), std::size_t(40));
+    timer.restart();
+    panel.openSession(sessions[0]);
+    const qint64 coldUs = timer.nsecsElapsed() / 1000;
+    QCoreApplication::processEvents();
+    const qint64 coldPaintUs = timer.nsecsElapsed() / 1000;
+    QPointer<QPushButton> original;
+    for (QPushButton* button : panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")))
+        if (button->property("messageId").toString() == QStringLiteral("msg_ses_switch_a_0079")) original = button;
+    QVERIFY(original);
+    panel.openSession(sessions[1]);
+    QCoreApplication::processEvents();
+    timer.restart();
+    panel.openSession(sessions[0]);
+    const qint64 revisitUs = timer.nsecsElapsed() / 1000;
+    QCoreApplication::processEvents();
+    const qint64 revisitPaintUs = timer.nsecsElapsed() / 1000;
+    qInfo("switch_fixture read_us=%lld cold_us=%lld cold_paint_us=%lld revisit_us=%lld revisit_paint_us=%lld",
+          readUs, coldUs, coldPaintUs, revisitUs, revisitPaintUs);
+    QVERIFY2(original, "Switching to another session destroyed the unchanged rendered message");
+    QVERIFY(original->isVisible());
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("session-switch-retained-rich-page")));
+}
+
+void AgentPanelSessionTest::cachedSessionAddsBackgroundMessagesWithoutReplacingHistory() {
+    AgentController controller(std::make_unique<SilentModel>(), QString());
+    const QString first = controller.createSession(QDir::currentPath());
+    const QString second = controller.createSession(QDir::currentPath());
+    QVERIFY(controller.sendPrompt(first, QStringLiteral("Stable history fixture")));
+    controller.agent().waitIdle();
+    AgentChatPanel panel(controller);
+    panel.resize(850, 600);
+    panel.show();
+    panel.openSession(first);
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    QPointer<QPushButton> original;
+    for (QPushButton* quote : panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")))
+        if (quote->isVisible()) original = quote;
+    QVERIFY(original);
+    panel.openSession(second);
+    QVERIFY(controller.sendPrompt(first, QStringLiteral("Message received while another page was visible")));
+    controller.agent().waitIdle();
+    QCoreApplication::processEvents();
+    panel.openSession(first);
+    QCoreApplication::processEvents();
+    QVERIFY(original && original->isVisible());
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    view->selectAll();
+    const QString text = view->selectedText();
+    QVERIFY(text.contains(QStringLiteral("Stable history fixture")));
+    QVERIFY(text.contains(QStringLiteral("Message received while another page was visible")));
+    view->clearSelection();
+}
+
+void AgentPanelSessionTest::clearedCachedSessionDoesNotRestoreRemovedHistory() {
+    AgentController controller(std::make_unique<SilentModel>(), QString());
+    const QString first = controller.createSession(QDir::currentPath());
+    const QString second = controller.createSession(QDir::currentPath());
+    QVERIFY(controller.sendPrompt(first, QStringLiteral("History that will be cleared")));
+    controller.agent().waitIdle();
+    AgentChatPanel panel(controller);
+    panel.resize(850, 600);
+    panel.show();
+    panel.openSession(first);
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    panel.openSession(second);
+    QVERIFY(controller.agent().submit(MaiClearMessages{first.toStdString()}));
+    panel.openSession(first);
+    auto* view = panel.findChild<MarkdownView*>();
+    auto* welcome = panel.findChild<QWidget*>(QStringLiteral("agentWelcomeView"));
+    QVERIFY(view && welcome);
+    QVERIFY(view->isEmpty());
+    QVERIFY(welcome->isVisible());
+}
+
+void AgentPanelSessionTest::boundedSessionPagesPreserveComposerDrafts() {
+    AgentController controller(std::make_unique<SilentModel>(), QString());
+    QStringList sessions;
+    for (int index = 0; index < 4; ++index) {
+        sessions << controller.createSession(QDir::currentPath());
+        QVERIFY(controller.sendPrompt(sessions.back(), QStringLiteral("Page fixture %1").arg(index)));
+        controller.agent().waitIdle();
+    }
+    AgentChatPanel panel(controller);
+    panel.resize(850, 600);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    auto* editor = panel.findChild<QTextEdit*>();
+    QVERIFY(editor);
+    const auto visibleQuote = [&panel]() -> QPushButton* {
+        for (QPushButton* quote : panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")))
+            if (quote->isVisible()) return quote;
+        return nullptr;
+    };
+    panel.openSession(sessions[0]);
+    QCoreApplication::processEvents();
+    QPointer<QPushButton> firstQuote = visibleQuote();
+    QVERIFY(firstQuote);
+    editor->setPlainText(QStringLiteral("Draft belongs to the first page"));
+    panel.openSession(sessions[1]);
+    QCoreApplication::processEvents();
+    QPointer<QPushButton> secondQuote = visibleQuote();
+    QVERIFY(secondQuote);
+    panel.openSession(sessions[2]);
+    panel.openSession(sessions[0]);
+    QCoreApplication::processEvents();
+    QVERIFY(firstQuote && firstQuote->isVisible());
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Draft belongs to the first page"));
+    panel.openSession(sessions[3]);
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    QVERIFY2(secondQuote.isNull(), "The least recently used fourth page must release retained widgets");
+    panel.openSession(sessions[0]);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Draft belongs to the first page"));
+    QVERIFY(firstQuote && firstQuote->isVisible());
+}
+
+void AgentPanelSessionTest::answeredCachedQuestionDoesNotReclaimComposer() {
+    AgentController controller(std::make_unique<QuestionModel>(), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(850, 600);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString first = controller.createSession(QDir::currentPath());
+    const QString second = controller.createSession(QDir::currentPath());
+    panel.openSession(first);
+    auto* editor = panel.findChild<QTextEdit*>();
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    QVERIFY(editor && send);
+    editor->setPlainText(QStringLiteral("ask me"));
+    send->click();
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    QTRY_COMPARE(send->toolTip(), QStringLiteral("回答问题"));
+    const auto question = controller.pendingQuestions().front();
+    editor->setPlainText(QStringLiteral("Keep the answer draft"));
+    panel.openSession(second);
+    QVERIFY(controller.agent().submit(MaiReplyQuestion{question.id, "A"}));
+    controller.agent().waitIdle();
+    QCoreApplication::processEvents();
+    panel.openSession(first);
+    QCOMPARE(send->toolTip(), QStringLiteral("发送消息"));
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Keep the answer draft"));
+    send->click();
+    controller.agent().waitIdle();
+    QCOMPARE(editor->toPlainText(), QString());
+}
+
+void AgentPanelSessionTest::emptyCachedSessionCanLoadEarlierBackgroundHistory() {
+    AgentController controller(std::make_unique<SilentModel>(), QString());
+    const QString first = controller.createSession(QDir::currentPath());
+    const QString second = controller.createSession(QDir::currentPath());
+    AgentChatPanel panel(controller);
+    panel.resize(850, 600);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    panel.openSession(first);
+    panel.openSession(second);
+    for (int index = 0; index < 45; ++index) {
+        QVERIFY(controller.sendPrompt(first, QStringLiteral("Deferred fixture number %1").arg(index)));
+        controller.agent().waitIdle();
+    }
+    panel.openSession(first);
+    auto* older = panel.findChild<QPushButton*>(QStringLiteral("agentLoadEarlierButton"));
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(older && view);
+    QVERIFY2(older->isVisible(), "A previously empty cached page must expose the older history received in background");
+    older->click();
+    QVERIFY(older->isVisible());
+    older->click();
+    QVERIFY(older->isHidden());
+    view->selectAll();
+    QVERIFY(view->selectedText().contains(QStringLiteral("Deferred fixture number 0")));
+    view->clearSelection();
+}
+
+void AgentPanelSessionTest::changedCompletedMessageRefreshesItsCachedPage() {
+    QTemporaryDir storage;
+    QVERIFY(storage.isValid());
+    const QString database = storage.filePath(QStringLiteral("changed-message.db"));
+    const std::string sessionId = "ses_changed_complete";
+    MaiMessage message;
+    message.id = "msg_changed_complete";
+    message.role = MaiRole::Assistant;
+    message.created = message.completed = 1;
+    message.parts.push_back({"prt_changed_complete", MaiTextPart{"Original completed result"}, 1});
+    {
+        auto opened = makeMaiSqliteStore(database.toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        MaiSession session;
+        session.id = sessionId;
+        session.directory = storage.path().toStdString();
+        session.created = session.updated = 1;
+        store->putSession(session);
+        store->putMessage(sessionId, message);
+    }
+    AgentController controller(std::make_unique<SilentModel>(), database);
+    const QString second = controller.createSession(storage.path());
+    AgentChatPanel panel(controller);
+    panel.resize(850, 600);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    panel.openSession(QString::fromStdString(sessionId));
+    panel.openSession(second);
+    {
+        auto opened = makeMaiSqliteStore(database.toStdString());
+        QVERIFY(opened);
+        auto store = std::move(opened.value());
+        std::get<MaiTextPart>(message.parts.front().body).text = "Updated completed result";
+        store->putMessage(sessionId, message);
+        QVERIFY(!store->lastWriteError().hasError());
+    }
+    panel.openSession(QString::fromStdString(sessionId));
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    view->selectAll();
+    const QString text = view->selectedText();
+    QVERIFY(text.contains(QStringLiteral("Updated completed result")));
+    QVERIFY(!text.contains(QStringLiteral("Original completed result")));
+    view->clearSelection();
 }
 
 void AgentPanelSessionTest::collapsedToolDetailsAreFormattedOnlyOnDisclosure() {

@@ -1,6 +1,9 @@
 // 文件作用：验证桌面端Markdown 选择、链接、滚动定位和内容更新。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QLabel>
+#include <QFrame>
+#include <QTimer>
+#include <QVBoxLayout>
 #include <QClipboard>
 #include <QLineEdit>
 #include <QPointer>
@@ -9,6 +12,7 @@
 #include <QWindow>
 #include <QtTest>
 #include <QtMath>
+#include <functional>
 
 #include "markdown/MarkdownView.h"
 #include "markdown/MarkdownLayout.h"
@@ -24,6 +28,30 @@ namespace {
 MarkdownTheme testTheme() {
     return MarkdownTheme::standard(1.0);
 }
+
+// Natural hints may be measured at a narrow default width. Once a wrapped
+// card has an assigned column width, its valid HFW result is authoritative.
+class WrappedHeightWidget final : public QWidget {
+public:
+    int wrappedHeight = 64;
+    QSize sizeHint() const override { return QSize(80, 500); }
+    bool hasHeightForWidth() const override { return true; }
+    int heightForWidth(int) const override { return wrappedHeight; }
+};
+
+// A real height-for-width card observes the body geometry offered during a
+// restore. An unchanged page must not transiently shape all text wider merely
+// because its empty placeholder hid the scrollbar.
+class PageWidthProbe final : public QWidget {
+public:
+    std::function<void()> observe;
+    QSize sizeHint() const override { return QSize(80, 32); }
+    bool hasHeightForWidth() const override { return true; }
+    int heightForWidth(int) const override {
+        if (observe) observe();
+        return 32;
+    }
+};
 
 }  // namespace
 
@@ -41,6 +69,8 @@ private slots:
     void clearDropsEverything();
     void readingColumnStaysCenteredAndCapped();
     void embeddedWidgetGrowingPushesTheRestDown();
+    void wrappedWidgetUsesAssignedWidthHeight_data();
+    void wrappedWidgetUsesAssignedWidthHeight();
     void batchedHistoryMatchesImmediateLayout();
     void movingExistingItemsPreservesWidgetsSelectionAndScroll();
     void movingItemsSupportsBatchingAndRejectsMissingIds();
@@ -48,6 +78,12 @@ private slots:
     void scrollingCodeKeepsSelectionAndCopiesVisibleTail();
     void streamingEarlierItemsKeepsLaterSelection_data();
     void streamingEarlierItemsKeepsLaterSelection();
+    void detachedPageRetainsWidgetsSelectionAndReadingPosition();
+    void detachedPageUsesCurrentWidthAndTheme();
+    void detachedPageIsConsumedAndSafeAfterOwnerDestruction();
+    void detachedPageKeepsWidgetParentAndBlocksInactiveShow();
+    void detachedPageKeepsCachedColumnWidthDuringRestore();
+    void releaseFromAnotherPageDoesNotActivateRestoredLink();
 
 private:
     void prepare(MarkdownView& view);
@@ -84,6 +120,212 @@ void MarkdownViewTest::selectsAcrossMessages() {
 
     view.clearSelection();
     QVERIFY(view.selectedText().isEmpty());
+}
+
+void MarkdownViewTest::detachedPageRetainsWidgetsSelectionAndReadingPosition() {
+    MarkdownView view;
+    prepare(view);
+    view.beginBatchUpdates();
+    view.addItem(QStringLiteral("body"), MarkdownView::Style::Document,
+                 QStringLiteral("Retained first page paragraph.\n\n").repeated(18));
+    auto* editor = new QLineEdit(QStringLiteral("Unsent question answer"));
+    editor->setFixedHeight(36);
+    view.addWidget(QStringLiteral("question"), editor);
+    view.endBatchUpdates();
+    // Qt shows an AsNeeded scrollbar through a queued layout. Capture the
+    // settled initial column rather than its pre-scrollbar placeholder width.
+    QCoreApplication::processEvents();
+    QPointer<QLineEdit> retained = editor;
+    QSignalSpy destroyed(editor, &QObject::destroyed);
+    editor->setSelection(0, 6);
+    view.selectAll();
+    const QString selection = view.selectedText();
+    view.verticalScrollBar()->setValue(80);
+    const int readingPosition = view.verticalScrollBar()->value();
+    const QRectF bodyRect = view.itemRect(QStringLiteral("body"));
+
+    auto first = view.takePage();
+    QVERIFY(first);
+    QVERIFY(view.isEmpty());
+    QVERIFY(view.selectedText().isEmpty());
+    QVERIFY(retained);
+    QVERIFY(!editor->isVisible());
+    QCOMPARE(editor->parentWidget(), view.viewport());
+    view.addItem(QStringLiteral("other"), MarkdownView::Style::Document,
+                 QStringLiteral("An unrelated second session"));
+    QVERIFY(view.selectedText().isEmpty());
+    auto second = view.takePage();
+    view.restorePage(first);
+    QCOMPARE(view.itemCount(), 2);
+    QCOMPARE(view.itemRect(QStringLiteral("body")), bodyRect);
+    QCOMPARE(view.selectedText(), selection);
+    QCOMPARE(view.verticalScrollBar()->value(), readingPosition);
+    QCOMPARE(editor->parentWidget(), view.viewport());
+    QCOMPARE(editor->text(), QStringLiteral("Unsent question answer"));
+    QCOMPARE(editor->selectedText(), QStringLiteral("Unsent"));
+    QCOMPARE(destroyed.count(), 0);
+
+    // Reinstalling event filters must retain dynamic tool-card geometry.
+    view.scrollToBottom();
+    QCoreApplication::processEvents();
+    editor->setFixedHeight(90);
+    QTRY_COMPARE(qRound(view.itemRect(QStringLiteral("question")).height()), 90);
+    auto restoredFirst = view.takePage();
+    view.restorePage(second);
+    QCOMPARE(view.itemCount(), 1);
+    QVERIFY(view.contains(QStringLiteral("other")));
+    QVERIFY(view.selectedText().isEmpty());
+    QVERIFY(retained && !retained->isVisible());
+    restoredFirst.reset();
+    QVERIFY(retained.isNull());
+    QCOMPARE(destroyed.count(), 1);
+}
+
+void MarkdownViewTest::detachedPageUsesCurrentWidthAndTheme() {
+    MarkdownView view;
+    prepare(view);
+    const QString text = QStringLiteral("A long retained paragraph reflows after changing its reading column. ")
+        .repeated(12);
+    view.addItem(QStringLiteral("body"), MarkdownView::Style::Document, text);
+    view.addItem(QStringLiteral("bubble"), MarkdownView::Style::Bubble, QStringLiteral("Short message"));
+    view.addItem(QStringLiteral("notice"), MarkdownView::Style::Notice, QStringLiteral("Waiting for input"));
+    const qreal oldHeight = view.itemRect(QStringLiteral("body")).height();
+    auto saved = view.takePage();
+    MarkdownTheme changed = testTheme();
+    changed.bodyPixelSize += 5;
+    changed.viewMargin = 24; // Same zoom is deliberately not an IM cache key.
+    changed.text = QColor(Qt::darkRed);
+    view.setTheme(changed);
+    view.setMaxContentWidth(240);
+    view.resize(400, 260);
+    QCoreApplication::processEvents();
+    view.restorePage(saved);
+    QCOMPARE(view.theme().bodyPixelSize, changed.bodyPixelSize);
+    QCOMPARE(view.theme().viewMargin, changed.viewMargin);
+    QCOMPARE(qRound(view.itemRect(QStringLiteral("body")).width()), 240);
+    QVERIFY(view.itemRect(QStringLiteral("body")).height() > oldHeight);
+
+    MarkdownView reference;
+    prepare(reference);
+    reference.resize(400, 260);
+    reference.setTheme(changed);
+    reference.setMaxContentWidth(240);
+    reference.addItem(QStringLiteral("body"), MarkdownView::Style::Document, text);
+    reference.addItem(QStringLiteral("bubble"), MarkdownView::Style::Bubble, QStringLiteral("Short message"));
+    reference.addItem(QStringLiteral("notice"), MarkdownView::Style::Notice, QStringLiteral("Waiting for input"));
+    QCoreApplication::processEvents();
+    QCOMPARE(view.itemRect(QStringLiteral("body")), reference.itemRect(QStringLiteral("body")));
+    QCOMPARE(view.itemRect(QStringLiteral("bubble")), reference.itemRect(QStringLiteral("bubble")));
+    QCOMPARE(view.itemRect(QStringLiteral("notice")), reference.itemRect(QStringLiteral("notice")));
+    QCOMPARE(view.contentHeight(), reference.contentHeight());
+}
+
+void MarkdownViewTest::detachedPageKeepsWidgetParentAndBlocksInactiveShow() {
+    MarkdownView view;
+    prepare(view);
+    auto* card = new QFrame;
+    card->setFixedHeight(40);
+    auto* layout = new QVBoxLayout(card);
+    auto* status = new QLabel(QStringLiteral("Before background update"), card);
+    layout->addWidget(status);
+    view.addWidget(QStringLiteral("card"), card);
+    QVERIFY(card->isVisible());
+    auto saved = view.takePage();
+    // Stable Qt ancestry avoids repolishing every descendant of hundreds of
+    // retained tool cards during an otherwise unchanged session switch.
+    QCOMPARE(card->parentWidget(), view.viewport());
+    view.addItem(QStringLiteral("other"), MarkdownView::Style::Document, QStringLiteral("Active second page"));
+    QTimer::singleShot(0, card, [card, status] {
+        status->setText(QStringLiteral("Changed asynchronously while inactive"));
+        status->show();
+        card->show(); // An old queued callback must not expose a dormant root.
+    });
+    QCoreApplication::processEvents();
+    QVERIFY(!card->isVisible());
+    QVERIFY(!status->isVisible());
+    view.restorePage(saved);
+    QVERIFY(card->isVisible());
+    QVERIFY(status->isVisible());
+    QCOMPARE(status->text(), QStringLiteral("Changed asynchronously while inactive"));
+}
+
+void MarkdownViewTest::detachedPageKeepsCachedColumnWidthDuringRestore() {
+    QVector<qreal> offeredWidths;
+    MarkdownView view;
+    prepare(view);
+    view.addItem(QStringLiteral("body"), MarkdownView::Style::Document,
+                 QStringLiteral("A retained overflowing paragraph keeps its shaped width.\n\n").repeated(24));
+    auto* probe = new PageWidthProbe;
+    probe->observe = [&] {
+        const qreal width = view.itemRect(QStringLiteral("body")).width();
+        if (width > 0) offeredWidths.push_back(width);
+    };
+    view.addWidget(QStringLiteral("card"), probe);
+    QCoreApplication::processEvents();
+    const qreal cachedWidth = view.itemRect(QStringLiteral("body")).width();
+    QVERIFY(view.verticalScrollBar()->maximum() > 0);
+    auto saved = view.takePage();
+    QCoreApplication::processEvents();
+    offeredWidths.clear();
+    view.restorePage(saved);
+    QCoreApplication::processEvents();
+    QVERIFY(!offeredWidths.isEmpty());
+    for (qreal width : offeredWidths) QCOMPARE(width, cachedWidth);
+}
+
+void MarkdownViewTest::releaseFromAnotherPageDoesNotActivateRestoredLink() {
+    MarkdownView view;
+    prepare(view);
+    const QString linkSource = QStringLiteral("[Restored link](https://example.com/restored)");
+    view.addItem(QStringLiteral("link"), MarkdownView::Style::Document, linkSource);
+    MarkdownLayout reference;
+    reference.layout(MarkdownDocument::parse(linkSource), testTheme(), view.itemRect(QStringLiteral("link")).width());
+    QPoint linkPosition(-1, -1);
+    for (int y = 0; y <= qCeil(reference.height()) && linkPosition.x() < 0; ++y)
+        for (int x = 0; x <= qCeil(reference.width()); ++x)
+            if (!reference.linkAt(QPointF(x, y)).isEmpty()) {
+                linkPosition = (QPointF(x, y) + view.itemRect(QStringLiteral("link")).topLeft()).toPoint();
+                break;
+            }
+    QVERIFY(linkPosition.x() >= 0);
+    QSignalSpy activated(&view, &MarkdownView::linkActivated);
+    QTest::mouseClick(view.viewport(), Qt::LeftButton, Qt::NoModifier, linkPosition);
+    QCOMPARE(activated.count(), 1);
+    activated.clear();
+    auto linkPage = view.takePage();
+    view.addItem(QStringLiteral("other"), MarkdownView::Style::Document, QStringLiteral("Different page"));
+    QTest::mousePress(view.viewport(), Qt::LeftButton, Qt::NoModifier, linkPosition);
+    auto otherPage = view.takePage();
+    view.restorePage(linkPage);
+    QTest::mouseRelease(view.viewport(), Qt::LeftButton, Qt::NoModifier, linkPosition);
+    QCOMPARE(activated.count(), 0);
+    QVERIFY(view.selectedText().isEmpty());
+}
+
+void MarkdownViewTest::detachedPageIsConsumedAndSafeAfterOwnerDestruction() {
+    auto* view = new MarkdownView;
+    prepare(*view);
+    auto* editor = new QLineEdit(QStringLiteral("Saved draft"));
+    editor->setFixedHeight(36);
+    QPointer<QLineEdit> retained = editor;
+    view->addWidget(QStringLiteral("card"), editor);
+    auto saved = view->takePage();
+    MarkdownView unrelated;
+    prepare(unrelated);
+    unrelated.addItem(QStringLiteral("existing"), MarkdownView::Style::Document, QStringLiteral("Keep me"));
+    unrelated.restorePage(saved);
+    QVERIFY(unrelated.contains(QStringLiteral("existing")));
+    QVERIFY(retained);
+    view->restorePage(saved);
+    QCOMPARE(editor->parentWidget(), view->viewport());
+    view->restorePage(saved); // A consumed state must not clear the installed page.
+    QCOMPARE(view->itemCount(), 1);
+    auto detached = view->takePage();
+    delete view;
+    QVERIFY(retained.isNull());
+    unrelated.restorePage(detached); // State can safely outlive its owning view.
+    QVERIFY(unrelated.contains(QStringLiteral("existing")));
+    detached.reset();
 }
 
 void MarkdownViewTest::streamingEarlierItemsKeepsLaterSelection_data() {
@@ -193,6 +435,18 @@ void MarkdownViewTest::scrollingCodeKeepsSelectionAndCopiesVisibleTail() {
     };
     const QPoint from = pointFor(start), to = pointFor(start + 11);
     QVERIFY(from.x() >= 0 && to.x() >= 0);
+    QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, windowPoint(from));
+    QTest::mouseMove(window, windowPoint(to));
+    QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, windowPoint(to));
+    QCOMPARE(view.selectedText(), QStringLiteral("TAIL_MARKER"));
+    auto retainedPage = view.takePage();
+    view.addItem(QStringLiteral("other"), MarkdownView::Style::Document, QStringLiteral("Other page"));
+    QVERIFY(view.selectedText().isEmpty());
+    view.restorePage(retainedPage);
+    QCoreApplication::processEvents();
+    QCOMPARE(view.selectedText(), QStringLiteral("TAIL_MARKER"));
+    // The same visible-tail coordinates must still address the horizontally
+    // scrolled code after restore, rather than selecting the hidden HEAD text.
     QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, windowPoint(from));
     QTest::mouseMove(window, windowPoint(to));
     QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, windowPoint(to));
@@ -487,6 +741,36 @@ void MarkdownViewTest::readingColumnStaysCenteredAndCapped() {
     const QRectF narrow = view.itemRect(QStringLiteral("a"));
     QVERIFY(narrow.width() < 300);
     QVERIFY(narrow.right() <= view.viewport()->width());
+}
+
+void MarkdownViewTest::wrappedWidgetUsesAssignedWidthHeight_data() {
+    QTest::addColumn<int>("wrappedHeight");
+    QTest::addColumn<int>("minimum");
+    QTest::addColumn<int>("maximum");
+    QTest::addColumn<int>("expected");
+    QTest::newRow("valid-wrapped-height") << 64 << 0 << QWIDGETSIZE_MAX << 64;
+    QTest::newRow("unsupported-falls-back-to-natural-hint") << -1 << 0 << QWIDGETSIZE_MAX << 500;
+    QTest::newRow("explicit-minimum-still-applies") << 64 << 100 << QWIDGETSIZE_MAX << 100;
+    QTest::newRow("explicit-maximum-still-applies") << 64 << 0 << 40 << 40;
+}
+
+void MarkdownViewTest::wrappedWidgetUsesAssignedWidthHeight() {
+    QFETCH(int, wrappedHeight);
+    QFETCH(int, minimum);
+    QFETCH(int, maximum);
+    QFETCH(int, expected);
+    MarkdownView view;
+    prepare(view);
+    auto* card = new WrappedHeightWidget;
+    card->wrappedHeight = wrappedHeight;
+    card->setMinimumHeight(minimum);
+    card->setMaximumHeight(maximum);
+    view.addWidget(QStringLiteral("wrapped"), card);
+    view.addItem(QStringLiteral("after"), MarkdownView::Style::Document, QStringLiteral("After wrapped card"));
+    QCoreApplication::processEvents();
+    QCOMPARE(qRound(view.itemRect(QStringLiteral("wrapped")).height()), expected);
+    QCOMPARE(view.itemRect(QStringLiteral("after")).top(),
+             view.itemRect(QStringLiteral("wrapped")).bottom() + testTheme().itemSpacing);
 }
 
 void MarkdownViewTest::embeddedWidgetGrowingPushesTheRestDown() {

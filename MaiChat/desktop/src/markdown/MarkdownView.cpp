@@ -7,13 +7,18 @@
 #include <QClipboard>
 #include <QContextMenuEvent>
 #include <QEvent>
+#include <QElapsedTimer>
+#include <QDebug>
 #include <QKeyEvent>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPointer>
 #include <QPaintEvent>
 #include <QResizeEvent>
 #include <QScrollBar>
+#include <QScopedValueRollback>
+#include <QThread>
 #include <QWheelEvent>
 #include <algorithm>
 #include <memory>
@@ -31,6 +36,13 @@ struct MarkdownViewItem {
     MarkdownDocument document;
     MarkdownLayout layout;
     MarkdownCodeScrollState codeScroll;
+
+    // Positions change when cards expand or rows move, while unchanged text
+    // keeps its expensive QTextLayouts. Theme revisions are per owning view;
+    // custom Agent themes must never share IM cache keys based only on zoom.
+    bool layoutValid = false;
+    qreal layoutAvailableWidth = 0;
+    quint64 layoutThemeRevision = 0;
 
     // 外框（气泡的底、整行的范围）和里面文字的左上角。
     QRectF frame;
@@ -71,7 +83,12 @@ int widgetSlotWidth(const QWidget* widget, int available) {
 int widgetSlotHeight(const QWidget* widget, int width) {
     int height = widget->sizeHint().height();
     if (widget->hasHeightForWidth() && width > 0) {
-        height = qMax(height, widget->heightForWidth(width));
+        // A natural hint may assume a narrow default width. A supported HFW
+        // result already measures wrapping at our actual column width; taking
+        // max(hint, HFW) leaves large blank tails in expanded sub-agent cards.
+        // Negative HFW means unsupported, so only that case keeps the hint.
+        const int wrappedHeight = widget->heightForWidth(width);
+        if (wrappedHeight >= 0) height = wrappedHeight;
     }
     return qBound(widget->minimumHeight(), qMax(height, 1), widget->maximumHeight());
 }
@@ -80,6 +97,7 @@ int widgetSlotHeight(const QWidget* widget, int width) {
 
 struct MarkdownView::Runtime {
     MarkdownTheme theme = MarkdownTheme::standard(1.0);
+    quint64 themeRevision = 1;
     std::vector<std::unique_ptr<Item>> items;
     qreal contentHeight = 0;
     int maxContentWidth = 0;
@@ -89,6 +107,7 @@ struct MarkdownView::Runtime {
 
     // 贴底跟随。用户自己往上滚过就停掉——正在看历史却被拽回底部很烦。
     bool stickToBottom = true;
+    bool preservingScrollState = false;
 
     // 选区，整片的字符偏移。
     int anchor = 0;
@@ -168,16 +187,20 @@ MarkdownView::MarkdownView(QWidget* parent) : QAbstractScrollArea(parent), runti
 
     applyScrollBarStyle();
     connect(verticalScrollBar(), &QScrollBar::valueChanged, this,
-            [this](int value) { runtime_->stickToBottom = value >= verticalScrollBar()->maximum() - 2; });
+            [this](int value) {
+                if (!runtime_->preservingScrollState)
+                    runtime_->stickToBottom = value >= verticalScrollBar()->maximum() - 2;
+            });
 }
 
 MarkdownView::~MarkdownView() = default;
 
 void MarkdownView::setTheme(const MarkdownTheme& theme) {
     runtime_->theme = theme;
+    ++runtime_->themeRevision;
     applyScrollBarStyle();
-    // 主题换了字号和间距都会变，整片重排。
-    for (const std::unique_ptr<Item>& item : runtime_->items) item->layout = MarkdownLayout();
+    // A detached page keeps its old revision, so it also reflows if the common
+    // theme changes while another session is visible.
     relayoutAll();
 }
 
@@ -215,11 +238,13 @@ void MarkdownView::setMaxContentWidth(int width) {
 
 void MarkdownView::addItem(const QString& id, Style style, const QString& markdown) {
     if (Item* existing = runtime_->find(id)) {
+        if (existing->style == style && existing->source == markdown) return;
         runtime_->rememberSelectionForReorder();
         if (!markdown.startsWith(existing->source)) existing->codeScroll.clear();
         existing->style = style;
         existing->source = markdown;
         existing->document = MarkdownDocument::parse(markdown);
+        existing->layoutValid = false;
         relayoutAll();
         return;
     }
@@ -240,6 +265,7 @@ void MarkdownView::updateItem(const QString& id, const QString& markdown) {
     if (!markdown.startsWith(item->source)) item->codeScroll.clear();
     item->source = markdown;
     item->document = MarkdownDocument::parse(markdown);
+    item->layoutValid = false;
     relayoutAll();
 }
 
@@ -320,6 +346,131 @@ void MarkdownView::endBatchUpdates() {
     }
 }
 
+// A saved page owns its explicitly hidden widget roots through QPointer.
+// Keeping their viewport parent avoids repolishing every tool-card descendant
+// on session switches. The pointers also become null if the view dies first.
+class MarkdownView::PageState : public QObject {
+public:
+    ~PageState() override {
+        for (const QPointer<QWidget>& widget : widgets)
+            if (widget) delete widget.data();
+    }
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        // Queued callbacks may still update a dormant card or call show().
+        // Its children retain their new state, but its root stays hidden until
+        // restore removes this filter and makes the page active again.
+        if (event->type() == QEvent::Show) {
+            if (auto* widget = qobject_cast<QWidget*>(watched)) widget->hide();
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+private:
+    friend class MarkdownView;
+    QPointer<MarkdownView> owner;
+    std::vector<QPointer<QWidget>> widgets;
+    std::unique_ptr<Runtime> runtime;
+    int scrollPosition = 0;
+    QSize viewSize;
+};
+
+std::shared_ptr<MarkdownView::PageState> MarkdownView::takePage() {
+    Q_ASSERT(thread() == QThread::currentThread());
+    Q_ASSERT(runtime_->batchDepth == 0);
+    const bool profile = qEnvironmentVariableIsSet("MAICHAT_MARKDOWN_PAGE_PROFILE");
+    QElapsedTimer timer;
+    if (profile) timer.start();
+    const int itemCount = static_cast<int>(runtime_->items.size());
+    int widgetCount = 0;
+    auto page = std::make_shared<PageState>();
+    page->owner = this;
+    page->scrollPosition = verticalScrollBar()->value();
+    page->viewSize = size();
+    // Swapping can occur between mouse events. Preserve offsets and selection,
+    // but an abandoned drag must never continue onto another session's items.
+    runtime_->selecting = false;
+    runtime_->draggingCodeItem.clear();
+    for (const auto& item : runtime_->items) {
+        item->codeScroll.release();
+        if (!item->widget) continue;
+        ++widgetCount;
+        item->widget->hide();
+        item->widget->removeEventFilter(this);
+        page->widgets.push_back(item->widget);
+        item->widget->installEventFilter(page.get());
+    }
+    const qint64 controlsUs = profile ? timer.nsecsElapsed() / 1000 : 0;
+    auto empty = std::make_unique<Runtime>();
+    empty->theme = runtime_->theme;
+    empty->themeRevision = runtime_->themeRevision;
+    empty->maxContentWidth = runtime_->maxContentWidth;
+    page->runtime = std::move(runtime_);
+    runtime_ = std::move(empty);
+    viewport()->setCursor(Qt::IBeamCursor);
+    relayoutAll();
+    if (profile) qInfo("page_take items=%d widgets=%d controls_us=%lld total_us=%lld", itemCount,
+                       widgetCount, controlsUs, timer.nsecsElapsed() / 1000);
+    return page;
+}
+
+void MarkdownView::restorePage(const std::shared_ptr<PageState>& page) {
+    Q_ASSERT(thread() == QThread::currentThread());
+    Q_ASSERT(runtime_->batchDepth == 0);
+    // Retained controls and their signal connections belong to one view.
+    // Wrong-owner and already-consumed states must leave its active page alone.
+    if (!page || page->owner != this || !page->runtime) return;
+    const bool profile = qEnvironmentVariableIsSet("MAICHAT_MARKDOWN_PAGE_PROFILE");
+    QElapsedTimer timer;
+    if (profile) timer.start();
+    const int itemCount = static_cast<int>(page->runtime->items.size());
+    int widgetCount = 0;
+    const MarkdownTheme currentTheme = runtime_->theme;
+    const quint64 currentRevision = runtime_->themeRevision;
+    const int currentMaxWidth = runtime_->maxContentWidth;
+    const Qt::ScrollBarPolicy configuredScrollPolicy = verticalScrollBarPolicy();
+    const bool sameLayoutSettings = page->viewSize == size() &&
+        page->runtime->themeRevision == currentRevision && page->runtime->maxContentWidth == currentMaxWidth;
+    clear();
+    runtime_ = std::move(page->runtime);
+    runtime_->theme = currentTheme;
+    runtime_->themeRevision = currentRevision;
+    runtime_->maxContentWidth = currentMaxWidth;
+    const bool followsBottom = runtime_->stickToBottom;
+    for (const auto& item : runtime_->items) {
+        if (!item->widget) continue;
+        ++widgetCount;
+        item->widget->removeEventFilter(page.get());
+        item->widget->installEventFilter(this);
+    }
+    page->widgets.clear(); // Ownership returns to this view's active page.
+    const qint64 controlsUs = profile ? timer.nsecsElapsed() / 1000 : 0;
+    // Ignore transient values only in our follow-state observer. Qt still
+    // needs rangeChanged to show/hide the scrollbar and resize the viewport;
+    // blocking the scrollbar object would leave retained column geometry stale.
+    {
+        QScopedValueRollback<bool> preserving(runtime_->preservingScrollState, true);
+        // The empty placeholder can hide an AsNeeded scrollbar. Reserve the
+        // saved column width synchronously before measuring an unchanged page;
+        // otherwise every warm restore reshapes all text at +scrollbarWidth and
+        // then again when overflow brings the bar back. Changed size/theme uses
+        // normal reflow. The caller's policy is restored before returning.
+        if (sameLayoutSettings && configuredScrollPolicy == Qt::ScrollBarAsNeeded) {
+            const bool needsBar = runtime_->contentHeight > viewport()->height();
+            setVerticalScrollBarPolicy(needsBar ? Qt::ScrollBarAlwaysOn : Qt::ScrollBarAlwaysOff);
+        }
+        relayoutAll();
+        setVerticalScrollBarPolicy(configuredScrollPolicy);
+        verticalScrollBar()->setValue(followsBottom ? verticalScrollBar()->maximum() : page->scrollPosition);
+        runtime_->stickToBottom = followsBottom;
+    }
+    positionWidgets();
+    viewport()->update();
+    if (profile) qInfo("page_restore items=%d widgets=%d controls_us=%lld total_us=%lld", itemCount,
+                       widgetCount, controlsUs, timer.nsecsElapsed() / 1000);
+}
+
 void MarkdownView::clear() {
     for (const std::unique_ptr<Item>& item : runtime_->items) {
         if (item->widget == nullptr) continue;
@@ -396,9 +547,11 @@ void MarkdownView::relayoutAll() {
             continue;
         }
 
+        const bool needsLayout = !item->layoutValid || item->layoutAvailableWidth != available ||
+            item->layoutThemeRevision != runtime_->themeRevision;
         switch (item->style) {
             case Style::Document: {
-                item->layout.layout(item->document, theme, available);
+                if (needsLayout) item->layout.layout(item->document, theme, available);
                 item->frame = QRectF(left, y, available, item->layout.height());
                 item->origin = item->frame.topLeft();
                 break;
@@ -407,10 +560,10 @@ void MarkdownView::relayoutAll() {
                 // 先按最大宽度排一遍，再按实际需要的宽度收窄。短消息不该占满一行，
                 // 而**宽度只能量出来不能估**——估窄了字会被提前折断。
                 const qreal maximum = qMax<qreal>(available * theme.bubbleMaxWidthRatio - 2 * theme.bubblePadding, 1);
-                item->layout.layout(item->document, theme, maximum);
-                const qreal natural = qMin(item->layout.naturalWidth(), maximum);
-                if (natural > 0 && natural < maximum) {
-                    item->layout.layout(item->document, theme, natural);
+                if (needsLayout) {
+                    item->layout.layout(item->document, theme, maximum);
+                    const qreal natural = qMin(item->layout.naturalWidth(), maximum);
+                    if (natural > 0 && natural < maximum) item->layout.layout(item->document, theme, natural);
                 }
                 const qreal width = item->layout.width() + 2 * theme.bubblePadding;
                 const qreal height = item->layout.height() + 2 * theme.bubblePadding;
@@ -422,18 +575,23 @@ void MarkdownView::relayoutAll() {
             case Style::Error: {
                 // 提示行要用自己的颜色，不能和正文一个色——它不是内容，
                 // 是「刚才发生了什么」，读的时候应该一眼掠过去。
-                MarkdownTheme muted = theme;
-                muted.text = item->style == Style::Error ? theme.errorText : theme.noticeText;
-                muted.bodyPixelSize = qMax(1, theme.bodyPixelSize - 2);
-                item->layout.layout(item->document, muted, available);
-                const qreal width = qMin(item->layout.naturalWidth(), available);
-                item->layout.layout(item->document, muted, qMax<qreal>(width, 1));
+                if (needsLayout) {
+                    MarkdownTheme muted = theme;
+                    muted.text = item->style == Style::Error ? theme.errorText : theme.noticeText;
+                    muted.bodyPixelSize = qMax(1, theme.bodyPixelSize - 2);
+                    item->layout.layout(item->document, muted, available);
+                    const qreal width = qMin(item->layout.naturalWidth(), available);
+                    item->layout.layout(item->document, muted, qMax<qreal>(width, 1));
+                }
                 item->frame = QRectF(left + (available - item->layout.width()) / 2, y, item->layout.width(),
                                      item->layout.height());
                 item->origin = item->frame.topLeft();
                 break;
             }
         }
+        item->layoutValid = true;
+        item->layoutAvailableWidth = available;
+        item->layoutThemeRevision = runtime_->themeRevision;
         item->codeScroll.synchronize(item->layout);
         y = item->frame.bottom();
         textStart += item->textLength();
@@ -630,6 +788,9 @@ void MarkdownView::mouseReleaseEvent(QMouseEvent* event) {
         event->accept();
         return;
     }
+    // A press may belong to a detached page. Only a matching live press in
+    // this page can finish a text drag or activate its link.
+    if (!runtime_->selecting) return;
     runtime_->selecting = false;
     // 拖过一段距离的是在选文字，不是在点链接。
     const int moved = (event->pos() - runtime_->pressPosition).manhattanLength();

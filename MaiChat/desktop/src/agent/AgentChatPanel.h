@@ -105,9 +105,12 @@ private:
     class ToolGroupCard;
     class SubAgentCard;
 
-    // 把整个对话从存储里重画一遍。用在打开会话和清空之后——
-    // 流式期间**不要**调它，那会把正在长的正文整个换掉，界面会闪。
+    // 冷页或历史已清空时重画；正常切换保留最近三个会话的页面与控件，
+    // 返回时只同步发生变化的消息。流式期间不能整页重建。
     void reloadFromStore();
+    void saveConversationPage();
+    void refreshConversationFromStore(const MaiSession& session);
+    void restoreConversationControls(bool activeAssistantHasVisibleActivity);
     void loadEarlierMessages();
     bool appendStoredMessage(const MaiMessage& message, const MaiSession& session);
     void appendStoredUserMessage(const MaiMessage& message, const MaiSession& session);
@@ -194,6 +197,7 @@ private:
     void selectApprovalPolicy(MaiApprovalPolicy policy);
     void updateApprovalPolicyUi();
 
+    struct ConversationState;
     struct Runtime;
     std::unique_ptr<Runtime> runtime_;
     std::function<void(const QString&, const QStringList&)> openVideo_;
