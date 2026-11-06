@@ -81,3 +81,33 @@ SessionSync 宿主目标。
 QA 原始日志、几何 JSONL 和隔离素材录屏在上述 /private/tmp 目录，不提交用户素材。
 原有整套播放器扩展验收中的原生分享/保存等历史边界不随本次局部回归宣称全部通过；
 本次不宣称已经完成跨设备实际 HDR 亮度一致性验收，不改公开 v2.2.52 资产。
+
+## ba374531 私有包与 Windows 复核
+
+Mac app-only 候选在私有 `delivery-ba374531/MaiChat-macos-arm64/MaiChat.app`：
+74 个 Mach-O 运行依赖审计无失败，codesign deep/strict 与系统 PATH 的 --smoke 均
+exit 0。构建主程序与签名后主程序的 __TEXT.__text SHA256 一致，签名后文件 SHA256
+为 `2b7d161e47302b85e303e07f3345781f4489e4ed4fbcf5cc57fade583a81e63e`。
+完整回执 `delivery-proof-ba374531.json` 保存在 QA 目录；没有替换现装 PID96951，
+没有改 GitHub 公开包。候选版本号仍为 2.2.52，必须按源码 SHA 区分，不当成新 Release。
+
+house 在 Windows 10 / Qt 5.15.2 / MSVC2019 正常全目标重编、119 项 PE 导入检查通过。
+同入口 qwindows 云盘加载回归 23.76s PASS：旧 886 的实际图标亮度 240..254，
+contrast14；ba 的黑底白环 0..239，contrast239，首帧后隐藏且错误条不显示。
+其全景 QWidget 抓图存在原生 backingstore 杂纹，未作为真实视频证据；前台保护
+拒绝了会混入其他 App 的 DWM 采样，没有绕开保护保存截图。
+
+Windows 扩展播放器首轮 15 PASS / 3 FAIL / 0 SKIP，明确保留三项失败：
+
+- titleBarControlsMoveResizeAndRestoreThePlayer 在最小化、还原后点击全屏时，
+  点击已到达、原生 IsIconic=false，但 QWidget state=0 / QWindow state=4。
+  独立复跑仍失败；将 cpp/h 和原测试恢复为 ef31 源码 overlay、按正常依赖重编
+  后，同机同操作也在旧行516失败（2 PASS / 1 FAIL）。因此是已有 Windows Qt5
+  状态边界，不是新增原生缓冲子窗或本轮 Mac 分支引入。临时 overlay 随后恢复 ba。
+- 新增额外覆盖的 HLG/PQ 两条均在 hasPresentedHdrFrame 等待失败，未到全屏步骤。
+  唯一 host_.present_native_frames 赋值位于 Q_OS_MAC 条件内，Windows 仍走旧 SDL/
+  RGBA 路径，ef31 同样如此。这是未实现的 Windows 原生 HDR 路径边界，没有改
+  阈值或跳过失败，也没有顺带扩大本次实现范围。
+
+其余 HUD、边缘缩放、菜单/音量关闭、IM 宽窄独立窗口，以及主窗口、预览、音乐、
+AudioTempo 等组通过。不能把本次私有候选表述为“全平台全部播放器用例通过”。
