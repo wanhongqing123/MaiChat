@@ -231,7 +231,9 @@ public:
                "geometry must still match. Approval follows the Agent policy. An "
                "action only dispatches input; observe again to verify its effect. macOS needs "
                "Screen Recording and Accessibility permissions; Windows uses the interactive "
-               "desktop. This cannot control secure or locked screens.";
+               "desktop. This cannot control secure or locked screens. clear only forgets the "
+               "selected window and snapshot; it does not clear input text. After clear, call "
+               "observe again before any further window action.";
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{)"
@@ -297,7 +299,9 @@ public:
                                               "clear has no other parameters");
             const MaiError cleared = controller_->clear(context.sessionId);
             if (cleared) return failure(cleared);
-            return MaiToolResult::success(R"({"state":"cleared"})");
+            // Preserve the state field while making the cleared scope explicit to the Agent.
+            return MaiToolResult::success(R"({"state":"cleared","scope":"window_observation",)"
+                R"("text_changed":false,"next_step":"Call observe before any further window action."})");
         }
         if (!args.value("snapshot_id", Json{}).is_string() ||
             !args.value("window_id", Json{}).is_string())

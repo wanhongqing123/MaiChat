@@ -28,6 +28,7 @@ public:
         const std::string& snapshotId, std::uint64_t windowId,
         double xRatio, double yRatio, const std::string& text,
         const std::string& key, int scrollLines);
+    // Forget the selected window and snapshot; this never edits input text.
     MaiError clear(const std::string& sessionId);
 
 private:
