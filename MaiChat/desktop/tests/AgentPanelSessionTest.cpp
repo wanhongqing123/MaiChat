@@ -1871,6 +1871,9 @@ void AgentPanelSessionTest::stoppedQuestionReleasesComposerWithoutLosingDraft() 
     stop->click();
     controller.agent().waitIdle();
     QVERIFY(controller.pendingQuestions().empty());
+    // Send retains the same normal label while a question is pending. Wait for
+    // the actual terminal UI event, not that now-identical label, before resend.
+    QTRY_VERIFY(!stop->isVisible());
     QTRY_COMPARE(send->toolTip(), QStringLiteral("发送消息"));
     QCOMPARE(editor->placeholderText(), QStringLiteral("交给它做点什么…"));
     QCOMPARE(editor->toPlainText(), QStringLiteral("Which workspace is active now?"));

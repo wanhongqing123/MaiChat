@@ -59,3 +59,9 @@ iOS 源码未找到 `question` 专用 sheet/confirmationDialog；现场记忆中
 - 本轮未更改 MaiAgent Core，九套 Core 测试沿用同日已跑完且源文件/测试程序哈希完全一致的证据，不伪造新的执行时间。
 
 最终提交和 Windows 安装包以交付信息及 release-manifest.json 为准。跨端完整子任务问答需要相关客户端和独立同步服务一起更新；线上服务目前仍未部署，等待已验证的 SSH 入口。
+
+## 发布门禁补充记录
+
+首次完整 16 项 Windows 发布门禁中，仅 stoppedQuestionReleasesComposerWithoutLosingDraft 的等待条件失败：旧用例用“发送消息”按钮文字等待结束，而本轮待答期间也使用同一文字，导致 UI 尚未处理 turnFinished 就继续发送。普通无调试器运行稳定复现（68 通过、1 失败）；测试改为等待 Stop 实际隐藏后，普通运行 69/69。产品代码没有为该用例增加延时或变更行为；失败包未发布，最终版本重新执行完整门禁。
+
+Android 最终隔离包两项真机操作验证 2/2 通过（94.732 秒），覆盖问答、复制、父子片段顺序、窗口外增量。APK 内 26 个动态库与 stripped 输出逐项 SHA-256 匹配；JNI build-ID 为 6f7d4023ff56b8f695b111f1a9f05cb6c5333d22，已安装隔离 APK SHA-256 为 2f4de2699c4a8e2cb462d553176718f4537a0ec541cf641ecac9cfee7cc649ad。测试后仅卸载隔离包及测试包；正式 Android App 版本和更新时间一致。详细本机证据 final-android-validation.json、final-remote-window-native-ui-instrumentation.log。
