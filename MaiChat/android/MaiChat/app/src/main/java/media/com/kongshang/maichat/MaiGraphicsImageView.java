@@ -25,7 +25,7 @@ public final class MaiGraphicsImageView extends FrameLayout {
         surface.setPresentationListener(this::onPresented);
         addView(surface, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
 
-        failureLabel = new TextView(context);
+        failureLabel = MaiChatTypography.text(context);
         failureLabel.setText("图片无法显示");
         failureLabel.setTextColor(MaiChatTheme.SECONDARY);
         failureLabel.setGravity(Gravity.CENTER);

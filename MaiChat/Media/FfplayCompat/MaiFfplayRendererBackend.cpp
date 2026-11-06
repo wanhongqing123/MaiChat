@@ -83,6 +83,8 @@ static int probeHdrSource(const char* path, const MaiFfplayHost* host,
         return 0;
     }
     const bool hasStreams = avformat_find_stream_info(input, nullptr) >= 0;
+    info->is_iso_base_media = input->iformat && input->iformat->name &&
+        std::strstr(input->iformat->name, "mov") != nullptr;
     bool hdr = false;
     bool subtitles = false;
     if (hasStreams) {

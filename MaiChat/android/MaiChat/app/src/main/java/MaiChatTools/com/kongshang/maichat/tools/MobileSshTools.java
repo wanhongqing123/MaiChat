@@ -58,7 +58,7 @@ final class MobileSshTools {
         CountDownLatch done = new CountDownLatch(1);
         activity.runOnUiThread(() -> {
             if (!activity.isHostToolForeground()) { done.countDown(); return; }
-            EditText field = new EditText(activity);
+            EditText field = com.kongshang.maichat.MaiChatTypography.input(activity);
             field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
             field.setSingleLine(true);
             new AlertDialog.Builder(activity)

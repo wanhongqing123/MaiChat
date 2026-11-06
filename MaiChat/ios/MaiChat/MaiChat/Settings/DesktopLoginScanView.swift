@@ -89,7 +89,7 @@ struct DesktopLoginApprovalView: View {
             }
         }
         .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
-        .navigationTitle("扫码登录电脑")
+        .appNavigationTitle("扫码登录电脑")
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(true)
         .toolbar {
@@ -163,16 +163,16 @@ struct DesktopLoginApprovalView: View {
     ) -> some View {
         VStack(spacing: compact ? 8 : 24) {
             Image(systemName: info.platform == "mac" ? "laptopcomputer" : "desktopcomputer")
-                .font(.system(size: compact ? 38 : 52, weight: .light))
+                .font(AppTypography.symbol(size: compact ? 38 : 52, weight: .light))
                 .foregroundStyle(.blue)
                 .frame(width: compact ? 70 : 96, height: compact ? 70 : 96)
                 .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 24))
             VStack(spacing: 8) {
                 Text("确认电脑登录")
-                    .font((compact ? Font.title3 : Font.title2).weight(.semibold))
+                    .font((compact ? AppTypography.heading : AppTypography.title))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                 Text("正在登录 \(info.platform == "mac" ? "Mac" : "Windows") 版 MaiChat")
-                    .font(.subheadline)
+                    .font(AppTypography.detail)
                     .foregroundStyle(RemoteIMStyle.textSecondary)
             }
         }
@@ -183,21 +183,20 @@ struct DesktopLoginApprovalView: View {
     ) -> some View {
         VStack(spacing: compact ? 6 : 12) {
             Text("请比对电脑上显示的 6 位核对码")
-                .font(.subheadline)
+                .font(AppTypography.detail)
                 .foregroundStyle(RemoteIMStyle.textSecondary)
             Text(info.displayCode)
-                .font(.system(size: compact ? 32 : 40,
-                              weight: .semibold, design: .monospaced))
+                .font((compact ? AppTypography.display : AppTypography.hero).monospaced())
                 .tracking(compact ? 3 : 5)
                 .foregroundStyle(RemoteIMStyle.textPrimary)
                 .accessibilityIdentifier("desktop-login-code")
             Text("剩余 \(max(0, Int(ceil(expiresAt.timeIntervalSince(now))))) 秒")
-                .font(.footnote)
+                .font(AppTypography.detail)
                 .foregroundStyle(RemoteIMStyle.textSecondary)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, compact ? 14 : 30)
-        .background(.white, in: RoundedRectangle(cornerRadius: 20))
+        .background(RemoteIMStyle.panelBackground, in: RoundedRectangle(cornerRadius: 20))
     }
 
     /// 批准和取消在请求处理中同步禁用，避免重复提交与状态回跳。
@@ -213,7 +212,7 @@ struct DesktopLoginApprovalView: View {
                     if isDeciding && approving { ProgressView().tint(.white) }
                     Text(isDeciding && approving ? "正在确认…" : "确认登录")
                 }
-                .font(.body.weight(.semibold))
+                .font(AppTypography.body.weight(.semibold))
                 .frame(maxWidth: .infinity, minHeight: compact ? 44 : 54)
             }
             .buttonStyle(.borderedProminent)
@@ -223,7 +222,7 @@ struct DesktopLoginApprovalView: View {
             Button("取消本次登录") {
                 decide(id: id, info: info, expiresAt: expiresAt, approve: false)
             }
-            .font(.body.weight(.medium))
+            .font(AppTypography.body.weight(.medium))
             .foregroundStyle(.red)
             .frame(minHeight: compact ? 36 : 44)
             .disabled(isDeciding)
@@ -241,15 +240,15 @@ struct DesktopLoginApprovalView: View {
                 ProgressView().controlSize(.large).frame(height: 70)
             } else {
                 Image(systemName: symbol)
-                    .font(.system(size: 58, weight: .light))
+                    .font(AppTypography.symbol(size: 58, weight: .light))
                     .foregroundStyle(title == "已允许电脑登录" ? .green : .blue)
                     .frame(height: 70)
             }
             Text(title)
-                .font(.title2.weight(.semibold))
+                .font(AppTypography.title.weight(.semibold))
                 .foregroundStyle(RemoteIMStyle.textPrimary)
             Text(message)
-                .font(.subheadline)
+                .font(AppTypography.detail)
                 .foregroundStyle(RemoteIMStyle.textSecondary)
                 .multilineTextAlignment(.center)
             if let actionTitle {
@@ -269,7 +268,7 @@ struct DesktopLoginApprovalView: View {
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 20)
         .padding(.vertical, 52)
-        .background(.white, in: RoundedRectangle(cornerRadius: 20))
+        .background(RemoteIMStyle.panelBackground, in: RoundedRectangle(cornerRadius: 20))
     }
 
     /// 扫码页已验证 URI 格式，这里仍向服务端查询真实平台和六位核对码。

@@ -39,7 +39,7 @@ struct AIMobileSMSSettingsView: View {
             }
             if !error.isEmpty { Section { Text(error).foregroundStyle(.red) } }
         }
-        .navigationTitle("短信接入")
+        .appNavigationTitle("短信接入")
         .navigationBarTitleDisplayMode(.inline)
         .task { await refresh() }
         .onChange(of: scenePhase) { phase in if phase == .active { Task { await refresh() } } }

@@ -30,6 +30,7 @@ $appSemver = & (Join-Path $PSScriptRoot 'read-maichat-version.ps1') `
     -ProjectRoot $projectRoot -BuildPath $buildPath
 $ffmpegEnabled = Select-String -Path $cachePath -Pattern '^MAICHAT_ENABLE_FFMPEG:BOOL=(ON|TRUE|1)$' -Quiet
 $opencvEnabled = Select-String -Path $cachePath -Pattern '^MAICHAT_ENABLE_OPENCV:BOOL=(ON|TRUE|1)$' -Quiet
+$portraitEnabled = Select-String -Path $cachePath -Pattern '^MAICHAT_ENABLE_PORTRAIT:BOOL=(ON|TRUE|1)$' -Quiet
 $runtimeOutputLine = Select-String -Path $cachePath -Pattern '^EXECUTABLE_OUTPUT_PATH:PATH=(.+)$'
 $exeDir = $buildPath
 if ($runtimeOutputLine) {
@@ -250,6 +251,45 @@ if ($ffmpegEnabled -and $opencvEnabled -and
     Write-Host 'Windows RVM 资产未启用，跳过打包（cv_video_matting 不注册）'
 }
 
+# 人像服务独立于 RVM/FFmpeg；ZIP 和安装器都从 staging 取资源，不能只放在 build/bin。
+if ($portraitEnabled) {
+    foreach ($asset in @(
+        'onnxruntime.dll',
+        'PortraitModels\face_landmarks.onnx',
+        'PortraitModels\selfie_multiclass.onnx',
+        'PortraitModels\person_detection.onnx',
+        'PortraitModels\pose_estimation.onnx',
+        'PortraitModels\MEDIAPIPE_LICENSE',
+        'PortraitModels\MODELS.md',
+        'PortraitModels\ONNXRUNTIME_LICENSE',
+        'PortraitModels\ONNXRUNTIME_ThirdPartyNotices.txt',
+        'PortraitModels\GPUPIXEL_LICENSE',
+        'PortraitModels\GPUPIXEL_NOTICE'
+    )) {
+        $source = Join-Path $exeDir $asset
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Portrait build asset is missing: $source"
+        }
+        $target = Join-Path $staging $asset
+        New-Item -ItemType Directory -Force (Split-Path -Parent $target) | Out-Null
+        Copy-Item -LiteralPath $source -Destination $target -Force
+        if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) {
+            throw "Portrait staging checksum mismatch: $target"
+        }
+    }
+    $portraitProvider = Join-Path $exeDir 'onnxruntime_providers_shared.dll'
+    if (Test-Path -LiteralPath $portraitProvider -PathType Leaf) {
+        $portraitProviderTarget = Join-Path $staging 'onnxruntime_providers_shared.dll'
+        Copy-Item -LiteralPath $portraitProvider -Destination $portraitProviderTarget -Force
+        if ((Get-FileHash -LiteralPath $portraitProviderTarget -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $portraitProvider -Algorithm SHA256).Hash) {
+            throw "Portrait provider staging checksum mismatch: $portraitProviderTarget"
+        }
+    }
+    Write-Host 'Portrait models, ONNX Runtime and licenses staged independently of RVM/FFmpeg'
+}
+
 # 使用说明
 $readme = @"
 MaiChat 桌面客户端（Windows 免安装版）
@@ -262,7 +302,7 @@ MaiChat 桌面客户端（Windows 免安装版）
 - 创作中心主模型凭据在登录后由账号服务提供，无需手动填写主模型服务地址或令牌。
 - 聊天记录等本地数据存放于当前用户目录，删除本目录即可完成"卸载"。
 - vendor\ 目录存放腾讯 IM SDK 动态库，请勿移动或删除。
-- MaiAgentModels\ 与 onnxruntime*.dll 是视频抠像资源，请勿移动或删除。
+- PortraitModels\、MaiAgentModels\ 与 onnxruntime*.dll 是本地人像/视频处理资源，请勿移动或删除。
 "@
 [System.IO.File]::WriteAllText(
     (Join-Path $staging '使用说明.txt'),

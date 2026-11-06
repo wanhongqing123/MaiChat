@@ -284,30 +284,30 @@ void BroadcastDialog::refreshSendState() {
 
 // 作用：应用页面现有的颜色、字号、间距和控件外观。
 void BroadcastDialog::applyStyle() {
-    setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         #broadcastPanel {
             background: #ffffff;
             border-radius: 16px;
         }
         #broadcastTitle {
             color: #0f172a;
-            font-size: 18px;
+            font-size: @heading3;
             font-weight: 700;
         }
         #broadcastDescription {
             color: #667085;
-            font-size: 13px;
+            font-size: @detail;
         }
         #broadcastSummary {
             color: #667085;
-            font-size: 13px;
+            font-size: @detail;
         }
         #broadcastFilter, #broadcastMessage {
             background: #f8fafc;
             border: 1px solid #d9e1ec;
             border-radius: 10px;
             color: #172033;
-            font-size: 14px;
+            font-size: @detail;
             padding: 8px 12px;
         }
         #broadcastFilter:focus, #broadcastMessage:focus {
@@ -319,7 +319,7 @@ void BroadcastDialog::applyStyle() {
             border: 1px solid #d9e1ec;
             border-radius: 10px;
             color: #172033;
-            font-size: 14px;
+            font-size: @detail;
             padding: 4px;
         }
         #broadcastRecipients::item {
@@ -327,7 +327,7 @@ void BroadcastDialog::applyStyle() {
         }
         #broadcastCancel, #broadcastSend {
             border-radius: 10px;
-            font-size: 14px;
+            font-size: @detail;
             font-weight: 700;
             padding: 10px 22px;
         }
@@ -349,5 +349,5 @@ void BroadcastDialog::applyStyle() {
             background: #cbd5e1;
             color: #f8fafc;
         }
-    )")));
+    )"));
 }

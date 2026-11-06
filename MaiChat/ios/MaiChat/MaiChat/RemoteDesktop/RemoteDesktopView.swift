@@ -104,7 +104,7 @@ private struct RemoteDesktopContent: View {
                     }
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 12, weight: .bold))
+                        .font(AppTypography.symbol(size: 12, weight: .bold))
                         .foregroundStyle(Color.white)
                         .frame(width: 28, height: 28)
                         .background(Color.red, in: Circle())
@@ -123,10 +123,10 @@ private struct RemoteDesktopContent: View {
     private var idleState: some View {
         VStack(spacing: 12) {
             Image(systemName: "display")
-                .font(.system(size: 34, weight: .medium))
+                .font(AppTypography.symbol(size: 34, weight: .medium))
                 .foregroundStyle(RemoteIMStyle.textSecondary)
             Text("没有进行中的远程桌面")
-                .font(.system(size: 17, weight: .semibold))
+                .font(AppTypography.body.weight(.semibold))
                 .foregroundStyle(RemoteIMStyle.textPrimary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -185,7 +185,7 @@ private struct RemoteDesktopContent: View {
                                 Text("×")
                                 Image(systemName: "arrow.counterclockwise")
                             }
-                            .font(.system(size: 12, weight: .semibold))
+                            .font(AppTypography.symbol(size: 12, weight: .semibold))
                             .foregroundStyle(Color.white)
                             .padding(.horizontal, 11)
                             .frame(minWidth: 44, minHeight: 44)
@@ -208,7 +208,7 @@ private struct RemoteDesktopContent: View {
                             ? "画面位置已锁定；关闭控制后可继续缩放"
                             : "关闭“控制中”后可缩放和移动画面"
                     )
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(AppTypography.metadata.weight(.semibold))
                     .foregroundStyle(Color.white)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -225,7 +225,7 @@ private struct RemoteDesktopContent: View {
                         .tint(.white)
                         .scaleEffect(1.15)
                     Text(session.state.statusText)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(AppTypography.detail.weight(.semibold))
                         .foregroundStyle(Color.white.opacity(0.82))
                 }
             }
@@ -233,7 +233,7 @@ private struct RemoteDesktopContent: View {
             if let noticeText = session.noticeText {
                 VStack {
                     Text(noticeText)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(AppTypography.detail.weight(.semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 9)
@@ -313,7 +313,7 @@ private struct RemoteDesktopContent: View {
 
                 if keyboardDraftFocused, keyboardDraft.isEmpty {
                     Text("输入远程文字")
-                        .font(.system(size: 15))
+                        .font(AppTypography.detail)
                         .foregroundStyle(Color.white.opacity(0.46))
                         .padding(.leading, 12)
                         .allowsHitTesting(false)
@@ -325,18 +325,18 @@ private struct RemoteDesktopContent: View {
                     } label: {
                         HStack(spacing: 8) {
                             Image(systemName: "keyboard")
-                                .font(.system(size: 14, weight: .semibold))
+                                .font(AppTypography.symbol(size: 14, weight: .semibold))
 
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("键盘直接控制中")
-                                    .font(.system(size: 13, weight: .semibold))
+                                    .font(AppTypography.detail.weight(.semibold))
 
                                 Text(
                                     keyboardDraft.isEmpty
                                         ? "点此编辑文字草稿"
                                         : "草稿已保留，点此继续编辑"
                                 )
-                                .font(.system(size: 11))
+                                .font(AppTypography.metadata)
                                 .foregroundStyle(Color.white.opacity(0.62))
                             }
 
@@ -368,7 +368,7 @@ private struct RemoteDesktopContent: View {
                 keyboardSubmitRequest &+= 1
             } label: {
                 Image(systemName: "arrow.up")
-                    .font(.system(size: 15, weight: .bold))
+                    .font(AppTypography.symbol(size: 15, weight: .bold))
                     .foregroundStyle(Color.white)
                     .frame(width: 36, height: 36)
                     .background(
@@ -476,7 +476,7 @@ private struct RemoteControlLabel: View {
 
     var body: some View {
         Image(systemName: systemImage)
-            .font(.system(size: 16, weight: .semibold))
+            .font(AppTypography.symbol(size: 16, weight: .semibold))
             .foregroundStyle(Color.white)
             .frame(width: 32, height: 32)
             .background(
@@ -1307,7 +1307,7 @@ private final class RemoteKeyboardInputTextView: UITextView, UITextViewDelegate 
         backgroundColor = .clear
         textColor = .white
         tintColor = .systemBlue
-        font = .preferredFont(forTextStyle: .body)
+        font = AppTypography.uiFont(.body)
         adjustsFontForContentSizeCategory = true
         textContainerInset = UIEdgeInsets(top: 8, left: 7, bottom: 8, right: 7)
         self.textContainer.lineFragmentPadding = 0

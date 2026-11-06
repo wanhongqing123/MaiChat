@@ -256,7 +256,7 @@ struct AIPdfPasswordView: View {
             .disabled(!AIPdfPasswordRequests.isValid(password, confirmation: confirmation))
             .accessibilityIdentifier("pdf-password-submit")
         }
-        .navigationTitle("PDF 密码保护")
+        .appNavigationTitle("PDF 密码保护")
         // 与账号安全表单统一用行内标题，保留半透明导航栏下清晰的标题对比度。
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

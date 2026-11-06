@@ -18,4 +18,6 @@ using MaiCloudDriveToolHandler = std::function<MaiToolResult(const std::string& 
 // preserves confirmed parts and needs no approval. Registration performs no
 // network call. Session attachment open is read-only and binds the current
 // Agent Session ID before calling the platform's ordinary download core.
+// Private-drive download also uses the ordinary core; it creates a new file
+// inside the current workspace, without replacing existing local files.
 void registerMaiCloudDriveTools(MaiToolRegistry& tools, MaiCloudDriveToolHandler handler);

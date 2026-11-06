@@ -26,6 +26,8 @@ public:
     void updateSession(const QJsonObject& remote);
     void receivePayload(const QJsonObject& remote, const QString& kind, const QJsonObject& payload);
     QJsonObject session() const;
+    // 上传完成后保留原服务器附件引用，未知回执重试不得重新导入同一内容。
+    void rememberPreparedPrompt(const QString& requestId, const QJsonObject& payload);
 
 private:
     struct Runtime;
@@ -39,6 +41,7 @@ private:
     void recoverQueuedDraft();
     void refreshAttachments();
     void sendAction(const QJsonObject& action, bool clearDraft, const QJsonObject& question = {});
+    void sendPrompt(const QJsonObject& action, const QString& retryId = {});
     void removeOptimisticMessage(const QString& id);
     void renderMessages();
     void updateThinking();

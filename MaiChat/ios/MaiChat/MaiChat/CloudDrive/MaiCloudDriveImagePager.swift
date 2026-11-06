@@ -127,7 +127,7 @@ final class MaiCloudDriveMediaPagerController: UIViewController,
                                        identifier: "cloud-drive-image-close")
         closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
         caption.textColor = .white
-        caption.font = .systemFont(ofSize: 12, weight: .medium)
+        caption.font = AppTypography.uiFont(.metadata, weight: .medium)
         caption.textAlignment = .center
         caption.lineBreakMode = .byTruncatingMiddle
         caption.accessibilityIdentifier = "cloud-drive-image-counter"
@@ -160,13 +160,13 @@ final class MaiCloudDriveMediaPagerController: UIViewController,
         actions.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(actions)
         feedback.textColor = .white
-        feedback.font = .systemFont(ofSize: 13, weight: .medium)
+        feedback.font = AppTypography.uiFont(.detail, weight: .medium)
         feedback.textAlignment = .right
         feedback.numberOfLines = 2
         feedback.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(feedback)
         moreButton.setTitle("加载更多", for: .normal)
-        moreButton.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+        moreButton.titleLabel?.font = AppTypography.uiFont(.detail, weight: .semibold)
         moreButton.tintColor = .white
         moreButton.backgroundColor = UIColor.black.withAlphaComponent(0.6)
         moreButton.layer.cornerRadius = 22
@@ -584,12 +584,12 @@ private final class MaiCloudDriveMediaPageController: UIViewController, UIScroll
         scroll.addGestureRecognizer(doubleTap)
         spinner.color = .white
         message.textColor = .white
-        message.font = .preferredFont(forTextStyle: .body)
+        message.font = AppTypography.uiFont(.body)
         message.numberOfLines = 4
         message.textAlignment = .center
         retryButton.setTitle("重试", for: .normal)
         retryButton.tintColor = .white
-        retryButton.titleLabel?.font = .preferredFont(forTextStyle: .headline)
+        retryButton.titleLabel?.font = AppTypography.uiFont(.body, weight: .semibold)
         retryButton.accessibilityIdentifier = "cloud-drive-image-retry"
         retryButton.addTarget(self, action: #selector(retryTapped), for: .touchUpInside)
         stateStack.axis = .vertical

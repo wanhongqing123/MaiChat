@@ -287,7 +287,7 @@ protected:
     }
 
     QFont font = painter.font();
-    font.setPixelSize(UiZoom::s(12));
+    font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Metadata));
     font.setWeight(QFont::DemiBold);
     painter.setFont(font);
     painter.setPen(QColor(QStringLiteral("#0b8fe3")));
@@ -353,7 +353,7 @@ public:
   explicit MarkdownMessageView(QWidget *parent = nullptr)
       : MarkdownLabel(parent) {
     setObjectName(QStringLiteral("messageMarkdownView"));
-    setTheme(MarkdownTheme::standard(UiZoom::factor()));
+    setTheme(MarkdownTheme::standard(UiZoom::markdownScale(), UiZoom::fontFamilies().first()));
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     // 链接点开走系统浏览器，和原来 setOpenExternalLinks(true) 一样。
     connect(this, &MarkdownLabel::linkActivated, this,
@@ -374,7 +374,7 @@ public:
     setTrailingNote(timestamp.isEmpty()
                         ? QString()
                         : QStringLiteral("  \u00b7 ") + timestamp,
-                    QColor(QStringLiteral("#0f8ddd")), UiZoom::s(11));
+                    QColor(QStringLiteral("#0f8ddd")), UiZoom::textPixels(UiZoom::TextRole::Metadata));
     setMarkdown(markdown);
     updateContentHeight();
   }
@@ -809,7 +809,7 @@ public:
     const int textLeft = avatarRect.right() + UiZoom::s(14);
   // 时间列按真实文字宽度测量；短的 HH:mm 为名称让位，长日期也不会被裁切。
     QFont timeFont = option.font;
-    timeFont.setPixelSize(UiZoom::s(12));
+    timeFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Metadata));
     const int timeWidth =
         time.isEmpty() ? 0 : QFontMetrics(timeFont).horizontalAdvance(time) + 2;
     const QRect timeRect(rowRect.right() - timeWidth - UiZoom::s(10),
@@ -824,7 +824,7 @@ public:
                             UiZoom::s(18));
 
     QFont nameFont = option.font;
-    nameFont.setPixelSize(UiZoom::s(14));
+    nameFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
     nameFont.setWeight(QFont::Medium);
     painter->setFont(nameFont);
     painter->setPen(QColor(QStringLiteral("#1f2329")));
@@ -844,7 +844,7 @@ public:
       const QString badgeText =
           unread > 99 ? QStringLiteral("99+") : QString::number(unread);
       QFont badgeFont = option.font;
-      badgeFont.setPixelSize(UiZoom::s(11));
+      badgeFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Metadata));
       badgeFont.setBold(true);
       const int badgeHeight = UiZoom::s(18);
       const int badgeWidth = qMax(
@@ -862,7 +862,7 @@ public:
     }
 
     QFont previewFont = option.font;
-    previewFont.setPixelSize(UiZoom::s(13));
+    previewFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Detail));
     painter->setFont(previewFont);
     painter->setPen(QColor(QStringLiteral("#667085")));
     painter->drawText(
@@ -938,7 +938,7 @@ public:
                          rowRect.height());
 
     QFont nameFont = option.font;
-    nameFont.setPixelSize(UiZoom::s(14));
+    nameFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
     nameFont.setWeight(QFont::Medium);
     painter->setFont(nameFont);
     painter->setPen(QColor(QStringLiteral("#1f2329")));
@@ -988,7 +988,7 @@ private:
     painter->drawPolygon(arrow);
 
     QFont titleFont = option.font;
-    titleFont.setPixelSize(UiZoom::s(12));
+    titleFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Metadata));
     titleFont.setWeight(QFont::Medium);
     painter->setFont(titleFont);
     painter->setPen(QColor(QStringLiteral("#667085")));
@@ -1392,7 +1392,7 @@ void applyMessageContextMenuStyle(QMenu &menu) {
   menu.setWindowFlags(menu.windowFlags() | Qt::FramelessWindowHint |
                       Qt::NoDropShadowWindowHint);
   menu.setAttribute(Qt::WA_TranslucentBackground);
-  menu.setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+  UiZoom::setStyle(&menu, QStringLiteral(R"(
         QMenu {
             background: #ffffff;
             border: 1px solid #e2e8f0;
@@ -1402,7 +1402,7 @@ void applyMessageContextMenuStyle(QMenu &menu) {
         QMenu::item {
             background: transparent;
             color: #1f2329;
-            font-size: 13px;
+            font-size: @detail;
             padding: 8px 36px 8px 10px;
             border-radius: 6px;
         }
@@ -1418,7 +1418,7 @@ void applyMessageContextMenuStyle(QMenu &menu) {
             background: #eef2f6;
             margin: 5px 6px;
         }
-    )")));
+    )"));
 }
 
 // 文本气泡右键菜单：复制（有选区复制选区，否则复制渲染后的整条消息）/
@@ -1824,9 +1824,10 @@ MainWindow::MainWindow(
       notificationTracker_(QDateTime::currentMSecsSinceEpoch()) {
   Q_INIT_RESOURCE(resources);
   // 缩放只作用于主界面：登录窗（先于此构造）保持设计尺寸，
-  // 进入主界面时才把全局字体切到基准 13px × 倍率。
+  // 进入主界面时才把全局字体切到基准 16px × 倍率。
   QFont scaledFont = QApplication::font();
-  scaledFont.setPixelSize(UiZoom::s(13));
+  scaledFont.setFamilies(UiZoom::fontFamilies());
+  scaledFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
   QApplication::setFont(scaledFont);
   auto updatePerformanceContext = [this] {
     const auto account = app_.client().currentAccount();
@@ -2587,20 +2588,20 @@ void MainWindow::buildUi() {
   aiReplyButton_->setCursor(Qt::PointingHandCursor);
   aiReplyButton_->setAccessibleName(QStringLiteral("AI 回复"));
   aiReplyButton_->installEventFilter(this);
-  aiReplyButton_->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+  UiZoom::setStyle(aiReplyButton_, QStringLiteral(R"(
         QPushButton#aiReplyButton {
             background: transparent;
             border: none;
             border-radius: 8px;
             padding: 0;
             color: #574ba7;
-            font-size: 12px;
+            font-size: @metadata;
             font-weight: 600;
         }
         QPushButton#aiReplyButton:hover { background: #f0edff; }
         QPushButton#aiReplyButton:pressed { background: #e2dcff; }
         QPushButton#aiReplyButton:disabled { background: transparent; }
-    )")));
+    )"));
   static_cast<ComposerTextEdit *>(messageEditor_)
       ->setLeadingAction(aiReplyButton_);
 
@@ -2609,17 +2610,17 @@ void MainWindow::buildUi() {
   aiReplyHint_->setAlignment(Qt::AlignCenter);
   aiReplyHint_->setFixedSize(UiZoom::s(54), UiZoom::s(22));
   aiReplyHint_->setAttribute(Qt::WA_TransparentForMouseEvents);
-  aiReplyHint_->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+  UiZoom::setStyle(aiReplyHint_, QStringLiteral(R"(
         QLabel#aiReplyHint {
             background: #ffffff;
             border: 1px solid #d7dde6;
             border-radius: 4px;
             color: #344054;
-            font-size: 11px;
+            font-size: @metadata;
             font-weight: 500;
             padding: 0;
         }
-    )")));
+    )"));
   aiReplyHint_->hide();
   static_cast<ComposerTextEdit *>(messageEditor_)->setLeadingHint(aiReplyHint_);
 
@@ -2632,11 +2633,11 @@ void MainWindow::buildUi() {
   commandButton_->setCursor(Qt::PointingHandCursor);
   commandButton_->installEventFilter(this);
   commandButton_->setFixedSize(UiZoom::s(30), UiZoom::s(30));
-  commandButton_->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
+  UiZoom::setStyle(commandButton_, QStringLiteral(
       "QPushButton{background:transparent;border:0;border-radius:8px;color:#"
       "64748b;"
-      "font-size:19px;padding:0;}QPushButton:hover{background:#edf2f7;}"
-      "QPushButton:pressed{background:#e2e8f0;}")));
+      "font-size: @title;padding:0;}QPushButton:hover{background:#edf2f7;}"
+      "QPushButton:pressed{background:#e2e8f0;}"));
   static_cast<ComposerTextEdit *>(messageEditor_)
       ->setSecondaryLeadingAction(commandButton_);
   commandMenu_ = new QMenu(commandButton_);
@@ -2705,7 +2706,7 @@ void MainWindow::buildUi() {
           &MainWindow::requestReplySuggestions);
   connect(closeSuggestionButton, &QPushButton::clicked, this,
           &MainWindow::clearReplySuggestions);
-  replySuggestionBar_->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+  UiZoom::setStyle(replySuggestionBar_, QStringLiteral(R"(
         #replySuggestionBar {
             background: #f8fbff;
             border: 1px solid #cfe5fb;
@@ -2713,7 +2714,7 @@ void MainWindow::buildUi() {
         }
         #replySuggestionStatus {
             color: #52677d;
-            font-size: 12px;
+            font-size: @metadata;
             background: transparent;
         }
         #replySuggestionBar QPushButton {
@@ -2734,7 +2735,7 @@ void MainWindow::buildUi() {
             text-align: center;
             padding: 2px 6px;
         }
-    )")));
+    )"));
   replySuggestionBar_->hide();
   composerLayout->addWidget(replySuggestionBar_);
 
@@ -2762,7 +2763,7 @@ void MainWindow::buildUi() {
           &MainWindow::cancelPendingReply);
   replyBarLayout->addWidget(pendingReplyLabel_, 1);
   replyBarLayout->addWidget(cancelReplyButton);
-  pendingReplyBar_->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+  UiZoom::setStyle(pendingReplyBar_, QStringLiteral(R"(
         #pendingReplyBar {
             background: #f1f5f9;
             border: 1px solid #e2e8f0;
@@ -2770,20 +2771,20 @@ void MainWindow::buildUi() {
         }
         #pendingReplyLabel {
             color: #475569;
-            font-size: 12px;
+            font-size: @metadata;
             background: transparent;
         }
         QPushButton#cancelReplyButton {
             background: transparent;
             border: none;
             color: #64748b;
-            font-size: 15px;
+            font-size: @body;
         }
         QPushButton#cancelReplyButton:hover {
             background: #e2e8f0;
             border-radius: 11px;
         }
-    )")));
+    )"));
   pendingReplyBar_->hide();
   composerLayout->addWidget(pendingReplyBar_);
 
@@ -2829,12 +2830,12 @@ void MainWindow::buildUi() {
   groupTitleLabel_ = new QLabel(groupHeader);
   groupTitleLabel_->setObjectName(QStringLiteral("groupChatTitle"));
   QFont groupTitleFont = groupTitleLabel_->font();
-  groupTitleFont.setPixelSize(UiZoom::s(17));
+  groupTitleFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
   groupTitleFont.setWeight(QFont::DemiBold);
-  groupTitleLabel_->setFont(groupTitleFont);
+  UiZoom::setFont(groupTitleLabel_, UiZoom::TextRole::Body, groupTitleFont);
   groupSubtitleLabel_ = new QLabel(groupHeader);
   groupSubtitleLabel_->setObjectName(QStringLiteral("groupChatSubtitle"));
-  groupSubtitleLabel_->setStyleSheet(QStringLiteral("color:#8895a7;font-size:12px;"));
+  UiZoom::setStyle(groupSubtitleLabel_, QStringLiteral("color:#8895a7;font-size: @metadata;"));
   groupHeaderLayout->addWidget(groupTitleLabel_);
   groupHeaderLayout->addWidget(groupSubtitleLabel_);
   groupLayout->addWidget(groupHeader);
@@ -3200,6 +3201,40 @@ void MainWindow::buildUi() {
   settingsLayout->addWidget(settingsSubtitle);
   settingsLayout->addWidget(profileCard);
   settingsLayout->addWidget(settingsPanel);
+
+  auto *familyChoice = new QComboBox(settingsContent);
+  familyChoice->setObjectName(QStringLiteral("settingsFontFamily"));
+  familyChoice->setAccessibleName(QStringLiteral("字体"));
+  for (const QString& id : UiZoom::availableFontFamilyIds())
+    familyChoice->addItem(UiZoom::fontFamilyTitle(id), id);
+  familyChoice->setCurrentIndex(qMax(0, familyChoice->findData(UiZoom::fontFamilyId())));
+  auto *familyRow = createSettingsRow(QStringLiteral("字体"), nullptr,
+      QStringLiteral("普通文字使用所选字体；代码保持等宽"));
+  qobject_cast<QHBoxLayout *>(familyRow->layout())->addWidget(familyChoice);
+  settingsLayout->addWidget(familyRow);
+  connect(familyChoice, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+      [this, familyChoice](int index) {
+        UiZoom::setFontFamilyId(familyChoice->itemData(index).toString());
+        applyUiZoom(false);
+      });
+
+  auto *fontChoice = new QComboBox(settingsContent);
+  fontChoice->setObjectName(QStringLiteral("settingsTextSize"));
+  fontChoice->setAccessibleName(QStringLiteral("字体大小"));
+  fontChoice->addItem(QStringLiteral("标准"), QStringLiteral("standard"));
+  fontChoice->addItem(QStringLiteral("大"), QStringLiteral("large"));
+  fontChoice->addItem(QStringLiteral("特大"), QStringLiteral("extraLarge"));
+  fontChoice->setCurrentIndex(qMax(0, fontChoice->findData(UiZoom::textPreset())));
+  auto *fontRow = createSettingsRow(QStringLiteral("字体大小"), nullptr,
+      QStringLiteral("统一调整应用文字和 Markdown；标题保留相对大小"));
+  qobject_cast<QHBoxLayout *>(fontRow->layout())->addWidget(fontChoice);
+  settingsLayout->addWidget(fontRow);
+  connect(fontChoice, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+      [this, fontChoice](int index) {
+        UiZoom::setTextPreset(fontChoice->itemData(index).toString());
+        applyUiZoom(false);
+      });
+
   settingsLayout->addSpacing(UiZoom::s(24));
   settingsLayout->addWidget(buildRemoteDesktopSettingsPanel(settingsContent));
   settingsLayout->addStretch(1);
@@ -3312,11 +3347,11 @@ void MainWindow::buildUi() {
 }
 
 void MainWindow::applyStyle() {
-  setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+  UiZoom::setStyle(this, QStringLiteral(R"(
         QMainWindow, #root {
             background: #f6f9fc;
             color: #172033;
-            font-size: 14px;
+            font-size: @detail;
         }
         #navLogoContainer {
             background: transparent;
@@ -3340,7 +3375,7 @@ void MainWindow::applyStyle() {
             background: #ffffff;
             color: #172033;
             padding: 0 8px;
-            font-size: 13px;
+            font-size: @detail;
         }
         #globalSearchBox:focus, #contactsSearchBox:focus {
             border-color: #8ed0ff;
@@ -3350,7 +3385,7 @@ void MainWindow::applyStyle() {
             border: 1px solid #dbe4ef;
             border-radius: 10px;
             padding: 4px;
-            font-size: 13px;
+            font-size: @detail;
         }
         #globalSearchResults::item {
             border-radius: 8px;
@@ -3398,12 +3433,22 @@ void MainWindow::applyStyle() {
         }
         #conversationSectionTitle {
             color: #172033;
-            font-size: 17px;
+            font-size: @title;
             font-weight: 600;
         }
+        #friendRequestsButton {
+            min-height: 30px;
+            border: 1px solid #d8e5f1;
+            border-radius: 8px;
+            background: #ffffff;
+            color: #45627f;
+            font-size: @metadata;
+            padding: 0 10px;
+        }
+        #friendRequestsButton:hover { background: #e9f2fb; }
         #pageTitle {
             color: #101828;
-            font-size: 16px;
+            font-size: @title;
             font-weight: 600;
         }
         QPushButton[chatHeaderIcon="true"] {
@@ -3455,7 +3500,7 @@ void MainWindow::applyStyle() {
         }
         #contactProfileName {
             color: #172033;
-            font-size: 22px;
+            font-size: @heading1;
             font-weight: 600;
         }
         #contactProfileAccountCard {
@@ -3463,8 +3508,8 @@ void MainWindow::applyStyle() {
             border: 1px solid #dae4f0;
             border-radius: 12px;
         }
-        #contactProfileAccountTitle { color: #66758d; font-size: 12px; }
-        #contactProfileAccountId { color: #172033; font-size: 14px; }
+        #contactProfileAccountTitle { color: #66758d; font-size: @metadata; }
+        #contactProfileAccountId { color: #172033; font-size: @detail; }
         #contactProfileCopyButton { color: #0985d7; border: 0; background: transparent; }
         #contactProfileMessageButton {
             background: #078ce3; color: #ffffff; border: 0;
@@ -3525,21 +3570,21 @@ void MainWindow::applyStyle() {
         }
         #contactHintTitle {
             color: #101828;
-            font-size: 16px;
+            font-size: @body;
             font-weight: 600;
         }
         #contactHintSubtitle, #settingsSubtitle {
             color: #667085;
-            font-size: 13px;
+            font-size: @detail;
         }
         #selfProfileCard {
             background: #ffffff;
             border: 1px solid #dae4f0;
             border-radius: 12px;
         }
-        #selfProfileName { color: #172033; font-size: 20px; font-weight: 600; }
-        #selfProfileId { color: #66758d; font-size: 13px; }
-        #selfConnectionStatus { color: #667085; font-size: 12px; }
+        #selfProfileName { color: #172033; font-size: @body; font-weight: 400; }
+        #selfProfileId { color: #66758d; font-size: @detail; }
+        #selfConnectionStatus { color: #667085; font-size: @metadata; }
         #selfConnectionStatus[connected="true"] { color: #14805b; }
         #settingsPanel {
             background: #ffffff;
@@ -3550,13 +3595,13 @@ void MainWindow::applyStyle() {
            否则标题直接贴在面板上边框上，看着像挤在线上。 */
         #settingsSectionTitle {
             color: #0f172a;
-            font-size: 15px;
+            font-size: @body;
             font-weight: 700;
             padding: 6px 0 12px 18px;
         }
         #settingsRadio {
             color: #334155;
-            font-size: 13px;
+            font-size: @detail;
             spacing: 8px;
         }
         #settingsRowButton {
@@ -3564,7 +3609,7 @@ void MainWindow::applyStyle() {
             border: 1px solid #d9e1ec;
             border-radius: 8px;
             color: #1e40af;
-            font-size: 13px;
+            font-size: @detail;
             font-weight: 700;
             padding: 6px 16px;
         }
@@ -3580,16 +3625,16 @@ void MainWindow::applyStyle() {
         }
         #settingsRowTitle {
             color: #172033;
-            font-size: 14px;
-            font-weight: 600;
+            font-size: @body;
+            font-weight: 400;
         }
         #settingsRowHelper {
             color: #667085;
-            font-size: 12px;
+            font-size: @detail;
         }
         #settingsAccountValue {
             color: #172033;
-            font-size: 14px;
+            font-size: @detail;
             font-weight: 500;
         }
         #chatContentPane {
@@ -3601,7 +3646,7 @@ void MainWindow::applyStyle() {
         }
         #chatTitle {
             color: #101828;
-            font-size: 16px;
+            font-size: @title;
             font-weight: 600;
         }
         #messageScroll, #messageContainer {
@@ -3642,7 +3687,7 @@ void MainWindow::applyStyle() {
             background: #ffffff;
             color: #172033;
             padding: 10px 52px 46px 13px;
-            font-size: 14px;
+            font-size: @body;
         }
         #messageEditor:focus {
             border-color: #b5bbc4;
@@ -3674,7 +3719,7 @@ void MainWindow::applyStyle() {
         QSplitter::handle:hover {
             background: transparent;
         }
-    )")));
+    )"));
 }
 
 void MainWindow::bindSignals() {
@@ -4093,15 +4138,15 @@ void MainWindow::refreshGroupConversation() {
     }
     auto *senderLabel = new QLabel(sender, bubble);
     senderLabel->setObjectName(QStringLiteral("groupMessageSender"));
-    senderLabel->setStyleSheet(QStringLiteral("color:#697b91;font-size:11px;"));
+    UiZoom::setStyle(senderLabel, QStringLiteral("color:#697b91;font-size: @metadata;"));
     auto *body = new QLabel(message.text, bubble);
     body->setObjectName(QStringLiteral("groupMessageText"));
     body->setWordWrap(true);
     body->setTextFormat(Qt::PlainText);
     body->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    body->setStyleSheet(QStringLiteral("color:#1d2939;font-size:14px;"));
+    UiZoom::setStyle(body, QStringLiteral("color:#1d2939;font-size: @detail;"));
     auto *meta = new QLabel(bubble);
-    meta->setStyleSheet(QStringLiteral("color:#92a0b1;font-size:10px;"));
+    UiZoom::setStyle(meta, QStringLiteral("color:#92a0b1;font-size: @metadata;"));
     meta->setText(message.failed ? QStringLiteral("发送失败") :
         message.pending ? QStringLiteral("发送中…") :
         QDateTime::fromMSecsSinceEpoch(message.createdAtMillis).toString(QStringLiteral("HH:mm")));
@@ -4868,6 +4913,7 @@ void MainWindow::wireRemoteAgentPanel() {
         completion(response.second.isEmpty() ? QStringLiteral("账号已切换") : response.second);
         return;
       }
+      panel->rememberPreparedPrompt(response.first.value(QStringLiteral("requestId")).toString(), response.first);
       sync->sendRemoteCommand(session, response.first,
                               [panel, completion = std::move(completion)](const QJsonObject&,
                                                                            const QString& error) {
@@ -5694,24 +5740,24 @@ void MainWindow::rebuildMessageList(const QString &peerId,
     emptyLayout->addWidget(title);
     emptyLayout->addWidget(subtitle);
     emptyLayout->addStretch(1);
-    emptyView->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(emptyView, QStringLiteral(R"(
             #emptyMessageIcon {
                 color: #98a2b3;
-                font-size: 28px;
+                font-size: @display;
                 background: transparent;
             }
             #emptyMessageTitle {
                 color: #101828;
-                font-size: 16px;
+                font-size: @body;
                 font-weight: 700;
                 background: transparent;
             }
             #emptyMessageSubtitle {
                 color: #667085;
-                font-size: 13px;
+                font-size: @detail;
                 background: transparent;
             }
-        )")));
+        )"));
     messageLayout_->addWidget(emptyView);
     return;
   }
@@ -5721,20 +5767,20 @@ void MainWindow::rebuildMessageList(const QString &peerId,
       new QPushButton(QStringLiteral("加载更早的消息"), messageContainer_);
   loadEarlierButton_->setObjectName(QStringLiteral("loadEarlierButton"));
   loadEarlierButton_->setCursor(Qt::PointingHandCursor);
-  loadEarlierButton_->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+  UiZoom::setStyle(loadEarlierButton_, QStringLiteral(R"(
         QPushButton#loadEarlierButton {
             background: #f1f5f9;
             border: 1px solid #e2e8f0;
             border-radius: 14px;
             color: #475569;
-            font-size: 12px;
+            font-size: @metadata;
             font-weight: 700;
             padding: 5px 14px;
         }
         QPushButton#loadEarlierButton:hover {
             background: #e2e8f0;
         }
-    )")));
+    )"));
   connect(loadEarlierButton_, &QPushButton::clicked, this, [this] {
     const QString peer = app_.chatState().selectedPeerId();
     // 内存里已有但没渲染的先补一批（便宜，布局有缓存）；内存用尽才向 DB
@@ -7172,7 +7218,7 @@ QWidget *MainWindow::createQuoteBlock(const RemoteIMMessage &message,
     block->setProperty("quoteMsgId", quoteMsgId);
   }
 
-  block->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+  UiZoom::setStyle(block, QStringLiteral(R"(
         #messageQuoteBlock {
             background: rgba(15, 23, 42, 0.04);
             border-radius: 8px;
@@ -7183,10 +7229,10 @@ QWidget *MainWindow::createQuoteBlock(const RemoteIMMessage &message,
         }
         #messageQuoteText {
             color: #475569;
-            font-size: 12px;
+            font-size: @metadata;
             background: transparent;
         }
-    )")));
+    )"));
   return block;
 }
 
@@ -7222,12 +7268,12 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
   applyMessageBubbleWidth(bubble, expandedTextBubble);
   bubble->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
   // 取消消息外框；发送仍用浅蓝底区分，接收正文融入聊天背景。
-  bubble->setStyleSheet(UiZoom::scaleQss(
+  UiZoom::setStyle(bubble,
       outgoing
           ? QStringLiteral("#messageBubbleOutgoing{background:#eaf4ff;border:0;"
                            "border-radius:12px;}")
           : QStringLiteral(
-                "#messageBubbleIncoming{background:transparent;border:0;}")));
+                "#messageBubbleIncoming{background:transparent;border:0;}"));
 
   auto *bubbleLayout = new QVBoxLayout(bubble);
   bubbleLayout->setContentsMargins(fullWidthBody ? 0 : UiZoom::s(14),
@@ -7335,13 +7381,13 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
     voiceButton->setText(QStringLiteral("🔊 语音 %1\"").arg(seconds));
     voiceButton->setMinimumWidth(UiZoom::s(120 + qMin(seconds, 30) * 4));
     voiceButton->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-    voiceButton->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(voiceButton, QStringLiteral(R"(
             QPushButton#messageVoiceButton {
                 background: #f8fafc;
                 border: 1px solid #d9e4ef;
                 border-radius: 8px;
                 color: #172033;
-                font-size: 13px;
+                font-size: @detail;
                 padding: 10px 14px;
                 text-align: left;
             }
@@ -7349,7 +7395,7 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
                 border-color: #1aa7ec;
                 background: #edf8ff;
             }
-        )")));
+        )"));
     connect(voiceButton, &QPushButton::clicked, this,
             [this, path = message.voice.localPath]() {
               if (path.trimmed().isEmpty() || !QFile::exists(path)) {
@@ -7484,8 +7530,8 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
     contentRow->addWidget(videoButton);
     if (!parts.isEmpty()) {
       auto *metaLabel = new QLabel(parts.join(QStringLiteral(" · ")), bubble);
-      metaLabel->setStyleSheet(
-          QStringLiteral("color: #6b7a8c; font-size: 12px;"));
+      UiZoom::setStyle(metaLabel,
+          QStringLiteral("color: #6b7a8c; font-size: @metadata;"));
       contentRow->addWidget(metaLabel);
     }
   } else if (message.hasFile) {
@@ -7527,13 +7573,13 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
             .arg(subtitle));
     fileButton->setMinimumWidth(UiZoom::s(220));
     fileButton->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-    fileButton->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(fileButton, QStringLiteral(R"(
             QPushButton#messageFileButton {
                 background: #f8fafc;
                 border: 1px solid #d9e4ef;
                 border-radius: 8px;
                 color: #172033;
-                font-size: 13px;
+                font-size: @detail;
                 font-weight: 700;
                 padding: 10px 12px;
                 text-align: left;
@@ -7542,7 +7588,7 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
                 border-color: #1aa7ec;
                 background: #edf8ff;
             }
-        )")));
+        )"));
     connect(fileButton, &QPushButton::clicked, this,
             [this, attachment = message.file]() {
               if (isPreviewableDocument(attachment)) {
@@ -7621,17 +7667,17 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
     deliveryStatusLabel->setObjectName(QStringLiteral("messageStatusLabel"));
     deliveryStatusLabel->setAlignment(Qt::AlignCenter);
     deliveryStatusLabel->setFixedSize(UiZoom::s(16), UiZoom::s(16));
-    deliveryStatusLabel->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(deliveryStatusLabel, QStringLiteral(R"(
             QLabel#messageStatusLabel {
                 border: 1px solid #12a150;
                 border-radius: 8px;
                 background: transparent;
                 color: #12a150;
-                font-size: 11px;
+                font-size: @metadata;
                 font-weight: 700;
                 padding: 0;
             }
-        )")));
+        )"));
   }
   bubbleLayout->addLayout(contentRow);
 
@@ -7653,13 +7699,13 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
                                   : QStringLiteral("审批选择正在发送…"),
                      bubble);
       sentLabel->setObjectName(QStringLiteral("approvalSentLabel"));
-      sentLabel->setStyleSheet(UiZoom::scaleQss(
-          QStringLiteral("QLabel#approvalSentLabel{color:%1;font-size:13px;"
+      UiZoom::setStyle(sentLabel,
+          QStringLiteral("QLabel#approvalSentLabel{color:%1;font-size: @detail;"
                          "font-weight:700;"
                          "padding:7px 2px;background:transparent;}")
               .arg(autoDeclined ? QStringLiteral("#d97706")
                    : resolved   ? QStringLiteral("#64748b")
-                                : QStringLiteral("#059669"))));
+                                : QStringLiteral("#059669")));
       bubbleLayout->addWidget(sentLabel);
     } else {
       auto *divider = new QFrame(bubble);
@@ -7684,7 +7730,7 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
         button->setCursor(Qt::PointingHandCursor);
         button->setMinimumHeight(UiZoom::s(38));
         button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-        button->setStyleSheet(UiZoom::scaleQss(
+        UiZoom::setStyle(button,
             reject ? QStringLiteral("QPushButton{background:transparent;border:"
                                     "1px solid #ef4444;"
                                     "border-radius:9px;color:#dc2626;font-size:"
@@ -7693,13 +7739,13 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
                    : QStringLiteral(
                          "QPushButton{background:%1;border:1px solid "
                          "%1;border-radius:9px;"
-                         "color:white;font-size:13px;font-weight:700;padding:"
+                         "color:white;font-size: @detail;font-weight:700;padding:"
                          "7px 10px;}"
                          "QPushButton:hover{background:%2;border-color:%2;}")
                          .arg(persistent ? QStringLiteral("#059669")
                                          : QStringLiteral("#0f8dde"),
                               persistent ? QStringLiteral("#047857")
-                                         : QStringLiteral("#087abe"))));
+                                         : QStringLiteral("#087abe")));
         connect(
             button, &QPushButton::clicked, this,
             [this, token, action, messageId = message.id] {
@@ -7755,13 +7801,13 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
       bubbleLayout->addWidget(captionView);
     }
   }
-  row->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+  UiZoom::setStyle(row, QStringLiteral(R"(
         #messageRowIncoming[showMessageDivider="true"], #messageRowOutgoing[showMessageDivider="true"] {
             border-top: 1px solid #e8edf3;
         }
         #messageTimeLabel {
             color: #0f8ddd;
-            font-size: 11px;
+            font-size: @metadata;
             font-weight: 500;
             background: transparent;
         }
@@ -7769,7 +7815,7 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
             background: #fff4c2;
             border-radius: 10px;
         }
-    )")));
+    )"));
 
   auto *bubbleRow = new QHBoxLayout();
   bubbleRow->setContentsMargins(0, 0, 0, 0);
@@ -8071,14 +8117,16 @@ void MainWindow::resetUiZoom() {
 }
 
 void MainWindow::applyUiZoom(bool showToastPopup) {
-  // 全局默认字体随倍率缩放（基准 13px，与 main.cpp 启动设置一致）。
+  // 全局默认字体随倍率缩放（基准 16px，与 main.cpp 启动设置一致）。
   QFont font = QApplication::font();
-  font.setPixelSize(UiZoom::s(13));
+  font.setFamilies(UiZoom::fontFamilies());
+  font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
   QApplication::setFont(font);
   // 全局样式表按新倍率重放；列表条目行高/头像与气泡样式都依赖倍率，
   // 清空渲染缓存强制消息全量重建。代码级最小宽高也须重放（否则缩不回去）。
   applyScaledFixedGeometry();
   applyStyle();
+  UiZoom::refreshText();
   renderedPeerId_.clear();
   refresh();
   if (showToastPopup)
@@ -8173,7 +8221,7 @@ void MainWindow::showToast(const QString &text, int fontPx, int durationMs) {
     connect(toastTimer_, &QTimer::timeout, this, [this] { toast_->hide(); });
   }
   toast_->setText(text);
-  toast_->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+  UiZoom::setStyle(toast_, QStringLiteral(R"(
         QLabel#toast {
             background: rgba(17, 24, 39, 0.88);
             color: #ffffff;
@@ -8183,7 +8231,7 @@ void MainWindow::showToast(const QString &text, int fontPx, int durationMs) {
             padding: 12px 26px;
         }
     )")
-                                             .arg(fontPx)));
+                                             .arg(fontPx));
   toast_->adjustSize();
   toast_->move((width() - toast_->width()) / 2,
                (height() - toast_->height()) / 2);

@@ -39,6 +39,12 @@ public:
     virtual void putMessage(const std::string& sessionId, const MaiMessage& message) = 0;
     virtual std::vector<MaiMessage> listMessages(const std::string& sessionId) const = 0;
 
+    // 用户输入的持久接收凭据及未消费队列。返回独立快照；空编号不匹配。
+    // 默认实现复用 listMessages，SQLite 实现使用索引，避免重试读取整个会话历史。
+    virtual bool getInputMessage(const std::string& sessionId, const std::string& requestId,
+                                 MaiMessage& out) const;
+    virtual std::vector<MaiMessage> listQueuedInputs(const std::string& sessionId) const;
+
     // 只读取一个会话的一页消息，按新到旧返回。beforeId 为空时从最新消息开始；
     // 非空时只返回 id 小于它的消息，不包含游标本身。limit 为 0、会话不存在或
     // 查询失败时返回空列表；调用方要区分会话不存在，先用 getSession。

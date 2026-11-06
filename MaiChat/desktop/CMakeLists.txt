@@ -2,7 +2,7 @@
 # 平台 SDK 和可选媒体能力由配置阶段检查；真实编译命令可导出给 clangd。
 cmake_minimum_required(VERSION 3.21)
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 2.2.51 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 2.2.52 LANGUAGES C CXX)
 if(MSVC AND CMAKE_CL_SHOWINCLUDES_PREFIX MATCHES "^娉")
   # Some CMake/VS2019 locale combinations double-decode /showIncludes. Ninja then
   # records no header dependencies, so changing a public header leaves stale objects.
@@ -233,9 +233,9 @@ if(WIN32 OR APPLE)
       message(FATAL_ERROR "Vendored OpenCV 4.14.0 source is missing")
     endif()
     if(WIN32)
-      set(BUILD_LIST "core,imgproc,imgcodecs,dnn,objdetect" CACHE STRING "" FORCE)
+      set(BUILD_LIST "core,imgproc,imgcodecs,photo,dnn,objdetect" CACHE STRING "" FORCE)
     else()
-      set(BUILD_LIST "core,imgproc,imgcodecs" CACHE STRING "" FORCE)
+      set(BUILD_LIST "core,imgproc,imgcodecs,photo" CACHE STRING "" FORCE)
     endif()
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     set(BUILD_WITH_STATIC_CRT OFF CACHE BOOL "" FORCE)
@@ -300,6 +300,15 @@ if(WIN32 OR APPLE)
       target_link_libraries(maichat_opencv INTERFACE opencv_imgcodecs)
     endif()
   endif()
+endif()
+
+# 人像核心和 ORT/四个感知模型与 RVM、FFmpeg 独立启用和打包。
+option(MAICHAT_ENABLE_PORTRAIT "Build local desktop portrait service" ${MAICHAT_ENABLE_OPENCV})
+if(MAICHAT_ENABLE_PORTRAIT)
+  if(NOT MAICHAT_ENABLE_OPENCV OR NOT (WIN32 OR APPLE))
+    message(FATAL_ERROR "Desktop portrait requires vendored OpenCV on Windows or macOS")
+  endif()
+  add_subdirectory(../Portrait maichat_portrait)
 endif()
 
 # MaiAgent 已编译仓库唯一一份 md4c；消息 Markdown 和 PDF 工具共用它。
@@ -612,9 +621,10 @@ if(TARGET maiagent_obs_metal OR TARGET maiagent_obs_d3d11)
   target_include_directories(remote_im_desktop_ui PUBLIC ../Media)
   target_compile_definitions(remote_im_desktop_ui PRIVATE MAICHAT_HAS_GRAPHICS=1)
   if(APPLE)
-    target_sources(remote_im_desktop_ui PRIVATE src/ui/MaiGraphicsMacLayer.mm)
+    target_sources(remote_im_desktop_ui PRIVATE src/ui/MaiGraphicsMacLayer.mm
+      src/ui/MaiMacVideoPlayback.mm)
     target_link_libraries(remote_im_desktop_ui PRIVATE
-      "-framework AppKit" "-framework QuartzCore")
+      "-framework AppKit" "-framework QuartzCore" "-framework AVFoundation")
   endif()
 endif()
 
@@ -917,6 +927,27 @@ if(WIN32 AND MAICHAT_ENABLE_OPENCV)
     src/MaiChatTools/DesktopVisionTools.h src/MaiChatTools/DesktopVisionTools.cpp)
   target_compile_definitions(maichat_agent PRIVATE MAICHAT_DESKTOP_VISION=1)
   target_link_libraries(maichat_agent PRIVATE maichat_image_vision)
+endif()
+if(MAICHAT_ENABLE_PORTRAIT)
+  add_library(maichat_desktop_portrait STATIC
+    src/MaiChatTools/DesktopPortraitService.cpp
+    src/MaiChatTools/DesktopPortraitTools.cpp
+    ../MaiChatTools/MaiPortraitHostTools.cpp)
+  target_include_directories(maichat_desktop_portrait PUBLIC src PRIVATE ../MaiChatTools)
+  target_link_libraries(maichat_desktop_portrait PUBLIC maichat_portrait Qt5::Widgets)
+  if(APPLE)
+    target_sources(maichat_desktop_portrait PRIVATE src/MaiChatTools/DesktopPortraitFacesMac.mm)
+    set_source_files_properties(src/MaiChatTools/DesktopPortraitFacesMac.mm
+      PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    target_link_libraries(maichat_desktop_portrait PRIVATE
+      "-framework Foundation" "-framework Vision" "-framework CoreGraphics")
+  elseif(WIN32)
+    target_sources(maichat_desktop_portrait PRIVATE src/MaiChatTools/DesktopPortraitFacesWindows.cpp)
+    target_link_libraries(maichat_desktop_portrait PRIVATE maichat_image_vision)
+  endif()
+  target_link_libraries(maichat_agent PRIVATE maichat_desktop_portrait)
+  target_compile_definitions(maichat_agent PRIVATE MAICHAT_DESKTOP_PORTRAIT=1)
+  include(cmake/PortraitAssets.cmake)
 endif()
 if(MAICHAT_ENABLE_OPENCV AND
    (TARGET maiagent_embedded_fftools OR TARGET maichat_ffmpeg_tools))
@@ -1583,6 +1614,7 @@ target_link_libraries(agent_page_visual_probe PRIVATE remote_im_desktop_ui remot
   remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
 
 add_executable(im_markdown_visual_probe tests/ImMarkdownVisualProbe.cpp)
+target_compile_definitions(im_markdown_visual_probe PRIVATE MAICHAT_TEST_FONTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../Presentation/fonts")
 target_link_libraries(im_markdown_visual_probe PRIVATE remote_im_desktop_ui remote_im_desktop_app
   remote_im_core maichat_markdown Qt5::Widgets Qt5::Test)
 
@@ -1700,11 +1732,23 @@ add_executable(message_search_test tests/MessageSearchTest.cpp)
 target_link_libraries(message_search_test PRIVATE remote_im_core Qt5::Widgets Qt5::Test)
 
 add_executable(ui_zoom_test tests/UiZoomTest.cpp)
+target_compile_definitions(ui_zoom_test PRIVATE MAICHAT_TEST_FONTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../Presentation/fonts")
 target_link_libraries(ui_zoom_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets Qt5::Test)
 
 add_executable(performance_log_test tests/PerformanceLogTest.cpp)
 target_link_libraries(performance_log_test PRIVATE remote_im_core Qt5::Test)
+if(MAICHAT_ENABLE_PORTRAIT)
+  add_executable(desktop_portrait_service_test tests/DesktopPortraitServiceTest.cpp)
+  target_include_directories(desktop_portrait_service_test PRIVATE ../MaiChatTools)
+  target_link_libraries(desktop_portrait_service_test PRIVATE maichat_desktop_portrait)
+endif()
+
 enable_testing()
+if(MAICHAT_ENABLE_PORTRAIT)
+  add_test(NAME desktop_portrait_service_test COMMAND desktop_portrait_service_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/../.." "${MAICHAT_PORTRAIT_ORT_RUNTIME}"
+    "${CMAKE_CURRENT_BINARY_DIR}/portrait-service-test-results")
+endif()
 add_test(NAME markdown_document_test COMMAND markdown_document_test)
 add_test(NAME markdown_layout_test COMMAND markdown_layout_test)
 add_test(NAME markdown_view_test COMMAND markdown_view_test)

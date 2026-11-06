@@ -1,6 +1,7 @@
 // 文件作用：桌面端共用界面；MaiFfplayVideoDialog 负责对话框呈现、确认交互和结果回传，本文件给出其实现。
 // 主要入口：setForwardAction、forwardVideo、saveCopy、activeDialog。
 // 直接依赖：MaiGraphicsPresenter.h；实现与这些接口协作。
+#include "ui/UiZoom.h"
 #include "ui/MaiFfplayVideoDialog.h"
 #include "ui/MaiVideoSpeedSelector.h"
 #include "ui/MaiVideoHud.h"
@@ -59,6 +60,7 @@
 #include "MaiGraphicsPresenter.h"
 
 #if defined(Q_OS_MAC)
+#include "ui/MaiMacVideoPlayback.h"
 extern "C" void* maiGraphicsCreateMacLayer(QWidget* widget);
 extern "C" void maiGraphicsResizeMacLayer(void* nativeLayer, QWidget* widget);
 extern "C" void maiGraphicsRetainMacLayer(void* nativeLayer);
@@ -242,7 +244,7 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     header->setSpacing(4);
     titleLabel_ = new MaiVideoTitleLabel(titleBar_);
     titleLabel_->setObjectName(QStringLiteral("ffplayTitleLabel"));
-    titleLabel_->setStyleSheet(QStringLiteral("color:#f4f4f4;font-size:13px;"));
+    UiZoom::setStyle(titleLabel_, QStringLiteral("color:#f4f4f4;font-size:@detail;"));
     titleLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     titleLabel_->setMinimumWidth(0);
     header->addWidget(titleLabel_, 1);
@@ -360,7 +362,7 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     durationLabel_ = new QLabel(QStringLiteral("0:00"), panel);
     durationLabel_->setObjectName(QStringLiteral("ffplayDurationLabel"));
     for (auto* label : {timeLabel_, durationLabel_}) {
-        label->setStyleSheet(QStringLiteral("color:#eeeeee;font-size:12px;"));
+        UiZoom::setStyle(label, QStringLiteral("color:#eeeeee;font-size:@metadata;"));
         label->setMinimumWidth(30);
     }
     seekSlider_ = new MaiVideoSeekSlider(panel);
@@ -393,12 +395,17 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     speedSelector_->setAccessibleName(QStringLiteral("播放倍速"));
     for (double rate : {0.25, 0.5, 1.0, 1.5, 2.0}) speedSelector_->addItem(QStringLiteral("%1×").arg(rate), rate);
     speedSelector_->setCurrentIndex(2);
-    speedSelector_->setFixedSize(44, 36);
-    speedSelector_->setStyleSheet(QStringLiteral(
-        "QComboBox {color:#f4f4f4;background:transparent;border:0;border-radius:5px;padding:4px 8px;font-size:13px;}"
-        "QComboBox:hover {background:#2b2b2b;} QComboBox::drop-down {border:0;width:0;}"
-        "QComboBox QAbstractItemView {color:#f4f4f4;background:#202020;border:1px solid #414141;"
-        "selection-background-color:#3a3a3a;padding:4px;}"));
+    speedSelector_->setFixedHeight(36);
+    speedSelector_->setMinimumWidth(44);
+    // Leave room for the longest rate at the selected text size, including 0.25×.
+    speedSelector_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    UiZoom::setStyle(
+        speedSelector_,
+        QStringLiteral("QComboBox {color:#f4f4f4;background:transparent;border:0;border-radius:5px;padding:4px "
+                       "8px;font-size:@detail;}"
+                       "QComboBox:hover {background:#2b2b2b;} QComboBox::drop-down {border:0;width:0;}"
+                       "QComboBox QAbstractItemView {color:#f4f4f4;background:#202020;border:1px solid #414141;"
+                       "selection-background-color:#3a3a3a;padding:4px;}"));
     row->addWidget(speedSelector_);
     volumeButton_ = new QToolButton(panel);
     volumeButton_->setObjectName(QStringLiteral("ffplayVolumeButton"));
@@ -424,12 +431,26 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     progressTimer_ = new QTimer(this);
     progressTimer_->setInterval(250);
     connect(progressTimer_, &QTimer::timeout, this, [this] {
-        // 音量队列可能先于媒体时钟就绪，准备期也需要补交尚未入队的用户意图。
+#if defined(Q_OS_MAC)
+        if (macPlayback_ && macPlayback_->failed()) {
+            errorLabel_->setText(QStringLiteral("无法播放该视频，请检查文件或网络连接。"));
+            errorLabel_->show();
+            playing_ = false;
+            updatePlayButton();
+            return;
+        }
+        if (macPlayback_ && macPlayback_->ready() && !initialVideoSizeQueued_.load()) {
+            const QSize videoSize = macPlayback_->videoSize();
+            if (videoSize.isValid() && !initialVideoSizeQueued_.exchange(true))
+                setSize(this, videoSize.width(), videoSize.height());
+        }
+#endif
+        // 两种正式播放路径共用 HUD；音量状态必须来自当前实际使用的播放器。
         syncAudioControls();
-        if (cloudSource_ && sPresentedFrames.load() > 0 && errorLabel_->text() == QStringLiteral("正在缓冲视频…"))
+        if (cloudSource_ && hasPresentedFrame() && errorLabel_->text() == QStringLiteral("正在缓冲视频…"))
             errorLabel_->hide();
         MaiFfplayPlaybackStatus status{};
-        if (!maiFfplayGetPlaybackStatus(&status) || status.duration_us <= 0) return;
+        if (!playbackStatus(&status) || status.duration_us <= 0) return;
         if (pauseAfterFirstFrame_) {
             // Graphics 的成功回执来自本次启动（startPlayback 会清零计数）。
             // 让 FFplay 先建立真实视频时钟，旧表面像素不算首帧就绪证据。
@@ -513,7 +534,7 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     connect(controlsHideTimer_, &QTimer::timeout, this, [this, panel] {
         if (!isFullScreen() || !playing_) return;
         if (seekSlider_->isSliderDown() || controlsSeeking_ || panel->underMouse() || titleBar_->underMouse() ||
-            QApplication::activePopupWidget() || errorLabel_->isVisible() || sPresentedFrames.load() == 0) {
+            QApplication::activePopupWidget() || errorLabel_->isVisible() || !hasPresentedFrame()) {
             controlsHideTimer_->start();
             return;
         }
@@ -538,10 +559,14 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
             if (!active) return;
             bool owned = false;
             for (QObject* item = active; item; item = item->parent())
-                if (item == this) { owned = true; break; }
+                if (item == this) {
+                    owned = true;
+                    break;
+                }
             const bool wasOwned = hudOwnerActive_;
             hudOwnerActive_ = owned;
-            if (owned && !wasOwned) revealControls();
+            if (owned && !wasOwned)
+                revealControls();
             else if (!owned) {
                 titleBar_->hide();
                 overlay_->hide();
@@ -569,22 +594,21 @@ void MaiFfplayVideoDialog::updateControlLayout() {
     const bool shown = isVisible() && !isMinimized() && hudOwnerActive_ && (!isFullScreen() || controlsVisible_);
     const QPoint origin = mapToGlobal(QPoint());
     titleBar_->setGeometry(QRect(origin, QSize(width(), 46)));
-    titleBar_->setStyleSheet(QStringLiteral(
-        "QWidget#ffplayTitleBar {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-        "stop:0 rgba(0,0,0,210),stop:1 rgba(0,0,0,15));}"));
+    titleBar_->setStyleSheet(
+        QStringLiteral("QWidget#ffplayTitleBar {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                       "stop:0 rgba(0,0,0,210),stop:1 rgba(0,0,0,15));}"));
     // 保持 Graphics 自己的 fit 规则：任意窗口比例下只保留必要的 letterbox，不裁剪或拉伸视频。
     surface_->setGeometry(rect());
     overlay_->setGeometry(QRect(origin + QPoint(0, height() - controlsHeight), QSize(width(), controlsHeight)));
     overlay_->setStyleSheet(QStringLiteral("QWidget#ffplayOverlay {background:transparent;}"));
     if (auto* panel = findChild<QWidget*>(QStringLiteral("ffplayControlPanel")))
-        panel->setStyleSheet(QStringLiteral(
-            "QWidget#ffplayControlPanel {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "stop:0 rgba(0,0,0,0),stop:1 rgba(0,0,0,190));}"));
+        panel->setStyleSheet(
+            QStringLiteral("QWidget#ffplayControlPanel {background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                           "stop:0 rgba(0,0,0,0),stop:1 rgba(0,0,0,190));}"));
     titleBar_->setVisible(shown);
     overlay_->setVisible(shown);
     // 原生 owner 关系保证 HUD 位于播放器之上；不反复 raise，否则会把 Popup 压回 owner 后面。
-    errorLabel_->setGeometry(40, std::max(0, (surface_->height() - 64) / 2), std::max(1, width() - 80),
-                             64);
+    errorLabel_->setGeometry(40, std::max(0, (surface_->height() - 64) / 2), std::max(1, width() - 80), 64);
     if (errorLabel_->isVisible()) errorLabel_->raise();
     if (auto* more = findChild<QWidget*>(QStringLiteral("videoMoreButton"))) more->setVisible(!cloudSource_);
     if (auto* divider = findChild<QWidget*>(QStringLiteral("ffplayTitleDivider"))) divider->setVisible(!cloudSource_);
@@ -610,23 +634,29 @@ void MaiFfplayVideoDialog::updateWindowChrome() {
 
 void MaiFfplayVideoDialog::syncAudioControls() {
     MaiFfplayAudioStatus status{sizeof(MaiFfplayAudioStatus), 100, 0};
-    if (started_ && maiFfplayGetAudioStatus(&status) == 1) {
-        const uint64_t consumed = audioStartupConsumedRevision_.load();
-        if (volumeRequestPending_ && consumed >= volumeIntentRevision_)
-            volumeRequestPending_ = false;
-        if (muteRequestPending_ && consumed >= muteIntentRevision_)
-            muteRequestPending_ = false;
-        if (volumeRequestPending_ && !volumeRequestReceipt_)
-            maiFfplaySetVolumePercentWithReceipt(volumePercent_, &volumeRequestReceipt_);
-        if (muteRequestPending_ && !muteRequestReceipt_)
-            maiFfplaySetMutedWithReceipt(audioMuted_ ? 1 : 0, &muteRequestReceipt_);
-        if (volumeRequestReceipt_ && status.applied_serial >= volumeRequestReceipt_)
-            volumeRequestPending_ = false;
-        if (muteRequestReceipt_ && status.applied_serial >= muteRequestReceipt_)
-            muteRequestPending_ = false;
-        if (!volumeRequestPending_) volumePercent_ = status.volume_percent;
-        if (!muteRequestPending_) audioMuted_ = status.muted != 0;
-    }
+#if defined(Q_OS_MAC)
+    if (macPlayback_) {
+        if (volumeRequestPending_) macPlayback_->setVolumePercent(volumePercent_);
+        if (muteRequestPending_) macPlayback_->setMuted(audioMuted_);
+        if (macPlayback_->audioStatus(&volumePercent_, &audioMuted_)) {
+            volumeRequestPending_ = muteRequestPending_ = false;
+            volumeRequestReceipt_ = muteRequestReceipt_ = 0;
+        }
+    } else if (!macPlaybackRequested_)
+#endif
+        if (started_ && maiFfplayGetAudioStatus(&status) == 1) {
+            const uint64_t consumed = audioStartupConsumedRevision_.load();
+            if (volumeRequestPending_ && consumed >= volumeIntentRevision_) volumeRequestPending_ = false;
+            if (muteRequestPending_ && consumed >= muteIntentRevision_) muteRequestPending_ = false;
+            if (volumeRequestPending_ && !volumeRequestReceipt_)
+                maiFfplaySetVolumePercentWithReceipt(volumePercent_, &volumeRequestReceipt_);
+            if (muteRequestPending_ && !muteRequestReceipt_)
+                maiFfplaySetMutedWithReceipt(audioMuted_ ? 1 : 0, &muteRequestReceipt_);
+            if (volumeRequestReceipt_ && status.applied_serial >= volumeRequestReceipt_) volumeRequestPending_ = false;
+            if (muteRequestReceipt_ && status.applied_serial >= muteRequestReceipt_) muteRequestPending_ = false;
+            if (!volumeRequestPending_) volumePercent_ = status.volume_percent;
+            if (!muteRequestPending_) audioMuted_ = status.muted != 0;
+        }
     audioStartupSettings_ = (audioIntentRevision_ << 8) | (volumePercent_ * 2 + (audioMuted_ ? 1 : 0));
     if (volumeSlider_ && !volumeSlider_->isSliderDown()) {
         const QSignalBlocker blocker(volumeSlider_);
@@ -691,8 +721,10 @@ void MaiFfplayVideoDialog::applyFullscreen(bool enabled) {
     if (enabled == isFullScreen()) return;
     // GUI、键盘、工具及底层宿主回调共同维护进入前的窗口状态。
     if (!enabled) {
-        if (windowWasMaximized_) showMaximized();
-        else showNormal();
+        if (windowWasMaximized_)
+            showMaximized();
+        else
+            showNormal();
     } else {
         windowWasMaximized_ = isMaximized();
         showFullScreen();
@@ -727,7 +759,7 @@ void MaiFfplayVideoDialog::saveCopy() {
     const QPointer<MaiFfplayVideoDialog> alive(this);
     const QString sourcePath = path_;
     QPointer<QFileDialog> picker = new QFileDialog(this, QStringLiteral("保存视频"), QString(),
-        QStringLiteral("视频文件 (*.mp4 *.mov *.m4v);;所有文件 (*)"));
+                                                   QStringLiteral("视频文件 (*.mp4 *.mov *.m4v);;所有文件 (*)"));
     picker->setAcceptMode(QFileDialog::AcceptSave);
     picker->setFileMode(QFileDialog::AnyFile);
     picker->selectFile(QFileInfo(sourcePath).fileName());
@@ -772,7 +804,24 @@ uint64_t MaiFfplayVideoDialog::presentedFrames() const {
     return sPresentedFrames.load();
 }
 
+bool MaiFfplayVideoDialog::hasPresentedFrame() const {
+#if defined(Q_OS_MAC)
+    if (macPlaybackRequested_) return macPlayback_ && macPlayback_->ready();
+#endif
+    return presentedFrames() > 0;
+}
+
+bool MaiFfplayVideoDialog::playbackStatus(MaiFfplayPlaybackStatus* output) const {
+#if defined(Q_OS_MAC)
+    if (macPlaybackRequested_) return macPlayback_ && macPlayback_->status(output);
+#endif
+    return maiFfplayGetPlaybackStatus(output) != 0;
+}
+
 bool MaiFfplayVideoDialog::hasPresentedHdrFrame() const {
+#if defined(Q_OS_MAC)
+    if (macPlaybackRequested_) return macPlayback_ && macPlayback_->ready();
+#endif
     return presentedHdrFrame_.load();
 }
 
@@ -794,8 +843,7 @@ bool MaiFfplayVideoDialog::presentVideo(void* userData, const MaiVideoFrame* fra
     // 视频帧尺寸作为可靠默认比例。只跨线程排队一次，不在每帧或换速时重新调整用户窗口。
     if (shown && frame && frame->width > 0 && frame->height > 0 &&
         frame->width <= uint32_t(std::numeric_limits<int>::max()) &&
-        frame->height <= uint32_t(std::numeric_limits<int>::max()) &&
-        !dialog->initialVideoSizeQueued_.exchange(true))
+        frame->height <= uint32_t(std::numeric_limits<int>::max()) && !dialog->initialVideoSizeQueued_.exchange(true))
         setSize(dialog, int(frame->width), int(frame->height));
     if (shown && frame && frame->color_transfer != MAI_VIDEO_TRANSFER_SDR) dialog->presentedHdrFrame_ = true;
     return shown;
@@ -833,18 +881,17 @@ void MaiFfplayVideoDialog::setSize(void* userData, int width, int height) {
         [dialog, width, height] {
             if (width <= 0 || height <= 0 || dialog->initialVideoSizeApplied_) return;
             dialog->initialVideoSizeApplied_ = true;
-            if (dialog->docked_ || dialog->isFullScreen() || dialog->isMaximized() ||
-                dialog->windowGeometryCustomized_) return;
+            if (dialog->docked_ || dialog->isFullScreen() || dialog->isMaximized() || dialog->windowGeometryCustomized_)
+                return;
             const QScreen* screen = dialog->screen();
             if (!screen) screen = QGuiApplication::primaryScreen();
             const QRect available = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 800);
             const QSize limit = available.size() * 0.85;
             // 用同一个比例因子满足普通素材的最小尺寸与屏幕上限，不分别拉宽/拉高源比例。
             // 极端长宽比受控件最小宽高约束时仍由 Presenter fit，绝不裁剪或变形内容。
-            const double minimumScale = std::max(double(dialog->minimumWidth()) / width,
-                                                  double(dialog->minimumHeight()) / height);
-            const double maximumScale = std::min(double(limit.width()) / width,
-                                                  double(limit.height()) / height);
+            const double minimumScale =
+                std::max(double(dialog->minimumWidth()) / width, double(dialog->minimumHeight()) / height);
+            const double maximumScale = std::min(double(limit.width()) / width, double(limit.height()) / height);
             const double scale = std::min(std::max(1.0, minimumScale), maximumScale);
             const QSize size(qRound(width * scale), qRound(height * scale));
             dialog->resize(size.expandedTo(dialog->minimumSize()));
@@ -858,8 +905,9 @@ void MaiFfplayVideoDialog::setPosition(void* userData, int x, int y) {
     QMetaObject::invokeMethod(
         dialog,
         [dialog, x, y] {
-            if (dialog->docked_ || dialog->isFullScreen() || dialog->isMaximized() ||
-                dialog->initialPositionApplied_ || dialog->windowGeometryCustomized_) return;
+            if (dialog->docked_ || dialog->isFullScreen() || dialog->isMaximized() || dialog->initialPositionApplied_ ||
+                dialog->windowGeometryCustomized_)
+                return;
             dialog->initialPositionApplied_ = true;
             // 兼容层 SDL_WINDOWPOS_CENTERED/UNDEFINED 都为 (0,0)；默认位置由首次定尺寸居中。
             // 后续重播/切速不能把用户已移动的窗口重新移到屏幕原点。
@@ -871,11 +919,7 @@ void MaiFfplayVideoDialog::setPosition(void* userData, int x, int y) {
 void MaiFfplayVideoDialog::setFullscreen(void* userData, int enabled) {
     auto* dialog = static_cast<MaiFfplayVideoDialog*>(userData);
     QMetaObject::invokeMethod(
-        dialog,
-        [dialog, enabled] {
-            dialog->applyFullscreen(enabled != 0);
-        },
-        Qt::QueuedConnection);
+        dialog, [dialog, enabled] { dialog->applyFullscreen(enabled != 0); }, Qt::QueuedConnection);
 }
 
 void MaiFfplayVideoDialog::showWindow(void* userData) {
@@ -884,7 +928,7 @@ void MaiFfplayVideoDialog::showWindow(void* userData) {
     Q_UNUSED(userData);
 }
 
-// 作用：验证文件并启动 FFplay，同时同步播放控件状态。
+// 作用：验证输入并启动对应的正式播放路径，同时同步共用播放控件。
 bool MaiFfplayVideoDialog::startPlayback() {
     if (started_ || (cloudSource_ ? mai_cloud_vod_size(cloudSource_.get()) == 0 : !QFileInfo(path_).isFile())) {
         qWarning() << "FFplay popup has no readable video file:" << path_;
@@ -958,7 +1002,13 @@ bool MaiFfplayVideoDialog::startPlayback() {
     const int64_t startPositionUs = startPositionUs_;
     audioStartupSettings_ = (audioIntentRevision_ << 8) | (volumePercent_ * 2 + (audioMuted_ ? 1 : 0));
     audioStartupConsumedRevision_ = 0;
-    playbackThread_ = std::thread([this, sourcePath, speed, startPositionUs] {
+#if defined(Q_OS_MAC)
+    macPlaybackRequested_ = false;
+    const uint64_t openGeneration = ++playbackOpenGeneration_;
+#else
+    const uint64_t openGeneration = 0;
+#endif
+    playbackThread_ = std::thread([this, sourcePath, speed, startPositionUs, openGeneration] {
         char name[] = "ffplay";
         char* arguments[] = {name, const_cast<char*>(sourcePath.constData())};
         int result = 0;
@@ -969,13 +1019,35 @@ bool MaiFfplayVideoDialog::startPlayback() {
             return MaiFfplayAudioOptions{sizeof(MaiFfplayAudioOptions), settings / 2, settings % 2};
         };
 #if defined(Q_OS_MAC)
-        // SDL 兼容纹理只有 8-bit BT.601/709，不能表示 HLG/PQ。与移动端复用
-        // HDR 探测和原生帧桥接，让 10-bit BT.2020 使用每视图 HLG EDR 或 PQ 转换。
-        // 探测放在解码线程，云盘继续使用 Range 源，不把整个视频下载到本地。
+        // SDL 兼容纹理不能表示 HLG/PQ。复用共享 HDR 探测：MP4/MOV 交给系统的
+        // 逐帧显示映射，其余格式保留现有 FFplay 原生 HDR 帧路径。
+        // 探测放在工作线程；两条路径的云盘读取都复用有限缓存的 Range 源。
         sourceInfo_ = {};
         const bool probed = cloudSource_ ? maiFfplayProbeHdrSourceFromHost(&host_, &sourceInfo_)
                                          : maiFfplayProbeHdrSource(sourcePath.constData(), &sourceInfo_);
         if (stopRequested_) {
+            playbackFinished_ = true;
+            return;
+        }
+        if (probed && sourceInfo_.native_frame_eligible && sourceInfo_.is_iso_base_media) {
+            // 系统 HDR 路径保留 AVPlayerItem 的逐帧显示映射（含 Dolby Vision）。
+            // 只把创建交给 GUI 线程；停止/换片先失效代际，避免 join 等待 GUI 而死锁。
+            macPlaybackRequested_ = true;
+            QMetaObject::invokeMethod(
+                this,
+                [this, openGeneration] {
+                    if (openGeneration != playbackOpenGeneration_ || stopRequested_ || !started_) return;
+                    macPlayback_.reset(new MaiMacVideoPlayback(surface_, path_, cloudSource_));
+                    macPlayback_->setVolumePercent(volumePercent_);
+                    macPlayback_->setMuted(audioMuted_);
+                    volumeRequestPending_ = muteRequestPending_ = false;
+                    volumeRequestReceipt_ = muteRequestReceipt_ = 0;
+                    if (!macPlayback_->open(startPositionUs_, playbackSpeed_, playing_)) {
+                        errorLabel_->setText(QStringLiteral("无法打开该 HDR 视频。"));
+                        errorLabel_->show();
+                    }
+                },
+                Qt::QueuedConnection);
             playbackFinished_ = true;
             return;
         }
@@ -1018,13 +1090,23 @@ bool MaiFfplayVideoDialog::startPlayback() {
 
 void MaiFfplayVideoDialog::stopPlayback(bool cancelCloudSource) {
     stopRequested_ = true;
+    syncAudioControls();
+    bool wasNativePlayback = false;
+#if defined(Q_OS_MAC)
+    wasNativePlayback = macPlaybackRequested_.load();
+#endif
     pauseAfterFirstFrame_ = false;
     firstFramePauseQueued_ = false;
+#if defined(Q_OS_MAC)
+    ++playbackOpenGeneration_;
+    macPlayback_.reset();
+    macPlaybackRequested_ = false;
+#endif
     if (!started_) return;
     syncAudioControls();
     MaiFfplayAudioStatus finalAudio{sizeof(MaiFfplayAudioStatus), 100, 0};
     // 仅在本窗口已运行核心时采集最终快照，避免 HDR 准备取消时借用上个会话。
-    const bool hadRunningAudio = maiFfplayGetAudioStatus(&finalAudio) == 1;
+    const bool hadRunningAudio = !wasNativePlayback && maiFfplayGetAudioStatus(&finalAudio) == 1;
     progressTimer_->stop();
     if (cloudSource_) {
         if (cancelCloudSource)
@@ -1077,12 +1159,26 @@ bool MaiFfplayVideoDialog::sendCommand(const QString& command) {
         return true;
     }
     const QByteArray utf8 = command.toUtf8();
-    const bool accepted = maiFfplaySendCommand(utf8.constData()) == 1;
+    bool accepted = false;
+#if defined(Q_OS_MAC)
+    if (macPlayback_)
+        accepted = macPlayback_->command(command);
+    else
+#endif
+        accepted = maiFfplaySendCommand(utf8.constData()) == 1;
     if (accepted && command == QStringLiteral("pause")) {
         // 若恢复暂停的命令已经入队，再次点击需追加同一 FIFO 中的抵消切换。
         pauseAfterFirstFrame_ = false;
         firstFramePauseQueued_ = false;
-        playing_ = !playing_;
+#if defined(Q_OS_MAC)
+        // 系统播放器立即更新意图；到尾后 GUI 轮询可能还没更新 playing_。
+        // 使用同一状态源，避免此时点击重播把暂停状态翻转错。
+        if (macPlayback_) {
+            MaiFfplayPlaybackStatus status{};
+            if (macPlayback_->status(&status)) playing_ = status.paused == 0;
+        } else
+#endif
+            playing_ = !playing_;
         updatePlayButton();
     }
     if (accepted && (command.startsWith(QStringLiteral("seek_")) || command == QStringLiteral("step") ||
@@ -1092,17 +1188,32 @@ bool MaiFfplayVideoDialog::sendCommand(const QString& command) {
 }
 
 bool MaiFfplayVideoDialog::seekPercent(double fraction) {
-    const bool accepted = maiFfplaySeekPercent(fraction) == 1;
+    bool accepted = false;
+#if defined(Q_OS_MAC)
+    if (macPlayback_) {
+        MaiFfplayPlaybackStatus status{};
+        accepted = std::isfinite(fraction) && fraction >= 0 && fraction <= 1 && playbackStatus(&status) &&
+                   status.duration_us > 0 && macPlayback_->seek(int64_t(std::llround(fraction * status.duration_us)));
+    } else
+#endif
+        accepted = maiFfplaySeekPercent(fraction) == 1;
     if (accepted) ++navigationGeneration_;
     return accepted;
 }
 
 bool MaiFfplayVideoDialog::seekSeconds(double seconds) {
     MaiFfplayPlaybackStatus status{};
-    if (!std::isfinite(seconds) || seconds < 0 || !maiFfplayGetPlaybackStatus(&status) || status.duration_us <= 0 ||
+    if (!std::isfinite(seconds) || seconds < 0 || !playbackStatus(&status) || status.duration_us <= 0 ||
         seconds * 1'000'000 > status.duration_us)
         return false;
-    const bool accepted = maiFfplaySeekAbsoluteUs(static_cast<int64_t>(std::llround(seconds * 1'000'000))) == 1;
+    const int64_t target = static_cast<int64_t>(std::llround(seconds * 1'000'000));
+    bool accepted = false;
+#if defined(Q_OS_MAC)
+    if (macPlayback_)
+        accepted = macPlayback_->seek(target);
+    else
+#endif
+        accepted = maiFfplaySeekAbsoluteUs(target) == 1;
     if (accepted) ++navigationGeneration_;
     return accepted;
 }
@@ -1115,16 +1226,30 @@ bool MaiFfplayVideoDialog::setSpeed(double speed) {
     if (speed != 0.25 && speed != 0.5 && speed != 1.0 && speed != 1.5 && speed != 2.0) return false;
     if (!started_) return false;
     if (speed == playbackSpeed_) return true;
+#if defined(Q_OS_MAC)
+    if (macPlayback_) {
+        if (!macPlayback_->setSpeed(speed)) return false;
+        playbackSpeed_ = speed;
+        if (speedSelector_) {
+            const QSignalBlocker blocked(speedSelector_);
+            for (int index = 0; index < speedSelector_->count(); ++index)
+                if (speedSelector_->itemData(index).toDouble() == speed) speedSelector_->setCurrentIndex(index);
+        }
+        return true;
+    }
+#endif
     MaiFfplayPlaybackStatus status{};
     // 首次 HDR 探测尚未启动 FFplay 时也接受倍速，按请求的源时间重建即可；
     // 不从尚不存在的播放时钟推断位置，也不把准备阶段当成播放失败。
-    if (!maiFfplayGetPlaybackStatus(&status)) {
+    if (!playbackStatus(&status)) {
         if (playbackFinished_) return false;
         status.position_us = startPositionUs_;
     }
     const bool wasPlaying = playing_;
-    const int64_t sourcePositionUs = std::max<int64_t>(0, status.seeking ? status.seek_target_us :
-        (pauseAfterFirstFrame_ && sPresentedFrames.load() == 0 ? startPositionUs_ : status.position_us));
+    const int64_t sourcePositionUs = std::max<int64_t>(
+        0, status.seeking
+               ? status.seek_target_us
+               : (pauseAfterFirstFrame_ && sPresentedFrames.load() == 0 ? startPositionUs_ : status.position_us));
     stopPlayback();
     playbackSpeed_ = speed;
     startPositionUs_ = sourcePositionUs;
@@ -1150,6 +1275,15 @@ bool MaiFfplayVideoDialog::setSpeed(double speed) {
 bool MaiFfplayVideoDialog::replay() {
     if (!started_) return false;
     ++navigationGeneration_;
+#if defined(Q_OS_MAC)
+    if (macPlayback_) {
+        MaiFfplayPlaybackStatus status{};
+        if (!macPlayback_->status(&status)) return false;
+        const bool accepted = macPlayback_->seek(0);
+        if (accepted && status.paused) sendCommand(QStringLiteral("pause"));
+        return accepted;
+    }
+#endif
     stopPlayback();
     startPositionUs_ = 0;
     playing_ = true;
@@ -1227,6 +1361,7 @@ void MaiFfplayVideoDialog::resizeEvent(QResizeEvent* event) {
     if (!viewId_) return;
 #if defined(Q_OS_MAC)
     maiGraphicsResizeMacLayer(nativeView_, surface_);
+    if (macPlayback_) macPlayback_->resize();
 #endif
     maiGraphicsPresenterResize(viewId_, std::max(surface_->width(), 1), std::max(surface_->height(), 1));
 }
@@ -1253,8 +1388,10 @@ bool MaiFfplayVideoDialog::handleFrameMouse(QObject* watched, QEvent* event) {
     const QPoint local = mapFromGlobal(mouse->globalPos());
     const bool titleHit = watched == titleBar_ || watched == titleLabel_;
     if (type == QEvent::MouseButtonDblClick && titleHit && mouse->button() == Qt::LeftButton) {
-        if (isFullScreen()) applyFullscreen(false);
-        else isMaximized() ? showNormal() : showMaximized();
+        if (isFullScreen())
+            applyFullscreen(false);
+        else
+            isMaximized() ? showNormal() : showMaximized();
         return true;
     }
     Qt::Edges edges;
@@ -1318,8 +1455,10 @@ bool MaiFfplayVideoDialog::handleFrameMouse(QObject* watched, QEvent* event) {
             cursor = Qt::SizeVerCursor;
         // native surface 与两个 owned HUD 是不同的原生窗口；仅给 owner 设置不会可靠继承。
         for (QWidget* widget : {static_cast<QWidget*>(this), surface_, titleBar_, overlay_}) {
-            if (cursor == Qt::ArrowCursor) widget->unsetCursor();
-            else widget->setCursor(cursor);
+            if (cursor == Qt::ArrowCursor)
+                widget->unsetCursor();
+            else
+                widget->setCursor(cursor);
         }
     }
     return false;

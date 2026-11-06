@@ -480,7 +480,7 @@ final class MaiFfplayVideoController: UIViewController {
         timeLabel.text = "0:00 / 0:00"
         timeLabel.accessibilityIdentifier = "ffplay-time"
         timeLabel.textColor = .white
-        timeLabel.font = .monospacedDigitSystemFont(ofSize: 15, weight: .medium)
+        timeLabel.font = AppTypography.uiFont(.detail, weight: .medium, monospacedDigits: true)
         let timeline = UIStackView(arrangedSubviews: [timeLabel, seekSlider])
         timeline.axis = .vertical
         timeline.spacing = 1
@@ -505,7 +505,7 @@ final class MaiFfplayVideoController: UIViewController {
         saveButton.heightAnchor.constraint(equalToConstant: 50).isActive = true
         speedButton.setTitle("1×", for: .normal)
         speedButton.setTitleColor(.white, for: .normal)
-        speedButton.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
+        speedButton.titleLabel?.font = AppTypography.uiFont(.body, weight: .semibold)
         speedButton.accessibilityLabel = "播放倍速 1.0×"
         speedButton.accessibilityIdentifier = "ffplay-speed"
         speedButton.backgroundColor = UIColor.white.withAlphaComponent(0.18)
@@ -548,7 +548,7 @@ final class MaiFfplayVideoController: UIViewController {
             let choice = UIButton(type: .system)
             choice.setTitle("\(rate)×", for: .normal)
             choice.setTitleColor(.white, for: .normal)
-            choice.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+            choice.titleLabel?.font = AppTypography.uiFont(.detail, weight: .semibold)
             choice.accessibilityIdentifier = "ffplay-speed-\(rate)"
             choice.tag = Int(rate * 100)
             choice.addTarget(self, action: #selector(speedChoiceTapped(_:)), for: .touchUpInside)
@@ -557,7 +557,7 @@ final class MaiFfplayVideoController: UIViewController {
         view.addSubview(speedChoices)
 
         saveStatusLabel.textColor = .white
-        saveStatusLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        saveStatusLabel.font = AppTypography.uiFont(.detail, weight: .medium)
         saveStatusLabel.textAlignment = .center
         saveStatusLabel.numberOfLines = 2
         saveStatusLabel.accessibilityIdentifier = "ffplay-save-status"

@@ -145,17 +145,38 @@ private struct PdfSecurityUITestProbe: View {
 private struct AppBarsLayoutUITestRoot: View {
     @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
     @State private var prepared = false
+    @State private var toolOrderStage = 0
 
     var body: some View {
         RootView()
             .environmentObject(appState)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if ProcessInfo.processInfo.arguments.contains("--tool-order-ui-test") {
+                    Button("追加下一段工具") {
+                        toolOrderStage += 1
+                        AIAssistantModel.shared.installToolOrderUITestFixture(stage: toolOrderStage)
+                    }
+                    .accessibilityIdentifier("tool-order-advance")
+                    .disabled(toolOrderStage >= 2)
+                }
+            }
             .onAppear {
                 guard !prepared else { return }
                 prepared = true
                 let owner = "app-bars-ui-test"
-                let contacts = (0..<35).map { index in
+                var contacts = (0..<35).map { index in
                     RemoteIMContact(userID: "bars-peer-\(index)",
                                     displayName: "边缘测试联系人 \(index)")
+                }
+                if ProcessInfo.processInfo.arguments.contains("--contacts-profile-ui-test") {
+                    contacts[1] = RemoteIMContact(userID: "bars-peer-1",
+                        displayName: "测试-Nickname-中英混合的很长昵称-LongContactName-完整资料")
+                }
+                // 同文样本走真实 IM 列表，便于跨页面核对字体而不读取线上会话。
+                if ProcessInfo.processInfo.arguments.contains("--im-list-font-ui-test") {
+                    contacts = [RemoteIMContact(userID: "bars-peer-34", displayName: "偏好设置"),
+                        RemoteIMContact(userID: "bars-peer-33",
+                            displayName: "测试-Nickname-中英混合的很长昵称-LongContactName-完整资料")]
                 }
                 var messages = contacts.enumerated().map { index, contact in
                     RemoteIMMessage(fromUserID: contact.userID, toUserID: owner,
@@ -167,11 +188,34 @@ private struct AppBarsLayoutUITestRoot: View {
                         text: "边缘聊天消息 \(index)\n第二行内容", direction: .incoming,
                         status: .sent, createdAt: Date(timeIntervalSince1970: Double(index + 100)))
                 }
+                // 同一条表格走正常 IM 与创作中心，避免只验孤立的文本控件。
+                var markdown: String? = ProcessInfo.processInfo.arguments.contains("--markdown-breaks-ui-test")
+                    ? "| Case | Result |\n| --- | --- |\n| **Expected**:<br>320x180<br><br>details | Actual:<br/>320x240<br />next<BR>last |\n\n`literal <br>`"
+                    : nil
+                if ProcessInfo.processInfo.arguments.contains("--typography-ui-test"), markdown != nil {
+                    markdown! += "\n\n# 标题 Heading\n\n你好 Hello，正文与 **加粗 Bold**、*斜体 Italic*。\n\n- 列表正文 List body\n- 保留 `inline code`\n\n> [!NOTE]\n> 引用 Quote\n\n```swift\nlet greeting = \"Hello 你好\"\n```"
+                }
+                if ProcessInfo.processInfo.arguments.contains("--menu-font-ui-test") ||
+                   ProcessInfo.processInfo.arguments.contains("--im-list-font-ui-test") {
+                    markdown = "偏好设置"
+                }
+                if let markdown {
+                    messages.append(RemoteIMMessage(fromUserID: "bars-peer-34", toUserID: owner,
+                        text: markdown, direction: .incoming, status: .sent,
+                        createdAt: Date(timeIntervalSince1970: 1000)))
+                }
                 appState.masterUserID = owner
                 appState.chatState = MasterChatState(ownerUserID: owner,
                                                      contacts: contacts, messages: messages)
                 appState.hasCompletedInitialLogin = true
-                AIAssistantModel.shared.installHistoryUITestFixture()
+                appState.configureTypographyUITestFriends()
+                AIAssistantModel.shared.installHistoryUITestFixture(markdown: markdown)
+                if ProcessInfo.processInfo.arguments.contains("--tool-order-ui-test") {
+                    AIAssistantModel.shared.installToolOrderUITestFixture(stage: 0)
+                }
+                if ProcessInfo.processInfo.arguments.contains("--drawer-font-ui-test") {
+                    AIAssistantModel.shared.installDrawerFontUITestFixture()
+                }
                 AIAssistantModel.shared.historyLoaded = true
             }
     }
@@ -384,7 +428,9 @@ private struct MaiChatSimulatorUITestEntry: View {
                 AccountToolsUITestRoot()
             } else if ProcessInfo.processInfo.arguments.contains("--ai-local-inference-ui-test") {
                 AILocalInferenceUITestRoot()
-            } else if ProcessInfo.processInfo.arguments.contains("--app-bars-layout-ui-test") {
+            } else if ProcessInfo.processInfo.arguments.contains("--app-bars-layout-ui-test") ||
+                        ProcessInfo.processInfo.arguments.contains("--my-settings-ui-test") ||
+                        ProcessInfo.processInfo.arguments.contains("--markdown-breaks-ui-test") {
                 AppBarsLayoutUITestRoot()
             } else if ProcessInfo.processInfo.arguments.contains("--ai-screen-frames-ui-test") {
                 #if DEBUG

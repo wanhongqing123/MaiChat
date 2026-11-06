@@ -557,8 +557,8 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     return calls;
 }
 
-// 按模型给出的顺序执行工具调用，并为每次调用持久化真实结果与可见事件。
-// 权限、取消和工具失败都产生对应回执，不能让模型误以为调用已经成功。
+// 每个工具开始前检查补充输入；已有工具结束后，有新输入便不再启动旧计划的剩余调用。
+// 未执行项仍保留原 callId 和明确回执，模型才能先看到新指令再决定是否重新调用。
 void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
                                  const std::atomic<bool>& cancel) {
     MaiSession session;
@@ -588,8 +588,18 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
     };
     std::vector<MaiToolImage> resultImages;
 
+    const auto hasPendingInput = [this] {
+        return mDependencies.pendingSteering && !mDependencies.pendingSteering().empty();
+    };
+    // 一旦让出执行权，本批剩余项均不再启动，不能因处理回执期间队列变化而恢复旧计划。
+    bool replan = false;
+    const char* replanHint =
+        "This tool was not executed because new user input arrived. Review the new user messages "
+        "and decide whether to request this tool again.";
+
     for (const auto& call : calls) {
         if (cancel.load(std::memory_order_relaxed)) break;
+        replan = replan || hasPendingInput();
 
         MaiMessagePart part;
         part.id = MaiIdGenerator::newPartId();
@@ -603,8 +613,11 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         MaiTool* tool = mDependencies.tools
                             ? mDependencies.tools->findForModel(call.name, mModelName)
                             : nullptr;
-        const bool needsApproval = toolNeedsApproval(call);
-        body.state = needsApproval ? MaiToolState::Pending : MaiToolState::Running;
+        const bool needsApproval = !replan && toolNeedsApproval(call);
+        body.state = replan          ? MaiToolState::Canceled
+                     : needsApproval ? MaiToolState::Pending
+                                     : MaiToolState::Running;
+        if (replan) body.error = body.output = replanHint;
         part.body = body;
         mAssistant.parts.push_back(part);
 
@@ -618,7 +631,11 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
                                         part.id);
 
         MaiToolResult result;
-        if (!tool) {
+        // 广播工具占位期间也可能收到输入；审批和实际执行前都要重新核对。
+        replan = replan || hasPendingInput();
+        if (replan) {
+            result = MaiToolResult::failure(MaiErrorCode::Canceled, replanHint);
+        } else if (!tool) {
             // 模型有时会编一个不存在的工具名。告诉它事实，它下一圈通常会改对；
             // 直接失败整轮反而更糟。
             MaiTool* publicTool =
@@ -652,7 +669,14 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
                 // partId 每次调用才知道。question 工具要把它带进提问里，
                 // 界面才认得出是哪一次调用在等回答。
                 context.partId = part.id;
-                result = tool->execute(call.arguments, context);
+                if (cancel.load(std::memory_order_relaxed)) {
+                    result = MaiToolResult::failure(MaiErrorCode::Canceled, "Interrupted.");
+                } else if ((replan = hasPendingInput())) {
+                    // 审批等待期间到达的补充同样优先；获批不等于旧调用仍适合执行。
+                    result = MaiToolResult::failure(MaiErrorCode::Canceled, replanHint);
+                } else {
+                    result = tool->execute(call.arguments, context);
+                }
             }
         }
 

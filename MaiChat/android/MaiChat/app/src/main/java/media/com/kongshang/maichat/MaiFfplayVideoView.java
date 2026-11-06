@@ -103,7 +103,7 @@ public final class MaiFfplayVideoView extends FrameLayout {
             }
             return true;
         });
-        errorLabel = new TextView(context);
+        errorLabel = MaiChatTypography.text(context);
         errorLabel.setText("正在打开视频…");
         errorLabel.setTextColor(Color.WHITE);
         errorLabel.setGravity(Gravity.CENTER);
@@ -149,18 +149,18 @@ public final class MaiFfplayVideoView extends FrameLayout {
                 seekPercent(bar.getProgress() / 1000.0);
             }
         });
-        timeLabel = new TextView(context);
+        timeLabel = MaiChatTypography.text(context);
         timeLabel.setText("0:00 / 0:00");
         timeLabel.setTextColor(Color.WHITE);
-        timeLabel.setTextSize(14);
+        MaiChatTypography.apply(timeLabel, MaiChatTypographyTokens.Role.DETAIL);
         timeLabel.setTypeface(Typeface.MONOSPACE);
         timeline.addView(timeLabel);
         timeline.addView(seekBar, new LinearLayout.LayoutParams(
             LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         controls.addView(timeline, new LinearLayout.LayoutParams(0, dp(64), 1));
-        speedButton = new Button(context);
+        speedButton = MaiChatTypography.button(context);
         speedButton.setText("1×");
-        speedButton.setTextSize(14);
+        MaiChatTypography.apply(speedButton, MaiChatTypographyTokens.Role.DETAIL);
         speedButton.setTextColor(Color.WHITE);
         // 倍速入口与时间信息保持相同视觉重量；只在按压时反馈，保留足够的触摸范围。
         speedButton.setAllCaps(false);
@@ -188,10 +188,10 @@ public final class MaiFfplayVideoView extends FrameLayout {
             Color.argb(220, 9, 15, 25), 16, context));
         final double[] rates = {0.25, 0.5, 1.0, 1.5, 2.0};
         for (double rate : rates) {
-            Button choice = new Button(context);
+            Button choice = MaiChatTypography.button(context);
             choice.setText(formatSpeed(rate));
             choice.setAllCaps(false);
-            choice.setTextSize(14);
+            MaiChatTypography.apply(choice, MaiChatTypographyTokens.Role.DETAIL);
             choice.setTextColor(Color.WHITE);
             choice.setBackgroundColor(Color.TRANSPARENT);
             choice.setContentDescription("播放倍速 " + formatSpeed(rate));

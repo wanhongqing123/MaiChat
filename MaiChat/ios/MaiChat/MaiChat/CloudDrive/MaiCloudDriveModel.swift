@@ -110,6 +110,18 @@ struct MaiCloudDriveUploadProgress: Sendable {
     }
 
     func reload() async {
+#if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--typography-ui-test") {
+            // 字号/主题验收只使用内存目录和配额，不读写线上账号或请求媒体。
+            availability = .available
+            folders = [MaiCloudDriveFolder(id: "typography-folder", name: "示例文件夹 Typography",
+                parentId: nil, createdAt: 0, updatedAt: 0)]
+            videos = []
+            quota = MaiCloudDriveQuota(usedBytes: 447_400_000, reservedBytes: 0, limitBytes: 10_000_000_000)
+            loading = false
+            return
+        }
+#endif
         guard !accountID.isEmpty, !loading else { return }
         browseGeneration &+= 1
         let expected = generation

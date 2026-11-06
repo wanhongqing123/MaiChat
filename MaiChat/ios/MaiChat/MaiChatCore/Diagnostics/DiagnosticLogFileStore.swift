@@ -74,7 +74,8 @@ public actor DiagnosticLogFileStore {
 
     public func makeExportSnapshot(
         in exportDirectoryURL: URL,
-        at date: Date = Date()
+        at date: Date = Date(),
+        since startDate: Date? = nil
     ) throws -> URL {
         try fileHandle?.synchronize()
         try prepareDirectory()
@@ -91,12 +92,25 @@ public actor DiagnosticLogFileStore {
         )
         var output = Data()
         for fileURL in retainedLogFiles() {
-            if !output.isEmpty {
-                output.append(Data("\n".utf8))
-            }
             let data = try Data(contentsOf: fileURL)
-            output.append(data)
-            if data.last != 0x0A {
+            // 日志文件可能横跨所选时间边界；按每条记录的 ISO8601 时间筛选，
+            // 不用文件 mtime 冒充事件发生时间。无范围的既有支持导出保留原有字节。
+            let selected: Data
+            if let startDate {
+                let content = String(decoding: data, as: UTF8.self)
+                let lines = content.split(separator: "\n").filter { line in
+                    guard let timestamp = line.split(separator: " ", maxSplits: 1).first,
+                          let instant = entryDate(String(timestamp)) else { return false }
+                    return instant >= startDate && instant <= date
+                }
+                selected = Data(lines.map(String.init).joined(separator: "\n").utf8)
+            } else {
+                selected = data
+            }
+            guard !selected.isEmpty else { continue }
+            if !output.isEmpty { output.append(Data("\n".utf8)) }
+            output.append(selected)
+            if selected.last != 0x0A {
                 output.append(Data("\n".utf8))
             }
         }
@@ -110,6 +124,37 @@ public actor DiagnosticLogFileStore {
     public func logFileURLs() -> [URL] {
         retainedLogFiles()
     }
+
+    /// 仅移除本服务的诊断日志及尚在本 App 内的导出快照，不触碰聊天、附件或其他文件。
+    /// actor 串行化关闭/清理/后续写入；清理失败如实抛错，后续新日志仍可重新打开文件。
+    public func clear(exportDirectoryURL: URL? = nil) throws {
+        try closeCurrentFile()
+        currentLogURL = nil
+        currentDay = ""
+        rotationIndex = 0
+        for url in retainedLogFiles() { try fileManager.removeItem(at: url) }
+        if let exportDirectoryURL {
+            let urls = try fileManager.contentsOfDirectory(at: exportDirectoryURL,
+                includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
+            for url in urls where url.lastPathComponent.hasPrefix("MaiChat-Diagnostics-")
+                && url.pathExtension == "log"
+                && (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                try fileManager.removeItem(at: url)
+            }
+        }
+    }
+
+    private func entryDate(_ value: String) -> Date? {
+        fractionalDateFormatter.date(from: value) ?? dateFormatter.date(from: value)
+    }
+
+    private let fractionalDateFormatter: ISO8601DateFormatter = {
+        let value = ISO8601DateFormatter()
+        value.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return value
+    }()
+
+    private let dateFormatter = ISO8601DateFormatter()
 
     private static func line(for entry: DiagnosticLogEntry) -> String {
         let levelMarker: String

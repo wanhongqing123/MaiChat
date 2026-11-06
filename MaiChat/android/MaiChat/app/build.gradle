@@ -30,8 +30,8 @@ android {
         applicationId "com.kongshang.maichat"
         minSdk 26
         targetSdk 34
-        versionCode 267
-        versionName "2.2.30"
+        versionCode 274
+        versionName "2.2.32"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
@@ -110,6 +110,12 @@ tasks.register("stageMaiAgentGraphicsEffects", Sync) {
         include "*.onnx", "MODELS.md", "LICENSE"
         into "MaiPortraitModels"
     }
+    // LUT 已编译进共享核心，许可和归属说明仍随 APK 分发。
+    from(file("$projectDir/../../../../MaiChat/Portrait/whitening")) {
+        include "LICENSE", "NOTICE"
+        rename { "GPUPIXEL_" + it }
+        into "MaiPortraitModels"
+    }
     // PDF 核心静态链接 qpdf；许可与归属随 App 发布，不能只留在开发机源目录。
     from(file("$projectDir/../../../../MaiAgent/third_party/qpdf")) {
         include "LICENSE.txt", "NOTICE.md"
@@ -152,6 +158,8 @@ tasks.register("stageMaiBundledPrimaryModel", Exec) {
 }
 android.sourceSets.main.assets.srcDir(bundledPrimaryAssets)
 
+// 三端共用同一份已校验字体与许可，不在平台目录重复维护。
+android.sourceSets.main.assets.srcDir(file("$projectDir/../../../Presentation"))
 android.sourceSets.main.jniLibs.srcDir(localOrtJniLibs)
 // Each feature is a Java source root; package names stay stable across feature directories.
 android.sourceSets.main.java.setSrcDirs([

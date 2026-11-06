@@ -128,23 +128,10 @@ set(WITH_OPENCL OFF CACHE BOOL "" FORCE)
 set(WITH_IPP OFF CACHE BOOL "" FORCE)
 set(WITH_TBB OFF CACHE BOOL "" FORCE)
 add_subdirectory("${maichat_opencv_source}" opencv EXCLUDE_FROM_ALL)
-add_library(maichat_portrait STATIC
-  ../Portrait/MaiPortraitEngine.cpp
-  ../Portrait/MaiPortraitRegion.cpp
-  ../Portrait/MaiPortraitPersonalization.cpp
-  ../Portrait/MaiPortraitBridge.cpp)
-target_include_directories(maichat_portrait PUBLIC ../Portrait PRIVATE
-  "${CMAKE_BINARY_DIR}"
-  "${CMAKE_CURRENT_BINARY_DIR}"
-  ../../MaiAgent/include ../../MaiAgent/third_party/nlohmann ../../MaiAgent/third_party/sqlite
-  ../../MaiAgent/third_party/onnxruntime/include/onnxruntime/core/session
-  "${CMAKE_CURRENT_BINARY_DIR}/opencv"
-  "${maichat_opencv_source}/modules/core/include"
-  "${maichat_opencv_source}/modules/imgproc/include"
-  "${maichat_opencv_source}/modules/photo/include"
-  ${MAI_OPENSSL_INCLUDE_DIR})
-target_link_libraries(maichat_portrait PUBLIC maiagent mai_sqlite opencv_core opencv_imgproc opencv_photo
-  ${MAI_OPENSSL_CRYPTO_TARGET})
+add_subdirectory(../Portrait maichat_portrait)
+# iOS 按原有位置合并归档；提取共享 target 不能在缓存中留下新旧两份 Portrait archive。
+set_target_properties(maichat_portrait PROPERTIES
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 set(ffmpeg_source "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/ffmpeg")
 if(NOT EXISTS "${ffmpeg_source}/configure")
   message(FATAL_ERROR "Vendored FFmpeg source is missing")
@@ -256,6 +243,7 @@ if(TARGET maiagent_graphics)
 endif()
 add_library(maichat_mobile STATIC
   MaiMobileAgent.cpp
+  MaiAppStorageBridge.cpp
   MaiLocalInference.cpp
   ../SessionSync/MaiSessionSyncSocket.cpp
   ../SessionSync/MaiSessionSyncC.cpp
@@ -276,7 +264,8 @@ add_library(maichat_mobile STATIC
   ../MaiChatTools/MaiCalendarTools.cpp
   ../third_party/qrcodegen/qrcodegen.c
   ../MaiChatTools/MaiImageFilter.cpp
-  ../MaiChatTools/MaiMobileHostTools.cpp)
+  ../MaiChatTools/MaiMobileHostTools.cpp
+  ../MaiChatTools/MaiPortraitHostTools.cpp)
 target_compile_features(maichat_mobile PRIVATE c_std_11)
 if(ANDROID)
   target_sources(maichat_mobile PRIVATE

@@ -300,6 +300,56 @@ final class DiagnosticLogTests: XCTestCase {
         XCTAssertTrue(files.isEmpty)
     }
 
+    func testExportRangeUsesEntryTimesInsideOneRecentlyModifiedFile() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = DiagnosticLogFileStore(directoryURL: directory)
+        let end = fixedDate("2026-08-11T03:00:00Z")
+        func entry(_ sequence: UInt64, _ timestamp: String, _ event: String) -> DiagnosticLogEntry {
+            DiagnosticLogEntry(sequence: sequence, createdAt: timestamp, level: .info,
+                               category: "range", event: event)
+        }
+        try await store.append([
+            entry(1, "2026-08-11T09:59:59.999+08:00", "before"),
+            entry(2, "2026-08-11T10:00:00.000+08:00", "boundary"),
+            entry(3, "2026-08-11T02:30:00Z", "inside"),
+            entry(4, "2026-08-11T03:00:01Z", "future"),
+        ], at: end)
+        let url = try await store.makeExportSnapshot(in: directory.appendingPathComponent("exports"),
+            at: end, since: fixedDate("2026-08-11T02:00:00Z"))
+        let content = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertFalse(content.contains("event=before"))
+        XCTAssertTrue(content.contains("event=boundary"))
+        XCTAssertTrue(content.contains("event=inside"))
+        XCTAssertFalse(content.contains("event=future"))
+    }
+
+    func testClearOnlyRemovesDiagnosticsAndAllowsNewWrites() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = DiagnosticLogFileStore(directoryURL: directory)
+        let now = fixedDate("2026-08-11T02:00:00Z")
+        try await store.append([testEntry(sequence: 1, event: "old")], at: now)
+        let attachment = directory.appendingPathComponent("attachment.log")
+        try Data("keep attachment".utf8).write(to: attachment)
+        let exportDirectory = directory.appendingPathComponent("exports")
+        let snapshot = try await store.makeExportSnapshot(in: exportDirectory, at: now)
+        let unrelated = exportDirectory.appendingPathComponent("other.log")
+        try Data("keep export".utf8).write(to: unrelated)
+
+        try await store.clear(exportDirectoryURL: exportDirectory)
+        let afterClear = await store.logFileURLs()
+        XCTAssertTrue(afterClear.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: snapshot.path))
+        XCTAssertEqual(try String(contentsOf: attachment, encoding: .utf8), "keep attachment")
+        XCTAssertEqual(try String(contentsOf: unrelated, encoding: .utf8), "keep export")
+        try await store.append([testEntry(sequence: 2, event: "fresh")], at: now.addingTimeInterval(1))
+        let fresh = try await store.makeExportSnapshot(in: exportDirectory, at: now.addingTimeInterval(2))
+        let content = try String(contentsOf: fresh, encoding: .utf8)
+        XCTAssertFalse(content.contains("event=old"))
+        XCTAssertTrue(content.contains("event=fresh"))
+    }
+
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("maichat-log-tests-\(UUID().uuidString)", isDirectory: true)

@@ -1120,7 +1120,9 @@ void AgentPanelSessionTest::subAgentCardsKeepTaskAndStreamedLatestLineVisible() 
 void AgentPanelSessionTest::subAgentCardsUseConsistentWidthAndExpandableSummary() {
     struct RestoreFont {
         QFont previous = QApplication::font();
-        ~RestoreFont() { QApplication::setFont(previous); }
+        ~RestoreFont() {
+            QApplication::setFont(previous);
+        }
     } restoreFont;
     QFont font;
     font.setFamilies({QStringLiteral("Segoe UI"), QStringLiteral("Microsoft YaHei UI")});
@@ -1145,10 +1147,11 @@ void AgentPanelSessionTest::subAgentCardsUseConsistentWidthAndExpandableSummary(
         delta.messageId = "msg_child_style_" + std::to_string(index);
         delta.partId = "prt_child_style_" + std::to_string(index);
         delta.field = "text";
-        const QString text = index == 0 ? QStringLiteral("规范检查完成。")
-            : QStringLiteral("审查已完成，以下是最近的检查进展。\n") +
-              QStringLiteral("已核对任务归属、后台状态和长内容展示，没有访问外部服务。\n").repeated(7) +
-              QStringLiteral("最终摘要：当前检查项已完成，可展开查看保留的进展内容。");
+        const QString text =
+            index == 0 ? QStringLiteral("规范检查完成。")
+                       : QStringLiteral("审查已完成，以下是最近的检查进展。\n") +
+                             QStringLiteral("已核对任务归属、后台状态和长内容展示，没有访问外部服务。\n").repeated(7) +
+                             QStringLiteral("最终摘要：当前检查项已完成，可展开查看保留的进展内容。");
         delta.delta = text.toStdString();
         harness.controller->agent().eventBus().publish(delta);
         QCoreApplication::processEvents();
@@ -1181,13 +1184,10 @@ void AgentPanelSessionTest::subAgentCardsUseConsistentWidthAndExpandableSummary(
     harness.panel->resize(650, 760);
     // Offscreen controls intentionally keep their old physical geometry until
     // visible again. The view's content frames are authoritative for all rows.
-    const auto frame = [&](int index) {
-        return harness.view()->itemRect(QStringLiteral("sub-") + childIds[index]);
-    };
+    const auto frame = [&](int index) { return harness.view()->itemRect(QStringLiteral("sub-") + childIds[index]); };
     QTRY_COMPARE(frame(0).width(), frame(1).width());
     QTRY_VERIFY(summary->width() < 600);
-    if (summary->hasHeightForWidth())
-        QTRY_VERIFY(summary->height() >= summary->heightForWidth(summary->width()));
+    if (summary->hasHeightForWidth()) QTRY_VERIFY(summary->height() >= summary->heightForWidth(summary->width()));
     QTRY_VERIFY(frame(0).bottom() < frame(1).top());
     QTRY_VERIFY(frame(1).bottom() < frame(2).top());
     QVERIFY(captureAgentFixture(*harness.panel, QStringLiteral("sub-task-card-expanded-narrow")));
@@ -1492,11 +1492,21 @@ void AgentPanelSessionTest::approvedChildToolCompletesWhileParentPageIsCached() 
     class ChildApprovalTool final : public MaiTool {
     public:
         explicit ChildApprovalTool(std::shared_ptr<Gate> gate) : gate_(std::move(gate)) {}
-        std::string name() const override { return "maichat_send_text"; }
-        std::string description() const override { return "Local child approval fixture"; }
-        std::string parametersSchema() const override { return R"({"type":"object"})"; }
-        bool requiresApproval(const std::string&) const override { return true; }
-        bool requiresPerCallApproval(const std::string&) const override { return true; }
+        std::string name() const override {
+            return "maichat_send_text";
+        }
+        std::string description() const override {
+            return "Local child approval fixture";
+        }
+        std::string parametersSchema() const override {
+            return R"({"type":"object"})";
+        }
+        bool requiresApproval(const std::string&) const override {
+            return true;
+        }
+        bool requiresPerCallApproval(const std::string&) const override {
+            return true;
+        }
         MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
             gate_->entered.store(true);
             while (!gate_->released.load() && !context.isCanceled())
@@ -1504,6 +1514,7 @@ void AgentPanelSessionTest::approvedChildToolCompletesWhileParentPageIsCached() 
             return context.isCanceled() ? MaiToolResult::failure(MaiErrorCode::Canceled, "Fixture canceled")
                                         : MaiToolResult::success("Child fixture completed");
         }
+
     private:
         std::shared_ptr<Gate> gate_;
     };
@@ -1513,7 +1524,9 @@ void AgentPanelSessionTest::approvedChildToolCompletesWhileParentPageIsCached() 
     });
     struct ReleaseOnExit {
         std::shared_ptr<Gate> gate;
-        ~ReleaseOnExit() { gate->released.store(true); }
+        ~ReleaseOnExit() {
+            gate->released.store(true);
+        }
     } release{gate};
     AgentChatPanel panel(controller);
     panel.resize(900, 650);
@@ -1659,11 +1672,16 @@ void AgentPanelSessionTest::childQuestionKeepsItsPositionBetweenParentParts() {
                 if (sink.onText) sink.onText("Root before question");
                 if (sink.onToolCall) sink.onToolCall({"root-probe", "progress_probe_x", "{}"});
             } else if (call == 1) {
-                if (sink.onToolCall) sink.onToolCall({"child-question", "question", R"({"question":"Child timeline question"})"});
-            } else if (sink.onText) sink.onText("Root after question");
+                if (sink.onToolCall)
+                    sink.onToolCall({"child-question", "question", R"({"question":"Child timeline question"})"});
+            } else if (sink.onText)
+                sink.onText("Root after question");
             return {};
         }
-        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
+
     private:
         std::atomic<int> calls_{0};
     };
@@ -1673,7 +1691,9 @@ void AgentPanelSessionTest::childQuestionKeepsItsPositionBetweenParentParts() {
     });
     struct ReleaseOnExit {
         std::shared_ptr<IntermediateProgressState> progress;
-        ~ReleaseOnExit() { progress->released.store(1); }
+        ~ReleaseOnExit() {
+            progress->released.store(1);
+        }
     } release{progress};
     AgentChatPanel panel(controller);
     panel.resize(1000, 700);
@@ -1718,11 +1738,16 @@ void AgentPanelSessionTest::nestedQuestionsFollowOrderAndReleaseAfterCancellatio
     public:
         MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
             if (calls_++ < 2) {
-                if (sink.onToolCall) sink.onToolCall({"nested-question", "question", R"({"question":"Nested fixture question"})"});
-            } else if (sink.onText) sink.onText("done");
+                if (sink.onToolCall)
+                    sink.onToolCall({"nested-question", "question", R"({"question":"Nested fixture question"})"});
+            } else if (sink.onText)
+                sink.onText("done");
             return {};
         }
-        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
+
     private:
         std::atomic<int> calls_{0};
     };
@@ -1748,8 +1773,9 @@ void AgentPanelSessionTest::nestedQuestionsFollowOrderAndReleaseAfterCancellatio
     QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
     QCOMPARE(controller.pendingQuestions().front().sessionId, nested.value());
     QTRY_VERIFY(view->contains(QString::fromStdString(first.partId) + QStringLiteral("-answer")));
-    const auto cancelled = controller.interrupt(QString::fromStdString(nested.value()),
-        QString::fromStdString(controller.agent().activeTurnId(nested.value())));
+    const auto cancelled =
+        controller.interrupt(QString::fromStdString(nested.value()),
+                             QString::fromStdString(controller.agent().activeTurnId(nested.value())));
     QVERIFY(cancelled);
     controller.agent().waitIdle();
     QCoreApplication::processEvents();
@@ -1763,24 +1789,41 @@ void AgentPanelSessionTest::nestedQuestionsFollowOrderAndReleaseAfterCancellatio
 void AgentPanelSessionTest::rootQuestionAfterSteeringKeepsItsPartPosition() {
     class SteeredQuestionModel final : public MaiModelClient {
     public:
-        MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
-            if (calls_++ == 0 && sink.onToolCall) {
+        std::atomic<bool> sawQueuedInput{false};
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink, const std::atomic<bool>&) override {
+            const int call = calls_++;
+            if (call == 0 && sink.onToolCall) {
                 sink.onToolCall({"held-root", "progress_probe_x", "{}"});
                 sink.onToolCall({"ask-root", "question", R"({"question":"Root question after queued input"})"});
-            } else if (sink.onText) sink.onText("done");
+            } else if (call == 1 && sink.onToolCall) {
+                // 补充会使旧的未执行问题取消；模型看到补充后再决定是否重新提问。
+                for (const auto& message : request.messages)
+                    if (message.role == MaiModelRole::User && message.content == "Queued root instruction")
+                        sawQueuedInput = true;
+                sink.onToolCall(
+                    {"replanned-root-question", "question", R"({"question":"Root question after queued input"})"});
+            } else if (sink.onText)
+                sink.onText("done");
             return {};
         }
-        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
+
     private:
         std::atomic<int> calls_{0};
     };
     auto progress = std::make_shared<IntermediateProgressState>();
-    AgentController controller(std::make_unique<SteeredQuestionModel>(), QString(), [progress](MaiToolRegistry& tools) {
+    auto model = std::make_unique<SteeredQuestionModel>();
+    auto* observed = model.get();
+    AgentController controller(std::move(model), QString(), [progress](MaiToolRegistry& tools) {
         tools.add(std::make_unique<IntermediateProgressTool>(progress, 1));
     });
     struct ReleaseOnExit {
         std::shared_ptr<IntermediateProgressState> state;
-        ~ReleaseOnExit() { state->released.store(1); }
+        ~ReleaseOnExit() {
+            state->released.store(1);
+        }
     } release{progress};
     AgentChatPanel panel(controller);
     panel.resize(1000, 700);
@@ -1799,7 +1842,15 @@ void AgentPanelSessionTest::rootQuestionAfterSteeringKeepsItsPartPosition() {
     const QString userItem = QString::fromStdString(recent.front().id);
     progress->released.store(1);
     QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
-    const QString questionItem = QString::fromStdString(controller.pendingQuestions().front().partId) + QStringLiteral("-question");
+    QVERIFY(observed->sawQueuedInput.load());
+    bool canceledOriginalQuestion = false;
+    for (const auto& message : controller.agent().listMessages(root.toStdString()))
+        for (const auto& part : message.parts)
+            if (const auto* tool = std::get_if<MaiToolPart>(&part.body))
+                canceledOriginalQuestion |= tool->callId == "ask-root" && tool->state == MaiToolState::Canceled;
+    QVERIFY(canceledOriginalQuestion);
+    const QString questionItem =
+        QString::fromStdString(controller.pendingQuestions().front().partId) + QStringLiteral("-question");
     auto* view = panel.findChild<MarkdownView*>();
     QTRY_VERIFY(view->contains(questionItem));
     QVERIFY(view->itemRect(questionItem).top() > view->itemRect(userItem).top());
@@ -2806,12 +2857,17 @@ void AgentPanelSessionTest::sessionSwitchRetainsUnchangedRenderedMessages() {
                 message.id = QStringLiteral("msg_%1_%2").arg(id).arg(index, 4, 10, QLatin1Char('0')).toStdString();
                 message.role = index % 2 == 0 ? MaiRole::User : MaiRole::Assistant;
                 message.created = message.completed = index + 1;
-                const QString text = message.role == MaiRole::User
-                    ? QStringLiteral("Fixture request %1").arg(index)
-                    : QStringLiteral("## Fixture result %1\n\n").arg(index) +
-                      QStringLiteral("The stable result contains **formatted text**, `code`, and a table.\n\n").repeated(8) +
-                      QStringLiteral("| Check | Result |\n| --- | --- |\n| Desktop | Ready |\n| Shared core | Ready |\n\n") +
-                      QStringLiteral("```cpp\nfor (int item = 0; item < 10; ++item) {\n    consume(item);\n}\n```\n");
+                const QString text =
+                    message.role == MaiRole::User
+                        ? QStringLiteral("Fixture request %1").arg(index)
+                        : QStringLiteral("## Fixture result %1\n\n").arg(index) +
+                              QStringLiteral("The stable result contains **formatted text**, `code`, and a table.\n\n")
+                                  .repeated(8) +
+                              QStringLiteral(
+                                  "| Check | Result |\n| --- | --- |\n| Desktop | Ready |\n| Shared core | Ready "
+                                  "|\n\n") +
+                              QStringLiteral(
+                                  "```cpp\nfor (int item = 0; item < 10; ++item) {\n    consume(item);\n}\n```\n");
                 message.parts.push_back({"prt_" + message.id, MaiTextPart{text.toStdString()}, index + 1});
                 if (message.role == MaiRole::Assistant) {
                     for (int toolIndex = 0; toolIndex < 12; ++toolIndex) {
@@ -2855,8 +2911,8 @@ void AgentPanelSessionTest::sessionSwitchRetainsUnchangedRenderedMessages() {
     const qint64 revisitUs = timer.nsecsElapsed() / 1000;
     QCoreApplication::processEvents();
     const qint64 revisitPaintUs = timer.nsecsElapsed() / 1000;
-    qInfo("switch_fixture read_us=%lld cold_us=%lld cold_paint_us=%lld revisit_us=%lld revisit_paint_us=%lld",
-          readUs, coldUs, coldPaintUs, revisitUs, revisitPaintUs);
+    qInfo("switch_fixture read_us=%lld cold_us=%lld cold_paint_us=%lld revisit_us=%lld revisit_paint_us=%lld", readUs,
+          coldUs, coldPaintUs, revisitUs, revisitPaintUs);
     QVERIFY2(original, "Switching to another session destroyed the unchanged rendered message");
     QVERIFY(original->isVisible());
     QVERIFY(captureAgentFixture(panel, QStringLiteral("session-switch-retained-rich-page")));

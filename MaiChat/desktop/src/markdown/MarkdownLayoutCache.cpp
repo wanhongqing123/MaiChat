@@ -30,11 +30,12 @@ struct Key {
     unsigned int noteRgba = 0;
     qreal width = 0;
     qreal zoom = 0;
+    QString fontKey;
 
     bool operator==(const Key& other) const {
         return source == other.source && note == other.note
                && notePixelSize == other.notePixelSize && noteRgba == other.noteRgba
-               && qFuzzyCompare(width, other.width) && qFuzzyCompare(zoom, other.zoom);
+               && qFuzzyCompare(width, other.width) && qFuzzyCompare(zoom, other.zoom) && fontKey == other.fontKey;
     }
 };
 
@@ -61,6 +62,7 @@ quint64 hashOf(const Key& key) {
     };
     mix(quint64(qHash(key.source)));
     mix(quint64(qHash(key.note)));
+    mix(quint64(qHash(key.fontKey)));
     mix(quint64(key.notePixelSize));
     mix(quint64(key.noteRgba));
     // 宽度和缩放都是小数，按 1/16 的精度取整——排版本来也只吃得下这个精度。
@@ -107,8 +109,8 @@ void dropOldest() {
 std::unique_ptr<MarkdownLayout> MarkdownLayoutCache::take(const QString& source,
                                                           const QString& note, int notePixelSize,
                                                           unsigned int noteRgba, qreal width,
-                                                          qreal zoom) {
-    const Key key{source, note, notePixelSize, noteRgba, width, zoom};
+                                                          qreal zoom, const QString& fontKey) {
+    const Key key{source, note, notePixelSize, noteRgba, width, zoom, fontKey};
     const quint64 hash = hashOf(key);
     Store& data = store();
     const auto bucket = data.buckets.find(hash);
@@ -135,12 +137,12 @@ std::unique_ptr<MarkdownLayout> MarkdownLayoutCache::take(const QString& source,
 
 void MarkdownLayoutCache::put(const QString& source, const QString& note, int notePixelSize,
                               unsigned int noteRgba, qreal width, qreal zoom,
-                              std::unique_ptr<MarkdownLayout> layout) {
+                              std::unique_ptr<MarkdownLayout> layout, const QString& fontKey) {
     if (layout == nullptr) return;
     // 空内容不值得占位置。
     if (source.isEmpty()) return;
 
-    const Key key{source, note, notePixelSize, noteRgba, width, zoom};
+    const Key key{source, note, notePixelSize, noteRgba, width, zoom, fontKey};
     const quint64 hash = hashOf(key);
     Store& data = store();
     // 选区是部件的状态，不是内容的。留着的话下次取出来会带着别人的高亮。

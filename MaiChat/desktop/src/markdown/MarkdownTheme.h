@@ -8,13 +8,14 @@
 #include <QString>
 
 #include "markdown/MarkdownDocument.h"
+#include "markdown/TypographyTokens.h"
 
 // Markdown 的配色和尺寸，**两端共用一套**。
 //
-// 值是从原来 MarkdownRenderer.cpp 里那段 CSS 一条条搬过来的，不是我另编的：
-// 换成自绘是为了突破 QTextDocument 的 CSS 子集，不是为了顺手改一遍外观。
-// 外观要调的话在这里调一次，agent 和 IM 一起变——这正是用户要的
-// 「肯定得全都公用一套」。
+// 字号、间距和语义颜色来源于 Presentation/typography.json 的生成令牌。
+// 这里适配 Qt 的字体和绘制 API；自绘不受 QTextDocument 的 CSS 子集限制。
+// 基础角色在共同契约中调整，agent 和 IM 使用相同主题与字号倍率。
+// 调用方不能另设正文、表格和列表的字号。
 //
 // 尺寸都是**逻辑像素**，standard(zoom) 会按倍率缩好，调用方直接用。
 //
@@ -37,24 +38,22 @@ struct MarkdownTheme {
     // 空表示跟随应用默认字体。等宽字体按平台给，不写浏览器式的回退列表。
     QString bodyFamily;
     QString codeFamily;
-    int bodyPixelSize = 14;
-    // 行内代码和代码块**不是一个字号**：iOS 行内 13、块内 12。
-    // 行内代码嵌在正文里，小太多会显得塌下去；代码块整块都是等宽字，小一点更紧凑。
-    int codePixelSize = 13;
-    int codeBlockPixelSize = 12;
-    int tablePixelSize = 12;
-    // 列表序号单独一个字号，比正文小一号并加粗——照 iOS 的 13 semibold。
-    int listMarkerPixelSize = 13;
-    // 项目符号保持小而实，避免大圆点比正文更抢眼。
-    int listBulletPixelSize = 13;
-    int calloutTitlePixelSize = 13;
-    int headingPixelSize[6] = {22, 18, 16, 14, 14, 14};
-    // 行高倍率。
-    //
-    // iOS 是 14pt 字加 4pt 行距，算下来约 1.48。桌面的阅读列有 760px，
-    // 比手机宽一倍多，理论上该更松一点；但两端「公用一套」的前提下先对齐 iOS，
-    // 真读着累再单独给桌面加个系数。
-    qreal lineHeightRatio = 1.48;
+    // 正文、列表、引用和表格同基准；代码等宽且按 detail 比例，标题保留语法层级。
+    // 默认值也引用生成令牌，standard() 只做配色与一次最终倍率换算。
+    int bodyPixelSize = static_cast<int>(TypographyTokens::kBody);
+    int codePixelSize = static_cast<int>(TypographyTokens::kBody * TypographyTokens::kDetailRatio);
+    int codeBlockPixelSize = static_cast<int>(TypographyTokens::kBody * TypographyTokens::kDetailRatio);
+    int tablePixelSize = static_cast<int>(TypographyTokens::kBody);
+    int listMarkerPixelSize = static_cast<int>(TypographyTokens::kBody);
+    int listBulletPixelSize = static_cast<int>(TypographyTokens::kBody);
+    int calloutTitlePixelSize = static_cast<int>(TypographyTokens::kBody * TypographyTokens::kDetailRatio);
+    int headingPixelSize[6] = {
+        static_cast<int>(TypographyTokens::kBody * TypographyTokens::kHeading1Ratio),
+        static_cast<int>(TypographyTokens::kBody * TypographyTokens::kHeading2Ratio),
+        static_cast<int>(TypographyTokens::kBody * TypographyTokens::kHeading3Ratio),
+        static_cast<int>(TypographyTokens::kBody), static_cast<int>(TypographyTokens::kBody),
+        static_cast<int>(TypographyTokens::kBody)};
+    qreal lineHeightRatio = 1.6;
 
     // ── 颜色 ────────────────────────────────────────────────
     QColor text;
@@ -85,13 +84,13 @@ struct MarkdownTheme {
     QColor selectionText;
 
     // ── 间距 ────────────────────────────────────────────────
-    // 块与块之间。iOS 的 VStack 是 12。
-    int blockSpacing = 12;
+    // 段间距按正文比例；三端使用同一个令牌。
+    int blockSpacing = static_cast<int>(TypographyTokens::kBody * TypographyTokens::kParagraphGapRatio);
     // 标题上下的留白。和 CSS 的 margin 一样会**合并**：相邻两块之间取两者的大值，
     // 不是相加——不然标题跟在段落后面时会空出一大块。
-    // iOS 是在 12 的块间距之上，给 h1/h2 再加 4、h3 往下再加 2。
-    int headingSpacingAbove[6] = {16, 16, 14, 14, 14, 14};
-    int headingSpacingBelow[6] = {12, 12, 12, 12, 12, 12};
+    // 在正文段间距之上，h1/h2 加 4，其他标题加 2。
+    int headingSpacingAbove[6] = {20, 20, 18, 18, 18, 18};
+    int headingSpacingBelow[6] = {16, 16, 16, 16, 16, 16};
     // 列表的三个横向量是分开的，别拿一个数兼着用：
     //   listIndent       每嵌套一层往右挪多少
     //   listMarkerWidth  标记列的宽度，标记在里面**右对齐**
@@ -102,13 +101,13 @@ struct MarkdownTheme {
     int listMarkerGap = 8;
     // 缩进封顶。再深就不往右挪了，否则窄一点的列宽下正文没地方站。
     int listMaxDepth = 4;
-    int listItemSpacing = 4;
+    int listItemSpacing = static_cast<int>(TypographyTokens::kBody * TypographyTokens::kListGapRatio);
     int codePadding = 12;
     int codeRadius = 10;
     int quoteBarWidth = 3;
     int quotePadding = 12;
     int quoteRadius = 8;
-    // 分割线自己只要一点点留白，块间距已经给了 12。
+    // 分割线只保留少量留白，其余使用正文段间距。
     int dividerSpacing = 3;
     // 单元格的横竖内边距不一样：横向要宽一点，列之间才分得开。
     int tableCellPaddingH = 12;
@@ -136,15 +135,15 @@ struct MarkdownTheme {
     // 气泡最宽占可用宽度的多少。人发的消息短，拉满一行反而难读。
     qreal bubbleMaxWidthRatio = 0.72;
 
-    // 造这份皮肤用的缩放倍率。**同时当这份皮肤的指纹**：排好的版按它缓存
-    // （见 MarkdownLayoutCache），两份皮肤只要这个数一样就会被当成同一份。
+    // 造这份皮肤用的缩放倍率。与 bodyFamily/codeFamily 一起标识排版：
+    // MarkdownLayoutCache 同时校验字体家族，倍率相同但字体不同仍需重排。
     //
-    // 产品里所有主题都出自 standard(zoom)，所以这个数就够用了。要是哪天有人
-    // 手改了别的字段又不动这里，缓存会命中旧的那份——那就把这里也改掉。
+    // 产品主题均由 standard(zoom, family) 构造。若调用方另外修改其他字段却
+    // 没更新排版键，仍可能命中旧结果；新增影响字形的字段时应同步扩展缓存键。
     qreal zoom = 1.0;
 
     // 标准主题。zoom 传 UiZoom::factor()；非界面场景（比如测量）传 1.0。
-    static MarkdownTheme standard(qreal zoom);
+    static MarkdownTheme standard(qreal zoom, const QString& bodyFamily = QStringLiteral("Inter"));
 
     // 提示框（> [!NOTE] 之类）的配色和中文标题。None 返回普通引用的样式。
     MarkdownCalloutStyle calloutStyle(MarkdownCallout callout) const;

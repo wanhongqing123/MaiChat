@@ -54,6 +54,55 @@ final class AIOutgoingMessageQueueTests: XCTestCase {
         } catch { XCTAssertEqual(error as? AIOutgoingMessageQueueError, .invalidTransition) }
     }
 
+    func testForwardedRemoteInputsDoNotWaitForOwnerReceiptsAndCanConfirmOutOfOrder() async throws {
+        let fixture = try Fixture(); defer { fixture.cleanup() }
+        let queue = try fixture.queue()
+        let first = try await queue.enqueue(owner: fixture.owner, payloadData: Data("first".utf8))
+        let second = try await queue.enqueue(owner: fixture.owner, payloadData: Data("second".utf8))
+        let binding = AIOutgoingMessageQueueBinding(mode: .enqueue, hostEpoch: "epoch-a")
+        let dispatched = try await queue.transition(id: first.id, expectedRevision: first.revision, to: .dispatch(binding))
+        let forwarded = try await queue.transition(id: first.id, expectedRevision: dispatched.revision, to: .forwarded)
+        let next = try await queue.head(for: fixture.owner)
+        XCTAssertEqual(next?.id, second.id)
+        let secondDispatch = try await queue.transition(id: second.id, expectedRevision: second.revision, to: .dispatch(binding))
+        let secondForward = try await queue.transition(id: second.id, expectedRevision: secondDispatch.revision, to: .forwarded)
+        _ = try await queue.transition(id: second.id, expectedRevision: secondForward.revision, to: .accepted(messageID: "msg_second"))
+        _ = try await queue.transition(id: first.id, expectedRevision: forwarded.revision, to: .accepted(messageID: "msg_first"))
+        let all = try await queue.allEntries()
+        XCTAssertEqual(all.map(\.acceptedMessageID), ["msg_first", "msg_second"])
+    }
+
+    func testQueuedRemoteRetrySurvivesEpochChangeWithoutChangingItsRequestIdentity() async throws {
+        let fixture = try Fixture(); defer { fixture.cleanup() }
+        let queue = try fixture.queue()
+        let first = try await queue.enqueue(owner: fixture.owner, payloadData: Data("input".utf8))
+        let sent = try await queue.transition(id: first.id, expectedRevision: first.revision,
+            to: .dispatch(AIOutgoingMessageQueueBinding(mode: .enqueue, hostEpoch: "epoch-a")))
+        _ = try await queue.transition(id: first.id, expectedRevision: sent.revision, to: .forwarded)
+        let reopened = try fixture.queue(epoch: "epoch-b")
+        let restored = try await reopened.load()
+        XCTAssertEqual(restored.first?.state, .unknown)
+        let retried = try await reopened.transition(id: first.id, expectedRevision: restored[0].revision, to: .retry)
+        XCTAssertEqual(retried.requestID, first.requestID)
+        XCTAssertEqual(retried.payloadData, first.payloadData)
+    }
+
+    func testOldUnknownSendDoesNotBlockNewRemoteQueueInputs() async throws {
+        let fixture = try Fixture(); defer { fixture.cleanup() }
+        let queue = try fixture.queue()
+        let old = try await queue.enqueue(owner: fixture.owner, payloadData: Data("old".utf8))
+        let sent = try await queue.transition(id: old.id, expectedRevision: old.revision,
+            to: .dispatch(AIOutgoingMessageQueueBinding(mode: .send, hostEpoch: "epoch-a")))
+        _ = try await queue.transition(id: old.id, expectedRevision: sent.revision, to: .unknown)
+        let fresh = try await queue.enqueue(owner: fixture.owner, payloadData: Data("new".utf8))
+        let serial = try await queue.head(for: fixture.owner)
+        let forwarding = try await queue.head(for: fixture.owner, forwarding: true)
+        XCTAssertEqual(serial?.id, old.id)
+        XCTAssertEqual(forwarding?.id, fresh.id)
+        _ = try await queue.transition(id: fresh.id, expectedRevision: fresh.revision,
+            to: .dispatch(AIOutgoingMessageQueueBinding(mode: .enqueue, hostEpoch: "epoch-a")))
+    }
+
     func testIdenticalClicksRemainDistinctAndSameClickEnqueueIsIdempotentAcrossReload() async throws
     {
         let fixture = try Fixture()

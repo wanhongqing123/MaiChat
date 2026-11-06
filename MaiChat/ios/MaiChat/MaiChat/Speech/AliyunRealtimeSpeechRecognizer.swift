@@ -210,7 +210,7 @@ private final class AliyunSpeechEngine: NSObject, @unchecked Sendable, NeoNuiSdk
                            ifFinish: Bool, retCode: Int32) {
         if nuiEvent == EVENT_ASR_ERROR || nuiEvent == EVENT_DIALOG_ERROR || nuiEvent == EVENT_MIC_ERROR {
             event(AliyunSpeechEvent(json: nil, sentenceFinal: false, completed: false,
-                                   error: "阿里云语音识别失败（\(retCode)）"))
+                                   error: AliyunSpeechTranscript.failureMessage(status: Int(retCode))))
             return
         }
         let hasText = nuiEvent == EVENT_ASR_PARTIAL_RESULT || nuiEvent == EVENT_SENTENCE_END

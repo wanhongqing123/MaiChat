@@ -42,9 +42,9 @@ public final class MaiChatSafetyReportsPanel extends LinearLayout {
         setBackgroundColor(MaiChatTheme.GROUPED_PAGE);
         LinearLayout header = new LinearLayout(activity);
         header.setGravity(Gravity.CENTER_VERTICAL);
-        status = MaiChatTheme.text(activity, "", 14, MaiChatTheme.SECONDARY);
+        status = MaiChatTheme.text(activity, "", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         header.addView(status, new LayoutParams(0, -2, 1));
-        refresh = new Button(activity);
+        refresh = MaiChatTypography.button(activity);
         refresh.setText("刷新");
         refresh.setTextColor(MaiChatTheme.BLUE);
         refresh.setOnClickListener(view -> load());
@@ -96,13 +96,13 @@ public final class MaiChatSafetyReportsPanel extends LinearLayout {
         card.setPadding(dp(16), dp(16), dp(16), dp(16));
         card.setBackground(MaiChatTheme.rounded(Color.WHITE, 16, activity));
         card.addView(MaiChatTheme.label(activity,
-            "resolved".equals(report.status) ? "已处理" : "处理中", 17, MaiChatTheme.TEXT));
+            "resolved".equals(report.status) ? "已处理" : "处理中", MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT));
         TextView detail = MaiChatTheme.text(activity,
             report.resolution == null || report.resolution.isEmpty()
-                ? "我们会尽快核查并处理。" : report.resolution, 14, MaiChatTheme.SECONDARY);
+                ? "我们会尽快核查并处理。" : report.resolution, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         detail.setPadding(0, dp(8), 0, dp(8));
         card.addView(detail);
-        TextView id = MaiChatTheme.text(activity, "编号：" + report.id, 12, MaiChatTheme.SECONDARY);
+        TextView id = MaiChatTheme.text(activity, "编号：" + report.id, MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
         id.setTextIsSelectable(true);
         card.addView(id);
         LayoutParams params = new LayoutParams(-1, -2);

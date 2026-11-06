@@ -24,7 +24,51 @@ typedef struct MaiPortraitRegionResult {
     char* error;
 } MaiPortraitRegionResult;
 
-// 统一校验模型字段；hostFields=1 时额外接受宿主 operation/_face_hints。
+// 不透明计划持有复制后的感知遮罩、有效参数和统计；不借用配置中的模型或宿主像素。
+// 分析、区域细化、面部保护、顺序处理各 tile、finish、free 必须在同一后台串行任务中完成。
+// Protect 内部一次准备共享净肤/LUT 工作场；宿主不能逐 tile 重新估计它。
+// v8 美白保留本次平滑/提亮/暖度后的输入色相并限制增色；暗部曲线参数随请求固定，
+// 不用图片均值反馈，也不能扩大最终人物/五官保护范围。
+typedef struct MaiPortraitSkinContext MaiPortraitSkinContext;
+typedef struct MaiPortraitSkinAnalysisResult {
+    MaiPortraitSkinContext* context;
+    char* metadata;
+    char* error;
+} MaiPortraitSkinAnalysisResult;
+// proxy 为按原图比例解码的全图，最长边 <=512；globalRgba 为原流程的 64x64 全图特征。
+// hints 是原图坐标 {_face_hints:[...]}；fingerprint 来自完整原图，不是缩略图。
+// metadata 为 {ok,output:{tiles:[{sample_rect,write_rect}],face_roi,face_plan,
+// effective_parameters,geometry_parameters,...}}，所有矩形均为原图左上像素。
+// whitening_color_policy 是实际颜色规则；whitening_shadow_amount 为 L* 曲线幅度 D，
+// 不是每像素最终亮度差。两字段由 finish/commit 透传，不属于模型输入参数。
+MaiPortraitSkinAnalysisResult maiPortraitAnalyzeSkinRgba(const unsigned char* proxyRgba, int proxyWidth,
+                                                         int proxyHeight, int proxyStride, int sourceWidth,
+                                                         int sourceHeight, const char* hints, const char* arguments,
+                                                         const char* profileDirectory, const char* sourcePath,
+                                                         const char* sourceFingerprint, const unsigned char* globalRgba,
+                                                         int globalStride);
+// Analyze 给出 skin_refinement_request 时必须提交一次：像素来自其绑定的原图区域，
+// 分辨率必须与请求一致（最长边 <=1024）。只能在 Protect 和 tile0 之前调用。
+// 不接受调用者坐标、参数或主体替换；失败使计划失效，不发布半成品。
+// 返回拥有的 {ok,output:{applied,source_rect,proxy_width,proxy_height}}，用 maiPortraitFree。
+char* maiPortraitRefineSkinRegionRgba(MaiPortraitSkinContext* context, const unsigned char* rgba, int width, int height,
+                                      int stride);
+// 在处理 tile 前提交 face_roi 的原生像素；mesh 仅保护眼眉唇，失败不猜测嘴部位置。
+// 面部不可可靠保护时跳过面部颜色，并仅在仍有可靠身体皮肤时继续；返回拥有的 JSON。
+// remove_body_hair=true 需要可靠 class2 身体范围；仅脸部计划必须明确失败。
+char* maiPortraitProtectSkinFaceRegion(MaiPortraitSkinContext* context, const unsigned char* rgba, int width,
+                                       int height, int stride);
+// tileIndex 必须从 0 顺序递增；输入严格匹配 sample_rect，输出仍为 sample_rect 大小。
+// 宿主只合入 write_rect；halo 不重复计数。失败计划不能 finish 或继续发布。
+MaiPortraitRegionResult maiPortraitProcessSkinTile(MaiPortraitSkinContext* context, int tileIndex,
+                                                   const unsigned char* rgba, int width, int height, int stride);
+// 全部 tile 完成后返回 {ok,output:<兼容 commit 的汇总元数据>}，不登记结果或发布文件。
+char* maiPortraitFinishSkin(MaiPortraitSkinContext* context);
+void maiPortraitFreeSkinContext(MaiPortraitSkinContext* context);
+
+// 统一校验模型字段；remove_body_hair 仅 beautify 接受严格 bool，省略为 auto。
+// effective_parameters 仅返显显式 bool；auto 时省略它，body_cleanup_request_mode 独立说明请求模式。
+// 该开关独立于八项训练 values；hostFields=1 时额外接受宿主 operation/_face_hints。
 // 合法时返回 NULL，失败返回不含路径的 JSON {code,stage,message,hint}，用 maiPortraitFree 释放。
 char* maiPortraitValidateArguments(const char* operation, const char* arguments, int hostFields);
 // 宿主全图/窗口检测结果合并，返回 {ok,output:{faces:[...]}}，坐标与输入一致。

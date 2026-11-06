@@ -20,9 +20,11 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,6 +39,8 @@
 
 struct MaiCloudDriveCancel {
     std::atomic_bool requested{false};
+    MaiDownloadCancel* download = mai_download_cancel_create();
+    ~MaiCloudDriveCancel() { mai_download_cancel_destroy(download); }
 };
 
 namespace {
@@ -1189,6 +1193,149 @@ bool completeUpload(const MaiCloudDriveOptions* options, const std::string& base
     return true;
 }
 
+// Search consumes ordinary owner-only listing pages, never media or read links.
+// Source cursors are preserved at page boundaries so filters cannot skip a
+// partially consumed page. A batch can contain 50..99 matches at its last page.
+std::string foldSearchText(std::string value) {
+    for (char& c : value) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    return value;
+}
+
+bool validListCursor(const std::string& cursor) {
+    return !cursor.empty() && cursor.size() <= 256 &&
+        std::all_of(cursor.begin(), cursor.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '-';
+        });
+}
+
+json cloudFolderPath(const json& folderId, const std::map<std::string, json>& folders) {
+    json current = folderId;
+    std::vector<std::string> names;
+    std::set<std::string> visited;
+    while (!current.is_null()) {
+        if (!current.is_string() || names.size() >= 64) return nullptr;
+        const std::string id = current.get<std::string>();
+        const auto found = folders.find(id);
+        if (found == folders.end() || !visited.insert(id).second) return nullptr;
+        names.push_back(found->second["name"].get<std::string>());
+        current = found->second["parent_id"];
+    }
+    std::string path;
+    for (auto it = names.rbegin(); it != names.rend(); ++it) {
+        path += "/" + *it;
+        if (path.size() > 4096) return nullptr;
+    }
+    return path.empty() ? "/" : path;
+}
+
+void searchMedia(const MaiCloudDriveOptions* options, const json& input,
+                 const MaiCloudDriveCancel* cancel, MaiCloudDriveResult* result) {
+    std::string query, type, cursor, folder;
+    if (sessionMode(options) || !stringField(input, "query", &query) || query.empty() ||
+        query.size() > 240 || !printable(query) ||
+        std::all_of(query.begin(), query.end(), [](unsigned char c) { return c == ' '; })) return;
+    for (auto it = input.begin(); it != input.end(); ++it) {
+        if (it.key() != "query" && it.key() != "media_type" && it.key() != "folder_id" &&
+            it.key() != "before" && it.key() != "exact_name") return;
+    }
+    if (input.contains("media_type") && (!stringField(input, "media_type", &type) ||
+        (type != "image" && type != "video"))) return;
+    if (input.contains("before") && (!stringField(input, "before", &cursor) || !validListCursor(cursor))) return;
+    if (input.contains("folder_id") && (!stringField(input, "folder_id", &folder) ||
+        (!folder.empty() && !validUuid(folder)))) return;
+    if (input.contains("exact_name") && !input["exact_name"].is_boolean()) return;
+    if (canceled(cancel)) { result->status = MAI_CLOUD_DRIVE_CANCELED; return; }
+    const bool exact = input.value("exact_name", false);
+    const std::string needle = foldSearchText(query);
+    mai_cloud_drive_request(options, MAI_CLOUD_DRIVE_LIST_FOLDERS, "{}", cancel, result);
+    if (result->status != MAI_CLOUD_DRIVE_OK) return;
+    const json tree = parseResponse(*result);
+    mai_cloud_drive_result_free(result);
+    std::map<std::string, json> folders;
+    for (const json& entry : tree["folders"]) {
+        if (!folders.emplace(entry["id"].get<std::string>(), entry).second) {
+            result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE; return;
+        }
+    }
+    if (!folder.empty() && !folders.count(folder)) {
+        result->status = MAI_CLOUD_DRIVE_HTTP_ERROR; result->http_status = 404; return;
+    }
+    json matches = json::array();
+    size_t scanned = 0;
+    std::set<std::string> seenCursors{cursor};
+    std::set<std::string> seenMedia;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (int page = 0; page < 20; ++page) {
+        if (canceled(cancel)) { result->status = MAI_CLOUD_DRIVE_CANCELED; return; }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (page && remaining <= 0) break;
+        json arguments = json::object();
+        if (!cursor.empty()) arguments["before"] = cursor;
+        if (input.contains("folder_id")) arguments["folder_id"] = folder;
+        const std::string payload = arguments.dump();
+        MaiCloudDriveOptions bounded = *options;
+        bounded.transfer_timeout_ms = int(std::min<int64_t>(std::max<int64_t>(1, remaining),
+            options->transfer_timeout_ms > 0 ? options->transfer_timeout_ms : 30000));
+        bounded.connect_timeout_ms = std::min(bounded.transfer_timeout_ms,
+            options->connect_timeout_ms > 0 ? options->connect_timeout_ms : 10000);
+        mai_cloud_drive_request(&bounded, MAI_CLOUD_DRIVE_LIST_MEDIA, payload.c_str(), cancel, result);
+        if (result->status != MAI_CLOUD_DRIVE_OK) return;
+        const json response = parseResponse(*result);
+        mai_cloud_drive_result_free(result);
+        const json& media = response["videos"];
+        const json& next = response["next_cursor"];
+        if (media.size() > 50 || (!next.is_null() &&
+            (!next.is_string() || !validListCursor(next.get<std::string>()) ||
+             !seenCursors.insert(next.get<std::string>()).second))) {
+            result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE; return;
+        }
+        scanned += media.size();
+        for (const json& entry : media) {
+            std::string id, name, contentType;
+            uint64_t size = 0, created = 0;
+            MaiCloudDriveMediaInfo info{};
+            if (!stringField(entry, "id", &id) || !validUuid(id) ||
+                !stringField(entry, "name", &name) || !mediaInfo(name, &info) ||
+                !stringField(entry, "content_type", &contentType) || contentType != info.content_type_utf8 ||
+                !uintField(entry, "size_bytes", 1, info.max_size_bytes, &size) ||
+                !uintField(entry, "created_at", 1, 9'007'199'254'740'991, &created) ||
+                !entry.contains("folder_id") || !(entry["folder_id"].is_null() ||
+                    (entry["folder_id"].is_string() && validUuid(entry["folder_id"].get<std::string>()))) ||
+                (entry.contains("media_type") && entry["media_type"] != info.media_type_utf8) ||
+                (input.contains("folder_id") && (folder.empty() ? !entry["folder_id"].is_null() :
+                     entry["folder_id"] != folder))) {
+                result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE; return;
+            }
+            const std::string folded = foldSearchText(name);
+            if ((exact ? folded != needle : folded.find(needle) == std::string::npos) ||
+                (!type.empty() && type != info.media_type_utf8) || !seenMedia.insert(id).second) continue;
+            const json folderPath = cloudFolderPath(entry["folder_id"], folders);
+            json path = nullptr;
+            if (folderPath.is_string()) {
+                const std::string prefix = folderPath.get<std::string>();
+                const std::string full = prefix + (prefix == "/" ? "" : "/") + name;
+                if (full.size() <= 4096) path = full;
+            }
+            // Only public metadata is copied; arbitrary response fields and
+            // internal object keys/URLs cannot leak into a model result.
+            matches.push_back({{"media_id", id}, {"name", name}, {"folder_id", entry["folder_id"]},
+                {"folder_path", folderPath}, {"cloud_path", path}, {"size_bytes", size},
+                {"content_type", contentType}, {"media_type", info.media_type_utf8}, {"created_at", created}});
+        }
+        cursor = next.is_null() ? "" : next.get<std::string>();
+        if (cursor.empty() || matches.size() >= 50) break;
+    }
+    if (canceled(cancel)) { result->status = MAI_CLOUD_DRIVE_CANCELED; return; }
+    const std::string body = json{{"matches", matches}, {"query", query}, {"scanned_count", scanned},
+        {"has_more", !cursor.empty()}, {"search_complete", cursor.empty()},
+        {"next_cursor", cursor.empty() ? json(nullptr) : json(cursor)}}.dump();
+    if (body.size() > kMaxJsonBytes) { result->status = MAI_CLOUD_DRIVE_RESPONSE_TOO_LARGE; return; }
+    result->status = assignBody(result, body) ? MAI_CLOUD_DRIVE_OK : MAI_CLOUD_DRIVE_FILE_ERROR;
+    result->http_status = 200;
+}
+
 }  // namespace
 
 extern "C" int mai_cloud_drive_media_info(const char* displayName,
@@ -1213,7 +1360,10 @@ extern "C" MaiCloudDriveCancel* mai_cloud_drive_cancel_create(void) {
 }
 
 extern "C" void mai_cloud_drive_cancel_request(MaiCloudDriveCancel* cancel) {
-    if (cancel) cancel->requested.store(true, std::memory_order_relaxed);
+    if (cancel) {
+        cancel->requested.store(true, std::memory_order_relaxed);
+        mai_download_cancel_request(cancel->download);
+    }
 }
 
 extern "C" void mai_cloud_drive_cancel_destroy(MaiCloudDriveCancel* cancel) {
@@ -1240,6 +1390,66 @@ extern "C" void mai_cloud_drive_request(const MaiCloudDriveOptions* options,
     if (payload.size() > kMaxRequestBytes) return;
     const json input = json::parse(payload, nullptr, false);
     if (!input.is_object()) return;
+    if (action == MAI_CLOUD_DRIVE_SEARCH_MEDIA) {
+        searchMedia(options, input, cancel, result);
+        return;
+    }
+    if (action == MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA) {
+        // The local path is never forwarded to the account server. The read
+        // link is consumed here, so neither platform code nor the Agent sees it.
+        std::string id, path;
+        if (sessionMode(options) || input.size() != 2 ||
+            !stringField(input, "media_id", &id) || !validUuid(id) ||
+            !stringField(input, "output_path", &path) || path.empty() ||
+            path.size() > 4096 || path.find('\0') != std::string::npos ||
+            !std::filesystem::u8path(path).is_absolute()) return;
+        if (canceled(cancel)) { result->status = MAI_CLOUD_DRIVE_CANCELED; return; }
+        const std::string linkArguments = json{{"video_id", id}}.dump();
+        mai_cloud_drive_request(options, MAI_CLOUD_DRIVE_PLAY_LINK,
+                                linkArguments.c_str(), cancel, result);
+        if (result->status != MAI_CLOUD_DRIVE_OK) return;
+        const json details = parseResponse(*result);
+        std::string url, type, mediaType;
+        uint64_t size = 0;
+        const bool valid = stringField(details, "read_url", &url) &&
+            stringField(details, "content_type", &type) &&
+            stringField(details, "media_type", &mediaType) &&
+            uintField(details, "size_bytes", 1, kMaxVideoBytes, &size);
+        const bool image = mediaType == "image" &&
+            (type == "image/jpeg" || type == "image/png" || type == "image/webp" || type == "image/heic");
+        const bool video = mediaType == "video" &&
+            (type == "video/mp4" || type == "video/quicktime");
+        mai_cloud_drive_result_free(result);
+        if (!valid || (!image && !video) || (image && size > kMaxImageBytes)) {
+            result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE; return;
+        }
+        if (cancel && !cancel->download) { result->status = MAI_CLOUD_DRIVE_FILE_ERROR; return; }
+        MaiDownloadOptions download{};
+        download.url_utf8 = url.c_str(); download.target_path_utf8 = path.c_str();
+        download.max_bytes = size;
+        download.ca_pem = options->ca_pem; download.ca_pem_length = options->ca_pem_length;
+        download.ca_path_utf8 = options->ca_path_utf8;
+        download.proxy_url_utf8 = options->proxy_url_utf8;
+        download.proxy_username_utf8 = options->proxy_username_utf8;
+        download.proxy_password_utf8 = options->proxy_password_utf8;
+        download.proxy_resolver = options->proxy_resolver; download.proxy_context = options->proxy_context;
+        download.connect_timeout_ms = options->connect_timeout_ms;
+        download.transfer_timeout_ms = options->transfer_timeout_ms > 0 ? options->transfer_timeout_ms : 7'200'000;
+        MaiDownloadResult received{};
+        mai_download_new_file(&download, size, cancel ? cancel->download : nullptr, &received);
+        result->http_status = received.http_status; result->curl_code = received.curl_code;
+        if (received.status != MAI_DOWNLOAD_OK) {
+            result->status = received.status == MAI_DOWNLOAD_CANCELED ? MAI_CLOUD_DRIVE_CANCELED
+                : received.status == MAI_DOWNLOAD_WRITE_ERROR ? MAI_CLOUD_DRIVE_FILE_ERROR
+                : received.status == MAI_DOWNLOAD_SIZE_MISMATCH || received.status == MAI_DOWNLOAD_TOO_LARGE
+                    ? MAI_CLOUD_DRIVE_INVALID_RESPONSE : MAI_CLOUD_DRIVE_NETWORK_ERROR;
+            return;
+        }
+        result->status = MAI_CLOUD_DRIVE_OK;
+        assignBody(result, json{{"downloaded", true}, {"media_id", id}, {"path", path},
+            {"size_bytes", size}, {"content_type", type}, {"media_type", mediaType}}.dump());
+        return;
+    }
     const std::string root = apiRoot(options);
     std::string route;
     const char* method = "GET";

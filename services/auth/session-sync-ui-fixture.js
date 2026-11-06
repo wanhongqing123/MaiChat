@@ -61,6 +61,9 @@ let macPermissions = [];
 const macPermissionDecisions = [];
 const modelCalls = [];
 const modelRequests = [];
+let holdInputReceipts = false;
+const heldInputReceipts = [];
+const receivedInputs = [];
 const messages = [{ id: 'msg_0001', role: 'assistant', created: 1,
   completed: 2, active: false,
   parts: [{ id: 'part_0001', kind: 'text', text: '这条历史来自本机假 Mac Session。' }] }];
@@ -149,12 +152,17 @@ async function fakeMacLoop() {
         messages.push({ id: `msg_${id}`, role: 'user', created: messages.length + 1,
           completed: messages.length + 2, active: false,
           parts: [{ id: `part_${id}`, kind: 'text', text }] });
-        await sendPayload(envelope, 'event', { type: 'command_result',
-          command_id: envelope.client_message_id, result: { ok: true } });
-        await call(macToken, 'POST', '/v1/session-sync/publish', {
-          session_id: sessionID, messages: [messages[messages.length - 1]],
-          permissions: macPermissions, questions: []
-        });
+        const message = messages[messages.length - 1];
+        receivedInputs.push({ text, request_id: envelope.payload.requestId,
+          has_turn_id: Boolean(envelope.payload.turnId), command_id: envelope.client_message_id });
+        if (holdInputReceipts) heldInputReceipts.push({ envelope, message });
+        else {
+          await sendPayload(envelope, 'event', { type: 'command_result',
+            command_id: envelope.client_message_id, result: { ok: true, user_message_id: message.id } });
+          await call(macToken, 'POST', '/v1/session-sync/publish', {
+            session_id: sessionID, messages: [message], permissions: macPermissions, questions: []
+          });
+        }
       }
       if (envelope.kind === 'command' && envelope.payload.action === 'permission') {
         macPermissionDecisions.push(envelope.payload.decision);
@@ -257,6 +265,24 @@ async function start() {
   if (login.statusCode !== 200) throw new Error('Could not log in fake Mac');
   macToken = login.body.access_token;
   const server = http.createServer(async (request, response) => {
+    if (request.url.startsWith('/test/mac-input-control')) {
+      const query = new URL(request.url, 'http://localhost').searchParams;
+      holdInputReceipts = query.get('hold') === '1';
+      macSessions = macSessions.map(session => ({ ...session, busy: query.get('busy') === '1', turnId: '' }));
+      await call(macToken, 'POST', '/v1/session-sync/presence', {
+        device_id: 'localmacfixture', name: '测试 Mac', sessions: macSessions });
+      if (!holdInputReceipts) {
+        for (const { envelope, message } of heldInputReceipts.splice(0)) {
+          await sendPayload(envelope, 'event', { type: 'command_result', command_id: envelope.client_message_id,
+            result: { ok: true, user_message_id: message.id } });
+          await call(macToken, 'POST', '/v1/session-sync/publish', {
+            session_id: sessionID, messages: [message], permissions: macPermissions, questions: [] });
+        }
+      }
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ hold: holdInputReceipts, received: receivedInputs.length }));
+      return;
+    }
     if (request.url === '/test/cert') {
       response.writeHead(200, { 'Content-Type': 'application/x-pem-file' });
       response.end(certificate);
@@ -272,7 +298,7 @@ async function start() {
         phonePresenceMs: syncDb.prepare(`SELECT last_seen FROM sync_devices
           WHERE slot='ios_phone'`).get()?.last_seen || 0,
         messages: messages.length, envelopes, phoneSession: phoneSession?.id,
-        phoneEvents: decodedPhoneEvents(), modelCalls, modelRequests,
+        phoneEvents: decodedPhoneEvents(), modelCalls, modelRequests, receivedInputs,
         macSessions: macSessions.map(session => session.id), workspaceSwitches,
         macPermissionDecisions,
         phoneLifecycleResults: phoneLifecycleResults(),

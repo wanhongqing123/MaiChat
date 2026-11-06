@@ -38,7 +38,7 @@ final class SocialLoginUITests: XCTestCase {
             )).firstMatch
             if imError.waitForExistence(timeout: 2) { imError.tap() }
             app.buttons["我的"].tap()
-            let settings = app.buttons["设置"]
+            let settings = app.buttons["my-preferences-entry"]
             XCTAssertTrue(settings.waitForExistence(timeout: 10))
             settings.tap()
         }
@@ -501,12 +501,23 @@ final class SocialLoginUITests: XCTestCase {
         XCTAssertTrue(accountValue.waitForExistence(timeout: 15))
     }
 
+    /// 从正常“我的”页走唯一退出入口，并确认；仅本机测试账号的用例调用。
+    @MainActor private func logoutFromMy(in app: XCUIApplication) {
+        let logout = app.buttons["my-logout"]
+        for _ in 0..<4 where !logout.isHittable { app.swipeUp() }
+        XCTAssertTrue(logout.waitForExistence(timeout: 10))
+        logout.tap()
+        let confirm = app.buttons["my-logout-confirm"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 5))
+        confirm.tap()
+    }
+
     @MainActor private func openAccountSettings(in app: XCUIApplication) {
         for _ in 0..<8 {
             if app.buttons["以后"].isHittable { app.buttons["以后"].tap() }
             if app.buttons["稍后"].isHittable { app.buttons["稍后"].tap() }
             if app.staticTexts["登录账号"].exists { return }
-            let settings = app.buttons["设置"]
+            let settings = app.buttons["my-account-entry"]
             if settings.isHittable {
                 settings.tap()
             } else {
@@ -671,10 +682,7 @@ final class SocialLoginUITests: XCTestCase {
             let me = app.buttons["我的"]
             XCTAssertTrue(me.waitForExistence(timeout: 10))
             me.tap()
-            let settings = app.buttons["设置"]
-            XCTAssertTrue(settings.waitForExistence(timeout: 10))
-            settings.tap()
-            app.buttons["切换账号"].tap()
+            logoutFromMy(in: app)
         }
         XCTAssertTrue(field.waitForExistence(timeout: 20))
         app.buttons["密码登录"].tap()
@@ -705,13 +713,7 @@ final class SocialLoginUITests: XCTestCase {
         let me = app.buttons["我的"]
         XCTAssertTrue(me.waitForExistence(timeout: 30))
         me.tap()
-        let settings = app.buttons["设置"]
-        if !settings.waitForExistence(timeout: 2) {
-            app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.955)).tap()
-        }
-        XCTAssertTrue(settings.waitForExistence(timeout: 10))
-        settings.tap()
-        app.buttons["切换账号"].tap()
+        logoutFromMy(in: app)
         XCTAssertTrue(app.textFields["account-phone"].waitForExistence(timeout: 15))
         app.terminate()
         app.launchEnvironment["MAICHAT_LOCAL_UI_SOCIAL_TEST"] = "1"
@@ -776,15 +778,8 @@ final class SocialLoginUITests: XCTestCase {
         let me = app.buttons["我的"]
         if me.waitForExistence(timeout: 5) {
             me.tap()
-            let settings = app.buttons["设置"]
-            if !settings.waitForExistence(timeout: 2) {
-                app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.955)).tap()
-            }
-            if settings.waitForExistence(timeout: 10) {
-                settings.tap()
-                app.buttons["切换账号"].tap()
-                _ = app.textFields["account-phone"].waitForExistence(timeout: 15)
-            }
+            logoutFromMy(in: app)
+            _ = app.textFields["account-phone"].waitForExistence(timeout: 15)
         }
         app.terminate()
         app.launchEnvironment["MAICHAT_LOCAL_UI_SOCIAL_TEST"] = "1"

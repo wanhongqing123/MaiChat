@@ -33,12 +33,32 @@ private slots:
     void readsTaskListsAndOrderedNumbers();
     void dropsUnsafeLinkTargets();
     void preservesChatSoftBreaks();
+    void rendersInlineHtmlBreaksWithoutChangingLiterals();
     void keepsSourceForCopying();
     void plainTextIsOneLine();
     void parsesTables();
     void nestsQuotesByDepth();
     void recognizesCallouts();
 };
+
+void MarkdownDocumentTest::rendersInlineHtmlBreaksWithoutChangingLiterals() {
+    const QString source = QStringLiteral(
+        "| Case | Result |\n| --- | --- |\n"
+        "| **Expected**:<br>320x180<br><br>details | Actual:<br/>320x240<br />next<BR>last |\n\n"
+        "a<br>b\n\n`<br>` \\<br> &lt;br&gt; <!-- <br> --> <span title=\"<br>\">x</span>\n\n"
+        "```html\n<br>\n```\n");
+    const auto document = MarkdownDocument::parse(source);
+    QCOMPARE(document.source(), source);
+    const auto& blocks = document.blocks();
+    QCOMPARE(blocks[0].kind, MarkdownBlockKind::Table);
+    QCOMPARE(textOf(blocks[0].rows[1][0]), QStringLiteral("Expected:\n320x180\n\ndetails"));
+    QVERIFY(blocks[0].rows[1][0][0].styles.testFlag(MarkdownStyle::Bold));
+    QCOMPARE(textOf(blocks[0].rows[1][1]), QStringLiteral("Actual:\n320x240\nnext\nlast"));
+    QCOMPARE(textOf(blocks[1].spans), QStringLiteral("a\nb"));
+    QCOMPARE(textOf(blocks[2].spans),
+             QStringLiteral("<br> <br> &lt;br&gt; <!-- <br> --> <span title=\"<br>\">x</span>"));
+    QCOMPARE(blocks[3].code, QStringLiteral("<br>\n"));
+}
 
 void MarkdownDocumentTest::parsesParagraphsAndHeadings() {
     const MarkdownDocument document =

@@ -156,28 +156,28 @@ void RemoteDesktopProxyDialog::buildUi(const Config& config) {
 
 // 作用：应用页面现有的颜色、字号、间距和控件外观。
 void RemoteDesktopProxyDialog::applyStyle() {
-    setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         #remoteDesktopProxyPanel {
             background: #ffffff;
             border-radius: 16px;
         }
         #remoteDesktopProxyTitle {
             color: #0f172a;
-            font-size: 18px;
+            font-size: @heading3;
             font-weight: 700;
         }
         #remoteDesktopProxyDescription, #remoteDesktopProxyHint {
             color: #667085;
-            font-size: 13px;
+            font-size: @detail;
         }
         #remoteDesktopProxyFieldLabel {
             color: #334155;
-            font-size: 14px;
+            font-size: @detail;
             font-weight: 700;
         }
         #trtcProxyEnabled, #trtcProxyUdp {
             color: #172033;
-            font-size: 14px;
+            font-size: @detail;
             font-weight: 600;
             spacing: 8px;
         }
@@ -187,7 +187,7 @@ void RemoteDesktopProxyDialog::applyStyle() {
             border: 1px solid #d9e1ec;
             border-radius: 10px;
             color: #172033;
-            font-size: 14px;
+            font-size: @detail;
             padding: 9px 12px;
         }
         #trtcProxyHost:focus, #trtcProxyPort:focus {
@@ -216,12 +216,12 @@ void RemoteDesktopProxyDialog::applyStyle() {
         }
         #remoteDesktopProxyError {
             color: #b42318;
-            font-size: 13px;
+            font-size: @detail;
             font-weight: 700;
         }
         #remoteDesktopProxyCancel, #remoteDesktopProxySave {
             border-radius: 10px;
-            font-size: 14px;
+            font-size: @detail;
             font-weight: 700;
             padding: 10px 22px;
         }
@@ -242,7 +242,7 @@ void RemoteDesktopProxyDialog::applyStyle() {
         #remoteDesktopProxySave:hover {
             background: #1e40af;
         }
-    )")));
+    )"));
 }
 
 void RemoteDesktopProxyDialog::updateFieldState() {

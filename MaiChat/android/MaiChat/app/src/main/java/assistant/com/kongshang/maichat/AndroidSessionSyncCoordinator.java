@@ -29,6 +29,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -65,6 +66,7 @@ final class AndroidSessionSyncCoordinator {
     private final Map<String, String> retryIdByFingerprint = new ConcurrentHashMap<>();
     private final Map<String, String> fingerprintByCommandId = new ConcurrentHashMap<>();
     private final Set<String> dirtySessions = ConcurrentHashMap.newKeySet();
+    private final Set<Long> receivingCommands = ConcurrentHashMap.newKeySet();
     private final Set<String> initiallyPublishedSessions = ConcurrentHashMap.newKeySet();
     private final Map<String, String> publishedMessageDigests = new ConcurrentHashMap<>();
     private final Map<String, String> publishedStateDigests = new ConcurrentHashMap<>();
@@ -269,7 +271,7 @@ final class AndroidSessionSyncCoordinator {
                         if (closed) return;
                         long handle = nativeCreate();
                         if (handle == 0) throw new IOException("设备同步连接初始化失败");
-                        if (!nativeStart(handle, "wss://ichat.life/api/v1/session-sync/ws",
+                        if (!nativeStart(handle, auth.sessionSyncWebSocketUrl(),
                             token, certificate, proxy)) {
                             nativeDestroy(handle);
                             throw new IOException("设备同步连接启动失败");
@@ -385,22 +387,39 @@ final class AndroidSessionSyncCoordinator {
 
     private void handle(JSONObject envelope) throws Exception {
         String kind = envelope.optString("kind");
-        if (kind.equals("command") && LIFECYCLE_SESSION.equals(envelope.optString("session_id"))) {
-            CompletableFuture<JSONObject> result = new CompletableFuture<>();
-            controller.lifecycleForSync(envelope.optJSONObject("payload"), result::complete);
-            send(envelope.optString("from_slot"), envelope.optString("from_login_session_id"),
-                LIFECYCLE_SESSION, "event", new JSONObject().put("type", "command_result")
-                    .put("command_id", envelope.optString("client_message_id"))
-                    .put("result", result.get(15, TimeUnit.SECONDS)));
-            requestPresenceRefresh();
-        } else if (kind.equals("command")) {
-            CompletableFuture<JSONObject> result = new CompletableFuture<>();
-            controller.commandForSync(envelope.optString("session_id"),
-                envelope.optJSONObject("payload"), result::complete);
-            sendPayload(envelope, "event", new JSONObject().put("type", "command_result")
-                .put("command_id", envelope.optString("client_message_id"))
-                .put("result", result.get(15, TimeUnit.SECONDS)));
-            schedulePublish(envelope.optString("session_id"));
+        if (kind.equals("command")) {
+            final long envelopeId = envelope.optLong("id");
+            if (!receivingCommands.add(envelopeId)) return;
+            final boolean lifecycle = LIFECYCLE_SESSION.equals(envelope.optString("session_id"));
+            JSONObject action = envelope.optJSONObject("payload");
+            if (action != null) {
+                action = new JSONObject(action.toString());
+                if (action.optString("action").equals("prompt") && action.optString("requestId").isEmpty())
+                    action.put("requestId", envelope.optString("client_message_id"));
+            }
+            // 所属端按 Handler 顺序导入和接收，socket 信箱不等待模型、附件或界面操作。
+            // 原命令仅在落库接收/明确拒绝后 ACK；重送中的同一 envelope 不重复排入 Handler。
+            Consumer<JSONObject> complete = result -> outbound.execute(() -> {
+                try {
+                    if (closed) return;
+                    JSONObject response = new JSONObject().put("type", "command_result")
+                        .put("command_id", envelope.optString("client_message_id")).put("result", result);
+                    if (lifecycle) {
+                        send(envelope.optString("from_slot"), envelope.optString("from_login_session_id"),
+                            LIFECYCLE_SESSION, "event", response);
+                        requestPresenceRefresh();
+                    } else {
+                        sendPayload(envelope, "event", response);
+                        schedulePublish(envelope.optString("session_id"));
+                    }
+                    request("ack", new JSONObject().put("ids", new JSONArray().put(envelopeId)), 15000);
+                } catch (Exception failure) {
+                    if (!closed) Log.w(TAG, "Owner input receipt will be retried");
+                } finally { receivingCommands.remove(envelopeId); }
+            });
+            if (lifecycle) controller.lifecycleForSync(action, complete);
+            else controller.commandForSync(envelope.optString("session_id"), action, complete);
+            return;
         } else if (kind.equals("event") && LIFECYCLE_SESSION.equals(envelope.optString("session_id"))) {
             acceptLifecycleResult(envelope);
         } else if (kind.equals("event")) {
@@ -631,7 +650,8 @@ final class AndroidSessionSyncCoordinator {
     String sendToRemote(JSONObject remote, String kind, JSONObject payload,
                         BiConsumer<String, String> completion) throws Exception {
         String id = newId();
-        if (kind.equals("command")) {
+        if (kind.equals("command") && !(payload.optString("action").equals("prompt") &&
+                !payload.optString("requestId").isEmpty())) {
             String key = fingerprint(remote, payload);
             id = retryIdByFingerprint.computeIfAbsent(key, ignored -> newId());
             fingerprintByCommandId.put(id, key);

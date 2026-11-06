@@ -9,6 +9,18 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public final class AIAssistantToolSummaryTest {
+    @Test public void textAndEmptyTextSeparateAdjacentToolRuns() throws Exception {
+        JSONArray parts = new JSONArray()
+            .put(new JSONObject().put("kind", "tool").put("id", "a").put("tool", "file_read").put("state", "completed"))
+            .put(new JSONObject().put("kind", "tool").put("id", "b").put("tool", "file_stat").put("state", "completed"))
+            .put(new JSONObject().put("kind", "text").put("id", "explanation").put("text", ""))
+            .put(new JSONObject().put("kind", "tool").put("id", "c").put("tool", "shell").put("state", "running"));
+        java.util.Map<String, JSONArray> groups = AIAssistantPanel.adjacentToolRuns(parts);
+        assertEquals(java.util.Arrays.asList("a", "c"), new java.util.ArrayList<>(groups.keySet()));
+        assertEquals(2, groups.get("a").length()); assertEquals(1, groups.get("c").length());
+        assertEquals("工具调用 1 次，运行中 · shell ×1", AIAssistantPanel.toolGroupTitle(groups.get("c")));
+    }
+
     @Test public void groupsToolCallsIntoOneStatusLine() throws Exception {
         JSONArray parts = new JSONArray()
             .put(new JSONObject().put("kind", "text").put("text", "hello"))

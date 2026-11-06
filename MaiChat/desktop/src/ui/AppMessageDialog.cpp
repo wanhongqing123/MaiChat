@@ -118,13 +118,13 @@ void AppMessageDialog::buildUi(const Options& options) {
 
 // 作用：应用页面现有的颜色、字号、间距和控件外观。
 void AppMessageDialog::applyStyle() {
-    setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         #appMessagePanel {
             background: #ffffff;
             border-radius: 16px;
         }
         #appMessageTitle, #appMessageTitleWarning {
-            font-size: 18px;
+            font-size: @heading3;
             font-weight: 700;
         }
         #appMessageTitle {
@@ -135,12 +135,12 @@ void AppMessageDialog::applyStyle() {
         }
         #appMessageBody {
             color: #334155;
-            font-size: 14px;
+            font-size: @detail;
             line-height: 22px;
         }
         #appMessageCancel, #appMessageConfirm, #appMessageDanger {
             border-radius: 10px;
-            font-size: 14px;
+            font-size: @detail;
             font-weight: 700;
             padding: 10px 22px;
         }
@@ -169,5 +169,5 @@ void AppMessageDialog::applyStyle() {
         #appMessageDanger:hover {
             background: #912018;
         }
-    )")));
+    )"));
 }

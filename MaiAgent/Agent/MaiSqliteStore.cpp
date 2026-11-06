@@ -537,10 +537,12 @@ public:
         if (!executeTransactionStatement("BEGIN IMMEDIATE")) return;
 
         sqlite3_stmt* upsert = prepareLocked(
-            "INSERT INTO messages(id, session_id, role, created, completed) "
-            "VALUES(?1, ?2, ?3, ?4, ?5) "
+            "INSERT INTO messages(id, session_id, role, created, completed, input_request_id, "
+            "pending_input) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) "
             "ON CONFLICT(id) DO UPDATE SET role=excluded.role, created=excluded.created, "
-            "completed=excluded.completed");
+            "completed=excluded.completed, input_request_id=excluded.input_request_id, "
+            "pending_input=excluded.pending_input");
         if (upsert) {
             Reset guard(upsert);
             bindText(upsert, 1, message.id);
@@ -548,6 +550,8 @@ public:
             sqlite3_bind_int(upsert, 3, roleToColumn(message.role));
             sqlite3_bind_int64(upsert, 4, message.created);
             sqlite3_bind_int64(upsert, 5, message.completed);
+            bindText(upsert, 6, message.inputRequestId);
+            sqlite3_bind_int(upsert, 7, message.pendingInput ? 1 : 0);
             executePreparedStatement(upsert);
         }
 
@@ -565,7 +569,7 @@ public:
         std::vector<MaiMessage> out;
 
         sqlite3_stmt* statement = prepareLocked(
-            "SELECT id, role, created, completed FROM messages "
+            "SELECT id, role, created, completed, input_request_id, pending_input FROM messages "
             "WHERE session_id = ?1 ORDER BY id");
         if (!statement) return out;
         {
@@ -577,6 +581,8 @@ public:
                 message.role = columnToRole(sqlite3_column_int(statement, 1));
                 message.created = sqlite3_column_int64(statement, 2);
                 message.completed = sqlite3_column_int64(statement, 3);
+                message.inputRequestId = textColumn(statement, 4);
+                message.pendingInput = sqlite3_column_int(statement, 5) != 0;
                 out.push_back(std::move(message));
             }
         }
@@ -588,7 +594,7 @@ public:
                     MaiMessage& out) const override {
         std::lock_guard<std::mutex> lock(mMutex);
         sqlite3_stmt* statement = prepareLocked(
-            "SELECT id, role, created, completed FROM messages "
+            "SELECT id, role, created, completed, input_request_id, pending_input FROM messages "
             "WHERE session_id = ?1 AND id = ?2");
         if (!statement) return false;
         MaiMessage message;
@@ -601,6 +607,8 @@ public:
             message.role = columnToRole(sqlite3_column_int(statement, 1));
             message.created = sqlite3_column_int64(statement, 2);
             message.completed = sqlite3_column_int64(statement, 3);
+            message.inputRequestId = textColumn(statement, 4);
+            message.pendingInput = sqlite3_column_int(statement, 5) != 0;
         }
         // 仅对精确命中的消息加载片段；失败路径不修改调用方原有快照。
         bool partsRead = false;
@@ -618,9 +626,11 @@ public:
         if (limit == 0) return page;
         const bool hasCursor = !beforeId.empty();
         sqlite3_stmt* statement =
-            prepareLocked(hasCursor ? "SELECT id, role, created, completed FROM messages "
+            prepareLocked(hasCursor ? "SELECT id, role, created, completed, input_request_id, "
+                                      "pending_input FROM messages "
                                       "WHERE session_id = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
-                                    : "SELECT id, role, created, completed FROM messages "
+                                    : "SELECT id, role, created, completed, input_request_id, "
+                                      "pending_input FROM messages "
                                       "WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2");
         if (!statement) return page;
         {
@@ -637,11 +647,60 @@ public:
                 message.role = columnToRole(sqlite3_column_int(statement, 1));
                 message.created = sqlite3_column_int64(statement, 2);
                 message.completed = sqlite3_column_int64(statement, 3);
+                message.inputRequestId = textColumn(statement, 4);
+                message.pendingInput = sqlite3_column_int(statement, 5) != 0;
                 page.push_back(std::move(message));
             }
         }
         for (auto& message : page) message.parts = readPartsLocked(message.id);
         return page;
+    }
+
+    bool getInputMessage(const std::string& sessionId, const std::string& requestId,
+                         MaiMessage& out) const override {
+        if (requestId.empty()) return false;
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto* query = prepareLocked(
+            "SELECT id, role, created, completed, input_request_id, pending_input "
+            "FROM messages WHERE session_id=?1 AND input_request_id=?2 AND role=0");
+        if (!query) return false;
+        Reset guard(query);
+        bindText(query, 1, sessionId);
+        bindText(query, 2, requestId);
+        if (sqlite3_step(query) != SQLITE_ROW) return false;
+        out.id = textColumn(query, 0);
+        out.role = columnToRole(sqlite3_column_int(query, 1));
+        out.created = sqlite3_column_int64(query, 2);
+        out.completed = sqlite3_column_int64(query, 3);
+        out.inputRequestId = textColumn(query, 4);
+        out.pendingInput = sqlite3_column_int(query, 5) != 0;
+        out.parts = readPartsLocked(out.id);
+        return true;
+    }
+
+    std::vector<MaiMessage> listQueuedInputs(const std::string& sessionId) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        std::vector<MaiMessage> result;
+        auto* query = prepareLocked(
+            "SELECT id, role, created, completed, input_request_id, pending_input "
+            "FROM messages WHERE session_id=?1 AND pending_input=1 AND role=0 ORDER BY id");
+        if (!query) return result;
+        {
+            Reset guard(query);
+            bindText(query, 1, sessionId);
+            while (sqlite3_step(query) == SQLITE_ROW) {
+                MaiMessage message;
+                message.id = textColumn(query, 0);
+                message.role = columnToRole(sqlite3_column_int(query, 1));
+                message.created = sqlite3_column_int64(query, 2);
+                message.completed = sqlite3_column_int64(query, 3);
+                message.inputRequestId = textColumn(query, 4);
+                message.pendingInput = sqlite3_column_int(query, 5) != 0;
+                result.push_back(std::move(message));
+            }
+        }
+        for (auto& message : result) message.parts = readPartsLocked(message.id);
+        return result;
     }
 
     void recoverInterruptedTools(const std::string& error, std::int64_t completedAt) override {
@@ -1181,5 +1240,51 @@ MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
         sqlite3_free(migrationError);
     }
 
+    if (readUserVersion(database) < 7) {
+        // 和 v6 相同，写锁内检查已有列，兼容并发打开和旧版保留新列的数据库。
+        char* migrationError = nullptr;
+        bool ok = sqlite3_exec(database, "BEGIN IMMEDIATE", nullptr, nullptr, &migrationError) ==
+                  SQLITE_OK;
+        bool hasRequest = false, hasPending = false;
+        sqlite3_stmt* columns = nullptr;
+        if (ok)
+            ok = sqlite3_prepare_v2(database, "PRAGMA table_info(messages)", -1, &columns,
+                                    nullptr) == SQLITE_OK;
+        if (ok) {
+            int status = SQLITE_ROW;
+            while ((status = sqlite3_step(columns)) == SQLITE_ROW) {
+                hasRequest |= textColumn(columns, 1) == "input_request_id";
+                hasPending |= textColumn(columns, 1) == "pending_input";
+            }
+            ok = status == SQLITE_DONE;
+        }
+        sqlite3_finalize(columns);
+        if (ok && !hasRequest)
+            ok = sqlite3_exec(
+                     database,
+                     "ALTER TABLE messages ADD COLUMN input_request_id TEXT NOT NULL DEFAULT ''",
+                     nullptr, nullptr, &migrationError) == SQLITE_OK;
+        if (ok && !hasPending)
+            ok = sqlite3_exec(
+                     database,
+                     "ALTER TABLE messages ADD COLUMN pending_input INTEGER NOT NULL DEFAULT 0",
+                     nullptr, nullptr, &migrationError) == SQLITE_OK;
+        if (ok)
+            ok = sqlite3_exec(database,
+                              "CREATE UNIQUE INDEX IF NOT EXISTS messages_input_request ON "
+                              "messages(session_id,input_request_id) WHERE input_request_id!='';"
+                              "CREATE INDEX IF NOT EXISTS messages_pending_input ON "
+                              "messages(session_id,id) WHERE pending_input=1;"
+                              "PRAGMA user_version=7;COMMIT;",
+                              nullptr, nullptr, &migrationError) == SQLITE_OK;
+        if (!ok) {
+            const std::string what = migrationError ? migrationError : sqlite3_errmsg(database);
+            sqlite3_free(migrationError);
+            sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
+            sqlite3_close(database);
+            return {MaiErrorCode::Internal, "cannot migrate schema to v7: " + what};
+        }
+        sqlite3_free(migrationError);
+    }
     return std::unique_ptr<MaiSessionStore>(new SqliteStore(database));
 }

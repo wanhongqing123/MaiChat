@@ -82,6 +82,13 @@ void MarkdownLayoutTest::emptyDocumentTakesNoSpace() {
 }
 
 void MarkdownLayoutTest::chatSourceLinesStayOnDistinctVisualLines() {
+    // HTML 换行和实际换行必须经过同一排版路径，表格内也不能被当成可见标签。
+    const auto html = laidOut(QStringLiteral("A1<br>first<br/>second<br />last"), 1200);
+    const auto lines = laidOut(QStringLiteral("A1\nfirst\nsecond\nlast"), 1200);
+    QCOMPARE(html.height(), lines.height());
+    const auto flatTable = laidOut(QStringLiteral("| A | B |\n| --- | --- |\n| first second | last |"), 1200);
+    const auto multiTable = laidOut(QStringLiteral("| A | B |\n| --- | --- |\n| first<br><br>second | last |"), 1200);
+    QVERIFY(multiTable.height() > flatTable.height());
     // 宽窗口没有自动折行干扰：每条真实换行都必须增加可见高度，并保留复制文本。
     const auto one = laidOut(QStringLiteral("A1 first recommendation"), 1200);
     auto report = laidOut(QStringLiteral("A1 first\nrecommendation one\nA2 second\nrecommendation two"), 1200);
@@ -218,7 +225,8 @@ void MarkdownLayoutTest::nestedListsUseCompactDistinctHierarchy() {
         laidOut(QStringLiteral("- 第一项\n- 第二项\n- 第三项\n- 第四项"), 600);
     const MarkdownTheme theme = MarkdownTheme::standard(1.0);
     const qreal fourLines = theme.bodyPixelSize * theme.lineHeightRatio * 4;
-    QVERIFY(compact.height() <= fourLines + 16);
+    // 四项只有三个列表间距；不能额外混入正文段间距。
+    QVERIFY(compact.height() <= fourLines + theme.listItemSpacing * 3 + 1);
 }
 
 void MarkdownLayoutTest::unorderedListMarkersVaryByDepth() {

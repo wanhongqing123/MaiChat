@@ -2,6 +2,7 @@
 // 类型关系：LoginDialog 继承 QDialog，使用 DesktopAuthClient 执行网络请求和凭据获取。
 // 对外边界：切换或关闭扫码页时废弃旧 verifier，不接受过期的异步登录结果。
 // 直接依赖：Qt Widgets、DesktopAuthClient 和现有 MaiChat 视觉资源。
+#include "ui/UiZoom.h"
 #include "ui/LoginDialog.h"
 
 #include <QLabel>
@@ -146,25 +147,25 @@ void LoginDialog::buildUi() {
 }
 
 void LoginDialog::applyStyle() {
-    setStyleSheet(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         LoginDialog { background: #ffffff; }
         #loginPanel, #loginLogo, #loginQrPane, #loginPasswordPane { background: transparent; }
         #loginModeButton { background: transparent; border: 0; color: #0871ba;
-            font-size: 13px; padding: 6px 8px; }
+            font-size: @detail; padding: 6px 8px; }
         #loginModeButton:hover { color: #005b9a; }
         #qrFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; }
-        #loginQr { color: #64748b; font-size: 14px; border: 0; }
-        #loginCode { color: #334155; font-size: 15px; font-weight: 600; }
-        #loginStatus { color: #0f172a; font-size: 15px; font-weight: 600; }
-        #loginDetail, #loginCountdown { color: #64748b; font-size: 12px; }
-        #accountLoginError { color: #d64242; font-size: 12px; }
-        #accountLoginAgreement, #accountLoginLegal { color: #64748b; font-size: 12px; }
+        #loginQr { color: #64748b; font-size: @detail; border: 0; }
+        #loginCode { color: #334155; font-size: @body; font-weight: 600; }
+        #loginStatus { color: #0f172a; font-size: @body; font-weight: 600; }
+        #loginDetail, #loginCountdown { color: #64748b; font-size: @metadata; }
+        #accountLoginError { color: #d64242; font-size: @metadata; }
+        #accountLoginAgreement, #accountLoginLegal { color: #64748b; font-size: @metadata; }
         #accountLoginId, #accountLoginPassword { border: 1px solid #d9e2ed;
             border-radius: 9px; padding: 8px 12px; min-height: 24px; background: #ffffff; }
         #accountLoginButton { background: #e8f3ff; color: #0871ba; border: 0;
-            border-radius: 9px; font-size: 14px; font-weight: 600; }
+            border-radius: 9px; font-size: @detail; font-weight: 600; }
         #loginRetryButton { border: 1px solid #d9e2ed; border-radius: 9px;
-                            background: #ffffff; color: #0871ba; font-size: 13px; }
+                            background: #ffffff; color: #0871ba; font-size: @detail; }
         #loginRetryButton:hover { background: #f0f7ff; }
     )"));
 }

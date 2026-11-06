@@ -70,9 +70,9 @@ PasswordChangeDialog::PasswordChangeDialog(const QString& account, Submit submit
     connect(cancel_, &QPushButton::clicked, this, &PasswordChangeDialog::reject);
     connect(save_, &QPushButton::clicked, this, &PasswordChangeDialog::submit);
     connect(confirmation_, &QLineEdit::returnPressed, this, &PasswordChangeDialog::submit);
-    setStyleSheet(QStringLiteral(
+    UiZoom::setStyle(this, QStringLiteral(
         "#passwordChangePanel{background:#fff;border:1px solid #dbe5f1;border-radius:16px;}"
-        "QLabel{color:#23324a;}#passwordChangeTitle{font-size:20px;font-weight:600;}"
+        "QLabel{color:#23324a;}#passwordChangeTitle{font-size: @title;font-weight:600;}"
         "QLineEdit{min-height:38px;padding:0 10px;border:1px solid #d5e0ee;border-radius:8px;background:#f8fbff;}"
         "QLineEdit:focus{border:1px solid #168ee0;}"
         "QPushButton{border:1px solid #d5e0ee;border-radius:8px;background:#f1f6fc;color:#23324a;}"

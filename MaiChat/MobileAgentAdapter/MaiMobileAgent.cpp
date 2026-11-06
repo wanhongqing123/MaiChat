@@ -1386,6 +1386,45 @@ struct MaiMobileAgent {
             return {{"ok", true}};
         }
         if (!agent) throw std::runtime_error("Agent is not initialized.");
+        if (op == "pin_input_file") {
+            // 图片转换留在平台；转换后的私有临时文件统一由 C++ 交付到稳定路径。
+            // 同一请求/附件跨传输重试不换路径，避免接收凭据因随机导入文件名而冲突。
+            const std::string requestId = r.at("requestId");
+            const std::string attachment = r.at("attachmentId");
+            const std::string relative = r.at("path");
+            if (requestId.empty() || requestId.size() > 128 || attachment.empty() || attachment.size() > 128 ||
+                !std::all_of(attachment.begin(), attachment.end(), [](unsigned char c) {
+                    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-';
+                })) throw std::runtime_error("Invalid input attachment identity.");
+            MaiToolContext paths;
+            paths.root = workspace;
+            const auto source = MaiFilePath::fromUtf8(paths.resolvePath(relative));
+            MaiRegularFileInfo sourceInfo;
+            if (source.isEmpty() || !MaiFileSystem::regularFileInfo(source, sourceInfo))
+                throw std::runtime_error("Imported input attachment is unavailable.");
+            constexpr char digits[] = "0123456789abcdef";
+            std::string key;
+            for (unsigned char c : requestId) { key += digits[c >> 4]; key += digits[c & 15]; }
+            const std::string base = source.baseName().toUtf8();
+            const auto dot = base.find_last_of('.');
+            const std::string extension = dot == std::string::npos || base.size() - dot > 16
+                ? ".bin" : base.substr(dot);
+            const std::string targetName = ".maichat/session-inputs/" + key.substr(0, 128) +
+                (key.size() > 128 ? "/" + key.substr(128) : "") + "/" + attachment + extension;
+            const std::string destination = paths.resolvePath(targetName);
+            if (destination.empty()) throw std::runtime_error("Input attachment path is outside the workspace.");
+            const auto target = MaiFilePath::fromUtf8(destination);
+            if (const auto error = MaiFileSystem::createDirectories(target.dirName())) throw std::runtime_error(error.message());
+            MaiRegularFileInfo existing;
+            if (MaiFileSystem::regularFileInfo(target, existing)) {
+                if (existing.bytes != sourceInfo.bytes) throw std::runtime_error("Input attachment content changed.");
+                if (source != target) MaiFileSystem::removeFile(source);
+            } else if (const auto error = MaiFileSystem::publishNewFile(source, target)) {
+                throw std::runtime_error(error.message());
+            }
+            return {{"ok", true}, {"path", targetName}};
+        }
         if (op == "local_model_probe") return localModelProbe(r);
         const std::string session = r.value("session", "");
         if (op == "snapshot") {
@@ -1466,11 +1505,11 @@ struct MaiMobileAgent {
         std::string acceptedTurnId;
         if (op == "create")
             id = result(agent->submit(MaiCreateSession{workspace, "", model}));
-        else if (op == "send" || op == "steer") {
+        else if (op == "send" || op == "steer" || op == "enqueue") {
             if (!configured) throw std::runtime_error("Configure an available primary model first.");
             // iOS 在升级或恢复后可能给同一数据容器分配新的绝对路径。图片片段只保存
             // 工作区相对路径，所以每轮发送前都把会话根目录迁到当前容器位置。
-            if (op == "send") {
+            if (op == "send" || (op == "enqueue" && !agent->isBusy(session))) {
                 result(agent->submit(MaiUpdateSession{session, "", model, "", workspace}));
                 std::lock_guard<std::mutex> lock(mutex);
                 errors.erase(session);
@@ -1499,7 +1538,13 @@ struct MaiMobileAgent {
             }
             if (r.contains("quoteMessageId") && !r["quoteMessageId"].is_string())
                 throw std::runtime_error("quoteMessageId must be a string.");
-            if (op == "steer") {
+            if (op == "enqueue") {
+                if (!r.contains("requestId") || !r["requestId"].is_string())
+                    throw std::runtime_error("Enqueue requires a stable requestId.");
+                id = result(agent->submit(MaiEnqueuePrompt{
+                    MaiSendPrompt{session, r.at("text"), std::move(images), std::move(videos),
+                                  r.value("quoteMessageId", std::string{})}, r["requestId"]}));
+            } else if (op == "steer") {
                 if (!r.contains("turnId") || !r["turnId"].is_string() || !r.contains("requestId") ||
                     !r["requestId"].is_string())
                     throw std::runtime_error("Steering requires turnId and requestId strings.");

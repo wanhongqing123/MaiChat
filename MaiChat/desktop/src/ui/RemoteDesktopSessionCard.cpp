@@ -151,19 +151,19 @@ void RemoteDesktopSessionCard::buildUi() {
 
 // 作用：应用页面现有的颜色、字号、间距和控件外观。
 void RemoteDesktopSessionCard::applyStyle() {
-    setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         #remoteCardHeader {
             background: #111c33;
         }
         #remoteCardTitle {
             color: #e2e8f0;
-            font-size: 13px;
+            font-size: @detail;
             font-weight: 700;
             background: transparent;
         }
         #remoteCardDuration {
             color: #94a3b8;
-            font-size: 12px;
+            font-size: @metadata;
             font-weight: 600;
             background: transparent;
         }
@@ -172,20 +172,20 @@ void RemoteDesktopSessionCard::applyStyle() {
         }
         #remoteCardPlaceholder {
             color: #94a3b8;
-            font-size: 14px;
+            font-size: @detail;
             background: transparent;
         }
         #remoteCardStatus {
             background: #111c33;
             color: #64748b;
-            font-size: 12px;
+            font-size: @metadata;
             padding: 5px 14px;
         }
         #remoteCardFullScreen {
             background: transparent;
             border: none;
             color: #94a3b8;
-            font-size: 15px;
+            font-size: @body;
             padding: 0 4px;
             min-width: 22px;
         }
@@ -197,7 +197,7 @@ void RemoteDesktopSessionCard::applyStyle() {
             border: 1px solid #334155;
             border-radius: 4px;
             color: #94a3b8;
-            font-size: 12px;
+            font-size: @metadata;
             font-weight: 600;
             padding: 3px 10px;
         }
@@ -217,11 +217,11 @@ void RemoteDesktopSessionCard::applyStyle() {
         #remoteCardNotice {
             background: #7c2d12;
             color: #fed7aa;
-            font-size: 13px;
+            font-size: @detail;
             font-weight: 600;
             padding: 8px 14px;
         }
-    )")));
+    )"));
 }
 
 void RemoteDesktopSessionCard::setNoticeText(const QString& text) {

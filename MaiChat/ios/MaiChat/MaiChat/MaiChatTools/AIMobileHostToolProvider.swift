@@ -378,6 +378,26 @@ final class AIMobileHostToolProvider {
             } catch {
                 return Self.cloudDriveFailure(error)
             }
+        case "maichat_cloud_drive_search_media":
+            let accountID = appState.maiChatAccountID
+            guard !accountID.isEmpty else {
+                return .failure(code: "not_configured", message: "MaiChat account login required")
+            }
+            do {
+                let data = try await MaiCloudDriveClient.shared.search(
+                    query: Self.string(arguments, key: "query"),
+                    exactName: arguments["exact_name"] as? Bool ?? false,
+                    mediaType: arguments["media_type"] as? String,
+                    folderID: arguments["folder_id"] as? String,
+                    before: arguments["before"] as? String)
+                guard appState.maiChatAccountID == accountID, !Task.isCancelled else {
+                    return .failure(code: "canceled", message: "MaiChat account or turn changed during search")
+                }
+                guard let body = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    return .failure(code: "protocol_error", message: "invalid cloud search response")
+                }
+                return Self.jsonSuccess(body)
+            } catch { return Self.cloudDriveFailure(error) }
         case "maichat_cloud_drive_list_folders":
             do {
                 let folders = try await MaiCloudDriveClient.shared.listFolders()
@@ -537,6 +557,30 @@ final class AIMobileHostToolProvider {
             } catch {
                 return Self.cloudDriveFailure(error)
             }
+        case "maichat_cloud_drive_download_media":
+            let accountID = appState.maiChatAccountID
+            let workspace = URL(fileURLWithPath: AIAssistantModel.shared.workspacePath)
+                .standardizedFileURL.resolvingSymlinksInPath()
+            let destination = URL(fileURLWithPath: Self.string(arguments, key: "output_path"))
+                .standardizedFileURL.resolvingSymlinksInPath()
+            guard !accountID.isEmpty, !AIAssistantModel.shared.workspacePath.isEmpty,
+                  destination.path.hasPrefix(workspace.path + "/") else {
+                return .failure(code: "invalid_input", message: "download must stay inside the current workspace")
+            }
+            do {
+                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
+                                                       withIntermediateDirectories: true)
+                let data = try await MaiCloudDriveClient.shared.downloadOriginal(
+                    mediaID: Self.string(arguments, key: "media_id"), to: destination)
+                guard appState.maiChatAccountID == accountID else {
+                    try? FileManager.default.removeItem(at: destination)
+                    return .failure(code: "canceled", message: "MaiChat account changed during download")
+                }
+                guard let body = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    return .failure(code: "internal", message: "invalid download result")
+                }
+                return Self.jsonSuccess(body)
+            } catch { return Self.cloudDriveFailure(error) }
         case "maichat_cloud_drive_open_media":
             let mediaID = Self.string(arguments, key: "media_id")
             let accountID = appState.maiChatAccountID

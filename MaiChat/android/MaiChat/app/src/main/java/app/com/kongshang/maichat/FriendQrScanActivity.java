@@ -32,7 +32,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public final class FriendQrScanActivity extends ComponentActivity {
+public final class FriendQrScanActivity extends MaiChatBaseActivity {
     private static final int CAMERA_PERMISSION_REQUEST = 1;
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean frameInFlight = new AtomicBoolean();
@@ -55,19 +55,19 @@ public final class FriendQrScanActivity extends ComponentActivity {
         FrameLayout.LayoutParams frameParams = new FrameLayout.LayoutParams(dp(250), dp(250),
             Gravity.CENTER);
         root.addView(frame, frameParams);
-        TextView title = MaiChatTheme.label(this, "扫一扫", 21, Color.WHITE);
+        TextView title = MaiChatTheme.label(this, "扫一扫", MaiChatTypographyTokens.Role.TITLE, Color.WHITE);
         title.setGravity(Gravity.CENTER);
         FrameLayout.LayoutParams titleParams = new FrameLayout.LayoutParams(dp(150), dp(50),
             Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         titleParams.topMargin = dp(12);
         root.addView(title, titleParams);
-        hint = MaiChatTheme.label(this, "扫描对方的好友二维码", 16, Color.WHITE);
+        hint = MaiChatTheme.label(this, "扫描对方的好友二维码", MaiChatTypographyTokens.Role.BODY, Color.WHITE);
         hint.setGravity(Gravity.CENTER);
         FrameLayout.LayoutParams hintParams = new FrameLayout.LayoutParams(-1, dp(58),
             Gravity.BOTTOM);
         hintParams.bottomMargin = dp(55);
         root.addView(hint, hintParams);
-        TextView close = MaiChatTheme.label(this, "关闭", 16, Color.WHITE);
+        TextView close = MaiChatTheme.label(this, "关闭", MaiChatTypographyTokens.Role.BODY, Color.WHITE);
         close.setGravity(Gravity.CENTER);
         close.setOnClickListener(view -> finish());
         FrameLayout.LayoutParams closeParams = new FrameLayout.LayoutParams(dp(70), dp(50),

@@ -165,7 +165,7 @@ void FilePreviewDialog::buildUi(const QString& displayName, const QString& conte
         markdownSource_ = content;
         markdownView_ = new MarkdownView(panel);
         markdownView_->setObjectName(QStringLiteral("filePreviewMarkdownView"));
-        markdownView_->setTheme(MarkdownTheme::standard(UiZoom::factor()));
+        markdownView_->setTheme(MarkdownTheme::standard(UiZoom::markdownScale(), UiZoom::fontFamilies().first()));
         markdownView_->setMaxContentWidth(UiZoom::s(920));
         markdownView_->addItem(QStringLiteral("document"), MarkdownView::Style::Document,
                                content);
@@ -234,7 +234,7 @@ void FilePreviewDialog::buildUi(const QString& displayName, const QString& conte
 
 // 作用：应用页面现有的颜色、字号、间距和控件外观。
 void FilePreviewDialog::applyStyle() {
-    setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         #filePreviewPanel {
             background: #ffffff;
             border-radius: 16px;
@@ -245,7 +245,7 @@ void FilePreviewDialog::applyStyle() {
         }
         #filePreviewTitle {
             color: #0f172a;
-            font-size: 17px;
+            font-size: @body;
             font-weight: 700;
         }
         /* HTML/Diff 正文字号由文档自身负责。 */
@@ -266,7 +266,7 @@ void FilePreviewDialog::applyStyle() {
             border: 1px solid #e6edf5;
             border-radius: 12px;
             color: #172033;
-            font-size: 12px;
+            font-size: @metadata;
         }
         #filePreviewFileList::item {
             padding: 3px 2px;
@@ -289,14 +289,14 @@ void FilePreviewDialog::applyStyle() {
             border: 0;
             border-radius: 10px;
             color: #ffffff;
-            font-size: 14px;
+            font-size: @detail;
             font-weight: 700;
             padding: 10px 22px;
         }
         #filePreviewClose:hover {
             background: #1e40af;
         }
-    )")));
+    )"));
 }
 
 // 作用：按预览内容的实际尺寸计算初始窗口大小。

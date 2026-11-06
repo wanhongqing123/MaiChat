@@ -10,21 +10,31 @@ $exe = Join-Path $AppDir 'maichat.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "Missing executable: $exe" }
 if (-not (Test-Path -LiteralPath $DumpbinPath)) { throw "Missing dumpbin: $DumpbinPath" }
 
-$output = & $DumpbinPath /dependents $exe
-if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed: $LASTEXITCODE" }
-$inImports = $false
-$imports = New-Object System.Collections.Generic.List[string]
-foreach ($line in $output) {
-    if ($line -match 'Image has the following dependencies:') {
-        $inImports = $true
-        continue
-    }
-    if ($inImports -and $line -match '^\s*Image has the following') { break }
-    if ($inImports -and $line -match '^\s*([A-Za-z0-9._-]+\.dll)\s*$') {
-        $imports.Add($Matches[1])
-    }
+# ORT is loaded dynamically and is absent from maichat.exe's PE import graph.
+# Validate its own direct/delay imports before shipping a package that can load Portrait.
+$binaries = @($exe)
+foreach ($runtimeName in 'onnxruntime.dll', 'onnxruntime_providers_shared.dll') {
+    $runtime = Join-Path $AppDir $runtimeName
+    if (Test-Path -LiteralPath $runtime -PathType Leaf) { $binaries += $runtime }
 }
-if ($imports.Count -eq 0) { throw "No PE imports found in $exe" }
+$imports = New-Object System.Collections.Generic.List[string]
+foreach ($binary in $binaries) {
+    $output = & $DumpbinPath /dependents $binary
+    if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed for ${binary}: $LASTEXITCODE" }
+    $inImports = $false
+    $binaryImportCount = 0
+    foreach ($line in $output) {
+        if ($line -match 'Image has the following (delay load )?dependencies:') {
+            $inImports = $true
+            continue
+        }
+        if ($inImports -and $line -match '^\s*([A-Za-z0-9._-]+\.dll)\s*$') {
+            $imports.Add($Matches[1])
+            $binaryImportCount++
+        }
+    }
+    if ($binaryImportCount -eq 0) { throw "No PE imports found in $binary" }
+}
 
 $missing = New-Object System.Collections.Generic.List[string]
 foreach ($name in ($imports | Select-Object -Unique)) {
@@ -44,4 +54,4 @@ foreach ($plugin in 'platforms\qwindows.dll', 'sqldrivers\qsqlite.dll') {
 if ($missing.Count -gt 0) {
     throw "Missing MaiChat runtime dependencies in ${AppDir}: $($missing -join ', ')"
 }
-Write-Host "MaiChat runtime verified: $($imports.Count) PE imports and Qt plugins"
+Write-Host "MaiChat runtime verified: $($binaries.Count) binaries, $($imports.Count) PE imports and Qt plugins"

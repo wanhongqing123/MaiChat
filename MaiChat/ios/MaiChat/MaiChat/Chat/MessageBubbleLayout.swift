@@ -629,16 +629,32 @@ struct ChatNavigationHost: UIViewControllerRepresentable {
     let detail: AnyView?
     let selectionID: String?
     let onPop: () -> Void
+    @Environment(\.appTextScale) private var textScale
+    @Environment(\.appFontFamily) private var fontFamily
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    // UIKit 建立的 HostingController 不会自动继承外层自定义环境。
+    // 每次更新传入相同环境，同时保留 controller 身份、导航和输入草稿。
+    private func styled(_ view: AnyView) -> AnyView {
+        AnyView(view.environment(\.appTextScale, textScale)
+            .environment(\.appFontFamily, fontFamily)
+            .environment(\.colorScheme, colorScheme)
+            .dynamicTypeSize(dynamicTypeSize)
+            .font(AppTypography.resolved(AppTypography.body, scale: textScale, family: fontFamily)))
+    }
 
     func makeUIViewController(context: Context) -> ChatNavigationController {
         let controller = ChatNavigationController()
-        controller.update(root: root, detail: detail, selectionID: selectionID, onPop: onPop,
+        controller.overrideUserInterfaceStyle = colorScheme == .dark ? .dark : .light
+        controller.update(root: styled(root), detail: detail.map(styled), selectionID: selectionID, onPop: onPop,
                           animated: false)
         return controller
     }
 
     func updateUIViewController(_ controller: ChatNavigationController, context: Context) {
-        controller.update(root: root, detail: detail, selectionID: selectionID, onPop: onPop)
+        controller.overrideUserInterfaceStyle = colorScheme == .dark ? .dark : .light
+        controller.update(root: styled(root), detail: detail.map(styled), selectionID: selectionID, onPop: onPop)
     }
 }
 

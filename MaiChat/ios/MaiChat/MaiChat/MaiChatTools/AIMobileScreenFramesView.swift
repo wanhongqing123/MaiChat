@@ -40,10 +40,10 @@ struct AIMobileScreenFramesView: View {
                 VStack(spacing: 0) {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(isRecording ? "每 2 秒截取一张，停止后选择" : "本次截取 \(frames.count) 张，选择需要的图片")
-                            .font(.headline)
+                            .font(AppTypography.heading)
                             .accessibilityIdentifier("ai-screen-frames-summary")
                         Text("只将选中的图片加入原会话草稿，不会自动发送。还可添加 \(capacity) 张。")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(AppTypography.detail).foregroundStyle(.secondary)
                         if batches.count > 1 {
                             Menu {
                                 ForEach(batches) { saved in
@@ -51,20 +51,20 @@ struct AIMobileScreenFramesView: View {
                                 }
                             } label: {
                                 Label("\(batch.map(Self.batchTime) ?? "本次截图") · 切换批次", systemImage: "clock")
-                                    .font(.footnote)
+                                    .font(AppTypography.detail)
                             }
                             .accessibilityIdentifier("ai-screen-frames-batches")
                         }
                         if let reason = batch?.finishReason, let message = finishMessage(reason) {
-                            Text(message).font(.footnote).foregroundStyle(.secondary)
+                            Text(message).font(AppTypography.detail).foregroundStyle(.secondary)
                         }
                         if !archiveWarning.isEmpty {
-                            Text(archiveWarning).font(.footnote).foregroundStyle(.secondary)
+                            Text(archiveWarning).font(AppTypography.detail).foregroundStyle(.secondary)
                                 .accessibilityIdentifier("ai-screen-frames-archive-warning")
                         }
                         if !error.isEmpty {
                             HStack(alignment: .top) {
-                                Text(error).font(.footnote).foregroundStyle(.red)
+                                Text(error).font(AppTypography.detail).foregroundStyle(.red)
                                 Spacer(minLength: 4)
                                 Button("重试") { revision += 1 }
                             }
@@ -77,12 +77,12 @@ struct AIMobileScreenFramesView: View {
                         ProgressView("正在读取截图…").frame(maxWidth: .infinity, minHeight: 200)
                     } else if frames.isEmpty {
                         VStack(spacing: 12) {
-                            Image(systemName: "photo.on.rectangle.angled").font(.largeTitle)
+                            Image(systemName: "photo.on.rectangle.angled").font(AppTypography.hero)
                                 .foregroundStyle(RemoteIMStyle.blue)
-                            Text(isRecording ? "尚未截取画面" : "本次没有截取到图片").font(.headline)
+                            Text(isRecording ? "尚未截取画面" : "本次没有截取到图片").font(AppTypography.heading)
                             Text(isRecording ? "每 2 秒保存可用的新画面。" :
                                 (kind == .camera ? "可以关闭此页后重新开启相机。" : "可以关闭此页后重新开启屏幕共享。"))
-                                .font(.footnote).foregroundStyle(.secondary)
+                                .font(AppTypography.detail).foregroundStyle(.secondary)
                             Button("刷新") { revision += 1 }
                         }
                         .padding().frame(maxWidth: .infinity, minHeight: 240)
@@ -99,14 +99,14 @@ struct AIMobileScreenFramesView: View {
             .accessibilityIdentifier("ai-screen-frames-grid")
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 HStack {
-                    Text("已选 \(selected.count) 张").font(.footnote)
+                    Text("已选 \(selected.count) 张").font(AppTypography.detail)
                         .accessibilityIdentifier("ai-screen-frames-selection-count")
                     Spacer()
                     Button {
                         Task { await addSelected() }
                     } label: {
                         if importing { ProgressView().tint(.white) }
-                        else { Text("加入原会话草稿").font(.body.weight(.semibold)) }
+                        else { Text("加入原会话草稿").font(AppTypography.body.weight(.semibold)) }
                     }
                     .buttonStyle(.borderedProminent).tint(RemoteIMStyle.blue)
                     .disabled(selected.isEmpty || selected.count > capacity || importing || isRecording)
@@ -116,7 +116,7 @@ struct AIMobileScreenFramesView: View {
                 .remoteIMBarBackground(edges: .bottom)
                 .overlay(alignment: .top) { RemoteIMBarSeparator() }
             }
-            .navigationTitle(kind == .camera ? "相机图片" : "屏幕截图").navigationBarTitleDisplayMode(.inline)
+            .appNavigationTitle(kind == .camera ? "相机图片" : "屏幕截图").navigationBarTitleDisplayMode(.inline)
             .remoteIMNavigationBarMaterial()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -162,7 +162,7 @@ struct AIMobileScreenFramesView: View {
                 .accessibilityIdentifier("ai-screen-frame-preview-\(index)")
                 Button { toggle(frame.id) } label: {
                     Image(systemName: selected.contains(frame.id) ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 25, weight: .semibold))
+                        .font(AppTypography.symbol(size: 25, weight: .semibold))
                         .foregroundStyle(selected.contains(frame.id) ? RemoteIMStyle.blue : Color.primary)
                         .padding(9).background(.regularMaterial, in: Circle()).padding(5)
                 }
@@ -175,7 +175,7 @@ struct AIMobileScreenFramesView: View {
                 Text("第 \(index + 1) 张")
                 Spacer()
                 Text(Self.frameTime(frame)).monospacedDigit()
-            }.font(.caption).foregroundStyle(.secondary)
+            }.font(AppTypography.metadata).foregroundStyle(.secondary)
         }
     }
 
@@ -294,10 +294,10 @@ private struct AIMobileScreenArchiveThumbnail: View {
                     revision: UInt64(revision)) { image in
                     Image(uiImage: image).resizable().scaledToFit()
                 } placeholder: { error in
-                    if error { Text("图片不可用").font(.footnote).onAppear(perform: failed) }
+                    if error { Text("图片不可用").font(AppTypography.detail).onAppear(perform: failed) }
                     else { ProgressView() }
                 }
-            } else if unavailable { Text("图片不可用").font(.footnote) }
+            } else if unavailable { Text("图片不可用").font(AppTypography.detail) }
             else { ProgressView() }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -334,7 +334,7 @@ private struct AIMobileScreenArchiveLargeImage: View {
                     }.frame(width: viewport.size.width, height: viewport.size.height)
                 }.ignoresSafeArea()
                 Button(action: close) {
-                    Image(systemName: "xmark").font(.headline).padding(15)
+                    Image(systemName: "xmark").font(AppTypography.heading).padding(15)
                         .background(.ultraThinMaterial, in: Circle())
                 }
                 .padding(16).accessibilityLabel("关闭大图")

@@ -45,7 +45,7 @@ public final class SwipeActionRow extends FrameLayout {
             ViewConfiguration.get(context).getScaledTouchSlop() * 3,
             MaiChatTheme.dp(context, 24)
         );
-        action = MaiChatTheme.label(context, actionTitle, 14, android.graphics.Color.WHITE);
+        action = MaiChatTheme.label(context, actionTitle, MaiChatTypographyTokens.Role.DETAIL, android.graphics.Color.WHITE);
         action.setGravity(android.view.Gravity.CENTER);
         action.setBackgroundColor(actionColor);
         action.setOnClickListener(view -> {

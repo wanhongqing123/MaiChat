@@ -90,7 +90,7 @@ public final class MaiIMAttachmentPanel extends LinearLayout {
         icon.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
         iconBox.addView(icon, new FrameLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
         tile.addView(iconBox, new LayoutParams(dp(36), dp(36)));
-        TextView label = MaiChatTheme.text(getContext(), title(action), 12, MaiChatTheme.SECONDARY);
+        TextView label = MaiChatTheme.text(getContext(), title(action), MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
         label.setGravity(Gravity.CENTER);
         label.setSingleLine(true);
         label.setEllipsize(TextUtils.TruncateAt.END);

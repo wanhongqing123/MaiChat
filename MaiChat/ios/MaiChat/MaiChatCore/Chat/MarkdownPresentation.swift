@@ -3,6 +3,38 @@
 // 附件标题和代码内容保持原意，不把文件名误当格式语法。
 import Foundation
 
+/// 在解析器给出的行内 HTML 节点中呈现换行，不改写 Markdown 原文或代码字面量。
+public enum MarkdownInlinePresentation {
+    private static let lineBreak = try! NSRegularExpression(
+        pattern: "\\A<br[ \\t]*/?>\\z", options: .caseInsensitive)
+
+    public static func parse(_ markdown: String) -> AttributedString {
+        // 源码位置让相邻 HTML 标签保持独立 run，避免把注释或属性里的 <br> 当作换行。
+        let parsed = (try? AttributedString(markdown: markdown, options: .init(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace,
+            appliesSourcePositionAttributes: true))) ?? AttributedString(markdown)
+        return renderingLineBreaks(in: parsed)
+    }
+
+    static func renderingLineBreaks(in source: AttributedString) -> AttributedString {
+        var result = source
+        let ranges = result.runs.compactMap { run -> Range<AttributedString.Index>? in
+            guard run.inlinePresentationIntent?.contains(.inlineHTML) == true else { return nil }
+            let text = String(result[run.range].characters)
+            return lineBreak.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+                ? run.range : nil
+        }
+        // 从后向前替换，保持尚未处理的字符区间有效；粗体和链接等外层属性继续保留。
+        for range in ranges.reversed() {
+            var replacement = AttributedString("\n", attributes: result[range].runs.first!.attributes)
+            replacement.inlinePresentationIntent?.remove(.inlineHTML)
+            result.replaceSubrange(range, with: replacement)
+        }
+        result.markdownSourcePosition = nil
+        return result
+    }
+}
+
 private final class ConversationPreviewCache: @unchecked Sendable {
     let values = NSCache<NSString, NSString>()
     init() {
@@ -32,7 +64,9 @@ public enum MarkdownConversationPreview {
         let key = input as NSString
         if let cached = cache.values.object(forKey: key) { return cached as String }
         var blocks: [String] = []
-        if let parsed = try? AttributedString(markdown: input) {
+        if let document = try? AttributedString(markdown: input, options: .init(
+            appliesSourcePositionAttributes: true)) {
+            let parsed = MarkdownInlinePresentation.renderingLineBreaks(in: document)
             var blockID: Int?
             var text = ""
             var quote = false

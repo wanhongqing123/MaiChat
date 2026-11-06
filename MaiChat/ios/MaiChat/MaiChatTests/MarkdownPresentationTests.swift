@@ -2,6 +2,7 @@
 // 验证 Markdown 展示、代码块、附件标题和文本选择。
 // 覆盖消息渲染在不同内容结构下的可读性。
 import XCTest
+import CoreText
 import Combine
 import SwiftUI
 import UIKit
@@ -11,6 +12,12 @@ import UniformTypeIdentifiers
 final class MarkdownPresentationTests: XCTestCase {
     @MainActor
     func testBundledCodeFaceUsesCompatibleLatinCjkAndBoxWidths() throws {
+        // This standalone unit-test bundle has no UIApplication/UIAppFonts
+        // launch phase. Register its packaged copy before checking real advances.
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "SarasaFixedSC-Regular", withExtension: "ttf"))
+        if UIFont(name: "Sarasa-Fixed-SC-Regular", size: 20) == nil {
+            XCTAssertTrue(CTFontManagerRegisterFontsForURL(file as CFURL, .process, nil))
+        }
         let face = try XCTUnwrap(UIFont(name: "Sarasa-Fixed-SC-Regular", size: 20))
         let width: (String) -> CGFloat = { text in
             (text as NSString).size(withAttributes: [.font: face]).width
@@ -22,6 +29,19 @@ final class MarkdownPresentationTests: XCTestCase {
         }
         XCTAssertEqual(width("中"), cell * 2, accuracy: 0.25)
         XCTAssertEqual(width("路径"), cell * 4, accuracy: 0.25)
+    }
+
+    func testInlineHtmlBreaksKeepMarkupLiteralsAndStyles() {
+        let source = "**Expected**:<br>320x180<br><br>details<br/>next<br />last<BR>end"
+        let parsed = MarkdownInlinePresentation.parse(source)
+        XCTAssertEqual(String(parsed.characters), "Expected:\n320x180\n\ndetails\nnext\nlast\nend")
+        XCTAssertTrue(parsed.runs.first?.inlinePresentationIntent?.contains(.stronglyEmphasized) == true)
+        let literals = "`<br>` \\<br> &lt;br&gt; <!-- <br> --> <span title=\"<br>\">x</span>"
+        XCTAssertEqual(String(MarkdownInlinePresentation.parse(literals).characters),
+                       "<br> <br> <br> <!-- <br> --> <span title=\"<br>\">x</span>")
+        XCTAssertEqual(String(MarkdownInlinePresentation.parse("a<br><em>b</em>").characters),
+                       "a\n<em>b</em>")
+        XCTAssertEqual(String(MarkdownInlinePresentation.parse("**a<br>b**").characters), "a\nb")
     }
 
     func testScreenshotRecencyRejectsOldOrMissingPhotoAssets() {

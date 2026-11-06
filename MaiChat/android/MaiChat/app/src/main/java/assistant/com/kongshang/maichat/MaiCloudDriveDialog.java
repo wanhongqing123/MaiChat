@@ -142,7 +142,7 @@ final class MaiCloudDriveDialog {
         list.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(list);
         list.addView(quotaCard(), row());
-        status = label("", 13, MaiChatTheme.SECONDARY);
+        status = label("", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         status.setContentDescription("云盘状态");
         status.setPadding(dp(12), dp(10), dp(12), dp(10));
         status.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE_SOFT, 12, activity));
@@ -188,8 +188,8 @@ final class MaiCloudDriveDialog {
 
     private View navigationBar() {
         FrameLayout bar = new FrameLayout(activity);
-        bar.setBackgroundColor(Color.WHITE);
-        TextView title = label("我的云盘", 17, MaiChatTheme.TEXT);
+        bar.setBackgroundColor(MaiChatTheme.PANEL);
+        TextView title = label("我的云盘", MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT);
         title.setTypeface(MaiChatTypography.semibold());
         title.setGravity(Gravity.CENTER);
         FrameLayout.LayoutParams titleParams = new FrameLayout.LayoutParams(-1, -1);
@@ -222,12 +222,12 @@ final class MaiCloudDriveDialog {
         heading.setGravity(Gravity.CENTER_VERTICAL);
         heading.addView(new CloudIconView(CloudIconView.CLOUD, MaiChatTheme.TEXT),
             new LinearLayout.LayoutParams(dp(23), dp(23)));
-        TextView title = label("云盘空间", 17, MaiChatTheme.TEXT);
+        TextView title = label("云盘空间", MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT);
         title.setTypeface(MaiChatTypography.semibold());
         LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(0, -2, 1);
         titleParams.leftMargin = dp(9);
         heading.addView(title, titleParams);
-        quota = label("", 14, MaiChatTheme.SECONDARY);
+        quota = label("", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         quota.setGravity(Gravity.END);
         heading.addView(quota, new LinearLayout.LayoutParams(-2, -2));
         card.addView(heading, new LinearLayout.LayoutParams(-1, -2));
@@ -239,7 +239,7 @@ final class MaiCloudDriveDialog {
         meterParams.topMargin = dp(14);
         meterParams.bottomMargin = dp(13);
         card.addView(quotaProgress, meterParams);
-        quotaNote = label("仅自己可见 · 视频 2 GB / 图片 20 MB", 13, MaiChatTheme.SECONDARY);
+        quotaNote = label("仅自己可见 · 视频 2 GB / 图片 20 MB", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         card.addView(quotaNote, new LinearLayout.LayoutParams(-1, -2));
         return card;
     }
@@ -467,7 +467,7 @@ final class MaiCloudDriveDialog {
         icon.addView(new CloudIconView(CloudIconView.FOLDER, MaiChatTheme.BLUE),
             new FrameLayout.LayoutParams(-1, -1));
         card.addView(icon, new LinearLayout.LayoutParams(dp(56), dp(56)));
-        TextView title = label(name, 16, MaiChatTheme.TEXT);
+        TextView title = label(name, MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT);
         title.setTypeface(MaiChatTypography.semibold());
         title.setMaxLines(2);
         title.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -528,7 +528,7 @@ final class MaiCloudDriveDialog {
 
     private void promptName(String title, String initial, Consumer<String> submit) {
         if (!canEdit()) return;
-        EditText input = new EditText(activity);
+        EditText input = MaiChatTypography.input(activity);
         input.setText(initial);
         input.setSingleLine(true);
         input.setSelectAllOnFocus(true);
@@ -607,9 +607,8 @@ final class MaiCloudDriveDialog {
         File checkpoint = new File(item.optString("checkpoint_path", ""));
         String sourceId = item.optString("source_id", "");
         LinearLayout card = card();
-        card.addView(label(name, 15, MaiChatTheme.TEXT), row());
-        card.addView(label(sizeText(item.optLong("size_bytes")) + " · 上传尚未完成",
-            12, MaiChatTheme.SECONDARY), row());
+        card.addView(label(name, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.TEXT), row());
+        card.addView(label(sizeText(item.optLong("size_bytes")) + " · 上传尚未完成", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY), row());
         LinearLayout actions = new LinearLayout(activity);
         card.addView(actions, row());
         Button resume = button("继续上传", () -> {
@@ -703,14 +702,14 @@ final class MaiCloudDriveDialog {
         if (!directory.currentId().isEmpty()) {
             LinearLayout path = new LinearLayout(activity);
             path.setGravity(Gravity.CENTER_VERTICAL);
-            TextView root = label("我的云盘", 14, MaiChatTheme.BLUE);
+            TextView root = label("我的云盘", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.BLUE);
             root.setPadding(0, dp(10), dp(8), dp(10));
             root.setContentDescription("返回云盘根目录");
             root.setOnClickListener(ignored -> browse(""));
             path.addView(root, new LinearLayout.LayoutParams(-2, dp(44)));
             path.addView(new CloudIconView(CloudIconView.CHEVRON, MaiChatTheme.SECONDARY),
                 new LinearLayout.LayoutParams(dp(18), dp(24)));
-            TextView current = label(directory.currentName(), 14, MaiChatTheme.TEXT);
+            TextView current = label(directory.currentName(), MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.TEXT);
             current.setSingleLine(true);
             current.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
             LinearLayout.LayoutParams currentParams = new LinearLayout.LayoutParams(0, -2, 1);
@@ -769,12 +768,12 @@ final class MaiCloudDriveDialog {
         LinearLayout.LayoutParams detailParams = new LinearLayout.LayoutParams(0, -2, 1);
         detailParams.leftMargin = dp(12);
         card.addView(details, detailParams);
-        TextView filename = label(name, 15, MaiChatTheme.TEXT);
+        TextView filename = label(name, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.TEXT);
         filename.setTypeface(MaiChatTypography.semibold());
         filename.setSingleLine(true);
         filename.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
         details.addView(filename, new LinearLayout.LayoutParams(-1, -2));
-        TextView size = label(sizeText(bytes), 12, Color.rgb(142, 142, 147));
+        TextView size = label(sizeText(bytes), MaiChatTypographyTokens.Role.METADATA, Color.rgb(142, 142, 147));
         LinearLayout.LayoutParams sizeParams = new LinearLayout.LayoutParams(-1, -2);
         sizeParams.topMargin = dp(5);
         details.addView(size, sizeParams);
@@ -1053,21 +1052,21 @@ final class MaiCloudDriveDialog {
     }
 
     private TextView sectionTitle(String text) {
-        TextView heading = label(text, 16, MaiChatTheme.TEXT);
+        TextView heading = label(text, MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT);
         heading.setTypeface(MaiChatTypography.semibold());
         heading.setPadding(0, dp(16), 0, dp(10));
         return heading;
     }
 
-    private TextView label(String text, int sp, int color) {
-        return MaiChatTheme.text(activity, text, sp, color);
+    private TextView label(String text, MaiChatTypographyTokens.Role role, int color) {
+        return MaiChatTheme.text(activity, text, role, color);
     }
 
     private Button button(String title, Runnable action) {
-        Button button = new Button(activity);
+        Button button = MaiChatTypography.button(activity);
         button.setText(title);
         button.setAllCaps(false);
-        button.setTextSize(14);
+        MaiChatTypography.apply(button, MaiChatTypographyTokens.Role.DETAIL);
         button.setMinHeight(0);
         button.setMinimumHeight(0);
         button.setElevation(0);

@@ -5,6 +5,51 @@ import XCTest
 import UIKit
 
 final class AIAssistantUITests: XCTestCase {
+    @MainActor func testToolRunsStayBetweenTheirOwnTextDuringStreaming() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--my-settings-ui-test", "--tool-order-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["创作中心"].waitForExistence(timeout: 15))
+        app.buttons["创作中心"].tap()
+        let first = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "file_read ×1")).firstMatch
+        let intro = app.staticTexts["先检查文件，再执行处理。"]
+        let answerA = app.staticTexts["A 段说明：文件检查已经完成。"]
+        XCTAssertTrue(first.waitForExistence(timeout: 10))
+        let before = XCTAttachment(screenshot: app.screenshot())
+        before.name = "tool-order-initial"; before.lifetime = .keepAlways; add(before)
+        XCTAssertLessThan(intro.frame.maxY, first.frame.minY)
+        XCTAssertLessThan(first.frame.maxY, answerA.frame.minY)
+        first.tap()
+        XCTAssertTrue(app.staticTexts["A1 执行结果"].exists)
+        app.buttons["tool-order-advance"].tap()
+        let second = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "工具调用 1 次，运行中")).firstMatch
+        XCTAssertTrue(second.waitForExistence(timeout: 5))
+        XCTAssertTrue(first.label.contains("工具调用 2 次"))
+        XCTAssertLessThan(answerA.frame.maxY, second.frame.minY)
+        XCTAssertTrue(app.staticTexts["A1 执行结果"].exists, "新增工具不能关闭原组")
+        let streaming = XCTAttachment(screenshot: app.screenshot())
+        streaming.name = "tool-order-next-run-streaming"; streaming.lifetime = .keepAlways; add(streaming)
+        app.buttons["tool-order-advance"].tap()
+        let answerB = app.staticTexts["B 段说明：处理结果已经核对。"]
+        let third = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "file_write ×1")).firstMatch
+        let completedSecond = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "工具调用 1 次，已完成")).firstMatch
+        XCTAssertTrue(third.waitForExistence(timeout: 5))
+        XCTAssertLessThan(completedSecond.frame.maxY, answerB.frame.minY)
+        XCTAssertLessThan(answerB.frame.maxY, third.frame.minY)
+        XCTAssertLessThan(third.frame.maxY, app.staticTexts["C 段说明：全部完成。"].frame.minY)
+        XCTAssertTrue(app.staticTexts["A1 执行结果"].exists)
+        completedSecond.tap()
+        XCTAssertTrue(app.staticTexts["B1 执行结果"].exists)
+        first.tap()
+        XCTAssertFalse(app.staticTexts["A1 执行结果"].exists)
+        XCTAssertTrue(app.staticTexts["B1 执行结果"].exists, "折叠第一组不能折叠第二组")
+        let complete = XCTAttachment(screenshot: app.screenshot())
+        complete.name = "tool-order-complete-independent-groups"; complete.lifetime = .keepAlways; add(complete)
+    }
+
     @MainActor private func launchSteeringFixture(archive: Bool = false, acknowledgementDelay: Int? = nil,
                                                  holdsFirstAcknowledgement: Bool = false) -> XCUIApplication {
         continueAfterFailure = false
@@ -2077,6 +2122,59 @@ final class AIAssistantUITests: XCTestCase {
         #endif
     }
 
+    @MainActor func testRemoteInputsPipelineWhileOwnerBusyAndReceiptHeld() async throws {
+        let base = "http://127.0.0.1:18190"
+        guard let probe = try? await URLSession.shared.data(from: URL(string: base + "/test/status")!),
+              (probe.1 as? HTTPURLResponse)?.statusCode == 200 else { throw XCTSkip("需要本地同步测试服务") }
+        _ = try await URLSession.shared.data(from: URL(string: base + "/test/mac-input-control?hold=1&busy=1")!)
+        let (certificate, _) = try await URLSession.shared.data(from: URL(string: base + "/test/cert")!)
+        let app = XCUIApplication()
+        app.launchEnvironment["MAICHAT_LOCAL_UI_PHONE"] = "sync-ui-test"
+        app.launchEnvironment["MAICHAT_LOCAL_UI_PASSWORD"] = "local sync UI test passphrase"
+        app.launchEnvironment["MAICHAT_LOCAL_UI_AUTH_PORT"] = "18190"
+        app.launchEnvironment["MAICHAT_LOCAL_UI_CA_BASE64"] = certificate.base64EncodedString()
+        app.launch()
+        guard app.buttons["创作中心"].waitForExistence(timeout: 30) else { XCTFail("测试账号未进入主界面"); return }
+        let loaded = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !app.staticTexts["正在加载"].exists && app.buttons["创作中心"].isHittable
+        }, object: nil)
+        guard await XCTWaiter.fulfillment(of: [loaded], timeout: 20) == .completed else {
+            XCTFail("主界面仍被加载遮罩覆盖"); return
+        }
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.93)).tap()
+        guard app.buttons["对话列表"].waitForExistence(timeout: 20) else {
+            XCTFail("未进入创作中心"); return
+        }
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.5))
+            .press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.72, dy: 0.5)))
+        let remote = app.buttons["ai-remote-conversation-mac:localmacfixture:ses_mock_mac"]
+        guard remote.waitForExistence(timeout: 30) else { XCTFail("测试 Mac 会话未同步"); return }
+        remote.tap()
+        let composer = app.textViews["ai-composer"]
+        guard composer.waitForExistence(timeout: 20) else { XCTFail("未找到远端输入框"); return }
+        let texts = ["queue-pipeline-A", "queue-pipeline-B", "queue-pipeline-A"]
+        for text in texts { composer.tap(); composer.typeText(text + "\n") }
+        var received: [[String: Any]] = []
+        for _ in 0..<40 {
+            let (data, _) = try await URLSession.shared.data(from: URL(string: base + "/test/status")!)
+            let status = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            received = (status["receivedInputs"] as? [[String: Any]] ?? [])
+                .filter { ($0["text"] as? String)?.hasPrefix("queue-pipeline-") == true }
+            if received.count >= 3 { break }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        XCTAssertEqual(received.map { $0["text"] as? String }, texts)
+        XCTAssertEqual(Set(received.compactMap { $0["request_id"] as? String }).count, 3)
+        XCTAssertTrue(received.allSatisfy { $0["has_turn_id"] as? Bool == false })
+        let before = XCTAttachment(screenshot: app.screenshot()); before.name = "remote-three-inputs-before-owner-receipts"
+        before.lifetime = .keepAlways; add(before)
+        _ = try await URLSession.shared.data(from: URL(string: base + "/test/mac-input-control?hold=0&busy=0")!)
+        try await Task.sleep(for: .seconds(2))
+        let after = XCTAttachment(screenshot: app.screenshot()); after.name = "remote-three-inputs-owner-confirmed"
+        after.lifetime = .keepAlways; add(after)
+        XCTAssertFalse(app.staticTexts["所属设备需更新后才能接收补充"].exists)
+    }
+
     @MainActor func testNormalAppReadsAndControlsLocalFakeMacSession() async throws {
         let fixture = URL(string: "http://127.0.0.1:18190/v1/session-sync/sessions")!
         let probe = try? await URLSession.shared.data(from: fixture)
@@ -2923,8 +3021,11 @@ final class AIAssistantUITests: XCTestCase {
 
         XCTAssertFalse(app.buttons["返回主页面"].exists)
         app.buttons["我的"].tap()
-        app.buttons["设置"].tap()
-        app.buttons["切换账号"].tap()
+        let logout = app.buttons["my-logout"]
+        for _ in 0..<4 where !logout.isHittable { app.swipeUp() }
+        logout.tap()
+        XCTAssertTrue(app.buttons["my-logout-confirm"].waitForExistence(timeout: 5))
+        app.buttons["my-logout-confirm"].tap()
         XCTAssertTrue(accountField.waitForExistence(timeout: 15))
     }
 

@@ -17,6 +17,8 @@
 #include <QVBoxLayout>
 #include <QWidgetAction>
 
+#include "ui/UiZoom.h"
+
 class MaiVideoVolumePopup final : public QMenu {
 public:
     explicit MaiVideoVolumePopup(QToolButton* anchor) : QMenu(anchor), anchor_(anchor) {
@@ -39,10 +41,13 @@ public:
         readout_->setFixedSize(40, 22);
         readout_->setCheckable(true);
         readout_->setCursor(Qt::PointingHandCursor);
-        readout_->setStyleSheet(QStringLiteral(
-            "QToolButton {color:#f4f4f4;background:transparent;border:0;border-radius:4px;font-size:11px;padding:0;}"
-            "QToolButton:hover {background:rgba(255,255,255,22);}"
-            "QToolButton:checked {color:#bbbbbb;}"));
+        UiZoom::setStyle(
+            readout_,
+            QStringLiteral(
+                "QToolButton "
+                "{color:#f4f4f4;background:transparent;border:0;border-radius:4px;font-size:@metadata;padding:0;}"
+                "QToolButton:hover {background:rgba(255,255,255,22);}"
+                "QToolButton:checked {color:#bbbbbb;}"));
         slider_ = new QSlider(Qt::Vertical, content);
         slider_->setObjectName(QStringLiteral("ffplayVolumeSlider"));
         slider_->setAccessibleName(QStringLiteral("音量"));
@@ -71,17 +76,21 @@ public:
         refreshReadout();
     }
 
-    QSlider* slider() const { return slider_; }
-    QAction* muteAction() const { return mute_; }
+    QSlider* slider() const {
+        return slider_;
+    }
+    QAction* muteAction() const {
+        return mute_;
+    }
 
     void refreshReadout() {
         readout_->setText(QString::number(slider_->value()) + QLatin1Char('%'));
         const QSignalBlocker blocker(readout_);
         readout_->setChecked(mute_->isChecked());
         const QString description = QStringLiteral("音量 %1%；%2，点击%3 (M)")
-            .arg(slider_->value())
-            .arg(mute_->isChecked() ? QStringLiteral("已静音") : QStringLiteral("有声"))
-            .arg(mute_->isChecked() ? QStringLiteral("取消静音") : QStringLiteral("静音"));
+                                        .arg(slider_->value())
+                                        .arg(mute_->isChecked() ? QStringLiteral("已静音") : QStringLiteral("有声"))
+                                        .arg(mute_->isChecked() ? QStringLiteral("取消静音") : QStringLiteral("静音"));
         readout_->setAccessibleName(description);
         readout_->setToolTip(description);
     }
@@ -108,11 +117,10 @@ protected:
             event->accept();
             return;
         }
-        if (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down ||
-            event->key() == Qt::Key_PageUp || event->key() == Qt::Key_PageDown ||
-            event->key() == Qt::Key_Home || event->key() == Qt::Key_End) {
-            QKeyEvent forwarded(event->type(), event->key(), event->modifiers(), event->text(),
-                                event->isAutoRepeat(), event->count());
+        if (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down || event->key() == Qt::Key_PageUp ||
+            event->key() == Qt::Key_PageDown || event->key() == Qt::Key_Home || event->key() == Qt::Key_End) {
+            QKeyEvent forwarded(event->type(), event->key(), event->modifiers(), event->text(), event->isAutoRepeat(),
+                                event->count());
             QCoreApplication::sendEvent(slider_, &forwarded);
             event->accept();
             return;
@@ -128,8 +136,10 @@ protected:
                 positionAboveAnchor();
             else if (event->type() == QEvent::WindowStateChange) {
                 auto* widget = qobject_cast<QWidget*>(watched);
-                if (widget && widget->isMinimized()) hide();
-                else positionAboveAnchor();
+                if (widget && widget->isMinimized())
+                    hide();
+                else
+                    positionAboveAnchor();
             }
         }
         return QMenu::eventFilter(watched, event);

@@ -1,6 +1,7 @@
 package com.kongshang.maichat.tools;
 
 import android.app.Activity;
+import com.kongshang.maichat.MaiChatTheme;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -272,16 +273,16 @@ public final class MobileBrowserTools {
     private void createPage() {
         pane = new LinearLayout(activity);
         pane.setOrientation(LinearLayout.VERTICAL);
-        pane.setBackgroundColor(Color.WHITE);
+        pane.setBackgroundColor(MaiChatTheme.PANEL);
         LinearLayout bar = new LinearLayout(activity);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setPadding(dp(12), dp(5), dp(10), dp(5));
-        heading = new TextView(activity);
+        heading = com.kongshang.maichat.MaiChatTypography.text(activity);
         heading.setText(allowedHost);
         heading.setTextColor(Color.rgb(30, 41, 59));
         heading.setSingleLine(true);
         bar.addView(heading, new LinearLayout.LayoutParams(0, dp(38), 1));
-        Button closeButton = new Button(activity);
+        Button closeButton = com.kongshang.maichat.MaiChatTypography.button(activity);
         closeButton.setText("关闭网页");
         closeButton.setOnClickListener(view -> close());
         bar.addView(closeButton, new LinearLayout.LayoutParams(dp(92), dp(38)));

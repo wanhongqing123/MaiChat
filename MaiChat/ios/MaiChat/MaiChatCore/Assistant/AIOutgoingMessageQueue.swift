@@ -16,7 +16,7 @@ public struct AIOutgoingMessageQueueOwner: Codable, Hashable, Sendable {
 }
 
 public struct AIOutgoingMessageQueueBinding: Codable, Equatable, Sendable {
-    public enum Mode: String, Codable, Sendable { case send, steer, answer }
+    public enum Mode: String, Codable, Sendable { case send, steer, enqueue, answer }
     public let mode: Mode
     public let turnID: String
     /// 回答只能投递到点击时捕获的问题；取消或超时后不得退化成新的普通消息。
@@ -33,7 +33,7 @@ public struct AIOutgoingMessageQueueBinding: Codable, Equatable, Sendable {
 }
 
 public enum AIOutgoingMessageQueueState: String, Codable, Sendable {
-    case queued, dispatching, unknown, accepted, failed
+    case queued, dispatching, forwarded, unknown, accepted, failed
 }
 
 public struct AIOutgoingMessageQueueEntry: Codable, Equatable, Identifiable, Sendable {
@@ -56,12 +56,14 @@ public enum AIOutgoingMessageQueueChange: Sendable {
     /// 附件上传产生的稳定引用在首次派发前写入；未知或已派发的 payload 永不改变。
     case updatePayload(Data)
     case dispatch(AIOutgoingMessageQueueBinding)
+    /// 转发服务已收到，所属端的持久接收回执仍可稍后到达；不阻挡下一条远端输入。
+    case forwarded
     case accepted(messageID: String)
     case unknown
     case failed
     /// 只供明确的未接受响应使用，例如 Busy/NotFound；网络失败或缺失收据不能走这里。
     case requeueRejected
-    /// unknown 只允许同 epoch 的 steer 原绑定重试；failed 可重试原绑定，不自动改发 send。
+    /// enqueue 可在新 epoch 下复用持久请求编号重试；旧 unknown 仅能按同 epoch 的 steer 原绑定重试。
     case retry
 }
 
@@ -71,11 +73,11 @@ public enum AIOutgoingMessageQueueError: Error, Equatable, Sendable {
     case permanentlyInvalidated
 }
 
-/// 每个账号工作区 URL 只创建一个实例，由同一个宿主泵负责调用现有 send/steer。
+/// 每个账号工作区 URL 只创建一个实例，由同一个宿主泵负责调用现有 send/steer 和所属端 enqueue。
 /// 初始化不做 I/O；异步 actor 方法隔离文件操作，不在 MainActor 同步读写。
 /// enqueue/transition 先原子写盘再发布内存结果，失败时调用者必须保留草稿和附件持有引用。
-/// queued 尚未选定 send/steer；dispatch 必须先落盘，然后宿主才能调用 native。
-/// head 跳过已接受条目，unknown/failed 仍挡住本会话后续消息；其他 owner 各自推进。
+/// queued 尚未选定投递方式；dispatch 必须先落盘，然后宿主才能调用 native。
+/// enqueue 的 forwarded/unknown/failed 不挡住后续消息；旧 send/steer 仍保留原绑定保护。
 /// load 首次恢复时把 dispatching 保存为 unknown，绝不自动重放普通 send。
 /// accepted 仅表示 native 已返回落库消息 ID；宿主合并历史后才能 removeAccepted 并释放媒体。
 /// 本类不承诺跨 native Agent 生命周期的 exactly-once；普通 send 本身没有幂等请求 ID。
@@ -186,10 +188,13 @@ public actor AIOutgoingMessageQueue {
         return ordered(document.entries.filter { $0.owner == owner })
     }
 
-    public func head(for owner: AIOutgoingMessageQueueOwner) throws
+    public func head(for owner: AIOutgoingMessageQueueOwner, forwarding: Bool = false) throws
         -> AIOutgoingMessageQueueEntry?
     {
-        try entries(for: owner).first { $0.state != .accepted }
+        try entries(for: owner).first {
+            if $0.state == .accepted || $0.state == .forwarded { return false }
+            return !((forwarding || $0.binding?.mode == .enqueue) && [.unknown, .failed].contains($0.state))
+        }
     }
 
     /// revision 是一次宿主派发的 CAS 凭据；旧回调不能覆盖随后重试、迁移或恢复的状态。
@@ -219,15 +224,20 @@ public actor AIOutgoingMessageQueue {
             entry.payloadData = data
         case .dispatch(let binding):
             guard entry.state == .queued,
-                try head(for: entry.owner)?.id == entry.id,
+                try head(for: entry.owner, forwarding: binding.mode == .enqueue)?.id == entry.id,
                 binding.hostEpoch == hostEpoch, Self.validBinding(binding)
             else {
                 throw AIOutgoingMessageQueueError.invalidTransition
             }
             entry.binding = binding
             entry.state = .dispatching
+        case .forwarded:
+            guard entry.state == .dispatching, entry.binding != nil else {
+                throw AIOutgoingMessageQueueError.invalidTransition
+            }
+            entry.state = .forwarded
         case .accepted(let messageID):
-            guard [.dispatching, .unknown].contains(entry.state),
+            guard [.dispatching, .forwarded, .unknown].contains(entry.state),
                 Self.validIdentifier(messageID)
             else {
                 throw AIOutgoingMessageQueueError.invalidTransition
@@ -235,20 +245,20 @@ public actor AIOutgoingMessageQueue {
             entry.acceptedMessageID = messageID
             entry.state = .accepted
         case .unknown:
-            guard entry.state == .dispatching else {
+            guard [.dispatching, .forwarded].contains(entry.state) else {
                 throw AIOutgoingMessageQueueError.invalidTransition
             }
             entry.state = .unknown
             entry.everUnknown = true
         case .failed:
-            guard [.queued, .dispatching].contains(entry.state), !entry.everUnknown,
-                entry.binding == nil || entry.binding?.hostEpoch == hostEpoch
+            guard [.queued, .dispatching, .forwarded].contains(entry.state), !entry.everUnknown,
+                entry.binding == nil || entry.binding?.mode == .enqueue || entry.binding?.hostEpoch == hostEpoch
             else {
                 throw AIOutgoingMessageQueueError.invalidTransition
             }
             entry.state = .failed
         case .requeueRejected:
-            guard entry.state == .dispatching, !entry.everUnknown,
+            guard [.dispatching, .forwarded].contains(entry.state), !entry.everUnknown,
                 entry.binding?.hostEpoch == hostEpoch
             else {
                 throw AIOutgoingMessageQueueError.invalidTransition
@@ -260,9 +270,10 @@ public actor AIOutgoingMessageQueue {
                 throw AIOutgoingMessageQueueError.invalidTransition
             }
             if let binding = entry.binding {
-                guard binding.hostEpoch == hostEpoch,
+                let isHead = try head(for: entry.owner)?.id == entry.id
+                guard binding.mode == .enqueue || binding.hostEpoch == hostEpoch,
                     entry.state != .unknown || binding.mode != .send,
-                    try head(for: entry.owner)?.id == entry.id
+                    binding.mode == .enqueue || isHead
                 else {
                     throw AIOutgoingMessageQueueError.invalidTransition
                 }
@@ -357,7 +368,7 @@ public actor AIOutgoingMessageQueue {
             var recovered = decoded
             var changed = false
             for index in recovered.entries.indices
-            where recovered.entries[index].state == .dispatching {
+            where [.dispatching, .forwarded].contains(recovered.entries[index].state) {
                 guard recovered.entries[index].revision < UInt64.max else {
                     throw AIOutgoingMessageQueueError.corruptStore
                 }
@@ -449,7 +460,7 @@ public actor AIOutgoingMessageQueue {
                 guard entry.binding == nil, entry.acceptedMessageID == nil else {
                     throw AIOutgoingMessageQueueError.corruptStore
                 }
-            case .dispatching, .unknown:
+            case .dispatching, .forwarded, .unknown:
                 guard entry.binding != nil, entry.acceptedMessageID == nil,
                     entry.state != .unknown || entry.everUnknown
                 else {
@@ -476,7 +487,7 @@ public actor AIOutgoingMessageQueue {
     private static func validBinding(_ value: AIOutgoingMessageQueueBinding) -> Bool {
         guard validIdentifier(value.hostEpoch) else { return false }
         switch value.mode {
-        case .send: return value.turnID.isEmpty && value.questionID == nil
+        case .send, .enqueue: return value.turnID.isEmpty && value.questionID == nil
         case .steer: return validIdentifier(value.turnID) && value.questionID == nil
         case .answer: return value.turnID.isEmpty && value.questionID.map(validIdentifier) == true
         }

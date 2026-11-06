@@ -532,6 +532,27 @@ void registerDesktopCloudDriveTools(MaiToolRegistry& registry, std::function<Des
             if (!operation.cancel || !operation.downloadCancel)
                 return failure(MaiErrorCode::Internal, "could not start cloud drive operation");
             const QJsonObject args = parseObject(argumentsJson);
+            if (name == "maichat_cloud_drive_search_media") {
+                const MaiToolResult found = request(operation, MAI_CLOUD_DRIVE_SEARCH_MEDIA, args);
+                // A search may span several control requests. Do not return
+                // old-account candidates after an account switch or cancellation.
+                if (context.isCanceled() || provider().accountId != access.accountId)
+                    return failure(MaiErrorCode::Canceled, "MaiChat account or turn changed during search");
+                return found;
+            }
+            if (name == "maichat_cloud_drive_download_media") {
+                const QString path = args.value(QStringLiteral("output_path")).toString();
+                const std::string resolved = context.resolvePath(path.toStdString());
+                if (resolved.empty() || QString::fromStdString(resolved) != path ||
+                    !QDir().mkpath(QFileInfo(path).absolutePath()))
+                    return failure(MaiErrorCode::InvalidInput, "download path must be inside the current workspace");
+                const MaiToolResult saved = request(operation, MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA, args);
+                if (!saved.hasError() && (context.isCanceled() || provider().accountId != access.accountId)) {
+                    QFile::remove(path);
+                    return failure(MaiErrorCode::Canceled, "MaiChat account or turn changed during download");
+                }
+                return saved;
+            }
             if (name == "maichat_cloud_drive_list_folders")
                 return request(operation, MAI_CLOUD_DRIVE_LIST_FOLDERS, args);
             if (name == "maichat_cloud_drive_create_folder")

@@ -84,6 +84,54 @@ static void releaseHostToolContext(void* context) {
     static_cast<HostToolProbe*>(context)->released = true;
 }
 
+// 相册 ID 不能冒充已知工作区文件；只测普通校验和分发，不访问系统相册。
+static void libraryExportDomainContract() {
+    const auto root = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8(MaiIdGenerator::generate("mobile_export_domain_")));
+    const auto workspace = root.append(MaiFilePath::fromUtf8("Workspace"));
+    CHECK(!MaiFileSystem::createDirectories(workspace));
+    const auto source = workspace.append(MaiFilePath::fromUtf8("portrait-source.jpg"));
+    const auto outside = root.append(MaiFilePath::fromUtf8("outside.jpg"));
+    CHECK(!MaiFileSystem::writeFile(source, "owned workspace fixture"));
+    CHECK(!MaiFileSystem::writeFile(outside, "owned outside fixture"));
+    CHECK(!MaiFileSystem::createDirectories(
+        workspace.append(MaiFilePath::fromUtf8("directory.jpg"))));
+    HostToolProbe probe;
+    auto dispatcher = makeMaiMobileHostDispatcher();
+    CHECK(setMaiMobileHostToolHandler(dispatcher, &probe, hostToolHandler, freeHostToolResponse,
+                                      releaseHostToolContext));
+    MaiToolRegistry registry;
+    registerMobilePhotoTools(registry, dispatcher);
+    MaiToolContext context;
+    context.root = workspace.toUtf8();
+    context.sessionId = "owned-library-domain-test";
+    for (const char* name : {"mobile_export_photo_original", "mobile_export_media_original"}) {
+        auto* tool = registry.find(name);
+        CHECK(tool);
+        const int before = probe.calls.load();
+        const auto invalid = tool->execute(R"({"id":"portrait-source.jpg"})", context);
+        CHECK(invalid.hasError() && invalid.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(probe.calls.load() == before);
+        CHECK(invalid.error().message().find("same exact path") != std::string::npos);
+        CHECK(invalid.error().message().find("permission") != std::string::npos);
+        for (const char* id :
+             {"OPAQUE-ASSET-UUID/L0/001", "absent.jpg", "directory.jpg", "../outside.jpg"}) {
+            const auto raw = Json{{"id", id}, {"component", "photo"}}.dump();
+            const int calls = probe.calls.load();
+            CHECK(!tool->execute(raw, context).hasError());
+            CHECK(probe.calls.load() == calls + 1);
+            CHECK(probe.lastTool == name && probe.lastArguments == raw);
+        }
+    }
+    std::string bytes;
+    CHECK(!MaiFileSystem::readFile(source, bytes) && bytes == "owned workspace fixture");
+    CHECK(!MaiFileSystem::readFile(outside, bytes) && bytes == "owned outside fixture");
+    clearMaiMobileHostToolHandler(dispatcher);
+    CHECK(probe.released.load());
+    MaiFileSystem::removeRecursively(root);
+    std::puts("PASS: library IDs reject existing workspace files before host dispatch");
+}
+
 struct BrowserToolProbe {
     int calls = 0;
     bool released = false;
@@ -826,6 +874,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
+        libraryExportDomainContract();
         browserContract();
         cameraRoutingContract();
 #if defined(MAICHAT_MOBILE_IOS) || (defined(__APPLE__) && TARGET_OS_IPHONE)

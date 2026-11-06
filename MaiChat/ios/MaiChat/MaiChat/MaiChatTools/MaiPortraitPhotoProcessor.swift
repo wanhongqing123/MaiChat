@@ -324,16 +324,20 @@ enum MaiPortraitPhotoProcessor {
         let found = try faces(input, cancellation: cancellation)
         let hints = try encoded(["_face_hints": found])
         let specification = try JSONSerialization.jsonObject(with: Data(arguments.utf8)) as! [String: Any]
-        let subject = (specification["subject_index"] as? NSNumber)?.intValue ?? -1
-        let proxy = rgba(input.image.transformed(by: CGAffineTransform(scaleX: 64 / CGFloat(input.width), y: 64 / CGFloat(input.height))),
-                         bounds: CGRect(x: 0, y: 0, width: 64, height: 64), context: context)
-        var plan = try proxy.withUnsafeBytes { bytes in
-            try hints.withCString { hints in
-                try output(take(maiPortraitPlanFaceRegion(Int32(input.width), Int32(input.height), hints,
-                    Int32(subject), bytes.bindMemory(to: UInt8.self).baseAddress, 64, 64, 256)))
-            }
-        }
-        // 与旧全图路径保持相同的尺寸前缀和逐行 RGBA 指纹；只持有 128 行像素。
+        // Keep the original feature domain for validated personal preferences.
+        // Semantic analysis is a separate bounded whole-image proxy; neither
+        // proxy replaces the native pixels that receive the visible-skin edit.
+        let global = rgba(input.image.transformed(by: CGAffineTransform(
+            scaleX: 64 / CGFloat(input.width), y: 64 / CGFloat(input.height))),
+            bounds: CGRect(x: 0, y: 0, width: 64, height: 64), context: context)
+        let scale = min(1, 512 / CGFloat(max(input.width, input.height)))
+        let proxyWidth = max(1, Int((CGFloat(input.width) * scale).rounded()))
+        let proxyHeight = max(1, Int((CGFloat(input.height) * scale).rounded()))
+        let proxy = rgba(input.image.transformed(by: CGAffineTransform(
+            scaleX: CGFloat(proxyWidth) / CGFloat(input.width),
+            y: CGFloat(proxyHeight) / CGFloat(input.height))),
+            bounds: CGRect(x: 0, y: 0, width: proxyWidth, height: proxyHeight), context: context)
+        // Fingerprint the oriented original, retaining only 128 rows at once.
         var hash = SHA256()
         hash.update(data: Data("\(input.width)x\(input.height):".utf8))
         for top in stride(from: 0, to: input.height, by: 128) {
@@ -344,54 +348,227 @@ enum MaiPortraitPhotoProcessor {
                     width: input.width, height: rows), context: context))
             }
         }
-        plan["source_fingerprint"] = hash.finalize().map { String(format: "%02x", $0) }.joined()
-        guard let region = plan["roi"] as? [String: Int], let x = region["x"], let y = region["y"],
-              let width = region["width"], let height = region["height"] else {
-            throw failed("invalid_region_context", "portrait", "Portrait service returned no native region", "No output was committed")
-        }
-        let bounds = CGRect(x: x, y: input.height - y - height, width: width, height: height)
-        let pixels = rgba(input.image, bounds: bounds, context: context)
-        let regionJSON = try encoded(plan)
-        try cancellation.check()
-        let result = pixels.withUnsafeBytes { bytes in
-            arguments.withCString { arguments in profile.withCString { profile in
-                originalURL.path.withCString { source in regionJSON.withCString { plan in
-                    maiPortraitProcessRegionRgba(bytes.bindMemory(to: UInt8.self).baseAddress,
-                        Int32(width), Int32(height), Int32(width * 4), arguments, profile, source, plan)
+        let fingerprint = hash.finalize().map { String(format: "%02x", $0) }.joined()
+        let analysis = proxy.withUnsafeBytes { proxyBytes in global.withUnsafeBytes { globalBytes in
+            hints.withCString { hints in arguments.withCString { arguments in
+                profile.withCString { profile in originalURL.path.withCString { source in
+                    fingerprint.withCString { fingerprint in
+                        maiPortraitAnalyzeSkinRgba(proxyBytes.bindMemory(to: UInt8.self).baseAddress,
+                            Int32(proxyWidth), Int32(proxyHeight), Int32(proxyWidth * 4),
+                            Int32(input.width), Int32(input.height), hints, arguments, profile, source,
+                            fingerprint, globalBytes.bindMemory(to: UInt8.self).baseAddress, 256)
+                    }
                 } }
             } }
+        } }
+        defer {
+            maiPortraitFree(analysis.metadata); maiPortraitFree(analysis.error)
+            maiPortraitFreeSkinContext(analysis.context)
         }
-        defer { maiPortraitFree(result.rgba); maiPortraitFree(result.mask); maiPortraitFree(result.metadata); maiPortraitFree(result.error) }
-        if let error = result.error { throw MaiPortraitHostFailure(detail: String(cString: error)) }
-        guard let edited = result.rgba, let alpha = result.mask, let metadata = result.metadata,
-              Int(result.width) == width, Int(result.height) == height else {
-            throw failed("portrait_service_failed", "portrait", "Portrait service returned an incomplete region", "No output was committed")
+        if let error = analysis.error { throw MaiPortraitHostFailure(detail: String(cString: error)) }
+        guard let skin = analysis.context, let encodedPlan = analysis.metadata else {
+            throw failed("portrait_service_failed", "portrait", "Portrait service returned no skin plan", "No output was committed")
+        }
+        let plan = try output(String(cString: encodedPlan))
+        func nativeRectangle(_ values: [Int]?, maximumSide: Int) throws -> CGRect {
+            guard let values, values.count == 4, values[0] >= 0, values[1] >= 0,
+                  values[0] <= input.width, values[1] <= input.height,
+                  values[2] > 0, values[3] > 0, values[2] <= maximumSide, values[3] <= maximumSide,
+                  values[2] <= input.width - values[0], values[3] <= input.height - values[1] else {
+                throw failed("invalid_region_context", "portrait", "Portrait service returned invalid native bounds", "No output was committed")
+            }
+            return CGRect(x: values[0], y: values[1], width: values[2], height: values[3])
+        }
+        func objectRectangle(_ object: [String: Int]?) throws -> CGRect? {
+            guard let object else { return nil }
+            return try nativeRectangle([object["x"] ?? -1, object["y"] ?? -1,
+                object["width"] ?? 0, object["height"] ?? 0], maximumSide: 2048)
+        }
+        func renderBounds(_ rectangle: CGRect) -> CGRect {
+            CGRect(x: rectangle.minX, y: CGFloat(input.height) - rectangle.maxY,
+                   width: rectangle.width, height: rectangle.height)
+        }
+        // A distant person needs fresh samples from the oriented original,
+        // rather than a larger copy of the already reduced whole-image proxy.
+        // Only the core's ownership-validated request chooses this region; the
+        // original global features, parameters and full-image tile plan stay fixed.
+        // The core may request up to 1024 pixels for one shared body-cleanup
+        // material plane; the initial whole-image analysis remains bounded at 512.
+        if let requestValue = plan["skin_refinement_request"], !(requestValue is NSNull) {
+            guard let request = requestValue as? [String: Any],
+                  let values = request["source_rect"] as? [Int],
+                  let width = request["proxy_width"] as? Int,
+                  let height = request["proxy_height"] as? Int else {
+                throw failed("invalid_region_context", "portrait", "Portrait service returned an invalid refinement request", "No output was committed")
+            }
+            let region = try nativeRectangle(values, maximumSide: max(input.width, input.height))
+            guard width > 0, height > 0, width <= 1024, height <= 1024,
+                  width <= Int(region.width), height <= Int(region.height),
+                  abs(width * Int(region.height) - height * Int(region.width)) <= max(Int(region.width), Int(region.height)) else {
+                throw failed("invalid_region_context", "portrait", "Skin refinement requires a proportional bounded original-source proxy", "No output was committed")
+            }
+            try autoreleasepool {
+                try cancellation.check()
+                let bounds = renderBounds(region)
+                let local = input.image.cropped(to: bounds)
+                    .transformed(by: CGAffineTransform(translationX: -bounds.minX, y: -bounds.minY))
+                    .transformed(by: CGAffineTransform(scaleX: CGFloat(width) / region.width,
+                        y: CGFloat(height) / region.height))
+                let pixels = rgba(local, bounds: CGRect(x: 0, y: 0, width: width, height: height), context: context)
+                let result = pixels.withUnsafeBytes { bytes in
+                    maiPortraitRefineSkinRegionRgba(skin, bytes.bindMemory(to: UInt8.self).baseAddress,
+                        Int32(width), Int32(height), Int32(width * 4))
+                }
+                let refined = try output(take(result))
+                guard refined["applied"] as? Bool == true,
+                      refined["source_rect"] as? [Int] == values,
+                      refined["proxy_width"] as? Int == width,
+                      refined["proxy_height"] as? Int == height else {
+                    throw failed("invalid_region_context", "portrait", "Skin refinement did not complete the requested original-source analysis", "No output was committed")
+                }
+                try cancellation.check()
+            }
+        }
+        // Dense landmarks protect facial features; they do not gate body skin.
+        // The native plan reports partial face coverage truthfully if protection
+        // fails, or rejects the operation when no reliable skin remains.
+        if let face = try objectRectangle(plan["face_roi"] as? [String: Int]) {
+            try autoreleasepool {
+                try cancellation.check()
+                let pixels = rgba(input.image, bounds: renderBounds(face), context: context)
+                let protected = pixels.withUnsafeBytes { bytes in
+                    maiPortraitProtectSkinFaceRegion(skin, bytes.bindMemory(to: UInt8.self).baseAddress,
+                        Int32(face.width), Int32(face.height), Int32(face.width) * 4)
+                }
+                _ = try output(take(protected))
+            }
+        } else {
+            _ = try output(take(maiPortraitProtectSkinFaceRegion(skin, nil, 0, 0, 0)))
+        }
+        guard let tiles = plan["tiles"] as? [[String: Any]], tiles.count <= 128 else {
+            throw failed("invalid_region_context", "portrait", "Portrait service returned no bounded tile plan", "No output was committed")
+        }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        var editedImage = input.image
+        var maskImage = CIImage(color: .black).cropped(to: input.image.extent)
+        var written: [CGRect] = []
+        for (index, tile) in tiles.enumerated() {
+            try cancellation.check()
+            let sample = try nativeRectangle(tile["sample_rect"] as? [Int], maximumSide: 1040)
+            let write = try nativeRectangle(tile["write_rect"] as? [Int], maximumSide: 1024)
+            guard sample.contains(write), write.minX - sample.minX <= 8, write.minY - sample.minY <= 8,
+                  sample.maxX - write.maxX <= 8, sample.maxY - write.maxY <= 8,
+                  !written.contains(where: {
+                      let overlap = $0.intersection(write)
+                      return overlap.width > 0 && overlap.height > 0
+                  }) else {
+                throw failed("invalid_region_context", "portrait", "Portrait tile interiors overlap or have invalid halos", "No output was committed")
+            }
+            written.append(write)
+            let images: (CIImage, CIImage) = try autoreleasepool {
+                let bounds = renderBounds(sample)
+                let width = Int(sample.width), height = Int(sample.height)
+                let pixels = rgba(input.image, bounds: bounds, context: context)
+                let result = pixels.withUnsafeBytes { bytes in
+                    maiPortraitProcessSkinTile(skin, Int32(index), bytes.bindMemory(to: UInt8.self).baseAddress,
+                        Int32(width), Int32(height), Int32(width * 4))
+                }
+                defer {
+                    maiPortraitFree(result.rgba); maiPortraitFree(result.mask)
+                    maiPortraitFree(result.metadata); maiPortraitFree(result.error)
+                }
+                if let error = result.error { throw MaiPortraitHostFailure(detail: String(cString: error)) }
+                guard let edited = result.rgba, let alpha = result.mask,
+                      Int(result.width) == width, Int(result.height) == height else {
+                    throw failed("portrait_service_failed", "portrait", "Portrait service returned an incomplete skin tile", "No output was committed")
+                }
+                let patch = CIImage(bitmapData: Data(bytes: edited, count: width * height * 4),
+                    bytesPerRow: width * 4, size: sample.size, format: .RGBA8, colorSpace: colorSpace)
+                    .transformed(by: CGAffineTransform(translationX: bounds.minX, y: bounds.minY))
+                let alphaImage = CIImage(bitmapData: Data(bytes: alpha, count: width * height),
+                    bytesPerRow: width, size: sample.size, format: .L8, colorSpace: CGColorSpaceCreateDeviceGray())
+                    .transformed(by: CGAffineTransform(translationX: bounds.minX, y: bounds.minY))
+                return (patch.cropped(to: renderBounds(write)), alphaImage.cropped(to: renderBounds(write)))
+            }
+            // Each disjoint interior is already composited by the core. Never
+            // multiply by diagnostic alpha again; halo pixels are not pasted.
+            editedImage = images.0.composited(over: editedImage)
+            maskImage = images.1.composited(over: maskImage)
         }
         try cancellation.check()
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        let patch = CIImage(bitmapData: Data(bytes: edited, count: width * height * 4), bytesPerRow: width * 4,
-            size: CGSize(width: width, height: height), format: .RGBA8, colorSpace: colorSpace)
-            .transformed(by: CGAffineTransform(translationX: bounds.minX, y: bounds.minY))
-        let mask = CIImage(bitmapData: Data(bytes: alpha, count: width * height), bytesPerRow: width,
-            size: CGSize(width: width, height: height), format: .L8, colorSpace: CGColorSpaceCreateDeviceGray())
-            .transformed(by: CGAffineTransform(translationX: bounds.minX, y: bounds.minY))
+        guard let effective = plan["effective_parameters"] as? [String: Any] else {
+            throw failed("portrait_service_failed", "portrait", "Portrait service returned no effective parameters", "No output was committed")
+        }
+        let hasGeometry = ["slim_face", "enlarge_eyes"].contains {
+            ((effective[$0] as? NSNumber)?.doubleValue ?? 0) > 0
+        }
+        var geometryRegion: CGRect?
+        if hasGeometry {
+            guard let facePlan = plan["face_plan"] as? [String: Any],
+                  let region = try objectRectangle(facePlan["roi"] as? [String: Int]),
+                  var geometryArguments = plan["geometry_parameters"] as? [String: Any] else {
+                throw failed("invalid_region_context", "portrait", "Requested face geometry has no reliable native region", "No output was committed")
+            }
+            guard ["smoothing", "brightening", "warmth", "whitening"].allSatisfy({
+                (geometryArguments[$0] as? NSNumber)?.doubleValue == 0
+            }), geometryArguments["use_personal_model"] as? Bool == false else {
+                throw failed("invalid_region_context", "portrait", "Face geometry must not repeat skin processing", "No output was committed")
+            }
+            geometryArguments["path"] = specification["path"] ?? originalURL.path
+            let encodedGeometry = try encoded(geometryArguments), encodedFacePlan = try encoded(facePlan)
+            let bounds = renderBounds(region), width = Int(region.width), height = Int(region.height)
+            let patch: CIImage = try autoreleasepool {
+                // The only geometry input is the already retouched face region.
+                // All color/smoothing values are explicitly zero and the personal
+                // model is disabled in the core-provided geometry arguments.
+                let pixels = rgba(editedImage, bounds: bounds, context: context)
+                let result = pixels.withUnsafeBytes { bytes in encodedGeometry.withCString { arguments in
+                    profile.withCString { profile in originalURL.path.withCString { source in
+                        encodedFacePlan.withCString { plan in
+                            maiPortraitProcessRegionRgba(bytes.bindMemory(to: UInt8.self).baseAddress,
+                                Int32(width), Int32(height), Int32(width * 4), arguments, profile, source, plan)
+                        }
+                    } }
+                } }
+                defer {
+                    maiPortraitFree(result.rgba); maiPortraitFree(result.mask)
+                    maiPortraitFree(result.metadata); maiPortraitFree(result.error)
+                }
+                if let error = result.error { throw MaiPortraitHostFailure(detail: String(cString: error)) }
+                guard let edited = result.rgba, Int(result.width) == width, Int(result.height) == height else {
+                    throw failed("portrait_service_failed", "portrait", "Portrait service returned incomplete face geometry", "No output was committed")
+                }
+                return CIImage(bitmapData: Data(bytes: edited, count: width * height * 4),
+                    bytesPerRow: width * 4, size: region.size, format: .RGBA8, colorSpace: colorSpace)
+                    .transformed(by: CGAffineTransform(translationX: bounds.minX, y: bounds.minY))
+            }
+            editedImage = patch.composited(over: editedImage)
+            geometryRegion = region
+        }
+        var metadata = try output(take(maiPortraitFinishSkin(skin)))
+        metadata["geometry_applied"] = hasGeometry
+        if let geometryRegion {
+            metadata["geometry_processing_bbox"] = [Int(geometryRegion.minX), Int(geometryRegion.minY),
+                Int(geometryRegion.width), Int(geometryRegion.height)]
+            metadata["metrics_scope"] = "skin_color_and_smoothing_before_optional_face_geometry"
+        }
         let id = UUID().uuidString
         let prepared = MaiPreparedPortrait(imageTemporary: workspace.appendingPathComponent(".portrait-\(id).tmp.png"),
             maskTemporary: workspace.appendingPathComponent(".portrait-mask-\(id).tmp.png"),
             imageOutput: workspace.appendingPathComponent("edited-\(id).png"),
             maskOutput: workspace.appendingPathComponent("skin-mask-\(id).png"),
-            metadata: String(cString: metadata), profile: profile, width: input.width, height: input.height)
+            metadata: try encoded(metadata), profile: profile, width: input.width, height: input.height)
         do {
             // patch 已在核心内软边合成；直接覆盖 ROI，不用导出的诊断 alpha 重复混合。
             // 编码器可能暂存完整光栅；每个文件各自释放临时对象，不能把两份缓冲叠加。
             try autoreleasepool {
-                try context.writePNGRepresentation(of: patch.composited(over: input.image).cropped(to: input.image.extent),
+                try context.writePNGRepresentation(of: editedImage.cropped(to: input.image.extent),
                     to: prepared.imageTemporary, format: .RGBA8, colorSpace: colorSpace)
             }
             context.clearCaches()
             try cancellation.check()
             try autoreleasepool {
-                try context.writePNGRepresentation(of: mask.composited(over: CIImage(color: .black).cropped(to: input.image.extent)),
+                try context.writePNGRepresentation(of: maskImage.cropped(to: input.image.extent),
                     to: prepared.maskTemporary, format: .L8, colorSpace: CGColorSpaceCreateDeviceGray())
             }
             context.clearCaches()

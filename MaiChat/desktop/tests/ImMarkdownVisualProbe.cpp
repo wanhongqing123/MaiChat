@@ -4,6 +4,9 @@
 #include <QFont>
 #include <QFontDatabase>
 #include <QFile>
+#include <QDir>
+#include <QPushButton>
+#include "ui/UiZoom.h"
 #include <QImage>
 #include <QTest>
 
@@ -44,9 +47,11 @@ layout.paint(&painter, origin, clip);
 
 | 层 | 职责 |
 | --- | --- |
-| MarkdownDocument | 文本 → 块树 |
+| MarkdownDocument | **预期**：<br>320×180<br><br>单元格内保留空行 |
 | MarkdownLayout | 块树 → 像素 |
-| MarkdownLabel | IM 的一条消息 |
+| MarkdownLabel | **实际**：<br/>320×240<br />下一行<BR>最后一行 |
+
+代码示例保持原样：`literal <br>`。
 )";
 
 }  // namespace
@@ -64,6 +69,15 @@ int main(int argc, char** argv) {
         if (!file.open(QIODevice::ReadOnly)) return 2;
         fixture = QString::fromUtf8(file.readAll());
     }
+    QDir fontDirectory(QString::fromUtf8(MAICHAT_TEST_FONTS_DIR));
+    for (const QString& name : fontDirectory.entryList({QStringLiteral("*.otf")}, QDir::Files))
+        QFontDatabase::addApplicationFont(fontDirectory.filePath(name));
+    if (qEnvironmentVariableIsSet("MAICHAT_PROBE_FONT_FAMILY"))
+        UiZoom::setFontFamilyId(qEnvironmentVariable("MAICHAT_PROBE_FONT_FAMILY"));
+    QFont selectedFont = app.font();
+    selectedFont.setFamilies(UiZoom::fontFamilies());
+    selectedFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
+    app.setFont(selectedFont);
 #ifdef Q_OS_WIN
     // 和 main.cpp 设的应用字体保持一致，否则中文落到宋体、字距被整像素提示打乱，
     // 截图不代表真机。见 main.cpp 里 setHintingPreference 那段注释。
@@ -96,6 +110,13 @@ int main(int argc, char** argv) {
     if (!image.save(output)) {
         qWarning("failed to save %s", qPrintable(output));
         return 1;
+    }
+    if (auto* settings = window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"))) {
+        settings->click(); QTest::qWait(100);
+        QImage settingsImage(window.size(), QImage::Format_ARGB32);
+        settingsImage.fill(Qt::white); window.render(&settingsImage);
+        QString settingsPath = output; settingsPath.replace(QStringLiteral(".png"), QStringLiteral("-settings.png"));
+        if (!settingsImage.save(settingsPath)) return 1;
     }
     qInfo("wrote %s (%dx%d)", qPrintable(output), image.width(), image.height());
     return 0;

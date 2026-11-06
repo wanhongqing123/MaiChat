@@ -87,6 +87,9 @@ private:
     void publishPresence();
     void handleEnvelope(const QJsonObject& envelope);
     void respondToCommand(const QJsonObject& envelope, QJsonObject result);
+    void dispatchQueuedInput(const QString& sessionId);
+    void cancelQueuedInputs(const QString& sessionId, const QString& reason);
+    bool isCurrentInput(const QJsonObject& envelope, quint64 generation) const;
     void startAttachmentCommand(const QJsonObject& envelope);
     void publishAttachmentHistory(const QJsonObject& body, int attempts);
     void finishDeletedRoom(const QString& sessionId);
@@ -132,8 +135,15 @@ private:
     QSet<QString> roomStateRestoresInFlight_;
     quint64 publishEpoch_ = 0;
     QHash<QString, Incoming> incoming_;
+    // Preserve wire order through asynchronous attachment preparation. Controls
+    // bypass this FIFO; accepted input execution remains in the shared Agent.
+    QHash<QString, QQueue<QJsonObject>> inputCommands_;
+    QSet<QString> preparingInputSessions_;
+    QSet<int> pendingInputEnvelopeIds_;
+    quint64 inputCommandGeneration_ = 0;
     QHash<QString, QString> retryIdByFingerprint_;
     QHash<QString, QString> fingerprintByCommandId_;
+    QHash<QString, QString> inputRequestByCommandId_;
     QHash<QString, PendingLifecycle> pendingLifecycle_;
     QJsonArray remoteSessions_;
     QJsonArray remoteDevices_;

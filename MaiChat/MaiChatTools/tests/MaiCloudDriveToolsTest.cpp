@@ -33,7 +33,7 @@ int main() {
                                    lastArguments = arguments;
                                    return MaiToolResult::success("{\"ok\":true}");
                                });
-    require(tools.specs().size() == 15, "cloud tool count changed");
+    require(tools.specs().size() == 17, "cloud tool count changed");
     for (const auto& spec : tools.specs()) {
         require(nlohmann::json::parse(spec.parametersJson, nullptr, false).is_object(),
                 "cloud tool schema is invalid JSON");
@@ -62,6 +62,36 @@ int main() {
     require(!MaiFileSystem::writeFile(image, "image").hasError(), "cannot create temporary image");
     MaiToolContext context;
     context.root = directory.toUtf8();
+
+    MaiTool* search = tools.findForModel("maichat_cloud_drive_search_media");
+    require(search != nullptr && !search->requiresApproval("{}"), "cloud search is not model-visible and read-only");
+    require(!search->execute(R"({"query":"草棚","folder_id":"123E4567-E89B-42D3-A456-426614174000","media_type":"video","exact_name":false})", context).hasError(),
+            "filename search rejected a valid query");
+    require(nlohmann::json::parse(lastArguments)["folder_id"] == "123e4567-e89b-42d3-a456-426614174000",
+            "search did not normalize its folder ID");
+    const int beforeInvalidSearch = calls;
+    for (const char* args : {R"({})", R"({"query":""})", R"({"query":"   "})",
+            R"({"query":"x","media_type":"file"})", R"({"query":"x","exact_name":"true"})",
+            R"({"query":"x","before":""})", R"({"query":"x","before":"bad?cursor"})",
+            R"({"query":"x","folder_id":null})", R"({"query":"x","owner":"someone-else"})",
+            R"({"query":"x\u0000y"})"})
+        require(search->execute(args, context).hasError(), "invalid search reached the platform");
+    require(calls == beforeInvalidSearch, "invalid cloud query invoked the host");
+
+    MaiTool* download = tools.findForModel("maichat_cloud_drive_download_media");
+    require(download != nullptr, "private cloud originals cannot be downloaded by the Agent");
+    require(!download->execute(R"({"media_id":"123E4567-E89B-42D3-A456-426614174000","output_path":"original.mov"})", context).hasError(),
+            "workspace download was rejected");
+    require(nlohmann::json::parse(lastArguments)["media_id"] == "123e4567-e89b-42d3-a456-426614174000",
+            "download media ID was not normalized");
+    require(nlohmann::json::parse(lastArguments)["output_path"] == MaiFileSystem::resolve(directory).append(MaiFilePath::fromUtf8("original.mov")).toUtf8(),
+            "download did not bind the authorized workspace path");
+    const int beforeInvalidDownload = calls;
+    require(download->execute(R"({"media_id":"123e4567-e89b-42d3-a456-426614174000","output_path":"sample.MP4"})", context).hasError(),
+            "download would replace an existing file");
+    require(download->execute(R"({"media_id":"123e4567-e89b-42d3-a456-426614174000","output_path":"../outside.mov"})", context).hasError(),
+            "download escaped the workspace");
+    require(calls == beforeInvalidDownload, "invalid download reached the platform");
 
     MaiTool* upload = tools.findForModel("maichat_cloud_drive_upload_media");
     require(upload->execute(R"({"file_path":"sample.MP4"})", context).hasError() == false, "valid upload was rejected");

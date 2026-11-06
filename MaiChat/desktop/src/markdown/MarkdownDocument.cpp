@@ -536,9 +536,15 @@ int onText(MD_TEXTTYPE type, const MD_CHAR* text, MD_SIZE size, void* userdata) 
             break;
 
         case MD_TEXT_HTML:
-            // MD_FLAG_NOHTML 开着，走到这里的是被当成字面量的尖括号之类，照常显示。
+            // 只消费解析器确认的 HTML 换行节点；代码、实体和转义尖括号不会进入此分支。
+            // 其余标签继续按文字显示，不能为了表格换行启用任意 HTML 渲染。
             builder->flushPendingCallout();
-            builder->addText(fromMd(text, size));
+            {
+                static const QRegularExpression lineBreak(QStringLiteral("\\A<br[ \\t]*/?>\\z"),
+                                                          QRegularExpression::CaseInsensitiveOption);
+                const QString html = fromMd(text, size);
+                builder->addText(lineBreak.match(html).hasMatch() ? QStringLiteral("\n") : html);
+            }
             break;
 
         default: {
@@ -565,7 +571,7 @@ MarkdownDocument MarkdownDocument::parse(const QString& markdown) {
     Builder builder;
     MD_PARSER parser{};
     parser.abi_version = 0;
-    parser.flags = MD_DIALECT_GITHUB | MD_FLAG_NOHTML | MD_FLAG_HARD_SOFT_BREAKS;
+    parser.flags = MD_DIALECT_GITHUB | MD_FLAG_NOHTMLBLOCKS | MD_FLAG_HARD_SOFT_BREAKS;
     parser.enter_block = enterBlock;
     parser.leave_block = leaveBlock;
     parser.enter_span = enterSpan;

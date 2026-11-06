@@ -7,150 +7,171 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		5C9BAD2A6133B9BAA1909A97 /* SarasaFixedSC-Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = CC8F75C8DBC53FFF4453A944 /* SarasaFixedSC-Regular.ttf */; };
-		17912663BF5879F20D835AF8 /* LICENSE-SarasaFixedSC.txt in Resources */ = {isa = PBXBuildFile; fileRef = CEE6F50BE9878D57B82966E1 /* LICENSE-SarasaFixedSC.txt */; };
-		CBAF828A4376CD76871EC9B4 /* AIPrimaryModelDeviceProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE69F2012EFB4FC038D2D699 /* AIPrimaryModelDeviceProbe.swift */; };
-		E79E75F7D90E3EDE3A1CBCDE /* PrimaryModelsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 170122169934D4AB42F45741 /* PrimaryModelsUITests.swift */; };
-		225101CA9971BD78067D4B27 /* AIPrimaryModelUITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77CF7376E440B653788B306C /* AIPrimaryModelUITestSupport.swift */; };
-		0EEE37DA59F5209F3B04CDFB /* LocalModelsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80EADE8B96704E502A286785 /* LocalModelsUITests.swift */; };
-		EDE2A4933AB84C43ECB16128 /* AIOutgoingMessageRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 973AD0DAC1EF76407EBA047E /* AIOutgoingMessageRowView.swift */; };
-		44EC63C4BA77196CD975052F /* AIOutgoingMessagePump.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54AFDD184FEAA7382DDC254D /* AIOutgoingMessagePump.swift */; };
-		932F788A269D48825AD0C797 /* AIOutgoingMessagePayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8958ED4FC332352057B46898 /* AIOutgoingMessagePayload.swift */; };
-		379C9247FD7652C65A375FAE /* AIOutgoingMessageQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C7AB4E0622930D4A056CBE0 /* AIOutgoingMessageQueueTests.swift */; };
-		379D03CAD642A70E76F3F795 /* AILocalModelStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D50A51C97C5A7381086D8241 /* AILocalModelStoreTests.swift */; };
-		698F33DD65C4A59DD221CFA8 /* AIOutgoingMessageQueue.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE78D1022E3334AA73A37B92 /* AIOutgoingMessageQueue.swift */; };
-		D526175AB40D14E9E37BBD39 /* AILocalModelStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F48E0D4E7D60AF8CD083F504 /* AILocalModelStore.swift */; };
-		7BE2BC4EA367B7517B6D286D /* LocalInferenceUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BCB5FFEB9C9B11BB747DE4D /* LocalInferenceUITests.swift */; };
-		122E240613E362BBF149EFFE /* AILocalInferenceUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAA6C971B5AE1B704B174CB5 /* AILocalInferenceUITestFixture.swift */; };
-		F8B3C2B1B42BAAE0624B9281 /* AILocalInferenceRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DB66B5A5984C9EF151C6F89 /* AILocalInferenceRuntime.swift */; };
-		6996899BF91F58CF5117B8A4 /* RealtimeSpeechRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 212C484CFEC8D824343ED193 /* RealtimeSpeechRecognizer.swift */; };
-		BC44715B7739C748E453B804 /* AliyunSpeechTranscript.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2EE8714FB985188F6A07079 /* AliyunSpeechTranscript.swift */; };
-		AC8A7F80F5634FA8F86FE5C8 /* AliyunRealtimeSpeechRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A146916AC8B530236EAA5708 /* AliyunRealtimeSpeechRecognizer.swift */; };
-		CB86796D266A41859B688E01 /* AccountCodeCooldown.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB86796D266A41859B688E02 /* AccountCodeCooldown.swift */; };
-		CB86796D266A41859B688E03 /* AccountCodeCooldownTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB86796D266A41859B688E04 /* AccountCodeCooldownTests.swift */; };
-		6F03A9BA5D80FAE8B01671B8 /* ScreenFrameArchiveUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22A65816850A01D44D6F4A9F /* ScreenFrameArchiveUITests.swift */; };
-		F77BA084695F31C9AD6308A7 /* AIMobileScreenFramesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 699DD641EBF222F19503CD4B /* AIMobileScreenFramesView.swift */; };
-		C4A881E263A97B3D41E6C001 /* AIMobileCameraCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A881E263A97B3D41E6C002 /* AIMobileCameraCapture.swift */; };
-		3CE9DB0AABBB106D926C907E /* AIMobileScreenFrameArchive.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BD3F9C5BD5EE3D987670129 /* AIMobileScreenFrameArchive.swift */; };
-		751C9C7EC4D79C407AB8992A /* MaiCloudDriveImagePager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 751C9C7EC4D79C407AB8992B /* MaiCloudDriveImagePager.swift */; };
+		02E79EF06353052B990EE9E1 /* AIMobileScreenCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35C33E4A86A3C9C3DBBB7077 /* AIMobileScreenCapture.swift */; };
 		0329ABDC04BBAC38945C24FA /* AIMobileHostToolProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29776A2C7E5D525FFA6CED8D /* AIMobileHostToolProvider.swift */; };
-		F2D771B8A5334D159C238C01 /* AIMobileBrowserTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2D771B8A5334D159C238C02 /* AIMobileBrowserTools.swift */; };
-		0195E28DD186A948669EB9E1 /* AIAssistantBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9D2CD930801CFDC68ED81AB /* AIAssistantBrowserView.swift */; };
-		80A93D25352CFB7F9675EB89 /* AIMobileScreenCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7090E768648CE5F2D55AD135 /* AIMobileScreenCapture.swift */; };
+		048332DE76BAF3E98167876D /* AppPageTitle.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2E42E45D8966090A859C27 /* AppPageTitle.swift */; };
 		060F9E4EA6E9FABAF30CF2E5 /* RemoteDiagnosticsCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 862125851990D87705405E68 /* RemoteDiagnosticsCoordinator.swift */; };
 		06A4AB7E2BF7C60D639D23CA /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C56C06620B6A4AB7289B13D /* SettingsView.swift */; };
 		0877D888456B3E24B13A6ED3 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A781F92B5DE618E07394EA0C /* ChatView.swift */; };
 		0B2637847F5454F182126805 /* ComposerDraftState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C846ED66C1F881705954E761 /* ComposerDraftState.swift */; };
 		0C3D673C246BAE33893EFDCD /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0075BCCB2188B8EB8E6F11FA /* RootView.swift */; };
+		0F11F7525A77C07F5A314303 /* LocalInferenceUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26C5C0CBE964E8A150325408 /* LocalInferenceUITests.swift */; };
 		0F2174634726BE7BB940C868 /* MaiCloudDriveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A47856A6735559D9160BB50C /* MaiCloudDriveView.swift */; };
 		10E63571389FF61C9869CE9E /* AIAssistantModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24AF3608C85D5AE5D045283D /* AIAssistantModel.swift */; };
 		123CB40D5B6165E8A91352B1 /* MaiVideoCircleView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41D9DAF7C3785B28932B4577 /* MaiVideoCircleView.swift */; };
+		14B173459CD0C6BD8C29FCB1 /* AppPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58C5F7FC7D5E65C5F1F3D849 /* AppPreferences.swift */; };
 		1505F33A923B571D5EF10FAD /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 3FE9276ACB6564FDA4876587 /* PrivacyInfo.xcprivacy */; };
+		161B7D544D1171CFDE4F49E7 /* AILocalModelStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F8ADD3B152CB2E98930E4B4 /* AILocalModelStore.swift */; };
+		178A2D52321DFCC7EB35FE26 /* BrowserUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = B46FF11070D2B398B608D67B /* BrowserUITestFixture.swift */; };
 		17D2334D14B8A1F571A7D69B /* AppDiagnosticLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A47E3BD08877657A12C0C35 /* AppDiagnosticLog.swift */; };
+		18BE9338561E0A39791EF8F9 /* AIMobileScreenFramesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A5191B01D201B98AFD4E1F7 /* AIMobileScreenFramesView.swift */; };
 		193A1C657EB5C24DF1A84BF4 /* ffplay-seek-sample.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 7702BC2F6BF7F9BF6571E11C /* ffplay-seek-sample.mp4 */; };
 		194E338FF3D0DE993B165814 /* AIAssistantUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89FDF5DC4F6DB91F2A1B3FD5 /* AIAssistantUITests.swift */; };
 		194EF7AD3FFBA215E15BC6C2 /* remote-diagnostics-failure-receipts.json in Resources */ = {isa = PBXBuildFile; fileRef = 1F8D037EEC9C74A8F43E4083 /* remote-diagnostics-failure-receipts.json */; };
+		195CBD2427916B9BDE4CA2D4 /* CloudDriveUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3058282469E191A83FDF3CC2 /* CloudDriveUITestFixtures.swift */; };
+		199D137EB0ECB086D85B83FC /* AIMobileScreenFrameArchive.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2B32178167C2411DE886093 /* AIMobileScreenFrameArchive.swift */; };
 		19AC531DF862B4E8460E9AFC /* MessageBubbleLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C5A4C74E12DC407146E1EBF /* MessageBubbleLayout.swift */; };
 		19E85AD53A94BD7E9DF9A1B5 /* SpeechRecognizing.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBE546568A0B3FFA1551D803 /* SpeechRecognizing.swift */; };
 		1A64DAEB06DA808D3F82C0D4 /* MaiChatCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 771AB137E6961E2B9187CFEB /* MaiChatCore.framework */; };
 		1B0DC102E851A3005DC43D69 /* RemoteDiagnosticsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2ABED4C39BFBF823F387BE75 /* RemoteDiagnosticsTests.swift */; };
+		1F4C5D0802D0376894673EDE /* MySettingsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FED20B9BC536846A6FC6BB3 /* MySettingsUITests.swift */; };
+		1F86EA1126E02BB4CB0B2D30 /* AppTypography.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20C61B705C24536DD3A03695 /* AppTypography.swift */; };
 		22F6961D7A52EC91127441D0 /* MaiChatApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73E259698A238F25ED2ED12E /* MaiChatApp.swift */; };
+		26497B03C9AD2C69921B8501 /* AliyunSpeechTranscript.swift in Sources */ = {isa = PBXBuildFile; fileRef = 362BB3CB4B3251315C55B8B3 /* AliyunSpeechTranscript.swift */; };
 		290398666A29A06E27AB57E3 /* MaiChatAuthClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC4C6DC9135AD53A7FEDD3DA /* MaiChatAuthClient.swift */; };
+		29DF2B5ED09615927A7AE457 /* fonts in Resources */ = {isa = PBXBuildFile; fileRef = 2832C84176ED41ACA2687F1B /* fonts */; };
 		2A55E61AA07338C31386DE07 /* ffplay-sample.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 8C7043E7ADEC49D3648291AF /* ffplay-sample.mp4 */; };
+		2BB7EC458B8370713722836F /* ScreenFrameArchiveUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B3BB5B39FF593766914E334 /* ScreenFrameArchiveUITests.swift */; };
+		2DC2405C219F4F7D86E7B301 /* AppTypography.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20C61B705C24536DD3A03695 /* AppTypography.swift */; };
 		2FA099751A7A133A032E55F8 /* ComposerDraftState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C846ED66C1F881705954E761 /* ComposerDraftState.swift */; };
 		30346792F4FE7D73D6F24B87 /* RemoteInputPacket.swift in Sources */ = {isa = PBXBuildFile; fileRef = AFC47464E3C7D9F6FBA8DD16 /* RemoteInputPacket.swift */; };
+		362A06698AB34F60E6BF1D6F /* MediaUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FD82E79022BE18AE4D23FFA /* MediaUITestFixtures.swift */; };
+		36AECCDEE38C852333CCC79C /* ScreenCaptureUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10452DFEC44A265F1B1DF758 /* ScreenCaptureUITestFixtures.swift */; };
+		36D5B0725A7CED42D48F6B5C /* AIOutgoingMessageRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F044A1FAD06EF5A68D6D388 /* AIOutgoingMessageRowView.swift */; };
+		3BB3173E37580E0B694C2CAD /* LICENSE-SarasaFixedSC.txt in Resources */ = {isa = PBXBuildFile; fileRef = 71BF7C1975A6A8D7934F8AFD /* LICENSE-SarasaFixedSC.txt */; };
 		3C6DF0BD9610ACAE564EF27D /* MaiChatCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 771AB137E6961E2B9187CFEB /* MaiChatCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		3DC0CE72E9E77DC2AF97AB34 /* ScreenFramesUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14EC0B1938F79D2E1754A41C /* ScreenFramesUITestFixtures.swift */; };
+		3E19BBF2C251E497F9DDE7FF /* LocalModelsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9018FE69F2EBA87F3B9F3B7 /* LocalModelsUITests.swift */; };
 		3ED72F9BC221AED70A3677F5 /* MarkdownPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0194E7C7F438293A088E45E0 /* MarkdownPresentationTests.swift */; };
 		3FB5135EF0A464E4798EE349 /* MasterChatState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE31D307132E0C37078DFFAB /* MasterChatState.swift */; };
+		3FC629E94BB3651A605079B8 /* AliyunRealtimeSpeechRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C18CACCCB44B8CA9D004A9 /* AliyunRealtimeSpeechRecognizer.swift */; };
+		434A790BCD491455A07E569F /* CameraUITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89C53568C4F652D63C72CCAF /* CameraUITestSupport.swift */; };
 		4550C5CE5BAE858E613A565C /* MaiCloudDriveAgentPlaybackCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 489905ADED5F3469B72DB261 /* MaiCloudDriveAgentPlaybackCache.swift */; };
+		46A0E99B673B19DE0206BBCA /* AIOutgoingMessagePayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE8BB3C88041916FBCDAFDD7 /* AIOutgoingMessagePayload.swift */; };
+		47CB2D9C6592D635C5E3A5FB /* SarasaFixedSC-Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B09E1DD2B5884DA6AA947C4D /* SarasaFixedSC-Regular.ttf */; };
+		48C110A36D979724793E1A7F /* RealtimeSpeechRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 505145D8A4F309B4924BB0CE /* RealtimeSpeechRecognizer.swift */; };
 		4AF5DDAC5AC5B4962C55600B /* AIMobileSshTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BD57C56FFB1D7BD773DD1A1 /* AIMobileSshTools.swift */; };
+		4C4477065297E131AF9D8B52 /* AISessionDrawerDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 304FFD09224FC6A940E9EDCB /* AISessionDrawerDiagnostics.swift */; };
+		4C7BEDAB56558EA2A532AE0B /* AccountToolsUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = A45963E1F6BECDABFBE96C68 /* AccountToolsUITestFixture.swift */; };
 		4C86EAFE404AF67E31CE9CBB /* DiagnosticLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = F91FF912AF9143D67795C97B /* DiagnosticLog.swift */; };
 		4D5C692662551DEA7F8CE433 /* MaiVideoCircleModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CEC5B18391DFD3ED641C749A /* MaiVideoCircleModel.swift */; };
+		523851CFD4281968BC40232D /* CloudImagePagerUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE680399025BF6064EE4D1F6 /* CloudImagePagerUITestFixtures.swift */; };
+		53565B38F2B1AFED1003A884 /* MaiPortraitPhotoProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 245C057A28FAF775D0A497E4 /* MaiPortraitPhotoProcessor.swift */; };
 		565AD4A1181778D023B2900E /* MobilePermissionTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = E40A92474C9E88F01019EDA5 /* MobilePermissionTools.swift */; };
+		57CEE29226B16905B9CC580F /* AIMobileSMSSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 095581B180AD2AAAFC91022F /* AIMobileSMSSettingsView.swift */; };
+		59787B6FD41111DD1ABB2E4A /* AppPageTitle.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2E42E45D8966090A859C27 /* AppPageTitle.swift */; };
+		5AFF59B23112D0239C3D877F /* fonts in Resources */ = {isa = PBXBuildFile; fileRef = 2832C84176ED41ACA2687F1B /* fonts */; };
 		5BFEB4C291120FC8B8A03DBB /* MasterChatStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 975D1B034E3ED14E787A9284 /* MasterChatStateTests.swift */; };
+		621FE51E6375FDBA2BE6BA2F /* BrowserUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8327FD46843F69C469D7793F /* BrowserUITests.swift */; };
 		6247CB164955518ADFF0D16A /* MaiFfplayIosBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = BC37326EBA1AE3428883E2A4 /* MaiFfplayIosBridge.cpp */; };
+		63DAFF51496A33DE5FE119A7 /* MobileSMSInboxTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CF89D1E5551CD9CA33C43A4 /* MobileSMSInboxTests.swift */; };
 		6497E7B3D6E8EA40BDF3D625 /* MarkdownInlineStyling.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F61CFA51E87A9791A0ECB26 /* MarkdownInlineStyling.swift */; };
+		650D6805B7F1C40F6CBF6331 /* AILocalInferenceUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69CDC9A44DA7E05B9516BCDD /* AILocalInferenceUITestFixture.swift */; };
 		6526F8020603CE866D68BC78 /* MaiVideoCircleClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DA09567A8E5CDF295C4A8E4 /* MaiVideoCircleClient.swift */; };
+		6557AE3DFD637DAD453DC1EF /* AppTypographyTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 824450885029170E949F29EA /* AppTypographyTokens.swift */; };
+		65FDB70E4181A3DDCFA2FEA8 /* AIMobileSMSImportIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6DAEBCC4E50C0CA4C2C00BD /* AIMobileSMSImportIntent.swift */; };
 		6602E48DB6C9BA2E18F73866 /* MessageBubbleLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C5A4C74E12DC407146E1EBF /* MessageBubbleLayout.swift */; };
 		678592B693D2A02D2B12A4BC /* remote-diagnostics-report.json in Resources */ = {isa = PBXBuildFile; fileRef = 8C57A0E06309C4F110DA1CBF /* remote-diagnostics-report.json */; };
+		67A4EC33E93EC66E1C786AB9 /* PlaybackControlsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 327ACCEAC5EE641B963C2E31 /* PlaybackControlsUITests.swift */; };
+		6A4A1CF43D2143D47EB9BD7E /* AppAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1435B66AEF9C0CE769E12FE7 /* AppAppearance.swift */; };
+		6F27F3334A1E232B6A80E3E4 /* AIMobileSMSInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94C41D820ED78119CDF742EC /* AIMobileSMSInbox.swift */; };
 		6F8A66D5F8344B2C0A738BE6 /* CloudDriveDeviceReadOnlySmokeUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FFB5E24161F8E400C19FB64 /* CloudDriveDeviceReadOnlySmokeUITests.swift */; };
-		6FA2296AE72440AA993F7C12 /* CloudDriveFolderBrowseUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FA2296AE72440AA993F7C13 /* CloudDriveFolderBrowseUITests.swift */; };
 		70CBD7973F5A4E17FD5955DD /* MaiChatAttachmentDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1D43CB045C50EED65F90E94 /* MaiChatAttachmentDownloader.swift */; };
+		750210DB432C2217891827B0 /* AIAssistantBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D38C95838607147DF6ACE19 /* AIAssistantBrowserView.swift */; };
+		760B0760C7109DCF87096FE4 /* AIOutgoingMessageQueue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A40E6944BEEEC734B27FFC9 /* AIOutgoingMessageQueue.swift */; };
+		7879DCC9479B831802F11AEA /* AccountCodeCooldownTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3430B039E16E694276340FC /* AccountCodeCooldownTests.swift */; };
+		788EAE47F375AFB5FF45C724 /* AIOutgoingMessageQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79DE5C121104EFD753CB69F2 /* AIOutgoingMessageQueueTests.swift */; };
+		799B5E67647F1FD4B5F3874B /* GroupChatUITestData.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7B7C526A1ED0B638B908CD2 /* GroupChatUITestData.swift */; };
+		79A4482AFDEB799184A64DEA /* PortraitUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33CE1C2407A2ADDD0C141A9B /* PortraitUITestFixture.swift */; };
 		7CA7F5C3C26143C75F69AC61 /* DiagnosticLogFileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A066546C97129E56C379365 /* DiagnosticLogFileStore.swift */; };
 		80014E0AD21DD45ABC9E3E35 /* MaiChatIMTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = C12D574F08359081230E0D3A /* MaiChatIMTools.swift */; };
 		80344E9754C2829FF2587CC2 /* MaiChatHttpTransport.cpp in Sources */ = {isa = PBXBuildFile; fileRef = B5711C22CDFDA05345598D84 /* MaiChatHttpTransport.cpp */; };
 		85FCBAC4610F6234A4215930 /* KeychainSecretStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FE19F9A1D05D98FE499F66B /* KeychainSecretStore.swift */; };
+		864E0A0974E56D8322BB0648 /* AccountToolsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 186FA75C76C188F6593BE78E /* AccountToolsUITests.swift */; };
 		865303D314A23F16D52058CE /* TencentSpeechRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E787240441066658C94A84DE /* TencentSpeechRecognizer.swift */; };
 		9032311C79468BE8D517F4ED /* MaiCloudDriveModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41EEBD50557FEDE54CCA64F9 /* MaiCloudDriveModel.swift */; };
 		91722667D29CD5A82A3A2E00 /* AIAssistantView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C319AE871235F0F7386CF383 /* AIAssistantView.swift */; };
+		93BBAAF780BEE3360548B277 /* MaiLocalMediaPager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28D8AD58B83B7A86314F546A /* MaiLocalMediaPager.swift */; };
+		93E798F4D764E580785DAD8C /* browser_server.cpython-314.pyc in Resources */ = {isa = PBXBuildFile; fileRef = 52E444CA42F7D206AD959C8E /* browser_server.cpython-314.pyc */; };
 		9647FC458C5CF43214B64E71 /* LocalChatHistoryStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59C1F4DABEBD721F3CB32385 /* LocalChatHistoryStoreTests.swift */; };
 		98BA28EC2B95E5BDEB0D7120 /* ContactsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FF39890C4F255D9CCC67B03 /* ContactsView.swift */; };
 		9BBB482670AD1810394FABB9 /* RemoteDiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5897033F54602274C5F58A4A /* RemoteDiagnosticsView.swift */; };
 		9CEE6443CEA6DFF1F20AAF48 /* RemoteIMAppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0F4570F9254D92809B25F35 /* RemoteIMAppState.swift */; };
 		9D0563575F319BE5C4DEBEB6 /* TencentIMClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C74D63C0AABABA134584A252 /* TencentIMClient.swift */; };
 		9EF853C23CC0121860279D06 /* SocialLoginUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAB7CB3554291BE63987EC07 /* SocialLoginUITests.swift */; };
+		9FD29D53802DE5CBE1EE82D0 /* browser_server.py in Resources */ = {isa = PBXBuildFile; fileRef = 31ADCC02AABA0DDD6C858475 /* browser_server.py */; };
 		A0787EEE0051E9674B39C7C0 /* PhoneAccountLoginView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9289D6B36E7E744EA1D6D196 /* PhoneAccountLoginView.swift */; };
+		A1B4A1EF5E7DF15807BD85CD /* AIAssistantUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE811292FBDC9F5C915A62AD /* AIAssistantUITestFixtures.swift */; };
+		A3691544C42771D297FE4A02 /* AIPrimaryModelDeviceProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E39DA374FF7DA67FA1D1A60 /* AIPrimaryModelDeviceProbe.swift */; };
 		A4FE70D1E7F52FD7C3E93B6C /* CloudDriveProductionCanaryUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4844275C1326313FC09CA83F /* CloudDriveProductionCanaryUITests.swift */; };
 		A61181A92420CE7BED70E67C /* LocalChatHistoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 131DCE635A48A9FA78E58E2E /* LocalChatHistoryStore.swift */; };
+		A68D038DD4D29D7F3CD851A1 /* MySecondaryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76C7D0A12A24ABBAD09B11AC /* MySecondaryViews.swift */; };
 		A96F037E371DD412156D6280 /* RemoteDiagnosticsCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 862125851990D87705405E68 /* RemoteDiagnosticsCoordinator.swift */; };
 		AF2B042FEDAA2F92B745DF53 /* MaiChatHttpClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 441C2D782141408514365477 /* MaiChatHttpClient.swift */; };
 		B01A0AEA22E375F4C4C7EF8E /* MaiChatAuthTransport.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1736378541B4DD835F46A183 /* MaiChatAuthTransport.cpp */; };
+		B2102F5969F09D006D8FC2C8 /* AIAssistantModel+UITesting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5581AF6F742B813887C927BF /* AIAssistantModel+UITesting.swift */; };
 		B3C7936F82D3E8A8FCE2998D /* LocalChatHistoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 131DCE635A48A9FA78E58E2E /* LocalChatHistoryStore.swift */; };
+		B993D5825DAD4A3F6C1ABF58 /* AppFontAssets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08411EAB16861C9E5B8F2132 /* AppFontAssets.swift */; };
 		BBD727996B6D9BF10BBB15FC /* MaiCloudDriveProductionCanaryCredential.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EFBEB437244CED3D8DC9B4D /* MaiCloudDriveProductionCanaryCredential.swift */; };
+		BBE2272BE695BB803249DBDF /* AIMobileBrowserTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AB076E66623E4B1D6D04FE9 /* AIMobileBrowserTools.swift */; };
+		BBFD1467C11D7855F9CAB7DD /* SarasaFixedSC-Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = B09E1DD2B5884DA6AA947C4D /* SarasaFixedSC-Regular.ttf */; };
+		BCE111C4DD3C3A3EDFEA9180 /* AIOutgoingMessagePump.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA14CC3E1AF3D98A3EE97569 /* AIOutgoingMessagePump.swift */; };
 		BE9564FF3CB798F45146F479 /* RemoteInputPacketTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 642E16B2EF5CA26E0EC53657 /* RemoteInputPacketTests.swift */; };
 		BF67EA97E4832C7CB516E18C /* SocialPhoneBindingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F69C36ED4BC53DE34F2D08CA /* SocialPhoneBindingView.swift */; };
-		94BDEAD66F18D3151E28ABCD /* MaiLocalMediaPager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94BDEAD66F18D3151E28ABCE /* MaiLocalMediaPager.swift */; };
 		C0AE3CB8A0041B5827EB9C52 /* MaiFfplayVideoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 749D3372E6EB0A110EDC7FB3 /* MaiFfplayVideoView.swift */; };
+		C2F2942ED37FC79FBCF68D14 /* AppStorageSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D9E10B71130E420750651B0E /* AppStorageSettingsView.swift */; };
 		C46604FD176732DD945AB319 /* RemoteDesktopSignal.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBCF1B230D1ACE9CD4748EE4 /* RemoteDesktopSignal.swift */; };
+		C6813221E63286DC8D7319A6 /* CloudDriveFolderBrowseUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C6692189A35E574A836F408 /* CloudDriveFolderBrowseUITests.swift */; };
+		C6E64D816F8C216393AADB45 /* httpbin-form.html in Resources */ = {isa = PBXBuildFile; fileRef = 4C225149A2FB51B21338F9B0 /* httpbin-form.html */; };
+		C83FC3CB98B20BC5A06346F7 /* PortraitUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38C504E6E5A41DD41EF2AE46 /* PortraitUITests.swift */; };
 		CAE5C1AEEBE80B9A14E59DAE /* LocalSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4FD40D258B32299ADDF36C3 /* LocalSettingsStore.swift */; };
+		CD25D27FC8230AD4C4EDC8C8 /* AILocalModelStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF418F1F9067998C3B21BA92 /* AILocalModelStoreTests.swift */; };
+		D0F2CD2AF99D619A7F299CF9 /* AppUITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E7229BE2EE6C7B998C860F4 /* AppUITestSupport.swift */; };
 		D153C2A4F2F5D6211CEB78B5 /* DesktopLoginScanView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D2095160132FC761449A82E /* DesktopLoginScanView.swift */; };
 		D24E6578A8A7EDF92BD0A9E4 /* video-circle-source.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 29ED9E52F55FF7B33F57D37C /* video-circle-source.mp4 */; };
+		D33D3EF1E1F564EDB44C7F7E /* MaiCloudDriveImagePager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7392F1754C193B2E75E6339C /* MaiCloudDriveImagePager.swift */; };
 		D357B7A7100F4773EB0864A6 /* MobilePhotoTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54414E908C459EF659BD48AD /* MobilePhotoTools.swift */; };
-		25DE731960DD4652B35BF097 /* MaiPortraitPhotoProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE03536076A1485083AC78A8 /* MaiPortraitPhotoProcessor.swift */; };
 		D745B4CE59A50B7DD36C83E0 /* AIAssistantPathPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB30A9BB79A305FE900BF9E5 /* AIAssistantPathPolicy.swift */; };
 		D8890915CD794198A0332BB2 /* MaiChatCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 771AB137E6961E2B9187CFEB /* MaiChatCore.framework */; };
 		DD0212F81BF7429B14829650 /* MobileImageTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8888872A869DC80CF8DF58B6 /* MobileImageTools.swift */; };
+		DDB74028C6497789CC7DF112 /* PrimaryModelsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4DEA82D066705E45EA7CD6E /* PrimaryModelsUITests.swift */; };
+		DE68E9FD069A387DE6B9102A /* LICENSE-SarasaFixedSC.txt in Resources */ = {isa = PBXBuildFile; fileRef = 71BF7C1975A6A8D7934F8AFD /* LICENSE-SarasaFixedSC.txt */; };
 		DEBCE768E14C523F47FC7CC5 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A6457534DA0479F3AD712C60 /* Assets.xcassets */; };
 		DF3DC5AB29D30556D9094095 /* RemoteDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C089D3C5D222B69986D04F /* RemoteDiagnostics.swift */; };
 		DF6DB710A7BAB0AD6FA5093B /* AgentDocumentTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = A66CCCBA03D225DD809F9F11 /* AgentDocumentTools.swift */; };
 		DF9681343308096189F53377 /* MarkdownPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E7FEB21284BEBC9F1AEDC19 /* MarkdownPresentation.swift */; };
-		E1D165386F4D23C334D9C2C0 /* Pods_MaiChat.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 426F2EF7911EDDCD7A4CC05C /* Pods_MaiChat.framework */; };
 		E33E3494243A3DDB309C0D94 /* MarkdownInlineStyling.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F61CFA51E87A9791A0ECB26 /* MarkdownInlineStyling.swift */; };
+		E3877AE81A1621B9D68997FC /* AppFontAssets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08411EAB16861C9E5B8F2132 /* AppFontAssets.swift */; };
+		E3C2CC60308E48F64E9A0F9A /* AILocalInferenceRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = F36518C296550A8DBD857F56 /* AILocalInferenceRuntime.swift */; };
+		E44DBB9A1A87C51D55D00A3B /* ChatUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06A685726E0637CAE9E0E783 /* ChatUITestFixtures.swift */; };
 		E5BF3394A45A4DA77030A3E9 /* RemoteDesktopSignalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF3AA66C952DF0D15005D6BE /* RemoteDesktopSignalTests.swift */; };
+		E5FB8A9EA66B3B9094AD2DE2 /* AIPrimaryModelUITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04A1DB55011531B9A3C95610 /* AIPrimaryModelUITestSupport.swift */; };
 		E614ECA45B50A47575FB9B82 /* DesktopLoginUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F3E7E371D631DE55D3D718C /* DesktopLoginUITests.swift */; };
 		E6827C0322D4694D998F2551 /* RemoteIMClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F156552A73C378980D11946 /* RemoteIMClient.swift */; };
+		E7A82FA7EABE783674FD7D56 /* AIMobileCameraCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E15712F302EEB2AF10ECCF2 /* AIMobileCameraCapture.swift */; };
 		EA00C27B7280EF805853CF84 /* MaiChatCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 771AB137E6961E2B9187CFEB /* MaiChatCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		EC03ECE682F5464A72A9C9E9 /* AIAssistantTextDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B01DEFD318C6FB127528D6F0 /* AIAssistantTextDecoder.swift */; };
 		EC4CC462A846C4BBBB877005 /* RemoteDesktopSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 34435FC46F139141F33B8DBF /* RemoteDesktopSession.swift */; };
+		ECFA3017473738D476B0EF28 /* AppTypographyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC1BDC1E5B9CFCEB0211160 /* AppTypographyTests.swift */; };
+		EDA65553ACBB02C464075669 /* AppAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1435B66AEF9C0CE769E12FE7 /* AppAppearance.swift */; };
 		F0D9326831C7925F6C4FC5D6 /* DiagnosticLogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E85A5C5C020900B2D0178B0A /* DiagnosticLogTests.swift */; };
 		F5418DE3092242A1E77BD638 /* MaiCloudDriveClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F2675F0F73004CB0E64EF24 /* MaiCloudDriveClient.swift */; };
+		F6872878C23C1B83C4CDFC28 /* MaiAccountProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B96C8AF4A3B38EE7F6C29E03 /* MaiAccountProfile.swift */; };
+		FC9931461E7A3F588C982347 /* AccountCodeCooldown.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82ADF68A81D4654BC382352F /* AccountCodeCooldown.swift */; };
 		FD528D33CC1DD16F835A3DD2 /* RemoteDiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5897033F54602274C5F58A4A /* RemoteDiagnosticsView.swift */; };
+		FDA2578FF477E1ECA48FF2E7 /* Pods_MaiChat.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 214646A398A175538DB4E41C /* Pods_MaiChat.framework */; };
 		FEA124404840D00F968F232A /* RemoteDesktopView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96C6084AAC26D9F252151972 /* RemoteDesktopView.swift */; };
-		70467023ED27455C3F0D7F56 /* AIAssistantModel+UITesting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D6AEEF497AF12C5AC0D8830 /* AIAssistantModel+UITesting.swift */; };
-		CD33CAFFD2CCD150280DD669 /* AIAssistantUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = F143E54A2E02B861C71B4912 /* AIAssistantUITestFixtures.swift */; };
-		0A25E40C9A746E802631C408 /* AISessionDrawerDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 92A6B87FA07CEFE77630E158 /* AISessionDrawerDiagnostics.swift */; };
-		418A1035153D6947FA4829F4 /* AppUITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 060E93A596039BFA991824E8 /* AppUITestSupport.swift */; };
-		571FDABF48F306A08274F862 /* ChatUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3FE951D4732465CA3CD85159 /* ChatUITestFixtures.swift */; };
-		60933569B9940BDDC862CFEA /* CloudDriveUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06DCD7EBBC3080717AFCF449 /* CloudDriveUITestFixtures.swift */; };
-		88217EC402BB981B39276A5D /* CloudImagePagerUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 992582E5F167CA0BD3EC6D03 /* CloudImagePagerUITestFixtures.swift */; };
-		792E6D5DD3A20B1EBDF1A9A1 /* MediaUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB25AFEE3235DD2B37CBEF79 /* MediaUITestFixtures.swift */; };
-		42F9DE5FF6A82BBC45D6E256 /* ScreenCaptureUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A7E28CACF5B75E559765AC7 /* ScreenCaptureUITestFixtures.swift */; };
-		26E07E6A677FDD3E7072C256 /* ScreenFramesUITestFixtures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 516EF0EC77000EAD40764A61 /* ScreenFramesUITestFixtures.swift */; };
-		6ABDB5A748DDA42D015DFAFF /* BrowserUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1711F6A2BEE1F77400D9D4CF /* BrowserUITestFixture.swift */; };
-		E7F9F5D4B6C2F7336B696B41 /* PortraitUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 015A64746F062D22CF72E042 /* PortraitUITestFixture.swift */; };
-		445783157F33489E8359C10C /* CameraUITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBBF1467007387E21204EA62 /* CameraUITestSupport.swift */; };
-		0AD77A68A30DFE0DDE8E88F9 /* GroupChatUITestData.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABE03DA77EC93EB1EFACD5D9 /* GroupChatUITestData.swift */; };
-		97387C3DF0C593C94754987C /* BrowserUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F72661B3076526C813462A35 /* BrowserUITests.swift */; };
-		46DC2FB7BFD7AAAB22B1B0B7 /* PortraitUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7E870F1F61ED5F83EBA6082 /* PortraitUITests.swift */; };
-		E9B117C085EA4D2A90737A10 /* PlaybackControlsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9B117C085EA4D2A90737A11 /* PlaybackControlsUITests.swift */; };
-		72F672A2C1333661B56ED12E /* AIMobileSMSInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = F687FEACE78BB73932DD6F66 /* AIMobileSMSInbox.swift */; };
-		39ADA5737D5477155B335019 /* AIMobileSMSImportIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8935A1601510CD98F08B68AA /* AIMobileSMSImportIntent.swift */; };
-		0ADF7EC5D1BA22A4E635B1EC /* AIMobileSMSSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA84E515ED6BF4E3F07A80A8 /* AIMobileSMSSettingsView.swift */; };
-		1B2C1AB32D317000A4CC94E1 /* MobileSMSInboxTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A0AF163BF44D0E393F0584B /* MobileSMSInboxTests.swift */; };
-		62AB469886D80D2A01959EBD /* AIMobileSMSInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = F687FEACE78BB73932DD6F66 /* AIMobileSMSInbox.swift */; };
-		8C02CA83DF38277D733725E4 /* MaiAccountProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E9155CBA293213BCC861B8B /* MaiAccountProfile.swift */; };
-		8329CA88A262F76CB2FA76F0 /* AccountToolsUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = D90D7FACFE8BCCEA31D0BF20 /* AccountToolsUITestFixture.swift */; };
-		C2D5DF25D72C1E7A1610BE92 /* AccountToolsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A4165956D22773A034F0701 /* AccountToolsUITests.swift */; };
+		FFAF8D81EC77F8653412DEEE /* AIMobileSMSInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94C41D820ED78119CDF742EC /* AIMobileSMSInbox.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -203,79 +224,96 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		CC8F75C8DBC53FFF4453A944 /* SarasaFixedSC-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = "SarasaFixedSC-Regular.ttf"; path = "../../Resources/fonts/SarasaFixedSC-Regular.ttf"; sourceTree = SOURCE_ROOT; };
-		CEE6F50BE9878D57B82966E1 /* LICENSE-SarasaFixedSC.txt */ = {isa = PBXFileReference; lastKnownFileType = text; name = "LICENSE-SarasaFixedSC.txt"; path = "../../Resources/fonts/LICENSE-SarasaFixedSC.txt"; sourceTree = SOURCE_ROOT; };
-		CE69F2012EFB4FC038D2D699 /* AIPrimaryModelDeviceProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/DebugSupport/AIPrimaryModelDeviceProbe.swift"; sourceTree = SOURCE_ROOT; };
-		170122169934D4AB42F45741 /* PrimaryModelsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatUITests/PrimaryModelsUITests.swift"; sourceTree = SOURCE_ROOT; };
-		77CF7376E440B653788B306C /* AIPrimaryModelUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/DebugSupport/AIPrimaryModelUITestSupport.swift"; sourceTree = SOURCE_ROOT; };
-		80EADE8B96704E502A286785 /* LocalModelsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatUITests/LocalModelsUITests.swift"; sourceTree = SOURCE_ROOT; };
-		973AD0DAC1EF76407EBA047E /* AIOutgoingMessageRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/Views/AIOutgoingMessageRowView.swift"; sourceTree = SOURCE_ROOT; };
-		54AFDD184FEAA7382DDC254D /* AIOutgoingMessagePump.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/AIOutgoingMessagePump.swift"; sourceTree = SOURCE_ROOT; };
-		8958ED4FC332352057B46898 /* AIOutgoingMessagePayload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChat/Assistant/AIOutgoingMessagePayload.swift"; sourceTree = SOURCE_ROOT; };
-		5C7AB4E0622930D4A056CBE0 /* AIOutgoingMessageQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatTests/AIOutgoingMessageQueueTests.swift"; sourceTree = SOURCE_ROOT; };
-		D50A51C97C5A7381086D8241 /* AILocalModelStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatTests/AILocalModelStoreTests.swift"; sourceTree = SOURCE_ROOT; };
-		EE78D1022E3334AA73A37B92 /* AIOutgoingMessageQueue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatCore/Assistant/AIOutgoingMessageQueue.swift"; sourceTree = SOURCE_ROOT; };
-		F48E0D4E7D60AF8CD083F504 /* AILocalModelStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MaiChatCore/Assistant/AILocalModelStore.swift"; sourceTree = SOURCE_ROOT; };
-		7BCB5FFEB9C9B11BB747DE4D /* LocalInferenceUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalInferenceUITests.swift; sourceTree = "<group>"; };
-		EAA6C971B5AE1B704B174CB5 /* AILocalInferenceUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AILocalInferenceUITestFixture.swift; sourceTree = "<group>"; };
-		6DB66B5A5984C9EF151C6F89 /* AILocalInferenceRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AILocalInferenceRuntime.swift; sourceTree = "<group>"; };
-		212C484CFEC8D824343ED193 /* RealtimeSpeechRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeSpeechRecognizer.swift; sourceTree = "<group>"; };
-		F2EE8714FB985188F6A07079 /* AliyunSpeechTranscript.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AliyunSpeechTranscript.swift; sourceTree = "<group>"; };
-		A146916AC8B530236EAA5708 /* AliyunRealtimeSpeechRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AliyunRealtimeSpeechRecognizer.swift; sourceTree = "<group>"; };
-		CB86796D266A41859B688E02 /* AccountCodeCooldown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountCodeCooldown.swift; sourceTree = "<group>"; };
-		CB86796D266A41859B688E04 /* AccountCodeCooldownTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountCodeCooldownTests.swift; sourceTree = "<group>"; };
-		22A65816850A01D44D6F4A9F /* ScreenFrameArchiveUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenFrameArchiveUITests.swift; sourceTree = "<group>"; };
-		699DD641EBF222F19503CD4B /* AIMobileScreenFramesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileScreenFramesView.swift; sourceTree = "<group>"; };
-		C4A881E263A97B3D41E6C002 /* AIMobileCameraCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileCameraCapture.swift; sourceTree = "<group>"; };
-		8BD3F9C5BD5EE3D987670129 /* AIMobileScreenFrameArchive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileScreenFrameArchive.swift; sourceTree = "<group>"; };
-		751C9C7EC4D79C407AB8992B /* MaiCloudDriveImagePager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiCloudDriveImagePager.swift; sourceTree = "<group>"; };
 		0075BCCB2188B8EB8E6F11FA /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		0194E7C7F438293A088E45E0 /* MarkdownPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownPresentationTests.swift; sourceTree = "<group>"; };
+		04A1DB55011531B9A3C95610 /* AIPrimaryModelUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIPrimaryModelUITestSupport.swift; sourceTree = "<group>"; };
+		06A685726E0637CAE9E0E783 /* ChatUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatUITestFixtures.swift; sourceTree = "<group>"; };
+		08411EAB16861C9E5B8F2132 /* AppFontAssets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppFontAssets.swift; sourceTree = "<group>"; };
+		095581B180AD2AAAFC91022F /* AIMobileSMSSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileSMSSettingsView.swift; sourceTree = "<group>"; };
 		0EFBEB437244CED3D8DC9B4D /* MaiCloudDriveProductionCanaryCredential.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiCloudDriveProductionCanaryCredential.swift; sourceTree = "<group>"; };
 		0F156552A73C378980D11946 /* RemoteIMClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteIMClient.swift; sourceTree = "<group>"; };
+		10452DFEC44A265F1B1DF758 /* ScreenCaptureUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureUITestFixtures.swift; sourceTree = "<group>"; };
 		131DCE635A48A9FA78E58E2E /* LocalChatHistoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalChatHistoryStore.swift; sourceTree = "<group>"; };
+		1435B66AEF9C0CE769E12FE7 /* AppAppearance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppAppearance.swift; sourceTree = "<group>"; };
+		14EC0B1938F79D2E1754A41C /* ScreenFramesUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenFramesUITestFixtures.swift; sourceTree = "<group>"; };
 		1736378541B4DD835F46A183 /* MaiChatAuthTransport.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MaiChatAuthTransport.cpp; sourceTree = "<group>"; };
+		186FA75C76C188F6593BE78E /* AccountToolsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountToolsUITests.swift; sourceTree = "<group>"; };
+		18CB0E75ECDD174514CFF647 /* Pods-MaiChat.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-MaiChat.release.xcconfig"; path = "Target Support Files/Pods-MaiChat/Pods-MaiChat.release.xcconfig"; sourceTree = "<group>"; };
 		1DA09567A8E5CDF295C4A8E4 /* MaiVideoCircleClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiVideoCircleClient.swift; sourceTree = "<group>"; };
 		1F8D037EEC9C74A8F43E4083 /* remote-diagnostics-failure-receipts.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "remote-diagnostics-failure-receipts.json"; sourceTree = "<group>"; };
+		1FED20B9BC536846A6FC6BB3 /* MySettingsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MySettingsUITests.swift; sourceTree = "<group>"; };
+		20C61B705C24536DD3A03695 /* AppTypography.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTypography.swift; sourceTree = "<group>"; };
+		214646A398A175538DB4E41C /* Pods_MaiChat.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_MaiChat.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		245C057A28FAF775D0A497E4 /* MaiPortraitPhotoProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiPortraitPhotoProcessor.swift; sourceTree = "<group>"; };
 		24AF3608C85D5AE5D045283D /* AIAssistantModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIAssistantModel.swift; sourceTree = "<group>"; };
+		26C5C0CBE964E8A150325408 /* LocalInferenceUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalInferenceUITests.swift; sourceTree = "<group>"; };
+		2832C84176ED41ACA2687F1B /* fonts */ = {isa = PBXFileReference; lastKnownFileType = folder; name = fonts; path = ../../Presentation/fonts; sourceTree = SOURCE_ROOT; };
+		28D8AD58B83B7A86314F546A /* MaiLocalMediaPager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiLocalMediaPager.swift; sourceTree = "<group>"; };
 		29776A2C7E5D525FFA6CED8D /* AIMobileHostToolProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileHostToolProvider.swift; sourceTree = "<group>"; };
-		F2D771B8A5334D159C238C02 /* AIMobileBrowserTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileBrowserTools.swift; sourceTree = "<group>"; };
-		C9D2CD930801CFDC68ED81AB /* AIAssistantBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIAssistantBrowserView.swift; sourceTree = "<group>"; };
-		7090E768648CE5F2D55AD135 /* AIMobileScreenCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileScreenCapture.swift; sourceTree = "<group>"; };
 		29ED9E52F55FF7B33F57D37C /* video-circle-source.mp4 */ = {isa = PBXFileReference; path = "video-circle-source.mp4"; sourceTree = "<group>"; };
 		2ABED4C39BFBF823F387BE75 /* RemoteDiagnosticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDiagnosticsTests.swift; sourceTree = "<group>"; };
 		2AF4D9C0BD1E990F8C3DAF26 /* MaiChat.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = MaiChat.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		2B596B570E3F1EC948188E4F /* Pods-MaiChat.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-MaiChat.release.xcconfig"; path = "Target Support Files/Pods-MaiChat/Pods-MaiChat.release.xcconfig"; sourceTree = "<group>"; };
 		2BD57C56FFB1D7BD773DD1A1 /* AIMobileSshTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileSshTools.swift; sourceTree = "<group>"; };
 		2FE19F9A1D05D98FE499F66B /* KeychainSecretStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainSecretStore.swift; sourceTree = "<group>"; };
+		304FFD09224FC6A940E9EDCB /* AISessionDrawerDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AISessionDrawerDiagnostics.swift; sourceTree = "<group>"; };
+		3058282469E191A83FDF3CC2 /* CloudDriveUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudDriveUITestFixtures.swift; sourceTree = "<group>"; };
+		31ADCC02AABA0DDD6C858475 /* browser_server.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = browser_server.py; sourceTree = "<group>"; };
+		327ACCEAC5EE641B963C2E31 /* PlaybackControlsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackControlsUITests.swift; sourceTree = "<group>"; };
+		33CE1C2407A2ADDD0C141A9B /* PortraitUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortraitUITestFixture.swift; sourceTree = "<group>"; };
 		34435FC46F139141F33B8DBF /* RemoteDesktopSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDesktopSession.swift; sourceTree = "<group>"; };
+		358BE40BF9DC97A7658AF28B /* Pods-MaiChat.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-MaiChat.debug.xcconfig"; path = "Target Support Files/Pods-MaiChat/Pods-MaiChat.debug.xcconfig"; sourceTree = "<group>"; };
+		35C33E4A86A3C9C3DBBB7077 /* AIMobileScreenCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileScreenCapture.swift; sourceTree = "<group>"; };
+		362BB3CB4B3251315C55B8B3 /* AliyunSpeechTranscript.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AliyunSpeechTranscript.swift; sourceTree = "<group>"; };
+		38C504E6E5A41DD41EF2AE46 /* PortraitUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortraitUITests.swift; sourceTree = "<group>"; };
 		3C5A4C74E12DC407146E1EBF /* MessageBubbleLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageBubbleLayout.swift; sourceTree = "<group>"; };
+		3C6692189A35E574A836F408 /* CloudDriveFolderBrowseUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudDriveFolderBrowseUITests.swift; sourceTree = "<group>"; };
+		3D38C95838607147DF6ACE19 /* AIAssistantBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIAssistantBrowserView.swift; sourceTree = "<group>"; };
+		3E15712F302EEB2AF10ECCF2 /* AIMobileCameraCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileCameraCapture.swift; sourceTree = "<group>"; };
+		3F044A1FAD06EF5A68D6D388 /* AIOutgoingMessageRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIOutgoingMessageRowView.swift; sourceTree = "<group>"; };
 		3FE9276ACB6564FDA4876587 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		41D9DAF7C3785B28932B4577 /* MaiVideoCircleView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiVideoCircleView.swift; sourceTree = "<group>"; };
 		41EEBD50557FEDE54CCA64F9 /* MaiCloudDriveModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiCloudDriveModel.swift; sourceTree = "<group>"; };
-		426F2EF7911EDDCD7A4CC05C /* Pods_MaiChat.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_MaiChat.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		42DFDC3E438CDFE0E82AB8E9 /* MaiChatTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = MaiChatTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		441C2D782141408514365477 /* MaiChatHttpClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiChatHttpClient.swift; sourceTree = "<group>"; };
 		4844275C1326313FC09CA83F /* CloudDriveProductionCanaryUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudDriveProductionCanaryUITests.swift; sourceTree = "<group>"; };
 		489905ADED5F3469B72DB261 /* MaiCloudDriveAgentPlaybackCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiCloudDriveAgentPlaybackCache.swift; sourceTree = "<group>"; };
+		4C225149A2FB51B21338F9B0 /* httpbin-form.html */ = {isa = PBXFileReference; lastKnownFileType = text.html; path = "httpbin-form.html"; sourceTree = "<group>"; };
 		4E3D9F697A1737B461CCB2EB /* MaiChatUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = MaiChatUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		4E7229BE2EE6C7B998C860F4 /* AppUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUITestSupport.swift; sourceTree = "<group>"; };
+		505145D8A4F309B4924BB0CE /* RealtimeSpeechRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeSpeechRecognizer.swift; sourceTree = "<group>"; };
+		52E444CA42F7D206AD959C8E /* browser_server.cpython-314.pyc */ = {isa = PBXFileReference; path = "browser_server.cpython-314.pyc"; sourceTree = "<group>"; };
 		54414E908C459EF659BD48AD /* MobilePhotoTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobilePhotoTools.swift; sourceTree = "<group>"; };
-		EE03536076A1485083AC78A8 /* MaiPortraitPhotoProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiPortraitPhotoProcessor.swift; sourceTree = "<group>"; };
+		5581AF6F742B813887C927BF /* AIAssistantModel+UITesting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIAssistantModel+UITesting.swift"; sourceTree = "<group>"; };
 		5897033F54602274C5F58A4A /* RemoteDiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDiagnosticsView.swift; sourceTree = "<group>"; };
+		58C5F7FC7D5E65C5F1F3D849 /* AppPreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppPreferences.swift; sourceTree = "<group>"; };
 		59C1F4DABEBD721F3CB32385 /* LocalChatHistoryStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalChatHistoryStoreTests.swift; sourceTree = "<group>"; };
+		5AB076E66623E4B1D6D04FE9 /* AIMobileBrowserTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileBrowserTools.swift; sourceTree = "<group>"; };
+		5CF89D1E5551CD9CA33C43A4 /* MobileSMSInboxTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileSMSInboxTests.swift; sourceTree = "<group>"; };
+		5E39DA374FF7DA67FA1D1A60 /* AIPrimaryModelDeviceProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIPrimaryModelDeviceProbe.swift; sourceTree = "<group>"; };
 		5FFB5E24161F8E400C19FB64 /* CloudDriveDeviceReadOnlySmokeUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudDriveDeviceReadOnlySmokeUITests.swift; sourceTree = "<group>"; };
-		6FA2296AE72440AA993F7C13 /* CloudDriveFolderBrowseUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudDriveFolderBrowseUITests.swift; sourceTree = "<group>"; };
 		642E16B2EF5CA26E0EC53657 /* RemoteInputPacketTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInputPacketTests.swift; sourceTree = "<group>"; };
 		66BE3D0F16E24A4DF136E427 /* MaiFfplayIosBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MaiFfplayIosBridge.h; sourceTree = "<group>"; };
+		69CDC9A44DA7E05B9516BCDD /* AILocalInferenceUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AILocalInferenceUITestFixture.swift; sourceTree = "<group>"; };
+		6F8ADD3B152CB2E98930E4B4 /* AILocalModelStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AILocalModelStore.swift; sourceTree = "<group>"; };
+		6FD82E79022BE18AE4D23FFA /* MediaUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaUITestFixtures.swift; sourceTree = "<group>"; };
 		6FF39890C4F255D9CCC67B03 /* ContactsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactsView.swift; sourceTree = "<group>"; };
+		71BF7C1975A6A8D7934F8AFD /* LICENSE-SarasaFixedSC.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "LICENSE-SarasaFixedSC.txt"; sourceTree = "<group>"; };
+		7392F1754C193B2E75E6339C /* MaiCloudDriveImagePager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiCloudDriveImagePager.swift; sourceTree = "<group>"; };
 		73E259698A238F25ED2ED12E /* MaiChatApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiChatApp.swift; sourceTree = "<group>"; };
-		94BDEAD66F18D3151E28ABCE /* MaiLocalMediaPager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiLocalMediaPager.swift; sourceTree = "<group>"; };
 		749D3372E6EB0A110EDC7FB3 /* MaiFfplayVideoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiFfplayVideoView.swift; sourceTree = "<group>"; };
+		76C7D0A12A24ABBAD09B11AC /* MySecondaryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MySecondaryViews.swift; sourceTree = "<group>"; };
 		7702BC2F6BF7F9BF6571E11C /* ffplay-seek-sample.mp4 */ = {isa = PBXFileReference; path = "ffplay-seek-sample.mp4"; sourceTree = "<group>"; };
 		771AB137E6961E2B9187CFEB /* MaiChatCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = MaiChatCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		79DE5C121104EFD753CB69F2 /* AIOutgoingMessageQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIOutgoingMessageQueueTests.swift; sourceTree = "<group>"; };
+		7A5191B01D201B98AFD4E1F7 /* AIMobileScreenFramesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileScreenFramesView.swift; sourceTree = "<group>"; };
+		7B3BB5B39FF593766914E334 /* ScreenFrameArchiveUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenFrameArchiveUITests.swift; sourceTree = "<group>"; };
 		7E7FEB21284BEBC9F1AEDC19 /* MarkdownPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownPresentation.swift; sourceTree = "<group>"; };
+		824450885029170E949F29EA /* AppTypographyTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTypographyTokens.swift; sourceTree = "<group>"; };
+		82ADF68A81D4654BC382352F /* AccountCodeCooldown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountCodeCooldown.swift; sourceTree = "<group>"; };
+		8327FD46843F69C469D7793F /* BrowserUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserUITests.swift; sourceTree = "<group>"; };
 		862125851990D87705405E68 /* RemoteDiagnosticsCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDiagnosticsCoordinator.swift; sourceTree = "<group>"; };
 		8888872A869DC80CF8DF58B6 /* MobileImageTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileImageTools.swift; sourceTree = "<group>"; };
+		89C53568C4F652D63C72CCAF /* CameraUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraUITestSupport.swift; sourceTree = "<group>"; };
 		89FDF5DC4F6DB91F2A1B3FD5 /* AIAssistantUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIAssistantUITests.swift; sourceTree = "<group>"; };
 		8A47E3BD08877657A12C0C35 /* AppDiagnosticLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDiagnosticLog.swift; sourceTree = "<group>"; };
 		8C56C06620B6A4AB7289B13D /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -286,68 +324,65 @@
 		8F3E7E371D631DE55D3D718C /* DesktopLoginUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopLoginUITests.swift; sourceTree = "<group>"; };
 		8F61CFA51E87A9791A0ECB26 /* MarkdownInlineStyling.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownInlineStyling.swift; sourceTree = "<group>"; };
 		91C089D3C5D222B69986D04F /* RemoteDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDiagnostics.swift; sourceTree = "<group>"; };
+		91C18CACCCB44B8CA9D004A9 /* AliyunRealtimeSpeechRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AliyunRealtimeSpeechRecognizer.swift; sourceTree = "<group>"; };
 		9289D6B36E7E744EA1D6D196 /* PhoneAccountLoginView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneAccountLoginView.swift; sourceTree = "<group>"; };
-		94F17FE4491979CA0B257D3F /* Pods-MaiChat.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-MaiChat.debug.xcconfig"; path = "Target Support Files/Pods-MaiChat/Pods-MaiChat.debug.xcconfig"; sourceTree = "<group>"; };
+		94C41D820ED78119CDF742EC /* AIMobileSMSInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileSMSInbox.swift; sourceTree = "<group>"; };
 		96C6084AAC26D9F252151972 /* RemoteDesktopView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDesktopView.swift; sourceTree = "<group>"; };
 		975D1B034E3ED14E787A9284 /* MasterChatStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MasterChatStateTests.swift; sourceTree = "<group>"; };
 		9A066546C97129E56C379365 /* DiagnosticLogFileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticLogFileStore.swift; sourceTree = "<group>"; };
+		9A40E6944BEEEC734B27FFC9 /* AIOutgoingMessageQueue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIOutgoingMessageQueue.swift; sourceTree = "<group>"; };
+		A2B32178167C2411DE886093 /* AIMobileScreenFrameArchive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileScreenFrameArchive.swift; sourceTree = "<group>"; };
+		A45963E1F6BECDABFBE96C68 /* AccountToolsUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountToolsUITestFixture.swift; sourceTree = "<group>"; };
 		A47856A6735559D9160BB50C /* MaiCloudDriveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiCloudDriveView.swift; sourceTree = "<group>"; };
+		A4DEA82D066705E45EA7CD6E /* PrimaryModelsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrimaryModelsUITests.swift; sourceTree = "<group>"; };
 		A4FD40D258B32299ADDF36C3 /* LocalSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalSettingsStore.swift; sourceTree = "<group>"; };
 		A6457534DA0479F3AD712C60 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A66CCCBA03D225DD809F9F11 /* AgentDocumentTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDocumentTools.swift; sourceTree = "<group>"; };
 		A781F92B5DE618E07394EA0C /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		AB30A9BB79A305FE900BF9E5 /* AIAssistantPathPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIAssistantPathPolicy.swift; sourceTree = "<group>"; };
+		AD2E42E45D8966090A859C27 /* AppPageTitle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppPageTitle.swift; sourceTree = "<group>"; };
 		AE6737BFED0DFE1A50F676EE /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		AFC47464E3C7D9F6FBA8DD16 /* RemoteInputPacket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInputPacket.swift; sourceTree = "<group>"; };
 		B01DEFD318C6FB127528D6F0 /* AIAssistantTextDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIAssistantTextDecoder.swift; sourceTree = "<group>"; };
+		B09E1DD2B5884DA6AA947C4D /* SarasaFixedSC-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "SarasaFixedSC-Regular.ttf"; sourceTree = "<group>"; };
+		B3430B039E16E694276340FC /* AccountCodeCooldownTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountCodeCooldownTests.swift; sourceTree = "<group>"; };
+		B46FF11070D2B398B608D67B /* BrowserUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserUITestFixture.swift; sourceTree = "<group>"; };
 		B50DFFBE34DBDEC32CFF76D2 /* MaiChat-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "MaiChat-Bridging-Header.h"; sourceTree = "<group>"; };
 		B5711C22CDFDA05345598D84 /* MaiChatHttpTransport.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MaiChatHttpTransport.cpp; sourceTree = "<group>"; };
+		B96C8AF4A3B38EE7F6C29E03 /* MaiAccountProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiAccountProfile.swift; sourceTree = "<group>"; };
 		BC37326EBA1AE3428883E2A4 /* MaiFfplayIosBridge.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MaiFfplayIosBridge.cpp; sourceTree = "<group>"; };
+		BE680399025BF6064EE4D1F6 /* CloudImagePagerUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudImagePagerUITestFixtures.swift; sourceTree = "<group>"; };
 		BF3AA66C952DF0D15005D6BE /* RemoteDesktopSignalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDesktopSignalTests.swift; sourceTree = "<group>"; };
 		C12D574F08359081230E0D3A /* MaiChatIMTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiChatIMTools.swift; sourceTree = "<group>"; };
 		C2DF82DAA4C777AE10172A57 /* MaiChatAuthTransport.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MaiChatAuthTransport.h; sourceTree = "<group>"; };
 		C319AE871235F0F7386CF383 /* AIAssistantView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIAssistantView.swift; sourceTree = "<group>"; };
+		C6DAEBCC4E50C0CA4C2C00BD /* AIMobileSMSImportIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileSMSImportIntent.swift; sourceTree = "<group>"; };
 		C74D63C0AABABA134584A252 /* TencentIMClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TencentIMClient.swift; sourceTree = "<group>"; };
 		C846ED66C1F881705954E761 /* ComposerDraftState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerDraftState.swift; sourceTree = "<group>"; };
+		CE8BB3C88041916FBCDAFDD7 /* AIOutgoingMessagePayload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIOutgoingMessagePayload.swift; sourceTree = "<group>"; };
 		CEC5B18391DFD3ED641C749A /* MaiVideoCircleModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiVideoCircleModel.swift; sourceTree = "<group>"; };
+		CF418F1F9067998C3B21BA92 /* AILocalModelStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AILocalModelStoreTests.swift; sourceTree = "<group>"; };
 		D1D43CB045C50EED65F90E94 /* MaiChatAttachmentDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiChatAttachmentDownloader.swift; sourceTree = "<group>"; };
+		D9E10B71130E420750651B0E /* AppStorageSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppStorageSettingsView.swift; sourceTree = "<group>"; };
 		DAB7CB3554291BE63987EC07 /* SocialLoginUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SocialLoginUITests.swift; sourceTree = "<group>"; };
 		DE31D307132E0C37078DFFAB /* MasterChatState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MasterChatState.swift; sourceTree = "<group>"; };
 		E0F4570F9254D92809B25F35 /* RemoteIMAppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteIMAppState.swift; sourceTree = "<group>"; };
 		E40A92474C9E88F01019EDA5 /* MobilePermissionTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobilePermissionTools.swift; sourceTree = "<group>"; };
 		E595B7644B6095C6A8A4E5CE /* MaiChatSystemProxy.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MaiChatSystemProxy.h; sourceTree = "<group>"; };
 		E787240441066658C94A84DE /* TencentSpeechRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TencentSpeechRecognizer.swift; sourceTree = "<group>"; };
+		E7B7C526A1ED0B638B908CD2 /* GroupChatUITestData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroupChatUITestData.swift; sourceTree = "<group>"; };
 		E85A5C5C020900B2D0178B0A /* DiagnosticLogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticLogTests.swift; sourceTree = "<group>"; };
+		E9018FE69F2EBA87F3B9F3B7 /* LocalModelsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalModelsUITests.swift; sourceTree = "<group>"; };
 		EC4C6DC9135AD53A7FEDD3DA /* MaiChatAuthClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiChatAuthClient.swift; sourceTree = "<group>"; };
+		EE811292FBDC9F5C915A62AD /* AIAssistantUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIAssistantUITestFixtures.swift; sourceTree = "<group>"; };
+		F36518C296550A8DBD857F56 /* AILocalInferenceRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AILocalInferenceRuntime.swift; sourceTree = "<group>"; };
 		F4EB70A8DA823BB88C100094 /* MaiChatHttpTransport.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MaiChatHttpTransport.h; sourceTree = "<group>"; };
 		F69C36ED4BC53DE34F2D08CA /* SocialPhoneBindingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SocialPhoneBindingView.swift; sourceTree = "<group>"; };
 		F91FF912AF9143D67795C97B /* DiagnosticLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticLog.swift; sourceTree = "<group>"; };
+		FA14CC3E1AF3D98A3EE97569 /* AIOutgoingMessagePump.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIOutgoingMessagePump.swift; sourceTree = "<group>"; };
+		FAC1BDC1E5B9CFCEB0211160 /* AppTypographyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTypographyTests.swift; sourceTree = "<group>"; };
 		FBCF1B230D1ACE9CD4748EE4 /* RemoteDesktopSignal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDesktopSignal.swift; sourceTree = "<group>"; };
 		FBE546568A0B3FFA1551D803 /* SpeechRecognizing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechRecognizing.swift; sourceTree = "<group>"; };
-		1D6AEEF497AF12C5AC0D8830 /* AIAssistantModel+UITesting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIAssistantModel+UITesting.swift"; sourceTree = "<group>"; };
-		F143E54A2E02B861C71B4912 /* AIAssistantUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AIAssistantUITestFixtures.swift"; sourceTree = "<group>"; };
-		92A6B87FA07CEFE77630E158 /* AISessionDrawerDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AISessionDrawerDiagnostics.swift"; sourceTree = "<group>"; };
-		060E93A596039BFA991824E8 /* AppUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppUITestSupport.swift"; sourceTree = "<group>"; };
-		3FE951D4732465CA3CD85159 /* ChatUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ChatUITestFixtures.swift"; sourceTree = "<group>"; };
-		06DCD7EBBC3080717AFCF449 /* CloudDriveUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudDriveUITestFixtures.swift"; sourceTree = "<group>"; };
-		992582E5F167CA0BD3EC6D03 /* CloudImagePagerUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CloudImagePagerUITestFixtures.swift"; sourceTree = "<group>"; };
-		EB25AFEE3235DD2B37CBEF79 /* MediaUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MediaUITestFixtures.swift"; sourceTree = "<group>"; };
-		2A7E28CACF5B75E559765AC7 /* ScreenCaptureUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ScreenCaptureUITestFixtures.swift"; sourceTree = "<group>"; };
-		516EF0EC77000EAD40764A61 /* ScreenFramesUITestFixtures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ScreenFramesUITestFixtures.swift"; sourceTree = "<group>"; };
-		1711F6A2BEE1F77400D9D4CF /* BrowserUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserUITestFixture.swift; sourceTree = "<group>"; };
-		015A64746F062D22CF72E042 /* PortraitUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortraitUITestFixture.swift; sourceTree = "<group>"; };
-		DBBF1467007387E21204EA62 /* CameraUITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraUITestSupport.swift; sourceTree = "<group>"; };
-		ABE03DA77EC93EB1EFACD5D9 /* GroupChatUITestData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroupChatUITestData.swift; sourceTree = "<group>"; };
-		F72661B3076526C813462A35 /* BrowserUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserUITests.swift; sourceTree = "<group>"; };
-		E7E870F1F61ED5F83EBA6082 /* PortraitUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortraitUITests.swift; sourceTree = "<group>"; };
-		E9B117C085EA4D2A90737A11 /* PlaybackControlsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackControlsUITests.swift; sourceTree = "<group>"; };
-		F687FEACE78BB73932DD6F66 /* AIMobileSMSInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileSMSInbox.swift; sourceTree = "<group>"; };
-		8935A1601510CD98F08B68AA /* AIMobileSMSImportIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileSMSImportIntent.swift; sourceTree = "<group>"; };
-		DA84E515ED6BF4E3F07A80A8 /* AIMobileSMSSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIMobileSMSSettingsView.swift; sourceTree = "<group>"; };
-		3A0AF163BF44D0E393F0584B /* MobileSMSInboxTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileSMSInboxTests.swift; sourceTree = "<group>"; };
-		8E9155CBA293213BCC861B8B /* MaiAccountProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiAccountProfile.swift; sourceTree = "<group>"; };
-		D90D7FACFE8BCCEA31D0BF20 /* AccountToolsUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountToolsUITestFixture.swift; sourceTree = "<group>"; };
-		6A4165956D22773A034F0701 /* AccountToolsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountToolsUITests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -356,7 +391,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				D8890915CD794198A0332BB2 /* MaiChatCore.framework in Frameworks */,
-				E1D165386F4D23C334D9C2C0 /* Pods_MaiChat.framework in Frameworks */,
+				FDA2578FF477E1ECA48FF2E7 /* Pods_MaiChat.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -371,6 +406,41 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		23E7EFC9A0583A0B378A6651 /* Pods */ = {
+			isa = PBXGroup;
+			children = (
+				358BE40BF9DC97A7658AF28B /* Pods-MaiChat.debug.xcconfig */,
+				18CB0E75ECDD174514CFF647 /* Pods-MaiChat.release.xcconfig */,
+			);
+			name = Pods;
+			path = Pods;
+			sourceTree = "<group>";
+		};
+		28C875B035A69D935E549730 /* DebugSupport */ = {
+			isa = PBXGroup;
+			children = (
+				A45963E1F6BECDABFBE96C68 /* AccountToolsUITestFixture.swift */,
+				5581AF6F742B813887C927BF /* AIAssistantModel+UITesting.swift */,
+				EE811292FBDC9F5C915A62AD /* AIAssistantUITestFixtures.swift */,
+				69CDC9A44DA7E05B9516BCDD /* AILocalInferenceUITestFixture.swift */,
+				5E39DA374FF7DA67FA1D1A60 /* AIPrimaryModelDeviceProbe.swift */,
+				04A1DB55011531B9A3C95610 /* AIPrimaryModelUITestSupport.swift */,
+				304FFD09224FC6A940E9EDCB /* AISessionDrawerDiagnostics.swift */,
+				4E7229BE2EE6C7B998C860F4 /* AppUITestSupport.swift */,
+				B46FF11070D2B398B608D67B /* BrowserUITestFixture.swift */,
+				89C53568C4F652D63C72CCAF /* CameraUITestSupport.swift */,
+				06A685726E0637CAE9E0E783 /* ChatUITestFixtures.swift */,
+				3058282469E191A83FDF3CC2 /* CloudDriveUITestFixtures.swift */,
+				BE680399025BF6064EE4D1F6 /* CloudImagePagerUITestFixtures.swift */,
+				E7B7C526A1ED0B638B908CD2 /* GroupChatUITestData.swift */,
+				6FD82E79022BE18AE4D23FFA /* MediaUITestFixtures.swift */,
+				33CE1C2407A2ADDD0C141A9B /* PortraitUITestFixture.swift */,
+				10452DFEC44A265F1B1DF758 /* ScreenCaptureUITestFixtures.swift */,
+				14EC0B1938F79D2E1754A41C /* ScreenFramesUITestFixtures.swift */,
+			);
+			path = DebugSupport;
+			sourceTree = "<group>";
+		};
 		2AF428EE27AADAE407C2B3FE /* MaiChat */ = {
 			isa = PBXGroup;
 			children = (
@@ -383,8 +453,8 @@
 				705E67BE604383D52BABE2D5 /* Chat */,
 				A0A32D09BB00261D66B6FFF5 /* CloudDrive */,
 				A6173F234030B5DA148EA7AD /* Contacts */,
+				28C875B035A69D935E549730 /* DebugSupport */,
 				4AC8CEA89B065BE353A5549A /* Diagnostics */,
-				FC6CBF8F8032BA5889FFE7AE /* DebugSupport */,
 				54465CEE1C20AEE9267E6E5E /* IM */,
 				63816AD21B434C5107F93E78 /* MaiChatTools */,
 				CAA65B25C21A859CA5AD1D59 /* Media */,
@@ -400,21 +470,32 @@
 		3CD4EF3DABF7B0B21E1E7C1C /* MaiChatUITests */ = {
 			isa = PBXGroup;
 			children = (
+				186FA75C76C188F6593BE78E /* AccountToolsUITests.swift */,
 				89FDF5DC4F6DB91F2A1B3FD5 /* AIAssistantUITests.swift */,
-				7BCB5FFEB9C9B11BB747DE4D /* LocalInferenceUITests.swift */,
-				F72661B3076526C813462A35 /* BrowserUITests.swift */,
-				E7E870F1F61ED5F83EBA6082 /* PortraitUITests.swift */,
-				6A4165956D22773A034F0701 /* AccountToolsUITests.swift */,
-				E9B117C085EA4D2A90737A11 /* PlaybackControlsUITests.swift */,
+				8327FD46843F69C469D7793F /* BrowserUITests.swift */,
 				5FFB5E24161F8E400C19FB64 /* CloudDriveDeviceReadOnlySmokeUITests.swift */,
-				6FA2296AE72440AA993F7C13 /* CloudDriveFolderBrowseUITests.swift */,
-				22A65816850A01D44D6F4A9F /* ScreenFrameArchiveUITests.swift */,
+				3C6692189A35E574A836F408 /* CloudDriveFolderBrowseUITests.swift */,
 				4844275C1326313FC09CA83F /* CloudDriveProductionCanaryUITests.swift */,
 				8F3E7E371D631DE55D3D718C /* DesktopLoginUITests.swift */,
+				26C5C0CBE964E8A150325408 /* LocalInferenceUITests.swift */,
+				E9018FE69F2EBA87F3B9F3B7 /* LocalModelsUITests.swift */,
+				1FED20B9BC536846A6FC6BB3 /* MySettingsUITests.swift */,
+				327ACCEAC5EE641B963C2E31 /* PlaybackControlsUITests.swift */,
+				38C504E6E5A41DD41EF2AE46 /* PortraitUITests.swift */,
+				A4DEA82D066705E45EA7CD6E /* PrimaryModelsUITests.swift */,
+				7B3BB5B39FF593766914E334 /* ScreenFrameArchiveUITests.swift */,
 				DAB7CB3554291BE63987EC07 /* SocialLoginUITests.swift */,
 				660A8D8471A610ABC4AB7BB5 /* Fixtures */,
 			);
 			path = MaiChatUITests;
+			sourceTree = "<group>";
+		};
+		49AF6EDA6AF92DCF3B38E6A6 /* __pycache__ */ = {
+			isa = PBXGroup;
+			children = (
+				52E444CA42F7D206AD959C8E /* browser_server.cpython-314.pyc */,
+			);
+			path = __pycache__;
 			sourceTree = "<group>";
 		};
 		4AC8CEA89B065BE353A5549A /* Diagnostics */ = {
@@ -427,20 +508,11 @@
 			path = Diagnostics;
 			sourceTree = "<group>";
 		};
-		4F333DE021D24CE09E117E27 /* Pods */ = {
-			isa = PBXGroup;
-			children = (
-				94F17FE4491979CA0B257D3F /* Pods-MaiChat.debug.xcconfig */,
-				2B596B570E3F1EC948188E4F /* Pods-MaiChat.release.xcconfig */,
-			);
-			name = Pods;
-			path = Pods;
-			sourceTree = "<group>";
-		};
 		54465CEE1C20AEE9267E6E5E /* IM */ = {
 			isa = PBXGroup;
 			children = (
 				131DCE635A48A9FA78E58E2E /* LocalChatHistoryStore.swift */,
+				B96C8AF4A3B38EE7F6C29E03 /* MaiAccountProfile.swift */,
 				D1D43CB045C50EED65F90E94 /* MaiChatAttachmentDownloader.swift */,
 				EC4C6DC9135AD53A7FEDD3DA /* MaiChatAuthClient.swift */,
 				1736378541B4DD835F46A183 /* MaiChatAuthTransport.cpp */,
@@ -450,7 +522,6 @@
 				F4EB70A8DA823BB88C100094 /* MaiChatHttpTransport.h */,
 				E595B7644B6095C6A8A4E5CE /* MaiChatSystemProxy.h */,
 				E0F4570F9254D92809B25F35 /* RemoteIMAppState.swift */,
-				8E9155CBA293213BCC861B8B /* MaiAccountProfile.swift */,
 				0F156552A73C378980D11946 /* RemoteIMClient.swift */,
 				C74D63C0AABABA134584A252 /* TencentIMClient.swift */,
 			);
@@ -467,25 +538,33 @@
 			path = ../../../tests/fixtures;
 			sourceTree = "<group>";
 		};
+		5C07C2B302990738D962237F /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				3F044A1FAD06EF5A68D6D388 /* AIOutgoingMessageRowView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
 		63816AD21B434C5107F93E78 /* MaiChatTools */ = {
 			isa = PBXGroup;
 			children = (
-				8935A1601510CD98F08B68AA /* AIMobileSMSImportIntent.swift */,
-				F687FEACE78BB73932DD6F66 /* AIMobileSMSInbox.swift */,
 				A66CCCBA03D225DD809F9F11 /* AgentDocumentTools.swift */,
+				3D38C95838607147DF6ACE19 /* AIAssistantBrowserView.swift */,
+				5AB076E66623E4B1D6D04FE9 /* AIMobileBrowserTools.swift */,
+				3E15712F302EEB2AF10ECCF2 /* AIMobileCameraCapture.swift */,
 				29776A2C7E5D525FFA6CED8D /* AIMobileHostToolProvider.swift */,
-				F2D771B8A5334D159C238C02 /* AIMobileBrowserTools.swift */,
-				C9D2CD930801CFDC68ED81AB /* AIAssistantBrowserView.swift */,
-				7090E768648CE5F2D55AD135 /* AIMobileScreenCapture.swift */,
-				8BD3F9C5BD5EE3D987670129 /* AIMobileScreenFrameArchive.swift */,
-				699DD641EBF222F19503CD4B /* AIMobileScreenFramesView.swift */,
-				C4A881E263A97B3D41E6C002 /* AIMobileCameraCapture.swift */,
+				35C33E4A86A3C9C3DBBB7077 /* AIMobileScreenCapture.swift */,
+				A2B32178167C2411DE886093 /* AIMobileScreenFrameArchive.swift */,
+				7A5191B01D201B98AFD4E1F7 /* AIMobileScreenFramesView.swift */,
+				C6DAEBCC4E50C0CA4C2C00BD /* AIMobileSMSImportIntent.swift */,
+				94C41D820ED78119CDF742EC /* AIMobileSMSInbox.swift */,
 				2BD57C56FFB1D7BD773DD1A1 /* AIMobileSshTools.swift */,
 				C12D574F08359081230E0D3A /* MaiChatIMTools.swift */,
+				245C057A28FAF775D0A497E4 /* MaiPortraitPhotoProcessor.swift */,
 				8888872A869DC80CF8DF58B6 /* MobileImageTools.swift */,
 				E40A92474C9E88F01019EDA5 /* MobilePermissionTools.swift */,
 				54414E908C459EF659BD48AD /* MobilePhotoTools.swift */,
-				EE03536076A1485083AC78A8 /* MaiPortraitPhotoProcessor.swift */,
 			);
 			path = MaiChatTools;
 			sourceTree = "<group>";
@@ -493,7 +572,10 @@
 		660A8D8471A610ABC4AB7BB5 /* Fixtures */ = {
 			isa = PBXGroup;
 			children = (
+				31ADCC02AABA0DDD6C858475 /* browser_server.py */,
+				4C225149A2FB51B21338F9B0 /* httpbin-form.html */,
 				29ED9E52F55FF7B33F57D37C /* video-circle-source.mp4 */,
+				49AF6EDA6AF92DCF3B38E6A6 /* __pycache__ */,
 			);
 			path = Fixtures;
 			sourceTree = "<group>";
@@ -504,11 +586,19 @@
 				A781F92B5DE618E07394EA0C /* ChatView.swift */,
 				C846ED66C1F881705954E761 /* ComposerDraftState.swift */,
 				749D3372E6EB0A110EDC7FB3 /* MaiFfplayVideoView.swift */,
-				94BDEAD66F18D3151E28ABCE /* MaiLocalMediaPager.swift */,
+				28D8AD58B83B7A86314F546A /* MaiLocalMediaPager.swift */,
 				8F61CFA51E87A9791A0ECB26 /* MarkdownInlineStyling.swift */,
 				3C5A4C74E12DC407146E1EBF /* MessageBubbleLayout.swift */,
 			);
 			path = Chat;
+			sourceTree = "<group>";
+		};
+		77B327CC070E67BC035AB78C /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				214646A398A175538DB4E41C /* Pods_MaiChat.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 		77FEC2B53DE369B0BBAE5A10 /* Products */ = {
@@ -537,6 +627,8 @@
 			children = (
 				AB30A9BB79A305FE900BF9E5 /* AIAssistantPathPolicy.swift */,
 				B01DEFD318C6FB127528D6F0 /* AIAssistantTextDecoder.swift */,
+				6F8ADD3B152CB2E98930E4B4 /* AILocalModelStore.swift */,
+				9A40E6944BEEEC734B27FFC9 /* AIOutgoingMessageQueue.swift */,
 			);
 			path = Assistant;
 			sourceTree = "<group>";
@@ -556,7 +648,7 @@
 		97FD80F22E592A1AAC43BA2B /* IM */ = {
 			isa = PBXGroup;
 			children = (
-				CB86796D266A41859B688E02 /* AccountCodeCooldown.swift */,
+				82ADF68A81D4654BC382352F /* AccountCodeCooldown.swift */,
 				DE31D307132E0C37078DFFAB /* MasterChatState.swift */,
 			);
 			path = IM;
@@ -567,10 +659,10 @@
 			children = (
 				489905ADED5F3469B72DB261 /* MaiCloudDriveAgentPlaybackCache.swift */,
 				8F2675F0F73004CB0E64EF24 /* MaiCloudDriveClient.swift */,
+				7392F1754C193B2E75E6339C /* MaiCloudDriveImagePager.swift */,
 				41EEBD50557FEDE54CCA64F9 /* MaiCloudDriveModel.swift */,
 				0EFBEB437244CED3D8DC9B4D /* MaiCloudDriveProductionCanaryCredential.swift */,
 				A47856A6735559D9160BB50C /* MaiCloudDriveView.swift */,
-				751C9C7EC4D79C407AB8992B /* MaiCloudDriveImagePager.swift */,
 			);
 			path = CloudDrive;
 			sourceTree = "<group>";
@@ -578,6 +670,7 @@
 		A3620EA51D9091FC1A03EB42 /* Chat */ = {
 			isa = PBXGroup;
 			children = (
+				824450885029170E949F29EA /* AppTypographyTokens.swift */,
 				7E7FEB21284BEBC9F1AEDC19 /* MarkdownPresentation.swift */,
 			);
 			path = Chat;
@@ -596,7 +689,10 @@
 			children = (
 				24AF3608C85D5AE5D045283D /* AIAssistantModel.swift */,
 				C319AE871235F0F7386CF383 /* AIAssistantView.swift */,
-				6DB66B5A5984C9EF151C6F89 /* AILocalInferenceRuntime.swift */,
+				F36518C296550A8DBD857F56 /* AILocalInferenceRuntime.swift */,
+				CE8BB3C88041916FBCDAFDD7 /* AIOutgoingMessagePayload.swift */,
+				FA14CC3E1AF3D98A3EE97569 /* AIOutgoingMessagePump.swift */,
+				5C07C2B302990738D962237F /* Views */,
 			);
 			path = Assistant;
 			sourceTree = "<group>";
@@ -604,10 +700,17 @@
 		ADC2F6FCAD23F0E348F57EFE /* Settings */ = {
 			isa = PBXGroup;
 			children = (
-				DA84E515ED6BF4E3F07A80A8 /* AIMobileSMSSettingsView.swift */,
+				095581B180AD2AAAFC91022F /* AIMobileSMSSettingsView.swift */,
+				1435B66AEF9C0CE769E12FE7 /* AppAppearance.swift */,
+				08411EAB16861C9E5B8F2132 /* AppFontAssets.swift */,
+				AD2E42E45D8966090A859C27 /* AppPageTitle.swift */,
+				58C5F7FC7D5E65C5F1F3D849 /* AppPreferences.swift */,
+				D9E10B71130E420750651B0E /* AppStorageSettingsView.swift */,
+				20C61B705C24536DD3A03695 /* AppTypography.swift */,
 				8D2095160132FC761449A82E /* DesktopLoginScanView.swift */,
 				2FE19F9A1D05D98FE499F66B /* KeychainSecretStore.swift */,
 				A4FD40D258B32299ADDF36C3 /* LocalSettingsStore.swift */,
+				76C7D0A12A24ABBAD09B11AC /* MySecondaryViews.swift */,
 				8C56C06620B6A4AB7289B13D /* SettingsView.swift */,
 			);
 			path = Settings;
@@ -616,12 +719,15 @@
 		B10C14934159C0FF468D3AB1 /* MaiChatTests */ = {
 			isa = PBXGroup;
 			children = (
-				3A0AF163BF44D0E393F0584B /* MobileSMSInboxTests.swift */,
-				CB86796D266A41859B688E04 /* AccountCodeCooldownTests.swift */,
+				B3430B039E16E694276340FC /* AccountCodeCooldownTests.swift */,
+				CF418F1F9067998C3B21BA92 /* AILocalModelStoreTests.swift */,
+				79DE5C121104EFD753CB69F2 /* AIOutgoingMessageQueueTests.swift */,
+				FAC1BDC1E5B9CFCEB0211160 /* AppTypographyTests.swift */,
 				E85A5C5C020900B2D0178B0A /* DiagnosticLogTests.swift */,
 				59C1F4DABEBD721F3CB32385 /* LocalChatHistoryStoreTests.swift */,
 				0194E7C7F438293A088E45E0 /* MarkdownPresentationTests.swift */,
 				975D1B034E3ED14E787A9284 /* MasterChatStateTests.swift */,
+				5CF89D1E5551CD9CA33C43A4 /* MobileSMSInboxTests.swift */,
 				BF3AA66C952DF0D15005D6BE /* RemoteDesktopSignalTests.swift */,
 				2ABED4C39BFBF823F387BE75 /* RemoteDiagnosticsTests.swift */,
 				642E16B2EF5CA26E0EC53657 /* RemoteInputPacketTests.swift */,
@@ -629,21 +735,13 @@
 			path = MaiChatTests;
 			sourceTree = "<group>";
 		};
-		B3BAC170BC2E5EB2948B300E /* Frameworks */ = {
-			isa = PBXGroup;
-			children = (
-				426F2EF7911EDDCD7A4CC05C /* Pods_MaiChat.framework */,
-			);
-			name = Frameworks;
-			sourceTree = "<group>";
-		};
 		C713F05D68577907E4F52B1A /* Speech */ = {
 			isa = PBXGroup;
 			children = (
+				91C18CACCCB44B8CA9D004A9 /* AliyunRealtimeSpeechRecognizer.swift */,
+				362BB3CB4B3251315C55B8B3 /* AliyunSpeechTranscript.swift */,
+				505145D8A4F309B4924BB0CE /* RealtimeSpeechRecognizer.swift */,
 				FBE546568A0B3FFA1551D803 /* SpeechRecognizing.swift */,
-				212C484CFEC8D824343ED193 /* RealtimeSpeechRecognizer.swift */,
-				F2EE8714FB985188F6A07079 /* AliyunSpeechTranscript.swift */,
-				A146916AC8B530236EAA5708 /* AliyunRealtimeSpeechRecognizer.swift */,
 				E787240441066658C94A84DE /* TencentSpeechRecognizer.swift */,
 			);
 			path = Speech;
@@ -688,6 +786,16 @@
 			path = App;
 			sourceTree = "<group>";
 		};
+		DBB053EB8BE83DAB31CF107A /* fonts */ = {
+			isa = PBXGroup;
+			children = (
+				71BF7C1975A6A8D7934F8AFD /* LICENSE-SarasaFixedSC.txt */,
+				B09E1DD2B5884DA6AA947C4D /* SarasaFixedSC-Regular.ttf */,
+			);
+			name = fonts;
+			path = ../../Resources/fonts;
+			sourceTree = "<group>";
+		};
 		E1A40365ECAB0B644D9FB84F /* RemoteDesktop */ = {
 			isa = PBXGroup;
 			children = (
@@ -700,60 +808,26 @@
 		E7962CFBC9970F3F3E757668 = {
 			isa = PBXGroup;
 			children = (
+				2832C84176ED41ACA2687F1B /* fonts */,
 				5B05726C2DC305E87DF922E6 /* fixtures */,
+				DBB053EB8BE83DAB31CF107A /* fonts */,
 				2AF428EE27AADAE407C2B3FE /* MaiChat */,
 				963B8982A2C2F09901650272 /* MaiChatCore */,
 				B10C14934159C0FF468D3AB1 /* MaiChatTests */,
 				3CD4EF3DABF7B0B21E1E7C1C /* MaiChatUITests */,
-				170122169934D4AB42F45741 /* PrimaryModelsUITests.swift */,
-				80EADE8B96704E502A286785 /* LocalModelsUITests.swift */,
-				973AD0DAC1EF76407EBA047E /* AIOutgoingMessageRowView.swift */,
-				54AFDD184FEAA7382DDC254D /* AIOutgoingMessagePump.swift */,
-				8958ED4FC332352057B46898 /* AIOutgoingMessagePayload.swift */,
-				5C7AB4E0622930D4A056CBE0 /* AIOutgoingMessageQueueTests.swift */,
-				D50A51C97C5A7381086D8241 /* AILocalModelStoreTests.swift */,
-				CE69F2012EFB4FC038D2D699 /* AIPrimaryModelDeviceProbe.swift */,
-				77CF7376E440B653788B306C /* AIPrimaryModelUITestSupport.swift */,
-				EE78D1022E3334AA73A37B92 /* AIOutgoingMessageQueue.swift */,
-				F48E0D4E7D60AF8CD083F504 /* AILocalModelStore.swift */,
 				77FEC2B53DE369B0BBAE5A10 /* Products */,
-				4F333DE021D24CE09E117E27 /* Pods */,
-				B3BAC170BC2E5EB2948B300E /* Frameworks */,
+				23E7EFC9A0583A0B378A6651 /* Pods */,
+				77B327CC070E67BC035AB78C /* Frameworks */,
 			);
 			sourceTree = "<group>";
 		};
 		EE8ECD3A4C1B1963704B4FD5 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
-				CC8F75C8DBC53FFF4453A944 /* SarasaFixedSC-Regular.ttf */,
-				CEE6F50BE9878D57B82966E1 /* LICENSE-SarasaFixedSC.txt */,
 				8C7043E7ADEC49D3648291AF /* ffplay-sample.mp4 */,
 				7702BC2F6BF7F9BF6571E11C /* ffplay-seek-sample.mp4 */,
 			);
 			path = Resources;
-			sourceTree = "<group>";
-		};
-		FC6CBF8F8032BA5889FFE7AE /* DebugSupport */ = {
-			isa = PBXGroup;
-			children = (
-				1D6AEEF497AF12C5AC0D8830 /* AIAssistantModel+UITesting.swift */,
-				F143E54A2E02B861C71B4912 /* AIAssistantUITestFixtures.swift */,
-				EAA6C971B5AE1B704B174CB5 /* AILocalInferenceUITestFixture.swift */,
-				92A6B87FA07CEFE77630E158 /* AISessionDrawerDiagnostics.swift */,
-				060E93A596039BFA991824E8 /* AppUITestSupport.swift */,
-				ABE03DA77EC93EB1EFACD5D9 /* GroupChatUITestData.swift */,
-				DBBF1467007387E21204EA62 /* CameraUITestSupport.swift */,
-				1711F6A2BEE1F77400D9D4CF /* BrowserUITestFixture.swift */,
-				015A64746F062D22CF72E042 /* PortraitUITestFixture.swift */,
-				D90D7FACFE8BCCEA31D0BF20 /* AccountToolsUITestFixture.swift */,
-				3FE951D4732465CA3CD85159 /* ChatUITestFixtures.swift */,
-				06DCD7EBBC3080717AFCF449 /* CloudDriveUITestFixtures.swift */,
-				992582E5F167CA0BD3EC6D03 /* CloudImagePagerUITestFixtures.swift */,
-				EB25AFEE3235DD2B37CBEF79 /* MediaUITestFixtures.swift */,
-				2A7E28CACF5B75E559765AC7 /* ScreenCaptureUITestFixtures.swift */,
-				516EF0EC77000EAD40764A61 /* ScreenFramesUITestFixtures.swift */,
-			);
-			path = DebugSupport;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -814,15 +888,15 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 0D9FD032A94C57101C76BCAD /* Build configuration list for PBXNativeTarget "MaiChat" */;
 			buildPhases = (
-				A269D560738F7CAAE18CA85D /* [CP] Check Pods Manifest.lock */,
+				5620A17D1585B6F7E5231221 /* [CP] Check Pods Manifest.lock */,
 				FF8236E8DE97989BDFBD9493 /* Build MaiAgent */,
 				AC6ECB119E2A73D2BBDAE0EC /* Sources */,
 				3D122CAA634FBFB42F650CDF /* Resources */,
-				C9D11D36D9F9496A96B77B41 /* Bundle Primary Model */,
 				8E103EF7F186558DF147E3F6 /* Frameworks */,
 				FF4A677DEFE40393506C34EC /* Embed Frameworks */,
-				B2AFD5CF0348E3A7B0A41273 /* [CP] Embed Pods Frameworks */,
-				3185D470FC866656850A2AE5 /* [CP] Copy Pods Resources */,
+				EAC25C291BC1E49498EC4F5F /* Bundle Primary Model */,
+				8964C5DDCE850EA25FDD92FE /* [CP] Embed Pods Frameworks */,
+				37F6A4DCB6988A5E3F211374 /* [CP] Copy Pods Resources */,
 			);
 			buildRules = (
 			);
@@ -875,6 +949,9 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				3BB3173E37580E0B694C2CAD /* LICENSE-SarasaFixedSC.txt in Resources */,
+				47CB2D9C6592D635C5E3A5FB /* SarasaFixedSC-Regular.ttf in Resources */,
+				5AFF59B23112D0239C3D877F /* fonts in Resources */,
 				194EF7AD3FFBA215E15BC6C2 /* remote-diagnostics-failure-receipts.json in Resources */,
 				678592B693D2A02D2B12A4BC /* remote-diagnostics-report.json in Resources */,
 			);
@@ -884,12 +961,13 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				5C9BAD2A6133B9BAA1909A97 /* SarasaFixedSC-Regular.ttf in Resources */,
-				17912663BF5879F20D835AF8 /* LICENSE-SarasaFixedSC.txt in Resources */,
 				DEBCE768E14C523F47FC7CC5 /* Assets.xcassets in Resources */,
+				DE68E9FD069A387DE6B9102A /* LICENSE-SarasaFixedSC.txt in Resources */,
 				1505F33A923B571D5EF10FAD /* PrivacyInfo.xcprivacy in Resources */,
+				BBFD1467C11D7855F9CAB7DD /* SarasaFixedSC-Regular.ttf in Resources */,
 				2A55E61AA07338C31386DE07 /* ffplay-sample.mp4 in Resources */,
 				193A1C657EB5C24DF1A84BF4 /* ffplay-seek-sample.mp4 in Resources */,
+				29DF2B5ED09615927A7AE457 /* fonts in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -897,6 +975,9 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				93E798F4D764E580785DAD8C /* browser_server.cpython-314.pyc in Resources */,
+				9FD29D53802DE5CBE1EE82D0 /* browser_server.py in Resources */,
+				C6E64D816F8C216393AADB45 /* httpbin-form.html in Resources */,
 				D24E6578A8A7EDF92BD0A9E4 /* video-circle-source.mp4 in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -904,7 +985,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		3185D470FC866656850A2AE5 /* [CP] Copy Pods Resources */ = {
+		37F6A4DCB6988A5E3F211374 /* [CP] Copy Pods Resources */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -921,7 +1002,7 @@
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-MaiChat/Pods-MaiChat-resources.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
-		A269D560738F7CAAE18CA85D /* [CP] Check Pods Manifest.lock */ = {
+		5620A17D1585B6F7E5231221 /* [CP] Check Pods Manifest.lock */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -943,7 +1024,7 @@
 			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
 			showEnvVarsInLog = 0;
 		};
-		B2AFD5CF0348E3A7B0A41273 /* [CP] Embed Pods Frameworks */ = {
+		8964C5DDCE850EA25FDD92FE /* [CP] Embed Pods Frameworks */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -959,6 +1040,36 @@
 			shellPath = /bin/sh;
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-MaiChat/Pods-MaiChat-frameworks.sh\"\n";
 			showEnvVarsInLog = 0;
+		};
+		EAC25C291BC1E49498EC4F5F /* Bundle Primary Model */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(PROJECT_DIR)/scripts/prepare-bundled-primary-model.py",
+				"$(PROJECT_DIR)/BundledPrimaryModel/manifest.json",
+				"$(PROJECT_DIR)/BundledPrimaryModel/LICENSE",
+				"$(PROJECT_DIR)/BundledPrimaryModel/SOURCE.json",
+				"$(PROJECT_DIR)/BundledPrimaryModel/UPSTREAM_MODEL_CARD.md",
+				"$(PROJECT_DIR)/BundledPrimaryModel/Qwen_Qwen3.5-2B-Q4_K_M.gguf",
+			);
+			name = "Bundle Primary Model";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/manifest.json",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/LICENSE",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/SOURCE.json",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/UPSTREAM_MODEL_CARD.md",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/Qwen_Qwen3.5-2B-Q4_K_M.gguf",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "python3 \"$PROJECT_DIR/scripts/prepare-bundled-primary-model.py\" --bundle-directory \"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MaiLocalModels/Primary\"";
 		};
 		FF8236E8DE97989BDFBD9493 /* Build MaiAgent */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -979,32 +1090,6 @@
 			shellPath = /bin/sh;
 			shellScript = "bash \"$PROJECT_DIR/scripts/build-mobile-agent.sh\"";
 		};
-		C9D11D36D9F9496A96B77B41 /* Bundle Primary Model */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = ();
-			inputPaths = (
-				"$(PROJECT_DIR)/scripts/prepare-bundled-primary-model.py",
-				"$(PROJECT_DIR)/BundledPrimaryModel/manifest.json",
-				"$(PROJECT_DIR)/BundledPrimaryModel/LICENSE",
-				"$(PROJECT_DIR)/BundledPrimaryModel/SOURCE.json",
-				"$(PROJECT_DIR)/BundledPrimaryModel/UPSTREAM_MODEL_CARD.md",
-				"$(PROJECT_DIR)/BundledPrimaryModel/Qwen_Qwen3.5-2B-Q4_K_M.gguf",
-			);
-			name = "Bundle Primary Model";
-			outputPaths = (
-				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/manifest.json",
-				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/LICENSE",
-				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/SOURCE.json",
-				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/UPSTREAM_MODEL_CARD.md",
-				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MaiLocalModels/Primary/Qwen_Qwen3.5-2B-Q4_K_M.gguf",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "python3 \"$PROJECT_DIR/scripts/prepare-bundled-primary-model.py\" --bundle-directory \"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MaiLocalModels/Primary\"";
-			showEnvVarsInLog = 0;
-		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -1012,15 +1097,16 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				CB86796D266A41859B688E01 /* AccountCodeCooldown.swift in Sources */,
 				D745B4CE59A50B7DD36C83E0 /* AIAssistantPathPolicy.swift in Sources */,
 				EC03ECE682F5464A72A9C9E9 /* AIAssistantTextDecoder.swift in Sources */,
+				161B7D544D1171CFDE4F49E7 /* AILocalModelStore.swift in Sources */,
+				760B0760C7109DCF87096FE4 /* AIOutgoingMessageQueue.swift in Sources */,
+				FC9931461E7A3F588C982347 /* AccountCodeCooldown.swift in Sources */,
+				6557AE3DFD637DAD453DC1EF /* AppTypographyTokens.swift in Sources */,
 				4C86EAFE404AF67E31CE9CBB /* DiagnosticLog.swift in Sources */,
 				7CA7F5C3C26143C75F69AC61 /* DiagnosticLogFileStore.swift in Sources */,
 				DF9681343308096189F53377 /* MarkdownPresentation.swift in Sources */,
 				3FB5135EF0A464E4798EE349 /* MasterChatState.swift in Sources */,
-				698F33DD65C4A59DD221CFA8 /* AIOutgoingMessageQueue.swift in Sources */,
-				D526175AB40D14E9E37BBD39 /* AILocalModelStore.swift in Sources */,
 				C46604FD176732DD945AB319 /* RemoteDesktopSignal.swift in Sources */,
 				DF3DC5AB29D30556D9094095 /* RemoteDiagnostics.swift in Sources */,
 				30346792F4FE7D73D6F24B87 /* RemoteInputPacket.swift in Sources */,
@@ -1031,9 +1117,15 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				62AB469886D80D2A01959EBD /* AIMobileSMSInbox.swift in Sources */,
-				1B2C1AB32D317000A4CC94E1 /* MobileSMSInboxTests.swift in Sources */,
-				CB86796D266A41859B688E03 /* AccountCodeCooldownTests.swift in Sources */,
+				CD25D27FC8230AD4C4EDC8C8 /* AILocalModelStoreTests.swift in Sources */,
+				6F27F3334A1E232B6A80E3E4 /* AIMobileSMSInbox.swift in Sources */,
+				788EAE47F375AFB5FF45C724 /* AIOutgoingMessageQueueTests.swift in Sources */,
+				7879DCC9479B831802F11AEA /* AccountCodeCooldownTests.swift in Sources */,
+				EDA65553ACBB02C464075669 /* AppAppearance.swift in Sources */,
+				E3877AE81A1621B9D68997FC /* AppFontAssets.swift in Sources */,
+				59787B6FD41111DD1ABB2E4A /* AppPageTitle.swift in Sources */,
+				2DC2405C219F4F7D86E7B301 /* AppTypography.swift in Sources */,
+				ECFA3017473738D476B0EF28 /* AppTypographyTests.swift in Sources */,
 				0B2637847F5454F182126805 /* ComposerDraftState.swift in Sources */,
 				F0D9326831C7925F6C4FC5D6 /* DiagnosticLogTests.swift in Sources */,
 				B3C7936F82D3E8A8FCE2998D /* LocalChatHistoryStore.swift in Sources */,
@@ -1041,9 +1133,8 @@
 				E33E3494243A3DDB309C0D94 /* MarkdownInlineStyling.swift in Sources */,
 				3ED72F9BC221AED70A3677F5 /* MarkdownPresentationTests.swift in Sources */,
 				5BFEB4C291120FC8B8A03DBB /* MasterChatStateTests.swift in Sources */,
-				379C9247FD7652C65A375FAE /* AIOutgoingMessageQueueTests.swift in Sources */,
-				379D03CAD642A70E76F3F795 /* AILocalModelStoreTests.swift in Sources */,
 				19AC531DF862B4E8460E9AFC /* MessageBubbleLayout.swift in Sources */,
+				63DAFF51496A33DE5FE119A7 /* MobileSMSInboxTests.swift in Sources */,
 				E5BF3394A45A4DA77030A3E9 /* RemoteDesktopSignalTests.swift in Sources */,
 				060F9E4EA6E9FABAF30CF2E5 /* RemoteDiagnosticsCoordinator.swift in Sources */,
 				1B0DC102E851A3005DC43D69 /* RemoteDiagnosticsTests.swift in Sources */,
@@ -1056,50 +1147,55 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				0ADF7EC5D1BA22A4E635B1EC /* AIMobileSMSSettingsView.swift in Sources */,
-				39ADA5737D5477155B335019 /* AIMobileSMSImportIntent.swift in Sources */,
-				72F672A2C1333661B56ED12E /* AIMobileSMSInbox.swift in Sources */,
-				0AD77A68A30DFE0DDE8E88F9 /* GroupChatUITestData.swift in Sources */,
-				445783157F33489E8359C10C /* CameraUITestSupport.swift in Sources */,
-				6ABDB5A748DDA42D015DFAFF /* BrowserUITestFixture.swift in Sources */,
-				E7F9F5D4B6C2F7336B696B41 /* PortraitUITestFixture.swift in Sources */,
-				8329CA88A262F76CB2FA76F0 /* AccountToolsUITestFixture.swift in Sources */,
-				70467023ED27455C3F0D7F56 /* AIAssistantModel+UITesting.swift in Sources */,
-				CD33CAFFD2CCD150280DD669 /* AIAssistantUITestFixtures.swift in Sources */,
-				122E240613E362BBF149EFFE /* AILocalInferenceUITestFixture.swift in Sources */,
-				0A25E40C9A746E802631C408 /* AISessionDrawerDiagnostics.swift in Sources */,
-				418A1035153D6947FA4829F4 /* AppUITestSupport.swift in Sources */,
-				571FDABF48F306A08274F862 /* ChatUITestFixtures.swift in Sources */,
-				60933569B9940BDDC862CFEA /* CloudDriveUITestFixtures.swift in Sources */,
-				88217EC402BB981B39276A5D /* CloudImagePagerUITestFixtures.swift in Sources */,
-				792E6D5DD3A20B1EBDF1A9A1 /* MediaUITestFixtures.swift in Sources */,
-				42F9DE5FF6A82BBC45D6E256 /* ScreenCaptureUITestFixtures.swift in Sources */,
-				26E07E6A677FDD3E7072C256 /* ScreenFramesUITestFixtures.swift in Sources */,
+				750210DB432C2217891827B0 /* AIAssistantBrowserView.swift in Sources */,
+				B2102F5969F09D006D8FC2C8 /* AIAssistantModel+UITesting.swift in Sources */,
 				10E63571389FF61C9869CE9E /* AIAssistantModel.swift in Sources */,
+				A1B4A1EF5E7DF15807BD85CD /* AIAssistantUITestFixtures.swift in Sources */,
 				91722667D29CD5A82A3A2E00 /* AIAssistantView.swift in Sources */,
-				F8B3C2B1B42BAAE0624B9281 /* AILocalInferenceRuntime.swift in Sources */,
-				EDE2A4933AB84C43ECB16128 /* AIOutgoingMessageRowView.swift in Sources */,
-				44EC63C4BA77196CD975052F /* AIOutgoingMessagePump.swift in Sources */,
-				932F788A269D48825AD0C797 /* AIOutgoingMessagePayload.swift in Sources */,
-				CBAF828A4376CD76871EC9B4 /* AIPrimaryModelDeviceProbe.swift in Sources */,
-				225101CA9971BD78067D4B27 /* AIPrimaryModelUITestSupport.swift in Sources */,
-				F77BA084695F31C9AD6308A7 /* AIMobileScreenFramesView.swift in Sources */,
-				C4A881E263A97B3D41E6C001 /* AIMobileCameraCapture.swift in Sources */,
+				E3C2CC60308E48F64E9A0F9A /* AILocalInferenceRuntime.swift in Sources */,
+				650D6805B7F1C40F6CBF6331 /* AILocalInferenceUITestFixture.swift in Sources */,
+				BBE2272BE695BB803249DBDF /* AIMobileBrowserTools.swift in Sources */,
+				E7A82FA7EABE783674FD7D56 /* AIMobileCameraCapture.swift in Sources */,
 				0329ABDC04BBAC38945C24FA /* AIMobileHostToolProvider.swift in Sources */,
-				F2D771B8A5334D159C238C01 /* AIMobileBrowserTools.swift in Sources */,
-				0195E28DD186A948669EB9E1 /* AIAssistantBrowserView.swift in Sources */,
-				80A93D25352CFB7F9675EB89 /* AIMobileScreenCapture.swift in Sources */,
-				3CE9DB0AABBB106D926C907E /* AIMobileScreenFrameArchive.swift in Sources */,
+				65FDB70E4181A3DDCFA2FEA8 /* AIMobileSMSImportIntent.swift in Sources */,
+				FFAF8D81EC77F8653412DEEE /* AIMobileSMSInbox.swift in Sources */,
+				57CEE29226B16905B9CC580F /* AIMobileSMSSettingsView.swift in Sources */,
+				02E79EF06353052B990EE9E1 /* AIMobileScreenCapture.swift in Sources */,
+				199D137EB0ECB086D85B83FC /* AIMobileScreenFrameArchive.swift in Sources */,
+				18BE9338561E0A39791EF8F9 /* AIMobileScreenFramesView.swift in Sources */,
 				4AF5DDAC5AC5B4962C55600B /* AIMobileSshTools.swift in Sources */,
+				46A0E99B673B19DE0206BBCA /* AIOutgoingMessagePayload.swift in Sources */,
+				BCE111C4DD3C3A3EDFEA9180 /* AIOutgoingMessagePump.swift in Sources */,
+				36D5B0725A7CED42D48F6B5C /* AIOutgoingMessageRowView.swift in Sources */,
+				A3691544C42771D297FE4A02 /* AIPrimaryModelDeviceProbe.swift in Sources */,
+				E5FB8A9EA66B3B9094AD2DE2 /* AIPrimaryModelUITestSupport.swift in Sources */,
+				4C4477065297E131AF9D8B52 /* AISessionDrawerDiagnostics.swift in Sources */,
+				4C7BEDAB56558EA2A532AE0B /* AccountToolsUITestFixture.swift in Sources */,
 				DF6DB710A7BAB0AD6FA5093B /* AgentDocumentTools.swift in Sources */,
+				3FC629E94BB3651A605079B8 /* AliyunRealtimeSpeechRecognizer.swift in Sources */,
+				26497B03C9AD2C69921B8501 /* AliyunSpeechTranscript.swift in Sources */,
+				6A4A1CF43D2143D47EB9BD7E /* AppAppearance.swift in Sources */,
 				17D2334D14B8A1F571A7D69B /* AppDiagnosticLog.swift in Sources */,
+				B993D5825DAD4A3F6C1ABF58 /* AppFontAssets.swift in Sources */,
+				048332DE76BAF3E98167876D /* AppPageTitle.swift in Sources */,
+				14B173459CD0C6BD8C29FCB1 /* AppPreferences.swift in Sources */,
+				C2F2942ED37FC79FBCF68D14 /* AppStorageSettingsView.swift in Sources */,
+				1F86EA1126E02BB4CB0B2D30 /* AppTypography.swift in Sources */,
+				D0F2CD2AF99D619A7F299CF9 /* AppUITestSupport.swift in Sources */,
+				178A2D52321DFCC7EB35FE26 /* BrowserUITestFixture.swift in Sources */,
+				434A790BCD491455A07E569F /* CameraUITestSupport.swift in Sources */,
+				E44DBB9A1A87C51D55D00A3B /* ChatUITestFixtures.swift in Sources */,
 				0877D888456B3E24B13A6ED3 /* ChatView.swift in Sources */,
+				195CBD2427916B9BDE4CA2D4 /* CloudDriveUITestFixtures.swift in Sources */,
+				523851CFD4281968BC40232D /* CloudImagePagerUITestFixtures.swift in Sources */,
 				2FA099751A7A133A032E55F8 /* ComposerDraftState.swift in Sources */,
 				98BA28EC2B95E5BDEB0D7120 /* ContactsView.swift in Sources */,
 				D153C2A4F2F5D6211CEB78B5 /* DesktopLoginScanView.swift in Sources */,
+				799B5E67647F1FD4B5F3874B /* GroupChatUITestData.swift in Sources */,
 				85FCBAC4610F6234A4215930 /* KeychainSecretStore.swift in Sources */,
 				A61181A92420CE7BED70E67C /* LocalChatHistoryStore.swift in Sources */,
 				CAE5C1AEEBE80B9A14E59DAE /* LocalSettingsStore.swift in Sources */,
+				F6872878C23C1B83C4CDFC28 /* MaiAccountProfile.swift in Sources */,
 				22F6961D7A52EC91127441D0 /* MaiChatApp.swift in Sources */,
 				70CBD7973F5A4E17FD5955DD /* MaiChatAttachmentDownloader.swift in Sources */,
 				290398666A29A06E27AB57E3 /* MaiChatAuthClient.swift in Sources */,
@@ -1109,37 +1205,39 @@
 				80014E0AD21DD45ABC9E3E35 /* MaiChatIMTools.swift in Sources */,
 				4550C5CE5BAE858E613A565C /* MaiCloudDriveAgentPlaybackCache.swift in Sources */,
 				F5418DE3092242A1E77BD638 /* MaiCloudDriveClient.swift in Sources */,
+				D33D3EF1E1F564EDB44C7F7E /* MaiCloudDriveImagePager.swift in Sources */,
 				9032311C79468BE8D517F4ED /* MaiCloudDriveModel.swift in Sources */,
 				BBD727996B6D9BF10BBB15FC /* MaiCloudDriveProductionCanaryCredential.swift in Sources */,
 				0F2174634726BE7BB940C868 /* MaiCloudDriveView.swift in Sources */,
-				751C9C7EC4D79C407AB8992A /* MaiCloudDriveImagePager.swift in Sources */,
 				6247CB164955518ADFF0D16A /* MaiFfplayIosBridge.cpp in Sources */,
 				C0AE3CB8A0041B5827EB9C52 /* MaiFfplayVideoView.swift in Sources */,
-				94BDEAD66F18D3151E28ABCD /* MaiLocalMediaPager.swift in Sources */,
+				93BBAAF780BEE3360548B277 /* MaiLocalMediaPager.swift in Sources */,
+				53565B38F2B1AFED1003A884 /* MaiPortraitPhotoProcessor.swift in Sources */,
 				6526F8020603CE866D68BC78 /* MaiVideoCircleClient.swift in Sources */,
 				4D5C692662551DEA7F8CE433 /* MaiVideoCircleModel.swift in Sources */,
 				123CB40D5B6165E8A91352B1 /* MaiVideoCircleView.swift in Sources */,
 				6497E7B3D6E8EA40BDF3D625 /* MarkdownInlineStyling.swift in Sources */,
+				362A06698AB34F60E6BF1D6F /* MediaUITestFixtures.swift in Sources */,
 				6602E48DB6C9BA2E18F73866 /* MessageBubbleLayout.swift in Sources */,
 				DD0212F81BF7429B14829650 /* MobileImageTools.swift in Sources */,
 				565AD4A1181778D023B2900E /* MobilePermissionTools.swift in Sources */,
 				D357B7A7100F4773EB0864A6 /* MobilePhotoTools.swift in Sources */,
-				25DE731960DD4652B35BF097 /* MaiPortraitPhotoProcessor.swift in Sources */,
+				A68D038DD4D29D7F3CD851A1 /* MySecondaryViews.swift in Sources */,
 				A0787EEE0051E9674B39C7C0 /* PhoneAccountLoginView.swift in Sources */,
+				79A4482AFDEB799184A64DEA /* PortraitUITestFixture.swift in Sources */,
+				48C110A36D979724793E1A7F /* RealtimeSpeechRecognizer.swift in Sources */,
 				EC4CC462A846C4BBBB877005 /* RemoteDesktopSession.swift in Sources */,
 				FEA124404840D00F968F232A /* RemoteDesktopView.swift in Sources */,
 				A96F037E371DD412156D6280 /* RemoteDiagnosticsCoordinator.swift in Sources */,
 				FD528D33CC1DD16F835A3DD2 /* RemoteDiagnosticsView.swift in Sources */,
 				9CEE6443CEA6DFF1F20AAF48 /* RemoteIMAppState.swift in Sources */,
-				8C02CA83DF38277D733725E4 /* MaiAccountProfile.swift in Sources */,
 				E6827C0322D4694D998F2551 /* RemoteIMClient.swift in Sources */,
 				0C3D673C246BAE33893EFDCD /* RootView.swift in Sources */,
+				36AECCDEE38C852333CCC79C /* ScreenCaptureUITestFixtures.swift in Sources */,
+				3DC0CE72E9E77DC2AF97AB34 /* ScreenFramesUITestFixtures.swift in Sources */,
 				06A4AB7E2BF7C60D639D23CA /* SettingsView.swift in Sources */,
 				BF67EA97E4832C7CB516E18C /* SocialPhoneBindingView.swift in Sources */,
 				19E85AD53A94BD7E9DF9A1B5 /* SpeechRecognizing.swift in Sources */,
-				6996899BF91F58CF5117B8A4 /* RealtimeSpeechRecognizer.swift in Sources */,
-				BC44715B7739C748E453B804 /* AliyunSpeechTranscript.swift in Sources */,
-				AC8A7F80F5634FA8F86FE5C8 /* AliyunRealtimeSpeechRecognizer.swift in Sources */,
 				9D0563575F319BE5C4DEBEB6 /* TencentIMClient.swift in Sources */,
 				865303D314A23F16D52058CE /* TencentSpeechRecognizer.swift in Sources */,
 			);
@@ -1150,18 +1248,19 @@
 			buildActionMask = 2147483647;
 			files = (
 				194E338FF3D0DE993B165814 /* AIAssistantUITests.swift in Sources */,
-				E79E75F7D90E3EDE3A1CBCDE /* PrimaryModelsUITests.swift in Sources */,
-				0EEE37DA59F5209F3B04CDFB /* LocalModelsUITests.swift in Sources */,
-				7BE2BC4EA367B7517B6D286D /* LocalInferenceUITests.swift in Sources */,
-				97387C3DF0C593C94754987C /* BrowserUITests.swift in Sources */,
-				46DC2FB7BFD7AAAB22B1B0B7 /* PortraitUITests.swift in Sources */,
-				C2D5DF25D72C1E7A1610BE92 /* AccountToolsUITests.swift in Sources */,
-				E9B117C085EA4D2A90737A10 /* PlaybackControlsUITests.swift in Sources */,
+				864E0A0974E56D8322BB0648 /* AccountToolsUITests.swift in Sources */,
+				621FE51E6375FDBA2BE6BA2F /* BrowserUITests.swift in Sources */,
 				6F8A66D5F8344B2C0A738BE6 /* CloudDriveDeviceReadOnlySmokeUITests.swift in Sources */,
-				6FA2296AE72440AA993F7C12 /* CloudDriveFolderBrowseUITests.swift in Sources */,
-				6F03A9BA5D80FAE8B01671B8 /* ScreenFrameArchiveUITests.swift in Sources */,
+				C6813221E63286DC8D7319A6 /* CloudDriveFolderBrowseUITests.swift in Sources */,
 				A4FE70D1E7F52FD7C3E93B6C /* CloudDriveProductionCanaryUITests.swift in Sources */,
 				E614ECA45B50A47575FB9B82 /* DesktopLoginUITests.swift in Sources */,
+				0F11F7525A77C07F5A314303 /* LocalInferenceUITests.swift in Sources */,
+				3E19BBF2C251E497F9DDE7FF /* LocalModelsUITests.swift in Sources */,
+				1F4C5D0802D0376894673EDE /* MySettingsUITests.swift in Sources */,
+				67A4EC33E93EC66E1C786AB9 /* PlaybackControlsUITests.swift in Sources */,
+				C83FC3CB98B20BC5A06346F7 /* PortraitUITests.swift in Sources */,
+				DDB74028C6497789CC7DF112 /* PrimaryModelsUITests.swift in Sources */,
+				2BB7EC458B8370713722836F /* ScreenFrameArchiveUITests.swift in Sources */,
 				9EF853C23CC0121860279D06 /* SocialLoginUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1189,14 +1288,14 @@
 /* Begin XCBuildConfiguration section */
 		02634FA75D1A47D3870F2CA0 /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 2B596B570E3F1EC948188E4F /* Pods-MaiChat.release.xcconfig */;
+			baseConfigurationReference = 18CB0E75ECDD174514CFF647 /* Pods-MaiChat.release.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
-					"$(SRCROOT)/../../../MaiAgent/third_party/curl-apple/include",
+					"$(SRCROOT)/../../../MaiAgent/third_party/curl/include",
 				);
 				INFOPLIST_FILE = MaiChat/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1268,7 +1367,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 188;
+				CURRENT_PROJECT_VERSION = 202;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1445,7 +1544,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 188;
+				CURRENT_PROJECT_VERSION = 202;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -1471,14 +1570,14 @@
 		};
 		FA0BF934ACBC80911B021979 /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 94F17FE4491979CA0B257D3F /* Pods-MaiChat.debug.xcconfig */;
+			baseConfigurationReference = 358BE40BF9DC97A7658AF28B /* Pods-MaiChat.debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
-					"$(SRCROOT)/../../../MaiAgent/third_party/curl-apple/include",
+					"$(SRCROOT)/../../../MaiAgent/third_party/curl/include",
 				);
 				INFOPLIST_FILE = MaiChat/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (

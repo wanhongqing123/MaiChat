@@ -220,7 +220,7 @@ public:
 
     FILE* file() const { return file_; }
 
-    bool commit() {
+    bool commit(bool replaceExisting) {
         if (!file_ || std::fflush(file_) != 0) return false;
 #ifdef _WIN32
         const bool synced = _commit(_fileno(file_)) == 0;
@@ -234,10 +234,18 @@ public:
         }
         file_ = nullptr;
 #ifdef _WIN32
-        if (!MoveFileExW(path_.c_str(), finalPath_.c_str(),
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return false;
+        const DWORD flags = MOVEFILE_WRITE_THROUGH |
+            (replaceExisting ? MOVEFILE_REPLACE_EXISTING : 0);
+        if (!MoveFileExW(path_.c_str(), finalPath_.c_str(), flags)) return false;
 #else
-        if (rename(path_.c_str(), finalPath_.c_str()) != 0) return false;
+        if (replaceExisting) {
+            if (rename(path_.c_str(), finalPath_.c_str()) != 0) return false;
+        } else {
+            // link publishes the complete inode atomically and rejects EEXIST;
+            // a preceding exists() check would race another workspace writer.
+            if (link(path_.c_str(), finalPath_.c_str()) != 0) return false;
+            unlink(path_.c_str());
+        }
 #endif
         path_.clear();
         return true;
@@ -276,12 +284,14 @@ extern "C" void mai_download_cancel_destroy(MaiDownloadCancel* cancel) {
     delete cancel;
 }
 
-extern "C" void mai_download_file(const MaiDownloadOptions* options,
-                                   const MaiDownloadCancel* cancel,
-                                   MaiDownloadResult* result) {
+static void downloadFile(const MaiDownloadOptions* options,
+                         const MaiDownloadCancel* cancel,
+                         MaiDownloadResult* result,
+                         uint64_t expectedBytes, bool replaceExisting) {
     if (!result) return;
     *result = {MAI_DOWNLOAD_INVALID_ARGUMENT, 0, 0, 0};
     if (!validOptions(options)) return;
+    if (!replaceExisting && (!expectedBytes || expectedBytes > options->max_bytes)) return;
     if (wasCanceled(cancel)) {
         result->status = MAI_DOWNLOAD_CANCELED;
         return;
@@ -414,11 +424,26 @@ extern "C" void mai_download_file(const MaiDownloadOptions* options,
             result->status = MAI_DOWNLOAD_NETWORK_ERROR;
         } else if (transfer.bytes == 0) {
             result->status = MAI_DOWNLOAD_EMPTY_BODY;
-        } else if (!output.commit()) {
+        } else if (expectedBytes && transfer.bytes != expectedBytes) {
+            result->status = MAI_DOWNLOAD_SIZE_MISMATCH;
+        } else if (!output.commit(replaceExisting)) {
             result->status = MAI_DOWNLOAD_WRITE_ERROR;
         } else {
             result->status = MAI_DOWNLOAD_OK;
         }
         break;
     }
+}
+
+extern "C" void mai_download_file(const MaiDownloadOptions* options,
+                                   const MaiDownloadCancel* cancel,
+                                   MaiDownloadResult* result) {
+    downloadFile(options, cancel, result, 0, true);
+}
+
+extern "C" void mai_download_new_file(const MaiDownloadOptions* options,
+                                       uint64_t expectedBytes,
+                                       const MaiDownloadCancel* cancel,
+                                       MaiDownloadResult* result) {
+    downloadFile(options, cancel, result, expectedBytes, false);
 }

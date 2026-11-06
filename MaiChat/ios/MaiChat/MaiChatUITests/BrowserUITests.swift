@@ -219,7 +219,7 @@ final class BrowserUITests: XCTestCase {
         let app = launchPage()
         defer { app.terminate() }
         app.buttons["我的"].tap()
-        app.buttons["设置"].tap()
+        app.buttons["my-account-entry"].tap()
         let entry = app.buttons["sms-integration-entry"]
         XCTAssertTrue(entry.waitForExistence(timeout: 5))
         entry.tap()

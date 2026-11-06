@@ -27,6 +27,9 @@ class QEvent;
 class QAction;
 class QToolButton;
 struct MaiCloudVod;
+#if defined(Q_OS_MAC)
+class MaiMacVideoPlayback;
+#endif
 
 class MaiFfplayVideoDialog final : public QDialog {
     Q_OBJECT
@@ -56,7 +59,10 @@ public:
         return playing_;
     }
     uint64_t presentedFrames() const;
-    // 仅在 Graphics 接受保留 HLG/PQ 元数据的帧后成立，供宿主诊断实际播放链路。
+    // GUI 线程：原生 HDR 显示层报告真正首帧就绪，不伪造 FFplay 帧数。
+    bool hasPresentedFrame() const;
+    bool playbackStatus(MaiFfplayPlaybackStatus* output) const;
+    // 原生 HDR 首帧就绪，或 Graphics 已接受保留 HLG/PQ 的帧后成立，供宿主诊断。
     bool hasPresentedHdrFrame() const;
     void setForwardAction(std::function<void(const QString&)> action);
     // Ordinary forwarding remains available independently of the compact UI.
@@ -166,5 +172,10 @@ private:
     std::atomic<bool> presentedHdrFrame_{false};
     std::atomic<bool> hlgOutputRequested_{false};
     MaiFfplayHdrSourceInfo sourceInfo_{};
+#if defined(Q_OS_MAC)
+    std::unique_ptr<MaiMacVideoPlayback> macPlayback_;
+    std::atomic<bool> macPlaybackRequested_{false};
+    uint64_t playbackOpenGeneration_ = 0;
+#endif
     std::function<void(const QString&)> forwardAction_;
 };

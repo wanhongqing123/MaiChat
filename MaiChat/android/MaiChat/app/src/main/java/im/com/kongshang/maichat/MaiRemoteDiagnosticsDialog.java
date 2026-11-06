@@ -51,9 +51,9 @@ final class MaiRemoteDiagnosticsDialog {
         body.setOrientation(LinearLayout.VERTICAL);
         body.setPadding(dp(20), dp(8), dp(20), dp(12));
         heading(body, "故障会话");
-        body.addView(text(peer.displayName(), 17, MaiChatTheme.TEXT), row());
+        body.addView(text(peer.displayName(), MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT), row());
         body.addView(text("收集 Android 本地现场，并请求该好友的 MultiAICode 回传近期诊断记录。" +
-            "不需要选择问题类型或操作远端电脑。", 13, MaiChatTheme.SECONDARY), row());
+            "不需要选择问题类型或操作远端电脑。", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY), row());
         heading(body, "发送给排查好友");
         picker = new Spinner(activity);
         picker.setContentDescription("接收排障报告的好友");
@@ -74,14 +74,14 @@ final class MaiRemoteDiagnosticsDialog {
         body.addView(picker, new LinearLayout.LayoutParams(-1, dp(48)));
         body.addView(text("确认后将自动合并并发送给所选好友。报告仅含设备版本、消息方向、状态、时间及稳定标签，" +
             "不含聊天正文、登录凭据或环境变量。当前未采集延迟、界面性能或原始日志，缺失证据会明确标注。" +
-            "采集请求会作为一条消息留在当前聊天。", 13, MaiChatTheme.SECONDARY), row());
+            "采集请求会作为一条消息留在当前聊天。", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY), row());
         spinner = new ProgressBar(activity);
         spinner.setIndeterminateTintList(ColorStateList.valueOf(MaiChatTheme.BLUE));
         spinner.setContentDescription("正在采集远程排障报告");
         spinner.setVisibility(View.GONE);
         body.addView(spinner, new LinearLayout.LayoutParams(dp(28), dp(28)));
         status = text(session.connectionState() == TencentIMClient.ConnectionState.CONNECTED ?
-            "选择接收报告的好友后，确认收集并发送。" : "本机未连接 IM，连接后才能发送请求与报告。", 13, MaiChatTheme.SECONDARY);
+            "选择接收报告的好友后，确认收集并发送。" : "本机未连接 IM，连接后才能发送请求与报告。", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         status.setContentDescription("远程排障状态");
         body.addView(status, row());
         ScrollView scroll = new ScrollView(activity);
@@ -163,14 +163,14 @@ final class MaiRemoteDiagnosticsDialog {
     }
 
     private void heading(LinearLayout body, String title) {
-        TextView heading = text(title, 13, MaiChatTheme.SECONDARY);
+        TextView heading = text(title, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         heading.setTypeface(MaiChatTypography.semibold());
         heading.setPadding(0, dp(16), 0, dp(6));
         body.addView(heading, row());
     }
 
-    private TextView text(String value, int size, int color) {
-        return MaiChatTheme.text(activity, value, size, color);
+    private TextView text(String value, MaiChatTypographyTokens.Role role, int color) {
+        return MaiChatTheme.text(activity, value, role, color);
     }
 
     private LinearLayout.LayoutParams row() {

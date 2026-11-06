@@ -74,13 +74,13 @@ void SharingIndicatorBar::refreshText() {
 
 void SharingIndicatorBar::applyStyle() {
     // 红底白字：与应用其余部分的蓝色体系形成强对比，避免被当成普通提示忽略。
-    setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         #sharingIndicatorBar {
             background: #b42318;
         }
         #sharingIndicatorText {
             color: #ffffff;
-            font-size: 13px;
+            font-size: @detail;
             font-weight: 700;
             background: transparent;
         }
@@ -89,12 +89,12 @@ void SharingIndicatorBar::applyStyle() {
             border: 1px solid rgba(255, 255, 255, 0.45);
             border-radius: 8px;
             color: #ffffff;
-            font-size: 12px;
+            font-size: @metadata;
             font-weight: 700;
             padding: 5px 14px;
         }
         #sharingIndicatorStop:hover {
             background: rgba(255, 255, 255, 0.32);
         }
-    )")));
+    )"));
 }

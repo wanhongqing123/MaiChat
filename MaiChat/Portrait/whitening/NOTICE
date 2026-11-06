@@ -1,0 +1,41 @@
+MaiPortraitWhiteningLut is a portable C++ adaptation of GPUPixel's whitening-only
+beauty_face_unit_filter.cc shader, with blurAlpha=0 and sharpen=0.
+
+GPUPixel
+Copyright (c) 2021 PixPark. All rights reserved.
+https://github.com/pixpark/gpupixel
+Pinned revision: ef552bf8ce2d0d41fa9b979bfb5c7cf79374ca88
+License: Apache License 2.0 (see LICENSE in this directory).
+
+Adapted source:
+  src/filter/beauty_face_unit_filter.cc
+  src/core/gpupixel_framebuffer.cc (GL_LINEAR / GL_CLAMP_TO_EDGE semantics)
+  src/source/source_image.cc (unflipped RGBA upload semantics)
+
+Unmodified LUT pixel data, losslessly embedded as RGB bytes:
+  src/res/lookup_gray.png   (256 x 1)
+  src/res/lookup_origin.png (64 x 64)
+  src/res/lookup_skin.png   (64 x 64)
+  src/res/lookup_light.png  (512 x 512)
+
+MaiPortraitWhiteningLutData.inc records each original PNG SHA-256 and its decoded
+RGB SHA-256. tests/generate-whitening-lut-data.py reproduces the file with Pillow.
+The Paeth predictor, canonical Huffman coding and base64 wrapping only compress
+storage; they do not resample, approximate, retrain or otherwise change the LUTs.
+The CPU module has no runtime Pillow, platform image loader, GL or zlib dependency.
+
+Adaptation notes:
+- The public argument is the shader whiten uniform in [0, 1]. Upstream's macOS
+  SetWhite divides its API argument by ten; there is no such division here.
+  Shader .25 therefore corresponds to upstream macOS API 2.5.
+- At zero, the upstream shader bypasses every whitening stage. Every positive
+  value first applies levels, gray, origin and skin stages, then interpolates
+  skin -> light with the supplied uniform. This preserves its discontinuity at
+  zero; a tiny positive value does not approach the unedited source.
+- Alpha is preserved, matching the GLES shader and the RGBA8 host contract. The
+  upstream desktop GL shader instead writes constant alpha 1.0.
+- CPU float bilinear LUT sampling follows normalized GL_LINEAR coordinates and
+  GL_CLAMP_TO_EDGE. GPU interpolation and final RGBA8 rounding may differ by a
+  least-significant byte; validate against pinned GPU outputs with that tolerance.
+- This pointwise module does not identify skin or select subjects. Its caller
+  controls selection, spatial masks and compositing in original-image space.

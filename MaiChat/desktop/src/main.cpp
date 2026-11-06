@@ -1,5 +1,6 @@
 // 文件作用：桌面端应用功能；main 负责桌面程序入口、服务初始化和事件循环，本文件给出其实现。
 // 直接依赖：app/RemoteIMApplication.h、auth/DesktopAuthClient.h、logging/AppLog.h。
+#include "ui/UiZoom.h"
 #include <QApplication>
 #include <QCoreApplication>
 #include <QDir>
@@ -128,6 +129,10 @@ int main(int argc, char* argv[]) {
         QStringLiteral(":/maichat/fonts/NotoSansSC-Regular.otf"),
         QStringLiteral(":/maichat/fonts/NotoSansSC-Medium.otf"),
         QStringLiteral(":/maichat/fonts/NotoSansSC-Bold.otf"),
+        QStringLiteral(":/maichat/fonts/NotoSerifSC-Regular.otf"),
+        QStringLiteral(":/maichat/fonts/NotoSerifSC-Medium.otf"),
+        QStringLiteral(":/maichat/fonts/NotoSerifSC-SemiBold.otf"),
+        QStringLiteral(":/maichat/fonts/NotoSerifSC-Bold.otf"),
         QStringLiteral(":/maichat/fonts/JetBrainsMono-latin-400.ttf"),
         QStringLiteral(":/maichat/fonts/JetBrainsMono-latin-700.ttf"),
         QStringLiteral(":/maichat/fonts/SarasaFixedSC-Regular.ttf"),
@@ -154,14 +159,9 @@ int main(int argc, char* argv[]) {
     //   DW   + Noto CFF（无 hinting 指令）  → NoHinting 才不坏
     // 换字体栈或引擎时，重验三件事：字距、粗体笔画连续性、小字锐度。
     appFont.setHintingPreference(QFont::PreferNoHinting);
-    appFont.setFamilies({QStringLiteral("Inter"),
-                         QStringLiteral("Noto Sans SC"),
-                         QStringLiteral("Microsoft YaHei UI"),
-                         QStringLiteral("Microsoft YaHei"),
-                         QStringLiteral("PingFang SC")});
-    // 登录窗保持设计尺寸（不随缩放倍率变化）：这里用基准 13px，
-    // 进入主界面时才由 MainWindow 把全局字体切到倍率值。
-    appFont.setPixelSize(13);
+    // 应用普通文字统一使用用户所选字体；系统默认保留平台回退。
+    appFont.setFamilies(UiZoom::fontFamilies());
+    appFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
     app.setFont(appFont);
 
     DesktopAuthClient auth;

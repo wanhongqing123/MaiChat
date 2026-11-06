@@ -58,11 +58,13 @@ public:
         std::string fileAccessRoot;
         bool allowOutsideWorkingDirectory = false;
         std::function<MaiResult<std::string>(const std::string&, const std::string&)> decodeText;
-        // 内部输入闸门：只在完整工具批次之间调用。原子消费补充消息并把 assistant
-        // 切到新的持久化分段；closeIfEmpty 为真时，没有待消费输入便封闭本轮接收。
+        // 内部输入闸门：工具结束后若有补充，先给本批未执行项补齐取消回执，
+        // 再在下次模型请求前原子消费并切换 assistant 持久化分段。
+        // closeIfEmpty 为真时，没有待消费输入便封闭本轮接收。
         // 回调不得持锁广播事件；轮次和回调捕获对象均须活到 run 返回。
         std::function<MaiResult<bool>(MaiMessage&, bool closeIfEmpty)> advanceSteering;
-        // 历史先读快照，再取这份 ID 列表，避免新到的待消费 user 提前进入模型请求。
+        // 工具开始前检查这份 ID 列表，发现输入便让模型重新规划剩余项。
+        // 构造请求时先读历史快照再取列表，避免尚未消费的 user 提前进入模型请求。
         std::function<std::vector<std::string>()> pendingSteering;
         std::function<void()> closeSteering;
     };
@@ -85,7 +87,8 @@ private:
     std::vector<MaiToolInvocation> requestCompletion(const MaiModelRequest& request,
                                                      const std::atomic<bool>& cancel);
 
-    // 执行一批工具调用，把每个的结果作为 part 追加到 mAssistant 上。
+    // 顺序执行工具，当前工具结束后若有新输入，跳过本批其余调用并补齐取消结果。
+    // 所有原调用及真实/未执行结果相邻落库，返回后由工具循环消费补充并请求模型重评。
     void executeTools(const std::vector<MaiToolInvocation>& calls, const std::atomic<bool>& cancel);
 
     // 这次调用该不该放行。需要审批的话会在这里阻塞等用户裁决。返回空表示放行；

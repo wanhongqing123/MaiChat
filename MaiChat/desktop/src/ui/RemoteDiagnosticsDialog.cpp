@@ -130,19 +130,19 @@ void RemoteDiagnosticsDialog::refreshConfirmState() {
 }
 
 void RemoteDiagnosticsDialog::applyStyle() {
-    setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         #remoteDiagnosticsDialog { background: #ffffff; }
-        #diagnosticsIntro { font-size: 15px; color: #1f2329; }
-        #diagnosticsContents { font-size: 13px; color: #646a73; }
-        #diagnosticsPickLabel { font-size: 13px; color: #1f2329; }
-        #diagnosticsFilter { font-size: 13px; padding: 6px 10px; border: 1px solid #dee0e3;
+        #diagnosticsIntro { font-size: @body; color: #1f2329; }
+        #diagnosticsContents { font-size: @detail; color: #646a73; }
+        #diagnosticsPickLabel { font-size: @detail; color: #1f2329; }
+        #diagnosticsFilter { font-size: @detail; padding: 6px 10px; border: 1px solid #dee0e3;
                              border-radius: 6px; }
-        #diagnosticsRecipients { font-size: 13px; border: 1px solid #dee0e3; border-radius: 6px; }
-        #diagnosticsSummary { font-size: 12px; color: #646a73; }
-        #diagnosticsCancel, #diagnosticsConfirm { font-size: 13px; padding: 6px 18px;
+        #diagnosticsRecipients { font-size: @detail; border: 1px solid #dee0e3; border-radius: 6px; }
+        #diagnosticsSummary { font-size: @metadata; color: #646a73; }
+        #diagnosticsCancel, #diagnosticsConfirm { font-size: @detail; padding: 6px 18px;
                                                   border-radius: 6px; }
         #diagnosticsConfirm { background: #3370ff; color: #ffffff; border: none; }
         #diagnosticsConfirm:disabled { background: #bcd0ff; }
-    )")));
+    )"));
     resize(UiZoom::s(420), UiZoom::s(460));
 }

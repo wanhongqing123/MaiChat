@@ -122,9 +122,17 @@ if [[ -n "${TARGET_BUILD_DIR:-}" && -n "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}" 
     test -f "$repo_dir/MaiChat/Portrait/models/$portrait_file"
     cp "$repo_dir/MaiChat/Portrait/models/$portrait_file" "$portrait_bundle/"
   done
+  # LUT 数据随静态库嵌入，来源声明与许可仍须随各平台 App 一起发布。
+  cp "$repo_dir/MaiChat/Portrait/whitening/LICENSE" "$portrait_bundle/GPUPIXEL_LICENSE"
+  cp "$repo_dir/MaiChat/Portrait/whitening/NOTICE" "$portrait_bundle/GPUPIXEL_NOTICE"
   if [[ "${CONFIGURATION:-}" == Debug ]]; then
     cp "$repo_dir/MaiAgent/third_party/opencv/samples/data/lena.jpg" \
       "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/portrait-test-face.jpg"
+    # 全身回归使用公开站姿图；普通构建不额外下载测试素材。
+    if [[ -f "$repo_dir/MaiChat/Portrait/tests/fixtures/pose.jpg" ]]; then
+      cp "$repo_dir/MaiChat/Portrait/tests/fixtures/pose.jpg" \
+        "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/portrait-test-body.jpg"
+    fi
   fi
   # iOS 的 OpenSSL libcurl 需要随 App 打包的受信任 CA，不能关闭证书校验。
   cert_bundle="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/MaiAgentCertificates"

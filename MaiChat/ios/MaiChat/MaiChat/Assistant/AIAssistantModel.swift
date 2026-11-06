@@ -1110,6 +1110,7 @@ struct AIResponse: Codable, Sendable {
     var id: String?
     var userMessageID: String?
     var questionID: String?
+    var path: String?
     var error: String?
     var errorCode: String?
     var changed: Bool?
@@ -1134,7 +1135,7 @@ struct AIResponse: Codable, Sendable {
     var professional: String?
 
     enum CodingKeys: String, CodingKey {
-        case ok, id, error, errorCode, changed, sessions, messages, messageUpdates, hasMessageUpdates, questionMessages, rootSessionId, permissions, questions
+        case ok, id, path, error, errorCode, changed, sessions, messages, messageUpdates, hasMessageUpdates, questionMessages, rootSessionId, permissions, questions
         case busy, turnId, configured, model, wire, localGpuSelected, localGpuModelBytes, localGpuBackend
         case natural, casual, professional
         case userMessageID = "user_message_id"
@@ -1538,6 +1539,21 @@ actor AIAssistantBackend {
         ])
     }
 
+    func enqueue(session: String, requestID: String, text: String, images: [AIImportedFile],
+                 videos: [AIImportedFile], quoteMessageId: String) throws -> AIResponse {
+        try requestAgentOperation("enqueue", values: [
+            "session": session, "requestId": requestID, "text": text, "quoteMessageId": quoteMessageId,
+            "images": images.map { ["path": $0.relativePath, "mimeType": $0.mimeType] },
+            "videos": videos.map { ["path": $0.relativePath, "mimeType": $0.mimeType] }])
+    }
+
+    func pinInputFile(_ file: AIImportedFile, requestID: String, attachmentID: String) throws -> AIImportedFile {
+        let result = try requestAgentOperation("pin_input_file", values: [
+            "path": file.relativePath, "requestId": requestID, "attachmentId": attachmentID])
+        guard let path = result.path else { throw AIBackendError(message: "无法保存会话附件") }
+        return AIImportedFile(relativePath: path, mimeType: file.mimeType, isImage: file.isImage)
+    }
+
     func suggestReplies(messages: [[String: String]], accountUserID: String) async throws
         -> AIReplySuggestions {
         _ = try await open(accountUserID: accountUserID)
@@ -1803,6 +1819,9 @@ final class AIAssistantModel: ObservableObject {
     private var pendingRemoteSelectionStarted = Date.distantPast
     private var remoteTransfers: [String: AIRemoteTransfer] = [:]
     private var pendingRemoteCommands: [String: Date] = [:]
+    private var ownerCommandQueues: [String: [AIRemoteSessionTransport.Envelope]] = [:]
+    private var ownerCommandIDs: Set<String> = []
+    private var ownerCommandTasks: [String: Task<Void, Never>] = [:]
     private var attachmentRemoteCommands: Set<String> = []
     private var remoteRetryIDByFingerprint: [String: String] = [:]
     private var remoteFingerprintByCommandID: [String: String] = [:]
@@ -2545,7 +2564,9 @@ final class AIAssistantModel: ObservableObject {
 
     private func handleRemoteEnvelope(_ envelope: AIRemoteSessionTransport.Envelope) async {
         logAIHistoryEvent("remote-envelope kind=\(envelope.kind) slot=\(envelope.fromSlot)")
-        defer { Task { try? await remoteTransport.acknowledge(envelope.id) } }
+        defer {
+            if envelope.kind != "command" { Task { try? await remoteTransport.acknowledge(envelope.id) } }
+        }
         if envelope.sessionID == Self.lifecycleSessionID {
             if envelope.kind == "command" {
                 await applyRemoteCommand(envelope)
@@ -2738,6 +2759,7 @@ final class AIAssistantModel: ObservableObject {
             }
         }
         reconcileQuestionAnswerEchoes()
+        Task { @MainActor [weak self] in await self?.outgoingPump?.publish() }
     }
 
     private func remoteDisplayMessage(_ message: AIMessage) -> AIMessage {
@@ -2866,6 +2888,34 @@ final class AIAssistantModel: ObservableObject {
     }
 
     private func applyRemoteCommand(_ envelope: AIRemoteSessionTransport.Envelope) async {
+        let generation = submissionGeneration
+        let account = screenFrameCurrentAccountID
+        let key = "\(account):\(generation):\(envelope.sessionID)"
+        let receipt = key + ":\(envelope.id)"
+        guard ownerCommandIDs.insert(receipt).inserted else { return }
+        ownerCommandQueues[key, default: []].append(envelope)
+        guard ownerCommandTasks[key] == nil else { return }
+        ownerCommandTasks[key] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.ownerCommandTasks.removeValue(forKey: key)
+                let abandoned = self.ownerCommandQueues.removeValue(forKey: key) ?? []
+                for item in abandoned { self.ownerCommandIDs.remove(key + ":\(item.id)") }
+            }
+            while !Task.isCancelled, self.submissionGeneration == generation,
+                  self.screenFrameCurrentAccountID == account,
+                  let next = self.ownerCommandQueues[key]?.first {
+                await self.performRemoteCommand(next)
+                self.ownerCommandQueues[key]?.removeFirst()
+                self.ownerCommandIDs.remove(key + ":\(next.id)")
+            }
+        }
+    }
+
+    private func performRemoteCommand(_ envelope: AIRemoteSessionTransport.Envelope) async {
+        // 入站消息已经排入所属端队列，收到前一条的模型输出不再阻挡 socket 继续接收。
+        // 只有持久接收/明确拒绝后才 ACK 信箱，进程退出时未处理的控制消息仍可重送。
+        defer { Task { try? await remoteTransport.acknowledge(envelope.id) } }
         if envelope.sessionID == Self.lifecycleSessionID {
             await applyRemoteLifecycleCommand(envelope)
             return
@@ -2901,8 +2951,8 @@ final class AIAssistantModel: ObservableObject {
                 guard let ownLogin = await remoteTransport.currentLoginSessionID() else {
                     throw AIBackendError(message: "会话同步登录状态不可用")
                 }
-                let turnID = envelope.payload.turnId ?? ""
-                let requestID = envelope.payload.steeringRequestId ?? ""
+                let turnID = isSteering ? envelope.payload.turnId ?? "" : "input"
+                let requestID = envelope.payload.steeringRequestId ?? envelope.clientMessageID
                 if isSteering && (turnID.isEmpty || requestID.isEmpty) {
                     throw AIBackendError(message: "补充内容缺少原任务编号，请更新发起设备")
                 }
@@ -2917,12 +2967,12 @@ final class AIAssistantModel: ObservableObject {
                               mimeType: String, path: String)] = []
                 let importKey = [ownLogin, envelope.sessionID, turnID, requestID].joined(separator: ":")
                 let referenceIDs = references.map(\.attachmentID)
-                let cached = isSteering ? remoteSteeringImports[importKey] : nil
+                let cached = remoteSteeringImports[importKey]
                 if let cached, cached.references != referenceIDs {
                     throw AIBackendError(message: "补充操作编号不能用于不同附件")
                 }
-                if isSteering && !references.isEmpty { steeringImportKey = importKey }
-                if isSteering && cached == nil && !references.isEmpty {
+                if !references.isEmpty { steeringImportKey = importKey }
+                if cached == nil && !references.isEmpty {
                     try await makeRoomForRemoteSteeringImport(ownerGeneration: ownerGeneration,
                         ownerAccount: ownerAccount, ownerLogin: ownLogin)
                 }
@@ -2939,10 +2989,14 @@ final class AIAssistantModel: ObservableObject {
                     let downloaded = try await MaiCloudDriveClient.shared
                         .downloadSessionAttachment(id: reference.attachmentID, room: room)
                     defer { try? FileManager.default.removeItem(at: downloaded.fileURL) }
-                    let imported = downloaded.mediaType == "image"
+                    var imported = downloaded.mediaType == "image"
                         ? try await backend.importDocument(downloaded.fileURL)
                         : try await backend.importSessionFile(
                             downloaded.fileURL, displayName: downloaded.name)
+                    if !isSteering {
+                        imported = try await backend.pinInputFile(imported, requestID: requestID,
+                                                                 attachmentID: reference.attachmentID)
+                    }
                     synced.append((reference.attachmentID, downloaded.name,
                                    downloaded.mediaType, downloaded.contentType,
                                    imported.relativePath))
@@ -2950,7 +3004,7 @@ final class AIAssistantModel: ObservableObject {
                     else if imported.mimeType.hasPrefix("video/") { videos.append(imported) }
                     else { documents.append(imported) }
                 }
-                if isSteering && cached == nil && !references.isEmpty {
+                if cached == nil && !references.isEmpty {
                     // An import awaited network/file work; recheck capacity and
                     // owner identity before the single synchronous insertion.
                     try await makeRoomForRemoteSteeringImport(ownerGeneration: ownerGeneration,
@@ -2991,20 +3045,22 @@ final class AIAssistantModel: ObservableObject {
                         remoteSteeringImportRevision &+= 1
                     }
                 } else {
-                    sent = try await backend.send(session: envelope.sessionID, text: prompt,
-                        images: images, videos: videos, quoteMessageId: "")
+                    steeringDispatched = true
+                    sent = try await backend.enqueue(session: envelope.sessionID, requestID: requestID, text: prompt,
+                        images: images, videos: videos, quoteMessageId: envelope.payload.quoteMessageId ?? "")
+                    guard let id = sent.id, !id.isEmpty else { throw AIBackendError(message: "所属设备未确认接收") }
+                    result["user_message_id"] = id
                 }
-                // The native receipt separates the accepted user row from its
-                // immutable task. Never infer either from a later moving window.
-                if let userID = sent.userMessageID, !userID.isEmpty,
-                   let receiptTurn = sent.turnId, !receiptTurn.isEmpty,
-                   !isSteering || receiptTurn == turnID {
-                    result["user_message_id"] = userID
-                    result["turnId"] = isSteering ? turnID : receiptTurn
+                // Queue receipts identify the persisted user row, independently of
+                // whichever model turn is active when the snapshot is read.
+                let acceptedID = isSteering ? sent.userMessageID : sent.id
+                guard let acceptedID, !acceptedID.isEmpty else {
+                    throw AIBackendError(message: "所属设备未返回消息接收编号")
                 }
+                result["user_message_id"] = acceptedID
+                if isSteering { result["turnId"] = turnID }
                 let latest = try? await backend.remoteSnapshot(session: envelope.sessionID, limit: 1)
-                let receiptUser = try? await backend.userMessage(
-                    session: envelope.sessionID, id: sent.userMessageID ?? "")
+                let receiptUser = try? await backend.userMessage(session: envelope.sessionID, id: acceptedID)
                 if let userMessage = receiptUser {
                     if !synced.isEmpty, let latest {
                         var parts = remoteHistoryMessage(userMessage).parts
@@ -3648,7 +3704,8 @@ final class AIAssistantModel: ObservableObject {
     /// Transport acknowledgement is not owner acceptance. Each delivery attempt
     /// uses a new envelope ID, while requestId stays stable for core deduplication.
     private func sendRemoteSteering(to remote: AIRemoteSession,
-                                    payload: [String: Any], questionID: String? = nil) async throws -> String {
+                                    payload: [String: Any], questionID: String? = nil,
+                                    onForwarded: (@MainActor () async -> Void)? = nil) async throws -> String {
         let encoded = try JSONSerialization.data(withJSONObject: payload, options: .sortedKeys)
         let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         return try await withCheckedThrowingContinuation { continuation in
@@ -3659,6 +3716,7 @@ final class AIAssistantModel: ObservableObject {
                 do {
                     try await remoteTransport.sendCommand(to: remote, encodedPayload: encoded,
                                                           messageID: id)
+                    await onForwarded?()
                 } catch {
                     finishRemoteSteering(id, result: .failure(AIBackendError(
                         message: error.localizedDescription, definitive: false)))
@@ -3667,7 +3725,7 @@ final class AIAssistantModel: ObservableObject {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(30))
                 self?.finishRemoteSteering(id, result: .failure(AIBackendError(
-                    message: "所属设备未确认补充内容，草稿已保留；重试会复用原任务编号",
+                    message: "所属设备尚未确认接收，内容已保留；重试会复用原请求编号",
                     definitive: false)))
             }
         }
@@ -3690,7 +3748,7 @@ final class AIAssistantModel: ObservableObject {
                   let payload = try? JSONDecoder().decode(AIOutgoingMessagePayload.self, from: entry.payloadData)
             else { return nil }
             if payload.questionID != nil, entry.state == .accepted, acceptedQuestionAnswers[entry.id] != nil { return nil }
-            let sameEpoch = entry.binding == nil || entry.binding?.hostEpoch == outgoingCurrentEpoch
+            let sameEpoch = entry.binding == nil || entry.binding?.mode == .enqueue || entry.binding?.hostEpoch == outgoingCurrentEpoch
             let retry = sameEpoch && (entry.state == .failed ||
                 (entry.state == .unknown && entry.binding?.mode != .send))
             return AIOutgoingMessageRow(entry: entry, payload: payload, allowsRetry: retry)
@@ -3879,9 +3937,11 @@ final class AIAssistantModel: ObservableObject {
                     #endif
                     self.scrollRequest += 1
                 }
-                _ = try? await queue.removeAccepted(id: entry.id, expectedRevision: entry.revision)
+                if self.messages.contains(where: { $0.id == entry.acceptedMessageID }) {
+                    _ = try? await queue.removeAccepted(id: entry.id, expectedRevision: entry.revision)
+                }
                 if let current = self.outgoingPump { await current.publish() }
-            })
+            }, forwardsWithoutWaiting: { $0.conversationID.hasPrefix("remote:") })
         outgoingQueueIdentity = identity
         outgoingCurrentEpoch = epoch
         outgoingQueue = queue
@@ -3918,6 +3978,16 @@ final class AIAssistantModel: ObservableObject {
                 .importedFiles(workspace: workspacePath)) ?? []
         }
         outgoingEntries = entries
+        let conversation = outgoingConversationID(session: selected, remote: selectedRemote)
+        let canonical = Set(messages.map(\.id))
+        let confirmed = entries.filter { $0.owner.conversationID == conversation && $0.state == .accepted &&
+            $0.acceptedMessageID.map(canonical.contains) == true }
+        if !confirmed.isEmpty, let pump = outgoingPump {
+            Task { @MainActor in
+                for entry in confirmed { _ = try? await pump.queue.removeAccepted(id: entry.id, expectedRevision: entry.revision) }
+                await pump.publish()
+            }
+        }
         outgoingProtectedPaths = Set(files.map(\.relativePath))
         outgoingProtectedReferenceIDs = Set(files.compactMap { $0.archiveReference?.referenceID })
         for (id, pins) in outgoingPreparedPins where
@@ -4016,8 +4086,8 @@ final class AIAssistantModel: ObservableObject {
                 $0.loginSessionID == remote.login && $0.sessionID == remote.session }), remoteIsOnline(owner) else {
                 throw AIBackendError(message: "原设备离线", code: "owner_offline")
             }
-            running = owner.busy
-            turn = owner.turnId ?? ""
+            _ = owner
+            return AIOutgoingMessageQueueBinding(mode: .enqueue, hostEpoch: epoch)
         } else {
             #if DEBUG && targetEnvironment(simulator)
             if uiTestSupport.steeringHandler != nil {
@@ -4050,7 +4120,8 @@ final class AIAssistantModel: ObservableObject {
         guard let binding = entry.binding else { throw AIBackendError(message: "排队请求尚未绑定任务") }
         let files = try payload.importedFiles(workspace: workspacePath)
         outgoingDeliveryCount += 1; isSubmitting = true
-        defer { outgoingDeliveryCount -= 1; isSubmitting = outgoingDeliveryCount > 0 }
+        var counting = true
+        defer { if counting { counting = false; outgoingDeliveryCount -= 1; isSubmitting = outgoingDeliveryCount > 0 } }
         if binding.mode == .answer {
             guard let questionID = binding.questionID, questionID == payload.questionID,
                   files.isEmpty, payload.quotedMessageID.isEmpty else {
@@ -4082,7 +4153,11 @@ final class AIAssistantModel: ObservableObject {
             if !payload.remoteAttachmentIDs.isEmpty {
                 command["attachments"] = payload.remoteAttachmentIDs.map { ["attachment_id": $0] }
             }
-            return try await sendRemoteSteering(to: owner, payload: command)
+            return try await sendRemoteSteering(to: owner, payload: command, onForwarded: { [weak self] in
+                guard let self else { return }
+                if counting { counting = false; self.outgoingDeliveryCount -= 1; self.isSubmitting = self.outgoingDeliveryCount > 0 }
+                await self.outgoingPump?.forwarded(entry)
+            })
         }
         try await prepareScreenFrameHistory(files.compactMap(\.archiveReference).filter {
             screenFrameHistoryPins[$0.referenceID] != payload.localSession

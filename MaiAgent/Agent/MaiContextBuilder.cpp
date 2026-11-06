@@ -50,7 +50,8 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
     // 但仍留在会话和工作区里，用户引用时可以按原路径再次读取。
     std::size_t latestUserIndex = history.size();
     for (std::size_t index = 0; index < history.size(); ++index) {
-        if (history[index].role == MaiRole::User) latestUserIndex = index;
+        if (history[index].role == MaiRole::User && !history[index].pendingInput)
+            latestUserIndex = index;
     }
     std::size_t currentToolImages = 0;
     for (std::size_t index = latestUserIndex; index < history.size(); ++index) {
@@ -66,7 +67,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
     std::size_t omittedImages = 0;
     std::size_t userImageCount = 0;
     for (const MaiMessage& message : history) {
-        if (message.role != MaiRole::User) continue;
+        if (message.role != MaiRole::User || message.pendingInput) continue;
         for (const MaiMessagePart& part : message.parts)
             if (std::holds_alternative<MaiImagePart>(part.body)) ++userImageCount;
     }
@@ -78,6 +79,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
 
     for (std::size_t messageIndex = 0; messageIndex < history.size(); ++messageIndex) {
         const auto& message = history[messageIndex];
+        if (message.pendingInput) continue;
         if (message.role == MaiRole::User) {
             // 用户消息的文字、图片、视频和引用共享同一模型消息。
             // 当前轮附件使用精确工作区路径，避免模型根据文件名猜测来源。

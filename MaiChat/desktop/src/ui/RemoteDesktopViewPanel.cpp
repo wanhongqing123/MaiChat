@@ -53,20 +53,20 @@ void RemoteDesktopViewPanel::buildUi() {
 }
 
 void RemoteDesktopViewPanel::applyStyle() {
-    setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         #remoteDesktopViewPanel {
             background: #ffffff;
         }
         #remoteIdleTitle {
             color: #0f172a;
-            font-size: 16px;
+            font-size: @body;
             font-weight: 700;
         }
         #remoteIdleHint {
             color: #94a3b8;
-            font-size: 13px;
+            font-size: @detail;
         }
-    )")));
+    )"));
 }
 
 void RemoteDesktopViewPanel::showIdle() {

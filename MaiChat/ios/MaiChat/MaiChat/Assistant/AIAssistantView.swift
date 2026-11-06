@@ -176,7 +176,7 @@ struct AIAssistantView: View {
                             HStack(spacing: 8) {
                                 ProgressView()
                                 Text("正在读取 \(pending.deviceName) 的对话…")
-                                    .font(.caption)
+                                    .font(AppTypography.metadata)
                                     .foregroundStyle(.secondary)
                             }
                             .frame(maxWidth: .infinity)
@@ -226,7 +226,7 @@ struct AIAssistantView: View {
                     if !model.error.isEmpty {
                         HStack(alignment: .top) {
                             Image(systemName: "exclamationmark.circle")
-                            Text(model.error).font(.caption).textSelection(.enabled)
+                            Text(model.error).font(AppTypography.metadata).textSelection(.enabled)
                             Spacer(minLength: 0)
                             Button { model.error = "" } label: { Image(systemName: "xmark") }
                         }.foregroundStyle(.red).padding(12).background(Color.red.opacity(0.05))
@@ -613,10 +613,10 @@ struct AIAssistantView: View {
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: collapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(AppTypography.symbol(size: 10, weight: .semibold))
                         .frame(width: 14)
-                    Text(title)
-                        .font(.system(size: 12, weight: .semibold))
+                    AppText(title)
+                        .font(AppTypography.metadata.weight(.semibold))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: 4)
@@ -624,10 +624,10 @@ struct AIAssistantView: View {
                         HStack(spacing: 4) {
                             Circle().fill(online == true ? RemoteIMStyle.green : Color.gray)
                                 .frame(width: 5, height: 5)
-                            Text(status).font(.system(size: 11))
+                            AppText(status).font(AppTypography.metadata)
                         }
                     }
-                    if count > 0 { Text("\(count)").font(.system(size: 11)) }
+                    if count > 0 { AppText("\(count)").font(AppTypography.metadata) }
                 }
                 .foregroundStyle(RemoteIMStyle.textSecondary)
                 .padding(.leading, 12).padding(.trailing, device == nil ? 12 : 2)
@@ -647,7 +647,7 @@ struct AIAssistantView: View {
                     }
                 } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(AppTypography.symbol(size: 15, weight: .semibold))
                         .frame(width: 34, height: 34)
                 }
                 .buttonStyle(.plain)
@@ -668,8 +668,8 @@ struct AIAssistantView: View {
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "square.and.pencil")
-                    .font(.system(size: 14)).foregroundStyle(Color.blue)
-                Text("未发送草稿").font(.system(size: 15, weight: .medium))
+                    .font(AppTypography.symbol(size: 14)).foregroundStyle(Color.blue)
+                AppText("未发送草稿").font(AppTypography.body)
                 Spacer(minLength: 8)
                 if model.selected.isEmpty && model.selectedRemote == nil {
                     Image(systemName: "checkmark").foregroundStyle(Color.blue)
@@ -695,8 +695,9 @@ struct AIAssistantView: View {
                 Task { await model.selectConversation(session.id) }
             } label: {
                 HStack(spacing: 8) {
-                    Text(session.displayTitle)
-                        .font(.system(size: 15, weight: selected ? .semibold : .medium))
+                    // 会话名称属于普通主文字，和正文共用所选家族及基准字号。
+                    AppText(session.displayTitle)
+                        .font(AppTypography.conversationTitle)
                         .lineLimit(1)
                     Spacer(minLength: 8)
                     if session.busy { ProgressView().controlSize(.small) }
@@ -722,7 +723,7 @@ struct AIAssistantView: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
-                    .font(.system(size: 15, weight: .medium))
+                    .font(AppTypography.symbol(size: 15, weight: .medium))
                     .foregroundStyle(.secondary)
                     .frame(width: 36, height: 44)
             }
@@ -744,13 +745,14 @@ struct AIAssistantView: View {
                 Task { await model.selectRemoteConversation(session) }
             } label: {
                 HStack(spacing: 8) {
-                    Text(session.displayTitle)
-                        .font(.system(size: 15, weight: selected ? .semibold : .medium))
+                    // 会话名称属于普通主文字，和正文共用所选家族及基准字号。
+                    AppText(session.displayTitle)
+                        .font(AppTypography.conversationTitle)
                         .lineLimit(1)
                     Spacer(minLength: 8)
                     if let updatedAt = session.updatedAt, updatedAt > 0 {
-                        Text(remoteUpdatedLabel(updatedAt))
-                            .font(.system(size: 10))
+                        AppText(remoteUpdatedLabel(updatedAt))
+                            .font(AppTypography.metadata)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -772,7 +774,7 @@ struct AIAssistantView: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
-                    .font(.system(size: 15, weight: .medium))
+                    .font(AppTypography.symbol(size: 15, weight: .medium))
                     .foregroundStyle(.secondary)
                     .frame(width: 36, height: 44)
             }
@@ -815,8 +817,8 @@ struct AIAssistantView: View {
                                 }
                             }
                         } else if !collapsedSessionDevices.contains("local") {
-                            Text("暂无本机对话")
-                                .font(.system(size: 13))
+                            AppText("暂无本机对话")
+                                .font(AppTypography.detail)
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                                 .padding(.leading, 34)
@@ -833,8 +835,8 @@ struct AIAssistantView: View {
                                         remoteSessionRow(session)
                                     }
                                     if group.sessions.isEmpty {
-                                        Text("暂无对话")
-                                            .font(.system(size: 13))
+                                        AppText("暂无对话")
+                                            .font(AppTypography.detail)
                                             .foregroundStyle(.secondary)
                                             .frame(maxWidth: .infinity, minHeight: 44,
                                                    alignment: .leading)
@@ -851,7 +853,7 @@ struct AIAssistantView: View {
             }
             .safeAreaInset(edge: .top, spacing: 0) {
                 HStack(spacing: 16) {
-                    Text("对话").font(.system(size: 20, weight: .bold))
+                    AppText("对话").font(AppTypography.title)
                     Spacer()
                     Button {
                         guard !sessionActionsBlocked else { return }
@@ -859,7 +861,7 @@ struct AIAssistantView: View {
                         Task { await model.create() }
                     } label: {
                         Image(systemName: "square.and.pencil")
-                            .font(.system(size: 18, weight: .medium))
+                            .font(AppTypography.symbol(size: 18, weight: .medium))
                             .frame(width: 32, height: 32)
                     }
                     .disabled(model.isSubmitting || model.isCreatingConversation)
@@ -869,7 +871,7 @@ struct AIAssistantView: View {
                             guard !sessionActionsBlocked else { return }
                             showsWideSidebar = false
                         }
-                            .font(.system(size: 14, weight: .medium))
+                            .font(AppTypography.detail.weight(.medium))
                     }
                 }
                 .buttonStyle(.plain)
@@ -960,7 +962,7 @@ private struct AIAssistantMessageList: View {
                         if !model.messages.isEmpty {
                             if model.hasOlderVisibleMessages {
                                 Button("查看更早消息", action: requestOlderMessages)
-                                    .font(.system(size: 13, weight: .medium))
+                                    .font(AppTypography.detail.weight(.medium))
                                     .foregroundStyle(.secondary)
                                     .frame(maxWidth: .infinity)
                                     .buttonStyle(.plain)
@@ -1217,12 +1219,12 @@ private struct AIAssistantMessageList: View {
     private var welcome: some View {
         VStack(alignment: .center, spacing: 0) {
             Image(systemName: "sparkles")
-                .font(.system(size: 24, weight: .medium))
+                .font(AppTypography.symbol(size: 24, weight: .medium))
                 .foregroundStyle(RemoteIMStyle.blue)
                 .frame(width: 48, height: 48)
                 .background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 15))
             Text("从这里开始创作")
-                .font(.system(size: 25, weight: .bold))
+                .font(AppTypography.display.weight(.bold))
                 .foregroundStyle(RemoteIMStyle.textPrimary)
                 .padding(.top, 18)
 
@@ -1260,7 +1262,7 @@ private struct AIAssistantMessageList: View {
                 Text(model.settings.isLocalModel
                     ? "内置本地模型暂时不可用，请重试；若仍失败，请更新 App"
                     : "登录后可使用云端主模型，也可在“更多→主模型”中选择本地 GGUF")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(AppTypography.detail).foregroundStyle(.secondary)
                     .padding(.top, 18)
                 Button("重试连接") {
                     Task {
@@ -1270,7 +1272,7 @@ private struct AIAssistantMessageList: View {
                         _ = await model.save(model.settings)
                     }
                 }
-                    .buttonStyle(.plain).font(.system(size: 14, weight: .semibold))
+                    .buttonStyle(.plain).font(AppTypography.detail.weight(.semibold))
                     .foregroundStyle(Color.white).padding(.horizontal, 16).frame(height: 38)
                     .background(Color.blue, in: RoundedRectangle(cornerRadius: 10))
                     .padding(.top, 10)
@@ -1285,10 +1287,10 @@ private struct AIAssistantMessageList: View {
     private func welcomeFeature(_ title: String, icon: String) -> some View {
         HStack(spacing: 10) {
             Image(systemName: icon)
-                .font(.system(size: 17, weight: .medium))
+                .font(AppTypography.symbol(size: 17, weight: .medium))
                 .foregroundStyle(RemoteIMStyle.blue)
                 .frame(width: 22)
-            Text(title).font(.system(size: 14, weight: .semibold))
+            Text(title).font(AppTypography.detail.weight(.semibold))
                 .foregroundStyle(RemoteIMStyle.textPrimary)
         }
         .frame(maxWidth: .infinity, minHeight: 58)
@@ -1316,7 +1318,7 @@ private struct AIHeader: View {
             }
             AIHeaderButton(systemImage: "ellipsis", label: "更多", action: openActions)
         }
-        .overlay { Text("创作中心").font(.system(size: 18, weight: .bold)).allowsHitTesting(false) }
+        .overlay { AppPageTitle("创作中心").allowsHitTesting(false) }
         .padding(.horizontal, 16).frame(height: 54)
         .foregroundStyle(.primary)
         .remoteIMBarBackground(edges: .top, opacity: RemoteIMStyle.conversationBarOpacity)
@@ -1331,7 +1333,7 @@ private struct AIHeaderButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: systemImage).font(.system(size: 16, weight: .semibold))
+            Image(systemName: systemImage).font(AppTypography.symbol(size: 16, weight: .semibold))
                 .frame(width: 34, height: 34)
                 .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
                 .frame(width: 44, height: 44)
@@ -1404,7 +1406,7 @@ private struct AIActionPanel: View {
                     policyOption("帮我批准", value: "unless-trusted")
                     policyOption("完全访问", value: "never")
                     Text("完全访问免除一般操作确认；付费任务仍需批准。")
-                        .font(.system(size: 11))
+                        .font(AppTypography.metadata)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 14)
@@ -1436,13 +1438,13 @@ private struct AIActionPanel: View {
             HStack(spacing: 12) {
                 Image(systemName: image).frame(width: 18)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title).font(.system(size: 14, weight: .medium))
-                    Text(value).font(.system(size: 11)).foregroundStyle(Color.secondary)
+                    Text(title).font(AppTypography.detail.weight(.medium))
+                    Text(value).font(AppTypography.metadata).foregroundStyle(Color.secondary)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 6)
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(AppTypography.symbol(size: 11, weight: .semibold))
                     .rotationEffect(.degrees(expandedSection == section ? 90 : 0))
             }
             .foregroundStyle(Color.primary)
@@ -1487,11 +1489,11 @@ private struct AIActionPanel: View {
     private func option(_ title: String, selected: Bool, select: @escaping () -> Void) -> some View {
         Button(action: select) {
             HStack {
-                Text(title).font(.system(size: 13, weight: .medium))
+                Text(title).font(AppTypography.detail.weight(.medium))
                 Spacer()
                 if selected {
                     Image(systemName: "checkmark")
-                        .font(.system(size: 11, weight: .bold))
+                        .font(AppTypography.symbol(size: 11, weight: .bold))
                         .foregroundStyle(Color.blue)
                 }
             }
@@ -1516,12 +1518,24 @@ private struct AIActionPanel: View {
         Button(action: handler) {
             HStack(spacing: 12) {
                 Image(systemName: image).frame(width: 18)
-                Text(title).font(.system(size: 14, weight: .medium))
+                Text(title).font(AppTypography.detail.weight(.medium))
                 Spacer()
             }.foregroundStyle(color).padding(.horizontal, 14).frame(height: 44)
         }.buttonStyle(.plain)
     }
 }
+// 每个工具组以首片段标识，后续正文/工具追加不会重建较早的折叠组。
+private enum AIAssistantDisplayBlock: Identifiable {
+    case tools([AIPart])
+    case part(AIPart)
+    var id: String {
+        switch self {
+        case .tools(let parts): "tools:" + (parts.first?.id ?? "")
+        case .part(let part): "part:" + part.id
+        }
+    }
+}
+
 struct AIMessageRow: View, Equatable {
     @EnvironmentObject private var appState: RemoteIMAppState
     @ObservedObject private var cloudDrive = MaiCloudDriveModel.shared
@@ -1565,7 +1579,7 @@ struct AIMessageRow: View, Equatable {
                     VStack(alignment: .leading, spacing: 10) {
                         ForEach(message.parts.filter { $0.kind == "quote" }) { part in
                             Label(part.preview ?? "已引用消息", systemImage: "arrowshape.turn.up.left")
-                                .font(.caption)
+                                .font(AppTypography.metadata)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
                         }
@@ -1596,7 +1610,7 @@ struct AIMessageRow: View, Equatable {
                             remoteAttachmentCard(part)
                         }
                         if let remoteDownloadError {
-                            Text(remoteDownloadError).font(.footnote).foregroundStyle(.red)
+                            Text(remoteDownloadError).font(AppTypography.detail).foregroundStyle(.red)
                         }
                         Button(action: quote) {
                             Label("引用", systemImage: "arrowshape.turn.up.left")
@@ -1708,9 +1722,9 @@ struct AIMessageRow: View, Equatable {
         if let stage = seedanceStage(in: toolParts) {
             Label {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(stage.title).font(.system(size: 14, weight: .semibold))
+                    Text(stage.title).font(AppTypography.detail.weight(.semibold))
                     if !stage.detail.isEmpty {
-                        Text(stage.detail).font(.system(size: 12))
+                        Text(stage.detail).font(AppTypography.metadata)
                     }
                 }
             } icon: {
@@ -1761,7 +1775,7 @@ struct AIMessageRow: View, Equatable {
                 ShareLink(item: url) {
                     Label("分享排障日志 · \(url.lastPathComponent)",
                           systemImage: "doc.text")
-                        .font(.system(size: 14, weight: .medium))
+                        .font(AppTypography.detail.weight(.medium))
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(12)
                         .background(Color.blue.opacity(0.07),
@@ -1796,7 +1810,7 @@ struct AIMessageRow: View, Equatable {
                     MaiVideoCircleModel.shared.presentation = .publish(source)
                 } label: {
                     Label("发布到视频圈", systemImage: "square.and.arrow.up")
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(AppTypography.detail.weight(.semibold))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(RemoteIMStyle.blue)
@@ -1823,14 +1837,14 @@ struct AIMessageRow: View, Equatable {
                     }
                 } label: {
                     Label("保存到云盘", systemImage: "icloud.and.arrow.up")
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(AppTypography.detail.weight(.semibold))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(RemoteIMStyle.blue)
                 .accessibilityIdentifier("ai-cloud-drive-save-\(artifact.id)")
             }
             if let cloudUploadNotice {
-                Text(cloudUploadNotice).font(.caption)
+                Text(cloudUploadNotice).font(AppTypography.metadata)
                     .foregroundStyle(RemoteIMStyle.textSecondary)
             }
         }
@@ -1953,13 +1967,14 @@ struct AIMessageRow: View, Equatable {
             (part.kind == "text" && !(part.text ?? "").isEmpty) || part.questionText != nil
         }
     }
+    private func isDisclosureTool(_ part: AIPart) -> Bool {
+        part.kind == "tool" && part.questionText == nil
+            && !(part.tool == "agent_send_media" && mediaArtifact(for: part) != nil)
+    }
     private var toolParts: [AIPart] {
         // Captures keep their execution receipt in the disclosure even when an
         // image card is present. agent_send_media retains its existing card-only UI.
-        message.parts.filter {
-            $0.kind == "tool" && $0.questionText == nil &&
-                !($0.tool == "agent_send_media" && mediaArtifact(for: $0) != nil)
-        }
+        message.parts.filter(isDisclosureTool)
     }
     private var mediaArtifacts: [AIAgentMediaArtifact] {
         var result: [AIAgentMediaArtifact] = []
@@ -2152,9 +2167,9 @@ struct AIMessageRow: View, Equatable {
             mediaSaveError = error.localizedDescription
         }
     }
-    private func toolSummary(for toolParts: [AIPart]) -> String {
+    private func toolSummary(for tools: [AIPart]) -> String {
         var counts: [(name: String, count: Int)] = []
-        for part in toolParts {
+        for part in tools {
             let name = part.tool ?? "工具"
             if let index = counts.firstIndex(where: { $0.name == name }) {
                 counts[index].count += 1
@@ -2164,13 +2179,13 @@ struct AIMessageRow: View, Equatable {
         }
         return counts.map { "\($0.name) ×\($0.count)" }.joined(separator: " · ")
     }
-    private func toolDisclosureTitle(for toolParts: [AIPart]) -> String {
-        let summary = "工具调用 \(toolParts.count) 次，\(toolGroupStatus(for: toolParts))"
-        let details = toolSummary(for: toolParts)
-        return details.isEmpty ? summary : "\(summary) · \(details)"
+    private func toolDisclosureTitle(for tools: [AIPart]) -> String {
+        let summary = "工具调用 \(tools.count) 次，\(toolGroupStatus(for: tools))"
+        let names = toolSummary(for: tools)
+        return names.isEmpty ? summary : "\(summary) · \(names)"
     }
-    private func toolGroupStatus(for toolParts: [AIPart]) -> String {
-        let states = toolParts.map(\.state)
+    private func toolGroupStatus(for tools: [AIPart]) -> String {
+        let states = tools.map(\.state)
         if states.contains("running") { return "运行中" }
         if states.contains("pending") { return "等待授权" }
         if states.contains("error") { return "有失败" }
@@ -2364,7 +2379,7 @@ private struct AIPDFPreviewScreen: View {
     var body: some View {
         NavigationStack {
             RemoteIMQuickLookPreview(filePath: item.url.path)
-                .navigationTitle(item.url.lastPathComponent)
+                .appNavigationTitle(item.url.lastPathComponent)
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
@@ -2386,7 +2401,7 @@ private struct AIPDFArtifactButton: View {
         Button(action: open) {
             Label("预览 PDF · \((path as NSString).lastPathComponent)",
                   systemImage: "doc.richtext")
-                .font(.system(size: 14, weight: .medium))
+                .font(AppTypography.detail.weight(.medium))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(12)
                 .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
@@ -2494,13 +2509,13 @@ private struct AIWorkspaceVideoCard: View {
                         startPoint: .topLeading, endPoint: .bottomTrailing)
                 }
                 Image(systemName: exists ? "play.fill" : "exclamationmark.triangle.fill")
-                    .font(.system(size: 20, weight: .bold))
+                    .font(AppTypography.symbol(size: 20, weight: .bold))
                     .foregroundStyle(.white)
                     .frame(width: 52, height: 52)
                     .background(.black.opacity(0.5), in: Circle())
                 // 文件名压在缩略图角落，保留画面主体，也能辨认当前是哪一段视频。
                 Text(fileName)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(AppTypography.metadata.weight(.semibold))
                     .foregroundStyle(.white)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -2515,7 +2530,7 @@ private struct AIWorkspaceVideoCard: View {
                         format: "%d:%02d", durationSeconds / 60,
                         durationSeconds % 60)
                 )
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .font(AppTypography.detailMonospaced.weight(.semibold))
                 .foregroundStyle(.white)
                 .padding(.horizontal, 7)
                 .frame(height: 22)
@@ -2790,7 +2805,7 @@ private struct AIDraftAttachmentTile: View {
                         } else if !file.mimeType.hasPrefix("video/") {
                             Image(systemName: file.mimeType.hasPrefix("audio/")
                                   ? "waveform" : "doc")
-                                .font(.system(size: 27))
+                                .font(AppTypography.symbol(size: 27))
                                 .foregroundStyle(RemoteIMStyle.blue)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .background(RemoteIMStyle.blueSoft)
@@ -2803,7 +2818,7 @@ private struct AIDraftAttachmentTile: View {
                         }
                         if file.mimeType.hasPrefix("video/") {
                             Image(systemName: "play.fill")
-                                .font(.system(size: 16, weight: .bold))
+                                .font(AppTypography.symbol(size: 16, weight: .bold))
                                 .foregroundStyle(.white)
                                 .frame(width: 34, height: 34)
                                 .background(.black.opacity(0.55), in: Circle())
@@ -2820,7 +2835,7 @@ private struct AIDraftAttachmentTile: View {
                     remove()
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 20, weight: .semibold))
+                        .font(AppTypography.symbol(size: 20, weight: .semibold))
                         .foregroundStyle(.white)
                         .shadow(color: .black.opacity(0.7), radius: 3)
                         .frame(width: 44, height: 44)
@@ -2832,12 +2847,12 @@ private struct AIDraftAttachmentTile: View {
                 .accessibilityIdentifier("ai-remove-attachment-\(file.relativePath)")
             }
             Text("\(typeName) \(position)")
-                .font(.caption.weight(.medium))
+                .font(AppTypography.metadata.weight(.medium))
                 .foregroundStyle(RemoteIMStyle.textSecondary)
                 .lineLimit(1)
                 .frame(width: 96)
             Text(fileName)
-                .font(.system(size: 10))
+                .font(AppTypography.metadata)
                 .foregroundStyle(RemoteIMStyle.textSecondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -2959,7 +2974,7 @@ private struct AIComposer: View, Equatable {
         VStack(spacing: 0) {
             if !snapshot.uploadStatus.isEmpty {
                 Label(snapshot.uploadStatus, systemImage: "icloud.and.arrow.up")
-                    .font(.footnote)
+                    .font(AppTypography.detail)
                     .foregroundStyle(RemoteIMStyle.blue)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)
@@ -2972,9 +2987,9 @@ private struct AIComposer: View, Equatable {
                         .foregroundStyle(RemoteIMStyle.blue)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(quoted.role == "user" ? "引用你的消息" : "引用 AI 消息")
-                            .font(.caption.weight(.semibold))
+                            .font(AppTypography.metadata.weight(.semibold))
                         Text(quoted.quotePreview)
-                            .font(.caption)
+                            .font(AppTypography.metadata)
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
                     }
@@ -2994,16 +3009,16 @@ private struct AIComposer: View, Equatable {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text("待发送附件")
-                            .font(.caption.weight(.semibold))
+                            .font(AppTypography.metadata.weight(.semibold))
                             .foregroundStyle(.secondary)
                         if !snapshot.attachments.isEmpty {
                             Text("\(snapshot.attachments.count)")
-                                .font(.caption)
+                                .font(AppTypography.metadata)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
                         if isImportingCurrentSession {
-                            ProgressView("正在导入…").font(.caption)
+                            ProgressView("正在导入…").font(AppTypography.metadata)
                         }
                     }
                     if !snapshot.attachments.isEmpty {
@@ -3038,11 +3053,11 @@ private struct AIComposer: View, Equatable {
                     Image(systemName: "music.note")
                         .foregroundStyle(RemoteIMStyle.blue)
                     Text(music.title.isEmpty ? "正在载入音乐…" : music.title)
-                        .font(.system(size: 13, weight: .medium))
+                        .font(AppTypography.detail.weight(.medium))
                         .lineLimit(1)
                     Spacer(minLength: 4)
                     Button("播放器") { showingMusic = true }
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(AppTypography.metadata.weight(.semibold))
                     Button { music.stop() } label: {
                         Image(systemName: "xmark")
                     }
@@ -3078,7 +3093,7 @@ private struct AIComposer: View, Equatable {
                     withAnimation(.easeOut(duration: 0.16)) { isVoiceMode.toggle() }
                 } label: {
                     Image(systemName: isVoiceMode ? "keyboard" : "speaker.wave.2.fill")
-                        .font(.system(size: 18, weight: .bold))
+                        .font(AppTypography.symbol(size: 18, weight: .bold))
                         .frame(width: 44, height: 44)
                         .background(RemoteIMStyle.blueSoft, in: Circle())
                         .overlay(Circle().stroke(RemoteIMStyle.border, lineWidth: 1))
@@ -3192,7 +3207,7 @@ private struct AIComposer: View, Equatable {
                     }
                 } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 20, weight: .semibold))
+                        .font(AppTypography.symbol(size: 20, weight: .semibold))
                         .foregroundStyle(Color.primary)
                         .frame(width: 44, height: 44)
                         .background(Color(uiColor: .secondarySystemBackground), in: Circle())
@@ -3290,7 +3305,7 @@ private struct AIComposer: View, Equatable {
                                 }
                                     .accessibilityIdentifier("ai-camera-stop")
                             }
-                            .font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                            .font(AppTypography.detail.weight(.semibold)).foregroundStyle(.white)
                             .padding().background(.black.opacity(0.6))
                             Spacer()
                         }
@@ -3628,7 +3643,7 @@ private struct AIComposer: View, Equatable {
         let active = screenCapture.isSharing || screenCapture.isStarting
         if model.screenFrameArchiveUnavailableCountForCurrentDraft() > 0 {
             Text("部分旧屏幕截图批次不可读取，原文件仍保留。")
-                .font(.footnote).foregroundStyle(.secondary)
+                .font(AppTypography.detail).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
         }
         if active || !saved.isEmpty {
@@ -3641,12 +3656,12 @@ private struct AIComposer: View, Equatable {
                             "每 2 秒截取一张 · 已截取 \(screenCapture.archiveBatch?.frameCount ?? 0) 张")
                         if let context = screenCapture.archiveContext,
                            !saved.contains(where: { $0.id == context.batchID }) {
-                            Text("图片保存在开始共享的原会话").font(.caption).foregroundStyle(.secondary)
+                            Text("图片保存在开始共享的原会话").font(AppTypography.metadata).foregroundStyle(.secondary)
                         }
                     } else {
                         Text("共享截图已保留 · 选择需要的图片")
                     }
-                }.font(.system(size: 13, weight: .medium))
+                }.font(AppTypography.detail.weight(.medium))
                 Spacer(minLength: 4)
                 if active {
                     Button("停止共享") { Task { await stopScreenShareAndReview() } }
@@ -3656,7 +3671,7 @@ private struct AIComposer: View, Equatable {
                         .accessibilityIdentifier("ai-screen-share-review")
                 }
             }
-            .font(.system(size: 12, weight: .semibold)).buttonStyle(.plain)
+            .font(AppTypography.metadata.weight(.semibold)).buttonStyle(.plain)
             .padding(.horizontal, 14).padding(.vertical, 10)
             .background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 11))
             .padding(.horizontal, 16)
@@ -3667,7 +3682,7 @@ private struct AIComposer: View, Equatable {
     @ViewBuilder private var cameraFramesStrip: some View {
         if model.cameraFrameArchiveUnavailableCountForCurrentDraft() > 0 {
             Text("部分旧相机图片批次不可读取，原文件仍保留。")
-                .font(.footnote).foregroundStyle(.secondary)
+                .font(AppTypography.detail).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16)
         }
         if let latest = model.cameraFrameBindingsForCurrentDraft().last {
@@ -3678,7 +3693,7 @@ private struct AIComposer: View, Equatable {
                 Button("选择图片") { cameraFrameSelection = latest }
                     .accessibilityIdentifier("ai-camera-review")
             }
-            .font(.system(size: 12, weight: .semibold)).buttonStyle(.plain)
+            .font(AppTypography.metadata.weight(.semibold)).buttonStyle(.plain)
             .padding(.horizontal, 14).padding(.vertical, 10)
             .background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 11))
             .padding(.horizontal, 16)
@@ -4415,7 +4430,7 @@ private struct AITranscriptionButton: View {
 
     var body: some View {
         Text(title)
-            .font(.system(size: 15, weight: .semibold))
+            .font(AppTypography.detail.weight(.semibold))
             .foregroundStyle(isEnabled ? Color.primary : Color.secondary)
             .frame(maxWidth: .infinity, minHeight: 44)
             .background(backgroundColor, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -4618,7 +4633,7 @@ struct AIPermissionCard: View {
                   : (isSendText ? "确认发送消息" : "确认工具操作"),
                   systemImage: isPaidGeneration ? "sparkles"
                     : isRealValidationLink ? "person.crop.circle" : "hand.raised")
-                .font(.headline)
+                .font(AppTypography.heading)
                 .foregroundStyle(Color.primary)
             if isPaidGeneration {
                 let usesRegisteredAsset =
@@ -4633,12 +4648,12 @@ struct AIPermissionCard: View {
                      : (fields["authorized_portrait_asset_id"] as? String)?.isEmpty == false
                          ? "将使用已授权真人形象。确认后提交给\(paidProvider)，可能消耗模型额度。"
                          : "确认后将提交给\(paidProvider)，可能消耗模型额度。")
-                    .font(.subheadline)
+                    .font(AppTypography.detail)
                     .foregroundStyle(.secondary)
                 if !paidRequest.isEmpty {
                     ScrollView {
                         Text(paidRequest)
-                            .font(.body)
+                            .font(AppTypography.body)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -4649,7 +4664,7 @@ struct AIPermissionCard: View {
                 }
                 if !paidDetails.isEmpty {
                     Text(paidDetails)
-                        .font(.subheadline)
+                        .font(AppTypography.detail)
                         .foregroundStyle(.secondary)
                 }
             } else if isVideoTaskManagement {
@@ -4658,20 +4673,20 @@ struct AIPermissionCard: View {
                         ? "将删除方舟中已结束的任务记录和本地任务索引；已保存的视频文件仍保留。"
                         : "只删除本地已交付的任务记录；云端任务和已保存的视频仍保留。")
                      : "仅排队中的任务可取消。若已开始生成，平台会拒绝，任务仍继续运行。")
-                    .font(.subheadline).foregroundStyle(.secondary)
+                    .font(AppTypography.detail).foregroundStyle(.secondary)
                 Text("任务：\((fields["conversation_id"] as? String) ?? "未指定")")
-                    .font(.caption).textSelection(.enabled)
+                    .font(AppTypography.metadata).textSelection(.enabled)
             } else if isRealValidationLink {
                 Text("将创建一次性 H5 链接，请由照片中的本人打开并完成验证。认证凭证有效期为 30 分钟；完成后才能登记真人素材。")
-                    .font(.subheadline)
+                    .font(AppTypography.detail)
                     .foregroundStyle(.secondary)
             } else if isSendText, let peer = fields["peer_id"] as? String,
                let text = fields["text"] as? String {
                 Label(peer, systemImage: "person.crop.circle")
-                    .font(.subheadline).foregroundStyle(.secondary)
+                    .font(AppTypography.detail).foregroundStyle(.secondary)
                 ScrollView {
                     Text(text)
-                        .font(.body)
+                        .font(AppTypography.body)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -4680,10 +4695,10 @@ struct AIPermissionCard: View {
                 .background(Color(uiColor: .systemBackground),
                             in: RoundedRectangle(cornerRadius: 10))
             } else {
-                Text(permission.tool).font(.subheadline.bold()).foregroundStyle(.secondary)
+                Text(permission.tool).font(AppTypography.detail.bold()).foregroundStyle(.secondary)
                 ScrollView {
                     Text(formattedInput)
-                        .font(.system(.caption, design: .monospaced))
+                        .font(AppTypography.detailMonospaced)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -4697,14 +4712,14 @@ struct AIPermissionCard: View {
                                 isExpanded: $showsRawInput) {
                     ScrollView {
                         Text(formattedInput)
-                            .font(.system(.caption, design: .monospaced))
+                            .font(AppTypography.detailMonospaced)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: 180)
                     .padding(.top, 6)
                 }
-                .font(.caption)
+                .font(AppTypography.metadata)
             }
             HStack {
                 action(isVideoTaskManagement ? "返回"
@@ -4726,7 +4741,7 @@ struct AIPermissionCard: View {
     }
     private func action(_ title: String, _ decision: String) -> some View {
         Button(title) { Task { await model.action("permission", values: ["id": permission.id, "decision": decision]) } }
-            .buttonStyle(.plain).font(.system(size: 12, weight: .semibold))
+            .buttonStyle(.plain).font(AppTypography.metadata.weight(.semibold))
             .foregroundStyle(decision == "denied" ? Color.secondary : Color.orange)
             .padding(.horizontal, 10).frame(height: 32)
             .background(Color(uiColor: .systemBackground), in: RoundedRectangle(cornerRadius: 8))
@@ -5056,13 +5071,13 @@ struct MaiLocalMusicPlayerView: View {
     var body: some View {
         VStack(spacing: 16) {
             HStack {
-                Text("正在播放").font(.caption.weight(.semibold))
+                Text("正在播放").font(AppTypography.metadata.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text(music.sourceName).font(.caption).foregroundStyle(.secondary)
+                Text(music.sourceName).font(AppTypography.metadata).foregroundStyle(.secondary)
             }
             Image(systemName: "music.note")
-                .font(.system(size: 44, weight: .light))
+                .font(AppTypography.symbol(size: 44, weight: .light))
                 .foregroundStyle(.white)
                 .frame(width: 108, height: 108)
                 .background(LinearGradient(colors: [Color(red: 0.16, green: 0.57, blue: 0.94),
@@ -5071,14 +5086,14 @@ struct MaiLocalMusicPlayerView: View {
                             in: RoundedRectangle(cornerRadius: 27))
                 .accessibilityHidden(true)
             Text(music.title)
-                .font(.system(size: 19, weight: .semibold))
+                .font(AppTypography.title.weight(.semibold))
                 .lineLimit(2).multilineTextAlignment(.center)
             if !music.artist.isEmpty {
-                Text(music.artist).font(.subheadline).foregroundStyle(.secondary)
+                Text(music.artist).font(AppTypography.detail).foregroundStyle(.secondary)
             }
-            if music.isLoading { ProgressView("正在载入…").font(.caption) }
+            if music.isLoading { ProgressView("正在载入…").font(AppTypography.metadata) }
             if !music.errorMessage.isEmpty {
-                Text(music.errorMessage).font(.caption).foregroundStyle(.red)
+                Text(music.errorMessage).font(AppTypography.metadata).foregroundStyle(.red)
             }
             Slider(value: Binding(
                 get: { isScrubbing ? scrubPosition : music.position },
@@ -5091,7 +5106,7 @@ struct MaiLocalMusicPlayerView: View {
                 Text(clock(music.position))
                 Spacer()
                 Text(clock(music.duration))
-            }.font(.caption).foregroundStyle(.secondary)
+            }.font(AppTypography.metadata).foregroundStyle(.secondary)
             HStack(spacing: 24) {
                 Button(music.isPlaying ? "暂停" : "播放") { music.toggle() }
                     .buttonStyle(.borderedProminent)

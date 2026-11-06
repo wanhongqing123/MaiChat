@@ -79,7 +79,7 @@ public:
             if (remote && index.data(Qt::UserRole + 6).toBool()) {
                 const QRect add = deviceCreateRect(option.rect);
                 painter->setPen(QColor(QStringLiteral("#0b67b7")));
-                font.setPixelSize(UiZoom::s(19));
+                font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Title));
                 font.setBold(false);
                 painter->setFont(font);
                 painter->drawText(add, Qt::AlignCenter, QStringLiteral("+"));
@@ -90,7 +90,7 @@ public:
             painter->setPen(Qt::NoPen);
             painter->setBrush(QColor(QStringLiteral("#dbe7f1")));
             painter->drawRoundedRect(badge, UiZoom::s(10), UiZoom::s(10));
-            font.setPixelSize(UiZoom::s(11));
+            font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Metadata));
             font.setBold(true);
             painter->setFont(font);
             painter->setPen(QColor(QStringLiteral("#516a82")));
@@ -102,7 +102,7 @@ public:
                                    UiZoom::s(38), card.height());
                 painter->setPen(online ? QColor(QStringLiteral("#2b8060")) :
                                          QColor(QStringLiteral("#98a2b3")));
-                font.setPixelSize(UiZoom::s(10));
+                font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Metadata));
                 font.setBold(false);
                 painter->setFont(font);
                 painter->drawText(status, Qt::AlignVCenter | Qt::AlignRight,
@@ -112,7 +112,7 @@ public:
             }
             const QRect title(card.left() + UiZoom::s(28), card.top(),
                               textRight - card.left() - UiZoom::s(28), card.height());
-            font.setPixelSize(UiZoom::s(12));
+            font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Metadata));
             font.setBold(true);
             painter->setFont(font);
             painter->setPen(QColor(QStringLiteral("#344e67")));
@@ -135,7 +135,7 @@ public:
             const int railX = option.rect.left() + UiZoom::s(22);
             painter->drawLine(railX, option.rect.top(), railX, option.rect.bottom());
             QFont font = option.font;
-            font.setPixelSize(UiZoom::s(13));
+            font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Detail));
             font.setBold(selected);
             painter->setFont(font);
             painter->setPen(QColor(selected ? QStringLiteral("#0b466f") :
@@ -150,7 +150,7 @@ public:
             if (hasMenu) {
                 const QRect menu = sessionMenuRect(option.rect);
                 painter->setPen(QColor(QStringLiteral("#607589")));
-                font.setPixelSize(UiZoom::s(18));
+                font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Heading3));
                 font.setBold(true);
                 painter->setFont(font);
                 painter->drawText(menu, Qt::AlignCenter, QStringLiteral("⋯"));
@@ -217,9 +217,9 @@ AgentSessionList::AgentSessionList(AgentController& controller, QWidget* parent)
     runtime_->controller = &controller;
     setObjectName(QStringLiteral("agentSessionList"));
     setMinimumWidth(UiZoom::s(210));
-    setStyleSheet(UiZoom::scaleQss(
+    UiZoom::setStyle(this,
         QStringLiteral("QWidget#agentSessionList{background:#fafbfd;"
-                       "border-right:1px solid %1;}").arg(kLine)));
+                       "border-right:1px solid %1;}").arg(kLine));
 
     auto* column = new QVBoxLayout(this);
     column->setContentsMargins(0, 0, 0, 0);
@@ -232,14 +232,14 @@ AgentSessionList::AgentSessionList(AgentController& controller, QWidget* parent)
     headRow->setContentsMargins(UiZoom::s(12), UiZoom::s(12), UiZoom::s(12), UiZoom::s(8));
     auto* newButton = new QPushButton(QStringLiteral("＋  新对话"));
     newButton->setCursor(Qt::PointingHandCursor);
-    newButton->setStyleSheet(UiZoom::scaleQss(
+    UiZoom::setStyle(newButton,
         QStringLiteral("QPushButton{background:#ffffff;color:%1;border:1px solid %2;"
                        "border-radius:8px;padding:7px 10px;text-align:left;}"
                        "QPushButton:hover{background:%3;border-color:%4;color:%4;}")
-            .arg(kInk, kLine, kAccentWash, kAccent)));
+            .arg(kInk, kLine, kAccentWash, kAccent));
     QFont newFont = newButton->font();
-    newFont.setPixelSize(UiZoom::s(13));
-    newButton->setFont(newFont);
+    newFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Detail));
+    UiZoom::setFont(newButton, UiZoom::TextRole::Detail, newFont);
     headRow->addWidget(newButton);
     column->addWidget(head);
 
@@ -339,10 +339,10 @@ void AgentSessionList::showRemoteSessionMenu(const QJsonObject& session, const Q
     if (!session.value(QStringLiteral("online")).toBool()) return;
     auto* menu = new QMenu(this);
     menu->setObjectName(QStringLiteral("agentRemoteSessionMenu"));
-    menu->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
+    UiZoom::setStyle(menu, QStringLiteral(
         "QMenu{background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;padding:4px;}"
         "QMenu::item{color:#b42318;padding:8px 16px;border-radius:5px;}"
-        "QMenu::item:selected{background:#fff1f2;}")));
+        "QMenu::item:selected{background:#fff1f2;}"));
     QAction* remove = menu->addAction(QStringLiteral("删除对话"));
     remove->setObjectName(QStringLiteral("agentRemoteDeleteSessionAction"));
     connect(remove, &QAction::triggered, this,
@@ -355,10 +355,10 @@ void AgentSessionList::showRemoteDeviceMenu(const QJsonObject& device, const QPo
     if (!device.value(QStringLiteral("online")).toBool()) return;
     auto* menu = new QMenu(this);
     menu->setObjectName(QStringLiteral("agentRemoteDeviceMenu"));
-    menu->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
+    UiZoom::setStyle(menu, QStringLiteral(
         "QMenu{background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;padding:4px;}"
         "QMenu::item{color:#172033;padding:8px 16px;border-radius:5px;}"
-        "QMenu::item:selected{background:#edf8ff;color:#0b67b7;}")));
+        "QMenu::item:selected{background:#edf8ff;color:#0b67b7;}"));
     QAction* create = menu->addAction(QStringLiteral("在此设备新建对话"));
     create->setObjectName(QStringLiteral("agentRemoteCreateSessionAction"));
     connect(create, &QAction::triggered, this,
@@ -371,10 +371,10 @@ void AgentSessionList::showLocalSessionMenu(const QString& sessionId,
                                             const QPoint& position) {
     auto* menu = new QMenu(this);
     menu->setObjectName(QStringLiteral("agentSessionMenu"));
-    menu->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
+    UiZoom::setStyle(menu, QStringLiteral(
         "QMenu{background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;padding:4px;}"
         "QMenu::item{color:#b42318;padding:8px 16px;border-radius:5px;}"
-        "QMenu::item:selected{background:#fff1f2;}")));
+        "QMenu::item:selected{background:#fff1f2;}"));
     QAction* remove = menu->addAction(QStringLiteral("删除对话"));
     remove->setObjectName(QStringLiteral("agentDeleteSessionAction"));
     connect(remove, &QAction::triggered, this,

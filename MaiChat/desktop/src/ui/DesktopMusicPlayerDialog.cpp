@@ -1,4 +1,5 @@
 // 文件作用：选择并播放一首本地音频，关闭窗口时立即停止声音。
+#include "ui/UiZoom.h"
 #include "ui/DesktopMusicPlayerDialog.h"
 #if defined(MAICHAT_HAS_FFPLAY)
 #include "ui/MaiFfplayVideoDialog.h"
@@ -71,7 +72,7 @@ DesktopMusicPlayerDialog::DesktopMusicPlayerDialog(QWidget* parent, const QStrin
     layout->setContentsMargins(28, 22, 28, 22);
     layout->setSpacing(12);
     auto* source = new QLabel(QStringLiteral("正在播放  ·  本地文件"), this);
-    source->setStyleSheet(QStringLiteral("color:#667085;font-size:12px;"));
+    UiZoom::setStyle(source, QStringLiteral("color:#667085;font-size: @metadata;"));
     layout->addWidget(source);
     auto* artwork = new QLabel(QStringLiteral("♫"), this);
     artwork->setAlignment(Qt::AlignCenter);
@@ -83,7 +84,7 @@ DesktopMusicPlayerDialog::DesktopMusicPlayerDialog(QWidget* parent, const QStrin
     title_ = new QLabel(this);
     title_->setWordWrap(true);
     title_->setAlignment(Qt::AlignCenter);
-    title_->setStyleSheet(QStringLiteral("color:#101828;font-size:17px;font-weight:600;"));
+    UiZoom::setStyle(title_, QStringLiteral("color:#101828;font-size: @body;font-weight:600;"));
     layout->addWidget(title_);
     progress_ = new QSlider(Qt::Horizontal, this);
     progress_->setObjectName(QStringLiteral("desktopMusicProgress"));
@@ -95,10 +96,10 @@ DesktopMusicPlayerDialog::DesktopMusicPlayerDialog(QWidget* parent, const QStrin
         "border-radius:7px;}"));
     layout->addWidget(progress_);
     time_ = new QLabel(QStringLiteral("0:00 / 0:00"), this);
-    time_->setStyleSheet(QStringLiteral("color:#667085;font-size:12px;"));
+    UiZoom::setStyle(time_, QStringLiteral("color:#667085;font-size: @metadata;"));
     layout->addWidget(time_);
     status_ = new QLabel(this);
-    status_->setStyleSheet(QStringLiteral("color:#667085;font-size:12px;"));
+    UiZoom::setStyle(status_, QStringLiteral("color:#667085;font-size: @metadata;"));
     layout->addWidget(status_);
     auto* controls = new QHBoxLayout;
     play_ = new QPushButton(QStringLiteral("暂停"), this);

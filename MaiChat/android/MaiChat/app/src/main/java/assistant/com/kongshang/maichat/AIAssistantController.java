@@ -242,8 +242,19 @@ public final class AIAssistantController {
     private final java.util.LinkedHashMap<String, String> childPublishRoots = new java.util.LinkedHashMap<>();
     private android.content.SharedPreferences outgoingPreferences;
     private final Set<String> outgoingActiveOwners = new HashSet<>();
+    private final Map<String, String> outgoingActiveInputs = new HashMap<>();
     private final Map<String, OutgoingReceipt> outgoingReceipts = new HashMap<>();
     private final Map<String, String> remoteSteeringInputs = new java.util.LinkedHashMap<>();
+    private static final class IncomingInput {
+        final JSONObject action;
+        final Consumer<JSONObject> completion;
+        IncomingInput(JSONObject action, Consumer<JSONObject> completion) {
+            this.action = action; this.completion = completion;
+        }
+    }
+    // The durable WebSocket mailbox retains commands until their individual
+    // owner receipts. Serialize attachment preparation only within one session.
+    private final Map<String, java.util.ArrayDeque<IncomingInput>> incomingInputs = new HashMap<>();
     private String outgoingEmptySession = "";
     private static final class OutgoingReceipt {
         final JSONObject owner;
@@ -311,6 +322,7 @@ public final class AIAssistantController {
     private final Map<String, String> pendingRemoteDraftById = new HashMap<>();
     private final Map<String, String> remoteOptimisticByCommandId = new HashMap<>();
     private final Map<String, Boolean> remoteCommandResultsById = new HashMap<>();
+
     private final Map<String, JSONArray> mediaMentionCache = new HashMap<>();
     private boolean ready;
     private volatile boolean closed;
@@ -762,12 +774,32 @@ public final class AIAssistantController {
     private JSONObject makeOperationRequest(String operationName) throws Exception {
         return new JSONObject().put("op", operationName).put("session", selected);
     }
+    /** 普通设置页与 Agent 配置使用同一组 App 自有目录；不需要初始化模型工具。 */
+    public static final class StorageRoots {
+        public final File temporary, cache, workspace;
+        public final java.util.function.BooleanSupplier current;
+        private StorageRoots(File temporary, File cache, File workspace,
+                             java.util.function.BooleanSupplier current) {
+            this.temporary = temporary; this.cache = cache; this.workspace = workspace;
+            this.current = current;
+        }
+    }
+    public StorageRoots storageRootsForHost() throws IOException {
+        final File ownerRoot = root;
+        if (ownerRoot == null || closed) throw new IOException("账号工作区暂不可用");
+        File temporary = new File(context.getFilesDir(), "storage-temporary");
+        File cache = context.getCacheDir();
+        File workspace = new File(ownerRoot, "Workspace");
+        for (File directory : new File[]{temporary, cache, workspace})
+            if (!directory.mkdirs() && !directory.isDirectory()) throw new IOException("无法打开存储目录");
+        return new StorageRoots(temporary, cache, workspace, () -> !closed && root == ownerRoot
+            && accountToolLoginGeneration == accountAuth.accountSessionGeneration());
+    }
     private JSONObject primaryModelConfiguration(AIAssistantModelSettings settings, File localFile,
                                                  String key) throws Exception {
         requireModelOwner();
-        File workspace = new File(root, "Workspace");
-        if (!workspace.mkdirs() && !workspace.isDirectory())
-            throw new IllegalStateException("无法创建工作区");
+        StorageRoots storage = storageRootsForHost();
+        File workspace = storage.workspace;
         File runtime = new File(context.getApplicationInfo().nativeLibraryDir,
             "libonnxruntime.so");
         JSONObject request = settings.configuration(localFile, key);
@@ -781,6 +813,8 @@ public final class AIAssistantController {
                     context.getResources().getConfiguration().smallestScreenWidthDp >= 600
                         ? "Android tablet" : "Android phone")
                 .put("workspace", workspace.getPath())
+                .put("temporaryDirectory", storage.temporary.getPath())
+                .put("cacheDirectory", storage.cache.getPath())
                 .put("appRoot", context.getFilesDir().getParentFile().getCanonicalPath())
                 .put("rvmModelPath", rvmModelFile != null ? rvmModelFile.getPath() : "")
                 .put("ortRuntimePath", runtime.isFile() ? runtime.getPath() : "")
@@ -1389,8 +1423,15 @@ public final class AIAssistantController {
                 MaiSessionAttachments.Downloaded downloaded = transfer.download(
                     reference.optString("attachment_id"),room,cancel);
                 ImportedFile file;
-                try { file = importDownloadedSessionFile(downloaded); }
-                finally { downloaded.file.delete(); }
+                try {
+                    file = importDownloadedSessionFile(downloaded);
+                    if (operation.equals("prompt")) {
+                        JSONObject pinned = invokeNativeAgent(new JSONObject().put("op", "pin_input_file")
+                            .put("path", file.relativePath).put("requestId", action.optString("requestId"))
+                            .put("attachmentId", reference.optString("attachment_id")));
+                        file = new ImportedFile(pinned.getString("path"), file.mimeType, file.image, file.displayName);
+                    }
+                } finally { downloaded.file.delete(); }
                 // 随机导入副本尚未交给 Core；只清理被取消任务的副本，原附件引用保持可用。
                 File preparedFile = workspaceFile(file.relativePath);
                 if (preparedFile != null) cancel.onCancel(() -> preparedFile.delete());
@@ -1412,7 +1453,7 @@ public final class AIAssistantController {
         }
         if (documents.length() > 0)
             text += "\n\n会话附件已保存到本机工作目录：" + documents;
-        request.put("op", operation.equals("steer") ? "steer" : "send").put("text",text)
+        request.put("op", operation.equals("steer") ? "steer" : "enqueue").put("text",text)
             .put("images", images).put("videos", videos)
             .put("quoteMessageId", action.optString("quoteMessageId"));
         cancel.check();
@@ -1426,9 +1467,37 @@ public final class AIAssistantController {
     }
     void commandForSync(String sessionId, JSONObject action, Consumer<JSONObject> completion) {
         worker.post(() -> {
+            if (action == null || !(action.optString("action").equals("prompt") || action.optString("action").equals("steer"))) {
+                performCommandForSync(sessionId, action, completion); return;
+            }
+            java.util.ArrayDeque<IncomingInput> queue = incomingInputs.computeIfAbsent(sessionId,
+                ignored -> new java.util.ArrayDeque<>());
+            if (queue.size() >= 256) {
+                completion.accept(rejectedPreparation(new IOException("所属设备输入队列已满，内容未受理"))); return;
+            }
+            queue.addLast(new IncomingInput(action, completion));
+            if (queue.size() == 1) drainIncomingInput(sessionId);
+        });
+    }
+    private void drainIncomingInput(String sessionId) {
+        java.util.ArrayDeque<IncomingInput> queue = incomingInputs.get(sessionId);
+        if (queue == null || queue.isEmpty()) return;
+        IncomingInput input = queue.peekFirst();
+        performCommandForSync(sessionId, input.action, result -> worker.post(() -> {
+            if (incomingInputs.get(sessionId) != queue || queue.peekFirst() != input) return;
+            queue.removeFirst();
+            input.completion.accept(result);
+            if (queue.isEmpty()) incomingInputs.remove(sessionId);
+            else drainIncomingInput(sessionId);
+        }));
+    }
+    private void performCommandForSync(String sessionId, JSONObject action, Consumer<JSONObject> completion) {
+        worker.post(() -> {
             try {
                 JSONObject captured = new JSONObject(action.toString());
                 String operation = captured.optString("action");
+                if (operation.equals("prompt") && captured.optString("requestId").isEmpty())
+                    captured.put("requestId", UUID.randomUUID().toString());
                 if (operation.equals("stop")) {
                     String turn = captured.optString("turnId");
                     if (!turn.isEmpty()) {
@@ -1508,7 +1577,9 @@ public final class AIAssistantController {
                     throw new IOException("原任务已结束或改变，没有停止新的任务");
             }
             JSONObject accepted = invokeNativeAgent(request);
-            result = AndroidSessionSyncCoordinator.commandReceipt(action, accepted);
+            result = operation.equals("prompt")
+                ? new JSONObject().put("ok", true).put("user_message_id", accepted.getString("id"))
+                : AndroidSessionSyncCoordinator.commandReceipt(action, accepted);
             if (result.optBoolean("ok") && (operation.equals("prompt") || operation.equals("steer"))) {
                 try {
                     JSONObject latest = invokeNativeAgent(new JSONObject()
@@ -2138,6 +2209,28 @@ public final class AIAssistantController {
     void create(Consumer<Boolean> completion) {
         actionWithResult("create", new JSONObject(), null, completion);
     }
+    void retryLastRemoteInput() { retryRemoteInput(""); }
+    void retryRemoteInput(String inputId) {
+        worker.post(() -> {
+            if (closed || outgoingQueue == null || selectedRemote == null) return;
+            try {
+                final String owner = outgoingOwner(selectedRemote.optString("id"), selectedRemote);
+                JSONArray entries = outgoingQueue.entries();
+                for (int i = 0; i < entries.length(); i++) {
+                    JSONObject entry = entries.getJSONObject(i);
+                    if ((!inputId.isEmpty() && !inputId.equals(entry.optString("id"))) ||
+                        !owner.equals(entry.optString("owner")) ||
+                        !entry.getJSONObject("payload").optString("operation").equals("enqueue")) continue;
+                    String state = entry.optString("state");
+                    if (!state.equals("unknown") && !state.equals("failed")) continue;
+                    outgoingQueue.retryInput(entry.getString("id"));
+                    error = "";
+                    publishState(); drainOutgoing(owner); return;
+                }
+            } catch (Exception failure) { error = safeMessage(failure); publishState(); }
+        });
+    }
+
     void send(String text, Consumer<Boolean> completion) {
         send(text, java.util.Collections.emptyList(), completion);
     }
@@ -2188,15 +2281,15 @@ public final class AIAssistantController {
                 throw new IOException("主模型正在切换，草稿已保留");
             if (!questionId.isEmpty() && (!attachments.isEmpty() || !quotedMessageId.isEmpty()))
                 throw new IOException("问题回答只发送文字，附件和引用仍保留在输入栏");
-            if (questionId.isEmpty() && runtime.optBoolean("busy") && runtime.optString("turnId").isEmpty())
+            if (questionId.isEmpty() && remote == null && runtime.optBoolean("busy") && runtime.optString("turnId").isEmpty())
                 throw new IOException("任务编号尚未就绪，草稿已保留");
             JSONArray files = new JSONArray();
             for (ImportedFile file : attachments) files.put(new JSONObject().put("path", file.relativePath)
                 .put("mimeType", file.mimeType).put("image", file.image).put("name", file.displayName));
             JSONObject payload = new JSONObject().put("session", intendedSession).put("text", text)
                 .put("quoteMessageId", quotedMessageId).put("files", files)
-                .put("operation", !questionId.isEmpty() ? "answer" : runtime.optBoolean("busy") ? "steer" : "")
-                .put("turnId", runtime.optString("turnId"));
+                .put("operation", !questionId.isEmpty() ? "answer" : remote != null ? "enqueue" : runtime.optBoolean("busy") ? "steer" : "")
+                .put("turnId", remote == null ? runtime.optString("turnId") : "");
             if (!questionId.isEmpty()) payload.put("questionId", questionId).put("questionCandidates", questions)
                 .put("question", new JSONObject(AIAssistantSubmission.questionToAnswer(questions,
                     visible.data.optJSONArray("questionAnswerEchoes")).toString()));
@@ -2236,8 +2329,8 @@ public final class AIAssistantController {
     }
     private void finishOutgoing(String owner, String id, JSONObject receipt) {
         try {
-            JSONObject head = outgoingQueue.head(owner);
-            if (head == null || !id.equals(head.optString("id"))) return;
+            JSONObject head = outgoingQueue.entry(id);
+            if (head == null || !owner.equals(head.optString("owner"))) return;
             JSONObject payload = head.getJSONObject("payload");
             boolean answer = payload.optString("operation").equals("answer");
             receipt = AIAssistantSubmission.receipt(receipt, payload.optString("operation"),
@@ -2246,11 +2339,13 @@ public final class AIAssistantController {
                 outgoingQueue.acceptAnswer(id, receipt.getString("question_id"));
                 questionEchoes.acknowledge(owner, payload);
             } else if (receipt.optBoolean("ok") && !receipt.optString("user_message_id").isEmpty())
-                outgoingQueue.accept(id, receipt.getString("user_message_id"), receipt.getString("turnId"));
+                outgoingQueue.accept(id, receipt.getString("user_message_id"), receipt.optString("turnId"));
             else outgoingQueue.transition(id, receipt.optBoolean("unknown") || receipt.optBoolean("ok")
                 ? "unknown" : "failed", null);
         } catch (Exception failure) { error = safeMessage(failure); }
-        outgoingActiveOwners.remove(owner);
+        if (id.equals(outgoingActiveInputs.get(owner))) {
+            outgoingActiveOwners.remove(owner); outgoingActiveInputs.remove(owner);
+        }
         refresh(true); publishState();
         drainOutgoing(owner);
     }
@@ -2281,6 +2376,7 @@ public final class AIAssistantController {
             final String captureId = id;
             outgoingQueue.transition(id, "preparing", payload);
             outgoingActiveOwners.add(owner);
+            outgoingActiveInputs.put(owner, id);
             final boolean supportsVisual = AIAssistantMediaPolicy.supportsImages(model);
             if (!preparations.start(owner, nativeEpoch, () -> nativeEpoch,
                 cancel -> prepareOutgoing(payload, supportsVisual, cancel), (prepared, failure) -> {
@@ -2294,6 +2390,7 @@ public final class AIAssistantController {
                                        AIAssistantPreparationJobs.Cancellation cancel) throws Exception {
         JSONObject payload = new JSONObject(source.toString());
         JSONObject remote = payload.optJSONObject("remote");
+        if (remote != null && payload.has("preparedAttachments")) return payload;
         JSONArray files = payload.getJSONArray("files"), references = new JSONArray();
         MaiSessionAttachments.Scope scope = new MaiSessionAttachments.Scope();
         cancel.onCancel(scope::cancel);
@@ -2321,7 +2418,10 @@ public final class AIAssistantController {
                 && (head.optString("state").equals("queued") || head.optString("state").equals("preparing")))
                 outgoingQueue.transition(id, "failed", null);
         } catch (Exception retained) { error = safeMessage(retained); }
-        outgoingActiveOwners.remove(owner); publishState();
+        if (id.equals(outgoingActiveInputs.get(owner))) {
+            outgoingActiveOwners.remove(owner); outgoingActiveInputs.remove(owner);
+        }
+        publishState(); drainOutgoing(owner);
     }
     private void dispatchPreparedOutgoing(String owner, String id, JSONObject payload) {
         boolean dispatched = false;
@@ -2340,8 +2440,8 @@ public final class AIAssistantController {
             AIAssistantSubmission binding = AIAssistantSubmission.capture(target, remote, captured);
             JSONObject latest = outgoingRuntime(target, remote);
             // 远端只在 owner 执行端判定问题仍有效；本机目录摘要不能冒充权威 pending 列表。
-            String operation = answering && remote != null ? "answer" : binding.bind(latest);
-            payload.put("operation", operation).put("turnId", binding.turnId());
+            String operation = answering && remote != null ? "answer" : remote != null ? "enqueue" : binding.bind(latest);
+            payload.put("operation", operation).put("turnId", remote == null ? binding.turnId() : "");
             JSONObject request = new JSONObject().put("text", payload.getString("text"))
                 .put("requestId", id).put("quoteMessageId", payload.optString("quoteMessageId"));
             if (operation.equals("steer")) request.put("turnId", binding.turnId());
@@ -2359,12 +2459,23 @@ public final class AIAssistantController {
                 if (references.length() > 0) request.put("attachments", references);
                 JSONObject destination = new JSONObject(remote.toString());
                 String envelope = sessionSync.sendToRemote(destination, "command", request, (message, failure) -> {
-                    if (!failure.isEmpty()) worker.post(() -> completeOutgoingReceipt(message,
-                        new JSONObject(), true));
+                    worker.post(() -> {
+                        if (!failure.isEmpty()) { completeOutgoingReceipt(message, new JSONObject(), true); return; }
+                        try {
+                            JSONObject entry = outgoingQueue.entry(acceptedId);
+                            if (entry != null && entry.optString("state").equals("dispatching"))
+                                outgoingQueue.transition(acceptedId, "forwarded", null);
+                            if (acceptedId.equals(outgoingActiveInputs.get(owner))) {
+                                outgoingActiveOwners.remove(owner); outgoingActiveInputs.remove(owner);
+                            }
+                            publishState(); drainOutgoing(owner);
+                        } catch (Exception retained) { error = safeMessage(retained); publishState(); }
+                    });
                 });
                 outgoingReceipts.put(envelope, new OutgoingReceipt(destination,
                     receipt -> finishOutgoing(owner, acceptedId, receipt)));
-                worker.postDelayed(() -> completeOutgoingReceipt(envelope, new JSONObject(), true), 30000);
+                worker.postDelayed(() -> completeOutgoingReceipt(envelope, new JSONObject(), true),
+                    payload.getJSONArray("files").length() == 0 ? 30000 : 2L * 60 * 60 * 1000);
             }
         } catch (Exception failure) {
             error = safeMessage(failure);
@@ -2372,7 +2483,10 @@ public final class AIAssistantController {
                 outgoingQueue.transition(id, dispatched && !(failure instanceof NativeAgentFailure)
                     ? "unknown" : "failed", null);
             } catch (Exception retained) { error = safeMessage(retained); }
-            outgoingActiveOwners.remove(owner); publishState();
+            if (id.equals(outgoingActiveInputs.get(owner))) {
+                outgoingActiveOwners.remove(owner); outgoingActiveInputs.remove(owner);
+            }
+            publishState(); drainOutgoing(owner);
         }
     }
     private void completeOutgoingReceipt(String id, JSONObject result, boolean unknown) {
@@ -2941,6 +3055,17 @@ public final class AIAssistantController {
             throw new IllegalArgumentException("media must be a readable file in the Agent workspace");
         return file;
     }
+    // 下载原件只创建工作区内的新文件；与读取媒体共用同一个路径授权策略。
+    public File workspaceOutputForHost(String path) throws Exception {
+        if (root == null) throw new IllegalStateException("AI workspace is unavailable");
+        File workspace = new File(root, "Workspace");
+        File file = AIAssistantPathPolicy.resolve(workspace, workspace, path);
+        if (file.exists()) throw new IllegalArgumentException("download destination already exists");
+        File parent = file.getParentFile();
+        if (parent == null || (!parent.isDirectory() && !parent.mkdirs()))
+            throw new IOException("download directory is unavailable");
+        return file;
+    }
     void discardComposerMedia(ImportedFile file) {
         if (file == null) return;
         worker.post(() -> {
@@ -3084,9 +3209,11 @@ public final class AIAssistantController {
         BitmapFactory.Options bounds = new BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
         BitmapFactory.decodeFile(output.getPath(), bounds);
+        // Completed files are delivered in the conversation; preview remains a user action.
+        // Portrait receipts may refine this hint, and ordinary transforms need the same default.
         JSONObject response = new JSONObject().put("path", file.relativePath)
             .put("mime_type", file.mimeType).put("width", bounds.outWidth).put("height", bounds.outHeight)
-            .put("next_tool", "mobile_preview_image");
+            .put("next_tool", "agent_send_media");
         JSONObject receipt = portraitReceiptForHost(file.relativePath);
         java.util.Iterator<String> keys = receipt.keys();
         while (keys.hasNext()) { String key = keys.next(); response.put(key, receipt.get(key)); }

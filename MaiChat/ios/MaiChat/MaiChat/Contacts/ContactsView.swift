@@ -66,15 +66,15 @@ struct AddContactDialog: View {
             VStack(alignment: .leading, spacing: 16) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("添加好友")
-                        .font(.system(size: 20, weight: .bold))
+                        .font(AppTypography.title.weight(.bold))
                         .foregroundStyle(RemoteIMStyle.textPrimary)
                     Text("输入手机号或好友账号 ID")
-                        .font(.system(size: 13))
+                        .font(AppTypography.detail)
                         .foregroundStyle(RemoteIMStyle.textSecondary)
                 }
 
                 TextField("手机号或账号 ID", text: $appState.newContactUserID)
-                    .font(.system(size: 15))
+                    .font(AppTypography.detail)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .submitLabel(.done)
@@ -100,13 +100,13 @@ struct AddContactDialog: View {
                 } label: {
                     Label("我的二维码", systemImage: "qrcode")
                 }
-                .font(.system(size: 14, weight: .medium))
+                .font(AppTypography.detail.weight(.medium))
                 .foregroundStyle(RemoteIMStyle.blue)
 
                 HStack(spacing: 10) {
                     Button("取消", action: cancel)
                         .buttonStyle(.plain)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(AppTypography.detail.weight(.semibold))
                         .foregroundStyle(RemoteIMStyle.textPrimary)
                         .frame(maxWidth: .infinity)
                         .frame(height: 42)
@@ -117,7 +117,7 @@ struct AddContactDialog: View {
 
                     Button(isSubmitting ? "发送中" : "发送申请", action: addContact)
                         .buttonStyle(.plain)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(AppTypography.detail.weight(.semibold))
                         .foregroundStyle(canAdd ? Color.white : RemoteIMStyle.textSecondary)
                         .frame(maxWidth: .infinity)
                         .frame(height: 42)
@@ -181,7 +181,7 @@ struct FriendQRShareView: View {
     var body: some View {
         VStack(spacing: 22) {
             Text("让对方扫一扫添加你为好友")
-                .font(.headline)
+                .font(AppTypography.heading)
             if let url = MaiChatFriendLink.url(for: userID),
                let image = FriendQRImage.image(for: url) {
                 Image(uiImage: image)
@@ -195,7 +195,7 @@ struct FriendQRShareView: View {
                     .foregroundStyle(RemoteIMStyle.textSecondary)
             }
             Text(userID)
-                .font(.system(.footnote, design: .monospaced))
+                .font(AppTypography.detailMonospaced)
                 .textSelection(.enabled)
             Button("复制账号 ID") { UIPasteboard.general.string = userID }
                 .buttonStyle(.bordered)
@@ -203,7 +203,7 @@ struct FriendQRShareView: View {
         }
         .padding(.top, 28)
         .padding(.horizontal, 20)
-        .navigationTitle("我的好友二维码")
+        .appNavigationTitle("我的好友二维码")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -251,7 +251,7 @@ private struct MaiChatQRScanView: View {
                     .fill(Color(red: 0.08, green: 0.12, blue: 0.19))
                 if simulatedCode != nil {
                     Image(systemName: "qrcode.viewfinder")
-                        .font(.system(size: 74, weight: .ultraLight))
+                        .font(AppTypography.symbol(size: 74, weight: .ultraLight))
                         .foregroundStyle(.white)
                 } else if cameraAuthorized {
                     MaiChatQRCodeCameraView(
@@ -290,7 +290,7 @@ private struct MaiChatQRScanView: View {
             Spacer(minLength: 0)
         }
         .padding(20)
-        .navigationTitle("扫一扫")
+        .appNavigationTitle("扫一扫")
         .navigationBarTitleDisplayMode(.inline)
         .task {
             if simulatedCode != nil { return }
@@ -358,9 +358,9 @@ private struct ContactList: View {
                                     presenceStatus: .unknown, size: 38
                                 )
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(request.displayName).font(.subheadline.weight(.semibold))
+                                    Text(request.displayName).font(AppTypography.detail.weight(.semibold))
                                     Text(request.message.isEmpty ? "请求添加你为好友" : request.message)
-                                        .font(.caption)
+                                        .font(AppTypography.metadata)
                                         .foregroundStyle(RemoteIMStyle.textSecondary)
                                 }
                                 Spacer()
@@ -445,12 +445,12 @@ private struct ContactList: View {
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                    .font(.system(size: 11, weight: .bold))
+                    .font(AppTypography.symbol(size: 11, weight: .bold))
                 Text(name)
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(AppTypography.detail.weight(.semibold))
                 Spacer()
                 Text("\(memberCount)")
-                    .font(.system(size: 12))
+                    .font(AppTypography.metadata)
                     .foregroundStyle(RemoteIMStyle.textSecondary)
             }
             .foregroundStyle(RemoteIMStyle.textPrimary)
@@ -475,13 +475,12 @@ private struct ContactList: View {
             VStack(alignment: .leading, spacing: 1) {
                 ContactRow(
                     contact: contact,
-                    accountID: appState.maiChatAccountId(forIMUserID: contact.userID),
                     selected: contact.userID == appState.chatState.selectedPeerID,
                     presenceStatus: appState.presenceStatus(for: contact)
                 )
                 if appState.pendingFriendSyncIMIDs.contains(contact.userID) {
                     Text("聊天服务同步中")
-                        .font(.caption2)
+                        .font(AppTypography.metadata)
                         .foregroundStyle(RemoteIMStyle.textSecondary)
                         .padding(.leading, 50)
                 }
@@ -543,22 +542,29 @@ private struct FriendProfileView: View {
                     isSelected: false, presenceStatus: .unknown, size: 88
                 )
                 Text(profile.displayName)
-                    .font(.title2.weight(.semibold))
+                    // 昵称是资料正文，和列表同一昵称共用偏好基准，不另用标题字号。
+                    .font(AppTypography.body)
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("friend-profile-nickname")
                 VStack(alignment: .leading, spacing: 12) {
                     Text("MaiChat ID")
-                        .font(.caption)
+                        .font(AppTypography.metadata)
                         .foregroundStyle(RemoteIMStyle.textSecondary)
                     HStack {
                         Text(accountID.isEmpty ? "正在读取账号" : accountID)
-                            .font(.subheadline.monospaced())
+                            // 账号不是代码，使用用户选择的正文字体；等宽只留给代码内容。
+                            .font(AppTypography.body)
+                            .foregroundStyle(RemoteIMStyle.textPrimary)
                             .textSelection(.enabled)
                             .accessibilityIdentifier("friend-profile-account-id")
                         Spacer(minLength: 8)
                         if !accountID.isEmpty {
-                            Button("复制") { UIPasteboard.general.string = accountID }
+                            Button { UIPasteboard.general.string = accountID } label: {
+                                Text("复制").font(AppTypography.body).fixedSize()
+                            }
+                            .accessibilityIdentifier("friend-profile-copy")
                         }
                     }
                 }
@@ -568,31 +574,40 @@ private struct FriendProfileView: View {
                     in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
                 Button(action: onMessage) {
-                    Text("发消息").frame(maxWidth: .infinity)
+                    Text("发消息").font(AppTypography.body).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .accessibilityIdentifier("friend-profile-message")
 
-                Button("删除好友", role: .destructive) {
+                // 字体落在实际按钮标签上，避免原生 ButtonStyle 覆盖统一正文环境。
+                Button(role: .destructive) {
                     showsDeleteConfirmation = true
+                } label: {
+                    Text("删除好友").font(AppTypography.body)
                 }
                 .disabled(isDeleting)
                 .accessibilityIdentifier("friend-profile-delete")
 
-                Button("举报此用户") { showsReport = true }
-                    .accessibilityIdentifier("friend-profile-report")
+                Button { showsReport = true } label: {
+                    Text("举报此用户").font(AppTypography.body)
+                }
+                .accessibilityIdentifier("friend-profile-report")
                 if appState.blockedIMUserIDs.contains(userID) {
-                    Button("解除屏蔽") {
+                    Button {
                         Task {
                             isBlocking = true
                             _ = await appState.unblockUser(userID)
                             isBlocking = false
                         }
+                    } label: {
+                        Text("解除屏蔽").font(AppTypography.body)
                     }
                     .disabled(isBlocking)
                 } else {
-                    Button("屏蔽此用户", role: .destructive) {
+                    Button(role: .destructive) {
                         showsBlockConfirmation = true
+                    } label: {
+                        Text("屏蔽此用户").font(AppTypography.body)
                     }
                     .disabled(isBlocking)
                     .accessibilityIdentifier("friend-profile-block")
@@ -601,7 +616,7 @@ private struct FriendProfileView: View {
             .padding(24)
         }
         .background(RemoteIMStyle.pageBackground.ignoresSafeArea())
-        .navigationTitle("好友资料")
+        .appNavigationTitle("好友资料")
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("确定删除这位好友？", isPresented: $showsDeleteConfirmation) {
             Button("删除好友", role: .destructive) {
@@ -670,7 +685,7 @@ struct SafetyReportView: View {
                 if let excerpt, !excerpt.isEmpty {
                     Section("将提交的消息文字") {
                         Text(String(excerpt.prefix(200)))
-                            .font(.footnote)
+                            .font(AppTypography.detail)
                             .textSelection(.enabled)
                     }
                 }
@@ -690,7 +705,7 @@ struct SafetyReportView: View {
                 }
             }
         }
-        .navigationTitle("举报")
+        .appNavigationTitle("举报")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("关闭") { dismiss() }
@@ -726,7 +741,7 @@ struct ContactGroupActionDialog: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 Text(groupName)
-                    .font(.system(size: 18, weight: .bold))
+                    .font(AppTypography.heading.weight(.bold))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .lineLimit(1)
 
@@ -772,12 +787,12 @@ struct ContactGroupActionDialog: View {
         Button(action: action) {
             HStack(spacing: 13) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(AppTypography.symbol(size: 17, weight: .semibold))
                     .foregroundStyle(color)
                     .frame(width: 30, height: 30)
                     .background(color.opacity(0.1), in: Circle())
                 Text(title)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(AppTypography.body.weight(.semibold))
                     .foregroundStyle(destructive ? Color.red : RemoteIMStyle.textPrimary)
                 Spacer(minLength: 0)
             }
@@ -808,7 +823,7 @@ struct RenameContactGroupDialog: View {
 
             VStack(alignment: .leading, spacing: 16) {
                 Text("重命名分组")
-                    .font(.system(size: 20, weight: .bold))
+                    .font(AppTypography.title.weight(.bold))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                 TextField(originalName, text: $name)
                     .focused($isFocused)
@@ -856,7 +871,7 @@ struct RenameContactGroupDialog: View {
     ) -> some View {
         Button(title, action: action)
             .buttonStyle(.plain)
-            .font(.system(size: 16, weight: .semibold))
+            .font(AppTypography.body.weight(.semibold))
             .foregroundStyle(primary ? Color.white : RemoteIMStyle.textPrimary)
             .frame(maxWidth: .infinity)
             .frame(height: 46)
@@ -882,10 +897,10 @@ struct DeleteContactGroupDialog: View {
 
             VStack(alignment: .leading, spacing: 16) {
                 Text("删除分组？")
-                    .font(.system(size: 20, weight: .bold))
+                    .font(AppTypography.title.weight(.bold))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                 Text(deleteMessage)
-                    .font(.system(size: 14))
+                    .font(AppTypography.detail)
                     .foregroundStyle(RemoteIMStyle.textSecondary)
 
                 HStack(spacing: 12) {
@@ -923,7 +938,7 @@ struct DeleteContactGroupDialog: View {
     ) -> some View {
         Button(title, action: action)
             .buttonStyle(.plain)
-            .font(.system(size: 16, weight: .semibold))
+            .font(AppTypography.body.weight(.semibold))
             .foregroundStyle(destructive ? Color.red : RemoteIMStyle.textPrimary)
             .frame(maxWidth: .infinity)
             .frame(height: 46)
@@ -949,10 +964,10 @@ struct MoveContactGroupDialog: View {
             VStack(alignment: .leading, spacing: 16) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("移动到分组")
-                        .font(.system(size: 20, weight: .bold))
+                        .font(AppTypography.title.weight(.bold))
                         .foregroundStyle(RemoteIMStyle.textPrimary)
                     Text("为 \(contact.displayName) 选择一个分组")
-                        .font(.system(size: 13))
+                        .font(AppTypography.detail)
                         .foregroundStyle(RemoteIMStyle.textSecondary)
                         .lineLimit(2)
                 }
@@ -977,7 +992,7 @@ struct MoveContactGroupDialog: View {
 
                 Button("取消", action: dismiss)
                     .buttonStyle(.plain)
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(AppTypography.detail.weight(.semibold))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .frame(maxWidth: .infinity)
                     .frame(height: 42)
@@ -1029,17 +1044,17 @@ struct MoveContactGroupDialog: View {
         } label: {
             HStack(spacing: 12) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(AppTypography.symbol(size: 15, weight: .semibold))
                     .foregroundStyle(isCurrent ? RemoteIMStyle.blue : RemoteIMStyle.textSecondary)
                     .frame(width: 24)
                 Text(title)
-                    .font(.system(size: 15, weight: isCurrent ? .semibold : .regular))
+                    .font(AppTypography.detail.weight(isCurrent ? .semibold : .regular))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 if isCurrent {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 18))
+                        .font(AppTypography.symbol(size: 18))
                         .foregroundStyle(RemoteIMStyle.blue)
                 }
             }
@@ -1063,7 +1078,6 @@ struct MoveContactGroupDialog: View {
 
 private struct ContactRow: View {
     let contact: RemoteIMContact
-    let accountID: String
     let selected: Bool
     let presenceStatus: RemoteIMPresenceStatus
 
@@ -1076,20 +1090,13 @@ private struct ContactRow: View {
                 size: 30
             )
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(contact.displayName)
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(RemoteIMStyle.textPrimary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text(accountID)
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundStyle(RemoteIMStyle.textSecondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-
-            Spacer()
+            // 列表用昵称识别人；账号与复制入口集中在资料页，避免重复占据一行。
+            Text(contact.displayName)
+                .font(AppTypography.conversationTitle)
+                .foregroundStyle(RemoteIMStyle.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
             VStack(alignment: .trailing, spacing: 6) {
                 RemoteIMPresenceBadge(status: presenceStatus)
@@ -1098,7 +1105,7 @@ private struct ContactRow: View {
         }
         .padding(12)
         .background(
-            selected ? RemoteIMStyle.blueSoft : Color.white,
+            selected ? RemoteIMStyle.blueSoft : RemoteIMStyle.panelBackground,
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
         )
         .overlay(
@@ -1112,13 +1119,13 @@ private struct EmptyContacts: View {
     var body: some View {
         VStack(spacing: 12) {
             Image(systemName: "person.2")
-                .font(.system(size: 28))
+                .font(AppTypography.symbol(size: 28))
                 .foregroundStyle(Color(red: 0.56, green: 0.59, blue: 0.64))
             Text("暂无联系人")
-                .font(.system(size: 16, weight: .bold))
+                .font(AppTypography.body.weight(.bold))
                 .foregroundStyle(RemoteIMStyle.textPrimary)
             Text("添加好友账号后即可开始聊天。")
-                .font(.system(size: 13))
+                .font(AppTypography.detail)
                 .foregroundStyle(RemoteIMStyle.textSecondary)
         }
         .frame(maxWidth: .infinity)

@@ -1,6 +1,8 @@
 // 文件作用：共用播放器的倍速入口；保留 QComboBox 的索引和信号，使用向上展开的浮层呈现已有倍率。
 #pragma once
 
+#include "ui/UiZoom.h"
+
 #include <QAction>
 #include <QComboBox>
 #include <QGuiApplication>
@@ -71,8 +73,8 @@ public:
         if (!screen) screen = QGuiApplication::primaryScreen();
         if (screen) {
             const QRect bounds = screen->availableGeometry();
-            position.setX(qBound(bounds.left(), position.x(),
-                                 qMax(bounds.left(), bounds.right() - popupSize.width() + 1)));
+            position.setX(
+                qBound(bounds.left(), position.x(), qMax(bounds.left(), bounds.right() - popupSize.width() + 1)));
             position.setY(qMax(bounds.top(), position.y()));
         }
         menu_->popup(position);
@@ -134,10 +136,10 @@ private:
             setWindowFlags(Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
             setAttribute(Qt::WA_TranslucentBackground);
             setFixedWidth(80);
-            setStyleSheet(QStringLiteral(
-                "QMenu {background:transparent;border:0;padding:6px 0;font-size:13px;}"
-                "QMenu::item {min-height:30px;padding:0 8px;margin:1px 6px;}"
-                "QMenu::indicator {width:0;height:0;}"));
+            UiZoom::setStyle(this,
+                             QStringLiteral("QMenu {background:transparent;border:0;padding:6px 0;font-size:@detail;}"
+                                            "QMenu::item {min-height:30px;padding:0 8px;margin:1px 6px;}"
+                                            "QMenu::indicator {width:0;height:0;}"));
         }
 
     protected:
@@ -153,8 +155,8 @@ private:
                 const QRect item = actionGeometry(action).adjusted(6, 1, -6, -1);
                 if (action == activeAction() || action->isChecked()) {
                     painter.setPen(Qt::NoPen);
-                    painter.setBrush(QColor(action == activeAction() ? QStringLiteral("#505050")
-                                                                    : QStringLiteral("#404040")));
+                    painter.setBrush(
+                        QColor(action == activeAction() ? QStringLiteral("#505050") : QStringLiteral("#404040")));
                     painter.drawRoundedRect(QRectF(item), 6, 6);
                 }
                 painter.setPen(QColor(QStringLiteral("#f4f4f4")));

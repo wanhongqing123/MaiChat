@@ -26,8 +26,8 @@
 // ── 键是什么 ────────────────────────────────────────────────────
 //
 // 内容、末尾附注、宽度、皮肤，四样任意一个不同都得重排。皮肤那一项用
-// MarkdownTheme::zoom——产品里所有主题都出自 MarkdownTheme::standard(zoom)，
-// 所以那个数就能把两份皮肤分开（见那边的注释）。
+// MarkdownTheme::zoom 和字体家族；换字体不一定改变字号，因此必须单独进入缓存键。
+// 同一条消息、同一宽度不能复用另一种字形度量的排版。
 //
 // 哈希会撞，所以命中之后**还要把键逐项比一遍**，不能只信哈希——撞上一次就是
 // 把别人的消息画到这条上，那种 bug 找起来要命。
@@ -39,12 +39,12 @@ public:
     // 而且取走之后调用方会往里写选区，留一份在这儿给别人用是错的。
     static std::unique_ptr<MarkdownLayout> take(const QString& source, const QString& note,
                                                 int notePixelSize, unsigned int noteRgba,
-                                                qreal width, qreal zoom);
+                                                qreal width, qreal zoom, const QString& fontKey = QString());
 
     // 还回来。用完就还，下次切回来还能用上。空指针会被忽略。
     static void put(const QString& source, const QString& note, int notePixelSize,
                     unsigned int noteRgba, qreal width, qreal zoom,
-                    std::unique_ptr<MarkdownLayout> layout);
+                    std::unique_ptr<MarkdownLayout> layout, const QString& fontKey = QString());
 
     // 清空。换皮肤之类的场合用不上（键里有皮肤），主要是给测试用。
     static void clear();

@@ -115,6 +115,17 @@ public final class MaiCloudDriveAgentTools {
         switch (tool) {
         case "maichat_cloud_drive_list_media":
             return list(activity, client, account, arguments);
+        case "maichat_cloud_drive_search_media": {
+            // 查询和下载复用普通 request/JNI；分页、筛选和路径都由共享核心处理。
+            MaiCloudDrive.Result found = await(activity, client, account,
+                callback -> client.request(MaiCloudDrive.SEARCH_MEDIA, arguments, callback), 120);
+            if (!account.equals(MaiChatAuthClient.shared(activity).accountId())) {
+                client.cancel();
+                throw new Failure("canceled", "MaiChat account changed during search");
+            }
+            if (!found.ok()) throw error(found, true);
+            return found.json();
+        }
         case "maichat_cloud_drive_list_folders":
         case "maichat_cloud_drive_create_folder":
         case "maichat_cloud_drive_update_folder":
@@ -135,6 +146,18 @@ public final class MaiCloudDriveAgentTools {
             return resume(activity, client, account, arguments.optString("task_id", ""));
         case "maichat_cloud_drive_abort_upload":
             return abort(activity, client, account, arguments.optString("task_id", ""));
+        case "maichat_cloud_drive_download_media": {
+            gate(activity, client, account);
+            File target = AIAssistantController.shared(activity)
+                .workspaceOutputForHost(arguments.optString("output_path", ""));
+            JSONObject payload = new JSONObject().put("media_id", arguments.optString("media_id", ""))
+                .put("output_path", target.getAbsolutePath());
+            // 普通 JNI request 调用共享下载内核；等待期间沿用账号切换与取消检查。
+            MaiCloudDrive.Result saved = await(activity, client, account,
+                callback -> client.request(MaiCloudDrive.DOWNLOAD_MEDIA, payload, callback), 7200);
+            if (!saved.ok()) throw error(saved, false);
+            return saved.json();
+        }
         case "maichat_cloud_drive_open_media":
             gate(activity, client, account);
             return play(activity, client, account, arguments.optString("media_id", ""));

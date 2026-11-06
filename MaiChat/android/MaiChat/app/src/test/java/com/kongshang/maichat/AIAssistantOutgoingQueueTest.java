@@ -153,4 +153,31 @@ public final class AIAssistantOutgoingQueueTest {
         assertEquals("steer", rows.getJSONObject(2).getJSONObject("payload").getString("operation"));
     }
 
+    @Test public void remoteInputsForwardBeforeOwnerReceiptsAndAcceptOutOfOrder() throws Exception {
+        MemoryStorage storage = new MemoryStorage();
+        AIAssistantOutgoingQueue queue = new AIAssistantOutgoingQueue(storage);
+        JSONObject input = payload("same text").put("operation", "enqueue").put("turnId", "");
+        String first = queue.enqueue("remote:one", input);
+        String second = queue.enqueue("remote:one", input);
+        String third = queue.enqueue("remote:one", input);
+        queue.transition(first, "dispatching", null);
+        queue.transition(first, "forwarded", null);
+        assertEquals(second, queue.head("remote:one").getString("id"));
+        queue.transition(second, "dispatching", null);
+        queue.transition(second, "forwarded", null);
+        queue.transition(third, "dispatching", null);
+        queue.transition(third, "forwarded", null);
+        assertNull(queue.head("remote:one"));
+        queue.accept(second, "user-two", "");
+        queue.accept(first, "user-one", "");
+        assertEquals(third, queue.entries().getJSONObject(0).getString("id"));
+        AIAssistantOutgoingQueue restored = new AIAssistantOutgoingQueue(storage);
+        assertEquals("unknown", restored.entry(third).getString("state"));
+        restored.retryInput(third);
+        assertEquals(third, restored.head("remote:one").getString("id"));
+        assertEquals("same text", restored.head("remote:one").getJSONObject("payload").getString("text"));
+        restored.transition(third, "dispatching", null);
+        restored.accept(third, "user-three", "");
+        assertEquals(0, restored.entries().length());
+    }
 }

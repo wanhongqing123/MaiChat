@@ -132,7 +132,7 @@ public final class MobilePdfPasswordRequests {
         form.setOrientation(LinearLayout.VERTICAL);
         int padding = Math.round(20 * activity.getResources().getDisplayMetrics().density);
         form.setPadding(padding, padding / 2, padding, padding / 2);
-        EditText password = new EditText(activity), confirmation = new EditText(activity);
+        EditText password = com.kongshang.maichat.MaiChatTypography.input(activity), confirmation = com.kongshang.maichat.MaiChatTypography.input(activity);
         EditText[] fields = {password, confirmation};
         for (EditText field : fields) {
             field.setSingleLine(true);
@@ -144,7 +144,7 @@ public final class MobilePdfPasswordRequests {
         }
         password.setHint("PDF 打开密码");
         confirmation.setHint("再次输入 PDF 密码");
-        TextView help = new TextView(activity);
+        TextView help = com.kongshang.maichat.MaiChatTypography.text(activity);
         help.setText("仅设置本次 PDF 的打开密码，不修改 MaiChat 登录密码。最多 127 个 UTF-8 字节，不会发给 AI 或保存在聊天记录中。");
         form.addView(help);
         AlertDialog dialog = new AlertDialog.Builder(activity).setTitle("PDF 密码保护")

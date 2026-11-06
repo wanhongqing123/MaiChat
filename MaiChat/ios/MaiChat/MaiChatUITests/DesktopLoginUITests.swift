@@ -16,7 +16,7 @@ final class DesktopLoginUITests: XCTestCase {
         XCTAssertTrue(app.buttons["我的"].waitForExistence(timeout: 30))
         if app.buttons["稍后"].exists { app.buttons["稍后"].tap() }
         tapMeTab(in: app)
-        let settings = app.buttons["设置"]
+        let settings = app.buttons["my-account-entry"]
         if !settings.waitForExistence(timeout: 2) {
             app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.955)).tap()
         }
@@ -46,7 +46,7 @@ final class DesktopLoginUITests: XCTestCase {
         XCTAssertTrue(app.buttons["我的"].waitForExistence(timeout: 30))
         if app.buttons["稍后"].exists { app.buttons["稍后"].tap() }
         tapMeTab(in: app)
-        let settings = app.buttons["设置"]
+        let settings = app.buttons["my-account-entry"]
         if !settings.waitForExistence(timeout: 2) {
             app.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.955)).tap()
         }
@@ -99,7 +99,7 @@ final class DesktopLoginUITests: XCTestCase {
         app.buttons["关闭"].tap()
         XCTAssertTrue(app.buttons["im-message-actions"].waitForExistence(timeout: 5))
         tapMeTab(in: app)
-        let settings = app.buttons["设置"]
+        let settings = app.buttons["my-account-entry"]
         XCTAssertTrue(settings.waitForExistence(timeout: 5))
         settings.tap()
         XCTAssertFalse(app.buttons["desktop-login-entry"].exists)
@@ -184,7 +184,7 @@ final class DesktopLoginUITests: XCTestCase {
         let me = app.buttons["我的"]
         XCTAssertTrue(me.waitForExistence(timeout: 30))
         tapMeTab(in: app)
-        let settings = app.buttons["设置"]
+        let settings = app.buttons["my-account-entry"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
         settings.tap()
         dismissLocalIMError(in: app)

@@ -450,27 +450,28 @@ struct MaiGraphicsImageSurface: UIViewRepresentable {
     }
 }
 
+// 页面、原生输入框及 Markdown 共用动态颜色，深色模式同时替换前景和底色。
 enum RemoteIMStyle {
-    static let pageBackground = Color(red: 0.966, green: 0.976, blue: 0.988)
-    static let panelBackground = Color.white
-    static let border = Color(red: 0.855, green: 0.894, blue: 0.941)
-    static let textPrimary = Color(red: 0.055, green: 0.081, blue: 0.145)
-    static let textSecondary = Color(red: 0.392, green: 0.459, blue: 0.561)
+    static let pageBackground = AppAppearance.page
+    static let panelBackground = AppAppearance.panel
+    static let border = AppAppearance.border
+    static let textPrimary = AppAppearance.text
+    static let textSecondary = AppAppearance.secondary
     static let blue = Color(red: 0.059, green: 0.553, blue: 0.867)
-    static let blueSoft = Color(red: 0.882, green: 0.957, blue: 1.0)
+    static let blueSoft = AppAppearance.color(AppTypographyTokens.blueSoftColor, AppTypographyTokens.blueSoftDarkColor)
     static let green = Color(red: 0.063, green: 0.596, blue: 0.325)
-    static let greenSoft = Color(red: 0.848, green: 0.984, blue: 0.902)
-    static let incomingBubbleBorder = Color(red: 235 / 255.0, green: 240 / 255.0, blue: 246 / 255.0)
-    static let incomingBubbleBackground = Color(red: 250 / 255.0, green: 252 / 255.0, blue: 254 / 255.0)
-    static let outgoingBubbleBackground = Color(red: 234 / 255.0, green: 244 / 255.0, blue: 255 / 255.0)
+    static let greenSoft = AppAppearance.color(AppTypographyTokens.greenSoftColor, AppTypographyTokens.greenSoftDarkColor)
+    static let incomingBubbleBorder = AppAppearance.border
+    static let incomingBubbleBackground = AppAppearance.color(AppTypographyTokens.incomingBubbleColor, AppTypographyTokens.incomingBubbleDarkColor)
+    static let outgoingBubbleBackground = AppAppearance.color(AppTypographyTokens.outgoingBubbleColor, AppTypographyTokens.outgoingBubbleDarkColor)
     static let navMessages = Color(red: 20 / 255.0, green: 135 / 255.0, blue: 212 / 255.0)
-    static let navMessagesSoft = Color(red: 230 / 255.0, green: 244 / 255.0, blue: 255 / 255.0)
+    static let navMessagesSoft = blueSoft
     static let navAssistant = Color(red: 111 / 255.0, green: 98 / 255.0, blue: 199 / 255.0)
-    static let navAssistantSoft = Color(red: 240 / 255.0, green: 237 / 255.0, blue: 255 / 255.0)
+    static let navAssistantSoft = AppAppearance.color(AppTypographyTokens.purpleSoftColor, AppTypographyTokens.purpleSoftDarkColor)
     static let navContacts = Color(red: 25 / 255.0, green: 140 / 255.0, blue: 115 / 255.0)
-    static let navContactsSoft = Color(red: 231 / 255.0, green: 247 / 255.0, blue: 241 / 255.0)
+    static let navContactsSoft = AppAppearance.color(AppTypographyTokens.contactSoftColor, AppTypographyTokens.contactSoftDarkColor)
     static let navProfile = Color(red: 83 / 255.0, green: 101 / 255.0, blue: 122 / 255.0)
-    static let navProfileSoft = Color(red: 233 / 255.0, green: 238 / 255.0, blue: 245 / 255.0)
+    static let navProfileSoft = AppAppearance.color(AppTypographyTokens.profileSoftColor, AppTypographyTokens.profileSoftDarkColor)
 }
 
 private struct RemoteIMImageEncodingInput: @unchecked Sendable {
@@ -507,10 +508,10 @@ struct ChatView: View {
                     } else {
                         VStack(spacing: 10) {
                             Image(systemName: "bubble.left.and.bubble.right")
-                                .font(.system(size: 32))
+                                .font(AppTypography.symbol(size: 32))
                             Text(activeContact == nil && activeGroup == nil
                                  ? "选择一个对话" : "正在加载消息")
-                                .font(.subheadline)
+                                .font(AppTypography.detail)
                         }
                         .foregroundStyle(RemoteIMStyle.textSecondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -817,18 +818,18 @@ struct RemoteIMPresenceBadge: View {
         switch status {
         case .online:
             Text("在线")
-                .font(.system(size: 11, weight: .semibold))
+                .font(AppTypography.metadata.weight(.semibold))
                 .foregroundStyle(Color(red: 0.047, green: 0.518, blue: 0.29))
                 .padding(.horizontal, 7)
                 .padding(.vertical, 3)
                 .background(RemoteIMStyle.greenSoft, in: Capsule())
         case .offline:
             Text("离线")
-                .font(.system(size: 11, weight: .semibold))
+                .font(AppTypography.metadata.weight(.semibold))
                 .foregroundStyle(RemoteIMStyle.textSecondary)
                 .padding(.horizontal, 7)
                 .padding(.vertical, 3)
-                .background(Color(red: 0.945, green: 0.953, blue: 0.965), in: Capsule())
+                .background(AppAppearance.tableAlternate, in: Capsule())
         case .unknown:
             EmptyView()
         }
@@ -840,8 +841,7 @@ private struct HeaderView: View {
 
     var body: some View {
         ZStack {
-            Text("消息")
-                .font(.system(size: 20, weight: .semibold))
+            AppPageTitle("消息")
                 .foregroundStyle(.primary)
 
             HStack(spacing: 14) {
@@ -852,7 +852,7 @@ private struct HeaderView: View {
                     }
                 } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 20, weight: .medium))
+                        .font(AppTypography.symbol(size: 20, weight: .medium))
                         .foregroundStyle(.primary)
                         .frame(width: 44, height: 44)
                         .contentShape(Rectangle())
@@ -911,10 +911,10 @@ private struct MessageActionsPopover: View {
         Button(action: action) {
             HStack(spacing: 12) {
                 Image(systemName: symbol)
-                    .font(.system(size: 18, weight: .medium))
+                    .font(AppTypography.symbol(size: 18, weight: .medium))
                     .frame(width: 23)
                 Text(title)
-                    .font(.system(size: 16))
+                    .font(AppTypography.body)
                 Spacer(minLength: 0)
             }
             .foregroundStyle(.white)
@@ -968,7 +968,7 @@ struct GroupCreationView: View {
                     VStack(alignment: .leading, spacing: 22) {
                         VStack(alignment: .leading, spacing: 9) {
                             Text("群聊名称")
-                                .font(.system(size: 15, weight: .semibold))
+                                .font(AppTypography.detail.weight(.semibold))
                                 .foregroundStyle(RemoteIMStyle.textPrimary)
                             TextField("给群聊起个名字", text: $groupName)
                                 .textInputAutocapitalization(.never)
@@ -986,28 +986,28 @@ struct GroupCreationView: View {
                                     if value.count > 30 { groupName = String(value.prefix(30)) }
                                 }
                             Text("最多 30 个字")
-                                .font(.system(size: 12))
+                                .font(AppTypography.metadata)
                                 .foregroundStyle(RemoteIMStyle.textSecondary)
                         }
 
                         VStack(alignment: .leading, spacing: 11) {
                             HStack {
                                 Text("邀请好友")
-                                    .font(.system(size: 15, weight: .semibold))
+                                    .font(AppTypography.detail.weight(.semibold))
                                     .foregroundStyle(RemoteIMStyle.textPrimary)
                                 Spacer()
                                 Text("已选 \(selectedMemberIDs.count) 人")
-                                    .font(.system(size: 13))
+                                    .font(AppTypography.detail)
                                     .foregroundStyle(RemoteIMStyle.textSecondary)
                             }
 
                             if availableFriends.isEmpty {
                                 VStack(alignment: .leading, spacing: 12) {
                                     Text("还没有可以邀请的好友")
-                                        .font(.system(size: 14))
+                                        .font(AppTypography.detail)
                                         .foregroundStyle(RemoteIMStyle.textSecondary)
                                     Button("添加朋友", action: addFriend)
-                                        .font(.system(size: 14, weight: .semibold))
+                                        .font(AppTypography.detail.weight(.semibold))
                                         .accessibilityIdentifier("im-group-add-friend")
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1033,13 +1033,13 @@ struct GroupCreationView: View {
                                                     contact: friend, isSelected: false,
                                                     presenceStatus: .unknown, size: 38)
                                                 Text(friend.displayName)
-                                                    .font(.system(size: 15, weight: .medium))
+                                                    .font(AppTypography.detail.weight(.medium))
                                                     .foregroundStyle(RemoteIMStyle.textPrimary)
                                                     .lineLimit(1)
                                                 Spacer()
                                                 Image(systemName: selectedMemberIDs.contains(friend.userID)
                                                       ? "checkmark.circle.fill" : "circle")
-                                                    .font(.system(size: 22))
+                                                    .font(AppTypography.markdownHeading(1))
                                                     .foregroundStyle(selectedMemberIDs.contains(friend.userID)
                                                                      ? RemoteIMStyle.blue
                                                                      : RemoteIMStyle.textSecondary)
@@ -1059,7 +1059,7 @@ struct GroupCreationView: View {
                                             in: RoundedRectangle(cornerRadius: 12))
                             }
                             Text("最多邀请 19 位好友，含你共 20 人")
-                                .font(.system(size: 12))
+                                .font(AppTypography.metadata)
                                 .foregroundStyle(RemoteIMStyle.textSecondary)
                         }
                     }
@@ -1069,11 +1069,11 @@ struct GroupCreationView: View {
                 if recoveryGroup != nil {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("群聊已创建，成员通知尚未送达")
-                            .font(.system(size: 14, weight: .semibold))
+                            .font(AppTypography.detail.weight(.semibold))
                         Text("请打开已创建的群聊发送一条消息。重复创建会产生另一个群聊。")
-                            .font(.system(size: 13))
+                            .font(AppTypography.detail)
                         Button("打开已创建群聊", action: openRecoveredGroup)
-                            .font(.system(size: 14, weight: .semibold))
+                            .font(AppTypography.detail.weight(.semibold))
                             .accessibilityIdentifier("im-group-open-recovered")
                     }
                     .foregroundStyle(RemoteIMStyle.textPrimary)
@@ -1085,7 +1085,7 @@ struct GroupCreationView: View {
                     .padding(.top, 8)
                 } else if let creationError {
                     Text(creationError)
-                        .font(.system(size: 13))
+                        .font(AppTypography.detail)
                         .foregroundStyle(.red)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 20)
@@ -1096,7 +1096,7 @@ struct GroupCreationView: View {
                         if isCreating { ProgressView().tint(.white) }
                         Text(isCreating ? "创建中" : "创建群聊")
                     }
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(AppTypography.body.weight(.semibold))
                     .foregroundStyle(.white)
                     .frame(maxWidth: .infinity)
                     .frame(height: 48)
@@ -1108,7 +1108,7 @@ struct GroupCreationView: View {
                 .padding(20)
             }
             .background(RemoteIMStyle.pageBackground.ignoresSafeArea())
-            .navigationTitle("发起群聊")
+            .appNavigationTitle("发起群聊")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -1279,7 +1279,7 @@ private struct GroupConversationRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: "person.3.fill")
-                .font(.system(size: 19, weight: .medium))
+                .font(AppTypography.symbol(size: 19, weight: .medium))
                 .foregroundStyle(RemoteIMStyle.blue)
                 .frame(width: 42, height: 42)
                 .background(RemoteIMStyle.blueSoft,
@@ -1358,14 +1358,14 @@ private struct GroupChatDetailView: View {
                                 if isLoadingEarlier { ProgressView() }
                                 else { Text("加载更早消息") }
                             }
-                            .font(.system(size: 13, weight: .medium))
+                            .font(AppTypography.detail.weight(.medium))
                             .disabled(isLoadingEarlier)
                             .accessibilityIdentifier("im-group-load-earlier")
                         }
 
                         if messages.isEmpty {
                             Text("群聊已创建，发条消息开始聊天吧")
-                                .font(.system(size: 14))
+                                .font(AppTypography.detail)
                                 .foregroundStyle(RemoteIMStyle.textSecondary)
                                 .frame(maxWidth: .infinity)
                                 .padding(.top, 88)
@@ -1397,7 +1397,7 @@ private struct GroupChatDetailView: View {
                             }
                         } label: {
                             Image(systemName: "arrow.down")
-                                .font(.system(size: 16, weight: .semibold))
+                                .font(AppTypography.symbol(size: 16, weight: .semibold))
                                 .foregroundStyle(RemoteIMStyle.blue)
                                 .frame(width: 42, height: 42)
                                 .background(.white, in: Circle())
@@ -1436,17 +1436,17 @@ private struct GroupChatDetailView: View {
         HStack(spacing: 10) {
             Button { activeGroup = nil } label: {
                 Image(systemName: "chevron.left")
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(AppTypography.symbol(size: 18, weight: .semibold))
                     .frame(width: 44, height: 44)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("返回会话列表")
             VStack(alignment: .leading, spacing: 2) {
                 Text(currentGroup.name)
-                    .font(.system(size: 18, weight: .bold))
+                    .font(AppTypography.heading.weight(.bold))
                     .lineLimit(1)
                 Text("\(currentGroup.memberCount) 位成员")
-                    .font(.system(size: 12))
+                    .font(AppTypography.metadata)
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -1463,7 +1463,7 @@ private struct GroupChatDetailView: View {
         HStack(alignment: .bottom, spacing: 10) {
             TextField("发送文字消息", text: $draft, axis: .vertical)
                 .lineLimit(1...4)
-                .font(.system(size: 16))
+                .font(AppTypography.body)
                 .padding(.horizontal, 13)
                 .padding(.vertical, 10)
                 .background(Color(uiColor: .secondarySystemBackground),
@@ -1474,7 +1474,7 @@ private struct GroupChatDetailView: View {
                 if isSending { ProgressView().tint(.white) }
                 else {
                     Image(systemName: "arrow.up")
-                        .font(.system(size: 18, weight: .bold))
+                        .font(AppTypography.symbol(size: 18, weight: .bold))
                         .foregroundStyle(.white)
                 }
             }
@@ -1519,12 +1519,12 @@ private struct GroupChatMessageRow: View {
                    spacing: 5) {
                 if message.direction == .incoming {
                     Text(senderName)
-                        .font(.system(size: 12, weight: .medium))
+                        .font(AppTypography.metadata.weight(.medium))
                         .foregroundStyle(RemoteIMStyle.textSecondary)
                         .lineLimit(1)
                 }
                 Text(message.text)
-                    .font(.system(size: 15))
+                    .font(AppTypography.detail)
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .textSelection(.enabled)
                     .padding(.horizontal, 13)
@@ -1538,7 +1538,7 @@ private struct GroupChatMessageRow: View {
                     if message.status == .pending { Text("发送中") }
                     if message.status == .failed { Text("发送失败").foregroundStyle(.red) }
                 }
-                .font(.system(size: 11))
+                .font(AppTypography.metadata)
                 .foregroundStyle(RemoteIMStyle.textSecondary)
             }
             if message.direction == .incoming { Spacer(minLength: 46) }
@@ -1563,10 +1563,10 @@ private struct ClearHistoryDialog: View {
 
             VStack(alignment: .leading, spacing: 16) {
                 Text("清空聊天记录？")
-                    .font(.system(size: 20, weight: .bold))
+                    .font(AppTypography.title.weight(.bold))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                 Text("将清空与 \(contact.displayName) 的消息，但保留该好友。")
-                    .font(.system(size: 14))
+                    .font(AppTypography.detail)
                     .foregroundStyle(RemoteIMStyle.textSecondary)
 
                 HStack(spacing: 12) {
@@ -1598,7 +1598,7 @@ private struct ClearHistoryDialog: View {
     ) -> some View {
         Button(title, action: action)
             .buttonStyle(.plain)
-            .font(.system(size: 16, weight: .semibold))
+            .font(AppTypography.body.weight(.semibold))
             .foregroundStyle(color)
             .frame(maxWidth: .infinity)
             .frame(height: 46)
@@ -1687,7 +1687,7 @@ struct RemoteIMUnreadBadge: View {
     var body: some View {
         if count > 0 {
             Text(count > 99 ? "99+" : String(count))
-                .font(.system(size: 11, weight: .bold))
+                .font(AppTypography.metadata.weight(.bold))
                 .foregroundStyle(.white)
                 .padding(.horizontal, 5)
                 .frame(minWidth: 18, minHeight: 18)
@@ -1701,13 +1701,13 @@ private struct EmptyConversationListView: View {
     var body: some View {
         VStack(spacing: 12) {
             Image(systemName: "bubble.left")
-                .font(.system(size: 28))
+                .font(AppTypography.symbol(size: 28))
                 .foregroundStyle(Color(red: 0.56, green: 0.59, blue: 0.64))
             Text("暂无会话")
-                .font(.system(size: 16, weight: .bold))
+                .font(AppTypography.body.weight(.bold))
                 .foregroundStyle(RemoteIMStyle.textPrimary)
             Text("到通讯录添加好友账号后即可开始聊天。")
-                .font(.system(size: 13))
+                .font(AppTypography.detail)
                 .foregroundStyle(RemoteIMStyle.textSecondary)
         }
         .frame(maxWidth: .infinity)
@@ -1997,7 +1997,7 @@ private struct RemoteIMScreenshotQuickSendView: View {
                             Image(systemName: "paperplane.fill")
                             Text("发送")
                         }
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(AppTypography.metadata.weight(.semibold))
                         .foregroundStyle(Color.white)
                         .padding(.horizontal, 8)
                         .frame(height: 25)
@@ -2025,7 +2025,7 @@ private struct RemoteIMScreenshotQuickSendView: View {
 
             Button(action: dismiss) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(AppTypography.symbol(size: 10, weight: .bold))
                     .foregroundStyle(Color.white)
                     .frame(width: 24, height: 24)
                     .background(Color.black.opacity(0.7), in: Circle())
@@ -2556,10 +2556,10 @@ private struct VoiceTranscriptionHighlight: View {
                         Image(systemName: "mic.fill")
                         Text(statusText)
                     }
-                    .font(.system(size: 14, weight: .medium))
+                    .font(AppTypography.detail.weight(.medium))
                     .foregroundStyle(.white.opacity(0.84))
                     Text(transcript.isEmpty ? "正在听，请说话…" : String(transcript.suffix(180)))
-                        .font(.system(size: 24, weight: .medium))
+                        .font(AppTypography.markdownHeading(1).weight(.medium))
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity, maxHeight: .infinity,
                                alignment: .topLeading)
@@ -2607,7 +2607,7 @@ private struct VoiceTranscriptionHighlight: View {
     ) -> some View {
         Button(action: systemImage == "xmark" ? onCancel : onEdit) {
             Image(systemName: systemImage)
-                .font(.system(size: 20, weight: .semibold))
+                .font(AppTypography.symbol(size: 20, weight: .semibold))
                 .frame(width: 52, height: 52)
                 .background(
                     Circle().fill(selected ? selectedColor : Color.black.opacity(0.65))
@@ -2662,7 +2662,7 @@ private struct ChatDetailHeader: View {
                 activeContact = nil
             } label: {
                 Image(systemName: "chevron.left")
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(AppTypography.symbol(size: 18, weight: .semibold))
                     .frame(width: 34, height: 34)
             }
             .buttonStyle(.plain)
@@ -2670,7 +2670,7 @@ private struct ChatDetailHeader: View {
             .accessibilityLabel("返回会话列表")
 
             Text(contact.displayName)
-                .font(.system(size: 18, weight: .bold))
+                .font(AppTypography.heading.weight(.bold))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -2689,7 +2689,7 @@ private struct ChatDetailHeader: View {
             } label: {
                 ZStack {
                     Image(systemName: "display")
-                        .font(.system(size: 16, weight: .semibold))
+                        .font(AppTypography.symbol(size: 16, weight: .semibold))
                     if session.state == .inviting || session.state == .connecting {
                         ProgressView()
                             .tint(remoteButtonColor)
@@ -2774,7 +2774,7 @@ struct RelationBadge: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 11, weight: .bold))
+            .font(AppTypography.metadata.weight(.bold))
             .foregroundStyle(Color(red: 0.706, green: 0.324, blue: 0.035))
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
@@ -2860,7 +2860,7 @@ private struct MessageListView: View {
                             Task { await loadEarlierMessagesIfNeeded() }
                         } label: {
                             if isLoadingEarlierMessages { ProgressView() }
-                            else { Text("加载更早消息").font(.caption) }
+                            else { Text("加载更早消息").font(AppTypography.metadata) }
                         }
                         .disabled(isLoadingEarlierMessages)
                         .frame(maxWidth: .infinity)
@@ -2993,10 +2993,10 @@ private struct MessageListView: View {
                 if hasNewerMessages {
                     Button(action: returnToLatestMessages) {
                         Image(systemName: "arrow.down")
-                            .font(.system(size: 17, weight: .semibold))
+                            .font(AppTypography.symbol(size: 17, weight: .semibold))
                             .foregroundStyle(RemoteIMStyle.blue)
                             .frame(width: 44, height: 44)
-                            .background(Color.white, in: Circle())
+                            .background(RemoteIMStyle.panelBackground, in: Circle())
                             .overlay(Circle().stroke(RemoteIMStyle.border, lineWidth: 1))
                     }
                     .buttonStyle(.plain)
@@ -3212,7 +3212,7 @@ private struct RemoteIMActivityBubble: View {
                             .tint(RemoteIMStyle.blue)
                             .scaleEffect(0.72)
                         Text(machineStatusText(at: context.date))
-                            .font(.system(size: 12, weight: .semibold))
+                            .font(AppTypography.metadata.weight(.semibold))
                             .foregroundStyle(RemoteIMStyle.blue)
                             .lineLimit(1)
                     }
@@ -3642,13 +3642,13 @@ private struct MessageBubbleView: View {
                         finishSelectingText()
                     } label: {
                         Label("复制", systemImage: "doc.on.doc")
-                            .font(.system(size: 12, weight: .semibold))
+                            .font(AppTypography.metadata.weight(.semibold))
                             .padding(.horizontal, 9)
                             .frame(height: 30)
                     }
                     Button(action: finishSelectingText) {
                         Image(systemName: "checkmark")
-                            .font(.system(size: 12, weight: .bold))
+                            .font(AppTypography.symbol(size: 12, weight: .bold))
                             .frame(width: 30, height: 30)
                     }
                     .accessibilityLabel("完成选择")
@@ -3695,24 +3695,24 @@ private struct RemoteIMApprovalActionsView: View {
         VStack(alignment: .leading, spacing: 9) {
             if decisionState == .autoDeclined {
                 Label("审批已因新消息自动拒绝", systemImage: "xmark.circle.fill")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(AppTypography.detail.weight(.semibold))
                     .foregroundStyle(Color.orange)
                     .accessibilityIdentifier("remote-im-approval-auto-declined")
             } else if decisionState == .resolved {
                 Label("审批已处理", systemImage: "checkmark.circle.fill")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(AppTypography.detail.weight(.semibold))
                     .foregroundStyle(RemoteIMStyle.textSecondary)
                     .accessibilityIdentifier("remote-im-approval-resolved")
             } else if decisionState == .sent ||
                         (decisionState == .available && submittedAction != nil) {
                 Label("审批选择已发送", systemImage: "checkmark.circle.fill")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(AppTypography.detail.weight(.semibold))
                     .foregroundStyle(RemoteIMStyle.green)
                     .accessibilityIdentifier("remote-im-approval-sent")
             } else if decisionState == .sending ||
                         (decisionState == .available && submittingAction != nil) {
                 Label("审批选择正在发送…", systemImage: "clock.arrow.circlepath")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(AppTypography.detail.weight(.semibold))
                     .foregroundStyle(RemoteIMStyle.blue)
                     .accessibilityIdentifier("remote-im-approval-sending")
             } else {
@@ -3727,7 +3727,7 @@ private struct RemoteIMApprovalActionsView: View {
                                     .tint(action == .reject ? .red : .white)
                             }
                             Text(action.title)
-                                .font(.system(size: 14, weight: .semibold))
+                                .font(AppTypography.detail.weight(.semibold))
                             Spacer(minLength: 0)
                         }
                         .frame(maxWidth: .infinity)
@@ -3911,9 +3911,9 @@ private struct MessageActionDialog: View {
         Button(action: action) {
             VStack(spacing: 6) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(AppTypography.symbol(size: 18, weight: .semibold))
                 Text(title)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(AppTypography.detail.weight(.medium))
             }
             .foregroundStyle(.white)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -3963,23 +3963,23 @@ private struct ForwardMessageDialog: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("转发给")
-                            .font(.system(size: 20, weight: .bold))
+                            .font(AppTypography.title.weight(.bold))
                             .foregroundStyle(RemoteIMStyle.textPrimary)
                         Text(RemoteIMMessageCopyPolicy.selectionText(for: message))
-                            .font(.system(size: 12))
+                            .font(AppTypography.metadata)
                             .foregroundStyle(RemoteIMStyle.textSecondary)
                             .lineLimit(1)
                     }
                     Spacer()
                     Button("取消", action: cancel)
                         .buttonStyle(.plain)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(AppTypography.detail.weight(.semibold))
                         .foregroundStyle(RemoteIMStyle.textSecondary)
                 }
 
                 HStack(spacing: 10) {
                     Image(systemName: "magnifyingglass")
-                        .font(.system(size: 16, weight: .semibold))
+                        .font(AppTypography.symbol(size: 16, weight: .semibold))
                         .foregroundStyle(RemoteIMStyle.textSecondary)
                     TextField("搜索联系人", text: $searchText)
                         .textInputAutocapitalization(.never)
@@ -4004,19 +4004,19 @@ private struct ForwardMessageDialog: View {
                             } label: {
                                 HStack(spacing: 12) {
                                     Text(String(contact.displayName.prefix(1)).uppercased())
-                                        .font(.system(size: 15, weight: .bold))
+                                        .font(AppTypography.detail.weight(.bold))
                                         .foregroundStyle(.white)
                                         .frame(width: 38, height: 38)
                                         .background(RemoteIMStyle.blue, in: Circle())
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(contact.displayName)
-                                            .font(.system(size: 15, weight: .semibold))
+                                            .font(AppTypography.detail.weight(.semibold))
                                             .foregroundStyle(RemoteIMStyle.textPrimary)
                                             .lineLimit(1)
                                         let accountID = accountIDForIM(contact.userID)
                                         if !accountID.isEmpty && contact.displayName != accountID {
                                             Text(accountID)
-                                                .font(.system(size: 12, design: .monospaced))
+                                                .font(AppTypography.detailMonospaced)
                                                 .foregroundStyle(RemoteIMStyle.textSecondary)
                                                 .lineLimit(1)
                                                 .truncationMode(.middle)
@@ -4024,7 +4024,7 @@ private struct ForwardMessageDialog: View {
                                     }
                                     Spacer(minLength: 0)
                                     Image(systemName: "paperplane.fill")
-                                        .font(.system(size: 14, weight: .semibold))
+                                        .font(AppTypography.symbol(size: 14, weight: .semibold))
                                         .foregroundStyle(RemoteIMStyle.blue)
                                 }
                                 .padding(.horizontal, 12)
@@ -4040,7 +4040,7 @@ private struct ForwardMessageDialog: View {
 
                         if filteredContacts.isEmpty {
                             Text("没有匹配的联系人")
-                                .font(.system(size: 14))
+                                .font(AppTypography.detail)
                                 .foregroundStyle(RemoteIMStyle.textSecondary)
                                 .padding(.vertical, 28)
                         }
@@ -4102,6 +4102,8 @@ private final class MessageTextSelectionController {
 }
 
 private struct SelectableMessageTextView: UIViewRepresentable {
+    @Environment(\.appFontFamily) private var fontFamily
+    @Environment(\.appTextScale) private var textScale
     let text: String
     let selectionController: MessageTextSelectionController
 
@@ -4116,8 +4118,8 @@ private struct SelectableMessageTextView: UIViewRepresentable {
         textView.isScrollEnabled = false
         textView.alwaysBounceVertical = false
         textView.backgroundColor = .clear
-        textView.font = ChatTypography.editor
-        textView.adjustsFontForContentSizeCategory = true
+        textView.font = AppTypography.uiFont(.body, scale: textScale, family: fontFamily)
+        textView.adjustsFontForContentSizeCategory = false
         textView.textColor = UIColor(RemoteIMStyle.textPrimary)
         textView.textContainerInset = .zero
         textView.textContainer.lineFragmentPadding = 0
@@ -4143,6 +4145,7 @@ private struct SelectableMessageTextView: UIViewRepresentable {
 
     func updateUIView(_ textView: UITextView, context: Context) {
         selectionController.textView = textView
+        textView.font = AppTypography.uiFont(.body, scale: textScale, family: fontFamily)
         guard textView.text != text else { return }
         textView.text = text
         // 选择模式只承载一条不可编辑的消息快照；它不会在展示期间被服务端改写。
@@ -4336,12 +4339,12 @@ private struct FullScreenFilePreviewView: View {
                 } else if let integrityError {
                     VStack(spacing: 12) {
                         Image(systemName: "exclamationmark.shield")
-                            .font(.system(size: 34, weight: .semibold))
+                            .font(AppTypography.symbol(size: 34, weight: .semibold))
                             .foregroundStyle(.red)
                         Text("Diff 校验失败")
-                            .font(.headline)
+                            .font(AppTypography.heading)
                         Text(integrityError)
-                            .font(.footnote)
+                            .font(AppTypography.detail)
                             .foregroundStyle(RemoteIMStyle.textSecondary)
                     }
                     .padding(24)
@@ -4355,7 +4358,7 @@ private struct FullScreenFilePreviewView: View {
                     RemoteIMQuickLookPreview(filePath: item.attachment.localFilePath)
                 }
             }
-            .navigationTitle(isGitDiff ? "代码 Diff" : item.attachment.fileName)
+            .appNavigationTitle(isGitDiff ? "代码 Diff" : item.attachment.fileName)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -4457,7 +4460,7 @@ private struct RemoteIMMarkdownFilePreview: View {
     var body: some View {
         ScrollView {
             MarkdownLikeText(text)
-                .font(.system(size: 14))
+                .font(AppTypography.detail)
                 .padding(18)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -4619,7 +4622,7 @@ private struct VideoBubbleContent: View {
                         ],
                         startPoint: .topLeading, endPoint: .bottomTrailing)
                     Image(systemName: "video.fill")
-                        .font(.system(size: 30, weight: .semibold))
+                        .font(AppTypography.symbol(size: 30, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.72))
                 }
                 .frame(width: previewSize.width, height: previewSize.height)
@@ -4627,7 +4630,7 @@ private struct VideoBubbleContent: View {
 
             if fileState.isPlayable {
                 Image(systemName: "play.fill")
-                    .font(.system(size: 20, weight: .bold))
+                    .font(AppTypography.symbol(size: 20, weight: .bold))
                     .foregroundStyle(.white)
                     .frame(width: 52, height: 52)
                     .background(.black.opacity(0.5), in: Circle())
@@ -4637,7 +4640,7 @@ private struct VideoBubbleContent: View {
                     ProgressView()
                         .tint(.white)
                     Text("视频下载中")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(AppTypography.metadata.weight(.semibold))
                         .foregroundStyle(.white)
                 }
                 .padding(.horizontal, 14)
@@ -4646,9 +4649,9 @@ private struct VideoBubbleContent: View {
             } else {
                 VStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 20, weight: .bold))
+                        .font(AppTypography.symbol(size: 20, weight: .bold))
                     Text(isIncoming ? "视频文件已丢失" : "本地视频已丢失")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(AppTypography.metadata.weight(.semibold))
                 }
                 .foregroundStyle(.white)
                 .padding(.horizontal, 14)
@@ -4657,7 +4660,7 @@ private struct VideoBubbleContent: View {
             }
 
             Text(durationText)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .font(AppTypography.detailMonospaced.weight(.semibold))
                 .foregroundStyle(.white)
                 .padding(.horizontal, 7)
                 .frame(height: 22)
@@ -4741,14 +4744,14 @@ private struct FileBubbleContent: View {
             Image(
                 systemName: isGitDiff
                     ? "arrow.left.arrow.right.square" : attachment.mimeType == "text/html" ? "safari" : "doc.text"
-            ).font(.system(size: 20, weight: .semibold))
+            ).font(AppTypography.symbol(size: 20, weight: .semibold))
                 .foregroundStyle(RemoteIMStyle.blue)
                 .frame(width: 38, height: 38)
                 .background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(attachment.fileName)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(AppTypography.detail.weight(.semibold))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -4757,7 +4760,7 @@ private struct FileBubbleContent: View {
                         ? "代码 Diff · 点击查看"
                         : attachment.mimeType == "text/html" ? "HTML 文件" : "Markdown 文件"
                 )
-                    .font(.system(size: 12, weight: .medium))
+                    .font(AppTypography.metadata.weight(.medium))
                     .foregroundStyle(RemoteIMStyle.textSecondary)
             }
         }
@@ -4777,7 +4780,7 @@ private struct VoiceBubbleContent: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                .font(.system(size: 13, weight: .bold))
+                .font(AppTypography.symbol(size: 13, weight: .bold))
                 .frame(width: 18)
             HStack(spacing: 3) {
                 ForEach(0..<7, id: \.self) { index in
@@ -4787,7 +4790,7 @@ private struct VoiceBubbleContent: View {
                 }
             }
             Text("\(attachment.durationSeconds)s")
-                .font(.system(size: 13, weight: .semibold))
+                .font(AppTypography.detail.weight(.semibold))
         }
         .foregroundStyle(RemoteIMStyle.textPrimary)
         .frame(minWidth: 116, alignment: .leading)
@@ -4800,7 +4803,7 @@ private struct StatusIcon: View {
 
     var body: some View {
         Image(systemName: systemName)
-            .font(.system(size: 16, weight: .semibold))
+            .font(AppTypography.symbol(size: 16, weight: .semibold))
             .foregroundStyle(color)
             .accessibilityLabel(accessibilityText)
     }
@@ -4875,9 +4878,9 @@ private final class MarkdownRenderCache: @unchecked Sendable {
         var inline: [String: AttributedString] = [:]
         func append(_ value: String) {
             guard inline[value] == nil else { return }
-            let parsed = (try? AttributedString(markdown: value,
-                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(value)
-            inline[value] = MarkdownInlineStyling.apply(to: parsed)
+            let parsed = MarkdownInlinePresentation.parse(value)
+            // 字号由呈现环境提供，解析缓存跨字号复用。
+            inline[value] = parsed
         }
         for block in blocks {
             switch block.kind {
@@ -4908,23 +4911,6 @@ enum MarkdownPreparation {
     }
 }
 
-enum ChatTypography {
-    static let bodyPointSize: CGFloat = 16
-    static let lineSpacing: CGFloat = 6
-    static let paragraphSpacing: CGFloat = 16
-    static let body = Font.system(size: bodyPointSize)
-    static let emphasizedBody = Font.system(size: bodyPointSize, weight: .semibold)
-    static let heading = Font.system(size: 18, weight: .semibold)
-    static let detail = Font.system(size: 14)
-    static let detailMonospaced = MarkdownCodeTypography.font(size: 14)
-    static let metadata = Font.system(size: 12)
-    static let conversationTitle = Font.system(size: 16, weight: .semibold)
-    static let conversationPreview = Font.system(size: 14)
-    static let conversationTime = Font.system(size: 12, weight: .medium)
-    static let editor = UIFont.systemFont(ofSize: bodyPointSize)
-}
-
-typealias AssistantMessageFont = ChatTypography
 
 private struct MarkdownAssistantTypographyKey: EnvironmentKey {
     static let defaultValue = false
@@ -4938,8 +4924,9 @@ private extension EnvironmentValues {
 }
 
 struct MarkdownLikeText: View {
+    @Environment(\.appTextScale) private var textScale
     private let source: String
-    private let bodyFont: Font
+    private let bodyFont: AppFontStyle
     private let assistantTypography: Bool
     @State private var prepared: PreparedMarkdown?
     private let trailingTimestamp: String?
@@ -4948,7 +4935,7 @@ struct MarkdownLikeText: View {
 
     init(_ text: String, trailingTimestamp: String? = nil,
          retainsPreviousWhilePreparing: Bool = false,
-         bodyFont: Font = ChatTypography.detail,
+         bodyFont: AppFontStyle = AppTypography.body,
          assistantTypography: Bool = false) {
         self.retainsPreviousWhilePreparing = retainsPreviousWhilePreparing
         self.source = text
@@ -4964,7 +4951,7 @@ struct MarkdownLikeText: View {
             ?? (retainsPreviousWhilePreparing ? prepared : nil)
         let blocks = document?.blocks ?? []
         return VStack(alignment: .leading,
-                      spacing: assistantTypography ? ChatTypography.paragraphSpacing : 12) {
+                      spacing: AppTypography.paragraphSpacing * textScale) {
             if document == nil { ProgressView() }
             if blocks.isEmpty, let trailingTimestamp {
                 MarkdownInlineText(text: "", trailingTimestamp: trailingTimestamp)
@@ -4977,8 +4964,7 @@ struct MarkdownLikeText: View {
                 case .sourceNote(let text):
                     MarkdownTrailingDate(timestamp: timestamp) {
                         MarkdownInlineText(text: text)
-                            .font(assistantTypography ? AssistantMessageFont.detail.weight(.semibold)
-                                                      : .system(size: 12, weight: .semibold))
+                            .font(AppTypography.metadata.weight(.semibold))
                             .foregroundStyle(RemoteIMStyle.blue)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
@@ -5004,7 +4990,7 @@ struct MarkdownLikeText: View {
             }
         }
         .font(bodyFont)
-        .lineSpacing(assistantTypography ? ChatTypography.lineSpacing : 4)
+        .lineSpacing(AppTypography.lineSpacing * textScale)
         .tint(RemoteIMStyle.blue)
         .lineLimit(nil)
         .multilineTextAlignment(.leading)
@@ -5058,18 +5044,21 @@ private struct MarkdownListItem: Identifiable, Sendable {
 private struct MarkdownTable: Sendable {
     let headers: [String]
     let rows: [[String]]
-    let columnWidths: [CGFloat]
     init(headers: [String], rows: [[String]]) {
         self.headers = headers
         self.rows = rows
-        // 表格各行共用列宽，避免每个单元格都重新扫描整张表。
+    }
+    func columnWidths(family: AppFontFamily) -> [CGFloat] {
+        // 语义缓存不存字形宽度。字体变化时按所选字体测量，不能沿用系统字形的列宽。
         let count = max(headers.count, rows.map(\.count).max() ?? 0)
-        self.columnWidths = (0..<count).map { column in
+        return (0..<count).map { column in
             let values = [headers[safe: column] ?? ""] + rows.map { $0[safe: column] ?? "" }
-            let longest = values
-                .flatMap { $0.components(separatedBy: .newlines) }
-                .map(\.count).max() ?? 0
-            return min(190, max(88, CGFloat(longest) * 7 + 24))
+            let font = AppTypography.uiFont(.body, weight: .semibold, scale: 1, family: family)
+            let longest = values.flatMap { value in
+                String(MarkdownInlinePresentation.parse(value).characters).components(separatedBy: .newlines)
+            }.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+            // 基准测量只做一次；呈现时统一乘当前比例。长列可横向滚动，避免挤窄数字和中英文。
+            return min(260, max(112, ceil(longest) + 24))
         }
     }
 }
@@ -5094,20 +5083,13 @@ private struct MarkdownInlineText: View {
     let text: String
     var trailingTimestamp: String? = nil
     @Environment(\.preparedMarkdownInline) private var inline
+    @Environment(\.appTextScale) private var textScale
     @Environment(\.markdownAssistantTypography) private var assistantTypography
     var body: some View {
-        var rendered = inline[text] ?? AttributedString(text)
-        if assistantTypography {
-            let codeRanges = rendered.runs
-                .filter { $0.inlinePresentationIntent?.contains(.code) == true }
-                .map(\.range)
-            for range in codeRanges {
-                rendered[range].font = AssistantMessageFont.detailMonospaced
-            }
-        }
+        var rendered = MarkdownInlineStyling.apply(to: inline[text] ?? AttributedString(text), scale: textScale)
         if let trailingTimestamp {
             var date = AttributedString("  · " + trailingTimestamp)
-            date.font = .system(size: 11, weight: .semibold)
+            date.font = AppTypography.resolved(AppTypography.metadata.weight(.semibold), scale: textScale)
             date.foregroundColor = RemoteIMStyle.blue
             rendered.append(date)
         }
@@ -5125,11 +5107,11 @@ private struct MarkdownQuoteView: View {
 
     private var accent: Color {
         switch quote.kind {
-        case .note: Color(red: 0.12, green: 0.39, blue: 0.69)
-        case .tip: Color(red: 0.09, green: 0.51, blue: 0.42)
-        case .important: Color(red: 0.46, green: 0.28, blue: 0.66)
-        case .warning: Color(red: 0.61, green: 0.39, blue: 0.06)
-        case .caution: Color(red: 0.73, green: 0.24, blue: 0.25)
+        case .note: AppAppearance.color(AppTypographyTokens.noteColor, AppTypographyTokens.noteDarkColor)
+        case .tip: AppAppearance.color(AppTypographyTokens.tipColor, AppTypographyTokens.tipDarkColor)
+        case .important: AppAppearance.color(AppTypographyTokens.importantColor, AppTypographyTokens.importantDarkColor)
+        case .warning: AppAppearance.color(AppTypographyTokens.warningColor, AppTypographyTokens.warningDarkColor)
+        case .caution: AppAppearance.color(AppTypographyTokens.cautionColor, AppTypographyTokens.cautionDarkColor)
         case nil: RemoteIMStyle.blue.opacity(0.55)
         }
     }
@@ -5149,8 +5131,7 @@ private struct MarkdownQuoteView: View {
         VStack(alignment: .leading, spacing: 6) {
             if let kind = quote.kind {
                 Label(kind.title, systemImage: symbol)
-                    .font(assistantTypography ? AssistantMessageFont.detail.weight(.semibold)
-                                              : .system(size: 13, weight: .semibold))
+                    .font(AppTypography.detail.weight(.semibold))
                     .foregroundStyle(accent)
             }
             if !quote.text.isEmpty || trailingTimestamp != nil {
@@ -5161,7 +5142,7 @@ private struct MarkdownQuoteView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
         .padding(.leading, 3)
-        .background(quote.kind == nil ? Color.primary.opacity(0.035) : accent.opacity(0.065),
+        .background(quote.kind == nil ? AppAppearance.quoteBackground : accent.opacity(0.10),
                     in: RoundedRectangle(cornerRadius: 8))
         .overlay(alignment: .leading) {
             RoundedRectangle(cornerRadius: 2).fill(accent).frame(width: 3)
@@ -5177,30 +5158,13 @@ private struct MarkdownHeadingView: View {
 
     var body: some View {
         MarkdownInlineText(text: text, trailingTimestamp: trailingTimestamp)
-            .font(assistantTypography ? assistantFont : .system(size: fontSize, weight: .semibold))
-            .foregroundStyle(level <= 2 ? Color(red: 0.11, green: 0.31, blue: 0.54) : RemoteIMStyle.textPrimary)
+            .font(AppTypography.markdownHeading(level))
+            .foregroundStyle(level <= 2 ? AppAppearance.heading : RemoteIMStyle.textPrimary)
             .lineSpacing(3)
             .padding(.top, level <= 2 ? 4 : 2)
             .accessibilityAddTraits(.isHeader)
     }
 
-    private var fontSize: CGFloat {
-        switch level {
-        case 1:
-            return 22
-        case 2:
-            return 18
-        default:
-            return level == 3 ? 16 : 14
-        }
-    }
-
-    private var assistantFont: Font {
-        switch level {
-        case 1: AssistantMessageFont.heading
-        default: AssistantMessageFont.emphasizedBody
-        }
-    }
 }
 
 private struct MarkdownListView: View {
@@ -5208,29 +5172,28 @@ private struct MarkdownListView: View {
     var trailingTimestamp: String? = nil
     @Environment(\.markdownAssistantTypography) private var assistantTypography
 
+    @Environment(\.appTextScale) private var textScale
     var body: some View {
-        VStack(alignment: .leading, spacing: assistantTypography ? 10 : 8) {
+        VStack(alignment: .leading, spacing: AppTypography.lineSpacing * textScale) {
             ForEach(list.items) { item in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Group {
                         if let checked = item.isChecked {
                             Image(systemName: checked ? "checkmark.square.fill" : "square")
                             .foregroundStyle(
-                                checked ? Color(red: 0.09, green: 0.51, blue: 0.42) : RemoteIMStyle.textSecondary
+                                checked ? AppAppearance.color(AppTypographyTokens.tipColor, AppTypographyTokens.tipDarkColor) : RemoteIMStyle.textSecondary
                             ).accessibilityLabel(checked ? "已完成" : "未完成")
                         } else {
                             Text(item.marker).foregroundStyle(RemoteIMStyle.blue)
                         }
                     }
-                    .font(assistantTypography ? AssistantMessageFont.emphasizedBody
-                                              : .system(size: 13, weight: .semibold))
+                    .font(AppTypography.body)
                     .frame(minWidth: 16, alignment: .trailing)
                     MarkdownInlineText(text: item.text,
                         trailingTimestamp: item.id == list.items.last?.id ? trailingTimestamp : nil)
-                        .font(assistantTypography ? AssistantMessageFont.body
-                                                  : .system(size: 14, weight: .regular))
+                        .font(AppTypography.body)
                         .foregroundStyle(RemoteIMStyle.textPrimary)
-                        .lineSpacing(assistantTypography ? 6 : 4)
+                        .lineSpacing(AppTypography.lineSpacing * textScale)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(.leading, CGFloat(min(item.indent, 4)) * 12)
@@ -5257,25 +5220,23 @@ private struct MarkdownCodeBlock: View {
                 Text("\(lineCount) 行")
                     .foregroundStyle(RemoteIMStyle.textSecondary)
             }
-            .font(assistantTypography ? AssistantMessageFont.metadata.weight(.medium)
-                                      : .system(size: 11, weight: .medium))
-            .foregroundStyle(Color(red: 0.11, green: 0.31, blue: 0.54))
+            .font(AppTypography.metadata.weight(.medium))
+            .foregroundStyle(AppAppearance.heading)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(red: 0.91, green: 0.95, blue: 0.98))
+            .background(AppAppearance.tableHeader)
 
             ScrollView(.horizontal, showsIndicators: true) {
                 Text(code.isEmpty ? " " : code)
-                    .font(assistantTypography ? AssistantMessageFont.detailMonospaced
-                                              : MarkdownCodeTypography.font(size: 12))
+                    .font(MarkdownCodeTypography.font(size: AppTypography.uiFont(.detail).pointSize))
                     .lineSpacing(4)
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .fixedSize(horizontal: true, vertical: true)
                     .padding(12)
             }
         }
-        .background(Color(red: 0.955, green: 0.965, blue: 0.978))
+        .background(AppAppearance.codeBackground)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -5286,40 +5247,42 @@ private struct MarkdownCodeBlock: View {
 
 private struct MarkdownTableView: View {
     let table: MarkdownTable
-    private let columnWidths: [CGFloat]
+    @Environment(\.appTextScale) private var textScale
+    @Environment(\.appFontFamily) private var fontFamily
+    private var columnWidths: [CGFloat] { table.columnWidths(family: fontFamily).map { $0 * textScale } }
     @Environment(\.markdownAssistantTypography) private var assistantTypography
 
     init(table: MarkdownTable) {
         self.table = table
-        self.columnWidths = table.columnWidths
     }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: true) {
+        let widths = columnWidths
+        return ScrollView(.horizontal, showsIndicators: true) {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(alignment: .top, spacing: 0) {
-                    ForEach(0..<columnCount, id: \.self) { column in
+                    ForEach(0..<widths.count, id: \.self) { column in
                         tableCell(
                             table.headers[safe: column] ?? "",
                             isHeader: true,
-                            width: columnWidths[column]
+                            width: widths[column]
                         )
                     }
                 }
-                .background(Color(red: 0.91, green: 0.94, blue: 0.97))
+                .background(AppAppearance.tableHeader)
                 ForEach(Array(table.rows.enumerated()), id: \.offset) { rowIndex, row in
                     HStack(alignment: .top, spacing: 0) {
-                        ForEach(0..<columnCount, id: \.self) { column in
+                        ForEach(0..<widths.count, id: \.self) { column in
                             tableCell(
                                 row[safe: column] ?? "",
                                 isHeader: false,
-                                width: columnWidths[column]
+                                width: widths[column]
                             )
                         }
                     }
                     .background(
                         rowIndex.isMultiple(of: 2)
-                            ? Color.white.opacity(0.85) : Color(red: 0.96, green: 0.97, blue: 0.98)
+                            ? RemoteIMStyle.panelBackground : AppAppearance.tableAlternate
                     ).overlay(alignment: .bottom) {
                         Rectangle().fill(RemoteIMStyle.border.opacity(0.6)).frame(height: 0.5)
                     }
@@ -5333,18 +5296,12 @@ private struct MarkdownTableView: View {
         }
     }
 
-    private var columnCount: Int {
-        columnWidths.count
-    }
-
     private func tableCell(_ text: String, isHeader: Bool, width: CGFloat) -> some View {
         MarkdownInlineText(text: text)
-            .font(assistantTypography
-                ? (isHeader ? AssistantMessageFont.emphasizedBody : AssistantMessageFont.body)
-                : .system(size: 12, weight: isHeader ? .semibold : .regular))
+            .font(AppTypography.body.weight(isHeader ? .semibold : .regular))
             .foregroundStyle(RemoteIMStyle.textPrimary)
             .lineLimit(nil)
-            .lineSpacing(assistantTypography ? 5 : 3)
+            .lineSpacing(AppTypography.lineSpacing * textScale)
             .frame(width: max(1, width - 24), alignment: .topLeading)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -5788,10 +5745,10 @@ private struct RemoteIMSlashCommandBar: View {
                     } label: {
                         HStack(spacing: 6) {
                             Text(command.command)
-                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .font(AppTypography.detailMonospaced.weight(.semibold))
                                 .foregroundStyle(RemoteIMStyle.blue)
                             Text(command.label)
-                                .font(.system(size: 12, weight: .medium))
+                                .font(AppTypography.metadata.weight(.medium))
                                 .foregroundStyle(RemoteIMStyle.textSecondary)
                             Spacer(minLength: 0)
                         }
@@ -5951,7 +5908,7 @@ struct ComposerAttachmentPanel: View {
         Button(action: action) {
             VStack(spacing: 8) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 25, weight: .medium))
+                    .font(AppTypography.symbol(size: 25, weight: .medium))
                     .foregroundStyle(
                         enabled ? actionColor(systemImage) : RemoteIMStyle.textSecondary.opacity(0.5)
                     )
@@ -5962,7 +5919,7 @@ struct ComposerAttachmentPanel: View {
                         in: RoundedRectangle(cornerRadius: 13, style: .continuous)
                     )
                 Text(title)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(AppTypography.metadata.weight(.medium))
                     .foregroundStyle(
                         enabled ? RemoteIMStyle.textSecondary : RemoteIMStyle.textSecondary.opacity(0.5)
                     )
@@ -6174,7 +6131,7 @@ private struct ComposerView: View {
                     .fill(RemoteIMStyle.blue)
                     .frame(width: 3, height: 26)
                 Text(replyQuoteTitle(quote))
-                    .font(.system(size: 12))
+                    .font(AppTypography.metadata)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 Spacer(minLength: 4)
@@ -6182,7 +6139,7 @@ private struct ComposerView: View {
                     appState.cancelReply()
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 12, weight: .bold))
+                        .font(AppTypography.symbol(size: 12, weight: .bold))
                         .frame(width: 30, height: 30)
                 }
                 .buttonStyle(.plain)
@@ -6237,7 +6194,7 @@ private struct ComposerView: View {
             setVoiceMode(!isVoiceMode)
         } label: {
             Image(systemName: isVoiceMode ? "keyboard" : "speaker.wave.2.fill")
-                .font(.system(size: 18, weight: .bold))
+                .font(AppTypography.symbol(size: 18, weight: .bold))
                 .frame(width: 44, height: 44)
                 .background(RemoteIMStyle.blueSoft, in: Circle())
                 .overlay(Circle().stroke(RemoteIMStyle.border, lineWidth: 1))
@@ -6257,7 +6214,7 @@ private struct ComposerView: View {
             }
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 20, weight: .semibold))
+                .font(AppTypography.symbol(size: 20, weight: .semibold))
                 .frame(width: 44, height: 44)
                 .background(Color(uiColor: .secondarySystemBackground), in: Circle())
                 .overlay(Circle().stroke(RemoteIMStyle.border, lineWidth: 1))
@@ -6384,7 +6341,7 @@ private struct ComposerView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(RemoteIMStyle.textSecondary)
             }
-            .font(.system(size: 12, weight: .medium))
+            .font(AppTypography.symbol(size: 12, weight: .medium))
 
             if let suggestions = replySuggestions {
                 suggestionButton("自然", text: suggestions.natural)
@@ -6408,12 +6365,12 @@ private struct ComposerView: View {
             composerFocusRequestGeneration &+= 1
         } label: {
             Text("\(label) · \(text)")
-                .font(.system(size: 14))
+                .font(AppTypography.detail)
                 .foregroundStyle(RemoteIMStyle.textPrimary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 11)
                 .padding(.vertical, 8)
-                .background(Color.white, in: RoundedRectangle(cornerRadius: 9))
+                .background(RemoteIMStyle.panelBackground, in: RoundedRectangle(cornerRadius: 9))
                 .overlay(
                     RoundedRectangle(cornerRadius: 9)
                         .stroke(RemoteIMStyle.border, lineWidth: 1)
@@ -7047,9 +7004,7 @@ final class ComposerTextEditingController {
             }
             speechSynthesizer.stopSpeaking(at: .immediate)
             let utterance = AVSpeechUtterance(string: spokenText)
-            utterance.voice = AVSpeechSynthesisVoice(
-                language: Locale.preferredLanguages.first ?? "zh-CN"
-            )
+            AppReadingPreferences.apply(to: utterance)
             speechSynthesizer.speak(utterance)
         case .newLine:
             let fullText = textView.text ?? ""
@@ -7088,9 +7043,9 @@ struct ComposerEditActionBar: View {
                         .frame(width: 58, height: 42)
                         .overlay {
                             ZStack {
-                                Color.white
+                                RemoteIMStyle.panelBackground
                                 Text("粘贴")
-                                    .font(.system(size: 14, weight: .medium))
+                                    .font(AppTypography.detail.weight(.medium))
                                     .foregroundStyle(RemoteIMStyle.textPrimary)
                             }
                             .allowsHitTesting(false)
@@ -7103,7 +7058,7 @@ struct ComposerEditActionBar: View {
                             perform(action)
                         } label: {
                             Text(action.title)
-                                .font(.system(size: 14, weight: .medium))
+                                .font(AppTypography.detail.weight(.medium))
                                 .foregroundStyle(RemoteIMStyle.textPrimary)
                                 .frame(minWidth: 58, minHeight: 42)
                                 .contentShape(Rectangle())
@@ -7121,7 +7076,7 @@ struct ComposerEditActionBar: View {
                     }
                 }
             }
-            .background(Color.white)
+            .background(RemoteIMStyle.panelBackground)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -7129,7 +7084,7 @@ struct ComposerEditActionBar: View {
             }
 
             MessageActionPointer()
-                .fill(Color.white)
+                .fill(RemoteIMStyle.panelBackground)
                 .frame(width: 16, height: 7)
                 .padding(.leading, 20)
                 .offset(y: -0.5)
@@ -7204,6 +7159,8 @@ final class GrowingComposerUITextView: UITextView {
 }
 
 struct ComposerTextView: UIViewRepresentable {
+    @Environment(\.appFontFamily) private var fontFamily
+    @Environment(\.appTextScale) private var textScale
     @Binding var text: String
     let onSubmit: () -> Void
     let focusRequestGeneration: Int
@@ -7243,7 +7200,7 @@ struct ComposerTextView: UIViewRepresentable {
         )
         textView.delegate = context.coordinator
         textView.backgroundColor = .clear
-        textView.font = ChatTypography.editor
+        textView.font = AppTypography.uiFont(.body, scale: textScale, family: fontFamily)
         textView.textColor = .label
         textView.tintColor = UIColor(RemoteIMStyle.blue)
         textView.autocapitalizationType = .none
@@ -7319,6 +7276,13 @@ struct ComposerTextView: UIViewRepresentable {
         let started = ProcessInfo.processInfo.systemUptime
         defer { AppDiagnosticLog.shared.recordDuration(.composerUpdate, since: started) }
         context.coordinator.parent = self
+        // 只改字体及测量缓存，不重建输入控件，保留选区、键盘、语音状态和未发送草稿。
+        let font = AppTypography.uiFont(.body, scale: textScale, family: fontFamily)
+        if textView.font != font {
+            textView.font = font
+            context.coordinator.requireMeasurement()
+            context.coordinator.scheduleContentHeightRefresh(for: textView)
+        }
         if textView.enablesReturnKeyAutomatically == allowsEmptySubmit {
             textView.enablesReturnKeyAutomatically = !allowsEmptySubmit
             if textView.isFirstResponder { textView.reloadInputViews() }
@@ -7707,7 +7671,7 @@ private struct PressToTalkButton: View {
 
     var body: some View {
         Text(title)
-            .font(.system(size: 15, weight: .semibold))
+            .font(AppTypography.detail.weight(.semibold))
             .foregroundStyle(isEnabled ? Color.primary : Color.secondary)
             .frame(maxWidth: .infinity, minHeight: 44)
             .background(backgroundColor, in: RoundedRectangle(cornerRadius: 14, style: .continuous))

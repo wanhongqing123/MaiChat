@@ -1,237 +1,225 @@
-// 文件作用：提供应用私有存储的查询与文件操作工具。
-// 直接依赖：MaiFilePath.h、MaiFileSystem.h、MaiIdGenerator.h；本文件在这些接口之间完成调用与结果转换。
+// 文件作用：把共用存储预览服务适配为工具参数、交付保护及逐次审批。
 #include "MaiAppStorageTool.h"
 
 #include <json.hpp>
 
-#include <algorithm>
-#include <cstdint>
-#include <ctime>
-#include <mutex>
-#include <string>
+#include <unordered_set>
 #include <utility>
-#include <vector>
 
+#include "MaiAgent.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
-#include "MaiIdGenerator.h"
 
 namespace {
-
 using Json = nlohmann::json;
-constexpr std::size_t kMaximumFiles = 20000;
-constexpr std::size_t kMaximumCleanupFiles = 1000;
-constexpr std::int64_t kMinimumAgeSeconds = 24 * 60 * 60;
 
-struct Candidate {
-    MaiFilePath path;
-    std::uint64_t bytes = 0;
-    std::int64_t modified = 0;
-};
-
-struct Scan {
-    std::uint64_t bytes = 0;
-    std::uint64_t files = 0;
-    std::uint64_t eligibleFiles = 0;
-    std::uint64_t eligibleBytes = 0;
-    bool truncated = false;
-    std::vector<Candidate> candidates;
-};
-
-Scan scanDirectory(const MaiFilePath& root, std::int64_t cutoff, std::size_t candidateLimit,
-                   bool cleanupEligible, const MaiToolContext& context) {
-    Scan result;
-    if (root.isEmpty() || !MaiFileSystem::isDirectory(root)) return result;
-    MaiFileSystem::walk(root, [&](const MaiFileEntry& entry) {
-        if (context.isCanceled()) {
-            result.truncated = true;
-            return MaiWalkAction::Stop;
+MaiAppStorageContext storageContext(const MaiToolContext& context) {
+    MaiAppStorageContext result{context.sessionId, context.root, {}, context.cancel};
+    if (!context.sessionAgent) return result;
+    result.protectionComplete = true;
+    const auto root = MaiFileSystem::resolve(MaiFilePath::fromUtf8(context.root));
+    // 普通会话列表不含子 Agent，须补齐其历史收据，不能把“没出现在列表”当成未交付。
+    auto sessions = context.sessionAgent->listSessions();
+    std::unordered_set<std::string> seen;
+    for (const auto& session : sessions) seen.insert(session.id);
+    for (std::size_t index = 0; index < sessions.size(); ++index) {
+        for (const auto& child : context.sessionAgent->listSubAgents(sessions[index].id)) {
+            MaiSession session;
+            if (seen.insert(child.sessionId).second &&
+                context.sessionAgent->getSession(child.sessionId, session))
+                sessions.push_back(std::move(session));
         }
-        if (result.files >= kMaximumFiles) {
-            result.truncated = true;
-            return MaiWalkAction::Stop;
+    }
+    // 保护实际附件和交付收据，而非把每张图片都当成品；同工作区其他会话也不能误删。
+    for (const auto& session : sessions) {
+        if (root.isEmpty() ||
+            MaiFileSystem::resolve(MaiFilePath::fromUtf8(session.directory)) != root)
+            continue;
+        for (const auto& message : context.sessionAgent->listMessages(session.id)) {
+            for (const auto& part : message.parts) {
+                std::string path;
+                if (const auto* image = std::get_if<MaiImagePart>(&part.body)) path = image->path;
+                if (const auto* video = std::get_if<MaiVideoPart>(&part.body)) path = video->path;
+                if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
+                    if (tool->state != MaiToolState::Completed || tool->tool != "agent_send_media")
+                        continue;
+                    const auto receipt = Json::parse(tool->output, nullptr, false);
+                    if (receipt.is_object() &&
+                        receipt.value("delivery", Json{}) == "current_ai_session" &&
+                        receipt.value("path", Json{}).is_string())
+                        path = receipt["path"].get<std::string>();
+                }
+                if (!path.empty())
+                    result.protectedPaths.push_back(
+                        root.append(MaiFilePath::fromUtf8(path)).toUtf8());
+            }
         }
-        if (entry.isDirectory) return MaiWalkAction::Continue;
-        if (MaiFileSystem::isSymbolicLink(entry.path)) return MaiWalkAction::Continue;
-        ++result.files;
-        result.bytes += entry.size;
-        std::int64_t modified = 0;
-        if (cleanupEligible && MaiFileSystem::modifiedTime(entry.path, modified) && modified > 0 &&
-            modified <= cutoff) {
-            ++result.eligibleFiles;
-            result.eligibleBytes += entry.size;
-            if (result.candidates.size() < candidateLimit)
-                result.candidates.push_back({entry.path, entry.size, modified});
-        }
-        return MaiWalkAction::Continue;
-    });
+    }
     return result;
 }
 
-Json summary(const Scan& scan) {
-    return Json{{"bytes", scan.bytes},
-                {"files", scan.files},
-                {"scan_truncated", scan.truncated},
-                {"eligible_files", scan.eligibleFiles},
-                {"eligible_bytes", scan.eligibleBytes},
-                {"cleanup_limited", scan.eligibleFiles > scan.candidates.size()},
-                {"cleanup_candidates", scan.candidates.size()}};
+Json previewJson(const MaiAppStoragePreview& preview) {
+    static const char* targets[] = {"app", "temporary", "cache", "workspace"};
+    Json result{
+        {"preview_id", preview.id},
+        {"dry_run", true},
+        {"target", targets[static_cast<int>(preview.selection.target)]},
+        {"scope", preview.selection.scope},
+        {"patterns", preview.selection.patterns},
+        {"workspace_cleanup_allowed", preview.selection.target == MaiAppStorageTarget::Workspace},
+        {"cleanup_min_age_hours", preview.minimumAgeHours},
+        {"cleanup_limit", 1000},
+        {"cleanup_limited", preview.limited},
+        {"cleanup_candidate_count", preview.candidates.size()},
+        {"cleanup_candidate_bytes", preview.candidateBytes},
+        {"cleanup_candidates", Json::array()}};
+    for (const auto& candidate : preview.candidates)
+        result["cleanup_candidates"].push_back(Json{{"path", candidate.path},
+                                                    {"relative_path", candidate.relativePath},
+                                                    {"target", candidate.target},
+                                                    {"bytes", candidate.bytes},
+                                                    {"modified_unix_seconds", candidate.modified}});
+    for (const auto& summary : preview.summaries) {
+        std::size_t count = 0;
+        for (const auto& candidate : preview.candidates)
+            if (candidate.target == summary.target) ++count;
+        result[summary.target] =
+            Json{{"bytes", summary.bytes},
+                 {"files", summary.files},
+                 {"scan_truncated", summary.truncated},
+                 {"eligible_files", summary.eligibleFiles},
+                 {"eligible_bytes", summary.eligibleBytes},
+                 {"excluded_recent_files", summary.excludedRecentFiles},
+                 {"excluded_recent_bytes", summary.excludedRecentBytes},
+                 {"excluded_protected_files", summary.excludedProtectedFiles},
+                 {"excluded_outside_policy_files", summary.excludedPolicyFiles},
+                 {"cleanup_candidates", count}};
+    }
+    return result;
 }
 
 class AppStorageTool final : public MaiTool {
 public:
-    explicit AppStorageTool(MaiAppStoragePaths paths) : mPaths(std::move(paths)) {}
-
+    explicit AppStorageTool(MaiAppStoragePaths paths) : mStorage(std::move(paths)) {}
     std::string name() const override {
         return "app_storage";
     }
     std::string description() const override {
-        // 清理前先扫描并取得预览 ID；只删除符合该预览且未变化的旧缓存，
-        // 不能把整个工作区或用户原文件当成临时文件清空。
-        return "Inspect App temporary, cache and AI workspace storage. Scan returns sizes and a "
-               "preview ID. Cleanup accepts that ID and removes only unchanged regular files "
-               "older than 24 hours from App temporary/cache directories, never the workspace. "
-               "Cleanup follows the selected Agent approval policy.";
+        // 默认只读预览；工作区仅选明确的可再生中间目录，不以扩展名推断成品。
+        // 最近文件和默认权重受保护；零年龄必须有界。执行只消费已确认预览，不补入新文件。
+        return "Inspect App storage and preview cleanup. action=scan without target reports App "
+               "temporary/cache/workspace sizes and selects no workspace files. Cleanup defaults "
+               "to "
+               "dry_run=true and returns the exact candidate list/count/bytes plus age/protection "
+               "exclusions. target is temporary, cache, or workspace. Workspace requires explicit "
+               "scope or bounded root-relative patterns limited to regenerable frames_<id>, "
+               "wmframes, "
+               "screenshots, search, browser, or .maiagent/model-previews. Never wipe the whole "
+               "workspace; gallery-* and recorded delivered media/attachments are protected. "
+               "Patterns "
+               "support * within one component only. min_age_hours defaults to 24; 0 requires a "
+               "bounded "
+               "scope and a preview first. Model files are protected unless explicitly scoped; "
+               "verify "
+               "ownership and inactivity before selecting QA weights. To execute send only "
+               "action=cleanup, dry_run=false and the confirmed preview_id. Only unchanged regular "
+               "files from that single-use ten-minute session/root-bound preview are removed; new "
+               "files are never added. Deletion follows the Agent approval policy.";
     }
     std::string parametersSchema() const override {
-        // action=scan 只读并返回预览 ID；action=cleanup 要带这次预览 ID，
-        // 执行层据此确认待删文件未变化。
-        return R"({"type":"object","properties":{"action":{"type":"string","enum":["scan",)"
-            R"("cleanup"]},"preview_id":{"type":"string"}},"required":["action"],)"
-            R"("additionalProperties":false})";
+        // 保留 action 入口；执行层校验选择参数与单次凭据不能混用，并拒绝未知字段。
+        return R"({"type":"object","properties":{"action":{"type":"string","enum":["scan","cleanup"]},"target":{"type":"string","enum":["temporary","cache","workspace"]},"scope":{"type":"string","minLength":1,"maxLength":1024},"patterns":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"string","minLength":1,"maxLength":1024}},"min_age_hours":{"type":"integer","minimum":0,"maximum":8760,"default":24},"dry_run":{"type":"boolean","default":true},"preview_id":{"type":"string","minLength":1}},"required":["action"],"additionalProperties":false})";
     }
     bool requiresApproval(const std::string& raw) const override {
-        const Json args = Json::parse(raw, nullptr, false);
-        return !args.is_object() || !args.value("action", Json{}).is_string() ||
-               args["action"].get<std::string>() != "scan";
+        const auto args = Json::parse(raw, nullptr, false);
+        if (!args.is_object() || !args.value("action", Json{}).is_string() ||
+            (args.contains("dry_run") && !args["dry_run"].is_boolean()))
+            return true;
+        const auto action = args["action"].get<std::string>();
+        return (action != "scan" && action != "cleanup") || !args.value("dry_run", true);
     }
     bool requiresPerCallApproval(const std::string& raw) const override {
         return requiresApproval(raw);
     }
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
-        const Json args = Json::parse(raw, nullptr, false);
+        const auto args = Json::parse(raw, nullptr, false);
         if (!args.is_object() || !args.value("action", Json{}).is_string())
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "action is required");
-        const std::string action = args["action"].get<std::string>();
-        if (action == "scan") return scan(context);
-        if (action == "cleanup") {
-            if (!args.value("preview_id", Json{}).is_string())
-                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "preview_id is required");
-            return cleanup(args["preview_id"].get<std::string>(), context);
+            return invalid("action is required");
+        for (auto item = args.begin(); item != args.end(); ++item)
+            if (item.key() != "action" && item.key() != "target" && item.key() != "scope" &&
+                item.key() != "patterns" && item.key() != "min_age_hours" &&
+                item.key() != "dry_run" && item.key() != "preview_id")
+                return invalid("unknown storage field");
+        const auto action = args["action"].get<std::string>();
+        if (action != "scan" && action != "cleanup") return invalid("unknown storage action");
+        if (args.contains("dry_run") && !args["dry_run"].is_boolean())
+            return invalid("dry_run must be boolean");
+        if (!args.value("dry_run", true)) {
+            if (action != "cleanup" || args.size() != 3 ||
+                !args.value("preview_id", Json{}).is_string())
+                return invalid("execute with only action=cleanup, dry_run=false and preview_id");
+            const auto result =
+                mStorage.cleanup(args["preview_id"].get<std::string>(), storageContext(context));
+            if (!result) return failure(result.error());
+            return MaiToolResult::success(Json{
+                {"dry_run", false},
+                {"removed_files", result.value().removedFiles},
+                {"reclaimed_bytes", result.value().reclaimedBytes},
+                {"skipped_files",
+                 result.value().skippedFiles}}.dump());
         }
-        return MaiToolResult::failure(MaiErrorCode::InvalidInput, "unknown storage action");
+        if (args.contains("preview_id"))
+            return invalid("preview_id is only used with cleanup and dry_run=false");
+        MaiAppStorageSelection selection;
+        if (args.contains("target")) {
+            if (!args["target"].is_string()) return invalid("target must be a storage category");
+            const auto target = args["target"].get<std::string>();
+            if (target == "temporary")
+                selection.target = MaiAppStorageTarget::Temporary;
+            else if (target == "cache")
+                selection.target = MaiAppStorageTarget::Cache;
+            else if (target == "workspace")
+                selection.target = MaiAppStorageTarget::Workspace;
+            else
+                return invalid("target must be temporary, cache, or workspace");
+        } else if (action == "cleanup")
+            return invalid("cleanup preview requires an explicit target");
+        if (args.contains("scope")) {
+            if (!args["scope"].is_string() || args["scope"].get<std::string>().empty())
+                return invalid("scope must be a nonempty relative path");
+            selection.scope = args["scope"].get<std::string>();
+        }
+        if (args.contains("patterns")) {
+            if (!args["patterns"].is_array() || args["patterns"].empty())
+                return invalid("patterns must be a nonempty array of relative patterns");
+            for (const auto& pattern : args["patterns"]) {
+                if (!pattern.is_string()) return invalid("patterns must contain strings");
+                selection.patterns.push_back(pattern.get<std::string>());
+            }
+        }
+        if (args.contains("min_age_hours")) {
+            if (!args["min_age_hours"].is_number_integer() || args["min_age_hours"] < 0 ||
+                args["min_age_hours"] > 8760)
+                return invalid("min_age_hours must be an integer from 0 to 8760");
+            selection.minimumAgeHours = args["min_age_hours"].get<int>();
+        }
+        if (selection.target == MaiAppStorageTarget::Workspace && !context.sessionAgent)
+            return invalid(
+                "workspace preview requires the session host to protect delivered media");
+        const auto result = mStorage.preview(selection, storageContext(context));
+        if (!result) return failure(result.error());
+        return MaiToolResult::success(previewJson(result.value()).dump());
     }
 
 private:
-    MaiToolResult scan(const MaiToolContext& context) {
-        const std::string workspacePath =
-            mPaths.workspace.empty() ? context.root : mPaths.workspace;
-        const MaiFilePath temporaryRoot =
-            MaiFileSystem::resolve(MaiFilePath::fromUtf8(mPaths.temporary));
-        const MaiFilePath cacheRoot = MaiFileSystem::resolve(MaiFilePath::fromUtf8(mPaths.cache));
-        const MaiFilePath workspaceRoot =
-            MaiFileSystem::resolve(MaiFilePath::fromUtf8(workspacePath));
-        if (temporaryRoot.isEmpty() || cacheRoot.isEmpty() || workspaceRoot.isEmpty() ||
-            !MaiFileSystem::isDirectory(temporaryRoot) || !MaiFileSystem::isDirectory(cacheRoot) ||
-            !MaiFileSystem::isDirectory(workspaceRoot) || temporaryRoot == cacheRoot ||
-            temporaryRoot.isParentOf(cacheRoot) || cacheRoot.isParentOf(temporaryRoot) ||
-            temporaryRoot == workspaceRoot || cacheRoot == workspaceRoot ||
-            temporaryRoot.isParentOf(workspaceRoot) || cacheRoot.isParentOf(workspaceRoot) ||
-            workspaceRoot.isParentOf(temporaryRoot) || workspaceRoot.isParentOf(cacheRoot))
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "App storage roots are missing or overlap");
-        const std::int64_t cutoff =
-            static_cast<std::int64_t>(std::time(nullptr)) - kMinimumAgeSeconds;
-        const Scan temporary =
-            scanDirectory(temporaryRoot, cutoff, kMaximumCleanupFiles, true, context);
-        const Scan cache = scanDirectory(
-            cacheRoot, cutoff, kMaximumCleanupFiles - temporary.candidates.size(), true, context);
-        const Scan workspace = scanDirectory(workspaceRoot, cutoff, 0, false, context);
-        if (context.isCanceled())
-            return MaiToolResult::failure(MaiErrorCode::Canceled, "storage scan was canceled");
-        std::lock_guard<std::mutex> lock(mMutex);
-        mSessionId = context.sessionId;
-        mPreviewId = MaiIdGenerator::generate("storage_");
-        mCreatedAt = static_cast<std::int64_t>(std::time(nullptr));
-        mTemporaryRoot = temporaryRoot;
-        mCacheRoot = cacheRoot;
-        mCandidates = temporary.candidates;
-        mCandidates.insert(mCandidates.end(), cache.candidates.begin(), cache.candidates.end());
-        Json examples = Json::array();
-        for (std::size_t index = 0; index < std::min<std::size_t>(mCandidates.size(), 20); ++index)
-            examples.push_back(Json{{"path", mCandidates[index].path.toUtf8()},
-                                    {"bytes", mCandidates[index].bytes}});
-        Json response{{"preview_id", mPreviewId},
-                      {"temporary", summary(temporary)},
-                      {"cache", summary(cache)},
-                      {"workspace", summary(workspace)},
-                      {"cleanup_max_age_hours", 24},
-                      {"cleanup_limit", kMaximumCleanupFiles},
-                      {"cleanup_candidate_count", mCandidates.size()},
-                      {"cleanup_candidate_examples", examples},
-                      {"workspace_cleanup_allowed", false}};
-        return MaiToolResult::success(response.dump());
+    static MaiToolResult invalid(const std::string& message) {
+        return MaiToolResult::failure(MaiErrorCode::InvalidInput, message);
     }
-
-    MaiToolResult cleanup(const std::string& previewId, const MaiToolContext& context) {
-        std::vector<Candidate> candidates;
-        MaiFilePath temporaryRoot;
-        MaiFilePath cacheRoot;
-        {
-            std::lock_guard<std::mutex> lock(mMutex);
-            const auto now = static_cast<std::int64_t>(std::time(nullptr));
-            if (previewId.empty() || previewId != mPreviewId || context.sessionId != mSessionId ||
-                now - mCreatedAt > 10 * 60)
-                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                              "scan storage again for a fresh preview ID");
-            candidates = std::move(mCandidates);
-            temporaryRoot = mTemporaryRoot;
-            cacheRoot = mCacheRoot;
-            mPreviewId.clear();
-        }
-        if (MaiFileSystem::resolve(MaiFilePath::fromUtf8(mPaths.temporary)) != temporaryRoot ||
-            MaiFileSystem::resolve(MaiFilePath::fromUtf8(mPaths.cache)) != cacheRoot)
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "App storage roots changed; scan again");
-        std::uint64_t bytes = 0;
-        std::uint64_t removed = 0;
-        std::uint64_t skipped = 0;
-        for (const Candidate& item : candidates) {
-            if (context.isCanceled())
-                return MaiToolResult::failure(MaiErrorCode::Canceled,
-                                              "storage cleanup was canceled");
-            std::uint64_t currentSize = 0;
-            std::int64_t modified = 0;
-            const MaiFilePath resolved = MaiFileSystem::resolve(item.path);
-            if (MaiFileSystem::isSymbolicLink(item.path) || resolved.isEmpty() ||
-                (!temporaryRoot.isParentOf(resolved) && !cacheRoot.isParentOf(resolved)) ||
-                !MaiFileSystem::fileSize(item.path, currentSize) ||
-                !MaiFileSystem::modifiedTime(item.path, modified) || currentSize != item.bytes ||
-                modified != item.modified ||
-                modified > static_cast<std::int64_t>(std::time(nullptr)) - kMinimumAgeSeconds ||
-                MaiFileSystem::removeFile(item.path).hasError()) {
-                ++skipped;
-                continue;
-            }
-            ++removed;
-            bytes += currentSize;
-        }
-        return MaiToolResult::success(Json{
-            {"removed_files", removed},
-            {"reclaimed_bytes", bytes},
-            {"skipped_files", skipped}}.dump());
+    static MaiToolResult failure(const MaiError& error) {
+        return MaiToolResult::failure(error.code(), error.message());
     }
-
-    MaiAppStoragePaths mPaths;
-    std::mutex mMutex;
-    std::string mSessionId;
-    std::string mPreviewId;
-    std::int64_t mCreatedAt = 0;
-    MaiFilePath mTemporaryRoot;
-    MaiFilePath mCacheRoot;
-    std::vector<Candidate> mCandidates;
+    MaiAppStorage mStorage;
 };
-
 }  // namespace
 
 std::unique_ptr<MaiTool> makeMaiAppStorageTool(MaiAppStoragePaths paths) {

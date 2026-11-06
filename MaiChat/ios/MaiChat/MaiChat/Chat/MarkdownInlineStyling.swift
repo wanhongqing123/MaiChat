@@ -14,19 +14,18 @@ enum MarkdownCodeTypography {
 }
 
 enum MarkdownInlineStyling {
-    // 这些颜色用于固定的浅色消息底板，不跟随系统外观变化。
-    // 若加入深色消息底板，须把配色参数纳入 MarkdownRenderCache 的键，或改用动态颜色。
-    static let codeForeground = Color(red: 0.42, green: 0.23, blue: 0.59)
-    static let codeFont = MarkdownCodeTypography.font(size: 13)
+    // 语义解析缓存不存字体；字号在绘制时计算，保证改字号后代码文字也立即生效。
+    static let codeForeground = AppAppearance.code
+    static var codeFont: Font { MarkdownCodeTypography.font(size: AppTypography.uiFont(.detail).pointSize) }
 
-    static func apply(to source: AttributedString) -> AttributedString {
+    static func apply(to source: AttributedString, scale: CGFloat = 1) -> AttributedString {
         var styled = source
         // 写入富文本属性会改变片段边界；修改前先保存字符范围，不能遍历正在变化的片段视图。
         let codeRanges = styled.runs
             .filter { $0.inlinePresentationIntent?.contains(.code) == true }
             .map(\.range)
         for range in codeRanges {
-            styled[range].font = codeFont
+            styled[range].font = MarkdownCodeTypography.font(size: CGFloat(AppTypography.detail.role.points) * scale)
             styled[range].foregroundColor = codeForeground
         }
         return styled

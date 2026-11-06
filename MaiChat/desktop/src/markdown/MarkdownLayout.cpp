@@ -169,7 +169,7 @@ private:
 
     QFont bodyFont() const {
         QFont font;
-        // 两个平台都使用打包的 Windows 字体排版；父控件或系统主题修改应用字体时也保持一致。
+        // 宿主显式提供所选字体；不继承父控件的字重或斜体，保持正文语义一致。
         if (!theme_.bodyFamily.isEmpty()) {
             font.setFamilies({theme_.bodyFamily, QStringLiteral("Noto Sans SC")});
             font.setFamily(theme_.bodyFamily);
@@ -585,7 +585,7 @@ private:
         return font;
     }
 
-    // 标记比正文小一号，直接顶对齐会浮在半空。按**基线**对齐：
+    // 标记和正文使用相同字号，但字重与字体度量可能不同，仍按**基线**对齐：
     // 两段都从各自的行顶往下 ascent 到基线，差多少就把标记往下推多少。
     qreal markerBaselineOffset(bool bullet) const {
         return qMax<qreal>(0, QFontMetricsF(bodyFont()).ascent() -

@@ -17,7 +17,8 @@ typedef enum MaiDownloadStatus {
     MAI_DOWNLOAD_TOO_LARGE = 4,
     MAI_DOWNLOAD_WRITE_ERROR = 5,
     MAI_DOWNLOAD_CANCELED = 6,
-    MAI_DOWNLOAD_EMPTY_BODY = 7
+    MAI_DOWNLOAD_EMPTY_BODY = 7,
+    MAI_DOWNLOAD_SIZE_MISMATCH = 8
 } MaiDownloadStatus;
 
 typedef struct MaiDownloadProxy {
@@ -74,6 +75,14 @@ void mai_download_cancel_destroy(MaiDownloadCancel* cancel);
 void mai_download_file(const MaiDownloadOptions* options,
                        const MaiDownloadCancel* cancel,
                        MaiDownloadResult* result);
+
+// Same transfer implementation, with exact-length verification before commit.
+// Publishes a new file only: an existing destination is never replaced, even
+// if it appears during the transfer. Failure removes only the private temp.
+void mai_download_new_file(const MaiDownloadOptions* options,
+                           uint64_t expected_bytes,
+                           const MaiDownloadCancel* cancel,
+                           MaiDownloadResult* result);
 
 #ifdef __cplusplus
 }

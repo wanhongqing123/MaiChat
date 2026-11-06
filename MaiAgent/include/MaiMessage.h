@@ -142,6 +142,11 @@ struct MaiMessage {
     // 一直是 0，直到 MaiTurnRunner::finish 填上。
     MaiMillis completed = 0;
 
+    // 仅用于用户输入的接收凭据和持久队列，不作为正文或模型协议内容。
+    // requestId 在会话内唯一；pendingInput=true 时仍向界面展示，但不能提前进入模型上下文。
+    std::string inputRequestId;
+    bool pendingInput = false;
+
     bool isInProgress() const;
 
     // 把所有 MaiTextPart 拼起来。reasoning 和 tool 片段**不算**。

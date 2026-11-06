@@ -1,12 +1,14 @@
-// 文件作用：展示账号、隐私和应用设置，并提供用户可执行的设置操作。
-// 展示账号、通知、远程桌面及应用设置入口。
-// 切换账号先退出当前会话，再进入 MaiChat 登录页。
+// 文件作用：组织“我的”、个人资料与账号安全页面，设置和支持能力按任务分组。
+// 只展示真实账号资料，不虚构套餐或积分；退出仍复用先保存、再撤销登录的账号流程。
 import MaiChatCore
 import SwiftUI
 import UIKit
 
 struct SettingsView: View {
     @EnvironmentObject private var appState: RemoteIMAppState
+    @AppStorage(AppPreferenceKey.theme) private var theme = AppTheme.system.rawValue
+    @State private var confirmLogout = false
+    @State private var isLoggingOut = false
 
     var body: some View {
         NavigationStack {
@@ -15,35 +17,95 @@ struct SettingsView: View {
                     NavigationLink {
                         PersonalProfileView()
                     } label: {
-                        HStack(spacing: 18) {
+                        HStack(spacing: 16) {
                             SelfProfileAvatar(size: 64)
                             VStack(alignment: .leading, spacing: 6) {
-                                Text(appState.selfDisplayName())
-                                    .font(.title3.weight(.semibold))
+                                MySettingsText(appState.selfDisplayName())
+                                    .font(AppTypography.conversationTitle)
                                     .foregroundStyle(RemoteIMStyle.textPrimary)
-                                Text(appState.maiChatAccountID)
-                                    .font(.subheadline)
+                                MySettingsText(appState.maiChatAccountID.isEmpty
+                                     ? appState.masterUserID : appState.maiChatAccountID)
+                                    .font(AppTypography.detail)
                                     .foregroundStyle(RemoteIMStyle.textSecondary)
                                 SelfConnectionStatus(state: appState.connectionState)
                             }
                             .lineLimit(1)
                         }
-                        .padding(.vertical, 16)
+                        .padding(.vertical, 14)
                     }
                     .accessibilityIdentifier("personal-profile-entry")
                 }
                 Section {
                     NavigationLink {
-                        AccountSettingsView().navigationTitle("设置")
+                        AppThemeSettingsView()
                     } label: {
-                        Label("设置", systemImage: "gearshape")
+                        MySettingsRow("主题色", systemImage: "circle.lefthalf.filled",
+                                      value: (AppTheme(rawValue: theme) ?? .system).title)
                     }
+                    .accessibilityIdentifier("my-theme-entry")
+                    NavigationLink {
+                        AppPreferencesView()
+                    } label: {
+                        MySettingsRow("偏好设置", systemImage: "slider.horizontal.3")
+                    }
+                    .accessibilityIdentifier("my-preferences-entry")
+                    NavigationLink {
+                        AppStorageSettingsView()
+                    } label: {
+                        MySettingsRow("存储空间", systemImage: "internaldrive")
+                    }
+                    .accessibilityIdentifier("my-storage-entry")
+                }
+                Section {
+                    NavigationLink {
+                        AccountSettingsView()
+                    } label: {
+                        MySettingsRow("账号与安全", systemImage: "lock.shield")
+                    }
+                    .accessibilityIdentifier("my-account-entry")
+                }
+                Section {
+                    NavigationLink {
+                        AppAboutView()
+                    } label: {
+                        MySettingsRow("关于 MaiChat", systemImage: "info.circle")
+                    }
+                    .accessibilityIdentifier("my-about-entry")
+                    MySettingsRow("版本信息", systemImage: "app.badge", value: AppVersion.display)
+                        .accessibilityIdentifier("my-version")
+                }
+                Section {
+                    Button(role: .destructive) { confirmLogout = true } label: {
+                        HStack {
+                            Spacer()
+                            if isLoggingOut { ProgressView() }
+                            MySettingsText(isLoggingOut ? "正在退出…" : "退出登录").font(AppTypography.body)
+                            Spacer()
+                        }
+                    }
+                    .disabled(isLoggingOut)
+                    .accessibilityIdentifier("my-logout")
                 }
             }
             .listStyle(.insetGrouped)
-            .navigationTitle("我")
+        .font(AppTypography.body)
+            .appNavigationTitle("我的")
             .navigationBarTitleDisplayMode(.inline)
             .remoteIMNavigationBarMaterial()
+            .confirmationDialog("退出当前账号？", isPresented: $confirmLogout,
+                                titleVisibility: .visible) {
+                Button("退出登录", role: .destructive) {
+                    isLoggingOut = true
+                    Task { @MainActor in
+                        _ = await appState.switchPhoneAccount()
+                        isLoggingOut = false
+                    }
+                }
+                .accessibilityIdentifier("my-logout-confirm")
+                Button("取消", role: .cancel) {}
+            } message: {
+                MySettingsText("当前消息和设置会先保存到本机。退出后可在登录页切换账号；这不会注销账号。")
+            }
         }
     }
 }
@@ -54,8 +116,8 @@ private struct SelfConnectionStatus: View {
     var body: some View {
         HStack(spacing: 6) {
             Circle().fill(color).frame(width: 8, height: 8)
-            Text("消息\(state.rawValue)")
-                .font(.caption)
+            MySettingsText("消息\(state.rawValue)")
+                .font(AppTypography.metadata)
                 .foregroundStyle(RemoteIMStyle.textSecondary)
         }
         .accessibilityElement(children: .ignore)
@@ -102,12 +164,12 @@ private struct PersonalProfileView: View {
                     isChoosingAvatar = true
                 } label: {
                     HStack {
-                        Text("头像").foregroundStyle(RemoteIMStyle.textPrimary)
+                        MySettingsText("头像").foregroundStyle(RemoteIMStyle.textPrimary)
                         Spacer()
                         if isSaving { ProgressView() }
                         SelfProfileAvatar(size: 48)
                         Image(systemName: "chevron.right")
-                            .font(.footnote.weight(.semibold))
+                            .font(AppTypography.detail.weight(.semibold))
                             .foregroundStyle(RemoteIMStyle.textSecondary)
                     }
                     .padding(.vertical, 4)
@@ -129,7 +191,7 @@ private struct PersonalProfileView: View {
             }
         }
         .listStyle(.plain)
-        .navigationTitle("个人资料")
+        .appNavigationTitle("个人资料")
         .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $isChoosingAvatar) {
             AvatarPhotoPicker { image in
@@ -164,13 +226,13 @@ private struct AccountNicknameView: View {
                 TextField("昵称", text: $nickname)
                     .accessibilityIdentifier("account-nickname-input")
             } footer: {
-                Text("最多 32 个字符；留空后显示 MaiChat ID。")
+                MySettingsText("最多 32 个字符；留空后显示 MaiChat ID。")
             }
             if let errorMessage {
-                Text(errorMessage).foregroundStyle(.red)
+                MySettingsText(errorMessage).foregroundStyle(.red)
             }
         }
-        .navigationTitle("修改昵称")
+        .appNavigationTitle("修改昵称")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("保存") { saveNickname() }
@@ -234,26 +296,14 @@ private struct AvatarPhotoPicker: UIViewControllerRepresentable {
 
 private struct AccountSettingsView: View {
     @EnvironmentObject private var appState: RemoteIMAppState
-    @State private var isSwitchingPhone = false
-    @AppStorage(SpeechRecognitionProvider.defaultsKey) private var speechProvider =
-        SpeechRecognitionProvider.tencent.rawValue
 
     var body: some View {
         Form {
-            Section("账号") {
+            MySettingsSection("账号") {
                 LabeledContent("登录账号") {
-                    Text(displayUserID)
+                    MySettingsText(displayUserID)
                         .foregroundStyle(appState.maiChatAccountID.isEmpty ? .secondary : .primary)
                 }
-                Button("切换账号") {
-                    guard !isSwitchingPhone else { return }
-                    isSwitchingPhone = true
-                    Task { @MainActor in
-                        _ = await appState.switchPhoneAccount()
-                        isSwitchingPhone = false
-                    }
-                }
-                .disabled(isSwitchingPhone)
                 if appState.hasUnifiedAccount {
                     NavigationLink("设置或修改登录密码") {
                         AccountPasswordView()
@@ -261,33 +311,23 @@ private struct AccountSettingsView: View {
                     NavigationLink {
                         AccountDeletionView()
                     } label: {
-                        Text("注销账号").foregroundStyle(.red)
+                        MySettingsText("注销账号").foregroundStyle(.red)
                     }
                     .accessibilityIdentifier("account-deletion-entry")
                 }
             }
 
-            Section("语音") {
-                Picker("语音识别服务", selection: $speechProvider) {
-                    ForEach(SpeechRecognitionProvider.allCases, id: \.rawValue) { provider in
-                        Text(provider.title).tag(provider.rawValue)
-                    }
-                }
-                .accessibilityIdentifier("speech-recognition-provider")
-            }
-
-            Section("隐私与支持") {
+            MySettingsSection("接入与安全") {
                 NavigationLink("短信接入") {
                     AIMobileSMSSettingsView(ownerID: appState.masterUserID)
                 }
                 .accessibilityIdentifier("sms-integration-entry")
-                Link("隐私政策", destination: URL(string: "https://ichat.life/legal/privacy.html")!)
-                Link("用户协议", destination: URL(string: "https://ichat.life/legal/terms.html")!)
-                Link("联系我们", destination: URL(string: "mailto:1925271463@kongshang.com")!)
                 NavigationLink("我的举报") { SafetyReportsView() }
             }
 
         }
+        .appNavigationTitle("账号与安全")
+        .navigationBarTitleDisplayMode(.inline)
     }
 
     private var displayUserID: String {
@@ -313,20 +353,20 @@ private struct AccountDeletionView: View {
     var body: some View {
         Form {
             Section {
-                Text("提交后立即停用 MaiChat 账号并撤销账号登录。好友关系、云端会话和可识别素材会进入清理流程；依法必须保留的记录按期限处理。")
-                    .font(.footnote)
+                MySettingsText("提交后立即停用 MaiChat 账号并撤销账号登录。好友关系、云端会话和可识别素材会进入清理流程；依法必须保留的记录按期限处理。")
+                    .font(AppTypography.detail)
                 if let options {
-                    Text("预计在 \(options.processingDays) 天内完成。完成后不能恢复账号及资料。")
-                        .font(.footnote)
+                    MySettingsText("预计在 \(options.processingDays) 天内完成。完成后不能恢复账号及资料。")
+                        .font(AppTypography.detail)
                 }
             }
-            Section("确认身份") {
+            MySettingsSection("确认身份") {
                 if options == nil { ProgressView() }
                 if let options {
                     if options.hasPassword && options.phoneMasked != nil {
                         Picker("确认方式", selection: $usePassword) {
-                            Text("登录密码").tag(true)
-                            Text("短信验证码").tag(false)
+                            MySettingsText("登录密码").tag(true)
+                            MySettingsText("短信验证码").tag(false)
                         }
                         .pickerStyle(.segmented)
                     }
@@ -347,8 +387,8 @@ private struct AccountDeletionView: View {
                     }
                 }
             }
-            Section("确认 MaiChat ID") {
-                Text(appState.maiChatAccountID)
+            MySettingsSection("确认 MaiChat ID") {
+                MySettingsText(appState.maiChatAccountID)
                     .textSelection(.enabled)
                     .accessibilityIdentifier("account-deletion-current-id")
                 TextField("输入上方 MaiChat ID", text: $accountID)
@@ -356,7 +396,7 @@ private struct AccountDeletionView: View {
                     .autocorrectionDisabled()
                     .accessibilityIdentifier("account-deletion-confirm-id")
             }
-            if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
+            if let errorMessage { MySettingsText(errorMessage).foregroundStyle(.red) }
             Section {
                 Button("提交注销申请", role: .destructive) {
                     showConfirmation = true
@@ -365,13 +405,13 @@ private struct AccountDeletionView: View {
                 .accessibilityIdentifier("account-deletion-submit")
             }
         }
-        .navigationTitle("注销账号")
+        .appNavigationTitle("注销账号")
         .task { await loadOptions() }
         .confirmationDialog("确认永久注销这个账号？", isPresented: $showConfirmation) {
             Button("确认提交", role: .destructive) { Task { await submit() } }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("提交后立即停止账号使用，并开始清理关联数据。")
+            MySettingsText("提交后立即停止账号使用，并开始清理关联数据。")
         }
     }
 
@@ -432,19 +472,19 @@ private struct SafetyReportsView: View {
             }
             ForEach(reports) { report in
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(report.status == "resolved" ? "已处理" : "处理中")
-                        .font(.headline)
-                    Text(report.resolution ?? "我们会尽快核查并处理。")
-                        .font(.subheadline)
+                    MySettingsText(report.status == "resolved" ? "已处理" : "处理中")
+                        .font(AppTypography.heading)
+                    MySettingsText(report.resolution ?? "我们会尽快核查并处理。")
+                        .font(AppTypography.detail)
                         .foregroundStyle(.secondary)
-                    Text("编号：\(report.id)")
-                        .font(.caption.monospaced())
+                    MySettingsText("编号：\(report.id)")
+                        .font(AppTypography.metadata.monospaced())
                         .foregroundStyle(.secondary)
                 }
             }
-            if let errorMessage { Text(errorMessage).foregroundStyle(.red) }
+            if let errorMessage { MySettingsText(errorMessage).foregroundStyle(.red) }
         }
-        .navigationTitle("我的举报")
+        .appNavigationTitle("我的举报")
         .task { await refresh() }
         .refreshable { await refresh() }
     }
@@ -587,10 +627,10 @@ struct AccountPasswordView: View {
                     .disabled(isSaving)
                     .accessibilityIdentifier("account-password-confirm")
             } footer: {
-                Text("密码须为 15–128 个字符；修改前须在最近 10 分钟内登录。保存后其他设备需重新登录，当前设备保持登录。")
+                MySettingsText("密码须为 15–128 个字符；修改前须在最近 10 分钟内登录。保存后其他设备需重新登录，当前设备保持登录。")
             }
             if let message {
-                Text(message).foregroundStyle(.secondary)
+                MySettingsText(message).foregroundStyle(.secondary)
             }
             Button(isSaving ? "保存中…" : "保存密码") {
                 Task { await save() }
@@ -598,7 +638,7 @@ struct AccountPasswordView: View {
             .disabled(isSaving || !isValid)
             .accessibilityIdentifier("account-password-save")
         }
-        .navigationTitle("登录密码")
+        .appNavigationTitle("登录密码")
         // 短安全表单使用原生行内标题，避免大标题滚入半透明导航背景后变得过淡。
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(isSaving)

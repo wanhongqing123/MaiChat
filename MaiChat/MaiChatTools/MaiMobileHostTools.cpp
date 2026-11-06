@@ -2,7 +2,7 @@
 // 调用边界：由 MaiChat 媒体或 Agent 宿主调用；平台资源在停止或失败时须正确释放。
 #include "MaiMobileHostTools.h"
 #include "MaiChangePasswordTool.h"
-#include "MaiPortraitBridge.h"
+#include "MaiPortraitHostTools.h"
 #include "MaiAccountTools.h"
 
 #include <cstdlib>
@@ -19,8 +19,8 @@
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
-#if defined(MAICHAT_MOBILE_IOS)
 #include "MaiPathGuard.h"
+#if defined(MAICHAT_MOBILE_IOS)
 #include "MaiScreenFrameArchive.h"
 #endif
 
@@ -581,20 +581,24 @@ public:
     bool requiresPerCallApproval(const std::string&) const override { return mApproval; }
     MaiToolResult execute(const std::string& argumentsJson,
                           const MaiToolContext& context) override {
-        if (mName == "mobile_beautify_image" || mName == "mobile_reshape_body") {
-            if (context.isCanceled())
-                return MaiToolResult::failure(MaiErrorCode::Canceled, "Portrait edit was canceled");
-            const char* operation = mName == "mobile_beautify_image" ? "beautify" : "reshape_body";
-            char* invalid = maiPortraitValidateArguments(operation, argumentsJson.c_str(), 0);
-            if (invalid) {
-                const std::string detail(invalid);
-                maiPortraitFree(invalid);
-                return MaiToolResult::failure(MaiErrorCode::InvalidInput, detail);
+        // 相册导出的 id 与工作区路径属于不同参数域；只在文件确实位于本工作区时拒绝。
+        // 不扫描目录、不探测越界文件，也不替模型自动选择或执行另一个工具。
+        if ((mName == "mobile_export_photo_original" || mName == "mobile_export_media_original") &&
+            !context.root.empty()) {
+            const Json request = Json::parse(argumentsJson, nullptr, false);
+            if (request.is_object() && request.value("id", Json{}).is_string()) {
+                const std::string path =
+                    maiResolvePathWithinRoot(context.root, request["id"].get<std::string>());
+                MaiRegularFileInfo file;
+                if (!path.empty() &&
+                    MaiFileSystem::regularFileInfo(MaiFilePath::fromUtf8(path), file))
+                    return MaiToolResult::failure(
+                        MaiErrorCode::InvalidInput,
+                        "id identifies an existing workspace file, not a photo-library asset ID. "
+                        "Pass the same exact path directly to mobile_beautify_image or the "
+                        "appropriate workspace image/video operation. No photo-library export "
+                        "or library permission is needed for that file.");
             }
-            auto request = Json::parse(argumentsJson);
-            if (!context.root.empty()) request["workspace_path"] = context.root;
-            if (!context.sessionId.empty()) request["session_id"] = context.sessionId;
-            return mDispatcher->call(mName, request.dump());
         }
         return mDispatcher->call(mName, argumentsJson);
     }
@@ -1363,10 +1367,13 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         dispatcher, false));
     tools.add(std::make_unique<MaiMobileHostTool>(
         "mobile_export_photo_original",
-        // 编辑或给视频模型提交首帧时导出原件；Live Photo 可明确选择静图或配对视频。
-        "Copy the original photo or video bytes by ID from the authorized system library into "
-        "the Agent working directory, preserving the source format and color metadata. Use this "
-        "for any image edit or media conversion. The library item stays unchanged. For an iOS Live Photo, "
+        // 仅相册素材需要先导出；id 必须来自相册查询，已有工作区路径直接交给处理工具。
+        // Live Photo 可明确选择静图或配对视频，原相册项目不改动。
+        "Export original photo or video bytes from the authorized system photo library. "
+        "id must be a library asset identifier returned by mobile_list_photos, never a filename "
+        "or workspace path. Already imported or captured workspace files go directly to image "
+        "processing tools without another export. Preserve source format and color metadata. "
+        "The library item stays unchanged. For an iOS Live Photo, "
         "component=video exports its paired video; otherwise its still photo is exported.",
         // id 是相册项目 ID；Live Photo 的 component=video 取配对视频，省略取静图。
         R"({"type":"object","properties":{"id":{"type":"string"},"component":{"type":"string","enum":["photo","video"])"
@@ -1374,9 +1381,11 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         dispatcher, false));
     tools.add(std::make_unique<MaiMobileHostTool>(
         "mobile_export_media_original",
+        // 与图片导出相同：只接受相册 ID，不能把工作区文件名当作相册素材再次导出。
         "Export the original photo or video file from the authorized system library into the "
-        "Agent workspace, preserving its media format. Use this for videos before ffprobe, "
-        "ffmpeg, or playback. A Live Photo exports its still image unless component=video.",
+        "Agent workspace, preserving its media format. id must come from mobile_list_photos; "
+        "it is not a filename or workspace path. Use existing workspace files directly with "
+        "ffprobe, ffmpeg, or playback. A Live Photo exports its still image unless component=video.",
         // 与原图导出共用素材 ID/Live Photo component 约定；视频分析应选原始视频。
         R"({"type":"object","properties":{"id":{"type":"string"},"component":{"type":"string","enum":["photo","video"])"
             R"(}},"required":["id"]})",
@@ -1407,8 +1416,9 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
         "(degrees 90/180/270 clockwise), resize (width,height), flip_horizontal, flip_vertical, "
         "grayscale, sharpen (amount 0..2), adjust (brightness -1..1, contrast 0..2, "
         "saturation 0..2), or beautify "
-        "(strength 0..1, local face-aware skin processing using the same portrait engine as "
-        "mobile_beautify_image). Deliver the returned path with agent_send_media "
+        "(strength 0..1, smoothing and brightening using the same skin engine as "
+        "mobile_beautify_image; use that dedicated tool for independent whitening). "
+        "Deliver the returned path with agent_send_media "
         "(file_path=path, type=image) in the current AI conversation. Do not open a full-screen "
         "preview automatically; the user can tap the chat image to inspect it. Use "
         "mobile_preview_image only when explicitly requested, and mobile_save_image to add "
@@ -1422,70 +1432,17 @@ void registerMobilePhotoTools(MaiToolRegistry& tools,
             R"("saturation":{"type":"number"},"strength":{"type":"number"},"amount":{"type":"number"}},)"
             R"("required":["path","operation"]})",
         dispatcher, false));
-    tools.add(std::make_unique<MaiMobileHostTool>(
-        "mobile_beautify_image",
-        "Create a NEW locally retouched portrait using dense face landmarks and a skin mask. "
-        "Smoothing, brightening, whitening, warmth, slimming and eye enlargement are independent. "
-        "whitening (default 0) lifts skin lightness and gently reduces skin chroma without an intentional "
-        "cool color shift; it affects the selected face skin, excluding eyes, brows and lips, not the entire image. "
-        "brightening is RGB gain, not whitening. For whitening-only use explicit smoothing=0, "
-        "brightening=0 and warmth=0; strength only controls smoothing and brightening. "
-        "Use original_path from prior results when refining; prior generated paths are also "
-        "resolved to their original. Explicit parameters override the validated personal model. "
-        "Unspecified shape changes default to zero. For multiple faces set subject_index "
-        "from left to right starting at 0. Return result_id for user feedback and deliver the "
-        "returned path with agent_send_media (file_path=path, type=image) in this AI conversation. "
-        "Do not open a full-screen preview automatically; the user can tap the chat image. "
-        "Use mobile_preview_image only when explicitly requested. The iOS host automatically processes a bounded face ROI "
-        "and composites it at the original dimensions; returned mask is diagnostic, not another blend alpha. "
-        "Use skin ROI L*/C* and reported mask coverage, not full-image threshold fractions, to assess changes. "
-        "Unknown fields including action/delegate are rejected. Never infer user preference from your own judgment.",
-        // 所有处理复用普通 C++ 核心；单独的几何参数默认关闭，strength 保留为旧调用映射。
-        R"({"type":"object","properties":{"path":{"type":"string"},"strength":{"type":"number","minimum":0,"maximum":1},)"
-        R"("smoothing":{"type":"number","minimum":0,"maximum":1},"brightening":{"type":"number","minimum":0,"maximum":1},)"
-        R"("whitening":{"type":"number","minimum":0,"maximum":1,"default":0,"description":"Independent skin lightness lift and gentle chroma reduction; not a warmth adjustment."},)"
-        R"("warmth":{"type":"number","minimum":-1,"maximum":1},"slim_face":{"type":"number","minimum":0,"maximum":1},)"
-        R"("enlarge_eyes":{"type":"number","minimum":0,"maximum":1},"subject_index":{"type":"integer","minimum":0},)"
-        R"("use_personal_model":{"type":"boolean"}},"required":["path"],"additionalProperties":false})",
-        dispatcher, false));
-    tools.add(std::make_unique<MaiMobileHostTool>(
-        "mobile_reshape_body",
-        "Create a NEW locally reshaped photo using body pose and person segmentation. "
-        "Supports mild waist slimming and leg proportion extension on clear upright standing "
-        "photos. Occluded joints, uncertain poses or no room below the feet return an error. "
-        "slim_waist and leg_length are bounded normalized strengths, not literal percentages. "
-        "For multiple people specify subject_index from left to right starting at 0. "
-        "Keep the original and deliver the new path with agent_send_media (file_path=path, "
-        "type=image) in this AI conversation. Do not open a full-screen preview automatically; "
-        "the user can tap the chat image. Use mobile_preview_image only when explicitly "
-        "requested, and use result_id for explicit user feedback.",
-        R"({"type":"object","properties":{"path":{"type":"string"},"slim_waist":{"type":"number","minimum":0,"maximum":1},)"
-        R"("leg_length":{"type":"number","minimum":0,"maximum":1},"subject_index":{"type":"integer","minimum":0},)"
-        R"("use_personal_model":{"type":"boolean"}},"required":["path"],"additionalProperties":false})",
-        dispatcher, false));
-    tools.add(std::make_unique<MaiMobileHostTool>(
-        "mobile_portrait_feedback",
-        "Record the user's explicit preference between two portrait results from the SAME "
-        "original photo. Use returned result_id values. Include ONLY the attributes the user "
-        "actually evaluated; unmentioned attributes remain unknown. This stores feedback, "
-        "not model training. Use model_continue_training afterward when requested.",
-        R"({"type":"object","properties":{"preferred_result_id":{"type":"string"},"rejected_result_id":{"type":"string"},)"
-        R"("attributes":{"type":"array","minItems":1,"maxItems":8,"uniqueItems":true,"items":{"type":"string",)"
-        R"("enum":["smoothing","brightening","warmth","slim_face","enlarge_eyes","slim_waist","leg_length","whitening"]}}},)"
-        R"("required":["preferred_result_id","rejected_result_id","attributes"],"additionalProperties":false})",
-        dispatcher, false));
-    tools.add(std::make_unique<MaiMobileHostTool>(
-        "model_continue_training",
-        "Train or inspect the CURRENT user's local portrait preference model using saved "
-        "explicit result-pair feedback. This updates small ranking weights; it does not train "
-        "MediaPipe base networks or implement album semantic search. train saves a checkpoint. "
-        "Fewer than three independent original photos produce candidate_only, not an activated "
-        "model. Activation requires held-out-photo validation improvement. status/versions "
-        "show active and saved versions. rollback with version=0 restores the baseline. "
-        "Report the actual returned activation and validation status to the user.",
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["train","status","versions","rollback"]},)"
-        R"("version":{"type":"integer","minimum":0}},"required":["action"],"additionalProperties":false})",
-        dispatcher, false));
+    // 四个人像工具只保留一份 schema；移动调度器只补可信的当前会话字段。
+    registerMaiPortraitHostTools(tools, [dispatcher](const std::string& name,
+        const std::string& arguments, const MaiToolContext& context) {
+        if (name == "mobile_beautify_image" || name == "mobile_reshape_body") {
+            auto request = Json::parse(arguments);
+            if (!context.root.empty()) request["workspace_path"] = context.root;
+            if (!context.sessionId.empty()) request["session_id"] = context.sessionId;
+            return callMaiMobileHostTool(dispatcher, name, request.dump());
+        }
+        return callMaiMobileHostTool(dispatcher, name, arguments);
+    });
     tools.add(std::make_unique<MaiMobileHostTool>(
         "mobile_detect_faces",
         "Find faces and facial landmarks in an image from the Agent working directory using "

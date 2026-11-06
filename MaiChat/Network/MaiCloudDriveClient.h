@@ -25,6 +25,8 @@ typedef enum MaiCloudDriveAction {
     MAI_CLOUD_DRIVE_DELETE_FOLDER = 10,
     MAI_CLOUD_DRIVE_MOVE_MEDIA = 11,
     MAI_CLOUD_DRIVE_RENAME_MEDIA = 12,
+    MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA = 13,
+    MAI_CLOUD_DRIVE_SEARCH_MEDIA = 14,
     // The account API retains its /videos transport path and video_id field.
     // These names also cover images without changing existing callers.
     MAI_CLOUD_DRIVE_LIST_MEDIA = MAI_CLOUD_DRIVE_LIST_VIDEOS,
@@ -155,6 +157,25 @@ void mai_cloud_drive_cancel_destroy(MaiCloudDriveCancel* cancel);
 // RENAME_MEDIA accepts {"media_id":...,"name":"new-name.ext"}; it updates only
 // the display name. The account service requires the existing extension to be
 // preserved (case-insensitive) and leaves content, placement and quota intact.
+// DOWNLOAD_MEDIA accepts {"media_id":"uuid","output_path":"absolute path"}.
+// It obtains an account-private read link internally and downloads directly
+// from storage using the ordinary shared downloader. The parent must exist;
+// exact size is checked before publishing, and an existing file is never
+// replaced. Returns only downloaded, media_id, path, size_bytes, media_type
+// and content_type; never a token or signed URL. Not a Session-space action.
+// SEARCH_MEDIA accepts {"query":"filename keyword"} plus optional exact_name
+// (boolean), media_type (image/video), folder_id and before (LIST_MEDIA cursor).
+// It searches private metadata without reading media bytes or needing a new
+// server endpoint. English ASCII matching is case-insensitive; other UTF-8
+// text matches literally. Folder selection has LIST_MEDIA's direct-file scope.
+// Returns matches with media_id, name, folder_id, folder_path/cloud_path (null when
+// unavailable, too deep or too long), size_bytes, media_type,
+// content_type and created_at (Unix milliseconds). Each call scans at most
+// 20 source pages within a bounded time and returns fewer than 100 candidates.
+// has_more/next_cursor explicitly indicate remaining pages: an empty partial
+// batch is not proof that no file matches. No signed links enter this result.
+// cloud_path is a logical cloud location, not a local file to pass to file tools;
+// DOWNLOAD_MEDIA's path becomes the local file only after a complete download.
 // The remaining media actions need
 // {"video_id":"uuid"}. THUMBNAIL_LINK returns a short-lived signed HTTPS
 // thumbnail_url. ABORT_UPLOAD discards an unfinished upload session;

@@ -48,7 +48,7 @@ target_include_directories(mai_cloud_drive_client PUBLIC "${CMAKE_CURRENT_SOURCE
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/openssl/include"
           ${MAI_OPENSSL_INCLUDE_DIR})
-target_link_libraries(mai_cloud_drive_client PUBLIC CURL::libcurl
+target_link_libraries(mai_cloud_drive_client PUBLIC CURL::libcurl mai_curl_download
   ${MAI_OPENSSL_CRYPTO_TARGET})
 set_target_properties(mai_cloud_drive_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

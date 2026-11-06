@@ -28,15 +28,18 @@ public final class MarkdownRenderer {
     private static volatile Markwon markwon;
     private static volatile Typeface codeFace;
     private static float density, scaledDensity;
+    private static boolean dark;
+    private static String fontFamily = "";
+    private static int generation;
     static final class Presentation {
         final String text; final Long timestamp;
         Presentation(String text, Long timestamp) { this.text = text; this.timestamp = timestamp; }
     }
     private static String cacheKey(String text, Long timestamp) {
-        if (timestamp == null) return "text:" + source(text);
+        if (timestamp == null) return generation + ":text:" + source(text);
         long now = System.currentTimeMillis();
         long day = (now + java.util.TimeZone.getDefault().getOffset(now)) / 86400000;
-        return "date:" + timestamp + ":" + day + "\0" + source(text);
+        return generation + ":date:" + timestamp + ":" + day + "\0" + source(text);
     }
     private static final LruCache<String, Spanned> cache = new LruCache<String, Spanned>(2 * 1024 * 1024) {
         @Override
@@ -56,29 +59,37 @@ public final class MarkdownRenderer {
     }
     public static synchronized void initialize(Context context) {
         float nextDensity = context.getResources().getDisplayMetrics().density;
-        float nextScale = context.getResources().getDisplayMetrics().scaledDensity;
-        if (markwon != null && density == nextDensity && scaledDensity == nextScale) return;
-        density = nextDensity; scaledDensity = nextScale; cache.evictAll();
+        float nextScale = nextDensity * context.getResources().getConfiguration().fontScale;
+        if (markwon != null && density == nextDensity && scaledDensity == nextScale && dark == MaiChatTheme.isDark() && fontFamily.equals(MaiChatTypography.familyId())) return;
+        density = nextDensity; scaledDensity = nextScale; dark = MaiChatTheme.isDark(); fontFamily = MaiChatTypography.familyId(); ++generation; cache.evictAll();
         Typeface fixedCode = codeTypeface(context);
         markwon = Markwon.builder(context.getApplicationContext())
             .usePlugin(new io.noties.markwon.AbstractMarkwonPlugin() {
+                @Override public void configureVisitor(io.noties.markwon.MarkwonVisitor.Builder builder) {
+                    // 只处理 CommonMark 的真实 HTML 节点，代码、转义和链接地址仍保留原意。
+                    // 不启用整个 HTML 插件，避免其它标签改变聊天排版或请求外部资源。
+                    builder.on(org.commonmark.node.HtmlInline.class, (visitor, node) -> {
+                        String literal = node.getLiteral();
+                        visitor.builder().append(literal.matches("(?i)<br[ \\t]*/?>") ? "\n" : literal);
+                    });
+                }
                 @Override public void configureTheme(io.noties.markwon.core.MarkwonTheme.Builder theme) {
-                    theme.linkColor(MaiChatTheme.BLUE)
+                    theme.linkColor(dark ? MaiChatTypographyTokens.LINK_DARK_COLOR : MaiChatTypographyTokens.LINK_COLOR)
                             .isLinkUnderlined(false)
                             .listItemColor(MaiChatTheme.BLUE)
                             .blockMargin(Math.round(24 * density))
                             .bulletWidth(Math.round(3 * density))
                             .headingTypeface(MaiChatTypography.semibold())
                             .headingBreakHeight(0)
-                            .headingTextSizeMultipliers(new float[] {22f / 14, 18f / 14, 16f / 14, 1, 1, 1})
+                            .headingTextSizeMultipliers(new float[] {MaiChatTypographyTokens.headingRatio(1), MaiChatTypographyTokens.headingRatio(2), MaiChatTypographyTokens.headingRatio(3), 1, 1, 1})
                             .codeTypeface(fixedCode)
-                            .codeTextSize(Math.round(13 * scaledDensity))
-                            .codeTextColor(MaiChatTypography.CODE_COLOR)
-                            .codeBackgroundColor(MaiChatTypography.CODE_BACKGROUND)
+                            .codeTextSize(Math.round(MaiChatTypographyTokens.Role.DETAIL.points * scaledDensity))
+                            .codeTextColor(dark ? MaiChatTypographyTokens.CODE_DARK_COLOR : MaiChatTypographyTokens.CODE_COLOR)
+                            .codeBackgroundColor(dark ? MaiChatTypographyTokens.INLINECODEBACKGROUND_DARK_COLOR : MaiChatTypographyTokens.INLINECODEBACKGROUND_COLOR)
                             .codeBlockTypeface(fixedCode)
-                            .codeBlockTextSize(Math.round(12 * scaledDensity))
+                            .codeBlockTextSize(Math.round(MaiChatTypographyTokens.Role.DETAIL.points * scaledDensity))
                             .codeBlockTextColor(MaiChatTheme.TEXT)
-                            .codeBlockBackgroundColor(android.graphics.Color.rgb(244, 246, 249))
+                            .codeBlockBackgroundColor(dark ? MaiChatTypographyTokens.CODEBACKGROUND_DARK_COLOR : MaiChatTypographyTokens.CODEBACKGROUND_COLOR)
                             .codeBlockMargin(Math.round(12 * density))
                             .blockQuoteColor(MaiChatTheme.BLUE)
                             .blockQuoteWidth(Math.round(3 * density))
@@ -89,7 +100,7 @@ public final class MarkdownRenderer {
                             (configuration, props)
                                     -> new android.text.style.ForegroundColorSpan(
                                             io.noties.markwon.core.CoreProps.HEADING_LEVEL.require(props) <= 2
-                                                    ? MaiChatTypography.HEADING_COLOR
+                                                    ? (dark ? MaiChatTypographyTokens.HEADING_DARK_COLOR : MaiChatTypographyTokens.HEADING_COLOR)
                                                     : MaiChatTheme.TEXT));
                     io.noties.markwon.SpanFactory fallback = builder.requireFactory(org.commonmark.node.ListItem.class);
                     builder.setFactory(org.commonmark.node.ListItem.class, (configuration, props) -> {
@@ -102,7 +113,12 @@ public final class MarkdownRenderer {
                     });
                 }
             })
-            .usePlugin(TablePlugin.create(context.getApplicationContext()))
+            .usePlugin(TablePlugin.create(builder -> builder
+                .tableCellPadding(Math.round(MaiChatTypographyTokens.Role.BODY.points * MaiChatTypographyTokens.TABLEPADDINGH_RATIO * scaledDensity))
+                .tableBorderColor(MaiChatTheme.BORDER).tableBorderWidth(Math.max(1, Math.round(density)))
+                .tableHeaderRowBackgroundColor(dark ? MaiChatTypographyTokens.TABLEHEADER_DARK_COLOR : MaiChatTypographyTokens.TABLEHEADER_COLOR)
+                .tableOddRowBackgroundColor(MaiChatTheme.PANEL)
+                .tableEvenRowBackgroundColor(dark ? MaiChatTypographyTokens.TABLEALTERNATE_DARK_COLOR : MaiChatTypographyTokens.TABLEALTERNATE_COLOR)))
             .usePlugin(StrikethroughPlugin.create())
             .usePlugin(TaskListPlugin.create(context.getApplicationContext()))
             .usePlugin(LinkifyPlugin.create())
@@ -132,7 +148,7 @@ public final class MarkdownRenderer {
                         Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                 styled.setSpan(new android.text.style.BackgroundColorSpan(MaiChatTheme.BLUE_SOFT), note.start(),
                         note.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                styled.setSpan(new android.text.style.AbsoluteSizeSpan(Math.round(12 * scaledDensity)), note.start(),
+                styled.setSpan(new android.text.style.AbsoluteSizeSpan(Math.round(MaiChatTypographyTokens.Role.METADATA.points * scaledDensity)), note.start(),
                         note.end(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                 styled.setSpan(new MaiChatTypography.SemiboldSpan(), note.start(), note.end(),
                         Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
@@ -143,7 +159,7 @@ public final class MarkdownRenderer {
                 int start = styled.length(); styled.append("  · ").append(RemoteIMTimestampFormatter.format(timestamp));
                 styled.setSpan(new android.text.style.ForegroundColorSpan(MaiChatTheme.BLUE), start, styled.length(),
                         Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                styled.setSpan(new android.text.style.AbsoluteSizeSpan(Math.round(11 * scaledDensity)), start,
+                styled.setSpan(new android.text.style.AbsoluteSizeSpan(Math.round(MaiChatTypographyTokens.Role.METADATA.points * scaledDensity)), start,
                         styled.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                 styled.setSpan(
                         new MaiChatTypography.SemiboldSpan(), start, styled.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
@@ -185,6 +201,7 @@ public final class MarkdownRenderer {
     static void bindStreaming(TextView view, String value) { bind(view, value, null, true); }
     static void bind(TextView view, String value, Long timestamp) { bind(view, value, timestamp, false); }
     private static void bind(TextView view, String value, Long timestamp, boolean retainPrevious) {
+        initialize(view.getContext());
         String key = cacheKey(value, timestamp);
         Object token = new Object(); view.setTag(token);
         Spanned ready = cache.get(key);

@@ -57,7 +57,7 @@ final class AIAssistantActionMenu extends LinearLayout {
         // background here would hide its frost and make expanded groups look like flat blocks.
         setContentDescription("创作中心操作菜单");
 
-        modelValue = text("", 11, SECONDARY);
+        modelValue = text("", MaiChatTypographyTokens.Role.METADATA, SECONDARY);
         modelChevron = icon(R.drawable.ic_ai_menu_chevron, PRIMARY);
         modelHeading = heading("主模型", R.drawable.ic_ai_menu_cpu, modelValue, modelChevron,
             ignored -> toggle(MODEL_SECTION));
@@ -67,7 +67,7 @@ final class AIAssistantActionMenu extends LinearLayout {
         addView(modelGroup, match(LayoutParams.WRAP_CONTENT));
         addDivider();
 
-        effortValue = text("", 11, SECONDARY);
+        effortValue = text("", MaiChatTypographyTokens.Role.METADATA, SECONDARY);
         effortChevron = icon(R.drawable.ic_ai_menu_chevron, PRIMARY);
         effortHeading = heading("思考强度", R.drawable.ic_ai_menu_sparkles, effortValue, effortChevron,
             ignored -> toggle(EFFORT_SECTION));
@@ -77,14 +77,14 @@ final class AIAssistantActionMenu extends LinearLayout {
         addView(effortGroup, match(LayoutParams.WRAP_CONTENT));
         addDivider();
 
-        policyValue = text("", 11, SECONDARY);
+        policyValue = text("", MaiChatTypographyTokens.Role.METADATA, SECONDARY);
         policyChevron = icon(R.drawable.ic_ai_menu_chevron, PRIMARY);
         policyHeading = heading("操作权限", R.drawable.ic_ai_menu_shield, policyValue, policyChevron,
             ignored -> toggle(POLICY_SECTION));
         addView(policyHeading, match(dp(52)));
         policyGroup = options(new String[]{"请求批准", "帮我批准", "完全访问"}, POLICIES,
             policyChoices, policyChecks, POLICY_SECTION);
-        TextView explanation = text("完全访问免除一般操作确认；付费任务仍需批准。", 11,
+        TextView explanation = text("完全访问免除一般操作确认；付费任务仍需批准。", MaiChatTypographyTokens.Role.METADATA,
             SECONDARY);
         explanation.setPadding(dp(14), 0, dp(14), dp(6));
         policyGroup.addView(explanation, match(LayoutParams.WRAP_CONTENT));
@@ -175,7 +175,7 @@ final class AIAssistantActionMenu extends LinearLayout {
             row.setPadding(dp(44), 0, dp(44), 0);
             row.setContentDescription(titles[i]);
             row.setFocusable(true);
-            TextView title = text(titles[i], 13, PRIMARY);
+            TextView title = text(titles[i], MaiChatTypographyTokens.Role.DETAIL, PRIMARY);
             title.setTypeface(medium());
             row.addView(title, new LayoutParams(0, -2, 1));
             ImageView check = icon(R.drawable.ic_ai_menu_check, CHECK);
@@ -216,7 +216,7 @@ final class AIAssistantActionMenu extends LinearLayout {
         LinearLayout labels = new LinearLayout(getContext());
         labels.setOrientation(VERTICAL);
         labels.setGravity(Gravity.CENTER_VERTICAL);
-        TextView caption = text(title, 14, color);
+        TextView caption = text(title, MaiChatTypographyTokens.Role.BODY, color);
         caption.setTypeface(medium());
         labels.addView(caption, match(LayoutParams.WRAP_CONTENT));
         if (value != null) {
@@ -249,13 +249,12 @@ final class AIAssistantActionMenu extends LinearLayout {
         addView(divider, params);
     }
 
-    private TextView text(String text, int size, int color) {
+    private TextView text(String text, MaiChatTypographyTokens.Role size, int color) {
         return MaiChatTheme.text(getContext(), text, size, color);
     }
 
     private static Typeface medium() {
-        return Build.VERSION.SDK_INT >= 28 ? Typeface.create(Typeface.SANS_SERIF, 500, false)
-            : Typeface.create("sans-serif-medium", Typeface.NORMAL);
+        return MaiChatTypography.semibold();
     }
 
     private LayoutParams match(int height) { return new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, height); }

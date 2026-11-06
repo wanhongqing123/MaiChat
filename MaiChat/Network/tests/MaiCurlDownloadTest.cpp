@@ -85,6 +85,23 @@ int main(int argc, char** argv) {
     require(read(target) == "/ok?token=a%2Fb&scope=x%20y", "signed query was changed");
     require(result.bytes == read(target).size(), "incorrect received byte count");
 
+    // New cloud originals must match metadata before publishing and must not
+    // replace an existing workspace file, including a late publication race.
+    const std::string fresh = directory + "/new-original.bin";
+    options.target_path_utf8 = fresh.c_str();
+    const uint64_t expected = read(target).size();
+    mai_download_new_file(&options, expected + 1, nullptr, &result);
+    require(result.status == MAI_DOWNLOAD_SIZE_MISMATCH && !exists(fresh),
+            "a truncated original was published");
+    mai_download_new_file(&options, expected, nullptr, &result);
+    require(result.status == MAI_DOWNLOAD_OK && read(fresh) == read(target),
+            "verified original download failed");
+    write(fresh, "keep existing");
+    mai_download_new_file(&options, expected, nullptr, &result);
+    require(result.status == MAI_DOWNLOAD_WRITE_ERROR && read(fresh) == "keep existing",
+            "original download replaced a workspace file");
+    options.target_path_utf8 = target.c_str();
+
     options.ca_pem = nullptr;
     options.ca_pem_length = 0;
     options.ca_path_utf8 = argv[2];

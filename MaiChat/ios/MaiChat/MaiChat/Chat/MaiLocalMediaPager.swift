@@ -479,7 +479,7 @@ private final class MaiLocalMediaPageController: UIViewController, UIScrollViewD
         view.addSubview(spinner)
         message.textColor = .white
         message.textAlignment = .center
-        message.font = .preferredFont(forTextStyle: .body)
+        message.font = AppTypography.uiFont(.body)
         message.numberOfLines = 3
         view.addSubview(message)
         retry.setTitle("重试", for: .normal)

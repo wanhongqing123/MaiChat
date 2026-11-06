@@ -33,6 +33,15 @@ struct MaiFileEntry {
     std::uint64_t size = 0;  // 目录时无意义
 };
 
+// 清理预览使用的普通文件快照。identity 是平台文件标识及高精度修改/变更时间的
+// 不透明组合，不能用来展示或跨进程持久化；比较时必须同时核对 bytes 和 modified。
+// 它能识别同尺寸、恢复秒级 mtime 的修改，不能作为对并发恶意写入者的文件锁。
+struct MaiRegularFileInfo {
+    std::uint64_t bytes = 0;
+    std::int64_t modified = 0;
+    std::string identity;
+};
+
 // 遍历时对每一项的处置。
 enum class MaiWalkAction {
     Continue,       // 接着走
@@ -52,6 +61,8 @@ public:
     // 修改时间以 Unix 纪元起算的秒数表示，不跟随最后一级符号链接。
     // 路径不存在或元数据不支持时返回 false，且不修改 `seconds`。
     static bool modifiedTime(const MaiFilePath& path, std::int64_t& seconds);
+    // 不跟随最后一段链接，只接受磁盘普通文件。失败不改 out；调用方还须检查父目录边界。
+    static bool regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo& out);
 
     // ── 读写 ────────────────────────────────────────────────────
     // 整个读进来。maxBytes 为 0 表示不限；

@@ -2,6 +2,8 @@
 // 主要入口：standard、listBulletForDepth、calloutStyle。
 // 实现边界：与 MarkdownTheme 的公开声明配套，调用方通过相应接口进入。
 #include "markdown/MarkdownTheme.h"
+#include <QGuiApplication>
+#include <QFont>
 
 namespace {
 
@@ -25,64 +27,60 @@ QString monospaceFamily() {
 
 }  // namespace
 
-MarkdownTheme MarkdownTheme::standard(qreal zoom) {
+MarkdownTheme MarkdownTheme::standard(qreal zoom, const QString& bodyFamily) {
     MarkdownTheme theme;
     // 记下倍率：它同时是这份皮肤的指纹，排版缓存靠它分辨两份皮肤。
     theme.zoom = zoom;
-    theme.bodyFamily = QStringLiteral("Inter");
+    theme.bodyFamily = bodyFamily;
     theme.codeFamily = monospaceFamily();
-    // 标题字号按 20/17/15/14/14/14 收紧。老的 IM 值是 22/18/16，那是给
-    // 「一两句话里偶尔一个标题」用的；长回答里 22px 的 h1 太抢眼。
-
-
-    theme.text = hex("#0e1525");
+    theme.text = hex(TypographyTokens::kTextColor);
     // **粗体、斜体、删除线都不改颜色。**
     //
     // iOS 那边只给行内代码换色，其余全靠字形本身的差别（粗、斜、删除线）。
     // 颜色和字形双重编码没必要，而且一段话里深深浅浅好几种灰反而更花。
-    theme.strong = hex("#0e1525");
-    theme.emphasis = hex("#0e1525");
-    theme.strike = hex("#0e1525");
-    theme.link = hex("#0b67b7");
+    theme.strong = hex(TypographyTokens::kTextColor);
+    theme.emphasis = hex(TypographyTokens::kTextColor);
+    theme.strike = hex(TypographyTokens::kTextColor);
+    theme.link = hex(TypographyTokens::kLinkColor);
     // 标题只有 h1/h2 上色，用一个沉的藏青；h3 往下就是正文墨色。
     //
     // 老的 IM 样式是 h2 亮蓝 #1769be、h3 青 #176e83，一屏五个标题就成了圣诞树。
     // iOS 的做法是中间路线：只把最高的两级挑出来，而且颜色压得很沉。
-    theme.headingColor[0] = hex("#1c4f8a");
-    theme.headingColor[1] = hex("#1c4f8a");
-    theme.headingColor[2] = hex("#0e1525");
-    theme.headingColor[3] = hex("#0e1525");
-    theme.headingColor[4] = hex("#0e1525");
-    theme.headingColor[5] = hex("#0e1525");
+    theme.headingColor[0] = hex(TypographyTokens::kHeadingColor);
+    theme.headingColor[1] = hex(TypographyTokens::kHeadingColor);
+    theme.headingColor[2] = hex(TypographyTokens::kTextColor);
+    theme.headingColor[3] = hex(TypographyTokens::kTextColor);
+    theme.headingColor[4] = hex(TypographyTokens::kTextColor);
+    theme.headingColor[5] = hex(TypographyTokens::kTextColor);
     // 行内代码是**紫**的，照 iOS。蓝色会和链接撞，中性灰又太弱看不出这是代码。
-    theme.inlineCodeText = hex("#6b3b97");
-    theme.codeText = hex("#0e1525");
-    theme.codeBackground = hex("#f4f6f9");
+    theme.inlineCodeText = hex(TypographyTokens::kCodeColor);
+    theme.codeText = hex(TypographyTokens::kTextColor);
+    theme.codeBackground = hex(TypographyTokens::kCodeBackgroundColor);
     theme.codeBorder = hex("#e5ecf5");
-    theme.quoteAccent = hex("#2873c7");
-    theme.quoteBackground = hex("#eaf3fd");
-    theme.quoteText = hex("#475569");
+    theme.quoteAccent = hex(TypographyTokens::kQuoteAccentColor);
+    theme.quoteBackground = hex(TypographyTokens::kQuoteBackgroundColor);
+    theme.quoteText = hex(TypographyTokens::kQuoteTextColor);
     // 表格对齐 iOS：**浅蓝灰表头配深色文字**，不是深蓝配白字。
     // 深色表头在一屏里比正文还抢眼，而表格通常只是个附注。
-    theme.tableHeaderBackground = hex("#e8f0f7");
-    theme.tableHeaderText = hex("#0e1525");
-    theme.tableRow = hex("#ffffff");
-    theme.tableRowAlternate = hex("#f5f7fa");
-    theme.tableLine = hex("#dae4f0");
+    theme.tableHeaderBackground = hex(TypographyTokens::kTableHeaderColor);
+    theme.tableHeaderText = hex(TypographyTokens::kTextColor);
+    theme.tableRow = hex(TypographyTokens::kPanelColor);
+    theme.tableRowAlternate = hex(TypographyTokens::kTableAlternateColor);
+    theme.tableLine = hex(TypographyTokens::kBorderColor);
     // 行间那条线比外框还淡（iOS 是 border 的 60% 透明度压在白底上）。
     theme.tableSeparator = hex("#e9eff6");
     theme.divider = hex("#e2e8f0");
     // 项目符号和序号都用主蓝，和 iOS 一致。原来是灰点，在一堆黑字里看不见。
     theme.listMarker = hex("#0f8ddd");
     theme.checkboxOn = hex("#17826b");
-    theme.checkboxOff = hex("#64758f");
+    theme.checkboxOff = hex(TypographyTokens::kSecondaryColor);
     theme.selection = hex("#b4d5fe");
     theme.selectionText = hex("#102a43");
     theme.bubbleBackground = hex("#e8f2ff");
     theme.bubbleText = hex("#16314f");
     theme.noticeText = hex("#8b96a5");
     theme.errorText = hex("#c0392b");
-    theme.viewBackground = hex("#ffffff");
+    theme.viewBackground = hex(TypographyTokens::kPanelColor);
     // 和 MaiChat 会话列表那两条细滚动条同色，不另起一套。
     theme.scrollBarHandle = hex("#d3dae4");
     theme.scrollBarHandleHover = hex("#b9c3d1");
@@ -139,15 +137,15 @@ MarkdownCalloutStyle MarkdownTheme::calloutStyle(MarkdownCallout callout) const 
         // 标题不在这儿写死：会话列表的预览行也要同一串字，
         // 两处各写一份迟早会对不上。
         case MarkdownCallout::Note:
-            return {hex("#1f64b0"), hex("#f0f5fb"), markdownCalloutTitle(callout)};
+            return {hex(TypographyTokens::kNoteColor), hex("#f0f5fb"), markdownCalloutTitle(callout)};
         case MarkdownCallout::Tip:
-            return {hex("#16836b"), hex("#eff7f4"), markdownCalloutTitle(callout)};
+            return {hex(TypographyTokens::kTipColor), hex("#eff7f4"), markdownCalloutTitle(callout)};
         case MarkdownCallout::Important:
-            return {hex("#7547a8"), hex("#f5f1fa"), markdownCalloutTitle(callout)};
+            return {hex(TypographyTokens::kImportantColor), hex("#f5f1fa"), markdownCalloutTitle(callout)};
         case MarkdownCallout::Warning:
-            return {hex("#9c640f"), hex("#fbf6ec"), markdownCalloutTitle(callout)};
+            return {hex(TypographyTokens::kWarningColor), hex("#fbf6ec"), markdownCalloutTitle(callout)};
         case MarkdownCallout::Caution:
-            return {hex("#ba3d40"), hex("#fbf1f2"), markdownCalloutTitle(callout)};
+            return {hex(TypographyTokens::kCautionColor), hex("#fbf1f2"), markdownCalloutTitle(callout)};
         case MarkdownCallout::None:
             break;
     }

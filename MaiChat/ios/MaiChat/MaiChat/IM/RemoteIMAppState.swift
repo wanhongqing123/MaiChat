@@ -388,6 +388,28 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     var selectedGroupID: String? { chatState.selectedGroupID }
 
 #if DEBUG && targetEnvironment(simulator)
+    // 正常好友页复用本地账号样本，覆盖列表、账号复制与资料字体；不依赖线上好友数据。
+    func configureTypographyUITestFriends() {
+        guard ProcessInfo.processInfo.arguments.contains("--typography-ui-test") else { return }
+        acceptedFriendIMIDs = Set(chatState.contacts.map(\.userID))
+        if ProcessInfo.processInfo.arguments.contains("--contacts-profile-ui-test") {
+            friendAccountByIMID = Dictionary(uniqueKeysWithValues: chatState.contacts.map {
+                ($0.userID, "sample-account-\($0.userID)")
+            })
+        }
+        if ProcessInfo.processInfo.arguments.contains("--im-list-font-ui-test") {
+            // 只在隔离模拟器补齐群聊和未读徽标，普通账号及历史不经过此分支。
+            // 阻止异步的本地群恢复覆盖样本；联网刷新也复用既有群聊夹具隔离。
+            groupUIFixtureMode = true
+            connectionState = .connected
+            groups = [RemoteIMGroup(groupID: "font-group", name: "偏好设置", memberCount: 3)]
+            chatState.receiveGroupText("偏好设置", groupID: "font-group",
+                fromUserID: "bars-peer-34", now: Date(timeIntervalSince1970: 900))
+            unreadCountByUserID["bars-peer-34"] = 10
+            unreadCountByGroupID["font-group"] = 7
+        }
+    }
+
     func configureGroupUITestFixture() {
         let arguments = ProcessInfo.processInfo.arguments
         guard arguments.contains("--im-group-ui-test") ||
@@ -1535,6 +1557,10 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     func refreshBlockedUsers() async {
+#if DEBUG && targetEnvironment(simulator)
+        // 本地资料验收没有登录 IM SDK；只检查实际页面，不发起屏蔽名单请求。
+        if ProcessInfo.processInfo.arguments.contains("--contacts-profile-ui-test") { return }
+#endif
         do { blockedIMUserIDs = Set(try await client.blockedUserIDs()) }
         catch { errorMessage = error.localizedDescription }
     }

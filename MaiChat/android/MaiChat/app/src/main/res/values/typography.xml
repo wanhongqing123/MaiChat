@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Keyed tag avoids collisions with message binding and normal view identities. -->
+    <item name="typography_role" type="id" />
+</resources>

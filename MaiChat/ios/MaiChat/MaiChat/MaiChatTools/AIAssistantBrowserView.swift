@@ -23,24 +23,24 @@ struct AIBrowserTaskEntry: View {
             } label: {
                 HStack(spacing: 12) {
                     Image(systemName: "globe")
-                        .font(.system(size: 21, weight: .medium))
+                        .font(AppTypography.symbol(size: 21, weight: .medium))
                         .foregroundStyle(.blue)
                         .frame(width: 40, height: 40)
                         .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
                     VStack(alignment: .leading, spacing: 4) {
                         Text(browser.domain.isEmpty ? "网页任务" : browser.domain)
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(AppTypography.detail.weight(.semibold))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
                         HStack(spacing: 6) {
                             if browser.isWorking { ProgressView().controlSize(.mini) }
-                            Text(statusText).font(.system(size: 13)).lineLimit(1)
+                            Text(statusText).font(AppTypography.detail).lineLimit(1)
                         }
                         .foregroundStyle(browser.needsUserInput || needsConfirmation ? Color.orange : Color.secondary)
                     }
                     Spacer(minLength: 8)
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+                        .font(AppTypography.symbol(size: 12, weight: .semibold)).foregroundStyle(.secondary)
                 }
                 .padding(12)
                 .background(Color(uiColor: .secondarySystemGroupedBackground),
@@ -73,7 +73,7 @@ struct AIAssistantBrowserScreen: View {
                         statusBar
                     }
                 }
-                .navigationTitle(browser.domain.isEmpty ? "网页" : browser.domain)
+                .appNavigationTitle(browser.domain.isEmpty ? "网页" : browser.domain)
                 .navigationBarTitleDisplayMode(.inline)
                 .remoteIMNavigationBarMaterial()
                 .toolbar {
@@ -109,7 +109,7 @@ struct AIAssistantBrowserScreen: View {
         HStack(spacing: 10) {
             if browser.isWorking { ProgressView().controlSize(.small) }
             Text(needsConfirmation ? "需要你确认" : browser.loadError.isEmpty ? browser.statusText : "网页加载失败")
-                .font(.system(size: 13)).foregroundStyle(.secondary).lineLimit(2)
+                .font(AppTypography.detail).foregroundStyle(.secondary).lineLimit(2)
             Spacer(minLength: 8)
             if needsConfirmation {
                 // 审批和提问仍由原会话处理，全屏网页只提供明确的返回入口。

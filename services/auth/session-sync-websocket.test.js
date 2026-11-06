@@ -38,6 +38,53 @@ function connected(url, token) {
   return { socket, next, request, received };
 }
 
+test('busy owner receives every new input before acknowledging earlier commands', async () => {
+  const db = openSessionSyncStore(':memory:');
+  const principals = new Map([
+    ['owner', { accountId: 'queue-test', slot: 'mac', loginSessionId: 'owner-login' }],
+    ['phone', { accountId: 'queue-test', slot: 'ios_phone', loginSessionId: 'phone-login' }]
+  ]);
+  const authorize = async headers => principals.get(headers.authorization?.slice(7)) || null;
+  const server = createServer(createSessionSyncService({ db, authorize }), authorize);
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const url = `ws://127.0.0.1:${server.address().port}/v1/session-sync/ws`;
+  const owner = connected(url, 'owner'), phone = connected(url, 'phone');
+  try {
+    await Promise.all([once(owner.socket, 'open'), once(phone.socket, 'open')]);
+    assert.equal((await owner.request('presence-owner', 'presence', {
+      device_id: 'owner-device', name: 'Owner',
+      sessions: [{ id: 'ses_queue', title: 'Held model', updated_at: Date.now(), busy: true, turnId: '' }]
+    })).status, 200);
+    assert.equal((await phone.request('presence-phone', 'presence', {
+      device_id: 'phone-device', name: 'Phone', sessions: []
+    })).status, 200);
+    const received = [];
+    for (let i = 0; i < 3; ++i) {
+      const id = `input-${i}`;
+      const sent = await phone.request(`send-${i}`, 'send', {
+        to_slot: 'mac', to_login_session_id: 'owner-login', client_message_id: id,
+        session_id: 'ses_queue', kind: 'command',
+        payload: { action: 'prompt', requestId: `stable-${i}`, text: 'Identical text is a distinct click' }
+      });
+      assert.equal(sent.status, 200);
+      const inbox = await owner.next(frame => frame.type === 'inbox' &&
+        frame.messages.some(message => message.client_message_id === id));
+      received.push(inbox.messages.find(message => message.client_message_id === id));
+    }
+    assert.deepEqual(received.map(message => message.payload.requestId), ['stable-0', 'stable-1', 'stable-2']);
+    assert.equal(new Set(received.map(message => message.id)).size, 3);
+    assert.ok(received.every(message => message.payload.turnId === undefined));
+    // No command or model-completion acknowledgement was sent by the owner.
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM sync_envelopes WHERE acked_at IS NULL').get().count, 3);
+  } finally {
+    const active = [owner, phone].filter(client => client.socket.readyState !== WebSocket.CLOSED);
+    const closed = active.map(client => once(client.socket, 'close'));
+    active.forEach(client => client.socket.terminate()); await Promise.all(closed);
+    await new Promise(resolve => server.close(resolve));
+    await new Promise(resolve => setTimeout(resolve, 20)); db.close();
+  }
+});
+
 test('WebSocket pushes same-account catalog and mailbox without HTTP polling', async () => {
   const db = openSessionSyncStore(':memory:');
   const principals = new Map([

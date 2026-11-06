@@ -375,6 +375,7 @@ add_library(maiagent STATIC
   Agent/MaiError.cpp
   Agent/MaiSession.cpp
   Agent/MaiMessage.cpp
+  Agent/MaiSessionStore.cpp
   Agent/MaiIdGenerator.cpp
   Agent/MaiEventBus.cpp
   Agent/MaiMemoryStore.cpp
@@ -389,6 +390,7 @@ add_library(maiagent STATIC
   # 按平台各一份。形状参考 chromium 的 base/files。
   Agent/MaiBlockingCheck.cpp
   Agent/MaiFilePath.cpp
+  Agent/MaiAppStorage.cpp
   AgentTools/MaiPathGuard.cpp
   AgentTools/MaiTool.cpp
   AgentTools/MaiLlamaTools.cpp
@@ -587,6 +589,7 @@ if(MAIAGENT_BUILD_TESTS)
 
   foreach(test_name
       MaiCoreTests          # id / 会话 / 事件总线
+      MaiInputQueueTests    # 所属端持续接收、收尾排队、幂等与普通/工具入口
       MaiSessionRenameTests # 当前会话改名、普通入口、显式命名与持久化
       MaiFilePathTests      # 路径词法 + 文件系统（走系统 API，不用 std::filesystem）
       MaiStoreTests         # 存储契约：内存和 SQLite 行为必须一致
@@ -605,7 +608,7 @@ if(MAIAGENT_BUILD_TESTS)
       MaiUploadFileTests # raw PUT/POST streaming and remote data boundary
       MaiZlibToolTests # gzip/zlib/deflate roundtrips and decompression bounds
       MaiOpenSslToolTests # EVP known vectors and a real PEM X.509 certificate
-      MaiAppStorageToolTests # only previewed, aged cache files can be deleted
+      MaiAppStorageToolTests # 预览、年龄、工作区中间文件及交付保护边界
       MaiSshToolTests # approval boundary and optional local SSH transport integration
       MaiArkMediaToolsTests # Ark model tools, dynamic key and input boundary checks
       MaiGlmMediaToolsTests # GLM model tools, credentials and async task boundaries

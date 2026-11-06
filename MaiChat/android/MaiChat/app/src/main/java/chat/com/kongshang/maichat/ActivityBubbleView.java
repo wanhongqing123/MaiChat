@@ -44,12 +44,12 @@ final class ActivityBubbleView extends View {
     }
     @Override protected void onDraw(Canvas canvas) {
         paint.setStyle(Paint.Style.FILL);
-        paint.setTextSize(12 * getResources().getDisplayMetrics().scaledDensity);
+        paint.setTextSize(MaiChatTypography.pixels(getContext(), MaiChatTypographyTokens.Role.METADATA));
         String status = statusText();
         if (!status.contentEquals(getContentDescription())) setContentDescription(status);
         float width = signal.kind == RemoteIMActivitySignal.Kind.HUMAN_TYPING
             ? 60 * scale : 48 * scale + paint.measureText(status);
-        paint.setColor(android.graphics.Color.rgb(242, 242, 247));
+        paint.setColor(MaiChatTheme.GROUPED_PAGE);
         canvas.drawRoundRect(new RectF(0, 3 * scale, width, 45 * scale), 21 * scale, 21 * scale, paint);
         paint.setColor(MaiChatTheme.BLUE);
         if (signal.kind == RemoteIMActivitySignal.Kind.HUMAN_TYPING) {

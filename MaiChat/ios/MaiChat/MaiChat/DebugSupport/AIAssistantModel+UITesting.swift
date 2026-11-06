@@ -110,13 +110,55 @@ extension AIAssistantModel {
         ready = true
     }
 
-    func installHistoryUITestFixture() {
+    // 固定片段身份逐步追加正文和工具，走正常 Root/消息行而不执行模型或工具。
+    func installToolOrderUITestFixture(stage: Int) {
+        let session = "tool-order-ui-test"
+        func text(_ id: String, _ value: String) -> AIPart {
+            AIPart(id: id, kind: "text", text: value)
+        }
+        func tool(_ id: String, _ name: String, _ result: String, running: Bool = false) -> AIPart {
+            AIPart(id: id, kind: "tool", tool: name, input: "{}", output: result,
+                   state: running ? "running" : "completed")
+        }
+        var parts = [text("intro", "先检查文件，再执行处理。"),
+                     tool("tool-a1", "file_read", "A1 执行结果"),
+                     tool("tool-a2", "file_stat", "A2 执行结果"),
+                     text("answer-a", "A 段说明：文件检查已经完成。")]
+        if stage > 0 {
+            parts.append(tool("tool-b1", "shell", stage == 1 ? "" : "B1 执行结果", running: stage == 1))
+        }
+        if stage > 1 {
+            parts += [text("answer-b", "B 段说明：处理结果已经核对。"),
+                      tool("tool-c1", "file_write", "C1 执行结果"),
+                      tool("tool-c2", "shell", "C2 执行结果"),
+                      text("answer-c", "C 段说明：全部完成。")]
+        }
+        sessions = [AISession(id: session, title: "工具与正文顺序", busy: stage < 2)]
+        selected = session
+        messages = [AIMessage(id: "tool-order-message", role: "assistant", created: 1000,
+                              completed: stage < 2 ? 0 : 5000, active: stage < 2, parts: parts)]
+        configured = true
+        ready = true
+        historyLoaded = true
+    }
+
+    func installDrawerFontUITestFixture() {
+        installHistoryUITestFixture(markdown: "偏好设置")
+        sessions = [AISession(id: "history-ui-test", title: "偏好设置", busy: false)]
+        applyUITestMutation(.remoteSessions([AIRemoteSession(
+            sessionID: "drawer-remote", title: "偏好设置", updatedAt: 1793880000000, busy: false,
+            deviceSlot: "mac", deviceName: "字体测试 Mac", deviceID: "drawer-font-mac",
+            loginSessionID: "drawer-font-login", online: false)]))
+    }
+
+    func installHistoryUITestFixture(markdown: String? = nil) {
         let session = "history-ui-test"
         sessions = [AISession(id: session, title: "历史会话", busy: false)]
         selected = session
         messages = (0..<80).map { index in
             let part = AIPart(id: "history-part-\(index)", kind: "text",
-                              text: "历史消息 \(index)\n第二行内容", tool: nil,
+                              text: index == 79 ? (markdown ?? "历史消息 \(index)\n第二行内容")
+                                                : "历史消息 \(index)\n第二行内容", tool: nil,
                               input: nil, output: nil, error: nil, state: nil,
                               path: nil, mimeType: nil)
             return AIMessage(id: "history-message-\(index)", role: "assistant",

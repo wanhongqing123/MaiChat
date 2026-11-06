@@ -353,6 +353,16 @@ struct MaiCloudDriveClient: Sendable {
                                        payload: [:])).folders
     }
 
+    // 普通调用与 Agent 共用 C++ 元数据查询；游标和完整/未完状态由核心返回。
+    func search(query: String, exactName: Bool = false, mediaType: String? = nil,
+                folderID: String? = nil, before: String? = nil) async throws -> Data {
+        var payload: [String: Any] = ["query": query, "exact_name": exactName]
+        if let mediaType { payload["media_type"] = mediaType }
+        if let folderID { payload["folder_id"] = folderID }
+        if let before { payload["before"] = before }
+        return try await request(action: MAI_CLOUD_DRIVE_SEARCH_MEDIA, payload: payload)
+    }
+
     func createFolder(name: String, parentID: String? = nil)
         async throws -> MaiCloudDriveFolder {
         var payload = ["name": name]
@@ -451,6 +461,12 @@ struct MaiCloudDriveClient: Sendable {
         try decode(MaiCloudDrivePlayLink.self,
                    from: await request(action: MAI_CLOUD_DRIVE_PLAY_LINK,
                                        payload: ["video_id": videoID])).readUrl
+    }
+
+    // 普通代码与 Agent 共用原件下载；完整长度校验和原子交付都由共享 C++ 内核完成。
+    func downloadOriginal(mediaID: String, to destination: URL) async throws -> Data {
+        try await request(action: MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA,
+                          payload: ["media_id": mediaID, "output_path": destination.path])
     }
 
     func downloadSessionAttachment(id: String, room: SessionRoom)
@@ -821,7 +837,7 @@ struct MaiCloudDriveClient: Sendable {
     }
 
     private func request(action: MaiCloudDriveAction,
-                         payload: [String: String],
+                         payload: [String: Any],
                          room: SessionRoom? = nil) async throws -> Data {
         guard let access = try await MaiChatAuthClient.shared.cloudDriveAccessIfAvailable()
         else { throw MaiChatAuthError.sessionExpired }

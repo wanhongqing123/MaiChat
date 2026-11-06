@@ -3,6 +3,14 @@
 import Foundation
 
 struct AliyunSpeechTranscript {
+    // NLS 的 40000010 是服务试用/商用权限或欠费问题；换 Token 或重录无法解决。
+    // SDK 错误回调和 JSON 状态共用说明，避免一条路径仍只显示笼统错误码。
+    static func failureMessage(status: Int) -> String {
+        if status == 40_000_010 {
+            return "阿里云语音服务权限或余额异常（40000010）。请检查对应服务的商用开通状态及账号余额。"
+        }
+        return "阿里云语音识别失败（\(status)）"
+    }
     private struct Response: Decodable {
         struct Header: Decodable { let taskId: String?; let status: Int? }
         struct Payload: Decodable { let index: Int; let result: String; let time: Int? }
@@ -27,7 +35,7 @@ struct AliyunSpeechTranscript {
             taskID = incoming
         }
         if let status = response.header?.status, status != 20_000_000 {
-            throw SpeechRecognitionError.service("阿里云语音识别失败（\(status)）")
+            throw SpeechRecognitionError.service(Self.failureMessage(status: status))
         }
         guard let payload = response.payload else { return true }
         guard payload.index > 0 else {

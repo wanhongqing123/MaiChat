@@ -569,8 +569,8 @@ Java_com_kongshang_maichat_AIAssistantController_nativePortraitRequest(JNIEnv* e
   return result;
 }
 
-// Android owns one full-sized mutable sRGB Bitmap. These entries only borrow its pixels;
-// the portrait core receives a bounded straight-RGBA ROI and never a full Java byte array.
+// Android owns one full-sized mutable sRGB destination and an L8 diagnostic mask.
+// These entries borrow bounded original samples; the shared core owns skin/subject policy.
 namespace {
 struct PortraitBitmapLock {
     JNIEnv* env;
@@ -653,6 +653,28 @@ const unsigned char* straightPortraitPixels(const unsigned char* input, int widt
         }
     return straight.data();
 }
+
+void writePortraitPixels(unsigned char* target, int stride, bool premultiplied, const unsigned char* rgba,
+                         int sourceStride, int width, int height) {
+    for (int row = 0; row < height; ++row) {
+        auto* output = target + static_cast<size_t>(row) * stride;
+        const auto* pixels = rgba + static_cast<size_t>(row) * sourceStride;
+        if (!premultiplied) {
+            std::memcpy(output, pixels, static_cast<size_t>(width) * 4);
+        } else {
+            for (int column = 0; column < width; ++column) {
+                const auto* pixel = pixels + column * 4;
+                for (int channel = 0; channel < 3; ++channel)
+                    output[column * 4 + channel] = static_cast<unsigned char>((pixel[channel] * pixel[3] + 127) / 255);
+                output[column * 4 + 3] = pixel[3];
+            }
+        }
+    }
+}
+
+MaiPortraitSkinContext* skinContext(jlong handle) {
+    return reinterpret_cast<MaiPortraitSkinContext*>(static_cast<intptr_t>(handle));
+}
 }  // namespace
 
 extern "C" JNIEXPORT jbyteArray JNICALL
@@ -676,24 +698,124 @@ extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitIm
     }
 }
 
-extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativePlan(
-    JNIEnv* env, jclass, jobject proxy, jint width, jint height, jbyteArray hints, jint subject) {
+extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativeAnalyze(
+    JNIEnv* env, jclass, jobject proxy, jobject global, jint width, jint height, jbyteArray hints,
+    jbyteArray arguments, jbyteArray profile, jbyteArray original, jbyteArray fingerprint, jlongArray handle) {
     try {
-        PortraitBitmapLock image(env, proxy);
-        if (!image.pixels || image.info.width > 256 || image.info.height > 256) return portraitHostFailure(env);
-        std::vector<unsigned char> straight;
+        PortraitBitmapLock image(env, proxy), features(env, global);
+        if (!image.pixels || image.info.width > 512 || image.info.height > 512 || !features.pixels ||
+            features.info.width != 64 || features.info.height != 64 || !handle || env->GetArrayLength(handle) != 1)
+            return portraitHostFailure(env);
+        std::vector<unsigned char> straight, globalStraight;
         const auto* input = straightPortraitPixels(
             static_cast<const unsigned char*>(image.pixels), static_cast<int>(image.info.width),
             static_cast<int>(image.info.height), static_cast<int>(image.info.stride), image.premultiplied, straight);
-        const auto encoded = portraitUtf8(env, hints);
-        return ownedPortraitBytes(
-            env, maiPortraitPlanFaceRegion(
-                     width, height, encoded.c_str(), subject, input, static_cast<int>(image.info.width),
-                     static_cast<int>(image.info.height),
-                     straight.empty() ? static_cast<int>(image.info.stride) : static_cast<int>(image.info.width) * 4));
+        const auto* globalInput = straightPortraitPixels(static_cast<const unsigned char*>(features.pixels), 64, 64,
+            static_cast<int>(features.info.stride), features.premultiplied, globalStraight);
+        const auto encodedHints = portraitUtf8(env, hints), encoded = portraitUtf8(env, arguments),
+                   directory = portraitUtf8(env, profile), path = portraitUtf8(env, original),
+                   identity = portraitUtf8(env, fingerprint);
+        const auto analysis = maiPortraitAnalyzeSkinRgba(input, static_cast<int>(image.info.width),
+            static_cast<int>(image.info.height),
+            straight.empty() ? static_cast<int>(image.info.stride) : static_cast<int>(image.info.width) * 4,
+            width, height, encodedHints.c_str(), encoded.c_str(), directory.c_str(), path.c_str(), identity.c_str(),
+            globalInput, globalStraight.empty() ? static_cast<int>(features.info.stride) : 256);
+        std::unique_ptr<MaiPortraitSkinContext, decltype(&maiPortraitFreeSkinContext)> context(
+            analysis.context, &maiPortraitFreeSkinContext);
+        std::unique_ptr<char, decltype(&maiPortraitFree)> metadata(analysis.metadata, &maiPortraitFree),
+            error(analysis.error, &maiPortraitFree);
+        if (error) return portraitBytes(env, error.get());
+        if (!context || !metadata) return portraitHostFailure(env);
+        jbyteArray response = portraitBytes(env, metadata.get());
+        if (!response || env->ExceptionCheck()) return nullptr;
+        const jlong value = static_cast<jlong>(reinterpret_cast<intptr_t>(context.get()));
+        env->SetLongArrayRegion(handle, 0, 1, &value);
+        if (env->ExceptionCheck()) return nullptr;
+        context.release();
+        return response;
     } catch (...) {
         return portraitHostFailure(env);
     }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativeRefine(
+    JNIEnv* env, jclass, jlong context, jobject proxy) {
+    try {
+        PortraitBitmapLock image(env, proxy);
+        // 仅原图人物细化工作面允许 1024；全图 Analyze 的 512 预算不变。
+        if (!image.pixels || image.info.width > 1024 || image.info.height > 1024) return portraitHostFailure(env);
+        std::vector<unsigned char> straight;
+        const auto* input = straightPortraitPixels(static_cast<const unsigned char*>(image.pixels),
+            static_cast<int>(image.info.width), static_cast<int>(image.info.height),
+            static_cast<int>(image.info.stride), image.premultiplied, straight);
+        return ownedPortraitBytes(env, maiPortraitRefineSkinRegionRgba(skinContext(context), input,
+            static_cast<int>(image.info.width), static_cast<int>(image.info.height),
+            straight.empty() ? static_cast<int>(image.info.stride) : static_cast<int>(image.info.width) * 4));
+    } catch (...) { return portraitHostFailure(env); }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativeProtect(
+    JNIEnv* env, jclass, jlong context, jobject face) {
+    try {
+        if (!face) return ownedPortraitBytes(env, maiPortraitProtectSkinFaceRegion(skinContext(context), nullptr, 0, 0, 0));
+        PortraitBitmapLock image(env, face);
+        if (!image.pixels || image.info.width > 2048 || image.info.height > 2048) return portraitHostFailure(env);
+        std::vector<unsigned char> straight;
+        const auto* input = straightPortraitPixels(static_cast<const unsigned char*>(image.pixels),
+            static_cast<int>(image.info.width), static_cast<int>(image.info.height),
+            static_cast<int>(image.info.stride), image.premultiplied, straight);
+        return ownedPortraitBytes(env, maiPortraitProtectSkinFaceRegion(skinContext(context), input,
+            static_cast<int>(image.info.width), static_cast<int>(image.info.height),
+            straight.empty() ? static_cast<int>(image.info.stride) : static_cast<int>(image.info.width) * 4));
+    } catch (...) { return portraitHostFailure(env); }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativeTile(
+    JNIEnv* env, jclass, jlong context, jint index, jobject sample, jobject destination, jbyteArray mask,
+    jint sampleX, jint sampleY, jint writeX, jint writeY, jint width, jint height) {
+    try {
+        PortraitBitmapLock image(env, sample), output(env, destination);
+        if (!image.pixels || !output.pixels || !output.mutablePixels || !mask || sampleX < 0 || sampleY < 0 ||
+            width < 1 || height < 1 || width > 1024 || height > 1024 || image.info.width > 1040 ||
+            image.info.height > 1040 || writeX < sampleX || writeY < sampleY ||
+            static_cast<int64_t>(sampleX) + image.info.width > output.info.width ||
+            static_cast<int64_t>(sampleY) + image.info.height > output.info.height ||
+            static_cast<int64_t>(writeX) + width > static_cast<int64_t>(sampleX) + image.info.width ||
+            static_cast<int64_t>(writeY) + height > static_cast<int64_t>(sampleY) + image.info.height ||
+            static_cast<int64_t>(env->GetArrayLength(mask)) != static_cast<int64_t>(output.info.width) * output.info.height)
+            return portraitHostFailure(env);
+        std::vector<unsigned char> straight;
+        const auto* input = straightPortraitPixels(static_cast<const unsigned char*>(image.pixels),
+            static_cast<int>(image.info.width), static_cast<int>(image.info.height),
+            static_cast<int>(image.info.stride), image.premultiplied, straight);
+        PortraitRegionOwner edited;
+        edited.value = maiPortraitProcessSkinTile(skinContext(context), index, input, static_cast<int>(image.info.width),
+            static_cast<int>(image.info.height),
+            straight.empty() ? static_cast<int>(image.info.stride) : static_cast<int>(image.info.width) * 4);
+        if (edited.value.error) return portraitBytes(env, edited.value.error);
+        if (!edited.value.rgba || !edited.value.mask || edited.value.width != static_cast<int>(image.info.width) ||
+            edited.value.height != static_cast<int>(image.info.height)) return portraitHostFailure(env);
+        const size_t offset = static_cast<size_t>(writeY - sampleY) * image.info.width + writeX - sampleX;
+        auto* target = static_cast<unsigned char*>(output.pixels) + static_cast<size_t>(writeY) * output.info.stride + writeX * 4;
+        writePortraitPixels(target, static_cast<int>(output.info.stride), output.premultiplied,
+            edited.value.rgba + offset * 4, edited.value.width * 4, width, height);
+        for (int row = 0; row < height; ++row) {
+            const auto* alpha = edited.value.mask + offset + static_cast<size_t>(row) * image.info.width;
+            env->SetByteArrayRegion(mask, static_cast<jsize>(static_cast<int64_t>(writeY + row) * output.info.width + writeX),
+                width, reinterpret_cast<const jbyte*>(alpha));
+            if (env->ExceptionCheck()) return nullptr;
+        }
+        return portraitBytes(env, R"({"ok":true,"output":{}})");
+    } catch (...) { return portraitHostFailure(env); }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativeFinish(
+    JNIEnv* env, jclass, jlong context) {
+    return ownedPortraitBytes(env, maiPortraitFinishSkin(skinContext(context)));
+}
+extern "C" JNIEXPORT void JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativeFree(
+    JNIEnv*, jclass, jlong context) {
+    maiPortraitFreeSkinContext(skinContext(context));
 }
 
 extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitImage_nativeApply(
@@ -719,21 +841,8 @@ extern "C" JNIEXPORT jbyteArray JNICALL Java_com_kongshang_maichat_MaiPortraitIm
         if (!edited.value.rgba || !edited.value.metadata || edited.value.width != width ||
             edited.value.height != height)
             return portraitHostFailure(env);
-        for (int row = 0; row < height; ++row) {
-            auto* output = target + static_cast<size_t>(row) * image.info.stride;
-            const auto* pixels = edited.value.rgba + static_cast<size_t>(row) * width * 4;
-            if (!image.premultiplied) {
-                std::memcpy(output, pixels, static_cast<size_t>(width) * 4);
-            } else {
-                for (int column = 0; column < width; ++column) {
-                    const auto* pixel = pixels + column * 4;
-                    for (int channel = 0; channel < 3; ++channel)
-                        output[column * 4 + channel] =
-                            static_cast<unsigned char>((pixel[channel] * pixel[3] + 127) / 255);
-                    output[column * 4 + 3] = pixel[3];
-                }
-            }
-        }
+        writePortraitPixels(target, static_cast<int>(image.info.stride), image.premultiplied,
+            edited.value.rgba, width * 4, width, height);
         // Core output already contains the soft-edge blend. The skin mask is diagnostic only.
         return portraitBytes(env, edited.value.metadata);
     } catch (...) {

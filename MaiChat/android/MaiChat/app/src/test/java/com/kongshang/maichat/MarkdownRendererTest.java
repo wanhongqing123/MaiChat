@@ -140,6 +140,29 @@ public class MarkdownRendererTest {
         assertTrue("Preparation must deliver its result", completed.get());
     }
 
+    @Test public void htmlBreaksStayInsideCellsAndKeepCodeAndEscapedTagsLiteral() throws Exception {
+        MarkdownRenderer.initialize(ApplicationProvider.getApplicationContext());
+        String source = "a<br>b<br/>c<br />d<BR>e<br><br>f\n\n"
+                + "`<br>` \\<br> &lt;br&gt; <!-- <br> --> <span title=\"<br>\">x</span>\n\n"
+                + "```html\n<br>\n```\n\n| A | B |\n| --- | --- |\n| first<br>second | **yes**<br/>next |";
+        AtomicBoolean completed = new AtomicBoolean();
+        MarkdownRenderer.prepare(Collections.singletonList(source), () -> true, () -> completed.set(true));
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (!completed.get() && System.nanoTime() < deadline) {
+            Shadows.shadowOf(Looper.getMainLooper()).idle(); Thread.sleep(5);
+        }
+        assertTrue("Preparation must complete", completed.get());
+        TextView view = new TextView(ApplicationProvider.getApplicationContext());
+        MarkdownRenderer.bind(view, source);
+        String text = view.getText().toString();
+        assertTrue(text, text.contains("a\nb\nc\nd\ne\n\nf"));
+        String unpadded = text.replace('\u00a0', ' ').replaceAll(" +", " ");
+        assertTrue(text, unpadded.contains("<br> <br> <br> <!-- <br> --> <span title=\"<br>\">x</span>"));
+        assertTrue(text, text.contains("<br>"));
+        // 表格插件用自有 span 保存单元格；端上回归另行核对实际高度和截图。
+        assertFalse(text, text.contains("| --- |"));
+    }
+
     @Test public void backgroundPreparationHandlesNestedMarkdownAndPreservesCodeEscapes() throws Exception {
         MarkdownRenderer.initialize(ApplicationProvider.getApplicationContext());
         String source = "# Heading\n\n- **bold** and [site](https://example.com)\n  - child\n\n`literal "

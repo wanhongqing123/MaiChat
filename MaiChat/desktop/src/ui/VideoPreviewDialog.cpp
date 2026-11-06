@@ -29,16 +29,16 @@ VideoPreviewDialog::VideoPreviewDialog(const QString& videoPath, const QString& 
     : QDialog(parent), videoPath_(videoPath) {
     setWindowTitle(title.isEmpty() ? QStringLiteral("视频") : title);
     setMinimumSize(UiZoom::s(640), UiZoom::s(420));
-    setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         QDialog { background: #000000; }
-        QLabel { color: #d9e4ef; font-size: 13px; }
-        QLabel#videoError { color: #ffb4b4; font-size: 13px; }
+        QLabel { color: #d9e4ef; font-size: @detail; }
+        QLabel#videoError { color: #ffb4b4; font-size: @detail; }
         QPushButton {
             background: #1f2a3a; border: 1px solid #33475b; border-radius: 6px;
-            color: #e8f0f8; font-size: 13px; padding: 6px 16px;
+            color: #e8f0f8; font-size: @detail; padding: 6px 16px;
         }
         QPushButton:hover { background: #27354a; }
-    )")));
+    )"));
 
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(12, 12, 12, 12);

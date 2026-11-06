@@ -75,8 +75,7 @@ MarkdownLabel::~MarkdownLabel() {
 }
 
 void MarkdownLabel::setTheme(const MarkdownTheme& theme) {
-    // Return both layouts under the inputs that actually produced them. Doing
-    // this after changing source/note/zoom would relabel stale geometry in cache.
+    // Return cached layouts under the source, font and zoom that produced them, before updating inputs.
     returnLayoutToCache();
     runtime_->theme = theme;
     invalidate();
@@ -134,7 +133,7 @@ void MarkdownLabel::returnLayoutToCache() {
         layout = MarkdownLayout();
         MarkdownLayoutCache::put(runtime.document.source(), runtime.noteText,
                                  runtime.notePixelSize, runtime.noteColor.rgba(), width,
-                                 runtime.theme.zoom, std::move(owned));
+                                 runtime.theme.zoom, std::move(owned), runtime.theme.bodyFamily + QLatin1Char('\n') + runtime.theme.codeFamily);
         width = -1;
     };
     if (runtime.layoutWorthCaching) give(runtime.layout, runtime.laidOutWidth);
@@ -150,7 +149,7 @@ void MarkdownLabel::returnProbeToCache() {
     runtime.probe = MarkdownLayout();
     MarkdownLayoutCache::put(runtime.document.source(), runtime.noteText, runtime.notePixelSize,
                              runtime.noteColor.rgba(), runtime.probedWidth, runtime.theme.zoom,
-                             std::move(owned));
+                             std::move(owned), runtime.theme.bodyFamily + QLatin1Char('\n') + runtime.theme.codeFamily);
     runtime.probedWidth = -1;
 }
 
@@ -191,7 +190,7 @@ int MarkdownLabel::heightForWidth(int width) const {
     // 缓存里有现成的就直接拿，连量都不用量。
     if (auto cached = MarkdownLayoutCache::take(runtime.document.source(), runtime.noteText,
                                                 runtime.notePixelSize, runtime.noteColor.rgba(),
-                                                target, runtime.theme.zoom)) {
+                                                target, runtime.theme.zoom, runtime.theme.bodyFamily + QLatin1Char('\n') + runtime.theme.codeFamily)) {
         runtime.probe = std::move(*cached);
         runtime.probedWidth = target;
         return qCeil(runtime.probe.height());
@@ -286,7 +285,7 @@ void MarkdownLabel::ensureLayout(qreal width) {
         runtime_->probedWidth = -1;
     } else if (auto cached = MarkdownLayoutCache::take(
                    runtime_->document.source(), runtime_->noteText, runtime_->notePixelSize,
-                   runtime_->noteColor.rgba(), width, runtime_->theme.zoom)) {
+                   runtime_->noteColor.rgba(), width, runtime_->theme.zoom, runtime_->theme.bodyFamily + QLatin1Char('\n') + runtime_->theme.codeFamily)) {
         // 这条消息之前排过，内容宽度皮肤都没变——直接用，省掉最贵的一步。
         runtime_->layout = std::move(*cached);
     } else {

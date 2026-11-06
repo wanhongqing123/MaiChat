@@ -144,6 +144,60 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             postDelayed(this, 1000);
         }
     };
+    /** 外观重建只保留已完成的草稿数据，不持有旧 Activity/View 或在途导入、转写任务。 */
+    static final class DraftSnapshot {
+        private final String selected, quotedMessage, quoteSession;
+        private final Map<String, String> drafts;
+        private final Map<String, List<AIAssistantController.ImportedFile>> attachments;
+        private final Set<String> remoteAttachmentTargets;
+        private final int restoreGeneration;
+        private DraftSnapshot(AIAssistantPanel panel) {
+            selected = panel.selected;
+            Map<String, String> text = new HashMap<>(panel.drafts);
+            // 当前编辑器不依赖切会话才落入 drafts；空会话键同样是有效的新建草稿。
+            text.put(selected, panel.composer.getText().toString());
+            drafts = Collections.unmodifiableMap(text);
+            Map<String, List<AIAssistantController.ImportedFile>> files = new HashMap<>();
+            for (Map.Entry<String, List<AIAssistantController.ImportedFile>> entry : panel.attachments.entrySet())
+                // ImportedFile 只有 final String/boolean 字段；冻结容器后不会共享可变 View 状态。
+                files.put(entry.getKey(), Collections.unmodifiableList(new ArrayList<>(entry.getValue())));
+            attachments = Collections.unmodifiableMap(files);
+            remoteAttachmentTargets = Collections.unmodifiableSet(new HashSet<>(panel.remoteAttachmentTargets));
+            quotedMessage = panel.quotedMessage == null ? "" : panel.quotedMessage.toString();
+            quoteSession = panel.quoteSession;
+            restoreGeneration = panel.lastRemoteRestoreGeneration;
+        }
+    }
+    DraftSnapshot exportDrafts() {
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper())
+            throw new IllegalStateException("Draft snapshots must be captured on the main thread");
+        return new DraftSnapshot(this);
+    }
+    /** 同账号的新面板构造后、加入 View 层级前调用，先恢复 selected 和 composer 再订阅状态。 */
+    void restoreDrafts(DraftSnapshot snapshot) {
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper())
+            throw new IllegalStateException("Draft snapshots must be restored on the main thread");
+        if (snapshot == null) return;
+        drafts.clear(); drafts.putAll(snapshot.drafts);
+        attachments.clear();
+        for (Map.Entry<String, List<AIAssistantController.ImportedFile>> entry : snapshot.attachments.entrySet())
+            attachments.put(entry.getKey(), new ArrayList<>(entry.getValue()));
+        remoteAttachmentTargets.clear(); remoteAttachmentTargets.addAll(snapshot.remoteAttachmentTargets);
+        lastRemoteRestoreGeneration = snapshot.restoreGeneration;
+        // 若调用方已经收过状态，以当前控制器会话为准；首次状态到达时不能把旧空编辑器
+        // 写回恢复的空会话键，也不能把当前文字误记到另一会话。
+        selected = state == null ? snapshot.selected : state.selected;
+        composer.setText(drafts.getOrDefault(selected, ""));
+        composer.setSelection(composer.length());
+        quoteSession = snapshot.quoteSession;
+        try {
+            quotedMessage = snapshot.quotedMessage.isEmpty() ? null : new JSONObject(snapshot.quotedMessage);
+        } catch (org.json.JSONException invalid) {
+            // 引用是附加状态；其损坏不能丢弃已经恢复的正文和附件。
+            quotedMessage = null; quoteSession = "";
+        }
+        updateSend(); updateAttachments(); updateQuote();
+    }
     AIAssistantPanel(Activity activity) {
         this(activity, AIAssistantController.shared(activity),
             activity instanceof MainActivity ? ((MainActivity) activity).voiceRecorderForAssistant() : null,
@@ -171,7 +225,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         this.speechRecognizer = speechRecognizer;
         setOrientation(VERTICAL);
         setFocusableInTouchMode(true);
-        setBackgroundColor(Color.WHITE);
+        setBackgroundColor(MaiChatTheme.PANEL);
         MarkdownRenderer.initialize(activity);
         FrameLayout header = new FrameLayout(activity);
         ImageButton sessionsButton = headerIcon(R.drawable.ic_ai_sidebar, "对话列表", v -> sessions());
@@ -179,12 +233,12 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             Gravity.START | Gravity.CENTER_VERTICAL);
         sessionsParams.setMarginStart(dp(16));
         header.addView(sessionsButton, sessionsParams);
-        TextView title = text("创作中心", 18, Color.BLACK);
+        TextView title = text("创作中心", MaiChatTypographyTokens.Role.HEADING3, MaiChatTheme.TEXT);
         title.setTypeface(MaiChatTypography.semibold());
         title.setGravity(Gravity.CENTER);
         header.addView(title, new FrameLayout.LayoutParams(
             LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT, Gravity.CENTER));
-        videoCircleEntry = text("视频圈", 13, MaiChatTheme.BLUE);
+        videoCircleEntry = text("视频圈", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.BLUE);
         videoCircleEntry.setTypeface(MaiChatTypography.semibold());
         videoCircleEntry.setGravity(Gravity.CENTER);
         videoCircleEntry.setContentDescription("打开 AI 视频圈");
@@ -259,32 +313,33 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         pending = column();
         pending.setPadding(dp(12), 0, dp(12), 0);
         addView(pending, matchWrap());
-        syncStatus = text("", 12, MaiChatTheme.BLUE);
+        syncStatus = text("", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.BLUE);
         syncStatus.setPadding(dp(16), dp(8), dp(16), dp(8));
         syncStatus.setBackgroundColor(MaiChatTheme.BLUE_SOFT);
         syncStatus.setVisibility(GONE);
         addView(syncStatus, matchWrap());
-        error = text("", 12, Color.rgb(183, 45, 45));
+        error = text("", MaiChatTypographyTokens.Role.METADATA, Color.rgb(183, 45, 45));
         error.setPadding(dp(14), dp(5), dp(14), dp(5));
         error.setTextIsSelectable(true);
+        error.setOnClickListener(view -> controller.retryLastRemoteInput());
         error.setVisibility(GONE);
         addView(error, matchWrap());
         View composerDivider = new View(activity);
         composerDivider.setBackgroundColor(MaiChatTheme.BORDER);
         addView(composerDivider, new LayoutParams(LayoutParams.MATCH_PARENT, dp(1)));
         LinearLayout composerArea = column();
-        composerArea.setBackgroundColor(Color.WHITE);
+        composerArea.setBackgroundColor(MaiChatTheme.PANEL);
         quoteSection = row();
         quoteSection.setGravity(Gravity.CENTER_VERTICAL);
         quoteSection.setPadding(dp(16), dp(8), dp(16), dp(8));
         quoteSection.setBackgroundColor(MaiChatTheme.BLUE_SOFT);
-        TextView quoteIcon = text("↩", 17, MaiChatTheme.BLUE);
+        TextView quoteIcon = text("↩", MaiChatTypographyTokens.Role.BODY, MaiChatTheme.BLUE);
         quoteSection.addView(quoteIcon, new LayoutParams(dp(28), LayoutParams.WRAP_CONTENT));
-        quoteText = text("", 12, MaiChatTheme.TEXT);
+        quoteText = text("", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.TEXT);
         quoteText.setMaxLines(2);
         quoteText.setEllipsize(android.text.TextUtils.TruncateAt.END);
         quoteSection.addView(quoteText, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
-        TextView cancelQuote = text("×", 22, MaiChatTheme.SECONDARY);
+        TextView cancelQuote = text("×", MaiChatTypographyTokens.Role.HEADING1, MaiChatTheme.SECONDARY);
         cancelQuote.setGravity(Gravity.CENTER);
         cancelQuote.setContentDescription("取消引用");
         cancelQuote.setOnClickListener(view -> {
@@ -297,7 +352,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         composerArea.addView(quoteSection, matchWrap());
         attachmentSection = column();
         attachmentSection.setPadding(dp(16), dp(10), dp(16), 0);
-        attachmentCount = text("待发送附件", 12, MaiChatTheme.SECONDARY);
+        attachmentCount = text("待发送附件", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
         attachmentCount.setTypeface(MaiChatTypography.semibold());
         attachmentSection.addView(attachmentCount, matchWrap());
         HorizontalScrollView attachmentScroll = new HorizontalScrollView(activity);
@@ -320,7 +375,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         composer.setTag("ai-composer");
         composer.setContentDescription("创作中心消息输入框");
         composer.setHint("可按住转文字");
-        composer.setTextSize(16);
+        MaiChatTypography.apply(composer, MaiChatTypographyTokens.Role.BODY);
         composer.setMinLines(1);
         composer.setMaxLines(6);
         composer.setMinHeight(dp(44));
@@ -359,7 +414,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         inputSurface.addView(composer, new FrameLayout.LayoutParams(
             LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         voiceHoldButton = button("按住转文字", "按住转文字", null);
-        voiceHoldButton.setTextSize(16);
+        MaiChatTypography.apply(voiceHoldButton, MaiChatTypographyTokens.Role.BODY);
         voiceHoldButton.setTextColor(MaiChatTheme.TEXT);
         voiceHoldButton.setSingleLine(true);
         voiceHoldButton.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -418,9 +473,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         musicMiniBar.setPadding(dp(12), 0, dp(6), 0);
         musicMiniBar.setBackground(MaiChatTheme.rounded(
             Color.rgb(232, 244, 252), 11, activity));
-        TextView note = text("♫", 19, MaiChatTheme.BLUE);
+        TextView note = text("♫", MaiChatTypographyTokens.Role.TITLE, MaiChatTheme.BLUE);
         musicMiniBar.addView(note, new LayoutParams(dp(28), dp(38)));
-        musicMiniTitle = text("", 13, MaiChatTheme.TEXT);
+        musicMiniTitle = text("", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.TEXT);
         musicMiniTitle.setSingleLine(true);
         musicMiniTitle.setEllipsize(android.text.TextUtils.TruncateAt.END);
         musicMiniBar.addView(musicMiniTitle, new LayoutParams(0, dp(38), 1));
@@ -714,6 +769,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         JSONArray pendingQuestions = state == null ? null : state.data.optJSONArray("questions");
         boolean answering = AIAssistantSubmission.questionToAnswer(pendingQuestions,
             state == null ? null : state.data.optJSONArray("questionAnswerEchoes")) != null;
+        boolean remote = state != null && state.remoteSession != null;
         boolean canSubmit = state != null && state.ready
             && (state.remoteSession != null || answering || controller.modelSettingsReady())
             && !navigationPending && pendingMediaImports.getOrDefault(selected, 0) == 0 && hasDraft
@@ -937,7 +993,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
                 if (source != null)
                     MessageImageLoader.load(source.getPath(), dp(82), dp(58), cover, null);
-                TextView play = text("▶", 20, Color.WHITE);
+                TextView play = text("▶", MaiChatTypographyTokens.Role.TITLE, Color.WHITE);
                 play.setGravity(Gravity.CENTER);
                 play.setBackground(MaiChatTheme.rounded(Color.argb(180, 0, 0, 0), 18, activity));
                 FrameLayout.LayoutParams playParams = new FrameLayout.LayoutParams(dp(36), dp(36));
@@ -949,7 +1005,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 Button preview = button(type.equals("音频") ? "♫" : "▤",
                     "预览" + type + " " + file.displayName,
                     view -> previewAttachment(file));
-                preview.setTextSize(25);
+                MaiChatTypography.apply(preview, MaiChatTypographyTokens.Role.DISPLAY);
                 preview.setTextColor(MaiChatTheme.BLUE);
                 top.addView(preview,new LayoutParams(dp(82),dp(58)));
             }
@@ -965,7 +1021,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             top.addView(remove, new LayoutParams(dp(48), dp(58)));
             chip.addView(top, matchWrap());
             TextView name = text(type + " " + ordinal
-                + " · " + file.displayName, 11, MaiChatTheme.TEXT);
+                + " · " + file.displayName, MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.TEXT);
             name.setSingleLine(true);
             name.setEllipsize(android.text.TextUtils.TruncateAt.END);
             name.setContentDescription(type + " " + ordinal
@@ -978,7 +1034,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         }
         int pendingCount = pendingMediaImports.getOrDefault(selected, 0);
         if (pendingCount > 0) {
-            TextView loading = text("正在添加媒体（" + pendingCount + "）…", 12,
+            TextView loading = text("正在添加媒体（" + pendingCount + "）…", MaiChatTypographyTokens.Role.METADATA,
                 MaiChatTheme.SECONDARY);
             loading.setGravity(Gravity.CENTER);
             loading.setPadding(dp(12), dp(5), dp(12), dp(5));
@@ -1152,7 +1208,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         LinearLayout content = new LinearLayout(activity);
         content.setOrientation(VERTICAL);
         content.setPadding(dp(18), dp(4), dp(18), dp(12));
-        EditText search = new EditText(activity);
+        EditText search = MaiChatTypography.input(activity);
         search.setSingleLine(true);
         search.setHint("搜索歌曲或歌手");
         content.addView(search, new LayoutParams(-1, dp(52)));
@@ -1710,12 +1766,16 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             String phase = entry.optString("state");
             String label = phase.equals("unknown") ? "送达待确认，内容已保留" : phase.equals("failed")
                 ? "未受理，内容已保留" : phase.equals("dispatching") ? "正在发送"
+                : phase.equals("forwarded") ? "已发出，等待所属设备接收"
                 : phase.equals("preparing") ? "正在准备附件" : "排队中";
-            TextView retained = text(label + "\n" + payload.optString("text"), 12, MaiChatTheme.SECONDARY);
+            TextView retained = text(label + "\n" + payload.optString("text"), MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
             retained.setMaxLines(4); retained.setTextIsSelectable(true);
             retained.setPadding(0, dp(4), 0, dp(4));
             outgoingRows.addView(retained, matchWrap());
-            if (phase.equals("failed")) {
+            if ((phase.equals("unknown") || phase.equals("failed")) && payload.optString("operation").equals("enqueue")) {
+                outgoingRows.addView(button("重试确认", "使用原编号重试确认这条消息", view ->
+                    controller.retryRemoteInput(entry.optString("id"))), matchWrap());
+            } else if (phase.equals("failed")) {
                 Button restore = button("恢复草稿", "恢复未受理的内容", view -> {
                     if (composer.length() > 0 || !currentAttachments().isEmpty()) {
                         Toast.makeText(activity, "请先处理当前草稿，原内容仍已保留", Toast.LENGTH_SHORT).show();
@@ -1756,18 +1816,15 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 boolean portraitValidation = tool.equals("ark_assets") &&
                     input.optString("action").equals("begin_real_validation");
                 if (taskManagement) {
-                    pending.addView(text(taskDelete ? "删除视频任务记录" : "取消视频任务",
-                        17, MaiChatTheme.TEXT), matchWrap());
+                    pending.addView(text(taskDelete ? "删除视频任务记录" : "取消视频任务", MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT), matchWrap());
                     pending.addView(text(taskDelete
                         ? (tool.equals("seedance_video")
                            ? "删除方舟中的已结束任务记录及本地索引；已保存的视频保留。"
                            : "只删除本地已交付记录；云端任务和已保存的视频保留。")
-                        : "仅排队中的任务可以取消；运行中任务会被平台拒绝。",
-                        13, MaiChatTheme.SECONDARY), matchWrap());
-                    pending.addView(text("任务：" + input.optString("conversation_id"),
-                        13, MaiChatTheme.SECONDARY), matchWrap());
+                        : "仅排队中的任务可以取消；运行中任务会被平台拒绝。", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY), matchWrap());
+                    pending.addView(text("任务：" + input.optString("conversation_id"), MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY), matchWrap());
                 } else if (paid) {
-                    pending.addView(text(paidApprovalTitle(tool, input), 17, MaiChatTheme.TEXT), matchWrap());
+                    pending.addView(text(paidApprovalTitle(tool, input), MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT), matchWrap());
                     JSONArray registeredAssets = input.optJSONArray("reference_asset_ids");
                     boolean usesRegisteredAsset =
                         registeredAssets != null && registeredAssets.length() > 0
@@ -1784,29 +1841,28 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             ? "将使用已授权真人形象。确认后提交给" + paidProvider(tool)
                                 + "，可能消耗模型额度。"
                             : "确认后将提交给" + paidProvider(tool) + "，可能消耗模型额度。";
-                    pending.addView(text(note, 13, MaiChatTheme.SECONDARY), matchWrap());
+                    pending.addView(text(note, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY), matchWrap());
                     String request = input.optString("message", input.optString("prompt"));
                     if (!request.isEmpty()) {
-                        TextView summary = text(request, 15, MaiChatTheme.TEXT);
+                        TextView summary = text(request, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.TEXT);
                         summary.setMaxLines(5);
                         summary.setOnClickListener(v -> details("任务内容", request));
                         pending.addView(summary, matchWrap());
                     }
                     String specs = paidSpecs(tool, input);
                     if (!specs.isEmpty())
-                        pending.addView(text(specs, 13, MaiChatTheme.SECONDARY), matchWrap());
-                    TextView more = text("查看完整请求", 12, MaiChatTheme.SECONDARY);
+                        pending.addView(text(specs, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY), matchWrap());
+                    TextView more = text("查看完整请求", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
                     more.setOnClickListener(v -> details("完整请求", permission.optString("input")));
                     pending.addView(more, matchWrap());
                 } else if (portraitValidation) {
-                    pending.addView(text("创建真人验证链接", 17, MaiChatTheme.TEXT), matchWrap());
+                    pending.addView(text("创建真人验证链接", MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT), matchWrap());
                     pending.addView(text("将创建一次性 H5 链接，"
                         + "请由照片中的本人打开并完成验证。"
-                        + "认证凭证有效期为 30 分钟。",
-                        13, MaiChatTheme.SECONDARY), matchWrap());
+                        + "认证凭证有效期为 30 分钟。", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY), matchWrap());
                 } else {
                     TextView heading = text(
-                        "允许执行 " + tool + "？ 点击查看参数", 13, MaiChatTheme.TEXT);
+                        "允许执行 " + tool + "？ 点击查看参数", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.TEXT);
                     heading.setOnClickListener(v -> details("操作参数", permission.optString("input")));
                     pending.addView(heading, matchWrap());
                 }
@@ -1865,11 +1921,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         FrameLayout overlay = new FrameLayout(activity);
         overlay.setBackgroundColor(Color.argb(42, 0, 0, 0));
         LinearLayout drawer = column();
-        drawer.setBackgroundColor(Color.WHITE);
+        drawer.setBackgroundColor(MaiChatTheme.PANEL);
         drawer.setElevation(dp(18));
         LinearLayout drawerHeader = row();
         drawerHeader.setPadding(dp(18), 0, dp(12), 0);
-        TextView drawerTitle = text("对话", 18, MaiChatTheme.TEXT);
+        TextView drawerTitle = text("对话", MaiChatTypographyTokens.Role.HEADING3, MaiChatTheme.TEXT);
         drawerTitle.setTypeface(MaiChatTypography.semibold());
         drawerHeader.addView(drawerTitle, new LayoutParams(0, dp(54), 1));
         ImageButton create = circularIcon(R.drawable.ic_ai_add, "新对话", false, null);
@@ -2261,7 +2317,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         sparkles.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE_SOFT, 15, activity));
         sparkles.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
         welcome.addView(sparkles, new LayoutParams(dp(48), dp(48)));
-        TextView heading = text("从这里开始创作", 25, MaiChatTheme.TEXT);
+        TextView heading = text("从这里开始创作", MaiChatTypographyTokens.Role.DISPLAY, MaiChatTheme.TEXT);
         heading.setTypeface(MaiChatTypography.semibold());
         heading.setGravity(Gravity.CENTER);
         LayoutParams headingParams = matchWrap();
@@ -2289,7 +2345,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         gridParams.topMargin = dp(28);
         welcome.addView(grid, gridParams);
         if (state != null && !state.data.optBoolean("configured")) {
-            TextView accountHint = text("登录后会自动连接主聊天模型", 13,
+            TextView accountHint = text("登录后会自动连接主聊天模型", MaiChatTypographyTokens.Role.DETAIL,
                 MaiChatTheme.SECONDARY);
             accountHint.setGravity(Gravity.CENTER);
             LayoutParams hintParams = matchWrap();
@@ -2297,7 +2353,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             welcome.addView(accountHint, hintParams);
             Button retry = button("重试连接", "重试连接", v -> retryMainModelConnection());
             retry.setTextColor(Color.WHITE);
-            retry.setTextSize(14);
+            MaiChatTypography.apply(retry, MaiChatTypographyTokens.Role.DETAIL);
             retry.setTypeface(MaiChatTypography.semibold());
             retry.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE, 10, activity));
             LayoutParams retryParams = new LayoutParams(dp(104), dp(38));
@@ -2322,7 +2378,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         icon.setColorFilter(MaiChatTheme.BLUE);
         icon.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
         card.addView(icon, new LayoutParams(dp(22), dp(22)));
-        TextView label = text(feature.title, 16, MaiChatTheme.TEXT);
+        TextView label = text(feature.title, MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT);
         label.setTypeface(MaiChatTypography.semibold());
         // 保留完整标题，字体或窄屏导致空间不足时增加卡片高度，不省略能力名称。
         label.setSingleLine(false);
@@ -2357,7 +2413,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         }
     }
     private void details(String title, String source) {
-        TextView view = text(source, 12, MaiChatTheme.TEXT);
+        TextView view = text(source, MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.TEXT);
         view.setTextIsSelectable(true);
         view.setTypeface(android.graphics.Typeface.MONOSPACE);
         view.setPadding(dp(16), dp(12), dp(16), dp(12));
@@ -2502,8 +2558,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     for (int i = 0; i < array.length(); i++) {
                         JSONObject part = array.optJSONObject(i);
                         if (part == null || !part.optString("kind").equals("quote")) continue;
-                        TextView quote = text("↩  " + part.optString("preview", "已引用消息"),
-                            12, MaiChatTheme.SECONDARY);
+                        TextView quote = text("↩  " + part.optString("preview", "已引用消息"), MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
                         quote.setMaxLines(2);
                         quote.setEllipsize(android.text.TextUtils.TruncateAt.END);
                         bubble.addView(quote, matchWrap());
@@ -2569,7 +2624,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     lp.gravity = Gravity.END;
                     lp.leftMargin = dp(28);
                     addView(bubble, lp);
-                    TextView quoteAction = text("↩  引用", 12, MaiChatTheme.SECONDARY);
+                    TextView quoteAction = text("↩  引用", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
                     quoteAction.setContentDescription("引用这条消息");
                     quoteAction.setOnClickListener(view -> beginQuote(value));
                     LayoutParams quoteLayout = matchWrap();
@@ -2580,6 +2635,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 } else {
                     for (int i = 0; i < array.length(); i++) {
                         JSONObject part = array.optJSONObject(i);
+                        if (part == null) continue;
                         String id = part.optString("id"), kind = part.optString("kind");
                         boolean deliveredMedia = kind.equals("tool") &&
                             mediaFromToolOutput(part) != null;
@@ -2589,7 +2645,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                         String toolGroupId = toolGroupIds[i];
                         LinearLayout toolDetails = toolGroups.get(toolGroupId);
                         if (kind.equals("tool") && !deliveredMedia && !toolGroups.containsKey(toolGroupId)) {
-                            TextView toolSummary = text("", 12, MaiChatTheme.SECONDARY);
+                            TextView toolSummary = text("", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
                             toolSummary.setSingleLine(true);
                             toolSummary.setEllipsize(android.text.TextUtils.TruncateAt.END);
                             toolSummary.setContentDescription(toolGroupTitle(groupParts.get(toolGroupId)));
@@ -2629,7 +2685,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             addView(content, contentLayout);
                             continue;
                         }
-                        TextView view = text("", 12, MaiChatTheme.SECONDARY);
+                        TextView view = text("", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
                         parts.put(id, view);
                         LayoutParams lp = matchWrap();
                         lp.bottomMargin = kind.equals("tool") && !deliveredMedia ? dp(4) : dp(12);
@@ -2642,7 +2698,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                                 adapter.notifyDataSetChanged();
                             });
                         if (expanded.contains(id)) {
-                            TextView detail = text("", 12, MaiChatTheme.SECONDARY);
+                            TextView detail = text("", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
                             detail.setTextIsSelectable(true);
                             detail.setTypeface(android.graphics.Typeface.MONOSPACE);
                             parts.put(id + ":detail", detail);
@@ -2689,11 +2745,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             addView(media, mediaLayout);
                         }
                     }
-                    status = text("", 11, MaiChatTheme.SECONDARY);
+                    status = text("", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
                     LinearLayout footer = row();
                     footer.setGravity(Gravity.CENTER_VERTICAL);
                     footer.addView(status, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
-                    TextView quoteAction = text("↩  引用", 11, MaiChatTheme.SECONDARY);
+                    TextView quoteAction = text("↩  引用", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
                     quoteAction.setContentDescription("引用这条消息");
                     quoteAction.setOnClickListener(view -> beginQuote(value));
                     // 后代问题是父页的显示投影，其真实消息属于另一个会话，不能按父会话引用。
@@ -2747,7 +2803,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             } else if (!playable && !"missing".equals(card.getTag())) {
                                 card.setTag("missing");
                                 card.removeAllViews();
-                                card.addView(text("视频文件已丢失", 13, MaiChatTheme.SECONDARY), matchWrap());
+                                card.addView(text("视频文件已丢失", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY), matchWrap());
                             }
                         }
                     }
@@ -2878,6 +2934,26 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             : state.equals("pending")    ? "等待授权"
                                          : "正在运行";
     }
+    // 使用本次快照更新状态，不持有上一次 JSONObject；空正文也是后续流式正文的边界。
+    static Map<String, JSONArray> adjacentToolRuns(JSONArray parts) {
+        Map<String, JSONArray> result = new LinkedHashMap<>();
+        JSONArray run = null;
+        if (parts == null) return result;
+        for (int index = 0; index < parts.length(); index++) {
+            JSONObject part = parts.optJSONObject(index);
+            if (part == null || !part.optString("kind").equals("tool") || mediaFromToolOutput(part) != null) {
+                run = null;
+                continue;
+            }
+            if (run == null) {
+                run = new JSONArray();
+                result.put(part.optString("id"), run);
+            }
+            run.put(part);
+        }
+        return result;
+    }
+
     static String toolGroupTitle(JSONArray parts) {
         if (parts == null) return "";
         int count = 0;
@@ -3089,13 +3165,13 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 video ? dp(280) : dp(220), video ? dp(320) : dp(240), cover,
                 () -> cover.setContentDescription("媒体无法显示"));
             if (video) {
-                TextView play = text("▶", 20, Color.WHITE);
+                TextView play = text("▶", MaiChatTypographyTokens.Role.TITLE, Color.WHITE);
                 play.setGravity(Gravity.CENTER);
                 play.setBackground(MaiChatTheme.rounded(Color.argb(190, 0, 0, 0), 26, activity));
                 FrameLayout.LayoutParams playLayout = new FrameLayout.LayoutParams(dp(52), dp(52));
                 playLayout.gravity = Gravity.CENTER;
                 preview.addView(play, playLayout);
-                TextView name = text(file.getName(), 12, Color.WHITE);
+                TextView name = text(file.getName(), MaiChatTypographyTokens.Role.METADATA, Color.WHITE);
                 name.setSingleLine(true);
                 name.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
                 name.setTypeface(MaiChatTypography.semibold());
@@ -3106,7 +3182,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 nameLayout.setMargins(dp(8), dp(8), dp(8), 0);
                 preview.addView(name, nameLayout);
                 name.setMaxWidth(dp(Math.max(1, initialSize[0] - 16)));
-                TextView duration = text("0:00", 12, Color.WHITE);
+                TextView duration = text("0:00", MaiChatTypographyTokens.Role.METADATA, Color.WHITE);
                 duration.setPadding(dp(5), dp(2), dp(5), dp(2));
                 duration.setBackground(MaiChatTheme.rounded(Color.argb(180, 0, 0, 0), 8, activity));
                 FrameLayout.LayoutParams durationLayout =
@@ -3179,11 +3255,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             audio.addView(play, new LayoutParams(dp(38), dp(38)));
             LinearLayout labels = column();
             labels.setPadding(dp(12), 0, 0, 0);
-            TextView name = text(file.getName(), 14, MaiChatTheme.TEXT);
+            TextView name = text(file.getName(), MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.TEXT);
             name.setSingleLine(true);
             name.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
             labels.addView(name, matchWrap());
-            TextView duration = text("0:00", 11, MaiChatTheme.SECONDARY);
+            TextView duration = text("0:00", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
             labels.addView(duration, matchWrap());
             audio.addView(labels, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
             new Thread(() -> {
@@ -3365,10 +3441,10 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private ImageButton headerIcon(int drawable, String description, OnClickListener action) {
         ImageButton button = new ImageButton(activity);
         button.setImageResource(drawable);
-        button.setColorFilter(Color.BLACK);
+        button.setColorFilter(MaiChatTheme.TEXT);
         button.setScaleType(ImageView.ScaleType.CENTER);
         button.setPadding(dp(10), dp(10), dp(10), dp(10));
-        button.setBackground(MaiChatTheme.rounded(Color.rgb(242, 242, 247), 12, activity));
+        button.setBackground(MaiChatTheme.rounded(MaiChatTheme.GROUPED_PAGE, 12, activity));
         button.setContentDescription(description);
         button.setOnClickListener(action);
         return button;
@@ -3399,7 +3475,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         ImageView icon = new ImageView(activity);
         icon.setImageResource(drawable);
         item.addView(icon, new LayoutParams(dp(24), dp(24)));
-        TextView label = text(title, 12, MaiChatTheme.TEXT);
+        TextView label = text(title, MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.TEXT);
         label.setGravity(Gravity.CENTER);
         LayoutParams labelParams = matchWrap();
         labelParams.setMargins(0, dp(5), 0, 0);
@@ -3420,8 +3496,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         row.setClickable(true);
         row.setFocusable(true);
         LinearLayout top = row();
-        TextView heading = text(title, 15, MaiChatTheme.TEXT);
-        heading.setTypeface(selected ? MaiChatTypography.semibold() : android.graphics.Typeface.SANS_SERIF);
+        // 会话名称与普通正文共用基准；选中状态由背景表达，避免另外覆盖字体字重。
+        TextView heading = text(title, MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT);
+        heading.setTypeface(MaiChatTypography.normal());
         heading.setSingleLine(true);
         heading.setEllipsize(android.text.TextUtils.TruncateAt.END);
         top.addView(heading, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1));
@@ -3432,7 +3509,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         }
         row.addView(top, matchWrap());
         if (!detail.isEmpty()) {
-            TextView status = text(detail, 12, MaiChatTheme.BLUE);
+            TextView status = text(detail, MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.BLUE);
             LayoutParams statusParams = matchWrap();
             statusParams.setMargins(0, dp(3), 0, 0);
             row.addView(status, statusParams);
@@ -3451,25 +3528,30 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         row.setOnClickListener(action);
         row.setClickable(true);
         row.setFocusable(true);
-        TextView heading = text(title, 14, titleColor);
+        TextView heading = text(title, MaiChatTypographyTokens.Role.DETAIL, titleColor);
         heading.setTypeface(MaiChatTypography.semibold());
         row.addView(heading, matchWrap());
         if (!value.isEmpty()) {
-            TextView detail = text(value, 11, MaiChatTheme.SECONDARY);
+            TextView detail = text(value, MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
             detail.setSingleLine(true);
             detail.setEllipsize(android.text.TextUtils.TruncateAt.END);
             row.addView(detail, matchWrap());
         }
         return row;
     }
-    private TextView text(String source, int size, int color) {
-        return MaiChatTheme.text(activity, source, size, color);
+    private View actionPanelDivider() {
+        View divider = new View(activity);
+        divider.setBackgroundColor(Color.rgb(239, 242, 246));
+        return divider;
+    }
+    private TextView text(String source, MaiChatTypographyTokens.Role role, int color) {
+        return MaiChatTheme.text(activity, source, role, color);
     }
     private Button button(String title, String description, OnClickListener action) {
-        Button button = new Button(activity);
+        Button button = MaiChatTypography.button(activity);
         button.setAllCaps(false);
         button.setText(title);
-        button.setTextSize(13);
+        MaiChatTypography.apply(button, MaiChatTypographyTokens.Role.DETAIL);
         button.setTextColor(MaiChatTheme.BLUE);
         button.setPadding(dp(3), 0, dp(3), 0);
         button.setMinWidth(0);

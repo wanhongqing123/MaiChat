@@ -49,9 +49,12 @@ typedef struct MaiFfplayHdrSourceInfo {
     int hlg;
     int has_ambient;
     uint8_t ambient[8];
+    int is_iso_base_media;
 } MaiFfplayHdrSourceInfo;
 // Read the source's HLG ambient viewing environment once before playback.
 // The eight bytes are the big-endian 'amve' payload accepted by CAEDRMetadata.
+// is_iso_base_media reports MP4/MOV family containers; the host decides which
+// supported platform HDR presentation path to use without guessing by suffix.
 MAI_FFPLAY_EXPORT int maiFfplayProbeHdrSource(const char* path,
                                               MaiFfplayHdrSourceInfo* info);
 MAI_FFPLAY_EXPORT int maiFfplayProbeHdrSourceFromHost(

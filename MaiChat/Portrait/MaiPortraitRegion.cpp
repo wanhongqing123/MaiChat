@@ -112,3 +112,15 @@ std::array<float, 8> MaiPortraitRegionPlanner::globalFeatures(const unsigned cha
                                (static_cast<float>(plan.sourceWidth) * plan.sourceHeight)),
             0};
 }
+
+bool MaiPortraitRegionPlanner::samePersonCrop(const std::array<float, 4>& a, const std::array<float, 4>& b) {
+    for (float value : a)
+        if (!std::isfinite(value)) return false;
+    for (float value : b)
+        if (!std::isfinite(value)) return false;
+    const float ax = a[2] - a[0], ay = a[3] - a[1], bx = b[2] - b[0], by = b[3] - b[1];
+    const float first = std::hypot(ax, ay), second = std::hypot(bx, by), radius = std::min(first, second);
+    if (radius < 1 || std::max(first, second) / radius > 1.15f) return false;
+    return std::hypot(a[0] - b[0], a[1] - b[1]) < .08f * radius &&
+           std::hypot(a[2] - b[2], a[3] - b[3]) < .08f * radius && (ax * bx + ay * by) / (first * second) > .997f;
+}

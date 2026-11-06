@@ -25,7 +25,7 @@ final class AIAssistantOutgoingQueue {
             JSONArray next = copy(items);
             for (int i = 0; i < next.length(); i++) {
                 JSONObject entry = next.getJSONObject(i);
-                if (entry.getString("state").equals("dispatching")) {
+                if ((entry.getString("state").equals("dispatching") || entry.getString("state").equals("forwarded"))) {
                     // 进程退出不是失败收据；恢复时不能重放可能已经执行的 send/steer。
                     entry.put("state", "unknown"); changed = true;
                 } else if (entry.getString("state").equals("preparing")) {
@@ -88,9 +88,43 @@ final class AIAssistantOutgoingQueue {
         try {
             for (int i = 0; i < items.length(); i++) {
                 JSONObject entry = items.getJSONObject(i);
-                if (owner.equals(entry.getString("owner"))) return new JSONObject(entry.toString());
+                if (!owner.equals(entry.getString("owner"))) continue;
+                String state = entry.getString("state");
+                // These remote inputs already have independent delivery state;
+                // their model/business receipts must not block later input.
+                if (entry.getJSONObject("payload").optString("operation").equals("enqueue") &&
+                    (state.equals("forwarded") || state.equals("unknown") || state.equals("failed"))) continue;
+                return new JSONObject(entry.toString());
             }
             return null;
+        } catch (Exception failure) { throw io(failure); }
+    }
+
+    synchronized JSONObject entry(String id) throws IOException {
+        try {
+            for (int i = 0; i < items.length(); i++) {
+                JSONObject entry = items.getJSONObject(i);
+                if (id.equals(entry.getString("id"))) return new JSONObject(entry.toString());
+            }
+            return null;
+        } catch (Exception failure) { throw io(failure); }
+    }
+
+    // Only owner-queued remote prompts can be resent across turn changes. The
+    // same ID and prepared attachment references reach the owner's durable dedup.
+    synchronized void retryInput(String id) throws IOException {
+        try {
+            JSONArray next = copy(items);
+            for (int i = 0; i < next.length(); i++) {
+                JSONObject entry = next.getJSONObject(i);
+                if (!id.equals(entry.getString("id"))) continue;
+                String state = entry.getString("state");
+                if (!entry.getJSONObject("payload").optString("operation").equals("enqueue") ||
+                    (!state.equals("unknown") && !state.equals("failed")))
+                    throw new IOException("This input cannot be retried");
+                entry.put("state", "queued"); commit(next); return;
+            }
+            throw new IOException("Input was already acknowledged");
         } catch (Exception failure) { throw io(failure); }
     }
 
@@ -117,7 +151,8 @@ final class AIAssistantOutgoingQueue {
                 String old = entry.getString("state");
                 if (!(old.equals("queued") && (state.equals("preparing") || state.equals("dispatching") || state.equals("failed")))
                     && !(old.equals("preparing") && (state.equals("dispatching") || state.equals("failed")))
-                    && !(old.equals("dispatching") && (state.equals("unknown") || state.equals("failed"))))
+                    && !(old.equals("dispatching") && (state.equals("forwarded") || state.equals("unknown") || state.equals("failed")))
+                    && !(old.equals("forwarded") && (state.equals("unknown") || state.equals("failed"))))
                     throw new IOException("发送条目状态已改变");
                 entry.put("state", state);
                 if (payload != null) entry.put("payload", new JSONObject(payload.toString()));
@@ -154,7 +189,11 @@ final class AIAssistantOutgoingQueue {
 
     synchronized void accept(String id, String messageId, String turnId) throws IOException {
         try {
-            if (messageId.isEmpty() || turnId.isEmpty()) throw new IOException("缺少明确消息与轮次收据");
+            JSONObject original = entry(id);
+            if (original == null) throw new IOException("发送条目不存在");
+            boolean queuedInput = original.getJSONObject("payload").optString("operation").equals("enqueue");
+            if (messageId.isEmpty() || (!queuedInput && turnId.isEmpty()))
+                throw new IOException("缺少明确消息与轮次收据");
             // 拷贝后再改尾项；写入失败时，原队首和未绑定草稿均保持原状。
             JSONArray captured = copy(items);
             String acceptedOwner = "";
@@ -162,7 +201,7 @@ final class AIAssistantOutgoingQueue {
                 JSONObject entry = captured.getJSONObject(i);
                 if (!id.equals(entry.getString("id"))) continue;
                 acceptedOwner = entry.getString("owner");
-                if (!id.equals(head(acceptedOwner).getString("id")))
+                if (!queuedInput && !id.equals(head(acceptedOwner).getString("id")))
                     throw new IOException("只能确认原所有者的队首内容");
             }
             JSONArray next = new JSONArray();
@@ -170,7 +209,7 @@ final class AIAssistantOutgoingQueue {
             for (int i = 0; i < captured.length(); i++) {
                 JSONObject entry = captured.getJSONObject(i);
                 if (id.equals(entry.getString("id"))) {
-                    if (!entry.getString("state").equals("dispatching"))
+                    if (!queuedInput && !entry.getString("state").equals("dispatching"))
                         throw new IOException("不能移除未确认派发的内容");
                     removed = true;
                 } else {

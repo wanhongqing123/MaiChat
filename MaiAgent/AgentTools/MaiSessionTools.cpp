@@ -328,6 +328,62 @@ public:
     }
 };
 
+class SendSessionInputTool final : public MaiTool {
+public:
+    std::string name() const override {
+        return "session_send_input";
+    }
+    std::string description() const override {
+        return "When the user asks to send input to another top-level conversation on this device, "
+               "enqueue text using an ID from session_list. The owner accepts it while busy and "
+               "consumes "
+               "it at a safe boundary without interrupting tools. Returns a persisted "
+               "user_message_id, "
+               "which confirms reception, not completion. Optional request_id must remain "
+               "unchanged on retry.";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object","properties":{"session_id":{"type":"string"},"text":{"type":"string","maxLength":65536},"request_id":{"type":"string","minLength":1,"maxLength":128}},"required":["session_id","text"],"additionalProperties":false})";
+    }
+    bool requiresApproval(const std::string&) const override {
+        return true;
+    }
+    bool requiresPerCallApproval(const std::string&) const override {
+        return true;
+    }
+    MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
+        if (!context.sessionAgent) return unavailable();
+        const auto parsed = parseArguments(raw);
+        if (!parsed) return failed(parsed.error());
+        const Json& args = parsed.value();
+        if (!args.contains("session_id") || !args["session_id"].is_string() ||
+            !args.contains("text") || !args["text"].is_string() ||
+            (args.contains("request_id") && !args["request_id"].is_string()))
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "session_id and text must be strings");
+        for (auto it = args.begin(); it != args.end(); ++it)
+            if (it.key() != "session_id" && it.key() != "text" && it.key() != "request_id")
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "unknown session input argument");
+        MaiSession current, target;
+        const std::string id = args["session_id"];
+        if (!context.sessionAgent->getSession(context.sessionId, current) || !current.isRoot() ||
+            !context.sessionAgent->getSession(id, target) || !target.isRoot() ||
+            id == context.sessionId)
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "select another top-level conversation");
+        if (context.isCanceled())
+            return MaiToolResult::failure(MaiErrorCode::Canceled, "session input was canceled");
+        const std::string requestId = args.value("request_id", context.partId);
+        const auto accepted = context.sessionAgent->submit(
+            MaiEnqueuePrompt{MaiSendPrompt{id, args["text"]}, requestId});
+        if (!accepted) return failed(accepted.error());
+        return MaiToolResult::success(
+            Json{{"accepted", true}, {"session_id", id}, {"user_message_id", accepted.value()}}
+                .dump());
+    }
+};
+
 class SetWorkspaceTool final : public MaiTool {
 public:
     std::string name() const override {
@@ -419,5 +475,6 @@ void registerMaiSessionTools(MaiToolRegistry& registry, bool includeWorkspaceSwi
     registry.add(makeMaiCreateSessionTool(MaiSessionCreateMode::InheritWorkspace));
     registry.add(std::make_unique<DeleteSessionTool>());
     registry.add(std::make_unique<RenameSessionTool>());
+    registry.add(std::make_unique<SendSessionInputTool>());
     if (includeWorkspaceSwitch) registry.add(std::make_unique<SetWorkspaceTool>());
 }

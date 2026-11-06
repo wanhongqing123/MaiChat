@@ -2,6 +2,7 @@
 // 主要实现：exists、isDirectory、isSymbolicLink；对应公开接口中的状态和错误处理。
 #include <windows.h>
 
+#include <utility>
 #include <vector>
 
 #include "MaiFilePath.h"
@@ -140,6 +141,35 @@ bool MaiFileSystem::modifiedTime(const MaiFilePath& path, std::int64_t& seconds)
     constexpr std::uint64_t kEpochOffset = 116444736000000000ull;
     if (stamp.QuadPart < kEpochOffset) return false;
     seconds = static_cast<std::int64_t>((stamp.QuadPart - kEpochOffset) / 10000000ull);
+    return true;
+}
+
+bool MaiFileSystem::regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo& out) {
+    if (path.isEmpty()) return false;
+    const HANDLE handle = ::CreateFileW(
+        path.value().c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info{};
+    FILE_BASIC_INFO basic{};
+    const bool valid =
+        ::GetFileType(handle) == FILE_TYPE_DISK && ::GetFileInformationByHandle(handle, &info) &&
+        ::GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic)) &&
+        !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+    ::CloseHandle(handle);
+    constexpr std::uint64_t kEpochOffset = 116444736000000000ull;
+    if (!valid || static_cast<std::uint64_t>(basic.LastWriteTime.QuadPart) < kEpochOffset)
+        return false;
+    MaiRegularFileInfo result;
+    result.bytes = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    result.modified = (basic.LastWriteTime.QuadPart - kEpochOffset) / 10000000ull;
+    result.identity = std::to_string(info.dwVolumeSerialNumber) + ":" +
+                      std::to_string(info.nFileIndexHigh) + ":" +
+                      std::to_string(info.nFileIndexLow) + ":" +
+                      std::to_string(basic.LastWriteTime.QuadPart) + ":" +
+                      std::to_string(basic.ChangeTime.QuadPart);
+    out = std::move(result);
     return true;
 }
 

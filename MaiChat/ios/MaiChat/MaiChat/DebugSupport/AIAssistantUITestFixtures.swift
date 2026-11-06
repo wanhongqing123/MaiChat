@@ -858,6 +858,8 @@ enum AIAssistantUITestRouting {
     static var usesStandaloneFixture: Bool {
         let arguments = ProcessInfo.processInfo.arguments
         return arguments.contains("--app-bars-layout-ui-test") ||
+            arguments.contains("--markdown-breaks-ui-test") ||
+            arguments.contains("--my-settings-ui-test") ||
             arguments.contains("--ai-history-ui-test") ||
             arguments.contains("--ai-welcome-ui-test") ||
             arguments.contains("--ai-steering-ui-test") ||

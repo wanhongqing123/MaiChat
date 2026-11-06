@@ -11,7 +11,7 @@ extern "C" {
 // request 的 steer 操作为 {op:"steer",session,turnId,requestId,text,images?,videos?,
 // quoteMessageId?}，媒体字段形状同 send。turnId 取该 session 的 snapshot.turnId，
 // 整轮稳定；requestId 由宿主生成且重试复用。成功 {ok:true,id:<已落库 user ID>}，
-// 只表示已接收，完整工具批次结束后、下一次模型请求前消费。idle/stop/收尾拒绝，
+// 只表示已接收，当前工具结束后消费；未执行的同批调用交回模型重新判断。idle/stop/收尾拒绝，
 // 不启动另一轮；失败须保留草稿，禁止自动回退 send。同轮相同请求有界幂等。
 // send/steer 成功另附 user_message_id 与 turnId：前者明确指向真实用户消息，
 // 后者是原任务最初的 assistant ID，即使任务已完成或重试也不改为后来活动轮次。

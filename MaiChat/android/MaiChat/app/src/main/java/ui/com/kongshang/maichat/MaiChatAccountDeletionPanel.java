@@ -92,8 +92,8 @@ public final class MaiChatAccountDeletionPanel extends LinearLayout {
         addView(scroll, new LayoutParams(-1, -1));
         form = new LinearLayout(activity); form.setOrientation(VERTICAL);
         form.setPadding(dp(18), dp(18), dp(18), dp(28)); scroll.addView(form);
-        addText("提交后立即停用 MaiChat 账号并撤销登录。好友关系、云端会话和可识别素材会进入清理流程；依法必须保留的记录按期限处理。", 14, MaiChatTheme.SECONDARY);
-        message = addText("正在读取注销确认方式…", 14, MaiChatTheme.SECONDARY);
+        addText("提交后立即停用 MaiChat 账号并撤销登录。好友关系、云端会话和可识别素材会进入清理流程；依法必须保留的记录按期限处理。", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
+        message = addText("正在读取注销确认方式…", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         retry = button("重新加载", () -> loadOptions()); form.addView(retry, row());
         submit = button("提交注销申请", this::confirmSubmission);
         submit.setTextColor(MaiChatTheme.RED); submit.setEnabled(false);
@@ -130,7 +130,7 @@ public final class MaiChatAccountDeletionPanel extends LinearLayout {
     }
 
     private void buildFields() {
-        addText("确认身份", 14, MaiChatTheme.SECONDARY);
+        addText("确认身份", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         usePassword = options.hasPassword;
         if (options.hasPassword && options.phoneMasked != null) {
             RadioGroup modes = new RadioGroup(activity); modes.setOrientation(HORIZONTAL);
@@ -144,16 +144,16 @@ public final class MaiChatAccountDeletionPanel extends LinearLayout {
         }
         password = input("输入登录密码", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         password.setSaveEnabled(false); password.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
-        if (options.phoneMasked != null) addText("已绑定手机号：" + options.phoneMasked, 14, MaiChatTheme.SECONDARY);
+        if (options.phoneMasked != null) addText("已绑定手机号：" + options.phoneMasked, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         code = input("输入 6 位验证码", InputType.TYPE_CLASS_NUMBER);
         code.setSaveEnabled(false); code.setFilters(new InputFilter[] {new InputFilter.LengthFilter(6)});
         sendCode = button("获取验证码", this::requestCode); form.addView(sendCode, row());
-        addText("确认 MaiChat ID", 14, MaiChatTheme.SECONDARY);
-        TextView account = addText(service.accountId(), 16, MaiChatTheme.TEXT); account.setTextIsSelectable(true);
+        addText("确认 MaiChat ID", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
+        TextView account = addText(service.accountId(), MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT); account.setTextIsSelectable(true);
         confirmation = input("输入上方 MaiChat ID", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
         confirmation.setSaveEnabled(false);
         if (!options.hasPassword && options.phoneMasked == null)
-            addText("当前账号没有可用的核验方式，请联系支持处理。", 14, MaiChatTheme.RED);
+            addText("当前账号没有可用的核验方式，请联系支持处理。", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.RED);
         form.addView(submit, row());
     }
 
@@ -247,7 +247,7 @@ public final class MaiChatAccountDeletionPanel extends LinearLayout {
     private void dismissDanger() { AlertDialog previous = danger; danger = null; if (previous != null) previous.dismiss(); }
 
     private EditText input(String hint, int inputType) {
-        EditText view = new EditText(activity); view.setSingleLine(); view.setHint(hint); view.setInputType(inputType);
+        EditText view = MaiChatTypography.input(activity); view.setSingleLine(); view.setHint(hint); view.setInputType(inputType);
         view.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) { if (confirmation != null) updateControls(); }
@@ -255,10 +255,10 @@ public final class MaiChatAccountDeletionPanel extends LinearLayout {
         });
         form.addView(view, row()); return view;
     }
-    private TextView addText(String value, int size, int color) {
-        TextView view = MaiChatTheme.text(activity, value, size, color); form.addView(view, row()); return view;
+    private TextView addText(String value, MaiChatTypographyTokens.Role role, int color) {
+        TextView view = MaiChatTheme.text(activity, value, role, color); form.addView(view, row()); return view;
     }
-    private Button button(String title, Runnable action) { Button button = new Button(activity); button.setText(title);
+    private Button button(String title, Runnable action) { Button button = MaiChatTypography.button(activity); button.setText(title);
         button.setOnClickListener(view -> action.run()); return button; }
     private LayoutParams row() { LayoutParams params = new LayoutParams(-1, -2); params.bottomMargin = dp(12); return params; }
     private int dp(int value) { return MaiChatTheme.dp(activity, value); }

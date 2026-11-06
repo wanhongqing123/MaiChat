@@ -1,6 +1,7 @@
 // 文件作用：桌面端共用界面；AddContactDialog 负责对话框呈现、确认交互和结果回传，本文件给出其实现。
 // 主要入口：userId、setUserId、buildUi、applyStyle。
 // 实现边界：与 AddContactDialog 的公开声明配套，调用方通过相应接口进入。
+#include "ui/UiZoom.h"
 #include "ui/AddContactDialog.h"
 #include "ui/FriendQrDecoder.h"
 
@@ -175,7 +176,7 @@ void AddContactDialog::buildUi() {
 
 // 作用：应用页面现有的颜色、字号、间距和控件外观。
 void AddContactDialog::applyStyle() {
-    setStyleSheet(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         QDialog#addContactDialog {
             background: transparent;
         }
@@ -186,19 +187,19 @@ void AddContactDialog::applyStyle() {
         }
         #addContactTitle {
             color: #0e1628;
-            font-size: 24px;
+            font-size: @heading1;
             font-weight: 700;
             background: transparent;
         }
         #addContactSubtitle {
             color: #66758c;
-            font-size: 13px;
+            font-size: @detail;
             font-weight: 700;
             background: transparent;
         }
         #addContactFieldLabel {
             color: #172033;
-            font-size: 15px;
+            font-size: @body;
             font-weight: 700;
             background: transparent;
         }
@@ -209,7 +210,7 @@ void AddContactDialog::applyStyle() {
             background: #ffffff;
             color: #101828;
             padding: 0 14px;
-            font-size: 16px;
+            font-size: @body;
         }
         #contactUserIdInput:focus {
             border-color: #42b8ff;
@@ -220,18 +221,18 @@ void AddContactDialog::applyStyle() {
             background: transparent;
             border: 0;
             text-align: left;
-            font-size: 14px;
+            font-size: @detail;
         }
         #showOwnFriendQrButton:disabled { color: #90a2b8; }
-        #scanFriendQrStatus { color: #66758c; font-size: 12px; }
+        #scanFriendQrStatus { color: #66758c; font-size: @metadata; }
         #ownFriendQr { background: #ffffff; border: 0; }
-        #ownFriendAccount { color: #66758c; font-size: 13px; }
+        #ownFriendAccount { color: #66758c; font-size: @detail; }
         #addContactCancelButton,
         #addContactConfirmButton {
             min-width: 96px;
             min-height: 40px;
             border-radius: 10px;
-            font-size: 14px;
+            font-size: @detail;
             font-weight: 700;
         }
         #addContactCancelButton {

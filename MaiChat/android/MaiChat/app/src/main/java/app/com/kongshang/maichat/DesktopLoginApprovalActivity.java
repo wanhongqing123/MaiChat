@@ -46,7 +46,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** 扫描时只接受本产品 URI；展示服务端核对码后才允许批准。 */
-public final class DesktopLoginApprovalActivity extends ComponentActivity {
+public final class DesktopLoginApprovalActivity extends MaiChatBaseActivity {
     private enum State { SCANNING, PERMISSION, LOADING, CONFIRM, DECIDING, RESULT, ERROR }
 
     private static final int CAMERA_PERMISSION_REQUEST = 1;
@@ -414,14 +414,14 @@ public final class DesktopLoginApprovalActivity extends ComponentActivity {
         LinearLayout header = new LinearLayout(this);
         header.setGravity(Gravity.CENTER_VERTICAL);
         header.setPadding(dp(20), 0, dp(20), 0);
-        header.setBackgroundColor(Color.WHITE);
+        header.setBackgroundColor(MaiChatTheme.PANEL);
         root.addView(header, new LinearLayout.LayoutParams(-1, dp(56)));
-        TextView back = MaiChatTheme.label(this, "‹", 32, MaiChatTheme.TEXT);
+        TextView back = MaiChatTheme.symbol(this, "‹", 32, MaiChatTheme.TEXT);
         back.setGravity(Gravity.CENTER);
         back.setContentDescription("返回设置");
         header.addView(back, new LinearLayout.LayoutParams(dp(40), -1));
         back.setOnClickListener(view -> onBackPressed());
-        TextView title = MaiChatTheme.label(this, "扫码登录桌面端", 18, MaiChatTheme.TEXT);
+        TextView title = MaiChatTheme.label(this, "扫码登录桌面端", MaiChatTypographyTokens.Role.HEADING3, MaiChatTheme.TEXT);
         title.setPadding(dp(8), 0, 0, 0);
         header.addView(title, new LinearLayout.LayoutParams(-1, -1));
 
@@ -483,7 +483,7 @@ public final class DesktopLoginApprovalActivity extends ComponentActivity {
         border.setBackground(outline);
         int scanSize = landscape ? dp(180) : dp(248);
         frame.addView(border, new FrameLayout.LayoutParams(scanSize, scanSize, Gravity.CENTER));
-        scannerHint = MaiChatTheme.label(this, "将电脑上的登录二维码放入框内", 15, Color.WHITE);
+        scannerHint = MaiChatTheme.label(this, "将电脑上的登录二维码放入框内", MaiChatTypographyTokens.Role.DETAIL, Color.WHITE);
         scannerHint.setGravity(Gravity.CENTER);
         scannerHint.setBackground(MaiChatTheme.rounded(0xCC14213A, 12, this));
         FrameLayout.LayoutParams hintParams = new FrameLayout.LayoutParams(-2, dp(48),
@@ -505,20 +505,20 @@ public final class DesktopLoginApprovalActivity extends ComponentActivity {
         cardParams.setMargins(0, dp(26), 0, dp(22));
         content.addView(card, cardParams);
         TextView target = MaiChatTheme.label(this,
-            platform.equals("mac") ? "Mac 桌面端" : "Windows 桌面端", 16, MaiChatTheme.TEXT);
+            platform.equals("mac") ? "Mac 桌面端" : "Windows 桌面端", MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT);
         target.setGravity(Gravity.CENTER);
         card.addView(target, new LinearLayout.LayoutParams(-1, dp(36)));
-        TextView code = MaiChatTheme.label(this, displayCode, 38, MaiChatTheme.BLUE_DARK);
+        TextView code = MaiChatTheme.label(this, displayCode, MaiChatTypographyTokens.Role.HERO, MaiChatTheme.BLUE_DARK);
         code.setGravity(Gravity.CENTER);
         code.setLetterSpacing(0.12f);
         code.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         card.addView(code, new LinearLayout.LayoutParams(-1, dp(70)));
-        expiryLabel = MaiChatTheme.text(this, "", 13, MaiChatTheme.SECONDARY);
+        expiryLabel = MaiChatTheme.text(this, "", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         expiryLabel.setGravity(Gravity.CENTER);
         card.addView(expiryLabel, new LinearLayout.LayoutParams(-1, dp(28)));
         main.post(tick);
         if (!errorMessage.isEmpty()) {
-            TextView failure = MaiChatTheme.text(this, errorMessage, 14, MaiChatTheme.RED);
+            TextView failure = MaiChatTheme.text(this, errorMessage, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.RED);
             failure.setGravity(Gravity.CENTER);
             content.addView(failure, new LinearLayout.LayoutParams(-1, dp(48)));
         }
@@ -532,13 +532,13 @@ public final class DesktopLoginApprovalActivity extends ComponentActivity {
     }
 
     private void addTitle(LinearLayout content, String value) {
-        TextView title = MaiChatTheme.label(this, value, 22, MaiChatTheme.TEXT);
+        TextView title = MaiChatTheme.label(this, value, MaiChatTypographyTokens.Role.HEADING1, MaiChatTheme.TEXT);
         title.setGravity(Gravity.CENTER);
         content.addView(title, new LinearLayout.LayoutParams(-1, dp(50)));
     }
 
     private void addDetail(LinearLayout content, String value) {
-        TextView detail = MaiChatTheme.text(this, value, 15, MaiChatTheme.SECONDARY);
+        TextView detail = MaiChatTheme.text(this, value, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         detail.setGravity(Gravity.CENTER);
         detail.setLineSpacing(dp(3), 1);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
@@ -547,10 +547,10 @@ public final class DesktopLoginApprovalActivity extends ComponentActivity {
     }
 
     private void addButton(LinearLayout content, String title, boolean primary, Runnable action) {
-        Button button = new Button(this);
+        Button button = MaiChatTypography.button(this);
         button.setAllCaps(false);
         button.setText(title);
-        button.setTextSize(16);
+        MaiChatTypography.apply(button, MaiChatTypographyTokens.Role.BODY);
         button.setTextColor(primary ? Color.WHITE : MaiChatTheme.TEXT);
         button.setBackground(primary
             ? MaiChatTheme.rounded(MaiChatTheme.BLUE, 10, this)

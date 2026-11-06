@@ -14,6 +14,7 @@
 #if defined(__ANDROID__)
 #include <atomic>
 #endif
+#include <utility>
 #include <vector>
 
 #if defined(__ANDROID__)
@@ -120,6 +121,27 @@ bool MaiFileSystem::modifiedTime(const MaiFilePath& path, std::int64_t& seconds)
     struct stat info {};
     if (::lstat(path.value().c_str(), &info) != 0) return false;
     seconds = static_cast<std::int64_t>(info.st_mtime);
+    return true;
+}
+
+bool MaiFileSystem::regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo& out) {
+    struct stat info{};
+    if (path.isEmpty() || ::lstat(path.value().c_str(), &info) != 0 || !S_ISREG(info.st_mode))
+        return false;
+#if defined(__APPLE__)
+    const auto modified = info.st_mtimespec;
+    const auto changed = info.st_ctimespec;
+#else
+    const auto modified = info.st_mtim;
+    const auto changed = info.st_ctim;
+#endif
+    MaiRegularFileInfo result;
+    result.bytes = static_cast<std::uint64_t>(info.st_size);
+    result.modified = static_cast<std::int64_t>(info.st_mtime);
+    result.identity = std::to_string(info.st_dev) + ":" + std::to_string(info.st_ino) + ":" +
+                      std::to_string(modified.tv_sec) + ":" + std::to_string(modified.tv_nsec) +
+                      ":" + std::to_string(changed.tv_sec) + ":" + std::to_string(changed.tv_nsec);
+    out = std::move(result);
     return true;
 }
 

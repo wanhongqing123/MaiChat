@@ -7,6 +7,7 @@
 #include <QPointer>
 #include <QRegularExpression>
 #include <QSet>
+#include <QUuid>
 
 #include <atomic>
 #include <mutex>
@@ -120,6 +121,15 @@ QJsonArray DesktopSessionSyncHost::rootSessions() const {
                                   {QStringLiteral("busy"), controller_.agent().isBusy(session.id)}});
     }
     return result;
+}
+
+QJsonObject DesktopSessionSyncHost::historyMessage(const QString& sessionId, const QString& messageId) const {
+    MaiSession session;
+    MaiMessage message;
+    if (!controller_.agent().getSession(sessionId.toStdString(), session) || !session.isRoot() ||
+        !controller_.agent().getMessage(sessionId.toStdString(), messageId.toStdString(), message))
+        return {};
+    return serializeMessage(message, controller_.agent().isBusy(sessionId.toStdString()), sessionId.toStdString());
 }
 
 QJsonObject DesktopSessionSyncHost::historyPage(const QString& sessionId, const QString& beforeId, int limit) const {
@@ -272,12 +282,16 @@ QJsonObject DesktopSessionSyncHost::applyCommand(const QString& sessionId, const
     if (action == QStringLiteral("prompt") || action == QStringLiteral("steer")) {
         const bool steering = action == QStringLiteral("steer");
         const QString turn = payload.value(QStringLiteral("turnId")).toString();
-        const QString request = payload.value(QStringLiteral("requestId")).toString();
+        QString request = payload.value(QStringLiteral("requestId")).toString();
         const QString quote = payload.value(QStringLiteral("quoteMessageId")).toString();
         static const QRegularExpression id(QStringLiteral("^[A-Za-z0-9_-]{1,128}$"));
         if (steering && (!id.match(turn).hasMatch() || !id.match(request).hasMatch() || request.size() > 96 ||
                          (!quote.isEmpty() && !id.match(quote).hasMatch())))
             return failure(QStringLiteral("当前任务标识无效，请重新读取会话"));
+        if (!steering && payload.contains(QStringLiteral("requestId")) &&
+            (!payload.value(QStringLiteral("requestId")).isString() || !id.match(request).hasMatch() ||
+             request.size() > 96))
+            return failure(QStringLiteral("消息请求编号无效"));
         const QString message = payload.value(QStringLiteral("text")).toString();
         const QJsonArray attachments = payload.value(QStringLiteral("resolved_attachments")).toArray();
         if ((message.isEmpty() && attachments.isEmpty()) || message.toUtf8().size() > 16 * 1024 ||
@@ -329,15 +343,17 @@ QJsonObject DesktopSessionSyncHost::applyCommand(const QString& sessionId, const
                     {QStringLiteral("user_message_id"), text(accepted.value())},
                     {QStringLiteral("turnId"), turn}};
         }
-        if (!controller_.sendPrompt(sessionId, prompt, images, videos, {})) return failure(controller_.lastError());
-        const QJsonArray recent = historyPage(sessionId, {}, 2).value(QStringLiteral("messages")).toArray();
-        for (const QJsonValue& value : recent) {
-            const QJsonObject candidate = value.toObject();
-            if (candidate.value(QStringLiteral("role")).toString() == QStringLiteral("user"))
-                return {{QStringLiteral("ok"), true},
-                        {QStringLiteral("user_message_id"), candidate.value(QStringLiteral("id"))},
-                        {QStringLiteral("turnId"), text(controller_.agent().activeTurnId(sessionId.toStdString()))}};
-        }
+        // 普通远端消息由所属端接收排队，不依赖观察端缓存的 turnId 或忙闲状态。
+        // Coordinator 为旧调用补上信箱请求编号；直接普通调用未给编号时视为新消息。
+        if (request.isEmpty()) request = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const auto accepted = controller_.agent().submit(
+            MaiEnqueuePrompt{MaiSendPrompt{sessionId.toStdString(), prompt.toStdString(), std::move(steeringImages),
+                                           std::move(steeringVideos), quote.toStdString()},
+                             request.toStdString()});
+        if (!accepted) return failure(text(accepted.error().message()));
+        return {{QStringLiteral("ok"), true},
+                {QStringLiteral("accepted"), true},
+                {QStringLiteral("user_message_id"), text(accepted.value())}};
     } else if (action == QStringLiteral("stop")) {
         if (!controller_.interrupt(sessionId, payload.value(QStringLiteral("turnId")).toString()))
             return failure(controller_.lastError());

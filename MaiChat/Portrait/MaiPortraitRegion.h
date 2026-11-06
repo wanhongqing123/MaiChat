@@ -43,6 +43,9 @@ public:
     // 原图不在这里解码。单 ROI 最长边 2048、至多 4 Mi 像素，不能隐式降低原图细节。
     static MaiPortraitRegionPlan faceRegion(int sourceWidth, int sourceHeight,
                                             const std::vector<MaiPortraitFaceHint>& faces, int subjectIndex);
+    // 多尺度检测的头框大小可能不同；只合并几乎相同的模型髋点/虚拟方向和半径。
+    // 数组为 hipX/hipY/extentX/extentY；不同姿态、尺度或位置必须保留独立目标。
+    static bool samePersonCrop(const std::array<float, 4>& first, const std::array<float, 4>& second);
     static std::vector<MaiPortraitFaceHint> mergeFaces(const std::vector<MaiPortraitFaceHint>& faces);
     // 缩略图为宿主按 EXIF 转正的 RGBA8，最长边 <=256；返回现有八维全局特征。
     static std::array<float, 8> globalFeatures(const unsigned char* rgba, int width, int height, int stride,

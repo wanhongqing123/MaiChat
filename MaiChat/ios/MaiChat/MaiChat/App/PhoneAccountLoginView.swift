@@ -73,7 +73,7 @@ struct PhoneAccountLoginView: View {
                                 errorMessage = nil
                             } label: {
                                 Image(systemName: "chevron.left")
-                                    .font(.system(size: 22, weight: .medium))
+                                    .font(AppTypography.symbol(size: 22, weight: .medium))
                                     .frame(width: 44, height: 44)
                             }
                             .accessibilityLabel("返回手机号登录")
@@ -86,15 +86,15 @@ struct PhoneAccountLoginView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Text(receipt.status == "completed" ? "账号注销已完成" :
                                     "注销申请已提交")
-                                .font(.headline)
+                                .font(AppTypography.heading)
                             Text("申请编号：\(receipt.requestId)")
-                                .font(.footnote.monospaced())
+                                .font(AppTypography.detail.monospaced())
                                 .textSelection(.enabled)
                             if receipt.status == "pending" {
                                 Text("预计完成日：" + Date(timeIntervalSince1970:
                                     Double(receipt.dueAt) / 1_000)
                                     .formatted(date: .abbreviated, time: .omitted))
-                                    .font(.footnote)
+                                    .font(AppTypography.detail)
                                 Button(refreshingDeletionStatus ? "查询中…" : "查询进度") {
                                     Task { await refreshDeletionStatus() }
                                 }
@@ -103,7 +103,7 @@ struct PhoneAccountLoginView: View {
                                 Button("知道了") { appState.dismissAccountDeletionReceipt() }
                             }
                             Text("如需帮助，请联系 \(receipt.supportEmail)。")
-                                .font(.footnote)
+                                .font(AppTypography.detail)
                         }
                         .frame(maxWidth: 470, alignment: .leading)
                         .padding(16)
@@ -124,7 +124,7 @@ struct PhoneAccountLoginView: View {
                         HStack(spacing: 14) {
                             if !usesPassword {
                                 Text("+86")
-                                    .font(.system(size: 18, weight: .semibold))
+                                    .font(AppTypography.heading.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                 Rectangle().fill(Color.black.opacity(0.08))
                                     .frame(width: 1, height: 24)
@@ -171,21 +171,21 @@ struct PhoneAccountLoginView: View {
                                 .foregroundStyle(accent)
                             }
                         }
-                        .font(.system(size: 13))
+                        .font(AppTypography.detail)
                         if let information {
-                            Text(information).font(.footnote).foregroundStyle(.secondary)
+                            Text(information).font(AppTypography.detail).foregroundStyle(.secondary)
                         }
                         if let accountError = appState.errorMessage,
                            appState.shouldShowInitialLogin {
-                            Text(accountError).font(.footnote).foregroundStyle(.red)
+                            Text(accountError).font(AppTypography.detail).foregroundStyle(.red)
                         }
                         if let errorMessage {
-                            Text(errorMessage).font(.footnote).foregroundStyle(.red)
+                            Text(errorMessage).font(AppTypography.detail).foregroundStyle(.red)
                         }
                         Button { Task { await submit() } } label: {
                             HStack(spacing: 8) {
                                 if isBusy { ProgressView().tint(.white) }
-                                Text(buttonTitle).font(.system(size: 18, weight: .semibold))
+                                Text(buttonTitle).font(AppTypography.heading.weight(.semibold))
                             }
                             .frame(maxWidth: .infinity)
                             .frame(height: 56)
@@ -204,7 +204,7 @@ struct PhoneAccountLoginView: View {
                                 Text("我已年满 14 周岁")
                                     .foregroundStyle(Color.secondary)
                             }
-                            .font(.system(size: 12))
+                            .font(AppTypography.metadata)
                         }
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("account-minimum-age")
@@ -230,7 +230,7 @@ struct PhoneAccountLoginView: View {
                                     .accessibilityIdentifier("account-children-privacy")
                             }
                         }
-                        .font(.system(size: 12))
+                        .font(AppTypography.metadata)
                         .foregroundStyle(accent)
                     }
                     .padding(.horizontal, 28)
@@ -252,7 +252,7 @@ struct PhoneAccountLoginView: View {
                 }
             }
         }
-        .background(Color.white.ignoresSafeArea())
+        .background(RemoteIMStyle.pageBackground.ignoresSafeArea())
     }
 
     @MainActor

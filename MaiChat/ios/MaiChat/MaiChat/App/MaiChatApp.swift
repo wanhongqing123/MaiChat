@@ -262,6 +262,7 @@ struct MaiChatApp: App {
                 appContent
                 #endif
             }
+            .appPreferences()
             .overlay {
                 // IM 和创作中心共用的语音悬浮层放在窗口最外侧，始终盖过视频播放器。
                 if let presentation = voiceOverlay.activePresentation {
@@ -292,7 +293,7 @@ struct MaiChatApp: App {
         } else if let error = bootstrap.errorMessage {
             VStack(spacing: 12) {
                 Text("加载失败")
-                Text(error).font(.footnote)
+                Text(error).font(AppTypography.detail)
                 Button("重试") { Task { await bootstrap.load() } }
             }.padding()
         } else {

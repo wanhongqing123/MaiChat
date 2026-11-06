@@ -27,6 +27,33 @@ cmake --build /tmp/maichat-network-test
 ctest --test-dir /tmp/maichat-network-test --output-on-failure
 ```
 
+## Private cloud lookup and originals
+
+Ordinary callers use `mai_cloud_drive_request` with `MAI_CLOUD_DRIVE_SEARCH_MEDIA`
+to resolve a filename before downloading. Supply `query`, optionally `exact_name`,
+`media_type` (`image`/`video`), `folder_id`, and a previous `next_cursor` as `before`.
+Omitting `folder_id` searches every folder; an empty string selects root, and a
+UUID selects that folder's direct files. Named folders can first be resolved
+through `MAI_CLOUD_DRIVE_LIST_FOLDERS`. The search uses existing owner-only metadata
+endpoints; no server update or media transfer is involved.
+
+Each candidate has `media_id`, `name`, `folder_id`, `folder_path`, `cloud_path`,
+`size_bytes`, `media_type`, `content_type`, and `created_at` (upload time in Unix
+milliseconds). English ASCII names match without case; other UTF-8 text matches
+literally. Same-name files retain separate IDs and locations. Paths can be null
+if unavailable or beyond safe depth/length bounds. A call scans up to 20 source
+pages in a bounded time and returns fewer than 100 matches; when `has_more` is
+true, repeat the same filters with `next_cursor`. An empty partial batch is not
+a complete no-match result.
+
+`cloud_path` describes a logical cloud location. To inspect the bytes, pass the
+selected `media_id` and a new absolute `output_path` to
+`MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA`. Its successful `path` is the local file, and its
+byte count has been checked before publication. `mai_download_new_file` shares
+the normal downloader, rejects an existing target atomically, and keeps the
+target absent on size mismatch or cancellation. Search results and download
+receipts expose no signed URL or account credential.
+
 ## AI video circle client
 
 `MaiVideoCircleClient.h` is one C ABI over the shared libcurl transport for

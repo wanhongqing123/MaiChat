@@ -17,6 +17,7 @@ struct AIPortraitUITestRoot: View {
     @State private var busy = true
     @State private var qaJSON = ""
     private var isLargeTest: Bool { ProcessInfo.processInfo.environment["MAICHAT_PORTRAIT_LARGE_TEST"] == "1" }
+    private var isBodyTest: Bool { ProcessInfo.processInfo.environment["MAICHAT_PORTRAIT_BODY_TEST"] == "1" }
 
     var body: some View {
         RootView()
@@ -40,11 +41,11 @@ struct AIPortraitUITestRoot: View {
                         Task { _ = await call(
                             "mobile_preview_image", arguments: ["path": resultPath]) }
                     }.disabled(resultPath.isEmpty || busy)
-                    if !isLargeTest {
+                    if !isLargeTest && !isBodyTest {
                         Button("测试本地训练") { Task { await train() } }.disabled(busy)
                     }
                     if !qaJSON.isEmpty {
-                        Text("24MP 检验数据").accessibilityIdentifier("portrait-fixture-qa")
+                        Text("修图检验数据").accessibilityIdentifier("portrait-fixture-qa")
                             .accessibilityLabel(qaJSON)
                     }
                 }
@@ -108,9 +109,31 @@ struct AIPortraitUITestRoot: View {
                     try checkLarge(pixels.bitsPerComponent == 8 && pixels.bitsPerPixel == 8, "Skin mask is not grayscale L8")
                 }
             }
-            try checkLarge(result["face_count"] as? Int == 1 && result["person_count"] is NSNull &&
-                result["face_analysis_performed"] as? Bool == true && result["person_analysis_performed"] as? Bool == false,
+            try checkLarge(result["face_count"] as? Int == 1 && ((result["person_count"] as? NSNumber)?.intValue ?? -1) >= 0 &&
+                result["face_analysis_performed"] as? Bool == true && result["person_analysis_performed"] as? Bool == true,
                 "Face/person counts do not describe the performed analysis")
+            let ownsPerson = result["person_ownership_reliable"] as? Bool == true
+            try checkLarge(result["skin_scope"] as? String == (ownsPerson ? "selected_person_visible_skin" : "face_skin_only"),
+                           "Partial face-only coverage was reported as full-person processing")
+            // Refinement bounds describe the upright original, not the small
+            // whole-image proxy. Keep that distinction visible in actual App QA.
+            guard let refined = result["skin_refinement_applied"] as? Bool else {
+                throw AIBackendError(message: "Regional skin-analysis status is missing")
+            }
+            if refined {
+                guard let rectangle = result["skin_analysis_source_rect"] as? [Int], rectangle.count == 4,
+                      let proxyWidth = result["skin_analysis_proxy_width"] as? Int,
+                      let proxyHeight = result["skin_analysis_proxy_height"] as? Int else {
+                    throw AIBackendError(message: "Regional skin-analysis dimensions are missing")
+                }
+                let region = CGRect(x: rectangle[0], y: rectangle[1], width: rectangle[2], height: rectangle[3])
+                let center = CGPoint(x: box["x"]!.doubleValue + box["width"]!.doubleValue / 2,
+                                     y: box["y"]!.doubleValue + box["height"]!.doubleValue / 2)
+                try checkLarge(region.width > 0 && region.height > 0 &&
+                    CGRect(x: 0, y: 0, width: 5712, height: 4284).contains(region) && region.contains(center) &&
+                    proxyWidth > 0 && proxyWidth <= 1024 && proxyHeight > 0 && proxyHeight <= 1024,
+                    "Regional analysis did not preserve the selected face's original coordinates")
+            }
             let beforeL = (result["skin_L_before"] as! NSNumber).doubleValue
             let afterL = (result["skin_L_after"] as! NSNumber).doubleValue
             let beforeC = (result["skin_C_before"] as! NSNumber).doubleValue
@@ -141,12 +164,16 @@ struct AIPortraitUITestRoot: View {
                                "24MP ROI edge or background block changed")
             }
             var qa: [String: Any] = ["status": "PASS", "width": 5712, "height": 4284,
-                "mask_width": 5712, "mask_height": 4284, "mask_format": "L8", "face_count": 1,
-                "person_count": NSNull(), "face_analysis_performed": true, "person_analysis_performed": false,
+                "mask_width": 5712, "mask_height": 4284, "mask_format": "L8",
                 "source_sha_before": sourceSHA, "source_sha_after": afterSHA,
                 "source_unchanged": true, "background_blocks_equal": true, "face_box": box]
             for key in ["skin_L_before", "skin_L_after", "skin_C_before", "skin_C_after", "roi", "processing_bbox",
-                        "mask_semantics", "parameters", "processing_version", "analysis_version", "changed_pixel_count"] {
+                        "mask_semantics", "parameters", "processing_version", "analysis_version", "changed_pixel_count",
+                        "face_count", "person_count", "face_analysis_performed", "person_analysis_performed",
+                        "skin_scope", "face_color_skipped", "person_ownership_reliable", "body_skin_pixel_count", "tile_count",
+                        "skin_refinement_applied", "skin_analysis_source_rect", "skin_analysis_proxy_width", "skin_analysis_proxy_height",
+                        "body_cleanup_request_mode", "body_ownership_skip_reason", "clean_applied", "clean_strength", "clean_scope", "clean_skip_reason",
+                        "whitening_shader_strength", "whitening_blend_gate", "whitening_color_policy", "whitening_shadow_amount"] {
                 qa[key] = result[key]
             }
             return String(data: try JSONSerialization.data(withJSONObject: qa, options: .sortedKeys), encoding: .utf8)!
@@ -207,6 +234,7 @@ struct AIPortraitUITestRoot: View {
     }
 
     @MainActor private func process() async {
+        if isBodyTest { await processBody(); return }
         if isLargeTest { await processLarge(); return }
         do {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("portrait-ui-" + UUID().uuidString).appendingPathComponent("Workspace")
@@ -228,6 +256,43 @@ struct AIPortraitUITestRoot: View {
             // 旧 fixture 手拼媒体消息，仅复用生产缩略图与点按预览；不是实际 Agent 发送或持久化验收。
             AIAssistantModel.shared.installImageZoomUITestFixture(directory.appendingPathComponent(path).path)
             status = "PASS：本地美白已生成新图"
+        } catch { status = "FAIL：" + error.localizedDescription }
+        busy = false
+    }
+
+    /// 在实际 App 中走自动身体蒙版与同一工具入口，不以手绘小腿 mask 代替产品验证。
+    @MainActor private func processBody() async {
+        do {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("portrait-body-ui-" + UUID().uuidString)
+                .appendingPathComponent("Workspace")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            AIAssistantModel.shared.installVideoToolTestWorkspace(directory.path)
+            guard let fixture = Bundle.main.url(forResource: "portrait-test-body", withExtension: "jpg") else {
+                throw AIBackendError(message: "Public body fixture is missing; run fetch-portrait-models.py --test-fixtures")
+            }
+            let original = directory.appendingPathComponent("original-body.jpg")
+            try FileManager.default.copyItem(at: fixture, to: original)
+            status = "净肤与身体范围美白"
+            let result = try decode(await call("mobile_beautify_image", arguments: [
+                "path": original.lastPathComponent, "smoothing": 0, "brightening": 0,
+                "warmth": 0, "whitening": 0.6, "use_personal_model": false,
+            ]))
+            try Self.checkLarge((result["processing_version"] as? String)?.hasSuffix("-20261105-v8") == true &&
+                result["clean_applied"] as? Bool == true && result["body_cleanup_request_mode"] as? String == "auto" &&
+                result["skin_scope"] as? String == "selected_person_visible_skin" &&
+                ((result["body_skin_pixel_count"] as? NSNumber)?.intValue ?? 0) > 500,
+                "Automatic body cleanup was not applied by the actual App tool")
+            try Self.checkLarge(abs(((result["whitening_shader_strength"] as? NSNumber)?.doubleValue ?? -1) - 0.25) < 0.00001,
+                "App whitening differs from the reviewed reference")
+            try Self.checkLarge(result["whitening_color_policy"] as? String == "source_hue_chroma_cap" &&
+                abs(((result["whitening_shadow_amount"] as? NSNumber)?.doubleValue ?? -1) - 21) < 0.0001,
+                "App did not use the shared hue protection and shadow curve")
+            resultPath = result["path"] as! String
+            resultNextTool = result["next_tool"] as? String ?? ""
+            // 只装配现有消息卡片，验证结果不会擅自全屏；不伪称模型完成了发送。
+            AIAssistantModel.shared.installImageZoomUITestFixture(directory.appendingPathComponent(resultPath).path)
+            qaJSON = String(data: try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]), encoding: .utf8)!
+            status = "PASS：净肤 + 身体范围美白"
         } catch { status = "FAIL：" + error.localizedDescription }
         busy = false
     }

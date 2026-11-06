@@ -1,3 +1,4 @@
+#include "ui/UiZoom.h"
 #include "ui/CloudDriveDialog.h"
 
 #include "MaiCloudDriveClient.h"
@@ -325,7 +326,7 @@ CloudDriveDialog::CloudDriveDialog(AccessProvider access, AccountIdProvider acco
     root->setSpacing(12);
     auto* header = new QHBoxLayout;
     auto* heading = new QLabel(QStringLiteral("我的云盘"), this);
-    heading->setStyleSheet(QStringLiteral("font-size:21px;font-weight:700;"));
+    UiZoom::setStyle(heading, QStringLiteral("font-size: @title;font-weight:700;"));
     header->addWidget(heading);
     header->addStretch();
     newFolderButton_ = new QPushButton(QStringLiteral("新建文件夹"), this);
@@ -856,13 +857,13 @@ void CloudDriveDialog::renderVideos(const QJsonArray& videos, bool append) {
         auto* icon = new QLabel(QStringLiteral("▣"), empty);
         icon->setAlignment(Qt::AlignCenter);
         icon->setFixedSize(56, 56);
-        icon->setStyleSheet(QStringLiteral(
-            "background:#e6f4fc;color:#1686c8;border-radius:18px;font-size:24px;"));
+        UiZoom::setStyle(icon, QStringLiteral(
+            "background:#e6f4fc;color:#1686c8;border-radius:18px;font-size: @heading1;"));
         layout->addWidget(icon, 0, Qt::AlignHCenter);
         auto* title = new QLabel(currentFolderId_.isEmpty() ?
             QStringLiteral("云盘里还没有图片或视频") : QStringLiteral("此文件夹为空"), empty);
         title->setAlignment(Qt::AlignCenter);
-        title->setStyleSheet(QStringLiteral("color:#172033;font-size:17px;font-weight:650;"));
+        UiZoom::setStyle(title, QStringLiteral("color:#172033;font-size: @body;font-weight:650;"));
         layout->addWidget(title);
         layout->addStretch();
         videoRows_->addWidget(empty);
@@ -892,8 +893,8 @@ void CloudDriveDialog::renderVideos(const QJsonArray& videos, bool append) {
         thumbnail->setObjectName(QStringLiteral("cloudDriveThumbnail"));
         thumbnail->setAlignment(Qt::AlignCenter);
         thumbnail->setFixedSize(64, 64);
-        thumbnail->setStyleSheet(QStringLiteral(
-            "background:#eaf4fc;color:#1686c8;border-radius:9px;font-size:23px;"));
+        UiZoom::setStyle(thumbnail, QStringLiteral(
+            "background:#eaf4fc;color:#1686c8;border-radius:9px;font-size: @heading1;"));
         layout->addWidget(thumbnail);
         auto* labels = new QVBoxLayout;
         auto* title = new QLabel(name, row);

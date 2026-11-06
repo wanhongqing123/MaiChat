@@ -289,17 +289,24 @@ void DesktopSessionSyncCoordinator::sendRemoteCommand(const QJsonObject& session
         completion({}, QStringLiteral("Invalid command request identity"));
         return;
     }
-    QString commandId = requestId.isEmpty() ? retryIdByFingerprint_.value(fingerprint) : requestId;
+    // A transport attempt may be retried after the owner's mailbox receipt was
+    // lost. Keep the input identity stable, while using a new envelope to deliver it.
+    const bool input =
+        payload.value(QStringLiteral("action")).toString() == QStringLiteral("prompt") && !requestId.isEmpty();
+    QString commandId = input ? newId() : (requestId.isEmpty() ? retryIdByFingerprint_.value(fingerprint) : requestId);
     if (commandId.isEmpty()) commandId = newId();
     const QString previousFingerprint = fingerprintByCommandId_.value(commandId);
     if (!previousFingerprint.isEmpty() && previousFingerprint != fingerprint) {
         completion({}, QStringLiteral("Command request identity was reused with different content"));
         return;
     }
-    // The queue's stable request identity is also the transport receipt identity;
-    // unrelated Stop/permission acknowledgements cannot release its FIFO head.
-    retryIdByFingerprint_.insert(fingerprint, commandId);
-    fingerprintByCommandId_.insert(commandId, fingerprint);
+    if (input) {
+        if (inputRequestByCommandId_.size() >= 512) inputRequestByCommandId_.erase(inputRequestByCommandId_.begin());
+        inputRequestByCommandId_.insert(commandId, requestId);
+    } else {
+        retryIdByFingerprint_.insert(fingerprint, commandId);
+        fingerprintByCommandId_.insert(commandId, fingerprint);
+    }
     requester_(QStringLiteral("session-sync/send"), "POST",
                {{QStringLiteral("to_slot"), slot},
                 {QStringLiteral("to_login_session_id"), login},
@@ -349,7 +356,13 @@ void DesktopSessionSyncCoordinator::sendRemoteLifecycle(const QJsonObject& devic
 
 DesktopSessionSyncHost* DesktopSessionSyncCoordinator::host() {
     AgentController* current = agentProvider_();
-    if (current == agent_) return host_.get();
+    if (current && current == agent_) return host_.get();
+    if (!current && !host_) return nullptr;
+    // An account/controller replacement must invalidate old file completions.
+    ++inputCommandGeneration_;
+    inputCommands_.clear();
+    preparingInputSessions_.clear();
+    pendingInputEnvelopeIds_.clear();
     if (agent_) disconnect(agent_, nullptr, this, nullptr);
     snapshotTimer_.stop();
     backfillTimer_.stop();
@@ -464,10 +477,12 @@ void DesktopSessionSyncCoordinator::publishPresence() {
                                   });
                    }
                    if (!backfillTimer_.isActive() && !backfillSessions_.isEmpty()) backfillTimer_.start(2000);
+                   for (const auto& session : inputCommands_.keys()) dispatchQueuedInput(session);
                });
 }
 
 void DesktopSessionSyncCoordinator::finishDeletedRoom(const QString& oldId) {
+    cancelQueuedInputs(oldId, QStringLiteral("所属会话已删除，准备中的内容未受理"));
     initiallyPublishedSessions_.remove(oldId);
     backfillSessions_.removeAll(oldId);
     backfillBefore_.remove(oldId);
@@ -486,7 +501,18 @@ void DesktopSessionSyncCoordinator::finishDeletedRoom(const QString& oldId) {
     }
 }
 
-void DesktopSessionSyncCoordinator::handleEnvelope(const QJsonObject& envelope) {
+void DesktopSessionSyncCoordinator::handleEnvelope(const QJsonObject& received) {
+    QJsonObject envelope = received;
+    if (envelope.value(QStringLiteral("kind")).toString() == QStringLiteral("command")) {
+        QJsonObject payload = envelope.value(QStringLiteral("payload")).toObject();
+        if (payload.value(QStringLiteral("action")).toString() == QStringLiteral("prompt") &&
+            (!payload.contains(QStringLiteral("requestId")) ||
+             (payload.value(QStringLiteral("requestId")).isString() &&
+              payload.value(QStringLiteral("requestId")).toString().isEmpty()))) {
+            payload.insert(QStringLiteral("requestId"), envelope.value(QStringLiteral("client_message_id")));
+            envelope.insert(QStringLiteral("payload"), payload);
+        }
+    }
     const int id = envelope.value(QStringLiteral("id")).toInt();
     const QString kind = envelope.value(QStringLiteral("kind")).toString();
     const QString session = envelope.value(QStringLiteral("session_id")).toString();
@@ -498,12 +524,25 @@ void DesktopSessionSyncCoordinator::handleEnvelope(const QJsonObject& envelope) 
     if (kind == QStringLiteral("command")) {
         const QJsonObject payload = envelope.value(QStringLiteral("payload")).toObject();
         const QString action = payload.value(QStringLiteral("action")).toString();
-        if ((action == QStringLiteral("prompt") || action == QStringLiteral("steer")) &&
-            !payload.value(QStringLiteral("attachments")).toArray().isEmpty()) {
-            startAttachmentCommand(envelope);
+        if (action == QStringLiteral("prompt") || action == QStringLiteral("steer")) {
+            if (pendingInputEnvelopeIds_.contains(id)) return;
+            auto& queue = inputCommands_[session];
+            if (queue.size() >= 256) {
+                respondToCommand(envelope,
+                                 {{QStringLiteral("ok"), false},
+                                  {QStringLiteral("error"), QStringLiteral("所属设备输入队列已满，内容未受理")}});
+                return;
+            }
+            envelope.insert(QStringLiteral("_input_owner_login"), localLoginSession_);
+            queue.enqueue(envelope);
+            pendingInputEnvelopeIds_.insert(id);
+            dispatchQueuedInput(session);
             return;
         }
-        respondToCommand(envelope, current->applyCommand(session, payload));
+        const QJsonObject result = current->applyCommand(session, payload);
+        if (action == QStringLiteral("stop") && result.value(QStringLiteral("ok")).toBool())
+            cancelQueuedInputs(session, QStringLiteral("任务已停止，准备中的内容未受理，已保留在发送端"));
+        respondToCommand(envelope, result);
         return;
     } else if (kind == QStringLiteral("event")) {
         if (session == QStringLiteral("session_lifecycle")) {
@@ -535,9 +574,12 @@ void DesktopSessionSyncCoordinator::respondToCommand(const QJsonObject& envelope
         error.replace(QRegularExpression(QStringLiteral("[\\x00-\\x1f\\x7f-\\x9f]")), QStringLiteral(" "));
         result.insert(QStringLiteral("error"), error.trimmed().isEmpty() ? QStringLiteral("会话操作失败") : error);
     }
-    const QJsonObject response{{QStringLiteral("type"), QStringLiteral("command_result")},
-                               {QStringLiteral("command_id"), envelope.value(QStringLiteral("client_message_id"))},
-                               {QStringLiteral("result"), result}};
+    const QJsonObject response{
+        {QStringLiteral("type"), QStringLiteral("command_result")},
+        {QStringLiteral("command_id"), envelope.value(QStringLiteral("client_message_id"))},
+        {QStringLiteral("result"), result},
+        {QStringLiteral("request_id"),
+         envelope.value(QStringLiteral("payload")).toObject().value(QStringLiteral("requestId"))}};
     if (session == QStringLiteral("session_lifecycle")) {
         requester_(QStringLiteral("session-sync/send"), "POST",
                    {{QStringLiteral("to_slot"), envelope.value(QStringLiteral("from_slot"))},
@@ -555,6 +597,55 @@ void DesktopSessionSyncCoordinator::respondToCommand(const QJsonObject& envelope
         scheduleSnapshot(session);
     }
     acknowledge(envelope.value(QStringLiteral("id")).toInt());
+    if (isCurrentInput(envelope, inputCommandGeneration_)) {
+        pendingInputEnvelopeIds_.remove(envelope.value(QStringLiteral("id")).toInt());
+        auto& queue = inputCommands_[session];
+        queue.dequeue();
+        preparingInputSessions_.remove(session);
+        if (queue.isEmpty()) inputCommands_.remove(session);
+        const quint64 generation = inputCommandGeneration_;
+        QTimer::singleShot(0, this, [this, session, generation] {
+            if (generation == inputCommandGeneration_) dispatchQueuedInput(session);
+        });
+    }
+}
+
+bool DesktopSessionSyncCoordinator::isCurrentInput(const QJsonObject& envelope, quint64 generation) const {
+    if (generation != inputCommandGeneration_) return false;
+    const auto found = inputCommands_.constFind(envelope.value(QStringLiteral("session_id")).toString());
+    return found != inputCommands_.cend() && !found->isEmpty() &&
+           found->head().value(QStringLiteral("id")) == envelope.value(QStringLiteral("id"));
+}
+
+void DesktopSessionSyncCoordinator::dispatchQueuedInput(const QString& sessionId) {
+    // host() may invalidate queues when the account's controller has changed.
+    DesktopSessionSyncHost* current = host();
+    const auto found = inputCommands_.constFind(sessionId);
+    if (!current || found == inputCommands_.cend() || found->isEmpty() || preparingInputSessions_.contains(sessionId))
+        return;
+    const QJsonObject envelope = found->head();
+    const QString ownerLogin = envelope.value(QStringLiteral("_input_owner_login")).toString();
+    if (!ownerLogin.isEmpty() && localLoginSession_.isEmpty()) return;
+    if (!ownerLogin.isEmpty() && ownerLogin != localLoginSession_) {
+        respondToCommand(envelope,
+                         {{QStringLiteral("ok"), false},
+                          {QStringLiteral("error"), QStringLiteral("所属设备登录已变化，准备中的内容未受理")}});
+        return;
+    }
+    preparingInputSessions_.insert(sessionId);
+    const QJsonObject payload = envelope.value(QStringLiteral("payload")).toObject();
+    if (!payload.value(QStringLiteral("attachments")).toArray().isEmpty())
+        startAttachmentCommand(envelope);
+    else
+        respondToCommand(envelope, current->applyCommand(sessionId, payload));
+}
+
+void DesktopSessionSyncCoordinator::cancelQueuedInputs(const QString& sessionId, const QString& reason) {
+    const auto queue = inputCommands_.take(sessionId);
+    preparingInputSessions_.remove(sessionId);
+    for (const auto& envelope : queue) pendingInputEnvelopeIds_.remove(envelope.value(QStringLiteral("id")).toInt());
+    for (const auto& envelope : queue)
+        respondToCommand(envelope, {{QStringLiteral("ok"), false}, {QStringLiteral("error"), reason}});
 }
 
 void DesktopSessionSyncCoordinator::startAttachmentCommand(const QJsonObject& envelope) {
@@ -569,7 +660,18 @@ void DesktopSessionSyncCoordinator::startAttachmentCommand(const QJsonObject& en
                                     {QStringLiteral("error"), QStringLiteral("所属设备或会话附件空间不可用")}});
         return;
     }
+    const quint64 generation = inputCommandGeneration_;
     const DesktopVideoCircleAccess access = attachmentAccessProvider_();
+    if (agentProvider_() != controller) {
+        host();
+        return;
+    }
+    if (!isCurrentInput(envelope, generation)) return;
+    if (envelope.value(QStringLiteral("_input_owner_login")).toString() != localLoginSession_) {
+        respondToCommand(envelope, {{QStringLiteral("ok"), false},
+                                    {QStringLiteral("error"), QStringLiteral("所属设备登录已变化，附件未派发")}});
+        return;
+    }
 #if defined(Q_OS_MAC)
     const QString slot = QStringLiteral("mac");
 #else
@@ -581,8 +683,11 @@ void DesktopSessionSyncCoordinator::startAttachmentCommand(const QJsonObject& en
     // The same core request must retain its imported media paths on a new
     // transport delivery. Bind the namespace to this account/login/turn.
     const QString retryNamespace =
-        command.value(QStringLiteral("action")).toString() == QStringLiteral("steer")
-            ? QStringList{access.accountId, room.login, sessionId, command.value(QStringLiteral("turnId")).toString(),
+        !command.value(QStringLiteral("requestId")).toString().isEmpty()
+            ? QStringList{access.accountId, room.login, sessionId,
+                          command.value(QStringLiteral("action")).toString() == QStringLiteral("steer")
+                              ? command.value(QStringLiteral("turnId")).toString()
+                              : QStringLiteral("input"),
                           command.value(QStringLiteral("requestId")).toString()}
                   .join(QLatin1Char(':'))
             : QString();
@@ -590,13 +695,23 @@ void DesktopSessionSyncCoordinator::startAttachmentCommand(const QJsonObject& en
     QPointer<DesktopSessionSyncCoordinator> guard(this);
     connect(
         watcher, &QFutureWatcher<QPair<QJsonArray, QString>>::finished, this,
-        [guard, watcher, envelope, access, sessionId, room, owner = QPointer<AgentController>(controller)] {
+        [guard, watcher, envelope, access, sessionId, room, generation, owner = QPointer<AgentController>(controller)] {
             const auto resolved = watcher->result();
             watcher->deleteLater();
-            if (!guard) return;
-            if (!resolved.second.isEmpty() || !guard->attachmentAccessProvider_ ||
-                guard->attachmentAccessProvider_().accountId != access.accountId ||
-                guard->localLoginSession_ != room.login || !owner || guard->agentProvider_() != owner) {
+            if (!guard || !guard->isCurrentInput(envelope, generation)) return;
+            if (!owner || guard->agentProvider_() != owner) {
+                guard->host();
+                return;
+            }
+            if (!guard->attachmentAccessProvider_ || guard->attachmentAccessProvider_().accountId != access.accountId) {
+                // Do not use a replacement account's token to acknowledge old work.
+                ++guard->inputCommandGeneration_;
+                guard->inputCommands_.clear();
+                guard->preparingInputSessions_.clear();
+                guard->pendingInputEnvelopeIds_.clear();
+                return;
+            }
+            if (!resolved.second.isEmpty() || guard->localLoginSession_ != room.login) {
                 guard->respondToCommand(envelope,
                                         {{QStringLiteral("ok"), false},
                                          {QStringLiteral("error"),
@@ -610,8 +725,8 @@ void DesktopSessionSyncCoordinator::startAttachmentCommand(const QJsonObject& en
             const QJsonObject result = current->applyCommand(sessionId, payload);
             if (result.value(QStringLiteral("ok")).toBool()) {
                 const QString userId = result.value(QStringLiteral("user_message_id")).toString();
-                const QJsonObject page = current->historyPage(sessionId, {}, 2);
-                for (const QJsonValue& value : page.value(QStringLiteral("messages")).toArray()) {
+                const QJsonObject page = current->historyPage(sessionId, {}, 1);
+                for (const QJsonValue& value : QJsonArray{current->historyMessage(sessionId, userId)}) {
                     QJsonObject message = value.toObject();
                     if (message.value(QStringLiteral("id")).toString() != userId) continue;
                     QJsonArray parts = message.value(QStringLiteral("parts")).toArray();
@@ -764,12 +879,15 @@ void DesktopSessionSyncCoordinator::handleRemoteChunk(const QJsonObject& envelop
     if (actual != digest) return;
     const QJsonDocument document = QJsonDocument::fromJson(complete);
     if (!document.isObject()) return;
-    if (document.object().value(QStringLiteral("type")).toString() == QStringLiteral("command_result")) {
-        const QString commandId = document.object().value(QStringLiteral("command_id")).toString();
+    QJsonObject decoded = document.object();
+    if (decoded.value(QStringLiteral("type")).toString() == QStringLiteral("command_result")) {
+        const QString commandId = decoded.value(QStringLiteral("command_id")).toString();
         const QString fingerprint = fingerprintByCommandId_.take(commandId);
         if (!fingerprint.isEmpty()) retryIdByFingerprint_.remove(fingerprint);
+        const QString request = inputRequestByCommandId_.take(commandId);
+        if (!request.isEmpty()) decoded.insert(QStringLiteral("request_id"), request);
     }
-    if (payloadHandler_) payloadHandler_(remote, transfer.kind, document.object());
+    if (payloadHandler_) payloadHandler_(remote, transfer.kind, decoded);
 }
 
 void DesktopSessionSyncCoordinator::acknowledge(int id) {

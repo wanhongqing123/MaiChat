@@ -161,12 +161,12 @@ private struct MaiCloudThumbnail: View {
                     .scaledToFill()
             } else {
                 Image(systemName: media.isImage ? "photo" : "play.fill")
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(AppTypography.symbol(size: 18, weight: .semibold))
                     .foregroundStyle(RemoteIMStyle.blue)
             }
             if image != nil && !media.isImage {
                 Image(systemName: "play.fill")
-                    .font(.system(size: 11, weight: .bold))
+                    .font(AppTypography.symbol(size: 11, weight: .bold))
                     .foregroundStyle(.white)
                     .frame(width: 23, height: 23)
                     .background(.black.opacity(0.6), in: Circle())
@@ -280,7 +280,7 @@ private struct MaiCloudDriveSwipeRow<Content: View>: View {
                 Button(role: .destructive, action: delete) {
                     Label("删除", systemImage: "trash")
                         .labelStyle(.titleAndIcon)
-                        .font(.subheadline.weight(.semibold))
+                        .font(AppTypography.detail.weight(.semibold))
                         .foregroundStyle(.white)
                         .frame(width: actionWidth - 8)
                         .frame(maxHeight: .infinity)
@@ -338,14 +338,14 @@ struct MaiCloudDriveView: View {
                     if model.availability == .disabled {
                         VStack(spacing: 12) {
                             Image(systemName: "icloud.slash")
-                                .font(.system(size: 36, weight: .light))
+                                .font(AppTypography.symbol(size: 36, weight: .light))
                                 .foregroundStyle(RemoteIMStyle.textSecondary)
-                            Text("云盘暂不可用").font(.headline)
+                            Text("云盘暂不可用").font(AppTypography.heading)
                             Text("当前账号尚未开通云盘，或服务暂时不可用")
-                                .font(.subheadline)
+                                .font(AppTypography.detail)
                                 .foregroundStyle(RemoteIMStyle.textSecondary)
                             Button("重试") { Task { await model.reload() } }
-                                .font(.subheadline.weight(.semibold))
+                                .font(AppTypography.detail.weight(.semibold))
                         }
                         .frame(maxWidth: .infinity, minHeight: 240)
                         .accessibilityIdentifier("cloud-drive-unavailable")
@@ -353,7 +353,7 @@ struct MaiCloudDriveView: View {
                         if model.availability == .available { quotaCard }
                         if !model.notice.isEmpty {
                             Text(model.notice)
-                                .font(.subheadline)
+                                .font(AppTypography.detail)
                                 .foregroundStyle(RemoteIMStyle.textPrimary)
                                 .padding(12)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -380,14 +380,14 @@ struct MaiCloudDriveView: View {
                         } else if model.videos.isEmpty && model.childFolders.isEmpty && model.listError.isEmpty {
                             VStack(spacing: 12) {
                                 Image(systemName: "photo.on.rectangle.angled")
-                                    .font(.system(size: 36, weight: .light))
+                                    .font(AppTypography.symbol(size: 36, weight: .light))
                                     .foregroundStyle(RemoteIMStyle.blue)
                                 Text(model.currentFolderID == nil ? "还没有图片或视频" : "文件夹是空的")
-                                    .font(.headline)
+                                    .font(AppTypography.heading)
                                 Text(model.currentFolderID == nil
                                      ? "上传后仅当前 MaiChat 账号可见"
                                      : "可以让 AI 将云盘文件整理到这里")
-                                    .font(.subheadline).foregroundStyle(.secondary)
+                                    .font(AppTypography.detail).foregroundStyle(.secondary)
                             }
                             .frame(maxWidth: .infinity, minHeight: 180)
                             .accessibilityIdentifier("cloud-drive-empty")
@@ -416,7 +416,7 @@ struct MaiCloudDriveView: View {
                                 Text(model.listError).foregroundStyle(.red)
                                 Button("重试") { Task { await model.reload() } }
                             }
-                            .font(.subheadline)
+                            .font(AppTypography.detail)
                             .padding(14)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(Color.red.opacity(0.07),
@@ -437,7 +437,7 @@ struct MaiCloudDriveView: View {
             }
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .navigationTitle("我的云盘")
+        .appNavigationTitle("我的云盘")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -454,7 +454,7 @@ struct MaiCloudDriveView: View {
                     }
                 } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 18, weight: .semibold))
+                        .font(AppTypography.symbol(size: 18, weight: .semibold))
                         .frame(width: 36, height: 36)
                 }
                 .accessibilityLabel(model.currentFolderID == nil ? "上传图片或视频" : "上传到根目录")
@@ -589,7 +589,7 @@ struct MaiCloudDriveView: View {
                     .accessibilityIdentifier("cloud-drive-folder-root")
                     ForEach(model.folderPath, id: \.id) { folder in
                         Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.semibold))
+                            .font(AppTypography.metadata.weight(.semibold))
                             .foregroundStyle(.secondary)
                         Button(folder.name) {
                             Task { await model.browse(folderID: folder.id) }
@@ -597,7 +597,7 @@ struct MaiCloudDriveView: View {
                         .accessibilityIdentifier("cloud-drive-breadcrumb-\(folder.id)")
                     }
                 }
-                .font(.subheadline)
+                .font(AppTypography.detail)
                 .frame(minHeight: 36)
             }
         }
@@ -610,17 +610,17 @@ struct MaiCloudDriveView: View {
         } label: {
             HStack(spacing: 14) {
                 Image(systemName: "folder.fill")
-                    .font(.system(size: 28))
+                    .font(AppTypography.symbol(size: 28))
                     .foregroundStyle(RemoteIMStyle.blue)
                     .frame(width: 56, height: 56)
                     .background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 12))
                 Text(folder.name)
-                    .font(.body.weight(.medium))
+                    .font(AppTypography.body.weight(.medium))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Image(systemName: "chevron.right")
-                    .font(.subheadline.weight(.semibold))
+                    .font(AppTypography.detail.weight(.semibold))
                     .foregroundStyle(.secondary)
             }
             .padding(12)
@@ -636,12 +636,12 @@ struct MaiCloudDriveView: View {
         VStack(alignment: .leading, spacing: 13) {
             HStack {
                 Label("云盘空间", systemImage: "icloud.fill")
-                    .font(.headline)
+                    .font(AppTypography.heading)
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                 Spacer()
                 Text(formatBytes(model.quota.usedBytes + model.quota.reservedBytes)
                      + " / " + formatBytes(model.quota.limitBytes))
-                    .font(.subheadline.monospacedDigit())
+                    .font(AppTypography.detail.monospacedDigit())
                     .foregroundStyle(RemoteIMStyle.textSecondary)
             }
             ProgressView(value: Double(model.quota.usedBytes + model.quota.reservedBytes),
@@ -650,7 +650,7 @@ struct MaiCloudDriveView: View {
             Text(model.quota.reservedBytes > 0
                  ? "其中 \(formatBytes(model.quota.reservedBytes)) 已预留 · 视频 2 GB / 图片 20 MB"
                  : "仅自己可见 · 视频 2 GB / 图片 20 MB")
-                .font(.footnote).foregroundStyle(RemoteIMStyle.textSecondary)
+                .font(AppTypography.detail).foregroundStyle(RemoteIMStyle.textSecondary)
         }
         .padding(17)
         .background(Color(uiColor: .secondarySystemGroupedBackground),
@@ -659,7 +659,7 @@ struct MaiCloudDriveView: View {
     }
 
     private func sectionTitle(_ title: String) -> some View {
-        Text(title).font(.headline).foregroundStyle(RemoteIMStyle.textPrimary)
+        Text(title).font(AppTypography.heading).foregroundStyle(RemoteIMStyle.textPrimary)
             .padding(.horizontal, 2)
     }
 
@@ -674,23 +674,23 @@ struct MaiCloudDriveView: View {
             HStack(spacing: 10) {
                 Image(systemName: task.contentType.hasPrefix("image/")
                       ? "photo" : "arrow.up.doc")
-                    .font(.system(size: 18, weight: .medium))
+                    .font(AppTypography.symbol(size: 18, weight: .medium))
                     .foregroundStyle(RemoteIMStyle.blue)
                     .frame(width: 38, height: 38)
                     .background(RemoteIMStyle.blueSoft,
                                 in: RoundedRectangle(cornerRadius: 10))
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(task.name).font(.subheadline.weight(.semibold))
+                    Text(task.name).font(AppTypography.detail.weight(.semibold))
                         .lineLimit(1).truncationMode(.middle)
                     Text(formatBytes(task.sizeBytes))
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(AppTypography.metadata).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
                 Button(model.isUploading(task.id) ? "暂停" : "继续") {
                     if model.isUploading(task.id) { model.pause(taskID: task.id) }
                     else { model.upload(task) }
                 }
-                .font(.subheadline.weight(.semibold))
+                .font(AppTypography.detail.weight(.semibold))
                 .accessibilityIdentifier("cloud-drive-upload-action-\(task.id)")
                 if !model.isUploading(task.id) {
                     Menu {
@@ -707,12 +707,12 @@ struct MaiCloudDriveView: View {
                 ProgressView(value: Double(progress.uploaded),
                              total: Double(max(progress.total, 1)))
                 Text("已上传 \(formatBytes(progress.uploaded)) / \(formatBytes(progress.total))")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .font(AppTypography.metadata.monospacedDigit()).foregroundStyle(.secondary)
             } else if let error = model.errors[task.id] {
-                Text(error).font(.footnote).foregroundStyle(.red)
+                Text(error).font(AppTypography.detail).foregroundStyle(.red)
             } else {
                 Text("已暂停，稍后可继续")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(AppTypography.detail).foregroundStyle(.secondary)
             }
         }
         .padding(14)
@@ -743,10 +743,10 @@ struct MaiCloudDriveView: View {
                     }
                     .frame(width: 72, height: 72)
                     VStack(alignment: .leading, spacing: 5) {
-                        Text(media.name).font(.subheadline.weight(.semibold))
+                        Text(media.name).font(AppTypography.detail.weight(.semibold))
                             .lineLimit(1).truncationMode(.middle)
                         Text(formatBytes(media.sizeBytes))
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(AppTypography.metadata).foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 0)
                 }

@@ -22,6 +22,8 @@ public:
     // 未完成正文可覆盖为宿主已收到的 live 文本，reasoning 始终不进入正文。
     // 不存在或不属于该根会话时返回空对象。
     QJsonObject messageUpdate(const QString& sessionId, const QString& messageId) const;
+    // Exact persisted receipt lookup; never infer the accepted row from later output.
+    QJsonObject historyMessage(const QString& sessionId, const QString& messageId) const;
     QJsonObject applyCommand(const QString& sessionId, const QJsonObject& payload);
 
 private:

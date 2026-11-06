@@ -2,6 +2,7 @@
 // 向 Swift 模块公开受控的 C/Objective-C 桥接声明。
 // 原生实现和资源所有权仍由对应 C++／Objective-C 文件管理。
 #include "../../../MobileAgentAdapter/MaiMobileAgent.h"
+#include "../../../MobileAgentAdapter/MaiAppStorageBridge.h"
 #include "../../../MobileAgentAdapter/MaiLocalInference.h"
 #include <onnxruntime_c_api.h>
 #include "../../../MaiChatTools/MaiImageFilter.h"

@@ -61,17 +61,17 @@ final class PdfPreviewDialog {
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
         LinearLayout controls = new LinearLayout(activity);
         controls.setGravity(Gravity.CENTER);
-        previous = new Button(activity);
+        previous = MaiChatTypography.button(activity);
         previous.setText("上一页");
         previous.setEnabled(false);
         previous.setOnClickListener(view -> requestPage(currentPage - 1));
         controls.addView(previous);
-        pageLabel = new TextView(activity);
+        pageLabel = MaiChatTypography.text(activity);
         pageLabel.setText("正在读取 PDF…");
         pageLabel.setGravity(Gravity.CENTER);
         controls.addView(pageLabel, new LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        next = new Button(activity);
+        next = MaiChatTypography.button(activity);
         next.setText("下一页");
         next.setEnabled(false);
         next.setOnClickListener(view -> requestPage(currentPage + 1));

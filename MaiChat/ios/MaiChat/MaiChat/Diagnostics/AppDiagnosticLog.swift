@@ -116,15 +116,17 @@ final class AppDiagnosticLog: DiagnosticLogSink {
         scheduleWrite(immediately: level == .error)
     }
 
-    func makeExportSnapshot() async throws -> URL {
+    func makeExportSnapshot(since startDate: Date? = nil) async throws -> URL {
+        // 不同范围是不同的用户请求，不能复用一个正在导出“全部”的快照。
+        if let startDate { return try await performExportSnapshot(since: startDate) }
         if let exportTask { return try await exportTask.value }
-        let task = Task { try await performExportSnapshot() }
+        let task = Task { try await performExportSnapshot(since: nil) }
         exportTask = task
         defer { exportTask = nil }
         return try await task.value
     }
 
-    private func performExportSnapshot() async throws -> URL {
+    private func performExportSnapshot(since startDate: Date?) async throws -> URL {
         let started = ProcessInfo.processInfo.systemUptime
         let account = performanceAccountTag
         let operation = UUID().uuidString.lowercased()
@@ -134,7 +136,7 @@ final class AppDiagnosticLog: DiagnosticLogSink {
         record(level: .info, category: "interaction-performance", event: "diagnostic-export-start", fields: fields)
         await flush()
         do {
-            let url = try await fileStore.makeExportSnapshot(in: exportDirectoryURL)
+            let url = try await fileStore.makeExportSnapshot(in: exportDirectoryURL, since: startDate)
             record(level: .info, category: "interaction-performance", event: "diagnostic-export-finished",
                 fields: fields.merging([
                     "duration_ms": String(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))
@@ -145,6 +147,15 @@ final class AppDiagnosticLog: DiagnosticLogSink {
                 fields: fields.merging(["code": String((error as NSError).code)]) { _, b in b })
             throw error
         }
+    }
+
+    func clearLogs() async throws {
+        // 等待已开始的导出和写入，避免清理后由旧批次重新写回；不会停止后续诊断。
+        if let exportTask { _ = try? await exportTask.value }
+        await flush()
+        try await fileStore.clear(exportDirectoryURL: exportDirectoryURL)
+        recentEntries.removeAll()
+        droppedAccountEntries = 0
     }
 
     func remoteMetadata(peerUserID: String, accountTag: String, since: Date) -> [RemoteDiagnosticsLogEntry] {

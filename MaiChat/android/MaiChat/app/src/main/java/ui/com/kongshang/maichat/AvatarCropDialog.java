@@ -88,7 +88,7 @@ public final class AvatarCropDialog implements Application.ActivityLifecycleCall
             Math.min(screenWidth, (int) (screenHeight * 0.55f)));
         content.addView(frame, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, previewHeight));
-        status = MaiChatTheme.text(activity, "正在读取图片…", 13, MaiChatTheme.SECONDARY);
+        status = MaiChatTheme.text(activity, "正在读取图片…", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         int inset = MaiChatTheme.dp(activity, 16);
         status.setPadding(inset, inset, inset, inset);
         content.addView(status, new LinearLayout.LayoutParams(

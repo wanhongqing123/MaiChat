@@ -15,7 +15,7 @@ struct AIOutgoingMessageRowView: View {
                     ForEach(Array(row.payload.files.enumerated()), id: \.offset) { _, file in
                         Label((file.path as NSString).lastPathComponent,
                               systemImage: file.isImage ? "photo" : "paperclip")
-                            .font(.caption).lineLimit(2)
+                            .font(AppTypography.metadata).lineLimit(2)
                     }
                 }
                 .padding(12).background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 14))
@@ -26,7 +26,7 @@ struct AIOutgoingMessageRowView: View {
                         Button("重试确认", action: retry)
                             .accessibilityIdentifier("outgoing-retry-" + row.entry.requestID)
                     }
-                }.font(.caption)
+                }.font(AppTypography.metadata)
             }
         }
         .accessibilityElement(children: .contain)

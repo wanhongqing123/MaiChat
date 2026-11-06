@@ -841,6 +841,15 @@ public final class MaiChatAuthClient {
         });
     }
 
+    // The explicit local-auth debug build must keep its session-sync transport
+    // with the same local fixture, rather than sending its fake account to production.
+    String sessionSyncWebSocketUrl() {
+        if (BuildConfig.DEBUG && BuildConfig.USE_LOCAL_UI_AUTH &&
+            (Build.FINGERPRINT.contains("sdk_gphone") || Build.FINGERPRINT.contains("generic")))
+            return "wss://localhost:18191/v1/session-sync/ws";
+        return "wss://ichat.life/api/v1/session-sync/ws";
+    }
+
     public synchronized MediaServiceAccess mediaServiceAccess() throws Exception {
         if (!hasSession()) return null;
         String token = currentAccessToken();

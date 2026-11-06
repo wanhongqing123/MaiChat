@@ -88,6 +88,11 @@ final class AIAssistantSubmission {
                 result.put("ok", false).put("unknown", true)
                     .put("error", "回答回执缺少原问题编号，内容已保留，请先核对历史");
             return result;
+        } else if (operation.equals("enqueue")) {
+            if (result.optBoolean("ok") && (result.optBoolean("unknown") || result.optBoolean("delivery_unknown") ||
+                !(result.opt("user_message_id") instanceof String) || result.optString("user_message_id").isEmpty()))
+                result.put("ok", false).put("unknown", true);
+            return result;
         }
         if (!result.optBoolean("ok") || !(operation.equals("send") || operation.equals("prompt")
             || operation.equals("steer"))) return result;

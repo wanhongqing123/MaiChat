@@ -22,12 +22,26 @@
 #include "MaiPortraitPersonalization.h"
 #include "MaiPortraitRegion.h"
 
+// 计划只借用共享引擎到面部保护完成；之后仅使用拥有的遮罩与参数，配置切换不会悬空。
+struct MaiPortraitSkinContext {
+    MaiPortraitSkinPlan plan;
+    MaiPortraitParameters parameters;
+    std::shared_ptr<MaiPortraitEngine> faceEngine;
+    nlohmann::json metadata;
+    int nextTile = 0;
+    bool failed = false;
+    double weight = 0;
+    std::array<double, 2> lightness{}, chroma{};
+    uint64_t skinPixels = 0, changedPixels = 0, bodyPixels = 0;
+    std::array<int, 4> processing{};
+};
+
 namespace {
 using Json = nlohmann::json;
 std::mutex configurationMutex;
 std::string modelDirectory, runtimePath;
 const void* apiBase = nullptr;
-std::unique_ptr<MaiPortraitEngine> engine;
+std::shared_ptr<MaiPortraitEngine> engine;
 constexpr std::array<const char*, MaiPortraitParameters::kCount> parameterNames{
     "smoothing", "brightening", "warmth", "slim_face", "enlarge_eyes", "slim_waist", "leg_length", "whitening"};
 char* copied(const std::string& value) {
@@ -103,7 +117,9 @@ Json diagnostic(const std::string& code, const std::string& message, int width =
     else if (code == "face_detection_failed")
         hint = "Run tiled face detection on the original; do not merely shrink the whole photo";
     else if (code == "skin_mask_empty" || code == "no_visible_effect")
-        hint = "Inspect mask coverage and skin ROI L*/C*; full-image threshold fractions are not whitening strength";
+        hint = "Inspect owned skin coverage, clean scope and actual LUT shader/blend strengths";
+    else if (code == "body_skin_unavailable" || code == "cannot_remove_body_hair")
+        hint = "Explicit body-hair removal requires reliably owned body skin; face-only coverage is insufficient";
     else if (code == "invalid_parameters" || code == "unknown_parameter")
         hint = "Use only the documented operation fields; action:delegate is not supported";
     return {{"code", code},
@@ -122,6 +138,7 @@ void validateArguments(const std::string& operation, const Json& arguments, bool
     std::set<std::string> allowed{"path", "use_personal_model", "subject_index"};
     if (operation == "beautify") {
         allowed.insert("strength");
+        allowed.insert("remove_body_hair");
         for (int index : {0, 1, 2, 3, 4, 7}) allowed.insert(parameterNames[index]);
     } else {
         allowed.insert("slim_waist");
@@ -145,9 +162,9 @@ void validateArguments(const std::string& operation, const Json& arguments, bool
             if (!field.value().is_number_integer() || field.value().get<int64_t>() < 0 ||
                 field.value().get<int64_t>() > 255)
                 throw MaiPortraitFailure("invalid_parameters", "subject_index must be a nonnegative bounded integer");
-        } else if (field.key() == "use_personal_model") {
+        } else if (field.key() == "use_personal_model" || field.key() == "remove_body_hair") {
             if (!field.value().is_boolean())
-                throw MaiPortraitFailure("invalid_parameters", "use_personal_model must be boolean");
+                throw MaiPortraitFailure("invalid_parameters", "Portrait switches must be boolean");
         } else if (field.key() == "operation") {
             if (!field.value().is_string() || field.value() != operation)
                 throw MaiPortraitFailure("invalid_parameters", "Host operation does not match the requested edit");
@@ -161,6 +178,31 @@ void validateArguments(const std::string& operation, const Json& arguments, bool
                 throw MaiPortraitFailure("invalid_parameters", "Portrait strengths exceed their documented ranges");
         }
     }
+}
+
+void effectiveHairParameter(Json& effective, const MaiPortraitParameters& parameters) {
+    if (parameters.removeBodyHair)
+        effective["remove_body_hair"] = *parameters.removeBodyHair;
+    else
+        effective.erase("remove_body_hair");
+}
+
+const char* bodyCleanupMode(const MaiPortraitParameters& parameters) {
+    return !parameters.removeBodyHair ? "auto" : *parameters.removeBodyHair ? "enabled" : "disabled";
+}
+
+template <class Material>
+void materialMetadata(Json& metadata, const Material& material) {
+    metadata["clean_applied"] = material.cleanApplied;
+    metadata["clean_strength"] = material.cleanStrength;
+    metadata["clean_skip_reason"] = material.cleanSkipReason;
+    metadata["clean_scope"] = material.cleanScope;
+    metadata["body_ownership_skip_reason"] = material.bodyOwnershipSkipReason;
+    metadata["whitening_shader_strength"] = material.whiteningShaderStrength;
+    metadata["whitening_blend_gate"] = material.whiteningBlendGate;
+    metadata["whitening_color_policy"] = "source_hue_chroma_cap";
+    // D 是请求固定的 L* 曲线幅度，不是每个像素最终得到的亮度差。
+    metadata["whitening_shadow_amount"] = material.whiteningShadowAmount;
 }
 
 Json faceJson(const MaiPortraitFaceHint& face) {
@@ -185,7 +227,7 @@ MaiPortraitRegionResult processImage(const unsigned char* pixels, int width, int
         const bool body = operation == "reshape_body";
         if (modelDirectory.empty())
             throw MaiPortraitFailure("portrait_not_configured", "Portrait models have not been configured");
-        if (!engine) engine = std::make_unique<MaiPortraitEngine>(modelDirectory, runtimePath, apiBase);
+        if (!engine) engine = std::make_shared<MaiPortraitEngine>(modelDirectory, runtimePath, apiBase);
         MaiPortraitPersonalization profile(profileDirectory);
         MaiPortraitParameters parameters;
         if (arguments.contains("strength")) {
@@ -196,6 +238,8 @@ MaiPortraitRegionResult processImage(const unsigned char* pixels, int width, int
         for (int index = 0; index < MaiPortraitParameters::kCount; ++index)
             if (arguments.contains(parameterNames[index]))
                 parameters.values[index] = arguments.at(parameterNames[index]).get<float>();
+        if (arguments.contains("remove_body_hair"))
+            parameters.removeBodyHair = arguments.at("remove_body_hair").get<bool>();
         auto hints = faceHints(arguments);
         int subject = arguments.value("subject_index", -1);
         if (context) {
@@ -211,6 +255,7 @@ MaiPortraitRegionResult processImage(const unsigned char* pixels, int width, int
         }
         for (int index = 0; index < MaiPortraitParameters::kCount; ++index)
             effective[parameterNames[index]] = parameters.values[index];
+        if (!body) effectiveHairParameter(effective, parameters);
         auto output = engine->apply(pixels, width, height, stride, hints, parameters, body, subject, context);
         const auto status = profile.status();
         if (status.activeVersion > 0 && arguments.value("use_personal_model", true)) {
@@ -231,7 +276,7 @@ MaiPortraitRegionResult processImage(const unsigned char* pixels, int width, int
         const int sourceHeight = context ? context->plan.sourceHeight : height;
         for (int index = 0; index < MaiPortraitParameters::kCount; ++index)
             effective[parameterNames[index]] = parameters.values[index];
-        const Json metadata = {
+        Json metadata = {
             {"source_fingerprint", context ? context->sourceFingerprint : fingerprint(pixels, width, height, stride)},
             {"source_path", sourcePath},
             {"parameters", parameters.values},
@@ -258,6 +303,33 @@ MaiPortraitRegionResult processImage(const unsigned char* pixels, int width, int
             {"skin_L_after", output.skinWeight > 0 ? Json(output.skinLightness[1]) : Json(nullptr)},
             {"skin_C_before", output.skinWeight > 0 ? Json(output.skinChroma[0]) : Json(nullptr)},
             {"skin_C_after", output.skinWeight > 0 ? Json(output.skinChroma[1]) : Json(nullptr)}};
+        if (!body) metadata["body_cleanup_request_mode"] = bodyCleanupMode(parameters);
+        if (context && parameters.values[MaiPortraitParameters::kWhiteningIndex] > 0) {
+            // 只有实际运行美白的新颜色目标才标 v8；纯几何 ROI 仍沿用其原有版本。
+            metadata["processing_version"] = "native-face-roi-20261105-v8";
+            materialMetadata(metadata, output);
+        }
+        if (output.skinAnalysisPerformed) {
+            metadata["processing_version"] = "native-owned-skin-full-raster-20261105-v8";
+            metadata["skin_scope"] = output.skinScope;
+            metadata["skin_refinement_applied"] = output.skinRefinementApplied;
+            metadata["skin_analysis_source_rect"] = output.skinAnalysisSourceRegion;
+            metadata["skin_analysis_proxy_width"] = output.skinAnalysisProxyWidth;
+            metadata["skin_analysis_proxy_height"] = output.skinAnalysisProxyHeight;
+            materialMetadata(metadata, output);
+            metadata["face_color_skipped"] = output.faceColorSkipped;
+            metadata["person_ownership_reliable"] = output.personOwnershipReliable;
+            metadata["body_skin_pixel_count"] = output.bodySkinPixels;
+            metadata["unreliable_person_masks"] = output.unreliablePersonMasks;
+            metadata["mask_edge_refinement"] = "body_class2_mature_matte_and_native_face_rgb";
+            metadata["metrics_scope"] = "skin_color_and_smoothing_before_optional_face_geometry";
+            metadata["geometry_applied"] = parameters.values[3] > 0 || parameters.values[4] > 0;
+            if (parameters.values[3] > 0 || parameters.values[4] > 0) {
+                const auto region =
+                    MaiPortraitRegionPlanner::faceRegion(width, height, faceHints(arguments), subject).region;
+                metadata["geometry_processing_bbox"] = {region.x, region.y, region.width, region.height};
+            }
+        }
         auto bytes = std::unique_ptr<unsigned char, decltype(&std::free)>(
             static_cast<unsigned char*>(std::malloc(output.rgba.size())), &std::free);
         auto mask = std::unique_ptr<unsigned char, decltype(&std::free)>(
@@ -267,7 +339,9 @@ MaiPortraitRegionResult processImage(const unsigned char* pixels, int width, int
             throw MaiPortraitFailure("allocation_failed", "Cannot allocate the bounded portrait output");
         std::memcpy(bytes.get(), output.rgba.data(), output.rgba.size());
         if (mask) std::memcpy(mask.get(), output.skinMask.data(), output.skinMask.size());
-        return {bytes.release(), mask.release(), width, height, copied(metadata.dump()), nullptr};
+        auto response = std::unique_ptr<char, decltype(&std::free)>(copied(metadata.dump()), &std::free);
+        if (!response) throw MaiPortraitFailure("allocation_failed", "Cannot allocate portrait metadata");
+        return {bytes.release(), mask.release(), width, height, response.release(), nullptr};
     } catch (const MaiPortraitFailure& error) {
         auto detail = diagnostic(error.code(), error.what(), width, height);
         detail["effective_parameters"] = effective;
@@ -450,11 +524,15 @@ extern "C" char* maiPortraitCommitResult(const char* directory, const char* enco
         MaiPortraitPersonalization profile(directory);
         MaiPortraitParameters parameters;
         parameters.values = data.at("parameters").get<MaiPortraitParameters::Values>();
+        if (data.contains("effective_parameters") && data.at("effective_parameters").contains("remove_body_hair") &&
+            data.at("effective_parameters").at("remove_body_hair").is_boolean())
+            parameters.removeBodyHair = data.at("effective_parameters").at("remove_body_hair").get<bool>();
         auto identifier = profile.recordResult(data.at("source_fingerprint"), data.at("source_path"), path, parameters,
                                                data.at("features").get<std::array<float, 8>>());
         Json effective = Json::object();
         for (int index = 0; index < MaiPortraitParameters::kCount; ++index)
             effective[parameterNames[index]] = parameters.values[index];
+        effectiveHairParameter(effective, parameters);
         Json output = {{"result_id", identifier},
                        {"original_path", data.at("source_path")},
                        {"parameters", effective},
@@ -462,11 +540,52 @@ extern "C" char* maiPortraitCommitResult(const char* directory, const char* enco
                        {"personal_model_version", data.at("personal_model_version")},
                        {"face_count", data.at("face_count")},
                        {"person_count", data.at("person_count")}};
-        for (const char* key :
-             {"processing_version", "face_analysis_performed", "person_analysis_performed", "source_width",
-              "source_height", "roi", "processing_bbox", "mask_semantics", "skin_pixel_count", "skin_weight",
-              "mask_coverage_in_roi", "changed_pixel_count", "changed_rgb_fraction_in_roi", "skin_L_before",
-              "skin_L_after", "skin_C_before", "skin_C_after"})
+        for (const char* key : {"processing_version",
+                                "face_analysis_performed",
+                                "person_analysis_performed",
+                                "source_width",
+                                "source_height",
+                                "roi",
+                                "processing_bbox",
+                                "mask_semantics",
+                                "skin_pixel_count",
+                                "skin_weight",
+                                "mask_coverage_in_roi",
+                                "changed_pixel_count",
+                                "changed_rgb_fraction_in_roi",
+                                "skin_L_before",
+                                "skin_L_after",
+                                "skin_C_before",
+                                "skin_C_after",
+                                "skin_refinement_applied",
+                                "skin_analysis_source_rect",
+                                "skin_analysis_proxy_width",
+                                "skin_analysis_proxy_height",
+                                "skin_visible_source_partial",
+                                "whitening_shader_strength",
+                                "whitening_blend_gate",
+                                "whitening_color_policy",
+                                "whitening_shadow_amount",
+                                "clean_applied",
+                                "clean_strength",
+                                "clean_skip_reason",
+                                "clean_scope",
+                                "body_ownership_skip_reason",
+                                "body_cleanup_request_mode",
+                                "skin_scope",
+                                "face_color_skipped",
+                                "person_ownership_reliable",
+                                "body_skin_pixel_count",
+                                "tile_count",
+                                "mask_edge_refinement",
+                                "unreliable_person_masks",
+                                "owned_body_proxy_pixels",
+                                "person_analysis_windows",
+                                "person_analysis_policy",
+                                "skin_analysis_proxy_rect",
+                                "geometry_applied",
+                                "geometry_processing_bbox",
+                                "metrics_scope"})
             if (data.contains(key)) output[key] = data[key];
         return success(output);
     } catch (const std::exception& error) {
@@ -522,4 +641,316 @@ extern "C" char* maiPortraitPersonalizationRequest(const char* directory, const 
 }
 extern "C" void maiPortraitFree(void* pointer) {
     std::free(pointer);
+}
+
+extern "C" MaiPortraitSkinAnalysisResult maiPortraitAnalyzeSkinRgba(const unsigned char* pixels, int width, int height,
+                                                                    int stride, int sourceWidth, int sourceHeight,
+                                                                    const char* encodedHints, const char* encoded,
+                                                                    const char* directory, const char* sourcePath,
+                                                                    const char* sourceFingerprint,
+                                                                    const unsigned char* globalRgba, int globalStride) {
+    try {
+        std::lock_guard<std::mutex> lock(configurationMutex);
+        if (!encodedHints || !encoded || !directory || !*directory || !sourcePath || !*sourcePath ||
+            !sourceFingerprint || std::strlen(sourceFingerprint) != 64 || modelDirectory.empty())
+            throw MaiPortraitFailure("portrait_not_configured",
+                                     "A current-account source and complete fingerprint are required");
+        const Json arguments = Json::parse(encoded);
+        validateArguments("beautify", arguments, true);
+        if (!engine) engine = std::make_shared<MaiPortraitEngine>(modelDirectory, runtimePath, apiBase);
+        auto context = std::make_unique<MaiPortraitSkinContext>();
+        context->faceEngine = engine;
+        context->plan = engine->analyzeSkin(pixels, width, height, stride, sourceWidth, sourceHeight,
+                                            faceHints(Json::parse(encodedHints)), arguments.value("subject_index", -1));
+        const auto& plan = context->plan;
+        MaiPortraitRegionPlan facePlan;
+        facePlan.sourceWidth = sourceWidth;
+        facePlan.sourceHeight = sourceHeight;
+        facePlan.faceCount = plan.faceCount;
+        facePlan.subjectIndex = plan.subjectIndex;
+        facePlan.selectedFace = plan.selectedFace;
+        facePlan.region = {plan.faceRegion[0], plan.faceRegion[1], plan.faceRegion[2], plan.faceRegion[3]};
+        const auto features = MaiPortraitRegionPlanner::globalFeatures(globalRgba, 64, 64, globalStride, facePlan);
+        auto& parameters = context->parameters;
+        if (arguments.contains("strength")) {
+            parameters.values[0] = arguments.at("strength");
+            parameters.values[1] = parameters.values[0] * .35f;
+        }
+        for (int index : {0, 1, 2, 3, 4, 7})
+            if (arguments.contains(parameterNames[index]))
+                parameters.values[index] = arguments.at(parameterNames[index]);
+        if (arguments.contains("remove_body_hair"))
+            parameters.removeBodyHair = arguments.at("remove_body_hair").get<bool>();
+        MaiPortraitPersonalization profile(directory);
+        const auto status = profile.status();
+        if (status.activeVersion > 0 && arguments.value("use_personal_model", true)) {
+            const auto learned = profile.recommend(features);
+            for (int index : {0, 1, 2, 3, 4, 7})
+                if (!arguments.contains(parameterNames[index]) && !(arguments.contains("strength") && index < 2))
+                    parameters.values[index] = learned.values[index];
+        }
+        if (plan.faceCount == 0 && (parameters.values[3] > 0 || parameters.values[4] > 0))
+            throw MaiPortraitFailure("face_detection_failed", "Face geometry requires a reliably located face");
+        Json effective = Json::object(), geometry = {{"operation", "beautify"}, {"use_personal_model", false}};
+        for (int index = 0; index < 8; ++index) effective[parameterNames[index]] = parameters.values[index];
+        effectiveHairParameter(effective, parameters);
+        // Geometry is a second face-only pass; it must never repeat body cleaning.
+        geometry["remove_body_hair"] = false;
+        for (int index : {0, 1, 2, 3, 4, 7})
+            geometry[parameterNames[index]] = index == 3 || index == 4 ? parameters.values[index] : 0.f;
+        Json tiles = Json::array();
+        for (const auto& tile : plan.tiles) tiles.push_back({{"sample_rect", tile.sample}, {"write_rect", tile.write}});
+        Json faceContext = nullptr, faceRoi = nullptr;
+        if (plan.faceCount > 0) {
+            faceRoi = {{"x", plan.faceRegion[0]},
+                       {"y", plan.faceRegion[1]},
+                       {"width", plan.faceRegion[2]},
+                       {"height", plan.faceRegion[3]}};
+            faceContext = {{"source_width", sourceWidth},
+                           {"source_height", sourceHeight},
+                           {"face_count", plan.faceCount},
+                           {"subject_index", plan.subjectIndex},
+                           {"roi", faceRoi},
+                           {"selected_face", faceJson(plan.selectedFace)},
+                           {"global_features", features},
+                           {"source_fingerprint", sourceFingerprint}};
+        }
+        context->metadata = {
+            {"source_fingerprint", sourceFingerprint},
+            {"source_path", sourcePath},
+            {"parameters", parameters.values},
+            {"effective_parameters", effective},
+            {"features", features},
+            {"face_count", plan.faceCount},
+            {"person_count", plan.personCount},
+            {"face_analysis_performed", true},
+            {"person_analysis_performed", true},
+            {"analysis_version", "mediapipe-onnx-skin-20261104-v3"},
+            {"processing_version", "native-owned-skin-tiles-20261105-v8"},
+            {"personal_model_version", status.activeVersion},
+            {"source_width", sourceWidth},
+            {"source_height", sourceHeight},
+            {"roi", {{"x", 0}, {"y", 0}, {"width", sourceWidth}, {"height", sourceHeight}}},
+            {"skin_scope", plan.hasPersonOwnership ? "selected_person_visible_skin" : "face_skin_only"},
+            {"person_ownership_reliable", plan.hasPersonOwnership},
+            {"body_ownership_skip_reason", plan.bodyOwnershipSkipReason},
+            {"face_color_skipped", false},
+            {"unreliable_person_masks", plan.unreliablePersonMasks},
+            {"owned_body_proxy_pixels", plan.bodyConfidencePixels},
+            {"person_analysis_windows", plan.personAnalysisWindows},
+            {"person_analysis_policy",
+             plan.personAnalysisWindows > 1 ? "whole_proxy_plus_overlapping_half_quarter_windows" : "whole_proxy"},
+            {"skin_analysis_proxy_rect", plan.skinProxyRegion},
+            {"tile_count", plan.tiles.size()},
+            {"mask_edge_refinement", "body_class2_mature_matte_and_native_face_rgb"},
+            {"whitening_shader_strength", MaiPortraitEngine::whiteningShaderStrength(parameters.values[7])},
+            {"whitening_blend_gate", MaiPortraitEngine::whiteningBlendGate(parameters.values[7])},
+            {"whitening_color_policy", "source_hue_chroma_cap"},
+            {"whitening_shadow_amount", MaiPortraitEngine::whiteningShadowAmount(parameters.values[7])},
+            {"clean_applied", false},
+            {"clean_strength", 0},
+            {"clean_skip_reason", "material_not_prepared"},
+            {"clean_scope", "none"},
+            {"body_cleanup_request_mode", bodyCleanupMode(parameters)},
+            {"mask_semantics", "diagnostic_skin_alpha; rgba_is_already_composited; do_not_apply_mask_again"}};
+        Json analysis = context->metadata;
+        analysis["skin_refinement_request"] = plan.refinementRequired
+                                                  ? Json{{"source_rect", plan.refinementSourceRegion},
+                                                         {"proxy_width", plan.refinementProxyWidth},
+                                                         {"proxy_height", plan.refinementProxyHeight}}
+                                                  : Json(nullptr);
+        analysis["tiles"] = tiles;
+        analysis["face_roi"] = faceRoi;
+        analysis["face_plan"] = faceContext;
+        analysis["geometry_parameters"] = geometry;
+        auto response = std::unique_ptr<char, decltype(&std::free)>(success(analysis), &std::free);
+        if (!response) throw MaiPortraitFailure("allocation_failed", "Cannot allocate skin analysis metadata");
+        return {context.release(), response.release(), nullptr};
+    } catch (const MaiPortraitFailure& error) {
+        return {nullptr, nullptr, copied(diagnostic(error.code(), error.what(), sourceWidth, sourceHeight).dump())};
+    } catch (const std::exception&) {
+        return {nullptr, nullptr,
+                copied(diagnostic("skin_analysis_failed", "Skin analysis failed; no output was committed", sourceWidth,
+                                  sourceHeight)
+                           .dump())};
+    }
+}
+
+extern "C" char* maiPortraitProtectSkinFaceRegion(MaiPortraitSkinContext* context, const unsigned char* rgba, int width,
+                                                  int height, int stride) {
+    try {
+        std::lock_guard<std::mutex> lock(configurationMutex);
+        if (!context || context->failed || !context->faceEngine)
+            throw MaiPortraitFailure("invalid_skin_sequence", "Skin context is not ready for face protection");
+        context->faceEngine->protectSkinFace(context->plan, rgba, width, height, stride);
+        context->metadata["face_color_skipped"] = context->plan.faceColorSkipped;
+        MaiPortraitEngine::prepareSkinMaterial(context->plan, context->parameters);
+        if (context->plan.faceColorSkipped &&
+            (!context->plan.hasPersonOwnership || context->plan.bodyConfidencePixels < 8))
+            throw MaiPortraitFailure("skin_mask_empty",
+                                     "Face protection is unreliable and no owned body skin is available");
+        context->faceEngine.reset();
+        materialMetadata(context->metadata, context->plan);
+        context->metadata["body_cleanup_request_mode"] = bodyCleanupMode(context->parameters);
+        Json protection = {{"face_color_skipped", context->plan.faceColorSkipped}};
+        materialMetadata(protection, context->plan);
+        auto* response = success(protection);
+        if (!response) throw MaiPortraitFailure("allocation_failed", "Cannot allocate face protection metadata");
+        return response;
+    } catch (const MaiPortraitFailure& e) {
+        if (context) context->failed = true;
+        return copied(Json{{"ok", false}, {"error", diagnostic(e.code(), e.what())}}.dump());
+    } catch (const std::exception&) {
+        if (context) context->failed = true;
+        return copied(
+            Json{{"ok", false}, {"error", diagnostic("skin_analysis_failed", "Face protection failed")}}.dump());
+    }
+}
+
+extern "C" MaiPortraitRegionResult maiPortraitProcessSkinTile(MaiPortraitSkinContext* context, int index,
+                                                              const unsigned char* rgba, int width, int height,
+                                                              int stride) {
+    try {
+        std::lock_guard<std::mutex> lock(configurationMutex);
+        if (!context || context->failed || index != context->nextTile)
+            throw MaiPortraitFailure("invalid_skin_sequence", "Process each planned skin tile once in order");
+        const auto output =
+            MaiPortraitEngine::applySkinTile(rgba, width, height, stride, context->plan, index, context->parameters);
+        auto bytes = std::unique_ptr<unsigned char, decltype(&std::free)>(
+            static_cast<unsigned char*>(std::malloc(output.rgba.size())), &std::free);
+        auto mask = std::unique_ptr<unsigned char, decltype(&std::free)>(
+            static_cast<unsigned char*>(std::malloc(output.skinMask.size())), &std::free);
+        if (!bytes || !mask) throw MaiPortraitFailure("allocation_failed", "Cannot allocate bounded skin output");
+        std::memcpy(bytes.get(), output.rgba.data(), output.rgba.size());
+        std::memcpy(mask.get(), output.skinMask.data(), output.skinMask.size());
+        context->skinPixels += output.skinPixels;
+        context->changedPixels += output.changedPixels;
+        for (int k = 0; k < 2; ++k) {
+            context->lightness[k] += output.skinLightness[k] * output.skinWeight;
+            context->chroma[k] += output.skinChroma[k] * output.skinWeight;
+        }
+        context->weight += output.skinWeight;
+        const auto& tile = context->plan.tiles[index];
+        const auto& face = context->plan.selectedFace;
+        for (int y = tile.write[1]; y < tile.write[1] + tile.write[3]; ++y)
+            for (int x = tile.write[0]; x < tile.write[0] + tile.write[2]; ++x) {
+                if (context->plan.faceCount > 0 && x >= face.x - .15f * face.width && x < face.x + 1.15f * face.width &&
+                    y >= face.y - .15f * face.height && y < face.y + 1.15f * face.height)
+                    continue;
+                if (output.skinMask[static_cast<size_t>(y - tile.sample[1]) * width + x - tile.sample[0]] > 0)
+                    ++context->bodyPixels;
+            }
+        const auto& box = output.processingRegion;
+        if (box[2] > 0 && box[3] > 0) {
+            auto& all = context->processing;
+            if (all[2] == 0)
+                all = box;
+            else {
+                const int right = std::max(all[0] + all[2], box[0] + box[2]),
+                          bottom = std::max(all[1] + all[3], box[1] + box[3]);
+                all[0] = std::min(all[0], box[0]);
+                all[1] = std::min(all[1], box[1]);
+                all[2] = right - all[0];
+                all[3] = bottom - all[1];
+            }
+        }
+        ++context->nextTile;
+        auto response =
+            std::unique_ptr<char, decltype(&std::free)>(copied(Json{{"tile_index", index}}.dump()), &std::free);
+        if (!response) throw MaiPortraitFailure("allocation_failed", "Cannot allocate skin tile metadata");
+        return {bytes.release(), mask.release(), width, height, response.release(), nullptr};
+    } catch (const MaiPortraitFailure& e) {
+        if (context) context->failed = true;
+        return {nullptr, nullptr, 0, 0, nullptr, copied(diagnostic(e.code(), e.what(), width, height).dump())};
+    } catch (const std::exception&) {
+        if (context) context->failed = true;
+        return {
+            nullptr, nullptr,
+            0,       0,
+            nullptr, copied(diagnostic("skin_processing_failed", "Skin tile processing failed", width, height).dump())};
+    }
+}
+
+extern "C" char* maiPortraitFinishSkin(MaiPortraitSkinContext* context) {
+    try {
+        std::lock_guard<std::mutex> lock(configurationMutex);
+        if (!context || context->failed || context->nextTile != static_cast<int>(context->plan.tiles.size()))
+            throw MaiPortraitFailure("incomplete_skin_tiles",
+                                     "All planned skin tiles must complete before publication");
+        const auto& values = context->parameters.values;
+        const bool color =
+            values[0] > 0 || values[1] > 0 || values[2] != 0 || values[7] > 0 || context->plan.cleanApplied;
+        if (color && (context->skinPixels == 0 || (context->plan.faceColorSkipped && context->bodyPixels < 64)))
+            throw MaiPortraitFailure("skin_mask_empty",
+                                     "No sufficient reliably protected skin was found; no result was committed");
+        // A C1 gate near zero may round to an exact RGBA8 identity. This remains a
+        // valid edit; it must not be reported as a processing failure.
+        const bool substantial = values[0] > .05f || values[1] > .05f || std::abs(values[2]) > .05f ||
+                                 values[7] > .05f || context->parameters.removeBodyHair.value_or(false);
+        if (color && substantial && context->changedPixels == 0)
+            throw MaiPortraitFailure("no_visible_effect", "Skin processing did not change any RGB pixels");
+        context->metadata["skin_analysis_proxy_rect"] = context->plan.skinProxyRegion;
+        context->metadata["owned_body_proxy_pixels"] = context->plan.bodyConfidencePixels;
+        context->metadata["skin_refinement_applied"] = context->plan.refinementApplied;
+        context->metadata["skin_analysis_source_rect"] = context->plan.analysisSourceRegion;
+        context->metadata["skin_analysis_proxy_width"] = context->plan.proxyWidth;
+        context->metadata["skin_analysis_proxy_height"] = context->plan.proxyHeight;
+        context->metadata["skin_visible_source_partial"] = context->plan.visibleSourcePartial;
+        materialMetadata(context->metadata, context->plan);
+        auto metadata = context->metadata;
+        metadata["processing_bbox"] = context->processing;
+        metadata["skin_pixel_count"] = context->skinPixels;
+        metadata["body_skin_pixel_count"] = context->bodyPixels;
+        metadata["skin_weight"] = context->weight;
+        metadata["mask_coverage_in_roi"] =
+            context->skinPixels / static_cast<double>(context->plan.sourceWidth * context->plan.sourceHeight);
+        metadata["changed_pixel_count"] = context->changedPixels;
+        metadata["changed_rgb_fraction_in_roi"] =
+            context->changedPixels / static_cast<double>(context->plan.sourceWidth * context->plan.sourceHeight);
+        metadata["skin_L_before"] = context->weight > 0 ? Json(context->lightness[0] / context->weight) : Json(nullptr);
+        metadata["skin_L_after"] = context->weight > 0 ? Json(context->lightness[1] / context->weight) : Json(nullptr);
+        metadata["skin_C_before"] = context->weight > 0 ? Json(context->chroma[0] / context->weight) : Json(nullptr);
+        metadata["skin_C_after"] = context->weight > 0 ? Json(context->chroma[1] / context->weight) : Json(nullptr);
+        auto* response = success(metadata);
+        if (!response) throw MaiPortraitFailure("allocation_failed", "Cannot allocate finished skin metadata");
+        return response;
+    } catch (const MaiPortraitFailure& e) {
+        if (context) context->failed = true;
+        return copied(Json{{"ok", false}, {"error", diagnostic(e.code(), e.what())}}.dump());
+    } catch (const std::exception&) {
+        if (context) context->failed = true;
+        return copied(
+            Json{{"ok", false}, {"error", diagnostic("skin_processing_failed", "Cannot finish skin processing")}}
+                .dump());
+    }
+}
+extern "C" void maiPortraitFreeSkinContext(MaiPortraitSkinContext* context) {
+    delete context;
+}
+
+extern "C" char* maiPortraitRefineSkinRegionRgba(MaiPortraitSkinContext* context, const unsigned char* rgba, int width,
+                                                 int height, int stride) {
+    try {
+        std::lock_guard<std::mutex> lock(configurationMutex);
+        if (!context || context->failed || !context->faceEngine || context->nextTile != 0)
+            throw MaiPortraitFailure("invalid_skin_sequence", "Regional refinement is unavailable in this phase");
+        context->faceEngine->refineSkin(context->plan, rgba, width, height, stride);
+        const auto& p = context->plan;
+        auto* response = success({{"applied", true},
+                                  {"source_rect", p.analysisSourceRegion},
+                                  {"proxy_width", p.proxyWidth},
+                                  {"proxy_height", p.proxyHeight}});
+        if (!response) throw MaiPortraitFailure("allocation_failed", "Cannot allocate refinement metadata");
+        return response;
+    } catch (const MaiPortraitFailure& e) {
+        if (context) context->failed = true;
+        return copied(Json{{"ok", false}, {"error", diagnostic(e.code(), e.what(), width, height)}}.dump());
+    } catch (const std::exception&) {
+        if (context) context->failed = true;
+        return copied(
+            Json{{"ok", false},
+                 {"error", diagnostic("skin_refinement_failed",
+                                      "Regional skin analysis failed; no result was committed", width, height)}}
+                .dump());
+    }
 }

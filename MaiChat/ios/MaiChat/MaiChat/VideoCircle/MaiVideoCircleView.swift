@@ -43,14 +43,14 @@ struct MaiVideoCircleView: View {
                             Text(errorText).foregroundStyle(.red)
                             Button("重试") { Task { await reload() } }
                         }
-                        .font(.subheadline)
+                        .font(AppTypography.detail)
                         .padding(16)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(Color.red.opacity(0.07),
                                     in: RoundedRectangle(cornerRadius: 14))
                     }
                     if !statusText.isEmpty {
-                        Text(statusText).font(.subheadline)
+                        Text(statusText).font(AppTypography.detail)
                             .foregroundStyle(RemoteIMStyle.textPrimary)
                             .padding(12).frame(maxWidth: .infinity, alignment: .leading)
                             .background(Color.blue.opacity(0.07),
@@ -94,12 +94,12 @@ struct MaiVideoCircleView: View {
                         ForEach(blocked) { author in
                             HStack {
                                 Text(author.authorName)
-                                    .font(.system(size: 15, weight: .medium))
+                                    .font(AppTypography.detail.weight(.medium))
                                 Spacer()
                                 Button("取消屏蔽") {
                                     Task { await unblock(authorID: author.authorId) }
                                 }
-                                .font(.subheadline)
+                                .font(AppTypography.detail)
                             }
                             .padding(15)
                             .background(Color(uiColor: .secondarySystemGroupedBackground),
@@ -126,7 +126,7 @@ struct MaiVideoCircleView: View {
                 .overlay(alignment: .bottom) { RemoteIMBarSeparator() }
             }
             .background(Color(uiColor: .systemGroupedBackground))
-            .navigationTitle("视频圈")
+            .appNavigationTitle("视频圈")
             .navigationBarTitleDisplayMode(.inline)
             .remoteIMNavigationBarMaterial()
             .toolbar {
@@ -187,7 +187,7 @@ struct MaiVideoCircleView: View {
             statusText = ""
             Task { await reload() }
         } label: {
-            Text(title).font(.system(size: 15, weight: .semibold))
+            Text(title).font(AppTypography.detail.weight(.semibold))
                 .frame(maxWidth: .infinity).padding(.vertical, 10)
                 .foregroundStyle(selectedPage == page ? RemoteIMStyle.textPrimary : .secondary)
                 .background(selectedPage == page ? Color(uiColor: .systemBackground) : .clear,
@@ -201,13 +201,13 @@ struct MaiVideoCircleView: View {
 
     private func emptyState(_ title: String, symbol: String) -> some View {
         VStack(spacing: 13) {
-            Image(systemName: symbol).font(.system(size: 34, weight: .light))
+            Image(systemName: symbol).font(AppTypography.symbol(size: 34, weight: .light))
                 .foregroundStyle(RemoteIMStyle.blue)
-            Text(title).font(.headline).foregroundStyle(RemoteIMStyle.textPrimary)
+            Text(title).font(AppTypography.heading).foregroundStyle(RemoteIMStyle.textPrimary)
             Text(selectedPage == 0 ? "审核通过的 AI 视频会出现在这里" :
                  selectedPage == 1 ? "从创作中心生成的视频卡片提交作品" :
                     "可以在作品菜单中屏蔽作者")
-                .font(.subheadline).foregroundStyle(.secondary)
+                .font(AppTypography.detail).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, minHeight: 250)
         .accessibilityIdentifier("video-circle-empty")
@@ -221,18 +221,18 @@ struct MaiVideoCircleView: View {
                                             Color(red: 0.19, green: 0.37, blue: 0.54)],
                                    startPoint: .topLeading, endPoint: .bottomTrailing)
                     Image(systemName: "play.fill")
-                        .font(.system(size: 24, weight: .bold)).foregroundStyle(.white)
+                        .font(AppTypography.symbol(size: 24, weight: .bold)).foregroundStyle(.white)
                         .frame(width: 58, height: 58)
                         .background(.black.opacity(0.38), in: Circle())
                     Text("AI 生成")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(AppTypography.metadata.weight(.semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 9).padding(.vertical, 5)
                         .background(.black.opacity(0.46), in: Capsule())
                         .frame(maxWidth: .infinity, maxHeight: .infinity,
                                alignment: .topLeading).padding(12)
                     Text(durationText(post.durationMs))
-                        .font(.caption.monospacedDigit()).foregroundStyle(.white)
+                        .font(AppTypography.metadata.monospacedDigit()).foregroundStyle(.white)
                         .padding(.horizontal, 8).padding(.vertical, 5)
                         .background(.black.opacity(0.46), in: Capsule())
                         .frame(maxWidth: .infinity, maxHeight: .infinity,
@@ -245,9 +245,9 @@ struct MaiVideoCircleView: View {
             .accessibilityIdentifier("video-circle-play-\(post.id)")
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(post.title).font(.system(size: 16, weight: .semibold))
+                    Text(post.title).font(AppTypography.body.weight(.semibold))
                         .foregroundStyle(RemoteIMStyle.textPrimary)
-                    Text(post.authorName).font(.subheadline).foregroundStyle(.secondary)
+                    Text(post.authorName).font(AppTypography.detail).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
                 if post.authorId != appState.maiChatAccountID {
@@ -275,18 +275,18 @@ struct MaiVideoCircleView: View {
     private func mineCard(_ post: MaiVideoCircleMinePost) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: "film")
-                .font(.system(size: 19, weight: .medium))
+                .font(AppTypography.symbol(size: 19, weight: .medium))
                 .foregroundStyle(RemoteIMStyle.blue)
                 .frame(width: 44, height: 44)
                 .background(Color.blue.opacity(0.08),
                             in: RoundedRectangle(cornerRadius: 11))
             VStack(alignment: .leading, spacing: 7) {
-                Text(post.title).font(.system(size: 15, weight: .semibold))
+                Text(post.title).font(AppTypography.detail.weight(.semibold))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
-                Text(statusTitle(post.status)).font(.subheadline)
+                Text(statusTitle(post.status)).font(AppTypography.detail)
                     .foregroundStyle(post.status == "rejected" ? .red : .secondary)
                 if let reason = post.reviewReason, !reason.isEmpty {
-                    Text(reason).font(.footnote).foregroundStyle(.secondary)
+                    Text(reason).font(AppTypography.detail).foregroundStyle(.secondary)
                 }
             }
             Spacer(minLength: 0)
@@ -445,11 +445,11 @@ struct MaiVideoCirclePublishView: View {
                                 Image(uiImage: cover).resizable().scaledToFit()
                             }
                             Image(systemName: "play.fill").foregroundStyle(.white)
-                                .font(.system(size: 21, weight: .bold))
+                                .font(AppTypography.symbol(size: 21, weight: .bold))
                                 .frame(width: 54, height: 54)
                                 .background(.black.opacity(0.45), in: Circle())
                             Text("AI 生成")
-                                .font(.caption.weight(.semibold)).foregroundStyle(.white)
+                                .font(AppTypography.metadata.weight(.semibold)).foregroundStyle(.white)
                                 .padding(8).background(.black.opacity(0.55), in: Capsule())
                                 .frame(maxWidth: .infinity, maxHeight: .infinity,
                                        alignment: .topLeading).padding(12)
@@ -461,7 +461,7 @@ struct MaiVideoCirclePublishView: View {
                     .accessibilityIdentifier("video-circle-publish-preview")
 
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("作品标题").font(.subheadline.weight(.semibold))
+                        Text("作品标题").font(AppTypography.detail.weight(.semibold))
                         TextField("给视频起个名字", text: $title, axis: .vertical)
                             .lineLimit(1...2).textInputAutocapitalization(.never)
                             .padding(13)
@@ -476,11 +476,11 @@ struct MaiVideoCirclePublishView: View {
                         Label("仅提交这段视频；原会话和私聊内容不会公开",
                               systemImage: "lock.shield")
                     }
-                    .font(.subheadline).foregroundStyle(RemoteIMStyle.textSecondary)
+                    .font(AppTypography.detail).foregroundStyle(RemoteIMStyle.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                     if !errorText.isEmpty {
-                        Text(errorText).font(.subheadline).foregroundStyle(.red)
+                        Text(errorText).font(AppTypography.detail).foregroundStyle(.red)
                             .accessibilityIdentifier("video-circle-publish-error")
                     }
                     Button {
@@ -490,7 +490,7 @@ struct MaiVideoCirclePublishView: View {
                             if isPublishing { ProgressView().tint(.white) }
                             Text(isPublishing ? "正在提交…" : "确认提交审核")
                         }
-                        .font(.system(size: 16, weight: .semibold))
+                        .font(AppTypography.body.weight(.semibold))
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity).padding(.vertical, 15)
                         .background(RemoteIMStyle.blue,
@@ -503,7 +503,7 @@ struct MaiVideoCirclePublishView: View {
                 .padding(18)
             }
             .background(Color(uiColor: .systemGroupedBackground))
-            .navigationTitle("发布到视频圈")
+            .appNavigationTitle("发布到视频圈")
             .navigationBarTitleDisplayMode(.inline)
             .remoteIMNavigationBarMaterial()
             .toolbar {

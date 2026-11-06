@@ -81,7 +81,8 @@ struct MaiSendPrompt {
 // 补充指定的正在运行轮次，不中断模型传输或当前工具，也不另起一轮。
 // turnId 必须是该轮最初的 assistant ID（activeTurnId），后续 assistant 分段不改变它。
 // requestId 是调用方生成的 1..128 字节 ASCII 标识，同一次提交重试必须复用。
-// 成功返回已落库的 user 消息 ID；完整工具批次结束后、下次模型调用前才消费这条消息。
+// 成功返回已落库的 user 消息 ID；当前工具结束后即暂停尚未执行的同批调用，
+// 补齐“未执行”回执后把消息带入下次模型请求，由模型决定后续工具。
 // 同 sessionId + turnId + requestId 的相同内容重试返回原 ID；改内容返回 InvalidInput。
 // 最近 128 份接收凭据在本 Agent 生命周期内保留，活动轮自身另保留全部凭据。
 // 每轮至多接受 64 条补充，文本至多 64 KiB，图片/视频各至多 10 项。
@@ -96,6 +97,19 @@ struct MaiSteerPrompt {
     std::vector<MaiModelImage> images = {};
     std::vector<MaiVideoPart> videos = {};
     std::string quotedMessageId = {};
+};
+
+// 接收会话输入而不要求调用方观察 busy/turnId。先持久化用户消息，再返回 user ID；
+// 活动轮在当前工具结束后消费，尚未执行的同批调用交给模型结合新输入重新判断。
+// 正在运行的工具或模型流不被强制中断；收尾时收到的输入由下一轮按序消费。
+// requestId 是调用方稳定的 1..128 ASCII 标识；同会话同编号同内容重试返回原 ID，
+// 改内容报 InvalidInput。正文/媒体边界与 MaiSteerPrompt 相同，最多保留 256 条未消费输入。
+// 停止暂停排队执行但保留内容；下一次 enqueue/重试恢复。退出不自动重放模型请求，
+// 尚未消费的输入持久保留，下一次该会话 enqueue 时恢复。成功只代表接收，不代表完成。
+// 删除会话或清空历史会同时结束该批接收凭据；调用方不得重送已明确清除的旧输入。
+struct MaiEnqueuePrompt {
+    MaiSendPrompt prompt;
+    std::string requestId;
 };
 
 // 中断正在跑的那一轮。
@@ -121,9 +135,9 @@ struct MaiReplyQuestion {
     std::string answer;
 };
 
-using MaiOperation =
-    std::variant<MaiCreateSession, MaiUpdateSession, MaiDeleteSession, MaiClearMessages,
-                 MaiSendPrompt, MaiSteerPrompt, MaiInterrupt, MaiReplyPermission, MaiReplyQuestion>;
+using MaiOperation = std::variant<MaiCreateSession, MaiUpdateSession, MaiDeleteSession,
+                                  MaiClearMessages, MaiSendPrompt, MaiSteerPrompt, MaiEnqueuePrompt,
+                                  MaiInterrupt, MaiReplyPermission, MaiReplyQuestion>;
 
 // ── 核心的门面 ──────────────────────────────────────────────────
 //

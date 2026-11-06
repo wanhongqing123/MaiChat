@@ -78,12 +78,12 @@ public final class VoiceTranscriptionOverlay {
         LinearLayout heading = new LinearLayout(activity);
         heading.setGravity(Gravity.CENTER_VERTICAL);
         heading.addView(new Glyph(activity, null), new LinearLayout.LayoutParams(dp(14), dp(14)));
-        status = label(14, 0xD6FFFFFF);
+        status = label( MaiChatTypographyTokens.Role.DETAIL, 0xD6FFFFFF);
         LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-2, -2);
         statusParams.leftMargin = dp(7);
         heading.addView(status, statusParams);
         card.addView(heading, new LinearLayout.LayoutParams(-1, -2));
-        transcript = label(24, Color.WHITE);
+        transcript = label( MaiChatTypographyTokens.Role.HEADING1, Color.WHITE);
         transcript.setMaxLines(8);
         transcript.setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE);
         transcript.setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE);
@@ -238,10 +238,10 @@ public final class VoiceTranscriptionOverlay {
         button.setEnabled(!finishing);
     }
 
-    private TextView label(int size, int color) {
-        TextView view = new TextView(activity);
-        view.setTextSize(size); view.setTextColor(color);
-        view.setTypeface(android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL));
+    private TextView label(MaiChatTypographyTokens.Role role, int color) {
+        TextView view = MaiChatTypography.text(activity);
+        MaiChatTypography.apply(view, role); view.setTextColor(color);
+        view.setTypeface(MaiChatTypography.semibold());
         view.setIncludeFontPadding(false);
         return view;
     }

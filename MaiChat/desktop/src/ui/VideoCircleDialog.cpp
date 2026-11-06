@@ -1,3 +1,4 @@
+#include "ui/UiZoom.h"
 #include "ui/VideoCircleDialog.h"
 
 #include "MaiCurlDownload.h"
@@ -92,11 +93,11 @@ QWidget* emptyState(const QString& title, const QString& detail, QWidget* parent
     auto* symbol = textLabel(QStringLiteral("▷"), host);
     symbol->setAlignment(Qt::AlignCenter);
     symbol->setFixedSize(58, 58);
-    symbol->setStyleSheet(QStringLiteral("background:#e8f4fc;color:#0b83ca;"
-                                         "border-radius:18px;font-size:28px;"));
+    UiZoom::setStyle(symbol, QStringLiteral("background:#e8f4fc;color:#0b83ca;"
+                                         "border-radius:18px;font-size: @display;"));
     layout->addWidget(symbol, 0, Qt::AlignHCenter);
     auto* heading = textLabel(title, host);
-    heading->setStyleSheet(QStringLiteral("color:#172033;font-size:17px;font-weight:650;"));
+    UiZoom::setStyle(heading, QStringLiteral("color:#172033;font-size: @body;font-weight:650;"));
     heading->setAlignment(Qt::AlignCenter);
     layout->addWidget(heading);
     auto* explanation = textLabel(detail, host, true);
@@ -198,7 +199,7 @@ VideoCircleDialog::VideoCircleDialog(AccessProvider access, AccountIdProvider ac
     root->setSpacing(10);
     auto* header = new QHBoxLayout;
     auto* heading = textLabel(QStringLiteral("AI 视频圈"), this);
-    heading->setStyleSheet(QStringLiteral("font-size:21px;font-weight:700;color:#172033;"));
+    UiZoom::setStyle(heading, QStringLiteral("font-size: @title;font-weight:700;color:#172033;"));
     header->addWidget(heading);
     header->addStretch();
     auto* close = new QPushButton(QStringLiteral("关闭"), this);
@@ -420,7 +421,7 @@ void VideoCircleDialog::renderFeed(const QJsonArray& posts, bool append) {
         layout->setSpacing(5);
         const QString fullTitle = post.value(QStringLiteral("title")).toString();
         auto* title = textLabel(fullTitle, row);
-        title->setStyleSheet(QStringLiteral("font-size:16px;font-weight:650;color:#172033;"));
+        UiZoom::setStyle(title, QStringLiteral("font-size: @body;font-weight:650;color:#172033;"));
         title->setWordWrap(false);
         title->setFixedHeight(21);
         title->setToolTip(fullTitle);

@@ -66,7 +66,7 @@ final class MaiVideoCircleDialog {
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(dp(activity, 22), dp(activity, 20),
             dp(activity, 22), dp(activity, 18));
-        TextView heading = text(activity, "发布到 AI 视频圈", 20, MaiChatTheme.TEXT);
+        TextView heading = text(activity, "发布到 AI 视频圈", MaiChatTypographyTokens.Role.TITLE, MaiChatTheme.TEXT);
         heading.setTypeface(MaiChatTypography.semibold());
         LinearLayout.LayoutParams headingLayout = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -85,19 +85,19 @@ final class MaiVideoCircleDialog {
                     Collections.singletonList(
                         new MainActivity.GalleryItem(original.getAbsolutePath(), true)));
         });
-        TextView badge = text(activity, "AI 生成 · 将公开给其他 MaiChat 用户", 13,
+        TextView badge = text(activity, "AI 生成 · 将公开给其他 MaiChat 用户", MaiChatTypographyTokens.Role.DETAIL,
             MaiChatTheme.BLUE);
         badge.setPadding(0, dp(activity, 12), 0, dp(activity, 4));
         panel.addView(badge);
         MaiChatAuthClient auth = MaiChatAuthClient.shared(activity);
         String initialAccount = auth.accountId();
         String publisher = auth.nickname().isEmpty() ? auth.accountId() : auth.nickname();
-        TextView identity = text(activity, "发布者：" + publisher, 12,
+        TextView identity = text(activity, "发布者：" + publisher, MaiChatTypographyTokens.Role.METADATA,
             MaiChatTheme.SECONDARY);
         panel.addView(identity);
-        EditText title = new EditText(activity);
+        EditText title = MaiChatTypography.input(activity);
         title.setSingleLine(true);
-        title.setTextSize(16);
+        MaiChatTypography.apply(title, MaiChatTypographyTokens.Role.BODY);
         title.setHint("给视频起个标题");
         title.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_DONE);
         title.setFilters(new android.text.InputFilter[] {
@@ -105,7 +105,7 @@ final class MaiVideoCircleDialog {
         });
         panel.addView(title);
         TextView detail = text(activity,
-            "提交时会生成带 AI 标识的新文件。审核通过后，其他用户可以浏览和播放。", 13,
+            "提交时会生成带 AI 标识的新文件。审核通过后，其他用户可以浏览和播放。", MaiChatTypographyTokens.Role.DETAIL,
             MaiChatTheme.SECONDARY);
         detail.setPadding(0, dp(activity, 8), 0, 0);
         panel.addView(detail);
@@ -118,7 +118,7 @@ final class MaiVideoCircleDialog {
         LinearLayout.LayoutParams actionsLayout = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(activity, 48));
         actionsLayout.topMargin = dp(activity, 18);
-        Button cancel = new Button(activity);
+        Button cancel = MaiChatTypography.button(activity);
         cancel.setText("取消");
         cancel.setAllCaps(false);
         cancel.setTextColor(MaiChatTheme.SECONDARY);
@@ -126,7 +126,7 @@ final class MaiVideoCircleDialog {
         cancel.setOnClickListener(view -> prompt.dismiss());
         actions.addView(cancel, new LinearLayout.LayoutParams(dp(activity, 76),
             dp(activity, 48)));
-        Button submit = new Button(activity);
+        Button submit = MaiChatTypography.button(activity);
         submit.setText("提交审核");
         submit.setAllCaps(false);
         submit.setTextColor(Color.WHITE);
@@ -171,7 +171,7 @@ final class MaiVideoCircleDialog {
             dp(activity, 18), dp(activity, 20));
         LinearLayout heading = new LinearLayout(activity);
         heading.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = text(activity, "AI 视频圈", 20, MaiChatTheme.TEXT);
+        TextView title = text(activity, "AI 视频圈", MaiChatTypographyTokens.Role.TITLE, MaiChatTheme.TEXT);
         title.setTypeface(MaiChatTypography.semibold());
         heading.addView(title, new LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1));
@@ -179,7 +179,7 @@ final class MaiVideoCircleDialog {
         close.setContentDescription("关闭 AI 视频圈");
         heading.addView(close);
         root.addView(heading);
-        TextView note = text(activity, "AI 生成 · 审核后公开", 12, MaiChatTheme.SECONDARY);
+        TextView note = text(activity, "AI 生成 · 审核后公开", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
         note.setPadding(0, dp(activity, 4), 0, dp(activity, 14));
         root.addView(note);
         LinearLayout tabs = new LinearLayout(activity);
@@ -190,7 +190,7 @@ final class MaiVideoCircleDialog {
         tabs.addView(mine, new LinearLayout.LayoutParams(0, dp(activity, 48), 1));
         tabs.addView(blocked, new LinearLayout.LayoutParams(0, dp(activity, 48), 1));
         root.addView(tabs);
-        hint = text(activity, "", 13, MaiChatTheme.SECONDARY);
+        hint = text(activity, "", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         hint.setPadding(0, dp(activity, 14), 0, dp(activity, 8));
         root.addView(hint);
         ScrollView scroll = new CappedScrollView(activity,
@@ -268,7 +268,7 @@ final class MaiVideoCircleDialog {
             if (rows.length() == 0 && content.getChildCount() == 0) {
                 String empty = mode == MaiVideoCircle.FEED ? "还没有公开视频"
                     : mode == MaiVideoCircle.MINE ? "你还没有发布视频" : "没有屏蔽的创作者";
-                content.addView(text(activity, empty, 15, MaiChatTheme.SECONDARY));
+                content.addView(text(activity, empty, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY));
             }
             for (int i = 0; i < rows.length(); ++i) {
                 JSONObject row = rows.optJSONObject(i);
@@ -292,7 +292,7 @@ final class MaiVideoCircleDialog {
             MaiChatAuthClient.shared(activity).accountId());
         LinearLayout summary = new LinearLayout(activity);
         summary.setGravity(Gravity.CENTER_VERTICAL);
-        TextView poster = text(activity, "▶", 29, Color.WHITE);
+        TextView poster = text(activity, "▶", MaiChatTypographyTokens.Role.HERO, Color.WHITE);
         poster.setGravity(Gravity.CENTER);
         poster.setContentDescription("AI 生成视频");
         GradientDrawable posterBackground = new GradientDrawable(
@@ -305,7 +305,7 @@ final class MaiVideoCircleDialog {
         LinearLayout labels = new LinearLayout(activity);
         labels.setOrientation(LinearLayout.VERTICAL);
         labels.setPadding(dp(activity, 12), 0, 0, 0);
-        TextView title = text(activity, post.optString("title", "视频"), 16, MaiChatTheme.TEXT);
+        TextView title = text(activity, post.optString("title", "视频"), MaiChatTypographyTokens.Role.BODY, MaiChatTheme.TEXT);
         title.setTypeface(MaiChatTypography.semibold());
         title.setMaxLines(2);
         title.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -313,7 +313,7 @@ final class MaiVideoCircleDialog {
         String author = own || myPublicPost ? "我的视频" :
             post.optString("author_name", "创作者");
         String status = own ? " · " + statusText(post.optString("status")) : "";
-        TextView metadata = text(activity, "AI 生成 · " + author + status, 12,
+        TextView metadata = text(activity, "AI 生成 · " + author + status, MaiChatTypographyTokens.Role.METADATA,
             MaiChatTheme.SECONDARY);
         metadata.setPadding(0, dp(activity, 5), 0, 0);
         labels.addView(metadata);
@@ -323,7 +323,7 @@ final class MaiVideoCircleDialog {
         String reviewReason = post.isNull("review_reason") ? "" :
             post.optString("review_reason");
         if (own && !reviewReason.isEmpty()) {
-            TextView reason = text(activity, reviewReason, 12,
+            TextView reason = text(activity, reviewReason, MaiChatTypographyTokens.Role.METADATA,
                 MaiChatTheme.SECONDARY);
             card.addView(reason);
         }
@@ -346,7 +346,7 @@ final class MaiVideoCircleDialog {
 
     private View blockedRow(JSONObject author) {
         LinearLayout card = card();
-        TextView title = text(activity, author.optString("author_name", "创作者"), 16,
+        TextView title = text(activity, author.optString("author_name", "创作者"), MaiChatTypographyTokens.Role.BODY,
             MaiChatTheme.TEXT);
         card.addView(title);
         card.addView(button("取消屏蔽", () -> act(MaiVideoCircle.UNBLOCK,
@@ -487,9 +487,9 @@ final class MaiVideoCircleDialog {
     }
 
     private Button button(String label, Runnable action) {
-        Button button = new Button(activity);
+        Button button = MaiChatTypography.button(activity);
         button.setText(label);
-        button.setTextSize(13);
+        MaiChatTypography.apply(button, MaiChatTypographyTokens.Role.DETAIL);
         button.setTextColor(MaiChatTheme.BLUE);
         button.setAllCaps(false);
         button.setMinHeight(dp(activity, 48));
@@ -499,10 +499,10 @@ final class MaiVideoCircleDialog {
         return button;
     }
 
-    private static TextView text(Activity activity, String value, int size, int color) {
-        TextView view = new TextView(activity);
+    private static TextView text(Activity activity, String value, MaiChatTypographyTokens.Role role, int color) {
+        TextView view = MaiChatTypography.text(activity);
         view.setText(value);
-        view.setTextSize(size);
+        MaiChatTypography.apply(view, role);
         view.setTextColor(color);
         return view;
     }

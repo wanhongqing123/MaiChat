@@ -329,6 +329,26 @@ int main(int argc, char** argv) {
     require(request(author, MAI_CLOUD_DRIVE_PLAY_LINK, target.c_str()).body.find(
             "https://localhost:") != std::string::npos,
             "owner did not receive short-lived HTTPS play URL");
+    const std::string originalPath = std::string(argv[4]) + "/downloaded-original.mov";
+    const std::string downloadArguments = nlohmann::json{
+        {"media_id", id}, {"output_path", originalPath}}.dump();
+    require(request(viewer, MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA, downloadArguments.c_str()).httpStatus == 404 &&
+            !exists(originalPath), "download crossed the account boundary");
+    const Call downloaded = request(author, MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA, downloadArguments.c_str());
+    require(downloaded.status == MAI_CLOUD_DRIVE_OK && readFile(originalPath) == contents,
+            "downloaded cloud original differs from uploaded bytes");
+    const auto receipt = nlohmann::json::parse(downloaded.body);
+    require(receipt["downloaded"] == true && receipt["path"] == originalPath &&
+            receipt["size_bytes"] == readFile(originalPath).size() &&
+            !receipt.contains("read_url") && downloaded.body.find("signature") == std::string::npos &&
+            downloaded.body.find("author-token") == std::string::npos,
+            "download receipt leaked access details or reported incorrect bytes");
+    require(request(author, MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA, downloadArguments.c_str()).status ==
+                MAI_CLOUD_DRIVE_FILE_ERROR && readFile(originalPath) == contents,
+            "download replaced an existing local original");
+    require(request(author, MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA,
+        R"({"media_id":"123e4567-e89b-42d3-a456-426614174000","output_path":"relative.mov"})").status ==
+                MAI_CLOUD_DRIVE_INVALID_ARGUMENT, "ordinary download accepted an unbound relative path");
     require(request(author, MAI_CLOUD_DRIVE_CREATE_FOLDER,
                     R"({"name":"../bad"})").status == MAI_CLOUD_DRIVE_INVALID_ARGUMENT,
             "unsafe folder name was sent over the network");
@@ -398,6 +418,76 @@ int main(int argc, char** argv) {
             renamedPage["quota"] == childPage["quota"] &&
             request(author, MAI_CLOUD_DRIVE_PLAY_LINK, target.c_str()).status == MAI_CLOUD_DRIVE_OK,
             "renamed media was not listed or playable with unchanged quota");
+
+    // Real ordinary search: nested path, name/type matching and owner isolation.
+    const auto search = [&](const nlohmann::json& input, const MaiCloudDriveOptions& options) {
+        const std::string arguments = input.dump();
+        const Call found = request(options, MAI_CLOUD_DRIVE_SEARCH_MEDIA, arguments.c_str());
+        require(found.status == MAI_CLOUD_DRIVE_OK, "cloud metadata search failed");
+        return nlohmann::json::parse(found.body);
+    };
+    const auto named = search({{"query", "RENAMED.MOV"}, {"exact_name", true}}, author);
+    require(named["search_complete"] == true && named["has_more"] == false &&
+            named["matches"].size() == 1 && named["matches"][0]["media_id"] == id &&
+            named["matches"][0]["cloud_path"] == "/Travel/Camera/Renamed.mov" &&
+            named["matches"][0]["size_bytes"] == contents.size(),
+            "search lost the candidate ID, nested path, size or case-insensitive exact match");
+    require(search({{"query", "Renamed"}, {"exact_name", true}}, author)["matches"].empty() &&
+            search({{"query", "renamed"}, {"media_type", "image"}}, author)["matches"].empty() &&
+            search({{"query", "renamed"}, {"folder_id", ""}}, author)["matches"].empty() &&
+            search({{"query", "renamed"}}, viewer)["matches"].empty(),
+            "search ignored exact name, type, root scope or account isolation");
+    require(request(author, MAI_CLOUD_DRIVE_SEARCH_MEDIA, R"({"query":" "})").status ==
+                MAI_CLOUD_DRIVE_INVALID_ARGUMENT &&
+            request(author, MAI_CLOUD_DRIVE_SEARCH_MEDIA, R"({"query":"x","owner":"other"})").status ==
+                MAI_CLOUD_DRIVE_INVALID_ARGUMENT,
+            "ordinary search accepted an invalid query or cross-account selector");
+    auto* queryCancel = mai_cloud_drive_cancel_create();
+    mai_cloud_drive_cancel_request(queryCancel);
+    MaiCloudDriveResult canceledQuery{};
+    mai_cloud_drive_request(&author, MAI_CLOUD_DRIVE_SEARCH_MEDIA, R"({"query":"renamed"})",
+                            queryCancel, &canceledQuery);
+    require(canceledQuery.status == MAI_CLOUD_DRIVE_CANCELED, "canceled search returned candidates");
+    mai_cloud_drive_result_free(&canceledQuery);
+    mai_cloud_drive_cancel_destroy(queryCancel);
+
+    // A target beyond page one must be found, and duplicate names keep distinct IDs/paths.
+    getState(endpoint, argv[2], "/test/search?case=duplicates");
+    const auto duplicates = search({{"query", "草棚"}, {"media_type", "video"}}, author);
+    require(duplicates["search_complete"] == true && duplicates["scanned_count"] == 52 &&
+            duplicates["matches"].size() == 2 &&
+            duplicates["matches"][0]["media_id"] != duplicates["matches"][1]["media_id"] &&
+            duplicates["matches"][0]["folder_path"] == "/Travel/Camera" &&
+            duplicates["matches"][1]["folder_path"] == "/",
+            "search missed an older page or arbitrarily collapsed duplicate filenames");
+    require(search({{"query", "草棚"}, {"folder_id", childId}}, author)["matches"].size() == 1,
+            "search ignored the requested folder");
+    getState(endpoint, argv[2], "/test/search?case=many");
+    const auto firstMatches = search({{"query", "candidate"}}, author);
+    const auto laterMatches = search({{"query", "candidate"}, {"before", firstMatches["next_cursor"]}}, author);
+    require(firstMatches["has_more"] == true && firstMatches["matches"].size() == 99 &&
+            laterMatches["search_complete"] == true && laterMatches["matches"].size() == 5 &&
+            firstMatches["matches"].back()["media_id"] != laterMatches["matches"].front()["media_id"],
+            "search continuation lost or repeated a partially consumed source page");
+    getState(endpoint, argv[2], "/test/search?case=nohit");
+    const auto partialEmpty = search({{"query", "last-page-match"}}, author);
+    require(partialEmpty["matches"].empty() && partialEmpty["has_more"] == true &&
+            partialEmpty["search_complete"] == false && partialEmpty["scanned_count"] == 1000 &&
+            search({{"query", "last-page-match"}, {"before", partialEmpty["next_cursor"]}}, author)
+                ["matches"].size() == 1,
+            "an empty bounded search incorrectly claimed no file exists");
+    getState(endpoint, argv[2], "/test/search?case=leak");
+    const std::string safeSearch = search({{"query", "safe"}}, author).dump();
+    require(safeSearch.find("read_url") == std::string::npos &&
+            safeSearch.find("object_key") == std::string::npos && safeSearch.find("signature") == std::string::npos,
+            "search leaked internal storage information");
+    for (const char* fault : {"cycle", "malformed"}) {
+        getState(endpoint, argv[2], (std::string("/test/search?case=") + fault).c_str());
+        require(request(author, MAI_CLOUD_DRIVE_SEARCH_MEDIA, R"({"query":"x"})").status ==
+                    MAI_CLOUD_DRIVE_INVALID_RESPONSE,
+                "search accepted a repeated cursor or malformed media metadata");
+    }
+    getState(endpoint, argv[2], "/test/search");
     require(request(viewer, MAI_CLOUD_DRIVE_RENAME_MEDIA, renameInput.c_str()).httpStatus == 404,
             "another account renamed private media");
     const std::string changedExtension = nlohmann::json{{"media_id", id}, {"name", "Renamed.mp4"}}.dump();

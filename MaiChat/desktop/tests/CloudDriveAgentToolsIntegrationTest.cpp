@@ -168,6 +168,17 @@ int main(int argc, char** argv) {
         renamed.value(QStringLiteral("size_bytes")) == listedVideo.value(QStringLiteral("size_bytes")) &&
         renamed.value(QStringLiteral("content_type")) == listedVideo.value(QStringLiteral("content_type")),
         "rename did not preserve video identity, folder, size and type");
+    // User task: resolve a named file, inspect its cloud location, then pass
+    // that returned identity to download. The model never has to invent an ID.
+    const QJsonObject searchedVideo = folderCall("maichat_cloud_drive_search_media",
+        {{QStringLiteral("query"), QStringLiteral("项目视频")},
+         {QStringLiteral("media_type"), QStringLiteral("video")}});
+    const QJsonArray videoMatches = searchedVideo.value(QStringLiteral("matches")).toArray();
+    require(searchedVideo.value(QStringLiteral("search_complete")).toBool() && videoMatches.size() == 1 &&
+        videoMatches.first().toObject().value(QStringLiteral("cloud_path")) == QStringLiteral("/项目/项目视频.MP4") &&
+        videoMatches.first().toObject().value(QStringLiteral("media_id")) == videoId,
+        "search did not resolve the file name, folder and download identity");
+    const QString searchedVideoId = videoMatches.first().toObject().value(QStringLiteral("media_id")).toString();
     require(folderCall("maichat_cloud_drive_list_media", {{QStringLiteral("folder_id"), folderId}})
         .value(QStringLiteral("media")).toArray().first().toObject()
         .value(QStringLiteral("name")) == renamedVideo, "renamed video did not update the media list");
@@ -193,6 +204,26 @@ int main(int argc, char** argv) {
             "cloud video did not open as a seekable in-memory source");
     require(!openedAsImage, "video opened through the image viewer");
     playedVod.reset();
+
+    // Download is independent of playback: the original is available to local
+    // tools, no viewer opens, and no signed URL is exposed to the model.
+    playedPath.clear();
+    MaiToolContext downloadContext;
+    downloadContext.root = QString::fromUtf8(argv[4]).toStdString();
+    const QString downloadedPath = QString::fromUtf8(argv[4]) + QStringLiteral("/agent-original.mp4");
+    MaiTool* download = registry.findForModel("maichat_cloud_drive_download_media");
+    require(download != nullptr, "cloud original download tool was not registered");
+    const QJsonObject downloaded = output(download->execute(QJsonDocument(QJsonObject{
+        {QStringLiteral("media_id"), searchedVideoId}, {QStringLiteral("output_path"), downloadedPath}})
+        .toJson(QJsonDocument::Compact).toStdString(), downloadContext));
+    QFile originalFile(source), downloadedFile(downloadedPath);
+    require(originalFile.open(QIODevice::ReadOnly) && downloadedFile.open(QIODevice::ReadOnly) &&
+            originalFile.readAll() == downloadedFile.readAll(), "Agent download changed the original bytes");
+    require(downloaded.value(QStringLiteral("downloaded")).toBool() &&
+            QFileInfo(downloaded.value(QStringLiteral("path")).toString()).canonicalFilePath() ==
+                QFileInfo(downloadedPath).canonicalFilePath() &&
+            !downloaded.contains(QStringLiteral("read_url")) && playedPath.isEmpty(),
+            "Agent download leaked a read link or opened a viewer");
 
     MaiTool* remove = registry.findForModel("maichat_cloud_drive_delete_media");
     require(remove && remove->requiresPerCallApproval("{}"), "delete lost per-call approval");
@@ -255,6 +286,16 @@ int main(int argc, char** argv) {
         QThread::msleep(20);
     }
     require(!listedImage.isEmpty(), "uploaded image was not listed as media");
+    const QString downloadedImagePath = QFileInfo(imagePath).absolutePath() + QStringLiteral("/agent-original.png");
+    const QJsonObject savedImage = output(download->execute(QJsonDocument(QJsonObject{
+        {QStringLiteral("media_id"), listedImage.value(QStringLiteral("media_id"))},
+        {QStringLiteral("output_path"), downloadedImagePath}})
+        .toJson(QJsonDocument::Compact).toStdString(), imageContext));
+    QFile imageOriginal(imagePath), imageCopy(downloadedImagePath);
+    require(imageOriginal.open(QIODevice::ReadOnly) && imageCopy.open(QIODevice::ReadOnly) &&
+            imageOriginal.readAll() == imageCopy.readAll() &&
+            savedImage.value(QStringLiteral("media_type")) == QStringLiteral("image"),
+            "Agent original download did not preserve image bytes and media type");
     const QJsonObject renamedImage = folderCall("maichat_cloud_drive_rename_media",
         {{QStringLiteral("media_id"), listedImage.value(QStringLiteral("media_id"))},
          {QStringLiteral("name"), QStringLiteral("海边照片.PNG")}});
@@ -262,6 +303,13 @@ int main(int argc, char** argv) {
         renamedImage.value(QStringLiteral("size_bytes")) == listedImage.value(QStringLiteral("size_bytes")) &&
         renamedImage.value(QStringLiteral("media_type")) == QStringLiteral("image"),
         "image rename lost the name, size or media type");
+    const QJsonArray imageMatches = folderCall("maichat_cloud_drive_search_media",
+        {{QStringLiteral("query"), QStringLiteral("海边照片.png")},
+         {QStringLiteral("exact_name"), true}, {QStringLiteral("media_type"), QStringLiteral("image")}})
+        .value(QStringLiteral("matches")).toArray();
+    require(imageMatches.size() == 1 && imageMatches.first().toObject()
+        .value(QStringLiteral("media_id")) == listedImage.value(QStringLiteral("media_id")),
+        "exact image search did not use the shared matching contract");
     const QByteArray imageIdArgs = QJsonDocument(QJsonObject{
         {QStringLiteral("media_id"), listedImage.value(QStringLiteral("media_id"))}})
         .toJson(QJsonDocument::Compact);

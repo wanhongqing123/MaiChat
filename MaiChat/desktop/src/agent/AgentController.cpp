@@ -40,6 +40,9 @@
 #include "MaiChatTools/DesktopProcessTools.h"
 #include "MaiChatTools/DesktopBrowserTools.h"
 #include "MaiChatTools/DesktopComputerTools.h"
+#if defined(MAICHAT_DESKTOP_PORTRAIT)
+#include "MaiChatTools/DesktopPortraitTools.h"
+#endif
 #if defined(Q_OS_MAC) || defined(Q_OS_WIN)
 #include "agent/MaiDesktopGpu.h"
 #endif
@@ -255,13 +258,19 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
 #else
     registerMaiSessionScheduleTools(*tools, scheduleStore, "Windows");
 #endif
-    registerMaiCalendarTools(*tools, [](const MaiCalendarEventInput& event, const MaiToolContext& context) {
-        return prepareDesktopCalendarImport(event, context);
-    });
-    const QString defaultWorkspace =
-        databasePath.isEmpty() ? QString()
-                               : QDir(QFileInfo(databasePath).absolutePath()).filePath(QStringLiteral("Workspace"));
-    tools->add(makeMaiCreateSessionTool(MaiSessionCreateMode::DefaultOrExplicitDirectory, toUtf8(defaultWorkspace)));
+    registerMaiCalendarTools(*tools,
+        [](const MaiCalendarEventInput& event, const MaiToolContext& context) {
+            return prepareDesktopCalendarImport(event, context);
+        });
+    const QString defaultWorkspace = databasePath.isEmpty() ? QString() :
+        QDir(QFileInfo(databasePath).absolutePath()).filePath(QStringLiteral("Workspace"));
+    tools->add(makeMaiCreateSessionTool(MaiSessionCreateMode::DefaultOrExplicitDirectory,
+                                        toUtf8(defaultWorkspace)));
+#if defined(MAICHAT_DESKTOP_PORTRAIT)
+    // 数据库和服务随当前账号 AgentController 一起重建；模型不能指定 profile 路径。
+    if (!databasePath.isEmpty())
+        registerDesktopPortraitTools(*tools, QFileInfo(databasePath).absolutePath());
+#endif
     registerDesktopProcessTools(*tools, std::make_shared<DesktopProcessManager>());
     registerDesktopBrowserTools(*tools, std::make_shared<DesktopBrowserManager>());
     registerDesktopComputerTools(*tools, std::make_shared<DesktopComputerController>());

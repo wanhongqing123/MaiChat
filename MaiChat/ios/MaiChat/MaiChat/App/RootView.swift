@@ -85,6 +85,7 @@ struct RootView: View {
     @ObservedObject private var pdfPasswordRequests = AIPdfPasswordRequests.shared
     @State private var selectedTab: AppTab = {
         #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--my-settings-ui-test") { return .me }
         if ProcessInfo.processInfo.arguments.contains("--ai-image-mixed-ui-test") { return .assistant }
         if ProcessInfo.processInfo.arguments.contains("--ai-session-reveal-ui-test") { return .assistant }
         if ProcessInfo.processInfo.arguments.contains("--ai-browser-ui-test") { return .assistant }
@@ -286,6 +287,7 @@ struct RootView: View {
 
         }
         .onChange(of: selectedTab) { tab in
+            AppHaptics.selectionChanged()
 #if DEBUG
             if tab == .cloudDrive { AIMobileScreenCapture.shared.captureCloudPageSmokeIfRequested() }
 #endif
@@ -307,7 +309,7 @@ struct RootView: View {
         .animation(.easeOut(duration: 0.18), value: contactGroupActionName)
         .animation(.easeOut(duration: 0.18), value: renamingContactGroup)
         .animation(.easeOut(duration: 0.18), value: deletingContactGroup)
-        .background(Color(red: 0.966, green: 0.976, blue: 0.988).ignoresSafeArea())
+        .background(RemoteIMStyle.pageBackground.ignoresSafeArea())
         // 系统模态覆盖主页面，不给主页面扣除宽高；原生宿主统一负责触摸和读屏隔离。
         .fullScreenCover(item: $appState.agentVideoPresentation) { presentation in
             MaiLocalMediaPager(sequence: presentation.sequence,
@@ -446,7 +448,7 @@ struct RootView: View {
         .overlay(alignment: .top) {
             if !appState.shouldShowInitialLogin, let errorMessage = appState.errorMessage {
                 Text(errorMessage)
-                    .font(.footnote)
+                    .font(AppTypography.detail)
                     .foregroundStyle(.white)
                     .lineLimit(2)
                     .truncationMode(.tail)
@@ -679,16 +681,16 @@ private struct NotificationPermissionDialog: View {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 12) {
                     Image(systemName: "bell.badge.fill")
-                        .font(.system(size: 19, weight: .semibold))
+                        .font(AppTypography.symbol(size: 19, weight: .semibold))
                         .foregroundStyle(RemoteIMStyle.blue)
                         .frame(width: 42, height: 42)
                         .background(RemoteIMStyle.blueSoft, in: Circle())
                     VStack(alignment: .leading, spacing: 3) {
                         Text("开启消息通知")
-                            .font(.system(size: 20, weight: .bold))
+                            .font(AppTypography.title.weight(.bold))
                             .foregroundStyle(RemoteIMStyle.textPrimary)
                         Text("仅在 MaiChat 退到后台时提醒新消息")
-                            .font(.system(size: 13))
+                            .font(AppTypography.detail)
                             .foregroundStyle(RemoteIMStyle.textSecondary)
                     }
                 }
@@ -698,7 +700,7 @@ private struct NotificationPermissionDialog: View {
                         later()
                     }
                     .buttonStyle(.plain)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(AppTypography.body.weight(.semibold))
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .frame(maxWidth: .infinity)
                     .frame(height: 46)
@@ -711,7 +713,7 @@ private struct NotificationPermissionDialog: View {
                         enable()
                     }
                     .buttonStyle(.plain)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(AppTypography.body.weight(.semibold))
                     .foregroundStyle(.white)
                     .frame(maxWidth: .infinity)
                     .frame(height: 46)
@@ -845,7 +847,7 @@ private struct TabButton: View {
             ZStack(alignment: .topTrailing) {
                 if let systemImageName {
                     Image(systemName: selected ? systemImageName + ".fill" : systemImageName)
-                        .font(.system(size: 23))
+                        .font(AppTypography.symbol(size: 23))
                         .frame(width: 23, height: 23)
                 } else {
                     Image(selected ? imageName + "Filled" : imageName)

@@ -1,6 +1,35 @@
 import XCTest
 
 final class PortraitUITests: XCTestCase {
+    @MainActor func testBodyCleanupAndWhiteningRemainInChat() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-portrait-ui-test"]
+        app.launchEnvironment["MAICHAT_PORTRAIT_BODY_TEST"] = "1"
+        app.launch()
+        let status = app.staticTexts["portrait-fixture-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 25))
+        expectation(for: NSPredicate(format: "label BEGINSWITH 'PASS' OR label BEGINSWITH 'FAIL'"), evaluatedWith: status)
+        waitForExpectations(timeout: 120)
+        XCTAssertEqual(status.label, "PASS：净肤 + 身体范围美白")
+        let thumbnail = app.buttons["agent-image-bubble"].firstMatch
+        XCTAssertTrue(thumbnail.waitForExistence(timeout: 10))
+        let preview = app.images["agent-image-preview"]
+        XCTAssertFalse(preview.exists)
+        let report = XCTAttachment(string: app.staticTexts["portrait-fixture-qa"].label)
+        report.name = "portrait-body-cleanskin-qa.json"; report.lifetime = .keepAlways; add(report)
+        let chat = XCTAttachment(screenshot: app.screenshot())
+        chat.name = "portrait-body-result-in-chat"; chat.lifetime = .keepAlways; add(chat)
+        thumbnail.tap()
+        XCTAssertTrue(preview.waitForExistence(timeout: 15))
+        let opened = XCTAttachment(screenshot: app.screenshot())
+        opened.name = "portrait-body-result-after-tap"; opened.lifetime = .keepAlways; add(opened)
+        preview.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: preview)], timeout: 10), .completed)
+        XCTAssertTrue(thumbnail.isHittable)
+    }
+
     @MainActor func testWelcomeDescribesPortraitToolsWithoutActions() throws {
         continueAfterFailure = false
         let app = XCUIApplication()
@@ -124,7 +153,11 @@ final class PortraitUITests: XCTestCase {
         XCTAssertEqual(qa["mask_height"] as? Int, 4284)
         XCTAssertEqual(qa["mask_format"] as? String, "L8")
         XCTAssertEqual(qa["face_count"] as? Int, 1)
-        XCTAssertTrue(qa["person_count"] is NSNull)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(qa["person_count"] as? Int), 0)
+        XCTAssertEqual(qa["face_analysis_performed"] as? Bool, true)
+        XCTAssertEqual(qa["person_analysis_performed"] as? Bool, true)
+        let ownsPerson = try XCTUnwrap(qa["person_ownership_reliable"] as? Bool)
+        XCTAssertEqual(qa["skin_scope"] as? String, ownsPerson ? "selected_person_visible_skin" : "face_skin_only")
         for field in ["source_unchanged", "background_blocks_equal", "unknown_parameter", "file_not_found", "input_not_ready"] {
             XCTAssertEqual(qa[field] as? Bool, true, field)
         }

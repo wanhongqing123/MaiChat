@@ -18,19 +18,21 @@ namespace {
 
 using Json = nlohmann::json;
 
-enum class Action { List, Pending, Upload, Pause, Resume, Abort, Play, Delete,
+enum class Action { List, Search, Pending, Upload, Pause, Resume, Abort, Play, Download, Delete,
                     SessionOpen, ListFolders, CreateFolder, UpdateFolder,
                     DeleteFolder, MoveMedia, RenameMedia };
 
 const char* toolName(Action action) {
     switch (action) {
         case Action::List: return "maichat_cloud_drive_list_media";
+        case Action::Search: return "maichat_cloud_drive_search_media";
         case Action::Pending: return "maichat_cloud_drive_list_pending_uploads";
         case Action::Upload: return "maichat_cloud_drive_upload_media";
         case Action::Pause: return "maichat_cloud_drive_pause_upload";
         case Action::Resume: return "maichat_cloud_drive_resume_upload";
         case Action::Abort: return "maichat_cloud_drive_abort_upload";
         case Action::Play: return "maichat_cloud_drive_open_media";
+        case Action::Download: return "maichat_cloud_drive_download_media";
         case Action::Delete: return "maichat_cloud_drive_delete_media";
         case Action::SessionOpen: return "maichat_session_attachment_open";
         case Action::ListFolders: return "maichat_cloud_drive_list_folders";
@@ -50,7 +52,22 @@ const char* toolDescription(Action action) {
                    "then list its images, videos and quota. A not_configured result means the "
                    "feature is disabled; do not attempt other cloud drive actions. "
                    "Omit folder_id for all files, use an empty string for root, or a folder UUID "
-                   "from maichat_cloud_drive_list_folders for that folder's direct files.";
+                   "from maichat_cloud_drive_list_folders for that folder's direct files. "
+                   "For a named file, use maichat_cloud_drive_search_media instead of reading every page.";
+        case Action::Search:
+            return "Find private cloud images/videos by filename keyword before opening or downloading. "
+                   "Use a filename fragment as query (Chinese text matches literally; English ASCII is "
+                   "case-insensitive), or exact_name=true for a full filename. Optional media_type filters "
+                   "image/video; folder_id selects direct files in a folder (empty string for root); omit "
+                   "it to search all folders. Resolve a named directory with maichat_cloud_drive_list_folders first. "
+                   "Returns candidate media_id, name, cloud_path, size_bytes, "
+                   "media_type and created_at (Unix milliseconds). If has_more=true, continue with "
+                   "next_cursor as before and the same filters: an empty partial batch is not no-match, "
+                   "and one partial candidate is not proof of uniqueness. Keep same-name candidates; "
+                   "compare folder/path, size and time with the user's request. Ask if still ambiguous; "
+                   "never guess an ID or download an arbitrary duplicate. This reads metadata only. "
+                   "cloud_path is a cloud location; pass media_id to the download tool and use its returned "
+                   "local path for inspection.";
         case Action::Pending:
             return "List this device's paused or active private cloud uploads. "
                    "The list never exposes local paths to the model. Remote resume still "
@@ -81,6 +98,13 @@ const char* toolDescription(Action action) {
         case Action::Delete:
             return "Only while this account's private cloud drive is enabled, permanently "
                    "delete one of its images or videos. Approval follows the Agent policy.";
+        case Action::Download:
+            return "Download an original image or video from this account's private cloud drive "
+                   "into the current Agent workspace so local tools can inspect it. Use a media_id "
+                   "from maichat_cloud_drive_search_media or maichat_cloud_drive_list_media and a new output_path, "
+                   "confirming the intended candidate when filenames are ambiguous and preserving the filename "
+                   "extension. Existing files are never replaced. Returns the local path and exact "
+                   "byte count only after the complete file is available; does not open a viewer.";
         case Action::SessionOpen:
             return "Open an attachment ID already shared in this MaiChat Agent Session. "
                    "Download it from the account's separate private Session space into this "
@@ -116,6 +140,8 @@ const char* toolSchema(Action action) {
     switch (action) {
         case Action::List:
             return R"({"type":"object","properties":{"before":{"type":"string","minLength":1,"maxLength":256},"folder_id":{"type":"string","maxLength":36}},"additionalProperties":false})";
+        case Action::Search:
+            return R"({"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":240},"exact_name":{"type":"boolean"},"media_type":{"type":"string","enum":["image","video"]},"folder_id":{"type":"string","maxLength":36},"before":{"type":"string","minLength":1,"maxLength":256}},"required":["query"],"additionalProperties":false})";
         case Action::ListFolders:
         case Action::Pending: return R"({"type":"object","properties":{},"additionalProperties":false})";
         case Action::CreateFolder:
@@ -130,6 +156,8 @@ const char* toolSchema(Action action) {
             return R"({"type":"object","properties":{"media_id":{"type":"string","minLength":36,"maxLength":36},"name":{"type":"string","minLength":1,"maxLength":240}},"required":["media_id","name"],"additionalProperties":false})";
         case Action::SessionOpen:
             return R"({"type":"object","properties":{"attachment_id":{"type":"string","minLength":36,"maxLength":36}},"required":["attachment_id"],"additionalProperties":false})";
+        case Action::Download:
+            return R"({"type":"object","properties":{"media_id":{"type":"string","minLength":36,"maxLength":36},"output_path":{"type":"string","minLength":1,"maxLength":4096}},"required":["media_id","output_path"],"additionalProperties":false})";
         case Action::Upload:
             return R"({"type":"object","properties":{"file_path":{"type":"string","minLength":1,"maxLength":4096}},"required":["file_path"],"additionalProperties":false})";
         case Action::Pause:
@@ -228,6 +256,30 @@ public:
         Json arguments = Json::parse(argumentsJson, nullptr, false);
         if (!arguments.is_object()) return invalid("arguments must be an object");
         switch (mAction) {
+            case Action::Search: {
+                if (!onlyKeys(arguments, {"query", "exact_name", "media_type", "folder_id", "before"}) ||
+                    !arguments.contains("query") || !arguments["query"].is_string())
+                    return invalid("supply a filename query and optional exact_name, media_type, folder_id or before");
+                const std::string query = arguments["query"].get<std::string>();
+                if (query.empty() || query.size() > 240 ||
+                    !std::all_of(query.begin(), query.end(), [](unsigned char c) { return c >= 0x20 && c != 0x7f; }) ||
+                    std::all_of(query.begin(), query.end(), [](unsigned char c) { return c == ' '; }) ||
+                    (arguments.contains("exact_name") && !arguments["exact_name"].is_boolean()) ||
+                    (arguments.contains("media_type") && arguments["media_type"] != "image" &&
+                     arguments["media_type"] != "video"))
+                    return invalid("query must be a nonblank filename fragment; media_type must be image or video");
+                if (arguments.contains("before")) {
+                    if (!arguments["before"].is_string()) return invalid("before must be a search result cursor");
+                    const std::string cursor = arguments["before"].get<std::string>();
+                    if (cursor.empty() || cursor.size() > 256 ||
+                        !std::all_of(cursor.begin(), cursor.end(), [](unsigned char c) {
+                            return std::isalnum(c) || c == '_' || c == '-';
+                        })) return invalid("before must be copied from next_cursor");
+                }
+                if (arguments.contains("folder_id") && !normalizeId(arguments, "folder_id", true))
+                    return invalid("folder_id must be a folder UUID or an empty string for root");
+                break;
+            }
             case Action::List:
                 if (!onlyKeys(arguments, {"before", "folder_id"}) ||
                     (arguments.contains("before") &&
@@ -285,6 +337,22 @@ public:
                 arguments["session_id"] = context.sessionId;
                 break;
             }
+            case Action::Download: {
+                if (!onlyKeys(arguments, {"media_id", "output_path"}) ||
+                    !normalizeId(arguments, "media_id") || context.root.empty() ||
+                    !arguments.contains("output_path") || !arguments["output_path"].is_string())
+                    return invalid("supply media_id and a new output_path in the current workspace");
+                const std::string requested = arguments["output_path"].get<std::string>();
+                const std::string resolved = requested.empty() || requested.size() > 4096 ||
+                    requested.find('\0') != std::string::npos
+                    ? std::string() : context.resolvePath(requested);
+                if (resolved.empty() || MaiFileSystem::exists(MaiFilePath::fromUtf8(resolved)))
+                    return invalid("output_path must be a new file inside the authorized workspace");
+                // The platform supplies account access; only this resolved path
+                // is allowed to reach the ordinary shared download operation.
+                arguments["output_path"] = resolved;
+                break;
+            }
             case Action::Upload: {
                 if (!onlyKeys(arguments, "file_path") || !arguments.contains("file_path") ||
                     !arguments["file_path"].is_string())
@@ -338,8 +406,8 @@ private:
 
 void registerMaiCloudDriveTools(MaiToolRegistry& tools, MaiCloudDriveToolHandler handler) {
     for (Action action :
-         {Action::List, Action::Pending, Action::Upload, Action::Pause,
-          Action::Resume, Action::Abort, Action::Play, Action::Delete,
+         {Action::List, Action::Search, Action::Pending, Action::Upload, Action::Pause,
+          Action::Resume, Action::Abort, Action::Play, Action::Download, Action::Delete,
           Action::SessionOpen, Action::ListFolders, Action::CreateFolder,
           Action::UpdateFolder, Action::DeleteFolder, Action::MoveMedia, Action::RenameMedia}) {
         tools.add(std::make_unique<MaiCloudDriveTool>(action, handler));

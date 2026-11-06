@@ -93,6 +93,7 @@ struct AIOutgoingMessageRow: Identifiable {
         switch entry.state {
         case .queued: "排队中"
         case .dispatching: "正在发送"
+        case .forwarded: "已发出，等待所属设备接收"
         case .unknown: "送达待确认"
         case .failed: "发送失败，内容已保留"
         case .accepted: "已送达"

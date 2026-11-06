@@ -43,6 +43,8 @@ class Fixture(http.server.ThreadingHTTPServer):
         self.folders = {}
         self.folder_id = None
         self.folder_response_case = ""
+        self.search_case = ""
+        self.search_requests = 0
 
     def media_type(self):
         if self.content_type.startswith("image/"):
@@ -176,6 +178,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path_only()
+        if path == "/test/search":
+            case = parse_qs(urlsplit(self.path).query).get("case", [""])[0]
+            with self.server.lock:
+                self.server.search_case = case
+                self.server.search_requests = 0
+            self.reply(200, {"case": case})
+            return
         if path == "/test/folder-response":
             case = parse_qs(urlsplit(self.path).query).get("case", [""])[0]
             with self.server.lock:
@@ -243,14 +252,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "content_type": self.server.content_type,
                     "media_type": self.server.media_type(),
                     "folder_id": self.server.folder_id,
-                    "created_at": "2026-10-24T00:00:00Z"}]
+                    "created_at": 1792800000000}]
                 if account != "author" or self.server.status != "ready":
                     videos = []
                 used = self.server.size if account == "author" and self.server.status == "ready" else 0
                 query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                next_cursor = None
+                case = self.server.search_case
+                if case:
+                    self.server.search_requests += 1
+                    def item(index, name, folder=None):
+                        return {"id": str(uuid.UUID(int=100000 + index)), "name": name,
+                            "size_bytes": 1000 + index, "media_type": "video",
+                            "content_type": "video/quicktime", "created_at": 1792800000000 - index,
+                            "folder_id": folder}
+                    if case == "duplicates":
+                        videos = [item(i, f"clip-{i}.mov") for i in range(50)]
+                        videos += [{**videos[0], "id": VIDEO_ID, "name": "草棚.MOV",
+                            "size_bytes": self.server.size, "folder_id": self.server.folder_id},
+                            item(52, "草棚.MOV")]
+                    elif case == "many":
+                        videos = [item(i, f"candidate-{i}.mov" if i else "other.mov") for i in range(105)]
+                    elif case == "nohit":
+                        videos = [item(i, "last-page-match.mov" if i == 1000 else f"clip-{i}.mov")
+                                  for i in range(1001)]
+                    elif case == "cycle":
+                        videos = [item(1, "cycle.mov")]
+                    elif case == "malformed":
+                        videos = [{**item(1, "invalid.mov"), "created_at": "not-a-timestamp"}]
+                    elif case == "leak":
+                        videos = [{**item(1, "safe.mov"), "read_url": "https://private.invalid/?signature=secret",
+                                   "object_key": "private-object-key"}]
+                    if account != "author":
+                        videos = []
                 if "folder_id" in query and (query["folder_id"][0] or None) != self.server.folder_id:
-                    videos = []
-            self.reply(200, {"videos": videos, "next_cursor": None,
+                    if not case:
+                        videos = []
+                if case:
+                    if "folder_id" in query:
+                        videos = [v for v in videos if v["folder_id"] == (query["folder_id"][0] or None)]
+                    before = query.get("before", [""])[0]
+                    offset = int(before[7:]) if re.fullmatch(r"search_\d+", before) else 0
+                    page = videos[offset:offset + 50]
+                    next_cursor = f"search_{offset+50}" if offset + 50 < len(videos) else None
+                    if case == "cycle":
+                        next_cursor = "search_cycle"
+                    videos = page
+            self.reply(200, {"videos": videos, "next_cursor": next_cursor,
                 "quota": {"used_bytes": used,
                           "reserved_bytes": 0, "limit_bytes": 10_000_000_000}})
             return

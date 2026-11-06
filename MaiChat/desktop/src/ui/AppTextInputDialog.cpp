@@ -99,26 +99,26 @@ void AppTextInputDialog::buildUi(const Options& options) {
 
 // 作用：应用页面现有的颜色、字号、间距和控件外观。
 void AppTextInputDialog::applyStyle() {
-    setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(this, QStringLiteral(R"(
         #appTextInputPanel {
             background: #ffffff;
             border-radius: 16px;
         }
         #appTextInputTitle {
             color: #0f172a;
-            font-size: 18px;
+            font-size: @heading3;
             font-weight: 700;
         }
         #appTextInputDescription {
             color: #667085;
-            font-size: 13px;
+            font-size: @detail;
         }
         #appTextInput {
             background: #f8fafc;
             border: 1px solid #d9e1ec;
             border-radius: 10px;
             color: #172033;
-            font-size: 14px;
+            font-size: @detail;
             padding: 10px 12px;
         }
         #appTextInput:focus {
@@ -127,7 +127,7 @@ void AppTextInputDialog::applyStyle() {
         }
         #appTextInputCancel, #appTextInputConfirm {
             border-radius: 10px;
-            font-size: 14px;
+            font-size: @detail;
             font-weight: 700;
             padding: 10px 22px;
         }
@@ -148,5 +148,5 @@ void AppTextInputDialog::applyStyle() {
         #appTextInputConfirm:hover {
             background: #1e40af;
         }
-    )")));
+    )"));
 }

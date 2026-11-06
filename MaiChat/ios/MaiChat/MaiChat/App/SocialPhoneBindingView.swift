@@ -40,7 +40,7 @@ struct SocialPhoneBindingView: View {
                     HStack {
                         Button(action: onCancel) {
                             Image(systemName: "chevron.left")
-                                .font(.system(size: 22, weight: .medium))
+                                .font(AppTypography.symbol(size: 22, weight: .medium))
                                 .frame(width: 44, height: 44)
                         }
                         .accessibilityLabel("返回手机号登录")
@@ -55,7 +55,7 @@ struct SocialPhoneBindingView: View {
                     VStack(alignment: .leading, spacing: landscape ? 8 : 18) {
                         HStack(spacing: 14) {
                             Text("+86")
-                                .font(.system(size: 18, weight: .semibold))
+                                .font(AppTypography.heading.weight(.semibold))
                                 .foregroundStyle(.secondary)
                             Rectangle().fill(Color.black.opacity(0.08))
                                 .frame(width: 1, height: 24)
@@ -88,23 +88,23 @@ struct SocialPhoneBindingView: View {
                                     .foregroundStyle(accent)
                             }
                         }
-                        .font(.system(size: 13))
+                        .font(AppTypography.detail)
 
                         if isExpired {
                             Text("授权已过期，请返回并重新使用\(intent.provider.displayName)登录。")
-                                .font(.footnote)
+                                .font(AppTypography.detail)
                                 .foregroundStyle(.red)
                         } else if let information {
-                            Text(information).font(.footnote).foregroundStyle(.secondary)
+                            Text(information).font(AppTypography.detail).foregroundStyle(.secondary)
                         }
                         if let errorMessage {
-                            Text(errorMessage).font(.footnote).foregroundStyle(.red)
+                            Text(errorMessage).font(AppTypography.detail).foregroundStyle(.red)
                         }
 
                         Button { Task { await submit() } } label: {
                             HStack(spacing: 8) {
                                 if isBusy { ProgressView().tint(.white) }
-                                Text(buttonTitle).font(.system(size: 18, weight: .semibold))
+                                Text(buttonTitle).font(AppTypography.heading.weight(.semibold))
                             }
                             .frame(maxWidth: .infinity)
                             .frame(height: landscape ? 46 : 56)
@@ -123,7 +123,7 @@ struct SocialPhoneBindingView: View {
                                     .frame(width: 24, height: 24)
                                 Text("我已年满 14 周岁").foregroundStyle(.secondary)
                             }
-                            .font(.system(size: 12))
+                            .font(AppTypography.metadata)
                         }
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("social-bind-minimum-age")
@@ -146,7 +146,7 @@ struct SocialPhoneBindingView: View {
                                 Link("《儿童隐私保护声明》", destination: childrenURL)
                             }
                         }
-                        .font(.system(size: 12))
+                        .font(AppTypography.metadata)
                         .foregroundStyle(accent)
                     }
                     .padding(.horizontal, 28)
@@ -160,7 +160,7 @@ struct SocialPhoneBindingView: View {
             }
             .scrollDismissesKeyboard(.interactively)
         }
-        .background(Color.white.ignoresSafeArea())
+        .background(RemoteIMStyle.pageBackground.ignoresSafeArea())
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { now = $0 }
         .onChange(of: scenePhase) { phase in
             if phase == .active { now = Date() }
@@ -173,14 +173,14 @@ struct SocialPhoneBindingView: View {
         if landscape {
             HStack(spacing: 16) {
                 Image(systemName: "person.crop.circle.badge.checkmark")
-                    .font(.system(size: 48, weight: .light))
+                    .font(AppTypography.symbol(size: 48, weight: .light))
                     .foregroundStyle(accent)
                     .frame(width: 58, height: 58)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("绑定手机号").font(.title2.weight(.semibold))
+                    Text("绑定手机号").font(AppTypography.title.weight(.semibold))
                     Text("验证手机号后，即可使用\(intent.provider.displayName)登录同一个 MaiChat 账号。")
-                        .font(.subheadline)
+                        .font(AppTypography.detail)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -188,14 +188,14 @@ struct SocialPhoneBindingView: View {
             .frame(maxWidth: 470, alignment: .leading)
         } else {
             Image(systemName: "person.crop.circle.badge.checkmark")
-                .font(.system(size: 65, weight: .light))
+                .font(AppTypography.symbol(size: 65, weight: .light))
                 .foregroundStyle(accent)
                 .frame(height: 76)
                 .accessibilityHidden(true)
             VStack(spacing: 8) {
-                Text("绑定手机号").font(.title2.weight(.semibold))
+                Text("绑定手机号").font(AppTypography.title.weight(.semibold))
                 Text("验证手机号后，即可使用\(intent.provider.displayName)登录同一个 MaiChat 账号。")
-                    .font(.subheadline)
+                    .font(AppTypography.detail)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }

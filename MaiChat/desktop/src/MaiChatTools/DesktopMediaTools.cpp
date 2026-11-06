@@ -63,8 +63,8 @@ struct DesktopVideoNavigation {
 QJsonObject videoStatus(MaiFfplayVideoDialog* dialog) {
     MaiFfplayPlaybackStatus status{};
     const bool open = dialog && dialog->isStarted();
-    const bool sampled = open && maiFfplayGetPlaybackStatus(&status);
-    const bool ready = sampled && status.duration_us > 0 && dialog->presentedFrames() > 0;
+    const bool sampled = open && dialog->playbackStatus(&status);
+    const bool ready = sampled && status.duration_us > 0 && dialog->hasPresentedFrame();
     const QString state =
         !open ? QStringLiteral("closed")
               : (!ready ? QStringLiteral("opening")
@@ -389,7 +389,7 @@ public:
             bool deduplicated = false;
             if (absoluteSeek) {
                 MaiFfplayPlaybackStatus status{};
-                const bool sampled = maiFfplayGetPlaybackStatus(&status) != 0;
+                const bool sampled = dialog->playbackStatus(&status);
                 if (action == QStringLiteral("seek_percent")) {
                     if (!sampled || status.duration_us <= 0) return;
                     targetUs = static_cast<int64_t>(fraction * status.duration_us);

@@ -24,7 +24,7 @@ public final class MobilePdfSecurityAcceptance {
         ExecutorService worker) {
         if (!BuildConfig.DEBUG || !activity.getIntent().getBooleanExtra("maichat-pdf-security-ui-test", false))
             return null;
-        Button run = new Button(activity);
+        Button run = com.kongshang.maichat.MaiChatTypography.button(activity);
         run.setText("PDF 本地验收");
         run.setContentDescription("pdf-security-test-run");
         FrameLayout.LayoutParams layout = new FrameLayout.LayoutParams(

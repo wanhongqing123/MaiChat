@@ -119,25 +119,27 @@ QByteArray storedMessageFingerprint(const MaiMessage& message) {
         text(part.id);
         number(part.created);
         number(static_cast<qint64>(part.body.index()));
-        std::visit([&](const auto& body) {
-            using Body = std::decay_t<decltype(body)>;
-            if constexpr (std::is_same_v<Body, MaiTextPart> || std::is_same_v<Body, MaiReasoningPart>) {
-                text(body.text);
-            } else if constexpr (std::is_same_v<Body, MaiImagePart> || std::is_same_v<Body, MaiVideoPart>) {
-                text(body.path);
-                text(body.mimeType);
-            } else if constexpr (std::is_same_v<Body, MaiQuotePart>) {
-                text(body.messageId);
-                text(body.preview);
-            } else if constexpr (std::is_same_v<Body, MaiToolPart>) {
-                text(body.tool);
-                text(body.callId);
-                text(body.input);
-                text(body.output);
-                text(body.error);
-                number(static_cast<int>(body.state));
-            }
-        }, part.body);
+        std::visit(
+            [&](const auto& body) {
+                using Body = std::decay_t<decltype(body)>;
+                if constexpr (std::is_same_v<Body, MaiTextPart> || std::is_same_v<Body, MaiReasoningPart>) {
+                    text(body.text);
+                } else if constexpr (std::is_same_v<Body, MaiImagePart> || std::is_same_v<Body, MaiVideoPart>) {
+                    text(body.path);
+                    text(body.mimeType);
+                } else if constexpr (std::is_same_v<Body, MaiQuotePart>) {
+                    text(body.messageId);
+                    text(body.preview);
+                } else if constexpr (std::is_same_v<Body, MaiToolPart>) {
+                    text(body.tool);
+                    text(body.callId);
+                    text(body.input);
+                    text(body.output);
+                    text(body.error);
+                    number(static_cast<int>(body.state));
+                }
+            },
+            part.body);
     }
     return hash.result();
 }
@@ -151,13 +153,12 @@ QStringList storedMessageShape(const MaiMessage& message) {
 }
 
 QString videoResourceName(const QString& path) {
-    return kComposerVideoPrefix + QUrl::fromLocalFile(QFileInfo(path).absoluteFilePath())
-        .toString(QUrl::FullyEncoded);
+    return kComposerVideoPrefix + QUrl::fromLocalFile(QFileInfo(path).absoluteFilePath()).toString(QUrl::FullyEncoded);
 }
 
 QString videoPathFromResource(const QString& name) {
-    return name.startsWith(kComposerVideoPrefix)
-        ? QUrl(name.mid(kComposerVideoPrefix.size())).toLocalFile() : QString();
+    return name.startsWith(kComposerVideoPrefix) ? QUrl(name.mid(kComposerVideoPrefix.size())).toLocalFile()
+                                                 : QString();
 }
 
 QString videoMimeType(const QString& path) {
@@ -175,11 +176,9 @@ QImage videoDraftImage(const QImage& source) {
     QPainter painter(&preview);
     painter.setRenderHint(QPainter::Antialiasing);
     if (!source.isNull()) {
-        const QImage fitted = source.scaled(preview.size(), Qt::KeepAspectRatioByExpanding,
-                                            Qt::SmoothTransformation);
+        const QImage fitted = source.scaled(preview.size(), Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
         painter.drawImage(QRect(QPoint(0, 0), preview.size()), fitted,
-                          QRect((fitted.width() - preview.width()) / 2,
-                                (fitted.height() - preview.height()) / 2,
+                          QRect((fitted.width() - preview.width()) / 2, (fitted.height() - preview.height()) / 2,
                                 preview.width(), preview.height()));
     }
     painter.setBrush(QColor(0, 0, 0, 160));
@@ -204,8 +203,7 @@ QString fromUtf8(const std::string& text) {
 QString defaultWorkspaceDirectory(const QString& preferred, bool configured) {
     if (configured) {
         if (preferred.isEmpty()) return {};
-        if (QDir(preferred).isRoot() || !QDir().mkpath(preferred) ||
-            !QFileInfo(preferred).isWritable()) return {};
+        if (QDir(preferred).isRoot() || !QDir().mkpath(preferred) || !QFileInfo(preferred).isWritable()) return {};
         return QDir(preferred).canonicalPath();
     }
     const QStringList roots = {
@@ -477,7 +475,7 @@ QString paidGenerationDetail(const QString& tool, const QString& arguments) {
     return detail;
 }
 
-QLabel* makeLabel(const QString& text, int pixelSize, const char* color, bool bold = false) {
+QLabel* makeLabel(const QString& text, UiZoom::TextRole role, const char* color, bool bold = false) {
     auto* label = new QLabel(text);
     label->setTextFormat(Qt::PlainText);
     label->setWordWrap(true);
@@ -485,9 +483,9 @@ QLabel* makeLabel(const QString& text, int pixelSize, const char* color, bool bo
     label->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::MinimumExpanding);
     label->setTextInteractionFlags(Qt::TextSelectableByMouse);
     QFont font = label->font();
-    font.setPixelSize(UiZoom::s(pixelSize));
+    font.setPixelSize(UiZoom::textPixels(role));
     font.setBold(bold);
-    label->setFont(font);
+    UiZoom::setFont(label, role, font);
     label->setStyleSheet(QStringLiteral("color:%1;background:transparent;").arg(color));
     return label;
 }
@@ -552,15 +550,15 @@ QWidget* makeWelcomeView(QWidget* parent) {
     contentLayout->setContentsMargins(0, 0, 0, 0);
     contentLayout->setSpacing(0);
 
-    auto* sparkle = makeLabel(QStringLiteral("✦"), 28, kAccent, true);
+    auto* sparkle = makeLabel(QStringLiteral("✦"), UiZoom::TextRole::Display, kAccent, true);
     sparkle->setObjectName(QStringLiteral("agentWelcomeSparkle"));
     sparkle->setAlignment(Qt::AlignCenter);
     sparkle->setFixedSize(UiZoom::s(52), UiZoom::s(52));
     sparkle->setTextInteractionFlags(Qt::NoTextInteraction);
-    sparkle->setStyleSheet(UiZoom::scaleQss(
-        QStringLiteral("QLabel#agentWelcomeSparkle{background:#e4f4ff;color:#168bd4;border-radius:15px;}")));
+    UiZoom::setStyle(
+        sparkle, QStringLiteral("QLabel#agentWelcomeSparkle{background:#e4f4ff;color:#168bd4;border-radius:15px;}"));
     contentLayout->addWidget(sparkle, 0, Qt::AlignHCenter);
-    auto* heading = makeLabel(QStringLiteral("从这里开始创作"), 25, kInk, true);
+    auto* heading = makeLabel(QStringLiteral("从这里开始创作"), UiZoom::TextRole::Display, kInk, true);
     heading->setObjectName(QStringLiteral("agentWelcomeHeading"));
     heading->setAlignment(Qt::AlignCenter);
     heading->setTextInteractionFlags(Qt::NoTextInteraction);
@@ -574,15 +572,24 @@ QWidget* makeWelcomeView(QWidget* parent) {
     grid->setVerticalSpacing(UiZoom::s(10));
     QList<QWidget*> cards;
     const QList<QPair<QString, QString>> features = {
-        {QStringLiteral("AI 问答"), QStringLiteral("AI")},      {QStringLiteral("图片创作"), QStringLiteral("图")},
-        {QStringLiteral("视频创作"), QStringLiteral("视")},     {QStringLiteral("文件处理"), QStringLiteral("文")},
-        {QStringLiteral("桌面截屏"), QStringLiteral("屏")},     {QStringLiteral("浏览器操作"), QStringLiteral("网")},
-        {QStringLiteral("终端与进程"), QStringLiteral("终")},   {QStringLiteral("电脑操作"), QStringLiteral("控")},
-        {QStringLiteral("会话定时任务"), QStringLiteral("时")}, {QStringLiteral("日历导入"), QStringLiteral("历")},
-        {QStringLiteral("二维码生成"), QStringLiteral("码")},   {QStringLiteral("本地媒体处理"), QStringLiteral("媒")},
-        {QStringLiteral("拍照"), QStringLiteral("拍")},         {QStringLiteral("音乐播放"), QStringLiteral("音")},
-        {QStringLiteral("我的云盘"), QStringLiteral("云")},     {QStringLiteral("MaiChat 消息"), QStringLiteral("聊")},
-        {QStringLiteral("联系人"), QStringLiteral("人")},     {QStringLiteral("账号资料与头像"), QStringLiteral("像")},
+        {QStringLiteral("AI 问答"), QStringLiteral("AI")},
+        {QStringLiteral("图片创作"), QStringLiteral("图")},
+        {QStringLiteral("视频创作"), QStringLiteral("视")},
+        {QStringLiteral("文件处理"), QStringLiteral("文")},
+        {QStringLiteral("桌面截屏"), QStringLiteral("屏")},
+        {QStringLiteral("浏览器操作"), QStringLiteral("网")},
+        {QStringLiteral("终端与进程"), QStringLiteral("终")},
+        {QStringLiteral("电脑操作"), QStringLiteral("控")},
+        {QStringLiteral("会话定时任务"), QStringLiteral("时")},
+        {QStringLiteral("日历导入"), QStringLiteral("历")},
+        {QStringLiteral("二维码生成"), QStringLiteral("码")},
+        {QStringLiteral("本地媒体处理"), QStringLiteral("媒")},
+        {QStringLiteral("拍照"), QStringLiteral("拍")},
+        {QStringLiteral("音乐播放"), QStringLiteral("音")},
+        {QStringLiteral("我的云盘"), QStringLiteral("云")},
+        {QStringLiteral("MaiChat 消息"), QStringLiteral("聊")},
+        {QStringLiteral("联系人"), QStringLiteral("人")},
+        {QStringLiteral("账号资料与头像"), QStringLiteral("像")},
         {QStringLiteral("跨设备会话"), QStringLiteral("跨")},
     };
     for (int index = 0; index < features.size(); ++index) {
@@ -597,14 +604,14 @@ QWidget* makeWelcomeView(QWidget* parent) {
         auto* row = new QHBoxLayout(card);
         row->setContentsMargins(UiZoom::s(14), UiZoom::s(8), UiZoom::s(14), UiZoom::s(8));
         row->setSpacing(UiZoom::s(10));
-        auto* symbol = makeLabel(features[index].second, 14, kAccent, true);
+        auto* symbol = makeLabel(features[index].second, UiZoom::TextRole::Detail, kAccent, true);
         symbol->setAlignment(Qt::AlignCenter);
         symbol->setTextInteractionFlags(Qt::NoTextInteraction);
         symbol->setFixedSize(UiZoom::s(28), UiZoom::s(28));
         symbol->setStyleSheet(
             UiZoom::scaleQss(QStringLiteral("QLabel{background:#eaf5ff;color:#168bd4;border-radius:7px;}")));
         row->addWidget(symbol);
-        auto* label = makeLabel(features[index].first, 14, kInk, true);
+        auto* label = makeLabel(features[index].first, UiZoom::TextRole::Detail, kInk, true);
         label->setWordWrap(false);
         label->setTextInteractionFlags(Qt::NoTextInteraction);
         row->addWidget(label, 1);
@@ -625,7 +632,7 @@ void applyAgentMenuStyle(QMenu* menu) {
     menu->setWindowFlags(menu->windowFlags() | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
     menu->setAttribute(Qt::WA_TranslucentBackground);
     menu->setToolTipsVisible(true);
-    menu->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(menu, QStringLiteral(R"(
         QMenu {
             background: #ffffff;
             border: 1px solid #dbe5f0;
@@ -635,7 +642,7 @@ void applyAgentMenuStyle(QMenu* menu) {
         QMenu::item {
             background: transparent;
             color: #344054;
-            font-size: 12px;
+            font-size: @metadata;
             padding: 8px 34px 8px 12px;
             border-radius: 6px;
         }
@@ -656,7 +663,7 @@ void applyAgentMenuStyle(QMenu* menu) {
             background: #0b67b7;
             border-radius: 4px;
         }
-    )")));
+    )"));
 }
 
 QIcon makeComposerActionIcon(bool stop, const QColor& color) {
@@ -746,12 +753,12 @@ public:
 
         auto* head = new QHBoxLayout;
         head->setSpacing(UiZoom::s(8));
-        name_ = makeLabel(QString(), 12, kInk, true);
+        name_ = makeLabel(QString(), UiZoom::TextRole::Metadata, kInk, true);
         name_->setObjectName(QStringLiteral("agentSubTaskTitle"));
         name_->setWordWrap(false);
         name_->setMinimumWidth(0);
         name_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-        state_ = makeLabel(QString(), 11, kInkFaint);
+        state_ = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkFaint);
         state_->setObjectName(QStringLiteral("agentSubTaskState"));
         state_->setWordWrap(false);
         state_->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
@@ -772,7 +779,7 @@ public:
         // Keep the default progress summary compact. Disclosure reveals the
         // complete bounded preview as selectable plain text, including paths
         // and earlier lines which do not fit in the collapsed summary.
-        latest_ = makeLabel(QString(), 12, kInkSoft);
+        latest_ = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkSoft);
         latest_->setObjectName(QStringLiteral("agentSubTaskSummary"));
         latest_->setWordWrap(true);
         latest_->setMinimumWidth(0);
@@ -784,9 +791,9 @@ public:
             refreshSummary();
         });
 
-        setStyleSheet(UiZoom::scaleQss(QStringLiteral("QFrame#agentSubTaskCard{background:#fbfcfe;border:1px solid %1;"
-                                                      "border-radius:8px;}")
-                                           .arg(kLine)));
+        UiZoom::setStyle(this, QStringLiteral("QFrame#agentSubTaskCard{background:#fbfcfe;border:1px solid %1;"
+                                              "border-radius:8px;}")
+                                   .arg(kLine));
         refreshSummary();
     }
 
@@ -801,10 +808,11 @@ public:
     void setState(const QString& state) {
         if (state_->text() == state) return;
         state_->setText(state);
-        const char* color = state == QStringLiteral("在跑") ? kAccent
-                            : state == QStringLiteral("完成") ? "#15803d" : kInkSoft;
-        state_->setStyleSheet(QStringLiteral("color:%1;background:transparent;border:0;font-weight:600;")
-                                 .arg(QLatin1String(color)));
+        const char* color = state == QStringLiteral("在跑")   ? kAccent
+                            : state == QStringLiteral("完成") ? "#15803d"
+                                                              : kInkSoft;
+        state_->setStyleSheet(
+            QStringLiteral("color:%1;background:transparent;border:0;font-weight:600;").arg(QLatin1String(color)));
         state_->setAccessibleName(QStringLiteral("子任务状态：%1").arg(state));
         refreshTitle();
     }
@@ -840,8 +848,8 @@ protected:
 private:
     void refreshTitle() {
         if (!name_ || !state_ || !disclosure_) return;
-        const int available = qMax(1, contentsRect().width() - UiZoom::s(24 + 16) - state_->sizeHint().width() -
-                                      disclosure_->width());
+        const int available =
+            qMax(1, contentsRect().width() - UiZoom::s(24 + 16) - state_->sizeHint().width() - disclosure_->width());
         name_->setText(name_->fontMetrics().elidedText(taskTitle_, Qt::ElideRight, available));
     }
 
@@ -861,7 +869,7 @@ private:
         measured.endLayout();
         if (firstLength >= line.size()) return line;
         return line.left(firstLength).trimmed() + QLatin1Char('\n') +
-            latest_->fontMetrics().elidedText(line.mid(firstLength).trimmed(), Qt::ElideRight, available);
+               latest_->fontMetrics().elidedText(line.mid(firstLength).trimmed(), Qt::ElideRight, available);
     }
 
     void refreshSummary() {
@@ -869,13 +877,12 @@ private:
         const QString full = latestText_.trimmed();
         const QString shown = expanded_ ? full : compactSummary(full);
         if (latest_->text() != shown) latest_->setText(shown);
-        latest_->setMaximumHeight(expanded_ ? QWIDGETSIZE_MAX : latest_->fontMetrics().lineSpacing() * 2 +
-                                                               UiZoom::s(2));
+        latest_->setMaximumHeight(expanded_ ? QWIDGETSIZE_MAX
+                                            : latest_->fontMetrics().lineSpacing() * 2 + UiZoom::s(2));
         latest_->setVisible(!full.isEmpty());
         disclosure_->setVisible(!full.isEmpty());
         disclosure_->setText(expanded_ ? QStringLiteral("⌄") : QStringLiteral("›"));
-        disclosure_->setAccessibleName(expanded_ ? QStringLiteral("收起子任务摘要")
-                                               : QStringLiteral("展开子任务摘要"));
+        disclosure_->setAccessibleName(expanded_ ? QStringLiteral("收起子任务摘要") : QStringLiteral("展开子任务摘要"));
         disclosure_->setToolTip(disclosure_->accessibleName());
         refreshTitle();
     }
@@ -897,7 +904,7 @@ public:
         setStyleSheet(QStringLiteral("QFrame#agentThinkingCard{background:transparent;border:none;}"));
         auto* column = new QVBoxLayout(this);
         column->setContentsMargins(0, UiZoom::s(2), 0, UiZoom::s(2));
-        caption_ = makeLabel(QStringLiteral("正在思考…"), 12, kInkFaint);
+        caption_ = makeLabel(QStringLiteral("正在思考…"), UiZoom::TextRole::Metadata, kInkFaint);
         caption_->setWordWrap(false);
         column->addWidget(caption_);
     }
@@ -927,11 +934,11 @@ public:
 
         auto* head = new QHBoxLayout;
         head->setSpacing(UiZoom::s(8));
-        icon_ = makeLabel(QStringLiteral("⌘"), 12, kInkFaint);
+        icon_ = makeLabel(QStringLiteral("⌘"), UiZoom::TextRole::Metadata, kInkFaint);
         icon_->setWordWrap(false);
-        name_ = makeLabel(QString(), 12, kInkSoft);
+        name_ = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkSoft);
         name_->setWordWrap(false);
-        state_ = makeLabel(QString(), 11, kInkFaint);
+        state_ = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkFaint);
         state_->setWordWrap(false);
         expand_ = new QPushButton(QStringLiteral("›"));
         expand_->setObjectName(QStringLiteral("agentToolDisclosure"));
@@ -948,7 +955,7 @@ public:
         head->addWidget(expand_);
         column->addLayout(head);
 
-        detail_ = makeLabel(QString(), 11, kInkSoft);
+        detail_ = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkSoft);
         detail_->setObjectName(QStringLiteral("agentToolDetail"));
         detail_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
         detail_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
@@ -972,21 +979,21 @@ public:
         allow_ = new QPushButton(QStringLiteral("允许"));
         deny_ = new QPushButton(QStringLiteral("拒绝"));
         always_ = new QPushButton(QStringLiteral("本会话都允许"));
-        allow_->setStyleSheet(UiZoom::scaleQss(QStringLiteral("QPushButton{background:%1;color:#fff;"
-                                                              "border:none;border-radius:6px;"
-                                                              "padding:4px 14px;}")
-                                                   .arg(kAccent)));
-        deny_->setStyleSheet(UiZoom::scaleQss(QStringLiteral("QPushButton{background:#fff;color:%1;border:1px solid %2;"
-                                                             "border-radius:6px;padding:4px 14px;}")
-                                                  .arg(kInk, kLine)));
+        UiZoom::setStyle(allow_, QStringLiteral("QPushButton{background:%1;color:#fff;"
+                                                "border:none;border-radius:6px;"
+                                                "padding:4px 14px;}")
+                                     .arg(kAccent));
+        UiZoom::setStyle(deny_, QStringLiteral("QPushButton{background:#fff;color:%1;border:1px solid %2;"
+                                               "border-radius:6px;padding:4px 14px;}")
+                                    .arg(kInk, kLine));
         always_->setStyleSheet(
             UiZoom::scaleQss(QStringLiteral("QPushButton{background:transparent;color:%1;border:none;"
                                             "padding:4px 6px;text-decoration:underline;}")
                                  .arg(kInkSoft)));
         for (QPushButton* button : {allow_, deny_, always_}) {
             QFont font = button->font();
-            font.setPixelSize(UiZoom::s(12));
-            button->setFont(font);
+            font.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Metadata));
+            UiZoom::setFont(button, UiZoom::TextRole::Metadata, font);
             button->setCursor(Qt::PointingHandCursor);
             buttons->addWidget(button);
         }
@@ -1235,10 +1242,10 @@ public:
         summary_ = new QPushButton(this);
         summary_->setObjectName(QStringLiteral("agentToolGroupDisclosure"));
         summary_->setCursor(Qt::PointingHandCursor);
-        summary_->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
-            "QPushButton#agentToolGroupDisclosure{background:transparent;border:none;"
-            "color:#667085;font-size:12px;text-align:left;padding:3px 0;}"
-            "QPushButton#agentToolGroupDisclosure:hover{color:#0b67b7;}")));
+        UiZoom::setStyle(summary_,
+                         QStringLiteral("QPushButton#agentToolGroupDisclosure{background:transparent;border:none;"
+                                        "color:#667085;font-size: @metadata;text-align:left;padding:3px 0;}"
+                                        "QPushButton#agentToolGroupDisclosure:hover{color:#0b67b7;}"));
         column->addWidget(summary_);
         details_ = new QWidget(this);
         detailsLayout_ = new QVBoxLayout(details_);
@@ -1252,7 +1259,9 @@ public:
         });
     }
 
-    void addCard(ToolCard* card) { detailsLayout_->addWidget(card); }
+    void addCard(ToolCard* card) {
+        detailsLayout_->addWidget(card);
+    }
 
     void removeCard(ToolCard* card) {
         detailsLayout_->removeWidget(card);
@@ -1260,8 +1269,12 @@ public:
         card->deleteLater();
     }
 
-    int cardCount() const { return detailsLayout_->count(); }
-    const QString& id() const { return id_; }
+    int cardCount() const {
+        return detailsLayout_->count();
+    }
+    const QString& id() const {
+        return id_;
+    }
 
     void setExpanded(bool expanded) {
         details_->setVisible(expanded);
@@ -1290,9 +1303,9 @@ public:
             failed |= tool->state == MaiToolState::Error;
             canceled |= tool->state == MaiToolState::Canceled;
         }
-        const QString state = running ? QStringLiteral("运行中")
-                              : pending ? QStringLiteral("等待授权")
-                              : failed ? QStringLiteral("有失败")
+        const QString state = running    ? QStringLiteral("运行中")
+                              : pending  ? QStringLiteral("等待授权")
+                              : failed   ? QStringLiteral("有失败")
                               : canceled ? QStringLiteral("部分取消")
                                          : QStringLiteral("已完成");
         title_ = QStringLiteral("工具调用 %1 次 · %2").arg(count).arg(state);
@@ -1305,8 +1318,8 @@ public:
 
 private:
     void refreshTitle() {
-        summary_->setText(QStringLiteral("⌘  %1  %2")
-                              .arg(title_, details_->isVisible() ? QStringLiteral("⌄") : QStringLiteral("›")));
+        summary_->setText(
+            QStringLiteral("⌘  %1  %2").arg(title_, details_->isVisible() ? QStringLiteral("⌄") : QStringLiteral("›")));
     }
 
     QPushButton* summary_ = nullptr;
@@ -1391,8 +1404,7 @@ struct AgentChatPanel::Runtime : AgentChatPanel::ConversationState {
     QString visibleDraftSession;
     QSet<QString> unsentImportedPaths;
     QSet<QString> pendingImportDestinations;
-    std::shared_ptr<std::atomic<bool>> importCanceled =
-        std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<std::atomic<bool>> importCanceled = std::make_shared<std::atomic<bool>>(false);
     QHash<QString, int> pendingMediaImports;
     int visiblePendingImports = -1;
     QPushButton* send = nullptr;
@@ -1434,8 +1446,8 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     // 顶栏只展示固定页标题和更多；模型与权限在更多面板内原位展开。
     auto* head = new QWidget(this);
     head->setObjectName(QStringLiteral("agentHeader"));
-    head->setStyleSheet(UiZoom::scaleQss(
-        QStringLiteral("QWidget#agentHeader{background:#ffffff;border-bottom:1px solid %1;}").arg(kLine)));
+    UiZoom::setStyle(head,
+                     QStringLiteral("QWidget#agentHeader{background:#ffffff;border-bottom:1px solid %1;}").arg(kLine));
     auto* headRow = new QHBoxLayout(head);
     head->setFixedHeight(UiZoom::s(54));
     headRow->setContentsMargins(UiZoom::s(16), UiZoom::s(8), UiZoom::s(16), UiZoom::s(8));
@@ -1446,20 +1458,21 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     circle->setAccessibleName(QStringLiteral("打开 AI 视频圈"));
     circle->setCursor(Qt::PointingHandCursor);
     circle->setFixedSize(UiZoom::s(76), UiZoom::s(34));
-    circle->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
-        "QPushButton{background:#eef6fd;border:0;border-radius:9px;color:#0b67b7;font-weight:600;}"
-        "QPushButton:hover{background:#dceefb;}")));
+    UiZoom::setStyle(
+        circle,
+        QStringLiteral("QPushButton{background:#eef6fd;border:0;border-radius:9px;color:#0b67b7;font-weight:600;}"
+                       "QPushButton:hover{background:#dceefb;}"));
     circle->hide();
     connect(circle, &QPushButton::clicked, this, &AgentChatPanel::videoCircleRequested);
     headRow->addWidget(circle);
-    runtime_->title = makeLabel(QStringLiteral("创作中心"), 18, kInk, true);
+    runtime_->title = makeLabel(QStringLiteral("创作中心"), UiZoom::TextRole::Heading3, kInk, true);
     runtime_->title->setObjectName(QStringLiteral("agentHeaderTitle"));
     runtime_->title->setAlignment(Qt::AlignCenter);
     runtime_->title->setWordWrap(false);
     headRow->addWidget(runtime_->title, 1);
 
     // 历史字数仍留在内部状态，不占用顶栏空间。
-    runtime_->contextSize = makeLabel(QString(), 11, kInkFaint);
+    runtime_->contextSize = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkFaint);
     runtime_->contextSize->setWordWrap(false);
     runtime_->contextSize->setParent(head);
     runtime_->contextSize->hide();
@@ -1483,7 +1496,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     // AI 页面使用窗口可用宽度，但正文和表格需要比普通消息列表更宽的呼吸区。
     // 48px 给正文和宽表格留出明确的页面边界，同时仍使用窗口剩余宽度。
     runtime_->view = new MarkdownView(this);
-    MarkdownTheme conversationTheme = MarkdownTheme::standard(UiZoom::factor());
+    MarkdownTheme conversationTheme = MarkdownTheme::standard(UiZoom::markdownScale(), UiZoom::fontFamilies().first());
     conversationTheme.viewMargin = UiZoom::s(48);
     runtime_->view->setTheme(conversationTheme);
     auto* conversationSurface = new QWidget(this);
@@ -1528,11 +1541,11 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
 
     runtime_->quoteStrip = new QWidget(composerHost);
     runtime_->quoteStrip->setObjectName(QStringLiteral("agentQuoteStrip"));
-    runtime_->quoteStrip->setStyleSheet(QStringLiteral(
-        "QWidget#agentQuoteStrip{background:#e8f4fc;border-radius:8px;}"));
+    runtime_->quoteStrip->setStyleSheet(
+        QStringLiteral("QWidget#agentQuoteStrip{background:#e8f4fc;border-radius:8px;}"));
     auto* quoteLayout = new QHBoxLayout(runtime_->quoteStrip);
     quoteLayout->setContentsMargins(UiZoom::s(12), UiZoom::s(6), UiZoom::s(8), UiZoom::s(6));
-    runtime_->quoteLabel = makeLabel(QString(), 12, kInkSoft);
+    runtime_->quoteLabel = makeLabel(QString(), UiZoom::TextRole::Metadata, kInkSoft);
     runtime_->quoteLabel->setWordWrap(false);
     quoteLayout->addWidget(runtime_->quoteLabel, 1);
     auto* cancelQuote = new QPushButton(QStringLiteral("×"), runtime_->quoteStrip);
@@ -1554,8 +1567,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     runtime_->mediaTray->setWidgetResizable(true);
     auto* trayContent = new QWidget(runtime_->mediaTray);
     runtime_->mediaTrayLayout = new QHBoxLayout(trayContent);
-    runtime_->mediaTrayLayout->setContentsMargins(UiZoom::s(12), UiZoom::s(5),
-                                                   UiZoom::s(12), UiZoom::s(5));
+    runtime_->mediaTrayLayout->setContentsMargins(UiZoom::s(12), UiZoom::s(5), UiZoom::s(12), UiZoom::s(5));
     runtime_->mediaTrayLayout->setSpacing(UiZoom::s(8));
     runtime_->mediaTray->setWidget(trayContent);
     runtime_->mediaTray->hide();
@@ -1566,7 +1578,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     runtime_->editor->setPlaceholderText(QStringLiteral("交给它做点什么…"));
     runtime_->editor->setMinimumHeight(UiZoom::s(96));
     runtime_->editor->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    runtime_->editor->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(runtime_->editor, QStringLiteral(R"(
         QTextEdit#agentPromptEditor {
             border:1px solid %1;
             border-radius:14px;
@@ -1576,10 +1588,10 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         }
         QTextEdit#agentPromptEditor:focus { border-color:#b5bbc4; }
     )")
-                                                         .arg(QStringLiteral("#d1d5db"), kInk)));
+                                           .arg(QStringLiteral("#d1d5db"), kInk));
     QFont editorFont = runtime_->editor->font();
-    editorFont.setPixelSize(UiZoom::s(14));
-    runtime_->editor->setFont(editorFont);
+    editorFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
+    UiZoom::setFont(runtime_->editor, UiZoom::TextRole::Body, editorFont);
     runtime_->editor->onSubmit = [this] { onSend(); };
     runtime_->editor->setMimeHandler([this](const QMimeData* mime) { return insertComposerMimeData(mime); });
     connect(runtime_->editor, &QTextEdit::textChanged, this, &AgentChatPanel::refreshComposerMediaTray);
@@ -1592,23 +1604,24 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     attachMedia->setToolTip(QStringLiteral("添加媒体"));
     attachMedia->setCursor(Qt::PointingHandCursor);
     attachMedia->setFixedSize(UiZoom::s(36), UiZoom::s(36));
-    attachMedia->setStyleSheet(QStringLiteral(
-        "QPushButton{border:0;border-radius:18px;background:#eef6ff;color:#0b67b7;font-size:24px;}"
-        "QPushButton:hover{background:#dceeff;}"
-        "QPushButton::menu-indicator{image:none;width:0px;}"));
+    UiZoom::setStyle(
+        attachMedia,
+        QStringLiteral("QPushButton{border:0;border-radius:18px;background:#eef6ff;color:#0b67b7;font-size: @heading1;}"
+                       "QPushButton:hover{background:#dceeff;}"
+                       "QPushButton::menu-indicator{image:none;width:0px;}"));
     runtime_->editor->setLeadingAction(attachMedia);
     auto* attachMenu = new QMenu(attachMedia);
     applyAgentMenuStyle(attachMenu);
     auto* fromFile = attachMenu->addAction(QStringLiteral("选择图片或视频"));
     connect(fromFile, &QAction::triggered, this, [this] {
         const QStringList paths = QFileDialog::getOpenFileNames(
-            this, QStringLiteral("添加图片或视频"),
-            QStandardPaths::writableLocation(QStandardPaths::PicturesLocation),
+            this, QStringLiteral("添加图片或视频"), QStandardPaths::writableLocation(QStandardPaths::PicturesLocation),
             QStringLiteral("媒体文件 (*.png *.jpg *.jpeg *.webp *.gif *.mp4 *.mov *.webm)"));
         for (const QString& path : paths) {
             if (!videoMimeType(path).isEmpty())
                 insertComposerVideoFile(path);
-            else insertComposerImageFile(path);
+            else
+                insertComposerImageFile(path);
         }
     });
     auto* takePhoto = attachMenu->addAction(QStringLiteral("打开摄像头拍照"));
@@ -1616,21 +1629,20 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         MaiSession session;
         if (!runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), session) ||
             session.directory.empty()) {
-            QMessageBox::warning(this, QStringLiteral("拍照失败"),
-                                 QStringLiteral("当前会话没有可写工作目录"));
+            QMessageBox::warning(this, QStringLiteral("拍照失败"), QStringLiteral("当前会话没有可写工作目录"));
             return;
         }
         QString error;
-        const QString image = DesktopCameraDialog::capturePhoto(
-            this, fromUtf8(session.directory), &error);
-        if (!image.isEmpty()) insertComposerImageFile(image);
-        else if (!error.isEmpty()) QMessageBox::warning(this, QStringLiteral("拍照失败"), error);
+        const QString image = DesktopCameraDialog::capturePhoto(this, fromUtf8(session.directory), &error);
+        if (!image.isEmpty())
+            insertComposerImageFile(image);
+        else if (!error.isEmpty())
+            QMessageBox::warning(this, QStringLiteral("拍照失败"), error);
     });
     auto* playMusic = attachMenu->addAction(QStringLiteral("播放本地音乐"));
     connect(playMusic, &QAction::triggered, this, [this] {
         const QString path = QFileDialog::getOpenFileName(
-            this, QStringLiteral("选择本地音乐"),
-            QStandardPaths::writableLocation(QStandardPaths::MusicLocation),
+            this, QStringLiteral("选择本地音乐"), QStandardPaths::writableLocation(QStandardPaths::MusicLocation),
             QStringLiteral("音频文件 (*.mp3 *.m4a *.wav)"));
         if (path.isEmpty()) return;
         QString error;
@@ -1643,7 +1655,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     runtime_->modelChip = new QPushButton(head);
     runtime_->modelChip->setObjectName(QStringLiteral("agentModelChip"));
     runtime_->modelChip->setCursor(Qt::PointingHandCursor);
-    runtime_->modelChip->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(runtime_->modelChip, QStringLiteral(R"(
         QPushButton#agentModelChip {
             background: #eef6ff;
             border: 1px solid #d5e8fb;
@@ -1662,16 +1674,16 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
             image: none;
             width: 0;
         }
-    )")));
+    )"));
     QFont modelFont = runtime_->modelChip->font();
-    modelFont.setPixelSize(UiZoom::s(11));
-    runtime_->modelChip->setFont(modelFont);
+    modelFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Metadata));
+    UiZoom::setFont(runtime_->modelChip, UiZoom::TextRole::Metadata, modelFont);
     runtime_->modelChip->hide();
     // 这句常驻。它是这套东西最重要的一句承诺，写在文档里没人看。
     runtime_->hint = new QPushButton(head);
     runtime_->hint->setObjectName(QStringLiteral("agentApprovalPolicy"));
     runtime_->hint->setCursor(Qt::PointingHandCursor);
-    runtime_->hint->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(runtime_->hint, QStringLiteral(R"(
         QPushButton#agentApprovalPolicy {
             background: #fff7ed;
             border: 1px solid #fed7aa;
@@ -1692,10 +1704,10 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
             image: none;
             width: 0;
         }
-    )")));
+    )"));
     QFont policyFont = runtime_->hint->font();
-    policyFont.setPixelSize(UiZoom::s(11));
-    runtime_->hint->setFont(policyFont);
+    policyFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Metadata));
+    UiZoom::setFont(runtime_->hint, UiZoom::TextRole::Metadata, policyFont);
     auto* policyMenu = new QMenu(runtime_->hint);
     applyAgentMenuStyle(policyMenu);
     auto addPolicy = [policyMenu](const QString& title, const QString& detail, MaiApprovalPolicy policy) {
@@ -1709,8 +1721,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     addPolicy(QStringLiteral("帮我批准"),
               QStringLiteral("每个文件首次变更先询问，此后本会话免问；网络和高风险命令仍询问"),
               MaiApprovalPolicy::UnlessTrusted);
-    addPolicy(QStringLiteral("完全访问"), QStringLiteral("一般操作不询问；付费操作仍会确认"),
-              MaiApprovalPolicy::Never);
+    addPolicy(QStringLiteral("完全访问"), QStringLiteral("一般操作不询问；付费操作仍会确认"), MaiApprovalPolicy::Never);
     runtime_->hint->setMenu(policyMenu);
     connect(policyMenu, &QMenu::triggered, this,
             [this](QAction* action) { selectApprovalPolicy(static_cast<MaiApprovalPolicy>(action->data().toInt())); });
@@ -1722,10 +1733,10 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     runtime_->actionPanel = actionPanel;
     actionPanel->setObjectName(QStringLiteral("agentActionPanel"));
     actionPanel->setFixedWidth(UiZoom::s(288));
-    actionPanel->setStyleSheet(UiZoom::scaleQss(QStringLiteral(R"(
+    UiZoom::setStyle(actionPanel, QStringLiteral(R"(
         QFrame#agentActionPanel { background:#ffffff; border:1px solid #e2e8f0; border-radius:12px; }
         QFrame#agentActionPanel QPushButton { background:transparent; border:0; color:#24334a;
-                                             text-align:left; padding:0 12px; font-size:13px;
+                                             text-align:left; padding:0 12px; font-size: @detail;
                                              border-radius:8px; }
         QFrame#agentActionPanel QPushButton:hover { background:#f1f6fb; }
         QFrame#agentActionPanel QPushButton:focus { border:1px solid #82b8e7; }
@@ -1739,7 +1750,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
             background:#f2f7fc;
         }
         QFrame#agentActionPanel QPushButton#agentOpenWorkspaceButton {
-            color:#53627a; text-align:center; padding:0; font-size:17px;
+            color:#53627a; text-align:center; padding:0; font-size: @body;
         }
         QFrame#agentActionPanel QPushButton:checked {
             background:#e6f2ff; color:#0a65ad; font-weight:600;
@@ -1747,12 +1758,12 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         QFrame#agentActionPanel QPushButton#agentClearConversation { color:#c0362c; }
         QFrame#agentActionPanel QPushButton#agentClearConversation:hover { background:#fff1f0; }
         QPushButton:disabled { color:#98a2b3; }
-    )")));
+    )"));
     auto* actionLayout = new QVBoxLayout(actionPanel);
     actionLayout->setContentsMargins(UiZoom::s(8), UiZoom::s(8), UiZoom::s(8), UiZoom::s(8));
     actionLayout->setSpacing(UiZoom::s(2));
-    auto makeSummary = [actionPanel](const QString& name, const QString& title,
-                                     const QString& initial, QLabel** currentValue) {
+    auto makeSummary = [actionPanel](const QString& name, const QString& title, const QString& initial,
+                                     QLabel** currentValue) {
         auto* row = new QPushButton(actionPanel);
         row->setObjectName(name);
         row->setAccessibleName(title + QStringLiteral("：") + initial);
@@ -1765,40 +1776,38 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         textColumn->setContentsMargins(0, 0, 0, 0);
         textColumn->setSpacing(UiZoom::s(2));
         auto* label = new QLabel(title, row);
-        label->setStyleSheet(UiZoom::scaleQss(
-            QStringLiteral("QLabel{background:transparent;border:0;color:#24334a;font-size:13px;font-weight:600;}")));
+        UiZoom::setStyle(
+            label, QStringLiteral(
+                       "QLabel{background:transparent;border:0;color:#24334a;font-size: @detail;font-weight:600;}"));
         label->setAttribute(Qt::WA_TransparentForMouseEvents);
         textColumn->addWidget(label);
         auto* value = new QLabel(initial, row);
-        value->setStyleSheet(UiZoom::scaleQss(
-            QStringLiteral("QLabel{background:transparent;border:0;color:#738198;font-size:11px;}")));
+        UiZoom::setStyle(value,
+                         QStringLiteral("QLabel{background:transparent;border:0;color:#738198;font-size: @metadata;}"));
         value->setAttribute(Qt::WA_TransparentForMouseEvents);
         textColumn->addWidget(value);
         layout->addLayout(textColumn, 1);
         auto* arrow = new QLabel(QStringLiteral("›"), row);
-        arrow->setStyleSheet(UiZoom::scaleQss(
-            QStringLiteral("QLabel{background:transparent;border:0;color:#98a2b3;font-size:18px;}")));
+        UiZoom::setStyle(arrow,
+                         QStringLiteral("QLabel{background:transparent;border:0;color:#98a2b3;font-size: @heading3;}"));
         arrow->setAttribute(Qt::WA_TransparentForMouseEvents);
         layout->addWidget(arrow);
         *currentValue = value;
         return row;
     };
-    auto* modelSection = makeSummary(QStringLiteral("agentEffortSection"),
-                                     QStringLiteral("思考强度"), QStringLiteral("标准"),
-                                     &runtime_->modelSectionValue);
+    auto* modelSection = makeSummary(QStringLiteral("agentEffortSection"), QStringLiteral("思考强度"),
+                                     QStringLiteral("标准"), &runtime_->modelSectionValue);
     runtime_->modelSection = modelSection;
     actionLayout->addWidget(modelSection);
     auto* modelOptions = new QWidget(actionPanel);
     runtime_->modelOptions = modelOptions;
-    modelOptions->setStyleSheet(UiZoom::scaleQss(
-        QStringLiteral("background:#f5f8fc;border-radius:8px;")));
+    UiZoom::setStyle(modelOptions, QStringLiteral("background:#f5f8fc;border-radius:8px;"));
     auto* modelOptionsLayout = new QVBoxLayout(modelOptions);
     modelOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
     modelOptionsLayout->setSpacing(0);
-    const QList<QPair<QString, QString>> efforts = {
-        {QStringLiteral("简单"), QStringLiteral("low")},
-        {QStringLiteral("标准"), QStringLiteral("high")},
-        {QStringLiteral("深度"), QStringLiteral("max")}};
+    const QList<QPair<QString, QString>> efforts = {{QStringLiteral("简单"), QStringLiteral("low")},
+                                                    {QStringLiteral("标准"), QStringLiteral("high")},
+                                                    {QStringLiteral("深度"), QStringLiteral("max")}};
     for (const auto& effort : efforts) {
         auto* option = new QPushButton(effort.first, modelOptions);
         option->setObjectName(QStringLiteral("agentEffortOption-") + effort.second);
@@ -1806,10 +1815,10 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         option->setCheckable(true);
         option->setAutoExclusive(true);
         option->setFixedHeight(UiZoom::s(38));
-        option->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
-            "QPushButton{padding-left:20px;text-align:left;background:#f5f8fc;}"
-            "QPushButton:hover{background:#e8f2fc;}"
-            "QPushButton:checked{background:#e6f2ff;color:#0a65ad;font-weight:600;}")));
+        UiZoom::setStyle(option,
+                         QStringLiteral("QPushButton{padding-left:20px;text-align:left;background:#f5f8fc;}"
+                                        "QPushButton:hover{background:#e8f2fc;}"
+                                        "QPushButton:checked{background:#e6f2ff;color:#0a65ad;font-weight:600;}"));
         modelOptionsLayout->addWidget(option);
         runtime_->modelOptionButtons.append(option);
         connect(option, &QPushButton::clicked, this, [this, actionPanel, effort] {
@@ -1824,15 +1833,13 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     effortDivider->setStyleSheet(QStringLiteral("color:#edf1f5;"));
     actionLayout->addWidget(effortDivider);
 
-    auto* policySection = makeSummary(QStringLiteral("agentPolicySection"),
-                                      QStringLiteral("操作权限"), QStringLiteral("请求批准"),
-                                      &runtime_->policySectionValue);
+    auto* policySection = makeSummary(QStringLiteral("agentPolicySection"), QStringLiteral("操作权限"),
+                                      QStringLiteral("请求批准"), &runtime_->policySectionValue);
     runtime_->policySection = policySection;
     actionLayout->addWidget(policySection);
     auto* policyOptions = new QWidget(actionPanel);
     runtime_->policyOptions = policyOptions;
-    policyOptions->setStyleSheet(UiZoom::scaleQss(
-        QStringLiteral("background:#f5f8fc;border-radius:8px;")));
+    UiZoom::setStyle(policyOptions, QStringLiteral("background:#f5f8fc;border-radius:8px;"));
     auto* policyOptionsLayout = new QVBoxLayout(policyOptions);
     policyOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
     policyOptionsLayout->setSpacing(0);
@@ -1847,10 +1854,10 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         option->setCheckable(true);
         option->setAutoExclusive(true);
         option->setFixedHeight(UiZoom::s(38));
-        option->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
-            "QPushButton{padding-left:20px;text-align:left;background:#f5f8fc;}"
-            "QPushButton:hover{background:#e8f2fc;}"
-            "QPushButton:checked{background:#e6f2ff;color:#0a65ad;font-weight:600;}")));
+        UiZoom::setStyle(option,
+                         QStringLiteral("QPushButton{padding-left:20px;text-align:left;background:#f5f8fc;}"
+                                        "QPushButton:hover{background:#e8f2fc;}"
+                                        "QPushButton:checked{background:#e6f2ff;color:#0a65ad;font-weight:600;}"));
         policyOptionsLayout->addWidget(option);
         runtime_->policyOptionButtons.append(option);
         connect(option, &QPushButton::clicked, this, [this, actionPanel, choice] {
@@ -1885,37 +1892,32 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     const auto positionPopup = [actionPanel, moreButton] {
         actionPanel->adjustSize();
         QPoint position = moreButton->mapToGlobal(
-            QPoint(moreButton->width() - actionPanel->width(),
-                   moreButton->height() + UiZoom::s(6)));
+            QPoint(moreButton->width() - actionPanel->width(), moreButton->height() + UiZoom::s(6)));
         QScreen* screen = QGuiApplication::screenAt(position);
         if (!screen) screen = QGuiApplication::primaryScreen();
         if (screen) {
             const QRect available = screen->availableGeometry();
-            position.setX(qBound(available.left(), position.x(),
-                                 available.right() - actionPanel->width() + 1));
+            position.setX(qBound(available.left(), position.x(), available.right() - actionPanel->width() + 1));
             if (position.y() + actionPanel->height() > available.bottom())
-                position.setY(moreButton->mapToGlobal(QPoint(0, 0)).y() -
-                              actionPanel->height() - UiZoom::s(6));
+                position.setY(moreButton->mapToGlobal(QPoint(0, 0)).y() - actionPanel->height() - UiZoom::s(6));
         }
         actionPanel->move(position);
     };
-    connect(modelSection, &QPushButton::clicked, this,
-            [modelOptions, policyOptions, positionPopup] {
+    connect(modelSection, &QPushButton::clicked, this, [modelOptions, policyOptions, positionPopup] {
         const bool expand = !modelOptions->isVisible();
         policyOptions->hide();
         modelOptions->setVisible(expand);
         positionPopup();
     });
-    connect(policySection, &QPushButton::clicked, this,
-            [modelOptions, policyOptions, positionPopup] {
+    connect(policySection, &QPushButton::clicked, this, [modelOptions, policyOptions, positionPopup] {
         const bool expand = !policyOptions->isVisible();
         modelOptions->hide();
         policyOptions->setVisible(expand);
         positionPopup();
     });
-    connect(moreButton, &QPushButton::clicked, this,
-            [actionPanel, positionPopup] {
-        if (actionPanel->isVisible()) actionPanel->hide();
+    connect(moreButton, &QPushButton::clicked, this, [actionPanel, positionPopup] {
+        if (actionPanel->isVisible())
+            actionPanel->hide();
         else {
             positionPopup();
             actionPanel->show();
@@ -1960,8 +1962,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     workspaceButtonLayout->setContentsMargins(UiZoom::s(12), 0, 0, 0);
     workspaceButtonLayout->setSpacing(UiZoom::s(10));
     auto* folderIcon = new QLabel(runtime_->chooseWorkspace);
-    folderIcon->setPixmap(style()->standardIcon(QStyle::SP_DirIcon).pixmap(
-        UiZoom::s(18), UiZoom::s(18)));
+    folderIcon->setPixmap(style()->standardIcon(QStyle::SP_DirIcon).pixmap(UiZoom::s(18), UiZoom::s(18)));
     folderIcon->setStyleSheet(QStringLiteral("background:transparent;border:0;"));
     folderIcon->setAttribute(Qt::WA_TransparentForMouseEvents);
     workspaceButtonLayout->addWidget(folderIcon);
@@ -1969,13 +1970,14 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     workspaceText->setContentsMargins(0, 0, 0, 0);
     workspaceText->setSpacing(UiZoom::s(2));
     auto* workspaceTitle = new QLabel(QStringLiteral("工作目录"), runtime_->chooseWorkspace);
-    workspaceTitle->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
-        "QLabel{background:transparent;border:0;color:#24334a;font-size:13px;font-weight:600;}")));
+    UiZoom::setStyle(
+        workspaceTitle,
+        QStringLiteral("QLabel{background:transparent;border:0;color:#24334a;font-size: @detail;font-weight:600;}"));
     workspaceTitle->setAttribute(Qt::WA_TransparentForMouseEvents);
     workspaceText->addWidget(workspaceTitle);
     runtime_->workspaceSectionValue = new QLabel(QStringLiteral("未选择"), runtime_->chooseWorkspace);
-    runtime_->workspaceSectionValue->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
-        "QLabel{background:transparent;border:0;color:#738198;font-size:11px;}")));
+    UiZoom::setStyle(runtime_->workspaceSectionValue,
+                     QStringLiteral("QLabel{background:transparent;border:0;color:#738198;font-size: @metadata;}"));
     runtime_->workspaceSectionValue->setAttribute(Qt::WA_TransparentForMouseEvents);
     workspaceText->addWidget(runtime_->workspaceSectionValue);
     workspaceButtonLayout->addLayout(workspaceText, 1);
@@ -2056,10 +2058,12 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
                 // QuestionAnswered precedes tool persistence. Invalidate dormant
                 // pages again on the canonical part update, including nested children.
                 bool knownQuestion = runtime_->questionPartIds.contains(partId);
-                for (auto it = runtime_->savedConversations.cbegin(); !knownQuestion && it != runtime_->savedConversations.cend(); ++it)
+                for (auto it = runtime_->savedConversations.cbegin();
+                     !knownQuestion && it != runtime_->savedConversations.cend(); ++it)
                     knownQuestion = it.value()->questionPartIds.contains(partId);
                 MaiMessage persisted;
-                if (knownQuestion && runtime_->controller->agent().getMessage(toUtf8(sessionId), toUtf8(messageId), persisted))
+                if (knownQuestion &&
+                    runtime_->controller->agent().getMessage(toUtf8(sessionId), toUtf8(messageId), persisted))
                     for (const auto& part : persisted.parts) {
                         const auto* tool = std::get_if<MaiToolPart>(&part.body);
                         if (fromUtf8(part.id) != partId || !tool || tool->tool != "question") continue;
@@ -2075,11 +2079,13 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
                     }
                 // 问题也可能因取消或超时结束，并没有真实的用户回答事件。
                 // 工具状态落库后检查权威列表；子任务仍由父页面处理提问。
-                if (maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId), toUtf8(sessionId)))
+                if (maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId),
+                                                toUtf8(sessionId)))
                     reconcileQuestion();
                 if (!isCurrentSession(sessionId)) {
                     if (!maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId),
-                                                     toUtf8(sessionId))) return;
+                                                     toUtf8(sessionId)))
+                        return;
                     MaiMessage questionMessage;
                     if (runtime_->controller->agent().getMessage(toUtf8(sessionId), toUtf8(messageId), questionMessage))
                         for (const auto& part : questionMessage.parts)
@@ -2098,8 +2104,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
                             if (fromUtf8(part.id) != partId) continue;
                             const auto* tool = std::get_if<MaiToolPart>(&part.body);
                             if (!tool) return;
-                            card->apply(tool->state, card->isWaitingForUser() &&
-                                                     tool->state == MaiToolState::Pending);
+                            card->apply(tool->state, card->isWaitingForUser() && tool->state == MaiToolState::Pending);
                             card->setDetail(tool->state == MaiToolState::Error ? fromUtf8(tool->error)
                                                                                : fromUtf8(tool->output));
                             group->setSummary(message, runtime_->toolCards);
@@ -2130,7 +2135,8 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
                 showQuestion(QString());
             });
     connect(&controller, &AgentController::turnFinished, this, [this](const QString& sessionId) {
-        if (maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId), toUtf8(sessionId))) {
+        if (maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId),
+                                        toUtf8(sessionId))) {
             reconcileQuestion();
             showQuestion(QString());
         }
@@ -2154,7 +2160,8 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         scrollToBottom();
     });
     connect(&controller, &AgentController::turnFailed, this, [this](const QString& sessionId, const QString& message) {
-        if (maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId), toUtf8(sessionId))) {
+        if (maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId),
+                                        toUtf8(sessionId))) {
             reconcileQuestion();
             showQuestion(QString());
         }
@@ -2167,12 +2174,11 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         flushAnswers();
         appendNotice(message, true);
     });
-    connect(&controller, &AgentController::sessionTitleChanged, this,
-            [this](const QString&, const QString&) {
-                // 列表展示所有会话。后台会话改名也要刷新，不能因用户已经切走而遗漏；
-                // 当前页的标题和消息仍由各自的会话过滤处理。
-                emit sessionListChanged();
-            });
+    connect(&controller, &AgentController::sessionTitleChanged, this, [this](const QString&, const QString&) {
+        // 列表展示所有会话。后台会话改名也要刷新，不能因用户已经切走而遗漏；
+        // 当前页的标题和消息仍由各自的会话过滤处理。
+        emit sessionListChanged();
+    });
     connect(&controller, &AgentController::sessionStructureChanged, this, [this] {
         for (const QString& saved : runtime_->savedConversations.keys()) {
             MaiSession session;
@@ -2216,19 +2222,18 @@ QString AgentChatPanel::sessionId() const {
 
 void AgentChatPanel::setModelLabel(const QString& model, bool configured) {
     runtime_->modelChip->setText(model);
-    runtime_->modelConfigured = configured &&
-        model != QStringLiteral("未配置模型") && !model.trimmed().isEmpty();
+    runtime_->modelConfigured = configured && model != QStringLiteral("未配置模型") && !model.trimmed().isEmpty();
     runtime_->modelChip->setEnabled(runtime_->modelConfigured && !runtime_->running);
 }
 
 void AgentChatPanel::setReasoningEffortLabel(const QString& effort) {
-    const QString normalized = effort == QStringLiteral("low") || effort == QStringLiteral("max")
-                                   ? effort : QStringLiteral("high");
-    const QString title = normalized == QStringLiteral("low") ? QStringLiteral("简单") :
-        normalized == QStringLiteral("max") ? QStringLiteral("深度") : QStringLiteral("标准");
+    const QString normalized =
+        effort == QStringLiteral("low") || effort == QStringLiteral("max") ? effort : QStringLiteral("high");
+    const QString title = normalized == QStringLiteral("low")   ? QStringLiteral("简单")
+                          : normalized == QStringLiteral("max") ? QStringLiteral("深度")
+                                                                : QStringLiteral("标准");
     if (runtime_->modelSectionValue) runtime_->modelSectionValue->setText(title);
-    if (runtime_->modelSection)
-        runtime_->modelSection->setAccessibleName(QStringLiteral("思考强度：%1").arg(title));
+    if (runtime_->modelSection) runtime_->modelSection->setAccessibleName(QStringLiteral("思考强度：%1").arg(title));
     for (QPushButton* option : runtime_->modelOptionButtons) {
         const QString value = option->property("reasoningEffort").toString();
         option->setChecked(value == normalized);
@@ -2237,9 +2242,8 @@ void AgentChatPanel::setReasoningEffortLabel(const QString& effort) {
 
 bool AgentChatPanel::applySelectedModel(const QString& model) {
     const QString selected = model.trimmed();
-    const bool applied = runtime_->sessionId.isEmpty() ?
-        runtime_->controller->setDefaultModel(selected) :
-        runtime_->controller->setModel(runtime_->sessionId, selected);
+    const bool applied = runtime_->sessionId.isEmpty() ? runtime_->controller->setDefaultModel(selected)
+                                                       : runtime_->controller->setModel(runtime_->sessionId, selected);
     if (!applied) {
         appendNotice(runtime_->controller->lastError(), true);
         return false;
@@ -2264,9 +2268,10 @@ QStringList AgentChatPanel::currentVideoPaths() const {
             if (!tool || tool->tool != "agent_send_media" || tool->state != MaiToolState::Completed) continue;
             const QJsonObject artifact = QJsonDocument::fromJson(fromUtf8(tool->output).toUtf8()).object();
             if (artifact.value(QStringLiteral("delivery")).toString() != QStringLiteral("current_ai_session") ||
-                artifact.value(QStringLiteral("type")).toString() != QStringLiteral("video")) continue;
-            const QString path = fromUtf8(maiResolvePathWithinRoot(
-                toUtf8(workspace), toUtf8(artifact.value(QStringLiteral("path")).toString())));
+                artifact.value(QStringLiteral("type")).toString() != QStringLiteral("video"))
+                continue;
+            const QString path = fromUtf8(
+                maiResolvePathWithinRoot(toUtf8(workspace), toUtf8(artifact.value(QStringLiteral("path")).toString())));
             if (QFileInfo(path).isFile() && !paths.contains(path)) paths.append(path);
         }
         for (const LocalMediaMention& mention : localMediaMentions(fromUtf8(message.text()), workspace)) {
@@ -2284,8 +2289,7 @@ void AgentChatPanel::setForwardMediaCallback(std::function<void(const QString&, 
 void AgentChatPanel::setVideoCircleAvailable(bool available) {
     runtime_->videoCircleAvailable = available;
     runtime_->videoCircleButton->setVisible(available);
-    for (auto it = runtime_->videoCirclePublishButtons.begin();
-         it != runtime_->videoCirclePublishButtons.end();) {
+    for (auto it = runtime_->videoCirclePublishButtons.begin(); it != runtime_->videoCirclePublishButtons.end();) {
         if (!*it) {
             it = runtime_->videoCirclePublishButtons.erase(it);
         } else {
@@ -2297,8 +2301,7 @@ void AgentChatPanel::setVideoCircleAvailable(bool available) {
 
 void AgentChatPanel::setCloudDriveAvailable(bool available) {
     runtime_->cloudDriveAvailable = available;
-    for (auto it = runtime_->cloudDriveSaveButtons.begin();
-         it != runtime_->cloudDriveSaveButtons.end();) {
+    for (auto it = runtime_->cloudDriveSaveButtons.begin(); it != runtime_->cloudDriveSaveButtons.end();) {
         if (!*it) {
             it = runtime_->cloudDriveSaveButtons.erase(it);
         } else {
@@ -2338,22 +2341,18 @@ void AgentChatPanel::updateApprovalPolicyUi() {
         runtime_->hint->setText(QStringLiteral("请求批准"));
         runtime_->hint->setToolTip(QStringLiteral("文件变更、访问网络或执行高风险命令前会询问；可单独授权文件。"));
     }
-    if (runtime_->policySectionValue)
-        runtime_->policySectionValue->setText(runtime_->hint->text());
+    if (runtime_->policySectionValue) runtime_->policySectionValue->setText(runtime_->hint->text());
     if (runtime_->policySection)
-        runtime_->policySection->setAccessibleName(
-            QStringLiteral("操作权限：%1").arg(runtime_->hint->text()));
+        runtime_->policySection->setAccessibleName(QStringLiteral("操作权限：%1").arg(runtime_->hint->text()));
     for (QPushButton* option : runtime_->policyOptionButtons) {
-        const bool selected = option->property("policyValue").toInt() ==
-                              static_cast<int>(policy);
+        const bool selected = option->property("policyValue").toInt() == static_cast<int>(policy);
         option->setChecked(selected);
     }
 }
 
 void AgentChatPanel::openSession(const QString& sessionId) {
     if (sessionId.isEmpty()) {
-        const QString directory = defaultWorkspaceDirectory(
-            defaultWorkspaceDirectory_, defaultWorkspaceConfigured_);
+        const QString directory = defaultWorkspaceDirectory(defaultWorkspaceDirectory_, defaultWorkspaceConfigured_);
         if (directory.isEmpty()) {
             appendNotice(QStringLiteral("无法创建创作中心工作目录"), true);
             return;
@@ -2403,9 +2402,8 @@ void AgentChatPanel::openSession(const QString& sessionId) {
         const QString directory = QDir::toNativeSeparators(fromUtf8(session.directory));
         QString name = QFileInfo(directory).fileName();
         if (name.isEmpty()) name = directory;
-        runtime_->workspaceSectionValue->setText(
-            runtime_->workspaceSectionValue->fontMetrics().elidedText(
-                name, Qt::ElideMiddle, runtime_->actionPanel->width() - UiZoom::s(128)));
+        runtime_->workspaceSectionValue->setText(runtime_->workspaceSectionValue->fontMetrics().elidedText(
+            name, Qt::ElideMiddle, runtime_->actionPanel->width() - UiZoom::s(128)));
         runtime_->chooseWorkspace->setToolTip(
             QStringLiteral("当前工作目录：%1\n点击切换当前会话工作目录").arg(directory));
     }
@@ -2429,8 +2427,8 @@ bool AgentChatPanel::chooseDirectoryAndCreateSession() {
     } else if (QFileInfo(defaultWorkspaceDirectory_).isDir()) {
         initial = defaultWorkspaceDirectory_;
     }
-    const QString selected = QFileDialog::getExistingDirectory(
-        this, QStringLiteral("选择新对话的工作目录"), initial, QFileDialog::ShowDirsOnly);
+    const QString selected = QFileDialog::getExistingDirectory(this, QStringLiteral("选择新对话的工作目录"), initial,
+                                                               QFileDialog::ShowDirsOnly);
     if (selected.isEmpty()) return false;
     const QString previous = runtime_->sessionId;
     openNewSessionInDirectory(selected);
@@ -2470,8 +2468,7 @@ void AgentChatPanel::createSessionInDirectory(const QString& directory) {
         return;
     }
     const QString preferredModel = runtime_->modelChip->text();
-    if (preferredModel == QStringLiteral("glm-5.3") ||
-        preferredModel == QStringLiteral("glm-5.3-flash") ||
+    if (preferredModel == QStringLiteral("glm-5.3") || preferredModel == QStringLiteral("glm-5.3-flash") ||
         preferredModel == QStringLiteral("deepseek-flash")) {
         if (!runtime_->controller->setModel(sessionId, preferredModel))
             appendNotice(runtime_->controller->lastError(), true);
@@ -2492,8 +2489,7 @@ void AgentChatPanel::saveConversationPage() {
         MaiSession existing;
         const bool exists = runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), existing);
         runtime_->olderVisible = !runtime_->olderMessages->isHidden();
-        auto saved = std::make_shared<ConversationState>(
-            std::move(static_cast<ConversationState&>(*runtime_)));
+        auto saved = std::make_shared<ConversationState>(std::move(static_cast<ConversationState&>(*runtime_)));
         saved->retainedPage = runtime_->view->takePage();
         if (exists) {
             runtime_->savedConversations.insert(runtime_->sessionId, std::move(saved));
@@ -2543,14 +2539,13 @@ void AgentChatPanel::refreshConversationFromStore(const MaiSession& session) {
     MaiMessage anchor;
     if (runtime_->directory != fromUtf8(session.directory) ||
         (!runtime_->oldestMessage.isEmpty() &&
-         !runtime_->controller->agent().getMessage(toUtf8(runtime_->sessionId),
-                                                  toUtf8(runtime_->oldestMessage), anchor))) {
+         !runtime_->controller->agent().getMessage(toUtf8(runtime_->sessionId), toUtf8(runtime_->oldestMessage),
+                                                   anchor))) {
         reloadFromStore();
         return;
     }
     const auto page = runtime_->controller->agent().listMessagesPage(toUtf8(runtime_->sessionId), {}, 40);
-    if (page.size() == 40 &&
-        std::none_of(page.cbegin(), page.cend(), [this](const MaiMessage& message) {
+    if (page.size() == 40 && std::none_of(page.cbegin(), page.cend(), [this](const MaiMessage& message) {
             return runtime_->loadedMessageIds.contains(fromUtf8(message.id));
         })) {
         // More than one complete page arrived while dormant. Start from a
@@ -2563,11 +2558,12 @@ void AgentChatPanel::refreshConversationFromStore(const MaiSession& session) {
         const auto previous = runtime_->messageShapes.constFind(id);
         if (previous == runtime_->messageShapes.constEnd()) continue;
         const QStringList shape = storedMessageShape(message);
-        const bool appendedOnly = previous->size() <= shape.size() &&
-            std::equal(previous->cbegin(), previous->cend(), shape.cbegin());
+        const bool appendedOnly =
+            previous->size() <= shape.size() && std::equal(previous->cbegin(), previous->cend(), shape.cbegin());
         const bool changedUser = message.role == MaiRole::User &&
-            runtime_->messageFingerprints.value(id) != storedMessageFingerprint(message);
-        const bool changedCompletedAnswer = message.role == MaiRole::Assistant && message.completed != 0 &&
+                                 runtime_->messageFingerprints.value(id) != storedMessageFingerprint(message);
+        const bool changedCompletedAnswer =
+            message.role == MaiRole::Assistant && message.completed != 0 &&
             !runtime_->unfinishedMessages.contains(id) && runtime_->messageFingerprints.contains(id) &&
             runtime_->messageFingerprints.value(id) != storedMessageFingerprint(message);
         // Completed media/PDF controls capture their artifact paths when they
@@ -2634,7 +2630,8 @@ void AgentChatPanel::restoreConversationControls(bool activeAssistantHasVisibleA
     // Retained pages reuse their question projection until a question event
     // changes it; ordinary token deltas and warm switches do not scan children.
     if (runtime_->questionHistoryDirty) {
-        const auto transcript = captureMaiQuestionTranscript(runtime_->controller->agent(), toUtf8(runtime_->sessionId));
+        const auto transcript =
+            captureMaiQuestionTranscript(runtime_->controller->agent(), toUtf8(runtime_->sessionId));
         runtime_->view->beginBatchUpdates();
         for (const auto& entry : transcript.childMessages)
             for (const auto& part : entry.message.parts)
@@ -2688,8 +2685,7 @@ bool AgentChatPanel::appendStoredMessage(const MaiMessage& message, const MaiSes
     runtime_->messageFingerprints.insert(messageId, fingerprint);
     runtime_->messageShapes.insert(messageId, storedMessageShape(message));
     runtime_->loadedMessageIds.insert(messageId);
-    if (runtime_->oldestMessage.isEmpty() || messageId < runtime_->oldestMessage)
-        runtime_->oldestMessage = messageId;
+    if (runtime_->oldestMessage.isEmpty() || messageId < runtime_->oldestMessage) runtime_->oldestMessage = messageId;
     if (message.role == MaiRole::Assistant && message.completed == 0)
         runtime_->unfinishedMessages.insert(messageId);
     else
@@ -2801,28 +2797,26 @@ void AgentChatPanel::appendStoredUserMessage(const MaiMessage& message, const Ma
     runtime_->messageShapes.insert(messageId, storedMessageShape(message));
     runtime_->renderedUserMessages.insert(messageId);
     runtime_->loadedMessageIds.insert(messageId);
-    if (runtime_->oldestMessage.isEmpty() || messageId < runtime_->oldestMessage)
-        runtime_->oldestMessage = messageId;
+    if (runtime_->oldestMessage.isEmpty() || messageId < runtime_->oldestMessage) runtime_->oldestMessage = messageId;
     runtime_->userTextCharacters.insert(messageId, fromUtf8(message.text()).size());
     QStringList images;
     QStringList videos;
     for (const MaiMessagePart& part : message.parts) {
         if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
             const QString stored = fromUtf8(image->path);
-            images.push_back(QFileInfo(stored).isAbsolute()
-                                 ? stored : QDir(fromUtf8(session.directory)).filePath(stored));
+            images.push_back(QFileInfo(stored).isAbsolute() ? stored
+                                                            : QDir(fromUtf8(session.directory)).filePath(stored));
         } else if (const auto* video = std::get_if<MaiVideoPart>(&part.body)) {
             const QString stored = fromUtf8(video->path);
-            videos.push_back(QFileInfo(stored).isAbsolute()
-                                 ? stored : QDir(fromUtf8(session.directory)).filePath(stored));
+            videos.push_back(QFileInfo(stored).isAbsolute() ? stored
+                                                            : QDir(fromUtf8(session.directory)).filePath(stored));
         }
     }
     const QString sourceText = fromUtf8(message.text());
     QString userText = sourceText;
     for (const MaiMessagePart& part : message.parts)
         if (const auto* quote = std::get_if<MaiQuotePart>(&part.body))
-            userText = QStringLiteral("> ↩ %1\n\n%2")
-                           .arg(fromUtf8(quote->preview).simplified(), userText);
+            userText = QStringLiteral("> ↩ %1\n\n%2").arg(fromUtf8(quote->preview).simplified(), userText);
     if (!images.isEmpty() && userText.trimmed() == QStringLiteral("请查看这些图片。")) userText.clear();
     if (!userText.isEmpty()) {
         runtime_->view->addItem(messageId, MarkdownView::Style::Bubble, userText);
@@ -2881,10 +2875,10 @@ void AgentChatPanel::appendUserBubble(const QString& text, const QString& quoted
     // 宽度不用自己量了：视图先按上限排一遍、再按**量出来的**自然宽度收窄。
     // 原来是拿 QFontMetrics 估的，估窄了最后一个字会被挤到下一行
     // （"你好"两个字排成两行就是这么来的）。
-    const QString displayed = quotedPreview.isEmpty()
-        ? text : QStringLiteral("> ↩ %1\n\n%2").arg(quotedPreview.simplified(), text);
-    runtime_->view->addItem(QStringLiteral("local-%1").arg(++runtime_->noticeSerial),
-                            MarkdownView::Style::Bubble, displayed);
+    const QString displayed =
+        quotedPreview.isEmpty() ? text : QStringLiteral("> ↩ %1\n\n%2").arg(quotedPreview.simplified(), text);
+    runtime_->view->addItem(QStringLiteral("local-%1").arg(++runtime_->noticeSerial), MarkdownView::Style::Bubble,
+                            displayed);
     updateWelcomeVisibility();
     scrollToBottom();
 }
@@ -2911,10 +2905,9 @@ void AgentChatPanel::appendQuoteAction(const QString& messageId) {
     button->setAccessibleName(QStringLiteral("引用这条消息"));
     button->setCursor(Qt::PointingHandCursor);
     button->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
-    button->setStyleSheet(UiZoom::scaleQss(QStringLiteral(
-        "QPushButton{background:transparent;border:none;color:#667085;"
-        "font-size:12px;padding:2px 0;text-align:left;}"
-        "QPushButton:hover{color:#0b67b7;}")));
+    UiZoom::setStyle(button, QStringLiteral("QPushButton{background:transparent;border:none;color:#667085;"
+                                            "font-size: @metadata;padding:2px 0;text-align:left;}"
+                                            "QPushButton:hover{color:#0b67b7;}"));
     connect(button, &QPushButton::clicked, this, [this, messageId] { beginQuote(messageId); });
     runtime_->view->addWidget(id, button);
     runtime_->view->moveItemAfter(id, anchor);
@@ -2972,9 +2965,11 @@ void AgentChatPanel::recordMessageItem(const QString& messageId, const QString& 
     // so a later root part cannot be inserted before an earlier child question
     // merely because the root message itself began first.
     QString timelineId;
-    if (itemId.startsWith(QStringLiteral("tool-group-prt_"))) timelineId = itemId.mid(11);
+    if (itemId.startsWith(QStringLiteral("tool-group-prt_")))
+        timelineId = itemId.mid(11);
     else if (itemId.startsWith(QStringLiteral("prt_")) && !itemId.endsWith(QStringLiteral("-question")) &&
-             !itemId.endsWith(QStringLiteral("-answer"))) timelineId = itemId;
+             !itemId.endsWith(QStringLiteral("-answer")))
+        timelineId = itemId;
     if (!timelineId.isEmpty()) runtime_->questionTimeline[timelineId] = QStringList{itemId};
     positionQuestionTranscript();
 }
@@ -2988,9 +2983,13 @@ void AgentChatPanel::positionQuestionTranscript() {
         while (previous != runtime_->questionTimeline.cbegin() && anchor.isEmpty()) {
             --previous;
             for (auto item = previous.value().crbegin(); item != previous.value().crend(); ++item)
-                if (runtime_->view->contains(*item)) { anchor = *item; break; }
+                if (runtime_->view->contains(*item)) {
+                    anchor = *item;
+                    break;
+                }
         }
-        if (!anchor.isEmpty()) runtime_->view->moveItemAfter(it.value().front(), anchor);
+        if (!anchor.isEmpty())
+            runtime_->view->moveItemAfter(it.value().front(), anchor);
         else {
             auto next = it;
             ++next;
@@ -3014,26 +3013,31 @@ void AgentChatPanel::beginQuote(const QString& messageId) {
     {
         QStringList media;
         for (const MaiMessagePart& part : message.parts) {
-            if (std::get_if<MaiImagePart>(&part.body)) media << QStringLiteral("图片");
-            else if (std::get_if<MaiVideoPart>(&part.body)) media << QStringLiteral("视频");
+            if (std::get_if<MaiImagePart>(&part.body))
+                media << QStringLiteral("图片");
+            else if (std::get_if<MaiVideoPart>(&part.body))
+                media << QStringLiteral("视频");
             else if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
                 if (tool->tool != "agent_send_media" || tool->state != MaiToolState::Completed) continue;
                 const QJsonObject artifact = QJsonDocument::fromJson(fromUtf8(tool->output).toUtf8()).object();
                 const QString type = artifact.value(QStringLiteral("type")).toString();
-                if (type == QStringLiteral("video")) media << QStringLiteral("视频");
-                else if (type == QStringLiteral("image")) media << QStringLiteral("图片");
-                else if (type == QStringLiteral("audio")) media << QStringLiteral("音频");
+                if (type == QStringLiteral("video"))
+                    media << QStringLiteral("视频");
+                else if (type == QStringLiteral("image"))
+                    media << QStringLiteral("图片");
+                else if (type == QStringLiteral("audio"))
+                    media << QStringLiteral("音频");
             }
         }
         const QString text = fromUtf8(message.text()).simplified();
         runtime_->quotedMessageId = messageId;
-        runtime_->quotedPreview = (media.isEmpty() ? QString() :
-            QStringLiteral("[%1] ").arg(media.join(QStringLiteral("、")))) +
+        runtime_->quotedPreview =
+            (media.isEmpty() ? QString() : QStringLiteral("[%1] ").arg(media.join(QStringLiteral("、")))) +
             (text.isEmpty() ? QStringLiteral("消息") : text.left(80));
-        runtime_->quoteLabel->setText(QStringLiteral("↩  %1\n%2")
-            .arg(message.role == MaiRole::User ? QStringLiteral("引用你的消息")
-                                           : QStringLiteral("引用 AI 消息"),
-                 runtime_->quotedPreview));
+        runtime_->quoteLabel->setText(
+            QStringLiteral("↩  %1\n%2")
+                .arg(message.role == MaiRole::User ? QStringLiteral("引用你的消息") : QStringLiteral("引用 AI 消息"),
+                     runtime_->quotedPreview));
         runtime_->quoteStrip->show();
         runtime_->editor->setFocus();
         return;
@@ -3084,7 +3088,8 @@ AgentChatPanel::ToolGroupCard* AgentChatPanel::toolGroupFor(const QString& partI
             continue;
         }
         // 这些工具在正文流中插入问答或独立产物，后续工具不能跨过它合组。
-        const bool separateArtifact = tool->tool == "agent_send_media" || tool->tool == "generate_pdf" || tool->tool == "question";
+        const bool separateArtifact =
+            tool->tool == "agent_send_media" || tool->tool == "generate_pdf" || tool->tool == "question";
         if (separateArtifact || firstTool.isEmpty()) firstTool = fromUtf8(part.id);
         if (fromUtf8(part.id) == partId) {
             groupId = firstTool;
@@ -3210,7 +3215,7 @@ void AgentChatPanel::appendPdfPreview(const QString& messageId, const QString& p
     button->setStyleSheet(
         UiZoom::scaleQss(QStringLiteral("QPushButton{background:#f3f8ff;border:1px solid "
                                         "#c9ddf7;border-radius:9px;"
-                                        "color:#175a9e;padding:10px 15px;text-align:left;font-size:13px;}"
+                                        "color:#175a9e;padding:10px 15px;text-align:left;font-size: @detail;}"
                                         "QPushButton:hover{background:#e9f3ff;border-color:#87b9ef;}")));
     connect(button, &QPushButton::clicked, this, [this, workspace, relative] {
         const QString path =
@@ -3254,12 +3259,12 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
         }
         cover->setGeometry(QRect(QPoint(0, 0), previewSize));
         cover->setAlignment(Qt::AlignCenter);
-        MessageImageLoader::instance().load(path, previewSize * 3, cover,
-            [cover, previewSize, video](const QPixmap& pixels) {
-            cover->setPixmap(pixels.scaled(previewSize,
-                video ? Qt::KeepAspectRatioByExpanding : Qt::KeepAspectRatio,
-                Qt::SmoothTransformation));
-        });
+        MessageImageLoader::instance().load(
+            path, previewSize * 3, cover, [cover, previewSize, video](const QPixmap& pixels) {
+                cover->setPixmap(pixels.scaled(previewSize,
+                                               video ? Qt::KeepAspectRatioByExpanding : Qt::KeepAspectRatio,
+                                               Qt::SmoothTransformation));
+            });
         if (type == QStringLiteral("image")) {
             auto* open = new QPushButton(preview);
             open->setObjectName(QStringLiteral("agentMediaImageOpen"));
@@ -3282,11 +3287,11 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
             play->setGeometry(96, 52, 48, 48);
             play->setCursor(Qt::PointingHandCursor);
             play->setToolTip(QStringLiteral("播放视频"));
-            play->setStyleSheet(QStringLiteral(
-                "QPushButton#agentMediaVideoPlay{background:rgba(10,16,27,195);"
-                "border:1px solid rgba(255,255,255,125);border-radius:24px;"
-                "color:white;font-size:20px;padding-left:3px;}"
-                "QPushButton#agentMediaVideoPlay:hover{background:rgba(10,16,27,230);}"));
+            UiZoom::setStyle(play,
+                             QStringLiteral("QPushButton#agentMediaVideoPlay{background:rgba(10,16,27,195);"
+                                            "border:1px solid rgba(255,255,255,125);border-radius:24px;"
+                                            "color:white;font-size: @title;padding-left:3px;}"
+                                            "QPushButton#agentMediaVideoPlay:hover{background:rgba(10,16,27,230);}"));
             connect(play, &QPushButton::clicked, this, [this, path] {
                 if (openVideo_) openVideo_(path, currentVideoPaths());
             });
@@ -3308,10 +3313,10 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
         audioCard->setAccessibleName(QStringLiteral("播放音频"));
         audioCard->setCursor(Qt::PointingHandCursor);
         audioCard->setFixedSize(240, 58);
-        audioCard->setStyleSheet(QStringLiteral(
-            "QPushButton#agentMediaAudioPlay{background:#f4f6f9;border:0;"
-            "border-radius:12px;text-align:left;}"
-            "QPushButton#agentMediaAudioPlay:hover{background:#eaf2fa;}"));
+        audioCard->setStyleSheet(
+            QStringLiteral("QPushButton#agentMediaAudioPlay{background:#f4f6f9;border:0;"
+                           "border-radius:12px;text-align:left;}"
+                           "QPushButton#agentMediaAudioPlay:hover{background:#eaf2fa;}"));
         auto* row = new QHBoxLayout(audioCard);
         row->setContentsMargins(10, 9, 10, 9);
         row->setSpacing(12);
@@ -3319,9 +3324,8 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
         symbol->setObjectName(QStringLiteral("agentMediaAudioSymbol"));
         symbol->setFixedSize(38, 38);
         symbol->setAlignment(Qt::AlignCenter);
-        symbol->setStyleSheet(QStringLiteral(
-            "QLabel#agentMediaAudioSymbol{background:#dff1fc;border-radius:19px;"
-            "color:#1687d4;font-size:18px;}"));
+        UiZoom::setStyle(symbol, QStringLiteral("QLabel#agentMediaAudioSymbol{background:#dff1fc;border-radius:19px;"
+                                                "color:#1687d4;font-size: @heading3;}"));
         row->addWidget(symbol);
         auto* labels = new QVBoxLayout;
         labels->setContentsMargins(0, 0, 0, 0);
@@ -3330,10 +3334,11 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
         auto* name = new QLabel(audioCard);
         name->setText(name->fontMetrics().elidedText(fileName, Qt::ElideMiddle, 160));
         name->setToolTip(fileName);
-        name->setStyleSheet(QStringLiteral("color:#172033;background:transparent;border:none;font-size:13px;"));
+        UiZoom::setStyle(name, QStringLiteral("color:#172033;background:transparent;border:none;font-size: @detail;"));
         auto* duration = new QLabel(QStringLiteral("0:00"), audioCard);
         duration->setObjectName(QStringLiteral("agentMediaAudioDuration"));
-        duration->setStyleSheet(QStringLiteral("color:#667085;background:transparent;border:none;font-size:11px;"));
+        UiZoom::setStyle(duration,
+                         QStringLiteral("color:#667085;background:transparent;border:none;font-size: @metadata;"));
         labels->addWidget(name);
         labels->addWidget(duration);
         row->addLayout(labels, 1);
@@ -3352,8 +3357,7 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
         });
         connect(audio, &QMediaPlayer::durationChanged, duration, [duration](qint64 milliseconds) {
             const qint64 seconds = qMax<qint64>(0, milliseconds / 1000);
-            duration->setText(QStringLiteral("%1:%2").arg(seconds / 60)
-                .arg(seconds % 60, 2, 10, QLatin1Char('0')));
+            duration->setText(QStringLiteral("%1:%2").arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0')));
         });
         layout->addWidget(audioCard);
     }
@@ -3368,19 +3372,17 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
         saveCloud->setObjectName(QStringLiteral("agentMediaCloudDriveSave"));
         saveCloud->setAccessibleName(QStringLiteral("将这个视频保存到我的私人云盘"));
         saveCloud->setCursor(Qt::PointingHandCursor);
-        saveCloud->setStyleSheet(QStringLiteral(
-            "QPushButton{background:#eef6fd;color:#0b67b7;border:0;border-radius:8px;"
-            "padding:8px 13px;text-align:left;font-weight:600;}"
-            "QPushButton:hover{background:#dceefb;}"));
+        saveCloud->setStyleSheet(
+            QStringLiteral("QPushButton{background:#eef6fd;color:#0b67b7;border:0;border-radius:8px;"
+                           "padding:8px 13px;text-align:left;font-weight:600;}"
+                           "QPushButton:hover{background:#dceefb;}"));
         saveCloud->setVisible(runtime_->cloudDriveAvailable);
         runtime_->cloudDriveSaveButtons.append(saveCloud);
-        connect(saveCloud, &QPushButton::clicked, this,
-                [this, path] { emit cloudDriveSaveRequested(path); });
+        connect(saveCloud, &QPushButton::clicked, this, [this, path] { emit cloudDriveSaveRequested(path); });
         layout->addWidget(saveCloud, 0, Qt::AlignLeft);
-        const QJsonObject completedCard{
-            {QStringLiteral("tool"), QStringLiteral("agent_send_media")},
-            {QStringLiteral("state"), QStringLiteral("completed")},
-            {QStringLiteral("output"), artifact}};
+        const QJsonObject completedCard{{QStringLiteral("tool"), QStringLiteral("agent_send_media")},
+                                        {QStringLiteral("state"), QStringLiteral("completed")},
+                                        {QStringLiteral("output"), artifact}};
         const QByteArray cardBytes = QJsonDocument(completedCard).toJson(QJsonDocument::Compact);
         MaiVideoCircleResult eligibility{};
         mai_video_circle_inspect_card(cardBytes.constData(), &eligibility);
@@ -3391,16 +3393,14 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
             publish->setObjectName(QStringLiteral("agentMediaVideoCirclePublish"));
             publish->setAccessibleName(QStringLiteral("发布这个已完成的 AI 视频到视频圈"));
             publish->setCursor(Qt::PointingHandCursor);
-            publish->setStyleSheet(QStringLiteral(
-                "QPushButton{background:#eef6fd;color:#0b67b7;border:0;border-radius:8px;"
-                "padding:8px 13px;text-align:left;font-weight:600;}"
-                "QPushButton:hover{background:#dceefb;}"));
+            publish->setStyleSheet(
+                QStringLiteral("QPushButton{background:#eef6fd;color:#0b67b7;border:0;border-radius:8px;"
+                               "padding:8px 13px;text-align:left;font-weight:600;}"
+                               "QPushButton:hover{background:#dceefb;}"));
             publish->setVisible(runtime_->videoCircleAvailable);
             runtime_->videoCirclePublishButtons.append(publish);
             connect(publish, &QPushButton::clicked, this,
-                    [this, cardBytes, path] {
-                        emit videoCirclePublishRequested(QString::fromUtf8(cardBytes), path);
-                    });
+                    [this, cardBytes, path] { emit videoCirclePublishRequested(QString::fromUtf8(cardBytes), path); });
             layout->addWidget(publish, 0, Qt::AlignLeft);
         }
     }
@@ -3459,7 +3459,7 @@ void AgentChatPanel::appendTextMediaCards(const QString& messageId, const QStrin
         button->setStyleSheet(
             UiZoom::scaleQss(QStringLiteral("QPushButton{background:#f3f8ff;border:1px solid #c9ddf7;"
                                             "border-radius:10px;color:#175a9e;padding:11px 15px;"
-                                            "text-align:left;font-size:13px;}"
+                                            "text-align:left;font-size: @detail;}"
                                             "QPushButton:hover{background:#e9f3ff;border-color:#87b9ef;}")));
         if (mention.video) {
             connect(button, &QPushButton::clicked, this, [this, path = mention.path] {
@@ -3489,8 +3489,7 @@ void AgentChatPanel::appendTextMediaCards(const QString& messageId, const QStrin
     }
 }
 
-void AgentChatPanel::noteOtherSession(const QString& sessionId, const QString& text,
-                                    const QString& partId) {
+void AgentChatPanel::noteOtherSession(const QString& sessionId, const QString& text, const QString& partId) {
     // 只认自己的孩子。别的根会话（用户在另一个标签页里开的）不关这儿的事。
     if (!runtime_->controller->isChildOf(sessionId, runtime_->sessionId)) return;
 
@@ -3523,8 +3522,7 @@ AgentChatPanel::SubAgentCard* AgentChatPanel::subAgentCardFor(const QString& ses
     return card;
 }
 
-bool AgentChatPanel::appendQuestionPart(const QString& owner, const QString& messageId,
-                                       const MaiMessagePart& part) {
+bool AgentChatPanel::appendQuestionPart(const QString& owner, const QString& messageId, const MaiMessagePart& part) {
     const auto* tool = std::get_if<MaiToolPart>(&part.body);
     if (!tool || tool->tool != "question") return false;
     const QJsonObject input = QJsonDocument::fromJson(QByteArray::fromStdString(tool->input)).object();
@@ -3556,7 +3554,8 @@ bool AgentChatPanel::appendQuestionPart(const QString& owner, const QString& mes
         if (runtime_->view->contains(messageId + QStringLiteral("-quote-action"))) appendQuoteAction(messageId);
     }
     QStringList visible{questionItem};
-    if (runtime_->view->contains(partId + QStringLiteral("-answer"))) visible.append(partId + QStringLiteral("-answer"));
+    if (runtime_->view->contains(partId + QStringLiteral("-answer")))
+        visible.append(partId + QStringLiteral("-answer"));
     runtime_->questionTimeline[partId] = visible;
     positionQuestionTranscript();
     clearPendingThinking();
@@ -3580,7 +3579,8 @@ void AgentChatPanel::markQuestionHistoryDirty(const QString& owner, const QStrin
 }
 
 void AgentChatPanel::showQuestion(const QString&) {
-    const auto transcript = captureMaiQuestionTranscript(runtime_->controller->agent(), toUtf8(runtime_->sessionId), false);
+    const auto transcript =
+        captureMaiQuestionTranscript(runtime_->controller->agent(), toUtf8(runtime_->sessionId), false);
     if (transcript.pending.empty()) return;
     // Bind the oldest pending question, not whichever callback arrived last.
     runtime_->pendingQuestionId = fromUtf8(transcript.pending.front().id);
@@ -3606,7 +3606,8 @@ void AgentChatPanel::clearQuestion() {
 
 bool AgentChatPanel::reconcileQuestion() {
     if (runtime_->pendingQuestionId.isEmpty()) return false;
-    const auto transcript = captureMaiQuestionTranscript(runtime_->controller->agent(), toUtf8(runtime_->sessionId), false);
+    const auto transcript =
+        captureMaiQuestionTranscript(runtime_->controller->agent(), toUtf8(runtime_->sessionId), false);
     for (const auto& pending : transcript.pending)
         if (fromUtf8(pending.id) == runtime_->pendingQuestionId) return true;
     // 只解除旧路由。草稿和附件属于用户，不能因问题在其它入口结束而清空。
@@ -3622,8 +3623,7 @@ void AgentChatPanel::showApproval(const QString& permissionId) {
         MaiMessage message;
         if (!runtime_->controller->agent().getMessage(pending.sessionId, pending.messageId, message)) return;
         ToolCard* card = toolCardFor(fromUtf8(pending.partId), message);
-        runtime_->approvalOwners.insert(fromUtf8(pending.partId),
-            qMakePair(owner, fromUtf8(pending.messageId)));
+        runtime_->approvalOwners.insert(fromUtf8(pending.partId), qMakePair(owner, fromUtf8(pending.messageId)));
         card->setCall(fromUtf8(pending.toolName), fromUtf8(pending.arguments));
         const int fileCount = !pending.approvalKeys.empty() && pending.approvalKeys.front().rfind("file:", 0) == 0
                                   ? static_cast<int>(pending.approvalKeys.size())
@@ -3649,9 +3649,12 @@ bool AgentChatPanel::insertComposerMimeData(const QMimeData* mime) {
             if (!url.isLocalFile()) continue;
             const QString path = url.toLocalFile();
             if (!QFileInfo(path).isFile()) continue;
-            if (!videoMimeType(path).isEmpty()) insertComposerVideoFile(path);
-            else if (!QImageReader::imageFormat(path).isEmpty()) insertComposerImageFile(path);
-            else continue;
+            if (!videoMimeType(path).isEmpty())
+                insertComposerVideoFile(path);
+            else if (!QImageReader::imageFormat(path).isEmpty())
+                insertComposerImageFile(path);
+            else
+                continue;
             inserted = true;
         }
         if (inserted) return true;
@@ -3697,8 +3700,7 @@ QString AgentChatPanel::composerMediaDirectory() const {
     return QDir(root).filePath(QStringLiteral("ComposerMedia"));
 }
 
-void AgentChatPanel::insertComposerMediaMarker(const QString& path, bool video,
-                                                const QString& sessionId) {
+void AgentChatPanel::insertComposerMediaMarker(const QString& path, bool video, const QString& sessionId) {
     QTextImageFormat format;
     format.setName(video ? videoResourceName(path) : path);
     format.setWidth(1);
@@ -3707,8 +3709,7 @@ void AgentChatPanel::insertComposerMediaMarker(const QString& path, bool video,
         if (video) {
             QImage marker(1, 1, QImage::Format_ARGB32_Premultiplied);
             marker.fill(Qt::transparent);
-            runtime_->editor->document()->addResource(QTextDocument::ImageResource,
-                                                       QUrl(format.name()), marker);
+            runtime_->editor->document()->addResource(QTextDocument::ImageResource, QUrl(format.name()), marker);
         }
         QTextCursor oldCursor = runtime_->editor->textCursor();
         QTextCursor cursor(runtime_->editor->document());
@@ -3727,13 +3728,12 @@ void AgentChatPanel::insertComposerMediaMarker(const QString& path, bool video,
     }
 }
 
-void AgentChatPanel::importComposerMediaFile(const QString& path, bool video,
-                                              bool removeSourceAfterCopy) {
+void AgentChatPanel::importComposerMediaFile(const QString& path, bool video, bool removeSourceAfterCopy) {
     const QFileInfo file(path);
-    if (!file.isFile() || (video ? videoMimeType(path).isEmpty()
-                                  : !QImageReader(path).size().isValid())) {
+    if (!file.isFile() || (video ? videoMimeType(path).isEmpty() : !QImageReader(path).size().isValid())) {
         appendNotice(QStringLiteral("%1无法读取：%2")
-            .arg(video ? QStringLiteral("视频") : QStringLiteral("图片"), file.fileName()), true);
+                         .arg(video ? QStringLiteral("视频") : QStringLiteral("图片"), file.fileName()),
+                     true);
         return;
     }
     if (runtime_->sessionId.isEmpty()) openSession();
@@ -3749,36 +3749,36 @@ void AgentChatPanel::importComposerMediaFile(const QString& path, bool video,
         appendNotice(QStringLiteral("无法创建创作中心媒体工作目录。"), true);
         return;
     }
-    const QString directory = QDir(storage).filePath(
-        QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const QString directory = QDir(storage).filePath(QUuid::createUuid().toString(QUuid::WithoutBraces));
     const QString destination = QDir(directory).filePath(file.fileName());
     runtime_->pendingMediaImports[targetSession] += 1;
     runtime_->pendingImportDestinations.insert(destination);
     refreshComposerMediaTray();
     auto* watcher = new QFutureWatcher<QString>(this);
     connect(watcher, &QFutureWatcher<QString>::finished, this,
-        [this, watcher, targetSession, video, destination, fileName = file.fileName()] {
-            const QString imported = watcher->result();
-            watcher->deleteLater();
-            runtime_->pendingImportDestinations.remove(destination);
-            const int remaining = runtime_->pendingMediaImports.value(targetSession) - 1;
-            if (remaining > 0) runtime_->pendingMediaImports[targetSession] = remaining;
-            else runtime_->pendingMediaImports.remove(targetSession);
-            MaiSession session;
-            if (!runtime_->controller->agent().getSession(toUtf8(targetSession), session)) {
-                if (!imported.isEmpty()) QDir(QFileInfo(imported).absolutePath()).removeRecursively();
-            } else if (imported.isEmpty()) {
-                if (targetSession == runtime_->sessionId)
-                    appendNotice(QStringLiteral("媒体导入失败：%1").arg(fileName), true);
-            } else {
-                runtime_->unsentImportedPaths.insert(imported);
-                insertComposerMediaMarker(imported, video, targetSession);
-            }
-            if (targetSession == runtime_->sessionId) refreshComposerMediaTray();
-        });
-    watcher->setFuture(QtConcurrent::run([source = file.absoluteFilePath(),
-                                          directory, destination, removeSourceAfterCopy,
-                                          canceled = runtime_->importCanceled] {
+            [this, watcher, targetSession, video, destination, fileName = file.fileName()] {
+                const QString imported = watcher->result();
+                watcher->deleteLater();
+                runtime_->pendingImportDestinations.remove(destination);
+                const int remaining = runtime_->pendingMediaImports.value(targetSession) - 1;
+                if (remaining > 0)
+                    runtime_->pendingMediaImports[targetSession] = remaining;
+                else
+                    runtime_->pendingMediaImports.remove(targetSession);
+                MaiSession session;
+                if (!runtime_->controller->agent().getSession(toUtf8(targetSession), session)) {
+                    if (!imported.isEmpty()) QDir(QFileInfo(imported).absolutePath()).removeRecursively();
+                } else if (imported.isEmpty()) {
+                    if (targetSession == runtime_->sessionId)
+                        appendNotice(QStringLiteral("媒体导入失败：%1").arg(fileName), true);
+                } else {
+                    runtime_->unsentImportedPaths.insert(imported);
+                    insertComposerMediaMarker(imported, video, targetSession);
+                }
+                if (targetSession == runtime_->sessionId) refreshComposerMediaTray();
+            });
+    watcher->setFuture(QtConcurrent::run([source = file.absoluteFilePath(), directory, destination,
+                                          removeSourceAfterCopy, canceled = runtime_->importCanceled] {
         if (!QDir().mkpath(directory)) {
             if (removeSourceAfterCopy) QFile::remove(source);
             return QString();
@@ -3832,7 +3832,8 @@ void AgentChatPanel::removeComposerMedia(const QString& resourceName) {
         for (QTextBlock::iterator it = block.begin(); !it.atEnd(); ++it) {
             const QTextFragment fragment = it.fragment();
             if (!fragment.isValid() || !fragment.charFormat().isImageFormat() ||
-                fragment.charFormat().toImageFormat().name() != resourceName) continue;
+                fragment.charFormat().toImageFormat().name() != resourceName)
+                continue;
             QTextCursor cursor(document);
             cursor.setPosition(fragment.position());
             cursor.movePosition(QTextCursor::NextCharacter, QTextCursor::KeepAnchor);
@@ -3880,8 +3881,7 @@ void AgentChatPanel::refreshComposerMediaTray() {
             const bool video = name.startsWith(kComposerVideoPrefix);
             const QString path = video ? videoPathFromResource(name) : name;
             auto* card = new QWidget(runtime_->mediaTray);
-            card->setObjectName(video ? QStringLiteral("agentVideoDraftCard") :
-                                        QStringLiteral("agentImageDraftCard"));
+            card->setObjectName(video ? QStringLiteral("agentVideoDraftCard") : QStringLiteral("agentImageDraftCard"));
             card->setFixedSize(UiZoom::s(136), UiZoom::s(90));
             card->setStyleSheet(QStringLiteral("background:#f3f7fb;border-radius:8px;"));
             auto* cover = new QLabel(card);
@@ -3892,19 +3892,18 @@ void AgentChatPanel::refreshComposerMediaTray() {
                 marker.fill(Qt::transparent);
                 document->addResource(QTextDocument::ImageResource, QUrl(name), marker);
                 cover->setPixmap(QPixmap::fromImage(videoDraftImage({})));
-                MessageImageLoader::instance().load(path, QSize(480, 270), cover,
-                    [cover, path](const QPixmap& pixels) {
-                        cover->setPixmap(QPixmap::fromImage(
-                            videoDraftImage(pixels.toImage())));
-                    });
+                MessageImageLoader::instance().load(path, QSize(480, 270), cover, [cover, path](const QPixmap& pixels) {
+                    cover->setPixmap(QPixmap::fromImage(videoDraftImage(pixels.toImage())));
+                });
             } else {
                 MessageImageLoader::instance().loadInto(path, QSize(272, 140), cover);
             }
             auto* open = new QPushButton(card);
-            open->setObjectName(video ? QStringLiteral("agentDraftVideoPreview") :
-                                        QStringLiteral("agentDraftImagePreview"));
-            open->setAccessibleName(QStringLiteral("预览%1 %2")
-                .arg(video ? QStringLiteral("视频") : QStringLiteral("图片"), QFileInfo(path).fileName()));
+            open->setObjectName(video ? QStringLiteral("agentDraftVideoPreview")
+                                      : QStringLiteral("agentDraftImagePreview"));
+            open->setAccessibleName(
+                QStringLiteral("预览%1 %2")
+                    .arg(video ? QStringLiteral("视频") : QStringLiteral("图片"), QFileInfo(path).fileName()));
             open->setGeometry(0, 0, UiZoom::s(136), UiZoom::s(70));
             open->setCursor(Qt::PointingHandCursor);
             open->setStyleSheet(QStringLiteral("QPushButton{background:transparent;border:0;}"));
@@ -3914,36 +3913,35 @@ void AgentChatPanel::refreshComposerMediaTray() {
                 } else {
                     const QScreen* screen = QGuiApplication::primaryScreen();
                     const QSize size = screen ? screen->availableGeometry().size() : QSize(1200, 900);
-                    MessageImageLoader::instance().load(path, size, card,
-                        [this](const QPixmap& pixels) {
-                            ImagePreviewDialog dialog(pixels, this);
-                            dialog.exec();
-                        });
+                    MessageImageLoader::instance().load(path, size, card, [this](const QPixmap& pixels) {
+                        ImagePreviewDialog dialog(pixels, this);
+                        dialog.exec();
+                    });
                 }
             });
             auto* remove = new QPushButton(QStringLiteral("×"), card);
             remove->setObjectName(QStringLiteral("agentRemoveDraftMedia"));
-            remove->setAccessibleName(QStringLiteral("移除%1 %2")
-                .arg(video ? QStringLiteral("视频") : QStringLiteral("图片"), QFileInfo(path).fileName()));
+            remove->setAccessibleName(
+                QStringLiteral("移除%1 %2")
+                    .arg(video ? QStringLiteral("视频") : QStringLiteral("图片"), QFileInfo(path).fileName()));
             remove->setGeometry(UiZoom::s(109), UiZoom::s(2), UiZoom::s(25), UiZoom::s(25));
             remove->setCursor(Qt::PointingHandCursor);
-            remove->setStyleSheet(QStringLiteral(
-                "QPushButton{background:rgba(0,0,0,180);border:0;border-radius:12px;color:white;}"));
-            connect(remove, &QPushButton::clicked, this,
-                    [this, name] { removeComposerMedia(name); });
+            remove->setStyleSheet(
+                QStringLiteral("QPushButton{background:rgba(0,0,0,180);border:0;border-radius:12px;color:white;}"));
+            connect(remove, &QPushButton::clicked, this, [this, name] { removeComposerMedia(name); });
             auto* label = new QLabel(QFileInfo(path).fileName(), card);
             label->setGeometry(UiZoom::s(4), UiZoom::s(72), UiZoom::s(128), UiZoom::s(16));
             label->setText(label->fontMetrics().elidedText(label->text(), Qt::ElideMiddle, UiZoom::s(124)));
-            label->setStyleSheet(QStringLiteral("color:#172033;background:transparent;font-size:11px;"));
+            UiZoom::setStyle(label, QStringLiteral("color:#172033;background:transparent;font-size: @metadata;"));
             row->addWidget(card);
         }
         if (pending > 0) {
-            auto* loading = new QLabel(QStringLiteral("正在导入媒体（%1）…").arg(pending),
-                                       runtime_->mediaTray);
+            auto* loading = new QLabel(QStringLiteral("正在导入媒体（%1）…").arg(pending), runtime_->mediaTray);
             loading->setFixedSize(UiZoom::s(160), UiZoom::s(90));
             loading->setAlignment(Qt::AlignCenter);
-            loading->setStyleSheet(QStringLiteral(
-                "QLabel{color:#667085;background:#f3f7fb;border-radius:8px;font-size:12px;}"));
+            UiZoom::setStyle(
+                loading,
+                QStringLiteral("QLabel{color:#667085;background:#f3f7fb;border-radius:8px;font-size: @metadata;}"));
             row->addWidget(loading);
         }
         row->addStretch(1);
@@ -3951,8 +3949,7 @@ void AgentChatPanel::refreshComposerMediaTray() {
     runtime_->mediaTray->setVisible(!resources.isEmpty() || pending > 0);
     if (runtime_->composerHost && runtime_->composerSplitter) {
         const bool hasMedia = !resources.isEmpty() || pending > 0;
-        const int expanded = UiZoom::s(250) +
-            (runtime_->quoteStrip->isVisible() ? UiZoom::s(42) : 0);
+        const int expanded = UiZoom::s(250) + (runtime_->quoteStrip->isVisible() ? UiZoom::s(42) : 0);
         const QList<int> sizes = runtime_->composerSplitter->sizes();
         const int current = sizes.size() > 1 ? sizes.at(1) : 0;
         if (hasMedia && !runtime_->mediaAutoExpanded && current < expanded) {
@@ -3961,15 +3958,13 @@ void AgentChatPanel::refreshComposerMediaTray() {
         }
         runtime_->composerHost->setMinimumHeight(hasMedia ? expanded : UiZoom::s(112));
         if (hasMedia && current < expanded) {
-            const int available = runtime_->composerSplitter->height() -
-                runtime_->composerSplitter->handleWidth();
+            const int available = runtime_->composerSplitter->height() - runtime_->composerSplitter->handleWidth();
             runtime_->composerSplitter->setSizes(QList<int>() << qMax(0, available - expanded) << expanded);
         } else if (!hasMedia && runtime_->mediaAutoExpanded) {
             runtime_->mediaAutoExpanded = false;
             if (current <= expanded + UiZoom::s(10)) {
                 const int previous = qMax(runtime_->composerSizeBeforeMedia, UiZoom::s(112));
-                const int available = runtime_->composerSplitter->height() -
-                    runtime_->composerSplitter->handleWidth();
+                const int available = runtime_->composerSplitter->height() - runtime_->composerSplitter->handleWidth();
                 runtime_->composerSplitter->setSizes(QList<int>() << qMax(0, available - previous) << previous);
             }
         }
@@ -3978,9 +3973,10 @@ void AgentChatPanel::refreshComposerMediaTray() {
 }
 
 void AgentChatPanel::updateComposerPlaceholder() {
-    runtime_->editor->setPlaceholderText(composerImagePaths().isEmpty() && composerVideoPaths().isEmpty()
-        && runtime_->pendingMediaImports.value(runtime_->sessionId) == 0
-        ? QStringLiteral("交给它做点什么…") : QStringLiteral("添加说明（可选）"));
+    runtime_->editor->setPlaceholderText(composerImagePaths().isEmpty() && composerVideoPaths().isEmpty() &&
+                                                 runtime_->pendingMediaImports.value(runtime_->sessionId) == 0
+                                             ? QStringLiteral("交给它做点什么…")
+                                             : QStringLiteral("添加说明（可选）"));
 }
 
 void AgentChatPanel::appendUserImages(const QString& messageId, const QStringList& paths) {
@@ -4011,28 +4007,26 @@ void AgentChatPanel::appendUserVideos(const QString& messageId, const QStringLis
         preview->setFixedSize(240, 135);
         auto* cover = new QLabel(preview);
         cover->setGeometry(0, 0, 240, 135);
-        cover->setPixmap(QPixmap::fromImage(videoDraftImage({}))
-                             .scaled(240, 135, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
-        MessageImageLoader::instance().load(path, QSize(480, 270), cover,
-            [cover, path](const QPixmap& pixels) {
-                cover->setPixmap(QPixmap::fromImage(
-                    videoDraftImage(pixels.toImage()))
-                    .scaled(240, 135, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
-            });
+        cover->setPixmap(
+            QPixmap::fromImage(videoDraftImage({})).scaled(240, 135, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+        MessageImageLoader::instance().load(path, QSize(480, 270), cover, [cover, path](const QPixmap& pixels) {
+            cover->setPixmap(QPixmap::fromImage(videoDraftImage(pixels.toImage()))
+                                 .scaled(240, 135, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+        });
         auto* play = new QPushButton(preview);
         play->setObjectName(QStringLiteral("agentUserVideoPlay"));
         play->setAccessibleName(QStringLiteral("播放视频 %1").arg(QFileInfo(path).fileName()));
         play->setGeometry(96, 43, 48, 48);
         play->setCursor(Qt::PointingHandCursor);
-        play->setStyleSheet(QStringLiteral(
-            "QPushButton{background:transparent;border:0;}"
-            "QPushButton:hover{background:rgba(255,255,255,45);border-radius:24px;}"));
+        play->setStyleSheet(
+            QStringLiteral("QPushButton{background:transparent;border:0;}"
+                           "QPushButton:hover{background:rgba(255,255,255,45);border-radius:24px;}"));
         connect(play, &QPushButton::clicked, this, [this, path, paths] {
             if (openVideo_) openVideo_(path, paths);
         });
         layout->addWidget(preview);
         auto* name = new QLabel(QFileInfo(path).fileName(), card);
-        name->setStyleSheet(QStringLiteral("color:#172033;background:transparent;border:0;font-size:12px;"));
+        UiZoom::setStyle(name, QStringLiteral("color:#172033;background:transparent;border:0;font-size: @metadata;"));
         name->setText(name->fontMetrics().elidedText(name->text(), Qt::ElideMiddle, 238));
         name->setToolTip(path);
         layout->addWidget(name);

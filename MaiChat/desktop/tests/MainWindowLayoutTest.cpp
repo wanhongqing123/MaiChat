@@ -88,15 +88,14 @@ class ScopedMessageHeaderFont {
 public:
     ScopedMessageHeaderFont() : previous_(QApplication::font()) {
         const QDir fonts(QFINDTESTDATA("../resources/fonts"));
-        for (const QString& file : fonts.entryList(
-                 {QStringLiteral("Inter-*.ttf"), QStringLiteral("NotoSansSC-*.otf")}, QDir::Files)) {
+        for (const QString& file :
+             fonts.entryList({QStringLiteral("Inter-*.ttf"), QStringLiteral("NotoSansSC-*.otf")}, QDir::Files)) {
             const int id = QFontDatabase::addApplicationFont(fonts.filePath(file));
             if (id >= 0) fontIds_.append(id);
         }
         QFont font;
-        font.setFamilies({QStringLiteral("Inter"), QStringLiteral("Noto Sans SC"),
-                          QStringLiteral("Microsoft YaHei UI"), QStringLiteral("Microsoft YaHei"),
-                          QStringLiteral("PingFang SC")});
+        font.setFamilies({QStringLiteral("Inter"), QStringLiteral("Noto Sans SC"), QStringLiteral("Microsoft YaHei UI"),
+                          QStringLiteral("Microsoft YaHei"), QStringLiteral("PingFang SC")});
         font.setHintingPreference(QFont::PreferNoHinting);
         font.setPixelSize(13);
         QApplication::setFont(font);
@@ -105,6 +104,7 @@ public:
         QApplication::setFont(previous_);
         for (int id : fontIds_) QFontDatabase::removeApplicationFont(id);
     }
+
 private:
     QFont previous_;
     QList<int> fontIds_;
@@ -258,7 +258,7 @@ void MainWindowLayoutTest::groupMenuCreatesAndOpensTextConversation() {
     MainWindow window(app);
     window.show();
     QTRY_VERIFY(window.isVisible());
-    auto *add = window.findChild<QPushButton*>(QStringLiteral("addConversationButton"));
+    auto* add = window.findChild<QPushButton*>(QStringLiteral("addConversationButton"));
     QVERIFY(add);
     add->click();
     QMenu* menu = nullptr;
@@ -285,8 +285,7 @@ void MainWindowLayoutTest::groupMenuCreatesAndOpensTextConversation() {
     createAction->trigger();
     QTRY_COMPARE(app.groups().size(), 1);
     QTRY_VERIFY(window.findChild<QWidget*>(QStringLiteral("groupConversationPane"))->isVisible());
-    QCOMPARE(window.findChild<QLabel*>(QStringLiteral("groupChatTitle"))->text(),
-             QStringLiteral("Project chat"));
+    QCOMPARE(window.findChild<QLabel*>(QStringLiteral("groupChatTitle"))->text(), QStringLiteral("Project chat"));
     auto* editor = window.findChild<QTextEdit*>(QStringLiteral("groupMessageEditor"));
     auto* send = window.findChild<QPushButton*>(QStringLiteral("groupSendButton"));
     QVERIFY(editor && send);
@@ -299,12 +298,12 @@ void MainWindowLayoutTest::groupMenuCreatesAndOpensTextConversation() {
     QTRY_VERIFY(window.findChildren<QLabel*>(QStringLiteral("groupMessageText")).size() >= 2);
     QTest::qWait(100);
     int visibleMessages = 0;
-    for (auto *label : window.findChildren<QLabel*>(QStringLiteral("groupMessageText")))
+    for (auto* label : window.findChildren<QLabel*>(QStringLiteral("groupMessageText")))
         if (label->isVisible()) ++visibleMessages;
     QCOMPARE(visibleMessages, 2);
     const QString screenshot = qEnvironmentVariable("MAICHAT_GROUP_SCREENSHOT");
     if (!screenshot.isEmpty()) QVERIFY(window.grab().save(screenshot));
-    auto *conversations = window.findChild<QListWidget*>(QStringLiteral("conversationList"));
+    auto* conversations = window.findChild<QListWidget*>(QStringLiteral("conversationList"));
     QVERIFY(conversations && conversations->count() == 2);
     conversations->setCurrentRow(1);
     QTRY_VERIFY(!window.findChild<QWidget*>(QStringLiteral("groupConversationPane"))->isVisible());
@@ -321,8 +320,9 @@ void MainWindowLayoutTest::transientActivityFollowsOnlyActivityEventsAcrossConve
     MainWindow window(app);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    emit fake->activityReceived(QStringLiteral("peer"), RemoteIMActivitySignal{
-        QStringLiteral("machine:test"), RemoteIMActivityKind::MachineTool, true, 12000, 1});
+    emit fake->activityReceived(
+        QStringLiteral("peer"),
+        RemoteIMActivitySignal{QStringLiteral("machine:test"), RemoteIMActivityKind::MachineTool, true, 12000, 1});
     QTRY_VERIFY(window.findChild<QWidget*>(QStringLiteral("remoteImActivityRow")) != nullptr);
     QVERIFY(app.chatState().messagesWith(QStringLiteral("peer")).isEmpty());
     app.selectPeer(QStringLiteral("other"));
@@ -332,8 +332,9 @@ void MainWindowLayoutTest::transientActivityFollowsOnlyActivityEventsAcrossConve
     emit fake->incomingText(QStringLiteral("peer"), QStringLiteral("真正的回复"));
     QTRY_VERIFY(window.findChild<QWidget*>(QStringLiteral("remoteImActivityRow")) != nullptr);
     QCOMPARE(app.chatState().messagesWith(QStringLiteral("peer")).size(), 1);
-    emit fake->activityReceived(QStringLiteral("peer"), RemoteIMActivitySignal{
-        QStringLiteral("machine:test"), RemoteIMActivityKind::MachineTool, false, 1000, 2});
+    emit fake->activityReceived(
+        QStringLiteral("peer"),
+        RemoteIMActivitySignal{QStringLiteral("machine:test"), RemoteIMActivityKind::MachineTool, false, 1000, 2});
     QTRY_VERIFY(window.findChild<QWidget*>(QStringLiteral("remoteImActivityRow")) == nullptr);
 }
 
@@ -348,13 +349,13 @@ void MainWindowLayoutTest::activityDurationUsesMinutesAfterSixtySeconds() {
     QVERIFY(QTest::qWaitForWindowExposed(&window));
 
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    emit fake->activityReceived(QStringLiteral("peer"), RemoteIMActivitySignal{
-        QStringLiteral("machine:duration"), RemoteIMActivityKind::MachineWorking, true,
-        12000, 1, now - 62 * 1000, now - 417 * 1000});
+    emit fake->activityReceived(
+        QStringLiteral("peer"),
+        RemoteIMActivitySignal{QStringLiteral("machine:duration"), RemoteIMActivityKind::MachineWorking, true, 12000, 1,
+                               now - 62 * 1000, now - 417 * 1000});
     auto* bubble = window.findChild<QWidget*>(QStringLiteral("remoteImActivityBubble"));
     QTRY_VERIFY(bubble != nullptr);
-    QTRY_COMPARE(bubble->accessibleName(),
-                 QStringLiteral("正在执行1分2秒，任务总耗时6分57秒"));
+    QTRY_COMPARE(bubble->accessibleName(), QStringLiteral("正在执行1分2秒，任务总耗时6分57秒"));
 }
 
 void MainWindowLayoutTest::transientActivityStaysAfterNewOutgoingMessage() {
@@ -378,12 +379,12 @@ void MainWindowLayoutTest::transientActivityStaysAfterNewOutgoingMessage() {
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     QVERIFY(!window.findChildren<QWidget*>(QStringLiteral("messageRowIncoming")).isEmpty());
 
-    emit fake->activityReceived(QStringLiteral("peer"), RemoteIMActivitySignal{
-        QStringLiteral("machine:test"), RemoteIMActivityKind::MachineWorking, true, 60000, 1});
+    emit fake->activityReceived(
+        QStringLiteral("peer"),
+        RemoteIMActivitySignal{QStringLiteral("machine:test"), RemoteIMActivityKind::MachineWorking, true, 60000, 1});
     auto* activityRow = window.findChild<QWidget*>(QStringLiteral("remoteImActivityRow"));
     QTRY_VERIFY(activityRow != nullptr);
-    auto* activityBubble =
-        activityRow->findChild<QWidget*>(QStringLiteral("remoteImActivityBubble"));
+    auto* activityBubble = activityRow->findChild<QWidget*>(QStringLiteral("remoteImActivityBubble"));
     QVERIFY(activityBubble != nullptr);
     QVERIFY(activityBubble->testAttribute(Qt::WA_TranslucentBackground));
     QVERIFY(!activityBubble->autoFillBackground());
@@ -470,8 +471,7 @@ void MainWindowLayoutTest::selectedConversationRowReachesTheListEdge() {
     QCoreApplication::processEvents();
 
     // 少量会话时不该出现纵向滚动条；留白若仍在，就与滚动条无关，是行本身没画到边。
-    QVERIFY2(!list->verticalScrollBar()->isVisible(),
-             "前提不成立：只有一条会话却出现了纵向滚动条");
+    QVERIFY2(!list->verticalScrollBar()->isVisible(), "前提不成立：只有一条会话却出现了纵向滚动条");
 
     const QRect rowRect = list->visualItemRect(list->item(0));
     const QImage painted = list->viewport()->grab().toImage();
@@ -483,8 +483,7 @@ void MainWindowLayoutTest::selectedConversationRowReachesTheListEdge() {
     const qreal dpr = painted.devicePixelRatio();
     const int y = qRound(rowRect.center().y() * dpr);
     QVERIFY2(y >= 0 && y < painted.height(),
-             qPrintable(QStringLiteral("取样行 y=%1 超出抓图高度 %2（dpr=%3）")
-                            .arg(y).arg(painted.height()).arg(dpr)));
+             qPrintable(QStringLiteral("取样行 y=%1 超出抓图高度 %2（dpr=%3）").arg(y).arg(painted.height()).arg(dpr)));
 
     // 从右缘往左找第一列高亮像素，中间隔了多少列就是留白宽度（物理像素）。
     int gap = 0;
@@ -497,8 +496,7 @@ void MainWindowLayoutTest::selectedConversationRowReachesTheListEdge() {
 
     const int tolerance = qMax(1, qRound(dpr));
     QVERIFY2(gap <= tolerance,
-             qPrintable(QStringLiteral("选中行右侧留白 %1 物理像素，应贴到列表边缘（容 %2）")
-                            .arg(gap).arg(tolerance)));
+             qPrintable(QStringLiteral("选中行右侧留白 %1 物理像素，应贴到列表边缘（容 %2）").arg(gap).arg(tolerance)));
 }
 
 // 上一条特意断言「没有滚动条」，只能证明委托多缩了 6px。
@@ -529,8 +527,7 @@ void MainWindowLayoutTest::selectedConversationRowReachesTheListEdgeWithScrollBa
 
     // 这条用例的前提正好和上一条相反：必须真的有滚动条，否则它什么都没测到。
     QVERIFY2(list->verticalScrollBar()->isVisible(),
-             qPrintable(QStringLiteral("前提不成立：%1 条会话仍未出现纵向滚动条")
-                            .arg(list->count())));
+             qPrintable(QStringLiteral("前提不成立：%1 条会话仍未出现纵向滚动条").arg(list->count())));
 
     const QRect rowRect = list->visualItemRect(list->item(0));
     const QImage painted = list->viewport()->grab().toImage();
@@ -540,8 +537,7 @@ void MainWindowLayoutTest::selectedConversationRowReachesTheListEdgeWithScrollBa
     const qreal dpr = painted.devicePixelRatio();
     const int y = qRound(rowRect.center().y() * dpr);
     QVERIFY2(y >= 0 && y < painted.height(),
-             qPrintable(QStringLiteral("取样行 y=%1 超出抓图高度 %2（dpr=%3）")
-                            .arg(y).arg(painted.height()).arg(dpr)));
+             qPrintable(QStringLiteral("取样行 y=%1 超出抓图高度 %2（dpr=%3）").arg(y).arg(painted.height()).arg(dpr)));
     int gap = 0;
     for (int x = painted.width() - 1; x >= 0; --x) {
         if (painted.pixelColor(x, y) == selected) {
@@ -554,14 +550,13 @@ void MainWindowLayoutTest::selectedConversationRowReachesTheListEdgeWithScrollBa
     // 用户看到的整条空白 = 这里的 gap + 滚动条自身宽度；后者是 Qt 的正常占位，
     // 本用例不改也不断言它，只钉住委托这部分为 0。
     const int tolerance = qMax(1, qRound(dpr));
-    QVERIFY2(gap <= tolerance,
-             qPrintable(QStringLiteral("有滚动条时选中行右侧仍留白 %1 物理像素（容 %2；"
-                                       "抓图宽 %3，滚动条宽 %4 逻辑像素，dpr=%5）")
-                            .arg(gap)
-                            .arg(tolerance)
-                            .arg(painted.width())
-                            .arg(list->verticalScrollBar()->width())
-                            .arg(dpr)));
+    QVERIFY2(gap <= tolerance, qPrintable(QStringLiteral("有滚动条时选中行右侧仍留白 %1 物理像素（容 %2；"
+                                                         "抓图宽 %3，滚动条宽 %4 逻辑像素，dpr=%5）")
+                                              .arg(gap)
+                                              .arg(tolerance)
+                                              .arg(painted.width())
+                                              .arg(list->verticalScrollBar()->width())
+                                              .arg(dpr)));
 }
 
 namespace {
@@ -578,8 +573,7 @@ bool dragScrollBarHandle(QScrollBar* bar, int dyLogical) {
     option.sliderValue = bar->value();
     option.pageStep = bar->pageStep();
     option.singleStep = bar->singleStep();
-    const QRect handle =
-        bar->style()->subControlRect(QStyle::CC_ScrollBar, &option, QStyle::SC_ScrollBarSlider, bar);
+    const QRect handle = bar->style()->subControlRect(QStyle::CC_ScrollBar, &option, QStyle::SC_ScrollBarSlider, bar);
     if (handle.isEmpty()) {
         return false;
     }
@@ -588,8 +582,7 @@ bool dragScrollBarHandle(QScrollBar* bar, int dyLogical) {
     QTest::mousePress(bar, Qt::LeftButton, Qt::NoModifier, from);
     // QTest::mouseMove 发出的移动事件 buttons 为 NoButton，QScrollBar 会当成
     // 普通悬停忽略掉，拖不动。这里手工构造一个「左键仍按住」的移动事件。
-    QMouseEvent move(QEvent::MouseMove, to, bar->mapToGlobal(to), Qt::NoButton, Qt::LeftButton,
-                     Qt::NoModifier);
+    QMouseEvent move(QEvent::MouseMove, to, bar->mapToGlobal(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
     QCoreApplication::sendEvent(bar, &move);
     QCoreApplication::processEvents();
     QTest::mouseRelease(bar, Qt::LeftButton, Qt::NoModifier, to);
@@ -604,7 +597,12 @@ bool dragScrollBarHandle(QScrollBar* bar, int dyLogical) {
 //   2. 还能拖、还能滚 —— 收窄不能把交互弄没
 //   3. 没有滚动条时不占位，别用一条恒定留白换掉原来的问题
 void MainWindowLayoutTest::listScrollBarsAreNarrowAndStillScrollableAcrossZoomLevels() {
-    struct RestoreZoom { qreal old; ~RestoreZoom() { UiZoom::setFactor(old); } } restore{UiZoom::factor()};
+    struct RestoreZoom {
+        qreal old;
+        ~RestoreZoom() {
+            UiZoom::setFactor(old);
+        }
+    } restore{UiZoom::factor()};
 
     for (const qreal zoom : {0.8, 1.0, 1.5, 2.0}) {
         UiZoom::setFactor(zoom);
@@ -625,14 +623,13 @@ void MainWindowLayoutTest::listScrollBarsAreNarrowAndStillScrollableAcrossZoomLe
         auto* list = window.findChild<QListWidget*>(QStringLiteral("conversationList"));
         QVERIFY(list != nullptr);
         QScrollBar* bar = list->verticalScrollBar();
-        QVERIFY2(bar->isVisible(),
-                 qPrintable(QStringLiteral("缩放 %1：40 条会话却没有纵向滚动条").arg(zoom)));
+        QVERIFY2(bar->isVisible(), qPrintable(QStringLiteral("缩放 %1：40 条会话却没有纵向滚动条").arg(zoom)));
 
         // 1. 宽度：基准 8px 随缩放走。Qt 默认约 17px，这里必须明显更窄。
         const int expected = UiZoom::s(8);
         QVERIFY2(qAbs(bar->width() - expected) <= 1,
-                 qPrintable(QStringLiteral("缩放 %1：滚动条宽 %2px，期望约 %3px")
-                                .arg(zoom).arg(bar->width()).arg(expected)));
+                 qPrintable(
+                     QStringLiteral("缩放 %1：滚动条宽 %2px，期望约 %3px").arg(zoom).arg(bar->width()).arg(expected)));
 
         // 2. 还能滚：直接改值 + 真实滚轮事件都要生效。
         // 注意别假设初始位置在顶部——列表会自动滚到当前项，起始值不一定是 minimum。
@@ -643,13 +640,11 @@ void MainWindowLayoutTest::listScrollBarsAreNarrowAndStillScrollableAcrossZoomLe
         bar->setValue(bar->minimum());
         QCOMPARE(bar->value(), bar->minimum());
         QWheelEvent wheel(QPointF(list->viewport()->rect().center()),
-                          list->viewport()->mapToGlobal(list->viewport()->rect().center()),
-                          QPoint(0, -40), QPoint(0, -120), Qt::NoButton, Qt::NoModifier,
-                          Qt::NoScrollPhase, /*inverted*/ false);
+                          list->viewport()->mapToGlobal(list->viewport()->rect().center()), QPoint(0, -40),
+                          QPoint(0, -120), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, /*inverted*/ false);
         QCoreApplication::sendEvent(list->viewport(), &wheel);
         QCoreApplication::processEvents();
-        QVERIFY2(bar->value() > bar->minimum(),
-                 qPrintable(QStringLiteral("缩放 %1：滚轮没有滚动列表").arg(zoom)));
+        QVERIFY2(bar->value() > bar->minimum(), qPrintable(QStringLiteral("缩放 %1：滚轮没有滚动列表").arg(zoom)));
 
         // 真实拖动：8px 宽的滑块必须还抓得住。setValue 走不到命中测试，
         // 证明不了这一点。
@@ -657,9 +652,10 @@ void MainWindowLayoutTest::listScrollBarsAreNarrowAndStillScrollableAcrossZoomLe
         QCoreApplication::processEvents();
         QVERIFY2(dragScrollBarHandle(bar, 120),
                  qPrintable(QStringLiteral("缩放 %1：会话列表滑块矩形为空，无法拖动").arg(zoom)));
-        QVERIFY2(bar->value() > bar->minimum(),
-                 qPrintable(QStringLiteral("缩放 %1：按住会话列表滑块拖动后 value 没变（仍为 %2）")
-                                .arg(zoom).arg(bar->value())));
+        QVERIFY2(
+            bar->value() > bar->minimum(),
+            qPrintable(
+                QStringLiteral("缩放 %1：按住会话列表滑块拖动后 value 没变（仍为 %2）").arg(zoom).arg(bar->value())));
 
         // 联系人列表用的是同一套样式，一并验证它也拖得动。
         auto* contacts = window.findChild<QListWidget*>(QStringLiteral("contactsList"));
@@ -671,18 +667,18 @@ void MainWindowLayoutTest::listScrollBarsAreNarrowAndStillScrollableAcrossZoomLe
         QScrollBar* contactsBar = contacts->verticalScrollBar();
         QVERIFY(contacts->isVisible());
         QVERIFY(contactsBar->isVisible());
-        QVERIFY2(contactsBar->maximum() > contactsBar->minimum(),
-                 "联系人滚动范围必须非空，不能跳过拖动验证");
+        QVERIFY2(contactsBar->maximum() > contactsBar->minimum(), "联系人滚动范围必须非空，不能跳过拖动验证");
         QVERIFY2(qAbs(contactsBar->width() - expected) <= 1,
                  qPrintable(QStringLiteral("缩放 %1：联系人列表滚动条宽 %2px，期望约 %3px")
-                                .arg(zoom).arg(contactsBar->width()).arg(expected)));
+                                .arg(zoom)
+                                .arg(contactsBar->width())
+                                .arg(expected)));
         auto* contactsPane = window.findChild<QWidget*>(QStringLiteral("contactsDirectoryPane"));
         QVERIFY(contactsPane != nullptr);
         const int barRight = contactsBar->mapTo(contactsPane, QPoint(contactsBar->width(), 0)).x();
         const int trailingGap = contactsPane->width() - barRight;
         QVERIFY2(trailingGap <= 1,
-                 qPrintable(QStringLiteral("缩放 %1：联系人滚动条到分割线仍有 %2px 空隙")
-                                .arg(zoom).arg(trailingGap)));
+                 qPrintable(QStringLiteral("缩放 %1：联系人滚动条到分割线仍有 %2px 空隙").arg(zoom).arg(trailingGap)));
         contactsBar->setValue(contactsBar->minimum());
         QCoreApplication::processEvents();
         QVERIFY2(dragScrollBarHandle(contactsBar, 120),
@@ -742,7 +738,10 @@ void MainWindowLayoutTest::conversationListPutsNewestMessageFirst() {
     //
     // 产品口径是「时间相同按首字母」，所以这里要测的是时间不同时按时间排——
     // 那就必须让时间确实不同，而不是指望它不同。
-    struct Seed { const char* peer; qint64 at; };
+    struct Seed {
+        const char* peer;
+        qint64 at;
+    };
     const QList<Seed> seeds{{"alpha", 1000}, {"bravo", 2000}, {"charlie", 3000}};
     for (const Seed& seed : seeds) {
         RemoteIMMessage m;
@@ -814,9 +813,7 @@ void MainWindowLayoutTest::conversationListBreaksTimeTiesByName() {
     for (int row = 0; row < list->count(); ++row) {
         order.append(list->item(row)->data(Qt::UserRole).toString());
     }
-    QCOMPARE(order, QStringList({QStringLiteral("alpha"),
-                                 QStringLiteral("bravo"),
-                                 QStringLiteral("charlie")}));
+    QCOMPARE(order, QStringList({QStringLiteral("alpha"), QStringLiteral("bravo"), QStringLiteral("charlie")}));
 
     // 再刷一次必须还是同样的顺序：并列时如果顺序不稳定，列表会自己抖。
     emit app.stateChanged();
@@ -893,8 +890,7 @@ QWidget* settledQuoteBlock(QWidget& window) {
     // QTRY_ 宏只能用在测试方法里，这里手动转事件循环。
     for (int i = 0; i < 50; ++i) {
         QTest::qWait(20);
-        const QList<QWidget*> blocks =
-            window.findChildren<QWidget*>(QStringLiteral("messageQuoteBlock"));
+        const QList<QWidget*> blocks = window.findChildren<QWidget*>(QStringLiteral("messageQuoteBlock"));
         if (blocks.size() != 1) continue;
         block = blocks.first();
         // 高度为 0 表示布局还没跑，这时候的坐标是假的，点下去会落到窗口外。
@@ -1134,8 +1130,7 @@ void MainWindowLayoutTest::settingsPanelBorderIsNotCoveredByRows() {
     // 沿高度多点采样，左右边框都得在。
     const auto nearBorder = [](QRgb c) {
         // 抗锯齿会让边框像素略有出入，允许小幅偏差但必须明显不是白色。
-        return qAbs(qRed(c) - 0xda) < 24 && qAbs(qGreen(c) - 0xe4) < 24
-               && qAbs(qBlue(c) - 0xf0) < 24;
+        return qAbs(qRed(c) - 0xda) < 24 && qAbs(qGreen(c) - 0xe4) < 24 && qAbs(qBlue(c) - 0xf0) < 24;
     };
 
     int leftHits = 0;
@@ -1170,20 +1165,18 @@ void MainWindowLayoutTest::settingsPanelBorderIsNotCoveredByRows() {
         }
     }
     QVERIFY(sampled > 5);
-    QVERIFY2(leftHits == sampled,
-             qPrintable(QStringLiteral("左边框只在 %1/%2 个采样点上存在，面板 %3x%4，缺失：%5")
-                            .arg(leftHits)
-                            .arg(sampled)
-                            .arg(painted.width())
-                            .arg(painted.height())
-                            .arg(leftMisses.join(QStringLiteral("; ")))));
-    QVERIFY2(rightHits == sampled,
-             qPrintable(QStringLiteral("右边框只在 %1/%2 个采样点上存在，面板 %3x%4，缺失：%5")
-                            .arg(rightHits)
-                            .arg(sampled)
-                            .arg(painted.width())
-                            .arg(painted.height())
-                            .arg(rightMisses.join(QStringLiteral("; ")))));
+    QVERIFY2(leftHits == sampled, qPrintable(QStringLiteral("左边框只在 %1/%2 个采样点上存在，面板 %3x%4，缺失：%5")
+                                                 .arg(leftHits)
+                                                 .arg(sampled)
+                                                 .arg(painted.width())
+                                                 .arg(painted.height())
+                                                 .arg(leftMisses.join(QStringLiteral("; ")))));
+    QVERIFY2(rightHits == sampled, qPrintable(QStringLiteral("右边框只在 %1/%2 个采样点上存在，面板 %3x%4，缺失：%5")
+                                                  .arg(rightHits)
+                                                  .arg(sampled)
+                                                  .arg(painted.width())
+                                                  .arg(painted.height())
+                                                  .arg(rightMisses.join(QStringLiteral("; ")))));
 }
 
 void MainWindowLayoutTest::exposesDesktopChatLayoutControls() {
@@ -1213,20 +1206,17 @@ void MainWindowLayoutTest::mainWindowUsesRoomierIconFreeTitleArea() {
     QVERIFY(inset->minimumHeight() >= UiZoom::s(32));
     QCOMPARE(inset->maximumHeight(), inset->minimumHeight());
     QCOMPARE(inset->palette().color(QPalette::Window), QColor(QStringLiteral("#f3f3f3")));
-    QCOMPARE(navRail->palette().color(QPalette::Window),
-             inset->palette().color(QPalette::Window));
+    QCOMPARE(navRail->palette().color(QPalette::Window), inset->palette().color(QPalette::Window));
 
     QEvent activateEvent(QEvent::WindowActivate);
     QApplication::sendEvent(&window, &activateEvent);
     QCOMPARE(inset->palette().color(QPalette::Window), QColor(QStringLiteral("#eef4f9")));
-    QCOMPARE(navRail->palette().color(QPalette::Window),
-             inset->palette().color(QPalette::Window));
+    QCOMPARE(navRail->palette().color(QPalette::Window), inset->palette().color(QPalette::Window));
 
     QEvent deactivateEvent(QEvent::WindowDeactivate);
     QApplication::sendEvent(&window, &deactivateEvent);
     QCOMPARE(inset->palette().color(QPalette::Window), QColor(QStringLiteral("#f3f3f3")));
-    QCOMPARE(navRail->palette().color(QPalette::Window),
-             inset->palette().color(QPalette::Window));
+    QCOMPARE(navRail->palette().color(QPalette::Window), inset->palette().color(QPalette::Window));
 
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
@@ -1260,9 +1250,7 @@ void MainWindowLayoutTest::windowsCaptionStaysInTitleBarAbovePageActions() {
     QCOMPARE(minimize->accessibleName(), QStringLiteral("最小化"));
     QCOMPARE(maximize->accessibleName(), QStringLiteral("最大化"));
     QCOMPARE(close->accessibleName(), QStringLiteral("关闭"));
-    const auto mapped = [&window](QWidget* widget) {
-        return QRect(widget->mapTo(&window, QPoint()), widget->size());
-    };
+    const auto mapped = [&window](QWidget* widget) { return QRect(widget->mapTo(&window, QPoint()), widget->size()); };
     auto* titleBar = window.findChild<QWidget*>(QStringLiteral("windowTopInset"));
     QVERIFY(titleBar);
     QTRY_VERIFY(mapped(titleBar).contains(mapped(controls)));
@@ -1327,9 +1315,7 @@ void MainWindowLayoutTest::windowsCaptionStaysVisibleWhileSettingsScrolls() {
     QTRY_VERIFY(scroll->isVisible());
     QTRY_VERIFY(scroll->verticalScrollBar()->maximum() > 0);
     QCoreApplication::processEvents();
-    const auto captionRect = [&] {
-        return QRect(controls->mapTo(&window, QPoint()), controls->size());
-    };
+    const auto captionRect = [&] { return QRect(controls->mapTo(&window, QPoint()), controls->size()); };
     const int captionCenter = captionRect().center().y();
     // The settings body really moves through its QScrollArea. A later native
     // resize must not reposition window actions using that scrolled title.
@@ -1370,18 +1356,15 @@ void MainWindowLayoutTest::windowsCaptionPreservesNativeWindowActions() {
         ClientToScreen(handle, &point);
         return MAKELPARAM(point.x, point.y);
     };
-    const auto maximizePoint = [&] {
-        return nativePoint(maximize->mapTo(&window, maximize->rect().center()));
-    };
+    const auto maximizePoint = [&] { return nativePoint(maximize->mapTo(&window, maximize->rect().center())); };
     QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0, maximizePoint()), LRESULT(HTMAXBUTTON));
-    QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0, nativePoint(QPoint(1, 1))),
-             LRESULT(HTTOPLEFT));
+    QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0, nativePoint(QPoint(1, 1))), LRESULT(HTTOPLEFT));
     QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0,
-                         nativePoint(titleBar->mapTo(&window, QPoint(12, titleBar->height() / 2)))),
+                          nativePoint(titleBar->mapTo(&window, QPoint(12, titleBar->height() / 2)))),
              LRESULT(HTCAPTION));
-    QCOMPARE(SendMessageW(handle, WM_NCHITTEST, 0,
-                         nativePoint(header->mapTo(&window, QPoint(12, header->height() / 2)))),
-             LRESULT(HTCLIENT));
+    QCOMPARE(
+        SendMessageW(handle, WM_NCHITTEST, 0, nativePoint(header->mapTo(&window, QPoint(12, header->height() / 2)))),
+        LRESULT(HTCLIENT));
 
     // Snap hover uses HTMAXBUTTON, so actual mouse clicks arrive as non-client messages.
     SendMessageW(handle, WM_NCLBUTTONDOWN, HTMAXBUTTON, maximizePoint());
@@ -1429,8 +1412,7 @@ void MainWindowLayoutTest::conversationSidebarUsesLighterBackground() {
 
     auto* navRail = window.findChild<QWidget*>(QStringLiteral("navRail"));
     auto* conversationPane = window.findChild<QWidget*>(QStringLiteral("conversationPane"));
-    auto* contactsDirectoryPane =
-        window.findChild<QWidget*>(QStringLiteral("contactsDirectoryPane"));
+    auto* contactsDirectoryPane = window.findChild<QWidget*>(QStringLiteral("contactsDirectoryPane"));
     QVERIFY(navRail != nullptr);
     QVERIFY(conversationPane != nullptr);
     QVERIFY(contactsDirectoryPane != nullptr);
@@ -1488,8 +1470,7 @@ void MainWindowLayoutTest::aiReplySuggestionOnlyFillsComposer() {
     app.addContact(QStringLiteral("other-user"), QStringLiteral("Other"));
     app.selectPeer(QStringLiteral("phone-user"));
     fake->emitIncomingText(QStringLiteral("phone-user"), QStringLiteral("今天能审核完吗？"));
-    const QString latestId =
-        app.chatState().messagesWith(QStringLiteral("phone-user")).last().id;
+    const QString latestId = app.chatState().messagesWith(QStringLiteral("phone-user")).last().id;
 
     MainWindow window(app);
     window.show();
@@ -1498,10 +1479,8 @@ void MainWindowLayoutTest::aiReplySuggestionOnlyFillsComposer() {
     auto* aiButton = window.findChild<QPushButton*>(QStringLiteral("aiReplyButton"));
     auto* aiHint = window.findChild<QLabel*>(QStringLiteral("aiReplyHint"));
     auto* bar = window.findChild<QWidget*>(QStringLiteral("replySuggestionBar"));
-    auto* professional =
-        window.findChild<QPushButton*>(QStringLiteral("professionalReplySuggestion"));
-    auto* controller = window.findChild<ReplySuggestionController*>(
-        QStringLiteral("replySuggestionController"));
+    auto* professional = window.findChild<QPushButton*>(QStringLiteral("professionalReplySuggestion"));
+    auto* controller = window.findChild<ReplySuggestionController*>(QStringLiteral("replySuggestionController"));
     QVERIFY(editor != nullptr);
     QVERIFY(aiButton != nullptr);
     QVERIFY(aiHint != nullptr);
@@ -1524,13 +1503,12 @@ void MainWindowLayoutTest::aiReplySuggestionOnlyFillsComposer() {
 
     aiButton->click();
     QVERIFY(bar->isVisible());
-    QVERIFY(QMetaObject::invokeMethod(
-        controller, "suggestionsReady", Qt::DirectConnection,
-        Q_ARG(quint64, quint64(1)), Q_ARG(QString, QStringLiteral("desktop-user")),
-        Q_ARG(QString, QStringLiteral("phone-user")), Q_ARG(QString, latestId),
-        Q_ARG(QString, QStringLiteral("好，我晚点看")),
-        Q_ARG(QString, QStringLiteral("收到，马上看 😄")),
-        Q_ARG(QString, QStringLiteral("已收到，我会在今天完成审核。"))));
+    QVERIFY(QMetaObject::invokeMethod(controller, "suggestionsReady", Qt::DirectConnection, Q_ARG(quint64, quint64(1)),
+                                      Q_ARG(QString, QStringLiteral("desktop-user")),
+                                      Q_ARG(QString, QStringLiteral("phone-user")), Q_ARG(QString, latestId),
+                                      Q_ARG(QString, QStringLiteral("好，我晚点看")),
+                                      Q_ARG(QString, QStringLiteral("收到，马上看 😄")),
+                                      Q_ARG(QString, QStringLiteral("已收到，我会在今天完成审核。"))));
     QVERIFY(professional->isEnabled());
     QCOMPARE(fake->lastText(), QString());
 
@@ -1554,8 +1532,10 @@ void MainWindowLayoutTest::conversationPreviewUsesPlainMarkdown_data() {
                                  << QStringLiteral("文档 与 旧版") << false;
     QTest::newRow("code-literals") << QStringLiteral("```cpp\na*b*c\npath_with_under_score\n```")
                                    << QStringLiteral("a*b*c path_with_under_score") << false;
-    QTest::newRow("callout") << QStringLiteral("> [!TIP]\n> 使用 **独立目录**") << QStringLiteral("建议：使用 独立目录") << false;
-    QTest::newRow("same-line-preview-callout") << QStringLiteral("> [!TIP] 正文") << QStringLiteral("建议：正文") << false;
+    QTest::newRow("callout") << QStringLiteral("> [!TIP]\n> 使用 **独立目录**") << QStringLiteral("建议：使用 独立目录")
+                             << false;
+    QTest::newRow("same-line-preview-callout")
+        << QStringLiteral("> [!TIP] 正文") << QStringLiteral("建议：正文") << false;
     QTest::newRow("emphasized-preview-callout")
         << QStringLiteral("> **[!TIP]** 正文") << QStringLiteral("建议：正文") << false;
     QTest::newRow("linked-literal-callout")
@@ -1580,7 +1560,7 @@ void MainWindowLayoutTest::conversationPreviewUsesPlainMarkdown_data() {
                                     QString::fromUtf8("1️⃣"), QString::fromUtf8("🇨🇳")}) {
         const QByteArray name = QByteArray("emoji-after-159-") + sequence.toUtf8().toHex();
         QTest::newRow(name.constData()) << (QString(159, QLatin1Char('a')) + sequence + sequence)
-            << (QString(159, QLatin1Char('a')) + sequence + QStringLiteral("…")) << false;
+                                        << (QString(159, QLatin1Char('a')) + sequence + QStringLiteral("…")) << false;
     }
 }
 
@@ -1608,11 +1588,10 @@ void MainWindowLayoutTest::conversationPreviewUsesPlainMarkdown() {
         for (int i = qMax(0, codepoints.size() - 12); i < codepoints.size(); ++i) {
             tail.append(QString::number(codepoints.at(i), 16));
         }
-        qInfo().noquote() << "preview mismatch: actual UTF16=" << actual.size()
-            << "expected UTF16=" << expected.size()
-            << "actual ZWJ=" << actual.count(QChar(0x200D))
-            << "expected ZWJ=" << expected.count(QChar(0x200D))
-            << "actual tail scalars=" << tail.join(QLatin1Char(','));
+        qInfo().noquote() << "preview mismatch: actual UTF16=" << actual.size() << "expected UTF16=" << expected.size()
+                          << "actual ZWJ=" << actual.count(QChar(0x200D))
+                          << "expected ZWJ=" << expected.count(QChar(0x200D))
+                          << "actual tail scalars=" << tail.join(QLatin1Char(','));
     }
     QCOMPARE(actual, expected);
     RemoteIMMessage stored;
@@ -1637,7 +1616,12 @@ void MainWindowLayoutTest::compactSplittersKeepDragTargets_data() {
 void MainWindowLayoutTest::compactSplittersKeepDragTargets() {
     QFETCH(QString, name);
     QFETCH(qreal, zoom);
-    struct RestoreZoom { qreal old; ~RestoreZoom() { UiZoom::setFactor(old); } } restore{UiZoom::factor()};
+    struct RestoreZoom {
+        qreal old;
+        ~RestoreZoom() {
+            UiZoom::setFactor(old);
+        }
+    } restore{UiZoom::factor()};
     UiZoom::setFactor(zoom);
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
@@ -1664,8 +1648,8 @@ void MainWindowLayoutTest::compactSplittersKeepDragTargets() {
     const QPoint start = handle->rect().center();
     const QPoint finish = start + (horizontal ? QPoint(40, 0) : QPoint(0, -40));
     QTest::mousePress(handle, Qt::LeftButton, Qt::NoModifier, start);
-    QMouseEvent move(QEvent::MouseMove, QPointF(finish), QPointF(handle->mapToGlobal(finish)),
-                     Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QMouseEvent move(QEvent::MouseMove, QPointF(finish), QPointF(handle->mapToGlobal(finish)), Qt::NoButton,
+                     Qt::LeftButton, Qt::NoModifier);
     QApplication::sendEvent(handle, &move);
     QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, finish);
     QVERIFY2(splitter->sizes().at(0) != before, "The thin splitter must remain draggable");
@@ -1696,13 +1680,11 @@ void MainWindowLayoutTest::agentConversationListUsesResizableSplitter() {
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
 
-    auto* agentButton =
-        window.findChild<QPushButton*>(QStringLiteral("agentNavButton"));
+    auto* agentButton = window.findChild<QPushButton*>(QStringLiteral("agentNavButton"));
     QVERIFY(agentButton != nullptr);
     agentButton->click();
 
-    auto* splitter =
-        window.findChild<QSplitter*>(QStringLiteral("agentContentSplitter"));
+    auto* splitter = window.findChild<QSplitter*>(QStringLiteral("agentContentSplitter"));
     QVERIFY(splitter != nullptr);
     QCOMPARE(splitter->orientation(), Qt::Horizontal);
     QCOMPARE(splitter->count(), 2);
@@ -1715,8 +1697,8 @@ void MainWindowLayoutTest::agentConversationListUsesResizableSplitter() {
     const QPoint start = handle->rect().center();
     const QPoint finish = start + QPoint(60, 0);
     QTest::mousePress(handle, Qt::LeftButton, Qt::NoModifier, start);
-    QMouseEvent move(QEvent::MouseMove, QPointF(finish), QPointF(handle->mapToGlobal(finish)),
-                     Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QMouseEvent move(QEvent::MouseMove, QPointF(finish), QPointF(handle->mapToGlobal(finish)), Qt::NoButton,
+                     Qt::LeftButton, Qt::NoModifier);
     QApplication::sendEvent(handle, &move);
     QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, finish);
     QVERIFY(splitter->sizes().at(0) != before);
@@ -1726,11 +1708,10 @@ void MainWindowLayoutTest::agentSessionSwitchReusesTheExistingPage() {
     ScopedMessageHeaderFont productFonts;
     QTemporaryDir workspace;
     QVERIFY(workspace.isValid());
-    const QString owner = QStringLiteral("switch-fixture-%1")
-                              .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const QString owner = QStringLiteral("switch-fixture-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
     const QString dataRoot = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-    const QString accountHash = QString::fromLatin1(
-        QCryptographicHash::hash(owner.toUtf8(), QCryptographicHash::Sha256).toHex());
+    const QString accountHash =
+        QString::fromLatin1(QCryptographicHash::hash(owner.toUtf8(), QCryptographicHash::Sha256).toHex());
     const QString accountRoot = QDir(dataRoot).filePath(QStringLiteral("Agent/Accounts/%1").arg(accountHash));
     QVERIFY(QDir().mkpath(accountRoot));
     const QStringList ids{QStringLiteral("ses_window_switch_a"), QStringLiteral("ses_window_switch_b"),
@@ -1748,15 +1729,20 @@ void MainWindowLayoutTest::agentSessionSwitchReusesTheExistingPage() {
             store->putSession(session);
             for (int index = 0; index < 40; ++index) {
                 MaiMessage message;
-                message.id = QStringLiteral("msg_%1_%2").arg(ids[sessionIndex])
-                                 .arg(index, 4, 10, QLatin1Char('0')).toStdString();
+                message.id = QStringLiteral("msg_%1_%2")
+                                 .arg(ids[sessionIndex])
+                                 .arg(index, 4, 10, QLatin1Char('0'))
+                                 .toStdString();
                 message.role = index % 2 ? MaiRole::Assistant : MaiRole::User;
                 message.created = message.completed = index + 1;
-                const QString body = message.role == MaiRole::User
-                    ? QStringLiteral("请查看这个本地回归结果 %1").arg(index)
-                    : QStringLiteral("## 已完成检查 %1\n\n").arg(index) +
-                      QStringLiteral("这段长正文用于检查会话切换，包含 **格式化文字** 与 `code`。\n\n").repeated(8) +
-                      QStringLiteral("| 检查项 | 结果 |\n| --- | --- |\n| 消息隔离 | 通过 |\n| 历史内容 | 保留 |\n");
+                const QString body =
+                    message.role == MaiRole::User
+                        ? QStringLiteral("请查看这个本地回归结果 %1").arg(index)
+                        : QStringLiteral("## 已完成检查 %1\n\n").arg(index) +
+                              QStringLiteral("这段长正文用于检查会话切换，包含 **格式化文字** 与 `code`。\n\n")
+                                  .repeated(8) +
+                              QStringLiteral(
+                                  "| 检查项 | 结果 |\n| --- | --- |\n| 消息隔离 | 通过 |\n| 历史内容 | 保留 |\n");
                 message.parts.push_back({"prt_" + message.id, MaiTextPart{body.toStdString()}, index + 1});
                 if (message.role == MaiRole::Assistant)
                     for (int toolIndex = 0; toolIndex < 12; ++toolIndex) {
@@ -1790,8 +1776,8 @@ void MainWindowLayoutTest::agentSessionSwitchReusesTheExistingPage() {
                 auto* item = rows->item(row);
                 if (item->data(Qt::UserRole).toString() != id) continue;
                 rows->scrollToItem(item);
-                QTest::mouseClick(rows->viewport(), Qt::LeftButton, Qt::NoModifier,
-                                  rows->visualItemRect(item).center(), 0);
+                QTest::mouseClick(rows->viewport(), Qt::LeftButton, Qt::NoModifier, rows->visualItemRect(item).center(),
+                                  0);
                 return true;
             }
             return false;
@@ -1812,8 +1798,7 @@ void MainWindowLayoutTest::agentSessionSwitchReusesTheExistingPage() {
         QVERIFY(clickSession(ids[0]));
         const qint64 clickUs = timer.nsecsElapsed() / 1000;
         QCoreApplication::processEvents();
-        qInfo("main_window_switch_fixture click_us=%lld first_paint_us=%lld", clickUs,
-              timer.nsecsElapsed() / 1000);
+        qInfo("main_window_switch_fixture click_us=%lld first_paint_us=%lld", clickUs, timer.nsecsElapsed() / 1000);
         QCOMPARE(panel->sessionId(), ids[0]);
         QVERIFY(original && original->isVisible());
         const QString output = qEnvironmentVariable("MAICHAT_SESSION_SWITCH_CAPTURE_DIR");
@@ -1836,8 +1821,8 @@ void MainWindowLayoutTest::agentAccountsUseDistinctDefaultStorage() {
     const QString dataRoot = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
     QVERIFY(!dataRoot.isEmpty());
     const auto accountRoot = [&dataRoot](const QString& owner) {
-        const QString hash = QString::fromLatin1(
-            QCryptographicHash::hash(owner.toUtf8(), QCryptographicHash::Sha256).toHex());
+        const QString hash =
+            QString::fromLatin1(QCryptographicHash::hash(owner.toUtf8(), QCryptographicHash::Sha256).toHex());
         return QDir(dataRoot).filePath(QStringLiteral("Agent/Accounts/%1").arg(hash));
     };
     const QString rootA = accountRoot(ownerA);
@@ -1883,14 +1868,11 @@ void MainWindowLayoutTest::agentAccountsUseDistinctDefaultStorage() {
 }
 
 void MainWindowLayoutTest::agentSessionDeletionUsesChineseProductDialog() {
-    const QString owner = QStringLiteral("delete-dialog-%1")
-                              .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
-    const QString dataRoot = QStandardPaths::writableLocation(
-        QStandardPaths::AppLocalDataLocation);
-    const QString accountHash = QString::fromLatin1(
-        QCryptographicHash::hash(owner.toUtf8(), QCryptographicHash::Sha256).toHex());
-    const QString accountRoot = QDir(dataRoot).filePath(
-        QStringLiteral("Agent/Accounts/%1").arg(accountHash));
+    const QString owner = QStringLiteral("delete-dialog-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const QString dataRoot = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    const QString accountHash =
+        QString::fromLatin1(QCryptographicHash::hash(owner.toUtf8(), QCryptographicHash::Sha256).toHex());
+    const QString accountRoot = QDir(dataRoot).filePath(QStringLiteral("Agent/Accounts/%1").arg(accountHash));
 
     {
         RemoteIMApplication app(owner, std::make_unique<FakeRemoteIMClient>());
@@ -1898,8 +1880,7 @@ void MainWindowLayoutTest::agentSessionDeletionUsesChineseProductDialog() {
         window.resize(1200, 800);
         window.show();
         QVERIFY(QTest::qWaitForWindowExposed(&window));
-        auto* navigation = window.findChild<QPushButton*>(
-            QStringLiteral("agentNavButton"));
+        auto* navigation = window.findChild<QPushButton*>(QStringLiteral("agentNavButton"));
         auto* panel = window.findChild<AgentChatPanel*>();
         auto* list = window.findChild<AgentSessionList*>();
         auto* controller = window.findChild<AgentController*>();
@@ -1933,33 +1914,28 @@ void MainWindowLayoutTest::agentSessionDeletionUsesChineseProductDialog() {
                 auto* dialog = qobject_cast<AppMessageDialog*>(modal);
                 if (dialog == nullptr) return;
                 state.shown = true;
-                auto* title = dialog->findChild<QLabel*>(
-                    QStringLiteral("appMessageTitle"));
-                auto* body = dialog->findChild<QLabel*>(
-                    QStringLiteral("appMessageBody"));
-                auto* cancel = dialog->findChild<QPushButton*>(
-                    QStringLiteral("appMessageCancel"));
-                auto* remove = dialog->findChild<QPushButton*>(
-                    QStringLiteral("appMessageDanger"));
+                auto* title = dialog->findChild<QLabel*>(QStringLiteral("appMessageTitle"));
+                auto* body = dialog->findChild<QLabel*>(QStringLiteral("appMessageBody"));
+                auto* cancel = dialog->findChild<QPushButton*>(QStringLiteral("appMessageCancel"));
+                auto* remove = dialog->findChild<QPushButton*>(QStringLiteral("appMessageDanger"));
                 state.title = title ? title->text() : QString();
                 state.body = body ? body->text() : QString();
                 state.cancel = cancel ? cancel->text() : QString();
                 state.deleteText = remove ? remove->text() : QString();
                 state.cancelDefault = cancel != nullptr && cancel->isDefault();
                 if (cancel != nullptr && remove != nullptr)
-                    state.buttonGap = remove->geometry().left() -
-                                      cancel->geometry().right() - 1;
-                const QString screenshot = qEnvironmentVariable(
-                    "MAICHAT_DELETE_DIALOG_SCREENSHOT");
-                if (!confirm && !screenshot.isEmpty())
-                    dialog->grab().save(screenshot);
-                if (confirm && remove) remove->click();
-                else if (cancel) cancel->click();
-                else dialog->reject();
+                    state.buttonGap = remove->geometry().left() - cancel->geometry().right() - 1;
+                const QString screenshot = qEnvironmentVariable("MAICHAT_DELETE_DIALOG_SCREENSHOT");
+                if (!confirm && !screenshot.isEmpty()) dialog->grab().save(screenshot);
+                if (confirm && remove)
+                    remove->click();
+                else if (cancel)
+                    cancel->click();
+                else
+                    dialog->reject();
             });
-            return QMetaObject::invokeMethod(
-                list, "deleteSessionRequested", Qt::DirectConnection,
-                Q_ARG(QString, sessionId));
+            return QMetaObject::invokeMethod(list, "deleteSessionRequested", Qt::DirectConnection,
+                                             Q_ARG(QString, sessionId));
         };
 
         QVERIFY(requestDelete(false));
@@ -1982,8 +1958,7 @@ void MainWindowLayoutTest::agentSessionDeletionUsesChineseProductDialog() {
 }
 
 void MainWindowLayoutTest::remoteSessionLifecycleUsesProductDialogsAndOwnerRoute() {
-    const QString owner = QStringLiteral("remote-lifecycle-%1")
-                              .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const QString owner = QStringLiteral("remote-lifecycle-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
     RemoteIMApplication app(owner, std::make_unique<FakeRemoteIMClient>());
     MainWindow window(app);
     window.resize(1200, 800);
@@ -2001,8 +1976,7 @@ void MainWindowLayoutTest::remoteSessionLifecycleUsesProductDialogsAndOwnerRoute
             if (path == QStringLiteral("session-sync/send")) sent.append(body);
             QTimer::singleShot(0, [completion = std::move(completion)] { completion({}, {}); });
         },
-        [&] { return window.activeAgentController(); }, nullptr,
-        QStringLiteral("mac-install"), QStringLiteral("Mac"));
+        [&] { return window.activeAgentController(); }, nullptr, QStringLiteral("mac-install"), QStringLiteral("Mac"));
     window.setSessionSyncCoordinator(&coordinator);
     const QJsonObject device{{QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
                              {QStringLiteral("device_name"), QStringLiteral("iPhone")},
@@ -2012,17 +1986,13 @@ void MainWindowLayoutTest::remoteSessionLifecycleUsesProductDialogsAndOwnerRoute
     coordinator.acceptDevices(QJsonArray{device});
     const QString createScreenshot = qEnvironmentVariable("MAICHAT_REMOTE_CREATE_SCREENSHOT");
     if (!createScreenshot.isEmpty()) QVERIFY(list->grab().save(createScreenshot));
-    QVERIFY(QMetaObject::invokeMethod(list, "remoteCreateRequested", Qt::DirectConnection,
-                                      Q_ARG(QJsonObject, device)));
+    QVERIFY(QMetaObject::invokeMethod(list, "remoteCreateRequested", Qt::DirectConnection, Q_ARG(QJsonObject, device)));
     QVERIFY(QApplication::activeModalWidget() == nullptr);
     QCOMPARE(sent.size(), 1);
-    QCOMPARE(sent.first().value(QStringLiteral("session_id")).toString(),
-             QStringLiteral("session_lifecycle"));
-    QCOMPARE(sent.first().value(QStringLiteral("payload")).toObject()
-                 .value(QStringLiteral("action")).toString(),
+    QCOMPARE(sent.first().value(QStringLiteral("session_id")).toString(), QStringLiteral("session_lifecycle"));
+    QCOMPARE(sent.first().value(QStringLiteral("payload")).toObject().value(QStringLiteral("action")).toString(),
              QStringLiteral("session_create"));
-    QVERIFY(!sent.first().value(QStringLiteral("payload")).toObject()
-                  .contains(QStringLiteral("workspace_path")));
+    QVERIFY(!sent.first().value(QStringLiteral("payload")).toObject().contains(QStringLiteral("workspace_path")));
     QJsonObject remote = device;
     remote.insert(QStringLiteral("id"), QStringLiteral("ses_phone"));
     remote.insert(QStringLiteral("title"), QStringLiteral("手机对话"));
@@ -2035,15 +2005,13 @@ void MainWindowLayoutTest::remoteSessionLifecycleUsesProductDialogsAndOwnerRoute
         auto* remove = dialog->findChild<QPushButton*>(QStringLiteral("appMessageDanger"));
         if (remove) remove->click();
     });
-    QVERIFY(QMetaObject::invokeMethod(list, "remoteDeleteRequested", Qt::DirectConnection,
-                                      Q_ARG(QJsonObject, remote)));
+    QVERIFY(QMetaObject::invokeMethod(list, "remoteDeleteRequested", Qt::DirectConnection, Q_ARG(QJsonObject, remote)));
     QCOMPARE(sent.size(), 2);
-    QCOMPARE(sent.last().value(QStringLiteral("payload")).toObject()
-                 .value(QStringLiteral("action")).toString(),
+    QCOMPARE(sent.last().value(QStringLiteral("payload")).toObject().value(QStringLiteral("action")).toString(),
              QStringLiteral("session_delete"));
-    QCOMPARE(sent.last().value(QStringLiteral("payload")).toObject()
-                 .value(QStringLiteral("target_session_id")).toString(),
-             QStringLiteral("ses_phone"));
+    QCOMPARE(
+        sent.last().value(QStringLiteral("payload")).toObject().value(QStringLiteral("target_session_id")).toString(),
+        QStringLiteral("ses_phone"));
     window.setSessionSyncCoordinator(nullptr);
 }
 
@@ -2209,8 +2177,8 @@ void MainWindowLayoutTest::rendersSentMessageFromTopWithMetadata() {
     QCOMPARE(statusRow, messageLayout->itemAt(1)->widget());
     // 气泡应当是同一行里的兄弟节点。父子关系已被上面的 parentWidget 断言锁死，
     // 再补一条 isAncestorOf 是恒真的废断言，故不写。
-    QVERIFY(statusRow->findChild<QWidget*>(QStringLiteral("messageBubbleOutgoing"),
-                                           Qt::FindDirectChildrenOnly) != nullptr);
+    QVERIFY(statusRow->findChild<QWidget*>(QStringLiteral("messageBubbleOutgoing"), Qt::FindDirectChildrenOnly) !=
+            nullptr);
 }
 
 void MainWindowLayoutTest::rendersRelativeMessageDates() {
@@ -2264,9 +2232,9 @@ void MainWindowLayoutTest::contactsNavigationShowsProfileBeforeChat() {
     app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
     RemoteIMApplication::AccountFriendOperations operations;
     operations.list = [](auto completion) {
-        completion({RemoteIMApplication::AccountFriend{
-            QStringLiteral("m_friend"), QStringLiteral("好友昵称"),
-            QStringLiteral("phone-user")}}, {});
+        completion({RemoteIMApplication::AccountFriend{QStringLiteral("m_friend"), QStringLiteral("好友昵称"),
+                                                       QStringLiteral("phone-user")}},
+                   {});
     };
     app.setAccountFriendOperations(std::move(operations));
 
@@ -2315,10 +2283,14 @@ void MainWindowLayoutTest::composerResizeHandleAlignsWithEditorBorder_data() {
 
 void MainWindowLayoutTest::composerResizeHandleAlignsWithEditorBorder() {
     QFETCH(qreal, zoom);
-    struct RestoreZoom { qreal old; ~RestoreZoom() { UiZoom::setFactor(old); } } restore{UiZoom::factor()};
+    struct RestoreZoom {
+        qreal old;
+        ~RestoreZoom() {
+            UiZoom::setFactor(old);
+        }
+    } restore{UiZoom::factor()};
     UiZoom::setFactor(zoom);
-    RemoteIMApplication app(QStringLiteral("desktop-user"),
-                            std::make_unique<FakeRemoteIMClient>());
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::make_unique<FakeRemoteIMClient>());
     MainWindow window(app);
     window.resize(1400, 900);
     window.show();
@@ -2337,8 +2309,7 @@ void MainWindowLayoutTest::composerResizeHandleAlignsWithEditorBorder() {
 }
 
 void MainWindowLayoutTest::composerResizeHandleBlendsIntoCanvas() {
-    RemoteIMApplication app(QStringLiteral("desktop-user"),
-                            std::make_unique<FakeRemoteIMClient>());
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::make_unique<FakeRemoteIMClient>());
     MainWindow window(app);
     window.resize(1400, 900);
     window.show();
@@ -2350,15 +2321,13 @@ void MainWindowLayoutTest::composerResizeHandleBlendsIntoCanvas() {
     const QImage image = window.grab().toImage();
     const qreal scale = image.devicePixelRatio();
     const QPoint center = handle->mapTo(&window, handle->rect().center());
-    const QColor color = image.pixelColor(qRound(center.x() * scale),
-                                          qRound(center.y() * scale));
+    const QColor color = image.pixelColor(qRound(center.x() * scale), qRound(center.y() * scale));
     QVERIFY2(color.red() >= 250 && color.green() >= 250 && color.blue() >= 250,
              qPrintable(QStringLiteral("Composer divider is visible: %1").arg(color.name())));
 }
 
 void MainWindowLayoutTest::composerResizeCursorClearsAfterPointerLeaves() {
-    RemoteIMApplication app(QStringLiteral("desktop-user"),
-                            std::make_unique<FakeRemoteIMClient>());
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::make_unique<FakeRemoteIMClient>());
     MainWindow window(app);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
@@ -2381,8 +2350,7 @@ void MainWindowLayoutTest::composerResizeCursorClearsAfterPointerLeaves() {
     auto* agentButton = window.findChild<QPushButton*>(QStringLiteral("agentNavButton"));
     QVERIFY(agentButton != nullptr);
     agentButton->click();
-    auto* agentSplitter =
-        window.findChild<QSplitter*>(QStringLiteral("agentMessageComposerSplitter"));
+    auto* agentSplitter = window.findChild<QSplitter*>(QStringLiteral("agentMessageComposerSplitter"));
     QVERIFY(agentSplitter != nullptr);
     QSplitterHandle* agentHandle = agentSplitter->handle(1);
     QVERIFY(agentHandle != nullptr);
@@ -2398,8 +2366,7 @@ void MainWindowLayoutTest::composerResizeKeepsLatestMessageVisible() {
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
     app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
     app.selectPeer(QStringLiteral("phone-user"));
-    for (int index = 0; index < 30; ++index)
-        app.sendText(QStringLiteral("message %1").arg(index));
+    for (int index = 0; index < 30; ++index) app.sendText(QStringLiteral("message %1").arg(index));
 
     MainWindow window(app);
     window.resize(1280, 800);
@@ -2424,38 +2391,37 @@ void MainWindowLayoutTest::composerResizeKeepsLatestMessageVisible() {
     for (int step = 1; step <= 5; ++step) {
         const QPoint global = startGlobal - QPoint(0, step * 24);
         const QPoint local = handle->mapFromGlobal(global);
-        QMouseEvent move(QEvent::MouseMove, QPointF(local), QPointF(global),
-                         Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QMouseEvent move(QEvent::MouseMove, QPointF(local), QPointF(global), Qt::NoButton, Qt::LeftButton,
+                         Qt::NoModifier);
         QApplication::sendEvent(handle, &move);
         QCoreApplication::processEvents();
         if (bar->value() != bar->maximum()) {
             latestVisibleDuringDrag = false;
-            clippedDuringDrag = QStringLiteral("step=%1 scroll=%2/%3")
-                                    .arg(step).arg(bar->value()).arg(bar->maximum());
+            clippedDuringDrag = QStringLiteral("step=%1 scroll=%2/%3").arg(step).arg(bar->value()).arg(bar->maximum());
             break;
         }
     }
     const QPoint finishGlobal = startGlobal - QPoint(0, 120);
-    QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier,
-                        handle->mapFromGlobal(finishGlobal));
+    QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, handle->mapFromGlobal(finishGlobal));
     QCoreApplication::processEvents();
     QVERIFY2(latestVisibleDuringDrag, qPrintable(clippedDuringDrag));
     QVERIFY(scroll->height() < oldHeight);
     QCOMPARE(bar->value(), bar->maximum());
-    const QList<QWidget*> rows =
-        window.findChildren<QWidget*>(QStringLiteral("messageRowOutgoing"));
+    const QList<QWidget*> rows = window.findChildren<QWidget*>(QStringLiteral("messageRowOutgoing"));
     QVERIFY(!rows.isEmpty());
     QWidget* latest = rows.first();
     for (QWidget* row : rows) {
-        if (row->mapTo(scroll->viewport(), QPoint(0, 0)).y() >
-            latest->mapTo(scroll->viewport(), QPoint(0, 0)).y())
+        if (row->mapTo(scroll->viewport(), QPoint(0, 0)).y() > latest->mapTo(scroll->viewport(), QPoint(0, 0)).y())
             latest = row;
     }
     const QRect latestRect(latest->mapTo(scroll->viewport(), QPoint(0, 0)), latest->size());
     QVERIFY2(latestRect.top() < scroll->viewport()->height() && latestRect.bottom() >= 0,
              qPrintable(QStringLiteral("latest row=%1..%2 viewport=%3 scroll=%4/%5")
-                            .arg(latestRect.top()).arg(latestRect.bottom())
-                            .arg(scroll->viewport()->height()).arg(bar->value()).arg(bar->maximum())));
+                            .arg(latestRect.top())
+                            .arg(latestRect.bottom())
+                            .arg(scroll->viewport()->height())
+                            .arg(bar->value())
+                            .arg(bar->maximum())));
 }
 
 // 编辑器控件被会话共用，切换联系人时必须同时切换富文本草稿和引用。
@@ -2641,8 +2607,7 @@ void MainWindowLayoutTest::settingsNavigationShowsAccountWithoutDiagnostics() {
     auto* contentStack = window.findChild<QStackedWidget*>(QStringLiteral("contentStack"));
     auto* accountValue = window.findChild<QLabel*>(QStringLiteral("settingsAccountValue"));
     auto* nicknameValue = window.findChild<QLabel*>(QStringLiteral("settingsNicknameValue"));
-    auto* nicknameButton = window.findChild<QPushButton*>(
-        QStringLiteral("settingsNicknameButton"));
+    auto* nicknameButton = window.findChild<QPushButton*>(QStringLiteral("settingsNicknameButton"));
     QVERIFY(settingsPage != nullptr);
     QVERIFY(contentStack != nullptr);
     QCOMPARE(contentStack->currentWidget(), settingsPage);
@@ -2658,8 +2623,8 @@ void MainWindowLayoutTest::settingsNavigationShowsAccountWithoutDiagnostics() {
         QCoreApplication::processEvents();
         QVERIFY(settingsPage->grab().save(QString::fromUtf8(capture)));
     }
-    for (const char* name : {"settingsConnectionValue", "settingsSdkAppIdValue",
-                             "settingsSignatureValue", "settingsAgentModelValue"}) {
+    for (const char* name :
+         {"settingsConnectionValue", "settingsSdkAppIdValue", "settingsSignatureValue", "settingsAgentModelValue"}) {
         QVERIFY(settingsPage->findChild<QLabel*>(QString::fromLatin1(name)) == nullptr);
     }
     // 设置页的值应是只读标签而非输入框；导航栏的搜索框是唯一合法的 QLineEdit。
@@ -2682,7 +2647,7 @@ void MainWindowLayoutTest::settingsAvatarUpdatesWhenSelfProfileArrives() {
                 socket->readAll();
                 ++requests;
                 socket->write("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: " +
-                    QByteArray::number(png.size()) + "\r\nConnection: close\r\n\r\n" + png);
+                              QByteArray::number(png.size()) + "\r\nConnection: close\r\n\r\n" + png);
                 socket->disconnectFromHost();
             });
             connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
@@ -2702,14 +2667,14 @@ void MainWindowLayoutTest::settingsAvatarUpdatesWhenSelfProfileArrives() {
     QVERIFY(avatar->property("avatarRequestsEnabled").toBool());
     QCOMPARE(avatar->accessibleName(), QStringLiteral("真实头像"));
     QTRY_VERIFY_WITH_TIMEOUT(requests > 0, 3000);
-    QTRY_VERIFY_WITH_TIMEOUT([&] {
-        const QColor center = avatar->grab().toImage().pixelColor(
-            avatar->width() / 2, avatar->height() / 2);
-        return center.red() > 200 && center.green() < 80 && center.blue() < 80;
-    }(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        [&] {
+            const QColor center = avatar->grab().toImage().pixelColor(avatar->width() / 2, avatar->height() / 2);
+            return center.red() > 200 && center.green() < 80 && center.blue() < 80;
+        }(),
+        3000);
     const QByteArray capture = qgetenv("MAICHAT_AVATAR_CAPTURE");
-    if (!capture.isEmpty())
-        QVERIFY(window.grab().save(QString::fromUtf8(capture)));
+    if (!capture.isEmpty()) QVERIFY(window.grab().save(QString::fromUtf8(capture)));
 }
 
 void MainWindowLayoutTest::settingsAvatarSurvivesNetworkLossAfterRestart() {
@@ -2725,13 +2690,12 @@ void MainWindowLayoutTest::settingsAvatarSurvivesNetworkLossAfterRestart() {
     settings->click();
 
     const auto isRed = [avatar] {
-        const QColor center = avatar->grab().toImage().pixelColor(
-            avatar->width() / 2, avatar->height() / 2);
+        const QColor center = avatar->grab().toImage().pixelColor(avatar->width() / 2, avatar->height() / 2);
         return center.red() > 200 && center.green() < 80 && center.blue() < 80;
     };
     if (!childUrl.isEmpty()) {
-        fake->selfProfileReceived(QStringLiteral("desktop-cache-user"),
-                                  QStringLiteral("Cached"), QString::fromUtf8(childUrl));
+        fake->selfProfileReceived(QStringLiteral("desktop-cache-user"), QStringLiteral("Cached"),
+                                  QString::fromUtf8(childUrl));
         QTRY_VERIFY_WITH_TIMEOUT(isRed(), 3000);
         return;
     }
@@ -2749,17 +2713,18 @@ void MainWindowLayoutTest::settingsAvatarSurvivesNetworkLossAfterRestart() {
             connect(socket, &QTcpSocket::readyRead, socket, [&, socket] {
                 socket->readAll();
                 socket->write("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: " +
-                    QByteArray::number(png.size()) + "\r\nConnection: close\r\n\r\n" + png);
+                              QByteArray::number(png.size()) + "\r\nConnection: close\r\n\r\n" + png);
                 socket->disconnectFromHost();
             });
             connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
         }
     });
     const QString url = QStringLiteral("http://127.0.0.1:%1/cache-avatar.png").arg(server.serverPort());
-    const QString cachePath = QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation))
-        .filePath(QStringLiteral("avatars/") + QString::fromLatin1(
-            QCryptographicHash::hash(url.toUtf8(), QCryptographicHash::Sha256).toHex()) +
-            QStringLiteral(".png"));
+    const QString cachePath =
+        QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation))
+            .filePath(QStringLiteral("avatars/") +
+                      QString::fromLatin1(QCryptographicHash::hash(url.toUtf8(), QCryptographicHash::Sha256).toHex()) +
+                      QStringLiteral(".png"));
     QFile::remove(cachePath);
     fake->selfProfileReceived(QStringLiteral("desktop-cache-user"), QStringLiteral("Cached"), url);
     QTRY_VERIFY_WITH_TIMEOUT(isRed(), 3000);
@@ -2793,8 +2758,8 @@ void MainWindowLayoutTest::settingsAvatarLoadsRealProfileUrl() {
     settings->click();
     const QImage fallback = avatar->grab().toImage();
     const QImage navFallback = navAvatar->grab().toImage();
-    fake->selfProfileReceived(QStringLiteral("desktop-live-avatar-user"),
-                              QStringLiteral("Real profile"), QString::fromUtf8(url));
+    fake->selfProfileReceived(QStringLiteral("desktop-live-avatar-user"), QStringLiteral("Real profile"),
+                              QString::fromUtf8(url));
     QTRY_VERIFY_WITH_TIMEOUT(avatar->grab().toImage() != fallback, 20000);
     QTRY_VERIFY_WITH_TIMEOUT(navAvatar->grab().toImage() != navFallback, 20000);
     const QByteArray capture = qgetenv("MAICHAT_AVATAR_CAPTURE");
@@ -2816,8 +2781,7 @@ void MainWindowLayoutTest::settingsLogoutRequiresConfirmationAndCallsHandler() {
     bool sawCancel = false;
     QTimer::singleShot(0, &window, [&] {
         auto* dialog = window.findChild<QDialog*>(QStringLiteral("appMessageDialog"));
-        auto* cancel = dialog ? dialog->findChild<QPushButton*>(
-            QStringLiteral("appMessageCancel")) : nullptr;
+        auto* cancel = dialog ? dialog->findChild<QPushButton*>(QStringLiteral("appMessageCancel")) : nullptr;
         sawCancel = cancel != nullptr;
         if (cancel) cancel->click();
     });
@@ -2828,8 +2792,7 @@ void MainWindowLayoutTest::settingsLogoutRequiresConfirmationAndCallsHandler() {
     bool sawConfirm = false;
     QTimer::singleShot(0, &window, [&] {
         auto* dialog = window.findChild<QDialog*>(QStringLiteral("appMessageDialog"));
-        auto* confirm = dialog ? dialog->findChild<QPushButton*>(
-            QStringLiteral("appMessageDanger")) : nullptr;
+        auto* confirm = dialog ? dialog->findChild<QPushButton*>(QStringLiteral("appMessageDanger")) : nullptr;
         sawConfirm = confirm != nullptr;
         if (confirm) confirm->click();
     });
@@ -2866,9 +2829,8 @@ void MainWindowLayoutTest::agentReasoningEffortKeepsConversation() {
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
     MainWindow window(app);
-    const QHash<QString, QString> keys = {
-        {QStringLiteral("glm"), QString(40, QLatin1Char('G'))},
-        {QStringLiteral("deepseek"), QString(40, QLatin1Char('D'))}};
+    const QHash<QString, QString> keys = {{QStringLiteral("glm"), QString(40, QLatin1Char('G'))},
+                                          {QStringLiteral("deepseek"), QString(40, QLatin1Char('D'))}};
     window.setAccountModelKeys(keys);
     int refreshed = 0;
     window.setModelKeyRefreshHandler([&] {
@@ -2896,12 +2858,11 @@ void MainWindowLayoutTest::agentReasoningEffortKeepsConversation() {
     auto* section = panel->findChild<QPushButton*>(QStringLiteral("agentEffortSection"));
     QVERIFY(section);
     QTest::mouseClick(section, Qt::LeftButton);
-    auto* option = panel->findChild<QPushButton*>(
-        QStringLiteral("agentEffortOption-max"));
+    auto* option = panel->findChild<QPushButton*>(QStringLiteral("agentEffortOption-max"));
     QVERIFY(option);
     QTest::mouseClick(option, Qt::LeftButton);
-    QTRY_COMPARE_WITH_TIMEOUT(settings.value(QStringLiteral("agent/reasoningEffort")).toString(),
-                              QStringLiteral("max"), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(settings.value(QStringLiteral("agent/reasoningEffort")).toString(), QStringLiteral("max"),
+                              5000);
     QCOMPARE(refreshed, 0);
     QCOMPARE(window.findChild<AgentChatPanel*>(), panel);
     QCOMPARE(panel->sessionId(), session);
@@ -2928,9 +2889,8 @@ void MainWindowLayoutTest::agentReasoningEffortBeforeFirstSessionKeepsDeepSeek()
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
     MainWindow window(app);
-    const QHash<QString, QString> keys = {
-        {QStringLiteral("glm"), QString(40, QLatin1Char('G'))},
-        {QStringLiteral("deepseek"), QString(40, QLatin1Char('D'))}};
+    const QHash<QString, QString> keys = {{QStringLiteral("glm"), QString(40, QLatin1Char('G'))},
+                                          {QStringLiteral("deepseek"), QString(40, QLatin1Char('D'))}};
     window.setAccountModelKeys(keys);
     window.setModelKeyRefreshHandler([&] { window.setAccountModelKeys(keys); });
     window.show();
@@ -2938,19 +2898,14 @@ void MainWindowLayoutTest::agentReasoningEffortBeforeFirstSessionKeepsDeepSeek()
     auto* panel = window.findChild<AgentChatPanel*>();
     QVERIFY(panel);
     QVERIFY(panel->sessionId().isEmpty());
-    QTest::mouseClick(panel->findChild<QPushButton*>(QStringLiteral("agentMoreActions")),
-                      Qt::LeftButton);
-    QTest::mouseClick(panel->findChild<QPushButton*>(QStringLiteral("agentEffortSection")),
-                      Qt::LeftButton);
-    QTest::mouseClick(panel->findChild<QPushButton*>(
-        QStringLiteral("agentEffortOption-low")), Qt::LeftButton);
-    QCOMPARE(settings.value(QStringLiteral("agent/reasoningEffort")).toString(),
-             QStringLiteral("low"));
+    QTest::mouseClick(panel->findChild<QPushButton*>(QStringLiteral("agentMoreActions")), Qt::LeftButton);
+    QTest::mouseClick(panel->findChild<QPushButton*>(QStringLiteral("agentEffortSection")), Qt::LeftButton);
+    QTest::mouseClick(panel->findChild<QPushButton*>(QStringLiteral("agentEffortOption-low")), Qt::LeftButton);
+    QCOMPARE(settings.value(QStringLiteral("agent/reasoningEffort")).toString(), QStringLiteral("low"));
     QCOMPARE(panel->sessionId(), QString());
     panel->openSession();
     MaiSession session;
-    QVERIFY(window.findChild<AgentController*>()->agent().getSession(
-        panel->sessionId().toStdString(), session));
+    QVERIFY(window.findChild<AgentController*>()->agent().getSession(panel->sessionId().toStdString(), session));
     QCOMPARE(QString::fromStdString(session.model), QStringLiteral("deepseek-flash"));
     settings.clear();
     QCoreApplication::setOrganizationName(oldOrganization);
@@ -2968,9 +2923,8 @@ void MainWindowLayoutTest::agentAccountKeysUpdateModelWithoutSavingSecrets() {
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
     MainWindow window(app);
 
-    const QHash<QString, QString> accountKeys = {
-        {QStringLiteral("glm"), QString(40, QLatin1Char('G'))},
-        {QStringLiteral("deepseek"), QString(40, QLatin1Char('D'))}};
+    const QHash<QString, QString> accountKeys = {{QStringLiteral("glm"), QString(40, QLatin1Char('G'))},
+                                                 {QStringLiteral("deepseek"), QString(40, QLatin1Char('D'))}};
     window.setAccountModelKeys(accountKeys);
     auto* chip = window.findChild<QPushButton*>(QStringLiteral("agentModelChip"));
     QVERIFY(chip != nullptr);
@@ -3007,8 +2961,7 @@ void MainWindowLayoutTest::agentDeepSeekKeyAloneConfiguresMainModel() {
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
     MainWindow window(app);
-    window.setAccountModelKeys({{QStringLiteral("deepseek"),
-                             QString(40, QLatin1Char('D'))}});
+    window.setAccountModelKeys({{QStringLiteral("deepseek"), QString(40, QLatin1Char('D'))}});
     auto* chip = window.findChild<QPushButton*>(QStringLiteral("agentModelChip"));
     QVERIFY(chip);
     QCOMPARE(chip->text(), QStringLiteral("deepseek-flash"));
@@ -3024,8 +2977,7 @@ void MainWindowLayoutTest::agentDeepSeekKeyAloneConfiguresMainModel() {
     auto* section = panel->findChild<QPushButton*>(QStringLiteral("agentEffortSection"));
     QVERIFY(section);
     QTest::mouseClick(section, Qt::LeftButton);
-    auto* option = panel->findChild<QPushButton*>(
-        QStringLiteral("agentEffortOption-max"));
+    auto* option = panel->findChild<QPushButton*>(QStringLiteral("agentEffortOption-max"));
     QVERIFY(option);
     QTest::mouseClick(option, Qt::LeftButton);
     QCOMPARE(chip->text(), QStringLiteral("deepseek-flash"));
@@ -3033,8 +2985,7 @@ void MainWindowLayoutTest::agentDeepSeekKeyAloneConfiguresMainModel() {
     QCOMPARE(window.findChild<AgentChatPanel*>(), panel);
     QVERIFY(window.findChild<QDialog*>(QStringLiteral("agentModelDialog")) == nullptr);
     settings.sync();
-    QCOMPARE(settings.value(QStringLiteral("agent/reasoningEffort")).toString(),
-             QStringLiteral("max"));
+    QCOMPARE(settings.value(QStringLiteral("agent/reasoningEffort")).toString(), QStringLiteral("max"));
     settings.clear();
     QCoreApplication::setOrganizationName(originalOrganization);
     QCoreApplication::setApplicationName(originalApplication);
@@ -3089,12 +3040,11 @@ void MainWindowLayoutTest::leftNavigationRailIsResizableAndWider() {
 
     // 一列图标的尺寸必须一致：混用尺寸时肉眼看到的就是「有的大有的小」，
     // 而每个按钮单独看都正常，所以要横向比。
-    const QList<QPushButton*> navButtons{
-        window.findChild<QPushButton*>(QStringLiteral("messagesNavButton")),
-        window.findChild<QPushButton*>(QStringLiteral("cloudNavButton")),
-        window.findChild<QPushButton*>(QStringLiteral("agentNavButton")),
-        contactsNavButton,
-        window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"))};
+    const QList<QPushButton*> navButtons{window.findChild<QPushButton*>(QStringLiteral("messagesNavButton")),
+                                         window.findChild<QPushButton*>(QStringLiteral("cloudNavButton")),
+                                         window.findChild<QPushButton*>(QStringLiteral("agentNavButton")),
+                                         contactsNavButton,
+                                         window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"))};
     for (QPushButton* button : navButtons) {
         QVERIFY(button != nullptr);
         QCOMPARE(button->iconSize(), navButtons.first()->iconSize());
@@ -3107,8 +3057,7 @@ void MainWindowLayoutTest::leftNavigationRailIsResizableAndWider() {
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     for (QPushButton* button : navButtons) {
         QVERIFY2(button->iconSize().width() >= 24, "导航栏图标应当比会话栏的「+」大一档");
-        QVERIFY2(button->iconSize().width() + 8 <= button->width(),
-                 "图标放大后必须仍装得进按钮，否则会被裁掉");
+        QVERIFY2(button->iconSize().width() + 8 <= button->width(), "图标放大后必须仍装得进按钮，否则会被裁掉");
         QVERIFY2(button->width() <= navRail->width(), "按钮不能宽过导航栏本身");
     }
 }
@@ -3131,14 +3080,11 @@ void MainWindowLayoutTest::cloudDriveNavigationUsesMainPageInRequestedOrder() {
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
 
-    const QStringList names{QStringLiteral("messagesNavButton"),
-                            QStringLiteral("cloudNavButton"),
-                            QStringLiteral("agentNavButton"),
-                            QStringLiteral("contactsNavButton"),
+    const QStringList names{QStringLiteral("messagesNavButton"), QStringLiteral("cloudNavButton"),
+                            QStringLiteral("agentNavButton"), QStringLiteral("contactsNavButton"),
                             QStringLiteral("settingsNavButton")};
-    const QStringList labels{QStringLiteral("消息"), QStringLiteral("云盘"),
-                             QStringLiteral("创作中心"), QStringLiteral("好友列表"),
-                             QStringLiteral("我的")};
+    const QStringList labels{QStringLiteral("消息"), QStringLiteral("云盘"), QStringLiteral("创作中心"),
+                             QStringLiteral("好友列表"), QStringLiteral("我的")};
     int previousTop = -1;
     for (int index = 0; index < names.size(); ++index) {
         auto* button = window.findChild<QPushButton*>(names.at(index));
@@ -3153,8 +3099,7 @@ void MainWindowLayoutTest::cloudDriveNavigationUsesMainPageInRequestedOrder() {
     QVERIFY(window.findChild<QPushButton*>(QStringLiteral("remoteDesktopButton")) != nullptr);
     QVERIFY(window.findChild<QPushButton*>(QStringLiteral("remoteViewerReturnButton")) != nullptr);
     const QByteArray messagesCapture = qgetenv("MAICHAT_CAPTURE_MESSAGES_NAV");
-    if (!messagesCapture.isEmpty())
-        QVERIFY(window.grab().save(QString::fromUtf8(messagesCapture)));
+    if (!messagesCapture.isEmpty()) QVERIFY(window.grab().save(QString::fromUtf8(messagesCapture)));
 
     auto* cloudButton = window.findChild<QPushButton*>(QStringLiteral("cloudNavButton"));
     cloudButton->click();
@@ -3191,11 +3136,8 @@ void MainWindowLayoutTest::conversationListsUseDelegateItemsForSmoothScrolling()
     for (int index = 0; index < 80; ++index) {
         app.addContact(QStringLiteral("phone-user-%1").arg(index), QStringLiteral("iPhone %1").arg(index));
     }
-    app.chatState().upsertContact(RemoteIMContact{
-        QStringLiteral("phone-user-0"),
-        QStringLiteral("iPhone 0"),
-        QStringLiteral("https://example.com/iphone.png")
-    });
+    app.chatState().upsertContact(RemoteIMContact{QStringLiteral("phone-user-0"), QStringLiteral("iPhone 0"),
+                                                  QStringLiteral("https://example.com/iphone.png")});
 
     MainWindow window(app);
     auto* conversationList = window.findChild<QListWidget*>(QStringLiteral("conversationList"));
@@ -3231,8 +3173,9 @@ void MainWindowLayoutTest::rendersMarkdownMessageContent() {
     RemoteIMMessage restoredMessage;
     restoredMessage.fromUserId = QStringLiteral("phone-user");
     restoredMessage.toUserId = QStringLiteral("desktop-user");
-    restoredMessage.text = hiddenPrefix
-        + QStringLiteral("# Win/Mac 每周 Crash 详细报表 `code`\n\n**重点**\n\n- 第一条\n- [链接](https://example.com)");
+    restoredMessage.text =
+        hiddenPrefix +
+        QStringLiteral("# Win/Mac 每周 Crash 详细报表 `code`\n\n**重点**\n\n- 第一条\n- [链接](https://example.com)");
     restoredMessage.direction = RemoteIMMessageDirection::Incoming;
     app.chatState().appendMessageForRestore(restoredMessage);
 
@@ -3338,8 +3281,7 @@ void MainWindowLayoutTest::markdownBubbleHasCompactBottomSpacing() {
     // 原来那条路要靠压 lastBlock 的 bottomMargin 才做得到，自绘这边是
     // 排版的结果直接当高度——这条断言卡的是「有人又在外面加余量」。
     QCOMPARE(view->height(), view->heightForWidth(view->width()));
-    const int bottomInset = bubble->height()
-        - (view->mapTo(bubble, QPoint()).y() + view->height());
+    const int bottomInset = bubble->height() - (view->mapTo(bubble, QPoint()).y() + view->height());
     QVERIFY2(bottomInset >= 0 && bottomInset <= UiZoom::s(8) + 1,
              qPrintable(QStringLiteral("bubble bottom inset=%1").arg(bottomInset)));
     QVERIFY(view->height() >= view->contentHeight());
@@ -3363,10 +3305,7 @@ void MainWindowLayoutTest::rendersApprovalButtonsAndSendsStructuredDecision() {
     request.hasApprovalRequest = true;
     request.approvalRequest = RemoteIMApprovalRequest{
         QStringLiteral("approval-ui-1"),
-        {RemoteIMApprovalAction::ApproveOnce,
-         RemoteIMApprovalAction::ApprovePrefix,
-         RemoteIMApprovalAction::Reject}
-    };
+        {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::ApprovePrefix, RemoteIMApprovalAction::Reject}};
     app.chatState().appendMessageForRestore(request);
 
     MainWindow window(app);
@@ -3374,8 +3313,7 @@ void MainWindowLayoutTest::rendersApprovalButtonsAndSendsStructuredDecision() {
     QCoreApplication::processEvents();
 
     QVERIFY(window.findChild<QPushButton*>(QStringLiteral("approvalApproveOnceButton")) != nullptr);
-    auto* prefixButton =
-        window.findChild<QPushButton*>(QStringLiteral("approvalApprovePrefixButton"));
+    auto* prefixButton = window.findChild<QPushButton*>(QStringLiteral("approvalApprovePrefixButton"));
     QVERIFY(prefixButton != nullptr);
     QVERIFY(window.findChild<QPushButton*>(QStringLiteral("approvalRejectButton")) != nullptr);
 
@@ -3419,8 +3357,7 @@ void MainWindowLayoutTest::rendersApprovalButtonsAndSendsStructuredDecision() {
     app.selectPeer(QStringLiteral("multi-ai-code"));
     QCoreApplication::processEvents();
     QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
-    QVERIFY(window.findChild<QPushButton*>(
-                QStringLiteral("approvalApproveOnceButton")) == nullptr);
+    QVERIFY(window.findChild<QPushButton*>(QStringLiteral("approvalApproveOnceButton")) == nullptr);
     QVERIFY(window.findChild<QLabel*>(QStringLiteral("approvalSentLabel")) != nullptr);
 }
 
@@ -3431,10 +3368,7 @@ void MainWindowLayoutTest::restoresSubmittedApprovalStateFromDatabase() {
     {
         LocalMessageDatabase database(databasePath);
         QVERIFY(database.isOpen());
-        database.upsertContact(RemoteIMContact{
-            QStringLiteral("multi-ai-code"),
-            QStringLiteral("Multi-AI Code")
-        });
+        database.upsertContact(RemoteIMContact{QStringLiteral("multi-ai-code"), QStringLiteral("Multi-AI Code")});
 
         RemoteIMMessage request;
         request.id = QStringLiteral("approval-restart-request");
@@ -3446,10 +3380,9 @@ void MainWindowLayoutTest::restoresSubmittedApprovalStateFromDatabase() {
         request.origin = RemoteIMMessageOrigin::Machine;
         request.createdAtMillis = 1700000000100LL;
         request.hasApprovalRequest = true;
-        request.approvalRequest = RemoteIMApprovalRequest{
-            QStringLiteral("approval-restart-1"),
-            {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::Reject}
-        };
+        request.approvalRequest =
+            RemoteIMApprovalRequest{QStringLiteral("approval-restart-1"),
+                                    {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::Reject}};
         QVERIFY(database.insertMessageIfAbsent(request, QStringLiteral("multi-ai-code")));
 
         RemoteIMMessage decision;
@@ -3462,28 +3395,22 @@ void MainWindowLayoutTest::restoresSubmittedApprovalStateFromDatabase() {
         decision.origin = RemoteIMMessageOrigin::Human;
         decision.createdAtMillis = 1700000000200LL;
         decision.hasApprovalDecision = true;
-        decision.approvalDecision = RemoteIMApprovalDecision{
-            QStringLiteral("approval-restart-1"),
-            RemoteIMApprovalAction::ApproveOnce
-        };
+        decision.approvalDecision =
+            RemoteIMApprovalDecision{QStringLiteral("approval-restart-1"), RemoteIMApprovalAction::ApproveOnce};
         QVERIFY(database.insertMessageIfAbsent(decision, QStringLiteral("multi-ai-code")));
     }
 
     auto client = std::make_unique<FakeRemoteIMClient>();
     auto database = std::make_unique<LocalMessageDatabase>(databasePath);
     QVERIFY(database->isOpen());
-    RemoteIMApplication app(
-        QStringLiteral("desktop-user"),
-        std::move(client),
-        std::move(database));
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client), std::move(database));
     app.selectPeer(QStringLiteral("multi-ai-code"));
 
     MainWindow window(app);
     window.show();
     QCoreApplication::processEvents();
 
-    QVERIFY(window.findChild<QPushButton*>(
-                QStringLiteral("approvalApproveOnceButton")) == nullptr);
+    QVERIFY(window.findChild<QPushButton*>(QStringLiteral("approvalApproveOnceButton")) == nullptr);
     auto* sentLabel = window.findChild<QLabel*>(QStringLiteral("approvalSentLabel"));
     QVERIFY(sentLabel != nullptr);
     QVERIFY(sentLabel->text().contains(QStringLiteral("已发送")));
@@ -3504,10 +3431,9 @@ void MainWindowLayoutTest::authoritativeApprovalResolutionOverridesLateSentDecis
     request.status = RemoteIMMessageStatus::Received;
     request.origin = RemoteIMMessageOrigin::Machine;
     request.hasApprovalRequest = true;
-    request.approvalRequest = RemoteIMApprovalRequest{
-        QStringLiteral("approval-authoritative-1"),
-        {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::Reject}
-    };
+    request.approvalRequest =
+        RemoteIMApprovalRequest{QStringLiteral("approval-authoritative-1"),
+                                {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::Reject}};
     app.chatState().appendMessageForRestore(request);
 
     RemoteIMMessage resolution;
@@ -3519,10 +3445,8 @@ void MainWindowLayoutTest::authoritativeApprovalResolutionOverridesLateSentDecis
     resolution.status = RemoteIMMessageStatus::Received;
     resolution.origin = RemoteIMMessageOrigin::Machine;
     resolution.hasApprovalDecision = true;
-    resolution.approvalDecision = RemoteIMApprovalDecision{
-        QStringLiteral("approval-authoritative-1"),
-        RemoteIMApprovalAction::AutoDeclined
-    };
+    resolution.approvalDecision =
+        RemoteIMApprovalDecision{QStringLiteral("approval-authoritative-1"), RemoteIMApprovalAction::AutoDeclined};
     app.chatState().appendMessageForRestore(resolution);
 
     RemoteIMMessage lateDecision;
@@ -3534,18 +3458,15 @@ void MainWindowLayoutTest::authoritativeApprovalResolutionOverridesLateSentDecis
     lateDecision.status = RemoteIMMessageStatus::Sent;
     lateDecision.origin = RemoteIMMessageOrigin::Human;
     lateDecision.hasApprovalDecision = true;
-    lateDecision.approvalDecision = RemoteIMApprovalDecision{
-        QStringLiteral("approval-authoritative-1"),
-        RemoteIMApprovalAction::ApproveOnce
-    };
+    lateDecision.approvalDecision =
+        RemoteIMApprovalDecision{QStringLiteral("approval-authoritative-1"), RemoteIMApprovalAction::ApproveOnce};
     app.chatState().appendMessageForRestore(lateDecision);
 
     MainWindow window(app);
     window.show();
     QCoreApplication::processEvents();
 
-    QVERIFY(window.findChild<QPushButton*>(
-                QStringLiteral("approvalApproveOnceButton")) == nullptr);
+    QVERIFY(window.findChild<QPushButton*>(QStringLiteral("approvalApproveOnceButton")) == nullptr);
     auto* resolvedLabel = window.findChild<QLabel*>(QStringLiteral("approvalSentLabel"));
     QVERIFY(resolvedLabel != nullptr);
     QVERIFY(resolvedLabel->text().contains(QStringLiteral("自动拒绝")));
@@ -3590,8 +3511,7 @@ void MainWindowLayoutTest::addContactButtonRemainsVisibleWithoutSearch() {
     QVERIFY(navRail != nullptr);
     // 去掉手动搜索后，添加联系人入口仍应保留在会话栏。
     QCOMPARE(addButtons.size(), 1);
-    QVERIFY2(addButtons.first()->parentWidget() != navRail,
-             "加号已从导航栏移出，不该还挂在导航栏上");
+    QVERIFY2(addButtons.first()->parentWidget() != navRail, "加号已从导航栏移出，不该还挂在导航栏上");
 
     auto* conversations = window.findChild<QListWidget*>(QStringLiteral("conversationList"));
     auto* search = window.findChild<QLineEdit*>(QStringLiteral("globalSearchBox"));
@@ -3642,14 +3562,16 @@ void MainWindowLayoutTest::conversationAddMenuKeepsActionsAndAnchorsToButton() {
     bool accepted = false;
     RemoteIMApplication::AccountFriendOperations operations;
     operations.list = [](auto completion) {
-        completion({RemoteIMApplication::AccountFriend{QStringLiteral("m_friend"),
-                    QStringLiteral("iPhone"), QStringLiteral("phone-user")}}, {});
+        completion({RemoteIMApplication::AccountFriend{QStringLiteral("m_friend"), QStringLiteral("iPhone"),
+                                                       QStringLiteral("phone-user")}},
+                   {});
     };
     operations.requests = [&requestLoads](auto completion) {
         ++requestLoads;
-        completion({RemoteIMApplication::AccountFriendRequest{QStringLiteral("request-id"),
-                    QStringLiteral("m_pending"), QStringLiteral("待处理好友"),
-                    QStringLiteral("pending-user")}}, {});
+        completion(
+            {RemoteIMApplication::AccountFriendRequest{QStringLiteral("request-id"), QStringLiteral("m_pending"),
+                                                       QStringLiteral("待处理好友"), QStringLiteral("pending-user")}},
+            {});
     };
     operations.decide = [&decidedId, &accepted](const QString& id, bool allow, auto completion) {
         decidedId = id;
@@ -3807,8 +3729,7 @@ void MainWindowLayoutTest::sectionTitleFollowsSelectedNavigation() {
     auto* search = window.findChild<QLineEdit*>(QStringLiteral("globalSearchBox"));
     QVERIFY2(search != nullptr && search->isHidden(), "会话搜索入口应隐藏");
     auto* contactsSearch = window.findChild<QLineEdit*>(QStringLiteral("contactsSearchBox"));
-    QVERIFY2(contactsSearch != nullptr && contactsSearch->isHidden(),
-             "通讯录搜索入口应隐藏");
+    QVERIFY2(contactsSearch != nullptr && contactsSearch->isHidden(), "通讯录搜索入口应隐藏");
     QVERIFY(contactsNavButton != nullptr);
     QVERIFY(contentStack != nullptr);
     QVERIFY(contactsPage != nullptr);
@@ -3820,7 +3741,8 @@ void MainWindowLayoutTest::sectionTitleFollowsSelectedNavigation() {
     QCOMPARE(contactsList->count(), 1);
     QVERIFY(contactsList->item(0)->data(Qt::UserRole + 2).toString().isEmpty());
     QVERIFY(contactsList->item(0)->data(Qt::UserRole + 3).toString().isEmpty());
-    QVERIFY(conversationList->item(0)->data(Qt::UserRole + 2).toString().contains(QStringLiteral("通讯录里不应该显示")));
+    QVERIFY(
+        conversationList->item(0)->data(Qt::UserRole + 2).toString().contains(QStringLiteral("通讯录里不应该显示")));
 }
 
 // 通讯录页的搜索框必须搜联系人（而不是搜消息），且要和消息搜索一样容错：
@@ -3926,11 +3848,11 @@ void MainWindowLayoutTest::receivedMessagesKeepTheSameLeftEdge() {
     QVERIFY(window.findChild<QLabel*>(QStringLiteral("messageAvatarIncoming")) == nullptr);
     auto* view = window.findChild<MarkdownLabel*>(QStringLiteral("messageMarkdownView"));
     auto* row = window.findChild<QWidget*>(QStringLiteral("messageRowIncoming"));
-    QVERIFY(row); QVERIFY(view);
+    QVERIFY(row);
+    QVERIFY(view);
     QTRY_COMPARE(view->mapTo(row, QPoint()).x(), 0);
     QTRY_VERIFY(view->mapTo(row, QPoint()).y() <= UiZoom::s(8));
     QTRY_VERIFY(view->width() >= row->contentsRect().width() - UiZoom::s(14) - 2);
-
 }
 
 void MainWindowLayoutTest::wideChatUsesWiderMessageBubbles() {
@@ -3972,16 +3894,16 @@ void MainWindowLayoutTest::wideChatUsesWiderMessageBubbles() {
     auto* outgoingView = outgoingRow->findChild<MarkdownLabel*>(QStringLiteral("messageMarkdownView"));
     QVERIFY(outgoingView);
     QVERIFY(outgoingView->plainText().endsWith(outgoingView->property("messageTimestamp").toString()));
-
 }
 
 void MainWindowLayoutTest::restoredLongMessagesExpandAfterWindowIsShown() {
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
     app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
-    app.chatState().receiveText(QStringLiteral("phone-user"),
-                                QStringLiteral("这是一段在窗口显示前就已经存在的历史长消息，用来模拟登录后拉取到的 AICLI 输出。"
-                                               "窗口完成布局后，这类历史消息也应该使用宽屏消息区的可用宽度，不能继续保持窄气泡。"));
+    app.chatState().receiveText(
+        QStringLiteral("phone-user"),
+        QStringLiteral("这是一段在窗口显示前就已经存在的历史长消息，用来模拟登录后拉取到的 AICLI 输出。"
+                       "窗口完成布局后，这类历史消息也应该使用宽屏消息区的可用宽度，不能继续保持窄气泡。"));
 
     MainWindow window(app);
     window.resize(1680, 900);
@@ -4131,8 +4053,7 @@ void MainWindowLayoutTest::navigationIconsDoNotUsePrivateFontGlyphProperties() {
 
     MainWindow window(app);
 
-    for (const QString& objectName : {QStringLiteral("messagesNavButton"),
-                                      QStringLiteral("contactsNavButton"),
+    for (const QString& objectName : {QStringLiteral("messagesNavButton"), QStringLiteral("contactsNavButton"),
                                       QStringLiteral("settingsNavButton")}) {
         auto* button = window.findChild<QPushButton*>(objectName);
         QVERIFY(button != nullptr);
@@ -4186,16 +4107,15 @@ void MainWindowLayoutTest::everyNavButtonIsStyledConsistently() {
     // 漏了就掉回 QPushButton 默认居中布局，与其余项对不齐（远程页上线时就踩过）。
     // 这里断言每个导航按钮都出现在样式表里，且共用同一条左对齐规则。
     const QString styleSheet = window.styleSheet();
-    const QStringList navObjectNames{
-        QStringLiteral("messagesNavButton"), QStringLiteral("cloudNavButton"),
-        QStringLiteral("agentNavButton"), QStringLiteral("contactsNavButton"),
-        QStringLiteral("settingsNavButton")};
+    const QStringList navObjectNames{QStringLiteral("messagesNavButton"), QStringLiteral("cloudNavButton"),
+                                     QStringLiteral("agentNavButton"), QStringLiteral("contactsNavButton"),
+                                     QStringLiteral("settingsNavButton")};
 
     for (const QString& name : navObjectNames) {
         auto* button = window.findChild<QPushButton*>(name);
         QVERIFY2(button != nullptr, qPrintable(name));
-        QVERIFY2(styleSheet.contains(QStringLiteral("#%1 ").arg(name))
-                     || styleSheet.contains(QStringLiteral("#%1,").arg(name)),
+        QVERIFY2(styleSheet.contains(QStringLiteral("#%1 ").arg(name)) ||
+                     styleSheet.contains(QStringLiteral("#%1,").arg(name)),
                  qPrintable(QStringLiteral("%1 缺少基础样式规则").arg(name)));
         QVERIFY2(styleSheet.contains(QStringLiteral("#%1[selected=\"true\"]").arg(name)),
                  qPrintable(QStringLiteral("%1 缺少选中态样式规则").arg(name)));
@@ -4263,8 +4183,7 @@ void MainWindowLayoutTest::connectionStatusLivesInSelfProfile() {
     QCOMPARE(qAlpha(image.pixel(0, 0)), 0);
     QCOMPARE(qAlpha(image.pixel(image.width() - 1, 0)), 0);
     QCOMPARE(qAlpha(image.pixel(0, image.height() - 1)), 0);
-    QVERIFY2(qAlpha(image.pixel(image.width() / 2, image.height() / 2)) > 200,
-             "状态点中心是透明的，等于没画");
+    QVERIFY2(qAlpha(image.pixel(image.width() / 2, image.height() / 2)) > 200, "状态点中心是透明的，等于没画");
 
     app.connectToService(1, QStringLiteral("test-user-sig"));
     QCOMPARE(statusDot->property("connected").toBool(), true);
@@ -4287,8 +4206,8 @@ void MainWindowLayoutTest::fileBubbleOffersContextMenu() {
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
     app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
-    app.chatState().receiveFile(QStringLiteral("phone-user"), sourcePath,
-                                QStringLiteral("report.md"), QStringLiteral("text/markdown"), 10);
+    app.chatState().receiveFile(QStringLiteral("phone-user"), sourcePath, QStringLiteral("report.md"),
+                                QStringLiteral("text/markdown"), 10);
 
     MainWindow window(app);
     auto* fileButton = window.findChild<QPushButton*>(QStringLiteral("messageFileButton"));
@@ -4324,11 +4243,9 @@ void MainWindowLayoutTest::imageBubbleUsesNativePixmapPreview() {
     original.fill(Qt::red);
     QVERIFY(original.save(path, "PNG"));
 
-    RemoteIMApplication app(QStringLiteral("desktop-user"),
-                            std::make_unique<FakeRemoteIMClient>());
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::make_unique<FakeRemoteIMClient>());
     app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
-    app.chatState().receiveImage(QStringLiteral("phone-user"), path, 3024, 1898,
-                                 QFileInfo(path).size());
+    app.chatState().receiveImage(QStringLiteral("phone-user"), path, 3024, 1898, QFileInfo(path).size());
     MainWindow window(app);
     window.resize(1280, 800);
     window.show();
@@ -4351,8 +4268,8 @@ void MainWindowLayoutTest::maximizedImageBubbleOpensOnlyOnePreview() {
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
     app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
-    app.chatState().receiveImage(QStringLiteral("phone-user"), imagePath,
-                                 originalSize.width(), originalSize.height(), 100);
+    app.chatState().receiveImage(QStringLiteral("phone-user"), imagePath, originalSize.width(), originalSize.height(),
+                                 100);
 
     MainWindow window(app);
     window.showMaximized();
@@ -4369,8 +4286,8 @@ void MainWindowLayoutTest::maximizedImageBubbleOpensOnlyOnePreview() {
     const QByteArray capture = qgetenv("MAICHAT_TEST_CAPTURE_PATH");
     if (!capture.isEmpty()) {
         QTest::qWait(100);
-        QVERIFY(window.screen()->grabWindow(0, window.x(), window.y(),
-                                            window.width(), window.height())
+        QVERIFY(window.screen()
+                    ->grabWindow(0, window.x(), window.y(), window.width(), window.height())
                     .save(QString::fromUtf8(capture)));
     }
     QTRY_COMPARE(window.findChildren<ImagePreviewDialog*>().size(), 1);
@@ -4389,8 +4306,8 @@ void MainWindowLayoutTest::maximizedImageBubbleOpensOnlyOnePreview() {
     QVERIFY(window.findChild<QLabel*>(QStringLiteral("imagePreviewTransitionSnapshot")) != nullptr);
     if (!capture.isEmpty()) {
         QTest::qWait(100);
-        QVERIFY(window.screen()->grabWindow(0, window.x(), window.y(),
-                                            window.width(), window.height())
+        QVERIFY(window.screen()
+                    ->grabWindow(0, window.x(), window.y(), window.width(), window.height())
                     .save(QString::fromUtf8(capture) + QStringLiteral(".close.png")));
     }
     QTRY_VERIFY(window.findChildren<ImagePreviewDialog*>().isEmpty());
@@ -4421,15 +4338,15 @@ void MainWindowLayoutTest::imagePreviewKeepsConversationBackgroundStable() {
     image.fill(Qt::red);
     QVERIFY(image.save(path));
 
-    RemoteIMApplication app(QStringLiteral("desktop-user"),
-                            std::make_unique<FakeRemoteIMClient>());
+    RemoteIMApplication app(QStringLiteral("desktop-user"), std::make_unique<FakeRemoteIMClient>());
     app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
-    app.chatState().receiveImage(QStringLiteral("phone-user"), path,
-                                 originalSize.width(), originalSize.height(), 100);
+    app.chatState().receiveImage(QStringLiteral("phone-user"), path, originalSize.width(), originalSize.height(), 100);
     MainWindow window(app);
     window.resize(1280, 800);
-    if (maximized) window.showMaximized();
-    else window.show();
+    if (maximized)
+        window.showMaximized();
+    else
+        window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     window.activateWindow();
     auto* label = window.findChild<QLabel*>(QStringLiteral("messageImageLabel"));
@@ -4441,11 +4358,9 @@ void MainWindowLayoutTest::imagePreviewKeepsConversationBackgroundStable() {
     // Observe rendered conversation pixels, away from both image endpoints and
     // native title/navigation chrome. Ordinary window activation may change the
     // chrome, but opening an image must not darken and brighten the conversation.
-    const QRect viewport(scroll->viewport()->mapTo(&window, QPoint()),
-                         scroll->viewport()->size());
+    const QRect viewport(scroll->viewport()->mapTo(&window, QPoint()), scroll->viewport()->size());
     const QRect source(label->mapTo(&window, QPoint()), label->size());
-    const QRect target(window.rect().center() - QPoint(originalSize.width() / 2,
-                                                       originalSize.height() / 2),
+    const QRect target(window.rect().center() - QPoint(originalSize.width() / 2, originalSize.height() / 2),
                        originalSize);
     const QRect imageMotionBounds = source.united(target).adjusted(-48, -48, 48, 48);
     const QPixmap baseline = window.grab();
@@ -4458,19 +4373,17 @@ void MainWindowLayoutTest::imagePreviewKeepsConversationBackgroundStable() {
             const QPoint point(viewport.left() + viewport.width() * xPercent / 100,
                                viewport.top() + viewport.height() * yPercent / 100);
             const QRect patch(point - QPoint(6, 6), QSize(12, 12));
-            if (!viewport.contains(patch) ||
-                imageMotionBounds.intersects(patch)) continue;
-            const QColor center = baselinePixels.pixelColor(qRound(point.x() * dpr),
-                                                            qRound(point.y() * dpr));
+            if (!viewport.contains(patch) || imageMotionBounds.intersects(patch)) continue;
+            const QColor center = baselinePixels.pixelColor(qRound(point.x() * dpr), qRound(point.y() * dpr));
             if (center.red() < 180 || center.green() < 180 || center.blue() < 180) continue;
             bool uniform = true;
             for (int dy : {-5, 0, 5}) {
                 for (int dx : {-5, 0, 5}) {
-                    const QColor pixel = baselinePixels.pixelColor(
-                        qRound((point.x() + dx) * dpr), qRound((point.y() + dy) * dpr));
-                    if (qAbs(pixel.red() - center.red()) > 2 ||
-                        qAbs(pixel.green() - center.green()) > 2 ||
-                        qAbs(pixel.blue() - center.blue()) > 2) uniform = false;
+                    const QColor pixel =
+                        baselinePixels.pixelColor(qRound((point.x() + dx) * dpr), qRound((point.y() + dy) * dpr));
+                    if (qAbs(pixel.red() - center.red()) > 2 || qAbs(pixel.green() - center.green()) > 2 ||
+                        qAbs(pixel.blue() - center.blue()) > 2)
+                        uniform = false;
                 }
             }
             if (uniform) {
@@ -4487,11 +4400,10 @@ void MainWindowLayoutTest::imagePreviewKeepsConversationBackgroundStable() {
     const auto captureScreen = [&](const QString& phase) {
         if (capturePrefix.isEmpty()) return;
         const QPoint origin = window.mapToGlobal(QPoint());
-        const QString file = capturePrefix + QLatin1Char('.') +
-            QString::fromLatin1(QTest::currentDataTag()) + QLatin1Char('.') + phase +
-            QStringLiteral(".png");
-        captures.append(qMakePair(file, window.screen()->grabWindow(
-            0, origin.x(), origin.y(), window.width(), window.height())));
+        const QString file = capturePrefix + QLatin1Char('.') + QString::fromLatin1(QTest::currentDataTag()) +
+                             QLatin1Char('.') + phase + QStringLiteral(".png");
+        captures.append(
+            qMakePair(file, window.screen()->grabWindow(0, origin.x(), origin.y(), window.width(), window.height())));
     };
     captureScreen(QStringLiteral("before"));
     const auto sampleFrame = [&](const QString& phase) {
@@ -4502,15 +4414,15 @@ void MainWindowLayoutTest::imagePreviewKeepsConversationBackgroundStable() {
         const qreal frameDpr = frame.devicePixelRatioF();
         for (int i = 0; i < samples.size(); ++i) {
             const QPoint point = samples.at(i);
-            const QColor actual = pixels.pixelColor(qRound(point.x() * frameDpr),
-                                                     qRound(point.y() * frameDpr));
+            const QColor actual = pixels.pixelColor(qRound(point.x() * frameDpr), qRound(point.y() * frameDpr));
             const QColor expected = colors.at(i);
-            if (qAbs(actual.red() - expected.red()) > 3 ||
-                qAbs(actual.green() - expected.green()) > 3 ||
+            if (qAbs(actual.red() - expected.red()) > 3 || qAbs(actual.green() - expected.green()) > 3 ||
                 qAbs(actual.blue() - expected.blue()) > 3) {
                 failures.append(QStringLiteral("%1 at (%2,%3): background %4 became %5")
-                    .arg(phase).arg(point.x()).arg(point.y())
-                    .arg(expected.name(), actual.name()));
+                                    .arg(phase)
+                                    .arg(point.x())
+                                    .arg(point.y())
+                                    .arg(expected.name(), actual.name()));
             }
         }
         captureScreen(phase);
@@ -4519,8 +4431,7 @@ void MainWindowLayoutTest::imagePreviewKeepsConversationBackgroundStable() {
         for (int time : {0, 50, 100, 150, 250, 400}) {
             const int wait = time - static_cast<int>(clock.elapsed());
             if (wait > 0) QTest::qWait(wait);
-            sampleFrame(QStringLiteral("%1-%2ms-actual-%3ms")
-                .arg(phase).arg(time).arg(clock.elapsed()));
+            sampleFrame(QStringLiteral("%1-%2ms-actual-%3ms").arg(phase).arg(time).arg(clock.elapsed()));
         }
     };
 
@@ -4634,7 +4545,6 @@ void MainWindowLayoutTest::ctrlShortcutsZoomWholeUi() {
     UiZoom::setFactor(1.0);
 }
 
-
 namespace {
 
 // 通讯录列表的一行：要么是分组表头，要么是联系人。
@@ -4665,8 +4575,7 @@ QStringList visibleLabels(QListWidget* list) {
     QStringList labels;
     for (const DirectoryRow& row : readDirectory(list)) {
         if (row.hidden) continue;
-        labels.append(row.isHeader ? QStringLiteral("[%1 %2]").arg(row.text).arg(row.count)
-                                   : row.text);
+        labels.append(row.isHeader ? QStringLiteral("[%1 %2]").arg(row.text).arg(row.count) : row.text);
     }
     return labels;
 }
@@ -4680,9 +4589,7 @@ QListWidget* openContactsPage(MainWindow& window) {
 int headerRowOf(QListWidget* list, const QString& groupName) {
     for (int index = 0; index < list->count(); ++index) {
         QListWidgetItem* item = list->item(index);
-        if (item->data(Qt::UserRole + 8).toBool() &&
-            item->data(Qt::UserRole + 9).toString() == groupName)
-            return index;
+        if (item->data(Qt::UserRole + 8).toBool() && item->data(Qt::UserRole + 9).toString() == groupName) return index;
     }
     return -1;
 }
@@ -4721,14 +4628,12 @@ void MainWindowLayoutTest::contactDirectoryShowsGroupsWithUngroupedLast() {
 
     // 分组按创建顺序；「家人」还没人也要显示，否则新建分组看起来什么都没发生。
     // 没有分组的 Bob 不套任何标题，直接跟在分组后面、和分组同一层。
-    QCOMPARE(visibleLabels(list),
-             QStringList({"[同事 1]", "Alice", "[家人 0]", "Bob"}));
+    QCOMPARE(visibleLabels(list), QStringList({"[同事 1]", "Alice", "[家人 0]", "Bob"}));
 
     // 移动之后 Bob 落到「家人」下面，没有分组的人一个不剩，列表里也不该
     // 冒出一个空的「未分组」标题。
     app.setContactGroup(QStringLiteral("bob"), QStringLiteral("家人"));
-    QCOMPARE(visibleLabels(list),
-             QStringList({"[同事 1]", "Alice", "[家人 1]", "Bob"}));
+    QCOMPARE(visibleLabels(list), QStringList({"[同事 1]", "Alice", "[家人 1]", "Bob"}));
 }
 
 void MainWindowLayoutTest::clickingGroupHeaderCollapsesItsMembers() {
@@ -4801,19 +4706,18 @@ void MainWindowLayoutTest::messageTextUsesNativeResolutionAndRegularBodyFont() {
     // 正文字号来自两端共用的那份主题。原来这里还顺带断言了字重是 Normal，
     // 挡的是 QTextDocument 把 CSS 的 700 读成 Black 那个坑；自绘之后没有 CSS，
     // 字重是主题里的常量，由 markdown_layout_test 直接盯着。
-    QCOMPARE(browser->theme().bodyPixelSize, UiZoom::s(14));
+    QCOMPARE(browser->theme().bodyPixelSize, UiZoom::textPixels(UiZoom::TextRole::Body));
     for (auto* widget = static_cast<QWidget*>(browser); widget; widget = widget->parentWidget())
         QVERIFY2(!widget->graphicsEffect(), "Message text must not pass through a graphics-effect bitmap cache");
-    qInfo() << "message-render-verification" << "dpr" << dpr
-            << "logical" << browser->size() << "physical" << capture.size()
-            << "body px" << browser->theme().bodyPixelSize;
+    qInfo() << "message-render-verification" << "dpr" << dpr << "logical" << browser->size() << "physical"
+            << capture.size() << "body px" << browser->theme().bodyPixelSize;
 }
 
 void MainWindowLayoutTest::outgoingTextBubbleDoesNotReserveUnusedLineWidth_data() {
     QTest::addColumn<QString>("text");
     QTest::newRow("short") << QStringLiteral("Hello");
-    QTest::newRow("more-than-fifty-characters")
-        << QStringLiteral("Please compare the tool execution limits and intermediate messages with the reference implementation.");
+    QTest::newRow("more-than-fifty-characters") << QStringLiteral(
+        "Please compare the tool execution limits and intermediate messages with the reference implementation.");
 }
 
 // Measure the actual painted body and inline timestamp, rather than assuming
@@ -4852,7 +4756,9 @@ void MainWindowLayoutTest::outgoingTextBubbleDoesNotReserveUnusedLineWidth() {
     const qreal emptyRight = body->width() - (lastInk + 1) / image.devicePixelRatioF();
     QVERIFY2(emptyRight <= UiZoom::s(20), qPrintable(QStringLiteral("Unused blue width: %1").arg(emptyRight)));
     const QByteArray capture = qgetenv("MAICHAT_CAPTURE_COMPACT_IM");
-    if (!capture.isEmpty()) QVERIFY(window.grab().save(QString::fromUtf8(capture) + QLatin1Char('-') + QString::fromLatin1(QTest::currentDataTag()) + QStringLiteral(".png")));
+    if (!capture.isEmpty())
+        QVERIFY(window.grab().save(QString::fromUtf8(capture) + QLatin1Char('-') +
+                                   QString::fromLatin1(QTest::currentDataTag()) + QStringLiteral(".png")));
 }
 
 void MainWindowLayoutTest::renamedHeaderButtonsKeepTheirCompactAppearance() {
