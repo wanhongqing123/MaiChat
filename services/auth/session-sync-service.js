@@ -13,6 +13,8 @@ const MAX_SESSIONS = 200;
 const MAX_PENDING = 1000;
 const RECEIPT_LIFETIME_MS = 30 * 24 * 60 * 60_000;
 const MAX_ROOM_MESSAGE_BYTES = 48 * 1024;
+const MAX_QUESTION_MESSAGES = 64;
+const MAX_QUESTION_MESSAGES_BYTES = 48 * 1024;
 const SESSION_LIFECYCLE_ID = 'session_lifecycle';
 
 function reply(statusCode, body) { return { statusCode, body }; }
@@ -30,6 +32,22 @@ function validWorkspacePath(value) {
     Buffer.byteLength(value, 'utf8') <= 4096 &&
     !/[\u0000-\u001f\u007f-\u009f]/u.test(value) &&
     (nodePath.posix.isAbsolute(value) || nodePath.win32.isAbsolute(value));
+}
+
+// These are display projections of child-owned question tools, not extra root messages.
+// Bound both count and bytes before the transaction or event fanout touches the database.
+function validQuestionMessages(value) {
+  if (value === undefined) return true;
+  if (!Array.isArray(value) || value.length > MAX_QUESTION_MESSAGES ||
+      Buffer.byteLength(JSON.stringify(value)) > MAX_QUESTION_MESSAGES_BYTES) return false;
+  if (new Set(value.map(message => message?.id)).size !== value.length) return false;
+  return value.every(message => message && typeof message === 'object' && !Array.isArray(message) &&
+    validId(message.id) && validId(message.sessionId) && message.role === 'assistant' &&
+    message.questionProjection === true && Array.isArray(message.parts) && message.parts.length > 0 &&
+    message.parts.every(part => part && typeof part === 'object' && !Array.isArray(part) &&
+      validId(part.id) && part.kind === 'tool' && part.tool === 'question' &&
+      typeof part.input === 'string' && (part.output === undefined || typeof part.output === 'string') &&
+      (part.error === undefined || typeof part.error === 'string')));
 }
 
 function createSessionSyncService({ db, authorize, now = Date.now }) {
@@ -173,17 +191,20 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
       expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`);
     const encodedPermissions = JSON.stringify(permissions);
     const encodedQuestions = JSON.stringify(questions);
-    const previousState = db.prepare(`SELECT permissions,questions FROM sync_room_state
+    const questionMessages = runtime.questionMessages || [];
+    const encodedQuestionMessages = JSON.stringify(questionMessages);
+    const previousState = db.prepare(`SELECT permissions,questions,question_messages FROM sync_room_state
       WHERE account_id=? AND owner_slot=? AND session_id=?`).get(
       principal.accountId, principal.slot, sessionId);
     const stateChanged = runtimeChanged || previousState?.permissions !== encodedPermissions ||
-      previousState?.questions !== encodedQuestions;
+      previousState?.questions !== encodedQuestions ||
+      previousState?.question_messages !== encodedQuestionMessages;
     if (stateChanged) db.prepare(`INSERT INTO sync_room_state(account_id,owner_slot,session_id,
-      permissions,questions,updated_at) VALUES(?,?,?,?,?,?)
+      permissions,questions,question_messages,updated_at) VALUES(?,?,?,?,?,?,?)
       ON CONFLICT(account_id,owner_slot,session_id) DO UPDATE SET
       permissions=excluded.permissions,questions=excluded.questions,
-      updated_at=excluded.updated_at`).run(principal.accountId, principal.slot,
-      sessionId, encodedPermissions, encodedQuestions, now());
+      question_messages=excluded.question_messages,updated_at=excluded.updated_at`).run(principal.accountId, principal.slot,
+      sessionId, encodedPermissions, encodedQuestions, encodedQuestionMessages, now());
     const changed = [];
     for (const message of messages) {
       const previous = existing.get(principal.accountId, principal.slot,
@@ -219,7 +240,7 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
     if (!updates.length && stateChanged) updates.push([]);
     for (const update of updates) {
       const bytes = Buffer.from(JSON.stringify({ ok: true, messages: update,
-        permissions, questions, busy: nextRuntime.busy, turnId: nextRuntime.turnId }));
+        permissions, questions, questionMessages, busy: nextRuntime.busy, turnId: nextRuntime.turnId }));
       const transferID = randomUUID().replaceAll('-', '');
       const digest = createHash('sha256').update(bytes).digest('hex');
       const chunks = Math.ceil(bytes.length / (24 * 1024));
@@ -320,12 +341,13 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
         AND owner_slot=? AND session_id=? AND message_id<?
         ORDER BY message_id DESC LIMIT ?`).all(principal.accountId, slot,
         sessionId, before || '\uffff', limit);
-      const state = db.prepare(`SELECT permissions,questions FROM sync_room_state WHERE
+      const state = db.prepare(`SELECT permissions,questions,question_messages FROM sync_room_state WHERE
         account_id=? AND owner_slot=? AND session_id=?`).get(principal.accountId, slot, sessionId);
       return reply(200, { ok: true, busy: owner.busy === 1, turnId: owner.turn_id,
         messages: rows.map(row => JSON.parse(row.payload)),
         permissions: state ? JSON.parse(state.permissions) : [],
-        questions: state ? JSON.parse(state.questions) : [] });
+        questions: state ? JSON.parse(state.questions) : [],
+        questionMessages: state ? JSON.parse(state.question_messages) : [] });
     }
     if (method === 'POST' && url.pathname === '/v1/session-sync/publish') {
       if (!isCurrent(principal)) return reply(409, { error: 'Device login was replaced' });
@@ -333,6 +355,7 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
           body.messages.length > 20 ||
           (body.permissions !== undefined && !Array.isArray(body.permissions)) ||
           (body.questions !== undefined && !Array.isArray(body.questions)) ||
+          !validQuestionMessages(body.questionMessages) ||
           (body.busy !== undefined && typeof body.busy !== 'boolean') ||
           (body.turnId !== undefined && body.turnId !== '' && !validId(body.turnId)) ||
           Buffer.byteLength(JSON.stringify(body.permissions || [])) > 16 * 1024 ||

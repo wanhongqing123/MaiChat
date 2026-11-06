@@ -145,4 +145,41 @@ public final class AIAssistantMessagePagesTest {
         assertEquals(49, pages.messages().length());
         assertEquals("msg_0001", pages.pageRequest("one", pages.beginOlder()).getString("before"));
     }
+    @Test public void remoteOldMessageUpdateUsesABoundedDisplayLaneUntilItsRealHistoryPageArrives() throws Exception {
+        AIAssistantMessagePages pages = new AIAssistantMessagePages(true);
+        AIAssistantMessagePages.Ticket current = pages.select("remote:one");
+        pages.acceptSnapshot(current, snapshot(20, 8).put("initialHistoryPage", true));
+        pages.acceptSnapshot(current, new JSONObject().put("messages", new JSONArray().put(message(5, "new answer"))));
+        assertEquals(8, pages.messages().length());
+        assertEquals("msg_0005", pages.displayUpdates().getJSONObject(0).getString("id"));
+        AIAssistantMessagePages.Ticket older = pages.beginOlder();
+        assertEquals("msg_0013", pages.pageRequest("one", older).getString("before"));
+        pages.acceptOlder(older, descending(12, 12));
+        assertEquals(20, pages.messages().length());
+        assertEquals(0, pages.displayUpdates().length());
+        assertEquals("new answer", pages.messages().getJSONObject(4).getJSONArray("parts").getJSONObject(0).getString("text"));
+    }
+    @Test public void remoteUnknownOldUpdatesNeverGrowTheContinuousRootWindow() throws Exception {
+        AIAssistantMessagePages pages = new AIAssistantMessagePages(true);
+        AIAssistantMessagePages.Ticket current = pages.select("remote:one");
+        pages.acceptSnapshot(current, snapshot(1000, 8));
+        for (int i = 1; i <= 25; i++) pages.acceptSnapshot(current,
+            new JSONObject().put("messages", new JSONArray().put(message(i, "old owner update"))));
+        assertEquals(8, pages.messages().length());
+        assertEquals(20, pages.displayUpdates().length());
+        assertEquals("msg_0993", pages.pageRequest("one", pages.beginOlder()).getString("before"));
+        pages.select("remote:two");
+        assertEquals(0, pages.displayUpdates().length());
+    }
+
+    @Test public void initialRemotePageMovesAnEarlierOldOwnerBroadcastToTheDisplayLane() throws Exception {
+        AIAssistantMessagePages pages = new AIAssistantMessagePages(true);
+        AIAssistantMessagePages.Ticket current = pages.select("remote:one");
+        pages.acceptSnapshot(current, new JSONObject().put("messages", new JSONArray().put(message(5, "old owner broadcast"))));
+        pages.acceptSnapshot(current, snapshot(20, 8).put("initialHistoryPage", true));
+        assertEquals(8, pages.messages().length());
+        assertEquals(1, pages.displayUpdates().length());
+        assertEquals("msg_0013", pages.pageRequest("one", pages.beginOlder()).getString("before"));
+    }
+
 }

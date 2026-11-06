@@ -14,6 +14,7 @@ final class AIAssistantOutgoingQueue {
     }
     private final Storage storage;
     private JSONArray items = new JSONArray();
+    private final java.util.LinkedHashSet<String> answeredQuestions = new java.util.LinkedHashSet<>();
 
     AIAssistantOutgoingQueue(Storage storage) throws IOException {
         this.storage = storage;
@@ -43,8 +44,37 @@ final class AIAssistantOutgoingQueue {
                 throw new IOException("发送队列已满或内容过长，草稿已保留");
             String id = UUID.randomUUID().toString();
             JSONArray next = copy(items);
+            JSONObject capture = new JSONObject(payload.toString());
+            if (capture.optString("operation").equals("answer") && !capture.optString("questionId").isEmpty()) {
+                JSONArray candidates = capture.optJSONArray("questionCandidates");
+                if (candidates == null) candidates = new JSONArray().put(capture.optJSONObject("question") != null
+                    ? capture.getJSONObject("question") : new JSONObject().put("id", capture.getString("questionId")));
+                JSONObject selected = null;
+                for (int i = 0; i < candidates.length(); i++) {
+                    JSONObject candidate = candidates.optJSONObject(i);
+                    if (candidate == null || candidate.optString("id").isEmpty()) continue;
+                    String question = candidate.getString("id");
+                    boolean claimed = answeredQuestions.contains(owner + "\u001f" + question);
+                    for (int j = 0; !claimed && j < next.length(); j++) {
+                        JSONObject prior = next.getJSONObject(j), priorPayload = prior.getJSONObject("payload");
+                        claimed = owner.equals(prior.optString("owner")) && question.equals(priorPayload.optString("questionId"));
+                    }
+                    if (!claimed) { selected = candidate; break; }
+                }
+                if (selected != null) capture.put("questionId", selected.getString("id"))
+                    .put("question", new JSONObject(selected.toString()));
+                else {
+                    // 包括 ACK 已处理、UI 仍是旧快照的间隙；后续输入只能补充原轮次。
+                    if (capture.optString("turnId").isEmpty())
+                        throw new IOException("问题的回答尚未确认，后续内容已保留草稿");
+                    capture.put("operation", "steer");
+                    capture.remove("questionId");
+                    capture.remove("question");
+                }
+            }
+            capture.remove("questionCandidates");
             next.put(new JSONObject().put("id", id).put("owner", owner).put("state", "queued")
-                .put("payload", new JSONObject(payload.toString())));
+                .put("payload", capture));
             commit(next);
             return id;
         } catch (Exception failure) { throw io(failure); }
@@ -94,6 +124,31 @@ final class AIAssistantOutgoingQueue {
                 commit(next); return;
             }
             throw new IOException("发送条目不存在");
+        } catch (Exception failure) { throw io(failure); }
+    }
+
+    // answer 没有新 Core user message，必须用明确的 question_id 收据，不能伪造消息编号。
+    synchronized void acceptAnswer(String id, String questionId) throws IOException {
+        try {
+            JSONArray next = new JSONArray();
+            boolean removed = false;
+            String answeredOwner = "";
+            for (int i = 0; i < items.length(); i++) {
+                JSONObject entry = items.getJSONObject(i);
+                if (!id.equals(entry.optString("id"))) { next.put(new JSONObject(entry.toString())); continue; }
+                JSONObject payload = entry.getJSONObject("payload");
+                if (!entry.optString("state").equals("dispatching")
+                    || !payload.optString("operation").equals("answer") || questionId.isEmpty()
+                    || !questionId.equals(payload.optString("questionId"))
+                    || !id.equals(head(entry.getString("owner")).optString("id")))
+                    throw new IOException("回答收据与原问题不一致，内容已保留");
+                removed = true;
+                answeredOwner = entry.getString("owner");
+            }
+            if (!removed) throw new IOException("发送条目不存在");
+            commit(next);
+            answeredQuestions.add(answeredOwner + "\u001f" + questionId);
+            while (answeredQuestions.size() > 128) answeredQuestions.remove(answeredQuestions.iterator().next());
         } catch (Exception failure) { throw io(failure); }
     }
 

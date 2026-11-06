@@ -72,4 +72,56 @@ public final class AIAssistantSubmissionTest {
         assertEquals("turn-one", request.getString("turnId"));
         assertEquals("request-one", request.getString("requestId"));
     }
+    @Test public void ordinaryComposerSendAnswersTheQuestionItSawInsteadOfSteeringPastIt() throws Exception {
+        JSONObject pending = runtime(true, "turn-one").put("questions", new JSONArray()
+            .put(new JSONObject().put("id", "question-one")));
+        AIAssistantSubmission binding = AIAssistantSubmission.capture("session-one", null, pending);
+        assertEquals("answer", binding.bind(pending));
+    }
+
+    @Test public void expiredQuestionAnswerNeverBecomesASteerOrANewPrompt() throws Exception {
+        JSONObject pending = runtime(true, "turn-one").put("questions", new JSONArray()
+            .put(new JSONObject().put("id", "question-one")));
+        for (JSONObject current : new JSONObject[] {
+                runtime(true, "turn-one"), runtime(false, ""),
+                runtime(true, "turn-one").put("questions", new JSONArray()
+                    .put(new JSONObject().put("id", "question-two")))}) {
+            AIAssistantSubmission binding = AIAssistantSubmission.capture("session-one", null, pending);
+            try { binding.bind(current); fail("An expired answer must stay retained for review"); }
+            catch (IllegalStateException expected) { }
+        }
+    }
+
+    @Test public void answerReceiptUsesTheQuestionIdentityInsteadOfInventingAUserMessage() throws Exception {
+        JSONObject valid = new JSONObject().put("ok", true).put("question_id", "question-one");
+        assertTrue(AIAssistantSubmission.receipt(valid, "answer", "question-one").getBoolean("ok"));
+        for (JSONObject invalid : new JSONObject[] {new JSONObject().put("ok", true),
+                new JSONObject().put("ok", true).put("question_id", "question-two")}) {
+            JSONObject result = AIAssistantSubmission.receipt(invalid, "answer", "question-one");
+            assertFalse(result.getBoolean("ok"));
+            assertTrue(result.getBoolean("unknown"));
+        }
+    }
+    @Test public void answerDispatchCarriesTheCapturedQuestionIdAndOnlyItsText() throws Exception {
+        JSONObject payload = new JSONObject().put("session", "session-one").put("text", "Use folder A")
+            .put("questionId", "question-one").put("files", new JSONArray()).put("quoteMessageId", "");
+        JSONObject request = AIAssistantSubmission.localRequest(payload, "answer", "turn-one", "request-one");
+        assertEquals("answer", request.getString("op"));
+        assertEquals("question-one", request.getString("id"));
+        assertEquals("Use folder A", request.getString("text"));
+        assertFalse(request.has("images"));
+        assertFalse(request.has("quoteMessageId"));
+    }
+
+    @Test public void acknowledgedQuestionCannotCaptureTheNextSendWhileItsPendingSnapshotIsStillOld() throws Exception {
+        JSONObject runtime = runtime(true, "turn-one").put("questions", new JSONArray()
+            .put(new JSONObject().put("id", "question-one")))
+            .put("questionAnswerEchoes", new JSONArray().put(new JSONObject().put("id", "question-one")));
+        AIAssistantSubmission next = AIAssistantSubmission.capture("session-one", null, runtime);
+        assertEquals("", next.questionId());
+        assertEquals("steer", next.bind(runtime));
+        runtime.getJSONArray("questions").put(new JSONObject().put("id", "question-two"));
+        assertEquals("question-two", AIAssistantSubmission.capture("session-one", null, runtime).questionId());
+    }
+
 }

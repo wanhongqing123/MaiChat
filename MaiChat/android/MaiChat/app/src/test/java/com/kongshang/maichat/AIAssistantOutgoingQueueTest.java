@@ -107,4 +107,50 @@ public final class AIAssistantOutgoingQueueTest {
         assertEquals(id, restored.head("owner-one").getString("id"));
         assertEquals("turn-one", restored.head("owner-one").getJSONObject("payload").getString("turnId"));
     }
+    @Test public void onlyFirstRapidSendClaimsAPendingQuestionAndLaterTextKeepsItsTurn() throws Exception {
+        AIAssistantOutgoingQueue queue = new AIAssistantOutgoingQueue(new MemoryStorage());
+        JSONObject answer = payload("Use folder A").put("operation", "answer").put("questionId", "question-one");
+        String first = queue.enqueue("owner-one", answer);
+        String second = queue.enqueue("owner-one", answer);
+        queue.enqueue("owner-two", answer);
+        JSONArray items = queue.entries();
+        assertEquals("answer", items.getJSONObject(0).getJSONObject("payload").getString("operation"));
+        assertEquals("steer", items.getJSONObject(1).getJSONObject("payload").getString("operation"));
+        assertEquals("", items.getJSONObject(1).getJSONObject("payload").optString("questionId"));
+        assertEquals("turn-one", items.getJSONObject(1).getJSONObject("payload").getString("turnId"));
+        assertEquals("answer", items.getJSONObject(2).getJSONObject("payload").getString("operation"));
+        queue.transition(first, "dispatching", null);
+        queue.acceptAnswer(first, "question-one");
+        assertEquals(second, queue.head("owner-one").getString("id"));
+        queue.enqueue("owner-one", answer);
+        JSONObject lateClick = queue.entries().getJSONObject(queue.entries().length() - 1).getJSONObject("payload");
+        assertEquals("An ACK processed before the UI snapshot must still reserve this question", "steer", lateClick.getString("operation"));
+    }
+    @Test public void answerAcknowledgmentMustMatchTheCapturedQuestionAndDurablyRemoveOnlyItsHead() throws Exception {
+        MemoryStorage storage = new MemoryStorage();
+        AIAssistantOutgoingQueue queue = new AIAssistantOutgoingQueue(storage);
+        String id = queue.enqueue("owner-one", payload("answer").put("operation", "answer").put("questionId", "question-one"));
+        queue.transition(id, "dispatching", null);
+        try { queue.acceptAnswer(id, "question-two"); fail("A different question cannot acknowledge this text"); }
+        catch (IOException expected) { }
+        assertEquals(id, queue.head("owner-one").getString("id"));
+        storage.writable = false;
+        try { queue.acceptAnswer(id, "question-one"); fail("Failed durable removal must keep the original answer"); }
+        catch (IOException expected) { }
+        assertEquals(id, queue.head("owner-one").getString("id"));
+    }
+
+    @Test public void parallelQuestionsAreClaimedInOrderBeforeFurtherTextBecomesSteering() throws Exception {
+        AIAssistantOutgoingQueue queue = new AIAssistantOutgoingQueue(new MemoryStorage());
+        JSONObject answer = payload("answer").put("operation", "answer").put("questionId", "question-one")
+            .put("questionCandidates", new JSONArray().put(new JSONObject().put("id", "question-one").put("partId", "part-one"))
+                .put(new JSONObject().put("id", "question-two").put("partId", "part-two")));
+        queue.enqueue("owner-one", answer); queue.enqueue("owner-one", answer); queue.enqueue("owner-one", answer);
+        JSONArray rows = queue.entries();
+        assertEquals("question-one", rows.getJSONObject(0).getJSONObject("payload").getString("questionId"));
+        assertEquals("question-two", rows.getJSONObject(1).getJSONObject("payload").getString("questionId"));
+        assertEquals("part-two", rows.getJSONObject(1).getJSONObject("payload").getJSONObject("question").getString("partId"));
+        assertEquals("steer", rows.getJSONObject(2).getJSONObject("payload").getString("operation"));
+    }
+
 }

@@ -269,6 +269,7 @@ add_library(maichat_mobile STATIC
   ../MaiChatTools/MaiChangePasswordTool.cpp
   ../MaiChatTools/MaiAccountTools.cpp
   ../MaiChatTools/MaiQrCode.cpp
+  ../MaiChatTools/MaiQuestionTranscript.cpp
   ../MaiChatTools/MaiSessionSchedule.cpp
   ../MaiChatTools/MaiSessionScheduleTools.cpp
   ../MaiChatTools/MaiScheduleTime.cpp

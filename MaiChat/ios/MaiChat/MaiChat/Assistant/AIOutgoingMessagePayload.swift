@@ -72,6 +72,9 @@ struct AIOutgoingMessagePayload: Codable, Sendable {
     let localSession: String
     let emptyDraftToken: UUID?
     let remote: RemoteOwner?
+    // 旧 outbox 无此可选字段仍可解码；问题编号在点击时固定，不在派发时重新选择问题。
+    var questionID: String? = nil
+    var question: AIQuestion? = nil
     // 派发前持久化稳定服务器附件引用；未知回执重试不重新上传或更改原请求。
     var remoteAttachmentIDs: [String] = []
     var archivePinsPrepared = false

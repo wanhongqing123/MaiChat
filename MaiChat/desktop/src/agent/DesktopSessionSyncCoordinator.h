@@ -50,8 +50,12 @@ public:
     void sendRemoteCommand(const QJsonObject& session, const QJsonObject& payload, Completion completion);
     void sendRemoteLifecycle(const QJsonObject& device, const QJsonObject& payload, Completion completion);
     void setDefaultWorkspaceDirectory(const QString& directory);
-    QJsonArray remoteDevices() const { return remoteDevices_; }
-    QJsonArray remoteSessions() const { return remoteSessions_; }
+    QJsonArray remoteDevices() const {
+        return remoteDevices_;
+    }
+    QJsonArray remoteSessions() const {
+        return remoteSessions_;
+    }
     DesktopSessionRoom localRoom(const QString& sessionId) const;
 
 private:
@@ -93,9 +97,10 @@ private:
     void queuePayload(const QString& slot, const QString& login, const QString& sessionId, const QString& kind,
                       const QJsonObject& payload);
     void flushOutbound();
-    void scheduleSnapshot(const QString& sessionId);
+    void scheduleSnapshot(const QString& sessionId, const QString& messageId = QString());
     void publishSnapshot(const QString& sessionId);
     void publishPage(const QString& sessionId, const QJsonObject& page);
+    void restorePublishedRoomState(const QString& sessionId);
     void processBackfillPage();
 
     Requester requester_;
@@ -104,17 +109,28 @@ private:
     std::unique_ptr<DesktopSessionSyncHost> host_;
     QTimer presenceTimer_;
     QTimer snapshotTimer_;
+    // parentId 创建后不变；每个安装实例内缓存变更来源的根房间，逐字 delta 不重复查库。
+    QHash<QString, QString> snapshotRootOwners_;
     QTimer backfillTimer_;
     QString deviceId_;
     QString deviceName_;
     QString localLoginSession_;
     QSet<QString> pendingSnapshotSessions_;
+    // 已接收事件的原消息可能被 steer 挤出最新页；每次最多点取二十条，不全量重扫。
+    QHash<QString, QSet<QString>> pendingMessageUpdates_;
     QSet<QString> initiallyPublishedSessions_;
     QSet<QString> pendingAttachmentCleanupRooms_;
     QQueue<QString> backfillSessions_;
     QHash<QString, QString> backfillBefore_;
     QHash<QString, QByteArray> publishedMessageDigests_;
     QHash<QString, QByteArray> publishedStateDigests_;
+    // 裁过显示投影的消息帧全部确认后，再补最新完整小状态；旧回执不覆盖新代次。
+    QHash<QString, QJsonObject> desiredPublishedStates_;
+    QHash<QString, int> pendingMessagePublishes_;
+    QHash<QString, quint64> messagePublishRevisions_;
+    QSet<QString> roomStateRestoresPending_;
+    QSet<QString> roomStateRestoresInFlight_;
+    quint64 publishEpoch_ = 0;
     QHash<QString, Incoming> incoming_;
     QHash<QString, QString> retryIdByFingerprint_;
     QHash<QString, QString> fingerprintByCommandId_;

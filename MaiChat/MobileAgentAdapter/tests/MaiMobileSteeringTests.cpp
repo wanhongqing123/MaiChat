@@ -21,6 +21,7 @@
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
+#include "MaiSqliteStore.h"
 #include "MaiThread.h"
 
 namespace {
@@ -97,6 +98,10 @@ int main() {
     httplib::Server server;
     std::mutex requestsMutex;
     std::vector<Json> requests;
+    std::atomic<bool> windowEntered{false};
+    std::atomic<bool> windowEmitTail{false};
+    std::atomic<bool> windowTailSent{false};
+    std::atomic<bool> windowReleased{false};
     server.Post("/chat/completions", [&](const httplib::Request& request, httplib::Response& response) {
         const Json body = Json::parse(request.body);
         std::size_t index;
@@ -105,13 +110,50 @@ int main() {
             index = requests.size();
             requests.push_back(body);
         }
-        if (index == 0) {
+        std::string lastUser;
+        for (const auto& message : body.at("messages"))
+            if (message.value("role", "") == "user" && message.value("content", Json{}).is_string())
+                lastUser = message.at("content");
+        if (lastUser == "Native old-window stream") {
+            response.set_chunked_content_provider("text/event-stream", [&](std::size_t, httplib::DataSink& sink) {
+                const auto writeDelta = [&](const Json& delta, const Json& finish) {
+                    const auto bytes =
+                        "data: " +
+                        Json{{"choices", Json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", finish}}})}}
+                            .dump() +
+                        "\n\n";
+                    return sink.write(bytes.data(), bytes.size());
+                };
+                if (!writeDelta({{"content", std::string(1100, 'P')}}, nullptr)) return false;
+                windowEntered = true;
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+                while (!windowReleased && sink.is_writable() && std::chrono::steady_clock::now() < deadline) {
+                    if (windowEmitTail.exchange(false)) {
+                        if (!writeDelta({{"content", " Native live tail outside latest twenty"}}, nullptr))
+                            return false;
+                        windowTailSent = true;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                if (!windowReleased) return false;
+                const Json tool{
+                    {"index", 0},
+                    {"id", "native-outside-page-question"},
+                    {"type", "function"},
+                    {"function",
+                     {{"name", "question"}, {"arguments", R"({"question":"Keep the native old result?"})"}}}};
+                if (!writeDelta({{"tool_calls", Json::array({tool})}}, "tool_calls")) return false;
+                sink.write("data: [DONE]\n\n", 14);
+                sink.done();
+                return true;
+            });
+        } else if (index == 0) {
             const Json tool{{"index", 0},
                             {"id", "synthetic-profile"},
                             {"type", "function"},
                             {"function", {{"name", "maichat_get_current_account"}, {"arguments", "{}"}}}};
             response.set_content(frame({{"tool_calls", Json::array({tool})}}, "tool_calls"), "text/event-stream");
-        } else if (index == 2) {
+        } else if (index == 2 || index == 4 || index == 6) {
             const Json tool{
                 {"index", 0},
                 {"id", "synthetic-question"},
@@ -352,13 +394,33 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         check(pending.at("questions").size() == 1, "synthetic question did not become pending");
-        const std::string questionId = pending.at("questions").front().at("id");
+        const Json question = pending.at("questions").front();
+        const std::string questionId = question.at("id");
+        check(question.value("sessionId", "") == session && !question.value("messageId", "").empty() &&
+                  !question.value("partId", "").empty() && question.value("asked", 0LL) > 0,
+              "pending question lost its transcript ownership metadata");
         check(call(handle, {{"op", "remote_snapshot"}, {"session", session}}).at("questions").size() == 1,
               "remote snapshot did not expose the pending question");
+        const Json crossedAnswer =
+            call(handle, {{"op", "answer"}, {"session", otherSession}, {"id", questionId}, {"text", "Wrong owner"}});
+        check(!crossedAnswer.at("ok") && crossedAnswer.value("errorCode", "") == "not_found",
+              "answer crossed conversation ownership");
+        const Json mediaAnswer = call(handle, {{"op", "answer"},
+                                               {"session", session},
+                                               {"id", questionId},
+                                               {"text", "Keep this result"},
+                                               {"images", Json::array({"unused"})}});
+        check(!mediaAnswer.at("ok") && mediaAnswer.value("errorCode", "") == "invalid_input",
+              "question answer silently discarded attached media");
         const int changesBeforeAnswer = mobileSessionChanges.load();
-        check(call(handle, {{"op", "answer"}, {"session", session}, {"id", questionId}, {"text", "Keep this result"}})
-                  .at("ok"),
-              "pending question answer was not accepted");
+        const Json answerReceipt = call(handle, {{"op", "answer"},
+                                                 {"session", session},
+                                                 {"id", questionId},
+                                                 {"text", "Keep this result"},
+                                                 {"requestId", "answer-capture"}});
+        check(answerReceipt.at("ok") && answerReceipt.value("question_id", "") == questionId &&
+                  !answerReceipt.contains("user_message_id"),
+              "question receipt did not identify the accepted question independently of normal prompts");
         bool clearedByNotification = false;
         for (int attempt = 0; attempt < 500; ++attempt) {
             const Json update = call(handle, {{"op", "snapshot"}, {"session", session}});
@@ -383,9 +445,285 @@ int main() {
         check(!snapshot().at("busy").get<bool>(), "answered question turn did not finish");
         std::puts("PASS: mobile question answer notification, authoritative pending clear, stale-answer rejection");
 
+        // 子任务的问答是原工具片段的只读投影，不复制进根会话，也不带出子任务其它正文。
+        const std::string childSession = MaiIdGenerator::newSessionId();
+        {
+            auto saved = makeMaiSqliteStore(workspace.append(MaiFilePath::fromUtf8("sessions.sqlite")).toUtf8());
+            check(bool(saved), "child fixture store did not open");
+            MaiSession child;
+            child.id = childSession;
+            child.parentId = session;
+            child.depth = 1;
+            child.directory = workspace.toUtf8();
+            child.model = "test-model";
+            child.created = MaiTime::getCurrentTime();
+            saved.value()->putSession(child);
+        }
+        check(call(handle, {{"op", "send"}, {"session", childSession}, {"text", "Private child task"}}).at("ok"),
+              "child question turn did not start");
+        Json childPending;
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            childPending = snapshot();
+            if (!childPending.at("questions").empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(childPending.at("questions").size() == 1 &&
+                  childPending.at("questions").front().at("sessionId") == childSession,
+              "root snapshot omitted its child's pending question");
+        const Json childQuestion = childPending.at("questions").front();
+        const auto inspectProjection = [&](const Json& state, bool answered) {
+            check(state.at("questionMessages").size() == 1, "child question was duplicated or omitted");
+            const auto& projected = state.at("questionMessages").front();
+            check(projected.at("id") == childQuestion.at("messageId") && projected.at("sessionId") == childSession &&
+                      projected.at("questionProjection") == true,
+                  "child projection invented a message or root owner identity");
+            check(projected.at("parts").size() == 1 && projected.at("parts").front().at("tool") == "question",
+                  "child projection leaked non-question parts");
+            if (answered)
+                check(projected.at("parts").front().at("output") == "Keep child result",
+                      "completed child answer could not be replayed from its tool result");
+            for (const auto& message : state.at("messages"))
+                check(message.at("id") != childQuestion.at("messageId"), "child projection polluted root pagination");
+        };
+        inspectProjection(childPending, false);
+        const Json rootRemote = call(handle, {{"op", "remote_snapshot"}, {"session", session}});
+        check(rootRemote.at("rootSessionId") == session, "root remote snapshot changed its room owner");
+        inspectProjection(rootRemote, false);
+        const Json changedChild = call(handle, {{"op", "remote_snapshot"}, {"session", childSession}});
+        check(changedChild.at("rootSessionId") == session,
+              "child change notification could not resolve the root synchronization room");
+        const Json otherProjection = call(handle, {{"op", "snapshot"}, {"session", otherSession}, {"force", true}});
+        check(otherProjection.at("questions").empty() && otherProjection.at("questionMessages").empty(),
+              "question projection crossed unrelated roots");
+        const Json childAnswer = call(
+            handle,
+            {{"op", "answer"}, {"session", session}, {"id", childQuestion.at("id")}, {"text", "Keep child result"}});
+        check(childAnswer.at("ok") && childAnswer.at("question_id") == childQuestion.at("id"),
+              "root could not answer its child's pending question");
+        Json completedChild;
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            completedChild = snapshot();
+            if (completedChild.at("questions").empty() && !completedChild.at("questionMessages").empty() &&
+                completedChild.at("questionMessages").front().at("parts").front().at("state") == "completed")
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        inspectProjection(completedChild, true);
+        inspectProjection(call(handle, {{"op", "remote_snapshot"}, {"session", session}}), true);
+        std::puts("PASS: scoped normal question receipts and child transcript projection without root history copies");
+
+        // 根会话可能空闲而子任务仍在收尾；缓存探针必须等子任务自己的终态，
+        // 不能把随后正常的 SessionIdle revision 误当作一次多余读取。
+        bool childIdle = false;
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            childIdle = !call(handle, {{"op", "remote_snapshot"}, {"session", childSession}}).at("busy").get<bool>();
+            if (childIdle) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(childIdle, "child question task did not finish before the cache probe");
+        inspectProjection(call(handle, {{"op", "remote_snapshot"}, {"session", session}}), true);
+
+        // 存储探针不发 Core 事件：同一远端 revision 必须复用小问答窗口，
+        // 本机 force snapshot 也不能消费或使远端缓存失效；下一条结构事件才重新读取。
+        {
+            auto saved = makeMaiSqliteStore(workspace.append(MaiFilePath::fromUtf8("sessions.sqlite")).toUtf8());
+            check(bool(saved), "remote question cache fixture store did not open");
+            MaiMessage extra;
+            extra.id = MaiIdGenerator::newMessageId();
+            extra.role = MaiRole::Assistant;
+            extra.created = MaiTime::getCurrentTime();
+            extra.completed = extra.created;
+            MaiToolPart tool;
+            tool.tool = "question";
+            tool.input = R"({"question":"Cached history probe?"})";
+            tool.output = "Probe result";
+            tool.state = MaiToolState::Completed;
+            extra.parts.push_back({MaiIdGenerator::newPartId(), tool, extra.created});
+            saved.value()->putMessage(childSession, extra);
+        }
+        check(call(handle, {{"op", "remote_snapshot"}, {"session", session}}).at("questionMessages").size() == 1,
+              "remote snapshot reread child history during an unchanged structure revision");
+        check(snapshot().at("questionMessages").size() == 2, "forced local snapshot missed the storage probe");
+        check(call(handle, {{"op", "remote_snapshot"}, {"session", session}}).at("questionMessages").size() == 1,
+              "local force snapshot invalidated the independent remote question cache");
+        check(call(handle, {{"op", "rename"}, {"session", session}, {"title", "Question cache refresh"}}).at("ok"),
+              "question cache structure event fixture failed");
+        check(call(handle, {{"op", "remote_snapshot"}, {"session", session}}).at("questionMessages").size() == 2,
+              "structure event did not refresh remote child question history");
+        std::puts("PASS: independent remote question cache, local refresh isolation, structure-event invalidation");
+
+        // 64 个历史 owner 窗口之外仍在等待的原消息必须点取，不能为显示它再扫描
+        // 该旧 owner 的其它历史。较晚写入的旧 owner 记录用于区分 owner 窗口和仅消息截断。
+        check(
+            call(handle, {{"op", "send"}, {"session", childSession}, {"text", "Ask another child question"}}).at("ok"),
+            "old child question turn did not start");
+        Json oldPending;
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            oldPending = snapshot();
+            if (!oldPending.at("questions").empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(oldPending.at("questions").size() == 1, "old child did not wait before the history window fixture");
+        const Json oldQuestion = oldPending.at("questions").front();
+        const std::string excludedMessage = MaiIdGenerator::newMessageId();
+        {
+            auto saved = makeMaiSqliteStore(workspace.append(MaiFilePath::fromUtf8("sessions.sqlite")).toUtf8());
+            check(bool(saved), "owner window fixture store did not open");
+            const auto created = MaiTime::getCurrentTime();
+            for (int index = 0; index < 65; ++index) {
+                MaiSession recent;
+                recent.id = MaiIdGenerator::newSessionId();
+                recent.parentId = session;
+                recent.depth = 1;
+                recent.directory = workspace.toUtf8();
+                recent.created = created + index;
+                recent.updated = recent.created;
+                saved.value()->putSession(recent);
+                MaiMessage message;
+                message.id = MaiIdGenerator::newMessageId();
+                message.role = MaiRole::Assistant;
+                message.created = recent.created;
+                message.completed = recent.created;
+                MaiToolPart tool;
+                tool.tool = "question";
+                tool.input = R"({"question":"Historical window question?"})";
+                tool.output = "Historical window answer";
+                tool.state = MaiToolState::Completed;
+                message.parts.push_back({MaiIdGenerator::newPartId(), tool, message.created});
+                saved.value()->putMessage(recent.id, message);
+            }
+            MaiMessage excluded;
+            excluded.id = excludedMessage;
+            excluded.role = MaiRole::Assistant;
+            excluded.created = created + 100;
+            excluded.completed = excluded.created;
+            MaiToolPart tool;
+            tool.tool = "question";
+            tool.input = R"({"question":"Outside owner history?"})";
+            tool.output = "Outside owner history answer";
+            tool.state = MaiToolState::Completed;
+            excluded.parts.push_back({MaiIdGenerator::newPartId(), tool, excluded.created});
+            saved.value()->putMessage(childSession, excluded);
+        }
+        const Json windowed = snapshot();
+        bool keptPending = false;
+        bool leakedOldHistory = false;
+        check(windowed.at("questionMessages").size() <= 64, "child question message window exceeded its limit");
+        for (const auto& message : windowed.at("questionMessages")) {
+            keptPending |= message.at("id") == oldQuestion.at("messageId");
+            leakedOldHistory |= message.at("id") == excludedMessage;
+        }
+        check(keptPending, "old pending question was lost beyond the historical owner window");
+        check(!leakedOldHistory, "historical owner window still scanned the old owner's other messages");
+        check(call(handle, {{"op", "answer"},
+                            {"session", session},
+                            {"id", oldQuestion.at("id")},
+                            {"text", "Complete old pending question"}})
+                  .at("ok"),
+              "old pending question was not answerable outside the history window");
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            if (!call(handle, {{"op", "remote_snapshot"}, {"session", childSession}}).at("busy").get<bool>()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::puts("PASS: 64 historical-owner query window and direct retrieval of older pending questions");
+
+        // 真实 SSE 未关闭时接受 21 条补充，原 assistant 与 question 均被根最新二十条挤出。
+        // remote-only 事件点取不能被普通 runtime 查询或本机 snapshot 消费。
+        const std::string windowSession = call(handle, {{"op", "create"}}).at("id");
+        call(handle, {{"op", "remote_snapshot"}, {"session", windowSession}, {"includeMessageUpdates", true}});
+        const Json windowStarted =
+            call(handle, {{"op", "send"}, {"session", windowSession}, {"text", "Native old-window stream"}});
+        check(windowStarted.at("ok"), "native old-window stream did not start");
+        const std::string windowTurn = windowStarted.at("turnId");
+        for (int attempt = 0; attempt < 500 && !windowEntered; ++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        check(windowEntered, "native old-window SSE did not enter");
+        for (int index = 0; index < 21; ++index)
+            check(call(handle, {{"op", "steer"},
+                                {"session", windowSession},
+                                {"turnId", windowTurn},
+                                {"requestId", "native-window-" + std::to_string(index)},
+                                {"text", "Native accepted supplement " + std::to_string(index)}})
+                      .at("ok"),
+                  "native old-window supplement was rejected");
+        windowEmitTail = true;
+        Json oldTailUpdate;
+        bool sawNativeTail = false;
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            oldTailUpdate =
+                call(handle, {{"op", "remote_snapshot"}, {"session", windowSession}, {"includeMessageUpdates", true}});
+            for (const auto& message : oldTailUpdate.at("messages"))
+                check(message.at("id") != windowTurn,
+                      "native fixture did not move the original assistant outside latest twenty");
+            for (const auto& message : oldTailUpdate.value("messageUpdates", Json::array()))
+                if (message.at("id") == windowTurn)
+                    for (const auto& part : message.at("parts"))
+                        sawNativeTail |= part.value("text", "").find("Native live tail") != std::string::npos;
+            if (sawNativeTail) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(sawNativeTail, "remote producer omitted live tail of assistant outside latest twenty");
+        const auto ordinaryRuntime = call(handle, {{"op", "remote_snapshot"}, {"session", windowSession}});
+        check(ordinaryRuntime.value("messageUpdates", Json::array()).empty(),
+              "ordinary runtime read consumed producer updates");
+        windowReleased = true;
+        Json windowPending;
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            windowPending = call(handle, {{"op", "snapshot"},
+                                          {"session", windowSession},
+                                          {"force", true},
+                                          {"messageLimit", 8},
+                                          {"includeMessageUpdates", true}});
+            if (!windowPending.at("questions").empty()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(windowPending.at("questions").size() == 1 &&
+                  windowPending.at("questions").front().at("messageId") == windowTurn,
+              "question did not remain attached to the original assistant outside the latest page");
+        check(call(handle, {{"op", "answer"},
+                            {"session", windowSession},
+                            {"id", windowPending.at("questions").front().at("id")},
+                            {"text", "Kept native old result"}})
+                  .at("ok"),
+              "native old-window question answer failed");
+        bool sawNativeFinal = false;
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            call(handle, {{"op", "snapshot"},
+                          {"session", windowSession},
+                          {"force", true},
+                          {"messageLimit", 8},
+                          {"includeMessageUpdates", true}});
+            const auto remote =
+                call(handle, {{"op", "remote_snapshot"}, {"session", windowSession}, {"includeMessageUpdates", true}});
+            check(remote.value("messageUpdates", Json::array()).size() <= 20,
+                  "remote owner update batch exceeded twenty");
+            for (const auto& message : remote.value("messageUpdates", Json::array()))
+                if (message.at("id") == windowTurn && message.value("completed", 0LL) > 0)
+                    for (const auto& part : message.at("parts"))
+                        sawNativeFinal |= part.value("output", "") == "Kept native old result";
+            if (sawNativeFinal) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(sawNativeFinal,
+              "remote producer lost the old assistant's final question answer after local update consumption");
+        bool windowIdle = false;
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            windowIdle = !call(handle, {{"op", "remote_snapshot"}, {"session", windowSession}}).at("busy").get<bool>();
+            if (windowIdle) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(windowIdle, "native old-window task did not finish before the local configuration gate");
+        std::puts(
+            "PASS: remote-only old-owner live tail, question completion, opt-in isolation, terminal point updates");
+
         // 配置检查不启动推理；真实 GGUF 生成与工具闭环由本地主模型专测/正常 App 另验。
         // 这里独立证明参数不回绕、损坏文件不覆盖配置，失败不偷偷降级到 HTTP。
         const int assetProbesBeforeLocal = host.assetProbes.load();
+        std::size_t requestsBeforeLocal;
+        {
+            std::lock_guard<std::mutex> lock(requestsMutex);
+            requestsBeforeLocal = requests.size();
+        }
         const auto localFile = workspace.append(MaiFilePath::fromUtf8("local-config-probe.gguf"));
         check(!MaiFileSystem::writeFile(localFile, std::string("GGUF") + std::string(24, '\0')),
               "local configuration probe creation failed");
@@ -460,7 +798,8 @@ int main() {
               "local configuration unexpectedly probed cloud asset credentials");
         {
             std::lock_guard<std::mutex> lock(requestsMutex);
-            check(requests.size() == 4, "local configuration unexpectedly sent a remote model request");
+            check(requests.size() == requestsBeforeLocal,
+                  "local configuration unexpectedly sent a remote model request");
         }
         std::puts("PASS: local C ABI configuration, no API key, limits, file boundary, no remote fallback");
     } catch (const std::exception& error) {
@@ -472,6 +811,7 @@ int main() {
         host.released = true;
         host.wake.notify_all();
     }
+    windowReleased = true;
     maiMobileAgentDestroy(handle);
     server.stop();
     listener.join();

@@ -159,6 +159,9 @@ public:
     QString lastError() const;
 
 signals:
+    // 已切到 Qt 宿主线程的持久化消息更新，包含 assistant 最终完成及 user 落库。
+    // 同步宿主据此点取原消息 ID，不暴露内部 Core 事件桥。
+    void storedMessageUpdated(const QString& sessionId, const QString& messageId);
     // 本地或远端入口落库了一条用户消息。界面按消息 ID 呈现，同一条只画一次。
     void userMessageAdded(const QString& sessionId, const QString& messageId);
 

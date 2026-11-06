@@ -75,6 +75,7 @@
 #include <variant>
 
 #include "MaiPathGuard.h"
+#include "MaiQuestionTranscript.h"
 #include "agent/AgentController.h"
 #include "markdown/MarkdownView.h"
 #include "ui/ComposerResizeSplitter.h"
@@ -1341,7 +1342,12 @@ struct AgentChatPanel::ConversationState {
     QHash<QString, QByteArray> messageFingerprints;
     QHash<QString, QStringList> messageShapes;
     QSet<QString> unfinishedMessages;
-    QSet<QString> displayedQuestions;
+    bool questionHistoryDirty = true;
+    QSet<QString> questionPartIds;
+    QSet<QString> questionTimelineParts;
+    QHash<QString, QString> questionMessageIds;
+    QMap<QString, QStringList> questionTimeline;
+    QSet<QString> projectedQuestionMessages;
     QHash<QString, QPair<QString, QString>> approvalOwners;
     QList<QPointer<QPushButton>> videoCirclePublishButtons;
     QList<QPointer<QPushButton>> cloudDriveSaveButtons;
@@ -2047,12 +2053,40 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
             });
     connect(&controller, &AgentController::toolPartChanged, this,
             [this](const QString& sessionId, const QString& messageId, const QString& partId) {
+                // QuestionAnswered precedes tool persistence. Invalidate dormant
+                // pages again on the canonical part update, including nested children.
+                bool knownQuestion = runtime_->questionPartIds.contains(partId);
+                for (auto it = runtime_->savedConversations.cbegin(); !knownQuestion && it != runtime_->savedConversations.cend(); ++it)
+                    knownQuestion = it.value()->questionPartIds.contains(partId);
+                MaiMessage persisted;
+                if (knownQuestion && runtime_->controller->agent().getMessage(toUtf8(sessionId), toUtf8(messageId), persisted))
+                    for (const auto& part : persisted.parts) {
+                        const auto* tool = std::get_if<MaiToolPart>(&part.body);
+                        if (fromUtf8(part.id) != partId || !tool || tool->tool != "question") continue;
+                        markQuestionHistoryDirty(sessionId);
+                        if (maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId),
+                                                        toUtf8(sessionId))) {
+                            reconcileQuestion();
+                            showQuestion(QString());
+                            appendQuestionPart(sessionId, messageId, part);
+                            scrollToBottom();
+                        }
+                        return;
+                    }
                 // 问题也可能因取消或超时结束，并没有真实的用户回答事件。
                 // 工具状态落库后检查权威列表；子任务仍由父页面处理提问。
-                if (isCurrentSession(sessionId) || runtime_->controller->isChildOf(sessionId, runtime_->sessionId))
+                if (maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId), toUtf8(sessionId)))
                     reconcileQuestion();
                 if (!isCurrentSession(sessionId)) {
-                    if (!runtime_->controller->isChildOf(sessionId, runtime_->sessionId)) return;
+                    if (!maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId),
+                                                     toUtf8(sessionId))) return;
+                    MaiMessage questionMessage;
+                    if (runtime_->controller->agent().getMessage(toUtf8(sessionId), toUtf8(messageId), questionMessage))
+                        for (const auto& part : questionMessage.parts)
+                            if (fromUtf8(part.id) == partId && appendQuestionPart(sessionId, messageId, part)) {
+                                scrollToBottom();
+                                return;
+                            }
                     ToolCard* card = runtime_->toolCards.value(partId, nullptr);
                     ToolGroupCard* group = runtime_->toolCardGroups.value(partId, nullptr);
                     if (!card || !group) return;
@@ -2085,16 +2119,21 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
                 showApproval(permissionId);
             });
     connect(&controller, &AgentController::questionAsked, this,
-            [this](const QString& questionId, const QString&, const QString&) {
-                // 同授权：子 Agent 问的话也得有人答。
+            [this](const QString& questionId, const QString& sessionId, const QString& partId) {
+                markQuestionHistoryDirty(sessionId, partId);
                 showQuestion(questionId);
             });
-    connect(&controller, &AgentController::questionAnswered, this, [this](const QString& questionId, const QString&) {
-        if (runtime_->pendingQuestionId == questionId) clearQuestion();
-    });
+    connect(&controller, &AgentController::questionAnswered, this,
+            [this](const QString& questionId, const QString& sessionId) {
+                markQuestionHistoryDirty(sessionId);
+                if (runtime_->pendingQuestionId == questionId) clearQuestion();
+                showQuestion(QString());
+            });
     connect(&controller, &AgentController::turnFinished, this, [this](const QString& sessionId) {
-        if (isCurrentSession(sessionId) || runtime_->controller->isChildOf(sessionId, runtime_->sessionId))
+        if (maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId), toUtf8(sessionId))) {
             reconcileQuestion();
+            showQuestion(QString());
+        }
         if (!isCurrentSession(sessionId)) {
             noteOtherSession(sessionId, QString());
             return;
@@ -2115,8 +2154,10 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         scrollToBottom();
     });
     connect(&controller, &AgentController::turnFailed, this, [this](const QString& sessionId, const QString& message) {
-        if (isCurrentSession(sessionId) || runtime_->controller->isChildOf(sessionId, runtime_->sessionId))
+        if (maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(runtime_->sessionId), toUtf8(sessionId))) {
             reconcileQuestion();
+            showQuestion(QString());
+        }
         if (!isCurrentSession(sessionId)) {
             noteOtherSession(sessionId, message);
             return;
@@ -2590,13 +2631,18 @@ void AgentChatPanel::restoreConversationControls(bool activeAssistantHasVisibleA
     for (const MaiPermissionRequest& pending : runtime_->controller->agent().listPendingPermissions()) {
         showApproval(fromUtf8(pending.id));
     }
-    for (const MaiQuestionRequest& pending : runtime_->controller->pendingQuestions()) {
-        if (fromUtf8(pending.sessionId) == runtime_->sessionId ||
-            runtime_->controller->isChildOf(fromUtf8(pending.sessionId), runtime_->sessionId)) {
-            showQuestion(fromUtf8(pending.id));
-            break;
-        }
+    // Retained pages reuse their question projection until a question event
+    // changes it; ordinary token deltas and warm switches do not scan children.
+    if (runtime_->questionHistoryDirty) {
+        const auto transcript = captureMaiQuestionTranscript(runtime_->controller->agent(), toUtf8(runtime_->sessionId));
+        runtime_->view->beginBatchUpdates();
+        for (const auto& entry : transcript.childMessages)
+            for (const auto& part : entry.message.parts)
+                appendQuestionPart(fromUtf8(entry.ownerSessionId), fromUtf8(entry.message.id), part);
+        runtime_->view->endBatchUpdates();
+        runtime_->questionHistoryDirty = false;
     }
+    showQuestion(QString());
     if (!sessionBusy || activeAssistantHasVisibleActivity || !runtime_->pendingQuestionId.isEmpty())
         clearPendingThinking();
     else
@@ -2677,6 +2723,7 @@ bool AgentChatPanel::appendStoredMessage(const MaiMessage& message, const MaiSes
             if (message.completed == 0 &&
                 (tool->state == MaiToolState::Pending || tool->state == MaiToolState::Running))
                 activeAssistantHasVisibleActivity = true;
+            if (appendQuestionPart(runtime_->sessionId, messageId, part)) continue;
             if (tool->tool == "agent_send_media" && tool->state == MaiToolState::Completed &&
                 appendAgentMediaCard(fromUtf8(message.id), partId, fromUtf8(tool->output),
                                      fromUtf8(selectedSession.directory))) {
@@ -2785,6 +2832,15 @@ void AgentChatPanel::appendStoredUserMessage(const MaiMessage& message, const Ma
     appendUserVideos(messageId, videos);
     appendTextMediaCards(messageId, sourceText, fromUtf8(session.directory));
     appendQuoteAction(messageId);
+    // A queued user message is an atomic timeline anchor, including its media
+    // and quote footer. Later question parts must retain their actual position.
+    if (!message.parts.empty()) {
+        QStringList anchors = runtime_->messageItems.value(messageId);
+        const QString footer = messageId + QStringLiteral("-quote-action");
+        if (runtime_->view->contains(footer)) anchors.append(footer);
+        runtime_->questionTimeline[fromUtf8(message.parts.back().id)] = anchors;
+        positionQuestionTranscript();
+    }
     updateWelcomeVisibility();
 }
 
@@ -2834,7 +2890,7 @@ void AgentChatPanel::appendUserBubble(const QString& text, const QString& quoted
 }
 
 void AgentChatPanel::appendQuoteAction(const QString& messageId) {
-    if (messageId.isEmpty()) return;
+    if (messageId.isEmpty() || runtime_->projectedQuestionMessages.contains(messageId)) return;
     const auto items = runtime_->messageItems.value(messageId);
     QString anchor;
     for (auto it = items.crbegin(); it != items.crend(); ++it)
@@ -2912,6 +2968,44 @@ void AgentChatPanel::recordMessageItem(const QString& messageId, const QString& 
     }
     const QString footer = messageId + QStringLiteral("-quote-action");
     if (runtime_->view->contains(footer)) appendQuoteAction(messageId);
+    // Core part IDs are time-ordered. Track the actual displayed part anchors,
+    // so a later root part cannot be inserted before an earlier child question
+    // merely because the root message itself began first.
+    QString timelineId;
+    if (itemId.startsWith(QStringLiteral("tool-group-prt_"))) timelineId = itemId.mid(11);
+    else if (itemId.startsWith(QStringLiteral("prt_")) && !itemId.endsWith(QStringLiteral("-question")) &&
+             !itemId.endsWith(QStringLiteral("-answer"))) timelineId = itemId;
+    if (!timelineId.isEmpty()) runtime_->questionTimeline[timelineId] = QStringList{itemId};
+    positionQuestionTranscript();
+}
+
+void AgentChatPanel::positionQuestionTranscript() {
+    if (runtime_->questionTimelineParts.isEmpty()) return;
+    for (auto it = runtime_->questionTimeline.cbegin(); it != runtime_->questionTimeline.cend(); ++it) {
+        if (!runtime_->questionTimelineParts.contains(it.key()) || it.value().isEmpty()) continue;
+        QString anchor;
+        auto previous = it;
+        while (previous != runtime_->questionTimeline.cbegin() && anchor.isEmpty()) {
+            --previous;
+            for (auto item = previous.value().crbegin(); item != previous.value().crend(); ++item)
+                if (runtime_->view->contains(*item)) { anchor = *item; break; }
+        }
+        if (!anchor.isEmpty()) runtime_->view->moveItemAfter(it.value().front(), anchor);
+        else {
+            auto next = it;
+            ++next;
+            for (; next != runtime_->questionTimeline.cend(); ++next) {
+                if (!next.value().isEmpty() && runtime_->view->contains(next.value().front())) {
+                    runtime_->view->moveItemBefore(it.value().front(), next.value().front());
+                    break;
+                }
+            }
+        }
+        for (int index = 1; index < it.value().size(); ++index)
+            runtime_->view->moveItemAfter(it.value()[index], it.value()[index - 1]);
+        const QString owner = runtime_->questionMessageIds.value(it.key());
+        if (runtime_->view->contains(owner + QStringLiteral("-quote-action"))) appendQuoteAction(owner);
+    }
 }
 
 void AgentChatPanel::beginQuote(const QString& messageId) {
@@ -2989,8 +3083,8 @@ AgentChatPanel::ToolGroupCard* AgentChatPanel::toolGroupFor(const QString& partI
             firstTool.clear();
             continue;
         }
-        // 这两种工具完成后在正文流中插入媒体/PDF 卡，后续工具不能越过它。
-        const bool separateArtifact = tool->tool == "agent_send_media" || tool->tool == "generate_pdf";
+        // 这些工具在正文流中插入问答或独立产物，后续工具不能跨过它合组。
+        const bool separateArtifact = tool->tool == "agent_send_media" || tool->tool == "generate_pdf" || tool->tool == "question";
         if (separateArtifact || firstTool.isEmpty()) firstTool = fromUtf8(part.id);
         if (fromUtf8(part.id) == partId) {
             groupId = firstTool;
@@ -3048,6 +3142,10 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
             if (fromUtf8(part.id) != partId) continue;
             const auto* tool = std::get_if<MaiToolPart>(&part.body);
             if (tool == nullptr) return;
+            if (appendQuestionPart(runtime_->sessionId, messageId, part)) {
+                scrollToBottom();
+                return;
+            }
 
             if (tool->tool == "agent_send_media" && tool->state == MaiToolState::Completed) {
                 MaiSession session;
@@ -3425,34 +3523,77 @@ AgentChatPanel::SubAgentCard* AgentChatPanel::subAgentCardFor(const QString& ses
     return card;
 }
 
-void AgentChatPanel::showQuestion(const QString& questionId) {
-    // 问题文本不在事件里（它在那次工具调用的参数上，重复一份就有两个真相），
-    // 所以回核心取。
-    for (const MaiQuestionRequest& pending : runtime_->controller->pendingQuestions()) {
-        if (fromUtf8(pending.id) != questionId) continue;
-        const QString owner = fromUtf8(pending.sessionId);
-        if (owner != runtime_->sessionId && !runtime_->controller->isChildOf(owner, runtime_->sessionId)) return;
-
-        QString text = fromUtf8(pending.question);
-        if (!pending.options.empty()) {
-            // 选项只是提示，用户照样可以回别的，所以摆成一行字而不是按钮——
-            // 做成按钮会让人以为只能选这几个。
-            QStringList options;
-            for (const std::string& option : pending.options) options << fromUtf8(option);
-            text += QStringLiteral("\n\n") + options.join(QStringLiteral(" · "));
-        }
-        runtime_->pendingQuestionId = questionId;
-        if (!runtime_->displayedQuestions.contains(questionId)) {
-            runtime_->displayedQuestions.insert(questionId);
-            appendNotice(text, false);
-        }
-        runtime_->editor->setPlaceholderText(QStringLiteral("回答它…"));
-        setRunning(runtime_->running);
-        runtime_->hint->setText(QStringLiteral("它在等你回答"));
-        runtime_->editor->setFocus();
-        scrollToBottom();
-        return;
+bool AgentChatPanel::appendQuestionPart(const QString& owner, const QString& messageId,
+                                       const MaiMessagePart& part) {
+    const auto* tool = std::get_if<MaiToolPart>(&part.body);
+    if (!tool || tool->tool != "question") return false;
+    const QJsonObject input = QJsonDocument::fromJson(QByteArray::fromStdString(tool->input)).object();
+    QString text = input.value(QStringLiteral("question")).toString().trimmed();
+    if (text.isEmpty()) return false;
+    for (const auto& option : input.value(QStringLiteral("options")).toArray())
+        if (option.isString() && !option.toString().trimmed().isEmpty())
+            text += QStringLiteral("\n\n- ") + option.toString();
+    const QString partId = fromUtf8(part.id);
+    runtime_->questionPartIds.insert(partId);
+    runtime_->questionTimelineParts.insert(partId);
+    runtime_->questionMessageIds.insert(partId, messageId);
+    const QString questionItem = partId + QStringLiteral("-question");
+    if (owner != runtime_->sessionId) {
+        runtime_->projectedQuestionMessages.insert(messageId);
     }
+    runtime_->view->addItem(questionItem, MarkdownView::Style::Document, text);
+    recordMessageItem(messageId, questionItem);
+    if (tool->state == MaiToolState::Completed && !tool->output.empty()) {
+        const QString answerItem = partId + QStringLiteral("-answer");
+        runtime_->view->addItem(answerItem, MarkdownView::Style::Bubble, fromUtf8(tool->output));
+        recordMessageItem(messageId, answerItem);
+        // Completion can arrive after following assistant text; keep the answer
+        // immediately after its question rather than after that later text.
+        runtime_->view->moveItemAfter(answerItem, questionItem);
+        auto& items = runtime_->messageItems[messageId];
+        items.removeAll(answerItem);
+        items.insert(items.indexOf(questionItem) + 1, answerItem);
+        if (runtime_->view->contains(messageId + QStringLiteral("-quote-action"))) appendQuoteAction(messageId);
+    }
+    QStringList visible{questionItem};
+    if (runtime_->view->contains(partId + QStringLiteral("-answer"))) visible.append(partId + QStringLiteral("-answer"));
+    runtime_->questionTimeline[partId] = visible;
+    positionQuestionTranscript();
+    clearPendingThinking();
+    updateWelcomeVisibility();
+    return true;
+}
+
+void AgentChatPanel::markQuestionHistoryDirty(const QString& owner, const QString& partId) {
+    const auto belongs = [this, &owner](const QString& selected) {
+        return maiQuestionBelongsToSession(runtime_->controller->agent(), toUtf8(selected), toUtf8(owner));
+    };
+    if (belongs(runtime_->sessionId)) {
+        runtime_->questionHistoryDirty = true;
+        if (!partId.isEmpty()) runtime_->questionPartIds.insert(partId);
+    }
+    for (auto it = runtime_->savedConversations.begin(); it != runtime_->savedConversations.end(); ++it)
+        if (belongs(it.key())) {
+            it.value()->questionHistoryDirty = true;
+            if (!partId.isEmpty()) it.value()->questionPartIds.insert(partId);
+        }
+}
+
+void AgentChatPanel::showQuestion(const QString&) {
+    const auto transcript = captureMaiQuestionTranscript(runtime_->controller->agent(), toUtf8(runtime_->sessionId), false);
+    if (transcript.pending.empty()) return;
+    // Bind the oldest pending question, not whichever callback arrived last.
+    runtime_->pendingQuestionId = fromUtf8(transcript.pending.front().id);
+    for (const auto& pending : transcript.pending) {
+        MaiMessage message;
+        if (runtime_->controller->agent().getMessage(pending.sessionId, pending.messageId, message))
+            for (const auto& part : message.parts)
+                if (part.id == pending.partId)
+                    appendQuestionPart(fromUtf8(pending.sessionId), fromUtf8(pending.messageId), part);
+    }
+    updateComposerPlaceholder();
+    setRunning(runtime_->running);
+    scrollToBottom();
 }
 
 void AgentChatPanel::clearQuestion() {
@@ -3465,11 +3606,9 @@ void AgentChatPanel::clearQuestion() {
 
 bool AgentChatPanel::reconcileQuestion() {
     if (runtime_->pendingQuestionId.isEmpty()) return false;
-    for (const MaiQuestionRequest& pending : runtime_->controller->pendingQuestions()) {
-        if (fromUtf8(pending.id) != runtime_->pendingQuestionId) continue;
-        const QString owner = fromUtf8(pending.sessionId);
-        if (owner == runtime_->sessionId || runtime_->controller->isChildOf(owner, runtime_->sessionId)) return true;
-    }
+    const auto transcript = captureMaiQuestionTranscript(runtime_->controller->agent(), toUtf8(runtime_->sessionId), false);
+    for (const auto& pending : transcript.pending)
+        if (fromUtf8(pending.id) == runtime_->pendingQuestionId) return true;
     // 只解除旧路由。草稿和附件属于用户，不能因问题在其它入口结束而清空。
     clearQuestion();
     return false;
@@ -3839,7 +3978,6 @@ void AgentChatPanel::refreshComposerMediaTray() {
 }
 
 void AgentChatPanel::updateComposerPlaceholder() {
-    if (!runtime_->pendingQuestionId.isEmpty()) return;
     runtime_->editor->setPlaceholderText(composerImagePaths().isEmpty() && composerVideoPaths().isEmpty()
         && runtime_->pendingMediaImports.value(runtime_->sessionId) == 0
         ? QStringLiteral("交给它做点什么…") : QStringLiteral("添加说明（可选）"));
@@ -3905,12 +4043,21 @@ void AgentChatPanel::appendUserVideos(const QString& messageId, const QStringLis
 }
 
 void AgentChatPanel::onSend() {
+    // A fast next Send can arrive before the queued QuestionAsked callback.
+    // Capture authoritative pending ownership before choosing send versus answer.
+    if (runtime_->pendingQuestionId.isEmpty()) showQuestion(QString());
     // 正在等回答时，**先把这一句当答案送出去**。
     //
     // 提问的答案仍优先路由到该问题；一般发送和 Stop 始终是不同动作。
     if (!runtime_->pendingQuestionId.isEmpty()) {
-        const QString answer = runtime_->editor->toPlainText().trimmed();
-        if (answer.isEmpty()) return;
+        QString answer = runtime_->editor->toPlainText();
+        answer.remove(QChar(0xFFFC));
+        answer = answer.trimmed();
+        if (answer.isEmpty()) {
+            if (!composerImagePaths().isEmpty() || !composerVideoPaths().isEmpty())
+                appendNotice(QStringLiteral("请直接输入文字回答，附件会保留在输入框中。"), false);
+            return;
+        }
         const QString questionId = runtime_->pendingQuestionId;
         // GUI 队列可能还没收到另一入口的回答/取消通知。失效答案不自动降级成
         // 新 prompt；保留草稿，下一次明确发送才按普通消息处理。
@@ -3919,6 +4066,9 @@ void AgentChatPanel::onSend() {
             appendNotice(expiredNotice, false);
             return;
         }
+        MaiQuestionRequest captured;
+        for (const auto& pending : runtime_->controller->pendingQuestions())
+            if (fromUtf8(pending.id) == questionId) captured = pending;
         if (!runtime_->controller->answerQuestion(questionId, answer)) {
             // 校验和提交之间仍可能发生结算；以核心当前状态判断，不能重复报
             // 同一个旧 questionId 的 NotFound，也不能吞掉真正的其它失败。
@@ -3928,9 +4078,37 @@ void AgentChatPanel::onSend() {
                 appendNotice(runtime_->controller->lastError(), true);
             return;
         }
-        runtime_->editor->clear();
-        appendUserBubble(answer);
+        // Consume text only. Media markers/resources and quoted context still
+        // belong to the next ordinary message in the same composer.
+        QTextDocument* document = runtime_->editor->document();
+        QList<QPair<int, int>> textRanges;
+        for (QTextBlock block = document->begin(); block.isValid(); block = block.next())
+            for (auto it = block.begin(); !it.atEnd(); ++it) {
+                const QTextFragment fragment = it.fragment();
+                if (fragment.isValid() && !fragment.charFormat().isImageFormat())
+                    textRanges.append(qMakePair(fragment.position(), fragment.length()));
+            }
+        QTextCursor cursor(document);
+        cursor.beginEditBlock();
+        for (auto it = textRanges.crbegin(); it != textRanges.crend(); ++it) {
+            cursor.setPosition(it->first);
+            cursor.setPosition(it->first + it->second, QTextCursor::KeepAnchor);
+            cursor.removeSelectedText();
+        }
+        cursor.endEditBlock();
+        if (composerImagePaths().isEmpty() && composerVideoPaths().isEmpty()) runtime_->editor->clear();
+        const QString answerItem = fromUtf8(captured.partId) + QStringLiteral("-answer");
+        runtime_->view->addItem(answerItem, MarkdownView::Style::Bubble, answer);
+        recordMessageItem(fromUtf8(captured.messageId), answerItem);
+        const QString questionItem = fromUtf8(captured.partId) + QStringLiteral("-question");
+        runtime_->view->moveItemAfter(answerItem, questionItem);
+        auto& items = runtime_->messageItems[fromUtf8(captured.messageId)];
+        items.removeAll(answerItem);
+        items.insert(items.indexOf(questionItem) + 1, answerItem);
+        runtime_->questionTimeline[fromUtf8(captured.partId)] = QStringList{questionItem, answerItem};
+        positionQuestionTranscript();
         clearQuestion();
+        showQuestion(QString());
         runtime_->view->scrollToBottom();
         return;
     }
@@ -3996,8 +4174,7 @@ void AgentChatPanel::setRunning(bool running) {
     runtime_->running = running;
     runtime_->send->setText(QString());
     runtime_->send->setIcon(makeComposerActionIcon(false, QColor(QStringLiteral("#ffffff"))));
-    runtime_->send->setToolTip(!runtime_->pendingQuestionId.isEmpty() ? QStringLiteral("回答问题")
-                                                                      : QStringLiteral("发送消息"));
+    runtime_->send->setToolTip(QStringLiteral("发送消息"));
     runtime_->send->setAccessibleName(runtime_->send->toolTip());
     runtime_->send->setStyleSheet(
         UiZoom::scaleQss(QStringLiteral("QPushButton#agentSendButton{background:%1;color:#ffffff;"

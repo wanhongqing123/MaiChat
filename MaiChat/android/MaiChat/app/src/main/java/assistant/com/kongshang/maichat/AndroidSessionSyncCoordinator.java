@@ -68,6 +68,7 @@ final class AndroidSessionSyncCoordinator {
     private final Set<String> initiallyPublishedSessions = ConcurrentHashMap.newKeySet();
     private final Map<String, String> publishedMessageDigests = new ConcurrentHashMap<>();
     private final Map<String, String> publishedStateDigests = new ConcurrentHashMap<>();
+    private final AIAssistantPublishPages pendingPublishPages = new AIAssistantPublishPages();
     private final BlockingQueue<String> backfillSessions = new LinkedBlockingQueue<>(200);
     private final Map<String, String> backfillBefore = new ConcurrentHashMap<>();
     private final Object socketLock = new Object();
@@ -331,6 +332,7 @@ final class AndroidSessionSyncCoordinator {
                         backfillSessions.remove(removed);
                         backfillBefore.remove(removed);
                         publishedStateDigests.remove(removed);
+                        pendingPublishPages.discard(removed);
                         publishedMessageDigests.keySet().removeIf(
                             key -> key.startsWith(removed + ":"));
                     }
@@ -338,9 +340,11 @@ final class AndroidSessionSyncCoordinator {
                 }
                 JSONObject envelope = mailbox.poll(1000, TimeUnit.MILLISECONDS);
                 if (envelope != null) handle(envelope);
-                for (String session : dirtySessions) {
-                    publishSession(session, "");
+                for (String session : new java.util.HashSet<>(dirtySessions)) {
+                    // 先移除再发布，发布中产生的 callback/hasMore 才能留下下一批，不能被末尾 remove 吞掉。
                     dirtySessions.remove(session);
+                    try { publishSession(session, ""); }
+                    catch (Exception failure) { dirtySessions.add(session); throw failure; }
                 }
                 if (System.currentTimeMillis() - lastBackfill >= 5000 &&
                     !backfillSessions.isEmpty()) {
@@ -478,21 +482,57 @@ final class AndroidSessionSyncCoordinator {
         }
     }
 
+    static JSONArray publicationMessages(JSONObject page) {
+        java.util.LinkedHashMap<String, JSONObject> unique = new java.util.LinkedHashMap<>();
+        for (String field : new String[] {"messages", "messageUpdates"}) {
+            JSONArray source = page.optJSONArray(field);
+            if (source == null) continue;
+            for (int i = 0; i < source.length(); i++) {
+                JSONObject message = source.optJSONObject(i);
+                if (message != null && !message.optString("id").isEmpty()) unique.put(message.optString("id"), message);
+            }
+        }
+        JSONArray result = new JSONArray();
+        for (JSONObject message : unique.values()) result.put(message);
+        return result;
+    }
+
+    // 所有发布入口共用状态字段；后代问答只传独立 questionMessages，不能混进根历史分页。
+    static JSONObject publishPayload(String session, JSONArray messages, JSONObject page) throws org.json.JSONException {
+        JSONObject request = new JSONObject().put("session_id", session)
+            .put("messages", messages == null ? new JSONArray() : messages)
+            .put("busy", page.optBoolean("busy")).put("turnId", page.optString("turnId"));
+        for (String name : new String[] {"permissions", "questions", "questionMessages"}) {
+            JSONArray values = page.optJSONArray(name);
+            request.put(name, values == null ? new JSONArray() : values);
+        }
+        JSONArray projections = new JSONArray(request.getJSONArray("questionMessages").toString());
+        while (projections.length() > 0 && request.toString().getBytes(StandardCharsets.UTF_8).length > 95 * 1024) {
+            projections.remove(0);
+            request.put("questionMessages", projections);
+        }
+        return request;
+    }
+    private static String publishedStateDigest(JSONObject payload) throws Exception {
+        return hex(MessageDigest.getInstance("SHA-256").digest(
+            publishPayload(payload.optString("session_id"), new JSONArray(), payload).toString().getBytes(StandardCharsets.UTF_8)));
+    }
+
     private String publishSession(String sessionId, String before) throws Exception {
-        CompletableFuture<JSONObject> state = new CompletableFuture<>();
-        controller.historyForSync(sessionId, before, 20, state::complete);
-        JSONObject page = state.get(15, TimeUnit.SECONDS);
-        if (!page.optBoolean("ok")) return null;
-        JSONArray messages = page.optJSONArray("messages");
-        JSONArray permissions = page.optJSONArray("permissions");
-        JSONArray questions = page.optJSONArray("questions");
-        if (messages == null) messages = new JSONArray();
-        if (permissions == null) permissions = new JSONArray();
-        if (questions == null) questions = new JSONArray();
-        String stateDigest = hex(MessageDigest.getInstance("SHA-256").digest(
-            (permissions.toString() + questions.toString() + page.optBoolean("busy")
-                + ":" + page.optString("turnId")).getBytes(StandardCharsets.UTF_8)));
-        boolean sentMessage = false;
+        JSONObject page = pendingPublishPages.page(sessionId, before);
+        boolean retrying = page != null;
+        if (page == null) {
+            CompletableFuture<JSONObject> state = new CompletableFuture<>();
+            controller.historyForSync(sessionId, before, 20, before.isEmpty(), state::complete);
+            page = state.get(15, TimeUnit.SECONDS);
+            if (!page.optBoolean("ok")) return null;
+            // Native 远端队列已被消费；全部原 ID 发布成功前，重试必须使用同一份捕获页。
+            pendingPublishPages.remember(sessionId, before, page);
+        }
+        JSONArray pagingMessages = page.optJSONArray("messages");
+        if (pagingMessages == null) pagingMessages = new JSONArray();
+        JSONArray messages = publicationMessages(page);
+        String stateDigest = publishedStateDigest(publishPayload(sessionId, new JSONArray(), page));
         for (int i = 0; i < messages.length(); i++) {
             JSONObject message = messages.optJSONObject(i);
             if (message == null) continue;
@@ -500,39 +540,37 @@ final class AndroidSessionSyncCoordinator {
             String digest = hex(MessageDigest.getInstance("SHA-256").digest(
                 message.toString().getBytes(StandardCharsets.UTF_8)));
             if (digest.equals(publishedMessageDigests.get(key))) continue;
-            request("publish", new JSONObject().put("session_id", sessionId)
-                .put("messages", new JSONArray().put(message))
-                .put("permissions", permissions).put("questions", questions)
-                .put("busy", page.optBoolean("busy")).put("turnId", page.optString("turnId")), 15000);
+            JSONObject publication = publishPayload(sessionId, new JSONArray().put(message), page);
+            request("publish", publication, 15000);
             publishedMessageDigests.put(key, digest);
-            publishedStateDigests.put(sessionId, stateDigest);
-            sentMessage = true;
+            publishedStateDigests.put(sessionId, publishedStateDigest(publication));
         }
-        if (!sentMessage && !stateDigest.equals(publishedStateDigests.get(sessionId))) {
-            request("publish", new JSONObject().put("session_id", sessionId)
-                .put("messages", new JSONArray())
-                .put("permissions", permissions).put("questions", questions)
-                .put("busy", page.optBoolean("busy")).put("turnId", page.optString("turnId")), 15000);
+        // 若大正文裁掉显示投影，紧接着用独立小状态帧恢复全集；不能把裁剪误记成完整状态。
+        if (!stateDigest.equals(publishedStateDigests.get(sessionId))) {
+            request("publish", publishPayload(sessionId, new JSONArray(), page), 15000);
             publishedStateDigests.put(sessionId, stateDigest);
         }
-        JSONObject oldest = messages.optJSONObject(messages.length() - 1);
-        return messages.length() == 20 && oldest != null ? oldest.optString("id") : null;
+        pendingPublishPages.complete(sessionId, before);
+        if (retrying || page.optBoolean("hasMessageUpdates")) schedulePublish(sessionId);
+        JSONObject oldest = pagingMessages.optJSONObject(pagingMessages.length() - 1);
+        return pagingMessages.length() == 20 && oldest != null ? oldest.optString("id") : null;
     }
 
     String localSlot() { return slot; }
     String localLoginSessionId() { return localLoginSessionId; }
 
     void publishAttachedMessage(String sessionId, JSONObject message,
-                                JSONArray permissions, JSONArray questions, boolean busy, String turnId) {
+                                JSONArray permissions, JSONArray questions, JSONArray questionMessages,
+                                boolean busy, String turnId) {
         if (closed) return;
         outbound.execute(() -> {
             for (int attempt = 0; attempt < 5 && !closed; attempt++) {
                 try {
-                    request("publish",new JSONObject().put("session_id",sessionId)
-                        .put("messages",new JSONArray().put(message))
-                        .put("permissions",permissions == null ? new JSONArray() : permissions)
-                        .put("questions",questions == null ? new JSONArray() : questions)
-                        .put("busy",busy).put("turnId",turnId),15000);
+                    JSONObject page = new JSONObject().put("permissions", permissions).put("questions", questions)
+                        .put("questionMessages", questionMessages).put("busy", busy).put("turnId", turnId);
+                    request("publish", publishPayload(sessionId, new JSONArray().put(message), page), 15000);
+                    publishedStateDigests.remove(sessionId);
+                    schedulePublish(sessionId);
                     return;
                 } catch (Exception failure) {
                     if (attempt == 4) Log.w(TAG,"Session attachment history sync failed");

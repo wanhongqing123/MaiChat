@@ -87,6 +87,7 @@ function openSessionSyncStore(filename) {
       session_id TEXT NOT NULL,
       permissions TEXT NOT NULL,
       questions TEXT NOT NULL,
+      question_messages TEXT NOT NULL DEFAULT '[]',
       updated_at INTEGER NOT NULL,
       PRIMARY KEY(account_id, owner_slot, session_id)
     );
@@ -100,6 +101,10 @@ function openSessionSyncStore(filename) {
   // Runtime turn binding is control-plane metadata, not a persisted model request.
   if (!sessionColumns.has('turn_id'))
     db.exec("ALTER TABLE sync_sessions ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''");
+  // Child question projections are bounded room state; root history rows/cursors remain separate.
+  const roomStateColumns = new Set(db.pragma('table_info(sync_room_state)').map(row => row.name));
+  if (!roomStateColumns.has('question_messages'))
+    db.exec("ALTER TABLE sync_room_state ADD COLUMN question_messages TEXT NOT NULL DEFAULT '[]'");
   // 进程重启后，旧心跳不能证明设备仍连着新进程；等待它重新上报。
   db.prepare('UPDATE sync_devices SET last_seen=0').run();
   // 未确认的事件可在新连接上立即重发；命令仍保持首次投递语义。

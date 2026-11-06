@@ -26,6 +26,17 @@ final class AIAssistantMessagePages {
     private Ticket pending;
     private final TreeMap<String, JSONObject> loaded = new TreeMap<>();
     private final Map<String, String> encoded = new TreeMap<>();
+    private final boolean isolateOldUpdates;
+    private final java.util.LinkedHashMap<String, JSONObject> displayUpdates = new java.util.LinkedHashMap<>();
+    private final Map<String, String> displayEncoded = new TreeMap<>();
+
+    AIAssistantMessagePages() { this(false); }
+    AIAssistantMessagePages(boolean isolateOldUpdates) { this.isolateOldUpdates = isolateOldUpdates; }
+    JSONArray displayUpdates() {
+        JSONArray result = new JSONArray();
+        for (JSONObject message : displayUpdates.values()) result.put(message);
+        return result;
+    }
 
     Ticket select(String nextOwner) {
         if (!owner.equals(nextOwner)) { owner = nextOwner; reset(); }
@@ -33,7 +44,7 @@ final class AIAssistantMessagePages {
     }
     void reset() {
         generation++; initialized = false; hasOlder = false; loading = false; olderVisited = false; pending = null;
-        loaded.clear(); encoded.clear();
+        loaded.clear(); encoded.clear(); displayUpdates.clear(); displayEncoded.clear();
         oldestPageCursor = "";
     }
     boolean matches(Ticket ticket) {
@@ -63,6 +74,14 @@ final class AIAssistantMessagePages {
             int count = messages == null ? 0 : messages.length();
             hasOlder = snapshot.optBoolean("hasOlderMessages", count >= LATEST_LIMIT);
             oldestPageCursor = oldestPageId(messages);
+            if (isolateOldUpdates && snapshot.optBoolean("initialHistoryPage") && !oldestPageCursor.isEmpty()) {
+                // 首次 history 到达前可能先收到旧 assistant 广播；它不能永久占据连续根窗口。
+                for (String id : new java.util.ArrayList<>(loaded.keySet())) if (id.compareTo(oldestPageCursor) < 0) {
+                    displayUpdates.put(id, loaded.remove(id));
+                    displayEncoded.put(id, encoded.remove(id));
+                }
+                trimDisplayUpdates();
+            }
             initialized = true;
         }
         merge(messages, false);
@@ -98,6 +117,12 @@ final class AIAssistantMessagePages {
         }
         return oldest;
     }
+    private void trimDisplayUpdates() {
+        while (displayUpdates.size() > 20) {
+            String oldest = displayUpdates.keySet().iterator().next();
+            displayUpdates.remove(oldest); displayEncoded.remove(oldest);
+        }
+    }
     private void merge(JSONArray messages, boolean historical) throws JSONException {
         if (messages == null) return;
         for (int i = 0; i < messages.length(); i++) {
@@ -105,9 +130,24 @@ final class AIAssistantMessagePages {
             if (item == null) continue;
             String id = item.optString("id");
             if (id.isEmpty() || (historical && loaded.containsKey(id))) continue;
+            if (historical && displayUpdates.containsKey(id)) {
+                // 真正的连续旧页到达才接管旁路；不能用较旧 history 覆盖已收到的新工具结果。
+                item = displayUpdates.remove(id);
+                displayEncoded.remove(id);
+            }
             JSONObject copy = new JSONObject(item.toString());
             copy.remove("uiRevision");
             String value = copy.toString();
+            if (isolateOldUpdates && !historical && !loaded.containsKey(id) && !oldestPageCursor.isEmpty()
+                && id.compareTo(oldestPageCursor) < 0) {
+                if (value.equals(displayEncoded.get(id))) continue;
+                copy.put("uiRevision", ++revision);
+                displayUpdates.remove(id);
+                displayUpdates.put(id, copy); displayEncoded.put(id, value);
+                trimDisplayUpdates();
+                continue;
+            }
+            displayUpdates.remove(id); displayEncoded.remove(id);
             if (value.equals(encoded.get(id))) continue;
             // 工具正文只在消息实际改变时产生新版本，回收行的重复 bind 不再解析原始输出。
             copy.put("uiRevision", ++revision);

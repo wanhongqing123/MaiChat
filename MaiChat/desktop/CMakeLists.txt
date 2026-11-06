@@ -2,7 +2,7 @@
 # 平台 SDK 和可选媒体能力由配置阶段检查；真实编译命令可导出给 clangd。
 cmake_minimum_required(VERSION 3.21)
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 2.2.50 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 2.2.51 LANGUAGES C CXX)
 if(MSVC AND CMAKE_CL_SHOWINCLUDES_PREFIX MATCHES "^娉")
   # Some CMake/VS2019 locale combinations double-decode /showIncludes. Ninja then
   # records no header dependencies, so changing a public header leaves stale objects.
@@ -824,6 +824,8 @@ add_library(maichat_agent
   src/agent/AgentController.cpp
   ../MaiChatTools/MaiQrCode.h
   ../MaiChatTools/MaiQrCode.cpp
+  ../MaiChatTools/MaiQuestionTranscript.h
+  ../MaiChatTools/MaiQuestionTranscript.cpp
   ../MaiChatTools/MaiSessionSchedule.h
   ../MaiChatTools/MaiSessionSchedule.cpp
   ../MaiChatTools/MaiSessionScheduleTools.cpp

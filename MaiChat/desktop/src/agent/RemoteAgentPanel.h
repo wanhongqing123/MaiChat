@@ -38,7 +38,7 @@ private:
     void finishQueued(const QString& requestId, const QJsonObject& result, bool unknown = false);
     void recoverQueuedDraft();
     void refreshAttachments();
-    void sendAction(const QJsonObject& action, bool clearDraft);
+    void sendAction(const QJsonObject& action, bool clearDraft, const QJsonObject& question = {});
     void removeOptimisticMessage(const QString& id);
     void renderMessages();
     void updateThinking();

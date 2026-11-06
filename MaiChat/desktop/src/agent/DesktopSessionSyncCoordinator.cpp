@@ -15,14 +15,46 @@
 #include <QUuid>
 #include <QtConcurrent/QtConcurrentRun>
 
+#include <algorithm>
+
 #include "agent/AgentController.h"
 #include "agent/DesktopSessionSyncHost.h"
+#include "MaiQuestionTranscript.h"
 #include "agent/DesktopSessionAttachments.h"
 
 namespace {
 
 QString newId() {
     return QUuid::createUuid().toString(QUuid::WithoutBraces).remove(QLatin1Char('-'));
+}
+
+QJsonObject roomState(const QJsonObject& source) {
+    return {{QStringLiteral("permissions"), source.value(QStringLiteral("permissions")).toArray()},
+            {QStringLiteral("questions"), source.value(QStringLiteral("questions")).toArray()},
+            {QStringLiteral("questionMessages"), source.value(QStringLiteral("questionMessages")).toArray()},
+            {QStringLiteral("busy"), source.value(QStringLiteral("busy"))},
+            {QStringLiteral("turnId"), source.value(QStringLiteral("turnId"))}};
+}
+
+QByteArray roomStateDigest(const QJsonObject& source) {
+    return QCryptographicHash::hash(QJsonDocument(roomState(source)).toJson(QJsonDocument::Compact),
+                                    QCryptographicHash::Sha256);
+}
+
+QJsonObject boundedRoomPublish(const QString& sessionId, const QJsonArray& messages, const QJsonObject& state,
+                               bool& trimmed) {
+    QJsonObject body = state;
+    body.insert(QStringLiteral("session_id"), sessionId);
+    body.insert(QStringLiteral("messages"), messages);
+    QJsonArray projection = body.value(QStringLiteral("questionMessages")).toArray();
+    trimmed = false;
+    // 为 WSS 的 id/op/body 包装留出 1 KiB；只能裁旧问答投影，不能改根正文或待回答问题。
+    while (!projection.isEmpty() && QJsonDocument(body).toJson(QJsonDocument::Compact).size() > 95 * 1024) {
+        projection.removeAt(0);
+        body.insert(QStringLiteral("questionMessages"), projection);
+        trimmed = true;
+    }
+    return body;
 }
 
 }  // namespace
@@ -74,6 +106,12 @@ void DesktopSessionSyncCoordinator::connectionLost() {
     initiallyPublishedSessions_.clear();
     publishedMessageDigests_.clear();
     publishedStateDigests_.clear();
+    ++publishEpoch_;
+    desiredPublishedStates_.clear();
+    pendingMessagePublishes_.clear();
+    messagePublishRevisions_.clear();
+    roomStateRestoresPending_.clear();
+    roomStateRestoresInFlight_.clear();
     backfillTimer_.stop();
     backfillSessions_.clear();
     backfillBefore_.clear();
@@ -316,24 +354,38 @@ DesktopSessionSyncHost* DesktopSessionSyncCoordinator::host() {
     snapshotTimer_.stop();
     backfillTimer_.stop();
     pendingSnapshotSessions_.clear();
+    pendingMessageUpdates_.clear();
+    snapshotRootOwners_.clear();
     initiallyPublishedSessions_.clear();
     backfillSessions_.clear();
     backfillBefore_.clear();
     publishedMessageDigests_.clear();
     publishedStateDigests_.clear();
+    ++publishEpoch_;
+    desiredPublishedStates_.clear();
+    pendingMessagePublishes_.clear();
+    messagePublishRevisions_.clear();
+    roomStateRestoresPending_.clear();
+    roomStateRestoresInFlight_.clear();
     host_.reset();
     agent_ = current;
     if (!current) return nullptr;
     host_ = std::make_unique<DesktopSessionSyncHost>(*current);
     host_->setDefaultWorkspaceDirectory(defaultWorkspaceDirectory_);
+    connect(current, &AgentController::textDelta, this,
+            [this](const QString& session, const QString& message, const QString&, const QString&) {
+                scheduleSnapshot(session, message);
+            });
+    connect(current, &AgentController::reasoningDelta, this,
+            [this](const QString& session, const QString& message, const QString&, const QString&) {
+                scheduleSnapshot(session, message);
+            });
     connect(
-        current, &AgentController::textDelta, this,
-        [this](const QString& session, const QString&, const QString&, const QString&) { scheduleSnapshot(session); });
-    connect(
-        current, &AgentController::reasoningDelta, this,
-        [this](const QString& session, const QString&, const QString&, const QString&) { scheduleSnapshot(session); });
-    connect(current, &AgentController::toolPartChanged, this,
-            [this](const QString& session, const QString&, const QString&) { scheduleSnapshot(session); });
+        current, &AgentController::toolPartChanged, this,
+        [this](const QString& session, const QString& message, const QString&) { scheduleSnapshot(session, message); });
+    // 控制器已将 Core 事件排到 Qt 线程；最终完成也按原 ID 更新，不暴露内部事件桥。
+    connect(current, &AgentController::storedMessageUpdated, this,
+            [this](const QString& session, const QString& message) { scheduleSnapshot(session, message); });
     connect(current, &AgentController::turnFinished, this,
             [this](const QString& session) { scheduleSnapshot(session); });
     connect(current, &AgentController::turnFailed, this,
@@ -342,7 +394,10 @@ DesktopSessionSyncHost* DesktopSessionSyncCoordinator::host() {
             [this](const QString&, const QString& session) { scheduleSnapshot(session); });
     connect(current, &AgentController::questionAsked, this,
             [this](const QString&, const QString& session, const QString&) { scheduleSnapshot(session); });
-    connect(current, &AgentController::sessionStructureChanged, this, [this] { publishPresence(); });
+    connect(current, &AgentController::sessionStructureChanged, this, [this] {
+        snapshotRootOwners_.clear();
+        publishPresence();
+    });
     connect(current, &AgentController::sessionTitleChanged, this,
             [this](const QString&, const QString&) { publishPresence(); });
     return host_.get();
@@ -417,6 +472,12 @@ void DesktopSessionSyncCoordinator::finishDeletedRoom(const QString& oldId) {
     backfillSessions_.removeAll(oldId);
     backfillBefore_.remove(oldId);
     publishedStateDigests_.remove(oldId);
+    pendingMessageUpdates_.remove(oldId);
+    desiredPublishedStates_.remove(oldId);
+    pendingMessagePublishes_.remove(oldId);
+    messagePublishRevisions_.remove(oldId);
+    roomStateRestoresPending_.remove(oldId);
+    roomStateRestoresInFlight_.remove(oldId);
     for (auto it = publishedMessageDigests_.begin(); it != publishedMessageDigests_.end();) {
         if (it.key().startsWith(oldId + QLatin1Char(':')))
             it = publishedMessageDigests_.erase(it);
@@ -778,17 +839,53 @@ void DesktopSessionSyncCoordinator::flushOutbound() {
                });
 }
 
-void DesktopSessionSyncCoordinator::scheduleSnapshot(const QString& sessionId) {
+void DesktopSessionSyncCoordinator::scheduleSnapshot(const QString& sessionId, const QString& messageId) {
     if (sessionId.isEmpty()) return;
-    pendingSnapshotSessions_.insert(sessionId);
+    AgentController* current = agentProvider_();
+    if (!current) return;
+    if (current != agent_) host();
+    QString root = snapshotRootOwners_.value(sessionId);
+    if (root.isEmpty()) {
+        // AgentController 已把 Core 事件排到 Qt 宿主线程；在这里查归属，
+        // 不在同步 Core publish 回调中查库。子任务问题必须发布到根会话房间。
+        root = QString::fromStdString(maiQuestionRootSessionId(current->agent(), sessionId.toStdString()));
+        if (root.isEmpty()) return;
+        if (snapshotRootOwners_.size() >= 256) snapshotRootOwners_.clear();
+        snapshotRootOwners_.insert(sessionId, root);
+    }
+    pendingSnapshotSessions_.insert(root);
+    if (root == sessionId && !messageId.isEmpty()) pendingMessageUpdates_[root].insert(messageId);
     if (!snapshotTimer_.isActive()) snapshotTimer_.start();
 }
 
 void DesktopSessionSyncCoordinator::publishSnapshot(const QString& sessionId) {
     DesktopSessionSyncHost* current = host();
     if (!current || sessionId.isEmpty()) return;
-    const QJsonObject page = current->historyPage(sessionId, {}, 20);
+    QJsonObject page = current->historyPage(sessionId, {}, 20);
     if (!page.value(QStringLiteral("ok")).toBool()) return;
+    QJsonArray messages = page.value(QStringLiteral("messages")).toArray();
+    auto updates = pendingMessageUpdates_.value(sessionId).values();
+    std::sort(updates.begin(), updates.end());
+    // 根 messages 保持原游标语义；这里仅为 publish 合入已知事件 owner，接收端按 ID 更新。
+    for (int index = 0; index < qMin(20, updates.size()); ++index) {
+        const auto id = updates[index];
+        pendingMessageUpdates_[sessionId].remove(id);
+        const auto updated = current->messageUpdate(sessionId, id);
+        if (updated.isEmpty()) continue;
+        bool replaced = false;
+        for (int item = 0; item < messages.size(); ++item)
+            if (messages[item].toObject().value(QStringLiteral("id")).toString() == id) {
+                messages[item] = updated;
+                replaced = true;
+                break;
+            }
+        if (!replaced) messages.append(updated);
+    }
+    if (pendingMessageUpdates_.value(sessionId).isEmpty())
+        pendingMessageUpdates_.remove(sessionId);
+    else
+        scheduleSnapshot(sessionId);
+    page.insert(QStringLiteral("messages"), messages);
     publishPage(sessionId, page);
 }
 
@@ -826,34 +923,12 @@ void DesktopSessionSyncCoordinator::processBackfillPage() {
 
 void DesktopSessionSyncCoordinator::publishPage(const QString& sessionId, const QJsonObject& page) {
     const QJsonArray messages = page.value(QStringLiteral("messages")).toArray();
-    const QJsonObject state{{QStringLiteral("permissions"), page.value(QStringLiteral("permissions"))},
-                            {QStringLiteral("busy"), page.value(QStringLiteral("busy"))},
-                            {QStringLiteral("turnId"), page.value(QStringLiteral("turnId"))},
-                            {QStringLiteral("questions"), page.value(QStringLiteral("questions"))}};
-    const QByteArray stateDigest =
-        QCryptographicHash::hash(QJsonDocument(state).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256);
-    auto publish = [this, sessionId, page, stateDigest](const QJsonArray& batch, const QString& key,
-                                                        const QByteArray& digest) {
-        if (!key.isEmpty()) publishedMessageDigests_.insert(key, digest);
-        publishedStateDigests_.insert(sessionId, stateDigest);
-        QPointer<DesktopSessionSyncCoordinator> guard(this);
-        requester_(QStringLiteral("session-sync/publish"), "POST",
-                   {{QStringLiteral("session_id"), sessionId},
-                    {QStringLiteral("messages"), batch},
-                    {QStringLiteral("busy"), page.value(QStringLiteral("busy"))},
-                    {QStringLiteral("turnId"), page.value(QStringLiteral("turnId"))},
-                    {QStringLiteral("permissions"), page.value(QStringLiteral("permissions"))},
-                    {QStringLiteral("questions"), page.value(QStringLiteral("questions"))}},
-                   [guard, key, digest, sessionId, stateDigest](const QJsonObject&, const QString& error) {
-                       if (!guard || error.isEmpty()) return;
-                       if (!key.isEmpty() && guard->publishedMessageDigests_.value(key) == digest)
-                           guard->publishedMessageDigests_.remove(key);
-                       if (guard->publishedStateDigests_.value(sessionId) == stateDigest)
-                           guard->publishedStateDigests_.remove(sessionId);
-                       guard->initiallyPublishedSessions_.remove(sessionId);
-                   });
-    };
-    bool sentMessage = false;
+    const auto state = roomState(page);
+    if (pendingMessagePublishes_.value(sessionId) > 0 &&
+        roomStateDigest(desiredPublishedStates_.value(sessionId)) != roomStateDigest(state))
+        roomStateRestoresPending_.insert(sessionId);
+    desiredPublishedStates_.insert(sessionId, state);
+    QList<QJsonObject> changed;
     for (const QJsonValue& message : messages) {
         const QString id = message.toObject().value(QStringLiteral("id")).toString();
         if (id.isEmpty()) continue;
@@ -861,8 +936,83 @@ void DesktopSessionSyncCoordinator::publishPage(const QString& sessionId, const 
         const QByteArray digest = QCryptographicHash::hash(
             QJsonDocument(message.toObject()).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256);
         if (publishedMessageDigests_.value(key) == digest) continue;
-        publish(QJsonArray{message}, key, digest);
-        sentMessage = true;
+        changed.append(message.toObject());
     }
-    if (!sentMessage && publishedStateDigests_.value(sessionId) != stateDigest) publish(QJsonArray{}, {}, {});
+    // 先登记整个批次，再发请求；测试/本地传输的同步回调也不能抢先补状态。
+    if (!changed.isEmpty()) ++messagePublishRevisions_[sessionId];
+    pendingMessagePublishes_[sessionId] += changed.size();
+    const auto epoch = publishEpoch_;
+    for (const auto& message : changed) {
+        bool trimmed = false;
+        const auto body = boundedRoomPublish(sessionId, QJsonArray{message}, state, trimmed);
+        if (trimmed) roomStateRestoresPending_.insert(sessionId);
+        if (QJsonDocument(body).toJson(QJsonDocument::Compact).size() > 95 * 1024) {
+            --pendingMessagePublishes_[sessionId];
+            initiallyPublishedSessions_.remove(sessionId);
+            continue;
+        }
+        const QString key = sessionId + QLatin1Char(':') + message.value(QStringLiteral("id")).toString();
+        const auto digest =
+            QCryptographicHash::hash(QJsonDocument(message).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256);
+        const auto actualStateDigest = roomStateDigest(body);
+        publishedMessageDigests_.insert(key, digest);
+        publishedStateDigests_.insert(sessionId, actualStateDigest);
+        QPointer<DesktopSessionSyncCoordinator> guard(this);
+        requester_(
+            QStringLiteral("session-sync/publish"), "POST", body,
+            [guard, key, digest, sessionId, actualStateDigest, epoch](const QJsonObject&, const QString& error) {
+                if (!guard || guard->publishEpoch_ != epoch || !guard->desiredPublishedStates_.contains(sessionId))
+                    return;
+                if (!error.isEmpty()) {
+                    if (guard->publishedMessageDigests_.value(key) == digest)
+                        guard->publishedMessageDigests_.remove(key);
+                    if (guard->publishedStateDigests_.value(sessionId) == actualStateDigest)
+                        guard->publishedStateDigests_.remove(sessionId);
+                    guard->initiallyPublishedSessions_.remove(sessionId);
+                }
+                // 失败也释放计数；旧 ACK 不写新的 digest，只在全批次结束后补最新状态。
+                guard->pendingMessagePublishes_[sessionId] =
+                    qMax(0, guard->pendingMessagePublishes_.value(sessionId) - 1);
+                guard->restorePublishedRoomState(sessionId);
+            });
+    }
+    restorePublishedRoomState(sessionId);
+}
+
+void DesktopSessionSyncCoordinator::restorePublishedRoomState(const QString& sessionId) {
+    if (!desiredPublishedStates_.contains(sessionId) || pendingMessagePublishes_.value(sessionId) > 0 ||
+        roomStateRestoresInFlight_.contains(sessionId))
+        return;
+    const auto state = desiredPublishedStates_.value(sessionId);
+    const auto desiredDigest = roomStateDigest(state);
+    if (!roomStateRestoresPending_.contains(sessionId) && publishedStateDigests_.value(sessionId) == desiredDigest)
+        return;
+    bool trimmed = false;
+    const auto body = boundedRoomPublish(sessionId, QJsonArray{}, state, trimmed);
+    if (QJsonDocument(body).toJson(QJsonDocument::Compact).size() > 95 * 1024) return;
+    const auto actualDigest = roomStateDigest(body);
+    const auto revision = messagePublishRevisions_.value(sessionId);
+    const auto epoch = publishEpoch_;
+    roomStateRestoresPending_.remove(sessionId);
+    roomStateRestoresInFlight_.insert(sessionId);
+    publishedStateDigests_.insert(sessionId, actualDigest);
+    QPointer<DesktopSessionSyncCoordinator> guard(this);
+    requester_(
+        QStringLiteral("session-sync/publish"), "POST", body,
+        [guard, sessionId, actualDigest, desiredDigest, revision, epoch](const QJsonObject&, const QString& error) {
+            if (!guard || guard->publishEpoch_ != epoch || !guard->desiredPublishedStates_.contains(sessionId)) return;
+            guard->roomStateRestoresInFlight_.remove(sessionId);
+            if (!error.isEmpty()) {
+                if (guard->publishedStateDigests_.value(sessionId) == actualDigest)
+                    guard->publishedStateDigests_.remove(sessionId);
+                guard->roomStateRestoresPending_.insert(sessionId);
+                guard->initiallyPublishedSessions_.remove(sessionId);
+                return;  // 网络失败留给下一次真实快照重试，不在回调中无限重发。
+            }
+            if (guard->messagePublishRevisions_.value(sessionId) != revision ||
+                roomStateDigest(guard->desiredPublishedStates_.value(sessionId)) != desiredDigest) {
+                guard->roomStateRestoresPending_.insert(sessionId);
+                guard->restorePublishedRoomState(sessionId);
+            }
+        });
 }

@@ -458,6 +458,11 @@ private slots:
     void pendingApprovalIsRestoredAfterSessionSwitch();
     void approvedChildToolCompletesWhileParentPageIsCached();
     void pendingQuestionIsRestoredOnlyInItsSession();
+    void questionUsesNormalTranscriptAndSurvivesColdReplay();
+    void childQuestionUsesParentComposerWithoutConsumingMedia();
+    void childQuestionKeepsItsPositionBetweenParentParts();
+    void nestedQuestionsFollowOrderAndReleaseAfterCancellation();
+    void rootQuestionAfterSteeringKeepsItsPartPosition();
     void stoppedQuestionReleasesComposerWithoutLosingDraft();
     void externalQuestionAnswerReleasesComposerWithoutLosingDraft();
     void expiredQuestionKeepsDraftUntilExplicitResend();
@@ -1548,6 +1553,265 @@ void AgentPanelSessionTest::approvedChildToolCompletesWhileParentPageIsCached() 
     QVERIFY(foundOutput);
 }
 
+// The question tool is persisted protocol state; the visible conversation uses
+// its real part ID without inventing a second Core User message.
+void AgentPanelSessionTest::questionUsesNormalTranscriptAndSurvivesColdReplay() {
+    AgentController controller(std::make_unique<QuestionModel>(), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 700);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(QDir::currentPath());
+    panel.openSession(session);
+    auto* editor = panel.findChild<QTextEdit*>();
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(editor && send && view);
+    editor->setPlainText(QStringLiteral("ask me"));
+    send->click();
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    QTRY_VERIFY(panel.findChild<MarkdownView*>()->contains(
+        QString::fromStdString(controller.pendingQuestions().front().partId) + QStringLiteral("-question")));
+    const auto question = controller.pendingQuestions().front();
+    const QString questionItem = QString::fromStdString(question.partId) + QStringLiteral("-question");
+    const QString answerItem = QString::fromStdString(question.partId) + QStringLiteral("-answer");
+    QTRY_VERIFY(view->contains(questionItem));
+    QCOMPARE(editor->placeholderText(), QStringLiteral("交给它做点什么…"));
+    QCOMPARE(send->toolTip(), QStringLiteral("发送消息"));
+    QCOMPARE(view->itemRect(questionItem).left(), qreal(UiZoom::s(48)));
+    QVERIFY(panel.findChildren<QWidget*>(QStringLiteral("agentToolGroup")).empty());
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("normal-question-pending")));
+    editor->setPlainText(QStringLiteral("Use A"));
+    send->click();
+    QTRY_VERIFY(view->contains(answerItem));
+    controller.agent().waitIdle();
+    QCoreApplication::processEvents();
+    for (int i = 0; i < 3; ++i) panel.openSession(controller.createSession(QDir::currentPath()));
+    panel.openSession(session);
+    QVERIFY(view->contains(questionItem));
+    QVERIFY(view->contains(answerItem));
+    view->selectAll();
+    QCOMPARE(view->selectedText().count(QStringLiteral("Choose A or B")), 1);
+    QCOMPARE(view->selectedText().count(QStringLiteral("Use A")), 1);
+    view->clearSelection();
+    int userMessages = 0;
+    for (const auto& message : controller.agent().listMessages(session.toStdString()))
+        if (message.role == MaiRole::User) ++userMessages;
+    QCOMPARE(userMessages, 1);
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("normal-question-answered-replay")));
+}
+
+void AgentPanelSessionTest::childQuestionUsesParentComposerWithoutConsumingMedia() {
+    AgentController controller(std::make_unique<QuestionModel>(), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 700);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString root = controller.createSession(QDir::currentPath());
+    panel.openSession(root);
+    const auto child = controller.agent().spawnSubAgent(root.toStdString(), "question-reviewer", "Ask a question");
+    QVERIFY(child);
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    QTRY_VERIFY(panel.findChild<MarkdownView*>()->contains(
+        QString::fromStdString(controller.pendingQuestions().front().partId) + QStringLiteral("-question")));
+    const auto question = controller.pendingQuestions().front();
+    auto* editor = panel.findChild<QTextEdit*>();
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(editor && send && view);
+    const QString questionItem = QString::fromStdString(question.partId) + QStringLiteral("-question");
+    const QString answerItem = QString::fromStdString(question.partId) + QStringLiteral("-answer");
+    QTRY_VERIFY(view->contains(questionItem));
+    QTemporaryDir media;
+    QImage image(10, 10, QImage::Format_RGB32);
+    image.fill(Qt::blue);
+    const QString path = media.filePath(QStringLiteral("draft.png"));
+    QVERIFY(image.save(path));
+    QTextImageFormat format;
+    format.setName(path);
+    editor->textCursor().insertImage(format);
+    send->click();
+    QCOMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    QVERIFY(editor->toPlainText().contains(QChar(0xFFFC)));
+    editor->textCursor().insertText(QStringLiteral("Use A"));
+    send->click();
+    controller.agent().waitIdle();
+    QTRY_VERIFY(controller.pendingQuestions().empty());
+    QVERIFY(editor->toPlainText().contains(QChar(0xFFFC)));
+    QVERIFY(!editor->toPlainText().contains(QStringLiteral("Use A")));
+    QTRY_VERIFY(view->contains(answerItem));
+    for (int i = 0; i < 3; ++i) panel.openSession(controller.createSession(QDir::currentPath()));
+    panel.openSession(root);
+    QVERIFY(view->contains(questionItem));
+    QVERIFY(view->contains(answerItem));
+    QCOMPARE(controller.agent().listMessages(root.toStdString()).size(), std::size_t(0));
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("normal-child-question-replayed")));
+}
+
+// The parent message starts before the child, but its later text part is
+// created after the question. Cross-session display order follows actual parts.
+void AgentPanelSessionTest::childQuestionKeepsItsPositionBetweenParentParts() {
+    class TimelineModel final : public MaiModelClient {
+    public:
+        MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
+            const int call = calls_++;
+            if (call == 0) {
+                if (sink.onText) sink.onText("Root before question");
+                if (sink.onToolCall) sink.onToolCall({"root-probe", "progress_probe_x", "{}"});
+            } else if (call == 1) {
+                if (sink.onToolCall) sink.onToolCall({"child-question", "question", R"({"question":"Child timeline question"})"});
+            } else if (sink.onText) sink.onText("Root after question");
+            return {};
+        }
+        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    private:
+        std::atomic<int> calls_{0};
+    };
+    auto progress = std::make_shared<IntermediateProgressState>();
+    AgentController controller(std::make_unique<TimelineModel>(), QString(), [progress](MaiToolRegistry& tools) {
+        tools.add(std::make_unique<IntermediateProgressTool>(progress, 1));
+    });
+    struct ReleaseOnExit {
+        std::shared_ptr<IntermediateProgressState> progress;
+        ~ReleaseOnExit() { progress->released.store(1); }
+    } release{progress};
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 700);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString root = controller.createSession(QDir::currentPath());
+    panel.openSession(root);
+    QVERIFY(controller.sendPrompt(root, QStringLiteral("run timeline fixture")));
+    QTRY_COMPARE(progress->entered.load(), 1);
+    const auto child = controller.agent().spawnSubAgent(root.toStdString(), "question-reviewer", "Ask a question");
+    QVERIFY(child);
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    const auto question = controller.pendingQuestions().front();
+    auto* view = panel.findChild<MarkdownView*>();
+    const QString questionItem = QString::fromStdString(question.partId) + QStringLiteral("-question");
+    QTRY_VERIFY(view->contains(questionItem));
+    progress->released.store(1);
+    QString laterPart;
+    const auto findLaterPart = [&] {
+        for (const auto& message : controller.agent().listMessages(root.toStdString()))
+            for (const auto& part : message.parts)
+                if (const auto* text = std::get_if<MaiTextPart>(&part.body))
+                    if (text->text == "Root after question") laterPart = QString::fromStdString(part.id);
+        return !laterPart.isEmpty() && view->contains(laterPart);
+    };
+    QTRY_VERIFY(findLaterPart());
+    QVERIFY(view->itemRect(questionItem).top() < view->itemRect(laterPart).top());
+    for (const auto* quote : panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")))
+        QVERIFY(quote->property("messageId").toString() != QString::fromStdString(question.messageId));
+    auto* editor = panel.findChild<QTextEdit*>();
+    editor->setPlainText(QStringLiteral("Continue"));
+    panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"))->click();
+    controller.agent().waitIdle();
+    QCoreApplication::processEvents();
+    for (int i = 0; i < 3; ++i) panel.openSession(controller.createSession(QDir::currentPath()));
+    panel.openSession(root);
+    QVERIFY(view->itemRect(questionItem).top() < view->itemRect(laterPart).top());
+}
+
+void AgentPanelSessionTest::nestedQuestionsFollowOrderAndReleaseAfterCancellation() {
+    class NestedModel final : public MaiModelClient {
+    public:
+        MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
+            if (calls_++ < 2) {
+                if (sink.onToolCall) sink.onToolCall({"nested-question", "question", R"({"question":"Nested fixture question"})"});
+            } else if (sink.onText) sink.onText("done");
+            return {};
+        }
+        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    private:
+        std::atomic<int> calls_{0};
+    };
+    AgentController controller(std::make_unique<NestedModel>(), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 700);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString root = controller.createSession(QDir::currentPath());
+    panel.openSession(root);
+    const auto child = controller.agent().spawnSubAgent(root.toStdString(), "child-reviewer", "Ask first");
+    QVERIFY(child);
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    const auto first = controller.pendingQuestions().front();
+    const auto nested = controller.agent().spawnSubAgent(first.sessionId, "nested-reviewer", "Ask second");
+    QVERIFY(nested);
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(2));
+    auto* editor = panel.findChild<QTextEdit*>();
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    auto* view = panel.findChild<MarkdownView*>();
+    editor->setPlainText(QStringLiteral("First answer"));
+    send->click();
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    QCOMPARE(controller.pendingQuestions().front().sessionId, nested.value());
+    QTRY_VERIFY(view->contains(QString::fromStdString(first.partId) + QStringLiteral("-answer")));
+    const auto cancelled = controller.interrupt(QString::fromStdString(nested.value()),
+        QString::fromStdString(controller.agent().activeTurnId(nested.value())));
+    QVERIFY(cancelled);
+    controller.agent().waitIdle();
+    QCoreApplication::processEvents();
+    editor->setPlainText(QStringLiteral("A new ordinary root message"));
+    send->click();
+    controller.agent().waitIdle();
+    QVERIFY(editor->toPlainText().isEmpty());
+    QCOMPARE(controller.agent().listMessages(root.toStdString()).size(), std::size_t(2));
+}
+
+void AgentPanelSessionTest::rootQuestionAfterSteeringKeepsItsPartPosition() {
+    class SteeredQuestionModel final : public MaiModelClient {
+    public:
+        MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic<bool>&) override {
+            if (calls_++ == 0 && sink.onToolCall) {
+                sink.onToolCall({"held-root", "progress_probe_x", "{}"});
+                sink.onToolCall({"ask-root", "question", R"({"question":"Root question after queued input"})"});
+            } else if (sink.onText) sink.onText("done");
+            return {};
+        }
+        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    private:
+        std::atomic<int> calls_{0};
+    };
+    auto progress = std::make_shared<IntermediateProgressState>();
+    AgentController controller(std::make_unique<SteeredQuestionModel>(), QString(), [progress](MaiToolRegistry& tools) {
+        tools.add(std::make_unique<IntermediateProgressTool>(progress, 1));
+    });
+    struct ReleaseOnExit {
+        std::shared_ptr<IntermediateProgressState> state;
+        ~ReleaseOnExit() { state->released.store(1); }
+    } release{progress};
+    AgentChatPanel panel(controller);
+    panel.resize(1000, 700);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString root = controller.createSession(QDir::currentPath());
+    panel.openSession(root);
+    QVERIFY(controller.sendPrompt(root, QStringLiteral("Run steered question fixture")));
+    QTRY_COMPARE(progress->entered.load(), 1);
+    auto* editor = panel.findChild<QTextEdit*>();
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    editor->setPlainText(QStringLiteral("Queued root instruction"));
+    send->click();
+    const auto recent = controller.agent().listMessagesPage(root.toStdString(), {}, 1);
+    QVERIFY(!recent.empty() && recent.front().role == MaiRole::User);
+    const QString userItem = QString::fromStdString(recent.front().id);
+    progress->released.store(1);
+    QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
+    const QString questionItem = QString::fromStdString(controller.pendingQuestions().front().partId) + QStringLiteral("-question");
+    auto* view = panel.findChild<MarkdownView*>();
+    QTRY_VERIFY(view->contains(questionItem));
+    QVERIFY(view->itemRect(questionItem).top() > view->itemRect(userItem).top());
+    editor->setPlainText(QStringLiteral("Continue"));
+    send->click();
+    controller.agent().waitIdle();
+    QCoreApplication::processEvents();
+    for (int i = 0; i < 3; ++i) panel.openSession(controller.createSession(QDir::currentPath()));
+    panel.openSession(root);
+    QVERIFY(view->itemRect(questionItem).top() > view->itemRect(userItem).top());
+}
+
 void AgentPanelSessionTest::pendingQuestionIsRestoredOnlyInItsSession() {
     AgentController controller(std::make_unique<QuestionModel>(), QString());
     AgentChatPanel panel(controller);
@@ -1563,18 +1827,20 @@ void AgentPanelSessionTest::pendingQuestionIsRestoredOnlyInItsSession() {
     editor->setPlainText(QStringLiteral("ask me"));
     send->click();
     QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
-    QTRY_COMPARE(editor->placeholderText(), QStringLiteral("回答它…"));
+    QTRY_VERIFY(panel.findChild<MarkdownView*>()->contains(
+        QString::fromStdString(controller.pendingQuestions().front().partId) + QStringLiteral("-question")));
+    QTRY_COMPARE(editor->placeholderText(), QStringLiteral("交给它做点什么…"));
     QCOMPARE(send->text(), QString());
-    QCOMPARE(send->toolTip(), QStringLiteral("回答问题"));
+    QCOMPARE(send->toolTip(), QStringLiteral("发送消息"));
     QVERIFY(!send->icon().isNull());
 
     panel.openSession(controller.createSession(QDir::currentPath()));
     QCOMPARE(editor->placeholderText(), QStringLiteral("交给它做点什么…"));
     QCOMPARE(send->toolTip(), QStringLiteral("发送消息"));
     panel.openSession(session);
-    QCOMPARE(editor->placeholderText(), QStringLiteral("回答它…"));
+    QCOMPARE(editor->placeholderText(), QStringLiteral("交给它做点什么…"));
     QCOMPARE(send->text(), QString());
-    QCOMPARE(send->toolTip(), QStringLiteral("回答问题"));
+    QCOMPARE(send->toolTip(), QStringLiteral("发送消息"));
     editor->setPlainText(QStringLiteral("A"));
     send->click();
     controller.agent().waitIdle();
@@ -1598,7 +1864,9 @@ void AgentPanelSessionTest::stoppedQuestionReleasesComposerWithoutLosingDraft() 
     editor->setPlainText(QStringLiteral("ask me"));
     send->click();
     QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
-    QTRY_COMPARE(send->toolTip(), QStringLiteral("回答问题"));
+    QTRY_VERIFY(panel.findChild<MarkdownView*>()->contains(
+        QString::fromStdString(controller.pendingQuestions().front().partId) + QStringLiteral("-question")));
+    QTRY_COMPARE(send->toolTip(), QStringLiteral("发送消息"));
     editor->setPlainText(QStringLiteral("Which workspace is active now?"));
     stop->click();
     controller.agent().waitIdle();
@@ -1633,7 +1901,9 @@ void AgentPanelSessionTest::externalQuestionAnswerReleasesComposerWithoutLosingD
     editor->setPlainText(QStringLiteral("ask me"));
     send->click();
     QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
-    QTRY_COMPARE(send->toolTip(), QStringLiteral("回答问题"));
+    QTRY_VERIFY(panel.findChild<MarkdownView*>()->contains(
+        QString::fromStdString(controller.pendingQuestions().front().partId) + QStringLiteral("-question")));
+    QTRY_COMPARE(send->toolTip(), QStringLiteral("发送消息"));
     const auto question = controller.pendingQuestions().front();
     editor->setPlainText(QStringLiteral("Keep this unsent draft"));
     QVERIFY(controller.agent().submit(MaiReplyQuestion{question.id, "A"}));
@@ -1662,7 +1932,9 @@ void AgentPanelSessionTest::expiredQuestionKeepsDraftUntilExplicitResend() {
     editor->setPlainText(QStringLiteral("ask me"));
     send->click();
     QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
-    QTRY_COMPARE(send->toolTip(), QStringLiteral("回答问题"));
+    QTRY_VERIFY(panel.findChild<MarkdownView*>()->contains(
+        QString::fromStdString(controller.pendingQuestions().front().partId) + QStringLiteral("-question")));
+    QTRY_COMPARE(send->toolTip(), QStringLiteral("发送消息"));
     const auto question = controller.pendingQuestions().front();
     editor->setPlainText(QStringLiteral("My answer draft"));
     QVERIFY(controller.agent().submit(MaiReplyQuestion{question.id, "A"}));
@@ -2695,7 +2967,9 @@ void AgentPanelSessionTest::answeredCachedQuestionDoesNotReclaimComposer() {
     editor->setPlainText(QStringLiteral("ask me"));
     send->click();
     QTRY_COMPARE(controller.pendingQuestions().size(), std::size_t(1));
-    QTRY_COMPARE(send->toolTip(), QStringLiteral("回答问题"));
+    QTRY_VERIFY(panel.findChild<MarkdownView*>()->contains(
+        QString::fromStdString(controller.pendingQuestions().front().partId) + QStringLiteral("-question")));
+    QTRY_COMPARE(send->toolTip(), QStringLiteral("发送消息"));
     const auto question = controller.pendingQuestions().front();
     editor->setPlainText(QStringLiteral("Keep the answer draft"));
     panel.openSession(second);

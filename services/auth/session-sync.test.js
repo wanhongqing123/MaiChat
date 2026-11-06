@@ -635,7 +635,7 @@ test('Session directory and pending envelopes survive a service restart', async 
     assert.equal((await call('mac-token', 'POST', '/v1/session-sync/publish', {
       session_id: 'ses_1', messages: [{ id: 'msg_saved', role: 'assistant',
         parts: [{ kind: 'text', text: 'Persisted reply' }] }],
-      permissions: [], questions: []
+      permissions: [], questions: [], questionMessages: [questionProjection('completed')]
     })).statusCode, 200);
     db.close();
     db = openSessionSyncStore(filename);
@@ -646,8 +646,96 @@ test('Session directory and pending envelopes survive a service restart', async 
     const history = await call('phone-token', 'GET',
       '/v1/session-sync/history?owner_slot=mac&session_id=ses_1&limit=10');
     assert.equal(history.body.messages[0].parts[0].text, 'Persisted reply');
+    assert.deepEqual(history.body.questionMessages, [questionProjection('completed')]);
     const received = await call('mac-token', 'GET', '/v1/session-sync/poll');
     assert.equal(received.body.messages[0].payload.text, 'Check the build');
+  } finally {
+    if (db.open) db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+
+function questionProjection(state = 'running') {
+  return { id: 'msg_child_question', sessionId: 'ses_child', role: 'assistant',
+    questionProjection: true, created: 2, completed: state === 'completed' ? 3 : 0,
+    parts: [{ id: 'part_question', kind: 'tool', tool: 'question', state,
+      input: JSON.stringify({ question: 'Choose the workspace', options: ['Current', 'Project'] }),
+      output: state === 'completed' ? 'Use project' : '' }] };
+}
+
+test('child question projections are runtime state and do not change root history paging', async () => {
+  const setup = fixture();
+  try {
+    await setup.macPresence(); await setup.phonePresence();
+    const roots = [1, 2].map(index => ({ id: `msg_root_00${index}`, role: 'assistant',
+      parts: [{ id: `part_root_${index}`, kind: 'text', text: 'Root message' }] }));
+    const questionMessages = [questionProjection()];
+    assert.equal((await setup.call('mac-token', 'POST', '/v1/session-sync/publish', {
+      session_id: 'ses_mac_1', messages: roots, questionMessages
+    })).statusCode, 200);
+    const history = await setup.call('phone-token', 'GET',
+      '/v1/session-sync/history?owner_slot=mac&session_id=ses_mac_1&limit=1');
+    assert.deepEqual(history.body.messages, [roots[1]]);
+    assert.deepEqual(history.body.questionMessages, questionMessages);
+    assert.equal(setup.db.prepare('SELECT COUNT(*) AS count FROM sync_room_messages').get().count, 2);
+    const older = await setup.call('phone-token', 'GET',
+      '/v1/session-sync/history?owner_slot=mac&session_id=ses_mac_1&before=msg_root_002&limit=1');
+    assert.deepEqual(older.body.messages, [roots[0]]);
+    assert.deepEqual(older.body.questionMessages, questionMessages);
+    const firstInbox = (await setup.call('phone-token', 'GET', '/v1/session-sync/poll')).body.messages;
+    assert.deepEqual(JSON.parse(Buffer.from(firstInbox[0].payload.data_base64, 'base64')).questionMessages, questionMessages);
+    const answered = [questionProjection('completed')];
+    const update = { session_id: 'ses_mac_1', messages: [], questionMessages: answered };
+    assert.equal((await setup.call('mac-token', 'POST', '/v1/session-sync/publish', update)).statusCode, 200);
+    const stateInbox = (await setup.call('phone-token', 'GET', '/v1/session-sync/poll')).body.messages;
+    assert.equal(stateInbox.length, 1);
+    const state = JSON.parse(Buffer.from(stateInbox[0].payload.data_base64, 'base64'));
+    assert.deepEqual(state.messages, []);
+    assert.deepEqual(state.questionMessages, answered);
+    await setup.call('mac-token', 'POST', '/v1/session-sync/publish', update);
+    assert.deepEqual((await setup.call('phone-token', 'GET', '/v1/session-sync/poll')).body.messages, []);
+    // Older clients omit this new field; omitted state is a defined empty collection.
+    await setup.call('mac-token', 'POST', '/v1/session-sync/publish', { session_id: 'ses_mac_1', messages: [] });
+    assert.deepEqual((await setup.call('phone-token', 'GET',
+      '/v1/session-sync/history?owner_slot=mac&session_id=ses_mac_1')).body.questionMessages, []);
+  } finally { setup.db.close(); }
+});
+
+test('question projection state rejects invalid, duplicate and oversized collections before persistence', async () => {
+  const setup = fixture();
+  try {
+    await setup.macPresence();
+    for (const questionMessages of [null, {}, [null], [{ ...questionProjection(), questionProjection: false }],
+      [{ ...questionProjection(), sessionId: '../outside' }], [questionProjection(), questionProjection()],
+      [{ ...questionProjection(), parts: [{ kind: 'text', text: 'Not a question tool' }] }],
+      [{ ...questionProjection(), parts: [{ ...questionProjection().parts[0], output: 'x'.repeat(49 * 1024) }] }]]) {
+      assert.equal((await setup.call('mac-token', 'POST', '/v1/session-sync/publish', {
+        session_id: 'ses_mac_1', messages: [], questionMessages
+      })).statusCode, 400);
+    }
+    const history = await setup.call('mac-token', 'GET', '/v1/session-sync/history?owner_slot=mac&session_id=ses_mac_1');
+    assert.deepEqual(history.body.questionMessages, []);
+  } finally { setup.db.close(); }
+});
+
+
+test('existing room state upgrades with an empty child projection without changing old questions', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'maichat-room-state-upgrade-'));
+  const filename = join(directory, 'sync.db');
+  const Database = require('better-sqlite3');
+  let db = new Database(filename);
+  try {
+    db.exec(`CREATE TABLE sync_room_state (account_id TEXT NOT NULL,owner_slot TEXT NOT NULL,
+      session_id TEXT NOT NULL,permissions TEXT NOT NULL,questions TEXT NOT NULL,updated_at INTEGER NOT NULL,
+      PRIMARY KEY(account_id,owner_slot,session_id))`);
+    db.prepare('INSERT INTO sync_room_state VALUES(?,?,?,?,?,?)').run(
+      'alice', 'mac', 'ses_old', '[]', '[{"id":"q_old"}]', 1);
+    db.close();
+    db = openSessionSyncStore(filename);
+    const old = db.prepare('SELECT questions,question_messages FROM sync_room_state WHERE session_id=?').get('ses_old');
+    assert.deepEqual(JSON.parse(old.questions), [{ id: 'q_old' }]);
+    assert.deepEqual(JSON.parse(old.question_messages), []);
   } finally {
     if (db.open) db.close();
     rmSync(directory, { recursive: true, force: true });

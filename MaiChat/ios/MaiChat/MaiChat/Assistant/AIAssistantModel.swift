@@ -926,11 +926,29 @@ struct AIPart: Codable, Identifiable, Sendable, Equatable {
     var preview: String? = nil
     var attachmentID: String? = nil
     var name: String? = nil
+    var created: Int64? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, kind, text, tool, input, output, error, state, path
-        case mimeType, messageId, preview, name
+        case mimeType, messageId, preview, name, created
         case attachmentID = "attachment_id"
+    }
+
+    // 问题沿用已持久化的工具片段位置；不再创建临时选项卡和第二个回答输入框。
+    // 即使等待已经结束，历史仍能还原问题与真实成功的回答；取消/失败不伪装成用户回答。
+    var questionText: String? {
+        guard kind == "tool", tool == "question", let data = input?.data(using: .utf8),
+              let value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let question = value["question"] as? String, !question.isEmpty else { return nil }
+        let options = value["options"] as? [String] ?? []
+        guard !options.isEmpty else { return question }
+        return question + "\n\n" + options.enumerated().map { "\($0.offset + 1). \($0.element)" }
+            .joined(separator: "\n")
+    }
+
+    var questionAnswer: String? {
+        guard questionText != nil, state == "completed", let output, !output.isEmpty else { return nil }
+        return output
     }
 }
 struct AIMessage: Codable, Identifiable, Sendable, Equatable {
@@ -940,6 +958,17 @@ struct AIMessage: Codable, Identifiable, Sendable, Equatable {
     let completed: Int64
     let active: Bool
     let parts: [AIPart]
+    // 子任务的问题只投影到父会话阅读；原消息仍属于真实子会话，不能作为父会话引用提交。
+    var sessionId: String? = nil
+    var questionProjection: Bool? = nil
+    // 只影响显示身份与媒体去重；原 id 仍用于 Core 查询/引用，不进入同步协议。
+    var displayId: String? = nil
+    var isLastDisplayFragment = true
+    var sourceParts: [AIPart]? = nil
+    var displayIdentity: String { displayId ?? id }
+    enum CodingKeys: String, CodingKey {
+        case id, role, created, completed, active, parts, sessionId, questionProjection
+    }
     // 思考正文仍由核心持久化；界面快照只保留片段身份。流式思考每个增量因此
     // 不会改变可见消息，也不会触发整行 Markdown 重排或打断键盘输入。
     func withoutReasoningText() -> AIMessage {
@@ -949,9 +978,22 @@ struct AIMessage: Codable, Identifiable, Sendable, Equatable {
             var part = original
             if part.kind == "reasoning" { part.text = nil }
             return part
-        })
+        }, sessionId: sessionId, questionProjection: questionProjection)
     }
-    var text: String { parts.filter { $0.kind == "text" }.compactMap(\.text).joined(separator: "\n") }
+    var text: String {
+        parts.compactMap { part in
+            if part.kind == "text" { return part.text }
+            guard let question = part.questionText else { return nil }
+            return question + (part.questionAnswer.map { "\n\n" + $0 } ?? "")
+        }.joined(separator: "\n")
+    }
+    var copyText: String {
+        (sourceParts ?? parts).compactMap { part in
+            if part.kind == "text" { return part.text }
+            guard let question = part.questionText else { return nil }
+            return question + (part.questionAnswer.map { "\n\n" + $0 } ?? "")
+        }.joined(separator: "\n")
+    }
     var quotePreview: String {
         var media: [String] = []
         for part in parts {
@@ -981,6 +1023,10 @@ struct AIQuestion: Codable, Identifiable, Sendable, Equatable {
     let id: String
     let question: String
     let options: [String]
+    var sessionId: String? = nil
+    var messageId: String? = nil
+    var partId: String? = nil
+    var asked: Int64? = nil
 }
 struct AIImportedFile: Sendable, Equatable {
     let relativePath: String
@@ -1063,11 +1109,16 @@ struct AIResponse: Codable, Sendable {
     let ok: Bool
     var id: String?
     var userMessageID: String?
+    var questionID: String?
     var error: String?
     var errorCode: String?
     var changed: Bool?
     var sessions: [AISession]?
     var messages: [AIMessage]?
+    var messageUpdates: [AIMessage]?
+    var hasMessageUpdates: Bool?
+    var questionMessages: [AIMessage]?
+    var rootSessionId: String?
     var permissions: [AIPermission]?
     var questions: [AIQuestion]?
     var busy: Bool?
@@ -1083,10 +1134,11 @@ struct AIResponse: Codable, Sendable {
     var professional: String?
 
     enum CodingKeys: String, CodingKey {
-        case ok, id, error, errorCode, changed, sessions, messages, permissions, questions
+        case ok, id, error, errorCode, changed, sessions, messages, messageUpdates, hasMessageUpdates, questionMessages, rootSessionId, permissions, questions
         case busy, turnId, configured, model, wire, localGpuSelected, localGpuModelBytes, localGpuBackend
         case natural, casual, professional
         case userMessageID = "user_message_id"
+        case questionID = "question_id"
     }
 
 }
@@ -1238,8 +1290,8 @@ actor AIAssistantBackend {
         guard let text = String(data: data, encoding: .utf8),
             let response = text.withCString({ maiMobileAgentRequest(UnsafeMutableRawPointer(bitPattern: address), $0) })
         else { throw AIBackendError(
-            message: operation == "steer" || operation == "send" ? "内容送达状态未知，已保留原操作编号" :
-                "创作中心初始化失败", definitive: !["steer", "send"].contains(operation))
+            message: ["steer", "send", "answer"].contains(operation) ? "内容送达状态未知，已保留原操作编号" :
+                "创作中心初始化失败", definitive: !["steer", "send", "answer"].contains(operation))
         }
         defer { maiMobileAgentFree(response) }
         let decoded = try JSONDecoder().decode(AIResponse.self, from: Data(String(cString: response).utf8))
@@ -1443,7 +1495,8 @@ actor AIAssistantBackend {
     }
 
     func snapshot(session: String, limit: Int, force: Bool) throws -> AIResponse {
-        try requestAgentOperation("snapshot", values: ["session": session, "messageLimit": limit], force: force)
+        try requestAgentOperation("snapshot", values: ["session": session, "messageLimit": limit,
+            "includeMessageUpdates": true], force: force)
     }
 
     func messagesPage(session: String, beforeId: String, limit: Int) throws -> [AIMessage] {
@@ -1458,9 +1511,10 @@ actor AIAssistantBackend {
             .messages?.first { $0.id == id && $0.role == "user" }
     }
 
-    func remoteSnapshot(session: String, beforeId: String = "", limit: Int) throws -> AIResponse {
+    func remoteSnapshot(session: String, beforeId: String = "", limit: Int,
+                        includeMessageUpdates: Bool = false) throws -> AIResponse {
         try requestAgentOperation("remote_snapshot", values: ["session": session,
-                                                       "before": beforeId, "limit": limit])
+            "before": beforeId, "limit": limit, "includeMessageUpdates": includeMessageUpdates])
     }
 
     func send(session: String, text: String, images: [AIImportedFile],
@@ -1621,6 +1675,7 @@ final class AIAssistantModel: ObservableObject {
         shared.appearingTask?.cancel()
         shared.hostStartup?.cancel()
         shared.transientErrorTask?.cancel()
+        shared.clearQuestionConversationState()
         shared = AIAssistantModel()
     }
 
@@ -1629,6 +1684,7 @@ final class AIAssistantModel: ObservableObject {
     static func invalidateOutgoingForDeletedAccount() async {
         let model = shared
         model.outgoingPermanentlyInvalidated = true
+        model.clearQuestionConversationState()
         model.outgoingPump?.stop()
         // actor 屏障覆盖正在等待模型文件/凭据的 open/save；删除目录后不能迟到重建。
         await model.backend.invalidatePermanently()
@@ -1647,6 +1703,9 @@ final class AIAssistantModel: ObservableObject {
     @Published private(set) var remoteSessionMutationInProgress = false
     @Published private(set) var selectedRemote: AIRemoteSession?
     @Published var messages: [AIMessage] = []
+    @Published private(set) var questionMessages: [AIMessage] = []
+    // Native 点取窗口外仍在更新的旧 assistant；它们不改变根页的 oldest/before。
+    @Published private var updatedRootMessages: [AIMessage] = []
     @Published var permissions: [AIPermission] = []
     @Published var questions: [AIQuestion] = []
     @Published var selected = ""
@@ -1697,9 +1756,22 @@ final class AIAssistantModel: ObservableObject {
         let text: String
         let quote: String
         let files: [AIImportedFile]
+        let questionID: String?
+        let question: AIQuestion?
         let result: AsyncStream<Bool>.Continuation
     }
     private var outgoingIntakes: [OutgoingIntake] = []
+    // MainActor 上同步保留首次回答的归属，连续点击不会把两条草稿抢投同一个问题。
+    private var questionAnswerReservations: [String: UUID] = [:]
+    private var questionAnswerReservationOrder: [String] = []
+    private struct AcceptedQuestionAnswer {
+        let owner: AIOutgoingMessageQueueOwner
+        let question: AIQuestion
+        let text: String
+    }
+    // Owner ACK 可能早于工具结果的下一次快照；只保留显示回声，不写入 Core 消息历史。
+    @Published private var acceptedQuestionAnswers: [UUID: AcceptedQuestionAnswer] = [:]
+    private var acceptedQuestionAnswerOrder: [UUID] = []
     private var outgoingIntakeTask: Task<Void, Never>?
     // Once submitted to the native sender, the token can also protect a
     // persisted user message. A draft cleanup must not release that history.
@@ -1722,6 +1794,7 @@ final class AIAssistantModel: ObservableObject {
     private var publishedRemoteMessageDigests: [String: String] = [:]
     private var publishedRemoteStateDigests: [String: String] = [:]
     private var pendingRemotePushSessions: Set<String> = []
+    private var remotePublishRoots: [String: String] = [:]
     private var remotePushTask: Task<Void, Never>?
     private var remoteBackfillTask: Task<Void, Never>?
     private var pendingBackfillSessions: [String] = []
@@ -1757,6 +1830,7 @@ final class AIAssistantModel: ObservableObject {
     private var submissionGeneration = 0
     private struct RemoteSteeringConfirmation {
         let remote: AIRemoteSession
+        let questionID: String?
         let continuation: CheckedContinuation<String, Error>
     }
     private var remoteSteeringConfirmations: [String: RemoteSteeringConfirmation] = [:]
@@ -1793,7 +1867,167 @@ final class AIAssistantModel: ObservableObject {
         !attachments(for: "").isEmpty ||
             !(drafts[""] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
-    var visibleMessages: [AIMessage] { Array(messages.suffix(visibleMessageLimit)) }
+    var visibleMessages: [AIMessage] {
+        // 投影只进入显示层；分页、oldest/before 与历史数量继续只使用根会话 messages。
+        var root = Array(messages.suffix(visibleMessageLimit))
+        let rootIDs = Set(root.map(\.id))
+        let cutoff = root.first?.created ?? 0
+        for updated in updatedRootMessages where !rootIDs.contains(updated.id) {
+            let recent = updated.parts.filter {
+                ($0.created.flatMap { $0 > 0 ? $0 : nil } ?? Self.coreIdTime($0.id) ?? updated.created) >= cutoff ||
+                    $0.questionText != nil
+            }
+            guard !recent.isEmpty else { continue }
+            root.append(AIMessage(id: updated.id, role: updated.role, created: updated.created,
+                completed: updated.completed, active: updated.active, parts: recent,
+                sessionId: updated.sessionId, questionProjection: updated.questionProjection, sourceParts: updated.parts))
+        }
+        let echoQuestions = currentAcceptedQuestionAnswers.map(\.question)
+        let displayQuestions = questions + echoQuestions.filter { echo in !questions.contains { $0.id == echo.id } }
+        let pendingPartIDs = Set(displayQuestions.compactMap(\.partId))
+        let rootParts = Set(root.flatMap { $0.parts.map(\.id) })
+        let oldest = root.first?.created
+        var result = root
+        for projection in questionMessages {
+            guard !result.contains(where: { $0.id == projection.id }) else { continue }
+            let parts = projection.parts.filter { part in
+                guard part.questionText != nil && !rootParts.contains(part.id) else { return false }
+                let created = part.created.flatMap { $0 > 0 ? $0 : nil } ?? Self.coreIdTime(part.id) ?? projection.created
+                return (oldest.map { created >= $0 } ?? true) || pendingPartIDs.contains(part.id)
+            }
+            guard !parts.isEmpty else { continue }
+            result.append(AIMessage(id: projection.id, role: "assistant", created: projection.created,
+                completed: projection.completed, active: projection.active, parts: parts,
+                sessionId: projection.sessionId, questionProjection: true))
+        }
+        let shownParts = Set(result.flatMap { $0.parts.map(\.id) })
+        for question in displayQuestions {
+            // 旧远端或窗口之外的等待问题仍显示为普通文本；完整投影到达后由原 part ID 去重。
+            if let part = question.partId, shownParts.contains(part) { continue }
+            guard let input = try? JSONSerialization.data(withJSONObject: [
+                "question": question.question, "options": question.options]),
+                  let text = String(data: input, encoding: .utf8) else { continue }
+            let part = AIPart(id: question.partId ?? "question-part-" + question.id, kind: "tool",
+                tool: "question", input: text, state: "running")
+            if question.partId == nil, result.contains(where: { $0.parts.contains { $0.questionText == part.questionText } }) {
+                continue
+            }
+            result.append(AIMessage(id: "question-pending-" + question.id, role: "assistant",
+                created: question.asked ?? result.last?.created ?? 0, completed: 0, active: true,
+                parts: [part], sessionId: question.sessionId, questionProjection: true))
+        }
+        return Self.questionDisplayTimeline(result)
+    }
+
+    /// Assistant 消息会跨多个工具周期继续追加片段；按真实片段时刻合流，不能用它最初的消息时刻
+    /// 把后续进展排到子任务提问之前。问题与其 answer 仍由同一个原片段渲染，始终相邻。
+    private static func coreIdTime(_ id: String) -> Int64? {
+        guard id.hasPrefix("prt_") || id.hasPrefix("msg_"), id.count >= 14 else { return nil }
+        let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+        var time: Int64 = 0
+        for character in id.dropFirst(4).prefix(10) {
+            guard let index = alphabet.firstIndex(of: character) else { return nil }
+            time = time * 32 + Int64(index)
+        }
+        return time
+    }
+
+    private static func questionDisplayTimeline(_ source: [AIMessage]) -> [AIMessage] {
+        struct Unit {
+            let message: AIMessage
+            let parts: [AIPart]
+            let time: Int64
+            let order: String
+        }
+        var units: [Unit] = []
+        for message in source {
+            let parts = message.parts.filter { $0.kind != "reasoning" }
+            if message.role == "user" || parts.isEmpty {
+                units.append(Unit(message: message, parts: parts, time: message.created,
+                    order: coreIdTime(message.id) == nil ? message.id : String(message.id.dropFirst(4))))
+                continue
+            }
+            var previous = message.created
+            for (index, part) in parts.enumerated() {
+                let actual = part.created.flatMap { $0 > 0 ? $0 : nil } ?? coreIdTime(part.id) ?? message.created
+                previous = max(previous, actual)
+                units.append(Unit(message: message, parts: [part], time: previous,
+                    order: coreIdTime(part.id) == nil ? message.id + String(format: ":%06d", index)
+                                                  : String(part.id.dropFirst(4))))
+            }
+        }
+        units.sort { $0.time == $1.time ? $0.order < $1.order : $0.time < $1.time }
+        var displayed: [AIMessage] = []
+        var counts: [String: Int] = [:]
+        for unit in units {
+            if let last = displayed.last, last.id == unit.message.id, last.role != "user" {
+                let combined = AIMessage(id: last.id, role: last.role, created: last.created,
+                    completed: last.completed, active: last.active, parts: last.parts + unit.parts,
+                    sessionId: last.sessionId, questionProjection: last.questionProjection,
+                    sourceParts: last.sourceParts ?? unit.message.sourceParts)
+                displayed[displayed.count - 1] = combined
+            } else {
+                displayed.append(AIMessage(id: unit.message.id, role: unit.message.role, created: unit.message.created,
+                    completed: unit.message.completed, active: unit.message.active, parts: unit.parts,
+                    sessionId: unit.message.sessionId, questionProjection: unit.message.questionProjection,
+                    sourceParts: unit.message.sourceParts))
+                counts[unit.message.id, default: 0] += 1
+            }
+        }
+        var remaining = counts
+        var seen = Set<String>()
+        let originals = Dictionary(source.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for index in displayed.indices {
+            let id = displayed[index].id
+            remaining[id, default: 1] -= 1
+            displayed[index].isLastDisplayFragment = remaining[id] == 0
+            if !seen.insert(id).inserted {
+                displayed[index].displayId = id + ":segment:" + (displayed[index].parts.first?.id ?? "empty")
+            }
+            if (counts[id] ?? 0) > 1, let original = originals[id] {
+                // Earlier fragments depend only on media ownership, not on text still streaming later.
+                let fullSource = original.sourceParts ?? original.parts
+                displayed[index].sourceParts = displayed[index].isLastDisplayFragment ? fullSource
+                    : fullSource.filter { $0.kind == "image" || $0.kind == "video" || $0.kind == "tool" }
+            }
+        }
+        return displayed
+    }
+
+    private var currentAcceptedQuestionAnswers: [AcceptedQuestionAnswer] {
+        let conversation = outgoingConversationID(session: selected, remote: selectedRemote)
+        return acceptedQuestionAnswers.values.filter {
+            $0.owner.accountID == screenFrameCurrentAccountID && $0.owner.conversationID == conversation
+        }
+    }
+
+    func questionAnswerEchoes(for message: AIMessage) -> [String: String] {
+        let parts = Set(message.parts.map(\.id))
+        return Dictionary(currentAcceptedQuestionAnswers.compactMap { echo in
+            let part = echo.question.partId ?? "question-part-" + echo.question.id
+            return parts.contains(part) ? (part, echo.text) : nil
+        }, uniquingKeysWith: { _, newest in newest })
+    }
+
+    private func reconcileQuestionAnswerEchoes() {
+        guard !acceptedQuestionAnswers.isEmpty else { return }
+        let finished = Set((messages + questionMessages + updatedRootMessages).flatMap { $0.parts }
+            .filter { $0.questionAnswer != nil }.map(\.id))
+        let conversation = outgoingConversationID(session: selected, remote: selectedRemote)
+        let retained = acceptedQuestionAnswers.filter { _, echo in
+            echo.owner.accountID != screenFrameCurrentAccountID || echo.owner.conversationID != conversation ||
+                echo.question.partId.map { !finished.contains($0) } != false
+        }
+        if retained.count != acceptedQuestionAnswers.count { acceptedQuestionAnswers = retained }
+    }
+
+    private func clearQuestionConversationState() {
+        questionAnswerReservations.removeAll()
+        questionAnswerReservationOrder.removeAll()
+        acceptedQuestionAnswers.removeAll()
+        acceptedQuestionAnswerOrder.removeAll()
+        updatedRootMessages.removeAll()
+    }
     var hasOlderVisibleMessages: Bool {
         messages.count > visibleMessageLimit || hasOlderMessages
     }
@@ -1940,6 +2174,7 @@ final class AIAssistantModel: ObservableObject {
         remoteBackfillTask = nil
         pendingBackfillSessions.removeAll()
         pendingRemotePushSessions.removeAll()
+        remotePublishRoots.removeAll()
         initiallyPublishedSessions.removeAll()
         publishedRemoteMessageDigests.removeAll()
         publishedRemoteStateDigests.removeAll()
@@ -1988,11 +2223,30 @@ final class AIAssistantModel: ObservableObject {
                 pendingRemotePushSessions.insert(sessionID)
                 continue
             }
+            var publishSessionID = sessionID
             do {
-                let state = try await backend.remoteSnapshot(session: sessionID, limit: 20)
-                try await publishLocalPage(state, sessionID: sessionID, backfill: false)
+                var rootOwner = remotePublishRoots[sessionID]
+                if rootOwner == nil {
+                    // 归属查询不消费 producer 的窗口外更新队列。
+                    let owner = try await backend.remoteSnapshot(session: sessionID, limit: 1)
+                    rootOwner = owner.rootSessionId ?? sessionID
+                    if remotePublishRoots.count >= 256 { remotePublishRoots.removeAll() }
+                    remotePublishRoots[sessionID] = rootOwner
+                }
+                let root = rootOwner ?? sessionID
+                if root.isEmpty { continue }
+                publishSessionID = root
+                if root != sessionID {
+                    if remoteCommandsInProgress.contains(root) {
+                        pendingRemotePushSessions.insert(root)
+                        continue
+                    }
+                }
+                // 仅真正的根房间 publisher 注册并消费独立的 remote 更新队列。
+                let state = try await backend.remoteSnapshot(session: root, limit: 20, includeMessageUpdates: true)
+                try await publishLocalPage(state, sessionID: root, backfill: false)
             } catch {
-                initiallyPublishedSessions.remove(sessionID)
+                initiallyPublishedSessions.remove(publishSessionID)
                 logAIHistoryEvent("remote-push snapshot failed: \(error.localizedDescription)")
             }
         }
@@ -2002,14 +2256,9 @@ final class AIAssistantModel: ObservableObject {
                                   backfill: Bool) async throws {
         let value = try remoteHistoryPayload(state)
         let messages = value["messages"] as? [[String: Any]] ?? []
+        let questionMessages = value["questionMessages"] as? [[String: Any]] ?? []
         let permissions = value["permissions"] as? [[String: Any]] ?? []
         let questions = value["questions"] as? [[String: Any]] ?? []
-        let stateBytes = try JSONSerialization.data(withJSONObject: [
-            "permissions": permissions, "questions": questions,
-            "busy": state.busy ?? false, "turnId": state.turnId ?? ""], options: .sortedKeys)
-        let stateDigest = SHA256.hash(data: stateBytes)
-            .map { String(format: "%02x", $0) }.joined()
-        var sentMessage = false
         for message in messages {
             guard let messageID = message["id"] as? String else { continue }
             let messageBytes = try JSONSerialization.data(
@@ -2018,24 +2267,50 @@ final class AIAssistantModel: ObservableObject {
                 .map { String(format: "%02x", $0) }.joined()
             let key = sessionID + ":" + messageID
             guard publishedRemoteMessageDigests[key] != messageDigest else { continue }
-            let encoded = try JSONSerialization.data(withJSONObject: [
+            let published = try boundedQuestionHistoryPayload([
+                "session_id": sessionID,
                 "messages": [message], "permissions": permissions,
-                "questions": questions, "busy": state.busy ?? false,
-                "turnId": state.turnId ?? ""], options: .sortedKeys)
+                "questions": questions, "questionMessages": questionMessages, "busy": state.busy ?? false,
+                "turnId": state.turnId ?? ""])
+            let encoded = try JSONSerialization.data(withJSONObject: published, options: .sortedKeys)
             try await remoteTransport.publish(sessionID: sessionID, data: encoded)
             publishedRemoteMessageDigests[key] = messageDigest
-            publishedRemoteStateDigests[sessionID] = stateDigest
-            sentMessage = true
+            publishedRemoteStateDigests[sessionID] = try remotePublishedStateDigest(published)
             if backfill { try await Task.sleep(for: .milliseconds(250)) }
         }
-        if !sentMessage && publishedRemoteStateDigests[sessionID] != stateDigest {
-            let encoded = try JSONSerialization.data(withJSONObject: [
+        // 大根消息可能暂时裁掉投影；紧接着用无正文的小状态帧恢复，历史和当前问题不被截断。
+        let published = try boundedQuestionHistoryPayload([
+                "session_id": sessionID,
                 "messages": [], "permissions": permissions,
-                "questions": questions, "busy": state.busy ?? false,
-                "turnId": state.turnId ?? ""], options: .sortedKeys)
+                "questions": questions, "questionMessages": questionMessages, "busy": state.busy ?? false,
+                "turnId": state.turnId ?? ""])
+        let stateDigest = try remotePublishedStateDigest(published)
+        if publishedRemoteStateDigests[sessionID] != stateDigest {
+            let encoded = try JSONSerialization.data(withJSONObject: published, options: .sortedKeys)
             try await remoteTransport.publish(sessionID: sessionID, data: encoded)
             publishedRemoteStateDigests[sessionID] = stateDigest
         }
+        if state.hasMessageUpdates == true { localSessionChanged(sessionID) }
+    }
+
+    private func boundedQuestionHistoryPayload(_ source: [String: Any]) throws -> [String: Any] {
+        var payload = source
+        var projections = payload["questionMessages"] as? [[String: Any]] ?? []
+        // 只裁显示副本，完整根正文与 pending question metadata 保留。留出 framing/session ID 的余量。
+        while !projections.isEmpty,
+              try JSONSerialization.data(withJSONObject: payload).count > 95 * 1024 {
+            projections.removeFirst()
+            payload["questionMessages"] = projections
+        }
+        return payload
+    }
+
+    private func remotePublishedStateDigest(_ payload: [String: Any]) throws -> String {
+        let state: [String: Any] = ["permissions": payload["permissions"] ?? [], "questions": payload["questions"] ?? [],
+            "questionMessages": payload["questionMessages"] ?? [], "busy": payload["busy"] ?? false,
+            "turnId": payload["turnId"] ?? ""]
+        let bytes = try JSONSerialization.data(withJSONObject: state, options: .sortedKeys)
+        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
     private func scheduleBackfill(_ sessionID: String) {
@@ -2125,6 +2400,8 @@ final class AIAssistantModel: ObservableObject {
             messages = []
             permissions = []
             questions = []
+            questionMessages = []
+            updatedRootMessages = []
             historyLoaded = true
             scrollRequest += 1
         }
@@ -2340,6 +2617,11 @@ final class AIAssistantModel: ObservableObject {
             let unknownDelivery = result?["unknown"] as? Bool == true ||
                 result?["delivery_unknown"] as? Bool == true
             if !unknownDelivery, result?["ok"] as? Bool == true,
+               let questionID = pending.questionID,
+               result?["question_id"] as? String == questionID {
+                // 问题回答确认的是原问题，不伪造普通用户消息 ID。
+                finishRemoteSteering(id, result: .success(questionID))
+            } else if pending.questionID == nil, !unknownDelivery, result?["ok"] as? Bool == true,
                let messageID = result?["user_message_id"] as? String, !messageID.isEmpty {
                 finishRemoteSteering(id, result: .success(messageID))
             } else {
@@ -2435,6 +2717,8 @@ final class AIAssistantModel: ObservableObject {
                 pendingRemoteSelection = nil
                 selected = source.sessionID
                 messages = Array(displayMessages.reversed())
+                updatedRootMessages = []
+                questionMessages = (page.questionMessages ?? []).map(remoteDisplayMessage)
                 permissions = page.permissions ?? []
                 questions = page.questions ?? []
                 quotedMessage = nil
@@ -2447,11 +2731,13 @@ final class AIAssistantModel: ObservableObject {
             mergeMessages(displayMessages)
             if let permissions = page.permissions { self.permissions = permissions }
             if let questions = page.questions { self.questions = questions }
+            if let projections = page.questionMessages { questionMessages = projections.map(remoteDisplayMessage) }
             if older {
                 visibleMessageLimit += received.count
                 hasOlderMessages = received.count == Self.olderPageCount
             }
         }
+        reconcileQuestionAnswerEchoes()
     }
 
     private func remoteDisplayMessage(_ message: AIMessage) -> AIMessage {
@@ -2474,7 +2760,8 @@ final class AIAssistantModel: ObservableObject {
         }
         return AIMessage(id: message.id, role: message.role,
                          created: message.created, completed: message.completed,
-                         active: message.active, parts: parts).withoutReasoningText()
+                         active: message.active, parts: parts, sessionId: message.sessionId,
+                         questionProjection: message.questionProjection).withoutReasoningText()
     }
 
     private func remoteHistoryMessage(_ message: AIMessage) -> AIMessage {
@@ -2484,8 +2771,8 @@ final class AIAssistantModel: ObservableObject {
             case "text":
                 break
             case "tool":
-                part.input = nil
-                part.output = nil
+                // 问题和回答是会话正文；其他工具仍不跨设备发布原始参数和输出。
+                if part.tool != "question" { part.input = nil; part.output = nil }
                 part.error = nil
             case "image", "video":
                 part.path = nil
@@ -2496,15 +2783,24 @@ final class AIAssistantModel: ObservableObject {
         }
         return AIMessage(id: message.id, role: message.role,
                          created: message.created, completed: message.completed,
-                         active: message.active, parts: parts)
+                         active: message.active, parts: parts, sessionId: message.sessionId,
+                         questionProjection: message.questionProjection)
     }
 
     private func remoteHistoryPayload(_ state: AIResponse) throws -> [String: Any] {
-        let safePage = (state.messages ?? []).map(remoteHistoryMessage)
+        var page = state.messages ?? []
+        // 旁路更新覆盖相同 actual ID，跨设备仍发送原 messages 协议；原 state.messages 页游标不变。
+        for updated in state.messageUpdates ?? [] {
+            if let index = page.firstIndex(where: { $0.id == updated.id }) { page[index] = updated }
+            else { page.append(updated) }
+        }
+        let safePage = page.map(remoteHistoryMessage)
         let encoded = try JSONEncoder().encode(safePage)
         return ["ok": true,
                 "busy": state.busy ?? false, "turnId": state.turnId ?? "",
                 "messages": try JSONSerialization.jsonObject(with: encoded),
+                "questionMessages": try JSONSerialization.jsonObject(
+                    with: JSONEncoder().encode((state.questionMessages ?? []).map(remoteHistoryMessage))),
                 "permissions": try JSONSerialization.jsonObject(
                     with: JSONEncoder().encode(state.permissions ?? [])),
                 "questions": try JSONSerialization.jsonObject(
@@ -2588,6 +2884,7 @@ final class AIAssistantModel: ObservableObject {
         var result: [String: Any] = ["ok": true]
         var steeringImportKey: String?
         var steeringDispatched = false
+        var questionAnswerDispatched = false
         do {
             switch envelope.payload.action {
             case "prompt", "steer":
@@ -2731,7 +3028,8 @@ final class AIAssistantModel: ObservableObject {
                         var payload = try remoteHistoryPayload(latest)
                         payload["messages"] = try JSONSerialization.jsonObject(
                             with: JSONEncoder().encode([decorated]))
-                        let encoded = try JSONSerialization.data(withJSONObject: payload)
+                        payload["session_id"] = envelope.sessionID
+                        let encoded = try JSONSerialization.data(withJSONObject: boundedQuestionHistoryPayload(payload))
                         do {
                             try await remoteTransport.publish(sessionID: envelope.sessionID,
                                 data: encoded)
@@ -2765,7 +3063,22 @@ final class AIAssistantModel: ObservableObject {
                 if closeCamera {
                     AIMobileLocalMediaRequests.shared.closeCamera(in: envelope.sessionID)
                 }
-            case "permission", "answer", "rename":
+            case "answer":
+                guard let questionID = envelope.payload.requestID, !questionID.isEmpty else {
+                    throw AIBackendError(message: "回答缺少原问题编号")
+                }
+                guard envelope.payload.attachments?.isEmpty != false else {
+                    throw AIBackendError(message: "问题回答仅发送文字，附件已保留")
+                }
+                questionAnswerDispatched = true
+                let receipt = try await backend.request("answer", values: ["session": envelope.sessionID,
+                    "id": questionID, "text": envelope.payload.text ?? "",
+                    "requestId": envelope.payload.steeringRequestId ?? ""])
+                guard receipt.questionID == questionID else {
+                    throw AIBackendError(message: "所属设备未确认原问题的回答", definitive: false)
+                }
+                result["question_id"] = questionID
+            case "permission", "rename":
                 var values = ["session": envelope.sessionID]
                 if let id = envelope.payload.requestID { values["id"] = id }
                 if let decision = envelope.payload.decision { values["decision"] = decision }
@@ -2776,7 +3089,8 @@ final class AIAssistantModel: ObservableObject {
                 throw AIBackendError(message: "不支持的远端操作")
             }
         } catch {
-            let unknown = steeringDispatched && (error as? AIBackendError)?.definitive != true
+            let unknown = (steeringDispatched || questionAnswerDispatched) &&
+                (error as? AIBackendError)?.definitive != true
             if let key = steeringImportKey,
                remoteSteeringImports[key]?.identity.acceptedOrder == nil, !unknown {
                 remoteSteeringImports.removeValue(forKey: key)
@@ -2823,6 +3137,8 @@ final class AIAssistantModel: ObservableObject {
                     messages = []
                     permissions = []
                     questions = []
+                    questionMessages = []
+                    updatedRootMessages = []
                     quotedMessage = nil
                     historyLoaded = true
                     scrollRequest += 1
@@ -2913,6 +3229,20 @@ final class AIAssistantModel: ObservableObject {
             }
             if let value = result.permissions, value != permissions { permissions = value }
             if let value = result.questions, value != questions { questions = value }
+            if let updates = result.messageUpdates, !updates.isEmpty {
+                let known = Set(messages.map(\.id))
+                // 未加载过的旧 ID 仅进显示旁路，不能让下一次历史查询跳过未读取的中间页。
+                mergeMessages(updates.filter { known.contains($0.id) })
+                var latest = updatedRootMessages
+                for message in updates {
+                    latest.removeAll { $0.id == message.id }
+                    latest.append(message.withoutReasoningText())
+                }
+                latest = Array(latest.suffix(20))
+                if latest != updatedRootMessages { updatedRootMessages = latest }
+            }
+            if let value = result.questionMessages, value != questionMessages { questionMessages = value }
+            reconcileQuestionAnswerEchoes()
             configured = result.configured ?? false
             if let detail = result.error, !detail.isEmpty {
                 if detail != lastBackendError {
@@ -3067,6 +3397,8 @@ final class AIAssistantModel: ObservableObject {
             messages = []
             permissions = []
             questions = []
+            questionMessages = []
+            updatedRootMessages = []
             quotedMessage = nil
             historyLoaded = true
             hasOlderMessages = false
@@ -3098,6 +3430,8 @@ final class AIAssistantModel: ObservableObject {
                 visibleMessageLimit = Self.recentMessageCount
                 permissions = []
                 questions = []
+                questionMessages = []
+                updatedRootMessages = []
                 error = ""
                 quotedMessage = nil
                 historyLoaded = true
@@ -3239,6 +3573,8 @@ final class AIAssistantModel: ObservableObject {
                 messages = []
                 permissions = []
                 questions = []
+                questionMessages = []
+                updatedRootMessages = []
                 historyLoaded = true
                 scrollRequest += 1
             }
@@ -3312,12 +3648,12 @@ final class AIAssistantModel: ObservableObject {
     /// Transport acknowledgement is not owner acceptance. Each delivery attempt
     /// uses a new envelope ID, while requestId stays stable for core deduplication.
     private func sendRemoteSteering(to remote: AIRemoteSession,
-                                    payload: [String: Any]) async throws -> String {
+                                    payload: [String: Any], questionID: String? = nil) async throws -> String {
         let encoded = try JSONSerialization.data(withJSONObject: payload, options: .sortedKeys)
         let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         return try await withCheckedThrowingContinuation { continuation in
             remoteSteeringConfirmations[id] = RemoteSteeringConfirmation(
-                remote: remote, continuation: continuation)
+                remote: remote, questionID: questionID, continuation: continuation)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 do {
@@ -3353,9 +3689,10 @@ final class AIAssistantModel: ObservableObject {
                   !(entry.state == .accepted && messages.contains { $0.id == entry.acceptedMessageID }),
                   let payload = try? JSONDecoder().decode(AIOutgoingMessagePayload.self, from: entry.payloadData)
             else { return nil }
+            if payload.questionID != nil, entry.state == .accepted, acceptedQuestionAnswers[entry.id] != nil { return nil }
             let sameEpoch = entry.binding == nil || entry.binding?.hostEpoch == outgoingCurrentEpoch
             let retry = sameEpoch && (entry.state == .failed ||
-                (entry.state == .unknown && entry.binding?.mode == .steer))
+                (entry.state == .unknown && entry.binding?.mode != .send))
             return AIOutgoingMessageRow(entry: entry, payload: payload, allowsRetry: retry)
         }
     }
@@ -3363,22 +3700,51 @@ final class AIAssistantModel: ObservableObject {
     /// 在点击的 MainActor 调用栈中捕获目标和顺序；收据只确认本地已持久入队，不冒充模型接收。
     func enqueueMessage(_ text: String, expectedSession: String? = nil) -> Task<Bool, Never> {
         let session = selected
-        let files = pendingAttachments[selectedRemote.map(remoteDraftKey) ?? session] ?? []
+        let draftFiles = pendingAttachments[selectedRemote.map(remoteDraftKey) ?? session] ?? []
         guard !outgoingPermanentlyInvalidated, ready, expectedSession == nil || expectedSession == session,
               !screenFrameCurrentAccountID.isEmpty, !workspacePath.isEmpty,
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !files.isEmpty else {
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftFiles.isEmpty else {
             return Task { false }
         }
+        let intakeID = UUID()
+        let conversation = outgoingConversationID(session: session, remote: selectedRemote)
+        let queuedQuestionIDs = Set(outgoingEntries.filter {
+            $0.owner.accountID == screenFrameCurrentAccountID && $0.owner.conversationID == conversation
+        }.compactMap { (try? JSONDecoder().decode(AIOutgoingMessagePayload.self, from: $0.payloadData))?.questionID })
+        let question = questions.sorted {
+            ($0.asked ?? 0) == ($1.asked ?? 0) ? $0.id < $1.id : ($0.asked ?? 0) < ($1.asked ?? 0)
+        }.first { !queuedQuestionIDs.contains($0.id) && questionAnswerReservations[questionReservationKey(session: session,
+            remote: selectedRemote, questionID: $0.id)] == nil }
+        if question != nil, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            showTransientError("请输入回答文字，附件仍保留在输入栏")
+            return Task { false }
+        }
+        if let question {
+            let key = questionReservationKey(session: session, remote: selectedRemote, questionID: question.id)
+            questionAnswerReservations[key] = intakeID
+            questionAnswerReservationOrder.removeAll { $0 == key }
+            questionAnswerReservationOrder.append(key)
+            while questionAnswerReservationOrder.count > 128 {
+                questionAnswerReservations.removeValue(forKey: questionAnswerReservationOrder.removeFirst())
+            }
+        }
+        // question 工具只接受文字；引用和媒体留在原草稿，不能随回答被悄悄消费或删除。
+        let files = question == nil ? draftFiles : []
         var answer: AsyncStream<Bool>.Continuation!
         let stream = AsyncStream<Bool>(bufferingPolicy: .bufferingNewest(1)) { answer = $0 }
         for file in files { outgoingIntakeProtection[file.relativePath, default: 0] += 1 }
-        outgoingIntakes.append(OutgoingIntake(id: UUID(), account: screenFrameCurrentAccountID,
+        outgoingIntakes.append(OutgoingIntake(id: intakeID, account: screenFrameCurrentAccountID,
             workspace: workspacePath, session: session, remote: selectedRemote, emptyToken: emptyDraftToken,
-            text: text, quote: quotedMessage?.id ?? "", files: files, result: answer))
+            text: text, quote: question == nil ? quotedMessage?.id ?? "" : "", files: files,
+            questionID: question?.id, question: question, result: answer))
         if outgoingIntakeTask == nil {
             outgoingIntakeTask = Task { @MainActor [weak self] in await self?.receiveOutgoingIntakes() }
         }
         return Task { for await value in stream { return value }; return false }
+    }
+
+    private func questionReservationKey(session: String, remote: AIRemoteSession?, questionID: String) -> String {
+        screenFrameCurrentAccountID + ":" + outgoingConversationID(session: session, remote: remote) + ":" + questionID
     }
 
     /// 普通调用复用同一个队列；UI 直接用同步 enqueueMessage 保持点击顺序。
@@ -3416,9 +3782,11 @@ final class AIAssistantModel: ObservableObject {
                     conversationID: outgoingConversationID(session: session, remote: intake.remote))
                 let remote = intake.remote.map { AIOutgoingMessagePayload.RemoteOwner(
                     slot: $0.deviceSlot, login: $0.loginSessionID, session: $0.sessionID) }
-                let payload = AIOutgoingMessagePayload(text: intake.text, quotedMessageID: intake.quote,
+                var payload = AIOutgoingMessagePayload(text: intake.text, quotedMessageID: intake.quote,
                     files: intake.files.map(AIOutgoingMessagePayload.File.init), localSession: session,
                     emptyDraftToken: nil, remote: remote)
+                payload.questionID = intake.questionID
+                payload.question = intake.question
                 _ = try await pump.queue.enqueue(owner: owner, payloadData: JSONEncoder().encode(payload), id: intake.id)
                 // 拥有原文件/截图引用的队列先落盘，才从该次草稿分离附件；不删除实际像素。
                 await pump.publish()
@@ -3431,6 +3799,10 @@ final class AIAssistantModel: ObservableObject {
                 scrollRequest += 1
                 pump.wake(owner)
             } catch {
+                if let questionID = intake.questionID {
+                    let key = questionReservationKey(session: intake.session, remote: intake.remote, questionID: questionID)
+                    if questionAnswerReservations[key] == intake.id { questionAnswerReservations.removeValue(forKey: key) }
+                }
                 if self === Self.shared, intake.account == screenFrameCurrentAccountID {
                     showTransientError("内容尚未保存到发送队列，请保留草稿后重试", duration: .seconds(8))
                 }
@@ -3484,6 +3856,21 @@ final class AIAssistantModel: ObservableObject {
             }, accepted: { [weak self] entry in
                 guard let self, !self.outgoingPermanentlyInvalidated, self === Self.shared, self.screenFrameCurrentAccountID == account,
                       self.workspacePath == workspace else { return }
+                if let payload = try? JSONDecoder().decode(AIOutgoingMessagePayload.self, from: entry.payloadData),
+                   let questionID = payload.questionID {
+                    if let question = payload.question {
+                        self.acceptedQuestionAnswers[entry.id] = AcceptedQuestionAnswer(owner: entry.owner,
+                            question: question, text: payload.text)
+                        self.acceptedQuestionAnswerOrder.removeAll { $0 == entry.id }
+                        self.acceptedQuestionAnswerOrder.append(entry.id)
+                        while self.acceptedQuestionAnswerOrder.count > 64 {
+                            self.acceptedQuestionAnswers.removeValue(forKey: self.acceptedQuestionAnswerOrder.removeFirst())
+                        }
+                    }
+                    if entry.owner.conversationID == self.outgoingConversationID(session: self.selected, remote: self.selectedRemote) {
+                        self.questions.removeAll { $0.id == questionID }
+                    }
+                }
                 if self === Self.shared, self.screenFrameCurrentAccountID == account {
                     #if DEBUG && targetEnvironment(simulator)
                     if self.uiTestSupport.steeringHandler == nil { await self.refresh(force: true) }
@@ -3564,6 +3951,12 @@ final class AIAssistantModel: ObservableObject {
 
     private func prepareOutgoing(_ entry: AIOutgoingMessageQueueEntry) async throws -> Data {
         var payload = try checkedOutgoingPayload(entry)
+        if payload.questionID != nil {
+            guard payload.files.isEmpty, payload.quotedMessageID.isEmpty else {
+                throw AIBackendError(message: "问题回答仅发送文字，附件和引用请保留在输入栏")
+            }
+            return try JSONEncoder().encode(payload)
+        }
         var files = try payload.importedFiles(workspace: workspacePath)
         if !payload.archivePinsPrepared {
             var owned: [AIMobileScreenArchiveReference] = []
@@ -3613,6 +4006,9 @@ final class AIAssistantModel: ObservableObject {
     private func bindOutgoing(_ entry: AIOutgoingMessageQueueEntry) async throws -> AIOutgoingMessageQueueBinding {
         let payload = try checkedOutgoingPayload(entry)
         let epoch = await backend.runtimeEpoch()
+        if let questionID = payload.questionID {
+            return AIOutgoingMessageQueueBinding(mode: .answer, questionID: questionID, hostEpoch: epoch)
+        }
         var running: Bool
         var turn: String
         if let remote = payload.remote {
@@ -3655,6 +4051,26 @@ final class AIAssistantModel: ObservableObject {
         let files = try payload.importedFiles(workspace: workspacePath)
         outgoingDeliveryCount += 1; isSubmitting = true
         defer { outgoingDeliveryCount -= 1; isSubmitting = outgoingDeliveryCount > 0 }
+        if binding.mode == .answer {
+            guard let questionID = binding.questionID, questionID == payload.questionID,
+                  files.isEmpty, payload.quotedMessageID.isEmpty else {
+                throw AIBackendError(message: "回答与原问题不匹配，内容已保留")
+            }
+            if let remote = payload.remote {
+                guard let owner = remoteSessions.first(where: { $0.deviceSlot == remote.slot &&
+                    $0.loginSessionID == remote.login && $0.sessionID == remote.session }), remoteIsOnline(owner) else {
+                    throw AIBackendError(message: "原设备未确认回答", definitive: false)
+                }
+                return try await sendRemoteSteering(to: owner, payload: ["action": "answer", "id": questionID,
+                    "text": payload.text, "requestId": entry.requestID], questionID: questionID)
+            }
+            let receipt = try await backend.request("answer", values: ["session": payload.localSession,
+                "id": questionID, "text": payload.text, "requestId": entry.requestID])
+            guard receipt.questionID == questionID else {
+                throw AIBackendError(message: "回答送达状态待确认，内容已保留", definitive: false)
+            }
+            return questionID
+        }
         if let remote = payload.remote {
             guard let owner = remoteSessions.first(where: { $0.deviceSlot == remote.slot &&
                 $0.loginSessionID == remote.login && $0.sessionID == remote.session }), remoteIsOnline(owner) else {
@@ -3698,6 +4114,8 @@ final class AIAssistantModel: ObservableObject {
             return self !== Self.shared || (error as? AIBackendError)?.code == "owner_offline" ? .wait : .failed
         }
         if entry.everUnknown || (error as? AIBackendError)?.definitive != true { return .unknown }
+        // 失效回答只能留在原 outbox 恢复，不能重新绑定为下一轮 send/steer。
+        if entry.binding?.mode == .answer { return .failed }
         if let payload = try? checkedOutgoingPayload(entry), payload.remote == nil,
            let files = try? payload.importedFiles(workspace: workspacePath) {
             let pins = files.compactMap(\.archiveReference).filter {

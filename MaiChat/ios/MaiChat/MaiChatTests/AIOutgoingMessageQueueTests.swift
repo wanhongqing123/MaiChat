@@ -29,6 +29,31 @@ final class AIOutgoingMessageQueueTests: XCTestCase {
         func cleanup() { try? FileManager.default.removeItem(at: root) }
     }
 
+    func testAnswerRetryKeepsItsOriginalQuestionAcrossReload() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanup() }
+        let queue = try fixture.queue()
+        let entry = try await queue.enqueue(owner: fixture.owner, payloadData: Data("answer".utf8))
+        let binding = AIOutgoingMessageQueueBinding(mode: .answer, questionID: "question-a", hostEpoch: "epoch-a")
+        let sending = try await queue.transition(id: entry.id, expectedRevision: entry.revision,
+                                                to: .dispatch(binding))
+        _ = try await queue.transition(id: sending.id, expectedRevision: sending.revision, to: .unknown)
+        let reopened = try fixture.queue()
+        let loaded = try await reopened.load()
+        let unknown = try XCTUnwrap(loaded.first)
+        let retry = try await reopened.transition(id: unknown.id, expectedRevision: unknown.revision, to: .retry)
+        XCTAssertEqual(retry.binding, binding)
+        XCTAssertEqual(retry.binding?.questionID, "question-a")
+        XCTAssertEqual(retry.state, .dispatching)
+        let restarted = try fixture.queue(epoch: "epoch-b")
+        let recovered = try await restarted.load()
+        let old = try XCTUnwrap(recovered.first)
+        do {
+            _ = try await restarted.transition(id: old.id, expectedRevision: old.revision, to: .retry)
+            XCTFail("An answer cannot be replayed into a replacement Agent runtime")
+        } catch { XCTAssertEqual(error as? AIOutgoingMessageQueueError, .invalidTransition) }
+    }
+
     func testIdenticalClicksRemainDistinctAndSameClickEnqueueIsIdempotentAcrossReload() async throws
     {
         let fixture = try Fixture()

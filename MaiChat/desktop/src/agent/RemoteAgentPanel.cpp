@@ -1,4 +1,4 @@
-// 文件作用：呈现远端 Session 的可见记录；输入和权限决定都发往所属设备。
+// 文件作用：呈现远端 Session 的可见记录；普通输入按原问题或任务投递，权限决定独立发往所属设备。
 #include "agent/RemoteAgentPanel.h"
 
 #include "MaiCloudDriveClient.h"
@@ -17,7 +17,6 @@
 #include <QJsonArray>
 #include <QKeyEvent>
 #include <QLabel>
-#include <QLineEdit>
 #include <QMap>
 #include <QMimeData>
 #include <QPainter>
@@ -31,6 +30,8 @@
 #include <QUuid>
 #include <QUrl>
 #include <QVBoxLayout>
+
+#include <algorithm>
 
 #include "markdown/MarkdownView.h"
 #include "ui/ComposerTextEdit.h"
@@ -52,6 +53,106 @@ QString attachmentSummary(const QStringList& paths) {
         .arg(names.join(QStringLiteral("、")), paths.size() > 3 ? QStringLiteral(" 等") : QString());
 }
 
+QString questionText(const QJsonObject& input) {
+    QString text = input.value(QStringLiteral("question")).toString();
+    if (text.isEmpty()) return {};
+    int index = 0;
+    for (const QJsonValue& option : input.value(QStringLiteral("options")).toArray())
+        text += QStringLiteral("\n%1. %2").arg(++index).arg(option.toString());
+    return text;
+}
+
+QString questionPartText(const QJsonObject& part) {
+    if (part.value(QStringLiteral("kind")) != QStringLiteral("tool") ||
+        part.value(QStringLiteral("tool")) != QStringLiteral("question"))
+        return {};
+    const QJsonValue input = part.value(QStringLiteral("input"));
+    return questionText(input.isObject() ? input.toObject()
+                                        : QJsonDocument::fromJson(input.toString().toUtf8()).object());
+}
+
+QString questionPartId(const QJsonObject& question) {
+    const QString part = question.value(QStringLiteral("partId")).toString();
+    return part.isEmpty() ? QStringLiteral("question-part:") + question.value(QStringLiteral("id")).toString() : part;
+}
+
+QJsonObject questionMessage(const QJsonObject& question) {
+    const QString input = QString::fromUtf8(QJsonDocument(QJsonObject{
+        {QStringLiteral("question"), question.value(QStringLiteral("question"))},
+        {QStringLiteral("options"), question.value(QStringLiteral("options"))}}).toJson(QJsonDocument::Compact));
+    return {{QStringLiteral("id"), QStringLiteral("pending-question:") + question.value(QStringLiteral("id")).toString()},
+            {QStringLiteral("role"), QStringLiteral("assistant")},
+            {QStringLiteral("created"), question.value(QStringLiteral("asked"))},
+            {QStringLiteral("questionProjection"), true},
+            {QStringLiteral("parts"), QJsonArray{QJsonObject{
+                {QStringLiteral("id"), questionPartId(question)}, {QStringLiteral("kind"), QStringLiteral("tool")},
+                {QStringLiteral("tool"), QStringLiteral("question")}, {QStringLiteral("state"), QStringLiteral("running")},
+                {QStringLiteral("input"), input}}}}};
+}
+
+double coreIdTime(const QString& id) {
+        if ((!id.startsWith(QStringLiteral("prt_")) && !id.startsWith(QStringLiteral("msg_"))) || id.size() < 14) return 0;
+        const QString alphabet = QStringLiteral("0123456789ABCDEFGHJKMNPQRSTVWXYZ");
+        quint64 value = 0;
+        for (const QChar ch : id.mid(4, 10)) {
+            const int index = alphabet.indexOf(ch);
+            if (index < 0) return 0;
+            value = value * 32 + quint64(index);
+        }
+        return double(value);
+}
+
+QList<QJsonObject> questionDisplayTimeline(const QMap<QString, QJsonObject>& source) {
+    struct Unit { QJsonObject message; QJsonArray parts; double time; QString order; };
+    QVector<Unit> units;
+    for (const QJsonObject& message : source) {
+        const QString id = message.value(QStringLiteral("id")).toString();
+        const QJsonArray parts = message.value(QStringLiteral("parts")).toArray();
+        double previous = message.value(QStringLiteral("created")).toDouble();
+        if (message.value(QStringLiteral("role")) == QStringLiteral("user") || parts.isEmpty()) {
+            units.append({message, parts, previous, coreIdTime(id) > 0 ? id.mid(4) : id});
+            continue;
+        }
+        for (int index = 0; index < parts.size(); ++index) {
+            const QJsonObject part = parts[index].toObject();
+            if (part.value(QStringLiteral("kind")) == QStringLiteral("reasoning")) continue;
+            const QString partId = part.value(QStringLiteral("id")).toString();
+            double time = part.value(QStringLiteral("created")).toDouble();
+            if (time <= 0) time = coreIdTime(partId);
+            previous = qMax(previous, time);
+            const QString order = coreIdTime(partId) > 0 ? partId.mid(4)
+                : id + QStringLiteral(":%1").arg(index, 6, 10, QLatin1Char('0'));
+            units.append({message, QJsonArray{part}, previous, order});
+        }
+    }
+    std::stable_sort(units.begin(), units.end(), [](const Unit& a, const Unit& b) {
+        return a.time == b.time ? a.order < b.order : a.time < b.time;
+    });
+    QList<QJsonObject> result;
+    QHash<QString, int> occurrences;
+    for (const Unit& unit : units) {
+        const QString sourceId = unit.message.value(QStringLiteral("id")).toString();
+        if (!result.isEmpty() && result.last().value(QStringLiteral("source_message_id")).toString() == sourceId &&
+            unit.message.value(QStringLiteral("role")) != QStringLiteral("user")) {
+            QJsonArray parts = result.last().value(QStringLiteral("parts")).toArray();
+            for (const auto& part : unit.parts) parts.append(part);
+            result.last().insert(QStringLiteral("parts"), parts);
+        } else {
+            QJsonObject fragment = unit.message;
+            fragment.insert(QStringLiteral("source_message_id"), sourceId);
+            fragment.insert(QStringLiteral("parts"), unit.parts);
+            if (occurrences.value(sourceId) > 0) {
+                const QString part = unit.parts.isEmpty() ? QStringLiteral("empty")
+                    : unit.parts.first().toObject().value(QStringLiteral("id")).toString(QString::number(occurrences.value(sourceId)));
+                fragment.insert(QStringLiteral("id"), sourceId + QStringLiteral(":segment:") + part);
+            }
+            ++occurrences[sourceId];
+            result.append(fragment);
+        }
+    }
+    return result;
+}
+
 QString messageText(const QJsonObject& message) {
     QStringList text;
     int toolCount = 0;
@@ -63,6 +164,8 @@ QString messageText(const QJsonObject& message) {
         if (kind == QStringLiteral("text"))
             text.append(part.value(QStringLiteral("text")).toString());
         else if (kind == QStringLiteral("tool")) {
+            const QString question = questionPartText(part);
+            if (!question.isEmpty()) { text.append(question); continue; }
             ++toolCount;
             lastTool = part.value(QStringLiteral("tool")).toString();
             lastState = part.value(QStringLiteral("state")).toString();
@@ -147,11 +250,41 @@ struct RemoteAgentPanel::Runtime {
     QVBoxLayout* requestsLayout = nullptr;
     QTimer historyTimeout;
     QMap<QString, QJsonObject> messages;
+    QMap<QString, QJsonObject> windowUpdates;
+    QStringList windowUpdateOrder;
+    QSet<QString> historyMessageIds;
+    void retainWindowUpdate(const QString& id, const QJsonObject& message) {
+        windowUpdates.insert(id, message);
+        windowUpdateOrder.removeAll(id);
+        windowUpdateOrder.append(id);
+        while (windowUpdateOrder.size() > 20) windowUpdates.remove(windowUpdateOrder.takeFirst());
+    }
+    QMap<QString, QJsonObject> questionMessages;
+    QJsonArray questions;
+    // ACK precedes the next canonical tool snapshot. These are display echoes,
+    // never invented Core user rows or remote user_message_id receipts.
+    QHash<QString, QJsonObject> acceptedAnswerEchoes;
+    QStringList acceptedAnswerOrder;
+    QSet<QString> reservedQuestions;
+    QStringList reservedQuestionOrder;
+    void reserveQuestion(const QString& key) {
+        if (reservedQuestions.contains(key)) return;
+        reservedQuestions.insert(key);
+        reservedQuestionOrder.append(key);
+        while (reservedQuestionOrder.size() > 128) reservedQuestions.remove(reservedQuestionOrder.takeFirst());
+    }
+    void acceptAnswerEcho(const QString& key, const QJsonObject& entry) {
+        acceptedAnswerEchoes.insert(key, entry);
+        acceptedAnswerOrder.removeAll(key);
+        acceptedAnswerOrder.append(key);
+        while (acceptedAnswerOrder.size() > 64) acceptedAnswerEchoes.remove(acceptedAnswerOrder.takeFirst());
+    }
     QMap<QString, QString> rendered;
     QSet<QString> optimisticMessages;
     QHash<QString, QString> drafts;
     QHash<QString, QStringList> attachmentDrafts;
     QHash<QString, QString> copiedUnknownRequests;
+    QHash<QString, QJsonObject> recoveredQuestions;
     QStringList attachments;
     QString oldest;
     bool pendingCommand = false;
@@ -198,6 +331,8 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
             runtime_->drafts.insert(it.key(), it.value().toObject().value(QStringLiteral("text")).toString());
             const QString copied = it.value().toObject().value(QStringLiteral("copied_unknown_request")).toString();
             if (!copied.isEmpty()) runtime_->copiedUnknownRequests.insert(it.key(), copied);
+            const QJsonObject question = it.value().toObject().value(QStringLiteral("answer_question")).toObject();
+            if (!question.isEmpty()) runtime_->recoveredQuestions.insert(it.key(), question);
             QStringList paths;
             for (const QJsonValue& path : it.value().toObject().value(QStringLiteral("files")).toArray())
                 paths.append(path.toString());
@@ -369,8 +504,10 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
     connect(runtime_->editor, &QTextEdit::textChanged, this, [this] {
         if (!runtime_->restoringDraft && !runtime_->session.isEmpty())
             runtime_->drafts.insert(sessionKey(runtime_->session), runtime_->editor->toPlainText());
-        if (!runtime_->restoringDraft && runtime_->editor->toPlainText().isEmpty())
+        if (!runtime_->restoringDraft && runtime_->editor->toPlainText().isEmpty()) {
             runtime_->copiedUnknownRequests.remove(sessionKey(runtime_->session));
+            runtime_->recoveredQuestions.remove(sessionKey(runtime_->session));
+        }
         updateControls();
     });
     connect(runtime_->older, &QPushButton::clicked, this, [this] {
@@ -452,6 +589,11 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
         runtime_->attachmentsLabel->setVisible(!runtime_->attachments.isEmpty());
         runtime_->clearAttachments->setVisible(!runtime_->attachments.isEmpty());
         runtime_->messages.clear();
+        runtime_->windowUpdates.clear();
+        runtime_->windowUpdateOrder.clear();
+        runtime_->historyMessageIds.clear();
+        runtime_->questionMessages.clear();
+        runtime_->questions = {};
         runtime_->rendered.clear();
         runtime_->optimisticMessages.clear();
         runtime_->view->clear();
@@ -530,7 +672,8 @@ bool RemoteAgentPanel::persistOutbox() {
         drafts.insert(it.key(), QJsonObject{{QStringLiteral("text"), it.value()},
                                             {QStringLiteral("files"), files},
                                             {QStringLiteral("copied_unknown_request"),
-                                             runtime_->copiedUnknownRequests.value(it.key())}});
+                                              runtime_->copiedUnknownRequests.value(it.key())},
+                                             {QStringLiteral("answer_question"), runtime_->recoveredQuestions.value(it.key())}});
     }
     const QByteArray data =
         QJsonDocument(QJsonObject{{QStringLiteral("outbox"), runtime_->outbox}, {QStringLiteral("drafts"), drafts}})
@@ -549,7 +692,7 @@ void RemoteAgentPanel::refreshAttachments() {
     runtime_->clearAttachments->setVisible(!runtime_->attachments.isEmpty());
 }
 
-void RemoteAgentPanel::sendAction(const QJsonObject& requested, bool clearDraft) {
+void RemoteAgentPanel::sendAction(const QJsonObject& requested, bool clearDraft, const QJsonObject& question) {
     if (!runtime_->command) return;
     const QJsonObject owner = runtime_->session;
     if (!owner.value(QStringLiteral("online")).toBool()) return;
@@ -573,42 +716,50 @@ void RemoteAgentPanel::sendAction(const QJsonObject& requested, bool clearDraft)
         return;
     }
     const QString key = sessionKey(owner);
+    const bool isAnswer = action.value(QStringLiteral("action")) == QStringLiteral("answer");
     const QJsonArray old = runtime_->outbox;
     const QString oldDraft = runtime_->drafts.value(key);
     const QStringList oldFiles = runtime_->attachmentDrafts.value(key);
+    const QJsonObject recoveredQuestion = runtime_->recoveredQuestions.value(key);
     QJsonObject entry{{QStringLiteral("owner"), owner},
                       {QStringLiteral("action"), action},
                       {QStringLiteral("requestId"), requestId},
                       {QStringLiteral("draft"), runtime_->editor->toPlainText()},
                       {QStringLiteral("state"), QStringLiteral("queued")}};
+    if (isAnswer) entry.insert(QStringLiteral("question"), question);
     runtime_->outbox.append(entry);
     runtime_->drafts.insert(key, {});
-    runtime_->attachmentDrafts.insert(key, {});
+    if (isAnswer) runtime_->recoveredQuestions.remove(key);
+    runtime_->attachmentDrafts.insert(key, isAnswer ? runtime_->attachments : QStringList{});
     // Durable capture precedes clearing any live draft. A storage error leaves
     // the editor and attachments intact and sends nothing.
     if (!persistOutbox()) {
         runtime_->outbox = old;
         runtime_->drafts.insert(key, oldDraft);
         runtime_->attachmentDrafts.insert(key, oldFiles);
+        if (!recoveredQuestion.isEmpty()) runtime_->recoveredQuestions.insert(key, recoveredQuestion);
         showStatus(
             QStringLiteral("\u65e0\u6cd5\u4fdd\u5b58\u5f85\u53d1\u6d88\u606f\uff0c\u8349\u7a3f\u5df2\u4fdd\u7559"),
             true);
         return;
     }
+    if (isAnswer) runtime_->reserveQuestion(key + QLatin1Char('|') + action.value(QStringLiteral("id")).toString());
     const QString optimisticId = QStringLiteral("msg_z_pending_%1").arg(requestId);
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     QString text = action.value(QStringLiteral("text")).toString();
     if (text.isEmpty()) text = QStringLiteral("\u5df2\u53d1\u9001\u9644\u4ef6");
-    runtime_->optimisticMessages.insert(optimisticId);
-    runtime_->messages.insert(
+    if (!isAnswer) {
+        runtime_->optimisticMessages.insert(optimisticId);
+        runtime_->messages.insert(
         optimisticId,
         {{QStringLiteral("id"), optimisticId},
          {QStringLiteral("role"), QStringLiteral("user")},
          {QStringLiteral("created"), double(now)},
          {QStringLiteral("parts"),
-          QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")}, {QStringLiteral("text"), text}}}}});
+           QJsonArray{QJsonObject{{QStringLiteral("kind"), QStringLiteral("text")}, {QStringLiteral("text"), text}}}}});
+    }
     runtime_->editor->clear();
-    runtime_->attachments.clear();
+    if (!isAnswer) runtime_->attachments.clear();
     refreshAttachments();
     renderMessages();
     dispatchQueued();
@@ -626,10 +777,11 @@ void RemoteAgentPanel::dispatchQueued(const QString& requestedOwner) {
         const QJsonObject current = runtime_->owners.value(ownerKey);
         if (!current.value(QStringLiteral("online")).toBool()) return;
         const QJsonObject action = entry.value(QStringLiteral("action")).toObject();
+        const bool isAnswer = action.value(QStringLiteral("action")) == QStringLiteral("answer");
         const QString turn = action.value(QStringLiteral("turnId")).toString();
         if (action.value(QStringLiteral("action")) == QStringLiteral("steer") && turn.isEmpty()) return;
-        if ((!turn.isEmpty() && turn != current.value(QStringLiteral("turnId")).toString()) ||
-            (turn.isEmpty() && current.value(QStringLiteral("busy")).toBool())) {
+        if (!isAnswer && ((!turn.isEmpty() && turn != current.value(QStringLiteral("turnId")).toString()) ||
+            (turn.isEmpty() && current.value(QStringLiteral("busy")).toBool()))) {
             entry.insert(QStringLiteral("state"), QStringLiteral("held"));
             runtime_->outbox[i] = entry;
             persistOutbox();
@@ -693,13 +845,18 @@ void RemoteAgentPanel::finishQueued(const QString& requestId, const QJsonObject&
         unknown |= result.value(QStringLiteral("unknown")).toBool() ||
                    result.value(QStringLiteral("delivery_unknown")).toBool();
         if (!result.value(QStringLiteral("ok")).isBool()) unknown = true;
+        const QJsonObject sent = entry.value(QStringLiteral("action")).toObject();
+        const bool isAnswer = sent.value(QStringLiteral("action")) == QStringLiteral("answer");
         if (!unknown && result.value(QStringLiteral("ok")).toBool() &&
-            result.value(QStringLiteral("user_message_id")).toString().isEmpty())
+            (isAnswer ? result.value(QStringLiteral("question_id")) != sent.value(QStringLiteral("id"))
+                      : result.value(QStringLiteral("user_message_id")).toString().isEmpty()))
             unknown = true;
         const bool accepted = !unknown && result.value(QStringLiteral("ok")).toBool();
         const QString optimisticId = QStringLiteral("msg_z_pending_%1").arg(requestId);
         if (accepted) {
-            const QString acceptedTurn = result.value(QStringLiteral("turnId")).toString();
+            const QString acceptedTurn = isAnswer
+                ? entry.value(QStringLiteral("owner")).toObject().value(QStringLiteral("turnId")).toString()
+                : result.value(QStringLiteral("turnId")).toString();
             for (int j = i + 1; j < runtime_->outbox.size(); ++j) {
                 QJsonObject tail = runtime_->outbox[j].toObject();
                 QJsonObject action = tail.value(QStringLiteral("action")).toObject();
@@ -722,11 +879,22 @@ void RemoteAgentPanel::finishQueued(const QString& requestId, const QJsonObject&
                 runtime_->owners.insert(key, owner);
                 if (visible) runtime_->session = owner;
             }
+            if (isAnswer) {
+                const QString answerKey = key + QLatin1Char('|') + sent.value(QStringLiteral("id")).toString();
+                runtime_->acceptAnswerEcho(answerKey, entry);
+                runtime_->reserveQuestion(answerKey);
+                if (visible) {
+                    QJsonArray pending;
+                    for (const QJsonValue& question : runtime_->questions)
+                        if (question.toObject().value(QStringLiteral("id")) != sent.value(QStringLiteral("id"))) pending.append(question);
+                    runtime_->questions = pending;
+                }
+            }
             runtime_->outbox.removeAt(i);
             if (visible) {
                 const QString canonical = result.value(QStringLiteral("user_message_id")).toString();
                 QJsonObject message = runtime_->messages.value(optimisticId);
-                if (!canonical.isEmpty()) {
+                if (!isAnswer && !canonical.isEmpty()) {
                     removeOptimisticMessage(optimisticId);
                     if (!runtime_->messages.contains(canonical)) {
                         message.insert(QStringLiteral("id"), canonical);
@@ -761,7 +929,7 @@ void RemoteAgentPanel::finishQueued(const QString& requestId, const QJsonObject&
         persistOutbox();
         if (visible) {
             runtime_->pendingCommand = false;
-            if (!accepted && !unknown && runtime_->editor->toPlainText().isEmpty() && runtime_->attachments.isEmpty())
+            if (!isAnswer && !accepted && !unknown && runtime_->editor->toPlainText().isEmpty() && runtime_->attachments.isEmpty())
                 recoverQueuedDraft();
             updateThinking();
             updateControls();
@@ -787,6 +955,9 @@ void RemoteAgentPanel::recoverQueuedDraft() {
             entry.value(QStringLiteral("state")) == QStringLiteral("queued"))
             return;
         const QJsonArray before = runtime_->outbox;
+        const QJsonObject previousQuestion = runtime_->recoveredQuestions.value(key);
+        const QJsonObject question = entry.value(QStringLiteral("question")).toObject();
+        if (!question.isEmpty()) runtime_->recoveredQuestions.insert(key, question);
         runtime_->drafts.insert(key, entry.value(QStringLiteral("draft")).toString());
         QStringList paths;
         for (const QJsonValue& path :
@@ -801,12 +972,15 @@ void RemoteAgentPanel::recoverQueuedDraft() {
         if (!unknown) runtime_->outbox.removeAt(i);
         if (!persistOutbox()) {
             runtime_->outbox = before;
+            if (previousQuestion.isEmpty()) runtime_->recoveredQuestions.remove(key);
+            else runtime_->recoveredQuestions.insert(key, previousQuestion);
             return;
         }
         runtime_->editor->setPlainText(runtime_->drafts.value(key));
         runtime_->attachments = paths;
         refreshAttachments();
         if (unknown) showStatus(QStringLiteral("发送结果未确认，请先核对所属设备；原请求仍已保留。"), true);
+        else if (!question.isEmpty()) showStatus(QStringLiteral("已取回回答；重发仍回答原问题。若问题已结束，请先清空文字再写新消息。"));
         removeOptimisticMessage(
             QStringLiteral("msg_z_pending_%1").arg(entry.value(QStringLiteral("requestId")).toString()));
         updateControls();
@@ -829,6 +1003,44 @@ void RemoteAgentPanel::sendOrStop() {
     }
     const QString text = runtime_->editor->toPlainText().trimmed();
     if ((text.isEmpty() && runtime_->attachments.isEmpty()) || text.toUtf8().size() > 16 * 1024) return;
+    const QJsonObject recovered = runtime_->recoveredQuestions.value(sessionKey(runtime_->session));
+    if (!recovered.isEmpty()) {
+        if (text.isEmpty()) { showStatus(QStringLiteral("原回答仅发送文字，附件已保留")); return; }
+        sendAction({{QStringLiteral("action"), QStringLiteral("answer")},
+                    {QStringLiteral("id"), recovered.value(QStringLiteral("id"))},
+                    {QStringLiteral("text"), text}}, true, recovered);
+        return;
+    }
+    QVector<QJsonObject> questions;
+    const QString ownerKey = sessionKey(runtime_->session);
+    for (const QJsonValue& value : runtime_->questions) {
+        const QJsonObject question = value.toObject();
+        const QString id = question.value(QStringLiteral("id")).toString();
+        bool reserved = id.isEmpty() || runtime_->reservedQuestions.contains(ownerKey + QLatin1Char('|') + id);
+        for (const QJsonValue& queued : runtime_->outbox) {
+            const QJsonObject entry = queued.toObject();
+            const QJsonObject action = entry.value(QStringLiteral("action")).toObject();
+            reserved |= sessionKey(entry.value(QStringLiteral("owner")).toObject()) == ownerKey &&
+                        action.value(QStringLiteral("action")) == QStringLiteral("answer") &&
+                        action.value(QStringLiteral("id")) == id;
+        }
+        if (!reserved) questions.append(question);
+    }
+    std::sort(questions.begin(), questions.end(), [](const QJsonObject& left, const QJsonObject& right) {
+        const double a = left.value(QStringLiteral("asked")).toDouble();
+        const double b = right.value(QStringLiteral("asked")).toDouble();
+        return a == b ? left.value(QStringLiteral("id")).toString() < right.value(QStringLiteral("id")).toString() : a < b;
+    });
+    if (!questions.isEmpty()) {
+        if (text.isEmpty()) { showStatus(QStringLiteral("请输入回答文字，附件仍保留在输入栏")); return; }
+        const QJsonObject question = questions.first();
+        // Only the captured question is answered. Media stays in the ordinary
+        // composer, and cancellation cannot turn this answer into a new prompt.
+        sendAction({{QStringLiteral("action"), QStringLiteral("answer")},
+                    {QStringLiteral("id"), question.value(QStringLiteral("id"))},
+                    {QStringLiteral("text"), text}}, true, question);
+        return;
+    }
     const bool busy = runtime_->session.value(QStringLiteral("busy")).toBool();
     const QString turn = runtime_->session.value(QStringLiteral("turnId")).toString();
     if (busy && turn.isEmpty()) {
@@ -898,10 +1110,29 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
         return;
     }
     const QJsonArray received = payload.value(QStringLiteral("messages")).toArray();
+    if (payload.contains(QStringLiteral("questions"))) runtime_->questions = payload.value(QStringLiteral("questions")).toArray();
+    if (payload.contains(QStringLiteral("questionMessages"))) {
+        runtime_->questionMessages.clear();
+        for (const QJsonValue& value : payload.value(QStringLiteral("questionMessages")).toArray()) {
+            const QJsonObject message = value.toObject();
+            const QString id = message.value(QStringLiteral("id")).toString();
+            if (!id.isEmpty()) runtime_->questionMessages.insert(id, message);
+        }
+    }
     for (const QJsonValue& value : received) {
         const QJsonObject message = value.toObject();
         const QString id = message.value(QStringLiteral("id")).toString();
-        if (!id.isEmpty()) runtime_->messages.insert(id, message);
+        if (!id.isEmpty()) {
+            const bool outsideWindow = kind != QStringLiteral("history_page") && !runtime_->messages.contains(id) &&
+                !runtime_->oldest.isEmpty() && id < runtime_->oldest;
+            if (outsideWindow) runtime_->retainWindowUpdate(id, message);
+            else {
+                runtime_->messages.insert(id, message);
+                runtime_->windowUpdates.remove(id);
+                runtime_->windowUpdateOrder.removeAll(id);
+            }
+            if (kind == QStringLiteral("history_page")) runtime_->historyMessageIds.insert(id);
+        }
         if (runtime_->awaitingResponse &&
             message.value(QStringLiteral("role")).toString() == QStringLiteral("assistant") &&
             message.value(QStringLiteral("created")).toVariant().toLongLong() >= runtime_->commandSentAt - 1000 &&
@@ -915,6 +1146,14 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
             runtime_->oldest = oldest;
             runtime_->older->setVisible(received.size() >= (initial ? 10 : 20));
         }
+        // A live point read can precede the first SQL page. Once its actual
+        // cursor is known, keep unknown older owners in the same bounded bypass.
+        for (auto it = runtime_->messages.begin(); it != runtime_->messages.end();) {
+            if (it.key() < runtime_->oldest && !runtime_->historyMessageIds.contains(it.key())) {
+                runtime_->retainWindowUpdate(it.key(), it.value());
+                it = runtime_->messages.erase(it);
+            } else ++it;
+        }
     }
     renderMessages();
     renderRequests(payload);
@@ -922,48 +1161,165 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
 }
 
 void RemoteAgentPanel::renderMessages() {
-    const QStringList ids = runtime_->messages.keys();
-    const bool followedLatest = runtime_->view->isAtBottom();
-    bool prepend = !runtime_->rendered.isEmpty() && !ids.isEmpty() && ids.first() < runtime_->rendered.firstKey();
-    if (!prepend && !runtime_->rendered.isEmpty()) {
-        const QString lastRendered = runtime_->rendered.lastKey();
-        for (const QString& id : ids)
-            if (id < lastRendered && !runtime_->rendered.contains(id)) {
-                prepend = true;
-                break;
-            }
+    struct Segment {
+        QString id;
+        QString text;
+        MarkdownView::Style style;
+    };
+    const QString ownerKey = sessionKey(runtime_->session);
+    QMap<QString, QJsonObject> displayed = runtime_->messages;
+    const double cutoff = runtime_->messages.value(runtime_->oldest).value(QStringLiteral("created")).toDouble();
+    for (auto it = runtime_->windowUpdates.cbegin(); it != runtime_->windowUpdates.cend(); ++it) {
+        if (displayed.contains(it.key())) continue;
+        QJsonObject message = it.value();
+        QJsonArray recent;
+        for (const QJsonValue& value : message.value(QStringLiteral("parts")).toArray()) {
+            const QJsonObject part = value.toObject();
+            // New hosts supply part.created. For old ULID snapshots the timeline
+            // still orders each retained part; unknown age stays conservative.
+            double created = part.value(QStringLiteral("created")).toDouble();
+            if (created <= 0) created = coreIdTime(part.value(QStringLiteral("id")).toString());
+            if (created <= 0) created = message.value(QStringLiteral("created")).toDouble();
+            if (created >= cutoff || !questionPartText(part).isEmpty()) recent.append(value);
+        }
+        if (recent.isEmpty()) continue;
+        message.insert(QStringLiteral("parts"), recent);
+        displayed.insert(it.key(), message);
     }
-    bool contentChanged = prepend;
-    for (const QString& id : ids) {
-        const QString content = messageText(runtime_->messages.value(id));
-        if (!content.isEmpty() && runtime_->rendered.value(id) != content) {
-            contentChanged = true;
-            break;
+    for (auto it = runtime_->questionMessages.begin(); it != runtime_->questionMessages.end(); ++it) {
+        if (displayed.contains(it.key())) continue;
+        QJsonObject projection = it.value();
+        projection.insert(QStringLiteral("questionProjection"), true);
+        displayed.insert(it.key(), projection);
+    }
+    QSet<QString> knownParts;
+    QSet<QString> completedParts;
+    for (const QJsonObject& message : displayed) {
+        for (const QJsonValue& value : message.value(QStringLiteral("parts")).toArray()) {
+            const QJsonObject part = value.toObject();
+            if (questionPartText(part).isEmpty()) continue;
+            const QString id = part.value(QStringLiteral("id")).toString();
+            knownParts.insert(id);
+            if (part.value(QStringLiteral("state")) == QStringLiteral("completed") &&
+                !part.value(QStringLiteral("output")).toString().isEmpty()) completedParts.insert(id);
         }
     }
-    if (runtime_->thinking && contentChanged) {
+    QHash<QString, QString> answerEchoes;
+    const auto includeEcho = [&](const QJsonObject& entry) {
+        if (sessionKey(entry.value(QStringLiteral("owner")).toObject()) != ownerKey) return;
+        const QJsonObject question = entry.value(QStringLiteral("question")).toObject();
+        if (question.value(QStringLiteral("id")).toString().isEmpty()) return;
+        const QString part = questionPartId(question);
+        if (!completedParts.contains(part))
+            answerEchoes.insert(part, entry.value(QStringLiteral("action")).toObject().value(QStringLiteral("text")).toString());
+        if (!knownParts.contains(part)) {
+            const QJsonObject message = questionMessage(question);
+            displayed.insert(message.value(QStringLiteral("id")).toString(), message);
+            knownParts.insert(part);
+        }
+    };
+    for (auto it = runtime_->acceptedAnswerEchoes.begin(); it != runtime_->acceptedAnswerEchoes.end();) {
+        const QJsonObject entry = it.value();
+        if (sessionKey(entry.value(QStringLiteral("owner")).toObject()) == ownerKey &&
+            completedParts.contains(questionPartId(entry.value(QStringLiteral("question")).toObject()))) {
+            it = runtime_->acceptedAnswerEchoes.erase(it);
+        } else {
+            includeEcho(entry);
+            ++it;
+        }
+    }
+    for (const QJsonValue& value : runtime_->outbox) {
+        const QJsonObject entry = value.toObject();
+        const QString state = entry.value(QStringLiteral("state")).toString();
+        if ((state == QStringLiteral("queued") || state == QStringLiteral("sending")) &&
+            entry.value(QStringLiteral("action")).toObject().value(QStringLiteral("action")) == QStringLiteral("answer"))
+            includeEcho(entry);
+    }
+    for (const QJsonValue& value : runtime_->questions) {
+        const QJsonObject question = value.toObject();
+        if (question.value(QStringLiteral("id")).toString().isEmpty() || knownParts.contains(questionPartId(question))) continue;
+        const QJsonObject message = questionMessage(question);
+        displayed.insert(message.value(QStringLiteral("id")).toString(), message);
+        knownParts.insert(questionPartId(question));
+    }
+    const QList<QJsonObject> ordered = questionDisplayTimeline(displayed);
+    QVector<Segment> segments;
+    QSet<QString> renderedQuestions;
+    for (const QJsonObject& message : ordered) {
+        const QString messageId = message.value(QStringLiteral("id")).toString();
+        const QJsonArray parts = message.value(QStringLiteral("parts")).toArray();
+        const bool projection = message.value(QStringLiteral("questionProjection")).toBool();
+        const auto style = message.value(QStringLiteral("role")) == QStringLiteral("user")
+                               ? MarkdownView::Style::Bubble : MarkdownView::Style::Document;
+        bool hasQuestion = false;
+        for (const QJsonValue& value : parts) hasQuestion |= !questionPartText(value.toObject()).isEmpty();
+        if (!hasQuestion && !projection) {
+            const QString text = messageText(message);
+            if (!text.isEmpty()) segments.append({messageId, text, style});
+            continue;
+        }
+        QJsonArray ordinary;
+        int run = 0;
+        const auto flush = [&] {
+            if (ordinary.isEmpty()) return;
+            QJsonObject chunk = message;
+            chunk.insert(QStringLiteral("parts"), ordinary);
+            const QString text = messageText(chunk);
+            const QString first = ordinary.first().toObject().value(QStringLiteral("id")).toString(QString::number(run));
+            if (!text.isEmpty()) segments.append({messageId + QStringLiteral(":segment:") + first, text, style});
+            ordinary = {};
+            ++run;
+        };
+        for (const QJsonValue& value : parts) {
+            const QJsonObject part = value.toObject();
+            const QString question = questionPartText(part);
+            if (question.isEmpty()) { if (!projection) ordinary.append(value); continue; }
+            flush();
+            const QString partId = part.value(QStringLiteral("id")).toString(messageId + QStringLiteral(":question"));
+            if (renderedQuestions.contains(partId)) continue;
+            renderedQuestions.insert(partId);
+            segments.append({QStringLiteral("remote-question:") + partId, question, MarkdownView::Style::Document});
+            QString answer = part.value(QStringLiteral("state")) == QStringLiteral("completed")
+                                 ? part.value(QStringLiteral("output")).toString() : answerEchoes.value(partId);
+            if (!answer.isEmpty())
+                segments.append({QStringLiteral("remote-answer:") + partId, answer, MarkdownView::Style::Bubble});
+        }
+        flush();
+    }
+    const bool followedLatest = runtime_->view->isAtBottom();
+    QSet<QString> wanted;
+    bool changed = segments.size() != runtime_->rendered.size();
+    for (const Segment& segment : segments) {
+        wanted.insert(segment.id);
+        changed |= runtime_->rendered.value(segment.id) != segment.text;
+    }
+    runtime_->view->beginBatchUpdates();
+    if (runtime_->thinking && changed) {
+        // removeItem defers QWidget destruction. Hide it now so rapid question
+        // updates cannot paint multiple retired thinking labels in one frame.
         runtime_->thinking->hide();
         runtime_->view->removeItem(QStringLiteral("remote-thinking"));
         runtime_->thinking = nullptr;
     }
-    if (prepend) {
-        runtime_->view->clear();
-        runtime_->rendered.clear();
+    for (const QString& old : runtime_->rendered.keys()) {
+        if (wanted.contains(old)) continue;
+        runtime_->view->removeItem(old);
+        runtime_->rendered.remove(old);
     }
-    runtime_->view->beginBatchUpdates();
-    for (const QString& id : ids) {
-        const QJsonObject message = runtime_->messages.value(id);
-        const QString content = messageText(message);
-        if (content.isEmpty() || runtime_->rendered.value(id) == content) continue;
-        const MarkdownView::Style style = message.value(QStringLiteral("role")).toString() == QStringLiteral("user")
-                                              ? MarkdownView::Style::Bubble
-                                              : MarkdownView::Style::Document;
-        runtime_->view->addItem(id, style, content);
-        runtime_->rendered.insert(id, content);
+    for (const Segment& segment : segments) {
+        if (!runtime_->rendered.contains(segment.id))
+            runtime_->view->addItem(segment.id, segment.style, segment.text);
+        else if (runtime_->rendered.value(segment.id) != segment.text)
+            runtime_->view->updateItem(segment.id, segment.text);
+        runtime_->rendered.insert(segment.id, segment.text);
     }
+    // Reorder existing rows only. Prepending or a late question projection must
+    // retain Markdown selection, layout caches and the original row lifetime.
+    for (int index = segments.size() - 2; index >= 0; --index)
+        runtime_->view->moveItemBefore(segments[index].id, segments[index + 1].id);
     runtime_->view->endBatchUpdates();
     updateThinking();
-    if (!prepend && followedLatest) runtime_->view->scrollToBottom();
+    if (followedLatest) runtime_->view->scrollToBottom();
 }
 
 void RemoteAgentPanel::updateThinking() {
@@ -973,7 +1329,7 @@ void RemoteAgentPanel::updateThinking() {
     const bool visibleAnswer = assistantActive && !messageText(last).trimmed().isEmpty();
     const bool show =
         (runtime_->awaitingResponse || runtime_->session.value(QStringLiteral("busy")).toBool() || assistantActive) &&
-        !visibleAnswer;
+        !visibleAnswer && runtime_->questions.isEmpty();
     if (show && !runtime_->thinking) {
         const bool followedLatest = runtime_->view->isAtBottom();
         runtime_->thinking = new QLabel(QStringLiteral("正在思考…"));
@@ -1017,27 +1373,6 @@ void RemoteAgentPanel::renderRequests(const QJsonObject& payload) {
         if (permission.value(QStringLiteral("allowForSession")).toBool())
             addDecision(QStringLiteral("本次会话允许"), QStringLiteral("approved_for_session"));
         addDecision(QStringLiteral("拒绝"), QStringLiteral("denied"));
-        runtime_->requestsLayout->addWidget(row);
-    }
-    for (const QJsonValue& value : payload.value(QStringLiteral("questions")).toArray()) {
-        const QJsonObject question = value.toObject();
-        const QString id = question.value(QStringLiteral("id")).toString();
-        if (id.isEmpty()) continue;
-        auto* row = new QWidget(runtime_->requests);
-        auto* line = new QHBoxLayout(row);
-        line->addWidget(new QLabel(question.value(QStringLiteral("question")).toString(), row), 1);
-        auto* answer = new QLineEdit(row);
-        answer->setPlaceholderText(QStringLiteral("回答问题"));
-        line->addWidget(answer);
-        auto* button = new QPushButton(QStringLiteral("回答"), row);
-        line->addWidget(button);
-        connect(button, &QPushButton::clicked, this, [this, id, answer] {
-            if (answer->text().trimmed().isEmpty()) return;
-            sendAction({{QStringLiteral("action"), QStringLiteral("answer")},
-                        {QStringLiteral("id"), id},
-                        {QStringLiteral("text"), answer->text().trimmed()}},
-                       false);
-        });
         runtime_->requestsLayout->addWidget(row);
     }
     runtime_->requests->setVisible(runtime_->requestsLayout->count() > 0);

@@ -6,18 +6,28 @@
 #include <QJsonObject>
 #include <QString>
 
+#include <memory>
+
 class AgentController;
 
 class DesktopSessionSyncHost final {
 public:
     explicit DesktopSessionSyncHost(AgentController& controller);
+    ~DesktopSessionSyncHost();
     void setDefaultWorkspaceDirectory(const QString& directory);
 
     QJsonArray rootSessions() const;
     QJsonObject historyPage(const QString& sessionId, const QString& beforeId, int limit) const;
+    // 已收到事件的根会话消息精读；不改变普通分页，不读取或转发其它子任务正文。
+    // 未完成正文可覆盖为宿主已收到的 live 文本，reasoning 始终不进入正文。
+    // 不存在或不属于该根会话时返回空对象。
+    QJsonObject messageUpdate(const QString& sessionId, const QString& messageId) const;
     QJsonObject applyCommand(const QString& sessionId, const QJsonObject& payload);
 
 private:
     AgentController& controller_;
     QString defaultWorkspaceDirectory_;
+    // 事件回调只更新共享 revision，不捕获宿主 this；退订后在途回调也不悬空。
+    struct Runtime;
+    std::shared_ptr<Runtime> runtime_;
 };

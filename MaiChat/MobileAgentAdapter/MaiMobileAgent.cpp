@@ -35,6 +35,7 @@
 #include "MaiLlamaModelClient.h"
 #include "MaiLlamaModelValidation.h"
 #include "MaiQuestionTool.h"
+#include "MaiQuestionTranscript.h"
 #include "MaiSessionTools.h"
 #include "MaiSqliteStore.h"
 #include "MaiSshTool.h"
@@ -53,6 +54,7 @@
 #include "mai_fftools_embed.h"
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -445,9 +447,17 @@ struct MaiMobileAgent {
     std::string cachedSession;
     int cachedLimit = -1;
     std::vector<MaiMessage> cachedMessages;
+    MaiQuestionTranscript cachedQuestionTranscript;
+    // 远端发布每 150ms 可能读取一次；不能复用本机被消费的 dirty/structureChanged。
+    std::atomic<std::uint64_t> questionStructureRevision{1};
+    std::uint64_t remoteQuestionRevision = 0;
+    std::unordered_map<std::string, std::vector<MaiQuestionTranscriptMessage>> remoteQuestionHistory;
     // Android 有限页的更新游标独立于 latest 缓存；summary/iOS 查询不能消费旧页增量。
     bool trackMessageUpdates = false;
     std::unordered_map<std::string, std::unordered_set<std::string>> pendingMessageUpdates;
+    // 同步生产方独立登记/消费；普通 runtime 查询和本机 UI 不能吃掉远端旧 owner 更新。
+    std::unordered_set<std::string> remoteTrackedRoots;
+    std::unordered_map<std::string, std::unordered_set<std::string>> remotePendingMessageUpdates;
     std::unordered_map<std::string, std::string> pendingDeltas;
     std::unordered_map<std::string, std::string> liveParts;
     std::unordered_map<std::string, std::string> errors;
@@ -946,15 +956,29 @@ struct MaiMobileAgent {
         cachedSession.clear();
         cachedLimit = -1;
         cachedMessages.clear();
+        cachedQuestionTranscript = {};
+        questionStructureRevision.store(1, std::memory_order_relaxed);
+        remoteQuestionRevision = 0;
+        remoteQuestionHistory.clear();
         trackMessageUpdates = false;
         pendingMessageUpdates.clear();
+        remoteTrackedRoots.clear();
+        remotePendingMessageUpdates.clear();
         agent->eventBus().subscribe([this](const MaiEvent& event) {
             // 网络线程只合并增量，不读数据库、不解析 Markdown、不调用 UI。
+            if (event.type != MaiEventType::MessagePartDelta && event.type != MaiEventType::SessionStatus)
+                questionStructureRevision.fetch_add(1, std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 dirty = true;
                 if (trackMessageUpdates && !event.messageId.empty())
                     pendingMessageUpdates[event.sessionId].insert(event.messageId);
+                if (!event.messageId.empty() && remoteTrackedRoots.count(event.sessionId) != 0)
+                    remotePendingMessageUpdates[event.sessionId].insert(event.messageId);
+                if (event.type == MaiEventType::SessionDeleted) {
+                    remoteTrackedRoots.erase(event.sessionId);
+                    remotePendingMessageUpdates.erase(event.sessionId);
+                }
                 if (event.type == MaiEventType::MessagePartDelta)
                     pendingDeltas[event.partId] += event.delta;
                 else
@@ -1072,7 +1096,8 @@ struct MaiMobileAgent {
 
     // 将持久化消息转为移动端可读快照，并保留最新消息和未完成任务的状态。
     // 返回值只包含本次请求选中的会话内容，不改动 Agent 存储。
-    Json serializeMessages(const std::vector<MaiMessage>& source, bool sessionBusy) {
+    Json serializeMessages(const std::vector<MaiMessage>& source, bool sessionBusy, const std::string& sessionId,
+                           const std::unordered_map<std::string, std::string>* liveOverride = nullptr) {
         Json messages = Json::array();
         std::string latestId;
         for (const auto& message : source)
@@ -1080,7 +1105,7 @@ struct MaiMobileAgent {
         for (const auto& message : source) {
             Json parts = Json::array();
             for (const auto& part : message.parts) {
-                Json value = {{"id", part.id}};
+                Json value = {{"id", part.id}, {"created", part.created}};
                 std::visit(
                     [&](const auto& body) {
                         using T = std::decay_t<decltype(body)>;
@@ -1099,8 +1124,9 @@ struct MaiMobileAgent {
                             value.update({{"kind", "quote"}, {"messageId", body.messageId}, {"preview", body.preview}});
                         } else {
                             std::string text = body.text;
-                            auto live = liveParts.find(part.id);
-                            if (message.isInProgress() && live != liveParts.end() && live->second.size() > text.size())
+                            const auto& streams = liveOverride ? *liveOverride : liveParts;
+                            auto live = streams.find(part.id);
+                            if (message.isInProgress() && live != streams.end() && live->second.size() > text.size())
                                 text = live->second;
                             value.update(
                                 {{"kind", std::is_same_v<T, MaiTextPart> ? "text" : "reasoning"}, {"text", text}});
@@ -1108,9 +1134,10 @@ struct MaiMobileAgent {
                     },
                     part.body);
                 parts.push_back(std::move(value));
-                if (!message.isInProgress()) liveParts.erase(part.id);
+                if (!message.isInProgress() && liveOverride == nullptr) liveParts.erase(part.id);
             }
             messages.push_back({{"id", message.id},
+                                {"sessionId", sessionId},
                                 {"role", maiRoleToString(message.role)},
                                 {"created", message.created},
                                 {"completed", message.completed},
@@ -1118,6 +1145,42 @@ struct MaiMobileAgent {
                                 {"parts", parts}});
         }
         return messages;
+    }
+
+    // 子任务问答独立于根消息页传输，真实消息/片段 ID 用于原位更新。
+    // 不合并进 messages，避免 before 游标或 hasOlderMessages 被子任务历史改变。
+    Json serializeQuestionMessages(const MaiQuestionTranscript& transcript) {
+        Json messages = Json::array();
+        for (const auto& projected : transcript.childMessages) {
+            Json serialized = serializeMessages({projected.message}, agent->isBusy(projected.ownerSessionId),
+                                                projected.ownerSessionId);
+            serialized.front()["questionProjection"] = true;
+            messages.push_back(std::move(serialized.front()));
+        }
+        // 与 SessionSync 的小状态帧使用同一 48 KiB 上限。超限先移除较旧的已结束问答，
+        // 不截断用户回答或改写 Core 历史；单条过大的当前问题仍可从 questions 正文显示。
+        std::unordered_set<std::string> pendingMessages;
+        for (const auto& question : transcript.pending) pendingMessages.insert(question.messageId);
+        while (!messages.empty() && messages.dump().size() > 48 * 1024) {
+            auto removed = std::find_if(messages.begin(), messages.end(), [&](const auto& message) {
+                return pendingMessages.count(message.at("id").template get<std::string>()) == 0;
+            });
+            messages.erase(removed == messages.end() ? messages.begin() : removed);
+        }
+        return messages;
+    }
+
+    Json serializePendingQuestions(const MaiQuestionTranscript& transcript) const {
+        Json questions = Json::array();
+        for (const auto& question : transcript.pending)
+            questions.push_back({{"id", question.id},
+                                 {"sessionId", question.sessionId},
+                                 {"messageId", question.messageId},
+                                 {"partId", question.partId},
+                                 {"asked", question.asked},
+                                 {"question", question.question},
+                                 {"options", question.options}});
+        return questions;
     }
 
     // 作用：读取指定会话的有限消息快照和任务状态。
@@ -1183,17 +1246,17 @@ struct MaiMobileAgent {
                     break;
                 }
             }
-            messages = serializeMessages(changedMessages, sessionBusy);
+            messages = serializeMessages(changedMessages, sessionBusy, selected);
         } else {
-            messages = serializeMessages(cachedMessages, sessionBusy);
+            messages = serializeMessages(cachedMessages, sessionBusy, selected);
         }
         std::vector<MaiMessage> updatedMessages;
         for (const auto& id : updatedIds) {
             MaiMessage message;
             if (agent->getMessage(selected, id, message)) updatedMessages.push_back(std::move(message));
         }
-        Json messageUpdates = serializeMessages(updatedMessages, sessionBusy);
-        Json permissions = Json::array(), questions = Json::array();
+        Json messageUpdates = serializeMessages(updatedMessages, sessionBusy, selected);
+        Json permissions = Json::array();
         for (const auto& p : agent->listPendingPermissions())
             if (p.sessionId == selected)
                 permissions.push_back({{"id", p.id},
@@ -1202,9 +1265,9 @@ struct MaiMobileAgent {
                                        {"allowForSession", p.allowForSession},
                                        {"rememberOnApproval", p.rememberOnApproval},
                                        {"fileCount", p.approvalKeys.size()}});
-        for (const auto& q : agent->listPendingQuestions())
-            if (q.sessionId == selected)
-                questions.push_back({{"id", q.id}, {"question", q.question}, {"options", q.options}});
+        // 模型逐字流式期间复用同一份问答结构，避免每个 delta 重读后代历史。
+        // 提问/回答/工具状态变化都是非 delta 事件，触发 reload 后刷新权威快照。
+        if (reload) cachedQuestionTranscript = captureMaiQuestionTranscript(*agent, selected);
         if (!busy) liveParts.clear();
         const auto localStatus =
             primaryWire == MaiWireApi::Local ? getSharedMaiLlamaRuntime()->status() : MaiLlamaStatus{};
@@ -1215,7 +1278,8 @@ struct MaiMobileAgent {
                 {"messageUpdates", std::move(messageUpdates)},
                 {"hasOlderMessages", limit > 0 && cachedMessages.size() >= static_cast<std::size_t>(limit)},
                 {"permissions", permissions},
-                {"questions", questions},
+                {"questions", serializePendingQuestions(cachedQuestionTranscript)},
+                {"questionMessages", serializeQuestionMessages(cachedQuestionTranscript)},
                 {"busy", busy},
                 {"turnId", agent->activeTurnId(selected)},
                 {"model", model},
@@ -1229,12 +1293,56 @@ struct MaiMobileAgent {
 
     // 远端读取不消费本机 UI 的 dirty 标记与增量缓存。否则 PC 拉一次历史，
     // iPhone 自己的下一次刷新会误以为没有新消息。
-    Json remoteSnapshot(const std::string& sessionId, const std::string& before, int limit) {
+    Json remoteSnapshot(const std::string& sessionId, const std::string& before, int limit,
+                        bool includeMessageUpdates) {
         MaiSession session;
         if (!agent->getSession(sessionId, session)) throw std::runtime_error("Session not found.");
         const bool busy = agent->isBusy(sessionId);
         const auto page = agent->listMessagesPage(sessionId, before, static_cast<std::size_t>(limit));
-        Json permissions = Json::array(), questions = Json::array();
+        std::vector<std::string> updatedIds;
+        bool hasMessageUpdates = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (includeMessageUpdates && session.isRoot()) {
+                remoteTrackedRoots.insert(sessionId);
+                auto pending = remotePendingMessageUpdates.find(sessionId);
+                if (pending != remotePendingMessageUpdates.end()) {
+                    updatedIds.assign(pending->second.begin(), pending->second.end());
+                    std::sort(updatedIds.begin(), updatedIds.end());
+                    if (updatedIds.size() > 20) updatedIds.resize(20);
+                    for (const auto& id : updatedIds) pending->second.erase(id);
+                    hasMessageUpdates = !pending->second.empty();
+                    if (!hasMessageUpdates) remotePendingMessageUpdates.erase(pending);
+                }
+            }
+        }
+        std::vector<MaiMessage> updatedMessages;
+        for (const auto& id : updatedIds) {
+            MaiMessage message;
+            if (agent->getMessage(sessionId, id, message)) updatedMessages.push_back(std::move(message));
+        }
+        // 精读正文尚可能短于 1024B checkpoint。只复制本次消息的 live 文本，
+        // 不消费本机 pendingDeltas/liveParts，也不把 reasoning 拼入正文。
+        std::unordered_map<std::string, std::string> remoteLiveParts;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto captureLive = [&](const std::vector<MaiMessage>& source) {
+                for (const auto& message : source)
+                    if (message.isInProgress())
+                        for (const auto& part : message.parts)
+                            if (std::holds_alternative<MaiTextPart>(part.body)) {
+                                std::string text;
+                                const auto saved = liveParts.find(part.id);
+                                if (saved != liveParts.end()) text = saved->second;
+                                const auto delta = pendingDeltas.find(part.id);
+                                if (delta != pendingDeltas.end()) text += delta->second;
+                                if (!text.empty()) remoteLiveParts.emplace(part.id, std::move(text));
+                            }
+            };
+            captureLive(page);
+            captureLive(updatedMessages);
+        }
+        Json permissions = Json::array();
         for (const auto& item : agent->listPendingPermissions())
             if (item.sessionId == sessionId)
                 permissions.push_back({{"id", item.id},
@@ -1243,13 +1351,30 @@ struct MaiMobileAgent {
                                        {"allowForSession", item.allowForSession},
                                        {"rememberOnApproval", item.rememberOnApproval},
                                        {"fileCount", item.approvalKeys.size()}});
-        for (const auto& item : agent->listPendingQuestions())
-            if (item.sessionId == sessionId)
-                questions.push_back({{"id", item.id}, {"question", item.question}, {"options", item.options}});
+        // 保持待回答列表实时，后代已持久化问答则按独立结构 revision 复用。
+        // 本机 snapshot(force) 不消费此缓存，逐字 delta 也不触发后代 SQLite 读取。
+        auto questionTranscript = captureMaiQuestionTranscript(*agent, sessionId, false);
+        const auto revision = questionStructureRevision.load(std::memory_order_relaxed);
+        if (remoteQuestionRevision != revision) {
+            remoteQuestionHistory.clear();
+            remoteQuestionRevision = revision;
+        }
+        const auto found = remoteQuestionHistory.find(sessionId);
+        if (found != remoteQuestionHistory.end()) {
+            questionTranscript.childMessages = found->second;
+        } else {
+            questionTranscript.childMessages = captureMaiQuestionTranscript(*agent, sessionId).childMessages;
+            if (remoteQuestionHistory.size() >= 3) remoteQuestionHistory.clear();
+            remoteQuestionHistory.emplace(sessionId, questionTranscript.childMessages);
+        }
         return {{"ok", true},
-                {"messages", serializeMessages(page, before.empty() && busy)},
+                {"rootSessionId", maiQuestionRootSessionId(*agent, sessionId)},
+                {"messages", serializeMessages(page, before.empty() && busy, sessionId, &remoteLiveParts)},
+                {"messageUpdates", serializeMessages(updatedMessages, busy, sessionId, &remoteLiveParts)},
+                {"hasMessageUpdates", hasMessageUpdates},
                 {"permissions", permissions},
-                {"questions", questions},
+                {"questions", serializePendingQuestions(questionTranscript)},
+                {"questionMessages", serializeQuestionMessages(questionTranscript)},
                 {"busy", busy},
                 {"turnId", agent->activeTurnId(sessionId)}};
     }
@@ -1271,7 +1396,8 @@ struct MaiMobileAgent {
         if (op == "remote_snapshot") {
             const int limit = r.value("limit", 10);
             if (limit < 1 || limit > 20) throw std::runtime_error("limit must be between 1 and 20.");
-            return remoteSnapshot(session, r.value("before", std::string{}), limit);
+            return remoteSnapshot(session, r.value("before", std::string{}), limit,
+                                  r.value("includeMessageUpdates", false));
         }
         if (op == "message") {
             if (!r.contains("id") || !r["id"].is_string())
@@ -1284,14 +1410,15 @@ struct MaiMobileAgent {
             if (!agent->getMessage(session, messageId, message))
                 throw NativeOperationFailure(
                     MaiError::make(MaiErrorCode::NotFound, "Message was not found in this conversation."));
-            return {{"ok", true}, {"messages", serializeMessages({message}, agent->isBusy(session))}};
+            return {{"ok", true}, {"messages", serializeMessages({message}, agent->isBusy(session), session)}};
         }
         if (op == "messages_page") {
             const int limit = r.value("limit", 30);
             if (limit < 1 || limit > 100) throw std::runtime_error("limit must be between 1 and 100.");
             const std::string before = r.value("before", "");
             const auto page = agent->listMessagesPage(session, before, limit);
-            return {{"ok", true}, {"messages", serializeMessages(page, before.empty() && agent->isBusy(session))}};
+            return {{"ok", true},
+                    {"messages", serializeMessages(page, before.empty() && agent->isBusy(session), session)}};
         }
         if (op == "suggest_replies") {
             if (!configured) throw std::runtime_error("Configure an available primary model first.");
@@ -1411,9 +1538,31 @@ struct MaiMobileAgent {
             if (!maiParsePermissionDecision(r.at("decision"), decision))
                 throw std::runtime_error("Unknown permission decision.");
             result(agent->submit(MaiReplyPermission{r.at("id"), decision}));
-        } else if (op == "answer")
-            result(agent->submit(MaiReplyQuestion{r.at("id"), r.at("text")}));
-        else
+        } else if (op == "answer") {
+            if (!r.contains("id") || !r["id"].is_string() || !r.contains("text") || !r["text"].is_string() ||
+                session.empty() || r["id"].get<std::string>().empty() || r["id"].get<std::string>().size() > 128 ||
+                r["text"].get<std::string>().empty() || r["text"].get<std::string>().size() > 16 * 1024)
+                throw NativeOperationFailure(MaiError::make(MaiErrorCode::InvalidInput, "Question answer is invalid."));
+            // 回答协议只接收自由文字。媒体草稿属于用户，不能在接收文字时悄悄忽略。
+            for (const char* field : {"images", "videos", "local_files", "resolved_attachments", "attachments"})
+                if (r.contains(field) && !r[field].empty())
+                    throw NativeOperationFailure(MaiError::make(
+                        MaiErrorCode::InvalidInput, "Question answers accept text only; keep media as a draft."));
+            const std::string questionId = r["id"];
+            bool owned = false;
+            for (const auto& question : agent->listPendingQuestions())
+                if (question.id == questionId && maiQuestionBelongsToSession(*agent, session, question.sessionId)) {
+                    owned = true;
+                    break;
+                }
+            if (!owned)
+                throw NativeOperationFailure(
+                    MaiError::make(MaiErrorCode::NotFound, "Question is not pending in this conversation."));
+            result(agent->submit(MaiReplyQuestion{questionId, r["text"]}));
+            Json receipt{{"ok", true}, {"question_id", questionId}};
+            if (r.contains("requestId") && r["requestId"].is_string()) receipt["requestId"] = r["requestId"];
+            return receipt;
+        } else
             throw std::runtime_error("Unknown operation.");
         Json response{{"ok", true}, {"id", id}};
         if (op == "send" || op == "steer") {

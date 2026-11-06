@@ -778,9 +778,10 @@ void AgentController::onEventQueued(const MaiEvent& event) {
     switch (event.type) {
         case MaiEventType::MessageUpdated: {
             MaiMessage message;
-            if (runtime_->agent->getMessage(event.sessionId, event.messageId, message) &&
-                message.role == MaiRole::User)
-                emit userMessageAdded(sessionId, messageId);
+            if (runtime_->agent->getMessage(event.sessionId, event.messageId, message)) {
+                emit storedMessageUpdated(sessionId, messageId);
+                if (message.role == MaiRole::User) emit userMessageAdded(sessionId, messageId);
+            }
             return;
         }
 

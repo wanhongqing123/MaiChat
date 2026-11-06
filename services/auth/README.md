@@ -242,6 +242,18 @@ Android 模拟器完成 JNI/WSS 握手及远端会话界面测试；Mac 和 Wind
 本协议需要同步服务与所属端统一升级；服务数据库会自动增加空默认值的 `turn_id` 列，
 现有历史不变。本次仅本地验证，生产部署须单独执行。
 
+问题问答使用 `action:"answer"`、捕获的 `id` 和 `text`，所属设备确认成功后返回
+`result:{ok:true,question_id:"…"}`。回答不新增模型 User 消息；客户端把已有 question 工具的
+input/options 与完成后的 output 显示为普通问答，不能要求或伪造 `user_message_id`。
+
+`publish` / `history` / 分块状态事件另带 `questionMessages`，表示所选根会话的后代问答显示投影。
+该数组最多 64 项、JSON 总大小最多 48 KiB；各项保留真实 `id`、`sessionId`、
+`questionProjection:true`、`role:"assistant"` 和仅含 question 工具的 `parts`（input/output/error/state）。
+它与根会话 `messages` 独立保存到 room state，不进入正式消息分页，也不改变 before/cursor。
+所属设备在集合改变时完整发布新数组；旧客户端缺省该字段表示空集合。数据库自动添加
+`question_messages TEXT NOT NULL DEFAULT '[]'`，旧 room state 默认为空，服务重启后仍可重放。
+上线需先升级同步服务，再升级各端；本次代码验证不等于线上已部署。
+
 远端创建、删除和切换 Session Workspace 复用 `send` 的设备信箱。客户端在 `catalog.devices`
 选择在线的所属设备，使用其 `device_slot` 与 `login_session_id` 作为 `to_slot`
 和 `to_login_session_id`。三种命令都使用保留的

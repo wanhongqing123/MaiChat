@@ -967,14 +967,16 @@ private struct AIAssistantMessageList: View {
                             }
                             // 只把已开放的一页交给视图，由真实行高决定可滚动范围。
                             VStack(alignment: .leading, spacing: 24) {
-                                ForEach(model.visibleMessages) { message in
+                                ForEach(model.visibleMessages, id: \.displayIdentity) { message in
                                     let hasInlineBrowser = hasBrowserEntryInCurrentSession &&
                                         browser.sourceMessageID == message.id && !browser.sourcePartID.isEmpty
                                     VStack(alignment: .leading, spacing: 16) {
                                         AIMessageRow(message: message,
                                                      workspacePath: model.workspacePath,
+                                                     questionAnswerEchoes: model.questionAnswerEchoes(for: message),
                                                      quote: {
-                                                         model.quotedMessage = message
+                                                         guard message.questionProjection != true else { return }
+                                                         model.quotedMessage = model.messages.first { $0.id == message.id } ?? message
                                                          focusController.focus()
                                                      },
                                                      canPublishVideo:
@@ -988,12 +990,12 @@ private struct AIAssistantMessageList: View {
                                                      openBrowser: openBrowser)
                                             .equatable()
                                         if hasBrowserEntryInCurrentSession && browser.sourceMessageID == message.id &&
-                                            browser.sourcePartID.isEmpty {
+                                            browser.sourcePartID.isEmpty && message.isLastDisplayFragment {
                                             // 普通 App 调用没有工具片段，挂在调用当时的消息之后。
                                             browserEntry
                                         }
                                     }
-                                    .id(message.id)
+                                    .id(message.displayIdentity)
                                 }
                             }
                         }
@@ -1004,10 +1006,6 @@ private struct AIAssistantMessageList: View {
                         ForEach(model.permissions) { permission in
                             AIPermissionCard(permission: permission, model: model)
                                 .id(permission.id)
-                        }
-                        ForEach(model.questions) { question in
-                            AIQuestionCard(question: question, model: model)
-                                .id(question.id)
                         }
                     }
                     .padding(.horizontal, 24)
@@ -1063,8 +1061,8 @@ private struct AIAssistantMessageList: View {
                     logAIHistoryEvent(
                         """
                         message-list appear session=\(model.selected) count=\(model.visibleMessages.count) \
-                        first=\(model.visibleMessages.first?.id ?? "none") \
-                        last=\(model.visibleMessages.last?.id ?? "none")
+                        first=\(model.visibleMessages.first?.displayIdentity ?? "none") \
+                        last=\(model.visibleMessages.last?.displayIdentity ?? "none")
                         """
                     )
                 }
@@ -1075,20 +1073,20 @@ private struct AIAssistantMessageList: View {
                     // 只在跟随最新时校正底部；阅读历史中的入口不改变原来的滚动意图。
                     bottomCorrectionRequest += 1
                 }
-                .onChange(of: model.visibleMessages.first?.id) { _ in
+                .onChange(of: model.visibleMessages.first?.displayIdentity) { _ in
                     if let anchor = prependAnchorID {
                         prependAnchorID = nil
                         position(at: anchor, proxy: proxy, anchor: .top)
                     }
                 }
-                .onChange(of: model.messages.last?.id) { latestID in
+                .onChange(of: model.visibleMessages.last?.displayIdentity) { latestID in
                     guard isActive, followsLatest, prependAnchorID == nil,
                           let latestID else { return }
                     // 新的用户或助手消息在当前页完成布局后再定位；
                     // 不能沿用发消息前的像素偏移，否则小视口可能停在空白区域。
                     DispatchQueue.main.async {
                         guard isActive, followsLatest,
-                              model.messages.last?.id == latestID else { return }
+                              model.visibleMessages.last?.displayIdentity == latestID else { return }
                         position(at: latestID, proxy: proxy, anchor: .bottom)
                         bottomCorrectionRequest += 1
                     }
@@ -1097,7 +1095,7 @@ private struct AIAssistantMessageList: View {
                     followsLatest = true
                     // 会话切换先拿最新一条、再补前面的历史；这里显式定位最新消息，
                     // 之后的布局修正继续跟随底部，不能继承上一个会话的阅读位置。
-                    if let latestID = model.messages.last?.id {
+                    if let latestID = model.visibleMessages.last?.displayIdentity {
                         position(at: latestID, proxy: proxy, anchor: .bottom)
                     }
                     bottomCorrectionRequest += 1
@@ -1126,12 +1124,12 @@ private struct AIAssistantMessageList: View {
                         ]
                     )
                     guard isActive, followsLatest,
-                          let latestID = model.messages.last?.id else { return }
+                          let latestID = model.visibleMessages.last?.displayIdentity else { return }
                     // 视口收缩或恢复后定位真实消息行；不能只按旧的像素偏移
                     // 推算底部，否则播放器与键盘改变高度时可能落进空白。
                     DispatchQueue.main.async {
                         guard isActive, followsLatest,
-                              model.messages.last?.id == latestID else { return }
+                              model.visibleMessages.last?.displayIdentity == latestID else { return }
                         position(at: latestID, proxy: proxy, anchor: .bottom)
                         bottomCorrectionRequest += 1
                     }
@@ -1187,8 +1185,8 @@ private struct AIAssistantMessageList: View {
         logAIHistoryEvent(
             """
             scroll-request session=\(model.selected) target=\(id) \
-            first=\(model.visibleMessages.first?.id ?? "none") \
-            last=\(model.visibleMessages.last?.id ?? "none")
+            first=\(model.visibleMessages.first?.displayIdentity ?? "none") \
+            last=\(model.visibleMessages.last?.displayIdentity ?? "none")
             """
         )
         var transaction = Transaction(animation: nil)
@@ -1198,11 +1196,11 @@ private struct AIAssistantMessageList: View {
 
     private func requestOlderMessages() {
         guard prependAnchorID == nil, model.hasOlderVisibleMessages,
-              let anchor = model.visibleMessages.first?.id else { return }
+              let anchor = model.visibleMessages.first?.displayIdentity else { return }
         prependAnchorID = anchor
         Task {
             await model.loadOlderMessages()
-            if model.visibleMessages.first?.id == anchor { prependAnchorID = nil }
+            if model.visibleMessages.first?.displayIdentity == anchor { prependAnchorID = nil }
         }
     }
 
@@ -1529,6 +1527,7 @@ struct AIMessageRow: View, Equatable {
     @ObservedObject private var cloudDrive = MaiCloudDriveModel.shared
     let message: AIMessage
     let workspacePath: String
+    var questionAnswerEchoes: [String: String] = [:]
     let quote: () -> Void
     var canPublishVideo = false
     // 缩略图隐藏/恢复也是行的可见状态；不能再依赖逐帧更换环境闭包偶然使 equatable 行刷新。
@@ -1548,6 +1547,7 @@ struct AIMessageRow: View, Equatable {
     @State private var remoteDownloadError: String?
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message && lhs.workspacePath == rhs.workspacePath &&
+            lhs.questionAnswerEchoes == rhs.questionAnswerEchoes &&
             lhs.canPublishVideo == rhs.canPublishVideo &&
             lhs.imagePreviewSourceID == rhs.imagePreviewSourceID &&
             lhs.browserSessionID == rhs.browserSessionID && lhs.browserPartID == rhs.browserPartID &&
@@ -1612,7 +1612,25 @@ struct AIMessageRow: View, Equatable {
                 ForEach(orderedPartGroups) { group in
                     if group.isToolGroup { toolGroup(group.parts) }
                     ForEach(group.parts) { part in
-                        if part.kind == "tool", part.id == browserPartID, let sessionID = browserSessionID {
+                        if let questionText = part.questionText {
+                            // 问题是正常对话正文，选项只展示文字；回答使用页面原有输入栏。
+                            MarkdownLikeText(questionText, retainsPreviousWhilePreparing: true,
+                                             bodyFont: ChatTypography.body, assistantTypography: true)
+                                .foregroundStyle(RemoteIMStyle.textPrimary)
+                            if let answer = part.questionAnswer ?? questionAnswerEchoes[part.id] {
+                                HStack {
+                                    Spacer(minLength: 30)
+                                    Text(answer)
+                                        .font(ChatTypography.body)
+                                        .lineSpacing(ChatTypography.lineSpacing)
+                                        .foregroundStyle(RemoteIMStyle.textPrimary)
+                                        .textSelection(.enabled)
+                                        .padding(14)
+                                        .background(Color(uiColor: .secondarySystemBackground),
+                                                    in: RoundedRectangle(cornerRadius: 18))
+                                }
+                            }
+                        } else if part.kind == "tool", part.id == browserPartID, let sessionID = browserSessionID {
                             AIBrowserTaskEntry(sessionID: sessionID, isLocal: true,
                                                needsConfirmation: browserNeedsConfirmation, open: openBrowser)
                         } else if part.kind == "text", let text = part.text, !text.isEmpty {
@@ -1643,20 +1661,22 @@ struct AIMessageRow: View, Equatable {
                     !hasVisibleAnswerText {
                     AIThinkingIndicator()
                 }
-                if !message.active {
+                if !message.active && message.isLastDisplayFragment {
                     HStack {
                         Text(
                             message.completed == 0
                                 ? "已中断" : "用时 \(max(0, (message.completed - message.created) / 1000)) 秒"
                         ).font(AssistantMessageFont.metadata)
-                        Button { RemoteIMClipboard.writeText(message.text) } label: {
+                        Button { RemoteIMClipboard.writeText(message.copyText) } label: {
                             Image(systemName: "doc.on.doc")
                         }
                             .accessibilityLabel("复制回复")
-                        Button(action: quote) {
-                            Label("引用", systemImage: "arrowshape.turn.up.left")
+                        if message.questionProjection != true {
+                            Button(action: quote) {
+                                Label("引用", systemImage: "arrowshape.turn.up.left")
+                            }
+                            .accessibilityLabel("引用这条消息")
                         }
-                        .accessibilityLabel("引用这条消息")
                     }.foregroundStyle(.secondary).font(AssistantMessageFont.metadata)
                 }
             }
@@ -1909,7 +1929,7 @@ struct AIMessageRow: View, Equatable {
         for part in message.parts {
             if part.kind == "reasoning" { continue }
             let hasArtifact = mediaArtifact(for: part) != nil
-            let isTool = part.kind == "tool" &&
+            let isTool = part.kind == "tool" && part.questionText == nil &&
                 !(part.tool == "agent_send_media" && hasArtifact)
             // A capture keeps its receipt, but its visible card ends the run.
             let canJoinNextTool = isTool && !hasArtifact
@@ -1930,20 +1950,21 @@ struct AIMessageRow: View, Equatable {
     }
     private var hasVisibleAnswerText: Bool {
         message.parts.contains { part in
-            part.kind == "text" && !(part.text ?? "").isEmpty
+            (part.kind == "text" && !(part.text ?? "").isEmpty) || part.questionText != nil
         }
     }
     private var toolParts: [AIPart] {
         // Captures keep their execution receipt in the disclosure even when an
         // image card is present. agent_send_media retains its existing card-only UI.
         message.parts.filter {
-            $0.kind == "tool" && !($0.tool == "agent_send_media" && mediaArtifact(for: $0) != nil)
+            $0.kind == "tool" && $0.questionText == nil &&
+                !($0.tool == "agent_send_media" && mediaArtifact(for: $0) != nil)
         }
     }
     private var mediaArtifacts: [AIAgentMediaArtifact] {
         var result: [AIAgentMediaArtifact] = []
         var imageIndexes: [String: Int] = [:]
-        for part in message.parts {
+        for part in message.sourceParts ?? message.parts {
             guard let artifact = mediaArtifact(for: part) else { continue }
             if artifact.type == "image" {
                 // A model may explicitly deliver the photo after capture. Keep
@@ -1958,7 +1979,7 @@ struct AIMessageRow: View, Equatable {
         }
         // A later delivery owns the canonical card. Keep the row and its media
         // playlist in that owner's original part order after capture deduplication.
-        let partOrder = Dictionary(uniqueKeysWithValues: message.parts.enumerated().map {
+        let partOrder = Dictionary(uniqueKeysWithValues: (message.sourceParts ?? message.parts).enumerated().map {
             ($0.element.id, $0.offset)
         })
         return result.sorted {
@@ -1966,11 +1987,13 @@ struct AIMessageRow: View, Equatable {
         }
     }
     private var textMediaMentions: [AIAssistantMediaMention] {
+        // 普通消息的文字附件原本只在整条正文之后展示一次；分片不能重复生成相同的媒体卡。
+        guard message.isLastDisplayFragment else { return [] }
         guard message.role != "assistant" || (!message.active && message.completed > 0) else {
             return []
         }
         let alreadyShown = Set(mediaArtifacts.map(\.filePath) + videoPaths)
-        return AIAssistantMediaMentionPolicy.cards(in: message.text,
+        return AIAssistantMediaMentionPolicy.cards(in: message.sourceParts == nil ? message.text : message.copyText,
                                                    workspacePath: workspacePath)
             .filter { !alreadyShown.contains($0.url.path) }
     }
@@ -4711,34 +4734,6 @@ struct AIPermissionCard: View {
     }
 }
 
-
-private struct AIQuestionCard: View {
-    let question: AIQuestion
-    @ObservedObject var model: AIAssistantModel
-    @State private var answer = ""
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(question.question).font(.subheadline.bold())
-            ForEach(question.options, id: \.self) { option in
-                Button(option) { reply(option) }.buttonStyle(.plain).font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Color.blue).padding(.horizontal, 12).frame(minHeight: 34)
-                    .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
-            }
-            HStack {
-                TextField("你的回答", text: $answer)
-                    .padding(.horizontal, 10).frame(height: 38)
-                    .background(Color(uiColor: .systemBackground), in: RoundedRectangle(cornerRadius: 9))
-                Button("回复") { reply(answer) }.buttonStyle(.plain).font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Color.white).padding(.horizontal, 12).frame(height: 38)
-                    .background(Color.blue, in: RoundedRectangle(cornerRadius: 9))
-                    .disabled(answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-        }.padding().background(Color.blue.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
-    }
-    private func reply(_ text: String) {
-        Task { await model.action("answer", values: ["id": question.id, "text": text]) }
-    }
-}
 
 private struct MaiSystemMusicPicker: UIViewControllerRepresentable {
     let onPick: (MPMediaItem) -> Void

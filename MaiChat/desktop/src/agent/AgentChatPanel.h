@@ -15,6 +15,7 @@ class QLabel;
 class QMimeData;
 enum class MaiApprovalPolicy;
 struct MaiMessage;
+struct MaiMessagePart;
 struct MaiSession;
 
 // AI 助手的聊天页。
@@ -176,6 +177,9 @@ private:
     // **不另起一个对话框，复用输入框。** 弹窗会打断阅读，而且这本来就是一次对话——
     // 问题当成一条消息显示出来，用户照常在下面打字回答，只是这一次回车发的是答案
     // 而不是新的 prompt。
+    bool appendQuestionPart(const QString& owner, const QString& messageId, const MaiMessagePart& part);
+    void markQuestionHistoryDirty(const QString& owner, const QString& partId = QString());
+    void positionQuestionTranscript();
     void showQuestion(const QString& questionId);
     void clearQuestion();
     // 核心待回答列表是权威状态；协调迟到的回答/取消事件，不消费输入草稿。

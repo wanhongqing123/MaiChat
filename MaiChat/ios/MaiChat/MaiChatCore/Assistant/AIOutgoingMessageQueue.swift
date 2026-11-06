@@ -16,15 +16,18 @@ public struct AIOutgoingMessageQueueOwner: Codable, Hashable, Sendable {
 }
 
 public struct AIOutgoingMessageQueueBinding: Codable, Equatable, Sendable {
-    public enum Mode: String, Codable, Sendable { case send, steer }
+    public enum Mode: String, Codable, Sendable { case send, steer, answer }
     public let mode: Mode
     public let turnID: String
+    /// 回答只能投递到点击时捕获的问题；取消或超时后不得退化成新的普通消息。
+    public let questionID: String?
     /// 每次创建 native Agent 都换一个 epoch；不能把进程重启后的 Agent 当成旧收据拥有者。
     public let hostEpoch: String
 
-    public init(mode: Mode, turnID: String = "", hostEpoch: String) {
+    public init(mode: Mode, turnID: String = "", questionID: String? = nil, hostEpoch: String) {
         self.mode = mode
         self.turnID = turnID
+        self.questionID = questionID
         self.hostEpoch = hostEpoch
     }
 }
@@ -258,7 +261,7 @@ public actor AIOutgoingMessageQueue {
             }
             if let binding = entry.binding {
                 guard binding.hostEpoch == hostEpoch,
-                    entry.state != .unknown || binding.mode == .steer,
+                    entry.state != .unknown || binding.mode != .send,
                     try head(for: entry.owner)?.id == entry.id
                 else {
                     throw AIOutgoingMessageQueueError.invalidTransition
@@ -471,8 +474,12 @@ public actor AIOutgoingMessageQueue {
     }
 
     private static func validBinding(_ value: AIOutgoingMessageQueueBinding) -> Bool {
-        validIdentifier(value.hostEpoch)
-            && (value.mode == .send ? value.turnID.isEmpty : validIdentifier(value.turnID))
+        guard validIdentifier(value.hostEpoch) else { return false }
+        switch value.mode {
+        case .send: return value.turnID.isEmpty && value.questionID == nil
+        case .steer: return validIdentifier(value.turnID) && value.questionID == nil
+        case .answer: return value.turnID.isEmpty && value.questionID.map(validIdentifier) == true
+        }
     }
 
     private func ordered(_ entries: [AIOutgoingMessageQueueEntry]) -> [AIOutgoingMessageQueueEntry]
