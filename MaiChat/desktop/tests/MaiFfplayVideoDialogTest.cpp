@@ -18,6 +18,9 @@
 #include <QLabel>
 #include <QMouseEvent>
 #include <QMenu>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QFile>
 #include <QCursor>
 #include <QScreen>
 #include <QScopeGuard>
@@ -59,11 +62,13 @@
 #include "im/FakeRemoteIMClient.h"
 
 #if defined(__APPLE__)
+#include "ui/MaiMacVideoWindow.h"
 extern "C" uint64_t maiFfplayAppleNonSilentBufferCount(void);
 void activateFfplayTestApplication();
 void activateFfplayTestWindow(QWidget* widget);
 bool ffplayTestWindowInteractive(QWidget* widget);
 QString ffplayTestNativeState(QWidget* widget);
+QJsonObject ffplayTestVideoLayerGeometry(QWidget* widget);
 bool cancelFfplayTestNativePanel();
 void observeFfplayTestNativePanel();
 bool clickFfplayTestNativeButton(QWidget* widget);
@@ -352,6 +357,7 @@ private slots:
     void imVideoUsesIndependentWindowAcrossNavigationAndFullscreen_data();
     void imVideoUsesIndependentWindowAcrossNavigationAndFullscreen();
     void fullscreenControlsHideAndWake();
+    void macFullscreenKeepsNativeVideoGeometry();
     void controlsHideAndKeepVisibleForPause();
     void agentRepeatedTargetDoesNotReplayFrames();
     void seeksToDecodedTargetFrame_data();
@@ -693,7 +699,10 @@ void MaiFfplayVideoDialogTest::ownedHudTracksOwnerAndForwardsKeys() {
     QTest::keyClick(header, Qt::Key_Escape);
     QTRY_VERIFY(!player.isFullScreen() && player.isVisible());
     QVERIFY(maiFfplayGetPlaybackStatus(&status) && status.paused);
-    player.showMinimized();
+    auto* minimize = player.findChild<QPushButton*>(QStringLiteral("ffplayMinimizeButton"));
+    QVERIFY(minimize);
+    minimize->click();
+    QTRY_VERIFY(player.isMinimized());
     QTRY_VERIFY(!header->isVisible() && !footer->isVisible());
     player.showNormal();
     activateOwnTestWindow(&player);
@@ -1829,13 +1838,13 @@ void MaiFfplayVideoDialogTest::hdrPlaybackKeepsTransferMetadata() {
                                  std::abs(status.position_us - target) < 50'000,
                              5000);
     const int64_t pausedPosition = status.position_us;
-    // 此处只检查逻辑窗口切换不改变播放状态；原生全屏、动画和亮度另做前台录屏验收。
-    player.showFullScreen();
+    // 使用 GUI/工具共用入口；原生异步转场期间仍应保留暂停、进度和倍速。
+    const QRect beforeFullscreen = player.geometry();
+    QVERIFY(player.sendCommand(QStringLiteral("fullscreen")));
     QTRY_VERIFY(player.isFullScreen());
-    QTest::qWait(350);
-    player.showNormal();
+    QVERIFY(player.sendCommand(QStringLiteral("fullscreen")));
     QTRY_VERIFY(!player.isFullScreen());
-    QTest::qWait(350);
+    QTRY_COMPARE(player.geometry(), beforeFullscreen);
     QVERIFY(player.playbackStatus(&status));
     QVERIFY(status.paused);
     QVERIFY(std::abs(status.position_us - pausedPosition) < 1000);
@@ -1853,7 +1862,7 @@ void MaiFfplayVideoDialogTest::hdrPlaybackKeepsTransferMetadata() {
         player.playbackStatus(&status) && !status.paused && !status.seeking && status.position_us < target, 5000);
 #endif
     player.close();
-    QVERIFY(!player.isStarted());
+    QTRY_VERIFY(!player.isStarted());
 #if defined(Q_OS_MAC)
     // 关闭可先于探测完成和 GUI 打开回调；过期回调不能重新打开播放或保留图层。
     MaiFfplayVideoDialog closing(file);
@@ -2121,7 +2130,7 @@ void MaiFfplayVideoDialogTest::controlsHideAndKeepVisibleForPause() {
     auto* header = player.findChild<QWidget*>(QStringLiteral("ffplayTitleBar"));
     auto* pause = player.findChild<QPushButton*>(QStringLiteral("ffplayPauseButton"));
     QVERIFY(surface && panel && header && pause);
-    QVERIFY(header->isVisible());
+    QTRY_VERIFY(header->isVisible());
     const QRect videoGeometry = surface->geometry();
     QTRY_VERIFY_WITH_TIMEOUT(panel->isHidden(), 6000);
     QVERIFY(header->isHidden());
@@ -2140,6 +2149,177 @@ void MaiFfplayVideoDialogTest::controlsHideAndKeepVisibleForPause() {
     QTRY_VERIFY(!player.isFullScreen());
     QVERIFY(player.isVisible() && panel->isVisible());
     player.close();
+    QTRY_VERIFY(!player.isVisible());
+}
+
+// 覆盖真实原生 HLG 显示层；持续采样中间帧，不能只检查最后 isFullScreen 的目标标志。
+void MaiFfplayVideoDialogTest::macFullscreenKeepsNativeVideoGeometry() {
+#if defined(Q_OS_MAC)
+    if (QGuiApplication::platformName() != QStringLiteral("cocoa")) QSKIP("Native Cocoa window required");
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    QString path = qEnvironmentVariable("MAICHAT_FFPLAY_LOCAL_VIDEO");
+    if (path.isEmpty()) {
+        path = directory.filePath(QStringLiteral("transition-hlg.mov"));
+        QProcess generate;
+        generate.start(QStringLiteral("ffmpeg"),
+            {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-f"), QStringLiteral("lavfi"),
+             QStringLiteral("-i"), QStringLiteral("testsrc2=size=192x108:rate=24:duration=2"),
+             QStringLiteral("-vf"), QStringLiteral("format=yuv420p10le"), QStringLiteral("-c:v"),
+             QStringLiteral("libx265"), QStringLiteral("-preset"), QStringLiteral("ultrafast"),
+             QStringLiteral("-x265-params"),
+             QStringLiteral("log-level=error:pools=1:frame-threads=1:colorprim=9:transfer=18:colormatrix=9"),
+             QStringLiteral("-color_primaries"), QStringLiteral("bt2020"), QStringLiteral("-colorspace"),
+             QStringLiteral("bt2020nc"), QStringLiteral("-color_trc"), QStringLiteral("arib-std-b67"),
+             QStringLiteral("-tag:v"), QStringLiteral("hvc1"), QStringLiteral("-an"), QStringLiteral("-y"), path});
+        QVERIFY(generate.waitForFinished(15000));
+        QCOMPARE(generate.exitCode(), 0);
+    }
+    QVERIFY(QFileInfo(path).isFile());
+    QWidget backdrop;
+    const QRect captureArea = QGuiApplication::primaryScreen()->availableGeometry();
+    backdrop.setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
+    backdrop.setStyleSheet(QStringLiteral("background:#26313f;"));
+    backdrop.setGeometry(captureArea);
+    showOwnTestWindow(&backdrop);
+    MaiFfplayVideoDialog player(path, &backdrop);
+    showOwnTestWindow(&player);
+    QTRY_VERIFY_WITH_TIMEOUT(player.hasPresentedHdrFrame(), 10000);
+    QVERIFY(player.sendCommand(QStringLiteral("pause")));
+    QTest::qWait(300);
+    player.resize(740, 440);
+    player.move(100, 120);
+    QTest::qWait(200);
+    // 独立录屏不阻塞 AppKit 事件循环。仅在隔离测试桌面显式启用：原生 Space
+    // 动画仍可能显示系统壁纸。退出（含断言失败）前先停止，再释放自有背景。
+    QProcess recorder;
+    const auto stopRecorder = qScopeGuard([&] {
+        if (recorder.state() == QProcess::NotRunning) return;
+        recorder.write("q\n");
+        if (!recorder.waitForFinished(5000)) { recorder.kill(); recorder.waitForFinished(1000); }
+    });
+    const QString recording = qEnvironmentVariable("MAICHAT_FULLSCREEN_RECORDING");
+    if (!recording.isEmpty()) {
+        const qreal scale = player.screen()->devicePixelRatio();
+        const QRect area = backdrop.geometry().adjusted(12, 12, -12, -12);
+        const QString filter = QStringLiteral("crop=%1:%2:%3:%4,scale=1280:-2")
+            .arg(qRound(area.width() * scale) / 2 * 2).arg(qRound(area.height() * scale) / 2 * 2)
+            .arg(qRound(area.x() * scale)).arg(qRound(area.y() * scale));
+        recorder.setStandardErrorFile(recording + QStringLiteral(".log"));
+        recorder.start(QStringLiteral("ffmpeg"),
+            {QStringLiteral("-hide_banner"), QStringLiteral("-y"), QStringLiteral("-f"),
+             QStringLiteral("avfoundation"), QStringLiteral("-framerate"), QStringLiteral("30"),
+             QStringLiteral("-pixel_format"), QStringLiteral("bgr0"), QStringLiteral("-i"),
+             QStringLiteral("Capture screen 0:none"), QStringLiteral("-vf"), filter,
+             QStringLiteral("-an"), QStringLiteral("-c:v"), QStringLiteral("libx264"),
+             QStringLiteral("-preset"), QStringLiteral("ultrafast"), QStringLiteral("-crf"),
+             QStringLiteral("22"), QStringLiteral("-pix_fmt"), QStringLiteral("yuv420p"), recording});
+        QVERIFY(recorder.waitForStarted(3000));
+        QTest::qWait(500);
+        QVERIFY(recorder.state() != QProcess::NotRunning);
+    }
+    auto* surface = player.findChild<QWidget*>(QStringLiteral("ffplayVideoSurface"));
+    auto* fullscreen = player.findChild<QPushButton*>(QStringLiteral("ffplayFullscreenButton"));
+    QVERIFY(surface && fullscreen);
+    bool nativeTransition = false;
+    void* observer = maiObserveMacVideoFullscreen(&player, &nativeTransition,
+        [](void* state, MaiMacFullscreenPhase phase) {
+            *static_cast<bool*>(state) = phase == MaiMacFullscreenPhase::WillEnter ||
+                                        phase == MaiMacFullscreenPhase::WillExit;
+        });
+    QVERIFY(observer);
+    const auto releaseObserver = qScopeGuard([&] { maiReleaseMacVideoFullscreenObserver(observer); });
+    const QRect windowed = player.geometry();
+    MaiFfplayPlaybackStatus before{};
+    QVERIFY(player.playbackStatus(&before));
+    QVERIFY(before.paused);
+    const double speed = player.speed();
+    const QJsonObject originalLayer = ffplayTestVideoLayerGeometry(surface);
+    QFile trace(qEnvironmentVariable("MAICHAT_FULLSCREEN_TRACE"));
+    if (!trace.fileName().isEmpty()) QVERIFY(trace.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QElapsedTimer elapsed;
+    elapsed.start();
+    double worstVideoMismatch = 0;
+    int animatedFrames = 0;
+    const auto sample = [&] {
+        QJsonObject value = ffplayTestVideoLayerGeometry(surface);
+        value.insert("ms", double(elapsed.elapsed()));
+        value.insert("qtWidth", player.width());
+        value.insert("qtHeight", player.height());
+        value.insert("qtFullscreen", player.isFullScreen());
+        value.insert("qtMaximized", player.isMaximized());
+        value.insert("surfaceWidth", surface->width());
+        value.insert("surfaceHeight", surface->height());
+        if (trace.isOpen()) trace.write(QJsonDocument(value).toJson(QJsonDocument::Compact) + '\n');
+        if (value.contains("videoWidth")) {
+            worstVideoMismatch = qMax(worstVideoMismatch,
+                std::abs(value.value("shownWidth").toDouble() - value.value("shownViewportWidth").toDouble()));
+            if (value.value("animationCount").toInt()) ++animatedFrames;
+        }
+    };
+    const auto observe = [&](int milliseconds) {
+        QElapsedTimer interval;
+        interval.start();
+        while (interval.elapsed() < milliseconds) { QTest::qWait(16); sample(); }
+    };
+    sample();
+    auto* maximize = player.findChild<QPushButton*>(QStringLiteral("ffplayMaximizeButton"));
+    QVERIFY(maximize);
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        maximize->click();
+        observe(200);
+        maximize->click();
+        observe(400);
+        qInfo() << "maximize-return" << iteration << player.geometry() << windowed;
+        QCOMPARE(player.geometry(), windowed);
+        fullscreen->click();
+        observe(70);
+        fullscreen->click();
+        observe(70);
+        fullscreen->click();
+        observe(450);
+        fullscreen->click();
+        observe(700);
+        // 连续输入保持原来的 70ms 间隔；最终验收等待实际 Did 通知，不把 700ms
+        // 当成系统动画的保证时长。录屏会增加 WindowServer 合成负载。
+        QElapsedTimer completion;
+        completion.start();
+        while (completion.elapsed() < 3000 &&
+               (nativeTransition || player.isFullScreen() || player.geometry() != windowed)) observe(16);
+        QVERIFY(!nativeTransition);
+        qInfo() << "fullscreen-return" << iteration << player.geometry() << windowed;
+        QCOMPARE(player.geometry(), windowed);
+    }
+    qInfo() << "native-video-geometry" << "worstPresentationMismatch" << worstVideoMismatch
+            << "animatedFrames" << animatedFrames << "restored" << player.geometry() << "expected" << windowed;
+    QCOMPARE(player.geometry(), windowed);
+    QVERIFY2(worstVideoMismatch <= 2.0, "Native video layer animates independently of its current viewport");
+    QCOMPARE(animatedFrames, 0);
+    MaiFfplayPlaybackStatus after{};
+    QVERIFY(player.playbackStatus(&after));
+    QVERIFY(after.paused);
+    QVERIFY(std::abs(after.position_us - before.position_us) < 50'000);
+    QCOMPARE(player.speed(), speed);
+    QCOMPARE(ffplayTestVideoLayerGeometry(surface).value("videoLayerIdentity"), originalLayer.value("videoLayerIdentity"));
+    fullscreen->click();
+    player.close();
+    QTRY_VERIFY_WITH_TIMEOUT(!player.isVisible(), 3000);
+    // 再开一个同宿主窗口验证原生 Space 已收敛，不能只检查关闭窗口已隐藏。
+    MaiFfplayVideoDialog reopened(path, &backdrop);
+    showOwnTestWindow(&reopened);
+    QTRY_VERIFY_WITH_TIMEOUT(reopened.hasPresentedHdrFrame(), 10000);
+    const QRect reopenedGeometry = reopened.geometry();
+    QVERIFY(reopened.sendCommand(QStringLiteral("fullscreen")));
+    QTRY_VERIFY(reopened.isFullScreen());
+    QVERIFY(reopened.sendCommand(QStringLiteral("fullscreen")));
+    QTRY_VERIFY_WITH_TIMEOUT(!reopened.isFullScreen(), 3000);
+    QTRY_COMPARE(reopened.geometry(), reopenedGeometry);
+    reopened.close();
+    QTRY_VERIFY_WITH_TIMEOUT(!reopened.isVisible(), 3000);
+
+#else
+    QSKIP("Native AppKit transition regression");
+#endif
 }
 
 void MaiFfplayVideoDialogTest::fullscreenControlsHideAndWake() {
@@ -2158,7 +2338,7 @@ void MaiFfplayVideoDialogTest::fullscreenControlsHideAndWake() {
     auto* header = player.findChild<QWidget*>(QStringLiteral("ffplayTitleBar"));
     auto* pause = player.findChild<QPushButton*>(QStringLiteral("ffplayPauseButton"));
     QVERIFY(surface && panel && header && pause);
-    QVERIFY(header->isVisible());
+    QTRY_VERIFY(header->isVisible());
     const QRect videoGeometry = surface->geometry();
     VideoControlMoveProbe moveProbe(player, *panel);
     qApp->installEventFilter(&moveProbe);
@@ -2189,6 +2369,7 @@ void MaiFfplayVideoDialogTest::fullscreenControlsHideAndWake() {
     QTRY_VERIFY(!player.isFullScreen());
     QVERIFY(player.isVisible() && panel->isVisible());
     player.close();
+    QTRY_VERIFY(!player.isVisible());
 }
 
 void MaiFfplayVideoDialogTest::cameraDoesNotOpenAfterAgentCancellation() {
@@ -2289,13 +2470,15 @@ void MaiFfplayVideoDialogTest::imVideoUsesIndependentWindowAcrossNavigationAndFu
 void MaiFfplayVideoDialogTest::imVideoUsesIndependentWindowAcrossNavigationAndFullscreen() {
     QFETCH(QSize, mainSize);
     const QString captureDirectory = qEnvironmentVariable("MAICHAT_VIDEO_PREVIEW_CAPTURE_DIR");
+    QScreen* screen = QGuiApplication::primaryScreen();
+    QVERIFY(screen);
+    // 后续显式增加 60×40 并移动窗口，夹具必须留在可用屏幕内，避免 AppKit
+    // 的越界约束在关闭播放器之后才修正宿主尺寸，被误判成播放器挤压聊天区。
+    mainSize = mainSize.boundedTo(screen->availableGeometry().size() - QSize(104, 116));
     QScreen* captureScreen = nullptr;
     if (!captureDirectory.isEmpty()) {
         QVERIFY(QDir().mkpath(captureDirectory));
-        captureScreen = QGuiApplication::primaryScreen();
-        QVERIFY(captureScreen);
-        // Reserve room for the later main-window move/resize, keeping synthetic UI on screen.
-        mainSize = mainSize.boundedTo(captureScreen->availableGeometry().size() - QSize(104, 116));
+        captureScreen = screen;
     }
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("im-video-window-test"), std::move(client));
@@ -2387,12 +2570,15 @@ void MaiFfplayVideoDialogTest::imVideoUsesIndependentWindowAcrossNavigationAndFu
     QCOMPARE(window.size(), windowBefore);
     QCOMPARE(editor->toPlainText(), draftBefore);
     QTRY_VERIFY_WITH_TIMEOUT(player->presentedFrames() > 0, 10000);
-    player->showFullScreen();
+    const QRect windowedGeometry = player->geometry();
+    // 经真实 GUI/工具共用入口切换；目标状态标志先变化，须继续等原窗口恢复。
+    QVERIFY(player->sendCommand(QStringLiteral("fullscreen")));
     QTRY_VERIFY(player->isFullScreen());
     QTRY_COMPARE(stack->geometry(), contentBefore);
     QVERIFY(!slot->isVisible() && !pane->isVisible());
-    player->showNormal();
+    QVERIFY(player->sendCommand(QStringLiteral("fullscreen")));
     QTRY_VERIFY(!player->isFullScreen());
+    QTRY_COMPARE(player->geometry(), windowedGeometry);
     QTRY_COMPARE(stack->geometry(), contentBefore);
 
     auto* contacts = window.findChild<QPushButton*>(QStringLiteral("contactsNavButton"));

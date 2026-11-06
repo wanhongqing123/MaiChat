@@ -29,6 +29,7 @@ class QToolButton;
 struct MaiCloudVod;
 #if defined(Q_OS_MAC)
 class MaiMacVideoPlayback;
+enum class MaiMacFullscreenPhase;
 #endif
 
 class MaiFfplayVideoDialog final : public QDialog {
@@ -98,9 +99,13 @@ private:
     void revealControls();
     void scheduleControlHide();
     void updateWindowChrome();
+    void setBuffering(bool buffering);
+    void showPlaybackError(const QString& message);
     void syncAudioControls();
     void applyFullscreen(bool enabled);
     void toggleFullscreen();
+    void toggleMaximized();
+    void minimizeWindow();
     bool handleFrameMouse(QObject* watched, QEvent* event);
 
     QString path_;
@@ -125,6 +130,7 @@ private:
     QTimer* progressTimer_ = nullptr;
     QTimer* controlsHideTimer_ = nullptr;
     QLabel* errorLabel_ = nullptr;
+    QWidget* bufferingIndicator_ = nullptr;
     MaiFfplayHost host_{};
     std::thread playbackThread_;
     void* nativeView_ = nullptr;
@@ -173,6 +179,17 @@ private:
     std::atomic<bool> hlgOutputRequested_{false};
     MaiFfplayHdrSourceInfo sourceInfo_{};
 #if defined(Q_OS_MAC)
+    void onMacFullscreenPhase(MaiMacFullscreenPhase phase);
+    void applyMacFullscreenRequest();
+    void* fullscreenObserver_ = nullptr;
+    bool nativeFullscreenTransition_ = false;
+    bool fullscreenRequestPending_ = false;
+    bool requestedFullscreen_ = false;
+    // AppKit 的全屏转场结束前保留窗口，避免销毁原生窗口打断整个 Space 转场。
+    bool closeAfterFullscreen_ = false;
+    bool hasPendingWindowedState_ = false;
+    bool pendingWindowedMaximized_ = false;
+    bool minimizeAfterFullscreen_ = false;
     std::unique_ptr<MaiMacVideoPlayback> macPlayback_;
     std::atomic<bool> macPlaybackRequested_{false};
     uint64_t playbackOpenGeneration_ = 0;

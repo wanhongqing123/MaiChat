@@ -1,8 +1,32 @@
 // 测试宿主走真实 macOS 前台激活，避免后台 QtTest 的逻辑窗口状态代替屏幕状态。
 #import <AppKit/AppKit.h>
+#import <QuartzCore/CALayer.h>
+#include <QJsonObject>
 #include <QString>
 #include <QDebug>
 #include <QWidget>
+
+// 只读采样自有播放器的实际原生几何，避免用 Qt 的目标状态代替转场中的显示层。
+QJsonObject ffplayTestVideoLayerGeometry(QWidget* widget) {
+    NSView* view = reinterpret_cast<NSView*>(widget->winId());
+    CALayer* root = view.layer;
+    QJsonObject value{{"nativeWidth", NSWidth(view.bounds)}, {"nativeHeight", NSHeight(view.bounds)},
+                      {"nativeFullscreen", bool(view.window.styleMask & NSWindowStyleMaskFullScreen)}};
+    CALayer* shownRoot = root.presentationLayer;
+    value.insert("shownViewportWidth", CGRectGetWidth(shownRoot ? shownRoot.bounds : root.bounds));
+    value.insert("shownViewportHeight", CGRectGetHeight(shownRoot ? shownRoot.bounds : root.bounds));
+    for (CALayer* layer in root.sublayers) {
+        if (![layer isKindOfClass:NSClassFromString(@"AVPlayerLayer")]) continue;
+        CALayer* shown = layer.presentationLayer;
+        value.insert("videoLayerIdentity", QString::number(reinterpret_cast<quintptr>(layer)));
+        value.insert("videoWidth", CGRectGetWidth(layer.frame));
+        value.insert("videoHeight", CGRectGetHeight(layer.frame));
+        value.insert("shownWidth", CGRectGetWidth(shown ? shown.frame : layer.frame));
+        value.insert("shownHeight", CGRectGetHeight(shown ? shown.frame : layer.frame));
+        value.insert("animationCount", int(layer.animationKeys.count));
+    }
+    return value;
+}
 
 void activateFfplayTestApplication() {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];

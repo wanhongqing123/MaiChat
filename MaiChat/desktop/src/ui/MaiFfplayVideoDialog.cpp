@@ -5,6 +5,7 @@
 #include "ui/MaiFfplayVideoDialog.h"
 #include "ui/MaiVideoSpeedSelector.h"
 #include "ui/MaiVideoHud.h"
+#include "ui/MaiVideoBufferingIndicator.h"
 #include "ui/MaiVideoVolumePopup.h"
 #include "MaiCloudVod.h"
 #include "ui/DesktopMusicPlayerDialog.h"
@@ -61,6 +62,7 @@
 
 #if defined(Q_OS_MAC)
 #include "ui/MaiMacVideoPlayback.h"
+#include "ui/MaiMacVideoWindow.h"
 extern "C" void* maiGraphicsCreateMacLayer(QWidget* widget);
 extern "C" void maiGraphicsResizeMacLayer(void* nativeLayer, QWidget* widget);
 extern "C" void maiGraphicsRetainMacLayer(void* nativeLayer);
@@ -332,8 +334,8 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     header->addWidget(minimize);
     header->addWidget(maximizeButton_);
     header->addWidget(close);
-    connect(minimize, &QPushButton::clicked, this, &QWidget::showMinimized);
-    connect(maximizeButton_, &QPushButton::clicked, this, [this] { isMaximized() ? showNormal() : showMaximized(); });
+    connect(minimize, &QPushButton::clicked, this, &MaiFfplayVideoDialog::minimizeWindow);
+    connect(maximizeButton_, &QPushButton::clicked, this, &MaiFfplayVideoDialog::toggleMaximized);
     connect(close, &QPushButton::clicked, this, &QDialog::close);
     surface_ = new MaiVideoSurface(this);
     surface_->setObjectName(QStringLiteral("ffplayVideoSurface"));
@@ -428,13 +430,13 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     errorLabel_->setWordWrap(true);
     errorLabel_->setStyleSheet(QStringLiteral("color:#ffb4b4;background:#191919;padding:12px;"));
     errorLabel_->hide();
+    bufferingIndicator_ = new MaiVideoBufferingIndicator(this);
     progressTimer_ = new QTimer(this);
     progressTimer_->setInterval(250);
     connect(progressTimer_, &QTimer::timeout, this, [this] {
 #if defined(Q_OS_MAC)
         if (macPlayback_ && macPlayback_->failed()) {
-            errorLabel_->setText(QStringLiteral("无法播放该视频，请检查文件或网络连接。"));
-            errorLabel_->show();
+            showPlaybackError(QStringLiteral("无法播放该视频，请检查文件或网络连接。"));
             playing_ = false;
             updatePlayButton();
             return;
@@ -447,8 +449,7 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
 #endif
         // 两种正式播放路径共用 HUD；音量状态必须来自当前实际使用的播放器。
         syncAudioControls();
-        if (cloudSource_ && hasPresentedFrame() && errorLabel_->text() == QStringLiteral("正在缓冲视频…"))
-            errorLabel_->hide();
+        if (cloudSource_ && hasPresentedFrame()) setBuffering(false);
         MaiFfplayPlaybackStatus status{};
         if (!playbackStatus(&status) || status.duration_us <= 0) return;
         if (pauseAfterFirstFrame_) {
@@ -607,9 +608,18 @@ void MaiFfplayVideoDialog::updateControlLayout() {
                            "stop:0 rgba(0,0,0,0),stop:1 rgba(0,0,0,190));}"));
     titleBar_->setVisible(shown);
     overlay_->setVisible(shown);
+#if defined(Q_OS_MAC)
+    // 保留两个 Tool 窗口和焦点关系；只在 AppKit 转场中令其不可见，避免旧尺寸
+    // HUD 叠在窗口转场快照上。不能 orderOut，否则会打断原生 Space 的窗口组转场。
+    const qreal opacity = nativeFullscreenTransition_ ? 0.0 : 1.0;
+    titleBar_->setWindowOpacity(opacity);
+    overlay_->setWindowOpacity(opacity);
+#endif
     // 原生 owner 关系保证 HUD 位于播放器之上；不反复 raise，否则会把 Popup 压回 owner 后面。
     errorLabel_->setGeometry(40, std::max(0, (surface_->height() - 64) / 2), std::max(1, width() - 80), 64);
     if (errorLabel_->isVisible()) errorLabel_->raise();
+    bufferingIndicator_->move(surface_->rect().center() - bufferingIndicator_->rect().center());
+    if (bufferingIndicator_->isVisible()) bufferingIndicator_->raise();
     if (auto* more = findChild<QWidget*>(QStringLiteral("videoMoreButton"))) more->setVisible(!cloudSource_);
     if (auto* divider = findChild<QWidget*>(QStringLiteral("ffplayTitleDivider"))) divider->setVisible(!cloudSource_);
     updateWindowChrome();
@@ -630,6 +640,19 @@ void MaiFfplayVideoDialog::updateWindowChrome() {
         fullscreen->setToolTip(isFullScreen() ? QStringLiteral("退出全屏") : QStringLiteral("进入全屏"));
         fullscreen->setAccessibleName(fullscreen->toolTip());
     }
+}
+
+void MaiFfplayVideoDialog::setBuffering(bool buffering) {
+    // 等待首帧是正常加载状态；只显示无障碍可识别的图标，不占据一条错误横幅。
+    bufferingIndicator_->setVisible(buffering);
+    if (buffering) bufferingIndicator_->raise();
+}
+
+void MaiFfplayVideoDialog::showPlaybackError(const QString& message) {
+    setBuffering(false);
+    errorLabel_->setText(message);
+    errorLabel_->show();
+    errorLabel_->raise();
 }
 
 void MaiFfplayVideoDialog::syncAudioControls() {
@@ -714,10 +737,33 @@ void MaiFfplayVideoDialog::scheduleControlHide() {
 }
 
 void MaiFfplayVideoDialog::toggleFullscreen() {
+#if defined(Q_OS_MAC)
+    if (closeAfterFullscreen_) return;
+    if (fullscreenObserver_ && (fullscreenRequestPending_ || nativeFullscreenTransition_)) {
+        applyFullscreen(!requestedFullscreen_);
+        return;
+    }
+#endif
     applyFullscreen(!isFullScreen());
 }
 
 void MaiFfplayVideoDialog::applyFullscreen(bool enabled) {
+#if defined(Q_OS_MAC)
+    if (closeAfterFullscreen_ && enabled) return;
+    if (fullscreenObserver_) {
+        const bool previous = fullscreenRequestPending_ || nativeFullscreenTransition_ ? requestedFullscreen_ : isFullScreen();
+        if (enabled && !previous)
+            windowWasMaximized_ = hasPendingWindowedState_ ? pendingWindowedMaximized_ : isMaximized();
+        if (enabled) {
+            hasPendingWindowedState_ = false;
+            minimizeAfterFullscreen_ = false;
+        }
+        requestedFullscreen_ = enabled;
+        fullscreenRequestPending_ = true;
+        applyMacFullscreenRequest();
+        return;
+    }
+#endif
     if (enabled == isFullScreen()) return;
     // GUI、键盘、工具及底层宿主回调共同维护进入前的窗口状态。
     if (!enabled) {
@@ -732,6 +778,95 @@ void MaiFfplayVideoDialog::applyFullscreen(bool enabled) {
     updateControlLayout();
     revealControls();
 }
+
+void MaiFfplayVideoDialog::toggleMaximized() {
+#if defined(Q_OS_MAC)
+    if (closeAfterFullscreen_) return;
+    minimizeAfterFullscreen_ = false;
+    if (fullscreenObserver_ && (isFullScreen() || fullscreenRequestPending_ || nativeFullscreenTransition_)) {
+        // 转场中仍接受最后一次用户意图，但必须等 AppKit 完成后再发出下一次窗口命令。
+        pendingWindowedMaximized_ = hasPendingWindowedState_ ? !pendingWindowedMaximized_ : !isMaximized();
+        hasPendingWindowedState_ = true;
+        applyFullscreen(false);
+        return;
+    }
+#endif
+    isMaximized() ? showNormal() : showMaximized();
+}
+
+void MaiFfplayVideoDialog::minimizeWindow() {
+#if defined(Q_OS_MAC)
+    if (closeAfterFullscreen_) return;
+    if (fullscreenObserver_ && (isFullScreen() || nativeFullscreenTransition_ || fullscreenRequestPending_)) {
+        // 最小化也必须排到 DidExit 之后，不能反向打断 AppKit 的退出动画。
+        minimizeAfterFullscreen_ = true;
+        hasPendingWindowedState_ = false;
+        applyFullscreen(false);
+        return;
+    }
+#endif
+    showMinimized();
+}
+
+#if defined(Q_OS_MAC)
+void MaiFfplayVideoDialog::applyMacFullscreenRequest() {
+    if (!fullscreenRequestPending_ || nativeFullscreenTransition_ || !isVisible()) return;
+    if (requestedFullscreen_ == isFullScreen()) {
+        fullscreenRequestPending_ = false;
+        if (!requestedFullscreen_ && closeAfterFullscreen_) {
+            // 直到 DidExit 之后才允许 Qt 真正关闭/删除窗口，保留转场期间的原生宿主。
+            closeAfterFullscreen_ = false;
+            QMetaObject::invokeMethod(this, [this] { close(); }, Qt::QueuedConnection);
+            return;
+        }
+        if (!requestedFullscreen_ && minimizeAfterFullscreen_) {
+            minimizeAfterFullscreen_ = false;
+            showMinimized();
+            return;
+        }
+        if (!requestedFullscreen_ && hasPendingWindowedState_) {
+            const bool maximized = pendingWindowedMaximized_;
+            hasPendingWindowedState_ = false;
+            maximized ? showMaximized() : showNormal();
+        }
+        updateControlLayout();
+        revealControls();
+        return;
+    }
+    // Qt 的逻辑状态可能先改变；完成条件来自原生 DidEnter/DidExit 通知。
+    nativeFullscreenTransition_ = true;
+    movingFrame_ = false;
+    resizingFrame_ = {};
+    if (QWidget::mouseGrabber() == this) releaseMouse();
+    updateControlLayout();
+    if (requestedFullscreen_) showFullScreen();
+    else if (hasPendingWindowedState_ ? pendingWindowedMaximized_ : windowWasMaximized_) showMaximized();
+    else showNormal();
+}
+
+void MaiFfplayVideoDialog::onMacFullscreenPhase(MaiMacFullscreenPhase phase) {
+    if (qEnvironmentVariableIntValue("MAICHAT_TRACE_VIDEO_CONTROLS") == 1)
+        qInfo() << "[native-fullscreen]" << int(phase) << "requested" << requestedFullscreen_
+                << "pending" << fullscreenRequestPending_ << "qt-fullscreen" << isFullScreen();
+    const bool entering = phase == MaiMacFullscreenPhase::WillEnter || phase == MaiMacFullscreenPhase::DidEnter;
+    if (phase == MaiMacFullscreenPhase::WillEnter || phase == MaiMacFullscreenPhase::WillExit) {
+        nativeFullscreenTransition_ = true;
+        // 系统快捷键等外部切换也由 Qt 处理，不能被上一轮已完成的意图撤销。
+        if (!fullscreenRequestPending_) requestedFullscreen_ = entering;
+        updateControlLayout();
+        return;
+    }
+    nativeFullscreenTransition_ = false;
+    if (!fullscreenRequestPending_) requestedFullscreen_ = entering;
+    // 等 Qt 的原生 delegate 也完成本次状态同步，再处理最后的排队意图。
+    QMetaObject::invokeMethod(this, [this] {
+        if (!isVisible()) return;
+        applyMacFullscreenRequest();
+        updateControlLayout();
+        revealControls();
+    }, Qt::QueuedConnection);
+}
+#endif
 
 void MaiFfplayVideoDialog::forwardVideo() {
     if (cloudSource_) {
@@ -793,6 +928,10 @@ void MaiFfplayVideoDialog::saveCopy() {
 }
 
 MaiFfplayVideoDialog::~MaiFfplayVideoDialog() {
+#if defined(Q_OS_MAC)
+    maiReleaseMacVideoFullscreenObserver(fullscreenObserver_);
+    fullscreenObserver_ = nullptr;
+#endif
     stopPlayback(true);
 }
 
@@ -883,6 +1022,9 @@ void MaiFfplayVideoDialog::setSize(void* userData, int width, int height) {
             dialog->initialVideoSizeApplied_ = true;
             if (dialog->docked_ || dialog->isFullScreen() || dialog->isMaximized() || dialog->windowGeometryCustomized_)
                 return;
+#if defined(Q_OS_MAC)
+            if (dialog->nativeFullscreenTransition_ || dialog->fullscreenRequestPending_) return;
+#endif
             const QScreen* screen = dialog->screen();
             if (!screen) screen = QGuiApplication::primaryScreen();
             const QRect available = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 800);
@@ -908,6 +1050,9 @@ void MaiFfplayVideoDialog::setPosition(void* userData, int x, int y) {
             if (dialog->docked_ || dialog->isFullScreen() || dialog->isMaximized() || dialog->initialPositionApplied_ ||
                 dialog->windowGeometryCustomized_)
                 return;
+#if defined(Q_OS_MAC)
+            if (dialog->nativeFullscreenTransition_ || dialog->fullscreenRequestPending_) return;
+#endif
             dialog->initialPositionApplied_ = true;
             // 兼容层 SDL_WINDOWPOS_CENTERED/UNDEFINED 都为 (0,0)；默认位置由首次定尺寸居中。
             // 后续重播/切速不能把用户已移动的窗口重新移到屏幕原点。
@@ -934,12 +1079,8 @@ bool MaiFfplayVideoDialog::startPlayback() {
         qWarning() << "FFplay popup has no readable video file:" << path_;
         return false;
     }
-    if (cloudSource_) {
-        errorLabel_->setText(QStringLiteral("正在缓冲视频…"));
-        errorLabel_->show();
-    } else {
-        errorLabel_->hide();
-    }
+    errorLabel_->hide();
+    setBuffering(bool(cloudSource_));
     DesktopMusicPlayerDialog::closeActive();
     if (!sActiveDialog.isNull() && sActiveDialog != this) sActiveDialog->close();
     const QString backend = bundledResource(QStringLiteral("/../Frameworks/libmaiagent_obs_metal.so"));
@@ -1043,8 +1184,7 @@ bool MaiFfplayVideoDialog::startPlayback() {
                     volumeRequestPending_ = muteRequestPending_ = false;
                     volumeRequestReceipt_ = muteRequestReceipt_ = 0;
                     if (!macPlayback_->open(startPositionUs_, playbackSpeed_, playing_)) {
-                        errorLabel_->setText(QStringLiteral("无法打开该 HDR 视频。"));
-                        errorLabel_->show();
+                        showPlaybackError(QStringLiteral("无法打开该 HDR 视频。"));
                     }
                 },
                 Qt::QueuedConnection);
@@ -1079,8 +1219,7 @@ bool MaiFfplayVideoDialog::startPlayback() {
             this,
             [this, result] {
                 if (result != 0) {
-                    errorLabel_->setText(QStringLiteral("无法播放该视频（FFplay 状态 %1）").arg(result));
-                    errorLabel_->show();
+                    showPlaybackError(QStringLiteral("无法播放该视频（FFplay 状态 %1）").arg(result));
                 }
             },
             Qt::QueuedConnection);
@@ -1089,6 +1228,7 @@ bool MaiFfplayVideoDialog::startPlayback() {
 }
 
 void MaiFfplayVideoDialog::stopPlayback(bool cancelCloudSource) {
+    setBuffering(false);
     stopRequested_ = true;
     syncAudioControls();
     bool wasNativePlayback = false;
@@ -1310,8 +1450,7 @@ bool MaiFfplayVideoDialog::navigateVideo(int direction) {
     if (nextIndex < 0 || nextIndex >= playlist_.size()) return false;
     const QString nextPath = playlist_.at(nextIndex);
     if (!QFileInfo(nextPath).isFile()) {
-        errorLabel_->setText(QStringLiteral("视频文件已被移动或删除。"));
-        errorLabel_->show();
+        showPlaybackError(QStringLiteral("视频文件已被移动或删除。"));
         return false;
     }
     const QString previousPath = path_;
@@ -1328,8 +1467,7 @@ bool MaiFfplayVideoDialog::navigateVideo(int direction) {
         path_ = previousPath;
         playlistIndex_ = previousIndex;
         startPlayback();
-        errorLabel_->setText(QStringLiteral("无法打开下一段视频。"));
-        errorLabel_->show();
+        showPlaybackError(QStringLiteral("无法打开下一段视频。"));
         return false;
     }
     if (previousItemAction_) previousItemAction_->setEnabled(playlistIndex_ > 0);
@@ -1345,11 +1483,32 @@ void MaiFfplayVideoDialog::showEvent(QShowEvent* event) {
     if (windowHandle()) windowHandle()->installEventFilter(this);
 #if defined(Q_OS_MAC)
     maiGraphicsStyleMacVideoWindow(this);
+    if (!fullscreenObserver_)
+        fullscreenObserver_ = maiObserveMacVideoFullscreen(this, this, [](void* context, MaiMacFullscreenPhase phase) {
+            static_cast<MaiFfplayVideoDialog*>(context)->onMacFullscreenPhase(phase);
+        });
 #endif
     if (!started_ && !startPlayback()) setWindowTitle(QStringLiteral("无法打开视频"));
 }
 
 void MaiFfplayVideoDialog::closeEvent(QCloseEvent* event) {
+#if defined(Q_OS_MAC)
+    if (fullscreenObserver_ && (nativeFullscreenTransition_ || isFullScreen())) {
+        // 进入全屏尚未结束时直接销毁 NSWindow，会使后续窗口也收不到 DidEnter。
+        // 合并为退出再关闭；视频图层保持存活，关闭期间不额外重建或隐藏它。
+        closeAfterFullscreen_ = true;
+        minimizeAfterFullscreen_ = false;
+        hasPendingWindowedState_ = false;
+        windowWasMaximized_ = false;
+        applyFullscreen(false);
+        event->ignore();
+        return;
+    }
+    fullscreenRequestPending_ = false;
+    nativeFullscreenTransition_ = false;
+    maiReleaseMacVideoFullscreenObserver(fullscreenObserver_);
+    fullscreenObserver_ = nullptr;
+#endif
     if (controlsHideTimer_) controlsHideTimer_->stop();
     stopPlayback(true);
     QDialog::closeEvent(event);
@@ -1391,9 +1550,12 @@ bool MaiFfplayVideoDialog::handleFrameMouse(QObject* watched, QEvent* event) {
         if (isFullScreen())
             applyFullscreen(false);
         else
-            isMaximized() ? showNormal() : showMaximized();
+            toggleMaximized();
         return true;
     }
+#if defined(Q_OS_MAC)
+    if (nativeFullscreenTransition_ && titleHit) return true;
+#endif
     Qt::Edges edges;
     if (!isMaximized() && !isFullScreen() && rect().contains(local)) {
         if (local.x() < 6) edges |= Qt::LeftEdge;
@@ -1478,6 +1640,12 @@ bool MaiFfplayVideoDialog::eventFilter(QObject* watched, QEvent* event) {
 
 void MaiFfplayVideoDialog::keyPressEvent(QKeyEvent* event) {
     if (event->key() == Qt::Key_Escape) {
+#if defined(Q_OS_MAC)
+        if (isFullScreen() || fullscreenRequestPending_ || nativeFullscreenTransition_) {
+            applyFullscreen(false);
+            return;
+        }
+#endif
         if (isFullScreen())
             toggleFullscreen();
         else

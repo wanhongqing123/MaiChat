@@ -6,6 +6,58 @@
 #include <QWidget>
 #include <QGuiApplication>
 #include <QDebug>
+#include <QPointer>
+#include <memory>
+#include "ui/MaiMacVideoWindow.h"
+
+namespace {
+struct FullscreenObserver {
+  QPointer<QWidget> owner;
+  void* context;
+  MaiMacFullscreenCallback callback;
+  NSMutableArray* tokens;
+  std::shared_ptr<bool> active = std::make_shared<bool>(true);
+};
+}
+
+void* maiObserveMacVideoFullscreen(QWidget* widget, void* context, MaiMacFullscreenCallback callback) {
+  if (!widget || !callback || QGuiApplication::platformName() != QStringLiteral("cocoa")) return nullptr;
+  NSWindow* window = reinterpret_cast<NSView*>(widget->winId()).window;
+  if (!window) return nullptr;
+  auto* observer = new FullscreenObserver{widget, context, callback, [[NSMutableArray alloc] init]};
+  NSArray* names = @[NSWindowWillEnterFullScreenNotification, NSWindowDidEnterFullScreenNotification,
+                     NSWindowWillExitFullScreenNotification, NSWindowDidExitFullScreenNotification];
+  for (NSUInteger index = 0; index < names.count; ++index) {
+    const auto phase = static_cast<MaiMacFullscreenPhase>(index);
+    id token = [NSNotificationCenter.defaultCenter addObserverForName:names[index] object:window queue:nil
+        usingBlock:^(NSNotification*) {
+          if (phase == MaiMacFullscreenPhase::WillEnter || phase == MaiMacFullscreenPhase::WillExit) {
+            if (observer->owner) observer->callback(observer->context, phase);
+            return;
+          }
+          // Did 通知仍在 AppKit 完成栈内。Qt 队列可被原生事件递归冲刷，不能据此
+          // 立即反向 toggle；先回到主 dispatch 队列，再让 GUI 消费下一次意图。
+          const QPointer<QWidget> owner = observer->owner;
+          const auto active = observer->active;
+          const auto callback = observer->callback;
+          void* context = observer->context;
+          dispatch_async(dispatch_get_main_queue(), ^{
+            if (*active && owner) callback(context, phase);
+          });
+        }];
+    [observer->tokens addObject:token];
+  }
+  return observer;
+}
+
+void maiReleaseMacVideoFullscreenObserver(void* value) {
+  auto* observer = static_cast<FullscreenObserver*>(value);
+  if (!observer) return;
+  *observer->active = false;
+  for (id token in observer->tokens) [NSNotificationCenter.defaultCenter removeObserver:token];
+  [observer->tokens release];
+  delete observer;
+}
 
 extern "C" void *maiGraphicsCreateMacLayer(QWidget *widget) {
   widget->setAttribute(Qt::WA_NativeWindow);

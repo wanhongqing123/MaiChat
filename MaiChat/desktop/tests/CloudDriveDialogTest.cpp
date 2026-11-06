@@ -324,16 +324,31 @@ int main(int argc, char** argv) {
             QTest::qWait(20);
         QPointer<MaiFfplayVideoDialog> player = MaiFfplayVideoDialog::activeDialog();
         require(player && player->isWindow() &&
-                !(player->windowFlags() & Qt::FramelessWindowHint), "cloud did not open independent window");
+                (player->windowFlags() & Qt::FramelessWindowHint) &&
+                player->findChild<QWidget*>(QStringLiteral("ffplayTitleBar")),
+                "cloud did not open the shared independent player window");
+        auto* buffering = player->findChild<QWidget*>(QStringLiteral("ffplayBufferingIndicator"));
+        auto* error = player->findChild<QLabel*>(QStringLiteral("ffplayErrorLabel"));
+        require(buffering && error && !error->isVisible(), "buffering was shown as an error banner");
+        if (!player->hasPresentedFrame()) {
+            require(buffering->isVisible(), "first-frame loading indicator was missing");
+            // 只记录实际加载控件，避开 QWidget::grab 中不可靠的原生视频 backingstore。
+            require(buffering->grab().save(screenshots + QStringLiteral("/cloud-buffering-icon.png")),
+                    "could not capture cloud loading indicator");
+        }
         auto* dock = window.findChild<QWidget*>(QStringLiteral("videoDockSlot"));
         require(dock && !dock->isVisible() && page->size() == pageSize,
                 "cloud video resized the main list or opened the dock");
         timer.restart();
         while (player->presentedFrames() == 0 && timer.elapsed() < 15000) QTest::qWait(20);
         require(player->presentedFrames() > 0, "independent cloud window produced no frames");
+        timer.restart();
+        while (buffering->isVisible() && timer.elapsed() < 2000) QTest::qWait(20);
+        require(!buffering->isVisible() && !error->isVisible(), "loading indicator remained over decoded video");
         QTest::qWait(300); // 等正常进度计时器收起缓冲提示后再记录控件画面。
         require(window.grab().save(screenshots + QStringLiteral("/cloud-main-window.png")),
                 "could not capture normal MainWindow cloud page");
+        // 此截图仅供检查 Qt 控件布局；真实原生视频合成由独立播放器录屏验收。
         require(player->grab().save(screenshots + QStringLiteral("/cloud-independent-player.png")),
                 "could not capture independent player controls");
         player->close();

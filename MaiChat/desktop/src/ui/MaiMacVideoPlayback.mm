@@ -3,6 +3,7 @@
 
 #import <AVFoundation/AVFoundation.h>
 #import <AppKit/AppKit.h>
+#import <QuartzCore/CATransaction.h>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QWidget>
@@ -356,6 +357,11 @@ void MaiMacVideoPlayback::resize() {
     if (!impl_->state || !impl_->surface)
         return;
     NSView* view = reinterpret_cast<NSView*>(impl_->surface->winId());
+    // 窗口已经由 AppKit/Qt 完成几何变化，视频层不能再隐式补一段缩放动画。
+    // 否则最大化/还原交替时，显示中的视频尺寸会落后视口数百像素。
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     impl_->state->layer.frame = view.bounds;
     impl_->state->layer.contentsScale = view.window ? view.window.backingScaleFactor : 1;
+    [CATransaction commit];
 }
