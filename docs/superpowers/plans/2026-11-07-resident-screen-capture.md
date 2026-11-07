@@ -23,7 +23,7 @@ The screenshot tool accepts capture/stop only, with capture as default. Remove m
 - [x] Simplify model tools to screen-only, retain correct same-file delivery and HTTP image bytes, and adapt product tests using an explicit owned-window capture source seam.
 - [x] Run Windows native lifecycle, actual-display metadata and product-path cases, plus required Core/desktop gates. Record Mac final-source lock/permission/display boundaries separately.
 - [ ] Resume final-source macOS native capture on an available authorized desktop; the locked-session failure and earlier-source success are not replaced by offline or Windows results.
-- [ ] Review, commit/push and prepare a private package with full staging/actual-ZIP PE/model/bare-PATH checks. Do not install or publish without existing authorization.
+- [x] Review, commit/push and prepare a private package with full staging/actual-ZIP PE/model/bare-PATH checks. Code commit: `85592c748fac52546ed91af9fae241a3d4d77b00`; no install or publication occurred.
 
 ## Evidence policy
 

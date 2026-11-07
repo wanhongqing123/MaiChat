@@ -18,14 +18,14 @@
 
 | 对象 | 当前记录 |
 | --- | --- |
-| 阶段 B 基线 | `main`，`ecdcc521d390e3e36860138ffa26589fcae30e47`，叠加本轮尚未提交的实现与测试 |
+| 阶段 B 源码 | 从 `ecdcc521d390e3e36860138ffa26589fcae30e47` 开始，统一提交并推送到 `main` 的 `85592c748fac52546ed91af9fae241a3d4d77b00`；双方工作区已清理并核对相同输入 |
 | Core 构建 | `E:/OpenSource/MaiChat/.cache/maiagent-core-gate/build-followup-20261105`，VS2022 / MSVC 14.44 |
 | Windows Desktop 构建 | `E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-release-62111144`，Windows x64 / Qt 5.15.2 |
 | 本地证据目录 | `.cache/resident-screen-20261107/`；下文日志名均相对此目录 |
 | Windows 当前构建程序 | `MaiChat/desktop/.cache/build-release-62111144/bin/maichat.exe`，新增 `MaiTool` virtual 后实际重编，主任务核对 SHA256 `f3b4e4f5fdaa8a784456d73dca049e18aea861683039722db2c9c31d624a0c1b` |
 | Windows 较早构建快照 | 同路径此前 SHA256 `048bdbf9a588595c76edbc2e825cac9e78566cf401df2df8039491683ed3184c`；只对应新增 virtual 前的快照，不再代表当前 exe |
 | 依赖检查 | `desktop-workspace-final-build.txt` 记录新增 header 后相关对象重编和 `MaiChat runtime verified: 3 binaries, 120 PE imports and Qt plugins`；早期记录另存于 `desktop-first-final-build.txt` |
-| 安装与发布 | 本轮没有安装、替换或发布；上述哈希属于构建目录，尚不是最终 ZIP 或现装产物身份 |
+| 安装与发布 | 本轮没有安装、替换或发布；最终私有 ZIP 与 staging/解压目录中的 exe 哈希均等于上述当前构建哈希，详见交付段落 |
 
 主任务在阶段开始时没有主动停止或替换 Windows 现装 PID 584。较新的只读进程查询已经没有 `maichat.exe`，原因尚未调查，本文不写成“PID 584 仍在运行”，也不凭此推定崩溃原因。Mac 现装 PID 96951 按同伴反馈未改动，未以 Windows 本地观测代替 Mac 进程核对。
 
@@ -146,7 +146,7 @@ Root 已读取最终 Core 逐项 command/time/binary SHA256 回执：14/14 全�
 
 **不能把离线 GREEN、offscreen 回归或较早窗口结果写成最终 native 通过**。Mac 现装 PID 96951 按同伴反馈未改，系统键鼠 native 验收未运行。
 
-Mac 额外执行 `all` 暴露 `reply_suggestion_controller_test` 链接缺口：AgentChatPanel 引用两个播放器方法，而该测试链接图缺少对应媒体实现。本轮未修改这些源文件或 Desktop CMake，冻结输入未为此扩大修改；原失败日志保留，指定 App/本轮消费者目标另外构建和验收，不宣称 Mac 全目标构建通过。
+Mac 额外执行 `all` 暴露 `reply_suggestion_controller_test` 链接缺口：未解析符号包含 MaiFfplayVideoDialog、DesktopMusicPlayerDialog、DesktopCameraDialog、MessageImageLoader 的实现。本轮未修改这些源文件或 Desktop CMake，冻结输入未为此扩大修改；原失败日志保留，指定 App/本轮消费者目标另外构建和验收，不宣称 Mac 全目标构建通过，也未把仅有源码无差异当成旧版本已实跑复现。
 
 ## 验证边界、待办与最终回填
 
@@ -156,17 +156,27 @@ Mac 额外执行 `all` 暴露 `reply_suggestion_controller_test` 链接缺口：
 - macOS：availabilityEpoch 离线 4 FAIL→0 FAIL、failed 锁存离线 18 FAIL→0 FAIL 已完成；最终限定编译、Core 14 组及无采集 Desktop 7 组通过。locked 环境 NotConfigured 的 CTest exit 8 / 43 处下游断言失败保留，最终 native 仍未验收，不把早期组件结果并入最终通过。额外 all 链接缺口未修，单列记录。
 - DeepSeek：没有运行付费的 live 云端识图，没有把当前 raw frame / PNG 回灌描述为云端已理解画面。阶段 B 最终 MaiModelClientTests 全套已包含真实 view_image→Agent→两轮本地 HTTP 的 ChatCompletions/Responses 图片字节验证并通过；仍不等同 live 供应商验收。
 - 系统键鼠操作：原生 key/mouse acceptance 仍 pending；本阶段没有用截图成功替代输入验收。
-- 交付：尚未提交阶段 B 最终实现、未形成最终包、未安装或发布。Windows 现装进程当前去向未调查，不能报告仍运行；Mac 仅按同伴提供的未替换信息记录。
+- 交付：阶段 B 代码 `85592c748fac52546ed91af9fae241a3d4d77b00` 已提交并推送；Windows 私有 ZIP 的目录/解压后运行验证通过，未安装或发布。Windows 现装进程当前去向未调查，不能报告仍运行；Mac 仅按同伴提供的未替换信息记录。
 
-| 最终引用 | 待补内容 |
+| 最终引用 | 核对结果与边界 |
 | --- | --- |
-| 阶段 B commit / 产品与 Core tree | 基线 `ecdcc521d390e3e36860138ffa26589fcae30e47` + 当前 overlay；最终提交后填写 |
+| 阶段 B commit / 产品与 Core tree | `85592c748fac52546ed91af9fae241a3d4d77b00`；MaiChat `e0dc4d994bade89fbb529f03ad8003acde26fa5c`；Core `69e18eb1e4b587b30ad8b467dd3172bea0443b8e` |
 | 最终 Core 门禁 | `core-dependency-final-rebuild.txt`、`core-dependency-final-readback.txt`（含 MaiTool.h，#deps 15）及 `core-clean-final-gates.txt`：14/14 PASS、0 SKIP、122.11 s，主任务核对 exit 0 |
 | Windows 全显示器实测 | 最终 `actual-display-final-metadata.txt` exit 0、2560×1600、帧 1→1 / 接收时间保持原值、资源计数复用与停止后 inactive；较早动态 1→2 单独保留，不保存或展示用户桌面像素 |
 | Mac 最终输入及验收 | 两次修补完整 SHA、最终 827/82be blob、离线红绿、App SHA 及限定编译/Core 14/Desktop 7 结果已列；原始逐项回执留存本地证据。额外 all 链接失败单列；最终 native/真实 display 验收仍受锁屏环境限制 |
-| Windows 最终构建与包 | 当前新增 virtual 后 exe SHA256、120 PE 及 8/8 回归已列；最终 staging/ZIP 路径、大小、哈希、模型资源检查、两处裸 PATH `--smoke` 及真实退出码待补 |
+| Windows 最终构建与包 | `private-85592c74-20261107T120311/` 完成完整 staging、实际 ZIP 解压及两处 120 PE / 4 模型 / ORT / 裸 PATH smoke 检查，均 exit 0；源码与产物身份详见下文 |
 | 安装及运行身份 | 本轮无安装/发布；如后续执行，应另核对实际运行路径、PID 与同一产物 SHA |
 
 ### 最终 Windows 显示器静止帧复验
 
 正确依赖重编后的 Session 测试二进制显式运行 `--display-metadata-only`，`actual-display-final-metadata.txt` 核对 exit 0：两次 2560×1600，同一 worker/device/session 各 1；这次屏幕静止，两次保留同一 `frameSequence=1` 和 `frameReceivedAtMs=1794023408150`，没有伪造新帧时间。最后 stop 后 inactive。较早运行的帧 1→2 与本次静止帧复用分别记录，均只保留元数据，不输出用户屏幕图片。
+
+## Windows 私有包交付
+
+以干净 `main` 的 `85592c748fac52546ed91af9fae241a3d4d77b00` 正常构建并打包，证据在 `.cache/resident-screen-20261107/private-85592c74-20261107T120311/`。归档名 `MaiChat-win64-v2.2.52-20261107-85592c74.zip`，244314981 bytes，SHA256 `85ea5aa4bbb99498258e60ada9d679ea61b823e3a02a2c7ff1a90b24f0837dad`。
+
+构建目录、完整 staging、实际 ZIP 解压目录的 `maichat.exe` 均为 163755520 bytes / SHA256 `f3b4e4f5fdaa8a784456d73dca049e18aea861683039722db2c9c31d624a0c1b`。staging 与解压目录分别通过 120 PE imports / Qt plugins、4/4 Portrait 模型及 ORT 检查，使用 `C:\Windows\System32;C:\Windows` 的裸 PATH 执行 `--smoke` 均 exit 0，实际子进程分别为 PID 8924 与 4256，均已退出。smoke 跳过登录/账号恢复，不据此声称已登录用户会话运行过新功能。
+
+结构化交付回执见 [delivery JSON](maichat-resident-screen-capture-delivery-20261107.json)。其 `sourceCommit` 指向实际打包代码提交；后续仅有诊断文档提交时，产品/Core tree 与已验二进制保持不变，不为文档重打包。Mac 最终完整回执的 23/23 canonical 和两棵 tree 已由 Root 独立比对，并已归档原始 42 文件证据；额外 all 失败、Qt 内部跳过与原生未验收边界均保留。
+
+Windows 本文的“0 SKIP”指 CTest 整项计数，不包含未运行的系统键鼠验收；Mac 的四个 Qt 内部跳过单独列出。公开 v2.2.52 资产、现装程序及系统设置均未由本轮更改。这个私有包通过打包与 Windows 屏幕路径验证，系统输入、Mac 最终原生采集及 live 供应商视觉理解仍未验收。

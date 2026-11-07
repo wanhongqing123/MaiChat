@@ -1,0 +1,217 @@
+{
+  "status": "PACKAGING_PASS_SCREEN_CAPTURE_NATIVE_INPUT_PENDING",
+  "sourceCommit": "85592c748fac52546ed91af9fae241a3d4d77b00",
+  "coreTree": "69e18eb1e4b587b30ad8b467dd3172bea0443b8e",
+  "version": "2.2.52",
+  "privateQaOnly": true,
+  "published": false,
+  "installerExecuted": false,
+  "installedAppReplaced": false,
+  "executables": [
+    {
+      "name": "maichat.exe",
+      "bytes": 163755520,
+      "sha256": "f3b4e4f5fdaa8a784456d73dca049e18aea861683039722db2c9c31d624a0c1b"
+    },
+    {
+      "name": "maichat.exe",
+      "bytes": 163755520,
+      "sha256": "f3b4e4f5fdaa8a784456d73dca049e18aea861683039722db2c9c31d624a0c1b"
+    },
+    {
+      "name": "maichat.exe",
+      "bytes": 163755520,
+      "sha256": "f3b4e4f5fdaa8a784456d73dca049e18aea861683039722db2c9c31d624a0c1b"
+    }
+  ],
+  "zip": {
+    "name": "MaiChat-win64-v2.2.52-20261107-85592c74.zip",
+    "bytes": 244314981,
+    "sha256": "85ea5aa4bbb99498258e60ada9d679ea61b823e3a02a2c7ff1a90b24f0837dad"
+  },
+  "tests": {
+    "sourceCommit": "85592c748fac52546ed91af9fae241a3d4d77b00",
+    "coreTree": "69e18eb1e4b587b30ad8b467dd3172bea0443b8e",
+    "maiChatTree": "e0dc4d994bade89fbb529f03ad8003acde26fa5c",
+    "sourceCanonicalFiles": 23,
+    "coreSuitesPassed": 10,
+    "additionalScreenshotSuitesPassed": 4,
+    "coreCtestTotal": 14,
+    "coreCtestSeconds": 122.11,
+    "desktopSuitesPassed": 8,
+    "desktopCtestSeconds": 89.89,
+    "coreResults": [
+      {
+        "name": "MaiCoreTests",
+        "seconds": 1.69
+      },
+      {
+        "name": "MaiInputQueueTests",
+        "seconds": 30.78
+      },
+      {
+        "name": "MaiTurnRunnerTests",
+        "seconds": 31.75
+      },
+      {
+        "name": "MaiToolTests",
+        "seconds": 0.87
+      },
+      {
+        "name": "MaiScreenshotToolTests",
+        "seconds": 1.29
+      },
+      {
+        "name": "MaiViewImageToolTests",
+        "seconds": 0.44
+      },
+      {
+        "name": "MaiWindowListToolTests",
+        "seconds": 0.58
+      },
+      {
+        "name": "MaiModelClientTests",
+        "seconds": 73.59
+      },
+      {
+        "name": "MaiToolLoopTests",
+        "seconds": 30.7
+      },
+      {
+        "name": "MaiScreenshotSessionTests",
+        "seconds": 1.87
+      },
+      {
+        "name": "MaiQuestionTests",
+        "seconds": 1.4
+      },
+      {
+        "name": "MaiStoreTests",
+        "seconds": 0.27
+      },
+      {
+        "name": "MaiFilePathTests",
+        "seconds": 0.14
+      },
+      {
+        "name": "MaiPermissionTests",
+        "seconds": 46.83
+      }
+    ],
+    "actualDisplayExit": 0,
+    "actualDisplayDimensions": [
+      2560,
+      1600
+    ],
+    "actualDisplaySavedOrDelivered": false,
+    "actualDisplayFinalStaticSequence": [
+      1,
+      1
+    ],
+    "actualDisplayResourceCounts": {
+      "workerStarts": 1,
+      "deviceCreations": 1,
+      "sessionStarts": 1
+    },
+    "actualDisplayStoppedInactive": true,
+    "productEvidenceBackend": "controlled_native_owned_window_source",
+    "liveSupplierVisionAccepted": false,
+    "windowsNativeInputAccepted": false,
+    "macNativeInputAccepted": false,
+    "macFinalNativeCaptureAccepted": false,
+    "macBoundary": "Final native capture not accepted: locked GUI was rejected; earlier owned-window success belongs to an earlier snapshot. Final public guard and terminal state have offline tests; no final display/warm-cache-lock/revoke acceptance.",
+    "app": {
+      "size": 163755520,
+      "sha256": "f3b4e4f5fdaa8a784456d73dca049e18aea861683039722db2c9c31d624a0c1b"
+    },
+    "coreTestBinaries": [
+      {
+        "name": "MaiCoreTests",
+        "size": 8603648,
+        "sha256": "5b493c75e3364b70360ecfb9087bd3955d838ff4aa4a2d54d292915616db7c26"
+      },
+      {
+        "name": "MaiInputQueueTests",
+        "size": 9603584,
+        "sha256": "f6f4ba1fe96b12192db81160170babdc100ce3c6b0c211dcbbadc390d9c23158"
+      },
+      {
+        "name": "MaiTurnRunnerTests",
+        "size": 9571840,
+        "sha256": "d9ac53648f242ec0e7e3b41145389d4ef34d50a87a2a80fa096d28977881b3ba"
+      },
+      {
+        "name": "MaiToolTests",
+        "size": 12427776,
+        "sha256": "c678cbb5c7a1972729dd042e989c071481996e329f88e5ab921283387d849207"
+      },
+      {
+        "name": "MaiScreenshotToolTests",
+        "size": 12362240,
+        "sha256": "d6afb16bcd8ac2927f21e2e9234e9abd43cf75617ed7436fb5fbec9fd0674667"
+      },
+      {
+        "name": "MaiViewImageToolTests",
+        "size": 8130048,
+        "sha256": "09055599efbae3f85fc07260c8e227449dfe7adaef1141bfc0af25f00dd26449"
+      },
+      {
+        "name": "MaiWindowListToolTests",
+        "size": 12299264,
+        "sha256": "be3503075dc0e9fff80588626dc7bb523103b567bd42f8672447e3f711f5ad17"
+      },
+      {
+        "name": "MaiModelClientTests",
+        "size": 9078272,
+        "sha256": "90b263b225d08d0e9b19d9facc0f6316b32e00083734658aaa071c36a337d77c"
+      },
+      {
+        "name": "MaiToolLoopTests",
+        "size": 12571648,
+        "sha256": "b3fbb1979e0f5052fe7c1b6f7b24a622b10d65c8d16d7b37e968f78e77407c7b"
+      },
+      {
+        "name": "MaiScreenshotSessionTests",
+        "size": 157696,
+        "sha256": "b0d37b94e32c8dae5312cbf8a62ca89ec6668109f43dfe02d16f1d80e50962a8"
+      },
+      {
+        "name": "MaiQuestionTests",
+        "size": 12323328,
+        "sha256": "2f6e9a6bfe431ffbf1fd415ea3b5a3395b48f35af1aec942e3013fe750e44015"
+      },
+      {
+        "name": "MaiStoreTests",
+        "size": 1347584,
+        "sha256": "0650a9f25dc64d4c5e119d2925c2f4478a55905f3db5958759a46fe5067696a0"
+      },
+      {
+        "name": "MaiFilePathTests",
+        "size": 138752,
+        "sha256": "a728dd21c0b4dbe9c0b691f1ef3072f90e21849edbf92cf42881423dacf292da"
+      },
+      {
+        "name": "MaiPermissionTests",
+        "size": 12545024,
+        "sha256": "daddb2990c214ba2b70b8e966240c3670659f08326d9d058417a98913a991cea"
+      }
+    ],
+    "createdAt": "2026-11-07T03:54:16.333538+00:00",
+    "windowsCTestSkipped": 0,
+    "macCoreCommandsPassed": 14,
+    "macCoreSeconds": 369.2531759738922,
+    "macDesktopCtestPassed": 7,
+    "macMainWindowQtSkipped": 4,
+    "macMainWindowQtSkipReasons": [
+      "3 Windows caption only",
+      "1 no live avatar URL"
+    ],
+    "macExtraAllLinkFailure": "reply_suggestion_controller_test: missing media implementations; frozen sources unchanged",
+    "macAppSha256": "d0dcc1ec3ad8c8db79f7cf89c42cda700440844745971f24129fe596c107886c"
+  },
+  "boundary": "Windows resident lifecycle and actual display metadata were verified. The product panel uses a controlled native owned-window source. Native keyboard/mouse acceptance and live supplier visual understanding remain pending. Mac environment and display boundaries are recorded in its report.",
+  "completedAt": "2026-11-07T12:03:38.8630915+08:00",
+  "verificationScope": "Windows packaging and resident screen capture passed; Mac final native capture, OS input and live supplier visual acceptance remain pending.",
+  "macFinalReceiptSha256": "ef4171ca52178c1e79b6e06785ab8db577a46cee9a965497ebbddcf8bec2649f",
+  "privateOutputRelativePath": ".cache/resident-screen-20261107/private-85592c74-20261107T120311"
+}
