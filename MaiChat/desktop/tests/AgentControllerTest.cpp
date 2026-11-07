@@ -635,6 +635,8 @@ void AgentControllerTest::registers_a_screenshot_tool_that_requires_approval_dat
         << QStringLiteral("glm-5.3") << QStringLiteral("glm-5.3") << false;
     QTest::newRow("image-capable")
         << QStringLiteral("glm-5.3-flash") << QStringLiteral("glm-5.3-flash") << true;
+    QTest::newRow("deepseek-cloud-image-capable")
+        << QStringLiteral("deepseek-flash") << QStringLiteral("deepseek-flash") << true;
     QTest::newRow("local-text-only")
         << QStringLiteral("local:qa") << QStringLiteral("local:qa") << false;
 }
@@ -673,7 +675,7 @@ void AgentControllerTest::registers_a_screenshot_tool_that_requires_approval() {
         if (tool.name == "view_image") foundViewImage = true;
         if (tool.name == "list_windows") foundListWindows = true;
     }
-    QCOMPARE(foundScreenshot, maiIsScreenshotSupported());
+    QCOMPARE(foundScreenshot, maiIsScreenshotSupported() && expectedViewImage);
     QCOMPARE(foundViewImage, expectedViewImage);
     QCOMPARE(foundListWindows, maiIsScreenshotSupported());
 }

@@ -51,9 +51,11 @@ public:
     DesktopComputerController(const DesktopComputerController&) = delete;
     DesktopComputerController& operator=(const DesktopComputerController&) = delete;
 
+    // Cancellation is polled during observation and is never retained in session state.
     MaiResult<DesktopComputerObservation> observe(const std::string& sessionId, const std::string& windowTitle,
                                                   const std::string& workspace, bool includeElements,
-                                                  std::uint64_t windowId = 0, bool includeImage = true);
+                                                  std::uint64_t windowId = 0, bool includeImage = true,
+                                                  std::function<bool()> isCanceled = {});
     MaiResult<std::vector<DesktopNativeWindow>> windows();
     MaiResult<DesktopComputerActionResult> perform(const std::string& sessionId, const DesktopComputerAction& action);
     MaiError act(const std::string& sessionId, const std::string& action, const std::string& snapshotId,

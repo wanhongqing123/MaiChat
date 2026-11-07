@@ -1220,6 +1220,18 @@ add_test(NAME desktop_computer_creation_native COMMAND desktop_computer_agent_in
 set_tests_properties(desktop_computer_creation_native PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 240)
 
+# Exercise the real native capture and same-file media path from the Creation
+# Center UI without shell helpers, external providers or OS input injection.
+add_executable(desktop_screenshot_integration_test tests/DesktopScreenshotIntegrationTest.cpp)
+target_link_libraries(desktop_screenshot_integration_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
+  remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
+target_include_directories(desktop_screenshot_integration_test PRIVATE ../../MaiAgent/third_party/nlohmann)
+if(APPLE)
+  target_link_libraries(desktop_screenshot_integration_test PRIVATE "-framework CoreGraphics")
+endif()
+add_test(NAME desktop_screenshot_integration COMMAND desktop_screenshot_integration_test)
+set_tests_properties(desktop_screenshot_integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
 add_executable(desktop_calendar_events_test
   tests/DesktopCalendarEventsTest.cpp
   src/MaiChatTools/DesktopCalendarEvents.cpp

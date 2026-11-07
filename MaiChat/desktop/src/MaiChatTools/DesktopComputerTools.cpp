@@ -22,6 +22,7 @@
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
+#include "MaiPathGuard.h"
 #include "MaiScreenshot.h"
 #include "MaiTool.h"
 
@@ -158,7 +159,11 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(const s
                                                                          const std::string& windowTitle,
                                                                          const std::string& workspace,
                                                                          bool includeElements, std::uint64_t windowId,
-                                                                         bool includeImage) {
+                                                                         bool includeImage,
+                                                                         std::function<bool()> isCanceled) {
+    // Cancellation is checked synchronously and never retained with session state.
+    const auto canceled = [&] { return isCanceled && isCanceled(); };
+    if (canceled()) return {MaiErrorCode::Canceled, "computer observation canceled"};
     if (sessionId.empty() || (windowTitle.empty() == (windowId == 0)) || windowTitle.size() > 500 || workspace.empty())
         return {MaiErrorCode::InvalidInput, "Session, exact window title and workspace are required"};
     const auto listed = impl_->backend->windows();
@@ -179,9 +184,31 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(const s
         return {MaiErrorCode::InvalidInput, "selected window has invalid bounds"};
 
     MaiScreenshot capture;
+    std::string relativeImagePath;
+    std::string captureDirectory;
+    MaiFilePath imageFile;
     if (includeImage) {
+        // The model needs a workspace-relative file reference as well as the
+        // pixels, so the same capture can be delivered without a shell recapture.
+        captureDirectory = maiResolvePathWithinRoot(workspace, "computer");
+        if (captureDirectory.empty())
+            return {MaiErrorCode::InvalidInput, "screenshot directory leaves the Session workspace"};
+        const std::string name = MaiIdGenerator::generate("computer_") + ".png";
+        relativeImagePath = "computer/" + name;
+        const std::string resolved = maiResolvePathWithinRoot(workspace,
+            MaiFilePath::fromUtf8(captureDirectory).append(MaiFilePath::fromUtf8(name)).toUtf8());
+        if (resolved.empty())
+            return {MaiErrorCode::InvalidInput, "screenshot path leaves the Session workspace"};
+        imageFile = MaiFilePath::fromUtf8(resolved);
+        const MaiError created = MaiFileSystem::createDirectories(imageFile.dirName());
+        if (created) return created;
+        if (maiResolvePathWithinRoot(workspace, "computer") != captureDirectory ||
+            maiResolvePathWithinRoot(workspace, imageFile.toUtf8()) != imageFile.toUtf8())
+            return {MaiErrorCode::InvalidInput, "screenshot path changed outside the Session workspace"};
+        if (canceled()) return {MaiErrorCode::Canceled, "computer observation canceled"};
         const MaiError captured = impl_->backend->capture(selected, capture);
         if (captured) return captured;
+        if (canceled()) return {MaiErrorCode::Canceled, "computer observation canceled"};
     }
     // Capture and accessibility reads can take time. Re-check the same ID/PID
     // and bounds before issuing a token; a recycled handle is a different target.
@@ -195,18 +222,21 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(const s
         if (capture.pngBytes.empty() || capture.width <= 0 || capture.height <= 0 ||
             capture.pngBytes.size() > 20 * 1024 * 1024)
             return {MaiErrorCode::Protocol, "selected window screenshot was empty or oversized"};
-        const MaiFilePath folder = MaiFilePath::fromUtf8(workspace).append(MaiFilePath::fromUtf8("computer"));
-        const MaiError created = MaiFileSystem::createDirectories(folder);
-        if (created) return created;
-        const MaiFilePath path = folder.append(MaiFilePath::fromUtf8(MaiIdGenerator::generate("computer_") + ".png"));
-        const std::string nativePath = path.toUtf8();
+        const std::string nativePath = imageFile.toUtf8();
+        if (maiResolvePathWithinRoot(workspace, "computer") != captureDirectory ||
+            maiResolvePathWithinRoot(workspace, nativePath) != nativePath)
+            return {MaiErrorCode::InvalidInput, "screenshot path changed outside the Session workspace"};
+        if (canceled()) return {MaiErrorCode::Canceled, "computer observation canceled"};
         QSaveFile file(QString::fromUtf8(nativePath.c_str(), int(nativePath.size())));
         if (!file.open(QIODevice::WriteOnly) ||
             file.write(reinterpret_cast<const char*>(capture.pngBytes.data()), qint64(capture.pngBytes.size())) !=
                 qint64(capture.pngBytes.size()) ||
             !file.commit())
             return {MaiErrorCode::Internal, "could not save selected window screenshot"};
-        imagePath = path.toUtf8();
+        if (maiResolvePathWithinRoot(workspace, "computer") != captureDirectory ||
+            maiResolvePathWithinRoot(workspace, nativePath) != nativePath)
+            return {MaiErrorCode::InvalidInput, "screenshot path changed outside the Session workspace"};
+        imagePath = nativePath;
     }
 
     Json output{
@@ -219,6 +249,10 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(const s
         {"image_height", capture.height},
         {"has_image", includeImage},
         {"coordinate_space", "relative fractions 0..1 within the captured window"}};
+    if (includeImage) {
+        output["image_path"] = relativeImagePath;
+        output["mime_type"] = "image/png";
+    }
     if (includeElements) {
         const auto elements = impl_->backend->elements(selected);
         if (elements) {
@@ -244,6 +278,7 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(const s
             output["element_error"] = elements.error().message();
         }
     }
+    if (canceled()) return {MaiErrorCode::Canceled, "computer observation canceled"};
     auto state = std::make_shared<ObservedWindow>();
     state->window = selected;
     state->token = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
@@ -512,7 +547,8 @@ public:
             }
             const auto observed =
                 controller_->observe(context.sessionId, args.value("window_title", std::string()), context.root,
-                                     args.value("include_elements", true), id, includeImage);
+                                     args.value("include_elements", true), id, includeImage,
+                                     [&context] { return context.isCanceled(); });
             if (!observed) return failure(observed.error());
             if (observed.value().imagePath.empty()) return MaiToolResult::success(observed.value().json);
             return MaiToolResult::successWithImages(observed.value().json,

@@ -1,5 +1,7 @@
 #include <QCoreApplication>
 #include <QBuffer>
+#include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QImage>
 #include <QTemporaryDir>
@@ -14,12 +16,20 @@
 #include <utility>
 #include <vector>
 
+#if defined(Q_OS_WIN)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <json.hpp>
 
 #include "MaiChatTools/DesktopComputerBackend.h"
 #include "MaiChatTools/DesktopComputerKeys.h"
 #include "MaiChatTools/DesktopComputerTools.h"
 #include "MaiTool.h"
+#include "MaiAgentSendMediaTool.h"
 
 namespace {
 
@@ -60,6 +70,7 @@ public:
     MaiError inputError;
     MaiError readError;
     std::function<void()> onActivate;
+    std::function<void()> onCapture;
 
     MaiResult<std::vector<DesktopNativeWindow>> windows() override {
         events.push_back("windows");
@@ -72,6 +83,7 @@ public:
     MaiError capture(const DesktopNativeWindow& window, MaiScreenshot& output) override {
         ++captureCount;
         capturedWindowId = window.id;
+        if (onCapture) onCapture();
         QImage image(20, 20, QImage::Format_RGB32);
         image.fill(Qt::white);
         QByteArray png;
@@ -268,6 +280,113 @@ void verifyWindowSelection() {
     CHECK(fixture.backend->inputs.empty());
 }
 
+void verifyScreenshotHandoff() {
+    Fixture fixture;
+    MaiToolRegistry registry;
+    auto controller = std::make_shared<DesktopComputerController>(fixture.backend);
+    registerDesktopComputerTools(registry, controller);
+    MaiToolContext context;
+    context.sessionId = "screenshot-delivery";
+    context.root = fixture.workspace.path().toUtf8().toStdString();
+    context.model = "deepseek-flash";
+    const auto captured = registry.find("desktop_computer")->execute(
+        R"({"action":"observe","window_id":"101"})", context);
+    CHECK(!captured.hasError());
+    CHECK(captured.images().size() == 1);
+    if (captured.hasError() || captured.images().size() != 1) return;
+    const Json output = Json::parse(captured.output());
+    const std::string relative = output.value("image_path", std::string());
+    CHECK(!relative.empty());
+    CHECK(QDir::isRelativePath(QString::fromStdString(relative)));
+    if (relative.empty()) return;
+    const QString saved = fixture.workspace.filePath(QString::fromStdString(relative));
+    CHECK(QFileInfo(saved).canonicalFilePath() ==
+          QFileInfo(QString::fromStdString(captured.images().front().path)).canonicalFilePath());
+    const auto delivered = makeMaiAgentSendMediaTool()->execute(
+        Json{{"file_path", relative}, {"type", "image"}}.dump(), context);
+    CHECK(!delivered.hasError());
+    if (!delivered.hasError()) {
+        const Json receipt = Json::parse(delivered.output());
+        CHECK(receipt["path"] == relative);
+        CHECK(receipt["type"] == "image");
+    }
+    CHECK(fixture.backend->captureCount == 1);
+    CHECK(fixture.backend->inputs.empty());
+}
+
+void verifyScreenshotDirectoryBoundary() {
+#if defined(Q_OS_WIN)
+    Fixture fixture;
+    QTemporaryDir outside;
+    CHECK(outside.isValid());
+    const QString link = fixture.workspace.filePath(QStringLiteral("computer"));
+    if (!CreateSymbolicLinkW(reinterpret_cast<LPCWSTR>(link.utf16()),
+                             reinterpret_cast<LPCWSTR>(outside.path().utf16()), 0x3)) {
+        std::fprintf(stderr, "computer directory link boundary not exercised: Win32 %lu\n", GetLastError());
+        return;
+    }
+    const auto observed = fixture.controller.observe("owner", "",
+        fixture.workspace.path().toUtf8().toStdString(), false, 101);
+    CHECK(!observed);
+    if (!observed) CHECK(observed.error().code() == MaiErrorCode::InvalidInput);
+    CHECK(fixture.backend->captureCount == 0);
+    CHECK(QDir(outside.path()).entryList(QDir::Files).isEmpty());
+    CHECK(RemoveDirectoryW(reinterpret_cast<LPCWSTR>(link.utf16())) != 0);
+#endif
+}
+
+void verifyScreenshotDirectoryIsValidatedBeforeCapture() {
+    Fixture fixture;
+    // A file occupying the output directory must fail before requesting pixels.
+    QFile blocker(fixture.workspace.filePath(QStringLiteral("computer")));
+    const bool opened = blocker.open(QIODevice::WriteOnly);
+    CHECK(opened);
+    if (!opened) return;
+    blocker.close();
+
+    MaiToolRegistry registry;
+    auto controller = std::make_shared<DesktopComputerController>(fixture.backend);
+    registerDesktopComputerTools(registry, controller);
+    MaiToolContext context;
+    context.sessionId = "screenshot-invalid-directory";
+    context.root = fixture.workspace.path().toUtf8().toStdString();
+    context.model = "deepseek-flash";
+    MaiTool* tool = registry.find("desktop_computer");
+    CHECK(tool);
+    if (!tool) return;
+    const auto captured = tool->execute(R"({"action":"observe","window_id":"101"})", context);
+    CHECK(captured.hasError());
+    CHECK(captured.images().empty());
+    CHECK(fixture.backend->captureCount == 0);
+    CHECK(QFileInfo(blocker).isFile());
+}
+
+void verifyScreenshotCancellationDoesNotPublishPixels() {
+    Fixture fixture;
+    MaiToolRegistry registry;
+    auto controller = std::make_shared<DesktopComputerController>(fixture.backend);
+    registerDesktopComputerTools(registry, controller);
+    std::atomic<bool> canceled{false};
+    // Cancellation during a successful capture must be observed before saving
+    // or publishing its pixels; an empty output directory may already exist.
+    fixture.backend->onCapture = [&canceled] { canceled.store(true, std::memory_order_relaxed); };
+    MaiToolContext context;
+    context.sessionId = "screenshot-canceled-during-capture";
+    context.root = fixture.workspace.path().toUtf8().toStdString();
+    context.model = "deepseek-flash";
+    context.cancel = &canceled;
+    MaiTool* tool = registry.find("desktop_computer");
+    CHECK(tool);
+    if (!tool) return;
+    const auto captured = tool->execute(R"({"action":"observe","window_id":"101"})", context);
+    CHECK(canceled.load(std::memory_order_relaxed));
+    CHECK(fixture.backend->captureCount == 1);
+    CHECK(captured.hasError());
+    CHECK(captured.error().code() == MaiErrorCode::Canceled);
+    CHECK(captured.images().empty());
+    CHECK(QDir(fixture.workspace.filePath(QStringLiteral("computer"))).entryList(QDir::Files).isEmpty());
+}
+
 void verifyObservationWithoutImage() {
     Fixture fixture;
     // Element-only observation still issues a fresh usable observation without
@@ -280,6 +399,7 @@ void verifyObservationWithoutImage() {
         CHECK(observed.value().imagePath.empty());
         const Json output = Json::parse(observed.value().json);
         CHECK(output["has_image"] == false);
+        CHECK(output.value("image_path", std::string()).empty());
         CHECK(output["window_id"] == "101");
         CHECK(output["elements"].size() == 1);
         firstSnapshot = output.value("snapshot_id", std::string());
@@ -646,6 +766,10 @@ int main(int argc, char** argv) {
     verifyKeyGrammar();
     verifySecureKeyboardInput();
     verifyWindowSelection();
+    verifyScreenshotHandoff();
+    verifyScreenshotDirectoryBoundary();
+    verifyScreenshotDirectoryIsValidatedBeforeCapture();
+    verifyScreenshotCancellationDoesNotPublishPixels();
     verifyObservationWithoutImage();
     verifyOwnedPopupInput();
     verifyDispatchAndSnapshots();

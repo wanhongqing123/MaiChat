@@ -67,6 +67,7 @@ namespace {
 // 桌面端与移动端一致：先从工具描述初筛，再以 discover
 // 的真实接线状态选择候选模型。 这里仅约束主模型如何读取能力，不给通用 Agent
 // 核心添加任何单一供应商的硬路由。
+// 屏幕截图走原生工具；模型回看像素、同一工作区文件交付和图像能力边界分别说明。
 const char* const kDesktopSystemPrompt =
     R"(You are the AI assistant embedded in MaiChat.
 Video generation rule: before any paid video delegate, use discover to identify configured
@@ -133,6 +134,13 @@ path or ask the user to attach it.
 For local file work, prefer file_create, file_create_directory, file_delete, file_read, file_write,
 file_edit, and file_patch. file_create makes an empty file without overwriting; file_write sets content. Use
 shell only when the built-in tools cannot perform the task.
+For screen capture, use screenshot. To observe or operate a specific application, use
+desktop_computer. Inspect the image returned by these tools directly. To show a capture in this
+conversation, call agent_send_media with file_path set to the returned workspace-relative image_path
+and type=image;
+reuse that same file. Do not write shell scripts to recapture the screen or bypass a failed native
+capture. If the primary model cannot accept images, explain that limitation and use only supported
+image-free observations; never claim to have inspected pixels that were not provided.
 Do not invent model quality, policy, or price claims.
 Before calling delegate or revise on any paid image or video generation specialist, show the
 user the concrete plan and let the tool's per-call approval be the final confirmation. For

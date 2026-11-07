@@ -1,5 +1,6 @@
 // 文件作用：验证“定义模型请求、流式响应和客户端接口契约”的正确行为和边界条件。
-// 验证入口：test_text_stream_one_byte_at_a_time、test_text_stream_all_at_once、test_tool_call_fragments；检查可观察结果而非实现细节。
+// 验证入口：test_text_stream_one_byte_at_a_time、test_tool_call_fragments、
+// test_view_image_tool_pixels_reach_next_http_request；检查实际线格式和工具图片回灌。
 // LLM 客户端的测试。
 //
 // 默认不打真实的大模型；可显式启用无账号 Key 的 TLS 探针，服务端拒绝后不会计费。
@@ -21,10 +22,12 @@
 
 #include "MaiModelClient.h"
 #include "MaiAgent.h"
-#include "MaiMemoryStore.h"
-#include "MaiOpenAiClient.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
+#include "MaiIdGenerator.h"
+#include "MaiMemoryStore.h"
+#include "MaiOpenAiClient.h"
+#include "MaiViewImageTool.h"
 
 using nlohmann::json;
 
@@ -45,6 +48,8 @@ struct FakeServer {
     std::thread th;
     int port = 0;
     std::string script;
+    // 连续工具请求需要不同的响应；未指定时仍使用单次响应脚本。
+    std::vector<std::string> scripts;
     std::size_t chunk = 1;
     int status = 200;
     int transientFailures = 0;
@@ -63,6 +68,7 @@ struct FakeServer {
     std::mutex mutex;
     std::string lastBody;
     std::string lastAuthorization;
+    std::vector<std::string> requestBodies;
 
     // 本地假服务器记录真实请求字节，并按测试配置模拟断流、心跳和重试；客户端协议断言不能只对自身数据结构做比较。
     void start() {
@@ -72,6 +78,7 @@ struct FakeServer {
                 std::lock_guard<std::mutex> lock(mutex);
                 lastBody = request.body;
                 lastAuthorization = request.get_header_value("Authorization");
+                requestBodies.push_back(request.body);
             }
             if (requestNumber <= transientFailures) {
                 response.status = 503;
@@ -132,7 +139,9 @@ struct FakeServer {
                     });
                 return;
             }
-            auto text = std::make_shared<std::string>(script);
+            const std::size_t scriptIndex = static_cast<std::size_t>(requestNumber - 1);
+            auto text = std::make_shared<std::string>(
+                scripts.empty() ? script : scripts[std::min(scriptIndex, scripts.size() - 1)]);
             auto pos = std::make_shared<std::size_t>(0);
             const std::size_t step = chunk;
             response.set_chunked_content_provider(
@@ -892,6 +901,179 @@ void test_user_image_is_sent_as_multimodal_content() {
         }
     }
     MaiFileSystem::removeRecursively(root);
+}
+
+// 按实际 HTTP 数据 URL 解码，和独立构造的有效 PNG 比较，避免只验证路径或 MIME 前缀。
+std::string decodeBase64Image(const std::string& encoded) {
+    const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string decoded;
+    unsigned int buffered = 0;
+    int bits = 0;
+    for (const char character : encoded) {
+        if (character == '=') break;
+        const std::size_t digit = alphabet.find(character);
+        CHECK(digit != std::string::npos);
+        if (digit == std::string::npos) return {};
+        buffered = (buffered << 6) | static_cast<unsigned int>(digit);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            decoded.push_back(static_cast<char>((buffered >> bits) & 0xff));
+        }
+    }
+    return decoded;
+}
+
+// 真实 view_image、Agent 工具循环和线格式客户端共同走两次本地 HTTP 请求。
+// 第一轮没有附图，第二轮必须包含工具实际读取的 PNG 像素，而非只有成功回执或文件路径。
+void test_view_image_tool_pixels_reach_next_http_request(MaiWireApi wire) {
+    // 有效的 1x1 RGBA PNG，含完整 IHDR/IDAT/IEND 和 CRC；不复用被测编码器构造期望值。
+    const char pngBytes[] =
+        "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52"
+        "\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        "\x00\x00\x00\x0d\x49\x44\x41\x54\x78\x9c\x63\x60\x68\xf8\xff\x1f"
+        "\x00\x04\x82\x02\x7f\xe7\xd8\x5a\x6c\x00\x00\x00\x00\x49\x45\x4e"
+        "\x44\xae\x42\x60\x82";
+    const std::string png(pngBytes, sizeof(pngBytes) - 1);
+    const MaiFilePath root = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8(MaiIdGenerator::generate("mai-tool-image-wire_")));
+    const MaiError directoryError = MaiFileSystem::createDirectories(root);
+    CHECK(!directoryError);
+    if (directoryError) return;
+    const MaiFilePath image = root.append(MaiFilePath::fromUtf8("photo.png"));
+    const MaiError writeError = MaiFileSystem::writeFile(image, png);
+    CHECK(!writeError);
+    if (writeError) {
+        MaiFileSystem::removeRecursively(root);
+        return;
+    }
+    const std::string imagePath = MaiFileSystem::resolve(image).toUtf8();
+
+    const bool responses = wire == MaiWireApi::Responses;
+    const std::string arguments = json{{"path", "photo.png"}}.dump();
+    FakeServer fake;
+    fake.chunk = 100000;
+    if (responses) {
+        const json call{{"type", "function_call"},
+                        {"id", "fc_view_image"},
+                        {"call_id", "call_view_image"},
+                        {"name", "view_image"},
+                        {"arguments", arguments}};
+        const json answer{
+            {"type", "message"},
+            {"id", "msg_image_answer"},
+            {"role", "assistant"},
+            {"content",
+             json::array({json{{"type", "output_text"}, {"text", "Pixels received."}}})}};
+        fake.scripts = {
+            sse(json{{"type", "response.completed"},
+                     {"response", {{"status", "completed"}, {"output", json::array({call})}}}}),
+            sse(json{{"type", "response.completed"},
+                     {"response", {{"status", "completed"}, {"output", json::array({answer})}}}})};
+    } else {
+        fake.scripts = {tool_delta(0, "call_view_image", "view_image", arguments.c_str()) + kDone,
+                        text_delta("Pixels received.") + kDone};
+    }
+    fake.start();
+
+    std::vector<MaiMessage> history;
+    {
+        MaiModelConfig config;
+        config.baseUrl = fake.base();
+        config.wire = wire;
+        config.maxRetries = 0;
+        config.connectTimeoutSeconds = 5;
+        config.totalTimeoutSeconds = 10;
+        auto tools = std::make_unique<MaiToolRegistry>();
+        tools->add(makeMaiViewImageTool());
+        MaiAgent::Options options;
+        options.defaultModel = "deepseek-flash";
+        options.maxToolIterations = 3;
+        MaiAgent agent(makeMaiMemoryStore(), makeMaiModelClient(config), std::move(tools), options);
+        const auto session = agent.submit(MaiCreateSession{root.toUtf8(), "", ""});
+        CHECK(session);
+        if (session) {
+            CHECK(agent.submit(MaiSendPrompt{session.value(), "Inspect photo.png."}));
+            agent.waitIdle();
+            history = agent.listMessages(session.value());
+        }
+    }
+    // Agent 已退出，临时输入不再被后台线程引用；所有断言只读取已经接收的 HTTP 字节。
+    MaiFileSystem::removeRecursively(root);
+    CHECK(!MaiFileSystem::exists(root));
+    std::vector<std::string> bodies;
+    {
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        bodies = fake.requestBodies;
+    }
+    CHECK(fake.requestCount.load() == 2);
+    CHECK(bodies.size() == 2);
+    CHECK(history.size() == 2);
+    if (history.size() == 2) {
+        CHECK(history.back().completed != 0);
+        CHECK(history.back().text() == "Pixels received.");
+        bool completedTool = false;
+        bool persistedImage = false;
+        for (const MaiMessagePart& part : history.back().parts) {
+            if (const auto* tool = std::get_if<MaiToolPart>(&part.body))
+                completedTool |=
+                    tool->tool == "view_image" && tool->state == MaiToolState::Completed;
+            if (const auto* pixels = std::get_if<MaiImagePart>(&part.body))
+                persistedImage |= pixels->path == imagePath && pixels->mimeType == "image/png";
+        }
+        CHECK(completedTool && persistedImage);
+    }
+    if (bodies.size() != 2) return;
+    CHECK(bodies.front().find("data:image/") == std::string::npos);
+    const json first = json::parse(bodies.front(), nullptr, false);
+    const json second = json::parse(bodies.back(), nullptr, false);
+    CHECK(!first.is_discarded() && !second.is_discarded());
+    if (first.is_discarded() || second.is_discarded()) return;
+    CHECK(first["model"] == "deepseek-flash");
+    CHECK(second["model"] == "deepseek-flash");
+    CHECK(first["tools"].size() == 1);
+    if (first["tools"].size() == 1)
+        CHECK((responses ? first["tools"][0]["name"] : first["tools"][0]["function"]["name"]) ==
+              "view_image");
+    const json& messages = second[responses ? "input" : "messages"];
+    CHECK(messages.is_array() && messages.size() == 4);
+    if (!messages.is_array() || messages.size() != 4) return;
+    CHECK(messages[0]["role"] == "user");
+    if (responses) {
+        CHECK(messages[1]["type"] == "function_call");
+        CHECK(messages[1]["call_id"] == "call_view_image");
+        CHECK(messages[1]["name"] == "view_image");
+        CHECK(messages[1]["arguments"] == arguments);
+        CHECK(messages[2]["type"] == "function_call_output");
+        CHECK(messages[2]["call_id"] == "call_view_image");
+        CHECK(messages[2]["output"].get<std::string>().find("photo.png") != std::string::npos);
+        CHECK(messages[3]["type"] == "message");
+    } else {
+        CHECK(messages[1]["role"] == "assistant");
+        CHECK(messages[1]["tool_calls"].size() == 1);
+        CHECK(messages[1]["tool_calls"][0]["id"] == "call_view_image");
+        CHECK(messages[1]["tool_calls"][0]["function"]["name"] == "view_image");
+        CHECK(messages[1]["tool_calls"][0]["function"]["arguments"] == arguments);
+        CHECK(messages[2]["role"] == "tool");
+        CHECK(messages[2]["tool_call_id"] == "call_view_image");
+        CHECK(messages[2]["content"].get<std::string>().find("photo.png") != std::string::npos);
+    }
+    CHECK(messages[3]["role"] == "user");
+    const json& observation = messages[3]["content"];
+    CHECK(observation.is_array() && observation.size() == 2);
+    if (!observation.is_array() || observation.size() != 2) return;
+    CHECK(observation[0]["type"] == (responses ? "input_text" : "text"));
+    CHECK(observation[0]["text"].get<std::string>().find("Image returned") != std::string::npos);
+    CHECK(observation[1]["type"] == (responses ? "input_image" : "image_url"));
+    const json& encoded =
+        responses ? observation[1]["image_url"] : observation[1]["image_url"]["url"];
+    CHECK(encoded.is_string());
+    if (!encoded.is_string()) return;
+    const std::string dataUrl = encoded.get<std::string>();
+    const std::string prefix = "data:image/png;base64,";
+    CHECK(dataUrl.compare(0, prefix.size(), prefix) == 0);
+    if (dataUrl.compare(0, prefix.size(), prefix) == 0)
+        CHECK(decodeBase64Image(dataUrl.substr(prefix.size())) == png);
 }
 
 // 验证历史大图在模型请求中使用有界缓存预览，避免反复解码完整原图。
@@ -1929,6 +2111,8 @@ int main() {
     test_wire_shape_of_request();
     test_no_tools_field_when_empty();
     test_user_image_is_sent_as_multimodal_content();
+    test_view_image_tool_pixels_reach_next_http_request(MaiWireApi::ChatCompletions);
+    test_view_image_tool_pixels_reach_next_http_request(MaiWireApi::Responses);
     test_large_historical_image_uses_cached_bounded_preview();
     test_absolute_desktop_image_can_be_outside_the_workspace();
     test_missing_historical_image_does_not_break_later_turns();

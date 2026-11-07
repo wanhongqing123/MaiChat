@@ -1,5 +1,5 @@
 // 文件作用：把屏幕截图能力封装为 Agent 工具。
-// 直接依赖：MaiFilePath.h、MaiFileSystem.h、MaiIdGenerator.h；本文件在这些接口之间完成调用与结果转换。
+// 直接依赖：MaiFilePath.h、MaiFileSystem.h、MaiIdGenerator.h、MaiPathGuard.h；完成捕获、边界校验与结果转换。
 #include "MaiScreenshotTool.h"
 
 #include <memory>
@@ -10,6 +10,7 @@
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
+#include "MaiPathGuard.h"
 #include "MaiScreenshot.h"
 
 using json = nlohmann::json;
@@ -23,11 +24,21 @@ public:
     }
 
     std::string description() const override {
-        // 屏幕或窗口截图必须通过可见区域和授权边界，返回图像供后续检查。
+        // 屏幕或窗口截图必须通过可见区域和授权边界；现成截图直接检查，不用脚本重复捕获。
+        // JSON 返回工作区相对路径、类型和尺寸；用同一路径交给媒体工具，展示这份原截图。
         return "Capture a display or a visible top-level window and inspect the returned image. "
                "Use mode=display for the display containing the mouse pointer. Use mode=window "
                "with windowTitle when the user names a specific window; call list_windows first "
-               "when the exact title is unknown.";
+               "when the exact title is unknown. The JSON result includes image_path relative to "
+               "this Agent workspace, type, mime_type, width, height, and mode. To show this same "
+               "screenshot in the current conversation, call agent_send_media with "
+               "file_path set to the returned image_path and type=image. Do not recapture it "
+               "with shell scripts.";
+    }
+
+    bool isAvailableForModel(const std::string& model) const override {
+        // 与 view_image 共用当前已接线的文本模型边界，避免宣告不能回灌像素的截图工具。
+        return model != "glm-5.3" && model.compare(0, 6, "local:") != 0;
     }
 
     std::string parametersSchema() const override {
@@ -47,7 +58,8 @@ public:
     }
 
     // 截图涉及屏幕隐私，审批后才解析窗口或显示器目标；目标无效时不能回退为整屏截图。
-    // 图像交给受控工作区保存，结果只返回可引用路径和尺寸，不在工具回包里携带像素字节。
+    // 图像保存到会话工作区；JSON 相对路径与图片附件绝对路径引用同一文件，供后续交付和检查。
+    // 桌面宿主即使允许读取工作区外文件，截图输出仍必须经过工作区边界校验。
     MaiToolResult execute(const std::string& argumentsJson,
                           const MaiToolContext& context) override {
         const json arguments = json::parse(argumentsJson, nullptr, /*allow_exceptions=*/false);
@@ -85,16 +97,56 @@ public:
         if (context.isCanceled()) {
             return MaiToolResult::failure(MaiErrorCode::Canceled, "screen capture was canceled");
         }
-        if (context.model == "glm-5.3") {
+        if (!isAvailableForModel(context.model)) {
+            if (context.model != "glm-5.3")
+                return MaiToolResult::failure(
+                    MaiErrorCode::NotSupported,
+                    "The current local primary model accepts text only and cannot inspect "
+                    "screenshots. Ask the user to select an image-capable primary model.");
             return MaiToolResult::failure(
                 MaiErrorCode::NotSupported,
                 "The current glm-5.3 model accepts text only. Ask the user to switch to "
                 "glm-5.3-flash before taking a screenshot.");
         }
+        if (context.root.empty() ||
+            !MaiFileSystem::isDirectory(MaiFilePath::fromUtf8(context.root))) {
+            return MaiToolResult::failure(MaiErrorCode::NotConfigured,
+                                          "screenshot requires an accessible Agent workspace");
+        }
+
+        // Windows 对不存在文件的解析只做词法归一化，必须先独立解析已存在的截图目录链接。
+        const std::string directoryPath = maiResolvePathWithinRoot(context.root, "screenshots");
+        if (directoryPath.empty()) {
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "screenshot output leaves the Agent workspace");
+        }
+        const MaiFilePath directory = MaiFilePath::fromUtf8(directoryPath);
+        const MaiError directoryError = MaiFileSystem::createDirectories(directory);
+        if (directoryError.hasError()) {
+            return MaiToolResult::failure(directoryError.code(), directoryError.message());
+        }
+        const std::string fileName = MaiIdGenerator::generate("screenshot_") + ".png";
+        const std::string relativePath = "screenshots/" + fileName;
+        const std::string resolvedPath = maiResolvePathWithinRoot(
+            context.root, directory.append(MaiFilePath::fromUtf8(fileName)).toUtf8());
+        const MaiFilePath path = MaiFilePath::fromUtf8(resolvedPath);
+        // 目录创建与捕获可能阻塞；每个阶段重新解析链接，变化时拒绝写入或交付失效路径。
+        const auto outputIsWithinWorkspace = [&] {
+            return !resolvedPath.empty() &&
+                   maiResolvePathWithinRoot(context.root, "screenshots") == directoryPath &&
+                   maiResolvePathWithinRoot(context.root, resolvedPath) == resolvedPath;
+        };
+        if (!outputIsWithinWorkspace() || MaiFileSystem::exists(path)) {
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "screenshot output must be a new workspace file");
+        }
         if (!maiIsScreenshotSupported()) {
             return MaiToolResult::failure(
                 MaiErrorCode::NotSupported,
                 "native screen capture is not supported on this platform");
+        }
+        if (context.isCanceled()) {
+            return MaiToolResult::failure(MaiErrorCode::Canceled, "screen capture was canceled");
         }
 
         MaiScreenshot screenshot;
@@ -107,16 +159,13 @@ public:
                                           "native screen capture returned an empty image");
         }
 
-        const MaiFilePath directory = MaiFileSystem::temporaryDirectory()
-                                          .append(MaiFilePath::fromUtf8("MaiAgent"))
-                                          .append(MaiFilePath::fromUtf8("screenshots"));
-        const MaiError directoryError = MaiFileSystem::createDirectories(directory);
-        if (directoryError.hasError()) {
-            return MaiToolResult::failure(directoryError.code(), directoryError.message());
+        if (context.isCanceled()) {
+            return MaiToolResult::failure(MaiErrorCode::Canceled, "screen capture was canceled");
         }
-
-        const std::string fileName = MaiIdGenerator::generate("screenshot_") + ".png";
-        const MaiFilePath path = directory.append(MaiFilePath::fromUtf8(fileName));
+        if (!outputIsWithinWorkspace()) {
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "screenshot output left the Agent workspace");
+        }
         const std::string bytes(reinterpret_cast<const char*>(screenshot.pngBytes.data()),
                                 screenshot.pngBytes.size());
         const MaiError writeError = MaiFileSystem::writeFile(path, bytes);
@@ -124,12 +173,14 @@ public:
             return MaiToolResult::failure(writeError.code(), writeError.message());
         }
 
-        const std::string target = request.target == MaiScreenshotTarget::WindowByTitle
-                                       ? "the requested window"
-                                       : "the current display";
-        const std::string output = "Captured " + target + " at " +
-                                   std::to_string(screenshot.width) + "x" +
-                                   std::to_string(screenshot.height) + ".";
+        if (!outputIsWithinWorkspace()) {
+            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                          "screenshot output left the Agent workspace");
+        }
+        const std::string output = json{{"image_path", relativePath},  {"type", "image"},
+                                        {"mime_type", "image/png"},    {"width", screenshot.width},
+                                        {"height", screenshot.height}, {"mode", mode}}
+                                       .dump();
         return MaiToolResult::successWithImages(output, {MaiToolImage{path.toUtf8(), "image/png"}});
     }
 };
