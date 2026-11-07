@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,10 @@ struct MaiScreenshot {
     // PNG 的最终像素尺寸；失败时都是 0。
     int width = 0;
     int height = 0;
+    // 最近完整原生帧的进程内序号和接收时间（Unix 毫秒）。静止画面可沿用同一帧，
+    // 不把本次 PNG 编码时间冒充帧更新时间；无元数据的平台保持 0。
+    std::uint64_t frameSequence = 0;
+    std::int64_t frameReceivedAtMs = 0;
 };
 
 enum class MaiScreenshotTarget {
@@ -33,6 +38,19 @@ struct MaiScreenshotRequest {
     // 此模式忽略 windowTitle；标识无效、目标不可见或最小化时返回错误，不回退到标题或显示器。
     // 原生标识可能被系统回收重用，调用方须在截图前后核对窗口所属进程和边界。
     std::uint64_t windowId = 0;
+    // 可选线程安全取消检查；后端仅在本次阻塞调用返回前使用，不能保留或在返回后调用。
+    std::function<bool()> isCanceled;
+};
+
+// 采集后端的普通诊断快照。计数按进程累计，stop 不清零；不把它当作图像内容或授权回执。
+struct MaiScreenshotCaptureState {
+    bool workerRunning = false;
+    bool capturing = false;
+    std::uint64_t workerStarts = 0;
+    // 仅计可直接观测的图形设备创建；没有此类公开对象的平台保持 0。
+    std::uint64_t deviceCreations = 0;
+    std::uint64_t sessionStarts = 0;
+    std::uint64_t framesReceived = 0;
 };
 
 // 当前平台是否提供原生屏幕捕获。调用方只有在返回 true 时才应把 screenshot 工具暴露给模型；
@@ -45,6 +63,11 @@ bool maiIsScreenshotSupported();
 // macOS 14+ 使用 ScreenCaptureKit；不依赖 Qt 或外部截屏进程。macOS 需要用户授予屏幕录制权限，
 // 授权后可能需要重启 App。失败时 screenshot 会保持为空，并返回可供模型纠正的错误。
 MaiError maiCaptureScreenshot(const MaiScreenshotRequest& request, MaiScreenshot& screenshot);
+
+// 读取线程安全状态，不启动采集。停止会释放原生会话并收回工作线程；重复停止无副作用。
+// 与停止并发的截图应结束等待并失败，后续新的调用可以重新启动后端。
+MaiScreenshotCaptureState maiScreenshotCaptureState();
+MaiError maiStopScreenshotCapture();
 
 // 枚举当前交互桌面上可按标题捕获的可见顶层窗口。成功但没有窗口时返回空数组；不支持时返回
 // NotSupported。标题统一转换为 UTF-8，顺序不保证稳定，调用方不能把位置当作窗口标识。

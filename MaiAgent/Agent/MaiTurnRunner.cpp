@@ -647,7 +647,9 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
                           "tool \"" + call.name + "\" is unavailable for the current primary model")
                     : MaiToolResult::failure(MaiErrorCode::NotFound,
                                              "no tool named \"" + call.name + "\" is registered");
-        } else if (context.root.empty()) {
+        } else if (context.root.empty() && tool->requiresWorkingDirectory(call.arguments)) {
+            // 文件工具仍然必须有显式工作目录；纯清理调用可由工具声明独立执行，
+            // 例如会话尚无工作区时也能释放进程中的常驻采集资源。
             result = MaiToolResult::failure(
                 MaiErrorCode::InvalidInput,
                 "this session has no working directory, so file tools are unavailable");

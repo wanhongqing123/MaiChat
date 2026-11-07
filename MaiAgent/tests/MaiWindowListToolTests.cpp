@@ -1,5 +1,7 @@
 // 文件作用：验证“列举可见窗口及其基础信息”的正确行为和边界条件。
-// 验证入口：test_contract_and_registration、test_lists_a_visible_native_window；检查可观察结果而非实现细节。
+// 验证入口：test_contract_and_registration、test_lists_a_visible_native_window；
+// 普通工厂保留兼容，但内置模型工具表不再提供窗口枚举。
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -31,7 +33,13 @@ void test_contract_and_registration() {
 
     MaiToolRegistry registry;
     registerMaiBuiltinTools(registry);
-    CHECK((registry.find("list_windows") != nullptr) == maiIsScreenshotSupported());
+    CHECK(registry.find("list_windows") == nullptr);
+    for (const std::string model : {"deepseek-flash", "glm-5.3-flash", "glm-5.3", "local:qa"}) {
+        CHECK(registry.findForModel("list_windows", model) == nullptr);
+        const auto specs = registry.specs(model);
+        CHECK(std::none_of(specs.begin(), specs.end(),
+                           [](const MaiToolSpec& spec) { return spec.name == "list_windows"; }));
+    }
 }
 
 void test_lists_a_visible_native_window() {
@@ -55,9 +63,14 @@ void test_lists_a_visible_native_window() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool validationOnly = argc == 2 && std::string(argv[1]) == "--request-validation-only";
+    if (argc > 1 && !validationOnly) {
+        std::printf("usage: MaiWindowListToolTests [--request-validation-only]\n");
+        return 2;
+    }
     test_contract_and_registration();
-    test_lists_a_visible_native_window();
+    if (!validationOnly) test_lists_a_visible_native_window();
     if (failures == 0) std::printf("window list tool tests passed\n");
     return failures == 0 ? 0 : 1;
 }

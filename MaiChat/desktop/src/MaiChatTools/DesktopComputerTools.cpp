@@ -453,9 +453,9 @@ public:
     }
     std::string description() const override {
         return "Operate visible PC applications through native keyboard/mouse input. First list windows, "
-               "then observe one window_id (or a unique exact window_title) to get its screenshot, "
-               "Accessibility/UIA elements and snapshot_id. Models without image input can set "
-               "include_image=false to use the window and element tree without a screenshot. "
+               "then observe one window_id (or a unique exact window_title) to get window metadata, "
+               "Accessibility/UIA elements and snapshot_id. Observation does not capture window images. "
+               "Use the screenshot tool for screen images. "
                "Use window-relative 0..1 coordinates for "
                "click, double_click, right_click, drag and scroll; focus activates that window. "
                "key accepts shortcuts such as Ctrl+A, Cmd+A or Shift+Home. type enters Unicode; "
@@ -474,7 +474,7 @@ public:
         return R"({"type":"object","properties":{
           "action":{"type":"string","enum":["list","observe","focus","click","double_click","right_click","drag","type","replace_text","key","scroll","verify","clear"]},
           "window_title":{"type":"string","maxLength":500},"window_id":{"type":"string"},
-          "include_elements":{"type":"boolean"},"include_image":{"type":"boolean"},"snapshot_id":{"type":"string"},
+          "include_elements":{"type":"boolean"},"snapshot_id":{"type":"string"},
           "x_ratio":{"type":"number","minimum":0,"maximum":1},"y_ratio":{"type":"number","minimum":0,"maximum":1},
           "to_x_ratio":{"type":"number","minimum":0,"maximum":1},"to_y_ratio":{"type":"number","minimum":0,"maximum":1},
           "duration_ms":{"type":"integer","minimum":1,"maximum":200},
@@ -528,17 +528,15 @@ public:
             return MaiToolResult::success(output.dump());
         }
         if (action == "observe") {
-            if (!exact({"action", "window_title", "window_id", "include_elements", "include_image"}) ||
+            if (args.contains("include_image"))
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "observe returns metadata only; use screenshot for screen images");
+            if (!exact({"action", "window_title", "window_id", "include_elements"}) ||
                 (args.contains("window_title") == args.contains("window_id")) ||
                 (args.contains("window_title") && !args["window_title"].is_string()) ||
-                (args.contains("include_elements") && !args["include_elements"].is_boolean()) ||
-                (args.contains("include_image") && !args["include_image"].is_boolean()) || context.root.empty())
+                (args.contains("include_elements") && !args["include_elements"].is_boolean()) || context.root.empty())
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                              "observe needs an exact window title and workspace");
-            const bool includeImage = args.value("include_image", context.model != "glm-5.3");
-            if (context.model == "glm-5.3" && includeImage)
-                return MaiToolResult::failure(MaiErrorCode::NotSupported,
-                                              "the current model cannot inspect screenshots");
+                                              "observe needs one exact window title or ID and a workspace");
             std::uint64_t id = 0;
             if (args.contains("window_id")) {
                 const auto parsed = windowIdFrom(args["window_id"]);
@@ -547,12 +545,10 @@ public:
             }
             const auto observed =
                 controller_->observe(context.sessionId, args.value("window_title", std::string()), context.root,
-                                     args.value("include_elements", true), id, includeImage,
+                                     args.value("include_elements", true), id, false,
                                      [&context] { return context.isCanceled(); });
             if (!observed) return failure(observed.error());
-            if (observed.value().imagePath.empty()) return MaiToolResult::success(observed.value().json);
-            return MaiToolResult::successWithImages(observed.value().json,
-                                                    {MaiToolImage{observed.value().imagePath, "image/png"}});
+            return MaiToolResult::success(observed.value().json);
         }
         if (action == "clear") {
             if (!exact({"action"}))

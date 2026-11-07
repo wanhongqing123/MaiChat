@@ -1,6 +1,8 @@
 // Native integration across two owned processes. The child only hosts a Qt
 // editor; the parent uses the production tool/controller/native backend. Child
 // state is an independent assertion source, never a substitute for UIA readback.
+// Tool observations are metadata/UIA only. Native screenshots remain separate
+// controlled fixture evidence produced by the ordinary controller API.
 #include <QApplication>
 #include <QDir>
 #include <QElapsedTimer>
@@ -193,10 +195,15 @@ enum class InputPosition { None, Center, TextStart, SelectionDrag };
 
 class NativeWorkflow {
 public:
-    NativeWorkflow(MaiTool& tool, MaiToolContext context, DesktopNativeWindow window,
-                   QProcess& child, QString statePath, QString evidencePath)
-        : tool_(tool), context_(std::move(context)), window_(std::move(window)),
-          child_(child), statePath_(std::move(statePath)), evidencePath_(std::move(evidencePath)) {}
+    NativeWorkflow(MaiTool& tool, DesktopComputerController& controller, MaiToolContext context,
+                   DesktopNativeWindow window, QProcess& child, QString statePath, QString evidencePath)
+        : tool_(tool),
+          controller_(controller),
+          context_(std::move(context)),
+          window_(std::move(window)),
+          child_(child),
+          statePath_(std::move(statePath)),
+          evidencePath_(std::move(evidencePath)) {}
 
     ~NativeWorkflow() {
         if (evidencePath_.isEmpty()) return;
@@ -220,19 +227,46 @@ public:
     }
 
     bool observe(const QString& stage) {
-        if (!call({{"action", "observe"}, {"window_id", std::to_string(window_.id)},
-                   {"include_elements", true}, {"include_image", true}}, stage)) return false;
+        if (!call({{"action", "observe"}, {"window_id", std::to_string(window_.id)}, {"include_elements", true}},
+                  stage))
+            return false;
         snapshot_ = output_;
-        if (!expect(snapshot_.value("window_id", std::string()) == std::to_string(window_.id), "observed a different window ID") ||
-            !expect(snapshot_.value("process_id", std::uint64_t(0)) == window_.processId, "observed a different process ID") ||
+        if (!expect(snapshot_.value("window_id", std::string()) == std::to_string(window_.id),
+                    "observed a different window ID") ||
+            !expect(snapshot_.value("process_id", std::uint64_t(0)) == window_.processId,
+                    "observed a different process ID") ||
             !expect(!snapshot_.value("snapshot_id", std::string()).empty(), "observation omitted its snapshot token") ||
-            !expect(snapshot_.value("has_image", false), "native observation omitted its WGC image") ||
-            !expect(lastImages_.size() == 1, "native observation did not return one image attachment")) return false;
-        const QString source = QString::fromStdString(lastImages_.front().path);
+            !expect(!snapshot_.contains("image_path"), "computer metadata observation exposed an image path") ||
+            !expect(!snapshot_.value("has_image", false), "computer metadata observation claimed an image") ||
+            !expect(lastImages_.empty(), "computer metadata observation returned image attachments"))
+            return false;
+
+        // Preserve native screenshots through the ordinary API under a distinct
+        // session so fixture evidence cannot replace the model's snapshot token
+        // or become a model attachment. The exact self-owned window ID is fixed.
+        const auto evidence =
+            controller_.observe(context_.sessionId + "-native-evidence", "", context_.root, false, window_.id, true);
+        if (!evidence) {
+            transcript_.push_back({{"stage", stage.toUtf8().toStdString()},
+                                   {"ordinary_fixture_capture_error", evidence.error().message()}});
+            if (!inputAttempted_ && (evidence.error().code() == MaiErrorCode::Busy ||
+                                     evidence.error().code() == MaiErrorCode::NotConfigured ||
+                                     evidence.error().code() == MaiErrorCode::NotSupported))
+                exitCode_ = unavailable(evidence.error().message());
+            else
+                exitCode_ = 1;
+            return false;
+        }
+        const QString source = QString::fromStdString(evidence.value().imagePath);
         if (!expect(QFileInfo(source).size() > 100, "native window screenshot is empty")) return false;
+        transcript_.push_back(
+            {{"stage", stage.toUtf8().toStdString()},
+             {"ordinary_fixture_capture",
+              {{"window_id", std::to_string(window_.id)}, {"has_image", true}, {"model_attachment", false}}}});
         if (!evidencePath_.isEmpty()) {
-            const QString destination = QDir(evidencePath_).filePath(
-                QStringLiteral("%1-%2.png").arg(screenshotCount_++, 2, 10, QLatin1Char('0')).arg(stage));
+            const QString destination =
+                QDir(evidencePath_)
+                    .filePath(QStringLiteral("%1-%2.png").arg(screenshotCount_++, 2, 10, QLatin1Char('0')).arg(stage));
             QFile::remove(destination);
             if (!expect(QFile::copy(source, destination), "could not preserve native window screenshot")) return false;
         }
@@ -325,11 +359,13 @@ private:
         output_ = Json::parse(result.output(), nullptr, false);
         lastImages_ = result.images();
         record["result"] = output_;
+        record["image_attachment_count"] = lastImages_.size();
         transcript_.push_back(record);
         return expect(output_.is_object(), "native computer tool returned invalid JSON");
     }
 
     MaiTool& tool_;
+    DesktopComputerController& controller_;
     MaiToolContext context_;
     DesktopNativeWindow window_;
     QProcess& child_;
@@ -428,13 +464,14 @@ int runParent() {
 #endif
 
     MaiToolRegistry registry;
-    registerDesktopComputerTools(registry, std::make_shared<DesktopComputerController>());
+    auto controller = std::make_shared<DesktopComputerController>();
+    registerDesktopComputerTools(registry, controller);
     MaiTool* tool = registry.find("desktop_computer");
     if (!tool) return 1;
     MaiToolContext context;
     context.sessionId = "native-owned-editor-" + std::to_string(childPid);
     context.root = workspace.path().toUtf8().toStdString();
-    NativeWorkflow workflow(*tool, context, native, editor.process, statePath, evidencePath);
+    NativeWorkflow workflow(*tool, *controller, context, native, editor.process, statePath, evidencePath);
     const std::string draft = QStringLiteral("原生输入中文草稿").toUtf8().toStdString();
     const std::string replacement = QStringLiteral("Ctrl+A 后的中文替换").toUtf8().toStdString();
     const std::string finalText = QStringLiteral("双进程原生验证：中文内容已替换。").toUtf8().toStdString();

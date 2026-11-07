@@ -6,6 +6,14 @@ bool maiIsScreenshotSupported() {
     return false;
 }
 
+MaiScreenshotCaptureState maiScreenshotCaptureState() {
+    return {};
+}
+
+MaiError maiStopScreenshotCapture() {
+    return {};
+}
+
 MaiError maiCaptureScreenshot(const MaiScreenshotRequest&, MaiScreenshot& screenshot) {
     screenshot = MaiScreenshot{};
     return MaiError::make(MaiErrorCode::NotSupported,

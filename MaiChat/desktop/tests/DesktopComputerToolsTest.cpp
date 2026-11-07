@@ -53,6 +53,7 @@ int main(int argc, char** argv) {
     registerDesktopComputerTools(registry, controller);
     MaiTool* tool = registry.find("desktop_computer");
     CHECK(tool && nlohmann::json::parse(tool->parametersSchema()).is_object());
+    CHECK(!nlohmann::json::parse(tool->parametersSchema())["properties"].contains("include_image"));
     CHECK(tool->requiresPerCallApproval(R"({"action":"observe"})"));
     CHECK(tool->requiresPerCallApproval(R"({"action":"click"})"));
     CHECK(!tool->requiresPerCallApproval(R"({"action":"clear"})"));
@@ -118,8 +119,9 @@ int main(int argc, char** argv) {
 #endif
     QTemporaryDir workspace;
     CHECK(workspace.isValid());
-    const auto observed = controller->observe("owner", native.title,
-        workspace.path().toUtf8().toStdString(), true);
+    // Ordinary controller observations may capture this self-owned fixture for
+    // native evidence; model-facing desktop_computer.observe is metadata only.
+    const auto observed = controller->observe("owner", native.title, workspace.path().toUtf8().toStdString(), true);
     if (!observed) {
         std::fprintf(stderr, "computer observe unavailable: %s\n",
                      observed.error().message().c_str());

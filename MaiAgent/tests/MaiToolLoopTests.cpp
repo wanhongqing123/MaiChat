@@ -1,6 +1,7 @@
 // 文件作用：验证“MaiToolLoop”的正确行为和边界条件。
 // 验证入口：test_tool_loop_closes、test_balance_error_routes_back_to_main_model、
-// test_tool_image_is_persisted_and_fed_back_to_the_model；检查可观察结果而非实现细节。
+// test_tool_image_is_persisted_and_fed_back_to_the_model、
+// test_screenshot_stop_without_workspace_keeps_file_tools_blocked；检查可观察结果而非实现细节。
 // 工具循环测试：模型说要调工具 → 我们执行 → 结果回灌 → 它接着答。
 //
 // 这是 agent 之所以是 agent 的地方，也是 M3 唯一真正需要证明的东西。
@@ -17,6 +18,8 @@
 #include <thread>
 #include <vector>
 
+#include <json.hpp>
+
 #include "MaiAgent.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
@@ -24,6 +27,7 @@
 #include "MaiFileTools.h"
 #include "MaiFakeModelClient.h"
 #include "MaiIdGenerator.h"
+#include "MaiScreenshotTool.h"
 #include "MaiViewImageTool.h"
 
 namespace fs = std::filesystem;
@@ -331,6 +335,77 @@ void test_tool_loop_closes() {
     for (const auto& e : recorder.all())
         if (e.type == MaiEventType::MessagePartUpdated) ++partUpdates;
     CHECK(partUpdates >= 2);  // 至少 running 和 completed 各一次
+}
+
+void test_screenshot_stop_without_workspace_keeps_file_tools_blocked() {
+    // 使用真实截图工具和文件工具经过完整 Agent dispatch，不能只证明直接 execute 绕过了工作区检查。
+    // 空目录会话中的 capture/read 必须在原生采集或文件访问之前拒绝；整个用例不采屏、不输入。
+    auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+        callTurn("screenshot", R"({"action":"stop"})", "stop_without_workspace"),
+        callTurn("screenshot", R"({"action":"capture"})", "capture_without_workspace"),
+        callTurn("file_read", R"({"path":"blocked.txt"})", "read_without_workspace"),
+        sayTurn("Cleanup completed; workspace access remains unavailable.")});
+    MaiFakeModelClient* observed = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(makeMaiScreenshotTool());
+    registerMaiFileTools(*tools);
+    MaiAgent::Options options;
+    options.defaultModel = "deepseek-flash";
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools), options);
+    const auto created = agent.submit(MaiCreateSession{"", "", "deepseek-flash"});
+    CHECK(created);
+    if (!created) return;
+    CHECK(agent.submit(
+        MaiSendPrompt{created.value(), "Stop capture without changing workspace access."}));
+    agent.waitIdle();
+
+    CHECK(observed->requestCount() == 4);
+    CHECK(agent.listPendingPermissions().empty());
+    bool stopFedBack = false;
+    for (std::size_t index = 0; index < observed->requestCount(); ++index) {
+        const MaiModelRequest request = observed->request(index);
+        CHECK(request.model == "deepseek-flash");
+        CHECK(request.workingDirectory.empty());
+        for (const MaiModelMessage& message : request.messages) {
+            CHECK(message.images.empty());
+            if (message.role == MaiModelRole::ToolResult &&
+                message.toolCallId == "stop_without_workspace") {
+                const auto output = nlohmann::json::parse(message.content, nullptr, false);
+                CHECK(output == nlohmann::json({{"action", "stop"}, {"state", "stopped"}}));
+                stopFedBack = true;
+            }
+        }
+    }
+    CHECK(stopFedBack);
+
+    const auto history = agent.listMessages(created.value());
+    CHECK(history.size() == 2);
+    if (history.size() != 2) return;
+    CHECK(history.back().completed != 0);
+    CHECK(history.back().text() == "Cleanup completed; workspace access remains unavailable.");
+    bool stopped = false;
+    int workspaceRejections = 0;
+    for (const MaiMessagePart& part : history.back().parts) {
+        CHECK(!std::holds_alternative<MaiImagePart>(part.body));
+        const auto* tool = std::get_if<MaiToolPart>(&part.body);
+        if (!tool) continue;
+        if (tool->callId == "stop_without_workspace") {
+            CHECK(tool->tool == "screenshot");
+            CHECK(tool->state == MaiToolState::Completed);
+            CHECK(tool->error.empty());
+            const auto output = nlohmann::json::parse(tool->output, nullptr, false);
+            CHECK(output == nlohmann::json({{"action", "stop"}, {"state", "stopped"}}));
+            stopped = true;
+        } else if (tool->callId == "capture_without_workspace" ||
+                   tool->callId == "read_without_workspace") {
+            CHECK(tool->state == MaiToolState::Error);
+            CHECK(tool->error.find("working directory") != std::string::npos);
+            CHECK(tool->output == tool->error);
+            ++workspaceRejections;
+        }
+    }
+    CHECK(stopped);
+    CHECK(workspaceRejections == 2);
 }
 
 void test_balance_error_routes_back_to_main_model() {
@@ -1161,6 +1236,7 @@ void test_specialist_reply_keeps_existing_history_and_new_steering_in_order() {
 
 int main() {
     test_tool_loop_closes();
+    test_screenshot_stop_without_workspace_keeps_file_tools_blocked();
     test_balance_error_routes_back_to_main_model();
     test_tool_image_is_persisted_and_fed_back_to_the_model();
     test_tool_image_keeps_parallel_tool_calls_in_one_assistant_batch();

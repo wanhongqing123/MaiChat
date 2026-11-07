@@ -462,7 +462,7 @@ elseif(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
   set_source_files_properties(AgentTools/MaiScreenshotMac.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
   target_link_libraries(maiagent PRIVATE
     "-framework ScreenCaptureKit" "-framework CoreGraphics" "-framework ImageIO"
-    "-framework Foundation")
+    "-framework Foundation" "-framework CoreVideo" "-framework CoreMedia" "-framework AppKit")
 else()
   target_sources(maiagent PRIVATE
     Agent/MaiFileSystemPosix.cpp
@@ -523,7 +523,7 @@ endif()
 target_link_libraries(maiagent PRIVATE libqpdf)
 target_compile_definitions(maiagent PRIVATE POINTERHOLDER_TRANSITION=4)
 if(WIN32)
-  target_link_libraries(maiagent PRIVATE d3d11 dxgi windowscodecs ole32 user32 windowsapp
+  target_link_libraries(maiagent PRIVATE d3d11 dxgi windowscodecs ole32 user32 windowsapp Wtsapi32
     ws2_32 iphlpapi crypt32 bcrypt advapi32)
 endif()
 
@@ -639,6 +639,19 @@ if(MAIAGENT_BUILD_TESTS)
     endif()
     add_test(NAME ${test_name} COMMAND ${test_name})
   endforeach()
+  if(WIN32)
+    add_executable(MaiScreenshotSessionTests tests/MaiScreenshotSessionTests.cpp)
+    target_link_libraries(MaiScreenshotSessionTests PRIVATE maiagent windowscodecs ole32 user32 gdi32)
+    add_test(NAME MaiScreenshotSessionTests COMMAND MaiScreenshotSessionTests)
+    set_tests_properties(MaiScreenshotSessionTests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 100)
+  elseif(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    add_executable(MaiScreenshotSessionTests tests/MaiScreenshotSessionTestsMac.mm)
+    set_source_files_properties(tests/MaiScreenshotSessionTestsMac.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    target_link_libraries(MaiScreenshotSessionTests PRIVATE maiagent "-framework AppKit"
+      "-framework CoreVideo" "-framework CoreMedia")
+    add_test(NAME MaiScreenshotSessionTests COMMAND MaiScreenshotSessionTests)
+    set_tests_properties(MaiScreenshotSessionTests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 100)
+  endif()
   target_link_libraries(MaiLlamaModelCapabilitiesTests PRIVATE mai_llama)
   target_include_directories(MaiStoreTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)

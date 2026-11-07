@@ -1,21 +1,24 @@
 // 文件作用：验证“把屏幕截图能力封装为 Agent 工具”的正确行为和边界条件。
 // 验证入口：test_tool_contract、test_builtin_registration_matches_platform_support、
-// test_workspace_is_required_before_capture、test_native_window_capture_returns_a_png、
-// test_native_window_id_capture；检查可观察结果而非实现细节。
+// test_capture_uses_only_screen_requests、test_stop_needs_no_capture_or_workspace、
+// test_controlled_tool_uses_owned_native_window_source；检查可观察结果而非实现细节。
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
-#elif defined(__APPLE__)
-#include <TargetConditionals.h>
-#if TARGET_OS_OSX
-#include <CoreGraphics/CoreGraphics.h>
-#endif
 #endif
 
 #if !defined(_WIN32)
@@ -30,6 +33,7 @@
 #include "MaiIdGenerator.h"
 #include "MaiScreenshot.h"
 #include "MaiScreenshotTool.h"
+#include "MaiThread.h"
 #include "MaiTool.h"
 
 static int failures = 0;
@@ -44,6 +48,86 @@ static int failures = 0;
 namespace {
 
 using Json = nlohmann::json;
+
+#if defined(_WIN32)
+// 超时退出只针对本测试进程；即使消息分发或线程收尾发生回归，也不能让测试无限挂起。
+class MaiScreenshotTestDeadline {
+public:
+    MaiScreenshotTestDeadline()
+        : mThread([this] {
+              MaiThread::setCurrentName("mai-cap-limit");
+              std::unique_lock<std::mutex> lock(mMutex);
+              if (!mCondition.wait_for(lock, std::chrono::seconds(90),
+                                       [this] { return mFinished; })) {
+                  std::fprintf(stderr,
+                               "FAIL screenshot tool test exceeded its 90 second deadline\n");
+                  std::fflush(stderr);
+                  std::_Exit(1);
+              }
+          }) {}
+
+    ~MaiScreenshotTestDeadline() {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mFinished = true;
+        }
+        mCondition.notify_one();
+        mThread.join();
+    }
+
+private:
+    std::mutex mMutex;
+    std::condition_variable mCondition;
+    bool mFinished = false;
+    std::thread mThread;
+};
+#endif
+
+template <typename Operation>
+auto runCaptureCallWithOwnerMessages(Operation operation) -> decltype(operation()) {
+#if defined(_WIN32)
+    // 原生 API 要求在工作线程调用。窗口所有者继续泵消息，避免后台 EnumWindows 读取同进程
+    // 窗口标题时，GetWindowTextLengthW 的同步消息与主线程等待采集互锁。
+    std::optional<decltype(operation())> result;
+    std::atomic<bool> finished{false};
+    std::thread caller([&] {
+        MaiThread::setCurrentName("mai-cap-test");
+        result.emplace(operation());
+        finished.store(true, std::memory_order_release);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (!finished.load(std::memory_order_acquire)) {
+        MSG message{};
+        for (int count = 0; count < 64 && ::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE);
+             ++count) {
+            ::TranslateMessage(&message);
+            ::DispatchMessageW(&message);
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::fprintf(stderr, "FAIL screenshot call exceeded its 20 second deadline\n");
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+        ::MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
+    }
+    // 正常路径先 join，再读取结果和销毁 fixture；不 detach，回调不会越过其引用对象生命周期。
+    caller.join();
+    return std::move(*result);
+#else
+    return operation();
+#endif
+}
+
+#if defined(_WIN32)
+void stopNativeCaptureWithOwnerMessages() {
+    const MaiError stopped =
+        runCaptureCallWithOwnerMessages([] { return maiStopScreenshotCapture(); });
+    CHECK(!stopped.hasError());
+    const MaiScreenshotCaptureState state = maiScreenshotCaptureState();
+    CHECK(!state.workerRunning);
+    CHECK(!state.capturing);
+}
+#endif
 
 // 每次运行使用独立的中文空格路径，同时覆盖 UTF-8 边界和截图交付的工作区隔离。
 struct MaiScreenshotTestWorkspace {
@@ -61,20 +145,43 @@ struct MaiScreenshotTestWorkspace {
     }
 };
 
-std::string missingWindowRequest() {
-    return Json{{"mode", "window"},
-                {"windowTitle", MaiIdGenerator::generate("MaiAgent Missing Window ")}}
-        .dump();
+MaiScreenshotCapture rejectCapture(int& calls) {
+    return [&calls](const MaiScreenshotRequest&, MaiScreenshot&) {
+        ++calls;
+        return MaiError{MaiErrorCode::Internal, "capture must not run in this validation case"};
+    };
 }
 
 void test_tool_contract() {
-    std::unique_ptr<MaiTool> tool = makeMaiScreenshotTool();
+    int captures = 0;
+    std::unique_ptr<MaiTool> tool = makeMaiScreenshotTool(rejectCapture(captures));
     CHECK(tool != nullptr);
     CHECK(tool->name() == "screenshot");
     CHECK(tool->requiresApproval("{}"));
     CHECK(tool->requiresPerCallApproval("{}"));
     CHECK(tool->parametersSchema().find("additionalProperties") != std::string::npos);
-    CHECK(tool->parametersSchema().find("windowTitle") != std::string::npos);
+    const Json schema = Json::parse(tool->parametersSchema(), nullptr, false);
+    CHECK(schema.is_object());
+    if (schema.is_object()) {
+        CHECK(schema.value("additionalProperties", true) == false);
+        CHECK(schema.value("properties", Json{}).is_object());
+        if (schema.value("properties", Json{}).is_object()) {
+            const Json& properties = schema["properties"];
+            CHECK(properties.size() == 1);
+            CHECK(properties.contains("action"));
+            CHECK(!properties.contains("mode"));
+            CHECK(!properties.contains("windowTitle"));
+            CHECK(properties.value("action", Json{}).is_object());
+            if (properties.value("action", Json{}).is_object()) {
+                CHECK(properties["action"].value("type", std::string()) == "string");
+                CHECK(properties["action"].value("enum", Json{}) ==
+                      Json::array({"capture", "stop"}));
+                CHECK(properties["action"].value("default", std::string()) == "capture");
+            }
+        }
+    }
+    CHECK(tool->description().find("mode=window") == std::string::npos);
+    CHECK(tool->description().find("list_windows") == std::string::npos);
     CHECK(!tool->isAvailableForModel("glm-5.3"));
     CHECK(!tool->isAvailableForModel("local:qa"));
     CHECK(tool->isAvailableForModel("glm-5.3-flash"));
@@ -87,12 +194,12 @@ void test_tool_contract() {
     CHECK(unsupported.error().code() == MaiErrorCode::NotSupported);
     CHECK(unsupported.error().message().find("glm-5.3-flash") != std::string::npos);
 
-    // 指定必定不存在的窗口，旧实现即使遗漏本地模型门禁也不会捕获任何用户画面。
+    // 受控回调拒绝任何采集，避免门禁回归触碰用户显示器。
     MaiScreenshotTestWorkspace workspace;
     MaiToolContext localOnly;
     localOnly.model = "local:qa";
     localOnly.root = workspace.root.toUtf8();
-    const MaiToolResult localUnsupported = tool->execute(missingWindowRequest(), localOnly);
+    const MaiToolResult localUnsupported = tool->execute("{}", localOnly);
     CHECK(localUnsupported.hasError());
     CHECK(localUnsupported.error().code() == MaiErrorCode::NotSupported);
     CHECK(localUnsupported.images().empty());
@@ -102,18 +209,62 @@ void test_tool_contract() {
     const MaiToolResult invalid = tool->execute("not-json", imageCapable);
     CHECK(invalid.hasError());
     CHECK(invalid.error().code() == MaiErrorCode::InvalidInput);
-    const MaiToolResult wrongModeType = tool->execute(R"({"mode":7})", imageCapable);
-    CHECK(wrongModeType.hasError());
-    CHECK(wrongModeType.error().code() == MaiErrorCode::InvalidInput);
+    const MaiToolResult wrongActionType = tool->execute(R"({"action":7})", imageCapable);
+    CHECK(wrongActionType.hasError());
+    CHECK(wrongActionType.error().code() == MaiErrorCode::InvalidInput);
     const MaiToolResult extraArgument = tool->execute(R"({"unexpected":true})", imageCapable);
     CHECK(extraArgument.hasError());
     CHECK(extraArgument.error().code() == MaiErrorCode::InvalidInput);
+    CHECK(captures == 0);
+}
+
+void test_legacy_window_arguments_are_rejected_before_capture() {
+    MaiScreenshotTestWorkspace workspace;
+    MaiToolContext context;
+    context.model = "deepseek-flash";
+    context.root = workspace.root.toUtf8();
+    int captures = 0;
+    auto tool = makeMaiScreenshotTool(rejectCapture(captures));
+    for (const char* arguments :
+         {R"({"mode":"display"})", R"({"mode":"window","windowTitle":"MaiAgent Legacy Window"})",
+          R"({"windowTitle":"MaiAgent Legacy Window"})",
+          R"({"action":"capture","window_id":"123"})", R"({"action":"stop","mode":"window"})",
+          R"({"action":"window"})"}) {
+        const MaiToolResult result = tool->execute(arguments, context);
+        CHECK(result.hasError());
+        CHECK(result.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(result.images().empty());
+    }
+    CHECK(captures == 0);
+}
+
+void test_stop_needs_no_capture_or_workspace() {
+    int captures = 0;
+    auto tool = makeMaiScreenshotTool(rejectCapture(captures));
+    CHECK(!tool->requiresApproval(R"({"action":"stop"})"));
+    CHECK(!tool->requiresPerCallApproval(R"({"action":"stop"})"));
+    std::atomic<bool> canceled{true};
+    MaiToolContext context;
+    context.model = "glm-5.3";
+    context.cancel = &canceled;
+    // stop 是清理操作，取消、缺少工作区或模型不能接收像素都不能阻止释放原生会话。
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        const MaiToolResult stopped = tool->execute(R"({"action":"stop"})", context);
+        CHECK(!stopped.hasError());
+        CHECK(stopped.images().empty());
+        if (!stopped.hasError()) {
+            const Json output = Json::parse(stopped.output(), nullptr, false);
+            CHECK(output == Json({{"action", "stop"}, {"state", "stopped"}}));
+        }
+    }
+    CHECK(captures == 0);
 }
 
 void test_builtin_registration_matches_platform_support() {
     MaiToolRegistry registry;
     registerMaiBuiltinTools(registry);
     CHECK((registry.find("screenshot") != nullptr) == maiIsScreenshotSupported());
+    CHECK(registry.find("list_windows") == nullptr);
     for (const std::string model : {"glm-5.3", "local:qa", "glm-5.3-flash", "deepseek-flash"}) {
         const auto specs = registry.specs(model);
         const bool declared = std::any_of(specs.begin(), specs.end(), [](const MaiToolSpec& spec) {
@@ -122,17 +273,21 @@ void test_builtin_registration_matches_platform_support() {
         CHECK(declared == (maiIsScreenshotSupported() &&
                            (model == "glm-5.3-flash" || model == "deepseek-flash")));
         CHECK((registry.findForModel("screenshot", model) != nullptr) == declared);
+        CHECK(std::none_of(specs.begin(), specs.end(),
+                           [](const MaiToolSpec& spec) { return spec.name == "list_windows"; }));
     }
 }
 
 void test_workspace_is_required_before_capture() {
-    auto tool = makeMaiScreenshotTool();
+    int captures = 0;
+    auto tool = makeMaiScreenshotTool(rejectCapture(captures));
     MaiToolContext context;
     context.model = "glm-5.3-flash";
-    const MaiToolResult result = tool->execute(missingWindowRequest(), context);
+    const MaiToolResult result = tool->execute("{}", context);
     CHECK(result.hasError());
     CHECK(result.error().code() == MaiErrorCode::NotConfigured);
     CHECK(result.images().empty());
+    CHECK(captures == 0);
 }
 
 void test_workspace_screenshot_directory_cannot_escape() {
@@ -157,10 +312,13 @@ void test_workspace_screenshot_directory_cannot_escape() {
     context.model = "glm-5.3-flash";
     context.root = workspace.root.toUtf8();
     context.allowOutsideWorkingDirectory = true;
-    const MaiToolResult result = makeMaiScreenshotTool()->execute(missingWindowRequest(), context);
+    int captures = 0;
+    const MaiToolResult result =
+        makeMaiScreenshotTool(rejectCapture(captures))->execute("{}", context);
     CHECK(result.hasError());
     CHECK(result.error().code() == MaiErrorCode::InvalidInput);
     CHECK(result.images().empty());
+    CHECK(captures == 0);
     std::size_t outsideEntries = 0;
     MaiFileSystem::walk(outside.root, [&outsideEntries](const MaiFileEntry&) {
         ++outsideEntries;
@@ -195,7 +353,8 @@ void test_native_window_id_rejects_zero() {
     screenshot.pngBytes = {0x7f};
     screenshot.width = 17;
     screenshot.height = 23;
-    const MaiError error = maiCaptureScreenshot(request, screenshot);
+    const MaiError error =
+        runCaptureCallWithOwnerMessages([&] { return maiCaptureScreenshot(request, screenshot); });
     if (error.code() != MaiErrorCode::InvalidInput) {
         std::printf("zero window ID capture error: %s\n", error.message().c_str());
     }
@@ -215,7 +374,8 @@ void test_native_window_id_rejects_invalid() {
     screenshot.pngBytes = {0x7f};
     screenshot.width = 17;
     screenshot.height = 23;
-    const MaiError error = maiCaptureScreenshot(request, screenshot);
+    const MaiError error =
+        runCaptureCallWithOwnerMessages([&] { return maiCaptureScreenshot(request, screenshot); });
 #if defined(_WIN32)
     const MaiErrorCode expected = sizeof(std::uintptr_t) < sizeof(std::uint64_t)
                                       ? MaiErrorCode::InvalidInput
@@ -307,29 +467,52 @@ void checkPngAndRemove(const MaiToolResult& captured, const MaiToolContext& cont
     CHECK(!MaiFileSystem::removeFile(path).hasError());
 }
 
-void test_native_capture_returns_a_png() {
-    if (!maiIsScreenshotSupported()) return;
-#if defined(__APPLE__) && TARGET_OS_OSX
-    if (!CGPreflightScreenCaptureAccess()) {
-        std::vector<std::string> titles;
-        const MaiError permission = maiListCaptureWindows(titles);
-        CHECK(permission.code() == MaiErrorCode::NotConfigured);
-        std::printf("live macOS capture skipped: Screen Recording permission is not granted\n");
-        return;
-    }
-#endif
-
-    std::unique_ptr<MaiTool> tool = makeMaiScreenshotTool();
+void test_capture_uses_only_screen_requests() {
     MaiScreenshotTestWorkspace workspace;
     MaiToolContext context;
-    context.model = "glm-5.3-flash";
+    context.model = "deepseek-flash";
     context.root = workspace.root.toUtf8();
-    const MaiToolResult captured = tool->execute("{}", context);
-    if (captured.hasError()) std::printf("capture error: %s\n", captured.error().message().c_str());
-    checkPngAndRemove(captured, context, "display");
+    int captures = 0;
+    auto tool = makeMaiScreenshotTool(
+        [&captures](const MaiScreenshotRequest& request, MaiScreenshot& screenshot) {
+            ++captures;
+            CHECK(request.target == MaiScreenshotTarget::DisplayUnderPointer);
+            CHECK(request.windowTitle.empty());
+            CHECK(request.windowId == 0);
+            CHECK(request.isCanceled && !request.isCanceled());
+            // 有效 1x1 PNG 是受控数据源，不启动原生 worker，也不读取显示器。
+            const char png[] =
+                "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52"
+                "\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+                "\x00\x00\x00\x0d\x49\x44\x41\x54\x78\x9c\x63\x60\x68\xf8\xff\x1f"
+                "\x00\x04\x82\x02\x7f\xe7\xd8\x5a\x6c\x00\x00\x00\x00\x49\x45\x4e"
+                "\x44\xae\x42\x60\x82";
+            screenshot.pngBytes.assign(png, png + sizeof(png) - 1);
+            screenshot.width = 1;
+            screenshot.height = 1;
+            screenshot.frameSequence = 42;
+            screenshot.frameReceivedAtMs = 1700000000123LL;
+            return MaiError{};
+        });
+    int expectedCaptures = 0;
+    for (const char* arguments : {"{}", R"({"action":"capture"})"}) {
+        const MaiToolResult captured = tool->execute(arguments, context);
+        CHECK(captures == ++expectedCaptures);
+        CHECK(!captured.hasError());
+        if (!captured.hasError()) {
+            const Json output = Json::parse(captured.output(), nullptr, false);
+            CHECK(output.is_object());
+            if (output.is_object()) {
+                CHECK(output.value("frame_sequence", std::uint64_t{}) == 42);
+                CHECK(output.value("frame_received_at_ms", std::int64_t{}) == 1700000000123LL);
+            }
+        }
+        checkPngAndRemove(captured, context, "display");
+    }
+    CHECK(captures == 2);
 }
 
-void test_native_window_capture_returns_a_png() {
+void test_controlled_tool_uses_owned_native_window_source() {
 #if defined(_WIN32)
     constexpr wchar_t kTitle[] = L"MaiAgent Native Window Capture Test";
     const HWND window =
@@ -340,16 +523,30 @@ void test_native_window_capture_returns_a_png() {
     ::ShowWindow(window, SW_SHOW);
     ::UpdateWindow(window);
 
-    std::unique_ptr<MaiTool> tool = makeMaiScreenshotTool();
+    int captures = 0;
+    auto tool = makeMaiScreenshotTool(
+        [&captures, window](const MaiScreenshotRequest& request, MaiScreenshot& screenshot) {
+            ++captures;
+            CHECK(request.target == MaiScreenshotTarget::DisplayUnderPointer);
+            CHECK(request.windowTitle.empty());
+            CHECK(request.windowId == 0);
+            // 模型工具只请求屏幕；测试宿主把采集源收窄到自有窗口，不能据此声称已验真实显示器。
+            MaiScreenshotRequest owned = request;
+            owned.target = MaiScreenshotTarget::WindowById;
+            owned.windowId = reinterpret_cast<std::uintptr_t>(window);
+            return maiCaptureScreenshot(owned, screenshot);
+        });
     MaiScreenshotTestWorkspace workspace;
     MaiToolContext context;
     context.model = "deepseek-flash";
     context.root = workspace.root.toUtf8();
-    const MaiToolResult captured = tool->execute(
-        R"({"mode":"window","windowTitle":"MaiAgent Native Window Capture Test"})", context);
+    const MaiToolResult captured =
+        runCaptureCallWithOwnerMessages([&] { return tool->execute("{}", context); });
     if (captured.hasError())
         std::printf("window capture error: %s\n", captured.error().message().c_str());
-    checkPngAndRemove(captured, context, "window");
+    checkPngAndRemove(captured, context, "display");
+    CHECK(captures == 1);
+    stopNativeCaptureWithOwnerMessages();
     ::DestroyWindow(window);
 #endif
 }
@@ -389,12 +586,15 @@ void test_native_window_id_capture() {
     request.target = MaiScreenshotTarget::WindowByTitle;
     request.windowTitle = "MaiAgent Same Title Window ID Capture Test";
     MaiScreenshot screenshot;
-    CHECK(maiCaptureScreenshot(request, screenshot).code() == MaiErrorCode::InvalidInput);
+    CHECK(runCaptureCallWithOwnerMessages([&] {
+              return maiCaptureScreenshot(request, screenshot);
+          }).code() == MaiErrorCode::InvalidInput);
 
     request.target = MaiScreenshotTarget::WindowById;
     // 保留会歧义的标题，证明 ID 模式只按句柄选择两者中尺寸更小的窗口。
     request.windowId = reinterpret_cast<std::uintptr_t>(smallWindow);
-    const MaiError captured = maiCaptureScreenshot(request, screenshot);
+    const MaiError captured =
+        runCaptureCallWithOwnerMessages([&] { return maiCaptureScreenshot(request, screenshot); });
     if (captured.hasError()) {
         std::printf("window ID capture error: %s\n", captured.message().c_str());
     }
@@ -409,7 +609,9 @@ void test_native_window_id_capture() {
     CHECK(child != nullptr);
     if (child) {
         request.windowId = reinterpret_cast<std::uintptr_t>(child);
-        CHECK(maiCaptureScreenshot(request, screenshot).code() == MaiErrorCode::NotFound);
+        CHECK(runCaptureCallWithOwnerMessages([&] {
+                  return maiCaptureScreenshot(request, screenshot);
+              }).code() == MaiErrorCode::NotFound);
         CHECK(screenshot.pngBytes.empty());
         ::DestroyWindow(child);
     }
@@ -417,18 +619,25 @@ void test_native_window_id_capture() {
     // 同一个 ID 失去可见性或被销毁时，必须清空旧帧并失败，不能借同名的大窗口兜底。
     request.windowId = reinterpret_cast<std::uintptr_t>(smallWindow);
     ::ShowWindow(smallWindow, SW_HIDE);
-    CHECK(maiCaptureScreenshot(request, screenshot).code() == MaiErrorCode::NotFound);
+    CHECK(runCaptureCallWithOwnerMessages([&] {
+              return maiCaptureScreenshot(request, screenshot);
+          }).code() == MaiErrorCode::NotFound);
     CHECK(screenshot.pngBytes.empty());
     CHECK(screenshot.width == 0);
     CHECK(screenshot.height == 0);
     ::ShowWindow(smallWindow, SW_SHOW);
     ::ShowWindow(smallWindow, SW_MINIMIZE);
     CHECK(::IsIconic(smallWindow));
-    CHECK(maiCaptureScreenshot(request, screenshot).code() == MaiErrorCode::NotFound);
+    CHECK(runCaptureCallWithOwnerMessages([&] {
+              return maiCaptureScreenshot(request, screenshot);
+          }).code() == MaiErrorCode::NotFound);
     CHECK(screenshot.pngBytes.empty());
     ::DestroyWindow(smallWindow);
-    CHECK(maiCaptureScreenshot(request, screenshot).code() == MaiErrorCode::NotFound);
+    CHECK(runCaptureCallWithOwnerMessages([&] {
+              return maiCaptureScreenshot(request, screenshot);
+          }).code() == MaiErrorCode::NotFound);
     CHECK(screenshot.pngBytes.empty());
+    stopNativeCaptureWithOwnerMessages();
     ::DestroyWindow(largeWindow);
 #endif
 }
@@ -436,6 +645,9 @@ void test_native_window_id_capture() {
 }  // namespace
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    MaiScreenshotTestDeadline deadline;
+#endif
     const bool validationOnly = argc == 2 && std::string(argv[1]) == "--request-validation-only";
     const bool ownedWindowOnly = argc == 2 && std::string(argv[1]) == "--owned-window-only";
     if (argc > 1 && !validationOnly && !ownedWindowOnly) {
@@ -447,15 +659,20 @@ int main(int argc, char** argv) {
     test_native_window_id_rejects_zero();
     test_native_window_id_rejects_invalid();
     test_tool_contract();
+    test_legacy_window_arguments_are_rejected_before_capture();
+    test_stop_needs_no_capture_or_workspace();
     test_builtin_registration_matches_platform_support();
     test_workspace_is_required_before_capture();
     test_workspace_screenshot_directory_cannot_escape();
+    test_capture_uses_only_screen_requests();
     if (!validationOnly) {
-        // --owned-window-only 只使用下面由本进程创建的 fixture，不进入显示器捕获。
-        if (!ownedWindowOnly) test_native_capture_returns_a_png();
-        test_native_window_capture_returns_a_png();
+        // 全部入口均只使用本进程创建的 fixture；受控来源不等于实际显示器采集验收。
+        test_controlled_tool_uses_owned_native_window_source();
         test_native_window_id_capture();
     }
+#if defined(_WIN32)
+    stopNativeCaptureWithOwnerMessages();
+#endif
     if (failures == 0) std::printf("screenshot tool tests passed\n");
     return failures == 0 ? 0 : 1;
 }

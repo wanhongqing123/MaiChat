@@ -152,6 +152,12 @@ public:
     // 本方法绝不能发网络请求，也不能在结果中包含密钥或用户媒体字节。
     virtual std::optional<MaiSpecialistInfo> specialistInfo() const;
 
+    // 这一次调用是否需要会话工作目录。默认 true，保持已有工具的路径守卫；
+    // 只有不访问文件的独立清理动作才能显式返回 false，例如停止常驻屏幕采集。
+    // 无效参数应返回 true。查询可跨会话并发执行，不得产生副作用；返回 false
+    // 不绕过权限、取消、模型能力或 execute() 的参数校验，也不赋予任何文件访问能力。
+    virtual bool requiresWorkingDirectory(const std::string& argumentsJson) const;
+
     // 这一次调用需要用户点头吗。
     //
     // **参数是要看的，不能只看工具名。** shell 最能说明问题：`git status` 和 `rm -rf /`

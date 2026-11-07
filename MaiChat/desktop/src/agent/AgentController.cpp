@@ -134,8 +134,10 @@ path or ask the user to attach it.
 For local file work, prefer file_create, file_create_directory, file_delete, file_read, file_write,
 file_edit, and file_patch. file_create makes an empty file without overwriting; file_write sets content. Use
 shell only when the built-in tools cannot perform the task.
-For screen capture, use screenshot. To observe or operate a specific application, use
-desktop_computer. Inspect the image returned by these tools directly. To show a capture in this
+For screen images, use screenshot; it reuses a resident native capture session and has no window
+capture mode. Use action=stop when screen capture is no longer needed. To locate or operate an
+application, use desktop_computer for window metadata, Accessibility/UIA elements and native input;
+its observe action does not capture window images. Inspect screenshot images directly. To show a capture in this
 conversation, call agent_send_media with file_path set to the returned workspace-relative image_path
 and type=image;
 reuse that same file. Do not write shell scripts to recapture the screen or bypass a failed native

@@ -282,28 +282,25 @@ void verifyWindowSelection() {
 
 void verifyScreenshotHandoff() {
     Fixture fixture;
-    MaiToolRegistry registry;
-    auto controller = std::make_shared<DesktopComputerController>(fixture.backend);
-    registerDesktopComputerTools(registry, controller);
+    // The ordinary API retains a controlled native-fixture capture for host
+    // integration; model-facing observe is metadata only.
     MaiToolContext context;
     context.sessionId = "screenshot-delivery";
     context.root = fixture.workspace.path().toUtf8().toStdString();
     context.model = "deepseek-flash";
-    const auto captured = registry.find("desktop_computer")->execute(
-        R"({"action":"observe","window_id":"101"})", context);
-    CHECK(!captured.hasError());
-    CHECK(captured.images().size() == 1);
-    if (captured.hasError() || captured.images().size() != 1) return;
-    const Json output = Json::parse(captured.output());
+    const auto captured = fixture.controller.observe(context.sessionId, "", context.root, true, 101);
+    CHECK(captured);
+    if (!captured) return;
+    const Json output = Json::parse(captured.value().json);
     const std::string relative = output.value("image_path", std::string());
     CHECK(!relative.empty());
     CHECK(QDir::isRelativePath(QString::fromStdString(relative)));
     if (relative.empty()) return;
     const QString saved = fixture.workspace.filePath(QString::fromStdString(relative));
     CHECK(QFileInfo(saved).canonicalFilePath() ==
-          QFileInfo(QString::fromStdString(captured.images().front().path)).canonicalFilePath());
-    const auto delivered = makeMaiAgentSendMediaTool()->execute(
-        Json{{"file_path", relative}, {"type", "image"}}.dump(), context);
+          QFileInfo(QString::fromStdString(captured.value().imagePath)).canonicalFilePath());
+    const auto delivered =
+        makeMaiAgentSendMediaTool()->execute(Json{{"file_path", relative}, {"type", "image"}}.dump(), context);
     CHECK(!delivered.hasError());
     if (!delivered.hasError()) {
         const Json receipt = Json::parse(delivered.output());
@@ -320,13 +317,13 @@ void verifyScreenshotDirectoryBoundary() {
     QTemporaryDir outside;
     CHECK(outside.isValid());
     const QString link = fixture.workspace.filePath(QStringLiteral("computer"));
-    if (!CreateSymbolicLinkW(reinterpret_cast<LPCWSTR>(link.utf16()),
-                             reinterpret_cast<LPCWSTR>(outside.path().utf16()), 0x3)) {
+    if (!CreateSymbolicLinkW(reinterpret_cast<LPCWSTR>(link.utf16()), reinterpret_cast<LPCWSTR>(outside.path().utf16()),
+                             0x3)) {
         std::fprintf(stderr, "computer directory link boundary not exercised: Win32 %lu\n", GetLastError());
         return;
     }
-    const auto observed = fixture.controller.observe("owner", "",
-        fixture.workspace.path().toUtf8().toStdString(), false, 101);
+    const auto observed =
+        fixture.controller.observe("owner", "", fixture.workspace.path().toUtf8().toStdString(), false, 101);
     CHECK(!observed);
     if (!observed) CHECK(observed.error().code() == MaiErrorCode::InvalidInput);
     CHECK(fixture.backend->captureCount == 0);
@@ -344,46 +341,26 @@ void verifyScreenshotDirectoryIsValidatedBeforeCapture() {
     if (!opened) return;
     blocker.close();
 
-    MaiToolRegistry registry;
-    auto controller = std::make_shared<DesktopComputerController>(fixture.backend);
-    registerDesktopComputerTools(registry, controller);
-    MaiToolContext context;
-    context.sessionId = "screenshot-invalid-directory";
-    context.root = fixture.workspace.path().toUtf8().toStdString();
-    context.model = "deepseek-flash";
-    MaiTool* tool = registry.find("desktop_computer");
-    CHECK(tool);
-    if (!tool) return;
-    const auto captured = tool->execute(R"({"action":"observe","window_id":"101"})", context);
-    CHECK(captured.hasError());
-    CHECK(captured.images().empty());
+    const auto captured = fixture.controller.observe("screenshot-invalid-directory", "",
+                                                     fixture.workspace.path().toUtf8().toStdString(), true, 101, true);
+    CHECK(!captured);
     CHECK(fixture.backend->captureCount == 0);
     CHECK(QFileInfo(blocker).isFile());
 }
 
 void verifyScreenshotCancellationDoesNotPublishPixels() {
     Fixture fixture;
-    MaiToolRegistry registry;
-    auto controller = std::make_shared<DesktopComputerController>(fixture.backend);
-    registerDesktopComputerTools(registry, controller);
     std::atomic<bool> canceled{false};
     // Cancellation during a successful capture must be observed before saving
     // or publishing its pixels; an empty output directory may already exist.
     fixture.backend->onCapture = [&canceled] { canceled.store(true, std::memory_order_relaxed); };
-    MaiToolContext context;
-    context.sessionId = "screenshot-canceled-during-capture";
-    context.root = fixture.workspace.path().toUtf8().toStdString();
-    context.model = "deepseek-flash";
-    context.cancel = &canceled;
-    MaiTool* tool = registry.find("desktop_computer");
-    CHECK(tool);
-    if (!tool) return;
-    const auto captured = tool->execute(R"({"action":"observe","window_id":"101"})", context);
+    const auto captured = fixture.controller.observe("screenshot-canceled-during-capture", "",
+                                                     fixture.workspace.path().toUtf8().toStdString(), true, 101, true,
+                                                     [&canceled] { return canceled.load(std::memory_order_relaxed); });
     CHECK(canceled.load(std::memory_order_relaxed));
     CHECK(fixture.backend->captureCount == 1);
-    CHECK(captured.hasError());
-    CHECK(captured.error().code() == MaiErrorCode::Canceled);
-    CHECK(captured.images().empty());
+    CHECK(!captured);
+    if (!captured) CHECK(captured.error().code() == MaiErrorCode::Canceled);
     CHECK(QDir(fixture.workspace.filePath(QStringLiteral("computer"))).entryList(QDir::Files).isEmpty());
 }
 
@@ -391,8 +368,8 @@ void verifyObservationWithoutImage() {
     Fixture fixture;
     // Element-only observation still issues a fresh usable observation without
     // depending on capture support or creating a screenshot on disk.
-    const auto observed = fixture.controller.observe("owner", "",
-        fixture.workspace.path().toUtf8().toStdString(), true, 101, false);
+    const auto observed =
+        fixture.controller.observe("owner", "", fixture.workspace.path().toUtf8().toStdString(), true, 101, false);
     CHECK(observed);
     std::string firstSnapshot;
     if (observed) {
@@ -417,33 +394,43 @@ void verifyObservationWithoutImage() {
     MaiToolContext context;
     context.sessionId = "element-only-tool-session";
     context.root = fixture.workspace.path().toUtf8().toStdString();
-    const auto result = tool->execute(
-        R"({"action":"observe","window_id":"101","include_elements":true,"include_image":false})",
-        context);
+    context.model = "deepseek-flash";
+    const auto result = tool->execute(R"({"action":"observe","window_id":"101","include_elements":true})", context);
     CHECK(!result.hasError());
     CHECK(result.images().empty());
     if (!result.hasError()) {
         const Json output = Json::parse(result.output());
         CHECK(output["has_image"] == false);
+        CHECK(!output.contains("image_path"));
         CHECK(output["elements"].size() == 1);
         CHECK(!output.value("snapshot_id", std::string()).empty());
         CHECK(output.value("snapshot_id", std::string()) != firstSnapshot);
     }
-    // The known text-only model defaults to element observation; an explicit
-    // request for an image is rejected before the capture backend is called.
-    context.model = "glm-5.3";
-    const auto defaultResult = tool->execute(
-        R"({"action":"observe","window_id":"101","include_elements":true})", context);
-    CHECK(!defaultResult.hasError());
-    CHECK(defaultResult.images().empty());
-    if (!defaultResult.hasError()) {
-        const Json output = Json::parse(defaultResult.output());
-        CHECK(output["has_image"] == false);
-        CHECK(output["elements"].size() == 1);
+    // Text-only and image-capable models receive the same metadata contract.
+    for (const std::string model : {"glm-5.3", "local:qa"}) {
+        context.model = model;
+        const auto defaultResult =
+            tool->execute(R"({"action":"observe","window_id":"101","include_elements":true})", context);
+        CHECK(!defaultResult.hasError());
+        CHECK(defaultResult.images().empty());
+        if (!defaultResult.hasError()) {
+            const Json output = Json::parse(defaultResult.output());
+            CHECK(output["has_image"] == false);
+            CHECK(!output.contains("image_path"));
+            CHECK(output["elements"].size() == 1);
+        }
     }
-    const auto unsupportedImage = tool->execute(
-        R"({"action":"observe","window_id":"101","include_image":true})", context);
-    CHECK(unsupportedImage.error().code() == MaiErrorCode::NotSupported);
+    for (const std::string model : {"deepseek-flash", "glm-5.3", "local:qa"}) {
+        context.model = model;
+        for (const Json includeImage : {Json(true), Json(false), Json(nullptr), Json("false")}) {
+            const auto unsupportedImage = tool->execute(
+                Json{{"action", "observe"}, {"window_id", "101"}, {"include_image", includeImage}}.dump(), context);
+            CHECK(unsupportedImage.hasError());
+            CHECK(unsupportedImage.error().code() == MaiErrorCode::InvalidInput);
+            CHECK(unsupportedImage.error().message().find("screenshot") != std::string::npos);
+            CHECK(unsupportedImage.images().empty());
+        }
+    }
     CHECK(fixture.backend->captureCount == 0);
     CHECK(fixture.backend->activationCount == 0);
     CHECK(fixture.backend->inputs.empty());
@@ -718,6 +705,7 @@ void verifyPublicContract() {
     CHECK(schema.is_object());
     if (!schema.is_object()) return;
     const Json properties = schema.value("properties", Json::object());
+    CHECK(!properties.contains("include_image"));
     const Json actions = properties.value("action", Json::object()).value("enum", Json{});
     // The public contract exposes routine desktop operations without needing a
     // native session. Native dispatch belongs to the separate fixture test.

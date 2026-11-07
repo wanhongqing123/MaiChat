@@ -23,7 +23,6 @@
 #include "MaiTimeTool.h"
 #include "MaiTodoWriteTool.h"
 #include "MaiViewImageTool.h"
-#include "MaiWindowListTool.h"
 #include "MaiZlibTool.h"
 
 // ── MaiToolContext ──────────────────────────────────────────────
@@ -96,6 +95,11 @@ std::vector<std::string> MaiTool::approvalKeys(const std::string& argumentsJson,
                                                const MaiToolContext& context) const {
     (void)context;
     return {approvalKey(argumentsJson)};
+}
+
+bool MaiTool::requiresWorkingDirectory(const std::string& argumentsJson) const {
+    (void)argumentsJson;
+    return true;
 }
 
 bool MaiTool::requiresApproval(const std::string& argumentsJson) const {
@@ -224,8 +228,8 @@ void registerMaiBuiltinTools(MaiToolRegistry& registry) {
     registry.add(makeMaiListAgentsTool());
     registry.add(makeMaiCloseAgentTool());
     registry.add(makeMaiViewImageTool());
+    // 模型只通过 screenshot 读取屏幕；窗口枚举的普通工厂仍可由非模型宿主显式使用。
     if (maiIsScreenshotSupported()) registry.add(makeMaiScreenshotTool());
-    if (maiIsScreenshotSupported()) registry.add(makeMaiWindowListTool());
     // shell 只在跑得了外部进程的平台上摆出来。
     //
     // **不支持就根本不注册，而不是注册一个总是失败的。** 摆出来的话模型会反复试，

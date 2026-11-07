@@ -1,5 +1,5 @@
-// 文件作用：实现 Windows 平台屏幕截图。
-// 直接依赖：MaiScreenshot.h、MaiBlockingCheck.h；本文件在这些接口之间完成调用与结果转换。
+// 文件作用：由常驻工作线程持有 Windows 原生采集会话，按命令生成当前完整画面的 PNG。
+// 直接依赖：MaiScreenshot.h、MaiThread.h；WGC 回调只唤醒线程，D3D 和 COM 的使用及释放均留在线程内。
 #include "MaiScreenshot.h"
 
 #include <windows.h>
@@ -11,6 +11,7 @@
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <wrl/client.h>
+#include <wtsapi32.h>
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
@@ -19,17 +20,26 @@
 #include <winrt/base.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <cwctype>
+#include <deque>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "MaiBlockingCheck.h"
+#include "MaiThread.h"
+#include "MaiTime.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -38,6 +48,10 @@ namespace {
 constexpr UINT kMaximumWidth = 2560;
 constexpr UINT kMaximumHeight = 1600;
 constexpr DWORD kCaptureTimeoutMs = 2000;
+constexpr DWORD kCaptureSettleMs = 100;
+constexpr DWORD kCancelPollMs = 20;
+constexpr DWORD kEnvironmentCheckMs = 250;
+constexpr std::size_t kMaximumPendingCaptures = 64;
 
 MaiError hresultError(const char* operation, HRESULT result) {
     char code[16] = {};
@@ -151,8 +165,8 @@ MaiError createDefaultDevice(ComPtr<ID3D11Device>& device, ComPtr<ID3D11DeviceCo
 }
 
 MaiError copyTextureToMemory(ID3D11Device* device, ID3D11DeviceContext* context,
-                             ID3D11Texture2D* texture, std::vector<std::uint8_t>& pixels,
-                             UINT& width, UINT& height) {
+                             ID3D11Texture2D* texture, ComPtr<ID3D11Texture2D>& staging,
+                             std::vector<std::uint8_t>& pixels, UINT& width, UINT& height) {
     D3D11_TEXTURE2D_DESC description{};
     texture->GetDesc(&description);
     if (description.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
@@ -167,19 +181,26 @@ MaiError copyTextureToMemory(ID3D11Device* device, ID3D11DeviceContext* context,
     stagingDescription.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     stagingDescription.MiscFlags = 0;
     stagingDescription.Usage = D3D11_USAGE_STAGING;
-    ComPtr<ID3D11Texture2D> staging;
-    HRESULT result = device->CreateTexture2D(&stagingDescription, nullptr, staging.GetAddressOf());
-    if (FAILED(result)) return hresultError("ID3D11Device::CreateTexture2D", result);
+    D3D11_TEXTURE2D_DESC existing{};
+    if (staging) staging->GetDesc(&existing);
+    HRESULT result = S_OK;
+    if (!staging || existing.Width != description.Width || existing.Height != description.Height ||
+        existing.Format != description.Format) {
+        staging.Reset();
+        result = device->CreateTexture2D(&stagingDescription, nullptr, staging.GetAddressOf());
+        if (FAILED(result)) return hresultError("ID3D11Device::CreateTexture2D", result);
+    }
 
+    width = description.Width;
+    height = description.Height;
+    const std::size_t destinationRowBytes = static_cast<std::size_t>(width) * 4;
+    // 分配放在 Map 前；映射成功后的路径只复制字节，异常也不会把 staging 留在映射状态。
+    pixels.resize(destinationRowBytes * height);
     context->CopyResource(staging.Get(), texture);
     D3D11_MAPPED_SUBRESOURCE mapped{};
     result = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(result)) return hresultError("ID3D11DeviceContext::Map", result);
 
-    width = description.Width;
-    height = description.Height;
-    const std::size_t destinationRowBytes = static_cast<std::size_t>(width) * 4;
-    pixels.resize(destinationRowBytes * height);
     for (UINT row = 0; row < height; ++row) {
         const auto* source = static_cast<const std::uint8_t*>(mapped.pData) + mapped.RowPitch * row;
         auto* destination = pixels.data() + destinationRowBytes * row;
@@ -190,31 +211,12 @@ MaiError copyTextureToMemory(ID3D11Device* device, ID3D11DeviceContext* context,
     return {};
 }
 
-class ComApartment {
-public:
-    ComApartment() : mResult(::CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
-    ~ComApartment() {
-        if (SUCCEEDED(mResult)) ::CoUninitialize();
-    }
-    HRESULT result() const {
-        return mResult;
-    }
-
-private:
-    HRESULT mResult;
-};
-
-// Qt/OLE 已在界面线程初始化 STA，强行切换 MTA 会返回 RPC_E_CHANGED_MODE。
-// 截屏可沿用当前 STA；释放 COM 前清除 WinRT 工厂缓存，避免下次调用命中失效指针。
+// 采集总在独立线程建立 MTA，不借用 Qt/OLE 的 STA；退出前先释放全部原生对象，
+// 再清理 WinRT 工厂缓存和 apartment，避免重启采集时命中已失效的 COM 对象。
 class MaiWinRtApartment {
 public:
     MaiWinRtApartment() {
-        try {
-            winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        } catch (const winrt::hresult_error& error) {
-            if (error.code() != RPC_E_CHANGED_MODE) throw;
-            winrt::init_apartment(winrt::apartment_type::single_threaded);
-        }
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
     }
 
     ~MaiWinRtApartment() {
@@ -228,23 +230,13 @@ public:
 
 // 通过 Windows Imaging Component 将捕获像素编码为 PNG，并填写真实图像尺寸。
 // COM、像素布局或编码失败时返回错误，不输出不完整的截图字节。
-MaiError encodePng(const std::vector<std::uint8_t>& pixels, UINT sourceWidth, UINT sourceHeight,
-                   MaiScreenshot& screenshot) {
-    ComApartment apartment;
-    if (FAILED(apartment.result()) && apartment.result() != RPC_E_CHANGED_MODE) {
-        return hresultError("CoInitializeEx", apartment.result());
-    }
-
-    ComPtr<IWICImagingFactory> factory;
-    HRESULT result = ::CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                        IID_PPV_ARGS(factory.GetAddressOf()));
-    if (FAILED(result)) return hresultError("CoCreateInstance(WICImagingFactory)", result);
-
+MaiError encodePng(IWICImagingFactory* factory, const std::vector<std::uint8_t>& pixels,
+                   UINT sourceWidth, UINT sourceHeight, MaiScreenshot& screenshot) {
     if (pixels.size() > static_cast<std::size_t>(UINT_MAX)) {
         return MaiError::make(MaiErrorCode::Internal, "captured screen is too large to encode");
     }
     ComPtr<IWICBitmap> bitmap;
-    result = factory->CreateBitmapFromMemory(
+    HRESULT result = factory->CreateBitmapFromMemory(
         sourceWidth, sourceHeight, GUID_WICPixelFormat32bppBGRA, sourceWidth * 4,
         static_cast<UINT>(pixels.size()), const_cast<BYTE*>(pixels.data()), bitmap.GetAddressOf());
     if (FAILED(result)) return hresultError("IWICImagingFactory::CreateBitmapFromMemory", result);
@@ -318,138 +310,654 @@ MaiError encodePng(const std::vector<std::uint8_t>& pixels, UINT sourceWidth, UI
     return {};
 }
 
-// 从指定 Windows Graphics Capture 项读取一帧并交给 PNG 编码路径。
-// D3D 设备、帧池及会话均按作用域释放，失败时不保留旧帧冒充新截图。
-MaiError captureGraphicsItem(const winrt::Windows::Graphics::Capture::GraphicsCaptureItem& item,
-                             MaiScreenshot& screenshot) {
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    MaiError error = createDefaultDevice(device, context);
-    if (error.hasError()) return error;
-
-    ComPtr<IDXGIDevice> dxgiDevice;
-    HRESULT result = device.As(&dxgiDevice);
-    if (FAILED(result)) return hresultError("ID3D11Device::QueryInterface", result);
-    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice captureDevice{nullptr};
-    result = ::CreateDirect3D11DeviceFromDXGIDevice(
-        dxgiDevice.Get(), reinterpret_cast<IInspectable**>(winrt::put_abi(captureDevice)));
-    if (FAILED(result)) return hresultError("CreateDirect3D11DeviceFromDXGIDevice", result);
-
-    using winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool;
-    using winrt::Windows::Graphics::DirectX::DirectXPixelFormat;
-    const auto size = item.Size();
-    auto pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        captureDevice, DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, size);
-    auto session = pool.CreateCaptureSession(item);
-    winrt::handle arrived(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    if (!arrived) {
-        return MaiError::make(MaiErrorCode::Internal,
-                              "CreateEvent failed while starting native capture");
-    }
-    const auto token = pool.FrameArrived(
-        [&arrived](const Direct3D11CaptureFramePool&,
-                   const winrt::Windows::Foundation::IInspectable&) { ::SetEvent(arrived.get()); });
-    session.StartCapture();
-    const DWORD wait = ::WaitForSingleObject(arrived.get(), kCaptureTimeoutMs);
-    pool.FrameArrived(token);
-    if (wait != WAIT_OBJECT_0) {
-        session.Close();
-        pool.Close();
-        return MaiError::make(MaiErrorCode::Internal,
-                              "Windows Graphics Capture timed out waiting for a frame");
-    }
-
-    auto frame = pool.TryGetNextFrame();
-    if (!frame) {
-        session.Close();
-        pool.Close();
-        return MaiError::make(MaiErrorCode::Internal, "Windows Graphics Capture returned no frame");
-    }
-    using Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
-    const auto access = frame.Surface().as<IDirect3DDxgiInterfaceAccess>();
-    ComPtr<ID3D11Texture2D> texture;
-    winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(texture.GetAddressOf())));
-    std::vector<std::uint8_t> pixels;
-    UINT width = 0;
-    UINT height = 0;
-    error = copyTextureToMemory(device.Get(), context.Get(), texture.Get(), pixels, width, height);
-    frame.Close();
-    session.Close();
-    pool.Close();
-    if (error.hasError()) return error;
-    return encodePng(pixels, width, height, screenshot);
+bool isCaptureWindow(HWND window) {
+    return ::IsWindow(window) && ::IsWindowVisible(window) && !::IsIconic(window) &&
+           ::GetAncestor(window, GA_ROOT) == window;
 }
 
-MaiError captureDisplay(MaiScreenshot& screenshot) {
-    POINT pointer{};
-    if (!::GetCursorPos(&pointer)) {
-        return MaiError::make(MaiErrorCode::Internal, "GetCursorPos failed");
+MaiError closedTargetError() {
+    return MaiError::make(MaiErrorCode::NotFound,
+                          "capture target is closed, hidden, minimized, or disconnected");
+}
+
+MaiError canceledCaptureError() {
+    return MaiError::make(MaiErrorCode::Canceled, "screen capture was canceled");
+}
+
+// 静态帧只能在原交互环境仍有效时复用。WGC 的 Closed 只承诺目标关闭，不能用未收到事件
+// 推断会话仍已解锁或仍是输入桌面；这里只读查询这些状态，不切换桌面，也不声称验证实时采集许可。
+MaiError verifyCaptureEnvironment() {
+    DWORD sessionId = 0;
+    if (!::ProcessIdToSessionId(::GetCurrentProcessId(), &sessionId)) {
+        return MaiError::make(MaiErrorCode::NotConfigured,
+                              "cannot verify the interactive desktop session for screen capture");
     }
-    const HMONITOR monitor = ::MonitorFromPoint(pointer, MONITOR_DEFAULTTOPRIMARY);
-    try {
-        MaiWinRtApartment apartment;
-        using winrt::Windows::Graphics::Capture::GraphicsCaptureItem;
-        if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported()) {
-            return MaiError::make(MaiErrorCode::NotSupported,
-                                  "Windows Graphics Capture is not supported on this system");
+    LPWSTR raw = nullptr;
+    DWORD bytes = 0;
+    const BOOL queried = ::WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessionId,
+                                                       WTSSessionInfoEx, &raw, &bytes);
+    bool activeUnlocked = false;
+    if (queried && raw && bytes >= sizeof(WTSINFOEXW)) {
+        const auto* information = reinterpret_cast<const WTSINFOEXW*>(raw);
+        if (information->Level == 1) {
+            const auto& session = information->Data.WTSInfoExLevel1;
+            activeUnlocked = session.SessionId == sessionId && session.SessionState == WTSActive &&
+                             session.SessionFlags == WTS_SESSIONSTATE_UNLOCK;
         }
-        const auto interop =
-            winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-        GraphicsCaptureItem item{nullptr};
-        winrt::check_hresult(interop->CreateForMonitor(
-            monitor, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item)));
-        return captureGraphicsItem(item, screenshot);
-    } catch (const winrt::hresult_error& exception) {
-        return hresultError("Windows Graphics Capture", exception.code());
-    } catch (...) {
-        return MaiError::make(MaiErrorCode::Internal,
-                              "Windows Graphics Capture failed unexpectedly");
     }
-}
-
-MaiError captureWindow(HWND window, MaiScreenshot& screenshot) {
-    try {
-        MaiWinRtApartment apartment;
-        using winrt::Windows::Graphics::Capture::GraphicsCaptureItem;
-        if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported()) {
-            return MaiError::make(MaiErrorCode::NotSupported,
-                                  "Windows Graphics Capture is not supported on this system");
-        }
-        const auto interop =
-            winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-        GraphicsCaptureItem item{nullptr};
-        winrt::check_hresult(interop->CreateForWindow(window, winrt::guid_of<GraphicsCaptureItem>(),
-                                                      winrt::put_abi(item)));
-        return captureGraphicsItem(item, screenshot);
-    } catch (const winrt::hresult_error& exception) {
-        return hresultError("Windows Graphics Capture", exception.code());
-    } catch (...) {
-        return MaiError::make(MaiErrorCode::Internal,
-                              "Windows Graphics Capture failed unexpectedly");
-    }
-}
-
-MaiError captureWindow(const std::string& title, MaiScreenshot& screenshot) {
-    HWND window = nullptr;
-    const MaiError error = findWindow(title, window);
-    if (error.hasError()) return error;
-    return captureWindow(window, screenshot);
-}
-
-MaiError captureWindowById(std::uint64_t windowId, MaiScreenshot& screenshot) {
-    if (windowId == 0 || windowId > std::numeric_limits<std::uintptr_t>::max()) {
-        return MaiError::make(MaiErrorCode::InvalidInput,
-                              "windowId must be a non-zero native window identifier");
-    }
-    const HWND window = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(windowId));
-    // 句柄路径不能借标题查找或整屏兜底，否则同名窗口和已关闭目标会被替换成别的内容。
-    if (!::IsWindow(window) || !::IsWindowVisible(window) || ::IsIconic(window) ||
-        ::GetAncestor(window, GA_ROOT) != window) {
+    // 缓冲还包含用户和域名。只读上述状态字段后立即释放，不把结构或身份字段写入日志。
+    if (raw) ::WTSFreeMemory(raw);
+    if (!activeUnlocked) {
         return MaiError::make(
-            MaiErrorCode::NotFound,
-            "windowId does not identify a visible non-minimized top-level window");
+            MaiErrorCode::NotConfigured,
+            "screen capture requires an active unlocked interactive desktop session");
     }
-    return captureWindow(window, screenshot);
+    const HDESK input = ::OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    const HDESK current = ::GetThreadDesktop(::GetCurrentThreadId());
+    wchar_t inputName[256] = {};
+    wchar_t currentName[256] = {};
+    DWORD needed = 0;
+    const bool matches =
+        input && current &&
+        ::GetUserObjectInformationW(input, UOI_NAME, inputName, sizeof(inputName), &needed) &&
+        ::GetUserObjectInformationW(current, UOI_NAME, currentName, sizeof(currentName), &needed) &&
+        ::lstrcmpiW(inputName, currentName) == 0;
+    if (input) ::CloseDesktop(input);
+    if (!matches) {
+        return MaiError::make(MaiErrorCode::NotConfigured,
+                              "screen capture requires the current interactive desktop");
+    }
+    return {};
+}
+
+// 回调可能在撤销注册后才退栈，因此事件句柄必须由回调和 worker 共同持有，不能引用栈变量。
+// WGC 的内部线程只设置事件和关闭标记，不触碰 D3D immediate context 或调用方的取消函数。
+struct MaiScreenshotWakeState {
+    winrt::handle event{::CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+    std::atomic<bool> stopping{false};
+};
+
+struct MaiScreenshotTargetState {
+    std::atomic<bool> closed{false};
+};
+
+struct MaiScreenshotCommand {
+    MaiScreenshotRequest request;
+    std::mutex mutex;
+    std::condition_variable finished;
+    bool done = false;
+    MaiError error;
+    MaiScreenshot screenshot;
+
+    void complete(MaiError completionError, MaiScreenshot completionScreenshot = {}) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            error = std::move(completionError);
+            screenshot = error.hasError() ? MaiScreenshot{} : std::move(completionScreenshot);
+            done = true;
+        }
+        finished.notify_one();
+    }
+};
+
+// 此队列只承载截图命令。生命周期参考 Chromium base::Thread / SequenceBound：
+// 创建、调用、清理原生对象都在同一线程；stop 先唤醒等待，再清理并 join，不能 detach 后继续引用宿主。
+class MaiScreenshotWindowsWorker {
+public:
+    ~MaiScreenshotWindowsWorker() {
+        stop();
+    }
+
+    MaiScreenshotCaptureState state() {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return mState;
+    }
+
+    MaiError capture(const MaiScreenshotRequest& request, MaiScreenshot& screenshot) {
+        auto command = std::make_shared<MaiScreenshotCommand>();
+        command->request = request;
+        if (mStopsInProgress.load() != 0) return canceledCaptureError();
+        {
+            std::lock_guard<std::mutex> lifecycle(mLifecycleMutex);
+            if (mStopsInProgress.load() != 0) return canceledCaptureError();
+            const MaiError startError = start();
+            if (startError.hasError()) return startError;
+            std::lock_guard<std::mutex> lock(mMutex);
+            if (mStopsInProgress.load() != 0) return canceledCaptureError();
+            if (!mState.workerRunning) return mWorkerError;
+            if (mCommands.size() >= kMaximumPendingCaptures) {
+                return MaiError::make(MaiErrorCode::Busy, "screen capture queue is full");
+            }
+            mCommands.push_back(command);
+            ::SetEvent(mWake->event.get());
+        }
+        // 调用方必须等 worker 完成命令后才能返回，否则 request.isCanceled 可能悬挂引用调用上下文。
+        std::unique_lock<std::mutex> lock(command->mutex);
+        command->finished.wait(lock, [&] { return command->done; });
+        if (!command->error.hasError()) screenshot = std::move(command->screenshot);
+        return command->error;
+    }
+
+    MaiError stop() {
+        // 多个 stop 可以同时到达；前一个完成时不能重新开放后一个仍在等待收回的后端。
+        mStopsInProgress.fetch_add(1);
+        std::lock_guard<std::mutex> lifecycle(mLifecycleMutex);
+        if (mWorker.joinable()) {
+            mWake->stopping.store(true);
+            ::SetEvent(mWake->event.get());
+            mWorker.join();
+        }
+        mWake.reset();
+        mStopsInProgress.fetch_sub(1);
+        return {};
+    }
+
+private:
+    // mLifecycleMutex 序列化线程启动和收回；mMutex 仅保护队列和诊断，不跨原生调用持有。
+    MaiError start() {
+        bool running = false;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            running = mState.workerRunning;
+        }
+        if (mWorker.joinable() && running) return {};
+        if (mWorker.joinable()) mWorker.join();
+        mWake = std::make_shared<MaiScreenshotWakeState>();
+        if (!mWake->event) {
+            return MaiError::make(MaiErrorCode::Internal,
+                                  "CreateEvent failed while starting native capture");
+        }
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mWorkerError = {};
+            mState.workerRunning = true;
+        }
+        try {
+            mWorker = std::thread([this, wake = mWake] { run(wake); });
+            std::lock_guard<std::mutex> lock(mMutex);
+            ++mState.workerStarts;
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mState.workerRunning = false;
+            return MaiError::make(MaiErrorCode::Internal, "cannot start screen capture worker");
+        }
+        return {};
+    }
+
+    void setCapturing(bool capturing) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mState.capturing = capturing;
+    }
+
+    MaiError checkEnvironment(bool force) {
+        const auto now = std::chrono::steady_clock::now();
+        if (force || mEnvironmentCheckedAt == std::chrono::steady_clock::time_point{} ||
+            now - mEnvironmentCheckedAt >= std::chrono::milliseconds(kEnvironmentCheckMs)) {
+            mEnvironmentCheckedAt = now;
+            mEnvironmentError = verifyCaptureEnvironment();
+            if (mEnvironmentError.hasError()) closeCapture();
+        }
+        return mEnvironmentError;
+    }
+
+    DWORD environmentWaitMs() const {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - mEnvironmentCheckedAt)
+                                 .count();
+        if (elapsed >= kEnvironmentCheckMs) return 0;
+        return kEnvironmentCheckMs - static_cast<DWORD>(elapsed);
+    }
+
+    void clearLatestFrame() {
+        mLatestTexture.Reset();
+        mStagingTexture.Reset();
+        mFrameSequence = 0;
+        mFrameReceivedAtMs = 0;
+    }
+
+    void closeCapture() noexcept {
+        clearLatestFrame();
+        if (mTargetState) mTargetState->closed.store(true);
+        // 清理中的单项 COM 失败不能阻止其余对象释放，也不能逃出 worker 的退出路径。
+        try {
+            if (mPool && mHasFrameToken) mPool.FrameArrived(mFrameToken);
+        } catch (...) {
+        }
+        try {
+            if (mItem && mHasClosedToken) mItem.Closed(mClosedToken);
+        } catch (...) {
+        }
+        mHasFrameToken = false;
+        mHasClosedToken = false;
+        try {
+            if (mSession) mSession.Close();
+        } catch (...) {
+        }
+        try {
+            if (mPool) mPool.Close();
+        } catch (...) {
+        }
+        mSession = nullptr;
+        mPool = nullptr;
+        mItem = nullptr;
+        mTargetState.reset();
+        mWindow = nullptr;
+        mMonitor = nullptr;
+        mWindowProcess = 0;
+        mPoolSize = {};
+        setCapturing(false);
+    }
+
+    void releaseDevice() noexcept {
+        closeCapture();
+        mImagingFactory.Reset();
+        mCaptureDevice = nullptr;
+        mContext.Reset();
+        mDevice.Reset();
+    }
+
+    void discardFailedCapture() noexcept {
+        // CopyResource 没有 HRESULT；Map 或取帧报错后还要查询设备状态，下一次命令才重新建设备。
+        if (mDevice && FAILED(mDevice->GetDeviceRemovedReason())) {
+            releaseDevice();
+        } else {
+            closeCapture();
+        }
+    }
+
+    MaiError ensureDevice() {
+        if (mDevice && mCaptureDevice && mImagingFactory) return {};
+        releaseDevice();
+        MaiError error = createDefaultDevice(mDevice, mContext);
+        if (error.hasError()) return error;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            ++mState.deviceCreations;
+        }
+        ComPtr<IDXGIDevice> dxgiDevice;
+        HRESULT result = mDevice.As(&dxgiDevice);
+        if (FAILED(result)) return hresultError("ID3D11Device::QueryInterface", result);
+        result = ::CreateDirect3D11DeviceFromDXGIDevice(
+            dxgiDevice.Get(), reinterpret_cast<IInspectable**>(winrt::put_abi(mCaptureDevice)));
+        if (FAILED(result)) return hresultError("CreateDirect3D11DeviceFromDXGIDevice", result);
+        result = ::CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(mImagingFactory.GetAddressOf()));
+        if (FAILED(result)) return hresultError("CoCreateInstance(WICImagingFactory)", result);
+        return {};
+    }
+
+    MaiError selectTarget(const MaiScreenshotRequest& request,
+                          const std::shared_ptr<MaiScreenshotWakeState>& wake) {
+        // 必须先验证交互环境，再解释窗口句柄或建立新设备，避免非输入桌面被误报为普通目标丢失。
+        const MaiError environmentError = checkEnvironment(true);
+        if (environmentError.hasError()) return environmentError;
+        HWND window = nullptr;
+        HMONITOR monitor = nullptr;
+        DWORD windowProcess = 0;
+        if (request.target == MaiScreenshotTarget::WindowByTitle) {
+            const MaiError error = findWindow(request.windowTitle, window);
+            if (error.hasError()) {
+                closeCapture();
+                return error;
+            }
+        } else if (request.target == MaiScreenshotTarget::WindowById) {
+            if (request.windowId == 0 ||
+                request.windowId > std::numeric_limits<std::uintptr_t>::max()) {
+                closeCapture();
+                return MaiError::make(MaiErrorCode::InvalidInput,
+                                      "windowId must be a non-zero native window identifier");
+            }
+            window = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(request.windowId));
+        } else if (request.target == MaiScreenshotTarget::DisplayUnderPointer) {
+            POINT pointer{};
+            if (!::GetCursorPos(&pointer)) {
+                closeCapture();
+                return MaiError::make(MaiErrorCode::Internal, "GetCursorPos failed");
+            }
+            monitor = ::MonitorFromPoint(pointer, MONITOR_DEFAULTTOPRIMARY);
+        } else {
+            closeCapture();
+            return MaiError::make(MaiErrorCode::InvalidInput, "unknown screen capture target");
+        }
+        if (window && !isCaptureWindow(window)) {
+            closeCapture();
+            return closedTargetError();
+        }
+        if (window) ::GetWindowThreadProcessId(window, &windowProcess);
+        if (mSession && mWindow == window && mMonitor == monitor &&
+            mWindowProcess == windowProcess && mTargetState && !mTargetState->closed.load()) {
+            return {};
+        }
+        closeCapture();
+        using winrt::Windows::Graphics::Capture::GraphicsCaptureItem;
+        using winrt::Windows::Graphics::Capture::GraphicsCaptureSession;
+        if (!GraphicsCaptureSession::IsSupported()) {
+            return MaiError::make(MaiErrorCode::NotSupported,
+                                  "Windows Graphics Capture is not supported on this system");
+        }
+        const MaiError deviceError = ensureDevice();
+        if (deviceError.hasError()) return deviceError;
+        const auto interop =
+            winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+        if (window) {
+            winrt::check_hresult(interop->CreateForWindow(
+                window, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(mItem)));
+        } else {
+            winrt::check_hresult(interop->CreateForMonitor(
+                monitor, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(mItem)));
+        }
+        mPoolSize = mItem.Size();
+        if (mPoolSize.Width <= 0 || mPoolSize.Height <= 0) return closedTargetError();
+        using winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool;
+        using winrt::Windows::Graphics::DirectX::DirectXPixelFormat;
+        mPool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            mCaptureDevice, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, mPoolSize);
+        mTargetState = std::make_shared<MaiScreenshotTargetState>();
+        mFrameToken =
+            mPool.FrameArrived([wake](const auto&, const auto&) { ::SetEvent(wake->event.get()); });
+        mHasFrameToken = true;
+        mClosedToken = mItem.Closed([wake, target = mTargetState](const auto&, const auto&) {
+            target->closed.store(true);
+            ::SetEvent(wake->event.get());
+        });
+        mHasClosedToken = true;
+        mSession = mPool.CreateCaptureSession(mItem);
+        mWindow = window;
+        mMonitor = monitor;
+        mWindowProcess = windowProcess;
+        mSession.StartCapture();
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            ++mState.sessionStarts;
+            mState.capturing = true;
+        }
+        return {};
+    }
+
+    bool targetIsAvailable() const {
+        if (!mTargetState || mTargetState->closed.load()) return false;
+        if (mWindow) {
+            DWORD process = 0;
+            ::GetWindowThreadProcessId(mWindow, &process);
+            return isCaptureWindow(mWindow) && process == mWindowProcess;
+        }
+        MONITORINFO information{};
+        information.cbSize = sizeof(information);
+        return mMonitor && ::GetMonitorInfoW(mMonitor, &information);
+    }
+
+    MaiError drainFrames(const std::shared_ptr<MaiScreenshotWakeState>& wake) {
+        if (!mPool) return {};
+        if (!targetIsAvailable()) return closedTargetError();
+        // 有限批次避免高刷新率画面饿死命令队列；通常两个池缓冲读完后立即得到空帧。
+        for (unsigned received = 0; received < 16 && !wake->stopping.load(); ++received) {
+            auto frame = mPool.TryGetNextFrame();
+            if (!frame) break;
+            const auto contentSize = frame.ContentSize();
+            if (contentSize.Width <= 0 || contentSize.Height <= 0) {
+                frame.Close();
+                return closedTargetError();
+            }
+            if (contentSize.Width != mPoolSize.Width || contentSize.Height != mPoolSize.Height) {
+                // 帧表面仍是旧池大小。先交还帧、丢弃旧完整图，再按明确的新尺寸重建池和会话。
+                // 实测关闭会话后在旧池 CreateCaptureSession 返回 E_UNEXPECTED，因此必须整对更换。
+                // 只有尺寸变化才重配，保留 item 和设备；普通静态截图始终沿用原会话。
+                const char* resizeStage = "WGC resize frame.Close";
+                try {
+                    frame.Close();
+                    frame = nullptr;
+                    clearLatestFrame();
+                    resizeStage = "WGC resize session.Close";
+                    mSession.Close();
+                    mSession = nullptr;
+                    setCapturing(false);
+                    resizeStage = "WGC resize pool.FrameArrived/remove";
+                    mPool.FrameArrived(mFrameToken);
+                    mHasFrameToken = false;
+                    resizeStage = "WGC resize pool.Close";
+                    mPool.Close();
+                    mPool = nullptr;
+                    using winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool;
+                    using winrt::Windows::Graphics::DirectX::DirectXPixelFormat;
+                    resizeStage = "WGC resize pool.CreateFreeThreaded";
+                    mPool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+                        mCaptureDevice, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, contentSize);
+                    // 旧回调即使仍在退栈也只设置事件；新一代像素只能从新池读取，不能沿用旧图。
+                    resizeStage = "WGC resize pool.FrameArrived/add";
+                    mFrameToken = mPool.FrameArrived(
+                        [wake](const auto&, const auto&) { ::SetEvent(wake->event.get()); });
+                    mHasFrameToken = true;
+                    mPoolSize = contentSize;
+                    resizeStage = "WGC resize pool.CreateCaptureSession";
+                    mSession = mPool.CreateCaptureSession(mItem);
+                    resizeStage = "WGC resize session.StartCapture";
+                    mSession.StartCapture();
+                    {
+                        std::lock_guard<std::mutex> lock(mMutex);
+                        ++mState.sessionStarts;
+                        mState.capturing = true;
+                    }
+                } catch (const winrt::hresult_error& exception) {
+                    const MaiError error = hresultError(resizeStage, exception.code());
+                    // 空闲取帧也会经历 resize；保留固定阶段和 HRESULT，避免后台错误丢失定位信息。
+                    std::fprintf(stderr, "%s\n", error.message().c_str());
+                    return error;
+                }
+                continue;
+            }
+            using Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
+            const auto access = frame.Surface().as<IDirect3DDxgiInterfaceAccess>();
+            ComPtr<ID3D11Texture2D> texture;
+            winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(texture.GetAddressOf())));
+            D3D11_TEXTURE2D_DESC description{};
+            texture->GetDesc(&description);
+            if (description.Width < static_cast<UINT>(contentSize.Width) ||
+                description.Height < static_cast<UINT>(contentSize.Height)) {
+                frame.Close();
+                return MaiError::make(MaiErrorCode::Internal,
+                                      "capture frame surface is smaller than its content");
+            }
+            if (!mLatestTexture) {
+                description.Width = static_cast<UINT>(contentSize.Width);
+                description.Height = static_cast<UINT>(contentSize.Height);
+                description.BindFlags = 0;
+                description.CPUAccessFlags = 0;
+                description.MiscFlags = 0;
+                description.Usage = D3D11_USAGE_DEFAULT;
+                winrt::check_hresult(
+                    mDevice->CreateTexture2D(&description, nullptr, mLatestTexture.GetAddressOf()));
+            }
+            const D3D11_BOX region{0,
+                                   0,
+                                   0,
+                                   static_cast<UINT>(contentSize.Width),
+                                   static_cast<UINT>(contentSize.Height),
+                                   1};
+            mContext->CopySubresourceRegion(mLatestTexture.Get(), 0, 0, 0, 0, texture.Get(), 0,
+                                            &region);
+            frame.Close();
+            const HRESULT deviceStatus = mDevice->GetDeviceRemovedReason();
+            if (FAILED(deviceStatus)) return hresultError("capture D3D11 device", deviceStatus);
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                mFrameSequence = ++mState.framesReceived;
+            }
+            mFrameReceivedAtMs = MaiTime::getCurrentTime();
+        }
+        return {};
+    }
+
+    bool isCanceled(const MaiScreenshotRequest& request,
+                    const std::shared_ptr<MaiScreenshotWakeState>& wake) const {
+        return mStopsInProgress.load() != 0 || wake->stopping.load() ||
+               (request.isCanceled && request.isCanceled());
+    }
+
+    MaiError captureCurrent(const MaiScreenshotRequest& request, MaiScreenshot& screenshot,
+                            const std::shared_ptr<MaiScreenshotWakeState>& wake) {
+        if (isCanceled(request, wake)) return canceledCaptureError();
+        MaiError error = selectTarget(request, wake);
+        if (error.hasError()) return error;
+        const auto started = std::chrono::steady_clock::now();
+        const bool hadFrame = mLatestTexture != nullptr;
+        const auto previousSequence = mFrameSequence;
+        auto timeout = std::chrono::milliseconds(hadFrame ? kCaptureSettleMs : kCaptureTimeoutMs);
+        for (;;) {
+            if (isCanceled(request, wake)) return canceledCaptureError();
+            error = checkEnvironment(false);
+            if (error.hasError()) return error;
+            error = drainFrames(wake);
+            if (error.hasError()) return error;
+            if (mLatestTexture && (!hadFrame || mFrameSequence > previousSequence)) break;
+            // WGC 在 Windows 11 24H2 可能只发送变化的画面。已有完整图时短暂等候更新，
+            // 静态画面仍可沿用同一图及真实元数据；不能通过每次重启会话制造“新帧”。
+            if (!mLatestTexture) timeout = std::chrono::milliseconds(kCaptureTimeoutMs);
+            const auto elapsed = std::chrono::steady_clock::now() - started;
+            if (elapsed >= timeout) {
+                if (mLatestTexture) break;
+                return MaiError::make(MaiErrorCode::Internal,
+                                      "Windows Graphics Capture timed out waiting for a frame");
+            }
+            const DWORD wait = ::WaitForSingleObject(wake->event.get(),
+                                                     std::min(kCancelPollMs, environmentWaitMs()));
+            if (wait == WAIT_FAILED) {
+                return MaiError::make(MaiErrorCode::Internal, "capture event wait failed");
+            }
+        }
+        if (isCanceled(request, wake)) return canceledCaptureError();
+        error = checkEnvironment(true);
+        if (error.hasError()) return error;
+        if (!targetIsAvailable()) return closedTargetError();
+        std::vector<std::uint8_t> pixels;
+        UINT width = 0;
+        UINT height = 0;
+        error = copyTextureToMemory(mDevice.Get(), mContext.Get(), mLatestTexture.Get(),
+                                    mStagingTexture, pixels, width, height);
+        if (error.hasError()) return error;
+        error = checkEnvironment(true);
+        if (error.hasError()) return error;
+        error = encodePng(mImagingFactory.Get(), pixels, width, height, screenshot);
+        if (error.hasError()) return error;
+        if (isCanceled(request, wake)) return canceledCaptureError();
+        error = checkEnvironment(true);
+        if (error.hasError()) return error;
+        if (!targetIsAvailable()) return closedTargetError();
+        screenshot.frameSequence = mFrameSequence;
+        screenshot.frameReceivedAtMs = mFrameReceivedAtMs;
+        return {};
+    }
+
+    void execute(const std::shared_ptr<MaiScreenshotCommand>& command,
+                 const std::shared_ptr<MaiScreenshotWakeState>& wake) {
+        MaiScreenshot screenshot;
+        MaiError error;
+        try {
+            error = captureCurrent(command->request, screenshot, wake);
+        } catch (const winrt::hresult_error& exception) {
+            error = hresultError("Windows Graphics Capture", exception.code());
+        } catch (...) {
+            error = MaiError::make(MaiErrorCode::Internal,
+                                   "Windows Graphics Capture failed unexpectedly");
+        }
+        if (error.hasError() && error.code() != MaiErrorCode::Canceled) discardFailedCapture();
+        command->complete(std::move(error), std::move(screenshot));
+    }
+
+    void run(const std::shared_ptr<MaiScreenshotWakeState>& wake) {
+        MaiThread::setCurrentName("mai-capture");
+        MaiError terminalError = canceledCaptureError();
+        try {
+            MaiWinRtApartment apartment;
+            try {
+                while (!wake->stopping.load()) {
+                    std::shared_ptr<MaiScreenshotCommand> command;
+                    {
+                        std::lock_guard<std::mutex> lock(mMutex);
+                        if (!mCommands.empty()) {
+                            command = mCommands.front();
+                            mCommands.pop_front();
+                        }
+                    }
+                    if (command) {
+                        execute(command, wake);
+                        continue;
+                    }
+                    try {
+                        MaiError error = checkEnvironment(false);
+                        if (!error.hasError()) error = drainFrames(wake);
+                        if (error.hasError()) discardFailedCapture();
+                    } catch (...) {
+                        discardFailedCapture();
+                    }
+                    // 即使 WGC 不再投帧，也按环境检查的剩余期限唤醒，失效后立即丢弃缓存并关目标。
+                    const DWORD wait =
+                        ::WaitForSingleObject(wake->event.get(), environmentWaitMs());
+                    if (wait == WAIT_FAILED) {
+                        terminalError = MaiError::make(MaiErrorCode::Internal,
+                                                       "capture worker event wait failed");
+                        break;
+                    }
+                }
+            } catch (...) {
+                terminalError = MaiError::make(MaiErrorCode::Internal,
+                                               "screen capture worker failed unexpectedly");
+            }
+            // Apartment 的析构必须晚于所有 WinRT、WIC、D3D 对象的释放。
+            releaseDevice();
+        } catch (const winrt::hresult_error& exception) {
+            terminalError = hresultError("screen capture apartment", exception.code());
+        } catch (...) {
+            terminalError =
+                MaiError::make(MaiErrorCode::Internal, "cannot initialize screen capture worker");
+        }
+        std::deque<std::shared_ptr<MaiScreenshotCommand>> pending;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mState.workerRunning = false;
+            mState.capturing = false;
+            mWorkerError = terminalError;
+            pending.swap(mCommands);
+        }
+        for (const auto& command : pending) command->complete(terminalError);
+    }
+
+    std::mutex mLifecycleMutex;
+    std::mutex mMutex;
+    std::atomic<unsigned> mStopsInProgress{0};
+    std::thread mWorker;
+    std::shared_ptr<MaiScreenshotWakeState> mWake;
+    std::deque<std::shared_ptr<MaiScreenshotCommand>> mCommands;
+    MaiScreenshotCaptureState mState;
+    MaiError mWorkerError;
+
+    // 下列状态只由 mai-capture 访问；stop 在 join 后才允许其他线程销毁 worker 门面。
+    std::chrono::steady_clock::time_point mEnvironmentCheckedAt{};
+    MaiError mEnvironmentError;
+    ComPtr<ID3D11Device> mDevice;
+    ComPtr<ID3D11DeviceContext> mContext;
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice mCaptureDevice{nullptr};
+    ComPtr<IWICImagingFactory> mImagingFactory;
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem mItem{nullptr};
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool mPool{nullptr};
+    winrt::Windows::Graphics::Capture::GraphicsCaptureSession mSession{nullptr};
+    winrt::event_token mFrameToken{};
+    winrt::event_token mClosedToken{};
+    bool mHasFrameToken = false;
+    bool mHasClosedToken = false;
+    std::shared_ptr<MaiScreenshotTargetState> mTargetState;
+    HWND mWindow = nullptr;
+    HMONITOR mMonitor = nullptr;
+    DWORD mWindowProcess = 0;
+    winrt::Windows::Graphics::SizeInt32 mPoolSize{};
+    ComPtr<ID3D11Texture2D> mLatestTexture;
+    ComPtr<ID3D11Texture2D> mStagingTexture;
+    std::uint64_t mFrameSequence = 0;
+    std::int64_t mFrameReceivedAtMs = 0;
+};
+
+MaiScreenshotWindowsWorker& screenshotWorker() {
+    static MaiScreenshotWindowsWorker worker;
+    return worker;
 }
 
 }  // namespace
@@ -458,16 +966,19 @@ bool maiIsScreenshotSupported() {
     return true;
 }
 
+MaiScreenshotCaptureState maiScreenshotCaptureState() {
+    return screenshotWorker().state();
+}
+
+MaiError maiStopScreenshotCapture() {
+    maiAssertBlockingAllowed("maiStopScreenshotCapture");
+    return screenshotWorker().stop();
+}
+
 MaiError maiCaptureScreenshot(const MaiScreenshotRequest& request, MaiScreenshot& screenshot) {
     maiAssertBlockingAllowed("maiCaptureScreenshot");
     screenshot = MaiScreenshot{};
-    if (request.target == MaiScreenshotTarget::WindowByTitle) {
-        return captureWindow(request.windowTitle, screenshot);
-    }
-    if (request.target == MaiScreenshotTarget::WindowById) {
-        return captureWindowById(request.windowId, screenshot);
-    }
-    return captureDisplay(screenshot);
+    return screenshotWorker().capture(request, screenshot);
 }
 
 MaiError maiListCaptureWindows(std::vector<std::string>& titles) {

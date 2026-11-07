@@ -2,6 +2,8 @@
 // desktop_computer tool. The deterministic slot uses an in-process editor; the
 // native slot delegates every platform operation to production and controls a
 // separately owned editor process through the same real conversation UI.
+// Model observations use metadata/UIA only; native captures are separate fixture
+// evidence and never enter the model conversation.
 #include <QApplication>
 #include <QBuffer>
 #include <QDir>
@@ -112,6 +114,7 @@ public:
         return output;
     }
     MaiError capture(const DesktopNativeWindow&, MaiScreenshot& output) override {
+        ++captureCount;
         QImage image;
         onUi([&] { image = editorWindow_.grab().toImage(); });
         QByteArray png;
@@ -176,6 +179,7 @@ public:
 
     int inputCount = 0;
     int readCount = 0;
+    int captureCount = 0;
     bool sawEmptyReplacement = false;
     bool sawSelectAll = false;
     bool evidenceOk = true;
@@ -220,9 +224,15 @@ public:
         state_->started = true;
         for (const auto& tool : request.tools)
             if (tool.name == "desktop_computer") state_->declaredTool = true;
-        for (const auto& message : request.messages)
+        for (const auto& message : request.messages) {
+            // No step requests vision: even a synthetic image observation would
+            // violate the model-facing metadata/UIA-only computer contract.
+            if (!message.images.empty())
+                return state_->fail("computer metadata workflow unexpectedly sent model images");
             if (message.role == MaiModelRole::User && message.content == prompt_) state_->receivedChinesePrompt = true;
-        if (!state_->declaredTool.load()) return state_->fail("desktop_computer was absent from the real Agent tool list");
+        }
+        if (!state_->declaredTool.load())
+            return state_->fail("desktop_computer was absent from the real Agent tool list");
         if (next_ != 0) {
             Json result;
             bool found = false;
@@ -234,7 +244,8 @@ public:
             if (!found || !result.is_object()) {
                 std::string detail;
                 for (const auto& message : request.messages)
-                    if (message.role == MaiModelRole::ToolResult && message.toolCallId == lastCallId_) detail = message.content;
+                    if (message.role == MaiModelRole::ToolResult && message.toolCallId == lastCallId_)
+                        detail = message.content;
                 return state_->fail("the Agent did not return a valid paired computer tool result: " + detail);
             }
             {
@@ -255,6 +266,8 @@ public:
                 snapshotId_ = result.value("snapshot_id", std::string());
                 if (snapshotId_.empty() || result.value("window_id", std::string()) != windowId_)
                     return state_->fail("observe did not return a snapshot for the listed editor ID");
+                if (result.contains("image_path") || result.value("has_image", false))
+                    return state_->fail("computer observe exposed an image in its metadata result");
             } else if (previousAction == "verify") {
                 if (!result.value("verified", false) || result.value("actual_text", std::string()) != expected_)
                     return state_->fail("the actual editor text did not match expected_text");
@@ -616,6 +629,7 @@ void DesktopComputerAgentIntegrationTest::chinesePromptTraversesRealAgentAndRead
     QVERIFY(backend->sawEmptyReplacement);
     QCOMPARE(backend->inputCount, 7);
     QCOMPARE(backend->readCount, 1);
+    QCOMPARE(backend->captureCount, 0);
     QVERIFY(backend->evidenceOk);
     QVERIFY(controller.agent().listPendingPermissions().empty());
     bool sawUser = false;
@@ -745,10 +759,14 @@ void DesktopComputerAgentIntegrationTest::nativePromptTraversesRealAgentAndReads
     if (!foregroundReady) return failOrSkipNativeReadiness(foregroundReady.error());
     if (!foregroundReady.value()) {
         QVERIFY(!backend->beganInput.load());
-        return skipNative("Owned native editor is not the actual foreground with all keyboard/mouse input released for 200 ms; no native input was sent.");
+        return skipNative(
+            "Owned native editor is not the actual foreground with all keyboard/mouse input released for 200 ms; no "
+            "native input was sent.");
     }
-    // Read-only preflight checks the actual capture, UIA and secure-input
-    // permissions before the real conversation is allowed to dispatch input.
+    // Capture is separate native fixture evidence. It is never returned by the
+    // metadata/UIA-only model tool or attached to the real conversation.
+    // Read-only preflight checks capture, UIA and secure-input permissions before
+    // the real conversation is allowed to dispatch input.
     MaiScreenshot preflightCapture;
     const MaiError captured = backend->capture(target, preflightCapture);
     if (captured) return failOrSkipNativeReadiness(captured);
@@ -826,7 +844,8 @@ void DesktopComputerAgentIntegrationTest::nativePromptTraversesRealAgentAndReads
     QCOMPARE(calls, std::size_t(17));
     QCOMPARE(results, calls);
     QCOMPARE(backend->inputs.load(), 7);
-    QVERIFY(backend->reads.load() >= 2);  // Real preflight and real tool verify.
+    QCOMPARE(backend->captures.load(), 1);  // Only the explicit preflight capture.
+    QVERIFY(backend->reads.load() >= 2);    // Real preflight and real tool verify.
     QVERIFY(stateBelongsToChild(child));
     QCOMPARE(child.value("text", std::string()), expectedText);
     QCOMPARE(child.value("confirmed_text", std::string()), expectedText);

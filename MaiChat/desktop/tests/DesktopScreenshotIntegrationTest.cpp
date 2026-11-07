@@ -1,6 +1,6 @@
-// Exercises the real Creation Center composer, Agent loop, native screenshot,
-// image feedback and media card. Only this process's nonce-titled window is captured;
-// the scripted model decodes PNG bytes and makes no claim of visual understanding.
+// Exercises the real Creation Center composer, screen-only screenshot tool,
+// Agent image feedback and media card with a controlled native owned-window source.
+// This does not capture the actual display or test a model's visual understanding.
 #include <QApplication>
 #include <QDir>
 #include <QElapsedTimer>
@@ -28,6 +28,7 @@
 #include <CoreGraphics/CoreGraphics.h>
 #endif
 #include "MaiScreenshot.h"
+#include "MaiScreenshotTool.h"
 #include "agent/AgentChatPanel.h"
 #include "agent/AgentController.h"
 #include "markdown/MarkdownView.h"
@@ -44,6 +45,7 @@ struct ScriptState {
     QByteArray png;
     Json trace = Json::array();
     int requests = 0;
+    std::atomic<int> captureCalls{0};
     MaiError fail(const std::string& message) {
         error = message;
         failed = true;
@@ -53,9 +55,8 @@ struct ScriptState {
 
 class ScreenshotScript final : public MaiModelClient {
 public:
-    ScreenshotScript(std::shared_ptr<ScriptState> state, QString title, QSize pixels, QString prompt)
-        : state_(std::move(state)), title_(title.toUtf8().toStdString()), pixels_(pixels),
-          prompt_(prompt.toUtf8().toStdString()) {}
+    ScreenshotScript(std::shared_ptr<ScriptState> state, QSize pixels, QString prompt)
+        : state_(std::move(state)), pixels_(pixels), prompt_(prompt.toUtf8().toStdString()) {}
 
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                     const std::atomic<bool>& cancel) override {
@@ -67,6 +68,15 @@ public:
         for (const auto& tool : request.tools) {
             screenshotDeclared |= tool.name == "screenshot";
             mediaDeclared |= tool.name == "agent_send_media";
+            if (tool.name == "list_windows") return state_->fail("legacy screenshot window listing was declared");
+            if (tool.name == "screenshot") {
+                const Json schema = Json::parse(tool.parametersJson, nullptr, false);
+                if (!schema.is_object()) return state_->fail("screen capture schema is invalid");
+                const Json properties = schema.value("properties", Json::object());
+                if (properties.contains("mode") || properties.contains("windowTitle") ||
+                    properties.contains("window_id") || !properties.contains("action"))
+                    return state_->fail("screenshot tool exposes a window target or lacks its capture action");
+            }
         }
         for (const auto& message : request.messages)
             promptFound |= message.role == MaiModelRole::User && message.content == prompt_;
@@ -74,7 +84,7 @@ public:
             return state_->fail("real Agent request lacks the prompt or production tool declarations");
         if (!sink.onToolCall) return state_->fail("missing Agent tool dispatch callback");
         if (step == 0) {
-            const Json input{{"mode", "window"}, {"windowTitle", title_}};
+            const Json input{{"action", "capture"}};
             state_->trace.push_back({{"tool", "screenshot"}, {"input", input}});
             sink.onToolCall({"owned-capture", "screenshot", input.dump()});
             return {};
@@ -89,12 +99,14 @@ public:
             }
         if (pairedCount != 1) return state_->fail("missing or duplicate paired production tool result");
         const Json result = Json::parse(paired->content, nullptr, false);
-        state_->trace.push_back({{"call_id", expectedId}, {"result", result.is_discarded() ? Json(paired->content) : result}});
+        state_->trace.push_back(
+            {{"call_id", expectedId}, {"result", result.is_discarded() ? Json(paired->content) : result}});
         if (!result.is_object()) return state_->fail(paired->content);
         if (step == 1) {
             if (result.value("type", "") != "image" || result.value("mime_type", "") != "image/png" ||
-                result.value("mode", "") != "window" || !result.contains("image_path") ||
-                !result["image_path"].is_string()) return state_->fail("screenshot JSON contract is incomplete");
+                result.value("mode", "") != "display" || !result.contains("image_path") ||
+                !result["image_path"].is_string())
+                return state_->fail("screenshot JSON contract is incomplete");
             state_->imagePath = result["image_path"].get<std::string>();
             const QString relative = QString::fromStdString(state_->imagePath);
             const QString root = QFileInfo(QString::fromStdString(request.workingDirectory)).canonicalFilePath();
@@ -118,7 +130,7 @@ public:
             if (!state_->png.startsWith(QByteArray::fromHex("89504e470d0a1a0a")) || decoded.isNull() ||
                 decoded.size() != pixels_ || result.value("width", 0) != decoded.width() ||
                 result.value("height", 0) != decoded.height())
-                return state_->fail("saved native PNG dimensions do not match the isolated owner window");
+                return state_->fail("controlled-source PNG dimensions do not match the isolated owner window");
             const Json input{{"file_path", state_->imagePath}, {"type", "image"}};
             state_->trace.push_back({{"tool", "agent_send_media"}, {"input", input},
                                      {"attachment", "same_saved_native_png"}, {"decoded_width", decoded.width()},
@@ -130,14 +142,13 @@ public:
             result.value("path", "") != state_->imagePath || result.value("type", "") != "image" ||
             result.value("mime_type", "") != "image/png" || result.value("bytes", qint64(0)) != state_->png.size())
             return state_->fail("media receipt did not deliver the same original native PNG");
-        if (sink.onText) sink.onText("The captured fixture image is attached.");
+        if (sink.onText) sink.onText("The image from the controlled native test source is attached.");
         state_->done = true;
         return {};
     }
     MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
 private:
     std::shared_ptr<ScriptState> state_;
-    std::string title_;
     QSize pixels_;
     std::string prompt_;
 };
@@ -158,7 +169,13 @@ bool saveBytes(const QString& path, const QByteArray& bytes) {
     QSaveFile output(path);
     return output.open(QIODevice::WriteOnly) && output.write(bytes) == bytes.size() && output.commit();
 }
-} // namespace
+
+struct StopControlledCaptureOnExit {
+    ~StopControlledCaptureOnExit() {
+        maiStopScreenshotCapture();
+    }
+};
+}  // namespace
 
 class DesktopScreenshotIntegrationTest final : public QObject {
     Q_OBJECT
@@ -189,6 +206,7 @@ void DesktopScreenshotIntegrationTest::nativeCaptureReturnsToCreationCenter() {
     QVERIFY(workspace.isValid());
     const QString nonce = QUuid::createUuid().toString(QUuid::WithoutBraces);
     QWidget owned(nullptr, Qt::Window | Qt::FramelessWindowHint);
+    StopControlledCaptureOnExit stopCapture;
     owned.setAttribute(Qt::WA_ShowWithoutActivating);
     owned.setWindowTitle(QStringLiteral("MaiChat isolated screenshot %1").arg(nonce));
     owned.setFixedSize(480, 320);
@@ -201,12 +219,29 @@ void DesktopScreenshotIntegrationTest::nativeCaptureReturnsToCreationCenter() {
     fixtureLayout->addWidget(marker);
     owned.show();
     QVERIFY(QTest::qWaitForWindowExposed(&owned));
-    const QSize pixels(qRound(owned.width() * owned.devicePixelRatioF()), qRound(owned.height() * owned.devicePixelRatioF()));
-    const QString prompt = QStringLiteral("Capture only my isolated test window '%1' and show that same image here.")
-                               .arg(owned.windowTitle());
+    const QSize pixels(qRound(owned.width() * owned.devicePixelRatioF()),
+                       qRound(owned.height() * owned.devicePixelRatioF()));
+    const QString prompt =
+        QStringLiteral("Capture the screen through the controlled test source and show that same image here.");
     auto state = std::make_shared<ScriptState>();
-    AgentController controller(std::make_unique<ScreenshotScript>(state, owned.windowTitle(), pixels, prompt),
-                               workspace.filePath(QStringLiteral("screenshot-agent.sqlite")));
+    const std::string ownedTitle = owned.windowTitle().toUtf8().toStdString();
+    AgentController controller(
+        std::make_unique<ScreenshotScript>(state, pixels, prompt),
+        workspace.filePath(QStringLiteral("screenshot-agent.sqlite")), [state, ownedTitle](MaiToolRegistry& registry) {
+            registry.add(
+                makeMaiScreenshotTool([state, ownedTitle](const MaiScreenshotRequest& request, MaiScreenshot& output) {
+                    // The public screen tool must ask for the display. Only this
+                    // controlled host source substitutes its own nonce-titled window.
+                    if (request.target != MaiScreenshotTarget::DisplayUnderPointer || !request.windowTitle.empty() ||
+                        request.windowId != 0)
+                        return MaiError{MaiErrorCode::Protocol, "controlled source expected a display capture request"};
+                    ++state->captureCalls;
+                    MaiScreenshotRequest controlled = request;
+                    controlled.target = MaiScreenshotTarget::WindowByTitle;
+                    controlled.windowTitle = ownedTitle;
+                    return maiCaptureScreenshot(controlled, output);
+                }));
+        });
     QVERIFY(controller.openError().isEmpty());
     QVERIFY(controller.setApprovalPolicy(MaiApprovalPolicy::Never));
     QVERIFY(controller.setDefaultModel(QStringLiteral("deepseek-flash")));
@@ -232,9 +267,15 @@ void DesktopScreenshotIntegrationTest::nativeCaptureReturnsToCreationCenter() {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (!evidence.isEmpty()) {
             QVERIFY(QDir().mkpath(evidence));
-            if (!state->png.isEmpty()) QVERIFY(saveBytes(QDir(evidence).filePath(QStringLiteral("native-owned-window.png")), state->png));
-            const Json transcript{{"backend", "production_native_window_screenshot"}, {"model", "deepseek-flash"},
-                                  {"requests", state->requests}, {"error", state->error}, {"trace", state->trace}};
+            if (!state->png.isEmpty())
+                QVERIFY(saveBytes(QDir(evidence).filePath(QStringLiteral("native-owned-window.png")), state->png));
+            const Json transcript{{"backend", "controlled_native_owned_window_source"},
+                                  {"actual_full_display_capture", false},
+                                  {"model", "deepseek-flash"},
+                                  {"capture_calls", state->captureCalls.load()},
+                                  {"requests", state->requests},
+                                  {"error", state->error},
+                                  {"trace", state->trace}};
             QByteArray sanitized = QByteArray::fromStdString(transcript.dump(2));
             sanitized.replace(workspace.path().toUtf8(), "<temporary-workspace>");
             sanitized.replace(QDir::toNativeSeparators(workspace.path()).toUtf8(), "<temporary-workspace>");
@@ -252,6 +293,7 @@ void DesktopScreenshotIntegrationTest::nativeCaptureReturnsToCreationCenter() {
             QFAIL(state->error.c_str());
         }
         QCOMPARE(state->requests, 3);
+        QCOMPARE(state->captureCalls.load(), 1);
         QVERIFY(state->done.load());
     }
     QCOMPARE(QDir(workspace.filePath(QStringLiteral("screenshots"))).entryList({QStringLiteral("*.png")}, QDir::Files).size(), 1);

@@ -648,6 +648,16 @@ void AgentControllerTest::registers_a_screenshot_tool_that_requires_approval() {
     std::unique_ptr<MaiTool> screenshot = makeMaiScreenshotTool();
     QCOMPARE(QString::fromStdString(screenshot->name()), QStringLiteral("screenshot"));
     QVERIFY(screenshot->requiresApproval(QStringLiteral("{}").toStdString()));
+    const QJsonObject screenshotSchema =
+        QJsonDocument::fromJson(QByteArray::fromStdString(screenshot->parametersSchema())).object();
+    const QJsonObject screenshotProperties = screenshotSchema.value(QStringLiteral("properties")).toObject();
+    QVERIFY(!screenshotProperties.contains(QStringLiteral("mode")));
+    QVERIFY(!screenshotProperties.contains(QStringLiteral("windowTitle")));
+    const QJsonArray screenshotActions =
+        screenshotProperties.value(QStringLiteral("action")).toObject().value(QStringLiteral("enum")).toArray();
+    QCOMPARE(screenshotActions.size(), 2);
+    QVERIFY(screenshotActions.contains(QStringLiteral("capture")));
+    QVERIFY(screenshotActions.contains(QStringLiteral("stop")));
     MaiToolContext textModelContext;
     textModelContext.model = "glm-5.3";
     const MaiToolResult unsupported = screenshot->execute("{}", textModelContext);
@@ -677,7 +687,7 @@ void AgentControllerTest::registers_a_screenshot_tool_that_requires_approval() {
     }
     QCOMPARE(foundScreenshot, maiIsScreenshotSupported() && expectedViewImage);
     QCOMPARE(foundViewImage, expectedViewImage);
-    QCOMPARE(foundListWindows, maiIsScreenshotSupported());
+    QVERIFY(!foundListWindows);
 }
 
 // 验证宿主工具注册顺序与内置工具同时可见；顺序变化不能覆盖需要审批的内置工具。
