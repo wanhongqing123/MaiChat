@@ -131,8 +131,10 @@ four verified Portrait models and ONNX Runtime, and normal/debug-plugin system-P
 from staging. The pre-fix candidate crash and its different binary hash are retained.
 After removing the unused startup setting, the final build/staging executable is
 SHA256 `11296b712215a45a940f9263790a4cf03fbcf42ce39424b7bb7cebeb81827921`.
-Final executable/ZIP hashes, full source identity, actual ZIP checks and the
-post-fix smoke results belong to the delivery receipt.
+The actual ZIP extraction repeats the same 42-PE and four-model gates and passes
+both normal and debug-plugin bare-system-PATH smoke. Build, staging and extracted
+executables are byte-identical. Full source identity, archive hashes and the four
+owned smoke processes are recorded in the [delivery receipt](maichat-qt-ui-delivery-20261109.json).
 
 ## Mac validation and boundaries
 
@@ -159,6 +161,18 @@ icon/style loading, pixel readback, rewritten dependencies/rpaths, strict signin
 and no build-SDK/Homebrew/retired-Qt dependency. A private normal App staging passes
 33 Mach-O dependency checks and ordinary sandboxed bare-PATH smoke; the same previously failing debug-plugin exit
 also passes after the logger fix described above. Installed PID 96951 is not replaced.
+
+After the final Windows-only startup-variable cleanup, Mac explicitly recompiles
+`main.cpp` and creates a new private stage; that pre-fast-forward candidate passes.
+The final authoritative artifacts are rebuilt and restaged after the safe fast
+forward to `f01c592d675a8eedb7438df6d15cf73d11009ce0`. Their source executable is
+SHA256 `c78d121c0b327fe9f0dd58f35abeafed16a09e05cf3fe55617935ce5d06adba5`;
+the signed stage executable is
+`933f1181c1a1de2ad7b8c872000a6289d693123f91d6faae6b567e062ecd3742`.
+The final stage passes 33-Mach-O/signature/four-model gates and the same sandboxed
+Cocoa smoke: normal exit 0 in 3.025 seconds and debug-plugin exit 0 in 0.676 seconds.
+Earlier Mac hashes remain historical candidates. The unchanged 92-suite source
+inputs are not rerun or counted twice.
 
 Actual Mac execution is macOS 27.2 arm64. Older cached media/vendor objects and some
 Homebrew dependencies have a higher minOS than the declared 14.4 target. This work

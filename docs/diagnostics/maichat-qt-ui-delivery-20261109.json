@@ -1,0 +1,1531 @@
+{
+  "status": "PRIVATE_PACKAGING_PASS_WITH_RECORDED_ACCEPTANCE_BOUNDARIES",
+  "createdAt": "2026-11-08T18:48:16.073287+00:00",
+  "source": {
+    "base": "b95e1ff006628bbf1301d7ec42749f6417442f36",
+    "codeCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0",
+    "tree": "6584634c878837b8ab406bd020a10fa9f5951020",
+    "MaiChatTree": "fa8724995009ce88242af4b55b9468fa763f11d2",
+    "CoreTree": "69e18eb1e4b587b30ad8b467dd3172bea0443b8e",
+    "files": [
+      {
+        "path": ".gitmodules",
+        "mode": "100644",
+        "blob": "f1300f117a9007580b0f5c6373df3d6e6229e246",
+        "rawSHA256": "106acb0b1d6712c4b9bab60ae292372bfedf26ddf508eb7e704e6a533cfa7514"
+      },
+      {
+        "path": "MaiChat/Media/MaiCameraCapture.h",
+        "mode": "100644",
+        "blob": "ec11e4cd641cc38fa2aef73b5b833ad3488efef9",
+        "rawSHA256": "e1358fa789a715ae4550775ec4f8557e4d41a2c6ead3c57cec318d029ab9c5f2"
+      },
+      {
+        "path": "MaiChat/Media/MaiCameraCaptureMac.mm",
+        "mode": "100644",
+        "blob": "594673e9e71939c448471f82dae2da86205f11c7",
+        "rawSHA256": "6439128e5f32154f987bb50809435cf1d068a3009d441b523c5ae8c7a6bd7680"
+      },
+      {
+        "path": "MaiChat/Media/MaiCameraCaptureWindows.cpp",
+        "mode": "100644",
+        "blob": "8447cb57744247514aeaad02dd38e8e717916eba",
+        "rawSHA256": "db873af7b990755d49e0a04f80c3dc3aa8b62309901323bafb8f5c84935e767c"
+      },
+      {
+        "path": "MaiChat/Media/MaiMediaProbe.cpp",
+        "mode": "100644",
+        "blob": "e98010f9fd51a33cf7f6e5c828a11f5311d74bb8",
+        "rawSHA256": "5aa56050ab5b9e50c55e6c0c255427e5dbb03ab934564c97bed673ffc0a47f7b"
+      },
+      {
+        "path": "MaiChat/Media/MaiMediaProbe.h",
+        "mode": "100644",
+        "blob": "c8db61afe8ca1b966651d86737f8f359132ddc0c",
+        "rawSHA256": "a5b1f71eea864676b6d0a7f4ba37ef3b836de9a293fb4b94dfe82343228d7f69"
+      },
+      {
+        "path": "MaiChat/Media/ffplay.c",
+        "mode": "100644",
+        "blob": "c2c3d605e55ff18403b92e739656d34fac9a059f",
+        "rawSHA256": "7cb95eb4445f08269528cad0ce2c284936370ca492225b0837f16adbef485052"
+      },
+      {
+        "path": "MaiChat/Media/tests/MaiCameraCaptureMacTests.mm",
+        "mode": "100644",
+        "blob": "b175ad0f26f9f2cd9721e8e9517898ca549617f4",
+        "rawSHA256": "b3074711e4369bcf6606a9ed51c5b12d29eb51b504675e73d2c0c497abf41f80"
+      },
+      {
+        "path": "MaiChat/Media/tests/MaiCameraCaptureWindowsTests.cpp",
+        "mode": "100644",
+        "blob": "67e0c213fd39d7ac7b55fa0bb4299beb8a78103b",
+        "rawSHA256": "bb2c723e92ba79e0440c32d4ec280c706caaa78837ab538a252f4c9807a232e4"
+      },
+      {
+        "path": "MaiChat/Media/tests/MaiMediaProbeTests.cpp",
+        "mode": "100644",
+        "blob": "a38ab9b6e78e69d149510ae3cf5a5f698bf9cc8e",
+        "rawSHA256": "e73cd59adeca94dd961e0feee8544296d1c79e6ae0885e9b832259b8ae645fa0"
+      },
+      {
+        "path": "MaiChat/Network/MaiNativeSystemProxy.h",
+        "mode": "100644",
+        "blob": "bedbe7297a67c69a8367a561b865f6f122c859f8",
+        "rawSHA256": "97b4ff7c599d30346e4d76c49d99d1c36d424232d63d391c10ce7b7006c11c5d"
+      },
+      {
+        "path": "MaiChat/Network/MaiNativeSystemProxyMac.mm",
+        "mode": "100644",
+        "blob": "94dc527f8415c04b9998fcb3052d6b2ef84ee661",
+        "rawSHA256": "6cd6a201e6fe8465936f3ad7a1f210907e92c395241d8c6c4839c1536bcf8f78"
+      },
+      {
+        "path": "MaiChat/Network/MaiNativeSystemProxyWindows.cpp",
+        "mode": "100644",
+        "blob": "15296f08ca54a4773b6103c33471089e9c97b5eb",
+        "rawSHA256": "7e56ae5380754b13c6762fe710390873fe30fc3d433f8339c85069fcae18decc"
+      },
+      {
+        "path": "MaiChat/Network/MaiSystemProxy.cpp",
+        "mode": "100644",
+        "blob": "edc473f0bdc08e71a445a3544bb1e3cd1981db05",
+        "rawSHA256": "23556a6e0d9b663f3817aa38b9707688433b2cd87d7a7f0268a0d6f305c9e367"
+      },
+      {
+        "path": "MaiChat/Network/MaiSystemProxy.h",
+        "mode": "100644",
+        "blob": "3cb97b53dfffbfd60f16e05b7c07bbd2a0853892",
+        "rawSHA256": "5d3ac9e5ef6207e17f0798aa94f658fe44a9b4bd869d2bc24a8aa47deb31ee02"
+      },
+      {
+        "path": "MaiChat/Network/MaiSystemProxyInternal.h",
+        "mode": "100644",
+        "blob": "d6a9b1befbb2f01aa698e6626b45378e1e122937",
+        "rawSHA256": "4b207d7c0d59aa01c625b86a1f9a7ba6285bf90ce58f683937dd81ced099c0cd"
+      },
+      {
+        "path": "MaiChat/Network/tests/MaiNativeSystemProxyMacTests.mm",
+        "mode": "100644",
+        "blob": "021ceabd129b18ac8224b204ccdf96860697493c",
+        "rawSHA256": "24b1356ebcab18c8d3c0315a86a475e2aff1fa4d047c2a66e4ac686c15bedd73"
+      },
+      {
+        "path": "MaiChat/Network/tests/MaiNativeSystemProxyWindowsTests.cpp",
+        "mode": "100644",
+        "blob": "27f60525d44358ac1d16398022d9b2fdbb0177e2",
+        "rawSHA256": "a0861254f629bc7e7bef927f6ab6e64d0d25d8406941db6884d75ead55704eba"
+      },
+      {
+        "path": "MaiChat/Network/tests/MaiSystemProxyTests.cpp",
+        "mode": "100644",
+        "blob": "486c2f6cafcd0879f1a6cbb77ff36e28fff6c114",
+        "rawSHA256": "67bc3f553c61ad6ce0ffd5feb20f92a791d79689d37910c9ac0c19bf7d6454ab"
+      },
+      {
+        "path": "MaiChat/SessionSync/MaiCdpTransport.cpp",
+        "mode": "100644",
+        "blob": "691c4eb5cb771bfa3232efb54290e191322f1fc3",
+        "rawSHA256": "74493c0abfd332ff7a0ad6e313044cbacf1b21ab24495b35fa5dcce7d92891df"
+      },
+      {
+        "path": "MaiChat/SessionSync/MaiCdpTransport.h",
+        "mode": "100644",
+        "blob": "a72a049bf85c4ee9b6d54925fdab5750efe26531",
+        "rawSHA256": "ceed72cb48382ef5160b2a42942e1f332b2b09ab8617b3fddb33941c217def00"
+      },
+      {
+        "path": "MaiChat/SessionSync/MaiSessionSyncSocket.cpp",
+        "mode": "100644",
+        "blob": "4986bdbce7b2cb8f7e11659ac6cb8d68543e3161",
+        "rawSHA256": "5edec2e03b9d41c97644c66903b098bfc5a9fb7117bd3e16ce4d8fb7548a09a6"
+      },
+      {
+        "path": "MaiChat/SessionSync/tests/MaiCdpTransportTests.cpp",
+        "mode": "100644",
+        "blob": "2dc21cf99a9b34a4bcb59bbd40c581aa464fb521",
+        "rawSHA256": "8298057e175cd0c8eb0286a479e2a95eff5ee49dfc775ea88c17f6bd8539535b"
+      },
+      {
+        "path": "MaiChat/SessionSync/tests/MaiSessionSyncProxyTests.cpp",
+        "mode": "100644",
+        "blob": "27930fe2d8f3940cc30516ed1b4fc122132229e3",
+        "rawSHA256": "dae83f6cab284214fd0654be125e2d53033bbbba83440e88cbbd372285ef6c5e"
+      },
+      {
+        "path": "MaiChat/desktop/CMakeLists.txt",
+        "mode": "100644",
+        "blob": "9cd675de4798313962794be72f9a4d6c543310bf",
+        "rawSHA256": "f72b040fb7046a198f05dbe89d61549e0c0bbab9bb3e6dff9b121fa0ab8ea86d"
+      },
+      {
+        "path": "MaiChat/desktop/README.md",
+        "mode": "100644",
+        "blob": "56a4c5cbc454df9f1bebbd949a9e6797197ed4a2",
+        "rawSHA256": "7f188da05edee4c5f64846496a2de70a5d66a342953903179833ef35ff274ce0"
+      },
+      {
+        "path": "MaiChat/desktop/cmake/MaiChatQt.cmake",
+        "mode": "100644",
+        "blob": "6ee7ef8171e2f09e3c5b7272f7c6b6d65ed2f533",
+        "rawSHA256": "bb5ca250e6a72cf76b907f3257b4ce1f9a1a78ece4f3cda2b59cfb08c42b7355"
+      },
+      {
+        "path": "MaiChat/desktop/cmake/MaiNativeComponents.cmake",
+        "mode": "100644",
+        "blob": "65fcf3e294f86e9066a1ac5c2f21024e8a30e023",
+        "rawSHA256": "cf7d1f0465a7a3697dcf8b258834510a3d58fd195acee283fa0d9982e69eb2cd"
+      },
+      {
+        "path": "MaiChat/desktop/qt/.gitignore",
+        "mode": "100644",
+        "blob": "0e03e15f242082fb4ffce1d7f5f061b59ca010bb",
+        "rawSHA256": "12de5da259979ec5807ebc92805b7e0767b68cb92305be64cc31cf2d8f539247"
+      },
+      {
+        "path": "MaiChat/desktop/qt/UPSTREAM.md",
+        "mode": "100644",
+        "blob": "f1a9d2635961094a0abe3faf7626308121515180",
+        "rawSHA256": "2725bd71693650baaf4cf14d97002dc7e0aeb23d1731241fcee7492a7e17f77c"
+      },
+      {
+        "path": "MaiChat/desktop/qt/qtbase",
+        "mode": "160000",
+        "blob": "025bdad181de241e81bf853c8a2d7bf3d19261a9"
+      },
+      {
+        "path": "MaiChat/desktop/qt/qtimageformats",
+        "mode": "160000",
+        "blob": "dc13f2fbff1d579cfb2eb2d9092e3563b4d05b8e"
+      },
+      {
+        "path": "MaiChat/desktop/qt/qtsvg",
+        "mode": "160000",
+        "blob": "883a58532078d003cefef0a549bfe9f885ce41f5"
+      },
+      {
+        "path": "MaiChat/desktop/qt/sources.lock.json",
+        "mode": "100644",
+        "blob": "70dffeff49cb84dfd80c8cf2a2e2f196216cd338",
+        "rawSHA256": "d3e6588302e908a2dfa8bd6f2f9eff93d1e1821e6bd64bd1290c421b507b3ae4"
+      },
+      {
+        "path": "MaiChat/desktop/resources/macos/Info.plist.in",
+        "mode": "100644",
+        "blob": "1f11be5241392b62f328ddb9d5d76f6e706e1019",
+        "rawSHA256": "e8b1d85cac155dfce5d2bc7c25861a6384337080623c4ee460d1d932be1b6c45"
+      },
+      {
+        "path": "MaiChat/desktop/scripts/build-qt.py",
+        "mode": "100644",
+        "blob": "16239bc48fbdac68cfd8e27f0abafa634065650a",
+        "rawSHA256": "ad47708d1b89b56432156f87c0a5bb768e9ecc6f1bdc85a07355308e1c74f888"
+      },
+      {
+        "path": "MaiChat/desktop/scripts/package-macos.sh",
+        "mode": "100755",
+        "blob": "3867985f3b398bcb83fda29635c7717d4fc22c35",
+        "rawSHA256": "c3e24849e58229f51e5b23420d47bb883899dc7d32a9a383d97ab6b4de7a759b"
+      },
+      {
+        "path": "MaiChat/desktop/scripts/package-windows.ps1",
+        "mode": "100644",
+        "blob": "b087f9f5e7daca1f03443497e7e72fc24ede45a5",
+        "rawSHA256": "03bc1121f22b902dd74b70cb0d1255b755332ec53cbb292da8d88dc97c2a6ded"
+      },
+      {
+        "path": "MaiChat/desktop/scripts/run-tests-windows.ps1",
+        "mode": "100644",
+        "blob": "fee936aeefa2a3b6325765ea9c222749d1118765",
+        "rawSHA256": "43465c9fcaf92dab40e42af9d9b9b1e71e89139647b2ed937da432df4f16c426"
+      },
+      {
+        "path": "MaiChat/desktop/scripts/verify-windows-runtime.ps1",
+        "mode": "100644",
+        "blob": "1e12ab7c8b30e4eddbdf618a7d5a1fa590f90058",
+        "rawSHA256": "eb71817540ef5a331430e088dfadf43eee0ced2aa449d496c93714405c87e328"
+      },
+      {
+        "path": "MaiChat/desktop/src/MaiChatTools/DesktopBrowserTools.cpp",
+        "mode": "100644",
+        "blob": "7908cb80e4c51b928264fbf262f4bec36f5b86b1",
+        "rawSHA256": "9abc5345ec4084c495a0a0acd1fb13dd983d85bea9cfc159b598f442c2a5c70c"
+      },
+      {
+        "path": "MaiChat/desktop/src/MaiChatTools/DesktopBrowserTools.h",
+        "mode": "100644",
+        "blob": "67733d3f9b995c004aec41755c12f5b66682836d",
+        "rawSHA256": "4587b76494c4e43e0a6fc4e67f92ae3a109f191d90d376377cbbc3aa8c4b8d27"
+      },
+      {
+        "path": "MaiChat/desktop/src/MaiChatTools/DesktopPdfRenderer.cpp",
+        "mode": "100644",
+        "blob": "4fcc164a27b0e106c25634dc560682897cb8d001",
+        "rawSHA256": "0c3c507f7cf2228d8fdc250de49ca4e0e088f47808d9adbece59674098906e2c"
+      },
+      {
+        "path": "MaiChat/desktop/src/MaiChatTools/DesktopProcessTools.cpp",
+        "mode": "100644",
+        "blob": "747e5c07141fa58d385c764dad5ed7811a6a3145",
+        "rawSHA256": "42d7855150d558c497a4df3853458a5dc03c5e40fbeffd833daa192c0aa530d7"
+      },
+      {
+        "path": "MaiChat/desktop/src/MaiChatTools/MaiChatHostTools.cpp",
+        "mode": "100644",
+        "blob": "53c0e564b8cf0458280af5adb094050b8c8022b0",
+        "rawSHA256": "2069f3403eff1226ae9ee07c5ad2531cab4474aeb616e788650ba0f2b0a2d247"
+      },
+      {
+        "path": "MaiChat/desktop/src/agent/AgentChatPanel.cpp",
+        "mode": "100644",
+        "blob": "d2db9ece10deae36306bfd3b2ca2cabd760d47ef",
+        "rawSHA256": "1b5708975d033bfa2515006f8274b9faa0497fc9bb78a7338678ce9aee06c44f"
+      },
+      {
+        "path": "MaiChat/desktop/src/agent/DesktopAccountModelClient.cpp",
+        "mode": "100644",
+        "blob": "64a213f5edc801215f20e543e686773313ea97a3",
+        "rawSHA256": "c11d35d365d151c65e415014b0a8ebc9d2a9dbb33a0960f4071ad2235e378d67"
+      },
+      {
+        "path": "MaiChat/desktop/src/agent/DesktopAccountModelClient.h",
+        "mode": "100644",
+        "blob": "3cae85479a1a866680d6265f20bdab52793bfbe7",
+        "rawSHA256": "b10562e7c1b9a4dceb2d4553c49c0c2ff6b30815ef2323a1c9b4de1af5b63f5b"
+      },
+      {
+        "path": "MaiChat/desktop/src/agent/DesktopSessionSyncChannel.cpp",
+        "mode": "100644",
+        "blob": "4dd9fe661b327a37fc5702ab21486a6a44b21b13",
+        "rawSHA256": "5ea63143db7db8c242af1d7ee63ea23506afe0b3a0a782ed583632bfb0b6000c"
+      },
+      {
+        "path": "MaiChat/desktop/src/agent/DesktopSessionSyncChannel.h",
+        "mode": "100644",
+        "blob": "3e8ee963f75109f8f14986980bc982a27f4dd887",
+        "rawSHA256": "52d79543aae844a04b9ec440e5864f55772c927d7f3f70493a07034e166b81ee"
+      },
+      {
+        "path": "MaiChat/desktop/src/app/RemoteIMApplication.cpp",
+        "mode": "100644",
+        "blob": "156e3c815d7ea9cbdca3c7961a3bb7a7b19aff33",
+        "rawSHA256": "f6ae08b975ad7198851bd63107ec410d7c8d47942d3f3fc1c13707449d59e1af"
+      },
+      {
+        "path": "MaiChat/desktop/src/auth/DesktopAuthClient.cpp",
+        "mode": "100644",
+        "blob": "31e14b647c51b6a3b680107d5f107d5e43785e9a",
+        "rawSHA256": "0b68e3d83d7ddb97d992cc906da7c1fb2b6fc83779ddf24c5a36662c5e29e339"
+      },
+      {
+        "path": "MaiChat/desktop/src/im/DesktopCurlAttachmentDownload.cpp",
+        "mode": "100644",
+        "blob": "0ccd5037bb954dc65f6412ad3671b25dd9ba28c2",
+        "rawSHA256": "fccc31ebe129298abd35a678f168b87114fde6f557ac4192cca2891e9449d2a9"
+      },
+      {
+        "path": "MaiChat/desktop/src/im/DesktopCurlAttachmentDownload.h",
+        "mode": "100644",
+        "blob": "c07aa135e87602425f56e24e35dd1796dfe169e7",
+        "rawSHA256": "8e53babc787cad6f32937944d66f224f5986b0ba08b07c62b9997a4d121001a6"
+      },
+      {
+        "path": "MaiChat/desktop/src/im/FakeRemoteIMClient.cpp",
+        "mode": "100644",
+        "blob": "61072d917b4cbb39cef048b7ba59b0e222131970",
+        "rawSHA256": "38c45ea19f4ea96cec3383e389649ccbacecdd71f23970c77db549afa1042966"
+      },
+      {
+        "path": "MaiChat/desktop/src/im/TimSdkRemoteIMClient.cpp",
+        "mode": "100644",
+        "blob": "353a3e8384812fed494c53eac04aaaf621be2eda",
+        "rawSHA256": "f6e3c1a3579c590d5cbe1b179a18b33d5588d5cd22287cfc1e8dfe85b5aa59f4"
+      },
+      {
+        "path": "MaiChat/desktop/src/logging/AppLog.cpp",
+        "mode": "100644",
+        "blob": "3ddbfdf187ecf91aad0460a43b54544eb9812f47",
+        "rawSHA256": "20ef16000d942abfc167cae0b0edb95da3477921a706c749ac225de0c43f1575"
+      },
+      {
+        "path": "MaiChat/desktop/src/main.cpp",
+        "mode": "100644",
+        "blob": "60e81f88717bd585b48e4b5e5194544e5d8b295a",
+        "rawSHA256": "7dca670243d31b24bdf996cdbcc5fc9496c50200874cd5bd3a4d076b76c35c75"
+      },
+      {
+        "path": "MaiChat/desktop/src/markdown/MarkdownLayout.cpp",
+        "mode": "100644",
+        "blob": "855ef5308b1da1721de5bed10602e92e634cd973",
+        "rawSHA256": "0ba80dd6dfc5f32e1e5991537d73c44d294f45a80b4842824f898d2e936ca985"
+      },
+      {
+        "path": "MaiChat/desktop/src/network/DesktopServiceRoute.cpp",
+        "mode": "100644",
+        "blob": "2538ea4a7528ddc680ee18b18c4aec16d1bb0f4a",
+        "rawSHA256": "1c700fd77307a73c396b6eb5ace3043fb802e17be06af6e19fe085ce10111e35"
+      },
+      {
+        "path": "MaiChat/desktop/src/network/DesktopServiceRoute.h",
+        "mode": "100644",
+        "blob": "98ecffe007f6d5821427111d3a438af1ca2e4df1",
+        "rawSHA256": "434eb8e2d579f2e23d21c2754544acda7bdfd3cc4a60483ad8c36555c5d8231d"
+      },
+      {
+        "path": "MaiChat/desktop/src/storage/LocalMessageDatabase.cpp",
+        "mode": "100644",
+        "blob": "a8ea0b866c1568db012d3e550e048405e53780ef",
+        "rawSHA256": "268960bf8c7331d79b46bfe6e296526b931de44ce032fb1b7185254a8ed7e5f6"
+      },
+      {
+        "path": "MaiChat/desktop/src/storage/LocalMessageDatabase.h",
+        "mode": "100644",
+        "blob": "623e822023c7a79208821a2381d6785f2938c454",
+        "rawSHA256": "0fbdca5d5eae6898be52a5ede454a008bb85f384735e71fb14f0070f4aafadcc"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/ComposerResizeSplitter.cpp",
+        "mode": "100644",
+        "blob": "984abbe44d8ac781c5f367eab7a2854c250c48fc",
+        "rawSHA256": "ea154b14fd58478c42943b98159a9586a46070eae90e9ee5c0aee469b8e1e3a0"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/ComposerTextEdit.h",
+        "mode": "100644",
+        "blob": "5ba09d92b4e1ba76be53c418f4e06f0e4bef6cd7",
+        "rawSHA256": "71d991ae3c46195aae5ebc4db8f26ac2a8f56eef73b6a23f2a19f68028c84219"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/DesktopAudioPlayback.cpp",
+        "mode": "100644",
+        "blob": "edae92b5ef56fe57a3c2590877829ce6529f4bfc",
+        "rawSHA256": "901d260e1af329335ec14f381daf685d49102a3c8ef8219a5bdd5984e302e2cb"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/DesktopAudioPlayback.h",
+        "mode": "100644",
+        "blob": "15594ec17503cd34bffe2e1beea2b5dc3c67eecc",
+        "rawSHA256": "6c51d1dafc67810b4751a692a98f95e63f905fe3fbb42eb1b12860a9d8dff914"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/DesktopCameraDialog.cpp",
+        "mode": "100644",
+        "blob": "b642ef42d98c3d87ae4ac7ab0f3078c9f6a73291",
+        "rawSHA256": "82edcb755340d9bb8920e972b8656b3cd62c99fb6550d63a372ddfcac709706a"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/DesktopCameraDialog.h",
+        "mode": "100644",
+        "blob": "97a4d93a930835e5f71efd0f6eb94ba8eef1802f",
+        "rawSHA256": "e1354edf93cbd7813c3969607ee57a19fa11fbe7c485a7053eab9e3cc1f8dc43"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/DesktopCameraSession.cpp",
+        "mode": "100644",
+        "blob": "248ecac5a15c31d46d8761a109676af7f8e0fd68",
+        "rawSHA256": "4b8d07b14522f8cb7f84ff8de9a91024f982da177611bc43963aedc8f619c737"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/DesktopCameraSession.h",
+        "mode": "100644",
+        "blob": "3e37caf2f8cdd57c5d8f377ff158fd6bb226bdff",
+        "rawSHA256": "08e98eef495cd3baea22b4b20aa70ecaaa5d61731b6757e8f5dc0781defb08db"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/DesktopMusicPlayerDialog.cpp",
+        "mode": "100644",
+        "blob": "2cac6c6b3aa1902872533f334613ff3defcf92aa",
+        "rawSHA256": "fd001eec4a5199037dfee8302abe2831e9d52a2468931998b1770208e1a0df04"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/DesktopMusicPlayerDialog.h",
+        "mode": "100644",
+        "blob": "9b1dcbf2a3bd0bf4ae01f92f36f10757ec5d258b",
+        "rawSHA256": "4d836f771e2c5d655f63bd97fea82813af7c6f9930267d5210d8d73059811deb"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/ImagePreviewDialog.h",
+        "mode": "100644",
+        "blob": "00dbd3fbcc6e88f612d0b975dd0fbd85ee99bc69",
+        "rawSHA256": "eb495684b354b822c60b9e0f76e1bd3937a3a8ffc453be209d9b917b06e76efb"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/MaiFfplayVideoDialog.cpp",
+        "mode": "100644",
+        "blob": "f232229c21853eddf94624a09529ea47c8b8b40f",
+        "rawSHA256": "6322d210c3db8011d96569fa570d81d6cffb20a5dfec4f6ce47c98b4bacc0553"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/MainWindow.cpp",
+        "mode": "100644",
+        "blob": "93b70114f4d3f4cdc170686bebff7140b11c40b1",
+        "rawSHA256": "8e9cf92d12489082cf7b4a215df6cd9d14b15dbf1aabb456ae84fb1a930244a7"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/MainWindow.h",
+        "mode": "100644",
+        "blob": "37c6639fbc014aacaa78b37b3f453a4d8257e174",
+        "rawSHA256": "00fe417dbe322f2f24d86d75931a382bc6e8b7144bac58d60a3105b3187488b4"
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/VideoPreviewDialog.cpp",
+        "deleted": true
+      },
+      {
+        "path": "MaiChat/desktop/src/ui/VideoPreviewDialog.h",
+        "deleted": true
+      },
+      {
+        "path": "MaiChat/desktop/tests/AgentControllerTest.cpp",
+        "mode": "100644",
+        "blob": "b32230b7fd47241fb95b25b58f68604a3dba1c6f",
+        "rawSHA256": "99ab6fcf4d2bf1a3d56f26b15b44837d5901a6c38787315d7a2000ff3f39dc3e"
+      },
+      {
+        "path": "MaiChat/desktop/tests/AgentPanelSessionTest.cpp",
+        "mode": "100644",
+        "blob": "84fc9593e07f51bb9149cc970a495bbb50260279",
+        "rawSHA256": "49ba6634975d57ed31b51301dfe023fa6390a074042f6ec13c6985d51eefc606"
+      },
+      {
+        "path": "MaiChat/desktop/tests/AppLogLifecycleTest.cpp",
+        "mode": "100644",
+        "blob": "014e3371aa73a2b4bb8d084eb549a7c255ada5a8",
+        "rawSHA256": "3db041e11c833528c5c4b9ff9cd4971759ebf31c585e9fa709b13aa91b25c337"
+      },
+      {
+        "path": "MaiChat/desktop/tests/AttachmentDownloadEvidenceTest.cpp",
+        "mode": "100644",
+        "blob": "5dd49a32e46dfdd42f8b2a39eb5382cb86db7409",
+        "rawSHA256": "40146fdeadc2196ca81b3a573b78215dd78ccc0161b6385150e7a1b3e6124353"
+      },
+      {
+        "path": "MaiChat/desktop/tests/DesktopAudioPlaybackTest.cpp",
+        "mode": "100644",
+        "blob": "df0d04168d5278dae06dfae2dd50d4b907629ebe",
+        "rawSHA256": "c7b5207b254c5323df66afa6a3e888bfab37608654b0ca463c2b3bc0808f8299"
+      },
+      {
+        "path": "MaiChat/desktop/tests/DesktopBrowserToolsTest.cpp",
+        "mode": "100644",
+        "blob": "845555d1d78ef510a72697d2d2deb913c185d031",
+        "rawSHA256": "ff3442a08f45103cacb9066428c98d311ce4ef4de3b72a512dca625355a4f0af"
+      },
+      {
+        "path": "MaiChat/desktop/tests/DesktopCameraDialogTest.cpp",
+        "mode": "100644",
+        "blob": "b063e173ad3bbacb74f67cce1650b3f587371788",
+        "rawSHA256": "1163d0f300d6cbcdbcc6d8bc0a756df2f256f995200e95dc8728eda8a1f9dd05"
+      },
+      {
+        "path": "MaiChat/desktop/tests/DesktopCameraNativeFake.cpp",
+        "mode": "100644",
+        "blob": "f0739141639585cf7382648d19acfafa82aeb3be",
+        "rawSHA256": "b1556b1e53c1422597f44b7066edbb76b45aa3277fc580c9813cf15b64d961ca"
+      },
+      {
+        "path": "MaiChat/desktop/tests/DesktopCameraNativeFake.h",
+        "mode": "100644",
+        "blob": "d4059b6d6b9edf2aebbe906b877dc20de00a097b",
+        "rawSHA256": "ea13a0ba95e4522f46376661bcd37271a33dd5b6119be2f02798ccd148acd582"
+      },
+      {
+        "path": "MaiChat/desktop/tests/DesktopCameraSessionTest.cpp",
+        "mode": "100644",
+        "blob": "a3021f9cc64061d3b52c1e012c2c6a67cf0250da",
+        "rawSHA256": "c0e331ce4b69a1a09cb502a628f0548c2ae5fea5ee7d16b37e43e698e164792b"
+      },
+      {
+        "path": "MaiChat/desktop/tests/DesktopComputerAgentIntegrationTest.cpp",
+        "mode": "100644",
+        "blob": "cea576f0b92154028d5ba7bdeadc805d34c6e30f",
+        "rawSHA256": "3afaf33a0ef31df05b6e603f1b3cf36cc263ccf39a1d7632eb64954dff2dc428"
+      },
+      {
+        "path": "MaiChat/desktop/tests/DesktopScreenshotIntegrationTest.cpp",
+        "mode": "100644",
+        "blob": "4e074749ca6f30e05e133869a9ef315850093580",
+        "rawSHA256": "c6ca8924c70c751a61c8bf9a94fb3e8df7da7791e8a805c524c7a02ae194acd3"
+      },
+      {
+        "path": "MaiChat/desktop/tests/DesktopSessionSyncChannelTest.cpp",
+        "mode": "100644",
+        "blob": "6ba5095ca015fedbc8e95542f620384a2b4f6cfe",
+        "rawSHA256": "7c947c1d3e3a0ca84dbb02d9b8f0448cd3c69447e8b662db61d29a71c5dc16b8"
+      },
+      {
+        "path": "MaiChat/desktop/tests/LocalMessageDatabaseTest.cpp",
+        "mode": "100644",
+        "blob": "470481d9ac736786e25639abea4a2955fbd842c4",
+        "rawSHA256": "b2307f8d89f1bdc9862b6d495e3d764817bf28ed1098d5f1955ccfa6d06cc661"
+      },
+      {
+        "path": "MaiChat/desktop/tests/LoginDialogTest.cpp",
+        "mode": "100644",
+        "blob": "8b04e8947e0114ebf4f0524afefe4f7ca3da4ae1",
+        "rawSHA256": "af264610661cb05d5eb9975ea409dc3f97f8b124e93db541ec557e378b314c93"
+      },
+      {
+        "path": "MaiChat/desktop/tests/MaiFfplayVideoDialogTest.cpp",
+        "mode": "100644",
+        "blob": "5862eed5c80fc33822903d2f8ab06547c9365a8f",
+        "rawSHA256": "bee64fe435ef93ceff2a1fe5e0a911bd7146737fd8ae260e9c6b4a01487dd87b"
+      },
+      {
+        "path": "MaiChat/desktop/tests/MainWindowLayoutTest.cpp",
+        "mode": "100644",
+        "blob": "0abfcd7f1a180eb8cd198f8a0cd4ee21e973bdef",
+        "rawSHA256": "0f1036316ef8b194b6be455ac4cf0f4837eb82d9d0936465fd888e5b53aa5c07"
+      },
+      {
+        "path": "MaiChat/desktop/tests/MessageImageLoaderTest.cpp",
+        "mode": "100644",
+        "blob": "935fe65e5af803f5eca09080caa3f69cdc71ec65",
+        "rawSHA256": "ad65f3751ffba89f7e258c501c634e023d6dbc366036a1c3b83dfc5732b30365"
+      },
+      {
+        "path": "MaiChat/desktop/tests/PdfPreviewDialogTest.cpp",
+        "mode": "100644",
+        "blob": "1c9d26426f29806d4609759f7f36c9b12681ebbf",
+        "rawSHA256": "9b67a81090b2625b60ff9f1d64b3495ccce4510d705440109a8b5cb9068d0e8c"
+      },
+      {
+        "path": "MaiChat/desktop/tests/QtSourceRuntimeTest.cpp",
+        "mode": "100644",
+        "blob": "e62f2510a924bde8749a43b0604da0ab644afab2",
+        "rawSHA256": "7af0a264242e20ce916a41ca7b8449806b23c3651c2b564d78dd74575c1539cf"
+      },
+      {
+        "path": "MaiChat/desktop/tests/UiZoomTest.cpp",
+        "mode": "100644",
+        "blob": "320a2f7476577b02e796d8d8d987aba85ec9a9ad",
+        "rawSHA256": "0707ff8364b9516a5a4339e0ebbae0dcd168ad2624ed0ac1a3f8e783264ee248"
+      },
+      {
+        "path": "MaiChat/desktop/tests/VideoPreviewDialogTest.cpp",
+        "deleted": true
+      },
+      {
+        "path": "MaiChat/desktop/tests/test_qt_builder_includes.py",
+        "mode": "100644",
+        "blob": "25df321739a7d714bbbd1f3ada6cd2bd07ac9869",
+        "rawSHA256": "86cf63436216421ef2446ab05d52433389b1304bc1fe287e576b090eed9ef539"
+      },
+      {
+        "path": "docs/diagnostics/maichat-qt-ui-boundary-20261109.md",
+        "mode": "100644",
+        "blob": "6048c860ab8251db05537252d593517798fe519b",
+        "rawSHA256": "208607875576cb734c91908fb14810abb5d20d9141833743c0d09f889e1b82be"
+      },
+      {
+        "path": "docs/diagnostics/maichat-qt6-source-integration-20261108.md",
+        "mode": "100644",
+        "blob": "d369f68d07c27622a3d8a7c0137e89832ae9f57c",
+        "rawSHA256": "0a4cb0d3f0ab81d448d53e5c1b05780fb7380fe1f95b814ea0d0b877b4599c99"
+      },
+      {
+        "path": "docs/superpowers/plans/2026-11-08-qt-ui-media-websocket.md",
+        "mode": "100644",
+        "blob": "9dd987168c6a4f40c63adf581b70606f47ddc825",
+        "rawSHA256": "2d14b418f93a61c0fb1c9db74633ed8a0d403ef5b22f50c6f087a810e7dd57a6"
+      }
+    ]
+  },
+  "windows": {
+    "platform": "Windows 11 x64",
+    "compiler": "MSVC 2022 14.44",
+    "qtVersion": "6.12.0 source SDK",
+    "artifact": {
+      "sourceCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0",
+      "zip": {
+        "name": "MaiChat-win64-v2.2.52-20261109-f01c592d.zip",
+        "bytes": 241963996,
+        "sha256": "e33978010ff55f1d85a83c01a244abe4d20894d07ad40b4ad3c09de90a9c9c5a"
+      },
+      "buildExe": {
+        "name": "maichat.exe",
+        "bytes": 165046784,
+        "sha256": "11296b712215a45a940f9263790a4cf03fbcf42ce39424b7bb7cebeb81827921"
+      },
+      "stagingExe": {
+        "name": "maichat.exe",
+        "bytes": 165046784,
+        "sha256": "11296b712215a45a940f9263790a4cf03fbcf42ce39424b7bb7cebeb81827921"
+      },
+      "extractedExe": {
+        "name": "maichat.exe",
+        "bytes": 165046784,
+        "sha256": "11296b712215a45a940f9263790a4cf03fbcf42ce39424b7bb7cebeb81827921"
+      },
+      "elapsedSeconds": 16.487,
+      "installerExecuted": false,
+      "installedAppReplaced": false,
+      "published": false
+    },
+    "stagePECount": 42,
+    "zipPECount": 42,
+    "missingOrRetiredQtImports": 0,
+    "portraitModelsVerified": 4,
+    "smokes": {
+      "staging-smoke": {
+        "status": "PASS",
+        "pid": 18456,
+        "runningPath": "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\maichat.exe",
+        "exitCode": 0,
+        "elapsedSeconds": 1.886,
+        "version": "2.2.52",
+        "qtVersion": "6.12.0",
+        "executable": {
+          "name": "maichat.exe",
+          "bytes": 165046784,
+          "sha256": "11296b712215a45a940f9263790a4cf03fbcf42ce39424b7bb7cebeb81827921"
+        },
+        "pathEnvironment": "C:\\WINDOWS\\System32;C:\\WINDOWS",
+        "logEvidence": [
+          "2026-11-09 02:44:10.913 [I] version: 2.2.52  qt: 6.12.0",
+          "2026-11-09 02:44:10.914 [I] executable: E:/OpenSource/MaiChat/.cache/qt-ui-boundary-20261108/private-verified/MaiChat-win64/maichat.exe",
+          "2026-11-09 02:44:10.914 [I] pid: 18456",
+          "2026-11-09 02:44:10.914 [I] log file: C:/Users/18034/AppData/Roaming/MaiChat/Desktop IM/logs/maichat-20261109.log",
+          "2026-11-09 02:44:10.914 [I] [im] libcurl TLS backend=OpenSSL/3.5.9"
+        ],
+        "qtDebugPlugins": null,
+        "loadedQtModules": [
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\Qt6Svg.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\Qt6Widgets.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\Qt6Gui.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\Qt6Core.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\platforms\\qwindows.dll"
+        ],
+        "pluginLoadEvidence": [],
+        "boundary": "Only this new --smoke child ran; login.start and account restore are skipped. Qt may append a startup header to its normal known-folder log; no existing log was read or copied."
+      },
+      "staging-debug-smoke": {
+        "status": "PASS",
+        "pid": 23728,
+        "runningPath": "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\maichat.exe",
+        "exitCode": 0,
+        "elapsedSeconds": 1.038,
+        "version": "2.2.52",
+        "qtVersion": "6.12.0",
+        "executable": {
+          "name": "maichat.exe",
+          "bytes": 165046784,
+          "sha256": "11296b712215a45a940f9263790a4cf03fbcf42ce39424b7bb7cebeb81827921"
+        },
+        "pathEnvironment": "C:\\WINDOWS\\System32;C:\\WINDOWS",
+        "logEvidence": [
+          "2026-11-09 02:44:12.612 [I] version: 2.2.52  qt: 6.12.0",
+          "2026-11-09 02:44:12.612 [I] executable: E:/OpenSource/MaiChat/.cache/qt-ui-boundary-20261108/private-verified/MaiChat-win64/maichat.exe",
+          "2026-11-09 02:44:12.612 [I] pid: 23728",
+          "2026-11-09 02:44:12.612 [I] log file: C:/Users/18034/AppData/Roaming/MaiChat/Desktop IM/logs/maichat-20261109.log",
+          "2026-11-09 02:44:12.612 [I] [im] libcurl TLS backend=OpenSSL/3.5.9"
+        ],
+        "qtDebugPlugins": "1",
+        "loadedQtModules": [
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\Qt6Svg.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\Qt6Widgets.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\Qt6Core.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\Qt6Gui.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\MaiChat-win64\\platforms\\qwindows.dll"
+        ],
+        "pluginLoadEvidence": [],
+        "boundary": "Only this new --smoke child ran; login.start and account restore are skipped. Qt may append a startup header to its normal known-folder log; no existing log was read or copied."
+      },
+      "zip-smoke": {
+        "status": "PASS",
+        "pid": 40652,
+        "runningPath": "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\maichat.exe",
+        "exitCode": 0,
+        "elapsedSeconds": 1.817,
+        "version": "2.2.52",
+        "qtVersion": "6.12.0",
+        "executable": {
+          "name": "maichat.exe",
+          "bytes": 165046784,
+          "sha256": "11296b712215a45a940f9263790a4cf03fbcf42ce39424b7bb7cebeb81827921"
+        },
+        "pathEnvironment": "C:\\WINDOWS\\System32;C:\\WINDOWS",
+        "logEvidence": [
+          "2026-11-09 02:46:31.910 [I] version: 2.2.52  qt: 6.12.0",
+          "2026-11-09 02:46:31.910 [I] executable: E:/OpenSource/MaiChat/.cache/qt-ui-boundary-20261108/private-verified/zip-extracted/maichat.exe",
+          "2026-11-09 02:46:31.910 [I] pid: 40652",
+          "2026-11-09 02:46:31.910 [I] log file: C:/Users/18034/AppData/Roaming/MaiChat/Desktop IM/logs/maichat-20261109.log",
+          "2026-11-09 02:46:31.910 [I] [im] libcurl TLS backend=OpenSSL/3.5.9"
+        ],
+        "qtDebugPlugins": null,
+        "loadedQtModules": [
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\Qt6Svg.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\Qt6Widgets.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\Qt6Gui.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\Qt6Core.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\platforms\\qwindows.dll"
+        ],
+        "pluginLoadEvidence": [],
+        "boundary": "Only this new --smoke child ran; login.start and account restore are skipped. Qt may append a startup header to its normal known-folder log; no existing log was read or copied."
+      },
+      "zip-debug-smoke": {
+        "status": "PASS",
+        "pid": 30892,
+        "runningPath": "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\maichat.exe",
+        "exitCode": 0,
+        "elapsedSeconds": 1.019,
+        "version": "2.2.52",
+        "qtVersion": "6.12.0",
+        "executable": {
+          "name": "maichat.exe",
+          "bytes": 165046784,
+          "sha256": "11296b712215a45a940f9263790a4cf03fbcf42ce39424b7bb7cebeb81827921"
+        },
+        "pathEnvironment": "C:\\WINDOWS\\System32;C:\\WINDOWS",
+        "logEvidence": [
+          "2026-11-09 02:46:33.590 [I] version: 2.2.52  qt: 6.12.0",
+          "2026-11-09 02:46:33.590 [I] executable: E:/OpenSource/MaiChat/.cache/qt-ui-boundary-20261108/private-verified/zip-extracted/maichat.exe",
+          "2026-11-09 02:46:33.590 [I] pid: 30892",
+          "2026-11-09 02:46:33.590 [I] log file: C:/Users/18034/AppData/Roaming/MaiChat/Desktop IM/logs/maichat-20261109.log",
+          "2026-11-09 02:46:33.590 [I] [im] libcurl TLS backend=OpenSSL/3.5.9"
+        ],
+        "qtDebugPlugins": "1",
+        "loadedQtModules": [
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\Qt6Svg.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\Qt6Widgets.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\Qt6Core.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\Qt6Gui.dll",
+          "E:\\OpenSource\\MaiChat\\.cache\\qt-ui-boundary-20261108\\private-verified\\zip-extracted\\platforms\\qwindows.dll"
+        ],
+        "pluginLoadEvidence": [],
+        "boundary": "Only this new --smoke child ran; login.start and account restore are skipped. Qt may append a startup header to its normal known-folder log; no existing log was read or copied."
+      }
+    },
+    "formalTests": {
+      "suiteCount": 25,
+      "failed": 0,
+      "seconds": 167.53,
+      "log": {
+        "path": ".cache/qt-ui-boundary-20261108/product-final-25-tests.txt",
+        "bytes": 60382,
+        "sha256": "473f843fde4ce25f2a94453a63c53a4b8bbc7515f7196ad3e53c7b3c97c6827d"
+      },
+      "tests": [
+        {
+          "name": "desktop_session_sync_channel_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_session_sync_channel_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/desktop_session_sync_channel_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_session_sync_channel_test.exe",
+            "bytes": 6311936,
+            "sha256": "adf12fad8c86fd78af596bd15349d83f78cab5dc98af08db52ef124887ad1bd7"
+          }
+        },
+        {
+          "name": "desktop_browser_tools",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_browser_tools_test.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_browser_tools_test.exe",
+            "bytes": 8807936,
+            "sha256": "0fa616a8411e63e9cbb92860ee9c34932ff1b9ac89ef1a5d3b0d2c185918ef97"
+          }
+        },
+        {
+          "name": "MaiMediaProbeTests",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiMediaProbeTests.exe",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/../Media/tests/fixtures/ffplay-av-subtitles.mkv"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiMediaProbeTests.exe",
+            "bytes": 22194688,
+            "sha256": "513f1d298ec3d10a1d83f23d7b551d4a02c025ee1ba8b3567e99de9f3bb85b79"
+          }
+        },
+        {
+          "name": "MaiCdpTransportTests",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiCdpTransportTests.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiCdpTransportTests.exe",
+            "bytes": 699392,
+            "sha256": "15ae829f04ceab2ca69c3e0c9e6f07a71b48f96b65a42e15e3b00deb04c7ce6b"
+          }
+        },
+        {
+          "name": "desktop_audio_playback_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_audio_playback_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/desktop_audio_playback_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_audio_playback_test.exe",
+            "bytes": 22189568,
+            "sha256": "0f45f2b54598423821b0c5a9706f641c55b74c8bf0afb71a2c4212ecff345470"
+          }
+        },
+        {
+          "name": "MaiCameraCaptureNativeTests",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiCameraCaptureNativeTests.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiCameraCaptureNativeTests.exe",
+            "bytes": 92672,
+            "sha256": "bac7d4b33af12f9c9a9e761e7059ad845624ad2c6d4063d58522c3a326d1e94f"
+          }
+        },
+        {
+          "name": "desktop_camera_session_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_camera_session_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/desktop_camera_session_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_camera_session_test.exe",
+            "bytes": 148992,
+            "sha256": "85ae0f89e9449a694027cc931a9baddf8a77e461bbe08e57e20277ea56b33d27"
+          }
+        },
+        {
+          "name": "desktop_camera_dialog_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_camera_dialog_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/desktop_camera_dialog_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_camera_dialog_test.exe",
+            "bytes": 157184,
+            "sha256": "3645f6d2dab78dfb229515c20d4d559e584c82b9a5638c70f76397a42c8af70e"
+          }
+        },
+        {
+          "name": "MaiSystemProxyTests",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiSystemProxyTests.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiSystemProxyTests.exe",
+            "bytes": 5309952,
+            "sha256": "bb9b7987a80aed4350d090d52dc8e6b0d61069a62ccdb29e8d99f2c402608283"
+          }
+        },
+        {
+          "name": "MaiNativeSystemProxyWindowsTests",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiNativeSystemProxyWindowsTests.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiNativeSystemProxyWindowsTests.exe",
+            "bytes": 5314048,
+            "sha256": "e4c07aee5b2175c9eb95082bb7171f9b94dff51e1eecd9647a5737998c79b42b"
+          }
+        },
+        {
+          "name": "MaiSessionSyncProxyTests",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiSessionSyncProxyTests.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/MaiSessionSyncProxyTests.exe",
+            "bytes": 5299712,
+            "sha256": "5535e2fb430d6fb4704c976b6683239c03e677d4a7851642299dbd2b8605f80e"
+          }
+        },
+        {
+          "name": "app_log_lifecycle_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/app_log_lifecycle_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/app_log_lifecycle_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/app_log_lifecycle_test.exe",
+            "bytes": 46592,
+            "sha256": "858d5723a08bdcabca42a1e45956ed41ea76a44237f8ae97a87727bb5e99b01c"
+          }
+        },
+        {
+          "name": "qt_source_runtime",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/qt_source_runtime_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/qt_source_runtime.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/qt_source_runtime_test.exe",
+            "bytes": 21504,
+            "sha256": "2f97767c7ac39eb03198fbfe8d4a23504104df4ad22138e3f4fa66c62318d28d"
+          }
+        },
+        {
+          "name": "markdown_document_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/markdown_document_test.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/markdown_document_test.exe",
+            "bytes": 151552,
+            "sha256": "d07a706e838f8c7b075ed98b78894c27550d12bda7485d4658462ee89c5d7f5d"
+          }
+        },
+        {
+          "name": "markdown_layout_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/markdown_layout_test.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/markdown_layout_test.exe",
+            "bytes": 229888,
+            "sha256": "9e3a1b2547bce86ed96d6df789558091c1e188e87c99a56a8d66429f5b33033d"
+          }
+        },
+        {
+          "name": "markdown_view_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/markdown_view_test.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/markdown_view_test.exe",
+            "bytes": 349184,
+            "sha256": "3170fd183208936516f8daeb8b56afadef323306a7103263e3dc683d10eb1b8f"
+          }
+        },
+        {
+          "name": "markdown_label_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/markdown_label_test.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/markdown_label_test.exe",
+            "bytes": 270336,
+            "sha256": "51ba6bd8326b04af8ec66e512b5fe3da5775ee85651b3693543fddcc5047ef4d"
+          }
+        },
+        {
+          "name": "agent_controller_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/agent_controller_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/agent_controller_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/agent_controller_test.exe",
+            "bytes": 160622592,
+            "sha256": "b165f3f5e6e05a5d1635791db447c47be9ee0f8b311499f3c9e6b0a5fac5c3df"
+          }
+        },
+        {
+          "name": "agent_panel_session_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/agent_panel_session_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/agent_panel_session_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/agent_panel_session_test.exe",
+            "bytes": 161673216,
+            "sha256": "605cd76290b296d372cefaa5961f024e420179d9e90c95acff32a6aa48372a68"
+          }
+        },
+        {
+          "name": "desktop_music_player_dialog_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_music_player_dialog_test.exe"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_music_player_dialog_test.exe",
+            "bytes": 22352896,
+            "sha256": "c1a2c95690b70924cf4f90cc10f8b5fe4afa6653ba999b180cfe37a0c0f93043"
+          }
+        },
+        {
+          "name": "attachment_download_evidence_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/attachment_download_evidence_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/attachment_download_evidence_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/attachment_download_evidence_test.exe",
+            "bytes": 6124544,
+            "sha256": "5e6aa0614c8e38e56bac48c5f0b1c0725a34869cf17277a6f72efc9eb249da77"
+          }
+        },
+        {
+          "name": "local_message_database_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/local_message_database_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/local_message_database_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/local_message_database_test.exe",
+            "bytes": 1285120,
+            "sha256": "8466c7c80d25eb2103770cb5d5f2c1e3bcd8acbb898d9e292d77df97246c2677"
+          }
+        },
+        {
+          "name": "login_dialog_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/login_dialog_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/login_dialog_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/login_dialog_test.exe",
+            "bytes": 129849344,
+            "sha256": "99382df42de4d77c5c0ebedbe19aa820ce703c9f08f08eb6bc3fd4b83d895255"
+          }
+        },
+        {
+          "name": "main_window_layout_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/main_window_layout_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/main_window_layout_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/main_window_layout_test.exe",
+            "bytes": 165335040,
+            "sha256": "deb66565273d1fcea87d36231a4b331ac3b6b4a195d8dbf7c9cc4f49d8f3730d"
+          }
+        },
+        {
+          "name": "ui_zoom_test",
+          "command": [
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/ui_zoom_test.exe",
+            "-o",
+            "E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/ui_zoom_test.txt,txt"
+          ],
+          "binary": {
+            "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/ui_zoom_test.exe",
+            "bytes": 262656,
+            "sha256": "68e0dc23e13dc03f7b9b1d0fba9acddc9799c01f578018ff23b7220af686016a"
+          }
+        }
+      ],
+      "qtReportedCounts": {
+        "agent_controller_test": {
+          "pass": 21,
+          "fail": 0,
+          "skip": 0
+        },
+        "agent_panel_session_test": {
+          "pass": 73,
+          "fail": 0,
+          "skip": 0
+        },
+        "app_log_lifecycle_test": {
+          "pass": 4,
+          "fail": 0,
+          "skip": 0
+        },
+        "attachment_download_evidence_test": {
+          "pass": 11,
+          "fail": 0,
+          "skip": 0
+        },
+        "desktop_audio_playback_test": {
+          "pass": 7,
+          "fail": 0,
+          "skip": 0
+        },
+        "desktop_camera_dialog_test": {
+          "pass": 6,
+          "fail": 0,
+          "skip": 0
+        },
+        "desktop_camera_session_test": {
+          "pass": 15,
+          "fail": 0,
+          "skip": 0
+        },
+        "desktop_session_sync_channel_test": {
+          "pass": 5,
+          "fail": 0,
+          "skip": 0
+        },
+        "local_message_database_test": {
+          "pass": 30,
+          "fail": 0,
+          "skip": 0
+        },
+        "login_dialog_test": {
+          "pass": 31,
+          "fail": 0,
+          "skip": 5
+        },
+        "main_window_layout_test": {
+          "pass": 158,
+          "fail": 0,
+          "skip": 1
+        },
+        "ui_zoom_test": {
+          "pass": 8,
+          "fail": 0,
+          "skip": 0
+        }
+      },
+      "inputBoundary": "The final 25-suite run precedes only deletion of the unused Windows QT_MEDIA_BACKEND startup setting. All test inputs/binaries remain unchanged; main.cpp was normally rebuilt and its final packaged executable was tested again in all four staging/ZIP normal/debug smoke cases."
+    }
+  },
+  "mac": {
+    "registeredSuitesPassed": 92,
+    "formalLogger": {
+      "start": "2026-11-09T02:34:17.375271+08:00",
+      "command": [
+        "ctest",
+        "--test-dir",
+        "/private/tmp/maichat-desktop-portrait-20261105/full-config",
+        "-R",
+        "^app_log_lifecycle_test$",
+        "--output-on-failure",
+        "--output-junit",
+        "/private/tmp/maichat-qt6-common-mac-20261109/common-3/formal-logger.junit.xml"
+      ],
+      "exit": 0,
+      "seconds": 0.73,
+      "sharedTemporaryTree": "dbfe93348d52c1d61470efea66f4b3f70be1ef11",
+      "target": "app_log_lifecycle_test",
+      "qtCounts": {
+        "pass": 4,
+        "fail": 0,
+        "skip": 0
+      },
+      "scope": "formal shared CMake normal target, frozen original test and AppLog.cpp; test-mode random data only"
+    },
+    "common3AppIdentity": {
+      "existingCompileCommands": 1816,
+      "changedExistingCompileCommands": 0,
+      "removedExistingCompileCommands": 0,
+      "newCommands": [
+        [
+          "/private/tmp/maichat-desktop-portrait-20261105/full-config/app_log_lifecycle_test_autogen/mocs_compilation.cpp",
+          "CMakeFiles/app_log_lifecycle_test.dir/app_log_lifecycle_test_autogen/mocs_compilation.cpp.o"
+        ],
+        [
+          "/Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop/tests/AppLogLifecycleTest.cpp",
+          "CMakeFiles/app_log_lifecycle_test.dir/tests/AppLogLifecycleTest.cpp.o"
+        ],
+        [
+          "/Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop/src/logging/AppLog.cpp",
+          "CMakeFiles/app_log_lifecycle_test.dir/src/logging/AppLog.cpp.o"
+        ]
+      ],
+      "sourceAppSHA256": "ae3c138c350907e833463586f9039d6a0d1f1302dd919ab4512532b763d46b62",
+      "normalAppBinaryUnchangedFromNativeDebugGreen": true,
+      "minimumOSActuallyValidated": "macOS 27.2 arm64 only"
+    },
+    "finalAppAfterCommon4": "PASS: authoritative post-fast-forward artifacts at f01c592d; earlier ae3c/7abc hashes are historical candidates only.",
+    "evidenceArchives": [
+      {
+        "bytes": 835506,
+        "sha256": "2253804e059cbed97e7a994941d2f9fd58787e7236e8c29daff70ecfe1424933"
+      },
+      {
+        "bytes": 31295,
+        "sha256": "2018727be02fdb9d6ed9483386603c1a14d45ba68742b766f51d5daef66104f2"
+      },
+      {
+        "bytes": 214598,
+        "sha256": "d0d47a0ceafb01edb20162615643b561bcdc07d7da646bd11d0906aee1d0a7fc",
+        "localArchive": ".cache/qt-ui-boundary-20261108/mac-common4-final",
+        "authoritativeProofJSON": {
+          "bytes": 11300,
+          "sha256": "91b359bf3b6e3f98c83a40f8e03bcc21e4b564132bf43df4ffddc03da7fae24d"
+        }
+      }
+    ],
+    "common4": {
+      "mainCppBlob": "60e81f88717bd585b48e4b5e5194544e5d8b295a",
+      "preFastForwardCandidate": {
+        "normalAppBuildSeconds": 7.147,
+        "mainObjectRecompiled": true,
+        "sourceAppSHA256": "ae3c138c350907e833463586f9039d6a0d1f1302dd919ab4512532b763d46b62",
+        "appOnlyPackageSeconds": 37.727,
+        "machOCount": 33,
+        "dependencyAndSignatureGates": "PASS",
+        "normalAndDebugSmoke": {
+          "normalExit": 0,
+          "normalSeconds": 3.295,
+          "debugExit": 0,
+          "debugSeconds": 0.671,
+          "environment": "Cocoa, system PATH; source SDK/Build/Homebrew, production AppData and outbound access denied",
+          "basis": "Historical candidate only; original pre-fast-forward receipts retained in the final Mac evidence archive."
+        },
+        "sourceIdentityBoundary": "Root CRLF and Mac LF differ only by line endings; canonical Git main.cpp blob matches. Deletion is inside Q_OS_WIN and the normally rebuilt Mac executable remains byte-identical.",
+        "signedStageExeSHA256": "7abcc27efee122636acf723f4ae9b6f4a7480d856c7ac4329ef7c9241fa5db76"
+      },
+      "authoritativePostFastForward": {
+        "codeCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0",
+        "MaiChatTree": "fa8724995009ce88242af4b55b9468fa763f11d2",
+        "CoreTree": "69e18eb1e4b587b30ad8b467dd3172bea0443b8e",
+        "normalReconfigureBuildExit": 0,
+        "privateAppOnlyRestageExit": 0,
+        "machOCount": 33,
+        "dependencySignatureAndFourModelGates": "PASS",
+        "sourceAppSHA256": "c78d121c0b327fe9f0dd58f35abeafed16a09e05cf3fe55617935ce5d06adba5",
+        "signedStageExeSHA256": "933f1181c1a1de2ad7b8c872000a6289d693123f91d6faae6b567e062ecd3742",
+        "smokes": {
+          "normalExit": 0,
+          "normalSeconds": 3.025,
+          "debugExit": 0,
+          "debugSeconds": 0.676,
+          "environment": "Original Cocoa/system-PATH sandbox restrictions; source SDK/Build/Homebrew, production AppData and outbound access denied"
+        }
+      }
+    },
+    "postFastForwardReceipt": {
+      "time": "2026-11-09T03:03:15.947380+08:00",
+      "sourceCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0",
+      "MaiChatTree": "fa8724995009ce88242af4b55b9468fa763f11d2",
+      "CoreTree": "69e18eb1e4b587b30ad8b467dd3172bea0443b8e",
+      "mainBlob": "60e81f88717bd585b48e4b5e5194544e5d8b295a",
+      "mainRawLF_SHA256": "cb5dd49475c74fbee95ea13e8807cd8ccd8c036f35b08aa81387b7243afacdac",
+      "mainRawCRLF_ProducerSHA256": "7dca670243d31b24bdf996cdbcc5fc9496c50200874cd5bd3a4d076b76c35c75",
+      "sourceProductWorkingTreeClean": true,
+      "sourceExe": "/private/tmp/maichat-desktop-portrait-20261105/full-config/bin/MaiChat.app/Contents/MacOS/MaiChat",
+      "sourceExeSHA256": "c78d121c0b327fe9f0dd58f35abeafed16a09e05cf3fe55617935ce5d06adba5",
+      "signedExe": "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/MacOS/MaiChat",
+      "signedExeSHA256": "933f1181c1a1de2ad7b8c872000a6289d693123f91d6faae6b567e062ecd3742",
+      "finalSupersedesPreFastForwardAppHashes": [
+        "ae3c138c350907e833463586f9039d6a0d1f1302dd919ab4512532b763d46b62",
+        "7abcc27efee122636acf723f4ae9b6f4a7480d856c7ac4329ef7c9241fa5db76"
+      ],
+      "pipeline": [
+        {
+          "name": "post-ff-configure",
+          "command": [
+            "cmake",
+            "-S",
+            "/Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop",
+            "-B",
+            "/private/tmp/maichat-desktop-portrait-20261105/full-config",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DMAICHAT_ENABLE_REMOTE_DESKTOP=ON",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+          ],
+          "start": "2026-11-09T02:59:01.573502+08:00",
+          "seconds": 7.766,
+          "exit": 0,
+          "sourceCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0"
+        },
+        {
+          "name": "post-ff-main-build",
+          "command": [
+            "cmake",
+            "--build",
+            "/private/tmp/maichat-desktop-portrait-20261105/full-config",
+            "--target",
+            "maichat",
+            "--parallel",
+            "4"
+          ],
+          "start": "2026-11-09T02:59:09.339880+08:00",
+          "seconds": 6.124,
+          "exit": 0,
+          "sourceCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0"
+        },
+        {
+          "name": "post-ff-private-package",
+          "command": [
+            "/usr/bin/sandbox-exec",
+            "-f",
+            "/private/tmp/maichat-qt6-common-mac-20261109/package-no-sdk-writes.sb",
+            "/Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop/scripts/package-macos.sh",
+            "--build-dir",
+            "/private/tmp/maichat-desktop-portrait-20261105/full-config",
+            "--out-dir",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output",
+            "--app-only",
+            "--macdeployqt",
+            "/Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop/qt/.build/macos-arm64/install/bin/macdeployqt",
+            "--python",
+            "/opt/homebrew/opt/python@3.14/bin/python3.14"
+          ],
+          "start": "2026-11-09T02:59:15.463860+08:00",
+          "seconds": 37.857,
+          "exit": 0,
+          "sourceCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0"
+        },
+        {
+          "name": "post-ff-ordinary-sandbox-smoke",
+          "command": [
+            "/usr/bin/sandbox-exec",
+            "-f",
+            "/private/tmp/maichat-qt6-common-mac-20261109/deployed-smoke-bare-path.sb",
+            "/usr/bin/env",
+            "DYLD_PRINT_LIBRARIES=1",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/MacOS/MaiChat",
+            "--smoke"
+          ],
+          "start": "2026-11-09T02:59:53.320772+08:00",
+          "seconds": 3.025,
+          "exit": 0,
+          "sourceCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0",
+          "sourceMainBlob": "60e81f88717bd585b48e4b5e5194544e5d8b295a",
+          "sourceExeSHA256": "c78d121c0b327fe9f0dd58f35abeafed16a09e05cf3fe55617935ce5d06adba5",
+          "signedExeSHA256": "933f1181c1a1de2ad7b8c872000a6289d693123f91d6faae6b567e062ecd3742",
+          "CocoaBarePATH": true,
+          "sourceSDKBuildHomebrewUserAppDataNetworkDenied": true,
+          "actualHost": "macOS 27.2 arm64",
+          "installedPIDUnchanged": "96951 /Applications/MaiChat.app/Contents/MacOS/MaiChat"
+        },
+        {
+          "name": "post-ff-debug-sandbox-smoke",
+          "command": [
+            "/usr/bin/sandbox-exec",
+            "-f",
+            "/private/tmp/maichat-qt6-common-mac-20261109/deployed-smoke-bare-path.sb",
+            "/usr/bin/env",
+            "DYLD_PRINT_LIBRARIES=1",
+            "QT_DEBUG_PLUGINS=1",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/MacOS/MaiChat",
+            "--smoke"
+          ],
+          "start": "2026-11-09T02:59:56.533999+08:00",
+          "seconds": 0.676,
+          "exit": 0,
+          "sourceCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0",
+          "sourceMainBlob": "60e81f88717bd585b48e4b5e5194544e5d8b295a",
+          "sourceExeSHA256": "c78d121c0b327fe9f0dd58f35abeafed16a09e05cf3fe55617935ce5d06adba5",
+          "signedExeSHA256": "933f1181c1a1de2ad7b8c872000a6289d693123f91d6faae6b567e062ecd3742",
+          "CocoaBarePATH": true,
+          "sourceSDKBuildHomebrewUserAppDataNetworkDenied": true,
+          "actualHost": "macOS 27.2 arm64",
+          "installedPIDUnchanged": "96951 /Applications/MaiChat.app/Contents/MacOS/MaiChat"
+        }
+      ],
+      "smokes": [
+        {
+          "name": "post-ff-ordinary-sandbox-smoke",
+          "command": [
+            "/usr/bin/sandbox-exec",
+            "-f",
+            "/private/tmp/maichat-qt6-common-mac-20261109/deployed-smoke-bare-path.sb",
+            "/usr/bin/env",
+            "DYLD_PRINT_LIBRARIES=1",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/MacOS/MaiChat",
+            "--smoke"
+          ],
+          "start": "2026-11-09T02:59:53.320772+08:00",
+          "seconds": 3.025,
+          "exit": 0,
+          "sourceCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0",
+          "sourceMainBlob": "60e81f88717bd585b48e4b5e5194544e5d8b295a",
+          "sourceExeSHA256": "c78d121c0b327fe9f0dd58f35abeafed16a09e05cf3fe55617935ce5d06adba5",
+          "signedExeSHA256": "933f1181c1a1de2ad7b8c872000a6289d693123f91d6faae6b567e062ecd3742",
+          "CocoaBarePATH": true,
+          "sourceSDKBuildHomebrewUserAppDataNetworkDenied": true,
+          "actualHost": "macOS 27.2 arm64",
+          "installedPIDUnchanged": "96951 /Applications/MaiChat.app/Contents/MacOS/MaiChat",
+          "ownedPID": 53141,
+          "qtImagesActuallyLoaded": [
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/Frameworks/QtSvg.framework/Versions/A/QtSvg",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/Frameworks/QtWidgets.framework/Versions/A/QtWidgets",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/Frameworks/QtGui.framework/Versions/A/QtGui",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/Frameworks/QtConcurrent.framework/Versions/A/QtConcurrent",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/Frameworks/QtCore.framework/Versions/A/QtCore"
+          ],
+          "cocoaPluginActuallyLoaded": [
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/PlugIns/platforms/libqcocoa.dylib"
+          ],
+          "allQtAndPlatformImagesLoadedFromStage": true
+        },
+        {
+          "name": "post-ff-debug-sandbox-smoke",
+          "command": [
+            "/usr/bin/sandbox-exec",
+            "-f",
+            "/private/tmp/maichat-qt6-common-mac-20261109/deployed-smoke-bare-path.sb",
+            "/usr/bin/env",
+            "DYLD_PRINT_LIBRARIES=1",
+            "QT_DEBUG_PLUGINS=1",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/MacOS/MaiChat",
+            "--smoke"
+          ],
+          "start": "2026-11-09T02:59:56.533999+08:00",
+          "seconds": 0.676,
+          "exit": 0,
+          "sourceCommit": "f01c592d675a8eedb7438df6d15cf73d11009ce0",
+          "sourceMainBlob": "60e81f88717bd585b48e4b5e5194544e5d8b295a",
+          "sourceExeSHA256": "c78d121c0b327fe9f0dd58f35abeafed16a09e05cf3fe55617935ce5d06adba5",
+          "signedExeSHA256": "933f1181c1a1de2ad7b8c872000a6289d693123f91d6faae6b567e062ecd3742",
+          "CocoaBarePATH": true,
+          "sourceSDKBuildHomebrewUserAppDataNetworkDenied": true,
+          "actualHost": "macOS 27.2 arm64",
+          "installedPIDUnchanged": "96951 /Applications/MaiChat.app/Contents/MacOS/MaiChat",
+          "ownedPID": 53335,
+          "qtImagesActuallyLoaded": [
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/Frameworks/QtSvg.framework/Versions/A/QtSvg",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/Frameworks/QtWidgets.framework/Versions/A/QtWidgets",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/Frameworks/QtGui.framework/Versions/A/QtGui",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/Frameworks/QtConcurrent.framework/Versions/A/QtConcurrent",
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/Frameworks/QtCore.framework/Versions/A/QtCore"
+          ],
+          "cocoaPluginActuallyLoaded": [
+            "/private/tmp/maichat-qt6-common-mac-20261109/common-4/package-output/MaiChat-macos-arm64/MaiChat.app/Contents/PlugIns/platforms/libqcocoa.dylib"
+          ],
+          "allQtAndPlatformImagesLoadedFromStage": true
+        }
+      ],
+      "runtimeAudit": {
+        "architecture": "arm64",
+        "machoFiles": 33,
+        "failures": [],
+        "nonTargetSDKDriverResources": [
+          "Contents/Frameworks/TXLiteAVSDK_TRTC_Mac.framework/Versions/A/Resources/PlugIns/TRTCAudioPlugin.driver/Contents/MacOS/TRTCAudioPlugin"
+        ]
+      },
+      "models4of4AndORTVerified": true,
+      "fastForward": {
+        "time": "2026-11-09T02:56:22.571206+08:00",
+        "oldHead": "b95e1ff006628bbf1301d7ec42749f6417442f36",
+        "head": "f01c592d675a8eedb7438df6d15cf73d11009ce0",
+        "MaiChatTree": "fa8724995009ce88242af4b55b9468fa763f11d2",
+        "CoreTree": "69e18eb1e4b587b30ad8b467dd3172bea0443b8e",
+        "fullOverlayBackup": "pre-fast-forward-overlay.tar.gz",
+        "backupSHA256": "be25601626a09f60f32127160c5ed3f797beb381e9a5c323bf4a831b406453cc",
+        "method": "Stage only entries identical to incoming commit, normal --ff-only with submodule recurse/autostash disabled; all original overlay/index backed up; no reset/restore/stash",
+        "preservedIndependentWork": [
+          "docs/diagnostics/maichat-build-artifact-disk-cleanup-20261107.md",
+          "Mac common-3 integration diagnostic additions"
+        ],
+        "statusAfter": " M docs/diagnostics/maichat-qt6-source-integration-20261108.md\n?? docs/diagnostics/maichat-build-artifact-disk-cleanup-20261107.md\n",
+        "sourceProductWorkingTreeClean": true,
+        "noIndependentCommitOrPush": true
+      },
+      "actualOS": "macOS 27.2 arm64 only; 14.4 not verified",
+      "tinyDirectQtWebPDefectPreserved": true,
+      "noInstallPublishOrDeviceOperations": true,
+      "noRepeated92Suites": true,
+      "installedPIDStillRunning": "96951 /Applications/MaiChat.app/Contents/MacOS/MaiChat"
+    }
+  },
+  "retainedFailures": [
+    "Original audio pause-clock RED before native fix",
+    "Original AppLog native shutdown crash and unchanged child RED before lifetime fix",
+    "Windows offscreen native-caption assertions; unchanged full qwindows group passes",
+    "Mac initial camera directory-alias test RED before canonical identity fix",
+    "Valid 38-byte direct Qt WebP decoder RED on source SDK and deployed Windows/Mac"
+  ],
+  "boundaries": [
+    "No installation or installed process replacement; no public release assets or tags changed.",
+    "Physical camera/microphone and native desktop input not exercised.",
+    "Mac runtime verified only on 27.2 arm64, not nominal 14.4.",
+    "Live cloud vision, authenticated CR editing, view_image policy and paired Live Photo preservation are separate.",
+    "Private smoke skips login and account restore. Qt may append startup identity to its known-folder log; no existing user log/database is read or copied."
+  ],
+  "windowsEvidenceArchive": {
+    "bytes": 66030,
+    "sha256": "e466d1d4a577a490f81baa7f74c06864f75c63a5eef599227de7effa483014e5",
+    "path": ".cache/qt-ui-boundary-20261108/windows-qt-ui-evidence.zip"
+  },
+  "deliveryDocumentation": "This receipt is a documentation-only follow-up to code commit f01c592d675a8eedb7438df6d15cf73d11009ce0. Future documentation commits do not change the tested product trees or require repackaging.",
+  "finalizedAt": "2026-11-08T19:04:16.953713+00:00"
+}

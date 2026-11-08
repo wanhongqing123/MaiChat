@@ -92,9 +92,9 @@ idempotent install and lock release, using only random Qt test-mode namespaces.
 The normal App was rebuilt and repackaged; the original Cocoa debug-plugin
 smoke then exited 0 in 3.032 seconds and logged successful plugin unloading.
 
-Final source App SHA256:
+Pre-fast-forward source App SHA256:
 `ae3c138c350907e833463586f9039d6a0d1f1302dd919ab4512532b763d46b62`.
-Signed private App executable SHA256:
+Pre-fast-forward signed private App executable SHA256:
 `7abcc27efee122636acf723f4ae9b6f4a7480d856c7ac4329ef7c9241fa5db76`.
 App path:
 `/private/tmp/maichat-qt6-common-mac-20261109/package-output/MaiChat-macos-arm64/MaiChat.app`.
@@ -118,3 +118,17 @@ path; the direct Qt limitation must not be generalized to that path without a
 separate test. Neither Qt SDK nor image business code was changed for this issue.
 
 Coordinator report: [Desktop Qt UI boundary](maichat-qt-ui-boundary-20261109.md).
+
+The final shared normal CMake registration adds `app_log_lifecycle_test`; its
+unchanged test passes 4/0/0. This brings the unique registered-suite ledger to 92,
+without counting the earlier private logger run twice. The final removal of an
+unused Windows-only startup variable is normally rebuilt on Mac and restaged;
+that candidate retains the values above and passes both smoke cases. After the
+safe fast forward, the authoritative source executable SHA256 is
+`c78d121c0b327fe9f0dd58f35abeafed16a09e05cf3fe55617935ce5d06adba5`, and the
+signed stage executable is
+`933f1181c1a1de2ad7b8c872000a6289d693123f91d6faae6b567e062ecd3742`.
+The final stage passes 33-Mach-O/signature/four-model gates and normal/debug
+sandboxed Cocoa smoke, exit 0 in 3.025/0.676 seconds. Code is coordinated at
+`f01c592d675a8eedb7438df6d15cf73d11009ce0`; exact delivery evidence is in the
+[delivery receipt](maichat-qt-ui-delivery-20261109.json).

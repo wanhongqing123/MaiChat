@@ -84,7 +84,7 @@ Files: `.gitmodules`, `desktop/qt/sources.lock.json`, `desktop/scripts/build-qt.
 - [x] Add source/bootstrap/runtime regression coverage for a minimal Widgets SDK. Build explicit Network targets before running tests that were previously EXCLUDE_FROM_ALL.
 - [x] Reproduce and resolve the imported Qt6 canonical-path and font-refresh failures with their original cases; retain environment skips and unrelated failures with exact evidence.
 - [x] Build the normal product and all affected header consumers. Inspect actual UI captures, run ordinary/native-owned/desktop gates, and verify runtime dependencies.
-- [ ] Export a private package only after exact-source freeze; verify complete staging and actual ZIP extraction with model/runtime closure and bare-system-PATH smoke. Record source, binaries, package hashes and all acceptance boundaries before commit/push. No installation/publication is implied.
+- [x] Export a private package only after exact-source freeze; verify complete staging and actual ZIP extraction with model/runtime closure and bare-system-PATH smoke. The code commit precedes the ZIP filename; a documentation-only receipt records the verified archive afterward. No installation/publication is implied.
 
 ## Task 6: Curl, native system proxy and SQLite boundaries
 
