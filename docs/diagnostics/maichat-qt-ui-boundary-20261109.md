@@ -136,6 +136,13 @@ both normal and debug-plugin bare-system-PATH smoke. Build, staging and extracte
 executables are byte-identical. Full source identity, archive hashes and the four
 owned smoke processes are recorded in the [delivery receipt](maichat-qt-ui-delivery-20261109.json).
 
+The Windows build runs before the source-freeze commit, from the working tree at
+`b95e1ff0` containing these changes. Its embedded OpenCV build information therefore
+reports `b95e1ff0-dirty`; the final executable was inspected to confirm that value.
+`f01c592d` identifies the committed canonical source snapshot, whose product tree
+and per-file manifests match the compiled inputs. It does not replace the embedded
+build-time label. The verified ZIP is retained unchanged.
+
 ## Mac validation and boundaries
 
 Peer normal App and default targets compile with RemoteDesktop ON, FakeClient OFF,
@@ -173,6 +180,9 @@ The final stage passes 33-Mach-O/signature/four-model gates and the same sandbox
 Cocoa smoke: normal exit 0 in 3.025 seconds and debug-plugin exit 0 in 0.676 seconds.
 Earlier Mac hashes remain historical candidates. The unchanged 92-suite source
 inputs are not rerun or counted twice.
+The post-fast-forward Mac hash change is traced to normal CMake regeneration of
+OpenCV's `version_string.inc` and rebuilding `system.cpp.o`: its build label changes
+from `b95e1ff0-dirty` to `f01c592d-dirty`, with the product source tree unchanged.
 
 Actual Mac execution is macOS 27.2 arm64. Older cached media/vendor objects and some
 Homebrew dependencies have a higher minOS than the declared 14.4 target. This work

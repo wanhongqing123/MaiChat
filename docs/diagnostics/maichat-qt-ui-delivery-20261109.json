@@ -629,7 +629,9 @@
         "blob": "9dd987168c6a4f40c63adf581b70606f47ddc825",
         "rawSHA256": "2d14b418f93a61c0fb1c9db74633ed8a0d403ef5b22f50c6f087a810e7dd57a6"
       }
-    ]
+    ],
+    "windowsWorkingTreeHEADAtBuild": "b95e1ff006628bbf1301d7ec42749f6417442f36",
+    "windowsSourceFreezeBoundary": "Windows compiles the changed working tree before commit. f01c592d is the canonical committed source snapshot matching the compiled product tree and manifest; it is not an assertion that the build-time HEAD or embedded OpenCV label already had that value."
   },
   "windows": {
     "platform": "Windows 11 x64",
@@ -1172,6 +1174,12 @@
         }
       },
       "inputBoundary": "The final 25-suite run precedes only deletion of the unused Windows QT_MEDIA_BACKEND startup setting. All test inputs/binaries remain unchanged; main.cpp was normally rebuilt and its final packaged executable was tested again in all four staging/ZIP normal/debug smoke cases."
+    },
+    "openCVBuildMetadata": {
+      "actualEmbeddedVersionControl": "b95e1ff0-dirty",
+      "generatedVersionStringSHA256": "8b16a4435a4c90927a4950bf066f5970ed615938651076abaa01b84d3dc92a30",
+      "verifiedInActualPackagedExe": true,
+      "doesNotChangeCanonicalProductTree": true
     }
   },
   "mac": {
@@ -1505,7 +1513,17 @@
       "noInstallPublishOrDeviceOperations": true,
       "noRepeated92Suites": true,
       "installedPIDStillRunning": "96951 /Applications/MaiChat.app/Contents/MacOS/MaiChat"
-    }
+    },
+    "postFastForwardOpenCVMetadataExplanation": {
+      "oldSignedAppSHA256": "7abcc27efee122636acf723f4ae9b6f4a7480d856c7ac4329ef7c9241fa5db76",
+      "oldOpenCVBuildInfo": "Version control:               b95e1ff0-dirty",
+      "newSignedAppSHA256": "933f1181c1a1de2ad7b8c872000a6289d693123f91d6faae6b567e062ecd3742",
+      "newOpenCVBuildInfo": "Version control:               f01c592d-dirty",
+      "actualRebuiltObject": "opencv/modules/core/CMakeFiles/opencv_core.dir/src/system.cpp.o",
+      "sourceProductTree": "fa8724995009ce88242af4b55b9468fa763f11d2",
+      "note": "Post-ff CMake regenerates OpenCV version_string.inc; getBuildInformation metadata changes from the prior HEAD. Dirty marker corresponds to preserved documentation work; product source working tree is clean. This is the observed rebuild/hash change, not an additional product implementation edit."
+    },
+    "postFastForwardOpenCVMetadataReceiptSHA256": "89eccc49bcb1f1ffa0abf83d2c887bfaa11849ad6a97ad78a35e7327b92fa4e4"
   },
   "retainedFailures": [
     "Original audio pause-clock RED before native fix",
