@@ -46,7 +46,7 @@ namespace {
 // not depend on the speed of the machine running this test.
 struct ControllerReadProbe {
     explicit ControllerReadProbe(QString path)
-        : databasePath(QDir::cleanPath(QDir::fromNativeSeparators(path))) {
+        : databasePath(QFileInfo(path).canonicalFilePath()) {
         active = this;
         installed = sqlite3_auto_extension(reinterpret_cast<void (*)()>(attach)) == SQLITE_OK;
     }
@@ -56,8 +56,9 @@ struct ControllerReadProbe {
     }
 
     static int attach(sqlite3* database, char**, const sqlite3_api_routines*) {
-        const QString path = QDir::cleanPath(QDir::fromNativeSeparators(
-            QString::fromUtf8(sqlite3_db_filename(database, "main"))));
+        // SQLite VFS 会解析 /var 等符号链接；按同一真实文件匹配，避免探针漏掉连接。
+        const QString path = QFileInfo(
+            QString::fromUtf8(sqlite3_db_filename(database, "main"))).canonicalFilePath();
         if (active && path == active->databasePath) {
             ++active->attachedConnections;
             sqlite3_trace_v2(database, SQLITE_TRACE_ROW, recordRow, active);
@@ -98,7 +99,7 @@ std::vector<std::string_view> splitUtf8(const std::string& text) {
         } else if ((lead & 0xF8u) == 0xF0u) {
             width = 4;
         }
-        width = std::min(width, view.size() - i);
+        width = std::min<qsizetype>(width, view.size() - i);
         pieces.push_back(view.substr(i, width));
         i += width;
     }

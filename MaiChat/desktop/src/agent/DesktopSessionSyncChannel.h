@@ -22,8 +22,8 @@ public:
     using InboxHandler = std::function<void(const QJsonArray&)>;
     using StateHandler = std::function<void()>;
 
-    DesktopSessionSyncChannel(QUrl url, std::function<QString()> bearerProvider,
-                              QObject* parent = nullptr, QByteArray trustedCaPem = {});
+    DesktopSessionSyncChannel(QUrl url, std::function<QString()> bearerProvider, QObject* parent = nullptr,
+                              QByteArray trustedCaPem = {});
     ~DesktopSessionSyncChannel() override;
 
     void setCatalogHandler(CatalogHandler handler);
@@ -37,6 +37,7 @@ public:
 
 private:
     void startWhenReady();
+    void openConnection(const QString& proxy);
     void sendReauthorization(const QByteArray& token);
     void resetConnection(const QString& error);
     void consume(MaiSessionSyncSocket::Event event, const QByteArray& bytes);
@@ -56,6 +57,7 @@ private:
     StateHandler disconnectedHandler_;
     bool started_ = false;
     bool connected_ = false;
+    bool proxyLookupPending_ = false;
     quint64 generation_ = 0;
     QByteArray connectingBearer_;
     QByteArray authorizedBearer_;

@@ -8,8 +8,7 @@ class QCloseEvent;
 class QLabel;
 class QPushButton;
 class QSlider;
-class QTimer;
-struct MaiFfplayAudioSession;
+class DesktopAudioPlayback;
 
 class DesktopMusicPlayerDialog final : public QDialog {
 public:
@@ -25,8 +24,7 @@ private:
     void stopPlayback();
     void refreshPlayback();
 
-    MaiFfplayAudioSession* session_ = nullptr;
-    QTimer* timer_ = nullptr;
+    DesktopAudioPlayback* playback_ = nullptr;
     QString path_;
     bool playing_ = false;
     QLabel* title_ = nullptr;

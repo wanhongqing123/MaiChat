@@ -877,13 +877,12 @@ void DesktopComputerAgentIntegrationTest::nativePromptTraversesRealAgentAndReads
 }
 
 int main(int argc, char** argv) {
-    // Keep Qt 5.15's QTEST_MAIN widget setup while exposing native QSKIP as a
+    // Keep Qt's QTEST_MAIN widget setup while exposing native QSKIP as a
     // process status: Windows GUI targets may have no capturable stdout.
     TESTLIB_SELFCOVERAGE_START("DesktopComputerAgentIntegrationTest")
     QT_PREPEND_NAMESPACE(QTest::Internal::callInitMain)<DesktopComputerAgentIntegrationTest>();
     QApplication app(argc, argv);
     app.setAttribute(Qt::AA_Use96Dpi, true);
-    QTEST_DISABLE_KEYPAD_NAVIGATION
     DesktopComputerAgentIntegrationTest test;
     QTEST_SET_MAIN_SOURCE_PATH
     const int result = QTest::qExec(&test, argc, argv);

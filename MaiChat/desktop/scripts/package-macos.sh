@@ -78,7 +78,7 @@ if [[ ! -d "$source_app" ]]; then
 Missing app bundle: $source_app
 
 Build it first, for example:
-  cmake -S MaiChat/desktop -B MaiChat/desktop/$build_dir -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/qt@5 -DCMAKE_BUILD_TYPE=Release
+  cmake -S MaiChat/desktop -B MaiChat/desktop/$build_dir  -DCMAKE_BUILD_TYPE=Release
   cmake --build MaiChat/desktop/$build_dir --target maichat --config Release
 EOF
   exit 1
@@ -87,9 +87,9 @@ fi
 if [[ -z "$macdeployqt" ]]; then
   cache_path="$build_path/CMakeCache.txt"
   if [[ -f "$cache_path" ]]; then
-    qt5_dir="$(sed -n 's/^Qt5_DIR:PATH=//p' "$cache_path" | head -1)"
-    if [[ -n "$qt5_dir" ]]; then
-      candidate="$(cd "$qt5_dir/../../.." && pwd)/bin/macdeployqt"
+    qt6_dir="$(sed -n 's/^Qt6_DIR:PATH=//p' "$cache_path" | head -1)"
+    if [[ -n "$qt6_dir" ]]; then
+      candidate="$(cd "$qt6_dir/../../.." && pwd)/bin/macdeployqt"
       if [[ -x "$candidate" ]]; then
         macdeployqt="$candidate"
       fi
@@ -97,9 +97,6 @@ if [[ -z "$macdeployqt" ]]; then
   fi
 fi
 
-if [[ -z "$macdeployqt" ]]; then
-  macdeployqt="$(command -v macdeployqt || true)"
-fi
 
 if [[ -z "$macdeployqt" || ! -x "$macdeployqt" ]]; then
   echo "Unable to locate macdeployqt. Pass --macdeployqt /path/to/macdeployqt." >&2
@@ -178,13 +175,58 @@ for framework in TXLiteAVSDK_TRTC_Mac TXFFmpeg TXSoundTouch; do
   ditto "$trtc_source" "$trtc_target_dir/$framework.framework"
 done
 
-"$macdeployqt" "$staged_app" -always-overwrite
-if [[ ! -f "$staged_app/Contents/Frameworks/QtWebSockets.framework/Versions/5/QtWebSockets" ]]; then
-  echo "Missing QtWebSockets framework in staged MaiChat App." >&2
-  exit 1
-fi
+# Qt 仅承担 UI。macdeployqt 会扫描 bundle 内已有的每个 dylib，旧 generic/TUIO
+# 即使不在默认插件列表，也会重新带入 QtNetwork；这里只重建 staging 的 Qt 插件目录。
+# 源 SDK 不修改。显式种子仍交给 macdeployqt 重写 install_name/rpath 并补齐实际闭包。
+qt_install_root="$("$python" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent.parent)' "$macdeployqt")"
+qt_plugin_source="$qt_install_root/plugins"
+qt_plugin_target="$staged_app/Contents/PlugIns"
+for plugin in platforms/libqcocoa.dylib imageformats/libqsvg.dylib imageformats/libqwebp.dylib \
+              imageformats/libqjpeg.dylib iconengines/libqsvgicon.dylib styles/libqmacstyle.dylib; do
+  if [[ ! -f "$qt_plugin_source/$plugin" ]]; then
+    echo "Missing Qt 6 UI plugin in source SDK: $plugin" >&2
+    exit 1
+  fi
+done
+rm -rf "$qt_plugin_target"
+mkdir -p "$qt_plugin_target"
+qt_plugin_args=()
+for plugin_source in "$qt_plugin_source"/platforms/libqcocoa.dylib \
+                     "$qt_plugin_source"/imageformats/*.dylib \
+                     "$qt_plugin_source"/iconengines/*.dylib \
+                     "$qt_plugin_source"/styles/*.dylib; do
+  [[ -f "$plugin_source" ]] || continue
+  [[ "$plugin_source" != *_debug.dylib ]] || continue
+  plugin="${plugin_source#"$qt_plugin_source"/}"
+  mkdir -p "$qt_plugin_target/$(dirname "$plugin")"
+  cp -p "$plugin_source" "$qt_plugin_target/$plugin"
+  qt_plugin_args+=("-executable=$qt_plugin_target/$plugin")
+done
+# 配置插件只从分发 bundle 读取；版本专用 qt6.conf 的优先级也不能指回构建 SDK。
+mkdir -p "$staged_app/Contents/Resources"
+for qt_config in qt.conf qt6.conf; do
+  cat > "$staged_app/Contents/Resources/$qt_config" <<'QTCONF'
+[Paths]
+Prefix=.
+Plugins=PlugIns
+QTCONF
+done
+"$macdeployqt" "$staged_app" -always-overwrite -no-plugins "${qt_plugin_args[@]}"
+for framework in QtNetwork QtWebSockets QtSql QtMultimedia QtMultimediaWidgets; do
+  if [[ -d "$staged_app/Contents/Frameworks/$framework.framework" ]]; then
+    echo "Retired Qt runtime in staged MaiChat App: $framework" >&2
+    exit 1
+  fi
+done
+for plugin in platforms/libqcocoa.dylib imageformats/libqsvg.dylib imageformats/libqwebp.dylib \
+              imageformats/libqjpeg.dylib iconengines/libqsvgicon.dylib styles/libqmacstyle.dylib; do
+  if [[ ! -f "$staged_app/Contents/PlugIns/$plugin" ]]; then
+    echo "Missing Qt 6 runtime plugin: $plugin" >&2
+    exit 1
+  fi
+done
 
-# Qt 5 的部署器会复制 WebP，但可能漏掉新版 WebP 的 @rpath SharpYUV 依赖。
+# 审计 WebP 的额外动态依赖；源码 SDK 使用内置 WebP，此分支通常无需补库。
 # 将同一安装包的依赖放到库旁边，显式使用 loader_path，避免只在有 Homebrew 的打包机上能解码。
 webp_needs_sharpyuv=false
 for webp_library in "$trtc_target_dir"/libwebp*.dylib; do

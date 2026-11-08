@@ -66,8 +66,6 @@
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QMutexLocker>
-#include <QNetworkProxyFactory>
-#include <QNetworkProxyQuery>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
@@ -109,6 +107,8 @@
 
 #include <QtConcurrent/QtConcurrentRun>
 #include <curl/curl.h>
+
+#include "MaiSystemProxy.h"
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
 #endif
@@ -127,7 +127,6 @@
 #include "ui/FilePreviewDialog.h"
 #include "ui/ImagePreviewDialog.h"
 #include "ui/PdfPreviewDialog.h"
-#include "ui/VideoPreviewDialog.h"
 #include <QButtonGroup>
 #include <QCache>
 #include <QCheckBox>
@@ -579,110 +578,106 @@ size_t receiveSignedAvatar(char *bytes, size_t size, size_t count, void *context
   return length;
 }
 
-QByteArray downloadAvatar(const QUrl &url, const QString &proxyUrl) {
-  const QString scheme = url.scheme().toLower();
-  if (!url.isValid() || !url.userInfo().isEmpty() ||
-      (scheme != QStringLiteral("https") && scheme != QStringLiteral("http"))) return {};
-  static std::once_flag initialization;
-  static CURLcode initializationCode = CURLE_FAILED_INIT;
-  std::call_once(initialization, [] { initializationCode = curl_global_init(CURL_GLOBAL_DEFAULT); });
-  if (initializationCode != CURLE_OK) return {};
-  CURL *curl = curl_easy_init();
-  if (!curl) return {};
-  QByteArray data;
-  const QByteArray encoded = url.toString(QUrl::FullyEncoded).toUtf8();
-  const QByteArray encodedProxy = proxyUrl.toUtf8();
-  curl_easy_setopt(curl, CURLOPT_URL, encoded.constData());
-  const char *protocols = scheme == QStringLiteral("https") ? "https" : "http,https";
-  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, protocols);
-  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, protocols);
-  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-  curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 20000L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  curl_easy_setopt(curl, CURLOPT_NETRC, CURL_NETRC_IGNORED);
-  curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, curl_off_t(4 * 1024 * 1024));
-  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receiveSignedAvatar);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
+QByteArray downloadAvatar(const QUrl& url) {
+    const QString scheme = url.scheme().toLower();
+    if (!url.isValid() || !url.userInfo().isEmpty() ||
+        (scheme != QStringLiteral("https") && scheme != QStringLiteral("http")))
+        return {};
+    static std::once_flag initialization;
+    static CURLcode initializationCode = CURLE_FAILED_INIT;
+    std::call_once(initialization, [] { initializationCode = curl_global_init(CURL_GLOBAL_DEFAULT); });
+    if (initializationCode != CURLE_OK) return {};
+    CURL* curl = curl_easy_init();
+    if (!curl) return {};
+    QByteArray data;
+    const QByteArray encoded = url.toString(QUrl::FullyEncoded).toUtf8();
+    // Native PAC may block; this function runs only on the avatar worker.
+    MaiSystemProxyResult proxy;
+    const bool loopback = url.host() == QStringLiteral("127.0.0.1") || url.host() == QStringLiteral("localhost");
+    if (loopback)
+        proxy.mode = MaiSystemProxyMode::Direct;
+    else
+        proxy = maiSystemProxyForUrl(encoded.toStdString());
+    if (proxy.mode != MaiSystemProxyMode::Direct && proxy.mode != MaiSystemProxyMode::Http &&
+        proxy.mode != MaiSystemProxyMode::Socks5) {
+        curl_easy_cleanup(curl);
+        return {};
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, encoded.constData());
+    const char* protocols = scheme == QStringLiteral("https") ? "https" : "http,https";
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, protocols);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, protocols);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 20000L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_NETRC, CURL_NETRC_IGNORED);
+    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, curl_off_t(4 * 1024 * 1024));
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receiveSignedAvatar);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
 #ifdef Q_OS_WIN
-  curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, long(CURLSSLOPT_NATIVE_CA));
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, long(CURLSSLOPT_NATIVE_CA));
 #elif defined(Q_OS_MACOS)
-  QFile certificates(QStringLiteral(":/maichat/auth/cacert.pem"));
-  if (!certificates.open(QIODevice::ReadOnly)) {
-    curl_easy_cleanup(curl);
-    return {};
-  }
-  const QByteArray caBundle = certificates.readAll();
-  if (caBundle.isEmpty()) {
-    curl_easy_cleanup(curl);
-    return {};
-  }
-  curl_blob caBlob = {const_cast<char *>(caBundle.constData()),
-                      size_t(caBundle.size()), CURL_BLOB_COPY};
-  curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &caBlob);
+    QFile certificates(QStringLiteral(":/maichat/auth/cacert.pem"));
+    if (!certificates.open(QIODevice::ReadOnly)) {
+        curl_easy_cleanup(curl);
+        return {};
+    }
+    const QByteArray caBundle = certificates.readAll();
+    if (caBundle.isEmpty()) {
+        curl_easy_cleanup(curl);
+        return {};
+    }
+    curl_blob caBlob = {const_cast<char*>(caBundle.constData()), size_t(caBundle.size()), CURL_BLOB_COPY};
+    curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &caBlob);
 #endif
-  if (!encodedProxy.isEmpty()) curl_easy_setopt(curl, CURLOPT_PROXY, encodedProxy.constData());
-  if (url.host() == QStringLiteral("127.0.0.1") || url.host() == QStringLiteral("localhost"))
-    curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
-  const CURLcode transferred = curl_easy_perform(curl);
-  long status = 0;
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-  curl_easy_cleanup(curl);
-  if (transferred != CURLE_OK || status != 200)
-    qWarning().noquote() << QStringLiteral("[im] avatar fetch failed: host=%1 status=%2 curl=%3")
-                              .arg(url.host()).arg(status).arg(int(transferred));
-  return transferred == CURLE_OK && status == 200 ? data : QByteArray{};
+    curl_easy_setopt(curl, CURLOPT_PROXY, proxy.url.c_str());
+    if (url.host() == QStringLiteral("127.0.0.1") || url.host() == QStringLiteral("localhost"))
+        curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
+    const CURLcode transferred = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(curl);
+    if (transferred != CURLE_OK || status != 200)
+        qWarning().noquote() << QStringLiteral("[im] avatar fetch failed: host=%1 status=%2 curl=%3")
+                                    .arg(url.host())
+                                    .arg(status)
+                                    .arg(int(transferred));
+    return transferred == CURLE_OK && status == 200 ? data : QByteArray{};
 }
 
 // 作用：异步读取头像并在目标控件仍有效时请求重绘。
-void requestAvatarPixmap(const QString &avatarUrl, QWidget *repaintTarget) {
-  const QString url = avatarUrl.trimmed();
-  if (url.isEmpty() || avatarPixmapCache().contains(url)) return;
-  if (restoreAvatarPixmap(url)) {
-    if (repaintTarget) repaintTarget->update();
-    return;
-  }
-  if (failedAvatarUrls().contains(url)) return;
-  if (!repaintTarget ||
-      !repaintTarget->property("avatarRequestsEnabled").toBool())
-    return;
+void requestAvatarPixmap(const QString& avatarUrl, QWidget* repaintTarget) {
+    const QString url = avatarUrl.trimmed();
+    if (url.isEmpty() || avatarPixmapCache().contains(url)) return;
+    if (restoreAvatarPixmap(url)) {
+        if (repaintTarget) repaintTarget->update();
+        return;
+    }
+    if (failedAvatarUrls().contains(url)) return;
+    if (!repaintTarget || !repaintTarget->property("avatarRequestsEnabled").toBool()) return;
 
-  if (repaintTarget) {
-    QList<QPointer<QWidget>> &waiters = avatarRepaintWaiters()[url];
-    const auto alreadyWaiting =
-        std::any_of(waiters.cbegin(), waiters.cend(),
-                    [repaintTarget](const QPointer<QWidget> &item) {
-                      return item.data() == repaintTarget;
-                    });
-    if (!alreadyWaiting)
-      waiters.append(QPointer<QWidget>(repaintTarget));
-  }
-  if (pendingAvatarUrls().contains(url))
-    return;
-  pendingAvatarUrls().insert(url);
+    if (repaintTarget) {
+        QList<QPointer<QWidget>>& waiters = avatarRepaintWaiters()[url];
+        const auto alreadyWaiting =
+            std::any_of(waiters.cbegin(), waiters.cend(),
+                        [repaintTarget](const QPointer<QWidget>& item) { return item.data() == repaintTarget; });
+        if (!alreadyWaiting) waiters.append(QPointer<QWidget>(repaintTarget));
+    }
+    if (pendingAvatarUrls().contains(url)) return;
+    pendingAvatarUrls().insert(url);
 
-  const QUrl avatarLocation(url);
-  QString proxyUrl;
-  const auto proxies = QNetworkProxyFactory::systemProxyForQuery(
-      QNetworkProxyQuery(avatarLocation));
-  if (!proxies.isEmpty() && proxies.first().type() == QNetworkProxy::HttpProxy) {
-    QUrl proxy;
-    proxy.setScheme(QStringLiteral("http"));
-    proxy.setHost(proxies.first().hostName());
-    proxy.setPort(proxies.first().port());
-    proxyUrl = proxy.toString(QUrl::FullyEncoded);
-  }
-  QPointer<QApplication> application(qApp);
-  QtConcurrent::run([avatarLocation, application, url, proxyUrl] {
-    const QByteArray data = downloadAvatar(avatarLocation, proxyUrl);
-    if (!application) return;
-    QMetaObject::invokeMethod(application.data(), [url, data] {
-      finishAvatarPixmap(url, data);
-    }, Qt::QueuedConnection);
-  });
+    const QUrl avatarLocation(url);
+    QPointer<QApplication> application(qApp);
+    QtConcurrent::run([avatarLocation, application, url] {
+        const QByteArray data = downloadAvatar(avatarLocation);
+        if (!application) return;
+        QMetaObject::invokeMethod(
+            application.data(), [url, data] { finishAvatarPixmap(url, data); }, Qt::QueuedConnection);
+    });
 }
 
 void drawAvatarPixmap(QPainter *painter, const QRectF &target,
@@ -1947,7 +1942,7 @@ void MainWindow::updateWindowCaptionControls() {
 }
 
 #ifdef Q_OS_WIN
-bool MainWindow::nativeEvent(const QByteArray& eventType, void* message, long* result) {
+bool MainWindow::nativeEvent(const QByteArray& eventType, void* message, qintptr* result) {
   auto* native = static_cast<MSG*>(message);
   if (native->message == WM_NCCALCSIZE && !isFullScreen()) {
     *result = 0;
@@ -6722,13 +6717,10 @@ void MainWindow::openVideoPreview(const RemoteIMVideoAttachment &attachment) {
                            QStringLiteral("无法播放"),
                            QStringLiteral("FFplay 渲染后端或视频文件不可用。"));
 #else
-  const QString title = attachment.fileName.trimmed().isEmpty()
-                            ? QFileInfo(path).fileName()
-                            : attachment.fileName.trimmed();
-  auto *dialog = new VideoPreviewDialog(path, title, this);
-  dialog->setForwardAction([this, path] { forwardLocalVideo(path); });
-  dialog->setAttribute(Qt::WA_DeleteOnClose);
-  dialog->show();
+  // 构建未提供正式媒体后端时明确说明，不启动另一套 Qt 播放器。
+  AppMessageDialog::show(this, AppMessageDialog::Kind::Warning,
+                        QStringLiteral("无法播放"),
+                        QStringLiteral("当前构建未包含 FFplay 媒体后端。"));
 #endif
 }
 
@@ -6788,10 +6780,11 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
         return false;
       QRect destination(mapFromGlobal(sourceGuard->mapToGlobal(QPoint(0, 0))),
                         sourceGuard->size());
-      if (auto *label = qobject_cast<QLabel *>(sourceGuard.data()); label &&
-          label->pixmap() && !label->pixmap()->isNull()) {
-        QSize fitted = (QSizeF(label->pixmap()->size()) /
-                        label->pixmap()->devicePixelRatioF()).toSize();
+      const auto *label = qobject_cast<QLabel *>(sourceGuard.data());
+      const QPixmap sourcePixmap = label ? label->pixmap() : QPixmap();
+      if (!sourcePixmap.isNull()) {
+        QSize fitted = (QSizeF(sourcePixmap.size()) /
+                        sourcePixmap.devicePixelRatioF()).toSize();
         fitted.scale(sourceGuard->size(), Qt::KeepAspectRatio);
         const QPoint inset((sourceGuard->width() - fitted.width()) / 2,
                            (sourceGuard->height() - fitted.height()) / 2);
@@ -6849,8 +6842,8 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
     QPixmap thumbnail;
     QRect start;
     if (auto *label = qobject_cast<QLabel *>(source); label &&
-        label->pixmap() && !label->pixmap()->isNull()) {
-      thumbnail = *label->pixmap();
+        !label->pixmap().isNull()) {
+      thumbnail = label->pixmap();
       QSize imageSize = (QSizeF(thumbnail.size()) / thumbnail.devicePixelRatioF()).toSize();
       imageSize.scale(source->size(), Qt::KeepAspectRatio);
       const QPoint inset((source->width() - imageSize.width()) / 2,
@@ -7993,9 +7986,9 @@ void MainWindow::requestReplySuggestions() {
   }
 
   QVector<ReplySuggestionTurn> turns;
-  const int begin = std::max(0, messages.size() - 24);
+  const qsizetype begin = std::max<qsizetype>(0, messages.size() - 24);
   turns.reserve(messages.size() - begin);
-  for (int i = begin; i < messages.size(); ++i) {
+  for (qsizetype i = begin; i < messages.size(); ++i) {
     const RemoteIMMessage &message = messages.at(i);
     if (message.hasApprovalRequest || message.hasApprovalDecision)
       continue;
@@ -8342,7 +8335,7 @@ QWidget *MainWindow::buildRemoteDesktopSettingsPanel(QWidget *parent) {
     modeLayout->addWidget(radio);
   }
   connect(remoteDesktopModeGroup_,
-          QOverload<int>::of(&QButtonGroup::buttonClicked), this,
+          &QButtonGroup::idClicked, this,
           [this](int id) {
             RemoteDesktopSettings settings = remoteDesktop_->settings();
             settings.mode = static_cast<RemoteDesktop::HostMode>(id);

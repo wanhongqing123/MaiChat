@@ -1,5 +1,7 @@
 // 文件作用：验证桌面端主窗口消息、视频封面和状态提示的布局行为。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
+#include <httplib.h>
+
 #include <QAbstractButton>
 #include <QBuffer>
 #include <QAction>
@@ -40,13 +42,10 @@
 #include <QFontMetrics>
 #include <QFontDatabase>
 #include <QImage>
-#include <QHostAddress>
 #include <QInputMethodEvent>
 #include <QMimeData>
 #include <QTemporaryDir>
 #include <QTest>
-#include <QTcpServer>
-#include <QTcpSocket>
 #include "agent/AgentChatPanel.h"
 #include "agent/AgentController.h"
 #include "agent/AgentSessionList.h"
@@ -65,6 +64,10 @@
 #include <QVector>
 #include <QWidget>
 #include <memory>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
 
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
@@ -82,6 +85,64 @@
 #include "ui/UiZoom.h"
 
 namespace {
+
+// 头像仍经真实 loopback HTTP 下载；服务持有 PNG 和计数器，关闭后等待全部 handler 结束。
+class AvatarHttpServer {
+public:
+    ~AvatarHttpServer() {
+        close();
+    }
+
+    bool listen() {
+        server_.Get(".*", [this](const httplib::Request&, httplib::Response& response) {
+            std::string bytes;
+            {
+                std::lock_guard<std::mutex> lock(pngMutex_);
+                bytes = png_;
+            }
+            ++requests;
+            response.set_content(bytes, "image/png");
+            response.set_header("Connection", "close");
+        });
+        server_.set_read_timeout(2);
+        server_.set_write_timeout(2);
+        port_ = server_.bind_to_any_port("127.0.0.1");
+        if (port_ <= 0) return false;
+        worker_ = std::thread([this] {
+            server_.listen_after_bind();
+            listenerExited_ = true;
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!server_.is_running() && !listenerExited_.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!server_.is_running() && !listenerExited_.load()) qFatal("Cannot start avatar HTTP fixture");
+        return server_.is_running();
+    }
+
+    void servePng(const QByteArray& png) {
+        std::lock_guard<std::mutex> lock(pngMutex_);
+        png_ = png.toStdString();
+    }
+
+    int serverPort() const {
+        return port_;
+    }
+
+    void close() {
+        server_.stop();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    std::atomic<int> requests{0};
+
+private:
+    httplib::Server server_;
+    std::thread worker_;
+    std::atomic<bool> listenerExited_{false};
+    std::mutex pngMutex_;
+    std::string png_;
+    int port_ = 0;
+};
 
 // 消息及窗口标题栏可视回归使用正常 App 随包字体；结束后恢复，避免影响其他套件。
 class ScopedMessageHeaderFont {
@@ -2740,27 +2801,16 @@ void MainWindowLayoutTest::settingsNavigationShowsAccountWithoutDiagnostics() {
 }
 
 void MainWindowLayoutTest::settingsAvatarUpdatesWhenSelfProfileArrives() {
-    QTcpServer server;
-    QVERIFY(server.listen(QHostAddress::LocalHost));
+    AvatarHttpServer server;
+    QVERIFY(server.listen());
     QImage red(32, 32, QImage::Format_RGB32);
     red.fill(QColor(230, 20, 20));
     QByteArray png;
     QBuffer imageBuffer(&png);
     QVERIFY(imageBuffer.open(QIODevice::WriteOnly));
     QVERIFY(red.save(&imageBuffer, "PNG"));
-    int requests = 0;
-    connect(&server, &QTcpServer::newConnection, &server, [&] {
-        while (QTcpSocket* socket = server.nextPendingConnection()) {
-            connect(socket, &QTcpSocket::readyRead, socket, [&, socket] {
-                socket->readAll();
-                ++requests;
-                socket->write("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: " +
-                              QByteArray::number(png.size()) + "\r\nConnection: close\r\n\r\n" + png);
-                socket->disconnectFromHost();
-            });
-            connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
-        }
-    });
+    std::atomic<int>& requests = server.requests;
+    server.servePng(png);
     auto client = std::make_unique<FakeRemoteIMClient>();
     FakeRemoteIMClient* fake = client.get();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
@@ -2808,25 +2858,15 @@ void MainWindowLayoutTest::settingsAvatarSurvivesNetworkLossAfterRestart() {
         return;
     }
 
-    QTcpServer server;
-    QVERIFY(server.listen(QHostAddress::LocalHost));
+    AvatarHttpServer server;
+    QVERIFY(server.listen());
     QImage red(32, 32, QImage::Format_RGB32);
     red.fill(QColor(230, 20, 20));
     QByteArray png;
     QBuffer imageBuffer(&png);
     QVERIFY(imageBuffer.open(QIODevice::WriteOnly));
     QVERIFY(red.save(&imageBuffer, "PNG"));
-    connect(&server, &QTcpServer::newConnection, &server, [&] {
-        while (QTcpSocket* socket = server.nextPendingConnection()) {
-            connect(socket, &QTcpSocket::readyRead, socket, [&, socket] {
-                socket->readAll();
-                socket->write("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: " +
-                              QByteArray::number(png.size()) + "\r\nConnection: close\r\n\r\n" + png);
-                socket->disconnectFromHost();
-            });
-            connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
-        }
-    });
+    server.servePng(png);
     const QString url = QStringLiteral("http://127.0.0.1:%1/cache-avatar.png").arg(server.serverPort());
     const QString cachePath =
         QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation))
@@ -3773,7 +3813,7 @@ void MainWindowLayoutTest::selfAvatarOpensProfileSettings() {
     QCOMPARE(stack->currentWidget(), settingsPage);
     QCOMPARE(profileName->text(), QStringLiteral("我的昵称"));
     QCOMPARE(profileId->text(), QStringLiteral("MaiChat ID  m_desktop"));
-    QVERIFY(!profileAvatar->pixmap(Qt::ReturnByValue).isNull());
+    QVERIFY(!profileAvatar->pixmap().isNull());
     QCOMPARE(app.chatState().selectedPeerId(), QStringLiteral("phone-user"));
     const QByteArray capture = qgetenv("MAICHAT_CAPTURE_SELF_PROFILE");
     if (!capture.isEmpty()) QVERIFY(settingsPage->grab().save(QString::fromUtf8(capture)));
@@ -4243,7 +4283,7 @@ void MainWindowLayoutTest::accountAvatarFollowsIMProfile() {
     MainWindow window(app);
     auto* logo = window.findChild<QLabel*>(QStringLiteral("navLogo"));
     QVERIFY(logo);
-    QVERIFY(!logo->pixmap(Qt::ReturnByValue).isNull());
+    QVERIFY(!logo->pixmap().isNull());
     QCOMPARE(logo->accessibleName(), QStringLiteral("desktop-user"));
     fake->selfProfileReceived(QStringLiteral("desktop-user"), QStringLiteral("My Name"),
                               QStringLiteral("https://example.com/new-avatar.jpg"));
@@ -4285,9 +4325,9 @@ void MainWindowLayoutTest::connectionStatusLivesInSelfProfile() {
     // 形状必须真是个圆。QSS 的 border-radius 在非整数缩放倍率下会塌成圆角方块
     // （尺寸与圆角各自四舍五入，半径小于半边长），所以这里直接看画出来的像素：
     // 四角透明、中心不透明。断言「有个 QLabel 在那儿」是看不出方块的。
-    const QPixmap* painted = statusDot->pixmap();
-    QVERIFY2(painted != nullptr && !painted->isNull(), "状态点没有画出来");
-    const QImage image = painted->toImage();
+    const QPixmap painted = statusDot->pixmap();
+    QVERIFY2(!painted.isNull(), "状态点没有画出来");
+    const QImage image = painted.toImage();
     QCOMPARE(qAlpha(image.pixel(0, 0)), 0);
     QCOMPARE(qAlpha(image.pixel(image.width() - 1, 0)), 0);
     QCOMPARE(qAlpha(image.pixel(0, image.height() - 1)), 0);
@@ -4360,8 +4400,8 @@ void MainWindowLayoutTest::imageBubbleUsesNativePixmapPreview() {
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     auto* label = window.findChild<QLabel*>(QStringLiteral("messageImageLabel"));
     QVERIFY(label != nullptr);
-    QTRY_VERIFY(label->pixmap() != nullptr && !label->pixmap()->isNull());
-    QCOMPARE(label->pixmap()->toImage().pixelColor(0, 0), QColor(Qt::red));
+    QTRY_VERIFY(!label->pixmap().isNull());
+    QCOMPARE(label->pixmap().toImage().pixelColor(0, 0), QColor(Qt::red));
     QVERIFY(label->findChild<QWidget*>(QStringLiteral("maiGraphicsImageOverlay")) == nullptr);
 }
 
@@ -4460,7 +4500,7 @@ void MainWindowLayoutTest::imagePreviewKeepsConversationBackgroundStable() {
     auto* label = window.findChild<QLabel*>(QStringLiteral("messageImageLabel"));
     auto* scroll = window.findChild<QScrollArea*>(QStringLiteral("messageScroll"));
     QVERIFY(label && scroll);
-    QTRY_VERIFY(label->pixmap() && !label->pixmap()->isNull());
+    QTRY_VERIFY(!label->pixmap().isNull());
     QTest::qWait(100);
 
     // Observe rendered conversation pixels, away from both image endpoints and

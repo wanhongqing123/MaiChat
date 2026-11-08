@@ -1,28 +1,26 @@
-// 文件作用：用 Qt5 摄像头预览拍摄一张图片；失败不返回不存在的文件。
+// 文件作用：以 Qt 控件显示普通原生相机的帧；用户快门与 Agent 预览共用同一照片入口。
 #include "ui/DesktopCameraDialog.h"
 
-#include <QCamera>
 #include <QApplication>
-#include <QCameraImageCapture>
-#include <QCameraInfo>
-#include <QCameraViewfinder>
 #include <QDir>
-#include <QFile>
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QHash>
 #include <QLabel>
 #include <QPointer>
+#include <QPixmap>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QTimer>
 #include <QUuid>
 #include <QVBoxLayout>
+
+#include "ui/DesktopCameraSession.h"
 
 namespace {
 struct CameraPreviewState {
     QPointer<DesktopCameraDialog> dialog;
     QString sessionId;
-    QString directory;
     QString lastPhoto;
     QUuid generation;
 };
@@ -31,23 +29,38 @@ QHash<QWidget*, CameraPreviewState>& activePreviews() {
     static QHash<QWidget*, CameraPreviewState> previews;
     return previews;
 }
+
+// 手动入口和 Agent 入口共用一台摄像头窗口，不能各开一个设备句柄。
+QPointer<DesktopCameraDialog>& cameraOwner() {
+    static QPointer<DesktopCameraDialog> owner;
+    return owner;
 }
 
-QString DesktopCameraDialog::capturePhoto(QWidget* parent, const QString& directory,
-                                           QString* error, const std::atomic<bool>* canceled) {
+bool usableDirectory(const QString& directory) {
+    const QFileInfo info(directory);
+    return info.isDir() && info.isWritable();
+}
+}  // namespace
+
+QString DesktopCameraDialog::capturePhoto(QWidget* parent, const QString& directory, QString* error,
+                                          const std::atomic<bool>* canceled) {
     if (error) error->clear();
     if (canceled && canceled->load(std::memory_order_relaxed)) return {};
-    if (QCameraInfo::availableCameras().isEmpty()) {
-        if (error) *error = QStringLiteral("没有可用的摄像头");
+    if (cameraOwner() && cameraOwner()->isVisible()) {
+        if (error) *error = QStringLiteral("另一个相机窗口正在使用摄像头");
         return {};
     }
-    if (!QDir(directory).exists() || !QFileInfo(directory).isWritable()) {
+    if (!usableDirectory(directory)) {
         if (error) *error = QStringLiteral("当前工作目录不可写，无法保存照片");
         return {};
     }
-    DesktopCameraDialog dialog(parent, directory);
+    DesktopCameraDialog dialog(parent, directory, false, canceled);
+    if (dialog.session_->state() == DesktopCameraSession::State::Error) {
+        if (error) *error = dialog.error_;
+        return {};
+    }
     QTimer cancellation;
-    if (canceled != nullptr) {
+    if (canceled) {
         cancellation.setInterval(100);
         QObject::connect(&cancellation, &QTimer::timeout, &dialog, [&dialog, canceled] {
             if (canceled->load(std::memory_order_relaxed)) dialog.reject();
@@ -55,14 +68,14 @@ QString DesktopCameraDialog::capturePhoto(QWidget* parent, const QString& direct
         cancellation.start();
     }
     if (dialog.exec() != QDialog::Accepted) {
-        if (error) *error = dialog.error_;
+        if (error && !(canceled && canceled->load(std::memory_order_relaxed))) *error = dialog.error_;
         return {};
     }
     return dialog.savedPath_;
 }
 
-bool DesktopCameraDialog::openPreview(QWidget* parent, const QString& sessionId,
-                                      const QString& directory, QString* error) {
+bool DesktopCameraDialog::openPreview(QWidget* parent, const QString& sessionId, const QString& directory,
+                                      QString* error) {
     if (error) error->clear();
     if (!parent || sessionId.isEmpty()) {
         if (error) *error = QStringLiteral("MaiChat 窗口不可用");
@@ -78,26 +91,28 @@ bool DesktopCameraDialog::openPreview(QWidget* parent, const QString& sessionId,
         current.dialog->activateWindow();
         return true;
     }
-    if (QCameraInfo::availableCameras().isEmpty()) {
-        if (error) *error = QStringLiteral("没有可用的摄像头");
+    if (cameraOwner() && cameraOwner()->isVisible()) {
+        if (error) *error = QStringLiteral("另一个相机窗口正在使用摄像头");
         return false;
     }
-    if (!QDir(directory).exists() || !QFileInfo(directory).isWritable()) {
+    if (!usableDirectory(directory)) {
         if (error) *error = QStringLiteral("当前工作目录不可写，无法保存照片");
         return false;
     }
     auto* dialog = new DesktopCameraDialog(parent, directory, true);
+    if (dialog->session_->state() == DesktopCameraSession::State::Error) {
+        if (error) *error = dialog->error_;
+        delete dialog;
+        return false;
+    }
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     const QUuid generation = QUuid::createUuid();
-    activePreviews().insert(parent, {dialog, sessionId, directory, {}, generation});
+    activePreviews().insert(parent, {dialog, sessionId, {}, generation});
     QObject::connect(dialog, &QObject::destroyed, parent, [parent, generation] {
         auto preview = activePreviews().find(parent);
-        if (preview != activePreviews().end() && preview->generation == generation)
-            preview->dialog = nullptr;
+        if (preview != activePreviews().end() && preview->generation == generation) preview->dialog = nullptr;
     });
-    QObject::connect(parent, &QObject::destroyed, qApp, [parent] {
-        activePreviews().remove(parent);
-    });
+    QObject::connect(parent, &QObject::destroyed, qApp, [parent] { activePreviews().remove(parent); });
     dialog->show();
     return true;
 }
@@ -127,16 +142,22 @@ QString DesktopCameraDialog::lastPreviewPhoto(QWidget* parent, const QString& se
     return QFileInfo(path).isFile() ? path : QString();
 }
 
-DesktopCameraDialog::DesktopCameraDialog(QWidget* parent, const QString& destination, bool persistent)
-    : QDialog(parent), destination_(destination), persistent_(persistent) {
+DesktopCameraDialog::DesktopCameraDialog(QWidget* parent, const QString& destination, bool persistent,
+                                         const std::atomic<bool>* canceled)
+    : QDialog(parent), persistent_(persistent), canceled_(canceled) {
+    cameraOwner() = this;
     setObjectName(QStringLiteral("desktopCameraDialog"));
     setWindowTitle(QStringLiteral("拍照"));
     setMinimumSize(640, 520);
     auto* layout = new QVBoxLayout(this);
-    viewfinder_ = new QCameraViewfinder(this);
+    viewfinder_ = new QLabel(this);
     viewfinder_->setObjectName(QStringLiteral("desktopCameraPreview"));
+    viewfinder_->setAlignment(Qt::AlignCenter);
+    viewfinder_->setMinimumSize(1, 1);
+    viewfinder_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
     layout->addWidget(viewfinder_, 1);
     status_ = new QLabel(QStringLiteral("正在打开摄像头…"), this);
+    status_->setObjectName(QStringLiteral("desktopCameraStatus"));
     layout->addWidget(status_);
     auto* actions = new QHBoxLayout;
     actions->addStretch();
@@ -150,80 +171,99 @@ DesktopCameraDialog::DesktopCameraDialog(QWidget* parent, const QString& destina
     connect(cancel, &QPushButton::clicked, this, &DesktopCameraDialog::reject);
     connect(shutter_, &QPushButton::clicked, this, &DesktopCameraDialog::takePhoto);
 
-    camera_ = new QCamera(QCameraInfo::defaultCamera(), this);
-    camera_->setCaptureMode(QCamera::CaptureStillImage);
-    camera_->setViewfinder(viewfinder_);
-    connect(camera_, QOverload<QCamera::Error>::of(&QCamera::error), this,
-            [this](QCamera::Error) {
-                error_ = camera_->errorString().isEmpty() ?
-                    QStringLiteral("摄像头无法打开，请检查系统权限") : camera_->errorString();
-                status_->setText(error_);
-                shutter_->setEnabled(false);
-            });
-    capture_ = new QCameraImageCapture(camera_, this);
-    capture_->setCaptureDestination(QCameraImageCapture::CaptureToFile);
-    connect(capture_, &QCameraImageCapture::readyForCaptureChanged, this,
-            [this](bool ready) {
-                if (pendingCapture_ < 0) shutter_->setEnabled(ready);
-                if (ready && pendingCapture_ < 0) status_->setText(QStringLiteral("准备就绪"));
-            });
-    connect(capture_, &QCameraImageCapture::imageSaved, this,
-            [this](int id, const QString& path) {
-                if (id != pendingCapture_) return;
-                if (!QFileInfo(path).isFile() || QFileInfo(path).size() <= 0) {
-                    error_ = QStringLiteral("照片未能保存，请重试");
-                    status_->setText(error_);
-                    QFile::remove(pendingPath_);
-                    pendingPath_.clear();
-                    pendingCapture_ = -1;
-                    shutter_->setEnabled(capture_->isReadyForCapture());
-                    return;
-                }
-                savedPath_ = path;
-                if (persistent_) activePreviews()[parentWidget()].lastPhoto = path;
-                pendingPath_.clear();
-                pendingCapture_ = -1;
-                camera_->stop();
-                accept();
-            });
-    connect(capture_, QOverload<int, QCameraImageCapture::Error, const QString&>::of(
-                &QCameraImageCapture::error), this,
-            [this](int id, QCameraImageCapture::Error, const QString& message) {
-                if (id != pendingCapture_) return;
-                error_ = message.isEmpty() ? QStringLiteral("拍照失败") : message;
-                status_->setText(error_);
-                QFile::remove(pendingPath_);
-                pendingPath_.clear();
-                pendingCapture_ = -1;
-                shutter_->setEnabled(capture_->isReadyForCapture());
-            });
-    camera_->start();
+    session_ = new DesktopCameraSession(this);
+    connect(session_, &DesktopCameraSession::stateChanged, this, [this](DesktopCameraSession::State state) {
+        if (closing_) return;
+        const bool ready = state == DesktopCameraSession::State::Running && session_->isReady();
+        shutter_->setEnabled(ready && !pendingCapture_);
+        if (state == DesktopCameraSession::State::Starting) status_->setText(QStringLiteral("正在打开摄像头…"));
+        if (ready && !pendingCapture_) status_->setText(QStringLiteral("准备就绪"));
+        if (state == DesktopCameraSession::State::Error || state == DesktopCameraSession::State::Stopped) {
+            previewFrame_ = {};
+            viewfinder_->clear();
+            pendingCapture_ = 0;
+        }
+    });
+    connect(session_, &DesktopCameraSession::frameReady, this, [this](const QImage& image) {
+        if (closing_) return;
+        previewFrame_ = image;
+        updatePreview();
+    });
+    connect(session_, &DesktopCameraSession::errorOccurred, this, [this](const QString& error) {
+        if (closing_) return;
+        error_ = error;
+        status_->setText(error_);
+        shutter_->setEnabled(false);
+    });
+    connect(session_, &DesktopCameraSession::photoFailed, this, [this](quint64 request, const QString& error) {
+        if (closing_ || request != pendingCapture_) return;
+        pendingCapture_ = 0;
+        error_ = error;
+        status_->setText(error_);
+        shutter_->setEnabled(session_->isReady());
+    });
+    connect(session_, &DesktopCameraSession::photoReady, this, [this](quint64 request) {
+        if (closing_ || request != pendingCapture_) return;
+        if (canceled_ && canceled_->load(std::memory_order_relaxed)) {
+            reject();
+            return;
+        }
+        const QString path = session_->takePhoto(request);
+        if (path.isEmpty()) return;
+        savedPath_ = path;
+        error_.clear();
+        pendingCapture_ = 0;
+        if (persistent_) {
+            auto preview = activePreviews().find(parentWidget());
+            if (preview != activePreviews().end() && preview->dialog == this) preview->lastPhoto = path;
+        }
+        accept();
+    });
+    session_->start(destination);
 }
 
 DesktopCameraDialog::~DesktopCameraDialog() {
-    if (camera_) camera_->stop();
+    closing_ = true;
+    if (session_) session_->stop();
+    if (cameraOwner() == this) cameraOwner().clear();
+}
+
+void DesktopCameraDialog::done(int result) {
+    closing_ = true;
+    pendingCapture_ = 0;
+    if (session_) session_->stop();
+    QDialog::done(result);
 }
 
 void DesktopCameraDialog::reject() {
-    if (pendingCapture_ >= 0) capture_->cancelCapture();
-    if (!pendingPath_.isEmpty()) QFile::remove(pendingPath_);
-    if (!savedPath_.isEmpty()) QFile::remove(savedPath_);
-    if (camera_) camera_->stop();
-    QDialog::reject();
+    done(QDialog::Rejected);
+}
+
+void DesktopCameraDialog::resizeEvent(QResizeEvent* event) {
+    QDialog::resizeEvent(event);
+    updatePreview();
+}
+
+void DesktopCameraDialog::updatePreview() {
+    if (!viewfinder_ || previewFrame_.isNull()) return;
+    viewfinder_->setPixmap(
+        QPixmap::fromImage(previewFrame_).scaled(viewfinder_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
 }
 
 void DesktopCameraDialog::takePhoto() {
-    if (!capture_ || !capture_->isReadyForCapture() || pendingCapture_ >= 0) return;
-    const QString path = QDir(destination_).filePath(
-        QStringLiteral("camera-%1.jpg").arg(QUuid::createUuid().toString(QUuid::WithoutBraces)));
-    pendingPath_ = path;
-    shutter_->setEnabled(false);
-    status_->setText(QStringLiteral("正在保存照片…"));
-    pendingCapture_ = capture_->capture(path);
-    if (pendingCapture_ >= 0) return;
-    error_ = capture_->errorString().isEmpty() ? QStringLiteral("拍照失败") : capture_->errorString();
-    status_->setText(error_);
-    QFile::remove(pendingPath_);
-    pendingPath_.clear();
-    shutter_->setEnabled(capture_->isReadyForCapture());
+    if (closing_ || !session_->isReady() || session_->photoPending()) return;
+    if (canceled_ && canceled_->load(std::memory_order_relaxed)) {
+        reject();
+        return;
+    }
+    pendingCapture_ = session_->capturePhoto();
+    if (pendingCapture_) {
+        error_.clear();
+        shutter_->setEnabled(false);
+        status_->setText(QStringLiteral("正在保存照片…"));
+    } else {
+        error_ = session_->errorString();
+        status_->setText(error_);
+        shutter_->setEnabled(session_->isReady());
+    }
 }

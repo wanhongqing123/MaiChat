@@ -325,7 +325,7 @@ void DesktopScreenshotIntegrationTest::nativeCaptureReturnsToCreationCenter() {
     QTRY_VERIFY_WITH_TIMEOUT(open->isVisible(), 5000);
     auto* cover = open->parentWidget()->findChild<QLabel*>();
     QVERIFY(cover);
-    QTRY_VERIFY_WITH_TIMEOUT(cover->pixmap() && !cover->pixmap()->isNull(), 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(!cover->pixmap().isNull(), 5000);
     if (!evidence.isEmpty()) {
         QVERIFY(owned.grab().save(QDir(evidence).filePath(QStringLiteral("owned-fixture-widget.png"))));
         QVERIFY(panel.grab().save(QDir(evidence).filePath(QStringLiteral("creation-center-delivered-image.png"))));

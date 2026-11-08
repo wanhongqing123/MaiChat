@@ -1,0 +1,23 @@
+{
+  "version": "6.12.0",
+  "modules": [
+    {
+      "name": "qtbase",
+      "repository": "https://github.com/qt/qtbase.git",
+      "tag": "v6.12.0",
+      "commit": "025bdad181de241e81bf853c8a2d7bf3d19261a9"
+    },
+    {
+      "name": "qtsvg",
+      "repository": "https://github.com/qt/qtsvg.git",
+      "tag": "v6.12.0",
+      "commit": "883a58532078d003cefef0a549bfe9f885ce41f5"
+    },
+    {
+      "name": "qtimageformats",
+      "repository": "https://github.com/qt/qtimageformats.git",
+      "tag": "v6.12.0",
+      "commit": "dc13f2fbff1d579cfb2eb2d9092e3563b4d05b8e"
+    }
+  ]
+}

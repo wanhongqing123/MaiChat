@@ -200,13 +200,13 @@ bool DesktopAuthClient::adoptSession(const QJsonObject& body, QString* error) {
 
 void DesktopAuthClient::scheduleRefresh() {
     const qint64 delay = QDateTime::currentDateTimeUtc().msecsTo(accessExpiresAt_.addSecs(-60));
-    refreshTimer_.start(int(qBound<qint64>(1000, delay, 15 * 60 * 1000)));
+    refreshTimer_.start(int(qBound(qint64(1000), delay, qint64(15 * 60 * 1000))));
 }
 
 void DesktopAuthClient::scheduleCredentialRefresh() {
     const QDateTime deadline = imCredential_.expiresAt.addSecs(-kCredentialRenewBeforeExpirySeconds);
     const qint64 delay = QDateTime::currentDateTimeUtc().msecsTo(deadline);
-    credentialTimer_.start(int(qBound<qint64>(60000, delay, 24 * 60 * 60 * 1000)));
+    credentialTimer_.start(int(qBound(qint64(60000), delay, qint64(24 * 60 * 60 * 1000))));
 }
 
 void DesktopAuthClient::invalidateSession(const QString& reason) {

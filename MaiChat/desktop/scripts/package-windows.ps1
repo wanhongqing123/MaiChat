@@ -5,14 +5,14 @@
 #
 # 用法（先完成 Release 构建）：
 #   powershell -ExecutionPolicy Bypass -File scripts\package-windows.ps1
-#   可选参数：-BuildDir build-msvc2019_64   -OutDir dist
+#   可选参数：-BuildDir build   -OutDir dist
 #
 # 产出：
 #   <OutDir>\MaiChat-win64\            解压即用目录
 #   <OutDir>\MaiChat-win64-v<版本>-<日期>-<git短哈希>.zip
 
 param(
-    [string]$BuildDir = 'build-msvc2019_64',
+    [string]$BuildDir = 'build',
     [string]$OutDir = 'dist',
     # 只组装 staging 目录不出 zip（供安装程序脚本 make-installer-windows.ps1 复用）。
     [switch]$SkipZip
@@ -47,10 +47,10 @@ if (-not (Test-Path $exePath)) {
 }
 
 # 从 CMakeCache 定位 Qt（避免依赖 PATH）
-$qt5DirLine = Select-String -Path $cachePath -Pattern '^Qt5_DIR:PATH=(.+)$'
-if (-not $qt5DirLine) { throw "CMakeCache.txt 里没有 Qt5_DIR，无法定位 windeployqt" }
-$qt5Dir = $qt5DirLine.Matches[0].Groups[1].Value
-$qtBin = (Resolve-Path (Join-Path $qt5Dir '..\..\..\bin')).Path
+$qt6DirLine = Select-String -Path $cachePath -Pattern '^Qt6_DIR:PATH=(.+)$'
+if (-not $qt6DirLine) { throw "CMakeCache.txt 里没有 Qt6_DIR，无法定位 windeployqt" }
+$qt6Dir = $qt6DirLine.Matches[0].Groups[1].Value
+$qtBin = (Resolve-Path (Join-Path $qt6Dir '..\..\..\bin')).Path
 $windeployqt = Join-Path $qtBin 'windeployqt.exe'
 if (-not (Test-Path $windeployqt)) { throw "未找到 $windeployqt" }
 
@@ -71,7 +71,7 @@ try {
     # Without VCINSTALLDIR, windeployqt writes a warning to stderr even though
     # it succeeds; the CRT is explicitly copied below.
     $ErrorActionPreference = 'Continue'
-    & $windeployqt --release --no-translations `
+    & $windeployqt --release --no-translations --skip-plugin-types 'generic,networkinformation,tls' `
         --dir $staging (Join-Path $staging 'maichat.exe')
     $deployExitCode = $LASTEXITCODE
 } finally {
@@ -80,38 +80,26 @@ try {
 if ($deployExitCode -ne 0) { throw "windeployqt 失败，退出码 $deployExitCode" }
 
 # Never validate or distribute the raw build/bin executable by itself. The Qt
-# imports are resolved before main(), so a missing Qt5Sql.dll produces a system
+# imports are resolved before main(), so a missing Qt6Widgets.dll produces a system
 # error dialog instead of an AppLog entry or a useful --smoke exit code.
 foreach ($requiredQtRuntime in @(
-    'Qt5Core.dll', 'Qt5Gui.dll', 'Qt5Network.dll', 'Qt5WebSockets.dll', 'Qt5Sql.dll',
-    'Qt5Widgets.dll', 'platforms\qwindows.dll', 'sqldrivers\qsqlite.dll'
+    'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'Qt6Svg.dll',
+    'platforms\qwindows.dll', 'imageformats\qsvg.dll', 'imageformats\qwebp.dll'
 )) {
     if (-not (Test-Path -LiteralPath (Join-Path $staging $requiredQtRuntime))) {
         throw "staging 缺少 Qt 运行时：$requiredQtRuntime"
     }
 }
 
-# 视频播放的解码后端是插件，不是 Qt5Multimedia.dll 本身。缺了它 QMediaPlayer
-# 不报错也不崩，只是永远停在 StoppedState、画面全黑——和当年缺 OpenSSL 导致
-# 「文字能收、图片收不到」是同一类静默故障。windeployqt 在部分环境不会带上，
-# 因此从同一套 Qt 的插件目录显式复制并校验。
-$mediaserviceDir = Join-Path $staging 'mediaservice'
-$qtMediaServiceDir = Join-Path (Split-Path -Parent $qtBin) 'plugins\mediaservice'
-New-Item -ItemType Directory -Force $mediaserviceDir | Out-Null
-foreach ($plugin in 'wmfengine.dll', 'dsengine.dll', 'qtmedia_audioengine.dll') {
-    $source = Join-Path $qtMediaServiceDir $plugin
-    if (Test-Path -LiteralPath $source) {
-        Copy-Item -LiteralPath $source -Destination (Join-Path $mediaserviceDir $plugin) -Force
+# 网络、数据库和媒体由普通 C++/原生后端提供；禁止旧 SDK 插件随包回流。
+foreach ($retiredQtRuntime in 'Qt6Network.dll', 'Qt6WebSockets.dll', 'Qt6Sql.dll',
+         'Qt6Multimedia.dll', 'Qt6MultimediaWidgets.dll', 'multimedia', 'sqldrivers', 'tls') {
+    if (Test-Path -LiteralPath (Join-Path $staging $retiredQtRuntime)) {
+        throw "staging contains retired Qt runtime: $retiredQtRuntime"
     }
 }
-$mediaBackends = @(Get-ChildItem $mediaserviceDir -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -in 'wmfengine.dll', 'dsengine.dll' })
-if ($mediaBackends.Count -eq 0) {
-    throw "staging 里没有 mediaservice 解码插件（wmfengine/dsengine），视频消息将无法播放"
-}
-Write-Host "多媒体解码插件已部署：$($mediaBackends.Name -join ', ')"
 
-# 显式旁挂 VC++ 运行库（app-local 部署）：exe 与 Qt5*.dll 都依赖
+# 显式旁挂 VC++ 运行库（app-local 部署）：exe 与 Qt6*.dll 都依赖
 # MSVCP140/VCRUNTIME140 系列，未装 VC Redist 的机器上缺它们会直接 0xc0000135。
 # 从本机 VS 的 Redist 目录取最新版本的 x64 CRT 全套。
 # 按 MSVC\<版本号> 解析并取最高版本：运行库版本必须 >= 编译工具集版本，
@@ -137,16 +125,7 @@ $imSdkTargetDir = Join-Path $staging 'vendor\tencent-im\windows\shared_lib\Win64
 New-Item -ItemType Directory -Force $imSdkTargetDir | Out-Null
 Copy-Item $imSdkSource $imSdkTargetDir
 
-# OpenSSL 1.1：Qt 5.15 的 QNetworkAccessManager 走 HTTPS 依赖它，windeployqt 不会携带。
-# 缺失时 QSslSocket::supportsSsl()==false，接收到的图片/文件（腾讯 IM 给的是 HTTPS URL，
-# 需本端下载）会静默失败——表现为"文字能收、图片收不到"。显式旁挂，缺失即报错。
-$opensslDir = Join-Path $projectRoot 'vendor\openssl\win64'
-foreach ($ssl in 'libssl-1_1-x64.dll', 'libcrypto-1_1-x64.dll') {
-    $sslSrc = Join-Path $opensslDir $ssl
-    if (-not (Test-Path $sslSrc)) { throw "未找到 $sslSrc（接收图片/文件的 HTTPS 下载需 OpenSSL 1.1）" }
-    Copy-Item $sslSrc $staging -Force
-}
-Write-Host 'OpenSSL 1.1 已旁挂（HTTPS 图片/文件下载所需）'
+# curl uses the shared native TLS implementation; no Qt Network TLS plugins.
 
 # TRTC 运行时（远程桌面）：liteav.dll 等必须与 exe 同目录，否则应用启动时
 # 直接弹「找不到 liteav.dll」而根本进不去——不是远程桌面不可用而已，是整个

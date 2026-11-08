@@ -1,5 +1,7 @@
 // 文件作用：验证桌面端扫码与 MaiChat 账号密码登录及会话安全。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
+#include <httplib.h>
+
 #include <QLabel>
 #include <QLineEdit>
 #include <QCheckBox>
@@ -10,14 +12,19 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMetaObject>
 #include <QPixmap>
 #include <QPushButton>
 #include <QSignalSpy>
-#include <QTcpServer>
-#include <QTcpSocket>
 #include <QTest>
 #include <QWidget>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "ui/LoginDialog.h"
 #include "auth/DesktopCurlAuthTransport.h"
@@ -33,6 +40,36 @@ QString testPlatformName() {
     return {};
 #endif
 }
+
+// 真正 HTTP handler 等待此回复；Qt 线程只处理测试字段和决定回复内容。
+// 延迟 claim/改密和不回复的超时场景均保留连接，关闭夹具时统一唤醒等待者。
+struct DeferredHttpReply {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool completed = false;
+    bool canceled = false;
+    int status = 200;
+    std::string body;
+
+    void finish(int value, const QByteArray& payload) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (canceled) return;
+            status = value;
+            body = payload.toStdString();
+            completed = true;
+        }
+        changed.notify_all();
+    }
+
+    void cancel() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            canceled = true;
+        }
+        changed.notify_all();
+    }
+};
 
 class FakeQrServer : public QObject {
 public:
@@ -51,256 +88,294 @@ public:
                 for (int x = 0; x < 11; ++x)
                     if ((x * 7 + y * 3) % 5 < 2)
                         for (int dy = 0; dy < 20; ++dy)
-                            for (int dx = 0; dx < 20; ++dx)
-                                image.setPixelColor(x * 20 + dx, y * 20 + dy, Qt::black);
+                            for (int dx = 0; dx < 20; ++dx) image.setPixelColor(x * 20 + dx, y * 20 + dy, Qt::black);
             QBuffer buffer(&png_);
             buffer.open(QIODevice::WriteOnly);
             image.save(&buffer, "PNG");
         }
-        connect(&server_, &QTcpServer::newConnection, this, [this] {
-            auto* socket = server_.nextPendingConnection();
-            auto bytes = std::make_shared<QByteArray>();
-            connect(socket, &QTcpSocket::readyRead, this, [this, socket, bytes] {
-                bytes->append(socket->readAll());
-                const int separator = bytes->indexOf("\r\n\r\n");
-                if (separator < 0) return;
-                const QByteArray headers = bytes->left(separator).toLower();
-                int contentLength = 0;
-                for (const QByteArray& line : headers.split('\n')) {
-                    if (line.startsWith("content-length:"))
-                        contentLength = line.mid(sizeof("content-length:") - 1).trimmed().toInt();
+        const auto handler = [this](const httplib::Request& request, httplib::Response& result) {
+            const auto reply = std::make_shared<DeferredHttpReply>();
+            {
+                std::lock_guard<std::mutex> lock(pendingMutex_);
+                if (stopping_.load()) {
+                    result.status = 503;
+                    return;
                 }
-                if (bytes->size() < separator + 4 + contentLength) return;
-                const QJsonObject body = QJsonDocument::fromJson(
-                    bytes->mid(separator + 4, contentLength)).object();
-                QJsonObject response;
-                int status = 200;
-                if (headers.startsWith("post /v1/auth/desktop/request ")) {
-                    ++qrRequestCount;
-                    // 保持连接不响应，复现账号服务长时间无响应时的超时界面。
-                    if (holdQrResponse) return;
-                    challenge = body.value(QStringLiteral("code_challenge")).toString();
-                    platform = body.value(QStringLiteral("platform")).toString();
-                    response = {{QStringLiteral("request_id"), requestId},
-                                {QStringLiteral("qr_uri"),
-                                 QStringLiteral("maichat://auth/desktop?request_id=") + requestId},
-                                {QStringLiteral("qr_png_base64"), QString::fromLatin1(png_.toBase64())},
-                                {QStringLiteral("display_code"), QStringLiteral("123456")},
-                                {QStringLiteral("expires_in"), 120}};
-                    if (oversizeQrResponse)
-                        response.insert(QStringLiteral("padding"),
-                                        QString(2 * 1024 * 1024, QLatin1Char('x')));
-                } else if (headers.startsWith("post /v1/auth/desktop/claim ")) {
-                    const QByteArray verifier = QByteArray::fromBase64(
-                        body.value(QStringLiteral("verifier")).toString().toLatin1(),
-                        QByteArray::Base64UrlEncoding);
-                    const QByteArray expected = QCryptographicHash::hash(
-                        verifier, QCryptographicHash::Sha256).toBase64(
-                        QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
-                    verifierValid = verifier.size() == 32 &&
-                        body.value(QStringLiteral("request_id")).toString() == requestId &&
-                        expected == challenge.toLatin1();
-                    if (deferClaimResponse) {
-                        deferredClaimSocket = socket;
-                        return;
-                    }
-                    status = claimStatus;
-                    if (status == 200) {
-                        response = approvedSession();
-                    } else if (status == 202) {
-                        response = {{QStringLiteral("status"), QStringLiteral("pending")},
-                                    {QStringLiteral("retry_after"), 2}};
-                    } else {
-                        response = {{QStringLiteral("error"), status == 403 ?
-                            (approvalRevoked ? QStringLiteral("Desktop login approval revoked") :
-                                               QStringLiteral("Desktop login request denied")) :
-                            QStringLiteral("test claim failure")}};
-                    }
-                } else if (headers.startsWith("post /v1/auth/password/login ")) {
-                    ++passwordLoginCount;
-                    passwordLoginAccount = body.value(QStringLiteral("account_id")).toString();
-                    passwordLoginAgeConfirmed = body.value(
-                        QStringLiteral("age_confirmed_14_plus")).toBool();
-                    status = body.value(QStringLiteral("password")).toString() ==
-                        QStringLiteral("test-account-password-123456") ? 200 : 401;
-                    response = status == 200 ? approvedSession() :
-                        QJsonObject{{QStringLiteral("error"),
-                                     QStringLiteral("Account or password is incorrect")}};
-                } else if (headers.startsWith("post /v1/auth/password/set ")) {
-                    ++passwordSetCount;
-                    passwordSetPayloadValid = body.size() == 1 &&
-                        body.value(QStringLiteral("new_password")).toString() ==
-                            QStringLiteral("new-password-safe-test-123");
-                    if (deferPasswordSet) { deferredPasswordSocket = socket; return; }
-                    status = passwordSetStatus;
-                    response = status == 200 ? QJsonObject{{QStringLiteral("password_set"), passwordSetConfirmation}} :
-                        QJsonObject{{QStringLiteral("error"), QStringLiteral("Sign in again before changing the password")}};
-                } else if (headers.startsWith("post /v1/auth/profile ")) {
-                    ++profileUpdateCount;
-                    profileNickname = body.value(QStringLiteral("nickname")).toString();
-                    response = {{QStringLiteral("user"), QJsonObject{
-                        {QStringLiteral("id"), QStringLiteral("m-auth-test")},
-                        {QStringLiteral("nickname"), profileNickname},
-                        {QStringLiteral("im_user_id"), QStringLiteral("im-auth-test")}}}};
-                } else if (headers.startsWith("post /v1/auth/refresh ")) {
-                    ++refreshCount;
-                    validRefreshToken = body.value(QStringLiteral("refresh_token")).toString() ==
-                                        QString(43, QLatin1Char('R'));
-                    status = refreshStatus;
-                    if (status == 200) {
-                        response = {{QStringLiteral("access_token"), QString(43, QLatin1Char('B'))},
+                pending_.push_back(reply);
+            }
+            QByteArray headers = QByteArray::fromStdString(request.method + " " + request.target + " HTTP/1.1\r\n");
+            for (const auto& header : request.headers)
+                headers += QByteArray::fromStdString(header.first + ": " + header.second + "\r\n");
+            headers = headers.toLower();
+            const QByteArray requestBody = QByteArray::fromStdString(request.body);
+            // 不在 HTTP worker 上读写 GUI 测试字段，也不用 BlockingQueuedConnection，
+            // 以免析构 join 与等待 Qt 的 handler 互相等待。
+            if (!QMetaObject::invokeMethod(
+                    this,
+                    [this, reply, headers, requestBody] {
+                        if (stopping_.load()) return;
+                        const QJsonObject body = QJsonDocument::fromJson(requestBody).object();
+                        QJsonObject response;
+                        int status = 200;
+                        if (headers.startsWith("post /v1/auth/desktop/request ")) {
+                            ++qrRequestCount;
+                            // 保持连接不响应，复现账号服务长时间无响应时的超时界面。
+                            if (holdQrResponse) return;
+                            challenge = body.value(QStringLiteral("code_challenge")).toString();
+                            platform = body.value(QStringLiteral("platform")).toString();
+                            response = {{QStringLiteral("request_id"), requestId},
+                                        {QStringLiteral("qr_uri"),
+                                         QStringLiteral("maichat://auth/desktop?request_id=") + requestId},
+                                        {QStringLiteral("qr_png_base64"), QString::fromLatin1(png_.toBase64())},
+                                        {QStringLiteral("display_code"), QStringLiteral("123456")},
+                                        {QStringLiteral("expires_in"), 120}};
+                            if (oversizeQrResponse)
+                                response.insert(QStringLiteral("padding"), QString(2 * 1024 * 1024, QLatin1Char('x')));
+                        } else if (headers.startsWith("post /v1/auth/desktop/claim ")) {
+                            const QByteArray verifier =
+                                QByteArray::fromBase64(body.value(QStringLiteral("verifier")).toString().toLatin1(),
+                                                       QByteArray::Base64UrlEncoding);
+                            const QByteArray expected =
+                                QCryptographicHash::hash(verifier, QCryptographicHash::Sha256)
+                                    .toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
+                            verifierValid = verifier.size() == 32 &&
+                                            body.value(QStringLiteral("request_id")).toString() == requestId &&
+                                            expected == challenge.toLatin1();
+                            if (deferClaimResponse) {
+                                deferredClaimSocket = reply;
+                                return;
+                            }
+                            status = claimStatus;
+                            if (status == 200) {
+                                response = approvedSession();
+                            } else if (status == 202) {
+                                response = {{QStringLiteral("status"), QStringLiteral("pending")},
+                                            {QStringLiteral("retry_after"), 2}};
+                            } else {
+                                response = {{QStringLiteral("error"),
+                                             status == 403
+                                                 ? (approvalRevoked ? QStringLiteral("Desktop login approval revoked")
+                                                                    : QStringLiteral("Desktop login request denied"))
+                                                 : QStringLiteral("test claim failure")}};
+                            }
+                        } else if (headers.startsWith("post /v1/auth/password/login ")) {
+                            ++passwordLoginCount;
+                            passwordLoginAccount = body.value(QStringLiteral("account_id")).toString();
+                            passwordLoginAgeConfirmed = body.value(QStringLiteral("age_confirmed_14_plus")).toBool();
+                            status = body.value(QStringLiteral("password")).toString() ==
+                                             QStringLiteral("test-account-password-123456")
+                                         ? 200
+                                         : 401;
+                            response = status == 200
+                                           ? approvedSession()
+                                           : QJsonObject{{QStringLiteral("error"),
+                                                          QStringLiteral("Account or password is incorrect")}};
+                        } else if (headers.startsWith("post /v1/auth/password/set ")) {
+                            ++passwordSetCount;
+                            passwordSetPayloadValid =
+                                body.size() == 1 && body.value(QStringLiteral("new_password")).toString() ==
+                                                        QStringLiteral("new-password-safe-test-123");
+                            if (deferPasswordSet) {
+                                deferredPasswordSocket = reply;
+                                return;
+                            }
+                            status = passwordSetStatus;
+                            response =
+                                status == 200
+                                    ? QJsonObject{{QStringLiteral("password_set"), passwordSetConfirmation}}
+                                    : QJsonObject{{QStringLiteral("error"),
+                                                   QStringLiteral("Sign in again before changing the password")}};
+                        } else if (headers.startsWith("post /v1/auth/profile ")) {
+                            ++profileUpdateCount;
+                            profileNickname = body.value(QStringLiteral("nickname")).toString();
+                            response = {{QStringLiteral("user"),
+                                         QJsonObject{{QStringLiteral("id"), QStringLiteral("m-auth-test")},
+                                                     {QStringLiteral("nickname"), profileNickname},
+                                                     {QStringLiteral("im_user_id"), QStringLiteral("im-auth-test")}}}};
+                        } else if (headers.startsWith("post /v1/auth/refresh ")) {
+                            ++refreshCount;
+                            validRefreshToken =
+                                body.value(QStringLiteral("refresh_token")).toString() == QString(43, QLatin1Char('R'));
+                            status = refreshStatus;
+                            if (status == 200) {
+                                response = {
+                                    {QStringLiteral("access_token"), QString(43, QLatin1Char('B'))},
                                     {QStringLiteral("refresh_token"), QString(43, QLatin1Char('S'))},
                                     {QStringLiteral("expires_in"), 900},
                                     {QStringLiteral("device_slot"), testPlatformName()},
-                                    {QStringLiteral("user"), QJsonObject{
-                                        {QStringLiteral("id"), QStringLiteral("m-auth-test")},
-                                        {QStringLiteral("nickname"), profileNickname},
-                                        {QStringLiteral("im_user_id"), QStringLiteral("im-auth-test")}}}};
-                    } else {
-                        response = {{QStringLiteral("error"), QStringLiteral("temporary network failure")}};
-                    }
-                } else if (headers.startsWith("get /v1/im/credential ")) {
-                    ++credentialRequestCount;
-                    lastCredentialBearer = headers.contains("authorization: bearer " +
-                        QByteArray(43, refreshCount > 0 ? 'b' : 'a'));
-                    if ((firstCredentialUnauthorized && refreshCount == 0) ||
-                        imCredentialStatus != 200) {
-                        status = imCredentialStatus == 200 ? 401 : imCredentialStatus;
-                        response = {{QStringLiteral("error"), QStringLiteral("IM unavailable")}};
-                    } else {
-                        response = {{QStringLiteral("sdk_app_id"), 1600148979},
-                                    {QStringLiteral("user_id"),
-                                     credentialUserMismatch ? QStringLiteral("wrong-user") :
-                                                              QStringLiteral("im-auth-test")},
-                                    {QStringLiteral("user_sig"), QStringLiteral("server-signed-user-sig")},
-                                    {QStringLiteral("expires_at"),
-                                     double(QDateTime::currentDateTimeUtc().addDays(7).toSecsSinceEpoch())}};
-                    }
-                } else if (headers.startsWith("get /v1/auth/me ")) {
-                    ++meRequestCount;
-                    meRequestNoStore = headers.contains("cache-control: no-store");
-                    status = meStatus;
-                    if (status == 200) {
-                        response = {{QStringLiteral("user"), QJsonObject{
-                                        {QStringLiteral("id"), QStringLiteral("m-auth-test")},
-                                        {QStringLiteral("nickname"), profileNickname},
-                                        {QStringLiteral("im_user_id"), QStringLiteral("im-auth-test")}}},
+                                    {QStringLiteral("user"),
+                                     QJsonObject{{QStringLiteral("id"), QStringLiteral("m-auth-test")},
+                                                 {QStringLiteral("nickname"), profileNickname},
+                                                 {QStringLiteral("im_user_id"), QStringLiteral("im-auth-test")}}}};
+                            } else {
+                                response = {{QStringLiteral("error"), QStringLiteral("temporary network failure")}};
+                            }
+                        } else if (headers.startsWith("get /v1/im/credential ")) {
+                            ++credentialRequestCount;
+                            lastCredentialBearer = headers.contains("authorization: bearer " +
+                                                                    QByteArray(43, refreshCount > 0 ? 'b' : 'a'));
+                            if ((firstCredentialUnauthorized && refreshCount == 0) || imCredentialStatus != 200) {
+                                status = imCredentialStatus == 200 ? 401 : imCredentialStatus;
+                                response = {{QStringLiteral("error"), QStringLiteral("IM unavailable")}};
+                            } else {
+                                response = {{QStringLiteral("sdk_app_id"), 1600148979},
+                                            {QStringLiteral("user_id"), credentialUserMismatch
+                                                                            ? QStringLiteral("wrong-user")
+                                                                            : QStringLiteral("im-auth-test")},
+                                            {QStringLiteral("user_sig"), QStringLiteral("server-signed-user-sig")},
+                                            {QStringLiteral("expires_at"),
+                                             double(QDateTime::currentDateTimeUtc().addDays(7).toSecsSinceEpoch())}};
+                            }
+                        } else if (headers.startsWith("get /v1/auth/me ")) {
+                            ++meRequestCount;
+                            meRequestNoStore = headers.contains("cache-control: no-store");
+                            status = meStatus;
+                            if (status == 200) {
+                                response = {
+                                    {QStringLiteral("user"),
+                                     QJsonObject{{QStringLiteral("id"), QStringLiteral("m-auth-test")},
+                                                 {QStringLiteral("nickname"), profileNickname},
+                                                 {QStringLiteral("im_user_id"), QStringLiteral("im-auth-test")}}},
                                     {QStringLiteral("device_slot"), testPlatformName()}};
-                        if (!mePhoneMasked.isUndefined()) {
-                            QJsonObject user = response.value(QStringLiteral("user")).toObject();
-                            user.insert(QStringLiteral("phone_masked"), mePhoneMasked);
-                            response.insert(QStringLiteral("user"), user);
-                        }
-                    } else if (status == 401) {
-                        response = {{QStringLiteral("error"),
-                                     QStringLiteral("Session replaced by another device")},
+                                if (!mePhoneMasked.isUndefined()) {
+                                    QJsonObject user = response.value(QStringLiteral("user")).toObject();
+                                    user.insert(QStringLiteral("phone_masked"), mePhoneMasked);
+                                    response.insert(QStringLiteral("user"), user);
+                                }
+                            } else if (status == 401) {
+                                response = {
+                                    {QStringLiteral("error"), QStringLiteral("Session replaced by another device")},
                                     {QStringLiteral("code"), QStringLiteral("SESSION_REPLACED")}};
-                    }
-                } else if (headers.startsWith("post /v1/auth/logout ")) {
-                    ++logoutRequestCount;
-                    response = {{QStringLiteral("logged_out"), true}};
-                } else if (headers.startsWith("post /v1/auth/desktop/cancel ")) {
-                    ++cancelRequestCount;
-                    cancelHadProof = body.value(QStringLiteral("request_id")).toString() ==
-                                         requestId &&
-                                     body.value(QStringLiteral("verifier")).toString().size() == 43;
-                    response = {{QStringLiteral("status"), QStringLiteral("canceled")}};
-                } else if (headers.startsWith("get /v1/model/seedance-credential ")) {
-                    ++arkCredentialRequestCount;
-                    if (modelAccessDenied) {
-                        status = 403;
-                        response = {{QStringLiteral("error"),
-                                     QStringLiteral("Model access is not enabled for this account")}};
-                    } else {
-                        response = {{QStringLiteral("api_key"),
-                                     QStringLiteral("ark-temporary-key-%1")
-                                         .arg(arkCredentialRequestCount)},
-                                    {QStringLiteral("expires_at"), double(
-                                         QDateTime::currentDateTimeUtc()
-                                             .addSecs(modelCredentialExpiresIn).toSecsSinceEpoch())}};
-                    }
-                } else if (headers.startsWith("get /v1/model/api-keys ")) {
-                    ++mainModelRequestCount;
-                    mainModelBearer = headers.contains("authorization: bearer " +
-                        QByteArray(43, refreshCount > 0 ? 'b' : 'a'));
-                    if (modelAccessDenied) {
-                        status = 403;
-                        response = {{QStringLiteral("error"),
-                                     QStringLiteral("Model access is not enabled for this account")}};
-                    } else {
-                        response = {{QStringLiteral("api_keys"), QJsonObject{
-                            {QStringLiteral("glm"), invalidMainModelShape ?
-                                QJsonValue(42) : QJsonValue(missingGlmKey ? QString() :
-                                    QString(40, QLatin1Char('G')))},
-                            {QStringLiteral("deepseek"), invalidMainModelKey ?
-                                QStringLiteral("bad\nkey") :
-                                QString(40, QLatin1Char('D'))},
-                            {QStringLiteral("minimax"), QString(40, QLatin1Char('M'))}}}};
-                    }
-                } else if (headers.startsWith("get /v1/model/bailian-credential ")) {
-                    ++bailianCredentialRequestCount;
-                    if (modelAccessDenied) {
-                        status = 403;
-                        response = {{QStringLiteral("error"),
-                                     QStringLiteral("Model access is not enabled for this account")}};
-                    } else {
-                        response = {{QStringLiteral("api_key"),
-                                     invalidBailianKey ? QStringLiteral("wrong-key") :
-                                     QStringLiteral("st-temporary-key-%1")
-                                         .arg(bailianCredentialRequestCount)},
+                            }
+                        } else if (headers.startsWith("post /v1/auth/logout ")) {
+                            ++logoutRequestCount;
+                            response = {{QStringLiteral("logged_out"), true}};
+                        } else if (headers.startsWith("post /v1/auth/desktop/cancel ")) {
+                            ++cancelRequestCount;
+                            cancelHadProof = body.value(QStringLiteral("request_id")).toString() == requestId &&
+                                             body.value(QStringLiteral("verifier")).toString().size() == 43;
+                            response = {{QStringLiteral("status"), QStringLiteral("canceled")}};
+                        } else if (headers.startsWith("get /v1/model/seedance-credential ")) {
+                            ++arkCredentialRequestCount;
+                            if (modelAccessDenied) {
+                                status = 403;
+                                response = {{QStringLiteral("error"),
+                                             QStringLiteral("Model access is not enabled for this account")}};
+                            } else {
+                                response = {{QStringLiteral("api_key"),
+                                             QStringLiteral("ark-temporary-key-%1").arg(arkCredentialRequestCount)},
+                                            {QStringLiteral("expires_at"), double(QDateTime::currentDateTimeUtc()
+                                                                                      .addSecs(modelCredentialExpiresIn)
+                                                                                      .toSecsSinceEpoch())}};
+                            }
+                        } else if (headers.startsWith("get /v1/model/api-keys ")) {
+                            ++mainModelRequestCount;
+                            mainModelBearer = headers.contains("authorization: bearer " +
+                                                               QByteArray(43, refreshCount > 0 ? 'b' : 'a'));
+                            if (modelAccessDenied) {
+                                status = 403;
+                                response = {{QStringLiteral("error"),
+                                             QStringLiteral("Model access is not enabled for this account")}};
+                            } else {
+                                response = {
+                                    {QStringLiteral("api_keys"),
+                                     QJsonObject{
+                                         {QStringLiteral("glm"),
+                                          invalidMainModelShape
+                                              ? QJsonValue(42)
+                                              : QJsonValue(missingGlmKey ? QString() : QString(40, QLatin1Char('G')))},
+                                         {QStringLiteral("deepseek"), invalidMainModelKey
+                                                                          ? QStringLiteral("bad\nkey")
+                                                                          : QString(40, QLatin1Char('D'))},
+                                         {QStringLiteral("minimax"), QString(40, QLatin1Char('M'))}}}};
+                            }
+                        } else if (headers.startsWith("get /v1/model/bailian-credential ")) {
+                            ++bailianCredentialRequestCount;
+                            if (modelAccessDenied) {
+                                status = 403;
+                                response = {{QStringLiteral("error"),
+                                             QStringLiteral("Model access is not enabled for this account")}};
+                            } else {
+                                response = {
+                                    {QStringLiteral("api_key"),
+                                     invalidBailianKey
+                                         ? QStringLiteral("wrong-key")
+                                         : QStringLiteral("st-temporary-key-%1").arg(bailianCredentialRequestCount)},
                                     {QStringLiteral("wan_workspace_id"),
-                                     invalidWorkspace ? QStringLiteral("bad-space") :
-                                                        QStringLiteral("ws-test")},
-                                    {QStringLiteral("expires_at"), double(
-                                         QDateTime::currentDateTimeUtc()
-                                             .addSecs(modelCredentialExpiresIn).toSecsSinceEpoch())}};
-                    }
-                } else {
-                    status = 404;
-                }
-                const QByteArray payload = QJsonDocument(response).toJson(QJsonDocument::Compact);
-                const QByteArray redirectHeader = status == 302 ?
-                    QByteArray("Location: /v1/im/credential\r\n") : QByteArray();
-                socket->write("HTTP/1.1 " + QByteArray::number(status) +
-                              " OK\r\nContent-Type: application/json\r\nContent-Length: " +
-                              QByteArray::number(payload.size()) +
-                              "\r\n" + redirectHeader + "Connection: close\r\n\r\n" + payload);
-                socket->disconnectFromHost();
-            });
-            connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+                                     invalidWorkspace ? QStringLiteral("bad-space") : QStringLiteral("ws-test")},
+                                    {QStringLiteral("expires_at"), double(QDateTime::currentDateTimeUtc()
+                                                                              .addSecs(modelCredentialExpiresIn)
+                                                                              .toSecsSinceEpoch())}};
+                            }
+                        } else {
+                            status = 404;
+                        }
+                        const QByteArray payload = QJsonDocument(response).toJson(QJsonDocument::Compact);
+                        reply->finish(status, payload);
+                    },
+                    Qt::QueuedConnection))
+                reply->cancel();
+            std::unique_lock<std::mutex> lock(reply->mutex);
+            reply->changed.wait(lock, [&] { return reply->completed || reply->canceled; });
+            if (reply->canceled) {
+                result.status = 503;
+                return;
+            }
+            result.status = reply->status;
+            result.set_content(reply->body, "application/json");
+            if (result.status == 302) result.set_header("Location", "/v1/im/credential");
+            result.set_header("Connection", "close");
+        };
+        server_.Get(".*", handler);
+        server_.Post(".*", handler);
+        server_.set_read_timeout(2);
+        server_.set_write_timeout(2);
+        port_ = server_.bind_to_any_port("127.0.0.1");
+        if (port_ <= 0) qFatal("Cannot bind account HTTP fixture");
+        worker_ = std::thread([this] {
+            server_.listen_after_bind();
+            listenerExited_ = true;
         });
-        server_.listen(QHostAddress::LocalHost);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!server_.is_running() && !listenerExited_.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!server_.is_running()) qFatal("Cannot start account HTTP fixture");
+    }
+
+    ~FakeQrServer() override {
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            stopping_ = true;
+            for (const auto& pending : pending_)
+                if (const auto reply = pending.lock()) reply->cancel();
+        }
+        server_.stop();
+        if (worker_.joinable()) worker_.join();
     }
 
     QUrl url() const {
-        return QUrl(QStringLiteral("http://127.0.0.1:%1/v1/").arg(server_.serverPort()));
+        return QUrl(QStringLiteral("http://127.0.0.1:%1/v1/").arg(port_));
     }
     QJsonObject approvedSession() const {
         return {{QStringLiteral("access_token"), QString(43, QLatin1Char('A'))},
                 {QStringLiteral("refresh_token"), QString(43, QLatin1Char('R'))},
                 {QStringLiteral("expires_in"), initialAccessExpiresIn},
                 {QStringLiteral("device_slot"), testPlatformName()},
-                {QStringLiteral("user"), QJsonObject{
-                    {QStringLiteral("id"), QStringLiteral("m-auth-test")},
-                    {QStringLiteral("nickname"), profileNickname},
-                    {QStringLiteral("im_user_id"), QStringLiteral("im-auth-test")}}}};
+                {QStringLiteral("user"), QJsonObject{{QStringLiteral("id"), QStringLiteral("m-auth-test")},
+                                                     {QStringLiteral("nickname"), profileNickname},
+                                                     {QStringLiteral("im_user_id"), QStringLiteral("im-auth-test")}}}};
     }
     void approveDeferredClaim() {
         if (!deferredClaimSocket) return;
         const QByteArray payload = QJsonDocument(approvedSession()).toJson(QJsonDocument::Compact);
-        deferredClaimSocket->write(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
-            QByteArray::number(payload.size()) + "\r\nConnection: close\r\n\r\n" + payload);
-        deferredClaimSocket->disconnectFromHost();
+        deferredClaimSocket->finish(200, payload);
         deferredClaimSocket = nullptr;
         deferClaimResponse = false;
     }
     void finishDeferredPasswordSet() {
         if (!deferredPasswordSocket) return;
         const QByteArray payload = "{\"password_set\":true}";
-        deferredPasswordSocket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
-            QByteArray::number(payload.size()) + "\r\nConnection: close\r\n\r\n" + payload);
-        deferredPasswordSocket->disconnectFromHost();
+        deferredPasswordSocket->finish(200, payload);
         deferredPasswordSocket = nullptr;
     }
     QString challenge;
@@ -314,7 +389,7 @@ public:
     bool firstCredentialUnauthorized = false;
     int imCredentialStatus = 200;
     bool deferClaimResponse = false;
-    QTcpSocket* deferredClaimSocket = nullptr;
+    std::shared_ptr<DeferredHttpReply> deferredClaimSocket;
     int initialAccessExpiresIn = 900;
     int refreshCount = 0;
     int passwordLoginCount = 0;
@@ -323,7 +398,7 @@ public:
     QJsonValue passwordSetConfirmation = true;
     bool passwordSetPayloadValid = false;
     bool deferPasswordSet = false;
-    QTcpSocket* deferredPasswordSocket = nullptr;
+    std::shared_ptr<DeferredHttpReply> deferredPasswordSocket;
     int profileUpdateCount = 0;
     QString profileNickname;
     QString passwordLoginAccount;
@@ -354,7 +429,13 @@ public:
     const QString requestId = QStringLiteral("12345678-1234-1234-1234-123456789abc");
 
 private:
-    QTcpServer server_;
+    httplib::Server server_;
+    std::thread worker_;
+    int port_ = 0;
+    std::atomic<bool> stopping_{false};
+    std::atomic<bool> listenerExited_{false};
+    std::mutex pendingMutex_;
+    std::vector<std::weak_ptr<DeferredHttpReply>> pending_;
     QByteArray png_;
 };
 
@@ -476,7 +557,7 @@ void LoginDialogTest::liveProductionQrDialog() {
     QSignalSpy rejected(&dialog, &QDialog::rejected);
     dialog.show();
     dialog.start();
-    QTRY_VERIFY_WITH_TIMEOUT(!qr->pixmap(Qt::ReturnByValue).isNull(), 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(!qr->pixmap().isNull(), 20000);
     const QString screenshot = qEnvironmentVariable("MAICHAT_AUTH_QR_CAPTURE");
     if (!screenshot.isEmpty()) QVERIFY(dialog.grab().save(screenshot));
     dialog.reject();
@@ -524,7 +605,7 @@ void LoginDialogTest::qrTimeoutShowsRetryAndDoesNotRepeatRequest() {
     server.holdQrResponse = false;
     retry->click();
     QTRY_COMPARE_WITH_TIMEOUT(server.qrRequestCount, 2, 5000);
-    QTRY_VERIFY_WITH_TIMEOUT(!qr->pixmap(Qt::ReturnByValue).isNull(), 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(!qr->pixmap().isNull(), 5000);
     dialog.reject();
 }
 
@@ -550,7 +631,7 @@ void LoginDialogTest::showsQrAndMaiChatPasswordLoginHierarchy() {
     QVERIFY(modeButton && qrPane && passwordPane);
     QVERIFY(dialog.findChild<QWidget*>(QStringLiteral("introPane")) == nullptr);
     QCOMPARE(dialog.windowTitle(), QStringLiteral("MaiChat"));
-    const QPixmap logoPixmap = logo->pixmap(Qt::ReturnByValue);
+    const QPixmap logoPixmap = logo->pixmap();
     QVERIFY(!logoPixmap.isNull());
     QVERIFY(dialog.findChild<QLabel*>(QStringLiteral("welcomeTitle")) == nullptr);
     QVERIFY(dialog.findChild<QLabel*>(QStringLiteral("loginSubtitle")) == nullptr);
@@ -752,7 +833,7 @@ void LoginDialogTest::displaysServerQrAndSendsMatchingVerifier() {
     QCOMPARE(server.platform, testPlatformName());
     QCOMPARE(server.challenge.size(), 43);
     QCOMPARE(code->text(), QStringLiteral("核对码  123456"));
-    QVERIFY(!qr->pixmap(Qt::ReturnByValue).isNull());
+    QVERIFY(!qr->pixmap().isNull());
     QVERIFY(!status->isVisible());
     QVERIFY(!detail->isVisible());
     QVERIFY(!countdown->isVisible());
@@ -1297,7 +1378,7 @@ void LoginDialogTest::cancelAfterApprovalRevokesAdoptedSession() {
     dialog.show();
     dialog.start();
     QTRY_COMPARE_WITH_TIMEOUT(status->text(), QStringLiteral("连接聊天服务失败"), 5000);
-    QVERIFY(qr->pixmap(Qt::ReturnByValue).isNull());
+    QVERIFY(qr->pixmap().isNull());
     QCOMPARE(auth.authenticatedUserId(), QStringLiteral("im-auth-test"));
 
     dialog.reject();

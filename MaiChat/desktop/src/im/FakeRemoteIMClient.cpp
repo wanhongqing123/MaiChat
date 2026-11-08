@@ -57,7 +57,7 @@ void FakeRemoteIMClient::createGroup(const QString& name, const QStringList& mem
         return;
     }
     const RemoteIMGroup group{QStringLiteral("fake-group-%1").arg(groups_.size() + 1),
-                              name.trimmed(), memberIds.size() + 1};
+                              name.trimmed(), static_cast<int>(memberIds.size()) + 1};
     groups_.append(group);
     emit groupsReceived({group});
     if (completion) completion(true, {}, group);

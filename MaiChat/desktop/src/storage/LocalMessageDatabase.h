@@ -5,11 +5,12 @@
 
 #include <QHash>
 #include <QList>
-#include <QSqlDatabase>
 #include <QString>
 
 #include "model/ChatState.h"
 #include "model/RemoteIMGroup.h"
+
+struct sqlite3;
 
 // 本地消息库（SQLite，每账号一个库文件）。
 //
@@ -48,7 +49,7 @@ public:
 
     // 自定义分组，按用户排序。「未分组」不在其中——它不是一个真的分组。
     QStringList contactGroups() const;
-    // 名字会先归一化。空名、保留名「未分组」、以及重名都返回 false 且不写库。
+    // 名字会先归一化。空名以及重名都返回 false 且不写库。
     bool createContactGroup(const QString& name);
     // 事务内改组名并把成员一起迁过去。目标名不合法或已存在则返回 false。
     bool renameContactGroup(const QString& from, const QString& to);
@@ -84,8 +85,9 @@ public:
     void updateGroupMessageStatus(const QString& id, bool pending, bool failed);
 
 private:
-    void migrate();
+    bool migrate();
 
-    QString connectionName_;
-    QSqlDatabase db_;
+    // 句柄由本对象独占；语句不跨方法逃逸。与原 Qt SQL 对象一样，调用方须串行使用。
+    // 初始化/增量迁移失败时关闭句柄，isOpen() 不会把半迁移的库报告为可用。
+    sqlite3* db_ = nullptr;
 };

@@ -605,9 +605,9 @@ private:
       return invalidInput(QStringLiteral("peer_id is required"));
     const QList<RemoteIMMessage> all = app.chatState().messagesWith(peerId);
     const int limit = boundedLimit(arguments);
-    const int begin = std::max(0, all.size() - limit);
+    const qsizetype begin = std::max<qsizetype>(0, all.size() - limit);
     QJsonArray messages;
-    for (int i = begin; i < all.size(); ++i)
+    for (qsizetype i = begin; i < all.size(); ++i)
       messages.append(messageJson(all.at(i), peerId));
     return jsonResult({{QStringLiteral("peer_id"), peerId},
                        {QStringLiteral("messages"), messages},

@@ -221,6 +221,8 @@ typedef struct VideoState {
     Clock audclk;
     Clock vidclk;
     Clock extclk;
+    /* 暂停切换与设备回调末尾的音频时钟发布必须原子交接；不覆盖解码或设备输出。 */
+    SDL_mutex *audio_clock_mutex;
 
     FrameQueue pictq;
     FrameQueue subpq;
@@ -1336,6 +1338,7 @@ static void stream_close(VideoState *is)
     frame_queue_destroy(&is->sampq);
     frame_queue_destroy(&is->subpq);
     SDL_DestroyCond(is->continue_read_thread);
+    SDL_DestroyMutex(is->audio_clock_mutex);
     sws_freeContext(is->sub_convert_ctx);
     av_free(is->filename);
     if (is->vis_texture)
@@ -1543,6 +1546,7 @@ static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int by_bytes)
 /* pause or resume the video */
 static void stream_toggle_pause(VideoState *is)
 {
+    SDL_LockMutex(is->audio_clock_mutex);
     if (is->paused) {
         is->frame_timer += av_gettime_relative() / 1000000.0 - is->vidclk.last_updated;
         if (is->read_pause_return != AVERROR(ENOSYS)) {
@@ -1550,8 +1554,11 @@ static void stream_toggle_pause(VideoState *is)
         }
         set_clock(&is->vidclk, get_clock(&is->vidclk), is->vidclk.serial);
     }
+    /* 保存实际播放位置；恢复时以当前墙钟重建 drift，不计入暂停经过的时间。 */
+    set_clock(&is->audclk, get_clock(&is->audclk), is->audclk.serial);
     set_clock(&is->extclk, get_clock(&is->extclk), is->extclk.serial);
     is->paused = is->audclk.paused = is->vidclk.paused = is->extclk.paused = !is->paused;
+    SDL_UnlockMutex(is->audio_clock_mutex);
 }
 
 static void toggle_pause(VideoState *is)
@@ -2594,10 +2601,13 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
     }
     is->audio_write_buf_size = is->audio_buf_size - is->audio_buf_index;
     /* Let's assume the audio driver that is used by SDL has two periods. */
-    if (!isnan(is->audio_clock)) {
+    SDL_LockMutex(is->audio_clock_mutex);
+    /* 暂停后的静音回调仍可能继续，不能拿旧解码时间覆盖已冻结的播放位置。 */
+    if (!is->paused && !isnan(is->audio_clock)) {
         set_clock_at(&is->audclk, is->audio_clock - (double)(2 * is->audio_hw_buf_size + is->audio_write_buf_size) / is->audio_tgt.bytes_per_sec, is->audio_clock_serial, audio_callback_time / 1000000.0);
         sync_clock_to_slave(&is->extclk, &is->audclk);
     }
+    SDL_UnlockMutex(is->audio_clock_mutex);
 }
 
 static int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int wanted_sample_rate, struct AudioParams *audio_hw_params)
@@ -3306,6 +3316,10 @@ static VideoState *stream_open(const char *filename,
 
     if (!(is->continue_read_thread = SDL_CreateCond())) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+        goto fail;
+    }
+    if (!(is->audio_clock_mutex = SDL_CreateMutex())) {
+        av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
         goto fail;
     }
 

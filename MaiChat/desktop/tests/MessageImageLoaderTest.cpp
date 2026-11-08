@@ -51,13 +51,13 @@ void MessageImageLoaderTest::decodesDownToTheRequestedSizeInsteadOfFullResolutio
     QLabel label;
     const QSize target(240, 180);
     loadQtInto(largePath_, target, &label);
-    QTRY_VERIFY(label.pixmap() != nullptr && !label.pixmap()->isNull());
-    QVERIFY2(label.pixmap()->width() <= target.width(),
+    QTRY_VERIFY(!label.pixmap().isNull());
+    QVERIFY2(label.pixmap().width() <= target.width(),
              "解出来的图不该比请求的目标还宽——那说明没有按目标尺寸降采样");
-    QVERIFY2(label.pixmap()->height() <= target.height(),
+    QVERIFY2(label.pixmap().height() <= target.height(),
              "解出来的图不该比请求的目标还高");
     // 也不能降过头：整体尺寸应当仍接近目标，否则贴上去是糊的。
-    QVERIFY(label.pixmap()->width() >= target.width() / 2);
+    QVERIFY(label.pixmap().width() >= target.width() / 2);
 }
 
 // 缓存被去掉的话这条会挂：第二次请求就不再是同步命中了。
@@ -65,12 +65,12 @@ void MessageImageLoaderTest::secondRequestForTheSameSizeIsServedFromCache() {
     const QSize target(200, 150);
     QLabel warmUp;
     loadQtInto(largePath_, target, &warmUp);
-    QTRY_VERIFY(warmUp.pixmap() != nullptr && !warmUp.pixmap()->isNull());
+    QTRY_VERIFY(!warmUp.pixmap().isNull());
 
     QLabel second;
     loadQtInto(largePath_, target, &second);
     // 不跑事件循环：命中缓存时必须当场贴好。
-    QVERIFY2(second.pixmap() != nullptr && !second.pixmap()->isNull(),
+    QVERIFY2(!second.pixmap().isNull(),
              "同尺寸的第二次请求应当直接命中缓存并同步贴图");
 }
 
@@ -79,11 +79,11 @@ void MessageImageLoaderTest::differentTargetSizesDoNotShareOneCacheEntry() {
     QLabel small;
     QLabel big;
     loadQtInto(largePath_, QSize(120, 90), &small);
-    QTRY_VERIFY(small.pixmap() != nullptr && !small.pixmap()->isNull());
+    QTRY_VERIFY(!small.pixmap().isNull());
     loadQtInto(largePath_, QSize(800, 600), &big);
-    QTRY_VERIFY(big.pixmap() != nullptr && !big.pixmap()->isNull());
+    QTRY_VERIFY(!big.pixmap().isNull());
 
-    QVERIFY2(big.pixmap()->width() > small.pixmap()->width(),
+    QVERIFY2(big.pixmap().width() > small.pixmap().width(),
              "大尺寸请求拿到的不该是小缩略图——说明缓存键没带目标尺寸");
 }
 
@@ -120,16 +120,16 @@ void MessageImageLoaderTest::cachedReplacementRejectsOlderAsyncResult() {
     const QSize replacementSize(91, 67);
     QLabel warmUp;
     loadQtInto(largePath_, replacementSize, &warmUp);
-    QTRY_VERIFY(warmUp.pixmap() != nullptr && !warmUp.pixmap()->isNull());
+    QTRY_VERIFY(!warmUp.pixmap().isNull());
 
     QLabel target;
     loadQtInto(largePath_, QSize(777, 583), &target);
     loadQtInto(largePath_, replacementSize, &target);
-    QVERIFY(target.pixmap() != nullptr && !target.pixmap()->isNull());
-    QVERIFY(target.pixmap()->width() <= replacementSize.width());
+    QVERIFY(!target.pixmap().isNull());
+    QVERIFY(target.pixmap().width() <= replacementSize.width());
 
     QTest::qWait(500);
-    QVERIFY2(target.pixmap() != nullptr && target.pixmap()->width() <= replacementSize.width(),
+    QVERIFY2(!target.pixmap().isNull() && target.pixmap().width() <= replacementSize.width(),
              "较早的异步结果不能覆盖后来同步命中的缓存图");
 }
 

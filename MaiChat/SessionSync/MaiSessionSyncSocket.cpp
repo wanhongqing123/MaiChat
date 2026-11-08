@@ -45,7 +45,70 @@ struct RoutedConfig : websocketpp::config::asio_tls_client {
 };
 using Client = websocketpp::client<RoutedConfig>;
 
-size_t discardProbe(char*, size_t size, size_t count, void*) { return size * count; }
+struct ProxyAuthentication {
+    std::string url;
+    std::string username;
+    std::string password;
+    bool authenticated = false;
+};
+
+// Keep userinfo out of websocketpp's CONNECT authority. The offline contract
+// exercises this parser without opening a socket or reading system settings.
+bool parseProxyAuthentication(const std::string& address, ProxyAuthentication& output) {
+    output = {};
+    if (address.empty()) return true;
+    if (address.size() >= 2048 || address.find_first_of("\r\n") != std::string::npos ||
+        address.find('\0') != std::string::npos)
+        return false;
+    using Url = std::unique_ptr<CURLU, decltype(&curl_url_cleanup)>;
+    Url parsed(curl_url(), curl_url_cleanup);
+    if (!parsed || curl_url_set(parsed.get(), CURLUPART_URL, address.c_str(), 0) != CURLUE_OK) return false;
+    const auto part = [&](CURLUPart field, std::string& value, unsigned flags = 0) {
+        char* bytes = nullptr;
+        const auto code = curl_url_get(parsed.get(), field, &bytes, flags);
+        if (code == CURLUE_OK) value.assign(bytes);
+        curl_free(bytes);
+        return code;
+    };
+    std::string scheme, host, port, path, query, fragment;
+    if (part(CURLUPART_SCHEME, scheme) != CURLUE_OK || scheme != "http" || part(CURLUPART_HOST, host) != CURLUE_OK ||
+        host.empty() || part(CURLUPART_PORT, port, CURLU_DEFAULT_PORT) != CURLUE_OK || port.empty() ||
+        part(CURLUPART_PATH, path) != CURLUE_OK || path != "/" || part(CURLUPART_QUERY, query) != CURLUE_NO_QUERY ||
+        part(CURLUPART_FRAGMENT, fragment) != CURLUE_NO_FRAGMENT)
+        return false;
+    unsigned number = 0;
+    for (const auto digit : port) {
+        if (digit < '0' || digit > '9') return false;
+        number = number * 10 + unsigned(digit - '0');
+        if (number > 65535) return false;
+    }
+    if (number == 0) return false;
+    ProxyAuthentication result;
+    const auto userCode = part(CURLUPART_USER, result.username, CURLU_URLDECODE);
+    const auto passwordCode = part(CURLUPART_PASSWORD, result.password, CURLU_URLDECODE);
+    if ((userCode != CURLUE_OK && userCode != CURLUE_NO_USER) ||
+        (passwordCode != CURLUE_OK && passwordCode != CURLUE_NO_PASSWORD))
+        return false;
+    const auto safeCredential = [](const std::string& value) {
+        for (const unsigned char byte : value)
+            if (byte < 0x20 || byte == 0x7f) return false;
+        return true;
+    };
+    if (result.username.find(':') != std::string::npos || !safeCredential(result.username) ||
+        !safeCredential(result.password))
+        return false;
+    result.authenticated = userCode == CURLUE_OK || passwordCode == CURLUE_OK;
+    if (curl_url_set(parsed.get(), CURLUPART_USER, nullptr, 0) != CURLUE_OK ||
+        curl_url_set(parsed.get(), CURLUPART_PASSWORD, nullptr, 0) != CURLUE_OK ||
+        part(CURLUPART_URL, result.url) != CURLUE_OK)
+        return false;
+    output = std::move(result);
+    return true;
+}
+
+size_t discardProbe(char*, size_t size, size_t count, void*) {
+    return size * count;
+}
 
 // 不带凭据的 HTTPS 探测既验证 DoH 返回的地址，也不重放任何账号写操作。
 std::string probeAddress(const std::string& caPem, const char* doh) {
@@ -59,9 +122,7 @@ std::string probeAddress(const std::string& caPem, const char* doh) {
     // 此模块可在账号或模型网络组件启动之前独立运行；不依赖它们初始化 curl。
     static std::once_flag curlInitialization;
     static CURLcode curlInitializationResult = CURLE_FAILED_INIT;
-    std::call_once(curlInitialization, [] {
-        curlInitializationResult = curl_global_init(CURL_GLOBAL_DEFAULT);
-    });
+    std::call_once(curlInitialization, [] { curlInitializationResult = curl_global_init(CURL_GLOBAL_DEFAULT); });
     if (curlInitializationResult != CURLE_OK) return {};
     CURL* curl = curl_easy_init();
     if (!curl) return {};
@@ -99,12 +160,13 @@ std::string probeAddress(const std::string& caPem, const char* doh) {
 
 bool isValidConfiguration(const MaiSessionSyncSocket::Configuration& value) {
     const websocketpp::uri uri(value.url);
+    ProxyAuthentication proxy;
     return value.url.rfind("wss://", 0) == 0 && uri.get_valid() && !uri.get_host().empty() && value.url.size() < 4096 &&
            value.url.find_first_of("\r\n") == std::string::npos && !value.bearer.empty() &&
            value.bearer.size() <= 8192 && value.bearer.find_first_of("\r\n") == std::string::npos &&
            !value.caPem.empty() && value.proxyUrl.size() < 2048 &&
            value.proxyUrl.find_first_of("\r\n") == std::string::npos &&
-           (value.proxyUrl.empty() || value.proxyUrl.rfind("http://", 0) == 0);
+           parseProxyAuthentication(value.proxyUrl, proxy);
 }
 
 }  // namespace
@@ -198,7 +260,16 @@ struct MaiSessionSyncSocket::Runtime {
             auto dial = endpoint->get_connection(settings.url, error);
             if (!error) {
                 dial->append_header("Authorization", "Bearer " + settings.bearer);
-                if (dialAddress.empty() && !settings.proxyUrl.empty()) dial->set_proxy(settings.proxyUrl, error);
+                if (dialAddress.empty() && !settings.proxyUrl.empty()) {
+                    ProxyAuthentication proxy;
+                    if (!parseProxyAuthentication(settings.proxyUrl, proxy)) {
+                        error = websocketpp::error::make_error_code(websocketpp::error::invalid_uri);
+                    } else {
+                        dial->set_proxy(proxy.url, error);
+                        if (!error && proxy.authenticated)
+                            dial->set_proxy_basic_auth(proxy.username, proxy.password, error);
+                    }
+                }
             }
             if (error) {
                 failure = error.message();

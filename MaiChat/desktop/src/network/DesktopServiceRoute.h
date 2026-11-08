@@ -23,9 +23,9 @@ class DesktopServiceRoute final {
 public:
     using Probe = std::function<bool(const DesktopServiceProxyRoute&)>;
 
+    // Native PAC discovery may block; callers query configured() on a worker.
     static DesktopServiceProxyRoute configured(const QUrl& url);
-    static DesktopServiceProxyRoute choose(const DesktopServiceProxyRoute& configured,
-                                           const Probe& probe);
+    static DesktopServiceProxyRoute choose(const DesktopServiceProxyRoute& configured, const Probe& probe);
     static DesktopServiceProxyRoute current(const DesktopServiceProxyRoute& configured);
     static void invalidate(const DesktopServiceProxyRoute& route);
 };

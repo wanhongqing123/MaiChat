@@ -1,0 +1,12 @@
+[submodule "MaiChat/desktop/qt/qtbase"]
+	path = MaiChat/desktop/qt/qtbase
+	url = https://github.com/qt/qtbase.git
+	shallow = true
+[submodule "MaiChat/desktop/qt/qtsvg"]
+	path = MaiChat/desktop/qt/qtsvg
+	url = https://github.com/qt/qtsvg.git
+	shallow = true
+[submodule "MaiChat/desktop/qt/qtimageformats"]
+	path = MaiChat/desktop/qt/qtimageformats
+	url = https://github.com/qt/qtimageformats.git
+	shallow = true

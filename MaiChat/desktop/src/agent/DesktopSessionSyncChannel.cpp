@@ -3,10 +3,12 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QMetaObject>
-#include <QNetworkProxyFactory>
-#include <QNetworkProxyQuery>
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrentRun>
 #include <QPointer>
 #include <QUuid>
+
+#include "MaiSystemProxy.h"
 
 #ifdef Q_OS_WIN
 #include "network/DesktopServiceRoute.h"
@@ -20,8 +22,7 @@ QString requestOperation(const QString& path, const QByteArray& method) {
     if (method == "POST" && path == QStringLiteral("session-sync/ack")) return QStringLiteral("ack");
     if (method == "POST" && path == QStringLiteral("session-sync/publish")) return QStringLiteral("publish");
     if (method == "GET" && path == QStringLiteral("session-sync/history")) return QStringLiteral("history");
-    if (method == "POST" && path == QStringLiteral("session-sync/room-delete"))
-        return QStringLiteral("room-delete");
+    if (method == "POST" && path == QStringLiteral("session-sync/room-delete")) return QStringLiteral("room-delete");
     return {};
 }
 
@@ -29,34 +30,26 @@ QString proxyForUrl(const QUrl& socketUrl) {
     QUrl lookup = socketUrl;
     lookup.setScheme(QStringLiteral("https"));
 #ifdef Q_OS_WIN
-    const DesktopServiceProxyRoute route = DesktopServiceRoute::current(
-        DesktopServiceRoute::configured(lookup));
-    if (route.mode == DesktopServiceProxyMode::Unsupported ||
-        route.mode == DesktopServiceProxyMode::Unavailable)
+    const DesktopServiceProxyRoute route = DesktopServiceRoute::current(DesktopServiceRoute::configured(lookup));
+    if (route.mode == DesktopServiceProxyMode::Unsupported || route.mode == DesktopServiceProxyMode::Unavailable)
         return QStringLiteral("unsupported");
     return route.proxyUrl;
 #else
-    const auto proxies = QNetworkProxyFactory::systemProxyForQuery(QNetworkProxyQuery(lookup));
-    if (proxies.isEmpty() || proxies.first().type() == QNetworkProxy::NoProxy ||
-        proxies.first().type() == QNetworkProxy::DefaultProxy)
-        return {};
-    const QNetworkProxy proxy = proxies.first();
-    if (proxy.type() != QNetworkProxy::HttpProxy || proxy.hostName().isEmpty() || proxy.port() == 0)
+    const auto proxy = maiSystemProxyForUrl(lookup.toEncoded().toStdString());
+    if (proxy.mode == MaiSystemProxyMode::Direct) return {};
+    if (proxy.mode != MaiSystemProxyMode::Http || proxy.url.rfind("http://", 0) != 0)
         return QStringLiteral("unsupported");
-    QUrl address;
-    address.setScheme(QStringLiteral("http"));
-    address.setHost(proxy.hostName());
-    address.setPort(proxy.port());
-    address.setPath(QStringLiteral("/"));
-    return address.toString(QUrl::FullyEncoded);
+    return QString::fromStdString(proxy.url);
 #endif
 }
 
 }  // namespace
 
-DesktopSessionSyncChannel::DesktopSessionSyncChannel(QUrl url, std::function<QString()> bearerProvider,
-                                                     QObject* parent, QByteArray trustedCaPem)
-    : QObject(parent), url_(std::move(url)), bearerProvider_(std::move(bearerProvider)),
+DesktopSessionSyncChannel::DesktopSessionSyncChannel(QUrl url, std::function<QString()> bearerProvider, QObject* parent,
+                                                     QByteArray trustedCaPem)
+    : QObject(parent),
+      url_(std::move(url)),
+      bearerProvider_(std::move(bearerProvider)),
       trustedCaPem_(std::move(trustedCaPem)) {
     retryTimer_.setInterval(2000);
     connect(&retryTimer_, &QTimer::timeout, this, [this] { startWhenReady(); });
@@ -107,8 +100,7 @@ void DesktopSessionSyncChannel::refreshBearerNow() {
         resetConnection(QStringLiteral("账号登录已失效"));
         return;
     }
-    if (connected_ && pendingReauthId_.isEmpty() && token != authorizedBearer_)
-        sendReauthorization(token);
+    if (connected_ && pendingReauthId_.isEmpty() && token != authorizedBearer_) sendReauthorization(token);
 }
 
 void DesktopSessionSyncChannel::sendReauthorization(const QByteArray& token) {
@@ -117,8 +109,7 @@ void DesktopSessionSyncChannel::sendReauthorization(const QByteArray& token) {
     const QJsonObject frame{
         {QStringLiteral("id"), pendingReauthId_},
         {QStringLiteral("op"), QStringLiteral("reauth")},
-        {QStringLiteral("body"), QJsonObject{
-            {QStringLiteral("access_token"), QString::fromUtf8(token)}}}};
+        {QStringLiteral("body"), QJsonObject{{QStringLiteral("access_token"), QString::fromUtf8(token)}}}};
     const QByteArray bytes = QJsonDocument(frame).toJson(QJsonDocument::Compact);
     if (!socket_->send(bytes.toStdString())) {
         resetConnection(QStringLiteral("设备同步续权失败"));
@@ -127,13 +118,13 @@ void DesktopSessionSyncChannel::sendReauthorization(const QByteArray& token) {
     const quint64 generation = generation_;
     const QString id = pendingReauthId_;
     QTimer::singleShot(15000, this, [this, generation, id] {
-        if (generation == generation_ && pendingReauthId_ == id)
-            resetConnection(QStringLiteral("设备同步续权超时"));
+        if (generation == generation_ && pendingReauthId_ == id) resetConnection(QStringLiteral("设备同步续权超时"));
     });
 }
 
 void DesktopSessionSyncChannel::resetConnection(const QString& error) {
     ++generation_;
+    proxyLookupPending_ = false;
     if (socket_) {
         socket_->stop();
         socket_.reset();
@@ -148,15 +139,29 @@ void DesktopSessionSyncChannel::resetConnection(const QString& error) {
 }
 
 void DesktopSessionSyncChannel::startWhenReady() {
+    if (socket_ || proxyLookupPending_ || !bearerProvider_) return;
+    if (bearerProvider_().isEmpty() || url_.scheme() != QStringLiteral("wss")) return;
+    // PAC/WPAD may block. Only immutable URL data crosses to the worker; the
+    // QObject owns completion and ignores a result after reset/destruction.
+    proxyLookupPending_ = true;
+    const quint64 generation = ++generation_;
+    auto* watcher = new QFutureWatcher<QString>(this);
+    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, generation] {
+        const QString proxy = watcher->result();
+        watcher->deleteLater();
+        if (generation != generation_) return;
+        proxyLookupPending_ = false;
+        if (proxy == QStringLiteral("unsupported")) return;
+        openConnection(proxy);
+    });
+    watcher->setFuture(QtConcurrent::run([url = url_] { return proxyForUrl(url); }));
+}
+
+void DesktopSessionSyncChannel::openConnection(const QString& proxy) {
     if (socket_ || !bearerProvider_) return;
+    // The account may renew or sign out while native proxy discovery runs.
     const QByteArray token = bearerProvider_().toUtf8();
-    if (token.isEmpty() || url_.scheme() != QStringLiteral("wss")) return;
-    QString proxy = proxyForUrl(url_);
-    if (proxy == QStringLiteral("unsupported")) {
-        // 账号域名允许尝试直连，其他域名仍遵守原有代理限制。
-        if (url_.host() != QStringLiteral("ichat.life")) return;
-        proxy.clear();
-    }
+    if (token.isEmpty()) return;
     QByteArray ca = trustedCaPem_;
     if (ca.isEmpty()) {
         Q_INIT_RESOURCE(AuthCertificates);
@@ -165,7 +170,7 @@ void DesktopSessionSyncChannel::startWhenReady() {
         ca = certificates.readAll();
     }
     QPointer<DesktopSessionSyncChannel> guard(this);
-    const quint64 generation = ++generation_;
+    const quint64 generation = generation_;
     connectingBearer_ = token;
     authorizedBearer_.clear();
     pendingReauthBearer_.clear();
@@ -223,8 +228,8 @@ void DesktopSessionSyncChannel::request(const QString& path, const QByteArray& m
     QTimer::singleShot(15000, this, [this, id, historyRead] {
         if (!pending_.contains(id)) return;
         const Completion expired = pending_.take(id);
-        expired({}, historyRead ? QStringLiteral("会话读取超时，请稍后重试") :
-                                   QStringLiteral("操作状态未知，请先查看所属设备会话记录"));
+        expired({}, historyRead ? QStringLiteral("会话读取超时，请稍后重试")
+                                : QStringLiteral("操作状态未知，请先查看所属设备会话记录"));
     });
 }
 

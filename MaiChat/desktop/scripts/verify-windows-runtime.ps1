@@ -46,9 +46,15 @@ foreach ($name in ($imports | Select-Object -Unique)) {
     }
     $missing.Add($name)
 }
-foreach ($plugin in 'platforms\qwindows.dll', 'sqldrivers\qsqlite.dll') {
+foreach ($plugin in 'platforms\qwindows.dll', 'imageformats\qsvg.dll', 'imageformats\qwebp.dll') {
     if (-not (Test-Path -LiteralPath (Join-Path $AppDir $plugin))) {
         $missing.Add($plugin)
+    }
+}
+foreach ($retired in 'Qt6Network.dll', 'Qt6WebSockets.dll', 'Qt6Sql.dll',
+                    'Qt6Multimedia.dll', 'Qt6MultimediaWidgets.dll') {
+    if (($imports -contains $retired) -or (Test-Path -LiteralPath (Join-Path $AppDir $retired))) {
+        throw "Retired Qt dependency in ${AppDir}: $retired"
     }
 }
 if ($missing.Count -gt 0) {

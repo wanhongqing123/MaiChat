@@ -173,6 +173,12 @@ QtMessageHandler& previousHandler() {
     return value;
 }
 
+struct RestoreMessageHandler {
+    ~RestoreMessageHandler() {
+        qInstallMessageHandler(previousHandler());
+    }
+};
+
 void handler(QtMsgType type, const QMessageLogContext& context, const QString& message) {
     const QString line = QStringLiteral("%1 [%2] %3")
                              .arg(QDateTime::currentDateTime().toString(
@@ -227,6 +233,11 @@ void install() {
                              .arg(QCoreApplication::applicationFilePath());
     qInfo().noquote() << QStringLiteral("pid: %1").arg(QCoreApplication::applicationPid());
     qInfo().noquote() << QStringLiteral("log file: %1").arg(filePath());
+
+    // 必须最后构造：启动日志已建立 QFile/QLockFile/目录/互斥量等非平凡状态。
+    // 退出时先恢复原 Qt 处理器，再释放这些状态；更早构造的 QFactoryLoader
+    // 随后仍可能发日志，不能让它回到已经析构的 QFile。锁、flush 和轮转不变。
+    static const RestoreMessageHandler restoreOnExit;
 }
 
 QString filePath() {

@@ -1,16 +1,66 @@
 // 文件作用：验证桌面端消息去重、时间排序、分页和重启后的持久化。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QSet>
-#include <QSqlDatabase>
-#include <QSqlQuery>
+#include <QElapsedTimer>
+#include <QCoreApplication>
+#include <QProcess>
+#include <QScopeGuard>
+#include <sqlite3.h>
 #include <QTemporaryDir>
 #include <QTest>
 #include <limits>
+#include <cstdio>
 
 #include "model/ChatState.h"
 #include "storage/LocalMessageDatabase.h"
 
 namespace {
+
+// Fixtures own only private QTemporaryDir files. Use the same vendored sqlite3
+// library as production, without loading a Qt SQL driver or touching account DBs.
+class SqlFixture {
+public:
+    explicit SqlFixture(const QString& path) {
+        const QByteArray bytes = path.toUtf8();
+        if (sqlite3_open_v2(bytes.constData(), &db_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                            nullptr) != SQLITE_OK) {
+            sqlite3_close_v2(db_);
+            db_ = nullptr;
+        }
+    }
+    ~SqlFixture() { if (db_) sqlite3_close_v2(db_); }
+    SqlFixture(const SqlFixture&) = delete;
+    SqlFixture& operator=(const SqlFixture&) = delete;
+    bool isOpen() const { return db_ != nullptr; }
+    bool exec(const QString& sql) const {
+        return db_ && sqlite3_exec(db_, sql.toUtf8().constData(), nullptr, nullptr, nullptr) == SQLITE_OK;
+    }
+    bool columnTexts(const QString& sql, int column, QSet<QString>& output) const {
+        sqlite3_stmt* statement = nullptr;
+        const QByteArray bytes = sql.toUtf8();
+        if (!db_ || sqlite3_prepare_v2(db_, bytes.constData(), int(bytes.size()), &statement, nullptr) != SQLITE_OK)
+            return false;
+        int result = SQLITE_OK;
+        while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
+            const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(statement, column));
+            output.insert(QString::fromUtf8(text, sqlite3_column_bytes(statement, column)));
+        }
+        sqlite3_finalize(statement);
+        return result == SQLITE_DONE;
+    }
+    qint64 integer(const QString& sql) const {
+        sqlite3_stmt* statement = nullptr;
+        const QByteArray bytes = sql.toUtf8();
+        if (!db_ || sqlite3_prepare_v2(db_, bytes.constData(), int(bytes.size()), &statement, nullptr) != SQLITE_OK)
+            return std::numeric_limits<qint64>::min();
+        const bool row = sqlite3_step(statement) == SQLITE_ROW;
+        const qint64 result = row ? sqlite3_column_int64(statement, 0) : std::numeric_limits<qint64>::min();
+        sqlite3_finalize(statement);
+        return result;
+    }
+private:
+    sqlite3* db_ = nullptr;
+};
 
 RemoteIMMessage makeTextMessage(const QString& id, const QString& from, const QString& to,
                                 RemoteIMMessageDirection direction, qint64 createdAtMillis,
@@ -52,6 +102,15 @@ private slots:
     void healsContactPointingAtMissingGroup();
     void upgradesPreGroupDatabaseWithoutLosingContacts();
     void groupHistoryPagesSeparatelyAndSurvivesMembershipRemoval();
+    void roundTripsUnicodeNullEmptyAndFullWidthIntegers();
+    void rejectsInvalidDatabasePath();
+    void cascadeFailureRollsBackBothDeletes();
+    void adoptionFailureKeepsTemporaryMessages();
+    void groupAdoptionFailureKeepsTemporaryMessages();
+    void groupStepFailuresRollBackMembers();
+    void commitFailureRollsBackAndKeepsConnectionUsable();
+    void failedMigrationPreservesOldSchema();
+    void pagesTimestampTiesAndRejectsEmptyBounds();
 };
 
 void LocalMessageDatabaseTest::groupHistoryPagesSeparatelyAndSurvivesMembershipRemoval() {
@@ -295,7 +354,7 @@ void LocalMessageDatabaseTest::roundTripsVideoAttachment() {
     const QList<RemoteIMMessage> messages = restored.messagesWith(QStringLiteral("peer"));
     QCOMPARE(messages.size(), 1);
     const RemoteIMMessage& loaded = messages.first();
-    // 插入是位置绑定（29 个 ?），列名单/占位符/绑定顺序错位不会报错，只会把值写进
+    // 插入是位置绑定（34 个 ?），列名单/占位符/绑定顺序错位不会报错，只会把值写进
     // 相邻的列。逐字段比对是唯一能发现错位的手段。
     QVERIFY(loaded.hasVideo);
     QVERIFY(!loaded.hasFile);
@@ -391,12 +450,9 @@ void LocalMessageDatabaseTest::upgradesPreVideoDatabaseWithoutLosingOldMessages(
 
     // 1) 先造一个「视频功能之前」的库：手工建不含 video_* 列的表并塞一条文件消息。
     {
-        QSqlDatabase legacy = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
-                                                        QStringLiteral("legacy_pre_video"));
-        legacy.setDatabaseName(path);
-        QVERIFY(legacy.open());
-        QSqlQuery q(legacy);
-        QVERIFY(q.exec(QStringLiteral(
+        SqlFixture legacy(path);
+        QVERIFY(legacy.isOpen());
+        QVERIFY(legacy.exec(QStringLiteral(
             "CREATE TABLE messages ("
             "  id TEXT PRIMARY KEY, from_user TEXT NOT NULL, to_user TEXT NOT NULL,"
             "  peer TEXT NOT NULL, direction INTEGER NOT NULL, status INTEGER NOT NULL,"
@@ -406,14 +462,12 @@ void LocalMessageDatabaseTest::upgradesPreVideoDatabaseWithoutLosingOldMessages(
             "  has_voice INTEGER NOT NULL DEFAULT 0, voice_path TEXT, voice_seconds INTEGER,"
             "  has_file INTEGER NOT NULL DEFAULT 0,"
             "  file_path TEXT, file_name TEXT, file_mime TEXT, file_bytes INTEGER)")));
-        QVERIFY(q.exec(QStringLiteral(
+        QVERIFY(legacy.exec(QStringLiteral(
             "INSERT INTO messages(id, from_user, to_user, peer, direction, status, text,"
             " created_at, has_file, file_path, file_name, file_mime, file_bytes)"
             " VALUES('old-1','peer','me','peer',0,2,'旧的文件消息',1600000000000,1,"
             "'E:/old/report.md','report.md','text/markdown',2048)")));
-        legacy.close();
     }
-    QSqlDatabase::removeDatabase(QStringLiteral("legacy_pre_video"));
 
     // 2) 用新版打开：迁移必须补列，且旧消息一条不丢。
     {
@@ -427,20 +481,13 @@ void LocalMessageDatabaseTest::upgradesPreVideoDatabaseWithoutLosingOldMessages(
         QCOMPARE(messages.first().file.fileName, QStringLiteral("report.md"));
         QVERIFY(!messages.first().hasVideo);
 
-        // 读取按列名取值，列不存在只会得到无效 QVariant（=0/空），所以上面那条
-        // hasVideo==false 两种情况都成立、证明不了迁移跑了。直接问 schema。
+        // 缺列和默认值都可能表现为 hasVideo==false；直接查 schema 才能证明补列确实发生。
         QSet<QString> columns;
         {
-            // QSqlQuery 必须先出作用域，否则 removeDatabase 会警告「连接仍在使用」。
-            QSqlDatabase probe = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
-                                                           QStringLiteral("probe_schema"));
-            probe.setDatabaseName(path);
-            QVERIFY(probe.open());
-            QSqlQuery probeQuery(probe);
-            QVERIFY(probeQuery.exec(QStringLiteral("PRAGMA table_info(messages)")));
-            while (probeQuery.next()) columns.insert(probeQuery.value(1).toString());
+            SqlFixture probe(path);
+            QVERIFY(probe.isOpen());
+            QVERIFY(probe.columnTexts(QStringLiteral("PRAGMA table_info(messages)"), 1, columns));
         }
-        QSqlDatabase::removeDatabase(QStringLiteral("probe_schema"));
         for (const QString& expected : {QStringLiteral("has_video"), QStringLiteral("video_path"),
                                         QStringLiteral("video_name"), QStringLiteral("video_cover"),
                                         QStringLiteral("video_seconds"), QStringLiteral("video_bytes"),
@@ -614,13 +661,10 @@ void LocalMessageDatabaseTest::healsContactPointingAtMissingGroup() {
     }
     // 绕过接口直接把分组删掉，模拟历史数据或半途失败留下的悬空引用。
     {
-        QSqlDatabase raw = QSqlDatabase::addDatabase("QSQLITE", "heal-check");
-        raw.setDatabaseName(path);
-        QVERIFY(raw.open());
-        QSqlQuery(raw).exec("DELETE FROM contact_groups WHERE name = '同事'");
-        raw.close();
+        SqlFixture raw(path);
+        QVERIFY(raw.isOpen());
+        QVERIFY(raw.exec("DELETE FROM contact_groups WHERE name = '同事'"));
     }
-    QSqlDatabase::removeDatabase("heal-check");
 
     // 读取时自愈成未分组：界面上不会冒出一个点不开、删不掉的幽灵分组。
     LocalMessageDatabase db(path);
@@ -632,16 +676,12 @@ void LocalMessageDatabaseTest::upgradesPreGroupDatabaseWithoutLosingContacts() {
     const QString path = dir.filePath("messages.db");
     // 手工造一个分组功能之前的库：contacts 只有三列，没有 contact_groups 表。
     {
-        QSqlDatabase legacy = QSqlDatabase::addDatabase("QSQLITE", "pre-group");
-        legacy.setDatabaseName(path);
-        QVERIFY(legacy.open());
-        QSqlQuery query(legacy);
-        QVERIFY(query.exec("CREATE TABLE contacts (user_id TEXT PRIMARY KEY,"
+        SqlFixture legacy(path);
+        QVERIFY(legacy.isOpen());
+        QVERIFY(legacy.exec("CREATE TABLE contacts (user_id TEXT PRIMARY KEY,"
                            " display_name TEXT NOT NULL, avatar_url TEXT NOT NULL DEFAULT '')"));
-        QVERIFY(query.exec("INSERT INTO contacts VALUES ('alice', 'Alice', '')"));
-        legacy.close();
+        QVERIFY(legacy.exec("INSERT INTO contacts VALUES ('alice', 'Alice', '')"));
     }
-    QSqlDatabase::removeDatabase("pre-group");
 
     // 升级靠 ALTER 加列，不重建表——重建会把已有联系人一起丢掉。
     LocalMessageDatabase db(path);
@@ -657,5 +697,301 @@ void LocalMessageDatabaseTest::upgradesPreGroupDatabaseWithoutLosingContacts() {
     QCOMPARE(groupOf(db, "alice"), QStringLiteral("同事"));
 }
 
-QTEST_MAIN(LocalMessageDatabaseTest)
+// UTF-8 byte lengths and SQL NULL are independent of QString character counts.
+// Check nullable fields through raw SQL as well as DTOs so a lossy conversion
+// cannot pass by normalizing both sides of the assertion to an empty string.
+void LocalMessageDatabaseTest::roundTripsUnicodeNullEmptyAndFullWidthIntegers() {
+    QTemporaryDir dir;
+    const QString path = dir.filePath(QStringLiteral("消息📂/聊天.sqlite"));
+    LocalMessageDatabase db(path);
+    QVERIFY(db.isOpen());
+    const QString peer = QStringLiteral("对端'🙂");
+    const qint64 large = std::numeric_limits<qint64>::max() - 2;
+    const QString text = QStringLiteral("引号'🙂 é ") + QChar(0) + QStringLiteral(" 后段");
+    RemoteIMMessage message = makeTextMessage(QStringLiteral("unicode'🧪"), peer, "me",
+        RemoteIMMessageDirection::Incoming, large, text);
+    message.hasImage = message.hasVoice = message.hasFile = message.hasVideo = true;
+    message.captionAbove = true;
+    message.image = {QString(), 640, 480, large - 1};
+    message.voice = {QStringLiteral("声音/你好🙂.m4a"), 17};
+    message.file = {QStringLiteral("文件/你好.md"), QStringLiteral(""), "text/markdown", large - 2};
+    message.video = {QStringLiteral("视频/片段.mp4"), QStringLiteral("片段🙂.mp4"),
+        QStringLiteral("封面/一.jpg"), 42, large - 3};
+    message.hasQuote = true;
+    message.quote = {QStringLiteral(""), peer, QStringLiteral("引用\n🙂"), QStringLiteral("image")};
+    QVERIFY(db.insertMessageIfAbsent(message, peer));
+    const auto rows = db.loadRecentMessages(peer, 2);
+    QCOMPARE(rows.size(), 1);
+    const auto& loaded = rows.first();
+    QCOMPARE(loaded.id, message.id);
+    QCOMPARE(loaded.text, text);
+    QCOMPARE(loaded.createdAtMillis, large);
+    QVERIFY(loaded.image.localPath.isNull());
+    QCOMPARE(loaded.image.width, 640);
+    QCOMPARE(loaded.image.height, 480);
+    QCOMPARE(loaded.image.sizeBytes, large - 1);
+    QCOMPARE(loaded.voice.localPath, message.voice.localPath);
+    QCOMPARE(loaded.voice.durationSeconds, 17);
+    QVERIFY(!loaded.file.fileName.isNull());
+    QVERIFY(loaded.file.fileName.isEmpty());
+    QCOMPARE(loaded.file.localPath, message.file.localPath);
+    QCOMPARE(loaded.file.mimeType, message.file.mimeType);
+    QCOMPARE(loaded.file.sizeBytes, large - 2);
+    QCOMPARE(loaded.video.localPath, message.video.localPath);
+    QCOMPARE(loaded.video.fileName, message.video.fileName);
+    QCOMPARE(loaded.video.coverPath, message.video.coverPath);
+    QCOMPARE(loaded.video.durationSeconds, 42);
+    QCOMPARE(loaded.video.sizeBytes, large - 3);
+    QVERIFY(loaded.captionAbove && loaded.hasImage && loaded.hasVoice && loaded.hasFile && loaded.hasVideo);
+    QVERIFY(loaded.hasQuote);
+    QCOMPARE(loaded.quote.msgId, QStringLiteral(""));
+    QCOMPARE(loaded.quote.senderId, peer);
+    QCOMPARE(loaded.quote.digest, message.quote.digest);
+    QCOMPARE(loaded.quote.kind, message.quote.kind);
+
+    SqlFixture raw(path);
+    QVERIFY(raw.isOpen());
+    QCOMPARE(raw.integer("SELECT image_path IS NULL FROM messages"), qint64(1));
+    QCOMPARE(raw.integer("SELECT typeof(file_name)='text' AND length(file_name)=0 FROM messages"), qint64(1));
+    QCOMPARE(raw.integer("SELECT typeof(created_at)='integer' FROM messages"), qint64(1));
+
+    auto empty = makeTextMessage("empty-text", peer, "me", RemoteIMMessageDirection::Incoming,
+        20, QStringLiteral(""));
+    QVERIFY(db.insertMessageIfAbsent(empty, peer));
+    auto null = empty;
+    null.id = QStringLiteral("null-text");
+    null.text = QString();
+    QVERIFY(!db.insertMessageIfAbsent(null, peer));  // INSERT OR IGNORE must preserve NOT NULL semantics.
+    QCOMPARE(raw.integer("SELECT COUNT(*) FROM messages"), qint64(2));
+    const auto emptyRow = db.loadMessagesBefore(peer, 21, "~", 1);
+    QCOMPARE(emptyRow.size(), 1);
+    QVERIFY(emptyRow.first().text.isEmpty() && !emptyRow.first().text.isNull());
+
+    const RemoteIMGroupMessage groupMessage{QStringLiteral("群'🧪"), QStringLiteral("群🙂"), peer,
+        text, large, std::numeric_limits<qint64>::min() + 3, true, true, false};
+    QVERIFY(db.insertGroupMessageIfAbsent(groupMessage));
+    auto groupRows = db.groupMessagesBefore(groupMessage.groupId,
+        std::numeric_limits<qint64>::max(), "~", 1);
+    QCOMPARE(groupRows.size(), 1);
+    QCOMPARE(groupRows.first().text, text);
+    QCOMPARE(groupRows.first().createdAtMillis, large);
+    QCOMPARE(groupRows.first().sequence, groupMessage.sequence);
+    QVERIFY(groupRows.first().fromSelf && groupRows.first().pending && !groupRows.first().failed);
+    db.updateGroupMessageStatus(groupMessage.id, false, true);
+    groupRows = db.groupMessagesBefore(groupMessage.groupId,
+        std::numeric_limits<qint64>::max(), "~", 1);
+    QVERIFY(!groupRows.first().pending && groupRows.first().failed);
+}
+
+void LocalMessageDatabaseTest::rejectsInvalidDatabasePath() {
+    QTemporaryDir dir;
+    LocalMessageDatabase db(dir.path()); // sqlite3 cannot open a directory as a DB file.
+    QVERIFY(!db.isOpen());
+    QVERIFY(!db.createContactGroup("safe"));
+    QVERIFY(db.contactGroups().isEmpty());
+    QVERIFY(db.loadRecentMessages("peer", 1).isEmpty());
+}
+
+void LocalMessageDatabaseTest::cascadeFailureRollsBackBothDeletes() {
+    QTemporaryDir dir;
+    const QString path = dir.filePath("messages.db");
+    LocalMessageDatabase db(path);
+    db.upsertContact({"peer", "Peer"});
+    QVERIFY(db.insertMessageIfAbsent(makeTextMessage("keep", "peer", "me",
+        RemoteIMMessageDirection::Incoming, 1, "keep me"), "peer"));
+    SqlFixture raw(path);
+    QVERIFY(raw.exec("CREATE TRIGGER reject_delete BEFORE DELETE ON contacts "
+                     "BEGIN SELECT RAISE(ABORT, 'fixture rejects second delete'); END"));
+    db.removeContactCascade("peer");
+    QCOMPARE(db.loadRecentMessages("peer", 10).size(), 1);
+    QCOMPARE(raw.integer("SELECT COUNT(*) FROM contacts"), qint64(1));
+    QVERIFY(raw.exec("DROP TRIGGER reject_delete"));
+    db.removeContactCascade("peer");
+    QCOMPARE(raw.integer("SELECT COUNT(*) FROM contacts"), qint64(0));
+    QCOMPARE(raw.integer("SELECT COUNT(*) FROM messages"), qint64(0));
+}
+
+void LocalMessageDatabaseTest::adoptionFailureKeepsTemporaryMessages() {
+    QTemporaryDir dir;
+    const QString path = dir.filePath("messages.db");
+    LocalMessageDatabase db(path);
+    QVERIFY(db.insertMessageIfAbsent(makeTextMessage("temporary", "me", "peer",
+        RemoteIMMessageDirection::Outgoing, 1, "keep until acknowledged"), "peer"));
+    SqlFixture raw(path);
+    QVERIFY(raw.exec("CREATE TRIGGER reject_adoption BEFORE UPDATE OF id ON messages "
+                     "BEGIN SELECT RAISE(ABORT, 'fixture rejects id change'); END"));
+    db.adoptMessageId("temporary", "stable");
+    auto rows = db.loadRecentMessages("peer", 10);
+    QCOMPARE(rows.size(), 1);
+    QCOMPARE(rows.first().id, QStringLiteral("temporary"));
+    QVERIFY(raw.exec("DROP TRIGGER reject_adoption"));
+    db.adoptMessageId("temporary", "stable");
+    rows = db.loadRecentMessages("peer", 10);
+    QCOMPARE(rows.size(), 1);
+    QCOMPARE(rows.first().id, QStringLiteral("stable"));
+}
+
+void LocalMessageDatabaseTest::groupAdoptionFailureKeepsTemporaryMessages() {
+    QTemporaryDir dir;
+    const QString path = dir.filePath("messages.db");
+    LocalMessageDatabase db(path);
+    const RemoteIMGroupMessage temporary{"temp", "group", "me", "keep", 1, 0, true, true, false};
+    QVERIFY(db.insertGroupMessageIfAbsent(temporary));
+    SqlFixture raw(path);
+    QVERIFY(raw.exec("CREATE TRIGGER reject_adoption BEFORE UPDATE OF id ON im_group_messages "
+                     "BEGIN SELECT RAISE(ABORT, 'fixture rejects group id change'); END"));
+    db.adoptGroupMessageId("temp", "stable", 20, 20000000000000001LL);
+    auto rows = db.groupMessagesBefore("group", 30, "~", 10);
+    QCOMPARE(rows.size(), 1);
+    QCOMPARE(rows.first().id, QStringLiteral("temp"));
+    QCOMPARE(rows.first().createdAtMillis, qint64(1));
+    QVERIFY(rows.first().pending);
+    QVERIFY(raw.exec("DROP TRIGGER reject_adoption"));
+    db.adoptGroupMessageId("temp", "stable", 20, 20000000000000001LL);
+    rows = db.groupMessagesBefore("group", 30, "~", 10);
+    QCOMPARE(rows.size(), 1);
+    QCOMPARE(rows.first().id, QStringLiteral("stable"));
+    QCOMPARE(rows.first().createdAtMillis, qint64(20));
+    QCOMPARE(rows.first().sequence, qint64(20000000000000001LL));
+    QVERIFY(!rows.first().pending);
+    QVERIFY(db.insertGroupMessageIfAbsent(temporary));
+    db.adoptGroupMessageId("temp", "stable", 25, 99);
+    QCOMPARE(db.groupMessageCount("group"), 1);
+    rows = db.groupMessagesBefore("group", 30, "~", 10);
+    QCOMPARE(rows.first().sequence, qint64(20000000000000001LL));
+}
+
+void LocalMessageDatabaseTest::groupStepFailuresRollBackMembers() {
+    QTemporaryDir dir;
+    const QString path = dir.filePath("messages.db");
+    LocalMessageDatabase db(path);
+    db.upsertContact({"peer", "Peer"});
+    QVERIFY(db.createContactGroup("old"));
+    db.setContactGroup("peer", "old");
+    SqlFixture raw(path);
+    QVERIFY(raw.exec("CREATE TRIGGER reject_move BEFORE UPDATE OF group_name ON contacts "
+                     "BEGIN SELECT RAISE(ABORT, 'fixture rejects move'); END"));
+    QVERIFY(!db.renameContactGroup("old", "new"));
+    QCOMPARE(db.contactGroups(), QStringList({"old"}));
+    QCOMPARE(groupOf(db, "peer"), QStringLiteral("old"));
+    QVERIFY(raw.exec("DROP TRIGGER reject_move"));
+    QVERIFY(raw.exec("CREATE TRIGGER reject_drop BEFORE DELETE ON contact_groups "
+                     "BEGIN SELECT RAISE(ABORT, 'fixture rejects group delete'); END"));
+    db.deleteContactGroup("old");
+    QCOMPARE(db.contactGroups(), QStringList({"old"}));
+    QCOMPARE(groupOf(db, "peer"), QStringLiteral("old"));
+    QVERIFY(raw.exec("DROP TRIGGER reject_drop"));
+    QVERIFY(db.renameContactGroup("old", "new"));
+    QCOMPARE(groupOf(db, "peer"), QStringLiteral("new"));
+}
+
+void LocalMessageDatabaseTest::commitFailureRollsBackAndKeepsConnectionUsable() {
+    QTemporaryDir dir;
+    const QString path = dir.filePath("messages.db");
+    LocalMessageDatabase db(path);
+    db.upsertContact({"peer", "Peer"});
+    QVERIFY(db.createContactGroup("old"));
+    db.setContactGroup("peer", "old");
+    // A child process holds the SHARED lock: the Qt baseline driver and our
+    // vendored sqlite library must contend through the OS, not two SQLite copies
+    // whose per-process POSIX-lock bookkeeping cannot coordinate with each other.
+    QProcess reader;
+    reader.start(QCoreApplication::applicationFilePath(), {QStringLiteral("--hold-storage-read-lock"), path});
+    const auto releaseReader = qScopeGuard([&] {
+        if (reader.state() != QProcess::NotRunning) {
+            reader.write("\n");
+            reader.closeWriteChannel();
+            reader.waitForFinished(5000);
+        }
+    });
+    QVERIFY(reader.waitForStarted(5000));
+    QVERIFY(reader.waitForReadyRead(5000));
+    QCOMPARE(reader.readLine().trimmed(), QByteArray("locked"));
+    QElapsedTimer elapsed;
+    elapsed.start();
+    QVERIFY(!db.renameContactGroup("old", "new"));
+    // Match the old QSQLITE driver's 5000 ms busy timeout, rather than silently
+    // switching the native implementation to immediate SQLITE_BUSY failures.
+    QVERIFY(elapsed.elapsed() >= 4500);
+    QVERIFY(elapsed.elapsed() < 15000);
+    QCOMPARE(db.contactGroups(), QStringList({"old"}));
+    QCOMPARE(groupOf(db, "peer"), QStringLiteral("old"));
+    reader.write("\n");
+    reader.closeWriteChannel();
+    QVERIFY(reader.waitForFinished(5000));
+    QCOMPARE(reader.exitCode(), 0);
+    QVERIFY(db.createContactGroup("after-failed-commit"));
+    QVERIFY(db.renameContactGroup("old", "new"));
+    QCOMPARE(groupOf(db, "peer"), QStringLiteral("new"));
+}
+
+void LocalMessageDatabaseTest::failedMigrationPreservesOldSchema() {
+    QTemporaryDir dir;
+    const QString path = dir.filePath("legacy.db");
+    SqlFixture raw(path);
+    QVERIFY(raw.exec("CREATE TABLE contacts(user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL)"));
+    QVERIFY(raw.exec("INSERT INTO contacts VALUES('legacy', '旧联系人🙂')"));
+    // The last CREATE INDEX must fail on this view, after all earlier DDL has
+    // already run. The old contact row and original two-column schema must survive.
+    QVERIFY(raw.exec("CREATE VIEW im_group_messages AS SELECT 'blocked' AS id"));
+    {
+        LocalMessageDatabase rejected(path);
+        QVERIFY(!rejected.isOpen());
+        QVERIFY(!rejected.createContactGroup("must-not-write"));
+    }
+    QSet<QString> columns;
+    QVERIFY(raw.columnTexts("PRAGMA table_info(contacts)", 1, columns));
+    QCOMPARE(columns, QSet<QString>({"user_id", "display_name"}));
+    QCOMPARE(raw.integer("SELECT COUNT(*) FROM contacts WHERE display_name='旧联系人🙂'"), qint64(1));
+    QCOMPARE(raw.integer("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages'"), qint64(0));
+    QVERIFY(raw.exec("DROP VIEW im_group_messages"));
+    LocalMessageDatabase recovered(path);
+    QVERIFY(recovered.isOpen());
+    ChatState state("me");
+    recovered.loadInto(state);
+    QCOMPARE(state.contacts().size(), 1);
+    QCOMPARE(state.contacts().first().displayName, QStringLiteral("旧联系人🙂"));
+}
+
+void LocalMessageDatabaseTest::pagesTimestampTiesAndRejectsEmptyBounds() {
+    QTemporaryDir dir;
+    LocalMessageDatabase db(dir.filePath("messages.db"));
+    for (const QString& id : {QStringLiteral("a"), QStringLiteral("b"), QStringLiteral("c"),
+                             QStringLiteral("d"), QStringLiteral("e")}) {
+        QVERIFY(db.insertMessageIfAbsent(makeTextMessage(id, "peer", "me",
+            RemoteIMMessageDirection::Incoming, 100, id), "peer"));
+    }
+    const auto recent = db.loadRecentMessages("peer", 3);
+    QCOMPARE(recent.size(), 3);
+    QCOMPARE(recent.first().id, QStringLiteral("c"));
+    const auto earlier = db.loadMessagesBefore("peer", 100, "c", 3);
+    QCOMPARE(earlier.size(), 2);
+    QCOMPARE(earlier.first().id, QStringLiteral("a"));
+    QCOMPARE(earlier.last().id, QStringLiteral("b"));
+    QVERIFY(db.loadRecentMessages("peer", 0).isEmpty());
+    QVERIFY(db.loadRecentMessages(QString(), 5).isEmpty());
+    QVERIFY(db.loadMessagesBefore("peer", 100, "a", 5).isEmpty());
+    QVERIFY(db.loadMessagesBefore("peer", 100, "c", -1).isEmpty());
+    db.updateMessageTime("a", 0);
+    db.updateMessageTime("b", -1);
+    QCOMPARE(db.loadRecentMessages("peer", 5).first().createdAtMillis, qint64(100));
+    db.updateMessageTime("a", 20000000000000001LL);
+    QCOMPARE(db.loadRecentMessages("peer", 5).last().createdAtMillis, qint64(20000000000000001LL));
+    db.removeMessagesForPeer("peer");
+    QVERIFY(db.loadRecentMessages("peer", 5).isEmpty());
+}
+
+int main(int argc, char** argv) {
+    QCoreApplication application(argc, argv);
+    if (argc == 3 && QByteArray(argv[1]) == "--hold-storage-read-lock") {
+        SqlFixture reader(application.arguments().at(2));
+        if (!reader.exec("BEGIN") || !reader.exec("SELECT * FROM contact_groups")) return 2;
+        std::puts("locked");
+        std::fflush(stdout);
+        std::getc(stdin);
+        return reader.exec("ROLLBACK") ? 0 : 3;
+    }
+    LocalMessageDatabaseTest test;
+    return QTest::qExec(&test, argc, argv);
+}
 #include "LocalMessageDatabaseTest.moc"

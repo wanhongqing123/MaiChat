@@ -2,7 +2,6 @@
 #pragma once
 
 #include <QByteArray>
-#include <QNetworkProxy>
 #include <QString>
 #include <QUrl>
 
@@ -15,15 +14,17 @@ struct DesktopCurlAttachmentResult {
     Status status = Status::NetworkError;
     int transferCode = 0;
     qint64 bytes = 0;
-    bool ok() const { return status == Status::Downloaded; }
+    bool ok() const {
+        return status == Status::Downloaded;
+    }
 };
 
 class DesktopCurlAttachmentDownload final {
 public:
     // The caller runs this synchronous operation off the UI thread. A nonempty CA PEM is
     // used by local TLS tests; the production path uses the bundled trust roots on macOS.
-    static DesktopCurlAttachmentResult perform(
-        const QUrl& url, const QString& targetPath, qint64 maximumBytes,
-        const QByteArray& certificatePem, const QNetworkProxy& proxy,
-        const std::shared_ptr<MaiDownloadCancel>& canceled);
+    // Proxy discovery is performed here on this worker, including every redirect.
+    static DesktopCurlAttachmentResult perform(const QUrl& url, const QString& targetPath, qint64 maximumBytes,
+                                               const QByteArray& certificatePem,
+                                               const std::shared_ptr<MaiDownloadCancel>& canceled);
 };

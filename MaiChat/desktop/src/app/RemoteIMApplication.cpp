@@ -19,8 +19,6 @@
 #include <QFutureWatcher>
 #include <QImageReader>
 #include <QMimeDatabase>
-#include <QNetworkProxyFactory>
-#include <QNetworkProxyQuery>
 #include <QPainter>
 #include <QStandardPaths>
 #include <QtConcurrent/QtConcurrentRun>
@@ -33,6 +31,7 @@
 #include "im/VideoFileMetadata.h"
 #include "remote/RemoteDesktopSignal.h"
 #include "MaiAvatarClient.h"
+#include "MaiSystemProxy.h"
 
 namespace {
 
@@ -42,46 +41,27 @@ struct AvatarUploadOutcome {
 };
 
 struct AvatarProxy {
-    QByteArray url;
-    QByteArray username;
-    QByteArray password;
+    std::string url;
 };
 
-// 只适配系统代理；签名、TLS、边界检查、取消与 PUT 均由三端共享上传核心实现。
-int resolveAvatarProxy(const char *location, void *context, MaiDownloadProxy *result) {
+// 只适配系统代理；共享上传核心在工作线程逐跳调用，失败时拒绝请求，不隐式直连。
+int resolveAvatarProxy(const char* location, void* context, MaiDownloadProxy* result) {
     if (!location || !context || !result) return 0;
-    auto *storage = static_cast<AvatarProxy *>(context);
-    const QUrl url = QUrl::fromEncoded(QByteArray(location));
-    const auto proxies = QNetworkProxyFactory::systemProxyForQuery(QNetworkProxyQuery(url));
-    for (const auto &proxy : proxies) {
-        if (proxy.type() == QNetworkProxy::NoProxy) {
-            result->url_utf8 = "";
-            result->username_utf8 = nullptr;
-            result->password_utf8 = nullptr;
-            return 1;
-        }
-        if (proxy.type() != QNetworkProxy::HttpProxy && proxy.type() != QNetworkProxy::Socks5Proxy)
-            continue;
-        QUrl address;
-        address.setScheme(proxy.type() == QNetworkProxy::HttpProxy ? QStringLiteral("http")
-                                                                   : QStringLiteral("socks5h"));
-        address.setHost(proxy.hostName());
-        address.setPort(proxy.port());
-        storage->url = address.toEncoded();
-        storage->username = proxy.user().toUtf8();
-        storage->password = proxy.password().toUtf8();
-        result->url_utf8 = storage->url.constData();
-        result->username_utf8 = storage->username.constData();
-        result->password_utf8 = storage->password.constData();
-        return 1;
-    }
-    return 0;
+    auto* storage = static_cast<AvatarProxy*>(context);
+    const auto proxy = maiSystemProxyForUrl(location);
+    if (proxy.mode != MaiSystemProxyMode::Direct && proxy.mode != MaiSystemProxyMode::Http &&
+        proxy.mode != MaiSystemProxyMode::Socks5)
+        return 0;
+    storage->url = proxy.url;
+    result->url_utf8 = storage->url.c_str();
+    // curl 从 URL 解码代理凭据；空指针避免覆盖 URL 内已有凭据。
+    result->username_utf8 = nullptr;
+    result->password_utf8 = nullptr;
+    return 1;
 }
 
-AvatarUploadOutcome uploadAvatar(const QString &path,
-                                 const RemoteIMApplication::AvatarAccess &access,
-                                 const QByteArray &caPem,
-                                 const std::shared_ptr<MaiAvatarCancel> &canceled) {
+AvatarUploadOutcome uploadAvatar(const QString& path, const RemoteIMApplication::AvatarAccess& access,
+                                 const QByteArray& caPem, const std::shared_ptr<MaiAvatarCancel>& canceled) {
     const QByteArray bytes = RemoteIMApplication::prepareAvatarJpeg(path);
     if (bytes.isEmpty()) return {{}, QStringLiteral("invalid_image")};
     const QByteArray base = access.mediaBaseUrl.toUtf8();

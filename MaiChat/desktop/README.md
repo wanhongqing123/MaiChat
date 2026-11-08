@@ -1,21 +1,26 @@
 # Desktop IM
 
-Qt5 Widgets based IM client for Windows and macOS.
+Qt 6.12 Widgets based IM client for Windows and macOS.
 
 ## Build
 
 ```bash
-cmake -S MaiChat/desktop -B MaiChat/desktop/build -DCMAKE_PREFIX_PATH=/path/to/qt5
+cmake -S MaiChat/desktop -B MaiChat/desktop/build
 cmake --build MaiChat/desktop/build
 ctest --test-dir MaiChat/desktop/build --output-on-failure
 ```
 
-On local Homebrew macOS setups:
+Qt is built from the pinned shallow source submodules under `qt/`; no system Qt
+SDK is selected. Initialize them once:
 
 ```bash
-cmake -S MaiChat/desktop -B MaiChat/desktop/build -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/qt@5
-cmake --build MaiChat/desktop/build
+git submodule update --init --depth 1 -- MaiChat/desktop/qt
 ```
+
+The first CMake configure builds the required shared Qt modules, without upstream
+examples/tests, into the fixed `qt/.build/<platform>-<architecture>` cache.
+Subsequent configures reuse the same SDK. CMake 3.25+, Python 3.10+, Ninja,
+macOS 14.4+ / MSVC 2022 are required; see [Qt source provenance](qt/UPSTREAM.md).
 
 ## Run
 
@@ -82,8 +87,8 @@ and model tool calls:
   screen. Password fields, locked screens and invisible windows are excluded. On macOS,
   grant Screen & System Audio Recording and Accessibility to the running MaiChat App.
 
-The browser uses Chrome or Edge; installing Qt WebSockets is required when building the
-Desktop App. Windows packages must include `Qt5WebSockets.dll`.
+The browser uses Chrome or Edge. CDP uses the shared WebSocket++ transport;
+HTTP requests use curl and native system proxy lookup. Qt supplies UI only.
 Full Access skips prompts for these general tools; billable provider submissions still
 require confirmation.
 
@@ -119,7 +124,6 @@ Windows 重链 `maichat` 目标会先用 `windeployqt` 给 `build/bin` 旁挂 Qt
 
 ```bash
 cmake -S MaiChat/desktop -B MaiChat/desktop/build \
-  -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/qt@5 \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build MaiChat/desktop/build --target maichat --config Release
 ```

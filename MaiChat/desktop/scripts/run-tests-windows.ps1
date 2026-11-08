@@ -17,28 +17,23 @@ if (-not (Test-Path -LiteralPath $cachePath)) {
 }
 
 $qtCoreEntry = Get-Content -LiteralPath $cachePath |
-    Where-Object { $_ -match '^Qt5Core_DIR:PATH=' } |
+    Where-Object { $_ -match '^Qt6Core_DIR:PATH=' } |
     Select-Object -First 1
 if (-not $qtCoreEntry) {
-    throw "Qt5Core_DIR is missing from $cachePath"
+    throw "Qt6Core_DIR is missing from $cachePath"
 }
 
 $qtCoreDirectory = $qtCoreEntry.Substring($qtCoreEntry.IndexOf('=') + 1)
 $qtBin = [System.IO.Path]::GetFullPath((Join-Path $qtCoreDirectory "..\..\..\bin"))
-$qtTestDll = Join-Path $qtBin "Qt5Test.dll"
+$qtTestDll = Join-Path $qtBin "Qt6Test.dll"
 if (-not (Test-Path -LiteralPath $qtTestDll)) {
     throw "Qt test runtime not found: $qtTestDll"
 }
 
 # Every desktop test must enter through this script. Launching a test executable directly on
-# Windows can omit Qt's bin directory and display a blocking system error dialog for Qt5Test.dll.
-$qtSslDir = Join-Path $desktopRoot 'vendor\openssl\win64'
-foreach ($name in 'libssl-1_1-x64.dll', 'libcrypto-1_1-x64.dll') {
-    if (-not (Test-Path -LiteralPath (Join-Path $qtSslDir $name))) {
-        throw "Qt SSL test runtime not found: $name"
-    }
-}
-$env:PATH = "$qtBin;$qtSslDir;$env:PATH"
+# Windows can omit Qt's bin directory and display a blocking system error dialog for Qt6Test.dll.
+# Network fixtures use the shared curl/OpenSSL backend; Qt supplies UI runtime only.
+$env:PATH = "$qtBin;$env:PATH"
 
 # Missing runtime DLLs and native crashes must be reported to the console, never as a modal system
 # dialog that blocks an unattended test run.

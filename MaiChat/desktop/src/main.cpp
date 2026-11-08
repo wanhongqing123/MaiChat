@@ -42,34 +42,16 @@ QString messageDatabasePath(const QString& userId) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    // High-DPI 支持：必须在构造 QApplication 之前设置，否则平台插件初始化时读不到。
-    // 不开启时，Qt5 在 Windows 上以逻辑分辨率绘制、再由系统按位图放大，
-    // 在 125%/150%/200% 缩放的显示器上文字与边框会发虚（低分辨率观感）。
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    // PassThrough 保留 1.5 这类分数缩放因子，避免被取整成 1x/2x 造成布局突变或再次模糊。
+    // Qt 6 默认启用高 DPI；保留分数缩放，避免 150% 等比例被取整。
     QApplication::setHighDpiScaleFactorRoundingPolicy(
         Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
-    QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
-    QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
-#endif
 
 #ifdef Q_OS_WIN
-    // 强制 QMediaPlayer 走 Windows Media Foundation。
-    //
-    // Qt5 在 Windows 上同时带 dsengine（DirectShow）和 wmfengine（WMF）两个后端，
-    // 默认可能挑中 DirectShow——而 DirectShow 没有内置 H.264/AAC 解码器，播放
-    // 手机录的 mp4 会失败：日志里是 DirectShowPlayerService::doRender 报
-    // 0x80040266（VFW_E_UNSUPPORTED_STREAM），界面上只有一块黑屏。
-    // 必须在构造 QApplication 之前设置，插件选择发生在那之前。
-    if (qEnvironmentVariableIsEmpty("QT_MULTIMEDIA_PREFERRED_PLUGINS")) {
-        qputenv("QT_MULTIMEDIA_PREFERRED_PLUGINS", "windowsmediafoundation");
-    }
-
     // 文字渲染走 DirectWrite，替换默认的 GDI 字体引擎。GDI 引擎只有 8 级
     // 灰度抗锯齿，且在 150% 这类分数缩放下按浮点位置摆放字形（横向无
     // hinting），黑字明显发灰发糊；DirectWrite 的栅格化质量对齐 Electron/
-    // 原生控件。仍然不是 ClearType 次像素渲染（Qt5 raster 管线做不到），
-    // 但已是 Qt5 下能拿到的最好结果。注意：QSS 里的 font-weight 也别超过
+    // 原生控件。仍然不是 ClearType 次像素渲染（当前 raster 管线做不到），
+    // 保持 Qt 6 的 DirectWrite 字体路径。注意：QSS 里的 font-weight 也别超过
     // 700——微软雅黑/Segoe UI 的真字面只到 Bold(700)，更高会触发合成假粗体，
     // 笔画交汇处断裂、粗细不均。必须与上面一样在 QApplication 之前设置。
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) {

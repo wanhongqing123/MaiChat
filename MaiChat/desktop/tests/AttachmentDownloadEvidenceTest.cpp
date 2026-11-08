@@ -5,17 +5,11 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QHash>
-#include <QHostAddress>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QPointer>
 #include <QSignalSpy>
-#include <QSslCertificate>
-#include <QSslKey>
-#include <QSslSocket>
 #include <QStandardPaths>
-#include <QTcpServer>
 #include <QTest>
 #include <QUrl>
 #include <QUuid>
@@ -25,6 +19,18 @@
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 #include <openssl/x509v3.h>
+
+#include <condition_variable>
+#include <mutex>
+#include <set>
+#include <thread>
+
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
+#include <httplib.h>
+
+#include "MaiThread.h"
 
 #include <memory>
 #include <utility>
@@ -40,7 +46,9 @@ namespace {
 // 只实现下载用例真正要用到的部分；其余返回成功即可。
 class FakeApi final : public TimSdkApi {
 public:
-    int init(quint64, const QString&) override { return 0; }
+    int init(quint64, const QString&) override {
+        return 0;
+    }
     void uninit() override {}
     int login(const QString&, const QString&, TimSdkCompletion completion) override {
         if (completion) completion(0, QString(), QString());
@@ -77,9 +85,15 @@ public:
     void addReceiveMessageCallback(TimSdkReceiveMessagesCallback callback) override {
         receive = std::move(callback);
     }
-    void removeReceiveMessageCallback() override { receive = nullptr; }
-    bool isReady() const override { return true; }
-    QString diagnosticError() const override { return {}; }
+    void removeReceiveMessageCallback() override {
+        receive = nullptr;
+    }
+    bool isReady() const override {
+        return true;
+    }
+    QString diagnosticError() const override {
+        return {};
+    }
 
     void deliver(const QJsonArray& messages) {
         if (receive) {
@@ -95,8 +109,7 @@ struct TestIdentity {
 };
 
 // 证书和私钥仅在测试进程内生成，不把测试私钥提交到仓库。
-TestIdentity createTestIdentity()
-{
+TestIdentity createTestIdentity() {
     using KeyContext = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
     using Key = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
     using Certificate = std::unique_ptr<X509, decltype(&X509_free)>;
@@ -104,7 +117,8 @@ TestIdentity createTestIdentity()
     using Buffer = std::unique_ptr<BIO, decltype(&BIO_free)>;
     KeyContext context(EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr), EVP_PKEY_CTX_free);
     if (!context || EVP_PKEY_keygen_init(context.get()) <= 0 ||
-        EVP_PKEY_CTX_set_rsa_keygen_bits(context.get(), 2048) <= 0) return {};
+        EVP_PKEY_CTX_set_rsa_keygen_bits(context.get(), 2048) <= 0)
+        return {};
     EVP_PKEY* rawKey = nullptr;
     if (EVP_PKEY_keygen(context.get(), &rawKey) <= 0) return {};
     Key key(rawKey, EVP_PKEY_free);
@@ -113,28 +127,29 @@ TestIdentity createTestIdentity()
         ASN1_INTEGER_set(X509_get_serialNumber(certificate.get()), 1) <= 0 ||
         !X509_gmtime_adj(X509_get_notBefore(certificate.get()), -3600) ||
         !X509_gmtime_adj(X509_get_notAfter(certificate.get()), 24 * 3600) ||
-        X509_set_pubkey(certificate.get(), key.get()) <= 0) return {};
+        X509_set_pubkey(certificate.get(), key.get()) <= 0)
+        return {};
     X509_NAME* name = X509_get_subject_name(certificate.get());
-    if (!name || X509_NAME_add_entry_by_txt(
-            name, "CN", MBSTRING_ASC,
-            reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0) <= 0 ||
-        X509_set_issuer_name(certificate.get(), name) <= 0) return {};
+    if (!name ||
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("localhost"), -1,
+                                   -1, 0) <= 0 ||
+        X509_set_issuer_name(certificate.get(), name) <= 0)
+        return {};
     X509V3_CTX extensionContext;
     X509V3_set_ctx(&extensionContext, certificate.get(), certificate.get(), nullptr, nullptr, 0);
     const auto addExtension = [&](int type, const char* value) {
         QByteArray writableValue(value);
-        Extension extension(
-            X509V3_EXT_conf_nid(nullptr, &extensionContext, type, writableValue.data()),
-            X509_EXTENSION_free);
+        Extension extension(X509V3_EXT_conf_nid(nullptr, &extensionContext, type, writableValue.data()),
+                            X509_EXTENSION_free);
         return extension && X509_add_ext(certificate.get(), extension.get(), -1) > 0;
     };
     if (!addExtension(NID_basic_constraints, "critical,CA:TRUE") ||
         !addExtension(NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1") ||
-        X509_sign(certificate.get(), key.get(), EVP_sha256()) <= 0) return {};
+        X509_sign(certificate.get(), key.get(), EVP_sha256()) <= 0)
+        return {};
     Buffer certificateBuffer(BIO_new(BIO_s_mem()), BIO_free);
     Buffer keyBuffer(BIO_new(BIO_s_mem()), BIO_free);
-    if (!certificateBuffer || !keyBuffer ||
-        PEM_write_bio_X509(certificateBuffer.get(), certificate.get()) <= 0 ||
+    if (!certificateBuffer || !keyBuffer || PEM_write_bio_X509(certificateBuffer.get(), certificate.get()) <= 0 ||
         PEM_write_bio_PrivateKey(keyBuffer.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr) <= 0)
         return {};
     BUF_MEM* certificateBytes = nullptr;
@@ -147,10 +162,31 @@ TestIdentity createTestIdentity()
 }
 
 // 本地 HTTPS 服务让测试真正经过 TLS、HTTP、libcurl 与文件缓存全链路。
-class LocalHttpsServer final : public QTcpServer {
+class LocalHttpsServer final {
 public:
-    LocalHttpsServer(QByteArray certificate, QByteArray privateKey)
-        : certificate_(std::move(certificate)), privateKey_(std::move(privateKey)) {}
+    LocalHttpsServer(QByteArray certificate, QByteArray privateKey) {
+        using Buffer = std::unique_ptr<BIO, decltype(&BIO_free)>;
+        using Certificate = std::unique_ptr<X509, decltype(&X509_free)>;
+        using Key = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+        Buffer certificateInput(BIO_new_mem_buf(certificate.constData(), certificate.size()), BIO_free);
+        Buffer keyInput(BIO_new_mem_buf(privateKey.constData(), privateKey.size()), BIO_free);
+        Certificate parsedCertificate(
+            certificateInput ? PEM_read_bio_X509(certificateInput.get(), nullptr, nullptr, nullptr) : nullptr,
+            X509_free);
+        Key parsedKey(keyInput ? PEM_read_bio_PrivateKey(keyInput.get(), nullptr, nullptr, nullptr) : nullptr,
+                      EVP_PKEY_free);
+        if (parsedCertificate && parsedKey)
+            server_ = std::make_unique<httplib::SSLServer>(parsedCertificate.get(), parsedKey.get());
+    }
+    ~LocalHttpsServer() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopped_ = true;
+        }
+        changed_.notify_all();
+        if (server_) server_->stop();
+        if (worker_.joinable()) worker_.join();
+    }
 
     struct Route {
         QByteArray body;
@@ -160,128 +196,112 @@ public:
         qint64 advertisedLength = -1;
     };
 
-    bool start() { return listen(QHostAddress::LocalHost); }
-    void addRoute(const QString& path, Route route) { routes_.insert(path, std::move(route)); }
-    QString url(const QString& name) const {
-        return QStringLiteral("https://localhost:%1/%2").arg(serverPort()).arg(name);
-    }
-    int requestCount(const QString& path) const { return requests_.count(path); }
-    void release(const QString& path) {
-        for (const Pending& pending : pending_) {
-            if (pending.path == path && pending.socket && pending.socket->state() == QAbstractSocket::ConnectedState)
-                respond(pending.socket, path);
-        }
-        pending_.clear();
-    }
-
-protected:
-    void incomingConnection(qintptr descriptor) override {
-        auto* socket = new QSslSocket(this);
-        socket->setLocalCertificate(QSslCertificate(certificate_, QSsl::Pem));
-        socket->setPrivateKey(QSslKey(privateKey_, QSsl::Rsa, QSsl::Pem));
-        socket->setPeerVerifyMode(QSslSocket::VerifyNone);
-        if (!socket->setSocketDescriptor(descriptor)) {
-            delete socket;
-            return;
-        }
-        connect(socket, &QSslSocket::readyRead, this, [this, socket] {
-            QByteArray& incoming = buffers_[socket];
-            incoming += socket->readAll();
-            const int end = incoming.indexOf("\r\n\r\n");
-            if (end < 0) return;
-            const QByteArray firstLine = incoming.left(incoming.indexOf("\r\n"));
-            incoming.clear();
-            const QList<QByteArray> parts = firstLine.split(' ');
-            if (parts.size() < 2 || parts.at(0) != "GET") {
-                socket->disconnectFromHost();
-                return;
+    bool start() {
+        if (!server_ || !server_->is_valid()) return false;
+        server_->Get("/.*", [this](const httplib::Request& request, httplib::Response& response) {
+            const auto path = QString::fromStdString(request.path);
+            Route route;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                requests_.append(path);
+                route = routes_.value(path, Route{QByteArray("missing"), 404});
+                // A held request is released by the UI test or fixture teardown.
+                // No Qt event loop is required by the listener or TLS exchange.
+                if (route.holdOpen) changed_.wait(lock, [&] { return stopped_ || released_.count(path) != 0; });
+                if (stopped_) return;
             }
-            const QString path = QString::fromUtf8(parts.at(1));
-            requests_.append(path);
-            if (routes_.value(path).holdOpen) {
-                pending_.append({socket, path});
-                return;
+            response.status = route.status;
+            response.set_header("Connection", "close");
+            if (route.headersOnly) {
+                const auto length = route.advertisedLength >= 0 ? route.advertisedLength : route.body.size();
+                response.set_content_provider(size_t(length), "application/octet-stream",
+                                              [this](size_t, size_t, httplib::DataSink&) {
+                                                  // Send the advertised header first and hold back every
+                                                  // body byte, so the limit test still proves header rejection.
+                                                  std::unique_lock<std::mutex> lock(mutex_);
+                                                  changed_.wait(lock, [&] { return stopped_; });
+                                                  return false;
+                                              });
+            } else {
+                response.set_content(route.body.toStdString(), "application/octet-stream");
             }
-            respond(socket, path);
         });
-        socket->startServerEncryption();
+        port_ = server_->bind_to_any_port("127.0.0.1");
+        if (port_ <= 0) return false;
+        worker_ = std::thread([this] {
+            MaiThread::setCurrentName("mai-https-fixture");
+            server_->listen_after_bind();
+        });
+        return true;
+    }
+    void addRoute(const QString& path, Route route) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        routes_.insert(path, std::move(route));
+    }
+    QString url(const QString& name) const {
+        return QStringLiteral("https://localhost:%1/%2").arg(port_).arg(name);
+    }
+    int requestCount(const QString& path) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return int(requests_.count(path));
+    }
+    void release(const QString& path) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_.insert(path);
+        }
+        changed_.notify_all();
     }
 
 private:
-    struct Pending {
-        QPointer<QSslSocket> socket;
-        QString path;
-    };
-
-    void respond(QSslSocket* socket, const QString& path) {
-        const Route route = routes_.value(path, Route{QByteArray("missing"), 404});
-        const qint64 length = route.advertisedLength >= 0 ? route.advertisedLength : route.body.size();
-        const QByteArray header =
-            QStringLiteral("HTTP/1.1 %1 %2\r\nContent-Length: %3\r\n"
-                           "Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n")
-                .arg(route.status)
-                .arg(route.status == 200 ? QStringLiteral("OK") : QStringLiteral("Failure"))
-                .arg(length)
-                .toUtf8();
-        socket->write(header);
-        if (!route.headersOnly) socket->write(route.body);
-        socket->flush();
-        if (!route.headersOnly) socket->disconnectFromHost();
-    }
-
-    QByteArray certificate_;
-    QByteArray privateKey_;
-    QHash<QSslSocket*, QByteArray> buffers_;
+    std::unique_ptr<httplib::SSLServer> server_;
+    std::thread worker_;
+    int port_ = 0;
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    bool stopped_ = false;
     QHash<QString, Route> routes_;
     QList<QString> requests_;
-    QList<Pending> pending_;
+    std::set<QString> released_;
 };
 
-QString cachePathFor(const QString& url, const QString& fileName)
-{
+QString cachePathFor(const QString& url, const QString& fileName) {
     const QByteArray hash = QCryptographicHash::hash(url.toUtf8(), QCryptographicHash::Sha1).toHex();
     QString suffix = QFileInfo(fileName).suffix();
     if (suffix.isEmpty()) suffix = QStringLiteral("bin");
     QString root = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir dir(root);
     dir.mkpath(QStringLiteral("RemoteIMFiles"));
-    return QDir(dir.filePath(QStringLiteral("RemoteIMFiles")))
-        .filePath(QString::fromUtf8(hash) + "." + suffix);
+    return QDir(dir.filePath(QStringLiteral("RemoteIMFiles"))).filePath(QString::fromUtf8(hash) + "." + suffix);
 }
 
-QJsonArray fileMessage(const QString& url, const QString& fileName, const QString& msgId)
-{
+QJsonArray fileMessage(const QString& url, const QString& fileName, const QString& msgId) {
     return QJsonArray{QJsonObject{
         {QStringLiteral("message_is_from_self"), false},
         {QStringLiteral("message_sender"), QStringLiteral("phone-user")},
         {QStringLiteral("message_msg_id"), msgId},
         {QStringLiteral("message_server_time"), 1700000000},
-        {QStringLiteral("message_elem_array"),
-         QJsonArray{QJsonObject{{QStringLiteral("elem_type"), 4},
-                                {QStringLiteral("file_elem_url"), url},
-                                {QStringLiteral("file_elem_file_name"), fileName},
-                                {QStringLiteral("file_elem_file_size"), 4}}}}}};
+        {QStringLiteral("message_elem_array"), QJsonArray{QJsonObject{{QStringLiteral("elem_type"), 4},
+                                                                      {QStringLiteral("file_elem_url"), url},
+                                                                      {QStringLiteral("file_elem_file_name"), fileName},
+                                                                      {QStringLiteral("file_elem_file_size"), 4}}}}}};
 }
 
-QJsonArray mediaMessage(const QJsonObject& elem, const QString& msgId)
-{
-    return QJsonArray{QJsonObject{
-        {QStringLiteral("message_is_from_self"), false},
-        {QStringLiteral("message_sender"), QStringLiteral("phone-user")},
-        {QStringLiteral("message_msg_id"), msgId},
-        {QStringLiteral("message_server_time"), 1700000000},
-        {QStringLiteral("message_elem_array"), QJsonArray{elem}}}};
+QJsonArray mediaMessage(const QJsonObject& elem, const QString& msgId) {
+    return QJsonArray{QJsonObject{{QStringLiteral("message_is_from_self"), false},
+                                  {QStringLiteral("message_sender"), QStringLiteral("phone-user")},
+                                  {QStringLiteral("message_msg_id"), msgId},
+                                  {QStringLiteral("message_server_time"), 1700000000},
+                                  {QStringLiteral("message_elem_array"), QJsonArray{elem}}}};
 }
 
-QByteArray readFile(const QString& path)
-{
+QByteArray readFile(const QString& path) {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) return {};
     return file.readAll();
 }
 
-bool hasPhase(const QList<AttachmentEvent>& events, AttachmentPhase phase)
-{
+bool hasPhase(const QList<AttachmentEvent>& events, AttachmentPhase phase) {
     for (const AttachmentEvent& e : events) {
         if (e.phase == phase) return true;
     }
@@ -309,8 +329,7 @@ private:
     TestIdentity identity_;
 };
 
-void AttachmentDownloadEvidenceTest::initTestCase()
-{
+void AttachmentDownloadEvidenceTest::initTestCase() {
     // 别往真实用户目录里写缓存。
     QStandardPaths::setTestModeEnabled(true);
     identity_ = createTestIdentity();
@@ -318,8 +337,7 @@ void AttachmentDownloadEvidenceTest::initTestCase()
     QVERIFY(!identity_.privateKey.isEmpty());
 }
 
-void AttachmentDownloadEvidenceTest::normalDownloadIsRecordedAsDeliveredAndReachesTheConversation()
-{
+void AttachmentDownloadEvidenceTest::normalDownloadIsRecordedAsDeliveredAndReachesTheConversation() {
     LocalHttpsServer server(identity_.certificate, identity_.privateKey);
     QVERIFY(server.start());
     auto api = std::make_unique<FakeApi>();
@@ -329,16 +347,17 @@ void AttachmentDownloadEvidenceTest::normalDownloadIsRecordedAsDeliveredAndReach
     client.connectToService(123456, QStringLiteral("desktop-user"), QStringLiteral("sig"), nullptr);
     QSignalSpy live(&client, &RemoteIMClient::liveMessagesReceived);
 
-    const QString name = QStringLiteral("remote-diagnostics-"
-                                        "65de6748-3a4e-4d08-8ffd-bc78e1804ff9.json");
+    const QString name = QStringLiteral(
+        "remote-diagnostics-"
+        "65de6748-3a4e-4d08-8ffd-bc78e1804ff9.json");
     const QString url = server.url(name);
     server.addRoute(QStringLiteral("/") + name, {QByteArray("{\"a\":1}")});
     QFile::remove(cachePathFor(url, name));
     fake->deliver(fileMessage(url, name, QStringLiteral("m-normal")));
 
     QVERIFY(live.wait(5000));
-    const auto events = client.diagnosticsEvidence().exportFor(
-        AccountTag{123456ULL, QStringLiteral("desktop-user")}, QStringLiteral("phone-user"));
+    const auto events = client.diagnosticsEvidence().exportFor(AccountTag{123456ULL, QStringLiteral("desktop-user")},
+                                                               QStringLiteral("phone-user"));
     QVERIFY(hasPhase(events, AttachmentPhase::DownloadStarted));
     QVERIFY(hasPhase(events, AttachmentPhase::Delivered));
     QVERIFY(!hasPhase(events, AttachmentPhase::DownloadFailed));
@@ -353,14 +372,13 @@ void AttachmentDownloadEvidenceTest::normalDownloadIsRecordedAsDeliveredAndReach
     fake->deliver(fileMessage(url, name, QStringLiteral("m-cached")));
     QTRY_COMPARE_WITH_TIMEOUT(live.count(), 2, 5000);
     QCOMPARE(server.requestCount(QStringLiteral("/") + name), 1);
-    QVERIFY(hasPhase(client.diagnosticsEvidence().exportFor(
-                         AccountTag{123456ULL, QStringLiteral("desktop-user")}, QStringLiteral("phone-user")),
+    QVERIFY(hasPhase(client.diagnosticsEvidence().exportFor(AccountTag{123456ULL, QStringLiteral("desktop-user")},
+                                                            QStringLiteral("phone-user")),
                      AttachmentPhase::CacheHit));
 }
 
 // 下载失败时消息**整条不出现**——所以只能靠这条记录知道附件卡在哪。
-void AttachmentDownloadEvidenceTest::networkFailureIsRecordedAndNoMessageAppears()
-{
+void AttachmentDownloadEvidenceTest::networkFailureIsRecordedAndNoMessageAppears() {
     LocalHttpsServer server(identity_.certificate, identity_.privateKey);
     QVERIFY(server.start());
     auto api = std::make_unique<FakeApi>();
@@ -377,17 +395,15 @@ void AttachmentDownloadEvidenceTest::networkFailureIsRecordedAndNoMessageAppears
     fake->deliver(fileMessage(url, QStringLiteral("missing.json"), QStringLiteral("m-net")));
 
     QTRY_VERIFY_WITH_TIMEOUT(
-        hasPhase(client.diagnosticsEvidence().exportFor(
-                     AccountTag{123456ULL, QStringLiteral("desktop-user")},
-                     QStringLiteral("phone-user")),
+        hasPhase(client.diagnosticsEvidence().exportFor(AccountTag{123456ULL, QStringLiteral("desktop-user")},
+                                                        QStringLiteral("phone-user")),
                  AttachmentPhase::DownloadFailed),
         5000);
     QCOMPARE(live.count(), 0);
     QCOMPARE(server.requestCount(QStringLiteral("/missing.json")), 1);
 }
 
-void AttachmentDownloadEvidenceTest::untrustedCertificateIsRejected()
-{
+void AttachmentDownloadEvidenceTest::untrustedCertificateIsRejected() {
     LocalHttpsServer server(identity_.certificate, identity_.privateKey);
     QVERIFY(server.start());
     server.addRoute(QStringLiteral("/untrusted.json"), {QByteArray("data")});
@@ -403,9 +419,9 @@ void AttachmentDownloadEvidenceTest::untrustedCertificateIsRejected()
     fake->deliver(fileMessage(url, QStringLiteral("untrusted.json"), QStringLiteral("m-cert")));
 
     QTRY_VERIFY_WITH_TIMEOUT(
-        hasPhase(client.diagnosticsEvidence().exportFor(
-                     AccountTag{123456ULL, QStringLiteral("desktop-user")},
-                     QStringLiteral("phone-user")), AttachmentPhase::DownloadFailed),
+        hasPhase(client.diagnosticsEvidence().exportFor(AccountTag{123456ULL, QStringLiteral("desktop-user")},
+                                                        QStringLiteral("phone-user")),
+                 AttachmentPhase::DownloadFailed),
         5000);
     QCOMPARE(live.count(), 0);
     QVERIFY(!QFileInfo::exists(target));
@@ -413,8 +429,7 @@ void AttachmentDownloadEvidenceTest::untrustedCertificateIsRejected()
 
 // 下载成功但存不住：不能记成 Delivered，否则下游会把「我们没存住」
 // 误判成「对端给了个坏报告」，归错因、排查方向全偏。
-void AttachmentDownloadEvidenceTest::writeFailureIsNotRecordedAsDelivered()
-{
+void AttachmentDownloadEvidenceTest::writeFailureIsNotRecordedAsDelivered() {
     LocalHttpsServer server(identity_.certificate, identity_.privateKey);
     QVERIFY(server.start());
     auto api = std::make_unique<FakeApi>();
@@ -444,13 +459,12 @@ void AttachmentDownloadEvidenceTest::writeFailureIsNotRecordedAsDelivered()
     fake->deliver(fileMessage(url, name, QStringLiteral("m-write")));
 
     QTRY_VERIFY_WITH_TIMEOUT(
-        hasPhase(client.diagnosticsEvidence().exportFor(
-                     AccountTag{123456ULL, QStringLiteral("desktop-user")},
-                     QStringLiteral("phone-user")),
+        hasPhase(client.diagnosticsEvidence().exportFor(AccountTag{123456ULL, QStringLiteral("desktop-user")},
+                                                        QStringLiteral("phone-user")),
                  AttachmentPhase::WriteFailed),
         5000);
-    const auto events = client.diagnosticsEvidence().exportFor(
-        AccountTag{123456ULL, QStringLiteral("desktop-user")}, QStringLiteral("phone-user"));
+    const auto events = client.diagnosticsEvidence().exportFor(AccountTag{123456ULL, QStringLiteral("desktop-user")},
+                                                               QStringLiteral("phone-user"));
     QVERIFY(!hasPhase(events, AttachmentPhase::Delivered));
     QVERIFY(!hasPhase(events, AttachmentPhase::CacheHit));
     QCOMPARE(live.count(), 0);
@@ -459,16 +473,17 @@ void AttachmentDownloadEvidenceTest::writeFailureIsNotRecordedAsDelivered()
     QDir().mkpath(cacheDir);
 }
 
-void AttachmentDownloadEvidenceTest::directoryAtCachePathIsNotAFileHit()
-{
+void AttachmentDownloadEvidenceTest::directoryAtCachePathIsNotAFileHit() {
     LocalHttpsServer server(identity_.certificate, identity_.privateKey);
     QVERIFY(server.start());
-    auto api = std::make_unique<FakeApi>(); auto* fake = api.get();
+    auto api = std::make_unique<FakeApi>();
+    auto* fake = api.get();
     TimSdkRemoteIMClient client(std::move(api), nullptr, identity_.certificate);
     client.connectToService(123456, QStringLiteral("desktop-user"), QStringLiteral("sig"), nullptr);
     QSignalSpy live(&client, &RemoteIMClient::liveMessagesReceived);
     const auto name = QStringLiteral("directory-not-file.json");
-    const auto url = server.url(name); const auto target = cachePathFor(url, name);
+    const auto url = server.url(name);
+    const auto target = cachePathFor(url, name);
     server.addRoute(QStringLiteral("/") + name, {QByteArray("{\"a\":1}")});
     QVERIFY(QDir().mkdir(target));
     fake->deliver(fileMessage(url, name, QStringLiteral("m-directory")));
@@ -477,14 +492,14 @@ void AttachmentDownloadEvidenceTest::directoryAtCachePathIsNotAFileHit()
         hasPhase(client.diagnosticsEvidence().exportFor(account, "phone-user"), AttachmentPhase::WriteFailed), 1500);
     const auto events = client.diagnosticsEvidence().exportFor(account, "phone-user");
     QVERIFY(!hasPhase(events, AttachmentPhase::CacheHit));
-    QVERIFY(!hasPhase(events, AttachmentPhase::Delivered)); QCOMPARE(live.count(), 0);
+    QVERIFY(!hasPhase(events, AttachmentPhase::Delivered));
+    QCOMPARE(live.count(), 0);
     QVERIFY(QDir().rmdir(target));
 }
 
 // 甲开始下载 -> 切到乙 -> 甲完成。文件确实下完了，但它不能进乙的会话，
 // 也不能记成「已交付」——那会让乙的报告里出现甲的数据。
-void AttachmentDownloadEvidenceTest::lateDownloadAfterAnAccountSwitchIsDroppedNotDelivered()
-{
+void AttachmentDownloadEvidenceTest::lateDownloadAfterAnAccountSwitchIsDroppedNotDelivered() {
     LocalHttpsServer server(identity_.certificate, identity_.privateKey);
     QVERIFY(server.start());
     auto api = std::make_unique<FakeApi>();
@@ -501,10 +516,9 @@ void AttachmentDownloadEvidenceTest::lateDownloadAfterAnAccountSwitchIsDroppedNo
     fake->deliver(fileMessage(url, name, QStringLiteral("m-late")));
 
     const AccountTag alice{123456ULL, QStringLiteral("alice")};
-    QTRY_VERIFY_WITH_TIMEOUT(
-        hasPhase(client.diagnosticsEvidence().exportFor(alice, QStringLiteral("phone-user")),
-                 AttachmentPhase::DownloadStarted),
-        5000);
+    QTRY_VERIFY_WITH_TIMEOUT(hasPhase(client.diagnosticsEvidence().exportFor(alice, QStringLiteral("phone-user")),
+                                      AttachmentPhase::DownloadStarted),
+                             5000);
     QTRY_COMPARE_WITH_TIMEOUT(server.requestCount(QStringLiteral("/late.json")), 1, 5000);
 
     // 换账号，然后让下载完成。
@@ -512,10 +526,9 @@ void AttachmentDownloadEvidenceTest::lateDownloadAfterAnAccountSwitchIsDroppedNo
     server.release(QStringLiteral("/late.json"));
 
     const AccountTag bob{123456ULL, QStringLiteral("bob")};
-    QTRY_VERIFY_WITH_TIMEOUT(
-        hasPhase(client.diagnosticsEvidence().exportFor(alice, QStringLiteral("phone-user")),
-                 AttachmentPhase::DroppedForAccountSwitch),
-        5000);
+    QTRY_VERIFY_WITH_TIMEOUT(hasPhase(client.diagnosticsEvidence().exportFor(alice, QStringLiteral("phone-user")),
+                                      AttachmentPhase::DroppedForAccountSwitch),
+                             5000);
 
     const auto aliceEvents = client.diagnosticsEvidence().exportFor(alice, QStringLiteral("phone-user"));
     QVERIFY2(!hasPhase(aliceEvents, AttachmentPhase::Delivered),
@@ -526,13 +539,11 @@ void AttachmentDownloadEvidenceTest::lateDownloadAfterAnAccountSwitchIsDroppedNo
     QVERIFY(!QFileInfo::exists(cachePathFor(url, name)));
 }
 
-void AttachmentDownloadEvidenceTest::oversizedResponseIsRejectedBeforeBody()
-{
+void AttachmentDownloadEvidenceTest::oversizedResponseIsRejectedBeforeBody() {
     LocalHttpsServer server(identity_.certificate, identity_.privateKey);
     QVERIFY(server.start());
     constexpr qint64 kFileLimit = 512LL * 1024 * 1024;
-    server.addRoute(QStringLiteral("/oversized.bin"),
-                    {QByteArray(), 200, false, true, kFileLimit + 1});
+    server.addRoute(QStringLiteral("/oversized.bin"), {QByteArray(), 200, false, true, kFileLimit + 1});
     auto api = std::make_unique<FakeApi>();
     FakeApi* fake = api.get();
     TimSdkRemoteIMClient client(std::move(api), nullptr, identity_.certificate);
@@ -546,24 +557,22 @@ void AttachmentDownloadEvidenceTest::oversizedResponseIsRejectedBeforeBody()
 
     // 服务端只发响应头且保持连接，不送正文；通过说明上限在下载前生效。
     QTRY_VERIFY_WITH_TIMEOUT(
-        hasPhase(client.diagnosticsEvidence().exportFor(
-                     AccountTag{123456ULL, QStringLiteral("desktop-user")},
-                     QStringLiteral("phone-user")), AttachmentPhase::DownloadFailed),
+        hasPhase(client.diagnosticsEvidence().exportFor(AccountTag{123456ULL, QStringLiteral("desktop-user")},
+                                                        QStringLiteral("phone-user")),
+                 AttachmentPhase::DownloadFailed),
         5000);
     QCOMPARE(server.requestCount(QStringLiteral("/oversized.bin")), 1);
     QCOMPARE(live.count(), 0);
     QVERIFY(!QFileInfo::exists(target));
 }
 
-void AttachmentDownloadEvidenceTest::destroyingClientCancelsHeldDownload()
-{
+void AttachmentDownloadEvidenceTest::destroyingClientCancelsHeldDownload() {
     LocalHttpsServer server(identity_.certificate, identity_.privateKey);
     QVERIFY(server.start());
     server.addRoute(QStringLiteral("/cancel.bin"), {QByteArray("late data"), 200, true});
     auto api = std::make_unique<FakeApi>();
     FakeApi* fake = api.get();
-    auto client = std::make_unique<TimSdkRemoteIMClient>(std::move(api), nullptr,
-                                                          identity_.certificate);
+    auto client = std::make_unique<TimSdkRemoteIMClient>(std::move(api), nullptr, identity_.certificate);
     client->connectToService(123456, QStringLiteral("desktop-user"), QStringLiteral("sig"), nullptr);
     const QString url = server.url(QStringLiteral("cancel.bin"));
     const QString target = cachePathFor(url, QStringLiteral("cancel.bin"));
@@ -578,8 +587,7 @@ void AttachmentDownloadEvidenceTest::destroyingClientCancelsHeldDownload()
     QVERIFY(!QFileInfo::exists(target));
 }
 
-void AttachmentDownloadEvidenceTest::imageVoiceAndVideoCoverDownloadOverTls()
-{
+void AttachmentDownloadEvidenceTest::imageVoiceAndVideoCoverDownloadOverTls() {
     LocalHttpsServer server(identity_.certificate, identity_.privateKey);
     QVERIFY(server.start());
     const QString suffix = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -597,32 +605,32 @@ void AttachmentDownloadEvidenceTest::imageVoiceAndVideoCoverDownloadOverTls()
     client.connectToService(123456, QStringLiteral("desktop-user"), QStringLiteral("sig"), nullptr);
     QSignalSpy live(&client, &RemoteIMClient::liveMessagesReceived);
 
-    fake->deliver(mediaMessage(
-        {{QStringLiteral("elem_type"), 1},
-         {QStringLiteral("image_elem_large_url"), server.url(imageName)},
-         {QStringLiteral("image_elem_orig_pic_width"), 4},
-         {QStringLiteral("image_elem_orig_pic_height"), 3}}, QStringLiteral("m-image")));
+    fake->deliver(mediaMessage({{QStringLiteral("elem_type"), 1},
+                                {QStringLiteral("image_elem_large_url"), server.url(imageName)},
+                                {QStringLiteral("image_elem_orig_pic_width"), 4},
+                                {QStringLiteral("image_elem_orig_pic_height"), 3}},
+                               QStringLiteral("m-image")));
     QTRY_COMPARE_WITH_TIMEOUT(live.count(), 1, 5000);
     const auto images = qvariant_cast<QList<RemoteIMMessage>>(live.at(0).at(0));
     QCOMPARE(images.size(), 1);
     QVERIFY(images.first().hasImage);
     QCOMPARE(readFile(images.first().image.localPath), QByteArray("image-bytes"));
 
-    fake->deliver(mediaMessage(
-        {{QStringLiteral("elem_type"), 2},
-         {QStringLiteral("sound_elem_url"), server.url(voiceName)},
-         {QStringLiteral("sound_elem_file_time"), 3}}, QStringLiteral("m-voice")));
+    fake->deliver(mediaMessage({{QStringLiteral("elem_type"), 2},
+                                {QStringLiteral("sound_elem_url"), server.url(voiceName)},
+                                {QStringLiteral("sound_elem_file_time"), 3}},
+                               QStringLiteral("m-voice")));
     QTRY_COMPARE_WITH_TIMEOUT(live.count(), 2, 5000);
     const auto voices = qvariant_cast<QList<RemoteIMMessage>>(live.at(1).at(0));
     QCOMPARE(voices.size(), 1);
     QVERIFY(voices.first().hasVoice);
     QCOMPARE(readFile(voices.first().voice.localPath), QByteArray("voice-bytes"));
 
-    fake->deliver(mediaMessage(
-        {{QStringLiteral("elem_type"), 9},
-         {QStringLiteral("video_elem_video_url"), server.url(videoName)},
-         {QStringLiteral("video_elem_image_url"), server.url(coverName)},
-         {QStringLiteral("video_elem_video_duration"), 4}}, QStringLiteral("m-video")));
+    fake->deliver(mediaMessage({{QStringLiteral("elem_type"), 9},
+                                {QStringLiteral("video_elem_video_url"), server.url(videoName)},
+                                {QStringLiteral("video_elem_image_url"), server.url(coverName)},
+                                {QStringLiteral("video_elem_video_duration"), 4}},
+                               QStringLiteral("m-video")));
     QTRY_COMPARE_WITH_TIMEOUT(live.count(), 3, 5000);
     const auto videos = qvariant_cast<QList<RemoteIMMessage>>(live.at(2).at(0));
     QCOMPARE(videos.size(), 1);

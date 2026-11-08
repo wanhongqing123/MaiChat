@@ -274,11 +274,12 @@ private:
 
             QTextLayout::FormatRange range;
             range.start = start;
-            range.length = span.text.size();
+            // QTextLayout 的范围仍使用 int；Qt 6 的 QString 长度改为了 qsizetype。
+            range.length = static_cast<int>(span.text.size());
             range.format = format;
             formats.push_back(range);
 
-            if (isLink) links.push_back({start, span.text.size(), span.href});
+            if (isLink) links.push_back({start, range.length, span.href});
         }
 
         // 附注接在最后一段的最后面，和正文同一个 QTextLayout——

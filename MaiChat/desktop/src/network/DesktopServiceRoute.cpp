@@ -2,8 +2,8 @@
 
 #include <QMutex>
 #include <QMutexLocker>
-#include <QNetworkProxyFactory>
-#include <QNetworkProxyQuery>
+
+#include "MaiSystemProxy.h"
 
 namespace {
 
@@ -26,8 +26,7 @@ bool sameRoute(const DesktopServiceProxyRoute& left, const DesktopServiceProxyRo
     return left.mode == right.mode && left.proxyUrl == right.proxyUrl;
 }
 
-void remember(const DesktopServiceProxyRoute& configured,
-              const DesktopServiceProxyRoute& selected) {
+void remember(const DesktopServiceProxyRoute& configured, const DesktopServiceProxyRoute& selected) {
     QMutexLocker lock(&routeMutex());
     configuredRoute() = configured;
     selectedRoute() = selected;
@@ -36,31 +35,24 @@ void remember(const DesktopServiceProxyRoute& configured,
 }  // namespace
 
 DesktopServiceProxyRoute DesktopServiceRoute::configured(const QUrl& url) {
-    const auto proxies = QNetworkProxyFactory::systemProxyForQuery(QNetworkProxyQuery(url));
-    if (proxies.isEmpty() || proxies.first().type() == QNetworkProxy::NoProxy ||
-        proxies.first().type() == QNetworkProxy::DefaultProxy) {
+    const auto proxy = maiSystemProxyForUrl(url.toEncoded().toStdString());
+    if (proxy.mode == MaiSystemProxyMode::Direct) {
         return {DesktopServiceProxyMode::Direct, {}};
     }
-    const QNetworkProxy proxy = proxies.first();
-    if (proxy.type() != QNetworkProxy::HttpProxy || proxy.hostName().isEmpty() ||
-        proxy.port() == 0) {
+    if (proxy.mode == MaiSystemProxyMode::Unavailable) return {DesktopServiceProxyMode::Unavailable, {}};
+    // The shared WebSocket transport supports plain HTTP CONNECT proxies only.
+    // Preserve credentials for its separate proxy authentication setup.
+    if (proxy.mode != MaiSystemProxyMode::Http || proxy.url.rfind("http://", 0) != 0) {
         return {DesktopServiceProxyMode::Unsupported, {}};
     }
-    QUrl address;
-    address.setScheme(QStringLiteral("http"));
-    address.setHost(proxy.hostName());
-    address.setPort(proxy.port());
-    address.setPath(QStringLiteral("/"));
-    return {DesktopServiceProxyMode::HttpProxy, address.toString(QUrl::FullyEncoded)};
+    return {DesktopServiceProxyMode::HttpProxy, QString::fromStdString(proxy.url)};
 }
 
-DesktopServiceProxyRoute DesktopServiceRoute::choose(
-    const DesktopServiceProxyRoute& configured, const Probe& probe) {
+DesktopServiceProxyRoute DesktopServiceRoute::choose(const DesktopServiceProxyRoute& configured, const Probe& probe) {
     if (configured.mode != DesktopServiceProxyMode::HttpProxy) return configured;
     {
         QMutexLocker lock(&routeMutex());
-        if (sameRoute(configuredRoute(), configured) &&
-            selectedRoute().mode != DesktopServiceProxyMode::Unavailable) {
+        if (sameRoute(configuredRoute(), configured) && selectedRoute().mode != DesktopServiceProxyMode::Unavailable) {
             return selectedRoute();
         }
     }
@@ -78,11 +70,9 @@ DesktopServiceProxyRoute DesktopServiceRoute::choose(
     return configured;
 }
 
-DesktopServiceProxyRoute DesktopServiceRoute::current(
-    const DesktopServiceProxyRoute& configured) {
+DesktopServiceProxyRoute DesktopServiceRoute::current(const DesktopServiceProxyRoute& configured) {
     QMutexLocker lock(&routeMutex());
-    if (sameRoute(configuredRoute(), configured) &&
-        selectedRoute().mode != DesktopServiceProxyMode::Unavailable) {
+    if (sameRoute(configuredRoute(), configured) && selectedRoute().mode != DesktopServiceProxyMode::Unavailable) {
         return selectedRoute();
     }
     return configured;

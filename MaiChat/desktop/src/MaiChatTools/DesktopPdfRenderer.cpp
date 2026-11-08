@@ -6,6 +6,7 @@
 #include <QFont>
 #include <QMarginsF>
 #include <QPdfWriter>
+#include <QPageSize>
 #include <QTextDocument>
 #include <QUrl>
 #include <QVariant>
@@ -45,7 +46,7 @@ MaiToolResult renderDesktopPdf(const std::string &htmlUtf8,
         MaiErrorCode::InvalidInput,
         "PDF output could not be created as a new file");
   QPdfWriter writer(&output);
-  writer.setPageSize(QPagedPaintDevice::A4);
+  writer.setPageSize(QPageSize(QPageSize::A4));
   writer.setPageMargins(QMarginsF(18, 18, 18, 18));
   writer.setResolution(144);
   document.print(&writer);

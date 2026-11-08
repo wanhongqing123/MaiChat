@@ -9,6 +9,7 @@
 #include "ui/MaiVideoVolumePopup.h"
 #include "MaiCloudVod.h"
 #include "ui/DesktopMusicPlayerDialog.h"
+#include "ui/DesktopAudioPlayback.h"
 
 #include <QCloseEvent>
 #include <QWidgetAction>
@@ -232,6 +233,10 @@ QString bundledResource(const QString& relative) {
 // 构造时一次性连接播放器、进度条和窗口关闭行为；关闭需停止解码与音频后再销毁界面。
 MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent, int64_t startPositionUs)
     : QDialog(parent), path_(path), startPositionUs_(std::max<int64_t>(0, startPositionUs)) {
+    // 音频卡通过普通播放桥停止当前视频；回调不借用本窗口，关闭后仍不会留下悬空 owner。
+    DesktopAudioPlayback::setVideoStopHandler([] {
+        if (auto video = MaiFfplayVideoDialog::activeDialog()) video->close();
+    });
     // 所有桌面入口共用自绘窗口；原生 surface 只负责画面，不再决定播放器外观。
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
     setWindowTitle(QFileInfo(path).fileName());
@@ -1081,6 +1086,7 @@ bool MaiFfplayVideoDialog::startPlayback() {
     }
     errorLabel_->hide();
     setBuffering(bool(cloudSource_));
+    DesktopAudioPlayback::prepareVideoPlayback();
     DesktopMusicPlayerDialog::closeActive();
     if (!sActiveDialog.isNull() && sActiveDialog != this) sActiveDialog->close();
     const QString backend = bundledResource(QStringLiteral("/../Frameworks/libmaiagent_obs_metal.so"));

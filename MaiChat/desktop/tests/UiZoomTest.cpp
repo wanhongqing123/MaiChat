@@ -1,6 +1,7 @@
 // 文件作用：验证桌面 UI 缩放比例边界和像素尺寸转换。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QtTest/QtTest>
+#include <QApplication>
 #include <QLineEdit>
 #include <QFontDatabase>
 #include <QFontInfo>
@@ -41,20 +42,25 @@ void UiZoomTest::fontFamilyUpdatesExistingControlsAndMarkdown() {
     editor.setText(QStringLiteral("Hello 你好 draft"));
     editor.setSelection(1, 4);
     UiZoom::setStyle(&editor, QStringLiteral("font-size: @body;"));
+    // 正常界面先完成控件初始化；Qt 6 对隐藏顶层控件排队交付字体变化事件。
+    editor.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&editor));
     MarkdownLabel markdown;
     markdown.setMarkdown(QStringLiteral("# Heading\n\nHello 你好 body `code`"));
     for (const QString& id : {QStringLiteral("notoSans"), QStringLiteral("notoSerif"), QStringLiteral("system")}) {
         QVERIFY(UiZoom::availableFontFamilyIds().contains(id));
         UiZoom::setFontFamilyId(id);
         UiZoom::refreshText();
+        // 系统默认携带平台字体和 CJK 回退列表；让 Qt 独立解析同一完整请求，
+        // 不能用仅首个 family 的请求替代它，也不能在字体事件交付前读取旧值。
+        QFont expectedFont;
+        expectedFont.setFamilies(UiZoom::fontFamilies());
+        expectedFont.setPixelSize(UiZoom::textPixels(UiZoom::TextRole::Body));
+        QTRY_COMPARE(QFontInfo(editor.font()).family(), QFontInfo(expectedFont).family());
         QCOMPARE(editor.text(), QStringLiteral("Hello 你好 draft"));
         QCOMPARE(editor.selectionStart(), 1);
         QCOMPARE(editor.selectedText().size(), 4);
         QCOMPARE(markdown.theme().bodyFamily, UiZoom::fontFamilies().first());
-        // Windows 同一字体可能以 SimSun / 宋体等别名返回；比较实际解析字体，仍检出未刷新为所选字体。
-        QFont expectedFont = editor.font();
-        expectedFont.setFamily(UiZoom::fontFamilies().first());
-        QCOMPARE(QFontInfo(editor.font()).family(), QFontInfo(expectedFont).family());
         QCOMPARE(markdown.theme().bodyPixelSize, 16);
         QVERIFY(markdown.theme().codeFamily != markdown.theme().bodyFamily);
     }

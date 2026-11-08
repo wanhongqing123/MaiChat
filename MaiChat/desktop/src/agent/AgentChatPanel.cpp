@@ -4,6 +4,7 @@
 #include "agent/AgentChatPanel.h"
 
 #include "ui/DesktopCameraDialog.h"
+#include "ui/DesktopAudioPlayback.h"
 #include "ui/DesktopMusicPlayerDialog.h"
 #include "MaiVideoCircleClient.h"
 
@@ -29,7 +30,6 @@
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QLabel>
-#include <QMediaPlayer>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
@@ -2438,8 +2438,11 @@ void AgentChatPanel::saveConversationPage() {
     flushAnswers();
     // Retaining a page must not retain audible playback. The player keeps its
     // position, and returning to this conversation never starts it implicitly.
-    for (QMediaPlayer* player : runtime_->view->viewport()->findChildren<QMediaPlayer*>())
-        if (player->state() == QMediaPlayer::PlayingState) player->pause();
+    for (auto* player : runtime_->view->viewport()->findChildren<DesktopAudioPlayback*>()) {
+        if (player->state() == DesktopAudioPlayback::State::Playing ||
+            player->state() == DesktopAudioPlayback::State::Starting)
+            player->pause();
+    }
     if (!runtime_->sessionId.isEmpty()) {
         MaiSession existing;
         const bool exists = runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), existing);
@@ -3259,12 +3262,17 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
             duration->setAlignment(Qt::AlignCenter);
             duration->setGeometry(186, 107, 46, 22);
             duration->setStyleSheet(QStringLiteral("color:white;background:rgba(0,0,0,175);border-radius:7px;"));
-            auto* metadata = new QMediaPlayer(preview);
-            connect(metadata, &QMediaPlayer::durationChanged, duration, [duration](qint64 milliseconds) {
-                const qint64 seconds = qMax<qint64>(0, milliseconds / 1000);
+            // 普通 avformat 探测在工作线程执行；卡片展示时长不会打开播放器或音频设备。
+            auto* metadata = new DesktopAudioPlayback(preview);
+            metadata->setObjectName(QStringLiteral("agentMediaVideoMetadata"));
+            duration->setObjectName(QStringLiteral("agentMediaVideoDuration"));
+            connect(metadata, &DesktopAudioPlayback::durationChanged, duration, [duration](qint64 microseconds) {
+                const qint64 seconds = qMax<qint64>(0, microseconds / 1000000);
                 duration->setText(QStringLiteral("%1:%2").arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0')));
             });
-            metadata->setMedia(QUrl::fromLocalFile(path));
+            connect(metadata, &DesktopAudioPlayback::errorOccurred, duration,
+                    [duration](const QString& error) { duration->setToolTip(error); });
+            metadata->setSource(path);
         }
         layout->addWidget(preview);
     } else {
@@ -3302,23 +3310,33 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
         labels->addWidget(name);
         labels->addWidget(duration);
         row->addLayout(labels, 1);
-        auto* audio = new QMediaPlayer(card);
-        audio->setMedia(QUrl::fromLocalFile(path));
+        auto* audio = new DesktopAudioPlayback(card);
+        audio->setObjectName(QStringLiteral("agentInlineAudioPlayback"));
         connect(audioCard, &QPushButton::clicked, audio, [audio] {
-            if (audio->state() == QMediaPlayer::PlayingState)
+            if (audio->state() == DesktopAudioPlayback::State::Playing ||
+                audio->state() == DesktopAudioPlayback::State::Starting)
                 audio->pause();
             else
                 audio->play();
         });
-        connect(audio, &QMediaPlayer::stateChanged, audioCard, [audioCard, symbol](QMediaPlayer::State state) {
-            const bool playing = state == QMediaPlayer::PlayingState;
-            symbol->setText(playing ? QStringLiteral("Ⅱ") : QStringLiteral("▶"));
-            audioCard->setAccessibleName(playing ? QStringLiteral("暂停音频") : QStringLiteral("播放音频"));
-        });
-        connect(audio, &QMediaPlayer::durationChanged, duration, [duration](qint64 milliseconds) {
-            const qint64 seconds = qMax<qint64>(0, milliseconds / 1000);
+        connect(audio, &DesktopAudioPlayback::stateChanged, audioCard,
+                [audioCard, symbol](DesktopAudioPlayback::State state) {
+                    const bool playing =
+                        state == DesktopAudioPlayback::State::Playing || state == DesktopAudioPlayback::State::Starting;
+                    symbol->setText(playing ? QStringLiteral("Ⅱ") : QStringLiteral("▶"));
+                    if (state != DesktopAudioPlayback::State::Error) audioCard->setToolTip({});
+                    audioCard->setAccessibleName(playing ? QStringLiteral("暂停音频")
+                                                 : state == DesktopAudioPlayback::State::Ended
+                                                     ? QStringLiteral("重播音频")
+                                                     : QStringLiteral("播放音频"));
+                });
+        connect(audio, &DesktopAudioPlayback::durationChanged, duration, [duration](qint64 microseconds) {
+            const qint64 seconds = qMax<qint64>(0, microseconds / 1000000);
             duration->setText(QStringLiteral("%1:%2").arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0')));
         });
+        connect(audio, &DesktopAudioPlayback::errorOccurred, audioCard,
+                [audioCard](const QString& error) { audioCard->setToolTip(error); });
+        audio->setSource(path);
         layout->addWidget(audioCard);
     }
     const QString caption = artifact.value(QStringLiteral("caption")).toString();
@@ -3429,19 +3447,30 @@ void AgentChatPanel::appendTextMediaCards(const QString& messageId, const QStrin
                     appendNotice(QStringLiteral("文件已被移动或删除。"), true);
             });
         } else {
-            auto* audio = new QMediaPlayer(button);
-            audio->setMedia(QUrl::fromLocalFile(mention.path));
+            auto* audio = new DesktopAudioPlayback(button);
+            audio->setObjectName(QStringLiteral("agentInlineAudioPlayback"));
             connect(button, &QPushButton::clicked, audio, [audio] {
-                if (audio->state() == QMediaPlayer::PlayingState)
+                if (audio->state() == DesktopAudioPlayback::State::Playing ||
+                    audio->state() == DesktopAudioPlayback::State::Starting)
                     audio->pause();
                 else
                     audio->play();
             });
-            connect(audio, &QMediaPlayer::stateChanged, button,
-                    [button, name = QFileInfo(mention.path).fileName()](QMediaPlayer::State state) {
-                        button->setText(QStringLiteral("%1  %2").arg(
-                            state == QMediaPlayer::PlayingState ? QStringLiteral("❚❚") : QStringLiteral("♫"), name));
+            connect(audio, &DesktopAudioPlayback::stateChanged, button,
+                    [button, name = QFileInfo(mention.path).fileName()](DesktopAudioPlayback::State state) {
+                        const bool playing = state == DesktopAudioPlayback::State::Playing ||
+                                             state == DesktopAudioPlayback::State::Starting;
+                        button->setText(
+                            QStringLiteral("%1  %2").arg(playing ? QStringLiteral("❚❚") : QStringLiteral("♫"), name));
+                        if (state != DesktopAudioPlayback::State::Error) button->setToolTip({});
+                        button->setAccessibleName(playing ? QStringLiteral("暂停音频")
+                                                  : state == DesktopAudioPlayback::State::Ended
+                                                      ? QStringLiteral("重播音频")
+                                                      : QStringLiteral("播放音频"));
                     });
+            connect(audio, &DesktopAudioPlayback::errorOccurred, button,
+                    [button](const QString& error) { button->setToolTip(error); });
+            audio->setSource(mention.path);
         }
         runtime_->view->addWidget(id, button);
         recordMessageItem(messageId, id);

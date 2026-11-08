@@ -82,7 +82,7 @@ void PdfPreviewDialogTest::opensPdfInsideApplication() {
   QVERIFY(pageLabel != nullptr);
   QVERIFY(pageImage != nullptr);
   QTRY_COMPARE_WITH_TIMEOUT(pageLabel->text(), QStringLiteral("1 / 1"), 10000);
-  QVERIFY(pageImage->pixmap() != nullptr && !pageImage->pixmap()->isNull());
+  QVERIFY(!pageImage->pixmap().isNull());
   dialog->close();
 }
 

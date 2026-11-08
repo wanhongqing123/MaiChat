@@ -12,6 +12,7 @@
 class QCloseEvent;
 
 class ImagePreviewDialog final : public QDialog {
+    Q_OBJECT
 public:
     explicit ImagePreviewDialog(const QString& imagePath, QWidget* parent = nullptr);
     explicit ImagePreviewDialog(const QPixmap& image, QWidget* parent = nullptr);

@@ -4,6 +4,7 @@
 #include "ui/ComposerResizeSplitter.h"
 
 #include <QEvent>
+#include <QEnterEvent>
 #include <QHideEvent>
 #include <QMouseEvent>
 #include <QSplitterHandle>
@@ -17,7 +18,7 @@ class ComposerResizeHandle final : public QSplitterHandle {
     }
 
   protected:
-    void enterEvent(QEvent *event) override {
+    void enterEvent(QEnterEvent *event) override {
         setCursor(Qt::SplitVCursor);
         QSplitterHandle::enterEvent(event);
     }

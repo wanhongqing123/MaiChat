@@ -4,7 +4,7 @@
 #include <QAbstractButton>
 #include <QAction>
 #include <QComboBox>
-#include <QCameraInfo>
+#include "MaiCameraCapture.h"
 #include <QDir>
 #include <QHBoxLayout>
 #include <QFileInfo>
@@ -2393,8 +2393,8 @@ void MaiFfplayVideoDialogTest::agentCameraOpensAndClosesWithoutWaitingForShutter
     if (qEnvironmentVariable("MAICHAT_TEST_REAL_CAMERA_CANCEL") != QStringLiteral("1"))
         QSKIP("Real camera test must be explicitly enabled");
     if (qEnvironmentVariable("QT_QPA_PLATFORM") == QStringLiteral("offscreen"))
-        QSKIP("Qt camera preview requires the normal desktop platform plugin");
-    if (QCameraInfo::availableCameras().isEmpty()) QSKIP("No camera is connected");
+        QSKIP("Native camera preview requires the normal desktop platform plugin");
+    if (!MaiCameraCapture::isAvailable()) QSKIP("No camera is connected");
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
     QWidget host;
@@ -2445,8 +2445,8 @@ void MaiFfplayVideoDialogTest::cameraActivePreviewClosesOnAgentCancellation() {
     if (qEnvironmentVariable("MAICHAT_TEST_REAL_CAMERA_CANCEL") != QStringLiteral("1"))
         QSKIP("Real camera test must be explicitly enabled");
     if (qEnvironmentVariable("QT_QPA_PLATFORM") == QStringLiteral("offscreen"))
-        QSKIP("Qt camera preview requires the normal desktop platform plugin");
-    if (QCameraInfo::availableCameras().isEmpty()) QSKIP("No camera is connected");
+        QSKIP("Native camera preview requires the normal desktop platform plugin");
+    if (!MaiCameraCapture::isAvailable()) QSKIP("No camera is connected");
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
     std::atomic<bool> canceled{false};

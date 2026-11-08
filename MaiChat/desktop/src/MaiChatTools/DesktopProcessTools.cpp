@@ -37,8 +37,11 @@ constexpr std::size_t kMaxSessions = 12;
 
 #ifndef Q_OS_WIN
 class GroupedProcess final : public QProcess {
-protected:
-    void setupChildProcess() override { ::setpgid(0, 0); }
+public:
+    GroupedProcess() {
+        // Qt 6 在 fork/exec 间执行此回调；只使用异步信号安全的原生调用。
+        setChildProcessModifier([] { ::setpgid(0, 0); });
+    }
 };
 #else
 using GroupedProcess = QProcess;

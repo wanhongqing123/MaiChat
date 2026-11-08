@@ -1,8 +1,19 @@
 # 文件作用：配置 Qt 桌面端、IM、远程桌面、创作中心与 MaiAgent 的构建目标。
 # 平台 SDK 和可选媒体能力由配置阶段检查；真实编译命令可导出给 clangd。
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.25)
+if(CMAKE_HOST_APPLE)
+  # Keep the application's deployment target aligned with the pinned Qt SDK.
+  if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.4" CACHE STRING "Minimum macOS version" FORCE)
+  elseif(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "14.4")
+    message(FATAL_ERROR "The pinned Qt 6.12 SDK requires macOS 14.4 or later")
+  endif()
+endif()
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
 project(MaiChatDesktop VERSION 2.2.52 LANGUAGES C CXX)
+if(MSVC AND MSVC_VERSION LESS 1930)
+  message(FATAL_ERROR "The source Qt 6 desktop build requires MSVC 2022 or later")
+endif()
 if(MSVC AND CMAKE_CL_SHOWINCLUDES_PREFIX MATCHES "^娉")
   # Some CMake/VS2019 locale combinations double-decode /showIncludes. Ninja then
   # records no header dependencies, so changing a public header leaves stale objects.
@@ -17,6 +28,11 @@ endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(MSVC)
+  # Encoding is shared; dependency targets retain their own conformance and
+  # exception settings (in particular OpenCV's explicit /EHa).
+  add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
+endif()
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
@@ -52,11 +68,8 @@ if(MAICHAT_ENABLE_REMOTE_DESKTOP)
   endif()
 endif()
 
-# Multimedia/MultimediaWidgets：视频消息的播放窗（QMediaPlayer + QVideoWidget）。
-# 注意 QMediaPlayer 的解码后端是插件（plugins/mediaservice 下的 wmfengine/dsengine），
-# 链接通过不代表能播——打包脚本会校验插件是否随包部署。
-find_package(Qt5 REQUIRED COMPONENTS
-  Core Network Sql Widgets Svg Multimedia MultimediaWidgets Concurrent Test WebSockets)
+# 所有桌面目标使用 desktop/qt 的同一份 UI 源码 SDK；网络和媒体使用普通 C++/原生后端。
+include(cmake/MaiChatQt.cmake)
 find_package(ZLIB REQUIRED)
 
 # md4c：CommonMark + GFM 扩展的 Markdown 解析器（与 Qt 内嵌同源，MIT）。
@@ -68,7 +81,7 @@ find_package(ZLIB REQUIRED)
 #
 # 它自带的第三方依赖全在 MaiAgent/third_party 里，**构建过程不下载任何东西**。
 # 和这边的依赖不打架：桌面账号与 MaiAgent 复用同一份 OpenSSL 版 curl；
-# sqlite 是它自己 amalgamation 的一份，这边本来也没有。
+# SQLite 复用核心的 amalgamation；桌面存储不再加载 Qt SQL 驱动。
 #
 # 测试关掉：那是 MaiAgent 自己仓库里跑的事，不该拖慢这边的构建。
 set(MAIAGENT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -315,8 +328,8 @@ endif()
 
 # Markdown 的解析 + 排版 + 绘制。**两端共用这一套**（agent 和 IM）。
 #
-# 单独成库是被依赖方向逼出来的：绘制要 Qt5::Widgets，而 remote_im_core 是
-# Core/Network/Sql 的，给它加 Widgets 会把一批无头测试也拖进去要 QApplication。
+# 单独成库是被依赖方向逼出来的：绘制要 Qt6::Widgets，而 remote_im_core 是
+# Core 的，给它加 Widgets 会把一批无头测试也拖进去要 QApplication。
 # 反过来它又不能放进 remote_im_desktop_ui——maichat_agent 在那一层下面，也要用。
 # 所以放在最底下，谁都能依赖，它谁也不依赖。
 add_library(maichat_markdown
@@ -334,13 +347,13 @@ add_library(maichat_markdown
   src/markdown/MarkdownLabel.cpp
 )
 target_include_directories(maichat_markdown PUBLIC src)
-target_link_libraries(maichat_markdown PUBLIC Qt5::Core Qt5::Gui Qt5::Widgets PRIVATE mai_md4c)
+target_link_libraries(maichat_markdown PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets PRIVATE mai_md4c)
 
 add_library(maichat_pdf_preview STATIC
   src/ui/PdfPreviewDialog.h
   src/ui/PdfPreviewDialog.cpp)
 target_include_directories(maichat_pdf_preview PUBLIC src)
-target_link_libraries(maichat_pdf_preview PUBLIC Qt5::Widgets)
+target_link_libraries(maichat_pdf_preview PUBLIC Qt6::Widgets)
 if(APPLE)
   enable_language(OBJCXX)
   target_sources(maichat_pdf_preview PRIVATE src/ui/PdfPreviewMac.mm)
@@ -349,10 +362,10 @@ if(APPLE)
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
   target_link_libraries(maichat_pdf_preview PRIVATE "-framework Cocoa" "-framework PDFKit")
 elseif(WIN32)
-  find_package(Qt5 REQUIRED COMPONENTS Concurrent)
+  find_package(Qt6 REQUIRED COMPONENTS Concurrent)
   target_sources(maichat_pdf_preview PRIVATE src/ui/PdfPreviewWindows.cpp)
   target_compile_definitions(maichat_pdf_preview PRIVATE MAICHAT_PDF_WINDOWS_NATIVE=1)
-  target_link_libraries(maichat_pdf_preview PRIVATE Qt5::Concurrent windowsapp)
+  target_link_libraries(maichat_pdf_preview PRIVATE Qt6::Concurrent windowsapp)
 endif()
 
 add_subdirectory(../Network "${CMAKE_CURRENT_BINARY_DIR}/maichat_network" EXCLUDE_FROM_ALL)
@@ -433,9 +446,9 @@ add_library(remote_im_core
   src/remote/TrtcNetworkProxyApi.h
 )
 target_include_directories(remote_im_core PUBLIC src)
-target_link_libraries(remote_im_core PUBLIC Qt5::Core Qt5::Network Qt5::Sql ZLIB::ZLIB
+target_link_libraries(remote_im_core PUBLIC Qt6::Core ZLIB::ZLIB
   mai_curl_download
-  PRIVATE mai_md4c Qt5::Concurrent CURL::libcurl)
+  PRIVATE mai_md4c Qt6::Concurrent CURL::libcurl)
 if(APPLE)
   target_link_libraries(remote_im_core PRIVATE
     "-framework ApplicationServices"
@@ -463,7 +476,7 @@ if(WIN32)
     src/network/DesktopServiceRoute.h
     src/network/DesktopServiceRoute.cpp)
   target_include_directories(maichat_desktop_service_route PUBLIC src)
-  target_link_libraries(maichat_desktop_service_route PUBLIC Qt5::Network)
+  target_link_libraries(maichat_desktop_service_route PUBLIC Qt6::Core)
 endif()
 
 add_library(remote_im_desktop_app
@@ -488,10 +501,10 @@ add_library(remote_im_desktop_app
 )
 target_include_directories(remote_im_desktop_app PUBLIC src PRIVATE ../MaiChatTools
   ../../MaiAgent/third_party/nlohmann)
-# Qt5::Gui：视频封面要用 QImage/QPainter 画（并在 Windows 上把系统缩略图的 HBITMAP
+# Qt6::Gui：视频封面要用 QImage/QPainter 画（并在 Windows 上把系统缩略图的 HBITMAP
 # 转成 QImage）。remote_im_core 保持无 GUI 依赖，封面这层留在应用层。
-target_link_libraries(remote_im_desktop_app PUBLIC remote_im_core Qt5::Gui maiagent
-  PRIVATE Qt5::Concurrent CURL::libcurl mai_avatar_client)
+target_link_libraries(remote_im_desktop_app PUBLIC remote_im_core Qt6::Gui maiagent
+  PRIVATE Qt6::Concurrent CURL::libcurl mai_avatar_client)
 if(WIN32)
   # IShellItemImageFactory（资源管理器的缩略图提供程序）取视频首帧。
   target_link_libraries(remote_im_desktop_app PRIVATE shell32 ole32 Advapi32
@@ -535,8 +548,6 @@ add_library(remote_im_desktop_ui
   src/ui/FilePreviewDialog.cpp
   src/ui/ImagePreviewDialog.h
   src/ui/ImagePreviewDialog.cpp
-  src/ui/VideoPreviewDialog.h
-  src/ui/VideoPreviewDialog.cpp
   src/ui/VideoCircleDialog.h
   src/ui/VideoCircleDialog.cpp
   src/ui/CloudDriveDialog.h
@@ -570,9 +581,9 @@ target_include_directories(remote_im_desktop_ui PRIVATE "${MAICHAT_QUIRC_DIR}"
   ../MaiChatTools ../../MaiAgent/third_party/nlohmann)
 target_include_directories(remote_im_desktop_ui PUBLIC src)
 target_link_libraries(remote_im_desktop_ui PUBLIC remote_im_desktop_app remote_im_core
-  maichat_agent Qt5::Widgets Qt5::Svg Qt5::Multimedia Qt5::MultimediaWidgets
+  maichat_agent Qt6::Widgets Qt6::Svg
   maichat_pdf_preview)
-target_link_libraries(remote_im_desktop_ui PRIVATE Qt5::Concurrent CURL::libcurl)
+target_link_libraries(remote_im_desktop_ui PRIVATE Qt6::Concurrent CURL::libcurl)
 target_link_libraries(remote_im_desktop_ui PRIVATE mai_video_circle_client
   mai_cloud_drive_client mai_curl_download mai_cloud_vod)
 if(APPLE AND TARGET maiagent_embedded_fftools)
@@ -605,10 +616,10 @@ endif()
 
 if(APPLE AND TARGET maiagent_embedded_fftools)
   add_executable(MaiImageDecodeTest tests/MaiImageDecodeTest.cpp)
-  target_link_libraries(MaiImageDecodeTest PRIVATE remote_im_desktop_ui Qt5::Gui)
+  target_link_libraries(MaiImageDecodeTest PRIVATE remote_im_desktop_ui Qt6::Gui)
   add_test(NAME MaiImageDecodeTest COMMAND MaiImageDecodeTest)
   add_executable(MaiVideoCircleMarkTest tests/MaiVideoCircleMarkTest.cpp)
-  target_link_libraries(MaiVideoCircleMarkTest PRIVATE remote_im_desktop_ui Qt5::Core)
+  target_link_libraries(MaiVideoCircleMarkTest PRIVATE remote_im_desktop_ui Qt6::Core)
   add_test(NAME MaiVideoCircleMarkTest COMMAND MaiVideoCircleMarkTest
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/video-lifecycle.mp4"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/video-circle-61s.mp4")
@@ -628,7 +639,8 @@ if(TARGET maiagent_obs_metal OR TARGET maiagent_obs_d3d11)
   endif()
 endif()
 
-add_executable(maichat
+# Qt finalization imports the macOS static camera permission plugin from Info.plist.
+qt6_add_executable(maichat
   src/main.cpp
   src/platform/DesktopRemoteIMClientFactory.h
   src/platform/DesktopRemoteIMClientFactory.cpp
@@ -681,8 +693,8 @@ elseif(APPLE)
 endif()
 if(WIN32)
   # GUI 子系统（/SUBSYSTEM:WINDOWS）：不加时 exe 是控制台程序，双击启动会先弹一个
-  # 黑色控制台窗口再出界面。Qt5::Core 会对 WIN32_EXECUTABLE 目标自动链接
-  # Qt5::WinMain（qtmain.lib 提供 WinMain → main 转发），main() 无需改动。
+  # 黑色控制台窗口再出界面。Qt6::Core 会为 WIN32_EXECUTABLE 目标传递
+  # Qt6::EntryPoint（WinMain → main 转发），main() 无需改动。
   set_target_properties(maichat PROPERTIES WIN32_EXECUTABLE TRUE)
   # 应用图标（任务栏/资源管理器/快捷方式）。
   enable_language(RC)
@@ -762,13 +774,13 @@ if(APPLE)
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
     MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/resources/macos/Info.plist.in"
+    # Development bundles find the source SDK; macdeployqt removes that SDK rpath
+    # when assembling the self-contained distribution bundle.
+    BUILD_WITH_INSTALL_RPATH FALSE
+    BUILD_RPATH "@executable_path/../Frameworks;${MAICHAT_QT_PREFIX}/lib"
+    INSTALL_RPATH "@executable_path/../Frameworks"
   )
   if(MAICHAT_TRTC_AVAILABLE)
-    set_target_properties(maichat PROPERTIES
-      BUILD_WITH_INSTALL_RPATH TRUE
-      BUILD_RPATH "@executable_path/../Frameworks"
-      INSTALL_RPATH "@executable_path/../Frameworks"
-    )
     add_custom_command(TARGET maichat POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory
               "$<TARGET_BUNDLE_DIR:maichat>/Contents/Frameworks"
@@ -785,10 +797,6 @@ if(APPLE)
     )
   endif()
   if(TARGET maiagent_obs_metal)
-    set_target_properties(maichat PROPERTIES
-      BUILD_WITH_INSTALL_RPATH TRUE
-      BUILD_RPATH "@executable_path/../Frameworks"
-      INSTALL_RPATH "@executable_path/../Frameworks")
     target_link_libraries(maichat PRIVATE maiagent_graphics)
     add_dependencies(maichat maiagent_obs_metal)
     add_custom_command(TARGET maichat POST_BUILD
@@ -808,7 +816,7 @@ if(APPLE)
               "$<TARGET_BUNDLE_DIR:maichat>/Contents/Resources/MaiAgentGraphics/video_conversion.effect")
   endif()
 endif()
-target_link_libraries(maichat PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core maichat_agent Qt5::Widgets)
+target_link_libraries(maichat PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core maichat_agent Qt6::Widgets)
 if(WIN32 AND MAICHAT_ENABLE_FFMPEG)
   target_link_libraries(maichat PRIVATE maichat_image_filter)
 endif()
@@ -893,6 +901,7 @@ elseif(WIN32)
   target_sources(maichat_agent PRIVATE
     src/agent/MaiDesktopGpu.h src/agent/MaiDesktopGpuWindows.cpp
     src/MaiChatTools/DesktopComputerWindows.cpp)
+  target_compile_definitions(maichat_agent PRIVATE NOMINMAX)
   target_link_libraries(maichat_agent PRIVATE dxgi dwmapi uiautomationcore ole32)
 endif()
 target_include_directories(maichat_agent PUBLIC src ../SessionSync)
@@ -905,7 +914,7 @@ target_include_directories(maichat_agent PRIVATE ../Media ../MaiChatTools
   ../../MaiAgent/third_party/openssl/include)
 target_compile_definitions(maichat_agent PRIVATE ASIO_STANDALONE _WEBSOCKETPP_CPP11_STRICT_)
 target_link_libraries(maichat_agent PUBLIC
-  Qt5::Core Qt5::Network Qt5::WebSockets Qt5::Widgets Qt5::Multimedia Qt5::Concurrent
+  Qt6::Core Qt6::Widgets Qt6::Concurrent
   maiagent maichat_markdown maichat_pdf_preview mai_video_circle_client)
 target_link_libraries(maichat_agent PRIVATE ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
 if(WIN32)
@@ -939,7 +948,7 @@ if(MAICHAT_ENABLE_PORTRAIT)
     src/MaiChatTools/DesktopPortraitTools.cpp
     ../MaiChatTools/MaiPortraitHostTools.cpp)
   target_include_directories(maichat_desktop_portrait PUBLIC src PRIVATE ../MaiChatTools)
-  target_link_libraries(maichat_desktop_portrait PUBLIC maichat_portrait Qt5::Widgets)
+  target_link_libraries(maichat_desktop_portrait PUBLIC maichat_portrait Qt6::Widgets)
   if(APPLE)
     target_sources(maichat_desktop_portrait PRIVATE src/MaiChatTools/DesktopPortraitFacesMac.mm)
     set_source_files_properties(src/MaiChatTools/DesktopPortraitFacesMac.mm
@@ -1004,7 +1013,7 @@ if(MAICHAT_ENABLE_OPENCV AND
   add_test(NAME MaiCvImageAnalysisTests COMMAND MaiCvImageAnalysisTests)
   add_executable(MaiVideoMattingTests tests/MaiVideoMattingTests.cpp)
   target_include_directories(MaiVideoMattingTests PRIVATE ../../MaiAgent/include)
-  target_link_libraries(MaiVideoMattingTests PRIVATE maiagent_cv_video_analysis maiagent Qt5::Gui)
+  target_link_libraries(MaiVideoMattingTests PRIVATE maiagent_cv_video_analysis maiagent Qt6::Gui)
   if(APPLE)
     target_include_directories(MaiVideoMattingTests PRIVATE
       "${CMAKE_CURRENT_BINARY_DIR}/maiagent/Graphics/ffmpeg-runtime/install/include")
@@ -1037,40 +1046,42 @@ if(MAICHAT_ENABLE_OPENCV AND
       "${CMAKE_CURRENT_BINARY_DIR}"
       "${CMAKE_CURRENT_BINARY_DIR}/maiagent/Graphics/ffmpeg-runtime/install/include")
     target_link_libraries(MaiTemporalWatermarkLive PRIVATE
-      maiagent opencv_imgproc opencv_core maiagent_embedded_fftools Qt5::Gui)
+      maiagent opencv_imgproc opencv_core maiagent_embedded_fftools Qt6::Gui)
   endif()
 endif()
 
 add_executable(markdown_document_test tests/MarkdownDocumentTest.cpp)
-target_link_libraries(markdown_document_test PRIVATE maichat_markdown Qt5::Test)
+target_link_libraries(markdown_document_test PRIVATE maichat_markdown Qt6::Test)
 
 add_executable(markdown_layout_test tests/MarkdownLayoutTest.cpp)
-target_link_libraries(markdown_layout_test PRIVATE maichat_markdown Qt5::Widgets Qt5::Test)
+target_link_libraries(markdown_layout_test PRIVATE maichat_markdown Qt6::Widgets Qt6::Test)
 
 add_executable(markdown_view_test tests/MarkdownViewTest.cpp)
-target_link_libraries(markdown_view_test PRIVATE maichat_markdown Qt5::Widgets Qt5::Test)
+target_link_libraries(markdown_view_test PRIVATE maichat_markdown Qt6::Widgets Qt6::Test)
 
 add_executable(markdown_label_test tests/MarkdownLabelTest.cpp)
-target_link_libraries(markdown_label_test PRIVATE maichat_markdown Qt5::Widgets Qt5::Test)
+target_link_libraries(markdown_label_test PRIVATE maichat_markdown Qt6::Widgets Qt6::Test)
 
 add_executable(agent_controller_test tests/AgentControllerTest.cpp)
 target_include_directories(agent_controller_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/httplib
   ../MaiChatTools)
 target_link_libraries(agent_controller_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
-  remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
+  remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 
 add_executable(desktop_session_sync_host_test tests/DesktopSessionSyncHostTest.cpp)
 target_include_directories(desktop_session_sync_host_test PRIVATE ../MaiChatTools)
 target_link_libraries(desktop_session_sync_host_test PRIVATE remote_im_desktop_ui
-  remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
+  remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 add_test(NAME desktop_session_sync_host_test COMMAND desktop_session_sync_host_test)
 add_executable(desktop_session_sync_channel_test
   tests/DesktopSessionSyncChannelTest.cpp)
 target_include_directories(desktop_session_sync_channel_test PRIVATE
-  ${OPENSSL_INCLUDE_DIR} ../../MaiAgent/third_party/openssl/include)
+  ${OPENSSL_INCLUDE_DIR} ../../MaiAgent/third_party/openssl/include
+  ../../MaiAgent/third_party/websocketpp ../../MaiAgent/third_party/asio/asio/include)
+target_compile_definitions(desktop_session_sync_channel_test PRIVATE ASIO_STANDALONE _WEBSOCKETPP_CPP11_STRICT_)
 target_link_libraries(desktop_session_sync_channel_test PRIVATE maichat_agent
-  remote_im_desktop_app Qt5::Network Qt5::Test ${OPENSSL_CRYPTO_LIBRARY})
+  remote_im_desktop_app Qt6::Test ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
 add_test(NAME desktop_session_sync_channel_test COMMAND desktop_session_sync_channel_test
   -o "${CMAKE_CURRENT_BINARY_DIR}/desktop_session_sync_channel_test.txt,txt")
 if(TARGET maiagent_cv_video_analysis)
@@ -1087,14 +1098,14 @@ target_compile_definitions(agent_panel_session_test PRIVATE
   MAICHAT_AGENT_AUDIO_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/lame/testcase.wav")
 # UiZoom 在 remote_im_desktop_ui 里，而 AgentChatPanel 用它做缩放，所以要一起链。
 target_link_libraries(agent_panel_session_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
-  remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
+  remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_executable(video_circle_dialog_test tests/VideoCircleDialogTest.cpp)
 target_compile_definitions(video_circle_dialog_test PRIVATE
   MAICHAT_VIDEO_CIRCLE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/video-lifecycle.mp4")
 target_link_libraries(video_circle_dialog_test PRIVATE remote_im_desktop_ui
-  remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
+  remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 add_test(NAME video_circle_dialog_local_tls COMMAND "${Python3_EXECUTABLE}"
   "${CMAKE_CURRENT_SOURCE_DIR}/../Network/tests/run_video_circle_local_tls.py"
   "$<TARGET_FILE:video_circle_dialog_test>")
@@ -1104,7 +1115,7 @@ set_tests_properties(video_circle_dialog_local_tls PROPERTIES
 add_executable(cloud_drive_dialog_test tests/CloudDriveDialogTest.cpp)
 target_include_directories(cloud_drive_dialog_test PRIVATE ../Media/FfplayCompat)
 target_link_libraries(cloud_drive_dialog_test PRIVATE remote_im_desktop_ui
-  remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
+  remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 add_test(NAME cloud_drive_dialog_local_tls COMMAND "${Python3_EXECUTABLE}"
   "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cloud_drive_dialog_local_tls.py"
   "$<TARGET_FILE:cloud_drive_dialog_test>"
@@ -1118,7 +1129,7 @@ set_tests_properties(cloud_drive_dialog_local_tls PROPERTIES
 if(UNIX)
   add_executable(cloud_drive_dialog_live_test tests/CloudDriveDialogLiveTest.cpp)
   target_link_libraries(cloud_drive_dialog_live_test PRIVATE remote_im_desktop_ui
-    remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt5::Widgets)
+    remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt6::Widgets)
 endif()
 
 add_executable(cloud_drive_agent_tools_test
@@ -1159,7 +1170,7 @@ target_compile_features(mai_qr_code_test PRIVATE c_std_11)
 target_include_directories(mai_qr_code_test PRIVATE
   ../MaiChatTools ../third_party/qrcodegen third_party/quirc
   ../../MaiAgent/include ../../MaiAgent/third_party/nlohmann)
-target_link_libraries(mai_qr_code_test PRIVATE maiagent Qt5::Gui)
+target_link_libraries(mai_qr_code_test PRIVATE maiagent Qt6::Gui)
 add_test(NAME mai_qr_code COMMAND mai_qr_code_test)
 
 add_executable(mai_session_schedule_test
@@ -1174,19 +1185,19 @@ target_link_libraries(mai_session_schedule_test PRIVATE maiagent mai_sqlite)
 add_test(NAME mai_session_schedule COMMAND mai_session_schedule_test)
 
 add_executable(desktop_process_tools_test tests/DesktopProcessToolsTest.cpp)
-target_link_libraries(desktop_process_tools_test PRIVATE maichat_agent Qt5::Core)
+target_link_libraries(desktop_process_tools_test PRIVATE maichat_agent Qt6::Core)
 target_include_directories(desktop_process_tools_test PRIVATE
   src ../../MaiAgent/third_party/nlohmann)
 add_test(NAME desktop_process_tools COMMAND desktop_process_tools_test)
 
 add_executable(desktop_browser_tools_test tests/DesktopBrowserToolsTest.cpp)
-target_link_libraries(desktop_browser_tools_test PRIVATE maichat_agent Qt5::Core Qt5::Network)
+target_link_libraries(desktop_browser_tools_test PRIVATE maichat_agent Qt6::Core)
 target_include_directories(desktop_browser_tools_test PRIVATE
   src ../../MaiAgent/third_party/nlohmann)
 add_test(NAME desktop_browser_tools COMMAND desktop_browser_tools_test)
 
 add_executable(desktop_computer_tools_test tests/DesktopComputerToolsTest.cpp)
-target_link_libraries(desktop_computer_tools_test PRIVATE maichat_agent Qt5::Widgets)
+target_link_libraries(desktop_computer_tools_test PRIVATE maichat_agent Qt6::Widgets)
 target_include_directories(desktop_computer_tools_test PRIVATE
   src ../../MaiAgent/third_party/nlohmann)
 add_test(NAME desktop_computer_tools COMMAND desktop_computer_tools_test)
@@ -1194,20 +1205,20 @@ set_tests_properties(desktop_computer_tools PROPERTIES SKIP_RETURN_CODE 77)
 
 # Pure controller/tool contracts run without sending input to the desktop.
 add_executable(desktop_computer_contracts_test tests/DesktopComputerContractsTest.cpp)
-target_link_libraries(desktop_computer_contracts_test PRIVATE maichat_agent Qt5::Core)
+target_link_libraries(desktop_computer_contracts_test PRIVATE maichat_agent Qt6::Core)
 target_include_directories(desktop_computer_contracts_test PRIVATE ../../MaiAgent/third_party/nlohmann)
 add_test(NAME desktop_computer_contracts COMMAND desktop_computer_contracts_test)
 
 add_executable(desktop_computer_agent_integration_test tests/DesktopComputerAgentIntegrationTest.cpp)
 target_link_libraries(desktop_computer_agent_integration_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
-  remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
+  remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 target_include_directories(desktop_computer_agent_integration_test PRIVATE ../../MaiAgent/third_party/nlohmann)
 # Keep deterministic conversation coverage independent of interactive desktop readiness.
 add_test(NAME desktop_computer_agent_integration COMMAND desktop_computer_agent_integration_test
   chinesePromptTraversesRealAgentAndReadsBackEditor -o -,txt)
 
 add_executable(desktop_computer_native_integration_test tests/DesktopComputerNativeIntegrationTest.cpp)
-target_link_libraries(desktop_computer_native_integration_test PRIVATE maichat_agent Qt5::Widgets)
+target_link_libraries(desktop_computer_native_integration_test PRIVATE maichat_agent Qt6::Widgets)
 target_include_directories(desktop_computer_native_integration_test PRIVATE ../../MaiAgent/third_party/nlohmann)
 add_test(NAME desktop_computer_native_integration COMMAND desktop_computer_native_integration_test)
 set_tests_properties(desktop_computer_native_integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
@@ -1224,7 +1235,7 @@ set_tests_properties(desktop_computer_creation_native PROPERTIES
 # Center UI without shell helpers, external providers or OS input injection.
 add_executable(desktop_screenshot_integration_test tests/DesktopScreenshotIntegrationTest.cpp)
 target_link_libraries(desktop_screenshot_integration_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
-  remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
+  remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 target_include_directories(desktop_screenshot_integration_test PRIVATE ../../MaiAgent/third_party/nlohmann)
 if(APPLE)
   target_link_libraries(desktop_screenshot_integration_test PRIVATE "-framework CoreGraphics")
@@ -1239,14 +1250,14 @@ add_executable(desktop_calendar_events_test
   ../MaiChatTools/MaiScheduleTime.cpp)
 target_include_directories(desktop_calendar_events_test PRIVATE
   src ../MaiChatTools ../../MaiAgent/include ../../MaiAgent/third_party/nlohmann)
-target_link_libraries(desktop_calendar_events_test PRIVATE maiagent Qt5::Gui)
+target_link_libraries(desktop_calendar_events_test PRIVATE maiagent Qt6::Gui)
 add_test(NAME desktop_calendar_events COMMAND desktop_calendar_events_test)
 
 add_executable(cloud_drive_agent_tools_integration_test
   tests/CloudDriveAgentToolsIntegrationTest.cpp)
 target_link_libraries(cloud_drive_agent_tools_integration_test PRIVATE
   remote_im_desktop_ui remote_im_desktop_app remote_im_core maichat_agent
-  Qt5::Widgets)
+  Qt6::Widgets)
 add_test(NAME cloud_drive_agent_tools_local_tls COMMAND "${Python3_EXECUTABLE}"
   "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cloud_drive_dialog_local_tls.py"
   "$<TARGET_FILE:cloud_drive_agent_tools_integration_test>"
@@ -1257,10 +1268,10 @@ set_tests_properties(cloud_drive_agent_tools_local_tls PROPERTIES
 add_executable(desktop_music_player_dialog_test tests/DesktopMusicPlayerDialogTest.cpp)
 target_include_directories(desktop_music_player_dialog_test PRIVATE ../Media/FfplayCompat)
 target_link_libraries(desktop_music_player_dialog_test PRIVATE
-  remote_im_desktop_ui Qt5::Widgets Qt5::Multimedia Qt5::Test)
+  remote_im_desktop_ui Qt6::Widgets Qt6::Test)
 
 add_executable(desktop_pdf_renderer_test tests/DesktopPdfRendererTest.cpp)
-target_link_libraries(desktop_pdf_renderer_test PRIVATE maichat_agent Qt5::Widgets Qt5::Test)
+target_link_libraries(desktop_pdf_renderer_test PRIVATE maichat_agent Qt6::Widgets Qt6::Test)
 
 set(ffplay_ffmpeg_source ${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/ffmpeg)
 # FFplay 的倍速音频从本仓库 SoundTouch 源码编译，不依赖 TRTC 内部二进制库。
@@ -1371,7 +1382,7 @@ if(APPLE AND TARGET maiagent_obs_metal)
     MAICHAT_FFPLAY_H264_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/Graphics/tests/fixtures/tiny-red.mp4"
     MAICHAT_FFPLAY_AV1_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/Graphics/tests/fixtures/tiny-red-av1.webm")
   target_include_directories(MaiFfplayVideoDialogTest PRIVATE ../Media/FfplayCompat)
-  target_link_libraries(MaiFfplayVideoDialogTest PRIVATE remote_im_desktop_ui Qt5::Test)
+  target_link_libraries(MaiFfplayVideoDialogTest PRIVATE remote_im_desktop_ui Qt6::Test)
   add_test(NAME MaiFfplayVideoDialogTest COMMAND MaiFfplayVideoDialogTest)
   add_custom_target(maichat_media_effects
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -1460,7 +1471,7 @@ if(WIN32 AND MAICHAT_ENABLE_FFMPEG)
       $<TARGET_FILE_DIR:MaiFfplayVideoDialogTest>/MaiAgentGraphics
     # Qt Test is a dependency of this executable, independent from the normal App runtime.
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      $<TARGET_FILE:Qt5::Test>
+      $<TARGET_FILE:Qt6::Test>
       $<TARGET_FILE_DIR:MaiFfplayVideoDialogTest>
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       $<TARGET_FILE:maichat_ffplay_hosted>
@@ -1488,7 +1499,7 @@ if(WIN32 AND MAICHAT_ENABLE_FFMPEG)
     MAICHAT_FFPLAY_H264_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/Graphics/tests/fixtures/tiny-red.mp4"
     MAICHAT_FFPLAY_AV1_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/Graphics/tests/fixtures/tiny-red-av1.webm")
   target_include_directories(MaiFfplayVideoDialogTest PRIVATE ../Media/FfplayCompat)
-  target_link_libraries(MaiFfplayVideoDialogTest PRIVATE remote_im_desktop_ui Qt5::Test)
+  target_link_libraries(MaiFfplayVideoDialogTest PRIVATE remote_im_desktop_ui Qt6::Test)
   add_test(NAME MaiFfplayVideoDialogTest COMMAND MaiFfplayVideoDialogTest)
   set_tests_properties(MaiFfplayVideoDialogTest PROPERTIES
     PASS_REGULAR_EXPRESSION "Seek to 50([.][0-9]+)?%"
@@ -1515,7 +1526,7 @@ if(WIN32)
       COMMENT "Copying MaiChat TRTC runtime before PE verification"
       VERBATIM)
   endif()
-  get_filename_component(maichat_qt_bin "${Qt5_DIR}/../../../bin" ABSOLUTE)
+  get_filename_component(maichat_qt_bin "${Qt6_DIR}/../../../bin" ABSOLUTE)
   set(maichat_windeployqt "${maichat_qt_bin}/windeployqt.exe")
   get_filename_component(maichat_linker_bin "${CMAKE_LINKER}" DIRECTORY)
   set(maichat_dumpbin "${maichat_linker_bin}/dumpbin.exe")
@@ -1524,6 +1535,7 @@ if(WIN32)
   endif()
   add_custom_command(TARGET maichat POST_BUILD
     COMMAND "${maichat_windeployqt}" --release --no-translations
+      --skip-plugin-types generic,networkinformation,tls
       --dir "$<TARGET_FILE_DIR:maichat>" "$<TARGET_FILE:maichat>"
     COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File
       "${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify-windows-runtime.ps1"
@@ -1549,11 +1561,11 @@ if((APPLE AND TARGET maiagent_embedded_fftools) OR
 endif()
 
 add_executable(pdf_preview_dialog_test tests/PdfPreviewDialogTest.cpp)
-target_link_libraries(pdf_preview_dialog_test PRIVATE maichat_pdf_preview Qt5::Test)
+target_link_libraries(pdf_preview_dialog_test PRIVATE maichat_pdf_preview Qt6::Test)
 if(WIN32)
   # 独立 Windows PDF 测试也需 UiZoom 及其文本刷新依赖；与产品使用同一 Markdown 实现。
   target_sources(pdf_preview_dialog_test PRIVATE src/ui/UiZoom.cpp)
-  target_link_libraries(pdf_preview_dialog_test PRIVATE Qt5::Concurrent maichat_markdown)
+  target_link_libraries(pdf_preview_dialog_test PRIVATE Qt6::Concurrent maichat_markdown)
 endif()
 
 if(WIN32 AND MAICHAT_ENABLE_FFMPEG)
@@ -1562,85 +1574,88 @@ if(WIN32 AND MAICHAT_ENABLE_FFMPEG)
 endif()
 if(WIN32 AND MAICHAT_ENABLE_OPENCV)
   add_executable(desktop_opencv_model_test tests/DesktopOpenCvModelTest.cpp)
-  target_link_libraries(desktop_opencv_model_test PRIVATE maichat_image_vision Qt5::Core)
+  target_link_libraries(desktop_opencv_model_test PRIVATE maichat_image_vision Qt6::Core)
   add_executable(desktop_vision_tools_test
     tests/DesktopVisionToolsTest.cpp resources/resources.qrc)
   target_compile_definitions(desktop_vision_tools_test PRIVATE
     MAICHAT_LENA_PATH="${MAICHAT_OPENCV_SOURCE}/samples/data/lena.jpg")
   target_link_libraries(desktop_vision_tools_test PRIVATE
-    maichat_agent Qt5::Widgets Qt5::Test)
+    maichat_agent Qt6::Widgets Qt6::Test)
 endif()
 
 # maichat_agent's PDF password prompt uses UiZoom; this isolated test does not link the desktop UI.
 add_executable(reply_suggestion_controller_test
   tests/ReplySuggestionControllerTest.cpp
   src/ui/UiZoom.cpp)
-target_link_libraries(reply_suggestion_controller_test PRIVATE maichat_agent Qt5::Test)
+target_link_libraries(reply_suggestion_controller_test PRIVATE
+  remote_im_desktop_ui remote_im_desktop_app maichat_agent Qt6::Test)
 
 add_executable(remote_diagnostics_controller_test tests/RemoteDiagnosticsControllerTest.cpp)
-target_link_libraries(remote_diagnostics_controller_test PRIVATE remote_im_desktop_app Qt5::Test)
+target_link_libraries(remote_diagnostics_controller_test PRIVATE remote_im_desktop_app Qt6::Test)
 target_compile_definitions(remote_diagnostics_controller_test PRIVATE
   MAICHAT_DIAGNOSTICS_REPORT_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fixtures/remote-diagnostics-report.json")
 
 add_executable(attachment_download_evidence_test tests/AttachmentDownloadEvidenceTest.cpp)
 target_include_directories(attachment_download_evidence_test PRIVATE
-  ${OPENSSL_INCLUDE_DIR} ../../MaiAgent/third_party/openssl/include)
+  ${OPENSSL_INCLUDE_DIR} ../../MaiAgent/third_party/openssl/include ../../MaiAgent/third_party/httplib)
+target_compile_definitions(attachment_download_evidence_test PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(attachment_download_evidence_test PRIVATE
-  remote_im_core Qt5::Network Qt5::Test ${OPENSSL_CRYPTO_LIBRARY})
+  remote_im_core maiagent Qt6::Test ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
 
 add_executable(remote_diagnostics_ui_test tests/RemoteDiagnosticsUiTest.cpp)
-target_link_libraries(remote_diagnostics_ui_test PRIVATE remote_im_desktop_ui remote_im_desktop_app Qt5::Widgets Qt5::Test)
+target_link_libraries(remote_diagnostics_ui_test PRIVATE remote_im_desktop_ui remote_im_desktop_app Qt6::Widgets Qt6::Test)
 
 add_executable(remote_diagnostics_evidence_test tests/RemoteDiagnosticsEvidenceTest.cpp)
-target_link_libraries(remote_diagnostics_evidence_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(remote_diagnostics_evidence_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(remote_diagnostics_protocol_test tests/RemoteDiagnosticsProtocolTest.cpp)
-target_link_libraries(remote_diagnostics_protocol_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(remote_diagnostics_protocol_test PRIVATE remote_im_core Qt6::Test)
 # 回绝样例是三端共用的同一份文件，测试直接读它，不再各自抄一份提示串。
 target_compile_definitions(remote_diagnostics_protocol_test PRIVATE
   MAICHAT_FAILURE_RECEIPT_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fixtures/remote-diagnostics-failure-receipts.json")
 
 add_executable(chat_state_test tests/ChatStateTest.cpp)
-target_link_libraries(chat_state_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(chat_state_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(fake_remote_im_client_test tests/FakeRemoteIMClientTest.cpp)
-target_link_libraries(fake_remote_im_client_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(fake_remote_im_client_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(tencent_user_sig_generator_test
   tests/TencentUserSigGeneratorTest.cpp
   src/im/TencentUserSigGenerator.h
   src/im/TencentUserSigGenerator.cpp)
-target_link_libraries(tencent_user_sig_generator_test PRIVATE remote_im_core Qt5::Test ZLIB::ZLIB)
+target_link_libraries(tencent_user_sig_generator_test PRIVATE remote_im_core Qt6::Test ZLIB::ZLIB)
 
 add_executable(tim_sdk_remote_im_client_test tests/TimSdkRemoteIMClientTest.cpp)
-target_link_libraries(tim_sdk_remote_im_client_test PRIVATE remote_im_core Qt5::Network Qt5::Test)
+target_link_libraries(tim_sdk_remote_im_client_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(markdown_renderer_test tests/MarkdownRendererTest.cpp)
-target_link_libraries(markdown_renderer_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(markdown_renderer_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(local_message_database_test tests/LocalMessageDatabaseTest.cpp)
-target_link_libraries(local_message_database_test PRIVATE remote_im_core Qt5::Test)
+target_include_directories(local_message_database_test PRIVATE ../../MaiAgent/third_party/sqlite)
+target_link_libraries(local_message_database_test PRIVATE remote_im_core mai_sqlite Qt6::Test)
 
 add_executable(remote_im_application_test tests/RemoteIMApplicationTest.cpp)
-target_link_libraries(remote_im_application_test PRIVATE remote_im_desktop_app remote_im_core Qt5::Test)
+target_link_libraries(remote_im_application_test PRIVATE remote_im_desktop_app remote_im_core Qt6::Test)
 
 add_executable(maichat_host_tools_test tests/MaiChatHostToolsTest.cpp)
-target_link_libraries(maichat_host_tools_test PRIVATE remote_im_desktop_app remote_im_core maiagent Qt5::Test)
+target_link_libraries(maichat_host_tools_test PRIVATE remote_im_desktop_app remote_im_core maiagent Qt6::Test)
 
 add_executable(login_dialog_test tests/LoginDialogTest.cpp)
 if(WIN32)
   add_executable(desktop_service_route_test tests/DesktopServiceRouteTest.cpp)
   target_link_libraries(desktop_service_route_test PRIVATE
-    maichat_desktop_service_route Qt5::Test)
+    maichat_desktop_service_route Qt6::Test)
   add_test(NAME desktop_service_route_test COMMAND desktop_service_route_test)
 endif()
-target_link_libraries(login_dialog_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(login_dialog_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets Qt6::Test)
 
 add_executable(secure_refresh_token_store_test
   tests/SecureRefreshTokenStoreTest.cpp
   src/auth/SecureRefreshTokenStore.cpp)
 target_include_directories(secure_refresh_token_store_test PRIVATE src)
-target_link_libraries(secure_refresh_token_store_test PRIVATE Qt5::Core Qt5::Test)
+target_link_libraries(secure_refresh_token_store_test PRIVATE Qt6::Core Qt6::Test)
 if(APPLE)
   target_link_libraries(secure_refresh_token_store_test PRIVATE
     "-framework Security" "-framework CoreFoundation")
@@ -1650,20 +1665,20 @@ endif()
 
 
 add_executable(app_message_dialog_test tests/AppMessageDialogTest.cpp)
-target_link_libraries(app_message_dialog_test PRIVATE remote_im_desktop_ui remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(app_message_dialog_test PRIVATE remote_im_desktop_ui remote_im_core Qt6::Widgets Qt6::Test)
 
 add_executable(message_notification_test tests/MessageNotificationTest.cpp)
-target_link_libraries(message_notification_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(message_notification_test PRIVATE remote_im_core Qt6::Test)
 
 # 视觉自检程序：手工跑起来截图用，不进 ctest。
 add_executable(agent_page_visual_probe tests/AgentPageVisualProbe.cpp)
 target_link_libraries(agent_page_visual_probe PRIVATE remote_im_desktop_ui remote_im_desktop_app
-  remote_im_core maichat_agent maichat_markdown Qt5::Widgets Qt5::Test)
+  remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 
 add_executable(im_markdown_visual_probe tests/ImMarkdownVisualProbe.cpp)
 target_compile_definitions(im_markdown_visual_probe PRIVATE MAICHAT_TEST_FONTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../Presentation/fonts")
 target_link_libraries(im_markdown_visual_probe PRIVATE remote_im_desktop_ui remote_im_desktop_app
-  remote_im_core maichat_markdown Qt5::Widgets Qt5::Test)
+  remote_im_core maichat_markdown Qt6::Widgets Qt6::Test)
 
 # Visual probes load the product code face even though they bypass product main.
 foreach(probe agent_page_visual_probe im_markdown_visual_probe)
@@ -1673,84 +1688,79 @@ endforeach()
 
 add_executable(im_stress_probe tests/ImStressProbe.cpp)
 target_link_libraries(im_stress_probe PRIVATE remote_im_desktop_ui remote_im_desktop_app
-  remote_im_core maichat_markdown Qt5::Widgets Qt5::Test)
+  remote_im_core maichat_markdown Qt6::Widgets Qt6::Test)
 
 add_executable(markdown_text_probe tests/MarkdownTextProbe.cpp)
-target_link_libraries(markdown_text_probe PRIVATE maichat_markdown Qt5::Widgets)
+target_link_libraries(markdown_text_probe PRIVATE maichat_markdown Qt6::Widgets)
 
 add_executable(markdown_visual_probe tests/MarkdownVisualProbe.cpp)
-target_link_libraries(markdown_visual_probe PRIVATE maichat_markdown Qt5::Widgets)
+target_link_libraries(markdown_visual_probe PRIVATE maichat_markdown Qt6::Widgets)
 
 add_executable(quote_visual_probe tests/QuoteVisualProbe.cpp)
-target_link_libraries(quote_visual_probe PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets)
+target_link_libraries(quote_visual_probe PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets)
 
 add_executable(message_quote_test tests/MessageQuoteTest.cpp)
-target_link_libraries(message_quote_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(message_quote_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(broadcast_dialog_test tests/BroadcastDialogTest.cpp)
-target_link_libraries(broadcast_dialog_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(broadcast_dialog_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets Qt6::Test)
 
 add_executable(app_text_input_dialog_test tests/AppTextInputDialogTest.cpp)
-target_link_libraries(app_text_input_dialog_test PRIVATE remote_im_desktop_ui remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(app_text_input_dialog_test PRIVATE remote_im_desktop_ui remote_im_core Qt6::Widgets Qt6::Test)
 
 add_executable(file_preview_dialog_test tests/FilePreviewDialogTest.cpp)
-target_link_libraries(file_preview_dialog_test PRIVATE remote_im_desktop_ui remote_im_core Qt5::Widgets Qt5::Test)
-
-add_executable(video_preview_dialog_test tests/VideoPreviewDialogTest.cpp)
-target_link_libraries(video_preview_dialog_test PRIVATE remote_im_desktop_ui remote_im_core Qt5::Widgets Qt5::Multimedia Qt5::Test)
-target_compile_definitions(video_preview_dialog_test PRIVATE
-  MAICHAT_TEST_VIDEO_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/video-lifecycle.mp4")
+target_link_libraries(file_preview_dialog_test PRIVATE remote_im_desktop_ui remote_im_core Qt6::Widgets Qt6::Test)
 
 add_executable(add_contact_dialog_test tests/AddContactDialogTest.cpp)
-target_link_libraries(add_contact_dialog_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(add_contact_dialog_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets Qt6::Test)
 target_compile_definitions(add_contact_dialog_test PRIVATE
   MAICHAT_FRIEND_QR_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/maichat-friend-qr.png")
 
 add_executable(main_window_layout_test tests/MainWindowLayoutTest.cpp)
-target_link_libraries(main_window_layout_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(main_window_layout_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets Qt6::Test)
 
 # Live QA probe uses a throwaway account and an isolated app identity. It is not part of ctest or normal builds.
 if(APPLE)
   add_executable(desktop_group_live_probe EXCLUDE_FROM_ALL tests/DesktopGroupLiveProbe.cpp)
   target_link_libraries(desktop_group_live_probe PRIVATE
-    remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets)
+    remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets)
 endif()
 
 add_executable(remote_desktop_signal_test tests/RemoteDesktopSignalTest.cpp)
-target_link_libraries(remote_desktop_signal_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(remote_desktop_signal_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(remote_input_protocol_test tests/RemoteInputProtocolTest.cpp)
-target_link_libraries(remote_input_protocol_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(remote_input_protocol_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(remote_input_injector_test tests/RemoteInputInjectorTest.cpp)
-target_link_libraries(remote_input_injector_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(remote_input_injector_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(remote_input_sender_test tests/RemoteInputSenderTest.cpp)
-target_link_libraries(remote_input_sender_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(remote_input_sender_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(secure_desktop_monitor_test tests/SecureDesktopMonitorTest.cpp)
-target_link_libraries(secure_desktop_monitor_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(secure_desktop_monitor_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(remote_desktop_auth_test tests/RemoteDesktopAuthTest.cpp)
-target_link_libraries(remote_desktop_auth_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(remote_desktop_auth_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(remote_desktop_session_test tests/RemoteDesktopSessionTest.cpp)
-target_link_libraries(remote_desktop_session_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(remote_desktop_session_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(remote_desktop_settings_test tests/RemoteDesktopSettingsTest.cpp)
-target_link_libraries(remote_desktop_settings_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(remote_desktop_settings_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(remote_desktop_controller_test tests/RemoteDesktopControllerTest.cpp)
-target_link_libraries(remote_desktop_controller_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(remote_desktop_controller_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(trtc_engine_test tests/TrtcEngineTest.cpp)
-target_link_libraries(trtc_engine_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(trtc_engine_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(video_file_metadata_test tests/VideoFileMetadataTest.cpp)
-target_link_libraries(video_file_metadata_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(video_file_metadata_test PRIVATE remote_im_core Qt6::Test)
 
 add_executable(video_cover_image_test tests/VideoCoverImageTest.cpp)
-target_link_libraries(video_cover_image_test PRIVATE remote_im_desktop_app remote_im_core Qt5::Gui Qt5::Test)
+target_link_libraries(video_cover_image_test PRIVATE remote_im_desktop_app remote_im_core Qt6::Gui Qt6::Test)
 
 if(MAICHAT_TRTC_AVAILABLE AND WIN32)
   # 测试程序也需同一组运行库；maichat 的复制必须早于上面的 PE 验证。
@@ -1762,28 +1772,28 @@ if(MAICHAT_TRTC_AVAILABLE AND WIN32)
 endif()
 
 add_executable(remote_input_capture_test tests/RemoteInputCaptureTest.cpp)
-target_link_libraries(remote_input_capture_test PRIVATE remote_im_desktop_ui remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(remote_input_capture_test PRIVATE remote_im_desktop_ui remote_im_core Qt6::Widgets Qt6::Test)
 
 add_executable(remote_desktop_ui_test tests/RemoteDesktopUiTest.cpp)
-target_link_libraries(remote_desktop_ui_test PRIVATE remote_im_desktop_ui remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(remote_desktop_ui_test PRIVATE remote_im_desktop_ui remote_im_core Qt6::Widgets Qt6::Test)
 
 add_executable(message_image_loader_test tests/MessageImageLoaderTest.cpp)
-target_link_libraries(message_image_loader_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(message_image_loader_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets Qt6::Test)
 if(APPLE AND TARGET maiagent_obs_metal)
   add_executable(mai_graphics_desktop_image_test tests/MaiGraphicsDesktopImageTest.cpp)
   target_link_libraries(mai_graphics_desktop_image_test PRIVATE remote_im_desktop_ui
-    remote_im_desktop_app remote_im_core Qt5::Widgets)
+    remote_im_desktop_app remote_im_core Qt6::Widgets)
 endif()
 
 add_executable(message_search_test tests/MessageSearchTest.cpp)
-target_link_libraries(message_search_test PRIVATE remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(message_search_test PRIVATE remote_im_core Qt6::Widgets Qt6::Test)
 
 add_executable(ui_zoom_test tests/UiZoomTest.cpp)
 target_compile_definitions(ui_zoom_test PRIVATE MAICHAT_TEST_FONTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../Presentation/fonts")
-target_link_libraries(ui_zoom_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets Qt5::Test)
+target_link_libraries(ui_zoom_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets Qt6::Test)
 
 add_executable(performance_log_test tests/PerformanceLogTest.cpp)
-target_link_libraries(performance_log_test PRIVATE remote_im_core Qt5::Test)
+target_link_libraries(performance_log_test PRIVATE remote_im_core Qt6::Test)
 if(MAICHAT_ENABLE_PORTRAIT)
   add_executable(desktop_portrait_service_test tests/DesktopPortraitServiceTest.cpp)
   if(WIN32)
@@ -1794,7 +1804,16 @@ if(MAICHAT_ENABLE_PORTRAIT)
   target_link_libraries(desktop_portrait_service_test PRIVATE maichat_desktop_portrait)
 endif()
 
+include(cmake/MaiNativeComponents.cmake)
+
 enable_testing()
+
+# Runtime validation of the pinned source SDK, with no native capture or provider calls.
+qt6_add_executable(qt_source_runtime_test tests/QtSourceRuntimeTest.cpp)
+target_link_libraries(qt_source_runtime_test PRIVATE Qt6::Widgets Qt6::Svg Qt6::Test)
+add_test(NAME qt_source_runtime COMMAND qt_source_runtime_test -o "${CMAKE_CURRENT_BINARY_DIR}/qt_source_runtime.txt,txt")
+set_tests_properties(qt_source_runtime PROPERTIES TIMEOUT 30)
+
 if(MAICHAT_ENABLE_PORTRAIT)
   add_test(NAME desktop_portrait_service_test COMMAND desktop_portrait_service_test
     "${CMAKE_CURRENT_SOURCE_DIR}/../.." "${MAICHAT_PORTRAIT_ORT_RUNTIME}"
@@ -1804,14 +1823,14 @@ add_test(NAME markdown_document_test COMMAND markdown_document_test)
 add_test(NAME markdown_layout_test COMMAND markdown_layout_test)
 add_test(NAME markdown_view_test COMMAND markdown_view_test)
 add_test(NAME markdown_label_test COMMAND markdown_label_test)
-add_test(NAME agent_controller_test COMMAND agent_controller_test)
-add_test(NAME agent_panel_session_test COMMAND agent_panel_session_test)
+add_test(NAME agent_controller_test COMMAND agent_controller_test -o "${CMAKE_CURRENT_BINARY_DIR}/agent_controller_test.txt,txt")
+add_test(NAME agent_panel_session_test COMMAND agent_panel_session_test -o "${CMAKE_CURRENT_BINARY_DIR}/agent_panel_session_test.txt,txt")
 add_test(NAME desktop_music_player_dialog_test COMMAND desktop_music_player_dialog_test)
 if(TARGET maichat_ffplay_hosted)
   target_compile_definitions(desktop_music_player_dialog_test PRIVATE MAICHAT_HAS_FFPLAY=1)
   add_executable(MaiFfplayAudioSessionTest tests/MaiFfplayAudioSessionTest.cpp)
   target_include_directories(MaiFfplayAudioSessionTest PRIVATE ../Media/FfplayCompat)
-  target_link_libraries(MaiFfplayAudioSessionTest PRIVATE maichat_ffplay_hosted Qt5::Test)
+  target_link_libraries(MaiFfplayAudioSessionTest PRIVATE maichat_ffplay_hosted Qt6::Test)
   add_test(NAME MaiFfplayAudioSessionTest COMMAND MaiFfplayAudioSessionTest)
 endif()
 add_test(NAME desktop_pdf_renderer_test COMMAND desktop_pdf_renderer_test)
@@ -1828,7 +1847,7 @@ endif()
 add_test(NAME reply_suggestion_controller_test COMMAND reply_suggestion_controller_test)
 add_test(NAME performance_log_test COMMAND performance_log_test)
 add_test(NAME remote_diagnostics_controller_test COMMAND remote_diagnostics_controller_test)
-add_test(NAME attachment_download_evidence_test COMMAND attachment_download_evidence_test)
+add_test(NAME attachment_download_evidence_test COMMAND attachment_download_evidence_test -o "${CMAKE_CURRENT_BINARY_DIR}/attachment_download_evidence_test.txt,txt")
 add_test(NAME remote_diagnostics_ui_test COMMAND remote_diagnostics_ui_test)
 add_test(NAME remote_diagnostics_evidence_test COMMAND remote_diagnostics_evidence_test)
 add_test(NAME remote_diagnostics_protocol_test COMMAND remote_diagnostics_protocol_test)
@@ -1840,17 +1859,16 @@ add_test(NAME fake_remote_im_client_test COMMAND fake_remote_im_client_test)
 add_test(NAME tencent_user_sig_generator_test COMMAND tencent_user_sig_generator_test)
 add_test(NAME tim_sdk_remote_im_client_test COMMAND tim_sdk_remote_im_client_test)
 add_test(NAME markdown_renderer_test COMMAND markdown_renderer_test)
-add_test(NAME local_message_database_test COMMAND local_message_database_test)
+add_test(NAME local_message_database_test COMMAND local_message_database_test -o "${CMAKE_CURRENT_BINARY_DIR}/local_message_database_test.txt,txt")
 add_test(NAME remote_im_application_test COMMAND remote_im_application_test)
 add_test(NAME maichat_host_tools_test COMMAND maichat_host_tools_test)
-add_test(NAME login_dialog_test COMMAND login_dialog_test)
+add_test(NAME login_dialog_test COMMAND login_dialog_test -o "${CMAKE_CURRENT_BINARY_DIR}/login_dialog_test.txt,txt")
 add_test(NAME secure_refresh_token_store_test COMMAND secure_refresh_token_store_test)
 add_test(NAME app_message_dialog_test COMMAND app_message_dialog_test)
 add_test(NAME app_text_input_dialog_test COMMAND app_text_input_dialog_test)
 add_test(NAME file_preview_dialog_test COMMAND file_preview_dialog_test)
-add_test(NAME video_preview_dialog_test COMMAND video_preview_dialog_test)
 add_test(NAME add_contact_dialog_test COMMAND add_contact_dialog_test)
-add_test(NAME main_window_layout_test COMMAND main_window_layout_test)
+add_test(NAME main_window_layout_test COMMAND main_window_layout_test -o "${CMAKE_CURRENT_BINARY_DIR}/main_window_layout_test.txt,txt")
 add_test(NAME remote_desktop_signal_test COMMAND remote_desktop_signal_test)
 add_test(NAME remote_input_protocol_test COMMAND remote_input_protocol_test)
 add_test(NAME remote_input_injector_test COMMAND remote_input_injector_test)
@@ -1867,7 +1885,7 @@ add_test(NAME remote_input_capture_test COMMAND remote_input_capture_test)
 add_test(NAME remote_desktop_ui_test COMMAND remote_desktop_ui_test)
 add_test(NAME message_image_loader_test COMMAND message_image_loader_test)
 add_test(NAME message_search_test COMMAND message_search_test)
-add_test(NAME ui_zoom_test COMMAND ui_zoom_test)
+add_test(NAME ui_zoom_test COMMAND ui_zoom_test -o "${CMAKE_CURRENT_BINARY_DIR}/ui_zoom_test.txt,txt")
 
 add_executable(desktop_password_change_test tests/DesktopPasswordChangeRequestsTest.cpp)
 if(APPLE)
@@ -1875,7 +1893,7 @@ if(APPLE)
   target_link_libraries(desktop_password_change_test PRIVATE "-framework AppKit")
 endif()
 target_link_libraries(desktop_password_change_test PRIVATE
-  remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets Qt5::Test)
+  remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets Qt6::Test)
 add_test(NAME desktop_password_change_test COMMAND desktop_password_change_test)
 
 add_executable(desktop_pdf_password_prompt_test tests/DesktopPdfPasswordPromptTest.cpp)
@@ -1884,5 +1902,11 @@ if(APPLE)
   target_link_libraries(desktop_pdf_password_prompt_test PRIVATE "-framework AppKit")
 endif()
 target_link_libraries(desktop_pdf_password_prompt_test PRIVATE
-  remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt5::Widgets Qt5::Test)
+  remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets Qt6::Test)
 add_test(NAME desktop_pdf_password_prompt_test COMMAND desktop_pdf_password_prompt_test)
+
+# Import the compiler-probed prefix after dependency projects have loaded their
+# compiler metadata, so Ninja tracks headers in every locale.
+if(MSVC)
+  include("${MAICHAT_QT_PREFIX}/../msvc-showincludes.cmake")
+endif()

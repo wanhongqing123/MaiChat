@@ -14,6 +14,7 @@ class QWidget;
 // IM 与 AI 助手共用的输入框外壳。它只统一拖放、粘贴和角落按钮的位置；
 // 附件如何入库、如何发送仍由各自页面的业务层决定。
 class ComposerTextEdit : public QTextEdit {
+    Q_OBJECT
 public:
     explicit ComposerTextEdit(QWidget* parent = nullptr);
 

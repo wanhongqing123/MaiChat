@@ -3,6 +3,7 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QDir>
+#include <QDataStream>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
@@ -43,6 +44,7 @@
 #include "agent/DesktopSessionSyncHost.h"
 #include "markdown/MarkdownView.h"
 #include "ui/ComposerTextEdit.h"
+#include "ui/DesktopAudioPlayback.h"
 #include "ui/UiZoom.h"
 
 // AI 面板：**别的会话说的话不能灌进这个会话的界面**。
@@ -58,6 +60,23 @@
 // 滤掉的话它会永远挂在闸门上等一个不会来的点头。
 
 namespace {
+
+// 有声播放控件的回归只用本次临时目录中的静音文件，不打开用户媒体或发起模型网络请求。
+bool writeInlineAudioFixture(const QString& path) {
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) return false;
+    QDataStream stream(&file);
+    stream.setByteOrder(QDataStream::LittleEndian);
+    constexpr quint32 sampleRate = 8000;
+    constexpr quint32 bytes = sampleRate * 5 * 2;
+    stream.writeRawData("RIFF", 4);
+    stream << quint32(36 + bytes);
+    stream.writeRawData("WAVEfmt ", 8);
+    stream << quint32(16) << quint16(1) << quint16(1) << sampleRate << sampleRate * 2 << quint16(2) << quint16(16);
+    stream.writeRawData("data", 4);
+    stream << bytes;
+    return stream.status() == QDataStream::Ok && file.write(QByteArray(bytes, '\0')) == bytes;
+}
 
 // Capture only isolated local fixtures; no user history or model request is involved.
 bool captureAgentFixture(QWidget& panel, const QString& name) {
@@ -506,6 +525,7 @@ private slots:
     void completedPdfToolShowsPreviewCardAfterRestore();
     void videoArtifactUsesCompactPlayBadge();
     void audioArtifactUsesCompactPlaybackCard();
+    void inlineAudioPausesWhenSwitchingSessions();
     void quotedMessageIsSentAndShownInTheComposer();
     void remotePromptAppearsInOpenOwnerSession();
     void localPromptKeepsOneBubbleAfterUserMessageEvent();
@@ -767,6 +787,48 @@ void AgentPanelSessionTest::audioArtifactUsesCompactPlaybackCard() {
     if (!capturePath.isEmpty()) QVERIFY(panel.grab().save(capturePath));
 }
 
+void AgentPanelSessionTest::inlineAudioPausesWhenSwitchingSessions() {
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    QVERIFY(writeInlineAudioFixture(workspace.filePath(QStringLiteral("sample.wav"))));
+    AgentController controller(std::make_unique<AudioDeliveringModel>(), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(700, 500);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString first = controller.createSession(workspace.path());
+    panel.openSession(first);
+    QVERIFY(controller.sendPrompt(first, QStringLiteral("Show the audio")));
+    controller.agent().waitIdle();
+    QTRY_VERIFY_WITH_TIMEOUT(panel.findChild<QPushButton*>(QStringLiteral("agentMediaAudioPlay")), 5000);
+    auto* play = panel.findChild<QPushButton*>(QStringLiteral("agentMediaAudioPlay"));
+    QPointer<DesktopAudioPlayback> audio =
+        panel.findChild<DesktopAudioPlayback*>(QStringLiteral("agentInlineAudioPlayback"));
+    QVERIFY(audio);
+    auto* duration = panel.findChild<QLabel*>(QStringLiteral("agentMediaAudioDuration"));
+    QVERIFY(duration);
+    QTRY_COMPARE_WITH_TIMEOUT(duration->text(), QStringLiteral("0:05"), 3000);
+    play->click();
+    QTRY_VERIFY_WITH_TIMEOUT(
+        audio && audio->state() == DesktopAudioPlayback::State::Playing && audio->positionUs() > 100000, 3000);
+    const QString second = controller.createSession(workspace.path());
+    panel.openSession(second);
+    QVERIFY(audio);
+    QTRY_COMPARE_WITH_TIMEOUT(audio->state(), DesktopAudioPlayback::State::Paused, 1500);
+    const qint64 pausedAt = audio->positionUs();
+    QTest::qWait(150);
+    QVERIFY(qAbs(audio->positionUs() - pausedAt) < 60000);
+    panel.openSession(first);
+    QVERIFY(audio);
+    QCOMPARE(audio->state(), DesktopAudioPlayback::State::Paused);
+    QCOMPARE(panel.findChild<QPushButton*>(QStringLiteral("agentMediaAudioPlay"))->accessibleName(),
+             QStringLiteral("播放音频"));
+    play->click();
+    QTRY_VERIFY_WITH_TIMEOUT(
+        audio->state() == DesktopAudioPlayback::State::Playing && audio->positionUs() > pausedAt + 50000, 2000);
+    audio->stop();
+}
+
 void AgentPanelSessionTest::quotedMessageIsSentAndShownInTheComposer() {
     AgentController controller(std::make_unique<CapturingModel>(), QString());
     AgentChatPanel panel(controller);
@@ -917,8 +979,9 @@ void AgentPanelSessionTest::inlineMediaBubblesRespectMessageBoundary() {
     for (QPushButton* bubble : panel.findChildren<QPushButton*>(QStringLiteral("agentTextMediaBubble"))) {
         if (bubble->text().contains(QStringLiteral("clip.mp4"))) QTest::mouseClick(bubble, Qt::LeftButton);
     }
-    QCOMPARE(QDir::fromNativeSeparators(openedVideo),
-             QDir::fromNativeSeparators(directory.filePath(QStringLiteral("clip.mp4"))));
+    // 回调返回解析过符号链接的路径；/var 与 /private/var 仍必须指向同一个已创建文件。
+    QCOMPARE(QFileInfo(openedVideo).canonicalFilePath(),
+             QFileInfo(directory.filePath(QStringLiteral("clip.mp4"))).canonicalFilePath());
     QVERIFY(videoPlaylist.contains(openedVideo));
     QVERIFY(controller.sendPrompt(session, QStringLiteral("second")));
     controller.agent().waitIdle();

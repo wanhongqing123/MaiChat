@@ -16,8 +16,6 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QNetworkProxyFactory>
-#include <QNetworkProxyQuery>
 #include <QPointer>
 #include <QRegularExpression>
 #include <QtMath>
@@ -863,7 +861,7 @@ void TimSdkRemoteIMClient::createGroup(const QString& name, const QStringList& m
     request[QStringLiteral("create_group_param_group_member_array")] = memberArray;
     const QPointer<TimSdkRemoteIMClient> self(this);
     const auto account = currentAccount();
-    api_->createGroup(compactJson(request), [self, account, cleanName, memberCount = members.size() + 1,
+    api_->createGroup(compactJson(request), [self, account, cleanName, memberCount = static_cast<int>(members.size()) + 1,
                                               completion = std::move(completion)](
         int code, const QString& description, const QString& payload) mutable {
         if (!self) return;
@@ -2056,48 +2054,32 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
     emitReceivedMessages(received, /*live=*/true);
 }
 
-void TimSdkRemoteIMClient::fetchAttachment(
-    const QString& url, const QString& targetPath, qint64 maximumBytes,
-    std::function<void(DesktopCurlAttachmentResult)> completion) {
+void TimSdkRemoteIMClient::fetchAttachment(const QString& url, const QString& targetPath, qint64 maximumBytes,
+                                           std::function<void(DesktopCurlAttachmentResult)> completion) {
     if (QThread::currentThread() != thread()) {
         const QPointer<TimSdkRemoteIMClient> self(this);
         if (!self) return;
-        QMetaObject::invokeMethod(self.data(),
+        QMetaObject::invokeMethod(
+            self.data(),
             [self, url, targetPath, maximumBytes, completion = std::move(completion)]() mutable {
                 if (self) self->fetchAttachment(url, targetPath, maximumBytes, std::move(completion));
-            }, Qt::QueuedConnection);
+            },
+            Qt::QueuedConnection);
         return;
     }
     const QUrl location(url);
-    QNetworkProxy proxy(QNetworkProxy::DefaultProxy);
-    if (location.host() == QStringLiteral("localhost") ||
-        location.host() == QStringLiteral("127.0.0.1")) {
-        proxy = QNetworkProxy(QNetworkProxy::NoProxy);
-    } else {
-        const auto candidates = QNetworkProxyFactory::systemProxyForQuery(QNetworkProxyQuery(location));
-        for (const QNetworkProxy& candidate : candidates) {
-            if (candidate.type() == QNetworkProxy::NoProxy ||
-                candidate.type() == QNetworkProxy::HttpProxy ||
-                candidate.type() == QNetworkProxy::Socks5Proxy) {
-                proxy = candidate;
-                break;
-            }
-        }
-    }
     const auto canceled = downloadsCanceled_;
     const QByteArray caPem = attachmentCaPem_;
     auto* watcher = new QFutureWatcher<DesktopCurlAttachmentResult>(this);
     connect(watcher, &QFutureWatcher<DesktopCurlAttachmentResult>::finished, this,
             [watcher, completion = std::move(completion)]() mutable {
-        DesktopCurlAttachmentResult result = watcher->result();
-        watcher->deleteLater();
-        completion(result);
-    });
-    watcher->setFuture(QtConcurrent::run(
-        [location, targetPath, maximumBytes, caPem, proxy, canceled] {
-            return DesktopCurlAttachmentDownload::perform(
-                location, targetPath, maximumBytes, caPem, proxy, canceled);
-        }));
+                DesktopCurlAttachmentResult result = watcher->result();
+                watcher->deleteLater();
+                completion(result);
+            });
+    watcher->setFuture(QtConcurrent::run([location, targetPath, maximumBytes, caPem, canceled] {
+        return DesktopCurlAttachmentDownload::perform(location, targetPath, maximumBytes, caPem, canceled);
+    }));
 }
 
 void TimSdkRemoteIMClient::handleIncomingImageUrl(RemoteIMMessage message, const QString& url, bool live) {
