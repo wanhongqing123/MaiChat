@@ -89,15 +89,23 @@ delivery does not claim coverage of the newly found Qt decoding paths.
 
 ## Task 4: Verify the actual products and freeze
 
-- [ ] Normally compile all affected header consumers and ordinary components on
+- [x] Normally compile all affected header consumers and ordinary components on
   Windows/Mac. The ordinary codec must have no Qt import requirement.
-- [ ] Run the frozen preview reproduction and native/presentation image tests,
+- [x] Run the frozen preview reproduction and native/presentation image tests,
   then existing loader, MainWindow, AgentPanel, application/avatar, host tools,
   QR, cloud-drive, vision and portrait regressions as applicable.
-- [ ] Inspect an owned image-preview/composer UI capture; never capture another
+- [x] Inspect an owned image-preview/composer UI capture; never capture another
   user window or reuse an image-generation result as a decoder fixture.
-- [ ] Record source/binary hashes and original RED/GREEN evidence in a new
+- [x] Record source/binary hashes and original RED/GREEN evidence in a new
   diagnostic. Keep the prior Qt direct-plugin defect and `87c` evidence historical.
-- [ ] Commit/push only the reviewed new scope, and verify any new private package
+- [x] Commit/push only the reviewed new scope, and verify any new private package
   from staging and actual ZIP with dependency/model/bare-PATH gates. Do not
   replace installed apps or public assets.
+
+## Final execution record
+
+- Source committed/pushed directly on main as `4879c147e9c7d8d3c4ac03b78a0e1cb30d5adcf1`.
+- Windows: App + 17 targets build, 17/17 registered suites pass; native 48/0/0.
+- Mac: 19 targets build, 18/18 registered suites pass; native 48/0/0; post-checkout private app-only stage verifies 26 Mach-O files/four models, normal/debug sandbox smokes exit 0.
+- User widgets were captured and visually checked. Windows staging/actual ZIP preserve all 81 file hashes; both have 37 valid PE files and ordinary/debug bare-PATH smokes exit 0.
+- Final exact artifact identities and platform boundaries are in the diagnostic delivery JSON.

@@ -1,7 +1,7 @@
 # Desktop user raster decoding through FFmpeg
 
-Status: final Windows consumer gates pass; source freeze and private packaging
-are being recorded. Baseline is
+Status: source committed as `4879c147e9c7d8d3c4ac03b78a0e1cb30d5adcf1`;
+Windows and Mac final consumer/private-package gates pass. Baseline is
 `87c0b93e4c228031de51502e251e79cdd376bdb6`; the preceding delivery and its private
 packages remain historical, with their recorded Qt decoding limitations.
 
@@ -86,6 +86,8 @@ Generated old build/bin Qt runtimes/plugins were archived before deploying the
 new profile for tests. This does not change the old source SDK, installed App or
 earlier private package. Packaging gates reject retired optional image decoder
 plugins rather than importing them from a stale SDK or stage.
+Raw PPM/RGB fixture bytes are explicitly marked binary so cross-platform Git
+checkouts cannot normalize pixel bytes as text line endings.
 
 ## Consumer regressions and independently reproduced failures
 
@@ -145,7 +147,7 @@ plugins rather than importing them from a stale SDK or stage.
   checked. This evidence uses explicit file URLs; the unchanged native-path test
   separately verifies the Windows drive fix. No full-screen capture is used.
 
-## Remaining verification and boundaries
+## Final verification and boundaries
 
 - Final Windows normal build succeeds for the App and seventeen test targets.
   All **17/17** affected registered suites pass in **161.00 seconds** under
@@ -154,12 +156,34 @@ plugins rather than importing them from a stale SDK or stage.
   document-resource regression **31/0/0**. MainWindow retains its single live-avatar
   skip; Login retains five existing optional/live skips. These internal skips
   are separate from the 17 passing registered suites.
+- Mac reports **19 normal targets built / 18 registered suites passed** in
+  **59.74 seconds**, using the new SDK with all ten platform-specific Qt package
+  and tool locations updated. MainWindow is **156/0/4**, Login **31/0/5**, native
+  **48/0/0**, presentation **9/0/0**, preview **5/0/0** and document **31/0/0**.
+  The post-checkout ordinary/debug sandbox smoke receipts and raw DYLD logs agree
+  on the exact source/signed EXE hashes, PIDs **48687/48879**, exit 0 and all five
+  Qt frameworks plus Cocoa loaded from the new stage. Its package gate checks
+  **26 Mach-O files / four models**. This is an app-only private stage, not an
+  installed or published DMG; runtime execution is only on macOS 27.2 arm64.
+- Windows reconfigures/builds after the source commit. OpenCV's generated Git
+  version string recompiles `src/system.cpp` and relinks the App; no functional
+  program source changes. Staging and actual ZIP extraction have **81 identical
+  files**, **37 PE binaries each** with no missing/retired imports, and preserve
+  four portrait models plus RVM. Ordinary/debug bare-PATH smoke children exit 0
+  for both directories; their five loaded Qt/QWindows modules come from the
+  corresponding package. The exact EXE/ZIP hashes are in the delivery JSON.
+- Root checks Mac's raw 18-suite CTest log, both smoke receipts against the
+  original DYLD logs, and its final post-checkout package receipt. Source/stage
+  hashes agree throughout; all five model hashes (four portrait plus RVM) match
+  the Windows package. The gate's separately listed TRTC SDK driver resource is
+  outside its 26 target Mach-O checks, as recorded in the receipt.
 - The expanded implementation adds targeted animated WebP/APNG, ICO same-item
   selection, TIFF orientation/strict strip errors and HEIF item-padding cases.
   Both platforms record 48 passing native cases after the separate allocation
   fix. The initial 23 cases alone do not establish these advanced-format results.
 - Final consumer regression, source freeze and package checks are recorded in the
-  delivery receipt when complete. Widget/composer captures are owned fixtures,
+  [delivery receipt](maichat-ffmpeg-user-bitmaps-delivery-20261109.json).
+  Widget/composer captures are owned fixtures,
   not a live model or account-session test.
 - No real camera, user media/database, paid supplier, installed-process replacement,
   installation or public release is performed. Mobile execution and macOS 14.4

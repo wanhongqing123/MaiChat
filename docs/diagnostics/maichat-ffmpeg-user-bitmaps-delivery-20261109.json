@@ -1,0 +1,257 @@
+{
+  "source_commit": "4879c147e9c7d8d3c4ac03b78a0e1cb30d5adcf1",
+  "baseline_commit": "87c0b93e4c228031de51502e251e79cdd376bdb6",
+  "product_trees": {
+    "MaiChat": "516356581af214999128fa08ce72baab7db2a47d",
+    "MaiAgent": "69e18eb1e4b587b30ad8b467dd3172bea0443b8e"
+  },
+  "scope": "Desktop user raster file/memory decoding through one ordinary FFmpeg component; Qt owning-pixel presentation and explicit UI/SVG resources; retired qtimageformats source SDK module.",
+  "windows": {
+    "status": "PRIVATE_PACKAGE_VERIFIED",
+    "normal_targets_built": 18,
+    "registered_suites": {
+      "passed": 17,
+      "failed": 0,
+      "seconds": 161.0,
+      "internal_optional_skips": {
+        "MainWindow": 1,
+        "Login": 5
+      }
+    },
+    "qt_tests": {
+      "raster": [
+        48,
+        0,
+        0
+      ],
+      "presentation": [
+        9,
+        0,
+        0
+      ],
+      "preview": [
+        5,
+        0,
+        0
+      ],
+      "document_resources": [
+        31,
+        0,
+        0
+      ]
+    },
+    "qt_version": "6.12.0",
+    "qt_package_and_tool_cache_entries_all_new_prefix": 11,
+    "source_exe_sha256": "2ddcc5b338557b252ee3a939628fa5f725c97ea0633ad055e2f1558c8f818ae6",
+    "zip": {
+      "zip": ".cache/ffmpeg-user-bitmaps-20261109/private-verified/MaiChat-win64-v2.2.52-20261109-4879c147.zip",
+      "bytes": 241337642,
+      "sha256": "07187e6190b4e7ae2d039cb8555adf3139e466346f7f016eb8af75ead6a832b6",
+      "crc": "PASS",
+      "same_file_count": 81,
+      "all_staged_vs_zip_extracted_sha256_equal": true,
+      "exe_sha256": "2ddcc5b338557b252ee3a939628fa5f725c97ea0633ad055e2f1558c8f818ae6",
+      "portrait_model_sha256": {
+        "PortraitModels/face_landmarks.onnx": "f38c3321ceffbc9e95103480ad38cc3f52e7e1bde2bcee7cd9355d0b9138ac0c",
+        "PortraitModels/person_detection.onnx": "47fd5599d6fa17608f03e0eb0ae230baa6e597d7e8a2c8199fe00abea55a701f",
+        "PortraitModels/pose_estimation.onnx": "9d89c599319a18fb7d2e28451a883476164543182bafca5f09eb2cf767ed2f3f",
+        "PortraitModels/selfie_multiclass.onnx": "35ec1ecd9ee7f85073c99c00020b7f6751b69506eeacf683bc8665f6117f85b0"
+      },
+      "rvm_sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828"
+    },
+    "pe_files_checked_in_each_stage_and_zip": 37,
+    "bare_path_smokes": [
+      {
+        "pid": 18780,
+        "exitCode": 0,
+        "qtDebugPlugins": "0"
+      },
+      {
+        "pid": 6456,
+        "exitCode": 0,
+        "qtDebugPlugins": "1"
+      },
+      {
+        "pid": 17664,
+        "exitCode": 0,
+        "qtDebugPlugins": "0"
+      },
+      {
+        "pid": 40888,
+        "exitCode": 0,
+        "qtDebugPlugins": "1"
+      }
+    ]
+  },
+  "mac": {
+    "status": "PRIVATE_APP_ONLY_VERIFIED",
+    "qt_package_and_tool_cache_entries_all_new_prefix": 10,
+    "runtime_platform_boundary": "macOS27.2 only; no macOS14.4 runtime acceptance claimed",
+    "source_exe_sha256": "064e9c9565d55a92be56618532420db1da5fefd4054bb714a51cb039d92636ec",
+    "signed_stage_exe_sha256": "1c44ade5a6832da4e998250581d2cf7002f265b14ceec719614a0dacb4e331c8",
+    "post_checkout_source_commit": "4879c147e9c7d8d3c4ac03b78a0e1cb30d5adcf1",
+    "bare_path_sandbox_smokes": [
+      {
+        "mode": "ordinary",
+        "pid": 48687,
+        "exit": 0,
+        "seconds": 3.202,
+        "all_six_qt_cocoa_components_from_stage": true
+      },
+      {
+        "mode": "debug",
+        "pid": 48879,
+        "exit": 0,
+        "seconds": 0.715,
+        "all_six_qt_cocoa_components_from_stage": true
+      }
+    ],
+    "smoke_receipts": [
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191289-56096610.json",
+        "sha256": "9fc659b49532cb87d013ee266aaff80337e948820d990f3cea9142626a4126da"
+      },
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191289-58518583.log",
+        "sha256": "40d2779392ad8d4450cb4a91332de77c8b84a29b7a1a8a70e9e15f958a80f102"
+      },
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191289-69183692.json",
+        "sha256": "60b4a1c27a0151a23ee9f367dfb9a1817749f0c4a0560b61a30483969c2b6a5e"
+      },
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191290-12956190.log",
+        "sha256": "755bf6e79d3a4e3d1959fd8d1d2486b0be278255229144509016ac1eaafef55b"
+      }
+    ],
+    "normal_targets_built": 19,
+    "registered_suites": {
+      "passed": 18,
+      "failed": 0,
+      "seconds": 59.74
+    },
+    "qt_tests": {
+      "raster": [
+        48,
+        0,
+        0
+      ],
+      "presentation": [
+        9,
+        0,
+        0
+      ],
+      "preview": [
+        5,
+        0,
+        0
+      ],
+      "document_resources": [
+        31,
+        0,
+        0
+      ],
+      "MainWindow": [
+        156,
+        0,
+        4
+      ],
+      "Login": [
+        31,
+        0,
+        5
+      ]
+    },
+    "macho_files_checked": 26,
+    "portrait_models_verified": 4,
+    "models": [
+      {
+        "path": "Contents/Resources/MaiAgentModels/rvm_mobilenetv3_fp32.onnx",
+        "bytes": 14975696,
+        "sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828"
+      },
+      {
+        "path": "Contents/Resources/PortraitModels/face_landmarks.onnx",
+        "bytes": 4920995,
+        "sha256": "f38c3321ceffbc9e95103480ad38cc3f52e7e1bde2bcee7cd9355d0b9138ac0c"
+      },
+      {
+        "path": "Contents/Resources/PortraitModels/person_detection.onnx",
+        "bytes": 11990159,
+        "sha256": "47fd5599d6fa17608f03e0eb0ae230baa6e597d7e8a2c8199fe00abea55a701f"
+      },
+      {
+        "path": "Contents/Resources/PortraitModels/pose_estimation.onnx",
+        "bytes": 5557238,
+        "sha256": "9d89c599319a18fb7d2e28451a883476164543182bafca5f09eb2cf767ed2f3f"
+      },
+      {
+        "path": "Contents/Resources/PortraitModels/selfie_multiclass.onnx",
+        "bytes": 16454560,
+        "sha256": "35ec1ecd9ee7f85073c99c00020b7f6751b69506eeacf683bc8665f6117f85b0"
+      }
+    ],
+    "signature_verify_exit": 0,
+    "sdk_driver_resource_outside_target_macho_gate": [
+      "Contents/Frameworks/TXLiteAVSDK_TRTC_Mac.framework/Versions/A/Resources/PlugIns/TRTCAudioPlugin.driver/Contents/MacOS/TRTCAudioPlugin"
+    ],
+    "raw_final_evidence": [
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191289-56096610.json",
+        "sha256": "9fc659b49532cb87d013ee266aaff80337e948820d990f3cea9142626a4126da"
+      },
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191289-58518583.log",
+        "sha256": "40d2779392ad8d4450cb4a91332de77c8b84a29b7a1a8a70e9e15f958a80f102"
+      },
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191289-69183692.json",
+        "sha256": "60b4a1c27a0151a23ee9f367dfb9a1817749f0c4a0560b61a30483969c2b6a5e"
+      },
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191290-12956190.log",
+        "sha256": "755bf6e79d3a4e3d1959fd8d1d2486b0be278255229144509016ac1eaafef55b"
+      },
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191389-14827326.json",
+        "sha256": "81fb50bd8040ffa654636075b8aa240065960d6aae590f9a2185ee0550697c4f"
+      },
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191389-27719592.json",
+        "sha256": "edb0777cd2043f218062c930fedf3b081fdefab66fae24a765744008426ef221"
+      },
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191389-51544963.json",
+        "sha256": "7a978ebeb4d273c108c0be5fe3fe4075695ecace8eb4ec81cd07c5732d343def"
+      },
+      {
+        "path": ".cache/ffmpeg-user-bitmaps-20261109/mac-final-proof/144115251141768230-1794191389-99302808.log",
+        "sha256": "56870b349498750477a937f36600b557421d42b56768c0a64218a002e5e504c4"
+      }
+    ]
+  },
+  "independent_reproductions": [
+    "Original 38-byte WebP preview failure; unchanged test now passes without qwebp.",
+    "Windows extreme reduction: decoded gray pixels all127; optimized scaling 125..130; accurate rounding fixes original assertion.",
+    "Windows native drive QUrl resource path was rejected; original draft/resource test passes after explicit local-drive handling.",
+    "WinRT140% DPI output exceeded mistakenly added logical axes; original page-size budget restored.",
+    "AVIF ispe metadata hid96x64 native allocation from4000px/axis16 budget; pre-decode coded-header inspection and exact self-allocator cap close the reproduced chain."
+  ],
+  "preservation": {
+    "windows_old_sdk_files_hashed_unchanged": 4325,
+    "windows_old_sdk_total_bytes": 99665737,
+    "qtimageformats_checkout_preserved": true,
+    "installed_apps_replaced": false,
+    "public_release_assets_modified": false,
+    "prior_windows_private_zip_sha256": "e33978010ff55f1d85a83c01a244abe4d20894d07ad40b4ad3c09de90a9c9c5a"
+  },
+  "limitations": [
+    "First-frame raster support is tested with owned fixtures, not every possible format/profile.",
+    "ICC bytes/tagging are retained; no ICC conversion/HDR tone-mapping claim.",
+    "No mobile run, live model vision request, real camera or real desktop input performed.",
+    "Private smoke children skip account/login restore; no existing account log was read or copied."
+  ],
+  "evidence_directory": ".cache/ffmpeg-user-bitmaps-20261109",
+  "windows_final_proof_sha256": "eca0485b441ab76e4c6c108ba3f9aa4e6236255c0e00ae27c9a26c3b7c95318b",
+  "status": "SOURCE_COMMITTED_PRIVATE_PACKAGE_GATES_VERIFIED"
+}
