@@ -16,22 +16,22 @@ the release changes only version metadata.
 
 ## Release procedure and expected result
 
-- [ ] Commit/push the shared version and freeze one source SHA for both hosts.
-- [ ] Normally configure/build both hosts. Verify actual version 2.2.53.
-- [ ] Windows: create a fresh portable stage/ZIP and a separate installer stage,
+- [x] Commit/push the shared version and freeze one source SHA for both hosts.
+- [x] Normally configure/build both hosts. Verify actual version 2.2.53.
+- [x] Windows: create a fresh portable stage/ZIP and a separate installer stage,
   verify PE closure and model hashes, ZIP CRC/extraction and all payload hashes,
   then normal/debug bare-PATH smoke both stage and extracted payloads.
   Compile NSIS and extract its actual payload for comparison; do not run the
   installer against Program Files or terminate an existing application.
-- [ ] Mac: create stage, DMG and ZIP; verify version, signature, dependency/model
+- [x] Mac: create stage, DMG and ZIP; verify version, signature, dependency/model
   closure and normal/debug sandbox smoke from stage, readonly DMG and actual ZIP.
   Record Apple Silicon/macOS 27.2 execution, without a macOS 14.4 claim.
-- [ ] Prepare user-facing release notes, per-host manifests and SHA256SUMS. State
+- [x] Prepare user-facing release notes, per-host manifests and SHA256SUMS. State
   unsigned Windows installer and Mac ad-hoc/not-notarized boundary accurately.
-- [ ] Root creates one new tag/draft at the frozen source commit. Each host adds
+- [x] Root creates one new tag/draft at the frozen source commit. Each host adds
   only its four new assets; never clobber previous assets. Compare GitHub asset
   bytes/digests and the downloaded checksum files with local verified artifacts.
-- [ ] Publish the complete eight-asset release, check public latest/tag/source
+- [x] Publish the complete eight-asset release, check public latest/tag/source
   identity, and preserve the previous release's assets unchanged.
 
 ## Verification boundaries
@@ -39,3 +39,9 @@ the release changes only version metadata.
 This is a desktop client release. It does not deploy SessionSync, run live model
 requests, replace an installed App, operate a real camera or inject desktop
 input. Those earlier acceptance boundaries remain explicit in the release notes.
+
+## Final result
+
+Published GitHub Release v2.2.53 (ID438802912) at 2026-11-09T06:54:29Z;
+public latest, exact36db08d1 source tag and eight asset digests verified.
+Both platforms retain their actual package/signature/installation boundaries.

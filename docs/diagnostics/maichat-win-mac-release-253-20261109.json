@@ -1,0 +1,123 @@
+{
+  "status": "PUBLISHED_VERIFIED",
+  "observedUTC": "2026-11-09T06:54:32.823049+00:00",
+  "releaseID": 438802912,
+  "tag": "v2.2.53",
+  "source": "36db08d1efb67a20b5511b56ae66b359378c5f78",
+  "url": "https://github.com/wanhongqing123/MaiChat/releases/tag/v2.2.53",
+  "publishedAt": "2026-11-09T06:54:29Z",
+  "latest": true,
+  "assetsVerified": 8,
+  "metadataActuallyDownloadedAndCompared": 4,
+  "previousReleaseBodyAndAssetsUnchanged": true,
+  "remoteTagRefs": "60f535d08c4f7e06c938f848125fe5857f8bf702\trefs/tags/v2.2.53\n36db08d1efb67a20b5511b56ae66b359378c5f78\trefs/tags/v2.2.53^{}\n",
+  "version": "2.2.53",
+  "MaiChatTree": "b3e340463d83a6e0ee68a79941d1d55128dbe7db",
+  "CoreTree": "69e18eb1e4b587b30ad8b467dd3172bea0443b8e",
+  "assets": [
+    {
+      "id": 726495188,
+      "name": "MaiChat-macos-arm64-v2.2.53-20261109-36db08d1.dmg",
+      "bytes": 213780637,
+      "digest": "sha256:0dc5f3a435989e6db6ba60fbcc2c7606bbe02482288f55134a3614806aec03e8",
+      "url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.53/MaiChat-macos-arm64-v2.2.53-20261109-36db08d1.dmg"
+    },
+    {
+      "id": 726521708,
+      "name": "MaiChat-macos-arm64-v2.2.53-20261109-36db08d1.zip",
+      "bytes": 214363053,
+      "digest": "sha256:85e1f837a84256d71ea6430957fd8b392e808044a0ecb7ec1f15a01a111d7502",
+      "url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.53/MaiChat-macos-arm64-v2.2.53-20261109-36db08d1.zip"
+    },
+    {
+      "id": 726486631,
+      "name": "MaiChat-Setup-win64-v2.2.53-36db08d1.exe",
+      "bytes": 200972427,
+      "digest": "sha256:fb246f21b856d8d763b6ce6e8f4c966085c06c6cae15359295ad333ed073c107",
+      "url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.53/MaiChat-Setup-win64-v2.2.53-36db08d1.exe"
+    },
+    {
+      "id": 726486629,
+      "name": "MaiChat-win64-v2.2.53-20261109-36db08d1.zip",
+      "bytes": 241337642,
+      "digest": "sha256:c976899d9dd0e1656caef26025b0743d5442d7fd0d7938e6d9f4922dd330bde9",
+      "url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.53/MaiChat-win64-v2.2.53-20261109-36db08d1.zip"
+    },
+    {
+      "id": 726480156,
+      "name": "release-manifest-macos-arm64.json",
+      "bytes": 5880,
+      "digest": "sha256:5fc947989ec2da1b45e7e0cf76078e293fc84c8c9ab2605090a37ec1c5573068",
+      "url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.53/release-manifest-macos-arm64.json"
+    },
+    {
+      "id": 726486633,
+      "name": "release-manifest-win64.json",
+      "bytes": 7900,
+      "digest": "sha256:689f196faab6b71241ef3de96b9bad5d30c2826717784e67d55dc3d4ac448d59",
+      "url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.53/release-manifest-win64.json"
+    },
+    {
+      "id": 726480157,
+      "name": "SHA256SUMS-macos-arm64.txt",
+      "bytes": 332,
+      "digest": "sha256:f2093a12cd3922a49709d7efdc361ef9e68504f7396e46c635514eda8401ba2f",
+      "url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.53/SHA256SUMS-macos-arm64.txt"
+    },
+    {
+      "id": 726486628,
+      "name": "SHA256SUMS-win64.txt",
+      "bytes": 314,
+      "digest": "sha256:cc46c141d5fd9a1ee54a2108bb70c72b38beab7ec3ae929b03fdbd29fc39d333",
+      "url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.53/SHA256SUMS-win64.txt"
+    }
+  ],
+  "windows": {
+    "sourceExeSHA256": "242b202264fdb203cf059236d1b727795149522a2af2aae9a939d1a2ffa366c9",
+    "normalDebugSmokes": 6,
+    "portableAndZipPEFiles": 37,
+    "installerExtractedPEFilesIncludingNSISSupport": 42,
+    "portableFilesIdentical": 81,
+    "installerPayloadFilesIdentical": 81,
+    "modelFilesVerified": 5,
+    "signing": "NotSigned",
+    "installerExecuted": false
+  },
+  "mac": {
+    "sourceExeSHA256": "62b5954a186d31b33ac9d282f8f35b08e0d7de87a6f55ecb6616da79d0f09841",
+    "signedExeSHA256": "2441cb61c93865d5c0ad882e2f6cefee775d8560fa0ac92d05e186a97f5406f7",
+    "normalDebugSmokes": 6,
+    "MachOFiles": 26,
+    "bundleRegularFilesIdentical": 338,
+    "symlinksIdentical": 37,
+    "modelFilesVerified": 5,
+    "signing": {
+      "type": "ad-hoc",
+      "notarized": false,
+      "strictVerificationExit": 0
+    },
+    "compatibility": {
+      "releaseRequirement": "Apple Silicon; macOS 27.2 or later",
+      "actuallyTested": "macOS 27.2 arm64",
+      "macOS14_4RuntimeVerified": false
+    }
+  },
+  "functionalRegression": {
+    "windowsRegisteredSuites": [
+      17,
+      0
+    ],
+    "macRegisteredSuites": [
+      18,
+      0
+    ],
+    "nativeRasterPerPlatform": [
+      48,
+      0,
+      0
+    ],
+    "reusedBecauseOnlyVersionMetadataChanged": true
+  },
+  "evidenceRoot": ".cache/release-253-20261109",
+  "rawMacProofSHA256": "fc243d801cf00975c66915114549fee51858ac1e1ed17edd015fd56b39d7e3be"
+}
