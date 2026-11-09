@@ -11,6 +11,7 @@
 
 #include <QAbstractTextDocumentLayout>
 #include <QAction>
+#include <QApplication>
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDebug>
@@ -63,6 +64,7 @@
 #include <QTextFragment>
 #include <QTextImageFormat>
 #include <QTextLayout>
+#include <QThreadPool>
 #include <QTimer>
 #include <QUrl>
 #include <QUuid>
@@ -97,6 +99,48 @@ const char* const kLineSoft = "#f1f5f9";
 const char* const kAccent = "#0b67b7";
 const char* const kDanger = "#b42318";
 const QString kComposerVideoPrefix = QStringLiteral("maichat-video:");
+
+QThreadPool* composerMediaImportPool() {
+    // Called on the GUI thread. Local composer I/O must not queue behind shared
+    // network jobs, and destroying a panel must not join its in-flight copy.
+    static QPointer<QThreadPool> pool;
+    if (!pool) {
+        pool = new QThreadPool(qApp);
+        pool->setObjectName(QStringLiteral("agentComposerMediaImportPool"));
+        pool->setMaxThreadCount(2);
+    }
+    return pool;
+}
+
+void removeComposerMediaDirectory(const QString& destination) {
+    if (destination.isEmpty()) return;
+    const QString directory = QFileInfo(destination).absolutePath();
+    composerMediaImportPool()->start([directory] { QDir(directory).removeRecursively(); });
+}
+
+QString copyComposerMediaFile(const QString& source, const QString& directory,
+                              const QString& destination, bool removeSourceAfterCopy,
+                              const std::shared_ptr<std::atomic<bool>>& canceled) {
+    const bool copied = [&] {
+        if (canceled->load() || !QDir().mkpath(directory)) return false;
+        QFile input(source);
+        QSaveFile output(destination);
+        if (!input.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly)) return false;
+        while (!input.atEnd()) {
+            if (canceled->load()) return false;
+            const QByteArray bytes = input.read(1024 * 1024);
+            if (bytes.isEmpty() || output.write(bytes) != bytes.size()) return false;
+        }
+        return !canceled->load() && output.commit();
+    }();
+    // Only clipboard files created by this panel grant ownership of the source.
+    if (removeSourceAfterCopy) QFile::remove(source);
+    if (!copied || canceled->load()) {
+        QDir(directory).removeRecursively();
+        return {};
+    }
+    return destination;
+}
 
 // Include every persisted field, with explicit lengths between strings. A
 // completed message may change without receiving a new ID; cached widgets can
@@ -1358,8 +1402,12 @@ struct AgentChatPanel::Runtime : AgentChatPanel::ConversationState {
     QStringList visibleDraftMedia;
     QString visibleDraftSession;
     QSet<QString> unsentImportedPaths;
-    QSet<QString> pendingImportDestinations;
-    std::shared_ptr<std::atomic<bool>> importCanceled = std::make_shared<std::atomic<bool>>(false);
+    struct ComposerMediaImport {
+        QString sessionId;
+        std::shared_ptr<std::atomic<bool>> canceled;
+        QTimer* deadline = nullptr;
+    };
+    QHash<QString, ComposerMediaImport> pendingImports;
     QHash<QString, int> pendingMediaImports;
     int visiblePendingImports = -1;
     QPushButton* send = nullptr;
@@ -2158,9 +2206,10 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
 }
 
 AgentChatPanel::~AgentChatPanel() {
-    runtime_->importCanceled->store(true);
-    for (const QString& path : runtime_->pendingImportDestinations)
-        QtConcurrent::run([path] { QDir(QFileInfo(path).absolutePath()).removeRecursively(); });
+    for (auto it = runtime_->pendingImports.cbegin(); it != runtime_->pendingImports.cend(); ++it) {
+        it->canceled->store(true);
+        removeComposerMediaDirectory(it.key());
+    }
     for (const QString& path : runtime_->unsentImportedPaths) {
         QFile::remove(path);
         QDir().rmdir(QFileInfo(path).absolutePath());
@@ -3786,23 +3835,53 @@ void AgentChatPanel::importComposerMediaFile(const QString& path, bool video, bo
     const QString directory = QDir(storage).filePath(QUuid::createUuid().toString(QUuid::WithoutBraces));
     const QString destination = QDir(directory).filePath(file.fileName());
     runtime_->pendingMediaImports[targetSession] += 1;
-    runtime_->pendingImportDestinations.insert(destination);
-    refreshComposerMediaTray();
+    auto canceled = std::make_shared<std::atomic<bool>>(false);
     auto* watcher = new QFutureWatcher<QString>(this);
+    watcher->setObjectName(QStringLiteral("agentMediaImportWatcher"));
+    auto* deadline = new QTimer(watcher);
+    deadline->setObjectName(QStringLiteral("agentMediaImportDeadline"));
+    deadline->setSingleShot(true);
+    runtime_->pendingImports.insert(destination, {targetSession, canceled, deadline});
+    qInfo().noquote() << "[composer-import] queued id=" << QFileInfo(directory).fileName()
+                      << "video=" << video << "bytes=" << file.size()
+                      << "shared-pool=" << QThreadPool::globalInstance()->activeThreadCount()
+                      << "/" << QThreadPool::globalInstance()->maxThreadCount();
+    refreshComposerMediaTray();
+    connect(deadline, &QTimer::timeout, this, [this, destination, targetSession, canceled] {
+        canceled->store(true);
+        if (!finishComposerMediaImport(destination)) return;
+        // Cleanup is independent of the watcher: the panel may disappear before
+        // an already completed future's queued GUI notification is delivered.
+        removeComposerMediaDirectory(destination);
+        qWarning() << "[composer-import] deadline reached";
+        if (targetSession == runtime_->sessionId) {
+            appendNotice(QStringLiteral("媒体导入超时，已停止等待。输入内容已保留，可重试或继续发送文字。"), true);
+            refreshComposerMediaTray();
+        }
+    });
+    // Bound the UI wait even if a storage operation cannot be interrupted yet.
+    // A late worker result is discarded using its job's cancellation flag.
+    deadline->start(60000);
     connect(watcher, &QFutureWatcher<QString>::finished, this,
-            [this, watcher, targetSession, video, destination, fileName = file.fileName()] {
-                const QString imported = watcher->result();
+            [this, watcher, targetSession, video, destination, canceled, fileName = file.fileName()] {
+                const bool pending = finishComposerMediaImport(destination);
+                QString imported;
+                try {
+                    imported = watcher->result();
+                } catch (...) {
+                    // A failed future must settle its pending count as well.
+                    qWarning() << "[composer-import] worker failed";
+                }
                 watcher->deleteLater();
-                runtime_->pendingImportDestinations.remove(destination);
-                const int remaining = runtime_->pendingMediaImports.value(targetSession) - 1;
-                if (remaining > 0)
-                    runtime_->pendingMediaImports[targetSession] = remaining;
-                else
-                    runtime_->pendingMediaImports.remove(targetSession);
+                if (!pending || canceled->load()) {
+                    removeComposerMediaDirectory(destination);
+                    return;
+                }
                 MaiSession session;
                 if (!runtime_->controller->agent().getSession(toUtf8(targetSession), session)) {
-                    if (!imported.isEmpty()) QDir(QFileInfo(imported).absolutePath()).removeRecursively();
+                    removeComposerMediaDirectory(destination);
                 } else if (imported.isEmpty()) {
+                    removeComposerMediaDirectory(destination);
                     if (targetSession == runtime_->sessionId)
                         appendNotice(QStringLiteral("媒体导入失败：%1").arg(fileName), true);
                 } else {
@@ -3811,24 +3890,45 @@ void AgentChatPanel::importComposerMediaFile(const QString& path, bool video, bo
                 }
                 if (targetSession == runtime_->sessionId) refreshComposerMediaTray();
             });
-    watcher->setFuture(QtConcurrent::run([source = file.absoluteFilePath(), directory, destination,
-                                          removeSourceAfterCopy, canceled = runtime_->importCanceled] {
-        if (!QDir().mkpath(directory)) {
-            if (removeSourceAfterCopy) QFile::remove(source);
-            return QString();
-        }
-        if (!QFile::copy(source, destination)) {
-            QDir(directory).removeRecursively();
-            if (removeSourceAfterCopy) QFile::remove(source);
-            return QString();
-        }
-        if (removeSourceAfterCopy) QFile::remove(source);
-        if (canceled->load()) {
-            QDir(directory).removeRecursively();
-            return QString();
-        }
-        return destination;
+    watcher->setFuture(QtConcurrent::run(composerMediaImportPool(),
+        [source = file.absoluteFilePath(), directory, destination, removeSourceAfterCopy, canceled] {
+        qInfo() << "[composer-import] copying id=" << QFileInfo(directory).fileName();
+        const QString imported = copyComposerMediaFile(source, directory, destination, removeSourceAfterCopy, canceled);
+        qInfo() << "[composer-import] copy returned success=" << !imported.isEmpty();
+        return imported;
     }));
+}
+
+bool AgentChatPanel::finishComposerMediaImport(const QString& destination) {
+    const auto it = runtime_->pendingImports.find(destination);
+    if (it == runtime_->pendingImports.end()) return false;
+    const QString sessionId = it->sessionId;
+    it->deadline->stop();
+    runtime_->pendingImports.erase(it);
+    const int remaining = runtime_->pendingMediaImports.value(sessionId) - 1;
+    if (remaining > 0)
+        runtime_->pendingMediaImports[sessionId] = remaining;
+    else
+        runtime_->pendingMediaImports.remove(sessionId);
+    return true;
+}
+
+void AgentChatPanel::cancelComposerMediaImports() {
+    const QString sessionId = runtime_->sessionId;
+    QStringList destinations;
+    for (auto it = runtime_->pendingImports.cbegin(); it != runtime_->pendingImports.cend(); ++it) {
+        if (it->sessionId != sessionId) continue;
+        it->canceled->store(true);
+        destinations.append(it.key());
+    }
+    for (const QString& destination : destinations) {
+        finishComposerMediaImport(destination);
+        removeComposerMediaDirectory(destination);
+    }
+    if (!destinations.isEmpty()) {
+        appendNotice(QStringLiteral("已取消媒体导入，输入内容已保留。"), false);
+        refreshComposerMediaTray();
+    }
 }
 
 QStringList AgentChatPanel::composerImagePaths() const {
@@ -3970,12 +4070,23 @@ void AgentChatPanel::refreshComposerMediaTray() {
             row->addWidget(card);
         }
         if (pending > 0) {
-            auto* loading = new QLabel(QStringLiteral("正在导入媒体（%1）…").arg(pending), runtime_->mediaTray);
+            auto* loading = new QWidget(runtime_->mediaTray);
+            loading->setObjectName(QStringLiteral("agentPendingMediaImport"));
             loading->setFixedSize(UiZoom::s(160), UiZoom::s(90));
-            loading->setAlignment(Qt::AlignCenter);
+            auto* layout = new QVBoxLayout(loading);
+            layout->setContentsMargins(UiZoom::s(6), UiZoom::s(8), UiZoom::s(6), UiZoom::s(8));
+            auto* label = new QLabel(QStringLiteral("正在导入媒体（%1）…").arg(pending), loading);
+            label->setAlignment(Qt::AlignCenter);
+            layout->addWidget(label);
+            auto* cancel = new QPushButton(QStringLiteral("取消导入"), loading);
+            cancel->setObjectName(QStringLiteral("agentCancelMediaImports"));
+            cancel->setCursor(Qt::PointingHandCursor);
+            connect(cancel, &QPushButton::clicked, this, &AgentChatPanel::cancelComposerMediaImports);
+            layout->addWidget(cancel);
             UiZoom::setStyle(
                 loading,
-                QStringLiteral("QLabel{color:#667085;background:#f3f7fb;border-radius:8px;font-size: @metadata;}"));
+                QStringLiteral("QWidget{color:#667085;background:#f3f7fb;border-radius:8px;font-size: @metadata;}"
+                               "QPushButton{color:#0b67b7;border:0;padding:3px;}"));
             row->addWidget(loading);
         }
         row->addStretch(1);

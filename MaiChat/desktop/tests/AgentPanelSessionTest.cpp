@@ -4,9 +4,12 @@
 #include <QClipboard>
 #include <QDir>
 #include <QDataStream>
+#include <QDebug>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QFuture>
+#include <QFutureWatcher>
 #include <QImage>
 #include <QLabel>
 #include <QListWidget>
@@ -25,7 +28,10 @@
 #include <QTemporaryDir>
 #include <QTextEdit>
 #include <QTextCursor>
+#include <QThreadPool>
+#include <QTimer>
 #include <QUrl>
+#include <QtConcurrent/QtConcurrentRun>
 #include <QtTest>
 
 #include <algorithm>
@@ -452,6 +458,144 @@ bool captureProgressFixture(AgentChatPanel& panel, const QString& name) {
     return panel.grab().save(QDir(directory).filePath(name + QStringLiteral(".png")));
 }
 
+QString mediaImportPendingText(const AgentChatPanel& panel) {
+    QStringList pending;
+    const auto* tray = panel.findChild<QScrollArea*>(QStringLiteral("agentMediaDraftTray"));
+    if (!tray) return {};
+    for (const auto* label : tray->findChildren<QLabel*>())
+        if (label->text().startsWith(QStringLiteral("正在导入媒体"))) pending.push_back(label->text());
+    return pending.join(QStringLiteral(" | "));
+}
+
+// Block only this test's media worker and retain its state until the worker exits.
+// Every assertion-return path releases it and restores the original capacity;
+// never use waitForDone(), which could wait for unrelated work in the same pool.
+class ScopedComposerImportBlocker {
+public:
+    explicit ScopedComposerImportBlocker(QThreadPool* pool)
+        : pool_(pool), previousMax_(pool->maxThreadCount()), gate_(std::make_shared<Gate>()) {
+        pool_->setMaxThreadCount(1);
+        blocker_ = QtConcurrent::run(pool_, [gate = gate_] {
+            gate->entered.release();
+            gate->release.acquire();
+        });
+    }
+    ~ScopedComposerImportBlocker() {
+        release();
+    }
+    bool waitUntilEntered() {
+        return gate_->entered.tryAcquire(1, 1000);
+    }
+    bool isBlocked() const {
+        return !blocker_.isFinished();
+    }
+    void release() {
+        if (released_) return;
+        released_ = true;
+        gate_->release.release();
+        pool_->setMaxThreadCount(previousMax_);
+        blocker_.waitForFinished();
+    }
+
+private:
+    struct Gate {
+        QSemaphore entered;
+        QSemaphore release;
+    };
+    QThreadPool* pool_;
+    int previousMax_;
+    std::shared_ptr<Gate> gate_;
+    QFuture<void> blocker_;
+    bool released_ = false;
+};
+
+enum class MediaImportTermination { Cancel, Deadline };
+
+void verifyMediaImportTermination(MediaImportTermination termination) {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString imagePath = directory.filePath(QStringLiteral("terminal-import.png"));
+    QImage image(32, 24, QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::blue);
+    QVERIFY(image.save(imagePath, "PNG"));
+    auto model = std::make_unique<CapturingModel>();
+    CapturingModel* captured = model.get();
+    AgentController controller(std::move(model), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(700, 500);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel, 1000));
+    panel.openSession(controller.createSession(directory.path()));
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    QVERIFY(editor && send);
+    const auto pasteFixture = [editor, imagePath] {
+        auto* mime = new QMimeData;
+        mime->setUrls({QUrl::fromLocalFile(imagePath)});
+        QApplication::clipboard()->setMimeData(mime);
+        editor->paste();
+    };
+    // A normal completed import creates the production pool. Clear its marker
+    // before blocking that pool, so only the second import can affect this case.
+    pasteFixture();
+    QTRY_VERIFY_WITH_TIMEOUT(editor->toPlainText().contains(QChar(0xFFFC)), 1000);
+    editor->clear();
+    QTRY_VERIFY_WITH_TIMEOUT(mediaImportPendingText(panel).isEmpty(), 1000);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        panel.findChildren<QFutureWatcherBase*>(QStringLiteral("agentMediaImportWatcher")).isEmpty(), 1000);
+    auto* pool = qApp->findChild<QThreadPool*>(QStringLiteral("agentComposerMediaImportPool"));
+    QVERIFY2(pool, "The ordinary composer import must expose its named diagnostic pool.");
+    ScopedComposerImportBlocker blocker(pool);
+    QVERIFY(blocker.waitUntilEntered());
+    const QString text = QStringLiteral("Keep this text while media imports.");
+    editor->setPlainText(text);
+    pasteFixture();
+    QTRY_VERIFY_WITH_TIMEOUT(!mediaImportPendingText(panel).isEmpty(), 1000);
+    QCOMPARE(editor->toPlainText(), text);
+    const QString capturePrefix = QString::fromUtf8(qgetenv("MAICHAT_CAPTURE_MEDIA_IMPORT_PREFIX"));
+    const QString captureKind = termination == MediaImportTermination::Cancel
+                                    ? QStringLiteral("-cancel") : QStringLiteral("-deadline");
+    if (!capturePrefix.isEmpty())
+        QVERIFY(panel.grab().save(capturePrefix + captureKind + QStringLiteral("-pending.png")));
+    auto* watcher = panel.findChild<QFutureWatcherBase*>(QStringLiteral("agentMediaImportWatcher"));
+    QVERIFY(watcher);
+    auto* deadline = watcher->findChild<QTimer*>(QStringLiteral("agentMediaImportDeadline"));
+    QVERIFY(deadline);
+    QVERIFY(deadline->isActive());
+    QVERIFY(deadline->interval() > 0 && deadline->interval() <= 60000);
+    QSignalSpy importFinished(watcher, &QFutureWatcherBase::finished);
+    if (termination == MediaImportTermination::Cancel) {
+        auto* cancel = panel.findChild<QPushButton*>(QStringLiteral("agentCancelMediaImports"));
+        QVERIFY(cancel && cancel->isEnabled());
+        cancel->click();
+    } else {
+        // Exercise the real production timer and event delivery, with no clock
+        // substitute or test-only cancellation API.
+        deadline->start(20);
+    }
+    QTRY_VERIFY_WITH_TIMEOUT(mediaImportPendingText(panel).isEmpty(), 1000);
+    QCOMPARE(editor->toPlainText(), text);
+    if (!capturePrefix.isEmpty())
+        QVERIFY(panel.grab().save(capturePrefix + captureKind + QStringLiteral("-recovered.png")));
+    QVERIFY(blocker.isBlocked());
+    QCOMPARE(importFinished.count(), 0);
+    QVERIFY(send->isEnabled());
+    QSignalSpy turnFinished(&controller, &AgentController::turnFinished);
+    send->click();
+    QTRY_COMPARE_WITH_TIMEOUT(turnFinished.count(), 1, 1000);
+    const MaiModelRequest request = captured->request();
+    QVERIFY(!request.messages.empty());
+    QCOMPARE(QString::fromStdString(request.messages.back().content), text);
+    QVERIFY(request.messages.back().images.empty());
+    const QString laterDraft = QStringLiteral("New text after the import was released.");
+    editor->setPlainText(laterDraft);
+    blocker.release();
+    QTRY_COMPARE_WITH_TIMEOUT(importFinished.count(), 1, 1000);
+    QCOMPARE(editor->toPlainText(), laterDraft);
+    QVERIFY(!editor->toPlainText().contains(QChar(0xFFFC)));
+    QVERIFY(mediaImportPendingText(panel).isEmpty());
+}
+
 }  // namespace
 
 class AgentPanelSessionTest : public QObject {
@@ -516,6 +660,10 @@ private slots:
     void composerPlaceholderFitsAtMinimumHeight();
     void conversationUsesAvailableWidth();
     void pastedImageUsesTheSharedComposerAndReachesTheModel();
+    void mediaImportDoesNotWaitForUnrelatedGlobalPoolWork();
+    void cancelingMediaImportKeepsTextAndIgnoresLateCompletion();
+    void mediaImportDeadlineReleasesTheComposer();
+    void cancelingCompletedImportThenDestroyingPanelCleansOwnedCopy();
     void pastedVideoDraftSurvivesSessionSwitchAndReachesModel();
     void videoImportFinishesInItsOriginalSession();
     void actionPanelMatchesMobileModelAndPolicyFlow();
@@ -2831,6 +2979,143 @@ void AgentPanelSessionTest::pastedImageUsesTheSharedComposerAndReachesTheModel()
     QVERIFY(panel.findChild<MarkdownView*>()->itemCount() >= 2);
     panel.openSession(sessionId);
     QVERIFY(panel.findChild<MarkdownView*>()->itemCount() >= 2);
+}
+
+void AgentPanelSessionTest::mediaImportDoesNotWaitForUnrelatedGlobalPoolWork() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString imagePath = directory.filePath(QStringLiteral("pool-blocked.png"));
+    QImage image(32, 24, QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::blue);
+    QVERIFY(image.save(imagePath, "PNG"));
+
+    auto model = std::make_unique<CapturingModel>();
+    CapturingModel* captured = model.get();
+    AgentController controller(std::move(model), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(700, 500);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel, 1000));
+    const QString sessionId = controller.createSession(directory.path());
+    panel.openSession(sessionId);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    auto* tray = panel.findChild<QScrollArea*>(QStringLiteral("agentMediaDraftTray"));
+    QVERIFY(editor && send && tray);
+
+    struct PoolGate {
+        QSemaphore entered;
+        QSemaphore release;
+    };
+    auto gate = std::make_shared<PoolGate>();
+    QThreadPool* pool = QThreadPool::globalInstance();
+    const int previousMax = pool->maxThreadCount();
+    pool->setMaxThreadCount(1);
+    const QFuture<void> blocker = QtConcurrent::run([gate] {
+        gate->entered.release();
+        gate->release.acquire();
+    });
+    // Declare after the panel so an assertion failure releases this test's own
+    // worker before panel destruction queues cleanup. Never wait on unrelated
+    // global work; restore the original pool capacity on every return path.
+    struct RestoreGlobalPool {
+        QThreadPool* pool;
+        int previousMax;
+        std::shared_ptr<PoolGate> gate;
+        QFuture<void> blocker;
+        ~RestoreGlobalPool() {
+            gate->release.release();
+            blocker.waitForFinished();
+            pool->setMaxThreadCount(previousMax);
+        }
+    } restoreGlobalPool{pool, previousMax, gate, blocker};
+    QVERIFY2(gate->entered.tryAcquire(1, 1000), "The owned global-pool blocker must start before pasting.");
+    QVERIFY(!blocker.isFinished());
+
+    auto* mime = new QMimeData;
+    mime->setUrls({QUrl::fromLocalFile(imagePath)});
+    QApplication::clipboard()->setMimeData(mime);
+    editor->setFocus();
+    QTest::keyClick(editor, Qt::Key_V, Qt::ControlModifier);
+    qInfo().noquote() << "media-import global-pool after paste: pending=" << mediaImportPendingText(panel)
+                      << "active=" << pool->activeThreadCount() << "max=" << pool->maxThreadCount();
+    // A shared pool occupied by another long-running job must not leave a local
+    // media copy pending. This controlled mechanism is not a live-incident claim.
+    QTRY_VERIFY_WITH_TIMEOUT(editor->toPlainText().contains(QChar(0xFFFC)), 1000);
+    const auto hasPendingImport = [tray] {
+        for (const auto* label : tray->findChildren<QLabel*>())
+            if (label->text().startsWith(QStringLiteral("正在导入媒体"))) return true;
+        return false;
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(!hasPendingImport(), 1000);
+    QVERIFY(!blocker.isFinished());
+    QVERIFY(send->isEnabled());
+    QVERIFY(QFile::remove(imagePath));
+    QSignalSpy finished(&controller, &AgentController::turnFinished);
+    QTest::mouseClick(send, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 1000);
+    QVERIFY(!blocker.isFinished());
+    const MaiModelRequest request = captured->request();
+    QVERIFY(!request.messages.empty());
+    QCOMPARE(request.messages.back().images.size(), std::size_t(1));
+    const QString importedPath = QString::fromStdString(request.messages.back().images.front().path);
+    QVERIFY(importedPath.startsWith(directory.path() + QStringLiteral("/ComposerMedia/")));
+    QVERIFY(QFileInfo(importedPath).isFile());
+}
+
+void AgentPanelSessionTest::cancelingMediaImportKeepsTextAndIgnoresLateCompletion() {
+    verifyMediaImportTermination(MediaImportTermination::Cancel);
+}
+
+void AgentPanelSessionTest::mediaImportDeadlineReleasesTheComposer() {
+    verifyMediaImportTermination(MediaImportTermination::Deadline);
+}
+
+void AgentPanelSessionTest::cancelingCompletedImportThenDestroyingPanelCleansOwnedCopy() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString imagePath = directory.filePath(QStringLiteral("completed-before-cancel.png"));
+    QImage image(32, 24, QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::blue);
+    QVERIFY(image.save(imagePath, "PNG"));
+    AgentController controller(std::make_unique<SilentModel>(), QString());
+    auto panel = std::make_unique<AgentChatPanel>(controller);
+    panel->resize(700, 500);
+    panel->show();
+    QVERIFY(QTest::qWaitForWindowExposed(panel.get(), 1000));
+    panel->openSession(controller.createSession(directory.path()));
+    auto* editor = panel->findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    QVERIFY(editor);
+    auto* mime = new QMimeData;
+    mime->setUrls({QUrl::fromLocalFile(imagePath)});
+    QApplication::clipboard()->setMimeData(mime);
+    editor->paste();
+    auto* watcher = panel->findChild<QFutureWatcherBase*>(QStringLiteral("agentMediaImportWatcher"));
+    auto* cancel = panel->findChild<QPushButton*>(QStringLiteral("agentCancelMediaImports"));
+    QVERIFY(watcher && cancel && cancel->isEnabled());
+    QSignalSpy deliveredFinished(watcher, &QFutureWatcherBase::finished);
+    QElapsedTimer elapsed;
+    elapsed.start();
+    // Do not pump GUI events or call waitForFinished(): the copy must physically
+    // finish on its worker while its GUI completion is still queued. Waiting on
+    // the future could instead steal that worker task into this GUI thread.
+    while (!watcher->isFinished() && elapsed.elapsed() < 1000)
+        QTest::qSleep(5);
+    QVERIFY2(watcher->isFinished(), "The owned copy must complete before canceling the queued GUI result.");
+    QCOMPARE(deliveredFinished.count(), 0);
+    QVERIFY(!editor->toPlainText().contains(QChar(0xFFFC)));
+    const QString storage = directory.filePath(QStringLiteral("ComposerMedia"));
+    const QStringList importedDirectories = QDir(storage).entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    QCOMPARE(importedDirectories.size(), 1);
+    const QString ownedDirectory = QDir(storage).filePath(importedDirectories.front());
+    QVERIFY(QFileInfo(QDir(ownedDirectory).filePath(QFileInfo(imagePath).fileName())).isFile());
+    // Cancel and destroy without an intervening event loop. Cleanup must not
+    // depend on the panel receiving the already-queued watcher completion.
+    cancel->click();
+    panel.reset();
+    QVERIFY(QFileInfo(imagePath).isFile());
+    QTRY_VERIFY_WITH_TIMEOUT(!QFileInfo::exists(ownedDirectory), 1000);
+    QVERIFY(QFileInfo(imagePath).isFile());
 }
 
 void AgentPanelSessionTest::pastedVideoDraftSurvivesSessionSwitchAndReachesModel() {

@@ -143,6 +143,10 @@ private:
     void insertComposerImageFile(const QString& path);
     void insertComposerVideoFile(const QString& path);
     void importComposerMediaFile(const QString& path, bool video, bool removeSourceAfterCopy = false);
+    // GUI-thread settlement is idempotent: late/canceled copies cannot reclaim
+    // the composer or attach media to an already canceled draft import.
+    bool finishComposerMediaImport(const QString& destination);
+    void cancelComposerMediaImports();
     void insertComposerMediaMarker(const QString& path, bool video, const QString& sessionId);
     QString composerMediaDirectory() const;
     QStringList composerImagePaths() const;
