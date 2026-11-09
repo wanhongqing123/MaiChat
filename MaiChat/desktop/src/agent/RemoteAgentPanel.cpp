@@ -237,7 +237,12 @@ public:
             }
             QString name = tool.value(QStringLiteral("tool")).toString().trimmed();
             if (name.isEmpty()) name = QStringLiteral("工具");
-            row->setText(name + QStringLiteral(" · ") + agentToolStateText(state));
+            QString detail = name + QStringLiteral(" · ") + agentToolStateText(state);
+            if (name == QStringLiteral("curl") && state == QStringLiteral("error")) {
+                const QString summary = tool.value(QStringLiteral("error")).toString();
+                if (!summary.isEmpty()) detail += QLatin1Char('\n') + summary;
+            }
+            row->setText(detail);
         }
         for (const QString& id : rows_.keys())
             if (!wanted.contains(id)) removeDetail(rows_.take(id));
@@ -1458,11 +1463,18 @@ void RemoteAgentPanel::renderMessages() {
                 if (projection) continue;
                 if (kind == QStringLiteral("tool")) {
                     flush();
-                    // This remote projection intentionally contains only real
-                    // synchronized names/states, never tool parameters/results.
-                    tools.append(QJsonObject{{QStringLiteral("id"), partIdentity(part, index)},
-                                              {QStringLiteral("tool"), part.value(QStringLiteral("tool"))},
-                                              {QStringLiteral("state"), part.value(QStringLiteral("state"))}});
+                    // 宿主仅为 curl 失败发送不含原始日志的静态摘要；它也参与 fingerprint，
+                    // 使同 id/state 的迟到摘要能够刷新。其它工具仍不显示参数或执行结果。
+                    QJsonObject tool{{QStringLiteral("id"), partIdentity(part, index)},
+                                      {QStringLiteral("tool"), part.value(QStringLiteral("tool"))},
+                                      {QStringLiteral("state"), part.value(QStringLiteral("state"))}};
+                    if (part.value(QStringLiteral("tool")) == QStringLiteral("curl") &&
+                        part.value(QStringLiteral("state")) == QStringLiteral("error")) {
+                        const QString summary = part.value(QStringLiteral("error")).toString();
+                        if (!summary.isEmpty() && summary.size() <= 256)
+                            tool.insert(QStringLiteral("error"), summary);
+                    }
+                    tools.append(tool);
                 } else {
                     flushTools();
                     // Media is a separate visible artifact, so a later tool or

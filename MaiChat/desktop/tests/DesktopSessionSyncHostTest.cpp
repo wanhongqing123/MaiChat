@@ -154,6 +154,9 @@ private slots:
     void remotePromptCreatesScheduledTaskOnItsOwner();
     void resolvedSessionFileStaysInsideItsOwnerWorkspace();
     void omitsLocalMediaPathsFromRemoteHistory();
+    void projectsOnlySafeCurlFailureSummaries_data();
+    void projectsOnlySafeCurlFailureSummaries();
+    void remotePanelDisplaysCurlFailureSummaryAndRefreshesIt();
     void coordinatorRoutesPhoneCommandToTheExistingDesktopSession();
     void coordinatorKeepsInputOrderDuringAttachmentPreparation_data();
     void coordinatorKeepsInputOrderDuringAttachmentPreparation();
@@ -1265,6 +1268,177 @@ void DesktopSessionSyncHostTest::omitsLocalMediaPathsFromRemoteHistory() {
         }
     }
     QVERIFY(sawImage);
+}
+
+void DesktopSessionSyncHostTest::projectsOnlySafeCurlFailureSummaries_data() {
+    QTest::addColumn<QString>("toolName");
+    QTest::addColumn<int>("toolState");
+    QTest::addColumn<QString>("storedError");
+    QTest::addColumn<QString>("expectedSummary");
+
+    // 远端只需要 curl 的退出码分类；日志里的请求头、签名地址和凭据不能成为正文。
+    const QString privateLog = QStringLiteral(
+        "Authorization: Bearer FAKE_BEARER_SECRET\n"
+        "https://private.example.test/download?signature=FAKE_SIGNATURE&token=FAKE_URL_TOKEN\n"
+        "password=FAKE_PASSWORD token=FAKE_TOKEN private response body");
+    const auto curlError = [&privateLog](const QJsonValue& exitStatus) {
+        return QString::fromUtf8(QJsonDocument(QJsonObject{
+            {QStringLiteral("exit_status"), exitStatus},
+            {QStringLiteral("log_tail"), privateLog},
+            {QStringLiteral("log_truncated"), true}}).toJson(QJsonDocument::Compact));
+    };
+    const auto addCurl = [&curlError](const char* name, const QJsonValue& code, const QString& summary) {
+        QTest::newRow(name) << QStringLiteral("curl") << int(MaiToolState::Error) << curlError(code) << summary;
+    };
+    addCurl("certificate", 60, QStringLiteral("curl 失败（错误码 60）：证书验证失败"));
+    addCurl("ca-file", 77, QStringLiteral("curl 失败（错误码 77）：无法加载 CA 证书"));
+    addCurl("dns", 6, QStringLiteral("curl 失败（错误码 6）：无法解析主机名"));
+    addCurl("connection", 7, QStringLiteral("curl 失败（错误码 7）：无法连接服务器"));
+    addCurl("timeout", 28, QStringLiteral("curl 失败（错误码 28）：请求超时"));
+    addCurl("other-valid-code", 42, QStringLiteral("curl 执行失败（错误码 42）"));
+    addCurl("string-code", QStringLiteral("60"), {});
+    addCurl("boolean-code", true, {});
+    addCurl("fractional-code", 60.5, {});
+    addCurl("success-code", 0, {});
+    addCurl("negative-code", -60, {});
+    addCurl("out-of-range-code", 256, {});
+    addCurl("huge-code", 1.0e30, {});
+    addCurl("null-code", QJsonValue(QJsonValue::Null), {});
+    QTest::newRow("missing-code") << QStringLiteral("curl") << int(MaiToolState::Error)
+                                  << QString::fromUtf8(QJsonDocument(QJsonObject{
+                                         {QStringLiteral("log_tail"), privateLog}}).toJson(QJsonDocument::Compact))
+                                  << QString();
+    QTest::newRow("non-object-error") << QStringLiteral("curl") << int(MaiToolState::Error)
+                                      << QStringLiteral("[60]") << QString();
+    QTest::newRow("unstructured-error") << QStringLiteral("curl") << int(MaiToolState::Error)
+                                        << privateLog << QString();
+    QTest::newRow("completed-curl") << QStringLiteral("curl") << int(MaiToolState::Completed)
+                                    << curlError(60) << QString();
+    QTest::newRow("canceled-curl") << QStringLiteral("curl") << int(MaiToolState::Canceled)
+                                   << curlError(60) << QString();
+    QTest::newRow("other-tool") << QStringLiteral("shell") << int(MaiToolState::Error)
+                                << curlError(60) << QString();
+}
+
+void DesktopSessionSyncHostTest::projectsOnlySafeCurlFailureSummaries() {
+    QFETCH(QString, toolName);
+    QFETCH(int, toolState);
+    QFETCH(QString, storedError);
+    QFETCH(QString, expectedSummary);
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    const QString database = workspace.filePath(QStringLiteral("curl-failure-summary.sqlite"));
+    AgentController controller(AgentController::ModelConfig{}, database);
+    const QString session = controller.createSession(workspace.path(), QStringLiteral("Curl failure fixture"));
+    QVERIFY(!session.isEmpty());
+    MaiMessage message;
+    message.id = MaiIdGenerator::newMessageId();
+    message.role = MaiRole::Assistant;
+    message.created = 1000;
+    message.completed = 2000;
+    MaiToolPart curl;
+    curl.tool = toolName.toStdString();
+    curl.state = static_cast<MaiToolState>(toolState);
+    curl.input = "{\"Authorization\":\"Bearer FAKE_INPUT_SECRET\",\"password\":\"FAKE_INPUT_PASSWORD\"}";
+    curl.output = "FAKE_OUTPUT_SECRET private response body";
+    curl.error = storedError.toStdString();
+    message.parts.push_back({MaiIdGenerator::newPartId(), curl, 1001});
+    MaiToolPart ordinary = curl;
+    ordinary.tool = "shell";
+    ordinary.state = MaiToolState::Error;
+    message.parts.push_back({MaiIdGenerator::newPartId(), ordinary, 1002});
+    MaiToolPart question;
+    question.tool = "question";
+    question.state = MaiToolState::Error;
+    question.input = R"({"question":"Use the bundled CA?"})";
+    question.output = "Use the bundled CA";
+    question.error = "Question fixture failed";
+    message.parts.push_back({MaiIdGenerator::newPartId(), question, 1003});
+    {
+        // 直接写入私有持久化夹具，不启动模型、curl 或界面；两个正式历史入口读取同一条记录。
+        auto store = makeMaiSqliteStore(database.toStdString());
+        QVERIFY(store);
+        store.value()->putMessage(session.toStdString(), message);
+        QVERIFY(!store.value()->lastWriteError().hasError());
+    }
+    DesktopSessionSyncHost host(controller);
+    const QJsonArray page = host.historyPage(session, {}, 20).value(QStringLiteral("messages")).toArray();
+    QCOMPARE(page.size(), 1);
+    const QList<QJsonObject> serialized{
+        page.first().toObject(), host.historyMessage(session, QString::fromStdString(message.id))};
+    for (const QJsonObject& snapshot : serialized) {
+        const QByteArray wire = QJsonDocument(snapshot).toJson(QJsonDocument::Compact);
+        for (const char* secret : {"FAKE_", "Authorization", "Bearer", "signature=", "password=", "token=",
+                                   "private.example.test", "private response body", "log_tail", "exit_status"})
+            QVERIFY2(!wire.contains(secret), secret);
+        const QJsonArray parts = snapshot.value(QStringLiteral("parts")).toArray();
+        QCOMPARE(parts.size(), 3);
+        const QJsonObject projected = parts.first().toObject();
+        QCOMPARE(projected.value(QStringLiteral("tool")).toString(), toolName);
+        QCOMPARE(projected.value(QStringLiteral("state")).toString(),
+                 QString::fromLatin1(maiToolStateToString(static_cast<MaiToolState>(toolState))));
+        QVERIFY(!projected.contains(QStringLiteral("input")));
+        QVERIFY(!projected.contains(QStringLiteral("output")));
+        QCOMPARE(projected.value(QStringLiteral("error")).toString(), expectedSummary);
+        QCOMPARE(projected.contains(QStringLiteral("error")), !expectedSummary.isEmpty());
+        const QJsonObject filtered = parts.at(1).toObject();
+        QVERIFY(!filtered.contains(QStringLiteral("input")));
+        QVERIFY(!filtered.contains(QStringLiteral("output")));
+        QVERIFY(!filtered.contains(QStringLiteral("error")));
+        const QJsonObject retainedQuestion = parts.at(2).toObject();
+        QCOMPARE(retainedQuestion.value(QStringLiteral("input")).toString(), QString::fromStdString(question.input));
+        QCOMPARE(retainedQuestion.value(QStringLiteral("output")).toString(), QString::fromStdString(question.output));
+        QCOMPARE(retainedQuestion.value(QStringLiteral("error")).toString(), QString::fromStdString(question.error));
+    }
+}
+
+void DesktopSessionSyncHostTest::remotePanelDisplaysCurlFailureSummaryAndRefreshesIt() {
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    RemoteAgentPanel panel(nullptr, workspace.filePath(QStringLiteral("remote-outbox.json")));
+    panel.resize(800, 500);
+    const QJsonObject owner{{QStringLiteral("owner_device_id"), QStringLiteral("owned-curl-fixture")},
+                             {QStringLiteral("session_id"), QStringLiteral("owned-curl-session")},
+                             {QStringLiteral("online"), true}};
+    panel.openSession(owner);
+    QJsonObject tool{{QStringLiteral("id"), QStringLiteral("part_curl_failure")},
+                      {QStringLiteral("kind"), QStringLiteral("tool")},
+                      {QStringLiteral("tool"), QStringLiteral("curl")},
+                      {QStringLiteral("state"), QStringLiteral("error")}};
+    const auto snapshot = [&tool] {
+        return QJsonObject{{QStringLiteral("id"), QStringLiteral("msg_curl_failure")},
+                            {QStringLiteral("role"), QStringLiteral("assistant")},
+                            {QStringLiteral("parts"), QJsonArray{tool}}};
+    };
+    panel.receivePayload(owner, QStringLiteral("history_page"),
+                         {{QStringLiteral("ok"), true},
+                          {QStringLiteral("messages"), QJsonArray{snapshot()}}});
+    panel.show();
+    const auto groups = panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup"));
+    QCOMPARE(groups.size(), 1);
+    auto* disclosure = groups.first()->findChild<QAbstractButton*>(QStringLiteral("remoteAgentToolGroupDisclosure"));
+    QVERIFY(disclosure);
+    disclosure->click();
+    auto* detail = groups.first()->findChild<QLabel*>(QStringLiteral("remoteAgentToolDetail"));
+    QVERIFY(detail && detail->isVisibleTo(groups.first()));
+    QCOMPARE(detail->text(), QStringLiteral("curl · 失败"));
+    // 同一 tool id/state 迟到的安全摘要也必须刷新，不能被旧三字段 fingerprint 吞掉。
+    for (const QString& summary : {QStringLiteral("curl 失败（错误码 60）：证书验证失败"),
+                                   QStringLiteral("curl 失败（错误码 77）：无法加载 CA 证书")}) {
+        tool.insert(QStringLiteral("error"), summary);
+        panel.receivePayload(owner, QStringLiteral("event"),
+                             {{QStringLiteral("ok"), true},
+                              {QStringLiteral("messages"), QJsonArray{snapshot()}}});
+        QCOMPARE(panel.findChildren<QFrame*>(QStringLiteral("remoteAgentToolGroup")), groups);
+        QCOMPARE(groups.first()->findChild<QLabel*>(QStringLiteral("remoteAgentToolDetail")), detail);
+        QCOMPARE(detail->textFormat(), Qt::PlainText);
+        QVERIFY(detail->text().contains(summary));
+    }
+    const QString capture = qEnvironmentVariable("MAICHAT_CAPTURE_CURL_FAILURE");
+    if (!capture.isEmpty()) {
+        QCoreApplication::processEvents();
+        QVERIFY(panel.grab().save(capture));
+    }
 }
 
 void DesktopSessionSyncHostTest::coordinatorKeepsInputOrderDuringAttachmentPreparation_data() {

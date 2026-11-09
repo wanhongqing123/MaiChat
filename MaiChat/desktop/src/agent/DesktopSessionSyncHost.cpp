@@ -10,6 +10,8 @@
 #include <QUuid>
 
 #include <atomic>
+#include <cmath>
+#include <cstddef>
 #include <mutex>
 #include <unordered_map>
 #include <variant>
@@ -31,6 +33,34 @@ QJsonObject questionFailure(const QString& message, const QString& code) {
     return {{QStringLiteral("ok"), false}, {QStringLiteral("error"), message}, {QStringLiteral("errorCode"), code}};
 }
 
+QString curlFailureSummary(const std::string& error) {
+    // curl 原始日志最多 16 KiB；JSON 控制字符转义最多放大六倍，另留固定信封空间。
+    // 超限时整条拒绝，不能截断 JSON 后再猜错误码；原始日志始终不进入远端快照。
+    constexpr std::size_t kMaximumCurlFailureJsonBytes = 16 * 1024 * 6 + 256;
+    if (error.size() > kMaximumCurlFailureJsonBytes) return {};
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(QByteArray::fromStdString(error), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) return {};
+    const QJsonValue status = document.object().value(QStringLiteral("exit_status"));
+    if (!status.isDouble()) return {};
+    const double numeric = status.toDouble();
+    if (!std::isfinite(numeric) || numeric < 1 || numeric > 255) return {};
+    const int code = static_cast<int>(numeric);
+    if (double(code) != numeric) return {};
+
+    // 只按可信的整数退出码选择静态文案，不拼接 URL、请求头、响应或 stderr。
+    QString reason;
+    switch (code) {
+        case 6: reason = QStringLiteral("无法解析主机名"); break;
+        case 7: reason = QStringLiteral("无法连接服务器"); break;
+        case 28: reason = QStringLiteral("请求超时"); break;
+        case 60: reason = QStringLiteral("证书验证失败"); break;
+        case 77: reason = QStringLiteral("无法加载 CA 证书"); break;
+        default: return QStringLiteral("curl 执行失败（错误码 %1）").arg(code);
+    }
+    return QStringLiteral("curl 失败（错误码 %1）：%2").arg(code).arg(reason);
+}
+
 QJsonObject serializePart(const MaiMessagePart& part) {
     QJsonObject value{{QStringLiteral("id"), text(part.id)}, {QStringLiteral("created"), double(part.created)}};
     if (const auto* body = std::get_if<MaiTextPart>(&part.body)) {
@@ -47,6 +77,10 @@ QJsonObject serializePart(const MaiMessagePart& part) {
             value.insert(QStringLiteral("input"), text(body->input));
             value.insert(QStringLiteral("output"), text(body->output));
             value.insert(QStringLiteral("error"), text(body->error));
+        } else if (body->tool == "curl" && body->state == MaiToolState::Error) {
+            // 普通工具仍仅发布状态；curl 失败只补静态分类，手机无需读取所属设备日志。
+            const QString summary = curlFailureSummary(body->error);
+            if (!summary.isEmpty()) value.insert(QStringLiteral("error"), summary);
         }
     } else if (const auto* body = std::get_if<MaiImagePart>(&part.body)) {
         value.insert(QStringLiteral("kind"), QStringLiteral("image"));

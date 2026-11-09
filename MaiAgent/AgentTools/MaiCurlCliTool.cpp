@@ -175,10 +175,10 @@ public:
         // arguments 是受限 curl 参数列表；output_path 指向新下载文件，text_only
         // 控制 HTML 文本化；max_size_mb 和 timeout_s 分别限制返回体及等待时间。
         return R"({"type":"object","properties":{"arguments":{"type":"array",)"
-            R"("items":{"type":"string"},"minItems":1,"maxItems":32},"output_path":{"type":"string)"
-            R"("},"text_only":{"type":"boolean"},"max_size_mb":{"type":"integer","minimum":1,)"
-            R"("maximum":1024},"timeout_s":{"type":"integer","minimum":1,"maximum":600}},)"
-            R"("required":["arguments"],"additionalProperties":false})";
+               R"("items":{"type":"string"},"minItems":1,"maxItems":32},"output_path":{"type":"string)"
+               R"("},"text_only":{"type":"boolean"},"max_size_mb":{"type":"integer","minimum":1,)"
+               R"("maximum":1024},"timeout_s":{"type":"integer","minimum":1,"maximum":600}},)"
+               R"("required":["arguments"],"additionalProperties":false})";
     }
     bool requiresApproval(const std::string&) const override {
         return true;
@@ -324,7 +324,16 @@ public:
                                             temporary.toUtf8(),
                                             "--dump-header",
                                             headers.toUtf8()};
-        if (!mCaBundlePath.empty()) command.insert(command.end(), {"--cacert", mCaBundlePath});
+        if (!mCaBundlePath.empty()) {
+            command.insert(command.end(), {"--cacert", mCaBundlePath});
+        }
+#if defined(_WIN32)
+        else {
+            // Windows 的 OpenSSL 后端不会自动读取系统根证书；默认与模型客户端保持一致。
+            // 显式 CA 仍是独立信任策略，不能叠加 native 后掩盖错误或缺失的 CA 文件。
+            command.push_back("--ca-native");
+        }
+#endif
         command.insert(command.end(), options.begin(), options.end());
         command.push_back(url);
         std::vector<char*> argv;
