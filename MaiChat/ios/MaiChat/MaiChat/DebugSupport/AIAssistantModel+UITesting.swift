@@ -3,12 +3,20 @@
 import Foundation
 import UIKit
 
+struct AIQuestionAnswerUITestRequest {
+    let sessionID: String
+    let questionID: String
+    let requestID: String
+    let text: String
+}
+
 @MainActor
 final class AIAssistantModelUITestSupport {
     var sessionSwitchEnabled = false
     var screenFrameAccountID: String?
     // Isolated composer fixtures confirm routing without contacting a model.
     var steeringHandler: ((AISteeringRequest) async throws -> String)?
+    var questionHandler: ((AIQuestionAnswerUITestRequest) async throws -> String)?
 }
 
 enum AIAssistantUITestMutation {
@@ -84,6 +92,28 @@ extension AIAssistantModel {
         configured = true
         ready = true
         historyLoaded = true
+    }
+
+    /// Exercise the real message projection, composer and durable answer queue.
+    /// Only the final native receipt is replaced; no model or user history is used.
+    func installQuestionConversationUITestFixture(
+        handler: @escaping (AIQuestionAnswerUITestRequest) async throws -> String
+    ) {
+        installSteeringUITestFixture { _ in
+            throw AIBackendError(message: "Question answers must not become steering messages")
+        }
+        uiTestSupport.questionHandler = handler
+        let question = AIQuestion(id: "question-fixture", question: "复现测试问题：选择哪份素材？",
+            options: ["第一份本地素材", "第二份本地素材"], sessionId: "switch-A",
+            messageId: "question-owner", partId: "question-part", asked: 1000)
+        let input = try! JSONSerialization.data(withJSONObject: [
+            "question": question.question, "options": question.options])
+        questions = [question]
+        messages = [AIMessage(id: "question-owner", role: "assistant", created: 900,
+            completed: 0, active: true, parts: [
+                AIPart(id: "question-intro", kind: "text", text: "请在下方聊天输入框直接回答。"),
+                AIPart(id: "question-part", kind: "tool", tool: "question",
+                    input: String(decoding: input, as: UTF8.self), state: "running")])]
     }
 
     func installScreenFrameUITestWorkspace(_ path: String, accountID: String) {

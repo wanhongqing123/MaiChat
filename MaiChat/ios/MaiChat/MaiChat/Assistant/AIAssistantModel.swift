@@ -4135,6 +4135,19 @@ final class AIAssistantModel: ObservableObject {
                 return try await sendRemoteSteering(to: owner, payload: ["action": "answer", "id": questionID,
                     "text": payload.text, "requestId": entry.requestID], questionID: questionID)
             }
+            #if DEBUG && targetEnvironment(simulator)
+            // Isolated UI tests retain the production queue/binding validation;
+            // only the final native receipt is supplied without contacting a model.
+            if let handler = uiTestSupport.questionHandler {
+                let receivedID = try await handler(AIQuestionAnswerUITestRequest(
+                    sessionID: payload.localSession, questionID: questionID,
+                    requestID: entry.requestID, text: payload.text))
+                guard receivedID == questionID else {
+                    throw AIBackendError(message: "回答送达状态待确认，内容已保留", definitive: false)
+                }
+                return questionID
+            }
+            #endif
             let receipt = try await backend.request("answer", values: ["session": payload.localSession,
                 "id": questionID, "text": payload.text, "requestId": entry.requestID])
             guard receipt.questionID == questionID else {

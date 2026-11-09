@@ -432,6 +432,15 @@ private final class AISteeringUITestProbe: ObservableObject {
             .map { String(decoding: $0, as: UTF8.self) } ?? "invalid-fixture-ledger"
     }
 
+    func answerQuestion(_ request: AIQuestionAnswerUITestRequest) async throws -> String {
+        guard request.sessionID == "switch-A", request.questionID == "question-fixture",
+              !request.requestID.isEmpty else {
+            throw AIBackendError(message: "回答没有绑定原问题和原会话")
+        }
+        status = "已回答 \(request.questionID) · \(request.text)"
+        return request.questionID
+    }
+
     func submit(_ request: AISteeringRequest) async throws -> String {
         let capturedAccount = AIAssistantModel.shared.screenFrameCurrentAccountID
         requests.append(request)
@@ -666,8 +675,14 @@ struct AISteeringUITestRoot: View {
                 appState.masterUserID = "steering-fixture-owner"
                 appState.chatState = MasterChatState(ownerUserID: "steering-fixture-owner")
                 appState.hasCompletedInitialLogin = true
-                AIAssistantModel.shared.installSteeringUITestFixture { request in
-                    try await probe.submit(request)
+                if ProcessInfo.processInfo.arguments.contains("--ai-question-conversation-ui-test") {
+                    AIAssistantModel.shared.installQuestionConversationUITestFixture { request in
+                        try await probe.answerQuestion(request)
+                    }
+                } else {
+                    AIAssistantModel.shared.installSteeringUITestFixture { request in
+                        try await probe.submit(request)
+                    }
                 }
             }
     }

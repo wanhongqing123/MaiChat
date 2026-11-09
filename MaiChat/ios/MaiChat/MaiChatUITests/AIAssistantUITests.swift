@@ -5,6 +5,78 @@ import XCTest
 import UIKit
 
 final class AIAssistantUITests: XCTestCase {
+    /// Explicit, connected-phone diagnostic only. Open the normal installed
+    /// account UI without answering a real question or starting a model request.
+    @MainActor func testInstalledQuestionUsesOnlyNormalComposerOnConnectedPhone() throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("Connected-phone inspection is opt-in and does not use simulator fixtures")
+        #else
+        guard ProcessInfo.processInfo.environment["MAICHAT_CONNECTED_QUESTION_VERIFY"] == "1",
+              let prompt = ProcessInfo.processInfo.environment["MAICHAT_CONNECTED_QUESTION_TEXT"],
+              !prompt.isEmpty else {
+            throw XCTSkip("Requires an explicitly selected connected phone and existing question")
+        }
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = []
+        app.launchEnvironment = [:]
+        app.launch()
+        let creator = app.buttons["创作中心"]
+        XCTAssertTrue(creator.waitForExistence(timeout: 15))
+        creator.tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@", prompt)).firstMatch.waitForExistence(timeout: 20))
+        XCTAssertEqual(app.textViews.matching(identifier: "ai-composer").count, 1)
+        XCTAssertFalse(app.textFields["你的回答"].exists)
+        XCTAssertFalse(app.buttons["回复"].exists)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "connected-phone-existing-question-normal-composer"
+        screenshot.lifetime = .keepAlways; add(screenshot)
+        #endif
+    }
+
+    /// A pending question is normal transcript text. The sole composer submits
+    /// its answer through the production durable queue with the original IDs.
+    @MainActor func testQuestionUsesTranscriptAndOnlyTheNormalComposer() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-steering-ui-test",
+            "--ai-question-conversation-ui-test", "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let tab = app.buttons["创作中心"]
+        XCTAssertTrue(tab.waitForExistence(timeout: 15))
+        tab.tap()
+        let question = app.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@", "复现测试问题：选择哪份素材？")).firstMatch
+        XCTAssertTrue(question.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.textFields["你的回答"].exists)
+        XCTAssertFalse(app.buttons["回复"].exists)
+        XCTAssertFalse(app.buttons["第一份本地素材"].exists)
+        XCTAssertFalse(app.buttons["第二份本地素材"].exists)
+        XCTAssertEqual(app.alerts.count, 0)
+        let composer = app.textViews["ai-composer"]
+        XCTAssertTrue(composer.exists)
+        XCTAssertEqual(app.textViews.matching(identifier: "ai-composer").count, 1)
+        let pending = XCTAttachment(screenshot: app.screenshot())
+        pending.name = "question-normal-transcript-one-composer"
+        pending.lifetime = .keepAlways; add(pending)
+        composer.tap()
+        composer.typeText("Use first local fixture\n")
+        let receipt = app.staticTexts["steering-receipt"]
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@",
+                "已回答 question-fixture · Use first local fixture"), object: receipt)], timeout: 10), .completed)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", ""), object: composer)], timeout: 5), .completed)
+        XCTAssertTrue(app.staticTexts["Use first local fixture"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.textFields["你的回答"].exists)
+        let answered = XCTAttachment(screenshot: app.screenshot())
+        answered.name = "question-answer-from-normal-composer"
+        answered.lifetime = .keepAlways; add(answered)
+    }
+
     @MainActor func testToolRunsStayBetweenTheirOwnTextDuringStreaming() {
         continueAfterFailure = false
         let app = XCUIApplication()
