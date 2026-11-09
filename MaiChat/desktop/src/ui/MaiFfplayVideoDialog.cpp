@@ -636,8 +636,13 @@ void MaiFfplayVideoDialog::updateWindowChrome() {
         titleLabel_->setToolTip(windowTitle());
     }
     if (maximizeButton_) {
-        maximizeButton_->setIcon(videoControlIcon(isMaximized() ? "restore" : "maximize"));
-        maximizeButton_->setToolTip(isMaximized() ? QStringLiteral("还原窗口") : QStringLiteral("最大化"));
+        bool expanded = isMaximized();
+#if defined(Q_OS_MAC)
+        // AppKit 的全屏与最大化互斥；全屏下右上角仍提供“还原窗口”。
+        expanded = expanded || isFullScreen();
+#endif
+        maximizeButton_->setIcon(videoControlIcon(expanded ? "restore" : "maximize"));
+        maximizeButton_->setToolTip(expanded ? QStringLiteral("还原窗口") : QStringLiteral("最大化"));
         maximizeButton_->setAccessibleName(maximizeButton_->toolTip());
     }
     if (auto* fullscreen = findChild<QPushButton*>(QStringLiteral("ffplayFullscreenButton"))) {
@@ -789,8 +794,12 @@ void MaiFfplayVideoDialog::toggleMaximized() {
     if (closeAfterFullscreen_) return;
     minimizeAfterFullscreen_ = false;
     if (fullscreenObserver_ && (isFullScreen() || fullscreenRequestPending_ || nativeFullscreenTransition_)) {
-        // 转场中仍接受最后一次用户意图，但必须等 AppKit 完成后再发出下一次窗口命令。
-        pendingWindowedMaximized_ = hasPendingWindowedState_ ? !pendingWindowedMaximized_ : !isMaximized();
+        // 全屏时 isMaximized() 为 false，不能据此排队“最大化”，否则 DidExit
+        // 后会再次铺满。若 Esc 等已请求退出，则这次点击仍是窗口态的正常最大化操作。
+        const bool fullscreen = fullscreenRequestPending_ || nativeFullscreenTransition_
+                                    ? requestedFullscreen_ : isFullScreen();
+        pendingWindowedMaximized_ = hasPendingWindowedState_ ? !pendingWindowedMaximized_
+                                                           : (!fullscreen && !isMaximized());
         hasPendingWindowedState_ = true;
         applyFullscreen(false);
         return;

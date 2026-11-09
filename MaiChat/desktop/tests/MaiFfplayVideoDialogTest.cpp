@@ -333,6 +333,8 @@ private slots:
     void initTestCase();
     void usesSharedFramelessPlayerChrome();
     void titleBarControlsMoveResizeAndRestoreThePlayer();
+    void macInitialWindowRestoreDoesNotReenterFullscreen_data();
+    void macInitialWindowRestoreDoesNotReenterFullscreen();
     void windowedVideoFillsViewportAndKeepsUserSize();
     void windowEdgesResizeThroughNativeVideoAndHud();
     void ownedHudTracksOwnerAndForwardsKeys();
@@ -542,6 +544,86 @@ void MaiFfplayVideoDialogTest::titleBarControlsMoveResizeAndRestoreThePlayer() {
     close->click();
     QTRY_VERIFY(!player.isVisible());
     QVERIFY(!player.isStarted());
+}
+
+void MaiFfplayVideoDialogTest::macInitialWindowRestoreDoesNotReenterFullscreen_data() {
+    QTest::addColumn<bool>("initialFullscreen");
+    QTest::newRow("initial-maximized") << false;
+    QTest::newRow("initial-native-fullscreen") << true;
+}
+
+// 初次显示就已铺满屏幕时，右上角还原应稳定回到普通窗口；持续检查原生状态，
+// 避免只看到 Qt 目标标志暂时清除就通过，漏掉后续 AppKit 回调再次铺满的情况。
+void MaiFfplayVideoDialogTest::macInitialWindowRestoreDoesNotReenterFullscreen() {
+#if defined(Q_OS_MAC)
+    if (QGuiApplication::platformName() != QStringLiteral("cocoa")) QSKIP("Native Cocoa window required");
+    QFETCH(bool, initialFullscreen);
+    MaiFfplayVideoDialog player(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE));
+    initialFullscreen ? player.showFullScreen() : player.showMaximized();
+    activateOwnTestWindow(&player);
+    QTRY_VERIFY_WITH_TIMEOUT(player.presentedFrames() > 0, 5000);
+    QTest::qWait(800);
+    QVERIFY2(ownTestWindowIsForeground(&player), qPrintable(ffplayTestNativeState(&player)));
+    qInfo() << "initial-restore" << player.windowState() << player.geometry()
+            << ffplayTestVideoLayerGeometry(&player);
+    QVERIFY(player.sendCommand(QStringLiteral("pause")));
+    MaiFfplayPlaybackStatus before{};
+    QTRY_VERIFY(player.playbackStatus(&before) && before.paused);
+    auto* maximize = player.findChild<QPushButton*>(QStringLiteral("ffplayMaximizeButton"));
+    QVERIFY(maximize && maximize->isVisible());
+    int nativeExits = 0;
+    void* observer = maiObserveMacVideoFullscreen(&player, &nativeExits,
+        [](void* context, MaiMacFullscreenPhase phase) {
+            if (phase == MaiMacFullscreenPhase::DidExit) ++*static_cast<int*>(context);
+        });
+    QVERIFY(observer);
+    const auto releaseObserver = qScopeGuard([&] { maiReleaseMacVideoFullscreenObserver(observer); });
+    const QString captureDirectory = qEnvironmentVariable("MAICHAT_VIDEO_RESTORE_CAPTURE_DIR");
+    const auto capture = [&](const QString& stage) {
+        if (captureDirectory.isEmpty()) return true;
+        if (!QDir().mkpath(captureDirectory)) return false;
+        const QPixmap pixels = captureOwnTestWindow(&player);
+        return !pixels.isNull() && pixels.save(QDir(captureDirectory).filePath(
+            QString::fromLatin1(QTest::currentDataTag()) + QLatin1Char('-') + stage + QStringLiteral(".png")));
+    };
+    QVERIFY(capture(QStringLiteral("before")));
+    QSignalSpy clicks(maximize, &QPushButton::clicked);
+    QVERIFY(clickFfplayTestNativeButton(maximize));
+    QTRY_COMPARE(clicks.count(), 1);
+    QString previousState;
+    const auto windowed = [&] {
+        const bool nativeFullscreen = ffplayTestVideoLayerGeometry(&player).value("nativeFullscreen").toBool();
+        const QString state = QStringLiteral("qt=%1 nativeFull=%2 geometry=%3,%4 %5x%6 didExit=%7")
+            .arg(int(player.windowState())).arg(nativeFullscreen).arg(player.x()).arg(player.y())
+            .arg(player.width()).arg(player.height()).arg(nativeExits);
+        if (state != previousState) {
+            qInfo().noquote() << "restore-state" << state;
+            previousState = state;
+        }
+        return !player.isFullScreen() && !player.isMaximized() && !nativeFullscreen &&
+               (!initialFullscreen || nativeExits > 0);
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(windowed(), 5000);
+    const QRect restored = player.geometry();
+    const QRect available = player.screen()->availableGeometry();
+    QVERIFY(restored.width() < available.width() || restored.height() < available.height());
+    QElapsedTimer stable;
+    stable.start();
+    while (stable.elapsed() < 1200) {
+        QTest::qWait(16);
+        QVERIFY(windowed());
+        QCOMPARE(player.geometry(), restored);
+    }
+    QVERIFY(capture(QStringLiteral("restored")));
+    MaiFfplayPlaybackStatus after{};
+    QVERIFY(player.playbackStatus(&after) && after.paused);
+    QVERIFY(std::abs(after.position_us - before.position_us) < 100'000);
+    QCOMPARE(player.speed(), 1.0);
+    player.close();
+    QTRY_VERIFY_WITH_TIMEOUT(!player.isVisible(), 3000);
+#else
+    QSKIP("Native macOS initial window restore regression");
+#endif
 }
 
 // 窗口态也应把栏位叠在完整视频视口上；首次尺寸采用源比例，切速不覆盖用户尺寸。
