@@ -1,0 +1,218 @@
+{
+  "schemaVersion": 1,
+  "updatedUTC": "2026-11-09T13:53:49.894073+00:00",
+  "version": "2.2.54",
+  "status": "PACKAGES_VERIFIED_AND_SENT_TO_IM",
+  "sourceCommit": "adfff832723595355a47db88430478cc60637d9e",
+  "MaiChatTree": "861cbcb3c8e9bd7113bcd380b817054780b4e44b",
+  "CoreTree": "69e18eb1e4b587b30ad8b467dd3172bea0443b8e",
+  "authorization": "Candidate packages and IM delivery completed. An optional new public GitHub Release remains a pending user choice; none created in this task.",
+  "windows": {
+    "artifacts": [
+      {
+        "name": "MaiChat-win64-v2.2.54-20261109-adfff832.zip",
+        "bytes": 241337577,
+        "sha256": "45b1378865ed36ae12c8009219925c029e3e883d4b4feee38565e6b94c76567d"
+      },
+      {
+        "name": "MaiChat-Setup-win64-v2.2.54-adfff832.exe",
+        "bytes": 200952507,
+        "sha256": "3a1b39e329ac5a4d18d003855de5d30de84250d26212fe391963de4663142cb7"
+      }
+    ],
+    "appExecutableSHA256": "5f30a24d0a322041319e04aebbb849b6e224eb9eba7fa704a3b096d29c591e38",
+    "fileCount": 81,
+    "PEAudits": [
+      37,
+      37,
+      42
+    ],
+    "modelCount": 5,
+    "smokeCount": 6,
+    "smokePIDs": [
+      35168,
+      34284,
+      40732,
+      33124,
+      21540,
+      11980
+    ],
+    "allSmokesExitZero": true,
+    "actualVersion": "2.2.54",
+    "signatures": "NotSigned App and installer",
+    "manifestSHA256": "ced195dbc181619eb9268347c161442e0cea3aa4d8a63c72c5d443d3ab0d6abb",
+    "installerExecuted": false,
+    "restoredPartsByteForByteEqual": true
+  },
+  "mac": {
+    "artifacts": [
+      {
+        "name": "MaiChat-macos-arm64-v2.2.54-20261109-adfff832.dmg",
+        "bytes": 213780883,
+        "sha256": "3307bd64aeadf5e76a86a78134e25b1bf50e9b6b64176bedb13cee3fdc38f724"
+      },
+      {
+        "name": "MaiChat-macos-arm64-v2.2.54-20261109-adfff832.zip",
+        "bytes": 214363157,
+        "sha256": "e3499f820c13f8d57f9d1308a41df5388f182a57c9a233a67b73979bfcbe9f5b"
+      }
+    ],
+    "sourceExecutableSHA256": "5fa5d1e76bcd3be7ba869988f7425734a855dba501327abe6b320d116a4a75b6",
+    "signedExecutableSHA256": "475c91e976752166cd0a5f4b42f9e8053e249d25d691392c7676ca2b13c49b7a",
+    "fileCount": 338,
+    "symlinkCount": 37,
+    "machOCount": 26,
+    "modelCount": 5,
+    "smokeCount": 6,
+    "smokePIDs": [
+      52989,
+      53203,
+      53717,
+      53878,
+      54258,
+      54402
+    ],
+    "allSmokesExitZero": true,
+    "actuallyTested": "macOS 27.2 arm64",
+    "macOS14_4Verified": false,
+    "signature": "ad-hoc; not notarized",
+    "latestNativeTests": {
+      "pass": 6,
+      "fail": 0,
+      "skip": 0,
+      "seconds": 27.796,
+      "screenshotsReviewedByBothHosts": 4,
+      "lockedDesktopPendingResolved": true
+    },
+    "controlledRealEntryCases": 4,
+    "userAutomaticInitialFullsizeReproduced": false,
+    "proofZIPBytes": 4046596,
+    "proofZIPSHA256": "0c1740a1e671149d46a3652436049cbf8ca6f28e205947e2b3ecf018d95f19f3",
+    "independentProofReviewPassed": true
+  },
+  "delivery": {
+    "originalWindowsSmallRequests": [
+      1192,
+      1193
+    ],
+    "originalWindowsSmallStatus": "sent-to-im",
+    "originalWindowsLargeRequests": [
+      1194,
+      1195
+    ],
+    "originalWindowsLargeStatus": "failed code2402 above100MB",
+    "windows80MiBToolsRequest": 1207,
+    "windows80MiBToolsStatus": "sent-to-im",
+    "windows80MiBPartRequests": [
+      1208,
+      1209,
+      1210,
+      1211,
+      1212,
+      1213
+    ],
+    "windows80MiBPartsStatus": "failed IM send timeout; no remote IM message IDs",
+    "windows80MiBRestorationTest": "both original packages restored byte for byte; identical output skip and conflicting output preservation verified",
+    "nextStrategy": "Final: 16MiB serial transfers, each SDK acknowledgement observed before next enqueue; complete on both hosts.",
+    "windows16MiB": {
+      "files": 28,
+      "installerParts": 12,
+      "portableParts": 15,
+      "toolFiles": 1,
+      "actualSentToIm": 28,
+      "failed": 0,
+      "retries": 0,
+      "localIds": [
+        1221,
+        1222,
+        1223,
+        1224,
+        1225,
+        1226,
+        1227,
+        1228,
+        1229,
+        1230,
+        1231,
+        1232,
+        1233,
+        1234,
+        1235,
+        1236,
+        1237,
+        1238,
+        1239,
+        1240,
+        1241,
+        1242,
+        1243,
+        1244,
+        1245,
+        1246,
+        1247,
+        1248
+      ],
+      "seconds": 100.424,
+      "completePackageSHA256Unchanged": true,
+      "reconstructionByteEqualityTest": "PASS",
+      "toolsZIP": "MaiChat-win64-v2.2.54-chunk16-tools.zip",
+      "toolsZIPBytes": 8596,
+      "toolsZIPSHA256": "01043e4a916d38cd192821293a6e58416dfbb34622121b4803a5e876de56e71c"
+    },
+    "mac16MiB": {
+      "files": 29,
+      "DMGParts": 13,
+      "ZIPParts": 13,
+      "toolFiles": 3,
+      "actualSentToIm": 29,
+      "localIds": [
+        1745,
+        1746,
+        1747,
+        1743,
+        1748,
+        1749,
+        1750,
+        1751,
+        1753,
+        1754,
+        1755,
+        1756,
+        1757,
+        1758,
+        1759,
+        1760,
+        1761,
+        1762,
+        1763,
+        1764,
+        1765,
+        1766,
+        1767,
+        1768,
+        1769,
+        1770,
+        1771,
+        1772,
+        1773
+      ],
+      "completePackageSHA256Unchanged": true,
+      "reconstructionFullSHA256Test": "PASS"
+    },
+    "recipientDownloadVerified": false
+  },
+  "font": {
+    "status": "OPEN_NOT_REPRODUCED_ON_CONTROLLED_HOST",
+    "userInstalledVersion": "2.2.53",
+    "choice": "Noto Sans SC",
+    "textPreset": "large",
+    "productFontChanges": false,
+    "actualAffectedProcessMatchingContextAvailable": false,
+    "restartObservation": "pending user reply"
+  },
+  "installedAppsReplaced": false,
+  "newGitHubTagCreated": false,
+  "newGitHubReleaseCreated": false,
+  "privateEvidenceDirectory": ".cache/release-254-20261109",
+  "fontDiagnostic": "docs/diagnostics/maichat-windows-noto-sans-20261109.md"
+}
