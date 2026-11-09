@@ -81,6 +81,38 @@ pending card exposes “取消导入”; cancellation or timeout removes that ca
 preserves the editor text and leaves sending available. Full logs and exact
 source/executable hashes are retained in the private evidence directory.
 
+## Mac result
+
+The received Mac evidence identifies source
+`631f5d9c5d83910e68d9b9d8ae24b2443016879c`. The three supplied product/test
+blobs match that commit. On macOS 27.2 arm64, Qt 6.12.0 with offscreen QPA, the
+normal App and panel-test targets build with exit 0 in 27.294 seconds. The focused
+run records 9 PASS / 0 FAIL / 0 SKIP in 1199 ms; the registered full panel suite
+records 77 PASS / 0 FAIL / 0 SKIP in 5392 ms. CTest reports 5.51 seconds; the
+receipt's 5.734 seconds measures the enclosing process. These QtTest totals
+include setup and cleanup records.
+
+The four final pending/recovery PNGs were independently viewed. Pending shows
+the import count and cancel action with the existing editor text; cancel or
+deadline removes the card, retains that text and leaves the send action visible.
+These final images come from a private diagnostic probe with only two added
+80 ms event-loop waits before the pending/recovered grabs. Its source was compared
+with the committed test and its 4 PASS / 0 FAIL / 0 SKIP log was verified; this
+repeats two existing cases for visual evidence, not additional functional coverage.
+The formal suite's instant grabs remain archived and are not used as proof of
+the laid-out pending card. Product and formal-test sources were not changed by
+that visual probe.
+
+The received ZIP is 239171 bytes, SHA256
+`9206a03a0a6921c052f684c6775ae224150e51a214adf579d3c5d084a2311642`.
+All 25 files named by its manifest pass size/SHA256 checks; the 26th ZIP entry is
+the manifest itself. The external and archived receipts are byte-identical.
+Original logs, instant grabs and the four final probe images are archived under
+`.cache/media-import-hang-20261109/mac-proof/`. This verifies isolated Mac widget
+fixtures and a normal build, not installed-App or native Cocoa acceptance; no
+new Mac package was made or installed. macOS 14.4 runtime compatibility was not
+tested.
+
 ## Remaining boundaries
 
 The reported original media and input route have not been supplied, so the
@@ -90,7 +122,6 @@ returns late. The UI deadline cannot forcibly interrupt a blocked kernel read.
 Panel destruction does not join the pool, but application shutdown can still
 wait for outstanding OS I/O.
 
-Mac received-source/build/regression confirmation is pending. No provider call,
-OSS upload, existing user database, camera or installed application is used for
-these fixtures. The earlier adfff832 2.2.54 packages do not contain this later
-source fix, and have not been replaced or relabeled.
+No provider call, OSS upload, existing user database, camera or installed
+application is used for these fixtures. The earlier adfff832 2.2.54 packages
+do not contain this later source fix, and have not been replaced or relabeled.
