@@ -1749,18 +1749,21 @@ public:
 protected:
   void paintEvent(QPaintEvent*) override {
     QPainter painter(this);
-    const bool hovered = underMouse() || property("captionHovered").toBool();
+    // Close keeps the idle appearance on hover; an explicit press still gets
+    // feedback so the destructive action remains visibly distinct.
+    const bool hovered = action_ != Action::Close &&
+                         (underMouse() || property("captionHovered").toBool());
     const bool pressed = isDown() || property("captionPressed").toBool();
     if (hovered || pressed) {
       painter.fillRect(rect(), action_ == Action::Close
-          ? QColor(pressed ? "#c42b35" : "#e5484d")
+          ? QColor("#c42b35")
           : QColor(pressed ? "#dce3eb" : "#edf2f7"));
     }
     painter.setRenderHint(QPainter::Antialiasing);
     const qreal glyph = UiZoom::s(10);
     const QRectF mark((width() - glyph) / 2.0, (height() - glyph) / 2.0,
                       glyph, glyph);
-    painter.setPen(QPen(action_ == Action::Close && (hovered || pressed)
+    painter.setPen(QPen(action_ == Action::Close && pressed
                             ? QColor(Qt::white) : QColor("#4c5866"),
                         qMax(1.0, UiZoom::factor())));
     if (action_ == Action::Minimize) {
