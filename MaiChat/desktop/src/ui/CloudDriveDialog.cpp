@@ -1,12 +1,10 @@
 #include "ui/UiZoom.h"
+#include "ui/DesktopRasterImage.h"
 #include "ui/CloudDriveDialog.h"
 
 #include "MaiCloudDriveClient.h"
 #include "MaiCloudVod.h"
 #include "MaiCurlDownload.h"
-#if defined(MAICHAT_FFMPEG_IMAGE_DECODE)
-#include "MaiImageDecode.h"
-#endif
 #include "ui/AppMessageDialog.h"
 #include "ui/AppTextInputDialog.h"
 #include "ui/ImagePreviewDialog.h"
@@ -23,7 +21,6 @@
 #include <QFutureWatcher>
 #include <QHBoxLayout>
 #include <QImage>
-#include <QImageReader>
 #include <QJsonDocument>
 #include <QLabel>
 #include <QKeyEvent>
@@ -200,33 +197,10 @@ QScrollArea* makeScroll(QVBoxLayout** rows, QWidget* parent) {
 }
 
 QImage decodeCloudImage(const QString& path, int maxWidth, int maxHeight) {
-#if defined(MAICHAT_FFMPEG_IMAGE_DECODE)
-    const QByteArray utf8 = path.toUtf8();
-    const MaiImageDecodeResult decoded = maiImageDecodeFile(
-        utf8.constData(), maxWidth, maxHeight);
-    QImage image;
-    if (decoded.rgba) {
-        image = QImage(decoded.rgba, decoded.width, decoded.height, decoded.stride,
-                       QImage::Format_RGBA8888).copy();
-        if (decoded.icc_profile && decoded.icc_size > 0) {
-            const QColorSpace color = QColorSpace::fromIccProfile(
-                QByteArray(reinterpret_cast<const char*>(decoded.icc_profile),
-                           decoded.icc_size));
-            if (color.isValid()) image.setColorSpace(color);
-        }
-        maiImageDecodeFree(decoded.rgba);
-    }
-    return image;
-#else
-    QImageReader reader(path);
-    reader.setAutoTransform(true);
-    QSize scaled = reader.size();
-    if (scaled.isValid()) {
-        scaled.scale(maxWidth, maxHeight, Qt::KeepAspectRatio);
-        reader.setScaledSize(scaled);
-    }
-    return reader.read();
-#endif
+    MaiImageReadOptions options{};
+    options.max_output_width = maxWidth;
+    options.max_output_height = maxHeight;
+    return desktopReadRasterFile(path, options).image;
 }
 
 MaiDownloadResult downloadCloudFile(const DesktopVideoCircleAccess& access,

@@ -79,7 +79,15 @@ def main():
         args.deployment_target = "14.4"
     arch = {"amd64": "x86_64", "aarch64": "arm64"}.get(args.arch.lower(), args.arch.lower())
     build_root = source_root / ".build" / (system + "-" + arch.replace(";", "_"))
-    prefix = build_root / "install"
+    lock = json.loads((source_root / "sources.lock.json").read_text(encoding="utf-8"))
+    profile = lock.get("sdk_profile")
+    if "sdk_profile" in lock and (not isinstance(profile, str) or
+                                  not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", profile)):
+        parser.error("sdk_profile must be a single ASCII name using letters, digits, underscore or hyphen")
+    # Reuse module build trees, but never install a new profile over the old SDK.
+    suffix = "-" + profile if profile else ""
+    prefix = build_root / ("install" + suffix)
+    stamp = build_root / ("installed" + suffix + ".json")
     if args.print_prefix:
         print(prefix)
         return
@@ -87,7 +95,6 @@ def main():
         parser.error("CMake 3.25+ and Ninja must be on PATH")
     if args.jobs < 1:
         parser.error("--jobs must be positive")
-    lock = json.loads((source_root / "sources.lock.json").read_text())
     sources = []
     dirty = False
     for module in lock["modules"]:
@@ -109,6 +116,7 @@ def main():
             parser.error("run the Qt source builder from an MSVC developer environment")
         include_prefix, include_hook = msvc_include_hook(compiler, build_root)
     fingerprint = {
+        "sdk_profile": profile,
         "sources": sources,
         "arch": arch,
         "cmake": str(Path(args.cmake).resolve()),
@@ -119,7 +127,6 @@ def main():
         "builder": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "msvcIncludePrefix": include_prefix,
     }
-    stamp = build_root / "installed.json"
     required = [prefix / "lib/cmake/Qt6Core/Qt6CoreConfig.cmake",
                 prefix / "lib/cmake/Qt6Widgets/Qt6WidgetsConfig.cmake",
                 prefix / "lib/cmake/Qt6Svg/Qt6SvgConfig.cmake",
@@ -155,9 +162,11 @@ def main():
                         "-DFEATURE_icu=OFF", "-DFEATURE_zstd=OFF", "-DFEATURE_brotli=OFF",
                         "-DFEATURE_openssl=OFF", "-DFEATURE_dbus=OFF"]
         else:
+            if profile:
+                # Reused external-module caches may pin Core/BuildInternals/Tools
+                # to the previous install even when Qt6_DIR selects the new SDK.
+                options += ["-U", "Qt6*_DIR"]
             options += [f"-DCMAKE_PREFIX_PATH={prefix}", f"-DQt6_DIR={prefix}/lib/cmake/Qt6"]
-        if name == "qtimageformats":
-            options += ["-DFEATURE_force_bundled_libs=ON"]
         run([args.cmake, "-S", source_root / name, "-B", build, *options])
         run([args.cmake, "--build", build, "--parallel", args.jobs])
         run([args.cmake, "--install", build])

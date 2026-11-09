@@ -1,6 +1,7 @@
 // 文件作用：桌面端共用界面；PdfPreviewWindows 负责Windows PDF 文件预览，本文件给出其实现。
 // 直接依赖：ui/PdfPreviewDialog.h；实现与这些接口协作。
 #include "ui/PdfPreviewDialog.h"
+#include "ui/DesktopRasterImage.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include <QByteArray>
+#include <QDebug>
 #include <QFile>
 
 #include <winrt/Windows.Data.Pdf.h>
@@ -74,10 +76,23 @@ PdfPreviewPage renderWindowsPdfPage(const QString &path, int pageIndex) {
             std::vector<std::uint8_t> imageBytes(
                 static_cast<std::size_t>(bytes));
             reader.ReadBytes(winrt::array_view<std::uint8_t>(imageBytes));
-            result.image = QImage::fromData(
-                imageBytes.data(), static_cast<int>(imageBytes.size()));
-            if (result.image.isNull())
+            // WinRT supplies compressed page pixels; use the same ordinary
+            // raster decoder as other byte inputs, retaining its owning image.
+            // Destination dimensions are logical requests: WinRT can emit larger
+            // physical pixels at display scaling. Keep its existing 50 MiB byte
+            // bound and the codec's decoded-pixel budget, not logical axis caps.
+            MaiImageReadOptions imageOptions{};
+            imageOptions.max_encoded_bytes = 50u * 1024 * 1024;
+            const auto decoded = desktopReadRasterBytes(
+                QByteArray::fromRawData(reinterpret_cast<const char*>(imageBytes.data()),
+                                       static_cast<int>(imageBytes.size())),
+                imageOptions);
+            result.image = decoded.image;
+            if (result.image.isNull()) {
+              qWarning() << "PDF raster decode failed" << decoded.errorCode
+                         << "bytes" << bytes << "requested" << width << height;
               result.error = QStringLiteral("PDF 页面无法解码。");
+            }
           }
         }
       }

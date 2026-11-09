@@ -338,7 +338,7 @@ void VideoCircleDialog::openPublish(const QString& completedCardJson,
         [preview = QPointer<QLabel>(sourcePreview_)](const QPixmap& pixels) {
             if (preview) preview->setPixmap(pixels.scaled(preview->size(),
                 Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation));
-        });
+        }, {}, true);
     pages_->setCurrentIndex(1);
     status_->clear();
     show();

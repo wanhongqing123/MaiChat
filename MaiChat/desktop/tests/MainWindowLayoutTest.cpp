@@ -242,6 +242,7 @@ private slots:
     void contactsCurrentSelectionDoesNotLeaveContactsPage();
     void settingsNavigationShowsAccountWithoutDiagnostics();
     void settingsAvatarUpdatesWhenSelfProfileArrives();
+    void settingsAvatarReadsTinyWebpFromMemory();
     void settingsAvatarSurvivesNetworkLossAfterRestart();
     void settingsAvatarLoadsRealProfileUrl();
     void settingsLogoutRequiresConfirmationAndCallsHandler();
@@ -2833,6 +2834,30 @@ void MainWindowLayoutTest::settingsAvatarUpdatesWhenSelfProfileArrives() {
         3000);
     const QByteArray capture = qgetenv("MAICHAT_AVATAR_CAPTURE");
     if (!capture.isEmpty()) QVERIFY(window.grab().save(QString::fromUtf8(capture)));
+}
+
+void MainWindowLayoutTest::settingsAvatarReadsTinyWebpFromMemory() {
+    AvatarHttpServer server;
+    QVERIFY(server.listen());
+    server.servePng(QByteArray::fromHex(
+        "524946461e000000574542505650384c110000002f0fc0020007d0b1b6b4b1ff8188e87f0000"));
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    FakeRemoteIMClient* fake = client.get();
+    RemoteIMApplication app(QStringLiteral("desktop-owned-webp-avatar"), std::move(client));
+    MainWindow window(app);
+    window.show();
+    auto* settings = window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"));
+    auto* avatar = window.findChild<QLabel*>(QStringLiteral("selfProfileAvatar"));
+    QVERIFY(settings && avatar);
+    settings->click();
+    const QString url = QStringLiteral("http://127.0.0.1:%1/owned-tiny.webp").arg(server.serverPort());
+    fake->selfProfileReceived(QStringLiteral("desktop-owned-webp-avatar"), QStringLiteral("Owned fixture"), url);
+    QTRY_VERIFY_WITH_TIMEOUT(server.requests > 0, 3000);
+    QTRY_VERIFY_WITH_TIMEOUT([&] {
+        const QColor center = avatar->grab().toImage().pixelColor(avatar->width() / 2, avatar->height() / 2);
+        return qAbs(center.red() - 45) <= 3 && qAbs(center.green() - 99) <= 3 &&
+               qAbs(center.blue() - 141) <= 3;
+    }(), 3000);
 }
 
 void MainWindowLayoutTest::settingsAvatarSurvivesNetworkLossAfterRestart() {

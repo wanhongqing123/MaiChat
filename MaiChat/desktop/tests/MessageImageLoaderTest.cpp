@@ -3,6 +3,7 @@
 #include <QtTest>
 
 #include <QImage>
+#include <QFile>
 #include <QLabel>
 #include <QPainter>
 #include <QTemporaryDir>
@@ -27,6 +28,9 @@ private slots:
     void reportsMissingFileInsteadOfHangingOnThePlaceholder();
     void cacheKeyChangesWhenTheFileContentChanges();
     void cachedReplacementRejectsOlderAsyncResult();
+    void tinyWebpDecodesWithoutAnImagePlugin();
+    void videoCoverIsExplicitAndCannotSatisfyAnImageRequest();
+    void destroyedOwnerDoesNotReceiveDecodedPixels();
 
 private:
     QTemporaryDir dir_;
@@ -131,6 +135,61 @@ void MessageImageLoaderTest::cachedReplacementRejectsOlderAsyncResult() {
     QTest::qWait(500);
     QVERIFY2(!target.pixmap().isNull() && target.pixmap().width() <= replacementSize.width(),
              "较早的异步结果不能覆盖后来同步命中的缓存图");
+}
+
+void MessageImageLoaderTest::tinyWebpDecodesWithoutAnImagePlugin() {
+    const QString path = dir_.filePath(QStringLiteral("owned-38-byte.webp"));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QCOMPARE(file.write(QByteArray::fromHex(
+        "524946461e000000574542505650384c110000002f0fc0020007d0b1b6b4b1ff8188e87f0000")), qint64(38));
+    file.close();
+    QLabel label;
+    loadQtInto(path, QSize(16, 12), &label);
+    QTRY_VERIFY(!label.pixmap().isNull());
+    const QImage pixels = label.pixmap().toImage();
+    QCOMPARE(pixels.size(), QSize(16, 12));
+    for (int y = 0; y < 12; ++y)
+        for (int x = 0; x < 16; ++x)
+            QCOMPARE(pixels.pixelColor(x, y), QColor(45, 99, 141));
+}
+
+void MessageImageLoaderTest::videoCoverIsExplicitAndCannotSatisfyAnImageRequest() {
+    const QString path = QFINDTESTDATA("../../../MaiAgent/Graphics/tests/fixtures/tiny-red.mp4");
+    QVERIFY(!path.isEmpty());
+    const QSize size(32, 32);
+    QVERIFY(MessageImageLoader::cacheKey(path, size, true) !=
+            MessageImageLoader::cacheKey(path, size, false));
+    QLabel video;
+    MessageImageLoader::instance().load(path, size, &video,
+        [&video](const QPixmap& pixels) { video.setPixmap(pixels); }, {}, true);
+    QTRY_VERIFY(!video.pixmap().isNull());
+    QLabel image;
+    bool missing = false;
+    loadQtInto(path, size, &image, [&missing] { missing = true; });
+    QTRY_VERIFY(missing);
+    QVERIFY(image.pixmap().isNull());
+
+    QWidget owner;
+    bool lateVideo = false;
+    missing = false;
+    MessageImageLoader::instance().load(path, QSize(31, 31), &owner,
+        [&lateVideo](const QPixmap&) { lateVideo = true; }, {}, true);
+    MessageImageLoader::instance().load(path, QSize(31, 31), &owner,
+        [&lateVideo](const QPixmap&) { lateVideo = true; }, [&missing] { missing = true; });
+    QTRY_VERIFY(missing);
+    QTest::qWait(250);
+    QVERIFY(!lateVideo);
+}
+
+void MessageImageLoaderTest::destroyedOwnerDoesNotReceiveDecodedPixels() {
+    auto* owner = new QWidget;
+    bool delivered = false;
+    MessageImageLoader::instance().load(largePath_, QSize(683, 512), owner,
+        [&delivered](const QPixmap&) { delivered = true; }, [&delivered] { delivered = true; });
+    delete owner;
+    QTest::qWait(500);
+    QVERIFY(!delivered);
 }
 
 QTEST_MAIN(MessageImageLoaderTest)

@@ -1,10 +1,12 @@
 // 文件作用：授权、转正 sRGB 解码、有界 tile 协调、完整新文件发布和当前账号登记。
 #include "MaiChatTools/DesktopPortraitService.h"
+#include "ui/DesktopRasterImage.h"
 
 #include <algorithm>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <cerrno>
 #include <stdexcept>
 #include <utility>
 #include <QColorSpace>
@@ -13,7 +15,6 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QImageReader>
 #include <QImageWriter>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -76,7 +77,7 @@ struct NewFiles {
 void savePng(const QImage& image, const QString& temporary, const QString& output,
              const DesktopPortraitRequest& request, NewFiles& files) {
     checkCanceled(request);
-    // Qt 读写器析构时才关闭文件；写入和验证各自结束后释放句柄，
+    // 编码器析构关闭文件后，用普通核心验证完整像素，再释放输入句柄，
     // Windows 才能对完整的同目录临时文件执行不覆盖的原子发布。
     {
         QImageWriter writer(temporary, "png");
@@ -84,8 +85,12 @@ void savePng(const QImage& image, const QString& temporary, const QString& outpu
     }
     // Decoder validation precedes no-replace publication; no partial file becomes a result.
     {
-        QImageReader verify(temporary, "png");
-        if (!verify.canRead() || verify.size() != image.size() || verify.read().isNull())
+        MaiImageReadOptions options{};
+        options.max_encoded_bytes = 512ll * 1024 * 1024;
+        options.max_source_pixels = 32'000'000;
+        const auto verify = desktopReadRasterFile(temporary, options);
+        if (verify.info.format != MAI_IMAGE_FORMAT_PNG || verify.image.size() != image.size() ||
+            verify.image.isNull())
             throw std::runtime_error("Encoded portrait PNG failed validation");
     }
     checkCanceled(request);
@@ -150,13 +155,20 @@ QJsonObject DesktopPortraitService::execute(const DesktopPortraitRequest& reques
         const QFileInfo sourceFile(sourcePath);
         if (!sourceFile.isFile() || sourceFile.size() <= 0 || sourceFile.size() > 128ll * 1024 * 1024)
             throw std::runtime_error("Source image is missing or exceeds 128 MB");
-        QImageReader reader(sourcePath);
-        reader.setAutoTransform(true);
-        const QSize size = reader.size();
-        if (!size.isValid() || size.width() > 20000 || size.height() > 20000 ||
-            static_cast<qint64>(size.width()) * size.height() > 32000000)
+        MaiImageReadOptions options{};
+        options.max_encoded_bytes = 128ll * 1024 * 1024;
+        options.max_source_pixels = 32'000'000;
+        options.max_source_width = options.max_source_height = 20000;
+        options.context = const_cast<DesktopPortraitRequest*>(&request);
+        options.is_canceled = [](void* opaque) {
+            const auto* value = static_cast<const DesktopPortraitRequest*>(opaque);
+            return value->isCanceled && value->isCanceled() ? 1 : 0;
+        };
+        auto raster = desktopReadRasterFile(sourcePath, options);
+        checkCanceled(request);
+        if (raster.errorCode == -EFBIG)
             throw std::runtime_error("Source exceeds the 32 megapixel portrait budget");
-        QImage source = reader.read();
+        QImage source = raster.image;
         if (source.isNull()) throw std::runtime_error("Cannot decode the original image");
         if (!source.colorSpace().isValid()) source.setColorSpace(QColorSpace::SRgb);
         source.convertToColorSpace(QColorSpace::SRgb);

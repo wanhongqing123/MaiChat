@@ -30,13 +30,67 @@
 #include <QVBoxLayout>
 #include <QUrl>
 #include <QtMath>
+#include <QVariant>
+#include <QFile>
+#include <QFileInfo>
+#include <QDir>
 
 #include "markdown/MarkdownDocument.h"
 #include "markdown/MarkdownLayout.h"
 #include "markdown/MarkdownView.h"
 #include "ui/UiZoom.h"
+#include "ui/DesktopRasterImage.h"
+#include "ui/DesktopDocumentImage.h"
 
 namespace {
+
+class PreviewRasterDocument final : public QTextDocument {
+public:
+    explicit PreviewRasterDocument(QObject* parent = nullptr) : QTextDocument(parent) {}
+
+protected:
+    QVariant loadResource(int type, const QUrl& name) override {
+        QImage image;
+        if (type == ImageResource) {
+            // Compiled UI artwork, including SVG, retains Qt's presentation
+            // path. User files/data never enter this trusted resource branch.
+            if (name.scheme() == QStringLiteral("qrc") && name.path().startsWith(QStringLiteral("/maichat/"))) {
+                const QVariant artwork = QTextDocument::loadResource(type, name);
+                if (artwork.isValid()) return artwork;
+            } else if (name.scheme() == QStringLiteral("data")) {
+                image = desktopDocumentDataImage(name);
+            } else {
+                QString path;
+                if (name.isLocalFile() && name.host().isEmpty())
+                    path = name.toLocalFile();
+                else if (name.isRelative() && name.host().isEmpty())
+                    path = name.path(QUrl::FullyDecoded);
+                // Local Windows drive paths may be present in existing HTML;
+                // other URL schemes and UNC/network authorities are rejected.
+                else if (name.scheme().size() == 1 && name.scheme().front().isLetter() &&
+                         QDir::isAbsolutePath(name.toString(QUrl::FullyDecoded)))
+                    path = name.toString(QUrl::FullyDecoded);
+                if (!path.isEmpty() && !path.contains(QChar::Null) &&
+                    !QDir::fromNativeSeparators(path).startsWith(QStringLiteral("//"))) {
+                    if (QFileInfo(path).suffix().compare(QStringLiteral("svg"), Qt::CaseInsensitive) == 0) {
+                        QFile file(path);
+                        if (file.open(QIODevice::ReadOnly) && file.size() > 0 &&
+                            file.size() <= kDesktopDocumentImageMaxEncodedBytes) {
+                            const QByteArray bytes = file.read(kDesktopDocumentImageMaxEncodedBytes + 1);
+                            if (bytes.size() <= kDesktopDocumentImageMaxEncodedBytes)
+                                image = desktopDocumentVectorImage(bytes);
+                        }
+                    } else {
+                        image = desktopReadRasterFile(path).image;
+                    }
+                }
+            }
+        }
+        const QVariant result = QVariant::fromValue(image);
+        addResource(type, name, result);
+        return result;
+    }
+};
 
 class PreviewSizeGrip final : public QSizeGrip {
 public:
@@ -52,8 +106,8 @@ protected:
         painter.setPen(QPen(QColor(QStringLiteral("#6786a3")), qMax(1, UiZoom::s(2))));
         const int corner = UiZoom::s(5);
         for (int offset = UiZoom::s(5); offset <= UiZoom::s(15); offset += UiZoom::s(5)) {
-            painter.drawLine(width() - corner - offset, height() - corner,
-                             width() - corner, height() - corner - offset);
+            painter.drawLine(width() - corner - offset, height() - corner, width() - corner,
+                             height() - corner - offset);
         }
     }
 };
@@ -174,6 +228,7 @@ void FilePreviewDialog::buildUi(const QString& displayName, const QString& conte
         layout->addWidget(markdownView_, 1);
     } else {
         content_ = new QTextBrowser(panel);
+        content_->setDocument(new PreviewRasterDocument(content_));
         content_->setObjectName(QStringLiteral("filePreviewContent"));
         content_->setOpenExternalLinks(true);
         content_->setReadOnly(true);
@@ -356,7 +411,7 @@ QSize FilePreviewDialog::contentAwareInitialSize() {
     const int documentWidth = qMax(1, targetWidth - chromeWidth);
     int documentHeight = 0;
     if (content_) {
-        QTextDocument probe;
+        PreviewRasterDocument probe;
         probe.setDefaultFont(content_->document()->defaultFont());
         probe.setHtml(content_->toHtml());
         probe.setTextWidth(documentWidth);

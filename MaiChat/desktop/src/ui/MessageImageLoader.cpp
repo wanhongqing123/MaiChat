@@ -6,16 +6,14 @@
 
 #include <QColorSpace>
 
-#if defined(MAICHAT_FFMPEG_IMAGE_DECODE)
 #include "MaiImageDecode.h"
-#endif
+#include "ui/DesktopRasterImage.h"
 
 #include <QDebug>
 #include <QElapsedTimer>
 #include <QEvent>
 #include <QFileInfo>
 #include <QImage>
-#include <QImageReader>
 #include <QPixmap>
 #include <QPixmapCache>
 #include <QRunnable>
@@ -28,11 +26,12 @@ constexpr qint64 kSlowDecodeMs = 50;      // 只有超过这个值才记一条�
 
 class DecodeTask : public QRunnable {
 public:
-    DecodeTask(MessageImageLoader* owner, QString path, QSize target, QString key)
+    DecodeTask(MessageImageLoader* owner, QString path, QSize target, QString key, bool videoCover)
         : owner_(owner),
           path_(std::move(path)),
           target_(target),
           key_(std::move(key)),
+          videoCover_(videoCover),
           context_(RemoteDiagnostics::PerformanceLog::shared().context()) {
         setAutoDelete(true);
     }
@@ -40,34 +39,34 @@ public:
     void run() override {
         QElapsedTimer timer;
         timer.start();
-#if defined(MAICHAT_FFMPEG_IMAGE_DECODE)
-        const QByteArray utf8Path = path_.toUtf8();
-        const MaiImageDecodeResult decoded = maiImageDecodeFile(
-            utf8Path.constData(), qMax(1, target_.width()), qMax(1, target_.height()));
         QImage image;
-        const int decodeError = decoded.error_code;
-        if (decoded.rgba) {
-            image = QImage(decoded.rgba, decoded.width, decoded.height, decoded.stride,
-                           QImage::Format_RGBA8888).copy();
-            if (decoded.icc_profile && decoded.icc_size > 0) {
-                const QColorSpace color = QColorSpace::fromIccProfile(
-                    QByteArray(reinterpret_cast<const char*>(decoded.icc_profile),
-                               decoded.icc_size));
-                if (color.isValid()) image.setColorSpace(color);
+        int decodeError = 0;
+        if (videoCover_) {
+            // Video cards request a first frame explicitly; the ordinary image
+            // path never treats arbitrary decodable media as a user bitmap.
+            const QByteArray utf8Path = path_.toUtf8();
+            const MaiImageDecodeResult decoded = maiImageDecodeFile(
+                utf8Path.constData(), qMax(1, target_.width()), qMax(1, target_.height()));
+            decodeError = decoded.error_code;
+            if (decoded.rgba) {
+                image = QImage(decoded.rgba, decoded.width, decoded.height, decoded.stride,
+                               QImage::Format_RGBA8888).copy();
+                if (decoded.icc_profile && decoded.icc_size > 0) {
+                    const QColorSpace color = QColorSpace::fromIccProfile(QByteArray(
+                        reinterpret_cast<const char*>(decoded.icc_profile), decoded.icc_size));
+                    if (color.isValid()) image.setColorSpace(color);
+                }
             }
             maiImageDecodeFree(decoded.rgba);
+        } else {
+            MaiImageReadOptions options{};
+            options.max_output_width = qMax(1, target_.width());
+            options.max_output_height = qMax(1, target_.height());
+            const auto decoded = desktopReadRasterFile(path_, options);
+            image = decoded.image;
+            decodeError = decoded.errorCode;
         }
-#else
-        const int decodeError = 0;
-        QImageReader reader(path_);
-// 明确由 Qt 发起的图片请求在解码阶段降采样，避免先解出整张大图。
-        QSize scaled = reader.size();
-        if (scaled.isValid() && !scaled.isEmpty()) {
-            scaled.scale(target_, Qt::KeepAspectRatio);
-            reader.setScaledSize(scaled);
-        }
-        QImage image = reader.read();
-#endif
+
         const qint64 elapsed = timer.elapsed();
         if (!owner_) return;
         QMetaObject::invokeMethod(owner_, "deliver", Qt::QueuedConnection,
@@ -81,6 +80,7 @@ private:
     QString path_;
     QSize target_;
     QString key_;
+    bool videoCover_ = false;
     QString context_;
 };
 
@@ -97,13 +97,13 @@ MessageImageLoader::MessageImageLoader(QObject* parent) : QObject(parent) {
     QPixmapCache::setCacheLimit(kCacheLimitKb);
 }
 
-QString MessageImageLoader::cacheKey(const QString& path, const QSize& targetPixels) {
+QString MessageImageLoader::cacheKey(const QString& path, const QSize& targetPixels, bool videoCover) {
     // 目标尺寸必须进键：气泡缩略图和全屏预览是同一文件的两个解码结果，
     // 共用一个键会让先到的把另一个顶掉。
     // 文件大小与修改时间也进键：同一路径的内容可能变（下载完成后覆盖、
     // 同一条消息重新接收），只按路径缓存会让界面一直贴着旧图，且没人会去清它。
     const QFileInfo info(path);
-    return QStringLiteral("%1|%2x%3|%4@%5")
+    return (videoCover ? QStringLiteral("video|") : QString()) + QStringLiteral("%1|%2x%3|%4@%5")
         .arg(path)
         .arg(targetPixels.width())
         .arg(targetPixels.height())
@@ -112,19 +112,19 @@ QString MessageImageLoader::cacheKey(const QString& path, const QSize& targetPix
 }
 
 void MessageImageLoader::loadInto(const QString& path, const QSize& targetPixels, QLabel* label,
-                                  const std::function<void()>& onMissing) {
+                                  const std::function<void()>& onMissing, bool videoCover) {
     if (!label) return;
     QPointer<QLabel> guard(label);
     load(path, targetPixels, label, [guard](const QPixmap& pixmap) {
         if (guard) guard->setPixmap(pixmap);
-    }, onMissing);
+    }, onMissing, videoCover);
 }
 
 void MessageImageLoader::load(const QString& path, const QSize& targetPixels, QWidget* owner,
                               const std::function<void(const QPixmap&)>& onReady,
-                              const std::function<void()>& onMissing) {
+                              const std::function<void()>& onMissing, bool videoCover) {
     if (!owner) return;
-    const QString key = cacheKey(path, targetPixels);
+    const QString key = cacheKey(path, targetPixels, videoCover);
     // 每次请求都先更新身份，包括缓存命中和文件缺失。否则旧的后台任务仍会认为
     // 控件在等旧 key，并在稍后把新缓存图或缺失占位覆盖掉。
     owner->setProperty("pendingImageKey", key);
@@ -144,7 +144,7 @@ void MessageImageLoader::load(const QString& path, const QSize& targetPixels, QW
     queue.append(Pending{QPointer<QWidget>(owner), onReady, onMissing});
     if (queue.size() > 1) return;  // 已有同键任务在解，等它的结果
 
-    pool_.start(new DecodeTask(this, path, targetPixels, key));
+    pool_.start(new DecodeTask(this, path, targetPixels, key, videoCover));
 }
 
 void MessageImageLoader::deliver(const QString& key, const QImage& image, qint64 elapsedMs,

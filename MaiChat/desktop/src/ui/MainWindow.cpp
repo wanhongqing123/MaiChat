@@ -2,6 +2,7 @@
 // 主要入口：event、updateWindowChromeBackground、closeEvent、eventFilter。
 // 直接依赖：diagnostics/PerformanceLog.h、model/ContactGroups.h、model/MessageNotification.h、model/MessageQuote.h；实现与这些接口协作。
 #include "ui/MainWindow.h"
+#include "ui/DesktopRasterImage.h"
 #include "app/DesktopPasswordChangeRequests.h"
 #include "diagnostics/PerformanceLog.h"
 
@@ -55,7 +56,6 @@
 #include <QHash>
 #include <QIcon>
 #include <QImage>
-#include <QImageReader>
 #include <QInputDialog>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
@@ -519,9 +519,12 @@ bool restoreAvatarPixmap(const QString &url) {
   if (path.isEmpty()) return false;
   const QFileInfo file(path);
   if (!file.isFile() || file.size() <= 0 || file.size() > 4 * 1024 * 1024) return false;
-  QPixmap source;
-  if (!source.load(path, "PNG") || source.isNull() ||
-      source.width() > 320 || source.height() > 320) return false;
+  MaiImageReadOptions options{};
+  options.max_encoded_bytes = 4 * 1024 * 1024;
+  options.max_source_width = options.max_source_height = 320;
+  const auto decoded = desktopReadRasterFile(path, options);
+  const QPixmap source = QPixmap::fromImage(decoded.image);
+  if (decoded.info.format != MAI_IMAGE_FORMAT_PNG || source.isNull()) return false;
   avatarPixmapCache().insert(url, source);
   return true;
 }
@@ -544,10 +547,10 @@ void requestAvatarPixmap(const QString &avatarUrl, QWidget *repaintTarget);
 void finishAvatarPixmap(const QString &url, const QByteArray &data) {
   QPixmap source;
   if (data.size() <= 4 * 1024 * 1024) {
-    source.loadFromData(data);
-    if (!source.isNull() && (source.width() > 320 || source.height() > 320))
-      source = source.scaled(320, 320, Qt::KeepAspectRatio,
-                             Qt::SmoothTransformation);
+    MaiImageReadOptions options{};
+    options.max_encoded_bytes = 4 * 1024 * 1024;
+    options.max_output_width = options.max_output_height = 320;
+    source = QPixmap::fromImage(desktopReadRasterBytes(data, options).image);
   }
   pendingAvatarUrls().remove(url);
   if (source.isNull()) {
@@ -5024,20 +5027,9 @@ void MainWindow::rebuildAgentPage() {
               if (cloudPresenter.isNull()) return false;
               if (isImage) {
                 if (cloudPresenter->imagePreviewDialog_) return false;
-                QImage decoded;
-#if defined(MAICHAT_FFMPEG_IMAGE_DECODE)
-                const QByteArray utf8 = path.toUtf8();
-                const MaiImageDecodeResult result = maiImageDecodeFile(utf8.constData(), 4096, 4096);
-                if (result.rgba) {
-                  decoded = QImage(result.rgba, result.width, result.height, result.stride,
-                                   QImage::Format_RGBA8888).copy();
-                  maiImageDecodeFree(result.rgba);
-                }
-#else
-                QImageReader reader(path);
-                reader.setAutoTransform(true);
-                decoded = reader.read();
-#endif
+                MaiImageReadOptions options{};
+                options.max_output_width = options.max_output_height = 4096;
+                const QImage decoded = desktopReadRasterFile(path, options).image;
                 if (decoded.isNull()) return false;
                 const QPixmap image = QPixmap::fromImage(decoded);
                 cloudPresenter->openImagePreview(path, nullptr, &image);
@@ -6406,13 +6398,11 @@ bool MainWindow::insertComposerMimeData(const QMimeData *mime) {
     }
     if (!files.isEmpty()) {
       for (const QString &path : files) {
-        // mp4/mov 走 IM 的视频消息（对端能直接播）；能被 Qt 认出的图片按图片发
-        // （对端气泡里直接出图、可预览）；其余一律按文件卡发。图片判断走内容而非
-        // 扩展名，HEIC 之类 Qt
-        // 读不了的会自然落到文件卡，不会变成一张打不开的破图。
+        // 视频仍优先；普通图片识别按内容、尺寸和预算检查，实际显示再由
+        // 同一核心完整解码。其余附件保留为文件卡，不以首帧可解码代替图片类型。
         if (isSupportedVideoFile(path)) {
           insertComposerVideo(path);
-        } else if (!QImageReader::imageFormat(path).isEmpty()) {
+        } else if (desktopInspectRasterFile(path).error_code == 0) {
           insertComposerImageFile(path);
         } else {
           insertComposerFile(path);
@@ -6435,7 +6425,7 @@ bool MainWindow::insertComposerMimeData(const QMimeData *mime) {
 
 void MainWindow::insertComposerImage(const QImage &image) {
   // 原图存临时 PNG（发送用原图）；内联显示时按最大宽度缩放，资源名即文件路径，
-  // QTextEdit 会从磁盘加载渲染，发送时也从这个路径取原图。
+  // Composer 资源加载器从磁盘解码，发送时仍从此路径取原图。
   const QString dir =
       QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation))
           .filePath(QStringLiteral("maichat-paste"));
@@ -6464,14 +6454,12 @@ void MainWindow::insertComposerImage(const QImage &image) {
 }
 
 void MainWindow::insertComposerImageFile(const QString &localPath) {
-  // 资源名直接用原文件路径：QTextEdit
-  // 从磁盘加载渲染，collectComposerAttachments 也据此判定为图片（没有
-  // pending-file:// 前缀），发送时发的就是这个原文件——
-  // 不像剪贴板图像那样先落一份 PNG，3MB 的 JPG 不会被重编码成十几 MB 的 PNG。
-  QImageReader reader(localPath);
-  const QSize size = reader.size();
-  if (!size.isValid() || size.isEmpty()) {
-    insertComposerFile(localPath); // 读不出尺寸就别硬塞，退回文件卡
+  // 原路径保持附件身份；ComposerTextEdit 的资源加载器统一解出 RGBA，
+  // 草稿恢复同样经过该入口，不让 QTextDocument 按路径再次隐式调用 Qt 解码。
+  const MaiImageInfo info = desktopInspectRasterFile(localPath);
+  const QSize size(info.display_width, info.display_height);
+  if (info.error_code != 0 || size.isEmpty()) {
+    insertComposerFile(localPath);
     return;
   }
 
@@ -7342,7 +7330,7 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
                 } else if (chosen == copyAction) {
                   // 位图 + 文件 URL
                   // 一起放剪贴板：贴到聊天/文档得到图片，贴到资源管理器得到文件。
-                  const QImage imageData(image.localPath);
+                  const QImage imageData = desktopReadRasterFile(image.localPath).image;
                   if (imageData.isNull()) {
                     AppMessageDialog::show(
                         this, AppMessageDialog::Kind::Warning,
@@ -7473,7 +7461,7 @@ QWidget *MainWindow::createMessageBubble(const RemoteIMMessage &message) {
             composed.setDevicePixelRatio(coverDpr);
             paintPlayBadge(composed);
             videoButton->setIcon(QIcon(composed));
-          });
+          }, {}, true);
     }
     videoButton->setFixedSize(coverWidth, coverHeight);
     videoButton->setStyleSheet(

@@ -84,7 +84,7 @@ if ($deployExitCode -ne 0) { throw "windeployqt 失败，退出码 $deployExitCo
 # error dialog instead of an AppLog entry or a useful --smoke exit code.
 foreach ($requiredQtRuntime in @(
     'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'Qt6Svg.dll',
-    'platforms\qwindows.dll', 'imageformats\qsvg.dll', 'imageformats\qwebp.dll'
+    'platforms\qwindows.dll', 'imageformats\qsvg.dll', 'imageformats\qjpeg.dll'
 )) {
     if (-not (Test-Path -LiteralPath (Join-Path $staging $requiredQtRuntime))) {
         throw "staging 缺少 Qt 运行时：$requiredQtRuntime"
@@ -93,7 +93,9 @@ foreach ($requiredQtRuntime in @(
 
 # 网络、数据库和媒体由普通 C++/原生后端提供；禁止旧 SDK 插件随包回流。
 foreach ($retiredQtRuntime in 'Qt6Network.dll', 'Qt6WebSockets.dll', 'Qt6Sql.dll',
-         'Qt6Multimedia.dll', 'Qt6MultimediaWidgets.dll', 'multimedia', 'sqldrivers', 'tls') {
+         'Qt6Multimedia.dll', 'Qt6MultimediaWidgets.dll', 'multimedia', 'sqldrivers', 'tls',
+         'imageformats\qwebp.dll', 'imageformats\qtiff.dll', 'imageformats\qicns.dll',
+         'imageformats\qtga.dll', 'imageformats\qwbmp.dll', 'imageformats\qmng.dll', 'imageformats\qjp2.dll') {
     if (Test-Path -LiteralPath (Join-Path $staging $retiredQtRuntime)) {
         throw "staging contains retired Qt runtime: $retiredQtRuntime"
     }

@@ -1,11 +1,11 @@
 // 文件作用：桌面端 Agent 工具；DesktopVisionTools 负责 Agent 工具注册、调用与结果返回，本文件给出其实现。
 // 直接依赖：MaiFilePath.h、MaiFileSystem.h、MaiIdGenerator.h、MaiImageVision.h；实现与这些接口协作。
 #include "MaiChatTools/DesktopVisionTools.h"
+#include "ui/DesktopRasterImage.h"
 
 #include <QByteArray>
 #include <QFile>
 #include <QImage>
-#include <QImageReader>
 #include <QImageWriter>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -13,6 +13,7 @@
 #include <QString>
 #include <QtMath>
 
+#include <cerrno>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -125,23 +126,23 @@ public:
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                           "image file is missing or exceeds 50 MB");
         }
-        QImageReader reader(QString::fromUtf8(resolved.c_str()));
-        reader.setAutoTransform(true);
-        const QSize dimensions = reader.size();
-        if (dimensions.isValid() &&
-            static_cast<std::int64_t>(dimensions.width()) * dimensions.height() > kMaxPixels) {
+        MaiImageReadOptions options{};
+        options.max_encoded_bytes = kMaxImageBytes;
+        options.max_source_pixels = kMaxPixels;
+        options.context = const_cast<MaiToolContext*>(&context);
+        options.is_canceled = [](void* opaque) {
+            return static_cast<const MaiToolContext*>(opaque)->isCanceled() ? 1 : 0;
+        };
+        const auto raster = desktopReadRasterFile(QString::fromUtf8(resolved.c_str()), options);
+        if (context.isCanceled())
+            return MaiToolResult::failure(MaiErrorCode::Canceled, "image analysis was canceled");
+        if (raster.errorCode == -EFBIG)
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                           "image cannot exceed 12 megapixels");
-        }
-        const QImage decoded = reader.read();
+        const QImage decoded = raster.image;
         if (decoded.isNull())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                           "image format could not be decoded");
-        if (static_cast<std::int64_t>(decoded.width()) * decoded.height() > kMaxPixels)
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "image cannot exceed 12 megapixels");
-        if (context.isCanceled())
-            return MaiToolResult::failure(MaiErrorCode::Canceled, "image analysis was canceled");
         const QImage rgba = decoded.convertToFormat(QImage::Format_RGBA8888);
         void* handle = mService->handle();
         if (handle == nullptr)

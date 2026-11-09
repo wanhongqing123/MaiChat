@@ -42,14 +42,14 @@ public:
      */
     void load(const QString& path, const QSize& targetPixels, QWidget* owner,
               const std::function<void(const QPixmap&)>& onReady,
-              const std::function<void()>& onMissing = {});
+              const std::function<void()>& onMissing = {}, bool videoCover = false);
 
     /** 贴到 QLabel 的常见情形。 */
     void loadInto(const QString& path, const QSize& targetPixels, QLabel* label,
-                  const std::function<void()>& onMissing = {});
+                  const std::function<void()>& onMissing = {}, bool videoCover = false);
 
     /** 缓存键：路径 + 目标像素 + 文件大小 + 修改时间。见 .cpp 里的说明。 */
-    static QString cacheKey(const QString& path, const QSize& targetPixels);
+    static QString cacheKey(const QString& path, const QSize& targetPixels, bool videoCover = false);
 
 private slots:
     void deliver(const QString& key, const QImage& image, qint64 elapsedMs,

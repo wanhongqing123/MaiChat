@@ -2,6 +2,7 @@
 // 主要入口：userId、setUserId、buildUi、applyStyle。
 // 实现边界：与 AddContactDialog 的公开声明配套，调用方通过相应接口进入。
 #include "ui/UiZoom.h"
+#include "ui/DesktopRasterImage.h"
 #include "ui/AddContactDialog.h"
 #include "ui/FriendQrDecoder.h"
 
@@ -11,7 +12,6 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPixmap>
-#include <QImageReader>
 #include <QVBoxLayout>
 
 namespace {
@@ -41,8 +41,10 @@ void AddContactDialog::setUserId(const QString& userId) {
 
 void AddContactDialog::setOwnQr(const QString& userId, const QByteArray& png,
                                 const QString& error) {
-    QPixmap image;
-    if (!error.isEmpty() || !image.loadFromData(png, "PNG") || userId.isEmpty()) {
+    const auto decoded = desktopReadRasterBytes(png);
+    const QPixmap image = QPixmap::fromImage(decoded.image);
+    if (!error.isEmpty() || decoded.info.format != MAI_IMAGE_FORMAT_PNG ||
+        image.isNull() || userId.isEmpty()) {
         showQrButton_->setText(error.isEmpty() ? QStringLiteral("二维码暂不可用") : error);
         showQrButton_->setEnabled(false);
         return;
@@ -131,15 +133,15 @@ void AddContactDialog::buildUi() {
             this, QStringLiteral("选择好友二维码图片"), {},
             QStringLiteral("图片 (*.png *.jpg *.jpeg *.webp *.bmp)"));
         if (path.isEmpty()) return;
-        QImageReader reader(path);
-        reader.setAutoTransform(true);
-        const QSize size = reader.size();
-        if (!size.isValid() || size.width() > 4096 || size.height() > 4096) {
+        MaiImageReadOptions options{};
+        options.max_source_width = options.max_source_height = 4096;
+        const auto decoded = desktopReadRasterFile(path, options);
+        if (decoded.image.isNull()) {
             scanStatusLabel_->setText(QStringLiteral("图片太大或无法读取"));
             scanStatusLabel_->show();
             return;
         }
-        const QString accountId = maiChatAccountIdFromQrImage(reader.read());
+        const QString accountId = maiChatAccountIdFromQrImage(decoded.image);
         if (accountId.isEmpty()) {
             scanStatusLabel_->setText(QStringLiteral("没有识别到 MaiChat 好友二维码"));
         } else {

@@ -13,17 +13,21 @@ private slots:
     void pinnedVersion() {
         QCOMPARE(QLibraryInfo::version(), QVersionNumber(6, 12, 0));
     }
-    void webpAndSvgPlugins() {
+    void uiResourceRasterAndSvgPlugins() {
         const auto formats = QImageReader::supportedImageFormats();
-        QVERIFY(formats.contains("webp"));
+        // User raster decoding is verified through FFmpeg. Qt retains the
+        // built-in/UI resource formats and SVG, without qtimageformats plugins.
+        QVERIFY(!formats.contains("webp"));
+        QVERIFY(formats.contains("png"));
+        QVERIFY(formats.contains("jpeg"));
         QVERIFY(formats.contains("svg"));
         QImage original(4, 4, QImage::Format_ARGB32);
         original.fill(Qt::red);
         QByteArray encoded;
         QBuffer output(&encoded);
         QVERIFY(output.open(QIODevice::WriteOnly));
-        QVERIFY(original.save(&output, "WEBP"));
-        const QImage decoded = QImage::fromData(encoded, "WEBP");
+        QVERIFY(original.save(&output, "PNG"));
+        const QImage decoded = QImage::fromData(encoded, "PNG");
         QCOMPARE(decoded.size(), original.size());
     }
     void svgRendererIsUsable() {

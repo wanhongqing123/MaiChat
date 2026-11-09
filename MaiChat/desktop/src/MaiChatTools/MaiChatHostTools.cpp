@@ -2,6 +2,7 @@
 // 主要入口：unreadSummary。
 // 直接依赖：MaiTool.h、app/RemoteIMApplication.h、model/MessageQuote.h、model/MessageSearch.h；实现与这些接口协作。
 #include "MaiChatTools/MaiChatHostTools.h"
+#include "ui/DesktopRasterImage.h"
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -10,7 +11,6 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
-#include <QImageReader>
 #include <QMetaObject>
 #include <QPointer>
 #include <QRegularExpression>
@@ -272,8 +272,17 @@ private:
         source.size() > limit) {
       return invalidInput(QStringLiteral("media file is missing, unreadable, empty, or too large"));
     }
-    if (kind == QStringLiteral("image") && !QImageReader(source.filePath()).canRead())
-      return invalidInput(QStringLiteral("image file cannot be decoded"));
+    if (kind == QStringLiteral("image")) {
+      MaiImageReadOptions options{};
+      options.max_encoded_bytes = 20LL * 1024 * 1024;
+      options.max_output_width = options.max_output_height = 1;
+      options.context = const_cast<MaiToolContext*>(&context);
+      options.is_canceled = [](void* opaque) {
+        return static_cast<const MaiToolContext*>(opaque)->isCanceled() ? 1 : 0;
+      };
+      if (desktopReadRasterFile(source.filePath(), options).image.isNull())
+        return invalidInput(QStringLiteral("image file cannot be decoded"));
+    }
     if (kind == QStringLiteral("video") &&
         source.suffix().compare(QStringLiteral("mp4"), Qt::CaseInsensitive) != 0 &&
         source.suffix().compare(QStringLiteral("mov"), Qt::CaseInsensitive) != 0) {

@@ -1,1 +1,3 @@
 /.build/
+# Preserve the retired local checkout outside the formal SDK module graph.
+/qtimageformats/

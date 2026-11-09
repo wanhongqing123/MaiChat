@@ -181,10 +181,19 @@ done
 qt_install_root="$("$python" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent.parent)' "$macdeployqt")"
 qt_plugin_source="$qt_install_root/plugins"
 qt_plugin_target="$staged_app/Contents/PlugIns"
-for plugin in platforms/libqcocoa.dylib imageformats/libqsvg.dylib imageformats/libqwebp.dylib \
+for plugin in platforms/libqcocoa.dylib imageformats/libqsvg.dylib \
               imageformats/libqjpeg.dylib iconengines/libqsvgicon.dylib styles/libqmacstyle.dylib; do
   if [[ ! -f "$qt_plugin_source/$plugin" ]]; then
     echo "Missing Qt 6 UI plugin in source SDK: $plugin" >&2
+    exit 1
+  fi
+done
+# This SDK profile uses FFmpeg for user raster images. Reject a stale optional
+# decoder before collecting UI seeds; the source SDK itself is never modified.
+for plugin in libqwebp.dylib libqtiff.dylib libqicns.dylib libqtga.dylib libqwbmp.dylib libqmng.dylib \
+              libqjp2.dylib libqmacheif.dylib libqmacjp2.dylib; do
+  if [[ -f "$qt_plugin_source/imageformats/$plugin" ]]; then
+    echo "Retired Qt image decoder in source SDK: $plugin" >&2
     exit 1
   fi
 done
@@ -218,7 +227,7 @@ for framework in QtNetwork QtWebSockets QtSql QtMultimedia QtMultimediaWidgets; 
     exit 1
   fi
 done
-for plugin in platforms/libqcocoa.dylib imageformats/libqsvg.dylib imageformats/libqwebp.dylib \
+for plugin in platforms/libqcocoa.dylib imageformats/libqsvg.dylib \
               imageformats/libqjpeg.dylib iconengines/libqsvgicon.dylib styles/libqmacstyle.dylib; do
   if [[ ! -f "$staged_app/Contents/PlugIns/$plugin" ]]; then
     echo "Missing Qt 6 runtime plugin: $plugin" >&2

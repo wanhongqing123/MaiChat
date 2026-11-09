@@ -2,6 +2,7 @@
 // 主要入口：keyPressEvent、mousePressEvent、resizeEvent、updateImage。
 // 实现边界：与 ImagePreviewDialog 的公开声明配套，调用方通过相应接口进入。
 #include "ui/ImagePreviewDialog.h"
+#include "ui/DesktopRasterImage.h"
 
 #include <QGuiApplication>
 #include <QCloseEvent>
@@ -14,7 +15,7 @@
 #include <utility>
 
 ImagePreviewDialog::ImagePreviewDialog(const QString& imagePath, QWidget* parent)
-    : ImagePreviewDialog(QPixmap(imagePath), parent) {}
+    : ImagePreviewDialog(QPixmap::fromImage(desktopReadRasterFile(imagePath).image), parent) {}
 
 ImagePreviewDialog::ImagePreviewDialog(const QPixmap& image, QWidget* parent)
     : QDialog(parent), image_(image) {

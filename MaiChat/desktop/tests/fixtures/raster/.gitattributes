@@ -1,0 +1,3 @@
+# Raw raster pixels can contain whitespace bytes; preserve them across checkouts.
+*.ppm binary
+*.rgb binary

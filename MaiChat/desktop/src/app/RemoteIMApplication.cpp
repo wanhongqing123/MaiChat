@@ -2,6 +2,7 @@
 // 主要入口：selfProfile、createContactGroup、renameContactGroup、deleteContactGroup。
 // 直接依赖：app/VideoCoverImage.h、im/VideoFileMetadata.h、remote/RemoteDesktopSignal.h；实现与这些接口协作。
 #include "app/RemoteIMApplication.h"
+#include "ui/DesktopRasterImage.h"
 
 #include <QSet>
 #include <QPointer>
@@ -17,7 +18,6 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFutureWatcher>
-#include <QImageReader>
 #include <QMimeDatabase>
 #include <QPainter>
 #include <QStandardPaths>
@@ -129,18 +129,13 @@ QByteArray RemoteIMApplication::prepareAvatarJpeg(const QString &path) {
         return {};
     QByteArray input = source.read(20LL * 1024 * 1024 + 1);
     if (input.isEmpty() || input.size() > 20LL * 1024 * 1024) return {};
-    QBuffer inputBuffer(&input);
-    if (!inputBuffer.open(QIODevice::ReadOnly)) return {};
-    QImageReader reader(&inputBuffer);
-    reader.setAutoTransform(true);
-    const QSize size = reader.size();
-    // 解码前约束像素；在支持原生缩放的插件中直接解到头像尺寸，避免超大图驻留。
-    if (!size.isValid() || qint64(size.width()) * size.height() > 100LL * 1000 * 1000) return {};
-    QSize decodeSize = size.scaled(QSize(2048, 2048), Qt::KeepAspectRatio);
-    decodeSize.setWidth(qMax(1, decodeSize.width()));
-    decodeSize.setHeight(qMax(1, decodeSize.height()));
-    reader.setScaledSize(decodeSize);
-    QImage decoded = reader.read();
+    // Keep the avatar's original 100MP source policy; thumbnail dimensions
+    // constrain output only and do not silently inherit the generic 64MP default.
+    MaiImageReadOptions options{};
+    options.max_encoded_bytes = 20LL * 1024 * 1024;
+    options.max_source_pixels = 100LL * 1000 * 1000;
+    options.max_output_width = options.max_output_height = 2048;
+    QImage decoded = desktopReadRasterBytes(input, options).image;
     if (decoded.isNull()) return {};
     if (decoded.colorSpace().isValid()) decoded.convertToColorSpace(QColorSpace::SRgb);
     QImage image(QSize(512, 512), QImage::Format_RGB32);

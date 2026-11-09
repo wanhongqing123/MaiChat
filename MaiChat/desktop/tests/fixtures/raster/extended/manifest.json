@@ -1,0 +1,26 @@
+{
+  "source": "Owned 96x64 six-cell source RGB from independent EXIF fixtures",
+  "generator": "Pillow 12.2.0",
+  "purpose": "Extended still/animation first-frame regression; no user media",
+  "files": {
+    "corrupt-deflate.tiff": "5f4b63859e710ec0f328a81c4b6be3f249d0769f90963f02bff0925d7c3054bb",
+    "owned-animated.gif": "ce144757e1c0f7f6c324ad4ae7c843d1ff9ae6325121bb8d2cbf8498f1c4a3df",
+    "owned-animated.png": "3eaf8e0bf95c1ae69a3b926e2e04e91ed86d4d88cf1725a5ffa080844b0ba466",
+    "owned-animated.webp": "8ce542abc5a919c3512eb66df2a96b07cde3dcdfc812b7ca173aacc8f96e6fed",
+    "owned-exif-7-deflate.tiff": "20aa38dfa15a72863aae46c674e41f83e9ad7def8fdfb8a9f77d17ddfdd67691",
+    "owned-exif-7.png": "f76f6a4a6eaaf8290e042b4ea0d50df21787d9333a14e29e223a5b9b4ae54feb",
+    "owned-exif-7.tiff": "c5bf48f4e33b9931c1fe79849f29f463fbd343246fd852e9b1b72871ddd5cfee",
+    "owned-exif-7.webp": "52a202a2d1d58f335e711dd04aa9010fda533f3725c23210df7bbbe8444aa98f",
+    "owned-multiple.ico": "f1cd128104c17a1063441ab52c88b53e56df819167ff573db1c357359c7bdce5",
+    "owned-padding.heic": "bda16de54d8bd46af5e0bcc03e1f96db1992dc108342a139f2ae2d304f330d93",
+    "owned.avif": "538d5a7c8b51543a0b9d5522df63dc38cdb14db62782b985e6c1fd8267434e03",
+    "owned.bmp": "63d92c3d9ab8fa928edb4dd3ff0420fff24a9f2fd663316271cd84f7ebebde14",
+    "owned.jp2": "28016544ba07bb2310dc430911c9fd1e5efbe720c2e47bb188756e09d54a983a",
+    "owned.ppm": "76624e272728ca5ee20e1ed8458714b7e2db189cc4d0573c9bb6395add35e719",
+    "owned.tiff": "1875ae6abdddb2bf493bbaf536f864288ae268fcb2bd322d266885b55cdf39d0",
+    "source-78x110.png": "85ec157ddc7fc99482a703d64c40c8e095f9450d03645d51acd258f2afbe3123",
+    "source.png": "7688c45f34d263f566f3c175169777ef3cbf60a4522ee7dd751012df73496c2a",
+    "owned-ispe-16.avif": "8e64324b0fea9abc33ba7543cefc16e172da7c97cbb81c8aa817690e2d6a6e9c"
+  },
+  "additionalGeneration": "Owned HEIC via macOS 27.2 sips, same owned PNG; damaged deflate TIFF flips a payload byte with original IFD retained."
+}

@@ -1,0 +1,1042 @@
+{
+  "schema_version": 1,
+  "purpose": "Owned still JPEG orientation/ICC fixtures, independent pixel oracle; no user media",
+  "source_generation": {
+    "size": [
+      96,
+      64
+    ],
+    "layout": "3 columns by 2 rows; each solid cell is 32x32",
+    "rgb_cells_top_to_bottom": [
+      [
+        [
+          224,
+          32,
+          32
+        ],
+        [
+          32,
+          192,
+          64
+        ],
+        [
+          32,
+          64,
+          224
+        ]
+      ],
+      [
+        [
+          32,
+          192,
+          192
+        ],
+        [
+          192,
+          32,
+          192
+        ],
+        [
+          224,
+          192,
+          32
+        ]
+      ]
+    ],
+    "pillow_version": "12.3.0",
+    "jpeg_library_version": "8.0",
+    "jpeg_encoder": {
+      "quality": 95,
+      "subsampling": "4:4:4",
+      "progressive": false,
+      "optimize": false
+    },
+    "pillow_base_decode_quality_control_max_rgb_error": 1,
+    "quality_control_is_orientation_oracle": false,
+    "generator_sha256": "f36c2b35fe95080642331f72b4be1896215ecca86573117fb694e00afec33503"
+  },
+  "oracle": {
+    "basis": "Original generated RGB layout plus explicit EXIF display-to-source coordinate formulas",
+    "coordinates": "Origin at top left; x increases right, y increases down; no Qt/FFmpeg decoder used",
+    "display_to_source": {
+      "1": [
+        "x",
+        "y"
+      ],
+      "2": [
+        "W-1-x",
+        "y"
+      ],
+      "3": [
+        "W-1-x",
+        "H-1-y"
+      ],
+      "4": [
+        "x",
+        "H-1-y"
+      ],
+      "5": [
+        "y",
+        "x"
+      ],
+      "6": [
+        "y",
+        "H-1-x"
+      ],
+      "7": [
+        "W-1-y",
+        "H-1-x"
+      ],
+      "8": [
+        "W-1-y",
+        "x"
+      ]
+    },
+    "expected_files": "Headerless, top-down tightly packed RGBA8; stride=display_width*4",
+    "rgb_tolerance": 12,
+    "alpha_tolerance": 0,
+    "dimensions_orientation_1_to_4": [
+      96,
+      64
+    ],
+    "dimensions_orientation_5_to_8": [
+      64,
+      96
+    ],
+    "spec_reference": "Exif Orientation tag 0x0112; TIFF/EP eight row/column orientations",
+    "references": [
+      "https://developer.adobe.com/xmp/docs/xmp-namespaces/tiff/",
+      "https://www.cipa.jp/std/documents/e/DC-X010-2017.pdf"
+    ]
+  },
+  "jpeg_identity": {
+    "base_sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23",
+    "sos_through_eoi_sha256": "1ca471e3d1ad44dd730b2e3d43514b50491a5fbdaa9977cb04dbc13860dd2cb8",
+    "eight_exif_files_differ_only_by_inserted_app1_orientation": true,
+    "encoder_invocations": 1
+  },
+  "icc": {
+    "path": "sRGB2014.icc",
+    "bytes": 3024,
+    "sha256": "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a",
+    "source_repository_file": "MaiChat/desktop/qt/qtbase/tests/auto/gui/painting/qcolorspace/resources/sRGB2014.icc",
+    "source_repository": "https://github.com/qt/qtbase",
+    "source_commit": "025bdad181de241e81bf853c8a2d7bf3d19261a9",
+    "upstream_url": "https://github.com/qt/qtbase/blob/025bdad181de241e81bf853c8a2d7bf3d19261a9/tests/auto/gui/painting/qcolorspace/resources/sRGB2014.icc",
+    "description": "sRGB2014",
+    "copyright": "Copyright International Color Consortium, 2015",
+    "validation": "ICC size/acsp checked; LittleCMS parsed it and built RGB-to-RGB transform",
+    "littlecms_version": "2.19",
+    "generated_or_modified_profile": false
+  },
+  "supporting_assets": [
+    {
+      "path": "source-asymmetric.rgb",
+      "bytes": 18432,
+      "sha256": "e572524997d8750407ea15e2a01e020da2c953bbd9adb90986ace9b0a6ed9b6a"
+    },
+    {
+      "path": "source-asymmetric.jpg",
+      "bytes": 930,
+      "sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23"
+    },
+    {
+      "path": "sRGB2014.icc",
+      "bytes": 3024,
+      "sha256": "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"
+    },
+    {
+      "path": "expected-orientation-1.rgba",
+      "bytes": 24576,
+      "sha256": "de08e4b6ccfe9bdc3fc57d0031f6d79eb2f32e8d03d541e96d44e27bc2a8100e"
+    },
+    {
+      "path": "expected-orientation-2.rgba",
+      "bytes": 24576,
+      "sha256": "d0e9e6333e1425363554a7b7bfb8636a6616ea9bc591db25d6613c944b938122"
+    },
+    {
+      "path": "expected-orientation-3.rgba",
+      "bytes": 24576,
+      "sha256": "aca4c699ff7491bd9fb1c3ca4b58e2df4c7a933ada13296cd1a18a47fae71441"
+    },
+    {
+      "path": "expected-orientation-4.rgba",
+      "bytes": 24576,
+      "sha256": "74080054d1a82cf1dffafb5e9ea37fe3ac44cd056a79a050dfe2a841c8b56389"
+    },
+    {
+      "path": "expected-orientation-5.rgba",
+      "bytes": 24576,
+      "sha256": "98947410d4ac41c47819ea78e08a3f929660b416584d3eeb41b1b0e71ad74652"
+    },
+    {
+      "path": "expected-orientation-6.rgba",
+      "bytes": 24576,
+      "sha256": "504e119ae633f12461707ac3341e281e586bd3d320784f508c30fd7aa8f1f790"
+    },
+    {
+      "path": "expected-orientation-7.rgba",
+      "bytes": 24576,
+      "sha256": "12923d1be6cb08433488f18aab82b6a4e4d54bba1cb89e42f48a94fcbb22fb90"
+    },
+    {
+      "path": "expected-orientation-8.rgba",
+      "bytes": 24576,
+      "sha256": "518bd6f73b993a959428cea0c3cfd3d76578dcded9577281d535ec082f98b09b"
+    }
+  ],
+  "fixtures": [
+    {
+      "path": "exif-orientation-1.jpg",
+      "bytes": 966,
+      "sha256": "1bb61c301c9200480c58fed76ff7daf6a5c778d45ab679245cc0fa6106d19f68",
+      "encoded_format": "JPEG",
+      "source_size": [
+        96,
+        64
+      ],
+      "exif_orientation": 1,
+      "expected_display_size": [
+        96,
+        64
+      ],
+      "display_transform": "identity",
+      "expected_corner_rgba": {
+        "top_left": [
+          224,
+          32,
+          32,
+          255
+        ],
+        "top_right": [
+          32,
+          64,
+          224,
+          255
+        ],
+        "bottom_left": [
+          32,
+          192,
+          192,
+          255
+        ],
+        "bottom_right": [
+          224,
+          192,
+          32,
+          255
+        ]
+      },
+      "sample_points": [
+        {
+          "label": "top_left",
+          "x": 4,
+          "y": 4,
+          "expected_rgba": [
+            224,
+            32,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "top_right",
+          "x": 91,
+          "y": 4,
+          "expected_rgba": [
+            32,
+            64,
+            224,
+            255
+          ]
+        },
+        {
+          "label": "bottom_left",
+          "x": 4,
+          "y": 59,
+          "expected_rgba": [
+            32,
+            192,
+            192,
+            255
+          ]
+        },
+        {
+          "label": "bottom_right",
+          "x": 91,
+          "y": 59,
+          "expected_rgba": [
+            224,
+            192,
+            32,
+            255
+          ]
+        }
+      ],
+      "rgb_max_absolute_error_per_channel": 12,
+      "alpha_expected_exactly": 255,
+      "expected_rgba_file": "expected-orientation-1.rgba",
+      "jpeg_sos_through_eoi_sha256": "1ca471e3d1ad44dd730b2e3d43514b50491a5fbdaa9977cb04dbc13860dd2cb8",
+      "stripped_jpeg_sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23",
+      "icc_profile_sha256": null
+    },
+    {
+      "path": "exif-orientation-2.jpg",
+      "bytes": 966,
+      "sha256": "ca84821327ccb1ff78b3842c0c441d2c083f398335e401710544506c1e28791f",
+      "encoded_format": "JPEG",
+      "source_size": [
+        96,
+        64
+      ],
+      "exif_orientation": 2,
+      "expected_display_size": [
+        96,
+        64
+      ],
+      "display_transform": "mirror horizontally",
+      "expected_corner_rgba": {
+        "top_left": [
+          32,
+          64,
+          224,
+          255
+        ],
+        "top_right": [
+          224,
+          32,
+          32,
+          255
+        ],
+        "bottom_left": [
+          224,
+          192,
+          32,
+          255
+        ],
+        "bottom_right": [
+          32,
+          192,
+          192,
+          255
+        ]
+      },
+      "sample_points": [
+        {
+          "label": "top_left",
+          "x": 4,
+          "y": 4,
+          "expected_rgba": [
+            32,
+            64,
+            224,
+            255
+          ]
+        },
+        {
+          "label": "top_right",
+          "x": 91,
+          "y": 4,
+          "expected_rgba": [
+            224,
+            32,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "bottom_left",
+          "x": 4,
+          "y": 59,
+          "expected_rgba": [
+            224,
+            192,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "bottom_right",
+          "x": 91,
+          "y": 59,
+          "expected_rgba": [
+            32,
+            192,
+            192,
+            255
+          ]
+        }
+      ],
+      "rgb_max_absolute_error_per_channel": 12,
+      "alpha_expected_exactly": 255,
+      "expected_rgba_file": "expected-orientation-2.rgba",
+      "jpeg_sos_through_eoi_sha256": "1ca471e3d1ad44dd730b2e3d43514b50491a5fbdaa9977cb04dbc13860dd2cb8",
+      "stripped_jpeg_sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23",
+      "icc_profile_sha256": null
+    },
+    {
+      "path": "exif-orientation-3.jpg",
+      "bytes": 966,
+      "sha256": "04a8901671e4bf6684d203244a4d5d0af1074255706011a5446ff3c597af3de1",
+      "encoded_format": "JPEG",
+      "source_size": [
+        96,
+        64
+      ],
+      "exif_orientation": 3,
+      "expected_display_size": [
+        96,
+        64
+      ],
+      "display_transform": "rotate 180 degrees",
+      "expected_corner_rgba": {
+        "top_left": [
+          224,
+          192,
+          32,
+          255
+        ],
+        "top_right": [
+          32,
+          192,
+          192,
+          255
+        ],
+        "bottom_left": [
+          32,
+          64,
+          224,
+          255
+        ],
+        "bottom_right": [
+          224,
+          32,
+          32,
+          255
+        ]
+      },
+      "sample_points": [
+        {
+          "label": "top_left",
+          "x": 4,
+          "y": 4,
+          "expected_rgba": [
+            224,
+            192,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "top_right",
+          "x": 91,
+          "y": 4,
+          "expected_rgba": [
+            32,
+            192,
+            192,
+            255
+          ]
+        },
+        {
+          "label": "bottom_left",
+          "x": 4,
+          "y": 59,
+          "expected_rgba": [
+            32,
+            64,
+            224,
+            255
+          ]
+        },
+        {
+          "label": "bottom_right",
+          "x": 91,
+          "y": 59,
+          "expected_rgba": [
+            224,
+            32,
+            32,
+            255
+          ]
+        }
+      ],
+      "rgb_max_absolute_error_per_channel": 12,
+      "alpha_expected_exactly": 255,
+      "expected_rgba_file": "expected-orientation-3.rgba",
+      "jpeg_sos_through_eoi_sha256": "1ca471e3d1ad44dd730b2e3d43514b50491a5fbdaa9977cb04dbc13860dd2cb8",
+      "stripped_jpeg_sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23",
+      "icc_profile_sha256": null
+    },
+    {
+      "path": "exif-orientation-4.jpg",
+      "bytes": 966,
+      "sha256": "190f1ee68117404fa6bacb4cc5d676545bc90677634d4c38d71b573614016671",
+      "encoded_format": "JPEG",
+      "source_size": [
+        96,
+        64
+      ],
+      "exif_orientation": 4,
+      "expected_display_size": [
+        96,
+        64
+      ],
+      "display_transform": "mirror vertically",
+      "expected_corner_rgba": {
+        "top_left": [
+          32,
+          192,
+          192,
+          255
+        ],
+        "top_right": [
+          224,
+          192,
+          32,
+          255
+        ],
+        "bottom_left": [
+          224,
+          32,
+          32,
+          255
+        ],
+        "bottom_right": [
+          32,
+          64,
+          224,
+          255
+        ]
+      },
+      "sample_points": [
+        {
+          "label": "top_left",
+          "x": 4,
+          "y": 4,
+          "expected_rgba": [
+            32,
+            192,
+            192,
+            255
+          ]
+        },
+        {
+          "label": "top_right",
+          "x": 91,
+          "y": 4,
+          "expected_rgba": [
+            224,
+            192,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "bottom_left",
+          "x": 4,
+          "y": 59,
+          "expected_rgba": [
+            224,
+            32,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "bottom_right",
+          "x": 91,
+          "y": 59,
+          "expected_rgba": [
+            32,
+            64,
+            224,
+            255
+          ]
+        }
+      ],
+      "rgb_max_absolute_error_per_channel": 12,
+      "alpha_expected_exactly": 255,
+      "expected_rgba_file": "expected-orientation-4.rgba",
+      "jpeg_sos_through_eoi_sha256": "1ca471e3d1ad44dd730b2e3d43514b50491a5fbdaa9977cb04dbc13860dd2cb8",
+      "stripped_jpeg_sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23",
+      "icc_profile_sha256": null
+    },
+    {
+      "path": "exif-orientation-5.jpg",
+      "bytes": 966,
+      "sha256": "d8f91a6b9a244adbef18b5d2fb3cd7706f5d16a5f5385249eb852ebbfdc55a9d",
+      "encoded_format": "JPEG",
+      "source_size": [
+        96,
+        64
+      ],
+      "exif_orientation": 5,
+      "expected_display_size": [
+        64,
+        96
+      ],
+      "display_transform": "transpose across the top-left/bottom-right diagonal",
+      "expected_corner_rgba": {
+        "top_left": [
+          224,
+          32,
+          32,
+          255
+        ],
+        "top_right": [
+          32,
+          192,
+          192,
+          255
+        ],
+        "bottom_left": [
+          32,
+          64,
+          224,
+          255
+        ],
+        "bottom_right": [
+          224,
+          192,
+          32,
+          255
+        ]
+      },
+      "sample_points": [
+        {
+          "label": "top_left",
+          "x": 4,
+          "y": 4,
+          "expected_rgba": [
+            224,
+            32,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "top_right",
+          "x": 59,
+          "y": 4,
+          "expected_rgba": [
+            32,
+            192,
+            192,
+            255
+          ]
+        },
+        {
+          "label": "bottom_left",
+          "x": 4,
+          "y": 91,
+          "expected_rgba": [
+            32,
+            64,
+            224,
+            255
+          ]
+        },
+        {
+          "label": "bottom_right",
+          "x": 59,
+          "y": 91,
+          "expected_rgba": [
+            224,
+            192,
+            32,
+            255
+          ]
+        }
+      ],
+      "rgb_max_absolute_error_per_channel": 12,
+      "alpha_expected_exactly": 255,
+      "expected_rgba_file": "expected-orientation-5.rgba",
+      "jpeg_sos_through_eoi_sha256": "1ca471e3d1ad44dd730b2e3d43514b50491a5fbdaa9977cb04dbc13860dd2cb8",
+      "stripped_jpeg_sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23",
+      "icc_profile_sha256": null
+    },
+    {
+      "path": "exif-orientation-6.jpg",
+      "bytes": 966,
+      "sha256": "f3df83c8fe1f3ff49cab2edae8c835609476e5d3979b8e99418947e3218ae328",
+      "encoded_format": "JPEG",
+      "source_size": [
+        96,
+        64
+      ],
+      "exif_orientation": 6,
+      "expected_display_size": [
+        64,
+        96
+      ],
+      "display_transform": "rotate 90 degrees clockwise",
+      "expected_corner_rgba": {
+        "top_left": [
+          32,
+          192,
+          192,
+          255
+        ],
+        "top_right": [
+          224,
+          32,
+          32,
+          255
+        ],
+        "bottom_left": [
+          224,
+          192,
+          32,
+          255
+        ],
+        "bottom_right": [
+          32,
+          64,
+          224,
+          255
+        ]
+      },
+      "sample_points": [
+        {
+          "label": "top_left",
+          "x": 4,
+          "y": 4,
+          "expected_rgba": [
+            32,
+            192,
+            192,
+            255
+          ]
+        },
+        {
+          "label": "top_right",
+          "x": 59,
+          "y": 4,
+          "expected_rgba": [
+            224,
+            32,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "bottom_left",
+          "x": 4,
+          "y": 91,
+          "expected_rgba": [
+            224,
+            192,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "bottom_right",
+          "x": 59,
+          "y": 91,
+          "expected_rgba": [
+            32,
+            64,
+            224,
+            255
+          ]
+        }
+      ],
+      "rgb_max_absolute_error_per_channel": 12,
+      "alpha_expected_exactly": 255,
+      "expected_rgba_file": "expected-orientation-6.rgba",
+      "jpeg_sos_through_eoi_sha256": "1ca471e3d1ad44dd730b2e3d43514b50491a5fbdaa9977cb04dbc13860dd2cb8",
+      "stripped_jpeg_sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23",
+      "icc_profile_sha256": null
+    },
+    {
+      "path": "exif-orientation-7.jpg",
+      "bytes": 966,
+      "sha256": "b05424640cfc12172e99f90d3abd29ba059c64aeeeab33a011ad85f6cfe62366",
+      "encoded_format": "JPEG",
+      "source_size": [
+        96,
+        64
+      ],
+      "exif_orientation": 7,
+      "expected_display_size": [
+        64,
+        96
+      ],
+      "display_transform": "transpose across the top-right/bottom-left diagonal",
+      "expected_corner_rgba": {
+        "top_left": [
+          224,
+          192,
+          32,
+          255
+        ],
+        "top_right": [
+          32,
+          64,
+          224,
+          255
+        ],
+        "bottom_left": [
+          32,
+          192,
+          192,
+          255
+        ],
+        "bottom_right": [
+          224,
+          32,
+          32,
+          255
+        ]
+      },
+      "sample_points": [
+        {
+          "label": "top_left",
+          "x": 4,
+          "y": 4,
+          "expected_rgba": [
+            224,
+            192,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "top_right",
+          "x": 59,
+          "y": 4,
+          "expected_rgba": [
+            32,
+            64,
+            224,
+            255
+          ]
+        },
+        {
+          "label": "bottom_left",
+          "x": 4,
+          "y": 91,
+          "expected_rgba": [
+            32,
+            192,
+            192,
+            255
+          ]
+        },
+        {
+          "label": "bottom_right",
+          "x": 59,
+          "y": 91,
+          "expected_rgba": [
+            224,
+            32,
+            32,
+            255
+          ]
+        }
+      ],
+      "rgb_max_absolute_error_per_channel": 12,
+      "alpha_expected_exactly": 255,
+      "expected_rgba_file": "expected-orientation-7.rgba",
+      "jpeg_sos_through_eoi_sha256": "1ca471e3d1ad44dd730b2e3d43514b50491a5fbdaa9977cb04dbc13860dd2cb8",
+      "stripped_jpeg_sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23",
+      "icc_profile_sha256": null
+    },
+    {
+      "path": "exif-orientation-8.jpg",
+      "bytes": 966,
+      "sha256": "7201e5becdbfb446194dce38e89dfd2a3007d21a0c8cf3f6250ccad2f65e8710",
+      "encoded_format": "JPEG",
+      "source_size": [
+        96,
+        64
+      ],
+      "exif_orientation": 8,
+      "expected_display_size": [
+        64,
+        96
+      ],
+      "display_transform": "rotate 90 degrees counterclockwise",
+      "expected_corner_rgba": {
+        "top_left": [
+          32,
+          64,
+          224,
+          255
+        ],
+        "top_right": [
+          224,
+          192,
+          32,
+          255
+        ],
+        "bottom_left": [
+          224,
+          32,
+          32,
+          255
+        ],
+        "bottom_right": [
+          32,
+          192,
+          192,
+          255
+        ]
+      },
+      "sample_points": [
+        {
+          "label": "top_left",
+          "x": 4,
+          "y": 4,
+          "expected_rgba": [
+            32,
+            64,
+            224,
+            255
+          ]
+        },
+        {
+          "label": "top_right",
+          "x": 59,
+          "y": 4,
+          "expected_rgba": [
+            224,
+            192,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "bottom_left",
+          "x": 4,
+          "y": 91,
+          "expected_rgba": [
+            224,
+            32,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "bottom_right",
+          "x": 59,
+          "y": 91,
+          "expected_rgba": [
+            32,
+            192,
+            192,
+            255
+          ]
+        }
+      ],
+      "rgb_max_absolute_error_per_channel": 12,
+      "alpha_expected_exactly": 255,
+      "expected_rgba_file": "expected-orientation-8.rgba",
+      "jpeg_sos_through_eoi_sha256": "1ca471e3d1ad44dd730b2e3d43514b50491a5fbdaa9977cb04dbc13860dd2cb8",
+      "stripped_jpeg_sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23",
+      "icc_profile_sha256": null
+    },
+    {
+      "path": "exif-orientation-6-srgb2014.jpg",
+      "bytes": 4008,
+      "sha256": "5503be6b3f7bd9b6e386f4a25a41278d8260a5255529d48c09f2a54e80fb8845",
+      "encoded_format": "JPEG",
+      "source_size": [
+        96,
+        64
+      ],
+      "exif_orientation": 6,
+      "expected_display_size": [
+        64,
+        96
+      ],
+      "display_transform": "rotate 90 degrees clockwise",
+      "expected_corner_rgba": {
+        "top_left": [
+          32,
+          192,
+          192,
+          255
+        ],
+        "top_right": [
+          224,
+          32,
+          32,
+          255
+        ],
+        "bottom_left": [
+          224,
+          192,
+          32,
+          255
+        ],
+        "bottom_right": [
+          32,
+          64,
+          224,
+          255
+        ]
+      },
+      "sample_points": [
+        {
+          "label": "top_left",
+          "x": 4,
+          "y": 4,
+          "expected_rgba": [
+            32,
+            192,
+            192,
+            255
+          ]
+        },
+        {
+          "label": "top_right",
+          "x": 59,
+          "y": 4,
+          "expected_rgba": [
+            224,
+            32,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "bottom_left",
+          "x": 4,
+          "y": 91,
+          "expected_rgba": [
+            224,
+            192,
+            32,
+            255
+          ]
+        },
+        {
+          "label": "bottom_right",
+          "x": 59,
+          "y": 91,
+          "expected_rgba": [
+            32,
+            64,
+            224,
+            255
+          ]
+        }
+      ],
+      "rgb_max_absolute_error_per_channel": 12,
+      "alpha_expected_exactly": 255,
+      "expected_rgba_file": "expected-orientation-6.rgba",
+      "jpeg_sos_through_eoi_sha256": "1ca471e3d1ad44dd730b2e3d43514b50491a5fbdaa9977cb04dbc13860dd2cb8",
+      "stripped_jpeg_sha256": "1837187d1e2566fcec3760c11319996679b65fd88acf157552c0fc156a9b6d23",
+      "icc_profile_sha256": "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"
+    }
+  ],
+  "not_claimed": [
+    "FFmpeg decoder acceptance",
+    "Qt decoder acceptance",
+    "display color-management accuracy"
+  ]
+}

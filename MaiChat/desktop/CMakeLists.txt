@@ -365,7 +365,8 @@ elseif(WIN32)
   find_package(Qt6 REQUIRED COMPONENTS Concurrent)
   target_sources(maichat_pdf_preview PRIVATE src/ui/PdfPreviewWindows.cpp)
   target_compile_definitions(maichat_pdf_preview PRIVATE MAICHAT_PDF_WINDOWS_NATIVE=1)
-  target_link_libraries(maichat_pdf_preview PRIVATE Qt6::Concurrent windowsapp)
+  target_link_libraries(maichat_pdf_preview PRIVATE
+    Qt6::Concurrent windowsapp maichat_image_presentation)
 endif()
 
 add_subdirectory(../Network "${CMAKE_CURRENT_BINARY_DIR}/maichat_network" EXCLUDE_FROM_ALL)
@@ -479,6 +480,8 @@ if(WIN32)
   target_link_libraries(maichat_desktop_service_route PUBLIC Qt6::Core)
 endif()
 
+include(cmake/MaiImageComponents.cmake)
+
 add_library(remote_im_desktop_app
   src/auth/DesktopAuthClient.h
   src/auth/DesktopAuthClient.cpp
@@ -504,7 +507,7 @@ target_include_directories(remote_im_desktop_app PUBLIC src PRIVATE ../MaiChatTo
 # Qt6::Gui：视频封面要用 QImage/QPainter 画（并在 Windows 上把系统缩略图的 HBITMAP
 # 转成 QImage）。remote_im_core 保持无 GUI 依赖，封面这层留在应用层。
 target_link_libraries(remote_im_desktop_app PUBLIC remote_im_core Qt6::Gui maiagent
-  PRIVATE Qt6::Concurrent CURL::libcurl mai_avatar_client)
+  PRIVATE Qt6::Concurrent CURL::libcurl mai_avatar_client maichat_image_presentation)
 if(WIN32)
   # IShellItemImageFactory（资源管理器的缩略图提供程序）取视频首帧。
   target_link_libraries(remote_im_desktop_app PRIVATE shell32 ole32 Advapi32
@@ -584,11 +587,11 @@ target_link_libraries(remote_im_desktop_ui PUBLIC remote_im_desktop_app remote_i
   maichat_agent Qt6::Widgets Qt6::Svg
   maichat_pdf_preview)
 target_link_libraries(remote_im_desktop_ui PRIVATE Qt6::Concurrent CURL::libcurl)
+target_link_libraries(remote_im_desktop_ui PRIVATE maichat_image_presentation)
 target_link_libraries(remote_im_desktop_ui PRIVATE mai_video_circle_client
   mai_cloud_drive_client mai_curl_download mai_cloud_vod)
 if(APPLE AND TARGET maiagent_embedded_fftools)
   target_sources(remote_im_desktop_ui PRIVATE
-    ../Media/MaiImageDecode.cpp ../Media/MaiImageEncode.cpp
     ../Media/MaiVideoCircleMark.cpp)
   target_include_directories(remote_im_desktop_ui PUBLIC ../Media)
   target_include_directories(remote_im_desktop_ui PRIVATE
@@ -600,7 +603,6 @@ if(APPLE AND TARGET maiagent_embedded_fftools)
 endif()
 if(WIN32 AND TARGET maichat_ffmpeg_tools)
   target_sources(remote_im_desktop_ui PRIVATE
-    ../Media/MaiImageDecode.cpp ../Media/MaiImageEncode.cpp
     ../Media/MaiVideoCircleMark.cpp)
   target_include_directories(remote_im_desktop_ui PUBLIC ../Media)
   target_include_directories(remote_im_desktop_ui PRIVATE
@@ -614,10 +616,19 @@ if(WIN32 AND TARGET maichat_ffmpeg_tools)
   target_compile_definitions(remote_im_desktop_ui PRIVATE MAICHAT_FFMPEG_IMAGE_DECODE=1)
 endif()
 
-if(APPLE AND TARGET maiagent_embedded_fftools)
+if(TARGET maichat_image_codec)
   add_executable(MaiImageDecodeTest tests/MaiImageDecodeTest.cpp)
-  target_link_libraries(MaiImageDecodeTest PRIVATE remote_im_desktop_ui Qt6::Gui)
+  target_link_libraries(MaiImageDecodeTest PRIVATE maichat_image_codec Qt6::Gui)
   add_test(NAME MaiImageDecodeTest COMMAND MaiImageDecodeTest)
+  add_executable(MaiRasterImageTest tests/MaiRasterImageTest.cpp)
+  target_include_directories(MaiRasterImageTest PRIVATE "${_maichat_image_ffmpeg_include_dir}")
+  target_compile_definitions(MaiRasterImageTest PRIVATE
+    MAI_RASTER_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/raster")
+  target_link_libraries(MaiRasterImageTest PRIVATE maichat_image_codec Qt6::Gui Qt6::Test)
+  add_test(NAME MaiRasterImageTest COMMAND MaiRasterImageTest
+    -o "${CMAKE_CURRENT_BINARY_DIR}/raster-image-qtest.txt,txt")
+endif()
+if(APPLE AND TARGET maiagent_embedded_fftools)
   add_executable(MaiVideoCircleMarkTest tests/MaiVideoCircleMarkTest.cpp)
   target_link_libraries(MaiVideoCircleMarkTest PRIVATE remote_im_desktop_ui Qt6::Core)
   add_test(NAME MaiVideoCircleMarkTest COMMAND MaiVideoCircleMarkTest
@@ -917,6 +928,7 @@ target_link_libraries(maichat_agent PUBLIC
   Qt6::Core Qt6::Widgets Qt6::Concurrent
   maiagent maichat_markdown maichat_pdf_preview mai_video_circle_client)
 target_link_libraries(maichat_agent PRIVATE ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
+target_link_libraries(maichat_agent PRIVATE maichat_image_presentation Qt6::Svg)
 if(WIN32)
   target_link_libraries(maichat_agent PRIVATE ws2_32 mswsock
     maichat_desktop_service_route)
@@ -948,7 +960,8 @@ if(MAICHAT_ENABLE_PORTRAIT)
     src/MaiChatTools/DesktopPortraitTools.cpp
     ../MaiChatTools/MaiPortraitHostTools.cpp)
   target_include_directories(maichat_desktop_portrait PUBLIC src PRIVATE ../MaiChatTools)
-  target_link_libraries(maichat_desktop_portrait PUBLIC maichat_portrait Qt6::Widgets)
+  target_link_libraries(maichat_desktop_portrait PUBLIC maichat_portrait Qt6::Widgets
+    PRIVATE maichat_image_presentation)
   if(APPLE)
     target_sources(maichat_desktop_portrait PRIVATE src/MaiChatTools/DesktopPortraitFacesMac.mm)
     set_source_files_properties(src/MaiChatTools/DesktopPortraitFacesMac.mm
@@ -1779,6 +1792,21 @@ target_link_libraries(remote_desktop_ui_test PRIVATE remote_im_desktop_ui remote
 
 add_executable(message_image_loader_test tests/MessageImageLoaderTest.cpp)
 target_link_libraries(message_image_loader_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets Qt6::Test)
+add_executable(desktop_raster_document_test tests/DesktopRasterDocumentTest.cpp)
+target_link_libraries(desktop_raster_document_test PRIVATE
+  remote_im_desktop_ui maichat_agent maiagent Qt6::Widgets Qt6::Test)
+# The fixture includes DesktopPdfRenderer.cpp once to exercise its private
+# document policy; do not add another source copy to this target.
+add_test(NAME desktop_raster_document_test COMMAND desktop_raster_document_test
+  -o "${CMAKE_CURRENT_BINARY_DIR}/raster-document-qtest.txt,txt")
+add_executable(desktop_raster_image_test tests/DesktopRasterImageTest.cpp)
+target_link_libraries(desktop_raster_image_test PRIVATE remote_im_desktop_ui Qt6::Test)
+add_test(NAME desktop_raster_image_test COMMAND desktop_raster_image_test
+  -o "${CMAKE_CURRENT_BINARY_DIR}/raster-presentation-qtest.txt,txt")
+add_executable(preview_raster_compatibility_test tests/PreviewRasterCompatibilityTest.cpp)
+target_link_libraries(preview_raster_compatibility_test PRIVATE remote_im_desktop_ui Qt6::Test)
+add_test(NAME preview_raster_compatibility_test COMMAND preview_raster_compatibility_test
+  -o "${CMAKE_CURRENT_BINARY_DIR}/raster-preview-qtest.txt,txt")
 if(APPLE AND TARGET maiagent_obs_metal)
   add_executable(mai_graphics_desktop_image_test tests/MaiGraphicsDesktopImageTest.cpp)
   target_link_libraries(mai_graphics_desktop_image_test PRIVATE remote_im_desktop_ui

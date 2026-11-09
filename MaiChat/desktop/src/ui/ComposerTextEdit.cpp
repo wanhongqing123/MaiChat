@@ -5,15 +5,99 @@
 
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
+#include <QFile>
 #include <QFileInfo>
 #include <QMimeData>
 #include <QResizeEvent>
+#include <QTextDocument>
 #include <QUrl>
 #include <utility>
 
 #include "ui/UiZoom.h"
+#include "ui/DesktopRasterImage.h"
 
-ComposerTextEdit::ComposerTextEdit(QWidget* parent) : QTextEdit(parent) { setAcceptDrops(true); }
+namespace {
+
+QImage dataImage(const QUrl& url) {
+    constexpr qsizetype maximumBytes = 128 * 1024 * 1024;
+    const QByteArray encoded = url.toEncoded();
+    const qsizetype comma = encoded.indexOf(',');
+    if (comma < 0) return {};
+    const QByteArray metadata = encoded.left(comma).toLower();
+    const QByteArray payload = encoded.mid(comma + 1);
+    if (metadata.endsWith(";base64")) {
+        if (payload.size() > (maximumBytes + 2) / 3 * 4) return {};
+        const auto decoded = QByteArray::fromBase64Encoding(
+            payload, QByteArray::AbortOnBase64DecodingErrors);
+        if (!decoded) return {};
+        return desktopReadRasterBytes(decoded.decoded).image;
+    }
+    // Percent decoding may shrink by at most three. Keep the encoded allocation
+    // bounded as well; the native image API checks the resulting byte budget.
+    if (payload.size() > maximumBytes) return {};
+    return desktopReadRasterBytes(QByteArray::fromPercentEncoding(payload)).image;
+}
+
+class ComposerRasterDocument final : public QTextDocument {
+public:
+    explicit ComposerRasterDocument(QObject* parent) : QTextDocument(parent) {}
+
+protected:
+    QVariant loadResource(int type, const QUrl& name) override {
+        if (type != QTextDocument::ImageResource)
+            return QTextDocument::loadResource(type, name);
+        QImage image;
+        if (name.scheme() == QStringLiteral("data")) {
+            image = dataImage(name);
+        } else {
+            QUrl resolved = name;
+            if (resolved.isRelative() && !baseUrl().isEmpty()) resolved = baseUrl().resolved(name);
+            QString path;
+            if (resolved.isLocalFile() && resolved.host().isEmpty()) path = resolved.toLocalFile();
+            else if (resolved.scheme().isEmpty()) {
+                path = resolved.path();
+                // Existing attachment names are native paths, including draft
+                // names containing URL punctuation. Preserve their identity.
+                if (resolved.hasQuery()) path += QLatin1Char('?') + resolved.query();
+                if (resolved.hasFragment()) path += QLatin1Char('#') + resolved.fragment();
+            }
+#ifdef Q_OS_WIN
+            else if (resolved.host().isEmpty() && resolved.scheme().size() == 1 &&
+                     resolved.scheme().at(0) >= QLatin1Char('a') &&
+                     resolved.scheme().at(0) <= QLatin1Char('z') &&
+                     (resolved.path().startsWith(QLatin1Char('/')) ||
+                      resolved.path().startsWith(QLatin1Char('\\')))) {
+                // Native attachment names such as C:/... parse as scheme "c".
+                // Restore the local drive explicitly; a null image remains a
+                // terminal failure, without a Qt decoder or resource fallback.
+                path = resolved.scheme().toUpper() + QLatin1Char(':') + resolved.path();
+                if (resolved.hasQuery()) path += QLatin1Char('?') + resolved.query();
+                if (resolved.hasFragment()) path += QLatin1Char('#') + resolved.fragment();
+            }
+#endif
+            if (path.startsWith(QStringLiteral("//")) || path.startsWith(QStringLiteral("\\\\")))
+                path.clear(); // Do not turn UNC/network resources into native file requests.
+            if (!path.isEmpty()) {
+                if (path.startsWith(QStringLiteral(":/"))) {
+                    QFile resource(path);
+                    constexpr qint64 maximumBytes = 128ll * 1024 * 1024;
+                    if (resource.open(QIODevice::ReadOnly) && resource.size() <= maximumBytes)
+                        image = desktopReadRasterBytes(resource.read(maximumBytes + 1)).image;
+                } else image = desktopReadRasterFile(path).image;
+            }
+        }
+        // An invalid QVariant would invoke document/global ResourceProvider and
+        // QTextImageHandler's byte/path decoder. A typed null QImage is terminal.
+        return QVariant::fromValue(image);
+    }
+};
+
+} // namespace
+
+ComposerTextEdit::ComposerTextEdit(QWidget* parent) : QTextEdit(parent) {
+    setDocument(new ComposerRasterDocument(this));
+    setAcceptDrops(true);
+}
 
 void ComposerTextEdit::setMimeHandler(std::function<bool(const QMimeData*)> handler) {
     mimeHandler_ = std::move(handler);

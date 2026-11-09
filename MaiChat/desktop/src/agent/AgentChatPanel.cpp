@@ -2,6 +2,7 @@
 // 主要入口：isCurrentSession、sessionId、setModelLabel、setOpenVideoCallback。
 // 直接依赖：MaiPathGuard.h、agent/AgentController.h、markdown/MarkdownView.h、ui/ComposerResizeSplitter.h；实现与这些接口协作。
 #include "agent/AgentChatPanel.h"
+#include "ui/DesktopRasterImage.h"
 
 #include "ui/DesktopCameraDialog.h"
 #include "ui/DesktopAudioPlayback.h"
@@ -24,7 +25,6 @@
 #include <QGuiApplication>
 #include <QGridLayout>
 #include <QHBoxLayout>
-#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -3227,7 +3227,7 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
                 cover->setPixmap(pixels.scaled(previewSize,
                                                video ? Qt::KeepAspectRatioByExpanding : Qt::KeepAspectRatio,
                                                Qt::SmoothTransformation));
-            });
+            }, {}, video);
         if (type == QStringLiteral("image")) {
             auto* open = new QPushButton(preview);
             open->setObjectName(QStringLiteral("agentMediaImageOpen"));
@@ -3685,7 +3685,7 @@ bool AgentChatPanel::insertComposerMimeData(const QMimeData* mime) {
             if (!QFileInfo(path).isFile()) continue;
             if (!videoMimeType(path).isEmpty())
                 insertComposerVideoFile(path);
-            else if (!QImageReader::imageFormat(path).isEmpty())
+            else if (desktopInspectRasterFile(path).error_code == 0)
                 insertComposerImageFile(path);
             else
                 continue;
@@ -3764,7 +3764,7 @@ void AgentChatPanel::insertComposerMediaMarker(const QString& path, bool video, 
 
 void AgentChatPanel::importComposerMediaFile(const QString& path, bool video, bool removeSourceAfterCopy) {
     const QFileInfo file(path);
-    if (!file.isFile() || (video ? videoMimeType(path).isEmpty() : !QImageReader(path).size().isValid())) {
+    if (!file.isFile() || (video ? videoMimeType(path).isEmpty() : desktopInspectRasterFile(path).error_code != 0)) {
         appendNotice(QStringLiteral("%1无法读取：%2")
                          .arg(video ? QStringLiteral("视频") : QStringLiteral("图片"), file.fileName()),
                      true);
@@ -3928,7 +3928,7 @@ void AgentChatPanel::refreshComposerMediaTray() {
                 cover->setPixmap(QPixmap::fromImage(videoDraftImage({})));
                 MessageImageLoader::instance().load(path, QSize(480, 270), cover, [cover, path](const QPixmap& pixels) {
                     cover->setPixmap(QPixmap::fromImage(videoDraftImage(pixels.toImage())));
-                });
+                }, {}, true);
             } else {
                 MessageImageLoader::instance().loadInto(path, QSize(272, 140), cover);
             }
@@ -4015,7 +4015,10 @@ void AgentChatPanel::updateComposerPlaceholder() {
 
 void AgentChatPanel::appendUserImages(const QString& messageId, const QStringList& paths) {
     for (const QString& path : paths) {
-        QPixmap pixmap(path);
+        MaiImageReadOptions options{};
+        options.max_output_width = UiZoom::s(560);
+        options.max_output_height = UiZoom::s(420);
+        const QPixmap pixmap = QPixmap::fromImage(desktopReadRasterFile(path, options).image);
         if (pixmap.isNull()) continue;
         auto* preview = new QLabel;
         preview->setPixmap(
@@ -4046,7 +4049,7 @@ void AgentChatPanel::appendUserVideos(const QString& messageId, const QStringLis
         MessageImageLoader::instance().load(path, QSize(480, 270), cover, [cover, path](const QPixmap& pixels) {
             cover->setPixmap(QPixmap::fromImage(videoDraftImage(pixels.toImage()))
                                  .scaled(240, 135, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
-        });
+        }, {}, true);
         auto* play = new QPushButton(preview);
         play->setObjectName(QStringLiteral("agentUserVideoPlay"));
         play->setAccessibleName(QStringLiteral("播放视频 %1").arg(QFileInfo(path).fileName()));

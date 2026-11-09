@@ -11,7 +11,8 @@ class QMimeData;
 class QResizeEvent;
 class QWidget;
 
-// IM 与 AI 助手共用的输入框外壳。它只统一拖放、粘贴和角落按钮的位置；
+// IM 与 AI 助手共用的输入框外壳，统一拖放、粘贴和角落按钮位置。
+// 文档图片资源由普通 FFmpeg 核心解码；失败返回 typed null，阻止 Qt 按路径重试。
 // 附件如何入库、如何发送仍由各自页面的业务层决定。
 class ComposerTextEdit : public QTextEdit {
     Q_OBJECT

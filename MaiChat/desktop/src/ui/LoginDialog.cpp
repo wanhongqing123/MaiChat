@@ -3,6 +3,7 @@
 // 对外边界：切换或关闭扫码页时废弃旧 verifier，不接受过期的异步登录结果。
 // 直接依赖：Qt Widgets、DesktopAuthClient 和现有 MaiChat 视觉资源。
 #include "ui/UiZoom.h"
+#include "ui/DesktopRasterImage.h"
 #include "ui/LoginDialog.h"
 
 #include <QLabel>
@@ -243,8 +244,9 @@ void LoginDialog::setState(State state, const QString& detail) {
     modeButton_->setEnabled(state != State::Restoring && state != State::Connecting &&
                             !passwordInFlight_);
     if (showQr) {
-        QPixmap pixmap;
-        pixmap.loadFromData(request_.qrPng, "PNG");
+        const auto decoded = desktopReadRasterBytes(request_.qrPng);
+        const QPixmap pixmap = decoded.info.format == MAI_IMAGE_FORMAT_PNG
+            ? QPixmap::fromImage(decoded.image) : QPixmap();
         qrLabel_->setPixmap(pixmap.width() <= 192 && pixmap.height() <= 192 ?
             pixmap : pixmap.scaled(192, 192, Qt::KeepAspectRatio,
                                    Qt::FastTransformation));
@@ -375,8 +377,8 @@ void LoginDialog::continueQrRequest() {
             setState(State::NetworkError, error);
             return;
         }
-        QPixmap pixmap;
-        if (!pixmap.loadFromData(request.qrPng, "PNG")) {
+        const auto decoded = desktopReadRasterBytes(request.qrPng);
+        if (decoded.info.format != MAI_IMAGE_FORMAT_PNG || decoded.image.isNull()) {
             setState(State::NetworkError, QStringLiteral("登录二维码图片无效"));
             return;
         }

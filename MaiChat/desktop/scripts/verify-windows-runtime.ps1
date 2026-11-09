@@ -46,7 +46,7 @@ foreach ($name in ($imports | Select-Object -Unique)) {
     }
     $missing.Add($name)
 }
-foreach ($plugin in 'platforms\qwindows.dll', 'imageformats\qsvg.dll', 'imageformats\qwebp.dll') {
+foreach ($plugin in 'platforms\qwindows.dll', 'imageformats\qsvg.dll', 'imageformats\qjpeg.dll') {
     if (-not (Test-Path -LiteralPath (Join-Path $AppDir $plugin))) {
         $missing.Add($plugin)
     }
@@ -55,6 +55,11 @@ foreach ($retired in 'Qt6Network.dll', 'Qt6WebSockets.dll', 'Qt6Sql.dll',
                     'Qt6Multimedia.dll', 'Qt6MultimediaWidgets.dll') {
     if (($imports -contains $retired) -or (Test-Path -LiteralPath (Join-Path $AppDir $retired))) {
         throw "Retired Qt dependency in ${AppDir}: $retired"
+    }
+}
+foreach ($retiredPlugin in 'qwebp.dll', 'qtiff.dll', 'qicns.dll', 'qtga.dll', 'qwbmp.dll', 'qmng.dll', 'qjp2.dll') {
+    if (Test-Path -LiteralPath (Join-Path $AppDir "imageformats\$retiredPlugin")) {
+        throw "Retired Qt image decoder in ${AppDir}: $retiredPlugin"
     }
 }
 if ($missing.Count -gt 0) {

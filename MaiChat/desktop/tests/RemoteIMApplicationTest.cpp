@@ -38,6 +38,8 @@ class RemoteIMApplicationTest : public QObject {
 
 private slots:
     void avatarPreparationCropsWithoutChangingOriginalAndRejectsOversizedInput();
+    void avatarPreparationReadsTinyWebp();
+    void avatarPreparationPreservesHundredMegapixelPolicy();
     void avatarUpdateRejectsCanceledOrInvalidAccountBeforeSdk();
     void friendRequestWaitsForRemoteAcceptance();
     void maiChatFriendListFiltersHistoryAndDeletionKeepsMessages();
@@ -118,6 +120,48 @@ void RemoteIMApplicationTest::
     QVERIFY(RemoteIMApplication::prepareAvatarJpeg(large).isEmpty());
     QVERIFY(RemoteIMApplication::prepareAvatarJpeg(directory.filePath(QStringLiteral("missing")))
                 .isEmpty());
+}
+
+void RemoteIMApplicationTest::avatarPreparationReadsTinyWebp() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("owned.webp"));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    const QByteArray bytes = QByteArray::fromHex(
+        "524946461e000000574542505650384c110000002f0fc0020007d0b1b6b4b1ff8188e87f0000");
+    QCOMPARE(file.write(bytes), qint64(38));
+    file.close();
+    const QByteArray prepared = RemoteIMApplication::prepareAvatarJpeg(path);
+    QVERIFY(!prepared.isEmpty());
+    const QImage image = QImage::fromData(prepared, "JPEG");
+    QCOMPARE(image.size(), QSize(512, 512));
+    const QColor center = image.pixelColor(256, 256);
+    QVERIFY(qAbs(center.red() - 45) <= 3);
+    QVERIFY(qAbs(center.green() - 99) <= 3);
+    QVERIFY(qAbs(center.blue() - 141) <= 3);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QCOMPARE(file.readAll(), bytes);
+}
+
+void RemoteIMApplicationTest::avatarPreparationPreservesHundredMegapixelPolicy() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("owned-100mp.png"));
+    {
+        QImage gray(10000, 10000, QImage::Format_Grayscale8);
+        QVERIFY(!gray.isNull());
+        gray.fill(QColor(127, 127, 127));
+        QVERIFY(gray.save(path, "PNG"));
+    }
+    const QByteArray prepared = RemoteIMApplication::prepareAvatarJpeg(path);
+    QVERIFY(!prepared.isEmpty());
+    const QImage image = QImage::fromData(prepared, "JPEG");
+    QCOMPARE(image.size(), QSize(512, 512));
+    const QColor center = image.pixelColor(256, 256);
+    QVERIFY(qAbs(center.red() - 127) <= 3);
+    QVERIFY(qAbs(center.green() - 127) <= 3);
+    QVERIFY(qAbs(center.blue() - 127) <= 3);
 }
 
 void RemoteIMApplicationTest::avatarUpdateRejectsCanceledOrInvalidAccountBeforeSdk() {
