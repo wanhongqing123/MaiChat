@@ -41,6 +41,7 @@ class AgentController;
 class AgentChatPanel;
 class AgentSessionList;
 class DesktopSessionSyncCoordinator;
+class DesktopScreenCaptureControl;
 class RemoteAgentPanel;
 class ReplySuggestionController;
 class RemoteDesktopViewPanel;
@@ -70,6 +71,9 @@ class MainWindow final : public QMainWindow {
 public:
     using FriendQrCompletion = std::function<void(const QString&, const QByteArray&, const QString&)>;
     explicit MainWindow(RemoteIMApplication& app, QWidget* parent = nullptr);
+    // 普通宿主可共用进程采集控制器；借用的控制器必须比窗口活得更久。
+    MainWindow(RemoteIMApplication& app, DesktopScreenCaptureControl& captureControl,
+               QWidget* parent = nullptr);
     MainWindow(RemoteIMApplication& app, int imSdkAppId,
                std::function<QString(const QString&)> userSigProvider,
                QWidget* parent = nullptr);
@@ -77,7 +81,8 @@ public:
                std::function<QString(const QString&)> userSigProvider,
                std::function<QString()> arkApiKeyProvider,
                std::function<QPair<QString, QString>()> wanCredentialsProvider,
-               QWidget* parent = nullptr);
+               QWidget* parent = nullptr,
+               DesktopScreenCaptureControl* captureControl = nullptr);
 
     // 开始回复某条消息：右键菜单调它，测试也直接调它。
     void beginReplyTo(const RemoteIMMessage& message);
@@ -129,6 +134,8 @@ protected:
 
 private:
     void updateWindowChromeBackground(bool active);
+    // 外框只覆盖客户区的最外一像素，不占布局；柔和阴影交给系统合成器。
+    void updateWindowBoundary();
     // Windows 窗口控制固定在独立顶部标题栏，与业务页标题及滚动区域分开。
     void updateWindowCaptionControls();
     void toggleWindowMaximized();
@@ -362,6 +369,7 @@ private:
     QPushButton* selfProfileButton_ = nullptr;
     QWidget* navRail_ = nullptr;
     QWidget* windowCaptionControls_ = nullptr;
+    QWidget* windowBoundaryOutline_ = nullptr;
     QPushButton* windowMinimizeButton_ = nullptr;
     QPushButton* windowMaximizeButton_ = nullptr;
     QPushButton* windowCloseButton_ = nullptr;
@@ -436,6 +444,8 @@ private:
     // 和 IM 那一侧完全不相干：不共用 RemoteIMClient，也不碰 chatState。
     // 它自己拿着一个 agent 核心，跑在同一个进程里。
     QWidget* agentPage_ = nullptr;
+    // 进程本机采集状态不归属于任何本地或远端会话；重建会话面板时保留。
+    DesktopScreenCaptureControl* screenCaptureControl_ = nullptr;
     QPushButton* agentNavButton_ = nullptr;
     AgentController* agentController_ = nullptr;
     AgentChatPanel* agentPanel_ = nullptr;

@@ -1,0 +1,459 @@
+{
+  "schema": 2,
+  "status": "code_and_public_ui_validated_mac_native_awaits_unlocked_desktop",
+  "baseCommit": "c71b0450d464ace6406af102951daf8a8d17f924",
+  "productTrees": {
+    "MaiChat": "3bdf317adf244f3cb33c9cb72cea8bdbbfb0ba24",
+    "MaiAgent": "4ab2cc60987f23c7d67659a4ea05e6f89cc92bcd"
+  },
+  "previousPatchSha256": "d914d64039ae8552ac9cccdd744ea7df5ce5f46278c5434552722d211a70af6b",
+  "codeDeltaSha256": "f84cf1d7946660d3dc29e89ab1a1f8a4db5fa9e19cb34d281632a009567bfa27",
+  "verifiedCodeFiles": [
+    {
+      "path": "MaiChat/desktop/CMakeLists.txt",
+      "previousBlob": "af58eaffa0e7283da277300a43c1514b92a527e1",
+      "newBlob": "2a1691189e83473467ebbdae6fb79b01b20c2162",
+      "newRawBytes": 107629,
+      "newRawSha256": "964dbb8568396c3769d4c40b720f51b09512b5640ca6326937dc2ffdb7f11b61",
+      "newGitBytesSha256": "0b7180a2bcf02624c60cf8dabd196c24951f74968349fe2dd1b52479eb200b2f"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/AgentChatPanel.h",
+      "previousBlob": "0867ddccfde49fe95eb38ef4bc3a3ab175d2d14e",
+      "newBlob": "780c4d2b47d4ef6af86385f65a8fb11a302fc557",
+      "newRawBytes": 12121,
+      "newRawSha256": "14a801d9a39ebcd4b6784e8d8ab372e21b878a6de693970a374a73ecaa59250c",
+      "newGitBytesSha256": "14a801d9a39ebcd4b6784e8d8ab372e21b878a6de693970a374a73ecaa59250c"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/AgentChatPanel.cpp",
+      "previousBlob": "59ff2e2b85c95abf49b6783ba2e299ba21d0f31a",
+      "newBlob": "1ada3062b4bc537c6427d41809ac6dd7b30e7ce8",
+      "newRawBytes": 232269,
+      "newRawSha256": "4c29e4a1aab5a44a5296e85463fcc5439b8cbe710e33ab5ce28c167c0f641a3c",
+      "newGitBytesSha256": "4c29e4a1aab5a44a5296e85463fcc5439b8cbe710e33ab5ce28c167c0f641a3c"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopScreenCaptureControl.h",
+      "previousBlob": "e03b84a5d2a75671fd043c7ab9828c3239116365",
+      "newBlob": "e03b84a5d2a75671fd043c7ab9828c3239116365",
+      "newRawBytes": 1892,
+      "newRawSha256": "0d1cc0ff6cc1dd516807e9af793f49a6a11ce49389af5b1646b98cf7c679b8af",
+      "newGitBytesSha256": "0d1cc0ff6cc1dd516807e9af793f49a6a11ce49389af5b1646b98cf7c679b8af"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopScreenCaptureControl.cpp",
+      "previousBlob": "35040e82331aed65777a93af35165a5142086510",
+      "newBlob": "35040e82331aed65777a93af35165a5142086510",
+      "newRawBytes": 5509,
+      "newRawSha256": "eec64f2621c1af8b9bc1ee8a104c0e67e1dfc73f1956068774ad11e939e2552b",
+      "newGitBytesSha256": "eec64f2621c1af8b9bc1ee8a104c0e67e1dfc73f1956068774ad11e939e2552b"
+    },
+    {
+      "path": "MaiChat/desktop/src/ui/MainWindow.h",
+      "previousBlob": "ca07eee0d61d7fb31cd5b0ae32bacc140b798701",
+      "newBlob": "b3c684c11b7b3eb0f5efb5d522eae9fa09be1611",
+      "newRawBytes": 28787,
+      "newRawSha256": "b1085dfce55ce55d4cc99ae633eeb838189554879d682e480f594f39dfd0b563",
+      "newGitBytesSha256": "f6b89fafdb111da7dafc59738eb1fd3a8abf2615d0c470d4d859a8066af59c2c"
+    },
+    {
+      "path": "MaiChat/desktop/src/ui/MainWindow.cpp",
+      "previousBlob": "a48a384f8b063d6d86ff0cecfb500a9aa2b6d68c",
+      "newBlob": "63e38812c39dd89a430361b2d61f8bc8cb6e4053",
+      "newRawBytes": 413570,
+      "newRawSha256": "b47fe6f070224974d76d6742213ed4bb58b9a136d159a5481e7ff1520c88767d",
+      "newGitBytesSha256": "b47fe6f070224974d76d6742213ed4bb58b9a136d159a5481e7ff1520c88767d"
+    },
+    {
+      "path": "MaiChat/desktop/tests/AgentPanelSessionTest.cpp",
+      "previousBlob": "5ba81bfca3755838f0125d03620d50730255cc95",
+      "newBlob": "54734820aba2e16518bd499c0612b7e058d2780d",
+      "newRawBytes": 203350,
+      "newRawSha256": "f84486a274ea88d9e10452162cce97c7cb814ac50681eb148e34b83cb84d4414",
+      "newGitBytesSha256": "f84486a274ea88d9e10452162cce97c7cb814ac50681eb148e34b83cb84d4414"
+    },
+    {
+      "path": "MaiChat/desktop/tests/DesktopScreenCaptureControlTest.cpp",
+      "previousBlob": "9a5fb5e04eecc0fb1547dab1d84dc4fcc0d93d47",
+      "newBlob": "9a5fb5e04eecc0fb1547dab1d84dc4fcc0d93d47",
+      "newRawBytes": 11180,
+      "newRawSha256": "cf0e785244a050ee177062c5cd428caf38885c39fd67af423c4a8fef72f20194",
+      "newGitBytesSha256": "cf0e785244a050ee177062c5cd428caf38885c39fd67af423c4a8fef72f20194"
+    },
+    {
+      "path": "MaiChat/desktop/tests/DesktopScreenshotIntegrationTest.cpp",
+      "previousBlob": "a34c09d48d2484aaec54072a97cd89285c476646",
+      "newBlob": "67b5b0a299df04a4a00ba24b415d1ddc94ae3126",
+      "newRawBytes": 20877,
+      "newRawSha256": "f8a60a8e28595289213749ac9ddc4122137f5ed49bcae388f42145fa551d65f3",
+      "newGitBytesSha256": "63ac9c195cc75ee08dc501298b8751b28ac9dd54780a7344000abc46faa196a3"
+    },
+    {
+      "path": "MaiChat/desktop/tests/MainWindowLayoutTest.cpp",
+      "previousBlob": "c4553e89d1d4f7102d5a0e716b6f199b397d3364",
+      "newBlob": "dc7ec36a35af0b7d6686e385cb7e7accf55ec10d",
+      "newRawBytes": 275704,
+      "newRawSha256": "55cc405e91f39085a33667a03b0c31d171b6e7935e6623a0f885b755e50a5b14",
+      "newGitBytesSha256": "55cc405e91f39085a33667a03b0c31d171b6e7935e6623a0f885b755e50a5b14"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopScreenCaptureBar.h",
+      "previousBlob": null,
+      "newBlob": "05a56ae750250be0ad387e65b13e92ee862335ca",
+      "newRawBytes": 751,
+      "newRawSha256": "32e6216eb9a167c10acf97d2650ce31e66c8b454b615e95dbeb7d844d295bdbf",
+      "newGitBytesSha256": "32e6216eb9a167c10acf97d2650ce31e66c8b454b615e95dbeb7d844d295bdbf"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopScreenCaptureBar.cpp",
+      "previousBlob": null,
+      "newBlob": "44b3a93fa3408f9cdced4ffa242e64e5526b88ee",
+      "newRawBytes": 3658,
+      "newRawSha256": "04fb6228ff1e6316642e64f718cf2d10dcde790c1e76e8194ccc9521ffa23496",
+      "newGitBytesSha256": "04fb6228ff1e6316642e64f718cf2d10dcde790c1e76e8194ccc9521ffa23496"
+    },
+    {
+      "path": "MaiChat/desktop/tests/DesktopScreenCaptureBarTest.cpp",
+      "previousBlob": null,
+      "newBlob": "04fa8cb8df77188a1b2346cecdf1b83809ec7396",
+      "newRawBytes": 8258,
+      "newRawSha256": "0a39e68f1636fd1c8a442e70332508e5142e72ef69c0c500b80957574773aef5",
+      "newGitBytesSha256": "0a39e68f1636fd1c8a442e70332508e5142e72ef69c0c500b80957574773aef5"
+    }
+  ],
+  "windows": {
+    "normalAppBuildExit": 0,
+    "deployAndPe": "3 binaries / 114 PE imports / Qt plugins passed",
+    "unchangedControl": {
+      "passedIncludingHooks": 11,
+      "failed": 0,
+      "skipped": 0,
+      "elapsedMs": 1792,
+      "log": {
+        "path": ".cache/desktop-creation-controls-20261110/control-green.txt",
+        "bytes": 1186,
+        "sha256": "281375b324fd22680e1c22981644c17d5ab6b6bfebf1d06fa8db9db10572c102"
+      }
+    },
+    "publicMainWindow": {
+      "passedIncludingHooks": 11,
+      "failed": 0,
+      "skipped": 0,
+      "elapsedMs": 4810,
+      "log": {
+        "path": ".cache/window-boundary-20261110/public-creation/common-entry-green-native.txt",
+        "bytes": 1565,
+        "sha256": "698686075ff0fef6c750d663ac9f4e22f2cbfa82166ba9701c2e1e991d82ce4c"
+      }
+    },
+    "publicBar": {
+      "passedIncludingHooks": 8,
+      "failed": 0,
+      "skipped": 0,
+      "elapsedMs": 683,
+      "log": {
+        "path": ".cache/desktop-creation-controls-20261110/normal-final-v2/bar-full.txt",
+        "bytes": 924,
+        "sha256": "70d77f2e55e997f2e1b891e3fd385e14ce67f6dbeaaf8a0a29ee1924575d2ba6"
+      }
+    },
+    "restoredOriginalPanel": {
+      "passedIncludingHooks": 80,
+      "failed": 0,
+      "skipped": 0,
+      "elapsedMs": 14504,
+      "log": {
+        "path": ".cache/desktop-creation-controls-20261110/normal-final-v2/panel-full.txt",
+        "bytes": 12858,
+        "sha256": "a357a2c03c45415a8601fd0820bba676f8f358b932ebb0a92174f38c48e52d07"
+      }
+    },
+    "nativeOwnedWindowIntegration": {
+      "passedIncludingHooks": 3,
+      "failed": 0,
+      "skipped": 0,
+      "elapsedMs": 937,
+      "log": {
+        "path": ".cache/desktop-creation-controls-20261110/normal-final-v2/native-integration.txt",
+        "bytes": 693,
+        "sha256": "dfef6b072ce129cd029009677e0dd4028dbd42e89bc5483ae5eb5867c930a4fc"
+      }
+    },
+    "smoke": {
+      "pid": 47840,
+      "exitCode": 0,
+      "elapsedSeconds": 1.743,
+      "executable": {
+        "name": "maichat.exe",
+        "bytes": 165520896,
+        "sha256": "d1ea324f9e8a6eeba90fb071c957d377071a8b4353e300ae0a54d5c43fa343e7"
+      },
+      "privateData": true,
+      "bareWindowsPath": true,
+      "loadedQtFromNormalBuild": true,
+      "receipt": {
+        "path": ".cache/desktop-creation-controls-20261110/normal-final-v2/normal-smoke.json",
+        "bytes": 1989,
+        "sha256": "3753255ecef6800411ac5bbe505ba03b0b95bc6567f2777d7e3d0798c62f6339"
+      }
+    }
+  },
+  "visuals": [
+    {
+      "path": ".cache/window-boundary-20261110/public-creation/creation-common-local.png",
+      "bytes": 66628,
+      "sha256": "0339e148e1826d35f4370ff2148e292f89258bbc760912abc006c080c6ef85ab"
+    },
+    {
+      "path": ".cache/window-boundary-20261110/public-creation/creation-common-remote.png",
+      "bytes": 56462,
+      "sha256": "bf170d1166a48ed036c492b3d362ec587d281928d46891858705e1160ca62f29"
+    },
+    {
+      "path": ".cache/window-boundary-20261110/green-owned-window.png",
+      "bytes": 48759,
+      "sha256": "69b764ffc65773dbdf6984d7f87a9687628bd04339a7e480c9734ca084b1e0d7"
+    },
+    {
+      "path": ".cache/desktop-creation-controls-20261110/normal-final-v2/native-images/creation-center-native-capture-stopped.png",
+      "bytes": 61132,
+      "sha256": "3d536f7c92039d2ad9cf100a278d5b811ec80e11ba99a0e4aa257f35a7e4db0b"
+    }
+  ],
+  "supersededV1": {
+    "reason": "Session-local entry rejected by user; removed from Panel.",
+    "windows": {
+      "platform": "Windows 11 x64 / MSVC 2022 / Qt 6.12.0 native windows QPA",
+      "normalAppBuildExit": 0,
+      "deployAndPe": "MaiChat runtime verified: 3 binaries, 114 PE imports and Qt plugins",
+      "control": {
+        "passedIncludingHooks": 11,
+        "failed": 0,
+        "skipped": 0,
+        "elapsedMs": 1792,
+        "log": {
+          "path": ".cache/desktop-creation-controls-20261110/control-green.txt",
+          "bytes": 1186,
+          "sha256": "281375b324fd22680e1c22981644c17d5ab6b6bfebf1d06fa8db9db10572c102"
+        }
+      },
+      "panel": {
+        "passedIncludingHooks": 83,
+        "failed": 0,
+        "skipped": 0,
+        "elapsedMs": 16287,
+        "log": {
+          "path": ".cache/desktop-creation-controls-20261110/normal-final/panel-full.txt",
+          "bytes": 13097,
+          "sha256": "0ee5b79bc5fb0b80e90b184890887e289456aac49f8fe83d478df14769a2b65a"
+        }
+      },
+      "nativeOwnedWindowIntegration": {
+        "passedIncludingHooks": 3,
+        "failed": 0,
+        "skipped": 0,
+        "elapsedMs": 900,
+        "log": {
+          "path": ".cache/desktop-creation-controls-20261110/normal-final/native-integration.txt",
+          "bytes": 693,
+          "sha256": "151a672fea45891a740cae1e4c6f8e137e3bef57f45964347a898aada2773006"
+        }
+      },
+      "windowBoundary": {
+        "passedIncludingHooks": 8,
+        "failed": 0,
+        "skipped": 0,
+        "elapsedMs": 2453,
+        "log": {
+          "path": ".cache/window-boundary-20261110/green-native.txt",
+          "bytes": 1161,
+          "sha256": "74d1d992340a3e1c405276320c8ced8306970026c3e158bbe7da7931f4b305a0"
+        }
+      },
+      "smoke": {
+        "pid": 40812,
+        "exitCode": 0,
+        "elapsedSeconds": 1.671,
+        "executable": {
+          "name": "maichat.exe",
+          "bytes": 165519872,
+          "sha256": "376b4b5b852b558cde8cf8108fd747b4632e2c4ca37febe0f316d7d253f8f36e"
+        },
+        "privateData": true,
+        "bareWindowsPath": true,
+        "loadedQtFromNormalBuild": true,
+        "receipt": {
+          "path": ".cache/desktop-creation-controls-20261110/normal-final/normal-smoke.json",
+          "bytes": 1989,
+          "sha256": "3e5f8e6863d6af45f0172a705430a99d8a25d3d81a1f04825a1c27e6d228aac2"
+        }
+      }
+    },
+    "mac": {
+      "normalConfigureExit": 0,
+      "normalFourTargetsBuildExit": 0,
+      "controlPassedIncludingHooks": 11,
+      "panelPassedIncludingHooks": 82,
+      "panelFailed": 1,
+      "panelElapsedMs": 13530,
+      "failure": "Original audio slot exceeded its existing 3000ms budget; Qt reported 4000ms sufficient.",
+      "nativeIntegrationAttempted": false,
+      "nativeIntegrationSkipped": false
+    }
+  },
+  "boundaries": [
+    "One common Creation Center bar above session list and local/remote content; labels explicitly identify this local process capture.",
+    "Session selection, remote selection and owner-page rebuild retain the same bar/control.",
+    "Original owner-page rebuild draft behavior is unchanged; ordinary session switching and stop preserve their drafts.",
+    "Native capture only used this test process owned nonce-titled window.",
+    "Stop closes current capture session; later screenshot requests may restart it.",
+    "Installed Apps, paid models, user databases, versions, packages and released assets were not changed."
+  ],
+  "mac": {
+    "productTree": "3bdf317adf244f3cb33c9cb72cea8bdbbfb0ba24",
+    "normalConfigureExit": 0,
+    "normalFourTargetsBuildExit": 0,
+    "normalFourTargetsBuildSeconds": 40.255,
+    "publicBar": {
+      "passedIncludingHooks": 8,
+      "failed": 0,
+      "skipped": 0,
+      "elapsedMs": 393,
+      "qpa": "offscreen"
+    },
+    "publicMainWindow": {
+      "passedIncludingHooks": 4,
+      "failed": 0,
+      "skipped": 0,
+      "elapsedMs": 508,
+      "qpa": "offscreen"
+    },
+    "nativeIntegration": {
+      "exitCode": 1,
+      "passedIncludingHooks": 2,
+      "failed": 1,
+      "skipped": 0,
+      "elapsedMs": 432,
+      "error": "GUI session is unavailable for screen capture",
+      "stopButtonReached": false,
+      "log": {
+        "receivedFile": "144115251141768230-1794323656-64253879.log",
+        "bytes": 955,
+        "sha256": "821897c00590ab6dab10e159b928c197c6c99bd652cacc35d49c5eb2b63d04ad"
+      },
+      "qpa": "cocoa"
+    },
+    "desktopAvailabilityProbe": {
+      "singleVariable": "sandbox-exec wrapper present vs absent; same binary, private-home/TMPDIR/QPA and cwd",
+      "probeBinarySha256": "10c2f96b53b9084d5d649231e0b7a8ad5280b2fcdea69137b293b7ef592b7c49",
+      "sameResultOnMainAndWorker": true,
+      "observed": {
+        "phase": "worker",
+        "guiSession": true,
+        "onConsole": true,
+        "loginDone": true,
+        "frontmostKnown": true,
+        "notLoginWindow": false,
+        "canCapture": false
+      },
+      "resultEvidence": {
+        "receivedFile": "144115251141768230-1794324027-27965448.json",
+        "bytes": 2141,
+        "sha256": "1f73b8917379f90771dc8e5f54811a8fd640a413ab1f6301efe58ba26a9914a5"
+      },
+      "sourceEvidence": {
+        "receivedFile": "144115251141768230-1794324027-99168353.mm",
+        "bytes": 2191,
+        "sha256": "839b48017cddcd9e486719fa994858d49f0d38b88f427dc96dd0b13377f12ce7"
+      }
+    },
+    "nativeStatus": "Actual failure preserved; frontmost application was reported as loginwindow. Await user unlock before rerunning the same owned-window test; no automatic UI waiting process.",
+    "receipt": {
+      "receivedFile": "144115251141768230-1794324233-8941048.json",
+      "bytes": 7643,
+      "sha256": "f7739541b0c1ee432d9913f7628046e945c5f7f46b99f5ca2ad60205da1078e1"
+    },
+    "rawEvidence": [
+      {
+        "receivedFile": "144115251141768230-1794324233-82164575.json",
+        "bytes": 914,
+        "sha256": "201e2b9e14998a11f32c3234453eb38ac3bae1a3c5055712dd9160723adc84f5"
+      },
+      {
+        "receivedFile": "144115251141768230-1794324233-49208774.log",
+        "bytes": 2991,
+        "sha256": "ef7a941dacf3b3e1afa0e185859d23c28ee87c1a6cf9ddc7d891c70e6bc42add"
+      },
+      {
+        "receivedFile": "144115251141768230-1794324233-40495772.log",
+        "bytes": 39002,
+        "sha256": "1ef8edc1860e161cd9371146795b779613ff46f73f6ab92217318829216d3086"
+      },
+      {
+        "receivedFile": "144115251141768230-1794323656-64253879.log",
+        "bytes": 955,
+        "sha256": "821897c00590ab6dab10e159b928c197c6c99bd652cacc35d49c5eb2b63d04ad"
+      },
+      {
+        "receivedFile": "144115251141768230-1794324233-77380754.json",
+        "bytes": 1848,
+        "sha256": "bf4d27e979d30093d5b44cb1f1aeb0fb6ee59d2f075990ba710fabce41ae3688"
+      },
+      {
+        "receivedFile": "144115251141768230-1794324234-96568588.log",
+        "bytes": 155579,
+        "sha256": "66c35b5328920800ac9ad7fd5bb9cabc0976a7c99526ffbcc27e6faa44f6b2a9"
+      },
+      {
+        "receivedFile": "144115251141768230-1794324027-27965448.json",
+        "bytes": 2141,
+        "sha256": "1f73b8917379f90771dc8e5f54811a8fd640a413ab1f6301efe58ba26a9914a5"
+      }
+    ],
+    "visuals": [
+      {
+        "received": {
+          "receivedFile": "144115251141768230-1794324234-49940732.png",
+          "bytes": 52870,
+          "sha256": "b002cc394173db6382c639b6ad6a81577f85c95a03db73bebac3969671e93516"
+        },
+        "originalReported": {
+          "name": "creation-public-local.png",
+          "bytes": 52911,
+          "sha256": "8e8a647b33e5003f6e7388225d1a24ef7e98a6a8bbec590df2abb4830b9b6a3c",
+          "personallyViewed": true,
+          "ownedFixtureOnly": true
+        },
+        "byteIdentity": false,
+        "usage": "Received PNG personally viewed; original and received hashes kept separately."
+      },
+      {
+        "received": {
+          "receivedFile": "144115251141768230-1794324234-31868200.png",
+          "bytes": 44964,
+          "sha256": "7f04c53b9f270d222d5dd75cbfb75443d9e8ca0c7d93bed5728d9829142c1025"
+        },
+        "originalReported": {
+          "name": "creation-public-remote.png",
+          "bytes": 44947,
+          "sha256": "d7f6e272c3f8aed5fd379a4d767aaa7f7fe091bdcfdea3a8af3b45472126adfd",
+          "personallyViewed": true,
+          "ownedFixtureOnly": true
+        },
+        "byteIdentity": false,
+        "usage": "Received PNG personally viewed; original and received hashes kept separately."
+      }
+    ],
+    "smoke": {
+      "pid": 60422,
+      "exit": 0,
+      "seconds": 3.788,
+      "exeSHA256": "12f9eb49a803a55214b4a4425aa3763b017fcaf1dde85049041d032bfa99b6a7",
+      "privateHome": true,
+      "barePATH": true,
+      "allSixObserved": true,
+      "qpa": "cocoa"
+    }
+  }
+}

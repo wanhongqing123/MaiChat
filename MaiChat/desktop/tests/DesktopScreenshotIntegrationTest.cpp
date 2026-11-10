@@ -31,6 +31,8 @@
 #include "MaiScreenshotTool.h"
 #include "agent/AgentChatPanel.h"
 #include "agent/AgentController.h"
+#include "agent/DesktopScreenCaptureBar.h"
+#include "agent/DesktopScreenCaptureControl.h"
 #include "markdown/MarkdownView.h"
 
 namespace {
@@ -245,16 +247,27 @@ void DesktopScreenshotIntegrationTest::nativeCaptureReturnsToCreationCenter() {
     QVERIFY(controller.openError().isEmpty());
     QVERIFY(controller.setApprovalPolicy(MaiApprovalPolicy::Never));
     QVERIFY(controller.setDefaultModel(QStringLiteral("deepseek-flash")));
-    AgentChatPanel panel(controller);
+    // Compose the process-wide bar outside the session panel, just as the
+    // normal Creation Center host does for its shared local/remote workspace.
+    QWidget creationHost;
+    creationHost.setAttribute(Qt::WA_ShowWithoutActivating);
+    auto* hostLayout = new QVBoxLayout(&creationHost);
+    hostLayout->setContentsMargins(0, 0, 0, 0);
+    hostLayout->setSpacing(0);
+    DesktopScreenCaptureControl captureControl;
+    DesktopScreenCaptureBar captureBar(captureControl, &creationHost);
+    AgentChatPanel panel(controller, &creationHost);
+    hostLayout->addWidget(&captureBar);
+    hostLayout->addWidget(&panel, 1);
     panel.setAttribute(Qt::WA_ShowWithoutActivating);
-    panel.resize(900, 760);
+    creationHost.resize(900, 760);
     panel.setModelLabel(QStringLiteral("deepseek-flash"));
     const QString session = controller.createSession(workspace.path(), QStringLiteral("Owned screenshot integration"));
     QVERIFY(!session.isEmpty());
     StopAgentOnExit stop{controller, session};
     panel.openSession(session);
-    panel.show();
-    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    creationHost.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&creationHost));
     auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
     auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
     QVERIFY(editor && send);
@@ -328,8 +341,28 @@ void DesktopScreenshotIntegrationTest::nativeCaptureReturnsToCreationCenter() {
     QTRY_VERIFY_WITH_TIMEOUT(!cover->pixmap().isNull(), 5000);
     if (!evidence.isEmpty()) {
         QVERIFY(owned.grab().save(QDir(evidence).filePath(QStringLiteral("owned-fixture-widget.png"))));
-        QVERIFY(panel.grab().save(QDir(evidence).filePath(QStringLiteral("creation-center-delivered-image.png"))));
+        QVERIFY(creationHost.grab().save(QDir(evidence).filePath(QStringLiteral("creation-center-delivered-image.png"))));
     }
+    // The same normal Creation Center now ends this process's owned native
+    // session through its visible control. No installed App or user's screen
+    // is involved; the PNG and completed tool receipts remain in the page.
+    auto* captureStatus = creationHost.findChild<QWidget*>(QStringLiteral("agentScreenCaptureStatus"));
+    auto* stopCaptureButton = creationHost.findChild<QPushButton*>(QStringLiteral("agentStopScreenCapture"));
+    QVERIFY(captureStatus && stopCaptureButton);
+    QTRY_VERIFY_WITH_TIMEOUT(captureStatus->isVisible(), 2000);
+    QVERIFY(maiScreenshotCaptureState().workerRunning);
+    editor->setPlainText(QStringLiteral("Owned draft after screenshot delivery."));
+    QTest::mouseClick(stopCaptureButton, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(!maiScreenshotCaptureState().workerRunning &&
+                            !maiScreenshotCaptureState().capturing, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(!captureStatus->isVisible(), 2000);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Owned draft after screenshot delivery."));
+    QVERIFY(history->contains(deliveredPart + QStringLiteral("-agent-media")));
+    const auto stoppedFrames = maiScreenshotCaptureState().framesReceived;
+    QTest::qWait(120);
+    QCOMPARE(maiScreenshotCaptureState().framesReceived, stoppedFrames);
+    if (!evidence.isEmpty())
+        QVERIFY(creationHost.grab().save(QDir(evidence).filePath(QStringLiteral("creation-center-native-capture-stopped.png"))));
 }
 
 int main(int argc, char** argv) {

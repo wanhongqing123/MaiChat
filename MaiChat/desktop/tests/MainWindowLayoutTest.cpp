@@ -51,6 +51,8 @@
 #include "agent/AgentController.h"
 #include "agent/AgentSessionList.h"
 #include "agent/DesktopSessionSyncCoordinator.h"
+#include "agent/DesktopScreenCaptureControl.h"
+#include "agent/RemoteAgentPanel.h"
 #include "MaiSqliteStore.h"
 #include "markdown/MarkdownView.h"
 #include <QTextBlock>
@@ -72,6 +74,7 @@
 
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
+#include <dwmapi.h>
 #endif
 
 #include "agent/ReplySuggestionController.h"
@@ -196,6 +199,8 @@ class MainWindowLayoutTest : public QObject {
 
 private slots:
     void agentSessionSwitchReusesTheExistingPage();
+    void agentCaptureStopEntryLivesAboveBothConversationPanes();
+    void agentCommonCaptureStopSurvivesSessionAndOwnerPageChanges();
     void groupMenuCreatesAndOpensTextConversation();
     void transientActivityFollowsOnlyActivityEventsAcrossConversationSwitches();
     void transientActivityStaysAfterNewOutgoingMessage();
@@ -210,6 +215,8 @@ private slots:
     void windowsCaptionStaysInTitleBarAbovePageActions();
     void windowsCaptionStaysVisibleWhileSettingsScrolls();
     void windowsCaptionPreservesNativeWindowActions();
+    void windowsWindowBoundaryDoesNotConsumeLayoutOrInput();
+    void windowsWindowShadowSeparatesTheOwnedBackdrop();
     void conversationSidebarUsesLighterBackground();
     void conversationPreviewUsesPlainMarkdown_data();
     void conversationPreviewUsesPlainMarkdown();
@@ -1493,6 +1500,149 @@ void MainWindowLayoutTest::conversationSidebarUsesLighterBackground() {
              "The conversation sidebar should remain distinct from white content");
 }
 
+void MainWindowLayoutTest::windowsWindowBoundaryDoesNotConsumeLayoutOrInput() {
+#ifdef Q_OS_WIN
+    RemoteIMApplication app("owned-window-boundary", std::make_unique<FakeRemoteIMClient>());
+    MainWindow window(app);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* outline = window.findChild<QWidget*>(QStringLiteral("windowBoundaryOutline"));
+    QVERIFY2(outline, "The frameless main window has no visible perimeter boundary");
+    QVERIFY(outline->isVisible());
+    QVERIFY(outline->testAttribute(Qt::WA_TransparentForMouseEvents));
+    QCOMPARE(outline->focusPolicy(), Qt::NoFocus);
+    QCOMPARE(outline->geometry(), window.rect());
+    QCOMPARE(window.centralWidget()->geometry(), window.rect());
+    QCOMPARE(window.centralWidget()->layout()->contentsMargins(), QMargins());
+    QVERIFY(!window.graphicsEffect());
+
+    QEvent activate(QEvent::WindowActivate);
+    QApplication::sendEvent(&window, &activate);
+    const QImage active = window.grab().toImage().convertToFormat(QImage::Format_RGB32);
+    const auto edge = [](const QImage& image) { return image.pixelColor(image.width() / 2, 0); };
+    QVERIFY2(edge(active).lightness() < 200, "The title edge still blends into the light desktop");
+    QVERIFY(active.pixelColor(0, active.height() / 2).lightness() < 200);
+    QVERIFY(active.pixelColor(active.width() - 1, active.height() / 2).lightness() < 200);
+    QVERIFY(active.pixelColor(active.width() / 2, active.height() - 1).lightness() < 200);
+    QEvent deactivate(QEvent::WindowDeactivate);
+    QApplication::sendEvent(&window, &deactivate);
+    const QColor inactive = edge(window.grab().toImage());
+    QVERIFY(inactive.lightness() > edge(active).lightness());
+    QVERIFY(inactive.lightness() < 220);
+
+    window.resize(window.width() - 40, window.height() - 20);
+    QTRY_COMPARE(outline->geometry(), window.rect());
+    QCOMPARE(window.centralWidget()->geometry(), window.rect());
+    window.showMaximized();
+    QTRY_VERIFY(window.isMaximized());
+    QTRY_VERIFY(!outline->isVisible());
+    QCOMPARE(window.centralWidget()->geometry(), window.rect());
+    window.showFullScreen();
+    QTRY_VERIFY(window.isFullScreen());
+    QTRY_VERIFY(!outline->isVisible());
+    window.showNormal();
+    QTRY_VERIFY(!window.isFullScreen() && !window.isMaximized());
+    QTRY_VERIFY(outline->isVisible());
+    QTRY_COMPARE(outline->geometry(), window.rect());
+#else
+    QSKIP("Other platforms retain their native window frame and shadow.");
+#endif
+}
+
+void MainWindowLayoutTest::windowsWindowShadowSeparatesTheOwnedBackdrop() {
+#ifdef Q_OS_WIN
+    if (QGuiApplication::platformName() != QStringLiteral("windows"))
+        QSKIP("The native compositor capture requires the Windows platform plugin.");
+    const auto module = LoadLibraryW(L"dwmapi.dll");
+    QVERIFY(module);
+    const auto releaseModule = qScopeGuard([module] { FreeLibrary(module); });
+    const auto attribute = reinterpret_cast<decltype(&DwmGetWindowAttribute)>(
+        GetProcAddress(module, "DwmGetWindowAttribute"));
+    const auto flush = reinterpret_cast<decltype(&DwmFlush)>(GetProcAddress(module, "DwmFlush"));
+    QVERIFY(attribute && flush);
+
+    // Capture only an owned blank fixture and its own plain backdrop. Window
+    // corners are checked before each grab so unrelated desktop data is never
+    // substituted for the expected backdrop when another window is in front.
+    QWidget backdrop(nullptr, Qt::Window | Qt::FramelessWindowHint);
+    backdrop.setWindowTitle(QStringLiteral("MaiChat owned boundary backdrop"));
+    backdrop.setStyleSheet(QStringLiteral("background: #eef2f6;"));
+    QScreen* screen = QGuiApplication::primaryScreen();
+    QVERIFY(screen);
+    const QRect available = screen->availableGeometry();
+    RemoteIMApplication app("owned-window-shadow", std::make_unique<FakeRemoteIMClient>());
+    MainWindow window(app);
+    window.resize(window.minimumSize());
+    const int padding = 32;
+    const QSize outerSize = window.size() + QSize(padding * 2, padding * 2);
+    QVERIFY(available.width() >= outerSize.width() && available.height() >= outerSize.height());
+    const QRect captureRegion(available.center() - QPoint(outerSize.width() / 2, outerSize.height() / 2), outerSize);
+    backdrop.setGeometry(captureRegion);
+    backdrop.show();
+    backdrop.raise();
+    backdrop.activateWindow();
+    QVERIFY(QTest::qWaitForWindowExposed(&backdrop));
+    backdrop.repaint();
+    QCoreApplication::processEvents();
+    QTest::qWait(200);
+    const HWND backdropHandle = reinterpret_cast<HWND>(backdrop.winId());
+    const auto cornerIsOwned = [&](QPoint point) {
+        const qreal ratio = screen->devicePixelRatio();
+        const POINT nativePoint{qRound(point.x() * ratio), qRound(point.y() * ratio)};
+        return WindowFromPoint(nativePoint) == backdropHandle;
+    };
+    QTRY_VERIFY(cornerIsOwned(captureRegion.topLeft() + QPoint(2, 2)));
+    flush();
+    const QImage before = screen->grabWindow(0, captureRegion.x(), captureRegion.y(),
+                                             captureRegion.width(), captureRegion.height()).toImage();
+    QVERIFY(!before.isNull());
+    int unexpectedBackdropPixels = 0;
+    for (int y = 0; y < before.height(); ++y)
+        for (int x = 0; x < before.width(); ++x)
+            if (before.pixelColor(x, y) != QColor(238, 242, 246)) ++unexpectedBackdropPixels;
+    QVERIFY2(unexpectedBackdropPixels == 0,
+             "The compositor has not presented the exclusively owned plain backdrop; no capture is saved");
+    window.move(captureRegion.topLeft() + QPoint(padding, padding));
+    window.show();
+    window.raise();
+    window.activateWindow();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QTRY_VERIFY(window.isActiveWindow());
+    QTRY_VERIFY(cornerIsOwned(captureRegion.topLeft() + QPoint(2, 2)));
+    QTRY_VERIFY(cornerIsOwned(captureRegion.bottomRight() - QPoint(2, 2)));
+    // DWM completes its asynchronous activation/shadow transition before the
+    // bounded capture; this does not alter the system's visual settings.
+    QTest::qWait(200);
+    flush();
+    const QImage after = screen->grabWindow(0, captureRegion.x(), captureRegion.y(),
+                                            captureRegion.width(), captureRegion.height()).toImage();
+    QCOMPARE(after.size(), before.size());
+    const QByteArray prefix = qgetenv("MAICHAT_CAPTURE_WINDOW_BOUNDARY");
+    if (!prefix.isEmpty()) {
+        QVERIFY(before.save(QString::fromUtf8(prefix) + QStringLiteral("-backdrop.png")));
+        QVERIFY(after.save(QString::fromUtf8(prefix) + QStringLiteral("-window.png")));
+    }
+    BOOL rendered = FALSE;
+    QCOMPARE(attribute(reinterpret_cast<HWND>(window.winId()), DWMWA_NCRENDERING_ENABLED,
+                       &rendered, sizeof(rendered)), HRESULT(S_OK));
+    QVERIFY2(rendered, "DWM non-client rendering is disabled for this frameless window");
+    const qreal ratio = qreal(after.width()) / captureRegion.width();
+    int darker = 0;
+    // Only pixels outside the application's HWND count as shadow. A painted
+    // client border or a shrunken content rectangle cannot satisfy this check.
+    for (int y = qRound((padding + window.height() + 2) * ratio);
+         y < qRound((padding + window.height() + 16) * ratio); ++y)
+        for (int x = qRound((padding + 40) * ratio);
+             x < qRound((padding + window.width() - 40) * ratio); ++x) {
+            if (qGray(after.pixel(x, y)) + 2 < qGray(before.pixel(x, y))) ++darker;
+        }
+    qInfo() << "owned-window-shadow" << "outside darker pixels" << darker << "dpr" << ratio;
+    QVERIFY2(darker > qRound(window.width() * ratio), "No soft shadow separates the owned window from its backdrop");
+#else
+    QSKIP("Other platforms retain their native window frame and shadow.");
+#endif
+}
+
 void MainWindowLayoutTest::composerUsesEmbeddedIconSendAction() {
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
@@ -1768,6 +1918,161 @@ void MainWindowLayoutTest::agentConversationListUsesResizableSplitter() {
     QApplication::sendEvent(handle, &move);
     QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, finish);
     QVERIFY(splitter->sizes().at(0) != before);
+}
+
+void MainWindowLayoutTest::agentCaptureStopEntryLivesAboveBothConversationPanes() {
+    RemoteIMApplication app("creation-public-capture", std::make_unique<FakeRemoteIMClient>());
+    MainWindow window(app);
+    auto* panel = window.findChild<AgentChatPanel*>();
+    auto* splitter = window.findChild<QSplitter*>(QStringLiteral("agentContentSplitter"));
+    auto* bar = window.findChild<QWidget*>(QStringLiteral("agentScreenCaptureStatus"));
+    QVERIFY(panel && splitter);
+    auto* page = splitter->parentWidget();
+    QVERIFY(page);
+    QVERIFY2(bar, "Creation Center has no common screen capture stop entry");
+    QVERIFY2(!panel->isAncestorOf(bar), "Process-wide screen capture controls must not live inside a conversation");
+    QCOMPARE(bar->parentWidget(), page);
+    QCOMPARE(splitter->parentWidget(), page);
+    QCOMPARE(page->layout()->indexOf(bar), 0);
+    QCOMPARE(page->layout()->indexOf(splitter), 1);
+    QCOMPARE(window.findChildren<QWidget*>(QStringLiteral("agentScreenCaptureStatus")).size(), 1);
+    auto* control = bar->findChild<DesktopScreenCaptureControl*>();
+    QVERIFY(control);
+    QCOMPARE(control->parent(), bar);
+}
+
+void MainWindowLayoutTest::agentCommonCaptureStopSurvivesSessionAndOwnerPageChanges() {
+    struct CaptureProbe {
+        std::mutex mutex;
+        MaiScreenshotCaptureState state{true, true, 1, 1, 1, 1};
+        std::atomic<int> stops{0};
+    };
+    auto probe = std::make_shared<CaptureProbe>();
+    DesktopScreenCaptureControl control({
+        [probe] {
+            std::lock_guard<std::mutex> lock(probe->mutex);
+            return probe->state;
+        },
+        [probe] {
+            ++probe->stops;
+            std::lock_guard<std::mutex> lock(probe->mutex);
+            probe->state.workerRunning = false;
+            probe->state.capturing = false;
+            return MaiError{};
+        }});
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    const QString owner = QStringLiteral("capture-common-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    RemoteIMApplication app(owner, std::make_unique<FakeRemoteIMClient>());
+    MainWindow window(app, control);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* navigation = window.findChild<QPushButton*>(QStringLiteral("agentNavButton"));
+    auto* splitter = window.findChild<QSplitter*>(QStringLiteral("agentContentSplitter"));
+    QPointer<QWidget> bar = window.findChild<QWidget*>(QStringLiteral("agentScreenCaptureStatus"));
+    QVERIFY(navigation && splitter && bar);
+    navigation->click();
+    auto* stop = bar->findChild<QPushButton*>(QStringLiteral("agentStopScreenCapture"));
+    auto* label = bar->findChild<QLabel*>(QStringLiteral("agentScreenCaptureLabel"));
+    QVERIFY(stop && label);
+    QTRY_VERIFY(bar->isVisible() && stop->isVisible() && stop->isEnabled());
+    QCOMPARE(bar->parentWidget(), splitter->parentWidget());
+    QCOMPARE(bar->width(), splitter->width());
+    QVERIFY(bar->geometry().bottom() < splitter->geometry().top());
+    QVERIFY(label->text().contains(QStringLiteral("本机")));
+    QCOMPARE(control.parent(), nullptr);
+
+    auto* controller = window.activeAgentController();
+    auto* list = window.findChild<AgentSessionList*>();
+    auto* panel = window.findChild<AgentChatPanel*>();
+    QVERIFY(controller && list && panel);
+    const QString first = controller->createSession(workspace.path());
+    const QString second = controller->createSession(workspace.path());
+    QVERIFY(!first.isEmpty() && !second.isEmpty());
+    list->refresh();
+    auto* rows = list->findChild<QListWidget*>();
+    QVERIFY(rows);
+    const auto clickLocal = [&](const QString& id) {
+        for (int row = 0; row < rows->count(); ++row) {
+            auto* item = rows->item(row);
+            if (item->data(Qt::UserRole).toString() != id) continue;
+            rows->scrollToItem(item);
+            QTest::mouseClick(rows->viewport(), Qt::LeftButton, Qt::NoModifier, rows->visualItemRect(item).center());
+            return true;
+        }
+        return false;
+    };
+    QVERIFY(clickLocal(first));
+    auto* editor = panel->findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    QVERIFY(editor);
+    editor->setPlainText(QStringLiteral("first local draft remains private"));
+    QVERIFY(clickLocal(second));
+    editor->setPlainText(QStringLiteral("second local draft remains private"));
+    QVERIFY(clickLocal(first));
+    QCOMPARE(editor->toPlainText(), QStringLiteral("first local draft remains private"));
+    QCOMPARE(window.findChild<QWidget*>(QStringLiteral("agentScreenCaptureStatus")), bar.data());
+    QVERIFY(bar->isVisible());
+    const QString capturePrefix = qEnvironmentVariable("MAICHAT_CAPTURE_CREATION_PUBLIC");
+    if (!capturePrefix.isEmpty())
+        QVERIFY(window.grab().save(capturePrefix + QStringLiteral("-local.png")));
+
+    DesktopSessionSyncCoordinator coordinator(
+        [](const QString&, const QByteArray&, const QJsonObject&,
+           DesktopSessionSyncCoordinator::Completion completion) {
+            QTimer::singleShot(0, [completion = std::move(completion)] { completion({}, {}); });
+        }, [&] { return window.activeAgentController(); });
+    window.setSessionSyncCoordinator(&coordinator);
+    const QJsonObject remote{{QStringLiteral("id"), QStringLiteral("owned-remote-fixture")},
+                            {QStringLiteral("title"), QStringLiteral("Owned remote fixture")},
+                            {QStringLiteral("device_slot"), QStringLiteral("ios_phone")},
+                            {QStringLiteral("device_id"), QStringLiteral("owned-phone")},
+                            {QStringLiteral("login_session_id"), QStringLiteral("owned-login")},
+                            {QStringLiteral("online"), true}};
+    coordinator.acceptCatalog(QJsonArray{remote});
+    QVERIFY(QMetaObject::invokeMethod(list, "remoteSelected", Qt::DirectConnection, Q_ARG(QJsonObject, remote)));
+    auto* panelStack = qobject_cast<QStackedWidget*>(panel->parentWidget());
+    QVERIFY(panelStack);
+    auto* remotePanel = dynamic_cast<RemoteAgentPanel*>(panelStack->currentWidget());
+    QVERIFY(remotePanel && remotePanel->isVisible());
+    QCOMPARE(remotePanel->session().value(QStringLiteral("id")).toString(), QStringLiteral("owned-remote-fixture"));
+    QVERIFY(!remotePanel->isAncestorOf(bar));
+    QVERIFY(bar->isVisible() && label->text().contains(QStringLiteral("本机")));
+    QCOMPARE(window.findChild<QWidget*>(QStringLiteral("agentScreenCaptureStatus")), bar.data());
+    if (!capturePrefix.isEmpty())
+        QVERIFY(window.grab().save(capturePrefix + QStringLiteral("-remote.png")));
+    QTest::mouseClick(stop, Qt::LeftButton);
+    QTRY_COMPARE(probe->stops.load(), 1);
+    QTRY_VERIFY(!control.isStopping() && !control.captureState().capturing && !control.captureState().workerRunning);
+    QVERIFY(clickLocal(first));
+    QCOMPARE(editor->toPlainText(), QStringLiteral("first local draft remains private"));
+    QVERIFY(clickLocal(second));
+    QCOMPARE(editor->toPlainText(), QStringLiteral("second local draft remains private"));
+    {
+        std::lock_guard<std::mutex> lock(probe->mutex);
+        probe->state.workerRunning = probe->state.capturing = true;
+        ++probe->state.sessionStarts;
+    }
+    control.refresh();
+    QTRY_VERIFY(bar->isVisible() && stop->isEnabled());
+
+    // This existing setter really rebuilds the local/remote owner pages. Draft
+    // retention across that older destructive API is not changed here; the new
+    // process-level control and public bar must remain the same live objects.
+    QPointer<AgentChatPanel> oldPanel = panel;
+    window.setMediaServiceAccessProvider({});
+    QVERIFY(oldPanel.isNull());
+    QVERIFY(window.findChild<AgentChatPanel*>());
+    QVERIFY(bar);
+    QCOMPARE(window.findChild<QWidget*>(QStringLiteral("agentScreenCaptureStatus")), bar.data());
+    QCOMPARE(window.findChildren<QWidget*>(QStringLiteral("agentScreenCaptureStatus")).size(), 1);
+    QCOMPARE(control.parent(), nullptr);
+    QCOMPARE(probe->stops.load(), 1);
+    QVERIFY(control.captureState().capturing);
+    QTRY_VERIFY(bar->isVisible());
+    QTest::mouseClick(stop, Qt::LeftButton);
+    QTRY_COMPARE(probe->stops.load(), 2);
+    QTRY_VERIFY(!control.isStopping() && !control.captureState().capturing);
+    window.setSessionSyncCoordinator(nullptr);
 }
 
 void MainWindowLayoutTest::agentSessionSwitchReusesTheExistingPage() {

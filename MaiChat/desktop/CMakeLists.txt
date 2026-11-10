@@ -851,6 +851,10 @@ add_library(maichat_agent
   src/ui/ComposerTextEdit.cpp
   src/agent/AgentController.h
   src/agent/AgentController.cpp
+  src/agent/DesktopScreenCaptureControl.h
+  src/agent/DesktopScreenCaptureControl.cpp
+  src/agent/DesktopScreenCaptureBar.h
+  src/agent/DesktopScreenCaptureBar.cpp
   ../MaiChatTools/MaiQrCode.h
   ../MaiChatTools/MaiQrCode.cpp
   ../MaiChatTools/MaiQuestionTranscript.h
@@ -1106,6 +1110,29 @@ if(WIN32 AND MAICHAT_RVM_WINDOWS_ASSETS_AVAILABLE)
 endif()
 
 add_executable(agent_panel_session_test tests/AgentPanelSessionTest.cpp)
+
+# The capture lifecycle is independent of chat turns; owned backends exercise
+# blocking native-stop behavior without touching the user's desktop session.
+add_executable(desktop_screen_capture_control_test
+  tests/DesktopScreenCaptureControlTest.cpp
+  src/agent/DesktopScreenCaptureControl.h
+  src/agent/DesktopScreenCaptureControl.cpp)
+target_include_directories(desktop_screen_capture_control_test PRIVATE src)
+target_link_libraries(desktop_screen_capture_control_test PRIVATE
+  maiagent Qt6::Widgets Qt6::Concurrent Qt6::Test)
+add_test(NAME desktop_screen_capture_control_test COMMAND desktop_screen_capture_control_test)
+
+add_executable(desktop_screen_capture_bar_test
+  tests/DesktopScreenCaptureBarTest.cpp
+  src/agent/DesktopScreenCaptureBar.h
+  src/agent/DesktopScreenCaptureBar.cpp
+  src/agent/DesktopScreenCaptureControl.h
+  src/agent/DesktopScreenCaptureControl.cpp
+  src/ui/UiZoom.cpp)
+target_include_directories(desktop_screen_capture_bar_test PRIVATE src)
+target_link_libraries(desktop_screen_capture_bar_test PRIVATE
+  maiagent maichat_markdown Qt6::Widgets Qt6::Concurrent Qt6::Test)
+add_test(NAME desktop_screen_capture_bar_test COMMAND desktop_screen_capture_bar_test)
 target_compile_definitions(agent_panel_session_test PRIVATE
   MAICHAT_AGENT_VIDEO_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/Graphics/tests/fixtures/tiny-red.mp4"
   MAICHAT_AGENT_AUDIO_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/third_party/lame/testcase.wav")

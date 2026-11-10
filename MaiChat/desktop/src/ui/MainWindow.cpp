@@ -112,6 +112,7 @@
 #include "MaiSystemProxy.h"
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
+#include <dwmapi.h>
 #endif
 
 #include "im/VideoFileMetadata.h"
@@ -160,6 +161,8 @@
 #include "agent/AgentSessionList.h"
 #include "agent/DesktopSessionSyncCoordinator.h"
 #include "agent/DesktopSessionAttachments.h"
+#include "agent/DesktopScreenCaptureBar.h"
+#include "agent/DesktopScreenCaptureControl.h"
 #include "agent/RemoteAgentPanel.h"
 #include "agent/ReplySuggestionController.h"
 
@@ -1733,6 +1736,63 @@ QString agentDatabasePath(const QString &ownerUserId) {
 }
 
 #ifdef Q_OS_WIN
+// Keep the perimeter independent of page layouts and hit testing. In particular,
+// adding transparent outer margins would shrink maximized content and turn the
+// native resize strip into a visible gutter. The compositor owns the soft shadow.
+class WindowBoundaryOutline final : public QWidget {
+public:
+  explicit WindowBoundaryOutline(QWidget* parent) : QWidget(parent) {
+    setObjectName(QStringLiteral("windowBoundaryOutline"));
+    setAttribute(Qt::WA_TransparentForMouseEvents);
+    setAttribute(Qt::WA_NoSystemBackground);
+    setFocusPolicy(Qt::NoFocus);
+  }
+
+  void setActive(bool active) {
+    if (active_ == active) return;
+    active_ = active;
+    update();
+  }
+
+protected:
+  void paintEvent(QPaintEvent*) override {
+    QPainter painter(this);
+    const QColor color = active_ ? QColor(144, 154, 166) : QColor(184, 192, 202);
+    painter.fillRect(QRect(0, 0, width(), 1), color);
+    painter.fillRect(QRect(0, height() - 1, width(), 1), color);
+    painter.fillRect(QRect(0, 0, 1, height()), color);
+    painter.fillRect(QRect(width() - 1, 0, 1, height()), color);
+  }
+
+private:
+  bool active_ = false;
+};
+
+void configureWindowsWindowShadow(QWidget* window) {
+  // Resolve DWM at runtime: the UI target does not gain a platform library
+  // dependency, and a missing compositor leaves the opaque client frame intact.
+  struct DwmApi {
+    HMODULE module = LoadLibraryW(L"dwmapi.dll");
+    decltype(&DwmSetWindowAttribute) setAttribute = module
+        ? reinterpret_cast<decltype(&DwmSetWindowAttribute)>(GetProcAddress(module, "DwmSetWindowAttribute"))
+        : nullptr;
+    decltype(&DwmExtendFrameIntoClientArea) extendFrame = module
+        ? reinterpret_cast<decltype(&DwmExtendFrameIntoClientArea)>(GetProcAddress(module, "DwmExtendFrameIntoClientArea"))
+        : nullptr;
+    ~DwmApi() { if (module) FreeLibrary(module); }
+  };
+  static const DwmApi api;
+  if (!api.setAttribute || !api.extendFrame) return;
+  const HWND handle = reinterpret_cast<HWND>(window->winId());
+  const DWMNCRENDERINGPOLICY policy = DWMNCRP_ENABLED;
+  api.setAttribute(handle, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy));
+  // A one-physical-pixel extended frame lets DWM retain its native external
+  // shadow after NCCALCSIZE removes the caption. The client stays fully opaque.
+  const int edge = window->isMaximized() || window->isFullScreen() ? 0 : 1;
+  const MARGINS margins{edge, edge, edge, edge};
+  api.extendFrame(handle, &margins);
+}
+
 // Caption glyphs remain vector lines at any UiZoom/DPI. The maximize button also
 // receives native hover/press feedback when Windows recognizes its Snap target.
 class WindowCaptionButton final : public QPushButton {
@@ -1805,6 +1865,10 @@ void configureWindowsTitleBar(QWidget* window) {
 MainWindow::MainWindow(RemoteIMApplication &app, QWidget *parent)
     : MainWindow(app, 0, {}, {}, {}, parent) {}
 
+MainWindow::MainWindow(RemoteIMApplication& app, DesktopScreenCaptureControl& captureControl,
+                       QWidget* parent)
+    : MainWindow(app, 0, {}, {}, {}, parent, &captureControl) {}
+
 MainWindow::MainWindow(RemoteIMApplication &app, int imSdkAppId,
                        std::function<QString(const QString&)> userSigProvider,
                        QWidget *parent)
@@ -1815,7 +1879,7 @@ MainWindow::MainWindow(
     std::function<QString(const QString&)> userSigProvider,
     std::function<QString()> arkApiKeyProvider,
     std::function<QPair<QString, QString>()> wanCredentialsProvider,
-    QWidget *parent)
+    QWidget *parent, DesktopScreenCaptureControl* captureControl)
     : QMainWindow(parent), app_(app), imSdkAppId_(imSdkAppId),
       userSigProvider_(std::move(userSigProvider)),
       arkApiKeyProvider_(std::move(arkApiKeyProvider)),
@@ -1860,6 +1924,7 @@ MainWindow::MainWindow(
     return passwordWindow && passwordWindow->passwordChangeRequests_ ?
         passwordWindow->passwordChangeRequests_->request(arguments) : QJsonObject{};
   });
+  screenCaptureControl_ = captureControl;
   buildUi();
   applyStyle();
   const AgentController::ModelConfig replyModel = loadAgentModelConfig(modelApiKeys_);
@@ -1899,8 +1964,11 @@ bool MainWindow::event(QEvent *event) {
   if (event->type() == QEvent::Move)
     QTimer::singleShot(0, this, [this] { syncVideoDock(); });
 #ifdef Q_OS_WIN
-  if (event->type() == QEvent::WindowStateChange)
+  if (event->type() == QEvent::WindowStateChange) {
     updateWindowCaptionControls();
+    updateWindowBoundary();
+    configureWindowsWindowShadow(this);
+  }
   if (event->type() == QEvent::WindowActivate) {
     updateWindowChromeBackground(true);
   } else if (event->type() == QEvent::WindowDeactivate) {
@@ -1948,6 +2016,8 @@ void MainWindow::updateWindowCaptionControls() {
 #ifdef Q_OS_WIN
 bool MainWindow::nativeEvent(const QByteArray& eventType, void* message, qintptr* result) {
   auto* native = static_cast<MSG*>(message);
+  if (native->message == WM_DWMCOMPOSITIONCHANGED)
+    configureWindowsWindowShadow(this);
   if (native->message == WM_NCCALCSIZE && !isFullScreen()) {
     *result = 0;
     return true;
@@ -2056,8 +2126,19 @@ void MainWindow::updateWindowChromeBackground(bool active) {
   }
   if (navRail_ != nullptr)
     setSolidWindowBackground(navRail_, color);
+  if (windowBoundaryOutline_)
+    static_cast<WindowBoundaryOutline*>(windowBoundaryOutline_)->setActive(active);
 #else
   Q_UNUSED(active);
+#endif
+}
+
+void MainWindow::updateWindowBoundary() {
+#ifdef Q_OS_WIN
+  if (!windowBoundaryOutline_) return;
+  windowBoundaryOutline_->setGeometry(rect());
+  windowBoundaryOutline_->setVisible(!isMaximized() && !isFullScreen());
+  windowBoundaryOutline_->raise();
 #endif
 }
 
@@ -2240,6 +2321,7 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event) {
 
 void MainWindow::resizeEvent(QResizeEvent *event) {
   QMainWindow::resizeEvent(event);
+  updateWindowBoundary();
   // 先按新的客户区宽度收回窗口按钮；内容布局完成后再校准标题行高度。
   updateWindowCaptionControls();
   QTimer::singleShot(0, this, [this] {
@@ -2255,7 +2337,9 @@ void MainWindow::showEvent(QShowEvent *event) {
   QMainWindow::showEvent(event);
 #ifdef Q_OS_WIN
   if (!isFullScreen()) configureWindowsTitleBar(this);
+  configureWindowsWindowShadow(this);
 #endif
+  updateWindowBoundary();
   updateWindowCaptionControls();
   QTimer::singleShot(0, this, [this] { updateMessageBubbleWidths(); });
 }
@@ -3272,22 +3356,30 @@ void MainWindow::buildUi() {
   connect(remoteDesktopView_, &RemoteDesktopViewPanel::controlToggleRequested,
           this, &MainWindow::toggleRemoteDesktopControl);
 
-  // AI 助手页。整页就是一个 AgentChatPanel，MainWindow 只负责把它放进来，
-  // 不参与它内部的任何事——这样将来要摘掉它，删这几行就够。
+  // 采集状态属于本机进程，放在创作中心公共层：左右会话列表和任意
+  // 本地/远端会话面板都在它下方，重建会话面板也不能销毁停止入口。
   agentPage_ = new QWidget(contentStack_);
+  agentPage_->setObjectName(QStringLiteral("agentPage"));
   {
     // 和消息页一样的两栏：左边会话列表，右边内容。这里不复用消息页那套——
     // 那边一项是"一个人"（头像、未读数、在线状态），这边一项是"一段工作"
     // （标题、工作目录），硬凑到一起两边都别扭。
-    auto *agentLayout = new QHBoxLayout(agentPage_);
+    auto *agentLayout = new QVBoxLayout(agentPage_);
     agentLayout->setContentsMargins(0, 0, 0, 0);
     agentLayout->setSpacing(0);
+    const bool ownsCaptureControl = !screenCaptureControl_;
+    if (ownsCaptureControl) screenCaptureControl_ = new DesktopScreenCaptureControl(this);
+    auto* captureBar = new DesktopScreenCaptureBar(*screenCaptureControl_, agentPage_);
+    // QObject destroys an object's children after its derived destructor. Keep
+    // an owned control alive throughout the bar's lifetime, including teardown.
+    if (ownsCaptureControl) screenCaptureControl_->setParent(captureBar);
+    agentLayout->addWidget(captureBar);
 
     auto *agentSplitter = new QSplitter(Qt::Horizontal, agentPage_);
     agentSplitter->setObjectName(QStringLiteral("agentContentSplitter"));
     agentSplitter->setChildrenCollapsible(false);
     agentSplitter->setHandleWidth(1);
-    agentLayout->addWidget(agentSplitter);
+    agentLayout->addWidget(agentSplitter, 1);
 
     rebuildAgentPage();
   }
@@ -3341,6 +3433,8 @@ void MainWindow::buildUi() {
           [this] { updateWindowCaptionControls(); });
   root->installEventFilter(this);
   rootContent->installEventFilter(this);
+  windowBoundaryOutline_ = new WindowBoundaryOutline(this);
+  updateWindowBoundary();
   updateWindowCaptionControls();
 #endif
 }
