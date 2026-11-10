@@ -36,3 +36,42 @@ Windows 已实际完成独立编辑器的另存为、读磁盘、清空和重新
 本轮以新目录保存候选与校验文件，保留旧包及现装应用。Windows 安装包未签名；Mac 使用
 ad-hoc 签名且未公证。实际 Mac 构建和运行环境为 Apple Silicon/macOS 27.2，没有据此冒称在
 其它 macOS 版本完成运行验收。两端包内实际启动、依赖与原始字节一致性由出包门禁分别记录。
+
+## 最终交付记录
+
+冻结源码：`8c36b3d2045519947c0d30f8202062837134a059`；MaiChat tree
+`ea1c3939f9a61129c20a0c2d1bb4650dbf9cc9d4`，Core tree
+`e5a1910545b8b328a77e19bdd26557a6dd4fe0f5`。下表均为实际生成的 2.2.55 包。
+
+| 平台/格式 | 字节数 | SHA256 |
+| --- | ---: | --- |
+| Windows EXE | 201031846 | `6f7d3b6aedcb200685f451ddcf94fe9be3e44bf6fad42ffad9113a1deacefbe8` |
+| Windows ZIP | 241467281 | `68600fb644fa22687809541b3555fe34e9deec1b00197af93d4efc1490c0fecc` |
+| Mac DMG | 213927913 | `7b7782a4852d5312c2f322ac11ecec5fd803a9c8be4880e534f37b4d3a837e94` |
+| Mac ZIP | 214486153 | `4932c022b748bda10e5671f668c1b1ed91b2c724d5e6e7300bb11ea433278981` |
+
+Windows 的完整 staging 与实际 ZIP 解压目录 81 文件逐项相同；实际 NSIS 解包的 81 个应用
+文件与独立 installer staging 逐项相同，另有 6 个已识别支持文件。三份 PE 闭包为 37/37/42，
+无缺失或旧 Qt 模块；五个模型 SHA 一致。三份 payload 各普通/debug 裸 PATH 启动，六个实际
+进程均 exit 0、版本 2.2.55，五个 Qt/Windows 组件均来自本副本。主 exe SHA 为
+`58bbdaaeca6ba921c6d2d63790b4375351a2c247e8d93ec592eb5465ab06bbfa`。
+
+Mac 的 staging、readonly DMG 和实际 ZIP 各 338 文件/37 symlink 逐项相同；26 Mach-O、
+签名、五模型及六个普通/debug 包内进程全部通过，运行版本 2.2.55。signed exe SHA 为
+`63c1cf50e9ec7dd605f92cd1439788770cc1772a9c214a88b2c0ca9c8473175c`。
+OpenCV 实读标签 `8c36b3d2-dirty`：dirty 仅来自保留的四份独立根文档，产品和 index 均 clean。
+
+两端已向 `whq-iphone` 串行发送 16 MiB 分片，并逐件等待真正 `sent-to-im` 和非空远程消息 ID：
+Windows 30/30（工具、12 EXE 片、15 ZIP 片、2 metadata），Mac 31/31（2 metadata、3 工具、
+13 DMG 片、13 ZIP 片），合计 61 文件，失败/重试均为 0。完整包重组后的原始字节及 SHA
+已核相同；同 SHA 跳过与冲突拒绝用例通过。这不表示收件人已经下载、合并或安装。
+各端四个完整资产均保存在各自 `Downloads/MaiChat-2.2.55-candidate`，逐 SHA 等于验收原包。
+
+Root 原始证据在 `.cache/release-2.2.55-20261110/`，含两个完整 send log、只读数据库送达复核、
+重组回执、六个 smoke JSON 和实际包 manifest。Mac 最终 proof 为 385253B，SHA256
+`886af9a649a0ec50456b1fee21418359592c598a075688a14676d12be90b124d`，
+Root 已核 50/50 长度/SHA 与 51 ZIP 项 CRC；31 条确认及逐件顺序屏障也逐项核过。
+
+本轮没有修改字体来处理先前 Windows 黑体粗细现场现象，也未将未复现的播放器初始铺满
+现象标为已解决。实际视觉模型自主操作、真实模型摘要质量/速度和现场手机更新仍不在本轮
+已完成验收范围。旧包、现装应用及线上 8cde 服务保持原状；没有创建 tag/公开 Release。

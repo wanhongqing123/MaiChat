@@ -1,0 +1,84 @@
+{
+  "version": "2.2.55",
+  "sourceCommit": "8c36b3d2045519947c0d30f8202062837134a059",
+  "MaiChatTree": "ea1c3939f9a61129c20a0c2d1bb4650dbf9cc9d4",
+  "CoreTree": "e5a1910545b8b328a77e19bdd26557a6dd4fe0f5",
+  "windows": {
+    "artifacts": [
+      {
+        "name": "MaiChat-win64-v2.2.55-20261110-8c36b3d2.zip",
+        "bytes": 241467281,
+        "sha256": "68600fb644fa22687809541b3555fe34e9deec1b00197af93d4efc1490c0fecc"
+      },
+      {
+        "name": "MaiChat-Setup-win64-v2.2.55-8c36b3d2.exe",
+        "bytes": 201031846,
+        "sha256": "6f7d3b6aedcb200685f451ddcf94fe9be3e44bf6fad42ffad9113a1deacefbe8"
+      }
+    ],
+    "appExeSHA256": "58bbdaaeca6ba921c6d2d63790b4375351a2c247e8d93ec592eb5465ab06bbfa",
+    "smokeCount": 6,
+    "allSmokeExitZero": true,
+    "applicationFiles": 81,
+    "PECounts": [
+      37,
+      37,
+      42
+    ],
+    "modelCount": 5,
+    "sdkConfirmedFiles": 30,
+    "remoteMessageIdsPresent": true,
+    "failures": 0,
+    "retries": 0,
+    "manifestSHA256": "d086c921eff5fd7f2e0167ef26dca42c02e59e4096776c2031e7a7a40ea2ec91"
+  },
+  "mac": {
+    "artifacts": [
+      {
+        "name": "MaiChat-macos-arm64-v2.2.55-20261110-8c36b3d2.dmg",
+        "bytes": 213927913,
+        "sha256": "7b7782a4852d5312c2f322ac11ecec5fd803a9c8be4880e534f37b4d3a837e94"
+      },
+      {
+        "name": "MaiChat-macos-arm64-v2.2.55-20261110-8c36b3d2.zip",
+        "bytes": 214486153,
+        "sha256": "4932c022b748bda10e5671f668c1b1ed91b2c724d5e6e7300bb11ea433278981"
+      }
+    ],
+    "sourceExeSHA256": "1d401cc36bcd09c2b92238bdfbbc8b124acfd06dcfecf720346bc61ff17a5ac0",
+    "signedExeSHA256": "63c1cf50e9ec7dd605f92cd1439788770cc1772a9c214a88b2c0ca9c8473175c",
+    "testedOS": "macOS 27.2 arm64",
+    "signing": "ad-hoc; not notarized",
+    "files": 338,
+    "symlinks": 37,
+    "MachOCount": 26,
+    "modelCount": 5,
+    "smokeCount": 6,
+    "allSmokeExitZero": true,
+    "sdkConfirmedFiles": 31,
+    "remoteMessageIdsPresent": true,
+    "failures": 0,
+    "retries": 0,
+    "proofZIPBytes": 385253,
+    "proofZIPSHA256": "886af9a649a0ec50456b1fee21418359592c598a075688a14676d12be90b124d",
+    "proofManifestFilesVerified": 50
+  },
+  "transport": {
+    "partBytes": 16777216,
+    "totalFilesSDKConfirmed": 61,
+    "completePackageReassemblyByteAndSHAEqual": true,
+    "sameSHAOutputSkipped": true,
+    "conflictingOutputRejected": true,
+    "recipientDownloadVerified": false,
+    "recipientInstallVerified": false
+  },
+  "boundaries": {
+    "publicReleaseCreated": false,
+    "tagCreated": false,
+    "installedAppReplaced": false,
+    "onlineServicesChangedByPackaging": false,
+    "backendSourceCommit": "8cde6a87418c84691598b567f49a68255880bd10",
+    "liveModelSummaryQualityOrSpeedVerified": false,
+    "visualModelAutonomousComputerTasksVerified": false
+  }
+}
