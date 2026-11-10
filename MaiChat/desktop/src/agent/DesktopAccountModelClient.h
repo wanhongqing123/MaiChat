@@ -22,6 +22,7 @@ public:
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                     const std::atomic<bool>& cancel) override;
     MaiWireApi wireApi() const override;
+    MaiModelContextLimits contextLimits(const std::string& model) const override;
 
 private:
     Config config_;

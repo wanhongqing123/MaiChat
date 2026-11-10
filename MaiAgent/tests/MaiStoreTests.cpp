@@ -695,9 +695,137 @@ void contract_specialist_media_delivery_dedup(MaiSessionStore& store, const char
         CHECK(pending.id != task.id);
 }
 
+// 压缩只推进独立检查点，原始消息仍可精确读取；同一契约同时约束两个后端。
+void contract_context_checkpoint_atomicity(MaiSessionStore& store, const char* which) {
+    std::printf("   [%s] context checkpoint source identity and compare-and-swap\n", which);
+    const auto owner = MaiIdGenerator::newSessionId();
+    const auto other = MaiIdGenerator::newSessionId();
+    store.putSession(makeSession(owner, "summary owner", 1));
+    store.putSession(makeSession(other, "other owner", 1));
+    auto user = makeMessage(MaiIdGenerator::newMessageId(), MaiRole::User);
+    user.parts.push_back(
+        textPart(MaiIdGenerator::newPartId(), "Keep https://original.example/source exactly."));
+    auto assistant = makeMessage(MaiIdGenerator::newMessageId(), MaiRole::Assistant);
+    assistant.parts.push_back(
+        textPart(MaiIdGenerator::newPartId(), "Inspected the original source."));
+    store.putMessage(owner, user);
+    store.putMessage(owner, assistant);
+    const auto snapshot = store.listMessages(owner);
+    MaiContextCheckpoint checkpoint;
+    checkpoint.sessionId = owner;
+    checkpoint.revision = 1;
+    checkpoint.sourceMessageCount = snapshot.size();
+    checkpoint.firstMessageId = user.id;
+    checkpoint.throughMessageId = assistant.id;
+    checkpoint.sourceFingerprint = maiContextSourceFingerprint(owner, snapshot, snapshot.size());
+    checkpoint.summary = "A validated summary supplied by the compactor.";
+    checkpoint.references = "[]";
+    checkpoint.model = "fixture";
+    checkpoint.created = 100;
+    CHECK(!store.advanceContextCheckpoint(owner, 0, checkpoint));
+    MaiContextCheckpoint loaded;
+    CHECK(store.getContextCheckpoint(owner, loaded));
+    CHECK(loaded.sourceFingerprint == checkpoint.sourceFingerprint);
+    CHECK(loaded.summary == checkpoint.summary);
+    CHECK(loaded.revision == 1);
+    CHECK(store.advanceContextCheckpoint(owner, 0, checkpoint).code() == MaiErrorCode::Busy);
+    CHECK(store.advanceContextCheckpoint(other, 0, checkpoint).hasError());
+    CHECK(!store.getContextCheckpoint(other, loaded));
+    MaiMessage exact;
+    CHECK(store.getMessage(owner, user.id, exact));
+    CHECK(exact.text() == user.text());
+    auto appended = makeMessage(MaiIdGenerator::newMessageId(), MaiRole::User);
+    appended.parts.push_back(textPart(MaiIdGenerator::newPartId(), "Concurrent new input."));
+    store.putMessage(owner, appended);
+    checkpoint.revision = 2;
+    checkpoint.summary = "Updated valid summary.";
+    CHECK(!store.advanceContextCheckpoint(owner, 1, checkpoint));
+    CHECK(store.listMessages(owner).size() == 3);
+    auto changed = user;
+    std::get<MaiTextPart>(changed.parts[0].body).text += " Changed old source.";
+    store.putMessage(owner, changed);
+    checkpoint.revision = 3;
+    CHECK(store.advanceContextCheckpoint(owner, 2, checkpoint).code() == MaiErrorCode::Busy);
+    CHECK(store.getContextCheckpoint(owner, loaded));
+    CHECK(loaded.revision == 2);
+    CHECK(!maiContextCheckpointMatches(loaded, owner, store.listMessages(owner)));
+    CHECK(store.clearMessages(owner));
+    CHECK(!store.getContextCheckpoint(owner, loaded));
+    CHECK(store.removeSession(owner));
+    CHECK(store.removeSession(other));
+}
+
+void contract_partial_context_checkpoint(MaiSessionStore& store, const char* which) {
+    std::printf(
+        "   [%s] partial source CAS ignores appended tail and completion, rejects changed sealed "
+        "parts\n",
+        which);
+    const auto owner = MaiIdGenerator::newSessionId();
+    store.putSession(makeSession(owner, "partial source owner", 1));
+    auto user = makeMessage(MaiIdGenerator::newMessageId(), MaiRole::User);
+    user.parts.push_back(textPart(MaiIdGenerator::newPartId(), "Keep the current user original."));
+    store.putMessage(owner, user);
+    auto assistant = makeMessage(MaiIdGenerator::newMessageId(), MaiRole::Assistant);
+    assistant.completed = 0;
+    for (int index = 0; index < 4; ++index) {
+        MaiToolPart tool;
+        tool.tool = "read";
+        tool.callId = "partial_" + std::to_string(index);
+        tool.input = "{}";
+        tool.output = "Original source " + std::to_string(index);
+        tool.state = index == 3 ? MaiToolState::Running : MaiToolState::Completed;
+        assistant.parts.push_back({MaiIdGenerator::newPartId(), tool, 1});
+    }
+    store.putMessage(owner, assistant);
+    const auto source = store.listMessages(owner);
+    MaiContextCheckpoint checkpoint;
+    checkpoint.sessionId = owner;
+    checkpoint.revision = 1;
+    checkpoint.sourceMessageCount = 1;
+    checkpoint.firstMessageId = user.id;
+    checkpoint.throughMessageId = user.id;
+    checkpoint.sourceFingerprint = maiContextSourceFingerprint(owner, source, 1);
+    checkpoint.partialMessageId = assistant.id;
+    checkpoint.partialPartCount = 2;
+    checkpoint.throughPartId = assistant.parts[1].id;
+    checkpoint.preservedUserMessageId = user.id;
+    checkpoint.partialSourceFingerprint = maiContextPartialSourceFingerprint(checkpoint, source);
+    checkpoint.summary = "Validated partial source summary.";
+    checkpoint.references = "[]";
+    CHECK(!store.advanceContextCheckpoint(owner, 0, checkpoint));
+    MaiContextCheckpoint loaded;
+    CHECK(store.getContextCheckpoint(owner, loaded));
+    CHECK(loaded.partialMessageId == assistant.id && loaded.partialPartCount == 2);
+    CHECK(loaded.partialSourceFingerprint == checkpoint.partialSourceFingerprint);
+    // 未覆盖的 Running/tail 和消息收尾变更不影响已覆盖源身份。
+    std::get<MaiToolPart>(assistant.parts.back().body).input = "{\"appended_state\":true}";
+    assistant.completed = 500;
+    assistant.parts.push_back(textPart(MaiIdGenerator::newPartId(), "New final text."));
+    store.putMessage(owner, assistant);
+    CHECK(maiContextCheckpointMatches(loaded, owner, store.listMessages(owner)));
+    checkpoint.revision = 2;
+    CHECK(!store.advanceContextCheckpoint(owner, 1, checkpoint));
+    // 任何已封存原字节变化仍须拒绝，不能对指纹做 UTF-8 replacement 归一化。
+    std::get<MaiToolPart>(assistant.parts[0].body).output += " Changed sealed source.";
+    store.putMessage(owner, assistant);
+    checkpoint.revision = 3;
+    CHECK(store.advanceContextCheckpoint(owner, 2, checkpoint).code() == MaiErrorCode::Busy);
+    CHECK(store.getContextCheckpoint(owner, loaded) && loaded.revision == 2);
+    auto active = loaded;
+    active.revision = 3;
+    active.partialPartCount = 4;
+    active.throughPartId = assistant.parts[3].id;
+    active.partialSourceFingerprint =
+        maiContextPartialSourceFingerprint(active, store.listMessages(owner));
+    CHECK(store.advanceContextCheckpoint(owner, 2, active).code() == MaiErrorCode::Busy);
+    CHECK(store.removeSession(owner));
+}
+
 // 对内存和 SQLite 实现运行相同的会话、消息、工具与任务存储契约。
 // 每项断言只依赖公开接口和可读取的持久化结果。
 void runContract(MaiSessionStore& store, const char* which) {
+    contract_partial_context_checkpoint(store, which);
+    contract_context_checkpoint_atomicity(store, which);
     contract_session_crud(store, which);
     contract_list_sessions_ordering(store, which);
     contract_messages_and_parts(store, which);
@@ -1084,6 +1212,58 @@ void test_sqlite_sanitizes_invalid_utf8_before_write() {
     CHECK(tool->error.find("\xEF\xBF\xBD") != std::string::npos);
 }
 
+void test_v8_checkpoint_migrates_without_changing_original_source() {
+    std::printf("-> v8 whole-message checkpoint survives the additive v9 migration\n");
+    TempDir temp;
+    const auto path = temp.file("context-v8.sqlite");
+    auto opened = makeMaiSqliteStore(path);
+    CHECK(opened);
+    if (!opened) return;
+    auto store = std::move(opened.value());
+    const auto id = MaiIdGenerator::newSessionId();
+    store->putSession(makeSession(id, "v8 checkpoint", 1));
+    auto source = makeMessage(MaiIdGenerator::newMessageId(), MaiRole::User);
+    source.parts.push_back(textPart(MaiIdGenerator::newPartId(), "Original v8 source."));
+    store->putMessage(id, source);
+    MaiContextCheckpoint checkpoint;
+    checkpoint.sessionId = id;
+    checkpoint.revision = 1;
+    checkpoint.sourceMessageCount = 1;
+    checkpoint.firstMessageId = source.id;
+    checkpoint.throughMessageId = source.id;
+    checkpoint.sourceFingerprint = maiContextSourceFingerprint(id, store->listMessages(id), 1);
+    checkpoint.summary = "Existing v8 summary.";
+    checkpoint.references = "[]";
+    CHECK(!store->advanceContextCheckpoint(id, 0, checkpoint));
+    store.reset();
+    sqlite3* database = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+    if (!database) return;
+    // 用实际 v8 列集合模拟升级前的库，不使用当前新列的默认值来假装完成迁移。
+    CHECK(sqlite3_exec(database,
+                       "ALTER TABLE context_checkpoints DROP COLUMN partial_message_id;"
+                       "ALTER TABLE context_checkpoints DROP COLUMN partial_part_count;"
+                       "ALTER TABLE context_checkpoints DROP COLUMN through_part_id;"
+                       "ALTER TABLE context_checkpoints DROP COLUMN partial_source_fingerprint;"
+                       "ALTER TABLE context_checkpoints DROP COLUMN preserved_user_message_id;"
+                       "PRAGMA user_version=8;",
+                       nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(database);
+    opened = makeMaiSqliteStore(path);
+    CHECK(opened);
+    if (!opened) return;
+    store = std::move(opened.value());
+    MaiContextCheckpoint migrated;
+    CHECK(store->getContextCheckpoint(id, migrated));
+    CHECK(migrated.revision == checkpoint.revision);
+    CHECK(migrated.summary == checkpoint.summary);
+    CHECK(migrated.sourceFingerprint == checkpoint.sourceFingerprint);
+    CHECK(migrated.partialMessageId.empty() && migrated.partialPartCount == 0);
+    CHECK(maiContextCheckpointMatches(migrated, id, store->listMessages(id)));
+    MaiMessage raw;
+    CHECK(store->getMessage(id, source.id, raw) && raw.text() == source.text());
+}
+
 }  // namespace
 
 int main() {
@@ -1114,6 +1294,7 @@ int main() {
         }
     }
 
+    test_v8_checkpoint_migrates_without_changing_original_source();
     test_survives_reopen();
     test_specialist_reply_survives_reopen();
     test_migrates_unfinished_tool_index();

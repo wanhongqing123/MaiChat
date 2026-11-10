@@ -14,6 +14,7 @@
 #include <json.hpp>
 
 #include "MaiIdGenerator.h"
+#include "MaiContextCompactor.h"
 
 namespace {
 
@@ -316,7 +317,12 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         if (mDependencies.closeSteering) mDependencies.closeSteering();
         advanceSteering(false);
         if (mError || cancel.load(std::memory_order_relaxed)) return;
-        MaiModelRequest finalRequest = buildRequest(mModelName, false);
+        auto built = buildRequest(mModelName, false, cancel);
+        if (!built) {
+            mError = built.error();
+            return;
+        }
+        MaiModelRequest finalRequest = std::move(built.value());
         finalRequest.tools.clear();
         MaiModelMessage instruction;
         instruction.role = MaiModelRole::System;
@@ -337,8 +343,12 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         }
         if (mError) break;
 
-        const auto calls =
-            requestCompletion(buildRequest(mModelName, retriedMissingFinalAnswer), cancel);
+        auto built = buildRequest(mModelName, retriedMissingFinalAnswer, cancel);
+        if (!built) {
+            mError = built.error();
+            break;
+        }
+        const auto calls = requestCompletion(built.value(), cancel);
         const bool producedVisibleText = mResponseHasVisibleText;
         commitStreamedParts();
 
@@ -399,8 +409,9 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
 
 // 从会话存储和当前内存中的 assistant 消息构造下一次模型请求。
 // 刚执行完的工具结果可能尚未进入旧快照，因此以内存中的最新片段覆盖它。
-MaiModelRequest MaiTurnRunner::buildRequest(const std::string& modelName,
-                                            bool requireFinalAnswer) const {
+MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelName,
+                                                       bool requireFinalAnswer,
+                                                       const std::atomic<bool>& cancel) {
     MaiModelRequest request;
     request.model = modelName;
     if (modelName == "deepseek-flash") {
@@ -422,23 +433,55 @@ MaiModelRequest MaiTurnRunner::buildRequest(const std::string& modelName,
                                      }),
                       history.end());
     }
+    // 摘要身份必须使用真实持久快照。SQLite 对旧工具非法 UTF-8 的既定写入策略可能
+    // 与 mAssistant 原字节不同；不能对指纹做归一化，也不能把内存副本冒充已落库源。
+    // 下面的模型 tail 仍以内存版本包含最新片段，检查点仅覆盖源快照已有的稳定 parts。
+    const auto sourceHistory = history;
     for (auto& message : history) {
         if (message.id == mAssistant.id) message = mAssistant;
     }
-    if (mDependencies.specialistReply.empty()) {
-        request.messages = mDependencies.context->build(history);
-    } else {
+    const auto buildHistory = [&](std::size_t firstMessage, std::size_t firstPart,
+                                  const std::string& preservedUserMessageId) {
+        auto modelHistory = history;
+        if (firstPart != 0) {
+            // 数字边界来自持久快照，内存片段的到达顺序可能不同。按已覆盖 ID 集合分区，
+            // 让稳定前缀保持原存储顺序，后面保留所有未覆盖的最新内存片段，不能靠位置误删。
+            const auto& source = sourceHistory[firstMessage];
+            auto& current = modelHistory[firstMessage];
+            std::set<std::string> covered;
+            std::vector<MaiMessagePart> ordered;
+            for (std::size_t index = 0; index < firstPart; ++index) {
+                ordered.push_back(source.parts[index]);
+                covered.insert(source.parts[index].id);
+            }
+            std::set<std::string> included = covered;
+            for (const auto& part : current.parts) {
+                if (included.insert(part.id).second) ordered.push_back(part);
+            }
+            // 即使宿主独立追加了尚未反映在内存中的持久 tail，也不能把它丢掉。
+            for (const auto& part : source.parts) {
+                if (included.insert(part.id).second) ordered.push_back(part);
+            }
+            current.parts = std::move(ordered);
+        }
+        if (mDependencies.specialistReply.empty())
+            return mDependencies.context->build(modelHistory, firstMessage, firstPart,
+                                                preservedUserMessageId);
         // 子模型回复应排在本轮工具调用之前。若每次迭代都把它追加在工具结果之后，
         // 主模型会把旧回复误认为用户刚刚发来的最新输入。
         std::vector<MaiMessage> earlier;
         std::vector<MaiMessage> continuation;
-        for (const MaiMessage& message : history) {
+        for (std::size_t index = 0; index < modelHistory.size(); ++index) {
+            if (index < firstMessage && modelHistory[index].id != preservedUserMessageId) continue;
+            MaiMessage message = modelHistory[index];
+            if (index == firstMessage && firstPart != 0)
+                message.parts.erase(message.parts.begin(), message.parts.begin() + firstPart);
             if (mSpecialistHistoryIds.count(message.id))
                 earlier.push_back(message);
             else
                 continuation.push_back(message);
         }
-        request.messages = mDependencies.context->build(earlier);
+        auto messages = mDependencies.context->build(earlier);
         MaiModelMessage instruction;
         instruction.role = MaiModelRole::System;
         instruction.content =
@@ -457,27 +500,39 @@ MaiModelRequest MaiTurnRunner::buildRequest(const std::string& modelName,
             specialist["status"] == "failed") {
             instruction.content += specialistFailureGuidance(specialist);
         }
-        request.messages.push_back(std::move(instruction));
+        messages.push_back(std::move(instruction));
         MaiModelMessage reply;
         reply.role = MaiModelRole::User;
         reply.content = mDependencies.specialistReply;
-        request.messages.push_back(std::move(reply));
+        messages.push_back(std::move(reply));
         // steer 产生新 assistant 段时，旧专业回复仍固定在本轮最初分段之前，
         // 不能越过新的用户指令重新变成“最新输入”。
         const auto current = mDependencies.context->build(continuation);
-        request.messages.insert(request.messages.end(), current.begin(), current.end());
-    }
+        messages.insert(messages.end(), current.begin(), current.end());
+        return messages;
+    };
     request.workingDirectory = mWorkingDirectory;
-    if (requireFinalAnswer) {
-        MaiModelMessage instruction;
-        instruction.role = MaiModelRole::System;
-        instruction.content = kFinalAnswerHint;
-        request.messages.push_back(std::move(instruction));
-    }
+    const auto buildContext = [&](std::size_t firstMessage, std::size_t firstPart,
+                                  const std::string& preservedUserMessageId) {
+        auto messages = buildHistory(firstMessage, firstPart, preservedUserMessageId);
+        if (requireFinalAnswer) {
+            MaiModelMessage instruction;
+            instruction.role = MaiModelRole::System;
+            instruction.content = kFinalAnswerHint;
+            messages.push_back(std::move(instruction));
+        }
+        return messages;
+    };
 
     if (mDependencies.tools && !mDependencies.tools->isEmpty())
         request.tools = mDependencies.tools->specs(mModelName);
-    return request;
+    MaiContextCompactor::Options options;
+    options.estimateMultiplier = mContextEstimateMultiplier;
+    const auto prepared = MaiContextCompactor(options).prepare(
+        *mDependencies.store, *mDependencies.model, *mDependencies.context, mSessionId,
+        sourceHistory, std::move(request), cancel, buildContext);
+    if (!prepared) return prepared.error();
+    return prepared.value().request;
 }
 
 std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRequest& request,
@@ -497,6 +552,13 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     std::map<int, std::string> textItemParts;
 
     MaiStreamSink sink;
+    const auto inputEstimate = mDependencies.model->estimateInputTokens(request);
+    sink.onUsage = [&](const MaiModelUsage& usage) {
+        if (!inputEstimate.exact && inputEstimate.tokens != 0 && usage.inputTokens != 0)
+            mContextEstimateMultiplier =
+                std::max(mContextEstimateMultiplier,
+                         static_cast<double>(usage.inputTokens) / inputEstimate.tokens);
+    };
     const auto selectTextItem = [&](const MaiModelTextItem& item) {
         auto& partId = textItemParts[item.index];
         if (partId.empty()) partId = MaiIdGenerator::newPartId();

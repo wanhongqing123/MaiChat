@@ -203,6 +203,8 @@ public:
             "(SELECT id FROM messages WHERE session_id = ?1)",
             id);
         executeStatementWithTextArgument("DELETE FROM messages WHERE session_id = ?1", id);
+        executeStatementWithTextArgument("DELETE FROM context_checkpoints WHERE session_id = ?1",
+                                         id);
         executeStatementWithTextArgument("DELETE FROM specialist_tasks WHERE owner_session_id = ?1",
                                          id);
         executeStatementWithTextArgument("DELETE FROM sessions WHERE id = ?1", id);
@@ -231,6 +233,8 @@ public:
             "(SELECT id FROM messages WHERE session_id = ?1)",
             sessionId);
         executeStatementWithTextArgument("DELETE FROM messages WHERE session_id = ?1", sessionId);
+        executeStatementWithTextArgument("DELETE FROM context_checkpoints WHERE session_id = ?1",
+                                         sessionId);
         executeStatementWithTextArgument("DELETE FROM specialist_tasks WHERE owner_session_id = ?1",
                                          sessionId);
         executeTransactionStatement("COMMIT");
@@ -566,15 +570,107 @@ public:
 
     std::vector<MaiMessage> listMessages(const std::string& sessionId) const override {
         std::lock_guard<std::mutex> lock(mMutex);
+        return listMessagesLocked(sessionId, std::numeric_limits<std::size_t>::max());
+    }
+
+    bool getContextCheckpoint(const std::string& sessionId,
+                              MaiContextCheckpoint& out) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return readContextCheckpointLocked(sessionId, out);
+    }
+
+    MaiError advanceContextCheckpoint(const std::string& sessionId, std::uint64_t expectedRevision,
+                                      const MaiContextCheckpoint& checkpoint) override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!executeTransactionStatement("BEGIN IMMEDIATE")) return mLastWriteError;
+        const auto reject = [&](MaiErrorCode code, const char* message) {
+            executeTransactionStatement("ROLLBACK");
+            return MaiError::make(code, message);
+        };
+        MaiContextCheckpoint previous;
+        const std::uint64_t revision =
+            readContextCheckpointLocked(sessionId, previous) ? previous.revision : 0;
+        if (revision != expectedRevision || checkpoint.revision == 0 ||
+            checkpoint.revision - 1 != expectedRevision ||
+            checkpoint.revision >
+                static_cast<std::uint64_t>(std::numeric_limits<sqlite3_int64>::max()))
+            return reject(MaiErrorCode::Busy, "Context checkpoint changed during compaction.");
+        // 写锁覆盖校验与提交；允许在源边界后追加新消息，但不接受旧片段的内容变化。
+        if (!checkpoint.partialMessageId.empty() &&
+            checkpoint.sourceMessageCount == std::numeric_limits<std::size_t>::max())
+            return reject(MaiErrorCode::InvalidInput, "Invalid partial context boundary.");
+        const auto source =
+            listMessagesLocked(sessionId, checkpoint.sourceMessageCount +
+                                              (checkpoint.partialMessageId.empty() ? 0 : 1));
+        if (!maiContextCheckpointMatches(checkpoint, sessionId, source))
+            return reject(MaiErrorCode::Busy,
+                          "Context source changed while preparing its summary.");
+        sqlite3_stmt* statement = prepareLocked(
+            "INSERT INTO context_checkpoints(session_id,revision,source_count,first_message_id,"
+            "through_message_id,source_fingerprint,model,summary,reference_text,created,"
+            "partial_message_id,partial_part_count,through_part_id,partial_source_fingerprint,"
+            "preserved_user_message_id) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) "
+            "ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,"
+            "source_count=excluded.source_count,first_message_id=excluded.first_message_id,"
+            "through_message_id=excluded.through_message_id,source_fingerprint=excluded.source_"
+            "fingerprint,"
+            "model=excluded.model,summary=excluded.summary,reference_text=excluded.reference_text,"
+            "created=excluded.created,partial_message_id=excluded.partial_message_id,"
+            "partial_part_count=excluded.partial_part_count,through_part_id=excluded.through_part_"
+            "id,"
+            "partial_source_fingerprint=excluded.partial_source_fingerprint,"
+            "preserved_user_message_id=excluded.preserved_user_message_id");
+        if (!statement) {
+            executeTransactionStatement("ROLLBACK");
+            return mLastWriteError;
+        }
+        bool saved = false;
+        {
+            Reset guard(statement);
+            bindText(statement, 1, sessionId);
+            sqlite3_bind_int64(statement, 2, static_cast<sqlite3_int64>(checkpoint.revision));
+            sqlite3_bind_int64(statement, 3,
+                               static_cast<sqlite3_int64>(checkpoint.sourceMessageCount));
+            bindText(statement, 4, checkpoint.firstMessageId);
+            bindText(statement, 5, checkpoint.throughMessageId);
+            bindText(statement, 6, checkpoint.sourceFingerprint);
+            bindText(statement, 7, checkpoint.model);
+            bindText(statement, 8, checkpoint.summary);
+            bindText(statement, 9, checkpoint.references);
+            sqlite3_bind_int64(statement, 10, checkpoint.created);
+            bindText(statement, 11, checkpoint.partialMessageId);
+            sqlite3_bind_int64(statement, 12,
+                               static_cast<sqlite3_int64>(checkpoint.partialPartCount));
+            bindText(statement, 13, checkpoint.throughPartId);
+            bindText(statement, 14, checkpoint.partialSourceFingerprint);
+            bindText(statement, 15, checkpoint.preservedUserMessageId);
+            saved = sqlite3_step(statement) == SQLITE_DONE;
+        }
+        if (!saved) return reject(MaiErrorCode::Internal, "Cannot save context checkpoint.");
+        if (!executeTransactionStatement("COMMIT")) {
+            executeTransactionStatement("ROLLBACK");
+            return mLastWriteError;
+        }
+        return {};
+    }
+
+private:
+    std::vector<MaiMessage> listMessagesLocked(const std::string& sessionId,
+                                               std::size_t limit) const {
         std::vector<MaiMessage> out;
 
         sqlite3_stmt* statement = prepareLocked(
             "SELECT id, role, created, completed, input_request_id, pending_input FROM messages "
-            "WHERE session_id = ?1 ORDER BY id");
+            "WHERE session_id = ?1 ORDER BY id LIMIT ?2");
         if (!statement) return out;
         {
             Reset guard(statement);
             bindText(statement, 1, sessionId);
+            sqlite3_bind_int64(
+                statement, 2,
+                static_cast<sqlite3_int64>(std::min(
+                    limit, static_cast<std::size_t>(std::numeric_limits<sqlite3_int64>::max()))));
             while (sqlite3_step(statement) == SQLITE_ROW) {
                 MaiMessage message;
                 message.id = textColumn(statement, 0);
@@ -590,6 +686,40 @@ public:
         return out;
     }
 
+    bool readContextCheckpointLocked(const std::string& sessionId,
+                                     MaiContextCheckpoint& out) const {
+        sqlite3_stmt* statement = prepareLocked(
+            "SELECT revision,source_count,first_message_id,through_message_id,source_fingerprint,"
+            "model,summary,reference_text,created,partial_message_id,partial_part_count,through_"
+            "part_id,"
+            "partial_source_fingerprint,preserved_user_message_id FROM context_checkpoints "
+            "WHERE session_id=?1 AND EXISTS(SELECT 1 FROM sessions WHERE id=?1)");
+        if (!statement) return false;
+        Reset guard(statement);
+        bindText(statement, 1, sessionId);
+        if (sqlite3_step(statement) != SQLITE_ROW) return false;
+        MaiContextCheckpoint checkpoint;
+        checkpoint.sessionId = sessionId;
+        checkpoint.revision = static_cast<std::uint64_t>(sqlite3_column_int64(statement, 0));
+        checkpoint.sourceMessageCount =
+            static_cast<std::size_t>(sqlite3_column_int64(statement, 1));
+        checkpoint.firstMessageId = textColumn(statement, 2);
+        checkpoint.throughMessageId = textColumn(statement, 3);
+        checkpoint.sourceFingerprint = textColumn(statement, 4);
+        checkpoint.model = textColumn(statement, 5);
+        checkpoint.summary = textColumn(statement, 6);
+        checkpoint.references = textColumn(statement, 7);
+        checkpoint.created = sqlite3_column_int64(statement, 8);
+        checkpoint.partialMessageId = textColumn(statement, 9);
+        checkpoint.partialPartCount = static_cast<std::size_t>(sqlite3_column_int64(statement, 10));
+        checkpoint.throughPartId = textColumn(statement, 11);
+        checkpoint.partialSourceFingerprint = textColumn(statement, 12);
+        checkpoint.preservedUserMessageId = textColumn(statement, 13);
+        out = std::move(checkpoint);
+        return true;
+    }
+
+public:
     bool getMessage(const std::string& sessionId, const std::string& messageId,
                     MaiMessage& out) const override {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -1283,6 +1413,65 @@ MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
             sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
             sqlite3_close(database);
             return {MaiErrorCode::Internal, "cannot migrate schema to v7: " + what};
+        }
+        sqlite3_free(migrationError);
+    }
+    if (readUserVersion(database) < 8) {
+        // 独立表保留原消息；IF NOT EXISTS 兼容同时打开同一旧库的另一连接。
+        char* migrationError = nullptr;
+        const char* migration =
+            "BEGIN IMMEDIATE;"
+            "CREATE TABLE IF NOT EXISTS context_checkpoints("
+            "session_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,source_count INTEGER NOT NULL,"
+            "first_message_id TEXT NOT NULL,through_message_id TEXT NOT NULL,"
+            "source_fingerprint TEXT NOT NULL,model TEXT NOT NULL,summary TEXT NOT NULL,"
+            "reference_text TEXT NOT NULL,created INTEGER NOT NULL);"
+            "PRAGMA user_version=8;COMMIT;";
+        if (sqlite3_exec(database, migration, nullptr, nullptr, &migrationError) != SQLITE_OK) {
+            const std::string what = migrationError ? migrationError : sqlite3_errmsg(database);
+            sqlite3_free(migrationError);
+            sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
+            sqlite3_close(database);
+            return {MaiErrorCode::Internal, "cannot migrate schema to v8: " + what};
+        }
+        sqlite3_free(migrationError);
+    }
+    if (readUserVersion(database) < 9) {
+        // 写锁内检查列，兼容并发打开以及保留新列的旧 user_version；只加字段，不改原史。
+        char* migrationError = nullptr;
+        bool ok = sqlite3_exec(database, "BEGIN IMMEDIATE", nullptr, nullptr, &migrationError) ==
+                  SQLITE_OK;
+        std::vector<std::string> columns;
+        sqlite3_stmt* schema = nullptr;
+        if (ok)
+            ok = sqlite3_prepare_v2(database, "PRAGMA table_info(context_checkpoints)", -1, &schema,
+                                    nullptr) == SQLITE_OK;
+        if (ok) {
+            int status = SQLITE_ROW;
+            while ((status = sqlite3_step(schema)) == SQLITE_ROW)
+                columns.push_back(textColumn(schema, 1));
+            ok = status == SQLITE_DONE;
+        }
+        sqlite3_finalize(schema);
+        for (const auto& column : {"partial_message_id", "partial_part_count", "through_part_id",
+                                   "partial_source_fingerprint", "preserved_user_message_id"}) {
+            if (!ok || std::find(columns.begin(), columns.end(), column) != columns.end()) continue;
+            const std::string sql =
+                "ALTER TABLE context_checkpoints ADD COLUMN " + std::string(column) +
+                (std::string(column) == "partial_part_count" ? " INTEGER NOT NULL DEFAULT 0"
+                                                             : " TEXT NOT NULL DEFAULT ''");
+            ok =
+                sqlite3_exec(database, sql.c_str(), nullptr, nullptr, &migrationError) == SQLITE_OK;
+        }
+        if (ok)
+            ok = sqlite3_exec(database, "PRAGMA user_version=9;COMMIT;", nullptr, nullptr,
+                              &migrationError) == SQLITE_OK;
+        if (!ok) {
+            const std::string what = migrationError ? migrationError : sqlite3_errmsg(database);
+            sqlite3_free(migrationError);
+            sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
+            sqlite3_close(database);
+            return {MaiErrorCode::Internal, "cannot migrate schema to v9: " + what};
         }
         sqlite3_free(migrationError);
     }

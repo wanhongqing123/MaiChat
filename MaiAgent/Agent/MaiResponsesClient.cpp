@@ -242,6 +242,7 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
     }
 
     Json body{{"model", request.model}, {"input", std::move(input)}, {"stream", true}};
+    if (request.maxOutputTokens != 0) body["max_output_tokens"] = request.maxOutputTokens;
     if (request.model == "deepseek-flash" &&
         (request.reasoningEffort == "low" || request.reasoningEffort == "high" ||
          request.reasoningEffort == "max"))
@@ -536,6 +537,13 @@ void handleEvent(StreamContext& context, const Json& event) {
     if (type == "response.completed" || type == "response.incomplete" ||
         type == "response.failed") {
         const Json response = event.value("response", Json::object());
+        const Json usage = response.value("usage", Json{});
+        if (usage.is_object() && context.sink->onUsage) {
+            const auto input = usage.value("input_tokens", Json{});
+            const auto output = usage.value("output_tokens", Json{});
+            if (input.is_number_unsigned() && output.is_number_unsigned())
+                context.sink->onUsage({input.get<std::size_t>(), output.get<std::size_t>()});
+        }
         emitFullOutput(context, response);
         // 有些兼容服务只发送正文增量而不发送 item.done 或终止 output。
         // 仍须关闭已开始的可见发言，让调用方持久化尾部。
@@ -652,6 +660,11 @@ public:
 
     MaiWireApi wireApi() const override {
         return MaiWireApi::Responses;
+    }
+
+    MaiModelContextLimits contextLimits(const std::string& model) const override {
+        return mConfig.contextLimits ? mConfig.contextLimits(model)
+                                     : maiOfficialModelContextLimits(mConfig.baseUrl, model);
     }
 
     // 建立 Responses 流并逐事件更新上层，保留取消与传输失败的明确结果。

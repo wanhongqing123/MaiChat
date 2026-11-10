@@ -15,7 +15,8 @@ enum class MaiSessionCreateMode {
 std::unique_ptr<MaiTool> makeMaiCreateSessionTool(MaiSessionCreateMode mode,
                                                   std::string defaultDirectory = {});
 
-// 注册会话列表、新建、删除和当前根会话改名工具；改名只接收 title，不接收目标 ID。
+// 注册会话列表、当前会话原史回查、新建、删除和当前根会话改名工具。
+// session_history 不接收目标会话 ID，复用 MaiAgent::readHistory；改名只接收 title。
 // 它复用普通 MaiUpdateSession 的持久化/事件，只要求普通写审批，不额外逐次审批。
 // 仅在宿主按会话路径执行全部文件能力时，才注册
 // 工作目录切换工具。调用端仍可直接通过 MaiAgent::submit 执行相同的会话操作。

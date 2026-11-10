@@ -99,7 +99,9 @@ private:
     bool toolNeedsApproval(const MaiToolInvocation& call) const;
 
     // 组装这一次要发给模型的请求。
-    MaiModelRequest buildRequest(const std::string& modelName, bool requireFinalAnswer) const;
+    // 可能同步增量总结旧轮次；失败/取消不发送缺少历史的请求，也不推进检查点。
+    MaiResult<MaiModelRequest> buildRequest(const std::string& modelName, bool requireFinalAnswer,
+                                            const std::atomic<bool>& cancel);
     bool advanceSteering(bool closeIfEmpty);
 
     // 流式 part 刚冒头时：先在消息里占个位、落库，再广播。
@@ -138,6 +140,8 @@ private:
     std::size_t mLastPersistedStreamBytes = 0;
     // item 切换会更换当前正文缓冲，整次响应是否有可见正文须独立记录。
     bool mResponseHasVisibleText = false;
+    // 真实 usage 高于启发式计数时，保守校正本轮后续请求；它不是供应商实际用量。
+    double mContextEstimateMultiplier = 1.0;
 
     MaiError mError;
     bool mHasVisibleText = false;

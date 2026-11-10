@@ -25,6 +25,7 @@
 #include "MaiSqliteStore.h"
 #include "MaiFakeModelClient.h"
 #include "MaiTool.h"
+#include "MaiSessionTools.h"
 
 static int failures = 0;
 #define CHECK(cond)                                                     \
@@ -877,9 +878,423 @@ void test_automatic_video_reply_skips_an_existing_media_delivery() {
     MaiFileSystem::removeFile(path);
 }
 
+// 通过真实 Agent/TurnRunner 自动触发摘要，再让假模型调用当前会话原史工具找回旧 URL。
+// 不调用供应商，也不把“URL 仍在 DB”当成已完成回查。
+void test_compacted_turn_reads_original_link_without_user_resend() {
+    std::printf("   compacted turn retrieves original source URL through session_history\n");
+    const std::string originalUrl =
+        "https://original.example.net/source/archive-17.zip?revision=17";
+    class RecallModel final : public MaiModelClient {
+    public:
+        std::string expectedUrl;
+        std::string originalMessageId;
+        int summaryCalls = 0;
+        int mainCalls = 0;
+        bool retrievedExactSource = false;
+        MaiModelContextLimits contextLimits(const std::string&) const override {
+            return {8192, 2048};
+        }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::Responses;
+        }
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                        const std::atomic<bool>&) override {
+            if (request.baseInstructions.find("Summarize earlier conversation") !=
+                std::string::npos) {
+                ++summaryCalls;
+                if (sink.onText)
+                    sink.onText(
+                        R"({"goals":["Continue from the saved source"],"constraints":["Preserve original files"],"decisions":[],"progress":["Source inspected; work unfinished"],"open_questions":[],"source_notes":["Read original history for exact evidence"]})");
+                return {};
+            }
+            ++mainCalls;
+            CHECK(request.maxOutputTokens == 0);
+            if (mainCalls == 1) {
+                if (sink.onToolCall)
+                    sink.onToolCall(
+                        {"history_original", "session_history",
+                         R"({"search":"original.example.net/source/","max_bytes":4096,"max_messages":2})"});
+            } else {
+                for (const auto& message : request.messages) {
+                    if (message.role != MaiModelRole::ToolResult ||
+                        message.toolCallId != "history_original")
+                        continue;
+                    const auto data = nlohmann::json::parse(message.content, nullptr, false);
+                    if (!data.is_object() || !data.contains("excerpts")) continue;
+                    for (const auto& item : data["excerpts"]) {
+                        if (item.value("message_id", std::string{}) == originalMessageId &&
+                            item.value("text", std::string{}).find(expectedUrl) !=
+                                std::string::npos)
+                            retrievedExactSource = true;
+                    }
+                }
+                if (sink.onText)
+                    sink.onText(retrievedExactSource ? "Recovered original source: " + expectedUrl
+                                                     : "Original source retrieval failed.");
+            }
+            return {};
+        }
+    };
+    auto store = makeMaiMemoryStore();
+    MaiSession session;
+    session.id = MaiIdGenerator::newSessionId();
+    session.title = "Original source continuity";
+    session.model = "fixture-small-context";
+    store->putSession(session);
+    std::string originalId;
+    for (int index = 0; index < 5; ++index) {
+        MaiMessage user;
+        user.id = MaiIdGenerator::newMessageId();
+        user.role = MaiRole::User;
+        user.created = 1;
+        user.completed = 2;
+        std::string text =
+            std::string(4000, 'a') + "\n" +
+            (index == 0 ? originalUrl : std::string("Preserve the existing source.")) + "\n" +
+            std::string(4000, 'b');
+        user.parts.push_back({MaiIdGenerator::newPartId(), MaiTextPart{std::move(text)}, 1});
+        store->putMessage(session.id, user);
+        if (index == 0) originalId = user.id;
+        MaiMessage assistant;
+        assistant.id = MaiIdGenerator::newMessageId();
+        assistant.role = MaiRole::Assistant;
+        assistant.created = 2;
+        assistant.completed = 3;
+        assistant.parts.push_back(
+            {MaiIdGenerator::newPartId(), MaiTextPart{"The work remains unfinished."}, 2});
+        store->putMessage(session.id, assistant);
+    }
+    auto* observedStore = store.get();
+    auto model = std::make_unique<RecallModel>();
+    model->expectedUrl = originalUrl;
+    model->originalMessageId = originalId;
+    auto* observedModel = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    registerMaiSessionTools(*tools);
+    MaiAgent agent(std::move(store), std::move(model), std::move(tools));
+    CHECK(agent.submit(MaiSendPrompt{session.id, "Continue using my earlier original link."}));
+    agent.waitIdle();
+    CHECK(observedModel->summaryCalls > 0);
+    CHECK(observedModel->mainCalls == 2);
+    CHECK(observedModel->retrievedExactSource);
+    MaiContextCheckpoint checkpoint;
+    CHECK(observedStore->getContextCheckpoint(session.id, checkpoint));
+    const auto history = agent.listMessages(session.id);
+    CHECK(history.size() == 12);
+    CHECK(history.front().id == originalId);
+    CHECK(history.front().text().find(originalUrl) != std::string::npos);
+    CHECK(history.back().text().find(originalUrl) != std::string::npos);
+}
+
+void test_active_turn_compaction_uses_sqlite_stored_bytes() {
+    std::printf(
+        "   v7 active turn / 20 bad-byte tools / SQLite snapshot / continued main request\n");
+    const auto path = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8("mai-active-bytes-" + MaiIdGenerator::newSessionId() + ".sqlite"));
+    auto opened = makeMaiSqliteStore(path.toUtf8());
+    CHECK(opened);
+    if (!opened) return;
+    class RawTool final : public MaiTool {
+    public:
+        std::string name() const override {
+            return "raw_fixture";
+        }
+        std::string description() const override {
+            return "Return old raw fixture bytes.";
+        }
+        std::string parametersSchema() const override {
+            return R"({"type":"object"})";
+        }
+        bool requiresWorkingDirectory(const std::string&) const override {
+            return false;
+        }
+        MaiToolResult execute(const std::string& input, const MaiToolContext&) override {
+            return MaiToolResult::success(input + std::string(1, static_cast<char>(0xff)) +
+                                          std::string(2400, 'r'));
+        }
+    };
+    class ActiveModel final : public MaiModelClient {
+    public:
+        MaiSessionStore* store = nullptr;
+        std::string sessionId;
+        std::vector<MaiMessage> storedBeforeSummary;
+        int summaries = 0, mainRequests = 0;
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::Responses;
+        }
+        MaiModelContextLimits contextLimits(const std::string&) const override {
+            return {8192, 1024};
+        }
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                        const std::atomic<bool>&) override {
+            if (request.baseInstructions.find("Summarize earlier conversation") !=
+                std::string::npos) {
+                ++summaries;
+                if (storedBeforeSummary.empty())
+                    storedBeforeSummary = store->listMessages(sessionId);
+                if (sink.onText)
+                    sink.onText(
+                        R"({"goals":["Continue this turn"],"constraints":[],"decisions":[],"progress":["Read saved tool results"],"open_questions":[],"source_notes":[]})");
+            } else if (++mainRequests == 1) {
+                for (int index = 0; index < 20; ++index)
+                    if (sink.onToolCall)
+                        sink.onToolCall({"raw_call_" + std::to_string(index), "raw_fixture", "{}"});
+            } else if (sink.onText)
+                sink.onText("The active tool loop continued after compaction.");
+            return {};
+        }
+    };
+    auto store = std::move(opened.value());
+    MaiSession session;
+    session.id = MaiIdGenerator::newSessionId();
+    session.title = "Active raw byte fixture";
+    store->putSession(session);
+    auto* observedStore = store.get();
+    auto model = std::make_unique<ActiveModel>();
+    model->store = observedStore;
+    model->sessionId = session.id;
+    auto* observedModel = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(std::make_unique<RawTool>());
+    {
+        MaiAgent agent(std::move(store), std::move(model), std::move(tools));
+        CHECK(agent.submit(
+            MaiSendPrompt{session.id, "Preserve this instruction and complete all tool work."}));
+        agent.waitIdle();
+        CHECK(observedModel->summaries > 0);
+        CHECK(observedModel->mainRequests == 2);
+        MaiContextCheckpoint checkpoint;
+        CHECK(observedStore->getContextCheckpoint(session.id, checkpoint));
+        const auto after = agent.listMessages(session.id);
+        CHECK(after.back().text().find("continued after compaction") != std::string::npos);
+        CHECK(maiContextCheckpointMatches(checkpoint, session.id, after));
+        if (!observedModel->storedBeforeSummary.empty() && !after.empty()) {
+            const auto& before = observedModel->storedBeforeSummary.back();
+            const auto& final = after.back();
+            CHECK(before.parts.size() == 20);
+            for (std::size_t index = 0; index < before.parts.size(); ++index) {
+                const auto* oldTool = std::get_if<MaiToolPart>(&before.parts[index].body);
+                const auto* newTool = std::get_if<MaiToolPart>(&final.parts[index].body);
+                CHECK(oldTool && newTool);
+                if (oldTool && newTool) {
+                    CHECK(oldTool->output == newTool->output);
+                    CHECK(oldTool->output.find(static_cast<char>(0xff)) == std::string::npos);
+                    CHECK(oldTool->output.find("\xef\xbf\xbd") != std::string::npos);
+                }
+            }
+            CHECK(maiContextPartialSourceFingerprint(checkpoint,
+                                                     observedModel->storedBeforeSummary) ==
+                  checkpoint.partialSourceFingerprint);
+        }
+    }
+    MaiFileSystem::removeFile(path);
+    MaiFileSystem::removeFile(MaiFilePath::fromUtf8(path.toUtf8() + "-wal"));
+    MaiFileSystem::removeFile(MaiFilePath::fromUtf8(path.toUtf8() + "-shm"));
+}
+
+void test_unfenced_image_groups_follow_execute_tools_and_continue() {
+    std::printf(
+        "   v7c actual executeTools: 20 contiguous results / group-only original pixels / next "
+        "large batch\n");
+    constexpr char png[] =
+        "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52"
+        "\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        "\x00\x00\x00\x0d\x49\x44\x41\x54\x78\x9c\x63\x30\x6d\x3b\xfc\x1f"
+        "\x00\x04\xf0\x02\x7e\xf1\xe8\x4f\x8a\x00\x00\x00\x00\x49\x45\x4e\x44"
+        "\xae\x42\x60\x82";
+    const std::string pixels(png, sizeof(png) - 1);
+    for (bool multiImage : {false, true}) {
+        const auto folder = MaiFileSystem::temporaryDirectory().append(
+            MaiFilePath::fromUtf8("mai-unfenced-execute-" + MaiIdGenerator::newSessionId()));
+        CHECK(!MaiFileSystem::createDirectories(folder));
+        auto opened =
+            makeMaiSqliteStore(folder.append(MaiFilePath::fromUtf8("state.sqlite")).toUtf8());
+        CHECK(opened);
+        if (!opened) continue;
+        class BatchTool final : public MaiTool {
+        public:
+            std::string toolName;
+            std::string folder;
+            std::string pixels;
+            bool multiImage = false;
+            std::string name() const override {
+                return toolName;
+            }
+            std::string description() const override {
+                return "Read deterministic fixture results or return fixture pixels.";
+            }
+            std::string parametersSchema() const override {
+                return R"({"type":"object","properties":{"index":{"type":"integer"},"phase":{"type":"integer"}}})";
+            }
+            bool requiresWorkingDirectory(const std::string&) const override {
+                return false;
+            }
+            MaiToolResult execute(const std::string& raw, const MaiToolContext&) override {
+                const auto input = nlohmann::json::parse(raw);
+                const int index = input["index"], phase = input["phase"];
+                const bool screenshot = toolName == "screenshot_fixture";
+                const std::string output =
+                    screenshot ? "Fixture image result." : std::string(12000, 'r');
+                if (!screenshot && !(multiImage && index == 5))
+                    return MaiToolResult::success(output);
+                const auto path = MaiFilePath::fromUtf8(folder).append(MaiFilePath::fromUtf8(
+                    "phase-" + std::to_string(phase) + "-tool-" + std::to_string(index) + ".png"));
+                const auto error = MaiFileSystem::writeFile(path, pixels);
+                if (error) return MaiToolResult::failure(error.code(), error.message());
+                return MaiToolResult::successWithImages(output, {{path.toUtf8(), "image/png"}});
+            }
+        };
+        class BatchModel final : public MaiModelClient {
+        public:
+            MaiSessionStore* store = nullptr;
+            std::string sessionId, instruction, pixels;
+            int mainRequests = 0, summaryRequests = 0;
+            int imageCount = 1;
+            std::vector<MaiMessage> initialSource;
+            std::set<std::string> initialToolParts;
+            MaiContextCheckpoint firstCheckpoint;
+            MaiWireApi wireApi() const override {
+                return MaiWireApi::Responses;
+            }
+            MaiModelContextLimits contextLimits(const std::string&) const override {
+                return {32768, 4096};
+            }
+            MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                            const std::atomic<bool>&) override {
+                if (request.baseInstructions.find("Summarize earlier conversation") !=
+                    std::string::npos) {
+                    ++summaryRequests;
+                    if (initialSource.empty()) {
+                        initialSource = store->listMessages(sessionId);
+                        CHECK(initialSource.back().parts.size() ==
+                              static_cast<std::size_t>(20 + imageCount));
+                        for (std::size_t index = 0; index < 20; ++index) {
+                            CHECK(std::holds_alternative<MaiToolPart>(
+                                initialSource.back().parts[index].body));
+                            initialToolParts.insert(initialSource.back().parts[index].id);
+                        }
+                    }
+                    MaiContextCheckpoint prior;
+                    if (store->getContextCheckpoint(sessionId, prior)) {
+                        const auto data = nlohmann::json::parse(request.messages[0].content);
+                        for (const auto& fragment : data["source_fragments"])
+                            CHECK(initialToolParts.count(fragment["part_id"].get<std::string>()) ==
+                                  0);
+                    }
+                    if (sink.onText)
+                        sink.onText(
+                            R"({"goals":["Keep the original request"],"constraints":[],"decisions":[],"progress":["The completed group returned stored results and image observations"],"open_questions":[],"source_notes":[]})");
+                    return {};
+                }
+                ++mainRequests;
+                CHECK(request.maxOutputTokens == 0);
+                if (mainRequests > 1) {
+                    bool keptUser = false;
+                    int observations = 0;
+                    for (const auto& message : request.messages) {
+                        if (message.role == MaiModelRole::User && message.content == instruction)
+                            keptUser = true;
+                        for (const auto& image : message.images) {
+                            ++observations;
+                            CHECK(image.path.find("phase-" + std::to_string(mainRequests - 2) +
+                                                  "-") != std::string::npos);
+                            std::string actual;
+                            CHECK(!MaiFileSystem::readFile(MaiFilePath::fromUtf8(image.path),
+                                                           actual, 1024));
+                            CHECK(actual == pixels);
+                            const auto data = nlohmann::json::parse(message.content);
+                            CHECK(data["ownership"] == "tool_group_only");
+                            CHECK(data["source_message_id"] == initialSource.back().id);
+                            CHECK(data["tool_count"] == 20);
+                            CHECK(data["tools"].size() == 20);
+                            CHECK(data["archived_tool_count"] == 20);
+                            for (const auto& tool : data["tools"]) CHECK(tool["archived"] == true);
+                            CHECK(message.content.find("preceding tool") == std::string::npos);
+                        }
+                    }
+                    CHECK(keptUser && observations == imageCount);
+                }
+                if (mainRequests == 2)
+                    CHECK(store->getContextCheckpoint(sessionId, firstCheckpoint));
+                if (mainRequests <= 2) {
+                    for (int index = 0; index < 20; ++index)
+                        if (sink.onToolCall)
+                            sink.onToolCall(
+                                {"phase_" + std::to_string(mainRequests - 1) + "_" +
+                                     std::to_string(index),
+                                 index == 19 ? "screenshot_fixture" : "read_fixture",
+                                 nlohmann::json{{"index", index}, {"phase", mainRequests - 1}}
+                                     .dump()});
+                } else if (sink.onText)
+                    sink.onText("Completed both image groups after context compaction.");
+                return {};
+            }
+        };
+        auto store = std::move(opened.value());
+        MaiSession session;
+        session.id = MaiIdGenerator::newSessionId();
+        session.title = "Unfenced batch fixture";
+        session.directory = folder.toUtf8();
+        store->putSession(session);
+        auto* observedStore = store.get();
+        auto model = std::make_unique<BatchModel>();
+        model->store = observedStore;
+        model->sessionId = session.id;
+        model->instruction =
+            "Keep my full original instruction and continue both large tool groups.";
+        model->pixels = pixels;
+        model->imageCount = multiImage ? 2 : 1;
+        auto* observedModel = model.get();
+        auto tools = std::make_unique<MaiToolRegistry>();
+        for (const auto& name : {"read_fixture", "screenshot_fixture"}) {
+            auto tool = std::make_unique<BatchTool>();
+            tool->toolName = name;
+            tool->folder = folder.toUtf8();
+            tool->pixels = pixels;
+            tool->multiImage = multiImage;
+            tools->add(std::move(tool));
+        }
+        {
+            MaiAgent agent(std::move(store), std::move(model), std::move(tools));
+            CHECK(agent.submit(MaiSendPrompt{session.id, observedModel->instruction}));
+            agent.waitIdle();
+            CHECK(observedModel->mainRequests == 3 && observedModel->summaryRequests > 0);
+            std::printf("     images=%d main_requests=%d summary_requests=%d\n", multiImage ? 2 : 1,
+                        observedModel->mainRequests, observedModel->summaryRequests);
+            MaiContextCheckpoint checkpoint;
+            CHECK(observedStore->getContextCheckpoint(session.id, checkpoint));
+            CHECK(checkpoint.revision == observedModel->firstCheckpoint.revision + 1);
+            const auto after = agent.listMessages(session.id);
+            CHECK(after.back().text().find("Completed both image groups") != std::string::npos);
+            CHECK(maiContextCheckpointMatches(checkpoint, session.id, after));
+            if (!observedModel->initialSource.empty())
+                for (std::size_t index = 0; index < 20; ++index) {
+                    const auto& original = std::get<MaiToolPart>(
+                        observedModel->initialSource.back().parts[index].body);
+                    const auto& persisted = std::get<MaiToolPart>(after.back().parts[index].body);
+                    CHECK(original.callId == persisted.callId &&
+                          original.input == persisted.input && original.output == persisted.output);
+                }
+        }
+        MaiFileSystem::removeRecursively(folder);
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--unfenced-images") {
+        test_unfenced_image_groups_follow_execute_tools_and_continue();
+        std::printf("unfenced executeTools checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    test_unfenced_image_groups_follow_execute_tools_and_continue();
+    if (argc == 2 && std::string(argv[1]) == "--active-turn-bytes") {
+        test_active_turn_compaction_uses_sqlite_stored_bytes();
+        return failures == 0 ? 0 : 1;
+    }
+    test_active_turn_compaction_uses_sqlite_stored_bytes();
+    test_compacted_turn_reads_original_link_without_user_resend();
     test_full_turn();
     test_prompt_images_reach_the_current_user_message();
     test_request_is_assembled_correctly();

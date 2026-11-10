@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -125,7 +126,8 @@ struct MaiModelRequest {
     // 相对图片路径从这个目录解析，且不能越过它。桌面端由用户明确选择的图片可以传绝对路径，
     // 因而允许位于工作区之外；移动端应先复制进自己的稳定沙盒目录，再传相对路径。
     std::string workingDirectory;
-    // 完整历史，按时间顺序。**每次都要带全**——协议是无状态的，少带了模型就没有上下文。
+    // 按时间顺序的完整有效上下文：原文，或已成功持久化的历史摘要与尚未覆盖的原文。
+    // 协议无状态，每次都必须带上这份上下文；不能只传新消息，也不能无摘要地丢弃旧消息。
     std::vector<MaiModelMessage> messages;
     // 这一轮允许模型用的工具。空表示纯对话模式，
     // 线上会**整个省掉 tools 字段**而不是发一个空数组（有的服务端见到空数组会报错）。
@@ -133,7 +135,43 @@ struct MaiModelRequest {
     // < 0 表示不传这个字段，用服务端默认。不用 0 当哨兵：
     // 0 是一个合法且有意义的取值（完全确定性输出）。
     double temperature = -1.0;
+    // 0 使用供应商默认值；非零是本次生成的 token 上限（包含供应商计入的推理）。
+    // 压缩器以同一个值预留输出空间，wire 层负责映射到真实协议字段。
+    std::size_t maxOutputTokens = 0;
 };
+
+// 模型目录的真实容量，不是历史字节上限。0 表示未知，不能擅自套用其他模型的窗口。
+// 宿主/配置提供器须按实际 endpoint 与选中模型查询；本地实现使用已配置的 contextSize。
+struct MaiModelContextLimits {
+    std::size_t contextWindowTokens = 0;
+    std::size_t maxOutputTokens = 0;
+    // 仅用于输入预算的可选生成预留，不写入 wire、不会限制实际生成长度。
+    // 0 保守预留目录中的 maxOutputTokens；本地 automatic 模式可指定运行时余量策略，
+    // 因为其真实输出上限由“窗口减实际输入”动态决定，不能预留整个窗口而拒绝所有输入。
+    std::size_t defaultOutputReserveTokens = 0;
+};
+
+// 本地估算与供应商 usage 分开，避免把 UTF-8 字节或启发式结果当成实际计费 token。
+// exact=false 时 tokens 仅用于提前压缩；不能保证包含供应商模板/媒体成本的精确窗口校验。
+struct MaiModelTokenEstimate {
+    std::size_t tokens = 0;
+    bool exact = false;
+};
+
+struct MaiModelUsage {
+    // 仅由供应商实际返回的 usage 填写；没有 usage 就不触发 onUsage，不能用估计值补齐。
+    std::size_t inputTokens = 0;
+    std::size_t outputTokens = 0;
+};
+
+// 仅匹配已核对的官方地址与模型，不将同名代理/自托管 endpoint 当作官方容量。
+// 目录来源及核对日期记录在实现中；未知组合返回全零。调用不访问网络、不读取凭据。
+MaiModelContextLimits maiOfficialModelContextLimits(const std::string& baseUrl,
+                                                    const std::string& model);
+
+// 无供应商 tokenizer 时的公开估计入口。按 Unicode 标量及 ASCII 段估计文本，
+// 另计消息/工具声明/媒体余量；不是把字节数称作 token。wire/tokenizer 实现可覆盖更精确计数。
+MaiModelTokenEstimate maiEstimateModelInputTokens(const MaiModelRequest& request);
 
 // 可见 assistant 发言的阶段，和不可见的推理内容无关。
 // Unspecified 用于未提供阶段的 Chat Completions、本地模型和兼容供应商。
@@ -186,6 +224,9 @@ struct MaiStreamSink {
     // 否则调用原 onText。两者不重复交付同一正文，Chat/local 仍可只用 onText。
     // 完成快照可能为此前 item 补尾，调用方必须按 index 定位原片段。
     std::function<void(const MaiModelTextItem&, std::string_view)> onTextItemDelta;
+    // 供应商实际返回的输入/输出 token。与其他流回调使用相同线程和引用生命周期。
+    // 可缺省，失败或未返回 usage 时不得合成“实际用量”。追加在末尾保留已有聚合初始化。
+    std::function<void(const MaiModelUsage&)> onUsage;
 };
 
 using MaiModelImagePreparer =
@@ -235,6 +276,12 @@ struct MaiModelConfig {
     // 非空地址覆盖环境代理；每个重定向目标重新查询，凭据仅用于该跳的代理。
     // 回调和捕获对象必须在线程并发调用期间有效且线程安全，不得记录目标或凭据。
     std::function<bool(const std::string&, MaiModelProxy&)> proxyResolver;
+    // 按实际选中模型提供窗口；空时只查询 maiOfficialModelContextLimits 的已核官方目录。
+    // 回调可能在多会话工作线程并发调用，必须线程安全，不得访问用户会话或发模型请求。
+    std::function<MaiModelContextLimits(const std::string&)> contextLimits;
+    // Chat Completions 是否声明 stream_options.include_usage。只有宿主/供应商确认支持时开启；
+    // 无论是否开启，都解析实际到达的 usage 帧。Responses 自带完成 usage，不使用这个开关。
+    bool includeStreamUsage = false;
 };
 
 // 模型客户端。一个接口，多个 wire 实现。
@@ -256,6 +303,10 @@ public:
                             const std::atomic<bool>& cancel) = 0;
 
     virtual MaiWireApi wireApi() const = 0;
+    // 默认未知；没有覆盖的自定义客户端保留原文，不得假设一个通用容量。
+    virtual MaiModelContextLimits contextLimits(const std::string& model) const;
+    // 默认返回明确标为估计的本地计数；有真实 tokenizer 的实现可返回 exact=true。
+    virtual MaiModelTokenEstimate estimateInputTokens(const MaiModelRequest& request) const;
 };
 
 // 工厂在 MaiOpenAiClient.h——那是**实现**，这里是接口。

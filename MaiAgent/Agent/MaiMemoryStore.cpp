@@ -46,6 +46,7 @@ public:
     bool removeSession(const std::string& id) override {
         std::lock_guard<std::mutex> lock(mMutex);
         mMessages.erase(id);
+        mContextCheckpoints.erase(id);
         for (auto it = mSpecialistTasks.begin(); it != mSpecialistTasks.end();) {
             if (it->second.ownerSessionId == id) {
                 it = mSpecialistTasks.erase(it);
@@ -59,6 +60,7 @@ public:
         std::lock_guard<std::mutex> lock(mMutex);
         if (mSessions.find(sessionId) == mSessions.end()) return false;
         mMessages.erase(sessionId);
+        mContextCheckpoints.erase(sessionId);
         for (auto it = mSpecialistTasks.begin(); it != mSpecialistTasks.end();) {
             if (it->second.ownerSessionId == sessionId) {
                 it = mSpecialistTasks.erase(it);
@@ -66,6 +68,32 @@ public:
                 ++it;
         }
         return true;
+    }
+
+    bool getContextCheckpoint(const std::string& sessionId,
+                              MaiContextCheckpoint& out) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mContextCheckpoints.find(sessionId);
+        if (found == mContextCheckpoints.end() || mSessions.count(sessionId) == 0) return false;
+        out = found->second;
+        return true;
+    }
+
+    MaiError advanceContextCheckpoint(const std::string& sessionId, std::uint64_t expectedRevision,
+                                      const MaiContextCheckpoint& checkpoint) override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mContextCheckpoints.find(sessionId);
+        const std::uint64_t revision =
+            found == mContextCheckpoints.end() ? 0 : found->second.revision;
+        const auto history = mMessages.find(sessionId);
+        if (mSessions.count(sessionId) == 0 || history == mMessages.end())
+            return {MaiErrorCode::NotFound, "Session history no longer exists."};
+        if (revision != expectedRevision || checkpoint.revision == 0 ||
+            checkpoint.revision - 1 != expectedRevision ||
+            !maiContextCheckpointMatches(checkpoint, sessionId, history->second))
+            return {MaiErrorCode::Busy, "Context source changed while preparing its summary."};
+        mContextCheckpoints[sessionId] = checkpoint;
+        return {};
     }
 
     MaiError insertSpecialistTask(const MaiSpecialistTask& task) override {
@@ -366,6 +394,7 @@ private:
     mutable std::mutex mMutex;
     std::unordered_map<std::string, MaiSession> mSessions;
     std::unordered_map<std::string, std::vector<MaiMessage>> mMessages;
+    std::unordered_map<std::string, MaiContextCheckpoint> mContextCheckpoints;
     std::unordered_map<std::string, MaiSpecialistTask> mSpecialistTasks;
 };
 

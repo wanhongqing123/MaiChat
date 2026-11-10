@@ -936,6 +936,11 @@ bool MaiAgent::getMessage(const std::string& sessionId, const std::string& messa
     return mRuntime->store->getMessage(sessionId, messageId, out);
 }
 
+MaiResult<MaiConversationHistoryPage> MaiAgent::readHistory(
+    const std::string& sessionId, const MaiConversationHistoryQuery& query) const {
+    return maiReadConversationHistory(*mRuntime->store, sessionId, query);
+}
+
 std::vector<MaiQuestionRequest> MaiAgent::listPendingQuestions() const {
     return mRuntime->questions->listPending();
 }

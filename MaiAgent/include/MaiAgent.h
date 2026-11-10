@@ -13,6 +13,7 @@
 #include "MaiEventBus.h"
 #include "MaiMessage.h"
 #include "MaiModelClient.h"
+#include "MaiConversationHistory.h"
 #include "MaiPermission.h"
 #include "MaiQuestion.h"
 #include "MaiSubAgent.h"
@@ -266,6 +267,11 @@ public:
     // 不改变模型上下文，也不生成操作、事件或新的模型请求。
     bool getMessage(const std::string& sessionId, const std::string& messageId,
                     MaiMessage& out) const;
+    // 普通原史回查，和 session_history 模型工具复用同一实现。仅查询传入的已授权会话，
+    // 精确消息/片段/字段读取和字面检索均返回原文来源及分页偏移，不调用模型或读用户媒体。
+    // 失败返回 NotFound/InvalidInput；可与活动轮次并发。宿主负责其会话授权边界。
+    MaiResult<MaiConversationHistoryPage> readHistory(
+        const std::string& sessionId, const MaiConversationHistoryQuery& query) const;
     // 这个会话现在有没有一轮在跑。注意这是**那一瞬间**的答案，
     // 拿它去做"没跑就发消息"的判断是有竞态的——直接 submit，忙的话会返回 Busy，那个判断在锁里做。
     bool isBusy(const std::string& sessionId) const;

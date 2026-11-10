@@ -213,7 +213,7 @@ MaiResult<std::string> imageDataUrl(const MaiModelRequest& request, const MaiMod
 
 // ── 请求体构造：中立结构 -> OpenAI 线格式 ─────────────────────
 MaiResult<std::string> buildRequestBody(const MaiModelRequest& request,
-                                        const ImagePreparer& prepareImage) {
+                                        const ImagePreparer& prepareImage, bool includeUsage) {
     json msgs = json::array();
     if (!request.baseInstructions.empty()) {
         msgs.push_back({{"role", "system"}, {"content", request.baseInstructions}});
@@ -274,6 +274,8 @@ MaiResult<std::string> buildRequestBody(const MaiModelRequest& request,
     }
 
     json body{{"model", request.model}, {"messages", std::move(msgs)}, {"stream", true}};
+    if (request.maxOutputTokens != 0) body["max_tokens"] = request.maxOutputTokens;
+    if (includeUsage) body["stream_options"] = json{{"include_usage", true}};
     if (request.model == "deepseek-flash" &&
         (request.reasoningEffort == "low" || request.reasoningEffort == "high" ||
          request.reasoningEffort == "max")) {
@@ -361,6 +363,15 @@ void handleSseLine(StreamCtx& context, const std::string& line) {
         context.error = parsed["error"].is_string() ? parsed["error"].get<std::string>()
                                                     : parsed["error"].dump();
         return;
+    }
+
+    // OpenAI Chat 的用量帧可以 choices=[]；必须在提前返回前读取，不能用本地估算补齐。
+    const auto usage = parsed.value("usage", json{});
+    if (usage.is_object() && context.sink->onUsage) {
+        const auto input = usage.value("prompt_tokens", json{});
+        const auto output = usage.value("completion_tokens", json{});
+        if (input.is_number_unsigned() && output.is_number_unsigned())
+            context.sink->onUsage({input.get<std::size_t>(), output.get<std::size_t>()});
     }
 
     if (!parsed.contains("choices") || !parsed["choices"].is_array() || parsed["choices"].empty())
@@ -492,6 +503,11 @@ public:
         return MaiWireApi::ChatCompletions;
     }
 
+    MaiModelContextLimits contextLimits(const std::string& model) const override {
+        return mConfig.contextLimits ? mConfig.contextLimits(model)
+                                     : maiOfficialModelContextLimits(mConfig.baseUrl, model);
+    }
+
     // 发送 Chat Completions 流式请求并将增量事件交给上层 sink。
     // 请求构造或传输失败时返回错误，不向会话写入伪造的完成事件。
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
@@ -501,9 +517,11 @@ public:
         url += "/chat/completions";
 
         MaiResult<std::string> builtBody = buildRequestBody(
-            request, [this](const std::string& source, const std::string& workspace) {
+            request,
+            [this](const std::string& source, const std::string& workspace) {
                 return prepareImage(source, workspace);
-            });
+            },
+            mConfig.includeStreamUsage);
         if (!builtBody) return builtBody.error();
         const std::string body = std::move(builtBody.value());
         std::size_t imageCount = 0;

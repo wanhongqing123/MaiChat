@@ -47,6 +47,14 @@ MaiWireApi DesktopAccountModelClient::wireApi() const {
     return MaiWireApi::Responses;
 }
 
+MaiModelContextLimits DesktopAccountModelClient::contextLimits(const std::string& model) const {
+    // 容量查询不读取账号 Key、不发网络请求；每次按本会话选中的真实供应商地址查询。
+    if (model == "glm-5.3" || model == "glm-5.3-flash")
+        return maiOfficialModelContextLimits(toUtf8(config_.glmBaseUrl), model);
+    if (model == "deepseek-flash") return maiOfficialModelContextLimits(toUtf8(config_.deepseekBaseUrl), model);
+    return {};
+}
+
 MaiError DesktopAccountModelClient::stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                                            const std::atomic<bool>& cancel) {
     const QString model = QString::fromUtf8(request.model.c_str(), static_cast<int>(request.model.size()));

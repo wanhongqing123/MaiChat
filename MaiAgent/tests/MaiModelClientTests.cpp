@@ -181,6 +181,7 @@ struct Collected {
     std::vector<MaiToolInvocation> calls;
     std::vector<MaiModelTextItem> startedItems;
     std::vector<MaiModelTextItem> completedItems;
+    std::vector<MaiModelUsage> usage;
     std::string error;
     MaiErrorCode code = MaiErrorCode::Ok;
     bool done = false;
@@ -196,6 +197,7 @@ Collected runAgainst(FakeServer& fake, const MaiModelRequest& request,
 
     Collected collected;
     MaiStreamSink sink;
+    sink.onUsage = [&](const MaiModelUsage& usage) { collected.usage.push_back(usage); };
     sink.onTextItemStarted = [&](const MaiModelTextItem& item) {
         collected.startedItems.push_back(item);
     };
@@ -1063,7 +1065,28 @@ void test_view_image_tool_pixels_reach_next_http_request(MaiWireApi wire) {
     CHECK(observation.is_array() && observation.size() == 2);
     if (!observation.is_array() || observation.size() != 2) return;
     CHECK(observation[0]["type"] == (responses ? "input_text" : "text"));
-    CHECK(observation[0]["text"].get<std::string>().find("Image returned") != std::string::npos);
+    // 工具图片在整组回执后追加，wire 只能声明真实组来源；原像素字节断言继续独立验证。
+    const json source = json::parse(observation[0]["text"].get<std::string>(), nullptr, false);
+    CHECK(source.is_object());
+    if (source.is_object()) {
+        CHECK(source["type"] == "tool_group_image_observation");
+        CHECK(source["ownership"] == "tool_group_only");
+        CHECK(source["tool_count"] == 1 && source["archived_tool_count"] == 0);
+        if (history.size() == 2) {
+            std::string toolPartId, imagePartId;
+            for (const auto& part : history.back().parts) {
+                if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
+                    if (tool->callId == "call_view_image") toolPartId = part.id;
+                } else if (std::holds_alternative<MaiImagePart>(part.body))
+                    imagePartId = part.id;
+            }
+            CHECK(!toolPartId.empty() && !imagePartId.empty());
+            CHECK(source["source_message_id"] == history.back().id);
+            CHECK(source["image_part_id"] == imagePartId);
+            CHECK(source["first_tool_part_id"] == toolPartId);
+            CHECK(source["through_tool_part_id"] == toolPartId);
+        }
+    }
     CHECK(observation[1]["type"] == (responses ? "input_image" : "image_url"));
     const json& encoded =
         responses ? observation[1]["image_url"] : observation[1]["image_url"]["url"];
@@ -2062,6 +2085,94 @@ void test_local_mode_never_falls_back_to_a_remote_request() {
     CHECK(destination.received().empty());
 }
 
+// 用实际 socket 字节核对 output 上限和 usage 字段，不能把本地估计当作服务端 usage。
+void test_context_limits_output_budget_and_actual_usage() {
+    std::printf("   context limits, output wire budgets, and actual provider usage\n");
+    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
+        FakeServer fake;
+        fake.chunk = 1;
+        if (wire == MaiWireApi::ChatCompletions) {
+            fake.script =
+                "data: "
+                "{\"choices\":[{\"delta\":{\"content\":\"reply\"},\"finish_reason\":\"stop\"}]}\n\n"
+                "data: "
+                "{\"choices\":[],\"usage\":{\"prompt_tokens\":1234,\"completion_tokens\":57}}\n\n"
+                "data: [DONE]\n\n";
+        } else {
+            fake.script =
+                "data: "
+                "{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"reply\"}"
+                "\n\n"
+                "data: "
+                "{\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_"
+                "tokens\":1234,\"output_tokens\":57}}}\n\n";
+        }
+        fake.start();
+        MaiModelConfig config;
+        config.baseUrl = fake.base();
+        config.wire = wire;
+        config.includeStreamUsage = true;
+        config.contextLimits = [](const std::string& model) {
+            return model == "small-window" ? MaiModelContextLimits{8192, 2048}
+                                           : MaiModelContextLimits{32768, 4096};
+        };
+        auto client = makeMaiModelClient(config);
+        CHECK(client->contextLimits("small-window").contextWindowTokens == 8192);
+        CHECK(client->contextLimits("large-window").contextWindowTokens == 32768);
+        MaiModelRequest request;
+        request.model = "small-window";
+        request.maxOutputTokens = 256;
+        MaiModelMessage user;
+        user.content = "Read the preserved history.";
+        request.messages.push_back(user);
+        std::vector<MaiModelUsage> observed;
+        MaiStreamSink sink;
+        sink.onUsage = [&](const MaiModelUsage& usage) { observed.push_back(usage); };
+        std::atomic<bool> cancel{false};
+        CHECK(!client->stream(request, sink, cancel));
+        CHECK(observed.size() == 1);
+        if (!observed.empty()) {
+            CHECK(observed[0].inputTokens == 1234);
+            CHECK(observed[0].outputTokens == 57);
+        }
+        std::string body;
+        {
+            std::lock_guard<std::mutex> lock(fake.mutex);
+            body = fake.lastBody;
+        }
+        const auto sent = json::parse(body);
+        if (wire == MaiWireApi::ChatCompletions) {
+            CHECK(sent["max_tokens"] == 256);
+            CHECK(sent["stream_options"]["include_usage"] == true);
+        } else {
+            CHECK(sent["max_output_tokens"] == 256);
+        }
+        request.maxOutputTokens = 0;
+        CHECK(!client->stream(request, sink, cancel));
+        {
+            std::lock_guard<std::mutex> lock(fake.mutex);
+            body = fake.lastBody;
+        }
+        const auto defaultBody = json::parse(body);
+        CHECK(!defaultBody.contains("max_tokens"));
+        CHECK(!defaultBody.contains("max_output_tokens"));
+    }
+    FakeServer absent;
+    absent.script =
+        "data: "
+        "{\"choices\":[{\"delta\":{\"content\":\"reply\"},\"finish_reason\":\"stop\"}]}\n\ndata: "
+        "[DONE]\n\n";
+    absent.start();
+    MaiModelRequest request;
+    request.model = "unknown";
+    const auto result = runAgainst(absent, request);
+    CHECK(result.done);
+    CHECK(result.usage.empty());
+    MaiModelConfig unknown;
+    unknown.baseUrl = absent.base();
+    CHECK(makeMaiModelClient(unknown)->contextLimits("glm-5.3").contextWindowTokens == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -2088,6 +2199,7 @@ int main() {
         CHECK(error.code() != MaiErrorCode::Network);
     }
 #endif
+    test_context_limits_output_budget_and_actual_usage();
     test_text_stream_one_byte_at_a_time();
     test_text_stream_all_at_once();
     test_tool_call_fragments();

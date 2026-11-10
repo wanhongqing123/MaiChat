@@ -179,7 +179,7 @@ void testQuotedUserMediaUsesExactSourceMessage() {
     CHECK(request.back().images.empty());
 }
 
-void testLargeProbeOutputDoesNotFloodTheNextRequest() {
+void testExplicitToolOutputBudgetKeepsItsExistingPolicy() {
     MaiMessage probe = userMessage("Inspect video", {});
     MaiMessage assistant;
     assistant.role = MaiRole::Assistant;
@@ -193,7 +193,12 @@ void testLargeProbeOutputDoesNotFloodTheNextRequest() {
     part.body = std::move(tool);
     assistant.parts.push_back(std::move(part));
     const MaiMessage followup = userMessage("j", {});
-    const auto request = MaiContextBuilder().build({probe, assistant, followup});
+    MaiContextBuilder::Options options;
+    options.maxHistoryTextBytes = 256 * 1024;
+    options.maxToolResultBytes = 16 * 1024;
+    options.maxOlderMessageBytes = 32 * 1024;
+    options.maxReasoningBytes = 8 * 1024;
+    const auto request = MaiContextBuilder(options).build({probe, assistant, followup});
     std::size_t total = 0;
     bool sawCall = false;
     bool sawShortenedResult = false;
@@ -214,13 +219,16 @@ void testLargeProbeOutputDoesNotFloodTheNextRequest() {
     CHECK(std::get<MaiToolPart>(assistant.parts.front().body).output.size() == 1'600'000);
 }
 
-void testOldTurnsAreOmittedWhileTheCurrentUserStays() {
+void testExplicitHistoryBudgetKeepsItsExistingPolicy() {
     std::vector<MaiMessage> history;
     for (int index = 0; index < 20; ++index)
         history.push_back(userMessage(
             "Earlier turn " + std::to_string(index) + " " + std::string(20'000, 'a'), {}));
     history.push_back(userMessage("Current request", {}));
-    const auto request = MaiContextBuilder().build(history);
+    MaiContextBuilder::Options options;
+    options.maxHistoryTextBytes = 256 * 1024;
+    options.maxOlderMessageBytes = 32 * 1024;
+    const auto request = MaiContextBuilder(options).build(history);
     std::size_t total = 0;
     for (const MaiModelMessage& message : request) total += message.content.size();
     CHECK(total < 300 * 1024);
@@ -228,6 +236,110 @@ void testOldTurnsAreOmittedWhileTheCurrentUserStays() {
     CHECK(request.front().content.find("Earlier conversation omitted") != std::string::npos);
     CHECK(request.back().role == MaiModelRole::User);
     CHECK(request.back().content == "Current request");
+}
+
+// 使用真实原文字节比较，不能只检查存储中仍存在或模型消息条数。
+// 早期链接放在长消息中部，旧的首尾摘录和总预算都无法通过这些断言。
+void testDefaultHistoryKeepsLongOriginalMessagesAndToolResults() {
+    const std::string firstText = std::string(600'000, 'a') +
+                                  "\nhttps://example.invalid/original-video.mp4\n" +
+                                  std::string(600'000, 'b');
+    const std::string answerText =
+        std::string(90'000, 'c') + "\nOriginal answer\n" + std::string(90'000, 'd');
+    const std::string output =
+        std::string(800'000, 'e') + "\nOriginal tool detail\n" + std::string(800'000, 'f');
+    MaiMessage assistant;
+    assistant.role = MaiRole::Assistant;
+    MaiMessagePart answer;
+    answer.body = MaiTextPart{answerText};
+    assistant.parts.push_back(answer);
+    MaiToolPart tool;
+    tool.tool = "read";
+    tool.callId = "call_original_file";
+    tool.input = R"({"path":"owned-test.txt"})";
+    tool.output = output;
+    tool.state = MaiToolState::Completed;
+    MaiMessagePart result;
+    result.body = tool;
+    assistant.parts.push_back(result);
+    const std::vector<MaiMessage> history = {userMessage(firstText, {}), assistant,
+                                             userMessage("Use the earlier link", {})};
+    const auto request = MaiContextBuilder().build(history);
+    CHECK(request.size() == 4);
+    if (request.size() == 4) {
+        CHECK(request[0].role == MaiModelRole::User);
+        CHECK(request[0].content == firstText);
+        CHECK(request[1].role == MaiModelRole::Assistant);
+        CHECK(request[1].content == answerText);
+        CHECK(request[1].invocations.size() == 1);
+        if (request[1].invocations.size() == 1) {
+            CHECK(request[1].invocations[0].id == tool.callId);
+            CHECK(request[1].invocations[0].name == tool.tool);
+            CHECK(request[1].invocations[0].arguments == tool.input);
+        }
+        CHECK(request[2].role == MaiModelRole::ToolResult);
+        CHECK(request[2].toolCallId == tool.callId);
+        CHECK(request[2].content == output);
+        CHECK(request[3].role == MaiModelRole::User);
+        CHECK(request[3].content == "Use the earlier link");
+    }
+    CHECK(history.front().text() == firstText);
+    CHECK(std::get<MaiToolPart>(history[1].parts[1].body).output == output);
+}
+
+void testDefaultHistoryKeepsEveryOldTurnInOrder() {
+    std::vector<MaiMessage> history;
+    for (int index = 0; index < 60; ++index)
+        history.push_back(userMessage(
+            "Original turn " + std::to_string(index) + " " + std::string(20'000, 'x'), {}));
+    history.push_back(userMessage("Current request", {}));
+    const auto request = MaiContextBuilder().build(history);
+    CHECK(request.size() == history.size());
+    if (request.size() != history.size()) return;
+    for (std::size_t index = 0; index < history.size(); ++index) {
+        CHECK(request[index].role == MaiModelRole::User);
+        CHECK(request[index].content == history[index].text());
+    }
+}
+
+void testDefaultHistoryKeepsLargeLatestInputAndOptedInReasoning() {
+    const std::string currentText =
+        std::string(600'000, 'a') + "\nFull current input\n" + std::string(600'000, 'b');
+    const auto current = MaiContextBuilder().build({userMessage(currentText, {})});
+    CHECK(current.size() == 1);
+    if (current.size() == 1) CHECK(current[0].content == currentText);
+
+    MaiMessage assistant;
+    assistant.role = MaiRole::Assistant;
+    MaiMessagePart reasoning;
+    const std::string reasoningText(60'000, 'r');
+    reasoning.body = MaiReasoningPart{reasoningText};
+    assistant.parts.push_back(reasoning);
+    MaiContextBuilder::Options options;
+    options.includeReasoning = true;
+    const auto request = MaiContextBuilder(options).build(
+        {userMessage("Earlier question", {}), assistant, userMessage("Next question", {})});
+    CHECK(request.size() == 3);
+    if (request.size() == 3) {
+        CHECK(request[1].content == reasoningText);
+        CHECK(request[1].reasoning == reasoningText);
+    }
+}
+
+void testExplicitZeroTextBudgetsMeanUnlimited() {
+    MaiContextBuilder::Options options;
+    options.maxHistoryTextBytes = 0;
+    options.maxOlderMessageBytes = 0;
+    options.maxToolResultBytes = 0;
+    options.maxReasoningBytes = 0;
+    const std::vector<MaiMessage> history = {userMessage("Keep the first message", {}),
+                                             userMessage("Keep the second message", {})};
+    const auto request = MaiContextBuilder(options).build(history);
+    CHECK(request.size() == 2);
+    if (request.size() == 2) {
+        CHECK(request[0].content == history[0].text());
+        CHECK(request[1].content == history[1].text());
+    }
 }
 
 void testQuotedAssistantMediaUsesDeliveredArtifact() {
@@ -283,8 +395,12 @@ int main() {
     testCurrentImagesHaveExactPathAndAttachmentIdentity();
     testRecentPreviousImagePathsRemainAvailableWithoutOldPixels();
     testQuotedUserMediaUsesExactSourceMessage();
-    testLargeProbeOutputDoesNotFloodTheNextRequest();
-    testOldTurnsAreOmittedWhileTheCurrentUserStays();
+    testExplicitToolOutputBudgetKeepsItsExistingPolicy();
+    testExplicitHistoryBudgetKeepsItsExistingPolicy();
+    testDefaultHistoryKeepsLongOriginalMessagesAndToolResults();
+    testDefaultHistoryKeepsEveryOldTurnInOrder();
+    testDefaultHistoryKeepsLargeLatestInputAndOptedInReasoning();
+    testExplicitZeroTextBudgetsMeanUnlimited();
     testQuotedAssistantMediaUsesDeliveredArtifact();
     testStoredReasoningDoesNotEnterDefaultHistory();
     return failures == 0 ? 0 : 1;

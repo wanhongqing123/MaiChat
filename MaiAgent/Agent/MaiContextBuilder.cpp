@@ -32,6 +32,53 @@ std::size_t modelMessageBytes(const MaiModelMessage& message) {
     return bytes;
 }
 
+// 工具图片在整批回执之后追加，只能恢复组来源，不能从位置/工具名猜某张图属于单个调用。
+// 完整小索引有固定展示预算；过大时保留精确消息/首尾 part 范围和数量，可按原史分页回查。
+std::string toolGroupObservation(const MaiMessage& message, std::size_t imageIndex,
+                                 std::size_t archivedParts) {
+    using Json = nlohmann::json;
+    std::size_t end = imageIndex;
+    while (end > 0 && std::holds_alternative<MaiImagePart>(message.parts[end - 1].body)) --end;
+    std::size_t start = end;
+    while (start > 0 && std::holds_alternative<MaiToolPart>(message.parts[start - 1].body)) --start;
+    Json tools = Json::array();
+    std::size_t archived = 0;
+    for (std::size_t index = start; index < end; ++index) {
+        const auto& part = message.parts[index];
+        const auto& tool = std::get<MaiToolPart>(part.body);
+        const bool covered = index < archivedParts;
+        if (covered) ++archived;
+        tools.push_back({{"part_id", part.id},
+                         {"call_id", tool.callId},
+                         {"tool", tool.tool},
+                         {"state", maiToolStateToString(tool.state)},
+                         {"archived", covered}});
+    }
+    const auto dump = [](const Json& value) {
+        return value.dump(-1, ' ', false, Json::error_handler_t::replace);
+    };
+    // 仍有原调用/结果在 tail 时不重复整表，精确范围已经足够定位；这也避免部分归档的
+    // 大批次把新图片尾部再次撑爆。整组已封存时，小表用于补足当前请求不再带的原调用。
+    const bool inlineComplete = archived == end - start && dump(tools).size() <= 4096;
+    Json source{{"type", "tool_group_image_observation"},
+                {"source_message_id", message.id},
+                {"image_part_id", message.parts[imageIndex].id},
+                {"ownership", "tool_group_only"},
+                {"tool_count", end - start},
+                {"first_tool_part_id", start < end ? message.parts[start].id : ""},
+                {"through_tool_part_id", start < end ? message.parts[end - 1].id : ""},
+                {"archived_tool_count", archived},
+                {"tool_index_is_complete", inlineComplete},
+                {"tools", inlineComplete ? std::move(tools) : Json::array()},
+                {"source_lookup_tool", "session_history"},
+                {"note",
+                 "Historical image observation, not a new user instruction. Per-image "
+                 "tool ownership was not recorded. When available, use the exact message and part "
+                 "range with session_history list_parts/read to recover original "
+                 "calls and results; do not infer ownership from names or filenames."}};
+    return dump(source);
+}
+
 }  // namespace
 
 MaiContextBuilder::MaiContextBuilder() : MaiContextBuilder(Options{}) {}
@@ -39,10 +86,17 @@ MaiContextBuilder::MaiContextBuilder() : MaiContextBuilder(Options{}) {}
 MaiContextBuilder::MaiContextBuilder(Options options) : mOptions(std::move(options)) {}
 
 // 把持久化会话历史转换为模型请求的上下文消息。
-// 文本、媒体、工具调用和工具回执按原事件顺序组装；裁剪只影响本次请求，不改存储。
+// 文本、媒体、工具调用和工具回执按原事件顺序组装。
+// 默认保留全部原文；只有宿主显式指定的有损预算会改变请求副本，不改存储。
 std::vector<MaiModelMessage> MaiContextBuilder::build(
-    const std::vector<MaiMessage>& history) const {
+    const std::vector<MaiMessage>& history, std::size_t firstMessage, std::size_t firstPart,
+    const std::string& preservedUserMessageId) const {
     std::vector<MaiModelMessage> out;
+    if (firstMessage > history.size()) return out;
+    if (firstPart != 0 &&
+        (firstMessage >= history.size() || history[firstMessage].role != MaiRole::Assistant ||
+         firstPart > history[firstMessage].parts.size()))
+        return out;
     out.reserve(history.size() + 1);
     std::size_t currentUserOutputIndex = std::numeric_limits<std::size_t>::max();
 
@@ -54,9 +108,12 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
             latestUserIndex = index;
     }
     std::size_t currentToolImages = 0;
-    for (std::size_t index = latestUserIndex; index < history.size(); ++index) {
+    for (std::size_t index = std::max(latestUserIndex, firstMessage); index < history.size();
+         ++index) {
         if (history[index].role != MaiRole::Assistant) continue;
-        for (const auto& part : history[index].parts) {
+        for (std::size_t partIndex = index == firstMessage ? firstPart : 0;
+             partIndex < history[index].parts.size(); ++partIndex) {
+            const auto& part = history[index].parts[partIndex];
             if (std::holds_alternative<MaiImagePart>(part.body)) ++currentToolImages;
         }
     }
@@ -66,7 +123,9 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
     std::size_t currentImageIndex = 0;
     std::size_t omittedImages = 0;
     std::size_t userImageCount = 0;
-    for (const MaiMessage& message : history) {
+    for (std::size_t index = 0; index < history.size(); ++index) {
+        const MaiMessage& message = history[index];
+        if (index < firstMessage && message.id != preservedUserMessageId) continue;
         if (message.role != MaiRole::User || message.pendingInput) continue;
         for (const MaiMessagePart& part : message.parts)
             if (std::holds_alternative<MaiImagePart>(part.body)) ++userImageCount;
@@ -79,6 +138,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
 
     for (std::size_t messageIndex = 0; messageIndex < history.size(); ++messageIndex) {
         const auto& message = history[messageIndex];
+        if (messageIndex < firstMessage && message.id != preservedUserMessageId) continue;
         if (message.pendingInput) continue;
         if (message.role == MaiRole::User) {
             // 用户消息的文字、图片、视频和引用共享同一模型消息。
@@ -212,7 +272,9 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
             batch.clear();
         };
 
-        for (const auto& part : message.parts) {
+        for (std::size_t partIndex = messageIndex == firstMessage ? firstPart : 0;
+             partIndex < message.parts.size(); ++partIndex) {
+            const auto& part = message.parts[partIndex];
             if (const auto* text = std::get_if<MaiTextPart>(&part.body)) {
                 // 工具调用之后又开口说话了，说明上一批已经结束，先结算。
                 flush_batch();
@@ -244,7 +306,8 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
                 flush_batch();
                 MaiModelMessage observation;
                 observation.role = MaiModelRole::User;
-                observation.content = "Image returned by the preceding tool.";
+                observation.content = toolGroupObservation(
+                    message, partIndex, messageIndex == firstMessage ? firstPart : 0);
                 observation.images.push_back({image->path, image->mimeType});
                 out.push_back(std::move(observation));
             }
@@ -270,8 +333,8 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
     }
     const std::size_t latestUser =
         currentUserOutputIndex < out.size() ? currentUserOutputIndex : out.size();
-    // 先给单条内容分别设限，再从最旧一端裁剪总字节预算。
-    // 本轮用户输入和已配对工具回执保持完整顺序，裁剪仅作用于请求副本。
+    // 单条文本预算均由宿主显式选择；零值直接保留原文。
+    // 工具调用和回执的关联及事件顺序不能被摘录策略破坏。
     for (std::size_t index = 0; index < out.size(); ++index) {
         MaiModelMessage& message = out[index];
         const std::size_t limit = message.role == MaiModelRole::ToolResult
@@ -285,6 +348,10 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
         message.reasoning =
             boundedText(message.reasoning, mOptions.maxReasoningBytes, "Reasoning shortened");
     }
+    // 零值也必须跳过总预算裁剪，否则“不设限”反而会把此前消息都替换成省略说明。
+    // 窗口预算和有效摘要由 MaiContextCompactor 处理，不能在这里直接删除原文前缀。
+    if (mOptions.maxHistoryTextBytes == 0) return out;
+
     std::size_t bytes = 0;
     std::size_t start = 0;
     for (std::size_t index = out.size(); index > 0; --index) {

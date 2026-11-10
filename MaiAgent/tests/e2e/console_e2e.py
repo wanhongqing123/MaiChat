@@ -46,6 +46,8 @@ def check(name, cond, extra=""):
     say("  [%s] %s%s" % ("OK" if cond else "FAIL", name, ("  " + extra) if extra else ""))
     if not cond:
         fails.append(name)
+        if "screen" in globals():
+            say("    console tail: " + repr(text()[-2000:]))
 
 
 # ── 1. 静态：产物里没有 HTTP 服务端 ──────────────────────────────
@@ -102,37 +104,43 @@ class ModelHandler(BaseHTTPRequestHandler):
         # （拿 GLM-5.3 抓过：先几百帧 reasoning_content，再开始 content）。
         reasoning = entry[3] if len(entry) > 3 else ""
 
+        def frame(delta):
+            return ("data: " + json.dumps({"choices": [{"delta": delta}]}, ensure_ascii=False)
+                    + "\n\n").encode("utf-8")
+
+        reasoning_frames = [frame({"reasoning_content": piece}) for piece in reasoning]
+        tool_frame = frame({"tool_calls": [{
+            "index": 0,
+            "id": "call_%d" % idx,
+            "function": {"name": tool, "arguments": args},
+        }]}) if tool else b""
+        text_frames = [frame({"content": piece}) for piece in text]
+        done = b"data: [DONE]\n\n"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
+        # HTTP/1.0 默认靠关闭连接界定正文；本地 Windows 定点复现会在首字后报告接收错误。
+        # 声明精确长度，使正常完成由已收到的字节决定，仍逐字流式发送。
+        self.send_header("Content-Length", str(sum(map(len, reasoning_frames)) + len(tool_frame)
+                                              + sum(map(len, text_frames)) + len(done)))
         self.end_headers()
         if reasoning:
-            for piece in reasoning:
-                frame = {"choices": [{"delta": {"reasoning_content": piece}}]}
-                self.wfile.write(("data: " + json.dumps(frame, ensure_ascii=False) + "\n\n")
-                                 .encode("utf-8"))
+            for encoded in reasoning_frames:
+                self.wfile.write(encoded)
             self.wfile.flush()
         if tool:
-            frame = {"choices": [{"delta": {"tool_calls": [{
-                "index": 0,
-                "id": "call_%d" % idx,
-                "function": {"name": tool, "arguments": args},
-            }]}}]}
-            self.wfile.write(("data: " + json.dumps(frame, ensure_ascii=False) + "\n\n")
-                             .encode("utf-8"))
+            self.wfile.write(tool_frame)
         if text:
             # 一个字一个字吐，顺便验多字节字符被切在 chunk 边界上还能拼回来。
-            for piece in text:
-                frame = {"choices": [{"delta": {"content": piece}}]}
+            for encoded in text_frames:
                 try:
-                    self.wfile.write(("data: " + json.dumps(frame, ensure_ascii=False) + "\n\n")
-                                     .encode("utf-8"))
+                    self.wfile.write(encoded)
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
                     # 被 /interrupt 掐断了。核心把连接关掉正是它该做的事，
                     # 这里不是失败——假模型安静退出就行，别把栈打到屏幕上。
                     return
                 time.sleep(char_delay["s"])
-        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.write(done)
         self.wfile.flush()
 
 
@@ -264,13 +272,19 @@ def send(line):
 check("banner says it links the library only", wait_for("links maiagent only"))
 check("banner shows the session id", "ses_" in text())
 check("banner shows the database", database in text())
+check("the initial prompt is ready", wait_prompts(1))
 
 # ── 第一轮：纯聊天，验流式 ──────────────────────────────────
+turns = prompts_seen()
 send("\u4f60\u597d")
 check("streams the full multi-byte answer", wait_for(GREETING), repr(text()[-120:]))
+# 最后正文仍可能早于 [DONE]、落库和 SessionIdle。先等本轮提示符，
+# 再发送下一请求；否则 Busy 的提示符还会污染后面各轮的计数基线。
+check("the first chat went idle", wait_prompts(turns + 1))
 
 # ── 第二轮：工具 + 授权 ────────────────────────────────────
 mark = len(text())
+turns = prompts_seen()
 send("write note.txt")
 check("tool card shows up as pending", wait_for("[tool] file_write  pending"))
 check("tool card carries the arguments", "note.txt" in text()[mark:])
@@ -282,6 +296,7 @@ send("/y")
 check("approval is echoed", wait_after("approved", mark))
 check("tool runs to completion", wait_after("[tool] file_write  completed", mark))
 check("model gets the last word", wait_after("Done, I wrote note.txt.", mark))
+check("the note turn went idle", wait_prompts(turns + 1))
 
 note = os.path.join(workspace, "note.txt")
 check("the file really got written", os.path.exists(note))

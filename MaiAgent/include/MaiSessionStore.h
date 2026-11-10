@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "MaiError.h"
+#include "MaiContextCheckpoint.h"
 #include "MaiMessage.h"
 #include "MaiSession.h"
 #include "MaiSpecialistTask.h"
@@ -84,6 +85,19 @@ public:
     // 标准 SQLite 后端仅查询该消息，不加载同会话的其他消息/工具载荷。
     virtual bool getMessage(const std::string& sessionId, const std::string& messageId,
                             MaiMessage& out) const = 0;
+
+    // 读取会话独立的压缩检查点。不存在/读取失败返回 false，out 不变。
+    // 自定义后端默认不提供检查点，原始历史仍可完整读取；需覆盖两个方法才支持压缩。
+    virtual bool getContextCheckpoint(const std::string& sessionId,
+                                      MaiContextCheckpoint& out) const;
+    // 在同一锁/事务内核对 expectedRevision、会话身份及完整源前缀后推进。
+    // 首次 expectedRevision=0，候选 revision 必须为 expectedRevision+1。
+    // 并发追加在消息/part 覆盖边界之后允许；partial assistant 收尾不会改变已覆盖前缀。
+    // 源前缀修改、清空或其他压缩已推进则返回 Busy。
+    // 成功只写检查点，不删除/缩短任何原消息；失败不修改原检查点或原历史。
+    virtual MaiError advanceContextCheckpoint(const std::string& sessionId,
+                                              std::uint64_t expectedRevision,
+                                              const MaiContextCheckpoint& checkpoint);
 };
 
 // 两个实现的工厂在各自的头里：MaiMemoryStore.h / MaiSqliteStore.h。
