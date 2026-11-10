@@ -29,4 +29,6 @@ Display observation JSON contains target=display, decimal-string display_id, bou
 4. Use target-machine Agent execution through existing Session sync where appropriate; a direct remote frame/input adapter can reuse current remote transport.
 5. Validate actual visual-model tasks in owned environments: desktop to editor to Save As/reopen, existing test browser navigation/dialogs, cross-application transfers and display/focus changes. Scripted executor tests and actual-model results are reported separately.
 
+2026-11-10 progress: the ordinary native executor completed a real Windows Save As, independent disk read, editor clear and native Open/reopen with exact UIA text (one resident worker/session, 95 frames). The original native click/type/Enter case also passed on the same binary. This is task-level native evidence; actual visual-model execution and browser tasks remain pending. See `docs/diagnostics/maichat-computer-use-document-workflow-20261110.md` for original failures, guard corrections and precise binary evidence.
+
 No paid model request or real-account operation is test setup. Native input is allowed only after verifying the fixture owns the target and interactive conditions. Installed apps and prior release assets are not replaced by these builds.
