@@ -11,6 +11,17 @@ class DesktopComputerBackend {
 public:
     virtual ~DesktopComputerBackend() = default;
     virtual MaiResult<std::vector<DesktopNativeWindow>> windows() = 0;
+    virtual MaiResult<std::vector<DesktopNativeDisplay>> displays();
+    virtual MaiError captureDisplay(const DesktopNativeDisplay& display, MaiScreenshot& output);
+    struct CaptureOptions {
+        std::uint64_t afterFrameSequence = 0;
+        std::int64_t afterFrameReceivedAtMs = 0;
+        std::function<bool()> isCanceled;
+    };
+    // Options and callbacks live only for this synchronous call. Implementations
+    // must not retain them; the controller also verifies the returned frame age.
+    virtual MaiError captureDisplay(const DesktopNativeDisplay& display, MaiScreenshot& output,
+                                    const CaptureOptions& options);
     virtual MaiResult<std::vector<DesktopNativeElement>> elements(const DesktopNativeWindow& window) = 0;
     virtual MaiError capture(const DesktopNativeWindow& window, MaiScreenshot& output) = 0;
     virtual MaiError activate(const DesktopNativeWindow& window) = 0;

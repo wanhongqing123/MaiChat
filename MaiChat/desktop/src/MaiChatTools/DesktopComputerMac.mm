@@ -136,6 +136,45 @@ MaiError accessPermission() {
     return {};
 }
 
+bool interactiveDesktopIsAvailable() {
+    @autoreleasepool {
+        CFDictionaryRef session = CGSessionCopyCurrentDictionary();
+        if (!session) return false;
+        const bool available = CFDictionaryGetValue(session, kCGSessionOnConsoleKey) == kCFBooleanTrue &&
+                               CFDictionaryGetValue(session, kCGSessionLoginDoneKey) == kCFBooleanTrue;
+        CFRelease(session);
+        NSRunningApplication* frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+        // Match the capture service's public rejection signals. macOS has no
+        // complete public lock-state API; an absent/locked GUI is never an
+        // opportunity to post input to a different login session.
+        return available && frontmost && ![frontmost.bundleIdentifier isEqualToString:@"com.apple.loginwindow"];
+    }
+}
+
+bool validDisplayBounds(CGRect frame) {
+    return std::isfinite(frame.origin.x) && std::isfinite(frame.origin.y) && std::isfinite(frame.size.width) &&
+           std::isfinite(frame.size.height) && frame.size.width > 0 && frame.size.height > 0;
+}
+
+MaiError validateDisplay(const DesktopNativeDisplay& display) {
+    if (!display.id || display.id > (std::numeric_limits<CGDirectDisplayID>::max)() || !std::isfinite(display.x) ||
+        !std::isfinite(display.y) || !std::isfinite(display.width) || !std::isfinite(display.height) ||
+        display.width <= 0 || display.height <= 0)
+        return {MaiErrorCode::InvalidInput, "a valid observed display is required"};
+    const CGDirectDisplayID id = CGDirectDisplayID(display.id);
+    if (!CGDisplayIsActive(id)) return {MaiErrorCode::NotFound, "the observed display is no longer active"};
+    const CGRect frame = CGDisplayBounds(id);
+    if (!validDisplayBounds(frame) || frame.origin.x != display.x || frame.origin.y != display.y ||
+        frame.size.width != display.width || frame.size.height != display.height)
+        return {MaiErrorCode::Busy, "display geometry changed; observe the display again"};
+    return {};
+}
+
+bool displayContainsPoint(const DesktopNativeDisplay& display, CGPoint point) {
+    return point.x >= display.x && point.y >= display.y && point.x < display.x + display.width &&
+           point.y < display.y + display.height;
+}
+
 struct ReleaseCFValue {
     void operator()(CFTypeRef value) const { CFRelease(value); }
 };
@@ -221,7 +260,10 @@ bool acceptsInputFromWindow(AXUIElementRef selected, AXUIElementRef focused,
 class InputScope {
 public:
     explicit InputScope(const DesktopNativeInput& input) : input_(input) {
-        flags_ = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+        // A remote-control source owns only its synthetic state table. Cleanup
+        // must never manufacture key-up events for the user's hardware state.
+        source_ = CGEventSourceCreate(kCGEventSourceStatePrivate);
+        if (input.desktopScope) return;
         if (input.expectedWindowId && input.expectedProcessId) {
             DesktopNativeWindow selected;
             selected.id = input.expectedWindowId;
@@ -248,15 +290,25 @@ public:
         }
     }
     ~InputScope() {
-        // CGEventPost has no delivery acknowledgement. Cleanup still pairs all
-        // posted downs with ups even after cancellation or an AX focus change.
+        // CGEventPost has no delivery acknowledgement. Cleanup pairs our downs
+        // with ups after cancellation/focus changes, preserving hardware holds.
         while (!releases_.empty()) release();
         if (window_) CFRelease(window_);
         if (application_) CFRelease(application_);
+        if (source_) CFRelease(source_);
     }
     MaiError validate() const {
         if (input_.isCanceled && input_.isCanceled())
             return {MaiErrorCode::Canceled, "computer input canceled"};
+        const MaiError permission = accessPermission();
+        if (permission) return permission;
+        if (!source_) return {MaiErrorCode::Internal, "could not create a private computer input source"};
+        if (input_.desktopScope) {
+            if (!interactiveDesktopIsAvailable())
+                return {MaiErrorCode::NotConfigured,
+                        "an unlocked interactive macOS desktop is required for computer input"};
+            return validateDisplay(input_.display);
+        }
         if (!window_ || !application_)
             return {MaiErrorCode::NotFound, "selected window is unavailable to macOS Accessibility"};
         bool front = false;
@@ -277,19 +329,36 @@ public:
                   CGEventFlags extra = 0) {
         const MaiError ready = validate();
         if (ready) return ready;
+        const CGEventType type = CGEventGetType(down);
+        const bool keyboard = type == kCGEventKeyDown || type == kCGEventFlagsChanged;
+        const int code = keyboard ? int(CGEventGetIntegerValueField(down, kCGKeyboardEventKeycode))
+                                  : int(CGEventGetIntegerValueField(down, kCGMouseEventButtonNumber));
+        if ((keyboard && CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, CGKeyCode(code))) ||
+            (!keyboard && CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, CGMouseButton(code))))
+            return {MaiErrorCode::Busy, "the requested input is already held by the user"};
         flags_ |= modifier;
-        CGEventSetFlags(down, flags_ | extra);
+        CGEventSetSource(down, source_);
+        CGEventSetFlags(down, effectiveFlags() | extra);
         CGEventPost(kCGHIDEventTap, down);
         CFRetain(up);
-        releases_.push_back({up, modifier, extra});
+        releases_.push_back({up, modifier, extra, keyboard, code});
         return {};
     }
     void release() {
         const Pending pending = releases_.back();
         releases_.pop_back();
         flags_ &= ~pending.modifier;
-        CGEventSetFlags(pending.event, flags_ | pending.extra);
-        CGEventPost(kCGHIDEventTap, pending.event);
+        // A physical key/button may have gone down after our synthetic down.
+        // Leave that hardware input held; releasing the private source still
+        // discards our private state when the action ends.
+        const bool userHeld =
+            pending.keyboard ? CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, CGKeyCode(pending.code))
+                             : CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, CGMouseButton(pending.code));
+        if (!userHeld) {
+            CGEventSetSource(pending.event, source_);
+            CGEventSetFlags(pending.event, effectiveFlags() | pending.extra);
+            CGEventPost(kCGHIDEventTap, pending.event);
+        }
         CFRelease(pending.event);
     }
     MaiError tap(CGEventRef down, CGEventRef up, CGEventFlags extra = 0) {
@@ -299,8 +368,8 @@ public:
         return validate();
     }
     MaiError key(CGKeyCode code, CGEventFlags extra = 0, bool holdModifier = false) {
-        CGEventRef down = CGEventCreateKeyboardEvent(nullptr, code, true);
-        CGEventRef up = CGEventCreateKeyboardEvent(nullptr, code, false);
+        CGEventRef down = CGEventCreateKeyboardEvent(source_, code, true);
+        CGEventRef up = CGEventCreateKeyboardEvent(source_, code, false);
         if (!down || !up) {
             if (down) CFRelease(down);
             if (up) CFRelease(up);
@@ -315,21 +384,39 @@ public:
         CFRelease(up);
         return sent;
     }
-    MaiError move(CGPoint point) {
+    MaiError move(CGPoint point, bool dragging = true) {
         const MaiError ready = validate();
         if (ready) return ready;
-        CGEventRef event = CGEventCreateMouseEvent(nullptr, kCGEventLeftMouseDragged,
+        if (input_.desktopScope && !displayContainsPoint(input_.display, point))
+            return {MaiErrorCode::InvalidInput, "pointer coordinates are outside the observed display"};
+        CGEventRef event = CGEventCreateMouseEvent(source_, dragging ? kCGEventLeftMouseDragged : kCGEventMouseMoved,
                                                    point, kCGMouseButtonLeft);
-        if (!event) return {MaiErrorCode::Internal, "could not create drag event"};
-        CGEventSetFlags(event, flags_);
+        if (!event) return {MaiErrorCode::Internal, "could not create pointer motion event"};
+        CGEventSetFlags(event, effectiveFlags());
         CGEventPost(kCGHIDEventTap, event);
         CFRelease(event);
-        if (!releases_.empty()) CGEventSetLocation(releases_.back().event, point);
+        if (dragging && !releases_.empty()) CGEventSetLocation(releases_.back().event, point);
         return validate();
     }
+    void post(CGEventRef event) const {
+        CGEventSetSource(event, source_);
+        CGEventSetFlags(event, effectiveFlags());
+        CGEventPost(kCGHIDEventTap, event);
+    }
+
 private:
-    struct Pending { CGEventRef event; CGEventFlags modifier; CGEventFlags extra; };
+    CGEventFlags effectiveFlags() const {
+        return flags_ | CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+    }
+    struct Pending {
+        CGEventRef event;
+        CGEventFlags modifier;
+        CGEventFlags extra;
+        bool keyboard;
+        int code;
+    };
     const DesktopNativeInput& input_;
+    CGEventSourceRef source_ = nullptr;
     AXUIElementRef application_ = nullptr;
     AXUIElementRef window_ = nullptr;
     pid_t process_ = 0;
@@ -340,6 +427,7 @@ private:
 struct NativeKey {
     CGKeyCode code = 0;
     CGEventFlags extra = 0;
+    CGEventFlags modifier = 0;
 };
 
 MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key) {
@@ -399,6 +487,10 @@ MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key) {
     case DesktopKeyCode::PageDown: return NativeKey{kVK_PageDown, kCGEventFlagMaskSecondaryFn};
     case DesktopKeyCode::Space: return NativeKey{kVK_Space, 0};
     case DesktopKeyCode::Insert: return NativeKey{kVK_Help, kCGEventFlagMaskSecondaryFn};
+    case DesktopKeyCode::Control: return NativeKey{kVK_Control, 0, kCGEventFlagMaskControl};
+    case DesktopKeyCode::Shift: return NativeKey{kVK_Shift, 0, kCGEventFlagMaskShift};
+    case DesktopKeyCode::Alt: return NativeKey{kVK_Option, 0, kCGEventFlagMaskAlternate};
+    case DesktopKeyCode::Meta: return NativeKey{kVK_Command, 0, kCGEventFlagMaskCommand};
     case DesktopKeyCode::Function: {
         const CGKeyCode functions[] = {kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5,
             kVK_F6, kVK_F7, kVK_F8, kVK_F9, kVK_F10, kVK_F11, kVK_F12,
@@ -439,8 +531,11 @@ MaiError sendChord(InputScope& scope, const DesktopKeyChord& chord) {
     }
     if (CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, key.value().code))
         return {MaiErrorCode::Busy, "the requested key is already held by the user"};
-    const MaiError sent = scope.key(key.value().code, key.value().extra);
+    const NativeKey mapped = key.value();
+    const MaiError sent =
+        mapped.modifier ? scope.key(mapped.code, mapped.modifier, true) : scope.key(mapped.code, mapped.extra);
     if (sent) return sent;
+    if (mapped.modifier) ++held;
     while (held-- > 0) scope.release();
     return scope.validate();
 }
@@ -486,13 +581,47 @@ bool hasUnexpectedModifiers(const DesktopKeyChord* chord) {
         {DesktopKeyModifier::Alt, kCGEventFlagMaskAlternate},
         {DesktopKeyModifier::Meta, kCGEventFlagMaskCommand}};
     for (const auto& item : modifiers) {
-        if ((flags & item.second) && (!chord || std::find(chord->modifiers.begin(),
-                chord->modifiers.end(), item.first) == chord->modifiers.end())) return true;
+        const bool requestedStandalone =
+            chord && ((item.first == DesktopKeyModifier::Control && chord->key == DesktopKeyCode::Control) ||
+                      (item.first == DesktopKeyModifier::Shift && chord->key == DesktopKeyCode::Shift) ||
+                      (item.first == DesktopKeyModifier::Alt && chord->key == DesktopKeyCode::Alt) ||
+                      (item.first == DesktopKeyModifier::Meta && chord->key == DesktopKeyCode::Meta));
+        if ((flags & item.second) && !requestedStandalone &&
+            (!chord ||
+             std::find(chord->modifiers.begin(), chord->modifiers.end(), item.first) == chord->modifiers.end()))
+            return true;
     }
     return false;
 }
 
 } // namespace
+
+MaiResult<std::vector<DesktopNativeDisplay>> maiDesktopDisplays() {
+    std::uint32_t count = 0;
+    if (CGGetActiveDisplayList(0, nullptr, &count) != kCGErrorSuccess || !count)
+        return {MaiErrorCode::NotFound, "no active display is available"};
+    // Keep the enumeration bounded even if a virtual-display provider misbehaves.
+    if (count > 64) return {MaiErrorCode::NotSupported, "the active display count exceeds the supported limit"};
+    std::vector<CGDirectDisplayID> displays(count);
+    if (CGGetActiveDisplayList(count, displays.data(), &count) != kCGErrorSuccess)
+        return {MaiErrorCode::Internal, "could not enumerate active macOS displays"};
+    const CGDirectDisplayID primary = CGMainDisplayID();
+    std::vector<DesktopNativeDisplay> output;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const CGDirectDisplayID id = displays[index];
+        const CGRect frame = CGDisplayBounds(id);
+        if (!CGDisplayIsActive(id) || !validDisplayBounds(frame)) continue;
+        // Quartz bounds use top-left global pointer coordinates, including
+        // negative origins. Do not substitute AppKit's bottom-left screen frame
+        // or Retina backing pixels for these input coordinates.
+        output.push_back({id, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height, id == primary});
+    }
+    if (output.empty()) return {MaiErrorCode::NotFound, "no active display has valid pointer bounds"};
+    std::sort(output.begin(), output.end(), [](const DesktopNativeDisplay& first, const DesktopNativeDisplay& second) {
+        return first.id < second.id;
+    });
+    return output;
+}
 
 MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows() {
     if (!CGPreflightScreenCaptureAccess())
@@ -709,21 +838,31 @@ MaiError maiDesktopInput(const DesktopNativeInput& input) {
             (input.kind == DesktopNativeInputKind::Type && input.text.empty()))
             return {MaiErrorCode::InvalidInput, "text must contain at most 4000 UTF-8 bytes"};
     }
-    const bool positioned = input.kind == DesktopNativeInputKind::Click ||
-        input.kind == DesktopNativeInputKind::DoubleClick ||
-        input.kind == DesktopNativeInputKind::RightClick ||
-        input.kind == DesktopNativeInputKind::Drag ||
-        input.kind == DesktopNativeInputKind::Scroll;
+    const bool positioned =
+        input.kind == DesktopNativeInputKind::Click || input.kind == DesktopNativeInputKind::DoubleClick ||
+        input.kind == DesktopNativeInputKind::RightClick || input.kind == DesktopNativeInputKind::Drag ||
+        input.kind == DesktopNativeInputKind::Scroll || input.kind == DesktopNativeInputKind::Move;
     if (positioned && !validPoint(input.x, input.y))
         return {MaiErrorCode::InvalidInput, "pointer coordinates are invalid"};
+    const int maximumDragMs = input.desktopScope ? 5000 : 200;
     if (input.kind == DesktopNativeInputKind::Drag &&
-        (!validPoint(input.toX, input.toY) || input.durationMs < 1 || input.durationMs > 200))
-        return {MaiErrorCode::InvalidInput, "drag needs a valid destination and 1 to 200 ms duration"};
+        (!validPoint(input.toX, input.toY) || input.durationMs < 1 || input.durationMs > maximumDragMs))
+        return {MaiErrorCode::InvalidInput, input.desktopScope
+                                                ? "drag needs a valid destination and 1 to 5000 ms duration"
+                                                : "drag needs a valid destination and 1 to 200 ms duration"};
     if (input.kind == DesktopNativeInputKind::Scroll &&
         (input.lines == 0 || input.lines < -10 || input.lines > 10))
         return {MaiErrorCode::InvalidInput, "scroll needs -10 to 10 lines, excluding zero"};
     if ((input.expectedWindowId == 0) != (input.expectedProcessId == 0))
         return {MaiErrorCode::InvalidInput, "expected window and process identities must be provided together"};
+    if (input.desktopScope) {
+        const MaiError display = validateDisplay(input.display);
+        if (display) return display;
+        if ((positioned && !displayContainsPoint(input.display, CGPointMake(input.x, input.y))) ||
+            (input.kind == DesktopNativeInputKind::Drag &&
+             !displayContainsPoint(input.display, CGPointMake(input.toX, input.toY))))
+            return {MaiErrorCode::InvalidInput, "pointer coordinates are outside the observed display"};
+    }
     DesktopKeyChord chord;
     if (input.kind == DesktopNativeInputKind::Key) {
         const auto parsed = maiDesktopParseKey(input.key);
@@ -750,13 +889,14 @@ MaiError maiDesktopInput(const DesktopNativeInput& input) {
         CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonRight) ||
         CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonCenter))
         return {MaiErrorCode::Busy, "a mouse button is already held by the user"};
+    if (input.kind == DesktopNativeInputKind::Move) return scope.move(CGPointMake(input.x, input.y), false);
     if (input.kind == DesktopNativeInputKind::Scroll) {
         CGEventRef event = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine,
                                                          1, input.lines);
         if (!event) return {MaiErrorCode::Internal, "could not create scroll event"};
         CGEventSetLocation(event, CGPointMake(input.x, input.y));
         const MaiError before = scope.validate();
-        if (!before) CGEventPost(kCGHIDEventTap, event);
+        if (!before) scope.post(event);
         CFRelease(event);
         return before ? before : scope.validate();
     }

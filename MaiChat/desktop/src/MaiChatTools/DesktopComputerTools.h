@@ -20,6 +20,11 @@ struct DesktopComputerAction {
     std::string action;
     std::string snapshotId;
     std::uint64_t windowId = 0;
+    std::uint64_t displayId = 0;
+    bool desktopScope = false;
+    // Required for display actions; a token from a different current workspace
+    // cannot inject input or publish screen images into its former directory.
+    std::string workspace;
     double xRatio = 0;
     double yRatio = 0;
     double toXRatio = 0;
@@ -39,6 +44,8 @@ struct DesktopComputerActionResult {
     bool verified = false;
     bool dryRun = false;
     std::string actualText;
+    DesktopComputerObservation observation;
+    std::string observationError;
 };
 
 // Session-owned observed window state. A later action must match the same
@@ -57,6 +64,14 @@ public:
                                                   std::uint64_t windowId = 0, bool includeImage = true,
                                                   std::function<bool()> isCanceled = {});
     MaiResult<std::vector<DesktopNativeWindow>> windows();
+    MaiResult<std::vector<DesktopNativeDisplay>> displays();
+    // Observe a whole display using the resident capture worker. The token binds
+    // this Session, input bounds and PNG dimensions. Desktop actions may switch
+    // foreground applications and provide a subsequent screen observation.
+    MaiResult<DesktopComputerObservation> observeDisplay(const std::string& sessionId, const std::string& workspace,
+                                                         std::uint64_t displayId, std::function<bool()> isCanceled = {},
+                                                         std::uint64_t afterFrameSequence = 0,
+                                                         std::int64_t afterFrameReceivedAtMs = 0, int waitMs = 0);
     MaiResult<DesktopComputerActionResult> perform(const std::string& sessionId, const DesktopComputerAction& action);
     MaiError act(const std::string& sessionId, const std::string& action, const std::string& snapshotId,
                  std::uint64_t windowId, double xRatio, double yRatio, const std::string& text, const std::string& key,

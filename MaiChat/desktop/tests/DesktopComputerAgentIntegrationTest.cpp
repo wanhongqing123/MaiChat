@@ -2,10 +2,12 @@
 // desktop_computer tool. The deterministic slot uses an in-process editor; the
 // native slot delegates every platform operation to production and controls a
 // separately owned editor process through the same real conversation UI.
-// Model observations use metadata/UIA only; native captures are separate fixture
-// evidence and never enter the model conversation.
+// The window slots use metadata/UIA only; their native captures remain separate
+// fixture evidence. The owned display slot exercises actual PNG feedback through
+// the Agent/ContextBuilder with a scripted client, without OS capture or input.
 #include <QApplication>
 #include <QBuffer>
+#include <QColor>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -27,6 +29,8 @@
 #include <QtTest>
 
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -332,6 +336,245 @@ private:
     std::string snapshotId_;
 };
 
+// This backend owns synthetic display pixels and receives ordinary controller
+// input only. It never lists real windows, captures the OS or injects input.
+class FakeDisplayBackend final : public DesktopComputerBackend {
+public:
+    FakeDisplayBackend() : producerEpochMs_(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count() + 60000) {}
+
+    MaiResult<std::vector<DesktopNativeDisplay>> displays() override {
+        return std::vector<DesktopNativeDisplay>{{71, 0, 0, 1920, 1080, true},
+                                                 {72, -1600, -90, 1600, 900, false}};
+    }
+    MaiError captureDisplay(const DesktopNativeDisplay& display, MaiScreenshot& output,
+                            const CaptureOptions& options) override {
+        output = {};
+        if (display.id != 72) return {MaiErrorCode::InvalidInput, "fixture display identity changed"};
+        if (options.isCanceled && options.isCanceled()) return {MaiErrorCode::Canceled, "fixture capture canceled"};
+        sawCancellationCallback = sawCancellationCallback && bool(options.isCanceled);
+        if (captures != 0) {
+            if (options.afterFrameSequence != frameSequence_ || options.afterFrameReceivedAtMs <= 0)
+                return {MaiErrorCode::Protocol, "post-input observation lacked the preceding frame barrier"};
+            ++freshBarrierCount;
+        }
+        ++captures;
+        ++frameSequence_;
+        // A private producer clock/tick is independent of the requested
+        // threshold. Native timing/permissions are tested by the native suite.
+        const std::int64_t receivedAtMs = producerEpochMs_ + std::int64_t(captures) * 16;
+        if (frameSequence_ <= options.afterFrameSequence || receivedAtMs <= options.afterFrameReceivedAtMs)
+            return {MaiErrorCode::Busy, "fixture producer has no fresh frame"};
+        QImage image(96, 54, QImage::Format_RGB32);
+        image.fill(QColor(20 + captures * 30, 80, 180));
+        QByteArray png;
+        QBuffer buffer(&png);
+        if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG"))
+            return {MaiErrorCode::Internal, "could not encode owned display pixels"};
+        output.width = image.width();
+        output.height = image.height();
+        output.pngBytes.assign(png.begin(), png.end());
+        output.frameSequence = frameSequence_;
+        output.frameReceivedAtMs = receivedAtMs;
+        return {};
+    }
+    MaiResult<std::vector<DesktopNativeWindow>> windows() override {
+        ++windowBoundaryCalls;
+        return std::vector<DesktopNativeWindow>{};
+    }
+    MaiResult<std::vector<DesktopNativeElement>> elements(const DesktopNativeWindow&) override {
+        ++windowBoundaryCalls;
+        return {MaiErrorCode::NotSupported, "fixture display has no window UIA"};
+    }
+    MaiError capture(const DesktopNativeWindow&, MaiScreenshot& output) override {
+        ++windowBoundaryCalls;
+        output = {};
+        return {MaiErrorCode::NotSupported, "fixture only captures its owned display"};
+    }
+    MaiError activate(const DesktopNativeWindow&) override {
+        ++windowBoundaryCalls;
+        return {MaiErrorCode::NotSupported, "display input must not activate a selected window"};
+    }
+    MaiResult<bool> isFocused(const DesktopNativeWindow&) override {
+        ++windowBoundaryCalls;
+        return false;
+    }
+    MaiResult<bool> secureInput() override { return false; }
+    MaiError input(const DesktopNativeInput& input) override {
+        if (input.isCanceled && input.isCanceled()) return {MaiErrorCode::Canceled, "fixture input canceled"};
+        if (!input.desktopScope || input.display.id != 72 || input.expectedWindowId || input.expectedProcessId)
+            return {MaiErrorCode::Protocol, "display input was incorrectly bound to a window"};
+        if (input.kind == DesktopNativeInputKind::Key && input.key == "Meta") sawLauncherKey = true;
+        else if (input.kind == DesktopNativeInputKind::Type) typedText = input.text;
+        else if (input.kind == DesktopNativeInputKind::Move) {
+            if (std::abs(input.x - (-1200.25)) > 0.01 || std::abs(input.y - 359.5) > 0.01)
+                return {MaiErrorCode::Protocol, "display movement ignored the negative native display origin"};
+            sawMove = true;
+        } else return {MaiErrorCode::NotSupported, "unexpected owned display input"};
+        ++inputs;
+        return {};
+    }
+    MaiResult<std::string> focusedText(const DesktopNativeWindow&) override {
+        ++windowBoundaryCalls;
+        return {MaiErrorCode::NotSupported, "display fixture has no window text readback"};
+    }
+
+    int captures = 0;
+    int inputs = 0;
+    int freshBarrierCount = 0;
+    int windowBoundaryCalls = 0;
+    bool sawCancellationCallback = true;
+    bool sawLauncherKey = false;
+    bool sawMove = false;
+    std::string typedText;
+
+private:
+    std::int64_t producerEpochMs_ = 0;
+    std::uint64_t frameSequence_ = 0;
+};
+
+struct DisplayScriptState : ScriptState {
+    std::atomic<int> imageObservations{0};
+    std::vector<std::string> observedTokens;
+    std::vector<std::string> imagePaths;
+};
+
+// A scripted model tests the actual Agent/ContextBuilder multimodal round trip.
+// It consumes the preceding tool result and attached pixels before selecting
+// the next snapshot; it is not a test of model visual understanding.
+class DisplayComputerScriptModel final : public MaiModelClient {
+public:
+    DisplayComputerScriptModel(std::shared_ptr<DisplayScriptState> state, std::string prompt, std::string workspace)
+        : state_(std::move(state)), prompt_(std::move(prompt)), workspace_(std::move(workspace)) {}
+
+    MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                    const std::atomic<bool>& cancel) override {
+        if (cancel.load()) return {MaiErrorCode::Canceled, "display Agent fixture canceled"};
+        state_->started = true;
+        if (QFileInfo(QString::fromStdString(request.workingDirectory)).canonicalFilePath() !=
+            QFileInfo(QString::fromStdString(workspace_)).canonicalFilePath())
+            return state_->fail("the display Agent request changed its working directory");
+        for (const auto& tool : request.tools) {
+            if (tool.name != "desktop_computer") continue;
+            state_->declaredTool = true;
+            const Json schema = Json::parse(tool.parametersJson, nullptr, false);
+            if (!schema.is_object() || !schema.contains("properties") || !schema["properties"].contains("display_id"))
+                return state_->fail("the Agent tool declaration omitted display targeting");
+        }
+        for (const auto& message : request.messages)
+            if (message.role == MaiModelRole::User && message.content == prompt_) state_->receivedChinesePrompt = true;
+        if (!state_->declaredTool.load()) return state_->fail("desktop_computer was not declared to the display script");
+        if (next_ != 0) {
+            std::size_t resultIndex = request.messages.size();
+            Json result;
+            for (std::size_t index = 0; index < request.messages.size(); ++index) {
+                const auto& message = request.messages[index];
+                if (message.role != MaiModelRole::ToolResult || message.toolCallId != lastCallId_) continue;
+                if (resultIndex != request.messages.size()) return state_->fail("display tool result was duplicated");
+                resultIndex = index;
+                result = Json::parse(message.content, nullptr, false);
+            }
+            if (!result.is_object()) return state_->fail("display Agent lost the paired tool result");
+            {
+                std::lock_guard<std::mutex> lock(state_->mutex);
+                state_->results.push_back(result);
+            }
+            if (next_ == 1) {
+                if (!result.contains("displays") || !result["displays"].is_array())
+                    return state_->fail("display listing was not passed back through the Agent");
+                for (const auto& display : result["displays"]) {
+                    if (!display.is_object() || !display.contains("bounds")) continue;
+                    const auto& bounds = display["bounds"];
+                    if (bounds.value("x", 0.0) < 0) {
+                        displayId_ = display.value("display_id", std::string());
+                        bounds_ = bounds;
+                    }
+                }
+                if (displayId_.empty() || bounds_.value("x", 0.0) != -1600 || bounds_.value("y", 0.0) != -90 ||
+                    bounds_.value("width", 0.0) != 1600 || bounds_.value("height", 0.0) != 900)
+                    return state_->fail("listing lost the negative-origin native display bounds");
+            } else {
+                Json observation;
+                if (next_ == 2) observation = result;
+                else {
+                    if (!result.value("dispatched", false) || result.value("verified", true) ||
+                        result.value("state", std::string()) != "dispatched")
+                        return state_->fail("a display input was not dispatched with a fresh observation");
+                    observation = result.value("observation", Json::object());
+                }
+                if (!observation.is_object() || observation.value("target", std::string()) != "display" ||
+                    observation.value("display_id", std::string()) != displayId_ ||
+                    observation.value("bounds", Json::object()) != bounds_ ||
+                    observation.value("image_width", 0) != 96 || observation.value("image_height", 0) != 54)
+                    return state_->fail("display observation metadata did not survive the real Agent round trip");
+                const std::string nextToken = observation.value("snapshot_id", std::string());
+                const std::uint64_t frame = observation.value("frame_sequence", std::uint64_t(0));
+                const std::int64_t frameTime = observation.value("frame_received_at_ms", std::int64_t(0));
+                if (nextToken.empty() || nextToken == snapshotId_ || frame <= frameSequence_ || frameTime <= frameTimeMs_)
+                    return state_->fail("display observation reused a token or a pre-input frame");
+                if (resultIndex + 1 >= request.messages.size())
+                    return state_->fail("the tool result lacked its following image observation message");
+                const auto& pixels = request.messages[resultIndex + 1];
+                if (pixels.role != MaiModelRole::User || pixels.images.size() != 1 ||
+                    pixels.images.front().mimeType != "image/png")
+                    return state_->fail("ContextBuilder did not feed back the display PNG after its result");
+                const QString imagePath = QString::fromUtf8(pixels.images.front().path.c_str());
+                const QImage decoded(imagePath);
+                const QString relative = QString::fromStdString(observation.value("image_path", std::string()));
+                if (decoded.size() != QSize(96, 54) || relative.isEmpty() || !QDir::isRelativePath(relative) ||
+                    QFileInfo(imagePath).canonicalFilePath() !=
+                        QFileInfo(QDir(QString::fromStdString(workspace_)).filePath(relative)).canonicalFilePath() ||
+                    decoded.pixelColor(0, 0) != QColor(20 + int(frame) * 30, 80, 180))
+                    return state_->fail("the model image did not contain the actual PNG for this display frame");
+                snapshotId_ = nextToken;
+                frameSequence_ = frame;
+                frameTimeMs_ = frameTime;
+                ++state_->imageObservations;
+                std::lock_guard<std::mutex> lock(state_->mutex);
+                state_->observedTokens.push_back(snapshotId_);
+                state_->imagePaths.push_back(pixels.images.front().path);
+            }
+        }
+        if (next_ == 5) {
+            if (state_->imageObservations.load() != 4)
+                return state_->fail("display script reached completion without all four actual PNG observations");
+            if (sink.onText) sink.onText("Display fixture completed: new screen pixels returned after every action.");
+            state_->done = true;
+            return {};
+        }
+        Json arguments;
+        if (next_ == 0) arguments = {{"action", "list_displays"}};
+        else if (next_ == 1) arguments = {{"action", "observe"}, {"target", "display"}, {"display_id", displayId_}};
+        else {
+            arguments = {{"target", "display"}, {"display_id", displayId_}, {"snapshot_id", snapshotId_}};
+            if (next_ == 2) { arguments["action"] = "key"; arguments["key"] = "Meta"; }
+            else if (next_ == 3) { arguments["action"] = "type"; arguments["text"] = "Owned display fixture draft"; }
+            else { arguments["action"] = "move"; arguments["x_ratio"] = 0.25; arguments["y_ratio"] = 0.5; }
+        }
+        lastCallId_ = "display-agent-fixture-" + std::to_string(next_);
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->calls.push_back(arguments);
+        }
+        if (sink.onToolCall) sink.onToolCall({lastCallId_, "desktop_computer", arguments.dump()});
+        ++next_;
+        return {};
+    }
+    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+
+private:
+    std::shared_ptr<DisplayScriptState> state_;
+    std::string prompt_;
+    std::string workspace_;
+    std::string lastCallId_;
+    std::string displayId_;
+    std::string snapshotId_;
+    Json bounds_;
+    std::uint64_t frameSequence_ = 0;
+    std::int64_t frameTimeMs_ = 0;
+    int next_ = 0;
+};
+
 Json readOwnedEditorState(const QString& path) {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) return {};
@@ -551,6 +794,7 @@ private:
 
 private slots:
     void chinesePromptTraversesRealAgentAndReadsBackEditor();
+    void displayPromptTraversesRealAgentAndReceivesFreshImages();
     void nativePromptTraversesRealAgentAndReadsBackOwnedProcess();
 };
 
@@ -652,6 +896,101 @@ void DesktopComputerAgentIntegrationTest::chinesePromptTraversesRealAgentAndRead
     QTRY_VERIFY_WITH_TIMEOUT((history->selectAll(), history->selectedText().contains(expected)), 5000);
     history->clearSelection();
     QVERIFY(saveEvidence(scene, QStringLiteral("computer-agent-verified-editor-and-conversation")));
+}
+
+void DesktopComputerAgentIntegrationTest::displayPromptTraversesRealAgentAndReceivesFreshImages() {
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    const QString prompt = QStringLiteral("观察隔离显示器，按 Meta 打开启动入口，输入草稿并移动指针，每步检查新画面。");
+    auto state = std::make_shared<DisplayScriptState>();
+    auto backend = std::make_shared<FakeDisplayBackend>();
+    AgentController controller(
+        std::make_unique<DisplayComputerScriptModel>(state, prompt.toUtf8().toStdString(),
+                                                     workspace.path().toUtf8().toStdString()),
+        workspace.filePath(QStringLiteral("display-computer-agent.sqlite")),
+        [backend](MaiToolRegistry& tools) {
+            registerDesktopComputerTools(tools, std::make_shared<DesktopComputerController>(backend));
+        });
+    QVERIFY(controller.setApprovalPolicy(MaiApprovalPolicy::Never));
+    QVERIFY(controller.setDefaultModel(QStringLiteral("deepseek-flash")));
+    QWidget scene;
+    scene.setWindowTitle(QStringLiteral("MaiChat owned display Agent integration fixture"));
+    scene.resize(1000, 700);
+    auto* layout = new QVBoxLayout(&scene);
+    auto panel = std::make_unique<AgentChatPanel>(controller, &scene);
+    layout->addWidget(panel.get());
+    const QString session = controller.createSession(workspace.path(), QStringLiteral("整屏图像回灌契约"));
+    QVERIFY(!session.isEmpty());
+    StopAgentOnExit stop{controller, session};
+    panel->openSession(session);
+    scene.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&scene));
+    auto* editor = panel->findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    auto* send = panel->findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    QVERIFY(editor && send);
+    editor->setPlainText(prompt);
+    QTest::mouseClick(send, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(state->started.load(), 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(state->done.load() || state->failed.load(), 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 5000);
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const QString directory = evidenceDirectory();
+        if (!directory.isEmpty()) {
+            QVERIFY(QDir().mkpath(directory));
+            const Json transcript{{"prompt", prompt.toUtf8().toStdString()},
+                {"backend", "owned_synthetic_display_no_OS_capture_or_input"},
+                {"model", "scripted_client_not_visual_model_acceptance"},
+                {"error", state->error}, {"calls", state->calls}, {"results", state->results},
+                {"observed_tokens", state->observedTokens}, {"image_paths", state->imagePaths},
+                {"image_observations", state->imageObservations.load()}};
+            QVERIFY(saveJsonEvidence(QDir(directory).filePath(QStringLiteral("display-computer-agent-transcript.json")),
+                                     transcript));
+        }
+        QVERIFY2(!state->failed.load(), state->error.c_str());
+        QCOMPARE(state->calls.size(), std::size_t(5));
+        QCOMPARE(state->results.size(), std::size_t(5));
+        QCOMPARE(state->observedTokens.size(), std::size_t(4));
+        QCOMPARE(state->imagePaths.size(), std::size_t(4));
+        for (std::size_t index = 1; index < state->observedTokens.size(); ++index) {
+            QVERIFY(state->observedTokens[index] != state->observedTokens[index - 1]);
+            QVERIFY(state->imagePaths[index] != state->imagePaths[index - 1]);
+        }
+    }
+    QVERIFY(state->done.load());
+    QVERIFY(state->declaredTool.load());
+    QVERIFY(state->receivedChinesePrompt.load());
+    QCOMPARE(state->imageObservations.load(), 4);
+    QCOMPARE(backend->captures, 4);
+    QCOMPARE(backend->freshBarrierCount, 3);
+    QCOMPARE(backend->inputs, 3);
+    QCOMPARE(backend->windowBoundaryCalls, 0);
+    QVERIFY(backend->sawCancellationCallback);
+    QVERIFY(backend->sawLauncherKey);
+    QVERIFY(backend->sawMove);
+    QCOMPARE(backend->typedText, std::string("Owned display fixture draft"));
+    QVERIFY(controller.agent().listPendingPermissions().empty());
+    int completedComputerTools = 0;
+    int storedImages = 0;
+    bool sawFinal = false;
+    for (const auto& message : controller.agent().listMessages(session.toStdString())) {
+        if (message.role == MaiRole::Assistant && message.text().find("Display fixture completed:") != std::string::npos)
+            sawFinal = true;
+        for (const auto& part : message.parts) {
+            const auto* tool = std::get_if<MaiToolPart>(&part.body);
+            if (tool && tool->tool == "desktop_computer" && tool->state == MaiToolState::Completed) ++completedComputerTools;
+            const auto* image = std::get_if<MaiImagePart>(&part.body);
+            if (image) {
+                ++storedImages;
+                QCOMPARE(image->mimeType, std::string("image/png"));
+                QCOMPARE(QImage(QString::fromStdString(image->path)).size(), QSize(96, 54));
+            }
+        }
+    }
+    QCOMPARE(completedComputerTools, 5);
+    QCOMPARE(storedImages, 4);
+    QVERIFY(sawFinal);
+    QVERIFY(saveEvidence(scene, QStringLiteral("display-computer-agent-completed-conversation")));
 }
 
 void DesktopComputerAgentIntegrationTest::nativePromptTraversesRealAgentAndReadsBackOwnedProcess() {

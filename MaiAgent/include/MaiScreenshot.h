@@ -27,6 +27,7 @@ enum class MaiScreenshotTarget {
     DisplayUnderPointer,  // 鼠标指针所在的显示器。
     WindowByTitle,        // 一个位于当前交互桌面的可见顶层窗口。
     WindowById,           // 按平台原生标识选择可见、未最小化的顶层窗口。
+    DisplayById,          // 按原生显示器标识选择整屏，不依赖鼠标当前位置。
 };
 
 struct MaiScreenshotRequest {
@@ -38,6 +39,12 @@ struct MaiScreenshotRequest {
     // 此模式忽略 windowTitle；标识无效、目标不可见或最小化时返回错误，不回退到标题或显示器。
     // 原生标识可能被系统回收重用，调用方须在截图前后核对窗口所属进程和边界。
     std::uint64_t windowId = 0;
+    // DisplayById 时必填且非 0；无效目标失败，不回退到主屏或鼠标所在屏。
+    std::uint64_t displayId = 0;
+    // 非零时要求返回严格晚于指定帧/接收时间的图像；有界等待期间仍轮询取消。
+    // 零保持现有截图复用最近完整帧的行为，不为等待新图重建常驻采集会话。
+    std::uint64_t afterFrameSequence = 0;
+    std::int64_t afterFrameReceivedAtMs = 0;
     // 可选线程安全取消检查；后端仅在本次阻塞调用返回前使用，不能保留或在返回后调用。
     std::function<bool()> isCanceled;
 };

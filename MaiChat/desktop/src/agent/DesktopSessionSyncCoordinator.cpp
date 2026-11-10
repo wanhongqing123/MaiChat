@@ -393,12 +393,28 @@ DesktopSessionSyncHost* DesktopSessionSyncCoordinator::host() {
             [this](const QString& session, const QString& message, const QString&, const QString&) {
                 scheduleSnapshot(session, message);
             });
-    connect(
-        current, &AgentController::toolPartChanged, this,
-        [this](const QString& session, const QString& message, const QString&) { scheduleSnapshot(session, message); });
+    connect(current, &AgentController::toolPartChanged, this,
+        [this](const QString& session, const QString& message, const QString&) {
+            configureImagePublicationScope();
+            // Tool result images have separate IDs and are appended after the
+            // tool event. Inspect its live message, then repeat at the deferred
+            // snapshot point below once that append has reached storage.
+            if (host_) host_->enrollLiveImages(session, message);
+            scheduleSnapshot(session, message);
+        });
+    connect(current, &AgentController::userMessageAdded, this,
+        [this](const QString& session, const QString& message) {
+            configureImagePublicationScope();
+            if (host_) host_->enrollLiveImages(session, message);
+            scheduleSnapshot(session, message);
+        });
     // 控制器已将 Core 事件排到 Qt 线程；最终完成也按原 ID 更新，不暴露内部事件桥。
     connect(current, &AgentController::storedMessageUpdated, this,
-            [this](const QString& session, const QString& message) { scheduleSnapshot(session, message); });
+            [this](const QString& session, const QString& message) {
+                configureImagePublicationScope();
+                if (host_) host_->enrollLiveImages(session, message);
+                scheduleSnapshot(session, message);
+            });
     connect(current, &AgentController::turnFinished, this,
             [this](const QString& session) { scheduleSnapshot(session); });
     connect(current, &AgentController::turnFailed, this,
@@ -979,6 +995,7 @@ void DesktopSessionSyncCoordinator::scheduleSnapshot(const QString& sessionId, c
 void DesktopSessionSyncCoordinator::publishSnapshot(const QString& sessionId) {
     DesktopSessionSyncHost* current = host();
     if (!current || sessionId.isEmpty()) return;
+    configureImagePublicationScope();
     QJsonObject page = current->historyPage(sessionId, {}, 20);
     if (!page.value(QStringLiteral("ok")).toBool()) return;
     QJsonArray messages = page.value(QStringLiteral("messages")).toArray();
@@ -988,6 +1005,11 @@ void DesktopSessionSyncCoordinator::publishSnapshot(const QString& sessionId) {
     for (int index = 0; index < qMin(20, updates.size()); ++index) {
         const auto id = updates[index];
         pendingMessageUpdates_[sessionId].remove(id);
+        // These IDs came from observed live events, never catalog or backfill.
+        // The ordinary point read is already bounded to twenty messages. It
+        // catches images appended after the completed tool part was announced,
+        // while the next model response can still be running.
+        current->enrollLiveImages(sessionId, id);
         const auto updated = current->messageUpdate(sessionId, id);
         if (updated.isEmpty()) continue;
         bool replaced = false;
@@ -1078,7 +1100,7 @@ void DesktopSessionSyncCoordinator::publishPage(const QString& sessionId, const 
         QPointer<DesktopSessionSyncCoordinator> guard(this);
         requester_(
             QStringLiteral("session-sync/publish"), "POST", body,
-            [guard, key, digest, sessionId, actualStateDigest, epoch](const QJsonObject&, const QString& error) {
+            [guard, key, digest, sessionId, actualStateDigest, epoch, message](const QJsonObject&, const QString& error) {
                 if (!guard || guard->publishEpoch_ != epoch || !guard->desiredPublishedStates_.contains(sessionId))
                     return;
                 if (!error.isEmpty()) {
@@ -1088,6 +1110,7 @@ void DesktopSessionSyncCoordinator::publishPage(const QString& sessionId, const 
                         guard->publishedStateDigests_.remove(sessionId);
                     guard->initiallyPublishedSessions_.remove(sessionId);
                 }
+                if (error.isEmpty()) guard->startPublishedImageUploads(sessionId, message);
                 // 失败也释放计数；旧 ACK 不写新的 digest，只在全批次结束后补最新状态。
                 guard->pendingMessagePublishes_[sessionId] =
                     qMax(0, guard->pendingMessagePublishes_.value(sessionId) - 1);
@@ -1095,6 +1118,51 @@ void DesktopSessionSyncCoordinator::publishPage(const QString& sessionId, const 
             });
     }
     restorePublishedRoomState(sessionId);
+}
+
+void DesktopSessionSyncCoordinator::configureImagePublicationScope() {
+    if (!host_ || !attachmentAccessProvider_) return;
+    const auto access = attachmentAccessProvider_();
+    const auto room = localRoom(QString());
+    host_->setImagePublicationScope(access.accountId, room.slot, room.login);
+}
+
+void DesktopSessionSyncCoordinator::startPublishedImageUploads(const QString& sessionId,
+                                                              const QJsonObject& message) {
+    if (!host_ || !attachmentAccessProvider_) return;
+    const auto access = attachmentAccessProvider_();
+    if (access.accountId.isEmpty()) return;
+    const auto room = localRoom(sessionId);
+    const auto messageId = message.value(QStringLiteral("id")).toString();
+    for (const auto& value : message.value(QStringLiteral("parts")).toArray()) {
+        const auto part = value.toObject();
+        if (part.value(QStringLiteral("kind")).toString() != QStringLiteral("image") ||
+            part.value(QStringLiteral("remoteImage")).toObject().value(QStringLiteral("state")).toString() !=
+                QStringLiteral("pending")) continue;
+        const auto partId = part.value(QStringLiteral("id")).toString();
+        const auto current = DesktopSessionAttachments::imagePublication(access.accountId, room, messageId, partId);
+        if (current.value(QStringLiteral("state")).toString() != QStringLiteral("pending")) continue;
+        const auto key = access.accountId + QLatin1Char(':') + room.key() + QLatin1Char(':') + messageId +
+                         QLatin1Char(':') + partId;
+        if (uploadingImages_.contains(key)) continue;
+        uploadingImages_.insert(key);
+        const auto source = host_->imageSource(sessionId, messageId, partId);
+        const auto epoch = publishEpoch_;
+        auto* watcher = new QFutureWatcher<DesktopSessionAttachmentResult>(this);
+        connect(watcher, &QFutureWatcher<DesktopSessionAttachmentResult>::finished, this,
+            [this, watcher, key, access, sessionId, messageId, epoch] {
+                watcher->deleteLater();
+                uploadingImages_.remove(key);
+                if (epoch != publishEpoch_ || !attachmentAccessProvider_ ||
+                    attachmentAccessProvider_().accountId != access.accountId) return;
+                // Receipt persistence precedes notification. Later text only
+                // republishes that fixed receipt, including after a restart.
+                scheduleSnapshot(sessionId, messageId);
+            });
+        watcher->setFuture(QtConcurrent::run([access, room, messageId, partId, source] {
+            return DesktopSessionAttachments::uploadTemporaryImage(access, room, messageId, partId, source);
+        }));
+    }
 }
 
 void DesktopSessionSyncCoordinator::restorePublishedRoomState(const QString& sessionId) {

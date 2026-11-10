@@ -911,6 +911,198 @@ private struct AIRemoteTransfer {
     var chunks: [Int: Data] = [:]
     var started = Date()
 }
+/// Temporary object metadata is a display receipt, never a local path or a
+/// request to re-upload. Malformed optional fields disable this image without
+/// making the rest of a remote history page unreadable.
+struct AIRemoteImageMetadata: Codable, Sendable, Equatable {
+    let state: String?
+    let retention: String?
+    let attachmentID: String?
+    let ownerLoginSessionID: String?
+    let roomKey: String?
+    let name: String?
+    let mediaType: String?
+    let contentType: String?
+    let sizeBytes: UInt64?
+    let expiresAt: Int64?
+    let errorCode: String?
+
+    enum CodingKeys: String, CodingKey {
+        case state, retention, name
+        case attachmentID = "attachment_id", ownerLoginSessionID = "owner_login_session_id"
+        case roomKey = "room_key", mediaType = "media_type", contentType = "content_type"
+        case sizeBytes = "size_bytes", expiresAt = "expires_at", errorCode = "error_code"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try? decoder.container(keyedBy: CodingKeys.self)
+        state = try? values?.decode(String.self, forKey: .state)
+        retention = try? values?.decode(String.self, forKey: .retention)
+        attachmentID = try? values?.decode(String.self, forKey: .attachmentID)
+        ownerLoginSessionID = try? values?.decode(String.self, forKey: .ownerLoginSessionID)
+        roomKey = try? values?.decode(String.self, forKey: .roomKey)
+        name = try? values?.decode(String.self, forKey: .name)
+        mediaType = try? values?.decode(String.self, forKey: .mediaType)
+        contentType = try? values?.decode(String.self, forKey: .contentType)
+        sizeBytes = try? values?.decode(UInt64.self, forKey: .sizeBytes)
+        expiresAt = try? values?.decode(Int64.self, forKey: .expiresAt)
+        errorCode = try? values?.decode(String.self, forKey: .errorCode)
+    }
+
+    var isExpired: Bool {
+        expiresAt.map { $0 > 0 && $0 <= Int64(Date().timeIntervalSince1970 * 1_000) } ?? false
+    }
+}
+
+struct AIRemoteImageOwner: Hashable, Sendable {
+    let accountID: String
+    let slot: String
+    let loginSessionID: String
+    let sessionID: String
+    let selectionGeneration: Int
+}
+
+/// The immutable original-owner tuple is also the cache namespace. The current
+/// catalog login is kept separately by AIRemoteImageOwner for stale UI checks.
+struct AIRemoteImageRequest: Codable, Hashable, Sendable {
+    let accountID: String
+    let ownerSlot: String
+    let ownerLoginSessionID: String
+    let sessionID: String
+    let messageID: String
+    let partID: String
+    let attachmentID: String
+    let name: String
+    let contentType: String
+    let sizeBytes: UInt64
+    let expiresAt: Int64
+
+    private static func digest(_ bytes: Data) -> String {
+        SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    }
+    var accountKey: String { Self.digest(Data(accountID.utf8)) }
+    var cacheKey: String {
+        Self.digest(try! JSONEncoder().encode([accountID, ownerSlot, ownerLoginSessionID,
+            sessionID, messageID, partID, attachmentID]))
+    }
+    var signature: String {
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        return Self.digest(try! encoder.encode(self))
+    }
+    var isExpired: Bool { expiresAt <= Int64(Date().timeIntervalSince1970 * 1_000) }
+
+    init?(owner: AIRemoteImageOwner, messageID: String, part: AIPart) {
+        guard let image = part.remoteImage, image.retention == "temporary",
+              image.state == "ready" || image.state == "expired",
+              !owner.accountID.isEmpty, ["mac", "windows", "ios_phone", "android_phone", "tablet"].contains(owner.slot),
+              !owner.sessionID.isEmpty, !messageID.isEmpty, !part.id.isEmpty,
+              part.kind == "image", part.remotePartID == nil || part.remotePartID == part.id,
+              let id = image.attachmentID, UUID(uuidString: id) != nil,
+              let login = image.ownerLoginSessionID, !login.isEmpty, login.utf8.count <= 128,
+              image.roomKey == owner.slot + ":" + owner.sessionID,
+              let name = image.name, let mime = image.contentType, image.mediaType == "image",
+              let size = image.sizeBytes, size > 0,
+              let expiry = image.expiresAt, expiry > 0 else { return nil }
+        var info = MaiCloudDriveMediaInfo()
+        guard name.withCString({ mai_session_attachment_media_info($0, &info) != 0 }),
+              String(cString: info.media_type_utf8) == "image",
+              String(cString: info.content_type_utf8) == mime, size <= info.max_size_bytes else { return nil }
+        accountID = owner.accountID; ownerSlot = owner.slot; ownerLoginSessionID = login
+        sessionID = owner.sessionID; self.messageID = messageID; partID = part.id
+        attachmentID = id; self.name = name; contentType = mime; sizeBytes = size; expiresAt = expiry
+    }
+}
+
+enum AIRemoteImageError: LocalizedError {
+    case unavailable, pending, uploadFailed, expired, changed
+    var errorDescription: String? {
+        switch self {
+        case .unavailable: "图片暂不可用"
+        case .pending: "图片正在同步"
+        case .uploadFailed: "图片同步失败"
+        case .expired: "图片已过期"
+        case .changed: "会话已切换"
+        }
+    }
+}
+
+/// Only completed, exact-size files with a matching receipt are reusable. This
+/// actor does filesystem work off MainActor; HTTP/OSS stays in the shared C++ core.
+private actor AIRemoteImageCache {
+    private struct Receipt: Codable {
+        let signature: String
+        let sha256: String
+    }
+    private let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("MaiSessionTemporaryImages", isDirectory: true)
+        .resolvingSymlinksInPath().standardizedFileURL
+    private var invalidated = false
+
+    private func directory(_ request: AIRemoteImageRequest) -> URL {
+        root.appendingPathComponent(request.accountKey, isDirectory: true)
+            .appendingPathComponent(request.cacheKey, isDirectory: true)
+    }
+    private func image(_ directory: URL, _ request: AIRemoteImageRequest) -> URL {
+        directory.appendingPathComponent(request.name)
+    }
+    private func completeBytes(_ url: URL, _ request: AIRemoteImageRequest) -> Data? {
+        guard url.resolvingSymlinksInPath().standardizedFileURL == url.standardizedFileURL,
+              let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              values.isRegularFile == true, let size = values.fileSize, UInt64(size) == request.sizeBytes,
+              let bytes = try? Data(contentsOf: url), UInt64(bytes.count) == request.sizeBytes else { return nil }
+        return bytes
+    }
+    func cached(_ request: AIRemoteImageRequest) -> URL? {
+        guard !invalidated else { return nil }
+        let directory = directory(request)
+        let receiptURL = directory.appendingPathComponent("complete.json")
+        guard receiptURL.resolvingSymlinksInPath().standardizedFileURL == receiptURL.standardizedFileURL,
+              let length = try? receiptURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              length > 0, length <= 4_096,
+              let raw = try? Data(contentsOf: receiptURL),
+              let receipt = try? JSONDecoder().decode(Receipt.self, from: raw),
+              receipt.signature == request.signature,
+              let bytes = completeBytes(image(directory, request), request),
+              SHA256.hash(data: bytes).map({ String(format: "%02x", $0) }).joined() == receipt.sha256
+        else { return nil }
+        return image(directory, request)
+    }
+    func staging(_ request: AIRemoteImageRequest) throws -> URL {
+        guard !invalidated else { throw CancellationError() }
+        let folder = root.appendingPathComponent(request.accountKey, isDirectory: true)
+            .appendingPathComponent("staging-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return image(folder, request)
+    }
+    func commit(_ source: URL, request: AIRemoteImageRequest) throws -> URL {
+        guard !invalidated, let bytes = completeBytes(source, request) else {
+            throw AIRemoteImageError.unavailable
+        }
+        if let existing = cached(request) { discard(source); return existing }
+        let receipt = Receipt(signature: request.signature,
+            sha256: SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
+        let stage = source.deletingLastPathComponent()
+        try JSONEncoder().encode(receipt).write(to: stage.appendingPathComponent("complete.json"), options: .atomic)
+        let destination = directory(request)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        try FileManager.default.moveItem(at: stage, to: destination)
+        return image(destination, request)
+    }
+    func discard(_ source: URL) {
+        let folder = source.deletingLastPathComponent()
+        guard folder.lastPathComponent.hasPrefix("staging-"),
+              folder.path.hasPrefix(root.path + "/") else { return }
+        try? FileManager.default.removeItem(at: folder)
+    }
+    func invalidate(accountID: String) {
+        invalidated = true
+        let account = SHA256.hash(data: Data(accountID.utf8)).map { String(format: "%02x", $0) }.joined()
+        try? FileManager.default.removeItem(at: root.appendingPathComponent(account, isDirectory: true))
+    }
+}
+
 struct AIPart: Codable, Identifiable, Sendable, Equatable {
     let id: String
     let kind: String
@@ -927,10 +1119,14 @@ struct AIPart: Codable, Identifiable, Sendable, Equatable {
     var attachmentID: String? = nil
     var name: String? = nil
     var created: Int64? = nil
+    var filename: String? = nil
+    var remotePartID: String? = nil
+    var remoteImage: AIRemoteImageMetadata? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, kind, text, tool, input, output, error, state, path
-        case mimeType, messageId, preview, name, created
+        case mimeType, messageId, preview, name, created, filename, remoteImage
+        case remotePartID = "remotePartId"
         case attachmentID = "attachment_id"
     }
 
@@ -1700,6 +1896,8 @@ final class AIAssistantModel: ObservableObject {
     static func invalidateOutgoingForDeletedAccount() async {
         let model = shared
         model.outgoingPermanentlyInvalidated = true
+        model.remoteImageFiles.removeAll()
+        await model.remoteImageCache.invalidate(accountID: model.screenFrameCurrentAccountID)
         model.clearQuestionConversationState()
         model.outgoingPump?.stop()
         // actor 屏障覆盖正在等待模型文件/凭据的 open/save；删除目录后不能迟到重建。
@@ -1804,6 +2002,8 @@ final class AIAssistantModel: ObservableObject {
     private var deletedDraftSessions: Set<String> = []
     private let backend = AIAssistantBackend()
     private let remoteTransport = AIRemoteSessionTransport()
+    private let remoteImageCache = AIRemoteImageCache()
+    @Published private var remoteImageFiles: [String: URL] = [:]
     private var poll: Task<Void, Never>?
     private var remotePoll: Task<Void, Never>?
     private var initiallyPublishedSessions: Set<String> = []
@@ -2064,6 +2264,9 @@ final class AIAssistantModel: ObservableObject {
         case .workspace(let path): workspacePath = path
         case .remoteSessions(let values): remoteSessions = values
         case .clearRemoteSelection: selectedRemote = nil
+        case .remoteImagePage(let data, let remote):
+            pendingRemoteSelection = remote
+            applyRemoteHistory(data, source: remote, older: false)
         case .attachments(let files, let firstSession):
             pendingAttachments.merge(files) { _, replacement in replacement }
             firstMessageSessionID = firstSession
@@ -2185,6 +2388,7 @@ final class AIAssistantModel: ObservableObject {
     }
 
     private func stopRemoteSync() {
+        remoteImageFiles.removeAll()
         remotePoll?.cancel()
         remotePoll = nil
         remotePushTask?.cancel()
@@ -2770,7 +2974,7 @@ final class AIAssistantModel: ObservableObject {
                 // 所属设备的相对路径不能在本机工作区解析，否则可能显示同名的其他文件。
                 part.path = nil
                 parts.append(part)
-                if part.attachmentID == nil { parts.append(AIPart(
+                if part.attachmentID == nil && part.remoteImage == nil { parts.append(AIPart(
                     id: part.id + "-remote-placeholder", kind: "text",
                     text: part.kind == "image" ? "[图片在所属设备，暂不可跨设备预览]" :
                         "[视频在所属设备，暂不可跨设备预览]",
@@ -3423,6 +3627,9 @@ final class AIAssistantModel: ObservableObject {
 
     func messagesForMediaPlaylist(in session: String) async -> [AIMessage] {
         guard !session.isEmpty, selected == session else { return [] }
+        // A remote ID must never query an unrelated local Session with the same
+        // ID. Its preview only includes already received/cached remote images.
+        if selectedRemote != nil { return messages }
         var collected: [AIMessage] = []
         var before = ""
         do {
@@ -4348,6 +4555,103 @@ final class AIAssistantModel: ObservableObject {
     }
     func attachments(for session: String) -> [AIImportedFile] {
         pendingAttachments[attachmentKey(for: session)] ?? []
+    }
+
+    var remoteImageOwner: AIRemoteImageOwner? {
+        guard let remote = selectedRemote, !screenFrameCurrentAccountID.isEmpty else { return nil }
+        return AIRemoteImageOwner(accountID: screenFrameCurrentAccountID, slot: remote.deviceSlot,
+            loginSessionID: remote.loginSessionID, sessionID: remote.sessionID,
+            selectionGeneration: selectionGeneration)
+    }
+
+    func cachedRemoteImagePath(owner: AIRemoteImageOwner, messageID: String, part: AIPart) -> String? {
+        guard remoteImageOwner == owner,
+              let request = AIRemoteImageRequest(owner: owner, messageID: messageID, part: part),
+              let file = remoteImageFiles[request.signature], FileManager.default.fileExists(atPath: file.path)
+        else { return nil }
+        return file.path
+    }
+
+    private func isCurrentRemoteImage(owner: AIRemoteImageOwner, messageID: String, part: AIPart) -> Bool {
+        self === Self.shared && !outgoingPermanentlyInvalidated && remoteImageOwner == owner &&
+            messages.contains { $0.id == messageID && $0.parts.contains {
+                $0.id == part.id && $0.remoteImage == part.remoteImage
+            } }
+    }
+
+    func loadRemoteImage(owner: AIRemoteImageOwner, messageID: String, part: AIPart) async throws -> URL {
+        try Task.checkCancellation()
+        guard isCurrentRemoteImage(owner: owner, messageID: messageID, part: part),
+              let metadata = part.remoteImage, metadata.retention == "temporary" else {
+            throw AIRemoteImageError.unavailable
+        }
+        if metadata.state == "pending" { throw AIRemoteImageError.pending }
+        if metadata.state == "failed" {
+            throw metadata.isExpired ? AIRemoteImageError.expired : AIRemoteImageError.uploadFailed
+        }
+        guard let request = AIRemoteImageRequest(owner: owner, messageID: messageID, part: part) else {
+            throw AIRemoteImageError.unavailable
+        }
+        // The completed local copy outlives the temporary OSS object. Expiry is
+        // checked only after this exact identity/integrity lookup, before HTTP.
+        if let file = await remoteImageCache.cached(request) {
+            try Task.checkCancellation()
+            guard isCurrentRemoteImage(owner: owner, messageID: messageID, part: part) else {
+                throw AIRemoteImageError.changed
+            }
+            remoteImageFiles[request.signature] = file
+            return file
+        }
+        remoteImageFiles.removeValue(forKey: request.signature)
+        try Task.checkCancellation()
+        guard isCurrentRemoteImage(owner: owner, messageID: messageID, part: part) else {
+            throw AIRemoteImageError.changed
+        }
+        guard !request.isExpired else { throw AIRemoteImageError.expired }
+        let staged = try await remoteImageCache.staging(request)
+        do {
+            try Task.checkCancellation()
+            guard isCurrentRemoteImage(owner: owner, messageID: messageID, part: part) else {
+                throw AIRemoteImageError.changed
+            }
+            #if DEBUG && targetEnvironment(simulator)
+            if ProcessInfo.processInfo.arguments.contains("--ai-remote-image-ui-test") {
+                guard let handler = uiTestSupport.remoteImageDownloadHandler else {
+                    throw AIBackendError(message: "Isolated image download fixture is missing")
+                }
+                uiTestSupport.remoteImageDownloadCount += 1
+                uiTestSupport.remoteImageRequestedIDs.append(request.attachmentID)
+                try await handler(request, staged)
+            } else {
+                _ = try await MaiCloudDriveClient.shared.downloadTemporarySessionImage(request, to: staged) { [weak self] in
+                    self?.isCurrentRemoteImage(owner: owner, messageID: messageID, part: part) == true
+                }
+            }
+            #else
+            _ = try await MaiCloudDriveClient.shared.downloadTemporarySessionImage(request, to: staged) { [weak self] in
+                self?.isCurrentRemoteImage(owner: owner, messageID: messageID, part: part) == true
+            }
+            #endif
+            try Task.checkCancellation()
+            guard isCurrentRemoteImage(owner: owner, messageID: messageID, part: part) else {
+                throw AIRemoteImageError.changed
+            }
+            guard !request.isExpired else { throw AIRemoteImageError.expired }
+            let file = try await remoteImageCache.commit(staged, request: request)
+            try Task.checkCancellation()
+            guard isCurrentRemoteImage(owner: owner, messageID: messageID, part: part) else {
+                throw AIRemoteImageError.changed
+            }
+            remoteImageFiles[request.signature] = file
+            return file
+        } catch {
+            await remoteImageCache.discard(staged)
+            if let failure = error as? MaiCloudDriveError,
+               failure.httpStatus == 410, failure.errorCode == "image_expired" {
+                throw AIRemoteImageError.expired
+            }
+            throw error
+        }
     }
 
     func downloadRemoteAttachment(_ part: AIPart)

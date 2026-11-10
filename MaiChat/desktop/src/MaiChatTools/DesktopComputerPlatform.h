@@ -27,9 +27,18 @@ struct DesktopNativeElement {
     double height = 0;
 };
 
-enum class DesktopNativeInputKind {
-    Click, DoubleClick, RightClick, Drag, Type, Key, ReplaceFocusedText, Scroll
+// Bounds use native pointer coordinates; the observation reports PNG pixels
+// separately and supplies the normalized mapping between these spaces.
+struct DesktopNativeDisplay {
+    std::uint64_t id = 0;
+    double x = 0;
+    double y = 0;
+    double width = 0;
+    double height = 0;
+    bool primary = false;
 };
+
+enum class DesktopNativeInputKind { Click, DoubleClick, RightClick, Drag, Type, Key, ReplaceFocusedText, Scroll, Move };
 
 // The controller resolves observed window coordinates before native dispatch.
 // Cancellation is checked throughout gestures; native code always releases its
@@ -48,10 +57,15 @@ struct DesktopNativeInput {
     // keeps the older free function wrappers scoped to their initial foreground.
     std::uint64_t expectedWindowId = 0;
     std::uint64_t expectedProcessId = 0;
+    // Explicit display scope permits intentional foreground changes; the legacy
+    // window scope continues checking the selected window identity.
+    bool desktopScope = false;
+    DesktopNativeDisplay display;
     std::function<bool()> isCanceled;
 };
 
 MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows();
+MaiResult<std::vector<DesktopNativeDisplay>> maiDesktopDisplays();
 MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(
     const DesktopNativeWindow& window);
 MaiError maiDesktopActivateWindow(const DesktopNativeWindow& window);

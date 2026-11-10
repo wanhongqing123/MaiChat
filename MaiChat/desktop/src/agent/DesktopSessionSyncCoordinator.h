@@ -103,6 +103,8 @@ private:
     void scheduleSnapshot(const QString& sessionId, const QString& messageId = QString());
     void publishSnapshot(const QString& sessionId);
     void publishPage(const QString& sessionId, const QJsonObject& page);
+    void configureImagePublicationScope();
+    void startPublishedImageUploads(const QString& sessionId, const QJsonObject& message);
     void restorePublishedRoomState(const QString& sessionId);
     void processBackfillPage();
 
@@ -152,6 +154,7 @@ private:
     DeviceHandler deviceHandler_;
     PayloadHandler payloadHandler_;
     AttachmentAccessProvider attachmentAccessProvider_;
+    QSet<QString> uploadingImages_;
     QQueue<Outgoing> outbound_;
     bool started_ = false;
     bool sending_ = false;

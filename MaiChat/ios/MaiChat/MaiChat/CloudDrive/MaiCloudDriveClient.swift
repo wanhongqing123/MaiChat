@@ -129,6 +129,7 @@ struct MaiCloudDriveError: LocalizedError, Sendable {
     let status: Int32
     let httpStatus: Int
     let detail: String
+    var errorCode: String? = nil
 
     var errorDescription: String? {
         if status == Int32(MAI_CLOUD_DRIVE_CANCELED.rawValue) { return "已暂停，可稍后继续上传" }
@@ -499,6 +500,31 @@ struct MaiCloudDriveClient: Sendable {
             contentType: link.contentType, mediaType: link.mediaType)
     }
 
+    // This adapter supplies identity and a sandbox output path only. The shared
+    // core validates the signed-read tuple, fixed expiry and complete file size,
+    // then downloads directly from OSS with its existing cancellation token.
+    func downloadTemporarySessionImage(_ image: AIRemoteImageRequest, to target: URL,
+        isCurrent: @escaping @MainActor @Sendable () -> Bool) async throws -> URL {
+        let data = try await request(action: MAI_SESSION_IMAGE_DOWNLOAD, payload: [
+            "attachment_id": image.attachmentID, "name": image.name,
+            "content_type": image.contentType, "media_type": "image",
+            "size_bytes": image.sizeBytes, "expires_at": image.expiresAt, "output_path": target.path
+        ], room: SessionRoom(ownerSlot: image.ownerSlot, ownerLoginSessionID: image.ownerLoginSessionID,
+                             sessionID: image.sessionID), sessionImage: (image.messageID, image.partID),
+           isCurrent: isCurrent)
+        let result = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard result?["downloaded"] as? Bool == true,
+              result?["attachment_id"] as? String == image.attachmentID,
+              result?["path"] as? String == target.path,
+              (result?["size_bytes"] as? NSNumber)?.uint64Value == image.sizeBytes,
+              (result?["expires_at"] as? NSNumber)?.int64Value == image.expiresAt,
+              result?["content_type"] as? String == image.contentType,
+              result?["media_type"] as? String == "image" else {
+            throw Self.error(status: MAI_CLOUD_DRIVE_INVALID_RESPONSE)
+        }
+        return target
+    }
+
     func cleanupSessionRoom(_ room: SessionRoom) async throws {
         _ = try await request(action: MAI_SESSION_ATTACHMENT_CLEANUP_ROOM,
                               payload: [:], room: room)
@@ -838,9 +864,16 @@ struct MaiCloudDriveClient: Sendable {
 
     private func request(action: MaiCloudDriveAction,
                          payload: [String: Any],
-                         room: SessionRoom? = nil) async throws -> Data {
+                         room: SessionRoom? = nil,
+                         sessionImage: (messageID: String, partID: String)? = nil,
+                         isCurrent: (@MainActor @Sendable () -> Bool)? = nil) async throws -> Data {
+        try Task.checkCancellation()
         guard let access = try await MaiChatAuthClient.shared.cloudDriveAccessIfAvailable()
         else { throw MaiChatAuthError.sessionExpired }
+        // Credentials may have awaited renewal. Do not submit an old image
+        // tuple using whichever account became current during that wait.
+        if let isCurrent, !(await isCurrent()) { throw CancellationError() }
+        try Task.checkCancellation()
         let certificate = try Self.certificate()
         let payload = try JSONSerialization.data(withJSONObject: payload)
         guard let json = String(data: payload, encoding: .utf8),
@@ -853,7 +886,7 @@ struct MaiCloudDriveClient: Sendable {
                 DispatchQueue.global(qos: .utility).async {
                     continuation.resume(with: Self.performRequest(
                         action: action, payload: json, access: access,
-                        certificate: certificate, cancel: cancel, room: room))
+                        certificate: certificate, cancel: cancel, room: room, sessionImage: sessionImage))
                 }
             }
         } onCancel: { cancel.cancel() }
@@ -863,7 +896,8 @@ struct MaiCloudDriveClient: Sendable {
                                        access: MaiChatCloudDriveAccess,
                                        certificate: (path: String, pem: Data?),
                                        cancel: MaiCloudDriveCancelToken,
-                                       room: SessionRoom?)
+                                       room: SessionRoom?,
+                                       sessionImage: (messageID: String, partID: String)?)
         -> Result<Data, Error> {
         let proxy = MaiChatAttachmentProxyContext()
         let signedHost = access.authBaseURL.contains("localhost") ||
@@ -884,8 +918,20 @@ struct MaiCloudDriveClient: Sendable {
                             // 文件操作只在探测成功后发送一次，失败留给下一次重新选路。
                             options.first_party_route_selector = maiChatSelectFirstPartyRoute
                             options.first_party_route_invalidator = maiChatInvalidateFirstPartyRoute
-                            let invokeRequest = { mai_cloud_drive_request(
-                                &options, action, json, cancel.pointer, &native) }
+                            let invokeRequest = {
+                                if let image = sessionImage {
+                                    image.messageID.withCString { message in
+                                        image.partID.withCString { part in
+                                            options.temporary_session_image = 1
+                                            options.message_id_utf8 = message
+                                            options.part_id_utf8 = part
+                                            mai_cloud_drive_request(&options, action, json, cancel.pointer, &native)
+                                        }
+                                    }
+                                } else {
+                                    mai_cloud_drive_request(&options, action, json, cancel.pointer, &native)
+                                }
+                            }
                             let invoke = {
                                 if let room {
                                     room.ownerSlot.withCString { slot in
@@ -927,7 +973,8 @@ struct MaiCloudDriveClient: Sendable {
         let body = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any]
         return MaiCloudDriveError(status: Int32(result.status.rawValue),
                                   httpStatus: Int(result.http_status),
-                                  detail: body?["error"] as? String ?? "")
+                                  detail: body?["error"] as? String ?? "",
+                                  errorCode: body?["error_code"] as? String)
     }
 
     private static func error(status: MaiCloudDriveStatus) -> MaiCloudDriveError {

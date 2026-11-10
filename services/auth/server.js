@@ -56,6 +56,26 @@ function videoCircleFromEnv(env, fetcher = fetch) {
   };
 }
 
+// Verify the exact published image in Sync's own database. Keep this call on
+// loopback and forward only the already authenticated account Bearer; there is
+// no new shared secret or caller-controlled service origin.
+function sessionAttachmentAuthorizerFromEnv(env,fetcher = fetch) {
+  const port = Number(env.MAICHAT_SESSION_SYNC_PORT || 9102);
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error('Invalid Session Sync port');
+  return async (binding,headers) => {
+    const bearer = headers?.authorization || headers?.Authorization;
+    if (typeof bearer !== 'string' || !bearer.startsWith('Bearer ')) return false;
+    const response = await fetcher(`http://127.0.0.1:${port}/v1/session-sync/authorize-attachment`,{
+      method:'POST',redirect:'error',signal:AbortSignal.timeout(5000),
+      headers:{'Content-Type':'application/json',Authorization:bearer},body:JSON.stringify(binding)
+    });
+    if ([400,401,403,404,409,410].includes(response.status)) return false;
+    if (response.status !== 200) throw new Error('Session ownership verification unavailable');
+    return (await response.json()).ok === true;
+  };
+}
+
 function cloudDriveFromEnv(env, fetcher = fetch) {
   if (env.MAICHAT_CLOUD_DRIVE_ENABLED === undefined ||
       env.MAICHAT_CLOUD_DRIVE_ENABLED === '0') return null;
@@ -84,12 +104,14 @@ function cloudDriveFromEnv(env, fetcher = fetch) {
   };
   return {
     maxVideoBytes,quotaBytes,allowedAccountIds,
+    authorizeAttachment:sessionAttachmentAuthorizerFromEnv(env,fetcher),
     startUpload:async (accountId,key,contentType) =>
       (await request('init',{ account_id:accountId,object_key:key,
         content_type:contentType })).upload_id,
-    signPart:async (accountId,key,uploadId,partNumber,bytes,md5) =>
+    signPart:async (accountId,key,uploadId,partNumber,bytes,md5,expiresAt) =>
       request('sign-part',{ account_id:accountId,object_key:key,upload_id:uploadId,
-        part_number:partNumber,expected_bytes:bytes,content_md5_base64:md5 }),
+        part_number:partNumber,expected_bytes:bytes,content_md5_base64:md5,
+        ...(expiresAt !== undefined ? {expires_at:expiresAt} : {}) }),
     listParts:async (accountId,key,uploadId) =>
       (await request('list-parts',{ account_id:accountId,object_key:key,
         upload_id:uploadId })).parts,
@@ -109,8 +131,9 @@ function cloudDriveFromEnv(env, fetcher = fetch) {
     verifyObject:async (accountId,key,bytes,contentType) =>
       request('verify',{ account_id:accountId,object_key:key,
         expected_bytes:bytes,content_type:contentType }),
-    signRead:async (accountId,key) =>
-      (await request('read',{ account_id:accountId,object_key:key })).read_url,
+    signRead:async (accountId,key,expiresAt) =>
+      (await request('read',{ account_id:accountId,object_key:key,
+        ...(expiresAt !== undefined ? {expires_at:expiresAt} : {}) })).read_url,
     signThumbnail:async (accountId,key) =>
       (await request('thumbnail',{ account_id:accountId,object_key:key })).thumbnail_url,
     deleteObject:async (accountId,key) => {
@@ -283,4 +306,5 @@ function start(env = process.env) {
 if (require.main === module) start();
 
 module.exports = { createServer, start, requireDeviceSlotFromEnv,
-  videoCircleFromEnv, cloudDriveFromEnv, cloudDriveAllowedAccountsFromEnv };
+  videoCircleFromEnv, cloudDriveFromEnv, cloudDriveAllowedAccountsFromEnv,
+  sessionAttachmentAuthorizerFromEnv };

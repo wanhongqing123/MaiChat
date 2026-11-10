@@ -2,7 +2,9 @@
 #include "agent/DesktopSessionSyncHost.h"
 
 #include <QDir>
+#include <QDateTime>
 #include <QFileInfo>
+#include <QHash>
 #include <QJsonDocument>
 #include <QPointer>
 #include <QRegularExpression>
@@ -18,6 +20,7 @@
 
 #include "MaiQuestionTranscript.h"
 #include "agent/AgentController.h"
+#include "agent/DesktopSessionAttachments.h"
 
 namespace {
 
@@ -115,6 +118,8 @@ QJsonObject serializeMessage(const MaiMessage& message, bool busy, const std::st
 }  // namespace
 
 struct DesktopSessionSyncHost::Runtime {
+    const qint64 liveImagesSince = QDateTime::currentMSecsSinceEpoch();
+    QHash<QString, QHash<QString, QSet<QString>>> pendingLiveImages;
     QPointer<AgentController> subscribedController;
     std::atomic<std::uint64_t> questionRevision{1};
     MaiEventBus::Token eventToken = 0;
@@ -144,6 +149,64 @@ void DesktopSessionSyncHost::setDefaultWorkspaceDirectory(const QString& directo
     defaultWorkspaceDirectory_ = directory;
 }
 
+void DesktopSessionSyncHost::setImagePublicationScope(const QString& account, const QString& slot,
+                                                     const QString& login) {
+    imageAccount_ = account; imageSlot_ = slot; imageLogin_ = login;
+    if (account.isEmpty() || slot.isEmpty() || login.isEmpty()) return;
+    const auto pending = runtime_->pendingLiveImages;
+    runtime_->pendingLiveImages.clear();
+    for (auto session = pending.cbegin(); session != pending.cend(); ++session)
+        for (auto message = session->cbegin(); message != session->cend(); ++message)
+            for (const auto& part : *message) enrollLiveImages(session.key(), message.key(), part);
+}
+
+void DesktopSessionSyncHost::enrollLiveImages(const QString& sessionId, const QString& messageId,
+                                            const QString& partId) {
+    MaiSession session;
+    MaiMessage message;
+    if (!controller_.agent().getSession(sessionId.toStdString(), session) || !session.isRoot() ||
+        !controller_.agent().getMessage(sessionId.toStdString(), messageId.toStdString(), message) ||
+        (message.role != MaiRole::User && message.role != MaiRole::Assistant)) return;
+    for (const auto& part : message.parts) {
+        if ((!partId.isEmpty() && text(part.id) != partId) || part.created < runtime_->liveImagesSince ||
+            !std::holds_alternative<MaiImagePart>(part.body)) continue;
+        if (imageAccount_.isEmpty() || imageLogin_.isEmpty()) {
+            // An image can arrive while the first presence ACK is in flight.
+            // Retain only these observed live IDs, never scan history later.
+            runtime_->pendingLiveImages[sessionId][messageId].insert(text(part.id));
+            continue;
+        }
+        DesktopSessionAttachments::enrollTemporaryImage(imageAccount_,
+            {imageSlot_, imageLogin_, sessionId}, messageId, text(part.id));
+    }
+}
+
+QString DesktopSessionSyncHost::imageSource(const QString& sessionId, const QString& messageId,
+                                           const QString& partId) const {
+    MaiMessage message;
+    if (!controller_.agent().getMessage(sessionId.toStdString(), messageId.toStdString(), message)) return {};
+    for (const auto& part : message.parts)
+        if (text(part.id) == partId)
+            if (const auto* image = std::get_if<MaiImagePart>(&part.body)) return text(image->path);
+    return {};
+}
+
+QJsonObject DesktopSessionSyncHost::decorateImages(QJsonObject message, const QString& sessionId) const {
+    if (imageAccount_.isEmpty()) return message;
+    auto parts = message.value(QStringLiteral("parts")).toArray();
+    const auto messageId = message.value(QStringLiteral("id")).toString();
+    for (int index = 0; index < parts.size(); ++index) {
+        auto part = parts[index].toObject();
+        if (part.value(QStringLiteral("kind")).toString() != QStringLiteral("image")) continue;
+        const auto image = DesktopSessionAttachments::imagePublication(imageAccount_,
+            {imageSlot_, imageLogin_, sessionId}, messageId, part.value(QStringLiteral("id")).toString());
+        if (!image.isEmpty()) part.insert(QStringLiteral("remoteImage"), image);
+        parts[index] = part;
+    }
+    message.insert(QStringLiteral("parts"), parts);
+    return message;
+}
+
 QJsonArray DesktopSessionSyncHost::rootSessions() const {
     QJsonArray result;
     for (const MaiSession& session : controller_.agent().listSessions()) {
@@ -163,7 +226,8 @@ QJsonObject DesktopSessionSyncHost::historyMessage(const QString& sessionId, con
     if (!controller_.agent().getSession(sessionId.toStdString(), session) || !session.isRoot() ||
         !controller_.agent().getMessage(sessionId.toStdString(), messageId.toStdString(), message))
         return {};
-    return serializeMessage(message, controller_.agent().isBusy(sessionId.toStdString()), sessionId.toStdString());
+    return decorateImages(serializeMessage(message, controller_.agent().isBusy(sessionId.toStdString()),
+                                          sessionId.toStdString()), sessionId);
 }
 
 QJsonObject DesktopSessionSyncHost::historyPage(const QString& sessionId, const QString& beforeId, int limit) const {
@@ -175,7 +239,7 @@ QJsonObject DesktopSessionSyncHost::historyPage(const QString& sessionId, const 
     const auto page =
         controller_.agent().listMessagesPage(sessionId.toStdString(), beforeId.toStdString(), size_t(limit));
     for (const MaiMessage& message : page)
-        messages.append(serializeMessage(message, controller_.agent().isBusy(session.id), session.id));
+        messages.append(decorateImages(serializeMessage(message, controller_.agent().isBusy(session.id), session.id), sessionId));
     QJsonArray permissions;
     for (const MaiPermissionRequest& request : controller_.agent().listPendingPermissions()) {
         if (request.sessionId != session.id) continue;
@@ -259,7 +323,7 @@ QJsonObject DesktopSessionSyncHost::messageUpdate(const QString& sessionId, cons
                 const auto live = controller_.livePartText(sessionId, text(part.id)).toUtf8().toStdString();
                 if (live.size() > body->text.size()) body->text = live;
             }
-    return serializeMessage(message, busy, session.id);
+    return decorateImages(serializeMessage(message, busy, session.id), sessionId);
 }
 
 QJsonObject DesktopSessionSyncHost::applyCommand(const QString& sessionId, const QJsonObject& payload) {

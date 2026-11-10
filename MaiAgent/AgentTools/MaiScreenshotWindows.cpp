@@ -53,6 +53,70 @@ constexpr DWORD kCancelPollMs = 20;
 constexpr DWORD kEnvironmentCheckMs = 250;
 constexpr std::size_t kMaximumPendingCaptures = 64;
 
+// 帧序号和接收时间是独立屏障：调用方同时提供两者时必须同时严格递增。
+// 不能用本次编码时间替代原始帧时间，也不能把相等的缓存帧作为操作后的新画面。
+bool framePassesBarrier(const MaiScreenshotRequest& request, std::uint64_t sequence,
+                        std::int64_t receivedAtMs, std::int64_t sourceProducedAtMs) {
+    return (!request.afterFrameSequence || sequence > request.afterFrameSequence) &&
+           (!request.afterFrameReceivedAtMs ||
+            (receivedAtMs > request.afterFrameReceivedAtMs && sourceProducedAtMs > 0 &&
+             sourceProducedAtMs > request.afterFrameReceivedAtMs));
+}
+
+// QPC 频率不是固定的 10 MHz。先分离整秒再缩放余数，并向上取整后采样，
+// 换算源帧时间时得到保守下界；异常频率或无法安全表示的值不给出时间证明。
+bool qpcIn100nsCeil(std::int64_t counter, std::int64_t frequency, std::int64_t& value) {
+    constexpr std::int64_t ticksPerSecond = 10000000;
+    if (counter < 0 || frequency <= 0) return false;
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+    const auto seconds = counter / frequency;
+    const auto remainder = counter % frequency;
+    if (seconds > maximum / ticksPerSecond || remainder > maximum / ticksPerSecond) return false;
+    const auto scaledRemainder = remainder * ticksPerSecond;
+    const auto fraction = scaledRemainder / frequency + (scaledRemainder % frequency != 0);
+    const auto whole = seconds * ticksPerSecond;
+    if (whole > maximum - fraction) return false;
+    value = whole + fraction;
+    return true;
+}
+
+std::int64_t sourceProducedUnixMs(std::int64_t sourceQpc100ns, std::int64_t unix100ns,
+                                  std::int64_t qpcAfter, std::int64_t frequency) {
+    std::int64_t sampledQpc100ns = 0;
+    if (sourceQpc100ns <= 0 || unix100ns <= 0 ||
+        !qpcIn100nsCeil(qpcAfter, frequency, sampledQpc100ns) || sourceQpc100ns > sampledQpc100ns)
+        return 0;
+    const auto age100ns = sampledQpc100ns - sourceQpc100ns;
+    if (age100ns >= unix100ns) return 0;
+    return (unix100ns - age100ns) / 10000;
+}
+
+// WGC 的 SystemRelativeTime 是 compositor 产出帧时的 QPC TimeSpan（100ns），
+// 不是 TryGetNextFrame/drain 的时间。以 QPC 夹取精确 UTC，再减去后采样得到的帧龄，
+// 防止输入前已排队、输入后才取出的旧像素被标记为操作后的观察。
+// 官方契约：learn.microsoft.com/uwp/api/windows.graphics.capture.direct3d11captureframe.systemrelativetime
+// TimeSpan 单位：learn.microsoft.com/uwp/api/windows.foundation.timespan.duration
+std::int64_t frameSourceProducedAtMs(std::int64_t sourceQpc100ns) {
+    LARGE_INTEGER frequency{};
+    LARGE_INTEGER before{};
+    LARGE_INTEGER after{};
+    if (!::QueryPerformanceFrequency(&frequency) || !::QueryPerformanceCounter(&before)) return 0;
+    FILETIME utc{};
+    ::GetSystemTimePreciseAsFileTime(&utc);
+    if (!::QueryPerformanceCounter(&after) || before.QuadPart < 0 ||
+        after.QuadPart < before.QuadPart)
+        return 0;
+    ULARGE_INTEGER ticks{};
+    ticks.LowPart = utc.dwLowDateTime;
+    ticks.HighPart = utc.dwHighDateTime;
+    constexpr std::uint64_t unixEpoch100ns = 116444736000000000ULL;
+    if (ticks.QuadPart <= unixEpoch100ns) return 0;
+    const auto unix100ns = ticks.QuadPart - unixEpoch100ns;
+    if (unix100ns > std::uint64_t(std::numeric_limits<std::int64_t>::max())) return 0;
+    return sourceProducedUnixMs(sourceQpc100ns, std::int64_t(unix100ns), after.QuadPart,
+                                frequency.QuadPart);
+}
+
 MaiError hresultError(const char* operation, HRESULT result) {
     char code[16] = {};
     std::snprintf(code, sizeof(code), "%08lX", static_cast<unsigned long>(result));
@@ -315,6 +379,30 @@ bool isCaptureWindow(HWND window) {
            ::GetAncestor(window, GA_ROOT) == window;
 }
 
+// 只接受本次枚举仍存在的 HMONITOR，不能把失效标识重新解释为主屏或鼠标所在屏。
+bool isCaptureMonitor(HMONITOR monitor) {
+    if (!monitor) return false;
+    struct Search {
+        HMONITOR selected = nullptr;
+        bool found = false;
+    } search;
+    search.selected = monitor;
+    ::EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR candidate, HDC, LPRECT, LPARAM parameter) -> BOOL {
+            auto& search = *reinterpret_cast<Search*>(parameter);
+            if (candidate != search.selected) return TRUE;
+            MONITORINFO information{};
+            information.cbSize = sizeof(information);
+            search.found = ::GetMonitorInfoW(candidate, &information) &&
+                           information.rcMonitor.right > information.rcMonitor.left &&
+                           information.rcMonitor.bottom > information.rcMonitor.top;
+            return FALSE;
+        },
+        reinterpret_cast<LPARAM>(&search));
+    return search.found;
+}
+
 MaiError closedTargetError() {
     return MaiError::make(MaiErrorCode::NotFound,
                           "capture target is closed, hidden, minimized, or disconnected");
@@ -513,6 +601,8 @@ private:
         mStagingTexture.Reset();
         mFrameSequence = 0;
         mFrameReceivedAtMs = 0;
+        mFrameSourceProducedAtMs = 0;
+        mFrameSourceQpc100ns = 0;
     }
 
     void closeCapture() noexcept {
@@ -608,6 +698,18 @@ private:
                                       "windowId must be a non-zero native window identifier");
             }
             window = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(request.windowId));
+        } else if (request.target == MaiScreenshotTarget::DisplayById) {
+            if (request.displayId == 0 ||
+                request.displayId > std::numeric_limits<std::uintptr_t>::max()) {
+                closeCapture();
+                return MaiError::make(MaiErrorCode::InvalidInput,
+                                      "displayId must be a non-zero native monitor identifier");
+            }
+            monitor = reinterpret_cast<HMONITOR>(static_cast<std::uintptr_t>(request.displayId));
+            if (!isCaptureMonitor(monitor)) {
+                closeCapture();
+                return closedTargetError();
+            }
         } else if (request.target == MaiScreenshotTarget::DisplayUnderPointer) {
             POINT pointer{};
             if (!::GetCursorPos(&pointer)) {
@@ -681,9 +783,7 @@ private:
             ::GetWindowThreadProcessId(mWindow, &process);
             return isCaptureWindow(mWindow) && process == mWindowProcess;
         }
-        MONITORINFO information{};
-        information.cbSize = sizeof(information);
-        return mMonitor && ::GetMonitorInfoW(mMonitor, &information);
+        return isCaptureMonitor(mMonitor);
     }
 
     MaiError drainFrames(const std::shared_ptr<MaiScreenshotWakeState>& wake) {
@@ -745,6 +845,14 @@ private:
                 }
                 continue;
             }
+            std::int64_t sourceProducedAtMs = 0;
+            std::int64_t sourceQpc100ns = 0;
+            try {
+                sourceQpc100ns = frame.SystemRelativeTime().count();
+                sourceProducedAtMs = frameSourceProducedAtMs(sourceQpc100ns);
+            } catch (const winrt::hresult_error&) {
+                // 普通截图保留既有行为；需要新帧的命令无法证明源时间时继续等待，不能回退缓存。
+            }
             using Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
             const auto access = frame.Surface().as<IDirect3DDxgiInterfaceAccess>();
             ComPtr<ID3D11Texture2D> texture;
@@ -783,6 +891,8 @@ private:
                 mFrameSequence = ++mState.framesReceived;
             }
             mFrameReceivedAtMs = MaiTime::getCurrentTime();
+            mFrameSourceProducedAtMs = sourceProducedAtMs;
+            mFrameSourceQpc100ns = sourceQpc100ns;
         }
         return {};
     }
@@ -794,26 +904,50 @@ private:
     }
 
     MaiError captureCurrent(const MaiScreenshotRequest& request, MaiScreenshot& screenshot,
-                            const std::shared_ptr<MaiScreenshotWakeState>& wake) {
+                            const std::shared_ptr<MaiScreenshotWakeState>& wake,
+                            bool& freshnessTimedOut) {
+        freshnessTimedOut = false;
         if (isCanceled(request, wake)) return canceledCaptureError();
         MaiError error = selectTarget(request, wake);
         if (error.hasError()) return error;
         const auto started = std::chrono::steady_clock::now();
         const bool hadFrame = mLatestTexture != nullptr;
         const auto previousSequence = mFrameSequence;
-        auto timeout = std::chrono::milliseconds(hadFrame ? kCaptureSettleMs : kCaptureTimeoutMs);
+        const bool hasBarrier = request.afterFrameSequence || request.afterFrameReceivedAtMs;
+        auto timeout = std::chrono::milliseconds(hasBarrier || !hadFrame ? kCaptureTimeoutMs
+                                                                         : kCaptureSettleMs);
         for (;;) {
             if (isCanceled(request, wake)) return canceledCaptureError();
             error = checkEnvironment(false);
             if (error.hasError()) return error;
+            // 原生 WGC 实测会把 compositor 时间戳提前数毫秒交付。保留原始
+            // QPC，只在时钟确实赶上后重新换算；不把稍晚的 drain/编码时间
+            // 当成源时间。先检查这张候选再 drain，避免高帧率不断覆盖候选。
+            if (hasBarrier && mLatestTexture) {
+                if (!mFrameSourceProducedAtMs && mFrameSourceQpc100ns > 0)
+                    mFrameSourceProducedAtMs = frameSourceProducedAtMs(mFrameSourceQpc100ns);
+                if (framePassesBarrier(request, mFrameSequence, mFrameReceivedAtMs, mFrameSourceProducedAtMs))
+                    break;
+            }
             error = drainFrames(wake);
             if (error.hasError()) return error;
-            if (mLatestTexture && (!hadFrame || mFrameSequence > previousSequence)) break;
+            if (mLatestTexture &&
+                (hasBarrier ? framePassesBarrier(request, mFrameSequence, mFrameReceivedAtMs,
+                                                 mFrameSourceProducedAtMs)
+                            : (!hadFrame || mFrameSequence > previousSequence)))
+                break;
             // WGC 在 Windows 11 24H2 可能只发送变化的画面。已有完整图时短暂等候更新，
-            // 静态画面仍可沿用同一图及真实元数据；不能通过每次重启会话制造“新帧”。
+            // 无屏障请求仍可沿用同一图及真实元数据；要求新帧的请求只能等待原会话后续投帧。
+            // 达到截止时明确失败，不能靠重启会话或重写接收时间制造“新帧”。
             if (!mLatestTexture) timeout = std::chrono::milliseconds(kCaptureTimeoutMs);
             const auto elapsed = std::chrono::steady_clock::now() - started;
             if (elapsed >= timeout) {
+                if (hasBarrier) {
+                    freshnessTimedOut = true;
+                    return MaiError::make(MaiErrorCode::Busy,
+                                          "Windows Graphics Capture timed out waiting for a frame "
+                                          "newer than the requested barrier");
+                }
                 if (mLatestTexture) break;
                 return MaiError::make(MaiErrorCode::Internal,
                                       "Windows Graphics Capture timed out waiting for a frame");
@@ -851,15 +985,19 @@ private:
                  const std::shared_ptr<MaiScreenshotWakeState>& wake) {
         MaiScreenshot screenshot;
         MaiError error;
+        bool freshnessTimedOut = false;
         try {
-            error = captureCurrent(command->request, screenshot, wake);
+            error = captureCurrent(command->request, screenshot, wake, freshnessTimedOut);
         } catch (const winrt::hresult_error& exception) {
             error = hresultError("Windows Graphics Capture", exception.code());
         } catch (...) {
             error = MaiError::make(MaiErrorCode::Internal,
                                    "Windows Graphics Capture failed unexpectedly");
         }
-        if (error.hasError() && error.code() != MaiErrorCode::Canceled) discardFailedCapture();
+        // 新帧等待超时不表示设备或原生会话损坏。保持常驻会话，下一次请求继续等待真实帧；
+        // 命令完成仍通过 complete 清空失败输出，不泄露上一张缓存图。
+        if (error.hasError() && error.code() != MaiErrorCode::Canceled && !freshnessTimedOut)
+            discardFailedCapture();
         command->complete(std::move(error), std::move(screenshot));
     }
 
@@ -953,6 +1091,9 @@ private:
     ComPtr<ID3D11Texture2D> mStagingTexture;
     std::uint64_t mFrameSequence = 0;
     std::int64_t mFrameReceivedAtMs = 0;
+    // 只用于新帧屏障的保守源生产时间；0 表示无法证明，公开接收时间口径保持不变。
+    std::int64_t mFrameSourceProducedAtMs = 0;
+    std::int64_t mFrameSourceQpc100ns = 0;
 };
 
 MaiScreenshotWindowsWorker& screenshotWorker() {

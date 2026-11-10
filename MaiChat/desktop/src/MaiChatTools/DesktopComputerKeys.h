@@ -8,9 +8,27 @@
 enum class DesktopKeyModifier { Control, Shift, Alt, Meta };
 
 enum class DesktopKeyCode {
-    Character, Enter, Tab, Escape, Backspace, Delete,
-    ArrowLeft, ArrowRight, ArrowUp, ArrowDown,
-    Home, End, PageUp, PageDown, Space, Insert, Function
+    Character,
+    Enter,
+    Tab,
+    Escape,
+    Backspace,
+    Delete,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Space,
+    Insert,
+    Function,
+    Control,
+    Shift,
+    Alt,
+    Meta
 };
 
 struct DesktopKeyChord {

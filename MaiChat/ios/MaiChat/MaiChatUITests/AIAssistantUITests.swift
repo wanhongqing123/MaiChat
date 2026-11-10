@@ -5,6 +5,137 @@ import XCTest
 import UIKit
 
 final class AIAssistantUITests: XCTestCase {
+    @MainActor private func assertRemoteImagePixels(_ bubble: XCUIElement,
+                                                   file: StaticString = #filePath, line: UInt = #line) {
+        // The fixture is an opaque, uniform #2d638d PNG. Read displayed pixels,
+        // not a cached filename or a test-only success label.
+        let deadline = Date().addingTimeInterval(2)
+        var rgb = [Int]()
+        repeat {
+            if let image = bubble.screenshot().image.cgImage,
+               let context = CGContext(data: nil, width: image.width, height: image.height,
+                    bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+                if let data = context.data {
+                    let pixel = data.assumingMemoryBound(to: UInt8.self) + (image.height / 2 * image.width + image.width / 2) * 4
+                    rgb = (0..<3).map { Int(pixel[$0]) }
+                    if zip(rgb, [45, 99, 141]).allSatisfy({ pair in abs(pair.0 - pair.1) <= 3 }) { return }
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        } while Date() < deadline
+        XCTFail("Remote image pixels did not match the fixture: \(rgb)", file: file, line: line)
+    }
+
+    @MainActor private func launchRemoteImageFixture(_ mode: String) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-steering-ui-test", "--ai-remote-image-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launchEnvironment["MAICHAT_REMOTE_IMAGE_MODE"] = mode
+        app.launch()
+        return app
+    }
+
+    @MainActor func testRemoteUserImageKeepsItsPartOrder() {
+        continueAfterFailure = false
+        let app = launchRemoteImageFixture("user")
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["创作中心"].waitForExistence(timeout: 15))
+        app.buttons["创作中心"].tap()
+        let bubble = app.buttons["agent-image-bubble"]
+        XCTAssertTrue(bubble.waitForExistence(timeout: 10))
+        assertRemoteImagePixels(bubble)
+        let before = app.staticTexts["截图前的说明"], after = app.staticTexts["截图后的说明"]
+        XCTAssertLessThan(before.frame.maxY, bubble.frame.minY)
+        XCTAssertLessThan(bubble.frame.maxY, after.frame.minY)
+        XCTAssertEqual(app.staticTexts["remote-image-download-count"].value as? String, "1")
+        let evidence = XCTAttachment(screenshot: app.screenshot())
+        evidence.name = "remote-user-image-part-order"; evidence.lifetime = .keepAlways; add(evidence)
+    }
+
+    @MainActor func testRemoteImagePendingFailureExpiryAndInvalidBindingStayDistinct() {
+        continueAfterFailure = false
+        for (mode, expected) in [("pending", "图片正在同步"), ("failed", "图片同步失败"),
+                                  ("expired", "图片已过期"), ("malformed", "图片暂不可用")] {
+            let app = launchRemoteImageFixture(mode)
+            XCTAssertTrue(app.buttons["创作中心"].waitForExistence(timeout: 15))
+            app.buttons["创作中心"].tap()
+            XCTAssertTrue(app.staticTexts[expected].waitForExistence(timeout: 8), mode)
+            XCTAssertEqual(app.staticTexts["remote-image-download-count"].value as? String, "0", mode)
+            XCTAssertFalse(app.buttons["重新加载图片"].exists, mode)
+            let evidence = XCTAttachment(screenshot: app.screenshot())
+            evidence.name = "remote-image-state-" + mode; evidence.lifetime = .keepAlways; add(evidence)
+            app.terminate()
+        }
+    }
+
+    @MainActor func testRemoteImageNetworkFailureRetriesTheSameTemporaryObject() {
+        continueAfterFailure = false
+        let app = launchRemoteImageFixture("network-failure")
+        defer { app.terminate() }
+        XCTAssertTrue(app.buttons["创作中心"].waitForExistence(timeout: 15))
+        app.buttons["创作中心"].tap()
+        XCTAssertTrue(app.staticTexts["图片加载失败"].waitForExistence(timeout: 8))
+        XCTAssertFalse(app.staticTexts["图片已过期"].exists)
+        XCTAssertEqual(app.staticTexts["remote-image-download-count"].value as? String, "1")
+        app.buttons["重新加载图片"].tap()
+        XCTAssertTrue(app.buttons["agent-image-bubble"].waitForExistence(timeout: 8))
+        XCTAssertEqual(app.staticTexts["remote-image-download-count"].value as? String, "2")
+        let ids = (app.staticTexts["remote-image-request-identities"].value as? String ?? "").split(separator: ",")
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertEqual(Set(ids).count, 1, "Retry must not allocate or upload another image")
+    }
+
+    @MainActor func testRemoteImageCompleteCacheExpiryIdentityAndLateResults() {
+        continueAfterFailure = false
+        let app = launchRemoteImageFixture("policy")
+        defer { app.terminate() }
+        let run = app.buttons["remote-image-policy-check"]
+        XCTAssertTrue(run.waitForExistence(timeout: 15))
+        run.tap()
+        let result = app.staticTexts["remote-image-policy-result"]
+        let finished = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH %@", "PASS"), object: result)
+        XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 15), .completed, result.label)
+        XCTAssertEqual(result.label, "PASS 20")
+        let evidence = XCTAttachment(screenshot: app.screenshot())
+        evidence.name = "remote-image-cache-expiry-and-cancellation"; evidence.lifetime = .keepAlways; add(evidence)
+    }
+
+    /// A remote screenshot stays between its original text parts and opens the
+    /// normal preview, even while its owner is offline. No provider is called.
+    @MainActor func testRemoteAssistantImageUsesTemporaryAttachmentAndNormalPreview() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-steering-ui-test", "--ai-remote-image-ui-test",
+            "-maichat.notification-preprompt-dismissed", "YES"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let creator = app.buttons["创作中心"]
+        XCTAssertTrue(creator.waitForExistence(timeout: 15))
+        creator.tap()
+        let before = app.staticTexts["截图前的说明"]
+        let after = app.staticTexts["截图后的说明"]
+        XCTAssertTrue(before.waitForExistence(timeout: 10))
+        let bubble = app.buttons["agent-image-bubble"]
+        let rendered = bubble.waitForExistence(timeout: 8)
+        let evidence = XCTAttachment(screenshot: app.screenshot())
+        evidence.name = "remote-assistant-image-between-text-parts"
+        evidence.lifetime = .keepAlways; add(evidence)
+        XCTAssertTrue(rendered, "远端图片应显示为普通图片，不能只留下跨设备不可预览提示")
+        assertRemoteImagePixels(bubble)
+        XCTAssertTrue(after.exists)
+        XCTAssertLessThan(before.frame.maxY, bubble.frame.minY)
+        XCTAssertLessThan(bubble.frame.maxY, after.frame.minY)
+        XCTAssertFalse(app.staticTexts["[图片在所属设备，暂不可跨设备预览]"].exists)
+        bubble.tap()
+        XCTAssertTrue(app.images["agent-image-preview"].waitForExistence(timeout: 10))
+        app.images["agent-image-preview"].tap()
+        XCTAssertTrue(app.textViews["ai-composer"].waitForExistence(timeout: 5))
+    }
+
     /// Explicit, connected-phone diagnostic only. Open the normal installed
     /// account UI without answering a real question or starting a model request.
     @MainActor func testInstalledQuestionUsesOnlyNormalComposerOnConnectedPhone() throws {

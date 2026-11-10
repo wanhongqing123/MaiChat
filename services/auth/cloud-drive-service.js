@@ -9,6 +9,7 @@ const DEFAULT_IMAGE_BYTES = 20_000_000;
 const DEFAULT_QUOTA_BYTES = 10_000_000_000;
 const PART_BYTES = 8 * 1024 * 1024;
 const UPLOAD_TTL_MS = 7 * 24 * 60 * 60_000;
+const TEMP_IMAGE_TTL_MS = 24 * 60 * 60_000;
 const COMPLETION_HOLD_MS = 24 * 60 * 60_000;
 const CLEANUP_RETRY_MS = 60 * 60_000;
 const PAGE_SIZE = 50;
@@ -90,7 +91,7 @@ function validMD5(value) {
 
 function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
   listParts, listUploads, completeUpload, abortUpload, verifyObject, signRead,
-  signThumbnail, deleteObject,
+  signThumbnail, deleteObject, authorizeAttachment,
   newID = randomUUID, maxVideoBytes = DEFAULT_VIDEO_BYTES,
   maxImageBytes = DEFAULT_IMAGE_BYTES,
   quotaBytes = DEFAULT_QUOTA_BYTES, allowedAccountIds = null,
@@ -127,6 +128,50 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     row.size_bytes-(partNumber-1)*PART_BYTES);
   const own = (id,userId) => prepare(`SELECT * FROM cloud_drive_videos
     WHERE id=? AND owner_user_id=?`).get(id,userId);
+  const temporary = row => mode === 'session' && row?.retention === 'temporary';
+  const expired = row => temporary(row) && row.object_expires_at <= now();
+  const signingExpired = row => temporary(row) && Math.floor((row.object_expires_at-now())/1000) < 1;
+  const imageExpired = () => result(410,{ error:'Image expired',error_code:'image_expired' });
+  const imageBinding = row => ({ owner_slot:row.owner_slot,
+    owner_login_session_id:row.owner_login_session_id,session_id:row.session_id,
+    message_id:row.message_id,part_id:row.part_id });
+  const temporaryMetadata = row => temporary(row) ? {
+    retention:'temporary',expires_at:row.object_expires_at,...imageBinding(row) } : {};
+  async function authorizeImage(operation,row,headers) {
+    if (typeof authorizeAttachment !== 'function')
+      return result(503,{ error:'Session ownership verification is unavailable' });
+    try {
+      const accepted = await authorizeAttachment({ operation,...imageBinding(row),
+        ...(operation === 'read' ? { attachment_id:row.id,
+          expires_at:row.object_expires_at } : {}) },headers);
+      return accepted === true ? null : result(404,{ error:'Session image not found' });
+    } catch { return result(503,{ error:'Session ownership verification is unavailable' }); }
+  }
+  function initialReceipt(row) {
+    return { video_id:row.id,upload_id:row.upload_id,
+      attachment_id:row.id,room_key:row.room_key,media_type:'image',
+      ...temporaryMetadata(row),part_size:PART_BYTES,parts_total:partsTotal(row),
+      upload_expires_at:expiresISO(row.upload_expires_at),quota:quota(row.owner_user_id) };
+  }
+  function previousImage(body,principal) {
+    const receipt = db.prepare(`SELECT * FROM session_image_publications WHERE
+      owner_user_id=? AND owner_slot=? AND owner_login_session_id=?
+      AND session_id=? AND message_id=? AND part_id=?`).get(principal.user_id,
+      body.owner_slot,body.owner_login_session_id,body.session_id,body.message_id,body.part_id);
+    if (!receipt) return null;
+    if (receipt.name !== body.name || receipt.size_bytes !== body.size_bytes ||
+        receipt.content_type !== body.content_type)
+      return result(409,{ error:'Image publication identity was reused' });
+    if (receipt.expires_at <= now()) return imageExpired();
+    const row = own(receipt.attachment_id,principal.user_id);
+    if (!row || row.status === 'deleted')
+      return result(409,{ error:'Image publication is no longer available' });
+    // Keep the original Multipart receipt even when already ready: the shared
+    // uploader resolves ListParts-ready -> Complete without sending bytes.
+    if (row.status === 'ready') return result(201,initialReceipt(row));
+    return row.upload_id ? result(201,initialReceipt(row)) :
+      result(409,{ error:'Image publication is starting' });
+  }
 
   function quota(owner) {
     const usage = prepare(`SELECT
@@ -145,7 +190,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         row.content_type.startsWith('video/') ? 'video' : 'file',
       ...(mode === 'session' ? { attachment_id:row.id,room_key:row.room_key } : {}),
       ...(mode === 'drive' ? { folder_id:row.folder_id ?? null } : {}),
-      created_at:row.created_at };
+      created_at:row.created_at,...temporaryMetadata(row) };
   }
 
   const ownFolder = (id,principal) => db.prepare(`SELECT * FROM cloud_drive_folders
@@ -289,28 +334,51 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     return result(404,{ error:'Video not found' });
   }
 
-  async function begin(body,principal) {
+  async function begin(body,principal,headers) {
     const media = mediaType(body.name,mode);
     const bytes = body.size_bytes;
     const binding = mode === 'session' ? roomKey(body) : null;
+    const isTemporary = mode === 'session' && body.purpose === 'temporary_session_image';
     if (mode === 'session' && !binding)
       return result(400,{ error:'Invalid Session binding' });
+    if (mode === 'session' && body.purpose !== undefined && !isTemporary)
+      return result(400,{ error:'Invalid Session attachment purpose' });
     if (!media || body.content_type !== media.contentType ||
         !Number.isSafeInteger(bytes) || bytes < 1 ||
         bytes > (media.kind === 'image' ? maxImageBytes : maxVideoBytes))
       return result(400,{ error:'Invalid cloud media upload' });
+    if (isTemporary) {
+      const fields = new Set(['purpose','name','size_bytes','content_type',
+        'owner_slot','owner_login_session_id','session_id','message_id','part_id']);
+      if (media.kind !== 'image' || Object.keys(body).some(key => !fields.has(key)) ||
+          !/^[A-Za-z0-9_-]{1,128}$/.test(body.message_id || '') ||
+          !/^[A-Za-z0-9_-]{1,128}$/.test(body.part_id || ''))
+        return result(400,{ error:'Invalid temporary image publication' });
+      if (principal.device_slot !== body.owner_slot || principal.id !== body.owner_login_session_id)
+        return result(403,{ error:'Only the image owner can publish it' });
+      const previous = previousImage(body,principal);
+      if (previous) return previous;
+      const rejected = await authorizeImage('create',body,headers);
+      if (rejected) return rejected;
+    }
     if (!storageReady(startUpload,abortUpload))
       return result(503,{ error:'Cloud video upload is unavailable' });
     const id = newID();
     if (!validID(id)) throw new Error('Invalid cloud video ID');
     const created = now();
-    const key = `${mode === 'session' ? 'session-attachments' : 'cloud-drive'}/${principal.account_id}/` +
+    const key = `${isTemporary ? 'session-temp-images' : mode === 'session' ? 'session-attachments' : 'cloud-drive'}/${principal.account_id}/` +
       `${new Date(created).toISOString().slice(0,10)}/${id}${media.extension}`;
-    const expires = created+UPLOAD_TTL_MS;
+    const expires = created+(isTemporary ? TEMP_IMAGE_TTL_MS : UPLOAD_TTL_MS);
     const reservation = db.transaction(() => {
       if (!prepare('SELECT 1 FROM users WHERE id=? AND disabled_at IS NULL')
         .get(principal.user_id))
         return result(401,{ error:'Account is no longer active' });
+      if (isTemporary) {
+        // Another request can finish the ownership check while this one awaits
+        // Sync. Reserve one immutable identity in the same quota transaction.
+        const previous = previousImage(body,principal);
+        if (previous) return previous;
+      }
       const available = quota(principal.user_id);
       if (available.used_bytes+available.reserved_bytes+bytes > quotaBytes)
         return result(413,{ error:'Cloud drive quota exceeded',quota:available });
@@ -325,6 +393,17 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         VALUES(?,?,?,?,?,?,'uploading',?,?${mode === 'session' ? ',?' : ''})`)
         .run(id,principal.user_id,body.name,key,bytes,media.contentType,created,
           expires,...(mode === 'session' ? [binding] : []));
+      if (isTemporary) {
+        db.prepare(`UPDATE session_attachments SET retention='temporary',object_expires_at=?,
+          owner_slot=?,owner_login_session_id=?,session_id=?,message_id=?,part_id=? WHERE id=?`)
+          .run(expires,body.owner_slot,body.owner_login_session_id,body.session_id,
+            body.message_id,body.part_id,id);
+        db.prepare(`INSERT INTO session_image_publications
+          (owner_user_id,owner_slot,owner_login_session_id,session_id,message_id,part_id,
+          attachment_id,expires_at,name,size_bytes,content_type) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(principal.user_id,body.owner_slot,body.owner_login_session_id,body.session_id,
+            body.message_id,body.part_id,id,expires,body.name,bytes,media.contentType);
+      }
       return null;
     })();
     if (reservation) return reservation;
@@ -364,6 +443,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     }
     return result(201,{ video_id:id,upload_id:uploadId,media_type:media.kind,
       ...(mode === 'session' ? { attachment_id:id,room_key:binding } : {}),
+      ...(isTemporary ? temporaryMetadata(own(id,principal.user_id)) : {}),
       part_size:PART_BYTES,
       parts_total:Math.ceil(bytes/PART_BYTES),upload_expires_at:expiresISO(expires),
       quota:quota(principal.user_id) });
@@ -385,6 +465,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
   async function signOne(id,number,body,principal) {
     const row = uploadRow(id,principal);
     if (row.statusCode) return row;
+    if (signingExpired(row)) return imageExpired();
     if (row.status !== 'uploading')
       return result(409,{ error:'Upload is completing' });
     const partNumber = Number(number);
@@ -397,29 +478,33 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     const expected = partBytes(row,partNumber);
     let signed;
     try { signed = await signPart(principal.account_id,row.object_key,row.upload_id,
-      partNumber,expected,body.content_md5_base64); }
-    catch { return result(502,{ error:'Could not sign upload part' }); }
+      partNumber,expected,body.content_md5_base64,temporary(row) ? row.object_expires_at : undefined); }
+    catch { return signingExpired(row) ? imageExpired() : result(502,{ error:'Could not sign upload part' }); }
+    if (signingExpired(row)) return imageExpired();
     if (typeof signed?.upload_url !== 'string' ||
         !signed.upload_url.startsWith('https://') ||
         signed.upload_headers?.['Content-Length'] !== String(expected) ||
         signed.upload_headers?.['Content-MD5'] !== body.content_md5_base64)
       return result(502,{ error:'Invalid signed upload part' });
     const current = own(id,principal.user_id);
+    if (expired(current)) return imageExpired();
     if (current?.status !== 'uploading' || current.upload_id !== row.upload_id)
       return result(409,{ error:'Upload changed while signing' });
     prepare('UPDATE cloud_drive_videos SET last_part_signed_at=? WHERE id=?')
       .run(now(),id);
     return result(200,{ part_number:partNumber,part_size_bytes:expected,
-      upload_url:signed.upload_url,upload_headers:signed.upload_headers,expires_in:300 });
+      upload_url:signed.upload_url,upload_headers:signed.upload_headers,
+      expires_in:temporary(row) ? Math.min(300,Math.floor((row.object_expires_at-now())/1000)) : 300 });
   }
 
   async function uploadedParts(id,principal) {
     if (validID(id)) {
       const completed = own(id,principal.user_id);
+      if (expired(completed)) return imageExpired();
       if (completed?.status === 'ready')
         return result(200,{ video_id:id,status:'ready',part_size:PART_BYTES,
           parts_total:partsTotal(completed),parts:[],
-          upload_expires_at:expiresISO(completed.upload_expires_at) });
+          upload_expires_at:expiresISO(completed.upload_expires_at),...temporaryMetadata(completed) });
     }
     const row = uploadRow(id,principal);
     if (row.statusCode) return row;
@@ -437,12 +522,13 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       part.size_bytes === partBytes(row,part.part_number));
     return result(200,{ video_id:id,status:row.status,part_size:PART_BYTES,
       parts_total:partsTotal(row),parts:valid,
-      upload_expires_at:expiresISO(row.upload_expires_at) });
+      upload_expires_at:expiresISO(row.upload_expires_at),...temporaryMetadata(row) });
   }
 
   async function complete(id,principal) {
     if (!validID(id)) return result(404,{ error:'Video not found' });
     const row = own(id,principal.user_id);
+    if (expired(row)) return imageExpired();
     if (!row || row.status === 'deleted')
       return result(404,{ error:'Video not found' });
     if (row.status === 'ready') return result(200,publicReady(row));
@@ -465,6 +551,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       let head;
       try { head = await verifyObject(principal.account_id,row.object_key,
         row.size_bytes,row.content_type); } catch { /* retry later */ }
+      if (expired(row)) { await remove(id,principal); return imageExpired(); }
       if (head?.exists === true && head.size_bytes === row.size_bytes &&
           head.content_type === row.content_type) {
         const changed = prepare(`UPDATE cloud_drive_videos SET status='ready',ready_at=?
@@ -506,6 +593,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         return settleDeletedCompletion(row,principal);
       return result(409,{ error:'Video parts are incomplete' });
     }
+    if (expired(row)) { await remove(id,principal); return imageExpired(); }
     try {
       await completeUpload(principal.account_id,row.object_key,row.upload_id,parts);
     } catch {
@@ -522,6 +610,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         return settleDeletedCompletion(row,principal);
       return result(502,{ error:'Could not verify completed video; retry completion' });
     }
+    if (expired(row)) { await remove(id,principal); return imageExpired(); }
     if (head?.exists !== true || head.size_bytes !== row.size_bytes ||
         head.content_type !== row.content_type) {
       if (own(id,principal.user_id)?.status === 'deleted')
@@ -567,32 +656,53 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       quota:quota(principal.user_id) });
   }
 
-  async function play(id,principal) {
+  async function play(id,principal,query,headers) {
     if (!validID(id)) return result(404,{ error:'Video not found' });
     const row = own(id,principal.user_id);
+    if (!row && mode === 'session') {
+      const receipt = db.prepare(`SELECT expires_at FROM session_image_publications
+        WHERE owner_user_id=? AND attachment_id=?`).get(principal.user_id,id);
+      if (receipt?.expires_at <= now()) return imageExpired();
+    }
+    if (expired(row)) return imageExpired();
     if (!row || row.status !== 'ready')
       return result(404,{ error:'Video not found' });
+    if (temporary(row)) {
+      if (Object.entries(imageBinding(row)).some(([key,value]) => query?.get(key) !== value))
+        return result(404,{ error:'Session image not found' });
+      if (signingExpired(row)) return imageExpired();
+      const rejected = await authorizeImage('read',row,headers);
+      if (rejected) return rejected;
+    }
     if (!storageReady(signRead))
       return result(503,{ error:'Video playback is unavailable' });
     let url;
-    try { url = await signRead(principal.account_id,row.object_key); }
+    try { url = await signRead(principal.account_id,row.object_key,
+      temporary(row) ? row.object_expires_at : undefined); }
     catch { /* storage detail is private */ }
+    if (signingExpired(row)) return imageExpired();
     if (typeof url !== 'string' || !url.startsWith('https://'))
       return result(502,{ error:'Could not open the video' });
-    if (own(id,principal.user_id)?.status !== 'ready')
+    const current = own(id,principal.user_id);
+    if (expired(current) || (temporary(row) && row.object_expires_at <= now())) return imageExpired();
+    if (current?.status !== 'ready')
       return result(404,{ error:'Video not found' });
-    return result(200,{ read_url:url,read_expires_in:60,
+    return result(200,{ read_url:url,read_expires_in:temporary(row) ?
+      Math.min(60,Math.floor((row.object_expires_at-now())/1000)) : 60,
       size_bytes:row.size_bytes,content_type:row.content_type,
       media_type:row.content_type.startsWith('image/') ? 'image' :
         row.content_type.startsWith('audio/') ? 'audio' :
         row.content_type.startsWith('video/') ? 'video' : 'file',
       ...(mode === 'session' ? { attachment_id:row.id,name:row.name,
-        room_key:row.room_key } : { folder_id:row.folder_id ?? null }) });
+        room_key:row.room_key } : { folder_id:row.folder_id ?? null }),...temporaryMetadata(row) });
   }
 
   async function thumbnail(id,principal) {
     if (!validID(id)) return result(404,{ error:'Media not found' });
     const row = own(id,principal.user_id);
+    // Temporary images use their exact original through play-link. Do not
+    // create an unbound second signing path through OSS transformations.
+    if (temporary(row)) return result(404,{ error:'Thumbnail is unavailable' });
     if (!row || row.status !== 'ready')
       return result(404,{ error:'Media not found' });
     if (!storageReady(signThumbnail))
@@ -629,6 +739,15 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
 
   async function sweep() {
     const current = now();
+    if (mode === 'session') {
+      prepare(`UPDATE cloud_drive_videos SET status='deleted',deleted_at=?,
+        cleanup_pending=1,cleanup_after=?,
+        cleanup_hold_until=CASE WHEN status='completing' OR
+          (status='uploading' AND upload_id IS NULL) THEN ? ELSE NULL END,
+        cleanup_revision=cleanup_revision+1 WHERE retention='temporary'
+        AND object_expires_at<=? AND status<>'deleted'`)
+        .run(current,current,current+COMPLETION_HOLD_MS,current);
+    }
     prepare(`UPDATE cloud_drive_videos SET status='deleted',deleted_at=?,
       cleanup_pending=1,cleanup_after=?,
       cleanup_hold_until=CASE WHEN status='completing' OR
@@ -712,6 +831,14 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         if (legacy) requeueLegacy(current);
       }
     }
+    if (mode === 'session') {
+      // Explicit room removal ends the deduplication scope, after every
+      // corresponding object row has passed the existing absence/race gates.
+      // Ordinary expiry retains its receipt and can never recreate the image.
+      db.prepare(`DELETE FROM session_image_publications WHERE room_deleted_at IS NOT NULL
+        AND NOT EXISTS(SELECT 1 FROM session_attachments
+          WHERE session_attachments.id=session_image_publications.attachment_id)`).run();
+    }
     return { cleaned,pending:rows.length-cleaned };
   }
 
@@ -728,11 +855,26 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       WHERE owner_user_id=?`).get(userId).count };
   }
 
-  function cleanupRoom(body,principal) {
+  async function cleanupRoom(body,principal,headers) {
     if (mode !== 'session') return result(404,{ error:'Not found' });
     const binding = roomKey(body);
     if (!binding) return result(400,{ error:'Invalid Session binding' });
+    const publications = db.prepare(`SELECT 1 FROM session_image_publications
+      WHERE owner_user_id=? AND owner_slot=? AND session_id=? LIMIT 1`)
+      .get(principal.user_id,body.owner_slot,body.session_id);
+    if (publications) {
+      if (typeof authorizeAttachment !== 'function')
+        return result(503,{error:'Session ownership verification is unavailable'});
+      try {
+        const removed = await authorizeAttachment({operation:'cleanup-room',owner_slot:body.owner_slot,
+          owner_login_session_id:body.owner_login_session_id,session_id:body.session_id},headers);
+        if (removed !== true) return result(409,{error:'Session room removal is not confirmed'});
+      } catch { return result(503,{error:'Session ownership verification is unavailable'}); }
+    }
     const current = now();
+    db.prepare(`UPDATE session_image_publications SET room_deleted_at=?
+      WHERE owner_user_id=? AND owner_slot=? AND session_id=?`)
+      .run(current,principal.user_id,body.owner_slot,body.session_id);
     const changed = prepare(`UPDATE cloud_drive_videos SET status='deleted',
       deleted_at=?,cleanup_pending=1,cleanup_after=?,
       cleanup_hold_until=CASE WHEN status='completing' OR
@@ -744,7 +886,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     return result(202,{ room_key:binding,deleted:changed });
   }
 
-  async function handle(method,path,body,principal,query) {
+  async function handle(method,path,body,principal,query,headers = {}) {
     if (!principal) return result(401,{ error:'Authentication required' });
     if (allowedAccountIds && !allowedAccountIds.has(principal.account_id))
       return result(404,{ error:'Not found' });
@@ -756,9 +898,9 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     if (folder && method === 'PATCH') return updateFolder(folder[1],body,principal);
     if (folder && method === 'DELETE') return deleteFolder(folder[1],principal);
     if (method === 'POST' && path === `${root}/uploads`)
-      return begin(body,principal);
+      return begin(body,principal,headers);
     if (method === 'POST' && path === `${root}/cleanup-room`)
-      return cleanupRoom(body,principal);
+      return cleanupRoom(body,principal,headers);
     if (method === 'GET' && path === root)
       return list(principal,query?.get('before'),
         query?.has('folder_id') ? query.get('folder_id') : undefined);
@@ -773,7 +915,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       return remove(upload[1],principal);
     const item = path.match(new RegExp(`^${root}/([^/]+)(/play-link|/thumbnail-link)?$`));
     if (item && item[2] === '/play-link' && method === 'GET')
-      return play(item[1],principal);
+      return play(item[1],principal,query,headers);
     if (item && item[2] === '/thumbnail-link' && method === 'GET')
       return thumbnail(item[1],principal);
     if (item && !item[2] && method === 'DELETE')

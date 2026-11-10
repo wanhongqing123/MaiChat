@@ -1236,6 +1236,14 @@ target_include_directories(desktop_computer_native_integration_test PRIVATE ../.
 add_test(NAME desktop_computer_native_integration COMMAND desktop_computer_native_integration_test)
 set_tests_properties(desktop_computer_native_integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
 
+# Whole-display capture/input uses a separate opt-in owned fullscreen fixture.
+# Default runs skip; a failed action after input starts remains a failure.
+add_executable(desktop_computer_display_native_test tests/DesktopComputerDisplayNativeTest.cpp)
+target_link_libraries(desktop_computer_display_native_test PRIVATE maichat_agent Qt6::Widgets)
+target_include_directories(desktop_computer_display_native_test PRIVATE ../../MaiAgent/third_party/nlohmann)
+add_test(NAME desktop_computer_display_native COMMAND desktop_computer_display_native_test)
+set_tests_properties(desktop_computer_display_native PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
+
 # This separate entry uses the same Creation Center UI and real native backend against
 # an owned editor process. A missing foreground/OS permission is visible as a CTest skip.
 add_dependencies(desktop_computer_agent_integration_test desktop_computer_native_integration_test)

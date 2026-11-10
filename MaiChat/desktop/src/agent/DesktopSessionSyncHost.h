@@ -15,6 +15,11 @@ public:
     explicit DesktopSessionSyncHost(AgentController& controller);
     ~DesktopSessionSyncHost();
     void setDefaultWorkspaceDirectory(const QString& directory);
+    void setImagePublicationScope(const QString& account, const QString& slot, const QString& login);
+    // Enroll only images created after this host subscribed to live events.
+    // History serialization reads journal receipts and never creates uploads.
+    void enrollLiveImages(const QString& sessionId, const QString& messageId, const QString& partId = {});
+    QString imageSource(const QString& sessionId, const QString& messageId, const QString& partId) const;
 
     QJsonArray rootSessions() const;
     QJsonObject historyPage(const QString& sessionId, const QString& beforeId, int limit) const;
@@ -29,6 +34,8 @@ public:
 private:
     AgentController& controller_;
     QString defaultWorkspaceDirectory_;
+    QString imageAccount_, imageSlot_, imageLogin_;
+    QJsonObject decorateImages(QJsonObject message, const QString& sessionId) const;
     // 事件回调只更新共享 revision，不捕获宿主 this；退订后在途回调也不悬空。
     struct Runtime;
     std::shared_ptr<Runtime> runtime_;

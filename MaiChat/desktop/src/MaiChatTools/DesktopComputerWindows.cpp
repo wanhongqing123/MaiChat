@@ -99,6 +99,41 @@ bool interactiveDesktop() {
     return matches;
 }
 
+// HMONITOR is the native identity shared with WGC. Resolve it through the
+// active monitor list instead of accepting a nearest/primary fallback.
+bool monitorInformation(std::uint64_t id, MONITORINFO& information) {
+    if (!id || id > std::numeric_limits<std::uintptr_t>::max()) return false;
+    struct Search {
+        HMONITOR selected = nullptr;
+        MONITORINFO information{};
+        bool found = false;
+    } search;
+    search.selected = reinterpret_cast<HMONITOR>(std::uintptr_t(id));
+    EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM parameter) -> BOOL {
+            auto& search = *reinterpret_cast<Search*>(parameter);
+            if (monitor != search.selected) return TRUE;
+            search.information.cbSize = sizeof(MONITORINFO);
+            search.found = GetMonitorInfoW(monitor, &search.information) != FALSE;
+            return FALSE;
+        },
+        reinterpret_cast<LPARAM>(&search));
+    if (search.found) information = search.information;
+    return search.found;
+}
+
+DesktopNativeDisplay nativeDisplay(HMONITOR monitor, const MONITORINFO& information) {
+    DesktopNativeDisplay display;
+    display.id = std::uint64_t(reinterpret_cast<std::uintptr_t>(monitor));
+    display.x = information.rcMonitor.left;
+    display.y = information.rcMonitor.top;
+    display.width = information.rcMonitor.right - information.rcMonitor.left;
+    display.height = information.rcMonitor.bottom - information.rcMonitor.top;
+    display.primary = (information.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    return display;
+}
+
 INPUT keyEvent(WORD key, bool up = false) {
     INPUT event{};
     event.type = INPUT_KEYBOARD;
@@ -123,9 +158,10 @@ MaiError sendInput(INPUT event) {
 class InputScope {
 public:
     explicit InputScope(const DesktopNativeInput& input)
-        : input_(input), foreground_(input.expectedWindowId ?
-            reinterpret_cast<HWND>(std::uintptr_t(input.expectedWindowId)) :
-            GetForegroundWindow()) {}
+        : input_(input),
+          foreground_(input.desktopScope       ? nullptr
+                      : input.expectedWindowId ? reinterpret_cast<HWND>(std::uintptr_t(input.expectedWindowId))
+                                               : GetForegroundWindow()) {}
     ~InputScope() {
         // Cleanup deliberately ignores cancellation/focus: every successful
         // synthetic down must have its matching up even after an early return.
@@ -135,6 +171,22 @@ public:
     MaiError validate() const {
         if (input_.isCanceled && input_.isCanceled())
             return {MaiErrorCode::Canceled, "computer input canceled"};
+        if (input_.desktopScope) {
+            // Desktop actions may intentionally open Start, switch apps, or
+            // cross popup windows. Their identity is the observed display,
+            // which must remain active and retain the exact pointer mapping.
+            if (!interactiveDesktop())
+                return {MaiErrorCode::NotConfigured, "Windows input requires the active interactive desktop"};
+            MONITORINFO information{};
+            if (!monitorInformation(input_.display.id, information))
+                return {MaiErrorCode::NotFound, "observed display is no longer active"};
+            const auto& bounds = information.rcMonitor;
+            if (input_.display.x != bounds.left || input_.display.y != bounds.top ||
+                input_.display.width != bounds.right - bounds.left ||
+                input_.display.height != bounds.bottom - bounds.top)
+                return {MaiErrorCode::Busy, "observed display geometry changed before input"};
+            return {};
+        }
         if (!foreground_ || !belongsToSelected(GetForegroundWindow(), foreground_))
             return {MaiErrorCode::Busy, "foreground window changed during computer input"};
         DWORD process = 0;
@@ -183,6 +235,13 @@ private:
     MaiError validatePoint(POINT point) const {
         const MaiError ready = validate();
         if (ready) return ready;
+        if (input_.desktopScope) {
+            const auto& display = input_.display;
+            if (point.x < display.x || point.y < display.y || point.x >= display.x + display.width ||
+                point.y >= display.y + display.height)
+                return {MaiErrorCode::InvalidInput, "pointer location is outside the observed display"};
+            return {};
+        }
         if (!belongsToSelected(WindowFromPoint(point), foreground_))
             return {MaiErrorCode::Busy, "pointer location no longer belongs to the selected window"};
         return {};
@@ -211,6 +270,10 @@ WORD nativeKey(const DesktopKeyChord& key) {
     case DesktopKeyCode::Space: return VK_SPACE;
     case DesktopKeyCode::Insert: return VK_INSERT;
     case DesktopKeyCode::Function: return WORD(VK_F1 + key.function - 1);
+    case DesktopKeyCode::Control: return VK_CONTROL;
+    case DesktopKeyCode::Shift: return VK_SHIFT;
+    case DesktopKeyCode::Alt: return VK_MENU;
+    case DesktopKeyCode::Meta: return VK_LWIN;
     }
     return 0;
 }
@@ -364,6 +427,32 @@ MaiResult<IUIAutomationElement*> focusedElementForWindow(
 }
 
 } // namespace
+
+MaiResult<std::vector<DesktopNativeDisplay>> maiDesktopDisplays() {
+    DpiScope dpi;
+    struct Enumeration {
+        std::vector<DesktopNativeDisplay> displays;
+        bool failed = false;
+    } enumeration;
+    const BOOL enumerated = EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM parameter) -> BOOL {
+            auto& enumeration = *reinterpret_cast<Enumeration*>(parameter);
+            MONITORINFO information{};
+            information.cbSize = sizeof(information);
+            if (!GetMonitorInfoW(monitor, &information) || information.rcMonitor.right <= information.rcMonitor.left ||
+                information.rcMonitor.bottom <= information.rcMonitor.top) {
+                enumeration.failed = true;
+                return FALSE;
+            }
+            enumeration.displays.push_back(nativeDisplay(monitor, information));
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&enumeration));
+    if (!enumerated || enumeration.failed)
+        return {MaiErrorCode::Internal, "Windows could not enumerate active displays"};
+    return enumeration.displays;
+}
 
 MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows() {
     DpiScope dpi;
@@ -533,21 +622,24 @@ MaiError maiDesktopInput(const DesktopNativeInput& input) {
             (input.kind == DesktopNativeInputKind::Type && input.text.empty()))
             return {MaiErrorCode::InvalidInput, "text must contain at most 4000 UTF-8 bytes"};
     }
-    const bool positioned = input.kind == DesktopNativeInputKind::Click ||
-        input.kind == DesktopNativeInputKind::DoubleClick ||
-        input.kind == DesktopNativeInputKind::RightClick ||
-        input.kind == DesktopNativeInputKind::Drag ||
-        input.kind == DesktopNativeInputKind::Scroll;
+    const bool positioned =
+        input.kind == DesktopNativeInputKind::Click || input.kind == DesktopNativeInputKind::DoubleClick ||
+        input.kind == DesktopNativeInputKind::RightClick || input.kind == DesktopNativeInputKind::Drag ||
+        input.kind == DesktopNativeInputKind::Scroll || input.kind == DesktopNativeInputKind::Move;
     if (positioned && !validPoint(input.x, input.y))
         return {MaiErrorCode::InvalidInput, "pointer coordinates are invalid"};
+    const int maximumDragMs = input.desktopScope ? 5000 : 200;
     if (input.kind == DesktopNativeInputKind::Drag &&
-        (!validPoint(input.toX, input.toY) || input.durationMs < 1 || input.durationMs > 200))
-        return {MaiErrorCode::InvalidInput, "drag needs a valid destination and 1 to 200 ms duration"};
+        (!validPoint(input.toX, input.toY) || input.durationMs < 1 || input.durationMs > maximumDragMs))
+        return {MaiErrorCode::InvalidInput,
+                "drag needs a valid destination and 1 to " + std::to_string(maximumDragMs) + " ms duration"};
     if (input.kind == DesktopNativeInputKind::Scroll &&
         (input.lines == 0 || input.lines < -10 || input.lines > 10))
         return {MaiErrorCode::InvalidInput, "scroll needs -10 to 10 lines, excluding zero"};
     if ((input.expectedWindowId == 0) != (input.expectedProcessId == 0))
         return {MaiErrorCode::InvalidInput, "expected window and process identities must be provided together"};
+    if (input.desktopScope && (!input.display.id || input.display.id > std::numeric_limits<std::uintptr_t>::max()))
+        return {MaiErrorCode::InvalidInput, "display identity must be a non-zero native monitor identifier"};
     DesktopKeyChord chord;
     if (input.kind == DesktopNativeInputKind::Key) {
         const auto parsed = maiDesktopParseKey(input.key);
@@ -583,6 +675,7 @@ MaiError maiDesktopInput(const DesktopNativeInput& input) {
         return {MaiErrorCode::Busy, "a mouse button is already held by the user"};
     const MaiError moved = scope.move(input.x, input.y);
     if (moved) return moved;
+    if (input.kind == DesktopNativeInputKind::Move) return {};
     if (input.kind == DesktopNativeInputKind::Scroll) {
         INPUT event{};
         event.type = INPUT_MOUSE;

@@ -95,6 +95,48 @@ JPEG，再按精确对象键删除。若 OSS 清理不确定，它留下 root-on
 OSS 与三端验收全部通过。systemd 行为见
 [systemd.exec EnvironmentFile](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)。
 
+## Remote Session 临时图片
+
+新用户或助手消息中的图片 part 在首次增量发布时上传一次，复用上述私有桶、Multipart 接口及
+`MAICHAT_CLOUD_DRIVE_*` 配置；对象独立放在
+`session-temp-images/<账号>/YYYY-MM-DD/<UUID>.<图片后缀>`。只接受 jpg、jpeg、png、webp、heic、gif
+及对应的精确图片 MIME，账号必须与对象前缀一致。该前缀不提供普通文件或视频上传。
+账号服务负责精确 Session/message/part 授权、持久化发布身份及首次预留起固定 24 小时到期时间；
+viewer 不发送 `image_prepare`，历史回填和查看图片不会触发上传或重新上传。媒体字节由客户端直传 OSS。
+
+内部 `/cloud-drive/read`、`/cloud-drive/thumbnail` 和 `/cloud-drive/sign-part` 为该前缀签名时，
+必须传原始 `expires_at`（Unix 毫秒整数）。缺少或非法值返回 400；剩余不足一秒返回 410 和
+`error_code:image_expired`。真实 OSS GET 签名及返回有效期均不超过
+`min(60,floor((expires_at-now)/1000))` 秒，part PUT 签名不超过
+`min(300,floor((expires_at-now)/1000))` 秒。刷新签名不会延长图片寿命；持久附件和云盘保持原有效期。
+过期后的对象仍可通过原有 exact-key list/abort/delete/HEAD 路径清理。已完整下载的本地缓存可以继续显示；
+没有缓存的过期图片显示“图片已过期”。物理删除使用账号服务清理与 OSS 生命周期兜底，二者均不承诺在
+24 小时时刻同步完成；业务读取到期后即拒绝签名。
+
+部署前先完成现有持久 Session 附件 RAM 升级，再在可信 ECS 管理员环境中对下列专用升级工具只读预检。
+`upgrade-session-temp-image-ram.py` 只接受仓库已审阅的现有策略，并仅增加临时前缀的现有 OSS 操作权限。
+执行需显式 `--apply --backup=<新文件>`，它会备份完整策略、再次读取检测变化、创建完整的新默认版本，
+随后读回核对；不会创建 AccessKey 或改写已有备份。
+
+```sh
+python3 scripts/upgrade-session-temp-image-ram.py
+python3 scripts/upgrade-session-temp-image-ram.py --apply --backup=/root/session-temp-image-ram-before.json
+node scripts/upgrade-session-temp-image-lifecycle.js --confirm-bucket=maichat-private-cloud-drive-gz-20261025-f346b709
+node scripts/upgrade-session-temp-image-lifecycle.js --confirm-bucket=maichat-private-cloud-drive-gz-20261025-f346b709 --apply --backup=/root/session-temp-image-lifecycle-before.json
+```
+
+生命周期工具仅为 `session-temp-images/` 增加专用规则，分别设置完成对象 `Expiration.Days:1` 与未完成
+Multipart `AbortMultipartUpload.Days:1`。它先 GET 全部规则并保存备份，再次 GET 检测漂移，PUT 完整合并列表，
+最后 GET 核对全部规则；`PutBucketLifecycle` 会替换整份列表，因此任何重叠或已有专用规则差异都会停止操作。
+原 `cloud-drive/` 与 `session-attachments/` 的持久附件保留规则不变。OSS 生命周期是异步兜底清理，
+一天规则不等于首个预留时间起精确 24 小时删除。
+工具在首次读取和备份后的写入前均核对 Bucket 从未启用版本控制；Enabled、Suspended 或无法确认
+时停止，因为仅过期当前对象不足以清除历史图片版本。工具不会改变 Bucket 的版本控制配置。
+
+本地验证使用 `npm test`，RAM 工具另跑
+`python3 scripts/upgrade-session-temp-image-ram.test.py`。测试只使用 fake OSS/RAM 和本地假凭据签名，
+不能代替部署后的私有桶、权限、生命周期与目标客户端验收；上述命令说明本身不会启用线上规则。
+
 ## 阿里云侧准备
 
 1. 创建**私有** OSS Bucket。当前目标是 `maichat-ai-video-resource`，地域

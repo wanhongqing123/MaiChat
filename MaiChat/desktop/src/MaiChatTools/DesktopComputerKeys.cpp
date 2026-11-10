@@ -53,6 +53,16 @@ MaiResult<DesktopKeyChord> maiDesktopParseKey(const std::string& key) {
         chord.character = token[0];
         return chord;
     }
+    if (chord.modifiers.empty()) {
+        DesktopKeyModifier single;
+        if (modifier(token, single)) {
+            chord.key = single == DesktopKeyModifier::Control ? DesktopKeyCode::Control
+                        : single == DesktopKeyModifier::Shift ? DesktopKeyCode::Shift
+                        : single == DesktopKeyModifier::Alt   ? DesktopKeyCode::Alt
+                                                              : DesktopKeyCode::Meta;
+            return chord;
+        }
+    }
     const std::pair<const char*, DesktopKeyCode> named[] = {
         {"ENTER", DesktopKeyCode::Enter}, {"TAB", DesktopKeyCode::Tab},
         {"ESCAPE", DesktopKeyCode::Escape}, {"BACKSPACE", DesktopKeyCode::Backspace},

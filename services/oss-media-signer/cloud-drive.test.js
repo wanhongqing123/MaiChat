@@ -149,6 +149,107 @@ test('Session files use the private bucket with a separate key and safe download
     content_type:'application/octet-stream' })).statusCode,400);
 });
 
+test('temporary Session images keep an isolated account prefix and exact image MIME', async () => {
+  const seen = [];
+  const handler = createHandler({ env:ENV,makeClient:() => ({
+    initMultipartUpload:async (key,options) => {
+      seen.push(['init',key,options]); return { uploadId:'temp_image_upload' };
+    },
+    head:async key => { seen.push(['head',key]);
+      return { res:{ headers:{ 'content-length':'100','content-type':'image/png' } } }; },
+    listUploads:async query => { seen.push(['list',query]);
+      return { uploads:[],isTruncated:false }; },
+    delete:async key => { seen.push(['delete',key]); },
+    abortMultipartUpload:async key => { seen.push(['abort',key]); }
+  }) });
+  const base = KEY.replace('cloud-drive/','session-temp-images/').replace(/\.mov$/,'');
+  for (const [extension,type] of [
+    ['jpg','image/jpeg'],['jpeg','image/jpeg'],['png','image/png'],
+    ['webp','image/webp'],['heic','image/heic'],['gif','image/gif']
+  ]) {
+    const object_key = `${base}.${extension}`;
+    assert.equal((await call(handler,'init',{ object_key,content_type:type })).statusCode,200);
+    assert.equal(seen.at(-1)[2].mime,type);
+    assert.equal(seen.at(-1)[2].headers['x-oss-object-acl'],'private');
+    assert.equal((await call(handler,'init',{
+      object_key,content_type:'application/octet-stream' })).statusCode,400);
+    assert.equal((await call(handler,'init',{
+      account_id:'account_b',object_key,content_type:type })).statusCode,400);
+  }
+  for (const suffix of ['mp4','pdf','png/extra','PNG'])
+    assert.equal((await call(handler,'init',{
+      object_key:`${base}.${suffix}`,content_type:'image/png' })).statusCode,400);
+  assert.equal((await call(handler,'init',{
+    object_key:`${base.replace('123e4567-e89b-42d3-a456-426614174000','------------------------------------')}.png`,
+    content_type:'image/png' })).statusCode,400);
+  const object_key = `${base}.png`;
+  assert.equal((await call(handler,'verify',{
+    object_key,expected_bytes:100,content_type:'image/png' })).statusCode,200);
+  assert.equal((await call(handler,'list-uploads',{ object_key })).statusCode,200);
+  assert.equal((await call(handler,'abort',{
+    object_key,upload_id:'temp_image_upload' })).statusCode,200);
+  assert.equal((await call(handler,'delete',{ object_key })).statusCode,200);
+  assert.deepEqual(seen.at(-1),['delete',object_key]);
+});
+
+test('temporary Session GET and part signatures never outlive the original expiry', async () => {
+  const object_key = KEY.replace('cloud-drive/','session-temp-images/').replace(/\.mov$/,'.png');
+  let now = Date.parse('2026-11-10T00:00:00.000Z');
+  const signed = [];
+  const handler = createHandler({ env:ENV,currentTime:() => new Date(now),
+    makeClient:() => ({ signatureUrlV4:async (...args) => {
+      signed.push(args); return 'https://private-test-bucket.oss-cn-hangzhou.aliyuncs.com/signed';
+    } }) });
+  const part = { upload_id:'temp_image_upload',part_number:1,expected_bytes:100,
+    content_md5_base64:Buffer.alloc(16,9).toString('base64') };
+  for (const action of ['read','thumbnail','sign-part']) {
+    for (const expires_at of [undefined,null,'1794268860000',1.5]) {
+      assert.equal((await call(handler,action,{ ...part,object_key,expires_at })).statusCode,400);
+    }
+    for (const remaining of [0,-1,999]) {
+      assert.equal((await call(handler,action,{
+        ...part,object_key,expires_at:now+remaining })).statusCode,410);
+    }
+  }
+  assert.equal(signed.length,0);
+  const expires_at = now+24*60*60*1000;
+  assert.equal(parse(await call(handler,'read',{ object_key,expires_at })).read_expires_in,60);
+  assert.equal(signed.at(-1)[1],60);
+  assert.equal((await call(handler,'sign-part',{ ...part,object_key,expires_at })).statusCode,200);
+  assert.equal(signed.at(-1)[1],300);
+  now = expires_at-2750;
+  assert.equal(parse(await call(handler,'read',{ object_key,expires_at })).read_expires_in,2);
+  assert.equal(signed.at(-1)[1],2);
+  assert.equal(parse(await call(handler,'thumbnail',{
+    object_key,expires_at })).thumbnail_expires_in,2);
+  assert.equal(signed.at(-1)[1],2);
+  assert.equal((await call(handler,'sign-part',{ ...part,object_key,expires_at })).statusCode,200);
+  assert.equal(signed.at(-1)[1],2);
+  now = expires_at;
+  const count = signed.length;
+  assert.equal((await call(handler,'read',{ object_key,expires_at })).statusCode,410);
+  assert.equal(signed.length,count);
+  // Persistent objects retain their established lifetimes without expiry metadata.
+  assert.equal(parse(await call(handler,'read',{})).read_expires_in,60);
+  assert.equal((await call(handler,'sign-part',part)).statusCode,200);
+  assert.equal(signed.at(-1)[1],300);
+});
+
+test('real V4 temporary signatures carry the remaining lifetime', async () => {
+  const now = Date.now();
+  const handler = createHandler({ env:ENV,currentTime:() => new Date(now) });
+  const object_key = KEY.replace('cloud-drive/','session-temp-images/').replace(/\.mov$/,'.gif');
+  const expires_at = now+2750;
+  const read = await call(handler,'read',{ object_key,expires_at });
+  assert.equal(read.statusCode,200);
+  assert.equal(new URL(parse(read).read_url).searchParams.get('x-oss-expires'),'2');
+  const part = await call(handler,'sign-part',{ object_key,expires_at,
+    upload_id:'temp_image_upload',part_number:1,expected_bytes:100,
+    content_md5_base64:Buffer.alloc(16,7).toString('base64') });
+  assert.equal(part.statusCode,200);
+  assert.equal(new URL(parse(part).upload_url).searchParams.get('x-oss-expires'),'2');
+});
+
 test('real ali-oss V4 thumbnail URL signs its processing query', async () => {
   const handler = createHandler({ env:ENV });
   const image = KEY.replace(/\.mov$/,'.jpg');

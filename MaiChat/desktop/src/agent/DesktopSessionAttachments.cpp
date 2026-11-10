@@ -5,11 +5,16 @@
 
 #include <QCryptographicHash>
 #include <QDir>
+#include <QDateTime>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QResource>
 #include <QStandardPaths>
+#include <QSaveFile>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QUuid>
 
 static QByteArray trustedRoots(const DesktopVideoCircleAccess& access) {
@@ -22,7 +27,7 @@ static QByteArray trustedRoots(const DesktopVideoCircleAccess& access) {
 namespace {
 
 struct Call {
-    QByteArray base, token, roots, proxy, host, slot, login, session;
+    QByteArray base, token, roots, proxy, host, slot, login, session, message, part;
     MaiCloudDriveOptions options{};
     explicit Call(const DesktopVideoCircleAccess& access, const DesktopSessionRoom& room)
         : base(access.authBaseUrl.toUtf8()), token(access.accountToken.toUtf8()),
@@ -39,6 +44,12 @@ struct Call {
         options.owner_login_session_id_utf8 = login.constData();
         options.session_id_utf8 = session.constData();
         options.retain_completed_checkpoint = 1;
+    }
+    void temporary(const QString& messageId, const QString& partId) {
+        message = messageId.toUtf8(); part = partId.toUtf8();
+        options.temporary_session_image = 1;
+        options.message_id_utf8 = message.constData();
+        options.part_id_utf8 = part.constData();
     }
 };
 
@@ -66,7 +77,167 @@ QString directory(const QString& name, const QString& account, bool cache = fals
     return QDir().mkpath(path) ? path : QString();
 }
 
+QMutex journalMutex;
+
+QString imageKey(const DesktopSessionRoom& room, const QString& message, const QString& part) {
+    // The original login is stored in the immutable journal binding. This
+    // lookup survives owner relogin so later text cannot erase a ready receipt.
+    return QString::fromLatin1(QCryptographicHash::hash(
+        QJsonDocument(QJsonArray{room.slot, room.session, message, part}).toJson(QJsonDocument::Compact),
+        QCryptographicHash::Sha256).toHex());
+}
+
+QString journalPath(const QString& account, const DesktopSessionRoom& room,
+                    const QString& message, const QString& part) {
+    const auto folder = directory(QStringLiteral("image-publications"), account);
+    return folder.isEmpty() ? QString() : QDir(folder).filePath(imageKey(room, message, part) + QStringLiteral(".json"));
+}
+
+QJsonObject readJournal(const QString& path) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly) || file.size() > 16 * 1024) return {};
+    return QJsonDocument::fromJson(file.readAll()).object();
+}
+
+bool writeJournal(const QString& path, const QJsonObject& object) {
+    QSaveFile file(path);
+    const auto bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    return !path.isEmpty() && file.open(QIODevice::WriteOnly) &&
+        file.write(bytes) == bytes.size() && file.commit();
+}
+
+bool matchesBinding(const QJsonObject& journal, const DesktopSessionRoom& room,
+                    const QString& message, const QString& part) {
+    return journal.value(QStringLiteral("owner_slot")).toString() == room.slot &&
+        journal.value(QStringLiteral("session_id")).toString() == room.session &&
+        journal.value(QStringLiteral("message_id")).toString() == message &&
+        journal.value(QStringLiteral("part_id")).toString() == part &&
+        !journal.value(QStringLiteral("owner_login_session_id")).toString().isEmpty();
+}
+
 }  // namespace
+
+bool DesktopSessionAttachments::enrollTemporaryImage(const QString& account, const DesktopSessionRoom& room,
+    const QString& messageId, const QString& partId) {
+    if (account.isEmpty() || room.slot.isEmpty() || room.login.isEmpty() || room.session.isEmpty() ||
+        messageId.isEmpty() || partId.isEmpty()) return false;
+    QMutexLocker lock(&journalMutex);
+    const auto path = journalPath(account, room, messageId, partId);
+    if (QFileInfo::exists(path)) return matchesBinding(readJournal(path), room, messageId, partId);
+    return writeJournal(path, {{QStringLiteral("owner_slot"), room.slot},
+        {QStringLiteral("owner_login_session_id"), room.login}, {QStringLiteral("session_id"), room.session},
+        {QStringLiteral("message_id"), messageId}, {QStringLiteral("part_id"), partId},
+        {QStringLiteral("remoteImage"), QJsonObject{{QStringLiteral("state"), QStringLiteral("pending")},
+                                                  {QStringLiteral("retention"), QStringLiteral("temporary")}}}});
+}
+
+QJsonObject DesktopSessionAttachments::imagePublication(const QString& account, const DesktopSessionRoom& room,
+    const QString& messageId, const QString& partId) {
+    if (account.isEmpty()) return {};
+    QMutexLocker lock(&journalMutex);
+    const auto journal = readJournal(journalPath(account, room, messageId, partId));
+    return matchesBinding(journal, room, messageId, partId)
+        ? journal.value(QStringLiteral("remoteImage")).toObject() : QJsonObject{};
+}
+
+DesktopSessionAttachmentResult DesktopSessionAttachments::uploadTemporaryImage(
+    const DesktopVideoCircleAccess& access, const DesktopSessionRoom& room,
+    const QString& messageId, const QString& partId, const QString& source) {
+    const auto path = journalPath(access.accountId, room, messageId, partId);
+    QJsonObject journal;
+    {
+        QMutexLocker lock(&journalMutex);
+        journal = readJournal(path);
+    }
+    if (!matchesBinding(journal, room, messageId, partId))
+        return {{}, {}, QStringLiteral("图片尚未发布")};
+    const auto previous = journal.value(QStringLiteral("remoteImage")).toObject();
+    if (previous.value(QStringLiteral("state")).toString() != QStringLiteral("pending"))
+        return {previous, {}, previous.value(QStringLiteral("state")).toString() == QStringLiteral("ready")
+            ? QString() : QStringLiteral("图片发布已结束")};
+    DesktopSessionAttachmentResult reply;
+    const QFileInfo file(source);
+    MaiCloudDriveMediaInfo media{};
+    const auto name = file.fileName().toUtf8();
+    if (!access.isValid() || room.login != journal.value(QStringLiteral("owner_login_session_id")).toString() ||
+        !file.isFile() || !mai_session_attachment_media_info(name.constData(), &media) ||
+        QByteArray(media.media_type_utf8) != "image" || file.size() < 1 || quint64(file.size()) > media.max_size_bytes) {
+        reply.error = QStringLiteral("图片文件或账号不可用");
+    } else {
+        Call call(access, room);
+        call.temporary(messageId, partId);
+        const auto checkpoint = (path + QStringLiteral(".maicloud.json")).toUtf8();
+        const auto sourcePath = file.absoluteFilePath().toUtf8();
+        MaiCloudDriveResult raw{};
+        mai_cloud_drive_upload_resumable(&call.options, sourcePath.constData(), checkpoint.constData(),
+            name.constData(), media.content_type_utf8, nullptr, nullptr, nullptr, &raw);
+        reply = parse(&raw);
+    }
+    QJsonObject image{{QStringLiteral("retention"), QStringLiteral("temporary")}};
+    if (reply.ok()) {
+        // Only the fixed receipt enters WS metadata. Paths, signed URLs, OSS
+        // keys and multipart state remain confined to the local transfer core.
+        for (const auto& key : {"attachment_id", "room_key", "owner_login_session_id", "name", "media_type",
+                                "content_type", "size_bytes", "expires_at"})
+            image.insert(QLatin1String(key), reply.metadata.value(QLatin1String(key)));
+        image.insert(QStringLiteral("state"), QStringLiteral("ready"));
+    } else {
+        image.insert(QStringLiteral("state"), QStringLiteral("failed"));
+        image.insert(QStringLiteral("error_code"), QStringLiteral("upload_failed"));
+        // A failed attempt also retains a server-assigned expiry when its init
+        // receipt reached the durable checkpoint before the transport failed.
+        const auto checkpoint = readJournal(path + QStringLiteral(".maicloud.json"));
+        if (checkpoint.value(QStringLiteral("expires_at")).toDouble() > 0)
+            image.insert(QStringLiteral("expires_at"), checkpoint.value(QStringLiteral("expires_at")));
+    }
+    journal.insert(QStringLiteral("remoteImage"), image);
+    {
+        QMutexLocker lock(&journalMutex);
+        if (!writeJournal(path, journal)) reply.error = QStringLiteral("无法保存图片发布回执");
+    }
+    reply.metadata = image;
+    return reply;
+}
+
+DesktopSessionAttachmentResult DesktopSessionAttachments::downloadTemporaryImage(
+    const DesktopVideoCircleAccess& access, const DesktopSessionRoom& room,
+    const QString& messageId, const QString& partId, const QJsonObject& image, const MaiCloudDriveCancel* cancel) {
+    if (!access.isValid() || image.value(QStringLiteral("retention")).toString() != QStringLiteral("temporary") ||
+        (image.value(QStringLiteral("state")).toString() != QStringLiteral("ready") &&
+         image.value(QStringLiteral("state")).toString() != QStringLiteral("expired")) ||
+        image.value(QStringLiteral("room_key")).toString() != room.key() ||
+        image.value(QStringLiteral("owner_login_session_id")).toString().isEmpty())
+        return {{}, {}, QStringLiteral("图片引用无效")};
+    const auto folder = directory(QStringLiteral("image-cache"), access.accountId, true);
+    const auto id = image.value(QStringLiteral("attachment_id")).toString();
+    const auto bytes = image.value(QStringLiteral("size_bytes")).toVariant().toLongLong();
+    if (folder.isEmpty() || id.isEmpty() || bytes < 1 || bytes > 20'000'000)
+        return {{}, {}, QStringLiteral("图片信息无效")};
+    DesktopSessionRoom originalRoom = room;
+    originalRoom.login = image.value(QStringLiteral("owner_login_session_id")).toString();
+    const auto digest = QCryptographicHash::hash((imageKey(originalRoom, messageId, partId) +
+        QLatin1Char(':') + originalRoom.login + QLatin1Char(':') + id).toUtf8(), QCryptographicHash::Sha256).toHex();
+    const auto target = QDir(folder).filePath(QString::fromLatin1(digest) + QStringLiteral(".image"));
+    // Only the shared new-file downloader publishes this cache path. A complete
+    // cached image remains usable after the server's fixed retention expires.
+    if (QFileInfo(target).isFile() && QFileInfo(target).size() == bytes) return {image, target, {}};
+    if (image.value(QStringLiteral("expires_at")).toDouble() <= QDateTime::currentMSecsSinceEpoch())
+        return {image, {}, QStringLiteral("图片已过期")};
+    Call call(access, originalRoom);
+    call.temporary(messageId, partId);
+    QJsonObject request;
+    for (const auto& key : {"attachment_id", "name", "content_type", "media_type", "size_bytes", "expires_at"})
+        request.insert(QLatin1String(key), image.value(QLatin1String(key)));
+    request.insert(QStringLiteral("output_path"), target);
+    const auto arguments = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    MaiCloudDriveResult raw{};
+    mai_cloud_drive_request(&call.options, MAI_SESSION_IMAGE_DOWNLOAD, arguments.constData(), cancel, &raw);
+    const bool expired = raw.http_status == 410;
+    auto reply = parse(&raw);
+    if (reply.ok()) reply.path = target;
+    else if (expired) reply.error = QStringLiteral("图片已过期");
+    return reply;
+}
 
 DesktopSessionAttachmentResult DesktopSessionAttachments::upload(
     const DesktopVideoCircleAccess& access, const DesktopSessionRoom& room,

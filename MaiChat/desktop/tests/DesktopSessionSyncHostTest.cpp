@@ -18,11 +18,13 @@
 #include <QScopeGuard>
 #include <QScrollBar>
 #include <QSignalSpy>
+#include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTextEdit>
 #include <QTest>
 #include <QTimer>
 #include <QWindow>
+#include <QUuid>
 #include <QtConcurrent>
 
 #include <atomic>
@@ -40,12 +42,55 @@
 #include "agent/AgentSessionList.h"
 #include "agent/DesktopSessionSyncCoordinator.h"
 #include "agent/DesktopSessionSyncHost.h"
+#include "agent/DesktopSessionAttachments.h"
 #include "agent/RemoteAgentPanel.h"
 #include "markdown/MarkdownView.h"
 #include "ui/ComposerTextEdit.h"
 #include "ui/UiZoom.h"
+#include "ui/ImagePreviewDialog.h"
 
 namespace {
+
+QStringList publicationTestAccounts;
+
+QString publicationTestAccount() {
+    const auto account = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    publicationTestAccounts.append(account);
+    return account;
+}
+
+class ImagePublicationTool final : public MaiTool {
+public:
+    explicit ImagePublicationTool(std::string path) : path_(std::move(path)) {}
+    std::string name() const override { return "publication_image_fixture"; }
+    std::string description() const override { return "Return an owned in-process image fixture"; }
+    std::string parametersSchema() const override { return R"({"type":"object","properties":{}})"; }
+    MaiToolResult execute(const std::string&, const MaiToolContext&) override {
+        return MaiToolResult::successWithImages("Owned image result", {{path_, "image/png"}});
+    }
+private:
+    std::string path_;
+};
+
+class ImagePublicationModel final : public MaiModelClient {
+public:
+    std::atomic_bool holdingAfterImage{false};
+    std::atomic_bool release{false};
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink, const std::atomic_bool& canceled) override {
+        if (calls_++ == 0) {
+            if (sink.onText) sink.onText("Before image");
+            if (sink.onToolCall) sink.onToolCall({"image_fixture_call", "publication_image_fixture", "{}"});
+        } else {
+            if (sink.onText) sink.onText("After image");
+            holdingAfterImage = true;
+            while (!release && !canceled) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return {};
+    }
+    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+private:
+    int calls_ = 0;
+};
 
 class ScheduledToolModel final : public MaiModelClient {
 public:
@@ -147,6 +192,14 @@ class DesktopSessionSyncHostTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void initTestCase();
+    void cleanupTestCase();
+    void imagePublicationJournalKeepsTerminalReceipt();
+    void remoteTemporaryImagesKeepOrderedStateRows();
+    void coordinatorWaitsForPendingImagePublishBeforeUpload();
+    void historyImagesNeverEnrollForUpload();
+    void temporaryImageLocalTlsCachesAcrossExpiryAndOwnerOffline();
+    void assistantToolImagePublishesPendingWhileTheTurnIsStillRunning();
     void appliesRemotePromptToTheExistingLocalSession();
     void remoteSteeringBindsToTheOriginalOwnerTurn();
     void remotePromptQueuesWhileOwnerIsBusy();
@@ -201,6 +254,289 @@ private slots:
     void remoteQuestionAppendRetainsExistingTextSelectionAndToolGroup();
     void remoteChildQuestionProjectionRetainsLaterTextIdentityAndToolGroups();
 };
+
+void DesktopSessionSyncHostTest::initTestCase() {
+    QStandardPaths::setTestModeEnabled(true);
+}
+
+void DesktopSessionSyncHostTest::cleanupTestCase() {
+    QVERIFY(QStandardPaths::isTestModeEnabled());
+    for (const auto& account : publicationTestAccounts) {
+        const auto digest = QString::fromLatin1(QCryptographicHash::hash(account.toUtf8(),
+            QCryptographicHash::Sha256).toHex().left(24));
+        for (const auto location : {QStandardPaths::AppDataLocation, QStandardPaths::CacheLocation}) {
+            const auto root = QDir(QStandardPaths::writableLocation(location)).absolutePath();
+            const auto target = QDir::cleanPath(root + QStringLiteral("/session-attachments/") + digest);
+            // Remove only the UUID accounts created by this run, under Qt's
+            // explicit test-mode root; never remove preferences or user data.
+            QVERIFY(target.startsWith(root + QStringLiteral("/session-attachments/")));
+            QVERIFY(!QFileInfo::exists(target) || QDir(target).removeRecursively());
+        }
+    }
+}
+
+void DesktopSessionSyncHostTest::imagePublicationJournalKeepsTerminalReceipt() {
+    const QString account = publicationTestAccount();
+    DesktopSessionRoom room{QStringLiteral("windows"), QStringLiteral("original_login"), QStringLiteral("session")};
+    const QString message = QStringLiteral("message"), part = QStringLiteral("part");
+    QVERIFY(DesktopSessionAttachments::imagePublication(account, room, message, part).isEmpty());
+    QVERIFY(DesktopSessionAttachments::enrollTemporaryImage(account, room, message, part));
+    const auto pending = DesktopSessionAttachments::imagePublication(account, room, message, part);
+    QCOMPARE(pending.value(QStringLiteral("state")).toString(), QStringLiteral("pending"));
+    // A failed first attempt is terminal across adapter instances and login replacement.
+    DesktopVideoCircleAccess access;
+    access.accountId = account;
+    const auto failed = DesktopSessionAttachments::uploadTemporaryImage(access, room, message, part, QString());
+    QVERIFY(!failed.ok());
+    room.login = QStringLiteral("replacement_login");
+    QVERIFY(DesktopSessionAttachments::enrollTemporaryImage(account, room, message, part));
+    QCOMPARE(DesktopSessionAttachments::imagePublication(account, room, message, part)
+                 .value(QStringLiteral("state")).toString(), QStringLiteral("failed"));
+}
+
+void DesktopSessionSyncHostTest::remoteTemporaryImagesKeepOrderedStateRows() {
+    QTemporaryDir data;
+    RemoteAgentPanel panel(nullptr, data.filePath(QStringLiteral("outbox.json")));
+    const QJsonObject owner{{QStringLiteral("device_slot"), QStringLiteral("windows")},
+        {QStringLiteral("login_session_id"), QStringLiteral("login")}, {QStringLiteral("id"), QStringLiteral("session")},
+        {QStringLiteral("online"), false}};
+    panel.openSession(owner);
+    const QJsonObject image{{QStringLiteral("id"), QStringLiteral("image")},
+        {QStringLiteral("kind"), QStringLiteral("image")},
+        {QStringLiteral("remoteImage"), QJsonObject{{QStringLiteral("state"), QStringLiteral("pending")},
+                                                 {QStringLiteral("retention"), QStringLiteral("temporary")}}}};
+    const QJsonObject message{{QStringLiteral("id"), QStringLiteral("message")},
+        {QStringLiteral("role"), QStringLiteral("assistant")},
+        {QStringLiteral("parts"), QJsonArray{
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("before")}, {QStringLiteral("kind"), QStringLiteral("text")},
+                        {QStringLiteral("text"), QStringLiteral("Before image")}}, image,
+            QJsonObject{{QStringLiteral("id"), QStringLiteral("after")}, {QStringLiteral("kind"), QStringLiteral("text")},
+                        {QStringLiteral("text"), QStringLiteral("After image")}}}}};
+    panel.receivePayload(owner, QStringLiteral("history_page"),
+        {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    QCOMPARE(view->itemCount(), 3);
+    const auto cards = panel.findChildren<QLabel*>(QStringLiteral("remoteSessionImage"));
+    QCOMPARE(cards.size(), 1);
+    QCOMPARE(cards.first()->text(), QStringLiteral("图片正在发布…"));
+    panel.receivePayload(owner, QStringLiteral("event"),
+        {{QStringLiteral("messages"), QJsonArray{message}}});
+    QCOMPARE(panel.findChildren<QLabel*>(QStringLiteral("remoteSessionImage")), cards);
+}
+
+void DesktopSessionSyncHostTest::coordinatorWaitsForPendingImagePublishBeforeUpload() {
+    QTemporaryDir workspace;
+    AgentController::ModelConfig model;
+    AgentController controller(model, {});
+    const auto session = controller.createSession(workspace.path(), QStringLiteral("Image publication"));
+    const auto account = publicationTestAccount();
+    QList<DesktopSessionSyncCoordinator::Completion> pendingAcks;
+    QString imageMessage, imagePart;
+    DesktopSessionSyncCoordinator coordinator(
+        [&](const QString& path, const QByteArray&, const QJsonObject& body,
+            DesktopSessionSyncCoordinator::Completion completion) {
+            if (path == QStringLiteral("session-sync/presence")) {
+                completion({{QStringLiteral("login_session_id"), QStringLiteral("owner_login")}}, {});
+                return;
+            }
+            for (const auto& value : body.value(QStringLiteral("messages")).toArray()) {
+                const auto message = value.toObject();
+                for (const auto& item : message.value(QStringLiteral("parts")).toArray()) {
+                    const auto part = item.toObject();
+                    if (part.value(QStringLiteral("remoteImage")).toObject().value(QStringLiteral("state")) !=
+                        QStringLiteral("pending")) continue;
+                    imageMessage = message.value(QStringLiteral("id")).toString();
+                    imagePart = part.value(QStringLiteral("id")).toString();
+                    QVERIFY(!QJsonDocument(body).toJson().contains(workspace.path().toUtf8()));
+                    pendingAcks.append(std::move(completion));
+                    return;
+                }
+            }
+            completion({}, {});
+        }, [&] { return &controller; }, nullptr, QStringLiteral("image-test"), QStringLiteral("Desktop"));
+    coordinator.setAttachmentAccessProvider([&] {
+        DesktopVideoCircleAccess access;
+        access.accountId = account;  // Missing credentials fail locally after the ACK; no HTTP.
+        return access;
+    });
+    coordinator.start();
+    coordinator.connectionReady();
+    QVERIFY(controller.agent().submit(MaiSendPrompt{session.toStdString(), "Image event",
+        {{workspace.filePath(QStringLiteral("private-screen.png")).toStdString(), "image/png"}}}));
+    QTRY_VERIFY_WITH_TIMEOUT(!pendingAcks.isEmpty(), 3000);
+    const auto room = coordinator.localRoom(session);
+    auto state = [&] {
+        return DesktopSessionAttachments::imagePublication(account, room, imageMessage, imagePart)
+            .value(QStringLiteral("state")).toString();
+    };
+    QCOMPARE(state(), QStringLiteral("pending"));
+    QTest::qWait(100);
+    QCOMPARE(state(), QStringLiteral("pending"));
+    pendingAcks.takeFirst()({}, {});
+    QTRY_COMPARE_WITH_TIMEOUT(state(), QStringLiteral("failed"), 3000);
+    // Later ordinary snapshots must retain the terminal journal receipt.
+    coordinator.connectionLost();
+    coordinator.connectionReady();
+    QTest::qWait(400);
+    QCOMPARE(state(), QStringLiteral("failed"));
+}
+
+void DesktopSessionSyncHostTest::historyImagesNeverEnrollForUpload() {
+    AgentController::ModelConfig model;
+    AgentController controller(model, {});
+    const auto session = controller.createSession({}, QStringLiteral("Legacy image history"));
+    QVERIFY(controller.agent().submit(MaiSendPrompt{session.toStdString(), "Old image",
+        {{"/private/old-image.png", "image/png"}}}));
+    QTRY_VERIFY_WITH_TIMEOUT(!controller.agent().isBusy(session.toStdString()), 3000);
+    QTest::qWait(2);
+    DesktopSessionSyncHost host(controller);
+    const auto account = publicationTestAccount();
+    host.setImagePublicationScope(account, QStringLiteral("windows"), QStringLiteral("owner_login"));
+    const auto messages = host.historyPage(session, {}, 20).value(QStringLiteral("messages")).toArray();
+    bool sawImage = false;
+    for (const auto& value : messages) {
+        const auto message = value.toObject();
+        host.enrollLiveImages(session, message.value(QStringLiteral("id")).toString());
+        for (const auto& item : host.historyMessage(session, message.value(QStringLiteral("id")).toString())
+                                    .value(QStringLiteral("parts")).toArray()) {
+            const auto part = item.toObject();
+            if (part.value(QStringLiteral("kind")) != QStringLiteral("image")) continue;
+            sawImage = true;
+            QVERIFY(!part.contains(QStringLiteral("remoteImage")));
+            QVERIFY(!part.contains(QStringLiteral("path")));
+        }
+    }
+    QVERIFY(sawImage);
+}
+
+void DesktopSessionSyncHostTest::temporaryImageLocalTlsCachesAcrossExpiryAndOwnerOffline() {
+    const auto endpoint = qEnvironmentVariable("MAICHAT_IMAGE_TEST_ENDPOINT");
+    if (endpoint.isEmpty()) QSKIP("Run run_session_image_local_tls.py for the disposable local TLS fixture");
+    QFile certificate(qEnvironmentVariable("MAICHAT_IMAGE_TEST_CA"));
+    QVERIFY(certificate.open(QIODevice::ReadOnly));
+    DesktopVideoCircleAccess access;
+    access.authBaseUrl = endpoint + QStringLiteral("/auth");
+    access.mediaBaseUrl = endpoint;
+    access.accountId = publicationTestAccount();
+    access.accountToken = QStringLiteral("author-token");
+    access.caPem = certificate.readAll();
+    access.proxyUrl = QStringLiteral("");
+    access.signedUploadHostSuffix = QStringLiteral("localhost");
+    QTemporaryDir files;
+    QImage pixels(80, 40, QImage::Format_RGBA8888);
+    pixels.fill(Qt::blue);
+    const auto source = files.filePath(QStringLiteral("screen.png"));
+    QVERIFY(pixels.save(source));
+    const DesktopSessionRoom room{QStringLiteral("mac"), QStringLiteral("login_a"), QStringLiteral("session_a")};
+    const QString messageId = QStringLiteral("message_a"), partId = QStringLiteral("part_a");
+    QVERIFY(DesktopSessionAttachments::enrollTemporaryImage(access.accountId, room, messageId, partId));
+    const auto uploaded = DesktopSessionAttachments::uploadTemporaryImage(access, room, messageId, partId, source);
+    QVERIFY2(uploaded.ok(), qPrintable(uploaded.error));
+    const auto ready = uploaded.metadata;
+    const QJsonObject owner{{QStringLiteral("device_slot"), room.slot},
+        {QStringLiteral("login_session_id"), QStringLiteral("replacement_login")},
+        {QStringLiteral("id"), room.session}, {QStringLiteral("online"), false}};
+    const auto payload = [&](const QJsonObject& image) {
+        return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{QJsonObject{
+            {QStringLiteral("id"), messageId}, {QStringLiteral("role"), QStringLiteral("assistant")},
+            {QStringLiteral("parts"), QJsonArray{QJsonObject{{QStringLiteral("id"), partId},
+                {QStringLiteral("kind"), QStringLiteral("image")}, {QStringLiteral("remoteImage"), image}}}}}}}};
+    };
+    const auto show = [&](RemoteAgentPanel& panel) {
+        panel.setImageAccessProvider([&] { return access; });
+        panel.openSession(owner);
+        panel.receivePayload(owner, QStringLiteral("history_page"), payload(ready));
+        panel.resize(600, 420);
+        panel.show();
+    };
+    RemoteAgentPanel first(nullptr, files.filePath(QStringLiteral("first.json")));
+    show(first);
+    auto* card = first.findChild<QLabel*>(QStringLiteral("remoteSessionImage"));
+    QVERIFY(card);
+    QTRY_VERIFY_WITH_TIMEOUT(!card->pixmap().isNull(), 3000);
+    QCOMPARE(card->pixmap().size(), QSize(80, 40));
+    const auto rendered = card->grab().toImage();
+    QRect blueBounds;
+    for (int y = 0; y < rendered.height(); ++y)
+        for (int x = 0; x < rendered.width(); ++x)
+            if (rendered.pixelColor(x, y) == QColor(Qt::blue))
+                blueBounds = blueBounds.united(QRect(x, y, 1, 1));
+    QVERIFY(!blueBounds.isEmpty());
+    QVERIFY2(qAbs(blueBounds.width() - 2 * blueBounds.height()) <= 2,
+        qPrintable(QStringLiteral("Displayed 2:1 image was stretched to %1x%2 in a %3x%4 card")
+            .arg(blueBounds.width()).arg(blueBounds.height()).arg(card->width()).arg(card->height())));
+    QTest::mouseClick(card, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(first.findChild<ImagePreviewDialog*>(QStringLiteral("remoteSessionImagePreview")), 1000);
+    auto* preview = first.findChild<ImagePreviewDialog*>(QStringLiteral("remoteSessionImagePreview"));
+    QVERIFY(preview->isVisible());
+    QVERIFY(!preview->isModal());
+    QCOMPARE(preview->sourceImage().size(), QSize(80, 40));
+    preview->close();
+    const auto screenshot = qEnvironmentVariable("MAICHAT_IMAGE_TEST_SCREENSHOT");
+    if (!screenshot.isEmpty()) QVERIFY(first.grab().save(screenshot));
+    const auto expiry = ready.value(QStringLiteral("expires_at")).toVariant().toLongLong();
+    QTest::qWait(int(qMax<qint64>(0, expiry - QDateTime::currentMSecsSinceEpoch()) + 30));
+    RemoteAgentPanel reopened(nullptr, files.filePath(QStringLiteral("second.json")));
+    show(reopened);
+    auto* cached = reopened.findChild<QLabel*>(QStringLiteral("remoteSessionImage"));
+    QVERIFY(cached);
+    QTRY_VERIFY_WITH_TIMEOUT(!cached->pixmap().isNull(), 3000);
+    QCOMPARE(cached->pixmap().size(), QSize(80, 40));
+    access.accountId = publicationTestAccount();
+    const auto uncached = DesktopSessionAttachments::downloadTemporaryImage(access, room, messageId, partId, ready);
+    QVERIFY(!uncached.ok());
+    QCOMPARE(uncached.error, QStringLiteral("图片已过期"));
+    QVERIFY(uncached.path.isEmpty());
+}
+
+void DesktopSessionSyncHostTest::assistantToolImagePublishesPendingWhileTheTurnIsStillRunning() {
+    QTemporaryDir workspace;
+    const auto source = workspace.filePath(QStringLiteral("owned-image.png"));
+    QImage pixels(8, 4, QImage::Format_RGBA8888);
+    pixels.fill(Qt::green);
+    QVERIFY(pixels.save(source));
+    auto model = std::make_unique<ImagePublicationModel>();
+    auto* scripted = model.get();
+    AgentController controller(std::move(model), {}, [&](MaiToolRegistry& registry) {
+        registry.add(std::make_unique<ImagePublicationTool>(source.toStdString()));
+    });
+    const auto release = qScopeGuard([&] { scripted->release = true; });
+    const auto session = controller.createSession(workspace.path(), QStringLiteral("Live assistant image"));
+    const auto account = publicationTestAccount();
+    bool sawPending = false;
+    DesktopSessionSyncCoordinator coordinator(
+        [&](const QString& path, const QByteArray&, const QJsonObject& body,
+            DesktopSessionSyncCoordinator::Completion completion) {
+            if (path == QStringLiteral("session-sync/presence")) {
+                completion({{QStringLiteral("login_session_id"), QStringLiteral("owner_login")}}, {});
+                return;
+            }
+            for (const auto& item : body.value(QStringLiteral("messages")).toArray()) {
+                const auto message = item.toObject();
+                if (message.value(QStringLiteral("role")) != QStringLiteral("assistant")) continue;
+                for (const auto& value : message.value(QStringLiteral("parts")).toArray()) {
+                    const auto part = value.toObject();
+                    if (part.value(QStringLiteral("kind")) != QStringLiteral("image")) continue;
+                    sawPending |= part.value(QStringLiteral("remoteImage")).toObject()
+                        .value(QStringLiteral("state")) == QStringLiteral("pending");
+                }
+            }
+            completion({}, {});
+        }, [&] { return &controller; }, nullptr, QStringLiteral("assistant-image-test"), QStringLiteral("Desktop"));
+    coordinator.setAttachmentAccessProvider([&] {
+        DesktopVideoCircleAccess access;
+        access.accountId = account;
+        return access;
+    });
+    coordinator.start();
+    coordinator.connectionReady();
+    QVERIFY(controller.sendPrompt(session, QStringLiteral("Observe the owned image")));
+    QTRY_VERIFY_WITH_TIMEOUT(scripted->holdingAfterImage.load(), 3000);
+    QVERIFY(controller.agent().isBusy(session.toStdString()));
+    QTRY_VERIFY_WITH_TIMEOUT(sawPending, 3000);
+    QVERIFY(controller.agent().isBusy(session.toStdString()));
+}
 
 void DesktopSessionSyncHostTest::ownerQuestionAnswersRequireMatchingConversationAndReceipt() {
     QTemporaryDir workspace;

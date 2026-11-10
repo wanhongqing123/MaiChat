@@ -4,11 +4,14 @@
 #include "MaiCloudDriveClient.h"
 
 #include <QDateTime>
+#include <QCoreApplication>
+#include <QEvent>
 #include <QDesktopServices>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFile>
+#include <QFutureWatcher>
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <QJsonDocument>
@@ -19,6 +22,7 @@
 #include <QLabel>
 #include <QMap>
 #include <QMimeData>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
 #include <QPointer>
@@ -30,15 +34,66 @@
 #include <QUuid>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
+#include <atomic>
 
 #include "agent/AgentToolGroupWidget.h"
 #include "markdown/MarkdownView.h"
 #include "ui/ComposerTextEdit.h"
 #include "ui/UiZoom.h"
+#include "ui/DesktopRasterImage.h"
+#include "ui/ImagePreviewDialog.h"
+#include "agent/DesktopSessionAttachments.h"
 
 namespace {
+
+struct ImageCancellation {
+    std::atomic_bool canceled{false};
+    MaiCloudDriveCancel* transfer = mai_cloud_drive_cancel_create();
+    ~ImageCancellation() { mai_cloud_drive_cancel_destroy(transfer); }
+    void cancel() {
+        canceled = true;
+        mai_cloud_drive_cancel_request(transfer);
+    }
+};
+
+class RemoteImageLabel final : public QLabel {
+public:
+    std::function<void()> activated;
+    RemoteImageLabel() {
+        setScaledContents(true);
+        setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
+    }
+    bool hasHeightForWidth() const override { return !pixmap().isNull(); }
+    int heightForWidth(int width) const override {
+        const auto image = pixmap();
+        if (image.isNull()) return QLabel::heightForWidth(width);
+        // The shared decoder bounds the thumbnail; layout scales it down for
+        // a narrow reading column while retaining its original aspect ratio.
+        const int inner = qBound(1, width - margin() * 2, image.width());
+        return qMax(1, qRound(double(image.height()) * inner / image.width())) + margin() * 2;
+    }
+protected:
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton && !pixmap().isNull() && activated) {
+            activated();
+            event->accept();
+            return;
+        }
+        QLabel::mousePressEvent(event);
+    }
+    void keyPressEvent(QKeyEvent* event) override {
+        if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter || event->key() == Qt::Key_Space) &&
+            !pixmap().isNull() && activated) {
+            activated();
+            event->accept();
+            return;
+        }
+        QLabel::keyPressEvent(event);
+    }
+};
 
 QString sessionKey(const QJsonObject& value) {
     return value.value(QStringLiteral("device_slot")).toString() + QLatin1Char(':') +
@@ -343,6 +398,15 @@ struct RemoteAgentPanel::Runtime {
     }
     QMap<QString, QString> rendered;
     QHash<QString, RemoteToolGroupCard*> toolGroups;
+    QHash<QString, QLabel*> imageCards;
+    ImageAccessProvider imageAccess;
+    quint64 imageGeneration = 0;
+    QString imageAccount;
+    QHash<QString, std::shared_ptr<ImageCancellation>> imageTransfers;
+    QPointer<ImagePreviewDialog> imagePreview;
+    std::shared_ptr<ImageCancellation> previewCancellation;
+    quint64 previewGeneration = 0;
+    QString previewIdentity;
     QSet<QString> optimisticMessages;
     QHash<QString, QString> drafts;
     QHash<QString, QStringList> attachmentDrafts;
@@ -617,6 +681,8 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
 }
 
 RemoteAgentPanel::~RemoteAgentPanel() {
+    resetImagePreview();
+    for (const auto& transfer : runtime_->imageTransfers) transfer->cancel();
     if (!runtime_->session.isEmpty()) {
         runtime_->drafts.insert(sessionKey(runtime_->session), runtime_->editor->toPlainText());
         runtime_->attachmentDrafts.insert(sessionKey(runtime_->session), runtime_->attachments);
@@ -634,6 +700,14 @@ void RemoteAgentPanel::setDownloadHandler(DownloadHandler handler) {
     runtime_->download = std::move(handler);
 }
 
+void RemoteAgentPanel::setImageAccessProvider(ImageAccessProvider provider) {
+    resetImagePreview();
+    for (const auto& transfer : runtime_->imageTransfers) transfer->cancel();
+    runtime_->imageTransfers.clear();
+    runtime_->imageAccess = std::move(provider);
+    ++runtime_->imageGeneration;
+}
+
 QJsonObject RemoteAgentPanel::session() const {
     return runtime_->session;
 }
@@ -642,6 +716,10 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
     const QString previous = sessionKey(runtime_->session);
     const QString next = sessionKey(remote);
     if (previous != next) {
+        resetImagePreview();
+        for (const auto& transfer : runtime_->imageTransfers) transfer->cancel();
+        runtime_->imageTransfers.clear();
+        ++runtime_->imageGeneration;
         ++runtime_->historyGeneration;
         runtime_->historyInFlight = false;
         runtime_->historyTimeout.stop();
@@ -665,6 +743,7 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
         runtime_->questions = {};
         runtime_->rendered.clear();
         runtime_->toolGroups.clear();
+        runtime_->imageCards.clear();
         runtime_->optimisticMessages.clear();
         runtime_->view->clear();
         runtime_->thinking = nullptr;
@@ -1314,6 +1393,8 @@ void RemoteAgentPanel::renderMessages() {
         QString text;
         MarkdownView::Style style;
         QJsonArray tools;
+        QJsonObject image;
+        QString sourceMessageId;
     };
     const QString ownerKey = sessionKey(runtime_->session);
     QMap<QString, QJsonObject> displayed = runtime_->messages;
@@ -1409,9 +1490,13 @@ void RemoteAgentPanel::renderMessages() {
         bool hasQuestion = false;
         for (const QJsonValue& value : parts) hasQuestion |= !questionPartText(value.toObject()).isEmpty();
         bool hasTools = false;
+        bool hasImage = false;
         for (const QJsonValue& value : parts)
             hasTools |= value.toObject().value(QStringLiteral("kind")) == QStringLiteral("tool");
-        if (!hasQuestion && !projection && !hasTools) {
+        for (const QJsonValue& value : parts)
+            hasImage |= value.toObject().value(QStringLiteral("kind")) == QStringLiteral("image") &&
+                        value.toObject().value(QStringLiteral("remoteImage")).isObject();
+        if (!hasQuestion && !projection && !hasTools && !hasImage) {
             const QString text = messageText(message);
             if (!text.isEmpty()) segments.append({messageId, text, style});
             continue;
@@ -1458,6 +1543,14 @@ void RemoteAgentPanel::renderMessages() {
             const QJsonObject part = parts[index].toObject();
             const QString kind = part.value(QStringLiteral("kind")).toString();
             if (kind == QStringLiteral("reasoning")) continue;
+            if (kind == QStringLiteral("image") && part.value(QStringLiteral("remoteImage")).isObject()) {
+                flushTools();
+                flush();
+                const auto id = sourceId + QStringLiteral(":image:") + partIdentity(part, index);
+                segments.append({id, QString::fromUtf8(QJsonDocument(part).toJson(QJsonDocument::Compact)),
+                                 style, {}, part, sourceId});
+                continue;
+            }
             const QString question = questionPartText(part);
             if (question.isEmpty()) {
                 if (projection) continue;
@@ -1520,11 +1613,40 @@ void RemoteAgentPanel::renderMessages() {
         // MarkdownView defers widget destruction. A merged/split group must
         // stop painting and receiving input during this update immediately.
         if (RemoteToolGroupCard* group = runtime_->toolGroups.take(old)) group->hide();
+        if (QLabel* image = runtime_->imageCards.take(old)) {
+            image->hide();
+            const auto identity = image->property("imageIdentity").toString();
+            if (runtime_->previewIdentity == identity) resetImagePreview();
+            if (const auto transfer = runtime_->imageTransfers.take(identity)) transfer->cancel();
+        }
         runtime_->view->removeItem(old);
         runtime_->rendered.remove(old);
     }
     for (const Segment& segment : segments) {
-        if (!segment.tools.isEmpty()) {
+        if (!segment.image.isEmpty()) {
+            auto* card = runtime_->imageCards.value(segment.id, nullptr);
+            if (!card) {
+                card = new RemoteImageLabel;
+                card->setObjectName(QStringLiteral("remoteSessionImage"));
+                card->setAccessibleName(QStringLiteral("远端图片"));
+                card->setToolTip(QStringLiteral("查看大图"));
+                card->setFocusPolicy(Qt::StrongFocus);
+                QPointer<RemoteAgentPanel> guard(this);
+                QPointer<QLabel> label(card);
+                static_cast<RemoteImageLabel*>(card)->activated = [guard, label] {
+                    if (guard && label) guard->openImagePreview(label.data());
+                };
+                card->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+                card->setMargin(UiZoom::s(10));
+                card->setMinimumHeight(UiZoom::s(42));
+                if (segment.style == MarkdownView::Style::Bubble)
+                    card->setStyleSheet(QStringLiteral("background:#edf2f7;border-radius:12px;color:#667085;"));
+                else card->setStyleSheet(QStringLiteral("color:#667085;"));
+                runtime_->view->addWidget(segment.id, card);
+                runtime_->imageCards.insert(segment.id, card);
+            }
+            renderImage(card, segment.sourceMessageId, segment.image);
+        } else if (!segment.tools.isEmpty()) {
             RemoteToolGroupCard* group = runtime_->toolGroups.value(segment.id, nullptr);
             if (!group) {
                 group = new RemoteToolGroupCard(segment.id);
@@ -1545,6 +1667,164 @@ void RemoteAgentPanel::renderMessages() {
     runtime_->view->endBatchUpdates();
     updateThinking();
     if (followedLatest) runtime_->view->scrollToBottom();
+}
+
+void RemoteAgentPanel::renderImage(QLabel* card, const QString& messageId, const QJsonObject& part) {
+    const auto image = part.value(QStringLiteral("remoteImage")).toObject();
+    const auto state = image.value(QStringLiteral("state")).toString();
+    const auto access = runtime_->imageAccess ? runtime_->imageAccess() : DesktopVideoCircleAccess{};
+    if (runtime_->imageAccount != access.accountId) {
+        resetImagePreview();
+        for (const auto& transfer : runtime_->imageTransfers) transfer->cancel();
+        runtime_->imageTransfers.clear();
+        runtime_->imageAccount = access.accountId;
+        ++runtime_->imageGeneration;
+    }
+    const auto owner = runtime_->session;
+    const auto partId = part.value(QStringLiteral("id")).toString();
+    const QString identity = access.accountId + QLatin1Char(':') + sessionKey(owner) + QLatin1Char(':') +
+        messageId + QLatin1Char(':') + partId + QLatin1Char(':') +
+        QString::fromUtf8(QJsonDocument(image).toJson(QJsonDocument::Compact));
+    if (card->property("imageIdentity").toString() == identity) return;
+    if (runtime_->previewIdentity == card->property("imageIdentity").toString()) resetImagePreview();
+    if (const auto transfer = runtime_->imageTransfers.take(card->property("imageIdentity").toString()))
+        transfer->cancel();
+    card->setProperty("imageIdentity", identity);
+    card->setProperty("imageState", state);
+    card->setProperty("imageAccount", access.accountId);
+    card->setProperty("imageCachePath", QString());
+    card->setCursor(Qt::ArrowCursor);
+    card->setPixmap({});
+    card->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+    if (state != QStringLiteral("ready") &&
+        !(state == QStringLiteral("expired") && !image.value(QStringLiteral("attachment_id")).toString().isEmpty())) {
+        card->setText(state == QStringLiteral("pending") ? QStringLiteral("图片正在发布…") :
+                      state == QStringLiteral("expired") ? QStringLiteral("图片已过期") :
+                      QStringLiteral("图片发布失败"));
+        return;
+    }
+    if (!access.isValid()) {
+        card->setText(QStringLiteral("登录后查看图片"));
+        return;
+    }
+    card->setText(QStringLiteral("图片加载中…"));
+    const DesktopSessionRoom room{owner.value(QStringLiteral("device_slot")).toString(),
+        image.value(QStringLiteral("owner_login_session_id")).toString(), owner.value(QStringLiteral("id")).toString()};
+    struct ImageResult { QImage pixels; QString error; QString path; };
+    const auto generation = runtime_->imageGeneration;
+    const auto cancellation = std::make_shared<ImageCancellation>();
+    runtime_->imageTransfers.insert(identity, cancellation);
+    QPointer<RemoteAgentPanel> guard(this);
+    QPointer<QLabel> label(card);
+    auto* watcher = new QFutureWatcher<ImageResult>(this);
+    connect(watcher, &QFutureWatcher<ImageResult>::finished, this,
+        [guard, label, watcher, generation, identity, access, owner, cancellation] {
+            const auto result = watcher->result();
+            watcher->deleteLater();
+            if (guard && guard->runtime_->imageTransfers.value(identity) == cancellation)
+                guard->runtime_->imageTransfers.remove(identity);
+            if (!guard || !label || guard->runtime_->imageGeneration != generation ||
+                label->property("imageIdentity").toString() != identity ||
+                sessionKey(guard->runtime_->session) != sessionKey(owner) || !guard->runtime_->imageAccess ||
+                guard->runtime_->imageAccess().accountId != access.accountId) return;
+            if (!result.error.isEmpty()) {
+                label->setText(result.error);
+                label->setProperty("imageState", result.error == QStringLiteral("图片已过期")
+                    ? QStringLiteral("expired") : QStringLiteral("failed"));
+                return;
+            }
+            label->setText({});
+            const auto pixmap = QPixmap::fromImage(result.pixels);
+            label->setMinimumHeight(0);
+            label->setPixmap(pixmap);
+            label->setMaximumSize(pixmap.width() + label->margin() * 2, pixmap.height() + label->margin() * 2);
+            label->setProperty("imageState", QStringLiteral("ready"));
+            label->setProperty("imageCachePath", result.path);
+            label->setCursor(Qt::PointingHandCursor);
+            label->updateGeometry();
+            // MarkdownView owns this row's geometry without a QLayout. Notify
+            // its widget filter explicitly; updateGeometry alone informs the
+            // viewport and leaves the former pending-label height in place.
+            QEvent layout(QEvent::LayoutRequest);
+            QCoreApplication::sendEvent(label.data(), &layout);
+        });
+    watcher->setFuture(QtConcurrent::run([access, room, messageId, partId, image, cancellation] {
+        const auto downloaded = DesktopSessionAttachments::downloadTemporaryImage(
+            access, room, messageId, partId, image, cancellation->transfer);
+        if (!downloaded.ok()) return ImageResult{{}, downloaded.error};
+        MaiImageReadOptions options{};
+        options.max_encoded_bytes = 20'000'000;
+        options.max_source_pixels = 100'000'000;
+        options.max_output_width = 480;
+        options.max_output_height = 360;
+        options.is_canceled = [](void* context) {
+            return static_cast<ImageCancellation*>(context)->canceled.load() ? 1 : 0;
+        };
+        options.context = cancellation.get();
+        const auto decoded = desktopReadRasterFile(downloaded.path, options);
+        return decoded.image.isNull() ? ImageResult{{}, QStringLiteral("图片无法解码")}
+                                     : ImageResult{decoded.image, {}, downloaded.path};
+    }));
+}
+
+void RemoteAgentPanel::resetImagePreview() {
+    ++runtime_->previewGeneration;
+    if (runtime_->previewCancellation) runtime_->previewCancellation->cancel();
+    runtime_->previewCancellation.reset();
+    runtime_->previewIdentity.clear();
+    if (runtime_->imagePreview) runtime_->imagePreview->close();
+    runtime_->imagePreview.clear();
+}
+
+void RemoteAgentPanel::openImagePreview(QLabel* card) {
+    const auto access = runtime_->imageAccess ? runtime_->imageAccess() : DesktopVideoCircleAccess{};
+    const auto path = card->property("imageCachePath").toString();
+    if (!access.isValid() || access.accountId != card->property("imageAccount").toString() ||
+        path.isEmpty() || card->property("imageState").toString() != QStringLiteral("ready")) return;
+    resetImagePreview();
+    const auto identity = card->property("imageIdentity").toString();
+    const auto owner = sessionKey(runtime_->session);
+    const auto generation = runtime_->previewGeneration;
+    const auto cancellation = std::make_shared<ImageCancellation>();
+    runtime_->previewCancellation = cancellation;
+    runtime_->previewIdentity = identity;
+    QPointer<RemoteAgentPanel> guard(this);
+    QPointer<QLabel> label(card);
+    auto* watcher = new QFutureWatcher<DesktopRasterImageResult>(this);
+    connect(watcher, &QFutureWatcher<DesktopRasterImageResult>::finished, this,
+        [guard, label, watcher, cancellation, generation, identity, owner, access] {
+            const auto decoded = watcher->result();
+            watcher->deleteLater();
+            if (!guard || !label || cancellation->canceled || guard->runtime_->previewGeneration != generation ||
+                guard->runtime_->previewIdentity != identity || sessionKey(guard->runtime_->session) != owner ||
+                label->property("imageIdentity").toString() != identity || !guard->runtime_->imageAccess ||
+                guard->runtime_->imageAccess().accountId != access.accountId) return;
+            guard->runtime_->previewCancellation.reset();
+            if (decoded.image.isNull()) {
+                guard->showStatus(QStringLiteral("图片无法打开"), true);
+                return;
+            }
+            // Preview uses only the previously committed local original and
+            // the ordinary codec. It cannot renew a URL or trigger an upload.
+            auto* dialog = new ImagePreviewDialog(QPixmap::fromImage(decoded.image), guard.data());
+            dialog->setObjectName(QStringLiteral("remoteSessionImagePreview"));
+            dialog->setAttribute(Qt::WA_DeleteOnClose);
+            dialog->setModal(false);
+            dialog->setWindowModality(Qt::NonModal);
+            guard->runtime_->imagePreview = dialog;
+            dialog->show();
+        });
+    watcher->setFuture(QtConcurrent::run([path, cancellation] {
+        MaiImageReadOptions options{};
+        options.max_encoded_bytes = 20'000'000;
+        options.max_source_pixels = 100'000'000;
+        options.max_output_width = options.max_output_height = 4096;
+        options.is_canceled = [](void* context) {
+            return static_cast<ImageCancellation*>(context)->canceled.load() ? 1 : 0;
+        };
+        options.context = cancellation.get();
+        return desktopReadRasterFile(path, options);
+    }));
 }
 
 void RemoteAgentPanel::updateThinking() {

@@ -1,7 +1,8 @@
 // 文件作用：验证“把屏幕截图能力封装为 Agent 工具”的正确行为和边界条件。
 // 验证入口：test_tool_contract、test_builtin_registration_matches_platform_support、
 // test_capture_uses_only_screen_requests、test_stop_needs_no_capture_or_workspace、
-// test_controlled_tool_uses_owned_native_window_source；检查可观察结果而非实现细节。
+// test_controlled_tool_uses_owned_native_window_source；普通 API 另测显式显示器的失败分派，
+// 不把缺少 GUI/屏幕录制授权计为目标校验成功。
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -19,6 +20,8 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <CoreGraphics/CoreGraphics.h>
 #endif
 
 #if !defined(_WIN32)
@@ -229,7 +232,10 @@ void test_legacy_window_arguments_are_rejected_before_capture() {
          {R"({"mode":"display"})", R"({"mode":"window","windowTitle":"MaiAgent Legacy Window"})",
           R"({"windowTitle":"MaiAgent Legacy Window"})",
           R"({"action":"capture","window_id":"123"})", R"({"action":"stop","mode":"window"})",
-          R"({"action":"window"})"}) {
+          R"({"action":"window"})", R"({"action":"capture","displayId":123})",
+          R"({"action":"capture","display_id":"123"})",
+          R"({"action":"capture","target":"DisplayById"})",
+          R"({"action":"capture","image_path":"screenshots/owned.png"})"}) {
         const MaiToolResult result = tool->execute(arguments, context);
         CHECK(result.hasError());
         CHECK(result.error().code() == MaiErrorCode::InvalidInput);
@@ -337,10 +343,93 @@ void test_native_request_contract() {
     CHECK(static_cast<int>(MaiScreenshotTarget::DisplayUnderPointer) == 0);
     CHECK(static_cast<int>(MaiScreenshotTarget::WindowByTitle) == 1);
     CHECK(static_cast<int>(MaiScreenshotTarget::WindowById) == 2);
+    CHECK(static_cast<int>(MaiScreenshotTarget::DisplayById) == 3);
     const MaiScreenshotRequest request;
     CHECK(request.target == MaiScreenshotTarget::DisplayUnderPointer);
     CHECK(request.windowTitle.empty());
     CHECK(request.windowId == 0);
+    CHECK(request.displayId == 0);
+}
+
+void check_native_display_request_rejected(std::uint64_t displayId, MaiErrorCode expected) {
+    MaiScreenshotRequest request;
+    request.target = MaiScreenshotTarget::DisplayById;
+    request.displayId = displayId;
+    // 故意填旧结果，拒绝请求时不能把此前的帧及时间戳交给新目标。
+    MaiScreenshot screenshot;
+    screenshot.pngBytes = {0x7f};
+    screenshot.width = 17;
+    screenshot.height = 23;
+    screenshot.frameSequence = 41;
+    screenshot.frameReceivedAtMs = 1700000000123LL;
+    const MaiScreenshotCaptureState before = maiScreenshotCaptureState();
+    const MaiError error =
+        runCaptureCallWithOwnerMessages([&] { return maiCaptureScreenshot(request, screenshot); });
+    if (error.code() != expected) {
+        std::printf("display ID %llu validation error: %s\n",
+                    static_cast<unsigned long long>(displayId), error.message().c_str());
+    }
+    // GUI/权限前置条件不足不是目标分派通过；只能把精确错误计为本用例的通过。
+    CHECK(error.code() == expected);
+    CHECK(screenshot.pngBytes.empty());
+    CHECK(screenshot.width == 0);
+    CHECK(screenshot.height == 0);
+    CHECK(screenshot.frameSequence == 0);
+    CHECK(screenshot.frameReceivedAtMs == 0);
+    const MaiScreenshotCaptureState after = maiScreenshotCaptureState();
+    CHECK(after.deviceCreations == before.deviceCreations);
+    CHECK(after.sessionStarts == before.sessionStarts);
+}
+
+void test_native_display_id_rejects_zero_and_invalid() {
+    if (!maiIsScreenshotSupported()) return;
+    check_native_display_request_rejected(0, MaiErrorCode::InvalidInput);
+#if defined(_WIN32)
+    const MaiErrorCode expected = sizeof(std::uintptr_t) < sizeof(std::uint64_t)
+                                      ? MaiErrorCode::InvalidInput
+                                      : MaiErrorCode::NotFound;
+#else
+    const MaiErrorCode expected = MaiErrorCode::InvalidInput;
+#endif
+    check_native_display_request_rejected(std::numeric_limits<std::uint64_t>::max(), expected);
+}
+
+void test_native_display_id_rejects_nonactive_target_without_fallback() {
+    if (!maiIsScreenshotSupported()) return;
+    std::vector<std::uint64_t> active;
+#if defined(_WIN32)
+    const BOOL enumerated = ::EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM context) -> BOOL {
+            auto& displays = *reinterpret_cast<std::vector<std::uint64_t>*>(context);
+            displays.push_back(reinterpret_cast<std::uintptr_t>(monitor));
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&active));
+    CHECK(enumerated != FALSE);
+    if (!enumerated) return;
+#elif defined(__APPLE__)
+    std::uint32_t count = 0;
+    const CGError counted = CGGetActiveDisplayList(0, nullptr, &count);
+    CHECK(counted == kCGErrorSuccess);
+    CHECK(count > 0 && count <= 64);
+    if (counted != kCGErrorSuccess || count == 0 || count > 64) return;
+    std::vector<CGDirectDisplayID> ids(count);
+    const CGError enumerated = CGGetActiveDisplayList(count, ids.data(), &count);
+    CHECK(enumerated == kCGErrorSuccess);
+    if (enumerated != kCGErrorSuccess) return;
+    active.assign(ids.begin(), ids.begin() + count);
+#else
+    CHECK(false);
+    return;
+#endif
+    CHECK(!active.empty());
+    if (active.empty()) return;
+    // 枚举只读取原生标识，不读取任何显示器像素。从 N+1 个候选中选出不在 N 个活动标识
+    // 内的非零值；不假定 1、主屏编号或 UINT32_MAX 永远不会是有效显示器。
+    std::uint64_t missing = 1;
+    while (std::find(active.begin(), active.end(), missing) != active.end()) ++missing;
+    check_native_display_request_rejected(missing, MaiErrorCode::NotFound);
 }
 
 void test_native_window_id_rejects_zero() {
@@ -479,6 +568,7 @@ void test_capture_uses_only_screen_requests() {
             CHECK(request.target == MaiScreenshotTarget::DisplayUnderPointer);
             CHECK(request.windowTitle.empty());
             CHECK(request.windowId == 0);
+            CHECK(request.displayId == 0);
             CHECK(request.isCanceled && !request.isCanceled());
             // 有效 1x1 PNG 是受控数据源，不启动原生 worker，也不读取显示器。
             const char png[] =
@@ -658,6 +748,8 @@ int main(int argc, char** argv) {
     test_native_request_contract();
     test_native_window_id_rejects_zero();
     test_native_window_id_rejects_invalid();
+    test_native_display_id_rejects_zero_and_invalid();
+    test_native_display_id_rejects_nonactive_target_without_fallback();
     test_tool_contract();
     test_legacy_window_arguments_are_rejected_before_capture();
     test_stop_needs_no_capture_or_workspace();

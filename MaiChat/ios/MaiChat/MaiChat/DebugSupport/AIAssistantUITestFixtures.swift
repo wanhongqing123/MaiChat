@@ -628,6 +628,21 @@ private final class AISteeringUITestProbe: ObservableObject {
     }
 }
 
+private struct AIRemoteImageUITestControls: View {
+    @ObservedObject private var support = AIAssistantModel.shared.uiTestSupport
+    var body: some View {
+        VStack(spacing: 2) {
+            Text("下载次数").accessibilityIdentifier("remote-image-download-count")
+                .accessibilityValue(String(support.remoteImageDownloadCount))
+            Text("图片请求").accessibilityIdentifier("remote-image-request-identities")
+                .accessibilityValue(support.remoteImageRequestedIDs.joined(separator: ","))
+            Button("验证图片边界") { Task { await AIAssistantModel.shared.runRemoteImagePolicyUITestChecks() } }
+                .accessibilityIdentifier("remote-image-policy-check")
+            Text(support.remoteImagePolicyResult).accessibilityIdentifier("remote-image-policy-result")
+        }.font(.caption).padding(4).frame(maxWidth: .infinity).background(.regularMaterial)
+    }
+}
+
 struct AISteeringUITestRoot: View {
     @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
     @StateObject private var probe = AISteeringUITestProbe()
@@ -637,6 +652,9 @@ struct AISteeringUITestRoot: View {
         RootView()
             .environmentObject(appState)
             .safeAreaInset(edge: .top, spacing: 0) {
+                if ProcessInfo.processInfo.arguments.contains("--ai-remote-image-ui-test") {
+                    AIRemoteImageUITestControls()
+                } else {
                 VStack(spacing: 2) {
                     Text(probe.status).font(.caption)
                         .accessibilityIdentifier("steering-receipt")
@@ -670,12 +688,15 @@ struct AISteeringUITestRoot: View {
                             .accessibilityIdentifier("steering-archive-result")
                     }
                 }.padding(4).frame(maxWidth: .infinity).background(.regularMaterial)
+                }
             }
             .onAppear {
                 appState.masterUserID = "steering-fixture-owner"
                 appState.chatState = MasterChatState(ownerUserID: "steering-fixture-owner")
                 appState.hasCompletedInitialLogin = true
-                if ProcessInfo.processInfo.arguments.contains("--ai-question-conversation-ui-test") {
+                if ProcessInfo.processInfo.arguments.contains("--ai-remote-image-ui-test") {
+                    AIAssistantModel.shared.installRemoteImageUITestFixture()
+                } else if ProcessInfo.processInfo.arguments.contains("--ai-question-conversation-ui-test") {
                     AIAssistantModel.shared.installQuestionConversationUITestFixture { request in
                         try await probe.answerQuestion(request)
                     }

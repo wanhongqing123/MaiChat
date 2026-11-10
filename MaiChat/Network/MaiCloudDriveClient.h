@@ -27,6 +27,8 @@ typedef enum MaiCloudDriveAction {
     MAI_CLOUD_DRIVE_RENAME_MEDIA = 12,
     MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA = 13,
     MAI_CLOUD_DRIVE_SEARCH_MEDIA = 14,
+    // Full-identity temporary Session image read through the shared downloader.
+    MAI_SESSION_IMAGE_DOWNLOAD = 15,
     // The account API retains its /videos transport path and video_id field.
     // These names also cover images without changing existing callers.
     MAI_CLOUD_DRIVE_LIST_MEDIA = MAI_CLOUD_DRIVE_LIST_VIDEOS,
@@ -103,6 +105,13 @@ typedef struct MaiCloudDriveOptions {
     MaiFirstPartyRouteSelector first_party_route_selector;
     MaiFirstPartyRouteInvalidator first_party_route_invalidator;
     void* first_party_route_context;
+    // Temporary image publication uses the existing Session Multipart path.
+    // Both IDs and all three room fields are mandatory when this is nonzero.
+    // The server assigns one fixed expiry; this mode never recreates an expired
+    // checkpoint or publication identity.
+    int temporary_session_image;
+    const char* message_id_utf8;
+    const char* part_id_utf8;
 } MaiCloudDriveOptions;
 
 typedef struct MaiCloudDriveResult {
@@ -176,6 +185,14 @@ void mai_cloud_drive_cancel_destroy(MaiCloudDriveCancel* cancel);
 // batch is not proof that no file matches. No signed links enter this result.
 // cloud_path is a logical cloud location, not a local file to pass to file tools;
 // DOWNLOAD_MEDIA's path becomes the local file only after a complete download.
+// SESSION_IMAGE_DOWNLOAD requires temporary_session_image and the full owner /
+// Session / message / part identity in options. Input is the immutable ready
+// receipt's attachment_id, name, content_type, media_type (image), size_bytes,
+// expires_at (Unix milliseconds), plus an absolute output_path. It rejects an
+// expired receipt before HTTP, validates every signed-read binding, and commits
+// a new file only after an exact-size download. The result contains downloaded,
+// attachment_id, path, size_bytes, content_type, media_type and expires_at;
+// neither the account token nor the signed URL is returned.
 // The remaining media actions need
 // {"video_id":"uuid"}. THUMBNAIL_LINK returns a short-lived signed HTTPS
 // thumbnail_url. ABORT_UPLOAD discards an unfinished upload session;

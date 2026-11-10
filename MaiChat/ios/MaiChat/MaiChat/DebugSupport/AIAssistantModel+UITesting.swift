@@ -2,6 +2,8 @@
 #if DEBUG
 import Foundation
 import UIKit
+import Combine
+import CryptoKit
 
 struct AIQuestionAnswerUITestRequest {
     let sessionID: String
@@ -11,12 +13,18 @@ struct AIQuestionAnswerUITestRequest {
 }
 
 @MainActor
-final class AIAssistantModelUITestSupport {
+final class AIAssistantModelUITestSupport: ObservableObject {
     var sessionSwitchEnabled = false
     var screenFrameAccountID: String?
     // Isolated composer fixtures confirm routing without contacting a model.
     var steeringHandler: ((AISteeringRequest) async throws -> String)?
     var questionHandler: ((AIQuestionAnswerUITestRequest) async throws -> String)?
+    // Simulator-owned files replace only the final download boundary.
+    var remoteImageSources: [String: URL] = [:]
+    var remoteImageDownloadHandler: ((AIRemoteImageRequest, URL) async throws -> Void)?
+    @Published var remoteImageDownloadCount = 0
+    @Published var remoteImageRequestedIDs: [String] = []
+    @Published var remoteImagePolicyResult = "未执行"
 }
 
 enum AIAssistantUITestMutation {
@@ -25,6 +33,7 @@ enum AIAssistantUITestMutation {
     case clearRemoteSelection
     case attachments([String: [AIImportedFile]], firstMessageSessionID: String)
     case selectedHistory(String, [AIMessage])
+    case remoteImagePage(Data, AIRemoteSession)
 }
 
 extension AIAssistantModel {
@@ -35,6 +44,224 @@ extension AIAssistantModel {
 
 #if targetEnvironment(simulator)
 extension AIAssistantModel {
+    /// Use the real wire decoder/projection. The remote path is deliberately
+    /// unusable on this phone; only its temporary attachment may supply pixels.
+    func installRemoteImageUITestFixture() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-images-" + ProcessInfo.processInfo.environment[
+                "MAICHAT_AI_TEST_ID", default: UUID().uuidString], isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 96, height: 64))
+        let png = renderer.pngData { context in
+            UIColor(red: 45 / 255, green: 99 / 255, blue: 141 / 255, alpha: 1).setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 96, height: 64))
+        }
+        let file = directory.appendingPathComponent("screenshot.png")
+        try? png.write(to: file, options: .atomic)
+        let attachment = "5f7c1716-9fe4-47f6-9c8d-b60acff14752"
+        uiTestSupport.remoteImageSources = [attachment: file]
+        uiTestSupport.remoteImageDownloadHandler = { [weak self] request, target in
+            guard let source = self?.uiTestSupport.remoteImageSources[request.attachmentID] else {
+                throw AIBackendError(message: "Isolated image source is unavailable")
+            }
+            try await RemoteIMBackgroundWork.file { try FileManager.default.copyItem(at: source, to: target) }
+        }
+        uiTestSupport.screenFrameAccountID = "remote-image-fixture-" + ProcessInfo.processInfo.environment[
+            "MAICHAT_AI_TEST_ID", default: UUID().uuidString]
+        let remote = AIRemoteSession(sessionID: "remote-image-session", title: "远端图片测试",
+            updatedAt: 1, busy: false, deviceSlot: "mac", deviceName: "图片测试 Mac",
+            deviceID: "remote-image-fixture-mac", loginSessionID: "remote-image-fixture-login", online: false)
+        let mode = ProcessInfo.processInfo.environment["MAICHAT_REMOTE_IMAGE_MODE", default: "assistant"]
+        var image: [String: Any] = [
+            "state": "ready", "retention": "temporary", "attachment_id": attachment,
+            "owner_login_session_id": remote.loginSessionID,
+            "room_key": "mac:remote-image-session", "name": "screenshot.png",
+            "media_type": "image", "content_type": "image/png", "size_bytes": png.count,
+            "expires_at": Int64(Date().addingTimeInterval(86_400).timeIntervalSince1970 * 1_000)]
+        if mode == "pending" { image = ["state": "pending", "retention": "temporary"] }
+        if mode == "failed" { image = ["state": "failed", "retention": "temporary", "error_code": "upload_failed"] }
+        if mode == "expired" { image["expires_at"] = Int64(Date().timeIntervalSince1970 * 1_000) - 1 }
+        if mode == "malformed" { image["room_key"] = "mac:another-session" }
+        if mode == "network-failure" {
+            uiTestSupport.remoteImageDownloadHandler = { [weak self] request, target in
+                guard let self else { throw CancellationError() }
+                if self.uiTestSupport.remoteImageDownloadCount == 1 { throw URLError(.cannotConnectToHost) }
+                guard let source = self.uiTestSupport.remoteImageSources[request.attachmentID] else {
+                    throw AIBackendError(message: "Isolated image source is unavailable")
+                }
+                try await RemoteIMBackgroundWork.file { try FileManager.default.copyItem(at: source, to: target) }
+            }
+        }
+        let page: [String: Any] = ["ok": true, "messages": [[
+            "id": "remote-image-message", "role": mode == "user" ? "user" : "assistant", "created": 1,
+            "completed": 2, "active": false, "parts": [
+                ["id": "before-image", "kind": "text", "text": "截图前的说明"],
+                ["id": "remote-image-part", "kind": "image", "mimeType": "image/png",
+                 "path": "images/not-on-this-phone.png", "filename": "screenshot.png",
+                 "remotePartId": "remote-image-part", "remoteImage": image],
+                ["id": "after-image", "kind": "text", "text": "截图后的说明"]
+            ]
+        ]]]
+        applyUITestMutation(.remoteSessions([remote]))
+        if let data = try? JSONSerialization.data(withJSONObject: page) {
+            applyUITestMutation(.remoteImagePage(data, remote))
+        }
+        configured = true
+        ready = true
+    }
+
+    /// Run before opening the transcript, so only explicit calls exercise the
+    /// real loader/cache and no visible tile can race its own request counter.
+    func runRemoteImagePolicyUITestChecks() async {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-image-ui-test"),
+              let original = messages.first, let remote = selectedRemote,
+              let source = uiTestSupport.remoteImageSources.values.first else { return }
+        uiTestSupport.remoteImagePolicyResult = "运行中"
+        let originalAccount = uiTestSupport.screenFrameAccountID
+        let originalHandler = uiTestSupport.remoteImageDownloadHandler
+        var checks = 0
+        func require(_ condition: Bool, _ detail: String) throws {
+            guard condition else { throw AIBackendError(message: detail) }
+            checks += 1
+        }
+        func page(attachment: String, expires: Int64, login: String? = nil,
+                  room: String? = nil, session: String? = nil, partID: String = "policy-image-part") throws
+            -> (AIRemoteImageOwner, AIPart) {
+            let sessionID = session ?? remote.sessionID
+            let owner = AIRemoteSession(sessionID: sessionID, title: remote.title, updatedAt: 1, busy: false,
+                deviceSlot: remote.deviceSlot, deviceName: remote.deviceName, deviceID: remote.deviceID,
+                loginSessionID: remote.loginSessionID, online: false)
+            let size = try source.resourceValues(forKeys: [.fileSizeKey]).fileSize!
+            let object: [String: Any] = ["ok": true, "messages": [[
+                "id": "policy-image-message", "role": "assistant", "created": 1, "completed": 2,
+                "active": false, "parts": [["id": partID, "kind": "image", "mimeType": "image/png",
+                    "remotePartId": partID, "remoteImage": ["state": "ready", "retention": "temporary",
+                        "attachment_id": attachment, "owner_login_session_id": login ?? remote.loginSessionID,
+                        "room_key": room ?? remote.deviceSlot + ":" + sessionID, "name": "screenshot.png",
+                        "media_type": "image", "content_type": "image/png", "size_bytes": size,
+                        "expires_at": expires]]]
+            ]]]
+            applyUITestMutation(.remoteSessions([owner]))
+            applyUITestMutation(.remoteImagePage(try JSONSerialization.data(withJSONObject: object), owner))
+            guard let identity = remoteImageOwner, let part = messages.first?.parts.first else {
+                throw AIBackendError(message: "Wire image projection was lost")
+            }
+            return (identity, part)
+        }
+        func load(_ pair: (AIRemoteImageOwner, AIPart)) async throws -> URL {
+            try await loadRemoteImage(owner: pair.0, messageID: "policy-image-message", part: pair.1)
+        }
+        func expectExpired(_ pair: (AIRemoteImageOwner, AIPart)) async throws {
+            do { _ = try await load(pair); throw AIBackendError(message: "Expired image unexpectedly succeeded") }
+            catch AIRemoteImageError.expired { checks += 1 }
+        }
+        do {
+            let id = UUID().uuidString
+            uiTestSupport.remoteImageSources[id] = source
+            let expiry = Int64(Date().timeIntervalSince1970 * 1_000) + 2_000
+            let first = try page(attachment: id, expires: expiry)
+            let count = uiTestSupport.remoteImageDownloadCount
+            let cached = try await load(first)
+            try require(uiTestSupport.remoteImageDownloadCount == count + 1, "Initial image did not use exactly one download")
+            let expected = try Data(contentsOf: source)
+            try require(try Data(contentsOf: cached) == expected, "Cached pixels differ from the source fixture")
+            let wait = max(0, expiry + 100 - Int64(Date().timeIntervalSince1970 * 1_000))
+            try await Task.sleep(for: .milliseconds(wait))
+            try require(try await load(first) == cached, "Complete cache was not retained after expiry")
+            try require(uiTestSupport.remoteImageDownloadCount == count + 1, "Expired cached image fetched again")
+            let uncached = try page(attachment: UUID().uuidString, expires: expiry)
+            try await expectExpired(uncached)
+            try require(uiTestSupport.remoteImageDownloadCount == count + 1, "Expired uncached image made a request")
+            try Data([0]).write(to: cached, options: .atomic)
+            let corrupt = try page(attachment: id, expires: expiry)
+            try await expectExpired(corrupt)
+            try require(uiTestSupport.remoteImageDownloadCount == count + 1, "Incomplete cache was fetched after expiry")
+
+            let future = Int64(Date().addingTimeInterval(86_400).timeIntervalSince1970 * 1_000)
+            let other = UUID().uuidString; uiTestSupport.remoteImageSources[other] = source
+            let base = try page(attachment: other, expires: future)
+            let basePath = try await load(base)
+            let beforeNamespaces = uiTestSupport.remoteImageDownloadCount
+            let newLogin = try page(attachment: other, expires: future, login: "another-original-login")
+            let loginPath = try await load(newLogin)
+            try require(loginPath != basePath && uiTestSupport.remoteImageDownloadCount == beforeNamespaces + 1,
+                        "Original owner login shared a cache entry")
+            uiTestSupport.screenFrameAccountID = "another-" + (originalAccount ?? "fixture")
+            let newAccount = try page(attachment: other, expires: future)
+            let accountPath = try await load(newAccount)
+            try require(accountPath != basePath && uiTestSupport.remoteImageDownloadCount == beforeNamespaces + 2,
+                        "Account switch shared image bytes")
+            uiTestSupport.screenFrameAccountID = originalAccount
+            let anotherPart = try page(attachment: other, expires: future, partID: "another-policy-part")
+            try require(try await load(anotherPart) != basePath, "Another part reused the first part's cache")
+            let anotherSession = try page(attachment: other, expires: future, session: "another-policy-session")
+            try require(try await load(anotherSession) != basePath, "Another Session reused the first Session's cache")
+            let invalid = try page(attachment: other, expires: future, room: "mac:wrong-room")
+            let beforeInvalid = uiTestSupport.remoteImageDownloadCount
+            do { _ = try await load(invalid); throw AIBackendError(message: "Wrong room binding was accepted") }
+            catch AIRemoteImageError.unavailable { checks += 1 }
+            try require(uiTestSupport.remoteImageDownloadCount == beforeInvalid, "Wrong room reached the downloader")
+
+            // Ignore cancellation at the test boundary, then release the late
+            // result after changing account. The production post-await guard and
+            // staging cleanup must still prevent publication.
+            let delayed = try page(attachment: UUID().uuidString, expires: future)
+            var gate: CheckedContinuation<Void, Never>?
+            var staging: URL?
+            uiTestSupport.remoteImageDownloadHandler = { _, target in
+                staging = target
+                await withCheckedContinuation { gate = $0 }
+                try FileManager.default.copyItem(at: source, to: target)
+            }
+            let pending = Task { try await load(delayed) }
+            let deadline = Date().addingTimeInterval(2)
+            while gate == nil && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            guard let release = gate else { pending.cancel(); throw AIBackendError(message: "Delayed downloader did not start") }
+            pending.cancel()
+            uiTestSupport.screenFrameAccountID = "canceled-" + (originalAccount ?? "fixture")
+            release.resume()
+            do { _ = try await pending.value; throw AIBackendError(message: "Canceled late image was published") }
+            catch is CancellationError { checks += 1 }
+            try require(staging.map { !FileManager.default.fileExists(atPath: $0.deletingLastPathComponent().path) } == true,
+                        "Canceled image staging directory remained")
+            uiTestSupport.screenFrameAccountID = originalAccount
+            // Also reject late results without cancellation: neither a new
+            // reference at the same part nor another account may inherit them.
+            for changeAccount in [false, true] {
+                let stale = try page(attachment: UUID().uuidString, expires: future)
+                var lateGate: CheckedContinuation<Void, Never>?
+                var lateStage: URL?
+                uiTestSupport.remoteImageDownloadHandler = { _, target in
+                    lateStage = target
+                    await withCheckedContinuation { lateGate = $0 }
+                    try FileManager.default.copyItem(at: source, to: target)
+                }
+                let late = Task { try await load(stale) }
+                let deadline = Date().addingTimeInterval(2)
+                while lateGate == nil && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+                guard let release = lateGate else { late.cancel(); throw AIBackendError(message: "Late downloader did not start") }
+                if changeAccount { uiTestSupport.screenFrameAccountID = "late-" + (originalAccount ?? "fixture") }
+                else { _ = try page(attachment: UUID().uuidString, expires: future) }
+                release.resume()
+                do { _ = try await late.value; throw AIBackendError(message: "Stale callback was accepted") }
+                catch AIRemoteImageError.changed { checks += 1 }
+                try require(lateStage.map { !FileManager.default.fileExists(atPath: $0.deletingLastPathComponent().path) } == true,
+                            "Late callback left an incomplete cache directory")
+                uiTestSupport.screenFrameAccountID = originalAccount
+            }
+            uiTestSupport.remoteImagePolicyResult = "PASS \(checks)"
+        } catch { uiTestSupport.remoteImagePolicyResult = "FAIL \(checks): \(error.localizedDescription)" }
+        uiTestSupport.screenFrameAccountID = originalAccount
+        uiTestSupport.remoteImageDownloadHandler = originalHandler
+        applyUITestMutation(.remoteSessions([remote]))
+        let encoder = JSONEncoder()
+        if let messageData = try? encoder.encode([original]),
+           let object = try? JSONSerialization.jsonObject(with: messageData),
+           let data = try? JSONSerialization.data(withJSONObject: ["ok": true, "messages": object]) {
+            applyUITestMutation(.remoteImagePage(data, remote))
+        }
+    }
+
     /// Load the unmodified C ABI snapshot exported after a real native Agent
     /// turn. Only the isolated workspace changes; message IDs, text, and tool
     /// receipts come from the snapshot and survive the normal Codable round-trip.

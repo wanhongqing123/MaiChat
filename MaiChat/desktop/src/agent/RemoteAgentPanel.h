@@ -3,6 +3,7 @@
 
 #include <QJsonObject>
 #include <QWidget>
+#include "auth/DesktopVideoCircleAccess.h"
 
 #include <functional>
 #include <memory>
@@ -14,6 +15,7 @@ public:
     using HistoryHandler = std::function<void(const QJsonObject&, const QString&, int, Completion)>;
     using DownloadCompletion = std::function<void(const QString&, const QString&)>;
     using DownloadHandler = std::function<void(const QJsonObject&, const QString&, DownloadCompletion)>;
+    using ImageAccessProvider = std::function<DesktopVideoCircleAccess()>;
 
     // outboxFile may select a private embedding/test store; empty uses app-local data.
     explicit RemoteAgentPanel(QWidget* parent = nullptr, const QString& outboxFile = {});
@@ -22,6 +24,7 @@ public:
     void setCommandHandler(CommandHandler handler);
     void setHistoryHandler(HistoryHandler handler);
     void setDownloadHandler(DownloadHandler handler);
+    void setImageAccessProvider(ImageAccessProvider provider);
     void openSession(const QJsonObject& remote);
     void updateSession(const QJsonObject& remote);
     void receivePayload(const QJsonObject& remote, const QString& kind, const QJsonObject& payload);
@@ -44,6 +47,9 @@ private:
     void sendPrompt(const QJsonObject& action, const QString& retryId = {});
     void removeOptimisticMessage(const QString& id);
     void renderMessages();
+    void renderImage(class QLabel* card, const QString& messageId, const QJsonObject& part);
+    void openImagePreview(class QLabel* card);
+    void resetImagePreview();
     void updateThinking();
     void renderRequests(const QJsonObject& payload);
     void updateControls();

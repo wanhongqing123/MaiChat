@@ -45,6 +45,15 @@ class Fixture(http.server.ThreadingHTTPServer):
         self.folder_response_case = ""
         self.search_case = ""
         self.search_requests = 0
+        self.temporary_binding = {}
+        self.temporary_case = ""
+        self.read_requests = 0
+        self.temporary_lifetime_ms = 86400000
+        self.require_temporary = False
+        self.temporary_read_delay = 0
+
+    def temporary_receipt(self):
+        return dict(self.temporary_binding)
 
     def media_type(self):
         if self.content_type.startswith("image/"):
@@ -191,13 +200,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.server.folder_response_case = case
             self.reply(200, {"case": case})
             return
+        if path == "/test/temporary-case":
+            self.server.temporary_case = parse_qs(urlsplit(self.path).query).get("case", [""])[0]
+            self.reply(200, {"ok": True})
+            return
         if path == "/test/state":
             with self.server.lock:
                 self.reply(200, {"sessions": self.server.sessions,
                     "parts": sorted(self.server.part_bytes),
                     "oss_authorization": self.server.oss_authorization,
                     "redirect_followed": self.server.redirect_followed,
-                    "status": self.server.status})
+                    "status": self.server.status, "read_requests": self.server.read_requests})
             return
         if path == "/test/complete-calls":
             with self.server.lock:
@@ -207,6 +220,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/oss/play":
             with self.server.lock:
                 content = b"".join(self.server.part_bytes.values())
+            if self.server.temporary_case == "short_bytes":
+                content = content[:-1]
             range_header = self.headers.get("Range")
             if range_header:
                 with self.server.lock:
@@ -303,6 +318,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                           "reserved_bytes": 0, "limit_bytes": 10_000_000_000}})
             return
         if path == f"/auth/v1/cloud-drive/videos/uploads/{VIDEO_ID}/parts":
+            if self.server.temporary_case == "expired":
+                self.reply(410, {"error_code": "image_expired"})
+                return
             if account != "author":
                 self.reply(404, {"error": "not_found"})
                 return
@@ -318,6 +336,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "upload_expires_at": "2026-10-31T00:00:00Z"})
             return
         if path == f"/auth/v1/cloud-drive/videos/{VIDEO_ID}/play-link":
+            self.server.read_requests += 1
+            if self.server.temporary_binding:
+                query = parse_qs(urlsplit(self.path).query)
+                expected = {"owner_slot": "mac", "owner_login_session_id": "login_a",
+                            "session_id": "session_a", "message_id": "message_a", "part_id": "part_a"}
+                if any(query.get(key) != [value] for key, value in expected.items()):
+                    self.reply(404, {"error": "binding_mismatch"})
+                    return
             with self.server.lock:
                 ready = self.server.status == "ready"
                 size = self.server.size
@@ -325,11 +351,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if account != "author" or not ready:
                 self.reply(404, {"error": "not_found"})
                 return
+            receipt = self.server.temporary_receipt()
+            if self.server.temporary_case == "wrong_part":
+                receipt["part_id"] = "other_part"
+            elif self.server.temporary_case == "wrong_login":
+                receipt["owner_login_session_id"] = "other_login"
+            elif self.server.temporary_case == "wrong_room":
+                receipt["room_key"] = "windows:other_session"
+            elif self.server.temporary_case == "wrong_expiry":
+                receipt["expires_at"] += 1
+            elif self.server.temporary_case == "wrong_size":
+                receipt["size_bytes"] = size + 1
+            read_lifetime = min(60, max(1, (receipt.get("expires_at", int(time.time() * 1000) + 60000)
+                                           - int(time.time() * 1000)) // 1000))
+            if self.server.temporary_read_delay:
+                time.sleep(self.server.temporary_read_delay)
             self.reply(200, {"read_url": self.origin() + "/oss/play?signature=fixture",
-                "read_expires_in": 60, "size_bytes": size,
+                "read_expires_in": read_lifetime, "size_bytes": size,
                 "content_type": content_type,
                 "media_type": self.server.media_type(),
-                "name": self.server.name, "room_key": self.server.room_key})
+                "name": self.server.name, "room_key": self.server.room_key, **receipt})
             return
         if path == f"/auth/v1/cloud-drive/videos/{VIDEO_ID}/thumbnail-link":
             with self.server.lock:
@@ -367,6 +408,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(202, {"room_key": room, "deleted": 1})
             return
         if path == "/auth/v1/cloud-drive/videos/uploads":
+            if self.server.require_temporary and body.get("purpose") != "temporary_session_image":
+                self.reply(400, {"error": "missing_temporary_purpose"})
+                return
+            if body.get("purpose") == "temporary_session_image":
+                if not session_mode or body.get("message_id") != "message_a" or body.get("part_id") != "part_a":
+                    self.reply(400, {"error": "missing_publication_identity"})
+                    return
+                self.server.temporary_binding = {"retention": "temporary", "attachment_id": VIDEO_ID,
+                    "owner_login_session_id": "login_a", "message_id": "message_a", "part_id": "part_a",
+                    "expires_at": int(time.time() * 1000) + self.server.temporary_lifetime_ms}
             content_type = body.get("content_type")
             if (account != "author" or content_type not in (
                     "video/mp4", "video/quicktime", "image/jpeg", "image/png",
@@ -395,7 +446,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "room_key": self.server.room_key,
                 "part_size": PART_SIZE,
                 "parts_total": (body["size_bytes"] + PART_SIZE - 1) // PART_SIZE,
-                "upload_expires_at": "2026-10-31T00:00:00Z"})
+                "upload_expires_at": "2026-10-31T00:00:00Z", **self.server.temporary_receipt()})
             return
         signed = re.fullmatch(
             rf"/auth/v1/cloud-drive/videos/uploads/{VIDEO_ID}/parts/(\d+)/sign", path)
@@ -436,7 +487,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             # The first call exercises the default beyond both prior 30-second
             # curl timers. The second checks that an explicit caller timeout wins.
-            if self.server.slow_complete and complete_calls == 1:
+            if self.server.slow_complete and not self.server.temporary_binding and complete_calls == 1:
                 time.sleep(31.5)
             elif self.server.slow_complete and complete_calls == 2:
                 time.sleep(1.5)
@@ -447,7 +498,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "content_type": content_type,
                 "media_type": self.server.media_type(),
                 "room_key": self.server.room_key,
-                "created_at": "2026-10-24T00:00:00Z"})
+                "created_at": "2026-10-24T00:00:00Z", **self.server.temporary_receipt()})
             return
         self.reply(404, {"error": "not_found"})
 
@@ -569,7 +620,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3):
         raise SystemExit("expected cloud-drive C++ test executable")
     with tempfile.TemporaryDirectory(prefix="maichat-cloud-test-") as directory:
         cert = os.path.join(directory, "server.pem")
@@ -583,6 +634,10 @@ def main():
                 "-keyout", private, "-out", crt], stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, check=True)
         server = Fixture(("127.0.0.1", 0))
+        server.require_temporary = len(sys.argv) == 3
+        if sys.argv[2:] == ["--temporary-latency"]:
+            server.temporary_lifetime_ms = 4000
+            server.temporary_read_delay = 1.2
         tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls.load_cert_chain(cert, key)
         server.socket = tls.wrap_socket(server.socket, server_side=True)
@@ -591,7 +646,7 @@ def main():
         try:
             return subprocess.run([sys.argv[1],
                 f"https://localhost:{server.server_port}", cert,
-                unrelated_cert, directory], timeout=90, check=False).returncode
+                unrelated_cert, directory] + sys.argv[2:], timeout=90, check=False).returncode
         finally:
             server.shutdown()
             server.server_close()

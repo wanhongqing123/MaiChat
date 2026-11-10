@@ -107,6 +107,17 @@ if(MAICHAT_NETWORK_BUILD_TESTS)
     COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cloud_drive_local_tls.py"
       "$<TARGET_FILE:mai_cloud_drive_client_test>")
+  # The same ordinary transfer client must preserve temporary publication
+  # identity, reject expired reads locally and never reinitialize after expiry.
+  add_test(NAME mai_session_image_local_tls
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cloud_drive_local_tls.py"
+      "$<TARGET_FILE:mai_cloud_drive_client_test>" --temporary)
+  add_test(NAME mai_session_image_latency_local_tls
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cloud_drive_local_tls.py"
+      "$<TARGET_FILE:mai_cloud_drive_client_test>" --temporary-latency)
+  set_tests_properties(mai_session_image_local_tls mai_session_image_latency_local_tls PROPERTIES TIMEOUT 100)
 
   add_executable(mai_cloud_vod_test tests/MaiCloudVodTest.cpp)
   target_link_libraries(mai_cloud_vod_test PRIVATE mai_cloud_vod)

@@ -173,6 +173,49 @@ FLAC、OGG；其他安全后缀文件以 `application/octet-stream` 保存。
 未完成 Multipart 自动中止，再部署素材签名服务、账号服务和 Session 同步服务；
 最后发布三端客户端。现有云盘 OSS 私有桶与模型直连路径保持原样。
 
+### Remote Session 临时图片
+
+新消息中的图片 part 在首次增量发布时上传一次；用户图片和助手截图共用同一协议，
+消息中原有的文字、图片顺序保持稳定。`remoteImage` 包含
+`state:pending|ready|failed|expired`；ready 带 `attachment_id`、`owner_login_session_id`、
+`room_key`、`name`、`media_type:image`、`content_type`、`size_bytes`、
+`retention:temporary` 和 `expires_at`（Unix 毫秒）。Sync 不接收图片路径、签名 URL 或图片字节。
+后续文字快照保留同一 part 的图片回执，不能更换对象或延长到期时间。
+历史回填和查看图片不触发上传，也没有 `image_prepare` 或过期重传操作。
+
+所属端先发布 pending part，再调用已有 `POST /v1/session-attachments/uploads`，
+在原上传字段外传 `purpose:temporary_session_image`、`message_id`、`part_id`。
+账号服务要求调用者是指定 `owner_slot` 和 `owner_login_session_id`，并将已鉴权的 Bearer
+通过固定 loopback 调用 `POST /v1/session-sync/authorize-attachment`，在 Sync 数据库中核对
+同账号、所属 Session、消息和具体 pending 图片 part。控制请求不接受路径、对象键或调用方到期时间。
+`MAICHAT_SESSION_SYNC_PORT` 默认为 9102，账号服务与 Sync 进程必须配置一致。
+
+临时对象写入独立的 `session-temp-images/<账号>/...`，首次预留起固定 24 小时到期；
+Multipart 初始化、完成和读取回执均返回完整 owner/Session/message/part 身份及原始 `expires_at`。
+数据库保留小型 `session_image_publications` 身份回执，保证重试、重启及对象清理后
+同一身份仍不会新建对象。普通持久会话附件的存储和七天未完成上传期限保持既有行为。
+包含临时图片的 `cleanup-room` 还会通过同一 Sync 授权路由的 `operation:cleanup-room`
+核对当前所属登录、会话目录与房间消息均已删除；仍存在的房间返回 409，防止清理操作重置发布身份。
+
+查看端调用已有 `{attachment_id}/play-link`，query 必须带
+`owner_slot`、`owner_login_session_id`、`session_id`、`message_id`、`part_id`。
+账号服务再次核对 Sync 中 exact ready ref；所属设备在线状态不参与已完成对象的读取授权。
+短期签名最多 60 秒，并截短到原始对象剩余寿命；到期返回 410、`error_code:image_expired`。
+客户端下载图片字节时直连 OSS，共用原生 Network 下载器。完整本地缓存可以继续显示；
+无缓存的过期图片显示“图片已过期”，不再请求图片或要求所属设备重传。
+
+每次读取都会检查业务到期，原有启动时与每小时清理任务负责 eventual 物理清理：
+逐个中止 exact-key Multipart、删除对象、核验 HEAD 不存在，失败保留清理记录和容量。
+现有 revision 与迟到 Complete 的保护期仍适用。到期时间不等于物理删除完成时间。
+部署前必须在独立前缀配置 RAM 最小权限与 OSS 完成对象一天过期、未完成 Multipart 一天中止规则；
+配置工具见素材签名服务 README，它们必须备份、合并并读回全部规则，不得覆盖无关规则。
+OSS 生命周期为异步兜底，仓库代码和本地测试不代表线上规则已启用。
+
+本地临时图片回归：
+`node --test session-temp-images.test.js session-temp-image-sync.test.js session-temp-image-integration.test.js`。
+测试使用注入时钟、fake OSS 和实际本机 Auth/Sync HTTP，覆盖固定过期、幂等、实际删除事实、
+完成跨过到期、两个消息角色、所属端离线及精确消息/part 授权。真实 OSS 和目标客户端需另行验收。
+
 缩略图由 OSS 按需处理，处理参数纳入 V4 签名，不在账号服务保存或转发媒体字节。
 图片缩图源文件上限为 20 MB；视频截帧仅支持 H.264/H.265，其他编码应显示占位图。
 视频截帧按调用计费，客户端应只为可见文件请求并复用未到期链接。

@@ -7,7 +7,40 @@ const { createAuthService } = require('./service');
 const { openStore } = require('./store');
 const { createAliyunAsrCredentialIssuer } = require('./aliyun-asr-credential');
 const { createServer, start, requireDeviceSlotFromEnv,
-  videoCircleFromEnv } = require('./server');
+  videoCircleFromEnv,cloudDriveFromEnv,sessionAttachmentAuthorizerFromEnv } = require('./server');
+
+test('temporary image ownership connector uses fixed Sync loopback and only forwards the authenticated Bearer',async () => {
+  const calls = [];
+  const verify = sessionAttachmentAuthorizerFromEnv({ MAICHAT_SESSION_SYNC_PORT:'9123' },async (url,options) => {
+    calls.push({url,options}); return {status:200,json:async () => ({ok:true})};
+  });
+  const binding = {operation:'create',owner_slot:'mac',owner_login_session_id:'login_mac',
+    session_id:'session_a',message_id:'message_a',part_id:'part_a'};
+  assert.equal(await verify(binding,{authorization:'Bearer account-test-token',cookie:'private'}),true);
+  assert.equal(calls[0].url,'http://127.0.0.1:9123/v1/session-sync/authorize-attachment');
+  assert.equal(calls[0].options.headers.Authorization,'Bearer account-test-token');
+  assert.equal(calls[0].options.headers.cookie,undefined);
+  assert.deepEqual(JSON.parse(calls[0].options.body),binding);
+  assert.equal(calls[0].options.redirect,'error');
+  assert.throws(() => sessionAttachmentAuthorizerFromEnv({MAICHAT_SESSION_SYNC_PORT:'https://caller.example'}),/port/);
+  const denied = sessionAttachmentAuthorizerFromEnv({},async () => ({status:404}));
+  assert.equal(await denied(binding,{authorization:'Bearer account-test-token'}),false);
+});
+
+test('cloud signer control carries absolute expiry only for temporary image requests',async () => {
+  const calls = [];
+  const connector = cloudDriveFromEnv({MAICHAT_CLOUD_DRIVE_ENABLED:'1',
+    MAICHAT_CLOUD_DRIVE_INTERNAL_KEY:'fixed-fake-internal-key-at-least-32-characters'},async (url,options) => {
+      calls.push(JSON.parse(options.body));
+      return {status:200,json:async () => ({read_url:'https://oss.example/read',upload_url:'https://oss.example/part'})};
+    });
+  await connector.signRead('account_a','session-temp-images/account_a/example.png',1794355200000);
+  await connector.signPart('account_a','session-temp-images/account_a/example.png','upload_a',1,1024,'md5',1794355200000);
+  await connector.signRead('account_a','cloud-drive/account_a/example.png');
+  assert.equal(calls[0].expires_at,1794355200000);
+  assert.equal(calls[1].expires_at,1794355200000);
+  assert.equal(Object.hasOwn(calls[2],'expires_at'),false);
+});
 
 test('device slot cutover flag defaults off and rejects ambiguous values', () => {
   assert.equal(requireDeviceSlotFromEnv(undefined), false);

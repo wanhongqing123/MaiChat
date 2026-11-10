@@ -34,6 +34,45 @@ function validWorkspacePath(value) {
     (nodePath.posix.isAbsolute(value) || nodePath.win32.isAbsolute(value));
 }
 
+function validRemoteImage(part,slot,sessionId) {
+  const image = part?.remoteImage;
+  if (image === undefined) return true;
+  const fields = new Set(['state','retention','attachment_id','owner_login_session_id',
+    'room_key','name','media_type','content_type','size_bytes','expires_at','error_code',
+    'owner_slot','session_id','message_id','part_id']);
+  if (part.kind !== 'image' || part.remotePartId !== part.id || !image ||
+      typeof image !== 'object' || Array.isArray(image) ||
+      Object.keys(image).some(key => !fields.has(key)) || image.retention !== 'temporary' ||
+      !['pending','ready','failed','expired'].includes(image.state)) return false;
+  if (image.expires_at !== undefined && (!Number.isSafeInteger(image.expires_at) || image.expires_at <= 0)) return false;
+  if (image.state !== 'ready') return true;
+  return /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(image.attachment_id || '') &&
+    validId(image.owner_login_session_id) && image.room_key === `${slot}:${sessionId}` &&
+    image.media_type === 'image' && ['image/jpeg','image/png','image/webp','image/heic','image/gif'].includes(image.content_type) &&
+    Number.isSafeInteger(image.size_bytes) && image.size_bytes > 0 && image.size_bytes <= 20_000_000 &&
+    Number.isSafeInteger(image.expires_at) && typeof image.name === 'string' && image.name.length > 0 &&
+    Buffer.byteLength(image.name) <= 240 && !/[\u0000-\u001f\u007f-\u009f/\\]/u.test(image.name);
+}
+
+// Later text snapshots can precede the image receipt reaching the host. Keep
+// one immutable image publication for either role, in the original part slot.
+function mergeRemoteImage(previous,part) {
+  const saved = previous?.remoteImage;
+  const next = part.remoteImage;
+  if (!saved || part.kind !== 'image') return part;
+  if (next) for (const key of ['attachment_id','owner_login_session_id','room_key',
+    'name','media_type','content_type','size_bytes','expires_at']) {
+    if (saved[key] !== undefined && next[key] !== undefined && saved[key] !== next[key]) {
+      const error = new Error('Image publication identity changed');
+      error.code = 'IMAGE_PUBLICATION_CONFLICT'; throw error;
+    }
+  }
+  if (!next || (saved.state !== 'pending' && next.state === 'pending') ||
+      (['failed','expired'].includes(saved.state) && next.state !== saved.state))
+    return { ...part,remoteImage:saved };
+  return { ...part,remoteImage:{...saved,...next} };
+}
+
 // These are display projections of child-owned question tools, not extra root messages.
 // Bound both count and bytes before the transaction or event fanout touches the database.
 function validQuestionMessages(value) {
@@ -210,12 +249,16 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
       const previous = existing.get(principal.accountId, principal.slot,
         sessionId, message.id);
       let merged = message;
+      if (previous) {
+        const byId = new Map(JSON.parse(previous.payload).parts.map(part => [part.id,part]));
+        merged = { ...message,parts:message.parts.map(part => mergeRemoteImage(byId.get(part.id),part)) };
+      }
       if (previous && message.role === 'user') {
         const retained = JSON.parse(previous.payload).parts.filter(part =>
           typeof part?.attachment_id === 'string');
         if (retained.length) {
           const byId = new Map(retained.map(part => [part.id,part]));
-          const parts = message.parts.map(part => byId.has(part.id)
+          const parts = merged.parts.map(part => byId.has(part.id)
             ? { ...part,attachment_id:byId.get(part.id).attachment_id,
               name:byId.get(part.id).name || part.name }
             : part);
@@ -289,6 +332,41 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
       return reply(403, { error: 'An updated device login is required' });
     const url = new URL(path, 'http://localhost');
     cleanup();
+    if (method === 'POST' && url.pathname === '/v1/session-sync/authorize-attachment') {
+      if (!['create','read','cleanup-room'].includes(body.operation) || !DEVICE_SLOTS.has(body.owner_slot) ||
+          !validId(body.owner_login_session_id) || !validId(body.session_id) ||
+          (body.operation !== 'cleanup-room' && (!validId(body.message_id) || !validId(body.part_id))))
+        return reply(400,{ error:'Invalid image binding' });
+      if (body.operation !== 'read' && (principal.slot !== body.owner_slot ||
+          principal.loginSessionId !== body.owner_login_session_id || !isCurrent(principal)))
+        return reply(403,{ error:'Only the current owner can publish the image' });
+      if (body.operation === 'cleanup-room') {
+        // A pending part must not lose its deduplication receipt merely because
+        // a caller invokes attachment cleanup while the room still exists.
+        const active = db.prepare(`SELECT 1 FROM sync_sessions WHERE account_id=? AND slot=? AND session_id=?`)
+          .get(principal.accountId,body.owner_slot,body.session_id);
+        const messages = db.prepare(`SELECT 1 FROM sync_room_messages WHERE account_id=? AND owner_slot=? AND session_id=? LIMIT 1`)
+          .get(principal.accountId,body.owner_slot,body.session_id);
+        return active || messages ? reply(409,{error:'Session room is still available'}) : reply(200,{ok:true});
+      }
+      if (body.operation === 'create' && !currentSession.get(principal.accountId,
+          body.owner_slot,body.owner_login_session_id,body.session_id))
+        return reply(404,{ error:'Session image not found' });
+      const row = db.prepare(`SELECT payload FROM sync_room_messages WHERE account_id=?
+        AND owner_slot=? AND session_id=? AND message_id=?`).get(principal.accountId,
+          body.owner_slot,body.session_id,body.message_id);
+      const part = row ? JSON.parse(row.payload).parts.find(item => item.id === body.part_id) : null;
+      const image = part?.remoteImage;
+      if (part?.kind !== 'image' || image?.retention !== 'temporary')
+        return reply(404,{ error:'Session image not found' });
+      if (body.operation === 'create') return image.state === 'pending' ?
+        reply(200,{ok:true}) : reply(409,{error:'Image publication already settled'});
+      if (image.attachment_id !== body.attachment_id || image.expires_at !== body.expires_at ||
+          image.owner_login_session_id !== body.owner_login_session_id)
+        return reply(404,{error:'Session image not found'});
+      if (image.expires_at <= now()) return reply(410,{error:'Image expired',error_code:'image_expired'});
+      return image.state === 'ready' ? reply(200,{ok:true}) : reply(404,{error:'Session image not found'});
+    }
     if (method === 'POST' && url.pathname === '/v1/session-sync/presence') {
       if (!validId(body.device_id, 64) || !validTitle(body.name) ||
           !body.name || !Array.isArray(body.sessions) ||
@@ -364,6 +442,7 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
             Array.isArray(message) || !validId(message.id) ||
             !['user', 'assistant', 'system'].includes(message.role) ||
             !Array.isArray(message.parts) ||
+            message.parts.some(part => !validRemoteImage(part,principal.slot,body.session_id)) ||
             Buffer.byteLength(JSON.stringify(message)) > MAX_ROOM_MESSAGE_BYTES) ||
           new Set(body.messages.map(message => message.id)).size !== body.messages.length)
         return reply(400, { error: 'Invalid room messages' });
@@ -375,6 +454,8 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
         ({ changed, members, stateChanged } = publishMessages(principal,
           body.session_id, body.messages, body.permissions || [], body.questions || [], body));
       } catch (error) {
+        if (error.code === 'IMAGE_PUBLICATION_CONFLICT')
+          return reply(409,{ error:'Image publication identity changed' });
         if (error.code === 'ROOM_MESSAGE_TOO_LARGE')
           return reply(413, { error:'Room message is too large' });
         throw error;

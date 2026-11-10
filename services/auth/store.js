@@ -319,6 +319,31 @@ function openStore(filename) {
     CREATE INDEX IF NOT EXISTS session_attachments_cleanup
       ON session_attachments(cleanup_pending,cleanup_after);
   `);
+  // Temporary image object rows can be removed after verified OSS cleanup,
+  // while this small publication receipt prevents the same part recreating an
+  // expired object. Account deletion removes receipts through the owner FK.
+  const attachmentColumns = new Set(db.pragma('table_info(session_attachments)')
+    .map(column => column.name));
+  for (const [name,type] of [
+    ['retention',"TEXT NOT NULL DEFAULT 'persistent'"],
+    ['object_expires_at','INTEGER'],['owner_slot','TEXT'],
+    ['owner_login_session_id','TEXT'],['session_id','TEXT'],
+    ['message_id','TEXT'],['part_id','TEXT']
+  ]) if (!attachmentColumns.has(name))
+    db.exec(`ALTER TABLE session_attachments ADD COLUMN ${name} ${type}`);
+  db.exec(`CREATE TABLE IF NOT EXISTS session_image_publications (
+    owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    owner_slot TEXT NOT NULL,owner_login_session_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,message_id TEXT NOT NULL,part_id TEXT NOT NULL,
+    attachment_id TEXT NOT NULL UNIQUE,expires_at INTEGER NOT NULL,
+    name TEXT NOT NULL,size_bytes INTEGER NOT NULL,content_type TEXT NOT NULL,
+    room_deleted_at INTEGER,
+    PRIMARY KEY(owner_user_id,owner_slot,owner_login_session_id,session_id,message_id,part_id)
+  );
+  CREATE INDEX IF NOT EXISTS session_attachments_expiry
+    ON session_attachments(retention,object_expires_at,status);`);
+  if (!db.pragma('table_info(session_image_publications)').some(column => column.name === 'room_deleted_at'))
+    db.exec('ALTER TABLE session_image_publications ADD COLUMN room_deleted_at INTEGER');
   const cloudColumns = new Set(db.pragma('table_info(cloud_drive_videos)')
     .map(column => column.name));
   if (!cloudColumns.has('cleanup_hold_until'))

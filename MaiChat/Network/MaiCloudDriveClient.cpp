@@ -80,6 +80,10 @@ struct Checkpoint {
     std::string contentType;
     std::string sourceId;
     std::string roomKey;
+    std::string ownerLogin;
+    std::string messageId;
+    std::string partId;
+    uint64_t expiresAt = 0;
     uint64_t size = 0;
     uint64_t partSize = 0;
     uint32_t partsTotal = 0;
@@ -362,6 +366,15 @@ bool sessionMode(const MaiCloudDriveOptions* options) {
     return options->session_id_utf8 != nullptr;
 }
 
+bool temporaryImage(const MaiCloudDriveOptions* options) {
+    return options->temporary_session_image != 0;
+}
+
+uint64_t currentMilliseconds() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
 std::string apiRoot(const MaiCloudDriveOptions* options) {
     return sessionMode(options) ? "/v1/session-attachments" :
         "/v1/cloud-drive/videos";
@@ -375,6 +388,9 @@ std::string roomKey(const MaiCloudDriveOptions* options) {
 
 bool validOptions(const MaiCloudDriveOptions* options, bool accountRequired) {
     if (!options) return false;
+    if (temporaryImage(options) && (!sessionMode(options) ||
+        !validRoomID(options->message_id_utf8) || !validRoomID(options->part_id_utf8))) return false;
+    if (!temporaryImage(options) && (options->message_id_utf8 || options->part_id_utf8)) return false;
     const bool hasRoom = options->owner_device_slot_utf8 ||
         options->owner_login_session_id_utf8 || options->session_id_utf8;
     if (hasRoom) {
@@ -540,7 +556,9 @@ bool writeCheckpoint(const char* path, const Checkpoint& value) {
         {"file_size", value.size}, {"source_id", value.sourceId},
         {"name", value.name}, {"room_key", value.roomKey},
         {"content_type", value.contentType}, {"part_size", value.partSize},
-        {"parts_total", value.partsTotal}, {"completed", value.completed}};
+        {"parts_total", value.partsTotal}, {"completed", value.completed},
+        {"owner_login_session_id", value.ownerLogin}, {"message_id", value.messageId},
+        {"part_id", value.partId}, {"expires_at", value.expiresAt}};
     const std::string serialized = body.dump();
     const std::string temp = std::string(path) + ".tmp";
     std::unique_ptr<FILE, decltype(&std::fclose)> file(openFile(temp.c_str(), "wb"),
@@ -571,7 +589,9 @@ bool readCheckpoint(const char* path, Checkpoint* output, bool* exists) {
         return !*exists;
     }
     *exists = true;
-    char buffer[4096];
+    // Full publication binding accompanies a possibly long platform source ID.
+    // Bound parsing while allowing the existing maximum-length source identity.
+    char buffer[16 * 1024];
     const size_t count = std::fread(buffer, 1, sizeof(buffer), file.get());
     if (count == sizeof(buffer) || std::ferror(file.get())) return false;
     const json parsed = json::parse(std::string(buffer, count), nullptr, false);
@@ -600,6 +620,14 @@ bool readCheckpoint(const char* path, Checkpoint* output, bool* exists) {
     if (room != parsed.end() &&
         (!room->is_string() || room->get<std::string>().size() > 400)) return false;
     output->roomKey = room == parsed.end() ? "" : room->get<std::string>();
+    if (parsed.contains("expires_at")) {
+        if (!uintField(parsed, "expires_at", 0, 9'007'199'254'740'991, &output->expiresAt) ||
+            !stringField(parsed, "owner_login_session_id", &output->ownerLogin) ||
+            !stringField(parsed, "message_id", &output->messageId) ||
+            !stringField(parsed, "part_id", &output->partId)) return false;
+        if (output->expiresAt && (!validRoomID(output->ownerLogin.c_str()) ||
+            !validRoomID(output->messageId.c_str()) || !validRoomID(output->partId.c_str()))) return false;
+    }
     MaiCloudDriveMediaInfo info{};
     if (!mediaInfo(output->name, &info, !output->roomKey.empty()) ||
         output->contentType != info.content_type_utf8 ||
@@ -1000,6 +1028,14 @@ bool parseCompletion(const json& response, const Checkpoint& checkpoint) {
     std::string name;
     std::string contentType;
     uint64_t bytes = 0;
+    if (checkpoint.expiresAt) {
+        const json expected{{"attachment_id", checkpoint.videoId}, {"room_key", checkpoint.roomKey},
+            {"retention", "temporary"}, {"expires_at", checkpoint.expiresAt},
+            {"owner_login_session_id", checkpoint.ownerLogin}, {"message_id", checkpoint.messageId},
+            {"part_id", checkpoint.partId}};
+        for (auto field = expected.begin(); field != expected.end(); ++field)
+            if (!response.contains(field.key()) || response[field.key()] != field.value()) return false;
+    }
     return stringField(response, "video_id", &id) && id == checkpoint.videoId &&
         stringField(response, "status", &status) && status == "ready" &&
         validResponseMediaType(response, checkpoint.contentType) &&
@@ -1111,6 +1147,11 @@ void createSession(const MaiCloudDriveOptions* options, const std::string& base,
         request["owner_login_session_id"] = options->owner_login_session_id_utf8;
         request["session_id"] = options->session_id_utf8;
     }
+    if (temporaryImage(options)) {
+        request["purpose"] = "temporary_session_image";
+        request["message_id"] = options->message_id_utf8;
+        request["part_id"] = options->part_id_utf8;
+    }
     requestInternal(options, base, apiRoot(options) + "/uploads", "POST",
         request, cancel, &initial);
     if (initial.status != MAI_CLOUD_DRIVE_OK) {
@@ -1130,6 +1171,24 @@ void createSession(const MaiCloudDriveOptions* options, const std::string& base,
     }
     checkpoint->sourceId = sourceId;
     checkpoint->roomKey = roomKey(options);
+    if (temporaryImage(options)) {
+        uint64_t expiry = 0;
+        const json expected{{"attachment_id", checkpoint->videoId}, {"retention", "temporary"},
+            {"owner_login_session_id", options->owner_login_session_id_utf8},
+            {"message_id", options->message_id_utf8}, {"part_id", options->part_id_utf8}};
+        bool matches = uintField(response, "expires_at", 1, 9'007'199'254'740'991, &expiry);
+        for (auto field = expected.begin(); field != expected.end(); ++field)
+            matches = matches && response.contains(field.key()) && response[field.key()] == field.value();
+        if (!matches || expiry <= currentMilliseconds()) {
+            result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE;
+            mai_cloud_drive_result_free(&initial);
+            return;
+        }
+        checkpoint->expiresAt = expiry;
+        checkpoint->ownerLogin = options->owner_login_session_id_utf8;
+        checkpoint->messageId = options->message_id_utf8;
+        checkpoint->partId = options->part_id_utf8;
+    }
     mai_cloud_drive_result_free(&initial);
     if (writeCheckpoint(checkpointPath, *checkpoint)) {
         result->status = MAI_CLOUD_DRIVE_OK;
@@ -1383,6 +1442,7 @@ extern "C" void mai_cloud_drive_request(const MaiCloudDriveOptions* options,
                                           MaiCloudDriveResult* result) {
     if (!result) return;
     resetResult(result);
+    const auto requestStartedAt = currentMilliseconds();
     if (!validOptions(options, true)) return;
     std::string base;
     if (!validBase(options->auth_base_url_utf8, &base)) return;
@@ -1394,15 +1454,33 @@ extern "C" void mai_cloud_drive_request(const MaiCloudDriveOptions* options,
         searchMedia(options, input, cancel, result);
         return;
     }
-    if (action == MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA) {
+    if (action == MAI_CLOUD_DRIVE_DOWNLOAD_MEDIA || action == MAI_SESSION_IMAGE_DOWNLOAD) {
         // The local path is never forwarded to the account server. The read
         // link is consumed here, so neither platform code nor the Agent sees it.
+        const bool temporary = action == MAI_SESSION_IMAGE_DOWNLOAD;
         std::string id, path;
-        if (sessionMode(options) || input.size() != 2 ||
-            !stringField(input, "media_id", &id) || !validUuid(id) ||
+        if ((temporary ? !temporaryImage(options) || input.size() != 7 : sessionMode(options) || input.size() != 2) ||
+            !stringField(input, temporary ? "attachment_id" : "media_id", &id) || !validUuid(id) ||
             !stringField(input, "output_path", &path) || path.empty() ||
             path.size() > 4096 || path.find('\0') != std::string::npos ||
             !std::filesystem::u8path(path).is_absolute()) return;
+        uint64_t expectedSize = 0, expectedExpiry = 0;
+        if (temporary) {
+            std::string name, type, mediaType;
+            MaiCloudDriveMediaInfo media{};
+            if (!stringField(input, "name", &name) || !mediaInfo(name, &media, true) ||
+                std::string(media.media_type_utf8) != "image" ||
+                !stringField(input, "content_type", &type) || type != media.content_type_utf8 ||
+                !stringField(input, "media_type", &mediaType) || mediaType != "image" ||
+                !uintField(input, "size_bytes", 1, media.max_size_bytes, &expectedSize) ||
+                !uintField(input, "expires_at", 1, 9'007'199'254'740'991, &expectedExpiry)) return;
+            if (expectedExpiry <= currentMilliseconds()) {
+                result->status = MAI_CLOUD_DRIVE_HTTP_ERROR;
+                result->http_status = 410;
+                assignBody(result, "{\"error_code\":\"image_expired\"}");
+                return;
+            }
+        }
         if (canceled(cancel)) { result->status = MAI_CLOUD_DRIVE_CANCELED; return; }
         const std::string linkArguments = json{{"video_id", id}}.dump();
         mai_cloud_drive_request(options, MAI_CLOUD_DRIVE_PLAY_LINK,
@@ -1419,8 +1497,14 @@ extern "C" void mai_cloud_drive_request(const MaiCloudDriveOptions* options,
             (type == "image/jpeg" || type == "image/png" || type == "image/webp" || type == "image/heic");
         const bool video = mediaType == "video" &&
             (type == "video/mp4" || type == "video/quicktime");
+        bool matches = true;
+        if (temporary) {
+            for (const char* key : {"name", "content_type", "media_type", "size_bytes", "expires_at", "attachment_id"})
+                matches = matches && details.contains(key) && details[key] == input[key];
+        }
         mai_cloud_drive_result_free(result);
-        if (!valid || (!image && !video) || (image && size > kMaxImageBytes)) {
+        if (!valid || !matches || (!temporary && !image && !video) ||
+            (temporary && (mediaType != "image" || size != expectedSize)) || (image && size > kMaxImageBytes)) {
             result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE; return;
         }
         if (cancel && !cancel->download) { result->status = MAI_CLOUD_DRIVE_FILE_ERROR; return; }
@@ -1446,8 +1530,10 @@ extern "C" void mai_cloud_drive_request(const MaiCloudDriveOptions* options,
             return;
         }
         result->status = MAI_CLOUD_DRIVE_OK;
-        assignBody(result, json{{"downloaded", true}, {"media_id", id}, {"path", path},
-            {"size_bytes", size}, {"content_type", type}, {"media_type", mediaType}}.dump());
+        json receipt{{"downloaded", true}, {temporary ? "attachment_id" : "media_id", id}, {"path", path},
+            {"size_bytes", size}, {"content_type", type}, {"media_type", mediaType}};
+        if (temporary) receipt["expires_at"] = expectedExpiry;
+        assignBody(result, receipt.dump());
         return;
     }
     const std::string root = apiRoot(options);
@@ -1543,6 +1629,11 @@ extern "C" void mai_cloud_drive_request(const MaiCloudDriveOptions* options,
             route = root + "/uploads/" + id;
             method = "DELETE";
         } else return;
+        if (action == MAI_CLOUD_DRIVE_PLAY_LINK && temporaryImage(options))
+            route += "?owner_slot=" + std::string(options->owner_device_slot_utf8) +
+                "&owner_login_session_id=" + options->owner_login_session_id_utf8 +
+                "&session_id=" + options->session_id_utf8 + "&message_id=" + options->message_id_utf8 +
+                "&part_id=" + options->part_id_utf8;
     }
     requestInternal(options, base, route, method, request, cancel, result);
     if (result->status != MAI_CLOUD_DRIVE_OK) return;
@@ -1619,6 +1710,22 @@ extern "C" void mai_cloud_drive_request(const MaiCloudDriveOptions* options,
             (thumbnail && (!stringField(response, "content_type", &field) ||
                            field != "image/jpeg")))
             result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE;
+        if (!thumbnail && temporaryImage(options)) {
+            const json expected{{"retention", "temporary"}, {"attachment_id", input["video_id"]},
+                {"room_key", roomKey(options)}, {"owner_login_session_id", options->owner_login_session_id_utf8},
+                {"message_id", options->message_id_utf8}, {"part_id", options->part_id_utf8}};
+            uint64_t absoluteExpiry = 0;
+            for (auto item = expected.begin(); item != expected.end(); ++item)
+                if (!response.contains(item.key()) || response[item.key()] != item.value())
+                    result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE;
+            if (!uintField(response, "expires_at", 1, 9'007'199'254'740'991, &absoluteExpiry) ||
+                absoluteExpiry <= currentMilliseconds() || expires > 60 ||
+                // Relative TTL starts at server issuance, before HTTP transit.
+                // Bound it against our request start; using receipt time would
+                // falsely reject valid links nearing the fixed object expiry.
+                expires * 1000 > absoluteExpiry - std::min(absoluteExpiry, requestStartedAt))
+                result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE;
+        }
     } else if (action == MAI_SESSION_ATTACHMENT_CLEANUP_ROOM) {
         if (!stringField(response, "room_key", &field) ||
             field != roomKey(options)) result->status = MAI_CLOUD_DRIVE_INVALID_RESPONSE;
@@ -1650,6 +1757,7 @@ extern "C" void mai_cloud_drive_upload_resumable_source(
     const std::string contentType(contentTypeRaw);
     MaiCloudDriveMediaInfo info{};
     if (!mediaInfo(name, &info, sessionMode(options)) ||
+        (temporaryImage(options) && std::string(info.media_type_utf8) != "image") ||
         contentType != info.content_type_utf8) return;
     std::string base;
     if (!validBase(options->auth_base_url_utf8, &base)) return;
@@ -1668,7 +1776,11 @@ extern "C" void mai_cloud_drive_upload_resumable_source(
                    checkpoint.fingerprint != fingerprint ||
                    checkpoint.name != name ||
                    checkpoint.contentType != contentType ||
-                   checkpoint.roomKey != roomKey(options))) {
+                   checkpoint.roomKey != roomKey(options) ||
+                   (temporaryImage(options) ? checkpoint.expiresAt == 0 ||
+                    checkpoint.ownerLogin != options->owner_login_session_id_utf8 ||
+                    checkpoint.messageId != options->message_id_utf8 ||
+                    checkpoint.partId != options->part_id_utf8 : checkpoint.expiresAt != 0))) {
         result->status = MAI_CLOUD_DRIVE_CHECKPOINT_MISMATCH;
         return;
     }
@@ -1678,6 +1790,14 @@ extern "C" void mai_cloud_drive_upload_resumable_source(
             result->status = MAI_CLOUD_DRIVE_FILE_ERROR;
             return;
         }
+    }
+    // A temporary identity is never recreated, including after server cleanup.
+    // Keep its durable receipt so a later text update can republish the same ref.
+    if (exists && temporaryImage(options) && checkpoint.expiresAt <= currentMilliseconds()) {
+        result->status = MAI_CLOUD_DRIVE_HTTP_ERROR;
+        result->http_status = 410;
+        assignBody(result, "{\"error_code\":\"image_expired\"}");
+        return;
     }
     std::vector<Part> parts;
     bool ready = false;
@@ -1691,7 +1811,7 @@ extern "C" void mai_cloud_drive_upload_resumable_source(
         if (listParts(options, base, checkpoint, cancel, &parts, &ready, result))
             break;
         if (result->status == MAI_CLOUD_DRIVE_HTTP_ERROR &&
-            result->http_status == 410 && sessionAttempt == 0) {
+            result->http_status == 410 && sessionAttempt == 0 && !temporaryImage(options)) {
             mai_cloud_drive_result_free(result);
             if (!removeCheckpoint(checkpointPath)) {
                 result->status = MAI_CLOUD_DRIVE_FILE_ERROR;

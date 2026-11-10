@@ -169,10 +169,87 @@ unsigned completeCalls(const std::string& state) {
                                  nullptr, 10));
 }
 
+void temporaryImages(MaiCloudDriveOptions options, const std::string& endpoint,
+                     const std::string& caPath, const std::string& directory, bool latency) {
+    options.owner_device_slot_utf8 = "mac";
+    options.owner_login_session_id_utf8 = "login_a";
+    options.session_id_utf8 = "session_a";
+    options.temporary_session_image = 1;
+    options.message_id_utf8 = "message_a";
+    options.part_id_utf8 = "part_a";
+    options.retain_completed_checkpoint = 1;
+    const std::string source = directory + "/screen.png";
+    const std::string checkpoint = directory + "/temporary.maicloud.json";
+    { std::ofstream image(source, std::ios::binary); image << "temporary image bytes"; }
+    auto publish = [&] {
+        MaiCloudDriveResult raw{};
+        mai_cloud_drive_upload_resumable(&options, source.c_str(), checkpoint.c_str(),
+            "screen.png", "image/png", nullptr, nullptr, nullptr, &raw);
+        return take(&raw);
+    };
+    const Call uploaded = publish();
+    require(uploaded.status == MAI_CLOUD_DRIVE_OK, "temporary image did not upload with its publication identity");
+    const auto ready = nlohmann::json::parse(uploaded.body);
+    require(ready["retention"] == "temporary" && ready["message_id"] == "message_a" &&
+            ready["part_id"] == "part_a" && ready["expires_at"].is_number_unsigned(),
+            "temporary upload lost its immutable receipt");
+    const auto state = nlohmann::json::parse(getState(endpoint, caPath));
+    options.part_id_utf8 = "part_b";
+    require(publish().status == MAI_CLOUD_DRIVE_CHECKPOINT_MISMATCH,
+            "temporary checkpoint crossed a publication identity");
+    options.part_id_utf8 = "part_a";
+    options.owner_login_session_id_utf8 = "replacement_login";
+    require(publish().status == MAI_CLOUD_DRIVE_CHECKPOINT_MISMATCH,
+            "temporary checkpoint crossed an original owner login");
+    options.owner_login_session_id_utf8 = "login_a";
+    nlohmann::json read{{"attachment_id", ready["attachment_id"]}, {"name", "screen.png"},
+        {"content_type", "image/png"}, {"media_type", "image"},
+        {"size_bytes", ready["size_bytes"]}, {"expires_at", ready["expires_at"]},
+        {"output_path", directory + "/download.png"}};
+    const auto downloaded = request(options, MAI_SESSION_IMAGE_DOWNLOAD, read.dump().c_str());
+    require(downloaded.status == MAI_CLOUD_DRIVE_OK &&
+            readFile(directory + "/download.png") == readFile(source) &&
+            downloaded.body.find("read_url") == std::string::npos,
+            "temporary download did not validate and commit complete image bytes");
+    if (latency) {
+        std::cout << "near-expiry temporary signed read survived control-response latency\n";
+        return;
+    }
+    read["expires_at"] = 1;
+    require(request(options, MAI_SESSION_IMAGE_DOWNLOAD, read.dump().c_str()).httpStatus == 410,
+            "expired local image receipt did not stop before HTTP");
+    const auto afterExpired = nlohmann::json::parse(getState(endpoint, caPath));
+    require(afterExpired["read_requests"] == 1, "expired local image attempted a read request");
+    read["expires_at"] = ready["expires_at"];
+    read["output_path"] = directory + "/mismatch.png";
+    for (const char* invalid : {"wrong_part", "wrong_login", "wrong_room", "wrong_expiry", "wrong_size", "short_bytes"}) {
+        getState(endpoint, caPath, (std::string("/test/temporary-case?case=") + invalid).c_str());
+        require(request(options, MAI_SESSION_IMAGE_DOWNLOAD, read.dump().c_str()).status ==
+                    MAI_CLOUD_DRIVE_INVALID_RESPONSE && !exists(directory + "/mismatch.png"),
+                "temporary image accepted a mismatched receipt or incomplete file");
+    }
+    getState(endpoint, caPath, "/test/temporary-case?case=normal");
+    const auto beforeCancel = nlohmann::json::parse(getState(endpoint, caPath));
+    auto* cancel = mai_cloud_drive_cancel_create();
+    mai_cloud_drive_cancel_request(cancel);
+    MaiCloudDriveResult canceled{};
+    mai_cloud_drive_request(&options, MAI_SESSION_IMAGE_DOWNLOAD, read.dump().c_str(), cancel, &canceled);
+    require(take(&canceled).status == MAI_CLOUD_DRIVE_CANCELED &&
+            nlohmann::json::parse(getState(endpoint, caPath))["read_requests"] == beforeCancel["read_requests"],
+            "canceled temporary image started a control request");
+    mai_cloud_drive_cancel_destroy(cancel);
+    getState(endpoint, caPath, "/test/temporary-case?case=expired");
+    require(publish().httpStatus == 410 && exists(checkpoint),
+            "expired temporary upload discarded its terminal identity");
+    require(nlohmann::json::parse(getState(endpoint, caPath))["sessions"] == state["sessions"],
+            "expired temporary upload allocated a replacement object");
+    std::cout << "temporary Session image binding/expiry/checkpoint/download/cancellation passed\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    require(argc == 5, "expected endpoint, certificate, unrelated certificate, directory");
+    require(argc == 5 || argc == 6, "expected endpoint, certificate, unrelated certificate, directory");
     require(mai_cloud_drive_folder_name_valid("Travel") == 1 &&
             mai_cloud_drive_folder_name_valid("\xe6\x97\x85\xe8\xa1\x8c \xf0\x9f\x8c\x8d") == 1,
             "folder validation rejected a valid Unicode name");
@@ -241,6 +318,10 @@ int main(int argc, char** argv) {
     author.first_party_route_context = &selectedRoutes;
     MaiCloudDriveOptions viewer = author;
     viewer.account_token_utf8 = "viewer-token";
+    if (argc == 6) {
+        temporaryImages(author, endpoint, argv[2], argv[4], std::string(argv[5]) == "--temporary-latency");
+        return 0;
+    }
 
     require(request(viewer, MAI_CLOUD_DRIVE_LIST_VIDEOS).body.find("\"videos\":[]") !=
             std::string::npos, "other account saw an unuploaded video");

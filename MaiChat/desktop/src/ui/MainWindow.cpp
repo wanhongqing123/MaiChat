@@ -4933,6 +4933,11 @@ void MainWindow::wireRemoteAgentPanel() {
       return QPair<QJsonObject, QString>{wire, {}};
     }));
   });
+  // Resolve current account access when an image is requested, including after
+  // the existing provider is replaced during authentication refresh.
+  agentRemotePanel_->setImageAccessProvider([this] {
+    return videoCircleAccessProvider_ ? videoCircleAccessProvider_() : DesktopVideoCircleAccess{};
+  });
   agentRemotePanel_->setDownloadHandler([this, panel](const QJsonObject& session,
       const QString& id, RemoteAgentPanel::DownloadCompletion completion) {
     const DesktopVideoCircleAccess access = videoCircleAccessProvider_ ?

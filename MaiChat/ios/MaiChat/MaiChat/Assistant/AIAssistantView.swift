@@ -974,7 +974,8 @@ private struct AIAssistantMessageList: View {
                                         browser.sourceMessageID == message.id && !browser.sourcePartID.isEmpty
                                     VStack(alignment: .leading, spacing: 16) {
                                         AIMessageRow(message: message,
-                                                     workspacePath: model.workspacePath,
+                                                     workspacePath: model.selectedRemote == nil ? model.workspacePath : "",
+                                                     remoteImageOwner: model.remoteImageOwner,
                                                      questionAnswerEchoes: model.questionAnswerEchoes(for: message),
                                                      quote: {
                                                          guard message.questionProjection != true else { return }
@@ -1541,6 +1542,7 @@ struct AIMessageRow: View, Equatable {
     @ObservedObject private var cloudDrive = MaiCloudDriveModel.shared
     let message: AIMessage
     let workspacePath: String
+    var remoteImageOwner: AIRemoteImageOwner? = nil
     var questionAnswerEchoes: [String: String] = [:]
     let quote: () -> Void
     var canPublishVideo = false
@@ -1561,6 +1563,7 @@ struct AIMessageRow: View, Equatable {
     @State private var remoteDownloadError: String?
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message && lhs.workspacePath == rhs.workspacePath &&
+            lhs.remoteImageOwner == rhs.remoteImageOwner &&
             lhs.questionAnswerEchoes == rhs.questionAnswerEchoes &&
             lhs.canPublishVideo == rhs.canPublishVideo &&
             lhs.imagePreviewSourceID == rhs.imagePreviewSourceID &&
@@ -1583,24 +1586,27 @@ struct AIMessageRow: View, Equatable {
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
                         }
-                        if !userDisplayText.isEmpty {
-                            Text(userDisplayText)
-                                .font(ChatTypography.body)
-                                .lineSpacing(ChatTypography.lineSpacing)
-                                .foregroundStyle(RemoteIMStyle.textPrimary)
-                                .textSelection(.enabled)
-                                .padding(14)
-                                .background(Color(uiColor: .secondarySystemBackground),
-                                            in: RoundedRectangle(cornerRadius: 18))
-                        }
-                        ForEach(Array(imagePaths.enumerated()), id: \.offset) { _, path in
-                            AIWorkspaceImage(filePath: path) { image, sourceFrame, sourceID in
-                                openImage(path, thumbnail: image, sourceFrame: sourceFrame, sourceID: sourceID)
+                        if message.parts.contains(where: { $0.remoteImage != nil }) {
+                            // Remote text/image parts keep their original order;
+                            // combining all text first would move a screenshot.
+                            ForEach(message.parts) { part in
+                                if part.kind == "text", let text = part.text, !text.isEmpty {
+                                    userTextBubble(text)
+                                } else if part.kind == "image", part.remoteImage != nil {
+                                    remoteImageCard(part)
+                                }
                             }
-                        }
-                        ForEach(videoPaths, id: \.self) { path in
-                            AIWorkspaceVideoCard(filePath: path) {
-                                openVideo(path)
+                        } else {
+                            if !userDisplayText.isEmpty { userTextBubble(userDisplayText) }
+                            ForEach(Array(imagePaths.enumerated()), id: \.offset) { _, path in
+                                AIWorkspaceImage(filePath: path) { image, sourceFrame, sourceID in
+                                    openImage(path, thumbnail: image, sourceFrame: sourceFrame, sourceID: sourceID)
+                                }
+                            }
+                            ForEach(videoPaths, id: \.self) { path in
+                                AIWorkspaceVideoCard(filePath: path) {
+                                    openVideo(path)
+                                }
                             }
                         }
                         ForEach(inlineMedia) { mention in
@@ -1647,6 +1653,10 @@ struct AIMessageRow: View, Equatable {
                         } else if part.kind == "tool", part.id == browserPartID, let sessionID = browserSessionID {
                             AIBrowserTaskEntry(sessionID: sessionID, isLocal: true,
                                                needsConfirmation: browserNeedsConfirmation, open: openBrowser)
+                        } else if part.kind == "image", part.remoteImage != nil {
+                            remoteImageCard(part)
+                        } else if part.kind == "image", part.attachmentID != nil {
+                            remoteAttachmentCard(part)
                         } else if part.kind == "text", let text = part.text, !text.isEmpty {
                             if let failure = specialistFailureText(text) {
                                 Label(failure, systemImage: "exclamationmark.triangle.fill")
@@ -1865,6 +1875,23 @@ struct AIMessageRow: View, Equatable {
         }
     }
 
+    private func userTextBubble(_ text: String) -> some View {
+        Text(text)
+            .font(ChatTypography.body)
+            .lineSpacing(ChatTypography.lineSpacing)
+            .foregroundStyle(RemoteIMStyle.textPrimary)
+            .textSelection(.enabled)
+            .padding(14)
+            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func remoteImageCard(_ part: AIPart) -> some View {
+        AIRemoteSessionImage(owner: remoteImageOwner, messageID: message.id, part: part) { path, image, frame, source in
+            guard AIAssistantModel.shared.remoteImageOwner == remoteImageOwner else { return }
+            openImage(path, thumbnail: image, sourceFrame: frame, sourceID: source)
+        }
+    }
+
     @ViewBuilder private func remoteAttachmentCard(_ part: AIPart) -> some View {
         let title = part.name ?? part.text ?? "附件"
         let kindLabel = part.kind == "image" ? "图片" :
@@ -2013,6 +2040,13 @@ struct AIMessageRow: View, Equatable {
             .filter { !alreadyShown.contains($0.url.path) }
     }
     private var displayedMediaItems: [MaiMediaItem] {
+        if let owner = remoteImageOwner {
+            return message.parts.compactMap { part in
+                guard let path = AIAssistantModel.shared.cachedRemoteImagePath(
+                    owner: owner, messageID: message.id, part: part) else { return nil }
+                return MaiMediaItem(kind: .image, path: path)
+            }
+        }
         let mentions = textMediaMentions.filter { $0.kind == .video }.map {
             MaiMediaItem(kind: .video, path: $0.url.path)
         }
@@ -2036,6 +2070,7 @@ struct AIMessageRow: View, Equatable {
         var items: [MaiMediaItem] = []
         for (index, entry) in history.enumerated() {
             items += Self(message: entry, workspacePath: workspacePath,
+                          remoteImageOwner: remoteImageOwner,
                           quote: {}).displayedMediaItems
             if index.isMultiple(of: 40) { await Task.yield() }
         }
@@ -2046,7 +2081,8 @@ struct AIMessageRow: View, Equatable {
         let model = AIAssistantModel.shared
         let session = model.selected
         let items = model.messages.flatMap {
-            Self(message: $0, workspacePath: workspacePath, quote: {}).displayedMediaItems
+            Self(message: $0, workspacePath: workspacePath,
+                 remoteImageOwner: remoteImageOwner, quote: {}).displayedMediaItems
         }
         let sequence = MaiMediaSequence(
             selected: MaiMediaItem(kind: .image, path: path), items: items)
@@ -2074,7 +2110,8 @@ struct AIMessageRow: View, Equatable {
             let model = AIAssistantModel.shared
             let session = model.selected
             let items = model.messages.flatMap {
-                Self(message: $0, workspacePath: workspacePath, quote: {}).displayedMediaItems
+                Self(message: $0, workspacePath: workspacePath,
+                     remoteImageOwner: remoteImageOwner, quote: {}).displayedMediaItems
             }
             let sequence = MaiMediaSequence(
                 selected: MaiMediaItem(kind: .video, path: path), items: items)
@@ -2408,6 +2445,87 @@ private struct AIPDFArtifactButton: View {
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("agentPdfPreviewButton")
+    }
+}
+
+/// A stable image part owns one normal bubble. Pending, failure and expiry use
+/// the same position; retry reads the same OSS object and never asks its owner
+/// to upload again. SwiftUI cancellation reaches the shared native downloader.
+private struct AIRemoteSessionImage: View {
+    let owner: AIRemoteImageOwner?
+    let messageID: String
+    let part: AIPart
+    let open: (String, UIImage, CGRect, UUID) -> Void
+
+    private struct LoadIdentity: Equatable {
+        let owner: AIRemoteImageOwner?
+        let messageID: String
+        let part: AIPart
+        let retry: Int
+    }
+    @State private var loadedIdentity: LoadIdentity?
+    @State private var checkedIdentity: LoadIdentity?
+    @State private var file: URL?
+    @State private var failure: String?
+    @State private var expired = false
+    @State private var retryable = false
+    @State private var retry = 0
+
+    var body: some View {
+        let identity = LoadIdentity(owner: owner, messageID: messageID, part: part, retry: retry)
+        Group {
+            if loadedIdentity == identity, let file {
+                AIWorkspaceImage(filePath: file.path) { image, frame, source in
+                    open(file.path, image, frame, source)
+                }
+            } else {
+                TimelineView(.periodic(from: .now, by: 30)) { _ in
+                    VStack(spacing: 8) {
+                        if expired || (checkedIdentity == identity && part.remoteImage?.isExpired == true) {
+                            Label("图片已过期", systemImage: "photo")
+                        } else if part.remoteImage?.state == "failed" {
+                            Label("图片同步失败", systemImage: "exclamationmark.triangle")
+                        } else if let failure {
+                            Label(failure, systemImage: "photo")
+                            if retryable {
+                                Button("重新加载图片") { retry &+= 1 }
+                            }
+                        } else {
+                            ProgressView()
+                            Text(part.remoteImage?.state == "pending" ? "图片正在同步" : "图片正在加载")
+                        }
+                    }
+                    .font(AppTypography.detail)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 220, height: 146)
+                    .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityIdentifier("agent-remote-image-state-" + part.id)
+                }
+            }
+        }
+        .task(id: identity) {
+            file = nil; failure = nil; expired = false; retryable = false
+            checkedIdentity = nil
+            defer { if !Task.isCancelled { checkedIdentity = identity } }
+            guard let owner else { failure = "图片暂不可用"; return }
+            do {
+                let downloaded = try await AIAssistantModel.shared.loadRemoteImage(
+                    owner: owner, messageID: messageID, part: part)
+                try Task.checkCancellation()
+                file = downloaded
+                loadedIdentity = identity
+            } catch is CancellationError {
+                // A disappearing/replaced part must not publish an old result.
+            } catch let error as AIRemoteImageError {
+                guard !Task.isCancelled else { return }
+                if case .expired = error { expired = true }
+                else if case .pending = error { /* Await the same part's ready projection. */ }
+                else { failure = error.localizedDescription }
+            } catch {
+                guard !Task.isCancelled else { return }
+                failure = "图片加载失败"; retryable = true
+            }
+        }
     }
 }
 

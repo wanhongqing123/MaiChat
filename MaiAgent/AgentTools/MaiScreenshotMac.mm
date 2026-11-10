@@ -33,6 +33,7 @@ namespace {
 constexpr double kMaximumWidth = 2560.0;
 constexpr double kMaximumHeight = 1600.0;
 constexpr auto kCaptureTimeout = std::chrono::seconds(20);
+constexpr auto kFreshFrameTimeout = std::chrono::seconds(2);
 
 struct MaiCaptureState {
     std::mutex mutex;
@@ -175,7 +176,46 @@ struct CapturedPixels {
     std::size_t stride = 0;
     std::uint64_t sequence = 0;
     std::int64_t received = 0;
+    std::int64_t sourceProducedAtMs = 0;  // 仅内部 fresh 屏障使用；0 表示源时间不可证明。
 };
+
+// 两个 CMTime 必须已在 host clock 上；不能把任意 sample PTS 直接当作 mach/Unix 时间。
+// Unix 锚点先于 hostNow 读取，年龄向上取整到毫秒，使结果不晚于可证明的源时间。
+// 把时钟读取与算术分开，受控测试可覆盖延迟回调、分数毫秒、无效/未来/跨 epoch 和溢出。
+bool sourceProducedUnixMilliseconds(CMTime presentationHost, CMTime hostNow,
+                                    std::int64_t unixAnchorMs, std::int64_t& producedMs) {
+    producedMs = 0;
+    if (!CMTIME_IS_NUMERIC(presentationHost) || !CMTIME_IS_NUMERIC(hostNow) ||
+        presentationHost.timescale <= 0 || hostNow.timescale <= 0 || unixAnchorMs <= 0 ||
+        presentationHost.epoch != hostNow.epoch || CMTimeCompare(presentationHost, hostNow) > 0)
+        return false;
+    const CMTime age = CMTimeSubtract(hostNow, presentationHost);
+    if (!CMTIME_IS_NUMERIC(age)) return false;
+    const CMTime ageMs =
+        CMTimeConvertScale(age, 1000, kCMTimeRoundingMethod_RoundTowardPositiveInfinity);
+    if (!CMTIME_IS_NUMERIC(ageMs) || ageMs.value < 0 || ageMs.value >= unixAnchorMs) return false;
+    producedMs = unixAnchorMs - ageMs.value;
+    return true;
+}
+
+std::int64_t sampleSourceProducedAtMs(CMSampleBufferRef sample, CMClockRef synchronizationClock) {
+    if (!synchronizationClock) return 0;
+    const CMTime presentation = CMSampleBufferGetPresentationTimeStamp(sample);
+    if (!CMTIME_IS_NUMERIC(presentation)) return 0;
+    const CMClockRef hostClock = CMClockGetHostTimeClock();
+    if (!hostClock) return 0;
+    // SCStream.synchronizationClock 是官方声明的输出 sample 时间基。显式转换到 host clock，
+    // 不依赖 SCK 当前实现恰好使用 mach_absolute_time，也不比较不同时钟的裸 value。
+    const CMTime presentationHost =
+        CMSyncConvertTime(presentation, synchronizationClock, hostClock);
+    const std::int64_t unixAnchorMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count();
+    const CMTime hostNow = CMClockGetTime(hostClock);
+    std::int64_t producedMs = 0;
+    sourceProducedUnixMilliseconds(presentationHost, hostNow, unixAnchorMs, producedMs);
+    return producedMs;
+}
 
 struct StreamState {
     explicit StreamState(CaptureCounters& counters) : counters(counters) {}
@@ -248,7 +288,8 @@ void rejectDesktopLocked(StreamState& state, const MaiError& error) {
 
 // 帧回调不持有请求或取消函数。独立复制一份有界像素，避免长期占用 SCK 的 IOSurface 池。
 void receiveFrame(const std::weak_ptr<StreamState>& weak, std::uint64_t generation,
-                  CMSampleBufferRef sample, const DesktopAvailability* injected = nullptr) {
+                  CMSampleBufferRef sample, const DesktopAvailability* injected = nullptr,
+                  CMClockRef synchronizationClock = nullptr) {
     const auto state = weak.lock();
     if (!state || state->stopping.load() || !CMSampleBufferIsValid(sample)) return;
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, false);
@@ -335,6 +376,7 @@ void receiveFrame(const std::weak_ptr<StreamState>& weak, std::uint64_t generati
         frame->received = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::system_clock::now().time_since_epoch())
                               .count();
+        frame->sourceProducedAtMs = sampleSourceProducedAtMs(sample, synchronizationClock);
         state->counters.update([&](auto& counts) {
             frame->sequence = ++counts.framesReceived;
             counts.capturing = true;
@@ -364,9 +406,9 @@ void receiveFrame(const std::weak_ptr<StreamState>& weak, std::uint64_t generati
 - (void)stream:(SCStream*)stream
     didOutputSampleBuffer:(CMSampleBufferRef)sample
                    ofType:(SCStreamOutputType)type {
-    (void)stream;
     @autoreleasepool {
-        if (type == SCStreamOutputTypeScreen) receiveFrame(state, generation, sample);
+        if (type == SCStreamOutputTypeScreen)
+            receiveFrame(state, generation, sample, nullptr, stream.synchronizationClock);
     }
 }
 - (void)stream:(SCStream*)stream didStopWithError:(NSError*)error {
@@ -411,7 +453,10 @@ struct CaptureCommand {
     // 仅复制目标字段；isCanceled 严禁进入此对象或任何异步 callback。
     MaiScreenshotTarget target;
     std::string title;
-    std::uint64_t windowId;
+    std::uint64_t windowId = 0;
+    std::uint64_t displayId = 0;
+    std::uint64_t afterFrameSequence = 0;
+    std::int64_t afterFrameReceivedAtMs = 0;
     std::atomic<bool> canceled{false};
     std::mutex mutex;
     std::condition_variable condition;
@@ -431,6 +476,16 @@ struct CaptureTarget {
                height == other.height;
     }
 };
+
+bool displayGeometry(CGDirectDisplayID id, CaptureTarget& target) {
+    if (!id || !CGDisplayIsActive(id)) return false;
+    const CGRect bounds = CGDisplayBounds(id);
+    if (!std::isfinite(bounds.size.width) || !std::isfinite(bounds.size.height) ||
+        bounds.size.width <= 0 || bounds.size.height <= 0)
+        return false;
+    target = {true, id, bounds.size.width, bounds.size.height};
+    return true;
+}
 
 bool windowGeometry(std::uint32_t id, CaptureTarget& target) {
     CFArrayRef windows = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, id);
@@ -575,6 +630,14 @@ private:
     }
     MaiError resolve(const CaptureCommand& command, CaptureTarget& target,
                      SCShareableContent* __strong& available) {
+        if (command.target == MaiScreenshotTarget::DisplayById) {
+            // 显式显示器沿用同一常驻 SCK 流和队列，目标消失时失败，
+            // 不把模型静默转到鼠标所在屏或主屏。
+            return displayGeometry(static_cast<CGDirectDisplayID>(command.displayId), target)
+                       ? MaiError{}
+                       : MaiError::make(MaiErrorCode::NotFound,
+                                        "requested display is not active or no longer exists");
+        }
         if (command.target == MaiScreenshotTarget::WindowById) {
             return windowGeometry(static_cast<std::uint32_t>(command.windowId), target)
                        ? MaiError{}
@@ -604,9 +667,10 @@ private:
                 selected = displays[i];
                 break;
             }
-        const CGRect bounds = CGDisplayBounds(selected);
-        target = {true, selected, bounds.size.width, bounds.size.height};
-        return {};
+        return displayGeometry(selected, target)
+                   ? MaiError{}
+                   : MaiError::make(MaiErrorCode::NotFound,
+                                    "pointer display is not active or no longer exists");
     }
     MaiError closeNative() {
         {
@@ -720,13 +784,37 @@ private:
         std::shared_ptr<const CapturedPixels> frame;
         {
             std::unique_lock<std::mutex> lock(state_->mutex);
-            const auto deadline = std::chrono::steady_clock::now() + kCaptureTimeout;
-            while (!state_->pixels && !state_->error) {
+            const bool fresh =
+                command->afterFrameSequence != 0 || command->afterFrameReceivedAtMs != 0;
+            const auto deadline =
+                std::chrono::steady_clock::now() + (fresh ? kFreshFrameTimeout : kCaptureTimeout);
+            const auto ready = [&] {
+                return state_->pixels &&
+                       (!fresh ||
+                        (state_->pixels->sequence > command->afterFrameSequence &&
+                         state_->pixels->received > command->afterFrameReceivedAtMs &&
+                         state_->pixels->sourceProducedAtMs > command->afterFrameReceivedAtMs));
+            };
+            // 输入后的观察必须同时越过序号、接收时间和源帧时间边界，排除输入前已生成、
+            // 输入后才到 callback 的旧帧；Idle 不伪造新帧，失败仍保留健康常驻流。
+            while (!ready() && !state_->error) {
                 if (command->canceled.load() || state_->stopping.load())
                     return MaiError::make(MaiErrorCode::Canceled, "screen capture canceled");
-                if (state_->condition.wait_until(lock, deadline) == std::cv_status::timeout)
-                    return MaiError::make(MaiErrorCode::Internal,
-                                          "screen capture first frame timed out");
+                if (fresh && state_->pixels &&
+                    state_->pixels->sequence > command->afterFrameSequence &&
+                    state_->pixels->received > command->afterFrameReceivedAtMs &&
+                    state_->pixels->sourceProducedAtMs == 0)
+                    return MaiError::make(
+                        MaiErrorCode::NotSupported,
+                        "native screen frame source time is unavailable for a fresh observation");
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline)
+                    return fresh ? MaiError::make(MaiErrorCode::Busy,
+                                                  "no newer screen frame arrived after input")
+                                 : MaiError::make(MaiErrorCode::Internal,
+                                                  "screen capture first frame timed out");
+                state_->condition.wait_until(
+                    lock, std::min(deadline, now + std::chrono::milliseconds(20)));
             }
             if (state_->error) return state_->error;
             frame = state_->pixels;
@@ -757,9 +845,11 @@ private:
             if (!windowGeometry(target.id, current) || !(current == target))
                 return MaiError::make(MaiErrorCode::NotFound,
                                       "window changed during screen capture");
-        } else if (!CGDisplayIsActive(target.id)) {
-            return MaiError::make(MaiErrorCode::NotFound,
-                                  "display disconnected during screen capture");
+        } else {
+            CaptureTarget current;
+            if (!displayGeometry(target.id, current) || !(current == target))
+                return MaiError::make(MaiErrorCode::NotFound,
+                                      "display changed during screen capture");
         }
         image.frameSequence = frame->sequence;
         image.frameReceivedAtMs = frame->received;
@@ -891,12 +981,23 @@ MaiError maiCaptureScreenshot(const MaiScreenshotRequest& request, MaiScreenshot
                               "ScreenCaptureKit requires macOS 14 or later");
     if (request.target != MaiScreenshotTarget::DisplayUnderPointer &&
         request.target != MaiScreenshotTarget::WindowByTitle &&
-        request.target != MaiScreenshotTarget::WindowById)
+        request.target != MaiScreenshotTarget::WindowById &&
+        request.target != MaiScreenshotTarget::DisplayById)
         return MaiError::make(MaiErrorCode::InvalidInput, "unsupported native screenshot target");
     if (request.target == MaiScreenshotTarget::WindowById &&
         (!request.windowId || request.windowId > std::numeric_limits<CGWindowID>::max()))
         return MaiError::make(MaiErrorCode::InvalidInput,
                               "windowId must be a non-zero native window identifier");
+    if (request.target == MaiScreenshotTarget::DisplayById &&
+        (!request.displayId || request.displayId > std::numeric_limits<CGDirectDisplayID>::max()))
+        return MaiError::make(MaiErrorCode::InvalidInput,
+                              "displayId must be a non-zero native display identifier");
+    // 目标有效性不依赖屏幕录制授权。活动表中没有的显式 ID 在 GUI/TCC/worker 之前
+    // 拒绝，纯负例校验不会触发系统授权请求；worker 在使用前仍复核同一 ID。
+    if (request.target == MaiScreenshotTarget::DisplayById &&
+        !CGDisplayIsActive(static_cast<CGDirectDisplayID>(request.displayId)))
+        return MaiError::make(MaiErrorCode::NotFound,
+                              "requested display is not active or no longer exists");
     if (!desktopCanCapture(readDesktopAvailability())) {
         const auto error = MaiError::make(MaiErrorCode::NotConfigured,
                                           "GUI session is unavailable for screen capture");
@@ -917,6 +1018,9 @@ MaiError maiCaptureScreenshot(const MaiScreenshotRequest& request, MaiScreenshot
     command->target = request.target;
     command->title = request.windowTitle;
     command->windowId = request.windowId;
+    command->displayId = request.displayId;
+    command->afterFrameSequence = request.afterFrameSequence;
+    command->afterFrameReceivedAtMs = request.afterFrameReceivedAtMs;
     if (!worker->submit(command))
         return MaiError::make(MaiErrorCode::Canceled, "screen capture stopped");
     // callback 只存在于本调用的栈上，异步命令只保存 atomic 取消标记。

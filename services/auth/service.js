@@ -986,7 +986,7 @@ function createAuthService(options) {
     if (path.startsWith('/v1/session-attachments')) {
       if (!sessionAttachments) return json(404,{ error:'Not found' });
       if (!session) return authenticationFailure(headers);
-      return sessionAttachments.handle(method,path,request,session,query);
+      return sessionAttachments.handle(method,path,request,session,query,headers);
     }
     if (path.startsWith('/v1/friends')) {
       if (!session) return authenticationFailure(headers);

@@ -146,11 +146,15 @@ function createHandler(options = {}) {
   }
 
   function validCloudKey(key, accountId = '') {
+    // Temporary image objects are isolated from persistent prompt attachments;
+    // their strict image suffix list must not permit general files or video.
     return typeof key === 'string' &&
       (/^cloud-drive\/[a-z][a-z0-9_-]{2,31}\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}\.(mp4|mov|jpg|jpeg|png|webp|heic)$/.test(key) ||
-       /^session-attachments\/[a-z][a-z0-9_-]{2,31}\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}\.[a-z0-9]{1,12}$/.test(key)) &&
+       /^session-attachments\/[a-z][a-z0-9_-]{2,31}\/\d{4}-\d{2}-\d{2}\/[a-f0-9-]{36}\.[a-z0-9]{1,12}$/.test(key) ||
+       /^session-temp-images\/[a-z][a-z0-9_-]{2,31}\/\d{4}-\d{2}-\d{2}\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.(jpg|jpeg|png|webp|heic|gif)$/.test(key)) &&
       (!accountId || key.startsWith(`cloud-drive/${accountId}/`) ||
-        key.startsWith(`session-attachments/${accountId}/`));
+        key.startsWith(`session-attachments/${accountId}/`) ||
+        key.startsWith(`session-temp-images/${accountId}/`));
   }
 
   function cloudContentType(key) {
@@ -161,6 +165,8 @@ function createHandler(options = {}) {
     if (key.endsWith('.png')) return 'image/png';
     if (key.endsWith('.webp')) return 'image/webp';
     if (key.endsWith('.heic')) return 'image/heic';
+    if (key.startsWith('session-temp-images/') && key.endsWith('.gif'))
+      return 'image/gif';
     if (key.startsWith('session-attachments/')) {
       if (key.endsWith('.gif')) return 'image/gif';
       if (key.endsWith('.mp3')) return 'audio/mpeg';
@@ -269,6 +275,22 @@ function createHandler(options = {}) {
             '/cloud-drive/complete','/cloud-drive/abort'].includes(cloudAction) &&
             !validCloudUploadId(body.upload_id)))
         return jsonResponse(400, { error: 'Invalid private video object' });
+      let signatureTTL = cloudAction === '/cloud-drive/sign-part'
+        ? CLOUD_PART_TTL_SECONDS : CLOUD_READ_TTL_SECONDS;
+      if (key.startsWith('session-temp-images/') &&
+          ['/cloud-drive/read','/cloud-drive/thumbnail','/cloud-drive/sign-part']
+            .includes(cloudAction)) {
+        // Only the account service supplies the original absolute expiry.
+        // Clamp the actual OSS signature as well as the advertised lifetime;
+        // cleanup operations remain available after expiry to prove deletion.
+        if (!Number.isSafeInteger(body.expires_at) || body.expires_at < 1)
+          return jsonResponse(400,{ error:'Invalid temporary image expiry' });
+        signatureTTL = Math.min(signatureTTL,
+          Math.floor((body.expires_at-currentTime().getTime())/1000));
+        if (signatureTTL < 1)
+          return jsonResponse(410,{ error:'Temporary image expired',
+            error_code:'image_expired' });
+      }
       const bucket = env.MAICHAT_CLOUD_DRIVE_OSS_BUCKET || '';
       const region = env.MAICHAT_CLOUD_DRIVE_OSS_REGION || '';
       if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(bucket) ||
@@ -297,7 +319,7 @@ function createHandler(options = {}) {
               Buffer.from(md5,'base64').length !== 16)
             return jsonResponse(400,{ error:'Invalid upload part' });
           const headers = { 'Content-Length':String(bytes), 'Content-MD5':md5 };
-          const url = await storage.signatureUrlV4('PUT',CLOUD_PART_TTL_SECONDS,
+          const url = await storage.signatureUrlV4('PUT',signatureTTL,
             { headers, queries:{ partNumber:number, uploadId:body.upload_id } },
             key,['content-length']);
           if (typeof url !== 'string' || !url.startsWith('https://'))
@@ -418,12 +440,12 @@ function createHandler(options = {}) {
             size_bytes: bytes, content_type: contentType });
         }
         if (cloudAction === '/cloud-drive/read') {
-          const url = await storage.signatureUrlV4('GET',CLOUD_READ_TTL_SECONDS,
+          const url = await storage.signatureUrlV4('GET',signatureTTL,
             { headers: {} },key);
           if (typeof url !== 'string' || !url.startsWith('https://'))
             throw new Error('Invalid signed read URL');
           return jsonResponse(200,{ read_url:url,
-            read_expires_in:CLOUD_READ_TTL_SECONDS });
+            read_expires_in:signatureTTL });
         }
         if (cloudAction === '/cloud-drive/thumbnail') {
           const transform = type.startsWith('image/')
@@ -431,12 +453,12 @@ function createHandler(options = {}) {
             : 'video/snapshot,t_0,f_jpg,w_320,ar_auto';
           // Processing must be in the V4 signature. Appending it to an
           // ordinary read URL would allow signature rejection or bypass.
-          const url = await storage.signatureUrlV4('GET',CLOUD_READ_TTL_SECONDS,
+          const url = await storage.signatureUrlV4('GET',signatureTTL,
             { headers:{},queries:{ 'x-oss-process':transform } },key);
           if (typeof url !== 'string' || !url.startsWith('https://'))
             throw new Error('Invalid signed thumbnail URL');
           return jsonResponse(200,{ thumbnail_url:url,
-            thumbnail_expires_in:CLOUD_READ_TTL_SECONDS });
+            thumbnail_expires_in:signatureTTL });
         }
         await storage.delete(key);
         return jsonResponse(200,{ deleted:true });
