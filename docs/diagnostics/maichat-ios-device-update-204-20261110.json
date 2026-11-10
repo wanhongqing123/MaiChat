@@ -1,0 +1,129 @@
+{
+  "date": "2026-11-10",
+  "source_commit": "b8782ef66d78611cf916356d0fcaaffdb31e9a6d",
+  "status": "physical device updated to 2.2.4 build 204; real menu acceptance pending unlock",
+  "physical_install_receipt": {
+    "sourceHead": "b8782ef66d78611cf916356d0fcaaffdb31e9a6d",
+    "productTrees": {
+      "MaiChat": "090bda434f1bbea8a67b01f37f61ba78e8045db3",
+      "MaiAgent": "b1698e10ee4494a925a7e0e69fdf50de4ec893ff"
+    },
+    "normalUserApp": true,
+    "bundle": "com.kongshang.maichat",
+    "configuration": "Release arm64 iPhoneOS; normal flags/no fixture arguments",
+    "versionBefore": "2.2.4",
+    "buildBefore": "203",
+    "versionAfter": "2.2.4",
+    "buildAfter": "204",
+    "buildExit": 0,
+    "buildExeSHA256": "5dcaa7656d1086c24186f7af2ae76a984b6444b0974c84711a23fdf3188449ea",
+    "signatureDeepStrictExit": 0,
+    "upgradeEntitlementCompatibility": {
+      "application-identifier": true,
+      "com.apple.developer.team-identifier": true,
+      "keychain-access-groups": true,
+      "com.apple.security.application-groups": true,
+      "com.apple.developer.icloud-container-identifiers": true,
+      "com.apple.developer.ubiquity-kvstore-identifier": true,
+      "com.apple.developer.icloud-services": true,
+      "aps-environment": true,
+      "com.apple.developer.applesignin": true
+    },
+    "installExit": 0,
+    "installSeconds": 56.243,
+    "uninstallUsed": false,
+    "userContainerReadOrExported": false,
+    "initialNormalLaunch": {
+      "exit": 0,
+      "pid": 47849,
+      "executableParentMatchesInstalledURL": true,
+      "containerPathSHA256": "82c73830eda157ef7edd9aaaef82ee58822185d076333717c46a72985e8f64f3",
+      "hashScope": "SHA256 of UTF8 decoded URL path, executable dirname / installed bundle URL, trailing slash removed",
+      "currentProcessPersistence": "not yet asserted after XCTest preflight"
+    },
+    "menuReadOnlyGate": "pending device unlock; not passed",
+    "sourceProductAndIndexClean": true,
+    "normalAppTestHooksExcluded": true
+  },
+  "shared_log_hash_manifest": {
+    "hashScopes": "Original hashes cover original raw bytes; shared hashes cover redacted UTF8 files. Do not compare a shared command string to an original-file hash.",
+    "files": [
+      {
+        "originalPrivateName": "device-release-build.log",
+        "originalPrivateBytes": 343555,
+        "originalPrivateSHA256": "0198a4baba939b4564dd1f16a3fd3e6546b33b932bb5f1d183a80497bf571679",
+        "sharedName": "device-release-build-redacted.log",
+        "sharedBytes": 343412,
+        "sharedSHA256": "effe25d80d67139df5658c0aa9dc8b8486007f3c02a2d2a29a141bc1d1242f98",
+        "redaction": "known device IDs, signing team/certificate identity, installed bundle container URL only; existing certificate subject"
+      },
+      {
+        "originalPrivateName": "normal-app-signature-verify.log",
+        "originalPrivateBytes": 233,
+        "originalPrivateSHA256": "d0b6d1a317e68ddb169a81e84c1b180eda3b1d77f515af7d4d3f029eead45f2c",
+        "sharedName": "normal-app-signature-verify-redacted.log",
+        "sharedBytes": 233,
+        "sharedSHA256": "d0b6d1a317e68ddb169a81e84c1b180eda3b1d77f515af7d4d3f029eead45f2c",
+        "redaction": "known device IDs, signing team/certificate identity, installed bundle container URL only; existing certificate subject"
+      },
+      {
+        "originalPrivateName": "device-install.log",
+        "originalPrivateBytes": 312,
+        "originalPrivateSHA256": "89b24990f147d5aee9769ba52b3aa7dbf858813d3acdc3eaf83463f56c42ba0e",
+        "sharedName": "device-install-redacted.log",
+        "sharedBytes": 237,
+        "sharedSHA256": "6b8ae90fb9ea4653b840aa201addcc9847afa09776c735b25026025352fc4093",
+        "redaction": "known device IDs, signing team/certificate identity, installed bundle container URL only; existing certificate subject"
+      },
+      {
+        "originalPrivateName": "normal-app-launch-v3.log",
+        "originalPrivateBytes": 67,
+        "originalPrivateSHA256": "4f68496be7aac424002b0c82aae8a8d95a727c4688926193afe4bceff3227167",
+        "sharedName": "normal-app-launch-v3-redacted.log",
+        "sharedBytes": 67,
+        "sharedSHA256": "4f68496be7aac424002b0c82aae8a8d95a727c4688926193afe4bceff3227167",
+        "redaction": "known device IDs, signing team/certificate identity, installed bundle container URL only; existing certificate subject"
+      }
+    ]
+  },
+  "coordinator_verification": {
+    "received_files": [
+      {
+        "path": "device-release-build-redacted.log",
+        "bytes": 343412,
+        "sha256": "effe25d80d67139df5658c0aa9dc8b8486007f3c02a2d2a29a141bc1d1242f98"
+      },
+      {
+        "path": "normal-app-signature-verify-redacted.log",
+        "bytes": 233,
+        "sha256": "d0b6d1a317e68ddb169a81e84c1b180eda3b1d77f515af7d4d3f029eead45f2c"
+      },
+      {
+        "path": "device-install-redacted.log",
+        "bytes": 237,
+        "sha256": "6b8ae90fb9ea4653b840aa201addcc9847afa09776c735b25026025352fc4093"
+      },
+      {
+        "path": "normal-app-launch-v3-redacted.log",
+        "bytes": 67,
+        "sha256": "4f68496be7aac424002b0c82aae8a8d95a727c4688926193afe4bceff3227167"
+      }
+    ],
+    "receipt_sha256": "bc0c5b1f2dc4ab94499f06fb2c009b5a11fedb92be5107ee2105669dbb2aeb44",
+    "hash_manifest_sha256": "e46c39831e04033f97380668acb5061e324a98abc7c791e456e1e17874632c34",
+    "scope": "Verified received shared redacted bytes only. Original private bytes remain on Mac; not independently rehashed here.",
+    "menu": "pending device unlock; not passed",
+    "initial_pid": 47849,
+    "current_pid_still_alive": null,
+    "current_pid_scope": "Not asserted after preflight; no conclusion whether process persisted or exited."
+  },
+  "menu_status": {
+    "passed": false,
+    "reason": "Device preflight: Unlock iPhone to Continue",
+    "private_verifier_wait_stopped": true,
+    "stop_scope": "SIGINT to private verifier xcodebuild only, per collaborator status; normal App/data/install untouched",
+    "automatic_ui_wait_remaining": false,
+    "resume_scope": "Only read-only menu verification after user unlock; no reinstall"
+  },
+  "evidence_boundary": "Coordinator verified received shared file lengths/hashes, build/signature/install/launch text and source trees. Device version/PID/path binding/entitlement compatibility/exe SHA are collaborator receipt observations; original private files were not transferred."
+}
