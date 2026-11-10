@@ -219,6 +219,11 @@ public:
     // model 为空时保留宿主的完整目录，不表示某个实际模型已经支持全部结果类型。
     // 查询可跨会话并发调用，不得读取文件、加载模型、访问网络或改变工具状态。
     virtual bool isAvailableForModel(const std::string& model) const;
+
+    // 按实际主模型提供同一工具的精确声明。默认复用原 description/parametersSchema；
+    // 供应商路由工具可返回各自查询长度/参数，避免通用声明暗示另一供应商能力。
+    // 纯查询，不取凭据、不发网络；注册表先用 isAvailableForModel 检查可用性。
+    virtual MaiToolSpec specForModel(const std::string& model) const;
 };
 
 // 工具注册表。

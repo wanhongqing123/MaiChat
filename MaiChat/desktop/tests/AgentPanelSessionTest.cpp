@@ -667,6 +667,9 @@ private slots:
     void pastedVideoDraftSurvivesSessionSwitchAndReachesModel();
     void videoImportFinishesInItsOriginalSession();
     void actionPanelMatchesMobileModelAndPolicyFlow();
+    void mainModelChoicesStaySeparateFromReasoningEffort();
+    void mainModelValueFollowsTheSelectedSession();
+    void firstModelSelectionPreservesTheBlankPageDraft();
     void newAgentOutputDoesNotInterruptReadingHistory();
     void switchingSessionsShowsLatestMessage();
     void inlineMediaBubblesRespectMessageBoundary();
@@ -1166,6 +1169,7 @@ void AgentPanelSessionTest::answerFromAnotherSessionDoesNotLeakIn() {
 
 void AgentPanelSessionTest::actionPanelMatchesMobileModelAndPolicyFlow() {
     Harness harness;
+    QVERIFY(harness.controller->setModel(harness.mine, QStringLiteral("deepseek-flash")));
     harness.panel->setModelLabel(QStringLiteral("deepseek-flash"));
     harness.panel->setReasoningEffortLabel(QStringLiteral("high"));
     QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
@@ -1212,9 +1216,108 @@ void AgentPanelSessionTest::actionPanelMatchesMobileModelAndPolicyFlow() {
     QCOMPARE(selected.first().first().toString(), QStringLiteral("max"));
     MaiSession session;
     QVERIFY(harness.controller->agent().getSession(harness.mine.toStdString(), session));
-    QVERIFY(session.model.empty());
+    QCOMPARE(QString::fromStdString(session.model), QStringLiteral("deepseek-flash"));
     QVERIFY(harness.panel->applySelectedModel(QStringLiteral("glm-5.3-flash")));
     QVERIFY(harness.controller->agent().getSession(harness.mine.toStdString(), session));
+    QCOMPARE(QString::fromStdString(session.model), QStringLiteral("glm-5.3-flash"));
+}
+
+void AgentPanelSessionTest::mainModelChoicesStaySeparateFromReasoningEffort() {
+    Harness harness;
+    QVERIFY(harness.controller->setModel(harness.mine, QStringLiteral("deepseek-flash")));
+    harness.panel->setModelLabel(QStringLiteral("deepseek-flash"));
+    harness.panel->setReasoningEffortLabel(QStringLiteral("high"));
+    connect(
+        harness.panel.get(), &AgentChatPanel::modelChangeRequested, harness.panel.get(),
+        [&harness](const QString& model) { QVERIFY(harness.panel->applySelectedModel(model)); });
+    QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
+    auto* more = harness.panel->findChild<QPushButton*>(QStringLiteral("agentMoreActions"));
+    QVERIFY(more);
+    QTest::mouseClick(more, Qt::LeftButton);
+    auto* actions = harness.panel->findChild<QWidget*>(QStringLiteral("agentActionPanel"));
+    QVERIFY(actions && actions->isVisible());
+    auto* models = actions->findChild<QPushButton*>(QStringLiteral("agentModelSection"));
+    auto* effort = actions->findChild<QPushButton*>(QStringLiteral("agentEffortSection"));
+    QVERIFY2(models, "The main-model row must be available alongside reasoning effort.");
+    QVERIFY(effort);
+    QTest::mouseClick(effort, Qt::LeftButton);
+    auto* high = actions->findChild<QPushButton*>(QStringLiteral("agentEffortOption-high"));
+    QVERIFY(high && high->isVisible() && high->isChecked());
+    QTest::mouseClick(models, Qt::LeftButton);
+    QVERIFY(!high->isVisible());
+    const QStringList ids{QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
+                          QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")};
+    for (const QString& id : ids) {
+        auto* option = actions->findChild<QPushButton*>(QStringLiteral("agentModelOption-") + id);
+        QVERIFY2(option && option->isVisible(), qPrintable(id));
+        QCOMPARE(option->isChecked(), id == QStringLiteral("deepseek-flash"));
+    }
+    const QString capture = qEnvironmentVariable("MAICHAT_SESSION_MODEL_CAPTURE");
+    if (!capture.isEmpty()) {
+        QCoreApplication::processEvents();
+        QVERIFY(actions->grab().save(capture));
+    }
+    QSignalSpy modelChanged(harness.panel.get(), &AgentChatPanel::modelChangeRequested);
+    QSignalSpy effortChanged(harness.panel.get(), &AgentChatPanel::reasoningEffortChangeRequested);
+    auto* pro =
+        actions->findChild<QPushButton*>(QStringLiteral("agentModelOption-deepseek-v4-pro"));
+    QTest::mouseClick(pro, Qt::LeftButton);
+    QCOMPARE(modelChanged.count(), 1);
+    QCOMPARE(modelChanged.first().first().toString(), QStringLiteral("deepseek-v4-pro"));
+    QCOMPARE(effortChanged.count(), 0);
+    QVERIFY(!actions->isVisible());
+    MaiSession session;
+    QVERIFY(harness.controller->agent().getSession(harness.mine.toStdString(), session));
+    QCOMPARE(QString::fromStdString(session.model), QStringLiteral("deepseek-v4-pro"));
+    auto* value = actions->findChild<QLabel*>(QStringLiteral("agentModelValue"));
+    QVERIFY(value);
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+}
+
+void AgentPanelSessionTest::mainModelValueFollowsTheSelectedSession() {
+    Harness harness;
+    QVERIFY(harness.controller->setModel(harness.mine, QStringLiteral("glm-5.3-flash")));
+    QVERIFY(harness.controller->setModel(harness.other, QStringLiteral("deepseek-v4-pro")));
+    harness.panel->openSession(harness.mine);
+    auto* value = harness.panel->findChild<QLabel*>(QStringLiteral("agentModelValue"));
+    QVERIFY2(value, "The main-model value must be projected from the selected session.");
+    QCOMPARE(value->text(), QStringLiteral("glm-5.3-flash"));
+    harness.panel->openSession(harness.other);
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    harness.panel->openSession(harness.mine);
+    QCOMPARE(value->text(), QStringLiteral("glm-5.3-flash"));
+
+    // An explicit future-session default must not copy the just-selected page.
+    QVERIFY(harness.controller->setDefaultModel(QStringLiteral("deepseek-flash")));
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    harness.panel->openNewSessionInDirectory(workspace.path());
+    QVERIFY(harness.panel->sessionId() != harness.mine &&
+            harness.panel->sessionId() != harness.other);
+    QCOMPARE(value->text(), QStringLiteral("deepseek-flash"));
+    MaiSession first, other;
+    QVERIFY(harness.controller->agent().getSession(harness.mine.toStdString(), first));
+    QVERIFY(harness.controller->agent().getSession(harness.other.toStdString(), other));
+    QCOMPARE(QString::fromStdString(first.model), QStringLiteral("glm-5.3-flash"));
+    QCOMPARE(QString::fromStdString(other.model), QStringLiteral("deepseek-v4-pro"));
+}
+
+void AgentPanelSessionTest::firstModelSelectionPreservesTheBlankPageDraft() {
+    AgentController controller(std::make_unique<SilentModel>(), QString());
+    AgentChatPanel panel(controller);
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    panel.setDefaultWorkspaceDirectory(workspace.path());
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    QVERIFY(editor);
+    QVERIFY(panel.sessionId().isEmpty());
+    const QString draft = QStringLiteral("Unsent first-page draft before selecting a model");
+    editor->setPlainText(draft);
+    QVERIFY(panel.applySelectedModel(QStringLiteral("glm-5.3-flash")));
+    QVERIFY(!panel.sessionId().isEmpty());
+    QCOMPARE(editor->toPlainText(), draft);
+    MaiSession session;
+    QVERIFY(controller.agent().getSession(panel.sessionId().toStdString(), session));
     QCOMPARE(QString::fromStdString(session.model), QStringLiteral("glm-5.3-flash"));
 }
 
@@ -2945,6 +3048,7 @@ void AgentPanelSessionTest::pastedImageUsesTheSharedComposerAndReachesTheModel()
     panel.show();
     QVERIFY(QTest::qWaitForWindowExposed(&panel));
     const QString sessionId = controller.createSession(directory.path());
+    QVERIFY(controller.setModel(sessionId, QStringLiteral("glm-5.3-flash")));
     panel.openSession(sessionId);
 
     QTextEdit* editor = panel.findChild<QTextEdit*>();
@@ -2997,6 +3101,7 @@ void AgentPanelSessionTest::mediaImportDoesNotWaitForUnrelatedGlobalPoolWork() {
     panel.show();
     QVERIFY(QTest::qWaitForWindowExposed(&panel, 1000));
     const QString sessionId = controller.createSession(directory.path());
+    QVERIFY(controller.setModel(sessionId, QStringLiteral("glm-5.3-flash")));
     panel.openSession(sessionId);
     auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
     auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));

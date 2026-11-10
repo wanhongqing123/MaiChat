@@ -5,7 +5,8 @@
 
 #include <QUrl>
 
-#include "MaiOpenAiClient.h"
+#include "MaiCloudModelCatalog.h"
+#include "MaiRoutedModelClient.h"
 #include "MaiSystemProxy.h"
 
 namespace {
@@ -13,6 +14,12 @@ namespace {
 std::string toUtf8(const QString& value) {
     const QByteArray bytes = value.toUtf8();
     return std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()));
+}
+
+QString providerBaseUrl(const DesktopAccountModelClient::Config& config, const QString& provider) {
+    if (provider == QStringLiteral("glm")) return config.glmBaseUrl;
+    if (provider == QStringLiteral("deepseek")) return config.deepseekBaseUrl;
+    return {};
 }
 
 // 系统代理按目标 URL 查询，每次重定向也重新查询，遵守 PAC 和绕过规则。
@@ -41,45 +48,53 @@ bool resolveSystemModelProxy(const std::string& url, MaiModelProxy& result) {
 
 }  // namespace
 
-DesktopAccountModelClient::DesktopAccountModelClient(Config config) : config_(std::move(config)) {}
+DesktopAccountModelClient::DesktopAccountModelClient(Config config) : config_(std::move(config)) {
+    MaiRoutedModelConfig routed;
+    // 这里只列产品提供的型号，供应商、协议和能力统一来自 Core 目录。
+    // 每条 route 的凭据回调在 stream 时执行，不能捕获构造时的旧 Key。
+    for (const char* model : {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"}) {
+        const auto info = maiCloudModelInfo(model);
+        if (!info) continue;
+        const QString provider = QString::fromStdString(info->provider);
+        MaiModelRoute route;
+        route.modelNames = {info->model};
+        route.config.baseUrl = toUtf8(providerBaseUrl(config_, provider));
+        route.config.wire = info->wire;
+        route.config.contextLimits = [modelName = info->model, limits = info->contextLimits](const std::string& model) {
+            return model == modelName ? limits : MaiModelContextLimits{};
+        };
+        route.config.prepareImage = config_.prepareImage;
+        route.config.proxyResolver = config_.proxyResolver ? config_.proxyResolver : resolveSystemModelProxy;
+        route.apiKeyProvider = [provider, keyProvider = config_.keyProvider,
+                                baseConfigured = !route.config.baseUrl.empty()] {
+            return baseConfigured && keyProvider ? toUtf8(keyProvider(provider)) : std::string();
+        };
+        routed.routes.push_back(std::move(route));
+    }
+    routed_ = makeMaiRoutedModelClient(std::move(routed));
+}
 
 MaiWireApi DesktopAccountModelClient::wireApi() const {
-    return MaiWireApi::Responses;
+    return routed_->wireApi();
+}
+
+std::optional<MaiWireApi> DesktopAccountModelClient::wireApiForModel(const std::string& model) const {
+    return routed_->wireApiForModel(model);
 }
 
 MaiModelContextLimits DesktopAccountModelClient::contextLimits(const std::string& model) const {
-    // 容量查询不读取账号 Key、不发网络请求；每次按本会话选中的真实供应商地址查询。
-    if (model == "glm-5.3" || model == "glm-5.3-flash")
-        return maiOfficialModelContextLimits(toUtf8(config_.glmBaseUrl), model);
-    if (model == "deepseek-flash") return maiOfficialModelContextLimits(toUtf8(config_.deepseekBaseUrl), model);
-    return {};
+    return routed_->contextLimits(model);
+}
+
+bool DesktopAccountModelClient::isConfiguredForModel(const std::string& model) const {
+    const auto info = maiCloudModelInfo(model);
+    if (!info || !config_.keyProvider) return false;
+    const QString provider = QString::fromStdString(info->provider);
+    const QString baseUrl = providerBaseUrl(config_, provider);
+    return !baseUrl.isEmpty() && !config_.keyProvider(provider).isEmpty();
 }
 
 MaiError DesktopAccountModelClient::stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                                            const std::atomic<bool>& cancel) {
-    const QString model = QString::fromUtf8(request.model.c_str(), static_cast<int>(request.model.size()));
-    QString provider;
-    QString baseUrl;
-    if (model == QStringLiteral("glm-5.3") || model == QStringLiteral("glm-5.3-flash")) {
-        provider = QStringLiteral("glm");
-        baseUrl = config_.glmBaseUrl;
-    } else if (model == QStringLiteral("deepseek-flash")) {
-        provider = QStringLiteral("deepseek");
-        baseUrl = config_.deepseekBaseUrl;
-    } else {
-        return MaiError::make(MaiErrorCode::InvalidInput, "unsupported account model");
-    }
-    if (!config_.keyProvider || baseUrl.isEmpty())
-        return MaiError::make(MaiErrorCode::NotConfigured, "account model unavailable");
-    const QString key = config_.keyProvider(provider);
-    if (key.isEmpty()) return MaiError::make(MaiErrorCode::NotConfigured, "account model key unavailable");
-    MaiModelConfig config;
-    config.baseUrl = toUtf8(baseUrl);
-    config.apiKey = toUtf8(key);
-    config.wire = MaiWireApi::Responses;
-    config.prepareImage = config_.prepareImage;
-    config.proxyResolver = config_.proxyResolver ? config_.proxyResolver : resolveSystemModelProxy;
-    auto client = makeMaiModelClient(config);
-    if (!client) return MaiError::make(MaiErrorCode::Internal, "model client creation failed");
-    return client->stream(request, sink, cancel);
+    return routed_->stream(request, sink, cancel);
 }

@@ -721,23 +721,47 @@ struct AISessionSwitchUITestRoot: View {
 /// 正常 Root 的会话侧滑验收使用内存历史与独立 App 数据，不登录或请求付费模型。
 struct AISessionRevealUITestRoot: View {
     @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
+    @State private var started = false
+    @State private var modelChecksComplete = false
+    private var runsModelChecks: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test")
+    }
 
     var body: some View {
-        RootView()
+        Group {
+            if runsModelChecks && !modelChecksComplete {
+                // Protocol/state checks seed stored drafts directly. Mount the
+                // actual editor afterwards so its independent local text binding
+                // cannot act as a second writer during a model-layer scenario.
+                ProgressView("正在检查所属设备协议")
+            } else { RootView() }
+        }
             .environmentObject(appState)
             .safeAreaInset(edge: .top, spacing: 0) {
                 if AIPrimaryModelUITestSupport.isRequested { AIPrimaryModelUITestStatus() }
             }
             .onAppear {
+                guard !started else { return }
+                started = true
                 let owner = "session-reveal-ui-test"
                 appState.masterUserID = owner
                 appState.chatState = MasterChatState(ownerUserID: owner)
                 appState.hasCompletedInitialLogin = true
+                AIMobileHostToolProvider.shared.appState = appState
                 if AIPrimaryModelUITestSupport.isRequested {
                     // session-reveal 路由会跳过普通页面 appear；这里显式进入真实准备与轮询链。
                     // 不安装内存会话或生成替身，open/configure/send 仍由正式后端完成。
                     AIAssistantModel.shared.uiTestSupport.screenFrameAccountID = owner
                     AIAssistantModel.shared.appear()
+                    if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") {
+                        Task { @MainActor in
+                            await AIAssistantModel.shared.prepareFirstPage()
+                            AIAssistantModel.shared.disappear()
+                            await AIAssistantModel.shared.runSessionModelRemoteUITestChecks()
+                            modelChecksComplete = true
+                            AIAssistantModel.shared.appear()
+                        }
+                    }
                 } else { AIAssistantModel.shared.installSessionSwitchUITestFixture() }
             }
     }

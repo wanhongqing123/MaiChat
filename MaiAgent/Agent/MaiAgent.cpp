@@ -2,6 +2,8 @@
 // 主要入口：submit、pollSpecialistTasks、forwardSpecialistReply；负责提交操作和恢复异步任务结果。
 #include "MaiAgent.h"
 
+#include "MaiCloudModelCatalog.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -819,6 +821,7 @@ MaiResult<std::string> MaiAgent::spawnSubAgent(const std::string& parentSessionI
     // 这是「子只能比父弱」落到实处的第一条。
     child.directory = parent.directory;
     child.model = parent.model;
+    child.reasoningEffort = parent.reasoningEffort;
     child.agent = parent.agent;
     child.parentId = parentSessionId;
     child.depth = parent.depth + 1;
@@ -1013,11 +1016,17 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
             using T = std::decay_t<decltype(operation)>;
 
             if constexpr (std::is_same_v<T, MaiCreateSession>) {
+                if (!maiIsValidReasoningEffort(operation.reasoningEffort))
+                    return {MaiErrorCode::InvalidInput, "Unsupported reasoning effort."};
+                if (!operation.model.empty() && mRuntime->model &&
+                    !mRuntime->model->wireApiForModel(operation.model))
+                    return {MaiErrorCode::InvalidInput, "The selected model is not configured."};
                 MaiSession session;
                 session.id = MaiIdGenerator::newSessionId();
                 session.directory = operation.directory;
                 session.title = operation.title.empty() ? kMaiDefaultSessionTitle : operation.title;
                 session.model = operation.model;
+                session.reasoningEffort = operation.reasoningEffort;
                 session.created = MaiTime::getCurrentTime();
                 session.updated = session.created;
                 mRuntime->store->putSession(session);
@@ -1031,8 +1040,21 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                     const auto valid = maiValidateSessionTitle(operation.title);
                     if (valid) return valid;
                 }
+                // 所有策略先校验再进入同一次 mutation，非法 effort 不能顺带改掉标题或模型。
+                if (operation.reasoningEffort &&
+                    !maiIsValidReasoningEffort(*operation.reasoningEffort))
+                    return {MaiErrorCode::InvalidInput, "Unsupported reasoning effort."};
+                if (!operation.model.empty() && mRuntime->model &&
+                    !mRuntime->model->wireApiForModel(operation.model))
+                    return {MaiErrorCode::InvalidInput, "The selected model is not configured."};
                 std::string title;
                 bool changed = false;
+                std::unique_lock<std::mutex> runtimeLock(mRuntime->mutex);
+                if ((!operation.model.empty() || operation.reasoningEffort.has_value()) &&
+                    (mRuntime->active.count(operation.sessionId) ||
+                     mRuntime->startingSessions.count(operation.sessionId)))
+                    return {MaiErrorCode::Busy,
+                            "Stop the target session before changing its model or effort."};
                 const bool found =
                     mRuntime->store->mutateSession(operation.sessionId, [&](MaiSession& session) {
                         // 标题与显式命名标记在同一次存储 mutation 中写入；Titler 的锁内复查
@@ -1045,6 +1067,11 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                         }
                         if (!operation.model.empty() && session.model != operation.model) {
                             session.model = operation.model;
+                            changed = true;
+                        }
+                        if (operation.reasoningEffort &&
+                            session.reasoningEffort != *operation.reasoningEffort) {
+                            session.reasoningEffort = *operation.reasoningEffort;
                             changed = true;
                         }
                         if (!operation.agent.empty() && session.agent != operation.agent) {
@@ -1063,6 +1090,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 const auto persisted = mRuntime->store->lastWriteError();
                 if (persisted) return persisted;
                 if (!changed) return operation.sessionId;
+                runtimeLock.unlock();
                 mRuntime->emitter.emitSession(MaiEventType::SessionUpdated, operation.sessionId,
                                               title);
                 return operation.sessionId;

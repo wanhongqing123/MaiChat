@@ -8,6 +8,7 @@
 #include "ui/DesktopAudioPlayback.h"
 #include "ui/DesktopMusicPlayerDialog.h"
 #include "MaiVideoCircleClient.h"
+#include "MaiCloudModelCatalog.h"
 
 #include <QAbstractTextDocumentLayout>
 #include <QAction>
@@ -1375,8 +1376,12 @@ struct AgentChatPanel::Runtime : AgentChatPanel::ConversationState {
     QLabel* contextSize = nullptr;
     QPushButton* modelChip = nullptr;
     QPushButton* modelSection = nullptr;
-    QPushButton* policySection = nullptr;
     QLabel* modelSectionValue = nullptr;
+    QWidget* modelOptions = nullptr;
+    QList<QPushButton*> modelOptionButtons;
+    QPushButton* effortSection = nullptr;
+    QPushButton* policySection = nullptr;
+    QLabel* effortSectionValue = nullptr;
     QLabel* policySectionValue = nullptr;
     QLabel* workspaceSectionValue = nullptr;
     QPushButton* moreButton = nullptr;
@@ -1384,9 +1389,9 @@ struct AgentChatPanel::Runtime : AgentChatPanel::ConversationState {
     bool videoCircleAvailable = false;
     bool cloudDriveAvailable = false;
     QWidget* actionPanel = nullptr;
-    QWidget* modelOptions = nullptr;
+    QWidget* effortOptions = nullptr;
     QWidget* policyOptions = nullptr;
-    QList<QPushButton*> modelOptionButtons;
+    QList<QPushButton*> effortOptionButtons;
     QList<QPushButton*> policyOptionButtons;
     MarkdownView* view = nullptr;
     QPushButton* olderMessages = nullptr;
@@ -1798,9 +1803,10 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         *currentValue = value;
         return row;
     };
-    auto* modelSection = makeSummary(QStringLiteral("agentEffortSection"), QStringLiteral("思考强度"),
-                                     QStringLiteral("标准"), &runtime_->modelSectionValue);
+    auto* modelSection = makeSummary(QStringLiteral("agentModelSection"), QStringLiteral("主模型"),
+                                     QStringLiteral("未选择"), &runtime_->modelSectionValue);
     runtime_->modelSection = modelSection;
+    runtime_->modelSectionValue->setObjectName(QStringLiteral("agentModelValue"));
     actionLayout->addWidget(modelSection);
     auto* modelOptions = new QWidget(actionPanel);
     runtime_->modelOptions = modelOptions;
@@ -1808,11 +1814,52 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     auto* modelOptionsLayout = new QVBoxLayout(modelOptions);
     modelOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
     modelOptionsLayout->setSpacing(0);
+    for (const QString& model :
+         {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
+          QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")}) {
+        auto* option = new QPushButton(model, modelOptions);
+        option->setObjectName(QStringLiteral("agentModelOption-") + model);
+        option->setProperty("model", model);
+        option->setCheckable(true);
+        option->setAutoExclusive(true);
+        option->setFixedHeight(UiZoom::s(38));
+        UiZoom::setStyle(
+            option, QStringLiteral(
+                        "QPushButton{padding-left:20px;text-align:left;background:#f5f8fc;}"
+                        "QPushButton:hover{background:#e8f2fc;}"
+                        "QPushButton:checked{background:#e6f2ff;color:#0a65ad;font-weight:600;}"));
+        modelOptionsLayout->addWidget(option);
+        runtime_->modelOptionButtons.append(option);
+        connect(option, &QPushButton::clicked, this, [this, actionPanel, model] {
+            actionPanel->hide();
+            // 先持久化再更新选中值；Key 缺失或 busy 不得留下乐观选中的假状态。
+            refreshModelConfiguration();
+            emit modelChangeRequested(model);
+        });
+    }
+    actionLayout->addWidget(modelOptions);
+    modelOptions->hide();
+    auto* modelDivider = new QFrame(actionPanel);
+    modelDivider->setFrameShape(QFrame::HLine);
+    modelDivider->setStyleSheet(QStringLiteral("color:#edf1f5;"));
+    actionLayout->addWidget(modelDivider);
+
+    auto* effortSection =
+        makeSummary(QStringLiteral("agentEffortSection"), QStringLiteral("思考强度"),
+                    QStringLiteral("标准"), &runtime_->effortSectionValue);
+    runtime_->effortSection = effortSection;
+    actionLayout->addWidget(effortSection);
+    auto* effortOptions = new QWidget(actionPanel);
+    runtime_->effortOptions = effortOptions;
+    UiZoom::setStyle(effortOptions, QStringLiteral("background:#f5f8fc;border-radius:8px;"));
+    auto* effortOptionsLayout = new QVBoxLayout(effortOptions);
+    effortOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
+    effortOptionsLayout->setSpacing(0);
     const QList<QPair<QString, QString>> efforts = {{QStringLiteral("简单"), QStringLiteral("low")},
                                                     {QStringLiteral("标准"), QStringLiteral("high")},
                                                     {QStringLiteral("深度"), QStringLiteral("max")}};
     for (const auto& effort : efforts) {
-        auto* option = new QPushButton(effort.first, modelOptions);
+        auto* option = new QPushButton(effort.first, effortOptions);
         option->setObjectName(QStringLiteral("agentEffortOption-") + effort.second);
         option->setProperty("reasoningEffort", effort.second);
         option->setCheckable(true);
@@ -1822,15 +1869,16 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
                          QStringLiteral("QPushButton{padding-left:20px;text-align:left;background:#f5f8fc;}"
                                         "QPushButton:hover{background:#e8f2fc;}"
                                         "QPushButton:checked{background:#e6f2ff;color:#0a65ad;font-weight:600;}"));
-        modelOptionsLayout->addWidget(option);
-        runtime_->modelOptionButtons.append(option);
+        effortOptionsLayout->addWidget(option);
+        runtime_->effortOptionButtons.append(option);
         connect(option, &QPushButton::clicked, this, [this, actionPanel, effort] {
             actionPanel->hide();
+            refreshModelConfiguration();
             emit reasoningEffortChangeRequested(effort.second);
         });
     }
-    actionLayout->addWidget(modelOptions);
-    modelOptions->hide();
+    actionLayout->addWidget(effortOptions);
+    effortOptions->hide();
     auto* effortDivider = new QFrame(actionPanel);
     effortDivider->setFrameShape(QFrame::HLine);
     effortDivider->setStyleSheet(QStringLiteral("color:#edf1f5;"));
@@ -1906,18 +1954,30 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         }
         actionPanel->move(position);
     };
-    connect(modelSection, &QPushButton::clicked, this, [modelOptions, policyOptions, positionPopup] {
-        const bool expand = !modelOptions->isVisible();
-        policyOptions->hide();
-        modelOptions->setVisible(expand);
-        positionPopup();
-    });
-    connect(policySection, &QPushButton::clicked, this, [modelOptions, policyOptions, positionPopup] {
-        const bool expand = !policyOptions->isVisible();
-        modelOptions->hide();
-        policyOptions->setVisible(expand);
-        positionPopup();
-    });
+    connect(modelSection, &QPushButton::clicked, this,
+            [modelOptions, effortOptions, policyOptions, positionPopup] {
+                const bool expand = !modelOptions->isVisible();
+                effortOptions->hide();
+                policyOptions->hide();
+                modelOptions->setVisible(expand);
+                positionPopup();
+            });
+    connect(effortSection, &QPushButton::clicked, this,
+            [modelOptions, effortOptions, policyOptions, positionPopup] {
+                const bool expand = !effortOptions->isVisible();
+                modelOptions->hide();
+                policyOptions->hide();
+                effortOptions->setVisible(expand);
+                positionPopup();
+            });
+    connect(policySection, &QPushButton::clicked, this,
+            [modelOptions, effortOptions, policyOptions, positionPopup] {
+                const bool expand = !policyOptions->isVisible();
+                modelOptions->hide();
+                effortOptions->hide();
+                policyOptions->setVisible(expand);
+                positionPopup();
+            });
     connect(moreButton, &QPushButton::clicked, this, [actionPanel, positionPopup] {
         if (actionPanel->isVisible())
             actionPanel->hide();
@@ -2181,6 +2241,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
         // 列表展示所有会话。后台会话改名也要刷新，不能因用户已经切走而遗漏；
         // 当前页的标题和消息仍由各自的会话过滤处理。
         emit sessionListChanged();
+        refreshModelConfiguration();
     });
     connect(&controller, &AgentController::sessionStructureChanged, this, [this] {
         for (const QString& saved : runtime_->savedConversations.keys()) {
@@ -2202,6 +2263,7 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
             }
         }
         emit sessionListChanged();
+        refreshModelConfiguration();
     });
 }
 
@@ -2228,6 +2290,15 @@ void AgentChatPanel::setModelLabel(const QString& model, bool configured) {
     runtime_->modelChip->setText(model);
     runtime_->modelConfigured = configured && model != QStringLiteral("未配置模型") && !model.trimmed().isEmpty();
     runtime_->modelChip->setEnabled(runtime_->modelConfigured && !runtime_->running);
+    if (runtime_->modelSectionValue) runtime_->modelSectionValue->setText(model);
+    if (runtime_->modelSection)
+        runtime_->modelSection->setAccessibleName(QStringLiteral("主模型：%1").arg(model));
+    for (QPushButton* option : runtime_->modelOptionButtons) {
+        // 自定义/本地型号不属于云选项时，旧云选中状态也必须清掉。
+        option->setAutoExclusive(false);
+        option->setChecked(option->property("model").toString() == model);
+        option->setAutoExclusive(true);
+    }
 }
 
 void AgentChatPanel::setReasoningEffortLabel(const QString& effort) {
@@ -2236,9 +2307,10 @@ void AgentChatPanel::setReasoningEffortLabel(const QString& effort) {
     const QString title = normalized == QStringLiteral("low")   ? QStringLiteral("简单")
                           : normalized == QStringLiteral("max") ? QStringLiteral("深度")
                                                                 : QStringLiteral("标准");
-    if (runtime_->modelSectionValue) runtime_->modelSectionValue->setText(title);
-    if (runtime_->modelSection) runtime_->modelSection->setAccessibleName(QStringLiteral("思考强度：%1").arg(title));
-    for (QPushButton* option : runtime_->modelOptionButtons) {
+    if (runtime_->effortSectionValue) runtime_->effortSectionValue->setText(title);
+    if (runtime_->effortSection)
+        runtime_->effortSection->setAccessibleName(QStringLiteral("思考强度：%1").arg(title));
+    for (QPushButton* option : runtime_->effortOptionButtons) {
         const QString value = option->property("reasoningEffort").toString();
         option->setChecked(value == normalized);
     }
@@ -2246,14 +2318,24 @@ void AgentChatPanel::setReasoningEffortLabel(const QString& effort) {
 
 bool AgentChatPanel::applySelectedModel(const QString& model) {
     const QString selected = model.trimmed();
-    const bool applied = runtime_->sessionId.isEmpty() ? runtime_->controller->setDefaultModel(selected)
-                                                       : runtime_->controller->setModel(runtime_->sessionId, selected);
+    if (runtime_->sessionId.isEmpty()) openSession();
+    const bool applied =
+        !runtime_->sessionId.isEmpty() &&
+        runtime_->controller->setSessionModelConfiguration(runtime_->sessionId, selected);
     if (!applied) {
         appendNotice(runtime_->controller->lastError(), true);
         return false;
     }
-    setModelLabel(selected);
+    refreshModelConfiguration();
     return true;
+}
+
+void AgentChatPanel::refreshModelConfiguration() {
+    AgentController::SessionModelConfiguration configuration;
+    if (!runtime_->controller->sessionModelConfiguration(runtime_->sessionId, configuration))
+        return;
+    setModelLabel(configuration.model, configuration.configured);
+    setReasoningEffortLabel(configuration.reasoningEffort);
 }
 
 void AgentChatPanel::setOpenVideoCallback(std::function<void(const QString&, const QStringList&)> callback) {
@@ -2355,6 +2437,10 @@ void AgentChatPanel::updateApprovalPolicyUi() {
 }
 
 void AgentChatPanel::openSession(const QString& sessionId) {
+    openSessionInternal(sessionId, false);
+}
+
+void AgentChatPanel::openSessionInternal(const QString& sessionId, bool keepBlankDraft) {
     if (sessionId.isEmpty()) {
         const QString directory = defaultWorkspaceDirectory(defaultWorkspaceDirectory_, defaultWorkspaceConfigured_);
         if (directory.isEmpty()) {
@@ -2365,6 +2451,7 @@ void AgentChatPanel::openSession(const QString& sessionId) {
         return;
     }
     const QString nextSession = sessionId;
+    const bool adoptingBlankDraft = keepBlankDraft && runtime_->sessionId.isEmpty();
     ++runtime_->historyGeneration;
     std::shared_ptr<ConversationState> retained;
     if (runtime_->sessionId != nextSession) {
@@ -2382,8 +2469,10 @@ void AgentChatPanel::openSession(const QString& sessionId) {
                                                 QTextDocumentFragment(runtime_->editor->document()));
         }
         runtime_->sessionId = nextSession;
-        runtime_->editor->clear();
-        if (runtime_->composerDrafts.contains(nextSession)) {
+        // 首次在空白页选模型/强度属于这份草稿的会话初始化，保留同一 document、
+        // 光标、附件标记和 undo 栈；不能先 clear 再重建一份看似相同的文字。
+        if (!adoptingBlankDraft) runtime_->editor->clear();
+        if (!adoptingBlankDraft && runtime_->composerDrafts.contains(nextSession)) {
             QTextCursor cursor = runtime_->editor->textCursor();
             cursor.insertFragment(runtime_->composerDrafts.take(nextSession));
             cursor.movePosition(QTextCursor::End);
@@ -2416,6 +2505,7 @@ void AgentChatPanel::openSession(const QString& sessionId) {
     else
         refreshConversationFromStore(session);
     refreshComposerMediaTray();
+    refreshModelConfiguration();
 }
 
 void AgentChatPanel::setDefaultWorkspaceDirectory(const QString& directory) {
@@ -2471,13 +2561,7 @@ void AgentChatPanel::createSessionInDirectory(const QString& directory) {
         appendNotice(runtime_->controller->lastError(), true);
         return;
     }
-    const QString preferredModel = runtime_->modelChip->text();
-    if (preferredModel == QStringLiteral("glm-5.3") || preferredModel == QStringLiteral("glm-5.3-flash") ||
-        preferredModel == QStringLiteral("deepseek-flash")) {
-        if (!runtime_->controller->setModel(sessionId, preferredModel))
-            appendNotice(runtime_->controller->lastError(), true);
-    }
-    openSession(sessionId);
+    openSessionInternal(sessionId, true);
 }
 
 // ── 重画 ────────────────────────────────────────────────────────
@@ -4269,10 +4353,17 @@ void AgentChatPanel::onSend() {
         emit modelConfigurationRequested();
         return;
     }
-    if (!imagePaths.isEmpty() &&
-        runtime_->modelChip->text().compare(QStringLiteral("glm-5.3"), Qt::CaseInsensitive) == 0) {
-        appendNotice(QStringLiteral("glm-5.3 仅支持文本，请先切换到 glm-5.3-flash。"), true);
-        return;
+    if (!imagePaths.isEmpty()) {
+        AgentController::SessionModelConfiguration configuration;
+        if (runtime_->controller->sessionModelConfiguration(runtime_->sessionId, configuration)) {
+            const auto info = maiCloudModelInfo(toUtf8(configuration.model));
+            if (info && !info->supportsImages) {
+                appendNotice(QStringLiteral("%1 仅支持文本，请先切换到支持图片的模型。")
+                                 .arg(configuration.model),
+                             true);
+                return;
+            }
+        }
     }
 
     const QString quotedMessageId = runtime_->quotedMessageId;

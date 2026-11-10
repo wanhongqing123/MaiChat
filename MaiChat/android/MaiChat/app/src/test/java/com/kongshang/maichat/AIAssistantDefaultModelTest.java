@@ -14,5 +14,7 @@ public final class AIAssistantDefaultModelTest {
             AIAssistantController.supportedModelOrDefault("glm-5.3-flash"));
         assertEquals("deepseek-flash",
             AIAssistantController.supportedModelOrDefault("deepseek-flash"));
+        assertEquals("deepseek-v4-pro",
+            AIAssistantController.supportedModelOrDefault("deepseek-v4-pro"));
     }
 }

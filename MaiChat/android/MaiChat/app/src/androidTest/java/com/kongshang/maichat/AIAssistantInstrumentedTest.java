@@ -866,6 +866,67 @@ public class AIAssistantInstrumentedTest {
         }
     }
 
+    @Test public void mainModelChoicesUseTheExistingInlinePopup() throws Exception {
+        try (ActivityScenario<AIAssistantTestActivity> scenario =
+                 ActivityScenario.launch(AIAssistantTestActivity.class)) {
+            await(scenario, panel -> panel.controller.state.ready);
+            scenario.onActivity(activity ->
+                assertTrue(findDescription(activity.panel, "更多").performClick()));
+            assertTrue(clickNodeOrParent(awaitExactSystemText("主模型", 3_000)));
+            for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
+                assertNotNull("Missing exact main-model choice: " + model,
+                    awaitExactSystemText(model, 3_000));
+            assertNotNull(awaitExactSystemText("本地模型", 3_000));
+            assertNull(awaitExactSystemText("简单", 300));
+            Bitmap screenshot = InstrumentationRegistry.getInstrumentation().getUiAutomation().takeScreenshot();
+            assertNotNull(screenshot);
+            File output = new File(InstrumentationRegistry.getInstrumentation().getTargetContext()
+                .getFilesDir(), "android-main-model-menu.png");
+            try (FileOutputStream stream = new FileOutputStream(output)) {
+                assertTrue(screenshot.compress(Bitmap.CompressFormat.PNG, 100, stream));
+            } finally { screenshot.recycle(); }
+            assertTrue(clickNodeOrParent(awaitExactSystemText("思考强度", 3_000)));
+            assertNotNull(awaitExactSystemText("简单", 3_000));
+            assertNull(awaitExactSystemText("glm-5.3", 300));
+        }
+    }
+
+    @Test public void remoteViewerMenuUsesTheVisibleOwnersCloudConfiguration() throws Exception {
+        try (ActivityScenario<AIAssistantTestActivity> scenario =
+                 ActivityScenario.launch(AIAssistantTestActivity.class)) {
+            await(scenario, panel -> panel.controller.state.ready);
+            // Render only an owned fixture through the normal View projection. This case does
+            // not impersonate a WebSocket receipt or claim a provider request was executed.
+            scenario.onActivity(activity -> {
+                try {
+                    JSONObject owner = new JSONObject().put("id", "remote-model-fixture")
+                        .put("device_slot", "mac").put("login_session_id", "fixture-login")
+                        .put("device_name", "Fixture Mac").put("online", true).put("busy", false)
+                        .put("model", "glm-5.3-flash").put("reasoningEffort", "low")
+                        .put("wire", "chat_completions");
+                    JSONObject data = new JSONObject().put("messages", new org.json.JSONArray())
+                        .put("sessions", new org.json.JSONArray().put(owner));
+                    activity.panel.onState(new AIAssistantController.State(data, owner,
+                        "remote-model-fixture", "", "deepseek-flash", "on-request", "", "", "", 0,
+                        false, true));
+                    activity.panel.composer.setText("fixture remote draft");
+                    assertTrue(findDescription(activity.panel, "更多").performClick());
+                } catch (Exception failure) { throw new AssertionError(failure); }
+            });
+            assertTrue(clickNodeOrParent(awaitExactSystemText("主模型", 3_000)));
+            for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
+                assertNotNull(awaitExactSystemText(model, 3_000));
+            assertNull(awaitExactSystemText("本地模型", 300));
+            assertNull(awaitExactSystemText("操作权限", 300));
+            assertNull(awaitExactSystemText("清空当前对话", 300));
+            assertTrue(clickNodeOrParent(awaitExactSystemText("思考强度", 3_000)));
+            assertNotNull(awaitExactSystemText("简单", 3_000));
+            assertNull(awaitExactSystemText("glm-5.3", 300));
+            scenario.onActivity(activity -> assertEquals("fixture remote draft",
+                activity.panel.composer.getText().toString()));
+        }
+    }
+
     @Test public void deepSeekEffortMenuHidesModelPicker() throws Exception {
         try (ActivityScenario<AIAssistantTestActivity> scenario =
                  ActivityScenario.launch(AIAssistantTestActivity.class)) {

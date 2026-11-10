@@ -7,6 +7,12 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 public class AIAssistantMediaPolicyTest {
+    @Test public void deepseekProIsTextOnlyWhileBothFlashModelsAcceptImages() {
+        assertFalse(AIAssistantMediaPolicy.supportsImages("deepseek-v4-pro"));
+        assertTrue(AIAssistantMediaPolicy.supportsImages("deepseek-flash"));
+        assertTrue(AIAssistantMediaPolicy.supportsImages("glm-5.3-flash"));
+    }
+
     @Test public void recognizesVisualModelsAndSupportedImageTypes() {
         assertFalse(AIAssistantMediaPolicy.supportsImages("glm-5.3"));
         assertTrue(AIAssistantMediaPolicy.supportsImages("glm-5.3-flash"));

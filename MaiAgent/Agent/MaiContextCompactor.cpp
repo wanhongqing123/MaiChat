@@ -336,7 +336,8 @@ MaiModelRequest summaryRequest(const MaiModelRequest& original, const std::strin
                                const Json& fragments, std::size_t outputTokens) {
     MaiModelRequest request;
     request.model = original.model;
-    request.reasoningEffort = "low";
+    // 当前轮已有显式 effort 时摘要沿用同一快照，不再暗中降级；未指定时保留原低开销默认。
+    request.reasoningEffort = original.reasoningEffort.empty() ? "low" : original.reasoningEffort;
     request.baseInstructions = kSummarizeInstructions;
     request.workingDirectory = original.workingDirectory;
     request.maxOutputTokens = outputTokens;

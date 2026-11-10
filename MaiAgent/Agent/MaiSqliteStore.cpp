@@ -169,7 +169,7 @@ public:
         std::lock_guard<std::mutex> lock(mMutex);
         sqlite3_stmt* statement = prepareLocked(
             "SELECT id, title, directory, model, agent, created, updated, parent_id, depth, "
-            "title_edited "
+            "title_edited, reasoning_effort "
             "FROM sessions WHERE id = ?1");
         if (!statement) return false;
         Reset guard(statement);
@@ -184,7 +184,7 @@ public:
         std::vector<MaiSession> out;
         sqlite3_stmt* statement = prepareLocked(
             "SELECT id, title, directory, model, agent, created, updated, parent_id, depth, "
-            "title_edited "
+            "title_edited, reasoning_effort "
             "FROM sessions ORDER BY updated DESC, id DESC");
         if (!statement) return out;
         Reset guard(statement);
@@ -893,7 +893,7 @@ public:
         bool found = false;
         sqlite3_stmt* statement = prepareLocked(
             "SELECT id, title, directory, model, agent, created, updated, parent_id, depth, "
-            "title_edited "
+            "title_edited, reasoning_effort "
             "FROM sessions WHERE id = ?1");
         if (statement) {
             Reset guard(statement);
@@ -936,6 +936,7 @@ private:
         session.parentId = textColumn(statement, 7);
         session.depth = sqlite3_column_int(statement, 8);
         session.titleEdited = sqlite3_column_int(statement, 9) != 0;
+        session.reasoningEffort = textColumn(statement, 10);
         session.created = sqlite3_column_int64(statement, 5);
         session.updated = sqlite3_column_int64(statement, 6);
         return session;
@@ -967,11 +968,11 @@ private:
     void writeSessionLocked(const MaiSession& session) {
         sqlite3_stmt* statement = prepareLocked(
             "INSERT INTO sessions(id, title, directory, model, agent, created, updated, "
-            "                     parent_id, depth, title_edited) "
-            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) "
+            "                     parent_id, depth, title_edited, reasoning_effort) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) "
             "ON CONFLICT(id) DO UPDATE SET title=excluded.title, directory=excluded.directory, "
             "model=excluded.model, agent=excluded.agent, updated=excluded.updated, "
-            "title_edited=excluded.title_edited");
+            "title_edited=excluded.title_edited, reasoning_effort=excluded.reasoning_effort");
         if (!statement) return;
         Reset guard(statement);
         bindText(statement, 1, session.id);
@@ -982,6 +983,7 @@ private:
         bindText(statement, 8, session.parentId);
         sqlite3_bind_int(statement, 9, session.depth);
         sqlite3_bind_int(statement, 10, session.titleEdited ? 1 : 0);
+        bindText(statement, 11, session.reasoningEffort);
         sqlite3_bind_int64(statement, 6, session.created);
         sqlite3_bind_int64(statement, 7, session.updated);
         executePreparedStatement(statement);
@@ -1472,6 +1474,40 @@ MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
             sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
             sqlite3_close(database);
             return {MaiErrorCode::Internal, "cannot migrate schema to v9: " + what};
+        }
+        sqlite3_free(migrationError);
+    }
+    if (readUserVersion(database) < 10) {
+        // 写锁内复查列，允许另一个连接先完成迁移；只追加会话策略，原消息/检查点不改。
+        char* migrationError = nullptr;
+        bool ok = sqlite3_exec(database, "BEGIN IMMEDIATE", nullptr, nullptr, &migrationError) ==
+                  SQLITE_OK;
+        bool hasEffort = false;
+        sqlite3_stmt* columns = nullptr;
+        if (ok)
+            ok = sqlite3_prepare_v2(database, "PRAGMA table_info(sessions)", -1, &columns,
+                                    nullptr) == SQLITE_OK;
+        if (ok) {
+            int status = SQLITE_ROW;
+            while ((status = sqlite3_step(columns)) == SQLITE_ROW)
+                if (textColumn(columns, 1) == "reasoning_effort") hasEffort = true;
+            ok = status == SQLITE_DONE;
+        }
+        sqlite3_finalize(columns);
+        if (ok && !hasEffort)
+            ok = sqlite3_exec(
+                     database,
+                     "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''",
+                     nullptr, nullptr, &migrationError) == SQLITE_OK;
+        if (ok)
+            ok = sqlite3_exec(database, "PRAGMA user_version=10;COMMIT;", nullptr, nullptr,
+                              &migrationError) == SQLITE_OK;
+        if (!ok) {
+            const std::string what = migrationError ? migrationError : sqlite3_errmsg(database);
+            sqlite3_free(migrationError);
+            sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
+            sqlite3_close(database);
+            return {MaiErrorCode::Internal, "cannot migrate schema to v10: " + what};
         }
         sqlite3_free(migrationError);
     }

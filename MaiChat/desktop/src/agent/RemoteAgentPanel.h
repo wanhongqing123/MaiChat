@@ -36,6 +36,13 @@ private:
     struct Runtime;
     std::unique_ptr<Runtime> runtime_;
     void refreshHistory();
+    void requestSessionModel();
+    void sendSessionModelCommand(const QJsonObject& command);
+    bool receiveSessionModelResult(const QJsonObject& owner, const QJsonObject& payload);
+    void showSessionModelFailure(const QString& ownerKey, const QString& message);
+    void invalidateReplacedModelOwner(const QJsonObject& owner);
+    void updateSessionModelControls();
+    void positionActionPanel();
     void requestHistory(const QString& before, int limit);
     void sendOrStop();
     bool persistOutbox();

@@ -15,6 +15,7 @@
 #include <QLabel>
 #include <QListWidget>
 #include <QScrollBar>
+#include <QScopeGuard>
 #include <QStyle>
 #include <QStyleOptionSlider>
 #include <QLayout>
@@ -252,6 +253,7 @@ private slots:
     void agentAccountKeysUpdateModelWithoutSavingSecrets();
     void agentDeepSeekKeyAloneConfiguresMainModel();
     void agentModelFailureRefreshesWithoutDialog();
+    void delayedModelCredentialsApplyOnlyToTheRequestedSession();
     void leftNavigationRailIsResizableAndWider();
     void navigationIconsSitNearTopEdge();
     void cloudDriveNavigationUsesMainPageInRequestedOrder();
@@ -3034,15 +3036,19 @@ void MainWindowLayoutTest::agentReasoningEffortKeepsConversation() {
     auto* option = panel->findChild<QPushButton*>(QStringLiteral("agentEffortOption-max"));
     QVERIFY(option);
     QTest::mouseClick(option, Qt::LeftButton);
-    QTRY_COMPARE_WITH_TIMEOUT(settings.value(QStringLiteral("agent/reasoningEffort")).toString(), QStringLiteral("max"),
-                              5000);
+    // 强度保存到本会话；账号默认、消息页、草稿和阅读位置都不随之改变。
+    MaiSession configured;
+    auto* controller = window.findChild<AgentController*>();
+    QVERIFY(controller && controller->agent().getSession(session.toStdString(), configured));
+    QCOMPARE(QString::fromStdString(configured.reasoningEffort), QStringLiteral("max"));
+    QVERIFY(!settings.contains(QStringLiteral("agent/reasoningEffort")));
     QCOMPARE(refreshed, 0);
     QCOMPARE(window.findChild<AgentChatPanel*>(), panel);
     QCOMPARE(panel->sessionId(), session);
     QCOMPARE(draft->toPlainText(), QStringLiteral("未发送的草稿"));
     QCOMPARE(view->verticalScrollBar()->value(), 37);
     QVERIFY(window.findChild<QDialog*>(QStringLiteral("agentModelDialog")) == nullptr);
-    QVERIFY(panel->findChild<QPushButton*>(QStringLiteral("agentModelOption-glm-5.3")) == nullptr);
+    QVERIFY(panel->findChild<QPushButton*>(QStringLiteral("agentModelOption-glm-5.3")) != nullptr);
     QVERIFY(window.findChild<AgentChatPanel*>() == panel);
     QCOMPARE(panel->sessionId(), session);
     QCOMPARE(draft->toPlainText(), QStringLiteral("未发送的草稿"));
@@ -3071,15 +3077,21 @@ void MainWindowLayoutTest::agentReasoningEffortBeforeFirstSessionKeepsDeepSeek()
     auto* panel = window.findChild<AgentChatPanel*>();
     QVERIFY(panel);
     QVERIFY(panel->sessionId().isEmpty());
+    auto* editor = panel->findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    QVERIFY(editor);
+    const QString draft = QStringLiteral("Unsent first-page draft before selecting effort");
+    editor->setPlainText(draft);
     QTest::mouseClick(panel->findChild<QPushButton*>(QStringLiteral("agentMoreActions")), Qt::LeftButton);
     QTest::mouseClick(panel->findChild<QPushButton*>(QStringLiteral("agentEffortSection")), Qt::LeftButton);
     QTest::mouseClick(panel->findChild<QPushButton*>(QStringLiteral("agentEffortOption-low")), Qt::LeftButton);
-    QCOMPARE(settings.value(QStringLiteral("agent/reasoningEffort")).toString(), QStringLiteral("low"));
-    QCOMPARE(panel->sessionId(), QString());
-    panel->openSession();
+    // 空白页第一次选择即建立自己的会话，不再更改所有会话的全局默认。
+    QVERIFY(!settings.contains(QStringLiteral("agent/reasoningEffort")));
+    QVERIFY(!panel->sessionId().isEmpty());
+    QCOMPARE(editor->toPlainText(), draft);
     MaiSession session;
     QVERIFY(window.findChild<AgentController*>()->agent().getSession(panel->sessionId().toStdString(), session));
     QCOMPARE(QString::fromStdString(session.model), QStringLiteral("deepseek-flash"));
+    QCOMPARE(QString::fromStdString(session.reasoningEffort), QStringLiteral("low"));
     settings.clear();
     QCoreApplication::setOrganizationName(oldOrganization);
     QCoreApplication::setApplicationName(oldApplication);
@@ -3158,10 +3170,91 @@ void MainWindowLayoutTest::agentDeepSeekKeyAloneConfiguresMainModel() {
     QCOMPARE(window.findChild<AgentChatPanel*>(), panel);
     QVERIFY(window.findChild<QDialog*>(QStringLiteral("agentModelDialog")) == nullptr);
     settings.sync();
-    QCOMPARE(settings.value(QStringLiteral("agent/reasoningEffort")).toString(), QStringLiteral("max"));
+    MaiSession configured;
+    QVERIFY(window.findChild<AgentController*>()->agent().getSession(
+        panel->sessionId().toStdString(), configured));
+    QCOMPARE(QString::fromStdString(configured.reasoningEffort), QStringLiteral("max"));
+    QVERIFY(!settings.contains(QStringLiteral("agent/reasoningEffort")));
     settings.clear();
     QCoreApplication::setOrganizationName(originalOrganization);
     QCoreApplication::setApplicationName(originalApplication);
+}
+
+void MainWindowLayoutTest::delayedModelCredentialsApplyOnlyToTheRequestedSession() {
+    const QString previousOrganization = QCoreApplication::organizationName();
+    const QString previousApplication = QCoreApplication::applicationName();
+    const bool previousTestMode = QStandardPaths::isTestModeEnabled();
+    QCoreApplication::setOrganizationName(QStringLiteral("MaiChatSessionModelTests"));
+    QCoreApplication::setApplicationName(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QStandardPaths::setTestModeEnabled(true);
+    const auto restore = qScopeGuard([previousOrganization, previousApplication, previousTestMode] {
+        QSettings ownSettings;
+        ownSettings.clear();
+        QCoreApplication::setOrganizationName(previousOrganization);
+        QCoreApplication::setApplicationName(previousApplication);
+        QStandardPaths::setTestModeEnabled(previousTestMode);
+    });
+    QSettings settings;
+    settings.setValue(QStringLiteral("agent/model"), QStringLiteral("legacy-model-choice"));
+    settings.sync();
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    RemoteIMApplication app(
+        QStringLiteral("model-fixture-") + QUuid::createUuid().toString(QUuid::WithoutBraces),
+        std::move(client));
+    MainWindow window(app);
+    window.setAccountModelKeys(
+        {{QStringLiteral("deepseek"), QStringLiteral("fixture-deepseek-key")}});
+    int refreshes = 0;
+    window.setModelKeyRefreshHandler([&] { ++refreshes; });
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* panel = window.findChild<AgentChatPanel*>();
+    auto* controller = window.findChild<AgentController*>();
+    QVERIFY(panel && controller);
+    const QString requestedSession = controller->createSession(workspace.path());
+    const QString subsequentlyVisibleSession = controller->createSession(workspace.path());
+    QVERIFY(!requestedSession.isEmpty() && !subsequentlyVisibleSession.isEmpty());
+    QVERIFY(controller->setModel(requestedSession, QStringLiteral("deepseek-flash")));
+    QVERIFY(controller->setModel(subsequentlyVisibleSession, QStringLiteral("deepseek-flash")));
+    panel->openSession(requestedSession);
+    QVERIFY(QMetaObject::invokeMethod(panel, "modelChangeRequested", Qt::DirectConnection,
+                                      Q_ARG(QString, QStringLiteral("glm-5.3-flash"))));
+    QCOMPARE(refreshes, 1);
+    panel->openSession(subsequentlyVisibleSession);
+    window.setAccountModelKeys(
+        {{QStringLiteral("deepseek"), QStringLiteral("fixture-deepseek-key")},
+         {QStringLiteral("glm"), QStringLiteral("fixture-glm-key")}});
+    MaiSession requested, visible;
+    QVERIFY(controller->agent().getSession(requestedSession.toStdString(), requested));
+    QVERIFY(controller->agent().getSession(subsequentlyVisibleSession.toStdString(), visible));
+    QVERIFY2(requested.model == "glm-5.3-flash" && visible.model == "deepseek-flash",
+             qPrintable(QStringLiteral("Requested session=%1; subsequently visible session=%2")
+                            .arg(QString::fromStdString(requested.model),
+                                 QString::fromStdString(visible.model))));
+    QCOMPARE(panel->sessionId(), subsequentlyVisibleSession);
+    auto* displayed = panel->findChild<QLabel*>(QStringLiteral("agentModelValue"));
+    QVERIFY(displayed);
+    QCOMPARE(displayed->text(), QStringLiteral("deepseek-flash"));
+
+    // A later explicit choice of the current model cancels the pending change.
+    window.setAccountModelKeys(
+        {{QStringLiteral("deepseek"), QStringLiteral("fixture-deepseek-key")}});
+    QVERIFY(QMetaObject::invokeMethod(panel, "modelChangeRequested", Qt::DirectConnection,
+                                      Q_ARG(QString, QStringLiteral("glm-5.3-flash"))));
+    QCOMPARE(refreshes, 2);
+    QVERIFY(QMetaObject::invokeMethod(panel, "modelChangeRequested", Qt::DirectConnection,
+                                      Q_ARG(QString, QStringLiteral("deepseek-flash"))));
+    window.setAccountModelKeys(
+        {{QStringLiteral("deepseek"), QStringLiteral("fixture-deepseek-key")},
+         {QStringLiteral("glm"), QStringLiteral("fixture-glm-key")}});
+    QVERIFY(controller->agent().getSession(subsequentlyVisibleSession.toStdString(), visible));
+    QCOMPARE(QString::fromStdString(visible.model), QStringLiteral("deepseek-flash"));
+    QCOMPARE(displayed->text(), QStringLiteral("deepseek-flash"));
+    settings.sync();
+    QCOMPARE(settings.value(QStringLiteral("agent/model")).toString(),
+             QStringLiteral("legacy-model-choice"));
 }
 
 void MainWindowLayoutTest::agentModelFailureRefreshesWithoutDialog() {

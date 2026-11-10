@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -26,6 +27,9 @@ enum class MaiWireApi {
     // 进程内模型复用同一消息/流式/工具契约，没有 HTTP 端点或 API Key。
     // 宿主必须通过 makeMaiLlamaModelClient 装配本地文件配置，远端工厂拒绝此项。
     Local,
+    // 仅用于组合客户端的目录描述，不是可发送的传输配置。
+    // 实际会话必须查询 wireApiForModel；远端工厂拒绝 Mixed，不能猜协议或回退供应商。
+    Mixed,
 };
 
 const char* maiWireApiToString(MaiWireApi wire);
@@ -303,6 +307,9 @@ public:
                             const std::atomic<bool>& cancel) = 0;
 
     virtual MaiWireApi wireApi() const = 0;
+    // 固定 wire 客户端默认返回 wireApi()；按型号路由的客户端对未知型号返回 nullopt。
+    // 纯查询，可并发调用，不取凭据、不访问网络或用户会话；返回值对应本次指定的型号。
+    virtual std::optional<MaiWireApi> wireApiForModel(const std::string& model) const;
     // 默认未知；没有覆盖的自定义客户端保留原文，不得假设一个通用容量。
     virtual MaiModelContextLimits contextLimits(const std::string& model) const;
     // 默认返回明确标为估计的本地计数；有真实 tokenizer 的实现可返回 exact=true。

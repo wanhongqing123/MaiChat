@@ -15,10 +15,12 @@
 #include <cmath>
 #include <cstddef>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <variant>
 
 #include "MaiQuestionTranscript.h"
+#include "MaiCloudModelCatalog.h"
 #include "agent/AgentController.h"
 #include "agent/DesktopSessionAttachments.h"
 
@@ -377,6 +379,51 @@ QJsonObject DesktopSessionSyncHost::applyCommand(const QString& sessionId, const
     MaiSession session;
     if (!controller_.agent().getSession(sessionId.toStdString(), session) || !session.isRoot())
         return failure(QStringLiteral("会话不存在"));
+    if (action == QStringLiteral("get_session") || action == QStringLiteral("set_model")) {
+        // 远端只能选择会话配置，不能把路径、密钥、endpoint 或代理带进宿主配置。
+        // 普通调用与远端命令复用 Controller 的原子校验和持久化入口。
+        const bool changing = action == QStringLiteral("set_model");
+        const QSet<QString> fields = changing
+            ? QSet<QString>{QStringLiteral("action"), QStringLiteral("requestId"),
+                            QStringLiteral("model"), QStringLiteral("reasoningEffort")}
+            : QSet<QString>{QStringLiteral("action"), QStringLiteral("requestId")};
+        for (auto field = payload.begin(); field != payload.end(); ++field)
+            if (!fields.contains(field.key())) return failure(QStringLiteral("会话模型参数无效"));
+        if (payload.contains(QStringLiteral("requestId")) &&
+            (!payload.value(QStringLiteral("requestId")).isString() ||
+             !QRegularExpression(QStringLiteral("^[A-Za-z0-9_-]{1,128}$"))
+                  .match(payload.value(QStringLiteral("requestId")).toString()).hasMatch()))
+            return failure(QStringLiteral("会话模型请求编号无效"));
+        if (changing) {
+            if (!payload.value(QStringLiteral("model")).isString() ||
+                (payload.contains(QStringLiteral("reasoningEffort")) &&
+                 !payload.value(QStringLiteral("reasoningEffort")).isString()))
+                return failure(QStringLiteral("会话模型参数无效"));
+            const auto model = payload.value(QStringLiteral("model")).toString();
+            // 固定 wire 的普通测试/嵌入客户端可以接受任意模型名；远端产品入口
+            // 仍须使用共享云目录，并把既有 local:* 的实际可用性留给宿主查询。
+            if (!maiCloudModelInfo(model.toUtf8().toStdString()) &&
+                !(model.startsWith(QStringLiteral("local:")) && model.size() > 6))
+                return failure(QStringLiteral("不支持的会话模型"));
+            std::optional<QString> effort;
+            if (payload.contains(QStringLiteral("reasoningEffort")))
+                effort = payload.value(QStringLiteral("reasoningEffort")).toString();
+            if (!controller_.setSessionModelConfiguration(sessionId, model, effort))
+                return failure(controller_.lastError());
+        }
+        AgentController::SessionModelConfiguration configuration;
+        if (!controller_.sessionModelConfiguration(sessionId, configuration))
+            return failure(QStringLiteral("无法读取会话模型配置"));
+        const auto wire = QString::fromLatin1(maiWireApiToString(configuration.wire));
+        if (wire != QStringLiteral("chat_completions") && wire != QStringLiteral("responses") &&
+            wire != QStringLiteral("local"))
+            return failure(QStringLiteral("会话模型路由尚未明确"));
+        return {{QStringLiteral("ok"), true},
+                {QStringLiteral("session"), sessionId},
+                {QStringLiteral("model"), configuration.model},
+                {QStringLiteral("reasoningEffort"), configuration.reasoningEffort},
+                {QStringLiteral("wire"), wire}};
+    }
     if (action == QStringLiteral("prompt") || action == QStringLiteral("steer")) {
         const bool steering = action == QStringLiteral("steer");
         const QString turn = payload.value(QStringLiteral("turnId")).toString();

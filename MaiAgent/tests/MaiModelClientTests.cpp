@@ -21,6 +21,8 @@
 #include <json.hpp>
 
 #include "MaiModelClient.h"
+#include "MaiRoutedModelClient.h"
+#include "MaiCloudModelCatalog.h"
 #include "MaiAgent.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
@@ -1612,43 +1614,146 @@ void test_responses_serializes_history_images_and_flat_tools() {
     MaiFileSystem::removeRecursively(root);
 }
 
-void test_deepseek_effort_levels_reach_responses_wire() {
-    FakeServer fake;
-    fake.script = sse(json{{"type", "response.completed"},
-                           {"response", {{"status", "completed"}, {"output", json::array()}}}});
-    fake.start();
-    for (const char* effort : {"low", "high", "max"}) {
-        MaiModelRequest request;
-        request.model = "deepseek-flash";
-        request.reasoningEffort = effort;
-        MaiModelMessage user;
-        user.role = MaiModelRole::User;
-        user.content = "Check effort";
-        request.messages.push_back(std::move(user));
-        CHECK(runAgainst(fake, request, MaiWireApi::Responses).done);
-        std::string wire;
-        {
-            std::lock_guard<std::mutex> lock(fake.mutex);
-            wire = fake.lastBody;
+// 官方型号矩阵：四个主聊天型号均支持 low/high/max；逐次核对实际发出的线格式。
+void test_cloud_effort_levels_reach_the_selected_wire() {
+    for (const MaiWireApi wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
+        FakeServer fake;
+        fake.script =
+            wire == MaiWireApi::Responses
+                ? sse(json{{"type", "response.completed"},
+                           {"response", {{"status", "completed"}, {"output", json::array()}}}})
+                : "data: [DONE]\n\n";
+        fake.start();
+        for (const char* model :
+             {"deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash"}) {
+            for (const char* effort : {"low", "high", "max"}) {
+                MaiModelRequest request;
+                request.model = model;
+                request.reasoningEffort = effort;
+                MaiModelMessage user;
+                user.role = MaiModelRole::User;
+                user.content = "Check effort";
+                request.messages.push_back(std::move(user));
+                CHECK(runAgainst(fake, request, wire).done);
+                json body;
+                {
+                    std::lock_guard<std::mutex> lock(fake.mutex);
+                    body = json::parse(fake.lastBody);
+                }
+                CHECK(body["model"] == model);
+                if (wire == MaiWireApi::Responses) {
+                    CHECK(body["reasoning"]["effort"] == effort);
+                } else {
+                    CHECK(body["thinking"]["type"] == "enabled");
+                    CHECK(body["reasoning_effort"] == effort);
+                }
+            }
         }
-        const json body = json::parse(wire);
-        CHECK(body["model"] == "deepseek-flash");
-        CHECK(body["reasoning"]["effort"] == effort);
-    }
-    MaiModelRequest glm;
-    glm.model = "glm-5.3";
-    glm.reasoningEffort = "max";
-    MaiModelMessage user;
-    user.role = MaiModelRole::User;
-    user.content = "Check isolation";
-    glm.messages.push_back(std::move(user));
-    CHECK(runAgainst(fake, glm, MaiWireApi::Responses).done);
-    std::string wire;
-    {
+        MaiModelRequest unknown;
+        unknown.model = "unrelated-fixture-model";
+        unknown.reasoningEffort = "max";
+        CHECK(runAgainst(fake, unknown, wire).done);
         std::lock_guard<std::mutex> lock(fake.mutex);
-        wire = fake.lastBody;
+        const auto body = json::parse(fake.lastBody);
+        CHECK(!body.contains("reasoning"));
+        CHECK(!body.contains("reasoning_effort"));
+        CHECK(!body.contains("thinking"));
     }
-    CHECK(!json::parse(wire).contains("reasoning"));
+}
+
+// 真 loopback 请求验证两个不同 wire 与账号凭据不可交叉，也不因鉴权错误回退供应商。
+void test_routed_models_keep_wire_key_and_failure_isolation() {
+    FakeServer glm, deepseek;
+    glm.script = "data: [DONE]\n\n";
+    deepseek.script = sse(json{{"type", "response.completed"},
+                               {"response", {{"status", "completed"}, {"output", json::array()}}}});
+    glm.start();
+    deepseek.start();
+    int glmKeyReads = 0, deepseekKeyReads = 0;
+    std::string glmKey = "synthetic-glm-key", deepseekKey = "synthetic-deepseek-key";
+    MaiModelRoute glmRoute;
+    glmRoute.modelNames = {"glm-5.3", "glm-5.3-flash"};
+    glmRoute.config.baseUrl = glm.base();
+    glmRoute.config.wire = MaiWireApi::ChatCompletions;
+    glmRoute.apiKeyProvider = [&] {
+        ++glmKeyReads;
+        return glmKey;
+    };
+    MaiModelRoute deepseekRoute;
+    deepseekRoute.modelNames = {"deepseek-flash", "deepseek-v4-pro"};
+    deepseekRoute.config.baseUrl = deepseek.base();
+    deepseekRoute.config.wire = MaiWireApi::Responses;
+    deepseekRoute.config.maxRetries = 0;
+    deepseekRoute.apiKeyProvider = [&] {
+        ++deepseekKeyReads;
+        return deepseekKey;
+    };
+    auto client = makeMaiRoutedModelClient({{glmRoute, deepseekRoute}});
+    CHECK(client->wireApi() == MaiWireApi::Mixed);
+    CHECK(client->wireApiForModel("glm-5.3") == MaiWireApi::ChatCompletions);
+    CHECK(client->wireApiForModel("deepseek-v4-pro") == MaiWireApi::Responses);
+    CHECK(!client->wireApiForModel("glm-unknown"));
+    CHECK(glmKeyReads == 0 && deepseekKeyReads == 0);
+    std::atomic<bool> cancel{false};
+    MaiModelRequest request;
+    request.reasoningEffort = "low";
+    MaiModelMessage assistant;
+    assistant.role = MaiModelRole::Assistant;
+    assistant.content = "Tool status";
+    assistant.reasoning = "Opaque reasoning\r\n\xE7\x95\x8C";
+    assistant.invocations = {{"raw_reasoning_call", "lookup", "{}"}};
+    request.messages.push_back(assistant);
+    MaiModelMessage output;
+    output.role = MaiModelRole::ToolResult;
+    output.toolCallId = "raw_reasoning_call";
+    output.content = "Result";
+    request.messages.push_back(output);
+    for (const char* model : {"glm-5.3", "deepseek-v4-pro", "glm-5.3-flash", "deepseek-flash"}) {
+        request.model = model;
+        CHECK(!client->stream(request, {}, cancel));
+    }
+    CHECK(glmKeyReads == 2 && deepseekKeyReads == 2);
+    CHECK(glm.requestCount == 2 && deepseek.requestCount == 2);
+    {
+        std::lock_guard<std::mutex> lock(glm.mutex);
+        CHECK(glm.lastAuthorization == "Bearer synthetic-glm-key");
+        const auto body = json::parse(glm.lastBody);
+        CHECK(body["reasoning_effort"] == "low" && body.contains("messages") &&
+              !body.contains("input"));
+        CHECK(body["messages"][0]["reasoning_content"] == assistant.reasoning);
+        CHECK(body["messages"][0]["content"] == "Tool status");
+        CHECK(body["messages"][0]["tool_calls"][0]["id"] == "raw_reasoning_call");
+        CHECK(body["messages"][1]["tool_call_id"] == "raw_reasoning_call");
+    }
+    {
+        std::lock_guard<std::mutex> lock(deepseek.mutex);
+        CHECK(deepseek.lastAuthorization == "Bearer synthetic-deepseek-key");
+        const auto body = json::parse(deepseek.lastBody);
+        CHECK(body["reasoning"]["effort"] == "low" && body.contains("input") &&
+              !body.contains("messages"));
+    }
+    request.model = "not-in-directory";
+    CHECK(client->stream(request, {}, cancel).code() == MaiErrorCode::InvalidInput);
+    CHECK(glmKeyReads == 2 && deepseekKeyReads == 2);
+    glmKey = "rotated-glm-key";
+    request.model = "glm-5.3";
+    CHECK(!client->stream(request, {}, cancel));
+    {
+        std::lock_guard<std::mutex> lock(glm.mutex);
+        CHECK(glm.lastAuthorization == "Bearer rotated-glm-key");
+    }
+    glm.status = 401;
+    CHECK(client->stream(request, {}, cancel).hasError());
+    CHECK(deepseekKeyReads == 2 && deepseek.requestCount == 2);
+    glmKey.clear();
+    const auto glmRequests = glm.requestCount.load();
+    CHECK(client->stream(request, {}, cancel).code() == MaiErrorCode::NotConfigured);
+    CHECK(glm.requestCount == glmRequests && deepseek.requestCount == 2);
+    auto invalid = makeMaiRoutedModelClient({{glmRoute, glmRoute}});
+    CHECK(!invalid->wireApiForModel("glm-5.3"));
+    CHECK(invalid->stream(request, {}, cancel).code() == MaiErrorCode::InvalidInput);
+    cancel = true;
+    CHECK(client->stream(request, {}, cancel).code() == MaiErrorCode::Canceled);
 }
 
 void test_responses_needs_terminal_event_and_reports_incomplete() {
@@ -1731,10 +1836,13 @@ struct FakeModelProxy {
                 return;
             }
             response.status = terminalStatus;
-            response.set_content(
-                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\","
-                "\"output\":[]}}\n\n",
-                "text/event-stream");
+            response.set_content(request.target.find("/responses") != std::string::npos ||
+                                         request.target.find("/final") != std::string::npos
+                                     ? "data: "
+                                       "{\"type\":\"response.completed\",\"response\":{\"status\":"
+                                       "\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n"
+                                     : "data: [DONE]\n\n",
+                                 "text/event-stream");
         };
         server.Post(".*", handle);
         server.Get(".*", handle);
@@ -1797,7 +1905,7 @@ private:
     bool mHadValue = false;
 };
 
-void test_responses_proxy_redirects() {
+void test_responses_proxy_redirects(MaiWireApi wire) {
     // NO_PROXY 覆盖了环境变量匹配目标的情况，系统代理选择仍应生效。
     ScopedProxyEnvironment noProxy("no_proxy", "*");
     ScopedProxyEnvironment upperNoProxy("NO_PROXY", "*");
@@ -1812,7 +1920,7 @@ void test_responses_proxy_redirects() {
         MaiModelConfig config;
         config.baseUrl = "http://first.test";
         config.apiKey = "test-key";
-        config.wire = MaiWireApi::Responses;
+        config.wire = wire;
         config.maxRetries = 0;
         config.proxyResolver = [&](const std::string& url, MaiModelProxy& proxy) {
             resolved.push_back(url);
@@ -1835,7 +1943,10 @@ void test_responses_proxy_redirects() {
         CHECK(secondRequests.size() == 1);
         if (firstRequests.size() == 1 && secondRequests.size() == 1) {
             CHECK(firstRequests[0].method == "POST");
-            CHECK(firstRequests[0].target == "http://first.test/responses");
+            CHECK(firstRequests[0].target ==
+                  "http://first.test" + std::string(wire == MaiWireApi::Responses
+                                                        ? "/responses"
+                                                        : "/chat/completions"));
             CHECK(firstRequests[0].host == "first.test");
             CHECK(firstRequests[0].authorization == "Bearer test-key");
             CHECK(firstRequests[0].proxyAuthorization == "Basic YWxwaGE6b25l");
@@ -1850,7 +1961,7 @@ void test_responses_proxy_redirects() {
     }
 }
 
-void test_responses_proxy_same_origin_redirect() {
+void test_responses_proxy_same_origin_redirect(MaiWireApi wire) {
     ScopedProxyEnvironment noProxy("no_proxy", "*");
     ScopedProxyEnvironment upperNoProxy("NO_PROXY", "*");
     FakeModelProxy proxy;
@@ -1860,7 +1971,7 @@ void test_responses_proxy_same_origin_redirect() {
     MaiModelConfig config;
     config.baseUrl = "http://first.test";
     config.apiKey = "test-key";
-    config.wire = MaiWireApi::Responses;
+    config.wire = wire;
     config.maxRetries = 0;
     config.proxyResolver = [&](const std::string&, MaiModelProxy& route) {
         route.url = proxy.address();
@@ -1882,7 +1993,7 @@ void test_responses_proxy_same_origin_redirect() {
     }
 }
 
-void test_responses_proxy_redirect_total_timeout() {
+void test_responses_proxy_redirect_total_timeout(MaiWireApi wire) {
     ScopedProxyEnvironment noProxy("no_proxy", "*");
     ScopedProxyEnvironment upperNoProxy("NO_PROXY", "*");
     FakeModelProxy first;
@@ -1895,7 +2006,7 @@ void test_responses_proxy_redirect_total_timeout() {
     second.start();
     MaiModelConfig config;
     config.baseUrl = "http://first.test";
-    config.wire = MaiWireApi::Responses;
+    config.wire = wire;
     config.maxRetries = 0;
     config.totalTimeoutSeconds = 2;
     config.proxyResolver = [&](const std::string& url, MaiModelProxy& route) {
@@ -1915,7 +2026,7 @@ void test_responses_proxy_redirect_total_timeout() {
     CHECK(second.received().size() == 1);
 }
 
-void test_responses_without_location_retains_body() {
+void test_responses_without_location_retains_body(MaiWireApi wire) {
     ScopedProxyEnvironment noProxy("no_proxy", "*");
     ScopedProxyEnvironment upperNoProxy("NO_PROXY", "*");
     FakeModelProxy destination;
@@ -1923,7 +2034,7 @@ void test_responses_without_location_retains_body() {
     destination.start();
     MaiModelConfig config;
     config.baseUrl = destination.address();
-    config.wire = MaiWireApi::Responses;
+    config.wire = wire;
     config.maxRetries = 0;
     MaiModelRequest request;
     request.model = "test-model";
@@ -1935,13 +2046,13 @@ void test_responses_without_location_retains_body() {
     CHECK(destination.received().size() == 2);
 }
 
-void test_responses_proxy_resolver_timeout_retries_before_output() {
+void test_responses_proxy_resolver_timeout_retries_before_output(MaiWireApi wire) {
     FakeModelProxy destination;
     destination.start();
     int resolutions = 0;
     MaiModelConfig config;
     config.baseUrl = destination.address();
-    config.wire = MaiWireApi::Responses;
+    config.wire = wire;
     config.totalTimeoutSeconds = 1;
     config.maxRetries = 1;
     config.retryInitialDelayMs = 0;
@@ -1961,7 +2072,7 @@ void test_responses_proxy_resolver_timeout_retries_before_output() {
 }
 
 #if defined(MAI_MODEL_CLIENT_TLS_TESTS)
-void test_responses_proxy_rejects_tls_downgrade() {
+void test_responses_proxy_rejects_tls_downgrade(MaiWireApi wire) {
     const std::string certificateRoot =
         std::string(MAI_AGENT_SOURCE_DIR) + "/third_party/curl/tests/certs/";
     const std::string certificate = certificateRoot + "Server-localhost-sv.crt";
@@ -1975,17 +2086,18 @@ void test_responses_proxy_rejects_tls_downgrade() {
     std::mutex mutex;
     std::vector<ProxyRequest> secureRequests;
     std::atomic<int> redirectStatus{302};
-    secure.Post("/responses", [&](const httplib::Request& request, httplib::Response& response) {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            secureRequests.push_back(
-                {request.method, request.target, request.get_header_value("Host"),
-                 request.get_header_value("Authorization"),
-                 request.get_header_value("Proxy-Authorization"), request.body});
-        }
-        response.status = redirectStatus.load();
-        response.set_header("Location", plain.address() + "/final");
-    });
+    secure.Post(wire == MaiWireApi::Responses ? "/responses" : "/chat/completions",
+                [&](const httplib::Request& request, httplib::Response& response) {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        secureRequests.push_back(
+                            {request.method, request.target, request.get_header_value("Host"),
+                             request.get_header_value("Authorization"),
+                             request.get_header_value("Proxy-Authorization"), request.body});
+                    }
+                    response.status = redirectStatus.load();
+                    response.set_header("Location", plain.address() + "/final");
+                });
     const int securePort = secure.bind_to_any_port("127.0.0.1");
     CHECK(securePort > 0);
     if (securePort <= 0) return;
@@ -1996,7 +2108,7 @@ void test_responses_proxy_rejects_tls_downgrade() {
     config.baseUrl = "https://localhost:" + std::to_string(securePort);
     config.caBundlePath = authority;
     config.apiKey = "test-key";
-    config.wire = MaiWireApi::Responses;
+    config.wire = wire;
     config.maxRetries = 0;
     std::vector<std::string> resolved;
     config.proxyResolver = [&](const std::string& url, MaiModelProxy&) {
@@ -2027,7 +2139,7 @@ void test_responses_proxy_rejects_tls_downgrade() {
 }
 #endif
 
-void test_responses_proxy_direct_and_cancel() {
+void test_responses_proxy_direct_and_cancel(MaiWireApi wire) {
     FakeModelProxy destination;
     destination.start();
     // 本地监听器能证明空路由绕过环境代理，而不是仅验证回调被调用。
@@ -2036,7 +2148,7 @@ void test_responses_proxy_direct_and_cancel() {
     ScopedProxyEnvironment httpProxy("http_proxy", "http://127.0.0.1:1");
     MaiModelConfig config;
     config.baseUrl = destination.address();
-    config.wire = MaiWireApi::Responses;
+    config.wire = wire;
     config.maxRetries = 0;
     config.proxyResolver = [](const std::string&, MaiModelProxy& route) {
         route.url.clear();
@@ -2175,7 +2287,24 @@ void test_context_limits_output_budget_and_actual_usage() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--chat-proxy") {
+        test_responses_proxy_redirects(MaiWireApi::ChatCompletions);
+        test_responses_proxy_same_origin_redirect(MaiWireApi::ChatCompletions);
+        test_responses_proxy_redirect_total_timeout(MaiWireApi::ChatCompletions);
+        test_responses_without_location_retains_body(MaiWireApi::ChatCompletions);
+        test_responses_proxy_resolver_timeout_retries_before_output(MaiWireApi::ChatCompletions);
+#if defined(MAI_MODEL_CLIENT_TLS_TESTS)
+        test_responses_proxy_rejects_tls_downgrade(MaiWireApi::ChatCompletions);
+#endif
+        test_responses_proxy_direct_and_cancel(MaiWireApi::ChatCompletions);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--session-models") {
+        test_cloud_effort_levels_reach_the_selected_wire();
+        test_routed_models_keep_wire_key_and_failure_isolation();
+        return failures == 0 ? 0 : 1;
+    }
 #if defined(_WIN32)
     if (std::getenv("MAI_MODEL_LIVE_TLS_TEST") != nullptr) {
         MaiModelConfig config;
@@ -2235,17 +2364,20 @@ int main() {
     test_responses_message_items_remain_distinct_in_agent_history();
     test_responses_terminal_snapshots_update_their_original_items();
     test_responses_serializes_history_images_and_flat_tools();
-    test_deepseek_effort_levels_reach_responses_wire();
+    test_cloud_effort_levels_reach_the_selected_wire();
+    test_routed_models_keep_wire_key_and_failure_isolation();
     test_responses_needs_terminal_event_and_reports_incomplete();
-    test_responses_proxy_redirects();
-    test_responses_proxy_same_origin_redirect();
-    test_responses_proxy_redirect_total_timeout();
-    test_responses_without_location_retains_body();
-    test_responses_proxy_resolver_timeout_retries_before_output();
+    for (const auto wire : {MaiWireApi::ChatCompletions, MaiWireApi::Responses}) {
+        test_responses_proxy_redirects(wire);
+        test_responses_proxy_same_origin_redirect(wire);
+        test_responses_proxy_redirect_total_timeout(wire);
+        test_responses_without_location_retains_body(wire);
+        test_responses_proxy_resolver_timeout_retries_before_output(wire);
 #if defined(MAI_MODEL_CLIENT_TLS_TESTS)
-    test_responses_proxy_rejects_tls_downgrade();
+        test_responses_proxy_rejects_tls_downgrade(wire);
 #endif
-    test_responses_proxy_direct_and_cancel();
+        test_responses_proxy_direct_and_cancel(wire);
+    }
     test_local_mode_never_falls_back_to_a_remote_request();
     if (failures == 0) std::printf("llm tests passed\n");
     return failures == 0 ? 0 : 1;

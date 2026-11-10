@@ -46,7 +46,8 @@ private func aiMobileAgentSessionChanged(_ sessionID: UnsafePointer<CChar>?) {
 }
 
 struct AIModelSettings: Codable, Sendable, Equatable {
-    static let glmResponsesUrl = "https://open.bigmodel.cn/api/v1"
+    static let glmChatUrl = "https://open.bigmodel.cn/api/paas/v4"
+    static let cloudModels = ["deepseek-flash", "deepseek-v4-pro", "glm-5.3", "glm-5.3-flash"]
     static let deepSeekUrl = "https://api.deepseek.com"
 
     var baseUrl = AIModelSettings.deepSeekUrl
@@ -67,9 +68,17 @@ struct AIModelSettings: Codable, Sendable, Equatable {
     var effectiveLocalThreads: Int { 2 }
     var effectiveCloudModel: String {
         let saved = cloudModel ?? (isLocalModel ? "deepseek-flash" : model)
-        return ["deepseek-flash", "glm-5.3", "glm-5.3-flash"].contains(saved) ? saved : "deepseek-flash"
+        return Self.cloudModels.contains(saved) ? saved : "deepseek-flash"
     }
-    var displayName: String { isLocalModel ? "本地模型" : "云端模型" }
+    var displayName: String {
+        if isLocalModel { return "本地模型" }
+        switch model {
+        case "glm-5.3": return "GLM-5.3"
+        case "glm-5.3-flash": return "GLM-5.3-Flash"
+        case "deepseek-v4-pro": return "DeepSeek V4 Pro"
+        default: return "DeepSeek Flash"
+        }
+    }
 
     /// 普通选择只区分云端和随包本地模型；旧文件 ID 仅保留兼容解码，不再要求用户管理文件。
     mutating func selectModelSource(local: Bool) {
@@ -90,14 +99,16 @@ struct AIModelSettings: Codable, Sendable, Equatable {
         return ["low", "high", "max"].contains(value) ? value : "high"
     }
     var policy = "on-request"
-    var effectiveWire: String { isLocalModel ? "local" : "responses" }
+    var effectiveWire: String {
+        isLocalModel ? "local" : (["glm-5.3", "glm-5.3-flash"].contains(model) ? "chat_completions" : "responses")
+    }
 
     mutating func selectModel(_ selected: String) {
         model = selected
-        if selected == "deepseek-flash" {
+        if ["deepseek-flash", "deepseek-v4-pro"].contains(selected) {
             cloudModel = selected; modelProvider = "remote"; baseUrl = Self.deepSeekUrl
-        } else if selected.hasPrefix("glm-") {
-            cloudModel = selected; modelProvider = "remote"; baseUrl = Self.glmResponsesUrl
+        } else if ["glm-5.3", "glm-5.3-flash"].contains(selected) {
+            cloudModel = selected; modelProvider = "remote"; baseUrl = Self.glmChatUrl
         }
     }
 
@@ -341,6 +352,9 @@ struct AISession: Codable, Identifiable, Sendable, Equatable {
     let title: String
     let busy: Bool
     var turnId: String? = nil
+    var model: String? = nil
+    var reasoningEffort: String? = nil
+    var wire: String? = nil
     var displayTitle: String { title == "New session" ? "新对话" : title }
 }
 
@@ -355,6 +369,9 @@ struct AIRemoteSession: Decodable, Identifiable, Sendable, Equatable {
     let loginSessionID: String
     let online: Bool
     var turnId: String? = nil
+    var model: String? = nil
+    var reasoningEffort: String? = nil
+    var wire: String? = nil
 
     var id: String { "\(deviceSlot):\(deviceID):\(sessionID)" }
     var displayTitle: String { title == "New session" ? "新对话" : title }
@@ -362,6 +379,7 @@ struct AIRemoteSession: Decodable, Identifiable, Sendable, Equatable {
     enum CodingKeys: String, CodingKey {
         case sessionID = "id"
         case title, busy, online, turnId
+        // Discovery never supplies model settings. Owner history/command ACKs do.
         case updatedAt = "updated_at"
         case deviceSlot = "device_slot"
         case deviceName = "device_name"
@@ -467,6 +485,8 @@ private actor AIRemoteSessionTransport {
         let before: String?
         let limit: Int?
         let action: String?
+        let model: String?
+        let reasoningEffort: String?
         let text: String?
         let attachments: [AISessionAttachmentReference]?
         let requestID: String?
@@ -487,7 +507,7 @@ private actor AIRemoteSessionTransport {
             case chunkCount = "chunk_count"
             case sha256
             case dataBase64 = "data_base64"
-            case before, limit, action, text, attachments, decision, title
+            case before, limit, action, model, reasoningEffort, text, attachments, decision, title
             case requestID = "id"
             case turnId, quoteMessageId
             case steeringRequestId = "requestId"
@@ -515,6 +535,13 @@ private actor AIRemoteSessionTransport {
     private var localLoginSessionID: String?
     private var cachedDevices: [AIRemoteDevice] = []
     private var catalogHandler: (@Sendable ([AIRemoteSession], [AIRemoteDevice]) -> Void)?
+    private var connectionEventSequence = 0
+    private var connectionHandler: (@Sendable (Bool, Int) -> Void)?
+
+    func setConnectionHandler(_ handler: @escaping @Sendable (Bool, Int) -> Void) {
+        connectionHandler = handler
+        if connected { handler(true, connectionEventSequence) }
+    }
 
     func setCatalogHandler(_ handler: @escaping @Sendable ([AIRemoteSession], [AIRemoteDevice]) -> Void) {
         catalogHandler = handler
@@ -528,6 +555,8 @@ private actor AIRemoteSessionTransport {
         if event == 1 {
             connected = true
             connectionGeneration += 1
+            connectionEventSequence += 1
+            connectionHandler?(true, connectionEventSequence)
             announcedGeneration = nil
             localLoginSessionID = nil
             let waiters = connectionWaiters
@@ -537,6 +566,8 @@ private actor AIRemoteSessionTransport {
         }
         if event == 2 || event == 4 {
             connected = false
+            connectionEventSequence += 1
+            connectionHandler?(false, connectionEventSequence)
             announcedGeneration = nil
             localLoginSessionID = nil
             authorizedBearer = nil
@@ -1322,6 +1353,12 @@ struct AIResponse: Codable, Sendable {
     var turnId: String?
     var configured: Bool?
     var model: String?
+    var reasoningEffort: String?
+    var defaultReasoningEffort: String?
+    var session: String?
+    var selectedModel: String?
+    var selectedReasoningEffort: String?
+    var selectedWire: String?
     var wire: String?
     var localGpuSelected: Bool?
     var localGpuModelBytes: UInt64?
@@ -1332,7 +1369,7 @@ struct AIResponse: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case ok, id, path, error, errorCode, changed, sessions, messages, messageUpdates, hasMessageUpdates, questionMessages, rootSessionId, permissions, questions
-        case busy, turnId, configured, model, wire, localGpuSelected, localGpuModelBytes, localGpuBackend
+        case busy, turnId, configured, model, reasoningEffort, defaultReasoningEffort, session, selectedModel, selectedReasoningEffort, selectedWire, wire, localGpuSelected, localGpuModelBytes, localGpuBackend
         case natural, casual, professional
         case userMessageID = "user_message_id"
         case questionID = "question_id"
@@ -1442,7 +1479,7 @@ actor AIAssistantBackend {
     }
     #endif
     private func storedKey(for model: String) -> String {
-        AICloudCredentialStore.shared.apiKey(model == "deepseek-flash" ? "deepseek" : "glm")
+        AICloudCredentialStore.shared.apiKey(["deepseek-flash", "deepseek-v4-pro"].contains(model) ? "deepseek" : "glm")
     }
 
     init() {
@@ -1525,12 +1562,12 @@ actor AIAssistantBackend {
         if FileManager.default.fileExists(atPath: file.path) {
             settings = try JSONDecoder().decode(AIModelSettings.self, from: Data(contentsOf: file))
         }
-        // 恢复原供应商；本地选择统一迁到随包版本，不再依赖用户上次导入的文件。
-        if settings.isLocalModel { settings.selectModelSource(local: true) }
-        else { settings.selectModel(settings.model) }
+        // 旧全局 model 不再覆盖任何 session；新/未设置会话统一使用固定默认。
+        // 本地会话是否需要准备由稍后的 owner snapshot 决定，不为云端首次打开复制 GGUF。
+        settings.selectModel("deepseek-flash")
         var key = ""
         #if DEBUG && targetEnvironment(simulator)
-        let primaryModelUITest = AIPrimaryModelUITestSupport.isRequested
+        let primaryModelUITest = AIPrimaryModelUITestSupport.isRequested || AIPrimaryModelUITestSupport.isSessionConfigurationRequested
         #else
         let primaryModelUITest = false
         #endif
@@ -1544,7 +1581,7 @@ actor AIAssistantBackend {
             key = storedKey(for: settings.model)
         }
         #if DEBUG && targetEnvironment(simulator)
-        if uiTest && !settings.isLocalModel {
+        if uiTest && !settings.isLocalModel && !AIPrimaryModelUITestSupport.isSessionConfigurationRequested {
             // 独立验收账号使用配套的本机模型端口，避免把测试调用发送到其他正在运行的 fixture。
             let modelPort = Int(ProcessInfo.processInfo.environment["MAICHAT_LOCAL_UI_MODEL_PORT"] ?? "18189")
                 .flatMap { (1...65535).contains($0) ? $0 : nil } ?? 18189
@@ -1567,7 +1604,10 @@ actor AIAssistantBackend {
                 configurationError: "内置本地模型暂时不可用，请重试；若仍失败，请更新 App。")
         }
         #if DEBUG && targetEnvironment(simulator)
-        if uiTest && !settings.isLocalModel { _ = try requestAgentOperation("create") }
+        if uiTest && !settings.isLocalModel {
+            let state = try requestAgentOperation("snapshot", values: ["session": "", "messageLimit": 0], force: true)
+            if state.sessions?.isEmpty != false { _ = try requestAgentOperation("create") }
+        }
         #endif
         initialized = true
         return AIAssistantOpenResult(
@@ -1593,9 +1633,20 @@ actor AIAssistantBackend {
         let workspace = root.appendingPathComponent("Workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         let appRootPath = AIAssistantPathPolicy.appRoot(workspacePath: workspace.path)
-        _ = try requestAgentOperation(
-            "configure",
-            values: [
+        var routeURLs: [String: Any] = ["glmBaseUrl": AIModelSettings.glmChatUrl,
+                                        "deepseekBaseUrl": AIModelSettings.deepSeekUrl]
+        #if DEBUG && targetEnvironment(simulator)
+        if AIPrimaryModelUITestSupport.isSessionConfigurationRequested {
+            let environment = ProcessInfo.processInfo.environment
+            for (provider, field) in [("GLM", "glmBaseUrl"), ("DEEPSEEK", "deepseekBaseUrl")] {
+                guard let port = Int(environment["MAICHAT_SESSION_MODELS_" + provider + "_PORT"] ?? ""),
+                      (1...65535).contains(port) else { throw AIBackendError(message: "缺少隔离测试端口") }
+                routeURLs[field] = "http://127.0.0.1:\(port)"
+            }
+        }
+        #endif
+        var nativeConfiguration: [String: Any] = [
+
                 "database": root.appendingPathComponent("sessions.sqlite").path,
                 "workspace": workspace.path, "baseUrl": config.baseUrl, "apiKey": key,
             "scheduleDeviceName": UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone",
@@ -1619,72 +1670,58 @@ actor AIAssistantBackend {
                 subdirectory: "MaiAgentModels")?.path ?? "",
             "lamaModelPath": Bundle.main.url(
                 forResource: "lama_fp32", withExtension: "onnx",
-                subdirectory: "MaiAgentModels")?.path ?? ""])
+                subdirectory: "MaiAgentModels")?.path ?? ""]
+        nativeConfiguration["localModelName"] = "local:" + AILocalModelStore.bundledPrimaryID
+        nativeConfiguration.merge(routeURLs) { _, supplied in supplied }
+        _ = try requestAgentOperation("configure", values: nativeConfiguration)
         agentEpoch = UUID().uuidString
+    }
+
+    private var preparedLocalEpoch = ""
+    func prepareLocalPrimaryModel() async throws {
+        try checkLifecycle()
+        let epoch = agentEpoch
+        if preparedLocalEpoch == epoch { return }
+        let local = try await AILocalModelStore.shared.bundledPrimarySelection()
+        try checkLifecycle()
+        guard epoch == agentEpoch else { throw CancellationError() }
+        _ = try requestAgentOperation("prepare_local_model", values: [
+            "model": "local:" + AILocalModelStore.bundledPrimaryID,
+            "localModelPath": local.modelURL.path,
+            "localProjectorPath": local.projectorURL?.path ?? "",
+            "localContextSize": settings.effectiveLocalContextSize,
+            "localMaximumTokens": settings.effectiveLocalMaximumTokens,
+            "localThreads": settings.effectiveLocalThreads])
+        preparedLocalEpoch = epoch
     }
 
     func save(_ config: AIModelSettings) async throws -> AIModelSettings {
         try checkLifecycle()
-        // 解析本地文件和领云 Key 都会 await；只允许一个配置事务跨越这些挂起点。
         guard !configurationInProgress else { throw AIBackendError(message: "模型配置正在准备，请稍后重试") }
+        guard ["on-request", "unless-trusted", "never"].contains(config.policy) else {
+            throw AIBackendError(message: "请选择受支持的权限模式")
+        }
         configurationInProgress = true
         defer { configurationInProgress = false }
-        #if DEBUG && targetEnvironment(simulator)
-        // 与 open 的本地模型判定一致，让正常 Root 验收也能通过正式设置保存权限模式。
-        let isLocalUITest = ProcessInfo.processInfo.arguments.contains("--ai-ui-test") ||
-            ProcessInfo.processInfo.environment["MAICHAT_LOCAL_UI_MODEL"] == "1"
-        #else
-        let isLocalUITest = false
-        #endif
-        #if DEBUG && targetEnvironment(simulator)
-        let primaryModelUITest = AIPrimaryModelUITestSupport.isRequested
-        #else
-        let primaryModelUITest = false
-        #endif
-        // QA 的云端回切仍使用原合成端点；不能为测试内联选项获取账号凭据或请求供应商。
-        let testModel = isLocalUITest && !config.isLocalModel &&
-            (config.model == "test-model" || primaryModelUITest)
-        guard config.modelProvider == nil || ["remote", "llama"].contains(config.modelProvider ?? "") else {
-            throw AIBackendError(message: "请选择受支持的模型来源")
-        }
-        guard config.isLocalModel || ["glm-5.3", "glm-5.3-flash", "deepseek-flash"].contains(config.model) || testModel else {
-            throw AIBackendError(message: "请选择受支持的主模型")
-        }
-        var normalized = config
-        if config.isLocalModel {
-            normalized.selectModelSource(local: true)
-        } else if testModel {
-            normalized.model = "test-model"
-            normalized.baseUrl = settings.baseUrl
-        }
-        else { normalized.selectModel(config.model) }
-        if !normalized.isLocalModel && !testModel && storedKey(for: normalized.model).isEmpty {
-            _ = try? await AICloudCredentialSync.refreshAccountModelKeysIfAvailable()
-            try checkLifecycle()
-        }
-        let effectiveKey = normalized.isLocalModel ? "" : (testModel ? "test-key" : storedKey(for: normalized.model))
-        guard normalized.isLocalModel || !effectiveKey.isEmpty || isLocalUITest else {
-            throw AIBackendError(message: "请先登录已开通模型服务的账号")
-        }
+        var normalized = settings
+        normalized.policy = config.policy
         let previous = settings
-        let previousKey = isLocalUITest && previous.model == "test-model"
-            ? "test-key" : (previous.isLocalModel ? "" : storedKey(for: previous.model))
-        let local = try await resolveLocalConfiguration(normalized)
-        try checkLifecycle()
-        let previousLocal = try? await resolveLocalConfiguration(previous)
-        try checkLifecycle()
-        try configure(normalized, key: effectiveKey, local: local) // 核心拒绝忙碌切换后才可覆盖配置。
+        #if DEBUG && targetEnvironment(simulator)
+        let testKey = ProcessInfo.processInfo.arguments.contains("--ai-ui-test") && normalized.model == "test-model"
+        #else
+        let testKey = false
+        #endif
+        let key = testKey ? "test-key" : storedKey(for: normalized.model)
+        try configure(normalized, key: key)
         do {
             try checkLifecycle()
-            try JSONEncoder().encode(normalized).write(
-                to: root!.appendingPathComponent("settings.json"), options: .atomic)
+            try JSONEncoder().encode(normalized).write(to: root!.appendingPathComponent("settings.json"), options: .atomic)
             settings = normalized
-            initialized = true
+            return normalized
         } catch {
-            try? configure(previous, key: previousKey, local: previousLocal)
+            try? configure(previous, key: testKey ? "test-key" : storedKey(for: previous.model))
             throw error
         }
-        return settings
     }
 
     func request(_ operation: String, values: [String: String] = [:], force: Bool = false) throws -> AIResponse {
@@ -1714,9 +1751,16 @@ actor AIAssistantBackend {
             "before": beforeId, "limit": limit, "includeMessageUpdates": includeMessageUpdates])
     }
 
+    private func prepareTargetSessionModel(_ session: String) async throws {
+        let choice = try requestAgentOperation("get_session", values: ["session": session])
+        if choice.wire == "local" { try await prepareLocalPrimaryModel() }
+        try checkLifecycle()
+    }
+
     func send(session: String, text: String, images: [AIImportedFile],
-              videos: [AIImportedFile], quoteMessageId: String) throws -> AIResponse {
-        try requestAgentOperation("send", values: [
+              videos: [AIImportedFile], quoteMessageId: String) async throws -> AIResponse {
+        try await prepareTargetSessionModel(session)
+        return try requestAgentOperation("send", values: [
             "session": session,
             "text": text,
             "quoteMessageId": quoteMessageId,
@@ -1725,8 +1769,9 @@ actor AIAssistantBackend {
         ])
     }
 
-    func steer(_ request: AISteeringRequest) throws -> AIResponse {
-        try requestAgentOperation("steer", values: [
+    func steer(_ request: AISteeringRequest) async throws -> AIResponse {
+        try await prepareTargetSessionModel(request.session)
+        return try requestAgentOperation("steer", values: [
             "session": request.session, "turnId": request.turnId,
             "requestId": request.requestId, "text": request.text,
             "quoteMessageId": request.quoteMessageId,
@@ -1736,8 +1781,9 @@ actor AIAssistantBackend {
     }
 
     func enqueue(session: String, requestID: String, text: String, images: [AIImportedFile],
-                 videos: [AIImportedFile], quoteMessageId: String) throws -> AIResponse {
-        try requestAgentOperation("enqueue", values: [
+                 videos: [AIImportedFile], quoteMessageId: String) async throws -> AIResponse {
+        try await prepareTargetSessionModel(session)
+        return try requestAgentOperation("enqueue", values: [
             "session": session, "requestId": requestID, "text": text, "quoteMessageId": quoteMessageId,
             "images": images.map { ["path": $0.relativePath, "mimeType": $0.mimeType] },
             "videos": videos.map { ["path": $0.relativePath, "mimeType": $0.mimeType] }])
@@ -1924,6 +1970,7 @@ final class AIAssistantModel: ObservableObject {
     @Published var questions: [AIQuestion] = []
     @Published var selected = ""
     @Published var settings = AIModelSettings()
+    private var sessionDefaultReasoningEffort = "high"
     @Published private(set) var changingModelSource = false
     @Published private(set) var actualModelID = ""
     @Published private(set) var actualWire = ""
@@ -2028,6 +2075,17 @@ final class AIAssistantModel: ObservableObject {
     private var remoteDraftByCommandID: [String: String] = [:]
     private var remoteOptimisticByCommandID: [String: String] = [:]
     private var remoteResultByCommandID: [String: Bool] = [:]
+    private var latestModelCommandByRemote: [String: String] = [:]
+    private var remoteConfigurationConnectionSequence = 0
+    private struct PendingModelChoice {
+        let owner: AIRemoteSession
+        let action: String
+        let model: String?
+        let reasoningEffort: String?
+        let generation: Int
+        let account: String
+    }
+    private var pendingModelOwners: [String: PendingModelChoice] = [:]
     private var remoteFilesByCommandID: [String: (key: String, files: [AIImportedFile])] = [:]
     private var remoteDeliveryPendingIDs: Set<String> = []
     private struct PendingLifecycle {
@@ -2255,6 +2313,31 @@ final class AIAssistantModel: ObservableObject {
     // DebugSupport 通过这一小型边界设置隔离状态，正式状态的 setter 继续保持私有。
     let uiTestSupport = AIAssistantModelUITestSupport()
     #if targetEnvironment(simulator)
+    func publishSessionModelUITestState(_ data: Data) async throws {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") else { return }
+        let state = try JSONDecoder().decode(AIResponse.self, from: data)
+        try await publishLocalPage(state, sessionID: state.session ?? "", backfill: false)
+    }
+
+    func reconnectSessionModelUITestPeer() async {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") else { return }
+        await remoteConfigurationConnectionChanged(connected: false)
+        await remoteConfigurationConnectionChanged(connected: true)
+    }
+
+    /// Feeds an owned fake peer's receipt through the exact production tuple/ACK decoder.
+    func deliverSessionModelUITestReceipt(owner: AIRemoteSession, id: String, result: [String: Any]) async {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") else { return }
+        let payload: [String: Any] = ["type": "command_result", "command_id": id, "result": result]
+        let value: [String: Any] = ["id": 1, "kind": "event", "session_id": owner.sessionID,
+            "client_message_id": id, "from_slot": owner.deviceSlot,
+            "from_login_session_id": owner.loginSessionID, "payload": payload]
+        guard let data = try? JSONSerialization.data(withJSONObject: value),
+              let envelope = try? JSONDecoder().decode(AIRemoteSessionTransport.Envelope.self, from: data),
+              let content = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        await applyRemotePayload(content, envelope: envelope)
+    }
+
     func prepareManualCameraImportForUITesting(_ workspace: URL) async throws {
         try await backend.prepareManualCameraImportForUITesting(workspace)
     }
@@ -2388,6 +2471,8 @@ final class AIAssistantModel: ObservableObject {
     }
 
     private func stopRemoteSync() {
+        latestModelCommandByRemote.removeAll()
+        pendingModelOwners.removeAll()
         remoteImageFiles.removeAll()
         remotePoll?.cancel()
         remotePoll = nil
@@ -2475,13 +2560,18 @@ final class AIAssistantModel: ObservableObject {
         }
     }
 
+    private func publishSessionConfigurationFrame(sessionID: String, data: Data) async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test"),
+           let handler = uiTestSupport.sessionModelPublishHandler { try await handler(sessionID, data); return }
+        #endif
+        try await remoteTransport.publish(sessionID: sessionID, data: data)
+    }
+
     private func publishLocalPage(_ state: AIResponse, sessionID: String,
                                   backfill: Bool) async throws {
         let value = try remoteHistoryPayload(state)
         let messages = value["messages"] as? [[String: Any]] ?? []
-        let questionMessages = value["questionMessages"] as? [[String: Any]] ?? []
-        let permissions = value["permissions"] as? [[String: Any]] ?? []
-        let questions = value["questions"] as? [[String: Any]] ?? []
         for message in messages {
             guard let messageID = message["id"] as? String else { continue }
             let messageBytes = try JSONSerialization.data(
@@ -2490,27 +2580,25 @@ final class AIAssistantModel: ObservableObject {
                 .map { String(format: "%02x", $0) }.joined()
             let key = sessionID + ":" + messageID
             guard publishedRemoteMessageDigests[key] != messageDigest else { continue }
-            let published = try boundedQuestionHistoryPayload([
-                "session_id": sessionID,
-                "messages": [message], "permissions": permissions,
-                "questions": questions, "questionMessages": questionMessages, "busy": state.busy ?? false,
-                "turnId": state.turnId ?? ""])
+            var frame = value
+            frame["session_id"] = sessionID
+            frame["messages"] = [message]
+            let published = try boundedQuestionHistoryPayload(frame)
             let encoded = try JSONSerialization.data(withJSONObject: published, options: .sortedKeys)
-            try await remoteTransport.publish(sessionID: sessionID, data: encoded)
+            try await publishSessionConfigurationFrame(sessionID: sessionID, data: encoded)
             publishedRemoteMessageDigests[key] = messageDigest
             publishedRemoteStateDigests[sessionID] = try remotePublishedStateDigest(published)
             if backfill { try await Task.sleep(for: .milliseconds(250)) }
         }
         // 大根消息可能暂时裁掉投影；紧接着用无正文的小状态帧恢复，历史和当前问题不被截断。
-        let published = try boundedQuestionHistoryPayload([
-                "session_id": sessionID,
-                "messages": [], "permissions": permissions,
-                "questions": questions, "questionMessages": questionMessages, "busy": state.busy ?? false,
-                "turnId": state.turnId ?? ""])
+        var frame = value
+        frame["session_id"] = sessionID
+        frame["messages"] = []
+        let published = try boundedQuestionHistoryPayload(frame)
         let stateDigest = try remotePublishedStateDigest(published)
         if publishedRemoteStateDigests[sessionID] != stateDigest {
             let encoded = try JSONSerialization.data(withJSONObject: published, options: .sortedKeys)
-            try await remoteTransport.publish(sessionID: sessionID, data: encoded)
+            try await publishSessionConfigurationFrame(sessionID: sessionID, data: encoded)
             publishedRemoteStateDigests[sessionID] = stateDigest
         }
         if state.hasMessageUpdates == true { localSessionChanged(sessionID) }
@@ -2531,7 +2619,9 @@ final class AIAssistantModel: ObservableObject {
     private func remotePublishedStateDigest(_ payload: [String: Any]) throws -> String {
         let state: [String: Any] = ["permissions": payload["permissions"] ?? [], "questions": payload["questions"] ?? [],
             "questionMessages": payload["questionMessages"] ?? [], "busy": payload["busy"] ?? false,
-            "turnId": payload["turnId"] ?? ""]
+            "turnId": payload["turnId"] ?? "", "session": payload["session"] ?? "",
+            "model": payload["model"] ?? "", "reasoningEffort": payload["reasoningEffort"] ?? "",
+            "wire": payload["wire"] ?? "", "defaultReasoningEffort": payload["defaultReasoningEffort"] ?? ""]
         let bytes = try JSONSerialization.data(withJSONObject: state, options: .sortedKeys)
         return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
@@ -2606,13 +2696,28 @@ final class AIAssistantModel: ObservableObject {
 
     private func applyRemoteCatalog(_ catalog: [AIRemoteSession],
                                     devices: [AIRemoteDevice]) {
-        remoteSessions = catalog.filter { $0.deviceSlot != syncDeviceSlot }
+        let previous = remoteSessions
+        remoteSessions = catalog.filter { $0.deviceSlot != syncDeviceSlot }.map { discovered in
+            var current = discovered
+            // catalog 只更新发现/在线状态，不能冲掉同一 owner login 已回读的会话配置。
+            if let known = previous.first(where: { $0.id == discovered.id && $0.loginSessionID == discovered.loginSessionID }) {
+                current.model = known.model
+                current.reasoningEffort = known.reasoningEffort
+                current.wire = known.wire
+            }
+            return current
+        }
         remoteDevices = devices.filter { $0.deviceSlot != syncDeviceSlot }
         if let selected = selectedRemote,
            let updated = remoteSessions.first(where: {
                $0.id == selected.id && $0.loginSessionID == selected.loginSessionID
            }) {
             selectedRemote = updated
+            // The socket may reconnect before the fresh catalog marks this owner online.
+            // Retry only the idempotent config read; never replay a model mutation.
+            if updated.online && updated.model == nil {
+                Task { @MainActor [weak self] in await self?.requestRemoteConfiguration(updated) }
+            }
         } else if let selected = selectedRemote,
                   remoteDevices.contains(where: {
                       $0.deviceSlot == selected.deviceSlot && $0.online
@@ -2630,10 +2735,57 @@ final class AIAssistantModel: ObservableObject {
         }
     }
 
+    private func remoteConfigurationConnectionChanged(connected: Bool, sequence: Int? = nil) async {
+        guard self === Self.shared, !outgoingPermanentlyInvalidated else { return }
+        if let sequence {
+            guard sequence > remoteConfigurationConnectionSequence else { return }
+            remoteConfigurationConnectionSequence = sequence
+        }
+        // A previous transport's delayed receipt cannot commit settings after reconnect.
+        // Writes are never replayed automatically; get_session resolves the owner's actual state.
+        for (id, _) in pendingModelOwners {
+            pendingRemoteCommands.removeValue(forKey: id)
+            if let fingerprint = remoteFingerprintByCommandID.removeValue(forKey: id) {
+                remoteRetryIDByFingerprint.removeValue(forKey: fingerprint)
+            }
+        }
+        pendingModelOwners.removeAll()
+        latestModelCommandByRemote.removeAll()
+        for index in remoteSessions.indices {
+            remoteSessions[index].model = nil
+            remoteSessions[index].reasoningEffort = nil
+            remoteSessions[index].wire = nil
+        }
+        if var remote = selectedRemote {
+            remote.model = nil; remote.reasoningEffort = nil; remote.wire = nil
+            selectedRemote = remote
+            if connected { await requestRemoteConfiguration(remote) }
+        }
+    }
+
+    private func requestRemoteConfiguration(_ remote: AIRemoteSession) async {
+        guard remoteIsOnline(remote), !pendingModelOwners.values.contains(where: {
+            $0.owner.id == remote.id && $0.owner.loginSessionID == remote.loginSessionID
+        }) else { return }
+        let generation = submissionGeneration
+        let account = screenFrameCurrentAccountID
+        do { _ = try await enqueueRemoteCommand(to: remote, payload: ["action": "get_session"]) }
+        catch {
+            guard generation == submissionGeneration, account == screenFrameCurrentAccountID,
+                  selectedRemote?.id == remote.id, selectedRemote?.loginSessionID == remote.loginSessionID else { return }
+            showTransientError(error.localizedDescription, duration: .seconds(8))
+        }
+    }
+
     private func startRemotePolling() {
         guard remotePoll == nil else { return }
         remotePoll = Task { [weak self] in
             guard let self else { return }
+            await self.remoteTransport.setConnectionHandler { [weak self] connected, sequence in
+                Task { @MainActor [weak self] in
+                    await self?.remoteConfigurationConnectionChanged(connected: connected, sequence: sequence)
+                }
+            }
             await self.remoteTransport.setCatalogHandler { [weak self] catalog, devices in
                 Task { @MainActor [weak self] in
                     self?.applyRemoteCatalog(catalog, devices: devices)
@@ -2710,8 +2862,16 @@ final class AIAssistantModel: ObservableObject {
                 (attachmentRemoteCommands.contains($0.key) ? 2 * 60 * 60 : 30)
         }
         if !timedOut.isEmpty {
+            var notifyCurrentRoom = false
             for id in timedOut.keys {
                 pendingRemoteCommands.removeValue(forKey: id)
+                if let pending = pendingModelOwners.removeValue(forKey: id) {
+                    if latestModelCommandByRemote[pending.owner.id] == id {
+                        latestModelCommandByRemote.removeValue(forKey: pending.owner.id)
+                    }
+                    notifyCurrentRoom = notifyCurrentRoom ||
+                        (selectedRemote?.id == pending.owner.id && selectedRemote?.loginSessionID == pending.owner.loginSessionID)
+                } else { notifyCurrentRoom = true }
                 attachmentRemoteCommands.remove(id)
                 if let pending = remoteFilesByCommandID.removeValue(forKey: id) {
                     pendingAttachments[pending.key, default: []].append(contentsOf: pending.files)
@@ -2724,9 +2884,11 @@ final class AIAssistantModel: ObservableObject {
                     remoteRestoreGeneration += 1
                 }
             }
-            showTransientError(
-                "所属设备是否执行了操作尚未确定，请先查看会话记录，不要直接重复发送",
-                duration: .seconds(12))
+            if notifyCurrentRoom {
+                showTransientError(
+                    "所属设备是否执行了操作尚未确定，请先查看会话记录，不要直接重复发送",
+                    duration: .seconds(12))
+            }
         }
         if pendingRemoteSelection != nil,
            Date().timeIntervalSince(pendingRemoteSelectionStarted) > 20 {
@@ -2750,16 +2912,37 @@ final class AIAssistantModel: ObservableObject {
         if selectedRemote?.id == remote.id &&
             selectedRemote?.loginSessionID == remote.loginSessionID {
             scrollRequest += 1
+            await requestRemoteConfiguration(remote)
             return
         }
+        let generation = submissionGeneration
+        let account = screenFrameCurrentAccountID
         selectionGeneration &+= 1
+        let selection = selectionGeneration
         pendingRemoteSelection = remote
         pendingRemoteSelectionStarted = Date()
         do {
-            let data = try await remoteTransport.history(ownerSlot: remote.deviceSlot,
+            let data: Data
+            #if DEBUG && targetEnvironment(simulator)
+            if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test"),
+               let handler = uiTestSupport.sessionModelHistoryHandler { data = try await handler(remote) }
+            else { data = try await remoteTransport.history(ownerSlot: remote.deviceSlot,
+                sessionID: remote.sessionID, before: "", limit: Self.recentMessageCount) }
+            #else
+            data = try await remoteTransport.history(ownerSlot: remote.deviceSlot,
                 sessionID: remote.sessionID, before: "", limit: Self.recentMessageCount)
+            #endif
+            guard generation == submissionGeneration, account == screenFrameCurrentAccountID,
+                  selection == selectionGeneration, pendingRemoteSelection?.id == remote.id,
+                  pendingRemoteSelection?.loginSessionID == remote.loginSessionID else { return }
             applyRemoteHistory(data, source: remote, older: false)
+            if selectedRemote?.id == remote.id, selectedRemote?.loginSessionID == remote.loginSessionID {
+                await requestRemoteConfiguration(remote)
+            }
         } catch {
+            guard generation == submissionGeneration, account == screenFrameCurrentAccountID,
+                  selection == selectionGeneration, pendingRemoteSelection?.id == remote.id,
+                  pendingRemoteSelection?.loginSessionID == remote.loginSessionID else { return }
             pendingRemoteSelection = nil
             logAIHistoryEvent("remote-select-error \(error.localizedDescription)")
             showTransientError(error.localizedDescription, duration: .seconds(8))
@@ -2857,6 +3040,56 @@ final class AIAssistantModel: ObservableObject {
             }
             return
         }
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           object["type"] as? String == "command_result",
+           let id = object["command_id"] as? String, let pending = pendingModelOwners[id] {
+            let owner = pending.owner
+            guard pending.generation == submissionGeneration, pending.account == screenFrameCurrentAccountID,
+                  owner.sessionID == envelope.sessionID, owner.deviceSlot == envelope.fromSlot,
+                  owner.loginSessionID == envelope.fromLoginSessionID else { return }
+            guard pendingRemoteCommands[id] != nil,
+                  let result = object["result"] as? [String: Any], let success = result["ok"] as? Bool else { return }
+            // 先验证完整回执，再消费请求。错误 owner、错误型号/等级或旧回执不能吞掉正确确认。
+            if success {
+                guard result["session"] as? String == owner.sessionID,
+                      let model = result["model"] as? String,
+                      let effort = result["reasoningEffort"] as? String,
+                      let wire = result["wire"] as? String,
+                      validRemoteModelConfiguration(model: model, effort: effort, wire: wire),
+                      pending.model == nil || pending.model == model,
+                      pending.reasoningEffort == nil || effort == pending.reasoningEffort else { return }
+            }
+            pendingRemoteCommands.removeValue(forKey: id)
+            pendingModelOwners.removeValue(forKey: id)
+            if remoteDeliveryPendingIDs.contains(id) { remoteResultByCommandID[id] = success }
+            if let fingerprint = remoteFingerprintByCommandID.removeValue(forKey: id) {
+                remoteRetryIDByFingerprint.removeValue(forKey: fingerprint)
+            }
+            guard latestModelCommandByRemote[owner.id] == id else { return }
+            latestModelCommandByRemote.removeValue(forKey: owner.id)
+            guard success else {
+                if selectedRemote?.id == owner.id && selectedRemote?.loginSessionID == owner.loginSessionID {
+                    showTransientError(result["error"] as? String ?? "所属设备未保存模型配置", duration: .seconds(8))
+                }
+                return
+            }
+            let model = result["model"] as? String ?? ""
+            let effort = result["reasoningEffort"] as? String ?? ""
+            let wire = result["wire"] as? String ?? ""
+            var current = owner
+            current.model = model; current.reasoningEffort = effort; current.wire = wire
+            if let index = remoteSessions.firstIndex(where: { $0.id == owner.id && $0.loginSessionID == owner.loginSessionID }) {
+                remoteSessions[index] = current
+            }
+            if selectedRemote?.id == owner.id && selectedRemote?.loginSessionID == owner.loginSessionID {
+                selectedRemote = current
+                if let fallback = result["defaultReasoningEffort"] as? String, ["low", "high", "max"].contains(fallback) {
+                    sessionDefaultReasoningEffort = fallback
+                }
+                projectSessionConfiguration(model: model, effort: effort, wire: wire)
+            }
+            return
+        }
         let source = pendingRemoteSelection ?? selectedRemote
         guard let source, source.sessionID == envelope.sessionID,
               source.deviceSlot == envelope.fromSlot,
@@ -2916,6 +3149,13 @@ final class AIAssistantModel: ObservableObject {
         applyRemotePage(page, source: source, older: false)
     }
 
+    private func validRemoteModelConfiguration(model: String, effort: String, wire: String) -> Bool {
+        guard ["", "low", "high", "max"].contains(effort) else { return false }
+        if model.hasPrefix("local:"), model.count > "local:".count { return wire == "local" }
+        guard AIModelSettings.cloudModels.contains(model) else { return false }
+        return wire == (["glm-5.3", "glm-5.3-flash"].contains(model) ? "chat_completions" : "responses")
+    }
+
     private func applyRemoteHistory(_ data: Data, source: AIRemoteSession,
                                     older: Bool) {
         guard let page = try? JSONDecoder().decode(AIResponse.self, from: data),
@@ -2926,12 +3166,35 @@ final class AIAssistantModel: ObservableObject {
     private func applyRemotePage(_ page: AIResponse, source: AIRemoteSession,
                                  older: Bool) {
         var source = source
+        // 旧页请求捕获的 discovery 对象可能早于一次模型 ACK；分页不能回退配置。
+        if let current = remoteSessions.first(where: { $0.id == source.id && $0.loginSessionID == source.loginSessionID }) {
+            source.model = current.model
+            source.reasoningEffort = current.reasoningEffort
+            source.wire = current.wire
+        }
         if let busy = page.busy { source.busy = busy }
         if let turnId = page.turnId { source.turnId = turnId }
+        if !older, page.session == source.sessionID,
+           let model = page.model, let effort = page.reasoningEffort, let wire = page.wire,
+           validRemoteModelConfiguration(model: model, effort: effort, wire: wire),
+           !pendingModelOwners.values.contains(where: {
+               $0.owner.id == source.id && $0.owner.loginSessionID == source.loginSessionID
+           }) {
+            source.model = model; source.reasoningEffort = effort; source.wire = wire
+            if selectedRemote?.id == source.id || pendingRemoteSelection?.id == source.id,
+               let fallback = page.defaultReasoningEffort, ["low", "high", "max"].contains(fallback) {
+                sessionDefaultReasoningEffort = fallback
+            }
+        }
         if let index = remoteSessions.firstIndex(where: {
             $0.id == source.id && $0.loginSessionID == source.loginSessionID
         }) { remoteSessions[index] = source }
-        if selectedRemote?.id == source.id { selectedRemote = source }
+        if selectedRemote?.id == source.id || pendingRemoteSelection?.id == source.id {
+            if selectedRemote?.id == source.id { selectedRemote = source }
+            if let model = source.model {
+                projectSessionConfiguration(model: model, effort: source.reasoningEffort, wire: source.wire)
+            }
+        }
         guard let received = page.messages else { return }
         let displayMessages = received.map(remoteDisplayMessage)
         if pendingRemoteSelection?.id == source.id {
@@ -3022,7 +3285,9 @@ final class AIAssistantModel: ObservableObject {
         }
         let safePage = page.map(remoteHistoryMessage)
         let encoded = try JSONEncoder().encode(safePage)
-        return ["ok": true,
+        return ["ok": true, "session": state.session ?? "", "model": state.model ?? "",
+                "reasoningEffort": state.reasoningEffort ?? "", "wire": state.wire ?? "",
+                "defaultReasoningEffort": state.defaultReasoningEffort ?? "high",
                 "busy": state.busy ?? false, "turnId": state.turnId ?? "",
                 "messages": try JSONSerialization.jsonObject(with: encoded),
                 "questionMessages": try JSONSerialization.jsonObject(
@@ -3307,6 +3572,21 @@ final class AIAssistantModel: ObservableObject {
                         }
                     }
                 }
+            case "get_session", "set_model":
+                var values = ["session": envelope.sessionID]
+                if envelope.payload.action == "set_model" {
+                    guard let model = envelope.payload.model, !model.isEmpty else {
+                        throw AIBackendError(message: "缺少主模型编号", code: "invalid_input")
+                    }
+                    values["model"] = model
+                    if let effort = envelope.payload.reasoningEffort { values["reasoningEffort"] = effort }
+                }
+                let choice = try await backend.request(envelope.payload.action ?? "", values: values)
+                result = ["ok": true, "session": choice.session ?? envelope.sessionID,
+                          "model": choice.model ?? "", "reasoningEffort": choice.reasoningEffort ?? "",
+                          "defaultReasoningEffort": choice.defaultReasoningEffort ?? "high",
+                          "wire": choice.wire ?? ""]
+                localSessionChanged(envelope.sessionID)
             case "stop":
                 let closeCamera = AIMobileLocalMediaRequests.shared.cameraSessionID == envelope.sessionID
                 do {
@@ -3357,6 +3637,7 @@ final class AIAssistantModel: ObservableObject {
                 remoteSteeringImportRevision &+= 1
             }
             result = ["ok": false, "error": error.localizedDescription]
+            if let code = (error as? AIBackendError)?.code { result["errorCode"] = code }
             if unknown { result["delivery_unknown"] = true }
         }
         try? await remoteTransport.sendPayload(
@@ -3443,10 +3724,46 @@ final class AIAssistantModel: ObservableObject {
             }
         }
     }
+    private func preparePrimaryModelForDisplay() async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test"),
+           let handler = uiTestSupport.sessionModelPreparationHandler { try await handler(); return }
+        #endif
+        try await backend.prepareLocalPrimaryModel()
+    }
+
+    private func displaySessionSnapshot(_ session: String, force: Bool) async throws -> AIResponse {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test"),
+           let data = try uiTestSupport.sessionModelSnapshotHandler?(session) {
+            return try JSONDecoder().decode(AIResponse.self, from: data)
+        }
+        #endif
+        return try await backend.snapshot(session: session, limit: Self.recentMessageCount, force: force)
+    }
+
+    private func createModelChoiceSession(_ values: [String: String]) async throws -> AIResponse {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") {
+            uiTestSupport.sessionModelCreateObserver?(values)
+        }
+        #endif
+        return try await backend.request("create", values: values)
+    }
+
     private func refresh(force: Bool) async {
         if selectedRemote != nil { return }
+        let target = selected
+        let selection = selectionGeneration
+        let generation = submissionGeneration
+        let account = screenFrameCurrentAccountID
+        func isCurrentPage() -> Bool {
+            self === Self.shared && !outgoingPermanentlyInvalidated && !Task.isCancelled &&
+                selectedRemote == nil && selected == target && selectionGeneration == selection &&
+                submissionGeneration == generation && screenFrameCurrentAccountID == account
+        }
         #if DEBUG && targetEnvironment(simulator)
-        let primaryModelUITest = AIPrimaryModelUITestSupport.isRequested
+        let primaryModelUITest = AIPrimaryModelUITestSupport.isRequested || AIPrimaryModelUITestSupport.isSessionConfigurationRequested
         #else
         let primaryModelUITest = false
         #endif
@@ -3454,14 +3771,27 @@ final class AIAssistantModel: ObservableObject {
             try? await AICloudCredentialSync.refreshSeedanceIfNeeded()
             try? await AICloudCredentialSync.refreshBailianIfNeeded()
         }
-        let target = selected
+        guard isCurrentPage() else { return }
         do {
             // 轮询只同步最近几条；旧消息由用户上滑时单独分页读取，避免又把首屏扩成 30 条。
-            let result = try await backend.snapshot(session: target,
-                                                    limit: Self.recentMessageCount, force: force)
-            guard target == selected else { return }
-            if let model = result.model { actualModelID = model }
-            if let wire = result.wire { actualWire = wire }
+            var result = try await displaySessionSnapshot(target, force: force)
+            guard isCurrentPage() else { return }
+            if let effort = result.defaultReasoningEffort { sessionDefaultReasoningEffort = effort }
+            if result.selectedWire == "local" {
+                projectSessionConfiguration(model: result.selectedModel ?? "", effort: result.selectedReasoningEffort,
+                                            wire: result.selectedWire)
+                configured = false
+                try await preparePrimaryModelForDisplay()
+                guard isCurrentPage() else { return }
+                result = try await displaySessionSnapshot(target, force: true)
+                guard isCurrentPage() else { return }
+            }
+            if let model = result.selectedModel ?? result.model { actualModelID = model }
+            if let wire = result.selectedWire ?? result.wire { actualWire = wire }
+            if let model = result.selectedModel {
+                projectSessionConfiguration(model: model, effort: result.selectedReasoningEffort,
+                                            wire: result.selectedWire)
+            }
             if let selected = result.localGpuSelected { actualGPUSelected = selected }
             if let bytes = result.localGpuModelBytes { actualGPUModelBytes = bytes }
             if let backend = result.localGpuBackend { actualGPUBackend = backend }
@@ -3515,7 +3845,11 @@ final class AIAssistantModel: ObservableObject {
             } else {
                 lastBackendError = ""
             }
-        } catch { showTransientError(error.localizedDescription, duration: .seconds(8)) }
+        } catch is CancellationError { }
+        catch {
+            guard isCurrentPage() else { return }
+            showTransientError(error.localizedDescription, duration: .seconds(8))
+        }
     }
 
     private func showNewestMessage(for session: String) async throws -> String? {
@@ -3657,6 +3991,7 @@ final class AIAssistantModel: ObservableObject {
             selectedRemote = nil
             pendingRemoteSelection = nil
             selected = ""
+            projectSessionConfiguration(model: "deepseek-flash", effort: nil, wire: "responses")
             messages = []
             permissions = []
             questions = []
@@ -3879,10 +4214,18 @@ final class AIAssistantModel: ObservableObject {
         let digest = SHA256.hash(data: encoded).map { String(format: "%02x", $0) }.joined()
         let fingerprint = [remote.deviceSlot, remote.loginSessionID,
                            remote.sessionID, digest].joined(separator: ":")
-        let id = remoteRetryIDByFingerprint[fingerprint] ??
+        // A read must get a fresh receipt ID after timeout/reconnect. Mutating
+        // commands retain their explicit retry ID for owner-side deduplication.
+        let id = (payload["action"] as? String == "get_session" ? nil : remoteRetryIDByFingerprint[fingerprint]) ??
             UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         remoteRetryIDByFingerprint[fingerprint] = id
         pendingRemoteCommands[id] = Date()
+        if let action = payload["action"] as? String, ["set_model", "get_session"].contains(action) {
+            latestModelCommandByRemote[remote.id] = id
+            pendingModelOwners[id] = PendingModelChoice(owner: remote, action: action, model: payload["model"] as? String,
+                reasoningEffort: payload["reasoningEffort"] as? String,
+                generation: submissionGeneration, account: screenFrameCurrentAccountID)
+        }
         if let attachments = payload["attachments"] as? [[String: String]],
            !attachments.isEmpty { attachmentRemoteCommands.insert(id) }
         remoteFingerprintByCommandID[id] = fingerprint
@@ -3894,8 +4237,13 @@ final class AIAssistantModel: ObservableObject {
             if let optimisticID { remoteOptimisticByCommandID[id] = optimisticID }
         }
         do {
-            try await remoteTransport.sendCommand(to: remote, encodedPayload: encoded,
-                                                  messageID: id)
+            #if DEBUG && targetEnvironment(simulator)
+            if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test"),
+               let handler = uiTestSupport.sessionModelCommandHandler { try await handler(remote, id, payload) }
+            else { try await remoteTransport.sendCommand(to: remote, encodedPayload: encoded, messageID: id) }
+            #else
+            try await remoteTransport.sendCommand(to: remote, encodedPayload: encoded, messageID: id)
+            #endif
         } catch {
             if remoteResultByCommandID[id] == nil { throw error }
         }
@@ -4527,15 +4875,97 @@ final class AIAssistantModel: ObservableObject {
             ownerLoginSessionID: login, sessionID: session)
         try await MaiCloudDriveClient.shared.cleanupSessionRoom(room)
     }
-    /// 与思考强度相同，点选立即提交；成功前保留原来源和原会话，不创建设置弹窗。
-    func selectPrimaryModelSource(local: Bool) async {
-        guard ready, selectedRemote == nil, !busy, !isSubmitting, !changingModelSource,
-              settings.isLocalModel != local else { return }
+    /// 显示层投影 owner 的会话配置；不写设置文件，不配置/重建 Native Agent。
+    private func projectSessionConfiguration(model: String, effort: String?, wire: String?) {
+        if model.hasPrefix("local:") {
+            settings.modelProvider = "llama"
+            settings.model = model
+        } else if AIModelSettings.cloudModels.contains(model) {
+            settings.selectModel(model)
+        } else {
+            #if DEBUG && targetEnvironment(simulator)
+            if model == "test-model" { settings.modelProvider = "remote"; settings.model = model }
+            #endif
+        }
+        settings.reasoningEffort = effort?.isEmpty == false ? effort : sessionDefaultReasoningEffort
+        actualModelID = model
+        if let wire { actualWire = wire }
+    }
+
+    var canChangeSessionModel: Bool {
+        !busy && !isSubmitting && !isCreatingConversation && !changingModelSource &&
+            (selectedRemote.map { $0.online && $0.model != nil } ?? ready)
+    }
+
+    var canChangeSessionReasoningEffort: Bool {
+        canChangeSessionModel && (selectedRemote.map {
+            AIModelSettings.cloudModels.contains($0.model ?? "")
+        } ?? true)
+    }
+
+    func selectPrimaryModel(_ model: String, reasoningEffort: String? = nil) async {
+        guard canChangeSessionModel else { return }
+        guard AIModelSettings.cloudModels.contains(model) || model == "local:" + AILocalModelStore.bundledPrimaryID else { return }
+        if let reasoningEffort, !["", "low", "high", "max"].contains(reasoningEffort) { return }
+        let target = selected
+        let remote = selectedRemote
+        let generation = submissionGeneration
+        let draftToken = emptyDraftToken
+        let selection = selectionGeneration
+        let requestedEffort = reasoningEffort ?? settings.effectiveReasoningEffort
+        let account = screenFrameCurrentAccountID
         changingModelSource = true
         defer { changingModelSource = false }
-        var next = settings
-        next.selectModelSource(local: local)
-        _ = await save(next)
+        do {
+            if let remote {
+                guard AIModelSettings.cloudModels.contains(model) else { return }
+                var payload: [String: Any] = ["action": "set_model", "model": model]
+                if let reasoningEffort { payload["reasoningEffort"] = reasoningEffort }
+                _ = try await enqueueRemoteCommand(to: remote, payload: payload)
+                return // 只有 owner ACK/history 可以提交显示选择，传输成功不冒充保存成功。
+            }
+            if model.hasPrefix("local:") { try await preparePrimaryModelForDisplay() }
+            guard generation == submissionGeneration else { throw CancellationError() }
+            if target.isEmpty {
+                // Leaving a blank page while its local model prepares cancels that
+                // choice. Check before creating anything, including leave-and-return.
+                guard account == screenFrameCurrentAccountID, selectedRemote == nil, selected.isEmpty,
+                      emptyDraftToken == draftToken, selectionGeneration == selection else { return }
+                let created = try await createModelChoiceSession(["model": model,
+                    "reasoningEffort": requestedEffort])
+                guard let id = created.id, !id.isEmpty else { throw AIBackendError(message: "没有返回会话编号") }
+                guard generation == submissionGeneration, account == screenFrameCurrentAccountID,
+                      selectedRemote == nil, selected.isEmpty, emptyDraftToken == draftToken,
+                      selectionGeneration == selection else { return }
+                migrateEmptyDraft(to: id)
+                await selectConversation(id)
+            } else {
+                var values = ["session": target, "model": model]
+                if let reasoningEffort { values["reasoningEffort"] = reasoningEffort }
+                _ = try await backend.request("set_model", values: values)
+                guard generation == submissionGeneration else { return }
+                await refresh(force: true)
+            }
+        } catch is CancellationError { }
+        catch {
+            guard generation == submissionGeneration, account == screenFrameCurrentAccountID else { return }
+            if let remote {
+                guard selectedRemote?.id == remote.id, selectedRemote?.loginSessionID == remote.loginSessionID else { return }
+            } else {
+                guard selectedRemote == nil, selected == target,
+                      !target.isEmpty || (emptyDraftToken == draftToken && selectionGeneration == selection) else { return }
+            }
+            showTransientError(error.localizedDescription, duration: .seconds(8))
+        }
+    }
+
+    func selectReasoningEffort(_ effort: String) async {
+        guard canChangeSessionReasoningEffort else { return }
+        await selectPrimaryModel(settings.model, reasoningEffort: effort)
+    }
+
+    func selectPrimaryModelSource(local: Bool) async {
+        await selectPrimaryModel(local ? "local:" + AILocalModelStore.bundledPrimaryID : "deepseek-flash")
     }
 
     func save(_ config: AIModelSettings) async -> Bool {
@@ -4543,7 +4973,8 @@ final class AIAssistantModel: ObservableObject {
         do {
             var normalized = config
             normalized.selectModel(config.model)
-            settings = try await backend.save(normalized)
+            let savedDefaults = try await backend.save(normalized)
+            settings.policy = savedDefaults.policy
             guard self === Self.shared, !outgoingPermanentlyInvalidated else { return false }
             ready = true
             error = ""

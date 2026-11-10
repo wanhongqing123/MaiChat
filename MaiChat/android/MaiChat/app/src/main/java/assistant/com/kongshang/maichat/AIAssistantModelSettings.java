@@ -1,4 +1,4 @@
-// Account-scoped primary-model settings. Paths and credentials are resolved only while configuring.
+// Account defaults for newly created sessions. Existing choices live in the shared session DB.
 package com.kongshang.maichat;
 
 import java.io.File;
@@ -40,9 +40,10 @@ final class AIAssistantModelSettings {
     }
     boolean isLocal() { return local; }
     String model() { return local ? "local:" + LOCAL_MODEL_ID : cloudModel; }
-    String baseUrl() { return local ? "" : cloudModel.equals("deepseek-flash")
-        ? "https://api.deepseek.com" : "https://open.bigmodel.cn/api/v1"; }
-    String wire() { return local ? "local" : "responses"; }
+    String baseUrl() { return local ? "" : cloudModel.startsWith("deepseek-")
+        ? "https://api.deepseek.com" : "https://open.bigmodel.cn/api/paas/v4"; }
+    String wire() { return local ? "local" : cloudModel.startsWith("glm-")
+        ? "chat_completions" : "responses"; }
 
     AIAssistantModelSettings selectSource(boolean local) {
         return this.local == local ? this : new AIAssistantModelSettings(local, cloudModel, policy, effort);
@@ -74,8 +75,9 @@ final class AIAssistantModelSettings {
         return result;
     }
 
-    private static boolean supportedCloud(String model) {
-        return "deepseek-flash".equals(model) || "glm-5.3".equals(model) || "glm-5.3-flash".equals(model);
+    static boolean supportedCloud(String model) {
+        return "deepseek-flash".equals(model) || "deepseek-v4-pro".equals(model)
+            || "glm-5.3".equals(model) || "glm-5.3-flash".equals(model);
     }
     private static boolean supportedPolicy(String policy) {
         return "on-request".equals(policy) || "unless-trusted".equals(policy) || "never".equals(policy);

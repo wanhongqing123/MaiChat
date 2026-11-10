@@ -59,7 +59,7 @@ MaiModelContextLimits maiOfficialModelContextLimits(const std::string& baseUrl,
     // https://api-docs.deepseek.com/quick_start/pricing/
     // https://api-docs.deepseek.com/api/list-models/
     if ((endpoint == "https://api.deepseek.com" || endpoint == "https://api.deepseek.com/v1") &&
-        model == "deepseek-flash")
+        (model == "deepseek-flash" || model == "deepseek-v4-pro"))
         return {1048576, 393216};
     return {};
 }
@@ -99,4 +99,8 @@ MaiModelContextLimits MaiModelClient::contextLimits(const std::string&) const {
 
 MaiModelTokenEstimate MaiModelClient::estimateInputTokens(const MaiModelRequest& request) const {
     return maiEstimateModelInputTokens(request);
+}
+
+std::optional<MaiWireApi> MaiModelClient::wireApiForModel(const std::string&) const {
+    return wireApi();
 }

@@ -25,6 +25,16 @@ extern "C" {
 // 读写会话或调用宿主凭据；工具输出请求本身算失败。用于隔离设备验收，不代表Agent工具闭环。
 void* maiMobileAgentCreate(void);
 void maiMobileAgentDestroy(void* handle);
+// 会话模型操作：set_model 带 session/model/reasoningEffort?，get_session 带 session。
+// effort 省略不修改，空串恢复继承，显式值仅 low/high/max；非法/未配置/目标 busy 整次拒绝。
+// 成功均返回 ok/session/model/reasoningEffort/wire；snapshot sessions[] 有同名配置字段，
+// selectedModel/selectedReasoningEffort/selectedWire 投影选中会话；旧 top model/wire 仅是新会话默认。
+// defaultReasoningEffort 仅作空 override 的显示解释，reasoningEffort 本身仍是持久原值。
+// prepare_local_model 仅本机宿主可用，带 model 和原 localModelPath/Projector/预算字段，
+// 验证后初始化 lazy slot，不加载权重或重建 Agent；远端 set_model 不接受此操作/任何路径。
+// send/enqueue/steer 不覆盖会话选择。configure 可提供 glmBaseUrl/deepseekBaseUrl，
+// 可同时预检 localModelName/localModelPath 等现有本地参数；选择会话不重建 Agent。
+// 四个正式云型号每请求使用既有 glm_api_key/deepseek_api_key 账号回调，不沿用旧 Key 兜底。
 char* maiMobileAgentRequest(void* handle, const char* request);
 void maiMobileAgentFree(char* response);
 

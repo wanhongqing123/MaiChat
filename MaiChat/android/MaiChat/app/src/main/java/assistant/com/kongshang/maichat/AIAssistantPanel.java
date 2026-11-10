@@ -112,9 +112,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private AIAssistantActionMenu actionMenu;
     private ScrollView actionScroll;
     private View actionAnchor;
-    private String actionOwner = "", actionEffort = "high", actionPolicy = "on-request";
+    private String actionOwner = "", actionRoomOwner = "", actionEffort = "high", actionPolicy = "on-request";
     private boolean actionRemote, settingsSavePending;
-    private long actionAccountGeneration;
+    private long actionAccountGeneration, actionOperationGeneration;
     private LinearLayout sessionDrawerList;
     private ScrollView sessionDrawerScroll;
     private String sessionDrawerSignature = "";
@@ -854,7 +854,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (state.remoteSession == null && sending.stream().anyMatch(file ->
                 file.image || file.mimeType.startsWith("video/")) &&
             !AIAssistantMediaPolicy.supportsImages(state.model)) {
-            Toast.makeText(activity, controller.isLocalModel()
+            Toast.makeText(activity, state.model.startsWith("local:")
                 ? "本地主模型当前仅支持文字和工具，请切换到云端模型后发送图片或视频。"
                 : "当前主模型仅支持文字，请选择支持图片或视频的云端模型。",
                 Toast.LENGTH_LONG).show();
@@ -2129,6 +2129,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         hideAttachmentPanel();
         actionOwner = selected;
         actionRemote = state.remoteSession != null;
+        actionRoomOwner = AIAssistantController.outgoingOwner(selected, state.remoteSession);
         actionAccountGeneration = MaiChatAuthClient.shared(activity).accountSessionGeneration();
         actionAnchor = anchor;
         ScrollView scroll = new ScrollView(activity);
@@ -2151,36 +2152,36 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             actionMenu = null;
             actionScroll = null;
             actionAnchor = null;
+            settingsSavePending = false;
+            actionOperationGeneration++;
         });
-        if (actionRemote) {
-            LinearLayout panel = column();
-            panel.addView(actionPanelRow("所属设备", state.remoteSession.optString("device_name"),
-                MaiChatTheme.TEXT, v -> popup.dismiss()), matchWrap());
-            scroll.addView(panel, new ScrollView.LayoutParams(-1, -2));
-        } else {
-            actionMenu = new AIAssistantActionMenu(activity, new AIAssistantActionMenu.Listener() {
-                @Override public void selectModelSource(boolean local) {
-                    if (actionPopup != popup || !popup.isShowing()) return;
-                    saveActionModelSource(local);
-                }
-                @Override public void selectEffort(String effort) {
-                    if (actionPopup != popup || !popup.isShowing()) return;
-                    saveActionSettings(effort, state == null ? "" : state.policy);
-                }
-                @Override public void selectPolicy(String policy) {
-                    if (actionPopup != popup || !popup.isShowing()) return;
-                    saveActionSettings(controller.reasoningEffort(), policy);
-                }
-                @Override public void clearConversation() {
-                    if (actionPopup != popup || !popup.isShowing()) return;
-                    if (!canClearFromActionMenu()) return;
-                    dismissActionMenu();
-                    confirmClearConversation();
-                }
-            }, this::resizeActionMenu);
-            scroll.addView(actionMenu, new ScrollView.LayoutParams(-1, -2));
-            updateActionMenu();
-        }
+        LinearLayout content = column();
+        actionMenu = new AIAssistantActionMenu(activity, new AIAssistantActionMenu.Listener() {
+            @Override public void selectModel(String model) {
+                if (actionPopup != popup || !popup.isShowing()) return;
+                saveActionModel(model);
+            }
+            @Override public void selectEffort(String effort) {
+                if (actionPopup != popup || !popup.isShowing()) return;
+                saveActionSettings(effort, state == null ? "" : state.policy);
+            }
+            @Override public void selectPolicy(String policy) {
+                if (actionPopup != popup || !popup.isShowing()) return;
+                saveActionSettings(state == null ? "" : state.reasoningEffort, policy);
+            }
+            @Override public void clearConversation() {
+                if (actionPopup != popup || !popup.isShowing()) return;
+                if (!canClearFromActionMenu()) return;
+                dismissActionMenu();
+                confirmClearConversation();
+            }
+        }, this::resizeActionMenu, actionRemote);
+        content.addView(actionMenu, matchWrap());
+        if (actionRemote) content.addView(actionPanelRow("所属设备",
+            state.remoteSession.optString("device_name"), MaiChatTheme.TEXT,
+            v -> popup.dismiss()), matchWrap());
+        scroll.addView(content, new ScrollView.LayoutParams(-1, -2));
+        updateActionMenu();
         popup.setHeight(actionMenuHeight(scroll, anchor));
         popup.showAsDropDown(anchor, anchor.getWidth() - dp(264) + dp(2), dp(6));
         if (scroll.getParent() instanceof View) {
@@ -2214,21 +2215,25 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             popup.update(anchor, anchor.getWidth() - dp(264) + dp(2), dp(6), dp(264), height);
     }
     private boolean ownsActionMenu() {
-        return actionPopup != null && visibleToUser && state != null && !actionRemote
-            && state.remoteSession == null && actionOwner.equals(selected)
+        return actionPopup != null && visibleToUser && state != null
+            && actionRemote == (state.remoteSession != null) && actionOwner.equals(selected)
+            && actionRoomOwner.equals(AIAssistantController.outgoingOwner(selected, state.remoteSession))
             && actionAccountGeneration == MaiChatAuthClient.shared(activity).accountSessionGeneration();
     }
     private boolean canChangeActionSettings() {
         return ownsActionMenu() && state.ready && !state.busy()
+            && (!actionRemote || state.remoteSession.optBoolean("online")
+                && AIAssistantModelSettings.supportedCloud(state.model))
             && !navigationPending && !settingsSavePending && !controller.changingModelSource();
     }
     private boolean canChangeActionModel() {
         // A failed local restore must still allow an explicit return to a usable cloud source.
-        return ownsActionMenu() && controller.modelSettingsReady() && !state.busy()
+        return ownsActionMenu() && (actionRemote ? state.remoteSession.optBoolean("online")
+            : controller.modelSettingsReady()) && !state.busy()
             && !navigationPending && !settingsSavePending && !controller.changingModelSource();
     }
     private boolean canClearFromActionMenu() {
-        return ownsActionMenu() && !selected.isEmpty() && !state.busy()
+        return ownsActionMenu() && !actionRemote && !selected.isEmpty() && !state.busy()
             && !navigationPending && !settingsSavePending && !controller.changingModelSource();
     }
     private void updateActionMenu() {
@@ -2236,36 +2241,43 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         // Controller's worker updates reasoningEffort while configuring. Keep the last committed
         // labels until its completion; unrelated state publication must not enable a second save.
         if (!settingsSavePending) {
-            actionEffort = controller.reasoningEffort();
+            actionEffort = state.reasoningEffort;
             actionPolicy = state.policy;
         }
-        actionMenu.update(controller.isLocalModel(), controller.changingModelSource(), actionEffort,
+        actionMenu.update(state.model, controller.changingModelSource(), actionEffort,
             actionPolicy, canChangeActionSettings(), canChangeActionModel(), canClearFromActionMenu());
     }
-    private void saveActionModelSource(boolean local) {
-        if (!canChangeActionModel() || local == controller.isLocalModel() && state.ready) return;
+    private void saveActionModel(String model) {
+        if (!canChangeActionModel() || model.equals(state.model) && state.ready) return;
         final long ownerGeneration = actionAccountGeneration;
         final String owner = actionOwner;
+        final String room = actionRoomOwner;
+        final long operation = ++actionOperationGeneration;
         settingsSavePending = true;
         updateActionMenu();
-        controller.selectModelSource(local, success -> finishActionSettingsSave(owner,
-            ownerGeneration, success));
+        controller.switchModel(state, model, success -> finishActionSettingsSave(owner, room,
+            ownerGeneration, operation, success));
     }
     private void saveActionSettings(String effort, String policy) {
         if (!canChangeActionSettings()) return;
-        if (effort.equals(controller.reasoningEffort()) && policy.equals(state.policy)) return;
+        if (effort.equals(state.reasoningEffort) && policy.equals(state.policy)) return;
         final long ownerGeneration = actionAccountGeneration;
         final String owner = actionOwner;
+        final String room = actionRoomOwner;
+        final long operation = ++actionOperationGeneration;
         settingsSavePending = true;
         updateActionMenu();
-        controller.save(state.model, policy, effort, success -> {
-            finishActionSettingsSave(owner, ownerGeneration, success);
+        controller.save(state, state.model, policy, effort, success -> {
+            finishActionSettingsSave(owner, room, ownerGeneration, operation, success);
         });
     }
-    private void finishActionSettingsSave(String owner, long ownerGeneration, boolean success) {
+    private void finishActionSettingsSave(String owner, String room, long ownerGeneration,
+                                          long operation, boolean success) {
+        if (operation != actionOperationGeneration) return;
         settingsSavePending = false;
         updateActionMenu();
         if (!success && visibleToUser && isAttachedToWindow() && owner.equals(selected)
+                && room.equals(AIAssistantController.outgoingOwner(selected, state.remoteSession))
                 && ownerGeneration == MaiChatAuthClient.shared(activity).accountSessionGeneration())
             Toast.makeText(activity, controller.state.error, Toast.LENGTH_LONG).show();
     }

@@ -10,9 +10,16 @@ enum AIPrimaryModelUITestSupport {
         guard let device = MTLCreateSystemDefaultDevice() else { return false }
         return device.supportsFamily(.apple7) || device.supportsFamily(.metal3)
     }()
+    // 独立会话配置验收使用正常 C ABI 和两种 wire 的 loopback 服务，不请求真实供应商。
+    static var isSessionConfigurationRequested: Bool {
+        let arguments = ProcessInfo.processInfo.arguments
+        return arguments.contains("--ai-ui-test") && arguments.contains("--ai-session-model-ui-test")
+    }
+
     static var isRequested: Bool {
         let arguments = ProcessInfo.processInfo.arguments
-        return arguments.contains("--ai-ui-test") && arguments.contains("--ai-primary-model-ui-test")
+        return arguments.contains("--ai-ui-test") &&
+            (arguments.contains("--ai-primary-model-ui-test") || arguments.contains("--ai-session-model-ui-test") || arguments.contains("--ai-remote-session-model-ui-test"))
     }
 
 }
@@ -34,11 +41,27 @@ struct AIPrimaryModelUITestStatus: View {
                 .font(.caption2)
                 .accessibilityIdentifier("primary-ui-model-state")
                 .accessibilityValue("provider:\(model.settings.isLocalModel ? "llama" : "remote");configured:\(model.configured);busy:\(model.busy);assistant-text-count:\(count);session:\(model.selected);native-wire:\(model.actualWire);native-model:\(model.actualModelID);gpu-selected:\(model.actualGPUSelected);gpu-bytes:\(model.actualGPUModelBytes);gpu-backend:\(model.actualGPUBackend);error-empty:\(model.error.isEmpty && !model.actualBackendHasError);qwen-gpu-ops-supported:\(AIPrimaryModelUITestSupport.supportsQwenGPUOperations)")
+            Text("会话模型配置")
+                .font(.caption2)
+                .accessibilityIdentifier("primary-ui-session-configuration")
+                .accessibilityValue("session:\(model.selected);model:\(model.settings.model);effort:\(model.settings.effectiveReasoningEffort);wire:\(model.actualWire);remote:\(model.selectedRemote != nil)")
+            if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") {
+                AISessionModelRemoteUITestStatus()
+            }
             Text("实际回复内容")
                 .font(.caption2)
                 .accessibilityIdentifier("primary-ui-model-output")
                 .accessibilityValue(String(latest.prefix(2000)))
         }
+    }
+}
+
+private struct AISessionModelRemoteUITestStatus: View {
+    @ObservedObject private var support = AIAssistantModel.shared.uiTestSupport
+    var body: some View {
+        Text("远端会话模型检查").font(.caption2)
+            .accessibilityIdentifier("remote-session-model-checks")
+            .accessibilityValue(support.sessionModelPolicyResult)
     }
 }
 #endif

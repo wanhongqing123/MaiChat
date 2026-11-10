@@ -143,6 +143,10 @@ const char* maiSpecialistCapabilityStatusToString(MaiSpecialistCapabilityStatus 
 
 // ── MaiToolRegistry ─────────────────────────────────────────────
 
+MaiToolSpec MaiTool::specForModel(const std::string&) const {
+    return {name(), description(), parametersSchema()};
+}
+
 void MaiToolRegistry::add(std::unique_ptr<MaiTool> tool) {
     if (!tool) return;
     const std::string name = tool->name();
@@ -186,11 +190,7 @@ std::vector<MaiToolSpec> MaiToolRegistry::specs(const std::string& model) const 
     out.reserve(mTools.size());
     for (const auto& tool : mTools) {
         if (mInternalNames.count(tool->name()) > 0 || !tool->isAvailableForModel(model)) continue;
-        MaiToolSpec spec;
-        spec.name = tool->name();
-        spec.description = tool->description();
-        spec.parametersJson = tool->parametersSchema();
-        out.push_back(std::move(spec));
+        out.push_back(tool->specForModel(model));
     }
     return out;
 }

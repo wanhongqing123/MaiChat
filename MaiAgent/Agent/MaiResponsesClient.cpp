@@ -1,6 +1,7 @@
 // 文件作用：实现 OpenAI Responses 协议的请求和流式解析。
 // 直接依赖：MaiFilePath.h、MaiFileSystem.h、MaiPathGuard.h；本文件在这些接口之间完成调用与结果转换。
 #include "MaiResponsesClient.h"
+#include "MaiCloudModelCatalog.h"
 
 #include <curl/curl.h>
 #include <json.hpp>
@@ -243,7 +244,7 @@ MaiResult<std::string> buildBody(const MaiModelRequest& request,
 
     Json body{{"model", request.model}, {"input", std::move(input)}, {"stream", true}};
     if (request.maxOutputTokens != 0) body["max_output_tokens"] = request.maxOutputTokens;
-    if (request.model == "deepseek-flash" &&
+    if (maiCloudModelInfo(request.model).has_value() &&
         (request.reasoningEffort == "low" || request.reasoningEffort == "high" ||
          request.reasoningEffort == "max"))
         body["reasoning"] = Json{{"effort", request.reasoningEffort}};

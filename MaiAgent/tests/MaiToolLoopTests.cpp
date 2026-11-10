@@ -460,6 +460,23 @@ void test_tool_image_is_persisted_and_fed_back_to_the_model() {
 
     CHECK(model->requestCount() == 2);
     const MaiModelRequest second = model->request(1);
+    std::string sourceMessageId, imagePartId, toolPartId;
+    for (const auto& message : agent.listMessages(sessionId)) {
+        for (const auto& part : message.parts) {
+            if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
+                if (image->path == screenshot.u8string()) {
+                    sourceMessageId = message.id;
+                    imagePartId = part.id;
+                }
+            } else if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
+                if (tool->callId == "call_screenshot") {
+                    CHECK(tool->tool == "screenshot" && tool->state == MaiToolState::Completed);
+                    toolPartId = part.id;
+                }
+            }
+        }
+    }
+    CHECK(!sourceMessageId.empty() && !imagePartId.empty() && !toolPartId.empty());
     bool foundToolResult = false;
     bool foundScreenshot = false;
     std::size_t toolResultIndex = 0;
@@ -475,9 +492,32 @@ void test_tool_image_is_persisted_and_fed_back_to_the_model() {
             foundScreenshot = true;
             screenshotIndex = i;
             CHECK(message.images.front().mimeType == "image/png");
-            CHECK(message.content.find("Image returned") != std::string::npos);
+            // 观察消息通过真实 source/part 范围标记整组来源，不再依赖早期说明文案。
+            const auto provenance = nlohmann::json::parse(message.content, nullptr, false);
+            CHECK(provenance.is_object());
+            if (provenance.is_object()) {
+                CHECK(provenance.value("type", "") == "tool_group_image_observation");
+                CHECK(provenance.value("ownership", "") == "tool_group_only");
+                CHECK(provenance.value("source_message_id", "") == sourceMessageId);
+                CHECK(provenance.value("image_part_id", "") == imagePartId);
+                CHECK(provenance.value("first_tool_part_id", "") == toolPartId);
+                CHECK(provenance.value("through_tool_part_id", "") == toolPartId);
+                CHECK(provenance.value("tool_count", 0) == 1);
+                CHECK(provenance.value("archived_tool_count", -1) == 0);
+                CHECK(provenance.value("source_lookup_tool", "") == "session_history");
+                CHECK(provenance["tools"].is_array() && provenance["tools"].empty());
+            }
         }
     }
+    bool foundCall = false;
+    for (const auto& message : second.messages) {
+        for (const auto& invocation : message.invocations)
+            if (invocation.id == "call_screenshot") {
+                foundCall = true;
+                CHECK(invocation.name == "screenshot" && invocation.arguments == "{}");
+            }
+    }
+    CHECK(foundCall);
     CHECK(foundToolResult);
     CHECK(foundScreenshot);
     CHECK(toolResultIndex < screenshotIndex);

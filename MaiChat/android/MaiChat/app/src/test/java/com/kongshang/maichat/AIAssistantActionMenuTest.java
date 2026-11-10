@@ -19,24 +19,58 @@ import org.robolectric.shadows.ShadowAlertDialog;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34, manifest = Config.NONE)
 public final class AIAssistantActionMenuTest {
+    @Test public void mainModelMenuOffersExactCloudModelsAndKeepsEffortSeparate() {
+        AIAssistantActionMenu menu = menu();
+        click(menu, "主模型");
+        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
+            assertNotNull("Missing main-model choice: " + model, option(menu, model));
+        assertNotNull(option(menu, "本地模型"));
+        assertNull(option(menu, "简单"));
+        click(menu, "思考强度");
+        assertNull(option(menu, "glm-5.3"));
+        assertNotNull(option(menu, "简单"));
+    }
+
     private final List<String> efforts = new ArrayList<>(), policies = new ArrayList<>();
-    private final List<Boolean> modelSelections = new ArrayList<>();
+    private final List<String> modelSelections = new ArrayList<>();
     private int clears;
 
-    private AIAssistantActionMenu menu() {
+    private AIAssistantActionMenu menu() { return menu(false); }
+    private AIAssistantActionMenu menu(boolean remote) {
         Activity activity = Robolectric.buildActivity(Activity.class).setup().get();
         FrameLayout host = new FrameLayout(activity);
         activity.setContentView(host);
         AIAssistantActionMenu menu = new AIAssistantActionMenu(activity,
             new AIAssistantActionMenu.Listener() {
-                @Override public void selectModelSource(boolean local) { modelSelections.add(local); }
+                @Override public void selectModel(String model) { modelSelections.add(model); }
                 @Override public void selectEffort(String effort) { efforts.add(effort); }
                 @Override public void selectPolicy(String policy) { policies.add(policy); }
                 @Override public void clearConversation() { clears++; }
-            }, () -> { });
+            }, () -> { }, remote);
         host.addView(menu);
-        menu.update(false, false, "high", "on-request", true, true, true);
+        menu.update("deepseek-flash", false, "high", "on-request", true, true, true);
         return menu;
+    }
+
+    @Test public void remoteModelMenuKeepsCloudAndEffortButNeverOffersLocalPathsOrAccountPolicy() {
+        AIAssistantActionMenu menu = menu(true);
+        click(menu, "主模型");
+        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"})
+            assertNotNull(option(menu, model));
+        assertNull(option(menu, "本地模型"));
+        assertNull(heading(menu, "操作权限"));
+        assertNull(heading(menu, "清空当前对话"));
+        option(menu, "glm-5.3").performClick();
+        assertEquals(List.of("glm-5.3"), modelSelections);
+        menu.update("deepseek-flash", true, "high", "on-request", false, false, false);
+        assertTrue(option(menu, "deepseek-flash").isSelected());
+        assertFalse(option(menu, "glm-5.3").isSelected());
+        assertFalse(option(menu, "glm-5.3").isEnabled());
+        menu.update("glm-5.3", false, "max", "on-request", true, true, false);
+        assertTrue(option(menu, "glm-5.3").isSelected());
+        click(menu, "思考强度");
+        assertNull(option(menu, "glm-5.3"));
+        assertNotNull(option(menu, "深度"));
     }
 
     @Test public void primaryModelIsTheFirstSectionAndSharesTheExistingInlineMenu() {
@@ -45,14 +79,14 @@ public final class AIAssistantActionMenuTest {
         assertNotNull("The first action must be the real primary-model source", primary);
         assertSame(menu.getChildAt(0), primary);
         click(menu, "主模型");
-        assertNotNull(option(menu, "云端模型"));
+        assertNotNull(option(menu, "deepseek-flash"));
         assertNotNull(option(menu, "本地模型"));
-        assertTrue(option(menu, "云端模型").isSelected());
-        option(menu, "云端模型").performClick();
+        assertTrue(option(menu, "deepseek-flash").isSelected());
+        option(menu, "deepseek-flash").performClick();
         assertTrue("Selecting the current source must be a no-op", modelSelections.isEmpty());
         option(menu, "本地模型").performClick();
-        assertEquals(List.of(true), modelSelections);
-        assertNotNull("Choosing a source must keep its options in this menu", option(menu, "云端模型"));
+        assertEquals(List.of(AIAssistantSessionModels.LOCAL), modelSelections);
+        assertNotNull("Choosing a source must keep its options in this menu", option(menu, "deepseek-flash"));
         click(menu, "思考强度");
         assertNull(option(menu, "本地模型"));
         assertNotNull(option(menu, "简单"));
@@ -61,19 +95,19 @@ public final class AIAssistantActionMenuTest {
     @Test public void preparingKeepsTheCommittedSourceAndFailedRestoreStillAllowsRecovery() {
         AIAssistantActionMenu menu = menu();
         click(menu, "主模型");
-        menu.update(false, true, "high", "on-request", false, false, false);
-        assertTrue(option(menu, "云端模型").isSelected());
+        menu.update("deepseek-flash", true, "high", "on-request", false, false, false);
+        assertTrue(option(menu, "deepseek-flash").isSelected());
         assertFalse(option(menu, "本地模型").isSelected());
         assertFalse(option(menu, "本地模型").isEnabled());
         option(menu, "本地模型").performClick();
         assertTrue(modelSelections.isEmpty());
 
-        menu.update(true, false, "high", "on-request", false, true, false);
+        menu.update(AIAssistantSessionModels.LOCAL, false, "high", "on-request", false, true, false);
         assertTrue(option(menu, "本地模型").isSelected());
         assertTrue(heading(menu, "主模型").isEnabled());
         assertFalse(heading(menu, "思考强度").isEnabled());
-        option(menu, "云端模型").performClick();
-        assertEquals(List.of(false), modelSelections);
+        option(menu, "deepseek-flash").performClick();
+        assertEquals(List.of("deepseek-flash"), modelSelections);
         assertNotNull(option(menu, "本地模型"));
     }
 
@@ -104,7 +138,7 @@ public final class AIAssistantActionMenuTest {
         option(menu, "深度").performClick();
         assertEquals(List.of("max"), efforts);
         assertNotNull("Selection must keep this popup section open", option(menu, "简单"));
-        menu.update(false, false, "max", "on-request", true, true, true);
+        menu.update("deepseek-flash", false, "max", "on-request", true, true, true);
         assertTrue(option(menu, "深度").isSelected());
         assertFalse(option(menu, "标准").isSelected());
         click(menu, "操作权限");
@@ -119,7 +153,7 @@ public final class AIAssistantActionMenuTest {
     @Test public void stateChangesDisableOpenOptionsAndDoNotApplyAStaleSelection() {
         AIAssistantActionMenu menu = menu();
         click(menu, "操作权限");
-        menu.update(false, false, "high", "on-request", false, false, false);
+        menu.update("deepseek-flash", false, "high", "on-request", false, false, false);
         View choice = option(menu, "完全访问");
         assertNotNull(choice);
         assertFalse(choice.isEnabled());
@@ -128,7 +162,7 @@ public final class AIAssistantActionMenuTest {
         assertFalse(heading(menu, "思考强度").isEnabled());
         click(menu, "清空当前对话");
         assertEquals(0, clears);
-        menu.update(false, false, "high", "unless-trusted", true, true, true);
+        menu.update("deepseek-flash", false, "high", "unless-trusted", true, true, true);
         assertTrue(option(menu, "帮我批准").isSelected());
         option(menu, "请求批准").performClick();
         assertEquals(List.of("on-request"), policies);

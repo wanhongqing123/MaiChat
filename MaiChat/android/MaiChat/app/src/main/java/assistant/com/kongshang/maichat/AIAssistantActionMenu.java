@@ -25,7 +25,7 @@ final class AIAssistantActionMenu extends LinearLayout {
     private static final int CHECK = Color.rgb(0, 122, 255);
     private static final int MODEL_SECTION = 1, EFFORT_SECTION = 2, POLICY_SECTION = 3;
     interface Listener {
-        void selectModelSource(boolean local);
+        void selectModel(String model);
         void selectEffort(String effort);
         void selectPolicy(String policy);
         void clearConversation();
@@ -33,25 +33,36 @@ final class AIAssistantActionMenu extends LinearLayout {
 
     private final Listener listener;
     private final Runnable sizeChanged;
+    private final boolean remote;
+    private final String[] models;
     private final LinearLayout modelGroup, effortGroup, policyGroup;
     private final View modelHeading, effortHeading, policyHeading, clear;
     private final TextView modelValue, effortValue, policyValue;
     private final ImageView modelChevron, effortChevron, policyChevron;
+    private final View effortDivider, policyDivider;
     private final List<View> modelChoices = new ArrayList<>();
     private final List<ImageView> modelChecks = new ArrayList<>();
     private final List<View> effortChoices = new ArrayList<>(), policyChoices = new ArrayList<>();
     private final List<ImageView> effortChecks = new ArrayList<>(), policyChecks = new ArrayList<>();
     private static final String[] EFFORTS = {"low", "high", "max"};
     private static final String[] POLICIES = {"on-request", "unless-trusted", "never"};
-    private static final String[] MODEL_SOURCES = {"cloud", "llama"};
+    private static final String[] MODELS = {"glm-5.3", "glm-5.3-flash", "deepseek-flash",
+        "deepseek-v4-pro", AIAssistantSessionModels.LOCAL};
+    private String model = "deepseek-flash";
     private String effort = "high", policy = "on-request";
-    private boolean localModel, changingModelSource, changeModelAllowed, changeAllowed, clearAllowed;
+    private boolean changingModelSource, changeModelAllowed, changeAllowed, clearAllowed;
     private int expandedSection;
 
     AIAssistantActionMenu(Context context, Listener listener, Runnable sizeChanged) {
+        this(context, listener, sizeChanged, false);
+    }
+
+    AIAssistantActionMenu(Context context, Listener listener, Runnable sizeChanged, boolean remote) {
         super(context);
         this.listener = listener;
         this.sizeChanged = sizeChanged;
+        this.remote = remote;
+        this.models = remote ? java.util.Arrays.copyOf(MODELS, 4) : MODELS;
         setOrientation(VERTICAL);
         // The PopupWindow owns the single material background and outline. A second opaque
         // background here would hide its frost and make expanded groups look like flat blocks.
@@ -62,7 +73,8 @@ final class AIAssistantActionMenu extends LinearLayout {
         modelHeading = heading("主模型", R.drawable.ic_ai_menu_cpu, modelValue, modelChevron,
             ignored -> toggle(MODEL_SECTION));
         addView(modelHeading, match(dp(52)));
-        modelGroup = options(new String[]{"云端模型", "本地模型"}, MODEL_SOURCES,
+        String[] titles = {"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro", "本地模型"};
+        modelGroup = options(remote ? java.util.Arrays.copyOf(titles, 4) : titles, models,
             modelChoices, modelChecks, MODEL_SECTION);
         addView(modelGroup, match(LayoutParams.WRAP_CONTENT));
         addDivider();
@@ -75,7 +87,7 @@ final class AIAssistantActionMenu extends LinearLayout {
         effortGroup = options(new String[]{"简单", "标准", "深度"}, EFFORTS,
             effortChoices, effortChecks, EFFORT_SECTION);
         addView(effortGroup, match(LayoutParams.WRAP_CONTENT));
-        addDivider();
+        effortDivider = addDivider();
 
         policyValue = text("", MaiChatTypographyTokens.Role.METADATA, SECONDARY);
         policyChevron = icon(R.drawable.ic_ai_menu_chevron, PRIMARY);
@@ -89,7 +101,7 @@ final class AIAssistantActionMenu extends LinearLayout {
         explanation.setPadding(dp(14), 0, dp(14), dp(6));
         policyGroup.addView(explanation, match(LayoutParams.WRAP_CONTENT));
         addView(policyGroup, match(LayoutParams.WRAP_CONTENT));
-        addDivider();
+        policyDivider = addDivider();
 
         clear = heading("清空当前对话", R.drawable.ic_ai_menu_trash, null, null, ignored -> {
             if (clearAllowed) listener.clearConversation();
@@ -98,9 +110,9 @@ final class AIAssistantActionMenu extends LinearLayout {
         render();
     }
 
-    void update(boolean localModel, boolean changingModelSource, String effort, String policy,
+    void update(String model, boolean changingModelSource, String effort, String policy,
                 boolean changeAllowed, boolean changeModelAllowed, boolean clearAllowed) {
-        this.localModel = localModel;
+        this.model = model;
         this.changingModelSource = changingModelSource;
         this.effort = effort;
         this.policy = policy;
@@ -126,8 +138,11 @@ final class AIAssistantActionMenu extends LinearLayout {
 
     private void render() {
         // Preserve the committed source/check until the controller finishes preparing and saving.
-        modelValue.setText(changingModelSource ? "正在切换…" : localModel ? "本地模型" : "云端模型");
-        effortValue.setText(effort.equals("low") ? "简单" : effort.equals("max") ? "深度" : "标准");
+        modelValue.setText(changingModelSource ? remote ? "等待所属设备确认…" : "正在切换…"
+            : model.isEmpty() ? "未读取模型"
+            : model.startsWith("local:") ? "本地模型" : model);
+        effortValue.setText(remote && model.isEmpty() ? "未读取" : effort.isEmpty() ? "跟随默认"
+            : effort.equals("low") ? "简单" : effort.equals("max") ? "深度" : "标准");
         policyValue.setText(policy.equals("never") ? "完全访问"
             : policy.equals("unless-trusted") ? "帮我批准" : "请求批准");
         modelHeading.setEnabled(changeModelAllowed);
@@ -141,8 +156,12 @@ final class AIAssistantActionMenu extends LinearLayout {
         policyChevron.setRotation(expandedSection == POLICY_SECTION ? 90f : 0f);
         modelGroup.setVisibility(expandedSection == MODEL_SECTION ? VISIBLE : GONE);
         effortGroup.setVisibility(expandedSection == EFFORT_SECTION ? VISIBLE : GONE);
-        policyGroup.setVisibility(expandedSection == POLICY_SECTION ? VISIBLE : GONE);
-        refreshChoices(modelChoices, modelChecks, MODEL_SOURCES, localModel ? "llama" : "cloud",
+        policyGroup.setVisibility(!remote && expandedSection == POLICY_SECTION ? VISIBLE : GONE);
+        policyHeading.setVisibility(remote ? GONE : VISIBLE);
+        effortDivider.setVisibility(remote ? GONE : VISIBLE);
+        policyDivider.setVisibility(remote ? GONE : VISIBLE);
+        clear.setVisibility(remote ? GONE : VISIBLE);
+        refreshChoices(modelChoices, modelChecks, models, model,
             changeModelAllowed);
         refreshChoices(effortChoices, effortChecks, EFFORTS, effort, changeAllowed);
         refreshChoices(policyChoices, policyChecks, POLICIES, policy, changeAllowed);
@@ -182,9 +201,7 @@ final class AIAssistantActionMenu extends LinearLayout {
             row.addView(check, new LayoutParams(dp(12), dp(12)));
             row.setOnClickListener(ignored -> {
                 if (section == MODEL_SECTION) {
-                    boolean nextLocal = value.equals("llama");
-                    if (changeModelAllowed && nextLocal != localModel)
-                        listener.selectModelSource(nextLocal);
+                    if (changeModelAllowed && !value.equals(model)) listener.selectModel(value);
                     return;
                 }
                 if (!changeAllowed) return;
@@ -241,12 +258,13 @@ final class AIAssistantActionMenu extends LinearLayout {
         return icon;
     }
 
-    private void addDivider() {
+    private View addDivider() {
         View divider = new View(getContext());
         divider.setBackgroundColor(Color.rgb(198, 198, 200));
         LayoutParams params = match(1);
         params.leftMargin = dp(42);
         addView(divider, params);
+        return divider;
     }
 
     private TextView text(String text, MaiChatTypographyTokens.Role size, int color) {

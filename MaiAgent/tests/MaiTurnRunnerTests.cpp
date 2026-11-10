@@ -7,6 +7,7 @@
 // 真实 GLM 说的是同一个协议，切过去只改 baseUrl。
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <mutex>
 #include <set>
@@ -18,6 +19,7 @@
 #include <json.hpp>
 
 #include "MaiAgent.h"
+#include "MaiCloudModelCatalog.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
@@ -1280,14 +1282,149 @@ void test_unfenced_image_groups_follow_execute_tools_and_continue() {
     }
 }
 
+// 两会话共用客户端时仍把选择写入各自会话；活动轮次/工具上下文使用固定配置。
+void test_session_model_effort_are_atomic_and_turn_scoped() {
+    struct Probe final : MaiModelClient {
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::vector<MaiModelRequest> requests;
+        bool released = false;
+        int glmRequests = 0;
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::Mixed;
+        }
+        std::optional<MaiWireApi> wireApiForModel(const std::string& model) const override {
+            const auto info = maiCloudModelInfo(model);
+            return info ? std::optional<MaiWireApi>(info->wire) : std::nullopt;
+        }
+        MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
+                        const std::atomic<bool>& cancel) override {
+            std::unique_lock<std::mutex> lock(mutex);
+            requests.push_back(request);
+            const bool first = requests.size() == 1;
+            const int glmCycle = request.model == "glm-5.3" ? ++glmRequests : 0;
+            wake.notify_all();
+            if (first && !wake.wait_for(lock, std::chrono::seconds(10),
+                                        [&] { return released || cancel.load(); }))
+                return {MaiErrorCode::Internal, "Synthetic model gate timed out."};
+            lock.unlock();
+            if (cancel.load()) return {MaiErrorCode::Canceled, "Canceled."};
+            if (glmCycle > 0 && glmCycle <= 2) {
+                if (sink.onReasoning)
+                    sink.onReasoning("Opaque GLM reasoning " + std::to_string(glmCycle) + "\r\n");
+                if (sink.onToolCall)
+                    sink.onToolCall(
+                        {"session_effort_call_" + std::to_string(glmCycle), "effort_probe", "{}"});
+            } else if (sink.onText)
+                sink.onText("Completed.");
+            return {};
+        }
+    };
+    struct Tool final : MaiTool {
+        std::string actualModel;
+        std::string name() const override {
+            return "effort_probe";
+        }
+        std::string description() const override {
+            return "Synthetic current-turn model probe.";
+        }
+        std::string parametersSchema() const override {
+            return "{}";
+        }
+        MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
+            actualModel = context.model;
+            return MaiToolResult::success("Observed current-turn model.");
+        }
+    };
+    auto model = std::make_unique<Probe>();
+    auto* probe = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    auto tool = std::make_unique<Tool>();
+    auto* observedTool = tool.get();
+    tools->add(std::move(tool));
+    std::atomic<int> defaultEffort{1};
+    MaiAgent::Options options;
+    options.defaultModel = "deepseek-flash";
+    options.reasoningEffortProvider = [&] { return defaultEffort.load() == 1 ? "high" : "max"; };
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools), options);
+    const auto a = agent.submit(MaiCreateSession{"/tmp/work", "A", "glm-5.3", "low"}).value();
+    const auto b =
+        agent.submit(MaiCreateSession{"/tmp/work", "B", "deepseek-v4-pro", "max"}).value();
+    CHECK(!agent.submit(MaiCreateSession{"/tmp/work", "Bad", "glm-unknown", "low"}));
+    CHECK(!agent.submit(MaiCreateSession{"/tmp/work", "Bad", "glm-5.3", "medium"}));
+    CHECK(agent.submit(MaiUpdateSession{b, "Must not change", "glm-5.3", "", "", "medium"})
+              .error()
+              .code() == MaiErrorCode::InvalidInput);
+    CHECK(agent.submit(MaiUpdateSession{b, "Must not change", "glm-unknown", "", "", "low"})
+              .error()
+              .code() == MaiErrorCode::InvalidInput);
+    MaiSession before;
+    CHECK(agent.getSession(b, before));
+    CHECK(before.title == "B" && before.model == "deepseek-v4-pro" &&
+          before.reasoningEffort == "max");
+    CHECK(agent.submit(MaiSendPrompt{a, "Check session A"}));
+    {
+        std::unique_lock<std::mutex> lock(probe->mutex);
+        CHECK(probe->wake.wait_for(lock, std::chrono::seconds(10),
+                                   [&] { return !probe->requests.empty(); }));
+    }
+    CHECK(agent.submit(MaiUpdateSession{a, "Must not change", "deepseek-flash", "", "", "max"})
+              .error()
+              .code() == MaiErrorCode::Busy);
+    CHECK(agent.submit(MaiUpdateSession{b, "", "deepseek-v4-pro", "", "", "high"}));
+    defaultEffort = 2;
+    CHECK(agent.submit(MaiSendPrompt{b, "Check independent session B"}));
+    {
+        std::unique_lock<std::mutex> lock(probe->mutex);
+        CHECK(probe->wake.wait_for(lock, std::chrono::seconds(10),
+                                   [&] { return probe->requests.size() >= 2; }));
+        probe->released = true;
+        probe->wake.notify_all();
+    }
+    agent.waitIdle();
+    CHECK(observedTool->actualModel == "glm-5.3");
+    {
+        std::lock_guard<std::mutex> lock(probe->mutex);
+        CHECK(probe->requests.size() == 4);
+        bool retainedReasoning = false;
+        for (const auto& request : probe->requests) {
+            for (const auto& message : request.messages) {
+                if (!message.invocations.empty() &&
+                    message.invocations.front().id.rfind("session_effort_call_", 0) == 0) {
+                    const auto cycle = message.invocations.front().id.back();
+                    CHECK(message.reasoning ==
+                          std::string("Opaque GLM reasoning ") + cycle + "\r\n");
+                    CHECK(message.content.find("Opaque GLM reasoning") == std::string::npos);
+                    retainedReasoning = true;
+                }
+            }
+        }
+        CHECK(retainedReasoning);
+        for (const auto& request : probe->requests)
+            CHECK((request.model == "glm-5.3" && request.reasoningEffort == "low") ||
+                  (request.model == "deepseek-v4-pro" && request.reasoningEffort == "high"));
+    }
+    CHECK(agent.submit(MaiUpdateSession{a, "", "", "", "/tmp/new-work"}));
+    MaiSession after;
+    CHECK(agent.getSession(a, after));
+    CHECK(after.model == "glm-5.3" && after.reasoningEffort == "low" && after.title == "A");
+    CHECK(agent.submit(MaiUpdateSession{a, "", "", "", "", std::string{}}));
+    CHECK(agent.getSession(a, after) && after.reasoningEffort.empty());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--session-models") {
+        test_session_model_effort_are_atomic_and_turn_scoped();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--unfenced-images") {
         test_unfenced_image_groups_follow_execute_tools_and_continue();
         std::printf("unfenced executeTools checks: %d failure(s)\n", failures);
         return failures == 0 ? 0 : 1;
     }
+    test_session_model_effort_are_atomic_and_turn_scoped();
     test_unfenced_image_groups_follow_execute_tools_and_continue();
     if (argc == 2 && std::string(argv[1]) == "--active-turn-bytes") {
         test_active_turn_compaction_uses_sqlite_stored_bytes();

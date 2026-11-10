@@ -2,6 +2,7 @@
 #include "agent/RemoteAgentPanel.h"
 
 #include "MaiCloudDriveClient.h"
+#include "MaiCloudModelCatalog.h"
 
 #include <QDateTime>
 #include <QCoreApplication>
@@ -11,8 +12,11 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFile>
+#include <QFrame>
 #include <QFutureWatcher>
 #include <QSaveFile>
+#include <QScreen>
+#include <QGuiApplication>
 #include <QStandardPaths>
 #include <QJsonDocument>
 #include <QHBoxLayout>
@@ -20,6 +24,7 @@
 #include <QJsonArray>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QList>
 #include <QMap>
 #include <QMimeData>
 #include <QMouseEvent>
@@ -99,6 +104,30 @@ QString sessionKey(const QJsonObject& value) {
     return value.value(QStringLiteral("device_slot")).toString() + QLatin1Char(':') +
            value.value(QStringLiteral("login_session_id")).toString() + QLatin1Char(':') +
            value.value(QStringLiteral("id")).toString();
+}
+
+const QStringList& sessionModelChoices() {
+    static const QStringList models{QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
+                                    QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")};
+    return models;
+}
+
+bool validModelOwner(const QJsonObject& value) {
+    return !value.value(QStringLiteral("id")).toString().isEmpty() &&
+           !value.value(QStringLiteral("device_slot")).toString().isEmpty() &&
+           !value.value(QStringLiteral("login_session_id")).toString().isEmpty();
+}
+
+bool sameModelRoom(const QJsonObject& first, const QJsonObject& second) {
+    return first.value(QStringLiteral("id")) == second.value(QStringLiteral("id")) &&
+           first.value(QStringLiteral("device_slot")) == second.value(QStringLiteral("device_slot"));
+}
+
+QString sessionEffortTitle(const QString& effort) {
+    if (effort == QStringLiteral("low")) return QStringLiteral("简单");
+    if (effort == QStringLiteral("high")) return QStringLiteral("标准");
+    if (effort == QStringLiteral("max")) return QStringLiteral("深度");
+    return QStringLiteral("未确认");
 }
 
 QString attachmentSummary(const QStringList& paths) {
@@ -346,7 +375,33 @@ protected:
 }  // namespace
 
 struct RemoteAgentPanel::Runtime {
+    struct ModelConfiguration {
+        QJsonObject owner;
+        QJsonObject value;
+    };
+    struct ModelRequest {
+        QJsonObject owner;
+        QJsonObject command;
+    };
     QJsonObject session;
+    // Discovery/catalog rows are never a model database. Only exact owner ACKs
+    // enter this bounded, login-scoped cache; drafts/outbox remain independent.
+    QHash<QString, ModelConfiguration> modelConfigurations;
+    QStringList modelConfigurationOrder;
+    QHash<QString, ModelRequest> modelRequests;
+    QHash<QString, QString> modelRequestByOwner;
+    QString modelStatus;
+    QString modelStatusOwner;
+    QPushButton* more = nullptr;
+    QFrame* actionPanel = nullptr;
+    QPushButton* modelSection = nullptr;
+    QPushButton* effortSection = nullptr;
+    QLabel* modelValue = nullptr;
+    QLabel* effortValue = nullptr;
+    QWidget* modelOptions = nullptr;
+    QWidget* effortOptions = nullptr;
+    QList<QPushButton*> modelButtons;
+    QList<QPushButton*> effortButtons;
     QLabel* status = nullptr;
     QLabel* thinking = nullptr;
     MarkdownView* view = nullptr;
@@ -486,8 +541,132 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
     UiZoom::setFont(title, UiZoom::TextRole::Heading3, titleFont);
     title->setAlignment(Qt::AlignCenter);
     headerLayout->addWidget(title, 1);
-    headerLayout->addSpacing(UiZoom::s(34));
+    runtime_->more = new QPushButton(QStringLiteral("⋯"), header);
+    runtime_->more->setObjectName(QStringLiteral("remoteAgentMoreActions"));
+    runtime_->more->setAccessibleName(QStringLiteral("更多"));
+    runtime_->more->setCursor(Qt::PointingHandCursor);
+    runtime_->more->setFixedSize(UiZoom::s(34), UiZoom::s(34));
+    UiZoom::setStyle(runtime_->more, QStringLiteral(
+        "QPushButton{background:transparent;border:0;color:#24334a;font-size:@heading2;border-radius:8px;}"
+        "QPushButton:hover{background:#f1f6fb;}"));
+    headerLayout->addWidget(runtime_->more);
     layout->addWidget(header);
+    // Match the local creation panel's expandable model/effort rows. Choices are
+    // controls sent to the owner; clicking never changes the confirmed selection.
+    runtime_->actionPanel = new QFrame(this, Qt::Popup | Qt::FramelessWindowHint);
+    runtime_->actionPanel->setObjectName(QStringLiteral("remoteAgentActionPanel"));
+    runtime_->actionPanel->setFixedWidth(UiZoom::s(288));
+    UiZoom::setStyle(runtime_->actionPanel, QStringLiteral(
+        "QFrame#remoteAgentActionPanel{background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;}"
+        "QFrame#remoteAgentActionPanel QPushButton{background:transparent;border:0;color:#24334a;"
+        "text-align:left;padding:0 12px;font-size:@detail;border-radius:8px;}"
+        "QFrame#remoteAgentActionPanel QPushButton:hover{background:#f1f6fb;}"
+        "QFrame#remoteAgentActionPanel QPushButton:checked{background:#e6f2ff;color:#0a65ad;font-weight:600;}"
+        "QFrame#remoteAgentActionPanel QPushButton:disabled{color:#98a2b3;}"));
+    auto* actionLayout = new QVBoxLayout(runtime_->actionPanel);
+    actionLayout->setContentsMargins(UiZoom::s(8), UiZoom::s(8), UiZoom::s(8), UiZoom::s(8));
+    actionLayout->setSpacing(UiZoom::s(2));
+    const auto summary = [this](const QString& name, const QString& title, const QString& valueName,
+                                QLabel*& value) {
+        auto* row = new QPushButton(runtime_->actionPanel);
+        row->setObjectName(name);
+        row->setCursor(Qt::PointingHandCursor);
+        row->setFixedHeight(UiZoom::s(54));
+        auto* rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(UiZoom::s(12), 0, UiZoom::s(12), 0);
+        auto* column = new QVBoxLayout;
+        column->setContentsMargins(0, 0, 0, 0);
+        column->setSpacing(UiZoom::s(2));
+        auto* label = new QLabel(title, row);
+        label->setAttribute(Qt::WA_TransparentForMouseEvents);
+        UiZoom::setStyle(label, QStringLiteral("QLabel{border:0;background:transparent;color:#24334a;"
+                                              "font-size:@detail;font-weight:600;}"));
+        column->addWidget(label);
+        value = new QLabel(QStringLiteral("未确认"), row);
+        value->setObjectName(valueName);
+        value->setTextFormat(Qt::PlainText);
+        value->setAttribute(Qt::WA_TransparentForMouseEvents);
+        UiZoom::setStyle(value, QStringLiteral("QLabel{border:0;background:transparent;color:#738198;"
+                                              "font-size:@metadata;}"));
+        column->addWidget(value);
+        rowLayout->addLayout(column, 1);
+        auto* arrow = new QLabel(QStringLiteral("›"), row);
+        arrow->setAttribute(Qt::WA_TransparentForMouseEvents);
+        UiZoom::setStyle(arrow, QStringLiteral("QLabel{border:0;background:transparent;color:#98a2b3;"
+                                              "font-size:@heading3;}"));
+        rowLayout->addWidget(arrow);
+        return row;
+    };
+    runtime_->modelSection = summary(QStringLiteral("remoteAgentModelSection"), QStringLiteral("主模型"),
+                                     QStringLiteral("remoteAgentModelValue"), runtime_->modelValue);
+    actionLayout->addWidget(runtime_->modelSection);
+    runtime_->modelOptions = new QWidget(runtime_->actionPanel);
+    auto* modelOptionsLayout = new QVBoxLayout(runtime_->modelOptions);
+    modelOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
+    modelOptionsLayout->setSpacing(0);
+    for (const auto& model : sessionModelChoices()) {
+        auto* option = new QPushButton(model, runtime_->modelOptions);
+        option->setObjectName(QStringLiteral("remoteAgentModelOption-") + model);
+        option->setProperty("model", model);
+        option->setCheckable(true);
+        option->setFixedHeight(UiZoom::s(38));
+        modelOptionsLayout->addWidget(option);
+        runtime_->modelButtons.append(option);
+        connect(option, &QPushButton::clicked, this, [this, model] {
+            updateSessionModelControls();  // Undo QPushButton's optimistic checked state.
+            runtime_->actionPanel->hide();
+            sendSessionModelCommand({{QStringLiteral("action"), QStringLiteral("set_model")},
+                                     {QStringLiteral("model"), model}});
+        });
+    }
+    actionLayout->addWidget(runtime_->modelOptions);
+    runtime_->modelOptions->hide();
+    runtime_->effortSection = summary(QStringLiteral("remoteAgentEffortSection"), QStringLiteral("思考强度"),
+                                      QStringLiteral("remoteAgentEffortValue"), runtime_->effortValue);
+    actionLayout->addWidget(runtime_->effortSection);
+    runtime_->effortOptions = new QWidget(runtime_->actionPanel);
+    auto* effortOptionsLayout = new QVBoxLayout(runtime_->effortOptions);
+    effortOptionsLayout->setContentsMargins(0, UiZoom::s(4), 0, UiZoom::s(4));
+    effortOptionsLayout->setSpacing(0);
+    for (const auto& effort : {QStringLiteral("low"), QStringLiteral("high"), QStringLiteral("max")}) {
+        auto* option = new QPushButton(sessionEffortTitle(effort), runtime_->effortOptions);
+        option->setObjectName(QStringLiteral("remoteAgentEffortOption-") + effort);
+        option->setProperty("reasoningEffort", effort);
+        option->setCheckable(true);
+        option->setFixedHeight(UiZoom::s(38));
+        effortOptionsLayout->addWidget(option);
+        runtime_->effortButtons.append(option);
+        connect(option, &QPushButton::clicked, this, [this, effort] {
+            updateSessionModelControls();
+            runtime_->actionPanel->hide();
+            const auto configuration = runtime_->modelConfigurations.value(sessionKey(runtime_->session)).value;
+            sendSessionModelCommand({{QStringLiteral("action"), QStringLiteral("set_model")},
+                                     {QStringLiteral("model"), configuration.value(QStringLiteral("model"))},
+                                     {QStringLiteral("reasoningEffort"), effort}});
+        });
+    }
+    actionLayout->addWidget(runtime_->effortOptions);
+    runtime_->effortOptions->hide();
+    connect(runtime_->modelSection, &QPushButton::clicked, this, [this] {
+        runtime_->effortOptions->hide();
+        runtime_->modelOptions->setVisible(!runtime_->modelOptions->isVisible());
+        positionActionPanel();
+    });
+    connect(runtime_->effortSection, &QPushButton::clicked, this, [this] {
+        runtime_->modelOptions->hide();
+        runtime_->effortOptions->setVisible(!runtime_->effortOptions->isVisible());
+        positionActionPanel();
+    });
+    connect(runtime_->more, &QPushButton::clicked, this, [this] {
+        if (runtime_->actionPanel->isVisible()) {
+            runtime_->actionPanel->hide();
+        } else {
+            if (!runtime_->modelConfigurations.contains(sessionKey(runtime_->session))) requestSessionModel();
+            positionActionPanel();
+            runtime_->actionPanel->show();
+            runtime_->actionPanel->raise();
+        }
+    });
     auto* divider = new QWidget(this);
     divider->setObjectName(QStringLiteral("remoteAgentHeaderDivider"));
     divider->setFixedHeight(qMax(1, UiZoom::s(1)));
@@ -692,6 +871,7 @@ RemoteAgentPanel::~RemoteAgentPanel() {
 
 void RemoteAgentPanel::setCommandHandler(CommandHandler handler) {
     runtime_->command = std::move(handler);
+    requestSessionModel();
 }
 void RemoteAgentPanel::setHistoryHandler(HistoryHandler handler) {
     runtime_->history = std::move(handler);
@@ -712,10 +892,188 @@ QJsonObject RemoteAgentPanel::session() const {
     return runtime_->session;
 }
 
+void RemoteAgentPanel::positionActionPanel() {
+    runtime_->actionPanel->adjustSize();
+    QPoint position = runtime_->more->mapToGlobal(
+        QPoint(runtime_->more->width() - runtime_->actionPanel->width(), runtime_->more->height() + UiZoom::s(6)));
+    QScreen* screen = QGuiApplication::screenAt(position);
+    if (!screen) screen = QGuiApplication::primaryScreen();
+    if (screen) {
+        const QRect available = screen->availableGeometry();
+        position.setX(qBound(available.left(), position.x(), available.right() - runtime_->actionPanel->width() + 1));
+        if (position.y() + runtime_->actionPanel->height() > available.bottom())
+            position.setY(runtime_->more->mapToGlobal(QPoint(0, 0)).y() - runtime_->actionPanel->height() - UiZoom::s(6));
+    }
+    runtime_->actionPanel->move(position);
+}
+
+void RemoteAgentPanel::updateSessionModelControls() {
+    const auto key = sessionKey(runtime_->session);
+    const auto configuration = runtime_->modelConfigurations.value(key).value;
+    const bool pending = runtime_->modelRequestByOwner.contains(key);
+    const bool available = validModelOwner(runtime_->session) && runtime_->command &&
+                           runtime_->session.value(QStringLiteral("online")).toBool() &&
+                           !runtime_->session.value(QStringLiteral("busy")).toBool() &&
+                           !configuration.isEmpty() && !pending;
+    const auto model = configuration.value(QStringLiteral("model")).toString();
+    const auto effort = configuration.value(QStringLiteral("reasoningEffort")).toString();
+    // A confirmed local model remains selectable/readable, but its client does
+    // not implement provider effort. Use the shared capability, not a UI guess.
+    const auto capability = maiCloudModelInfo(model.toUtf8().toStdString());
+    const bool effortAvailable = available && capability && capability->supportsReasoningEffort;
+    runtime_->modelValue->setText(model.isEmpty()
+                                     ? pending ? QStringLiteral("正在读取") : QStringLiteral("未确认")
+                                     : model);
+    runtime_->effortValue->setText(sessionEffortTitle(effort));
+    runtime_->modelSection->setAccessibleName(QStringLiteral("主模型：") + runtime_->modelValue->text());
+    runtime_->effortSection->setAccessibleName(QStringLiteral("思考强度：") + runtime_->effortValue->text());
+    const QString detail = pending ? QStringLiteral("正在等待所属设备确认") : QString();
+    runtime_->modelSection->setToolTip(detail);
+    runtime_->effortSection->setToolTip(detail);
+    runtime_->modelSection->setEnabled(available);
+    runtime_->effortSection->setEnabled(effortAvailable);
+    runtime_->more->setEnabled(validModelOwner(runtime_->session));
+    for (auto* option : runtime_->modelButtons) {
+        option->setChecked(option->property("model").toString() == model);
+        option->setEnabled(available);
+    }
+    for (auto* option : runtime_->effortButtons) {
+        option->setChecked(option->property("reasoningEffort").toString() == effort);
+        option->setEnabled(effortAvailable);
+    }
+}
+
+void RemoteAgentPanel::invalidateReplacedModelOwner(const QJsonObject& owner) {
+    if (!validModelOwner(owner)) return;
+    const auto replaced = [&](const QJsonObject& previous) {
+        return sameModelRoom(previous, owner) && sessionKey(previous) != sessionKey(owner);
+    };
+    for (auto it = runtime_->modelRequests.begin(); it != runtime_->modelRequests.end();) {
+        if (!replaced(it->owner)) { ++it; continue; }
+        const auto key = sessionKey(it->owner);
+        if (runtime_->modelRequestByOwner.value(key) == it.key()) runtime_->modelRequestByOwner.remove(key);
+        it = runtime_->modelRequests.erase(it);
+    }
+    for (auto it = runtime_->modelConfigurations.begin(); it != runtime_->modelConfigurations.end();) {
+        if (!replaced(it->owner)) { ++it; continue; }
+        runtime_->modelConfigurationOrder.removeAll(it.key());
+        it = runtime_->modelConfigurations.erase(it);
+    }
+}
+
+void RemoteAgentPanel::requestSessionModel() {
+    sendSessionModelCommand({{QStringLiteral("action"), QStringLiteral("get_session")}});
+}
+
+void RemoteAgentPanel::sendSessionModelCommand(const QJsonObject& requested) {
+    const QJsonObject owner = runtime_->session;
+    const auto key = sessionKey(owner);
+    if (!runtime_->command || !validModelOwner(owner) || !owner.value(QStringLiteral("online")).toBool() ||
+        runtime_->modelRequestByOwner.contains(key)) return;
+    const bool changing = requested.value(QStringLiteral("action")) == QStringLiteral("set_model");
+    if (changing && (owner.value(QStringLiteral("busy")).toBool() ||
+                     !runtime_->modelConfigurations.contains(key))) return;
+    if (runtime_->modelRequests.size() >= 128) return;
+    QJsonObject command = requested;
+    const auto requestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    command.insert(QStringLiteral("requestId"), requestId);
+    runtime_->modelRequests.insert(requestId, {owner, command});
+    runtime_->modelRequestByOwner.insert(key, requestId);
+    updateSessionModelControls();
+    QPointer<RemoteAgentPanel> guard(this);
+    const auto fail = [guard, key, requestId, changing](const QString& error) {
+        if (!guard || !guard->runtime_->modelRequests.contains(requestId) ||
+            guard->runtime_->modelRequestByOwner.value(key) != requestId) return;
+        guard->runtime_->modelRequests.remove(requestId);
+        guard->runtime_->modelRequestByOwner.remove(key);
+        // A lost enqueue/ACK can leave a completed owner mutation. Require a new
+        // explicit read before showing/selecting a model after this unknown result.
+        if (changing) {
+            guard->runtime_->modelConfigurations.remove(key);
+            guard->runtime_->modelConfigurationOrder.removeAll(key);
+        }
+        guard->updateSessionModelControls();
+        guard->showSessionModelFailure(key, error);
+    };
+    QTimer::singleShot(30'000, this, [fail] { fail(QStringLiteral("所属设备未确认会话模型，请重新读取后重试")); });
+    runtime_->command(owner, command, [fail](const QString& error) { if (!error.isEmpty()) fail(error); });
+}
+
+bool RemoteAgentPanel::receiveSessionModelResult(const QJsonObject& owner, const QJsonObject& payload) {
+    QString id = payload.value(QStringLiteral("request_id")).toString();
+    if (id.isEmpty()) id = payload.value(QStringLiteral("command_id")).toString();
+    const auto it = runtime_->modelRequests.constFind(id);
+    if (it == runtime_->modelRequests.cend()) return false;
+    const auto request = it.value();
+    const auto key = sessionKey(request.owner);
+    const auto commandId = payload.value(QStringLiteral("command_id")).toString();
+    if (sessionKey(owner) != key || runtime_->modelRequestByOwner.value(key) != id ||
+        (!commandId.isEmpty() && commandId != id)) return true;
+    const auto result = payload.value(QStringLiteral("result")).toObject();
+    const auto expectedSession = request.owner.value(QStringLiteral("id"));
+    if (!result.value(QStringLiteral("ok")).isBool() ||
+        (result.contains(QStringLiteral("session")) && result.value(QStringLiteral("session")) != expectedSession))
+        return true;
+    if (result.value(QStringLiteral("ok")).toBool()) {
+        const auto model = result.value(QStringLiteral("model")).toString();
+        const auto effort = result.value(QStringLiteral("reasoningEffort")).toString();
+        const auto wire = result.value(QStringLiteral("wire")).toString();
+        const bool local = model.startsWith(QStringLiteral("local:")) && model.size() > 6 && model.size() <= 256 &&
+                           !QRegularExpression(QStringLiteral("[\\x00-\\x1f\\x7f]")).match(model).hasMatch();
+        const bool validEffort = effort == QStringLiteral("low") || effort == QStringLiteral("high") ||
+                                 effort == QStringLiteral("max");
+        const bool validWire = wire == QStringLiteral("chat_completions") || wire == QStringLiteral("responses") ||
+                               wire == QStringLiteral("local");
+        if (result.value(QStringLiteral("session")) != expectedSession ||
+            (!sessionModelChoices().contains(model) && !local) ||
+            !validEffort || !validWire)
+            return true;
+        if (request.command.value(QStringLiteral("action")) == QStringLiteral("set_model") &&
+            (request.command.value(QStringLiteral("model")) != result.value(QStringLiteral("model")) ||
+             (request.command.contains(QStringLiteral("reasoningEffort")) &&
+              request.command.value(QStringLiteral("reasoningEffort")) != result.value(QStringLiteral("reasoningEffort")))))
+            return true;
+        const QJsonObject configuration{{QStringLiteral("session"), result.value(QStringLiteral("session"))},
+                                         {QStringLiteral("model"), model},
+                                         {QStringLiteral("reasoningEffort"), effort},
+                                         {QStringLiteral("wire"), wire}};
+        runtime_->modelConfigurations.insert(key, {request.owner, configuration});
+        runtime_->modelConfigurationOrder.removeAll(key);
+        runtime_->modelConfigurationOrder.append(key);
+        while (runtime_->modelConfigurationOrder.size() > 128)
+            runtime_->modelConfigurations.remove(runtime_->modelConfigurationOrder.takeFirst());
+        if (sessionKey(runtime_->session) == key) {
+            if (runtime_->modelStatusOwner == key && !runtime_->modelStatus.isEmpty())
+                showStatus({});
+            runtime_->modelStatus.clear();
+            runtime_->modelStatusOwner.clear();
+        }
+    } else if (sessionKey(runtime_->session) == key) {
+        showSessionModelFailure(key, result.value(QStringLiteral("error")).toString());
+    }
+    runtime_->modelRequests.remove(id);
+    runtime_->modelRequestByOwner.remove(key);
+    updateSessionModelControls();
+    return true;
+}
+
+void RemoteAgentPanel::showSessionModelFailure(const QString& ownerKey, const QString& message) {
+    if (ownerKey != sessionKey(runtime_->session)) return;
+    const QString reason = message.isEmpty() ? QStringLiteral("所属设备拒绝读取或修改会话模型") : message.left(120);
+    showStatus(reason, true);
+    runtime_->modelStatus = reason;
+    runtime_->modelStatusOwner = ownerKey;
+}
+
 void RemoteAgentPanel::openSession(const QJsonObject& remote) {
     const QString previous = sessionKey(runtime_->session);
     const QString next = sessionKey(remote);
     if (previous != next) {
+        runtime_->actionPanel->hide();
+        runtime_->modelOptions->hide();
+        runtime_->effortOptions->hide();
+        runtime_->modelStatus.clear();
+        runtime_->modelStatusOwner.clear();
         resetImagePreview();
         for (const auto& transfer : runtime_->imageTransfers) transfer->cancel();
         runtime_->imageTransfers.clear();
@@ -754,18 +1112,32 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
         runtime_->observedBusy = false;
     }
     runtime_->session = remote;
+    invalidateReplacedModelOwner(remote);
     runtime_->owners.insert(next, remote);
     dispatchQueued();
     updateControls();
-    if (previous == next && !runtime_->messages.isEmpty()) return;
+    if (previous == next && !runtime_->messages.isEmpty()) {
+        requestSessionModel();
+        return;
+    }
     showStatus(remote.value(QStringLiteral("online")).toBool() ? QStringLiteral("正在读取所属设备的会话…")
                                                                : QStringLiteral("所属设备离线；输入保留为草稿"));
     requestHistory({}, 10);
+    requestSessionModel();
 }
 
 void RemoteAgentPanel::updateSession(const QJsonObject& remote) {
+    invalidateReplacedModelOwner(remote);
     runtime_->owners.insert(sessionKey(remote), remote);
-    if (sessionKey(remote) != sessionKey(runtime_->session)) return;
+    if (sessionKey(remote) != sessionKey(runtime_->session)) {
+        if (sameModelRoom(remote, runtime_->session)) {
+            runtime_->session.insert(QStringLiteral("online"), false);
+            runtime_->actionPanel->hide();
+            updateControls();
+            showStatus(QStringLiteral("所属设备登录已变化，请重新选择会话"), true);
+        }
+        return;
+    }
     const bool wasOnline = runtime_->session.value(QStringLiteral("online")).toBool();
     runtime_->session = remote;
     runtime_->owners.insert(sessionKey(remote), remote);
@@ -784,6 +1156,7 @@ void RemoteAgentPanel::updateSession(const QJsonObject& remote) {
     } else if (!wasOnline) {
         // WebSocket 断线期间的消息可能没收到；重新上线后补最近一页。
         refreshHistory();
+        requestSessionModel();
     }
 }
 
@@ -1279,6 +1652,7 @@ void RemoteAgentPanel::sendPrompt(const QJsonObject&, const QString& retryId) {
 void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& kind, const QJsonObject& payload) {
     if (kind == QStringLiteral("event") &&
         payload.value(QStringLiteral("type")).toString() == QStringLiteral("command_result")) {
+        if (receiveSessionModelResult(remote, payload)) return;
         QString id = payload.value(QStringLiteral("request_id")).toString();
         if (id.isEmpty()) id = payload.value(QStringLiteral("command_id")).toString();
         if (runtime_->controlRequests.value(id) == sessionKey(remote)) {
@@ -1359,7 +1733,12 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
     }
     renderMessages();
     renderRequests(payload);
-    if (!runtime_->pendingCommand) showStatus({});
+    // A history/event receipt cannot acknowledge a model mutation. Preserve a
+    // currently displayed model failure only for this exact owner; a newer
+    // prompt status goes through showStatus and supersedes that marker.
+    const bool modelFailure = runtime_->modelStatusOwner == sessionKey(runtime_->session) &&
+                              !runtime_->modelStatus.isEmpty();
+    if (!runtime_->pendingCommand && !modelFailure) showStatus({});
 }
 
 void RemoteAgentPanel::renderMessages() {
@@ -1884,6 +2263,7 @@ void RemoteAgentPanel::renderRequests(const QJsonObject& payload) {
 }
 
 void RemoteAgentPanel::updateControls() {
+    updateSessionModelControls();
     const bool online = runtime_->session.value(QStringLiteral("online")).toBool();
     const bool busy = runtime_->session.value(QStringLiteral("busy")).toBool();
     runtime_->send->setText({});
@@ -1913,6 +2293,10 @@ void RemoteAgentPanel::updateControls() {
 }
 
 void RemoteAgentPanel::showStatus(const QString& message, bool failure) {
+    // Other actions own their own progress/error text. Never resurrect an older
+    // model error over a prompt, attachment, reconnect or replacement status.
+    runtime_->modelStatus.clear();
+    runtime_->modelStatusOwner.clear();
     runtime_->status->setText(message);
     runtime_->status->setVisible(!message.isEmpty());
     runtime_->status->setStyleSheet(failure ? QStringLiteral("color:#b42318;background:#fff5f3;")

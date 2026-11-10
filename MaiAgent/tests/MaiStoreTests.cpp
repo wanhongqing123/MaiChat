@@ -99,6 +99,7 @@ void contract_session_crud(MaiSessionStore& store, const char* which) {
     CHECK(loaded.title == "first title");
     CHECK(loaded.directory == "/tmp/work");
     CHECK(loaded.model == "glm-5.3");
+    CHECK(loaded.reasoningEffort.empty());
     CHECK(loaded.agent == "build");  // 默认值也要存下来
     CHECK(loaded.created == 1000);
     CHECK(loaded.updated == 5000);
@@ -107,6 +108,10 @@ void contract_session_crud(MaiSessionStore& store, const char* which) {
     store.putSession(makeSession(id, "second title", 6000));
     CHECK(store.getSession(id, loaded));
     CHECK(loaded.title == "second title");
+    store.mutateSession(id, [](MaiSession& session) { session.reasoningEffort = "low"; });
+    CHECK(store.getSession(id, loaded));
+    CHECK(loaded.reasoningEffort == "low");
+    CHECK(store.listSessions().front().reasoningEffort == "low");
 
     CHECK(store.removeSession(id));
     CHECK(!store.getSession(id, loaded));
@@ -1264,6 +1269,49 @@ void test_v8_checkpoint_migrates_without_changing_original_source() {
     CHECK(store->getMessage(id, source.id, raw) && raw.text() == source.text());
 }
 
+// v9 旧库升级只追加 effort，保留原模型、历史和检查点；重启后各会话选择独立。
+void test_session_effort_survives_reopen_and_v9_migration() {
+    TempDir temp;
+    const auto path = temp.file("session-effort.db");
+    {
+        auto opened = makeMaiSqliteStore(path);
+        CHECK(opened.isOk());
+        if (!opened) return;
+        auto first = makeSession("ses_effort_a", "A", 10);
+        first.reasoningEffort = "low";
+        auto second = makeSession("ses_effort_b", "B", 20);
+        second.model = "deepseek-v4-pro";
+        second.reasoningEffort = "max";
+        opened.value()->putSession(first);
+        opened.value()->putSession(second);
+    }
+    {
+        auto opened = makeMaiSqliteStore(path);
+        CHECK(opened.isOk());
+        if (!opened) return;
+        MaiSession first, second;
+        CHECK(opened.value()->getSession("ses_effort_a", first));
+        CHECK(opened.value()->getSession("ses_effort_b", second));
+        CHECK(first.model == "glm-5.3" && first.reasoningEffort == "low");
+        CHECK(second.model == "deepseek-v4-pro" && second.reasoningEffort == "max");
+    }
+    sqlite3* database = nullptr;
+    CHECK(sqlite3_open(path.c_str(), &database) == SQLITE_OK);
+    CHECK(sqlite3_exec(database,
+                       "ALTER TABLE sessions DROP COLUMN reasoning_effort;"
+                       "PRAGMA user_version=9;",
+                       nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(database);
+    auto migrated = makeMaiSqliteStore(path);
+    CHECK(migrated.isOk());
+    if (!migrated) return;
+    MaiSession first, second;
+    CHECK(migrated.value()->getSession("ses_effort_a", first));
+    CHECK(migrated.value()->getSession("ses_effort_b", second));
+    CHECK(first.model == "glm-5.3" && first.reasoningEffort.empty());
+    CHECK(second.model == "deepseek-v4-pro" && second.reasoningEffort.empty());
+}
+
 }  // namespace
 
 int main() {
@@ -1295,6 +1343,7 @@ int main() {
     }
 
     test_v8_checkpoint_migrates_without_changing_original_source();
+    test_session_effort_survives_reopen_and_v9_migration();
     test_survives_reopen();
     test_specialist_reply_survives_reopen();
     test_migrates_unfinished_tool_index();

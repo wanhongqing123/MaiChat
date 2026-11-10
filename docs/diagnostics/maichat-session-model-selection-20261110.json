@@ -1,0 +1,787 @@
+{
+  "date": "2026-11-10",
+  "base_commit": "2c5a81b394f4b0b7dfc8f9698f1b4df1498bfa8a",
+  "scope": "Four cloud models, per-session model/effort, provider-native retrieval, desktop/mobile/remote adapters",
+  "models": [
+    "glm-5.3",
+    "glm-5.3-flash",
+    "deepseek-flash",
+    "deepseek-v4-pro"
+  ],
+  "sources": [
+    {
+      "path": "MaiAgent/Agent/MaiAgent.cpp",
+      "bytes": 78206,
+      "sha256": "78496eb3c2c4108c43b2a953bc202293c97bb9f6a6ab4b9a2503672b2ae7afd2",
+      "git_blob": "1bbf6f10eb3d6366ca6060d87434f26984a10c2d"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiCloudModelCatalog.cpp",
+      "bytes": 1343,
+      "sha256": "0deb6d951fc4148728928c6ecde146f81d9b60f509c665fea102fc5eb5067e98",
+      "git_blob": "9623d7f5b22a72250f053cbde92deba1f4e460a1"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiContextBuilder.cpp",
+      "bytes": 21660,
+      "sha256": "0929714373269996f9ac7016a2232ffd7c762c889b6a011913ac7f93fe7cfccc",
+      "git_blob": "2f93a385ea1af40def78987261232c3a12b06ab5"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiContextCompactor.cpp",
+      "bytes": 32659,
+      "sha256": "d61f564d194687f8799a9a9994023e5a244dec5946a1bc5fe5728d16aa65576b",
+      "git_blob": "6aacd74da2453936fa3185a48788f5aeb29068e1"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiModelClient.cpp",
+      "bytes": 4676,
+      "sha256": "6398ebe3c5a17e271590ed24d1a9fc9dc8af5afb9f55cb55f60109cd2af2ceff",
+      "git_blob": "ddcdbd7e41a7a2b8dd4bf406f2f8aa6aa93cbb25"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiOpenAiClient.cpp",
+      "bytes": 43655,
+      "sha256": "f83cadb6afaf43c2d3e9289d6f1eebe6bfc0036208c714596d51599b1de4fb48",
+      "git_blob": "208d1889f42eee6c6cacac704d9ba027ea08d6f7"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiResponsesClient.cpp",
+      "bytes": 44952,
+      "sha256": "b4590f2f0a2f42459cb47987c5af89cb89fa44236106a9d0791811fb7527d20c",
+      "git_blob": "b4b521a47f789313d3800da422b54d89a37fc57e"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiRoutedModelClient.cpp",
+      "bytes": 4590,
+      "sha256": "f9d89024a3219b85fc97e495e83f106c998c0ec79a7ab441bb5f45100a428c2b",
+      "git_blob": "250c65a351b0f522b4838d2cdbbcb72b5f6873c5"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiSqliteStore.cpp",
+      "bytes": 76009,
+      "sha256": "96fe126d96af193997c9f1d9a13ea79f6bc420fc3d58521273233ac5ea141e1b",
+      "git_blob": "79be90c5ed376ee6d515c3819a89ae09a9dee330"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiTurnRunner.cpp",
+      "bytes": 53310,
+      "sha256": "d941412e77687a2f9c2c5a703b29c542907004f910e1f6c9d149b544f5d4ab6c",
+      "git_blob": "d12145299a94105e89b7fe884cd1b10a42e21679"
+    },
+    {
+      "path": "MaiAgent/AgentTools/MaiDeepSeekWebTools.cpp",
+      "bytes": 19476,
+      "sha256": "003d166c297ea4900784ec66da2345ed4147dede7f3412012b60060cc78e6ab4",
+      "git_blob": "5f14cccfc46ffe5f4116ff3c0f37ca721ffb87eb"
+    },
+    {
+      "path": "MaiAgent/AgentTools/MaiGlmWebTools.cpp",
+      "bytes": 16905,
+      "sha256": "11bf34a2d83f8fd01f05e8aa745ed373fb4fc0c48e06b2ff5e052b4add9b8a36",
+      "git_blob": "843691bfdaacc30034de3f672d09f93ab7460106"
+    },
+    {
+      "path": "MaiAgent/AgentTools/MaiProviderWebTools.cpp",
+      "bytes": 2574,
+      "sha256": "bc4d4aef4979b285f8af19d1338e8200964849d586cdb6a0e240aa37a8ea2659",
+      "git_blob": "b0c4ac2a2a747126fda1c3f0b3de898884c0c0a3"
+    },
+    {
+      "path": "MaiAgent/AgentTools/MaiTool.cpp",
+      "bytes": 9059,
+      "sha256": "4a38b60befd7976465e589c8262e3c1aad26ccd886954b5ea436746d3f6aaeb6",
+      "git_blob": "820d6f40fe725c0a0f0d16bb2122628dff49c9c3"
+    },
+    {
+      "path": "MaiAgent/AgentTools/MaiWebRetrievalTransport.cpp",
+      "bytes": 13767,
+      "sha256": "64abf72a24d16e8a0565cd4e5f22adc30a6f59ec02125bd3cb76505d7ef10058",
+      "git_blob": "99d647599ac3a24f2a4e447eebd674604b74bfac"
+    },
+    {
+      "path": "MaiAgent/CMakeLists.txt",
+      "bytes": 39089,
+      "sha256": "84e0651ebb76ad7c8dd0dce201fa135fc43d4a50ebf01bab23c184c535dedf4c",
+      "git_blob": "ddf4bc048abd4d70a2ce83c2e0a938e5325c5a74"
+    },
+    {
+      "path": "MaiAgent/include/MaiAgent.h",
+      "bytes": 21144,
+      "sha256": "a9baa5da6ad7890790a9bc6b8927a9e0626406011e52c175092f55e4147d1892",
+      "git_blob": "9a762b509552abaa7aeca338a0e9cca9d823ef50"
+    },
+    {
+      "path": "MaiAgent/include/MaiCloudModelCatalog.h",
+      "bytes": 898,
+      "sha256": "fd0eeefc34d8914e0e01d883a1c2558058598e8246c0182dc9c4acfff00e7eb6",
+      "git_blob": "7873cd5fc2106af529ae375ffdf11d0860a8d37d"
+    },
+    {
+      "path": "MaiAgent/include/MaiContextBuilder.h",
+      "bytes": 3663,
+      "sha256": "a10609f0d6db1d5dacc57d9ff98249ecef6564e0f62ed97295a7d345cf7b45d9",
+      "git_blob": "2624e98e503724c3a3dc1553e866c8ec14faef36"
+    },
+    {
+      "path": "MaiAgent/include/MaiDeepSeekWebTools.h",
+      "bytes": 2318,
+      "sha256": "7ac147ac9ad128a1317b49b30a54254e9d0eea9d70e43a31db9be2aba743baa4",
+      "git_blob": "c632ae505d1a938c22fe16201f783ced7037f9cc"
+    },
+    {
+      "path": "MaiAgent/include/MaiGlmWebTools.h",
+      "bytes": 2127,
+      "sha256": "c6b09838286026289d3ea4e7bdf49dd1698eb1b7587380d9bc228f2e5bd57770",
+      "git_blob": "3d87be4e0be2b2fedd074da31cb151b6e330257e"
+    },
+    {
+      "path": "MaiAgent/include/MaiModelClient.h",
+      "bytes": 19425,
+      "sha256": "c4b9bfa39699506bc1ba66effbd5e63dcc8b0dd10d715985ac97ee8e8b7647e7",
+      "git_blob": "b58b2bd86c77ff3af1a98dd4c48a7677a4718f78"
+    },
+    {
+      "path": "MaiAgent/include/MaiProviderWebTools.h",
+      "bytes": 710,
+      "sha256": "dd9163f516b0cefa36c46a6f6dce3fcf5286afbdb37b2caddef8c355b15630b4",
+      "git_blob": "609a59f0645ec2a428be3014cd057f350206e89a"
+    },
+    {
+      "path": "MaiAgent/include/MaiRoutedModelClient.h",
+      "bytes": 1785,
+      "sha256": "af79b4517ab8b177f2ebe068616dbee62baa3c549276a16630c2b57f6e454378",
+      "git_blob": "a6e0d169e00c3f1108c255a34e9658d68c307ecd"
+    },
+    {
+      "path": "MaiAgent/include/MaiSession.h",
+      "bytes": 3235,
+      "sha256": "998fc7b664130e1e586bd94fe7a296e80f3aba622a959eb63df5747cef0fa346",
+      "git_blob": "39f899a8c728de9edbe66c8e9944d078e1672d6c"
+    },
+    {
+      "path": "MaiAgent/include/MaiTool.h",
+      "bytes": 14387,
+      "sha256": "41d8511ab3238c5c11e6d6fde9f0af251d091fe1252afe2e3f76412ddf6ae5f4",
+      "git_blob": "ed2d7ddcef1d49df8728fc7fbe26ae81a7c2f0ef"
+    },
+    {
+      "path": "MaiAgent/include/MaiTurnRunner.h",
+      "bytes": 8569,
+      "sha256": "01fa3e8b95542d3ae91ebe696a897ab99dd049c81222f63201ef9fee6f25c8b0",
+      "git_blob": "667a609d1e1c4387fd0c482b1b229523369fc2d2"
+    },
+    {
+      "path": "MaiAgent/include/MaiWebRetrieval.h",
+      "bytes": 1879,
+      "sha256": "6cedaadbb00cee0aec7ac48ea04e953b841e87b0e1be2009a414b28e714070c4",
+      "git_blob": "d32378ed0726c2da3b512232d027ed24872924f6"
+    },
+    {
+      "path": "MaiAgent/include/MaiWebRetrievalTransport.h",
+      "bytes": 1745,
+      "sha256": "8130fc46c4a189599efeb5021bc44cf5345b60c290ca0e16ad246296caa2858d",
+      "git_blob": "0e5c00aa8ff9c30ac431f6e273481aadcb98b838"
+    },
+    {
+      "path": "MaiAgent/tests/MaiContextCompactorTests.cpp",
+      "bytes": 77068,
+      "sha256": "ee670bed1e1041ac55b68ee7b8b19ee6338aecfbdf50a2c366bb12a805c5c924",
+      "git_blob": "1c915b87e19f5b8f5924f962c51b8e525182a4cf"
+    },
+    {
+      "path": "MaiAgent/tests/MaiDeepSeekWebToolsTests.cpp",
+      "bytes": 45008,
+      "sha256": "84796aa25b89a5873ff69abb89e0dfe4453613f67abb6c1fe328156121053510",
+      "git_blob": "9e322886d6c70d478b4a11cb5aec09212b9078c1"
+    },
+    {
+      "path": "MaiAgent/tests/MaiModelClientTests.cpp",
+      "bytes": 101038,
+      "sha256": "ee7751948a2839bc4dae9857e690d1d62a101f5ed1c1c45ae3aa309038998664",
+      "git_blob": "067c2fc53a45e4aa61f2eb1fedd12b7f53e959c3"
+    },
+    {
+      "path": "MaiAgent/tests/MaiStoreTests.cpp",
+      "bytes": 61449,
+      "sha256": "3639899c2c27c3748aa3352c55363714d9a70d2806bc387f2d4469787d0aead6",
+      "git_blob": "adc6b495b6063c3726beec51fa0f93c4a93d6dcc"
+    },
+    {
+      "path": "MaiAgent/tests/MaiToolLoopTests.cpp",
+      "bytes": 57363,
+      "sha256": "4d0d27bd9da1489ea919a5a423eeb0044f539f7e5f77f28425511727ed47c923",
+      "git_blob": "576cf0f073e611e3b89a94aa5696a4c0d5bb769e"
+    },
+    {
+      "path": "MaiAgent/tests/MaiTurnRunnerTests.cpp",
+      "bytes": 67593,
+      "sha256": "28f5e2c61fcd92096f8a799aa08a05aa7a76ad01408a7af14fde470196efae44",
+      "git_blob": "4d3da341fa2681b431aca5e1c27dc50f2e838b77"
+    },
+    {
+      "path": "MaiChat/MobileAgentAdapter/CMakeLists.txt",
+      "bytes": 23474,
+      "sha256": "9240a950b779abe781575c379c6b949dd3fdd2511d653836f7a811e092ec4ad2",
+      "git_blob": "930d487587caec830cc4146baa73eb92211fbcf9"
+    },
+    {
+      "path": "MaiChat/MobileAgentAdapter/MaiMobileAgent.cpp",
+      "bytes": 114749,
+      "sha256": "cba99601605b4318c3391591323efc25966ef8983936f8f775d2f4d2c3cdabfd",
+      "git_blob": "8bd0a42db295d7bb92045c5686fd031d258e0026"
+    },
+    {
+      "path": "MaiChat/MobileAgentAdapter/MaiMobileAgent.h",
+      "bytes": 6746,
+      "sha256": "e9bda1a8a075fa2098f4aaed4aa2bea425bb7e645283f34a4dfe2324ce78d6cd",
+      "git_blob": "ed996df155f6083e58b3a17792ef9f07cda26254"
+    },
+    {
+      "path": "MaiChat/MobileAgentAdapter/tests/MaiMobileSessionModelTests.cpp",
+      "bytes": 15208,
+      "sha256": "660ecb426acf0bec4a40323d586dea92631ff6507d1e722634faae9cf91fc9ef",
+      "git_blob": "4104458cccbd7c74cc49dc6ab977b6a7ece77795"
+    },
+    {
+      "path": "MaiChat/MobileAgentAdapter/tests/MaiMobileSteeringTests.cpp",
+      "bytes": 52491,
+      "sha256": "fdd1e293703f0b67e6cab3158744ca63c35bd4b9670ce5d5e950bb4e325d7b0e",
+      "git_blob": "62a756a31a77f1cee7d4783fc12e7312e7cd3def"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/androidTest/java/com/kongshang/maichat/AIAssistantInstrumentedTest.java",
+      "bytes": 65451,
+      "sha256": "f692539a4138c660dacf940203b83ec5abf69179058a2b256182b59017ad2443",
+      "git_blob": "9c295ec7c968355c63f7be98de69572c1e78bb5a"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/main/java/assistant/com/kongshang/maichat/AIAssistantActionMenu.java",
+      "bytes": 14558,
+      "sha256": "2f16a7fd8074901eb948123f24a19afa293b7610f8e30b59f2fd09eb93c5bb89",
+      "git_blob": "4d286c7d5c666390240a1dc1b213f995b6eb911b"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/main/java/assistant/com/kongshang/maichat/AIAssistantController.java",
+      "bytes": 204012,
+      "sha256": "d242df83693f9e94274b5d43ab8b2d3552e5e621ed3706b494ec3143be9865f8",
+      "git_blob": "da311ea130ab8ba81e57ad58aaee1407e9dc87a2"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/main/java/assistant/com/kongshang/maichat/AIAssistantMediaPolicy.java",
+      "bytes": 2227,
+      "sha256": "24e9679c196aeeea193480deb408f69aac7831b2c79f9cf5660c19e48889af99",
+      "git_blob": "9caf80777f46779c2cbbc5e04f3a5e2653f7fce6"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/main/java/assistant/com/kongshang/maichat/AIAssistantModelSettings.java",
+      "bytes": 4807,
+      "sha256": "9d4626b59b29fad929d63955463d8d66d14d9a299e56c2289ba95e29490c76b1",
+      "git_blob": "a4300b743c488a60b1e7e334e953bccb6ea070ba"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/main/java/assistant/com/kongshang/maichat/AIAssistantPanel.java",
+      "bytes": 203891,
+      "sha256": "3a00f6f88462c0049217be7980efe03338f985ceb6bff041d4932607045e1a10",
+      "git_blob": "810b04ef263ee4e0314feb3a863b81c29a33486f"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/main/java/assistant/com/kongshang/maichat/AIAssistantSessionModels.java",
+      "bytes": 10079,
+      "sha256": "aa2e5999bc4af9f09702fd441ef725df49ba0f3f57a152da5b848740fc4270fb",
+      "git_blob": "ecc021f995c9af5d99430bed5c9f9ba774ee87ad"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/test/java/com/kongshang/maichat/AIAssistantActionMenuTest.java",
+      "bytes": 9610,
+      "sha256": "c4cf9701f9fda3df5ebf22b06819b6ec7203a04ddbf310f9110dd89878bb426d",
+      "git_blob": "5b7cf1e99ec4af141f1660c93dc6a5086b601f0c"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/test/java/com/kongshang/maichat/AIAssistantDefaultModelTest.java",
+      "bytes": 975,
+      "sha256": "7ae07ea723eede28c00a31c3ff2db79218923715a7942da6196e5d3c27047803",
+      "git_blob": "bc1ce91c9e6adf7c57469ff746658e3b78b8b272"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/test/java/com/kongshang/maichat/AIAssistantMediaPolicyTest.java",
+      "bytes": 2299,
+      "sha256": "a2bd97ae9c4ef5807a2fa4f5800d912ad98f71608555cc68b6ed4dbf825e335a",
+      "git_blob": "1ff9bf68a16de14275ddcdd1954662ec45f36ff6"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/test/java/com/kongshang/maichat/AIAssistantModelSettingsTest.java",
+      "bytes": 4400,
+      "sha256": "a115a033c1f384902000e50d2b34cfea83fc7a7c7d50b4c0a770d5b77902f457",
+      "git_blob": "cc27768f3245cc34d319bde0b52acdd803b339a2"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/test/java/com/kongshang/maichat/AIAssistantSessionModelBoundaryTest.java",
+      "bytes": 6367,
+      "sha256": "373f9c5204c39687df6c4591c434480d5cfd884571b5ddae279e9e3031d25833",
+      "git_blob": "b2454e9975ddcf22aefb673b7cddeda76c124d95"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/test/java/com/kongshang/maichat/AIAssistantSessionModelTest.java",
+      "bytes": 11958,
+      "sha256": "bb0cb56defe6d40e8488dc4472c17dfb330fc50b8b185d4a3599d9d6530b773a",
+      "git_blob": "ce3245b293534942664a3d697ebf9cd123ba9176"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/AgentChatPanel.cpp",
+      "bytes": 232269,
+      "sha256": "4c29e4a1aab5a44a5296e85463fcc5439b8cbe710e33ab5ce28c167c0f641a3c",
+      "git_blob": "1ada3062b4bc537c6427d41809ac6dd7b30e7ce8"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/AgentChatPanel.h",
+      "bytes": 12341,
+      "sha256": "2ee61c0312cf625dc366813f9d217f861fb7e8da93e7cd81f40365a875c0fe5a",
+      "git_blob": "780c4d2b47d4ef6af86385f65a8fb11a302fc557"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/AgentController.cpp",
+      "bytes": 55707,
+      "sha256": "ead1c3304eca8f4eae2319c3d4f72702ba0d6fb76f4e7e8d63cd87401cf0dbda",
+      "git_blob": "bc6ef55902d9cac55670210790a61ac21caf1fd2"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/AgentController.h",
+      "bytes": 13750,
+      "sha256": "f7926e3b268a27ae430bb79bd22f431723acf7bcfe1f6c07477355cab704faf1",
+      "git_blob": "1f7c9cc26fc1a762a9d83e758e566f29072c8d2c"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopAccountModelClient.cpp",
+      "bytes": 4763,
+      "sha256": "2b87e381bec3e0a0bf64cf2eb6ff4bcf142171bcce6f354778d73fac086c31e9",
+      "git_blob": "7fb0f3b68df3fa8cd3e19d7156dc1e891f674c27"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopAccountModelClient.h",
+      "bytes": 1450,
+      "sha256": "73565195454a4dce31db4c5216dc893e41935cd0c0edffdf39811882100e7112",
+      "git_blob": "4ddcdf90a3e1934c05b26c9dad3ef9f79ece10d0"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopSessionSyncHost.cpp",
+      "bytes": 34535,
+      "sha256": "4d394bd4d25397c22732ef5b02c3ae8376272eb662cc146cda180284d62d46c6",
+      "git_blob": "1d4f01f24f6675dbe5aac813215324058b963dcb"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopSessionSyncHost.h",
+      "bytes": 2366,
+      "sha256": "cbc22c8fa1896a96e526361ab2ac5b6a6059bbae27ea6794a76b8c1454f6350f",
+      "git_blob": "9d8cf5232d14ba0b445d679a26f59bae5c1bf8c8"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/RemoteAgentPanel.cpp",
+      "bytes": 125208,
+      "sha256": "9ec9112fa41cd914fd0f3d0e986158ea66a3a4f552564408c197d0a569b7652b",
+      "git_blob": "38836f5653e241e3267dce1b216ec59dbc7a19d4"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/RemoteAgentPanel.h",
+      "bytes": 3185,
+      "sha256": "f4d3c812ea73df4a5e85bf93a5e8ed70f845786dab51c817e0db8d2d3b9b35fc",
+      "git_blob": "72916710496a2bf8817d9f9f205878857f1d9a12"
+    },
+    {
+      "path": "MaiChat/desktop/src/ui/MainWindow.cpp",
+      "bytes": 409419,
+      "sha256": "8c7f238f748f24b06118b64757f576639635f8a1627f51a7d951c1277ab4ba95",
+      "git_blob": "49b901ecd40730a79258d1cf0096858f19b5d078"
+    },
+    {
+      "path": "MaiChat/desktop/src/ui/MainWindow.h",
+      "bytes": 28088,
+      "sha256": "6669f5d7f21280e833db83b472a35bedf9bb87a539b2a9494bda3922213d4227",
+      "git_blob": "673abd013867e5d6a0fdbd026f4a0e15ff9c2e89"
+    },
+    {
+      "path": "MaiChat/desktop/tests/AgentControllerTest.cpp",
+      "bytes": 83996,
+      "sha256": "0803d395422f0b529bc95f44df173299d6046ae368667f390c6595f23570c407",
+      "git_blob": "73e5a7813332e4c20d2682a3cbf0cd2e42efe21d"
+    },
+    {
+      "path": "MaiChat/desktop/tests/AgentPanelSessionTest.cpp",
+      "bytes": 207441,
+      "sha256": "58bbc2bd725d44f4cfefeab7dd133092f553416271fd614f09c91399ce7854cc",
+      "git_blob": "54734820aba2e16518bd499c0612b7e058d2780d"
+    },
+    {
+      "path": "MaiChat/desktop/tests/DesktopSessionSyncHostTest.cpp",
+      "bytes": 254789,
+      "sha256": "234bd778d6dda868242450fb8d547e2f99e4e0c160cf48d8de4bd86c250dcc35",
+      "git_blob": "da232d97d89b6240a3df9a8a5fba970f13e7f8e1"
+    },
+    {
+      "path": "MaiChat/desktop/tests/MainWindowLayoutTest.cpp",
+      "bytes": 259233,
+      "sha256": "3a1b082610c81667962ac801c6cc4ebc931371722a51de1fa055a14676fb59dd",
+      "git_blob": "abf92d475fd67745b9e2dedb553886a974246b12"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat.xcodeproj/project.pbxproj",
+      "bytes": 110703,
+      "sha256": "c9b6c952c7160ea95d0639707b5b023264136aeb25f133817b3f39b66b596de5",
+      "git_blob": "8d18fa5a4306f7dca90fe4f7de8f9d7544faf58c"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/Assistant/AIAssistantModel.swift",
+      "bytes": 283091,
+      "sha256": "74da57e0aa3c83c8bad6d7d3b6e3fe66521d3f37af493f9ccdf7f5bae9b8f613",
+      "git_blob": "f88bc9328547196e6a946131c5892c24179dd920"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/Assistant/AIAssistantView.swift",
+      "bytes": 270141,
+      "sha256": "d0c0f22ee438fb26773a6b20b273f738952bdc6eacc54c0954bf40f93f07851a",
+      "git_blob": "a66072fb00bb78b16455b4d3f4e04f03db552deb"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/DebugSupport/AIAssistantModel+UITesting.swift",
+      "bytes": 47545,
+      "sha256": "8804622643288784a9372fd7df5d779604cd654e3250069f86a2d628cf177e54",
+      "git_blob": "fcdcaadfeb2696d2570c1cde7872c089add5df56"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/DebugSupport/AIAssistantUITestFixtures.swift",
+      "bytes": 49464,
+      "sha256": "efb4a41575d5921adad421899e0d8b0e9e003be54c4534f2a26ecaaed8362ee5",
+      "git_blob": "4eca89f8e2e7de220ad1b9f7ed55171a7a90c95e"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/DebugSupport/AIPrimaryModelUITestSupport.swift",
+      "bytes": 3800,
+      "sha256": "36de20736193e5a32dd3302c01c8e81352e73bf3b4f2cac6eaca1e38d90736ae",
+      "git_blob": "2d2a868974da928d0fb7702cdf725c340780d543"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/MaiChatTools/AIMobileHostToolProvider.swift",
+      "bytes": 82236,
+      "sha256": "a5872bdecce43dbb7a122fe054ba4b36534575fc171007661ed678e05318ca0f",
+      "git_blob": "b7d6ab035229b5396f3e2ae56b6cb0f8e5e20ab0"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChatUITests/SessionModelsUITests.swift",
+      "bytes": 14871,
+      "sha256": "35300245dbe544a3d883415aff88a7f7db70a23edce66932ca38f923eea7a3b2",
+      "git_blob": "5706377cfe4bd0aa0955d29198223cb1a9ca604c"
+    }
+  ],
+  "windows": {
+    "core": {
+      "passed_suites": 13,
+      "failed_suites": 0,
+      "seconds": 78.78
+    },
+    "console_e2e": "all checks passed",
+    "desktop": {
+      "controller_passed": 45,
+      "panel_passed": 80,
+      "main_window_related_passed": 12,
+      "host_passed": 87,
+      "host_skipped": 1,
+      "failed": 0,
+      "skip_reason": "Existing opt-in temporary-image local TLS fixture"
+    },
+    "development_exe": {
+      "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/maichat.exe",
+      "bytes": 165491200,
+      "sha256": "d4915ccf6a6ea28ca9266eb56e9f675e5fcd3e66013a2495b885fe4bdd58a430"
+    },
+    "smoke": {
+      "exit": 0,
+      "pid": 45944,
+      "existing_version": "2.2.55",
+      "installation_changed": false
+    },
+    "verified_raw_logs": [
+      {
+        "path": ".cache/session-models-20261110/core-chat-proxy-final-run.txt",
+        "bytes": 3146,
+        "sha256": "0a015d91cc893906c7b91bd1d7c46c29c20c491669f6c38be63b23771b87ad96"
+      },
+      {
+        "path": ".cache/session-models-20261110/console-chat-proxy-final-e2e.txt",
+        "bytes": 7144,
+        "sha256": "da2799bb8670319e6d9a207ba1573fcf419ef768f141b66a43702e5c68573022"
+      },
+      {
+        "path": ".cache/session-models-20261110/host-final-capability-run.txt",
+        "bytes": 18685,
+        "sha256": "de5045f0a19fba18993321bdd2d43c448c3bb951d8e84cde4161020f93b488ba"
+      },
+      {
+        "path": ".cache/session-models-20261110/agent_controller_test-green-v1-run.txt",
+        "bytes": 4157,
+        "sha256": "63ac0e214d57245c517b4a96d1f65f56f427b6130496e5f45e3eaad1b971a3a3"
+      },
+      {
+        "path": ".cache/session-models-20261110/agent_panel_session_test-green-v2-run.txt",
+        "bytes": 25501,
+        "sha256": "d790fdeb05e1abd5e95bc9fce4d86c6147912bf01645f6e15d2557466031fb1c"
+      },
+      {
+        "path": ".cache/session-models-20261110/main-window-final-model-run.txt",
+        "bytes": 4734,
+        "sha256": "f8e6a6e6692abf2d9d626ffc5cd2eb4a45522a419c631c7bb71dd96ffbd1d030"
+      }
+    ]
+  },
+  "android": {
+    "junit_tests": 61,
+    "failures": 0,
+    "errors": 0,
+    "java_sources_verified": 13,
+    "normal_arm64_jni": {
+      "path": ".cache/session-models-20261110/android-chat-proxy-final/libmaichat_agent.so",
+      "bytes": 323823000,
+      "sha256": "2abc9bff139e67ca0399e856a5b7e9708f682e65b9f6f148ffb6021ca7b62f68"
+    },
+    "apk_built": false,
+    "device_runtime_verified": false
+  },
+  "mac_ios": {
+    "verification": "Coordinator verified received raw lengths/hashes, final source hashes/blobs and test/build log results; executable observations are collaborator receipts",
+    "receipt": {
+      "path": ".cache/session-models-20261110/mac-ios-final/mac-ios-final-receipt.json",
+      "bytes": 7634,
+      "sha256": "7420fe8066da1982f2617f72f8295bb1f78626200d1e9f78225fc251533e6283"
+    },
+    "ios_source_files_verified": 8,
+    "ios_ui": {
+      "passed": 3,
+      "failed": 0,
+      "seconds": 76.474,
+      "rawLog": "ios-final-cohort.log",
+      "coverage": [
+        "Normal Root per-session models/effort, draft retention, actual native provider HTTP fixtures, relaunch",
+        "Normal Root landscape viewport scroll, last model and actual bottom-action confirmation; no clear executed",
+        "Model/native protocol assertions with owned fake peer I/O before mounting editor; normal Root displayed afterwards"
+      ],
+      "liveWebSocketOwnerPeer": false,
+      "paidProviderCalled": false
+    },
+    "ios_release": {
+      "configuration": "normal Release unsigned iOS Simulator arm64",
+      "buildExit": 0,
+      "rawLog": "ios-final-cohort-release-build.log",
+      "bundle": "com.kongshang.maichat",
+      "version": "2.2.4",
+      "build": "203",
+      "exeSHA256": "aaa59e9dd1bff48de30a9bd6378dfa6bd4f1b4035e5bd177b7e5022875a4ae36",
+      "debugOnlySymbolsAbsent": {
+        "sessionModelCommandHandler": true,
+        "sessionModelPreparationHandler": true,
+        "sessionModelSnapshotHandler": true,
+        "runSessionModelRemoteUITestChecks": true,
+        "AIAssistantModelUITestSupport": true
+      },
+      "ownedFixtureLiteralsAbsent": {
+        "owned restored A preparation failure": true,
+        "owned blank draft": true,
+        "Owned history ": true
+      },
+      "installed": false,
+      "physicalDeviceTouched": false
+    },
+    "ios_debug_artifact_binding": {
+      "kind": "simulator-only Debug test artifact binding",
+      "built": {
+        "bundle": "com.kongshang.maichat",
+        "version": "2.2.4",
+        "build": "203",
+        "exeSHA256": "cc2cf7dd08b02d4c34785f8e291854aec8242105e23dbd9e793b26bd4f205982"
+      },
+      "installedTestApp": {
+        "bundle": "com.kongshang.maichat",
+        "version": "2.2.4",
+        "build": "203",
+        "exeSHA256": "cc2cf7dd08b02d4c34785f8e291854aec8242105e23dbd9e793b26bd4f205982"
+      },
+      "physicalDeviceTouched": false,
+      "exeMatches": true
+    },
+    "native_c_abi": {
+      "models": {
+        "exit": 0,
+        "sourceSHA256": "660ecb426acf0bec4a40323d586dea92631ff6507d1e722634faae9cf91fc9ef",
+        "exeSHA256": "8386f4d973e3d4cb1f7d866d68c7c94581c2d64dd39ce2bf4cff24018b2225a1",
+        "log": "mobile-final-models.log",
+        "seconds": 0.669
+      },
+      "steeringOriginal": {
+        "exit": 1,
+        "log": "mobile-final-steering.log",
+        "cause": "Old fixture dispatched a tool after queued user inputs; base HEAD already cancels this stale plan."
+      },
+      "steeringReplanned": {
+        "exit": 0,
+        "sourceSHA256": "fdd1e293703f0b67e6cab3158744ca63c35bd4b9670ce5d5e950bb4e325d7b0e",
+        "exeSHA256": "db3c8987658b6a125d7c0da8f4c285a2ebe84b0649ea07daee752f27213b70a4",
+        "log": "mobile-steering-replanned.log",
+        "elapsed": "not recorded; no estimate substituted"
+      }
+    },
+    "mac_desktop": {
+      "controller": {
+        "passed": 46,
+        "failed": 0,
+        "milliseconds": 24382
+      },
+      "panelSerial": {
+        "passed": 80,
+        "failed": 0,
+        "milliseconds": 5469
+      },
+      "hostBeforeLocalDelta": {
+        "passed": 86,
+        "failed": 0,
+        "skipped": 1
+      },
+      "hostFinalAffectedSlots": {
+        "passed": 5,
+        "failed": 0,
+        "milliseconds": 555
+      },
+      "mainWindowRelated": {
+        "passed": 15,
+        "failed": 0
+      },
+      "devSmoke": {
+        "command": [
+          "/usr/bin/sandbox-exec",
+          "-f",
+          "/private/tmp/maichat-session-models-20261110/desktop-tests.sb",
+          "/private/tmp/maichat-desktop-portrait-20261105/full-config/bin/MaiChat.app/Contents/MacOS/MaiChat",
+          "--smoke",
+          "--debug"
+        ],
+        "pid": 56814,
+        "exit": 0,
+        "seconds": 4.309,
+        "exeSHA256": "d215b790a0f29b5248f8ad57696337adb64e7625b9f196893a47b32a7c9e07c2",
+        "privateHome": true,
+        "network": "loopback only",
+        "platform": "native Cocoa; development App, not staged package",
+        "installationChanged": false
+      },
+      "nativeOwnedMenu": {
+        "command": [
+          "/usr/bin/sandbox-exec",
+          "-f",
+          "/private/tmp/maichat-session-models-20261110/desktop-tests.sb",
+          "/private/tmp/maichat-desktop-portrait-20261105/full-config/bin/agent_panel_session_test",
+          "mainModelChoicesStaySeparateFromReasoningEffort",
+          "-o",
+          "/private/tmp/maichat-session-models-20261110/mac-native-model-menu-mf5i_v10/result.txt,txt"
+        ],
+        "exit": 0,
+        "seconds": 2.549,
+        "exeSHA256": "e415009f62561f8dbb358879104d6f44feb26a4e15eb48619db8f7e93f49ec60",
+        "captureSHA256": "c3c4e4a59d70bbf4cdebb8b695f8f14ad51068f149bd836a74bf62b36ac26e19",
+        "captureScope": "owned QWidget only; native Cocoa, normal test target",
+        "privateHome": true,
+        "network": "loopback only"
+      },
+      "initialFailureEvidence": "Initial full Controller/Panel txt were overwritten by an earlier wrapper. Observed excerpts/totals only retained; later unique-directory raw files preserved. NO_PROXY cause claim explicitly retracted; Chat ignored proxy callback (0 calls, 0 proxy requests)."
+    },
+    "verified_received_artifacts": [
+      {
+        "path": "ios-final-cohort.log",
+        "bytes": 190299,
+        "sha256": "e9d6ffce13e368c9f436add621b6a47d775de0ff4288d6de2d73f4e97963bf72"
+      },
+      {
+        "path": "ios-final-cohort-release-build.log",
+        "bytes": 272239,
+        "sha256": "469e4e49ea4c4f093ac4504eb0c652939d0f7c00f03eed5cee4d72e521eace15"
+      },
+      {
+        "path": "ios-remote-model-red-r2.log",
+        "bytes": 293469,
+        "sha256": "94e83dd3c3ac5c40117318a2d4f12d6b394934a32ea061fb90d03ffc87477d50"
+      },
+      {
+        "path": "ios-refresh-single-variable-red.log",
+        "bytes": 200297,
+        "sha256": "f0b684648f090f816c677ed89e4777d4fcc9a02006ce95c01c4b17e6925cf2dc"
+      },
+      {
+        "path": "ios-final-release-receipt.json",
+        "bytes": 749,
+        "sha256": "ea575601b55d7fb395426ca1e4c864247ecc01c377cbae9d532d71b10ed48b34"
+      },
+      {
+        "path": "ios-final-debug-artifact-binding.json",
+        "bytes": 496,
+        "sha256": "b82ebd066965afb4660ad17e0af6076ad9083eef53c8f9923042aca402630e69"
+      },
+      {
+        "path": "ios-final-eight-source-manifest.json",
+        "bytes": 2309,
+        "sha256": "f0cf069e3acfda6e4deed77a87056c6e86184cdec9c7b4a16628fd8607b362d0"
+      },
+      {
+        "path": "mobile-final-models.log",
+        "bytes": 115,
+        "sha256": "6514226f4fc13dafc7a2ef8de49fa220a1d2ed5ce794d200e4f3acf60343c47e"
+      },
+      {
+        "path": "mobile-final-steering.log",
+        "bytes": 712,
+        "sha256": "aee01eadf25353f23177e85b49f47bc35bf8a264a017708207716f52f21c05d6"
+      },
+      {
+        "path": "mobile-steering-replanned.log",
+        "bytes": 811,
+        "sha256": "c31665ff14b9809ba2743c64180f361f64e2fbea8a067710bbe95ae1ff9deec9"
+      },
+      {
+        "path": "chat-proxy-red.log",
+        "bytes": 2784,
+        "sha256": "86fd4a376456a7c134bc2d73af93b462d7a3213c2a2370b9e32af4441d7f824c"
+      },
+      {
+        "path": "chat-proxy-full-modelclient.log",
+        "bytes": 83,
+        "sha256": "31d4ae6095d26a26c551297271b6a7f2f35ce5627b39c798faa84f51ab60a8d7"
+      }
+    ],
+    "referenced_but_not_received_optional_artifacts": [
+      "ios-review-scope-red.log"
+    ],
+    "verified_visuals": [
+      {
+        "path": "ios-landscape-clear-tap-confirmation.png",
+        "bytes": 286183,
+        "sha256": "8549c7b7cd510617409f355ee2c77bd1c4371d46f04067d8c86223d883c6f47d"
+      },
+      {
+        "path": "ios-landscape-viewport-bottom.png",
+        "bytes": 606707,
+        "sha256": "5f66b542ad305ef1dae80116c5de219fe4a67478e753c88b41b811b8d52bdbf5"
+      },
+      {
+        "path": "ios-landscape-viewport-last-model.png",
+        "bytes": 606707,
+        "sha256": "5f66b542ad305ef1dae80116c5de219fe4a67478e753c88b41b811b8d52bdbf5"
+      }
+    ],
+    "unique_visual_frames": 2,
+    "visual_review": "Coordinator viewed original full-screen captures. Menu scroll stays within material and bottom action opens confirmation; clear not executed."
+  },
+  "boundaries": [
+    "No paid provider call or semantic/latency acceptance",
+    "No real user database read/write for tests",
+    "No physical phone or live cross-device WebSocket acceptance",
+    "No Android device/emulator execution",
+    "No new package, install, version, tag, public Release, or service deployment",
+    "Prior candidate packages and live temporary-image service preserved",
+    "iOS protocol self-test is isolated fake-peer I/O, distinct from two normal Root gesture tests"
+  ]
+}

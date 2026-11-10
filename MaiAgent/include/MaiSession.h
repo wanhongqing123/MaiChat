@@ -49,6 +49,10 @@ struct MaiSession {
     // 必须持久化，否则同轮收尾或 App 重启后的自动起名会覆盖用户指定的有效名称。
     bool titleEdited = false;
 
+    // 本会话推理等级。空串继承宿主默认，显式值仅 low/high/max；SQLite v10 持久化。
+    // 追加末尾，保留原聚合初始化各字段的位置；不会随其他会话的 UI 选择变化。
+    std::string reasoningEffort;
+
     // 标题是不是还没被真正命名过。第一轮结束后会用用户那句话填上。
     bool isUntitled() const;
 

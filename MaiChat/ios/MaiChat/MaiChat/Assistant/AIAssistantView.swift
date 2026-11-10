@@ -278,22 +278,25 @@ struct AIAssistantView: View {
                         Color.black.opacity(0.001).ignoresSafeArea().contentShape(Rectangle())
                             .onTapGesture { showActions = false }
                         AIActionPanel(
-                            selectedModel: model.settings.displayName,
+                            maximumHeight: max(100, viewportSize.height - safeAreaInsets.top - safeAreaInsets.bottom - 68),
+                            selectedModel: model.selectedRemote != nil && model.selectedRemote?.model == nil
+                                ? "所属设备未提供配置" : model.settings.displayName,
+                            selectedModelID: model.settings.model,
                             isLocalModel: model.settings.isLocalModel,
+                            allowLocalModel: model.selectedRemote == nil,
                             changingModelSource: model.changingModelSource,
-                            selectedEffort: model.settings.effectiveReasoningEffort,
+                            selectedEffort: model.selectedRemote != nil && model.selectedRemote?.model == nil
+                                ? "unavailable" : model.settings.effectiveReasoningEffort,
                             selectedPolicy: model.settings.policy,
-                            canChangeModel: model.selectedRemote == nil && model.ready &&
-                                !model.busy && !model.isSubmitting && !model.changingModelSource,
+                            canChangeModel: model.canChangeSessionModel,
+                            canChangeEffort: model.canChangeSessionReasoningEffort,
                             canChangeSettings: model.selectedRemote == nil && model.configured &&
                                 !model.busy && !model.isSubmitting && !model.changingModelSource,
                             canClear: model.selectedRemote == nil && !model.busy &&
                                 !model.selected.isEmpty,
                             selectEffort: { selected in
                                 guard selected != model.settings.effectiveReasoningEffort else { return }
-                                var next = model.settings
-                                next.reasoningEffort = selected
-                                Task { _ = await model.save(next) }
+                                Task { await model.selectReasoningEffort(selected) }
                             },
                             selectPolicy: { policy in
                                 guard policy != model.settings.policy else { return }
@@ -301,8 +304,8 @@ struct AIAssistantView: View {
                                 next.policy = policy
                                 Task { _ = await model.save(next) }
                             },
-                            selectModelSource: { local in
-                                Task { await model.selectPrimaryModelSource(local: local) }
+                            selectModel: { selected in
+                                Task { await model.selectPrimaryModel(selected) }
                             },
                             clear: { showActions = false; confirmClear = true }
                         )
@@ -1343,20 +1346,30 @@ private struct AIHeaderButton: View {
     }
 }
 
+private struct AIActionPanelHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
 private struct AIActionPanel: View {
+    let maximumHeight: CGFloat
     let selectedModel: String
+    let selectedModelID: String
     let isLocalModel: Bool
+    let allowLocalModel: Bool
     let changingModelSource: Bool
     let selectedEffort: String
     let selectedPolicy: String
     let canChangeModel: Bool
+    let canChangeEffort: Bool
     let canChangeSettings: Bool
     let canClear: Bool
     let selectEffort: (String) -> Void
     let selectPolicy: (String) -> Void
-    let selectModelSource: (Bool) -> Void
+    let selectModel: (String) -> Void
     let clear: () -> Void
     @State private var expandedSection: Section?
+    @State private var contentHeight: CGFloat = 208
 
     private enum Section: Equatable {
         case model
@@ -1365,59 +1378,82 @@ private struct AIActionPanel: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // 模型来源与思考强度使用同一内联展开交互，点选后直接保存。
-            // 本地权重随包提供；此入口不再创建设置 sheet、文件管理或应用确认页。
-            expandableAction(title: "主模型", value: changingModelSource ? "正在切换…" : selectedModel,
-                             image: "cpu", section: .model, enabled: canChangeModel)
-            .accessibilityIdentifier("ai-primary-model-settings")
-            if expandedSection == .model {
-                optionGroup(identifier: "ai-primary-model-menu") {
-                    option("云端模型", selected: !isLocalModel) { selectModelSource(false) }
-                        .accessibilityIdentifier("ai-primary-model-cloud")
-                    option("本地模型", selected: isLocalModel) { selectModelSource(true) }
-                        .accessibilityIdentifier("ai-primary-model-local")
+        ScrollView(.vertical) {
+            VStack(spacing: 0) {
+                // 模型来源与思考强度使用同一内联展开交互，点选后直接保存。
+                // 本地权重随包提供；此入口不再创建设置 sheet、文件管理或应用确认页。
+                expandableAction(title: "主模型", value: changingModelSource ? "正在切换…" : selectedModel,
+                                 image: "cpu", section: .model, enabled: canChangeModel)
+                .accessibilityIdentifier("ai-primary-model-settings")
+                if expandedSection == .model {
+                    optionGroup(identifier: "ai-primary-model-menu") {
+                        option("DeepSeek Flash", selected: selectedModelID == "deepseek-flash") { selectModel("deepseek-flash") }
+                            .accessibilityIdentifier("ai-primary-model-deepseek-flash")
+                        option("DeepSeek V4 Pro", selected: selectedModelID == "deepseek-v4-pro") { selectModel("deepseek-v4-pro") }
+                            .accessibilityIdentifier("ai-primary-model-deepseek-v4-pro")
+                        option("GLM-5.3", selected: selectedModelID == "glm-5.3") { selectModel("glm-5.3") }
+                            .accessibilityIdentifier("ai-primary-model-glm-5.3")
+                        option("GLM-5.3-Flash", selected: selectedModelID == "glm-5.3-flash") { selectModel("glm-5.3-flash") }
+                            .accessibilityIdentifier("ai-primary-model-glm-5.3-flash")
+                        if allowLocalModel {
+                            option("本地模型", selected: isLocalModel) { selectModel("local:" + AILocalModelStore.bundledPrimaryID) }
+                                .accessibilityIdentifier("ai-primary-model-local")
+                        }
+                    }
+                    .disabled(!canChangeModel)
                 }
-                .disabled(!canChangeModel)
-            }
-            Divider().padding(.leading, 42)
-            expandableAction(
-                title: "思考强度",
-                value: effortTitle(selectedEffort),
-                image: "sparkles",
-                section: .effort
-            )
-            if expandedSection == .effort {
-                optionGroup(identifier: "ai-effort-menu") {
-                    effortOption("简单", value: "low")
-                    effortOption("标准", value: "high")
-                    effortOption("深度", value: "max")
+                Divider().padding(.leading, 42)
+                expandableAction(
+                    title: "思考强度",
+                    value: effortTitle(selectedEffort),
+                    image: "sparkles",
+                    section: .effort,
+                    enabled: canChangeEffort
+                )
+                if expandedSection == .effort {
+                    optionGroup(identifier: "ai-effort-menu") {
+                        effortOption("简单", value: "low")
+                        effortOption("标准", value: "high")
+                        effortOption("深度", value: "max")
+                    }
+                    .disabled(!canChangeEffort)
                 }
-            }
-            Divider().padding(.leading, 42)
-            expandableAction(
-                title: "操作权限",
-                value: policyTitle(selectedPolicy),
-                image: "shield",
-                section: .policy
-            )
-            if expandedSection == .policy {
-                optionGroup(identifier: "ai-policy-menu") {
-                    policyOption("请求批准", value: "on-request")
-                    policyOption("帮我批准", value: "unless-trusted")
-                    policyOption("完全访问", value: "never")
-                    Text("完全访问免除一般操作确认；付费任务仍需批准。")
-                        .font(AppTypography.metadata)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 14)
-                        .padding(.bottom, 6)
+                Divider().padding(.leading, 42)
+                expandableAction(
+                    title: "操作权限",
+                    value: policyTitle(selectedPolicy),
+                    image: "shield",
+                    section: .policy
+                )
+                if expandedSection == .policy {
+                    optionGroup(identifier: "ai-policy-menu") {
+                        policyOption("请求批准", value: "on-request")
+                        policyOption("帮我批准", value: "unless-trusted")
+                        policyOption("完全访问", value: "never")
+                        Text("完全访问免除一般操作确认；付费任务仍需批准。")
+                            .font(AppTypography.metadata)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 6)
+                    }
                 }
+                Divider().padding(.leading, 42)
+                action("清空当前对话", "trash", canClear ? Color.red : Color.secondary, clear)
+                    .disabled(!canClear)
             }
-            Divider().padding(.leading, 42)
-            action("清空当前对话", "trash", canClear ? Color.red : Color.secondary, clear)
-                .disabled(!canClear)
-        }.frame(width: 264).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .background(GeometryReader { geometry in
+                Color.clear.preference(key: AIActionPanelHeightKey.self, value: geometry.size.height)
+            })
+        }
+            // Measure the unbounded content, then size the scroll viewport itself.
+            // fixedSize on a ScrollView would let its content draw outside the panel.
+            .frame(width: 264, height: min(maximumHeight, contentHeight))
+            .onPreferenceChange(AIActionPanelHeightKey.self) { height in
+                if height.isFinite && height > 0 { contentHeight = height }
+            }
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .clipShape(RoundedRectangle(cornerRadius: 14))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.black.opacity(0.08)))
             .shadow(color: Color.black.opacity(0.14), radius: 20, y: 8)
             .accessibilityElement(children: .contain)
@@ -1479,6 +1515,7 @@ private struct AIActionPanel: View {
         switch value {
         case "low": return "简单"
         case "max": return "深度"
+        case "unavailable": return "未提供"
         default: return "标准"
         }
     }

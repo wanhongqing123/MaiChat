@@ -1467,10 +1467,79 @@ void test_empty_history_with_oversized_instructions_or_tools() {
     CHECK(model.requests().empty());
 }
 
+// 模型/effort 已在当前轮固定：摘要请求也不能偷偷改成另一个会话或旧全局等级。
+void test_compaction_keeps_frozen_effort_and_glm_tool_reasoning() {
+    for (const char* selectedModel : {"glm-5.3", "deepseek-v4-pro"}) {
+        for (const char* effort : {"low", "high", "max"}) {
+            auto store = makeMaiMemoryStore();
+            const auto id = newSession(*store);
+            populate(*store, id);
+            auto assistant = message(MaiRole::Assistant, "");
+            assistant.completed = 0;
+            assistant.parts.clear();
+            const std::string raw = "Opaque source reasoning\r\n\xE7\x95\x8C";
+            assistant.parts.push_back({MaiIdGenerator::newPartId(), MaiReasoningPart{raw}, 1});
+            MaiToolPart tool;
+            tool.tool = "read";
+            tool.callId = "frozen_effort_call";
+            tool.input = "{}";
+            tool.output = "Original tool result";
+            tool.state = MaiToolState::Completed;
+            assistant.parts.push_back({MaiIdGenerator::newPartId(), tool, 1});
+            store->putMessage(id, assistant);
+            const auto history = store->listMessages(id);
+            const auto fingerprint = maiContextSourceFingerprint(id, history, history.size());
+            SummaryModel model;
+            std::atomic<bool> cancel{false};
+            auto input = request(selectedModel);
+            input.reasoningEffort = effort;
+            const MaiContextBuilder builder;
+            const auto build = [&](std::size_t first, std::size_t part,
+                                   const std::string& preserved) {
+                return builder.build(history, first, part, preserved, true);
+            };
+            const auto compacted = MaiContextCompactor().prepare(*store, model, builder, id,
+                                                                 history, input, cancel, build);
+            CHECK(compacted && compacted.value().advancedCheckpoint);
+            CHECK(!model.requests().empty());
+            for (const auto& summary : model.requests()) {
+                CHECK(summary.model == selectedModel);
+                CHECK(summary.reasoningEffort == effort);
+            }
+            if (compacted) {
+                CHECK(compacted.value().request.reasoningEffort == effort);
+                bool originalPair = false;
+                const auto& messages = compacted.value().request.messages;
+                for (std::size_t index = 0; index + 1 < messages.size(); ++index) {
+                    if (messages[index].invocations.empty() ||
+                        messages[index].invocations[0].id != tool.callId)
+                        continue;
+                    CHECK(messages[index].reasoning == raw);
+                    CHECK(messages[index].content.find("Opaque source reasoning") ==
+                          std::string::npos);
+                    CHECK(messages[index + 1].toolCallId == tool.callId &&
+                          messages[index + 1].content == tool.output);
+                    originalPair = true;
+                }
+                CHECK(originalPair);
+            }
+            const auto stored = store->listMessages(id);
+            CHECK(maiContextSourceFingerprint(id, stored, stored.size()) == fingerprint);
+            MaiContextCheckpoint checkpoint;
+            CHECK(store->getContextCheckpoint(id, checkpoint) && checkpoint.revision == 1);
+        }
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--session-models") {
+        test_compaction_keeps_frozen_effort_and_glm_tool_reasoning();
+        return failures == 0 ? 0 : 1;
+    }
     std::puts("MaiContextCompactorTests");
+    test_compaction_keeps_frozen_effort_and_glm_tool_reasoning();
     test_empty_history_with_oversized_instructions_or_tools();
     test_group_observation_provenance_uses_bounded_exact_range();
     test_unfenced_completed_batch_with_retained_images();

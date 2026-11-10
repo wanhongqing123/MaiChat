@@ -68,13 +68,12 @@ public:
     // 更换当前会话的工作目录；没有打开会话时在选定目录新建。
     void openSessionInDirectory(const QString& directory);
 
-    // 上下文条上显示哪个模型。
-    //
-    // **刻意让调用方给**，不在这儿写死一个名字当兜底：会话上的 model 字段为空是常态
-    //（那表示「用 MaiAgent::Options 里的默认值」），而面板看不见那个默认值。
-    // 自己编一个名字显示出去，用户看到的就可能不是实际在跑的那个。
+    // 空白页初始化由宿主给默认/凭据状态；已有会话通过下方普通 getter 刷新，
+    // 不从另一个会话的 label 或全局 UI 选择推断实际配置。
     void setModelLabel(const QString& model, bool configured = true);
     void setReasoningEffortLabel(const QString& effort);
+    // 从当前会话的持久配置重投影；凭据刷新不会覆盖另一个会话的选择。
+    void refreshModelConfiguration();
     // 账号凭据确认可用后，原位更新当前会话模型；不重建消息、编辑器或滚动视图。
     bool applySelectedModel(const QString& model);
     void setOpenVideoCallback(std::function<void(const QString&, const QStringList&)> callback);
@@ -99,6 +98,8 @@ signals:
 
 private:
     void createSessionInDirectory(const QString& directory);
+    // 仅显式首建会话接管空白页草稿；浏览另一历史会话仍按原会话边界切换。
+    void openSessionInternal(const QString& sessionId, bool keepBlankDraft);
     // 这两个是这个面板专用的部件，别处用不上，所以做成嵌套私有类、定义在 .cpp 里。
     // 它们要能点（展开、授权），画不出来，所以嵌进 MarkdownView 里当部件用。
     class ThinkingLine;

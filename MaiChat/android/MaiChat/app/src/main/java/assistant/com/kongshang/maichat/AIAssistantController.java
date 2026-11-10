@@ -52,7 +52,7 @@ public final class AIAssistantController {
     static final class State {
         final JSONObject data;
         final JSONObject remoteSession;
-        final String selected, baseUrl, model, policy, error, syncStatus, restoreDraft;
+        final String selected, baseUrl, model, reasoningEffort, policy, error, syncStatus, restoreDraft;
         final int restoreGeneration;
         final boolean remoteCommandPending;
         final boolean ready;
@@ -66,8 +66,12 @@ public final class AIAssistantController {
             try { this.remoteSession = remoteSession == null ? null : new JSONObject(remoteSession.toString()); }
             catch (Exception invalid) { throw new IllegalArgumentException("Invalid remote owner snapshot", invalid); }
             this.selected = selected;
-            this.baseUrl = baseUrl;
-            this.model = model;
+            this.model = AIAssistantSessionModels.model(data, remoteSession, selected,
+                remoteSession == null ? model : "");
+            this.baseUrl = this.model.startsWith("glm-") ? "https://open.bigmodel.cn/api/paas/v4"
+                : this.model.startsWith("deepseek-") ? DEEPSEEK_URL : baseUrl;
+            this.reasoningEffort = AIAssistantSessionModels.effort(data, remoteSession, selected,
+                remoteSession == null ? data.optString("defaultReasoningEffort", "high") : "");
             this.policy = policy;
             this.error = error;
             this.syncStatus = syncStatus;
@@ -244,6 +248,7 @@ public final class AIAssistantController {
     private final Set<String> outgoingActiveOwners = new HashSet<>();
     private final Map<String, String> outgoingActiveInputs = new HashMap<>();
     private final Map<String, OutgoingReceipt> outgoingReceipts = new HashMap<>();
+    private final AIAssistantSessionModels.Remote remoteModels = new AIAssistantSessionModels.Remote();
     private final Map<String, String> remoteSteeringInputs = new java.util.LinkedHashMap<>();
     private static final class IncomingInput {
         final JSONObject action;
@@ -259,8 +264,12 @@ public final class AIAssistantController {
     private static final class OutgoingReceipt {
         final JSONObject owner;
         final Consumer<JSONObject> completion;
+        final boolean modelConfiguration;
         OutgoingReceipt(JSONObject owner, Consumer<JSONObject> completion) {
-            this.owner = owner; this.completion = completion;
+            this(owner, completion, false);
+        }
+        OutgoingReceipt(JSONObject owner, Consumer<JSONObject> completion, boolean modelConfiguration) {
+            this.owner = owner; this.completion = completion; this.modelConfiguration = modelConfiguration;
         }
     }
     private final MaiChatAuthClient accountAuth;
@@ -268,13 +277,13 @@ public final class AIAssistantController {
     private final AndroidSessionSyncCoordinator sessionSync;
     private volatile Listener listener;
     private volatile HostToolHandler hostToolHandler;
-    static final String GLM_CHAT_URL = "https://open.bigmodel.cn/api/coding/paas/v4";
-    static final String GLM_RESPONSES_URL = "https://open.bigmodel.cn/api/v1";
+    static final String GLM_CHAT_URL = "https://open.bigmodel.cn/api/paas/v4";
     static final String DEEPSEEK_URL = "https://api.deepseek.com";
     static final String DEFAULT_MODEL = "deepseek-flash";
     volatile State state = new State(new JSONObject(), null, "", DEEPSEEK_URL,
         DEFAULT_MODEL, "on-request", "", "", "", 0, false, false);
     private long handle;
+    private long preparedLocalEpoch = -1;
     private File root;
     private File rvmModelFile;
     private volatile String selected = "", baseUrl = state.baseUrl, model = state.model, policy = state.policy,
@@ -443,7 +452,7 @@ public final class AIAssistantController {
         if (tool.equals("glm_api_key")) {
             try {
                 return new JSONObject().put("ok", true)
-                    .put("output", new JSONObject().put("key", glmApiKey))
+                    .put("output", new JSONObject().put("key", testEndpoint == null ? glmApiKey : "test-key"))
                     .toString().getBytes(StandardCharsets.UTF_8);
             } catch (Exception failure) {
                 return hostToolFailure("GLM key is unavailable", "not_configured");
@@ -452,7 +461,7 @@ public final class AIAssistantController {
         if (tool.equals("deepseek_api_key")) {
             try {
                 return new JSONObject().put("ok", true)
-                    .put("output", new JSONObject().put("key", deepseekApiKey))
+                    .put("output", new JSONObject().put("key", testEndpoint == null ? deepseekApiKey : "test-key"))
                     .toString().getBytes(StandardCharsets.UTF_8);
             } catch (Exception failure) {
                 return hostToolFailure("DeepSeek key is unavailable", "not_configured");
@@ -677,19 +686,19 @@ public final class AIAssistantController {
             catch (Exception failure) { Log.w("MaiChatAgent", "Portrait models are unavailable"); }
             exportSystemCertificates();
             modelConfigurationAvailable = true;
-            // Restore the source before resolving credentials. A persisted local model must not
-            // become the default cloud model, or require a cloud key merely to reopen the app.
+            // Old account settings supply defaults only. Session models are authoritative in
+            // SQLite; registering the local slot must not copy a 2B weight on cloud startup.
             File settings = new File(root, "settings.json");
             if (settings.isFile()) {
                 JSONObject saved =
                     new JSONObject(new String(Files.readAllBytes(settings.toPath()), StandardCharsets.UTF_8));
                 primarySettings = AIAssistantModelSettings.fromJson(saved);
             }
+            primarySettings = primarySettings.selectSource(false).withOptions(DEFAULT_MODEL,
+                primarySettings.policy, primarySettings.effort);
             bindPrimarySettings(primarySettings, null);
-            changingModelSource = primarySettings.isLocal();
             publishState();
-            File localFile = resolvePrimaryModel(primarySettings);
-            if (!primarySettings.isLocal() && testEndpoint == null) {
+            if (testEndpoint == null) {
                 try {
                     refreshAccountModelKeys();
                 } catch (Exception failure) {
@@ -697,8 +706,8 @@ public final class AIAssistantController {
                 }
             }
             requireModelOwner();
-            JSONObject configuration = primaryModelConfiguration(primarySettings, localFile,
-                primarySettings.isLocal() ? "" : cloudKey(primarySettings));
+            JSONObject configuration = primaryModelConfiguration(primarySettings, null,
+                cloudKey(primarySettings));
             invokeNativeAgent(configuration);
             requireModelOwner();
             committedModelConfiguration = configuration;
@@ -709,6 +718,7 @@ public final class AIAssistantController {
             if (sessions != null && sessions.length() > 0) {
                 selected = sessions.getJSONObject(0).getString("id");
                 refresh(true);
+                prepareLocalModel(state.model);
             }
             // These are existing media-tool credentials, independent of the primary model.
             // Local model selection and configuration themselves never fetch model API keys.
@@ -723,8 +733,7 @@ public final class AIAssistantController {
         }
     }
     static String supportedModelOrDefault(String selected) {
-        return "glm-5.3".equals(selected) || "glm-5.3-flash".equals(selected) ||
-            "deepseek-flash".equals(selected) ? selected : DEFAULT_MODEL;
+        return AIAssistantModelSettings.supportedCloud(selected) ? selected : DEFAULT_MODEL;
     }
     private static String safeMessage(Throwable error) {
         String detail = error.getMessage();
@@ -803,6 +812,9 @@ public final class AIAssistantController {
         File runtime = new File(context.getApplicationInfo().nativeLibraryDir,
             "libonnxruntime.so");
         JSONObject request = settings.configuration(localFile, key);
+        request.put("localModelName", AIAssistantSessionModels.LOCAL)
+            .put("glmBaseUrl", testEndpoint == null ? GLM_CHAT_URL : testEndpoint)
+            .put("deepseekBaseUrl", testEndpoint == null ? DEEPSEEK_URL : testEndpoint);
         if (testEndpoint != null && !settings.isLocal()) {
             request.put("baseUrl", testEndpoint).put("model", "test-model")
                 .put("wire", "chat_completions").put("apiKey", "test-key");
@@ -834,8 +846,12 @@ public final class AIAssistantController {
     }
 
     private String cloudKey(AIAssistantModelSettings settings) {
+        return cloudKey(settings.cloudModel);
+    }
+
+    private String cloudKey(String model) {
         if (testEndpoint != null) return "test-key";
-        return settings.cloudModel.equals("deepseek-flash") ? deepseekApiKey : glmApiKey;
+        return model.startsWith("deepseek-") ? deepseekApiKey : glmApiKey;
     }
 
     private void bindPrimarySettings(AIAssistantModelSettings settings, JSONObject configuration) {
@@ -1096,12 +1112,20 @@ public final class AIAssistantController {
     private void publishState() {
         JSONObject visible = selectedRemote == null ? data : remoteData;
         String shown = selectedRemote == null ? selected : selectedRemote.optString("id");
+        JSONObject visibleOwner = selectedRemote;
         try {
             visible = new JSONObject(visible.toString());
             JSONArray combined = new JSONArray();
             JSONArray local = data.optJSONArray("sessions");
             if (local != null) for (int i = 0; i < local.length(); i++) combined.put(local.get(i));
-            for (int i = 0; i < remoteSessions.length(); i++) combined.put(remoteSessions.get(i));
+            for (int i = 0; i < remoteSessions.length(); i++) {
+                JSONObject remote = remoteSessions.optJSONObject(i);
+                if (remote != null) combined.put(remoteModels.project(remote));
+            }
+            if (selectedRemote != null) {
+                visibleOwner = remoteModels.project(selectedRemote);
+                visible.put("remoteModelPending", remoteModels.changing(selectedRemote));
+            }
             visible.put("sessions", combined);
             visible.put("devices", new JSONArray(remoteDevices.toString()));
             visible.put("outgoing", outgoingQueue == null ? new JSONArray() : outgoingQueue.entries());
@@ -1109,6 +1133,7 @@ public final class AIAssistantController {
                 visible.optJSONArray("messages"), visible.optJSONArray("questionMessages"),
                 visible.optJSONArray("messageDisplayUpdates")));
             visible.put("emptyDraftSession", outgoingEmptySession);
+            visible.put("defaultReasoningEffort", reasoningEffort);
             visible.put("outgoingRecovery", outgoingPreferences == null ? new JSONObject()
                 : new JSONObject(outgoingPreferences.getString("recovery", "{}")));
         } catch (Exception ignored) { visible = data; }
@@ -1125,7 +1150,7 @@ public final class AIAssistantController {
             }
             for (String owner : owners) worker.post(() -> drainOutgoing(owner));
         } catch (IOException ignored) { /* 保留私有记录，不能因发布界面而清除内容。 */ }
-        State next = new State(visible, selectedRemote, shown, baseUrl, model, policy,
+        State next = new State(visible, visibleOwner, shown, baseUrl, model, policy,
             error, status, remoteRestoreDraft, remoteRestoreGeneration,
             selectedRemote != null && !pendingRemoteCommandIds.isEmpty(), ready);
         state = next;
@@ -1567,6 +1592,29 @@ public final class AIAssistantController {
                     while (remoteSteeringInputs.size() > 128)
                         remoteSteeringInputs.remove(remoteSteeringInputs.keySet().iterator().next());
                 }
+            } else if (operation.equals("get_session") || operation.equals("set_model")) {
+                // This allowlist is deliberately separate from trusted local JSON operations.
+                // A peer can choose a registered model, never submit a path, endpoint or key.
+                java.util.Iterator<String> fields = action.keys();
+                while (fields.hasNext()) {
+                    String field = fields.next();
+                    if (!field.equals("action") && !field.equals("requestId")
+                        && !(operation.equals("set_model") && (field.equals("model")
+                            || field.equals("reasoningEffort"))))
+                        throw new IOException("远端主模型参数无效");
+                }
+                request = new JSONObject().put("op", operation).put("session", sessionId);
+                if (operation.equals("set_model")) {
+                    if (!AIAssistantModelSettings.supportedCloud(action.optString("model")))
+                        throw new IOException("请选择受支持的云端主模型");
+                    requireModelOwner();
+                    if (testEndpoint == null && cloudKey(action.optString("model")).isEmpty())
+                        refreshAccountModelKeys();
+                    requireModelOwner();
+                    request.put("model", action.getString("model"));
+                    if (action.has("reasoningEffort")) request.put("reasoningEffort",
+                        action.getString("reasoningEffort"));
+                }
             } else if (!operation.equals("stop") && !operation.equals("permission") &&
                 !operation.equals("answer") && !operation.equals("rename")) {
                 throw new IOException("不支持的远端操作");
@@ -1576,8 +1624,9 @@ public final class AIAssistantController {
                 if (!runtime.optBoolean("busy") || !action.optString("turnId").equals(runtime.optString("turnId")))
                     throw new IOException("原任务已结束或改变，没有停止新的任务");
             }
-            JSONObject accepted = invokeNativeAgent(request);
-            result = operation.equals("prompt")
+            JSONObject accepted = AIAssistantSessionModels.executeSessionRequest(request,
+                this::invokeNativeAgent, this::prepareLocalModel);
+            result = operation.equals("get_session") || operation.equals("set_model") ? accepted : operation.equals("prompt")
                 ? new JSONObject().put("ok", true).put("user_message_id", accepted.getString("id"))
                 : AndroidSessionSyncCoordinator.commandReceipt(action, accepted);
             if (result.optBoolean("ok") && (operation.equals("prompt") || operation.equals("steer"))) {
@@ -1919,11 +1968,10 @@ public final class AIAssistantController {
             if (payload.optString("type").equals("command_result")) {
                 String command = payload.optString("command_id");
                 OutgoingReceipt receipt = outgoingReceipts.get(command);
-                if (receipt != null && receipt.owner.optString("id").equals(envelope.optString("session_id"))
-                    && receipt.owner.optString("device_slot").equals(envelope.optString("from_slot"))
-                    && receipt.owner.optString("login_session_id").equals(envelope.optString("from_login_session_id"))) {
+                if (receipt != null && AIAssistantSessionModels.Remote.matchesOwner(receipt.owner, envelope)) {
                     JSONObject result = payload.optJSONObject("result");
                     completeOutgoingReceipt(command, result == null ? new JSONObject() : result, result == null);
+                    if (receipt.modelConfiguration) return;
                 }
             }
             JSONObject owner = pendingRemoteSelection != null ? pendingRemoteSelection : selectedRemote;
@@ -1934,6 +1982,9 @@ public final class AIAssistantController {
             if (payload.optString("type").equals("command_result")) {
                 JSONObject result = payload.optJSONObject("result");
                 String id = payload.optString("command_id");
+                // Timed-out/unknown commands cannot clear a newer page's error or consume its
+                // pending UI state. Model callbacks are handled exclusively by their ticket.
+                if (!pendingRemoteCommandIds.contains(id) && !remoteDeliveryPendingIds.contains(id)) return;
                 boolean ok = result != null && result.optBoolean("ok");
                 boolean deliveryPending = remoteDeliveryPendingIds.contains(id);
                 PendingRemoteFiles pendingFiles = pendingRemoteFilesById.remove(id);
@@ -1995,6 +2046,13 @@ public final class AIAssistantController {
             } catch (Exception failure) { error = safeMessage(failure); publishState(); return; }
             error = "";
             publishState();
+            try {
+                String known = remoteModels.project(owner).optString("model");
+                String observed = payload.optString("model");
+                if (payload.optBoolean("initialHistoryPage")
+                    || !observed.isEmpty() && !observed.equals(known))
+                    requestRemoteModel(owner, null, null, null);
+            } catch (Exception failure) { /* Existing history stays visible if metadata is unavailable. */ }
         });
     }
 
@@ -2140,6 +2198,7 @@ public final class AIAssistantController {
                 selected = id;
                 error = "";
                 refresh(true);
+                prepareLocalModel(AIAssistantSessionModels.model(data, null, id, model));
                 success = true;
             } catch (Exception failure) {
                 error = safeMessage(failure);
@@ -2202,6 +2261,62 @@ public final class AIAssistantController {
                 main.post(() -> completion.accept(false));
             }
         });
+    }
+
+    private boolean hasRemoteModelOwner(JSONObject owner) {
+        for (int i = 0; i < remoteSessions.length(); i++)
+            if (sameRemote(owner, remoteSessions.optJSONObject(i))) return true;
+        return false;
+    }
+
+    // The existing receipt map validates the command's owner slot/login/session before invoking
+    // this callback. Transport delivery only acknowledges forwarding, never a model mutation.
+    private void requestRemoteModel(JSONObject owner, String name, String effort,
+                                    Consumer<Boolean> completion) {
+        AIAssistantSessionModels.Remote.Ticket ticket = null;
+        try {
+            if (!ownsModelConfiguration() || sessionSync == null || !hasRemoteModelOwner(owner)
+                || !owner.optBoolean("online")) throw new IOException("所属设备离线，原选择已保留");
+            if (name == null && remoteModels.pending(owner)) return;
+            if (name != null && (owner.optBoolean("busy") || remoteModels.changing(owner)))
+                throw new IOException("原会话正在执行或等待模型确认，原选择已保留");
+            JSONObject action = AIAssistantSessionModels.Remote.request(name, effort)
+                .put("requestId", UUID.randomUUID().toString());
+            ticket = remoteModels.begin(owner, name, effort);
+            final AIAssistantSessionModels.Remote.Ticket captured = ticket;
+            String command = sessionSync.sendToRemote(captured.owner, "command", action,
+                (message, failure) -> worker.post(() -> {
+                    if (!failure.isEmpty()) completeOutgoingReceipt(message,
+                        rejectedPreparation(new IOException(failure)), false);
+                }));
+            outgoingReceipts.put(command, new OutgoingReceipt(captured.owner, result -> {
+                boolean accepted = false;
+                try {
+                    if (!ownsModelConfiguration() || !hasRemoteModelOwner(captured.owner)) {
+                        remoteModels.finish(captured);
+                    } else {
+                        accepted = remoteModels.accept(captured, result);
+                        if (accepted && sameRemote(selectedRemote, captured.owner)) error = "";
+                    }
+                } catch (Exception failure) {
+                    if (ownsModelConfiguration() && sameRemote(selectedRemote, captured.owner))
+                        error = safeMessage(failure);
+                }
+                if (ownsModelConfiguration()) publishState();
+                if (completion != null) {
+                    boolean success = accepted;
+                    main.post(() -> completion.accept(success));
+                }
+            }, true));
+            worker.postDelayed(() -> completeOutgoingReceipt(command,
+                rejectedPreparation(new IOException("等待所属设备确认超时，原选择已保留")), false), 30000);
+            publishState();
+        } catch (Exception failure) {
+            if (ticket != null) remoteModels.finish(ticket);
+            if (ownsModelConfiguration() && sameRemote(selectedRemote, owner)) error = safeMessage(failure);
+            if (ownsModelConfiguration()) publishState();
+            if (completion != null) main.post(() -> completion.accept(false));
+        }
     }
     void create() {
         create(null);
@@ -2293,7 +2408,10 @@ public final class AIAssistantController {
             if (!questionId.isEmpty()) payload.put("questionId", questionId).put("questionCandidates", questions)
                 .put("question", new JSONObject(AIAssistantSubmission.questionToAnswer(questions,
                     visible.data.optJSONArray("questionAnswerEchoes")).toString()));
-            payload.put("model", visible.model);
+            payload.put("model", AIAssistantSessionModels.model(visible.data, remote,
+                intendedSession, visible.model));
+            payload.put("reasoningEffort", AIAssistantSessionModels.effort(visible.data, remote,
+                intendedSession, visible.reasoningEffort));
             if (remote != null) payload.put("remote", new JSONObject(remote.toString()));
             String owner = outgoingOwner(intendedSession, remote);
             JSONObject recovery = new JSONObject(outgoingPreferences.getString("recovery", "{}"));
@@ -2326,6 +2444,20 @@ public final class AIAssistantController {
             if (candidate != null && sameRemote(candidate, remote) && candidate.optBoolean("online")) return candidate;
         }
         throw new IOException("原设备离线，内容保留在发送队列");
+    }
+    // Queue entries carry the clicked session's configuration. Changing another visible page
+    // cannot retarget them, while an actual change on their owner leaves the input recoverable.
+    private void validateOutgoingModel(JSONObject payload) throws Exception {
+        requireModelOwner();
+        JSONObject runtime = invokeNativeAgent(new JSONObject().put("op", "get_session")
+            .put("session", payload.getString("session")));
+        String actual = runtime.optString("model", model);
+        String effort = runtime.optString("reasoningEffort");
+        if (effort.isEmpty()) effort = reasoningEffort;
+        if (!actual.equals(payload.optString("model", actual))
+            || !effort.equals(payload.optString("reasoningEffort", effort)))
+            throw new IOException("原会话主模型或思考强度已改变，内容保留在发送队列");
+        prepareLocalModel(actual);
     }
     private void finishOutgoing(String owner, String id, JSONObject receipt) {
         try {
@@ -2361,23 +2493,24 @@ public final class AIAssistantController {
             JSONObject remote = payload.optJSONObject("remote");
             if (remote == null) {
                 if (!payload.optString("operation").equals("answer")) requireModelOwner();
-                if (!payload.optString("operation").equals("answer") && !model.equals(payload.optString("model", model)))
-                    throw new IOException("原主模型已改变，内容保留在发送队列");
                 if (target.isEmpty()) {
                     if (outgoingEmptySession.isEmpty()) {
-                        outgoingEmptySession = invokeNativeAgent(new JSONObject().put("op", "create")).getString("id");
+                        JSONObject created = invokeNativeAgent(sessionModelRequest("",
+                            payload.optString("model", model), payload.optString("reasoningEffort", reasoningEffort)));
+                        outgoingEmptySession = created.getString("id");
                         if (selected.isEmpty()) selected = outgoingEmptySession;
                     }
                     String createdOwner = outgoingOwner(outgoingEmptySession, null);
                     outgoingQueue.retarget(owner, createdOwner, outgoingEmptySession);
                     publishState(); drainOutgoing(createdOwner); return;
                 }
+                if (!payload.optString("operation").equals("answer")) validateOutgoingModel(payload);
             }
             final String captureId = id;
             outgoingQueue.transition(id, "preparing", payload);
             outgoingActiveOwners.add(owner);
             outgoingActiveInputs.put(owner, id);
-            final boolean supportsVisual = AIAssistantMediaPolicy.supportsImages(model);
+            final boolean supportsVisual = AIAssistantMediaPolicy.supportsImages(payload.optString("model"));
             if (!preparations.start(owner, nativeEpoch, () -> nativeEpoch,
                 cancel -> prepareOutgoing(payload, supportsVisual, cancel), (prepared, failure) -> {
                     if (failure != null) failOutgoingPreparation(owner, captureId, failure);
@@ -2449,6 +2582,7 @@ public final class AIAssistantController {
             dispatched = true; publishState();
             final String acceptedId = id;
             if (remote == null) {
+                if (!answering) validateOutgoingModel(payload);
                 request = AIAssistantSubmission.localRequest(payload, operation, binding.turnId(), id);
                 JSONObject accepted = invokeNativeAgent(request);
                 finishOutgoing(owner, id, accepted);
@@ -2525,7 +2659,25 @@ public final class AIAssistantController {
         } catch (Exception failure) { error = safeMessage(failure); worker.post(this::publishState); return null; }
     }
     void switchModel(String name, Consumer<Boolean> completion) {
-        save(name, policy, completion);
+        switchModel(state, name, completion);
+    }
+    void switchModel(State clicked, String name, Consumer<Boolean> completion) {
+        if (clicked.remoteSession != null) {
+            worker.post(() -> requestRemoteModel(clicked.remoteSession, name, null, completion));
+            return;
+        }
+        if (!beginModelSettingsChange(clicked, true, completion)) return;
+        worker.post(() -> {
+            boolean success = false;
+            publishState();
+            try {
+                // A model-only choice preserves the stored effort, including its empty inherit
+                // value. Sending the displayed fallback here would silently make it explicit.
+                applySessionModel(clicked, name, null);
+                success = true;
+            } catch (Exception failure) { reportModelSettingsFailure(clicked, failure); }
+            finally { finishModelSettingsChange(success, completion); }
+        });
     }
     void action(String operation, JSONObject values, Runnable completion) {
         actionWithResult(operation, values, completion, null);
@@ -2618,61 +2770,104 @@ public final class AIAssistantController {
             }
         });
     }
-    String reasoningEffort() { return reasoningEffort; }
-    boolean isLocalModel() { return primarySettings.isLocal(); }
-    boolean changingModelSource() { return changingModelSource; }
-    String primaryModelTitle() { return isLocalModel() ? "本地模型" : "云端模型"; }
+    String reasoningEffort() { return state.reasoningEffort; }
+    boolean isLocalModel() { return state.model.startsWith("local:"); }
+    boolean changingModelSource() { return state.remoteSession == null ? changingModelSource
+        : state.data.optBoolean("remoteModelPending"); }
+    String primaryModelTitle() { return isLocalModel() ? "本地模型" : state.model; }
     // Configuration availability is separate from configured/ready: a failed local restore must
     // still allow the ordinary source menu to recover by selecting a valid cloud configuration.
     boolean modelSettingsReady() { return modelConfigurationAvailable && !closed && !modelSettingsChange.get(); }
 
 
     void save(String name, String approval, Consumer<Boolean> completion) {
-        save(name, approval, reasoningEffort, completion);
+        save(name, approval, state.reasoningEffort, completion);
     }
 
     void save(String name, String approval, String effort, Consumer<Boolean> completion) {
-        if (!beginModelSettingsChange(false, completion)) return;
-        worker.post(() -> {
-            boolean success = false;
-            try {
-                String selectedName = testEndpoint != null && "test-model".equals(name)
-                    ? primarySettings.cloudModel : name;
-                applyPrimarySettings(primarySettings.withOptions(selectedName, approval, effort));
-                success = true;
-            } catch (Exception failure) {
-                reportModelSettingsFailure(failure);
-            } finally {
-                finishModelSettingsChange(success, completion);
-            }
-        });
+        save(state, name, approval, effort, completion);
     }
-
-    /** Ordinary source selection shares the same configure/persist transaction as option saves. */
-    void selectModelSource(boolean local, Consumer<Boolean> completion) {
-        if (primarySettings.isLocal() == local && state.ready && !modelSettingsChange.get()
-                && ownsModelConfiguration()) {
-            if (completion != null) main.post(() -> completion.accept(true));
+    void save(State clicked, String name, String approval, String effort, Consumer<Boolean> completion) {
+        if (clicked.remoteSession != null) {
+            worker.post(() -> requestRemoteModel(clicked.remoteSession, name, effort, completion));
             return;
         }
-        if (!beginModelSettingsChange(true, completion)) return;
+        if (!beginModelSettingsChange(clicked, false, completion)) return;
         worker.post(() -> {
             boolean success = false;
-            publishState();
             try {
-                applyPrimarySettings(primarySettings.selectSource(local));
+                // Policy remains the existing account default operation. Model/effort edits use
+                // the shared session mutation and never rebuild the Agent or persist defaults.
+                if (!approval.equals(policy)) {
+                    applyPrimarySettings(primarySettings.withOptions(primarySettings.model(), approval,
+                        primarySettings.effort));
+                } else {
+                    applySessionModel(clicked, name, effort);
+                }
                 success = true;
             } catch (Exception failure) {
-                reportModelSettingsFailure(failure);
+                reportModelSettingsFailure(clicked, failure);
             } finally {
                 finishModelSettingsChange(success, completion);
             }
         });
     }
 
-    private boolean beginModelSettingsChange(boolean source, Consumer<Boolean> completion) {
-        if (!ownsModelConfiguration() || !modelConfigurationAvailable || state.remoteSession != null
-                || state.busy() || !modelSettingsChange.compareAndSet(false, true)) {
+    private void applySessionModel(State clicked, String name, String effort) throws Exception {
+        requireModelOwner();
+        if (clicked.remoteSession != null) throw new IOException("请在所属设备修改此会话主模型");
+        JSONObject request = sessionModelRequest(clicked.selected, name, effort);
+        if (name.startsWith("local:")) prepareLocalModel(name);
+        else if (testEndpoint == null) {
+            if (cloudKey(name).isEmpty()) refreshAccountModelKeys();
+            requireModelOwner();
+            if (cloudKey(name).isEmpty()) throw new IOException("账号尚未配置所选供应商模型");
+        }
+        requireModelOwner();
+        JSONObject result = invokeNativeAgent(request);
+        boolean stillSelected = ownsSelectedModelPage(clicked);
+        if (!clicked.selected.isEmpty())
+            AIAssistantSessionModels.validateReceipt(result, clicked.selected, name);
+        // A delayed blank-page choice may create its own session, but must not replace a page
+        // selected while local assets or credentials were being prepared.
+        else if (stillSelected) {
+            selected = result.getString("id");
+            outgoingEmptySession = AIAssistantSessionModels.createdDraftSession(clicked.selected,
+                stillSelected, selected, outgoingEmptySession);
+        }
+        if (stillSelected) error = "";
+        refresh(true);
+    }
+
+    private JSONObject sessionModelRequest(String target, String name, String effort) throws Exception {
+        if (testEndpoint != null && "test-model".equals(name)) {
+            // Preserve the pre-existing explicit Chat fixture. Four-model routing tests use
+            // their real IDs and two wire formats instead of relabeling this custom model.
+            JSONObject request = new JSONObject().put("op", target.isEmpty() ? "create" : "set_model")
+                .put("session", target).put("model", name);
+            if (effort != null) request.put("reasoningEffort", effort);
+            return request;
+        }
+        return AIAssistantSessionModels.selection(target, name, effort);
+    }
+
+    /** Only this trusted local host resolves paths. Remote commands cannot prepare a model. */
+    private void prepareLocalModel(String name) throws Exception {
+        if (!name.startsWith("local:")) return;
+        if (!name.equals(AIAssistantSessionModels.LOCAL))
+            throw new IOException("本地模型身份不受支持");
+        if (preparedLocalEpoch == nativeEpoch) return;
+        File file = resolvePrimaryModel(primarySettings.selectSource(true));
+        requireModelOwner();
+        invokeNativeAgent(new JSONObject().put("op", "prepare_local_model").put("model", name)
+            .put("localModelPath", file.getCanonicalPath()).put("localProjectorPath", "")
+            .put("localContextSize", 32768).put("localMaximumTokens", 0).put("localThreads", 2));
+        preparedLocalEpoch = nativeEpoch;
+    }
+
+    private boolean beginModelSettingsChange(State clicked, boolean source, Consumer<Boolean> completion) {
+        if (!ownsModelConfiguration() || !modelConfigurationAvailable || clicked.remoteSession != null
+                || clicked.busy() || !modelSettingsChange.compareAndSet(false, true)) {
             if (completion != null) main.post(() -> completion.accept(false));
             return false;
         }
@@ -2718,24 +2913,23 @@ public final class AIAssistantController {
         refresh(true);
     }
 
-    private void reportModelSettingsFailure(Exception failure) {
+    private boolean ownsSelectedModelPage(State clicked) {
+        return clicked.remoteSession == null ? selectedRemote == null && clicked.selected.equals(selected)
+            : sameRemote(selectedRemote, clicked.remoteSession);
+    }
+
+    private void reportModelSettingsFailure(State clicked, Exception failure) {
+        if (!ownsModelConfiguration()) return;
         if (failure.getSuppressed().length > 0) ready = false;
-        error = safeMessage(failure);
+        if (ownsSelectedModelPage(clicked) || !ready) error = safeMessage(failure);
     }
 
     private void finishModelSettingsChange(boolean success, Consumer<Boolean> completion) {
         changingModelSource = false;
         modelSettingsChange.set(false);
-        if (!closed) publishState();
+        if (ownsModelConfiguration()) publishState();
         boolean saved = success && ownsModelConfiguration();
         if (completion != null) main.post(() -> completion.accept(saved));
-    }
-    static String endpointFor(String name, String selectedWire, String url, String chatUrl) {
-        if (name.equals("deepseek-flash")) return DEEPSEEK_URL;
-        if (!name.startsWith("glm-") || !url.startsWith("https://open.bigmodel.cn/"))
-            return url;
-        if (selectedWire.equals("responses")) return GLM_RESPONSES_URL;
-        return url.equals(GLM_RESPONSES_URL) ? chatUrl : url;
     }
     private void refreshAccountModelKeys() throws Exception {
         MaiChatAuthClient.AccountModelKeys keys = accountAuth.accountModelKeys();

@@ -346,7 +346,14 @@ private:
     };
     std::shared_ptr<ModelKeyState> modelKeyState_ = std::make_shared<ModelKeyState>();
     QString modelKeyError_;
-    QString pendingModelSelection_;
+    struct PendingModelSelection {
+        QString model;
+        QString owner;
+        quint64 controllerGeneration = 0;
+    };
+    // Key 请求可跨过会话切换；按发起会话保存，不借用回调时当前页的 id。
+    QHash<QString, PendingModelSelection> pendingModelSelections_;
+    quint64 agentControllerGeneration_ = 0;
     std::function<void()> modelKeyRefreshHandler_;
     std::function<void()> logoutHandler_;
     RemoteDiagnosticsController* diagnostics_ = nullptr;

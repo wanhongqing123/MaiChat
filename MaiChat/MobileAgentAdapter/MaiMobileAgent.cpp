@@ -14,7 +14,9 @@
 #include "MaiArkAssetTools.h"
 #include "MaiArkMediaTools.h"
 #include "MaiCurlTools.h"
-#include "MaiDeepSeekWebTools.h"
+#include "MaiProviderWebTools.h"
+#include "MaiCloudModelCatalog.h"
+#include "MaiRoutedModelClient.h"
 #include "MaiCvImageTools.h"
 #include "MaiCvVideoAnalysis.h"
 #include "MaiCvVideoTools.h"
@@ -431,6 +433,78 @@ std::string encodeBase64(const std::string& input) {
     return output;
 }
 
+// 仅宿主提供已授权的沙箱路径；与 configure 共用相同 GGUF/模板/预算预检，不加载权重。
+MaiLlamaModelConfig validatedMobileLocalConfig(const Json& request, const std::string& workspace,
+                                               const std::string& appRoot) {
+    MaiLlamaModelConfig local;
+    MaiToolContext paths;
+    paths.root = workspace;
+    paths.fileAccessRoot = appRoot;
+    const auto authorizedModelFile = [&](const char* field, bool optional) -> MaiFilePath {
+        if (!request.contains(field)) {
+            if (optional) return {};
+            throw NativeOperationFailure(MaiError::make(MaiErrorCode::InvalidInput, "A local GGUF file is required."));
+        }
+        if (!request[field].is_string())
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::InvalidInput, "Local model paths must be strings."));
+        const auto raw = request[field].get<std::string>();
+        if (raw.empty() && optional) return {};
+        const auto path = paths.resolvePath(raw);
+        if (path.empty())
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::InvalidInput, "Local model file is outside the application root."));
+        const auto file = MaiFilePath::fromUtf8(path);
+        std::uint64_t size = 0;
+        if (!MaiFileSystem::fileSize(file, size) || MaiFileSystem::isDirectory(file) || size < 24)
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::NotFound, "Local GGUF file is missing or unavailable."));
+        return file;
+    };
+    const auto boundedNumber = [&](const char* field, std::uint32_t fallback, std::uint32_t lower,
+                                   std::uint32_t upper) -> std::uint32_t {
+        if (!request.contains(field)) return fallback;
+        const auto& value = request[field];
+        std::uint64_t parsed = 0;
+        if (value.is_number_unsigned())
+            parsed = value.get<std::uint64_t>();
+        else if (value.is_number_integer() && value.get<std::int64_t>() >= 0)
+            parsed = static_cast<std::uint64_t>(value.get<std::int64_t>());
+        else
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::InvalidInput, "Local inference limits must be integers."));
+        if (parsed < lower || parsed > upper)
+            throw NativeOperationFailure(
+                MaiError::make(MaiErrorCode::InvalidInput, "Local inference limit is out of range."));
+        return static_cast<std::uint32_t>(parsed);
+    };
+    local.modelPath = authorizedModelFile("localModelPath", false);
+    local.projectorPath = authorizedModelFile("localProjectorPath", true);
+    if (!local.projectorPath.isEmpty())
+        throw NativeOperationFailure(MaiError::make(
+            MaiErrorCode::NotSupported,
+            "Local primary models currently support text and tools; use the local inference test for images."));
+    // 完整移动工具目录的首轮模板实测已超过 23k token；默认 8k 会在第一轮必然失败。
+    // 保留显式较小预算的严格错误，不裁历史/工具来伪装适配。
+    local.contextSize = boundedNumber("localContextSize", 32768, 128, 32768);
+    // 0 交由模型自然结束，最大只受实际上下文余量约束；保留显式预算供普通调用/测试。
+    local.maximumTokens = boundedNumber("localMaximumTokens", 0, 0, 4096);
+    local.threads = boundedNumber("localThreads", 2, 1, 64);
+    if (local.maximumTokens >= local.contextSize)
+        throw NativeOperationFailure(
+            MaiError::make(MaiErrorCode::InvalidInput, "Generation tokens must be smaller than local context size."));
+    // 有界预检 GGUF 元数据和原生工具模板；失败时旧 Agent/设置仍保持有效。
+    // 不加载张量，也不把预检通过当作权重质量、内存或实际推理成功保证。
+    const auto checked = validateMaiLlamaModelConfig(local);
+    if (checked) throw NativeOperationFailure(checked);
+    return local;
+}
+
+struct MaiMobileLocalRouteState {
+    std::mutex mutex;
+    std::optional<MaiLlamaModelConfig> config;
+};
+
 char* ownedResponse(const std::string& response) {
     char* result = static_cast<char*>(std::malloc(response.size() + 1));
     if (result) std::memcpy(result, response.c_str(), response.size() + 1);
@@ -469,6 +543,13 @@ struct MaiMobileAgent {
     std::vector<MaiToolSpec> modelProbeTools;
     std::string modelProbeInstructions;
     bool configured = false;
+    // 目录只在账号 configure 时替换；会话选择仅写 session，不重建 Agent/epoch。
+    MaiRoutedModelConfig routeDirectory;
+    std::string defaultReasoningEffort;
+    std::string localModelName;
+    bool localSupportsImages = false;
+    std::shared_ptr<MaiMobileLocalRouteState> localRouteState;
+    std::string fileAccessRoot;
     const void* ortApiBase = nullptr;
     std::shared_ptr<MaiMobileHostDispatcher> hostTools = makeMaiMobileHostDispatcher();
     MaiMobileAgentChangeHandler changeHandler = nullptr;
@@ -591,74 +672,85 @@ struct MaiMobileAgent {
                                      mai_fftools_set_log_sink, mai_fftools_error_string};
         config.prepareImage = makeMaiFfmpegModelImagePreparer(ffmpegEngine);
         std::function<std::unique_ptr<MaiModelClient>()> nextModelClientFactory;
-        if (isLocal) {
-            MaiLlamaModelConfig local;
-            MaiToolContext paths;
-            paths.root = request.at("workspace").get<std::string>();
-            paths.fileAccessRoot = request.value("appRoot", paths.root);
-            const auto authorizedModelFile = [&](const char* field, bool optional) -> MaiFilePath {
-                if (!request.contains(field)) {
-                    if (optional) return {};
-                    throw NativeOperationFailure(
-                        MaiError::make(MaiErrorCode::InvalidInput, "A local GGUF file is required."));
-                }
-                if (!request[field].is_string())
-                    throw NativeOperationFailure(
-                        MaiError::make(MaiErrorCode::InvalidInput, "Local model paths must be strings."));
-                const auto raw = request[field].get<std::string>();
-                if (raw.empty() && optional) return {};
-                const auto path = paths.resolvePath(raw);
-                if (path.empty())
-                    throw NativeOperationFailure(MaiError::make(MaiErrorCode::InvalidInput,
-                                                                "Local model file is outside the application root."));
-                const auto file = MaiFilePath::fromUtf8(path);
-                std::uint64_t size = 0;
-                if (!MaiFileSystem::fileSize(file, size) || MaiFileSystem::isDirectory(file) || size < 24)
-                    throw NativeOperationFailure(
-                        MaiError::make(MaiErrorCode::NotFound, "Local GGUF file is missing or unavailable."));
-                return file;
-            };
-            const auto boundedNumber = [&](const char* field, std::uint32_t fallback, std::uint32_t lower,
-                                           std::uint32_t upper) -> std::uint32_t {
-                if (!request.contains(field)) return fallback;
-                const auto& value = request[field];
-                std::uint64_t parsed = 0;
-                if (value.is_number_unsigned())
-                    parsed = value.get<std::uint64_t>();
-                else if (value.is_number_integer() && value.get<std::int64_t>() >= 0)
-                    parsed = static_cast<std::uint64_t>(value.get<std::int64_t>());
-                else
-                    throw NativeOperationFailure(
-                        MaiError::make(MaiErrorCode::InvalidInput, "Local inference limits must be integers."));
-                if (parsed < lower || parsed > upper)
-                    throw NativeOperationFailure(
-                        MaiError::make(MaiErrorCode::InvalidInput, "Local inference limit is out of range."));
-                return static_cast<std::uint32_t>(parsed);
-            };
-            local.modelPath = authorizedModelFile("localModelPath", false);
-            local.projectorPath = authorizedModelFile("localProjectorPath", true);
-            if (!local.projectorPath.isEmpty())
-                throw NativeOperationFailure(MaiError::make(
-                    MaiErrorCode::NotSupported,
-                    "Local primary models currently support text and tools; use the local inference test for images."));
-            // 完整移动工具目录的首轮模板实测已超过 23k token；默认 8k 会在第一轮必然失败。
-            // 保留显式较小预算的严格错误，不裁历史/工具来伪装适配。
-            local.contextSize = boundedNumber("localContextSize", 32768, 128, 32768);
-            // 0 交由模型自然结束，最大只受实际上下文余量约束；保留显式预算供普通调用/测试。
-            local.maximumTokens = boundedNumber("localMaximumTokens", 0, 0, 4096);
-            local.threads = boundedNumber("localThreads", 2, 1, 64);
-            if (local.maximumTokens >= local.contextSize)
-                throw NativeOperationFailure(MaiError::make(
-                    MaiErrorCode::InvalidInput, "Generation tokens must be smaller than local context size."));
-            // 有界预检 GGUF 元数据和原生工具模板；失败时旧 Agent/设置仍保持有效。
-            // 不加载张量，也不把预检通过当作权重质量、内存或实际推理成功保证。
-            const auto checked = validateMaiLlamaModelConfig(local);
-            if (checked) throw NativeOperationFailure(checked);
-            // 每个 stream 从完整对话构建原生模板；这里仅绑定配置，不预加载大权重或触发推理。
-            nextModelClientFactory = [local] { return makeMaiLlamaModelClient(local); };
-        } else {
-            nextModelClientFactory = [config] { return makeMaiModelClient(config); };
+        std::optional<MaiModelRoute> nextLocalRoute;
+        bool nextLocalSupportsImages = false;
+        const auto requestedModel = request.at("model").get<std::string>();
+        const auto defaultCapability = maiCloudModelInfo(requestedModel);
+        if (!isLocal && defaultCapability) {
+            config.wire = defaultCapability->wire;
+            // 旧 GLM Responses 官方配置只在这个精确已知迁移点改到兼容 Coding Plan 的 Chat。
+            if (defaultCapability->provider == "glm" && config.baseUrl == "https://open.bigmodel.cn/api/v1")
+                config.baseUrl = "https://open.bigmodel.cn/api/paas/v4";
         }
+        const bool hasLocalConfiguration = isLocal || !request.value("localModelPath", std::string{}).empty();
+        const auto nextLocalName = isLocal ? requestedModel : request.value("localModelName", std::string{});
+        auto nextLocalState = std::make_shared<MaiMobileLocalRouteState>();
+        if (hasLocalConfiguration) {
+            nextLocalState->config =
+                validatedMobileLocalConfig(request, request.at("workspace").get<std::string>(),
+                                           request.value("appRoot", request.at("workspace").get<std::string>()));
+            nextLocalSupportsImages = !nextLocalState->config->projectorPath.isEmpty();
+        }
+        if (hasLocalConfiguration || !nextLocalName.empty()) {
+            if (nextLocalName.empty() || nextLocalName.rfind("local:", 0) != 0)
+                throw NativeOperationFailure(
+                    {MaiErrorCode::InvalidInput, "A local route needs its explicit local: identifier."});
+            MaiModelRoute route;
+            route.modelNames = {nextLocalName};
+            route.config.wire = MaiWireApi::Local;
+            route.config.contextLimits = [state = nextLocalState](const std::string&) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (!state->config) return MaiModelContextLimits{};
+                const auto& local = *state->config;
+                return MaiModelContextLimits{local.contextSize,
+                                             local.maximumTokens != 0 ? local.maximumTokens : local.contextSize - 1,
+                                             local.maximumTokens != 0 ? local.maximumTokens : local.contextSize / 8};
+            };
+            route.clientFactory = [state = nextLocalState]() -> std::unique_ptr<MaiModelClient> {
+                std::optional<MaiLlamaModelConfig> local;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    local = state->config;
+                }
+                return local ? makeMaiLlamaModelClient(*local) : nullptr;
+            };
+            nextLocalRoute = std::move(route);
+        }
+        // 账号提供器在实际请求线程读取。缺失 GLM 不能使用 DeepSeek 或旧快照 Key 顶替。
+        const auto accountKey = [dispatcher = hostTools](const std::string& provider) -> std::string {
+            const auto response = callMaiMobileHostTool(dispatcher, provider + "_api_key", "{}");
+            if (response.hasError()) return {};
+            const auto parsed = Json::parse(response.output(), nullptr, false);
+            return parsed.is_object() && parsed.value("key", Json{}).is_string() ? parsed["key"].get<std::string>()
+                                                                                 : std::string{};
+        };
+        MaiRoutedModelConfig nextRoutes;
+        for (const std::string providerName : {"glm", "deepseek"}) {
+            MaiModelRoute route;
+            route.modelNames = providerName == "glm" ? std::vector<std::string>{"glm-5.3", "glm-5.3-flash"}
+                                                     : std::vector<std::string>{"deepseek-flash", "deepseek-v4-pro"};
+            route.config = config;
+            route.config.apiKey.clear();
+            route.config.wire = providerName == "glm" ? MaiWireApi::ChatCompletions : MaiWireApi::Responses;
+            const char* field = providerName == "glm" ? "glmBaseUrl" : "deepseekBaseUrl";
+            const char* official =
+                providerName == "glm" ? "https://open.bigmodel.cn/api/paas/v4" : "https://api.deepseek.com";
+            route.config.baseUrl = request.value(field, defaultCapability && defaultCapability->provider == providerName
+                                                            ? config.baseUrl
+                                                            : std::string(official));
+            route.apiKeyProvider = [accountKey, providerName] { return accountKey(providerName); };
+            nextRoutes.routes.push_back(std::move(route));
+        }
+        if (nextLocalRoute) nextRoutes.routes.push_back(*nextLocalRoute);
+        if (!isLocal && !defaultCapability) {
+            // 普通 C ABI 仍可显式配置自有端点/型号（含合成测试），只允许该精确型号。
+            // 产品四型号始终走以上账号提供器；这不是账号缺失时的另一条业务兜底。
+            MaiModelRoute route;
+            route.modelNames = {requestedModel};
+            route.config = config;
+            nextRoutes.routes.push_back(std::move(route));
+        }
+        nextModelClientFactory = [nextRoutes] { return makeMaiRoutedModelClient(nextRoutes); };
         auto tools = std::make_unique<MaiToolRegistry>();
         // 两个移动端只提供真实可用的本地文件和网络工具，不暴露桌面 shell。
         registerMaiFileTools(*tools);
@@ -668,17 +760,12 @@ struct MaiMobileAgent {
         // 与普通 C ABI 共用进程内的唯一驻留模型；主聊天仍直连原供应商。
         registerMaiLlamaTools(*tools);
         // 检索由供应商API处理；凭据每次从所属账号读取，不用curl抓搜索引擎HTML。
-        MaiDeepSeekWebOptions webOptions;
-        webOptions.caBundlePath = config.caBundlePath;
-        webOptions.apiKey = [dispatcher = hostTools]() -> std::string {
-            const auto result = callMaiMobileHostTool(dispatcher, "deepseek_api_key", "{}");
-            if (result.hasError()) return {};
-            const auto response = Json::parse(result.output(), nullptr, false);
-            return response.is_object() && response.value("key", Json{}).is_string()
-                       ? response["key"].get<std::string>()
-                       : std::string{};
-        };
-        registerMaiDeepSeekWebTools(*tools, std::move(webOptions));
+        MaiProviderWebOptions webOptions;
+        webOptions.deepseek.caBundlePath = config.caBundlePath;
+        webOptions.glm.caBundlePath = config.caBundlePath;
+        webOptions.deepseek.apiKey = [accountKey] { return accountKey("deepseek"); };
+        webOptions.glm.apiKey = [accountKey] { return accountKey("glm"); };
+        registerMaiProviderWebTools(*tools, std::move(webOptions));
         tools->add(makeMaiZlibCompressTool());
         tools->add(makeMaiZlibDecompressTool());
         tools->add(makeMaiOpenSslCliTool());
@@ -878,8 +965,8 @@ struct MaiMobileAgent {
         MaiAgent::Options options;
         options.defaultModel = request.at("model").get<std::string>();
         options.reasoningEffort = request.value("reasoningEffort", std::string("high"));
-        if (options.reasoningEffort != "low" && options.reasoningEffort != "high" && options.reasoningEffort != "max")
-            throw std::runtime_error("Unsupported DeepSeek reasoning effort.");
+        if (!maiIsValidReasoningEffort(options.reasoningEffort))
+            throw NativeOperationFailure({MaiErrorCode::InvalidInput, "Unsupported reasoning effort."});
         options.fileAccessRoot = request.value("appRoot", request.at("workspace").get<std::string>());
         options.decodeText = [dispatcher = hostTools](const std::string& bytes,
                                                       const std::string& encoding) -> MaiResult<std::string> {
@@ -890,16 +977,10 @@ struct MaiMobileAgent {
         };
         // 与桌面端共用可见正文进度约定，后续本地模型能力边界仍按当前配置追加。
         options.baseInstructions = kMarkdownBaseInstructions + maiAgentProgressInstructions();
-        if (isLocal) {
-            // 当前本地主模型未加载视觉投影器；展示工具产物和向模型送入图片是两种能力。
-            // 明确边界，不能把成功拍照或界面显示误称为已经理解了照片内容。
-            options.baseInstructions +=
-                "\nYour primary model runs locally in this App through in-process GGUF inference. "
-                "Use the same registered tools and approval rules as other primary models. "
-                "This local configuration accepts text only and cannot analyze image contents. "
-                "Displaying an image to the user does not mean you have visually inspected it. "
-                "Do not claim that your text responses came from a cloud model.";
-        }
+        options.baseInstructions +=
+            "\nPrimary model selection belongs to this session. "
+            "A text-only primary model cannot analyze image pixels merely "
+            "because a tool can display an image to the user.";
         // 内置模型路径由原生宿主复制/校验后提供，只允许当前App容器中的现有文件。
         // 提示词只介绍已知可用的英文测试权重，不改变主聊天供应商，也不让模型猜目录。
         if (!isLocal && request.value("localTestModelPath", Json{}).is_string()) {
@@ -950,7 +1031,13 @@ struct MaiMobileAgent {
         workspace = request.at("workspace").get<std::string>();
         model = options.defaultModel;
         primaryWire = config.wire;
-        configured = (isLocal || !config.apiKey.empty()) && !model.empty();
+        routeDirectory = std::move(nextRoutes);
+        defaultReasoningEffort = options.reasoningEffort;
+        localModelName = nextLocalRoute ? nextLocalRoute->modelNames.front() : std::string{};
+        localSupportsImages = nextLocalSupportsImages;
+        localRouteState = std::move(nextLocalState);
+        fileAccessRoot = options.fileAccessRoot;
+        configured = !model.empty();
         dirty = true;
         structureChanged = true;
         cachedSession.clear();
@@ -1183,6 +1270,53 @@ struct MaiMobileAgent {
         return questions;
     }
 
+    const MaiModelRoute* routeForModel(const std::string& selectedModel) const {
+        for (const auto& route : routeDirectory.routes)
+            if (std::find(route.modelNames.begin(), route.modelNames.end(), selectedModel) != route.modelNames.end())
+                return &route;
+        return nullptr;
+    }
+
+    MaiSession requireSession(const std::string& id) const {
+        MaiSession session;
+        if (!agent || id.empty() || !agent->getSession(id, session))
+            throw NativeOperationFailure({MaiErrorCode::NotFound, "Session not found."});
+        return session;
+    }
+
+    Json sessionConfiguration(const MaiSession& session) const {
+        const auto selectedModel = session.model.empty() ? model : session.model;
+        const auto* route = routeForModel(selectedModel);
+        return {{"session", session.id},
+                {"model", selectedModel},
+                {"reasoningEffort", session.reasoningEffort},
+                {"defaultReasoningEffort", defaultReasoningEffort},
+                {"wire", route ? maiWireApiToString(route->config.wire) : ""}};
+    }
+
+    void requireConfiguredModel(const std::string& selectedModel) const {
+        const auto* route = routeForModel(selectedModel);
+        if (!route) throw NativeOperationFailure({MaiErrorCode::InvalidInput, "The selected model is unavailable."});
+        if (route->clientFactory) {
+            if (selectedModel == localModelName) {
+                std::lock_guard<std::mutex> lock(localRouteState->mutex);
+                if (!localRouteState->config)
+                    throw NativeOperationFailure(
+                        {MaiErrorCode::NotConfigured, "The bundled local model has not been prepared."});
+            }
+            return;
+        }
+        std::string key;
+        try {
+            key = route->apiKeyProvider ? route->apiKeyProvider() : route->config.apiKey;
+        } catch (...) {
+        }
+        if (key.empty() || key.size() > 8192 || key.find_first_of("\r\n") != std::string::npos ||
+            key.find('\0') != std::string::npos)
+            throw NativeOperationFailure(
+                {MaiErrorCode::NotConfigured, "The selected provider is not configured for this account."});
+    }
+
     // 作用：读取指定会话的有限消息快照和任务状态。
     Json snapshot(const std::string& selected, bool force, int limit, bool includeMessageUpdates = false) {
         std::unordered_map<std::string, std::string> errorCopy;
@@ -1222,7 +1356,10 @@ struct MaiMobileAgent {
             sessions.push_back({{"id", session.id},
                                 {"title", session.title},
                                 {"busy", active},
-                                {"turnId", agent->activeTurnId(session.id)}});
+                                {"turnId", agent->activeTurnId(session.id)},
+                                {"model", sessionConfiguration(session)["model"]},
+                                {"reasoningEffort", session.reasoningEffort},
+                                {"wire", sessionConfiguration(session)["wire"]}});
         }
         // 增量期间复用消息结构，避免每个批次重新读整段 SQLite 历史。
         if (reload) {
@@ -1269,8 +1406,18 @@ struct MaiMobileAgent {
         // 提问/回答/工具状态变化都是非 delta 事件，触发 reload 后刷新权威快照。
         if (reload) cachedQuestionTranscript = captureMaiQuestionTranscript(*agent, selected);
         if (!busy) liveParts.clear();
-        const auto localStatus =
-            primaryWire == MaiWireApi::Local ? getSharedMaiLlamaRuntime()->status() : MaiLlamaStatus{};
+        MaiSession chosen;
+        const bool hasChosen = agent->getSession(selected, chosen);
+        const auto choice = hasChosen ? sessionConfiguration(chosen)
+                                      : Json{{"model", model},
+                                             {"reasoningEffort", defaultReasoningEffort},
+                                             {"wire", maiWireApiToString(primaryWire)}};
+        const auto localStatus = choice["wire"] == "local" ? getSharedMaiLlamaRuntime()->status() : MaiLlamaStatus{};
+        bool selectedConfigured = configured;
+        if (choice["wire"] == "local") {
+            std::lock_guard<std::mutex> lock(localRouteState->mutex);
+            selectedConfigured = localRouteState->config.has_value();
+        }
         return {{"ok", true},
                 {"changed", true},
                 {"sessions", sessions},
@@ -1284,10 +1431,14 @@ struct MaiMobileAgent {
                 {"turnId", agent->activeTurnId(selected)},
                 {"model", model},
                 {"wire", maiWireApiToString(primaryWire)},
+                {"selectedModel", choice["model"]},
+                {"selectedReasoningEffort", choice["reasoningEffort"]},
+                {"defaultReasoningEffort", defaultReasoningEffort},
+                {"selectedWire", choice["wire"]},
                 {"localGpuSelected", localStatus.gpuSelected},
                 {"localGpuModelBytes", localStatus.gpuModelBytes},
                 {"localGpuBackend", localStatus.gpuBackend},
-                {"configured", configured},
+                {"configured", selectedConfigured},
                 {"error", errorCopy[selected]}};
     }
 
@@ -1367,7 +1518,13 @@ struct MaiMobileAgent {
             if (remoteQuestionHistory.size() >= 3) remoteQuestionHistory.clear();
             remoteQuestionHistory.emplace(sessionId, questionTranscript.childMessages);
         }
+        const auto choice = sessionConfiguration(session);
         return {{"ok", true},
+                {"session", sessionId},
+                {"model", choice["model"]},
+                {"reasoningEffort", choice["reasoningEffort"]},
+                {"defaultReasoningEffort", defaultReasoningEffort},
+                {"wire", choice["wire"]},
                 {"rootSessionId", maiQuestionRootSessionId(*agent, sessionId)},
                 {"messages", serializeMessages(page, before.empty() && busy, sessionId, &remoteLiveParts)},
                 {"messageUpdates", serializeMessages(updatedMessages, busy, sessionId, &remoteLiveParts)},
@@ -1394,9 +1551,10 @@ struct MaiMobileAgent {
             const std::string relative = r.at("path");
             if (requestId.empty() || requestId.size() > 128 || attachment.empty() || attachment.size() > 128 ||
                 !std::all_of(attachment.begin(), attachment.end(), [](unsigned char c) {
-                    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                        (c >= '0' && c <= '9') || c == '_' || c == '-';
-                })) throw std::runtime_error("Invalid input attachment identity.");
+                    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+                           c == '-';
+                }))
+                throw std::runtime_error("Invalid input attachment identity.");
             MaiToolContext paths;
             paths.root = workspace;
             const auto source = MaiFilePath::fromUtf8(paths.resolvePath(relative));
@@ -1405,17 +1563,22 @@ struct MaiMobileAgent {
                 throw std::runtime_error("Imported input attachment is unavailable.");
             constexpr char digits[] = "0123456789abcdef";
             std::string key;
-            for (unsigned char c : requestId) { key += digits[c >> 4]; key += digits[c & 15]; }
+            for (unsigned char c : requestId) {
+                key += digits[c >> 4];
+                key += digits[c & 15];
+            }
             const std::string base = source.baseName().toUtf8();
             const auto dot = base.find_last_of('.');
-            const std::string extension = dot == std::string::npos || base.size() - dot > 16
-                ? ".bin" : base.substr(dot);
+            const std::string extension =
+                dot == std::string::npos || base.size() - dot > 16 ? ".bin" : base.substr(dot);
             const std::string targetName = ".maichat/session-inputs/" + key.substr(0, 128) +
-                (key.size() > 128 ? "/" + key.substr(128) : "") + "/" + attachment + extension;
+                                           (key.size() > 128 ? "/" + key.substr(128) : "") + "/" + attachment +
+                                           extension;
             const std::string destination = paths.resolvePath(targetName);
             if (destination.empty()) throw std::runtime_error("Input attachment path is outside the workspace.");
             const auto target = MaiFilePath::fromUtf8(destination);
-            if (const auto error = MaiFileSystem::createDirectories(target.dirName())) throw std::runtime_error(error.message());
+            if (const auto error = MaiFileSystem::createDirectories(target.dirName()))
+                throw std::runtime_error(error.message());
             MaiRegularFileInfo existing;
             if (MaiFileSystem::regularFileInfo(target, existing)) {
                 if (existing.bytes != sourceInfo.bytes) throw std::runtime_error("Input attachment content changed.");
@@ -1427,6 +1590,61 @@ struct MaiMobileAgent {
         }
         if (op == "local_model_probe") return localModelProbe(r);
         const std::string session = r.value("session", "");
+        if (op == "prepare_local_model") {
+            for (const auto& field : r.items())
+                if (field.key() != "op" && field.key() != "force" && field.key() != "model" &&
+                    field.key() != "localModelPath" && field.key() != "localProjectorPath" &&
+                    field.key() != "localContextSize" && field.key() != "localMaximumTokens" &&
+                    field.key() != "localThreads")
+                    throw NativeOperationFailure(
+                        {MaiErrorCode::InvalidInput, "Unknown local model preparation field."});
+            if (localModelName.empty() || r.value("model", std::string{}) != localModelName)
+                throw NativeOperationFailure({MaiErrorCode::InvalidInput, "The local route identity does not match."});
+            const auto candidate = validatedMobileLocalConfig(r, workspace, fileAccessRoot);
+            {
+                std::lock_guard<std::mutex> lock(localRouteState->mutex);
+                if (localRouteState->config && (localRouteState->config->modelPath != candidate.modelPath ||
+                                                localRouteState->config->projectorPath != candidate.projectorPath ||
+                                                localRouteState->config->contextSize != candidate.contextSize ||
+                                                localRouteState->config->maximumTokens != candidate.maximumTokens ||
+                                                localRouteState->config->threads != candidate.threads))
+                    throw NativeOperationFailure(
+                        {MaiErrorCode::Busy, "An existing local route cannot be replaced by session selection."});
+                localRouteState->config = candidate;
+                localSupportsImages = !candidate.projectorPath.isEmpty();
+            }
+            return {{"ok", true}, {"model", localModelName}, {"wire", "local"}};
+        }
+        if (op == "get_session") {
+            auto choice = sessionConfiguration(requireSession(session));
+            choice["ok"] = true;
+            return choice;
+        }
+        if (op == "set_model") {
+            for (const auto& field : r.items())
+                if (field.key() != "op" && field.key() != "session" && field.key() != "model" &&
+                    field.key() != "reasoningEffort" && field.key() != "force")
+                    throw NativeOperationFailure({MaiErrorCode::InvalidInput, "Unknown session model field."});
+            requireSession(session);
+            if (!r.contains("model") || !r["model"].is_string() || r["model"].get<std::string>().empty())
+                throw NativeOperationFailure({MaiErrorCode::InvalidInput, "A model identifier is required."});
+            std::optional<std::string> effort;
+            if (r.contains("reasoningEffort")) {
+                if (!r["reasoningEffort"].is_string() ||
+                    !maiIsValidReasoningEffort(r["reasoningEffort"].get<std::string>()))
+                    throw NativeOperationFailure({MaiErrorCode::InvalidInput, "Unsupported reasoning effort."});
+                effort = r["reasoningEffort"].get<std::string>();
+            }
+            if (agent->isBusy(session))
+                throw NativeOperationFailure(
+                    {MaiErrorCode::Busy, "Stop the target session before changing its model."});
+            const auto selectedModel = r["model"].get<std::string>();
+            requireConfiguredModel(selectedModel);
+            result(agent->submit(MaiUpdateSession{session, "", selectedModel, "", "", effort}));
+            auto choice = sessionConfiguration(requireSession(session));
+            choice["ok"] = true;
+            return choice;
+        }
         if (op == "snapshot") {
             const int limit = r.value("messageLimit", -1);
             if (limit < -1 || limit > 100) throw std::runtime_error("messageLimit must be between 0 and 100.");
@@ -1460,7 +1678,7 @@ struct MaiMobileAgent {
                     {"messages", serializeMessages(page, before.empty() && agent->isBusy(session), session)}};
         }
         if (op == "suggest_replies") {
-            if (!configured) throw std::runtime_error("Configure an available primary model first.");
+            requireConfiguredModel(model);
             if (!r.contains("messages") || !r["messages"].is_array() || r["messages"].empty() ||
                 r["messages"].size() > 30)
                 throw std::runtime_error("Messages must contain between 1 and 30 items.");
@@ -1503,14 +1721,23 @@ struct MaiMobileAgent {
         std::string id;
         std::string acceptedUserId;
         std::string acceptedTurnId;
-        if (op == "create")
-            id = result(agent->submit(MaiCreateSession{workspace, "", model}));
-        else if (op == "send" || op == "steer" || op == "enqueue") {
-            if (!configured) throw std::runtime_error("Configure an available primary model first.");
+        if (op == "create") {
+            const auto selectedModel = r.value("model", model);
+            const auto effort = r.value("reasoningEffort", defaultReasoningEffort);
+            if (!maiIsValidReasoningEffort(effort))
+                throw NativeOperationFailure({MaiErrorCode::InvalidInput, "Unsupported reasoning effort."});
+            if (!routeForModel(selectedModel))
+                throw NativeOperationFailure({MaiErrorCode::InvalidInput, "The selected model is unavailable."});
+            if (r.contains("model")) requireConfiguredModel(selectedModel);
+            id = result(agent->submit(MaiCreateSession{workspace, "", selectedModel, effort}));
+        } else if (op == "send" || op == "steer" || op == "enqueue") {
+            const auto target = requireSession(session);
+            const auto selectedModel = target.model.empty() ? model : target.model;
+            requireConfiguredModel(selectedModel);
             // iOS 在升级或恢复后可能给同一数据容器分配新的绝对路径。图片片段只保存
             // 工作区相对路径，所以每轮发送前都把会话根目录迁到当前容器位置。
             if (op == "send" || (op == "enqueue" && !agent->isBusy(session))) {
-                result(agent->submit(MaiUpdateSession{session, "", model, "", workspace}));
+                result(agent->submit(MaiUpdateSession{session, "", "", "", workspace}));
                 std::lock_guard<std::mutex> lock(mutex);
                 errors.erase(session);
             }
@@ -1536,14 +1763,20 @@ struct MaiMobileAgent {
                     videos.push_back({value["path"].get<std::string>(), value["mimeType"].get<std::string>()});
                 }
             }
+            const auto capability = maiCloudModelInfo(selectedModel);
+            if ((!images.empty() || !videos.empty()) && ((capability && !capability->supportsImages) ||
+                                                         (selectedModel == localModelName && !localSupportsImages)))
+                throw NativeOperationFailure({MaiErrorCode::NotSupported,
+                                              "The target session model accepts text only; its draft was preserved."});
             if (r.contains("quoteMessageId") && !r["quoteMessageId"].is_string())
                 throw std::runtime_error("quoteMessageId must be a string.");
             if (op == "enqueue") {
                 if (!r.contains("requestId") || !r["requestId"].is_string())
                     throw std::runtime_error("Enqueue requires a stable requestId.");
-                id = result(agent->submit(MaiEnqueuePrompt{
-                    MaiSendPrompt{session, r.at("text"), std::move(images), std::move(videos),
-                                  r.value("quoteMessageId", std::string{})}, r["requestId"]}));
+                id = result(agent->submit(
+                    MaiEnqueuePrompt{MaiSendPrompt{session, r.at("text"), std::move(images), std::move(videos),
+                                                   r.value("quoteMessageId", std::string{})},
+                                     r["requestId"]}));
             } else if (op == "steer") {
                 if (!r.contains("turnId") || !r["turnId"].is_string() || !r.contains("requestId") ||
                     !r["requestId"].is_string())

@@ -186,6 +186,62 @@ private:
     int calls_ = 0;
 };
 
+QJsonObject modelOwner(const QString& id, const QString& login = QStringLiteral("model-owner-login")) {
+    return {{QStringLiteral("id"), id},
+            {QStringLiteral("device_slot"), QStringLiteral("mac")},
+            {QStringLiteral("device_name"), QStringLiteral("Model owner fixture")},
+            {QStringLiteral("login_session_id"), login},
+            {QStringLiteral("online"), true},
+            {QStringLiteral("busy"), false}};
+}
+
+QJsonObject modelReceipt(const QJsonObject& owner, const QString& model) {
+    return {{QStringLiteral("ok"), true},
+            {QStringLiteral("session"), owner.value(QStringLiteral("id"))},
+            {QStringLiteral("model"), model},
+            {QStringLiteral("reasoningEffort"), QStringLiteral("high")},
+            {QStringLiteral("wire"), QStringLiteral("responses")}};
+}
+
+void deliverModelReceipt(RemoteAgentPanel& panel, const QJsonObject& owner,
+                         const QJsonObject& command, const QJsonObject& result) {
+    panel.receivePayload(owner, QStringLiteral("event"),
+                         {{QStringLiteral("type"), QStringLiteral("command_result")},
+                          {QStringLiteral("command_id"), command.value(QStringLiteral("requestId"))},
+                          {QStringLiteral("request_id"), command.value(QStringLiteral("requestId"))},
+                          {QStringLiteral("result"), result}});
+}
+
+// Existing scenarios model prompts/questions, so their fake owner explicitly
+// answers the newly added configuration read before retaining the same business
+// command counts. Model-selection tests below observe that exchange themselves.
+void setBusinessCommandHandler(RemoteAgentPanel& panel, RemoteAgentPanel::CommandHandler handler) {
+    panel.setCommandHandler([&panel, handler = std::move(handler)](
+        const QJsonObject& owner, const QJsonObject& command, RemoteAgentPanel::Completion completion) {
+        if (command.value(QStringLiteral("action")) == QStringLiteral("get_session")) {
+            deliverModelReceipt(panel, owner, command, modelReceipt(owner, QStringLiteral("deepseek-flash")));
+            completion({});
+            return;
+        }
+        handler(owner, command, std::move(completion));
+    });
+}
+
+QPushButton* remoteModelOption(RemoteAgentPanel& panel, const QString& model) {
+    auto* more = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentMoreActions"));
+    if (!more) return nullptr;
+    auto* actions = panel.findChild<QWidget*>(QStringLiteral("remoteAgentActionPanel"));
+    if (!actions || !actions->isVisible()) QTest::mouseClick(more, Qt::LeftButton);
+    auto* option = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentModelOption-") + model);
+    if (!option || !option->isVisible()) {
+        auto* section = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentModelSection"));
+        if (!section) return nullptr;
+        QTest::mouseClick(section, Qt::LeftButton);
+        option = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentModelOption-") + model);
+    }
+    return option;
+}
+
 }  // namespace
 
 class DesktopSessionSyncHostTest : public QObject {
@@ -201,6 +257,14 @@ private slots:
     void temporaryImageLocalTlsCachesAcrossExpiryAndOwnerOffline();
     void assistantToolImagePublishesPendingWhileTheTurnIsStillRunning();
     void appliesRemotePromptToTheExistingLocalSession();
+    void remoteHostReadsAndPersistsOnlyTheTargetSessionModel();
+    void remoteHostRejectsInvalidAndBusyModelChangesWithoutMutation();
+    void coordinatorModelCommandKeepsOwnerTupleAndRejectsOldLogin();
+    void remoteModelDisplayWaitsForOwnerAckAndSurvivesCatalogRefresh();
+    void remoteModelReceiptsCannotCrossSessionOrLogin();
+    void remoteLocalConfigurationKeepsCloudChoicesButDisablesEffort();
+    void remoteModelFailureSurvivesNormalHistory_data();
+    void remoteModelFailureSurvivesNormalHistory();
     void remoteSteeringBindsToTheOriginalOwnerTurn();
     void remotePromptQueuesWhileOwnerIsBusy();
     void remotePanelSendsMoreBeforePriorReceiptAndStopsSeparately();
@@ -1272,7 +1336,7 @@ void DesktopSessionSyncHostTest::remotePermissionButtonsUseSharedWireDecisions()
                                   {QStringLiteral("permissions"), permissions}});
             completion({});
         });
-        panel.setCommandHandler(
+        setBusinessCommandHandler(panel,
             [&](const QJsonObject&, const QJsonObject& payload, RemoteAgentPanel::Completion completion) {
                 sent = payload;
                 completion({});
@@ -1298,6 +1362,205 @@ void DesktopSessionSyncHostTest::remotePermissionButtonsUseSharedWireDecisions()
         QVERIFY(!result.value(QStringLiteral("ok")).toBool());
         QVERIFY(result.value(QStringLiteral("error")).toString() != QStringLiteral("权限决定无效"));
     }
+}
+
+void DesktopSessionSyncHostTest::remoteHostReadsAndPersistsOnlyTheTargetSessionModel() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString database = directory.filePath(QStringLiteral("model-owner.sqlite"));
+    AgentController::ModelConfig configured;
+    configured.glmBaseUrl = QStringLiteral("http://127.0.0.1:1/glm");
+    configured.deepseekBaseUrl = QStringLiteral("http://127.0.0.1:1/deepseek");
+    configured.accountModelKeyProvider = [](const QString& provider) {
+        if (provider == QStringLiteral("glm")) return QStringLiteral("fixture-glm-key");
+        if (provider == QStringLiteral("deepseek")) return QStringLiteral("fixture-deepseek-key");
+        return QString();
+    };
+    QString target;
+    QString other;
+    {
+        // Configuration queries use the real provider/catalog router and fake
+        // cached keys. No prompt is submitted, so no HTTP/model call occurs.
+        AgentController controller(configured, database);
+        QVERIFY2(controller.openError().isEmpty(), qPrintable(controller.openError()));
+        target = controller.createSession(directory.path(), QStringLiteral("Target model fixture"));
+        other = controller.createSession(directory.path(), QStringLiteral("Other model fixture"));
+        QVERIFY(!target.isEmpty() && !other.isEmpty());
+        // Seed through the existing Core mutation, avoiding the Controller's old global selector.
+        QVERIFY(controller.agent().submit(MaiUpdateSession{target.toStdString(), "", "glm-5.3", "", ""}));
+        QVERIFY(controller.agent().submit(MaiUpdateSession{other.toStdString(), "", "deepseek-flash", "", ""}));
+        DesktopSessionSyncHost host(controller);
+        const auto current = host.applyCommand(target, {{QStringLiteral("action"), QStringLiteral("get_session")}});
+        QVERIFY2(current.value(QStringLiteral("ok")).toBool(),
+                 qPrintable(current.value(QStringLiteral("error")).toString()));
+        QCOMPARE(current.value(QStringLiteral("session")).toString(), target);
+        QCOMPARE(current.value(QStringLiteral("model")).toString(), QStringLiteral("glm-5.3"));
+        QCOMPARE(current.value(QStringLiteral("reasoningEffort")).toString(), QStringLiteral("high"));
+        QVERIFY(current.value(QStringLiteral("wire")).isString());
+        QVERIFY(!current.value(QStringLiteral("wire")).toString().isEmpty());
+        QCOMPARE(current.value(QStringLiteral("wire")).toString(), QStringLiteral("chat_completions"));
+        QVERIFY(!current.contains(QStringLiteral("session_id")));
+        for (const QString& selected : {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
+                                        QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")}) {
+            const auto changed = host.applyCommand(
+                target, {{QStringLiteral("action"), QStringLiteral("set_model")},
+                         {QStringLiteral("model"), selected},
+                         {QStringLiteral("reasoningEffort"), QStringLiteral("high")}});
+            QVERIFY2(changed.value(QStringLiteral("ok")).toBool(),
+                     qPrintable(changed.value(QStringLiteral("error")).toString()));
+            QCOMPARE(changed.value(QStringLiteral("session")).toString(), target);
+            QCOMPARE(changed.value(QStringLiteral("model")).toString(), selected);
+            QCOMPARE(changed.value(QStringLiteral("reasoningEffort")).toString(), QStringLiteral("high"));
+            QVERIFY(changed.value(QStringLiteral("wire")).isString());
+            QVERIFY(!changed.value(QStringLiteral("wire")).toString().isEmpty());
+            QCOMPARE(changed.value(QStringLiteral("wire")).toString(),
+                     selected.startsWith(QStringLiteral("glm-")) ? QStringLiteral("chat_completions")
+                                                                  : QStringLiteral("responses"));
+            QVERIFY(!changed.contains(QStringLiteral("session_id")));
+            MaiSession savedTarget;
+            MaiSession savedOther;
+            QVERIFY(controller.agent().getSession(target.toStdString(), savedTarget));
+            QVERIFY(controller.agent().getSession(other.toStdString(), savedOther));
+            QCOMPARE(QString::fromStdString(savedTarget.model), selected);
+            QCOMPARE(QString::fromStdString(savedTarget.reasoningEffort), QStringLiteral("high"));
+            QCOMPARE(QString::fromStdString(savedOther.model), QStringLiteral("deepseek-flash"));
+            QCOMPARE(QString::fromStdString(savedTarget.title), QStringLiteral("Target model fixture"));
+            QCOMPARE(QDir(QString::fromStdString(savedTarget.directory)).canonicalPath(),
+                     QDir(directory.path()).canonicalPath());
+            QVERIFY(controller.agent().listMessages(target.toStdString()).empty());
+            QVERIFY(controller.agent().listMessages(other.toStdString()).empty());
+        }
+        // Core v10 has arrived: changing effort uses the same atomic owner path
+        // and must survive reopening without touching the other Session's field.
+        MaiSession beforeOther;
+        QVERIFY(controller.agent().getSession(other.toStdString(), beforeOther));
+        const auto effortChanged = host.applyCommand(
+            target, {{QStringLiteral("action"), QStringLiteral("set_model")},
+                     {QStringLiteral("model"), QStringLiteral("deepseek-v4-pro")},
+                     {QStringLiteral("reasoningEffort"), QStringLiteral("max")}});
+        QVERIFY(effortChanged.value(QStringLiteral("ok")).toBool());
+        QCOMPARE(effortChanged.value(QStringLiteral("reasoningEffort")).toString(), QStringLiteral("max"));
+        const auto readBack = host.applyCommand(target, {{QStringLiteral("action"), QStringLiteral("get_session")}});
+        QCOMPARE(readBack.value(QStringLiteral("reasoningEffort")).toString(), QStringLiteral("max"));
+        MaiSession afterOther;
+        QVERIFY(controller.agent().getSession(other.toStdString(), afterOther));
+        QCOMPARE(QString::fromStdString(afterOther.reasoningEffort), QString::fromStdString(beforeOther.reasoningEffort));
+    }
+    AgentController reopened(configured, database);
+    QVERIFY2(reopened.openError().isEmpty(), qPrintable(reopened.openError()));
+    MaiSession savedTarget;
+    MaiSession savedOther;
+    QVERIFY(reopened.agent().getSession(target.toStdString(), savedTarget));
+    QVERIFY(reopened.agent().getSession(other.toStdString(), savedOther));
+    QCOMPARE(QString::fromStdString(savedTarget.model), QStringLiteral("deepseek-v4-pro"));
+    QCOMPARE(QString::fromStdString(savedTarget.reasoningEffort), QStringLiteral("max"));
+    QCOMPARE(QString::fromStdString(savedOther.model), QStringLiteral("deepseek-flash"));
+}
+
+void DesktopSessionSyncHostTest::remoteHostRejectsInvalidAndBusyModelChangesWithoutMutation() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto model = std::make_unique<HeldSteeringModel>();
+    auto* held = model.get();
+    AgentController controller(std::move(model), {});
+    const QString target = controller.createSession(directory.path());
+    const QString other = controller.createSession(directory.path());
+    QVERIFY(controller.agent().submit(MaiUpdateSession{target.toStdString(), "", "glm-5.3", "", ""}));
+    QVERIFY(controller.agent().submit(MaiUpdateSession{other.toStdString(), "", "deepseek-flash", "", ""}));
+    DesktopSessionSyncHost host(controller);
+    for (const QJsonObject& invalid : {
+             QJsonObject{{QStringLiteral("action"), QStringLiteral("set_model")},
+                         {QStringLiteral("model"), QStringLiteral("unknown-model")}},
+             QJsonObject{{QStringLiteral("action"), QStringLiteral("set_model")},
+                         {QStringLiteral("model"), QStringLiteral("glm-5.3-flash")},
+                         {QStringLiteral("reasoningEffort"), QStringLiteral("disabled")}},
+             QJsonObject{{QStringLiteral("action"), QStringLiteral("set_model")},
+                         {QStringLiteral("model"), QStringLiteral("glm-5.3-flash")},
+                         {QStringLiteral("endpoint"), QStringLiteral("https://untrusted.invalid")}},
+             QJsonObject{{QStringLiteral("action"), QStringLiteral("set_model")},
+                         {QStringLiteral("model"), QStringLiteral("glm-5.3-flash")},
+                         {QStringLiteral("path"), QStringLiteral("untrusted-model.bin")}},
+             QJsonObject{{QStringLiteral("action"), QStringLiteral("set_model")},
+                         {QStringLiteral("model"), QStringLiteral("glm-5.3-flash")},
+                         {QStringLiteral("api_key"), QStringLiteral("fake-not-a-user-key")}}}) {
+        const auto result = host.applyCommand(target, invalid);
+        QVERIFY(!result.value(QStringLiteral("ok")).toBool());
+        QVERIFY(!result.value(QStringLiteral("error")).toString().isEmpty());
+        MaiSession saved;
+        QVERIFY(controller.agent().getSession(target.toStdString(), saved));
+        QCOMPARE(QString::fromStdString(saved.model), QStringLiteral("glm-5.3"));
+    }
+    QVERIFY(!host.applyCommand(QStringLiteral("ses_missing"),
+                               {{QStringLiteral("action"), QStringLiteral("get_session")}})
+                 .value(QStringLiteral("ok")).toBool());
+    const auto release = qScopeGuard([&] {
+        held->release.store(true);
+        controller.agent().waitIdle();
+    });
+    QVERIFY(controller.agent().submit(MaiSendPrompt{target.toStdString(), "Hold this owner turn"}));
+    QTRY_VERIFY_WITH_TIMEOUT(held->entered.load(), 3000);
+    const auto turn = controller.agent().activeTurnId(target.toStdString());
+    QVERIFY(!turn.empty());
+    const auto refused = host.applyCommand(
+        target, {{QStringLiteral("action"), QStringLiteral("set_model")},
+                 {QStringLiteral("model"), QStringLiteral("deepseek-v4-pro")},
+                 {QStringLiteral("reasoningEffort"), QStringLiteral("max")}});
+    QVERIFY(!refused.value(QStringLiteral("ok")).toBool());
+    QVERIFY(!refused.value(QStringLiteral("error")).toString().isEmpty());
+    MaiSession unchanged;
+    QVERIFY(controller.agent().getSession(target.toStdString(), unchanged));
+    QCOMPARE(QString::fromStdString(unchanged.model), QStringLiteral("glm-5.3"));
+    QCOMPARE(QString::fromStdString(controller.agent().activeTurnId(target.toStdString())),
+             QString::fromStdString(turn));
+    const auto independent = host.applyCommand(
+        other, {{QStringLiteral("action"), QStringLiteral("set_model")},
+                {QStringLiteral("model"), QStringLiteral("glm-5.3-flash")}});
+    QVERIFY2(independent.value(QStringLiteral("ok")).toBool(),
+             qPrintable(independent.value(QStringLiteral("error")).toString()));
+    QCOMPARE(independent.value(QStringLiteral("session")).toString(), other);
+    MaiSession changedOther;
+    QVERIFY(controller.agent().getSession(other.toStdString(), changedOther));
+    QCOMPARE(QString::fromStdString(changedOther.model), QStringLiteral("glm-5.3-flash"));
+    QVERIFY(controller.agent().isBusy(target.toStdString()));
+}
+
+void DesktopSessionSyncHostTest::coordinatorModelCommandKeepsOwnerTupleAndRejectsOldLogin() {
+    AgentController controller(AgentController::ModelConfig{}, {});
+    QList<QJsonObject> sent;
+    DesktopSessionSyncCoordinator coordinator(
+        [&](const QString& path, const QByteArray&, const QJsonObject& body,
+            DesktopSessionSyncCoordinator::Completion completion) {
+            if (path == QStringLiteral("session-sync/send")) sent.append(body);
+            completion({{QStringLiteral("id"), sent.size()}}, {});
+        }, [&] { return &controller; });
+    const auto owner = modelOwner(QStringLiteral("ses_remote_model"));
+    coordinator.acceptCatalog(QJsonArray{owner});
+    const QJsonObject action{{QStringLiteral("action"), QStringLiteral("set_model")},
+                             {QStringLiteral("model"), QStringLiteral("deepseek-v4-pro")},
+                             {QStringLiteral("reasoningEffort"), QStringLiteral("max")},
+                             {QStringLiteral("requestId"), QUuid::createUuid().toString(QUuid::WithoutBraces)}};
+    QString error;
+    coordinator.sendRemoteCommand(owner, action, [&](const QJsonObject&, const QString& failure) { error = failure; });
+    QVERIFY(error.isEmpty());
+    QCOMPARE(sent.size(), 1);
+    QCOMPARE(sent.first().value(QStringLiteral("to_slot")), owner.value(QStringLiteral("device_slot")));
+    QCOMPARE(sent.first().value(QStringLiteral("to_login_session_id")), owner.value(QStringLiteral("login_session_id")));
+    QCOMPARE(sent.first().value(QStringLiteral("session_id")), owner.value(QStringLiteral("id")));
+    QCOMPARE(sent.first().value(QStringLiteral("kind")).toString(), QStringLiteral("command"));
+    QCOMPARE(sent.first().value(QStringLiteral("payload")).toObject(), action);
+    QCOMPARE(sent.first().value(QStringLiteral("client_message_id")), action.value(QStringLiteral("requestId")));
+    auto replacement = owner;
+    replacement.insert(QStringLiteral("login_session_id"), QStringLiteral("replacement-model-login"));
+    coordinator.acceptCatalog(QJsonArray{replacement});
+    coordinator.sendRemoteCommand(owner, action, [&](const QJsonObject&, const QString& failure) { error = failure; });
+    QVERIFY(!error.isEmpty());
+    QCOMPARE(sent.size(), 1);
+    replacement.insert(QStringLiteral("online"), false);
+    coordinator.acceptCatalog(QJsonArray{replacement});
+    coordinator.sendRemoteCommand(replacement, action,
+                                  [&](const QJsonObject&, const QString& failure) { error = failure; });
+    QVERIFY(!error.isEmpty());
+    QCOMPARE(sent.size(), 1);
 }
 
 void DesktopSessionSyncHostTest::appliesRemotePromptToTheExistingLocalSession() {
@@ -1393,7 +1656,7 @@ void DesktopSessionSyncHostTest::remotePanelSendsMoreBeforePriorReceiptAndStopsS
                              {QStringLiteral("online"), true},
                              {QStringLiteral("busy"), true}};
     QList<QJsonObject> commands;
-    panel.setCommandHandler([&](const QJsonObject&, const QJsonObject& payload, RemoteAgentPanel::Completion done) {
+    setBusinessCommandHandler(panel, [&](const QJsonObject&, const QJsonObject& payload, RemoteAgentPanel::Completion done) {
         commands.append(payload);
         done({});
     });
@@ -2170,7 +2433,7 @@ void DesktopSessionSyncHostTest::remoteBusyComposerQueuesInputsAndStopsSeparatel
                              {QStringLiteral("busy"), true},
                              {QStringLiteral("turnId"), QStringLiteral("msg_original_turn")}};
     QList<QJsonObject> sent;
-    panel.setCommandHandler(
+    setBusinessCommandHandler(panel,
         [&](const QJsonObject& owner, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
             QCOMPARE(owner.value(QStringLiteral("id")), remote.value(QStringLiteral("id")));
             sent.append(action);
@@ -2225,7 +2488,7 @@ void DesktopSessionSyncHostTest::remoteTransportCompletionPreservesNewDraft() {
                              {QStringLiteral("online"), true},
                              {QStringLiteral("busy"), false}};
     RemoteAgentPanel::Completion delivered;
-    panel.setCommandHandler([&](const QJsonObject&, const QJsonObject&, RemoteAgentPanel::Completion completion) {
+    setBusinessCommandHandler(panel, [&](const QJsonObject&, const QJsonObject&, RemoteAgentPanel::Completion completion) {
         delivered = std::move(completion);
     });
     panel.openSession(remote);
@@ -2253,7 +2516,7 @@ void DesktopSessionSyncHostTest::remoteQueueMatchesOwnerReceiptAndRetainsPrivate
     QString second;
     {
         RemoteAgentPanel panel(nullptr, path);
-        panel.setCommandHandler([&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion done) {
+        setBusinessCommandHandler(panel, [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion done) {
             sent.append(action);
             done({});
         });
@@ -2279,7 +2542,7 @@ void DesktopSessionSyncHostTest::remoteQueueMatchesOwnerReceiptAndRetainsPrivate
         QCOMPARE(editor->toPlainText(), QStringLiteral("Other owner's draft"));
     }
     RemoteAgentPanel restored(nullptr, path);
-    restored.setCommandHandler([&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion done) {
+    setBusinessCommandHandler(restored, [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion done) {
         sent.append(action);
         done({});
     });
@@ -2309,7 +2572,7 @@ void DesktopSessionSyncHostTest::remoteIdleConsecutiveInputsDoNotWaitForTurnAckn
                             {QStringLiteral("online"), true},
                             {QStringLiteral("busy"), false}};
     QList<QJsonObject> sent;
-    panel.setCommandHandler(
+    setBusinessCommandHandler(panel,
         [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
             sent.append(action);
             completion({});
@@ -2345,7 +2608,7 @@ void DesktopSessionSyncHostTest::remoteQueueStorageFailureRetainsDraft() {
                             {QStringLiteral("login_session_id"), QStringLiteral("login")},
                             {QStringLiteral("online"), true}};
     int sent = 0;
-    panel.setCommandHandler([&](const QJsonObject&, const QJsonObject&, RemoteAgentPanel::Completion) { ++sent; });
+    setBusinessCommandHandler(panel, [&](const QJsonObject&, const QJsonObject&, RemoteAgentPanel::Completion) { ++sent; });
     panel.openSession(owner);
     auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
     editor->setPlainText(QStringLiteral("No data loss on storage failure"));
@@ -2364,7 +2627,7 @@ void DesktopSessionSyncHostTest::remoteLateInputReceiptDoesNotReplaceNewerOwnerT
                       {QStringLiteral("busy"), true},
                       {QStringLiteral("turnId"), QStringLiteral("msg_original_turn")}};
     QList<QJsonObject> sent;
-    panel.setCommandHandler([&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion done) {
+    setBusinessCommandHandler(panel, [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion done) {
         sent.append(action);
         done({});
     });
@@ -2394,6 +2657,292 @@ void DesktopSessionSyncHostTest::remoteLateInputReceiptDoesNotReplaceNewerOwnerT
     QCOMPARE(sent.last().value(QStringLiteral("turnId")).toString(), QStringLiteral("msg_newer_turn"));
 }
 
+void DesktopSessionSyncHostTest::remoteModelDisplayWaitsForOwnerAckAndSurvivesCatalogRefresh() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("model-outbox.json")));
+    panel.resize(900, 680);
+    const auto owner = modelOwner(QStringLiteral("ses_model_ack"));
+    QList<QJsonObject> commands;
+    panel.setHistoryHandler(
+        [&](const QJsonObject& remote, const QString&, int, RemoteAgentPanel::Completion completion) {
+            panel.receivePayload(remote, QStringLiteral("history_page"),
+                                 {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{}}});
+            completion({});
+        });
+    panel.setCommandHandler(
+        [&](const QJsonObject& remote, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            QCOMPARE(remote.value(QStringLiteral("id")), owner.value(QStringLiteral("id")));
+            QCOMPARE(remote.value(QStringLiteral("login_session_id")), owner.value(QStringLiteral("login_session_id")));
+            commands.append(action);
+            completion({});  // Transport enqueue succeeds; this is deliberately not an owner ACK.
+        });
+    const auto selections = [&] {
+        QList<QJsonObject> result;
+        for (const auto& command : commands)
+            if (command.value(QStringLiteral("action")) == QStringLiteral("set_model")) result.append(command);
+        return result;
+    };
+    panel.show();
+    panel.openSession(owner);
+    QTRY_VERIFY_WITH_TIMEOUT(!commands.isEmpty(), 3000);
+    QCOMPARE(commands.first().value(QStringLiteral("action")).toString(), QStringLiteral("get_session"));
+    QVERIFY(!commands.first().value(QStringLiteral("requestId")).toString().isEmpty());
+    auto* value = panel.findChild<QLabel*>(QStringLiteral("remoteAgentModelValue"));
+    auto* composer = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+    QVERIFY(value && composer);
+    QVERIFY(value->text() != QStringLiteral("deepseek-flash"));
+    deliverModelReceipt(panel, owner, commands.first(), modelReceipt(owner, QStringLiteral("deepseek-flash")));
+    QCOMPARE(value->text(), QStringLiteral("deepseek-flash"));
+    composer->setPlainText(QStringLiteral("Keep this draft during model selection"));
+    auto* option = remoteModelOption(panel, QStringLiteral("deepseek-v4-pro"));
+    QVERIFY(option && option->isVisible() && option->isEnabled());
+    QTest::mouseClick(option, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(selections().size(), 1, 3000);
+    const auto selection = selections().last();
+    QCOMPARE(selection.value(QStringLiteral("action")).toString(), QStringLiteral("set_model"));
+    QCOMPARE(selection.value(QStringLiteral("model")).toString(), QStringLiteral("deepseek-v4-pro"));
+    QCOMPARE(value->text(), QStringLiteral("deepseek-flash"));
+    QCOMPARE(composer->toPlainText(), QStringLiteral("Keep this draft during model selection"));
+    // Presence/catalog is discovery data, including when it happens to carry stale model-looking keys.
+    auto catalog = owner;
+    catalog.insert(QStringLiteral("model"), QStringLiteral("glm-5.3"));
+    catalog.insert(QStringLiteral("reasoningEffort"), QStringLiteral("low"));
+    panel.updateSession(catalog);
+    QCOMPARE(value->text(), QStringLiteral("deepseek-flash"));
+    deliverModelReceipt(panel, owner, selection, modelReceipt(owner, QStringLiteral("deepseek-v4-pro")));
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    panel.updateSession(owner);  // A normal catalog has no model fields at all.
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    option = remoteModelOption(panel, QStringLiteral("glm-5.3-flash"));
+    QVERIFY(option && option->isVisible() && option->isEnabled());
+    QTest::mouseClick(option, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(selections().size(), 2, 3000);
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    deliverModelReceipt(panel, owner, selections().last(),
+                        {{QStringLiteral("ok"), false},
+                         {QStringLiteral("error"), QStringLiteral("Fixture owner rejected selection")}});
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    QCOMPARE(composer->toPlainText(), QStringLiteral("Keep this draft during model selection"));
+    auto* status = panel.findChild<QLabel*>(QStringLiteral("remoteAgentStatus"));
+    QVERIFY(status && status->text().contains(QStringLiteral("Fixture owner rejected selection")));
+    auto offline = owner;
+    offline.insert(QStringLiteral("online"), false);
+    panel.updateSession(offline);
+    const auto beforeOfflineChoice = commands.size();
+    if (auto* offlineOption = remoteModelOption(panel, QStringLiteral("glm-5.3")))
+        QTest::mouseClick(offlineOption, Qt::LeftButton);
+    QCOMPARE(commands.size(), beforeOfflineChoice);
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    QCOMPARE(composer->toPlainText(), QStringLiteral("Keep this draft during model selection"));
+}
+
+void DesktopSessionSyncHostTest::remoteModelReceiptsCannotCrossSessionOrLogin() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("isolated-model-outbox.json")));
+    panel.resize(900, 680);
+    const auto first = modelOwner(QStringLiteral("ses_first_model"));
+    const auto second = modelOwner(QStringLiteral("ses_second_model"));
+    QList<QJsonObject> commands;
+    QList<QJsonObject> owners;
+    panel.setHistoryHandler(
+        [&](const QJsonObject& remote, const QString&, int, RemoteAgentPanel::Completion completion) {
+            panel.receivePayload(remote, QStringLiteral("history_page"),
+                                 {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{}}});
+            completion({});
+        });
+    panel.setCommandHandler(
+        [&](const QJsonObject& remote, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            owners.append(remote);
+            commands.append(action);
+            completion({});
+        });
+    panel.show();
+    panel.openSession(first);
+    QTRY_COMPARE_WITH_TIMEOUT(commands.size(), 1, 3000);
+    QCOMPARE(commands.last().value(QStringLiteral("action")).toString(), QStringLiteral("get_session"));
+    deliverModelReceipt(panel, first, commands.last(), modelReceipt(first, QStringLiteral("deepseek-v4-pro")));
+    auto* value = panel.findChild<QLabel*>(QStringLiteral("remoteAgentModelValue"));
+    auto* composer = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+    QVERIFY(value && composer);
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    composer->setPlainText(QStringLiteral("First Session draft"));
+    auto* option = remoteModelOption(panel, QStringLiteral("deepseek-flash"));
+    QVERIFY(option && option->isVisible() && option->isEnabled());
+    QTest::mouseClick(option, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(commands.size(), 2, 3000);
+    const auto firstSelection = commands.last();
+    panel.openSession(second);
+    QTRY_COMPARE_WITH_TIMEOUT(commands.size(), 3, 3000);
+    QCOMPARE(owners.last().value(QStringLiteral("id")), second.value(QStringLiteral("id")));
+    QCOMPARE(commands.last().value(QStringLiteral("action")).toString(), QStringLiteral("get_session"));
+    deliverModelReceipt(panel, second, commands.last(), modelReceipt(second, QStringLiteral("deepseek-v4-pro")));
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    composer->setPlainText(QStringLiteral("Second Session draft"));
+    deliverModelReceipt(panel, first, firstSelection, modelReceipt(first, QStringLiteral("deepseek-flash")));
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    QCOMPARE(composer->toPlainText(), QStringLiteral("Second Session draft"));
+    auto replacement = first;
+    replacement.insert(QStringLiteral("login_session_id"), QStringLiteral("new-model-owner-login"));
+    panel.openSession(replacement);
+    QTRY_COMPARE_WITH_TIMEOUT(commands.size(), 4, 3000);
+    const auto replacementQuery = commands.last();
+    QCOMPARE(owners.last().value(QStringLiteral("login_session_id")), replacement.value(QStringLiteral("login_session_id")));
+    QCOMPARE(replacementQuery.value(QStringLiteral("action")).toString(), QStringLiteral("get_session"));
+    const QString unconfirmed = value->text();
+    // Neither a correct request ID from the old login nor a wrong result Session may consume this query.
+    deliverModelReceipt(panel, first, replacementQuery, modelReceipt(first, QStringLiteral("deepseek-flash")));
+    QCOMPARE(value->text(), unconfirmed);
+    deliverModelReceipt(panel, replacement, replacementQuery, modelReceipt(second, QStringLiteral("deepseek-flash")));
+    QCOMPARE(value->text(), unconfirmed);
+    auto wrongRequest = replacementQuery;
+    wrongRequest.insert(QStringLiteral("requestId"), QUuid::createUuid().toString(QUuid::WithoutBraces));
+    deliverModelReceipt(panel, replacement, wrongRequest, modelReceipt(replacement, QStringLiteral("deepseek-flash")));
+    QCOMPARE(value->text(), unconfirmed);
+    auto mixed = modelReceipt(replacement, QStringLiteral("deepseek-v4-pro"));
+    mixed.insert(QStringLiteral("wire"), QStringLiteral("mixed"));
+    deliverModelReceipt(panel, replacement, replacementQuery, mixed);
+    QCOMPARE(value->text(), unconfirmed);
+    deliverModelReceipt(panel, replacement, replacementQuery, modelReceipt(replacement, QStringLiteral("deepseek-v4-pro")));
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    deliverModelReceipt(panel, first, firstSelection, modelReceipt(first, QStringLiteral("deepseek-flash")));
+    QCOMPARE(value->text(), QStringLiteral("deepseek-v4-pro"));
+    panel.openSession(second);
+    QCOMPARE(composer->toPlainText(), QStringLiteral("Second Session draft"));
+}
+
+void DesktopSessionSyncHostTest::remoteLocalConfigurationKeepsCloudChoicesButDisablesEffort() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("local-model-outbox.json")));
+    panel.resize(900, 680);
+    const auto owner = modelOwner(QStringLiteral("ses_local_model"));
+    QList<QJsonObject> commands;
+    panel.setCommandHandler(
+        [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            commands.append(action);
+            completion({});
+        });
+    panel.show();
+    panel.openSession(owner);
+    QTRY_COMPARE_WITH_TIMEOUT(commands.size(), 1, 3000);
+    QCOMPARE(commands.first().value(QStringLiteral("action")).toString(), QStringLiteral("get_session"));
+    auto local = modelReceipt(owner, QStringLiteral("local:fixture"));
+    local.insert(QStringLiteral("wire"), QStringLiteral("local"));
+    deliverModelReceipt(panel, owner, commands.first(), local);
+    auto* value = panel.findChild<QLabel*>(QStringLiteral("remoteAgentModelValue"));
+    auto* composer = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+    auto* modelSection = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentModelSection"));
+    auto* effortSection = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentEffortSection"));
+    QVERIFY(value && composer && modelSection && effortSection);
+    QCOMPARE(value->text(), QStringLiteral("local:fixture"));
+    QVERIFY(modelSection->isEnabled());
+    // Local remains readable and can switch to a supported cloud model, but its
+    // provider effort setting has no implementation to invoke on the owner.
+    QVERIFY(!effortSection->isEnabled());
+    const QString draft = QStringLiteral("Keep the local Session draft");
+    composer->setPlainText(draft);
+    effortSection->click();
+    for (const auto& effort : {QStringLiteral("low"), QStringLiteral("high"), QStringLiteral("max")}) {
+        auto* option = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentEffortOption-") + effort);
+        QVERIFY(option && !option->isEnabled());
+        option->click();
+    }
+    QCOMPARE(commands.size(), 1);
+    QCOMPARE(composer->toPlainText(), draft);
+    auto* cloud = remoteModelOption(panel, QStringLiteral("glm-5.3-flash"));
+    QVERIFY(cloud && cloud->isVisible() && cloud->isEnabled());
+    QTest::mouseClick(cloud, Qt::LeftButton);
+    QTRY_COMPARE_WITH_TIMEOUT(commands.size(), 2, 3000);
+    QCOMPARE(commands.last().value(QStringLiteral("action")).toString(), QStringLiteral("set_model"));
+    QCOMPARE(commands.last().value(QStringLiteral("model")).toString(), QStringLiteral("glm-5.3-flash"));
+    QVERIFY(!commands.last().contains(QStringLiteral("reasoningEffort")));
+    QVERIFY(!cloud->isChecked());  // Enqueue success must undo the button's optimistic toggle.
+    QCOMPARE(value->text(), QStringLiteral("local:fixture"));
+    QCOMPARE(composer->toPlainText(), draft);
+    deliverModelReceipt(panel, owner, commands.last(),
+                        {{QStringLiteral("ok"), false},
+                         {QStringLiteral("error"), QStringLiteral("Fixture rejects the cloud model change")}});
+    QCOMPARE(value->text(), QStringLiteral("local:fixture"));
+    for (const auto& model : {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash"),
+                              QStringLiteral("deepseek-flash"), QStringLiteral("deepseek-v4-pro")}) {
+        auto* option = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentModelOption-") + model);
+        QVERIFY(option && !option->isChecked());
+    }
+    QCOMPARE(commands.size(), 2);
+    QCOMPARE(composer->toPlainText(), draft);
+}
+
+void DesktopSessionSyncHostTest::remoteModelFailureSurvivesNormalHistory_data() {
+    QTest::addColumn<QString>("kind");
+    QTest::newRow("history-page") << QStringLiteral("history_page");
+    QTest::newRow("room-event") << QStringLiteral("event");
+}
+
+void DesktopSessionSyncHostTest::remoteModelFailureSurvivesNormalHistory() {
+    QFETCH(QString, kind);
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("model-error-outbox.json")));
+    panel.resize(900, 680);
+    const auto owner = modelOwner(QStringLiteral("ses_model_error"));
+    QJsonObject selection;
+    setBusinessCommandHandler(panel,
+        [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
+            selection = action;
+            completion({});
+        });
+    panel.show();
+    panel.openSession(owner);
+    auto* composer = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
+    auto* value = panel.findChild<QLabel*>(QStringLiteral("remoteAgentModelValue"));
+    auto* status = panel.findChild<QLabel*>(QStringLiteral("remoteAgentStatus"));
+    auto* transcript = panel.findChild<MarkdownView*>();
+    QVERIFY(composer && value && status && transcript);
+    QCOMPARE(value->text(), QStringLiteral("deepseek-flash"));
+    const QString draft = QStringLiteral("Keep this draft after the owner rejects the model");
+    composer->setPlainText(draft);
+    auto* option = remoteModelOption(panel, QStringLiteral("deepseek-v4-pro"));
+    QVERIFY(option && option->isVisible() && option->isEnabled());
+    QTest::mouseClick(option, Qt::LeftButton);
+    QCOMPARE(selection.value(QStringLiteral("action")).toString(), QStringLiteral("set_model"));
+    const QString reason = QStringLiteral("Fixture owner rejected this model selection");
+    deliverModelReceipt(panel, owner, selection,
+                        {{QStringLiteral("ok"), false}, {QStringLiteral("error"), reason}});
+    QVERIFY(status->isVisible());
+    QCOMPARE(status->text(), reason);
+    const QJsonObject message{
+        {QStringLiteral("id"), QStringLiteral("msg_after_model_error")},
+        {QStringLiteral("role"), QStringLiteral("assistant")},
+        {QStringLiteral("created"), 1}, {QStringLiteral("completed"), 2},
+        {QStringLiteral("parts"), QJsonArray{QJsonObject{
+            {QStringLiteral("id"), QStringLiteral("part_after_model_error")},
+            {QStringLiteral("kind"), QStringLiteral("text")},
+            {QStringLiteral("text"), QStringLiteral("Ordinary owner history still loads")}}}}};
+    panel.receivePayload(owner, kind,
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("busy"), false},
+                          {QStringLiteral("messages"), QJsonArray{message}},
+                          {QStringLiteral("permissions"), QJsonArray{}},
+                          {QStringLiteral("questions"), QJsonArray{}}});
+    // History success is not model success. Verify it was processed while its
+    // unrelated completion did not erase the outstanding model failure.
+    QVERIFY(transcript->contains(QStringLiteral("msg_after_model_error")));
+    QVERIFY(status->isVisible());
+    QCOMPARE(status->text(), reason);
+    QCOMPARE(value->text(), QStringLiteral("deepseek-flash"));
+    QCOMPARE(composer->toPlainText(), draft);
+    // A later business status supersedes the old model error. Another history
+    // success must not restore that error over the prompt's existing flow.
+    composer->setPlainText(QStringLiteral("New prompt after the model rejection"));
+    QTest::keyClick(composer, Qt::Key_Return);
+    QCOMPARE(selection.value(QStringLiteral("action")).toString(), QStringLiteral("prompt"));
+    QVERIFY(status->text() != reason);
+    panel.receivePayload(owner, kind,
+                         {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
+    QVERIFY(status->text() != reason);
+}
+
 void DesktopSessionSyncHostTest::remotePanelShowsHistoryAndRoutesTextToOwner() {
     QTemporaryDir spool;
     QVERIFY(spool.isValid());
@@ -2418,7 +2967,7 @@ void DesktopSessionSyncHostTest::remotePanelShowsHistoryAndRoutesTextToOwner() {
                                  {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{message}}});
             completion({});
         });
-    panel.setCommandHandler(
+    setBusinessCommandHandler(panel,
         [&](const QJsonObject& session, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
             QCOMPARE(session.value(QStringLiteral("id")).toString(), QStringLiteral("ses_remote"));
             sent = action;
@@ -2479,7 +3028,7 @@ void DesktopSessionSyncHostTest::remotePanelShowsHistoryAndRoutesTextToOwner() {
          {QStringLiteral("result"),
           QJsonObject{{QStringLiteral("ok"), false}, {QStringLiteral("error"), QStringLiteral("所属设备拒绝")}}}});
     QCOMPARE(composer->toPlainText(), QStringLiteral("请保留草稿"));
-    panel.setCommandHandler(
+    setBusinessCommandHandler(panel,
         [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
             sent = action;
             panel.receivePayload(
@@ -2493,7 +3042,7 @@ void DesktopSessionSyncHostTest::remotePanelShowsHistoryAndRoutesTextToOwner() {
     composer->setPlainText(QStringLiteral("快速拒绝也保留"));
     QTest::mouseClick(send, Qt::LeftButton);
     QCOMPARE(composer->toPlainText(), QStringLiteral("快速拒绝也保留"));
-    panel.setCommandHandler(
+    setBusinessCommandHandler(panel,
         [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
             sent = action;
             panel.receivePayload(remote, QStringLiteral("event"),
@@ -2634,7 +3183,7 @@ void DesktopSessionSyncHostTest::remotePanelKeepsOwnPromptWhenRoomBroadcastsCano
                                  {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{}}});
             completion({});
         });
-    panel.setCommandHandler(
+    setBusinessCommandHandler(panel,
         [&](const QJsonObject&, const QJsonObject& payload, RemoteAgentPanel::Completion completion) {
             requestId = payload.value(QStringLiteral("requestId")).toString();
             completion({});
@@ -2805,7 +3354,7 @@ void DesktopSessionSyncHostTest::remoteQuestionUsesNormalComposerAndExplicitAnsw
         {QStringLiteral("question"), QStringLiteral("Which fixture should continue?")},
         {QStringLiteral("options"), QJsonArray{QStringLiteral("Option A"), QStringLiteral("Option B")}}};
     QList<QJsonObject> commands;
-    panel.setCommandHandler(
+    setBusinessCommandHandler(panel,
         [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
             commands.append(action);
             completion({});
@@ -2954,7 +3503,7 @@ void DesktopSessionSyncHostTest::remoteRejectedQuestionRecoveryKeepsItsQuestionB
                             {QStringLiteral("login_session_id"), QStringLiteral("recovery_login")},
                             {QStringLiteral("online"), true}};
     QList<QJsonObject> commands;
-    panel.setCommandHandler(
+    setBusinessCommandHandler(panel,
         [&](const QJsonObject&, const QJsonObject& action, RemoteAgentPanel::Completion completion) {
             commands.append(action);
             completion({});

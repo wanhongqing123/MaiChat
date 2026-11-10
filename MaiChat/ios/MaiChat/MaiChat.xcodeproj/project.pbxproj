@@ -145,6 +145,7 @@
 		D8890915CD794198A0332BB2 /* MaiChatCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 771AB137E6961E2B9187CFEB /* MaiChatCore.framework */; };
 		DD0212F81BF7429B14829650 /* MobileImageTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8888872A869DC80CF8DF58B6 /* MobileImageTools.swift */; };
 		DDB74028C6497789CC7DF112 /* PrimaryModelsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4DEA82D066705E45EA7CD6E /* PrimaryModelsUITests.swift */; };
+		F2DBC42A698B4D28950F6DA3 /* SessionModelsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D2CFE217EEE7E7CF0CC8DDF /* SessionModelsUITests.swift */; };
 		DE68E9FD069A387DE6B9102A /* LICENSE-SarasaFixedSC.txt in Resources */ = {isa = PBXBuildFile; fileRef = 71BF7C1975A6A8D7934F8AFD /* LICENSE-SarasaFixedSC.txt */; };
 		DEBCE768E14C523F47FC7CC5 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A6457534DA0479F3AD712C60 /* Assets.xcassets */; };
 		DF3DC5AB29D30556D9094095 /* RemoteDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91C089D3C5D222B69986D04F /* RemoteDiagnostics.swift */; };
@@ -335,6 +336,7 @@
 		A45963E1F6BECDABFBE96C68 /* AccountToolsUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountToolsUITestFixture.swift; sourceTree = "<group>"; };
 		A47856A6735559D9160BB50C /* MaiCloudDriveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MaiCloudDriveView.swift; sourceTree = "<group>"; };
 		A4DEA82D066705E45EA7CD6E /* PrimaryModelsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrimaryModelsUITests.swift; sourceTree = "<group>"; };
+		0D2CFE217EEE7E7CF0CC8DDF /* SessionModelsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionModelsUITests.swift; sourceTree = "<group>"; };
 		A4FD40D258B32299ADDF36C3 /* LocalSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalSettingsStore.swift; sourceTree = "<group>"; };
 		A6457534DA0479F3AD712C60 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A66CCCBA03D225DD809F9F11 /* AgentDocumentTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentDocumentTools.swift; sourceTree = "<group>"; };
@@ -483,6 +485,7 @@
 				327ACCEAC5EE641B963C2E31 /* PlaybackControlsUITests.swift */,
 				38C504E6E5A41DD41EF2AE46 /* PortraitUITests.swift */,
 				A4DEA82D066705E45EA7CD6E /* PrimaryModelsUITests.swift */,
+				0D2CFE217EEE7E7CF0CC8DDF /* SessionModelsUITests.swift */,
 				7B3BB5B39FF593766914E334 /* ScreenFrameArchiveUITests.swift */,
 				DAB7CB3554291BE63987EC07 /* SocialLoginUITests.swift */,
 				660A8D8471A610ABC4AB7BB5 /* Fixtures */,
@@ -1260,6 +1263,7 @@
 				67A4EC33E93EC66E1C786AB9 /* PlaybackControlsUITests.swift in Sources */,
 				C83FC3CB98B20BC5A06346F7 /* PortraitUITests.swift in Sources */,
 				DDB74028C6497789CC7DF112 /* PrimaryModelsUITests.swift in Sources */,
+				F2DBC42A698B4D28950F6DA3 /* SessionModelsUITests.swift in Sources */,
 				2BB7EC458B8370713722836F /* ScreenFrameArchiveUITests.swift in Sources */,
 				9EF853C23CC0121860279D06 /* SocialLoginUITests.swift in Sources */,
 			);

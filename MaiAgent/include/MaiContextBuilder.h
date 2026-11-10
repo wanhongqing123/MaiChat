@@ -46,9 +46,13 @@ public:
     // firstMessage 为已成功摘要覆盖的源前缀长度，默认 0；firstPart 只跳过其 assistant
     // 稳定片段前缀。preservedUserMessageId 允许把部分 assistant 的当前 user 原文保留在前。
     // 越界/试图裁 user parts 返回空列表。引用仍在完整 history 中解析；图片预算只计剩余 tail。
+    // preserveReasoning 用于 GLM 等要求工具跟进回传原思考的协议：仅填独立 reasoning，
+    // 不把它复制成可见 content。默认 false 保持旧契约；原显式字节策略仍适用，
+    // 产品默认各预算为零，因此原始片段字节及其 call/result 归属保持不变。
     std::vector<MaiModelMessage> build(const std::vector<MaiMessage>& history,
                                        std::size_t firstMessage = 0, std::size_t firstPart = 0,
-                                       const std::string& preservedUserMessageId = {}) const;
+                                       const std::string& preservedUserMessageId = {},
+                                       bool preserveReasoning = false) const;
 
 private:
     Options mOptions;

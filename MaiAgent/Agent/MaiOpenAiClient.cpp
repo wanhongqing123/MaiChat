@@ -1,12 +1,15 @@
 // 文件作用：实现兼容 Chat Completions 的模型客户端。
 // 直接依赖：MaiFilePath.h、MaiFileSystem.h、MaiPathGuard.h；本文件在这些接口之间完成调用与结果转换。
 #include "MaiOpenAiClient.h"
+#include "MaiCloudModelCatalog.h"
 
 #include <curl/curl.h>
 #include <json.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -22,6 +25,29 @@
 namespace {
 
 using json = nlohmann::json;
+
+// curl 默认只向初始来源发送 Authorization；逐跳处理时必须保留同一边界。
+std::string modelOrigin(const std::string& url) {
+    CURLU* parsed = curl_url();
+    if (!parsed) return {};
+    char* scheme = nullptr;
+    char* host = nullptr;
+    char* port = nullptr;
+    std::string origin;
+    if (curl_url_set(parsed, CURLUPART_URL, url.c_str(), 0) == CURLUE_OK &&
+        curl_url_get(parsed, CURLUPART_SCHEME, &scheme, 0) == CURLUE_OK &&
+        curl_url_get(parsed, CURLUPART_HOST, &host, 0) == CURLUE_OK &&
+        curl_url_get(parsed, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) == CURLUE_OK) {
+        origin = std::string(scheme) + "://" + host + ":" + port;
+        std::transform(origin.begin(), origin.end(), origin.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    }
+    curl_free(scheme);
+    curl_free(host);
+    curl_free(port);
+    curl_url_cleanup(parsed);
+    return origin;
+}
 
 // ── 按行切分流式字节 ────────────────────────────────────────────
 // curl 的写回调给的是任意大小的字节块，一个 SSE 事件可能被劈成几块，也可能一块里塞了好几个事件。
@@ -256,6 +282,11 @@ MaiResult<std::string> buildRequestBody(const MaiModelRequest& request,
         } else if (!message.content.empty() || message.invocations.empty()) {
             messageNode["content"] = message.content;
         }
+        // GLM 交错思考必须随原 assistant 调用回传 reasoning_content；它不是可见正文。
+        // 普通未知模型不猜此扩展；默认 Builder 不会为它们回灌旧思考。
+        if (maiCloudModelInfo(request.model) && message.role == MaiModelRole::Assistant &&
+            !message.reasoning.empty())
+            messageNode["reasoning_content"] = message.reasoning;
         // 线上字段名是 tool_call_id（snake_case），不是我们结构体里那个 toolCallId。
         // 写错的话工具结果和它对应的调用就对不上——服务端要么直接 400，
         // 要么模型认不出这是哪次调用的结果，下一轮把同样的工具再调一遍。
@@ -276,7 +307,7 @@ MaiResult<std::string> buildRequestBody(const MaiModelRequest& request,
     json body{{"model", request.model}, {"messages", std::move(msgs)}, {"stream", true}};
     if (request.maxOutputTokens != 0) body["max_tokens"] = request.maxOutputTokens;
     if (includeUsage) body["stream_options"] = json{{"include_usage", true}};
-    if (request.model == "deepseek-flash" &&
+    if (maiCloudModelInfo(request.model).has_value() &&
         (request.reasoningEffort == "low" || request.reasoningEffort == "high" ||
          request.reasoningEffort == "max")) {
         body["thinking"] = json{{"type", "enabled"}};
@@ -314,6 +345,9 @@ struct StreamCtx {
     std::string finishReason;
     bool sawOutput = false;
     bool done = false;
+    bool manualRedirects = false;
+    bool redirectStatus = false;
+    bool redirectResponse = false;
     long inactivityTimeoutSeconds = 0;
     long progressTimeoutSeconds = 0;
     // 心跳和未拼完的 SSE 都证明连接仍在传输，但不能证明模型产生了有效进展。
@@ -420,18 +454,38 @@ void handleSseLine(StreamCtx& context, const std::string& line) {
     }
 }
 
-std::size_t headerCallback(char*, std::size_t size, std::size_t count, void* userdata) {
-    auto& context = *static_cast<StreamCtx*>(userdata);
+std::size_t headerCallback(char* bytes, std::size_t size, std::size_t count, void* user) {
+    auto& context = *static_cast<StreamCtx*>(user);
     if (count != 0 && size > SIZE_MAX / count) return 0;
     const auto length = size * count;
-    // 仅记录响应头到达的时间，不保存头内容；这属于传输活动而非模型输出。
+    if (context.manualRedirects && length >= 5 && std::memcmp(bytes, "HTTP/", 5) == 0) {
+        const std::string line(bytes, length);
+        const auto space = line.find(' ');
+        const int status = space == std::string::npos ? 0 : std::atoi(line.c_str() + space + 1);
+        context.redirectStatus = status >= 300 && status < 400;
+        context.redirectResponse = false;
+    } else if (context.manualRedirects && context.redirectStatus && !context.redirectResponse &&
+               length > 9) {
+        const std::string name(bytes, 9);
+        if (std::equal(name.begin(), name.end(),
+                       "location:", [](unsigned char left, unsigned char right) {
+                           return std::tolower(left) == right;
+                       })) {
+            const std::string value(bytes + 9, length - 9);
+            context.redirectResponse = value.find_first_not_of(" \t\r\n") != std::string::npos;
+        }
+    }
+    // 响应头到达也是真实通信；只记时间，不保存可能带凭据的头字段。
     if (length > 0) context.lastStreamActivity = std::chrono::steady_clock::now();
     return context.cancel->load(std::memory_order_relaxed) ? 0 : length;
 }
 
 std::size_t writeCallback(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
     auto& context = *static_cast<StreamCtx*>(userdata);
+    if (nmemb != 0 && size > SIZE_MAX / nmemb) return 0;
     const std::size_t total = size * nmemb;
+    // 逐跳选路时，重定向正文不是供应商输出，不应推进工具或文字。
+    if (context.redirectResponse) return total;
     context.responseBytes += total;
     if (total > 0) context.lastStreamActivity = std::chrono::steady_clock::now();
     // 返回不等于 total 的值会让 curl 以 CURLE_WRITE_ERROR 中断传输。取消和收到完整的
@@ -526,65 +580,136 @@ public:
         const std::string body = std::move(builtBody.value());
         std::size_t imageCount = 0;
         for (const auto& message : request.messages) imageCount += message.images.size();
+        const std::string originalOrigin = mConfig.proxyResolver ? modelOrigin(url) : std::string();
+        if (mConfig.proxyResolver && originalOrigin.empty())
+            return MaiError::make(MaiErrorCode::InvalidInput, "model URL is invalid");
         for (int attempt = 0;; ++attempt) {
-            CURL* curl = curl_easy_init();
-            if (!curl) return MaiError::make(MaiErrorCode::Internal, "curl_easy_init failed");
-
-            curl_slist* headers = nullptr;
-            headers = curl_slist_append(headers, "Content-Type: application/json");
-            headers = curl_slist_append(headers, "Accept: text/event-stream");
-            headers = curl_slist_append(headers, "Cache-Control: no-cache");
-            std::string auth;
-            if (!mConfig.apiKey.empty()) {
-                auth = "Authorization: Bearer " + mConfig.apiKey;
-                headers = curl_slist_append(headers, auth.c_str());
-            }
-
-            char transportError[CURL_ERROR_SIZE] = {};
-            curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, transportError);
+            std::string currentUrl = url;
+            bool post = true;
+            const auto attemptStarted = std::chrono::steady_clock::now();
+            auto lastStreamActivity = attemptStarted;
+            auto lastModelProgress = attemptStarted;
             StreamCtx context;
-            context.sink = &sink;
-            context.cancel = &cancel;
-            context.inactivityTimeoutSeconds = mConfig.inactivityTimeoutSeconds;
-            context.progressTimeoutSeconds = mConfig.progressTimeoutSeconds;
-            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-#if defined(_WIN32)
-            // 内嵌 OpenSSL 没有随包 PEM 时使用 Windows 信任根；显式 CA 路径仍保持独立。
-            if (mConfig.caBundlePath.empty())
-                curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, long(CURLSSLOPT_NATIVE_CA));
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-#endif
-            if (!mConfig.caBundlePath.empty())
-                curl_easy_setopt(curl, CURLOPT_CAINFO, mConfig.caBundlePath.c_str());
-            curl_easy_setopt(curl, CURLOPT_POST, 1L);
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
-            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headerCallback);
-            curl_easy_setopt(curl, CURLOPT_HEADERDATA, &context);
-            // 连接静默期间进度回调仍会运行；写回调要等新字节到达才能检查取消或空闲期限。
-            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progressCallback);
-            curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
-            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, mConfig.connectTimeoutSeconds);
-            if (mConfig.totalTimeoutSeconds > 0)
-                curl_easy_setopt(curl, CURLOPT_TIMEOUT, mConfig.totalTimeoutSeconds);
-            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-            curl_easy_setopt(curl, CURLOPT_USERAGENT, "MaiAgent/0.1");
-
-            const CURLcode curlResult = curl_easy_perform(curl);
-            std::string finalLine;
-            if (context.lines.takeRemainder(finalLine)) handleSseLine(context, finalLine);
+            char transportError[CURL_ERROR_SIZE] = {};
+            CURLcode transfer = CURLE_OK;
             long status = 0;
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-            curl_slist_free_all(headers);
-            curl_easy_cleanup(curl);
-
+            for (int redirects = 0;; ++redirects) {
+                if (cancel.load(std::memory_order_relaxed))
+                    return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
+                MaiModelProxy proxy;
+                if (mConfig.proxyResolver) {
+                    const bool resolved = mConfig.proxyResolver(currentUrl, proxy);
+                    if (cancel.load(std::memory_order_relaxed))
+                        return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
+                    if (!resolved)
+                        return MaiError::make(MaiErrorCode::Network,
+                                              "model proxy selection failed");
+                }
+                CURL* curl = curl_easy_init();
+                if (!curl) return MaiError::make(MaiErrorCode::Internal, "curl_easy_init failed");
+                curl_slist* headers = nullptr;
+                headers = curl_slist_append(headers, "Content-Type: application/json");
+                headers = curl_slist_append(headers, "Accept: text/event-stream");
+                headers = curl_slist_append(headers, "Cache-Control: no-cache");
+                if (!mConfig.apiKey.empty() &&
+                    (!mConfig.proxyResolver || modelOrigin(currentUrl) == originalOrigin))
+                    headers = curl_slist_append(
+                        headers, ("Authorization: Bearer " + mConfig.apiKey).c_str());
+                context = StreamCtx{};
+                context.manualRedirects = bool(mConfig.proxyResolver);
+                context.sink = &sink;
+                context.cancel = &cancel;
+                if (mConfig.proxyResolver) {
+                    context.lastStreamActivity = lastStreamActivity;
+                    context.lastModelProgress = lastModelProgress;
+                }
+                context.inactivityTimeoutSeconds = mConfig.inactivityTimeoutSeconds;
+                context.progressTimeoutSeconds = mConfig.progressTimeoutSeconds;
+                transportError[0] = 0;
+                curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, transportError);
+                curl_easy_setopt(curl, CURLOPT_URL, currentUrl.c_str());
+#if defined(_WIN32)
+                // 内嵌 OpenSSL 没有随包 PEM 时使用 Windows 信任根；显式 CA 路径仍保持独立。
+                if (mConfig.caBundlePath.empty())
+                    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, long(CURLSSLOPT_NATIVE_CA));
+                curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+                curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+#endif
+                if (!mConfig.caBundlePath.empty())
+                    curl_easy_setopt(curl, CURLOPT_CAINFO, mConfig.caBundlePath.c_str());
+                if (post) {
+                    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+                    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+                    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
+                                     static_cast<curl_off_t>(body.size()));
+                } else {
+                    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+                }
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+                curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
+                curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headerCallback);
+                curl_easy_setopt(curl, CURLOPT_HEADERDATA, &context);
+                curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+                curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progressCallback);
+                curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
+                curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, mConfig.connectTimeoutSeconds);
+                if (mConfig.totalTimeoutSeconds > 0 && !mConfig.proxyResolver) {
+                    curl_easy_setopt(curl, CURLOPT_TIMEOUT, mConfig.totalTimeoutSeconds);
+                } else if (mConfig.totalTimeoutSeconds > 0) {
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - attemptStarted)
+                                             .count();
+                    const auto remaining = mConfig.totalTimeoutSeconds * 1000LL - elapsed;
+                    if (remaining <= 0) {
+                        curl_slist_free_all(headers);
+                        curl_easy_cleanup(curl);
+                        // 与 curl 传输内的同一超时一致，仍由外层决定是否重试。
+                        transfer = CURLE_OPERATION_TIMEDOUT;
+                        break;
+                    }
+                    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(remaining));
+                }
+                if (mConfig.proxyResolver) {
+                    curl_easy_setopt(curl, CURLOPT_PROXY, proxy.url.c_str());
+                    curl_easy_setopt(curl, CURLOPT_NOPROXY, proxy.url.empty() ? "*" : "");
+                    curl_easy_setopt(curl, CURLOPT_PROXYUSERNAME, proxy.username.c_str());
+                    curl_easy_setopt(curl, CURLOPT_PROXYPASSWORD, proxy.password.c_str());
+                }
+                curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, mConfig.proxyResolver ? 0L : 1L);
+                curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+                curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+                curl_easy_setopt(curl, CURLOPT_USERAGENT, "MaiAgent/0.1");
+                transfer = curl_easy_perform(curl);
+                std::string remainder;
+                if (context.lines.takeRemainder(remainder)) handleSseLine(context, remainder);
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+                char* target = nullptr;
+                if (mConfig.proxyResolver) curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &target);
+                const std::string nextUrl = target ? target : "";
+                lastStreamActivity = context.lastStreamActivity;
+                lastModelProgress = context.lastModelProgress;
+                curl_slist_free_all(headers);
+                curl_easy_cleanup(curl);
+                if (!mConfig.proxyResolver || transfer != CURLE_OK || nextUrl.empty() ||
+                    cancel.load(std::memory_order_relaxed))
+                    break;
+                // 与 curl 默认限制一致：最多 30 跳，且只允许默认重定向协议。
+                const std::string nextOrigin = modelOrigin(nextUrl);
+                if (redirects >= 30 || nextOrigin.empty() ||
+                    (nextOrigin.rfind("http://", 0) != 0 && nextOrigin.rfind("https://", 0) != 0 &&
+                     nextOrigin.rfind("ftp://", 0) != 0 && nextOrigin.rfind("ftps://", 0) != 0))
+                    return MaiError::make(MaiErrorCode::Protocol,
+                                          "model redirect is invalid or exceeds its limit");
+                // 307/308 会携带原始对话正文；即使去掉认证，也不能将其降级到明文链路。
+                if (modelOrigin(currentUrl).rfind("https://", 0) == 0 &&
+                    nextOrigin.rfind("https://", 0) != 0)
+                    return MaiError::make(
+                        MaiErrorCode::Protocol,
+                        "model redirect cannot downgrade an encrypted connection");
+                if (status == 301 || status == 302 || status == 303) post = false;
+                currentUrl = nextUrl;
+            }
             if (cancel.load(std::memory_order_relaxed))
                 return MaiError::make(MaiErrorCode::Canceled, "canceled by user");
             if (context.inactive)
@@ -606,8 +731,8 @@ public:
                         " bytes). The provider sent no text, reasoning, or tool arguments during "
                         "this interval; retry later or choose another available model.");
 
-            const bool transient = curlResult != CURLE_OK ? isRetryableCurlError(curlResult)
-                                                          : status == 408 || status >= 500;
+            const bool transient = transfer != CURLE_OK ? isRetryableCurlError(transfer)
+                                                        : status == 408 || status >= 500;
             if (transient && !context.sawOutput && attempt < mConfig.maxRetries) {
                 const long delay = mConfig.retryInitialDelayMs * (1L << attempt);
                 if (!waitBeforeRetry(delay, cancel))
@@ -615,13 +740,13 @@ public:
                 continue;
             }
 
-            if (curlResult != CURLE_OK && !(context.done && curlResult == CURLE_WRITE_ERROR))
+            if (transfer != CURLE_OK && !(context.done && transfer == CURLE_WRITE_ERROR))
                 return MaiError::make(
                     MaiErrorCode::Network,
                     std::string("curl: ") +
-                        (curlResult == CURLE_PEER_FAILED_VERIFICATION && transportError[0]
+                        (transfer == CURLE_PEER_FAILED_VERIFICATION && transportError[0]
                              ? transportError
-                             : curl_easy_strerror(curlResult)));
+                             : curl_easy_strerror(transfer)));
             if (status >= 400) {
                 const std::string provider = providerErrorMessage(context.rawBody);
                 std::string message = "HTTP " + std::to_string(status);
@@ -687,8 +812,12 @@ struct CurlGlobal {
 // 不能把 Local 当作默认 Chat Completions，从而意外访问供应商或 localhost。
 class LocalConfigurationRequiredClient final : public MaiModelClient {
 public:
+    explicit LocalConfigurationRequiredClient(MaiWireApi wire = MaiWireApi::Local) : mWire(wire) {}
     MaiError stream(const MaiModelRequest&, const MaiStreamSink&,
                     const std::atomic<bool>& cancel) override {
+        if (mWire == MaiWireApi::Mixed)
+            return {MaiErrorCode::InvalidInput,
+                    "Mixed is a route directory description, not a transport."};
         return cancel.load() ? MaiError::make(MaiErrorCode::Canceled, "Local request canceled.")
                              : MaiError::make(
                                    MaiErrorCode::NotConfigured,
@@ -696,15 +825,18 @@ public:
     }
 
     MaiWireApi wireApi() const override {
-        return MaiWireApi::Local;
+        return mWire;
     }
+
+private:
+    MaiWireApi mWire;
 };
 
 }  // namespace
 
 std::unique_ptr<MaiModelClient> makeMaiModelClient(MaiModelConfig config) {
-    if (config.wire == MaiWireApi::Local)
-        return std::make_unique<LocalConfigurationRequiredClient>();
+    if (config.wire == MaiWireApi::Local || config.wire == MaiWireApi::Mixed)
+        return std::make_unique<LocalConfigurationRequiredClient>(config.wire);
     // curl_global_init 不是线程安全的，用函数内静态保证只跑一次。
     static CurlGlobal once;
     (void)once;
@@ -712,7 +844,9 @@ std::unique_ptr<MaiModelClient> makeMaiModelClient(MaiModelConfig config) {
         case MaiWireApi::ChatCompletions:
             return std::make_unique<ChatCompletionsClient>(std::move(config));
         case MaiWireApi::Responses: return makeMaiResponsesClient(std::move(config));
-        case MaiWireApi::Local: return std::make_unique<LocalConfigurationRequiredClient>();
+        case MaiWireApi::Local:
+        case MaiWireApi::Mixed:
+            return std::make_unique<LocalConfigurationRequiredClient>(config.wire);
     }
     return nullptr;
 }
@@ -722,6 +856,7 @@ const char* maiWireApiToString(MaiWireApi wireApi) {
         case MaiWireApi::ChatCompletions: return "chat_completions";
         case MaiWireApi::Responses: return "responses";
         case MaiWireApi::Local: return "local";
+        case MaiWireApi::Mixed: return "mixed";
     }
     return "chat_completions";
 }

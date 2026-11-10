@@ -4,6 +4,7 @@ import Foundation
 import UIKit
 import Combine
 import CryptoKit
+import MaiChatCore
 
 struct AIQuestionAnswerUITestRequest {
     let sessionID: String
@@ -25,6 +26,17 @@ final class AIAssistantModelUITestSupport: ObservableObject {
     @Published var remoteImageDownloadCount = 0
     @Published var remoteImageRequestedIDs: [String] = []
     @Published var remoteImagePolicyResult = "未执行"
+    #if targetEnvironment(simulator)
+    // Replace only the peer I/O boundary. History intentionally has no model fields;
+    // the production owner command/ACK path must discover the configuration.
+    var sessionModelHistoryHandler: (@MainActor (AIRemoteSession) async throws -> Data)?
+    var sessionModelCommandHandler: (@MainActor (AIRemoteSession, String, [String: Any]) async throws -> Void)?
+    var sessionModelPreparationHandler: (@MainActor () async throws -> Void)?
+    var sessionModelPublishHandler: (@MainActor (String, Data) async throws -> Void)?
+    var sessionModelSnapshotHandler: (@MainActor (String) throws -> Data?)?
+    var sessionModelCreateObserver: (@MainActor ([String: String]) -> Void)?
+    @Published var sessionModelPolicyResult = "未执行"
+    #endif
 }
 
 enum AIAssistantUITestMutation {
@@ -44,6 +56,202 @@ extension AIAssistantModel {
 
 #if targetEnvironment(simulator)
 extension AIAssistantModel {
+    func runSessionModelRemoteUITestChecks() async {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") else { return }
+        uiTestSupport.sessionModelPolicyResult = "运行中"
+        var checks = 0
+        var failures: [String] = []
+        func require(_ value: Bool, _ detail: String) { checks += 1; if !value { failures.append(detail) } }
+        func owner(_ id: String, online: Bool = true, login: String = "owned-model-login", slot: String = "windows") -> AIRemoteSession {
+            AIRemoteSession(sessionID: id, title: "远端模型 " + id, updatedAt: 1, busy: false,
+                deviceSlot: slot, deviceName: "Owned desktop", deviceID: "owned-model-device",
+                loginSessionID: login, online: online)
+        }
+        let a = owner("A"), b = owner("B"), local = owner("local")
+        var states: [String: [String: Any]] = [
+            a.sessionID: ["model": "glm-5.3", "reasoningEffort": "low", "wire": "chat_completions"],
+            b.sessionID: ["model": "deepseek-flash", "reasoningEffort": "high", "wire": "responses"],
+            local.sessionID: ["model": "local:owned-model", "reasoningEffort": "", "wire": "local"]]
+        var commands: [(AIRemoteSession, String, [String: Any])] = []
+        var readCount = 0
+        func result(_ peer: AIRemoteSession, model: String? = nil, effort: String? = nil) -> [String: Any] {
+            var value = states[peer.sessionID] ?? [:]
+            if let model { value["model"] = model; value["wire"] = model.hasPrefix("glm-") ? "chat_completions" : "responses" }
+            if let effort { value["reasoningEffort"] = effort }
+            value["ok"] = true; value["session"] = peer.sessionID; value["defaultReasoningEffort"] = "high"
+            return value
+        }
+        uiTestSupport.sessionModelHistoryHandler = { peer in
+            // The deployed service history contract carries no model/effort/wire.
+            try JSONSerialization.data(withJSONObject: ["ok": true, "messages": [[
+                "id": "owned-message-" + peer.sessionID, "role": "assistant", "created": 1, "completed": 2,
+                "active": false, "parts": [["id": "owned-text-" + peer.sessionID, "kind": "text", "text": "Owned history " + peer.sessionID]]]],
+                "busy": false, "permissions": [], "questions": [], "questionMessages": []])
+        }
+        uiTestSupport.sessionModelCommandHandler = { [weak self] peer, id, payload in
+            guard let self else { throw CancellationError() }
+            commands.append((peer, id, payload))
+            if payload["action"] as? String == "get_session" {
+                readCount += 1
+                await self.deliverSessionModelUITestReceipt(owner: peer, id: id, result: result(peer))
+            }
+        }
+        applyUITestMutation(.remoteSessions([a, b, local]))
+        await selectRemoteConversation(a)
+        require(readCount == 1 && selectedRemote?.model == "glm-5.3" && settings.model == "glm-5.3" &&
+                settings.effectiveReasoningEffort == "low" && canChangeSessionModel,
+                "plain-history open did not request/read owner configuration; reads=\(readCount)")
+        guard failures.isEmpty else { uiTestSupport.sessionModelPolicyResult = "FAIL " + failures.joined(separator: " | "); return }
+        let draftA = "remote:windows:owned-model-login:A", draftB = "remote:windows:owned-model-login:B"
+        drafts[draftA] = "owned draft A"; drafts[draftB] = "owned draft B"
+        await selectPrimaryModel("deepseek-v4-pro", reasoningEffort: "max")
+        guard let first = commands.last else { uiTestSupport.sessionModelPolicyResult = "FAIL no set command"; return }
+        require(first.2["action"] as? String == "set_model" && selectedRemote?.model == "glm-5.3", "optimistic selection before owner ACK")
+        let accepted = result(a, model: "deepseek-v4-pro", effort: "max")
+        for wrong in [owner("A", login: "other-login"), owner("A", slot: "mac"), owner("other-session")] {
+            await deliverSessionModelUITestReceipt(owner: wrong, id: first.1, result: accepted)
+        }
+        await deliverSessionModelUITestReceipt(owner: a, id: "not-the-command", result: accepted)
+        await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: result(a, model: "glm-5.3-flash", effort: "max"))
+        await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: result(a, model: "deepseek-v4-pro", effort: "low"))
+        require(selectedRemote?.model == "glm-5.3", "mismatched tuple/model/effort consumed the pending request")
+        await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: accepted)
+        require(selectedRemote?.model == "deepseek-v4-pro" && settings.effectiveReasoningEffort == "max", "valid ACK was lost after malformed receipts")
+        await deliverSessionModelUITestReceipt(owner: a, id: first.1, result: result(a))
+        require(settings.model == "deepseek-v4-pro", "duplicate old ACK reverted configuration")
+        await selectPrimaryModel("glm-5.3-flash")
+        guard let rejected = commands.last else { return }
+        await selectRemoteConversation(b)
+        error = "owned B status"
+        let bMessages = messages
+        await deliverSessionModelUITestReceipt(owner: a, id: rejected.1, result: ["ok": false, "error": "owned A rejection"])
+        require(selectedRemote?.id == b.id && error == "owned B status" && messages == bMessages, "A rejection repainted B")
+        require(drafts[draftA] == "owned draft A" && drafts[draftB] == "owned draft B", "ACK changed another room's draft")
+
+        // A local preparation failure may arrive only after another real native session is selected.
+        if let nativeA = sessions.first?.id {
+            // Seed a saved draft before selecting the room, so the normal composer
+            // restores that value; changing the backing dictionary after display
+            // would bypass the actual editor and let its old value overwrite it.
+            drafts[nativeA] = "owned local draft A"
+            await selectConversation(nativeA)
+            uiTestSupport.sessionModelPreparationHandler = { [weak self] in
+                guard let self else { throw CancellationError() }
+                await self.create()
+                self.error = "owned local B status"
+                throw AIBackendError(message: "owned local A preparation failure")
+            }
+            await selectPrimaryModel("local:" + AILocalModelStore.bundledPrimaryID)
+            require(selected != nativeA && selectedRemote == nil && error == "owned local B status", "local A preparation failure repainted B")
+            require(drafts[nativeA] == "owned local draft A", "local preparation failure lost A draft")
+            uiTestSupport.sessionModelPreparationHandler = nil
+        } else { require(false, "native session control missing") }
+
+        if let nativeA = sessions.first?.id, let cloudB = sessions.first(where: { $0.id != nativeA })?.id {
+            // A persisted local choice is represented at the native snapshot boundary;
+            // the actual restoration/prepare await/catch is the production refresh path.
+            await selectConversation(cloudB)
+            var restorePrepares = 0
+            uiTestSupport.sessionModelSnapshotHandler = { target in
+                guard target == nativeA else { return nil }
+                return try JSONSerialization.data(withJSONObject: ["ok": true, "changed": true,
+                    "selectedModel": "local:" + AILocalModelStore.bundledPrimaryID,
+                    "selectedReasoningEffort": "high", "selectedWire": "local", "configured": false])
+            }
+            uiTestSupport.sessionModelPreparationHandler = { [weak self] in
+                guard let self else { throw CancellationError() }
+                await self.selectConversation(cloudB)
+                restorePrepares += 1
+                self.error = "owned restored B status"
+                throw AIBackendError(message: "owned restored A preparation failure")
+            }
+            await selectConversation(nativeA)
+            require(restorePrepares == 1 && selected == cloudB && error == "owned restored B status",
+                    "restored local A failure repainted B; prepare=\(restorePrepares), selected=\(selected == cloudB), error=\(error)")
+            uiTestSupport.sessionModelSnapshotHandler = nil
+            uiTestSupport.sessionModelPreparationHandler = nil
+
+            await selectConversation("")
+            drafts[""] = "owned canceled blank draft"
+            let before = Set(sessions.map(\.id))
+            var creates = 0
+            uiTestSupport.sessionModelCreateObserver = { _ in creates += 1 }
+            uiTestSupport.sessionModelPreparationHandler = { [weak self] in
+                await self?.selectConversation(cloudB)
+            }
+            await selectPrimaryModel("local:" + AILocalModelStore.bundledPrimaryID, reasoningEffort: "max")
+            require(creates == 0 && Set(sessions.map(\.id)) == before && selected == cloudB,
+                    "canceled blank prepare dispatched an orphan session create")
+            uiTestSupport.sessionModelCreateObserver = nil
+            uiTestSupport.sessionModelPreparationHandler = nil
+        } else { require(false, "local restore controls missing") }
+
+        // A blank page's explicit model/effort action creates one native session
+        // and transfers exactly its composer ownership, without sending a prompt.
+        let attachment = AIImportedFile(relativePath: "owned-draft.txt", mimeType: "text/plain", isImage: false)
+        for effortOnly in [false, true] {
+            await selectConversation("")
+            drafts[""] = "owned blank draft"
+            applyUITestMutation(.attachments(["": [attachment]], firstMessageSessionID: ""))
+            if effortOnly { await selectReasoningEffort("max") }
+            else { await selectPrimaryModel("glm-5.3-flash", reasoningEffort: "low") }
+            let target = selected
+            require(!target.isEmpty && selectedRemote == nil && drafts[target] == "owned blank draft" && drafts[""] == nil,
+                    "blank selection did not migrate original draft")
+            require(pendingAttachments[target] == [attachment] && pendingAttachments[""] == nil,
+                    "blank selection did not migrate original attachment ownership")
+            require(settings.model == (effortOnly ? "deepseek-flash" : "glm-5.3-flash") &&
+                    settings.effectiveReasoningEffort == (effortOnly ? "max" : "low"), "blank selection persisted the wrong native configuration")
+        }
+
+        await selectRemoteConversation(local)
+        require(selectedRemote?.wire == "local" && canChangeSessionModel, "local owner get_session ACK was not consumed")
+        let beforeEffort = commands.count
+        await selectReasoningEffort("max")
+        require(commands.count == beforeEffort, "remote local sent vendor reasoning effort")
+        await selectPrimaryModel("glm-5.3-flash")
+        guard let localSwitch = commands.last else { return }
+        require(localSwitch.2["action"] as? String == "set_model" && localSwitch.2["model"] as? String == "glm-5.3-flash", "remote local could not select a cloud model")
+        await deliverSessionModelUITestReceipt(owner: local, id: localSwitch.1, result: result(local, model: "glm-5.3-flash", effort: "high"))
+        require(settings.model == "glm-5.3-flash", "cloud switch from local was not committed")
+        states[local.sessionID] = ["model": "deepseek-v4-pro", "reasoningEffort": "max", "wire": "responses"]
+        let beforeReconnect = readCount
+        let writes = commands.filter { $0.2["action"] as? String == "set_model" }.count
+        await reconnectSessionModelUITestPeer()
+        require(readCount == beforeReconnect + 1 && settings.model == "deepseek-v4-pro", "reconnect did not read fresh owner configuration")
+        require(commands.filter { $0.2["action"] as? String == "set_model" }.count == writes, "reconnect replayed a model mutation")
+        await deliverSessionModelUITestReceipt(owner: local, id: localSwitch.1, result: result(local, model: "glm-5.3-flash", effort: "high"))
+        require(settings.model == "deepseek-v4-pro", "pre-reconnect ACK reverted new owner read")
+
+        // Only an explicitly owned publisher frame is captured; nothing is sent to a real account.
+        var frames: [[String: Any]] = []
+        uiTestSupport.sessionModelPublishHandler = { _, data in
+            frames.append(try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:])
+        }
+        func page(_ model: String, effort: String, wire: String) throws -> Data {
+            try JSONSerialization.data(withJSONObject: ["ok": true, "session": "owned-publisher", "model": model,
+                "reasoningEffort": effort, "wire": wire, "defaultReasoningEffort": "high",
+                "messages": [], "permissions": [], "questions": [], "questionMessages": [], "busy": false, "turnId": ""])
+        }
+        do {
+            try await publishSessionModelUITestState(page("glm-5.3", effort: "low", wire: "chat_completions"))
+            let count = frames.count
+            require(frames.last?["model"] as? String == "glm-5.3" && frames.last?["reasoningEffort"] as? String == "low", "ordinary publication dropped configuration")
+            try await publishSessionModelUITestState(page("glm-5.3", effort: "low", wire: "chat_completions"))
+            require(frames.count == count, "unchanged configuration republished")
+            try await publishSessionModelUITestState(page("deepseek-v4-pro", effort: "max", wire: "responses"))
+            require(frames.count == count + 1 && frames.last?["model"] as? String == "deepseek-v4-pro", "config-only change was dropped by state digest")
+        } catch { require(false, "publisher fixture failed: " + error.localizedDescription) }
+        uiTestSupport.sessionModelPublishHandler = nil
+        let offline = owner("offline", online: false)
+        applyUITestMutation(.remoteSessions([a, b, local, offline]))
+        let beforeOffline = commands.count
+        await selectRemoteConversation(offline)
+        require(commands.count == beforeOffline && !canChangeSessionModel, "offline owner accepted model mutation")
+        await selectRemoteConversation(b)
+        uiTestSupport.sessionModelPolicyResult = failures.isEmpty ? "PASS \(checks) owner protocol checks" : "FAIL " + failures.joined(separator: " | ")
+    }
+
     /// Use the real wire decoder/projection. The remote path is deliberately
     /// unusable on this phone; only its temporary attachment may supply pixels.
     func installRemoteImageUITestFixture() {

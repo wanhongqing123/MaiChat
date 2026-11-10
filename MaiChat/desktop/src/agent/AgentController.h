@@ -11,6 +11,7 @@
 #include <QVector>
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include "MaiAgent.h"
 
@@ -65,7 +66,7 @@ public:
         QString deepseekApiKey;
         QString arkApiKey;
         QString miniMaxApiKey;
-        // 模型工作线程在每次请求前读取当前账号 Key；由宿主保证线程安全。
+        // 每次请求读取当前账号 Key；配置查询也只读此缓存。宿主须保证线程安全且不触网。
         std::function<QString(const QString&)> accountModelKeyProvider;
         std::function<QString()> glmApiKeyProvider;
         std::function<QString()> miniMaxApiKeyProvider;
@@ -79,9 +80,17 @@ public:
         std::function<QPair<QString, QString>()> mediaServiceAccessProvider;
         QString modelName = QStringLiteral("deepseek-flash");
         QString reasoningEffort = QStringLiteral("high");
-        std::function<QString()> reasoningEffortProvider;
         MaiWireApi wire = MaiWireApi::Responses;
         MaiApprovalPolicy approvalPolicy = MaiApprovalPolicy::OnRequest;
+    };
+
+    // 当前会话的有效配置；旧空字段只继承构造时的固定默认值。
+    // configured 仅查询宿主已缓存的凭据/客户端，不发网络请求。
+    struct SessionModelConfiguration {
+        QString model;
+        QString reasoningEffort;
+        MaiWireApi wire = MaiWireApi::ChatCompletions;
+        bool configured = false;
     };
 
     // databasePath 为空表示纯内存：进程退出后会话和消息都不留。
@@ -124,7 +133,15 @@ public:
     bool steerPrompt(const QString& sessionId, const QString& turnId, const QString& requestId, const QString& text,
                      const QStringList& imagePaths = {}, const QStringList& videoPaths = {},
                      const QString& quotedMessageId = QString());
+    // 失败返回 false 并重置 out；const 查询不改 lastError()。
+    bool sessionModelConfiguration(const QString& sessionId, SessionModelConfiguration& out) const;
+    // nullopt 保留强度；显式空串恢复继承。型号与强度同一次提交，拒绝时不部分写入。
+    // busy 仅拒绝有效配置的实际变化；同值重投影不会打断活动任务。
+    // 无写入的同值操作不要求凭据；实际写入须有客户端及所选供应商缓存凭据。
+    bool setSessionModelConfiguration(const QString& sessionId, const QString& model,
+                                      std::optional<QString> reasoningEffort = std::nullopt);
     bool setModel(const QString& sessionId, const QString& model);
+    // 只影响后续 createSession，绝不改已有会话或旧空值的解析结果。
     bool setDefaultModel(const QString& model);
     bool interrupt(const QString& sessionId);
     // Reject stale owner-turn controls; empty expectedTurn preserves the ordinary API.

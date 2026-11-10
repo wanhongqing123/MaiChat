@@ -19,10 +19,11 @@
 #include "MaiQrCode.h"
 #include "MaiSessionSchedule.h"
 #include "MaiCalendarTools.h"
+#include "MaiCloudModelCatalog.h"
+#include "MaiProviderWebTools.h"
 #include "MaiTime.h"
 #if defined(MAICHAT_CV_VIDEO_ANALYSIS)
 #include "MaiCvImageTools.h"
-#include "MaiDeepSeekWebTools.h"
 #include "MaiCvVideoAnalysis.h"
 #include "MaiCvVideoTools.h"
 #include "MaiVideoMatting.h"
@@ -60,6 +61,7 @@
 #include <QStandardPaths>
 #include <QTimer>
 #include <cstddef>
+#include <utility>
 #include <variant>
 
 namespace {
@@ -207,7 +209,21 @@ enum class PartKind { Unknown, Text, Reasoning, Tool };
 }  // namespace
 
 struct AgentController::Runtime {
+    Runtime(QString model, QString effort)
+        : initialDefaultModel(std::move(model)), initialDefaultReasoningEffort(std::move(effort)),
+          newSessionDefaultModel(initialDefaultModel) {}
+
+    bool supportsModel(const QString& model) const {
+        if (!modelClient) return maiCloudModelInfo(toUtf8(model)).has_value();
+        const auto wire = modelClient->wireApiForModel(toUtf8(model));
+        return wire && *wire != MaiWireApi::Mixed;
+    }
+
     std::unique_ptr<MaiAgent> agent;
+    // 由 agent 持有，生命周期覆盖所有普通配置查询；不另建一份 wire/能力表。
+    MaiModelClient* modelClient = nullptr;
+    DesktopAccountModelClient* accountClient = nullptr;
+    bool ordinaryConfigured = false;
     std::shared_ptr<MaiSessionScheduleStore> scheduleStore;
     std::unique_ptr<MaiSessionScheduleRunner> scheduleRunner;
     QTimer scheduleTimer;
@@ -217,10 +233,21 @@ struct AgentController::Runtime {
     // 只有主线程碰它：所有事件都排队到主线程之后才分类。
     QHash<QString, QHash<QString, PartKind>> partKindsBySession;
     QHash<QString, QHash<QString, QString>> livePartTextBySession;
-    QString modelName;
+    // 旧空值只继承初始默认；改未来默认不能重新解释已有会话。
+    const QString initialDefaultModel;
+    const QString initialDefaultReasoningEffort;
+    QString newSessionDefaultModel;
 };
 
 namespace {
+
+QString initialModel(const QString& model) {
+    return model.isEmpty() ? fromUtf8(MaiAgent::Options{}.defaultModel) : model;
+}
+
+QString initialReasoningEffort(const QString& effort) {
+    return maiIsValidReasoningEffort(toUtf8(effort)) ? effort : QStringLiteral("high");
+}
 
 // 存储打不开时退化成内存存储，而不是让整个界面起不来。
 //
@@ -257,15 +284,24 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     // 要不要把工具声明给模型看是 MaiContextBuilder 的事，不是这里的。
     auto tools = std::make_unique<MaiToolRegistry>();
     registerMaiBuiltinTools(*tools);
-    // 搜索/文章抓取走固定供应商API，复用账号控制面下发的DeepSeek凭据。
-    MaiDeepSeekWebOptions webOptions;
+    // 搜索/抓取只填宿主凭据与证书；普通工具由 Core 按该轮固定型号选择供应商。
+    MaiProviderWebOptions webOptions;
     QFile webCertificates(QStringLiteral(":/maichat/auth/cacert.pem"));
-    if (webCertificates.open(QIODevice::ReadOnly))
-        webOptions.caPem = toUtf8(QString::fromUtf8(webCertificates.readAll()));
-    webOptions.apiKey = [provider = credentials.accountModelKeyProvider, key = toUtf8(credentials.deepseekApiKey)] {
+    if (webCertificates.open(QIODevice::ReadOnly)) {
+        const std::string caPem = toUtf8(QString::fromUtf8(webCertificates.readAll()));
+        webOptions.deepseek.caPem = caPem;
+        webOptions.glm.caPem = caPem;
+    }
+    webOptions.deepseek.apiKey = [provider = credentials.accountModelKeyProvider,
+                                  key = toUtf8(credentials.deepseekApiKey)] {
         return provider ? toUtf8(provider(QStringLiteral("deepseek"))) : key;
     };
-    registerMaiDeepSeekWebTools(*tools, std::move(webOptions));
+    webOptions.glm.apiKey = [provider = credentials.accountModelKeyProvider,
+                            glmProvider = credentials.glmApiKeyProvider, key = toUtf8(credentials.glmApiKey)] {
+        if (provider) return toUtf8(provider(QStringLiteral("glm")));
+        return glmProvider ? toUtf8(glmProvider()) : key;
+    };
+    registerMaiProviderWebTools(*tools, std::move(webOptions));
     registerMaiQrCodeTools(*tools);
 #if defined(Q_OS_MAC)
     registerMaiSessionScheduleTools(*tools, scheduleStore, "Mac");
@@ -404,14 +440,8 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
 
     MaiAgent::Options options;
     if (!defaultModel.isEmpty()) options.defaultModel = toUtf8(defaultModel);
-    options.reasoningEffort = toUtf8(credentials.reasoningEffort);
-    if (credentials.reasoningEffortProvider) {
-        options.reasoningEffortProvider = [provider = credentials.reasoningEffortProvider] {
-            const QString value = provider();
-            return toUtf8(value == QStringLiteral("low") || value == QStringLiteral("max") ? value
-                                                                                           : QStringLiteral("high"));
-        };
-    }
+    // 会话空值继承这个构造期常量，不再逐请求读取可变的 UI 全局设置。
+    options.reasoningEffort = toUtf8(initialReasoningEffort(credentials.reasoningEffort));
     // 0 = 无限等。桌面端有人盯着，超时自动拒绝等于替用户做决定。
     options.permissionTimeoutMs = 0;
     options.approvalPolicy = approvalPolicy;
@@ -429,13 +459,18 @@ AgentController::AgentController(std::unique_ptr<MaiModelClient> model, const QS
 
 AgentController::AgentController(std::unique_ptr<MaiModelClient> model, const QString& databasePath,
                                  ToolRegistrar hostTools, QObject* parent)
-    : QObject(parent), runtime_(std::make_unique<Runtime>()) {
+    : QObject(parent),
+      runtime_(std::make_unique<Runtime>(initialModel(QString()),
+                                        initialReasoningEffort(ModelConfig{}.reasoningEffort))) {
     // 排队投递要求这个类型是注册过的。放在构造里而不是全局静态，是因为注册本身是幂等且线程安全的，
     // 而全局静态的初始化顺序不好讲。
     qRegisterMetaType<MaiEvent>("MaiEvent");
 
     runtime_->scheduleStore = openScheduleStore(databasePath);
-    runtime_->agent = buildAgent(std::move(model), openStore(databasePath, runtime_->openError), QString(),
+    runtime_->modelClient = model.get();
+    runtime_->ordinaryConfigured = model != nullptr;
+    runtime_->agent = buildAgent(std::move(model), openStore(databasePath, runtime_->openError),
+                                 runtime_->initialDefaultModel,
                                  MaiApprovalPolicy::OnRequest, hostTools, AgentController::ModelConfig{}, databasePath,
                                  runtime_->scheduleStore);
 
@@ -461,7 +496,8 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
 
 AgentController::AgentController(const ModelConfig& model, const QString& databasePath, ToolRegistrar hostTools,
                                  QObject* parent)
-    : QObject(parent), runtime_(std::make_unique<Runtime>()) {
+    : QObject(parent),
+      runtime_(std::make_unique<Runtime>(initialModel(model.modelName), initialReasoningEffort(model.reasoningEffort))) {
     qRegisterMetaType<MaiEvent>("MaiEvent");
     runtime_->scheduleStore = openScheduleStore(databasePath);
 
@@ -478,7 +514,9 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
                                      mai_fftools_set_log_sink, mai_fftools_error_string};
         config.prepareImage = makeMaiFfmpegModelImagePreparer(ffmpegEngine);
 #endif
-        client = std::make_unique<DesktopAccountModelClient>(std::move(config));
+        auto accountClient = std::make_unique<DesktopAccountModelClient>(std::move(config));
+        runtime_->accountClient = accountClient.get();
+        client = std::move(accountClient);
     } else if (!model.baseUrl.isEmpty()) {
         MaiModelConfig config;
         config.baseUrl = toUtf8(model.baseUrl);
@@ -493,8 +531,10 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
         client = makeMaiModelClient(config);
     }
 
-    runtime_->modelName = model.modelName;
-    runtime_->agent = buildAgent(std::move(client), openStore(databasePath, runtime_->openError), model.modelName,
+    runtime_->modelClient = client.get();
+    runtime_->ordinaryConfigured = client && model.wire != MaiWireApi::Local && model.wire != MaiWireApi::Mixed;
+    runtime_->agent = buildAgent(std::move(client), openStore(databasePath, runtime_->openError),
+                                 runtime_->initialDefaultModel,
                                  model.approvalPolicy, hostTools, model, databasePath, runtime_->scheduleStore);
 
     connect(this, &AgentController::eventQueued, this, &AgentController::onEventQueued, Qt::QueuedConnection);
@@ -553,7 +593,10 @@ MaiAgent& AgentController::agent() {
 // ---- 变更 ----
 
 QString AgentController::createSession(const QString& directory, const QString& title) {
-    MaiResult<std::string> created = runtime_->agent->submit(MaiCreateSession{toUtf8(directory), toUtf8(title), {}});
+    // 显式保存创建时默认，随后切换其他会话或未来默认均不改变它。
+    MaiResult<std::string> created = runtime_->agent->submit(
+        MaiCreateSession{toUtf8(directory), toUtf8(title), toUtf8(runtime_->newSessionDefaultModel),
+                         toUtf8(runtime_->initialDefaultReasoningEffort)});
     if (!created) {
         runtime_->lastError = fromUtf8(created.error().message());
         return QString();
@@ -656,8 +699,7 @@ bool AgentController::submitPrompt(const QString& sessionId, const QString& text
         }
         videos.push_back({toUtf8(file.absoluteFilePath()), toUtf8(mimeType)});
     }
-    // 活动轮次保留原模型与授权；补充不是重开任务，也不能在失败后改为 Send。
-    if (turnId.isEmpty() && !runtime_->modelName.isEmpty() && !setModel(sessionId, runtime_->modelName)) return false;
+    // 普通发送与补充均由 Core 读取该会话配置，绝不把其他页面的选择写进目标会话。
     MaiResult<std::string> sent =
         turnId.isEmpty()
             ? runtime_->agent->submit(MaiSendPrompt{toUtf8(sessionId), toUtf8(text), std::move(images),
@@ -671,20 +713,91 @@ bool AgentController::submitPrompt(const QString& sessionId, const QString& text
     return true;
 }
 
-bool AgentController::setModel(const QString& sessionId, const QString& model) {
+bool AgentController::sessionModelConfiguration(const QString& sessionId, SessionModelConfiguration& out) const {
+    out = {};
+    MaiSession session;
+    if (!runtime_->agent->getSession(toUtf8(sessionId), session)) return false;
+    SessionModelConfiguration resolved;
+    resolved.model = session.model.empty() ? runtime_->initialDefaultModel : fromUtf8(session.model);
+    resolved.reasoningEffort = session.reasoningEffort.empty() ? runtime_->initialDefaultReasoningEffort
+                                                              : fromUtf8(session.reasoningEffort);
+    if (runtime_->modelClient) {
+        const auto wire = runtime_->modelClient->wireApiForModel(toUtf8(resolved.model));
+        if (!wire || *wire == MaiWireApi::Mixed) return false;
+        resolved.wire = *wire;
+        resolved.configured = runtime_->accountClient
+                                  ? runtime_->accountClient->isConfiguredForModel(toUtf8(resolved.model))
+                                  : runtime_->ordinaryConfigured;
+    } else {
+        // 未配置客户端仍允许显示会话选项；云型号协议由共享目录给出。
+        const auto info = maiCloudModelInfo(toUtf8(resolved.model));
+        if (!info) return false;
+        resolved.wire = info->wire;
+    }
+    out = std::move(resolved);
+    return true;
+}
+
+bool AgentController::setSessionModelConfiguration(const QString& sessionId, const QString& model,
+                                                    std::optional<QString> reasoningEffort) {
     const QString selected = model.trimmed();
     if (sessionId.isEmpty() || selected.isEmpty()) {
         runtime_->lastError = QStringLiteral("模型名称不能为空。");
         return false;
     }
+    if (!runtime_->supportsModel(selected)) {
+        runtime_->lastError = QStringLiteral("当前客户端不支持此模型。");
+        return false;
+    }
+    if (reasoningEffort && !maiIsValidReasoningEffort(toUtf8(*reasoningEffort))) {
+        runtime_->lastError = QStringLiteral("思考强度仅支持 low、high、max 或继承默认。");
+        return false;
+    }
+    MaiSession session;
+    if (!runtime_->agent->getSession(toUtf8(sessionId), session)) {
+        runtime_->lastError = QStringLiteral("当前会话不存在。");
+        return false;
+    }
+    const QString currentModel = session.model.empty() ? runtime_->initialDefaultModel : fromUtf8(session.model);
+    const QString currentEffort = session.reasoningEffort.empty() ? runtime_->initialDefaultReasoningEffort
+                                                                 : fromUtf8(session.reasoningEffort);
+    QString requestedEffort = currentEffort;
+    if (reasoningEffort)
+        requestedEffort = reasoningEffort->isEmpty() ? runtime_->initialDefaultReasoningEffort : *reasoningEffort;
+    if (runtime_->agent->isBusy(toUtf8(sessionId))) {
+        if (selected != currentModel || requestedEffort != currentEffort) {
+            runtime_->lastError = QStringLiteral("任务进行中，请结束后再切换模型或思考强度。");
+            return false;
+        }
+        // 有效值未变化时不把 legacy 空值物化，避免向活动轮次提交任何 mutation。
+        runtime_->lastError.clear();
+        return true;
+    }
+    const std::optional<std::string> storedEffort = reasoningEffort
+        ? std::make_optional(toUtf8(*reasoningEffort)) : std::nullopt;
+    if (toUtf8(selected) == session.model && (!storedEffort || *storedEffort == session.reasoningEffort)) {
+        runtime_->lastError.clear();
+        return true;
+    }
+    // 仅明确装配的普通客户端允许 custom/local 型号；空转实例不能把选择保存成已配置。
+    // 账号侧只读所选供应商的缓存，不取另一个 Key，也不在这里发凭据或模型请求。
+    if (!runtime_->modelClient ||
+        (runtime_->accountClient && !runtime_->accountClient->isConfiguredForModel(toUtf8(selected)))) {
+        runtime_->lastError = QStringLiteral("所选模型尚未配置可用凭据或客户端，当前会话配置未修改。");
+        return false;
+    }
     MaiResult<std::string> updated =
-        runtime_->agent->submit(MaiUpdateSession{toUtf8(sessionId), "", toUtf8(selected), "", ""});
+        runtime_->agent->submit(MaiUpdateSession{toUtf8(sessionId), "", toUtf8(selected), "", "", storedEffort});
     if (!updated) {
         runtime_->lastError = fromUtf8(updated.error().message());
         return false;
     }
-    runtime_->modelName = selected;
+    runtime_->lastError.clear();
     return true;
+}
+
+bool AgentController::setModel(const QString& sessionId, const QString& model) {
+    return setSessionModelConfiguration(sessionId, model);
 }
 
 bool AgentController::setDefaultModel(const QString& model) {
@@ -693,7 +806,12 @@ bool AgentController::setDefaultModel(const QString& model) {
         runtime_->lastError = QStringLiteral("模型名称不能为空。");
         return false;
     }
-    runtime_->modelName = selected;
+    if (!runtime_->supportsModel(selected)) {
+        runtime_->lastError = QStringLiteral("当前客户端不支持此模型。");
+        return false;
+    }
+    runtime_->newSessionDefaultModel = selected;
+    runtime_->lastError.clear();
     return true;
 }
 

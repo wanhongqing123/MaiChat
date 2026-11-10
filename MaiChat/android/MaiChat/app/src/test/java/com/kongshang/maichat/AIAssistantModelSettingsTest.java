@@ -9,6 +9,17 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public final class AIAssistantModelSettingsTest {
+    @Test public void allFourCloudChoicesKeepTheirOwnSupplierWire() throws Exception {
+        for (String model : new String[]{"glm-5.3", "glm-5.3-flash", "deepseek-flash", "deepseek-v4-pro"}) {
+            AIAssistantModelSettings settings = AIAssistantModelSettings.fromJson(
+                new JSONObject().put("model", model));
+            assertEquals("The exact session choice must survive", model, settings.model());
+            assertEquals(model.startsWith("glm-") ? "chat_completions" : "responses", settings.wire());
+            assertEquals(model.startsWith("glm-") ? "https://open.bigmodel.cn/api/paas/v4"
+                : "https://api.deepseek.com", settings.baseUrl());
+        }
+    }
+
     @Test public void localSettingsRestoreTheirSourceInsteadOfBeingForcedToTheCloud() throws Exception {
         JSONObject saved = new JSONObject("{\"modelProvider\":\"llama\","
             + "\"model\":\"local:builtin-qwen3.5-2b-q4_k_m\",\"cloudModel\":\"glm-5.3\","

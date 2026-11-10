@@ -88,9 +88,11 @@ MaiContextBuilder::MaiContextBuilder(Options options) : mOptions(std::move(optio
 // 把持久化会话历史转换为模型请求的上下文消息。
 // 文本、媒体、工具调用和工具回执按原事件顺序组装。
 // 默认保留全部原文；只有宿主显式指定的有损预算会改变请求副本，不改存储。
-std::vector<MaiModelMessage> MaiContextBuilder::build(
-    const std::vector<MaiMessage>& history, std::size_t firstMessage, std::size_t firstPart,
-    const std::string& preservedUserMessageId) const {
+std::vector<MaiModelMessage> MaiContextBuilder::build(const std::vector<MaiMessage>& history,
+                                                      std::size_t firstMessage,
+                                                      std::size_t firstPart,
+                                                      const std::string& preservedUserMessageId,
+                                                      bool preserveReasoning) const {
     std::vector<MaiModelMessage> out;
     if (firstMessage > history.size()) return out;
     if (firstPart != 0 &&
@@ -282,7 +284,11 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
                 pending.content += text->text;
             } else if (const auto* toolResult = std::get_if<MaiReasoningPart>(&part.body)) {
                 flush_batch();
-                if (mOptions.includeReasoning) {
+                if (preserveReasoning) {
+                    // 供应商原字节属于这份 assistant 的调用，不能注入换行或可见正文。
+                    // flush_batch 已在响应边界结算前一批，后续 call/result 仍保持成对。
+                    pending.reasoning += toolResult->text;
+                } else if (mOptions.includeReasoning) {
                     if (!pending.reasoning.empty()) pending.reasoning += "\n";
                     pending.reasoning += toolResult->text;
                     if (!pending.content.empty()) pending.content += "\n";
@@ -314,7 +320,8 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(
         }
         flush_batch();
 
-        if (!pending.content.empty() || !pending.invocations.empty()) {
+        if (!pending.content.empty() || !pending.invocations.empty() ||
+            (preserveReasoning && !pending.reasoning.empty())) {
             out.push_back(std::move(pending));
         }
     }

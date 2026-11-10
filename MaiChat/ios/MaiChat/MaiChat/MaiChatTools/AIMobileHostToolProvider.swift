@@ -333,8 +333,18 @@ final class AIMobileHostToolProvider {
         case "ark_api_key":
             return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("ark")])
         case "glm_api_key":
+            #if DEBUG && targetEnvironment(simulator)
+            if AIPrimaryModelUITestSupport.isSessionConfigurationRequested {
+                return Self.jsonSuccess(["key": "synthetic-session-glm-key"])
+            }
+            #endif
             return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("glm")])
         case "deepseek_api_key":
+            #if DEBUG && targetEnvironment(simulator)
+            if AIPrimaryModelUITestSupport.isSessionConfigurationRequested {
+                return Self.jsonSuccess(["key": "synthetic-session-deepseek-key"])
+            }
+            #endif
             return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("deepseek")])
         case "minimax_api_key":
             return Self.jsonSuccess(["key": AICloudCredentialStore.shared.apiKey("minimax")])

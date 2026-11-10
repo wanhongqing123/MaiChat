@@ -2,6 +2,8 @@
 // 主要实现：run、succeeded；对应公开接口中的状态和错误处理。
 #include "MaiTurnRunner.h"
 
+#include "MaiCloudModelCatalog.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -292,6 +294,16 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
     mWorkingDirectory = session.directory;
 
     mModelName = session.model.empty() ? mDependencies.defaultModel : session.model;
+    mReasoningEffort =
+        session.reasoningEffort.empty()
+            ? (mDependencies.reasoningEffortProvider ? mDependencies.reasoningEffortProvider()
+                                                     : mDependencies.reasoningEffort)
+            : session.reasoningEffort;
+    if (!maiIsValidReasoningEffort(mReasoningEffort)) {
+        mError = {MaiErrorCode::InvalidInput, "Unsupported reasoning effort."};
+        finish(cancel);
+        return;
+    }
     if (!mDependencies.specialistReply.empty()) {
         const auto history = mDependencies.store->listMessages(mSessionId);
         const auto pending = mDependencies.pendingSteering ? mDependencies.pendingSteering()
@@ -414,11 +426,9 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
                                                        const std::atomic<bool>& cancel) {
     MaiModelRequest request;
     request.model = modelName;
-    if (modelName == "deepseek-flash") {
-        request.reasoningEffort = mDependencies.reasoningEffortProvider
-                                      ? mDependencies.reasoningEffortProvider()
-                                      : mDependencies.reasoningEffort;
-    }
+    const auto capability = maiCloudModelInfo(modelName);
+    if (capability && capability->supportsReasoningEffort)
+        request.reasoningEffort = mReasoningEffort;
     request.baseInstructions = mDependencies.baseInstructions;
 
     // 历史里那条正在写的 assistant 消息，
@@ -440,6 +450,7 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
     for (auto& message : history) {
         if (message.id == mAssistant.id) message = mAssistant;
     }
+    const bool preserveReasoning = capability && capability->provider == "glm";
     const auto buildHistory = [&](std::size_t firstMessage, std::size_t firstPart,
                                   const std::string& preservedUserMessageId) {
         auto modelHistory = history;
@@ -466,7 +477,7 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
         }
         if (mDependencies.specialistReply.empty())
             return mDependencies.context->build(modelHistory, firstMessage, firstPart,
-                                                preservedUserMessageId);
+                                                preservedUserMessageId, preserveReasoning);
         // 子模型回复应排在本轮工具调用之前。若每次迭代都把它追加在工具结果之后，
         // 主模型会把旧回复误认为用户刚刚发来的最新输入。
         std::vector<MaiMessage> earlier;
@@ -481,7 +492,7 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
             else
                 continuation.push_back(message);
         }
-        auto messages = mDependencies.context->build(earlier);
+        auto messages = mDependencies.context->build(earlier, 0, 0, {}, preserveReasoning);
         MaiModelMessage instruction;
         instruction.role = MaiModelRole::System;
         instruction.content =
@@ -507,7 +518,8 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
         messages.push_back(std::move(reply));
         // steer 产生新 assistant 段时，旧专业回复仍固定在本轮最初分段之前，
         // 不能越过新的用户指令重新变成“最新输入”。
-        const auto current = mDependencies.context->build(continuation);
+        const auto current =
+            mDependencies.context->build(continuation, 0, 0, {}, preserveReasoning);
         messages.insert(messages.end(), current.begin(), current.end());
         return messages;
     };

@@ -395,6 +395,9 @@ add_library(maiagent STATIC
   AgentTools/MaiTool.cpp
   AgentTools/MaiLlamaTools.cpp
   AgentTools/MaiDeepSeekWebTools.cpp
+  AgentTools/MaiGlmWebTools.cpp
+  AgentTools/MaiProviderWebTools.cpp
+  AgentTools/MaiWebRetrievalTransport.cpp
   AgentTools/MaiFfmpegTools.cpp
   AgentTools/MaiVideoGeometryTool.cpp
   AgentTools/MaiCvVideoTools.cpp
@@ -443,6 +446,8 @@ add_library(maiagent STATIC
   Agent/MaiTurnRunner.cpp
   Agent/MaiContextBuilder.cpp
   Agent/MaiModelClient.cpp
+  Agent/MaiRoutedModelClient.cpp
+  Agent/MaiCloudModelCatalog.cpp
   Agent/MaiContextCheckpoint.cpp
   Agent/MaiContextCompactor.cpp
   Agent/MaiConversationHistory.cpp

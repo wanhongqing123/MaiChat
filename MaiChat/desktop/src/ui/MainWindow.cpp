@@ -16,6 +16,7 @@
 #include "ui/VideoCircleDialog.h"
 #include "ui/CloudDriveDialog.h"
 #include "ui/RemoteDiagnosticsDialog.h"
+#include "MaiCloudModelCatalog.h"
 #if defined(MAICHAT_FFMPEG_IMAGE_DECODE)
 #include "MaiImageDecode.h"
 #endif
@@ -1682,8 +1683,8 @@ QString readTextFile(const QString &path) {
 
 namespace {
 
-// 本地保存推理强度和审批策略。Responses 地址由供应商确定；
-// 模型凭据领取后仅驻留当前进程内存。
+// 此处只给新会话和旧空值会话提供初始化默认；会话选择由核心持久化。
+// 模型凭据领取后仅驻留当前进程内存，实际协议按请求的型号选路。
 AgentController::ModelConfig loadAgentModelConfig(
     const QHash<QString, QString>& modelKeys) {
   AgentController::ModelConfig config;
@@ -1695,12 +1696,9 @@ AgentController::ModelConfig loadAgentModelConfig(
   if (config.reasoningEffort != QStringLiteral("low") &&
       config.reasoningEffort != QStringLiteral("max"))
     config.reasoningEffort = QStringLiteral("high");
-  const bool deepseek = config.modelName == QStringLiteral("deepseek-flash");
   config.wire = MaiWireApi::Responses;
-  config.baseUrl = deepseek ? QStringLiteral("https://api.deepseek.com")
-                            : QStringLiteral("https://open.bigmodel.cn/api/v1");
-  config.apiKey = modelKeys.value(deepseek ? QStringLiteral("deepseek") :
-                                    QStringLiteral("glm"));
+  config.baseUrl = QStringLiteral("https://api.deepseek.com");
+  config.apiKey = modelKeys.value(QStringLiteral("deepseek"));
   config.glmApiKey = modelKeys.value(QStringLiteral("glm"));
   config.miniMaxApiKey = modelKeys.value(QStringLiteral("minimax"));
   const QString policy = settings
@@ -4655,37 +4653,42 @@ void MainWindow::setAccountModelKeys(QHash<QString, QString> keys,
     QMutexLocker lock(&modelKeyState_->mutex);
     modelKeyState_->keys = modelApiKeys_;
   }
-  const QString requested = std::exchange(pendingModelSelection_, QString());
-  if (!requested.isEmpty()) {
-    const QString provider = requested == QStringLiteral("deepseek-flash") ?
-        QStringLiteral("deepseek") : QStringLiteral("glm");
-    if (modelApiKeys_.value(provider).isEmpty()) {
+  const auto pending = std::exchange(pendingModelSelections_, {});
+  for (auto it = pending.cbegin(); it != pending.cend(); ++it) {
+    const auto &request = it.value();
+    if (!agentController_ || request.owner != app_.chatState().ownerUserId() ||
+        request.controllerGeneration != agentControllerGeneration_)
+      continue;
+    const auto info = maiCloudModelInfo(request.model.toStdString());
+    if (!info || modelApiKeys_.value(QString::fromStdString(info->provider)).isEmpty()) {
       showToast(modelKeyError_.isEmpty() ?
           QStringLiteral("当前账号暂不可用所选模型") : modelKeyError_, 13, 2500);
-    } else if (agentPanel_) {
-      QSettings settings;
-      const QVariant oldModel = settings.value(QStringLiteral("agent/model"));
-      settings.setValue(QStringLiteral("agent/model"), requested);
-      settings.sync();
-      if (settings.status() != QSettings::NoError ||
-          !agentPanel_->applySelectedModel(requested)) {
-        if (oldModel.isValid()) settings.setValue(QStringLiteral("agent/model"), oldModel);
-        else settings.remove(QStringLiteral("agent/model"));
-        settings.sync();
-        showToast(QStringLiteral("模型切换失败，已保留原模型"), 13, 2500);
-      }
+      continue;
+    }
+    // 空白页的选择只在仍为空白时创建首个会话；不可借用稍后打开的另一个会话。
+    const bool applied = it.key().isEmpty() ? agentPanel_ && agentPanel_->sessionId().isEmpty() &&
+                                                  agentPanel_->applySelectedModel(request.model)
+                                            : agentController_->setSessionModelConfiguration(
+                                                  it.key(), request.model);
+    if (!applied) {
+      showToast(QStringLiteral("模型切换失败，已保留原模型"), 13, 2500);
     }
   }
   if (agentPanel_) {
-    const AgentController::ModelConfig selected = loadAgentModelConfig(modelApiKeys_);
-    const bool ready = !selected.apiKey.isEmpty();
-    const QString label = ready ? selected.modelName :
-        !modelKeyError_.isEmpty() ?
-            (modelKeyError_.contains(QStringLiteral("未开通")) ?
-                QStringLiteral("模型未开通") : QStringLiteral("模型连接失败")) :
-        !modelApiKeys_.isEmpty() ? QStringLiteral("模型未开通") :
-                                   QStringLiteral("正在连接模型");
-    agentPanel_->setModelLabel(label, ready);
+    if (!agentPanel_->sessionId().isEmpty()) {
+      agentPanel_->refreshModelConfiguration();
+    } else {
+      const AgentController::ModelConfig selected = loadAgentModelConfig(modelApiKeys_);
+      const bool ready = !selected.apiKey.isEmpty();
+      const QString label =
+          ready ? selected.modelName
+          : !modelKeyError_.isEmpty()
+              ? (modelKeyError_.contains(QStringLiteral("未开通")) ? QStringLiteral("模型未开通")
+                                                                   : QStringLiteral("模型连接失败"))
+          : !modelApiKeys_.isEmpty() ? QStringLiteral("模型未开通")
+                                     : QStringLiteral("正在连接模型");
+      agentPanel_->setModelLabel(label, ready);
+    }
   }
   if (replySuggestionController_) {
     const AgentController::ModelConfig selected = loadAgentModelConfig(modelApiKeys_);
@@ -4972,6 +4975,9 @@ void MainWindow::rebuildAgentPage() {
   if (agentSplitter == nullptr)
     return;
 
+  ++agentControllerGeneration_;
+  pendingModelSelections_.clear();
+
   const QString sessionToRestore =
       agentPanel_ == nullptr ? QString() : agentPanel_->sessionId();
   const QJsonObject remoteToRestore =
@@ -5003,15 +5009,8 @@ void MainWindow::rebuildAgentPage() {
     QMutexLocker lock(&keyState->mutex);
     return keyState->keys.value(QStringLiteral("minimax"));
   };
-  modelConfig.glmBaseUrl = QStringLiteral("https://open.bigmodel.cn/api/v1");
+  modelConfig.glmBaseUrl = QStringLiteral("https://open.bigmodel.cn/api/paas/v4");
   modelConfig.deepseekBaseUrl = QStringLiteral("https://api.deepseek.com");
-  modelConfig.reasoningEffortProvider = [] {
-    QSettings settings;
-    const QString value = settings.value(
-        QStringLiteral("agent/reasoningEffort"), QStringLiteral("high")).toString();
-    return value == QStringLiteral("low") || value == QStringLiteral("max") ?
-        value : QStringLiteral("high");
-  };
   modelConfig.arkApiKeyProvider = arkApiKeyProvider_;
   modelConfig.wanCredentialsProvider = wanCredentialsProvider_;
   modelConfig.mediaServiceAccessProvider = mediaServiceAccessProvider_;
@@ -5316,14 +5315,15 @@ void MainWindow::rebuildAgentPage() {
           [this](const QString& effort) {
             if (effort != QStringLiteral("low") && effort != QStringLiteral("high") &&
                 effort != QStringLiteral("max")) return;
-            QSettings settings;
-            settings.setValue(QStringLiteral("agent/reasoningEffort"), effort);
-            settings.sync();
-            if (settings.status() == QSettings::NoError) {
-              agentPanel_->setReasoningEffortLabel(effort);
-            } else {
+            if (agentPanel_->sessionId().isEmpty()) agentPanel_->openSession();
+            AgentController::SessionModelConfiguration configuration;
+            if (!agentController_->sessionModelConfiguration(agentPanel_->sessionId(),
+                                                             configuration) ||
+                !agentController_->setSessionModelConfiguration(agentPanel_->sessionId(),
+                                                                configuration.model, effort)) {
               showToast(QStringLiteral("思考强度保存失败"), 13, 2500);
             }
+            agentPanel_->refreshModelConfiguration();
           });
   if (!sessionToRestore.isEmpty())
     agentPanel_->openSession(sessionToRestore);
@@ -5341,9 +5341,24 @@ void MainWindow::rebuildAgentPage() {
 
 void MainWindow::requestAgentModelChange(const QString& model) {
   const QString selected = model.trimmed();
-  if (selected.isEmpty() ||
-      selected == loadAgentModelConfig(modelApiKeys_).modelName) return;
-  pendingModelSelection_ = selected;
+  const auto info = maiCloudModelInfo(selected.toStdString());
+  if (!info || !agentController_ || !agentPanel_) return;
+  const QString target = agentPanel_->sessionId();
+  // 用户再次选择原模型也会取消此前等待 Key 的切换意图。
+  pendingModelSelections_.remove(target);
+  AgentController::SessionModelConfiguration current;
+  if (agentController_->sessionModelConfiguration(target, current) && current.model == selected)
+    return;
+  if (!modelApiKeys_.value(QString::fromStdString(info->provider)).isEmpty()) {
+    const bool applied = target.isEmpty()
+                             ? agentPanel_->applySelectedModel(selected)
+                             : agentController_->setSessionModelConfiguration(target, selected);
+    if (!applied) showToast(QStringLiteral("模型切换失败，已保留原模型"), 13, 2500);
+    agentPanel_->refreshModelConfiguration();
+    return;
+  }
+  pendingModelSelections_.insert(
+      target, {selected, app_.chatState().ownerUserId(), agentControllerGeneration_});
   if (modelKeyRefreshHandler_) modelKeyRefreshHandler_();
   else setAccountModelKeys(modelApiKeys_, modelKeyError_);
 }

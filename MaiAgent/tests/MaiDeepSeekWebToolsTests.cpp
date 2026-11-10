@@ -1,6 +1,8 @@
 // 文件作用：用 loopback 假服务验证普通检索客户端、只读工具的协议、权限、边界、重试及 TLS。
 // 所有请求均为本地合成 JSON；凭据仅为进程内假值，不访问官方服务或真实账号。
 #include "MaiDeepSeekWebTools.h"
+#include "MaiGlmWebTools.h"
+#include "MaiProviderWebTools.h"
 
 #include <algorithm>
 #include <atomic>
@@ -97,6 +99,12 @@ public:
         mServer->Post("/v1/tools/fetch", [this](const auto& request, auto& response) {
             handle(request, response, false);
         });
+        mServer->Post("/web_search", [this](const auto& request, auto& response) {
+            handle(request, response, true);
+        });
+        mServer->Post("/reader", [this](const auto& request, auto& response) {
+            handle(request, response, false);
+        });
         mServer->Get("/collected", [this](const auto& request, auto& response) {
             handle(request, response, false);
         });
@@ -134,6 +142,15 @@ public:
             return mCredential;
         };
         return options;
+    }
+    MaiGlmWebOptions glmOptions() {
+        const auto source = options();
+        return {source.apiKey,
+                source.caBundlePath,
+                source.caPem,
+                source.baseUrl,
+                source.allowLoopbackTestServer,
+                source.timeoutSeconds};
     }
     std::string address() const {
         return std::string(mSecure ? "https" : "http") + "://127.0.0.1:" + std::to_string(mPort);
@@ -728,9 +745,167 @@ void test_tls_peer_hostname_and_https_to_http_redirect() {
         "Local TLS peer/hostname verification and HTTPS redirect credential boundary passed\n");
 }
 #endif
+Json glmSearchResult() {
+    return {{"search_result", Json::array({{{"title", "GLM official document"},
+                                            {"link", "https://example.com/glm-doc"},
+                                            {"content", "Native structured result"}}})}};
+}
+
+void test_glm_native_search_reader_and_exact_limits() {
+    MaiDeepSeekFakeProvider provider;
+    provider.searchReplies({{200, glmSearchResult().dump(), {}, 0}});
+    MaiGlmWebClient client(provider.glmOptions());
+    MaiGlmWebSearchRequest request;
+    request.query = "site:example.com native API";
+    request.count = 3;
+    request.searchEngine = "search_pro";
+    request.searchIntent = true;
+    request.domainFilter = "example.com";
+    request.recencyFilter = "oneWeek";
+    request.contentSize = "high";
+    const auto response = client.search(request);
+    CHECK(response.error.code.empty() && response.results.size() == 1);
+    if (!response.results.empty()) {
+        CHECK(!response.results[0].date && !response.results[0].site);
+        CHECK(response.results[0].authority == -1 && response.results[0].summary.empty());
+    }
+    auto captured = provider.requests();
+    CHECK(captured.size() == 1 && captured[0].authenticated && captured[0].path == "/web_search");
+    if (!captured.empty()) {
+        const auto& body = captured[0].body;
+        CHECK(body["search_query"] == request.query && body["search_engine"] == "search_pro");
+        CHECK(body["search_intent"] == true && body["search_domain_filter"] == "example.com");
+        CHECK(body["search_recency_filter"] == "oneWeek" && body["content_size"] == "high");
+        CHECK(!body.contains("query") && !body.contains("api_key"));
+    }
+    request.query.clear();
+    for (int i = 0; i < 70; ++i) request.query += u8"\u754c";
+    CHECK(client.search(request).error.code.empty());
+    const auto reads = provider.keyReads();
+    request.query += u8"\u754c";
+    CHECK(client.search(request).error.code == "INVALID_INPUT");
+    CHECK(provider.keyReads() == reads);
+    request.query = "valid";
+    request.searchEngine = "search_pro_sogou";
+    request.count = 3;
+    CHECK(client.search(request).error.code == "INVALID_INPUT" && provider.keyReads() == reads);
+    provider.fetchReplies(
+        {{200,
+          Json{{"reader_result", {{"title", "Article"}, {"content", u8"A\u754cB"}}}}.dump(),
+          {},
+          0}});
+    const auto page = client.fetch("https://example.com/article", 2);
+    CHECK(page.error.code.empty() && page.content == u8"A\u754c" && page.truncated);
+    captured = provider.requests();
+    CHECK(captured.size() == 1 && captured[0].authenticated && captured[0].path == "/reader");
+    if (!captured.empty()) {
+        CHECK(captured[0].body["url"] == "https://example.com/article");
+        CHECK(captured[0].body["return_format"] == "markdown" &&
+              captured[0].body["keep_img_data_url"] == false);
+    }
+}
+
+void test_glm_filters_do_not_make_count_a_hard_response_limit() {
+    MaiDeepSeekFakeProvider provider;
+    auto fixture = glmSearchResult();
+    auto second = fixture["search_result"][0];
+    second["title"] = "Second native result";
+    second["link"] = "https://example.com/second";
+    fixture["search_result"].push_back(second);
+    provider.searchReplies({{200, fixture.dump(), {}, 0}});
+    MaiGlmWebSearchRequest request;
+    request.query = "native filter behavior";
+    request.count = 1;
+    request.domainFilter = "example.com";
+    request.recencyFilter = "oneWeek";
+    const auto ordinary = MaiGlmWebClient(provider.glmOptions()).search(request);
+    CHECK(ordinary.error.code.empty() && ordinary.results.size() == 2);
+    MaiToolRegistry tools;
+    registerMaiGlmWebTools(tools, provider.glmOptions());
+    const auto tool =
+        tools.find("web_search")
+            ->execute(
+                R"({"query":"native filter behavior","count":1,"domain_filter":"example.com","recency_filter":"oneWeek"})",
+                {});
+    CHECK(!tool.hasError());
+    if (!tool.hasError()) CHECK(Json::parse(tool.output())["results"].size() == 2);
+    fixture["search_result"] = Json::array();
+    for (int index = 0; index < 51; ++index) fixture["search_result"].push_back(second);
+    provider.searchReplies({{200, fixture.dump(), {}, 0}});
+    CHECK(MaiGlmWebClient(provider.glmOptions()).search(request).error.code ==
+          "RESPONSE_TOO_LARGE");
+}
+
+void test_glm_errors_cancel_and_provider_dispatch_never_fallback() {
+    MaiDeepSeekFakeProvider deepseek, glm;
+    glm.searchReplies({{200, glmSearchResult().dump(), {}, 0}});
+    glm.fetchReplies(
+        {{200,
+          Json{{"reader_result", {{"title", "GLM page"}, {"content", "# Markdown"}}}}.dump(),
+          {},
+          0}});
+    MaiToolRegistry registry;
+    registerMaiProviderWebTools(registry, {deepseek.options(), glm.glmOptions()});
+    CHECK(registry.specs("glm-5.3").size() == 2 && registry.specs("deepseek-v4-pro").size() == 2);
+    CHECK(registry.findForModel("web_search", "unconfigured-model") == nullptr);
+    CHECK(Json::parse(
+              registry.specs("glm-5.3")[0].parametersJson)["properties"]["query"]["maxLength"] ==
+          70);
+    CHECK(Json::parse(registry.specs("deepseek-v4-pro")[0]
+                          .parametersJson)["properties"]["query"]["maxLength"] == 128);
+    MaiToolContext context;
+    context.model = "glm-5.3";
+    context.sessionId = "ses_glm_native";
+    auto* search = registry.findForModel("web_search", context.model);
+    CHECK(search && !search->requiresApproval("{}") && !search->requiresPaidApproval("{}"));
+    if (!search) return;
+    auto result = search->execute(R"({"query":"native GLM"})", context);
+    CHECK(!result.hasError() && Json::parse(result.output())["provider"] == "glm");
+    CHECK(deepseek.requests().empty() && glm.requests().size() == 1);
+    CHECK(search->execute(R"({"query":"native GLM","need_content":true})", context).hasError());
+    glm.searchReplies({{401, "{}", {}, 0}});
+    result = search->execute(R"({"query":"native GLM"})", context);
+    CHECK(result.hasError() && result.error().code() == MaiErrorCode::NotConfigured);
+    CHECK(deepseek.requests().empty() && glm.requests().size() == 1);
+    context.model = "deepseek-v4-pro";
+    result = search->execute(R"({"query":"native DeepSeek"})", context);
+    CHECK(!result.hasError() && Json::parse(result.output())["provider"] == "deepseek");
+    CHECK(deepseek.requests().size() == 1 && deepseek.requests()[0].authenticated);
+    context.model = "glm-unknown";
+    CHECK(search->execute(R"({"query":"no fallback"})", context).error().code() ==
+          MaiErrorCode::NotSupported);
+    std::atomic<bool> cancel{true};
+    MaiGlmWebClient ordinary(glm.glmOptions());
+    const auto reads = glm.keyReads();
+    CHECK(ordinary.fetch("https://example.com", 10, &cancel).error.code == "CANCELED");
+    CHECK(glm.keyReads() == reads);
+    glm.fetchReplies(
+        {{503, "{}", {}, 0},
+         {200,
+          Json{{"reader_result", {{"title", "Page"}, {"content", "Recovered"}}}}.dump(),
+          {},
+          0}});
+    CHECK(ordinary.fetch("https://example.com").attempts == 2);
+    glm.fetchReplies(
+        {{200,
+          Json{{"reader_result", {{"title", "Page"}, {"content", "<html>Not extracted"}}}}.dump(),
+          {},
+          0}});
+    CHECK(ordinary.fetch("https://example.com").error.code == "HTML_NOT_EXTRACTED");
+    auto invalid = glm.glmOptions();
+    invalid.baseUrl = "https://example.com";
+    invalid.allowLoopbackTestServer = false;
+    CHECK(MaiGlmWebClient(invalid).search(MaiGlmWebSearchRequest{"query"}).error.code ==
+          "INVALID_CONFIGURATION");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--glm-filter-count") {
+        test_glm_filters_do_not_make_count_a_hard_response_limit();
+        return failures == 0 ? 0 : 1;
+    }
     MaiThread::setCurrentName("mai-web-tests");
     // 只改本测试进程，loopback 假服务不交给环境代理，避免任何外网请求。
 #if defined(_WIN32)
@@ -739,6 +914,9 @@ int main() {
     setenv("NO_PROXY", "*", 1);
     setenv("no_proxy", "*", 1);
 #endif
+    test_glm_filters_do_not_make_count_a_hard_response_limit();
+    test_glm_native_search_reader_and_exact_limits();
+    test_glm_errors_cancel_and_provider_dispatch_never_fallback();
     test_unicode_operators_unknown_metadata_and_empty_results();
     test_invalid_typed_inputs_never_read_credentials_or_send_requests();
     test_localization_uses_a_known_ip_or_is_omitted();

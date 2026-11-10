@@ -102,6 +102,7 @@ int main() {
     std::atomic<bool> windowEmitTail{false};
     std::atomic<bool> windowTailSent{false};
     std::atomic<bool> windowReleased{false};
+    std::atomic<bool> windowQuestionReplanned{false};
     server.Post("/chat/completions", [&](const httplib::Request& request, httplib::Response& response) {
         const Json body = Json::parse(request.body);
         std::size_t index;
@@ -147,6 +148,15 @@ int main() {
                 sink.done();
                 return true;
             });
+        } else if (lastUser == "Native accepted supplement 20" && !windowQuestionReplanned.exchange(true)) {
+            // 新输入已被真实下一次模型请求读取，重新提出的问题不再属于被取消的旧计划。
+            const Json tool{
+                {"index", 0},
+                {"id", "native-replanned-question"},
+                {"type", "function"},
+                {"function",
+                 {{"name", "question"}, {"arguments", R"({"question":"Keep the reviewed native result?"})"}}}};
+            response.set_content(frame({{"tool_calls", Json::array({tool})}}, "tool_calls"), "text/event-stream");
         } else if (index == 0) {
             const Json tool{{"index", 0},
                             {"id", "synthetic-profile"},
@@ -677,9 +687,39 @@ int main() {
             if (!windowPending.at("questions").empty()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        check(windowPending.at("questions").size() == 1 && windowPending.at("turnId") == windowTurn,
+              "reviewed question lost its original stable task identity");
+        const std::string questionMessageID = windowPending.at("questions").front().at("messageId");
+        check(!questionMessageID.empty() && questionMessageID != windowTurn,
+              "reviewed question did not belong to its real continuation assistant");
+        const Json staleAssistant = call(handle, {{"op", "message"}, {"session", windowSession}, {"id", windowTurn}});
+        bool staleCanceled = false;
+        for (const auto& part : staleAssistant.at("messages").front().at("parts"))
+            staleCanceled |= part.value("kind", "") == "tool" && part.value("tool", "") == "question" &&
+                             part.value("state", "") == "canceled" &&
+                             part.value("error", "").find("new user input arrived") != std::string::npos;
+        check(staleCanceled, "the pre-steering question plan was executed without reviewing new inputs");
+        // 只有已经实际 Running 的问题才在新补充到达后继续等待。推到最新页外后，
+        // 仍必须点取同一条 question owner，而非把问题错误归到本轮最初 assistant。
+        for (int index = 0; index < 21; ++index)
+            check(call(handle, {{"op", "steer"},
+                                {"session", windowSession},
+                                {"turnId", windowTurn},
+                                {"requestId", "native-question-window-" + std::to_string(index)},
+                                {"text", "Native question supplement " + std::to_string(index)}})
+                      .at("ok"),
+                  "running question supplement was rejected");
+        windowPending = call(handle, {{"op", "snapshot"},
+                                      {"session", windowSession},
+                                      {"force", true},
+                                      {"messageLimit", 8},
+                                      {"includeMessageUpdates", true}});
         check(windowPending.at("questions").size() == 1 &&
-                  windowPending.at("questions").front().at("messageId") == windowTurn,
-              "question did not remain attached to the original assistant outside the latest page");
+                  windowPending.at("questions").front().at("messageId") == questionMessageID,
+              "question did not remain attached to its actual assistant outside the latest page");
+        for (const auto& message : windowPending.at("messages"))
+            check(message.at("id") != questionMessageID,
+                  "running question fixture did not move its owner outside the latest page");
         check(call(handle, {{"op", "answer"},
                             {"session", windowSession},
                             {"id", windowPending.at("questions").front().at("id")},
@@ -698,7 +738,7 @@ int main() {
             check(remote.value("messageUpdates", Json::array()).size() <= 20,
                   "remote owner update batch exceeded twenty");
             for (const auto& message : remote.value("messageUpdates", Json::array()))
-                if (message.at("id") == windowTurn && message.value("completed", 0LL) > 0)
+                if (message.at("id") == questionMessageID && message.value("completed", 0LL) > 0)
                     for (const auto& part : message.at("parts"))
                         sawNativeFinal |= part.value("output", "") == "Kept native old result";
             if (sawNativeFinal) break;
