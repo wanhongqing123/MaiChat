@@ -3,6 +3,8 @@
 // native file dialogs may show real Windows quick-access labels, so captures
 // remain private evidence. A lost foreground cancels capture/input.
 // This proves native execution, not a visual model's autonomous decisions.
+#include "DesktopComputerBrowserNativeDependencies.h"
+
 #include <QApplication>
 #include <QCryptographicHash>
 #include <QDir>
@@ -1025,6 +1027,8 @@ int runDocumentWorkflow() {
 }
 }  // namespace
 
+#include "DesktopComputerBrowserNativeFixture.h"
+
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
     const auto arguments = app.arguments();
@@ -1033,5 +1037,6 @@ int main(int argc, char** argv) {
     if (arguments.size() == 5 && arguments[1] == QStringLiteral("--document-editor"))
         return childDocumentEditor(arguments[2], arguments[3], arguments[4]);
     if (arguments.size() == 2 && arguments[1] == QStringLiteral("--workflow")) return runDocumentWorkflow();
+    if (arguments.size() == 2 && arguments[1] == QStringLiteral("--browser-workflow")) return runBrowserWorkflow();
     return arguments.size() == 1 ? runParent() : 1;
 }

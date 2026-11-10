@@ -184,8 +184,12 @@ UIA 独立文本读回均符合；`worker_starts=1/session_starts=1/frames_recei
 最终 normal App/三个电脑测试目标构建 exit0，自动部署核对 3 binaries/114PE imports/plugins。
 contracts 通过 0.98 秒；原/新脚本 Agent 链 4PASS/0FAIL/0SKIP，779ms。最终 QPC 源重建后
 validation-only exit0，9 组 Core 通过 156.05 秒；先前 94.48 秒是此修正之前的历史记录。
-Mac 第2快照正常 App/contracts 构建 exit0，registered contracts 通过 0.87 秒，仍无 OS 采集/输入。
-第3小增量已经发给 Mac；此前结果不倒填为第3版通过。真实视觉模型调用尚未执行，已询问用户
+Mac 第3快照正常 App/contracts 构建 exit0，registered contracts 1/1 通过 1.00 秒，仍无 OS 采集/输入。
+Windows 后续普通执行器已完成原生 Save As、独立磁盘读回、清空与 Open/reopen，两个真实文件
+对话框和最终 UIA 内容均验证，一条 resident worker/session；具体原始失败与最终结果见
+`maichat-computer-use-document-workflow-20261110.md`。随后同一普通执行入口在独立 Chrome 配置中完成
+原生地址栏两页导航，服务端 Cookie、UIA 地址和正文均独立验证，进程及临时配置已清理；详见
+`maichat-computer-use-browser-workflow-20261110.md`。这些不替代视觉模型决策验收。真实视觉模型调用尚未执行，已询问用户
 用于最终自有编辑器/浏览器验收的模型；没有读取其凭据或为 UI 测试发起付费请求。
 
 ## 对照资料（外部依据）
