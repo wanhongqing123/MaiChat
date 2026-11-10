@@ -42,6 +42,13 @@ constexpr int kMaxGlobResults = 300;
 constexpr int kMaxGlobVisitedEntries = 50000;
 constexpr auto kMaxGlobDuration = std::chrono::seconds(5);
 
+// grep 的结果上限不能限制“没有命中”的大目录扫描，另行限制总工作量。
+// 时间预算是协作式的：在目录项、读取/解码返回及每行之间检查，不能抢占一次阻塞 I/O 或 regex_search。
+constexpr std::size_t kMaxGrepVisitedEntries = 50000;
+constexpr std::uint64_t kMaxGrepFileBytes = 2u * 1024 * 1024;
+constexpr std::uint64_t kMaxGrepReadBytes = 32u * 1024 * 1024;
+constexpr auto kMaxGrepDuration = std::chrono::seconds(5);
+
 // 截断时要落在 UTF-8 字符边界上，不然会切出半个汉字，后面 JSON 序列化会失败或者产生乱码。
 void truncateUtf8(std::string& text, std::size_t maxBytes) {
     if (text.size() <= maxBytes) return;
@@ -844,20 +851,25 @@ public:
         return "file_grep";
     }
     std::string description() const override {
-        // 对文本内容做正则搜索；编码先转成 UTF-8，无法可靠识别的旧编码需指定。
+        // 对文本内容做正则搜索；已知文件时直接指定该文件，避免扩大到整个源码树。
+        // 编码先转成 UTF-8；预算耗尽返回明确的部分结果，取消返回 Canceled。
         return "Search text files with a regular expression. Source bytes are converted to "
                "UTF-8 before matching; set encoding for ambiguous legacy text. Relative paths "
-               "use the working directory. Returns the file, line number and matching line.";
+               "use the working directory. When a specific file is known, set path to that file "
+               "instead of searching its parent directory. Returns the file, line number and "
+               "matching line. Regular files up to 2 MiB are searched, with cooperative scan "
+               "limits of 5 seconds, 50000 entries and 32 MiB read. Limited results are partial; "
+               "narrow path or glob before retrying.";
     }
     std::string parametersSchema() const override {
-        // pattern 是内容正则，path 限定搜索目录；encoding 处理自动识别不了的旧文本。
+        // pattern 是内容正则，path 可精确指定一个文件或限定目录；encoding 处理旧文本。
         return R"({"type":"object","properties":{)"
                R"("pattern":{"type":"string","description":"Regular expression"},)"
-               R"("path":{"type":"string","description":"Subdirectory to search from,)"
-                   R"( defaults to the working directory root"},)"
+               R"("path":{"type":"string","description":"Exact file or directory to search;)"
+               R"( prefer the supplied file path. Defaults to the working directory root"},)"
                R"("encoding":{"type":"string","description":"Source text encoding; default auto"},)"
                R"("glob":{"type":"string","description":"Only search files matching this pattern,)"
-                   R"( for example *.cpp"}},)"
+               R"( for example *.cpp"}},)"
                R"("required":["pattern"]})";
     }
 
@@ -869,6 +881,9 @@ public:
         if (pattern.empty())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                           "missing required parameter: pattern");
+        if (context.isCanceled())
+            return MaiToolResult::failure(MaiErrorCode::Canceled, "File search canceled.");
+        const auto deadline = std::chrono::steady_clock::now() + kMaxGrepDuration;
 
         std::string base = context.root;
         if (args.contains("path") && args["path"].is_string() &&
@@ -893,14 +908,35 @@ public:
         std::string out;
         int matches = 0;
         int undecodable = 0;
+        MaiError singleFileFailure;
+        std::size_t visitedEntries = 0;
+        std::uint64_t readBytes = 0;
+        bool scanLimited = false;
+
+        const auto shouldStop = [&] {
+            if (context.isCanceled()) return true;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                scanLimited = true;
+                return true;
+            }
+            return false;
+        };
 
         const MaiFilePath basePath = MaiFilePath::fromUtf8(base);
-        if (!MaiFileSystem::isDirectory(basePath))
-            return MaiToolResult::failure(MaiErrorCode::NotFound,
-                                          "could not read directory: " + base);
+        const bool searchDirectory = MaiFileSystem::isDirectory(basePath);
+        MaiRegularFileInfo singleFile;
+        if (!searchDirectory && !MaiFileSystem::regularFileInfo(basePath, singleFile))
+            return MaiToolResult::failure(
+                MaiFileSystem::exists(basePath) ? MaiErrorCode::InvalidInput
+                                                : MaiErrorCode::NotFound,
+                "path must name an accessible regular file or directory: " + base);
 
-        MaiFileSystem::walk(basePath, [&](const MaiFileEntry& entry) {
-            if (context.isCanceled() || matches >= kMaxGrepMatches) return MaiWalkAction::Stop;
+        const auto visit = [&](const MaiFileEntry& entry) {
+            if (shouldStop() || matches >= kMaxGrepMatches) return MaiWalkAction::Stop;
+            if (++visitedEntries > kMaxGrepVisitedEntries) {
+                scanLimited = true;
+                return MaiWalkAction::Stop;
+            }
             if (entry.isDirectory) {
                 return shouldSkipDirectory(entry.nameUtf8) ? MaiWalkAction::SkipDirectory
                                                            : MaiWalkAction::Continue;
@@ -910,15 +946,49 @@ public:
                 !globMatch(globPattern, entry.nameUtf8))
                 return MaiWalkAction::Continue;
 
-            // 太大的文件跳过：多半是二进制或产物，搜了也没意义还很慢。大小是遍历时顺路拿到的，
-            // 不用再 stat 一次。
-            if (entry.size > 2u * 1024 * 1024) return MaiWalkAction::Continue;
+            // walk 也会给出 FIFO、socket 和文件链接；不能按 size=0 当普通文件打开。
+            // 再核普通文件，并在实际读取时传上限，避免枚举后文件增长导致无界分配。
+            MaiRegularFileInfo info;
+            if (!MaiFileSystem::regularFileInfo(entry.path, info)) {
+                if (!searchDirectory)
+                    singleFileFailure = MaiError::make(
+                        MaiErrorCode::NotFound,
+                        "The requested file is no longer an accessible regular file.");
+                return MaiWalkAction::Continue;
+            }
+            if (info.bytes > kMaxGrepFileBytes) {
+                if (!searchDirectory)
+                    singleFileFailure = MaiError::make(
+                        MaiErrorCode::InvalidInput,
+                        "The requested file exceeds the 2 MiB file search limit. Use file_read "
+                        "with a bounded range instead.");
+                return MaiWalkAction::Continue;
+            }
+            if (readBytes == kMaxGrepReadBytes || info.bytes > kMaxGrepReadBytes - readBytes) {
+                scanLimited = true;
+                return MaiWalkAction::Stop;
+            }
 
             std::string blob;
-            if (MaiFileSystem::readFile(entry.path, blob).hasError())
+            bool readTruncated = false;
+            const std::uint64_t readLimit =
+                std::min(kMaxGrepFileBytes, kMaxGrepReadBytes - readBytes);
+            const MaiError readError =
+                MaiFileSystem::readFile(entry.path, blob, readLimit, &readTruncated);
+            if (readError.hasError()) {
+                // 目录搜索保持逐项跳过；精确文件没有其它候选，必须保留真实读取失败。
+                if (!searchDirectory) singleFileFailure = readError;
                 return MaiWalkAction::Continue;
+            }
+            readBytes += blob.size();
+            if (readTruncated) {
+                scanLimited = true;
+                return MaiWalkAction::Stop;
+            }
+            if (shouldStop()) return MaiWalkAction::Stop;
             const MaiResult<std::string> decoded =
                 decodeFileText(blob, stringArgument(args, "encoding"), context);
+            if (shouldStop()) return MaiWalkAction::Stop;
             if (!decoded) {
                 ++undecodable;
                 return MaiWalkAction::Continue;
@@ -929,6 +999,7 @@ public:
             int lineno = 0;
             std::size_t cursor = 0;
             while (cursor <= blob.size() && matches < kMaxGrepMatches) {
+                if (shouldStop()) return MaiWalkAction::Stop;
                 const std::size_t newlineAt = blob.find('\n', cursor);
                 if (newlineAt == std::string::npos) {
                     if (cursor >= blob.size()) break;
@@ -960,9 +1031,30 @@ public:
                 if (out.size() > kMaxOutputBytes) break;
             }
             return out.size() > kMaxOutputBytes ? MaiWalkAction::Stop : MaiWalkAction::Continue;
-        });
+        };
+        if (searchDirectory) {
+            MaiFileSystem::walk(basePath, visit);
+        } else {
+            MaiFileEntry entry;
+            entry.path = basePath;
+            entry.nameUtf8 = basePath.baseName().toUtf8();
+            entry.size = singleFile.bytes;
+            visit(entry);
+        }
+
+        // 取消不是成功的“没有匹配”：Runner 必须收到 Canceled，不能把卡片记为 Completed。
+        if (context.isCanceled())
+            return MaiToolResult::failure(MaiErrorCode::Canceled, "File search canceled.");
+        if (singleFileFailure.hasError())
+            return MaiToolResult::failure(singleFileFailure.code(), singleFileFailure.message());
 
         if (matches == 0) {
+            if (scanLimited)
+                return MaiToolResult::success(
+                    "Search stopped at the scan limit without finding a match in the scanned "
+                    "files. This is a partial search. Set path to the exact file or a smaller "
+                    "directory, or add glob to narrow the search.",
+                    true);
             const std::string message = "No content matches " + pattern;
             if (undecodable == 0) return MaiToolResult::success(message);
             return MaiToolResult::success(
@@ -970,13 +1062,17 @@ public:
                     " files that could not be decoded. Retry with an explicit encoding.",
                 true);
         }
-        const bool truncated =
-            matches >= kMaxGrepMatches || out.size() > kMaxOutputBytes || undecodable > 0;
+        const bool outputLimited = matches >= kMaxGrepMatches || out.size() > kMaxOutputBytes;
+        const bool truncated = outputLimited || undecodable > 0 || scanLimited;
         truncateUtf8(out, kMaxOutputBytes);
         if (undecodable > 0)
             out += "\n...Skipped " + std::to_string(undecodable) +
                    " files that could not be decoded; specify encoding to search them.";
-        if (truncated)
+        if (scanLimited)
+            out +=
+                "\n...Search stopped at the scan limit; only scanned files are represented. "
+                "Set path to the exact file or a smaller directory, or add glob.";
+        if (outputLimited)
             out +=
                 "\n...Too many matches; showing the first ones only. Use a more specific "
                 "regular expression, or add the glob parameter to narrow the search.";

@@ -13,10 +13,18 @@
 // 测试里要用 std::filesystem::u8path("中文")，产品代码里用
 // MaiPathUtf8::fromUtf8()。
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include <json.hpp>
 
@@ -536,6 +544,156 @@ void test_grep() {
     CHECK(cn.output().find("README.md") != std::string::npos);
 }
 
+void test_grep_specific_file_preserves_scope() {
+    Workspace workspace;
+    const auto file = workspace.root / fs::u8path(kCjkFile);
+    Workspace::write(file, "IP-CIDR,11.164.94.213/32,DIRECT\n");
+    Workspace::write(workspace.root / "unrelated.svg", "<path d=\"M164.94 10\"/>\n");
+    auto grep = makeMaiGrepTool();
+    const auto result = grep->execute(
+        args({{"pattern", R"(11\.164\.94\.213|11\.164\.94\.|164\.94)"}, {"path", file.u8string()}}),
+        workspace.context());
+    CHECK(!result.hasError());
+    CHECK(result.output().find(std::string(kCjkFile) + ":1:") != std::string::npos);
+    CHECK(result.output().find("11.164.94.213/32,DIRECT") != std::string::npos);
+    CHECK(result.output().find("unrelated.svg") == std::string::npos);
+}
+
+void test_grep_specific_oversized_file_reports_limit() {
+    Workspace workspace;
+    const auto file = workspace.root / "large.conf";
+    std::string bytes(2u * 1024 * 1024 + 1, 'x');
+    bytes.replace(0, 14, "11.164.94.213\n");
+    // 保持精确的 2 MiB + 1，不让首行替换改变越界条件。
+    bytes.resize(2u * 1024 * 1024 + 1, 'x');
+    Workspace::write(file, bytes);
+    const auto result = makeMaiGrepTool()->execute(
+        args({{"pattern", R"(11\.164\.94\.213)"}, {"path", file.u8string()}}), workspace.context());
+    CHECK(result.hasError());
+    CHECK(result.error().message().find("2 MiB") != std::string::npos);
+    CHECK(result.output().find("No content matches") == std::string::npos);
+}
+
+#if !defined(_WIN32)
+void test_grep_specific_unreadable_file_preserves_error() {
+    Workspace workspace;
+    const auto file = workspace.root / "unreadable.conf";
+    Workspace::write(file, "11.164.94.213\n");
+    CHECK(::chmod(file.c_str(), 0000) == 0);
+    std::string content;
+    const auto originalReadError = MaiFileSystem::readFile(MaiFilePath(file.string()), content);
+    if (!originalReadError.hasError()) {
+        // 提权的测试用户可能仍可读取；不把这种运行环境算作拒读路径已验。
+        std::printf("SKIP unreadable-file fixture: process can still read mode-000 file\n");
+        ::chmod(file.c_str(), 0600);
+        return;
+    }
+    const auto result = makeMaiGrepTool()->execute(
+        args({{"pattern", R"(11\.164\.94\.213)"}, {"path", file.u8string()}}), workspace.context());
+    CHECK(::chmod(file.c_str(), 0600) == 0);
+    CHECK(result.hasError());
+    CHECK(result.error().code() == originalReadError.code());
+    CHECK(result.output().find("No content matches") == std::string::npos);
+}
+#endif
+
+void test_grep_pre_canceled_is_not_completed_no_match() {
+    Workspace workspace;
+    auto context = workspace.context();
+    std::atomic<bool> canceled{true};
+    context.cancel = &canceled;
+    const auto result = makeMaiGrepTool()->execute(args({{"pattern", "never-present"}}), context);
+    CHECK(result.hasError());
+    CHECK(result.error().code() == MaiErrorCode::Canceled);
+    CHECK(result.output().find("No content matches") == std::string::npos);
+}
+
+void test_grep_cancel_before_scanning_decoded_lines() {
+    Workspace workspace;
+    Workspace::write(workspace.root / "cancel.legacy", "\xff");
+    auto context = workspace.context();
+    std::atomic<bool> canceled{false};
+    context.cancel = &canceled;
+    context.decodeText = [&](const std::string&, const std::string&) -> MaiResult<std::string> {
+        // 解码器返回时取消已经发生；不能把后面的行当作一次已完成的成功搜索。
+        canceled.store(true);
+        return std::string("11.164.94.213\n");
+    };
+    const auto result = makeMaiGrepTool()->execute(
+        args({{"pattern", R"(11\.164\.94\.213)"}, {"glob", "*.legacy"}}), context);
+    CHECK(result.hasError());
+    CHECK(result.error().code() == MaiErrorCode::Canceled);
+}
+
+void test_grep_read_budget_does_not_claim_complete_no_match() {
+    Workspace workspace;
+    // 总原始字节超过 32 MiB，单个文件仍满足原先 2 MiB 限制。
+    // 平台解码器用于固定内容与工作量，不访问用户文件或依赖主机字符集。
+    std::string bytes(2u * 1024 * 1024, 'x');
+    bytes[0] = '\xff';
+    for (int index = 0; index < 18; ++index)
+        Workspace::write(workspace.root / ("budget-" + std::to_string(index) + ".legacy"), bytes);
+    auto context = workspace.context();
+    int decodedFiles = 0;
+    context.decodeText = [&](const std::string&, const std::string&) -> MaiResult<std::string> {
+        ++decodedFiles;
+        return std::string("no requested address here\n");
+    };
+    const auto result = makeMaiGrepTool()->execute(
+        args({{"pattern", R"(11\.164\.94\.213|11\.164\.94\.|164\.94)"}, {"glob", "*.legacy"}}),
+        context);
+    CHECK(!result.hasError());
+    CHECK(decodedFiles > 0 && decodedFiles < 18);
+    CHECK(result.isTruncated());
+    CHECK(result.output().find("scan limit") != std::string::npos);
+    CHECK(result.output().find("No content matches") == std::string::npos);
+}
+
+void test_grep_time_budget_checks_after_decoder_returns() {
+    Workspace workspace;
+    Workspace::write(workspace.root / "slow.legacy", "\xff");
+    auto context = workspace.context();
+    context.decodeText = [](const std::string&, const std::string&) -> MaiResult<std::string> {
+        // 预算是协作式检查，不声称能抢占宿主解码器、单次 I/O 或 regex_search。
+        std::this_thread::sleep_for(std::chrono::milliseconds(5100));
+        return std::string("11.164.94.213\n");
+    };
+    const auto result = makeMaiGrepTool()->execute(
+        args({{"pattern", R"(11\.164\.94\.213)"}, {"glob", "*.legacy"}}), context);
+    CHECK(!result.hasError());
+    CHECK(result.isTruncated());
+    CHECK(result.output().find("scan limit") != std::string::npos);
+    CHECK(result.output().find("slow.legacy:1:") == std::string::npos);
+}
+
+#if !defined(_WIN32)
+void test_grep_does_not_open_named_pipes() {
+    Workspace workspace;
+    const auto fifo = workspace.root / "search.pipe";
+    CHECK(::mkfifo(fifo.c_str(), 0600) == 0);
+    std::atomic<bool> finished{false};
+    std::atomic<bool> opened{false};
+    // 原实现若尝试打开 FIFO，由自有写端解阻塞并记录事实，避免 RED 用例永久挂住。
+    std::thread writer([&] {
+        while (!finished.load()) {
+            const int handle = ::open(fifo.c_str(), O_WRONLY | O_NONBLOCK);
+            if (handle >= 0) {
+                opened.store(true);
+                ::close(handle);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    const auto result = makeMaiGrepTool()->execute(
+        args({{"pattern", "never-present"}, {"glob", "*.pipe"}}), workspace.context());
+    finished.store(true);
+    writer.join();
+    CHECK(!result.hasError());
+    CHECK(!opened.load());
+}
+#endif
+
 // ── 6. 注册表 ───────────────────────────────────────────────────
 
 void test_registry() {
@@ -675,6 +833,18 @@ int main() {
     RUN(test_explicit_create_and_delete_tools_use_utf8_paths);
     RUN(test_glob);
     RUN(test_grep);
+    RUN(test_grep_specific_file_preserves_scope);
+    RUN(test_grep_specific_oversized_file_reports_limit);
+#if !defined(_WIN32)
+    RUN(test_grep_specific_unreadable_file_preserves_error);
+#endif
+    RUN(test_grep_pre_canceled_is_not_completed_no_match);
+    RUN(test_grep_cancel_before_scanning_decoded_lines);
+    RUN(test_grep_read_budget_does_not_claim_complete_no_match);
+    RUN(test_grep_time_budget_checks_after_decoder_returns);
+#if !defined(_WIN32)
+    RUN(test_grep_does_not_open_named_pipes);
+#endif
     RUN(test_registry);
     RUN(test_cv_video_tool_registration_and_results);
     RUN(test_cancel_stops_traversal);

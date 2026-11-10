@@ -1,0 +1,663 @@
+{
+  "sourceBase": "49d0168853f4adcbec7ab3040c3f44241b7e8826",
+  "sourceManifest": {
+    "baseCommit": "49d0168853f4adcbec7ab3040c3f44241b7e8826",
+    "requiresPatchSHA256": "e977a4e77c0271816ebe92bb3b0e845bfb1b30347e6c6419db2d45bfcbacfce1",
+    "patch": "file-grep-budget-v2-delta.patch",
+    "patchBytes": 6073,
+    "patchSHA256": "ff6f0736900df29919caa1f6b253cb625d6e408ef9c442d81ef4d51c451b88f7",
+    "files": [
+      {
+        "path": "MaiAgent/AgentTools/MaiFileTools.cpp",
+        "baseBlob": "02b2064f15b5269d519cb05b70afd273a7916fcb",
+        "previousSupplyBlob": "0f97a0cb7bcf62ba00b11037ade5515c09289b19",
+        "previousRawSHA256": "52b849551baae0fca1da799de76a0ee194714733b779422cb469b0fd9c338842",
+        "newBlob": "d0d2c1779a04209e3030c4bd5929726bae734273",
+        "bytes": 55364,
+        "rawSHA256": "507381a0b403b86ade2f37d02be1b8bf902392a77df9100cd66a441285a855e7",
+        "canonicalSHA256": "507381a0b403b86ade2f37d02be1b8bf902392a77df9100cd66a441285a855e7"
+      },
+      {
+        "path": "MaiAgent/tests/MaiToolTests.cpp",
+        "baseBlob": "28b50c0d8073585eb6076c227aac704d7cbcad92",
+        "previousSupplyBlob": "5bc00565df9dc3c7246967ee611b24c281a517d6",
+        "previousRawSHA256": "b97aad23d84337eff23a9e3f54a02ef0fef1acf48cd1f82013b2588de74469ed",
+        "newBlob": "4b09c9f50a8a8f6bad1e8b4427eb35e81d6a6a86",
+        "bytes": 39211,
+        "rawSHA256": "2ef5899c6c1959722a102bba0c91dc384f1c12197aef02a08e7c87f95aa22c77",
+        "canonicalSHA256": "2ef5899c6c1959722a102bba0c91dc384f1c12197aef02a08e7c87f95aa22c77"
+      }
+    ],
+    "isolatedIndexApplyCheck": true
+  },
+  "coordinatorVerification": {
+    "sourceBase": "49d0168853f4adcbec7ab3040c3f44241b7e8826",
+    "sourceManifest": {
+      "baseCommit": "49d0168853f4adcbec7ab3040c3f44241b7e8826",
+      "requiresPatchSHA256": "e977a4e77c0271816ebe92bb3b0e845bfb1b30347e6c6419db2d45bfcbacfce1",
+      "patch": "file-grep-budget-v2-delta.patch",
+      "patchBytes": 6073,
+      "patchSHA256": "ff6f0736900df29919caa1f6b253cb625d6e408ef9c442d81ef4d51c451b88f7",
+      "files": [
+        {
+          "path": "MaiAgent/AgentTools/MaiFileTools.cpp",
+          "baseBlob": "02b2064f15b5269d519cb05b70afd273a7916fcb",
+          "previousSupplyBlob": "0f97a0cb7bcf62ba00b11037ade5515c09289b19",
+          "previousRawSHA256": "52b849551baae0fca1da799de76a0ee194714733b779422cb469b0fd9c338842",
+          "newBlob": "d0d2c1779a04209e3030c4bd5929726bae734273",
+          "bytes": 55364,
+          "rawSHA256": "507381a0b403b86ade2f37d02be1b8bf902392a77df9100cd66a441285a855e7",
+          "canonicalSHA256": "507381a0b403b86ade2f37d02be1b8bf902392a77df9100cd66a441285a855e7"
+        },
+        {
+          "path": "MaiAgent/tests/MaiToolTests.cpp",
+          "baseBlob": "28b50c0d8073585eb6076c227aac704d7cbcad92",
+          "previousSupplyBlob": "5bc00565df9dc3c7246967ee611b24c281a517d6",
+          "previousRawSHA256": "b97aad23d84337eff23a9e3f54a02ef0fef1acf48cd1f82013b2588de74469ed",
+          "newBlob": "4b09c9f50a8a8f6bad1e8b4427eb35e81d6a6a86",
+          "bytes": 39211,
+          "rawSHA256": "2ef5899c6c1959722a102bba0c91dc384f1c12197aef02a08e7c87f95aa22c77",
+          "canonicalSHA256": "2ef5899c6c1959722a102bba0c91dc384f1c12197aef02a08e7c87f95aa22c77"
+        }
+      ],
+      "isolatedIndexApplyCheck": true
+    },
+    "mac_received_artifacts_verified": 16,
+    "mac_diagnostic_sha256": "79c68652971f025d7e533bf08a1798b4b3f03088ca8aa51d1e5b48450f002d80",
+    "mac_raw_core_suites_passed": 13,
+    "mac_raw_smoke_pid": 76425,
+    "mac_six_sdk_module_lines_match_original_log": true,
+    "windows_raw_evidence_verified": 19,
+    "windows_final_case_count": 24,
+    "windows_registered_suites_passed": 2,
+    "windows_development_exe_sha256": "a003e63c3dad5fe856e76b5508f8afb1472d0128aa764a63ec756887e9b32697",
+    "source_and_index_scope": "Only2intendedsource changes; indexempty before integration",
+    "sample_boundary": "Observed completed-tool later state; dominant sampled stack in model curl, not proof of a grep deadlock or complete original scan timing."
+  },
+  "windows": {
+    "status": "FINAL_WINDOWS_GATES_PASS",
+    "createdUTC": "2026-11-10T13:50:32.185952+00:00",
+    "baseCommit": "49d0168853f4adcbec7ab3040c3f44241b7e8826",
+    "sourceIdentity": "Base commit plus the two exact verified working-tree source overlays listed here; worker performed no tracked edit or commit.",
+    "sourceOverlay": [
+      {
+        "path": "MaiAgent/AgentTools/MaiFileTools.cpp",
+        "bytes": 55364,
+        "rawSHA256": "507381a0b403b86ade2f37d02be1b8bf902392a77df9100cd66a441285a855e7",
+        "gitBlob": "d0d2c1779a04209e3030c4bd5929726bae734273"
+      },
+      {
+        "path": "MaiAgent/tests/MaiToolTests.cpp",
+        "bytes": 39211,
+        "rawSHA256": "2ef5899c6c1959722a102bba0c91dc384f1c12197aef02a08e7c87f95aa22c77",
+        "gitBlob": "4b09c9f50a8a8f6bad1e8b4427eb35e81d6a6a86"
+      }
+    ],
+    "cohorts": {
+      "red-v1": {
+        "receipt": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-v1\\receipt.json",
+          "bytes": 7658,
+          "sha256": "093315754f1fd73f926e9536fe3cb88b2df92a65f2f7f3143a8e4b03685a3346"
+        },
+        "productionSHA256": "ac2441542e50519519f0ca6bcbc571dae20bfe908fdfa1eb742bc658ae873980",
+        "testSourceSHA256": "b97aad23d84337eff23a9e3f54a02ef0fef1acf48cd1f82013b2588de74469ed",
+        "totalCases": 23,
+        "failedCases": 5,
+        "failedAssertions": 15,
+        "testExitCode": 1,
+        "testElapsedSeconds": 5.806,
+        "executable": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-v1\\MaiToolTests-old-production.exe",
+          "bytes": 12569088,
+          "sha256": "2ad35a91d7be908f1ba9e917925c517fa828992a2142d8d3d612fe6ef6d95fdc"
+        },
+        "log": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-v1\\tooltests.txt",
+          "bytes": 2624,
+          "sha256": "28604c8fd5cd0af3756f025238010cbe5dc76da64462ff0d5885374e959591dd"
+        }
+      },
+      "green-v1": {
+        "receipt": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v1\\receipt.json",
+          "bytes": 3191,
+          "sha256": "d98fc43aa970b16810611bd7d528104ef6c490be41703a76b0e5e2f2ccf350b4"
+        },
+        "productionSHA256": "52b849551baae0fca1da799de76a0ee194714733b779422cb469b0fd9c338842",
+        "testSourceSHA256": "b97aad23d84337eff23a9e3f54a02ef0fef1acf48cd1f82013b2588de74469ed",
+        "totalCases": 23,
+        "failedCases": 0,
+        "failedAssertions": 0,
+        "testExitCode": 0,
+        "testElapsedSeconds": 5.77,
+        "executable": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v1\\MaiToolTests-v1.exe",
+          "bytes": 12574208,
+          "sha256": "82d61dcbfb32359f3580d66c5e042fbe549704389ca913dd67c9320acff8ec9e"
+        },
+        "log": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v1\\tooltests.txt",
+          "bytes": 995,
+          "sha256": "6fb3ecb37d6c21b45a976f9e28a0e708fd75c55fd2af827dc3735fa12466f487"
+        }
+      },
+      "red-p2-v1": {
+        "receipt": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-p2-v1\\receipt.json",
+          "bytes": 4380,
+          "sha256": "f6555845077f18be9965d3c7393627ec57398e7d4f1580e0e475928c33861841"
+        },
+        "productionSHA256": "52b849551baae0fca1da799de76a0ee194714733b779422cb469b0fd9c338842",
+        "testSourceSHA256": "2ef5899c6c1959722a102bba0c91dc384f1c12197aef02a08e7c87f95aa22c77",
+        "totalCases": 24,
+        "failedCases": 1,
+        "failedAssertions": 3,
+        "testExitCode": 1,
+        "testElapsedSeconds": 5.791,
+        "executable": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-p2-v1\\MaiToolTests-v1.exe",
+          "bytes": 12576768,
+          "sha256": "686450e7d77a8034bb091544e379b5a7c94eb8c46e6ae869c0e24bbb0e6cc7c4"
+        },
+        "log": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-p2-v1\\tooltests.txt",
+          "bytes": 1365,
+          "sha256": "32027d07a5bedf56a70965e9e6a0b231e22fe86bfd5478e78dc9c839432efe14"
+        }
+      },
+      "green-v2-final": {
+        "receipt": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v2-final\\receipt.json",
+          "bytes": 3525,
+          "sha256": "5c2e39d275b3fcf9e837387594645f0f01620801ec9361b761af6c6d28267f25"
+        },
+        "productionSHA256": "507381a0b403b86ade2f37d02be1b8bf902392a77df9100cd66a441285a855e7",
+        "testSourceSHA256": "2ef5899c6c1959722a102bba0c91dc384f1c12197aef02a08e7c87f95aa22c77",
+        "totalCases": 24,
+        "failedCases": 0,
+        "failedAssertions": 0,
+        "testExitCode": 0,
+        "testElapsedSeconds": 5.858,
+        "executable": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v2-final\\MaiToolTests-v2.exe",
+          "bytes": 12577792,
+          "sha256": "872c96bde46d4a59c8b7c76193d071eef9bc82890cd1283ba9d5d4094c4b21c4"
+        },
+        "log": {
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v2-final\\tooltests.txt",
+          "bytes": 1047,
+          "sha256": "374f36b0e31ae01773dc659dd06c75010b963a9626008e53ec4f0d45a6e8223a"
+        }
+      }
+    },
+    "registered": {
+      "status": "PASS",
+      "sourceCommit": "49d0168853f4adcbec7ab3040c3f44241b7e8826",
+      "sources": [
+        {
+          "path": "MaiAgent/AgentTools/MaiFileTools.cpp",
+          "bytes": 55364,
+          "sha256": "507381a0b403b86ade2f37d02be1b8bf902392a77df9100cd66a441285a855e7"
+        },
+        {
+          "path": "MaiAgent/tests/MaiToolTests.cpp",
+          "bytes": 39211,
+          "sha256": "2ef5899c6c1959722a102bba0c91dc384f1c12197aef02a08e7c87f95aa22c77"
+        },
+        {
+          "path": "MaiAgent/tests/MaiToolLoopTests.cpp",
+          "bytes": 57363,
+          "sha256": "4d0d27bd9da1489ea919a5a423eeb0044f539f7e5f77f28425511727ed47c923"
+        },
+        {
+          "path": "MaiAgent/tests/MaiTurnRunnerTests.cpp",
+          "bytes": 67593,
+          "sha256": "28f5e2c61fcd92096f8a799aa08a05aa7a76ad01408a7af14fde470196efae44"
+        }
+      ],
+      "executables": [
+        {
+          "target": "MaiToolLoopTests",
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\maiagent-core-gate\\build-followup-20261105\\bin\\MaiToolLoopTests.exe",
+          "bytes": 12704768,
+          "sha256": "bde862951ef1d7fbaa749ba38c72dd21ad56bdfd1db7e6f65bd64d3b0327fd60"
+        },
+        {
+          "target": "MaiTurnRunnerTests",
+          "path": "E:\\OpenSource\\MaiChat\\.cache\\maiagent-core-gate\\build-followup-20261105\\bin\\MaiTurnRunnerTests.exe",
+          "bytes": 9822720,
+          "sha256": "9b2cbf3eed0609efac788af856a6c4fb8de05dab3fc275203778a8aa297bd5d9"
+        }
+      ],
+      "command": [
+        "ctest",
+        "--test-dir",
+        "E:\\OpenSource\\MaiChat\\.cache\\maiagent-core-gate\\build-followup-20261105",
+        "-R",
+        "^(MaiToolLoopTests|MaiTurnRunnerTests)$",
+        "--output-on-failure",
+        "-j",
+        "1"
+      ],
+      "exitCode": 0,
+      "elapsedSeconds": 122.073,
+      "results": {
+        "MaiTurnRunnerTests": "passed",
+        "MaiToolLoopTests": "passed"
+      },
+      "log": {
+        "name": "ctest.txt",
+        "bytes": 363,
+        "sha256": "0c206d637a6e1e1b0df44d4506c8fe88fe1dfbf6fffa1c5e0e5c11842515b202"
+      },
+      "lastTestLog": {
+        "name": "LastTest.log",
+        "bytes": 1879,
+        "sha256": "4985325411954f465b97d6a2c151fd17748a6b478a1a905d964ce2a08b9a8e31"
+      },
+      "MaiToolTestsNotRunAgain": true,
+      "noSourceEdits": true
+    },
+    "desktopBuild": {
+      "status": "BUILD_DEPLOY_PE_PASS",
+      "sourceCommit": "49d0168853f4adcbec7ab3040c3f44241b7e8826",
+      "production": {
+        "path": "E:\\OpenSource\\MaiChat\\MaiAgent\\AgentTools\\MaiFileTools.cpp",
+        "bytes": 55364,
+        "sha256": "507381a0b403b86ade2f37d02be1b8bf902392a77df9100cd66a441285a855e7"
+      },
+      "testSource": {
+        "path": "E:\\OpenSource\\MaiChat\\MaiAgent\\tests\\MaiToolTests.cpp",
+        "bytes": 39211,
+        "sha256": "2ef5899c6c1959722a102bba0c91dc384f1c12197aef02a08e7c87f95aa22c77"
+      },
+      "cache": "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109",
+      "buildExitCode": 0,
+      "buildElapsedSeconds": 9.825,
+      "buildLog": {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\desktop-v2-final\\build.txt",
+        "bytes": 2209,
+        "sha256": "867331a26491d699f88cf99af3eb726e2633bbdc7ff97aae054bc00bc610491a"
+      },
+      "executable": {
+        "path": "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\maichat.exe",
+        "bytes": 165496320,
+        "sha256": "a003e63c3dad5fe856e76b5508f8afb1472d0128aa764a63ec756887e9b32697"
+      },
+      "appStarted": false,
+      "packageOrInstallationPerformed": false,
+      "versionChanged": false
+    },
+    "desktopSmoke": {
+      "status": "PASS",
+      "pid": 2476,
+      "runningPath": "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\maichat.exe",
+      "exitCode": 0,
+      "elapsedSeconds": 2.005,
+      "version": "2.2.56",
+      "qtVersion": "6.12.0",
+      "executable": {
+        "name": "maichat.exe",
+        "bytes": 165496320,
+        "sha256": "a003e63c3dad5fe856e76b5508f8afb1472d0128aa764a63ec756887e9b32697"
+      },
+      "pathEnvironment": "C:\\WINDOWS\\System32;C:\\WINDOWS",
+      "logEvidence": [
+        "2026-11-10 21:47:46.694 [I] version: 2.2.56  qt: 6.12.0",
+        "2026-11-10 21:47:46.694 [I] executable: E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/maichat.exe",
+        "2026-11-10 21:47:46.694 [I] pid: 2476",
+        "2026-11-10 21:47:46.694 [I] [im] libcurl TLS backend=OpenSSL/3.5.9"
+      ],
+      "qtDebugPlugins": "0",
+      "loadedQtModules": [
+        "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\Qt6Widgets.dll",
+        "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\Qt6Svg.dll",
+        "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\Qt6Gui.dll",
+        "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\Qt6Core.dll",
+        "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\platforms\\qwindows.dll"
+      ],
+      "pluginLoadEvidence": [],
+      "boundary": "Only this new --smoke child ran; login.start and account restore are skipped. Qt may append a startup header to its normal known-folder log; no existing log was read or copied."
+    },
+    "publishedReleaseArtifactsUnchanged": [
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\release-2.2.56-20261110\\assets\\MaiChat-Setup-win64-v2.2.56-b9243c3d.exe",
+        "bytes": 201072882,
+        "sha256": "fb1cb2fcf5499197d6478f19ffba6712aa5a70cac826206992f740d129d17966"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\release-2.2.56-20261110\\assets\\MaiChat-win64-v2.2.56-20261110-b9243c3d.zip",
+        "bytes": 241514910,
+        "sha256": "abf809a8701203aacce2280a4a959450516b126ae55f2cda6071393e29d5056b"
+      }
+    ],
+    "rawEvidence": [
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\desktop-v2-final\\build-receipt.json",
+        "bytes": 1565,
+        "sha256": "496323a8e467bb1fd4cfe0bd10250496b544ae0b1d7043a1c18957770a131545"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\desktop-v2-final\\build.txt",
+        "bytes": 2209,
+        "sha256": "867331a26491d699f88cf99af3eb726e2633bbdc7ff97aae054bc00bc610491a"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\desktop-v2-final\\smoke.json",
+        "bytes": 1987,
+        "sha256": "45a03d3fa4f64c62d751290226f1dddfd73249b7ef3047dc76233af86a2f6233"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v1\\build.txt",
+        "bytes": 191,
+        "sha256": "eb7e1f8c29d368679fcf70dfd688e3379606276cd41ce81e3d00c1a5ed1580b4"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v1\\receipt.json",
+        "bytes": 3191,
+        "sha256": "d98fc43aa970b16810611bd7d528104ef6c490be41703a76b0e5e2f2ccf350b4"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v1\\tooltests.txt",
+        "bytes": 995,
+        "sha256": "6fb3ecb37d6c21b45a976f9e28a0e708fd75c55fd2af827dc3735fa12466f487"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v2-final\\build.txt",
+        "bytes": 303,
+        "sha256": "ed559dbfe2c0fc733e8035616cdbd17ab17b8604bd141f5716499cc6f7d34e80"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v2-final\\receipt.json",
+        "bytes": 3525,
+        "sha256": "5c2e39d275b3fcf9e837387594645f0f01620801ec9361b761af6c6d28267f25"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\green-v2-final\\tooltests.txt",
+        "bytes": 1047,
+        "sha256": "374f36b0e31ae01773dc659dd06c75010b963a9626008e53ec4f0d45a6e8223a"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-p2-v1\\build.txt",
+        "bytes": 139,
+        "sha256": "5c33f9aa4b24e84235d0c56c6a7342f0a9f403cc8af0854ac568eb6827571eb2"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-p2-v1\\receipt.json",
+        "bytes": 4380,
+        "sha256": "f6555845077f18be9965d3c7393627ec57398e7d4f1580e0e475928c33861841"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-p2-v1\\tooltests.txt",
+        "bytes": 1365,
+        "sha256": "32027d07a5bedf56a70965e9e6a0b231e22fe86bfd5478e78dc9c839432efe14"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-v1\\build.txt",
+        "bytes": 139,
+        "sha256": "5c33f9aa4b24e84235d0c56c6a7342f0a9f403cc8af0854ac568eb6827571eb2"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-v1\\receipt.json",
+        "bytes": 7658,
+        "sha256": "093315754f1fd73f926e9536fe3cb88b2df92a65f2f7f3143a8e4b03685a3346"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\red-v1\\tooltests.txt",
+        "bytes": 2624,
+        "sha256": "28604c8fd5cd0af3756f025238010cbe5dc76da64462ff0d5885374e959591dd"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\registered-v2-final\\ctest.txt",
+        "bytes": 363,
+        "sha256": "0c206d637a6e1e1b0df44d4506c8fe88fe1dfbf6fffa1c5e0e5c11842515b202"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\registered-v2-final\\LastTest.log",
+        "bytes": 1879,
+        "sha256": "4985325411954f465b97d6a2c151fd17748a6b478a1a905d964ce2a08b9a8e31"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\registered-v2-final\\prior-LastTest.log",
+        "bytes": 18258,
+        "sha256": "37c1136d4cab2048e1edc5fcb181fda4808f2293069fbdd86557cc007ea98f36"
+      },
+      {
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\grep-running-20261110\\windows\\registered-v2-final\\receipt.json",
+        "bytes": 3169,
+        "sha256": "35eb256ec5f5d42e49a219bb1bf869e008e2a890fb36e3eb6cffb7d5a40fb4dd"
+      }
+    ],
+    "boundaries": [
+      "Windows final MaiToolTests executed 24 cases once; POSIX FIFO and mode-000 read denial were not compiled or counted.",
+      "Registered ToolLoop and TurnRunner ran once after final production; MaiToolTests was not repeated by CTest.",
+      "Normal dev build and one owned bare-PATH private-data --smoke ran; published packages and existing installed programs were not replaced.",
+      "No source/flags/CMake/version change, package, installation, user process termination, user database read, paid model, IM, GitHub or online deployment action by this worker."
+    ]
+  },
+  "mac": {
+    "installedAppObservation": {
+      "bundle": "com.kongshang.maichat",
+      "version": "2.2.56",
+      "build": "2.2.56",
+      "exeSHA256": "50e8b5bd0db02b4f247879f4e3ef227227631fe11fcae07e70436a33b2deaeba",
+      "pid": 4175
+    },
+    "v2Core": {
+      "sourceManifest": "file-grep-budget-v2-manifest.json",
+      "commands": [
+        {
+          "stage": "build",
+          "command": [
+            "cmake",
+            "--build",
+            "/private/tmp/maichat-pdf-core-gate",
+            "--target",
+            "MaiCoreTests",
+            "MaiInputQueueTests",
+            "MaiFilePathTests",
+            "MaiStoreTests",
+            "MaiModelClientTests",
+            "MaiTurnRunnerTests",
+            "MaiToolTests",
+            "MaiEditToolTests",
+            "MaiApplyPatchToolTests",
+            "MaiQuestionTests",
+            "MaiPermissionTests",
+            "MaiSubAgentTests",
+            "MaiToolLoopTests",
+            "--parallel",
+            "4"
+          ],
+          "pid": 59839,
+          "exit": 0,
+          "seconds": 13.608
+        },
+        {
+          "stage": "ctest",
+          "command": [
+            "ctest",
+            "--test-dir",
+            "/private/tmp/maichat-pdf-core-gate",
+            "-R",
+            "^(MaiCoreTests|MaiInputQueueTests|MaiFilePathTests|MaiStoreTests|MaiModelClientTests|MaiTurnRunnerTests|MaiToolTests|MaiEditToolTests|MaiApplyPatchToolTests|MaiQuestionTests|MaiPermissionTests|MaiSubAgentTests|MaiToolLoopTests)$",
+            "--output-on-failure",
+            "-j",
+            "2",
+            "--timeout",
+            "180"
+          ],
+          "pid": 62811,
+          "exit": 0,
+          "seconds": 160.908
+        }
+      ],
+      "targets": [
+        "MaiCoreTests",
+        "MaiInputQueueTests",
+        "MaiFilePathTests",
+        "MaiStoreTests",
+        "MaiModelClientTests",
+        "MaiTurnRunnerTests",
+        "MaiToolTests",
+        "MaiEditToolTests",
+        "MaiApplyPatchToolTests",
+        "MaiQuestionTests",
+        "MaiPermissionTests",
+        "MaiSubAgentTests",
+        "MaiToolLoopTests"
+      ]
+    },
+    "v2NormalAppBuild": {
+      "sourceManifest": "file-grep-budget-v2-manifest.json",
+      "command": [
+        "cmake",
+        "--build",
+        "/private/tmp/maichat-desktop-portrait-20261105/full-config",
+        "--target",
+        "maichat",
+        "--parallel",
+        "4"
+      ],
+      "exit": 0,
+      "pid": 59840,
+      "seconds": 6.706,
+      "builtExeSHA256": "c9f43ce01b1b0c7936ab5bef5b27608b6c3f41843616eae9cb56a2b4112f8260"
+    },
+    "v2Smoke": {
+      "sourceManifest": "file-grep-budget-v2-manifest.json",
+      "checkedUTC": "2026-11-10T13:47:04.024229+00:00",
+      "command": [
+        "/usr/bin/sandbox-exec",
+        "-f",
+        "/private/tmp/maichat-session-models-20261110/desktop-tests.sb",
+        "/usr/bin/env",
+        "DYLD_PRINT_LIBRARIES=1",
+        "/private/tmp/maichat-desktop-portrait-20261105/full-config/bin/MaiChat.app/Contents/MacOS/MaiChat",
+        "--smoke",
+        "--debug"
+      ],
+      "pid": 76425,
+      "exit": 0,
+      "seconds": 1.742,
+      "exeSHA256": "c9f43ce01b1b0c7936ab5bef5b27608b6c3f41843616eae9cb56a2b4112f8260",
+      "actualVersion": "2.2.56",
+      "nativeCocoa": true,
+      "privateHome": true,
+      "network": "loopback only",
+      "developmentApp": true,
+      "installationChanged": false,
+      "actualQtCocoaModuleLines": [
+        "dyld[76425]: <67E432C7-C3F1-319D-830C-28BA4B8EA9AF> /Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop/qt/.build/macos-arm64/install-widgets-native-images/lib/QtWidgets.framework/Versions/A/QtWidgets",
+        "dyld[76425]: <CFBCF57F-02EF-3D85-9CD2-51B181043D78> /Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop/qt/.build/macos-arm64/install-widgets-native-images/lib/QtConcurrent.framework/Versions/A/QtConcurrent",
+        "dyld[76425]: <D5D161F6-F873-3DAD-9A71-BCAA28DE4DD3> /Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop/qt/.build/macos-arm64/install-widgets-native-images/lib/QtSvg.framework/Versions/A/QtSvg",
+        "dyld[76425]: <10F674E2-9C33-3591-B970-EEAC5E70B060> /Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop/qt/.build/macos-arm64/install-widgets-native-images/lib/QtGui.framework/Versions/A/QtGui",
+        "dyld[76425]: <6467E316-0AE9-374F-B9C4-D15D1DAF8951> /Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop/qt/.build/macos-arm64/install-widgets-native-images/lib/QtCore.framework/Versions/A/QtCore",
+        "dyld[76425]: <D76F47F3-C8F1-3196-ACF8-34A6B65E8691> /Users/hongqingwan/OpenSource/MaiChat/MaiChat/desktop/qt/.build/macos-arm64/install-widgets-native-images/plugins/platforms/libqcocoa.dylib"
+      ],
+      "allSixModulesObserved": true,
+      "logPIDMatchesSpawnedPID": true
+    },
+    "receivedArtifacts": [
+      {
+        "name": "file-grep-budget-v1-manifest.json",
+        "bytes": 1465,
+        "sha256": "42867c7f7a12d86f454f472063012e6342952fa0d275c0d10f50b4c0abb232b0"
+      },
+      {
+        "name": "file-grep-budget-v2-manifest.json",
+        "bytes": 1472,
+        "sha256": "dfd388b3075e4e4afa923f67267410cda8f2f5480b3a3a154598bf7a2d17ce37"
+      },
+      {
+        "name": "red-tool-tests.log",
+        "bytes": 2960,
+        "sha256": "3c1a109ab941cde4f446153fb26c452d23ce1626c75efb7b29f2adbf189bcdaf"
+      },
+      {
+        "name": "red-tool-tests-receipt.json",
+        "bytes": 268,
+        "sha256": "f053ad2a38f34e86fe55c02c7ee9a8458a9ad5236b109c368bd46e851c048107"
+      },
+      {
+        "name": "green-tool-tests.log",
+        "bytes": 1010,
+        "sha256": "4f1410b745f955552fd79d44a3a08455630e50753373a000e64f8d62cbea13a9"
+      },
+      {
+        "name": "green-tool-tests-receipt.json",
+        "bytes": 320,
+        "sha256": "39a3ead49b48bb31b3a75c400e8df6142c9fefd91e751552a67c6e562ae4b2cd"
+      },
+      {
+        "name": "p2-red.log",
+        "bytes": 859,
+        "sha256": "8d9f72ba31abde5e6d39381dfe107587d44dedf09f47ded1c954ac971eef359f"
+      },
+      {
+        "name": "p2-red-receipt.json",
+        "bytes": 3069,
+        "sha256": "4a2b8f88053b7859ad66b16df022f47ac50d56936c7e730b37291b99e3b13818"
+      },
+      {
+        "name": "v2-green-tool-tests.log",
+        "bytes": 1115,
+        "sha256": "e778431087adc18cabc872f10f3a1ac9f1bff41a25bbcd6e4447f2dd08a560f9"
+      },
+      {
+        "name": "v2-green-tool-tests-receipt.json",
+        "bytes": 209,
+        "sha256": "de47e47fdd788fd771d29b55f3b6f77c89cb69c608cd4794de13f183827f0a9e"
+      },
+      {
+        "name": "v2-core13-ctest.log",
+        "bytes": 1499,
+        "sha256": "abe617513ddc19d5dcf1da44d1ab739d90e930517e79e28cf8328256460cb1a7"
+      },
+      {
+        "name": "v2-core13-receipt.json",
+        "bytes": 1604,
+        "sha256": "593d1d6c6274a1cd986af65018b2d25d31ffbcde25b8ae5a166eebd8d88f0b9d"
+      },
+      {
+        "name": "v2-normal-app-build-receipt.json",
+        "bytes": 368,
+        "sha256": "f0cc9b5eb61896ca5bac5ceef1daec246feb6788750dd387350857d2004a7620"
+      },
+      {
+        "name": "v2-dev-smoke-dyld/receipt.json",
+        "bytes": 2056,
+        "sha256": "2049c1183e622975747cb4f60d853e36675dd001a2432f25dd643f926a2e9048"
+      },
+      {
+        "name": "v2-dev-smoke-dyld/console.log",
+        "bytes": 155840,
+        "sha256": "03d92b8fb2dce07fd3879603f1cc6d7c26b50d9bdfb2a87d0871a55489a9ef92"
+      },
+      {
+        "name": "installed-pid4175-sample.txt",
+        "bytes": 382852,
+        "sha256": "68e1a3a1b328d835514014d189af0b9178e7f144e2b11bdb3c9c2716890d9f0a"
+      }
+    ],
+    "diagnosticSHA256": "79c68652971f025d7e533bf08a1798b4b3f03088ca8aa51d1e5b48450f002d80"
+  },
+  "contracts": {
+    "cooperativeSeconds": 5,
+    "visitedEntries": 50000,
+    "totalReadBytes": 33554432,
+    "singleFileBytes": 2097152,
+    "cancelOutcome": "Canceled",
+    "limitedOutcome": "partial; never complete no-match",
+    "exactFileUnsearchedOutcome": "explicit size/metadata/read error",
+    "preemptsSingleBlockingCall": false
+  },
+  "boundaries": [
+    "Original field grep completed; captured later model curl stack is not grep deadlock proof",
+    "Windows excludes POSIX FIFO and mode000 read-denial cases",
+    "Normal development builds only; installed App and public2.2.56 artifacts unchanged",
+    "No header/CMake/version/SDK/flag/package/service change",
+    "No user conversation DB or paid model requests; exact user-directory search not rerun by coordinator"
+  ]
+}
