@@ -80,3 +80,22 @@ MaiResult<bool> maiDesktopWindowIsFocused(const DesktopNativeWindow& window);
 // Input may continue in a menu/HUD owned by the selected window. Text readback
 // and explicit focus verification still require the selected window itself.
 MaiResult<bool> maiDesktopWindowAcceptsInput(const DesktopNativeWindow& window);
+
+#if defined(_WIN32)
+#include "MaiChatTools/DesktopComputerKeys.h"
+
+// Read-only native key resolution shared by dispatch and host diagnostics. The
+// supplied layout is the target thread's HKL; resolving never activates a window
+// or injects input. A valid VK and its scan/extended identity are returned, or a
+// typed error for unsupported hardware/system keys. impliedModifiers only apply
+// to literal characters; named punctuation keys retain their physical identity.
+struct DesktopWindowsKeyBinding {
+    std::uint16_t virtualKey = 0;
+    std::uint16_t scanCode = 0;
+    bool extended = false;
+    std::vector<DesktopKeyModifier> impliedModifiers;
+};
+
+MaiResult<DesktopWindowsKeyBinding> maiDesktopWindowsResolveKey(
+    const DesktopKeyChord& chord, std::uintptr_t keyboardLayout);
+#endif

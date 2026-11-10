@@ -4,6 +4,7 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <Carbon/Carbon.h>
+#include <IOKit/hidsystem/IOLLEvent.h>
 
 #include <algorithm>
 #include <chrono>
@@ -336,9 +337,8 @@ public:
         if ((keyboard && CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, CGKeyCode(code))) ||
             (!keyboard && CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, CGMouseButton(code))))
             return {MaiErrorCode::Busy, "the requested input is already held by the user"};
-        flags_ |= modifier;
         CGEventSetSource(down, source_);
-        CGEventSetFlags(down, effectiveFlags() | extra);
+        CGEventSetFlags(down, effectiveFlags() | modifier | extra);
         CGEventPost(kCGHIDEventTap, down);
         CFRetain(up);
         releases_.push_back({up, modifier, extra, keyboard, code});
@@ -347,7 +347,6 @@ public:
     void release() {
         const Pending pending = releases_.back();
         releases_.pop_back();
-        flags_ &= ~pending.modifier;
         // A physical key/button may have gone down after our synthetic down.
         // Leave that hardware input held; releasing the private source still
         // discards our private state when the action ends.
@@ -406,7 +405,12 @@ public:
 
 private:
     CGEventFlags effectiveFlags() const {
-        return flags_ | CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+        // Both explicitly requested sides may belong to one modifier family.
+        // Recompute from the still-owned downs so releasing RightShift cannot
+        // clear Shift while our LeftShift remains down (or vice versa).
+        CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+        for (const auto& pending : releases_) flags |= pending.modifier;
+        return flags;
     }
     struct Pending {
         CGEventRef event;
@@ -420,56 +424,154 @@ private:
     AXUIElementRef application_ = nullptr;
     AXUIElementRef window_ = nullptr;
     pid_t process_ = 0;
-    CGEventFlags flags_ = 0;
     std::vector<Pending> releases_;
 };
+
+struct NativeModifierFamily {
+    DesktopKeyModifier generic;
+    DesktopKeyModifier left;
+    DesktopKeyModifier right;
+    CGKeyCode leftCode;
+    CGKeyCode rightCode;
+    CGEventFlags familyFlag;
+    CGEventFlags leftFlag;
+    CGEventFlags rightFlag;
+};
+
+const NativeModifierFamily modifierFamilies[] = {
+    {DesktopKeyModifier::Control, DesktopKeyModifier::ControlLeft, DesktopKeyModifier::ControlRight, kVK_Control,
+     kVK_RightControl, kCGEventFlagMaskControl, NX_DEVICELCTLKEYMASK, NX_DEVICERCTLKEYMASK},
+    {DesktopKeyModifier::Shift, DesktopKeyModifier::ShiftLeft, DesktopKeyModifier::ShiftRight, kVK_Shift,
+     kVK_RightShift, kCGEventFlagMaskShift, NX_DEVICELSHIFTKEYMASK, NX_DEVICERSHIFTKEYMASK},
+    {DesktopKeyModifier::Alt, DesktopKeyModifier::AltLeft, DesktopKeyModifier::AltRight, kVK_Option, kVK_RightOption,
+     kCGEventFlagMaskAlternate, NX_DEVICELALTKEYMASK, NX_DEVICERALTKEYMASK},
+    {DesktopKeyModifier::Meta, DesktopKeyModifier::MetaLeft, DesktopKeyModifier::MetaRight, kVK_Command,
+     kVK_RightCommand, kCGEventFlagMaskCommand, NX_DEVICELCMDKEYMASK, NX_DEVICERCMDKEYMASK}};
+
+const NativeModifierFamily* nativeModifierFamily(DesktopKeyModifier modifier) {
+    const DesktopKeyModifier family = maiDesktopModifierFamily(modifier);
+    for (const auto& item : modifierFamilies) {
+        if (item.generic == family) return &item;
+    }
+    return nullptr;
+}
 
 struct NativeKey {
     CGKeyCode code = 0;
     CGEventFlags extra = 0;
     CGEventFlags modifier = 0;
+    std::vector<DesktopKeyModifier> implicitModifiers;
 };
 
 MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key) {
     if (key.key == DesktopKeyCode::Character) {
-        // Resolve through the active layout so Cmd+A does not become Cmd+Q on
-        // AZERTY or another remapped layout. Scan every virtual key position:
-        // Dvorak puts some letters on ANSI punctuation positions. Unsupported
-        // layout keys fail explicitly instead of posting an unrelated shortcut.
+        // Resolve logical characters through the active layout, including the
+        // Command layer used by Dvorak-QWERTY shortcuts. Explicit modifiers keep
+        // their shortcut meaning (Shift+1 is not a request to type a literal 1).
+        // Only add Shift/Option when the character itself needs them. Never use
+        // a keypad substitute or a dead-key sequence as a printable key match.
+        static const CGKeyCode positions[] = {
+            kVK_ANSI_A,         kVK_ANSI_S,     kVK_ANSI_D,           kVK_ANSI_F,     kVK_ANSI_H,
+            kVK_ANSI_G,         kVK_ANSI_Z,     kVK_ANSI_X,           kVK_ANSI_C,     kVK_ANSI_V,
+            kVK_ANSI_B,         kVK_ANSI_Q,     kVK_ANSI_W,           kVK_ANSI_E,     kVK_ANSI_R,
+            kVK_ANSI_Y,         kVK_ANSI_T,     kVK_ANSI_1,           kVK_ANSI_2,     kVK_ANSI_3,
+            kVK_ANSI_4,         kVK_ANSI_6,     kVK_ANSI_5,           kVK_ANSI_Equal, kVK_ANSI_9,
+            kVK_ANSI_7,         kVK_ANSI_Minus, kVK_ANSI_8,           kVK_ANSI_0,     kVK_ANSI_RightBracket,
+            kVK_ANSI_O,         kVK_ANSI_U,     kVK_ANSI_LeftBracket, kVK_ANSI_I,     kVK_ANSI_P,
+            kVK_ANSI_L,         kVK_ANSI_J,     kVK_ANSI_Quote,       kVK_ANSI_K,     kVK_ANSI_Semicolon,
+            kVK_ANSI_Backslash, kVK_ANSI_Comma, kVK_ANSI_Slash,       kVK_ANSI_N,     kVK_ANSI_M,
+            kVK_ANSI_Period,    kVK_ANSI_Grave, kVK_ISO_Section,      kVK_JIS_Yen,    kVK_JIS_Underscore};
+        bool command = false;
+        for (const auto modifier : key.modifiers) {
+            command = command || maiDesktopModifierFamily(modifier) == DesktopKeyModifier::Meta;
+        }
         __block int matched = -1;
+        __block UInt32 required = 0;
         const auto resolve = ^{
-            TISInputSourceRef source = TISCopyCurrentKeyboardLayoutInputSource();
-            if (!source) return;
-            const auto data = static_cast<CFDataRef>(TISGetInputSourceProperty(
-                source, kTISPropertyUnicodeKeyLayoutData));
-            if (data && CFGetTypeID(data) == CFDataGetTypeID()) {
-                const auto* layout = reinterpret_cast<const UCKeyboardLayout*>(
-                    CFDataGetBytePtr(data));
-                const UInt32 modifiers = std::find(key.modifiers.begin(),
-                    key.modifiers.end(), DesktopKeyModifier::Meta) != key.modifiers.end() ?
-                    (cmdKey >> 8) : 0;
-                for (CGKeyCode code = 0; code < 128; ++code) {
-                    UInt32 dead = 0;
-                    UniCharCount count = 0;
-                    UniChar units[4]{};
-                    if (UCKeyTranslate(layout, code, kUCKeyActionDown, modifiers,
-                            UInt32(LMGetKbdType()), kUCKeyTranslateNoDeadKeysMask,
-                            &dead, 4, &count, units) != noErr || count != 1) continue;
-                    UniChar character = units[0];
-                    if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
-                    if (character == key.character) {
-                        matched = code;
-                        break;
-                    }
-                }
-            }
-            CFRelease(source);
+          TISInputSourceRef source = TISCopyCurrentKeyboardLayoutInputSource();
+          if (!source) return;
+          const auto data = static_cast<CFDataRef>(TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData));
+          if (data && CFGetTypeID(data) == CFDataGetTypeID()) {
+              const auto* layout = reinterpret_cast<const UCKeyboardLayout*>(CFDataGetBytePtr(data));
+              const UInt32 combinations[] = {0, shiftKey, optionKey, shiftKey | optionKey};
+              for (const UInt32 combination : combinations) {
+                  for (const CGKeyCode code : positions) {
+                      UInt32 dead = 0;
+                      UniCharCount count = 0;
+                      UniChar units[4]{};
+                      const UInt32 modifiers = (combination | (command ? cmdKey : 0)) >> 8;
+                      if (UCKeyTranslate(layout, code, kUCKeyActionDown, modifiers, UInt32(LMGetKbdType()), 0, &dead, 4,
+                                         &count, units) != noErr ||
+                          dead != 0 || count != 1)
+                          continue;
+                      UniChar character = units[0];
+                      if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
+                      if (character == static_cast<unsigned char>(key.character)) {
+                          matched = code;
+                          required = combination;
+                          break;
+                      }
+                  }
+                  if (matched >= 0) break;
+              }
+              if (matched < 0 && command) {
+                  // Some Command tables suppress Shift in the translated
+                  // text even though the shortcut still has a Shift flag.
+                  // Resolve its glyph separately only when this exact key's
+                  // unshifted identity is unchanged by Command. A layout
+                  // that remaps the key must not borrow an ANSI substitute.
+                  const auto glyph = [layout](CGKeyCode code, UInt32 modifiers, UniChar& value) {
+                      UInt32 dead = 0;
+                      UniCharCount count = 0;
+                      UniChar units[4]{};
+                      const auto status = UCKeyTranslate(layout, code, kUCKeyActionDown, modifiers >> 8,
+                                                         UInt32(LMGetKbdType()), 0, &dead, 4, &count, units);
+                      if (status != noErr || dead || count != 1) return false;
+                      value = units[0];
+                      return true;
+                  };
+                  for (const UInt32 combination : combinations) {
+                      if (!(combination & shiftKey)) continue;
+                      for (const CGKeyCode code : positions) {
+                          UniChar character = 0, base = 0, commandBase = 0, commandShifted = 0;
+                          if (!glyph(code, combination, character)) continue;
+                          if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
+                          if (character != static_cast<unsigned char>(key.character)) continue;
+                          const UInt32 unshifted = combination & ~UInt32(shiftKey);
+                          if (!glyph(code, unshifted, base) || !glyph(code, unshifted | cmdKey, commandBase) ||
+                              !glyph(code, combination | cmdKey, commandShifted) || base != commandBase ||
+                              commandShifted != commandBase)
+                              continue;
+                          matched = code;
+                          required = combination;
+                          break;
+                      }
+                      if (matched >= 0) break;
+                  }
+              }
+          }
+          CFRelease(source);
         };
-        if ([NSThread isMainThread]) resolve();
-        else dispatch_sync(dispatch_get_main_queue(), resolve);
-        if (matched >= 0) return NativeKey{CGKeyCode(matched), 0};
+        if ([NSThread isMainThread])
+            resolve();
+        else
+            dispatch_sync(dispatch_get_main_queue(), resolve);
+        if (matched >= 0) {
+            NativeKey result{CGKeyCode(matched), 0};
+            if (required & shiftKey) result.implicitModifiers.push_back(DesktopKeyModifier::Shift);
+            if (required & optionKey) result.implicitModifiers.push_back(DesktopKeyModifier::Alt);
+            return result;
+        }
         return {MaiErrorCode::NotSupported,
-                "the current macOS keyboard layout cannot map the requested character key"};
+                "the current macOS keyboard layout cannot map this character to a non-dead physical key"};
+    }
+    DesktopKeyModifier modifier;
+    if (maiDesktopKeyModifier(key.key, modifier)) {
+        const auto* family = nativeModifierFamily(modifier);
+        if (!family) return {MaiErrorCode::InvalidInput, "unknown native modifier family"};
+        const bool right = modifier == family->right;
+        return NativeKey{right ? family->rightCode : family->leftCode, 0,
+                         family->familyFlag | (right ? family->rightFlag : family->leftFlag)};
     }
     switch (key.key) {
     case DesktopKeyCode::Enter: return NativeKey{kVK_Return, 0};
@@ -486,11 +588,46 @@ MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key) {
     case DesktopKeyCode::PageUp: return NativeKey{kVK_PageUp, kCGEventFlagMaskSecondaryFn};
     case DesktopKeyCode::PageDown: return NativeKey{kVK_PageDown, kCGEventFlagMaskSecondaryFn};
     case DesktopKeyCode::Space: return NativeKey{kVK_Space, 0};
-    case DesktopKeyCode::Insert: return NativeKey{kVK_Help, kCGEventFlagMaskSecondaryFn};
-    case DesktopKeyCode::Control: return NativeKey{kVK_Control, 0, kCGEventFlagMaskControl};
-    case DesktopKeyCode::Shift: return NativeKey{kVK_Shift, 0, kCGEventFlagMaskShift};
-    case DesktopKeyCode::Alt: return NativeKey{kVK_Option, 0, kCGEventFlagMaskAlternate};
-    case DesktopKeyCode::Meta: return NativeKey{kVK_Command, 0, kCGEventFlagMaskCommand};
+    // Named keys identify physical ANSI/ISO/JIS positions. They do not promise
+    // the glyph printed by a different active keyboard layout.
+    case DesktopKeyCode::Backquote: return NativeKey{kVK_ANSI_Grave, 0};
+    case DesktopKeyCode::Minus: return NativeKey{kVK_ANSI_Minus, 0};
+    case DesktopKeyCode::Equal: return NativeKey{kVK_ANSI_Equal, 0};
+    case DesktopKeyCode::BracketLeft: return NativeKey{kVK_ANSI_LeftBracket, 0};
+    case DesktopKeyCode::BracketRight: return NativeKey{kVK_ANSI_RightBracket, 0};
+    case DesktopKeyCode::Backslash: return NativeKey{kVK_ANSI_Backslash, 0};
+    case DesktopKeyCode::IntlBackslash: return NativeKey{kVK_ISO_Section, 0};
+    case DesktopKeyCode::Semicolon: return NativeKey{kVK_ANSI_Semicolon, 0};
+    case DesktopKeyCode::Quote: return NativeKey{kVK_ANSI_Quote, 0};
+    case DesktopKeyCode::Comma: return NativeKey{kVK_ANSI_Comma, 0};
+    case DesktopKeyCode::Period: return NativeKey{kVK_ANSI_Period, 0};
+    case DesktopKeyCode::Slash: return NativeKey{kVK_ANSI_Slash, 0};
+    case DesktopKeyCode::Numpad0: return NativeKey{kVK_ANSI_Keypad0, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Numpad1: return NativeKey{kVK_ANSI_Keypad1, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Numpad2: return NativeKey{kVK_ANSI_Keypad2, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Numpad3: return NativeKey{kVK_ANSI_Keypad3, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Numpad4: return NativeKey{kVK_ANSI_Keypad4, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Numpad5: return NativeKey{kVK_ANSI_Keypad5, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Numpad6: return NativeKey{kVK_ANSI_Keypad6, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Numpad7: return NativeKey{kVK_ANSI_Keypad7, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Numpad8: return NativeKey{kVK_ANSI_Keypad8, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Numpad9: return NativeKey{kVK_ANSI_Keypad9, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::NumpadAdd: return NativeKey{kVK_ANSI_KeypadPlus, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::NumpadSubtract: return NativeKey{kVK_ANSI_KeypadMinus, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::NumpadMultiply: return NativeKey{kVK_ANSI_KeypadMultiply, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::NumpadDivide: return NativeKey{kVK_ANSI_KeypadDivide, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::NumpadDecimal: return NativeKey{kVK_ANSI_KeypadDecimal, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::NumpadEnter: return NativeKey{kVK_ANSI_KeypadEnter, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::NumpadEqual: return NativeKey{kVK_ANSI_KeypadEquals, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::NumpadComma: return NativeKey{kVK_JIS_KeypadComma, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Clear: return NativeKey{kVK_ANSI_KeypadClear, kCGEventFlagMaskNumericPad};
+    case DesktopKeyCode::Help: return NativeKey{kVK_Help, kCGEventFlagMaskHelp};
+    case DesktopKeyCode::ContextMenu: return NativeKey{kVK_ContextualMenu, 0};
+    case DesktopKeyCode::KanaMode: return NativeKey{kVK_JIS_Kana, 0};
+    case DesktopKeyCode::Eisu: return NativeKey{kVK_JIS_Eisu, 0};
+    case DesktopKeyCode::IntlRo: return NativeKey{kVK_JIS_Underscore, 0};
+    case DesktopKeyCode::IntlYen: return NativeKey{kVK_JIS_Yen, 0};
+    case DesktopKeyCode::Fn: return NativeKey{kVK_Function, 0, kCGEventFlagMaskSecondaryFn};
     case DesktopKeyCode::Function: {
         const CGKeyCode functions[] = {kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5,
             kVK_F6, kVK_F7, kVK_F8, kVK_F9, kVK_F10, kVK_F11, kVK_F12,
@@ -501,31 +638,52 @@ MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key) {
         // Posting Unicode as keycode zero can become an unrelated shortcut.
         return {MaiErrorCode::NotSupported, "macOS native key dispatch supports F1 through F20"};
     }
+    case DesktopKeyCode::CapsLock:
+        // A normal key down/up pair does not prove a persistent CapsLock
+        // toggle. Do not report a momentary modifier as a successful lock.
+        return {MaiErrorCode::NotSupported, "macOS CapsLock toggle is not supported by this input backend"};
     default: break;
     }
-    return {MaiErrorCode::InvalidInput, "unsupported native key"};
+    // Insert is not Help, Clear is not NumLock, and NX media identifiers are
+    // not CGKeyCodes. System/media/browser keys without a verified ordinary
+    // event path fail explicitly instead of changing another key or claiming
+    // that the OS consumed an event it might ignore.
+    return {MaiErrorCode::NotSupported, "this key has no supported native macOS mapping"};
 }
+
+std::vector<DesktopKeyModifier> chordModifiers(const DesktopKeyChord& chord, const NativeKey& key) {
+    std::vector<DesktopKeyModifier> modifiers = chord.modifiers;
+    for (const auto implicit : key.implicitModifiers) {
+        const bool hasFamily = std::any_of(modifiers.begin(), modifiers.end(), [implicit](DesktopKeyModifier value) {
+            return maiDesktopModifierFamily(value) == implicit;
+        });
+        // An explicit right/left side must not be widened to either side by a
+        // generic modifier inferred from character translation.
+        if (!hasFamily) modifiers.push_back(implicit);
+    }
+    return modifiers;
+}
+
+bool hasUnexpectedModifiers(const DesktopKeyChord* chord, const NativeKey* key = nullptr);
 
 MaiError sendChord(InputScope& scope, const DesktopKeyChord& chord) {
     const auto key = nativeKey(chord);
     if (!key) return key.error();
+    if (hasUnexpectedModifiers(&chord, &key.value()))
+        return {MaiErrorCode::Busy, "release modifiers that are not part of the requested action"};
     int held = 0;
-    for (const auto modifier : chord.modifiers) {
-        CGKeyCode code = kVK_Control;
-        CGKeyCode right = kVK_RightControl;
-        CGEventFlags flag = kCGEventFlagMaskControl;
-        switch (modifier) {
-        case DesktopKeyModifier::Control: break;
-        case DesktopKeyModifier::Shift:
-            code = kVK_Shift; right = kVK_RightShift; flag = kCGEventFlagMaskShift; break;
-        case DesktopKeyModifier::Alt:
-            code = kVK_Option; right = kVK_RightOption; flag = kCGEventFlagMaskAlternate; break;
-        case DesktopKeyModifier::Meta:
-            code = kVK_Command; right = kVK_RightCommand; flag = kCGEventFlagMaskCommand; break;
-        }
-        if (CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, code) ||
-            CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, right)) continue;
-        const MaiError sent = scope.key(code, flag, true);
+    for (const auto modifier : chordModifiers(chord, key.value())) {
+        const auto* family = nativeModifierFamily(modifier);
+        if (!family) return {MaiErrorCode::InvalidInput, "unknown native modifier family"};
+        const bool right = modifier == family->right;
+        const CGKeyCode code = right ? family->rightCode : family->leftCode;
+        const bool heldByUser = modifier == family->generic
+                                    ? CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, family->leftCode) ||
+                                          CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, family->rightCode)
+                                    : CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, code);
+        if (heldByUser) continue;
+        const CGEventFlags flags = family->familyFlag | (right ? family->rightFlag : family->leftFlag);
+        const MaiError sent = scope.key(code, flags, true);
         if (sent) return sent;
         ++held;
     }
@@ -573,24 +731,29 @@ bool validPoint(double x, double y) {
     return std::isfinite(x) && std::isfinite(y) && std::abs(x) <= limit && std::abs(y) <= limit;
 }
 
-bool hasUnexpectedModifiers(const DesktopKeyChord* chord) {
+bool hasUnexpectedModifiers(const DesktopKeyChord* chord, const NativeKey* key) {
     const CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
-    const std::pair<DesktopKeyModifier, CGEventFlags> modifiers[] = {
-        {DesktopKeyModifier::Control, kCGEventFlagMaskControl},
-        {DesktopKeyModifier::Shift, kCGEventFlagMaskShift},
-        {DesktopKeyModifier::Alt, kCGEventFlagMaskAlternate},
-        {DesktopKeyModifier::Meta, kCGEventFlagMaskCommand}};
-    for (const auto& item : modifiers) {
-        const bool requestedStandalone =
-            chord && ((item.first == DesktopKeyModifier::Control && chord->key == DesktopKeyCode::Control) ||
-                      (item.first == DesktopKeyModifier::Shift && chord->key == DesktopKeyCode::Shift) ||
-                      (item.first == DesktopKeyModifier::Alt && chord->key == DesktopKeyCode::Alt) ||
-                      (item.first == DesktopKeyModifier::Meta && chord->key == DesktopKeyCode::Meta));
-        if ((flags & item.second) && !requestedStandalone &&
-            (!chord ||
-             std::find(chord->modifiers.begin(), chord->modifiers.end(), item.first) == chord->modifiers.end()))
-            return true;
+    std::vector<DesktopKeyModifier> requested;
+    if (chord) {
+        requested = key ? chordModifiers(*chord, *key) : chord->modifiers;
+        DesktopKeyModifier terminal;
+        if (maiDesktopKeyModifier(chord->key, terminal)) requested.push_back(terminal);
     }
+    const auto allows = [&requested](DesktopKeyModifier modifier) {
+        return std::find(requested.begin(), requested.end(), modifier) != requested.end();
+    };
+    for (const auto& family : modifierFamilies) {
+        const bool generic = allows(family.generic);
+        const bool left =
+            (flags & family.leftFlag) || CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, family.leftCode);
+        const bool right =
+            (flags & family.rightFlag) || CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, family.rightCode);
+        if ((left && !generic && !allows(family.left)) || (right && !generic && !allows(family.right))) return true;
+        // A generic family flag without a proven side cannot satisfy a
+        // side-specific request. Keep that uncertainty fail-closed.
+        if ((flags & family.familyFlag) && !left && !right && !generic) return true;
+    }
+    if ((flags & kCGEventFlagMaskSecondaryFn) && (!chord || chord->key != DesktopKeyCode::Fn)) return true;
     return false;
 }
 
@@ -869,9 +1032,10 @@ MaiError maiDesktopInput(const DesktopNativeInput& input) {
         if (!parsed) return parsed.error();
         chord = parsed.value();
     }
-    // Never turn an ordinary click or text entry into a modified gesture, and
-    // never clear physical modifiers by synthesizing key-up on the user's keys.
-    if (hasUnexpectedModifiers(input.kind == DesktopNativeInputKind::Key ? &chord : nullptr))
+    // Chords check explicit sides and layout-inferred modifiers together in
+    // sendChord. Other actions must never become modified gestures, and never
+    // clear hardware modifiers by manufacturing key-up on the user's keys.
+    if (input.kind != DesktopNativeInputKind::Key && hasUnexpectedModifiers(nullptr))
         return {MaiErrorCode::Busy, "release modifiers that are not part of the requested action"};
     InputScope scope(input);
     const MaiError ready = scope.validate();

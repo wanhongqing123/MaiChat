@@ -134,16 +134,85 @@ DesktopNativeDisplay nativeDisplay(HMONITOR monitor, const MONITORINFO& informat
     return display;
 }
 
-INPUT keyEvent(WORD key, bool up = false) {
+INPUT keyEvent(const DesktopWindowsKeyBinding& key, bool up = false) {
     INPUT event{};
     event.type = INPUT_KEYBOARD;
-    event.ki.wVk = key;
-    if (key == VK_DELETE || key == VK_INSERT || key == VK_HOME || key == VK_END ||
-        key == VK_PRIOR || key == VK_NEXT || key == VK_LEFT || key == VK_RIGHT ||
-        key == VK_UP || key == VK_DOWN || key == VK_LWIN)
-        event.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    event.ki.wVk = key.virtualKey;
+    event.ki.wScan = key.scanCode;
+    if (key.extended) event.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
     if (up) event.ki.dwFlags |= KEYEVENTF_KEYUP;
     return event;
+}
+
+DesktopWindowsKeyBinding virtualKeyBinding(WORD key, HKL layout) {
+    const UINT scan = MapVirtualKeyExW(key, MAPVK_VK_TO_VSC_EX, layout);
+    DesktopWindowsKeyBinding binding;
+    binding.virtualKey = key;
+    binding.scanCode = WORD(scan & 0xff);
+    binding.extended = (scan & 0xff00) == 0xe000;
+    // Some CJK layouts return only the low scan byte even with VK_TO_VSC_EX.
+    // Preserve the independent navigation cluster and other documented E0
+    // identities explicitly; keypad digits keep their separate non-E0 VKs.
+    switch (key) {
+    case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END:
+    case VK_PRIOR: case VK_NEXT: case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+    case VK_RCONTROL: case VK_RMENU: case VK_LWIN: case VK_RWIN: case VK_APPS: case VK_DIVIDE:
+        binding.extended = true;
+        break;
+    default:
+        break;
+    }
+    // NumLock and Pause are distinct VK sequences. Pause is E1, not E0; neither
+    // may inherit KEYEVENTF_EXTENDEDKEY merely because their scan bytes overlap.
+    if (key == VK_NUMLOCK || key == VK_PAUSE) binding.extended = false;
+    if (key == VK_SNAPSHOT) { binding.scanCode = 0x37; binding.extended = true; }
+    return binding;
+}
+
+HKL foregroundLayout() {
+    const DWORD thread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    return thread ? GetKeyboardLayout(thread) : nullptr;
+}
+
+MaiResult<DesktopWindowsKeyBinding> modifierBinding(DesktopKeyModifier modifier, HKL layout) {
+    WORD key = 0;
+    switch (modifier) {
+    case DesktopKeyModifier::Control: key = VK_CONTROL; break;
+    case DesktopKeyModifier::Shift: key = VK_SHIFT; break;
+    case DesktopKeyModifier::Alt: key = VK_MENU; break;
+    case DesktopKeyModifier::Meta: key = VK_LWIN; break;
+    case DesktopKeyModifier::ControlLeft: key = VK_LCONTROL; break;
+    case DesktopKeyModifier::ControlRight: key = VK_RCONTROL; break;
+    case DesktopKeyModifier::ShiftLeft: key = VK_LSHIFT; break;
+    case DesktopKeyModifier::ShiftRight: key = VK_RSHIFT; break;
+    case DesktopKeyModifier::AltLeft: key = VK_LMENU; break;
+    case DesktopKeyModifier::AltRight: key = VK_RMENU; break;
+    case DesktopKeyModifier::MetaLeft: key = VK_LWIN; break;
+    case DesktopKeyModifier::MetaRight: key = VK_RWIN; break;
+    }
+    if (!key) return {MaiErrorCode::NotSupported, "Windows has no native mapping for this modifier"};
+    return virtualKeyBinding(key, layout);
+}
+
+bool modifierPressed(DesktopKeyModifier modifier) {
+    const auto binding = modifierBinding(modifier, GetKeyboardLayout(0));
+    if (!binding) return false;
+    if (modifier == DesktopKeyModifier::Meta)
+        return ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
+    return (GetAsyncKeyState(binding.value().virtualKey) & 0x8000) != 0;
+}
+
+bool hasModifierFamily(const std::vector<DesktopKeyModifier>& modifiers, DesktopKeyModifier family) {
+    return std::any_of(modifiers.begin(), modifiers.end(), [family](DesktopKeyModifier modifier) {
+        return maiDesktopModifierFamily(modifier) == family;
+    });
+}
+
+DesktopKeyChord withImpliedModifiers(DesktopKeyChord chord, const DesktopWindowsKeyBinding& binding) {
+    for (const auto modifier : binding.impliedModifiers)
+        if (!hasModifierFamily(chord.modifiers, maiDesktopModifierFamily(modifier)))
+            chord.modifiers.push_back(modifier);
+    return chord;
 }
 
 MaiError sendInput(INPUT event) {
@@ -251,62 +320,39 @@ private:
     std::vector<INPUT> releases_;
 };
 
-WORD nativeKey(const DesktopKeyChord& key) {
-    switch (key.key) {
-    case DesktopKeyCode::Character: return WORD(key.character);
-    case DesktopKeyCode::Enter: return VK_RETURN;
-    case DesktopKeyCode::Tab: return VK_TAB;
-    case DesktopKeyCode::Escape: return VK_ESCAPE;
-    case DesktopKeyCode::Backspace: return VK_BACK;
-    case DesktopKeyCode::Delete: return VK_DELETE;
-    case DesktopKeyCode::ArrowLeft: return VK_LEFT;
-    case DesktopKeyCode::ArrowRight: return VK_RIGHT;
-    case DesktopKeyCode::ArrowUp: return VK_UP;
-    case DesktopKeyCode::ArrowDown: return VK_DOWN;
-    case DesktopKeyCode::Home: return VK_HOME;
-    case DesktopKeyCode::End: return VK_END;
-    case DesktopKeyCode::PageUp: return VK_PRIOR;
-    case DesktopKeyCode::PageDown: return VK_NEXT;
-    case DesktopKeyCode::Space: return VK_SPACE;
-    case DesktopKeyCode::Insert: return VK_INSERT;
-    case DesktopKeyCode::Function: return WORD(VK_F1 + key.function - 1);
-    case DesktopKeyCode::Control: return VK_CONTROL;
-    case DesktopKeyCode::Shift: return VK_SHIFT;
-    case DesktopKeyCode::Alt: return VK_MENU;
-    case DesktopKeyCode::Meta: return VK_LWIN;
-    }
-    return 0;
-}
-
-MaiError sendChord(InputScope& scope, const DesktopKeyChord& chord) {
+MaiError sendChord(InputScope& scope, const DesktopKeyChord& chord,
+                   const DesktopWindowsKeyBinding& key, HKL layout) {
     int held = 0;
     for (const auto modifier : chord.modifiers) {
-        WORD key = VK_CONTROL;
-        switch (modifier) {
-        case DesktopKeyModifier::Control: key = VK_CONTROL; break;
-        case DesktopKeyModifier::Shift: key = VK_SHIFT; break;
-        case DesktopKeyModifier::Alt: key = VK_MENU; break;
-        case DesktopKeyModifier::Meta: key = VK_LWIN; break;
-        }
-        // Preserve modifiers held by the user; only our downs enter cleanup.
-        const bool pressed = (GetAsyncKeyState(key) & 0x8000) ||
-            (modifier == DesktopKeyModifier::Meta &&
-             (GetAsyncKeyState(VK_RWIN) & 0x8000));
-        if (pressed) continue;
-        const MaiError sent = scope.hold(keyEvent(key), keyEvent(key, true));
+        const auto binding = modifierBinding(modifier, layout);
+        if (!binding) return binding.error();
+        // Generic families borrow either user-held side. Explicit modifiers only
+        // borrow that exact side, and every injected side owns its matching up.
+        if (modifierPressed(modifier)) continue;
+        const MaiError sent = scope.hold(keyEvent(binding.value()), keyEvent(binding.value(), true));
         if (sent) return sent;
         ++held;
     }
-    const WORD key = nativeKey(chord);
-    if (GetAsyncKeyState(key) & 0x8000)
+    DesktopKeyModifier terminal;
+    const bool isModifier = maiDesktopKeyModifier(chord.key, terminal);
+    if (!isModifier && (GetAsyncKeyState(key.virtualKey) & 0x8000))
         return {MaiErrorCode::Busy, "the requested key is already held by the user"};
-    const MaiError tapped = scope.tap(keyEvent(key), keyEvent(key, true));
-    if (tapped) return tapped;
+    if (!isModifier || !modifierPressed(terminal)) {
+        const MaiError tapped = scope.tap(keyEvent(key), keyEvent(key, true));
+        if (tapped) return tapped;
+    }
     while (held-- > 0) {
         const MaiError released = scope.release();
         if (released) return released;
     }
     return scope.validate();
+}
+
+MaiError sendChord(InputScope& scope, const DesktopKeyChord& chord) {
+    const HKL layout = foregroundLayout();
+    const auto binding = maiDesktopWindowsResolveKey(chord, reinterpret_cast<std::uintptr_t>(layout));
+    if (!binding) return binding.error();
+    return sendChord(scope, withImpliedModifiers(chord, binding.value()), binding.value(), layout);
 }
 
 MaiError sendText(InputScope& scope, const std::string& text) {
@@ -331,15 +377,21 @@ bool validPoint(double x, double y) {
 }
 
 bool hasUnexpectedModifiers(const DesktopKeyChord* chord) {
-    const std::pair<DesktopKeyModifier, bool> pressed[] = {
-        {DesktopKeyModifier::Control, (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0},
-        {DesktopKeyModifier::Shift, (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0},
-        {DesktopKeyModifier::Alt, (GetAsyncKeyState(VK_MENU) & 0x8000) != 0},
-        {DesktopKeyModifier::Meta, ((GetAsyncKeyState(VK_LWIN) |
-                                   GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0}};
-    for (const auto& item : pressed) {
-        if (item.second && (!chord || std::find(chord->modifiers.begin(),
-                chord->modifiers.end(), item.first) == chord->modifiers.end())) return true;
+    std::vector<DesktopKeyModifier> requested = chord ? chord->modifiers : std::vector<DesktopKeyModifier>{};
+    DesktopKeyModifier terminal;
+    if (chord && maiDesktopKeyModifier(chord->key, terminal)) requested.push_back(terminal);
+    const std::pair<DesktopKeyModifier, std::pair<DesktopKeyModifier, DesktopKeyModifier>> sides[] = {
+        {DesktopKeyModifier::Control, {DesktopKeyModifier::ControlLeft, DesktopKeyModifier::ControlRight}},
+        {DesktopKeyModifier::Shift, {DesktopKeyModifier::ShiftLeft, DesktopKeyModifier::ShiftRight}},
+        {DesktopKeyModifier::Alt, {DesktopKeyModifier::AltLeft, DesktopKeyModifier::AltRight}},
+        {DesktopKeyModifier::Meta, {DesktopKeyModifier::MetaLeft, DesktopKeyModifier::MetaRight}}};
+    const auto contains = [&](DesktopKeyModifier modifier) {
+        return std::find(requested.begin(), requested.end(), modifier) != requested.end();
+    };
+    for (const auto& family : sides) {
+        if (contains(family.first)) continue;
+        for (const auto side : {family.second.first, family.second.second})
+            if (modifierPressed(side) && !contains(side)) return true;
     }
     return false;
 }
@@ -427,6 +479,85 @@ MaiResult<IUIAutomationElement*> focusedElementForWindow(
 }
 
 } // namespace
+
+MaiResult<DesktopWindowsKeyBinding> maiDesktopWindowsResolveKey(
+    const DesktopKeyChord& chord, std::uintptr_t keyboardLayout) {
+    if (chord.key == DesktopKeyCode::Delete &&
+        hasModifierFamily(chord.modifiers, DesktopKeyModifier::Control) &&
+        hasModifierFamily(chord.modifiers, DesktopKeyModifier::Alt))
+        return {MaiErrorCode::NotSupported, "Ctrl+Alt+Delete is a system secure-attention sequence, not injectable keyboard input"};
+    if (chord.key == DesktopKeyCode::Fn || chord.key == DesktopKeyCode::Eisu ||
+        chord.key == DesktopKeyCode::IntlRo || chord.key == DesktopKeyCode::IntlYen ||
+        chord.key == DesktopKeyCode::NumpadEqual || chord.key == DesktopKeyCode::NumpadComma)
+        return {MaiErrorCode::NotSupported, "Windows has no reliable distinct native mapping for this hardware key"};
+    if (!keyboardLayout)
+        return {MaiErrorCode::NotConfigured, "the target Windows keyboard layout is unavailable"};
+    const HKL layout = reinterpret_cast<HKL>(keyboardLayout);
+    if (chord.key == DesktopKeyCode::Character) {
+        const unsigned char character = static_cast<unsigned char>(chord.character);
+        if ((character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9'))
+            return virtualKeyBinding(character, layout);
+        if (character < '!' || character > '~')
+            return {MaiErrorCode::InvalidInput, "a keyboard character must be printable ASCII"};
+        const SHORT translated = VkKeyScanExW(wchar_t(character), layout);
+        if (translated == -1 || (HIBYTE(translated) & ~7))
+            return {MaiErrorCode::NotSupported, "this character has no native key in the target keyboard layout; use Unicode type for text"};
+        auto binding = virtualKeyBinding(LOBYTE(translated), layout);
+        if (!binding.virtualKey)
+            return {MaiErrorCode::NotSupported, "the target keyboard layout returned an empty virtual key"};
+        if (HIBYTE(translated) & 2) binding.impliedModifiers.push_back(DesktopKeyModifier::Control);
+        if (HIBYTE(translated) & 1) binding.impliedModifiers.push_back(DesktopKeyModifier::Shift);
+        if (HIBYTE(translated) & 4) binding.impliedModifiers.push_back(DesktopKeyModifier::Alt);
+        return binding;
+    }
+    DesktopKeyModifier modifier;
+    if (maiDesktopKeyModifier(chord.key, modifier)) return modifierBinding(modifier, layout);
+    if (chord.key == DesktopKeyCode::Function) {
+        if (chord.function < 1 || chord.function > 24)
+            return {MaiErrorCode::InvalidInput, "Windows function keys are F1 through F24"};
+        return virtualKeyBinding(WORD(VK_F1 + chord.function - 1), layout);
+    }
+    const std::pair<DesktopKeyCode, WORD> keys[] = {
+        {DesktopKeyCode::Enter,VK_RETURN},{DesktopKeyCode::Tab,VK_TAB},{DesktopKeyCode::Escape,VK_ESCAPE},
+        {DesktopKeyCode::Backspace,VK_BACK},{DesktopKeyCode::Delete,VK_DELETE},{DesktopKeyCode::ArrowLeft,VK_LEFT},
+        {DesktopKeyCode::ArrowRight,VK_RIGHT},{DesktopKeyCode::ArrowUp,VK_UP},{DesktopKeyCode::ArrowDown,VK_DOWN},
+        {DesktopKeyCode::Home,VK_HOME},{DesktopKeyCode::End,VK_END},{DesktopKeyCode::PageUp,VK_PRIOR},
+        {DesktopKeyCode::PageDown,VK_NEXT},{DesktopKeyCode::Space,VK_SPACE},{DesktopKeyCode::Insert,VK_INSERT},
+        {DesktopKeyCode::Backquote,VK_OEM_3},{DesktopKeyCode::Minus,VK_OEM_MINUS},{DesktopKeyCode::Equal,VK_OEM_PLUS},
+        {DesktopKeyCode::BracketLeft,VK_OEM_4},{DesktopKeyCode::BracketRight,VK_OEM_6},
+        {DesktopKeyCode::Backslash,VK_OEM_5},{DesktopKeyCode::IntlBackslash,VK_OEM_102},
+        {DesktopKeyCode::Semicolon,VK_OEM_1},{DesktopKeyCode::Quote,VK_OEM_7},{DesktopKeyCode::Comma,VK_OEM_COMMA},
+        {DesktopKeyCode::Period,VK_OEM_PERIOD},{DesktopKeyCode::Slash,VK_OEM_2},
+        {DesktopKeyCode::CapsLock,VK_CAPITAL},{DesktopKeyCode::NumLock,VK_NUMLOCK},{DesktopKeyCode::ScrollLock,VK_SCROLL},
+        {DesktopKeyCode::PrintScreen,VK_SNAPSHOT},{DesktopKeyCode::Pause,VK_PAUSE},{DesktopKeyCode::ContextMenu,VK_APPS},
+        {DesktopKeyCode::Numpad0,VK_NUMPAD0},{DesktopKeyCode::Numpad1,VK_NUMPAD1},{DesktopKeyCode::Numpad2,VK_NUMPAD2},
+        {DesktopKeyCode::Numpad3,VK_NUMPAD3},{DesktopKeyCode::Numpad4,VK_NUMPAD4},{DesktopKeyCode::Numpad5,VK_NUMPAD5},
+        {DesktopKeyCode::Numpad6,VK_NUMPAD6},{DesktopKeyCode::Numpad7,VK_NUMPAD7},{DesktopKeyCode::Numpad8,VK_NUMPAD8},
+        {DesktopKeyCode::Numpad9,VK_NUMPAD9},{DesktopKeyCode::NumpadAdd,VK_ADD},
+        {DesktopKeyCode::NumpadSubtract,VK_SUBTRACT},{DesktopKeyCode::NumpadMultiply,VK_MULTIPLY},
+        {DesktopKeyCode::NumpadDivide,VK_DIVIDE},{DesktopKeyCode::NumpadDecimal,VK_DECIMAL},
+        {DesktopKeyCode::NumpadEnter,VK_RETURN},{DesktopKeyCode::Clear,VK_CLEAR},{DesktopKeyCode::Help,VK_HELP},
+        {DesktopKeyCode::Convert,VK_CONVERT},{DesktopKeyCode::NonConvert,VK_NONCONVERT},{DesktopKeyCode::KanaMode,VK_KANA},
+        {DesktopKeyCode::VolumeMute,VK_VOLUME_MUTE},{DesktopKeyCode::VolumeDown,VK_VOLUME_DOWN},
+        {DesktopKeyCode::VolumeUp,VK_VOLUME_UP},{DesktopKeyCode::MediaPlayPause,VK_MEDIA_PLAY_PAUSE},
+        {DesktopKeyCode::MediaStop,VK_MEDIA_STOP},{DesktopKeyCode::MediaNext,VK_MEDIA_NEXT_TRACK},
+        {DesktopKeyCode::MediaPrevious,VK_MEDIA_PREV_TRACK},{DesktopKeyCode::BrowserBack,VK_BROWSER_BACK},
+        {DesktopKeyCode::BrowserForward,VK_BROWSER_FORWARD},{DesktopKeyCode::BrowserRefresh,VK_BROWSER_REFRESH},
+        {DesktopKeyCode::BrowserStop,VK_BROWSER_STOP},{DesktopKeyCode::BrowserSearch,VK_BROWSER_SEARCH},
+        {DesktopKeyCode::BrowserFavorites,VK_BROWSER_FAVORITES},{DesktopKeyCode::BrowserHome,VK_BROWSER_HOME},
+        {DesktopKeyCode::LaunchMail,VK_LAUNCH_MAIL},{DesktopKeyCode::LaunchMedia,VK_LAUNCH_MEDIA_SELECT},
+        {DesktopKeyCode::LaunchApp1,VK_LAUNCH_APP1},{DesktopKeyCode::LaunchApp2,VK_LAUNCH_APP2}};
+    for (const auto& item : keys) {
+        if (item.first != chord.key) continue;
+        auto binding = virtualKeyBinding(item.second, layout);
+        if (chord.key == DesktopKeyCode::NumpadEnter) {
+            binding.scanCode = 0x1c;
+            binding.extended = true;
+        }
+        return binding;
+    }
+    return {MaiErrorCode::NotSupported, "Windows has no native mapping for this key"};
+}
 
 MaiResult<std::vector<DesktopNativeDisplay>> maiDesktopDisplays() {
     DpiScope dpi;
@@ -641,10 +772,16 @@ MaiError maiDesktopInput(const DesktopNativeInput& input) {
     if (input.desktopScope && (!input.display.id || input.display.id > std::numeric_limits<std::uintptr_t>::max()))
         return {MaiErrorCode::InvalidInput, "display identity must be a non-zero native monitor identifier"};
     DesktopKeyChord chord;
+    DesktopWindowsKeyBinding keyBinding;
+    HKL keyLayout = nullptr;
     if (input.kind == DesktopNativeInputKind::Key) {
         const auto parsed = maiDesktopParseKey(input.key);
         if (!parsed) return parsed.error();
-        chord = parsed.value();
+        keyLayout = foregroundLayout();
+        const auto resolved = maiDesktopWindowsResolveKey(parsed.value(), reinterpret_cast<std::uintptr_t>(keyLayout));
+        if (!resolved) return resolved.error();
+        keyBinding = resolved.value();
+        chord = withImpliedModifiers(parsed.value(), keyBinding);
     }
     // Extra physical modifiers change the requested action (for example a
     // Ctrl-click or a different shortcut). Preserve those user keys and wait.
@@ -655,7 +792,7 @@ MaiError maiDesktopInput(const DesktopNativeInput& input) {
     InputScope scope(input);
     const MaiError ready = scope.validate();
     if (ready) return ready;
-    if (input.kind == DesktopNativeInputKind::Key) return sendChord(scope, chord);
+    if (input.kind == DesktopNativeInputKind::Key) return sendChord(scope, chord, keyBinding, keyLayout);
     if (input.kind == DesktopNativeInputKind::Type)
         return sendText(scope, input.text);
     if (input.kind == DesktopNativeInputKind::ReplaceFocusedText) {
@@ -663,8 +800,10 @@ MaiError maiDesktopInput(const DesktopNativeInput& input) {
         const MaiError selected = sendChord(scope, select.value());
         if (selected) return selected;
         // Replacing with an empty value must delete the selection explicitly.
-        if (input.text.empty())
-            return scope.tap(keyEvent(VK_BACK), keyEvent(VK_BACK, true));
+        if (input.text.empty()) {
+            const auto backspace = virtualKeyBinding(VK_BACK, foregroundLayout());
+            return scope.tap(keyEvent(backspace), keyEvent(backspace, true));
+        }
         return sendText(scope, input.text);
     }
     // Moving a pointer while the user holds another button can drag their

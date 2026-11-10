@@ -72,6 +72,7 @@ public:
     bool ownedPopup = false;
     bool requirePopupForKey = false;
     int activationCount = 0;
+    int windowsCount = 0;
     int captureCount = 0;
     int displayCaptureCount = 0;
     int captureOptionsCount = 0;
@@ -96,6 +97,7 @@ public:
     std::function<MaiError(const CaptureOptions&)> onDisplayCaptureOptions;
 
     MaiResult<std::vector<DesktopNativeWindow>> windows() override {
+        ++windowsCount;
         events.push_back("windows");
         return visible;
     }
@@ -1051,7 +1053,7 @@ void verifyDisplayToolRejectsMixedTargetsAndInvalidIds() {
 }
 
 void verifyDisplayToolRejectsTextModelsBeforeNativeAccess() {
-    for (const std::string model : {"glm-5.3", "local:qa"}) {
+    for (const std::string model : {"glm-5.3", "deepseek-v4-pro", "local:qa"}) {
         DisplayToolFixture fixture;
         if (!fixture.tool) continue;
         // Seed a valid ordinary observation: failure must be the model gate,
@@ -1064,6 +1066,9 @@ void verifyDisplayToolRejectsTextModelsBeforeNativeAccess() {
         if (!first.is_object()) continue;
         fixture.context.model = model;
         const int captures = fixture.backend->displayCaptureCount;
+        const auto events = fixture.backend->events.size();
+        const int windows = fixture.backend->windowsCount;
+        const int captureOptions = fixture.backend->captureOptionsCount;
         const auto deniedObserve =
             fixture.tool->execute(R"({"action":"observe","target":"display","display_id":"22"})", fixture.context);
         CHECK(deniedObserve.hasError());
@@ -1078,6 +1083,9 @@ void verifyDisplayToolRejectsTextModelsBeforeNativeAccess() {
         CHECK(deniedInput.hasError());
         if (deniedInput.hasError()) CHECK(deniedInput.error().code() == MaiErrorCode::NotSupported);
         CHECK(fixture.backend->displayCaptureCount == captures);
+        CHECK(fixture.backend->captureOptionsCount == captureOptions);
+        CHECK(fixture.backend->windowsCount == windows);
+        CHECK(fixture.backend->events.size() == events);
         CHECK(fixture.backend->inputs.empty());
         CHECK(fixture.backend->activationCount == 0);
         // Metadata-only window observation remains usable by these models.
@@ -1158,7 +1166,8 @@ void verifySecureKeyboardInput() {
         CHECK(fixture.backend->inputs.empty());
     }
     // Navigating away from a protected field remains available without writing it.
-    for (const char* key : {"Tab", "Escape"}) {
+    for (const char* key : {"Tab", "Escape", "ControlRight", "ShiftLeft", "AltRight", "MetaRight",
+             "Ctrl+Shift", "ControlLeft+ControlRight"}) {
         Fixture fixture;
         auto action = fixture.observe("key");
         action.key = key;
@@ -1166,6 +1175,49 @@ void verifySecureKeyboardInput() {
         CHECK(fixture.controller.perform("owner", action));
         CHECK(fixture.backend->inputs.size() == 1);
     }
+}
+
+void verifyNativeInputFailureRequiresObservation() {
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        auto action = display ? fixture.observeDisplay("key") : fixture.observe("key");
+        action.key = "Enter";
+        const auto code = display ? MaiErrorCode::Internal : MaiErrorCode::Busy;
+        const std::string detail = display ? "owned display native error after input began"
+                                           : "owned window native error after input began";
+        // The native seam may fail after part of a key batch reached the OS.
+        // Preserve that uncertainty so the next decision observes the current
+        // application, instead of treating a tool error as proof of no input.
+        fixture.backend->inputError = {code, detail};
+        const auto failed = fixture.controller.perform("owner", action);
+        CHECK(!failed);
+        if (!failed) {
+            CHECK(failed.error().code() == code);
+            CHECK(failed.error().message().find(
+                "Input may have been partially delivered. Observe the current application state before deciding whether to retry. Native error: ") == 0);
+            CHECK(failed.error().message().find(detail) != std::string::npos);
+        }
+        CHECK(fixture.backend->inputs.size() == 1);
+        fixture.backend->inputError = {};
+        const auto replay = fixture.controller.perform("owner", action);
+        CHECK(!replay);
+        if (!replay) CHECK(replay.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(fixture.backend->inputs.size() == 1);
+    }
+    // A failure before native input remains precise; it must not imply that a
+    // keyboard event might have been delivered when activation itself failed.
+    Fixture fixture;
+    auto action = fixture.observe("key");
+    action.key = "Enter";
+    const std::string detail = "owned activation denied before input";
+    fixture.backend->activationError = {MaiErrorCode::Busy, detail};
+    const auto denied = fixture.controller.perform("owner", action);
+    CHECK(!denied);
+    if (!denied) {
+        CHECK(denied.error().code() == MaiErrorCode::Busy);
+        CHECK(denied.error().message() == detail);
+    }
+    CHECK(fixture.backend->inputs.empty());
 }
 
 void verifyKeyGrammar() {
@@ -1186,7 +1238,7 @@ void verifyKeyGrammar() {
                                   "Super+A", "Enter", "Tab", "Escape", "Delete",
                                   "Backspace", "ArrowLeft", "ArrowRight", "ArrowUp",
                                   "ArrowDown", "PageUp", "PageDown", "Space", "Insert",
-                                  "End", "F1", "F24", "9"}) {
+                                  "End", "F1", "F24", "9", "Ctrl+Shift", "Alt+Shift"}) {
         const auto parsed = maiDesktopParseKey(shortcut);
         CHECK(parsed);
     }
@@ -1203,12 +1255,207 @@ void verifyKeyGrammar() {
     }
     for (const std::string& invalid :
          {std::string(), std::string("Ctrl+"), std::string("+A"), std::string("Ctrl++A"), std::string("Ctrl+Control+A"),
-          std::string("Cmd+Meta+A"), std::string("Ctrl+A+B"), std::string("Shift+Ctrl"), std::string("F0"),
+           std::string("Cmd+Meta+A"), std::string("Ctrl+A+B"), std::string("F0"),
           std::string("F25"), std::string("Hyper+A"), std::string("\xe4\xb8\xad")}) {
         const auto parsed = maiDesktopParseKey(invalid);
         CHECK(!parsed);
         if (!parsed) CHECK(parsed.error().code() == MaiErrorCode::InvalidInput);
     }
+}
+
+void verifyExpandedKeyGrammar() {
+    // Key chords describe hardware operations; Unicode text (including Chinese)
+    // remains the separate type action. Punctuation glyphs and physical names
+    // must both reach native mapping without conflating Equal with NumpadAdd.
+    for (char character = '!'; character <= '~'; ++character) {
+        const auto parsed = maiDesktopParseKey(std::string(1, character));
+        if (!parsed) std::fprintf(stderr, "printable key rejected: %c\n", character);
+        CHECK(parsed);
+        if (parsed) {
+            const char expected = character >= 'a' && character <= 'z' ? char(character - 'a' + 'A') : character;
+            CHECK(parsed.value().key == DesktopKeyCode::Character);
+            CHECK(parsed.value().character == expected);
+        }
+    }
+    const auto plus = maiDesktopParseKey("Ctrl++");
+    CHECK(plus);
+    if (plus) {
+        CHECK(plus.value().key == DesktopKeyCode::Character);
+        CHECK(plus.value().character == '+');
+        CHECK(plus.value().modifiers == std::vector<DesktopKeyModifier>{DesktopKeyModifier::Control});
+    }
+    for (const char* key : {"Plus", "Option+Return", "Win+R", "Windows+R", "Esc", "Del", "PgUp", "PgDn",
+             "Backquote", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "IntlBackslash",
+             "Semicolon", "Quote", "Comma", "Period", "Slash", "CapsLock", "NumLock", "ScrollLock",
+             "PrintScreen", "Pause", "ContextMenu", "Numpad0", "Numpad1", "Numpad2", "Numpad3",
+             "Numpad4", "Numpad5", "Numpad6", "Numpad7", "Numpad8", "Numpad9", "NumpadAdd",
+             "NumpadSubtract", "NumpadMultiply", "NumpadDivide", "NumpadDecimal", "NumpadEnter",
+             "NumpadEqual", "NumpadComma", "Clear", "Help", "Convert", "NonConvert", "KanaMode", "Eisu",
+             "IntlRo", "IntlYen", "ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "AltLeft",
+             "AltRight", "MetaLeft", "MetaRight", "Fn", "VolumeMute", "VolumeDown", "VolumeUp",
+             "MediaPlayPause", "MediaStop", "MediaNext", "MediaPrevious", "BrowserBack", "BrowserForward",
+             "BrowserRefresh", "BrowserStop", "BrowserSearch", "BrowserFavorites", "BrowserHome",
+             "LaunchMail", "LaunchMedia", "LaunchApp1", "LaunchApp2", "LeftCtrl+RightCtrl",
+             "ControlLeft+ControlRight+A", "LeftShift+RightAlt+Enter"}) {
+        const auto parsed = maiDesktopParseKey(key);
+        if (!parsed) std::fprintf(stderr, "named key rejected: %s\n", key);
+        CHECK(parsed);
+    }
+    for (const char* invalid : {"Ctrl+++", "Ctrl++A", "Ctrl+ControlLeft+A", "ShiftLeft+ShiftLeft+A",
+             "MetaRight+RightCmd+A", "AltLeft+Option+A", "ControlLeft+Ctrl", "ControlRight+RightCtrl"}) {
+        const auto parsed = maiDesktopParseKey(invalid);
+        CHECK(!parsed);
+        if (!parsed) CHECK(parsed.error().code() == MaiErrorCode::InvalidInput);
+    }
+}
+
+void verifyKeyIdentityAndCatalog() {
+    // Distinguish logical printable input from its physical main/numpad key.
+    const auto literal = maiDesktopParseKey("=");
+    const auto physical = maiDesktopParseKey("Equal");
+    const auto numpad = maiDesktopParseKey("NumpadEqual");
+    CHECK(literal && physical && numpad);
+    if (literal && physical && numpad) {
+        CHECK(literal.value().key == DesktopKeyCode::Character);
+        CHECK(literal.value().character == '=');
+        CHECK(physical.value().key == DesktopKeyCode::Equal);
+        CHECK(numpad.value().key == DesktopKeyCode::NumpadEqual);
+    }
+    const auto plusAlias = maiDesktopParseKey("Ctrl+Plus");
+    CHECK(plusAlias);
+    if (plusAlias) {
+        CHECK(plusAlias.value().key == DesktopKeyCode::Character);
+        CHECK(plusAlias.value().character == '+');
+        CHECK(plusAlias.value().modifiers == std::vector<DesktopKeyModifier>{DesktopKeyModifier::Control});
+    }
+    const std::pair<const char*, DesktopKeyCode> identities[] = {
+        {"NumpadEnter", DesktopKeyCode::NumpadEnter}, {"Enter", DesktopKeyCode::Enter},
+        {"NumpadAdd", DesktopKeyCode::NumpadAdd}, {"Numpad0", DesktopKeyCode::Numpad0},
+        {"Numpad9", DesktopKeyCode::Numpad9}, {"CapsLock", DesktopKeyCode::CapsLock},
+        {"PrintScreen", DesktopKeyCode::PrintScreen}, {"Pause", DesktopKeyCode::Pause},
+        {"IntlRo", DesktopKeyCode::IntlRo}, {"IntlYen", DesktopKeyCode::IntlYen},
+        {"VolumeUp", DesktopKeyCode::VolumeUp}, {"BrowserBack", DesktopKeyCode::BrowserBack},
+        {"LaunchApp2", DesktopKeyCode::LaunchApp2}};
+    for (const auto& identity : identities) {
+        const auto parsed = maiDesktopParseKey(identity.first);
+        CHECK(parsed);
+        if (parsed) CHECK(parsed.value().key == identity.second);
+    }
+
+    struct ModifierCase {
+        const char* name;
+        DesktopKeyCode key;
+        DesktopKeyModifier modifier;
+        DesktopKeyModifier family;
+    };
+    const ModifierCase modifiers[] = {
+        {"Control", DesktopKeyCode::Control, DesktopKeyModifier::Control, DesktopKeyModifier::Control},
+        {"Shift", DesktopKeyCode::Shift, DesktopKeyModifier::Shift, DesktopKeyModifier::Shift},
+        {"Alt", DesktopKeyCode::Alt, DesktopKeyModifier::Alt, DesktopKeyModifier::Alt},
+        {"Meta", DesktopKeyCode::Meta, DesktopKeyModifier::Meta, DesktopKeyModifier::Meta},
+        {"ControlLeft", DesktopKeyCode::ControlLeft, DesktopKeyModifier::ControlLeft, DesktopKeyModifier::Control},
+        {"ControlRight", DesktopKeyCode::ControlRight, DesktopKeyModifier::ControlRight, DesktopKeyModifier::Control},
+        {"ShiftLeft", DesktopKeyCode::ShiftLeft, DesktopKeyModifier::ShiftLeft, DesktopKeyModifier::Shift},
+        {"ShiftRight", DesktopKeyCode::ShiftRight, DesktopKeyModifier::ShiftRight, DesktopKeyModifier::Shift},
+        {"AltLeft", DesktopKeyCode::AltLeft, DesktopKeyModifier::AltLeft, DesktopKeyModifier::Alt},
+        {"AltRight", DesktopKeyCode::AltRight, DesktopKeyModifier::AltRight, DesktopKeyModifier::Alt},
+        {"MetaLeft", DesktopKeyCode::MetaLeft, DesktopKeyModifier::MetaLeft, DesktopKeyModifier::Meta},
+        {"MetaRight", DesktopKeyCode::MetaRight, DesktopKeyModifier::MetaRight, DesktopKeyModifier::Meta}};
+    for (const auto& item : modifiers) {
+        const auto parsed = maiDesktopParseKey(item.name);
+        CHECK(parsed);
+        if (parsed) CHECK(parsed.value().key == item.key);
+        DesktopKeyModifier found = DesktopKeyModifier::Control;
+        CHECK(maiDesktopKeyModifier(item.key, found));
+        CHECK(found == item.modifier);
+        CHECK(maiDesktopModifierFamily(found) == item.family);
+    }
+    DesktopKeyModifier unchanged = DesktopKeyModifier::Alt;
+    CHECK(!maiDesktopKeyModifier(DesktopKeyCode::Enter, unchanged));
+    CHECK(unchanged == DesktopKeyModifier::Alt);
+    const auto opposite = maiDesktopParseKey("LeftCtrl+RightCtrl");
+    CHECK(opposite);
+    if (opposite) {
+        CHECK(opposite.value().modifiers == std::vector<DesktopKeyModifier>{DesktopKeyModifier::ControlLeft});
+        CHECK(opposite.value().key == DesktopKeyCode::ControlRight);
+    }
+    const auto chord = maiDesktopParseKey(" rightctrl + LEFTSHIFT + ? ");
+    CHECK(chord);
+    if (chord) {
+        const std::vector<DesktopKeyModifier> expected{DesktopKeyModifier::ControlRight, DesktopKeyModifier::ShiftLeft};
+        CHECK(chord.value().modifiers == expected);
+        CHECK(chord.value().character == '?');
+    }
+    for (const char* invalid : {" ", "\t", "Ctrl+ ", "Ctrl+Control", "Shift+Shift", "Ctrl+ControlRight+Enter"}) {
+        CHECK(!maiDesktopParseKey(invalid));
+    }
+
+    const auto& names = maiDesktopKeyNames();
+    CHECK(!names.empty());
+    for (auto iterator = names.begin(); iterator != names.end(); ++iterator) {
+        CHECK(maiDesktopParseKey(*iterator));
+        CHECK(std::find(iterator + 1, names.end(), *iterator) == names.end());
+    }
+    for (const char* name : {"+", "=", "A", "0", "F24", "Space", "Equal", "NumpadEnter", "ControlRight", "LaunchApp2"})
+        CHECK(std::find(names.begin(), names.end(), name) != names.end());
+}
+
+void verifyKeyCatalogTool() {
+    auto backend = std::make_shared<RecordingBackend>();
+    auto controller = std::make_shared<DesktopComputerController>(backend);
+    MaiToolRegistry registry;
+    registerDesktopComputerTools(registry, controller);
+    MaiTool* tool = registry.find("desktop_computer");
+    CHECK(tool);
+    if (!tool) return;
+    const auto schema = Json::parse(tool->parametersSchema(), nullptr, false);
+    CHECK(schema.is_object());
+    if (schema.is_object()) {
+        CHECK(contains(schema["properties"]["action"]["enum"], "list_keys"));
+        CHECK(schema["properties"]["key"].value("maxLength", 0) == 128);
+    }
+    MaiToolContext context;
+    context.sessionId = "catalog-no-observation";
+    // Capabilities are ordinary metadata: no observation token, workspace,
+    // display, window enumeration, capture, activation or native input is needed.
+    const auto catalog = tool->execute(R"({"action":"list_keys"})", context);
+    CHECK(!catalog.hasError());
+    CHECK(catalog.images().empty());
+    CHECK(!catalog.isTruncated());
+    if (!catalog.hasError()) {
+        const auto output = Json::parse(catalog.output(), nullptr, false);
+        CHECK(output.is_object());
+        if (output.is_object()) {
+            for (const char* name : {"ControlRight", "NumpadEnter", "Equal", "Plus", "VolumeMute"})
+                CHECK(contains(output.value("key_names", Json::array()), name));
+            CHECK(output.value("text_action", std::string()) == "type");
+            CHECK(output.value("native_support_checked_at_dispatch", false));
+        }
+    }
+    for (const auto& extra : {Json{{"text", "do not type"}}, Json{{"key", "Enter"}},
+             Json{{"target", "display"}}, Json{{"window_id", "1"}}, Json{{"snapshot_id", "unused"}}}) {
+        Json arguments{{"action", "list_keys"}};
+        arguments.update(extra);
+        const auto rejected = tool->execute(arguments.dump(), context);
+        CHECK(rejected.hasError());
+        if (rejected.hasError()) CHECK(rejected.error().code() == MaiErrorCode::InvalidInput);
+    }
+    std::atomic<bool> canceled{true};
+    context.cancel = &canceled;
+    const auto stopped = tool->execute(R"({"action":"list_keys"})", context);
+    CHECK(stopped.hasError());
+    if (stopped.hasError()) CHECK(stopped.error().code() == MaiErrorCode::Canceled);
+    context.cancel = nullptr;
+    context.sessionId.clear();
+    const auto ownerless = tool->execute(R"({"action":"list_keys"})", context);
+    CHECK(ownerless.hasError());
+    if (ownerless.hasError()) CHECK(ownerless.error().code() == MaiErrorCode::NotConfigured);
+    CHECK(backend->windowsCount == 0);
+    CHECK(backend->activationCount == 0);
+    CHECK(backend->captureCount == 0);
+    CHECK(backend->displayCaptureCount == 0);
+    CHECK(backend->inputs.empty());
+    CHECK(backend->events.empty());
 }
 
 void verifyWindowSelection() {
@@ -1743,6 +1990,9 @@ int main(int argc, char** argv) {
     verifyDisplayToolWorkspaceChangeRejectsOldToken();
     verifyPublicContract();
     verifyKeyGrammar();
+    verifyExpandedKeyGrammar();
+    verifyKeyIdentityAndCatalog();
+    verifyKeyCatalogTool();
     verifySecureKeyboardInput();
     verifyWindowSelection();
     verifyScreenshotHandoff();
@@ -1755,6 +2005,7 @@ int main(int argc, char** argv) {
     verifyTextAndReadback();
     verifyIdentityAndSyntaxFailures();
     verifyFailureAndCancellationBoundaries();
+    verifyNativeInputFailureRequiresObservation();
 
     if (failures != 0) {
         std::fprintf(stderr, "desktop computer contract failures: %d\n", failures);

@@ -21,6 +21,7 @@
 #include <json.hpp>
 
 #include "MaiChatTools/DesktopComputerPlatform.h"
+#include "MaiCloudModelCatalog.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
@@ -162,8 +163,17 @@ bool validText(const std::string& text, bool allowEmpty) {
     return decoded.toUtf8().toStdString() == text;
 }
 
+MaiError inputDispatchFailure(const MaiError& error) {
+    // A native error can follow a successful down/character and a failed up,
+    // focus check or cancellation. Preserve the code/detail, but do not tell
+    // callers that nothing happened or encourage repeating a state-changing key.
+    return {error.code(), "Input may have been partially delivered. Observe the current application state "
+                          "before deciding whether to retry. Native error: " + error.message()};
+}
+
 bool desktopLauncherKey(const DesktopKeyChord& chord) {
-    if (chord.modifiers.size() != 1 || chord.modifiers.front() != DesktopKeyModifier::Meta) return false;
+    if (chord.modifiers.size() != 1 ||
+        maiDesktopModifierFamily(chord.modifiers.front()) != DesktopKeyModifier::Meta) return false;
     // Shell launchers are valid even when there is no focused AX/UIA control.
     // Keep the exception exact: arbitrary Meta chords may still edit or paste.
 #if defined(Q_OS_MAC)
@@ -548,9 +558,9 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         // value just like type(). Only navigation away is exempt from the
         // same secure-input check; raw character keys cannot bypass it.
         const auto key = parsed.value().key;
+        DesktopKeyModifier modifier;
         keyNeedsInputCheck = key != DesktopKeyCode::Tab && key != DesktopKeyCode::Escape &&
-                             key != DesktopKeyCode::Control && key != DesktopKeyCode::Shift &&
-                             key != DesktopKeyCode::Alt && key != DesktopKeyCode::Meta;
+                             !maiDesktopKeyModifier(key, modifier);
         if (request.desktopScope && desktopLauncherKey(parsed.value())) keyNeedsInputCheck = false;
     }
     if (action == "scroll" && (request.scrollLines == 0 || request.scrollLines < -10 || request.scrollLines > 10))
@@ -616,7 +626,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         state->token.clear();
         DesktopInputBatch inputBatch;
         const MaiError sent = impl_->backend->input(input);
-        if (sent) return sent;
+        if (sent) return inputDispatchFailure(sent);
         inputBatch.finish();
         receipt.state = "dispatched";
         receipt.dispatched = true;
@@ -712,8 +722,9 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
                  : action == "key"          ? DesktopNativeInputKind::Key
                                             : DesktopNativeInputKind::Scroll;
     const MaiError sent = impl_->backend->input(input);
-    if (sent) return sent;
-    if (canceled()) return {MaiErrorCode::Canceled, "computer operation canceled"};
+    if (sent) return inputDispatchFailure(sent);
+    if (canceled())
+        return inputDispatchFailure({MaiErrorCode::Canceled, "computer operation canceled after input dispatch"});
     receipt.state = "dispatched";
     receipt.dispatched = true;
     return receipt;
@@ -752,7 +763,13 @@ public:
                "Use the screenshot tool for screen images. "
                "Use window-relative 0..1 coordinates for "
                "click, double_click, right_click, drag and scroll; focus activates that window. "
-               "key accepts shortcuts such as Ctrl+A, Cmd+A or Shift+Home. type enters Unicode; "
+               "list_keys returns the accepted shared keyboard names without observing or injecting input. "
+               "Native platform support is checked before dispatch; an unavailable key is not replaced "
+               "with a different key. key accepts named keys and chords such as Ctrl+A, Cmd+A, "
+               "Ctrl+Shift, ControlRight+F4 or Ctrl+Plus. Named Equal/Minus refer to physical keys; "
+               "literal punctuation resolves through the current layout. NumpadEnter is distinct "
+               "from Enter. type enters Unicode text, including Chinese and emoji; use it for text "
+               "instead of spelling characters as hardware keys. "
                "replace_text selects all in the focused editable control then types the replacement "
                "(an empty string deletes its text). Re-observe after every operation before reusing "
                "the window. verify reads the focused non-password control and compares expected_text; "
@@ -766,7 +783,7 @@ public:
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{
-          "action":{"type":"string","enum":["list","list_displays","observe","focus","move","click","double_click","right_click","drag","type","replace_text","key","scroll","verify","clear"]},
+          "action":{"type":"string","enum":["list","list_displays","list_keys","observe","focus","move","click","double_click","right_click","drag","type","replace_text","key","scroll","verify","clear"]},
           "target":{"type":"string","enum":["window","display"]},"display_id":{"type":"string"},
           "window_title":{"type":"string","maxLength":500},"window_id":{"type":"string"},
           "include_elements":{"type":"boolean"},"snapshot_id":{"type":"string"},
@@ -775,7 +792,7 @@ public:
           "to_x_ratio":{"type":"number","minimum":0,"maximum":1},"to_y_ratio":{"type":"number","minimum":0,"maximum":1},
           "duration_ms":{"type":"integer","minimum":1,"maximum":5000},
           "text":{"type":"string","minLength":0,"maxLength":4000},
-          "key":{"type":"string","minLength":1,"maxLength":64,"description":"Single key or modifier chord, e.g. Ctrl+A, Cmd+A, Shift+Home"},
+          "key":{"type":"string","minLength":1,"maxLength":128,"description":"Single key or modifier chord; list_keys gives accepted names. Examples: Ctrl+A, Cmd+A, Ctrl+Shift, ControlRight+F4, Ctrl+Plus, NumpadEnter"},
           "lines":{"type":"integer","minimum":-10,"maximum":10},
           "expected_text":{"type":"string","maxLength":4000},"dry_run":{"type":"boolean"}
         },"required":["action"],"additionalProperties":false})";
@@ -795,6 +812,19 @@ public:
         Json args = Json::parse(raw, nullptr, false);
         if (!args.is_object() || !args.value("action", Json{}).is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "computer action is required");
+        if (args["action"] == "list_keys") {
+            if (args.size() != 1)
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "list_keys has no other parameters");
+            // This ordinary immutable directory has no dependency on a selected
+            // session window, permissions, capture, focus or native input state.
+            return MaiToolResult::success(Json{
+                {"key_names", maiDesktopKeyNames()},
+                {"key_action", "key"},
+                {"text_action", "type"},
+                {"native_support_checked_at_dispatch", true},
+                {"note", "Names describe the shared grammar. Unsupported native mappings fail explicitly; use type for Unicode text."}}
+                                              .dump());
+        }
         if (args.contains("target")) {
             if (!args["target"].is_string() || (args["target"] != "display" && args["target"] != "window"))
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "target must be display or window");
@@ -951,7 +981,8 @@ private:
         }
         // Use the same current image boundary as the resident screenshot tool.
         // A text-only model must not inject against pixels it cannot observe.
-        if (context.model == "glm-5.3" || context.model.compare(0, 6, "local:") == 0)
+        const auto modelInfo = maiCloudModelInfo(context.model);
+        if ((modelInfo && !modelInfo->supportsImages) || context.model.compare(0, 6, "local:") == 0)
             return MaiToolResult::failure(
                 MaiErrorCode::NotSupported,
                 "Desktop screen operation requires an image-capable primary model; window metadata remains available.");

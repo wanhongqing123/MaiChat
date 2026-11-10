@@ -1,0 +1,585 @@
+{
+  "base_commit": "ff09eaa779c58e9cd50955e8068e2dbf021063b0",
+  "recorded_at_utc": "2026-11-10T18:05:39.099911+00:00",
+  "status": "IMPLEMENTED_BUILD_CONTRACTS_MAPPING_PASS_NATIVE_PENDING_FOCUS",
+  "source": [
+    {
+      "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerKeys.h",
+      "raw_bytes": 2692,
+      "raw_sha256": "7e969fc90f5ffa7f0e586b88a6c67853fdb99e2345f8419a79bc8124cf83c56c",
+      "canonical_bytes": 2692,
+      "canonical_sha256": "7e969fc90f5ffa7f0e586b88a6c67853fdb99e2345f8419a79bc8124cf83c56c",
+      "new_blob": "bd4c1ad6fd6d98bdb687b7c8cada598288650682",
+      "previous_blob": "bd4c1ad6fd6d98bdb687b7c8cada598288650682"
+    },
+    {
+      "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerKeys.cpp",
+      "raw_bytes": 12409,
+      "raw_sha256": "59061a71e0affcdd9509432c57663d8470c2d34e675c071682bc6ac892146085",
+      "canonical_bytes": 12409,
+      "canonical_sha256": "59061a71e0affcdd9509432c57663d8470c2d34e675c071682bc6ac892146085",
+      "new_blob": "39f9a4f053de11ccb5b64dc320b31aff0ebe3116",
+      "previous_blob": "39f9a4f053de11ccb5b64dc320b31aff0ebe3116"
+    },
+    {
+      "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerTools.cpp",
+      "raw_bytes": 62887,
+      "raw_sha256": "70347152db9653ec7a2ed36c9d1396f7b445ad71493e49cec3444c791588cd16",
+      "canonical_bytes": 61804,
+      "canonical_sha256": "4dd30cd93cbbef16ce4223e6534488d28a229403d73262dddcdf0b7c1a7f9bdc",
+      "new_blob": "43a26ddbc520ea67e77600531258501335c1356f",
+      "previous_blob": "43a26ddbc520ea67e77600531258501335c1356f"
+    },
+    {
+      "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerBackend.h",
+      "raw_bytes": 2478,
+      "raw_sha256": "032e7a51b7c5441e6f7fe8ff0c45bbcc3276ed1e4230166418039824ae9cc656",
+      "canonical_bytes": 2478,
+      "canonical_sha256": "032e7a51b7c5441e6f7fe8ff0c45bbcc3276ed1e4230166418039824ae9cc656",
+      "new_blob": "3071b35eee160cb2b7d200cc65903ddf14a136c9",
+      "previous_blob": "3071b35eee160cb2b7d200cc65903ddf14a136c9"
+    },
+    {
+      "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerMac.mm",
+      "raw_bytes": 64217,
+      "raw_sha256": "496b5f1f7c3c2377d4c1a725a1a43c5b1e7bcb27f949de2155f3b9b4c967651a",
+      "canonical_bytes": 63015,
+      "canonical_sha256": "11277f0d5ef6a26e2ce58d72955ef60113563ca76b141b6dfca6df810a71bfaa",
+      "new_blob": "2e25a88a1bbbfdb8736b6b1a95e9dba35e8e3fe0",
+      "previous_blob": "2e25a88a1bbbfdb8736b6b1a95e9dba35e8e3fe0"
+    },
+    {
+      "path": "MaiChat/desktop/tests/DesktopComputerContractsTest.cpp",
+      "raw_bytes": 98916,
+      "raw_sha256": "99970102a9960264a4b5b13f035ef3a133dd53ace8403ad21147f8ba3d1499c7",
+      "canonical_bytes": 96900,
+      "canonical_sha256": "fe86e456a0b4a2d25895d627e4e1659f0cb4f2817eb87f9746834c20b01803af",
+      "new_blob": "5709cb78c53ab0697b56dc711424a0beb360a12b",
+      "previous_blob": "5709cb78c53ab0697b56dc711424a0beb360a12b"
+    },
+    {
+      "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerPlatform.h",
+      "raw_bytes": 3745,
+      "raw_sha256": "1d0901e27b2e4782d214310a6715e4f55f9237653f07d6036ba99a730d4c116b",
+      "canonical_bytes": 3745,
+      "canonical_sha256": "1d0901e27b2e4782d214310a6715e4f55f9237653f07d6036ba99a730d4c116b",
+      "new_blob": "f5b22e0f73995a0d63d2253db99a33a1fb0336b7",
+      "previous_blob": "e55befff9747d4395aa7bbf72536fdc77ffead92"
+    },
+    {
+      "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerWindows.cpp",
+      "raw_bytes": 44634,
+      "raw_sha256": "d1608e83ab95c5a877631b86c3f9e52cf09126d454af2e0f634d5c6d1e0c887f",
+      "canonical_bytes": 43705,
+      "canonical_sha256": "a09fcb23f43b17ac803fe968efe39921e4bb9277f82e65e3c49fb189655ea09f",
+      "new_blob": "f0298bae0dd19ad3942afbbdb795e0f4d96121f9",
+      "previous_blob": "c4ab1e385a768aeb0ae6f5f226e296e3ec2b93d0"
+    },
+    {
+      "path": "MaiChat/desktop/tests/DesktopComputerNativeIntegrationTest.cpp",
+      "raw_bytes": 51613,
+      "raw_sha256": "af4788d2ef05767dc6d6be86639f130f29c33b9176acac8ce77ff296636459db",
+      "canonical_bytes": 50688,
+      "canonical_sha256": "6450c624f4de20f64807153c869f1c4ef0a9e47a64a10296f539f82d9c8bb6b4",
+      "new_blob": "245fd626995506d08190b6a81ed01a8097ce3856",
+      "previous_blob": "a18af7c2d805d87f7ec4d0137405ea32be260fb4"
+    }
+  ],
+  "product_trees": {
+    "MaiChat": "552cf43ed333426ba8769df50d2e8263788cc07c",
+    "MaiAgent": "4ab2cc60987f23c7d67659a4ea05e6f89cc92bcd"
+  },
+  "scope": "Generic desktop keys, Unicode path retained, ordinary API + model tool, no task-specific QQ/PPT feature.",
+  "red_green": {
+    "old_parser_assertions_failed": 117,
+    "old_catalog_assertions_failed": 3,
+    "old_generic_p1_assertions_failed": 7,
+    "old_windows_mapping_assertions_failed": 23,
+    "navigation_matrix_assertions_failed_before_final_fix": 20,
+    "mac_protocol2_same_source_red": {
+      "pass": 117,
+      "fail": 1
+    },
+    "mac_protocol2_green": {
+      "pass": 118,
+      "fail": 0
+    },
+    "original_mac_inverse_only_assertion_failure_preserved": true
+  },
+  "windows": {
+    "normal_consumers": {
+      "build": {
+        "name": "build",
+        "file": "C:\\WINDOWS\\system32\\cmd.exe",
+        "pid": 44472,
+        "arguments": "/d /c \"call \"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat\" >nul && \"D:\\Program Files\\CMake\\bin\\cmake.exe\" --build \"E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\" --target maichat desktop_computer_contracts_test desktop_computer_agent_integration_test --parallel 4\"",
+        "exit": 0,
+        "seconds": 8.0088426
+      },
+      "base": "ff09eaa779c58e9cd50955e8068e2dbf021063b0",
+      "source": [
+        {
+          "sha256": "032e7a51b7c5441e6f7fe8ff0c45bbcc3276ed1e4230166418039824ae9cc656",
+          "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerBackend.h"
+        },
+        {
+          "sha256": "59061a71e0affcdd9509432c57663d8470c2d34e675c071682bc6ac892146085",
+          "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerKeys.cpp"
+        },
+        {
+          "sha256": "7e969fc90f5ffa7f0e586b88a6c67853fdb99e2345f8419a79bc8124cf83c56c",
+          "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerKeys.h"
+        },
+        {
+          "sha256": "496b5f1f7c3c2377d4c1a725a1a43c5b1e7bcb27f949de2155f3b9b4c967651a",
+          "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerMac.mm"
+        },
+        {
+          "sha256": "1d0901e27b2e4782d214310a6715e4f55f9237653f07d6036ba99a730d4c116b",
+          "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerPlatform.h"
+        },
+        {
+          "sha256": "70347152db9653ec7a2ed36c9d1396f7b445ad71493e49cec3444c791588cd16",
+          "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerTools.cpp"
+        },
+        {
+          "sha256": "d1608e83ab95c5a877631b86c3f9e52cf09126d454af2e0f634d5c6d1e0c887f",
+          "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerWindows.cpp"
+        },
+        {
+          "sha256": "99970102a9960264a4b5b13f035ef3a133dd53ace8403ad21147f8ba3d1499c7",
+          "path": "MaiChat/desktop/tests/DesktopComputerContractsTest.cpp"
+        },
+        {
+          "sha256": "af4788d2ef05767dc6d6be86639f130f29c33b9176acac8ce77ff296636459db",
+          "path": "MaiChat/desktop/tests/DesktopComputerNativeIntegrationTest.cpp"
+        }
+      ],
+      "agent_selected": {
+        "name": "agent",
+        "file": "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\desktop_computer_agent_integration_test.exe",
+        "pid": 11236,
+        "arguments": "chinesePromptTraversesRealAgentAndReadsBackEditor displayPromptTraversesRealAgentAndReceivesFreshImages -o \"E:\\OpenSource\\MaiChat\\.cache\\desktop-keyboard-20261111\\root\\final-cohort\\agent-selected.txt\",txt",
+        "exit": 0,
+        "seconds": 1.1213197
+      },
+      "contracts": {
+        "name": "contracts",
+        "file": "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\desktop_computer_contracts_test.exe",
+        "pid": 17124,
+        "arguments": "",
+        "exit": 0,
+        "seconds": 0.7155556
+      },
+      "source_unchanged": true,
+      "normal_exe": {
+        "sha256": "aea51d3b7fbdbd998d89020230e6044abd6008bc8c22abfa1ea8df93d2aad573",
+        "path": "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\maichat.exe"
+      }
+    },
+    "smoke": {
+      "status": "PASS",
+      "pid": 37776,
+      "runningPath": "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\maichat.exe",
+      "exitCode": 0,
+      "elapsedSeconds": 1.551,
+      "version": "2.2.56",
+      "qtVersion": "6.12.0",
+      "executable": {
+        "name": "maichat.exe",
+        "bytes": 165541376,
+        "sha256": "aea51d3b7fbdbd998d89020230e6044abd6008bc8c22abfa1ea8df93d2aad573"
+      },
+      "pathEnvironment": "C:\\WINDOWS\\System32;C:\\WINDOWS",
+      "logEvidence": [
+        "2026-11-11 02:03:55.682 [I] version: 2.2.56  qt: 6.12.0",
+        "2026-11-11 02:03:55.683 [I] executable: E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/maichat.exe",
+        "2026-11-11 02:03:55.683 [I] pid: 37776",
+        "2026-11-11 02:03:55.683 [I] [im] libcurl TLS backend=OpenSSL/3.5.9"
+      ],
+      "qtDebugPlugins": "0",
+      "loadedQtModules": [
+        "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\Qt6Widgets.dll",
+        "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\Qt6Svg.dll",
+        "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\Qt6Gui.dll",
+        "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\Qt6Core.dll",
+        "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\platforms\\qwindows.dll"
+      ],
+      "pluginLoadEvidence": [],
+      "boundary": "Only this new --smoke child ran; login.start and account restore are skipped. Qt may append a startup header to its normal known-folder log; no existing log was read or copied."
+    },
+    "final_mapping": {
+      "path": ".cache/desktop-keyboard-20261111/windows/right-shift-fix/navigation-green-mapping",
+      "supported_identifiers": 177,
+      "not_supported_identifiers": 6,
+      "failures": 0,
+      "input_dispatched": false
+    },
+    "latest_native": {
+      "path": ".cache/desktop-keyboard-20261111/windows/right-shift-fix/navigation-green-native",
+      "parent_pid": 46940,
+      "child_pid": 45648,
+      "exit_code": 77,
+      "input_attempted": false,
+      "reason": "Windows refused foreground; no retry performed"
+    },
+    "native_executable": {
+      "path": "MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/desktop_computer_native_integration_test.exe",
+      "bytes": 8463360,
+      "sha256": "e85cdea82376c24a640f241667a3ccc98143112a1165d4cb196955691e2845ea"
+    },
+    "prior_native_failures_preserved": [
+      "Root initial RightShift raw E0 expectation failure",
+      "Scan-mode experiment had same failure, reverted",
+      "Semantic rightShift + side states passed; next A raw VK_PROCESSKEY failure",
+      "Read-only IMM original_vk recovered A; next Insert E0 classification failure"
+    ],
+    "fixture_oracle": "Raw vk/extended unchanged; original_vk is read-only pre-TranslateMessage ImmGetVirtualKey result, 0/229 fails. RightShift semantic identity additionally requires actual receiver side states and ordered transitions; all other E0 checks remain strict.",
+    "whole_agent_first_run_exit77_not_counted_green": true
+  },
+  "mac": {
+    "verified_compiled_sources": [
+      {
+        "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerMac.mm",
+        "bytes": 63015,
+        "sha256": "11277f0d5ef6a26e2ce58d72955ef60113563ca76b141b6dfca6df810a71bfaa",
+        "blob": "2e25a88a1bbbfdb8736b6b1a95e9dba35e8e3fe0"
+      },
+      {
+        "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerBackend.h",
+        "bytes": 2478,
+        "sha256": "032e7a51b7c5441e6f7fe8ff0c45bbcc3276ed1e4230166418039824ae9cc656",
+        "blob": "3071b35eee160cb2b7d200cc65903ddf14a136c9"
+      },
+      {
+        "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerKeys.h",
+        "bytes": 2692,
+        "sha256": "7e969fc90f5ffa7f0e586b88a6c67853fdb99e2345f8419a79bc8124cf83c56c",
+        "blob": "bd4c1ad6fd6d98bdb687b7c8cada598288650682"
+      },
+      {
+        "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerKeys.cpp",
+        "bytes": 12409,
+        "sha256": "59061a71e0affcdd9509432c57663d8470c2d34e675c071682bc6ac892146085",
+        "blob": "39f9a4f053de11ccb5b64dc320b31aff0ebe3116"
+      },
+      {
+        "path": "MaiChat/desktop/src/MaiChatTools/DesktopComputerTools.cpp",
+        "bytes": 61804,
+        "sha256": "4dd30cd93cbbef16ce4223e6534488d28a229403d73262dddcdf0b7c1a7f9bdc",
+        "blob": "43a26ddbc520ea67e77600531258501335c1356f"
+      },
+      {
+        "path": "MaiChat/desktop/tests/DesktopComputerContractsTest.cpp",
+        "bytes": 96900,
+        "sha256": "fe86e456a0b4a2d25895d627e4e1659f0cb4f2817eb87f9746834c20b01803af",
+        "blob": "5709cb78c53ab0697b56dc711424a0beb360a12b"
+      }
+    ],
+    "normal_consumers": {
+      "argv": [
+        "cmake",
+        "--build",
+        "/private/tmp/maichat-desktop-portrait-20261105/full-config",
+        "--target",
+        "maichat",
+        "desktop_computer_contracts_test",
+        "-j",
+        "4"
+      ],
+      "cohort": "shared4 v1 + Mac11277f0d v2 + genericP1 v2 three-path delta",
+      "build_exit": 0,
+      "build_seconds": 14.341330250026658,
+      "source_sha256": {
+        "MaiChat/desktop/src/MaiChatTools/DesktopComputerMac.mm": "11277f0d5ef6a26e2ce58d72955ef60113563ca76b141b6dfca6df810a71bfaa",
+        "MaiChat/desktop/src/MaiChatTools/DesktopComputerBackend.h": "032e7a51b7c5441e6f7fe8ff0c45bbcc3276ed1e4230166418039824ae9cc656",
+        "MaiChat/desktop/src/MaiChatTools/DesktopComputerKeys.h": "7e969fc90f5ffa7f0e586b88a6c67853fdb99e2345f8419a79bc8124cf83c56c",
+        "MaiChat/desktop/src/MaiChatTools/DesktopComputerKeys.cpp": "59061a71e0affcdd9509432c57663d8470c2d34e675c071682bc6ac892146085",
+        "MaiChat/desktop/src/MaiChatTools/DesktopComputerTools.cpp": "4dd30cd93cbbef16ce4223e6534488d28a229403d73262dddcdf0b7c1a7f9bdc",
+        "MaiChat/desktop/tests/DesktopComputerContractsTest.cpp": "fe86e456a0b4a2d25895d627e4e1659f0cb4f2817eb87f9746834c20b01803af"
+      },
+      "source_unchanged": true,
+      "contracts_pid": 2918,
+      "contracts_exit": 0,
+      "contracts_seconds": 1.7221836659591645,
+      "contracts_exe_sha256": "0bc658934736d2636a4576aab510eb785bf44ddb7b9148ff8534d86e54257e36",
+      "contracts_argv": [
+        "/usr/bin/sandbox-exec",
+        "-f",
+        "/private/tmp/maichat-session-models-20261110/desktop-tests.sb",
+        "/private/tmp/maichat-desktop-portrait-20261105/full-config/bin/desktop_computer_contracts_test"
+      ],
+      "normal_app_exe_sha256": "de6a63910f611a53575f49e2e8f4ff1465d8da1f506b6ef04bfd7b05ad5f058e",
+      "normal_app_launched": false
+    },
+    "mapper_protocol2": {
+      "input_cases": 118,
+      "red_source_sha256": "02f83516cc26544000affb4400b2c506019b7cbe127d0e22c09ce1a56649c3b4",
+      "red_pass": 117,
+      "red_fail": 1,
+      "green_source_sha256": "11277f0d5ef6a26e2ce58d72955ef60113563ca76b141b6dfca6df810a71bfaa",
+      "green_pass": 118,
+      "green_fail": 0,
+      "same_probe_sha256": "93da80ad0bd320e6b3e05380c07f4af21efcb436b01f3883600bab4951017a8e",
+      "same_TIS_data_sha256": "464baf9b5025c0e060e45b1ceeafe45307e8be4c7a518d1bf4606edfecd98545",
+      "CGEventPost_imported": false,
+      "protocol_note": "Original inverse-only Command literal assertion and its 117/1 failure remain preserved. Apple key-equivalent protocol distinguishes glyph from modifier flags. Protocol2 retains all 118 inputs, tightens CmdRight+Plus to exact observed Equal physical identity, implicit Shift, explicit MetaRight and independent same-layout basic/Command/Shift table; same protocol2 probe source was run RED against v1 and GREEN against v2. This is not a claim that the original inverse-only assertion became true."
+    },
+    "dvorak": {
+      "layouts": 4,
+      "checks": 16,
+      "fail": 0,
+      "active_layout_changed": false,
+      "CGEventPost_imported": false,
+      "TISSelectInputSource_imported": false
+    },
+    "native_input_gate": {
+      "run": false,
+      "permission_requested": false,
+      "guard_changed": false,
+      "reason": "Prior task observed loginwindow; this task did not rerun the GUI availability/native fixture. No synthetic OS input was dispatched.",
+      "prior_failure_not_relabeled": true
+    },
+    "final_three_path_compile": {
+      "argv": [
+        "cmake",
+        "--build",
+        "/private/tmp/maichat-desktop-portrait-20261105/full-config",
+        "--target",
+        "maichat",
+        "desktop_computer_contracts_test",
+        "desktop_computer_native_integration_test",
+        "-j",
+        "4"
+      ],
+      "exit_code": 0,
+      "duration_s": 19.721006583073176,
+      "source9_unchanged": true,
+      "execute_app": false,
+      "execute_contracts": false,
+      "execute_native_fixture": false,
+      "no_OS_input_or_capture": true,
+      "product_trees": {
+        "MaiChat": "552cf43ed333426ba8769df50d2e8263788cc07c",
+        "MaiAgent": "4ab2cc60987f23c7d67659a4ea05e6f89cc92bcd"
+      },
+      "source_manifest_sha256": "42b3018f458e4d3fdcbe4d90365a34ec0e4321eb227cddafa3d4891675e3ef15",
+      "artifacts": [
+        {
+          "target": "maichat",
+          "path": "/private/tmp/maichat-desktop-portrait-20261105/full-config/bin/MaiChat.app/Contents/MacOS/MaiChat",
+          "bytes": 156055704,
+          "sha256": "de6a63910f611a53575f49e2e8f4ff1465d8da1f506b6ef04bfd7b05ad5f058e",
+          "executed": false
+        },
+        {
+          "target": "desktop_computer_contracts_test",
+          "path": "/private/tmp/maichat-desktop-portrait-20261105/full-config/bin/desktop_computer_contracts_test",
+          "bytes": 25214432,
+          "sha256": "0bc658934736d2636a4576aab510eb785bf44ddb7b9148ff8534d86e54257e36",
+          "executed": false
+        },
+        {
+          "target": "desktop_computer_native_integration_test",
+          "path": "/private/tmp/maichat-desktop-portrait-20261105/full-config/bin/desktop_computer_native_integration_test",
+          "bytes": 25030584,
+          "sha256": "8085f199ed07e4419010c954da1f9acb9117802c2f34a65d9c5217c79af2c500",
+          "executed": false
+        }
+      ],
+      "mac_backend_is_normal_source": true,
+      "windows_backend_not_mac_compile_source": true
+    },
+    "final9_source_verified": true
+  },
+  "independent_review": {
+    "shared_tools_backend_contracts": "No concrete blocker; source/contract review only. Original enum ordinals, catalog semantics, sided guards, image gate and uncertain-input feedback checked.",
+    "mac_mapper": "No concrete blocker; exact Command priority, physical identity and stable glyph fallback checked. No real input.",
+    "windows_e0": "No concrete blocker; explicit navigation E0 keeps numpad digits, main Return and right Shift distinct; cleanup unchanged. No build/input by reviewer."
+  },
+  "boundaries": {
+    "all_hardware_keys_claimed_supported": false,
+    "windows_not_supported": [
+      "Fn",
+      "Eisu",
+      "IntlRo",
+      "IntlYen",
+      "NumpadEqual",
+      "NumpadComma"
+    ],
+    "mac_unsupported_examples": [
+      "Insert",
+      "CapsLock",
+      "NumLock",
+      "ScrollLock",
+      "F21-F24",
+      "unverified media/browser keys"
+    ],
+    "global_effect_keys_actually_pressed": false,
+    "persistent_cross_call_key_holds_added": false,
+    "QQ_PPT_or_real_contacts_operated": false,
+    "clipboard_accessed": false,
+    "real_visual_model_task_quality_verified": false,
+    "exactly_once_application_side_effect_guaranteed": false,
+    "installed_user_apps_changed_or_stopped": false,
+    "Core_CMake_version_release_changed": false,
+    "public_v2_2_56_contains_this_change": false
+  },
+  "evidence": [
+    {
+      "path": ".cache/desktop-keyboard-20261111/shared/red-test.txt",
+      "bytes": 32248,
+      "sha256": "5d335dc4ac33ea353cfdd0f2839982476887b308a70dc48e91185e5c153a046f"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/shared/green-test.txt",
+      "bytes": 880,
+      "sha256": "762acdaa82da88f5ed7b50cd34b5f792b33e368ac82ec16e257148e946549cde"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/shared/catalog-red-test.txt",
+      "bytes": 472,
+      "sha256": "ed7dfcf869ff525b7b466ae2250fc4d84e0fa23bea5dd4bd071754e776ca2b61"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/shared/p1-red-receipt.json",
+      "bytes": 1596,
+      "sha256": "1974f91c5d9a49c5523182e4e9890bed40eca468bdf9a7a03d8d8ecec8c00aae"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/root/p1-green-raw.txt",
+      "bytes": 65,
+      "sha256": "3172be282d84927c44e3de3038da24bc00278465f88d61194485ac856f3761b0"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/root/final-cohort/normal-consumers.json",
+      "bytes": 4272,
+      "sha256": "e452f37bb973390b51456b7a56f985ac0befc2f07c34f46c14b25b50f9c387fb"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/root/final-cohort/build-stdout.txt",
+      "bytes": 2212,
+      "sha256": "2064eaabd25d78656722431f9153d06b81765b613020b0ab87f76113a37cd0d6"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/root/final-cohort/build-stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/root/final-cohort/contracts-stderr.txt",
+      "bytes": 65,
+      "sha256": "3172be282d84927c44e3de3038da24bc00278465f88d61194485ac856f3761b0"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/root/final-cohort/agent-selected.txt",
+      "bytes": 1325,
+      "sha256": "c47e704204aee09bde4f5d947551c8ff148717b292f86d5108632022a04d02ce"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/root/final-cohort/normal-smoke.json",
+      "bytes": 1989,
+      "sha256": "5bcebeed6893ce5aa343018daf82b1f43e0e71413d4056d0fa1c7458a6b19143"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/root/mac-received-verification.json",
+      "bytes": 1516,
+      "sha256": "43579faa5c7313433ae82614ebed32bf1941cd8b31b658ce975f4bcb82ad09ee"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/root/keyboard-final-source-manifest.json",
+      "bytes": 5144,
+      "sha256": "42b3018f458e4d3fdcbe4d90365a34ec0e4321eb227cddafa3d4891675e3ef15"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/windows/right-shift-fix/final-short-receipt.json",
+      "bytes": 3063,
+      "sha256": "dcdc9b59a211fb4c9d7a55b1f4b6c173a37bc80ee24ff7829f0e53db0b1a5f19"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/windows/right-shift-fix/navigation-red-mapping/windows-key-mappings.json",
+      "bytes": 20133,
+      "sha256": "28e47219c8f9f3797805a23d54cf50f7e2359ab3df1ee34472cd92549e25b86a"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/windows/right-shift-fix/navigation-green-mapping/windows-key-mappings.json",
+      "bytes": 20112,
+      "sha256": "6ccc197645925ebfde77ab62a8b5178d836aae8528d4ec02e73a4028ce18ea8f"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/windows/right-shift-fix/navigation-green-native/native-transcript.json",
+      "bytes": 6210,
+      "sha256": "fdc8c526d9e0ccbc25d0f2d2389d414c2f607ff9d81b0fa2c31ba0b0aac8ae30"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/windows/right-shift-fix/navigation-green-native/exit.json",
+      "bytes": 139,
+      "sha256": "397d4913080b88843bcb190c6bbed697dc64a194e64d5cb615d8f5fc6e246eda"
+    },
+    {
+      "path": ".cache/desktop-keyboard-20261111/windows/right-shift-fix/native-stage-observations.json",
+      "bytes": 6276,
+      "sha256": "63d39bd189eea20a9ed2f3d45389fa6f4801a96f9405bf24ff5a06b1e15b7f58"
+    },
+    {
+      "path": "received/144115251141768230-1794332294-19155778.json",
+      "bytes": 9335,
+      "sha256": "ffee93c3abba97fae5915860a386e259157931bd4a5a802189360409bcc440dd"
+    },
+    {
+      "path": "received/144115251141768230-1794332294-14358020.log",
+      "bytes": 119011,
+      "sha256": "552e61737598ed918dfff80e6fa53c7fcc70ba03d48e1ff87ed25473369fa985"
+    },
+    {
+      "path": "received/144115251141768230-1794332294-37020629.log",
+      "bytes": 64,
+      "sha256": "a709f12dd20c5d567b512c90fbbc7d473c353191687388bf4de3a787fb632a29"
+    },
+    {
+      "path": "received/144115251141768230-1794331763-32350810.log",
+      "bytes": 177,
+      "sha256": "642c4587d3c660c849137692088404c3744abdc494cf9b65ed186743f6c5edd8"
+    },
+    {
+      "path": "received/144115251141768230-1794331764-13648662.log",
+      "bytes": 158,
+      "sha256": "f09355d9d9efddda8bcae4679281459ad66fdcb9d6e4d28ab47e25fd76209758"
+    },
+    {
+      "path": "received/144115251141768230-1794331908-54887459.log",
+      "bytes": 1339,
+      "sha256": "101392be23faaeccfe6a0fde54f5e246de31f1febcd534524c910b076e344a20"
+    },
+    {
+      "path": "received/144115251141768230-1794334176-27152888.json",
+      "bytes": 3394,
+      "sha256": "6e7a67d3e38e76fda799ae0d09da7d5188e831892f83dfbdaca2727941a700cc"
+    },
+    {
+      "path": "received/144115251141768230-1794334176-53138906.log",
+      "bytes": 127135,
+      "sha256": "53505f5c00577eafd216c06c90258530b946eb0ccc8f5a4ec9564612e10c82a7"
+    },
+    {
+      "path": "received/144115251141768230-1794334176-96539182.json",
+      "bytes": 1732,
+      "sha256": "3255c81b4de4fe5d104c946fffa511c5d03a17da713c231e9808e29928a5feb7"
+    },
+    {
+      "path": "received/144115251141768230-1794334176-80600610.json",
+      "bytes": 7097,
+      "sha256": "a55cedca9c34355b9aa53844fcfd7ba2eed0222e94a130d93ab238be632418b3"
+    }
+  ],
+  "artifact_correction": {
+    "private_CRLF_navigation_delta": "Not applicable; original error retained. Final Root three-path Git-generated patch was temp-index apply/check verified and Mac verified exact blobs.",
+    "canonical_replacement_sha256": "57d0acbe9f23203b9ae5e30b6b574d8936f80347816d2ec95cb07d7fb9bcb2d0"
+  },
+  "numlock_review": {
+    "source_changed": false,
+    "actual_toggle_performed": false,
+    "reason": "Microsoft overview explicitly says Num Lock not considered extended, although a legacy keybd_event sample sets extended. No demonstrated runtime failure; did not change source by guessing from the sample.",
+    "reference": "https://learn.microsoft.com/en-us/windows/win32/inputdev/about-keyboard-input#extended-key-flag"
+  }
+}

@@ -31,6 +31,10 @@ public:
     virtual MaiError activateForInput(const DesktopNativeWindow& window);
     virtual MaiResult<bool> inputFocused(const DesktopNativeWindow& window);
     virtual MaiResult<bool> secureInput() = 0;
+    // An error may occur after part of a gesture/key sequence was dispatched.
+    // Callers must observe the application before retrying; an error does not
+    // acknowledge that no input reached the target. Native scopes release only
+    // their owned downs on failure and never promise application-level success.
     virtual MaiError input(const DesktopNativeInput& input) = 0;
     virtual MaiResult<std::string> focusedText(const DesktopNativeWindow& window) = 0;
 };
