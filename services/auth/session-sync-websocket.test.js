@@ -349,7 +349,18 @@ test('WebSocket refreshes its bearer without dropping the device connection', as
   const principals = new Map([[original, principal], [renewed, principal],
     [anotherAccount, { ...principal, accountId: 'bob' }]]);
   const authorize = async headers => principals.get(headers.authorization?.slice(7)) || null;
-  const server = createServer(createSessionSyncService({ db, authorize }), authorize);
+  const service = createSessionSyncService({ db, authorize });
+  let resolveDisconnected;
+  const disconnected = new Promise(resolve => { resolveDisconnected = resolve; });
+  const markDisconnected = service.markDisconnected;
+  service.markDisconnected = disconnectedPrincipal => {
+    const result = markDisconnected(disconnectedPrincipal);
+    if (disconnectedPrincipal.accountId === principal.accountId &&
+        disconnectedPrincipal.loginSessionId === principal.loginSessionId)
+      resolveDisconnected();
+    return result;
+  };
+  const server = createServer(service, authorize);
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const client = connected(`ws://127.0.0.1:${server.address().port}/v1/session-sync/ws`, original);
@@ -375,6 +386,17 @@ test('WebSocket refreshes its bearer without dropping the device connection', as
       await closed;
     }
     await new Promise(resolve => server.close(resolve));
-    db.close();
+    // HTTP close does not drain upgraded sockets. Wait for the actual server
+    // disconnect callback before closing its database; a client close alone
+    // can precede this callback on Node 22/Linux.
+    let disconnectDeadline;
+    try {
+      await Promise.race([disconnected, new Promise((_, reject) => {
+        disconnectDeadline = setTimeout(() => reject(new Error('Server disconnect did not finish')), 3000);
+      })]);
+    } finally {
+      clearTimeout(disconnectDeadline);
+      db.close();
+    }
   }
 });
