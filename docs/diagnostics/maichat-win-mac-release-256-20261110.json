@@ -1,0 +1,202 @@
+{
+  "publication": {
+    "status": "PUBLISHED_AND_VERIFIED_LATEST",
+    "release_id": 440314433,
+    "tag": "v2.2.56",
+    "source": "b9243c3ddb99f4f51da9657ad6bf4d4849760b7a",
+    "url": "https://github.com/wanhongqing123/MaiChat/releases/tag/v2.2.56",
+    "published_at": "2026-11-10T12:36:52Z",
+    "draft": false,
+    "prerelease": false,
+    "latest_id": 440314433,
+    "assets": [
+      {
+        "id": 731355725,
+        "name": "MaiChat-macos-arm64-v2.2.56-20261110-b9243c3d.dmg",
+        "size": 213976841,
+        "digest": "sha256:4f3d19dcd2c8a8ab5f0fa3557ced5976ecb650baaa39f4a2c2626cf36c402664",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.56/MaiChat-macos-arm64-v2.2.56-20261110-b9243c3d.dmg"
+      },
+      {
+        "id": 731373819,
+        "name": "MaiChat-macos-arm64-v2.2.56-20261110-b9243c3d.zip",
+        "size": 214548982,
+        "digest": "sha256:021d34e3df145c1adf468c95fc033334d87c764b588fa3d72a94e10bea74a347",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.56/MaiChat-macos-arm64-v2.2.56-20261110-b9243c3d.zip"
+      },
+      {
+        "id": 731332993,
+        "name": "MaiChat-Setup-win64-v2.2.56-b9243c3d.exe",
+        "size": 201072882,
+        "digest": "sha256:fb1cb2fcf5499197d6478f19ffba6712aa5a70cac826206992f740d129d17966",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.56/MaiChat-Setup-win64-v2.2.56-b9243c3d.exe"
+      },
+      {
+        "id": 731332982,
+        "name": "MaiChat-win64-v2.2.56-20261110-b9243c3d.zip",
+        "size": 241514910,
+        "digest": "sha256:abf809a8701203aacce2280a4a959450516b126ae55f2cda6071393e29d5056b",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.56/MaiChat-win64-v2.2.56-20261110-b9243c3d.zip"
+      },
+      {
+        "id": 731345916,
+        "name": "release-manifest-macos-arm64.json",
+        "size": 4358,
+        "digest": "sha256:67a74f22ff95ed75cdf56e2ac909e8e3f1a61e84146b477af368f3132319618f",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.56/release-manifest-macos-arm64.json"
+      },
+      {
+        "id": 731332984,
+        "name": "release-manifest-win64.json",
+        "size": 6108,
+        "digest": "sha256:5387620a0afd532e81f50fcd7e8d563d184aa93c25ae2d47bc0be6f851f76e29",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.56/release-manifest-win64.json"
+      },
+      {
+        "id": 731345763,
+        "name": "SHA256SUMS-macos-arm64.txt",
+        "size": 332,
+        "digest": "sha256:d69e9d3a563b541e4d3bc7c4570c8d7c29a8cefceef504bdff6dccf524634a9c",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.56/SHA256SUMS-macos-arm64.txt"
+      },
+      {
+        "id": 731332983,
+        "name": "SHA256SUMS-win64.txt",
+        "size": 314,
+        "digest": "sha256:12209e7ed375dcc71838b0370c0969ef26dbd17725487141f7788399bd4e4274",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.56/SHA256SUMS-win64.txt"
+      }
+    ],
+    "metadata_downloaded_and_verified": 4,
+    "old_v2_2_53_body_assets_unchanged": true,
+    "tag_peeled_to_source": true
+  },
+  "windows_verification": {
+    "source": "b9243c3ddb99f4f51da9657ad6bf4d4849760b7a",
+    "status": "ROOT_INDEPENDENT_VERIFICATION_PASS",
+    "assets": [
+      {
+        "name": "MaiChat-Setup-win64-v2.2.56-b9243c3d.exe",
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\release-2.2.56-20261110\\assets\\MaiChat-Setup-win64-v2.2.56-b9243c3d.exe",
+        "bytes": 201072882,
+        "sha256": "fb1cb2fcf5499197d6478f19ffba6712aa5a70cac826206992f740d129d17966"
+      },
+      {
+        "name": "MaiChat-win64-v2.2.56-20261110-b9243c3d.zip",
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\release-2.2.56-20261110\\assets\\MaiChat-win64-v2.2.56-20261110-b9243c3d.zip",
+        "bytes": 241514910,
+        "sha256": "abf809a8701203aacce2280a4a959450516b126ae55f2cda6071393e29d5056b"
+      },
+      {
+        "name": "release-manifest-win64.json",
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\release-2.2.56-20261110\\assets\\release-manifest-win64.json",
+        "bytes": 6108,
+        "sha256": "5387620a0afd532e81f50fcd7e8d563d184aa93c25ae2d47bc0be6f851f76e29"
+      },
+      {
+        "name": "SHA256SUMS-win64.txt",
+        "path": "E:\\OpenSource\\MaiChat\\.cache\\release-2.2.56-20261110\\assets\\SHA256SUMS-win64.txt",
+        "bytes": 314,
+        "sha256": "12209e7ed375dcc71838b0370c0969ef26dbd17725487141f7788399bd4e4274"
+      }
+    ],
+    "raw_evidence_verified": 39,
+    "zip_and_nsis_payloads_each": 81,
+    "actual_copies_rehashed": 3,
+    "smoke_runtime_logs_verified": 6,
+    "each_loaded_qt_module_belongs_to_its_copy": true,
+    "app_sha256": "086e4e4584817db713f7050f131b9c32e2a5ddc675471a4fdbe7baf960a4e236",
+    "installer_executed": false,
+    "manifest_scope_corrected_before_upload": true,
+    "stage_comparison_scope": "Portable ZIP matches portable stage; NSIS payload matches installer stage. Only generated use-instructions differ between portable and installer stages by design; no cross-stage all-file equality asserted."
+  },
+  "mac_received_proof_verification": {
+    "status": "COORDINATOR_MAC_RECEIVED_PROOF_VERIFIED",
+    "source": "b9243c3ddb99f4f51da9657ad6bf4d4849760b7a",
+    "public_manifest_sha256": "67a74f22ff95ed75cdf56e2ac909e8e3f1a61e84146b477af368f3132319618f",
+    "gate_receipt_sha256": "08a30fab00346a6df5b002015ab0d8fd813b77f9f83ddb11d3cd9e96a916b591",
+    "raw_smoke_logs": [
+      {
+        "path": "staging-ordinary-smoke.log",
+        "bytes": 156004,
+        "sha256": "cc6c17d0ee16a30a87150fb76047d57b46e1a121769c81fa1eaa5542ac420ed4",
+        "pid": 86287
+      },
+      {
+        "path": "staging-debug-smoke.log",
+        "bytes": 162699,
+        "sha256": "12f76dac8bdc9c926d60c979eb215f71afb81b8f69a1003ba366c2945467e9b6",
+        "pid": 86506
+      },
+      {
+        "path": "mounted-dmg-ordinary-smoke.log",
+        "bytes": 155792,
+        "sha256": "da0759b5fe148d7f979b6395c7db25cb9107f070c400dde02f40f1033378647c",
+        "pid": 86914
+      },
+      {
+        "path": "mounted-dmg-debug-smoke.log",
+        "bytes": 162235,
+        "sha256": "7ad4adfb35d8444492ef181ba30d197f7d67c57173b39cdf8c95b052aa764eb8",
+        "pid": 87019
+      },
+      {
+        "path": "extracted-zip-ordinary-smoke.log",
+        "bytes": 156172,
+        "sha256": "71218acd1c0173a6cd7889a688078c0060d06b8061106a69a1c88646ecd06267",
+        "pid": 87513
+      },
+      {
+        "path": "extracted-zip-debug-smoke.log",
+        "bytes": 163056,
+        "sha256": "8216c035f1cb0651d2d989adc8f6f039867fa6ff7690c6ce5a829eaf92a76b7d",
+        "pid": 87616
+      }
+    ],
+    "independent_runtime_review": "Six actual PID/main image/version/Qt6.12.0 and QtCore/Gui/Widgets/Svg/Concurrent+Cocoa paths match corresponding bundles in original dyld logs.",
+    "payload_boundary": "338 files and 37 symlinks equality is Mac executor receipt evidence; attachments do not include a complete per-file inventory, so coordinator did not rehash Mac payloads individually.",
+    "mac_runtime": {
+      "testedOn": "macOS 27.2 Apple Silicon",
+      "deliveryRequirement": "macOS 27.2+ arm64; older 14.4 runtime not tested",
+      "signature": "ad-hoc",
+      "notarized": false
+    },
+    "artifacts": [
+      {
+        "name": "MaiChat-macos-arm64-v2.2.56-20261110-b9243c3d.dmg",
+        "bytes": 213976841,
+        "sha256": "4f3d19dcd2c8a8ab5f0fa3557ced5976ecb650baaa39f4a2c2626cf36c402664"
+      },
+      {
+        "name": "MaiChat-macos-arm64-v2.2.56-20261110-b9243c3d.zip",
+        "bytes": 214548982,
+        "sha256": "021d34e3df145c1adf468c95fc033334d87c764b588fa3d72a94e10bea74a347"
+      }
+    ]
+  },
+  "public_manifest_hashes": {
+    "release-manifest-win64.json": "5387620a0afd532e81f50fcd7e8d563d184aa93c25ae2d47bc0be6f851f76e29",
+    "SHA256SUMS-win64.txt": "12209e7ed375dcc71838b0370c0969ef26dbd17725487141f7788399bd4e4274",
+    "release-manifest-macos-arm64.json": "67a74f22ff95ed75cdf56e2ac909e8e3f1a61e84146b477af368f3132319618f",
+    "SHA256SUMS-macos-arm64.txt": "d69e9d3a563b541e4d3bc7c4570c8d7c29a8cefceef504bdff6dccf524634a9c"
+  },
+  "mac_independent_public_verification_sha256": "3a454fbb031aa7e243da66bfff67e949bf0ed252e7b84bf421deb65ed2ebcc29",
+  "release_notes_sha256": "44ed8ef6434ffb1ed8f1b3f2ef30f42d5b65c5d60f9a2b008ccf49f5773cbc0c",
+  "boundaries": [
+    "No desktop installation replaced",
+    "No paid model request or user database read for release acceptance",
+    "No online service deployment",
+    "Old v2.2.53 and 2.2.55 candidates preserved",
+    "No ZIP/parts sent to IM",
+    "Mac payload file/link equality is executor receipt evidence; coordinator verified six original runtime traces",
+    "Physical iOS204 update completed separately; read-only menu acceptance pending device connectivity"
+  ]
+}

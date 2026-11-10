@@ -4,9 +4,11 @@
 
 2026-11-10，用户明确要求更新 iOS 真机。执行端为 Mac 协作者，Root 负责源码与收到证据的独立核对。操作范围是正常用户 App 的 Release 构建、保数据覆盖安装及只读页面验证；桌面版本、包、tag、公开 Release 和线上服务不在本次范围内。
 
-**真机已更新至 2.2.4（204），初次正常启动成功；菜单实机验收待用户解锁，未通过。**
+**真机已更新至 2.2.4（204），初次正常启动成功；菜单实机验收待设备连接恢复，未通过。**
 
-最后的私有 XCUI verifier 在设备预检显示 `Unlock iPhone to Continue`。协作者已仅向该 verifier 的 xcodebuild 发 SIGINT 停止预检，避免以后某次解锁突然执行 UI；没有停止或修改正常 App、数据及安装。解锁请求已发出，待用户响应后只恢复这项只读菜单检查，不重新安装。
+此前的私有 XCUI verifier 在设备预检显示 `Unlock iPhone to Continue`。协作者仅向该 verifier 的 xcodebuild 发 SIGINT 停止预检，避免以后某次解锁突然执行 UI；没有停止或修改正常 App、数据及安装。当时发出解锁请求，并约定只恢复这项只读菜单检查，不重新安装。
+
+后续状态：用户已明确反馈解锁；但执行端最新 devicectl 读回 tunnel=unavailable、transport 缺失，私有 verifier 安装请求出现 CoreDevice4016 usage assertion。已请求重新接数据线；计划用 UseDestinationArtifacts 读取已装用户 App，不重复安装正常 204。该设备连接阻断与正常 App 安装/初次启动结果分列，不继续把当前条件写成用户尚未解锁，也不把菜单计为通过。
 
 ## 可复现操作与预期
 

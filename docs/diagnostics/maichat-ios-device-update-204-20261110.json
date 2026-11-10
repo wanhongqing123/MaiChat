@@ -1,7 +1,7 @@
 {
   "date": "2026-11-10",
   "source_commit": "b8782ef66d78611cf916356d0fcaaffdb31e9a6d",
-  "status": "physical device updated to 2.2.4 build 204; real menu acceptance pending unlock",
+  "status": "physical device updated to 2.2.4 build 204; real menu acceptance pending restored device connectivity",
   "physical_install_receipt": {
     "sourceHead": "b8782ef66d78611cf916356d0fcaaffdb31e9a6d",
     "productTrees": {
@@ -119,11 +119,22 @@
   },
   "menu_status": {
     "passed": false,
-    "reason": "Device preflight: Unlock iPhone to Continue",
+    "reason": "User reports unlocked; subsequent device tunnel unavailable / no transport / private verifier CoreDevice4016",
     "private_verifier_wait_stopped": true,
     "stop_scope": "SIGINT to private verifier xcodebuild only, per collaborator status; normal App/data/install untouched",
     "automatic_ui_wait_remaining": false,
-    "resume_scope": "Only read-only menu verification after user unlock; no reinstall"
+    "resume_scope": "Only read-only menu verification after user unlock; no reinstall",
+    "prior_lock_wait_stop": "The earlier locked preflight was stopped by SIGINT; it was not a menu PASS."
   },
-  "evidence_boundary": "Coordinator verified received shared file lengths/hashes, build/signature/install/launch text and source trees. Device version/PID/path binding/entitlement compatibility/exe SHA are collaborator receipt observations; original private files were not transferred."
+  "evidence_boundary": "Coordinator verified received shared file lengths/hashes, build/signature/install/launch text and source trees. Device version/PID/path binding/entitlement compatibility/exe SHA are collaborator receipt observations; original private files were not transferred.",
+  "latest_device_followup": {
+    "source": "Mac collaborator status during release256",
+    "user_reported_unlocked": true,
+    "tunnel": "unavailable",
+    "transport_available": false,
+    "private_verifier_error": "CoreDevice4016 usage assertion",
+    "normal_user_app_reinstalled": false,
+    "menu_passed": false,
+    "next_scope": "Restore data-cable device connectivity, then only read-only menu validation using installed user App"
+  }
 }
