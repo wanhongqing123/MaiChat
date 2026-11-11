@@ -1,0 +1,642 @@
+{
+  "version": "2.2.58",
+  "recordType": "post-publication-docs-only",
+  "sourceCommit": "c14a7d087384fd592d7ab1e02368f21494943f14",
+  "productTrees": {
+    "MaiChat": "cd1a9d0832bbe6cb3d586dc8fc0ac2d0039c4cd6",
+    "MaiAgent": "1607a9dd61adc4e9228f09f4c967ccca71ef122d"
+  },
+  "publicRelease": {
+    "verifiedUTC": "2026-11-11T11:32:59.608421+00:00",
+    "authenticationUsed": false,
+    "releaseId": 441590927,
+    "tag": "v2.2.58",
+    "sourceCommit": "c14a7d087384fd592d7ab1e02368f21494943f14",
+    "draft": false,
+    "prerelease": false,
+    "latestId": 441590927,
+    "publishedAt": "2026-11-11T11:32:18Z",
+    "url": "https://github.com/wanhongqing123/MaiChat/releases/tag/v2.2.58",
+    "bodySHA256": "c94bc037a380b0ce2d9cd9a86395f44363a97112b5463fb81abc150a2aee6b19",
+    "publicPageLatestAndSourceVisible": true,
+    "publicExpandedAssetNamesVisible": true,
+    "metadataActualDownloads": [
+      {
+        "name": "SHA256SUMS-macos-arm64.txt",
+        "bytes": 332,
+        "sha256": "3aac7204938b6bd3f452eb148cccdbb74c71ef0f6032f0398d867d88469f7d65"
+      },
+      {
+        "name": "SHA256SUMS-win64.txt",
+        "bytes": 314,
+        "sha256": "1d9db5346917ec094020a96f349fa4ae321685f17df58b28951cfc71877ff07a"
+      },
+      {
+        "name": "release-manifest-macos-arm64.json",
+        "bytes": 4110,
+        "sha256": "e96e1bd481a8a0edec068cd745b2e50451c619e877be7fecfcf268cbd4beabe0"
+      },
+      {
+        "name": "release-manifest-win64.json",
+        "bytes": 11401,
+        "sha256": "d4ccc0c2d67fd79e15f121a8d94fc2bca91a20395a6670caee515817343d4593"
+      }
+    ],
+    "annotatedTag": "aa5af711a7defe49473c011152bf44204080f8f0",
+    "tagPeeledToSource": true,
+    "previousReleaseBodyAssetsTagUnchanged": true,
+    "assets": [
+      {
+        "id": 735267634,
+        "name": "MaiChat-macos-arm64-v2.2.58-20261111-c14a7d08.dmg",
+        "size": 214030691,
+        "digest": "sha256:6c0aed1da7b71ee6ea2970736dbef7721797fea3e2b89bad231c26f902c7c08c",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.58/MaiChat-macos-arm64-v2.2.58-20261111-c14a7d08.dmg"
+      },
+      {
+        "id": 735272525,
+        "name": "MaiChat-macos-arm64-v2.2.58-20261111-c14a7d08.zip",
+        "size": 214628061,
+        "digest": "sha256:8cd847eff3147ea563c92009c37e01c419b154f3235f87cc0286bbb432d95cac",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.58/MaiChat-macos-arm64-v2.2.58-20261111-c14a7d08.zip"
+      },
+      {
+        "id": 735279399,
+        "name": "MaiChat-Setup-win64-v2.2.58-c14a7d08.exe",
+        "size": 201134448,
+        "digest": "sha256:54110ddae14cdab40de2643714a2bd5f8f64cafa6c9bfd9dd6d1e8ba04f2125e",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.58/MaiChat-Setup-win64-v2.2.58-c14a7d08.exe"
+      },
+      {
+        "id": 735281439,
+        "name": "MaiChat-win64-v2.2.58-20261111-c14a7d08.zip",
+        "size": 241604380,
+        "digest": "sha256:ce28461f0f16b67d089ba7fb66657b1b3f9de994c38761494f2c74728e25ddb3",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.58/MaiChat-win64-v2.2.58-20261111-c14a7d08.zip"
+      },
+      {
+        "id": 735267391,
+        "name": "release-manifest-macos-arm64.json",
+        "size": 4110,
+        "digest": "sha256:e96e1bd481a8a0edec068cd745b2e50451c619e877be7fecfcf268cbd4beabe0",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.58/release-manifest-macos-arm64.json"
+      },
+      {
+        "id": 735278974,
+        "name": "release-manifest-win64.json",
+        "size": 11401,
+        "digest": "sha256:d4ccc0c2d67fd79e15f121a8d94fc2bca91a20395a6670caee515817343d4593",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.58/release-manifest-win64.json"
+      },
+      {
+        "id": 735267202,
+        "name": "SHA256SUMS-macos-arm64.txt",
+        "size": 332,
+        "digest": "sha256:3aac7204938b6bd3f452eb148cccdbb74c71ef0f6032f0398d867d88469f7d65",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.58/SHA256SUMS-macos-arm64.txt"
+      },
+      {
+        "id": 735279142,
+        "name": "SHA256SUMS-win64.txt",
+        "size": 314,
+        "digest": "sha256:1d9db5346917ec094020a96f349fa4ae321685f17df58b28951cfc71877ff07a",
+        "state": "uploaded",
+        "browser_download_url": "https://github.com/wanhongqing123/MaiChat/releases/download/v2.2.58/SHA256SUMS-win64.txt"
+      }
+    ]
+  },
+  "macIndependentPublicVerification": {
+    "verifiedUTC": "2026-11-11T11:33:18.645157+00:00",
+    "releaseId": 441590927,
+    "latestId": 441590927,
+    "url": "https://github.com/wanhongqing123/MaiChat/releases/tag/v2.2.58",
+    "draft": false,
+    "prerelease": false,
+    "publishedAt": "2026-11-11T11:32:18Z",
+    "sourceCommit": "c14a7d087384fd592d7ab1e02368f21494943f14",
+    "MaiChatTree": "cd1a9d0832bbe6cb3d586dc8fc0ac2d0039c4cd6",
+    "CoreTree": "1607a9dd61adc4e9228f09f4c967ccca71ef122d",
+    "allEightNameSizeDigestStateMatch": true,
+    "assets": [
+      {
+        "id": 735267634,
+        "name": "MaiChat-macos-arm64-v2.2.58-20261111-c14a7d08.dmg",
+        "bytes": 214030691,
+        "digest": "sha256:6c0aed1da7b71ee6ea2970736dbef7721797fea3e2b89bad231c26f902c7c08c",
+        "state": "uploaded"
+      },
+      {
+        "id": 735272525,
+        "name": "MaiChat-macos-arm64-v2.2.58-20261111-c14a7d08.zip",
+        "bytes": 214628061,
+        "digest": "sha256:8cd847eff3147ea563c92009c37e01c419b154f3235f87cc0286bbb432d95cac",
+        "state": "uploaded"
+      },
+      {
+        "id": 735279399,
+        "name": "MaiChat-Setup-win64-v2.2.58-c14a7d08.exe",
+        "bytes": 201134448,
+        "digest": "sha256:54110ddae14cdab40de2643714a2bd5f8f64cafa6c9bfd9dd6d1e8ba04f2125e",
+        "state": "uploaded"
+      },
+      {
+        "id": 735281439,
+        "name": "MaiChat-win64-v2.2.58-20261111-c14a7d08.zip",
+        "bytes": 241604380,
+        "digest": "sha256:ce28461f0f16b67d089ba7fb66657b1b3f9de994c38761494f2c74728e25ddb3",
+        "state": "uploaded"
+      },
+      {
+        "id": 735267391,
+        "name": "release-manifest-macos-arm64.json",
+        "bytes": 4110,
+        "digest": "sha256:e96e1bd481a8a0edec068cd745b2e50451c619e877be7fecfcf268cbd4beabe0",
+        "state": "uploaded"
+      },
+      {
+        "id": 735278974,
+        "name": "release-manifest-win64.json",
+        "bytes": 11401,
+        "digest": "sha256:d4ccc0c2d67fd79e15f121a8d94fc2bca91a20395a6670caee515817343d4593",
+        "state": "uploaded"
+      },
+      {
+        "id": 735267202,
+        "name": "SHA256SUMS-macos-arm64.txt",
+        "bytes": 332,
+        "digest": "sha256:3aac7204938b6bd3f452eb148cccdbb74c71ef0f6032f0398d867d88469f7d65",
+        "state": "uploaded"
+      },
+      {
+        "id": 735279142,
+        "name": "SHA256SUMS-win64.txt",
+        "bytes": 314,
+        "digest": "sha256:1d9db5346917ec094020a96f349fa4ae321685f17df58b28951cfc71877ff07a",
+        "state": "uploaded"
+      }
+    ],
+    "fourMetadata": [
+      {
+        "name": "release-manifest-macos-arm64.json",
+        "bytes": 4110,
+        "sha256": "e96e1bd481a8a0edec068cd745b2e50451c619e877be7fecfcf268cbd4beabe0",
+        "unauthenticatedDownload": true
+      },
+      {
+        "name": "SHA256SUMS-macos-arm64.txt",
+        "bytes": 332,
+        "sha256": "3aac7204938b6bd3f452eb148cccdbb74c71ef0f6032f0398d867d88469f7d65",
+        "unauthenticatedDownload": true
+      },
+      {
+        "name": "release-manifest-win64.json",
+        "bytes": 11401,
+        "sha256": "d4ccc0c2d67fd79e15f121a8d94fc2bca91a20395a6670caee515817343d4593",
+        "unauthenticatedDownload": true
+      },
+      {
+        "name": "SHA256SUMS-win64.txt",
+        "bytes": 314,
+        "sha256": "1d9db5346917ec094020a96f349fa4ae321685f17df58b28951cfc71877ff07a",
+        "unauthenticatedDownload": true
+      }
+    ],
+    "fiveModelsCrossPlatformIdentical": true,
+    "tagAnnotatedAndPeeledExact": true,
+    "publicPageAndExpandedAssetsRetrieved": true,
+    "oldV257BodyAssetsAndTagUnchanged": true,
+    "authorizationHeaderSent": false
+  },
+  "coreFunctionalVerification": {
+    "baselineCommit": "739ba3b887b82e411d2cc8536ff8f8e20e767ef2",
+    "ctestResult": {
+      "passed": 13,
+      "failed": 0,
+      "seconds": 124.18,
+      "ctest_pid": 49080
+    },
+    "receipts": {
+      "red-build": {
+        "pid": 22016,
+        "exit": 0,
+        "end": "2026-11-11T10:58:35.736754+00:00"
+      },
+      "red-run": {
+        "pid": 48644,
+        "exit": 1,
+        "end": "2026-11-11T10:58:39.349528+00:00"
+      },
+      "green-run-first": {
+        "pid": 40604,
+        "exit": 0,
+        "end": "2026-11-11T11:00:54.993618+00:00"
+      },
+      "red-final-budget-build": {
+        "pid": 41476,
+        "exit": 0,
+        "end": "2026-11-11T11:06:30.514805+00:00"
+      },
+      "red-final-budget-run": {
+        "pid": 32236,
+        "exit": 1,
+        "end": "2026-11-11T11:06:34.360177+00:00"
+      },
+      "green-final-budget-run": {
+        "pid": 44880,
+        "exit": 0,
+        "end": "2026-11-11T11:07:03.283202+00:00"
+      },
+      "red-index-capacity-build": {
+        "pid": 8640,
+        "exit": 0,
+        "end": "2026-11-11T11:08:57.254837+00:00"
+      },
+      "red-index-capacity-run": {
+        "pid": 22076,
+        "exit": 1,
+        "end": "2026-11-11T11:09:01.400213+00:00"
+      },
+      "green-index-capacity-run": {
+        "pid": 42768,
+        "exit": 0,
+        "end": "2026-11-11T11:09:36.562172+00:00"
+      },
+      "final-full-target": {
+        "pid": 21800,
+        "exit": 0,
+        "end": "2026-11-11T11:10:50.006143+00:00"
+      },
+      "final-core-build-frozen": {
+        "pid": 31500,
+        "exit": 0,
+        "end": "2026-11-11T11:11:01.426824+00:00"
+      },
+      "final-core-ctest": {
+        "pid": 49080,
+        "exit": 0,
+        "end": "2026-11-11T11:13:11.202686+00:00"
+      }
+    },
+    "compactorExeSHA256": "4ce9930248c9cb0f50488ff958bb09092ec80a2db94adb0152b8c7ccdd88e6f7",
+    "recoveryFlow": [
+      "summary protocol failure",
+      "deterministic partial source index",
+      "exact session_history database read",
+      "continue current turn"
+    ],
+    "behaviorDetails": "docs/diagnostics/maichat-context-history-index-recovery-20261111.md"
+  },
+  "windows": {
+    "build": {
+      "timeUTC": "2026-11-11T11:16:09.1017239Z",
+      "sourceCommit": "c14a7d087384fd592d7ab1e02368f21494943f14",
+      "version": "2.2.58",
+      "configureExitCode": 0,
+      "buildExitCode": 0,
+      "configureElapsedSeconds": 8.473,
+      "buildElapsedSeconds": 15.921,
+      "configureCommand": [
+        "D:/Program Files/CMake/bin/cmake.exe",
+        "-S",
+        "MaiChat/desktop",
+        "-B",
+        "MaiChat/desktop/.cache/build-qt6-ui-20261109"
+      ],
+      "buildCommand": [
+        "D:/Program Files/CMake/bin/cmake.exe",
+        "--build",
+        "MaiChat/desktop/.cache/build-qt6-ui-20261109",
+        "--target",
+        "maichat",
+        "--parallel",
+        "4"
+      ],
+      "configureLog": "windows-configure.txt",
+      "configureLogSHA256": "89dbb4dbc61aa1569c9ae23947ba7cb3ae66ef7b76c02dde43af29c7e0bffe4a",
+      "buildLog": "windows-build.txt",
+      "buildLogSHA256": "81f41bf68e36c880cbb87a21502e2b47b6e2c515ca7117bed844a0b900d4c47c",
+      "executablePath": "E:\\OpenSource\\MaiChat\\MaiChat\\desktop\\.cache\\build-qt6-ui-20261109\\bin\\maichat.exe",
+      "executableSHA256": "e228c029d259259efd2bfa952161e361f99484e6ab027a77e7b0c2d5f190ceba",
+      "executableBytes": 165695488,
+      "runtimeVersionBoundary": "No App start in build stage; six packaged runtime smokes follow only after deployment and PE gates."
+    },
+    "package": {
+      "sourceCommit": "c14a7d087384fd592d7ab1e02368f21494943f14",
+      "version": "2.2.58",
+      "buildExecutableSHA256": "e228c029d259259efd2bfa952161e361f99484e6ab027a77e7b0c2d5f190ceba",
+      "portable": {
+        "exitCode": 0,
+        "elapsedSeconds": 14.558
+      },
+      "installer": {
+        "exitCode": 0,
+        "elapsedSeconds": 137.569
+      },
+      "installationPerformed": false
+    },
+    "appExeSHA256": "e228c029d259259efd2bfa952161e361f99484e6ab027a77e7b0c2d5f190ceba",
+    "archiveEquality": {
+      "files": 81,
+      "allSHA256Match": true,
+      "zipCRC": "PASS"
+    },
+    "installerPayload": {
+      "method": "7-Zip NSIS extraction only; installer never executed",
+      "stagingFiles": 81,
+      "allPayloadSHA256Match": true,
+      "supportFiles": [
+        "$PLUGINSDIR/System.dll",
+        "$PLUGINSDIR/WinShell.dll",
+        "$PLUGINSDIR/modern-wizard.bmp",
+        "$PLUGINSDIR/nsDialogs.dll",
+        "$PLUGINSDIR/nsExec.dll",
+        "Uninstall.exe"
+      ]
+    },
+    "PEAudits": [
+      {
+        "evidence": "portable-pe.json",
+        "binaries": 37,
+        "missing": []
+      },
+      {
+        "evidence": "zip-pe.json",
+        "binaries": 37,
+        "missing": []
+      },
+      {
+        "evidence": "installer-pe.json",
+        "binaries": 42,
+        "missing": []
+      }
+    ],
+    "fiveModels": {
+      "MaiAgentModels/rvm_mobilenetv3_fp32.onnx": {
+        "bytes": 14975696,
+        "sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828"
+      },
+      "PortraitModels/face_landmarks.onnx": {
+        "bytes": 4920995,
+        "sha256": "f38c3321ceffbc9e95103480ad38cc3f52e7e1bde2bcee7cd9355d0b9138ac0c"
+      },
+      "PortraitModels/person_detection.onnx": {
+        "bytes": 11990159,
+        "sha256": "47fd5599d6fa17608f03e0eb0ae230baa6e597d7e8a2c8199fe00abea55a701f"
+      },
+      "PortraitModels/pose_estimation.onnx": {
+        "bytes": 5557238,
+        "sha256": "9d89c599319a18fb7d2e28451a883476164543182bafca5f09eb2cf767ed2f3f"
+      },
+      "PortraitModels/selfie_multiclass.onnx": {
+        "bytes": 16454560,
+        "sha256": "35ec1ecd9ee7f85073c99c00020b7f6751b69506eeacf683bc8665f6117f85b0"
+      }
+    },
+    "signatures": [
+      {
+        "name": "maichat.exe",
+        "status": "NotSigned",
+        "fileVersion": null,
+        "numericVersion": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "name": "MaiChat-Setup-win64-v2.2.58-c14a7d08.exe",
+        "status": "NotSigned",
+        "fileVersion": "2.2.58-c14a7d08",
+        "numericVersion": [
+          2,
+          2,
+          58,
+          0
+        ]
+      }
+    ],
+    "smokes": [
+      {
+        "copy": "portable",
+        "debug": "0",
+        "pid": 41072,
+        "exitCode": 0,
+        "version": "2.2.58",
+        "qtVersion": "6.12.0",
+        "loadedQtModuleCount": 5
+      },
+      {
+        "copy": "portable",
+        "debug": "1",
+        "pid": 27300,
+        "exitCode": 0,
+        "version": "2.2.58",
+        "qtVersion": "6.12.0",
+        "loadedQtModuleCount": 5
+      },
+      {
+        "copy": "zip",
+        "debug": "0",
+        "pid": 22020,
+        "exitCode": 0,
+        "version": "2.2.58",
+        "qtVersion": "6.12.0",
+        "loadedQtModuleCount": 5
+      },
+      {
+        "copy": "zip",
+        "debug": "1",
+        "pid": 30000,
+        "exitCode": 0,
+        "version": "2.2.58",
+        "qtVersion": "6.12.0",
+        "loadedQtModuleCount": 5
+      },
+      {
+        "copy": "installer",
+        "debug": "0",
+        "pid": 33584,
+        "exitCode": 0,
+        "version": "2.2.58",
+        "qtVersion": "6.12.0",
+        "loadedQtModuleCount": 5
+      },
+      {
+        "copy": "installer",
+        "debug": "1",
+        "pid": 22952,
+        "exitCode": 0,
+        "version": "2.2.58",
+        "qtVersion": "6.12.0",
+        "loadedQtModuleCount": 5
+      }
+    ]
+  },
+  "macOS": {
+    "platform": "macOS 27.2 arm64",
+    "signature": "ad-hoc; not notarized",
+    "sourceExeSHA256": "dd246d90aafd31b2066caf24ea92ce95add7d7c68f1a9d48a655f2e73256d97f",
+    "signedExeSHA256": "9d29c92ffdb37b719ad359d7fda9d581186b8f38b5e0ee00526c96dcdc434588",
+    "bundleFileCount": 338,
+    "bundleSymlinkCount": 37,
+    "verifiedCopies": [
+      "staging",
+      "mounted-dmg",
+      "extracted-zip"
+    ],
+    "allBundleFileHashesAndSymlinksIdentical": true,
+    "machOAudit": {
+      "machoFiles": 26,
+      "failures": []
+    },
+    "MacTargetedCore": {
+      "source": "c14a7d087384fd592d7ab1e02368f21494943f14",
+      "receipts": [
+        {
+          "label": "core-target-build",
+          "args": [
+            "cmake",
+            "--build",
+            "/private/tmp/maichat-pdf-core-gate",
+            "--target",
+            "MaiContextCompactorTests",
+            "--parallel",
+            "4"
+          ],
+          "exit": 0,
+          "seconds": 12.43911641696468
+        },
+        {
+          "label": "core-target-tests",
+          "args": [
+            "ctest",
+            "--test-dir",
+            "/private/tmp/maichat-pdf-core-gate",
+            "-R",
+            "^MaiContextCompactorTests$",
+            "--output-on-failure",
+            "--timeout",
+            "180",
+            "-j",
+            "1"
+          ],
+          "exit": 0,
+          "seconds": 3.31419925019145
+        }
+      ]
+    },
+    "allFormalCommandExitsZero": true,
+    "smokes": [
+      {
+        "copy": "staging",
+        "mode": "ordinary",
+        "pid": 67039,
+        "exit": 0,
+        "loadedQtCocoaModuleCount": 6
+      },
+      {
+        "copy": "staging",
+        "mode": "debug",
+        "pid": 67202,
+        "exit": 0,
+        "loadedQtCocoaModuleCount": 6
+      },
+      {
+        "copy": "mounted-dmg",
+        "mode": "ordinary",
+        "pid": 67603,
+        "exit": 0,
+        "loadedQtCocoaModuleCount": 6
+      },
+      {
+        "copy": "mounted-dmg",
+        "mode": "debug",
+        "pid": 67760,
+        "exit": 0,
+        "loadedQtCocoaModuleCount": 6
+      },
+      {
+        "copy": "extracted-zip",
+        "mode": "ordinary",
+        "pid": 68239,
+        "exit": 0,
+        "loadedQtCocoaModuleCount": 6
+      },
+      {
+        "copy": "extracted-zip",
+        "mode": "debug",
+        "pid": 68391,
+        "exit": 0,
+        "loadedQtCocoaModuleCount": 6
+      }
+    ]
+  },
+  "crossPlatformModelsIdentical": true,
+  "uploadPolicy": {
+    "order": [
+      "Mac four assets",
+      "Windows four assets"
+    ],
+    "serial": true,
+    "clobber": false,
+    "retries": 0
+  },
+  "evidence": [
+    {
+      "path": ".cache/release-2.2.58-20261111/source-freeze.json",
+      "bytes": 1020,
+      "sha256": "0b436c7283ad6da0ea3ac7591b7847754ea3bb41883fd3353b62ad967e669dbb"
+    },
+    {
+      "path": ".cache/release-2.2.58-20261111/windows-package-handoff.json",
+      "bytes": 25188,
+      "sha256": "8c21a7ce3334160e9c0126633885a9c1dc4efbbf5eb8110889b84abf24c7c7a2"
+    },
+    {
+      "path": ".cache/release-2.2.58-20261111/macos-package-handoff.json",
+      "bytes": 13627,
+      "sha256": "83da9b9c1fd1d7ded13d285edc58bda4467472b774f67012382c888f9cafe748"
+    },
+    {
+      "path": ".cache/release-2.2.58-20261111/macos-complete-evidence.json",
+      "bytes": 20894,
+      "sha256": "f797fa81e77b29aa6e12671cacf2d1b36e27a673010140fbd47a2ebecc9e19bc"
+    },
+    {
+      "path": ".cache/release-2.2.58-20261111/github-prepublish-verification.json",
+      "bytes": 3495,
+      "sha256": "4f00954d108f5afba943ba4a9391bfdb492a590618289e960a65878c3ef2aa3c"
+    },
+    {
+      "path": ".cache/release-2.2.58-20261111/github-published-public-verified.json",
+      "bytes": 4429,
+      "sha256": "99a1ec76e13ede35dd92bcd857b84793230fd9637de4d44914261f2f20c75ffb"
+    },
+    {
+      "path": ".cache/release-2.2.58-20261111/macos-public-release-final-verification.json",
+      "bytes": 3384,
+      "sha256": "60bd4d4e5ea97dd5a86d3f0a3309df0ea5d93d6ec98b8244b1dab4f8da5c590a"
+    }
+  ],
+  "boundaries": [
+    "Functional tests use owned fixtures; no real user database or paid supplier request.",
+    "Deterministic Core tests verify production dataflow, not real model lookup quality.",
+    "Capability, budget, cancellation, network, storage and source conflict guards remain effective.",
+    "Recovery does not replay completed actions; ambiguous native delivery is not an exactly-once guarantee.",
+    "Desktop release gates use owned smoke children and do not replace installed applications.",
+    "NSIS was extracted, not executed; Windows main executable and installer are not signed.",
+    "Mac runtime verified on macOS 27.2 arm64; ad-hoc signed and not notarized.",
+    "Mac OpenCV dirty suffix is from four preserved independent old docs; product source and real index clean.",
+    "Earlier mobile, Host, native input and real cross-device WS evidence keeps its original source cohort.",
+    "Subsequent authorized iOS physical-device installation is a separate delivery record.",
+    "Documentation does not change released product trees, tag or assets."
+  ]
+}
