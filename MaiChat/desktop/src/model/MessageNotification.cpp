@@ -2,6 +2,8 @@
 // 实现边界：与 MessageNotification 的公开声明配套，调用方通过相应接口进入。
 #include "model/MessageNotification.h"
 
+#include <QSettings>
+
 namespace MessageNotification {
 
 namespace {
@@ -32,6 +34,17 @@ QString truncated(const QString& text) {
 }
 
 }  // namespace
+
+bool doNotDisturbEnabled() {
+    return QSettings().value(QStringLiteral("maichat.preferences.do-not-disturb"), false).toBool();
+}
+
+bool setDoNotDisturbEnabled(bool enabled) {
+    QSettings settings;
+    settings.setValue(QStringLiteral("maichat.preferences.do-not-disturb"), enabled);
+    settings.sync();
+    return settings.status() == QSettings::NoError;
+}
 
 DeliveryTracker::DeliveryTracker(qint64 sessionStartedAtMillis)
     : sessionStartedAtMillis_(sessionStartedAtMillis) {}

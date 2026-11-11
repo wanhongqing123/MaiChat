@@ -14,6 +14,11 @@
 // 系统通知会出现在锁屏、通知中心、甚至录屏里，路径既没用又泄露目录结构。
 namespace MessageNotification {
 
+// Per-device only: never include this preference in account or room payloads.
+// Read at the notification submission point, so queued arrivals use current settings.
+bool doNotDisturbEnabled();
+bool setDoNotDisturbEnabled(bool enabled);
+
 enum class DeliveryDisposition {
     Show,
     StartupBacklog,

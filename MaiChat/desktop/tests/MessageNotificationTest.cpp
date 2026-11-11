@@ -1,6 +1,10 @@
 // 文件作用：验证桌面端消息通知摘要、隐私过滤和重复交付抑制。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QTest>
+#include <QSettings>
+#include <QScopeGuard>
+#include <QTemporaryDir>
+#include <QUuid>
 
 #include "model/MessageNotification.h"
 
@@ -34,6 +38,7 @@ private slots:
     void deliveryTrackerSuppressesStartupBacklog();
     void deliveryTrackerShowsOnlyOnceUntilConversationIsViewed();
     void foregroundWindowSuppressesSystemNotification();
+    void doNotDisturbPreferenceIsLocalPersistentAndReadFresh();
 };
 
 void MessageNotificationTest::titleFallsBackToUserIdWhenThereIsNoDisplayName() {
@@ -135,6 +140,31 @@ void MessageNotificationTest::foregroundWindowSuppressesSystemNotification() {
     // 最小化或切到别的应用后才需要系统级提醒。
     QVERIFY(!MessageNotification::shouldSuppressForForegroundWindow(true, true));
     QVERIFY(!MessageNotification::shouldSuppressForForegroundWindow(false, false));
+}
+
+void MessageNotificationTest::doNotDisturbPreferenceIsLocalPersistentAndReadFresh() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString organization = QCoreApplication::organizationName();
+    const QString application = QCoreApplication::applicationName();
+    const QSettings::Format format = QSettings::defaultFormat();
+    const auto restore = qScopeGuard([&] {
+        QSettings::setDefaultFormat(format);
+        QCoreApplication::setOrganizationName(organization);
+        QCoreApplication::setApplicationName(application);
+    });
+    QCoreApplication::setOrganizationName(QStringLiteral("MaiChatDndPolicyTests"));
+    QCoreApplication::setApplicationName(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, directory.path());
+    QVERIFY(!MessageNotification::doNotDisturbEnabled());
+    QVERIFY(MessageNotification::setDoNotDisturbEnabled(true));
+    QSettings reopened;
+    QCOMPARE(reopened.value(QStringLiteral("maichat.preferences.do-not-disturb")).toBool(), true);
+    QVERIFY(MessageNotification::doNotDisturbEnabled());
+    reopened.setValue(QStringLiteral("maichat.preferences.do-not-disturb"), false);
+    reopened.sync();
+    QVERIFY(!MessageNotification::doNotDisturbEnabled());
 }
 
 QTEST_MAIN(MessageNotificationTest)

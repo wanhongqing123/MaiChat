@@ -189,6 +189,7 @@ private:
     // ---- 新消息系统通知 ----
     void setUpMessageNotifications();
     void handleIncomingMessageForNotification(const QString& peerId, const RemoteIMMessage& message);
+    void updateDoNotDisturbPreference(bool enabled);
     // MaiChat 正在前台且未最小化时不弹系统通知；失焦或最小化才需要提醒。
     bool appIsForegroundVisible() const;
     void showContactsPage();
@@ -378,6 +379,7 @@ private:
     QLineEdit* navSearchInput_ = nullptr;
     QLineEdit* contactsSearchInput_ = nullptr;
     QSystemTrayIcon* trayIcon_ = nullptr;
+    QCheckBox* settingsDoNotDisturb_ = nullptr;
     // 系统只保留最近一个通知气泡，点击回调也不带任何负载，所以只能记住
     // 「最后弹的是谁」。多个联系人先后来消息时，点通知只能定位到最后那个。
     QString lastNotifiedPeerId_;

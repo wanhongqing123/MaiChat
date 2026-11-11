@@ -3285,6 +3285,21 @@ void MainWindow::buildUi() {
   settingsLayout->addWidget(profileCard);
   settingsLayout->addWidget(settingsPanel);
 
+  // This device's notification policy is independent of the signed-in account.
+  // Keep the existing settings-row style and preserve message/unread processing.
+  settingsDoNotDisturb_ = new QCheckBox(QStringLiteral("开启"), settingsContent);
+  settingsDoNotDisturb_->setObjectName(QStringLiteral("settingsDoNotDisturb"));
+  settingsDoNotDisturb_->setAccessibleName(QStringLiteral("免打扰模式"));
+  settingsDoNotDisturb_->setChecked(MessageNotification::doNotDisturbEnabled());
+  auto* doNotDisturbRow = createSettingsRow(
+      QStringLiteral("免打扰模式"), nullptr,
+      QStringLiteral("开启后不弹出新消息通知；消息仍会正常接收，未读数量保留。"));
+  doNotDisturbRow->setObjectName(QStringLiteral("settingsDoNotDisturbRow"));
+  qobject_cast<QHBoxLayout*>(doNotDisturbRow->layout())->addWidget(settingsDoNotDisturb_);
+  settingsLayout->addWidget(doNotDisturbRow);
+  connect(settingsDoNotDisturb_, &QCheckBox::toggled, this,
+          &MainWindow::updateDoNotDisturbPreference);
+
   auto *familyChoice = new QComboBox(settingsContent);
   familyChoice->setObjectName(QStringLiteral("settingsFontFamily"));
   familyChoice->setAccessibleName(QStringLiteral("字体"));
@@ -4727,6 +4742,10 @@ void MainWindow::toggleContactGroupCollapsed(const QString &groupName) {
 }
 
 void MainWindow::refreshSettings() {
+  if (settingsDoNotDisturb_) {
+    const QSignalBlocker blocker(settingsDoNotDisturb_);
+    settingsDoNotDisturb_->setChecked(MessageNotification::doNotDisturbEnabled());
+  }
   const QString accountId = maiChatAccountIdProvider_ ?
       maiChatAccountIdProvider_() : app_.chatState().ownerUserId();
   settingsAccountValue_->setText(accountId);
@@ -5501,6 +5520,13 @@ bool MainWindow::appIsForegroundVisible() const {
 
 void MainWindow::handleIncomingMessageForNotification(
     const QString &peerId, const RemoteIMMessage &message) {
+  // App reception, SQLite persistence and unread updates have already committed.
+  // Consult the latest local preference before occupying any notification gate.
+  if (MessageNotification::doNotDisturbEnabled()) {
+    notificationTracker_.clearAll();
+    lastNotifiedPeerId_.clear();
+    return;
+  }
   if (!trayIcon_ || peerId.isEmpty())
     return;
 
@@ -5538,6 +5564,27 @@ void MainWindow::handleIncomingMessageForNotification(
   qInfo("[notify] requested peer=%s pending=%d", qUtf8Printable(peerId),
         decision.pendingCount);
   trayIcon_->showMessage(title, body, QSystemTrayIcon::Information, 5000);
+}
+
+void MainWindow::updateDoNotDisturbPreference(bool enabled) {
+  if (!MessageNotification::setDoNotDisturbEnabled(enabled)) {
+    const QSignalBlocker blocker(settingsDoNotDisturb_);
+    settingsDoNotDisturb_->setChecked(MessageNotification::doNotDisturbEnabled());
+    showToast(QStringLiteral("免打扰设置保存失败，请重试"), 13, 2500);
+    return;
+  }
+  // Turning it off only affects future arrivals; never replay silent history.
+  if (!enabled) return;
+  notificationTracker_.clearAll();
+  lastNotifiedPeerId_.clear();
+#ifdef Q_OS_WIN
+  // Installed Qt's Windows backend maps BOTH empty strings to NIM_MODIFY/NIF_INFO
+  // with empty szInfo: withdraw the current balloon without hiding the tray.
+  // This does not promise deletion of Notification Center history or OS queues.
+  // Other platforms must not receive an empty notification as a cancellation API.
+  if (trayIcon_ && trayIcon_->isVisible())
+    trayIcon_->showMessage(QString(), QString(), QSystemTrayIcon::NoIcon, 1);
+#endif
 }
 
 void MainWindow::openConversationFromNotification(const QString &peerId) {

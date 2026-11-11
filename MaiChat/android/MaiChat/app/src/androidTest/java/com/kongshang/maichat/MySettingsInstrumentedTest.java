@@ -23,6 +23,181 @@ import static org.junit.Assert.*;
 
 @RunWith(AndroidJUnit4.class)
 public class MySettingsInstrumentedTest {
+    @Test public void notificationPreferenceDefaultsOffAndAdvancesOnlyForActualModeChanges() {
+        Context original = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String prefix = "NotificationDndPreference-" + System.nanoTime() + "-";
+        Context isolated = new android.content.ContextWrapper(original) {
+            @Override public android.content.SharedPreferences getSharedPreferences(String name, int mode) {
+                return super.getSharedPreferences(prefix + name, mode);
+            }
+        };
+        try {
+            MaiChatPreferences.MessageNotificationState first = MaiChatPreferences.messageNotificationState(isolated);
+            assertFalse(first.doNotDisturb);
+            MaiChatPreferences.doNotDisturb(isolated, true);
+            MaiChatPreferences.MessageNotificationState enabled = MaiChatPreferences.messageNotificationState(isolated);
+            assertTrue(enabled.doNotDisturb); assertEquals(first.epoch + 1, enabled.epoch);
+            MaiChatPreferences.doNotDisturb(isolated, true);
+            assertEquals(enabled.epoch, MaiChatPreferences.messageNotificationState(isolated).epoch);
+            MaiChatPreferences.doNotDisturb(isolated, false);
+            MaiChatPreferences.MessageNotificationState disabled = MaiChatPreferences.messageNotificationState(isolated);
+            assertFalse(disabled.doNotDisturb); assertEquals(first.epoch + 2, disabled.epoch);
+        } finally { original.deleteSharedPreferences(prefix + "maichat.notifications"); }
+    }
+
+    // This component case uses an owned legacy session and synthetic notices.
+    // Its receive assertion covers the in-memory model/unread count, not DB
+    // persistence or MainActivity's production incoming-notification listener.
+    // It never requests screen capture, starts a call or contacts an IM account.
+    @Test public void doNotDisturbSwitchPersistsAndClearsOnlyMessageNotices() throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        boolean previous = MaiChatPreferences.doNotDisturb(context);
+        android.app.NotificationManager manager = context.getSystemService(android.app.NotificationManager.class);
+        assertNotNull(manager);
+        if (android.os.Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            InstrumentationRegistry.getInstrumentation().getUiAutomation()
+                .grantRuntimePermission(context.getPackageName(), android.Manifest.permission.POST_NOTIFICATIONS);
+        final int messageId = 3842901, unrelatedId = 3842902;
+        String unrelatedChannel = "maichat-dnd-owned-ongoing-fixture";
+        File directory = new File(context.getCacheDir(), "NotificationDndTest-" + System.nanoTime());
+        assertTrue(directory.mkdirs());
+        OwnedNotificationSession[] owned = new OwnedNotificationSession[1];
+        MaiChatPreferences.doNotDisturb(context, false);
+        manager.createNotificationChannel(new android.app.NotificationChannel(unrelatedChannel,
+            "Owned ongoing fixture", android.app.NotificationManager.IMPORTANCE_LOW));
+        try (ActivityScenario<MainActivity> scenario = ActivityScenario.launch(MainActivity.class)) {
+            on(scenario, activity -> owned[0] = installOwnedNotificationSession(activity, directory));
+            click(scenario, "偏好设置");
+            manager.notify(messageId, new android.app.Notification.Builder(context, "maichat-new-messages")
+                .setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle("Owned new message").build());
+            manager.notify(unrelatedId, new android.app.Notification.Builder(context, unrelatedChannel)
+                .setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle("Owned ongoing notice")
+                .setOngoing(true).build());
+            awaitOwnedNotice(manager, messageId, true);
+            awaitOwnedNotice(manager, unrelatedId, true);
+            on(scenario, activity -> {
+                android.widget.Switch toggle = notificationDndSwitch(activity.getWindow().getDecorView());
+                assertNotNull(toggle); assertFalse(toggle.isChecked()); assertTrue(toggle.performClick());
+                assertTrue(MaiChatPreferences.doNotDisturb(activity));
+                RemoteIMSessionController fixture = owned[0].controller;
+                Method receive = RemoteIMSessionController.class.getDeclaredMethod("receive", RemoteIMMessage.class);
+                receive.setAccessible(true);
+                RemoteIMMessage incoming = new RemoteIMMessage("alice", "notification-dnd-fixture", "Owned muted message",
+                    RemoteIMMessage.Direction.INCOMING, RemoteIMMessage.Status.RECEIVED, 1L, null, null);
+                // An empty remote ID keeps the legacy fixture out of the
+                // production SQLite duplicate lookup; no DB claim is made.
+                assertEquals("", incoming.remoteId());
+                receive.invoke(fixture, incoming);
+            });
+            // receive queues IO before returning to the main thread. Wait on
+            // its actual callback off the UI thread, not on elapsed sleep.
+            assertTrue("Owned receive callback must complete", owned[0].received.await(3, java.util.concurrent.TimeUnit.SECONDS));
+            assertNull("Owned receive must not report an error", owned[0].error.get());
+            on(scenario, activity -> {
+                assertTrue("Owned receive must return to the main thread", owned[0].receivedOnMain);
+                assertNotNull(owned[0].incoming);
+                assertEquals("Owned muted message", owned[0].incoming.text());
+                assertEquals(1, owned[0].controller.unreadCount("alice"));
+                assertEquals(1, owned[0].controller.chatState().messagesWith("alice").size());
+            });
+            awaitOwnedNotice(manager, messageId, false);
+            awaitOwnedNotice(manager, unrelatedId, true);
+            on(scenario, activity -> owned[0].close());
+            assertTrue("Owned IO must stop before recreation", owned[0].executor.awaitTermination(3, java.util.concurrent.TimeUnit.SECONDS));
+            scenario.recreate();
+            on(scenario, activity -> owned[0] = installOwnedNotificationSession(activity, directory));
+            click(scenario, "偏好设置");
+            on(scenario, activity -> {
+                android.widget.Switch toggle = notificationDndSwitch(activity.getWindow().getDecorView());
+                assertNotNull(toggle); assertTrue(toggle.isChecked()); assertTrue(toggle.performClick());
+                assertFalse(MaiChatPreferences.doNotDisturb(activity));
+            });
+            awaitOwnedNotice(manager, messageId, false);
+        } finally {
+            try {
+                if (owned[0] != null) {
+                    InstrumentationRegistry.getInstrumentation().runOnMainSync(owned[0]::close);
+                    assertTrue("Owned IO must stop during cleanup", owned[0].executor.awaitTermination(3, java.util.concurrent.TimeUnit.SECONDS));
+                }
+            } finally {
+                // Restore the preference/notices even if owned IO cleanup fails.
+                manager.cancel(messageId); manager.cancel(unrelatedId);
+                manager.deleteNotificationChannel(unrelatedChannel);
+                MaiChatPreferences.doNotDisturb(context, previous);
+            }
+        }
+    }
+
+    private static OwnedNotificationSession installOwnedNotificationSession(MainActivity activity, File directory) throws Exception {
+        ((RemoteIMSessionController) get(activity, "session")).destroy();
+        RemoteIMSessionController fixture = new RemoteIMSessionController(
+            new LocalSettingsStore(new File(directory, "settings")), new LocalChatHistoryStore(new File(directory, "history")));
+        fixture.login("notification-dnd-fixture"); fixture.addContact("alice");
+        OwnedNotificationSession owned = new OwnedNotificationSession(fixture);
+        set(activity, "session", fixture); set(activity, "showInitialLogin", false);
+        set(activity, "activeTab", RemoteIMTab.ME); render(activity);
+        return owned;
+    }
+
+    // The legacy constructor intentionally has no listener/Handler and does
+    // not shut down its IO executor in destroy(). Supply only owned test ports
+    // and close that executor explicitly, without initializing SDK/auth/SQLite.
+    private static final class OwnedNotificationSession implements RemoteIMSessionController.Listener, AutoCloseable {
+        final RemoteIMSessionController controller;
+        final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
+        final java.util.concurrent.ExecutorService executor;
+        final java.util.concurrent.CountDownLatch received = new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicReference<String> error = new java.util.concurrent.atomic.AtomicReference<>();
+        RemoteIMMessage incoming;
+        boolean receivedOnMain;
+
+        OwnedNotificationSession(RemoteIMSessionController controller) throws Exception {
+            this.controller = controller;
+            executor = (java.util.concurrent.ExecutorService) get(controller, "ioExecutor");
+            set(controller, "listener", this);
+            set(controller, "mainHandler", handler);
+        }
+
+        @Override public void onStateChanged() { }
+        @Override public void onError(String message) { error.set(message); received.countDown(); }
+        @Override public void onNewIncomingMessage(RemoteIMMessage message, boolean conversationVisible) {
+            incoming = message;
+            receivedOnMain = android.os.Looper.myLooper() == android.os.Looper.getMainLooper();
+            received.countDown();
+        }
+
+        @Override public void close() {
+            try {
+                set(controller, "destroyed", true);
+                handler.removeCallbacksAndMessages(null);
+                executor.shutdownNow();
+            } catch (Exception failure) { throw new AssertionError(failure); }
+        }
+    }
+
+    private static android.widget.Switch notificationDndSwitch(View root) {
+        if (root instanceof android.widget.Switch && "免打扰模式".contentEquals(root.getContentDescription()))
+            return (android.widget.Switch) root;
+        if (root instanceof ViewGroup) for (int index = 0; index < ((ViewGroup) root).getChildCount(); ++index) {
+            android.widget.Switch found = notificationDndSwitch(((ViewGroup) root).getChildAt(index));
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static void awaitOwnedNotice(android.app.NotificationManager manager, int id, boolean expected) {
+        long deadline = android.os.SystemClock.uptimeMillis() + 3000;
+        do {
+            boolean found = false;
+            for (android.service.notification.StatusBarNotification notice : manager.getActiveNotifications())
+                if (notice.getId() == id) found = true;
+            if (found == expected) return;
+            android.os.SystemClock.sleep(20);
+        } while (android.os.SystemClock.uptimeMillis() < deadline);
+        fail("Owned notification presence did not reach " + expected + " for " + id);
+    }
+
     @Test public void creationToolRunsKeepTextOrderAndIndependentExpansion() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         File screenshots = new File(context.getFilesDir(), "ToolOrderTest-visual");

@@ -393,6 +393,7 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         maiChatHostTools = new MaiChatHostTools(this, session);
         AIAssistantController.shared(this).setHostToolHandler(maiChatHostTools::execute);
         createMessageNotificationChannel();
+        if (MaiChatPreferences.doNotDisturb(this)) cancelNewMessageNotifications();
         showInitialLogin = session.requiresLogin();
         render();
         // 仅显式 Debug Intent 验收普通 PDF API；默认无入口，不影响真实会话或账号密码。
@@ -656,7 +657,8 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         boolean conversationVisible
     ) {
         if (destroyed || message == null) return;
-        runOnUiThread(() -> showNewMessageNotification(message));
+        MaiChatPreferences.MessageNotificationState queued = MaiChatPreferences.messageNotificationState(this);
+        runOnUiThread(() -> showNewMessageNotification(message, queued));
     }
 
     @Override
@@ -829,7 +831,8 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         );
     }
 
-    private void showNewMessageNotification(RemoteIMMessage message) {
+    private void showNewMessageNotification(RemoteIMMessage message,
+                                            MaiChatPreferences.MessageNotificationState queued) {
         if (!RemoteIMNewMessageNotificationPolicy.shouldNotify(
             true,
             activityInForeground
@@ -874,6 +877,12 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setGroup(MESSAGE_GROUP_KEY)
             .setNumber(unreadCount);
+        // Re-read at the posting boundary. A muted arrival or an old callback
+        // cannot reappear when DND is disabled before that callback executes.
+        MaiChatPreferences.MessageNotificationState current = MaiChatPreferences.messageNotificationState(this);
+        if (!RemoteIMNewMessageNotificationPolicy.shouldNotify(
+            true, activityInForeground, queued.doNotDisturb, queued.epoch,
+            current.doNotDisturb, current.epoch)) return;
         NotificationManagerCompat.from(this).notify(notificationId(peerUserId), builder.build());
         Log.i(TAG, "notification-requested peer=" + peerUserId
             + " unread=" + session.unreadCount(peerUserId));
@@ -895,6 +904,23 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         openChat(peerUserId);
         NotificationManagerCompat.from(this).cancel(notificationId(peerUserId));
         Log.i(TAG, "notification-clicked peer=" + peerUserId);
+    }
+
+    private void setDoNotDisturb(boolean enabled) {
+        MaiChatPreferences.doNotDisturb(this, enabled);
+        if (enabled) cancelNewMessageNotifications();
+        // Disabling resumes future incoming callbacks; never replay muted history.
+    }
+
+    private void cancelNewMessageNotifications() {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager == null) return;
+        // Only this message channel belongs to DND. In particular the screen
+        // capture foreground service must retain its mandatory ongoing notice.
+        for (android.service.notification.StatusBarNotification item : manager.getActiveNotifications()) {
+            if (MESSAGE_CHANNEL_ID.equals(item.getNotification().getChannelId()))
+                manager.cancel(item.getTag(), item.getId());
+        }
     }
 
     private static int notificationId(String peerUserId) {
@@ -4430,15 +4456,22 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
     private void renderPreferences(LinearLayout page) {
         View notifications = preferenceRow("消息通知", notificationState(), 0, this::openNotificationSettings);
         notificationPreferenceValue = notifications.findViewWithTag("preference-value");
+        View doNotDisturb = preferenceRow("免打扰模式", "", 0, null);
+        android.widget.Switch dndToggle = new android.widget.Switch(this);
+        dndToggle.setContentDescription("免打扰模式");
+        dndToggle.setChecked(MaiChatPreferences.doNotDisturb(this));
+        dndToggle.setOnCheckedChangeListener((button, checked) -> setDoNotDisturb(checked));
+        ((LinearLayout) doNotDisturb).addView(dndToggle);
         View haptics = preferenceRow("触感反馈", "", 0, null);
         android.widget.Switch toggle = new android.widget.Switch(this);
         toggle.setContentDescription("触感反馈"); toggle.setChecked(MaiChatPreferences.haptics(this));
         toggle.setOnCheckedChangeListener((button, checked) -> MaiChatPreferences.haptics(this, checked));
         ((LinearLayout) haptics).addView(toggle);
         page.addView(preferenceGroup("",
-            preferenceRow("语言", "简体中文", 0, null), notifications,
+            preferenceRow("语言", "简体中文", 0, null), notifications, doNotDisturb,
             preferenceRow("字体", MaiChatPreferences.fontFamilyTitle(this), 0, this::chooseFontFamily),
             preferenceRow("字体大小", MaiChatPreferences.fontTitle(this), 0, this::chooseFont), haptics), matchWrap());
+        page.addView(MaiChatTheme.text(this, "开启后不弹出新消息通知；消息仍会正常接收，未读数量保留。", MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY));
         View provider = preferenceRow("语音识别服务", MaiChatAuthClient.shared(this).speechRecognitionProvider().title(), 0, this::chooseSpeechRecognitionProvider);
         speechProviderValue = provider.findViewWithTag("preference-value");
         page.addView(preferenceGroup("语音", provider), matchWrap());

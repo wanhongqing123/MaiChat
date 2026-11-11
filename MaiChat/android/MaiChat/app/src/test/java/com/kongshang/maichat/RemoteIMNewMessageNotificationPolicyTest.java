@@ -13,6 +13,73 @@ import org.junit.Test;
 
 public class RemoteIMNewMessageNotificationPolicyTest {
     @Test
+    public void messageQueuedWhileMutedDoesNotAlertAfterUnmuting() throws Exception {
+        NotificationQueue queue = new NotificationQueue(true);
+        queue.receive();
+        queue.changeMode(false);
+        queue.drain();
+        assertEquals(0, queue.alerts);
+        queue.receive();
+        queue.drain();
+        assertEquals(1, queue.alerts);
+    }
+
+    @Test
+    public void modeRoundTripInvalidatesAnOlderQueuedAlert() throws Exception {
+        NotificationQueue queue = new NotificationQueue(false);
+        queue.receive();
+        queue.changeMode(true);
+        queue.changeMode(false);
+        queue.drain();
+        assertEquals(0, queue.alerts);
+        queue.receive();
+        queue.drain();
+        assertEquals(1, queue.alerts);
+    }
+
+    private static final class NotificationQueue {
+        final java.util.ArrayDeque<java.util.concurrent.Callable<Boolean>> pending = new java.util.ArrayDeque<>();
+        boolean muted;
+        long epoch;
+        int alerts;
+        NotificationQueue(boolean muted) { this.muted = muted; }
+        void changeMode(boolean next) { if (muted != next) { muted = next; ++epoch; } }
+        void receive() {
+            boolean queuedMuted = muted;
+            long queuedEpoch = epoch;
+            pending.add(() -> deliveryAllowed(queuedMuted, queuedEpoch, muted, epoch));
+        }
+        void drain() throws Exception {
+            while (!pending.isEmpty()) if (pending.remove().call()) ++alerts;
+        }
+    }
+
+    private static boolean deliveryAllowed(boolean queuedMuted, long queuedEpoch,
+                                          boolean currentMuted, long currentEpoch) throws Exception {
+        return RemoteIMNewMessageNotificationPolicy.shouldNotify(
+            true, false, queuedMuted, queuedEpoch, currentMuted, currentEpoch);
+    }
+
+    @Test
+    public void doNotDisturbSuppressesNewMessagesWithoutChangingForegroundOrDuplicatePolicy() throws Exception {
+        assertFalse(shouldNotify(true, false, true));
+        assertFalse(shouldNotify(true, true, true));
+        assertFalse(shouldNotify(false, false, true));
+        assertFalse(shouldNotify(false, true, true));
+    }
+
+    @Test
+    public void leavingDoNotDisturbAllowsOnlyTheNextNewBackgroundMessage() throws Exception {
+        assertTrue(shouldNotify(true, false, false));
+        assertFalse(shouldNotify(false, false, false));
+        assertFalse(shouldNotify(true, true, false));
+    }
+
+    private static boolean shouldNotify(boolean inserted, boolean foreground, boolean dnd) throws Exception {
+        return RemoteIMNewMessageNotificationPolicy.shouldNotify(inserted, foreground, dnd);
+    }
+
+    @Test
     public void onlyNotifiesForFirstInsertionWhileInBackground() {
         assertFalse(RemoteIMNewMessageNotificationPolicy.shouldNotify(false, false));
         assertFalse(RemoteIMNewMessageNotificationPolicy.shouldNotify(true, true));

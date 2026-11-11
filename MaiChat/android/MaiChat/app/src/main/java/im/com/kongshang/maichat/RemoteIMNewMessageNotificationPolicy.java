@@ -10,7 +10,31 @@ public final class RemoteIMNewMessageNotificationPolicy {
         boolean wasInserted,
         boolean activityInForeground
     ) {
-        return wasInserted && !activityInForeground;
+        return shouldNotify(wasInserted, activityInForeground, false);
+    }
+
+    // DND changes presentation only. Reception, persistence and unread counts
+    // stay with the session controller, including while notifications are muted.
+    public static boolean shouldNotify(
+        boolean wasInserted,
+        boolean activityInForeground,
+        boolean doNotDisturb
+    ) {
+        return wasInserted && !activityInForeground && !doNotDisturb;
+    }
+
+    public static boolean shouldNotify(
+        boolean wasInserted,
+        boolean activityInForeground,
+        boolean queuedDoNotDisturb,
+        long queuedEpoch,
+        boolean currentDoNotDisturb,
+        long currentEpoch
+    ) {
+        // Muted arrivals and callbacks invalidated by any mode change are never
+        // replayed. Only a new arrival after unmuting may alert again.
+        return shouldNotify(wasInserted, activityInForeground, currentDoNotDisturb)
+            && !queuedDoNotDisturb && queuedEpoch == currentEpoch;
     }
 
     public static String preview(RemoteIMMessage message) {

@@ -6,6 +6,7 @@
 #include <QBuffer>
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
 #include <QDateTime>
@@ -28,6 +29,7 @@
 #include <QScrollArea>
 #include <QScreen>
 #include <QSettings>
+#include <QSystemTrayIcon>
 #include <QStandardPaths>
 #include <QSignalSpy>
 #include <QSplitter>
@@ -85,10 +87,58 @@
 #include "ui/ImagePreviewDialog.h"
 #include "ui/AppMessageDialog.h"
 #include "model/MessageQuote.h"
+#include "storage/LocalMessageDatabase.h"
 #include "ui/MainWindow.h"
 #include "ui/UiZoom.h"
 
 namespace {
+
+// Isolate both preference identity and backing files; no normal account settings
+// or database is opened by the notification fixtures.
+class ScopedNotificationSettings {
+public:
+    ScopedNotificationSettings()
+        : organization_(QCoreApplication::organizationName()),
+          application_(QCoreApplication::applicationName()), format_(QSettings::defaultFormat()) {
+        QCoreApplication::setOrganizationName(QStringLiteral("MaiChatDndTests"));
+        QCoreApplication::setApplicationName(QUuid::createUuid().toString(QUuid::WithoutBraces));
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, directory_.path());
+    }
+    ~ScopedNotificationSettings() {
+        QSettings::setDefaultFormat(format_);
+        QCoreApplication::setOrganizationName(organization_);
+        QCoreApplication::setApplicationName(application_);
+    }
+    QString directory() const { return directory_.path(); }
+private:
+    QString organization_, application_;
+    QSettings::Format format_;
+    QTemporaryDir directory_;
+};
+
+// Observe the real host's existing notification-submit point; transport and
+// reception still use Fake IM and the ordinary application/store pipeline.
+class ScopedNotificationSubmissions {
+public:
+    ScopedNotificationSubmissions() {
+        current_ = this;
+        previous_ = qInstallMessageHandler(&capture);
+    }
+    ~ScopedNotificationSubmissions() {
+        qInstallMessageHandler(previous_);
+        current_ = nullptr;
+    }
+    int count = 0;
+private:
+    static void capture(QtMsgType type, const QMessageLogContext& context, const QString& text) {
+        if (current_ && text.startsWith(QStringLiteral("[notify] requested peer="))) ++current_->count;
+        if (current_ && current_->previous_) current_->previous_(type, context, text);
+    }
+    static ScopedNotificationSubmissions* current_;
+    QtMessageHandler previous_ = nullptr;
+};
+ScopedNotificationSubmissions* ScopedNotificationSubmissions::current_ = nullptr;
 
 // 头像仍经真实 loopback HTTP 下载；服务持有 PNG 和计数器，关闭后等待全部 handler 结束。
 class AvatarHttpServer {
@@ -275,6 +325,8 @@ private slots:
     void rendersMarkdownMessageContent();
     void notificationClickPreservesWindowState_data();
     void notificationClickPreservesWindowState();
+    void doNotDisturbReadsLatestPreferenceAndRetainsIncomingMessages();
+    void doNotDisturbSwitchPersistsAndClearsNotificationDeliveryState();
     void markdownBubbleHasCompactBottomSpacing_data();
     void markdownBubbleHasCompactBottomSpacing();
     void rendersApprovalButtonsAndSendsStructuredDecision();
@@ -3819,6 +3871,93 @@ void MainWindowLayoutTest::notificationClickPreservesWindowState() {
     QCOMPARE(window.isMaximized(), bool(state & Qt::WindowMaximized));
     QCOMPARE(window.isFullScreen(), bool(state & Qt::WindowFullScreen));
     QCOMPARE(app.chatState().selectedPeerId(), QStringLiteral("phone-user"));
+}
+
+void MainWindowLayoutTest::doNotDisturbReadsLatestPreferenceAndRetainsIncomingMessages() {
+    ScopedNotificationSettings preferences;
+    auto database = std::make_unique<LocalMessageDatabase>(preferences.directory() + QStringLiteral("/owned.sqlite"));
+    QVERIFY(database->isOpen());
+    auto* stored = database.get();
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    auto* incoming = client.get();
+    RemoteIMApplication app(QStringLiteral("dnd-owned-user"), std::move(client), std::move(database));
+    app.addContact(QStringLiteral("dnd-owned-peer"), QStringLiteral("DND test message"));
+    app.addContact(QStringLiteral("dnd-other-peer"), QStringLiteral("Owned other conversation"));
+    app.selectPeer(QStringLiteral("dnd-other-peer"));
+    MainWindow window(app);
+    window.showMinimized();
+    QCoreApplication::processEvents();
+    auto* tray = window.findChild<QSystemTrayIcon*>();
+    QVERIFY2(tray && tray->isVisible(), "This host test needs the actual Windows tray submission path");
+    ScopedNotificationSubmissions submissions;
+    // Admission precedes the change: dispatch must use the latest preference,
+    // not a value captured when the window or queued callback was created.
+    QTimer::singleShot(0, incoming, [incoming] {
+        incoming->emitIncomingText(QStringLiteral("dnd-owned-peer"), QStringLiteral("owned silent message"));
+    });
+    QSettings().setValue(QStringLiteral("maichat.preferences.do-not-disturb"), true);
+    QTRY_COMPARE(app.chatState().messagesWith(QStringLiteral("dnd-owned-peer")).size(), 1);
+    QCOMPARE(app.chatState().unreadCount(QStringLiteral("dnd-owned-peer")), 1);
+    QCOMPARE(stored->loadRecentMessages(QStringLiteral("dnd-owned-peer"), 10).size(), 1);
+    QCOMPARE(submissions.count, 0);
+    QVERIFY(tray->isVisible());
+
+    QSettings().setValue(QStringLiteral("maichat.preferences.do-not-disturb"), false);
+    QCoreApplication::processEvents();
+    QCOMPARE(submissions.count, 0); // Disabling does not replay silent history.
+    incoming->emitIncomingText(QStringLiteral("dnd-owned-peer"), QStringLiteral("owned new realtime message"));
+    QCOMPARE(submissions.count, 1); // Silent traffic did not consume the delivery gate.
+    QCOMPARE(app.chatState().unreadCount(QStringLiteral("dnd-owned-peer")), 2);
+    QCOMPARE(stored->loadRecentMessages(QStringLiteral("dnd-owned-peer"), 10).size(), 2);
+}
+
+void MainWindowLayoutTest::doNotDisturbSwitchPersistsAndClearsNotificationDeliveryState() {
+    ScopedNotificationSettings preferences;
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    auto* incoming = client.get();
+    RemoteIMApplication app(QStringLiteral("dnd-owned-settings"), std::move(client));
+    app.addContact(QStringLiteral("dnd-owned-peer"), QStringLiteral("DND test message"));
+    app.addContact(QStringLiteral("dnd-other-peer"), QStringLiteral("Owned other conversation"));
+    app.selectPeer(QStringLiteral("dnd-other-peer"));
+    {
+        MainWindow window(app);
+        window.showMinimized();
+        QCoreApplication::processEvents();
+        auto* tray = window.findChild<QSystemTrayIcon*>();
+        QVERIFY(tray && tray->isVisible());
+        auto* toggle = window.findChild<QCheckBox*>(QStringLiteral("settingsDoNotDisturb"));
+        QVERIFY2(toggle, "Settings must expose the per-device do-not-disturb switch");
+        QVERIFY(!toggle->isChecked());
+        ScopedNotificationSubmissions submissions;
+        incoming->emitIncomingText(QStringLiteral("dnd-owned-peer"), QStringLiteral("owned earlier notification"));
+        QCOMPARE(submissions.count, 1);
+        toggle->setChecked(true);
+        QCOMPARE(QSettings().value(QStringLiteral("maichat.preferences.do-not-disturb")).toBool(), true);
+        QVERIFY(tray->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(tray, "messageClicked", Qt::DirectConnection));
+        QCOMPARE(app.chatState().selectedPeerId(), QStringLiteral("dnd-other-peer"));
+        incoming->emitIncomingText(QStringLiteral("dnd-owned-peer"), QStringLiteral("owned silent second message"));
+        QCOMPARE(submissions.count, 1);
+        toggle->setChecked(false);
+        QCoreApplication::processEvents();
+        QCOMPARE(submissions.count, 1);
+        incoming->emitIncomingText(QStringLiteral("dnd-owned-peer"), QStringLiteral("owned new notification"));
+        QCOMPARE(submissions.count, 2);
+        QCOMPARE(app.chatState().unreadCount(QStringLiteral("dnd-owned-peer")), 3);
+        toggle->setChecked(true);
+        if (!qgetenv("MAICHAT_DND_CAPTURE").isEmpty()) {
+            window.resize(1280, 820);
+            window.showNormal();
+            window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"))->click();
+            QCoreApplication::processEvents();
+            QVERIFY(window.grab().save(QString::fromUtf8(qgetenv("MAICHAT_DND_CAPTURE"))));
+        }
+    }
+    QSettings().sync();
+    MainWindow recreated(app);
+    auto* restored = recreated.findChild<QCheckBox*>(QStringLiteral("settingsDoNotDisturb"));
+    QVERIFY(restored && restored->isChecked());
+    QCOMPARE(QSettings().value(QStringLiteral("maichat.preferences.do-not-disturb")).toBool(), true);
 }
 
 void MainWindowLayoutTest::markdownBubbleHasCompactBottomSpacing_data() {
