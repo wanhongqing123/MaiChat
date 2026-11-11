@@ -1442,6 +1442,46 @@ public enum RemoteIMMessageQuotePolicy {
     }
 }
 
+/// 本机消息提醒偏好；仅由 MainActor 的通知控制器写入，不进入账号或会话同步。
+/// permit 只在创建它的实例及偏好代际内有效；切换后再关闭免打扰也不能补弹旧工作。
+@MainActor
+public final class RemoteIMNotificationPreferences {
+    public nonisolated static let defaultsKey = "maichat.preferences.do-not-disturb"
+
+    public struct Permit: Equatable, Sendable {
+        fileprivate let owner: UUID
+        fileprivate let revision: UInt64
+    }
+
+    public private(set) var isDoNotDisturbEnabled: Bool
+    public private(set) var revision: UInt64 = 0
+    private let defaults: UserDefaults
+    private let owner = UUID()
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        isDoNotDisturbEnabled = defaults.object(forKey: Self.defaultsKey) as? Bool ?? false
+    }
+
+    @discardableResult
+    public func setDoNotDisturb(_ enabled: Bool) -> Bool {
+        guard enabled != isDoNotDisturbEnabled else { return false }
+        defaults.set(enabled, forKey: Self.defaultsKey)
+        isDoNotDisturbEnabled = enabled
+        revision &+= 1
+        return true
+    }
+
+    public func prepareNotification() -> Permit? {
+        guard !isDoNotDisturbEnabled else { return nil }
+        return Permit(owner: owner, revision: revision)
+    }
+
+    public func allowsNotification(_ permit: Permit) -> Bool {
+        !isDoNotDisturbEnabled && permit.owner == owner && permit.revision == revision
+    }
+}
+
 public enum RemoteIMNewMessageNotificationPolicy {
     /// 未读历史很大时仍保持 App 图标角标可读；这是 MaiChat 的产品取值，并非 iOS 上限。
     public static func systemBadgeCount(totalUnreadCount: Int) -> Int {
@@ -1451,9 +1491,10 @@ public enum RemoteIMNewMessageNotificationPolicy {
     public static func shouldNotify(
         wasInserted: Bool,
         isApplicationActive: Bool,
-        incomingUserID: String
+        incomingUserID: String,
+        doNotDisturb: Bool = false
     ) -> Bool {
-        guard wasInserted else { return false }
+        guard wasInserted, !doNotDisturb else { return false }
         let incoming = incomingUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !incoming.isEmpty else { return false }
         return !isApplicationActive

@@ -409,6 +409,9 @@ struct RootView: View {
         .onChange(of: systemNotificationCenter.pendingRouteRevision) { _ in
             schedulePendingNotificationRoute(sceneIsActive: scenePhase == .active)
         }
+        .onChange(of: systemNotificationCenter.isDoNotDisturbEnabled) { enabled in
+            if enabled { isShowingNotificationPermissionPrompt = false }
+        }
         .onChange(of: scenePhase) { phase in
             AppDiagnosticLog.shared.record(
                 level: .info,
@@ -584,6 +587,7 @@ struct RootView: View {
     }
 
     private func offerNotificationPermissionIfNeeded() async {
+        guard !systemNotificationCenter.isDoNotDisturbEnabled else { return }
 #if targetEnvironment(simulator)
         if ProcessInfo.processInfo.arguments.contains("--app-bars-layout-ui-test") ||
             ProcessInfo.processInfo.arguments.contains("--ai-session-reveal-ui-test") ||
@@ -595,7 +599,8 @@ struct RootView: View {
         }
 #endif
         await systemNotificationCenter.refreshAuthorizationStatus()
-        guard systemNotificationCenter.authorizationStatus == .notDetermined,
+        guard !systemNotificationCenter.isDoNotDisturbEnabled,
+              systemNotificationCenter.authorizationStatus == .notDetermined,
               !notificationPermissionPromptDismissed
         else { return }
         isShowingNotificationPermissionPrompt = true

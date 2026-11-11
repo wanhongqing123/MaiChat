@@ -140,6 +140,208 @@ private struct PdfSecurityUITestProbe: View {
 #endif
 
 #if targetEnvironment(simulator)
+/// 只在自有模拟器运行；所有 gate 都由确定性 continuation 释放，不依赖 sleep 或真实通知权限。
+@MainActor
+private final class RemoteIMDNDProbeGate {
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    func enter() async {
+        entered = true
+        let waiters = entryWaiters; entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        if !released { await withCheckedContinuation { releaseWaiters.append($0) } }
+    }
+    func waitUntilEntered() async {
+        if !entered { await withCheckedContinuation { entryWaiters.append($0) } }
+    }
+    func release() {
+        released = true
+        let waiters = releaseWaiters; releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
+@MainActor
+private final class RemoteIMDNDProbeDelivery: RemoteIMNotificationDelivery {
+    var authorizationGate: RemoteIMDNDProbeGate?
+    var addGate: RemoteIMDNDProbeGate?
+    var pendingGate: RemoteIMDNDProbeGate?
+    var pending: Set<String> = []
+    var delivered: Set<String> = []
+    var requests: [String: UNNotificationRequest] = [:]
+    var addCalls = 0
+    var authorizationCalls = 0
+    var badge = -1
+    var failNextAdd = false
+    func authorizationStatus() async -> UNAuthorizationStatus {
+        authorizationCalls += 1
+        let gate = authorizationGate; authorizationGate = nil
+        if let gate { await gate.enter() }
+        return .authorized
+    }
+    func add(_ request: UNNotificationRequest) async throws {
+        addCalls += 1
+        let gate = addGate; addGate = nil
+        if let gate { await gate.enter() }
+        if failNextAdd { failNextAdd = false; throw RemoteIMDNDProbeFailure(message: "owned-add-error") }
+        requests[request.identifier] = request
+    }
+    func pendingIdentifiers() async -> [String] {
+        let snapshot = Array(pending)
+        let gate = pendingGate; pendingGate = nil
+        if let gate { await gate.enter() }
+        return snapshot
+    }
+    func deliveredIdentifiers() async -> [String] { Array(delivered.union(requests.keys)) }
+    func removePending(_ identifiers: [String]) { pending.subtract(identifiers) }
+    func removeDelivered(_ identifiers: [String]) {
+        delivered.subtract(identifiers)
+        for identifier in identifiers { requests.removeValue(forKey: identifier) }
+    }
+    func setBadgeCount(_ count: Int) { badge = count }
+}
+
+private struct RemoteIMDNDProbeFailure: Error { let message: String }
+
+@MainActor
+private struct RemoteIMDNDContractProbe: View {
+    @State private var output = "idle"
+    @State private var busy = false
+    var body: some View {
+        VStack(spacing: 4) {
+            Button("核验消息通知策略") { Task { await run() } }
+                .disabled(busy)
+                .accessibilityIdentifier("notification-dnd-contract-run")
+            Text("通知策略结果")
+                .accessibilityIdentifier("notification-dnd-contract-result")
+                .accessibilityValue(output)
+        }
+        .font(.caption)
+        .padding(6)
+    }
+
+    private func require(_ value: Bool, _ message: String) throws {
+        if !value { throw RemoteIMDNDProbeFailure(message: message) }
+    }
+
+    private func run() async {
+        guard !busy else { return }
+        busy = true; output = "running"
+        defer { busy = false }
+        let suite = "MaiChat.DND.ControllerProbe.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { output = "failed:defaults"; return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let delivery = RemoteIMDNDProbeDelivery()
+        let notifications = RemoteIMSystemNotificationCenter(defaults: defaults, delivery: delivery)
+        let scenario = ProcessInfo.processInfo.environment["MAICHAT_DND_SCENARIO"] ?? "interleavings"
+        func post(_ body: String, _ count: Int,
+                  _ permit: RemoteIMNotificationPreferences.Permit? = nil,
+                  peer: String = "owned-peer") async -> RemoteIMNotificationPostResult {
+            await notifications.post(peerUserID: peer, title: "Owned fixture", body: body,
+                                     badgeCount: count, permit: permit)
+        }
+        do {
+            switch scenario {
+            case "stale-permit":
+                notifications.updateBadgeCount(1)
+                let oldPermit = notifications.prepareNotification()
+                if let cleanup = notifications.setDoNotDisturb(true) { await cleanup.value }
+                notifications.setDoNotDisturb(false)
+                notifications.updateBadgeCount(2)
+                let result = await post("stale-preview", 1, oldPermit)
+                try require(result == .suppressed, "stale-permit-was-not-suppressed")
+                try require(delivery.badge == 2, "stale-permit-regressed-authoritative-badge")
+                try require(delivery.addCalls == 0, "stale-permit-reached-add")
+            case "reordered-previews":
+                notifications.updateBadgeCount(1)
+                let oldPermit = notifications.prepareNotification()
+                notifications.updateBadgeCount(2)
+                let currentPermit = notifications.prepareNotification()
+                let current = await post("current-preview", 2, currentPermit)
+                let late = await post("late-old-preview", 1, oldPermit)
+                try require(current == .posted && late == .posted, "valid-previews-were-not-posted")
+                try require(delivery.badge == 2, "late-preview-regressed-authoritative-badge")
+                try require(delivery.requests["remote-im-message-owned-peer"]?.content.badge?.intValue == 2,
+                            "late-preview-content-badge-was-not-current")
+            case "read-decrease":
+                notifications.updateBadgeCount(2)
+                let gate = RemoteIMDNDProbeGate(); delivery.addGate = gate
+                let task = Task { @MainActor in await post("before-read", 2) }
+                await gate.waitUntilEntered()
+                notifications.updateBadgeCount(0)
+                gate.release()
+                let result = await task.value
+                try require(result == .posted, "read-decrease-post-result")
+                try require(delivery.badge == 0, "read-decrease-was-lost")
+                let afterRead = await post("late-after-read", 2)
+                try require(afterRead == .posted, "after-read-post-result")
+                try require(delivery.badge == 0, "after-read-old-preview-regressed-badge")
+                try require(delivery.requests["remote-im-message-owned-peer"]?.content.badge?.intValue == 0,
+                            "after-read-content-badge-was-not-zero")
+            case "interleavings":
+                delivery.pending = ["remote-im-message-legacy", "call-owned"]
+                delivery.delivered = ["remote-im-message-delivered", "capture-ongoing-owned"]
+                notifications.updateBadgeCount(12)
+                if let cleanup = notifications.setDoNotDisturb(true) { await cleanup.value }
+                try require(delivery.pending == ["call-owned"] && delivery.delivered == ["capture-ongoing-owned"],
+                            "cleanup-crossed-message-prefix")
+                let muted = await post("muted", 12)
+                try require(muted == .suppressed && delivery.addCalls == 0 && delivery.badge == 12,
+                            "muted-post-or-badge")
+                notifications.setDoNotDisturb(false)
+                try require(delivery.addCalls == 0, "unmute-replayed-muted-history")
+
+                // add 已在系统后端挂起，on/off 后同 peer 的新 add 必须排在旧撤销之后。
+                let oldAdd = RemoteIMDNDProbeGate(); delivery.addGate = oldAdd
+                let oldTask = Task { @MainActor in await post("old-add", 12) }
+                await oldAdd.waitUntilEntered()
+                let cleanup = notifications.setDoNotDisturb(true)
+                notifications.setDoNotDisturb(false)
+                let newTask = Task { @MainActor in await post("new-add", 12) }
+                oldAdd.release()
+                let oldResult = await oldTask.value
+                let newResult = await newTask.value
+                if let cleanup { await cleanup.value }
+                try require(oldResult == .suppressed && newResult == .posted, "old-add-result-or-new-add-lost")
+                try require(delivery.requests["remote-im-message-owned-peer"]?.content.body == "new-add",
+                            "old-completion-deleted-new-same-peer")
+
+                // on 的 prefix 枚举尚未回调，off 后另一个 peer 的新提醒不能被旧批量清理删除。
+                let enumeration = RemoteIMDNDProbeGate(); delivery.pendingGate = enumeration
+                delivery.pending.insert("remote-im-message-legacy-pending")
+                let lateCleanup = notifications.setDoNotDisturb(true)
+                await enumeration.waitUntilEntered()
+                notifications.setDoNotDisturb(false)
+                let another = await post("other-peer-new", 12, peer: "owned-other")
+                enumeration.release()
+                if let lateCleanup { await lateCleanup.value }
+                try require(another == .posted && delivery.requests["remote-im-message-owned-other"]?.content.body == "other-peer-new",
+                            "late-prefix-cleanup-deleted-new-peer")
+                try require(delivery.pending.contains("call-owned") && delivery.delivered.contains("capture-ongoing-owned") && delivery.badge == 12,
+                            "nonmessage-or-badge-was-altered")
+
+                // 权限查询也属于旧工作；即便开关又关闭，也不得把旧 permit 重新放行。
+                let authorization = RemoteIMDNDProbeGate(); delivery.authorizationGate = authorization
+                let staleTask = Task { @MainActor in await post("old-settings-query", 12) }
+                await authorization.waitUntilEntered()
+                if let cleanup = notifications.setDoNotDisturb(true) { await cleanup.value }
+                notifications.setDoNotDisturb(false)
+                authorization.release()
+                let staleResult = await staleTask.value
+                try require(staleResult == .suppressed, "old-authorization-query-revived")
+                delivery.failNextAdd = true
+                let failure = await post("owned-error", 12)
+                try require(failure == .failed, "posting-error-was-hidden")
+            default: throw RemoteIMDNDProbeFailure(message: "unknown-scenario")
+            }
+            output = "passed"
+        } catch let error as RemoteIMDNDProbeFailure { output = "failed:" + error.message }
+        catch { output = "failed:unexpected" }
+    }
+}
+
 /// Exercise the production RootView and its real tab bar with content that
 /// reaches both system edges, rather than a short list or a placeholder bar.
 private struct AppBarsLayoutUITestRoot: View {
@@ -151,6 +353,9 @@ private struct AppBarsLayoutUITestRoot: View {
         RootView()
             .environmentObject(appState)
             .safeAreaInset(edge: .top, spacing: 0) {
+                if ProcessInfo.processInfo.arguments.contains("--notification-dnd-contract-ui-test") {
+                    RemoteIMDNDContractProbe()
+                }
                 if ProcessInfo.processInfo.arguments.contains("--tool-order-ui-test") {
                     Button("追加下一段工具") {
                         toolOrderStage += 1

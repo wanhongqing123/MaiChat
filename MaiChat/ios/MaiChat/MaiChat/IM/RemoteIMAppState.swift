@@ -3378,16 +3378,23 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         wasInserted: Bool
     ) async {
         let isApplicationActive = UIApplication.shared.applicationState == .active
+        let notifications = RemoteIMSystemNotificationCenter.shared
+        let badgeCount = RemoteIMNewMessageNotificationPolicy.systemBadgeCount(
+            totalUnreadCount: totalUnreadCount
+        )
+        notifications.updateBadgeCount(badgeCount)
         guard RemoteIMNewMessageNotificationPolicy.shouldNotify(
             wasInserted: wasInserted,
             isApplicationActive: isApplicationActive,
-            incomingUserID: userID
-        ) else {
+            incomingUserID: userID,
+            doNotDisturb: notifications.isDoNotDisturbEnabled
+        ), let permit = notifications.prepareNotification() else {
             logIM(
                 level: .debug,
                 event: "notification-suppressed",
                 fields: [
-                    "reason": wasInserted ? "app-foreground" : "duplicate-or-history",
+                    "reason": notifications.isDoNotDisturbEnabled ? "do-not-disturb"
+                        : (wasInserted ? "app-foreground" : "duplicate-or-history"),
                 ],
                 userID: userID
             )
@@ -3395,23 +3402,22 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         }
 
         let profile = profile(for: userID)
-        let badgeCount = RemoteIMNewMessageNotificationPolicy.systemBadgeCount(
-            totalUnreadCount: totalUnreadCount
-        )
         let pendingCount = unreadCountByUserID[userID] ?? 1
         let identity = remoteDiagnosticsIdentity
         guard let body = try? await RemoteIMBackgroundWork.parse({
             RemoteIMNewMessageNotificationPolicy.aggregatedPreview(for: message, pendingCount: pendingCount)
         }), remoteDiagnosticsIdentity == identity else { return }
-        let posted = await RemoteIMSystemNotificationCenter.shared.post(
+        let outcome = await notifications.post(
             peerUserID: userID,
             title: profile.displayName,
             body: body,
-            badgeCount: badgeCount
+            badgeCount: badgeCount,
+            permit: permit
         )
         logIM(
-            level: posted ? .info : .warning,
-            event: posted ? "notification-requested" : "notification-failed",
+            level: outcome == .suppressed ? .debug : (outcome == .posted ? .info : .warning),
+            event: outcome == .suppressed ? "notification-suppressed"
+                : (outcome == .posted ? "notification-requested" : "notification-failed"),
             fields: [
                 "badge_count": String(badgeCount),
                 "unread_count": String(totalUnreadCount),

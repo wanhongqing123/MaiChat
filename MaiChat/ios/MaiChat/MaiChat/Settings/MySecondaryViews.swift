@@ -210,6 +210,18 @@ private struct AppNotificationSettingsView: View {
     var body: some View {
         List {
             Section {
+                Toggle(isOn: Binding(
+                    get: { notifications.isDoNotDisturbEnabled },
+                    set: { _ = notifications.setDoNotDisturb($0) }
+                )) {
+                    MySettingsText("免打扰模式").font(AppTypography.body)
+                }
+                .tint(RemoteIMStyle.green)
+                .accessibilityIdentifier("notification-do-not-disturb")
+            } footer: {
+                MySettingsText("开启后不弹出新消息通知；消息仍会正常接收，未读数量保留。")
+            }
+            Section {
                 LabeledContent("系统通知", value: statusText)
                 if notifications.authorizationStatus == .notDetermined {
                     Button("开启消息通知") {

@@ -184,6 +184,39 @@ final class MasterChatStateTests: XCTestCase {
         ))
     }
 
+    func testDoNotDisturbSuppressesNewMessageAlertsWithoutChangingBadgePolicy() {
+        XCTAssertFalse(RemoteIMNewMessageNotificationPolicy.shouldNotify(
+            wasInserted: true, isApplicationActive: false,
+            incomingUserID: "peer-a", doNotDisturb: true
+        ))
+        XCTAssertTrue(RemoteIMNewMessageNotificationPolicy.shouldNotify(
+            wasInserted: true, isApplicationActive: false,
+            incomingUserID: "peer-a", doNotDisturb: false
+        ))
+        XCTAssertEqual(RemoteIMNewMessageNotificationPolicy.systemBadgeCount(totalUnreadCount: 12), 12)
+    }
+
+    @MainActor func testDoNotDisturbPersistsAndInvalidatesPreparedNotifications() throws {
+        let suite = "MaiChat.DNDTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = RemoteIMNotificationPreferences(defaults: defaults)
+        XCTAssertFalse(preferences.isDoNotDisturbEnabled)
+        let beforeMute = try XCTUnwrap(preferences.prepareNotification())
+        XCTAssertTrue(preferences.allowsNotification(beforeMute))
+        XCTAssertTrue(preferences.setDoNotDisturb(true))
+        XCTAssertNil(preferences.prepareNotification())
+        XCTAssertFalse(preferences.allowsNotification(beforeMute))
+        XCTAssertTrue(RemoteIMNotificationPreferences(defaults: defaults).isDoNotDisturbEnabled)
+        XCTAssertFalse(preferences.setDoNotDisturb(true))
+        XCTAssertTrue(preferences.setDoNotDisturb(false))
+        XCTAssertFalse(preferences.allowsNotification(beforeMute))
+        let afterMute = try XCTUnwrap(preferences.prepareNotification())
+        XCTAssertTrue(preferences.allowsNotification(afterMute))
+        XCTAssertFalse(RemoteIMNotificationPreferences(defaults: defaults).allowsNotification(afterMute))
+        XCTAssertFalse(RemoteIMNotificationPreferences(defaults: defaults).isDoNotDisturbEnabled)
+    }
+
     /// 验证新消息通知只展示用户可读预览。
     /// 本地附件路径不得泄漏到系统通知正文。
     func testNewMessageNotificationPreviewDoesNotExposeAttachmentPath() {

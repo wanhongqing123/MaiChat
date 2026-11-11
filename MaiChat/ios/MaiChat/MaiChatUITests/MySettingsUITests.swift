@@ -2,6 +2,74 @@
 import XCTest
 
 final class MySettingsUITests: XCTestCase {
+    @MainActor func testNotificationStalePermitCannotRegressBadge() {
+        runNotificationContract("stale-permit")
+    }
+
+    @MainActor func testNotificationReorderedPreviewsUseAuthoritativeBadge() {
+        runNotificationContract("reordered-previews")
+    }
+
+    @MainActor func testNotificationReadCanDecreaseBadgeDuringAsyncAdd() {
+        runNotificationContract("read-decrease")
+    }
+
+    @MainActor func testDoNotDisturbControlledDeliveryInterleavings() {
+        runNotificationContract("interleavings")
+    }
+
+    @MainActor private func runNotificationContract(_ scenario: String) {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--my-settings-ui-test", "--app-bars-layout-ui-test",
+                               "--notification-dnd-contract-ui-test"]
+        app.launchEnvironment["MAICHAT_DND_SCENARIO"] = scenario
+        app.launch()
+        defer { app.terminate() }
+        let run = app.buttons["notification-dnd-contract-run"]
+        XCTAssertTrue(run.waitForExistence(timeout: 15))
+        run.tap()
+        let result = app.staticTexts["notification-dnd-contract-result"]
+        let finished = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == 'passed' OR value BEGINSWITH 'failed:'"),
+            object: result
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 10), .completed)
+        capture(app, "notification-\(scenario)")
+        XCTAssertEqual(result.value as? String, "passed")
+    }
+
+    @MainActor func testDoNotDisturbPersistsAndCanBeDisabledFromNotificationSettings() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--my-settings-ui-test", "--app-bars-layout-ui-test"]
+        app.launch()
+        defer { app.terminate() }
+        func openNotifications() {
+            XCTAssertTrue(app.buttons["my-preferences-entry"].waitForExistence(timeout: 15))
+            app.buttons["my-preferences-entry"].tap()
+            app.buttons["preferences-notifications"].tap()
+        }
+        openNotifications()
+        let toggle = app.switches["notification-do-not-disturb"]
+        capture(app, "notifications-before-do-not-disturb")
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+        XCTAssertEqual(toggle.value as? String, "0")
+        // SwiftUI 的 switch AX 框包含整行标签；中心点落在空白区域。
+        // 点截图中右侧实际可见的开关，保留同一真实 Toggle 及值断言。
+        XCTAssertTrue(toggle.isHittable)
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.94, dy: 0.5)).tap()
+        XCTAssertEqual(toggle.value as? String, "1")
+        capture(app, "notifications-do-not-disturb-enabled")
+        app.terminate()
+        app.launch()
+        openNotifications()
+        XCTAssertEqual(toggle.value as? String, "1")
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.94, dy: 0.5)).tap()
+        XCTAssertEqual(toggle.value as? String, "0")
+        capture(app, "notifications-do-not-disturb-disabled")
+    }
+
     // 对照真实列表 Button 内的同文标题、摘要与菜单，避免只检查字号常量。
     @MainActor func testIMConversationListUsesSelectedFontAndRelativeSizes() {
         continueAfterFailure = false

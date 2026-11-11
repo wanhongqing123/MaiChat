@@ -1,4 +1,4 @@
-// 文件作用：保存本机外观、字体、朗读与触感偏好，并在普通页面和输入框共用。
+// 文件作用：声明本机外观、字体、朗读、触感与消息提醒偏好，并在普通页面共用。
 // 偏好不含账号凭据；外观和字体只更新环境，不重建 Root，避免丢失导航及输入草稿。
 import AVFoundation
 import MaiChatCore
@@ -12,6 +12,7 @@ enum AppPreferenceKey {
     static let speechRate = "maichat.preferences.speech-rate"
     static let speechLanguage = "maichat.preferences.speech-language"
     static let haptics = "maichat.preferences.haptics"
+    static let doNotDisturb = RemoteIMNotificationPreferences.defaultsKey
 }
 
 enum AppTheme: String, CaseIterable, Identifiable {

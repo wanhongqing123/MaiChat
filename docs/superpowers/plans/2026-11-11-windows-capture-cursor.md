@@ -47,7 +47,8 @@
   /复用/stop 与严格自有色块和 steady pointer metadata 均过，源/产物/PID已绑定。
 - [ ] 用户现场验证采集活跃时真实指针可见、停止后状态正常；不以 API flags 或独立
   pointer plane 代替人眼。指定窗口 WGC 路径保持分列，尚未宣称修复。
-- [ ] 在 `docs/diagnostics/` 记录旧/新源码、产物、原日志、用户现场与未验边界，再提交。
+- [x] 在 `docs/diagnostics/` 记录旧/新源码、产物、原日志、用户现场与未验边界；
+  修正已提交为 `9f9e7a49c45904403d7b8df83cea4ab87215fa11`，未替换现装。
 
 ## 不采用的处理
 
