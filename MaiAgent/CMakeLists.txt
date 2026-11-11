@@ -434,6 +434,7 @@ add_library(maiagent STATIC
   AgentTools/MaiTodoWriteTool.cpp
   AgentTools/MaiQuestionTool.cpp
   AgentTools/MaiSessionTools.cpp
+  AgentTools/MaiToolOutputTool.cpp
   AgentTools/MaiSubAgentTools.cpp
   AgentTools/MaiShellTool.cpp
   AgentTools/MaiScreenshotTool.cpp
@@ -452,6 +453,8 @@ add_library(maiagent STATIC
   Agent/MaiContextCompactor.cpp
   Agent/MaiConversationHistory.cpp
   Agent/MaiToolDetail.cpp
+  Agent/MaiToolOutput.cpp
+  Agent/MaiToolExecution.cpp
   Agent/MaiEventEmitter.cpp
   Agent/MaiSessionTitler.cpp
 )
@@ -604,6 +607,9 @@ if(MAIAGENT_BUILD_TESTS)
       MaiSessionRenameTests # 当前会话改名、普通入口、显式命名与持久化
       MaiFilePathTests      # 路径词法 + 文件系统（走系统 API，不用 std::filesystem）
       MaiStoreTests         # 存储契约：内存和 SQLite 行为必须一致
+      MaiToolOutputStoreTests # 会话输出的保留、分页、配额及重开恢复
+      MaiToolOutputReadTests # 原命令只执行一次，模型补读及重开后尾部恢复
+      MaiToolExecutionTests # 执行事实、恢复动作、回灌顺序及元数据身份
       MaiModelClientTests   # 流式解析 + 工具调用分片聚合
       MaiTurnRunnerTests    # 一轮对话的完整生命周期
       MaiToolTests          # 路径边界 + 内置工具
@@ -670,6 +676,8 @@ if(MAIAGENT_BUILD_TESTS)
   endif()
   target_link_libraries(MaiLlamaModelCapabilitiesTests PRIVATE mai_llama)
   target_include_directories(MaiStoreTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
+  target_include_directories(MaiToolOutputStoreTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
   target_include_directories(MaiSessionRenameTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)

@@ -63,6 +63,8 @@ struct MaiProcessResult {
     //
     // 分开收对模型没好处：它要的是「这条命令说了什么」，而编译器把错误写在
     // stderr、进度写在 stdout，分开之后对不上号。交错着给才是终端里看到的样子。
+    // POSIX 保留原始字节，可能不是合法 UTF-8。Windows 沿用严格 UTF-8 优先、
+    // 失败再按系统 OEM 解码的文本契约，不保证恢复原始编码字节；解码后同样受上限约束。
     std::string output;
 
     bool timedOut = false;
@@ -70,6 +72,11 @@ struct MaiProcessResult {
     // 输出超过 maxOutputBytes，尾巴被丢了。**一定要如实往上报**：
     // 不报的话模型会把看到的当成全部（见 MaiToolResult::isTruncated 的注释）。
     bool truncated = false;
+
+    // 仅在操作系统确认进程已成功创建/exec 后置位；启动前校验失败或预先取消时为 false。
+    // true 不代表命令成功或没有副作用。即使返回 MaiError，调用方也必须检查此事实，
+    // 不能把执行后的收集错误当成可以安全重试的启动失败。
+    bool started = false;
 
     bool isSuccess() const;
 };
@@ -88,4 +95,6 @@ bool maiIsProcessExecutionSupported();
 // 跑一个命令。启动失败（程序不存在、工作目录不存在）返回带错误码的 MaiError；
 // 平台压根不支持时返回 NotSupported。
 // **命令自己跑失败不算错误**——那是正常结果，看 exitCode。
+// 执行后收集/配置失败也可能返回错误；必须检查 result.started，不能据错误码断言没有执行。
+// 预先置位 cancel 时不创建进程，返回空错误，并令 canceled=true、started=false。
 MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& result);

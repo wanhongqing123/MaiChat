@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "MaiError.h"
+#include "MaiToolExecution.h"
 #include "MaiModelClient.h"
 #include "MaiPathGuard.h"
 #include "MaiQuestion.h"
@@ -19,6 +20,7 @@
 #include "MaiSpecialistTask.h"
 
 class MaiAgent;
+class MaiSessionStore;
 
 // 工具执行时能看到的环境。
 //
@@ -54,6 +56,8 @@ struct MaiToolContext {
     // 界面才知道是哪一次调用在等回答。
     std::string messageId;
     std::string partId;
+    // 当前批次复用 context；宿主在每次调用前更新此 ID，不能沿用上一个工具身份。
+    std::string callId;
 
     // 子 Agent 的宿主。**可能为空**：宿主没接子 Agent 时就是空的，
     // 那组工具据此明说「这儿起不了」，而不是失败得莫名其妙。
@@ -62,6 +66,10 @@ struct MaiToolContext {
     // 当前 Agent 的会话门面；由一轮对话的宿主提供，不由工具持有。
     // 直接执行工具的测试或未接会话宿主时可为空；这种情况下管理工具必须拒绝操作。
     MaiAgent* sessionAgent = nullptr;
+
+    // 保存及读取当前会话工具输出的宿主存储。可能为空；工具不能持有该指针。
+    // 宿主保证存储活到本次 execute 返回，输出读取仍必须核对 sessionId。
+    MaiSessionStore* toolOutputStore = nullptr;
 
     // 当前 Agent 的专用模型修订记录。直接工具测试或未接持久化的宿主中可能为空；
     // 此时工具不能声称自己记得此前的编辑。
@@ -106,12 +114,18 @@ public:
     static MaiToolResult successWithImages(std::string output, std::vector<MaiToolImage> images);
 
     // message 同样是给模型看的，要写成**它能据此改正**的话。比如"路径超出工作目录，
-    // 只能访问工作目录内的文件"比"权限不足"有用。
-    static MaiToolResult failure(MaiErrorCode code, std::string message);
+    // 只能访问工作目录内的文件"比"权限不足"有用。truncated 如实标记失败时保留的部分输出。
+    static MaiToolResult failure(MaiErrorCode code, std::string message, bool truncated = false);
 
     const std::string& output() const;
     const std::vector<MaiToolImage>& images() const;
     const MaiError& error() const;
+
+    // 原始输出保持原文；可信执行事实单独保存。无值兼容既有工具和历史消息。
+    const std::optional<MaiToolExecution>& execution() const;
+    // 复制事实并返回自身，支持在 success/failure 工厂结果上链式附加。
+    // 调用方不能把模型或原始输出中的自述字段直接当作此处事实。
+    MaiToolResult& withExecution(MaiToolExecution execution);
 
     // 输出被截断过。**一定要如实置位**：
     // 不置的话模型会把"看到的就是全部"当真——grep 只回了前 200 行，它会以为总共就 200 处匹配，
@@ -124,6 +138,7 @@ private:
     std::vector<MaiToolImage> mImages;
     MaiError mError;
     bool mTruncated = false;
+    std::optional<MaiToolExecution> mExecution;
 };
 
 // 一个工具。

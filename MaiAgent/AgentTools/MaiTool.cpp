@@ -19,6 +19,7 @@
 #include "MaiScreenshot.h"
 #include "MaiScreenshotTool.h"
 #include "MaiShellTool.h"
+#include "MaiToolOutputTool.h"
 #include "MaiSubAgentTools.h"
 #include "MaiTimeTool.h"
 #include "MaiTodoWriteTool.h"
@@ -58,9 +59,10 @@ MaiToolResult MaiToolResult::successWithImages(std::string output,
     return result;
 }
 
-MaiToolResult MaiToolResult::failure(MaiErrorCode code, std::string message) {
+MaiToolResult MaiToolResult::failure(MaiErrorCode code, std::string message, bool truncated) {
     MaiToolResult result;
     result.mError = MaiError::make(code, std::move(message));
+    result.mTruncated = truncated;
     return result;
 }
 
@@ -74,6 +76,15 @@ const std::vector<MaiToolImage>& MaiToolResult::images() const {
 
 const MaiError& MaiToolResult::error() const {
     return mError;
+}
+
+const std::optional<MaiToolExecution>& MaiToolResult::execution() const {
+    return mExecution;
+}
+
+MaiToolResult& MaiToolResult::withExecution(MaiToolExecution execution) {
+    mExecution = std::move(execution);
+    return *this;
 }
 
 bool MaiToolResult::isTruncated() const {
@@ -222,6 +233,7 @@ void registerMaiBuiltinTools(MaiToolRegistry& registry) {
 #endif
     registry.add(makeMaiQuestionTool());
     registerMaiSessionTools(registry);
+    registry.add(makeMaiToolOutputReadTool());
     registry.add(makeMaiSpawnAgentTool());
     registry.add(makeMaiWaitAgentTool());
     registry.add(makeMaiSendInputTool());

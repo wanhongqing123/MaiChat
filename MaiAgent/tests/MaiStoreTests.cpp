@@ -347,6 +347,7 @@ void contract_recovers_interrupted_tools(MaiSessionStore& store, const char* whi
         MaiToolPart tool;
         tool.tool = "shell";
         tool.state = state;
+        if (state == MaiToolState::Running) tool.output = "captured before interruption";
         part.body = tool;
         message.parts.push_back(part);
         store.putMessage(session, message);
@@ -377,7 +378,17 @@ void contract_recovers_interrupted_tools(MaiSessionStore& store, const char* whi
     for (const MaiMessage* message : {&pending, &running}) {
         const auto* tool = std::get_if<MaiToolPart>(&message->parts[0].body);
         CHECK(tool && tool->state == MaiToolState::Error);
-        CHECK(tool && tool->error == "interrupted" && tool->output == "interrupted");
+        // 恢复只补执行状态，不能拿错误文案覆盖此前已捕获的原始输出。
+        CHECK(tool && tool->error == "interrupted");
+        CHECK(tool && tool->output == (message == &running ? "captured before interruption" : ""));
+        CHECK(tool && tool->execution.has_value());
+        if (tool && tool->execution) {
+            CHECK(tool->execution->status == (message == &running
+                                                  ? MaiToolExecutionStatus::Unknown
+                                                  : MaiToolExecutionStatus::NotStarted));
+            CHECK(tool->execution->effectStatus ==
+                  (message == &running ? MaiToolEffectStatus::Unknown : MaiToolEffectStatus::None));
+        }
     }
     const auto* finishedTool = std::get_if<MaiToolPart>(&completed.parts[0].body);
     CHECK(finishedTool && finishedTool->state == MaiToolState::Completed);

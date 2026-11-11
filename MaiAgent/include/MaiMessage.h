@@ -2,11 +2,13 @@
 // 对外类型：MaiTextPart、MaiReasoningPart、MaiImagePart、MaiVideoPart；线程、失败和生命周期以类型附近注释为准。
 #pragma once
 
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
 
 #include "MaiTime.h"
+#include "MaiToolExecution.h"
 
 // 一次对话里的消息和它的组成片段。
 //
@@ -103,6 +105,9 @@ struct MaiToolPart {
     // 而它只读 tool 消息的 content。
     std::string error;
     MaiToolState state = MaiToolState::Pending;
+    // 宿主/工具提供的执行事实，与 output/error 的原始协议文本分开持久化。
+    // 旧消息可无值；不能把没有事实解释成“未执行”或“可安全重试”。
+    std::optional<MaiToolExecution> execution;
 };
 
 using MaiMessagePartBody = std::variant<MaiTextPart, MaiReasoningPart, MaiImagePart, MaiToolPart,

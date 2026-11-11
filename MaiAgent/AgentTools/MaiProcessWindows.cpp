@@ -26,7 +26,7 @@ std::wstring toWide(const std::string& utf8) {
     return wide;
 }
 
-std::string normalizeOutputUtf8(const std::string& bytes) {
+std::string normalizeOutputUtf8(const std::string& bytes, bool truncated) {
     if (bytes.empty()) return {};
 
     // 很多现代 CLI 直接写 UTF-8，先原样保留。不能无条件按 OEM 代码页转：那会把 git、
@@ -34,6 +34,23 @@ std::string normalizeOutputUtf8(const std::string& bytes) {
     if (::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
                               static_cast<int>(bytes.size()), nullptr, 0) > 0) {
         return bytes;
+    }
+
+    // 捕获上限可能落在 UTF-8 标量内部。若仅尾端是不完整标量，保留完整前缀，
+    // 避免把原本正确的整个 UTF-8 输出错误地按 OEM 解码。
+    if (truncated) {
+        std::size_t begin = bytes.size() - 1;
+        while (begin > 0 && (static_cast<unsigned char>(bytes[begin]) & 0xc0) == 0x80) --begin;
+        const unsigned char first = static_cast<unsigned char>(bytes[begin]);
+        const std::size_t expected = first >= 0xf0 && first <= 0xf4   ? 4
+                                     : first >= 0xe0 && first <= 0xef ? 3
+                                     : first >= 0xc2 && first <= 0xdf ? 2
+                                                                      : 0;
+        if (expected > bytes.size() - begin &&
+            (begin == 0 || ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(),
+                                                 static_cast<int>(begin), nullptr, 0) > 0)) {
+            return bytes.substr(0, begin);
+        }
     }
 
     // cmd.exe 的内建命令和错误信息在重定向后仍可能走 OEM 代码页；中文 Windows 上就是
@@ -96,6 +113,27 @@ void killJob(HANDLE job) {
     if (job != nullptr) ::TerminateJobObject(job, 1);
 }
 
+void appendCapped(const char* data, std::size_t size, const MaiProcessOptions& options,
+                  MaiProcessResult& result) {
+    const std::size_t room = options.maxOutputBytes - result.output.size();
+    result.output.append(data, std::min(room, size));
+    if (size > room) result.truncated = true;
+}
+
+void drainAvailable(HANDLE readEnd, const MaiProcessOptions& options, MaiProcessResult& result) {
+    // 只抽干此刻已到达的字节，不能被仍持有写端的后代进程无限延长收尾。
+    DWORD available = 0;
+    if (!::PeekNamedPipe(readEnd, nullptr, 0, nullptr, &available, nullptr)) return;
+    char buffer[4096];
+    while (available > 0) {
+        DWORD got = 0;
+        const DWORD want = static_cast<DWORD>(std::min<std::size_t>(sizeof(buffer), available));
+        if (!::ReadFile(readEnd, buffer, want, &got, nullptr) || got == 0) break;
+        appendCapped(buffer, got, options, result);
+        available -= got;
+    }
+}
+
 }  // namespace
 
 bool maiIsProcessExecutionSupported() {
@@ -109,6 +147,10 @@ MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& resul
     result = MaiProcessResult{};
     if (options.argv.empty()) {
         return MaiError(MaiErrorCode::InvalidInput, "no command given");
+    }
+    if (options.cancel != nullptr && options.cancel->load(std::memory_order_relaxed)) {
+        result.canceled = true;
+        return MaiError();
     }
 
     SECURITY_ATTRIBUTES inherit{};
@@ -166,56 +208,40 @@ MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& resul
         ::CloseHandle(readEnd);
         return MaiError(MaiErrorCode::NotFound, "could not start \"" + options.argv[0] + "\"");
     }
+    result.started = true;
 
     // Job 要在进程**还挂起**的时候挂上去，不然它可能已经派生出不受管的孙子进程了。
     HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
-    if (job != nullptr) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        ::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
-        ::AssignProcessToJobObject(job, process.hProcess);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (job == nullptr ||
+        !::SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
+                                   sizeof(limits)) ||
+        !::AssignProcessToJobObject(job, process.hProcess)) {
+        // 无法建立整树终止边界时不能放任命令继续执行；此时子进程仍挂起，先销毁再报错。
+        ::TerminateProcess(process.hProcess, 1);
+        ::WaitForSingleObject(process.hProcess, 2000);
+        ::CloseHandle(readEnd);
+        ::CloseHandle(process.hThread);
+        ::CloseHandle(process.hProcess);
+        if (job != nullptr) ::CloseHandle(job);
+        return MaiError(MaiErrorCode::Internal, "could not configure process-tree termination");
     }
-    ::ResumeThread(process.hThread);
+    if (::ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+        killJob(job);
+        ::WaitForSingleObject(process.hProcess, 2000);
+        ::CloseHandle(readEnd);
+        ::CloseHandle(process.hThread);
+        ::CloseHandle(process.hProcess);
+        ::CloseHandle(job);
+        return MaiError(MaiErrorCode::Internal, "could not resume the created process");
+    }
 
     const auto begun = std::chrono::steady_clock::now();
     char buffer[4096];
     while (true) {
-        DWORD available = 0;
-        if (::PeekNamedPipe(readEnd, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
-            DWORD got = 0;
-            const DWORD want = static_cast<DWORD>(std::min<std::size_t>(sizeof(buffer), available));
-            if (!::ReadFile(readEnd, buffer, want, &got, nullptr) || got == 0) break;
-            // 超了上限就不再收，但照常把管道抽干：不抽的话子进程会卡在写管道上，
-            // 于是它永远不退出，我们只能等超时。
-            if (result.output.size() < options.maxOutputBytes) {
-                const std::size_t room = options.maxOutputBytes - result.output.size();
-                result.output.append(buffer, std::min<std::size_t>(room, got));
-                if (got > room) result.truncated = true;
-            } else {
-                result.truncated = true;
-            }
-            continue;
-        }
-
-        const DWORD waited = ::WaitForSingleObject(process.hProcess, 0);
-        if (waited == WAIT_OBJECT_0) {
-            // 进程没了，管道里可能还有剩的，抽干再走。
-            DWORD rest = 0;
-            while (::PeekNamedPipe(readEnd, nullptr, 0, nullptr, &rest, nullptr) && rest > 0) {
-                DWORD got = 0;
-                const DWORD want = static_cast<DWORD>(std::min<std::size_t>(sizeof(buffer), rest));
-                if (!::ReadFile(readEnd, buffer, want, &got, nullptr) || got == 0) break;
-                if (result.output.size() < options.maxOutputBytes) {
-                    const std::size_t room = options.maxOutputBytes - result.output.size();
-                    result.output.append(buffer, std::min<std::size_t>(room, got));
-                    if (got > room) result.truncated = true;
-                } else {
-                    result.truncated = true;
-                }
-            }
-            break;
-        }
-
+        if (::WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0) break;
+        // 读取成功后的 continue 不能绕过中断检查，否则持续打印会无限延长执行。
         if (options.cancel != nullptr && options.cancel->load(std::memory_order_relaxed)) {
             result.canceled = true;
             killJob(job);
@@ -231,6 +257,17 @@ MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& resul
                 break;
             }
         }
+        DWORD available = 0;
+        if (::PeekNamedPipe(readEnd, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
+            DWORD got = 0;
+            const DWORD want = static_cast<DWORD>(std::min<std::size_t>(sizeof(buffer), available));
+            if (::ReadFile(readEnd, buffer, want, &got, nullptr) && got > 0) {
+                // 超了上限就不再收，但照常把管道抽干：不抽的话子进程会卡在写管道上。
+                appendCapped(buffer, got, options, result);
+                continue;
+            }
+            // 管道关闭并不等于进程退出；继续轮询进程，避免提前报告完成或绕过超时。
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
     }
 
@@ -238,11 +275,22 @@ MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& resul
     DWORD exitCode = 0;
     ::GetExitCodeProcess(process.hProcess, &exitCode);
     result.exitCode = static_cast<int>(exitCode);
+    drainAvailable(readEnd, options, result);
 
     ::CloseHandle(readEnd);
     ::CloseHandle(process.hThread);
     ::CloseHandle(process.hProcess);
     if (job != nullptr) ::CloseHandle(job);
-    result.output = normalizeOutputUtf8(result.output);
+    result.output = normalizeOutputUtf8(result.output, result.truncated);
+    // OEM 转 UTF-8 可能扩张字节数；保留上限约束的是最终工具文本，且不能切坏标量。
+    if (result.output.size() > options.maxOutputBytes) {
+        std::size_t boundary = options.maxOutputBytes;
+        while (boundary > 0 &&
+               (static_cast<unsigned char>(result.output[boundary]) & 0xc0) == 0x80) {
+            --boundary;
+        }
+        result.output.resize(boundary);
+        result.truncated = true;
+    }
     return MaiError();
 }

@@ -14,6 +14,7 @@
 #include "MaiMessage.h"
 #include "MaiSession.h"
 #include "MaiSpecialistTask.h"
+#include "MaiToolOutput.h"
 
 // 持久化接口。
 //
@@ -40,6 +41,21 @@ public:
     virtual void putMessage(const std::string& sessionId, const MaiMessage& message) = 0;
     virtual std::vector<MaiMessage> listMessages(const std::string& sessionId) const = 0;
 
+    // 保存已结束捕获的工具原始字节快照；与消息共享后端锁/事务。
+    // 精确核对已落库的会话、消息、工具片段和 callId；不接受未落库或跨会话归属。
+    // 同一 id 永不覆盖，重复写入返回 InvalidInput。单条超过 16 MiB 同样拒绝。
+    // 成功写入可按 created/id 淘汰最旧快照，将会话/全局字节数限制在 64/256 MiB。
+    // 清空消息或删除会话同步清理其快照；返回值只说明快照保存，不代表执行成功。
+    // 自定义后端默认 NotSupported；不得把失败误报为可恢复的输出句柄。
+    virtual MaiError putToolOutput(const MaiToolOutputRecord& output);
+
+    // 仅读取 sessionId 内的不可变快照，允许与普通写入并发，返回值归调用方持有。
+    // 不存在、已淘汰、跨会话或原始工具归属已失效时返回 NotFound。
+    // 分页预算、UTF-8 边界与结束游标按 MaiToolOutputQuery/Page 契约；不载入全文。
+    // 参数无效返回 InvalidInput，后端故障返回 Internal，默认返回 NotSupported。
+    virtual MaiResult<MaiToolOutputPage> readToolOutput(const std::string& sessionId,
+                                                        const MaiToolOutputQuery& query) const;
+
     // 用户输入的持久接收凭据及未消费队列。返回独立快照；空编号不匹配。
     // 默认实现复用 listMessages，SQLite 实现使用索引，避免重试读取整个会话历史。
     virtual bool getInputMessage(const std::string& sessionId, const std::string& requestId,
@@ -59,6 +75,9 @@ public:
     // 原子地把这些工具标为 Error，并给所属的未完成消息补 completed 时间。
     // 只修改符合条件的记录，不向调用方加载其他会话的完整消息；无匹配项是空操作。
     // error 是回灌给模型及界面的真实错误文本，调用方负责提供；允许与普通读并发。
+    // 原 output 保留；Pending 的执行事实为 NotStarted/None，Running 则为 Unknown/Unknown，
+    // 提示 InspectState；已有 taskId 则保留 QueryStatus 入口。
+    // 不能据重启错误声称无副作用或建议直接重放原操作。
     virtual void recoverInterruptedTools(const std::string& error, std::int64_t completedAt) = 0;
 
     // 最近一次写入失败了吗？没失败返回一个空的 MaiError。

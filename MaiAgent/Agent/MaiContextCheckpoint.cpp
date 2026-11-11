@@ -64,6 +64,11 @@ void appendPart(SourceDigest& digest, const MaiMessagePart& part) {
                 digest.append(body.output);
                 digest.append(body.error);
                 digest.append(maiToolStateToString(body.state));
+                // 旧记录没有此字段，维持既有指纹；新增事实必须使已覆盖源摘要失效。
+                if (body.execution) {
+                    digest.append("MaiToolExecution/v1");
+                    digest.append(maiSerializeToolExecution(*body.execution));
+                }
             }
         },
         part.body);

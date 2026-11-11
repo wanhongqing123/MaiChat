@@ -1,6 +1,15 @@
 // 文件作用：为自定义存储提供用户输入凭据及队列的普通查询兜底。
 #include "MaiSessionStore.h"
 
+MaiError MaiSessionStore::putToolOutput(const MaiToolOutputRecord&) {
+    return {MaiErrorCode::NotSupported, "This session store does not retain tool output."};
+}
+
+MaiResult<MaiToolOutputPage> MaiSessionStore::readToolOutput(const std::string&,
+                                                             const MaiToolOutputQuery&) const {
+    return {MaiErrorCode::NotSupported, "This session store does not retain tool output."};
+}
+
 bool MaiSessionStore::getContextCheckpoint(const std::string&, MaiContextCheckpoint&) const {
     return false;
 }

@@ -311,6 +311,9 @@ std::vector<SourceField> sourceFields(const std::vector<MaiMessage>& history,
                 add("tool_input", tool->input);
                 add("tool_output", tool->output);
                 add("tool_error", tool->error);
+                // 摘要保留输出句柄与执行事实，压缩不能把“结果未知”改成“没有执行”。
+                if (tool->execution)
+                    add("tool_execution", maiSerializeToolExecution(*tool->execution));
             } else if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
                 add("image_path", image->path);
                 add("image_mime", image->mimeType);

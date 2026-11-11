@@ -38,12 +38,15 @@ struct MaiToolDetailPage {
     bool textIsValidUtf8 = true;
 };
 
-// 对 tool/state/callId/input/output/error 的原字节按长度分帧计算 SHA256（64位小写十六进制）。
+// 对 tool/state/callId/input/output/error 及可选 execution 的原字节按长度分帧计算 SHA256。
+// 结果为 64 位小写十六进制；execution 缺省时保持旧记录的版本兼容。
 // 不包含查询偏移；任一工具字段改变都会改变版本。摘要失败返回空串，读取入口会报告 Internal。
 std::string maiToolDetailRevision(const MaiToolPart& tool);
 
 // sessionId 必须来自宿主已鉴权的归属绑定。同步只读：仅一次 getMessage 获取独立快照，
 // 可与活动工具并发读取，不写原史、不调用模型/工具、不访问字段内的文件或 URL。
+// output 有已验证的完整保留快照时分页读取它；捕获不完整时保留原预览警告，
+// 此时普通 readToolOutput/tool_output_read 可补读部分快照并取得不完整标志。
 // 消息/part不存在或归属不符为 NotFound；字段、ID、偏移或1..4096预算非法为 InvalidInput。
 // 合法UTF-8标量不可拆；非法原字节按单字节前进。预算容不下下一个完整标量则 InvalidInput，
 // 调用方可增大 limit；不返回无法推进的成功页。版本不符为 Busy（detail_changed），应从首屏重读。

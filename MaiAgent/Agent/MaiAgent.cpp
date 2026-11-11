@@ -121,7 +121,9 @@ std::string inputFingerprint(const MaiMessage& message) {
 }
 
 constexpr const char* kInterruptedToolError =
-    "Tool execution was interrupted when the app stopped. Retry if needed.";
+    "The app stopped before a final tool result was recorded. The operation may have already "
+    "produced effects. Inspect its current state or query the existing task before considering "
+    "another attempt; do not blindly repeat the operation.";
 
 const char* specialistStatusName(MaiSpecialistTaskStatus status) {
     switch (status) {
@@ -947,6 +949,11 @@ MaiResult<MaiConversationHistoryPage> MaiAgent::readHistory(
 MaiResult<MaiToolDetailPage> MaiAgent::readToolDetail(const std::string& sessionId,
                                                       const MaiToolDetailQuery& query) const {
     return maiReadToolDetail(*mRuntime->store, sessionId, query);
+}
+
+MaiResult<MaiToolOutputPage> MaiAgent::readToolOutput(const std::string& sessionId,
+                                                      const MaiToolOutputQuery& query) const {
+    return mRuntime->store->readToolOutput(sessionId, query);
 }
 
 std::vector<MaiQuestionRequest> MaiAgent::listPendingQuestions() const {

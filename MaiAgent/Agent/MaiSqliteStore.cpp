@@ -198,20 +198,24 @@ public:
 
         // 显式逐级删，不靠 ON DELETE CASCADE：外键约束要连接上开了 PRAGMA foreign_keys 才生效，
         // 而那个 pragma 是每连接的，将来谁新开一个连接忘了设，删除就会只删一半、留下孤儿行。
-        executeStatementWithTextArgument(
-            "DELETE FROM parts WHERE message_id IN "
-            "(SELECT id FROM messages WHERE session_id = ?1)",
-            id);
-        executeStatementWithTextArgument("DELETE FROM messages WHERE session_id = ?1", id);
-        executeStatementWithTextArgument("DELETE FROM context_checkpoints WHERE session_id = ?1",
-                                         id);
-        executeStatementWithTextArgument("DELETE FROM specialist_tasks WHERE owner_session_id = ?1",
-                                         id);
-        executeStatementWithTextArgument("DELETE FROM sessions WHERE id = ?1", id);
+        bool ok =
+            executeStatementWithTextArgument("DELETE FROM tool_outputs WHERE session_id = ?1", id);
+        ok = ok && executeStatementWithTextArgument(
+                       "DELETE FROM parts WHERE message_id IN "
+                       "(SELECT id FROM messages WHERE session_id = ?1)",
+                       id);
+        ok = ok &&
+             executeStatementWithTextArgument("DELETE FROM messages WHERE session_id = ?1", id);
+        ok = ok && executeStatementWithTextArgument(
+                       "DELETE FROM context_checkpoints WHERE session_id = ?1", id);
+        ok = ok && executeStatementWithTextArgument(
+                       "DELETE FROM specialist_tasks WHERE owner_session_id = ?1", id);
+        ok = ok && executeStatementWithTextArgument("DELETE FROM sessions WHERE id = ?1", id);
         const int removed = sqlite3_changes(mDatabase);
 
-        executeTransactionStatement("COMMIT");
-        return removed > 0;
+        if (ok && executeTransactionStatement("COMMIT")) return removed > 0;
+        executeTransactionStatement("ROLLBACK");
+        return false;
     }
 
     bool clearMessages(const std::string& sessionId) override {
@@ -228,17 +232,147 @@ public:
 
         if (!executeTransactionStatement("BEGIN IMMEDIATE")) return false;
         // 和 removeSession 一样显式逐级删，理由见那边的注释。
-        executeStatementWithTextArgument(
-            "DELETE FROM parts WHERE message_id IN "
-            "(SELECT id FROM messages WHERE session_id = ?1)",
-            sessionId);
-        executeStatementWithTextArgument("DELETE FROM messages WHERE session_id = ?1", sessionId);
-        executeStatementWithTextArgument("DELETE FROM context_checkpoints WHERE session_id = ?1",
-                                         sessionId);
-        executeStatementWithTextArgument("DELETE FROM specialist_tasks WHERE owner_session_id = ?1",
-                                         sessionId);
-        executeTransactionStatement("COMMIT");
-        return true;
+        bool ok = executeStatementWithTextArgument("DELETE FROM tool_outputs WHERE session_id = ?1",
+                                                   sessionId);
+        ok = ok && executeStatementWithTextArgument(
+                       "DELETE FROM parts WHERE message_id IN "
+                       "(SELECT id FROM messages WHERE session_id = ?1)",
+                       sessionId);
+        ok = ok && executeStatementWithTextArgument("DELETE FROM messages WHERE session_id = ?1",
+                                                    sessionId);
+        ok = ok && executeStatementWithTextArgument(
+                       "DELETE FROM context_checkpoints WHERE session_id = ?1", sessionId);
+        ok = ok && executeStatementWithTextArgument(
+                       "DELETE FROM specialist_tasks WHERE owner_session_id = ?1", sessionId);
+        if (ok && executeTransactionStatement("COMMIT")) return true;
+        executeTransactionStatement("ROLLBACK");
+        return false;
+    }
+
+    MaiError putToolOutput(const MaiToolOutputRecord& output) override {
+        if (const auto error = maiValidateToolOutputRecord(output)) return error;
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!executeTransactionStatement("BEGIN IMMEDIATE")) return mLastWriteError;
+        auto fail = [&](MaiError error) {
+            executeTransactionStatement("ROLLBACK");
+            return error;
+        };
+        sqlite3_stmt* owner = prepareLocked(
+            "SELECT 1 FROM sessions s JOIN messages m ON m.session_id=s.id "
+            "JOIN parts p ON p.message_id=m.id "
+            "WHERE s.id=?1 AND m.id=?2 AND p.id=?3 AND p.kind=2 AND p.call_id=?4");
+        if (!owner) return fail(mLastWriteError);
+        {
+            Reset guard(owner);
+            bindText(owner, 1, output.sessionId);
+            bindText(owner, 2, output.messageId);
+            bindText(owner, 3, output.partId);
+            bindText(owner, 4, output.callId);
+            const int result = sqlite3_step(owner);
+            if (result == SQLITE_DONE)
+                return fail({MaiErrorCode::InvalidInput, "Tool output owner is invalid."});
+            if (result != SQLITE_ROW) {
+                noteError("tool output ownership read failed: " +
+                          std::string(sqlite3_errmsg(mDatabase)));
+                return fail(mLastWriteError);
+            }
+        }
+        sqlite3_stmt* insert = prepareLocked(
+            "INSERT INTO "
+            "tool_outputs(id,session_id,message_id,part_id,call_id,payload,truncated,created) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,?8)");
+        if (!insert) return fail(mLastWriteError);
+        {
+            Reset guard(insert);
+            bindText(insert, 1, output.id);
+            bindText(insert, 2, output.sessionId);
+            bindText(insert, 3, output.messageId);
+            bindText(insert, 4, output.partId);
+            bindText(insert, 5, output.callId);
+            // BLOB 不经过 TEXT 编码净化，NUL/非法 UTF-8 字节必须与捕获时完全一致。
+            if (output.text.empty())
+                sqlite3_bind_zeroblob(insert, 6, 0);
+            else
+                sqlite3_bind_blob(insert, 6, output.text.data(),
+                                  static_cast<int>(output.text.size()), SQLITE_TRANSIENT);
+            sqlite3_bind_int(insert, 7, output.truncated ? 1 : 0);
+            sqlite3_bind_int64(insert, 8, output.created);
+            const int result = sqlite3_step(insert);
+            if (result == SQLITE_CONSTRAINT)
+                return fail(
+                    {MaiErrorCode::InvalidInput, "Tool output immutable ID already exists."});
+            if (result != SQLITE_DONE) {
+                noteError("tool output write failed: " + std::string(sqlite3_errmsg(mDatabase)));
+                return fail(mLastWriteError);
+            }
+        }
+        if (!evictToolOutputsLocked(output.sessionId, false) ||
+            !evictToolOutputsLocked(output.sessionId, true))
+            return fail(mLastWriteError);
+        sqlite3_stmt* retained =
+            prepareLocked("SELECT 1 FROM tool_outputs WHERE id=?1 AND payload IS NOT NULL");
+        if (!retained) return fail(mLastWriteError);
+        {
+            Reset guard(retained);
+            bindText(retained, 1, output.id);
+            const int result = sqlite3_step(retained);
+            if (result == SQLITE_DONE)
+                return fail({MaiErrorCode::InvalidInput,
+                             "Tool output is older than the retention window."});
+            if (result != SQLITE_ROW) {
+                noteError("tool output retention read failed: " +
+                          std::string(sqlite3_errmsg(mDatabase)));
+                return fail(mLastWriteError);
+            }
+        }
+        if (!executeTransactionStatement("COMMIT")) return fail(mLastWriteError);
+        return {};
+    }
+
+    MaiResult<MaiToolOutputPage> readToolOutput(const std::string& sessionId,
+                                                const MaiToolOutputQuery& query) const override {
+        if (const auto error = maiValidateToolOutputQuery(sessionId, query)) return error;
+        std::lock_guard<std::mutex> lock(mMutex);
+        // 偏移最多为单条上限，先完成公共校验再做算术；前后各 peek 3 字节足够识别标量边界。
+        const std::size_t windowOffset =
+            query.offsetBytes - std::min<std::size_t>(3, query.offsetBytes);
+        sqlite3_stmt* statement = prepareLocked(
+            "SELECT o.message_id,o.part_id,o.call_id,o.truncated,length(o.payload), "
+            "substr(o.payload,?3,?4) FROM tool_outputs o "
+            "JOIN sessions s ON s.id=o.session_id "
+            "JOIN messages m ON m.id=o.message_id AND m.session_id=o.session_id "
+            "JOIN parts p ON p.id=o.part_id AND p.message_id=o.message_id "
+            "AND p.kind=2 AND p.call_id=o.call_id "
+            "WHERE o.id=?1 AND o.session_id=?2 AND o.payload IS NOT NULL");
+        if (!statement) return mLastWriteError;
+        Reset guard(statement);
+        bindText(statement, 1, query.outputId);
+        bindText(statement, 2, sessionId);
+        sqlite3_bind_int64(statement, 3, static_cast<sqlite3_int64>(windowOffset + 1));
+        sqlite3_bind_int64(statement, 4, static_cast<sqlite3_int64>(query.maxBytes + 6));
+        const int result = sqlite3_step(statement);
+        if (result == SQLITE_DONE)
+            return {MaiErrorCode::NotFound, "Retained tool output is unavailable."};
+        if (result != SQLITE_ROW) {
+            noteError("tool output read failed: " + std::string(sqlite3_errmsg(mDatabase)));
+            return mLastWriteError;
+        }
+        const sqlite3_int64 length = sqlite3_column_int64(statement, 4);
+        if (length < 0 || length > static_cast<sqlite3_int64>(kMaiToolOutputMaxBytes))
+            return {MaiErrorCode::Internal, "Retained tool output size is invalid."};
+        MaiToolOutputRecord output;
+        output.id = query.outputId;
+        output.sessionId = sessionId;
+        output.messageId = textColumn(statement, 0);
+        output.partId = textColumn(statement, 1);
+        output.callId = textColumn(statement, 2);
+        output.truncated = sqlite3_column_int(statement, 3) != 0;
+        const void* data = sqlite3_column_blob(statement, 5);
+        const int count = sqlite3_column_bytes(statement, 5);
+        const std::string_view bytes(count == 0 ? "" : static_cast<const char*>(data),
+                                     static_cast<std::size_t>(count));
+        return maiPageToolOutput(output, query, bytes, windowOffset,
+                                 static_cast<std::size_t>(length));
     }
 
     MaiError insertSpecialistTask(const MaiSpecialistTask& task) override {
@@ -858,25 +992,65 @@ public:
         }
 
         sqlite3_stmt* parts = prepareLocked(
-            "UPDATE parts SET state = 3, error = ?1, output = ?1 "
+            "SELECT id,state,execution FROM parts "
             "WHERE kind = 2 AND state IN (0, 1)");
         if (!parts) {
             executeTransactionStatement("ROLLBACK");
             return;
         }
-        bool updatedParts = false;
+        // 只读取未完成工具的元数据，保留其原始 output 以及已获知的输出/任务句柄。
+        std::vector<std::pair<std::string, std::string>> recovered;
+        bool readParts = false;
         {
             Reset guard(parts);
-            bindText(parts, 1, error);
-            updatedParts = sqlite3_step(parts) == SQLITE_DONE;
+            int result = SQLITE_ROW;
+            while ((result = sqlite3_step(parts)) == SQLITE_ROW) {
+                const bool pending = sqlite3_column_int(parts, 1) == 0;
+                MaiToolExecution execution;
+                maiParseToolExecution(textColumn(parts, 2), execution);
+                execution.status =
+                    pending ? MaiToolExecutionStatus::NotStarted : MaiToolExecutionStatus::Unknown;
+                execution.effectStatus =
+                    pending ? MaiToolEffectStatus::None : MaiToolEffectStatus::Unknown;
+                execution.nextAction = pending ? MaiToolNextAction::None
+                                       : !execution.taskId.empty()
+                                           ? MaiToolNextAction::QueryStatus
+                                           : MaiToolNextAction::InspectState;
+                execution.exitCode.reset();
+                if (pending) {
+                    execution.started = false;
+                    execution.timedOut = false;
+                    execution.canceled = false;
+                } else if (!execution.started.value_or(false))
+                    execution.started.reset();
+                recovered.emplace_back(textColumn(parts, 0), maiSerializeToolExecution(execution));
+            }
+            readParts = result == SQLITE_DONE;
         }
-        if (!updatedParts) {
+        if (!readParts) {
             noteError("interrupted tool recovery failed: " +
                       std::string(sqlite3_errmsg(mDatabase)));
             executeTransactionStatement("ROLLBACK");
             return;
         }
-        executeTransactionStatement("COMMIT");
+        sqlite3_stmt* update = prepareLocked(
+            "UPDATE parts SET state=3,error=?1,execution=?2 WHERE id=?3 AND kind=2 AND state IN "
+            "(0,1)");
+        if (!update) {
+            executeTransactionStatement("ROLLBACK");
+            return;
+        }
+        for (const auto& entry : recovered) {
+            Reset guard(update);
+            bindText(update, 1, error);
+            bindText(update, 2, entry.second);
+            bindText(update, 3, entry.first);
+            if (!executePreparedStatement(update)) {
+                executeTransactionStatement("ROLLBACK");
+                return;
+            }
+        }
+        if (!executeTransactionStatement("COMMIT")) executeTransactionStatement("ROLLBACK");
     }
 
     MaiError lastWriteError() const override {
@@ -925,6 +1099,55 @@ private:
             sqlite3_clear_bindings(statement);
         }
     };
+
+    // 调用方持有写事务；只读取长度与编号，淘汰时置 NULL 保留不可复用编号墓碑。
+    bool evictToolOutputsLocked(const std::string& sessionId, bool global) {
+        sqlite3_stmt* sum =
+            prepareLocked(global ? "SELECT COALESCE(SUM(length(payload)),0) FROM tool_outputs "
+                                   "WHERE payload IS NOT NULL"
+                                 : "SELECT COALESCE(SUM(length(payload)),0) FROM tool_outputs "
+                                   "WHERE session_id=?1 AND payload IS NOT NULL");
+        if (!sum) return false;
+        sqlite3_int64 bytes = 0;
+        {
+            Reset guard(sum);
+            if (!global) bindText(sum, 1, sessionId);
+            if (sqlite3_step(sum) != SQLITE_ROW) {
+                noteError("tool output quota read failed: " +
+                          std::string(sqlite3_errmsg(mDatabase)));
+                return false;
+            }
+            bytes = sqlite3_column_int64(sum, 0);
+        }
+        const auto limit = static_cast<sqlite3_int64>(global ? kMaiToolOutputTotalMaxBytes
+                                                             : kMaiToolOutputSessionMaxBytes);
+        while (bytes > limit) {
+            sqlite3_stmt* oldest = prepareLocked(
+                global ? "SELECT id,length(payload) FROM tool_outputs WHERE payload IS NOT NULL "
+                         "ORDER BY created,id LIMIT 1"
+                       : "SELECT id,length(payload) FROM tool_outputs WHERE session_id=?1 AND "
+                         "payload IS NOT NULL ORDER BY created,id LIMIT 1");
+            if (!oldest) return false;
+            std::string id;
+            sqlite3_int64 removed = 0;
+            {
+                Reset guard(oldest);
+                if (!global) bindText(oldest, 1, sessionId);
+                if (sqlite3_step(oldest) != SQLITE_ROW) {
+                    noteError("tool output eviction read failed: " +
+                              std::string(sqlite3_errmsg(mDatabase)));
+                    return false;
+                }
+                id = textColumn(oldest, 0);
+                removed = sqlite3_column_int64(oldest, 1);
+            }
+            if (!executeStatementWithTextArgument(
+                    "UPDATE tool_outputs SET payload=NULL WHERE id=?1", id))
+                return false;
+            bytes -= removed;
+        }
+        return true;
+    }
 
     MaiSession readSession(sqlite3_stmt* statement) const {
         MaiSession session;
@@ -994,7 +1217,8 @@ private:
     void writePartLocked(const std::string& messageId, const MaiMessagePart& part) {
         sqlite3_stmt* statement = prepareLocked(
             "INSERT INTO parts(id, message_id, kind, created, text, tool, call_id, input, "
-            "output, error, state) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)");
+            "output, error, state, execution) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, "
+            "?12)");
         if (!statement) return;
         Reset guard(statement);
 
@@ -1002,7 +1226,7 @@ private:
         // 这样 sqlite3 命令行能直接查——排障时能看见"那次 write 的 input 到底是什么"，
         // 而不是一坨转义过的字符串。也省掉了把 nlohmann 拖进核心。
         int kind = kText;
-        std::string text, tool, callId, input, output, error;
+        std::string text, tool, callId, input, output, error, execution;
         int state = 0;
         if (const auto* textBody = std::get_if<MaiTextPart>(&part.body)) {
             kind = kText;
@@ -1030,6 +1254,7 @@ private:
             output = toolBody->output;
             error = toolBody->error;
             state = toolStateToColumn(toolBody->state);
+            if (toolBody->execution) execution = maiSerializeToolExecution(*toolBody->execution);
         }
 
         bindText(statement, 1, part.id);
@@ -1043,6 +1268,7 @@ private:
         bindText(statement, 9, output);
         bindText(statement, 10, error);
         sqlite3_bind_int(statement, 11, state);
+        bindText(statement, 12, execution);
         executePreparedStatement(statement);
     }
 
@@ -1051,7 +1277,7 @@ private:
         if (succeeded) *succeeded = false;
         std::vector<MaiMessagePart> out;
         sqlite3_stmt* statement = prepareLocked(
-            "SELECT id, kind, created, text, tool, call_id, input, output, error, state "
+            "SELECT id, kind, created, text, tool, call_id, input, output, error, state, execution "
             "FROM parts WHERE message_id = ?1 ORDER BY id");
         if (!statement) return out;
         Reset guard(statement);
@@ -1078,6 +1304,9 @@ private:
                 tool.output = textColumn(statement, 7);
                 tool.error = textColumn(statement, 8);
                 tool.state = columnToToolState(sqlite3_column_int(statement, 9));
+                MaiToolExecution execution;
+                if (maiParseToolExecution(textColumn(statement, 10), execution))
+                    tool.execution = std::move(execution);
                 part.body = std::move(tool);
             } else {
                 part.body = MaiTextPart{textColumn(statement, 3)};
@@ -1104,19 +1333,20 @@ private:
     }
 
     // 推进一条已绑定参数的写入语句，并记录 SQLite 返回的首个错误。
-    void executePreparedStatement(sqlite3_stmt* statement) {
+    bool executePreparedStatement(sqlite3_stmt* statement) {
         const int code = sqlite3_step(statement);
-        if (code != SQLITE_DONE && code != SQLITE_ROW)
-            noteError("write failed: " + std::string(sqlite3_errmsg(mDatabase)));
+        if (code == SQLITE_DONE || code == SQLITE_ROW) return true;
+        noteError("write failed: " + std::string(sqlite3_errmsg(mDatabase)));
+        return false;
     }
 
     // 为单文本参数语句准备、绑定并执行，再用作用域守卫重置缓存句柄。
-    void executeStatementWithTextArgument(const char* sql, const std::string& argument) {
+    bool executeStatementWithTextArgument(const char* sql, const std::string& argument) {
         sqlite3_stmt* statement = prepareLocked(sql);
-        if (!statement) return;
+        if (!statement) return false;
         Reset guard(statement);
         bindText(statement, 1, argument);
-        executePreparedStatement(statement);
+        return executePreparedStatement(statement);
     }
 
     // 执行 BEGIN、COMMIT 或 ROLLBACK 等事务控制语句。
@@ -1508,6 +1738,49 @@ MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
             sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
             sqlite3_close(database);
             return {MaiErrorCode::Internal, "cannot migrate schema to v10: " + what};
+        }
+        sqlite3_free(migrationError);
+    }
+    if (readUserVersion(database) < 11) {
+        // 写锁内复查列，兼容并发迁移与测试中的旧版本号；旧消息保留无元数据状态。
+        char* migrationError = nullptr;
+        bool ok = sqlite3_exec(database, "BEGIN IMMEDIATE", nullptr, nullptr, &migrationError) ==
+                  SQLITE_OK;
+        bool hasExecution = false;
+        sqlite3_stmt* columns = nullptr;
+        if (ok)
+            ok = sqlite3_prepare_v2(database, "PRAGMA table_info(parts)", -1, &columns, nullptr) ==
+                 SQLITE_OK;
+        if (ok) {
+            int result = SQLITE_ROW;
+            while ((result = sqlite3_step(columns)) == SQLITE_ROW)
+                if (textColumn(columns, 1) == "execution") hasExecution = true;
+            ok = result == SQLITE_DONE;
+        }
+        sqlite3_finalize(columns);
+        if (ok && !hasExecution)
+            ok = sqlite3_exec(database,
+                              "ALTER TABLE parts ADD COLUMN execution TEXT NOT NULL DEFAULT ''",
+                              nullptr, nullptr, &migrationError) == SQLITE_OK;
+        if (ok)
+            ok = sqlite3_exec(
+                     database,
+                     "CREATE TABLE IF NOT EXISTS tool_outputs("
+                     "id TEXT PRIMARY KEY,session_id TEXT NOT NULL,message_id TEXT NOT NULL,"
+                     "part_id TEXT NOT NULL,call_id TEXT NOT NULL,payload BLOB,"
+                     "truncated INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL);"
+                     "CREATE INDEX IF NOT EXISTS tool_outputs_session ON "
+                     "tool_outputs(session_id,created,id);"
+                     "CREATE INDEX IF NOT EXISTS tool_outputs_oldest ON tool_outputs(created,id) "
+                     "WHERE payload IS NOT NULL;"
+                     "PRAGMA user_version=11;COMMIT;",
+                     nullptr, nullptr, &migrationError) == SQLITE_OK;
+        if (!ok) {
+            const std::string what = migrationError ? migrationError : sqlite3_errmsg(database);
+            sqlite3_free(migrationError);
+            sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
+            sqlite3_close(database);
+            return {MaiErrorCode::Internal, "cannot migrate schema to v11: " + what};
         }
         sqlite3_free(migrationError);
     }

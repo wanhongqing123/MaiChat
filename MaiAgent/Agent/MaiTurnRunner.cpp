@@ -50,177 +50,79 @@ constexpr const char* kRepeatedToolFinalHint =
     "You cannot call more tools in this turn. Explain what you learned and what remains "
     "unfinished. Do not claim progress that the tool results do not show.";
 
-// 只把明确的欠费信号归入余额不足；普通网络错误和限流不能按欠费处理。
-bool isBalanceFailure(const nlohmann::json& error) {
-    if (!error.is_object()) return false;
-    const auto providerCode = error.value("provider_code", nlohmann::json{});
-    if (providerCode.is_number_integer() && (providerCode == 1008 || providerCode == 1102))
-        return true;
-    std::string detail;
-    if (providerCode.is_string()) detail = providerCode.get<std::string>() + " ";
-    for (const char* field : {"message", "error", "reply"}) {
-        if (error.contains(field) && error[field].is_string())
-            detail += error[field].get<std::string>() + " ";
-    }
-    std::transform(detail.begin(), detail.end(), detail.begin(),
-                   [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
-    return detail.find("insufficient_balance") != std::string::npos ||
-           detail.find("insufficient balance") != std::string::npos ||
-           detail.find("balance insufficient") != std::string::npos ||
-           detail.find("balance not enough") != std::string::npos ||
-           detail.find("account balance") != std::string::npos ||
-           detail.find("arrears") != std::string::npos;
+MaiToolExecution notStartedExecution() {
+    MaiToolExecution execution;
+    execution.status = MaiToolExecutionStatus::NotStarted;
+    execution.effectStatus = MaiToolEffectStatus::None;
+    execution.started = false;
+    return execution;
 }
 
-// 一个供应商欠费不代表整个用户任务结束。保留素材，寻找可用模型；视频换模型前
-// 仍需用户选择，已提交任务的查询失败则绝不能重复付费提交。
-constexpr const char* kBalanceRecovery =
-    "This provider cannot accept more work because its balance is insufficient. Do not stop "
-    "the user's task, ask for a top-up, or retry this provider. Keep the original request and "
-    "media references. Check other configured specialist tools and continue with a suitable "
-    "provider, using the normal paid-call approval for any new submission. For video generation, "
-    "confirm a different model choice with the user before its paid call. Report an obstacle "
-    "to the user only after practical alternatives have been exhausted. If this error came "
-    "from checking an already-submitted task, its outcome is unverified; do not claim that "
-    "generation failed or silently submit a duplicate paid task.";
-
-// 把子任务失败状态转换成可回灌给主 Agent 的准确说明。
-// 只使用真实错误与已确认的产物，不能把查询异常写成生成失败。
-std::string specialistFailureGuidance(const nlohmann::json& specialist) {
-    // 子工具失败先把原始结果回灌主模型，再按可观察到的信号附加下一步建议。
-    // 下方每个分支只是建议，不把笼统审核标签伪装成已查明的根因。
-    if (isBalanceFailure(specialist)) return std::string(" ") + kBalanceRecovery;
-    std::string detail;
-    for (const char* field : {"message", "error", "reply", "provider_message"}) {
-        if (!specialist.contains(field)) continue;
-        const nlohmann::json& value = specialist[field];
-        if (value.is_string()) detail += value.get<std::string>() + " ";
-        if (value.is_object() && value.value("message", nlohmann::json{}).is_string())
-            detail += value["message"].get<std::string>() + " ";
+// continue 的参数只提供查找键；只有同会话、同工具的任务表或可信 typed 字段能证明接受身份。
+// shell、文件和供应商原始文本都可能包含 task_id 自述，不能据此升级成宿主事实。
+std::optional<MaiToolExecution> acceptedTaskExecution(const MaiToolInvocation& call,
+                                                      const MaiToolContext& context) {
+    const auto input = nlohmann::json::parse(call.arguments, nullptr, false);
+    if (!input.is_object() || input.value("action", nlohmann::json{}) != "continue" ||
+        !input.value("conversation_id", nlohmann::json{}).is_string())
+        return {};
+    const auto id = input["conversation_id"].get<std::string>();
+    if (id.empty()) return {};
+    MaiSpecialistTask task;
+    if (context.specialistTasks &&
+        context.specialistTasks->getSpecialistTask(id, context.sessionId, task) &&
+        task.specialistName == call.name && !task.providerTaskId.empty()) {
+        MaiToolExecution execution;
+        execution.taskId = task.providerTaskId;
+        execution.effectStatus = MaiToolEffectStatus::Confirmed;
+        switch (task.status) {
+            case MaiSpecialistTaskStatus::Failed:
+                execution.status = MaiToolExecutionStatus::Failed;
+                break;
+            case MaiSpecialistTaskStatus::Canceled:
+                execution.status = MaiToolExecutionStatus::Canceled;
+                execution.canceled = true;
+                break;
+            case MaiSpecialistTaskStatus::Succeeded:
+                execution.status = MaiToolExecutionStatus::Completed;
+                // 生成已完成但本次读取可能仍失败；允许按同一任务恢复产物，不能重新提交。
+                execution.nextAction = MaiToolNextAction::QueryStatus;
+                execution.recoveryTool = call.name;
+                break;
+            case MaiSpecialistTaskStatus::Submitted:
+            case MaiSpecialistTaskStatus::Running:
+            case MaiSpecialistTaskStatus::NeedsInput:
+                execution.nextAction = MaiToolNextAction::QueryStatus;
+                execution.recoveryTool = call.name;
+                break;
+        }
+        return execution;
     }
-    if (specialist.contains("provider_code")) {
-        const nlohmann::json& code = specialist["provider_code"];
-        if (code.is_string()) detail += code.get<std::string>();
-        if (code.is_number_integer()) detail += std::to_string(code.get<std::int64_t>());
+    if (!context.toolOutputStore) return {};
+    const auto history = context.toolOutputStore->listMessages(context.sessionId);
+    for (auto message = history.rbegin(); message != history.rend(); ++message) {
+        for (auto part = message->parts.rbegin(); part != message->parts.rend(); ++part) {
+            const auto* previous = std::get_if<MaiToolPart>(&part->body);
+            if (!previous || previous->tool != call.name || !previous->execution ||
+                previous->execution->taskId != id ||
+                previous->execution->effectStatus != MaiToolEffectStatus::Confirmed)
+                continue;
+            // 只继承任务身份与终态；输出句柄、退出码和 started 属于原调用，不能转移给新查询。
+            MaiToolExecution execution;
+            execution.taskId = id;
+            execution.effectStatus = MaiToolEffectStatus::Confirmed;
+            execution.status = previous->execution->status;
+            execution.canceled = previous->execution->canceled;
+            if (previous->execution->nextAction == MaiToolNextAction::QueryStatus) {
+                if (execution.status != MaiToolExecutionStatus::Completed)
+                    execution.status = MaiToolExecutionStatus::Unknown;
+                execution.nextAction = MaiToolNextAction::QueryStatus;
+                execution.recoveryTool = call.name;
+            }
+            return execution;
+        }
     }
-    std::transform(detail.begin(), detail.end(), detail.begin(),
-                   [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
-    if (specialist.value("specialist", std::string{}) == "seedance_video" &&
-        (detail.find("real person") != std::string::npos ||
-         detail.find("human face") != std::string::npos ||
-         detail.find("portrait") != std::string::npos)) {
-        // Seedance 报可能有真人时，保留原素材并要求真人授权组；不能降级到 AIGC 组，
-        // 也不能通过改脸绕过审核。重试仍须使用 Active 资产和新的付费确认。
-        return " The Seedance attempt was rejected for a possible real person. Keep every "
-               "original image and video unchanged. Do not register a natural person in an "
-               "AIGC group. Use an existing LivenessFace group for that person, or complete "
-               "ark_assets begin_real_validation and get_real_validation first. Prepare each "
-               "required local medium through OSS and Ark Assets, wait until every asset is "
-               "Active, then retry the same Seedance model using only asset:// IDs and new "
-               "paid-call approval. Do not resubmit local paths or silently drop an input. "
-               "Do not flip, repaint, or rewrite a face to evade review. If registration is "
-               "Processing or Failed, report that actual state instead of changing models.";
-    }
-    if (detail.find("text sensitive") != std::string::npos ||
-        detail.find("prompt sensitive") != std::string::npos) {
-        // 文本敏感标签只说明上游怎样归类，不证明参考图已经过审；先核对原请求文本。
-        return " This attempt failed. The provider labeled the text input as sensitive. Inspect "
-               "the exact submitted "
-               "instruction for unnecessary or ambiguous wording, then propose a concise "
-               "rewrite that preserves the legitimate action. That label alone does not prove "
-               "the reference image was accepted; compare inputs one at a time if needed. "
-               "Show the next plan and obtain new per-call approval before a paid retry.";
-    }
-    if (detail.find("real person") != std::string::npos ||
-        detail.find("human face") != std::string::npos ||
-        detail.find("portrait") != std::string::npos) {
-        // 其他模型报告真人时，区分“明确要求授权”和“模糊审核结果”。允许处理的图像
-        // 先轻度处理，仍失败才考虑较强处理，并把处理损失如实写入后续提示词。
-        return " This attempt failed. The provider reported a possible real person in the "
-               "reference image. This signal alone does not prove an explicit authorization "
-               "requirement. Inspect the raw provider wording, selected tool limitation, and "
-               "exact submitted image. If the provider explicitly forbids recognizable "
-               "real-person references without an authorized asset and the user's goal needs "
-               "the same identity, do not hide the face in an edited image and reconstruct it "
-               "with text. Briefly offer the authorized-asset path or a visibly fictional "
-               "subject; ask before proposing another model. Otherwise, for a permitted "
-               "derivative, do not switch providers yet. Preserve the original, then first "
-               "use local FFmpeg/OpenCV image tools for a light, legitimate transformation. "
-               "Preview the "
-               "derivative and retry the same provider with new per-call approval. If it is still "
-               "rejected, consider a stronger FFmpeg oil-paint-style derivative as a last "
-               "image-processing "
-               "step. Record details lost at each step and describe permitted details accurately "
-               "in the next prompt so the result remains close to the original goal. Consider "
-               "another provider only after these bounded same-provider attempts.";
-    }
-    if (detail.find("image sensitive") != std::string::npos ||
-        detail.find("reference image") != std::string::npos) {
-        // 明确指向参考图时，主模型应保留原图、预览衍生图，再用同一模型重试。
-        return " This attempt failed. The provider identified the reference image. Inspect its "
-               "actual content and role, preserve the original, then use FFmpeg/OpenCV image tools "
-               "for the "
-               "smallest permitted transformation that still serves the user's goal. Preview "
-               "the derivative and retry this provider with new per-call approval. Only if that "
-               "fails, consider a stronger FFmpeg oil-paint-style derivative as the last "
-               "image-processing "
-               "step. Record changed or lost traits and describe desired permitted details in "
-               "the next prompt. Consider a different provider only after these bounded "
-               "same-provider attempts.";
-    }
-    if (detail.find("sensitive") != std::string::npos ||
-        detail.find("moderation") != std::string::npos ||
-        detail.find("1026") != std::string::npos) {
-        // 审核原因笼统时不能仅凭错误码判定是文字还是图片；逐项核对实际提交输入。
-        return " This attempt failed. The provider gave an ambiguous input-moderation result. Do "
-               "not assign it to text or image without evidence. Inspect the exact submitted "
-               "prompt and source image. If evidence points to the photo, preserve the original "
-               "and "
-               "first use FFmpeg/OpenCV image tools for a light, permitted user-consistent "
-               "transformation; "
-               "preview the derivative and retry the same provider with new per-call approval. "
-               "If image evidence still points to the image, a stronger FFmpeg oil-paint-style "
-               "derivative is "
-               "the last image-processing step. Record changed or lost details and describe "
-               "desired permitted details in the next prompt. Change text separately if its "
-               "wording is implicated. Consider another provider only after bounded, "
-               "justified same-provider attempts have failed; do not launch paid diagnostic "
-               "generations without approval or conceal explicitly prohibited material.";
-    }
-    if (detail.find("output delivery failed") != std::string::npos) {
-        // 生成已完成但下载失败：恢复已有任务产物，不再发起一次收费生成。
-        return " The provider finished, but delivery of its output failed. First recover the "
-               "existing result using the saved task ID and output location; do not submit "
-               "another paid generation just to download the same result.";
-    }
-    if (detail.find("status check failed") != std::string::npos) {
-        // 查询失败无法推断生成失败；保留任务 ID 后继续安全查询。
-        return " The status check failed, so the accepted provider task's result is unknown. "
-               "Keep its task ID, inspect the original provider error, and try a safe status "
-               "recovery before considering a new generation. Never claim that generation "
-               "failed or silently create a duplicate paid task.";
-    }
-    if (detail.find("rate limit") != std::string::npos ||
-        detail.find("temporarily unavailable") != std::string::npos ||
-        detail.find("timeout") != std::string::npos) {
-        // 暂时性故障可有界重试，但不能把同一收费请求重复提交。
-        return " This appears temporary. Use a bounded retry or an available equivalent "
-               "specialist while preserving the original task. Do not repeatedly submit the "
-               "same paid generation.";
-    }
-    if (detail.find("invalid input") != std::string::npos ||
-        detail.find("unsupported") != std::string::npos ||
-        detail.find("invalid_input") != std::string::npos) {
-        // 字段类错误由主模型结合工具规则修正，避免让用户承担参数排错。
-        return " Check the exact rejected field and repair it locally while preserving the "
-               "user's creative intent. Then continue the task using the normal paid-call "
-               "approval; do not ask the user to diagnose an implementation detail.";
-    }
-    // 未识别错误也要把失败交给主模型继续判断，不能吞掉子工具结果。
-    return " The specialist did not provide a classified recovery path. Inspect its exact "
-           "error and execution stage, preserve the original task and media references, "
-           "and try a practical repair or a capable alternate specialist before reporting "
-           "an unresolved result to the user. Do not make speculative paid retry calls.";
+    return {};
 }
 
 using MaiObservedToolCall = std::tuple<std::string, std::string, MaiToolState, std::string>;
@@ -505,7 +407,8 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
             nlohmann::json::parse(mDependencies.specialistReply, nullptr, false);
         if (specialist.is_object() && specialist.value("status", nlohmann::json{}).is_string() &&
             specialist["status"] == "failed") {
-            instruction.content += specialistFailureGuidance(specialist);
+            instruction.content += maiToolFailureRecoveryGuidance(
+                specialist.value("specialist", std::string{}), specialist.dump());
         }
         messages.push_back(std::move(instruction));
         MaiModelMessage reply;
@@ -656,6 +559,7 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
     context.subAgents = mDependencies.subAgents;
     context.sessionAgent = mDependencies.sessionAgent;
     context.specialistTasks = mDependencies.store;
+    context.toolOutputStore = mDependencies.store;
     context.messageId = mAssistant.id;
     // 广播是在这儿绑的，而不是让工具自己去碰事件总线：工具层不该认识事件。
     MaiEventEmitter* emitter = mDependencies.emitter;
@@ -688,6 +592,10 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         body.tool = call.name;
         body.callId = call.id;
         body.input = call.arguments;
+        body.execution = notStartedExecution();
+        // context 在本批次复用，授权、输出留存和实际 execute 都必须属于当前调用。
+        context.partId = part.id;
+        context.callId = call.id;
         // 要审批的工具先挂在 Pending：界面靠这个状态显示"等待授权"，
         // 不用另外对着 permission.asked 事件维护一张表。
         MaiTool* tool = mDependencies.tools
@@ -711,6 +619,8 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
                                         part.id);
 
         MaiToolResult result;
+        bool enteredExecution = false;
+        std::optional<MaiToolExecution> knownTaskExecution;
         // 广播工具占位期间也可能收到输入；审批和实际执行前都要重新核对。
         replan = replan || hasPendingInput();
         if (replan) {
@@ -739,47 +649,94 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
             if (!allowed) {
                 result = std::move(denial);
             } else {
-                if (needsApproval) {
-                    // 批了才真正开跑。这条状态变化界面等着用——不发的话工具卡会一直停在"等待授权"，
-                    // 直到它跑完才跳变。
-                    std::get<MaiToolPart>(mAssistant.parts.back().body).state =
-                        MaiToolState::Running;
-                    mDependencies.store->putMessage(mSessionId, mAssistant);
-                    mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId,
-                                                    mAssistant.id, part.id);
-                }
-                // partId 每次调用才知道。question 工具要把它带进提问里，
-                // 界面才认得出是哪一次调用在等回答。
-                context.partId = part.id;
                 if (cancel.load(std::memory_order_relaxed)) {
                     result = MaiToolResult::failure(MaiErrorCode::Canceled, "Interrupted.");
                 } else if ((replan = hasPendingInput())) {
                     // 审批等待期间到达的补充同样优先；获批不等于旧调用仍适合执行。
                     result = MaiToolResult::failure(MaiErrorCode::Canceled, replanHint);
                 } else {
+                    // 进入工具前先落“可能已执行”的事实，崩溃恢复不能沿用未执行占位。
+                    // execute 被调用不证明外部进程/任务已启动，因此 started 仍然未知。
+                    auto& running = std::get<MaiToolPart>(mAssistant.parts.back().body);
+                    MaiToolExecution execution;
+                    execution.status = MaiToolExecutionStatus::Running;
+                    execution.nextAction = MaiToolNextAction::InspectState;
+                    knownTaskExecution = acceptedTaskExecution(call, context);
+                    if (knownTaskExecution) {
+                        execution = *knownTaskExecution;
+                        if (execution.nextAction == MaiToolNextAction::QueryStatus &&
+                            execution.status == MaiToolExecutionStatus::Unknown)
+                            execution.status = MaiToolExecutionStatus::Running;
+                    }
+                    running.state = MaiToolState::Running;
+                    running.execution = execution;
+                    mDependencies.store->putMessage(mSessionId, mAssistant);
+                    if (needsApproval)
+                        mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated,
+                                                        mSessionId, mAssistant.id, part.id);
+                    enteredExecution = true;
                     result = tool->execute(call.arguments, context);
                 }
             }
         }
 
         auto& stored = std::get<MaiToolPart>(mAssistant.parts.back().body);
+        stored.execution = result.execution();
+        if (!stored.execution && result.hasError()) {
+            if (enteredExecution) {
+                // 查询期间任务表可能被工具/后台更新为终态；新的可信状态优先于进入前快照。
+                if (const auto latest = acceptedTaskExecution(call, context))
+                    knownTaskExecution = latest;
+            }
+            MaiToolExecution execution = knownTaskExecution ? *knownTaskExecution
+                                         : enteredExecution ? MaiToolExecution{}
+                                                            : notStartedExecution();
+            if (enteredExecution && !knownTaskExecution)
+                execution.nextAction = MaiToolNextAction::InspectState;
+            if (result.error().code() == MaiErrorCode::Canceled) {
+                execution.canceled = true;
+                if (!enteredExecution) {
+                    execution.nextAction = MaiToolNextAction::AskUser;
+                } else if (execution.status == MaiToolExecutionStatus::Completed) {
+                    execution.nextAction = MaiToolNextAction::None;
+                    execution.recoveryTool.clear();
+                } else if (!knownTaskExecution ||
+                           execution.nextAction == MaiToolNextAction::QueryStatus) {
+                    execution.status = MaiToolExecutionStatus::Canceled;
+                    execution.nextAction = MaiToolNextAction::InspectState;
+                }
+            } else if (enteredExecution) {
+                const auto error = nlohmann::json::parse(result.error().message(), nullptr, false);
+                if (knownTaskExecution && execution.status == MaiToolExecutionStatus::Unknown &&
+                    execution.nextAction == MaiToolNextAction::QueryStatus && error.is_object() &&
+                    error.value("code", nlohmann::json{}) == "task_failed") {
+                    // 已验证任务归属后，供应商工具的结构化 task_failed 是生成终态，
+                    // 与 provider_error 的查询连接故障不同；原始错误文本仍逐字保留。
+                    execution.status = MaiToolExecutionStatus::Failed;
+                    execution.nextAction = MaiToolNextAction::None;
+                    execution.recoveryTool.clear();
+                }
+            }
+            stored.execution = std::move(execution);
+        }
+        if (result.isTruncated()) {
+            if (!stored.execution) {
+                MaiToolExecution execution;
+                execution.status = MaiToolExecutionStatus::Completed;
+                execution.nextAction = MaiToolNextAction::InspectState;
+                stored.execution = std::move(execution);
+            }
+            stored.execution->outputTruncated = true;
+        }
         if (result.hasError()) {
             stored.state = result.error().code() == MaiErrorCode::Canceled ? MaiToolState::Canceled
                                                                            : MaiToolState::Error;
             stored.error = result.error().message();
             // 错误也要回灌给模型——它需要知道失败了才能换个做法。
             stored.output = result.error().message();
-            auto error = nlohmann::json::parse(stored.error, nullptr, false);
-            if (error.is_object() && error.value("code", nlohmann::json{}).is_string() &&
-                (error["code"] == "provider_error" || error["code"] == "task_failed")) {
-                error["specialist"] = call.name;
-                error["agent_next_step"] = specialistFailureGuidance(error);
-                stored.output = error.dump();
-            }
         } else {
             stored.state = MaiToolState::Completed;
             stored.output = result.output();
-            if (result.isTruncated()) stored.output += "\n(output truncated)";
 
             resultImages.insert(resultImages.end(), result.images().begin(), result.images().end());
         }
@@ -876,7 +833,11 @@ MaiToolResult MaiTurnRunner::checkPermission(const MaiToolInvocation& call,
     if (decision == MaiPermissionDecision::TimedOut) {
         allowed = false;
         mRejected.insert(signature);
-        return MaiToolResult::failure(MaiErrorCode::Canceled, kTimedOutHint);
+        auto execution = notStartedExecution();
+        execution.timedOut = true;
+        execution.nextAction = MaiToolNextAction::AskUser;
+        return MaiToolResult::failure(MaiErrorCode::Canceled, kTimedOutHint)
+            .withExecution(std::move(execution));
     }
 
     if (decision == MaiPermissionDecision::Denied) {

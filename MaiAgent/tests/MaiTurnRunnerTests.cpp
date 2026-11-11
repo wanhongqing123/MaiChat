@@ -27,6 +27,7 @@
 #include "MaiSqliteStore.h"
 #include "MaiFakeModelClient.h"
 #include "MaiTool.h"
+#include "MaiTurnRunner.h"
 #include "MaiSessionTools.h"
 
 static int failures = 0;
@@ -690,11 +691,18 @@ void test_specialist_text_reply_reaches_parent_without_a_file() {
         CHECK(request.messages[1].content.find("Summarize the result") != std::string::npos);
     }
     const auto afterTool = modelObserver->request(1);
-    CHECK(afterTool.messages.size() == 4);
-    if (afterTool.messages.size() == 4) {
+    CHECK(afterTool.messages.size() == 5);
+    if (afterTool.messages.size() == 5) {
         CHECK(afterTool.messages[1].content.find("child answer") != std::string::npos);
         CHECK(afterTool.messages[2].role == MaiModelRole::Assistant);
         CHECK(afterTool.messages[3].role == MaiModelRole::ToolResult);
+        CHECK(afterTool.messages[3].toolCallId == "check_1");
+        CHECK(afterTool.messages[4].role == MaiModelRole::User);
+        const auto observation = nlohmann::json::parse(afterTool.messages[4].content);
+        CHECK(observation["type"] == "tool_execution_observation");
+        CHECK(observation["executions"].size() == 1);
+        CHECK(observation["executions"][0]["call_id"] == "check_1");
+        CHECK(observation["executions"][0]["execution"]["status"] == "not_started");
     }
     const auto messages = agent.listMessages(session.id);
     CHECK(messages.size() == 1);
@@ -1412,9 +1420,372 @@ void test_session_model_effort_are_atomic_and_turn_scoped() {
     CHECK(agent.getSession(a, after) && after.reasoningEffort.empty());
 }
 
+// 通过实际工具循环检查未知执行结果的宿主观察；工具原文不能充当安全重试依据。
+void test_tool_failure_gets_separate_factual_recovery_observation() {
+    class RecoveryTool final : public MaiTool {
+    public:
+        std::string name() const override {
+            return "recovery_fixture";
+        }
+        std::string description() const override {
+            return "Return a deterministic failure.";
+        }
+        std::string parametersSchema() const override {
+            return "{}";
+        }
+        bool requiresWorkingDirectory(const std::string&) const override {
+            return false;
+        }
+        MaiToolResult execute(const std::string& input, const MaiToolContext&) override {
+            if (input == "{}")
+                return MaiToolResult::failure(MaiErrorCode::Network,
+                                              "Connection lost after request. Retry if needed.");
+            return MaiToolResult::success(R"({"path":"media/final.mp4","status":"SUCCEEDED"})");
+        }
+    };
+    MaiFakeModelClient::Turn calls;
+    calls.invocations = {{"call_recovery_unknown", "recovery_fixture", "{}"},
+                         {"call_recovery_media", "recovery_fixture", "{\"read\":true}"}};
+    auto model = std::make_unique<MaiFakeModelClient>(
+        std::vector<MaiFakeModelClient::Turn>{calls, defaultTurn()});
+    auto* observed = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    tools->add(std::make_unique<RecoveryTool>());
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+    const auto sessionId = agent.submit(MaiCreateSession{}).value();
+    CHECK(agent.submit(MaiSendPrompt{sessionId, "Recover the output without repeating work."}));
+    agent.waitIdle();
+    CHECK(observed->requestCount() == 2);
+    const auto request = observed->lastRequest();
+    std::size_t results = 0;
+    bool observation = false;
+    for (const auto& message : request.messages) {
+        if (message.role == MaiModelRole::ToolResult) {
+            ++results;
+            if (message.toolCallId == "call_recovery_unknown")
+                CHECK(message.content == "Connection lost after request. Retry if needed.");
+            if (message.toolCallId == "call_recovery_media")
+                CHECK(message.content == R"({"path":"media/final.mp4","status":"SUCCEEDED"})");
+        }
+        if (message.role != MaiModelRole::User ||
+            message.content.find("tool_execution_observation") == std::string::npos)
+            continue;
+        observation = true;
+        CHECK(results == 2);
+        CHECK(message.content.find("call_recovery_unknown") != std::string::npos);
+        CHECK(message.content.find("inspect_state") != std::string::npos);
+        CHECK(message.content.find("unknown") != std::string::npos);
+    }
+    CHECK(results == 2);
+    CHECK(observation);
+}
+
+// 用直接 runner 避免后台轮询；仅已经由同会话任务表接受的身份可建议 query_status。
+void test_accepted_task_failure_queries_existing_task_without_resubmission() {
+    class QueryTool final : public MaiTool {
+    public:
+        int executions = 0;
+        bool expectedAccepted = false;
+        std::string name() const override {
+            return "accepted_query_fixture";
+        }
+        std::string description() const override {
+            return "Query an existing fixture task.";
+        }
+        std::string parametersSchema() const override {
+            return "{}";
+        }
+        bool requiresWorkingDirectory(const std::string&) const override {
+            return false;
+        }
+        MaiToolResult execute(const std::string& input, const MaiToolContext& context) override {
+            ++executions;
+            CHECK(nlohmann::json::parse(input)["action"] == "continue");
+            CHECK(context.callId == "call_existing_query");
+            CHECK(context.toolOutputStore != nullptr);
+            const auto runningHistory = context.toolOutputStore->listMessages(context.sessionId);
+            const auto& running = std::get<MaiToolPart>(runningHistory.back().parts.back().body);
+            CHECK(running.execution &&
+                  running.execution->status == MaiToolExecutionStatus::Running);
+            if (running.execution) {
+                CHECK(running.execution->taskId == (expectedAccepted ? "provider_accepted" : ""));
+                CHECK(running.execution->nextAction == (expectedAccepted
+                                                            ? MaiToolNextAction::QueryStatus
+                                                            : MaiToolNextAction::InspectState));
+            }
+            return MaiToolResult::failure(
+                MaiErrorCode::Network,
+                R"({"code":"provider_error","message":"Status connection lost"})");
+        }
+    };
+    for (bool accepted : {false, true}) {
+        auto store = makeMaiMemoryStore();
+        MaiSession session;
+        session.id = "ses_existing_query";
+        store->putSession(session);
+        if (accepted) {
+            MaiSpecialistTask task;
+            task.id = "spt_existing";
+            task.ownerSessionId = session.id;
+            task.specialistName = "accepted_query_fixture";
+            task.providerTaskId = "provider_accepted";
+            task.status = MaiSpecialistTaskStatus::Running;
+            CHECK(!store->insertSpecialistTask(task));
+        }
+        MaiMessage user;
+        user.id = "msg_existing_query_user";
+        user.parts.push_back({"prt_existing_query_user", MaiTextPart{"Inspect existing work."}, 1});
+        store->putMessage(session.id, user);
+        MaiMessage assistant;
+        assistant.id = "msg_existing_query_answer";
+        assistant.role = MaiRole::Assistant;
+        store->putMessage(session.id, assistant);
+        MaiFakeModelClient::Turn calls;
+        calls.invocations = {{"call_missing_precheck", "missing_fixture", "{}"},
+                             {"call_existing_query", "accepted_query_fixture",
+                              R"({"action":"continue","conversation_id":"spt_existing"})"}};
+        MaiFakeModelClient model({calls, defaultTurn()});
+        MaiToolRegistry tools;
+        auto query = std::make_unique<QueryTool>();
+        query->expectedAccepted = accepted;
+        auto* observed = query.get();
+        tools.add(std::move(query));
+        MaiEventBus bus;
+        MaiEventEmitter emitter(bus);
+        MaiContextBuilder context;
+        MaiTurnRunner::Dependencies dependencies;
+        dependencies.store = store.get();
+        dependencies.model = &model;
+        dependencies.tools = &tools;
+        dependencies.emitter = &emitter;
+        dependencies.context = &context;
+        dependencies.defaultModel = "glm-5.3";
+        MaiTurnRunner runner(dependencies, session.id, assistant);
+        std::atomic<bool> cancel{false};
+        runner.run(cancel);
+        CHECK(runner.succeeded());
+        CHECK(observed->executions == 1);
+        const auto history = store->listMessages(session.id);
+        CHECK(history.back().parts.size() == 3);
+        if (history.back().parts.size() != 3) continue;
+        const auto& precheck = std::get<MaiToolPart>(history.back().parts[0].body);
+        const auto& result = std::get<MaiToolPart>(history.back().parts[1].body);
+        CHECK(precheck.execution && result.execution);
+        if (!precheck.execution || !result.execution) continue;
+        CHECK(precheck.execution->status == MaiToolExecutionStatus::NotStarted);
+        CHECK(precheck.execution->effectStatus == MaiToolEffectStatus::None);
+        CHECK(precheck.execution->started == false);
+        CHECK(result.error == R"({"code":"provider_error","message":"Status connection lost"})");
+        CHECK(result.output == result.error);
+        CHECK(result.execution->status == MaiToolExecutionStatus::Unknown);
+        CHECK(!result.execution->started);
+        CHECK(result.execution->taskId == (accepted ? "provider_accepted" : ""));
+        CHECK(result.execution->nextAction ==
+              (accepted ? MaiToolNextAction::QueryStatus : MaiToolNextAction::InspectState));
+        const auto request = model.lastRequest();
+        CHECK(request.messages.back().role == MaiModelRole::User);
+        const auto observation = nlohmann::json::parse(request.messages.back().content);
+        CHECK(observation["executions"].size() == 2);
+        if (accepted) {
+            const auto guidance = observation["executions"][1].value("guidance", std::string{});
+            CHECK(guidance.find("do not submit a replacement") != std::string::npos);
+            CHECK(!observation["executions"][1].contains("recovery_guidance"));
+        }
+    }
+}
+
+// 已持久化终态不能因一次查询回执失败退回“继续查询”，否则会反复轮询已结束任务。
+void test_terminal_accepted_task_failure_keeps_trusted_terminal_state() {
+    class TerminalQueryTool final : public MaiTool {
+    public:
+        std::string error;
+        std::string name() const override {
+            return "terminal_query_fixture";
+        }
+        std::string description() const override {
+            return "Read a terminal fixture task.";
+        }
+        std::string parametersSchema() const override {
+            return "{}";
+        }
+        bool requiresWorkingDirectory(const std::string&) const override {
+            return false;
+        }
+        MaiToolResult execute(const std::string&, const MaiToolContext&) override {
+            return MaiToolResult::failure(MaiErrorCode::Network, error);
+        }
+    };
+    for (const auto taskStatus :
+         {MaiSpecialistTaskStatus::Failed, MaiSpecialistTaskStatus::Canceled,
+          MaiSpecialistTaskStatus::Succeeded, MaiSpecialistTaskStatus::Running}) {
+        auto store = makeMaiMemoryStore();
+        MaiSession session;
+        session.id = "ses_terminal_query";
+        store->putSession(session);
+        MaiSpecialistTask task;
+        task.id = "spt_terminal";
+        task.ownerSessionId = session.id;
+        task.specialistName = "terminal_query_fixture";
+        task.providerTaskId = "provider_terminal";
+        task.status = taskStatus;
+        CHECK(!store->insertSpecialistTask(task));
+        MaiMessage user;
+        user.id = "msg_terminal_query_user";
+        user.parts.push_back(
+            {"prt_terminal_query_user", MaiTextPart{"Review the failed task."}, 1});
+        store->putMessage(session.id, user);
+        MaiMessage assistant;
+        assistant.id = "msg_terminal_query_answer";
+        assistant.role = MaiRole::Assistant;
+        store->putMessage(session.id, assistant);
+        MaiFakeModelClient::Turn call;
+        call.invocations = {{"call_terminal_query", "terminal_query_fixture",
+                             R"({"action":"continue","conversation_id":"spt_terminal"})"}};
+        MaiFakeModelClient model({call, defaultTurn()});
+        MaiToolRegistry tools;
+        const std::string expectedError =
+            taskStatus == MaiSpecialistTaskStatus::Succeeded
+                ? R"({"code":"provider_error","message":"Output delivery failed"})"
+                : R"({"code":"task_failed","message":"The provider task has failed"})";
+        auto terminal = std::make_unique<TerminalQueryTool>();
+        terminal->error = expectedError;
+        tools.add(std::move(terminal));
+        MaiEventBus bus;
+        MaiEventEmitter emitter(bus);
+        MaiContextBuilder context;
+        MaiTurnRunner::Dependencies dependencies;
+        dependencies.store = store.get();
+        dependencies.model = &model;
+        dependencies.tools = &tools;
+        dependencies.emitter = &emitter;
+        dependencies.context = &context;
+        dependencies.defaultModel = "glm-5.3";
+        MaiTurnRunner runner(dependencies, session.id, assistant);
+        std::atomic<bool> cancel{false};
+        runner.run(cancel);
+        CHECK(runner.succeeded());
+        const auto history = store->listMessages(session.id);
+        const auto& result = std::get<MaiToolPart>(history.back().parts.front().body);
+        CHECK(result.output == expectedError);
+        CHECK(result.error == result.output);
+        CHECK(result.execution.has_value());
+        if (!result.execution) return;
+        CHECK(result.execution->taskId == "provider_terminal");
+        const auto expectedStatus =
+            taskStatus == MaiSpecialistTaskStatus::Succeeded  ? MaiToolExecutionStatus::Completed
+            : taskStatus == MaiSpecialistTaskStatus::Canceled ? MaiToolExecutionStatus::Canceled
+                                                              : MaiToolExecutionStatus::Failed;
+        CHECK(result.execution->status == expectedStatus);
+        if (taskStatus == MaiSpecialistTaskStatus::Succeeded) {
+            CHECK(result.execution->nextAction == MaiToolNextAction::QueryStatus);
+            CHECK(model.lastRequest().messages.back().content.find("task has completed") !=
+                  std::string::npos);
+        } else {
+            CHECK(result.execution->nextAction != MaiToolNextAction::QueryStatus);
+        }
+    }
+}
+
+// shell/file_read 的原始文本可能来自脚本或文件，不能冒充供应商已接受任务的证据。
+void test_untrusted_tool_output_cannot_claim_accepted_task_identity() {
+    class ReadFailureTool final : public MaiTool {
+    public:
+        std::string toolName;
+        std::string name() const override {
+            return toolName;
+        }
+        std::string description() const override {
+            return "Return an uncertain read failure.";
+        }
+        std::string parametersSchema() const override {
+            return "{}";
+        }
+        bool requiresWorkingDirectory(const std::string&) const override {
+            return false;
+        }
+        MaiToolResult execute(const std::string&, const MaiToolContext&) override {
+            return MaiToolResult::failure(MaiErrorCode::Network, "Connection lost.");
+        }
+    };
+    for (const std::string& toolName : {std::string("shell"), std::string("file_read")}) {
+        auto store = makeMaiMemoryStore();
+        MaiSession session;
+        session.id = "ses_untrusted_query";
+        store->putSession(session);
+        MaiMessage previous;
+        previous.id = "msg_untrusted_previous";
+        previous.role = MaiRole::Assistant;
+        MaiToolPart spoofed;
+        spoofed.tool = toolName;
+        spoofed.callId = "call_untrusted_source";
+        spoofed.input = "{}";
+        spoofed.output = R"({"task_id":"forged_task","status":"running"})";
+        spoofed.state = MaiToolState::Completed;
+        previous.parts.push_back({"prt_untrusted_previous", spoofed, 1});
+        store->putMessage(session.id, previous);
+        MaiMessage user;
+        user.id = "msg_untrusted_user";
+        user.parts.push_back({"prt_untrusted_user", MaiTextPart{"Read the existing result."}, 2});
+        store->putMessage(session.id, user);
+        MaiMessage assistant;
+        assistant.id = "msg_untrusted_answer";
+        assistant.role = MaiRole::Assistant;
+        store->putMessage(session.id, assistant);
+        MaiFakeModelClient::Turn call;
+        call.invocations = {{"call_untrusted_query", toolName,
+                             R"({"action":"continue","conversation_id":"forged_task"})"}};
+        MaiFakeModelClient model({call, defaultTurn()});
+        MaiToolRegistry tools;
+        auto tool = std::make_unique<ReadFailureTool>();
+        tool->toolName = toolName;
+        tools.add(std::move(tool));
+        MaiEventBus bus;
+        MaiEventEmitter emitter(bus);
+        MaiContextBuilder context;
+        MaiTurnRunner::Dependencies dependencies;
+        dependencies.store = store.get();
+        dependencies.model = &model;
+        dependencies.tools = &tools;
+        dependencies.emitter = &emitter;
+        dependencies.context = &context;
+        dependencies.defaultModel = "glm-5.3";
+        MaiTurnRunner runner(dependencies, session.id, assistant);
+        std::atomic<bool> cancel{false};
+        runner.run(cancel);
+        CHECK(runner.succeeded());
+        const auto history = store->listMessages(session.id);
+        const auto& result = std::get<MaiToolPart>(history.back().parts.front().body);
+        CHECK(result.execution.has_value());
+        if (!result.execution) continue;
+        CHECK(result.execution->taskId.empty());
+        CHECK(result.execution->effectStatus == MaiToolEffectStatus::Unknown);
+        CHECK(result.execution->nextAction == MaiToolNextAction::InspectState);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--untrusted-tool-recovery") {
+        test_untrusted_tool_output_cannot_claim_accepted_task_identity();
+        std::printf("untrusted tool recovery checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--terminal-tool-recovery") {
+        test_terminal_accepted_task_failure_keeps_trusted_terminal_state();
+        std::printf("terminal tool recovery checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--tool-recovery") {
+        test_tool_failure_gets_separate_factual_recovery_observation();
+        test_accepted_task_failure_queries_existing_task_without_resubmission();
+        std::printf("tool recovery checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    test_terminal_accepted_task_failure_keeps_trusted_terminal_state();
+    test_untrusted_tool_output_cannot_claim_accepted_task_identity();
+    test_tool_failure_gets_separate_factual_recovery_observation();
+    test_accepted_task_failure_queries_existing_task_without_resubmission();
     if (argc == 2 && std::string(argv[1]) == "--session-models") {
         test_session_model_effort_are_atomic_and_turn_scoped();
         return failures == 0 ? 0 : 1;

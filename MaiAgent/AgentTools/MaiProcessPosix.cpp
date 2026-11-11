@@ -19,6 +19,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -69,6 +70,10 @@ MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& resul
     result = MaiProcessResult{};
     if (options.argv.empty()) {
         return MaiError(MaiErrorCode::InvalidInput, "no command given");
+    }
+    if (options.cancel != nullptr && options.cancel->load(std::memory_order_relaxed)) {
+        result.canceled = true;
+        return MaiError();
     }
 
     // 用 fork + exec，不用 posix_spawn。
@@ -155,7 +160,10 @@ MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& resul
     ::close(errorFds[1]);
 
     int startupErrno = 0;
-    const ssize_t errorBytes = ::read(errorFds[0], &startupErrno, sizeof(startupErrno));
+    ssize_t errorBytes = 0;
+    do {
+        errorBytes = ::read(errorFds[0], &startupErrno, sizeof(startupErrno));
+    } while (errorBytes < 0 && errno == EINTR);
     ::close(errorFds[0]);
     if (errorBytes == static_cast<ssize_t>(sizeof(startupErrno))) {
         ::close(pipeFds[0]);
@@ -164,6 +172,7 @@ MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& resul
         return MaiError(MaiErrorCode::NotFound,
                         "could not start \"" + storage[0] + "\": " + std::strerror(startupErrno));
     }
+    result.started = true;
 
     const int flags = ::fcntl(pipeFds[0], F_GETFL, 0);
     ::fcntl(pipeFds[0], F_SETFL, flags | O_NONBLOCK);
@@ -174,29 +183,11 @@ MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& resul
     int status = 0;
 
     while (true) {
-        const ssize_t got = ::read(pipeFds[0], buffer, sizeof(buffer));
-        if (got > 0) {
-            // 超了上限就不再往里塞，但**照常继续读**：不读的话子进程会卡在写管道上，
-            // 于是它永远不退出，我们只能等超时。
-            appendCapped(result.output, buffer, static_cast<std::size_t>(got),
-                         options.maxOutputBytes, result.truncated);
-            continue;
-        }
-        if (got == 0) break;  // 写端全关了，输出到头了
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
-
         if (::waitpid(pid, &status, WNOHANG) == pid) {
             reaped = true;
-            // 进程没了，但管道里可能还剩没读完的字节，抽干再走。
-            while (true) {
-                const ssize_t rest = ::read(pipeFds[0], buffer, sizeof(buffer));
-                if (rest <= 0) break;
-                appendCapped(result.output, buffer, static_cast<std::size_t>(rest),
-                             options.maxOutputBytes, result.truncated);
-            }
             break;
         }
-
+        // 持续输出也必须经过这两个检查；放在 read 后面会被 got > 0 的 continue 永远绕过。
         if (options.cancel != nullptr && options.cancel->load(std::memory_order_relaxed)) {
             result.canceled = true;
             killProcessGroup(pid);
@@ -212,11 +203,37 @@ MaiError maiRunProcess(const MaiProcessOptions& options, MaiProcessResult& resul
                 break;
             }
         }
+        const ssize_t got = ::read(pipeFds[0], buffer, sizeof(buffer));
+        if (got > 0) {
+            // 超了上限就不再往里塞，但**照常继续读**：不读的话子进程会卡在写管道上，
+            // 于是它永远不退出，我们只能等超时。
+            appendCapped(result.output, buffer, static_cast<std::size_t>(got),
+                         options.maxOutputBytes, result.truncated);
+            continue;
+        }
+        // 写端关闭只说明没有更多输出；命令仍可能在运行，仍需遵守超时与取消。
+        if (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
+
         std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
     }
 
+    if (!reaped) {
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+    }
+    // 先等被终止的进程退出，再收走此刻已到达的字节。后代仍持写端时不能无限延长收尾。
+    int available = 0;
+    if (::ioctl(pipeFds[0], FIONREAD, &available) != 0) available = sizeof(buffer);
+    while (available > 0) {
+        const std::size_t want = std::min<std::size_t>(sizeof(buffer), available);
+        const ssize_t rest = ::read(pipeFds[0], buffer, want);
+        if (rest < 0 && errno == EINTR) continue;
+        if (rest <= 0) break;
+        appendCapped(result.output, buffer, static_cast<std::size_t>(rest), options.maxOutputBytes,
+                     result.truncated);
+        available -= static_cast<int>(rest);
+    }
     ::close(pipeFds[0]);
-    if (!reaped) ::waitpid(pid, &status, 0);
 
     if (WIFEXITED(status)) {
         result.exitCode = WEXITSTATUS(status);

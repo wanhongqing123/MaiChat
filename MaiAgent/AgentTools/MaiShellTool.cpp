@@ -1,14 +1,20 @@
 // 文件作用：在权限边界内执行 shell 命令并收集结果。
-// 直接依赖：MaiProcess.h；本文件在这些接口之间完成调用与结果转换。
-#include <json.hpp>
+// 直接依赖：MaiProcess.h、MaiSessionStore.h；执行一次，保存捕获快照，返回有界预览与恢复事实。
+#include "MaiShellTool.h"
 
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <json.hpp>
+
+#include "MaiIdGenerator.h"
 #include "MaiProcess.h"
-#include "MaiShellTool.h"
+#include "MaiSessionStore.h"
+#include "MaiTime.h"
+#include "MaiToolOutput.h"
 
 // shell 工具：跑一条命令，把它说的话给模型。
 //
@@ -21,7 +27,73 @@ using json = nlohmann::json;
 
 constexpr int kDefaultTimeoutMs = 120000;
 constexpr int kMaxTimeoutMs = 600000;
-constexpr std::size_t kMaxOutputBytes = 48 * 1024;
+constexpr std::size_t kPreviewBytes = 48 * 1024;
+
+// 和 Chromium ReadUnicodeCharacter 一样，只接受 Unicode 标量；非字符仍合法。
+// 非法字节按单字节转义展示，原字节只保存在独立快照中，不能悄悄修成另一段文本。
+std::size_t utf8ScalarBytes(const std::string& text, std::size_t offset) {
+    const unsigned char first = static_cast<unsigned char>(text[offset]);
+    if (first < 0x80) return 1;
+    const std::size_t length = first >= 0xc2 && first <= 0xdf   ? 2
+                               : first >= 0xe0 && first <= 0xef ? 3
+                               : first >= 0xf0 && first <= 0xf4 ? 4
+                                                                : 0;
+    if (length == 0 || length > text.size() - offset) return 0;
+    unsigned int codepoint = first & (0x7f >> length);
+    for (std::size_t i = 1; i < length; ++i) {
+        const unsigned char next = static_cast<unsigned char>(text[offset + i]);
+        if ((next & 0xc0) != 0x80) return 0;
+        codepoint = (codepoint << 6) | (next & 0x3f);
+    }
+    if ((length == 2 && codepoint < 0x80) || (length == 3 && codepoint < 0x800) ||
+        (length == 4 && codepoint < 0x10000) || codepoint > 0x10ffff ||
+        (codepoint >= 0xd800 && codepoint <= 0xdfff)) {
+        return 0;
+    }
+    return length;
+}
+
+struct OutputPreview {
+    std::string text;
+    bool truncated = false;
+    bool escapedBytes = false;
+};
+
+OutputPreview previewOf(const std::string& source) {
+    OutputPreview preview;
+    std::size_t offset = 0;
+    while (offset < source.size()) {
+        const std::size_t length = utf8ScalarBytes(source, offset);
+        const std::size_t renderedBytes = length == 0 ? 4 : length;
+        if (renderedBytes > kPreviewBytes - preview.text.size()) break;
+        if (length == 0) {
+            static constexpr char kHex[] = "0123456789ABCDEF";
+            const unsigned char byte = static_cast<unsigned char>(source[offset++]);
+            preview.text += "\\x";
+            preview.text += kHex[byte >> 4];
+            preview.text += kHex[byte & 0x0f];
+            preview.escapedBytes = true;
+        } else {
+            preview.text.append(source, offset, length);
+            offset += length;
+        }
+    }
+    preview.truncated = offset != source.size();
+    return preview;
+}
+
+MaiToolResult beforeStartFailure(MaiErrorCode code, const std::string& message) {
+    MaiToolExecution execution;
+    execution.status = MaiToolExecutionStatus::NotStarted;
+    execution.effectStatus = MaiToolEffectStatus::None;
+    execution.started = false;
+    execution.canceled = code == MaiErrorCode::Canceled;
+    execution.nextAction =
+        execution.canceled ? MaiToolNextAction::None : MaiToolNextAction::ReviseArguments;
+    MaiToolResult result = MaiToolResult::failure(code, message);
+    result.withExecution(std::move(execution));
+    return result;
+}
 
 json parseArguments(const std::string& raw) {
     json parsed = json::parse(raw, nullptr, false);
@@ -126,7 +198,7 @@ public:
         return R"({"type":"object","properties":{)"
                R"("command":{"type":"string","description":"The command line to run"},)"
                R"("timeout_ms":{"type":"integer","description":"Give up after this many millisecon)"
-                   R"(ds, default 120000, max 600000"}},)"
+               R"(ds, default 120000, max 600000"}},)"
                R"("required":["command"]})";
     }
 
@@ -163,11 +235,11 @@ public:
         const json args = parseArguments(raw);
         const std::string command = commandOf(args);
         if (command.empty()) {
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "the command parameter is required");
+            return beforeStartFailure(MaiErrorCode::InvalidInput,
+                                      "the command parameter is required");
         }
         if (context.root.empty()) {
-            return MaiToolResult::failure(
+            return beforeStartFailure(
                 MaiErrorCode::InvalidInput,
                 "this session has no working directory, so shell commands are unavailable");
         }
@@ -181,36 +253,114 @@ public:
         options.useShell = true;
         options.argv = {command};
         options.workingDirectory = context.root;
-        options.maxOutputBytes = kMaxOutputBytes;
+        options.maxOutputBytes = kMaiToolOutputMaxBytes;
         options.cancel = context.cancel;
+        if (args.contains("timeout_ms") && !args["timeout_ms"].is_number_integer()) {
+            return beforeStartFailure(MaiErrorCode::InvalidInput, "timeout_ms must be an integer");
+        }
         const int requested = args.value("timeout_ms", kDefaultTimeoutMs);
         options.timeoutMs = std::max(1000, std::min(requested, kMaxTimeoutMs));
 
         MaiProcessResult process;
         const MaiError failure = maiRunProcess(options, process);
-        if (failure.hasError()) {
-            return MaiToolResult::failure(failure.code(), failure.message());
+        if (!process.started) {
+            if (process.canceled) {
+                return beforeStartFailure(MaiErrorCode::Canceled,
+                                          "the command was not started because it was canceled");
+            }
+            return beforeStartFailure(failure.code(), failure.message());
         }
 
-        if (process.canceled) {
-            return MaiToolResult::failure(MaiErrorCode::Canceled,
-                                          "the command was interrupted by the user");
+        MaiToolExecution execution;
+        execution.started = true;
+        execution.effectStatus = MaiToolEffectStatus::Unknown;
+        execution.timedOut = process.timedOut;
+        execution.canceled = process.canceled;
+        execution.status = process.canceled ? MaiToolExecutionStatus::Canceled
+                           : process.timedOut || failure.hasError()
+                               ? MaiToolExecutionStatus::Unknown
+                               : MaiToolExecutionStatus::Completed;
+        if (!process.canceled && !process.timedOut && !failure.hasError()) {
+            execution.exitCode = process.exitCode;
         }
 
-        // 下面这些话都会原样进上下文，所以每一句都必须是真的——
-        // 超时说成「命令失败了」会让模型以为是代码有问题，然后去改不该改的地方。
-        std::string out = process.output;
+        const OutputPreview preview = previewOf(process.output);
+        // 中断或收集失败同样是不完整捕获，不能把“已到达的字节都保存了”说成命令输出完整。
+        const bool captureIncomplete =
+            process.truncated || process.timedOut || process.canceled || failure.hasError();
+        execution.outputTruncated = preview.truncated || captureIncomplete;
+        bool saved = false;
+        if (context.toolOutputStore != nullptr) {
+            MaiToolOutputRecord record;
+            record.id = MaiIdGenerator::generate("out");
+            record.sessionId = context.sessionId;
+            record.messageId = context.messageId;
+            record.partId = context.partId;
+            record.callId = context.callId;
+            record.text = std::move(process.output);
+            record.truncated = captureIncomplete;
+            record.created = MaiTime::getCurrentTime();
+            const MaiError storageFailure = context.toolOutputStore->putToolOutput(record);
+            saved = !storageFailure.hasError();
+            if (saved) execution.outputId = record.id;
+        }
+
+        // 先保存再返回句柄。取消与超时同样保留已捕获的部分，不重执行命令来“补”输出。
+        std::string out = preview.text;
         if (out.empty()) out = "(no output)";
-        if (process.timedOut) {
+        if (preview.escapedBytes) {
+            out += "\n[invalid source bytes are shown as \\xHH escapes]";
+        }
+        if (process.canceled) {
+            out +=
+                "\n\n[the command was interrupted by the user; effects may already have occurred. "
+                "Inspect current state before considering another execution.]";
+        } else if (process.timedOut) {
             out += "\n\n[timed out after " + std::to_string(options.timeoutMs) +
-                   " ms and was killed; it may have been waiting for input or running forever]";
+                   " ms; termination was requested and effects may already have occurred. "
+                   "Inspect current state before considering another execution.]";
+        } else if (failure.hasError()) {
+            out +=
+                "\n\n[process execution or collection failed after launch; inspect current state]";
         } else if (process.exitCode != 0) {
             out += "\n\n[exit code " + std::to_string(process.exitCode) + "]";
         }
         if (process.truncated) {
-            out += "\n[output truncated; rerun with something that prints less]";
+            out +=
+                "\n[output capture truncated at the 16 MiB limit; bytes beyond the retained "
+                "capture cannot be recovered from this call]";
+        } else if (preview.truncated) {
+            out += "\n[output preview truncated]";
         }
-        return MaiToolResult::success(std::move(out), process.truncated);
+        if (captureIncomplete && !process.truncated) {
+            out += "\n[captured output is partial because execution did not finish normally]";
+        }
+        if (saved && (execution.outputTruncated || process.canceled || process.timedOut)) {
+            out += "\n[Use tool_output_read with output_id=\"" + execution.outputId +
+                   "\" to read the retained captured output. Do not rerun the command to recover "
+                   "its output.]";
+        } else if (!saved && execution.outputTruncated) {
+            out +=
+                "\n[retained output unavailable: output storage was unavailable or rejected the "
+                "snapshot. Omitted output cannot be recovered from this call. Do not rerun "
+                "the command merely to recover output; inspect current state first.]";
+        }
+
+        if (process.canceled || process.timedOut || failure.hasError() ||
+            (!saved && execution.outputTruncated)) {
+            execution.nextAction = MaiToolNextAction::InspectState;
+        } else if (execution.outputTruncated && saved) {
+            execution.nextAction = MaiToolNextAction::ReadOutput;
+            execution.recoveryTool = "tool_output_read";
+        }
+        MaiToolResult result =
+            process.canceled ? MaiToolResult::failure(MaiErrorCode::Canceled, std::move(out),
+                                                      execution.outputTruncated)
+            : failure.hasError()
+                ? MaiToolResult::failure(failure.code(), std::move(out), execution.outputTruncated)
+                : MaiToolResult::success(std::move(out), execution.outputTruncated);
+        result.withExecution(std::move(execution));
+        return result;
     }
 };
 

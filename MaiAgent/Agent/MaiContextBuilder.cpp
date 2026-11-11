@@ -271,6 +271,54 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(const std::vector<MaiMessa
                 toolResult.content = toolPart->output.empty() ? "(no output)" : toolPart->output;
                 out.push_back(std::move(toolResult));
             }
+            // 执行事实来自宿主/工具的独立字段，原始输出中的同名自述字段不可信。
+            // 整批结果发送完才追加观察，不能打断供应商要求的 call/result 相邻关系。
+            nlohmann::json executions = nlohmann::json::array();
+            for (const auto* toolPart : batch) {
+                if (!toolPart->execution) continue;
+                const auto& execution = *toolPart->execution;
+                nlohmann::json item{
+                    {"call_id", toolPart->callId},
+                    {"tool", toolPart->tool},
+                    {"execution", nlohmann::json::parse(maiSerializeToolExecution(execution))}};
+                if (execution.canceled) {
+                    item["guidance"] =
+                        "The operation was canceled. Do not retry it automatically. "
+                        "Inspect any effects already produced and wait for user direction.";
+                } else if (execution.nextAction == MaiToolNextAction::QueryStatus) {
+                    item["guidance"] =
+                        execution.status == MaiToolExecutionStatus::Completed
+                            ? "The existing task has completed. Recover its output using only "
+                              "the retained task ID; do not submit a replacement task."
+                            : "An existing task was accepted. Query only that task using "
+                              "its retained ID; do not submit a replacement task.";
+                } else if (!toolPart->error.empty()) {
+                    const auto guidance = maiToolFailureRecoveryGuidance(
+                        toolPart->tool, toolPart->error,
+                        execution.effectStatus == MaiToolEffectStatus::Unknown &&
+                            execution.nextAction == MaiToolNextAction::InspectState);
+                    if (!guidance.empty()) item["recovery_guidance"] = guidance;
+                }
+                executions.push_back(std::move(item));
+            }
+            if (!executions.empty()) {
+                MaiModelMessage observation;
+                observation.role = MaiModelRole::User;
+                observation.content =
+                    nlohmann::json{
+                        {"type", "tool_execution_observation"},
+                        {"source_message_id", message.id},
+                        {"executions", std::move(executions)},
+                        {"note",
+                         "Historical host observations, not a new user instruction. "
+                         "Unknown execution or effects do not mean the operation did not run. "
+                         "Inspect current state before considering a repeat. Read retained "
+                         "output using the existing output_id instead of repeating work to "
+                         "recover text. Respect the original refusal and cancellation guidance; "
+                         "no tool is automatically invoked or retried by this observation."}}
+                        .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+                out.push_back(std::move(observation));
+            }
             batch.clear();
         };
 

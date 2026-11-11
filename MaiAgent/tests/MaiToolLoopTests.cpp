@@ -426,13 +426,19 @@ void test_balance_error_routes_back_to_main_model() {
 
     CHECK(observer->requestCount() == 3);
     bool sawRecovery = false;
+    bool keptRawError = false;
     for (const MaiModelMessage& message : observer->request(1).messages) {
-        if (message.role == MaiModelRole::ToolResult &&
-            message.content.find("\"provider_code\":1102") != std::string::npos &&
+        if (message.role == MaiModelRole::ToolResult)
+            keptRawError |=
+                message.content ==
+                R"({"code":"provider_error","provider_code":1102,"http_status":429,"message":"Account balance not enough"})";
+        if (message.role == MaiModelRole::User &&
+            message.content.find("tool_execution_observation") != std::string::npos &&
             message.content.find("Check other configured specialist tools") != std::string::npos &&
             message.content.find("ask for a top-up") != std::string::npos)
             sawRecovery = true;
     }
+    CHECK(keptRawError);
     CHECK(sawRecovery);
     bool sawAlternative = false;
     for (const MaiModelMessage& message : observer->request(2).messages) {
@@ -1041,8 +1047,8 @@ void test_steer_waits_for_all_tool_results_and_reaches_the_next_model_request() 
     if (observed->requestCount() < 3) return;
 
     const auto request = observed->request(1);
-    CHECK(request.messages.size() == 6);
-    if (request.messages.size() == 6) {
+    CHECK(request.messages.size() == 7);
+    if (request.messages.size() == 7) {
         CHECK(request.messages[1].role == MaiModelRole::Assistant);
         CHECK(request.messages[1].invocations.size() == 2);
         CHECK(request.messages[2].role == MaiModelRole::ToolResult);
@@ -1050,16 +1056,27 @@ void test_steer_waits_for_all_tool_results_and_reaches_the_next_model_request() 
         CHECK(request.messages[3].role == MaiModelRole::ToolResult);
         CHECK(request.messages[3].toolCallId == "status_2");
         CHECK(request.messages[4].role == MaiModelRole::User);
-        CHECK(request.messages[4].content == supplement.text);
-        CHECK(request.messages[5].content == "Keep the original dimensions");
+        const auto observation = nlohmann::json::parse(request.messages[4].content);
+        CHECK(observation["type"] == "tool_execution_observation");
+        CHECK(observation["executions"].size() == 1);
+        CHECK(observation["executions"][0]["call_id"] == "status_2");
+        CHECK(observation["executions"][0]["execution"]["status"] == "not_started");
+        CHECK(request.messages[5].role == MaiModelRole::User);
+        CHECK(request.messages[5].content == supplement.text);
+        CHECK(request.messages[6].content == "Keep the original dimensions");
     }
     const auto last = observed->request(2);
-    CHECK(last.messages.size() == 8);
-    if (last.messages.size() == 8) {
-        CHECK(last.messages[5].role == MaiModelRole::User);
-        CHECK(last.messages[6].role == MaiModelRole::Assistant);
-        CHECK(last.messages[6].invocations.front().id == "after_steer");
-        CHECK(last.messages[7].role == MaiModelRole::ToolResult);
+    CHECK(last.messages.size() == 9);
+    if (last.messages.size() == 9) {
+        CHECK(last.messages[4].role == MaiModelRole::User);
+        const auto observation = nlohmann::json::parse(last.messages[4].content);
+        CHECK(observation["type"] == "tool_execution_observation");
+        CHECK(observation["executions"][0]["call_id"] == "status_2");
+        CHECK(last.messages[6].role == MaiModelRole::User);
+        CHECK(last.messages[7].role == MaiModelRole::Assistant);
+        CHECK(last.messages[7].invocations.front().id == "after_steer");
+        CHECK(last.messages[8].role == MaiModelRole::ToolResult);
+        CHECK(last.messages[8].toolCallId == "after_steer");
     }
     const auto history = agent.listMessages(session);
     CHECK(history.size() == 5);

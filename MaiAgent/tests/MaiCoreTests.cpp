@@ -383,6 +383,7 @@ static void test_interrupted_tool_is_recovered_on_startup() {
     running.tool = "glob";
     running.callId = "call_recovery";
     running.state = MaiToolState::Running;
+    running.output = "already captured before shutdown";
     message.parts.push_back(MaiMessagePart{"prt_running", running});
     MaiToolPart completed = running;
     completed.state = MaiToolState::Completed;
@@ -397,7 +398,16 @@ static void test_interrupted_tool_is_recovered_on_startup() {
     const auto* recovered = std::get_if<MaiToolPart>(&messages.front().parts[0].body);
     const auto* unchanged = std::get_if<MaiToolPart>(&messages.front().parts[1].body);
     CHECK(recovered != nullptr && recovered->state == MaiToolState::Error);
-    CHECK(recovered != nullptr && recovered->output.find("interrupted") != std::string::npos);
+    CHECK(recovered != nullptr && recovered->output == "already captured before shutdown");
+    CHECK(recovered != nullptr &&
+          recovered->error.find("Inspect its current state") != std::string::npos);
+    CHECK(recovered != nullptr && recovered->error.find("Retry if needed") == std::string::npos);
+    CHECK(recovered != nullptr && recovered->execution.has_value());
+    if (recovered && recovered->execution) {
+        CHECK(recovered->execution->status == MaiToolExecutionStatus::Unknown);
+        CHECK(recovered->execution->effectStatus == MaiToolEffectStatus::Unknown);
+        CHECK(recovered->execution->nextAction == MaiToolNextAction::InspectState);
+    }
     CHECK(unchanged != nullptr && unchanged->state == MaiToolState::Completed);
     CHECK(unchanged != nullptr && unchanged->output == "done");
     CHECK(messages.front().completed != 0);

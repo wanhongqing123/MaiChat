@@ -47,6 +47,7 @@ public:
         std::lock_guard<std::mutex> lock(mMutex);
         mMessages.erase(id);
         mContextCheckpoints.erase(id);
+        clearToolOutputsLocked(id);
         for (auto it = mSpecialistTasks.begin(); it != mSpecialistTasks.end();) {
             if (it->second.ownerSessionId == id) {
                 it = mSpecialistTasks.erase(it);
@@ -61,6 +62,7 @@ public:
         if (mSessions.find(sessionId) == mSessions.end()) return false;
         mMessages.erase(sessionId);
         mContextCheckpoints.erase(sessionId);
+        clearToolOutputsLocked(sessionId);
         for (auto it = mSpecialistTasks.begin(); it != mSpecialistTasks.end();) {
             if (it->second.ownerSessionId == sessionId) {
                 it = mSpecialistTasks.erase(it);
@@ -68,6 +70,61 @@ public:
                 ++it;
         }
         return true;
+    }
+
+    MaiError putToolOutput(const MaiToolOutputRecord& output) override {
+        if (const auto error = maiValidateToolOutputRecord(output)) return error;
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!ownsToolOutputLocked(output) || mToolOutputIds.count(output.id) != 0)
+            return {MaiErrorCode::InvalidInput, "Tool output owner or immutable ID is invalid."};
+
+        // 先算淘汰集合再修改，避免新快照自身过旧时返回成功却已无法读取。
+        std::vector<const MaiToolOutputRecord*> retained;
+        std::size_t sessionBytes = output.text.size();
+        std::size_t totalBytes = output.text.size();
+        for (const auto& entry : mToolOutputs) {
+            retained.push_back(&entry.second);
+            totalBytes += entry.second.text.size();
+            if (entry.second.sessionId == output.sessionId)
+                sessionBytes += entry.second.text.size();
+        }
+        retained.push_back(&output);
+        std::sort(retained.begin(), retained.end(), [](const auto* left, const auto* right) {
+            if (left->created != right->created) return left->created < right->created;
+            return left->id < right->id;
+        });
+        std::vector<std::string> evicted;
+        for (const auto* candidate : retained) {
+            if (sessionBytes <= kMaiToolOutputSessionMaxBytes) break;
+            if (candidate->sessionId != output.sessionId) continue;
+            evicted.push_back(candidate->id);
+            sessionBytes -= candidate->text.size();
+            totalBytes -= candidate->text.size();
+        }
+        for (const auto* candidate : retained) {
+            if (totalBytes <= kMaiToolOutputTotalMaxBytes) break;
+            if (std::find(evicted.begin(), evicted.end(), candidate->id) != evicted.end()) continue;
+            evicted.push_back(candidate->id);
+            totalBytes -= candidate->text.size();
+        }
+        if (std::find(evicted.begin(), evicted.end(), output.id) != evicted.end())
+            return {MaiErrorCode::InvalidInput, "Tool output is older than the retention window."};
+        for (const auto& id : evicted) mToolOutputs.erase(id);
+        mToolOutputIds.emplace(output.id, output.sessionId);
+        mToolOutputs.emplace(output.id, output);
+        return {};
+    }
+
+    MaiResult<MaiToolOutputPage> readToolOutput(const std::string& sessionId,
+                                                const MaiToolOutputQuery& query) const override {
+        if (const auto error = maiValidateToolOutputQuery(sessionId, query)) return error;
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mToolOutputs.find(query.outputId);
+        if (found == mToolOutputs.end() || found->second.sessionId != sessionId ||
+            !ownsToolOutputLocked(found->second))
+            return {MaiErrorCode::NotFound, "Retained tool output is unavailable."};
+        return maiPageToolOutput(found->second, query, found->second.text, 0,
+                                 found->second.text.size());
     }
 
     bool getContextCheckpoint(const std::string& sessionId,
@@ -380,9 +437,26 @@ public:
                     if (!tool || (tool->state != MaiToolState::Pending &&
                                   tool->state != MaiToolState::Running))
                         continue;
+                    const bool pending = tool->state == MaiToolState::Pending;
+                    auto execution = tool->execution.value_or(MaiToolExecution{});
+                    execution.status = pending ? MaiToolExecutionStatus::NotStarted
+                                               : MaiToolExecutionStatus::Unknown;
+                    execution.effectStatus =
+                        pending ? MaiToolEffectStatus::None : MaiToolEffectStatus::Unknown;
+                    execution.nextAction = pending ? MaiToolNextAction::None
+                                           : !execution.taskId.empty()
+                                               ? MaiToolNextAction::QueryStatus
+                                               : MaiToolNextAction::InspectState;
+                    execution.exitCode.reset();
+                    if (pending) {
+                        execution.started = false;
+                        execution.timedOut = false;
+                        execution.canceled = false;
+                    } else if (!execution.started.value_or(false))
+                        execution.started.reset();
+                    tool->execution = std::move(execution);
                     tool->state = MaiToolState::Error;
                     tool->error = error;
-                    tool->output = error;
                     changed = true;
                 }
                 if (changed && message.completed == 0) message.completed = completedAt;
@@ -391,11 +465,45 @@ public:
     }
 
 private:
+    // 锁内核验当前源片段；保留快照不能绕过消息或 callId 后续变更。
+    bool ownsToolOutputLocked(const MaiToolOutputRecord& output) const {
+        if (mSessions.count(output.sessionId) == 0) return false;
+        const auto session = mMessages.find(output.sessionId);
+        if (session == mMessages.end()) return false;
+        for (const auto& message : session->second) {
+            if (message.id != output.messageId) continue;
+            for (const auto& part : message.parts) {
+                if (part.id != output.partId) continue;
+                const auto* tool = std::get_if<MaiToolPart>(&part.body);
+                return tool && tool->callId == output.callId;
+            }
+        }
+        return false;
+    }
+
+    // 同锁清理字节和编号墓碑；淘汰仅丢字节，直至消息被清空才释放其不可变编号。
+    void clearToolOutputsLocked(const std::string& sessionId) {
+        for (auto it = mToolOutputs.begin(); it != mToolOutputs.end();) {
+            if (it->second.sessionId == sessionId)
+                it = mToolOutputs.erase(it);
+            else
+                ++it;
+        }
+        for (auto it = mToolOutputIds.begin(); it != mToolOutputIds.end();) {
+            if (it->second == sessionId)
+                it = mToolOutputIds.erase(it);
+            else
+                ++it;
+        }
+    }
+
     mutable std::mutex mMutex;
     std::unordered_map<std::string, MaiSession> mSessions;
     std::unordered_map<std::string, std::vector<MaiMessage>> mMessages;
     std::unordered_map<std::string, MaiContextCheckpoint> mContextCheckpoints;
     std::unordered_map<std::string, MaiSpecialistTask> mSpecialistTasks;
+    std::unordered_map<std::string, MaiToolOutputRecord> mToolOutputs;
+    std::unordered_map<std::string, std::string> mToolOutputIds;
 };
 
 }  // namespace

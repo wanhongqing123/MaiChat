@@ -66,6 +66,14 @@ std::string maiToolDetailRevision(const MaiToolPart& tool) {
             EVP_DigestUpdate(digest.get(), value.data(), value.size()) != 1)
             return {};
     }
+    if (tool.execution) {
+        // 仅为带新事实的记录追加分帧字段，旧记录的 revision 继续保持兼容。
+        const auto facts = maiSerializeToolExecution(*tool.execution);
+        const auto frame = std::to_string(facts.size()) + ":";
+        if (EVP_DigestUpdate(digest.get(), frame.data(), frame.size()) != 1 ||
+            EVP_DigestUpdate(digest.get(), facts.data(), facts.size()) != 1)
+            return {};
+    }
     std::array<unsigned char, EVP_MAX_MD_SIZE> bytes{};
     unsigned int length = 0;
     if (EVP_DigestFinal_ex(digest.get(), bytes.data(), &length) != 1) return {};
@@ -102,6 +110,42 @@ MaiResult<MaiToolDetailPage> maiReadToolDetail(const MaiSessionStore& store,
     if (!query.expectedRevision.empty() && query.expectedRevision != revision)
         return {MaiErrorCode::Busy,
                 "detail_changed: Tool detail changed; read again from the first page."};
+
+    if (query.field == "output" && tool->execution && !tool->execution->outputId.empty()) {
+        // 输出句柄只指向同一个源 part；句柄本身不赋予访问另一段输出的能力。
+        const auto retained = store.readToolOutput(sessionId, {tool->execution->outputId});
+        if (!retained) return retained.error();
+        const auto& source = retained.value();
+        if (source.messageId != message.id || source.partId != found->id ||
+            source.callId != tool->callId)
+            return {MaiErrorCode::Protocol, "Retained output does not belong to this tool part."};
+        // 发生捕获丢失时保留原预览里的明确警告；完整保留的输出才直接投影到旧详情协议。
+        // 原始部分快照仍可经普通输出 API/tool_output_read 补读并取得 truncated 标志。
+        if (!source.truncated) {
+            const auto selected =
+                query.offsetBytes == 0 && query.maxBytes == 4096
+                    ? retained
+                    : store.readToolOutput(sessionId, {tool->execution->outputId, query.offsetBytes,
+                                                       query.maxBytes});
+            if (!selected) return selected.error();
+            const auto& bytes = selected.value();
+            MaiToolDetailPage page;
+            page.messageId = message.id;
+            page.partId = found->id;
+            page.callId = tool->callId;
+            page.tool = tool->tool;
+            page.state = tool->state;
+            page.field = query.field;
+            page.revision = revision;
+            page.text = bytes.text;
+            page.offsetBytes = bytes.offsetBytes;
+            page.sourceBytesRead = bytes.sourceBytesRead;
+            page.totalBytes = bytes.totalBytes;
+            page.nextOffsetBytes = bytes.nextOffsetBytes;
+            page.textIsValidUtf8 = bytes.textIsValidUtf8;
+            return page;
+        }
+    }
 
     // 版本和全部身份字段都取同一次getMessage的快照，活动工具不会造成页内的撕裂读取。
     const auto& source = query.field == "input"    ? tool->input
