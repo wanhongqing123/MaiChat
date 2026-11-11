@@ -99,9 +99,12 @@ private:
     bool toolNeedsApproval(const MaiToolInvocation& call) const;
 
     // 组装这一次要发给模型的请求。
-    // 可能同步增量总结旧轮次；失败/取消不发送缺少历史的请求，也不推进检查点。
+    // 可能同步增量总结旧轮次。includeTools 对应实际请求能力，与最终回答提示无关；
+    // 无工具收尾在 prepare 之前移除工具，不能创建或复用依赖原史回查的部分来源索引。
+    // finalAnswerHint 若非空也在 prepare 前加入完整预算，调用期间须保持字符串有效。
     MaiResult<MaiModelRequest> buildRequest(const std::string& modelName, bool requireFinalAnswer,
-                                            const std::atomic<bool>& cancel);
+                                            bool includeTools, const std::atomic<bool>& cancel,
+                                            const char* finalAnswerHint = nullptr);
     bool advanceSteering(bool closeIfEmpty);
 
     // 流式 part 刚冒头时：先在消息里占个位、落库，再广播。

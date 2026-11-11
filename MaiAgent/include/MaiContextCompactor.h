@@ -21,6 +21,9 @@ struct MaiContextPreparation {
     MaiModelTokenEstimate inputEstimate;
     // 仅摘要 Protocol 失败且原请求仍适配时延后压缩；request 保持原文/旧检查点，未推进存储。
     bool deferredCompaction = false;
+    // 本次请求含宿主生成的部分来源索引（新建或复用），不是模型已成功理解的语义摘要。
+    // 调用方须保证 request 的真实工具能力可精确读取本会话原史；不会删除或改写原消息。
+    bool usedHistoryIndexRecovery = false;
 };
 
 // 普通 C++ 摘要入口，直接调用同一个供应商客户端，不依赖工具协议或服务端代理。
@@ -31,7 +34,8 @@ struct MaiContextPreparation {
 // 大工具组可整体摘要，像素仍保留并带真实组来源，不能声称知道不存在的单图调用归属。
 // 超长旧片段分成带精确源 ID/字段/偏移的数据块，全部成功后才提交一个原子检查点。
 // 失败、取消、空/无效摘要、源变化或持久化失败不推进；原始消息永不改写或删除。
-// 软区摘要 Protocol 失败可返回仍适配的原请求并标记 deferredCompaction；真实超限仍失败。
+// 软区摘要 Protocol 失败可返回仍适配的原请求并标记 deferredCompaction。
+// 硬区仅在显式保证原史回查能力时尝试部分来源索引；必要原文/保护尾部放不下仍明确失败。
 class MaiContextCompactor {
 public:
     struct Options {
@@ -46,6 +50,12 @@ public:
         // 同一 Runner 先前已安全延后时，跳过软阈值重试；每次仍重算容量与倍率，
         // 超过硬输入预算必须重新压缩。成功检查点推进后由调用方恢复常规软阈值策略。
         bool deferUntilHardLimit = false;
+        // 默认禁用。调用方显式保证本次实际发送的请求有已授权的同会话精确原史回查能力，
+        // 才可在硬区摘要 Protocol 失败后安装或复用部分来源索引。索引保留有效旧摘要和新增
+        // 用户原文/引用/附件元信息，只把稳定 assistant/tool 大正文留在未改写的原史中。
+        // 取消、网络、限流、存储/来源/CAS 冲突不恢复；索引也须满足完整预算和严格缩小检查。
+        // 无工具收尾或自定义宿主没有该保证时须保持 false；不隐式调用工具协议。
+        bool allowHistoryIndexRecovery = false;
     };
 
     // 特殊宿主可注入“从消息/片段边界构建原文并保留指定 user”的同线程回调。

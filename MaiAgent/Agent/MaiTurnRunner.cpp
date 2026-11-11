@@ -329,17 +329,12 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         if (mDependencies.closeSteering) mDependencies.closeSteering();
         advanceSteering(false);
         if (mError || cancel.load(std::memory_order_relaxed)) return;
-        auto built = buildRequest(mModelName, false, cancel);
+        auto built = buildRequest(mModelName, false, false, cancel, hint);
         if (!built) {
             mError = built.error();
             return;
         }
         MaiModelRequest finalRequest = std::move(built.value());
-        finalRequest.tools.clear();
-        MaiModelMessage instruction;
-        instruction.role = MaiModelRole::System;
-        instruction.content = hint;
-        finalRequest.messages.push_back(std::move(instruction));
         const auto finalCalls = requestCompletion(finalRequest, cancel);
         const bool hasFinalText = mResponseHasVisibleText;
         commitStreamedParts();
@@ -355,7 +350,7 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         }
         if (mError) break;
 
-        auto built = buildRequest(mModelName, retriedMissingFinalAnswer, cancel);
+        auto built = buildRequest(mModelName, retriedMissingFinalAnswer, true, cancel);
         if (!built) {
             mError = built.error();
             break;
@@ -422,8 +417,9 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
 // 从会话存储和当前内存中的 assistant 消息构造下一次模型请求。
 // 刚执行完的工具结果可能尚未进入旧快照，因此以内存中的最新片段覆盖它。
 MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelName,
-                                                       bool requireFinalAnswer,
-                                                       const std::atomic<bool>& cancel) {
+                                                       bool requireFinalAnswer, bool includeTools,
+                                                       const std::atomic<bool>& cancel,
+                                                       const char* finalAnswerHint) {
     MaiModelRequest request;
     request.model = modelName;
     const auto capability = maiCloudModelInfo(modelName);
@@ -527,20 +523,25 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
     const auto buildContext = [&](std::size_t firstMessage, std::size_t firstPart,
                                   const std::string& preservedUserMessageId) {
         auto messages = buildHistory(firstMessage, firstPart, preservedUserMessageId);
-        if (requireFinalAnswer) {
+        if (requireFinalAnswer || finalAnswerHint) {
             MaiModelMessage instruction;
             instruction.role = MaiModelRole::System;
-            instruction.content = kFinalAnswerHint;
+            instruction.content = finalAnswerHint ? finalAnswerHint : kFinalAnswerHint;
             messages.push_back(std::move(instruction));
         }
         return messages;
     };
 
-    if (mDependencies.tools && !mDependencies.tools->isEmpty())
+    if (includeTools && mDependencies.tools && !mDependencies.tools->isEmpty())
         request.tools = mDependencies.tools->specs(mModelName);
     MaiContextCompactor::Options options;
     options.estimateMultiplier = mContextEstimateMultiplier;
     options.deferUntilHardLimit = mCompactionDeferred;
+    // 注册名和真实请求声明均需存在，且工具上下文绑定本会话门面；不能用回答提示猜能力。
+    options.allowHistoryIndexRecovery =
+        mDependencies.sessionAgent &&
+        std::any_of(request.tools.begin(), request.tools.end(),
+                    [](const MaiToolSpec& tool) { return tool.name == "session_history"; });
     const auto prepared = MaiContextCompactor(options).prepare(
         *mDependencies.store, *mDependencies.model, *mDependencies.context, mSessionId,
         sourceHistory, std::move(request), cancel, buildContext);

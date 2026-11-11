@@ -10,7 +10,7 @@ if(CMAKE_HOST_APPLE)
   endif()
 endif()
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 2.2.57 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 2.2.58 LANGUAGES C CXX)
 if(MSVC AND MSVC_VERSION LESS 1930)
   message(FATAL_ERROR "The source Qt 6 desktop build requires MSVC 2022 or later")
 endif()
