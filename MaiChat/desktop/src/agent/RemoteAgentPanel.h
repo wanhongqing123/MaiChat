@@ -22,6 +22,9 @@ public:
     ~RemoteAgentPanel() override;
 
     void setCommandHandler(CommandHandler handler);
+    // The authenticated host supplies this scope; discovery JSON is not an
+    // authority for account identity. Changing it drops only read-detail state.
+    void setToolDetailScope(const QString& accountId, quint64 generation);
     void setHistoryHandler(HistoryHandler handler);
     void setDownloadHandler(DownloadHandler handler);
     void setImageAccessProvider(ImageAccessProvider provider);
@@ -54,6 +57,13 @@ private:
     void sendPrompt(const QJsonObject& action, const QString& retryId = {});
     void removeOptimisticMessage(const QString& id);
     void renderMessages();
+    void syncToolDetailMetadata(const QJsonObject& tool);
+    void activateToolDetail(const QJsonObject& tool, const QString& field);
+    void requestToolDetailPage(const QString& key, const QString& field);
+    bool receiveToolDetailResult(const QJsonObject& owner, const QJsonObject& payload);
+    void invalidateToolDetailRequests(bool clearCache);
+    void refreshToolDetailViews();
+    QJsonObject toolDetailPresentation(const QJsonObject& tool) const;
     void renderImage(class QLabel* card, const QString& messageId, const QJsonObject& part);
     void openImagePreview(class QLabel* card);
     void resetImagePreview();

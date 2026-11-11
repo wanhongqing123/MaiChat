@@ -4973,6 +4973,9 @@ void MainWindow::setSessionSyncCoordinator(DesktopSessionSyncCoordinator* coordi
 
 void MainWindow::wireRemoteAgentPanel() {
   if (!agentRemotePanel_ || !sessionSync_) return;
+  // Bind read-only tool pages to this account/controller lifetime as well as
+  // the remote slot/login/session, so replaced callbacks cannot fill new pages.
+  agentRemotePanel_->setToolDetailScope(app_.chatState().ownerUserId(), agentControllerGeneration_);
   QPointer<RemoteAgentPanel> panel(agentRemotePanel_);
   agentRemotePanel_->setHistoryHandler([this, panel](const QJsonObject& session, const QString& before, int limit,
                                                       RemoteAgentPanel::Completion completion) {

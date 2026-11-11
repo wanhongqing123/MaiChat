@@ -273,6 +273,9 @@ private slots:
     void omitsLocalMediaPathsFromRemoteHistory();
     void projectsOnlySafeCurlFailureSummaries_data();
     void projectsOnlySafeCurlFailureSummaries();
+    void remoteToolDetailReadsPersistedFieldsWithoutExecuting();
+    void remoteToolDetailMetadataTracksSameStateChanges();
+    void remoteToolDetailMetadataAndInvalidEchoStayWithinWireBudget();
     void remotePanelDisplaysCurlFailureSummaryAndRefreshesIt();
     void coordinatorRoutesPhoneCommandToTheExistingDesktopSession();
     void coordinatorKeepsInputOrderDuringAttachmentPreparation_data();
@@ -1989,6 +1992,167 @@ void DesktopSessionSyncHostTest::projectsOnlySafeCurlFailureSummaries() {
         QCOMPARE(retainedQuestion.value(QStringLiteral("output")).toString(), QString::fromStdString(question.output));
         QCOMPARE(retainedQuestion.value(QStringLiteral("error")).toString(), QString::fromStdString(question.error));
     }
+}
+
+void DesktopSessionSyncHostTest::remoteToolDetailReadsPersistedFieldsWithoutExecuting() {
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    const auto database = workspace.filePath(QStringLiteral("owned-tool-detail.sqlite"));
+    AgentController controller(AgentController::ModelConfig{}, database);
+    const auto session = controller.createSession(workspace.path(), QStringLiteral("Owned detail"));
+    const auto other = controller.createSession(workspace.path(), QStringLiteral("Other owner"));
+    MaiMessage message;
+    message.id = MaiIdGenerator::newMessageId();
+    message.role = MaiRole::Assistant;
+    message.created = 1000;
+    message.completed = 2000;
+    MaiToolPart tool;
+    tool.tool = "shell";
+    tool.callId = "owned-detail-call";
+    tool.state = MaiToolState::Completed;
+    tool.input = R"({"command":"printf owned-only","working_directory":"owned"})";
+    tool.output = std::string(4093, 'a') + "\xf0\x9f\x8c\x8d" + std::string(70000, 'b');
+    tool.error = "Owned error detail";
+    const auto part = MaiIdGenerator::newPartId();
+    message.parts.push_back({part, tool, 1001});
+    auto store = makeMaiSqliteStore(database.toStdString());
+    QVERIFY(store);
+    store.value()->putMessage(session.toStdString(), message);
+    QVERIFY(!store.value()->lastWriteError().hasError());
+    DesktopSessionSyncHost host(controller);
+    QJsonObject request{{QStringLiteral("action"), QStringLiteral("get_tool_detail")},
+                        {QStringLiteral("requestId"), QStringLiteral("owned-detail-read")},
+                        {QStringLiteral("messageId"), QString::fromStdString(message.id)},
+                        {QStringLiteral("partId"), QString::fromStdString(part)},
+                        {QStringLiteral("field"), QStringLiteral("output")},
+                        {QStringLiteral("offset"), 0}, {QStringLiteral("limit"), 4096}};
+    auto page = host.applyCommand(session, request);
+    QVERIFY2(page.value(QStringLiteral("ok")).toBool(), qPrintable(page.value(QStringLiteral("error")).toString()));
+    QCOMPARE(page.value(QStringLiteral("requestId")), request.value(QStringLiteral("requestId")));
+    QCOMPARE(page.value(QStringLiteral("sessionId")).toString(), session);
+    QCOMPARE(page.value(QStringLiteral("messageId")), request.value(QStringLiteral("messageId")));
+    QCOMPARE(page.value(QStringLiteral("partId")), request.value(QStringLiteral("partId")));
+    QCOMPARE(page.value(QStringLiteral("callId")).toString(), QString::fromStdString(tool.callId));
+    QCOMPARE(page.value(QStringLiteral("sourceBytesRead")).toInt(), 4093);
+    QCOMPARE(page.value(QStringLiteral("nextOffset")).toInt(), 4093);
+    QCOMPARE(page.value(QStringLiteral("totalBytes")).toInt(), int(tool.output.size()));
+    QVERIFY(page.value(QStringLiteral("hasMore")).toBool());
+    QVERIFY(QJsonDocument(page).toJson(QJsonDocument::Compact).size() < 64 * 1024);
+    const auto revision = page.value(QStringLiteral("detailRevision")).toString();
+    QCOMPARE(revision.size(), 64);
+    QByteArray complete = page.value(QStringLiteral("text")).toString().toUtf8();
+    while (page.value(QStringLiteral("hasMore")).toBool()) {
+        request.insert(QStringLiteral("offset"), page.value(QStringLiteral("nextOffset")));
+        request.insert(QStringLiteral("detailRevision"), revision);
+        page = host.applyCommand(session, request);
+        QVERIFY(page.value(QStringLiteral("ok")).toBool());
+        QVERIFY(page.value(QStringLiteral("sourceBytesRead")).toInt() > 0);
+        QVERIFY(QJsonDocument(page).toJson(QJsonDocument::Compact).size() < 64 * 1024);
+        QCOMPARE(page.value(QStringLiteral("detailRevision")).toString(), revision);
+        complete += page.value(QStringLiteral("text")).toString().toUtf8();
+    }
+    QCOMPARE(complete.toStdString(), tool.output);
+    QCOMPARE(host.applyCommand(other, request).value(QStringLiteral("errorCode")).toString(), QStringLiteral("not_found"));
+    request.insert(QStringLiteral("offset"), 1);
+    request.insert(QStringLiteral("detailRevision"), QString(64, QLatin1Char('0')));
+    const auto stale = host.applyCommand(session, request);
+    QCOMPARE(stale.value(QStringLiteral("errorCode")).toString(), QStringLiteral("busy"));
+    QCOMPARE(stale.value(QStringLiteral("requestId")), request.value(QStringLiteral("requestId")));
+    request.insert(QStringLiteral("offset"), 0);
+    request.remove(QStringLiteral("detailRevision"));
+    request.insert(QStringLiteral("field"), QStringLiteral("input"));
+    QCOMPARE(host.applyCommand(session, request).value(QStringLiteral("text")).toString(), QString::fromStdString(tool.input));
+    request.insert(QStringLiteral("field"), QStringLiteral("error"));
+    QCOMPARE(host.applyCommand(session, request).value(QStringLiteral("text")).toString(), QString::fromStdString(tool.error));
+    request.insert(QStringLiteral("field"), QStringLiteral("media_path"));
+    QCOMPARE(host.applyCommand(session, request).value(QStringLiteral("errorCode")).toString(), QStringLiteral("invalid_input"));
+    MaiMessage unchanged;
+    QVERIFY(controller.agent().getMessage(session.toStdString(), message.id, unchanged));
+    const auto& original = std::get<MaiToolPart>(unchanged.parts.front().body);
+    QCOMPARE(original.input, tool.input);
+    QCOMPARE(original.output, tool.output);
+    QCOMPARE(original.error, tool.error);
+    QVERIFY(!controller.agent().isBusy(session.toStdString()));
+    QVERIFY(!QFileInfo::exists(workspace.filePath(QStringLiteral("owned-only"))));
+}
+
+void DesktopSessionSyncHostTest::remoteToolDetailMetadataTracksSameStateChanges() {
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    const auto database = workspace.filePath(QStringLiteral("owned-detail-metadata.sqlite"));
+    AgentController controller(AgentController::ModelConfig{}, database);
+    const auto session = controller.createSession(workspace.path(), QStringLiteral("Owned detail"));
+    auto store = makeMaiSqliteStore(database.toStdString());
+    QVERIFY(store);
+    MaiMessage message;
+    message.id = MaiIdGenerator::newMessageId();
+    message.role = MaiRole::Assistant;
+    message.created = 1000;
+    MaiToolPart tool;
+    tool.tool = "shell";
+    tool.callId = "same-state-call";
+    tool.state = MaiToolState::Completed;
+    tool.output = "First owned result";
+    message.parts.push_back({MaiIdGenerator::newPartId(), tool, 1001});
+    store.value()->putMessage(session.toStdString(), message);
+    DesktopSessionSyncHost host(controller);
+    const auto partSnapshot = [&] {
+        return host.historyMessage(session, QString::fromStdString(message.id))
+            .value(QStringLiteral("parts")).toArray().first().toObject();
+    };
+    const auto first = partSnapshot();
+    QVERIFY(first.value(QStringLiteral("detailsAvailable")).toBool());
+    QCOMPARE(first.value(QStringLiteral("callId")).toString(), QString::fromStdString(tool.callId));
+    const auto before = first.value(QStringLiteral("detailRevision")).toString();
+    QCOMPARE(before.size(), 64);
+    QVERIFY(!first.contains(QStringLiteral("input")));
+    QVERIFY(!first.contains(QStringLiteral("output")));
+    std::get<MaiToolPart>(message.parts.front().body).output = "Second owned result";
+    store.value()->putMessage(session.toStdString(), message);
+    const auto after = partSnapshot();
+    QCOMPARE(after.value(QStringLiteral("id")), first.value(QStringLiteral("id")));
+    QCOMPARE(after.value(QStringLiteral("state")), first.value(QStringLiteral("state")));
+    QVERIFY(after.value(QStringLiteral("detailRevision")).toString() != before);
+}
+
+void DesktopSessionSyncHostTest::remoteToolDetailMetadataAndInvalidEchoStayWithinWireBudget() {
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    const auto database = workspace.filePath(QStringLiteral("owned-detail-wire-budget.sqlite"));
+    AgentController controller(AgentController::ModelConfig{}, database);
+    const auto session = controller.createSession(workspace.path(), QStringLiteral("Owned detail budget"));
+    auto store = makeMaiSqliteStore(database.toStdString());
+    QVERIFY(store);
+    MaiMessage message;
+    message.id = MaiIdGenerator::newMessageId();
+    message.role = MaiRole::Assistant;
+    MaiToolPart tool;
+    tool.tool = "shell";
+    tool.callId = std::string(50 * 1024, 'c');
+    tool.state = MaiToolState::Completed;
+    tool.input = "Owned input";
+    const auto partId = MaiIdGenerator::newPartId();
+    message.parts.push_back({partId, tool, 1001});
+    store.value()->putMessage(session.toStdString(), message);
+    DesktopSessionSyncHost host(controller);
+    const auto snapshot = host.historyMessage(session, QString::fromStdString(message.id));
+    const auto wire = QJsonDocument(snapshot).toJson(QJsonDocument::Compact);
+    QVERIFY2(wire.size() < 48 * 1024, "Optional callId must not make an otherwise small tool message unpublishable.");
+    const auto part = snapshot.value(QStringLiteral("parts")).toArray().first().toObject();
+    QVERIFY(!part.contains(QStringLiteral("callId")));
+    QCOMPARE(part.value(QStringLiteral("detailRevision")).toString().size(), 64);
+    QVERIFY(part.value(QStringLiteral("detailsAvailable")).toBool());
+    const QJsonObject request{{QStringLiteral("action"), QStringLiteral("get_tool_detail")},
+                              {QStringLiteral("requestId"), QStringLiteral("owned-invalid-offset")},
+                              {QStringLiteral("messageId"), QString::fromStdString(message.id)},
+                              {QStringLiteral("partId"), QString::fromStdString(partId)},
+                              {QStringLiteral("field"), QStringLiteral("input")},
+                              {QStringLiteral("offset"), QString(65400, QLatin1Char('a'))},
+                              {QStringLiteral("limit"), 4096}};
+    const auto error = host.applyCommand(session, request);
+    QCOMPARE(error.value(QStringLiteral("errorCode")).toString(), QStringLiteral("invalid_input"));
+    QCOMPARE(error.value(QStringLiteral("offset")).toInt(), 0);
+    QVERIFY(QJsonDocument(error).toJson(QJsonDocument::Compact).size() < 4096);
 }
 
 void DesktopSessionSyncHostTest::remotePanelDisplaysCurlFailureSummaryAndRefreshesIt() {

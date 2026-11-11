@@ -1199,10 +1199,15 @@ struct MaiMobileAgent {
                         if constexpr (std::is_same_v<T, MaiToolPart>) {
                             value.update({{"kind", "tool"},
                                           {"tool", body.tool},
+                                          {"detailRevision", maiToolDetailRevision(body)},
+                                          {"detailsAvailable", true},
                                           {"input", body.input},
                                           {"output", body.output},
                                           {"error", body.error},
                                           {"state", maiToolStateToString(body.state)}});
+                            // 可选身份元数据不撑破同步消息预算；省略异常值而不截断伪造另一个callId。
+                            // revision仍覆盖完整源值，按需详情读取也保留该源值。
+                            if (body.callId.size() <= 128) value["callId"] = body.callId;
                         } else if constexpr (std::is_same_v<T, MaiImagePart>) {
                             value.update({{"kind", "image"}, {"path", body.path}, {"mimeType", body.mimeType}});
                         } else if constexpr (std::is_same_v<T, MaiVideoPart>) {
@@ -1536,12 +1541,103 @@ struct MaiMobileAgent {
                 {"turnId", agent->activeTurnId(sessionId)}};
     }
 
+    // 详情读取不消费增量快照。所有失败也带回原请求绑定，宿主可丢弃已切页/切账号的迟到响应。
+    Json toolDetail(const Json& r) const {
+        const auto boundedIdentity = [&](const char* key) -> std::string {
+            if (!r.contains(key) || !r[key].is_string()) return {};
+            const auto& value = r[key].get_ref<const std::string&>();
+            return value.empty() || value.size() > 128 ? std::string{} : value;
+        };
+        const auto readSize = [](const Json& value, std::size_t& out) {
+            if (!value.is_number_integer()) return false;
+            if (!value.is_number_unsigned() && value.get<std::int64_t>() < 0) return false;
+            const auto number = value.get<std::uint64_t>();
+            out = static_cast<std::size_t>(number);
+            return static_cast<std::uint64_t>(out) == number;
+        };
+        std::size_t offset = 0;
+        const bool validOffset = !r.contains("offset") || readSize(r["offset"], offset);
+        if (!validOffset) offset = 0;
+        std::string selectedField = "input";
+        if (r.contains("field")) {
+            selectedField.clear();
+            if (r["field"].is_string()) {
+                const auto& field = r["field"].get_ref<const std::string&>();
+                if (field == "input" || field == "output" || field == "error") selectedField = field;
+            }
+        }
+        // 先规范化回执绑定，再校验请求；不能把巨大字符串、数组或对象原样回显到失败消息。
+        Json response{{"ok", false},
+                      {"requestId", boundedIdentity("requestId")},
+                      {"sessionId", boundedIdentity("session")},
+                      {"messageId", boundedIdentity("messageId")},
+                      {"partId", boundedIdentity("partId")},
+                      {"field", selectedField},
+                      {"offset", offset}};
+        const Json binding = response;
+        const auto fail = [&](MaiErrorCode code, const std::string& message) {
+            Json failure = binding;
+            failure["errorCode"] = maiErrorCodeToString(code);
+            failure["error"] = message;
+            return failure;
+        };
+        for (const auto& field : r.items())
+            if (field.key() != "op" && field.key() != "session" && field.key() != "requestId" &&
+                field.key() != "messageId" && field.key() != "partId" && field.key() != "field" &&
+                field.key() != "offset" && field.key() != "limit" && field.key() != "detailRevision")
+                return fail(MaiErrorCode::InvalidInput, "Unknown tool detail field.");
+        for (const char* field : {"requestId", "session", "messageId", "partId"})
+            if (!r.contains(field) || !r[field].is_string() || r[field].get_ref<const std::string&>().empty() ||
+                r[field].get_ref<const std::string&>().size() > 128)
+                return fail(MaiErrorCode::InvalidInput, "Invalid tool detail identity.");
+        if (selectedField.empty() || (r.contains("detailRevision") && !r["detailRevision"].is_string()))
+            return fail(MaiErrorCode::InvalidInput, "Invalid tool detail field or revision.");
+        MaiToolDetailQuery query;
+        query.messageId = r["messageId"];
+        query.partId = r["partId"];
+        query.field = response["field"];
+        query.expectedRevision = r.value("detailRevision", std::string{});
+        query.offsetBytes = offset;
+        if (!validOffset || (r.contains("limit") && !readSize(r["limit"], query.maxBytes)))
+            return fail(MaiErrorCode::InvalidInput, "Tool detail offset and limit must be nonnegative integers.");
+        if (!agent) return fail(MaiErrorCode::NotConfigured, "Agent is not initialized.");
+        const auto detail = agent->readToolDetail(r["session"], query);
+        if (!detail) return fail(detail.error().code(), detail.error().message());
+        const auto& page = detail.value();
+        response.update({{"ok", true},
+                         {"messageId", page.messageId},
+                         {"partId", page.partId},
+                         {"callId", page.callId},
+                         {"tool", page.tool},
+                         {"state", maiToolStateToString(page.state)},
+                         {"field", page.field},
+                         {"detailRevision", page.revision},
+                         {"offset", page.offsetBytes},
+                         {"sourceBytesRead", page.sourceBytesRead},
+                         {"totalBytes", page.totalBytes},
+                         {"nextOffset", page.nextOffsetBytes},
+                         {"hasMore", page.nextOffsetBytes != 0},
+                         {"textIsValidUtf8", page.textIsValidUtf8}});
+        if (page.textIsValidUtf8) {
+            response["text"] = page.text;
+        } else {
+            // 预览允许替换，但游标始终按源字节推进；Base64只为坏编码页提供无损原文。
+            response["text"] = Json::parse(Json(page.text).dump(-1, ' ', false, Json::error_handler_t::replace));
+            response["rawBase64"] = encodeBase64(page.text);
+        }
+        // 4096源字节的转义和Base64仍有界；异常旧元数据不能撑破宿主的控制消息上限。
+        if (response.dump(-1, ' ', false, Json::error_handler_t::replace).size() >= 64 * 1024)
+            return fail(MaiErrorCode::InvalidInput, "Tool detail metadata exceeds the response budget.");
+        return response;
+    }
+
     Json request(const Json& r) {
         const std::string op = r.at("op");
         if (op == "configure") {
             configure(r);
             return {{"ok", true}};
         }
+        if (op == "tool_detail") return toolDetail(r);
         if (!agent) throw std::runtime_error("Agent is not initialized.");
         if (op == "pin_input_file") {
             // 图片转换留在平台；转换后的私有临时文件统一由 C++ 交付到稳定路径。

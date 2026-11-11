@@ -914,10 +914,44 @@ struct AILocalMusicUITestRoot: View {
 #endif
 
 #if targetEnvironment(simulator)
+struct AIRemoteToolDetailsUITestRoot: View {
+    @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
+    @ObservedObject private var model = AIAssistantModel.shared
+    @ObservedObject private var support = AIAssistantModel.shared.uiTestSupport
+    @State private var prepared = false
+    @State private var started = false
+
+    var body: some View {
+        Group {
+            if prepared { AIAssistantView() }
+            else { ProgressView("正在准备自有详情记录") }
+        }
+        .environmentObject(appState)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 3) {
+                Text(support.toolDetailPolicyResult).font(.caption)
+                    .accessibilityIdentifier("tool-detail-policy")
+                Text("只读请求 \(support.toolDetailCommandCount)").font(.caption)
+                    .accessibilityIdentifier("tool-detail-request-count")
+            }.padding(.vertical, 4)
+        }
+        .task {
+            guard !started else { return }; started = true
+            appState.masterUserID = "owned-tool-detail-account"
+            appState.chatState = MasterChatState(ownerUserID: "owned-tool-detail-account")
+            appState.hasCompletedInitialLogin = true
+            await model.installRemoteToolDetailUITestFixture(runChecks:
+                ProcessInfo.processInfo.arguments.contains("--ai-tool-detail-state-checks"))
+            prepared = true
+        }
+    }
+}
+
 enum AIAssistantUITestRouting {
     static var usesStandaloneFixture: Bool {
         let arguments = ProcessInfo.processInfo.arguments
-        return arguments.contains("--app-bars-layout-ui-test") ||
+        return arguments.contains("--ai-remote-tool-details-ui-test") ||
+            arguments.contains("--app-bars-layout-ui-test") ||
             arguments.contains("--markdown-breaks-ui-test") ||
             arguments.contains("--my-settings-ui-test") ||
             arguments.contains("--ai-history-ui-test") ||

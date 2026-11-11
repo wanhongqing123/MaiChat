@@ -29,6 +29,8 @@ public:
     QJsonObject messageUpdate(const QString& sessionId, const QString& messageId) const;
     // Exact persisted receipt lookup; never infer the accepted row from later output.
     QJsonObject historyMessage(const QString& sessionId, const QString& messageId) const;
+    // get_tool_detail reads a revision-bound persisted field page without
+    // executing a tool. The caller supplies the authenticated owner session.
     // get_session/set_model return the owner's persisted session/model/effort/wire.
     // Model mutations use the same Controller API as ordinary local calls.
     QJsonObject applyCommand(const QString& sessionId, const QJsonObject& payload);

@@ -38,6 +38,147 @@ import org.junit.runner.RunWith;
 
 @RunWith(AndroidJUnit4.class)
 public class AIAssistantInstrumentedTest {
+    // Component acceptance uses the real Panel and Controller, with only the read-only
+    // history/command transport replaced. It is not a deployed cross-device acceptance run.
+    @Test public void remoteToolDetailsReadOriginalFieldsAndRestartAnOmittedPrefix() throws Exception {
+        Context app = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        DetailReadOwner owner = new DetailReadOwner();
+        try (ActivityScenario<AIAssistantTestActivity> scenario = ActivityScenario.launch(
+                new Intent(app, AIAssistantTestActivity.class).putExtra("model_url", "http://127.0.0.1:18190"))) {
+            scenario.onActivity(activity -> {
+                activity.panel.closeLocalMusic();
+                activity.panel.controller.close();
+                activity.panel = new AIAssistantPanel(activity,
+                    new AIAssistantController(activity, "http://127.0.0.1:18190", owner), null, null, activity.browser);
+                activity.setContentView(activity.panel);
+            });
+            await(scenario, panel -> panel.controller.state.ready);
+            scenario.onActivity(activity -> {
+                try {
+                    activity.panel.controller.acceptRemoteCatalog(new org.json.JSONArray().put(owner.owner()), new org.json.JSONArray(), "local-fixture");
+                    activity.panel.controller.selectRemote(owner.owner(), success -> assertTrue(success));
+                } catch (Exception failure) { throw new AssertionError(failure); }
+            });
+            await(scenario, panel -> panel.controller.state.remoteSession != null
+                && DetailReadOwner.SESSION.equals(panel.controller.state.selected));
+            scenario.onActivity(activity -> {
+                View group = findDescription(activity.panel, "工具调用 1 次，有失败 · curl ×1");
+                assertNotNull(group); assertTrue(group.performClick());
+            });
+            await(scenario, panel -> findContainingText(panel, "失败 curl") != null);
+            scenario.onActivity(activity -> assertTrue(findContainingText(activity.panel, "失败 curl").performClick()));
+            await(scenario, panel -> owner.requests.size() == 3 && detailOutput(panel) != null
+                && detailOutput(panel).optString("text").startsWith("HEAD\n"));
+            scenario.onActivity(activity -> {
+                assertNotNull(findContainingText(activity.panel, "original curl args"));
+                assertNotNull(findContainingText(activity.panel, "original TLS error"));
+                assertNotNull(findContainingText(activity.panel, "curl request failed"));
+                assertEquals(0, activity.panel.controller.state.data.optJSONArray("outgoing").length());
+                java.util.Set<String> fields = new java.util.HashSet<>();
+                for (JSONObject request : owner.requests) fields.add(request.optString("field"));
+                assertEquals(3, fields.size());
+            });
+            Bitmap screenshot = InstrumentationRegistry.getInstrumentation().getUiAutomation().takeScreenshot();
+            assertNotNull(screenshot);
+            try (FileOutputStream stream = new FileOutputStream(new File(app.getExternalFilesDir(null), "android-tool-detail-component.png"))) {
+                assertTrue(screenshot.compress(Bitmap.CompressFormat.PNG, 100, stream));
+            } finally { screenshot.recycle(); }
+            for (int page = 1; page < 17; page++) {
+                final long nextOffset = (page + 1L) * 4096;
+                scenario.onActivity(activity -> {
+                    View next = findDescription(activity.panel, "读取工具输出");
+                    assertNotNull(next); assertTrue(next.isEnabled()); assertTrue(next.performClick());
+                });
+                await(scenario, panel -> detailOutput(panel) != null
+                    && detailOutput(panel).optLong("nextOffset") == nextOffset && !detailOutput(panel).optBoolean("loading"));
+            }
+            await(scenario, panel -> detailOutput(panel).optBoolean("prefixOmitted"));
+            scenario.onActivity(activity -> {
+                View restart = findDescription(activity.panel, "从头读取工具输出");
+                assertNotNull(restart); assertEquals(View.VISIBLE, restart.getVisibility());
+                assertTrue(restart.isEnabled()); assertTrue(restart.performClick());
+            });
+            await(scenario, panel -> detailOutput(panel).optLong("nextOffset") == 4096
+                && !detailOutput(panel).optBoolean("prefixOmitted") && detailOutput(panel).optString("text").startsWith("HEAD\n"));
+            assertEquals("Only field reads and explicit pagination were dispatched", 20, owner.requests.size());
+            assertTrue(owner.requests.get(owner.requests.size() - 1).optLong("offset") == 0);
+        }
+    }
+    private static JSONObject detailOutput(AIAssistantPanel panel) {
+        JSONObject details = panel.controller.state.data.optJSONObject("toolDetails");
+        JSONObject part = details == null ? null : details.optJSONObject(AIAssistantToolDetails.key(DetailReadOwner.MESSAGE, DetailReadOwner.PART));
+        return part == null ? null : part.optJSONObject("output");
+    }
+    private TextView findContainingText(View view, String text) {
+        if (view instanceof TextView && ((TextView) view).getText().toString().contains(text)) return (TextView) view;
+        if (view instanceof ViewGroup) for (int i = 0; i < ((ViewGroup) view).getChildCount(); i++) {
+            TextView found = findContainingText(((ViewGroup) view).getChildAt(i), text);
+            if (found != null) return found;
+        }
+        return null;
+    }
+    private static final class DetailReadOwner implements AIAssistantController.SessionReads {
+        static final String SESSION = "owned-detail-session", MESSAGE = "owned-detail-message", PART = "owned-detail-part";
+        final java.util.List<JSONObject> requests = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final String output = "HEAD\n" + repeated('x', 18 * 4096 - 9) + "TAIL";
+        private static String repeated(char value, int count) {
+            // Keep the fixture executable on the product's older supported Android APIs.
+            char[] text = new char[count]; java.util.Arrays.fill(text, value); return new String(text);
+        }
+        JSONObject owner() throws Exception {
+            return new JSONObject().put("id", SESSION).put("device_slot", "owned-detail-owner")
+                .put("login_session_id", "owned-detail-login").put("online", true).put("model", "deepseek-flash")
+                .put("reasoningEffort", "high").put("wire", "chat_completions");
+        }
+        JSONObject envelope() throws Exception {
+            return new JSONObject().put("session_id", SESSION).put("from_slot", "owned-detail-owner")
+                .put("from_login_session_id", "owned-detail-login");
+        }
+        public void history(JSONObject owner, String before, int limit,
+                            java.util.function.BiConsumer<JSONObject, String> completion) throws Exception {
+            JSONObject part = new JSONObject().put("id", PART).put("kind", "tool").put("tool", "curl")
+                .put("state", "error").put("error", "curl request failed").put("detailsAvailable", true)
+                .put("detailRevision", repeated('a', 64)); // Optional 129-byte call ID is absent from compact history.
+            JSONObject message = new JSONObject().put("id", MESSAGE).put("role", "assistant")
+                .put("created", System.currentTimeMillis()).put("completed", System.currentTimeMillis())
+                .put("parts", new org.json.JSONArray().put(part));
+            completion.accept(new JSONObject().put("ok", true).put("session", SESSION)
+                .put("messages", new org.json.JSONArray().put(message)).put("permissions", new org.json.JSONArray())
+                .put("questions", new org.json.JSONArray()).put("questionMessages", new org.json.JSONArray())
+                .put("model", "deepseek-flash").put("busy", false), "");
+        }
+        public String command(JSONObject owner, JSONObject request,
+                              java.util.function.BiConsumer<String, String> sent,
+                              java.util.function.BiConsumer<JSONObject, JSONObject> received) throws Exception {
+            String command = UUID.randomUUID().toString();
+            JSONObject result;
+            if (request.optString("action").equals("get_session")) {
+                result = new JSONObject().put("ok", true).put("session", SESSION).put("model", "deepseek-flash")
+                    .put("reasoningEffort", "high").put("wire", "chat_completions");
+            } else {
+                assertEquals("No tool, prompt or mutable command is accepted", "get_tool_detail", request.optString("action"));
+                requests.add(new JSONObject(request.toString()));
+                String field = request.getString("field");
+                String source = field.equals("input") ? "original curl args" : field.equals("error") ? "original TLS error" : output;
+                byte[] bytes = source.getBytes(StandardCharsets.UTF_8);
+                int offset = request.getInt("offset"), count = Math.min(request.getInt("limit"), bytes.length - offset);
+                int next = offset + count < bytes.length ? offset + count : 0;
+                result = new JSONObject().put("ok", true).put("requestId", request.getString("requestId"))
+                    .put("sessionId", SESSION).put("messageId", MESSAGE).put("partId", PART)
+                    .put("callId", repeated('c', 129)).put("tool", "curl").put("state", "error").put("field", field)
+                    .put("detailRevision", repeated('a', 64)).put("offset", offset).put("sourceBytesRead", count)
+                    .put("totalBytes", bytes.length).put("nextOffset", next).put("hasMore", next != 0)
+                    .put("textIsValidUtf8", true).put("text", new String(bytes, offset, count, StandardCharsets.UTF_8));
+                if (offset == 0 && field.equals("output")) received.accept(envelope(), new JSONObject()
+                    .put("type", "command_result").put("command_id", command)
+                    .put("result", new JSONObject(result.toString()).put("partId", "wrong-part")));
+            }
+            sent.accept(command, "");
+            received.accept(envelope(), new JSONObject().put("type", "command_result").put("command_id", command).put("result", result));
+            return command;
+        }
+    }
+
     @Test public void remoteSessionAttachmentOffersARealDownloadAction() throws Exception {
         assertEquals("audio/mp4",MaiSessionAttachments.mediaInfo("voice.m4a").contentType);
         assertEquals("application/octet-stream",

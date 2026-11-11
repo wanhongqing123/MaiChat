@@ -49,6 +49,15 @@ public final class AIAssistantController {
     interface Listener {
         void onState(State state);
     }
+    // Ordinary read-only transport seam. Callers still pass through the controller's owner,
+    // epoch and ACK checks; no prompt, tool execution or mutable session command uses it.
+    interface SessionReads {
+        void history(JSONObject owner, String before, int limit,
+                     java.util.function.BiConsumer<JSONObject, String> completion) throws Exception;
+        String command(JSONObject owner, JSONObject request,
+                       java.util.function.BiConsumer<String, String> sent,
+                       java.util.function.BiConsumer<JSONObject, JSONObject> received) throws Exception;
+    }
     static final class State {
         final JSONObject data;
         final JSONObject remoteSession;
@@ -83,7 +92,8 @@ public final class AIAssistantController {
             JSONArray messages = data.optJSONArray("messages");
             String encoded = (messages == null ? "" : messages.toString())
                 + String.valueOf(data.optJSONArray("questionMessages")) + String.valueOf(data.optJSONArray("questions"))
-                + String.valueOf(data.optJSONArray("questionAnswerEchoes")) + String.valueOf(data.optJSONArray("messageDisplayUpdates"));
+                + String.valueOf(data.optJSONArray("questionAnswerEchoes")) + String.valueOf(data.optJSONArray("messageDisplayUpdates"))
+                + String.valueOf(data.optJSONObject("toolDetails"));
             this.messageHash = encoded.hashCode();
             this.messageLength = encoded.length();
         }
@@ -249,6 +259,7 @@ public final class AIAssistantController {
     private final Map<String, String> outgoingActiveInputs = new HashMap<>();
     private final Map<String, OutgoingReceipt> outgoingReceipts = new HashMap<>();
     private final AIAssistantSessionModels.Remote remoteModels = new AIAssistantSessionModels.Remote();
+    private final AIAssistantToolDetails toolDetails = new AIAssistantToolDetails();
     private final Map<String, String> remoteSteeringInputs = new java.util.LinkedHashMap<>();
     private static final class IncomingInput {
         final JSONObject action;
@@ -275,6 +286,7 @@ public final class AIAssistantController {
     private final MaiChatAuthClient accountAuth;
     private final long accountToolLoginGeneration;
     private final AndroidSessionSyncCoordinator sessionSync;
+    private final SessionReads sessionReads;
     private volatile Listener listener;
     private volatile HostToolHandler hostToolHandler;
     static final String GLM_CHAT_URL = "https://open.bigmodel.cn/api/paas/v4";
@@ -350,7 +362,11 @@ public final class AIAssistantController {
     };
 
     AIAssistantController(Context context, String testEndpoint) {
+        this(context, testEndpoint, null);
+    }
+    AIAssistantController(Context context, String testEndpoint, SessionReads sessionReads) {
         this.context = context.getApplicationContext();
+        this.sessionReads = sessionReads;
         accountAuth = MaiChatAuthClient.shared(this.context);
         accountToolLoginGeneration = accountAuth.accountSessionGeneration();
         if (testEndpoint != null && !BuildConfig.DEBUG)
@@ -766,7 +782,7 @@ public final class AIAssistantController {
     private static final class NativeAgentFailure extends IOException {
         NativeAgentFailure(String message) { super(message); }
     }
-    private JSONObject invokeNativeAgent(JSONObject request) throws Exception {
+    private JSONObject invokeNativeAgentResponse(JSONObject request) throws Exception {
         if (Looper.myLooper() == Looper.getMainLooper())
             throw new IllegalStateException("Native agent on UI thread");
         if (handle == 0)
@@ -774,7 +790,10 @@ public final class AIAssistantController {
         byte[] response = nativeRequest(handle, request.toString().getBytes(StandardCharsets.UTF_8));
         if (response == null)
             throw new IllegalStateException("AI 核心未返回结果");
-        JSONObject result = new JSONObject(new String(response, StandardCharsets.UTF_8));
+        return new JSONObject(new String(response, StandardCharsets.UTF_8));
+    }
+    private JSONObject invokeNativeAgent(JSONObject request) throws Exception {
+        JSONObject result = invokeNativeAgentResponse(request);
         if (!result.optBoolean("ok"))
             throw new NativeAgentFailure(result.optString("error", "操作失败"));
         if (request.optString("op").equals("configure")) nativeEpoch++;
@@ -1128,6 +1147,10 @@ public final class AIAssistantController {
             }
             visible.put("sessions", combined);
             visible.put("devices", new JSONArray(remoteDevices.toString()));
+            toolDetails.select(accountUserId, accountToolLoginGeneration, shown, selectedRemote);
+            toolDetails.observeMessages(visible.optJSONArray("messages"));
+            toolDetails.observeMessages(visible.optJSONArray("messageDisplayUpdates"));
+            visible.put("toolDetails", toolDetails.snapshot());
             visible.put("outgoing", outgoingQueue == null ? new JSONArray() : outgoingQueue.entries());
             visible.put("questionAnswerEchoes", questionEchoes.visible(outgoingOwner(shown, selectedRemote),
                 visible.optJSONArray("messages"), visible.optJSONArray("questionMessages"),
@@ -1492,6 +1515,11 @@ public final class AIAssistantController {
     }
     void commandForSync(String sessionId, JSONObject action, Consumer<JSONObject> completion) {
         worker.post(() -> {
+            // A detail read returns the persisted original call. It never enters the prompt
+            // queue, prepares a model, refreshes the conversation or reruns the tool.
+            if (action != null && action.optString("action").equals("get_tool_detail")) {
+                completion.accept(readToolDetailForSync(sessionId, action)); return;
+            }
             if (action == null || !(action.optString("action").equals("prompt") || action.optString("action").equals("steer"))) {
                 performCommandForSync(sessionId, action, completion); return;
             }
@@ -1503,6 +1531,92 @@ public final class AIAssistantController {
             queue.addLast(new IncomingInput(action, completion));
             if (queue.size() == 1) drainIncomingInput(sessionId);
         });
+    }
+    private JSONObject readToolDetailForSync(String sessionId, JSONObject action) {
+        try {
+            JSONObject request = AIAssistantToolDetails.nativeRequest(sessionId, action);
+            if (!ownsModelConfiguration()) return AIAssistantToolDetails.failure(sessionId, action,
+                "not_configured", "原账号已改变，未读取详情");
+            if (!hasLocalSession(sessionId)) return AIAssistantToolDetails.failure(sessionId, action,
+                "not_found", "本机会话不存在");
+            // Keep the Core's bound failure and revision instead of throwing away its tuple.
+            return invokeNativeAgentResponse(request);
+        } catch (IllegalArgumentException invalid) {
+            return AIAssistantToolDetails.failure(sessionId, action, "invalid_input", "工具详情请求无效");
+        } catch (Exception failure) {
+            return AIAssistantToolDetails.failure(sessionId, action, "internal", safeMessage(failure));
+        }
+    }
+
+    void loadToolDetails(State clicked, String messageId, JSONObject part) {
+        for (String field : AIAssistantToolDetails.FIELDS)
+            loadToolDetail(clicked, messageId, part, field, false, false);
+    }
+    void loadToolDetail(State clicked, String messageId, JSONObject source, String field, boolean more, boolean retry) {
+        final JSONObject captured = AIAssistantToolDetails.copy(source);
+        worker.post(() -> {
+            AIAssistantToolDetails.Ticket ticket = null;
+            try {
+                if (!ownsModelConfiguration() || clicked == null || !clicked.ready || pendingRemoteSelection != null
+                    || !clicked.selected.equals(state.selected)
+                    || (clicked.remoteSession == null ? selectedRemote != null : !sameRemote(clicked.remoteSession, selectedRemote))) return;
+                JSONObject current = findVisibleToolPart(messageId, captured.optString("id"));
+                if (current == null || !current.optString("detailRevision").equals(captured.optString("detailRevision"))
+                    || !current.optString("callId").equals(captured.optString("callId"))) return;
+                toolDetails.select(accountUserId, accountToolLoginGeneration, clicked.selected, selectedRemote);
+                ticket = toolDetails.begin(messageId, current, field, more, retry);
+                if (ticket == null) return;
+                final AIAssistantToolDetails.Ticket pending = ticket;
+                if (selectedRemote == null) {
+                    toolDetails.bind(pending, pending.request.optString("requestId"));
+                    JSONObject result = readToolDetailForSync(clicked.selected, pending.request);
+                    if (!toolDetails.accept(pending.request.optString("requestId"), null, result))
+                        toolDetails.fail(pending, "详情回执与原调用不符，可重试");
+                } else {
+                    if ((sessionSync == null && sessionReads == null) || !hasRemoteModelOwner(selectedRemote) || !selectedRemote.optBoolean("online"))
+                        throw new IOException("所属设备离线，已加载详情保留，可重试");
+                    String command = sendReadOnlyRemote(pending.owner, pending.request,
+                        (message, failure) -> worker.post(() -> {
+                            if (!failure.isEmpty()) {
+                                toolDetails.fail(pending, "所属设备暂不可达，已加载详情保留，可重试"); publishState();
+                            }
+                        }));
+                    toolDetails.bind(pending, command);
+                    worker.postDelayed(() -> {
+                        toolDetails.fail(pending, "读取所属设备详情超时，已加载内容保留，可重试"); publishState();
+                    }, 20000);
+                }
+            } catch (Exception failure) {
+                if (ticket != null) toolDetails.fail(ticket, safeMessage(failure));
+            }
+            if (ownsModelConfiguration()) publishState();
+        });
+    }
+    private JSONObject findVisibleToolPart(String messageId, String partId) {
+        JSONObject visible = selectedRemote == null ? data : remoteData;
+        for (String field : new String[] {"messages", "messageDisplayUpdates"}) {
+            JSONArray messages = visible.optJSONArray(field);
+            if (messages == null) continue;
+            for (int i = 0; i < messages.length(); i++) {
+                JSONObject message = messages.optJSONObject(i);
+                if (message == null || !messageId.equals(message.optString("id"))) continue;
+                JSONArray parts = message.optJSONArray("parts");
+                if (parts != null) for (int j = 0; j < parts.length(); j++) {
+                    JSONObject part = parts.optJSONObject(j);
+                    if (part != null && partId.equals(part.optString("id")) && part.optString("kind").equals("tool")) return part;
+                }
+            }
+        }
+        return null;
+    }
+    private String sendReadOnlyRemote(JSONObject owner, JSONObject request,
+                                     java.util.function.BiConsumer<String, String> sent) throws Exception {
+        String action = request.optString("action");
+        if (!action.equals("get_tool_detail") && !action.equals("get_session"))
+            throw new IllegalArgumentException("Only read-only session commands use this transport");
+        if (sessionReads != null) return sessionReads.command(AIAssistantToolDetails.copy(owner),
+            AIAssistantToolDetails.copy(request), sent, this::acceptRemotePayload);
+        return sessionSync.sendToRemote(owner, "command", request, sent);
     }
     private void drainIncomingInput(String sessionId) {
         java.util.ArrayDeque<IncomingInput> queue = incomingInputs.get(sessionId);
@@ -1967,6 +2081,10 @@ public final class AIAssistantController {
         worker.post(() -> {
             if (payload.optString("type").equals("command_result")) {
                 String command = payload.optString("command_id");
+                if (toolDetails.handles(command)) {
+                    if (ownsModelConfiguration() && toolDetails.acceptCommandResult(envelope, payload)) publishState();
+                    return; // A mismatched ACK leaves the original read pending.
+                }
                 OutgoingReceipt receipt = outgoingReceipts.get(command);
                 if (receipt != null && AIAssistantSessionModels.Remote.matchesOwner(receipt.owner, envelope)) {
                     JSONObject result = payload.optJSONObject("result");
@@ -2183,6 +2301,7 @@ public final class AIAssistantController {
     }
     void select(String id, Consumer<Boolean> completion) {
         worker.post(() -> {
+            toolDetails.clearPending();
             boolean success = false;
             try {
                 selectedRemote = null;
@@ -2212,7 +2331,8 @@ public final class AIAssistantController {
     }
     void selectRemote(JSONObject remote, Consumer<Boolean> completion) {
         worker.post(() -> {
-            if (sessionSync == null) {
+            toolDetails.clearPending();
+            if (sessionSync == null && sessionReads == null) {
                 error = "设备同步暂时不可用";
                 publishState();
                 main.post(() -> completion.accept(false));
@@ -2229,7 +2349,7 @@ public final class AIAssistantController {
                 publishState();
             }, 20000);
             try {
-                sessionSync.readRemoteHistory(remote, "", AIAssistantMessagePages.LATEST_LIMIT, (page, failure) -> {
+                java.util.function.BiConsumer<JSONObject, String> readCompleted = (page, failure) -> {
                     worker.post(() -> {
                         boolean selectedByBroadcast = generation + 1 == remoteSelectionGeneration
                             && pendingRemoteSelection == null && sameRemote(selectedRemote, remote);
@@ -2253,7 +2373,10 @@ public final class AIAssistantController {
                         }
                         main.post(() -> completion.accept(failure.isEmpty()));
                     });
-                });
+                };
+                if (sessionReads != null) sessionReads.history(AIAssistantToolDetails.copy(remote), "",
+                    AIAssistantMessagePages.LATEST_LIMIT, readCompleted);
+                else sessionSync.readRemoteHistory(remote, "", AIAssistantMessagePages.LATEST_LIMIT, readCompleted);
             } catch (Exception failure) {
                 pendingRemoteSelection = null;
                 error = safeMessage(failure);
@@ -2275,7 +2398,7 @@ public final class AIAssistantController {
                                     Consumer<Boolean> completion) {
         AIAssistantSessionModels.Remote.Ticket ticket = null;
         try {
-            if (!ownsModelConfiguration() || sessionSync == null || !hasRemoteModelOwner(owner)
+            if (!ownsModelConfiguration() || (sessionSync == null && (name != null || sessionReads == null)) || !hasRemoteModelOwner(owner)
                 || !owner.optBoolean("online")) throw new IOException("所属设备离线，原选择已保留");
             if (name == null && remoteModels.pending(owner)) return;
             if (name != null && (owner.optBoolean("busy") || remoteModels.changing(owner)))
@@ -2284,11 +2407,12 @@ public final class AIAssistantController {
                 .put("requestId", UUID.randomUUID().toString());
             ticket = remoteModels.begin(owner, name, effort);
             final AIAssistantSessionModels.Remote.Ticket captured = ticket;
-            String command = sessionSync.sendToRemote(captured.owner, "command", action,
-                (message, failure) -> worker.post(() -> {
+            java.util.function.BiConsumer<String, String> sent = (message, failure) -> worker.post(() -> {
                     if (!failure.isEmpty()) completeOutgoingReceipt(message,
                         rejectedPreparation(new IOException(failure)), false);
-                }));
+                });
+            String command = name == null ? sendReadOnlyRemote(captured.owner, action, sent)
+                : sessionSync.sendToRemote(captured.owner, "command", action, sent);
             outgoingReceipts.put(command, new OutgoingReceipt(captured.owner, result -> {
                 boolean accepted = false;
                 try {

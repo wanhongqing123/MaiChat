@@ -492,6 +492,12 @@ private actor AIRemoteSessionTransport {
         let requestID: String?
         let turnId: String?
         let steeringRequestId: String?
+        // requestId 沿用既有控制消息字段；工具详情不复用用户输入的 id。
+        let messageId: String?
+        let partId: String?
+        let field: String?
+        let offset: UInt64?
+        let detailRevision: String?
         let quoteMessageId: String?
         let decision: String?
         let title: String?
@@ -500,6 +506,38 @@ private actor AIRemoteSessionTransport {
         let type: String?
         let commandID: String?
         let result: LifecycleResult?
+        let toolDetailInputsAreTyped: Bool
+
+        // Detail failures still need a small legal binding when an untrusted peer
+        // sends an object/string instead of a byte cursor. Other command decoders
+        // retain their original strict behavior.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let detail = (try? c.decode(String.self, forKey: .action)) == "get_tool_detail"
+            func read<T: Decodable>(_ type: T.Type, _ key: CodingKeys) throws -> T? {
+                if detail { return try? c.decodeIfPresent(type, forKey: key) }
+                return try c.decodeIfPresent(type, forKey: key)
+            }
+            transferID = try read(String.self, .transferID)
+            chunkIndex = try read(Int.self, .chunkIndex); chunkCount = try read(Int.self, .chunkCount)
+            sha256 = try read(String.self, .sha256); dataBase64 = try read(String.self, .dataBase64)
+            before = try read(String.self, .before); limit = try read(Int.self, .limit)
+            action = try read(String.self, .action); model = try read(String.self, .model)
+            reasoningEffort = try read(String.self, .reasoningEffort); text = try read(String.self, .text)
+            attachments = try read([AISessionAttachmentReference].self, .attachments)
+            requestID = try read(String.self, .requestID); turnId = try read(String.self, .turnId)
+            steeringRequestId = try read(String.self, .steeringRequestId)
+            messageId = try read(String.self, .messageId); partId = try read(String.self, .partId)
+            field = try read(String.self, .field); offset = try read(UInt64.self, .offset)
+            detailRevision = try read(String.self, .detailRevision)
+            quoteMessageId = try read(String.self, .quoteMessageId); decision = try read(String.self, .decision)
+            title = try read(String.self, .title); workspacePath = try read(String.self, .workspacePath)
+            targetSessionID = try read(String.self, .targetSessionID)
+            type = try read(String.self, .type); commandID = try read(String.self, .commandID)
+            result = try read(LifecycleResult.self, .result)
+            toolDetailInputsAreTyped = (!c.contains(.offset) || offset != nil) &&
+                (!c.contains(.limit) || limit != nil) && (!c.contains(.detailRevision) || detailRevision != nil)
+        }
 
         enum CodingKeys: String, CodingKey {
             case transferID = "transfer_id"
@@ -511,6 +549,7 @@ private actor AIRemoteSessionTransport {
             case requestID = "id"
             case turnId, quoteMessageId
             case steeringRequestId = "requestId"
+            case messageId, partId, field, offset, detailRevision
             case workspacePath = "workspace_path"
             case targetSessionID = "target_session_id"
             case type
@@ -1153,12 +1192,30 @@ struct AIPart: Codable, Identifiable, Sendable, Equatable {
     var filename: String? = nil
     var remotePartID: String? = nil
     var remoteImage: AIRemoteImageMetadata? = nil
+    // 普通工具正文仍留在所属端；这些可选元数据只用于按需读取和版本失效。
+    var callID: String? = nil
+    var detailRevision: String? = nil
+    var detailsAvailable: Bool? = nil
+
+    // A short inline failure is a snapshot summary, not all three detail fields.
+    // Old peers may still supply complete inline data without capability metadata.
+    var toolDetailIdentity: String {
+        [detailRevision ?? "", callID ?? "", tool ?? "", state ?? "",
+         detailsAvailable.map { $0 ? "yes" : "no" } ?? "unknown"].joined(separator: "|")
+    }
+
+    var usesRemoteToolDetails: Bool {
+        kind == "tool" && tool != "question" &&
+            (detailsAvailable == true || (input == nil && output == nil && error?.isEmpty != false))
+    }
 
     enum CodingKeys: String, CodingKey {
         case id, kind, text, tool, input, output, error, state, path
         case mimeType, messageId, preview, name, created, filename, remoteImage
         case remotePartID = "remotePartId"
         case attachmentID = "attachment_id"
+        case callID = "callId"
+        case detailRevision, detailsAvailable
     }
 
     // 问题沿用已持久化的工具片段位置；不再创建临时选项卡和第二个回答输入框。
@@ -1178,6 +1235,132 @@ struct AIPart: Codable, Identifiable, Sendable, Equatable {
         return output
     }
 }
+
+enum AIRemoteToolDetailField: String, CaseIterable, Codable, Sendable {
+    case input, output, error
+
+    var title: String {
+        switch self {
+        case .input: "参数"
+        case .output: "输出"
+        case .error: "错误"
+        }
+    }
+}
+
+struct AIRemoteToolDetailQuery: Codable, Sendable {
+    let requestID: String
+    let messageID: String
+    let partID: String
+    let field: AIRemoteToolDetailField
+    let offset: UInt64
+    let limit: Int
+    let detailRevision: String?
+
+    enum CodingKeys: String, CodingKey {
+        case requestID = "requestId", messageID = "messageId", partID = "partId"
+        case field, offset, limit, detailRevision
+    }
+}
+
+/// 只解释一次所属端只读回执，不把详情写回会话正文或当成本地媒体路径。
+struct AIRemoteToolDetailPage: Decodable, Sendable {
+    let ok: Bool
+    let requestID: String
+    let sessionID: String
+    let messageID: String
+    let partID: String
+    let field: AIRemoteToolDetailField
+    let offset: UInt64
+    let callID: String?
+    let tool: String?
+    let state: String?
+    let detailRevision: String?
+    let sourceBytesRead: UInt64?
+    let totalBytes: UInt64?
+    let nextOffset: UInt64?
+    let hasMore: Bool?
+    let text: String?
+    let textIsValidUtf8: Bool?
+    let rawBase64: String?
+    let error: String?
+    let errorCode: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, field, offset, tool, state, detailRevision, sourceBytesRead, totalBytes
+        case nextOffset, hasMore, text, textIsValidUtf8, rawBase64, error, errorCode
+        case requestID = "requestId", sessionID = "sessionId", messageID = "messageId"
+        case partID = "partId", callID = "callId"
+    }
+
+    func isBound(to query: AIRemoteToolDetailQuery, session: String) -> Bool {
+        requestID == query.requestID && sessionID == session && messageID == query.messageID &&
+            partID == query.partID && field == query.field && offset == query.offset
+    }
+
+    func isValidPage(for query: AIRemoteToolDetailQuery, tool expectedTool: String?,
+                     callID expectedCall: String?, state expectedState: String?) -> Bool {
+        guard ok, (1...4096).contains(query.limit), let revision = detailRevision, revision.utf8.count == 64,
+              revision.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              query.detailRevision == nil || query.detailRevision == revision,
+              let tool, !tool.isEmpty, expectedTool == nil || expectedTool == tool,
+              let state, ["pending", "running", "completed", "error", "canceled"].contains(state),
+              expectedState == nil || state == expectedState,
+              expectedCall?.isEmpty != false || callID == expectedCall,
+              let read = sourceBytesRead, read <= UInt64(query.limit),
+              let total = totalBytes, let next = nextOffset, let more = hasMore,
+              let text, let valid = textIsValidUtf8 else { return false }
+        let (end, overflow) = offset.addingReportingOverflow(read)
+        guard !overflow, end <= total else { return false }
+        if more {
+            guard read > 0, next == end, next > offset, end < total else { return false }
+        } else if next != 0 || end != total { return false }
+        if read == 0 && (!text.isEmpty || more) { return false }
+        if UInt64(text.utf8.count) > read * 3 { return false }
+        if valid && UInt64(text.utf8.count) != read { return false }
+        if let rawBase64 {
+            guard let raw = Data(base64Encoded: rawBase64), UInt64(raw.count) == read else { return false }
+            if valid && raw != Data(text.utf8) { return false }
+        }
+        return true
+    }
+}
+
+struct AIRemoteToolDetailFieldState {
+    struct Chunk {
+        let offset: UInt64
+        let sourceBytes: UInt64
+        let text: String
+        let rawBase64: String?
+    }
+    // Keep at most 16 source pages per field. Older text remains on the owner
+    // and the visible restart action actually requests offset zero again.
+    var chunks: [Chunk] = []
+    var retainedFromOffset: UInt64 = 0
+    var text = ""
+    var rawBase64Pages: [String] = []
+    var loaded = false
+    var loading = false
+    var hasMore = false
+    var nextOffset: UInt64 = 0
+    var totalBytes: UInt64 = 0
+    var sourceBytesRead: UInt64 = 0
+    var containsInvalidUtf8 = false
+    var error: String?
+}
+
+struct AIRemoteToolDetailsState {
+    let epoch: UUID
+    let createdOrder: UInt64
+    let metadataRevision: String?
+    let metadataIdentity: String
+    var revision: String?
+    var state: String?
+    var fields: [AIRemoteToolDetailField: AIRemoteToolDetailFieldState] = [:]
+}
+
+private struct AIRemoteToolDetailChanged: Error {}
+
 struct AIMessage: Codable, Identifiable, Sendable, Equatable {
     let id: String
     let role: String
@@ -1516,10 +1699,20 @@ actor AIAssistantBackend {
     private func requestAgentOperation(_ operation: String, values: [String: Any] = [:], force: Bool = false) throws
         -> AIResponse
     {
+        let data = try requestAgentData(operation, values: values, force: force)
+        let decoded = try JSONDecoder().decode(AIResponse.self, from: data)
+        guard decoded.ok else { throw AIBackendError(message: decoded.error ?? "操作失败", code: decoded.errorCode) }
+        return decoded
+    }
+
+    // 普通 JSON ABI 的只读详情保留失败回执的完整绑定；其它操作仍走原 AIResponse 检查。
+    private func requestAgentData(_ operation: String, values: [String: Any] = [:], force: Bool = false) throws -> Data {
         try checkLifecycle()
         var request: [String: Any] = values
         request["op"] = operation
-        request["force"] = force
+        // tool_detail has a strict read-only allowlist; snapshot's force flag
+        // is not part of that operation and must not leak through the common ABI.
+        if operation != "tool_detail" { request["force"] = force }
         let data = try JSONSerialization.data(withJSONObject: request)
         guard let text = String(data: data, encoding: .utf8),
             let response = text.withCString({ maiMobileAgentRequest(UnsafeMutableRawPointer(bitPattern: address), $0) })
@@ -1528,9 +1721,7 @@ actor AIAssistantBackend {
                 "创作中心初始化失败", definitive: !["steer", "send", "answer"].contains(operation))
         }
         defer { maiMobileAgentFree(response) }
-        let decoded = try JSONDecoder().decode(AIResponse.self, from: Data(String(cString: response).utf8))
-        guard decoded.ok else { throw AIBackendError(message: decoded.error ?? "操作失败", code: decoded.errorCode) }
-        return decoded
+        return Data(String(cString: response).utf8)
     }
 
     /// 准备当前账号的工作区、模型凭证和 C++ Agent，返回界面可使用的设置与路径。
@@ -1749,6 +1940,39 @@ actor AIAssistantBackend {
                         includeMessageUpdates: Bool = false) throws -> AIResponse {
         try requestAgentOperation("remote_snapshot", values: ["session": session,
             "before": beforeId, "limit": limit, "includeMessageUpdates": includeMessageUpdates])
+    }
+
+    #if DEBUG && targetEnvironment(simulator)
+    func prepareToolDetailUITestBackend() throws -> Data {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-tool-details-ui-test"),
+              let sourcePath = ProcessInfo.processInfo.environment["MAICHAT_TOOL_DETAIL_FIXTURE_DIR"],
+              sourcePath.hasPrefix("/private/tmp/maichat-remote-tool-details-"),
+              let testID = ProcessInfo.processInfo.environment["MAICHAT_AI_TEST_ID"], UUID(uuidString: testID) != nil
+        else { throw AIBackendError(message: "缺少自有详情测试目录") }
+        let source = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        let manifest = try Data(contentsOf: source.appendingPathComponent("fixture.json"))
+        guard let metadata = try JSONSerialization.jsonObject(with: manifest) as? [String: Any],
+              metadata["marker"] as? String == "owned-tool-detail-fixture-v1" else { throw CancellationError() }
+        let database = try Data(contentsOf: source.appendingPathComponent("sessions.sqlite"))
+        let digest = SHA256.hash(data: database).map { String(format: "%02x", $0) }.joined()
+        guard digest == metadata["databaseSHA256"] as? String else { throw CancellationError() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AIAssistantUITest-" + testID)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try database.write(to: directory.appendingPathComponent("sessions.sqlite"), options: .atomic)
+        root = directory
+        _ = try requestAgentOperation("configure", values: ["model": "test", "apiKey": "unused-owned-fixture",
+            "baseUrl": "http://127.0.0.1:9", "database": directory.appendingPathComponent("sessions.sqlite").path,
+            "workspace": directory.appendingPathComponent("Workspace").path])
+        initialized = true
+        return manifest
+    }
+    #endif
+
+    func toolDetail(session: String, query: AIRemoteToolDetailQuery) throws -> Data {
+        var values = try JSONSerialization.jsonObject(with: JSONEncoder().encode(query)) as? [String: Any] ?? [:]
+        // session 来自已鉴权的 envelope，不接受详情参数改写所属会话。
+        values["session"] = session
+        return try requestAgentData("tool_detail", values: values)
     }
 
     private func prepareTargetSessionModel(_ session: String) async throws {
@@ -2086,6 +2310,21 @@ final class AIAssistantModel: ObservableObject {
         let account: String
     }
     private var pendingModelOwners: [String: PendingModelChoice] = [:]
+    @Published private(set) var remoteToolDetails: [String: AIRemoteToolDetailsState] = [:]
+    private struct PendingToolDetail {
+        let owner: AIRemoteImageOwner
+        let generation: Int
+        let cacheKey: String
+        let epoch: UUID
+        let query: AIRemoteToolDetailQuery
+        let tool: String?
+        let callID: String?
+        let state: String?
+        let continuation: CheckedContinuation<AIRemoteToolDetailPage, Error>
+        var timeout: Task<Void, Never>?
+    }
+    private var pendingToolDetails: [String: PendingToolDetail] = [:]
+    private var nextToolDetailCacheOrder: UInt64 = 0
     private var remoteFilesByCommandID: [String: (key: String, files: [AIImportedFile])] = [:]
     private var remoteDeliveryPendingIDs: Set<String> = []
     private struct PendingLifecycle {
@@ -2338,6 +2577,74 @@ final class AIAssistantModel: ObservableObject {
         await applyRemotePayload(content, envelope: envelope)
     }
 
+    func deliverToolDetailUITestReceipt(owner: AIRemoteSession, id: String, result: [String: Any],
+                                       outerRequestID: String? = nil) async {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-tool-details-ui-test") else { return }
+        var payload: [String: Any] = ["type": "command_result", "command_id": id, "result": result]
+        if let outerRequestID { payload["request_id"] = outerRequestID }
+        let value: [String: Any] = ["id": 1, "kind": "event", "session_id": owner.sessionID,
+            "client_message_id": id, "from_slot": owner.deviceSlot,
+            "from_login_session_id": owner.loginSessionID, "payload": payload]
+        guard let data = try? JSONSerialization.data(withJSONObject: value),
+              let envelope = try? JSONDecoder().decode(AIRemoteSessionTransport.Envelope.self, from: data),
+              let content = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        await applyRemotePayload(content, envelope: envelope)
+    }
+
+    func readToolDetailUITestOwner(session: String, payload: [String: Any]) async throws -> [String: Any] {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-tool-details-ui-test") else { throw CancellationError() }
+        var value = payload; value["action"] = "get_tool_detail"
+        let decoded = try JSONDecoder().decode(AIRemoteSessionTransport.Payload.self,
+            from: JSONSerialization.data(withJSONObject: value))
+        return await toolDetailReadResult(decoded, session: session)
+    }
+
+    func checkToolDetailUITestCapacity(_ peer: AIRemoteSession) async throws -> Bool {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-tool-details-ui-test") else { return false }
+        resetToolDetailUITestCache()
+        let parts: [[String: Any]] = (0..<65).map { ["id": "prt_capacity_" + String($0), "kind": "tool",
+            "tool": "owned_recorded_tool", "state": "running", "detailsAvailable": true,
+            "detailRevision": String(repeating: "0", count: 64)] }
+        let data = try JSONSerialization.data(withJSONObject: ["ok": true, "messages": [["id": "msg_capacity",
+            "role": "assistant", "created": 1, "completed": 0, "active": true, "parts": parts]]])
+        applyUITestMutation(.remoteImagePage(data, peer))
+        guard let owner = remoteImageOwner, let message = messages.first else { return false }
+        let before = uiTestSupport.toolDetailCommandCount
+        var tasks: [Task<Void, Never>] = []
+        for (index, part) in message.parts.enumerated() {
+            tasks.append(Task { await self.loadRemoteToolDetails(owner: owner, messageID: message.id, part: part) })
+            for _ in 0..<50 {
+                if uiTestSupport.toolDetailCommandCount > before + index { break }
+                try await Task.sleep(for: .milliseconds(2))
+            }
+        }
+        let count = remoteToolDetails.count
+        let dispatched = uiTestSupport.toolDetailCommandCount - before
+        uiTestSupport.toolDetailCapacityObservation = "cache=\(count),requests=\(dispatched)"
+        for task in tasks { task.cancel() }
+        cancelAllToolDetailRequests()
+        for task in tasks { await task.value }
+        resetToolDetailUITestCache()
+        return count <= 64 && dispatched == 65
+    }
+
+    func toolDetailUITestDiagnostic(owner: AIRemoteImageOwner, messageID: String, part: AIPart) -> String {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-tool-details-ui-test") else { return "" }
+        let fields = remoteToolDetails[toolDetailKey(owner, messageID: messageID, partID: part.id)]?.fields
+        let errors = fields?.map { $0.key.rawValue + ":" + ($0.value.error ?? ($0.value.loading ? "loading" : "idle")) }.sorted().joined(separator: ",") ?? "no-cache"
+        return "scope=\(isCurrentToolDetailOwner(owner)),part=\(isCurrentToolDetailPart(messageID: messageID, part: part)),requests=\(uiTestSupport.toolDetailCommandCount),fields=\(errors)"
+    }
+
+    func resetToolDetailUITestCache() {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-tool-details-ui-test") else { return }
+        cancelAllToolDetailRequests(); remoteToolDetails.removeAll()
+    }
+
+    func prepareToolDetailUITestBackend() async throws -> Data {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-tool-details-ui-test") else { throw CancellationError() }
+        return try await backend.prepareToolDetailUITestBackend()
+    }
+
     func prepareManualCameraImportForUITesting(_ workspace: URL) async throws {
         try await backend.prepareManualCameraImportForUITesting(workspace)
     }
@@ -2471,6 +2778,8 @@ final class AIAssistantModel: ObservableObject {
     }
 
     private func stopRemoteSync() {
+        cancelAllToolDetailRequests()
+        remoteToolDetails.removeAll()
         latestModelCommandByRemote.removeAll()
         pendingModelOwners.removeAll()
         remoteImageFiles.removeAll()
@@ -2743,6 +3052,7 @@ final class AIAssistantModel: ObservableObject {
         }
         // A previous transport's delayed receipt cannot commit settings after reconnect.
         // Writes are never replayed automatically; get_session resolves the owner's actual state.
+        cancelAllToolDetailRequests()
         for (id, _) in pendingModelOwners {
             pendingRemoteCommands.removeValue(forKey: id)
             if let fingerprint = remoteFingerprintByCommandID.removeValue(forKey: id) {
@@ -3012,6 +3322,19 @@ final class AIAssistantModel: ObservableObject {
 
     private func applyRemotePayload(_ data: Data,
                                     envelope: AIRemoteSessionTransport.Envelope) async {
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           object["type"] as? String == "command_result",
+           let id = object["command_id"] as? String,
+           let result = object["result"] as? [String: Any],
+           pendingToolDetails[id] != nil || (result["requestId"] != nil && result["field"] != nil) {
+            // Unknown/late detail receipts are read-only side data, never a
+            // history page or a business-command error for the current room.
+            if object["request_id"] == nil || object["request_id"] as? String == id,
+               let bytes = try? JSONSerialization.data(withJSONObject: result) {
+                applyToolDetailReceipt(bytes, commandID: id, envelope: envelope)
+            }
+            return
+        }
         // A receipt belongs to the captured room even when the user has switched
         // conversations. Only the caller decides whether its draft may be cleared.
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -3165,6 +3488,11 @@ final class AIAssistantModel: ObservableObject {
 
     private func applyRemotePage(_ page: AIResponse, source: AIRemoteSession,
                                  older: Bool) {
+        if pendingRemoteSelection?.id == source.id, let current = selectedRemote,
+           current.sessionID != source.sessionID || current.deviceSlot != source.deviceSlot ||
+            current.loginSessionID != source.loginSessionID {
+            cancelAllToolDetailRequests()
+        }
         var source = source
         // 旧页请求捕获的 discovery 对象可能早于一次模型 ACK；分页不能回退配置。
         if let current = remoteSessions.first(where: { $0.id == source.id && $0.loginSessionID == source.loginSessionID }) {
@@ -3226,7 +3554,276 @@ final class AIAssistantModel: ObservableObject {
             }
         }
         reconcileQuestionAnswerEchoes()
+        reconcileRemoteToolDetailRevisions()
         Task { @MainActor [weak self] in await self?.outgoingPump?.publish() }
+    }
+
+    private func toolDetailKey(_ owner: AIRemoteImageOwner, messageID: String, partID: String) -> String {
+        [owner.accountID, String(submissionGeneration), owner.slot, owner.loginSessionID,
+         owner.sessionID, messageID, partID].joined(separator: "|")
+    }
+
+    private func isCurrentToolDetailOwner(_ owner: AIRemoteImageOwner) -> Bool {
+        owner.accountID == screenFrameCurrentAccountID && owner.selectionGeneration == selectionGeneration &&
+            selectedRemote?.deviceSlot == owner.slot && selectedRemote?.loginSessionID == owner.loginSessionID &&
+            selectedRemote?.sessionID == owner.sessionID
+    }
+
+    private func toolDetailPart(messageID: String, partID: String) -> AIPart? {
+        for message in updatedRootMessages + messages where message.id == messageID {
+            if let part = (message.sourceParts ?? message.parts).first(where: { $0.id == partID }) { return part }
+        }
+        return nil
+    }
+
+    private func isCurrentToolDetailPart(messageID: String, part: AIPart) -> Bool {
+        guard let current = toolDetailPart(messageID: messageID, partID: part.id) else { return false }
+        return current.tool == part.tool && current.state == part.state &&
+            current.detailRevision == part.detailRevision && current.callID == part.callID &&
+            current.detailsAvailable == part.detailsAvailable
+    }
+
+    func remoteToolDetailState(owner: AIRemoteImageOwner, messageID: String, partID: String) -> AIRemoteToolDetailsState? {
+        guard isCurrentToolDetailOwner(owner) else { return nil }
+        return remoteToolDetails[toolDetailKey(owner, messageID: messageID, partID: partID)]
+    }
+
+    func remoteToolDetailStates(for message: AIMessage) -> [String: String] {
+        guard let owner = remoteImageOwner else { return [:] }
+        return Dictionary((message.sourceParts ?? message.parts).compactMap { part -> (String, String)? in
+            guard part.kind == "tool",
+                  let cached = remoteToolDetailState(owner: owner, messageID: message.id, partID: part.id),
+                  cached.metadataIdentity == part.toolDetailIdentity, let state = cached.state else { return nil }
+            return (part.id, state)
+        }, uniquingKeysWith: { _, newest in newest })
+    }
+
+    private func finishToolDetail(_ id: String, result: Result<AIRemoteToolDetailPage, Error>) {
+        guard let pending = pendingToolDetails.removeValue(forKey: id) else { return }
+        pending.timeout?.cancel()
+        pending.continuation.resume(with: result)
+    }
+
+    private func cancelAllToolDetailRequests() {
+        for id in Array(pendingToolDetails.keys) { finishToolDetail(id, result: .failure(CancellationError())) }
+    }
+
+    func cancelRemoteToolDetails(owner: AIRemoteImageOwner, messageID: String, partID: String) {
+        let key = toolDetailKey(owner, messageID: messageID, partID: partID)
+        let ids = pendingToolDetails.filter { $0.value.cacheKey == key }.map(\.key)
+        for id in ids {
+            finishToolDetail(id, result: .failure(CancellationError()))
+        }
+    }
+
+    private func prepareToolDetails(owner: AIRemoteImageOwner, messageID: String, part: AIPart,
+                                    refresh: Bool = false) -> String {
+        let key = toolDetailKey(owner, messageID: messageID, partID: part.id)
+        let identity = part.toolDetailIdentity
+        if !refresh, let state = remoteToolDetails[key], state.metadataIdentity == identity { return key }
+        cancelRemoteToolDetails(owner: owner, messageID: messageID, partID: part.id)
+        // Reading many tools must not accumulate every historical output in RAM.
+        if remoteToolDetails[key] == nil, remoteToolDetails.count >= 64,
+           let evicted = remoteToolDetails.min(by: { $0.value.createdOrder < $1.value.createdOrder })?.key {
+            let ids = pendingToolDetails.filter { $0.value.cacheKey == evicted }.map(\.key)
+            for id in ids { finishToolDetail(id, result: .failure(CancellationError())) }
+            remoteToolDetails.removeValue(forKey: evicted)
+        }
+        nextToolDetailCacheOrder &+= 1
+        remoteToolDetails[key] = AIRemoteToolDetailsState(epoch: UUID(), createdOrder: nextToolDetailCacheOrder,
+            metadataRevision: part.detailRevision,
+            metadataIdentity: identity, revision: refresh ? nil : part.detailRevision, state: refresh ? nil : part.state)
+        return key
+    }
+
+    private func reconcileRemoteToolDetailRevisions() {
+        guard let owner = remoteImageOwner else { return }
+        // The getter uses the same original part identity as the expanded row.
+        // A new revision invalidates all three fields, including in-flight pages.
+        for message in messages {
+            for part in message.sourceParts ?? message.parts where part.kind == "tool" {
+                let key = toolDetailKey(owner, messageID: message.id, partID: part.id)
+                let identity = part.toolDetailIdentity
+                if let state = remoteToolDetails[key], state.metadataIdentity != identity {
+                    _ = prepareToolDetails(owner: owner, messageID: message.id, part: part)
+                }
+            }
+        }
+    }
+
+    private func sendToolDetailCommand(to remote: AIRemoteSession, id: String,
+                                       query: AIRemoteToolDetailQuery) async throws {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("--ai-remote-tool-details-ui-test"),
+           let handler = uiTestSupport.toolDetailCommandHandler {
+            try await handler(remote, id, query)
+            return
+        }
+        #endif
+        var payload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(query)) as? [String: Any] ?? [:]
+        payload["action"] = "get_tool_detail"
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        // Read requests have independent IDs and never enter the business outbox.
+        try await remoteTransport.sendCommand(to: remote, encodedPayload: data, messageID: id)
+    }
+
+    private func fetchToolDetail(owner: AIRemoteImageOwner, messageID: String, part: AIPart,
+                                 field: AIRemoteToolDetailField, offset: UInt64,
+                                 key: String, epoch: UUID, revision: String?, state: String?) async throws -> AIRemoteToolDetailPage {
+        guard isCurrentToolDetailOwner(owner), let remote = selectedRemote else { throw CancellationError() }
+        guard remoteIsOnline(remote) else { throw AIBackendError(message: "所属设备当前离线，可在上线后重试") }
+        let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let query = AIRemoteToolDetailQuery(requestID: UUID().uuidString, messageID: messageID, partID: part.id,
+            field: field, offset: offset, limit: 4096, detailRevision: revision)
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                pendingToolDetails[id] = PendingToolDetail(owner: owner, generation: submissionGeneration,
+                    cacheKey: key, epoch: epoch, query: query, tool: part.tool, callID: part.callID, state: state,
+                    continuation: continuation)
+                pendingToolDetails[id]?.timeout = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .seconds(20))
+                    guard !Task.isCancelled else { return }
+                    self?.finishToolDetail(id, result: .failure(AIBackendError(message: "读取详情超时，请重试")))
+                }
+                Task { @MainActor [weak self] in
+                    guard let self, self.pendingToolDetails[id] != nil,
+                          self.isCurrentToolDetailOwner(owner) else { return }
+                    do { try await self.sendToolDetailCommand(to: remote, id: id, query: query) }
+                    catch { self.finishToolDetail(id, result: .failure(error)) }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.finishToolDetail(id, result: .failure(CancellationError())) }
+        }
+    }
+
+    private func readToolDetailField(owner: AIRemoteImageOwner, messageID: String, part: AIPart,
+                                     field: AIRemoteToolDetailField, append: Bool) async throws {
+        guard isCurrentToolDetailOwner(owner), isCurrentToolDetailPart(messageID: messageID, part: part)
+        else { throw CancellationError() }
+        let key = prepareToolDetails(owner: owner, messageID: messageID, part: part)
+        guard var item = remoteToolDetails[key] else { return }
+        var state = item.fields[field] ?? AIRemoteToolDetailFieldState()
+        guard !state.loading, append ? state.hasMore : !state.loaded else { return }
+        let offset = append ? state.nextOffset : 0
+        let epoch = item.epoch
+        state.loading = true; state.error = nil
+        item.fields[field] = state; remoteToolDetails[key] = item
+        do {
+            let page = try await fetchToolDetail(owner: owner, messageID: messageID, part: part,
+                field: field, offset: offset, key: key, epoch: epoch, revision: item.revision, state: item.state)
+            try Task.checkCancellation()
+            guard isCurrentToolDetailOwner(owner), var current = remoteToolDetails[key], current.epoch == epoch,
+                  current.revision == nil || current.revision == page.detailRevision,
+                  var value = current.fields[field] else { throw CancellationError() }
+            if append, (value.nextOffset != offset || value.totalBytes != page.totalBytes) {
+                throw AIRemoteToolDetailChanged()
+            }
+            current.revision = page.detailRevision
+            current.state = page.state
+            if !append { value.chunks.removeAll() }
+            value.chunks.append(.init(offset: offset, sourceBytes: page.sourceBytesRead ?? 0,
+                                      text: page.text ?? "", rawBase64: page.rawBase64))
+            if value.chunks.count > 16 { value.chunks.removeFirst(value.chunks.count - 16) }
+            value.retainedFromOffset = value.chunks.first?.offset ?? 0
+            value.text = value.chunks.map(\.text).joined()
+            value.rawBase64Pages = value.chunks.compactMap(\.rawBase64)
+            value.loaded = true; value.loading = false; value.error = nil
+            value.containsInvalidUtf8 = value.containsInvalidUtf8 || page.textIsValidUtf8 == false
+            value.totalBytes = page.totalBytes ?? 0; value.nextOffset = page.nextOffset ?? 0
+            value.hasMore = page.hasMore ?? false; value.sourceBytesRead = offset + (page.sourceBytesRead ?? 0)
+            current.fields[field] = value; remoteToolDetails[key] = current
+        } catch {
+            if var current = remoteToolDetails[key], current.epoch == epoch, var value = current.fields[field] {
+                value.loading = false
+                if !(error is CancellationError) && !(error is AIRemoteToolDetailChanged) {
+                    value.error = error.localizedDescription
+                }
+                current.fields[field] = value; remoteToolDetails[key] = current
+            }
+            throw error
+        }
+    }
+
+    func loadRemoteToolDetails(owner: AIRemoteImageOwner, messageID: String, part: AIPart,
+                               refresh: Bool = false) async {
+        guard isCurrentToolDetailOwner(owner), isCurrentToolDetailPart(messageID: messageID, part: part) else { return }
+        let key = prepareToolDetails(owner: owner, messageID: messageID, part: part)
+        if refresh, let remote = selectedRemote, !remoteIsOnline(remote),
+           var cached = remoteToolDetails[key], cached.fields.values.contains(where: \.loaded) {
+            // An offline refresh cannot replace readable warm pages with an
+            // empty error card. It leaves the retained text selectable.
+            for field in Array(cached.fields.keys) {
+                cached.fields[field]?.error = "所属设备当前离线，正在显示已读取内容"
+            }
+            remoteToolDetails[key] = cached
+            return
+        }
+        if refresh { _ = prepareToolDetails(owner: owner, messageID: messageID, part: part, refresh: true) }
+        if part.detailsAvailable == false {
+            _ = prepareToolDetails(owner: owner, messageID: messageID, part: part)
+            setToolDetailError(owner, messageID: messageID, part: part, text: "所属设备暂未提供该工具的详情")
+            return
+        }
+        // A changing tool may invalidate one read. Retry the first page once,
+        // rather than automatically downloading a continuously growing output.
+        for attempt in 0..<2 {
+            do {
+                for field in AIRemoteToolDetailField.allCases {
+                    try Task.checkCancellation()
+                    try await readToolDetailField(owner: owner, messageID: messageID, part: part, field: field, append: false)
+                }
+                return
+            } catch is AIRemoteToolDetailChanged {
+                guard isCurrentToolDetailOwner(owner), isCurrentToolDetailPart(messageID: messageID, part: part) else { return }
+                _ = prepareToolDetails(owner: owner, messageID: messageID, part: part, refresh: true)
+                if attempt == 1 { setToolDetailError(owner, messageID: messageID, part: part, text: "详情仍在变化，请重新加载") }
+            } catch is CancellationError { return }
+            catch {
+                setToolDetailError(owner, messageID: messageID, part: part, text: error.localizedDescription)
+                return
+            }
+        }
+    }
+
+    func loadMoreRemoteToolDetail(owner: AIRemoteImageOwner, messageID: String, part: AIPart,
+                                  field: AIRemoteToolDetailField) async {
+        do { try await readToolDetailField(owner: owner, messageID: messageID, part: part, field: field, append: true) }
+        catch is AIRemoteToolDetailChanged { await loadRemoteToolDetails(owner: owner, messageID: messageID, part: part, refresh: true) }
+        catch { /* 原请求的字段状态保留错误；不改别的会话或输入草稿。 */ }
+    }
+
+    private func setToolDetailError(_ owner: AIRemoteImageOwner, messageID: String, part: AIPart, text: String) {
+        guard isCurrentToolDetailOwner(owner) else { return }
+        let key = toolDetailKey(owner, messageID: messageID, partID: part.id)
+        guard var item = remoteToolDetails[key] else { return }
+        for field in AIRemoteToolDetailField.allCases where item.fields[field]?.loaded != true {
+            var value = item.fields[field] ?? AIRemoteToolDetailFieldState()
+            value.loading = false; value.error = text; item.fields[field] = value
+        }
+        remoteToolDetails[key] = item
+    }
+
+    private func applyToolDetailReceipt(_ result: Data, commandID: String,
+                                        envelope: AIRemoteSessionTransport.Envelope) {
+        guard result.count < 64 * 1024, let pending = pendingToolDetails[commandID], pending.generation == submissionGeneration,
+              isCurrentToolDetailOwner(pending.owner),
+              envelope.sessionID == pending.owner.sessionID, envelope.fromSlot == pending.owner.slot,
+              envelope.fromLoginSessionID == pending.owner.loginSessionID,
+              remoteToolDetails[pending.cacheKey]?.epoch == pending.epoch,
+              let page = try? JSONDecoder().decode(AIRemoteToolDetailPage.self, from: result),
+              page.isBound(to: pending.query, session: pending.owner.sessionID) else { return }
+        if page.ok {
+            guard page.isValidPage(for: pending.query, tool: pending.tool, callID: pending.callID,
+                                   state: pending.state) else { return }
+            finishToolDetail(commandID, result: .success(page))
+        } else if page.errorCode == "busy" {
+            finishToolDetail(commandID, result: .failure(AIRemoteToolDetailChanged()))
+        } else {
+            finishToolDetail(commandID, result: .failure(AIBackendError(
+                message: page.error ?? "无法读取所属设备工具详情，请重试", code: page.errorCode)))
+        }
     }
 
     private func remoteDisplayMessage(_ message: AIMessage) -> AIMessage {
@@ -3263,6 +3860,7 @@ final class AIAssistantModel: ObservableObject {
                 // 问题和回答是会话正文；其他工具仍不跨设备发布原始参数和输出。
                 if part.tool != "question" { part.input = nil; part.output = nil }
                 part.error = nil
+                if let callID = part.callID, callID.utf8.count > 128 { part.callID = nil }
             case "image", "video":
                 part.path = nil
             default:
@@ -3387,6 +3985,10 @@ final class AIAssistantModel: ObservableObject {
         defer { Task { try? await remoteTransport.acknowledge(envelope.id) } }
         if envelope.sessionID == Self.lifecycleSessionID {
             await applyRemoteLifecycleCommand(envelope)
+            return
+        }
+        if envelope.payload.action == "get_tool_detail" {
+            await performToolDetailRead(envelope)
             return
         }
         guard sessions.contains(where: { $0.id == envelope.sessionID }) else { return }
@@ -3644,6 +4246,55 @@ final class AIAssistantModel: ObservableObject {
             to: envelope, kind: "event",
             value: ["type": "command_result", "command_id": envelope.clientMessageID,
                     "result": result])
+    }
+
+    private func toolDetailReadResult(_ payload: AIRemoteSessionTransport.Payload,
+                                       session: String) async -> [String: Any] {
+        func identifier(_ value: String?) -> String {
+            guard let value, !value.isEmpty, value.utf8.count <= 128,
+                  value.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) ||
+                      (97...122).contains($0) || $0 == 45 || $0 == 95 }) else { return "" }
+            return value
+        }
+        let requestID = identifier(payload.steeringRequestId)
+        let messageID = identifier(payload.messageId), partID = identifier(payload.partId)
+        let sessionID = identifier(session)
+        let field = AIRemoteToolDetailField(rawValue: payload.field ?? "")
+        let offset = payload.offset ?? 0
+        // Invalid values, including malformed cursors, never get echoed into an
+        // oversized failure. Session identity comes from the authenticated route.
+        var result: [String: Any] = ["ok": false, "requestId": requestID,
+            "sessionId": sessionID, "messageId": messageID, "partId": partID,
+            "field": field?.rawValue ?? "", "offset": offset,
+            "errorCode": "invalid_input", "error": "工具详情请求无效"]
+        if payload.toolDetailInputsAreTyped, !sessionID.isEmpty, !requestID.isEmpty,
+           !messageID.isEmpty, !partID.isEmpty, let field,
+           (1...4096).contains(payload.limit ?? 4096),
+           payload.detailRevision == nil || payload.detailRevision?.utf8.count == 64 {
+            let query = AIRemoteToolDetailQuery(requestID: requestID, messageID: messageID, partID: partID,
+                field: field, offset: offset, limit: payload.limit ?? 4096, detailRevision: payload.detailRevision)
+            do {
+                let bytes = try await backend.toolDetail(session: sessionID, query: query)
+                let page = try JSONDecoder().decode(AIRemoteToolDetailPage.self, from: bytes)
+                guard bytes.count < 64 * 1024, page.isBound(to: query, session: sessionID),
+                      let value = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else {
+                    throw AIBackendError(message: "工具详情回执归属无效", code: "internal")
+                }
+                result = value
+            } catch {
+                result["errorCode"] = (error as? AIBackendError)?.code ?? "internal"
+                result["error"] = "所属设备暂时无法读取该工具详情"
+            }
+        }
+        return result
+    }
+
+    private func performToolDetailRead(_ envelope: AIRemoteSessionTransport.Envelope) async {
+        let generation = submissionGeneration, account = screenFrameCurrentAccountID
+        let result = await toolDetailReadResult(envelope.payload, session: envelope.sessionID)
+        guard generation == submissionGeneration, account == screenFrameCurrentAccountID else { return }
+        try? await remoteTransport.sendPayload(to: envelope, kind: "event",
+            value: ["type": "command_result", "command_id": envelope.clientMessageID, "result": result])
     }
 
     private func applyRemoteLifecycleCommand(

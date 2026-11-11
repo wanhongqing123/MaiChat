@@ -20,6 +20,17 @@ extern "C" {
 // message 操作为 {op:"message",session,id}，只读精确查询该会话的一条记录；
 // 成功 {ok:true,messages:[记录]}，找不到/归属不符 {ok:false,errorCode:"not_found"}。
 // 不用 ID 前缀或游标模拟精读，不消费 snapshot 的增量状态，也不触发模型请求。
+// tool_detail 操作为 {op:"tool_detail",session,requestId,messageId,partId,
+// field:"input"|"output"|"error",offset?:0,limit?:4096,detailRevision?:string}。
+// 只读取一次已落库工具快照，不重跑命令；limit为1..4096源字节，offset>0须带前页版本。
+// 成功返回上述绑定（session改名sessionId）及callId/tool/state/detailRevision/text、
+// sourceBytesRead/totalBytes/nextOffset/hasMore/textIsValidUtf8；nextOffset=0表示读完。
+// 原文UTF-8标量不拆；坏编码页text为replacement预览并附rawBase64，游标仍按源字节。
+// 工具任一字段变化返回errorCode:"busy"，须从首屏重读。非法字段/偏移为invalid_input，
+// 归属不符为not_found；失败仍保requestId/sessionId/messageId/partId/field/offset绑定。
+// 非法绑定不原样回显：ID须是1..128源字节字符串，否则为空；field非法为空；offset非法为0。
+// 普通消息tool片段增加detailRevision/detailsAvailable及可选callId（源字节<=128才发布），
+// 不截断异常callId，版本仍覆盖其完整原值；原input/output/error不变。
 // local_model_probe 仅测已配置本地客户端：messages 为最多10条 {role,content}，
 // role 仅 user/assistant，timeout_ms 为1..120000。复用同一完整工具声明，绝不执行工具、
 // 读写会话或调用宿主凭据；工具输出请求本身算失败。用于隔离设备验收，不代表Agent工具闭环。

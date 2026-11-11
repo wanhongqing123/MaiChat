@@ -21,6 +21,7 @@
 
 #include "MaiQuestionTranscript.h"
 #include "MaiCloudModelCatalog.h"
+#include "MaiToolDetail.h"
 #include "agent/AgentController.h"
 #include "agent/DesktopSessionAttachments.h"
 
@@ -77,6 +78,17 @@ QJsonObject serializePart(const MaiMessagePart& part) {
         value.insert(QStringLiteral("kind"), QStringLiteral("tool"));
         value.insert(QStringLiteral("tool"), text(body->tool));
         value.insert(QStringLiteral("state"), QString::fromLatin1(maiToolStateToString(body->state)));
+        if (body->tool != "question") {
+            // Only a revision is broadcast. Large or sensitive stored fields
+            // are read explicitly for this owner/message/part when expanded.
+            const auto revision = maiToolDetailRevision(*body);
+            // It is optional metadata, not the stable part identity. Omit an
+            // abnormal model-provided ID rather than truncate it or block the
+            // whole room message; the revision still covers its full bytes.
+            if (body->callId.size() <= 128) value.insert(QStringLiteral("callId"), text(body->callId));
+            value.insert(QStringLiteral("detailRevision"), text(revision));
+            value.insert(QStringLiteral("detailsAvailable"), !revision.empty());
+        }
         if (body->tool == "question") {
             // 只发送模型明确问用户的话与用户的答案；其它工具仍不外传参数和输出。
             value.insert(QStringLiteral("input"), text(body->input));
@@ -330,6 +342,85 @@ QJsonObject DesktopSessionSyncHost::messageUpdate(const QString& sessionId, cons
 
 QJsonObject DesktopSessionSyncHost::applyCommand(const QString& sessionId, const QJsonObject& payload) {
     const QString action = payload.value(QStringLiteral("action")).toString();
+    if (action == QStringLiteral("get_tool_detail")) {
+        // This branch is a persisted, read-only lookup. In particular it must
+        // never enter prompt/tool execution or the input preparation lane.
+        const auto requestId = payload.value(QStringLiteral("requestId")).toString();
+        const auto messageId = payload.value(QStringLiteral("messageId")).toString();
+        const auto partId = payload.value(QStringLiteral("partId")).toString();
+        const auto field = payload.value(QStringLiteral("field")).toString();
+        const auto requestedOffset = payload.value(QStringLiteral("offset"));
+        const bool boundedOffset = requestedOffset.isDouble() && std::isfinite(requestedOffset.toDouble()) &&
+                                   requestedOffset.toDouble() >= 0 && requestedOffset.toDouble() <= 9007199254740991.0 &&
+                                   std::floor(requestedOffset.toDouble()) == requestedOffset.toDouble();
+        const QJsonObject binding{{QStringLiteral("requestId"), requestId.left(96)},
+                                  {QStringLiteral("sessionId"), sessionId},
+                                  {QStringLiteral("messageId"), messageId.left(128)},
+                                  {QStringLiteral("partId"), partId.left(128)},
+                                  {QStringLiteral("field"), field.left(16)},
+                                  {QStringLiteral("offset"), boundedOffset ? requestedOffset : QJsonValue(0)}};
+        const auto rejected = [&](MaiErrorCode code, const QString& message) {
+            QJsonObject result = binding;
+            result.insert(QStringLiteral("ok"), false);
+            result.insert(QStringLiteral("errorCode"), QString::fromLatin1(maiErrorCodeToString(code)));
+            result.insert(QStringLiteral("error"), message);
+            return result;
+        };
+        static const QRegularExpression id(QStringLiteral("^[A-Za-z0-9_-]{1,128}$"));
+        const QSet<QString> fields{QStringLiteral("action"), QStringLiteral("requestId"),
+                                  QStringLiteral("messageId"), QStringLiteral("partId"),
+                                  QStringLiteral("field"), QStringLiteral("offset"),
+                                  QStringLiteral("limit"), QStringLiteral("detailRevision")};
+        for (auto it = payload.begin(); it != payload.end(); ++it)
+            if (!fields.contains(it.key()))
+                return rejected(MaiErrorCode::InvalidInput, QStringLiteral("Invalid tool detail request fields."));
+        if (!payload.value(QStringLiteral("requestId")).isString() || requestId.size() > 96 ||
+            !id.match(requestId).hasMatch() || !id.match(messageId).hasMatch() || !id.match(partId).hasMatch() ||
+            (field != QStringLiteral("input") && field != QStringLiteral("output") && field != QStringLiteral("error")))
+            return rejected(MaiErrorCode::InvalidInput, QStringLiteral("Invalid tool detail identity or field."));
+        const auto offset = payload.value(QStringLiteral("offset"));
+        const auto limit = payload.value(QStringLiteral("limit"));
+        if (!offset.isDouble() || !limit.isDouble() || !std::isfinite(offset.toDouble()) ||
+            offset.toDouble() < 0 || offset.toDouble() > 9007199254740991.0 ||
+            std::floor(offset.toDouble()) != offset.toDouble() || limit.toDouble() < 1 || limit.toDouble() > 4096 ||
+            std::floor(limit.toDouble()) != limit.toDouble() ||
+            (payload.contains(QStringLiteral("detailRevision")) && !payload.value(QStringLiteral("detailRevision")).isString()))
+            return rejected(MaiErrorCode::InvalidInput, QStringLiteral("Invalid tool detail page bounds."));
+        MaiSession session;
+        if (!controller_.agent().getSession(sessionId.toStdString(), session) || !session.isRoot())
+            return rejected(MaiErrorCode::NotFound, QStringLiteral("Tool detail session was not found."));
+        MaiToolDetailQuery query;
+        query.messageId = messageId.toStdString();
+        query.partId = partId.toStdString();
+        query.field = field.toStdString();
+        query.offsetBytes = static_cast<std::size_t>(offset.toDouble());
+        query.maxBytes = static_cast<std::size_t>(limit.toDouble());
+        query.expectedRevision = payload.value(QStringLiteral("detailRevision")).toString().toStdString();
+        const auto read = controller_.agent().readToolDetail(session.id, query);
+        if (!read) return rejected(read.error().code(), text(read.error().message()));
+        const auto& page = read.value();
+        QJsonObject result = binding;
+        result.insert(QStringLiteral("ok"), true);
+        result.insert(QStringLiteral("callId"), text(page.callId));
+        result.insert(QStringLiteral("tool"), text(page.tool));
+        result.insert(QStringLiteral("state"), QString::fromLatin1(maiToolStateToString(page.state)));
+        result.insert(QStringLiteral("detailRevision"), text(page.revision));
+        result.insert(QStringLiteral("text"), text(page.text));
+        result.insert(QStringLiteral("offset"), double(page.offsetBytes));
+        result.insert(QStringLiteral("sourceBytesRead"), double(page.sourceBytesRead));
+        result.insert(QStringLiteral("totalBytes"), double(page.totalBytes));
+        result.insert(QStringLiteral("nextOffset"), double(page.nextOffsetBytes));
+        result.insert(QStringLiteral("hasMore"), page.nextOffsetBytes != 0);
+        result.insert(QStringLiteral("textIsValidUtf8"), page.textIsValidUtf8);
+        if (!page.textIsValidUtf8)
+            result.insert(QStringLiteral("rawBase64"), QString::fromLatin1(QByteArray::fromStdString(page.text).toBase64()));
+        // Escaping can expand 4096 source bytes sixfold. Unusually large old
+        // tool metadata must still fail explicitly, leaving room for the
+        // command_result envelope inside the relay's 64 KiB payload limit.
+        if (QJsonDocument(result).toJson(QJsonDocument::Compact).size() >= 48 * 1024)
+            return rejected(MaiErrorCode::InvalidInput, QStringLiteral("Tool detail metadata exceeds the relay budget."));
+        return result;
+    }
     if (sessionId == QStringLiteral("session_lifecycle")) {
         if (action == QStringLiteral("session_create")) {
             QString path = payload.value(QStringLiteral("workspace_path")).toString();

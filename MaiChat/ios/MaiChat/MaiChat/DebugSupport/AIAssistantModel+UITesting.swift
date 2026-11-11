@@ -35,6 +35,12 @@ final class AIAssistantModelUITestSupport: ObservableObject {
     var sessionModelPublishHandler: (@MainActor (String, Data) async throws -> Void)?
     var sessionModelSnapshotHandler: (@MainActor (String) throws -> Data?)?
     var sessionModelCreateObserver: (@MainActor ([String: String]) -> Void)?
+    // This replaces only peer I/O; owner reads still use the normal persisted C ABI.
+    var toolDetailCommandHandler: (@MainActor (AIRemoteSession, String, AIRemoteToolDetailQuery) async throws -> Void)?
+    @Published var toolDetailPolicyResult = "未执行"
+    @Published var toolDetailCommandCount = 0
+    @Published var toolDetailCapacityObservation = ""
+
     @Published var sessionModelPolicyResult = "未执行"
     #endif
 }
@@ -56,6 +62,171 @@ extension AIAssistantModel {
 
 #if targetEnvironment(simulator)
 extension AIAssistantModel {
+    /// Own SQLite data is prepared by the normal C++ store fixture. Only the
+    /// transport peer is looped back; every displayed field comes from tool_detail.
+    func installRemoteToolDetailUITestFixture(runChecks: Bool) async {
+        guard ProcessInfo.processInfo.arguments.contains("--ai-remote-tool-details-ui-test") else { return }
+        uiTestSupport.toolDetailPolicyResult = "运行中"
+        do {
+            let manifest = try JSONSerialization.jsonObject(with: await prepareToolDetailUITestBackend()) as? [String: Any]
+            guard let rooms = manifest?["rooms"] as? [[String: Any]], rooms.count == 2 else { throw CancellationError() }
+            uiTestSupport.screenFrameAccountID = "owned-tool-detail-account"
+            func peer(_ id: String, online: Bool = true, login: String = "owned-detail-login", slot: String = "windows") -> AIRemoteSession {
+                AIRemoteSession(sessionID: id, title: "自有工具详情", updatedAt: 1, busy: false, deviceSlot: slot,
+                    deviceName: "Owned desktop", deviceID: "owned-detail-device", loginSessionID: login, online: online)
+            }
+            let a = peer("ses_owned_detail_A"), b = peer("ses_owned_detail_B")
+            func show(_ remote: AIRemoteSession, revision: String? = nil, state: String? = nil) throws -> (AIMessage, AIPart, AIRemoteImageOwner) {
+                guard var value = rooms.first(where: { $0["session"] as? String == remote.sessionID })?["message"] as? [String: Any] else { throw CancellationError() }
+                if var parts = value["parts"] as? [[String: Any]] {
+                    if let revision { parts[0]["detailRevision"] = revision }
+                    if let state { parts[0]["state"] = state }
+                    value["parts"] = parts
+                }
+                let data = try JSONSerialization.data(withJSONObject: ["ok": true, "messages": [value], "busy": false])
+                applyUITestMutation(.remoteSessions([remote, remote.sessionID == a.sessionID ? b : a]))
+                applyUITestMutation(.remoteImagePage(data, remote))
+                guard let message = messages.first, let part = message.parts.first, let owner = remoteImageOwner else { throw CancellationError() }
+                return (message, part, owner)
+            }
+            var mode = "normal"
+            var held: (AIRemoteSession, String, [String: Any])?
+            uiTestSupport.toolDetailCommandHandler = { [weak self] remote, id, query in
+                guard let self else { throw CancellationError() }
+                self.uiTestSupport.toolDetailCommandCount += 1
+                let payload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(query)) as? [String: Any] ?? [:]
+                if mode == "capacity" { return }
+                let result = try await self.readToolDetailUITestOwner(session: remote.sessionID, payload: payload)
+                if mode == "hold" { held = (remote, id, result); return }
+                if mode == "wrong" {
+                    for wrongPeer in [peer(remote.sessionID, login: "wrong-login"), peer(remote.sessionID, slot: "mac"), b] {
+                        await self.deliverToolDetailUITestReceipt(owner: wrongPeer, id: id, result: result)
+                    }
+                    for key in ["requestId", "messageId", "partId", "field", "offset", "detailRevision", "state"] {
+                        var wrong = result
+                        if key == "offset" { wrong[key] = query.offset + 1 }
+                        else if key == "field" { wrong[key] = query.field == .input ? "output" : "input" }
+                        else if key == "detailRevision" { wrong[key] = String(repeating: "0", count: 64) }
+                        else if key == "state" { wrong[key] = "completed" }
+                        else { wrong[key] = "wrong-binding" }
+                        await self.deliverToolDetailUITestReceipt(owner: remote, id: id, result: wrong)
+                    }
+                    await self.deliverToolDetailUITestReceipt(owner: remote, id: "wrong-command", result: result)
+                    await self.deliverToolDetailUITestReceipt(owner: remote, id: id, result: result, outerRequestID: "wrong-outer")
+                }
+                // Real Android receipts have only command_id, not request_id.
+                await self.deliverToolDetailUITestReceipt(owner: remote, id: id, result: result)
+            }
+            var checks = 0, failures: [String] = []
+            func require(_ value: Bool, _ why: String) { checks += 1; if !value { failures.append(why) } }
+            var fixture = try show(a)
+            ready = true; configured = true; historyLoaded = true
+            if runChecks {
+                var legacy = fixture.1
+                legacy.detailsAvailable = nil; legacy.detailRevision = nil
+                require(!legacy.usesRemoteToolDetails, "legacy inline error must stay readable without capability")
+                let query = AIRemoteToolDetailQuery(requestID: "owned-known-call", messageID: fixture.0.id,
+                    partID: fixture.1.id, field: .input, offset: 0, limit: 4096, detailRevision: fixture.1.detailRevision)
+                let queryPayload = try JSONSerialization.jsonObject(with: JSONEncoder().encode(query)) as? [String: Any] ?? [:]
+                var valid = try await readToolDetailUITestOwner(session: a.sessionID, payload: queryPayload)
+                valid["callId"] = "known-call"
+                let validPage = try JSONDecoder().decode(AIRemoteToolDetailPage.self,
+                    from: JSONSerialization.data(withJSONObject: valid))
+                require(validPage.isValidPage(for: query, tool: fixture.1.tool, callID: "known-call", state: fixture.1.state), "known call control page invalid")
+                for replacement in [nil, ""] as [String?] {
+                    var wrong = valid
+                    if let replacement { wrong["callId"] = replacement } else { wrong.removeValue(forKey: "callId") }
+                    let page = try JSONDecoder().decode(AIRemoteToolDetailPage.self,
+                        from: JSONSerialization.data(withJSONObject: wrong))
+                    require(!page.isValidPage(for: query, tool: fixture.1.tool, callID: "known-call", state: fixture.1.state),
+                        "known metadata callId accepted missing/empty ACK")
+                }
+                mode = "capacity"
+                let bounded = try await checkToolDetailUITestCapacity(a)
+                require(bounded, "65 unacknowledged detail reads exceeded hard cache limit: " + uiTestSupport.toolDetailCapacityObservation)
+                uiTestSupport.toolDetailCommandCount = 0
+                mode = "normal"
+                fixture = try show(a)
+                let draftKey = "remote:windows:owned-detail-login:" + a.sessionID
+                drafts[draftKey] = "owned detail draft"
+                let originals = messages
+                require(fixture.1.usesRemoteToolDetails && fixture.1.input == nil && fixture.1.output == nil &&
+                    fixture.1.error == "short snapshot failure", "capability must win over inline error")
+                require(fixture.1.callID == nil, "fixture must omit optional 129B metadata callId")
+                mode = "wrong"
+                await loadRemoteToolDetails(owner: fixture.2, messageID: fixture.0.id, part: fixture.1)
+                var state = remoteToolDetailState(owner: fixture.2, messageID: fixture.0.id, partID: fixture.1.id)
+                require(state?.fields[.input]?.text.contains("never execute") == true,
+                    "valid input ACK lost after wrong bindings: " + toolDetailUITestDiagnostic(owner: fixture.2, messageID: fixture.0.id, part: fixture.1))
+                require(state?.fields[.output]?.text.contains("OWNED OUTPUT FIRST") == true, "owner C ABI output missing")
+                require(state?.fields[.error]?.text.contains("OWNED ERROR ORIGINAL") == true, "inline error replaced original error")
+                require(state?.fields[.output]?.hasMore == true && (state?.fields[.output]?.sourceBytesRead ?? 0) <= 4096,
+                    "first page budget/hasMore")
+                require(uiTestSupport.toolDetailCommandCount == 3, "expansion must read only three first pages")
+                require(messages == originals && drafts[draftKey] == "owned detail draft", "details rewrote original parts/draft")
+                mode = "normal"
+                for _ in 0..<17 { await loadMoreRemoteToolDetail(owner: fixture.2, messageID: fixture.0.id, part: fixture.1, field: .output) }
+                state = remoteToolDetailState(owner: fixture.2, messageID: fixture.0.id, partID: fixture.1.id)
+                require((state?.fields[.output]?.retainedFromOffset ?? 0) > 0 &&
+                    (state?.fields[.output]?.chunks.count ?? 99) == 16, "tail cache not bounded")
+                let beforeRestart = uiTestSupport.toolDetailCommandCount
+                await loadRemoteToolDetails(owner: fixture.2, messageID: fixture.0.id, part: fixture.1, refresh: true)
+                state = remoteToolDetailState(owner: fixture.2, messageID: fixture.0.id, partID: fixture.1.id)
+                require(uiTestSupport.toolDetailCommandCount == beforeRestart + 3 && state?.fields[.output]?.retainedFromOffset == 0 &&
+                    state?.fields[.output]?.text.contains("OWNED OUTPUT FIRST") == true, "restart did not actually reread offset zero")
+                let beforeOffline = uiTestSupport.toolDetailCommandCount
+                fixture = try show(peer(a.sessionID, online: false))
+                await loadRemoteToolDetails(owner: fixture.2, messageID: fixture.0.id, part: fixture.1)
+                require(uiTestSupport.toolDetailCommandCount == beforeOffline &&
+                    remoteToolDetailState(owner: fixture.2, messageID: fixture.0.id, partID: fixture.1.id)?.fields[.input]?.loaded == true,
+                    "offline warm cache lost")
+                await loadRemoteToolDetails(owner: fixture.2, messageID: fixture.0.id, part: fixture.1, refresh: true)
+                require(uiTestSupport.toolDetailCommandCount == beforeOffline &&
+                    remoteToolDetailState(owner: fixture.2, messageID: fixture.0.id, partID: fixture.1.id)?.fields[.input]?.error != nil,
+                    "offline cold read dispatched")
+                fixture = try show(a, revision: String(repeating: "0", count: 64), state: "running")
+                let beforeBusy = uiTestSupport.toolDetailCommandCount
+                await loadRemoteToolDetails(owner: fixture.2, messageID: fixture.0.id, part: fixture.1)
+                require(uiTestSupport.toolDetailCommandCount == beforeBusy + 4 &&
+                    remoteToolDetailState(owner: fixture.2, messageID: fixture.0.id, partID: fixture.1.id)?.fields[.error]?.loaded == true,
+                    "ASCII busy did not restart under new revision")
+                fixture = try show(a)
+                mode = "hold"; held = nil
+                let captured = fixture
+                let reading = Task { await self.loadRemoteToolDetails(owner: captured.2, messageID: captured.0.id, part: captured.1, refresh: true) }
+                for _ in 0..<50 { if held != nil { break }; try await Task.sleep(for: .milliseconds(10)) }
+                require(held != nil, "pending scope test did not dispatch")
+                _ = try show(b); error = "owned B status"; let bMessages = messages
+                if let held { await deliverToolDetailUITestReceipt(owner: held.0, id: held.1, result: held.2) }
+                reading.cancel(); await reading.value
+                require(selectedRemote?.sessionID == b.sessionID && messages == bMessages && error == "owned B status", "late A receipt changed B")
+                require(drafts[draftKey] == "owned detail draft", "switch lost A draft")
+                mode = "normal"
+                let validPayload: [String: Any] = ["requestId": "owned-request", "messageId": "msg_owned_detail_A",
+                    "partId": "prt_owned_detail_A", "field": "input", "offset": 0, "limit": 4096]
+                for change in [["offset": String(repeating: "a", count: 65400)], ["offset": ["bad": 1]],
+                               ["messageId": String(repeating: "m", count: 50000)], ["field": String(repeating: "f", count: 50000)],
+                               ["partId": ["bad": 1]]] as [[String: Any]] {
+                    var payload = validPayload; payload.merge(change) { _, new in new }
+                    let failure = try await readToolDetailUITestOwner(session: a.sessionID, payload: payload)
+                    let failureBytes = try JSONSerialization.data(withJSONObject: failure)
+                    require(failure["ok"] as? Bool == false && failureBytes.count < 1024,
+                        "host prevalidation echoed malformed binding")
+                }
+                uiTestSupport.toolDetailPolicyResult = failures.isEmpty ? "PASS \(checks)" : "FAIL " + failures.joined(separator: " | ")
+            } else { uiTestSupport.toolDetailPolicyResult = "准备完成" }
+            // Mount a fresh unopened row. The actual user's disclosure must be
+            // what triggers these reads; policy checks do not warm its cache.
+            fixture = try show(a)
+            cancelRemoteToolDetails(owner: fixture.2, messageID: fixture.0.id, partID: fixture.1.id)
+            resetToolDetailUITestCache()
+            if ProcessInfo.processInfo.arguments.contains("--ai-tool-detail-busy-ui-test") {
+                _ = try show(b, revision: String(repeating: "0", count: 64), state: "running")
+            }
+            error = ""
+        } catch { uiTestSupport.toolDetailPolicyResult = "FAIL " + error.localizedDescription }
+    }
+
     func runSessionModelRemoteUITestChecks() async {
         guard ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test") else { return }
         uiTestSupport.sessionModelPolicyResult = "运行中"

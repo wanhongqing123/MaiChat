@@ -101,6 +101,9 @@ void DesktopSessionSyncCoordinator::connectionReady() {
 }
 
 void DesktopSessionSyncCoordinator::connectionLost() {
+    // A prior successful callback must not be projected into a fresh viewer read
+    // after reconnect, or consume its in-flight live-tool protection.
+    latestRemoteHistoryRequests_.clear();
     localLoginSession_.clear();
     pendingAttachmentCleanupRooms_.clear();
     initiallyPublishedSessions_.clear();
@@ -253,14 +256,26 @@ void DesktopSessionSyncCoordinator::requestRemoteHistory(const QJsonObject& sess
         completion({}, QStringLiteral("所属设备登录已变化，请刷新列表"));
         return;
     }
+    const QString historyKey = QString::fromUtf8(
+        QJsonDocument(QJsonArray{slot, login, id}).toJson(QJsonDocument::Compact));
+    const quint64 serial = ++remoteHistorySerial_;
+    latestRemoteHistoryRequests_.insert(historyKey, serial);
     QPointer<DesktopSessionSyncCoordinator> guard(this);
     requester_(QStringLiteral("session-sync/history"), "GET",
                {{QStringLiteral("owner_slot"), slot},
                 {QStringLiteral("session_id"), id},
                 {QStringLiteral("before"), before},
                 {QStringLiteral("limit"), limit}},
-               [guard, session, completion = std::move(completion)](const QJsonObject& page, const QString& error) {
-                   if (guard && error.isEmpty() && guard->payloadHandler_)
+               [guard, session, historyKey, serial, slot, login, id,
+                completion = std::move(completion)](const QJsonObject& page, const QString& error) {
+                   const bool current = guard && guard->latestRemoteHistoryRequests_.value(historyKey) == serial;
+                   if (!current || guard->matchingRemote(slot, login, id).isEmpty()) {
+                       if (current) guard->latestRemoteHistoryRequests_.remove(historyKey);
+                       completion({}, QStringLiteral("History request was superseded; read the current conversation again."));
+                       return;
+                   }
+                   guard->latestRemoteHistoryRequests_.remove(historyKey);
+                   if (error.isEmpty() && guard->payloadHandler_)
                        guard->payloadHandler_(session, QStringLiteral("history_page"), page);
                    completion(page, error);
                });

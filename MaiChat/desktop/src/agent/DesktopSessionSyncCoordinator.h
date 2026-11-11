@@ -147,6 +147,10 @@ private:
     QHash<QString, QString> fingerprintByCommandId_;
     QHash<QString, QString> inputRequestByCommandId_;
     QHash<QString, PendingLifecycle> pendingLifecycle_;
+    // Read callbacks have local identities even though the history body has no
+    // wire request ID. Serials never reset when a connection is replaced.
+    quint64 remoteHistorySerial_ = 0;
+    QHash<QString, quint64> latestRemoteHistoryRequests_;
     QJsonArray remoteSessions_;
     QJsonArray remoteDevices_;
     QString defaultWorkspaceDirectory_;

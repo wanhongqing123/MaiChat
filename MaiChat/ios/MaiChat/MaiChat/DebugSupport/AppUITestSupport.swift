@@ -476,6 +476,12 @@ private struct MaiChatSimulatorUITestEntry: View {
                 AIHistoryUITestRoot()
             } else if ProcessInfo.processInfo.arguments.contains("--ai-welcome-ui-test") {
                 AIWelcomeUITestRoot()
+            } else if ProcessInfo.processInfo.arguments.contains("--ai-remote-tool-details-ui-test") {
+                #if targetEnvironment(simulator)
+                AIRemoteToolDetailsUITestRoot()
+                #else
+                AIAssistantView()
+                #endif
             } else if ProcessInfo.processInfo.arguments.contains("--ai-steering-ui-test") {
                 AISteeringUITestRoot()
             } else if ProcessInfo.processInfo.arguments.contains("--ai-session-switch-ui-test") {

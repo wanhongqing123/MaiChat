@@ -208,6 +208,108 @@ final class AIAssistantUITests: XCTestCase {
         answered.lifetime = .keepAlways; add(answered)
     }
 
+    @MainActor private func launchRemoteToolDetailFixture(checks: Bool = false, busy: Bool = false, fixtureOverride: String? = nil) throws -> XCUIApplication {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-remote-tool-details-ui-test"]
+        if checks { app.launchArguments.append("--ai-tool-detail-state-checks") }
+        if busy { app.launchArguments.append("--ai-tool-detail-busy-ui-test") }
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        guard let fixture = ProcessInfo.processInfo.environment["MAICHAT_TOOL_DETAIL_FIXTURE_DIR"] else {
+            throw XCTSkip("需要普通 C++ Store 创建的自有详情记录目录")
+        }
+        app.launchEnvironment["MAICHAT_TOOL_DETAIL_FIXTURE_DIR"] = fixtureOverride ?? fixture
+        app.launch()
+        return app
+    }
+
+    @MainActor func testRemoteToolDetailsReadStoredFieldsWhenExpanded() throws {
+        let app = try launchRemoteToolDetailFixture()
+        defer { app.terminate() }
+        let ready = app.staticTexts["tool-detail-policy"]
+        XCTAssertTrue(ready.waitForExistence(timeout: 15))
+        let prepared = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "准备完成"), object: ready)
+        XCTAssertEqual(XCTWaiter.wait(for: [prepared], timeout: 15), .completed, ready.label)
+        XCTAssertEqual(app.staticTexts["tool-detail-request-count"].label, "只读请求 0")
+        let disclosure = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "owned_recorded_tool")).firstMatch
+        XCTAssertTrue(disclosure.waitForExistence(timeout: 5))
+        disclosure.tap()
+        let input = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "owned recorded command; never execute")).firstMatch
+        XCTAssertTrue(input.waitForExistence(timeout: 5), "实际展开必须按需读取原参数，不能只显示完成状态")
+        XCTAssertTrue(app.staticTexts["tool-detail-text-output-prt_owned_detail_A"].label.contains("OWNED OUTPUT FIRST"))
+        XCTAssertTrue(app.staticTexts["tool-detail-text-error-prt_owned_detail_A"].label.contains("OWNED ERROR ORIGINAL"))
+        XCTAssertEqual(app.staticTexts["tool-detail-request-count"].label, "只读请求 3")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "remote-tool-details-first-pages"; screenshot.lifetime = .keepAlways; add(screenshot)
+        let more = app.buttons["tool-detail-more-output-prt_owned_detail_A"]
+        XCTAssertTrue(more.exists)
+        if !more.isHittable { app.swipeUp() }
+        XCTAssertTrue(more.isHittable); more.tap()
+        XCTAssertTrue(app.staticTexts["tool-detail-text-output-prt_owned_detail_A"].label.contains("OWNED OUTPUT SECOND"))
+        let restart = app.buttons["tool-detail-restart-prt_owned_detail_A"]
+        if !restart.isHittable { app.swipeUp() }
+        XCTAssertTrue(restart.isHittable); restart.tap()
+        let count = app.staticTexts["tool-detail-request-count"]
+        XCTAssertTrue(NSPredicate(format: "label == %@", "只读请求 7").evaluate(with: count))
+        disclosure.tap()
+        disclosure.tap()
+        XCTAssertEqual(count.label, "只读请求 7", "收起再展开应复用同版本缓存")
+        app.terminate()
+        let recovering = try launchRemoteToolDetailFixture(busy: true)
+        defer { recovering.terminate() }
+        let running = recovering.buttons.matching(NSPredicate(format: "label CONTAINS %@", "owned_recorded_tool")).firstMatch
+        XCTAssertTrue(running.waitForExistence(timeout: 10)); running.tap()
+        let recoveredOutput = recovering.staticTexts["tool-detail-text-output-prt_owned_detail_B"]
+        XCTAssertTrue(recoveredOutput.waitForExistence(timeout: 5))
+        let completed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@", "已完成"), object: running)
+        XCTAssertEqual(XCTWaiter.wait(for: [completed], timeout: 5), .completed,
+                       "Busy首0重读已读到Completed时，不能仍显示旧Running")
+    }
+
+    @MainActor func testRemoteToolDetailsLoadedAsciiPageIsVisuallyReadable() throws {
+        guard let fixture = ProcessInfo.processInfo.environment["MAICHAT_TOOL_DETAIL_ASCII_FIXTURE_DIR"] else {
+            throw XCTSkip("需要带可见 ASCII 页尾的自有详情记录")
+        }
+        let app = try launchRemoteToolDetailFixture(fixtureOverride: fixture)
+        defer { app.terminate() }
+        let disclosure = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "owned_recorded_tool")).firstMatch
+        XCTAssertTrue(disclosure.waitForExistence(timeout: 15)); disclosure.tap()
+        let output = app.staticTexts["tool-detail-text-output-prt_owned_detail_A"]
+        XCTAssertTrue(output.waitForExistence(timeout: 5))
+        XCTAssertTrue(output.label.contains("VISIBLE PAGE TAIL"))
+        print("ASCII_PAGE_LAYOUT frame=\(output.frame), loadedLabelBytes=\(output.label.utf8.count)")
+        // Verify actual layout and scrolling, then retain the original pixels
+        // for human review of the visible page tail. AX text alone is insufficient.
+        XCTAssertGreaterThan(output.frame.height, 1000, "4096字节的多行页不能压成单行预览")
+        let startY = output.frame.minY
+        app.swipeDown()
+        XCTAssertGreaterThan(output.frame.minY, startY, "已加载的多行正文必须随正常消息列表滚动")
+        app.swipeUp()
+        let more = app.buttons["tool-detail-more-output-prt_owned_detail_A"]
+        let restart = app.buttons["tool-detail-restart-prt_owned_detail_A"]
+        for _ in 0..<4 {
+            if more.isHittable && restart.isHittable { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(more.isHittable && restart.isHittable)
+        XCTAssertLessThanOrEqual(output.frame.maxY, more.frame.minY + 2,
+                                 "继续加载应位于已加载正文实际末尾之后")
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "remote-tool-details-loaded-ascii-page-tail"; attachment.lifetime = .keepAlways; add(attachment)
+    }
+
+    @MainActor func testRemoteToolDetailsScopeRevisionAndBoundedOwnerFailures() throws {
+        let app = try launchRemoteToolDetailFixture(checks: true)
+        defer { app.terminate() }
+        let status = app.staticTexts["tool-detail-policy"]
+        XCTAssertTrue(status.waitForExistence(timeout: 15))
+        let done = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH 'PASS ' OR label BEGINSWITH 'FAIL '"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [done], timeout: 15), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS "), status.label)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "remote-tool-details-state-contract"; screenshot.lifetime = .keepAlways; add(screenshot)
+    }
+
     @MainActor func testToolRunsStayBetweenTheirOwnTextDuringStreaming() {
         continueAfterFailure = false
         let app = XCUIApplication()
@@ -216,6 +318,7 @@ final class AIAssistantUITests: XCTestCase {
         app.launch()
         defer { app.terminate() }
         XCTAssertTrue(app.buttons["创作中心"].waitForExistence(timeout: 15))
+        print("LOCAL_TOOL_NAV \(app.debugDescription)")
         app.buttons["创作中心"].tap()
         let first = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "file_read ×1")).firstMatch
         let intro = app.staticTexts["先检查文件，再执行处理。"]

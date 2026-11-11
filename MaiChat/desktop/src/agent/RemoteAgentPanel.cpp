@@ -35,6 +35,7 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringList>
+#include <QStringConverter>
 #include <QTimer>
 #include <QUuid>
 #include <QUrl>
@@ -224,7 +225,8 @@ QList<QJsonObject> questionDisplayTimeline(const QMap<QString, QJsonObject>& sou
     QList<QJsonObject> result;
     QHash<QString, int> occurrences;
     for (const Unit& unit : units) {
-        const QString sourceId = unit.message.value(QStringLiteral("id")).toString();
+        const QString sourceId = unit.message.value(QStringLiteral("source_message_id"))
+                                     .toString(unit.message.value(QStringLiteral("id")).toString());
         if (!result.isEmpty() && result.last().value(QStringLiteral("source_message_id")).toString() == sourceId &&
             unit.message.value(QStringLiteral("role")) != QStringLiteral("user")) {
             QJsonArray parts = result.last().value(QStringLiteral("parts")).toArray();
@@ -291,8 +293,156 @@ bool hasVisibleActivity(const QJsonObject& message) {
     return false;
 }
 
+QString toolDetailKey(const QJsonObject& tool) {
+    return tool.value(QStringLiteral("messageId")).toString() + QChar(0x1f) +
+           tool.value(QStringLiteral("id")).toString();
+}
+
+bool validDetailRevision(const QString& revision) {
+    static const QRegularExpression expression(QStringLiteral("^[0-9a-f]{64}$"));
+    return expression.match(revision).hasMatch();
+}
+
+const QStringList& toolDetailFields() {
+    static const QStringList fields{QStringLiteral("input"), QStringLiteral("output"), QStringLiteral("error")};
+    return fields;
+}
+
+// A tool keeps the same quiet metadata row as the local card. Its selectable
+// plain-text fields have their own disclosure, separate from the answer Markdown.
+class RemoteToolDetailRow final : public QWidget {
+public:
+    std::function<void(const QJsonObject&, const QString&)> activated;
+    explicit RemoteToolDetailRow(QWidget* parent = nullptr) : QWidget(parent) {
+        auto* column = new QVBoxLayout(this);
+        column->setContentsMargins(0, UiZoom::s(2), 0, UiZoom::s(2));
+        column->setSpacing(UiZoom::s(5));
+        auto* head = new QHBoxLayout;
+        metadata_ = new QLabel(this);
+        metadata_->setObjectName(QStringLiteral("remoteAgentToolDetail"));
+        metadata_->setTextFormat(Qt::PlainText);
+        metadata_->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+        metadata_->setWordWrap(true);
+        UiZoom::setFont(metadata_, UiZoom::TextRole::Detail, metadata_->font());
+        UiZoom::setStyle(metadata_, QStringLiteral("QLabel{background:transparent;color:#667085;font-size:@detail;}"));
+        head->addWidget(metadata_, 1);
+        disclosure_ = new QPushButton(QStringLiteral("›"), this);
+        disclosure_->setObjectName(QStringLiteral("remoteAgentToolDisclosure"));
+        disclosure_->setAccessibleName(QStringLiteral("展开工具参数、输出与错误"));
+        disclosure_->setCursor(Qt::PointingHandCursor);
+        disclosure_->setFixedSize(UiZoom::s(22), UiZoom::s(22));
+        disclosure_->setStyleSheet(QStringLiteral("QPushButton{background:transparent;border:none;color:#98a2b3;padding:0;}"));
+        head->addWidget(disclosure_);
+        column->addLayout(head);
+        body_ = new QWidget(this);
+        auto* fields = new QVBoxLayout(body_);
+        fields->setContentsMargins(UiZoom::s(9), UiZoom::s(7), UiZoom::s(9), UiZoom::s(7));
+        fields->setSpacing(UiZoom::s(5));
+        body_->setObjectName(QStringLiteral("remoteAgentToolFields"));
+        body_->setStyleSheet(QStringLiteral("QWidget#remoteAgentToolFields{background:#f7f8fa;border:1px solid #e4e7ec;border-radius:7px;}"));
+        note_ = new QLabel(body_);
+        note_->setWordWrap(true);
+        UiZoom::setFont(note_, UiZoom::TextRole::Detail, note_->font());
+        fields->addWidget(note_);
+        for (const QString& field : toolDetailFields()) {
+            auto* section = new QWidget(body_);
+            auto* layout = new QVBoxLayout(section);
+            layout->setContentsMargins(0, 0, 0, 0);
+            layout->setSpacing(UiZoom::s(3));
+            const QString title = field == QStringLiteral("input") ? QStringLiteral("参数")
+                                  : field == QStringLiteral("output") ? QStringLiteral("输出") : QStringLiteral("错误");
+            auto* label = new QLabel(title, section);
+            UiZoom::setFont(label, UiZoom::TextRole::Detail, label->font());
+            label->setStyleSheet(QStringLiteral("color:#667085;background:transparent;"));
+            layout->addWidget(label);
+            auto* text = new QLabel(section);
+            text->setObjectName(QStringLiteral("remoteAgentToolFieldText"));
+            text->setProperty("detailField", field);
+            text->setTextFormat(Qt::PlainText);
+            text->setWordWrap(true);
+            text->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+            text->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+            UiZoom::setFont(text, UiZoom::TextRole::Detail, text->font());
+            text->setStyleSheet(QStringLiteral("color:#475467;background:transparent;"));
+            layout->addWidget(text);
+            auto* more = new QPushButton(section);
+            more->setObjectName(QStringLiteral("remoteAgentToolFieldMore"));
+            more->setProperty("detailField", field);
+            more->setCursor(Qt::PointingHandCursor);
+            more->setStyleSheet(QStringLiteral("QPushButton{background:transparent;border:none;color:#0b67b7;text-align:left;padding:2px 0;}"));
+            layout->addWidget(more, 0, Qt::AlignLeft);
+            texts_.insert(field, text);
+            more_.insert(field, more);
+            fields->addWidget(section);
+            QObject::connect(more, &QPushButton::clicked, this, [this, field] {
+                if (activated) activated(tool_, field);
+            });
+        }
+        body_->hide();
+        column->addWidget(body_);
+        QObject::connect(disclosure_, &QPushButton::clicked, this, [this] {
+            if (activated) activated(tool_, {});
+        });
+    }
+
+    void setTool(const QJsonObject& tool) {
+        tool_ = tool;
+        refreshMetadata(tool);
+        setProperty("detailKey", toolDetailKey(tool));
+    }
+
+    const QJsonObject& tool() const { return tool_; }
+
+    void refresh(const QJsonObject& presentation) {
+        auto metadata = tool_;
+        if (presentation.contains(QStringLiteral("state")))
+            metadata.insert(QStringLiteral("state"), presentation.value(QStringLiteral("state")));
+        refreshMetadata(metadata);
+        const bool expanded = presentation.value(QStringLiteral("expanded")).toBool();
+        body_->setVisible(expanded);
+        disclosure_->setText(expanded ? QStringLiteral("⌄") : QStringLiteral("›"));
+        const QString note = presentation.value(QStringLiteral("note")).toString();
+        note_->setText(note);
+        note_->setVisible(!note.isEmpty());
+        for (const QString& field : toolDetailFields()) {
+            const auto value = presentation.value(field).toObject();
+            QLabel* text = texts_.value(field);
+            const QString content = value.value(QStringLiteral("text")).toString();
+            if (text->text() != content) text->setText(content);
+            text->setToolTip(value.value(QStringLiteral("invalidUtf8")).toBool()
+                                 ? QStringLiteral("原文包含无效 UTF-8；显示替换字符，源字节按原样分页保留") : QString());
+            QPushButton* more = more_.value(field);
+            more->setText(value.value(QStringLiteral("button")).toString());
+            more->setVisible(value.value(QStringLiteral("canLoad")).toBool());
+            more->setEnabled(value.value(QStringLiteral("enabled")).toBool());
+        }
+        updateGeometry();
+    }
+
+private:
+    void refreshMetadata(const QJsonObject& tool) {
+        QString name = tool.value(QStringLiteral("tool")).toString().trimmed();
+        if (name.isEmpty()) name = QStringLiteral("工具");
+        QString detail = name + QStringLiteral(" · ") + agentToolStateText(tool.value(QStringLiteral("state")).toString());
+        if (name == QStringLiteral("curl") && tool.value(QStringLiteral("state")) == QStringLiteral("error")) {
+            const QString summary = tool.value(QStringLiteral("error")).toString();
+            if (!summary.isEmpty()) detail += QLatin1Char('\n') + summary;
+        }
+        if (metadata_->text() != detail) metadata_->setText(detail);
+    }
+    QJsonObject tool_;
+    QLabel* metadata_ = nullptr;
+    QPushButton* disclosure_ = nullptr;
+    QWidget* body_ = nullptr;
+    QLabel* note_ = nullptr;
+    QHash<QString, QLabel*> texts_;
+    QHash<QString, QPushButton*> more_;
+};
+
 class RemoteToolGroupCard final : public AgentToolGroupWidget {
 public:
+    std::function<void(const QJsonObject&, const QString&)> activated;
+    std::function<QJsonObject(const QJsonObject&)> presentation;
     explicit RemoteToolGroupCard(const QString& id) : AgentToolGroupWidget(id) {
         setObjectName(QStringLiteral("remoteAgentToolGroup"));
         disclosureButton()->setObjectName(QStringLiteral("remoteAgentToolGroupDisclosure"));
@@ -307,35 +457,57 @@ public:
             wanted.insert(id);
             const QString state = tool.value(QStringLiteral("state")).toString();
             states.append(state);
-            QLabel* row = rows_.value(id, nullptr);
+            RemoteToolDetailRow* row = rows_.value(id, nullptr);
             if (!row) {
-                row = new QLabel;
-                row->setObjectName(QStringLiteral("remoteAgentToolDetail"));
-                row->setTextFormat(Qt::PlainText);
-                row->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-                row->setWordWrap(true);
-                UiZoom::setFont(row, UiZoom::TextRole::Detail, row->font());
-                UiZoom::setStyle(row, QStringLiteral("QLabel{background:transparent;color:#667085;font-size:@detail;}"));
+                row = new RemoteToolDetailRow;
+                row->activated = [this](const QJsonObject& tool, const QString& field) {
+                    if (activated) activated(tool, field);
+                };
                 addDetail(row);
                 rows_.insert(id, row);
             }
-            QString name = tool.value(QStringLiteral("tool")).toString().trimmed();
-            if (name.isEmpty()) name = QStringLiteral("工具");
-            QString detail = name + QStringLiteral(" · ") + agentToolStateText(state);
-            if (name == QStringLiteral("curl") && state == QStringLiteral("error")) {
-                const QString summary = tool.value(QStringLiteral("error")).toString();
-                if (!summary.isEmpty()) detail += QLatin1Char('\n') + summary;
-            }
-            row->setText(detail);
+            row->setTool(tool);
+            if (presentation) row->refresh(presentation(tool));
         }
         for (const QString& id : rows_.keys())
             if (!wanted.contains(id)) removeDetail(rows_.take(id));
         setTitle(agentToolGroupTitle(states));
+        refreshDetails();
         updateGeometry();
     }
 
+    void refreshDetails() {
+        if (presentation) {
+            QStringList states;
+            for (auto* row : rows_) {
+                const auto value = presentation(row->tool());
+                row->refresh(value);
+                states.append(value.value(QStringLiteral("state")).toString(
+                    row->tool().value(QStringLiteral("state")).toString()));
+            }
+            setTitle(agentToolGroupTitle(states));
+        }
+        refreshWidth(isExpanded());
+    }
+
+protected:
+    void disclosureClicked() override { refreshWidth(!isExpanded()); }
+
 private:
-    QHash<QString, QLabel*> rows_;
+    void refreshWidth(bool groupExpanded) {
+        bool detailExpanded = false;
+        if (groupExpanded && presentation)
+            for (auto* row : rows_)
+                detailExpanded |= presentation(row->tool()).value(QStringLiteral("expanded")).toBool();
+        // MarkdownView intentionally keeps metadata-only Maximum widgets at
+        // their natural width. A readable detail uses the available column;
+        // collapsing restores the original compact group without a global rule.
+        const auto policy = detailExpanded ? QSizePolicy::Preferred : QSizePolicy::Maximum;
+        if (sizePolicy().horizontalPolicy() == policy) return;
+        setSizePolicy(policy, QSizePolicy::Fixed);
+        updateGeometry();
+    }
+    QHash<QString, RemoteToolDetailRow*> rows_;
 };
 
 QIcon actionIcon(bool stop, const QColor& color) {
@@ -375,6 +547,50 @@ protected:
 }  // namespace
 
 struct RemoteAgentPanel::Runtime {
+    struct ToolField {
+        QString text;
+        QByteArray raw;
+        QString pendingId;
+        QString error;
+        qint64 nextOffset = 0;
+        qint64 totalBytes = 0;
+        bool loaded = false;
+        bool hasMore = false;
+        bool invalidUtf8 = false;
+    };
+    struct ToolDetail {
+        QJsonObject metadata;
+        QHash<QString, ToolField> fields;
+        QString revision;
+        QString state;
+        bool expanded = false;
+        bool restartRequired = false;
+        // Only an explicit Busy->user restart may learn a changed state before
+        // its snapshot. The first fully validated page locks all three fields.
+        bool busyIdentityPending = false;
+    };
+    struct ToolRead {
+        QJsonObject owner;
+        QJsonObject command;
+        QString key;
+        QString account;
+        quint64 accountGeneration = 0;
+        quint64 generation = 0;
+    };
+    struct HistoryLiveTool {
+        QString messageId;
+        QJsonObject part;
+    };
+    QString detailAccount;
+    quint64 detailAccountGeneration = 0;
+    quint64 detailGeneration = 0;
+    QHash<QString, ToolDetail> toolDetails;
+    QHash<QString, ToolRead> toolReads;
+    QSet<QString> toolRefresh;
+    // Only the latest part observed while this single history request was in
+    // flight is retained. A fresh request clears the guard; hashes are unordered.
+    quint64 historyToolGeneration = 0;
+    QHash<QString, HistoryLiveTool> historyLiveTools;
     struct ModelConfiguration {
         QJsonObject owner;
         QJsonObject value;
@@ -851,6 +1067,7 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
     connect(&runtime_->historyTimeout, &QTimer::timeout, this, [this] {
         if (!runtime_->historyInFlight) return;
         runtime_->historyInFlight = false;
+        runtime_->historyLiveTools.clear();
         runtime_->older->setEnabled(true);
         if (runtime_->messages.isEmpty()) {
             showStatus(QStringLiteral("会话读取超时，可重新进入会话重试"), true);
@@ -870,8 +1087,275 @@ RemoteAgentPanel::~RemoteAgentPanel() {
 }
 
 void RemoteAgentPanel::setCommandHandler(CommandHandler handler) {
+    // A replacement transport may represent another authenticated connection.
+    // Outstanding reads must not be adopted by its eventual receipts.
+    invalidateToolDetailRequests(true);
     runtime_->command = std::move(handler);
     requestSessionModel();
+}
+void RemoteAgentPanel::setToolDetailScope(const QString& accountId, quint64 generation) {
+    if (runtime_->detailAccount == accountId && runtime_->detailAccountGeneration == generation) return;
+    runtime_->detailAccount = accountId;
+    runtime_->detailAccountGeneration = generation;
+    invalidateToolDetailRequests(true);
+}
+
+void RemoteAgentPanel::invalidateToolDetailRequests(bool clearCache) {
+    ++runtime_->detailGeneration;
+    runtime_->toolReads.clear();
+    runtime_->toolRefresh.clear();
+    runtime_->historyLiveTools.clear();
+    if (clearCache) {
+        runtime_->toolDetails.clear();
+    } else {
+        for (auto& detail : runtime_->toolDetails)
+            for (auto& field : detail.fields)
+                if (!field.pendingId.isEmpty()) {
+                    field.pendingId.clear();
+                    field.error = QStringLiteral("读取已中断，请重试");
+                }
+    }
+    refreshToolDetailViews();
+}
+
+void RemoteAgentPanel::syncToolDetailMetadata(const QJsonObject& tool) {
+    const QString key = toolDetailKey(tool);
+    auto& detail = runtime_->toolDetails[key];
+    const bool existed = !detail.metadata.isEmpty();
+    const bool changed = existed &&
+        (detail.metadata.value(QStringLiteral("detailRevision")) != tool.value(QStringLiteral("detailRevision")) ||
+         detail.metadata.value(QStringLiteral("state")) != tool.value(QStringLiteral("state")) ||
+         detail.metadata.value(QStringLiteral("callId")) != tool.value(QStringLiteral("callId")) ||
+         detail.metadata.value(QStringLiteral("tool")) != tool.value(QStringLiteral("tool")) ||
+         detail.metadata.value(QStringLiteral("detailsAvailable")) != tool.value(QStringLiteral("detailsAvailable")));
+    if (changed) {
+        for (auto it = runtime_->toolReads.begin(); it != runtime_->toolReads.end();)
+            it = it->key == key ? runtime_->toolReads.erase(it) : ++it;
+        detail.fields.clear();
+        detail.restartRequired = false;
+        detail.busyIdentityPending = false;
+    }
+    detail.metadata = tool;
+    if (!existed || changed) {
+        detail.revision = tool.value(QStringLiteral("detailRevision")).toString();
+        detail.state = tool.value(QStringLiteral("state")).toString();
+    }
+    if (!tool.value(QStringLiteral("detailsAvailable")).toBool()) {
+        // Old owners may have sent inline data. Display exactly what they did
+        // provide without claiming absent fields are empty or complete.
+        for (const QString& name : toolDetailFields()) {
+            const QJsonValue value = tool.value(name);
+            if (!value.isString() && !value.isObject() && !value.isArray()) continue;
+            auto& field = detail.fields[name];
+            field.text = value.isString() ? value.toString()
+                         : QString::fromUtf8((value.isObject() ? QJsonDocument(value.toObject())
+                                                               : QJsonDocument(value.toArray())).toJson(QJsonDocument::Indented));
+            field.loaded = true;
+        }
+    }
+    if (changed && detail.expanded) runtime_->toolRefresh.insert(key);
+}
+
+QJsonObject RemoteAgentPanel::toolDetailPresentation(const QJsonObject& tool) const {
+    const auto detail = runtime_->toolDetails.value(toolDetailKey(tool));
+    const bool available = detail.metadata.value(QStringLiteral("detailsAvailable")).toBool() &&
+                           validDetailRevision(detail.metadata.value(QStringLiteral("detailRevision")).toString());
+    const bool online = runtime_->session.value(QStringLiteral("online")).toBool() && bool(runtime_->command);
+    QJsonObject presentation{{QStringLiteral("expanded"), detail.expanded},
+                              {QStringLiteral("state"), detail.state.isEmpty()
+                                   ? tool.value(QStringLiteral("state")).toString() : detail.state}};
+    if (!available)
+        presentation.insert(QStringLiteral("note"), QStringLiteral("所属设备未提供分页详情；仅显示已有内嵌内容"));
+    else if (detail.restartRequired)
+        presentation.insert(QStringLiteral("note"), QStringLiteral("详情已更新，请重读；旧页不会拼入新版结果"));
+    else if (!online)
+        presentation.insert(QStringLiteral("note"), QStringLiteral("所属设备不可达；已缓存内容仍可查看，未读内容可在恢复连接后重试"));
+    for (const QString& name : toolDetailFields()) {
+        const auto field = detail.fields.value(name);
+        QString text = field.text;
+        if (!field.loaded) text = !field.pendingId.isEmpty() ? QStringLiteral("正在读取…")
+                                       : !field.error.isEmpty() ? field.error
+                                       : available ? QStringLiteral("尚未读取") : QStringLiteral("所属设备未提供此字段");
+        else if (!field.error.isEmpty()) text += QStringLiteral("\n\n") + field.error;
+        const bool canLoad = available && (detail.restartRequired || !field.loaded || field.hasMore || !field.error.isEmpty());
+        presentation.insert(name, QJsonObject{{QStringLiteral("text"), text},
+                                             {QStringLiteral("invalidUtf8"), field.invalidUtf8},
+                                             {QStringLiteral("canLoad"), canLoad},
+                                             {QStringLiteral("enabled"), online && field.pendingId.isEmpty()},
+                                             {QStringLiteral("button"), detail.restartRequired ? QStringLiteral("重读详情")
+                                                  : !field.pendingId.isEmpty() ? QStringLiteral("正在读取…")
+                                                  : !field.error.isEmpty() ? QStringLiteral("重试")
+                                                  : field.loaded ? QStringLiteral("继续加载") : QStringLiteral("读取")}});
+    }
+    return presentation;
+}
+
+void RemoteAgentPanel::refreshToolDetailViews() {
+    for (auto* group : runtime_->toolGroups) group->refreshDetails();
+}
+
+void RemoteAgentPanel::activateToolDetail(const QJsonObject& tool, const QString& field) {
+    const QString key = toolDetailKey(tool);
+    if (!runtime_->toolDetails.contains(key)) syncToolDetailMetadata(tool);
+    auto& detail = runtime_->toolDetails[key];
+    if (field.isEmpty()) {
+        detail.expanded = !detail.expanded;
+        if (detail.expanded && !detail.restartRequired)
+            for (const QString& name : toolDetailFields()) requestToolDetailPage(key, name);
+    } else if (detail.restartRequired) {
+        // A Busy reply proves the snapshot changed. First pages may omit the
+        // retired revision; the first returned revision binds the whole refresh.
+        detail.fields.clear();
+        detail.revision.clear();
+        detail.state.clear();
+        detail.busyIdentityPending = true;
+        detail.restartRequired = false;
+        for (const QString& name : toolDetailFields()) requestToolDetailPage(key, name);
+    } else if (toolDetailFields().contains(field)) {
+        requestToolDetailPage(key, field);
+    }
+    refreshToolDetailViews();
+}
+
+void RemoteAgentPanel::requestToolDetailPage(const QString& key, const QString& name) {
+    auto found = runtime_->toolDetails.find(key);
+    if (found == runtime_->toolDetails.end()) return;
+    auto& detail = found.value();
+    if (!detail.metadata.value(QStringLiteral("detailsAvailable")).toBool() ||
+        !validDetailRevision(detail.metadata.value(QStringLiteral("detailRevision")).toString())) return;
+    auto& field = detail.fields[name];
+    if (!field.pendingId.isEmpty() || (field.loaded && !field.hasMore && field.error.isEmpty())) return;
+    if (!runtime_->command || !runtime_->session.value(QStringLiteral("online")).toBool() ||
+        !validModelOwner(runtime_->session)) {
+        field.error = QStringLiteral("所属设备不可达，请恢复连接后重试");
+        return;
+    }
+    if (runtime_->toolReads.size() >= 128) {
+        field.error = QStringLiteral("正在读取其他详情，请稍后重试");
+        return;
+    }
+    const QString requestId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QJsonObject command{{QStringLiteral("action"), QStringLiteral("get_tool_detail")},
+                         {QStringLiteral("requestId"), requestId},
+                         {QStringLiteral("messageId"), detail.metadata.value(QStringLiteral("messageId"))},
+                         {QStringLiteral("partId"), detail.metadata.value(QStringLiteral("id"))},
+                         {QStringLiteral("field"), name},
+                         {QStringLiteral("offset"), field.loaded ? field.nextOffset : 0},
+                         {QStringLiteral("limit"), 4096}};
+    if (!detail.revision.isEmpty()) command.insert(QStringLiteral("detailRevision"), detail.revision);
+    const QJsonObject current = runtime_->session;
+    runtime_->toolReads.insert(requestId, {current, command, key, runtime_->detailAccount,
+                                           runtime_->detailAccountGeneration, runtime_->detailGeneration});
+    field.pendingId = requestId;
+    field.error.clear();
+    QPointer<RemoteAgentPanel> guard(this);
+    const auto fail = [guard, requestId](const QString& error) {
+        if (!guard) return;
+        const auto request = guard->runtime_->toolReads.find(requestId);
+        if (request == guard->runtime_->toolReads.end()) return;
+        const auto read = request.value();
+        guard->runtime_->toolReads.erase(request);
+        auto& field = guard->runtime_->toolDetails[read.key].fields[read.command.value(QStringLiteral("field")).toString()];
+        if (field.pendingId != requestId) return;
+        field.pendingId.clear();
+        field.error = error.isEmpty() ? QStringLiteral("所属设备未确认详情读取，请重试") : error.left(240);
+        guard->refreshToolDetailViews();
+    };
+    QTimer::singleShot(30'000, this, [fail] { fail({}); });
+    // Read-only and deliberately outside the durable business outbox: reconnect
+    // never replays a tool execution or silently downloads the remaining pages.
+    runtime_->command(current, command, [fail](const QString& error) { if (!error.isEmpty()) fail(error); });
+}
+
+bool RemoteAgentPanel::receiveToolDetailResult(const QJsonObject& owner, const QJsonObject& payload) {
+    // command_id is the common wire identity. Android owners do not publish the
+    // Desktop-specific optional request_id projection for these read commands.
+    const QString id = payload.value(QStringLiteral("command_id")).toString();
+    const auto found = runtime_->toolReads.constFind(id);
+    if (found == runtime_->toolReads.cend()) return false;
+    const auto read = found.value();
+    const auto result = payload.value(QStringLiteral("result")).toObject();
+    if ((payload.contains(QStringLiteral("request_id")) &&
+         payload.value(QStringLiteral("request_id")).toString() != id) ||
+        sessionKey(owner) != sessionKey(read.owner) || sessionKey(runtime_->session) != sessionKey(read.owner) ||
+        read.account != runtime_->detailAccount || read.accountGeneration != runtime_->detailAccountGeneration ||
+        read.generation != runtime_->detailGeneration || !result.value(QStringLiteral("ok")).isBool() ||
+        result.value(QStringLiteral("requestId")).toString() != id ||
+        result.value(QStringLiteral("sessionId")) != read.owner.value(QStringLiteral("id"))) return true;
+    for (const QString& name : {QStringLiteral("messageId"), QStringLiteral("partId"), QStringLiteral("field"), QStringLiteral("offset")})
+        if (result.value(name) != read.command.value(name)) return true;
+    auto detail = runtime_->toolDetails.find(read.key);
+    if (detail == runtime_->toolDetails.end()) return true;
+    const QString fieldName = read.command.value(QStringLiteral("field")).toString();
+    auto& field = detail->fields[fieldName];
+    if (field.pendingId != id) return true;
+    if (!result.value(QStringLiteral("ok")).toBool()) {
+        if (result.value(QStringLiteral("errorCode")) == QStringLiteral("busy")) {
+            for (auto it = runtime_->toolReads.begin(); it != runtime_->toolReads.end();)
+                it = it->key == read.key ? runtime_->toolReads.erase(it) : ++it;
+            detail->fields.clear();
+            detail->restartRequired = true;
+            detail->busyIdentityPending = false;
+        } else {
+            runtime_->toolReads.remove(id);
+            field.pendingId.clear();
+            field.error = result.value(QStringLiteral("error")).toString(QStringLiteral("所属设备无法读取详情")).left(240);
+        }
+        refreshToolDetailViews();
+        return true;
+    }
+    const QString revision = result.value(QStringLiteral("detailRevision")).toString();
+    const QString state = result.value(QStringLiteral("state")).toString();
+    const bool freshBusyIdentity = detail->busyIdentityPending && detail->revision.isEmpty() && detail->state.isEmpty();
+    const bool knownState = state == QStringLiteral("pending") || state == QStringLiteral("running") ||
+                            state == QStringLiteral("completed") || state == QStringLiteral("error") ||
+                            state == QStringLiteral("canceled");
+    if (!validDetailRevision(revision) || (!detail->revision.isEmpty() && revision != detail->revision) ||
+        (!read.command.value(QStringLiteral("detailRevision")).toString().isEmpty() &&
+         revision != read.command.value(QStringLiteral("detailRevision")).toString()) ||
+        result.value(QStringLiteral("tool")) != detail->metadata.value(QStringLiteral("tool")) ||
+        !knownState || (!freshBusyIdentity && state != detail->state) ||
+        (detail->metadata.contains(QStringLiteral("callId")) &&
+         result.value(QStringLiteral("callId")) != detail->metadata.value(QStringLiteral("callId")))) return true;
+    const auto integer = [&](const QString& name) {
+        const QJsonValue value = result.value(name);
+        const qint64 number = value.toInteger(-1);
+        return value.isDouble() && number >= 0 && double(number) == value.toDouble() ? number : qint64(-1);
+    };
+    const qint64 offset = integer(QStringLiteral("offset"));
+    const qint64 bytes = integer(QStringLiteral("sourceBytesRead"));
+    const qint64 total = integer(QStringLiteral("totalBytes"));
+    const qint64 next = integer(QStringLiteral("nextOffset"));
+    if (offset < 0 || bytes < 0 || bytes > 4096 || total < offset || bytes > total - offset || next < 0 ||
+        !result.value(QStringLiteral("hasMore")).isBool() || !result.value(QStringLiteral("textIsValidUtf8")).isBool() ||
+        !result.value(QStringLiteral("text")).isString()) return true;
+    const bool more = result.value(QStringLiteral("hasMore")).toBool();
+    if (more != (offset + bytes < total) || next != (more ? offset + bytes : 0) || (more && bytes == 0) ||
+        (offset != 0 && (!field.loaded || field.nextOffset != offset || field.totalBytes != total))) return true;
+    const QString text = result.value(QStringLiteral("text")).toString();
+    const bool validUtf8 = result.value(QStringLiteral("textIsValidUtf8")).toBool();
+    QByteArray raw = validUtf8 ? text.toUtf8()
+                             : QByteArray::fromBase64(result.value(QStringLiteral("rawBase64")).toString().toLatin1(),
+                                                      QByteArray::AbortOnBase64DecodingErrors);
+    QStringDecoder decoder(QStringDecoder::Utf8, QStringConverter::Flag::Stateless);
+    const QString decoded = decoder(raw);
+    if (raw.size() != bytes || decoded != text || decoder.hasError() == validUtf8) return true;
+    runtime_->toolReads.remove(id);
+    field.pendingId.clear();
+    field.error.clear();
+    if (offset == 0) { field.text.clear(); field.raw.clear(); field.invalidUtf8 = false; }
+    field.raw += raw;
+    field.text += text;
+    field.invalidUtf8 |= !validUtf8;
+    field.loaded = true;
+    field.totalBytes = total;
+    field.nextOffset = next;
+    field.hasMore = more;
+    detail->revision = revision;
+    detail->state = state;
+    detail->busyIdentityPending = false;
+    refreshToolDetailViews();
+    return true;
 }
 void RemoteAgentPanel::setHistoryHandler(HistoryHandler handler) {
     runtime_->history = std::move(handler);
@@ -1069,6 +1553,7 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
     const QString previous = sessionKey(runtime_->session);
     const QString next = sessionKey(remote);
     if (previous != next) {
+        invalidateToolDetailRequests(true);
         runtime_->actionPanel->hide();
         runtime_->modelOptions->hide();
         runtime_->effortOptions->hide();
@@ -1131,7 +1616,9 @@ void RemoteAgentPanel::updateSession(const QJsonObject& remote) {
     runtime_->owners.insert(sessionKey(remote), remote);
     if (sessionKey(remote) != sessionKey(runtime_->session)) {
         if (sameModelRoom(remote, runtime_->session)) {
+            invalidateToolDetailRequests(false);
             runtime_->session.insert(QStringLiteral("online"), false);
+            refreshToolDetailViews();
             runtime_->actionPanel->hide();
             updateControls();
             showStatus(QStringLiteral("所属设备登录已变化，请重新选择会话"), true);
@@ -1141,6 +1628,7 @@ void RemoteAgentPanel::updateSession(const QJsonObject& remote) {
     const bool wasOnline = runtime_->session.value(QStringLiteral("online")).toBool();
     runtime_->session = remote;
     runtime_->owners.insert(sessionKey(remote), remote);
+    refreshToolDetailViews();
     updateControls();
     if (remote.value(QStringLiteral("busy")).toBool() && runtime_->awaitingResponse) runtime_->observedBusy = true;
     if (!remote.value(QStringLiteral("busy")).toBool() && runtime_->observedBusy) {
@@ -1149,6 +1637,7 @@ void RemoteAgentPanel::updateSession(const QJsonObject& remote) {
     }
     updateThinking();
     if (!remote.value(QStringLiteral("online")).toBool()) {
+        invalidateToolDetailRequests(false);
         runtime_->historyInFlight = false;
         runtime_->historyTimeout.stop();
         runtime_->older->setEnabled(true);
@@ -1172,6 +1661,8 @@ void RemoteAgentPanel::requestHistory(const QString& before, int limit) {
     runtime_->historyTimeout.start();
     const QJsonObject current = runtime_->session;
     const quint64 generation = ++runtime_->historyGeneration;
+    runtime_->historyToolGeneration = generation;
+    runtime_->historyLiveTools.clear();
     QPointer<RemoteAgentPanel> guard(this);
     runtime_->history(current, before, limit, [guard, current, generation](const QString& error) {
         if (!guard || generation != guard->runtime_->historyGeneration ||
@@ -1179,6 +1670,7 @@ void RemoteAgentPanel::requestHistory(const QString& before, int limit) {
             !guard->runtime_->historyInFlight)
             return;
         guard->runtime_->historyInFlight = false;
+        guard->runtime_->historyLiveTools.clear();
         guard->runtime_->historyTimeout.stop();
         guard->runtime_->older->setEnabled(true);
         if (guard->runtime_->messages.isEmpty()) guard->showStatus(error, true);
@@ -1652,6 +2144,7 @@ void RemoteAgentPanel::sendPrompt(const QJsonObject&, const QString& retryId) {
 void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& kind, const QJsonObject& payload) {
     if (kind == QStringLiteral("event") &&
         payload.value(QStringLiteral("type")).toString() == QStringLiteral("command_result")) {
+        if (receiveToolDetailResult(remote, payload)) return;
         if (receiveSessionModelResult(remote, payload)) return;
         QString id = payload.value(QStringLiteral("request_id")).toString();
         if (id.isEmpty()) id = payload.value(QStringLiteral("command_id")).toString();
@@ -1671,8 +2164,13 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
         return;
     }
     if (sessionKey(remote) != sessionKey(runtime_->session)) return;
+    const auto protectedTools = kind == QStringLiteral("history_page") && runtime_->historyInFlight &&
+                                        runtime_->historyToolGeneration == runtime_->historyGeneration
+                                    ? runtime_->historyLiveTools
+                                    : QHash<QString, Runtime::HistoryLiveTool>{};
     if (kind == QStringLiteral("history_page")) {
         runtime_->historyInFlight = false;
+        runtime_->historyLiveTools.clear();
         runtime_->historyTimeout.stop();
         runtime_->older->setEnabled(true);
     }
@@ -1694,8 +2192,30 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
         }
     }
     for (const QJsonValue& value : received) {
-        const QJsonObject message = value.toObject();
+        QJsonObject message = value.toObject();
         const QString id = message.value(QStringLiteral("id")).toString();
+        const QString sourceId = message.value(QStringLiteral("source_message_id")).toString(id);
+        QJsonArray parts = message.value(QStringLiteral("parts")).toArray();
+        QSet<QString> presentTools;
+        for (int index = 0; index < parts.size(); ++index) {
+            const QJsonObject part = parts[index].toObject();
+            const QString partId = part.value(QStringLiteral("id")).toString();
+            if (part.value(QStringLiteral("kind")) != QStringLiteral("tool") || partId.isEmpty()) continue;
+            const QString key = sourceId + QChar(0x1f) + partId;
+            presentTools.insert(key);
+            if (kind == QStringLiteral("history_page")) {
+                if (protectedTools.contains(key)) parts[index] = protectedTools.value(key).part;
+            } else if (runtime_->historyInFlight &&
+                       runtime_->historyToolGeneration == runtime_->historyGeneration) {
+                runtime_->historyLiveTools.insert(key, {sourceId, part});
+            }
+        }
+        // Keep a newly appended live tool when the older snapshot predates its
+        // creation. Other text parts and the original history cursor stay intact.
+        if (kind == QStringLiteral("history_page"))
+            for (auto it = protectedTools.cbegin(); it != protectedTools.cend(); ++it)
+                if (it->messageId == sourceId && !presentTools.contains(it.key())) parts.append(it->part);
+        message.insert(QStringLiteral("parts"), parts);
         if (!id.isEmpty()) {
             const bool outsideWindow = kind != QStringLiteral("history_page") && !runtime_->messages.contains(id) &&
                                        !runtime_->oldest.isEmpty() && id < runtime_->oldest;
@@ -1935,17 +2455,27 @@ void RemoteAgentPanel::renderMessages() {
                 if (projection) continue;
                 if (kind == QStringLiteral("tool")) {
                     flush();
-                    // 宿主仅为 curl 失败发送不含原始日志的静态摘要；它也参与 fingerprint，
-                    // 使同 id/state 的迟到摘要能够刷新。其它工具仍不显示参数或执行结果。
+                    // Detail version and real source identity participate in the
+                    // fingerprint even when tool/state have not changed.
                     QJsonObject tool{{QStringLiteral("id"), partIdentity(part, index)},
+                                      {QStringLiteral("messageId"), sourceId},
                                       {QStringLiteral("tool"), part.value(QStringLiteral("tool"))},
                                       {QStringLiteral("state"), part.value(QStringLiteral("state"))}};
+                    for (const QString& name : {QStringLiteral("callId"), QStringLiteral("detailRevision"),
+                                                 QStringLiteral("detailsAvailable")})
+                        if (part.contains(name)) tool.insert(name, part.value(name));
+                    // New snapshots contain no full fields. Legacy inline data
+                    // stays readable, with an explicit completeness boundary.
+                    if (!part.value(QStringLiteral("detailsAvailable")).toBool())
+                        for (const QString& name : toolDetailFields())
+                            if (part.contains(name)) tool.insert(name, part.value(name));
                     if (part.value(QStringLiteral("tool")) == QStringLiteral("curl") &&
                         part.value(QStringLiteral("state")) == QStringLiteral("error")) {
                         const QString summary = part.value(QStringLiteral("error")).toString();
                         if (!summary.isEmpty() && summary.size() <= 256)
                             tool.insert(QStringLiteral("error"), summary);
                     }
+                    syncToolDetailMetadata(tool);
                     tools.append(tool);
                 } else {
                     flushTools();
@@ -2029,6 +2559,10 @@ void RemoteAgentPanel::renderMessages() {
             RemoteToolGroupCard* group = runtime_->toolGroups.value(segment.id, nullptr);
             if (!group) {
                 group = new RemoteToolGroupCard(segment.id);
+                group->activated = [this](const QJsonObject& tool, const QString& field) {
+                    activateToolDetail(tool, field);
+                };
+                group->presentation = [this](const QJsonObject& tool) { return toolDetailPresentation(tool); };
                 runtime_->view->addWidget(segment.id, group);
                 runtime_->toolGroups.insert(segment.id, group);
             }
@@ -2044,6 +2578,12 @@ void RemoteAgentPanel::renderMessages() {
     for (int index = segments.size() - 2; index >= 0; --index)
         runtime_->view->moveItemBefore(segments[index].id, segments[index + 1].id);
     runtime_->view->endBatchUpdates();
+    const auto refresh = runtime_->toolRefresh;
+    runtime_->toolRefresh.clear();
+    for (const QString& key : refresh)
+        if (runtime_->toolDetails.value(key).expanded)
+            for (const QString& field : toolDetailFields()) requestToolDetailPage(key, field);
+    refreshToolDetailViews();
     updateThinking();
     if (followedLatest) runtime_->view->scrollToBottom();
 }

@@ -11,13 +11,16 @@
 #include "MaiSqliteStore.h"
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <httplib.h>
 #include <json.hpp>
+#include <memory>
 #include <optional>
+#include <sqlite3.h>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -864,14 +867,321 @@ static void captureContract() {
     CHECK(probe.released.load());
     std::puts("PASS: screen capture schema, dispatch, delay cancellation and owned PNG cleanup");
 }
+// Details are read from owned, persisted tool records. No model, command, host
+// callback or external file is involved; closing before writes also exercises
+// the same SQLite recovery path as a normal application restart.
+static void toolDetailContract(const std::string& only = "") {
+    struct Fixture {
+        MaiFilePath root = MaiFileSystem::temporaryDirectory().append(
+            MaiFilePath::fromUtf8("mai-mobile-tool-detail-" + MaiIdGenerator::newEventId()));
+        void* agent = nullptr;
+        ~Fixture() {
+            maiMobileAgentDestroy(agent);
+            MaiFileSystem::removeRecursively(root);
+        }
+    } fixture;
+    CHECK(!MaiFileSystem::createDirectories(fixture.root));
+    const std::string database = fixture.root.toUtf8() + "/sessions.db";
+    const Json config{{"op", "configure"},
+                      {"model", "test"},
+                      {"apiKey", "unused-owned-fixture"},
+                      {"baseUrl", "http://127.0.0.1:9"},
+                      {"workspace", fixture.root.toUtf8()},
+                      {"database", database}};
+    const auto reopen = [&] {
+        fixture.agent = maiMobileAgentCreate();
+        CHECK(fixture.agent != nullptr);
+        CHECK(call(fixture.agent, config).at("ok") == true);
+    };
+    const auto close = [&] {
+        maiMobileAgentDestroy(fixture.agent);
+        fixture.agent = nullptr;
+    };
+    reopen();
+    const std::string owner = call(fixture.agent, {{"op", "create"}}).at("id");
+    const std::string other = call(fixture.agent, {{"op", "create"}}).at("id");
+    close();
+    MaiToolPart tool;
+    tool.tool = "owned_recorded_tool";
+    tool.callId = only == "call_id" ? std::string(50 * 1024, 'c') : "call_owned_detail";
+    tool.input = R"({"query":"owned recorded arguments","literal":"\\n"})";
+    // A scalar straddles the default byte page. It must be delivered intact on
+    // the next page, rather than introducing a replacement into valid text.
+    tool.output = std::string(4095, 'a') + "\xe4\xb8\xad\xf0\x9f\x98\x84" + std::string(5000, 'z');
+    tool.error = "owned recorded failure\nsecond line";
+    tool.state = MaiToolState::Error;
+    MaiMessage message;
+    message.id = MaiIdGenerator::newMessageId();
+    message.role = MaiRole::Assistant;
+    message.created = MaiTime::getCurrentTime();
+    message.completed = message.created;
+    const std::string partId = MaiIdGenerator::newPartId();
+    const std::string textPartId = MaiIdGenerator::newPartId();
+    message.parts.push_back({partId, tool, message.created});
+    message.parts.push_back({textPartId, MaiTextPart{"owned sibling text"}, message.created});
+    {
+        auto store = makeMaiSqliteStore(database);
+        CHECK(store);
+        store.value()->putMessage(owner, message);
+        CHECK(!store.value()->lastWriteError());
+    }
+    reopen();
+    const Json base{{"op", "tool_detail"},     {"session", owner}, {"requestId", "owned-detail-read"},
+                    {"messageId", message.id}, {"partId", partId}, {"field", "output"}};
+    if (only == "binding") {
+        // A request below the control-message budget must not become a larger
+        // failure just because an invalid JSON binding value is echoed back.
+        Json oversized{{"op", "tool_detail"},
+                       {"session", "s"},
+                       {"requestId", "r"},
+                       {"messageId", "m"},
+                       {"partId", "p"},
+                       {"field", "input"},
+                       {"offset", std::string(65400, 'a')}};
+        CHECK(oversized.dump().size() < 64 * 1024);
+        const auto invalidOffset = call(fixture.agent, oversized);
+        std::fprintf(stderr, "OBSERVE: malformed offset request=%zu response=%zu bytes\n", oversized.dump().size(),
+                     invalidOffset.dump().size());
+        CHECK(invalidOffset.dump().size() < 64 * 1024);
+        CHECK(invalidOffset.at("ok") == false && invalidOffset.at("errorCode") == "invalid_input");
+        CHECK(invalidOffset.at("offset") == 0 && invalidOffset.at("requestId") == "r");
+        for (const char* key : {"requestId", "session", "messageId", "partId", "field", "offset"}) {
+            for (const auto& value : {Json(std::string(65400, 'a')), Json{{"nested", std::string(65400, 'a')}},
+                                      Json::array({"invalid", "binding"})}) {
+                Json request = base;
+                request[key] = value;
+                const auto response = call(fixture.agent, request);
+                CHECK(response.dump().size() < 64 * 1024);
+                CHECK(response.at("ok") == false && response.at("errorCode") == "invalid_input");
+                const std::string responseKey = std::strcmp(key, "session") == 0 ? "sessionId" : key;
+                CHECK(response.at(responseKey) == (std::strcmp(key, "offset") == 0 ? Json(0) : Json("")));
+                CHECK(!response.contains("text") && !response.contains("rawBase64"));
+                if (std::strcmp(key, "messageId") != 0) CHECK(response.at("messageId") == message.id);
+                if (std::strcmp(key, "partId") != 0) CHECK(response.at("partId") == partId);
+            }
+        }
+        std::puts("PASS: malformed tool-detail bindings remain bounded and retain valid identities");
+        return;
+    }
+    if (only == "call_id") {
+        for (const char* op : {"snapshot", "remote_snapshot", "messages_page", "message"}) {
+            const auto response =
+                call(fixture.agent, {{"op", op}, {"session", owner}, {"force", true}, {"id", message.id}});
+            CHECK(response.at("ok") == true && response.at("messages").size() == 1);
+            const auto& projectedMessage = response.at("messages").at(0);
+            const auto& projected = projectedMessage.at("parts").at(0);
+            std::fprintf(stderr, "OBSERVE: %s projected message=%zu bytes callId_present=%d\n", op,
+                         projectedMessage.dump().size(), projected.contains("callId") ? 1 : 0);
+            CHECK(!projected.contains("callId"));
+            CHECK(projectedMessage.dump().size() < 48 * 1024);
+            CHECK(projected.at("detailsAvailable") == true);
+            const auto original = call(fixture.agent, base);
+            CHECK(original.at("ok") == true && original.at("callId") == tool.callId);
+            CHECK(original.at("detailRevision") == projected.at("detailRevision"));
+        }
+        std::puts("PASS: oversized optional call IDs are omitted without truncating the source revision");
+        return;
+    }
+    const auto bound = [&](const Json& response, const Json& request) {
+        CHECK(response.at("requestId") == request.at("requestId"));
+        CHECK(response.at("sessionId") == request.at("session"));
+        CHECK(response.at("messageId") == request.at("messageId"));
+        CHECK(response.at("partId") == request.at("partId"));
+        const std::string field = request.at("field");
+        CHECK(response.at("field") == (field == "input" || field == "output" || field == "error" ? field : ""));
+        const auto requestedOffset = request.value("offset", Json(0));
+        const auto expectedOffset = requestedOffset.is_number_integer() && (requestedOffset.is_number_unsigned() ||
+                                                                            requestedOffset.get<std::int64_t>() >= 0)
+                                        ? requestedOffset
+                                        : Json(0);
+        CHECK(response.at("offset") == expectedOffset);
+    };
+    const auto rejected = [&](const Json& request, const char* code) {
+        const Json response = call(fixture.agent, request);
+        bound(response, request);
+        CHECK(response.at("ok") == false);
+        CHECK(response.at("errorCode") == code);
+        CHECK(!response.contains("text") && !response.contains("rawBase64"));
+    };
+    Json first = call(fixture.agent, base);
+    CHECK(first.at("ok") == true);
+    bound(first, base);
+    CHECK(first.at("callId") == tool.callId && first.at("tool") == tool.tool);
+    CHECK(first.at("state") == "error");
+    CHECK(first.at("offset") == 0 && first.at("totalBytes") == tool.output.size());
+    CHECK(first.at("sourceBytesRead") == 4095 && first.at("nextOffset") == 4095);
+    CHECK(first.at("text") == std::string(4095, 'a'));
+    CHECK(first.at("textIsValidUtf8") == true && first.at("hasMore") == true);
+    CHECK(!first.contains("rawBase64"));
+    const std::string revision = first.at("detailRevision");
+    CHECK(!revision.empty());
+    std::string assembled = first.at("text");
+    Json page = first;
+    while (page.at("hasMore") == true) {
+        Json request = base;
+        request["offset"] = page.at("nextOffset");
+        request["detailRevision"] = revision;
+        page = call(fixture.agent, request);
+        bound(page, request);
+        CHECK(page.at("ok") == true && page.at("detailRevision") == revision);
+        CHECK(page.at("totalBytes") == tool.output.size());
+        CHECK(page.at("textIsValidUtf8") == true && !page.contains("rawBase64"));
+        CHECK(page.at("sourceBytesRead").get<std::size_t>() == page.at("text").get<std::string>().size());
+        CHECK(page.at("nextOffset").get<std::size_t>() ==
+              (page.at("hasMore").get<bool>()
+                   ? request.at("offset").get<std::size_t>() + page.at("sourceBytesRead").get<std::size_t>()
+                   : 0));
+        CHECK(page.at("sourceBytesRead").get<std::size_t>() > 0);
+        assembled += page.at("text").get<std::string>();
+    }
+    CHECK(assembled == tool.output);
+    CHECK(page.at("nextOffset") == 0);
+    for (const char* field : {"input", "error"}) {
+        Json request = base;
+        request["field"] = field;
+        request["detailRevision"] = revision;
+        const Json response = call(fixture.agent, request);
+        bound(response, request);
+        CHECK(response.at("ok") == true && response.at("detailRevision") == revision);
+        CHECK(response.at("text") == (std::strcmp(field, "input") == 0 ? tool.input : tool.error));
+        CHECK(response.at("hasMore") == false);
+    }
+    for (const char* op : {"snapshot", "remote_snapshot", "messages_page", "message"}) {
+        Json request{{"op", op}, {"session", owner}, {"force", true}, {"id", message.id}};
+        const Json response = call(fixture.agent, request);
+        CHECK(response.at("ok") == true && response.at("messages").size() == 1);
+        const Json& projected = response.at("messages").at(0).at("parts").at(0);
+        CHECK(projected.at("callId") == tool.callId);
+        CHECK(projected.at("detailRevision") == revision && projected.at("detailsAvailable") == true);
+        CHECK(projected.at("input") == tool.input && projected.at("output") == tool.output &&
+              projected.at("error") == tool.error);
+    }
+    for (const auto& change :
+         {Json{{"session", other}}, Json{{"session", "ses_absent"}}, Json{{"messageId", "msg_absent"}},
+          Json{{"partId", "prt_absent"}}, Json{{"partId", textPartId}}}) {
+        Json request = base;
+        request.update(change);
+        rejected(request, "not_found");
+    }
+    for (const auto& change : {Json{{"field", "path"}}, Json{{"field", "metadata"}}, Json{{"offset", -1}},
+                               Json{{"offset", 1.5}}, Json{{"offset", "0"}}, Json{{"offset", tool.output.size() + 1}},
+                               Json{{"limit", 0}}, Json{{"limit", -1}}, Json{{"limit", 4097}}, Json{{"limit", "4096"}},
+                               Json{{"limit", 1.5}}, Json{{"offset", 4096}}, Json{{"offset", 4095}, {"limit", 1}}}) {
+        Json request = base;
+        request.update(change);
+        request["detailRevision"] = revision;
+        rejected(request, "invalid_input");
+    }
+    Json unboundContinuation = base;
+    unboundContinuation["offset"] = 4095;
+    rejected(unboundContinuation, "invalid_input");
+    Json eof = base;
+    eof["offset"] = tool.output.size();
+    eof["detailRevision"] = revision;
+    const Json emptyPage = call(fixture.agent, eof);
+    bound(emptyPage, eof);
+    CHECK(emptyPage.at("ok") == true && emptyPage.at("text") == "");
+    CHECK(emptyPage.at("sourceBytesRead") == 0 && emptyPage.at("hasMore") == false);
+    close();
+    // Same-length changes invalidate the whole-part revision; a size-only token
+    // would incorrectly let a client append pages from two different outputs.
+    std::get<MaiToolPart>(message.parts.front().body).output.front() = 'b';
+    const std::string invalidPartId = MaiIdGenerator::newPartId();
+    MaiToolPart invalid = tool;
+    invalid.callId = "call_owned_invalid_utf8";
+    invalid.output = "owned legacy fixture placeholder";
+    message.parts.push_back({invalidPartId, invalid, message.created});
+    {
+        auto store = makeMaiSqliteStore(database);
+        CHECK(store);
+        store.value()->putMessage(owner, message);
+        CHECK(!store.value()->lastWriteError());
+    }
+    // Ordinary writes correctly normalize UTF-8. A legacy-reader test therefore
+    // creates its own row normally, then injects exact historical bytes through
+    // a bound BLOB->TEXT update. No production store behavior is bypassed outside
+    // this disposable, closed fixture database.
+    const std::string legacyBytes("\xff\x80x", 3);
+    {
+        sqlite3* rawDatabase = nullptr;
+        const int opened = sqlite3_open_v2(database.c_str(), &rawDatabase, SQLITE_OPEN_READWRITE, nullptr);
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> legacy(rawDatabase, sqlite3_close);
+        CHECK(opened == SQLITE_OK);
+        sqlite3_stmt* rawUpdate = nullptr;
+        const int prepared =
+            sqlite3_prepare_v2(legacy.get(),
+                               "UPDATE parts SET output=CAST(?1 AS TEXT) WHERE id=?2 AND message_id=?3 "
+                               "AND message_id IN (SELECT id FROM messages WHERE session_id=?4)",
+                               -1, &rawUpdate, nullptr);
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> update(rawUpdate, sqlite3_finalize);
+        CHECK(prepared == SQLITE_OK);
+        CHECK(sqlite3_bind_blob(update.get(), 1, legacyBytes.data(), static_cast<int>(legacyBytes.size()),
+                                SQLITE_TRANSIENT) == SQLITE_OK);
+        CHECK(sqlite3_bind_text(update.get(), 2, invalidPartId.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK);
+        CHECK(sqlite3_bind_text(update.get(), 3, message.id.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK);
+        CHECK(sqlite3_bind_text(update.get(), 4, owner.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK);
+        CHECK(sqlite3_step(update.get()) == SQLITE_DONE && sqlite3_changes(legacy.get()) == 1);
+        update.reset();
+        sqlite3_stmt* rawRead = nullptr;
+        const int readPrepared = sqlite3_prepare_v2(
+            legacy.get(), "SELECT CAST(output AS BLOB),typeof(output) FROM parts WHERE id=?1 AND message_id=?2", -1,
+            &rawRead, nullptr);
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> read(rawRead, sqlite3_finalize);
+        CHECK(readPrepared == SQLITE_OK);
+        CHECK(sqlite3_bind_text(read.get(), 1, invalidPartId.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK);
+        CHECK(sqlite3_bind_text(read.get(), 2, message.id.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK);
+        CHECK(sqlite3_step(read.get()) == SQLITE_ROW);
+        CHECK(sqlite3_column_bytes(read.get(), 0) == 3);
+        CHECK(std::memcmp(sqlite3_column_blob(read.get(), 0), legacyBytes.data(), legacyBytes.size()) == 0);
+        CHECK(std::strcmp(reinterpret_cast<const char*>(sqlite3_column_text(read.get(), 1)), "text") == 0);
+        std::fprintf(stderr, "OBSERVE: owned legacy tool output stored_bytes=%d\n",
+                     sqlite3_column_bytes(read.get(), 0));
+    }
+    reopen();
+    Json stale = base;
+    stale["offset"] = 4095;
+    stale["detailRevision"] = revision;
+    rejected(stale, "busy");
+    const Json changed = call(fixture.agent, base);
+    CHECK(changed.at("ok") == true && changed.at("detailRevision") != revision);
+    Json invalidRequest = base;
+    invalidRequest["partId"] = invalidPartId;
+    const Json invalidPage = call(fixture.agent, invalidRequest);
+    bound(invalidPage, invalidRequest);
+    CHECK(invalidPage.at("ok") == true && invalidPage.at("textIsValidUtf8") == false);
+    CHECK(invalidPage.at("sourceBytesRead") == 3 && invalidPage.at("nextOffset") == 0);
+    CHECK(invalidPage.at("totalBytes") == 3 && invalidPage.at("hasMore") == false);
+    CHECK(invalidPage.at("rawBase64") == "/4B4");
+    CHECK(invalidPage.at("text") == "\xef\xbf\xbd\xef\xbf\xbdx");
+    std::puts("PASS: stored tool detail C ABI identity, pagination, revision, UTF-8 and ownership");
+}
+
 // 作用：按测试场景构造移动 Agent、调用公开接口并核对结果。
 // 按真实调用顺序检查输入和可观察结果，失败时保留定位所需的上下文。
 int main(int argc, char** argv) {
     const bool captureOnly = argc == 2 && std::strcmp(argv[1], "--capture-contract-only") == 0;
     const bool cameraOnly = argc == 2 && std::strcmp(argv[1], "--camera-routing-contract-only") == 0;
-    if (argc != 1 && !captureOnly && !cameraOnly) {
-        std::fputs("usage: MaiMobileAgentTests [--capture-contract-only|--camera-routing-contract-only]\n", stderr);
+    const bool detailOnly = argc == 2 && std::strcmp(argv[1], "--tool-detail-contract-only") == 0;
+    const bool bindingOnly = argc == 2 && std::strcmp(argv[1], "--tool-detail-binding-contract-only") == 0;
+    const bool callIdOnly = argc == 2 && std::strcmp(argv[1], "--tool-detail-call-id-contract-only") == 0;
+    if (argc != 1 && !captureOnly && !cameraOnly && !detailOnly && !bindingOnly && !callIdOnly) {
+        std::fputs(
+            "usage: MaiMobileAgentTests "
+            "[--capture-contract-only|--camera-routing-contract-only|--tool-detail-contract-only|"
+            "--tool-detail-binding-contract-only|--tool-detail-call-id-contract-only]\n",
+            stderr);
         return 2;
+    }
+    if (argc == 1 || detailOnly || bindingOnly || callIdOnly) {
+        try {
+            if (argc == 1 || detailOnly) toolDetailContract();
+            if (!callIdOnly) toolDetailContract("binding");
+            if (!bindingOnly) toolDetailContract("call_id");
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "FAIL: tool detail contract: %s\n", error.what());
+            return 1;
+        }
+        if (detailOnly || bindingOnly || callIdOnly) return 0;
     }
     try {
         libraryExportDomainContract();

@@ -1,0 +1,579 @@
+{
+  "baseline": "04890bb7f0162f43967602f668bf4c1b631a56ff",
+  "parent_at_freeze": "d27cb80b7ffd2a039f4877d58cf474af3486dc03",
+  "source_count": 34,
+  "sources": [
+    {
+      "path": "MaiAgent/Agent/MaiAgent.cpp",
+      "raw_bytes": 78454,
+      "raw_sha256": "65268e9bfb2778150ca99da6961faf493e12bb7572d7471e07f9ca96e6e75fd5",
+      "canonical_bytes": 78454,
+      "canonical_sha256": "65268e9bfb2778150ca99da6961faf493e12bb7572d7471e07f9ca96e6e75fd5",
+      "git_blob": "dfdfb1865ea7520616833f4655aeafa34ef35c4e"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiContextCompactor.cpp",
+      "raw_bytes": 38300,
+      "raw_sha256": "df8b38b5d8e2170a604db6b2b8e629de0d29bf37cd0e92e7c9d967a0a34459a8",
+      "canonical_bytes": 38300,
+      "canonical_sha256": "df8b38b5d8e2170a604db6b2b8e629de0d29bf37cd0e92e7c9d967a0a34459a8",
+      "git_blob": "12fcaf325a3824add37dba2287725b57a6e1f68c"
+    },
+    {
+      "path": "MaiAgent/Agent/MaiToolDetail.cpp",
+      "raw_bytes": 6492,
+      "raw_sha256": "4796bc485f3ae9a9c08a00ae8955fb055a57eaa4e3dceb893b02b55bb106536e",
+      "canonical_bytes": 6492,
+      "canonical_sha256": "4796bc485f3ae9a9c08a00ae8955fb055a57eaa4e3dceb893b02b55bb106536e",
+      "git_blob": "e9a5fe4f660da6b13817860f8dce862ba3a3557b"
+    },
+    {
+      "path": "MaiAgent/CMakeLists.txt",
+      "raw_bytes": 39115,
+      "raw_sha256": "197dd0bfd13fe4532aa8dce28659eacb1e36834204531a3679da4ba6fdfd6659",
+      "canonical_bytes": 39115,
+      "canonical_sha256": "197dd0bfd13fe4532aa8dce28659eacb1e36834204531a3679da4ba6fdfd6659",
+      "git_blob": "c3fb92c0a9dca088e861175d548094ab3b18caa8"
+    },
+    {
+      "path": "MaiAgent/include/MaiAgent.h",
+      "raw_bytes": 21581,
+      "raw_sha256": "95a8144719bf47d6d86b520e546dbceb7d6095cfdaf910c1f1d78f513d441d99",
+      "canonical_bytes": 21581,
+      "canonical_sha256": "95a8144719bf47d6d86b520e546dbceb7d6095cfdaf910c1f1d78f513d441d99",
+      "git_blob": "74d980c5a9e317635e50fdbd8fe6a7019d24567d"
+    },
+    {
+      "path": "MaiAgent/include/MaiToolDetail.h",
+      "raw_bytes": 2459,
+      "raw_sha256": "6b3d6f83ad1e04c13a9c8edd0bc9b9694f82fab0d6fca2513c44c8e550592cfc",
+      "canonical_bytes": 2459,
+      "canonical_sha256": "6b3d6f83ad1e04c13a9c8edd0bc9b9694f82fab0d6fca2513c44c8e550592cfc",
+      "git_blob": "52ee7f5c3641582f50eecc072df542dfdd6d1682"
+    },
+    {
+      "path": "MaiAgent/tests/MaiContextCompactorTests.cpp",
+      "raw_bytes": 90729,
+      "raw_sha256": "1430f7d58ea8b29dca45a9abe04913809c25eaa37df5a556bd8d3ea91a6b65fe",
+      "canonical_bytes": 90729,
+      "canonical_sha256": "1430f7d58ea8b29dca45a9abe04913809c25eaa37df5a556bd8d3ea91a6b65fe",
+      "git_blob": "515bb05a46bfe45bae22e445ce10b2eee9a5d945"
+    },
+    {
+      "path": "MaiAgent/tests/MaiToolTests.cpp",
+      "raw_bytes": 47586,
+      "raw_sha256": "621e26506ddb0ef0fa974f6af7200d505bf40748d1b28e0f943541021f8509b1",
+      "canonical_bytes": 47586,
+      "canonical_sha256": "621e26506ddb0ef0fa974f6af7200d505bf40748d1b28e0f943541021f8509b1",
+      "git_blob": "fded51c3681e01f7eb193d21d06c3edeac113c7d"
+    },
+    {
+      "path": "MaiChat/MobileAgentAdapter/MaiMobileAgent.cpp",
+      "raw_bytes": 120801,
+      "raw_sha256": "5f04021a8c4df9c7b6ae412557a6cf8b533e7a3dbd5a697d6ebf7df07a992fc3",
+      "canonical_bytes": 120801,
+      "canonical_sha256": "5f04021a8c4df9c7b6ae412557a6cf8b533e7a3dbd5a697d6ebf7df07a992fc3",
+      "git_blob": "906ebdc8560f90b8c19d746031661d511eb9342e"
+    },
+    {
+      "path": "MaiChat/MobileAgentAdapter/MaiMobileAgent.h",
+      "raw_bytes": 7864,
+      "raw_sha256": "894fd9e5ed9731d044f9cfb50bf7c080aeb5caaa0ef9ce68bf7f5fe81dae4e61",
+      "canonical_bytes": 7864,
+      "canonical_sha256": "894fd9e5ed9731d044f9cfb50bf7c080aeb5caaa0ef9ce68bf7f5fe81dae4e61",
+      "git_blob": "a955397a297168f764202e267bf988fc0e3e995f"
+    },
+    {
+      "path": "MaiChat/MobileAgentAdapter/tests/MaiMobileAgentTests.cpp",
+      "raw_bytes": 104040,
+      "raw_sha256": "cae1aec5a7bd911bd61c93366757d44d19e4b6d86b33b49f88d59ebed7ae20ed",
+      "canonical_bytes": 104040,
+      "canonical_sha256": "cae1aec5a7bd911bd61c93366757d44d19e4b6d86b33b49f88d59ebed7ae20ed",
+      "git_blob": "c2a400e52992c2a92122bb336e199cb8be602cd8"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/androidTest/java/com/kongshang/maichat/AIAssistantInstrumentedTest.java",
+      "raw_bytes": 76041,
+      "raw_sha256": "c1acf87f1c514eca474a94a5d8ab59b953e61866df659f350348b5e80a0d2007",
+      "canonical_bytes": 76041,
+      "canonical_sha256": "c1acf87f1c514eca474a94a5d8ab59b953e61866df659f350348b5e80a0d2007",
+      "git_blob": "7f23b41535c7ef7802977497cb09476d22455d28"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/main/java/assistant/com/kongshang/maichat/AIAssistantController.java",
+      "raw_bytes": 212537,
+      "raw_sha256": "f626d74249a470fa6e8806ee249bdc97126d24c1fb44fcd54298f3636521f8f0",
+      "canonical_bytes": 208879,
+      "canonical_sha256": "177e007ed9d7cefa4c419e066896d1b399628c7c3d153c4ca862e19002387bae",
+      "git_blob": "735fe148cc823b62818ec359810a139a0599052f"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/main/java/assistant/com/kongshang/maichat/AIAssistantPanel.java",
+      "raw_bytes": 209408,
+      "raw_sha256": "7dd4f6f1f08f5810da582009ae765759a7c83d1dea362cf5b1ff2ac03fa3816b",
+      "canonical_bytes": 205750,
+      "canonical_sha256": "dd0da26a33c35d8587324c928045950be3cba765e30ae39e899b0e431e447ca4",
+      "git_blob": "b2cb4c9587034ab421f24de5e23d9e29c2231ad8"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/main/java/assistant/com/kongshang/maichat/AIAssistantToolDetails.java",
+      "raw_bytes": 21358,
+      "raw_sha256": "783cfdf98cd0a8866073b284e3dcabb997e8449ea00dc4993cd15bb24947c81e",
+      "canonical_bytes": 21358,
+      "canonical_sha256": "783cfdf98cd0a8866073b284e3dcabb997e8449ea00dc4993cd15bb24947c81e",
+      "git_blob": "c49e61fdfe9a807280a160e828d5b90011e95c0f"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/main/java/assistant/com/kongshang/maichat/AndroidSessionSyncCoordinator.java",
+      "raw_bytes": 36844,
+      "raw_sha256": "55057d31b7886732981b9f76ab528df06305f643a77986e5259b1bad11ea4f84",
+      "canonical_bytes": 36163,
+      "canonical_sha256": "9b8beb6e2c4486cb292c45d98a19f018e36b064bacac172d2000c942edfe76d7",
+      "git_blob": "d89cc3414ed1ae8cb8fe721a18853870355ab5e6"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/test/java/com/kongshang/maichat/AIAssistantToolDetailsTest.java",
+      "raw_bytes": 22176,
+      "raw_sha256": "d6ceee345c119d6129af64e0cdd8bdc4ea03c631b69edf767dc658316bba0e4c",
+      "canonical_bytes": 21863,
+      "canonical_sha256": "b8e40e6ac7566424a171c9bc3338cba2939599e5b4f26f8e980d1358f3420b0b",
+      "git_blob": "863a8eb602b36821df729774fb6ec76b5cd27c7b"
+    },
+    {
+      "path": "MaiChat/android/MaiChat/app/src/test/java/com/kongshang/maichat/SessionSyncPayloadAssemblerTest.java",
+      "raw_bytes": 6608,
+      "raw_sha256": "31389dbb5adc06908651d9b9aa4bfd5307bc496d77d3e522ca6ec7dbb1298ec5",
+      "canonical_bytes": 6608,
+      "canonical_sha256": "31389dbb5adc06908651d9b9aa4bfd5307bc496d77d3e522ca6ec7dbb1298ec5",
+      "git_blob": "1e149112e0e00ccc1402ed84dc477f374ab77d6b"
+    },
+    {
+      "path": "MaiChat/desktop/CMakeLists.txt",
+      "raw_bytes": 108021,
+      "raw_sha256": "099809bdb8e1117d66b464bcc8e3eeea543dcd735e662bb281bfc3f05e275c93",
+      "canonical_bytes": 106041,
+      "canonical_sha256": "94fee909c48e2e159eea765f8d3385577ca311ef140577c2edc80027da5bbda4",
+      "git_blob": "710bf387b24a05fc767acd15af06d05d8a1cb134"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopSessionSyncCoordinator.cpp",
+      "raw_bytes": 67326,
+      "raw_sha256": "e1533632adac6c36714084881ab1de192a200991c68ede2ce81428712b71d28e",
+      "canonical_bytes": 66107,
+      "canonical_sha256": "411a3f5fc691829e292e555cdfccfb2dbc74935bb981fdc592df12caf94a69fa",
+      "git_blob": "151d6fcc0aa84650388efe9b24c5a913365a8b53"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopSessionSyncCoordinator.h",
+      "raw_bytes": 7277,
+      "raw_sha256": "e68a06f851bcda0a879c038eacdec66b228a15d2fcfc225637d125e02c713633",
+      "canonical_bytes": 7112,
+      "canonical_sha256": "0676b7d43dddb786e7f82446999655eb06efcc58f94a64d70914994898c404d9",
+      "git_blob": "7aac14c4b97dd1036ba50e3ba5bbd49dfa42a5cd"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopSessionSyncHost.cpp",
+      "raw_bytes": 41552,
+      "raw_sha256": "fc1612fd5da635deba8452423b7a491a845f3b0b84bf0f8dff3850c320e86658",
+      "canonical_bytes": 40904,
+      "canonical_sha256": "5d002a6bfa9a59d14977b6337e959bdb57255ee1b6701d6096fc1b9fd6a0c119",
+      "git_blob": "e1d928b947d5c152e4933b25f87dd02ca2a0963f"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/DesktopSessionSyncHost.h",
+      "raw_bytes": 2521,
+      "raw_sha256": "e4d53e9f2471a74a139e6b9fd9661beeb9c2f7819d0f68a71d184273a05f383c",
+      "canonical_bytes": 2475,
+      "canonical_sha256": "4f827a6a5e3cea1e5ba8813e1c462bae4245a4a8512cb97f74e2a209c5850bbe",
+      "git_blob": "9830ee68f36140d3b7c8cb51c9667a52d93ab600"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/RemoteAgentPanel.cpp",
+      "raw_bytes": 155881,
+      "raw_sha256": "a0e6070cadbacfd87a8c259e6ed165599c185b8ca47479b80cca909072a37f2e",
+      "canonical_bytes": 153037,
+      "canonical_sha256": "31076bf93918ec5d5d8f935d9bcdd17a86a9226af520cf4e2f494020734a0b72",
+      "git_blob": "77d23e7fc7f821b43812ed82c3670341133b597c"
+    },
+    {
+      "path": "MaiChat/desktop/src/agent/RemoteAgentPanel.h",
+      "raw_bytes": 3885,
+      "raw_sha256": "e7606ea156dedca61b9978e7cd238bf54d05e7cd792e3cf8189260416cea3b0b",
+      "canonical_bytes": 3811,
+      "canonical_sha256": "33300526aa387c80f81c928c29f16ce5f5600f00610e5bde396e64d82045daf9",
+      "git_blob": "a69805976aab3d6393cd11f9c2a103697c8c2ce6"
+    },
+    {
+      "path": "MaiChat/desktop/src/ui/MainWindow.cpp",
+      "raw_bytes": 413830,
+      "raw_sha256": "84296c254baf03c6cb7cf1e2c7a0d8b5fbb67067a54dffb0e1989a251244d327",
+      "canonical_bytes": 413830,
+      "canonical_sha256": "84296c254baf03c6cb7cf1e2c7a0d8b5fbb67067a54dffb0e1989a251244d327",
+      "git_blob": "ca8292b4e24b69f1ed761de4caf7a88ae94ad10f"
+    },
+    {
+      "path": "MaiChat/desktop/tests/DesktopSessionSyncHostTest.cpp",
+      "raw_bytes": 265243,
+      "raw_sha256": "43609057712b6df4f126b4e378051ada505a0ebeabe13685b412b41558ff81eb",
+      "canonical_bytes": 260947,
+      "canonical_sha256": "9cafe486ffabf41c580df30dab844d00c402842c2f7a53ec0eab718e2dd2cc0c",
+      "git_blob": "5a96e042009e0e6dedea010c6395f546667de35f"
+    },
+    {
+      "path": "MaiChat/desktop/tests/RemoteToolDetailTest.cpp",
+      "raw_bytes": 33079,
+      "raw_sha256": "6964f01c0fa5f4947ca494d4f54352eecbd619d21e03806040e175d5b2368ee0",
+      "canonical_bytes": 33079,
+      "canonical_sha256": "6964f01c0fa5f4947ca494d4f54352eecbd619d21e03806040e175d5b2368ee0",
+      "git_blob": "9ba5a7e7cbc2b4fe13365932daddde9afc02d708"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/Assistant/AIAssistantModel.swift",
+      "raw_bytes": 326706,
+      "raw_sha256": "188d0adaae73ddfd727da4a5b679a3129d6f80da342fa038df10051f17f9fd3e",
+      "canonical_bytes": 320514,
+      "canonical_sha256": "cba89143c7700d4714e34c425b551de3b77bcec1af86c9cf5dabee88f28c26ec",
+      "git_blob": "d4eb54c10c53ecd1e40faf0241abd1db34101123"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/Assistant/AIAssistantView.swift",
+      "raw_bytes": 281272,
+      "raw_sha256": "458c70fad0bc156bc0a6bb47cb98f56a02f994e59f1afc4f0d03bcc3b2ce5653",
+      "canonical_bytes": 275621,
+      "canonical_sha256": "647a2ca1cd2d7d7a2f1b9ab7d3d2492c46f91e3b4dd1857a12463400c6b8d48e",
+      "git_blob": "64a81a9d7d0edcf22b40e59f9986c6a8a392803b"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/DebugSupport/AIAssistantModel+UITesting.swift",
+      "raw_bytes": 62616,
+      "raw_sha256": "5738f5f7e66010cbfdfc877ad20c0be2f497d8f0d874e8e5b6dbdf9dc3b1e1f7",
+      "canonical_bytes": 61691,
+      "canonical_sha256": "5d814391b9680adc4659b1f61c0eff94278b12061f41e9f5d4c2c987ab6024bf",
+      "git_blob": "fd3b7e7eb8927e44d0874b5eb7b9daaee9d1e320"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/DebugSupport/AIAssistantUITestFixtures.swift",
+      "raw_bytes": 51977,
+      "raw_sha256": "7cbc9e3d353c892cca87d75c8d9d12290f2eff2c3e2254079498611e43b9ad5b",
+      "canonical_bytes": 51005,
+      "canonical_sha256": "6c096d3863ff761d15d813a2e3c579370c1522863ee9df89c1e62ac4661e692c",
+      "git_blob": "0c7267988b5a8585b8ecf97030802a324ec2ac91"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChat/DebugSupport/AppUITestSupport.swift",
+      "raw_bytes": 28646,
+      "raw_sha256": "8cfc2d7d29e12af84d8e5787dc46bb80faa16522483508922424d1da092f5b24",
+      "canonical_bytes": 28107,
+      "canonical_sha256": "74e4e551ecf5f0449f79d2efb752a29356b522b1be389069ac23a2720ba16d82",
+      "git_blob": "364920a00b7bc3df5c8ad5c9daf2e217f3011277"
+    },
+    {
+      "path": "MaiChat/ios/MaiChat/MaiChatUITests/AIAssistantUITests.swift",
+      "raw_bytes": 309322,
+      "raw_sha256": "d7114a9eeefc4ca6f49e738bac96e5e2119eaa6e5ea1b76944bc353dd7abc105",
+      "canonical_bytes": 303753,
+      "canonical_sha256": "836a58cbe06c1beed6f74b3727fd058ec595d5b04c5dbf9daa78320b558deec4",
+      "git_blob": "75fbb5c0638c6f5d402bc3000b97f5f005ef0034"
+    }
+  ],
+  "product_trees": {
+    "MaiAgent": "807679c649b37e4f7157a86ed38d15625e791513",
+    "MaiChat": "ed41543fadb21e07a95cb8f16eec4170e4029d8d"
+  },
+  "method": "Source-only temporary index; root diagnostics excluded from product trees. Real index untouched.",
+  "evidence": [
+    {
+      "path": ".cache\\remote-tool-detail-20261111\\root\\final-core-proof.json",
+      "bytes": 18214,
+      "sha256": "e9fc1ef23406331965a8cc7922d7b4173d9bfbe02f61b641fe6d9cd034ea842b"
+    },
+    {
+      "path": ".cache\\remote-tool-detail-20261111\\ui-cross-history-final-20261111T064236969\\ui-final-proof.json",
+      "bytes": 8658,
+      "sha256": "5c6fc88ea4e344ec224c1cc4284aab4207c2dc325056fadd0959f5b50aa81e07"
+    },
+    {
+      "path": ".cache\\remote-tool-detail-20261111\\root\\final-cross-history-normal-app-smoke.json",
+      "bytes": 1989,
+      "sha256": "2eb41e441f4f216870f5e7de9b36e73a44bdf4e361e031c9fa58ad9b17aefb01"
+    },
+    {
+      "path": ".cache\\remote-tool-detail-20261111\\android\\final-proof\\android-final-proof.json",
+      "bytes": 29153,
+      "sha256": "2641b2d523e078890b27c2994e94250e77fa17424972be097f1b9f4ec3c904f4"
+    },
+    {
+      "path": ".cache\\remote-tool-detail-20261111\\ios\\received-ios-v1-apply-receipt.json",
+      "bytes": 3978,
+      "sha256": "70ce16b4618a446dc727f0afaaa2bf64d13a1d951eaf7dc32d37860a61db8a68"
+    },
+    {
+      "path": ".cache\\remote-tool-detail-20261111\\ios\\received-ios-v2-apply-receipt.json",
+      "bytes": 3510,
+      "sha256": "54d993e4b02489d88c17a361947985f38afff8cd99eee9edf841a5b4b577bbfb"
+    },
+    {
+      "path": ".cache\\remote-tool-detail-20261111\\service\\receipt.json",
+      "bytes": 567,
+      "sha256": "9c5c75ced6205765ae23188bc5c5d9ae38f34bc9523d2b9adc1f93dc443f8f25"
+    },
+    {
+      "path": ".cache\\remote-tool-detail-20261111\\ios\\received-ios-visual-test-apply-receipt.json",
+      "bytes": 974,
+      "sha256": "38e19a6b1068924a115fb005bf08d98b40032c627cb6425a3ccc5a99cac2553d"
+    },
+    {
+      "path": ".cache\\remote-tool-detail-20261111\\ios\\final-source-cross-platform-check.json",
+      "bytes": 2992,
+      "sha256": "b2210d5f9e14dc23aa5114c3775f7be57d206b08f68a142883e37540a0235b61"
+    }
+  ],
+  "limits": [
+    "No deployed cross-device WS acceptance, paid model replay, user DB access, installation or new Release.",
+    "Android component UI compiled and packaged; not executed because no compatible ARM device/image."
+  ],
+  "received_mac_evidence": [
+    {
+      "received_file": "144115251141768230-1794378449-93889562.json",
+      "bytes": 11554,
+      "sha256": "b50025db10f6351a414844ff207d588d1a0d4bd2b23a001977580e03f15edec7"
+    },
+    {
+      "received_file": "144115251141768230-1794378449-73607602.log",
+      "bytes": 623,
+      "sha256": "d364efa9bee74ffcb2f86b629ba0707c0a26b3e4caebb41a778779617237cce4"
+    },
+    {
+      "received_file": "144115251141768230-1794378450-71824393.json",
+      "bytes": 522,
+      "sha256": "9d284433b166cddee55acbe8c48a6f8b8ef13f2fabca93522ad1b5932473f027"
+    },
+    {
+      "received_file": "144115251141768230-1794380232-28863233.log",
+      "bytes": 31395,
+      "sha256": "5284d0935124587b76806979ccee057de28d1a1a4d56833969193177ff5b5273"
+    },
+    {
+      "received_file": "144115251141768230-1794381194-45312287.json",
+      "bytes": 1056,
+      "sha256": "d8c8ead98e2b7a39e0cca88b4a4f0731e09bcad797c0f99ebcaf16bfd0b43c25"
+    },
+    {
+      "received_file": "144115251141768230-1794381194-5562050.json",
+      "bytes": 6262,
+      "sha256": "3c23168f06113498190449530bdc413741b898a3e3e1a42bdfe94bc144d55076"
+    },
+    {
+      "received_file": "144115251141768230-1794380400-89889889.png",
+      "bytes": 202527,
+      "sha256": "20e853f2ec73c82ff83a3ee5fe92c04eb8fb1b8161e3b2ae1444983c0c99e596"
+    },
+    {
+      "received_file": "144115251141768230-1794381194-97701578.png",
+      "bytes": 452905,
+      "sha256": "d806b13c384fd9d71b5ed095ec97162bea9baeff849b762e4d499810c8745199"
+    },
+    {
+      "received_file": "144115251141768230-1794381193-79584264.log",
+      "bytes": 19358,
+      "sha256": "15bcaad3c2914ca0954e735dfc4c5088ff11dd1f6683a6220190a42933e1baf5"
+    },
+    {
+      "received_file": "144115251141768230-1794382006-32744360.json",
+      "bytes": 420,
+      "sha256": "d5f05dbbdb3f1d752d77ec984cc6d4c6b20acc1d531584e80c79cf1ca39e5c8e"
+    },
+    {
+      "received_file": "144115251141768230-1794382006-8652251.log",
+      "bytes": 3781,
+      "sha256": "707d34f0361ffc3ce7a05a286203e91414b6b61f3299a4ce40e83b09b43043b5"
+    },
+    {
+      "received_file": "144115251141768230-1794382006-49785277.json",
+      "bytes": 582,
+      "sha256": "7c1d36e9811653a6dcc8815dedeed7b1b795fc269c88baef491af31a10752ddb"
+    },
+    {
+      "received_file": "144115251141768230-1794382476-40263462.json",
+      "bytes": 7025,
+      "sha256": "6a8288b3b900f27af7849d0c40de9843c15489f4800aaecf9e3357f5eacaf91c"
+    },
+    {
+      "received_file": "144115251141768230-1794382476-29853838.log",
+      "bytes": 4037,
+      "sha256": "94b86c0197f82932d1f8564df193d131dd2904bf5abd66068fd998b68ee547da"
+    },
+    {
+      "received_file": "144115251141768230-1794382477-76851717.log",
+      "bytes": 637,
+      "sha256": "576b1596781c8a7283086bedbdaa58c5a352a08458bf01a36179d654e6d1eb5b"
+    },
+    {
+      "received_file": "144115251141768230-1794382477-91518580.json",
+      "bytes": 1476,
+      "sha256": "f9c44b22e182e54ad9052cb3443d358970a29a3ab3a0b9d56e1c04c3824ba47d"
+    },
+    {
+      "received_file": "144115251141768230-1794382841-60668123.json",
+      "bytes": 801,
+      "sha256": "cf9802a5b61e73f08b9da22342c1d048c1d87ef9fcee14c62f3243f34f51e683"
+    },
+    {
+      "received_file": "144115251141768230-1794382841-53159775.log",
+      "bytes": 8010,
+      "sha256": "86240599aca90d14cbf99f841e3355d7c65db96f12eafbba39f2d8e7a198a398"
+    },
+    {
+      "received_file": "144115251141768230-1794382954-32472894.json",
+      "bytes": 8961,
+      "sha256": "953b87d2c3d1b1d55009834bfcfe8bd7efddcefc9fcc63d6b63478fab9e2cbf1"
+    },
+    {
+      "received_file": "144115251141768230-1794382955-59226292.json",
+      "bytes": 4175,
+      "sha256": "40932ba40a8c54a7347bac4532ea24585cd01f462f61e0cdaafb6793c3e673e8"
+    },
+    {
+      "received_file": "144115251141768230-1794382955-65163170.log",
+      "bytes": 12678,
+      "sha256": "4f67ab3b4a2291c0e27f6dad294257525086f0e557906c63a01a3575d32aab63"
+    },
+    {
+      "received_file": "144115251141768230-1794382955-35097387.log",
+      "bytes": 272277,
+      "sha256": "7c3237cbf0f792c78bd11005c7b07bf0073a05468a5e1f2135958b7a7b007869"
+    },
+    {
+      "received_file": "144115251141768230-1794382955-77052608.json",
+      "bytes": 392,
+      "sha256": "f85f3ff35f3b6dedb60f3ba61447121844edab40673037279f5ffbf2012f4ef8"
+    }
+  ],
+  "layer_results": {
+    "windows_core": {
+      "passed": 13,
+      "failed": 0,
+      "seconds": 189.39
+    },
+    "windows_desktop": {
+      "new_ui_passed": 15,
+      "new_ui_failed": 0,
+      "full_host_passed": 90,
+      "full_host_failed": 0,
+      "full_host_skipped": 1,
+      "skip": "Independent opt-in temporary image TLS fixture not provided",
+      "native_owned_ui_passed": 4,
+      "native_owned_ui_failed": 0,
+      "normal_build_deploy_pe_exit": 0,
+      "smoke_exit": 0,
+      "smoke_pid": 44232,
+      "smoke_exe_sha256": "d677f5cafe94a11698bc55dc286cbd7c7cc9d903acd470b6d06948f0ef3e3c38"
+    },
+    "android": {
+      "normal_default_dual_abi_build_exit": 0,
+      "full_build_duration": "11m5s",
+      "java_package_cohorts": [
+        "21s",
+        "18s"
+      ],
+      "targeted_groups": 9,
+      "tests": 83,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "component_ui_compiled_packaged": true,
+      "component_ui_executed": false
+    },
+    "simulator_cabi": {
+      "same_object_sha256": "c76ae9e917ccc66ffc2b470851bdeb4e48b976e0c1f76a71c1b1feba5dcf5dd6",
+      "test_source_sha256": "cae1aec5a7bd911bd61c93366757d44d19e4b6d86b33b49f88d59ebed7ae20ed",
+      "old_op_library_exit": 1,
+      "v1_binding_exit": 1,
+      "v1_large_call_id_exit": 1,
+      "v2_detail_contract_exit": 0
+    },
+    "ios_simulator": {
+      "normal_debug_build_exit": 0,
+      "uikit_passed": 3,
+      "uikit_failed": 0,
+      "uikit_seconds": 34.745,
+      "release_build_exit": 0,
+      "release_build_seconds": 104.176947125,
+      "release_version": "2.2.4",
+      "release_build": "203",
+      "release_exe_sha256": "0053fd2e1079b34559dab1bd85ecddd00b96e15f78212cc924952b403dda48c1",
+      "release_macho_images": 9,
+      "debug_macho_images": 11,
+      "test_markers_absent_in_all_release_images": true,
+      "production_reader_symbol_linked": true,
+      "visible_ascii_page_height_points": 2230.33,
+      "visible_ascii_tail_image_inspected_by_root": true,
+      "ocr_observer_pass_claimed": false,
+      "scope": "Owned fixture, synthetic peer transport and actual ordinary C ABI; no production WS/physical iPhone acceptance",
+      "additional_geometry_cohort": {
+        "passed": 1,
+        "failed": 0,
+        "test_seconds": 12.542,
+        "process_seconds": 15.36566575,
+        "debug_exe_sha256": "f22181aa90a0a0c7c4bb5b7605c0b6ef7d14e5dbafc0ec19c59743aa28a8000d",
+        "debug_dylib_sha256": "df0ad87d8139fe40c154d42612641f2299b04dcf50cedbe9636bd7755eab4afb",
+        "product_five_unchanged": true,
+        "prior_three_tests_rerun": false,
+        "ocr_dependency": false
+      }
+    },
+    "mac_desktop": {
+      "normal_app_host_build_exit": 0,
+      "new_ui_target_first_make_reentry": "First invocation No rule after Make regeneration; separate target build succeeded",
+      "new_ui_raw_log_pending": false,
+      "full_host_passed": 89,
+      "full_host_failed": 1,
+      "full_host_skipped": 1,
+      "failed_slot": "coordinatorWaitsForPendingImagePublishBeforeUpload",
+      "failed_original_budget_ms": 3000,
+      "same_exe_exact_env_single_slot_passed": 3,
+      "same_exe_exact_env_single_slot_failed": 0,
+      "full_host_marked_green": false,
+      "first_full_failure_root_cause_confirmed": false,
+      "normal_smoke_exit": 0,
+      "normal_smoke_pid": 10914,
+      "normal_smoke_exe_sha256": "c00f4db9537cbc9bc7f6513664485cfc4dd30db86a37392ae15db20a6713b32f",
+      "new_ui_passed": 15,
+      "new_ui_failed": 0,
+      "new_ui_exe_sha256": "15bcdcd6056963aa794572e157dcb181448194d1c3964ee8c0088d0bb9e520fb",
+      "host_exe_sha256": "a67b8182cf064ef26628e60bcb1b83d9e6b8c12d303e0b550a339445c964e5b9",
+      "runtime_qt_version": "6.12.0",
+      "loaded_module_path_observation_available": false,
+      "final_normal_three_target_build_exit": 0,
+      "final_normal_three_target_build_seconds": 6.1451671668328345,
+      "final_build_same_smoked_exe": true
+    },
+    "service_loopback": {
+      "production_service_changes": false,
+      "exit": 0,
+      "pid": 37752,
+      "elapsed_ms": 231,
+      "viewer_slots": 4,
+      "states": [
+        "running",
+        "completed",
+        "error"
+      ],
+      "history_preserved": true,
+      "large_payload_chunks": 2,
+      "other_account_status": 404,
+      "production_deployment_acceptance": false
+    }
+  },
+  "summary_fix_commit": "d27cb80b7ffd2a039f4877d58cf474af3486dc03",
+  "source_count_note": "Combined baseline-to-final product source files, including two summary sources already committed in the parent. Root diagnostics do not affect product trees.",
+  "acceptance_limits": [
+    "Mac full Host cohort retains one failure despite exact-env single-slot pass; not relabeled all green.",
+    "iOS actual normal Simulator UI and C ABI tested with owned data; production cross-device WebSocket deployment and physical iPhone not accepted.",
+    "Android normal ARM packages compiled/linked; no compatible device/image for component UI execution.",
+    "No new package Release, installation, user App replacement, user DB read, real command replay or paid model request.",
+    "Semantic local document retrieval is a separate pending scope and has no product implementation in this change."
+  ],
+  "line_endings": "All six iOS Mac LF raw/canonical fingerprints verified; Root Windows raw is the exact CRLF rendering of those blobs. Raw equality across platforms is not claimed.",
+  "final_mac_source_receipt_verified": true
+}

@@ -87,4 +87,19 @@ public class SessionSyncPayloadAssemblerTest {
             AndroidSessionSyncCoordinator.fingerprint(remote, first),
             AndroidSessionSyncCoordinator.fingerprint(remote, different));
     }
+
+    @Test public void detailReadFingerprintSeparatesEverySourcePage() throws Exception {
+        JSONObject owner = new JSONObject().put("device_slot", "mac")
+            .put("login_session_id", "login").put("id", "session");
+        JSONObject request = new JSONObject().put("action", "get_tool_detail")
+            .put("requestId", "request").put("messageId", "message").put("partId", "part")
+            .put("field", "output").put("offset", 0).put("limit", 4096).put("detailRevision", "revision");
+        String first = AndroidSessionSyncCoordinator.fingerprint(owner, request);
+        for (String field : new String[] {"messageId", "partId", "field", "detailRevision"})
+            assertNotEquals(field + " is part of a read-only detail request",
+                first, AndroidSessionSyncCoordinator.fingerprint(owner, new JSONObject(request.toString()).put(field, "different")));
+        for (String field : new String[] {"offset", "limit"})
+            assertNotEquals(field + " is part of a source-byte page",
+                first, AndroidSessionSyncCoordinator.fingerprint(owner, new JSONObject(request.toString()).put(field, 17)));
+    }
 }

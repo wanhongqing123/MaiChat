@@ -1091,6 +1091,11 @@ target_include_directories(desktop_session_sync_host_test PRIVATE ../MaiChatTool
 target_link_libraries(desktop_session_sync_host_test PRIVATE remote_im_desktop_ui
   remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 add_test(NAME desktop_session_sync_host_test COMMAND desktop_session_sync_host_test)
+add_executable(remote_tool_detail_test tests/RemoteToolDetailTest.cpp)
+target_include_directories(remote_tool_detail_test PRIVATE ../MaiChatTools)
+target_link_libraries(remote_tool_detail_test PRIVATE remote_im_desktop_ui
+  remote_im_desktop_app remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
+add_test(NAME remote_tool_detail_test COMMAND remote_tool_detail_test)
 add_executable(desktop_session_sync_channel_test
   tests/DesktopSessionSyncChannelTest.cpp)
 target_include_directories(desktop_session_sync_channel_test PRIVATE

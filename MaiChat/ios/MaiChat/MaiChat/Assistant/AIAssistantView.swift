@@ -979,6 +979,7 @@ private struct AIAssistantMessageList: View {
                                         AIMessageRow(message: message,
                                                      workspacePath: model.selectedRemote == nil ? model.workspacePath : "",
                                                      remoteImageOwner: model.remoteImageOwner,
+                                                     remoteToolStates: model.remoteToolDetailStates(for: message),
                                                      questionAnswerEchoes: model.questionAnswerEchoes(for: message),
                                                      quote: {
                                                          guard message.questionProjection != true else { return }
@@ -1580,6 +1581,9 @@ struct AIMessageRow: View, Equatable {
     let message: AIMessage
     let workspacePath: String
     var remoteImageOwner: AIRemoteImageOwner? = nil
+    // Accepted detail receipts may advance state before the next snapshot arrives.
+    // This display-only map also invalidates the equatable row/group header.
+    var remoteToolStates: [String: String] = [:]
     var questionAnswerEchoes: [String: String] = [:]
     let quote: () -> Void
     var canPublishVideo = false
@@ -1601,6 +1605,7 @@ struct AIMessageRow: View, Equatable {
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message && lhs.workspacePath == rhs.workspacePath &&
             lhs.remoteImageOwner == rhs.remoteImageOwner &&
+            lhs.remoteToolStates == rhs.remoteToolStates &&
             lhs.questionAnswerEchoes == rhs.questionAnswerEchoes &&
             lhs.canPublishVideo == rhs.canPublishVideo &&
             lhs.imagePreviewSourceID == rhs.imagePreviewSourceID &&
@@ -1766,7 +1771,12 @@ struct AIMessageRow: View, Equatable {
     }
 
     @ViewBuilder private func toolGroup(_ toolParts: [AIPart]) -> some View {
-        if let stage = seedanceStage(in: toolParts) {
+        let displayTools = toolParts.map { original in
+            var copy = original
+            if let state = remoteToolStates[original.id] { copy.state = state }
+            return copy
+        }
+        if let stage = seedanceStage(in: displayTools) {
             Label {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(stage.title).font(AppTypography.detail.weight(.semibold))
@@ -1784,20 +1794,33 @@ struct AIMessageRow: View, Equatable {
             .background((stage.failed ? Color.red : Color.blue).opacity(0.08),
                         in: RoundedRectangle(cornerRadius: 12))
         }
-        AIExpandableBlock(title: toolDisclosureTitle(for: toolParts)) {
+        AIExpandableBlock(title: toolDisclosureTitle(for: displayTools),
+                          identifier: "agent-tool-group-" + (toolParts.first?.id ?? "")) {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(toolParts) { tool in
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("\(tool.tool ?? "工具") · \(toolStatus(tool.state))")
+                        Text("\(tool.tool ?? "工具") · \(toolStatus(remoteToolStates[tool.id] ?? tool.state))")
                             .font(AssistantMessageFont.detail.weight(.semibold))
-                        Text(tool.input ?? "")
-                            .font(AssistantMessageFont.detailMonospaced)
-                        if let output = tool.output, !output.isEmpty {
-                            Text(output)
+                        if let owner = remoteImageOwner, tool.usesRemoteToolDetails {
+                            if toolParts.count == 1 {
+                                AIRemoteToolDetailPane(owner: owner, messageID: message.id, part: tool)
+                            } else {
+                                // Opening a large group does not read every tool. Only the
+                                // selected item's disclosure mounts its three first pages.
+                                AIExpandableBlock(title: "参数、输出和错误",
+                                                  identifier: "agent-tool-detail-" + tool.id) {
+                                    AIRemoteToolDetailPane(owner: owner, messageID: message.id, part: tool)
+                                }
+                            }
+                        } else {
+                            Text(tool.input ?? "")
                                 .font(AssistantMessageFont.detailMonospaced)
-                        }
-                        if let error = tool.error, !error.isEmpty {
-                            Text(error).font(AssistantMessageFont.detail).foregroundStyle(.red)
+                            if let output = tool.output, !output.isEmpty {
+                                Text(output).font(AssistantMessageFont.detailMonospaced)
+                            }
+                            if let error = tool.error, !error.isEmpty {
+                                Text(error).font(AssistantMessageFont.detail).foregroundStyle(.red)
+                            }
                         }
                     }
                     if tool.id != toolParts.last?.id { Divider() }
@@ -2844,13 +2867,86 @@ private struct AIThinkingIndicator: View {
     }
 }
 
+/// Details remain separate from AIPart: owner paths in recorded output must never
+/// become local media actions. The same disclosure works online and with warm cache.
+private struct AIRemoteToolDetailPane: View {
+    @ObservedObject private var model = AIAssistantModel.shared
+    let owner: AIRemoteImageOwner
+    let messageID: String
+    let part: AIPart
+
+    private var state: AIRemoteToolDetailsState? {
+        model.remoteToolDetailState(owner: owner, messageID: messageID, partID: part.id)
+    }
+    private var identity: String {
+        [owner.accountID, owner.slot, owner.loginSessionID, owner.sessionID,
+         String(owner.selectionGeneration), messageID, part.id, part.toolDetailIdentity].joined(separator: "|")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(AIRemoteToolDetailField.allCases, id: \.self) { field in
+                fieldView(field, state?.fields[field] ?? AIRemoteToolDetailFieldState())
+            }
+            Button("从头读取") {
+                Task { await model.loadRemoteToolDetails(owner: owner, messageID: messageID, part: part, refresh: true) }
+            }
+            .accessibilityIdentifier("tool-detail-restart-" + part.id)
+            .disabled(state?.fields.values.contains(where: \.loading) == true)
+        }
+        .task(id: identity) { await model.loadRemoteToolDetails(owner: owner, messageID: messageID, part: part) }
+        .onDisappear { model.cancelRemoteToolDetails(owner: owner, messageID: messageID, partID: part.id) }
+    }
+
+    private func fieldView(_ field: AIRemoteToolDetailField, _ value: AIRemoteToolDetailFieldState) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(field.title).font(AssistantMessageFont.detail.weight(.semibold))
+            if value.retainedFromOffset > 0 {
+                Text("较早的内容已收起，可从头读取。")
+                    .font(AssistantMessageFont.detail).foregroundStyle(.secondary)
+            }
+            if value.loaded {
+                Text(value.text.isEmpty ? "（空）" : value.text)
+                    .font(AssistantMessageFont.detailMonospaced)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("tool-detail-text-" + field.rawValue + "-" + part.id)
+            }
+            if value.containsInvalidUtf8 {
+                Text("原记录含无效 UTF-8，预览使用替换字符；原页字节可在下方查看。")
+                    .font(AssistantMessageFont.detail).foregroundStyle(.secondary)
+                if !value.rawBase64Pages.isEmpty {
+                    AIExpandableBlock(title: "原页 Base64") {
+                        Text(value.rawBase64Pages.joined(separator: "\n"))
+                            .font(AssistantMessageFont.detailMonospaced).textSelection(.enabled)
+                    }
+                }
+            }
+            if value.loading { ProgressView("读取中…").font(AssistantMessageFont.detail) }
+            if let error = value.error {
+                Text(error).font(AssistantMessageFont.detail).foregroundStyle(.red)
+                    .accessibilityIdentifier("tool-detail-error-" + field.rawValue + "-" + part.id)
+            }
+            if value.hasMore {
+                Button("继续加载 \(field.title)（\(value.sourceBytesRead)/\(value.totalBytes) 字节）") {
+                    Task { await model.loadMoreRemoteToolDetail(owner: owner, messageID: messageID, part: part, field: field) }
+                }
+                .accessibilityIdentifier("tool-detail-more-" + field.rawValue + "-" + part.id)
+                .disabled(value.loading)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 private struct AIExpandableBlock<Content: View>: View {
     let title: String
+    let identifier: String
     let content: Content
     @State private var expanded = false
 
-    init(title: String, @ViewBuilder content: () -> Content) {
+    init(title: String, identifier: String = "", @ViewBuilder content: () -> Content) {
         self.title = title
+        self.identifier = identifier
         self.content = content()
     }
 
@@ -2864,7 +2960,7 @@ private struct AIExpandableBlock<Content: View>: View {
                 }
                 .foregroundStyle(.secondary)
                 .frame(minHeight: 32)
-            }.buttonStyle(.plain)
+            }.buttonStyle(.plain).accessibilityIdentifier(identifier)
             if expanded { content }
         }
     }

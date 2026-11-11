@@ -2476,6 +2476,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         TextView status;
         final Map<String, TextView> toolSummaries = new HashMap<>();
         final Map<String, LinearLayout> toolGroups = new HashMap<>();
+        final Map<String, Button> toolDetailActions = new HashMap<>();
+        final Map<String, Button> toolDetailRestarts = new HashMap<>();
+        final Map<String, String> requestedToolDetails = new HashMap<>();
         MessageRow() {
             super(activity);
             setOrientation(VERTICAL);
@@ -2497,6 +2500,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     status = null;
                     toolSummaries.clear();
                     toolGroups.clear();
+                    toolDetailActions.clear(); toolDetailRestarts.clear(); requestedToolDetails.clear();
                     setGravity(Gravity.TOP | Gravity.CENTER_HORIZONTAL);
                     addView(welcomeContent(), matchWrap());
                 }
@@ -2505,8 +2509,18 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             setGravity(Gravity.NO_GRAVITY);
             setMinimumHeight(0);
             // question 工具沿原片段顺序投影成正常正文；视图切换或历史重载也走同一路径。
-            JSONArray array = AIAssistantQuestionConversation.parts(value.optJSONArray("parts"),
+            JSONArray sourceParts = AIAssistantQuestionConversation.parts(value.optJSONArray("parts"),
                 value.optJSONArray("questionAnswerEchoes"));
+            JSONArray array = new JSONArray();
+            JSONObject detailSnapshots = state == null ? null : state.data.optJSONObject("toolDetails");
+            for (int i = 0; i < sourceParts.length(); i++) {
+                JSONObject part = sourceParts.optJSONObject(i);
+                JSONObject cached = part == null || detailSnapshots == null ? null : detailSnapshots.optJSONObject(
+                    AIAssistantToolDetails.key(value.optString("id"), part.optString("id")));
+                // The adopted read-only state owns both group and individual titles. A
+                // Completed detail must not remain labeled Running until the next history frame.
+                array.put(AIAssistantToolDetails.visiblePart(part, cached));
+            }
             // Only adjacent tools share a disclosure. Text/media keep their original
             // positions, and a group's first stable part ID owns its expanded state.
             String[] kinds = new String[array.length()];
@@ -2564,6 +2578,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 status = null;
                 toolSummaries.clear();
                 toolGroups.clear();
+                toolDetailActions.clear(); toolDetailRestarts.clear(); requestedToolDetails.clear();
                 if (outgoing) {
                     LinearLayout bubble = column();
                     TextView body = MaiChatTypography.body(activity);
@@ -2716,6 +2731,27 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             parts.put(id + ":detail", detail);
                             if (kind.equals("tool") && !deliveredMedia) toolDetails.addView(detail, lp);
                             else addView(detail, lp);
+                            if (kind.equals("tool") && part.optBoolean("detailsAvailable")
+                                && !AIAssistantToolDetails.hasInlineDetails(part)) {
+                                for (String field : AIAssistantToolDetails.FIELDS) {
+                                    Button load = button("", "读取工具" + AIAssistantToolDetails.fieldTitle(field), clicked -> {
+                                        JSONObject current = currentToolPart(id);
+                                        if (current != null) controller.loadToolDetail(state, message.optString("id"), current, field, true, true);
+                                    });
+                                    toolDetailActions.put(id + ":" + field, load);
+                                    if (!deliveredMedia) toolDetails.addView(load, matchWrap());
+                                    else addView(load, matchWrap());
+                                    Button restart = button("从头读取" + AIAssistantToolDetails.fieldTitle(field),
+                                        "从头读取工具" + AIAssistantToolDetails.fieldTitle(field), clicked -> {
+                                            JSONObject current = currentToolPart(id);
+                                            if (current != null) controller.loadToolDetail(state, message.optString("id"), current, field, false, true);
+                                        });
+                                    restart.setVisibility(GONE);
+                                    toolDetailRestarts.put(id + ":" + field, restart);
+                                    if (!deliveredMedia) toolDetails.addView(restart, matchWrap());
+                                    else addView(restart, matchWrap());
+                                }
+                            }
                         }
                         if (kind.equals("tool")) {
                             Button preview = button("预览 PDF", "预览生成的 PDF", clicked -> {
@@ -2848,9 +2884,34 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                         view.setText(stage == null ? toolStatus(part.optString("state")) + " "
                             + part.optString("tool") + "  ›" : stage + "  ›");
                         TextView detail = parts.get(id + ":detail");
-                        if (detail != null)
-                            detail.setText(part.optString("input") + "\n"
-                                + part.optString("output") + "\n" + part.optString("error"));
+                        if (detail != null) {
+                            JSONObject allDetails = state.data.optJSONObject("toolDetails");
+                            JSONObject cached = allDetails == null ? null : allDetails.optJSONObject(
+                                AIAssistantToolDetails.key(value.optString("id"), id));
+                            detail.setText(AIAssistantToolDetails.displayText(part, cached));
+                            for (String field : AIAssistantToolDetails.FIELDS) {
+                                Button load = toolDetailActions.get(id + ":" + field);
+                                if (load == null) continue;
+                                JSONObject page = cached == null ? null : cached.optJSONObject(field);
+                                boolean loading = page != null && page.optBoolean("loading");
+                                load.setEnabled(!loading);
+                                load.setText((page != null && page.optBoolean("hasMore") ? "继续加载" :
+                                    page != null && page.has("error") ? "重试读取" : "重新读取")
+                                    + AIAssistantToolDetails.fieldTitle(field));
+                                Button restart = toolDetailRestarts.get(id + ":" + field);
+                                if (restart != null) {
+                                    restart.setVisibility(page != null && page.optBoolean("prefixOmitted")
+                                        && page.optBoolean("hasMore") ? VISIBLE : GONE);
+                                    restart.setEnabled(!loading);
+                                }
+                            }
+                            if (part.optBoolean("detailsAvailable") && !AIAssistantToolDetails.hasInlineDetails(part)) {
+                                String request = AIAssistantToolDetails.key(value.optString("id"), id);
+                                String revision = part.optString("detailRevision");
+                                if (!revision.equals(requestedToolDetails.put(request, revision)))
+                                    controller.loadToolDetails(state, value.optString("id"), part);
+                            }
+                        }
                         Button pdfCard = pdfCards.get(id);
                         if (pdfCard != null) {
                             String path = pdfPathFromToolOutput(part);
@@ -2893,6 +2954,14 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     }
                 }
             updateTime();
+        }
+        private JSONObject currentToolPart(String id) {
+            JSONArray values = message == null ? null : message.optJSONArray("parts");
+            if (values != null) for (int i = 0; i < values.length(); i++) {
+                JSONObject part = values.optJSONObject(i);
+                if (part != null && id.equals(part.optString("id"))) return part;
+            }
+            return null;
         }
         @Override
         protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {

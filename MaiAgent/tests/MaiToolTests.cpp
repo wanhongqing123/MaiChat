@@ -36,6 +36,8 @@
 #include "MaiTool.h"
 #include "MaiFileTools.h"
 #include "MaiPathGuard.h"
+#include "MaiMemoryStore.h"
+#include "MaiToolDetail.h"
 
 namespace fs = std::filesystem;
 using nlohmann::json;
@@ -806,6 +808,183 @@ void test_cancel_stops_traversal() {
     CHECK(!r.hasError() || r.error().code() != MaiErrorCode::Internal);
 }
 
+// 详情只能回查已落库的原调用；分页不能执行命令、解析路径或把下一版输出混入当前页。
+void test_tool_detail_pages_and_revision_binding() {
+    auto store = makeMaiMemoryStore();
+    MaiSession session;
+    session.id = "ses_detail";
+    store->putSession(session);
+    MaiSession other;
+    other.id = "ses_other";
+    store->putSession(other);
+    MaiToolPart tool;
+    tool.tool = "command";
+    tool.callId = "call_original";
+    tool.input = R"({"command":"fixture only; never executed","cwd":"/not-read"})";
+    tool.output = std::string(4095, 'x') + "\u4f60\U0001f642" + std::string(4099, 'y');
+    tool.error = "stored fixture error";
+    tool.state = MaiToolState::Running;
+    MaiMessage message;
+    message.id = "msg_detail";
+    message.role = MaiRole::Assistant;
+    message.parts.push_back({"prt_tool", tool, 1});
+    message.parts.push_back({"prt_text", MaiTextPart{"not a tool"}, 1});
+    store->putMessage(session.id, message);
+    const std::string revision = maiToolDetailRevision(tool);
+    CHECK(revision.size() == 64);
+    CHECK(revision.find_first_not_of("0123456789abcdef") == std::string::npos);
+
+    for (const char* field : {"input", "output", "error"}) {
+        MaiToolDetailQuery query;
+        query.messageId = message.id;
+        query.partId = "prt_tool";
+        query.field = field;
+        std::string assembled;
+        do {
+            const auto result = maiReadToolDetail(*store, session.id, query);
+            CHECK(result.isOk());
+            if (!result) break;
+            const auto& page = result.value();
+            CHECK(page.messageId == message.id && page.partId == "prt_tool");
+            CHECK(page.callId == tool.callId && page.tool == tool.tool);
+            CHECK(page.state == MaiToolState::Running && page.revision == revision);
+            CHECK(page.field == field && page.offsetBytes == assembled.size());
+            CHECK(page.sourceBytesRead == page.text.size() && page.text.size() <= 4096);
+            CHECK(page.textIsValidUtf8);
+            assembled += page.text;
+            query.offsetBytes = page.nextOffsetBytes;
+            query.expectedRevision = page.revision;
+            CHECK(query.offsetBytes == 0 || query.offsetBytes == assembled.size());
+        } while (query.offsetBytes != 0);
+        CHECK(assembled == (query.field == "input"    ? tool.input
+                            : query.field == "output" ? tool.output
+                                                      : tool.error));
+    }
+
+    MaiToolDetailQuery query;
+    query.messageId = message.id;
+    query.partId = "prt_tool";
+    query.field = "output";
+    const auto first = maiReadToolDetail(*store, session.id, query);
+    CHECK(first && first.value().sourceBytesRead == 4095 && first.value().nextOffsetBytes == 4095);
+    query.offsetBytes = 4095;
+    CHECK(maiReadToolDetail(*store, session.id, query).error().code() ==
+          MaiErrorCode::InvalidInput);
+    query.expectedRevision = revision;
+    auto changed = tool;
+    changed.output += "next generation";
+    message.parts[0].body = changed;
+    store->putMessage(session.id, message);
+    const auto stale = maiReadToolDetail(*store, session.id, query);
+    CHECK(stale.error().code() == MaiErrorCode::Busy);
+    CHECK(stale.error().message().find("detail_changed") != std::string::npos);
+    query.offsetBytes = 0;
+    CHECK(maiReadToolDetail(*store, session.id, query).error().code() == MaiErrorCode::Busy);
+    query.expectedRevision.clear();
+    CHECK(maiReadToolDetail(*store, session.id, query).value().revision != revision);
+
+    for (int field = 0; field < 6; ++field) {
+        auto different = tool;
+        if (field == 0) different.tool += "x";
+        if (field == 1) different.callId += "x";
+        if (field == 2) different.input += "x";
+        if (field == 3) different.output += "x";
+        if (field == 4) different.error += "x";
+        if (field == 5) different.state = MaiToolState::Completed;
+        CHECK(maiToolDetailRevision(different) != revision);
+    }
+    MaiToolPart left, right;
+    left.tool = "a";
+    left.callId = "bc";
+    right.tool = "ab";
+    right.callId = "c";
+    CHECK(maiToolDetailRevision(left) != maiToolDetailRevision(right));
+    CHECK(maiReadToolDetail(*store, other.id, query).error().code() == MaiErrorCode::NotFound);
+    query.messageId = "msg_missing";
+    CHECK(maiReadToolDetail(*store, session.id, query).error().code() == MaiErrorCode::NotFound);
+    query.messageId = message.id;
+    for (const char* part : {"prt_missing", "prt_text"}) {
+        query.partId = part;
+        CHECK(maiReadToolDetail(*store, session.id, query).error().code() ==
+              MaiErrorCode::NotFound);
+    }
+    MaiMessage saved;
+    CHECK(store->getMessage(session.id, message.id, saved));
+    CHECK(std::get<MaiToolPart>(saved.parts[0].body).output == changed.output);
+    CHECK(saved.completed == 0 && store->listMessages(session.id).size() == 1);
+}
+
+void test_tool_detail_utf8_and_invalid_queries() {
+    auto store = makeMaiMemoryStore();
+    MaiSession session;
+    session.id = "ses_utf8_detail";
+    store->putSession(session);
+    MaiToolPart tool;
+    tool.output = "A\u4f60\U0001f642Z";
+    // 非法旧字节含孤立续字节、过长编码、代理项、越界标量、截断序列和NUL。
+    tool.error = std::string("\x80\xc0\xaf\xed\xa0\x80\xf4\x90\x80\x80\xe2\x82\0", 13);
+    MaiMessage message;
+    message.id = "msg_utf8_detail";
+    message.parts.push_back({"prt_utf8_detail", tool, 0});
+    store->putMessage(session.id, message);
+    MaiToolDetailQuery query;
+    query.messageId = message.id;
+    query.partId = "prt_utf8_detail";
+    query.field = "output";
+    query.maxBytes = 4;
+    const auto first = maiReadToolDetail(*store, session.id, query);
+    CHECK(first && first.value().text == "A\u4f60" && first.value().nextOffsetBytes == 4);
+    query.expectedRevision = maiToolDetailRevision(tool);
+    query.offsetBytes = 4;
+    const auto second = maiReadToolDetail(*store, session.id, query);
+    CHECK(second && second.value().text == "\U0001f642" && second.value().nextOffsetBytes == 8);
+    query.offsetBytes = 8;
+    CHECK(maiReadToolDetail(*store, session.id, query).value().text == "Z");
+    query.offsetBytes = 9;
+    const auto end = maiReadToolDetail(*store, session.id, query);
+    CHECK(end && end.value().text.empty() && end.value().nextOffsetBytes == 0);
+    for (const auto offset : {std::size_t{2}, std::size_t{3}, std::size_t{5}, std::size_t{7},
+                              std::size_t{10}, std::size_t(-1)}) {
+        query.offsetBytes = offset;
+        CHECK(maiReadToolDetail(*store, session.id, query).error().code() ==
+              MaiErrorCode::InvalidInput);
+    }
+    query.offsetBytes = 1;
+    query.maxBytes = 1;
+    CHECK(maiReadToolDetail(*store, session.id, query).error().code() ==
+          MaiErrorCode::InvalidInput);
+    query.offsetBytes = 0;
+    for (const auto limit : {std::size_t{0}, std::size_t{4097}}) {
+        query.maxBytes = limit;
+        CHECK(maiReadToolDetail(*store, session.id, query).error().code() ==
+              MaiErrorCode::InvalidInput);
+    }
+    query.maxBytes = 1;
+    query.field = "error";
+    std::string recovered;
+    for (std::size_t index = 0; index < tool.error.size(); ++index) {
+        query.offsetBytes = index;
+        const auto page = maiReadToolDetail(*store, session.id, query);
+        CHECK(page && page.value().text.size() == 1 && page.value().sourceBytesRead == 1);
+        if (page) {
+            recovered += page.value().text;
+            CHECK(page.value().textIsValidUtf8 == (index == tool.error.size() - 1));
+        }
+    }
+    CHECK(recovered == tool.error);
+    query.offsetBytes = 0;
+    query.field = "media_path";
+    CHECK(maiReadToolDetail(*store, session.id, query).error().code() ==
+          MaiErrorCode::InvalidInput);
+    query.field = "input";
+    query.expectedRevision.clear();
+    const auto empty = maiReadToolDetail(*store, session.id, query);
+    CHECK(empty && empty.value().totalBytes == 0 && empty.value().textIsValidUtf8);
+    query.messageId.clear();
+    CHECK(maiReadToolDetail(*store, session.id, query).error().code() ==
+          MaiErrorCode::InvalidInput);
+}
+
 }  // namespace
 
 // 每个用例跑之前先打一行，崩了的话能立刻看出停在哪一个。这次就是靠它定位的：
@@ -818,6 +997,8 @@ void test_cancel_stops_traversal() {
     } while (0)
 
 int main() {
+    RUN(test_tool_detail_pages_and_revision_binding);
+    RUN(test_tool_detail_utf8_and_invalid_queries);
     RUN(test_path_escape_is_blocked);
     RUN(test_sibling_with_shared_prefix_is_outside);
     RUN(test_write_cannot_escape);

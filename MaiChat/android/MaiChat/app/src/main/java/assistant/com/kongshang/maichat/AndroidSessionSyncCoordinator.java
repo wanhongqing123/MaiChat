@@ -399,6 +399,7 @@ final class AndroidSessionSyncCoordinator {
             }
             // 所属端按 Handler 顺序导入和接收，socket 信箱不等待模型、附件或界面操作。
             // 原命令仅在落库接收/明确拒绝后 ACK；重送中的同一 envelope 不重复排入 Handler。
+            final boolean detailRead = action != null && action.optString("action").equals("get_tool_detail");
             Consumer<JSONObject> complete = result -> outbound.execute(() -> {
                 try {
                     if (closed) return;
@@ -410,7 +411,7 @@ final class AndroidSessionSyncCoordinator {
                         requestPresenceRefresh();
                     } else {
                         sendPayload(envelope, "event", response);
-                        schedulePublish(envelope.optString("session_id"));
+                        if (!detailRead) schedulePublish(envelope.optString("session_id"));
                     }
                     request("ack", new JSONObject().put("ids", new JSONArray().put(envelopeId)), 15000);
                 } catch (Exception failure) {
@@ -640,6 +641,9 @@ final class AndroidSessionSyncCoordinator {
             action.optString("id"), action.optString("decision"), action.optString("title"),
             // 同文的连续点击和不同轮次必须分开；仅网络重试复用同一 requestId。
             action.optString("turnId"), action.optString("requestId"), action.optString("quoteMessageId"),
+            // Read-only pages must not share a retry envelope with another call or byte range.
+            action.optString("messageId"), action.optString("partId"), action.optString("field"),
+            action.optString("offset"), action.optString("limit"), action.optString("detailRevision"),
             action.optJSONArray("attachments") == null ? "" :
                 action.optJSONArray("attachments").toString()})
             canonical.append(value.length()).append(':').append(value);
@@ -650,7 +654,8 @@ final class AndroidSessionSyncCoordinator {
     String sendToRemote(JSONObject remote, String kind, JSONObject payload,
                         BiConsumer<String, String> completion) throws Exception {
         String id = newId();
-        if (kind.equals("command") && !(payload.optString("action").equals("prompt") &&
+        if (kind.equals("command") && !payload.optString("action").equals("get_tool_detail")
+            && !(payload.optString("action").equals("prompt") &&
                 !payload.optString("requestId").isEmpty())) {
             String key = fingerprint(remote, payload);
             id = retryIdByFingerprint.computeIfAbsent(key, ignored -> newId());

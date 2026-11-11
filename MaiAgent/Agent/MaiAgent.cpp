@@ -944,6 +944,11 @@ MaiResult<MaiConversationHistoryPage> MaiAgent::readHistory(
     return maiReadConversationHistory(*mRuntime->store, sessionId, query);
 }
 
+MaiResult<MaiToolDetailPage> MaiAgent::readToolDetail(const std::string& sessionId,
+                                                      const MaiToolDetailQuery& query) const {
+    return maiReadToolDetail(*mRuntime->store, sessionId, query);
+}
+
 std::vector<MaiQuestionRequest> MaiAgent::listPendingQuestions() const {
     return mRuntime->questions->listPending();
 }

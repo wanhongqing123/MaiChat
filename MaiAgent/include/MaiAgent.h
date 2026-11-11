@@ -21,6 +21,7 @@
 #include "MaiSession.h"
 #include "MaiSessionStore.h"
 #include "MaiTool.h"
+#include "MaiToolDetail.h"
 
 // ── 能提交给核心的操作 ──────────────────────────────────────────
 // 形状抄 codex（它的 core 对外就 submit(Op) / next_event() 两个方法）。
@@ -278,6 +279,10 @@ public:
     // 失败返回 NotFound/InvalidInput；可与活动轮次并发。宿主负责其会话授权边界。
     MaiResult<MaiConversationHistoryPage> readHistory(
         const std::string& sessionId, const MaiConversationHistoryQuery& query) const;
+    // 版本绑定的工具详情分页，复用普通只读入口；只取已落库的单条消息快照，不执行原工具。
+    // Busy表示详情版本变化，须首屏重读；其余身份、预算与UTF-8边界见MaiToolDetail.h。
+    MaiResult<MaiToolDetailPage> readToolDetail(const std::string& sessionId,
+                                                const MaiToolDetailQuery& query) const;
     // 这个会话现在有没有一轮在跑。注意这是**那一瞬间**的答案，
     // 拿它去做"没跑就发消息"的判断是有竞态的——直接 submit，忙的话会返回 Busy，那个判断在锁里做。
     bool isBusy(const std::string& sessionId) const;
