@@ -144,6 +144,8 @@ private:
     bool mResponseHasVisibleText = false;
     // 真实 usage 高于启发式计数时，保守校正本轮后续请求；它不是供应商实际用量。
     double mContextEstimateMultiplier = 1.0;
+    // 只属于当前轮次；一次软区整理失败后不在每项工具后重复整理，硬上限仍会重检。
+    bool mCompactionDeferred = false;
 
     MaiError mError;
     bool mHasVisibleText = false;

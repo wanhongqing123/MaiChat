@@ -540,10 +540,15 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
         request.tools = mDependencies.tools->specs(mModelName);
     MaiContextCompactor::Options options;
     options.estimateMultiplier = mContextEstimateMultiplier;
+    options.deferUntilHardLimit = mCompactionDeferred;
     const auto prepared = MaiContextCompactor(options).prepare(
         *mDependencies.store, *mDependencies.model, *mDependencies.context, mSessionId,
         sourceHistory, std::move(request), cancel, buildContext);
     if (!prepared) return prepared.error();
+    if (prepared.value().advancedCheckpoint)
+        mCompactionDeferred = false;
+    else if (prepared.value().deferredCompaction)
+        mCompactionDeferred = true;
     return prepared.value().request;
 }
 

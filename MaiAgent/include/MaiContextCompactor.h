@@ -19,6 +19,8 @@ struct MaiContextPreparation {
     bool advancedCheckpoint = false;
     // 明确标为估计/精确计数，不是供应商 usage。包含摘要、原文、基础指令和工具声明。
     MaiModelTokenEstimate inputEstimate;
+    // 仅摘要 Protocol 失败且原请求仍适配时延后压缩；request 保持原文/旧检查点，未推进存储。
+    bool deferredCompaction = false;
 };
 
 // 普通 C++ 摘要入口，直接调用同一个供应商客户端，不依赖工具协议或服务端代理。
@@ -29,6 +31,7 @@ struct MaiContextPreparation {
 // 大工具组可整体摘要，像素仍保留并带真实组来源，不能声称知道不存在的单图调用归属。
 // 超长旧片段分成带精确源 ID/字段/偏移的数据块，全部成功后才提交一个原子检查点。
 // 失败、取消、空/无效摘要、源变化或持久化失败不推进；原始消息永不改写或删除。
+// 软区摘要 Protocol 失败可返回仍适配的原请求并标记 deferredCompaction；真实超限仍失败。
 class MaiContextCompactor {
 public:
     struct Options {
@@ -40,6 +43,9 @@ public:
         // 供应商真实 usage 比本地估计更高时，宿主可提高此倍数；小于 1 按 1。
         // 只影响标为估计的计数，不修改实际 usage 或模型目录容量。
         double estimateMultiplier = 1.0;
+        // 同一 Runner 先前已安全延后时，跳过软阈值重试；每次仍重算容量与倍率，
+        // 超过硬输入预算必须重新压缩。成功检查点推进后由调用方恢复常规软阈值策略。
+        bool deferUntilHardLimit = false;
     };
 
     // 特殊宿主可注入“从消息/片段边界构建原文并保留指定 user”的同线程回调。

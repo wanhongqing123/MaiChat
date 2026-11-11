@@ -6,6 +6,7 @@
 #include <limits>
 #include <set>
 #include <string_view>
+#include <tuple>
 #include <utility>
 
 #include <json.hpp>
@@ -14,6 +15,18 @@
 
 namespace {
 using Json = nlohmann::json;
+
+// 延后不写检查点，也必须核对读取时的完整检查点身份，不能复用并发替换前的正文。
+bool sameCheckpoint(const MaiContextCheckpoint& left, const MaiContextCheckpoint& right) {
+    const auto identity = [](const MaiContextCheckpoint& value) {
+        return std::tie(value.sessionId, value.revision, value.sourceMessageCount,
+                        value.firstMessageId, value.throughMessageId, value.sourceFingerprint,
+                        value.model, value.summary, value.references, value.created,
+                        value.partialMessageId, value.partialPartCount, value.throughPartId,
+                        value.partialSourceFingerprint, value.preservedUserMessageId);
+    };
+    return identity(left) == identity(right);
+}
 
 // 与既有模型 wire 一致：旧工具可能含本地编码原字节，JSON 表示替换非法 UTF-8，
 // 不能因压缩而抛异常或修改原史。源身份始终对原始字节计算，替换只发生在模型数据边界。
@@ -570,6 +583,13 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
         prepared.request = std::move(request);
         return prepared;
     }
+    // 同轮已安全延后时，只免除软阈值整理；倍率和各项 reserve 已按本次请求重新计算。
+    if (mOptions.deferUntilHardLimit && estimate(request) <= inputBudget) {
+        if (const MaiError error = store.lastWriteError()) return error;
+        prepared.deferredCompaction = true;
+        prepared.request = std::move(request);
+        return prepared;
+    }
     MaiContextCheckpoint next;
     next.sourceMessageCount = sourceBoundary(history, mOptions.retainRecentTurns);
     MaiModelRequest tailProbe = request;
@@ -627,6 +647,47 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
         std::min({limits.maxOutputTokens, std::size_t{16384}, limits.contextWindowTokens / 8});
     const std::size_t summaryInput = limits.contextWindowTokens - summaryOutput;
     const std::size_t summaryLimit = std::min(std::size_t{8192}, limits.contextWindowTokens / 16);
+    const auto sourceFingerprint =
+        maiContextSourceFingerprint(sessionId, history, history.size());
+    // Runner 可有意过滤尚未消费的 steering；保存当时完整 store 前缀，既允许这些
+    // 已知排除项存在，也不漏掉摘要过程中对它们或真实来源/尾部的并发修改。
+    const auto storedHistory = store.listMessages(sessionId);
+    const auto storedFingerprint =
+        maiContextSourceFingerprint(sessionId, storedHistory, storedHistory.size());
+    std::set<std::string> sourceIds;
+    for (const auto& message : history) sourceIds.insert(message.id);
+    const auto deferOrFail = [&](const MaiError& error) -> MaiResult<MaiContextPreparation> {
+        if (cancel.load(std::memory_order_relaxed))
+            return {MaiErrorCode::Canceled, "Context summarization was canceled."};
+        if (error.code() != MaiErrorCode::Protocol || estimate(request) > inputBudget)
+            return error;
+        if (const MaiError storageError = store.lastWriteError()) return storageError;
+        // flush 之前可能已有成功批次，但它们从未保存，不能混入原请求。只读核对整个
+        // 原来源（含未压缩尾部）与旧检查点；并发追加后缀允许，原前缀改变则显式 Busy。
+        // 这是提交前的来源校验，不以写入/CAS 推进检查点来伪造一次“成功压缩”。
+        const auto currentHistory = store.listMessages(sessionId);
+        std::vector<MaiMessage> currentSource;
+        for (const auto& message : currentHistory)
+            if (sourceIds.count(message.id)) currentSource.push_back(message);
+        MaiContextCheckpoint currentCheckpoint;
+        const bool hasCheckpoint = store.getContextCheckpoint(sessionId, currentCheckpoint);
+        if (const MaiError storageError = store.lastWriteError()) return storageError;
+        if (sourceFingerprint.empty() || storedFingerprint.empty())
+            return {MaiErrorCode::Internal, "The original context source could not be verified."};
+        if (maiContextSourceFingerprint(sessionId, currentHistory, storedHistory.size()) !=
+                storedFingerprint ||
+            currentSource.size() != history.size() ||
+            maiContextSourceFingerprint(sessionId, currentSource, history.size()) != sourceFingerprint ||
+            hasCheckpoint != hadCheckpoint ||
+            (hadCheckpoint && !sameCheckpoint(previous, currentCheckpoint)))
+            return {MaiErrorCode::Busy,
+                    "The context source or checkpoint changed during summarization."};
+        if (cancel.load(std::memory_order_relaxed))
+            return {MaiErrorCode::Canceled, "Context summarization was canceled."};
+        prepared.deferredCompaction = true;
+        prepared.request = std::move(request);
+        return prepared;
+    };
     Json batch = Json::array();
     const auto flush = [&]() -> MaiError {
         if (batch.empty()) return {};
@@ -666,13 +727,13 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
                     return {MaiErrorCode::InvalidInput,
                             "The selected model cannot fit the summary instructions and preserved "
                             "state."};
-                if (const MaiError error = flush()) return error;
+                if (const MaiError error = flush()) return deferOrFail(error);
                 continue;
             }
             offset += length;
         }
     }
-    if (const MaiError error = flush()) return error;
+    if (const MaiError error = flush()) return deferOrFail(error);
     if (!validateSummary(summary))
         return {MaiErrorCode::Protocol,
                 "No valid context summary was produced; original history is preserved."};
