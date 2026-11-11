@@ -54,8 +54,29 @@ bool hasText(const std::string& source) {
     return source.find_first_not_of(" \r\n\t") != std::string::npos;
 }
 
+// 部分兼容模型会给完整 JSON 加一个 markdown 代码围栏。只剥除覆盖整条正文的
+// 单个 JSON/无语言围栏，不搜索任意花括号，也不接纳围栏外的解释或不完整 JSON。
+std::string_view summaryJsonText(const std::string& text) {
+    const auto first = text.find_first_not_of(" \r\n\t");
+    if (first == std::string::npos) return {};
+    const auto last = text.find_last_not_of(" \r\n\t");
+    std::string_view body(text.data() + first, last - first + 1);
+    if (body.substr(0, 3) != "```") return body;
+    const auto line = body.find('\n');
+    if (line == std::string_view::npos || body.size() < line + 4 ||
+        body.substr(body.size() - 3) != "```")
+        return body;
+    auto language = body.substr(3, line - 3);
+    if (!language.empty() && language.back() == '\r') language.remove_suffix(1);
+    if (!language.empty() && language != "json" && language != "JSON") return body;
+    body.remove_prefix(line + 1);
+    body.remove_suffix(3);
+    return body;
+}
+
 MaiResult<std::string> validateSummary(const std::string& text) {
-    const Json parsed = Json::parse(text, nullptr, false);
+    const auto body = summaryJsonText(text);
+    const Json parsed = Json::parse(body.begin(), body.end(), nullptr, false);
     constexpr const char* fields[] = {"goals",    "constraints",    "decisions",
                                       "progress", "open_questions", "source_notes"};
     bool meaningful = false;
@@ -350,23 +371,54 @@ MaiModelRequest summaryRequest(const MaiModelRequest& original, const std::strin
     return request;
 }
 
-MaiResult<std::string> summarize(MaiModelClient& model, const MaiModelRequest& request,
-                                 std::size_t summaryLimit, const std::atomic<bool>& cancel) {
+MaiResult<std::string> collectSummaryText(MaiModelClient& model, const MaiModelRequest& request,
+                                          const std::atomic<bool>& cancel) {
     std::string text;
+    struct SummaryItem {
+        MaiModelTextItem info;
+        std::string text;
+    };
+    std::vector<SummaryItem> items;
+    std::size_t receivedBytes = 0;
     bool calledTool = false;
     bool tooLarge = false;
+    const auto itemFor = [&](const MaiModelTextItem& info) -> SummaryItem* {
+        for (auto& item : items) {
+            if ((info.index >= 0 && item.info.index == info.index) ||
+                (info.index < 0 && !info.id.empty() && item.info.id == info.id)) {
+                if (!info.id.empty()) item.info.id = info.id;
+                if (info.phase != MaiModelTextPhase::Unspecified) item.info.phase = info.phase;
+                return &item;
+            }
+        }
+        if (items.size() >= 4096) {
+            tooLarge = true;
+            return nullptr;
+        }
+        items.push_back({info, {}});
+        return &items.back();
+    };
+    const auto append = [&](std::string& destination, std::string_view delta) {
+        // 所有可见发言共享同一个内存上限，不能通过拆成多条 item 绕开它。
+        if (delta.size() > 1024 * 1024 || receivedBytes > 1024 * 1024 - delta.size()) {
+            tooLarge = true;
+        } else if (!tooLarge) {
+            destination.append(delta);
+            receivedBytes += delta.size();
+        }
+    };
     MaiStreamSink sink;
     sink.onText = [&](std::string_view delta) {
         // 分词结果不超过原 UTF-8 字节数的限制不是反向保证；此处只是独立的内存保护，
         // 最终摘要是否适配 token 预算仍通过模型计数/明确估计验证，不据此声称实际用量。
-        if (delta.size() > 1024 * 1024 || text.size() > 1024 * 1024 - delta.size()) {
-            tooLarge = true;
-        } else if (!tooLarge) {
-            text.append(delta);
-        }
+        append(text, delta);
     };
-    sink.onTextItemDelta = [&](const MaiModelTextItem&, std::string_view delta) {
-        sink.onText(delta);
+    // Responses 的进度发言与最终答案是不同 item，不能串拼成一个 JSON。
+    // phase 可能在完成快照才出现，所以先按稳定身份收集，再在 stream 成功后选择。
+    sink.onTextItemStarted = [&](const MaiModelTextItem& info) { itemFor(info); };
+    sink.onTextItemCompleted = [&](const MaiModelTextItem& info) { itemFor(info); };
+    sink.onTextItemDelta = [&](const MaiModelTextItem& info, std::string_view delta) {
+        if (auto* item = itemFor(info)) append(item->text, delta);
     };
     sink.onToolCall = [&](const MaiToolInvocation&) { calledTool = true; };
     const MaiError error = model.stream(request, sink, cancel);
@@ -377,8 +429,63 @@ MaiResult<std::string> summarize(MaiModelClient& model, const MaiModelRequest& r
     if (calledTool || tooLarge)
         return {MaiErrorCode::Protocol,
                 "Context summarization did not return a bounded text summary."};
-    const auto validated = validateSummary(text);
-    if (!validated) return validated.error();
+    if (!items.empty()) {
+        if (hasText(text))
+            return {MaiErrorCode::Protocol,
+                    "Context summarization returned ambiguous text streams."};
+        const SummaryItem* selected = nullptr;
+        for (const auto& item : items) {
+            if (item.info.phase != MaiModelTextPhase::FinalAnswer) continue;
+            if (selected)
+                return {MaiErrorCode::Protocol,
+                        "Context summarization returned multiple final summary messages."};
+            selected = &item;
+        }
+        // 无 phase 的兼容服务仍允许一个独立正文；多个正文不能猜哪条才是摘要。
+        if (!selected) {
+            for (const auto& item : items) {
+                if (item.info.phase != MaiModelTextPhase::Unspecified || !hasText(item.text))
+                    continue;
+                if (selected)
+                    return {MaiErrorCode::Protocol,
+                            "Context summarization returned ambiguous summary messages."};
+                selected = &item;
+            }
+        }
+        text = selected ? selected->text : std::string{};
+    }
+    return text;
+}
+
+MaiResult<std::string> summarize(MaiModelClient& model, const MaiModelRequest& request,
+                                 std::size_t summaryLimit, std::size_t inputLimit,
+                                 double estimateMultiplier, const std::atomic<bool>& cancel) {
+    auto text = collectSummaryText(model, request, cancel);
+    if (!text) return text.error();
+    auto validated = validateSummary(text.value());
+    if (!validated) {
+        // 只重试格式/schema 错误一次，不重发工具、网络失败、截断、歧义发言或过量输出。
+        // 坏响应不作为提示或数据回传，避免把其中的指令带进新的模型请求。
+        MaiModelRequest retry = request;
+        retry.baseInstructions +=
+            " The previous response did not match the required summary format. Return one "
+            "complete JSON object only, with exactly goals, constraints, decisions, progress, "
+            "open_questions, and source_notes as arrays of concise nonempty strings. Empty "
+            "arrays are allowed, but at least one entry is required. No explanation or fences.";
+        if (scaledTokens(model.estimateInputTokens(retry), estimateMultiplier) > inputLimit)
+            return {MaiErrorCode::Protocol,
+                    "Context summary format was invalid and cannot be retried within the "
+                    "selected model's input budget. Original history is preserved."};
+        if (cancel.load(std::memory_order_relaxed))
+            return {MaiErrorCode::Canceled, "Context summarization was canceled before retrying."};
+        text = collectSummaryText(model, retry, cancel);
+        if (!text) return text.error();
+        validated = validateSummary(text.value());
+        if (!validated)
+            return {validated.error().code(),
+                    validated.error().message() +
+                        " The bounded format retry was exhausted; original history is preserved."};
+    }
     MaiModelRequest sizeProbe;
     sizeProbe.model = request.model;
     MaiModelMessage summaryMessage;
@@ -523,8 +630,9 @@ MaiResult<MaiContextPreparation> MaiContextCompactor::prepare(
     Json batch = Json::array();
     const auto flush = [&]() -> MaiError {
         if (batch.empty()) return {};
-        const auto merged = summarize(model, summaryRequest(request, summary, batch, summaryOutput),
-                                      summaryLimit, cancel);
+        const auto merged =
+            summarize(model, summaryRequest(request, summary, batch, summaryOutput), summaryLimit,
+                      summaryInput, mOptions.estimateMultiplier, cancel);
         if (!merged) return merged.error();
         summary = merged.value();
         batch = Json::array();

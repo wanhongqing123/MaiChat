@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include <httplib.h>
 #include <json.hpp>
 
 #include "MaiAgent.h"
@@ -22,6 +23,7 @@
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
 #include "MaiMemoryStore.h"
+#include "MaiOpenAiClient.h"
 #include "MaiSessionTools.h"
 #include "MaiSqliteStore.h"
 
@@ -1531,14 +1533,279 @@ void test_compaction_keeps_frozen_effort_and_glm_tool_reasoning() {
     }
 }
 
+// 摘要是同一个真实 wire 客户端的子请求，不能只用直接 onText 的假模型证明可用。
+// 这里的 loopback 服务不执行工具、不读用户数据，覆盖独立可见发言与整体 JSON 围栏。
+class SummaryWireServer {
+public:
+    explicit SummaryWireServer(std::string script, std::string nextScript = {})
+        : mScript(std::move(script)), mNextScript(std::move(nextScript)) {
+        const auto handle = [this](const httplib::Request& request, httplib::Response& response) {
+            const int number = ++requests;
+            const auto body = Json::parse(request.body, nullptr, false);
+            if (!body.is_object() || body.contains("tools")) invalidRequest.store(true);
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                mBodies.push_back(body);
+            }
+            response.set_content(number > 1 && !mNextScript.empty() ? mNextScript : mScript,
+                                 "text/event-stream");
+        };
+        mServer.Post("/responses", handle);
+        mServer.Post("/chat/completions", handle);
+        mPort = mServer.bind_to_any_port("127.0.0.1");
+        if (mPort > 0) {
+            mThread = std::thread([this] { mServer.listen_after_bind(); });
+            for (int index = 0; index < 200 && !mServer.is_running(); ++index)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    ~SummaryWireServer() {
+        mServer.stop();
+        if (mThread.joinable()) mThread.join();
+    }
+    std::string baseUrl() const {
+        return "http://127.0.0.1:" + std::to_string(mPort);
+    }
+    bool ready() const {
+        return mPort > 0 && mServer.is_running();
+    }
+    std::vector<Json> bodies() const {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return mBodies;
+    }
+    std::atomic<int> requests{0};
+    std::atomic<bool> invalidRequest{false};
+
+private:
+    httplib::Server mServer;
+    std::thread mThread;
+    std::string mScript;
+    std::string mNextScript;
+    mutable std::mutex mMutex;
+    std::vector<Json> mBodies;
+    int mPort = 0;
+};
+
+std::string summarySse(const Json& event) {
+    return "data: " + event.dump() + "\n\n";
+}
+
+Json summaryOutputItem(const char* id, const char* phase, std::string text) {
+    Json item{{"type", "message"},
+              {"id", id},
+              {"role", "assistant"},
+              {"content", Json::array({Json{{"type", "output_text"}, {"text", text}}})}};
+    if (*phase) item["phase"] = phase;
+    return item;
+}
+
+void test_summary_format_through_real_wire() {
+    std::puts(
+        "   loopback Chat/Responses preserve final summary identity and accept only bounded "
+        "whole JSON wrappers");
+    for (int mode = 0; mode < 13; ++mode) {
+        const bool chat = mode >= 6 && mode <= 11;
+        const bool accepted =
+            mode == 0 || mode == 1 || mode == 2 || mode == 5 || mode == 6 || mode == 10;
+        std::string script;
+        if (chat) {
+            std::string text = mode == 6   ? "```json\n" + summaryJson() + "\n```"
+                               : mode == 7 ? "Here is the summary:\n" + summaryJson()
+                               : mode == 8 ? summaryJson().substr(0, 40)
+                                           : "```json\n" + summaryJson() + "\n```\nExtra text";
+            script =
+                summarySse({{"choices", Json::array({Json{{"delta", {{"content", text}}},
+                                                          {"finish_reason", nullptr}}})}}) +
+                summarySse(
+                    {{"choices",
+                      Json::array({Json{{"delta", Json::object()},
+                                        {"finish_reason", mode == 11 ? "length" : "stop"}}})}}) +
+                "data: [DONE]\n\n";
+        } else {
+            Json items = Json::array();
+            if (mode == 0 || mode == 1 || mode == 4)
+                items.push_back(summaryOutputItem("summary_progress", "commentary",
+                                                  mode == 4 ? summaryJson() : "Merging history."));
+            if (mode == 1)
+                items.push_back(summaryOutputItem("summary_partial", "partial_answer",
+                                                  "Earlier incomplete outline."));
+            if (mode == 3) {
+                items.push_back(summaryOutputItem("summary_first", "final_answer", summaryJson()));
+                items.push_back(summaryOutputItem("summary_second", "final_answer", summaryJson()));
+            } else if (mode == 4) {
+                items.push_back(summaryOutputItem("summary_final", "final_answer", "invalid"));
+            } else {
+                items.push_back(summaryOutputItem("summary_final", mode == 2 ? "" : "final_answer",
+                                                  summaryJson()));
+            }
+            for (std::size_t index = 0; index < items.size(); ++index) {
+                Json initial = items[index];
+                // phase 可直到 item.done 才出现；增量身份仍由 output_index 保持。
+                if (mode == 1) initial.erase("phase");
+                initial["content"] = Json::array();
+                script += summarySse({{"type", "response.output_item.added"},
+                                      {"output_index", index},
+                                      {"item", initial}});
+                const auto text = items[index]["content"][0]["text"].get<std::string>();
+                script += summarySse({{"type", "response.output_text.delta"},
+                                      {"output_index", index},
+                                      {"content_index", 0},
+                                      {"delta", text}});
+                script += summarySse({{"type", "response.output_item.done"},
+                                      {"output_index", index},
+                                      {"item", items[index]}});
+            }
+            script +=
+                summarySse({{"type", mode == 12 ? "response.incomplete" : "response.completed"},
+                            {"response",
+                             {{"status", mode == 12 ? "incomplete" : "completed"},
+                              {"incomplete_details", {{"reason", "max_output_tokens"}}},
+                              {"output", items}}}});
+        }
+        const std::string retryScript =
+            mode == 10
+                ? summarySse({{"choices", Json::array({Json{{"delta", {{"content", summaryJson()}}},
+                                                            {"finish_reason", "stop"}}})}}) +
+                      "data: [DONE]\n\n"
+                : std::string{};
+        SummaryWireServer server(std::move(script), retryScript);
+        CHECK(server.ready());
+        if (!server.ready()) continue;
+        MaiModelConfig config;
+        config.baseUrl = server.baseUrl();
+        config.wire = chat ? MaiWireApi::ChatCompletions : MaiWireApi::Responses;
+        config.maxRetries = 0;
+        config.totalTimeoutSeconds = 5;
+        config.proxyResolver = [](const std::string&, MaiModelProxy& route) {
+            route = {};
+            return true;
+        };
+        config.contextLimits = [](const std::string&) { return MaiModelContextLimits{8192, 2048}; };
+        auto model = makeMaiModelClient(std::move(config));
+        auto store = makeMaiMemoryStore();
+        const auto id = newSession(*store);
+        // 这一份旧轮次超过触发阈值，但可完整放入单个摘要请求，精确计数重试次数。
+        appendRound(*store, id, "Saved source: " + std::string(15000, 's'));
+        store->putMessage(id, message(MaiRole::User, "Continue using the saved source."));
+        const auto history = store->listMessages(id);
+        const auto fingerprint = maiContextSourceFingerprint(id, history, history.size());
+        const std::atomic<bool> cancel{false};
+        auto input = request("deepseek-flash");
+        input.reasoningEffort = "high";
+        const auto result = MaiContextCompactor().prepare(*store, *model, MaiContextBuilder{}, id,
+                                                          history, input, cancel);
+        std::printf("     wire case %d expected=%s actual=%s%s%s\n", mode,
+                    accepted ? "accepted" : "rejected", result ? "accepted" : "rejected",
+                    result ? "" : " detail=", result ? "" : result.error().message().c_str());
+        CHECK(static_cast<bool>(result) == accepted);
+        const int expectedRequests =
+            mode == 4 || mode == 7 || mode == 8 || mode == 9 || mode == 10 ? 2 : 1;
+        CHECK(server.requests.load() == expectedRequests && !server.invalidRequest.load());
+        const auto bodies = server.bodies();
+        if (expectedRequests == 2 && bodies.size() == 2) {
+            CHECK(bodies[0]["model"] == bodies[1]["model"]);
+            CHECK(bodies[0][chat ? "max_tokens" : "max_output_tokens"] ==
+                  bodies[1][chat ? "max_tokens" : "max_output_tokens"]);
+            if (chat) {
+                CHECK(bodies[0]["messages"].back() == bodies[1]["messages"].back());
+                CHECK(bodies[0]["reasoning_effort"] == "high" &&
+                      bodies[1]["reasoning_effort"] == "high");
+            } else {
+                CHECK(bodies[0]["input"] == bodies[1]["input"]);
+                CHECK(bodies[0]["reasoning"]["effort"] == "high" &&
+                      bodies[1]["reasoning"]["effort"] == "high");
+            }
+        }
+        MaiContextCheckpoint checkpoint;
+        CHECK(store->getContextCheckpoint(id, checkpoint) == accepted);
+        if (accepted && result) CHECK(checkpoint.summary == summaryJson());
+        CHECK(maiContextSourceFingerprint(id, store->listMessages(id), history.size()) ==
+              fingerprint);
+    }
+}
+
+// 格式恢复不能变成不受预算/取消约束的自动重发，也不能把部分成功写入检查点。
+void test_summary_format_retry_guards() {
+    std::puts("   summary format retry is bounded, budgeted, and preserves existing checkpoints");
+    class GuardModel : public SummaryModel {
+    public:
+        mutable int retryProbes = 0;
+        MaiModelTokenEstimate estimateInputTokens(const MaiModelRequest& input) const override {
+            if (input.baseInstructions.find("previous response did not match") !=
+                std::string::npos) {
+                ++retryProbes;
+                // 未乘倍率时适配；实际 1.2 倍估计超过 7168 的摘要输入窗口。
+                return {6100, false};
+            }
+            return SummaryModel::estimateInputTokens(input);
+        }
+    };
+    for (int mode = 0; mode < 5; ++mode) {
+        auto store = makeMaiMemoryStore();
+        const auto id = newSession(*store);
+        populate(*store, id);
+        const auto history = store->listMessages(id);
+        const auto fingerprint = maiContextSourceFingerprint(id, history, history.size());
+        GuardModel model;
+        model.response = "not JSON";
+        std::atomic<bool> cancel{false};
+        if (mode == 1) model.failAt = 1;
+        if (mode == 2) model.interleave = [&](int) { cancel.store(true); };
+        if (mode == 3) model.returnTool = true;
+        if (mode == 4) model.response = std::string(1024 * 1024 + 1, 'x');
+        MaiContextCompactor::Options options;
+        options.estimateMultiplier = 1.2;
+        const auto result = MaiContextCompactor(options).prepare(*store, model, MaiContextBuilder{},
+                                                                 id, history, request(), cancel);
+        CHECK(!result && model.requests().size() == 1);
+        CHECK(model.retryProbes == (mode == 0 ? 1 : 0));
+        if (mode == 0) CHECK(result.error().message().find("input budget") != std::string::npos);
+        if (mode == 1) CHECK(result.error().code() == MaiErrorCode::Network);
+        if (mode == 2) CHECK(result.error().code() == MaiErrorCode::Canceled);
+        MaiContextCheckpoint checkpoint;
+        CHECK(!store->getContextCheckpoint(id, checkpoint));
+        CHECK(maiContextSourceFingerprint(id, store->listMessages(id), history.size()) ==
+              fingerprint);
+    }
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    populate(*store, id);
+    SummaryModel seed;
+    const std::atomic<bool> cancel{false};
+    CHECK(prepare(*store, seed, id, cancel));
+    MaiContextCheckpoint before;
+    CHECK(store->getContextCheckpoint(id, before));
+    for (int index = 0; index < 4; ++index)
+        appendRound(*store, id, "New uncovered source " + std::string(8000, 't'));
+    store->putMessage(id, message(MaiRole::User, "Continue after the new source."));
+    const auto history = store->listMessages(id);
+    const auto fingerprint = maiContextSourceFingerprint(id, history, history.size());
+    SummaryModel malformed;
+    malformed.response = "not JSON";
+    const auto rejected = prepare(*store, malformed, id, cancel);
+    CHECK(!rejected && malformed.requests().size() == 2);
+    MaiContextCheckpoint after;
+    CHECK(store->getContextCheckpoint(id, after));
+    CHECK(after.revision == before.revision && after.summary == before.summary &&
+          after.sourceFingerprint == before.sourceFingerprint);
+    CHECK(maiContextSourceFingerprint(id, store->listMessages(id), history.size()) == fingerprint);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--summary-format-wire") {
+        test_summary_format_through_real_wire();
+        test_summary_format_retry_guards();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--session-models") {
         test_compaction_keeps_frozen_effort_and_glm_tool_reasoning();
         return failures == 0 ? 0 : 1;
     }
     std::puts("MaiContextCompactorTests");
+    test_summary_format_through_real_wire();
+    test_summary_format_retry_guards();
     test_compaction_keeps_frozen_effort_and_glm_tool_reasoning();
     test_empty_history_with_oversized_instructions_or_tools();
     test_group_observation_provenance_uses_bounded_exact_range();
