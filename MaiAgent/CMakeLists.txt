@@ -461,6 +461,7 @@ if(WIN32)
     Agent/MaiFileSystemWindows.cpp
     AgentTools/MaiProcessWindows.cpp
     AgentTools/MaiScreenshotWindows.cpp
+    AgentTools/MaiDesktopDuplication.cpp
   )
 elseif(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
   enable_language(OBJCXX)
@@ -533,7 +534,7 @@ endif()
 target_link_libraries(maiagent PRIVATE libqpdf)
 target_compile_definitions(maiagent PRIVATE POINTERHOLDER_TRANSITION=4)
 if(WIN32)
-  target_link_libraries(maiagent PRIVATE d3d11 dxgi windowscodecs ole32 user32 windowsapp Wtsapi32
+  target_link_libraries(maiagent PRIVATE d3d11 dxgi windowscodecs ole32 user32 gdi32 windowsapp Wtsapi32
     ws2_32 iphlpapi crypt32 bcrypt advapi32)
 endif()
 
@@ -651,6 +652,10 @@ if(MAIAGENT_BUILD_TESTS)
     add_test(NAME ${test_name} COMMAND ${test_name})
   endforeach()
   if(WIN32)
+    # 纯像素/时间与失效资源契约，不读取实际桌面像素。
+    add_executable(MaiDesktopDuplicationTests tests/MaiDesktopDuplicationTests.cpp)
+    target_link_libraries(MaiDesktopDuplicationTests PRIVATE maiagent)
+    add_test(NAME MaiDesktopDuplicationTests COMMAND MaiDesktopDuplicationTests)
     add_executable(MaiScreenshotSessionTests tests/MaiScreenshotSessionTests.cpp)
     target_link_libraries(MaiScreenshotSessionTests PRIVATE maiagent windowscodecs ole32 user32 gdi32)
     add_test(NAME MaiScreenshotSessionTests COMMAND MaiScreenshotSessionTests)

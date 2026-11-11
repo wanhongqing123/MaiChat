@@ -1,5 +1,6 @@
 // 文件作用：由常驻工作线程持有 Windows 原生采集会话，按命令生成当前完整画面的 PNG。
-// 直接依赖：MaiScreenshot.h、MaiThread.h；WGC 回调只唤醒线程，D3D 和 COM 的使用及释放均留在线程内。
+// 直接依赖：MaiDesktopDuplication.h、MaiThread.h；整屏使用 DXGI，指定窗口使用 WGC。
+// WGC 回调只唤醒线程，所有 D3D、COM 和 duplication 的使用及释放均留在线程内。
 #include "MaiScreenshot.h"
 
 #include <windows.h>
@@ -38,6 +39,7 @@
 #include <vector>
 
 #include "MaiBlockingCheck.h"
+#include "MaiDesktopDuplication.h"
 #include "MaiThread.h"
 #include "MaiTime.h"
 
@@ -96,7 +98,7 @@ std::int64_t sourceProducedUnixMs(std::int64_t sourceQpc100ns, std::int64_t unix
 // 防止输入前已排队、输入后才取出的旧像素被标记为操作后的观察。
 // 官方契约：learn.microsoft.com/uwp/api/windows.graphics.capture.direct3d11captureframe.systemrelativetime
 // TimeSpan 单位：learn.microsoft.com/uwp/api/windows.foundation.timespan.duration
-std::int64_t frameSourceProducedAtMs(std::int64_t sourceQpc100ns) {
+std::int64_t frameSourceProducedAtMs(std::int64_t sourceQpc, bool rawQpc = false) {
     LARGE_INTEGER frequency{};
     LARGE_INTEGER before{};
     LARGE_INTEGER after{};
@@ -113,8 +115,12 @@ std::int64_t frameSourceProducedAtMs(std::int64_t sourceQpc100ns) {
     if (ticks.QuadPart <= unixEpoch100ns) return 0;
     const auto unix100ns = ticks.QuadPart - unixEpoch100ns;
     if (unix100ns > std::uint64_t(std::numeric_limits<std::int64_t>::max())) return 0;
-    return sourceProducedUnixMs(sourceQpc100ns, std::int64_t(unix100ns), after.QuadPart,
-                                frequency.QuadPart);
+    // DXGI LastPresentTime 使用原始 QPC 频率，WGC TimeSpan 使用固定 100ns；
+    // 两者共用时钟夹取，但不能共用输入单位。
+    return rawQpc ? maiDesktopSourceProducedAtMs(sourceQpc, std::int64_t(unix100ns), after.QuadPart,
+                                                 frequency.QuadPart)
+                  : sourceProducedUnixMs(sourceQpc, std::int64_t(unix100ns), after.QuadPart,
+                                         frequency.QuadPart);
 }
 
 MaiError hresultError(const char* operation, HRESULT result) {
@@ -603,9 +609,11 @@ private:
         mFrameReceivedAtMs = 0;
         mFrameSourceProducedAtMs = 0;
         mFrameSourceQpc100ns = 0;
+        mFrameSourceRawQpc = 0;
     }
 
     void closeCapture() noexcept {
+        mDesktop.close();
         clearLatestFrame();
         if (mTargetState) mTargetState->closed.store(true);
         // 清理中的单项 COM 失败不能阻止其余对象释放，也不能逃出 worker 的退出路径。
@@ -670,8 +678,14 @@ private:
         result = ::CreateDirect3D11DeviceFromDXGIDevice(
             dxgiDevice.Get(), reinterpret_cast<IInspectable**>(winrt::put_abi(mCaptureDevice)));
         if (FAILED(result)) return hresultError("CreateDirect3D11DeviceFromDXGIDevice", result);
-        result = ::CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                    IID_PPV_ARGS(mImagingFactory.GetAddressOf()));
+        return ensureImagingFactory();
+    }
+
+    MaiError ensureImagingFactory() {
+        if (mImagingFactory) return {};
+        const HRESULT result =
+            ::CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                               IID_PPV_ARGS(mImagingFactory.GetAddressOf()));
         if (FAILED(result)) return hresultError("CoCreateInstance(WICImagingFactory)", result);
         return {};
     }
@@ -726,11 +740,30 @@ private:
             return closedTargetError();
         }
         if (window) ::GetWindowThreadProcessId(window, &windowProcess);
+        if (monitor && mDesktop.isOpen() && mMonitor == monitor) return {};
         if (mSession && mWindow == window && mMonitor == monitor &&
             mWindowProcess == windowProcess && mTargetState && !mTargetState->closed.load()) {
             return {};
         }
         closeCapture();
+        if (monitor) {
+            // 常驻 WGC 整屏会改变系统指针的合成路径。直接匹配输出建立 DXGI 会话，
+            // 保持同屏请求共用资源，不通过每次截图 stop/start 补偿指针可见性。
+            MaiError error = ensureImagingFactory();
+            if (error.hasError()) return error;
+            bool deviceCreated = false;
+            error = mDesktop.open(reinterpret_cast<std::uintptr_t>(monitor), &deviceCreated);
+            if (deviceCreated) {
+                std::lock_guard<std::mutex> lock(mMutex);
+                ++mState.deviceCreations;
+            }
+            if (error.hasError()) return error;
+            mMonitor = monitor;
+            std::lock_guard<std::mutex> lock(mMutex);
+            ++mState.sessionStarts;
+            mState.capturing = true;
+            return {};
+        }
         using winrt::Windows::Graphics::Capture::GraphicsCaptureItem;
         using winrt::Windows::Graphics::Capture::GraphicsCaptureSession;
         if (!GraphicsCaptureSession::IsSupported()) {
@@ -741,13 +774,8 @@ private:
         if (deviceError.hasError()) return deviceError;
         const auto interop =
             winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-        if (window) {
-            winrt::check_hresult(interop->CreateForWindow(
-                window, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(mItem)));
-        } else {
-            winrt::check_hresult(interop->CreateForMonitor(
-                monitor, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(mItem)));
-        }
+        winrt::check_hresult(interop->CreateForWindow(window, winrt::guid_of<GraphicsCaptureItem>(),
+                                                      winrt::put_abi(mItem)));
         mPoolSize = mItem.Size();
         if (mPoolSize.Width <= 0 || mPoolSize.Height <= 0) return closedTargetError();
         using winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool;
@@ -777,6 +805,7 @@ private:
     }
 
     bool targetIsAvailable() const {
+        if (mDesktop.isOpen()) return isCaptureMonitor(mMonitor);
         if (!mTargetState || mTargetState->closed.load()) return false;
         if (mWindow) {
             DWORD process = 0;
@@ -787,6 +816,21 @@ private:
     }
 
     MaiError drainFrames(const std::shared_ptr<MaiScreenshotWakeState>& wake) {
+        if (mDesktop.isOpen()) {
+            if (!targetIsAvailable()) return closedTargetError();
+            // 零超时取帧配合 worker 的有限轮询，不在忙循环或持帧状态等待命令。
+            MaiDesktopDuplicationFrame frame;
+            const MaiError error = mDesktop.poll(frame);
+            if (error.hasError()) return error;
+            if (frame.desktopChanged) {
+                std::lock_guard<std::mutex> lock(mMutex);
+                mFrameSequence = ++mState.framesReceived;
+                mFrameReceivedAtMs = MaiTime::getCurrentTime();
+                mFrameSourceRawQpc = frame.sourceQpc;
+                mFrameSourceProducedAtMs = frameSourceProducedAtMs(frame.sourceQpc, true);
+            }
+            return {};
+        }
         if (!mPool) return {};
         if (!targetIsAvailable()) return closedTargetError();
         // 有限批次避免高刷新率画面饿死命令队列；通常两个池缓冲读完后立即得到空帧。
@@ -911,7 +955,7 @@ private:
         MaiError error = selectTarget(request, wake);
         if (error.hasError()) return error;
         const auto started = std::chrono::steady_clock::now();
-        const bool hadFrame = mLatestTexture != nullptr;
+        const bool hadFrame = mFrameSequence != 0;
         const auto previousSequence = mFrameSequence;
         const bool hasBarrier = request.afterFrameSequence || request.afterFrameReceivedAtMs;
         auto timeout = std::chrono::milliseconds(hasBarrier || !hadFrame ? kCaptureTimeoutMs
@@ -923,34 +967,37 @@ private:
             // 原生 WGC 实测会把 compositor 时间戳提前数毫秒交付。保留原始
             // QPC，只在时钟确实赶上后重新换算；不把稍晚的 drain/编码时间
             // 当成源时间。先检查这张候选再 drain，避免高帧率不断覆盖候选。
-            if (hasBarrier && mLatestTexture) {
+            if (hasBarrier && mFrameSequence) {
                 if (!mFrameSourceProducedAtMs && mFrameSourceQpc100ns > 0)
                     mFrameSourceProducedAtMs = frameSourceProducedAtMs(mFrameSourceQpc100ns);
-                if (framePassesBarrier(request, mFrameSequence, mFrameReceivedAtMs, mFrameSourceProducedAtMs))
+                if (!mFrameSourceProducedAtMs && mFrameSourceRawQpc > 0)
+                    mFrameSourceProducedAtMs = frameSourceProducedAtMs(mFrameSourceRawQpc, true);
+                if (framePassesBarrier(request, mFrameSequence, mFrameReceivedAtMs,
+                                       mFrameSourceProducedAtMs))
                     break;
             }
             error = drainFrames(wake);
             if (error.hasError()) return error;
-            if (mLatestTexture &&
+            if (mFrameSequence &&
                 (hasBarrier ? framePassesBarrier(request, mFrameSequence, mFrameReceivedAtMs,
                                                  mFrameSourceProducedAtMs)
                             : (!hadFrame || mFrameSequence > previousSequence)))
                 break;
-            // WGC 在 Windows 11 24H2 可能只发送变化的画面。已有完整图时短暂等候更新，
+            // WGC 和 DXGI 都可能只发送变化的画面。已有完整图时短暂等候更新，
             // 无屏障请求仍可沿用同一图及真实元数据；要求新帧的请求只能等待原会话后续投帧。
             // 达到截止时明确失败，不能靠重启会话或重写接收时间制造“新帧”。
-            if (!mLatestTexture) timeout = std::chrono::milliseconds(kCaptureTimeoutMs);
+            if (!mFrameSequence) timeout = std::chrono::milliseconds(kCaptureTimeoutMs);
             const auto elapsed = std::chrono::steady_clock::now() - started;
             if (elapsed >= timeout) {
                 if (hasBarrier) {
                     freshnessTimedOut = true;
                     return MaiError::make(MaiErrorCode::Busy,
-                                          "Windows Graphics Capture timed out waiting for a frame "
+                                          "screen capture timed out waiting for a frame "
                                           "newer than the requested barrier");
                 }
-                if (mLatestTexture) break;
+                if (mFrameSequence) break;
                 return MaiError::make(MaiErrorCode::Internal,
-                                      "Windows Graphics Capture timed out waiting for a frame");
+                                      "screen capture timed out waiting for a frame");
             }
             const DWORD wait = ::WaitForSingleObject(wake->event.get(),
                                                      std::min(kCancelPollMs, environmentWaitMs()));
@@ -965,8 +1012,15 @@ private:
         std::vector<std::uint8_t> pixels;
         UINT width = 0;
         UINT height = 0;
-        error = copyTextureToMemory(mDevice.Get(), mContext.Get(), mLatestTexture.Get(),
-                                    mStagingTexture, pixels, width, height);
+        if (mDesktop.isOpen()) {
+            std::uint32_t desktopWidth = 0, desktopHeight = 0;
+            error = mDesktop.copyPixels(pixels, desktopWidth, desktopHeight);
+            width = desktopWidth;
+            height = desktopHeight;
+        } else {
+            error = copyTextureToMemory(mDevice.Get(), mContext.Get(), mLatestTexture.Get(),
+                                        mStagingTexture, pixels, width, height);
+        }
         if (error.hasError()) return error;
         error = checkEnvironment(true);
         if (error.hasError()) return error;
@@ -1027,9 +1081,12 @@ private:
                     } catch (...) {
                         discardFailedCapture();
                     }
-                    // 即使 WGC 不再投帧，也按环境检查的剩余期限唤醒，失效后立即丢弃缓存并关目标。
-                    const DWORD wait =
-                        ::WaitForSingleObject(wake->event.get(), environmentWaitMs());
+                    // DXGI 没有 WGC 事件，常驻期间有限轮询；不变帧不触发 CPU readback。
+                    // 即使没有新帧，也按环境检查期限丢弃失效缓存并关闭目标。
+                    const DWORD wait = ::WaitForSingleObject(
+                        wake->event.get(), mDesktop.isOpen()
+                                               ? std::min(kCancelPollMs, environmentWaitMs())
+                                               : environmentWaitMs());
                     if (wait == WAIT_FAILED) {
                         terminalError = MaiError::make(MaiErrorCode::Internal,
                                                        "capture worker event wait failed");
@@ -1071,6 +1128,7 @@ private:
     // 下列状态只由 mai-capture 访问；stop 在 join 后才允许其他线程销毁 worker 门面。
     std::chrono::steady_clock::time_point mEnvironmentCheckedAt{};
     MaiError mEnvironmentError;
+    MaiDesktopDuplication mDesktop;
     ComPtr<ID3D11Device> mDevice;
     ComPtr<ID3D11DeviceContext> mContext;
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice mCaptureDevice{nullptr};
@@ -1094,6 +1152,7 @@ private:
     // 只用于新帧屏障的保守源生产时间；0 表示无法证明，公开接收时间口径保持不变。
     std::int64_t mFrameSourceProducedAtMs = 0;
     std::int64_t mFrameSourceQpc100ns = 0;
+    std::int64_t mFrameSourceRawQpc = 0;
 };
 
 MaiScreenshotWindowsWorker& screenshotWorker() {

@@ -66,8 +66,9 @@ bool maiIsScreenshotSupported();
 
 // 按 request 截取鼠标所在显示器或指定窗口，并编码为 PNG。
 //
-// 这是阻塞调用，只能在 agent 的工作线程调用。Windows 使用 Windows Graphics Capture，
-// macOS 14+ 使用 ScreenCaptureKit；不依赖 Qt 或外部截屏进程。macOS 需要用户授予屏幕录制权限，
+// 这是阻塞调用，只能在 agent 的工作线程调用。Windows 整屏使用 DXGI Desktop Duplication，
+// 指定窗口使用 Windows Graphics Capture，绝不扩大成整屏裁剪；macOS 14+ 使用 ScreenCaptureKit。
+// 后端共用常驻采集线程和当前目标会话，不依赖 Qt 或外部截屏进程。macOS 需要用户授予屏幕录制权限，
 // 授权后可能需要重启 App。失败时 screenshot 会保持为空，并返回可供模型纠正的错误。
 MaiError maiCaptureScreenshot(const MaiScreenshotRequest& request, MaiScreenshot& screenshot);
 
