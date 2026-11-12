@@ -3,7 +3,8 @@
 - 时间：2026-11-12 14:02 +08:00。
 - 平台：Windows 11、Qt 6.12.0、MSVC 2022；用户提供的设置截图来自 Mac Qt 桌面。
 - 源码基线：`37e1381addf4a58e8a11ca41d6ee2126148a5fed`，验证时叠加本文所述 Desktop 未提交修改。
-- 构建与运行产物：`MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/` 中重新构建的远程桌面测试与 `main_window_layout_test.exe`；未启动或替换用户正常 App，未接触真实账号数据库、远端设备和服务部署。
+- 最终产品提交：`3befec3df52cd6e0b6e5380739ceb4e2cbf99afe`，MaiChat tree `29d8bfb555d5fb5fe46ca5dac1a852f2b19fcc1b`；Core tree `30114b3e33472ba1692987e0a90df11f81d853df`。
+- 构建与运行产物：`MaiChat/desktop/.cache/build-qt6-ui-20261109/bin/` 中重新构建的远程桌面测试与 `main_window_layout_test.exe`，以及后述私有候选 App；未启动或替换用户现装 App，未接触真实账号数据库、远端设备和服务部署。
 
 ## 操作与预期
 
@@ -31,7 +32,7 @@
 
 Windows 原生 Qt 设置面板截图为 `tmp/remote-device-list-settings-green.png`，已实际查看：名单行消失，剩余四组设置完整。UI 测试输出一个已有 `QFont::setPointSize(-1)` 警告；本次未修改字体逻辑。编译输出的 `MainWindow.cpp` 既有 C4858 警告也未扩大处理。
 
-这是本机构建及实际 Qt 组件验证；未进行 Mac 正式 App 构建、安装产物核对或跨设备远程连接验收，不能视为完成这些平台与链路的实机验收。
+这是本机构建及实际 Qt 组件验证；Mac 验证记录见后续章节。尚未安装替换用户 App 或进行跨设备远程连接验收，不能视为完成这些链路的实机验收。
 
 ## 同链审查发现：忙碌拒绝改写原会话
 
@@ -45,3 +46,37 @@ Windows 原生 Qt 设置面板截图为 `tmp/remote-device-list-settings-green.p
 RED 日志：`tmp/remote-device-list-busy-tuple-red.txt`。修复将邀请拒绝回复放在接管 host 会话上下文之前，并直接使用被拒邀请自己的 session ID；只有需要确认或接受的邀请才写入 host tuple。原会话的用户确认拒绝仍沿用原 `applyHostDecision()` 路径。
 
 修复后只重新构建并完整运行 controller 套件：31 项通过、0 失败（`tmp/remote-device-list-busy-tuple-controller-green.txt`）。其他已通过的测试和 UI 未重复运行；本节没有扩大协议或输入授权规则。
+
+## Windows 普通 App 与包启动
+
+2026-11-12 14:25–14:29 +08:00，在精确 3bef 源码复用上述普通 Release cache 构建 `maichat`，
+exit 0，post-build windeployqt 完成；PE 门禁覆盖 3 binaries、114 imports 和 Qt plugins。
+build、完整 staging、实际 ZIP 解压后三份 exe 均为 165797888 bytes，SHA256
+`98c62d231a2fda5ece4857d563da1faa35ac6dc9ab2468ddea36ac3e5101ad3a`。
+staging 与 ZIP 的 81 个文件逐 SHA 相同；ZIP 为 241653560 bytes，SHA256
+`29c535871971de35ff340c83afa533689524c6e18c3e2e5b9835c83ca16d7b1e`。
+
+两包分别在仅含 Windows/System32 的 PATH 下运行普通 `--smoke`，PID 46796、47072，均 exit 0，
+启动日志实读 2.2.58 / Qt 6.12.0。五个实际加载的 Qt 模块（Core、Gui、Widgets、Svg、qwindows）
+逐项来自对应包内。候选证据保留在 `.cache/local-model-empty-20261112/desktop-candidate/`
+的 `build-receipt.json`、`candidate-gates.json`、`staging-smoke.json`、`zip-smoke.json` 及原日志。
+
+私有 smoke 脚本仅增加新子进程的 USERPROFILE 重定位，配合 APPDATA/LOCALAPPDATA；
+启动日志实际路径均核准在候选目录的 smoke-profiles 内。未读、复制或清理旧 profile/log，未恢复账号、
+安装或发布。普通 Windows/Qt 启动不宣称零用户注册表写入；这些 smoke 也不代表远端真实连接验收。
+
+## Mac 普通 App 与 Cocoa 验证
+
+执行端核对 3bef 的十二份 Desktop 源码 canonical SHA/blob、plain patch 及两产品树后，
+复用原普通 Qt 6.12 cache 构建 App 和四个测试 target，exit 0 / 88.112s。
+App 版本为 2.2.58，exe SHA256 为
+`bf38076853eb1eec3f893a99d5dac30fc316e7579d02f5ebd41e731264c73e33`，本轮未额外运行 Mac App smoke。
+
+测试使用真实 Cocoa、各自私有 CF home 和原 sandbox：controller 31/0（7436ms），
+session 21/0（1ms），settings 9/0（341ms）；MainWindow 仅上述两个指定用例及 hooks，4/0（1074ms）。
+四份原 txt 均在 Windows 独立读回，长度/SHA 与执行端索引逐项相同，Totals 均为零失败。
+两张实收设置图已亲看：远程桌面设备名单行消失，模式、密码、远控、代理完整；
+账号设置页没有诊断字段。IM 实收图仅用于显示核对，不宣称与执行端原 PNG 逐字节相同。
+
+该轮使用 Fake IM/TRTC 与真实 widgets，没有实际远程连接或用户输入注入。
+没有部署、安装、现装 App/设备操作或版本、发布改动；跨设备远程连接仍未验收。
