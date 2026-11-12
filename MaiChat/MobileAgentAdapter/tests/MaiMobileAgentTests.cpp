@@ -9,6 +9,7 @@
 #include "MaiMobileHostTools.h"
 #include "MaiImageFilter.h"
 #include "MaiSqliteStore.h"
+#include "MaiToolOutput.h"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -1157,8 +1158,143 @@ static void toolDetailContract(const std::string& only = "") {
 }
 
 // 作用：按测试场景构造移动 Agent、调用公开接口并核对结果。
+// Exercise the ordinary Mobile configure/model/Runner path with an owned DB.
+// The retained record is historical data, never a command to execute again.
+static void toolOutputRegistrationContract() {
+    struct Fixture {
+        MaiFilePath root = MaiFileSystem::temporaryDirectory().append(
+            MaiFilePath::fromUtf8("mai-mobile-output-" + MaiIdGenerator::newEventId()));
+        httplib::Server server;
+        std::thread listener;
+        void* agent = nullptr;
+        ~Fixture() {
+            maiMobileAgentDestroy(agent);
+            server.stop();
+            if (listener.joinable()) listener.join();
+            MaiFileSystem::removeRecursively(root);
+        }
+    };
+    const std::string outputId = "owned_mobile_retained_output";
+    const std::string expectedText = "OWNED MOBILE OUTPUT\n\xe4\xb8\xad\xf0\x9f\x98\x84";
+    std::string session, messageId, partId;
+    std::atomic<int> requests{0};
+    std::atomic<bool> advertised{false}, readBack{false}, invalidRequest{false};
+    // Destroy the Agent and join HTTP callbacks before their captured state.
+    Fixture fixture;
+    CHECK(!MaiFileSystem::createDirectories(fixture.root));
+    const std::string database = fixture.root.toUtf8() + "/sessions.db";
+    fixture.server.Post("/chat/completions", [&](const httplib::Request& request,
+                                                 httplib::Response& response) {
+        try {
+            const Json body = Json::parse(request.body);
+            for (const auto& tool : body.at("tools")) {
+                if (tool.at("function").at("name") == "tool_output_read") advertised = true;
+            }
+            const int index = requests.fetch_add(1);
+            if (index == 0) {
+                response.set_content(
+                    frame({{"tool_calls", Json::array({
+                        {{"index", 0}, {"id", "owned_mobile_read_call"}, {"type", "function"},
+                         {"function", {{"name", "tool_output_read"},
+                                       {"arguments", Json{{"output_id", outputId}}.dump()}}}}
+                    })}}, "tool_calls") + "data: [DONE]\n\n", "text/event-stream");
+                return;
+            }
+            for (const auto& message : body.at("messages")) {
+                if (message.value("role", "") != "tool" ||
+                    message.value("tool_call_id", "") != "owned_mobile_read_call") continue;
+                const Json result = Json::parse(message.at("content").get<std::string>(), nullptr, false);
+                if (result.is_object() && result.value("output_id", "") == outputId &&
+                    result.value("message_id", "") == messageId &&
+                    result.value("part_id", "") == partId &&
+                    result.value("call_id", "") == "owned_original_call" &&
+                    result.value("text", "") == expectedText &&
+                    result.value("next_offset_bytes", 1) == 0) readBack = true;
+            }
+            response.set_content(frame({{"content", "owned read complete"}}, "stop") +
+                                     "data: [DONE]\n\n", "text/event-stream");
+        } catch (...) {
+            invalidRequest = true;
+            response.status = 500;
+            response.set_content("owned fixture request shape mismatch", "text/plain");
+        }
+    });
+    const int port = fixture.server.bind_to_any_port("127.0.0.1");
+    CHECK(port > 0);
+    const Json config{{"op", "configure"}, {"model", "test"}, {"apiKey", "test-key"},
+                      {"wire", "chat_completions"}, {"policy", "never"},
+                      {"baseUrl", "http://127.0.0.1:" + std::to_string(port)},
+                      {"workspace", fixture.root.toUtf8()}, {"database", database}};
+    const auto open = [&] {
+        fixture.agent = maiMobileAgentCreate();
+        CHECK(fixture.agent != nullptr);
+        CHECK(call(fixture.agent, config).at("ok") == true);
+    };
+    open();
+    session = call(fixture.agent, {{"op", "create"}}).at("id");
+    maiMobileAgentDestroy(fixture.agent);
+    fixture.agent = nullptr;
+    {
+        auto store = makeMaiSqliteStore(database);
+        CHECK(store);
+        MaiToolPart original;
+        original.tool = "owned_recorded_tool";
+        original.callId = "owned_original_call";
+        original.input = "{}";
+        original.output = "owned retained-output preview";
+        original.state = MaiToolState::Completed;
+        MaiMessage message;
+        message.id = messageId = MaiIdGenerator::newMessageId();
+        message.role = MaiRole::Assistant;
+        message.created = message.completed = MaiTime::getCurrentTime();
+        partId = MaiIdGenerator::newPartId();
+        message.parts.push_back({partId, original, message.created});
+        store.value()->putMessage(session, message);
+        CHECK(!store.value()->lastWriteError());
+        MaiToolOutputRecord output;
+        output.id = outputId;
+        output.sessionId = session;
+        output.messageId = messageId;
+        output.partId = partId;
+        output.callId = original.callId;
+        output.text = expectedText;
+        output.created = message.created;
+        CHECK(!store.value()->putToolOutput(output));
+    }
+    open();
+    // All identifiers are fixed before the listener thread starts.
+    fixture.listener = std::thread([&] { fixture.server.listen_after_bind(); });
+    fixture.server.wait_until_ready();
+    CHECK(fixture.server.is_running());
+    CHECK(call(fixture.agent, {{"op", "send"}, {"session", session},
+                               {"text", "Read the owned saved output without rerunning its tool."}}).at("ok") == true);
+    bool finished = false;
+    for (int i = 0; i < 160; ++i) {
+        const auto snapshot = call(fixture.agent,
+            {{"op", "snapshot"}, {"session", session}, {"force", true}});
+        if (!snapshot.at("busy").get<bool>()) { finished = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    CHECK(finished);
+    CHECK(!invalidRequest.load());
+    CHECK(requests.load() >= 1);
+    CHECK(advertised.load());
+    CHECK(readBack.load());
+    CHECK(requests.load() == 2);
+    std::puts("PASS: Mobile configure advertises tool_output_read; Runner reads same-session saved output");
+}
+
 // 按真实调用顺序检查输入和可观察结果，失败时保留定位所需的上下文。
 int main(int argc, char** argv) {
+    const bool outputOnly = argc == 2 && std::strcmp(argv[1], "--tool-output-registration-only") == 0;
+    if (argc == 1 || outputOnly) {
+        try { toolOutputRegistrationContract(); }
+        catch (const std::exception& error) {
+            std::fprintf(stderr, "FAIL: Mobile output registration: %s\n", error.what());
+            return 1;
+        }
+        if (outputOnly) return 0;
+    }
     const bool captureOnly = argc == 2 && std::strcmp(argv[1], "--capture-contract-only") == 0;
     const bool cameraOnly = argc == 2 && std::strcmp(argv[1], "--camera-routing-contract-only") == 0;
     const bool detailOnly = argc == 2 && std::strcmp(argv[1], "--tool-detail-contract-only") == 0;
@@ -1168,7 +1304,8 @@ int main(int argc, char** argv) {
         std::fputs(
             "usage: MaiMobileAgentTests "
             "[--capture-contract-only|--camera-routing-contract-only|--tool-detail-contract-only|"
-            "--tool-detail-binding-contract-only|--tool-detail-call-id-contract-only]\n",
+            "--tool-detail-binding-contract-only|--tool-detail-call-id-contract-only|"
+            "--tool-output-registration-only]\n",
             stderr);
         return 2;
     }

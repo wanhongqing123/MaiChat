@@ -48,6 +48,7 @@
 #include "MaiTemporalWatermarkTool.h"
 #include "MaiTimeTool.h"
 #include "MaiTodoWriteTool.h"
+#include "MaiToolOutputTool.h"
 #include "MaiVideoGeometryTool.h"
 #include "MaiVideoMatting.h"
 #include "MaiVideoMattingTool.h"
@@ -756,6 +757,8 @@ struct MaiMobileAgent {
         registerMaiFileTools(*tools);
         // 移动宿主的媒体与导出工具仍使用统一的默认工作目录，不能只切换 Agent 会话路径。
         registerMaiSessionTools(*tools, /*includeWorkspaceSwitch=*/false);
+        // 移动端手工注册表也必须提供只读回查，才能消费Runner返回的原始输出句柄。
+        tools->add(makeMaiToolOutputReadTool());
         registerMaiCurlTools(*tools, config.caBundlePath);
         // 与普通 C ABI 共用进程内的唯一驻留模型；主聊天仍直连原供应商。
         registerMaiLlamaTools(*tools);
