@@ -94,9 +94,22 @@ wired/connected 变为 unavailable。没有执行任何 install 命令，最后�
 4016 原日志的 `CurrentlyAssertableStates` 为空，表示当前不满足所需的 CoreDevice 状态；
 `unavailable` 分类来自 Mac 的设备状态回报，不仅凭错误号断定数据线或具体连接故障。
 
-Mac 已异步请用户重新接数据线并解锁。等待连接恢复后直接用既定签名 build206 保数据覆盖，
-再读回设备版本和普通启动 PID；不反复重试、不重建、不留自动 UI 等待。
-构建和签名已就绪，安装与实机启动验收尚未完成。
+Mac 已异步请用户重新接数据线并解锁；不反复查询不可用设备，不留自动 UI 等待。
+a328 阶段的构建和签名已就绪，安装与实机启动验收尚未完成。
+
+## 后续空答修正使旧候选暂停安装
+
+随后用户报告创作中心本地模型空回复。Core `37e1381a` 和 iOS `cfed9c93` 已新增有界补答与
+持久空答说明，详见 [空回复诊断](maichat-local-model-empty-reply-20261112.md)。
+旧 a328 签名 build206 没有这些修正，已明确暂停安装，不能在连接恢复后直接使用。
+
+最新产品冻结为 `3befec3df52cd6e0b6e5380739ceb4e2cbf99afe`：MaiChat tree
+`29d8bfb555d5fb5fe46ca5dac1a852f2b19fcc1b`，Core tree
+`30114b3e33472ba1692987e0a90df11f81d853df`。
+Mac 已获指令复用原普通 device-derived cache 做必要 Release 增量，按实际构建源码记录，
+不为后续 docs-only 提交重建。新 device 候选还须核对最终链接、签名/profile 和升级兼容。
+连接恢复后装前读实际现装 build，再选更大的命令行 build override，保数据覆盖并核装后版本与普通启动 PID。
+本节没有新候选构建或安装成功结果；Simulator Release 的通过不能替代这些证据。
 
 ## 验证边界
 
