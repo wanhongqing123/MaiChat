@@ -1,4 +1,4 @@
-// 文件作用：扫描 MaiChat 好友二维码，只返回经过格式校验的 MaiChat 账号 ID。
+// 文件作用：统一扫描好友与电脑登录二维码；好友返回账号，电脑登录进入显式确认页。
 package com.kongshang.maichat;
 
 import android.Manifest;
@@ -34,6 +34,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class FriendQrScanActivity extends MaiChatBaseActivity {
     private static final int CAMERA_PERMISSION_REQUEST = 1;
+    private static final int DESKTOP_LOGIN_REQUEST = 2;
+    private static final String KEY_DESKTOP_OPEN = "desktop_approval_open";
+    private static final String SCAN_HINT = "扫描好友二维码或电脑登录二维码";
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean frameInFlight = new AtomicBoolean();
     private final BarcodeScanner scanner = BarcodeScanning.getClient(
@@ -43,9 +46,12 @@ public final class FriendQrScanActivity extends MaiChatBaseActivity {
     private ProcessCameraProvider provider;
     private boolean providerLoading;
     private volatile boolean finished;
+    private volatile boolean active;
+    private volatile boolean openingDesktop;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        openingDesktop = state != null && state.getBoolean(KEY_DESKTOP_OPEN);
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(0xFF101829);
         previewView = new PreviewView(this);
@@ -61,7 +67,7 @@ public final class FriendQrScanActivity extends MaiChatBaseActivity {
             Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         titleParams.topMargin = dp(12);
         root.addView(title, titleParams);
-        hint = MaiChatTheme.label(this, "扫描对方的好友二维码", MaiChatTypographyTokens.Role.BODY, Color.WHITE);
+        hint = MaiChatTheme.label(this, SCAN_HINT, MaiChatTypographyTokens.Role.BODY, Color.WHITE);
         hint.setGravity(Gravity.CENTER);
         FrameLayout.LayoutParams hintParams = new FrameLayout.LayoutParams(-1, dp(58),
             Gravity.BOTTOM);
@@ -80,6 +86,8 @@ public final class FriendQrScanActivity extends MaiChatBaseActivity {
 
     @Override protected void onResume() {
         super.onResume();
+        active = true;
+        if (finished || openingDesktop) return;
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             == PackageManager.PERMISSION_GRANTED) {
             ensureCamera();
@@ -90,8 +98,30 @@ public final class FriendQrScanActivity extends MaiChatBaseActivity {
     }
 
     @Override protected void onPause() {
+        active = false;
         if (provider != null) provider.unbindAll();
         super.onPause();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle state) {
+        state.putBoolean(KEY_DESKTOP_OPEN, openingDesktop);
+        super.onSaveInstanceState(state);
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != DESKTOP_LOGIN_REQUEST || !openingDesktop || finished) return;
+        openingDesktop = false;
+        if (resultCode == DesktopLoginApprovalActivity.RESULT_SCAN_AGAIN) {
+            hint.setText(SCAN_HINT);
+            // 只恢复实际已回到前台的父页面；通常由随后的 onResume 打开相机。
+            if (active) ensureCamera();
+        } else {
+            // 登录结果不是好友结果，不能把子页面的 RESULT_OK/extra 传给添加好友入口。
+            finished = true;
+            setResult(RESULT_CANCELED);
+            finish();
+        }
     }
 
     @Override public void onRequestPermissionsResult(int requestCode, String[] permissions,
@@ -106,13 +136,15 @@ public final class FriendQrScanActivity extends MaiChatBaseActivity {
     }
 
     private void ensureCamera() {
-        if (finished || providerLoading) return;
+        if (!active || finished || openingDesktop || providerLoading) return;
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED) return;
         if (provider != null) { bindCamera(); return; }
         providerLoading = true;
         ListenableFuture<ProcessCameraProvider> future = ProcessCameraProvider.getInstance(this);
         future.addListener(() -> {
             providerLoading = false;
-            if (isFinishing() || isDestroyed()) return;
+            if (!active || finished || openingDesktop || isFinishing() || isDestroyed()) return;
             try {
                 provider = future.get();
                 bindCamera();
@@ -121,7 +153,7 @@ public final class FriendQrScanActivity extends MaiChatBaseActivity {
     }
 
     private void bindCamera() {
-        if (finished || provider == null || isFinishing()) return;
+        if (!active || finished || openingDesktop || provider == null || isFinishing()) return;
         try {
             Preview preview = new Preview.Builder().build();
             preview.setSurfaceProvider(previewView.getSurfaceProvider());
@@ -130,13 +162,13 @@ public final class FriendQrScanActivity extends MaiChatBaseActivity {
             analysis.setAnalyzer(cameraExecutor, this::scanFrame);
             provider.unbindAll();
             provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis);
-            hint.setText("扫描对方的好友二维码");
+            hint.setText(SCAN_HINT);
         } catch (Exception failure) { hint.setText("相机不可用"); }
     }
 
     @androidx.camera.core.ExperimentalGetImage
     private void scanFrame(ImageProxy frame) {
-        if (finished || !frameInFlight.compareAndSet(false, true)) {
+        if (!active || finished || openingDesktop || !frameInFlight.compareAndSet(false, true)) {
             frame.close();
             return;
         }
@@ -146,17 +178,7 @@ public final class FriendQrScanActivity extends MaiChatBaseActivity {
             frame.getImageInfo().getRotationDegrees());
         scanner.process(input).addOnSuccessListener(codes -> {
             for (Barcode code : codes) {
-                String userId = FriendQrPolicy.userId(code.getRawValue());
-                if (userId.isEmpty()) {
-                    hint.setText("这不是 MaiChat 好友二维码");
-                    continue;
-                }
-                if (finished) return;
-                finished = true;
-                Intent result = new Intent().putExtra("friend_user_id", userId);
-                setResult(RESULT_OK, result);
-                finish();
-                return;
+                if (acceptQrUri(code.getRawValue())) return;
             }
         }).addOnCompleteListener(task -> {
             frameInFlight.set(false);
@@ -164,11 +186,34 @@ public final class FriendQrScanActivity extends MaiChatBaseActivity {
         });
     }
 
+    // 相机和普通调用共用严格识别入口；登录码只读取请求，不携带批准决定。
+    boolean acceptQrUri(String raw) {
+        if (!active || finished || openingDesktop || isFinishing() || isDestroyed()) return false;
+        String userId = FriendQrPolicy.userId(raw);
+        if (userId.isEmpty()) {
+            if (DesktopLoginQrUri.requestId(raw).isEmpty()) {
+                hint.setText("这不是 MaiChat 好友或电脑登录二维码");
+                return false;
+            }
+            openingDesktop = true;
+            if (provider != null) provider.unbindAll();
+            startActivityForResult(new Intent(this, DesktopLoginApprovalActivity.class)
+                .putExtra(DesktopLoginApprovalActivity.EXTRA_QR_URI, raw), DESKTOP_LOGIN_REQUEST);
+            return true;
+        }
+        finished = true;
+        Intent result = new Intent().putExtra("friend_user_id", userId);
+        setResult(RESULT_OK, result);
+        finish();
+        return true;
+    }
+
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
     @Override protected void onDestroy() {
+        active = false;
         finished = true;
         if (provider != null) provider.unbindAll();
         scanner.close();

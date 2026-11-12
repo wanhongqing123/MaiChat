@@ -47,6 +47,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /** 扫描时只接受本产品 URI；展示服务端核对码后才允许批准。 */
 public final class DesktopLoginApprovalActivity extends MaiChatBaseActivity {
+    static final String EXTRA_QR_URI = "desktop_login_qr_uri";
+    static final int RESULT_SCAN_AGAIN = RESULT_FIRST_USER;
     private enum State { SCANNING, PERMISSION, LOADING, CONFIRM, DECIDING, RESULT, ERROR }
 
     private static final int CAMERA_PERMISSION_REQUEST = 1;
@@ -127,6 +129,15 @@ public final class DesktopLoginApprovalActivity extends MaiChatBaseActivity {
                 } else {
                     state = State.LOADING;
                 }
+            }
+        } else if (openedFromScanner()) {
+            // 内部 Intent 仍须复验二维码；合法输入只加载详情，批准沿用原确认按钮。
+            requestId = DesktopLoginQrUri.requestId(getIntent().getStringExtra(EXTRA_QR_URI));
+            if (requestId.isEmpty()) {
+                state = State.ERROR;
+                errorMessage = "这不是 MaiChat 电脑登录二维码";
+            } else {
+                state = State.LOADING;
             }
         }
         render();
@@ -392,6 +403,11 @@ public final class DesktopLoginApprovalActivity extends MaiChatBaseActivity {
     }
 
     private void scanAgain() {
+        if (openedFromScanner()) {
+            setResult(RESULT_SCAN_AGAIN);
+            finish();
+            return;
+        }
         requestId = "";
         displayCode = "";
         platform = "";
@@ -400,6 +416,10 @@ public final class DesktopLoginApprovalActivity extends MaiChatBaseActivity {
         state = State.SCANNING;
         render();
         ensureCamera();
+    }
+
+    private boolean openedFromScanner() {
+        return getIntent() != null && getIntent().hasExtra(EXTRA_QR_URI);
     }
 
     private void render() {
@@ -418,7 +438,7 @@ public final class DesktopLoginApprovalActivity extends MaiChatBaseActivity {
         root.addView(header, new LinearLayout.LayoutParams(-1, dp(56)));
         TextView back = MaiChatTheme.symbol(this, "‹", 32, MaiChatTheme.TEXT);
         back.setGravity(Gravity.CENTER);
-        back.setContentDescription("返回设置");
+        back.setContentDescription(openedFromScanner() ? "关闭扫码登录" : "返回设置");
         header.addView(back, new LinearLayout.LayoutParams(dp(40), -1));
         back.setOnClickListener(view -> onBackPressed());
         TextView title = MaiChatTheme.label(this, "扫码登录桌面端", MaiChatTypographyTokens.Role.HEADING3, MaiChatTheme.TEXT);
@@ -458,12 +478,12 @@ public final class DesktopLoginApprovalActivity extends MaiChatBaseActivity {
         } else if (state == State.RESULT) {
             addTitle(content, approved ? "已批准桌面登录" : "已拒绝桌面登录");
             addDetail(content, approved ? "电脑正在完成登录。" : "该二维码已失效。");
-            addButton(content, "返回设置", true, this::finish);
+            addButton(content, openedFromScanner() ? "完成" : "返回设置", true, this::finish);
         } else if (state == State.ERROR) {
             addTitle(content, "无法完成扫码登录");
             addDetail(content, errorMessage);
             addButton(content, "重新扫码", true, this::scanAgain);
-            addButton(content, "返回设置", false, this::finish);
+            addButton(content, openedFromScanner() ? "关闭" : "返回设置", false, this::finish);
         }
     }
 

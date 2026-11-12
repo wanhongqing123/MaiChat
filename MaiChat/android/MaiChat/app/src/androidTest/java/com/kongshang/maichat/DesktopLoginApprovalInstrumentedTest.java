@@ -40,15 +40,20 @@ public final class DesktopLoginApprovalInstrumentedTest {
 
         Instrumentation instrumentation = InstrumentationRegistry.getInstrumentation();
         Context context = instrumentation.getTargetContext();
-        Intent intent = new Intent(context, DesktopLoginApprovalActivity.class);
+        Intent intent = new Intent(context, FriendQrScanActivity.class);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        DesktopLoginApprovalActivity activity =
-            (DesktopLoginApprovalActivity) instrumentation.startActivitySync(intent);
+        Instrumentation.ActivityMonitor monitor = instrumentation.addMonitor(
+            DesktopLoginApprovalActivity.class.getName(), null, false);
+        FriendQrScanActivity scanner =
+            (FriendQrScanActivity) instrumentation.startActivitySync(intent);
+        DesktopLoginApprovalActivity activity = null;
         try {
             AtomicBoolean accepted = new AtomicBoolean();
-            instrumentation.runOnMainSync(() -> accepted.set(activity.acceptQrUri(
+            instrumentation.runOnMainSync(() -> accepted.set(scanner.acceptQrUri(
                 "maichat://auth/desktop?request_id=" + id)));
             assertTrue(accepted.get());
+            activity = (DesktopLoginApprovalActivity) monitor.waitForActivityWithTimeout(5_000);
+            assertNotNull("Unified scan must enter the existing confirmation Activity", activity);
             assertNotNull(waitForText(instrumentation, activity, displayCode, 15_000));
             capture(context, instrumentation, "confirm-" + decision);
 
@@ -62,7 +67,12 @@ public final class DesktopLoginApprovalInstrumentedTest {
             assertNotNull(waitForText(instrumentation, activity, result, 15_000));
             capture(context, instrumentation, "result-" + decision);
         } finally {
-            instrumentation.runOnMainSync(activity::finish);
+            DesktopLoginApprovalActivity opened = activity;
+            instrumentation.runOnMainSync(() -> {
+                if (opened != null) opened.finish();
+                scanner.finish();
+            });
+            instrumentation.removeMonitor(monitor);
         }
     }
 
