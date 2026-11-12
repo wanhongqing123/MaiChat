@@ -65,14 +65,34 @@ Root 已收到并阅读两轮原始测试输出，核对两份 patch 的长度�
 - 最终签名 exe SHA256：
   `8f9cee1a6b749b7d082afb978b30663e92eaffe954dd87c93c501a6f9d08042d`。
   Mac 状态及 ready 回执记 strict signature exit 0、profile 含目标设备、十项升级 entitlement 兼容、
-  九个 Release MachO 不含 Debug seam。这些是 Mac 端核查结果；Root 已核回执的源码与两树身份，
-  尚未收到本轮完整构建、签名和合库原日志，不把布尔回执写成 Windows 本机实测。
+  九个 Release MachO 不含 Debug seam。
+
+### 后补证据核对
+
+Root 已核收六份共享日志的长度和 SHA256。destination、ce74 构建和 a328 构建是脱敏副本，
+清单把各自 private 原件与 shared 副本的长度、SHA 分开；final Ld、factory 符号和
+安装前 4016 三份日志与所列原件同字节。实际 Ld 行包含最终合库路径，符号日志包含
+已定义的 `T __Z25makeMaiToolOutputReadToolv`，两份构建日志分别记录五个 Core 源实际编译
+和最后 Mobile 源重编。
+
+Root 同时核对六份源码 canonical SHA 与 a328 提交相等，三归档共十二个 member SHA
+记录与对应 object SHA 自洽。真实对象、归档、profile、签名材料和完整依赖日志仍在 Mac 私有目录，
+Root 没有下载二进制重算；六份 header 依赖仅收到所需行摘段，不冒充完整 deps 原日志。
+十项 entitlement 记录包括 presence 与 equal；签名旧基线为此前已验证的 205 产物，
+不是本轮从设备容器导出的材料。codesign 默认静默的零字节日志仅记录空文件 SHA 和实际 exit 0，
+没有非空签名日志附件。
+
+Mac 已把同一签名 App 同卷移动到独立 ready 路径冻结，未复制整包。
+装前须从 ready 路径复核签名和 exe SHA；此移动不构成安装。
 
 ## 当前阻断：物理设备断开
 
 安装前再次读设备 app metadata 时，CoreDevice 返回 4016，物理 iPhone 从此前
 wired/connected 变为 unavailable。没有执行任何 install 命令，最后实际读回的现装版本仍是
 `2.2.4 / 205`；没有 build206 的装后版本或启动 PID。
+
+4016 原日志的 `CurrentlyAssertableStates` 为空，表示当前不满足所需的 CoreDevice 状态；
+`unavailable` 分类来自 Mac 的设备状态回报，不仅凭错误号断定数据线或具体连接故障。
 
 Mac 已异步请用户重新接数据线并解锁。等待连接恢复后直接用既定签名 build206 保数据覆盖，
 再读回设备版本和普通启动 PID；不反复重试、不重建、不留自动 UI 等待。
