@@ -2,6 +2,8 @@
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QtTest/QtTest>
 
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTemporaryDir>
 
 #include "remote/RemoteDesktopSettings.h"
@@ -15,17 +17,16 @@ private slots:
     void defaultsToAttendedWithoutPassword();
     void roundTripsThroughDisk();
     void neverWritesPlaintextPassword();
-    void fallsBackToAttendedWhenUnattendedHasNoPassword();
+    void keepsUnattendedModeWithoutPassword();
     void recoversFromCorruptFileWithSafeDefaults();
     void treatsUnknownModeAsAttended();
-    void matchesAllowListExactlyAfterTrimming();
+    void dropsLegacyDeviceListWhenSaving();
 };
 
 void RemoteDesktopSettingsTest::defaultsToAttendedWithoutPassword() {
     const RemoteDesktopSettings settings;
     QCOMPARE(static_cast<int>(settings.mode), static_cast<int>(HostMode::Attended));
     QVERIFY(!settings.hasPassword());
-    QVERIFY(settings.allowedUserIds.isEmpty());
     QCOMPARE(settings.consecutiveAuthFailures, 0);
     QVERIFY(!settings.trtcProxyEnabled);
     QCOMPARE(settings.trtcProxyHost, QStringLiteral("127.0.0.1"));
@@ -41,8 +42,6 @@ void RemoteDesktopSettingsTest::roundTripsThroughDisk() {
     settings.mode = HostMode::Unattended;
     settings.secret = RemoteDesktopAuth::deriveSecret(QStringLiteral("pw-123"),
                                                       RemoteDesktopAuth::generateSalt());
-    settings.allowedUserIds =
-        QStringList{QStringLiteral("whq-iphone"), QStringLiteral("mac-multi-ai-code")};
     settings.consecutiveAuthFailures = 2;
     settings.trtcProxyEnabled = true;
     settings.trtcProxyHost = QStringLiteral("proxy.internal");
@@ -54,7 +53,6 @@ void RemoteDesktopSettingsTest::roundTripsThroughDisk() {
     QCOMPARE(static_cast<int>(loaded.mode), static_cast<int>(HostMode::Unattended));
     QCOMPARE(loaded.secret.salt, settings.secret.salt);
     QCOMPARE(loaded.secret.hash, settings.secret.hash);
-    QCOMPARE(loaded.allowedUserIds, settings.allowedUserIds);
     QCOMPARE(loaded.consecutiveAuthFailures, 2);
     QVERIFY(loaded.trtcProxyEnabled);
     QCOMPARE(loaded.trtcProxyHost, QStringLiteral("proxy.internal"));
@@ -82,11 +80,10 @@ void RemoteDesktopSettingsTest::neverWritesPlaintextPassword() {
     QVERIFY(!onDisk.contains(password.toUtf8()));
 }
 
-void RemoteDesktopSettingsTest::fallsBackToAttendedWhenUnattendedHasNoPassword() {
+void RemoteDesktopSettingsTest::keepsUnattendedModeWithoutPassword() {
     RemoteDesktopSettings settings;
     settings.mode = HostMode::Unattended;
-    // 密码是可选加固，不是无人值守的前提：没设密码时模式保持不变，
-    // 授权由白名单承担（主场景是自己连自己的电脑，不该被密码挡住）。
+    // 密码是可选加固；没设密码时仍遵循用户选择的无人值守模式。
     QVERIFY(!settings.hasPassword());
     QCOMPARE(static_cast<int>(settings.effectiveMode()), static_cast<int>(HostMode::Unattended));
 }
@@ -103,7 +100,6 @@ void RemoteDesktopSettingsTest::recoversFromCorruptFileWithSafeDefaults() {
     // 解析失败不得放宽权限。
     QCOMPARE(static_cast<int>(loaded.mode), static_cast<int>(HostMode::Attended));
     QVERIFY(!loaded.hasPassword());
-    QVERIFY(loaded.allowedUserIds.isEmpty());
 }
 
 void RemoteDesktopSettingsTest::treatsUnknownModeAsAttended() {
@@ -118,16 +114,21 @@ void RemoteDesktopSettingsTest::treatsUnknownModeAsAttended() {
              static_cast<int>(HostMode::Attended));
 }
 
-void RemoteDesktopSettingsTest::matchesAllowListExactlyAfterTrimming() {
-    RemoteDesktopSettings settings;
-    settings.allowedUserIds = QStringList{QStringLiteral("  whq-iphone  ")};
+void RemoteDesktopSettingsTest::dropsLegacyDeviceListWhenSaving() {
+    QTemporaryDir dir;
+    const QString path = dir.filePath(QStringLiteral("remote-desktop.json"));
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    file.write("{\"mode\":\"unattended\",\"allowedUserIds\":[\"company-iphone\"]}");
+    file.close();
 
-    QVERIFY(settings.isSenderAllowed(QStringLiteral("whq-iphone")));
-    QVERIFY(settings.isSenderAllowed(QStringLiteral(" whq-iphone ")));
-    // 前缀/子串不算命中，避免 whq-iphone-evil 混进来。
-    QVERIFY(!settings.isSenderAllowed(QStringLiteral("whq-iphone-evil")));
-    QVERIFY(!settings.isSenderAllowed(QStringLiteral("whq")));
-    QVERIFY(!settings.isSenderAllowed(QString()));
+    const RemoteDesktopSettingsStore store(path);
+    const RemoteDesktopSettings settings = store.load();
+    QCOMPARE(settings.mode, HostMode::Unattended);
+    QVERIFY(store.save(settings));
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    const QJsonObject saved = QJsonDocument::fromJson(file.readAll()).object();
+    QVERIFY(!saved.contains(QStringLiteral("allowedUserIds")));
 }
 
 QTEST_MAIN(RemoteDesktopSettingsTest)

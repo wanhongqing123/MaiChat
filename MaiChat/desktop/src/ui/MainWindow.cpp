@@ -8476,7 +8476,7 @@ QWidget *MainWindow::buildRemoteDesktopSettingsPanel(QWidget *parent) {
   };
   const QVector<ModeOption> options{
       {RemoteDesktop::HostMode::Unattended, QStringLiteral("无人值守"),
-       QStringLiteral("允许列表内的设备可直接连入，不打扰你")},
+       QStringLiteral("收到请求后自动接受，已设置的访问密码仍须验证")},
       {RemoteDesktop::HostMode::Attended, QStringLiteral("每次确认"),
        QStringLiteral("每次收到请求都弹窗，60 秒无应答自动拒绝")},
       {RemoteDesktop::HostMode::Disabled, QStringLiteral("关闭"),
@@ -8510,7 +8510,7 @@ QWidget *MainWindow::buildRemoteDesktopSettingsPanel(QWidget *parent) {
   auto *passwordRow = createSettingsRow(
       QStringLiteral("访问密码"), remoteDesktopPasswordValue_,
       QStringLiteral(
-          "可选。设置后，对方连入时还需输入此密码；不设则仅凭允许列表授权。"));
+          "可选。无人值守时，设置后对方连入还需输入此密码。"));
   auto *passwordButton = new QPushButton(QStringLiteral("设置"), passwordRow);
   passwordButton->setObjectName(QStringLiteral("settingsRowButton"));
   passwordButton->setCursor(Qt::PointingHandCursor);
@@ -8520,23 +8520,6 @@ QWidget *MainWindow::buildRemoteDesktopSettingsPanel(QWidget *parent) {
     rowLayout->addWidget(passwordButton);
   }
   layout->addWidget(passwordRow);
-
-  // 允许列表：谁能连入本机。
-  remoteDesktopAllowValue_ = new QLabel(panel);
-  remoteDesktopAllowValue_->setObjectName(QStringLiteral("settingsRowValue"));
-  remoteDesktopAllowValue_->setProperty("settingsRowValue", true);
-  auto *allowRow = createSettingsRow(
-      QStringLiteral("允许连入的设备"), remoteDesktopAllowValue_,
-      QStringLiteral("只有列表内的账号能远程本机，其余一律拒绝。"));
-  auto *allowButton = new QPushButton(QStringLiteral("编辑"), allowRow);
-  allowButton->setObjectName(QStringLiteral("settingsRowButton"));
-  allowButton->setCursor(Qt::PointingHandCursor);
-  connect(allowButton, &QPushButton::clicked, this,
-          &MainWindow::editRemoteDesktopAllowList);
-  if (auto *rowLayout = qobject_cast<QHBoxLayout *>(allowRow->layout())) {
-    rowLayout->addWidget(allowButton);
-  }
-  layout->addWidget(allowRow);
 
   // 远程控制：与「允许观看」彼此独立的一道闸，默认关。
   // 不跟着无人值守走——否则那一个开关会在用户不知情的情况下，
@@ -8620,10 +8603,6 @@ void MainWindow::refreshRemoteDesktopSettings() {
   remoteDesktopPasswordValue_->setText(settings.hasPassword()
                                            ? QStringLiteral("已设置")
                                            : QStringLiteral("未设置"));
-  remoteDesktopAllowValue_->setText(
-      settings.allowedUserIds.isEmpty()
-          ? QStringLiteral("尚未添加")
-          : settings.allowedUserIds.join(QStringLiteral("、")));
 
   if (remoteDesktopControlToggle_) {
     // 回填时挡掉 toggled：否则会反过来触发一次保存，形成回环。
@@ -8660,7 +8639,7 @@ void MainWindow::editRemoteDesktopPassword() {
   AppTextInputDialog::Options options;
   options.title = QStringLiteral("访问密码");
   options.description = QStringLiteral(
-      "留空表示不设密码，仅凭允许列表授权。设置后对方连入时还需输入此密码。");
+      "留空表示不设密码。设置后，无人值守连入时仍需输入此密码。");
   options.placeholder = QStringLiteral("留空即不设密码");
   options.password = true;
   bool ok = false;
@@ -8676,33 +8655,6 @@ void MainWindow::editRemoteDesktopPassword() {
                                             ? RemoteDesktopAuth::generateSalt()
                                             : settings.secret.salt);
   settings.consecutiveAuthFailures = 0;
-  remoteDesktop_->updateSettings(settings);
-  remoteDesktopSettingsStore_->save(settings);
-  refreshRemoteDesktopSettings();
-}
-
-void MainWindow::editRemoteDesktopAllowList() {
-  const RemoteDesktopSettings current = remoteDesktop_->settings();
-  AppTextInputDialog::Options options;
-  options.title = QStringLiteral("允许连入的设备");
-  options.description =
-      QStringLiteral("只有列表内的账号能远程本机，多个账号用逗号分隔。");
-  options.placeholder = QStringLiteral("例如：whq-iphone, mac-air");
-  options.initialText = current.allowedUserIds.join(QStringLiteral(","));
-  bool ok = false;
-  const QString text = AppTextInputDialog::getText(this, options, &ok);
-  if (!ok)
-    return;
-
-  RemoteDesktopSettings settings = current;
-  settings.allowedUserIds.clear();
-  const QStringList parts = text.split(
-      QRegularExpression(QStringLiteral("[,，]")), Qt::SkipEmptyParts);
-  for (const QString &part : parts) {
-    const QString clean = part.trimmed();
-    if (!clean.isEmpty())
-      settings.allowedUserIds.append(clean);
-  }
   remoteDesktop_->updateSettings(settings);
   remoteDesktopSettingsStore_->save(settings);
   refreshRemoteDesktopSettings();
@@ -9204,8 +9156,8 @@ void MainWindow::requestRemoteDesktop() {
   if (peerId.isEmpty())
     return;
 
-  // 直接发起，不打断用户。绝大多数情况对方靠白名单授权即可；
-  // 只有对方额外设了访问密码时才会被拒，那时再按需索取密码。
+  // 直接发起，由对端的被控模式决定确认或自动接受；
+  // 无人值守若额外设了访问密码，收到密码拒绝后再按需索取。
   remoteDesktop_->requestView(peerId, remoteDesktopPasswords_.value(peerId));
 }
 

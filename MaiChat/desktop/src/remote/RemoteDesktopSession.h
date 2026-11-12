@@ -18,7 +18,7 @@ namespace RemoteDesktop {
 enum class HostMode {
     Disabled,    // 不接受任何请求
     Attended,    // 有人值守：每次弹窗确认（默认）
-    Unattended   // 无人值守：白名单 + 密码校验通过则自动接受
+    Unattended   // 无人值守：自动接受；设置了访问密码时必须校验通过
 };
 
 // 控制端（发起方）状态。
@@ -58,9 +58,7 @@ struct HostDecision {
 struct HostInviteInput {
     HostMode mode = HostMode::Attended;
     HostState currentState = HostState::Idle;
-    bool senderAllowed = false;      // 是否在白名单内
-    // 是否设置了访问密码。密码是**可选加固**：白名单本身即授权，
-    // 用户想要额外一层时才设。没设密码不代表不安全，只是少一道锁。
+    // 是否设置了可选访问密码；IM 发起身份由 controller 在调用前检查。
     bool passwordConfigured = false;
     bool authProofValid = false;     // 设了密码时，校验是否通过
     int consecutiveFailures = 0;     // 此前连续失败次数
@@ -68,7 +66,6 @@ struct HostInviteInput {
 
 // 拒绝原因常量：UI 与测试共用，避免散落的字面量。
 QString reasonNotEnabled();
-QString reasonNotAllowed();
 QString reasonBusy();
 QString reasonBadPassword();
 QString reasonDeclined();

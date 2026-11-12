@@ -132,13 +132,12 @@ const QString kPassword = QStringLiteral("pw-remote-1");
 
 class Harness {
 public:
-    explicit Harness(HostMode mode, bool withPassword = true, bool allowPeer = true) {
+    explicit Harness(HostMode mode, bool withPassword = true) {
         settings.mode = mode;
         if (withPassword) {
             settings.secret =
                 RemoteDesktopAuth::deriveSecret(kPassword, RemoteDesktopAuth::generateSalt());
         }
-        if (allowPeer) settings.allowedUserIds = QStringList{kPeerUser};
 
         RemoteDesktopController::Config config;
         config.sdkAppId = 1600148979;
@@ -232,8 +231,12 @@ private slots:
     void unattendedModeSharesWithoutPrompting();
     void unattendedModeRejectsWrongPassword();
     void unattendedModeDowngradesAfterRepeatedFailures();
-    void rejectsSenderOutsideAllowList();
+    void acceptsPeerWithoutDeviceList();
+    void attendedModeRequestsConsentWithoutDeviceList();
+    void ignoresInvitesWithoutSenderIdentity();
     void rejectsInviteWhileAlreadySharing();
+    void busyInviteKeepsPendingConsentSession();
+    void busyInviteKeepsActiveSessionInputAndStop();
     void reportsRejectionToViewer();
     void stopsSharingOnPeerStop();
     void reportsFailureWhenScreenShareCannotStart();
@@ -578,15 +581,39 @@ void RemoteDesktopControllerTest::unattendedModeDowngradesAfterRepeatedFailures(
     QCOMPARE(h.engine->shareCalls, 0);
 }
 
-void RemoteDesktopControllerTest::rejectsSenderOutsideAllowList() {
-    Harness h(HostMode::Unattended, /*withPassword=*/true, /*allowPeer=*/false);
+void RemoteDesktopControllerTest::acceptsPeerWithoutDeviceList() {
+    Harness h(HostMode::Unattended);
     QVERIFY(h.controller->handleIncomingText(
         kPeerUser, h.inviteText(QStringLiteral("s1"), QStringLiteral("room-1"), kPassword)));
 
-    QCOMPARE(static_cast<int>(h.lastSent().type), static_cast<int>(Type::Reject));
-    // 即使密码正确，不在白名单也一律拒绝，且不泄漏本机模式。
-    QCOMPARE(h.lastSent().reason, reasonNotAllowed());
+    QCOMPARE(static_cast<int>(h.lastSent().type), static_cast<int>(Type::Accept));
+    QCOMPARE(h.engine->shareCalls, 1);
+}
+
+void RemoteDesktopControllerTest::attendedModeRequestsConsentWithoutDeviceList() {
+    Harness h(HostMode::Attended, /*withPassword=*/false);
+    QSignalSpy consentSpy(h.controller.get(), &RemoteDesktopController::consentRequested);
+    QVERIFY(h.controller->handleIncomingText(
+        kPeerUser, h.inviteText(QStringLiteral("s1"), QStringLiteral("room-1"))));
+
+    QCOMPARE(consentSpy.count(), 1);
+    QCOMPARE(h.controller->hostState(), HostState::AwaitingConsent);
     QCOMPARE(h.engine->shareCalls, 0);
+}
+
+void RemoteDesktopControllerTest::ignoresInvitesWithoutSenderIdentity() {
+    // 名单移除后仍须有 IM 提供的发起身份，空值不能变成匿名连入。
+    for (const QString& sender : {QString(), QStringLiteral("  ")}) {
+        for (HostMode mode : {HostMode::Attended, HostMode::Unattended}) {
+            Harness h(mode, /*withPassword=*/false);
+            QSignalSpy consentSpy(h.controller.get(), &RemoteDesktopController::consentRequested);
+            QVERIFY(h.controller->handleIncomingText(
+                sender, h.inviteText(QStringLiteral("s1"), QStringLiteral("room-1"))));
+            QCOMPARE(h.controller->hostState(), HostState::Idle);
+            QCOMPARE(consentSpy.count(), 0);
+            QCOMPARE(h.engine->shareCalls, 0);
+        }
+    }
 }
 
 void RemoteDesktopControllerTest::rejectsInviteWhileAlreadySharing() {
@@ -603,6 +630,60 @@ void RemoteDesktopControllerTest::rejectsInviteWhileAlreadySharing() {
     // 已有会话不被抢占。
     QCOMPARE(h.engine->shareCalls, 1);
     QCOMPARE(h.engine->lastRoomId, QStringLiteral("room-1"));
+}
+
+void RemoteDesktopControllerTest::busyInviteKeepsPendingConsentSession() {
+    Harness h(HostMode::Attended, /*withPassword=*/false);
+    QSignalSpy consentSpy(h.controller.get(), &RemoteDesktopController::consentRequested);
+    h.controller->handleIncomingText(
+        kPeerUser, h.inviteText(QStringLiteral("session-a"), QStringLiteral("room-a")));
+    QCOMPARE(consentSpy.count(), 1);
+    QCOMPARE(h.controller->hostState(), HostState::AwaitingConsent);
+
+    const QString otherPeer = QStringLiteral("peer-b");
+    h.controller->handleIncomingText(
+        otherPeer, h.inviteText(QStringLiteral("session-b"), QStringLiteral("room-b")));
+    QCOMPARE(h.lastSent().type, Type::Reject);
+    QCOMPARE(h.lastSent().reason, reasonBusy());
+    QCOMPARE(h.lastSent().sessionId, QStringLiteral("session-b"));
+    QCOMPARE(h.sent.last().peerId, otherPeer);
+    QCOMPARE(consentSpy.count(), 1);
+
+    // B 被拒后，确认弹窗仍属于 A，不能把 A 的身份与 B 的房间拼在一起。
+    h.controller->resolveConsent(true);
+    QCOMPARE(h.engine->lastRoomId, QStringLiteral("room-a"));
+    QCOMPARE(h.lastSent().type, Type::Accept);
+    QCOMPARE(h.lastSent().sessionId, QStringLiteral("session-a"));
+    QCOMPARE(h.lastSent().roomId, QStringLiteral("room-a"));
+    QCOMPARE(h.sent.last().peerId, kPeerUser);
+}
+
+void RemoteDesktopControllerTest::busyInviteKeepsActiveSessionInputAndStop() {
+    Harness h(HostMode::Unattended);
+    h.settings.allowRemoteControl = true;
+    h.controller->updateSettings(h.settings);
+    startSharing(h);
+
+    h.controller->handleIncomingText(
+        QStringLiteral("peer-b"),
+        h.inviteText(QStringLiteral("session-b"), QStringLiteral("room-b")));
+    QCOMPARE(h.lastSent().type, Type::Reject);
+    QCOMPARE(h.lastSent().sessionId, QStringLiteral("session-b"));
+    QCOMPARE(h.lastSent().reason, reasonBusy());
+
+    // 忙碌拒绝不得改写已共享的会话：A 后续输入和 stop 必须继续匹配。
+    h.deliverInput(QStringLiteral("s-1"), 1, {keyDown(0x41)});
+    const QStringList inputCalls = h.sink->calls;
+    Signal stop;
+    stop.type = Type::Stop;
+    stop.sessionId = QStringLiteral("s-1");
+    h.controller->handleIncomingText(kPeerUser, RemoteDesktopSignals::encodeSignal(stop));
+    QVERIFY2(inputCalls == QStringList{QStringLiteral("key 65 down")} &&
+                 h.engine->stopCalls == 1 && h.controller->hostState() == HostState::Idle,
+             qPrintable(QStringLiteral("A input calls=%1, stop calls=%2, host state=%3")
+                            .arg(inputCalls.join(QStringLiteral(", ")))
+                            .arg(h.engine->stopCalls)
+                            .arg(static_cast<int>(h.controller->hostState()))));
 }
 
 void RemoteDesktopControllerTest::reportsRejectionToViewer() {

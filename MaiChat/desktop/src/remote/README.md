@@ -38,7 +38,7 @@ controller 不自己决定"要不要放行"，只把状态机的决策翻译成�
 | `RemoteDesktopSignal` | invite/accept/reject/stop 的编解码 | 无 |
 | `RemoteDesktopAuth` | PBKDF2 密码哈希、HMAC proof 生成与校验 | 无 |
 | `RemoteDesktopSession` | 双端状态机与全部安全决策 | Signal, Auth |
-| `RemoteDesktopSettings` | 模式/密码凭据/白名单/失败计数落盘 | Auth, Session |
+| `RemoteDesktopSettings` | 模式/密码凭据/控制权限/失败计数落盘 | Auth, Session |
 | `TrtcEngine` | `ITrtcEngine` 接口 + TRTC 实现 + 空实现 | 无（SDK 在 vendor） |
 | `RemoteDesktopController` | 粘合与副作用执行 | 以上全部 |
 | `RemoteInputProtocol` | 输入事件编解码、可靠/不可靠通道与坐标归一化 | 无 |

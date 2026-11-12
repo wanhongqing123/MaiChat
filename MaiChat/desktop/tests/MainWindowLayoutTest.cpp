@@ -299,6 +299,7 @@ private slots:
     void sentImageDoesNotReturnAsDraftDuringConversationChange();
     void contactsCurrentSelectionDoesNotLeaveContactsPage();
     void settingsNavigationShowsAccountWithoutDiagnostics();
+    void remoteDesktopSettingsHaveNoDeviceList();
     void settingsAvatarUpdatesWhenSelfProfileArrives();
     void settingsAvatarReadsTinyWebpFromMemory();
     void settingsAvatarSurvivesNetworkLossAfterRestart();
@@ -3117,6 +3118,37 @@ void MainWindowLayoutTest::contactsCurrentSelectionDoesNotLeaveContactsPage() {
     contactsList->setCurrentRow(0);
 
     QCOMPARE(contentStack->currentWidget(), contactsPage);
+}
+
+void MainWindowLayoutTest::remoteDesktopSettingsHaveNoDeviceList() {
+    ScopedNotificationSettings isolatedSettings;
+    RemoteIMApplication app(QStringLiteral("remote-settings-test"), std::make_unique<FakeRemoteIMClient>());
+    MainWindow window(app);
+    auto* settingsButton = window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"));
+    QVERIFY(settingsButton);
+    settingsButton->click();
+
+    QWidget* remotePanel = nullptr;
+    for (QLabel* label : window.findChildren<QLabel*>()) {
+        if (label->text() == QStringLiteral("远程桌面")) remotePanel = label->parentWidget();
+    }
+    QVERIFY(remotePanel);
+    QStringList titles;
+    for (QLabel* label : remotePanel->findChildren<QLabel*>()) {
+        QVERIFY(!label->text().contains(QStringLiteral("允许连入的设备")));
+        QVERIFY(!label->text().contains(QStringLiteral("允许列表")));
+        titles.append(label->text());
+    }
+    QVERIFY(titles.contains(QStringLiteral("被控模式")));
+    QVERIFY(titles.contains(QStringLiteral("访问密码")));
+    QVERIFY(titles.contains(QStringLiteral("允许远程控制")));
+
+    const QByteArray capture = qgetenv("MAICHAT_CAPTURE_REMOTE_DESKTOP_SETTINGS");
+    if (!capture.isEmpty()) {
+        window.show();
+        QCoreApplication::processEvents();
+        QVERIFY(remotePanel->grab().save(QString::fromUtf8(capture)));
+    }
 }
 
 void MainWindowLayoutTest::settingsNavigationShowsAccountWithoutDiagnostics() {

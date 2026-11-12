@@ -318,7 +318,6 @@ private:
     QWidget* buildRemoteDesktopSettingsPanel(QWidget* parent);
     void refreshRemoteDesktopSettings();
     void editRemoteDesktopPassword();
-    void editRemoteDesktopAllowList();
     void editRemoteDesktopProxy();
     void showConversationContextMenu(const QPoint& pos);
     void showContactContextMenu(QListWidget* list, const QPoint& pos);
@@ -467,7 +466,6 @@ private:
     QHash<QString, QString> remoteDesktopPasswords_;
     QButtonGroup* remoteDesktopModeGroup_ = nullptr;
     QLabel* remoteDesktopPasswordValue_ = nullptr;
-    QLabel* remoteDesktopAllowValue_ = nullptr;
     QLabel* remoteDesktopControlValue_ = nullptr;
     QCheckBox* remoteDesktopControlToggle_ = nullptr;
     QLabel* remoteDesktopProxyValue_ = nullptr;

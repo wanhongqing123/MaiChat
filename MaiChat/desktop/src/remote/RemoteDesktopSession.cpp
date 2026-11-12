@@ -10,7 +10,6 @@ using RemoteDesktopSignals::Signal;
 using RemoteDesktopSignals::Type;
 
 QString reasonNotEnabled()  { return QStringLiteral("对方未开启远程桌面"); }
-QString reasonNotAllowed()  { return QStringLiteral("你不在对方的允许列表中"); }
 QString reasonBusy()        { return QStringLiteral("对方正在共享中"); }
 QString reasonBadPassword() { return QStringLiteral("访问密码错误"); }
 QString reasonDeclined()    { return QStringLiteral("对方拒绝了请求"); }
@@ -84,13 +83,6 @@ HostDecision decideOnInvite(const HostInviteInput& input) {
         return decision;
     }
 
-    // 白名单先于模式判断：不在允许列表里的账号，连"对方开没开远程"都不该知道。
-    if (!input.senderAllowed) {
-        decision.action = HostAction::RejectInvite;
-        decision.reason = reasonNotAllowed();
-        return decision;
-    }
-
     if (input.mode == HostMode::Disabled) {
         decision.action = HostAction::RejectInvite;
         decision.reason = reasonNotEnabled();
@@ -103,8 +95,7 @@ HostDecision decideOnInvite(const HostInviteInput& input) {
         return decision;
     }
 
-    // 无人值守 + 未设密码：白名单即授权，直接放行。主场景是「自己在外面连
-    // 自己的电脑」，每次输密码的摩擦不值得——安全性由白名单与 IM 账号本身承担。
+    // 无人值守按用户选择自动接受；可选密码未设置时不额外要求证明。
     if (!input.passwordConfigured) {
         decision.action = HostAction::AcceptAndShare;
         decision.nextState = HostState::Sharing;

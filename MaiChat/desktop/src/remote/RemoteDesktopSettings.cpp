@@ -1,12 +1,10 @@
 // 文件作用：桌面端远程桌面连接与控制；RemoteDesktopSettings 负责用户配置的读取、更新和持久化，本文件给出其实现。
-// 主要入口：isSenderAllowed。
 // 实现边界：与 RemoteDesktopSettings 的公开声明配套，调用方通过相应接口进入。
 #include "remote/RemoteDesktopSettings.h"
 
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 
@@ -31,15 +29,6 @@ HostMode modeFromString(const QString& value) {
 }
 
 }  // namespace
-
-bool RemoteDesktopSettings::isSenderAllowed(const QString& userId) const {
-    const QString clean = userId.trimmed();
-    if (clean.isEmpty()) return false;
-    for (const QString& allowed : allowedUserIds) {
-        if (allowed.trimmed() == clean) return true;
-    }
-    return false;
-}
 
 RemoteDesktopSettingsStore::RemoteDesktopSettingsStore(QString filePath)
     : filePath_(std::move(filePath)) {}
@@ -79,11 +68,7 @@ RemoteDesktopSettings RemoteDesktopSettingsStore::load() const {
     settings.secret.hash =
         QByteArray::fromBase64(object.value(QStringLiteral("passwordHash")).toString().toLatin1());
 
-    const QJsonArray allowed = object.value(QStringLiteral("allowedUserIds")).toArray();
-    for (const QJsonValue& value : allowed) {
-        const QString userId = value.toString().trimmed();
-        if (!userId.isEmpty()) settings.allowedUserIds.append(userId);
-    }
+    // 已移除设备名单；旧文件的对应字段不参与授权，也不再写回。
     return settings;
 }
 
@@ -103,13 +88,6 @@ bool RemoteDesktopSettingsStore::save(const RemoteDesktopSettings& settings) con
                   QString::fromLatin1(settings.secret.salt.toBase64()));
     object.insert(QStringLiteral("passwordHash"),
                   QString::fromLatin1(settings.secret.hash.toBase64()));
-
-    QJsonArray allowed;
-    for (const QString& userId : settings.allowedUserIds) {
-        const QString clean = userId.trimmed();
-        if (!clean.isEmpty()) allowed.append(clean);
-    }
-    object.insert(QStringLiteral("allowedUserIds"), allowed);
 
     QFile file(filePath_);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;

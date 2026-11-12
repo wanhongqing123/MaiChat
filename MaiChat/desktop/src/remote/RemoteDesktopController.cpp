@@ -405,10 +405,11 @@ bool RemoteDesktopController::handleIncomingText(const QString& fromUserId, cons
 }
 
 void RemoteDesktopController::handleInvite(const QString& fromUserId, const Signal& signal) {
+    // 名单不再限制连入设备；IM 发起身份仍必须存在，不能放行匿名邀请。
+    if (fromUserId.trimmed().isEmpty()) return;
     HostInviteInput input;
     input.mode = settings_.effectiveMode();
     input.currentState = hostState_;
-    input.senderAllowed = settings_.isSenderAllowed(fromUserId);
     input.consecutiveFailures = settings_.consecutiveAuthFailures;
     input.passwordConfigured = settings_.hasPassword();
     // 密码校验只在设了密码时才有意义；proof 绑定本次会话参数。
@@ -418,6 +419,17 @@ void RemoteDesktopController::handleInvite(const QString& fromUserId, const Sign
     const HostDecision decision = decideOnInvite(input);
     recordAuthAttempt(input, decision);
 
+    // 拒绝只回复本次邀请，不接管正在等待确认或共享中的会话上下文。
+    // 否则第二个邀请虽被拒绝，仍会替换原会话的房间和输入/停止匹配依据。
+    if (decision.action == HostAction::RejectInvite) {
+        Signal reject;
+        reject.type = Type::Reject;
+        reject.sessionId = signal.sessionId;
+        reject.reason = decision.reason;
+        send(fromUserId, reject);
+        return;
+    }
+
     hostSessionId_ = signal.sessionId;
     hostRoomId_ = signal.roomId;
     applyHostDecision(decision, fromUserId);
@@ -426,9 +438,8 @@ void RemoteDesktopController::handleInvite(const QString& fromUserId, const Sign
 void RemoteDesktopController::recordAuthAttempt(const HostInviteInput& input,
                                                 const HostDecision& decision) {
     // 只有真正走到密码校验那一步才计数：有人值守模式没有密码这回事，
-    // 非白名单/忙碌被挡下的请求也不该影响爆破计数。
-    const bool passwordWasChecked = input.mode == HostMode::Unattended && input.senderAllowed
-                                    && input.passwordConfigured
+    // 忙碌被挡下的请求不该影响爆破计数。
+    const bool passwordWasChecked = input.mode == HostMode::Unattended && input.passwordConfigured
                                     && input.currentState == HostState::Idle;
     if (!passwordWasChecked) return;
 

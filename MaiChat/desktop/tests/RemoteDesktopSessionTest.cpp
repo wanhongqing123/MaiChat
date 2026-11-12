@@ -1,4 +1,4 @@
-// 文件作用：验证桌面端远控邀请、白名单、无人值守和错误证明的拒绝。
+// 文件作用：验证桌面端远控邀请、被控模式、无人值守和错误证明的拒绝。
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QtTest/QtTest>
 
@@ -17,14 +17,12 @@ private slots:
     void remoteInputRejectedUnlessEverythingLinesUp();
     // 被控端
     void attendedModeAsksForConsent();
-    void unattendedModeAcceptsWhitelistedPeerWithoutPassword();
+    void unattendedModeAcceptsWithoutPassword();
     void unattendedModeAutoAcceptsWithValidProof();
     void unattendedModeRejectsInvalidProof();
     void unattendedModeDowngradesAfterRepeatedFailures();
     void disabledModeRejectsEveryInvite();
-    void rejectsSenderOutsideAllowList();
     void rejectsSecondInviteWhileSharing();
-    void whitelistCheckPrecedesModeCheck();
     void consentAcceptStartsSharing();
     void consentDeclineReturnsToIdle();
     void ignoresConsentResultWhenNotAwaiting();
@@ -42,10 +40,9 @@ private slots:
 
 namespace {
 
-HostInviteInput inviteInput(HostMode mode, bool allowed = true, bool proofValid = false) {
+HostInviteInput inviteInput(HostMode mode, bool proofValid = false) {
     HostInviteInput input;
     input.mode = mode;
-    input.senderAllowed = allowed;
     // 这些用例聚焦「设了密码」的分支；未设密码的放行单独用例覆盖。
     input.passwordConfigured = true;
     input.authProofValid = proofValid;
@@ -97,12 +94,10 @@ void RemoteDesktopSessionTest::attendedModeAsksForConsent() {
     QVERIFY(!decision.downgradeToAttended);
 }
 
-void RemoteDesktopSessionTest::unattendedModeAcceptsWhitelistedPeerWithoutPassword() {
-    // 主场景：自己在外面连自己的电脑。没设密码时白名单即授权，直接放行，
-    // 不该因为「没配密码」而把用户挡在门外。
+void RemoteDesktopSessionTest::unattendedModeAcceptsWithoutPassword() {
+    // 用户选择无人值守且未设密码时，邀请不需要额外密码证明。
     HostInviteInput input;
     input.mode = HostMode::Unattended;
-    input.senderAllowed = true;
     input.passwordConfigured = false;
     input.authProofValid = false;
 
@@ -110,17 +105,11 @@ void RemoteDesktopSessionTest::unattendedModeAcceptsWhitelistedPeerWithoutPasswo
     QCOMPARE(static_cast<int>(decision.action), static_cast<int>(HostAction::AcceptAndShare));
     QCOMPARE(static_cast<int>(decision.nextState), static_cast<int>(HostState::Sharing));
     QVERIFY(!decision.downgradeToAttended);
-
-    // 但白名单之外的账号依然进不来——没有密码不等于没有门禁。
-    input.senderAllowed = false;
-    const HostDecision rejected = decideOnInvite(input);
-    QCOMPARE(static_cast<int>(rejected.action), static_cast<int>(HostAction::RejectInvite));
-    QCOMPARE(rejected.reason, reasonNotAllowed());
 }
 
 void RemoteDesktopSessionTest::unattendedModeAutoAcceptsWithValidProof() {
     const HostDecision decision =
-        decideOnInvite(inviteInput(HostMode::Unattended, /*allowed=*/true, /*proofValid=*/true));
+        decideOnInvite(inviteInput(HostMode::Unattended, /*proofValid=*/true));
     // 无人值守的核心承诺：密码对了就不打扰用户，直接进入共享。
     QCOMPARE(static_cast<int>(decision.action), static_cast<int>(HostAction::AcceptAndShare));
     QCOMPARE(static_cast<int>(decision.nextState), static_cast<int>(HostState::Sharing));
@@ -128,14 +117,14 @@ void RemoteDesktopSessionTest::unattendedModeAutoAcceptsWithValidProof() {
 
 void RemoteDesktopSessionTest::unattendedModeRejectsInvalidProof() {
     const HostDecision decision =
-        decideOnInvite(inviteInput(HostMode::Unattended, /*allowed=*/true, /*proofValid=*/false));
+        decideOnInvite(inviteInput(HostMode::Unattended, /*proofValid=*/false));
     QCOMPARE(static_cast<int>(decision.action), static_cast<int>(HostAction::RejectInvite));
     QCOMPARE(decision.reason, reasonBadPassword());
     QCOMPARE(static_cast<int>(decision.nextState), static_cast<int>(HostState::Idle));
 }
 
 void RemoteDesktopSessionTest::unattendedModeDowngradesAfterRepeatedFailures() {
-    HostInviteInput input = inviteInput(HostMode::Unattended, true, false);
+    HostInviteInput input = inviteInput(HostMode::Unattended, false);
 
     input.consecutiveFailures = RemoteDesktopAuth::kMaxConsecutiveFailures - 2;
     QVERIFY(!decideOnInvite(input).downgradeToAttended);
@@ -148,20 +137,13 @@ void RemoteDesktopSessionTest::unattendedModeDowngradesAfterRepeatedFailures() {
 void RemoteDesktopSessionTest::disabledModeRejectsEveryInvite() {
     // 即使密码正确，模式为关闭时也不放行。
     const HostDecision decision =
-        decideOnInvite(inviteInput(HostMode::Disabled, /*allowed=*/true, /*proofValid=*/true));
+        decideOnInvite(inviteInput(HostMode::Disabled, /*proofValid=*/true));
     QCOMPARE(static_cast<int>(decision.action), static_cast<int>(HostAction::RejectInvite));
     QCOMPARE(decision.reason, reasonNotEnabled());
 }
 
-void RemoteDesktopSessionTest::rejectsSenderOutsideAllowList() {
-    const HostDecision decision =
-        decideOnInvite(inviteInput(HostMode::Unattended, /*allowed=*/false, /*proofValid=*/true));
-    QCOMPARE(static_cast<int>(decision.action), static_cast<int>(HostAction::RejectInvite));
-    QCOMPARE(decision.reason, reasonNotAllowed());
-}
-
 void RemoteDesktopSessionTest::rejectsSecondInviteWhileSharing() {
-    HostInviteInput input = inviteInput(HostMode::Unattended, true, true);
+    HostInviteInput input = inviteInput(HostMode::Unattended, true);
     input.currentState = HostState::Sharing;
 
     const HostDecision decision = decideOnInvite(input);
@@ -169,13 +151,6 @@ void RemoteDesktopSessionTest::rejectsSecondInviteWhileSharing() {
     QCOMPARE(decision.reason, reasonBusy());
     // 已有会话不被抢占。
     QCOMPARE(static_cast<int>(decision.nextState), static_cast<int>(HostState::Sharing));
-}
-
-void RemoteDesktopSessionTest::whitelistCheckPrecedesModeCheck() {
-    // 非白名单账号即使在"关闭"模式下也应得到统一的"不在允许列表"回复，
-    // 不泄漏对方到底有没有开启远程桌面。
-    const HostDecision decision = decideOnInvite(inviteInput(HostMode::Disabled, false, false));
-    QCOMPARE(decision.reason, reasonNotAllowed());
 }
 
 void RemoteDesktopSessionTest::consentAcceptStartsSharing() {
