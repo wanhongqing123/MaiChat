@@ -1,5 +1,8 @@
 # iOS build206：移动补读工具注册与真机交付
 
+本页先保留 a328 阶段的构建与断连记录，末节记录后续 3bef 新候选。
+旧 a328 候选已暂停安装；两份候选都没有装后设备回读。
+
 ## 操作与预期
 
 用户要求把最新 MaiChat 安装到既有 iPhone。沿用普通 Release、原签名和设备，
@@ -109,7 +112,22 @@ a328 阶段的构建和签名已就绪，安装与实机启动验收尚未完成
 Mac 已获指令复用原普通 device-derived cache 做必要 Release 增量，按实际构建源码记录，
 不为后续 docs-only 提交重建。新 device 候选还须核对最终链接、签名/profile 和升级兼容。
 连接恢复后装前读实际现装 build，再选更大的命令行 build override，保数据覆盖并核装后版本与普通启动 PID。
-本节没有新候选构建或安装成功结果；Simulator Release 的通过不能替代这些证据。
+Simulator Release 的通过不能替代这些设备候选与装后证据。
+
+### 3bef 新 device 候选已就绪，仍未安装
+
+随后收到 Mac 普通 generic Release iPhoneOS/arm64 小回执：build exit 0 / 115.758s，
+版本 `2.2.4 / 206`，signed exe SHA256
+`c5fa4614a47cd95d4eec56403fa30d24ae30a1872adefc6ca7f7b33158e66c71`。
+执行端回执报告 deep/strict 签名 exit 0、profile 含目标设备且 Team/有效期有效、
+十项升级 entitlement 与既有 205 基线核等；Runner 本轮正常重编，六对象和三归档成员与实际 Ld 输入核合。
+最终 exe 包含 reader factory、新 Core 收尾提示和 Swift 空答说明；九个 Mach-O 中十个测试 marker 均未出现。
+这些签名、成员和二进制检查按执行端回执记录，Root 没有传输并重新计算完整二进制。
+实收小回执 SHA256 为 `f9345cc67efcf20ce176d6870b1a6007df839aa7e157b6b7e5e096bb3097da5c`。
+
+GGUF 复用硬链接且执行端核 inode 保持；新 App 同卷移动到独立 ready 路径，旧 a328 原字节仍保全，
+其安装 guard 继续禁止。该轮没有查询设备、install 或 launch，最后实际现装读回仍是历史 build205。
+当前状态为新候选 ready、等待连接恢复；装前仍须读实际 build，再决定是否需要更大的 override。
 
 ## 验证边界
 
