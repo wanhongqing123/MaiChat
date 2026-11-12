@@ -804,6 +804,55 @@ extension AIAssistantModel {
         ready = true
     }
 
+    #if targetEnvironment(simulator)
+    // 从自有 snapshot 形状经过普通解码和推理剥离，验证真实消息行；不调用模型或读取用户库。
+    func installEmptyCompletionUITestFixture() {
+        let shape = ProcessInfo.processInfo.environment["MAICHAT_EMPTY_COMPLETION_SHAPE"] ?? "empty"
+        var parts: [[String: Any]] = []
+        switch shape {
+        case "reasoning": parts = [["id": "owned-reasoning", "kind": "reasoning", "text": "OWNED HIDDEN REASONING"]]
+        case "whitespace": parts = [["id": "owned-space", "kind": "text", "text": " \n\t\r "]]
+        case "text", "source-text": parts = [["id": "owned-text", "kind": "text", "text": "OWNED VISIBLE ANSWER"]]
+        case "tool": parts = [["id": "owned-tool", "kind": "tool", "tool": "shell", "input": "{}",
+                                "output": "OWNED TOOL OUTPUT", "state": "completed"]]
+        case "question": parts = [["id": "owned-question", "kind": "tool", "tool": "question",
+                                    "input": "{\"question\":\"OWNED QUESTION\",\"options\":[]}", "state": "completed"]]
+        case "media": parts = [["id": "owned-media", "kind": "image", "path": "/owned/missing.png", "mimeType": "image/png"]]
+        case "unknown": parts = [["id": "owned-unknown", "kind": "future-content"]]
+        case "attachment": parts = [["id": "owned-attachment", "kind": "text", "attachment_id": "owned-file"]]
+        case "reasoning-path": parts = [["id": "owned-reasoning", "kind": "reasoning", "path": "/owned/attachment"]]
+        default: break
+        }
+        let snapshot: [String: Any] = ["ok": true, "messages": [
+            ["id": "owned-input", "role": "user", "created": 500, "completed": 600,
+             "active": false, "parts": [["id": "owned-user-text", "kind": "text", "text": "OWNED INPUT " + shape]]],
+            ["id": "owned-empty-answer", "role": "assistant", "created": 1000,
+             "completed": shape == "interrupted" || shape == "active" ? 0 : shape == "empty" ? 1000 : 19000,
+             "active": shape == "active", "parts": parts]
+        ]]
+        do {
+            let decoded = try JSONDecoder().decode(AIResponse.self, from: JSONSerialization.data(withJSONObject: snapshot))
+            messages = (decoded.messages ?? []).map { $0.withoutReasoningText() }
+            if shape == "projection" { messages[1].questionProjection = true }
+            if shape == "intermediate" { messages[1].isLastDisplayFragment = false }
+            if shape == "source-text" {
+                messages[1].sourceParts = messages[1].parts
+                messages[1] = AIMessage(id: messages[1].id, role: "assistant", created: 1000,
+                                        completed: 19000, active: false, parts: [],
+                                        sourceParts: messages[1].sourceParts)
+            }
+            precondition(!messages[1].copyText.contains("本次未生成可显示的回复"))
+            sessions = [AISession(id: "owned-empty-session", title: "空回复形状", busy: shape == "active")]
+            selected = "owned-empty-session"
+            ready = true
+            historyLoaded = true
+            if shape == "expired-error" { showTransientError("OWNED TRANSIENT ERROR", duration: .seconds(8)) }
+        } catch {
+            preconditionFailure("Invalid owned empty-completion fixture: \(error)")
+        }
+    }
+    #endif
+
     func installStreamingTypingUITestFixture() {
         let session = "stream-typing-ui-test"
         sessions = [AISession(id: session, title: "流式输入测试", busy: true)]

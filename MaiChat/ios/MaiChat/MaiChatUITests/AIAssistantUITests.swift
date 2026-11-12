@@ -5,6 +5,53 @@ import XCTest
 import UIKit
 
 final class AIAssistantUITests: XCTestCase {
+    @MainActor private func launchEmptyCompletionShape(_ shape: String, boundaries: Bool = false) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-history-ui-test", "--ai-empty-completion-ui-test"]
+        if boundaries { app.launchArguments.append("--ai-empty-completion-boundaries") }
+        app.launchEnvironment["MAICHAT_EMPTY_COMPLETION_SHAPE"] = shape
+        app.launch()
+        XCTAssertTrue(app.staticTexts["OWNED INPUT " + shape].waitForExistence(timeout: 5))
+        return app
+    }
+
+    @MainActor
+    func testCompletedEmptyReplyRemainsExplainedAfterTransientErrorExpires() throws {
+        for shape in ["empty", "reasoning", "whitespace", "expired-error"] {
+            let app = launchEmptyCompletionShape(shape)
+            let footer = shape == "empty" ? "用时 0 秒" : "用时 18 秒"
+            XCTAssertTrue(app.staticTexts[footer].waitForExistence(timeout: 3), shape)
+            XCTAssertFalse(app.staticTexts["OWNED HIDDEN REASONING"].exists)
+            if shape == "expired-error" {
+                let banner = app.staticTexts["OWNED TRANSIENT ERROR"]
+                XCTAssertTrue(banner.waitForExistence(timeout: 2))
+                let expired = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: banner)
+                XCTAssertEqual(XCTWaiter.wait(for: [expired], timeout: 10), .completed)
+                XCTAssertTrue(app.staticTexts[footer].exists)
+            }
+            let notice = app.staticTexts["本次未生成可显示的回复"]
+            XCTAssertTrue(notice.waitForExistence(timeout: 2), shape)
+            XCTAssertTrue(notice.isHittable, shape)
+            let attachment = XCTAttachment(screenshot: app.screenshot())
+            attachment.name = "empty-completion-" + shape
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            app.terminate()
+        }
+    }
+
+    @MainActor
+    func testEmptyReplyNoticeDoesNotReplaceExistingOrActiveContent() throws {
+        for shape in ["text", "tool", "question", "media", "unknown", "attachment", "reasoning-path", "active",
+                      "projection", "intermediate", "source-text", "interrupted"] {
+            let app = launchEmptyCompletionShape(shape, boundaries: true)
+            XCTAssertFalse(app.staticTexts["本次未生成可显示的回复"].exists, shape)
+            if shape == "text" { XCTAssertTrue(app.staticTexts["OWNED VISIBLE ANSWER"].waitForExistence(timeout: 3)) }
+            if shape == "interrupted" { XCTAssertTrue(app.staticTexts["已中断"].exists) }
+            app.terminate()
+        }
+    }
+
     @MainActor private func assertRemoteImagePixels(_ bubble: XCUIElement,
                                                    file: StaticString = #filePath, line: UInt = #line) {
         // The fixture is an opaque, uniform #2d638d PNG. Read displayed pixels,

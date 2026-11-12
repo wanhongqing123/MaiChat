@@ -380,9 +380,35 @@ struct AITranscriptUITestRoot: View {
 struct AIHistoryUITestRoot: View {
     @StateObject private var appState = RemoteIMAppState(loadedSettings: .empty)
     var body: some View {
-        AIAssistantView()
+        Group {
+            if ProcessInfo.processInfo.arguments.contains("--ai-empty-completion-boundaries") {
+                AIEmptyCompletionBoundaryUITestRows()
+            } else {
+                AIAssistantView()
+            }
+        }
             .environmentObject(appState)
-            .onAppear { AIAssistantModel.shared.installHistoryUITestFixture() }
+            .onAppear {
+                if ProcessInfo.processInfo.arguments.contains("--ai-empty-completion-ui-test") {
+                    AIAssistantModel.shared.installEmptyCompletionUITestFixture()
+                } else {
+                    AIAssistantModel.shared.installHistoryUITestFixture()
+                }
+            }
+    }
+}
+
+// 直接驱动普通消息行，保留 timeline 通常会重新计算的 fragment/sourceParts 边界。
+private struct AIEmptyCompletionBoundaryUITestRows: View {
+    @ObservedObject private var model = AIAssistantModel.shared
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                ForEach(model.messages) { message in
+                    AIMessageRow(message: message, workspacePath: "", quote: {})
+                }
+            }.padding(20)
+        }
     }
 }
 

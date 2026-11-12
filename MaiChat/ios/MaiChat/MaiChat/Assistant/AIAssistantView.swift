@@ -1612,6 +1612,21 @@ struct AIMessageRow: View, Equatable {
             lhs.browserSessionID == rhs.browserSessionID && lhs.browserPartID == rhs.browserPartID &&
             lhs.browserNeedsConfirmation == rhs.browserNeedsConfirmation
     }
+    // 仅解释已经结束、没有可显示内容的整条助手消息；不伪造答复或改动复制/模型上下文。
+    // 最后一个 steering 片段也要检查完整源消息，不能把前段已有正文误报为空回复。
+    private var showsEmptyCompletionNotice: Bool {
+        guard message.role == "assistant", !message.active, message.completed > 0,
+              message.isLastDisplayFragment, message.questionProjection != true else { return false }
+        return (message.sourceParts ?? message.parts).allSatisfy { part in
+            guard part.attachmentID == nil, part.remoteImage == nil, part.path == nil else { return false }
+            switch part.kind {
+            case "reasoning": return true
+            case "text": return (part.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            // 工具、问答、媒体及未来片段的能力未知，保守保留原来的显示路径。
+            default: return false
+            }
+        }
+    }
     var body: some View {
         #if DEBUG
         let _ = AISessionDrawerDiagnostics.rowBody()
@@ -1722,6 +1737,11 @@ struct AIMessageRow: View, Equatable {
                 }
                 ForEach(inlineMedia) { mention in
                     fileMentionCard(mention)
+                }
+                if showsEmptyCompletionNotice {
+                    Text("本次未生成可显示的回复")
+                        .font(ChatTypography.body)
+                        .foregroundStyle(.secondary)
                 }
                 if message.active && toolParts.isEmpty && artifacts.isEmpty &&
                     !hasVisibleAnswerText {
