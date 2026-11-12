@@ -34,10 +34,13 @@ constexpr const char* kTimedOutHint =
     "The approval request timed out with no answer from the user. "
     "Do not retry; tell the user what you were about to do and wait for them.";
 
-// 一轮工具调用结束后，提醒主模型基于真实工具结果给出最终答复。
+// 空白或仅思考都不是可见答复；补答不能假称本轮已执行过工具。
 constexpr const char* kFinalAnswerHint =
-    "Tool execution is complete. Use the tool results above to provide the user with a complete "
-    "final answer now. Do not return only reasoning or a description of the steps you took.";
+    "The previous response did not include a visible final answer. Provide the user with a "
+    "complete "
+    "final answer now, based on their request and any available tool results. No tools are "
+    "available "
+    "for this response. Do not return only reasoning or a description of the steps you took.";
 
 // 工具预算耗尽和重复调用不是“成功”；分别说明已完成与未完成的工作。
 constexpr const char* kToolLimitFinalHint =
@@ -224,7 +227,6 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
     // 每一圈都重新组装上下文，因为上一圈的工具结果已经作为 part 落在 mAssistant 上了，
     // MaiContextBuilder 会把它展开成模型认得的形状。
     bool hasToolResults = false;
-    bool retriedMissingFinalAnswer = false;
     std::map<MaiObservedToolBatch, int> observedBatches;
     const auto requestFinalAnswer = [&](const char* hint, const std::string& failure) {
         // 最后的无工具请求先封闭接收，再消费已接受的补充，避免接受后再无模型调用。
@@ -248,11 +250,10 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         if (cancel.load(std::memory_order_relaxed)) break;
         if (advanceSteering(false)) {
             observedBatches.clear();
-            retriedMissingFinalAnswer = false;
         }
         if (mError) break;
 
-        auto built = buildRequest(mModelName, retriedMissingFinalAnswer, true, cancel);
+        auto built = buildRequest(mModelName, false, true, cancel);
         if (!built) {
             mError = built.error();
             break;
@@ -268,7 +269,6 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
             if (advanceSteering(true)) {
                 if (iteration + 1 < mDependencies.maxIterations) {
                     observedBatches.clear();
-                    retriedMissingFinalAnswer = false;
                     continue;
                 }
                 requestFinalAnswer(kToolLimitFinalHint,
@@ -276,20 +276,19 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
                 break;
             }
             if (mError) break;
-            if (hasToolResults && !producedVisibleText) {
-                if (!retriedMissingFinalAnswer && iteration + 1 < mDependencies.maxIterations) {
-                    retriedMissingFinalAnswer = true;
-                    continue;
-                }
-                mError = MaiError::make(
-                    MaiErrorCode::Internal,
-                    "The model completed after tool execution without a final answer.");
+            if (!producedVisibleText) {
+                // 首轮也可能直接结束或只输出空白。复用一次有界、无工具的收尾，
+                // 防止补答重新执行原工具；仍无正文时由收尾路径发布明确错误。
+                requestFinalAnswer(
+                    kFinalAnswerHint,
+                    hasToolResults
+                        ? "The model completed after tool execution without a final answer."
+                        : "The model completed without a final answer.");
             }
             break;
         }
         if (cancel.load(std::memory_order_relaxed)) break;
 
-        retriedMissingFinalAnswer = false;
         const std::size_t firstToolPart = mAssistant.parts.size();
         executeTools(calls, cancel);
         hasToolResults = true;

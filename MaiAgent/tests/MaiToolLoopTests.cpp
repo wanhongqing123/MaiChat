@@ -641,6 +641,147 @@ void test_repeated_missing_final_answer_reports_error() {
     CHECK(foundError);
 }
 
+// 首次没有工具调用也可能只返回空白或思考；只允许一次不带工具的补答。
+void test_empty_initial_completion_retries_once_without_tools() {
+    const std::vector<MaiFakeModelClient::Turn> missingAnswers{
+        MaiFakeModelClient::Turn{}, reasoningTurn("A private draft without an answer."),
+        sayTurn(" \t\r\n")};
+    for (const auto& missingAnswer : missingAnswers) {
+        Workspace workspace;
+        MaiAgent::Options options;
+        options.defaultModel = "local-test";
+        Recorder recorder;
+        auto underTest =
+            makeAgent({missingAnswer, sayTurn("Hello from the final answer.")}, options);
+        MaiAgent& agent = *underTest.agent;
+        recorder.attach(agent);
+        const std::string sessionId =
+            agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+        CHECK(agent.submit(MaiSendPrompt{sessionId, "hello"}));
+        agent.waitIdle();
+
+        CHECK(underTest.model->requestCount() == 2);
+        CHECK(!underTest.model->request(0).tools.empty());
+        CHECK(underTest.model->request(1).tools.empty());
+        bool foundAnswer = false;
+        const auto messages = agent.listMessages(sessionId);
+        CHECK(messages.size() == 2);
+        for (const auto& message : messages) {
+            if (message.role != MaiRole::Assistant) continue;
+            CHECK(message.completed > 0);
+            for (const auto& part : message.parts) {
+                const auto* text = std::get_if<MaiTextPart>(&part.body);
+                if (text && text->text == "Hello from the final answer.") foundAnswer = true;
+            }
+        }
+        CHECK(foundAnswer);
+        for (const auto& event : recorder.all()) CHECK(event.type != MaiEventType::SessionError);
+    }
+}
+
+// 持续空答必须成为可观察错误，不能静默完成或无限消耗请求。
+void test_repeated_empty_initial_completion_reports_error_after_one_retry() {
+    const std::vector<MaiFakeModelClient::Turn> missingAnswers{
+        MaiFakeModelClient::Turn{}, reasoningTurn("Still no visible answer."), sayTurn(" \t\n")};
+    for (const auto& missingAnswer : missingAnswers) {
+        Workspace workspace;
+        MaiAgent::Options options;
+        options.defaultModel = "local-test";
+        Recorder recorder;
+        auto underTest = makeAgent(
+            {missingAnswer, missingAnswer, sayTurn("An extra request must not recover this turn.")},
+            options);
+        MaiAgent& agent = *underTest.agent;
+        recorder.attach(agent);
+        const std::string sessionId =
+            agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+        CHECK(agent.submit(MaiSendPrompt{sessionId, "hello"}));
+        agent.waitIdle();
+
+        CHECK(underTest.model->requestCount() == 2);
+        CHECK(underTest.model->request(1).tools.empty());
+        int errors = 0;
+        for (const auto& event : recorder.all()) {
+            if (event.type != MaiEventType::SessionError) continue;
+            CHECK(event.sessionId == sessionId);
+            CHECK(!event.detail.empty());
+            ++errors;
+        }
+        CHECK(errors == 1);
+    }
+}
+
+// 正常正文和主动取消已经有明确结果，不能套用空答补答。
+void test_visible_or_canceled_initial_completion_is_not_retried() {
+    MaiFakeModelClient::Turn canceled;
+    canceled.error = MaiError::make(MaiErrorCode::Canceled, "Canceled by the user.");
+    for (const auto& first : {sayTurn("Hello."), canceled}) {
+        Workspace workspace;
+        Recorder recorder;
+        auto underTest = makeAgent({first, sayTurn("This extra request is unexpected.")});
+        MaiAgent& agent = *underTest.agent;
+        recorder.attach(agent);
+        const std::string sessionId =
+            agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+        CHECK(agent.submit(MaiSendPrompt{sessionId, "hello"}));
+        agent.waitIdle();
+
+        CHECK(underTest.model->requestCount() == 1);
+        const auto messages = agent.listMessages(sessionId);
+        CHECK(messages.size() == 2);
+        if (messages.size() == 2) {
+            CHECK(messages.back().completed > 0);
+            CHECK(messages.back().text() == (first.error ? "" : "Hello."));
+        }
+        for (const auto& event : recorder.all()) CHECK(event.type != MaiEventType::SessionError);
+    }
+}
+
+// 无工具补答若仍返回真实写入调用，必须拒绝整轮，不能执行该调用产生文件。
+void test_empty_completion_recovery_rejects_tool_calls_without_side_effects() {
+    Workspace workspace;
+    const MaiFilePath unexpectedOutput =
+        MaiFilePath::fromUtf8(workspace.utf8Root())
+            .append(MaiFilePath::fromUtf8("unexpected-recovery.txt"));
+    CHECK(!MaiFileSystem::exists(unexpectedOutput));
+    MaiAgent::Options options;
+    options.defaultModel = "local-test";
+    // 禁用审批等待，若编排误执行回执中的调用，真实 file_write 会直接留下可观察副作用。
+    options.approvalPolicy = MaiApprovalPolicy::Never;
+    Recorder recorder;
+    auto underTest = makeAgent(
+        {MaiFakeModelClient::Turn{},
+         callTurn("file_write",
+                  R"({"path":"unexpected-recovery.txt","content":"This write must never run."})",
+                  "call_unexpected_recovery"),
+         sayTurn("An extra request is unexpected.")},
+        options);
+    MaiAgent& agent = *underTest.agent;
+    recorder.attach(agent);
+    const std::string sessionId =
+        agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    CHECK(agent.submit(MaiSendPrompt{sessionId, "hello"}));
+    agent.waitIdle();
+
+    CHECK(underTest.model->requestCount() == 2);
+    CHECK(underTest.model->request(1).tools.empty());
+    CHECK(!MaiFileSystem::exists(unexpectedOutput));
+    int toolParts = 0;
+    for (const auto& message : agent.listMessages(sessionId)) {
+        for (const auto& part : message.parts)
+            if (std::holds_alternative<MaiToolPart>(part.body)) ++toolParts;
+    }
+    CHECK(toolParts == 0);
+    int errors = 0;
+    for (const auto& event : recorder.all()) {
+        if (event.type != MaiEventType::SessionError) continue;
+        CHECK(event.sessionId == sessionId);
+        CHECK(!event.detail.empty());
+        ++errors;
+    }
+    CHECK(errors == 1);
+}
+
 void test_tool_error_is_fed_back() {
     Workspace workspace;
     // 模型要读一个不存在的文件，然后（拿到错误后）改口
@@ -1299,6 +1440,10 @@ int main() {
     test_tool_image_keeps_parallel_tool_calls_in_one_assistant_batch();
     test_reasoning_only_after_tools_retries_for_final_answer();
     test_repeated_missing_final_answer_reports_error();
+    test_empty_initial_completion_retries_once_without_tools();
+    test_repeated_empty_initial_completion_reports_error_after_one_retry();
+    test_visible_or_canceled_initial_completion_is_not_retried();
+    test_empty_completion_recovery_rejects_tool_calls_without_side_effects();
     test_tool_error_is_fed_back();
     test_unknown_tool_does_not_kill_the_turn();
     test_internal_tool_is_not_visible_or_callable_by_model();
