@@ -1,4 +1,4 @@
-// 文件作用：桌面端共用界面；ComposerTextEdit 负责富文本输入、选区与编辑操作，本文件给出其实现。
+// 文件作用：桌面端共用界面；ComposerTextEdit 负责纯文本输入、内联附件及编辑操作，本文件给出其实现。
 // 主要入口：setMimeHandler、setCornerAction、setLeadingAction、setLeadingHint。
 // 直接依赖：ui/UiZoom.h；实现与这些接口协作。
 #include "ui/ComposerTextEdit.h"
@@ -96,6 +96,8 @@ protected:
 
 ComposerTextEdit::ComposerTextEdit(QWidget* parent) : QTextEdit(parent) {
     setDocument(new ComposerRasterDocument(this));
+    // IM 与创作中心都使用自己的正文样式；内联附件仍由业务层通过文档 API 插入。
+    setAcceptRichText(false);
     setAcceptDrops(true);
 }
 
@@ -167,12 +169,31 @@ void ComposerTextEdit::resizeEvent(QResizeEvent* event) {
 
 bool ComposerTextEdit::canInsertFromMimeData(const QMimeData* source) const {
     if (hasLocalFile(source)) return true;
+    // 查询不调用业务 handler；图片没有 text/plain 时仍须允许其进入普通附件路径。
+    if (mimeHandler_ && source && source->hasImage()) return true;
+    if (source && !source->hasText() && source->hasFormat("text/markdown"))
+        return !source->data("text/markdown").isEmpty();
     return QTextEdit::canInsertFromMimeData(source);
 }
 
 void ComposerTextEdit::insertFromMimeData(const QMimeData* source) {
     if (mimeHandler_ && mimeHandler_(source)) return;
-    QTextEdit::insertFromMimeData(source);
+    if (!source) return;
+    QString text;
+    if (source->hasText()) {
+        text = source->text();
+    } else if (source->hasFormat("text/markdown")) {
+        text = QString::fromUtf8(source->data("text/markdown"));
+    } else {
+        // 无纯文本的 HTML 不导入；其它附件仍保留原来的非富文本 Qt 回退。
+        QTextEdit::insertFromMimeData(source);
+        return;
+    }
+    // Qt 6.12 会在 acceptRichText=false 时仍优先解析 Markdown；仅交付 text/plain，
+    // 避免来源的字体、背景、链接样式以及 Markdown 解析改变字面输入。
+    QMimeData plain;
+    plain.setText(text);
+    QTextEdit::insertFromMimeData(&plain);
 }
 
 void ComposerTextEdit::dragEnterEvent(QDragEnterEvent* event) {

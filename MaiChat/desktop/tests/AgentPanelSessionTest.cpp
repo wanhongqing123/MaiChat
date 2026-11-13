@@ -5,6 +5,9 @@
 #include <QDir>
 #include <QDataStream>
 #include <QDebug>
+#include <QDragEnterEvent>
+#include <QDragMoveEvent>
+#include <QDropEvent>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
@@ -27,6 +30,7 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTextEdit>
+#include <QTextBlock>
 #include <QTextCursor>
 #include <QThreadPool>
 #include <QTimer>
@@ -66,6 +70,35 @@
 // 滤掉的话它会永远挂在闸门上等一个不会来的点头。
 
 namespace {
+
+// 走普通 MIME 插入入口，不读取或覆盖操作系统剪贴板。
+class MimeComposer final : public ComposerTextEdit {
+public:
+    using ComposerTextEdit::canInsertFromMimeData;
+    using ComposerTextEdit::insertFromMimeData;
+};
+
+QString ownedComposerText() {
+    return QString::fromUtf8("OWNED: https://example.invalid/issue/42\nChange-Id: I0123456789 中文 🙂 **literal**");
+}
+
+QString ownedComposerHtml() {
+    return QStringLiteral("<p style=\"background-color:#111111\"><span style=\"color:#c5c5c5;"
+                          "background-color:#111111;font-family:'Courier New';font-size:28px;font-weight:700\">"
+                          "OWNED: <a href=\"https://example.invalid/issue/42\">https://example.invalid/issue/42</a>"
+                          "<br>Change-Id: I0123456789 中文 🙂 **literal**</span></p>");
+}
+
+void dropOwnedComposerMime(QTextEdit& editor, const QMimeData& mime) {
+    auto* target = editor.viewport();
+    const QPointF position(target->width() / 2.0, target->height() / 2.0);
+    QDragEnterEvent enter(position.toPoint(), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(target, &enter);
+    QDragMoveEvent move(position.toPoint(), Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(target, &move);
+    QDropEvent drop(position, Qt::CopyAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(target, &drop);
+}
 
 // 有声播放控件的回归只用本次临时目录中的静音文件，不打开用户媒体或发起模型网络请求。
 bool writeInlineAudioFixture(const QString& path) {
@@ -655,6 +688,10 @@ private slots:
     void unconfiguredModelOpensConfigurationInsteadOfFailingTurn();
     void desktopAgentSuppliesMarkdownSystemPrompt();
     void composerMatchesImLayoutAndUsesEmbeddedSendAction();
+    void composerTextMimeUsesOnlyLiteralText_data();
+    void composerTextMimeUsesOnlyLiteralText();
+    void composerMimeHandlerAndInlineImagesKeepTheirExistingPath();
+    void normalAgentComposerDropsSourceFormattingAndSendsLiteralText();
     void conversationAndComposerUseResizableSplitter();
     void composerResizeHandleAlignsWithEditorBorder();
     void composerPlaceholderFitsAtMinimumHeight();
@@ -3452,6 +3489,109 @@ void AgentPanelSessionTest::composerMatchesImLayoutAndUsesEmbeddedSendAction() {
     QCOMPARE(policy->menu()->actions()[0]->text(), QStringLiteral("请求批准"));
     QCOMPARE(policy->menu()->actions()[1]->text(), QStringLiteral("帮我批准"));
     QCOMPARE(policy->menu()->actions()[2]->text(), QStringLiteral("完全访问"));
+}
+
+void AgentPanelSessionTest::composerTextMimeUsesOnlyLiteralText_data() {
+    QTest::addColumn<QString>("format");
+    for (const char* format : {"plain", "html", "markdown", "qrichtext", "markdown-only", "html-only"})
+        QTest::newRow(format) << QString::fromLatin1(format);
+}
+
+void AgentPanelSessionTest::composerTextMimeUsesOnlyLiteralText() {
+    QFETCH(QString, format);
+    MimeComposer editor;
+    QMimeData mime;
+    const QString text = ownedComposerText();
+    // text/markdown 排第一时，Qt 6.12 默认解析分支会绕过 acceptRichText。
+    if (format.startsWith(QStringLiteral("markdown"))) mime.setData("text/markdown", text.toUtf8());
+    if (format == QStringLiteral("html") || format == QStringLiteral("html-only")) mime.setHtml(ownedComposerHtml());
+    if (format == QStringLiteral("qrichtext")) mime.setData("application/x-qrichtext", ownedComposerHtml().toUtf8());
+    if (!format.endsWith(QStringLiteral("-only"))) mime.setText(text);
+    editor.insertFromMimeData(&mime);
+    const QString expected = format == QStringLiteral("html-only") ? QString() : text;
+    QCOMPARE(editor.toPlainText(), expected);
+    QCOMPARE(editor.canInsertFromMimeData(&mime), format != QStringLiteral("html-only"));
+    for (QTextBlock block = editor.document()->begin(); block.isValid(); block = block.next()) {
+        QCOMPARE(block.blockFormat().background().style(), Qt::NoBrush);
+        for (auto fragment = block.begin(); !fragment.atEnd(); ++fragment) {
+            const QTextCharFormat style = fragment.fragment().charFormat();
+            QCOMPARE(style.background().style(), Qt::NoBrush);
+            QVERIFY(!style.isAnchor());
+            QVERIFY(!style.font().bold());
+            QVERIFY(style.foreground().color() != QColor(QStringLiteral("#c5c5c5")));
+        }
+    }
+    if (!expected.isEmpty()) {
+        editor.undo();
+        QVERIFY(editor.toPlainText().isEmpty());
+        editor.redo();
+        QCOMPARE(editor.toPlainText(), expected);
+    }
+}
+
+void AgentPanelSessionTest::composerMimeHandlerAndInlineImagesKeepTheirExistingPath() {
+    MimeComposer editor;
+    editor.setPlainText(QStringLiteral("existing draft"));
+    QImage image(4, 3, QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::blue);
+    QMimeData mime;
+    mime.setImageData(image);
+    mime.setHtml(ownedComposerHtml());
+    int calls = 0;
+    bool originalMime = false;
+    QImage handledImage;
+    editor.setMimeHandler([&](const QMimeData* original) {
+        ++calls;
+        originalMime = original == &mime;
+        handledImage = qvariant_cast<QImage>(original->imageData());
+        return true;
+    });
+    QVERIFY(editor.canInsertFromMimeData(&mime));
+    QCOMPARE(calls, 0); // 可插入性查询不能调用有副作用的业务 handler。
+    editor.insertFromMimeData(&mime);
+    QCOMPARE(calls, 1);
+    QVERIFY(originalMime);
+    QCOMPARE(handledImage, image);
+    QCOMPARE(editor.toPlainText(), QStringLiteral("existing draft"));
+    mime.setText(QStringLiteral("ALT TEXT MUST NOT LEAK"));
+    editor.insertFromMimeData(&mime);
+    QCOMPARE(calls, 2);
+    QCOMPARE(editor.toPlainText(), QStringLiteral("existing draft"));
+    // 纯文本粘贴策略不能禁止业务层用 QTextCursor 插入内联图片。
+    editor.document()->addResource(QTextDocument::ImageResource, QUrl(QStringLiteral("owned-image")), image);
+    QTextCursor cursor = editor.textCursor();
+    cursor.movePosition(QTextCursor::End);
+    cursor.insertImage(QStringLiteral("owned-image"));
+    QVERIFY(editor.toPlainText().contains(QChar(0xFFFC)));
+}
+
+void AgentPanelSessionTest::normalAgentComposerDropsSourceFormattingAndSendsLiteralText() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto model = std::make_unique<CapturingModel>();
+    auto* captured = model.get();
+    AgentController controller(std::move(model), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(900, 600);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString session = controller.createSession(directory.path());
+    panel.openSession(session);
+    auto* editor = panel.findChild<ComposerTextEdit*>(QStringLiteral("agentPromptEditor"));
+    QVERIFY(editor);
+    QMimeData mime;
+    mime.setHtml(ownedComposerHtml());
+    mime.setText(ownedComposerText());
+    dropOwnedComposerMime(*editor, mime);
+    QCOMPARE(editor->toPlainText(), ownedComposerText());
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("composer-owned-source-formatting")));
+    QVERIFY(!editor->acceptRichText());
+    QSignalSpy finished(&controller, &AgentController::turnFinished);
+    QTest::mouseClick(panel.findChild<QPushButton*>(QStringLiteral("agentSendButton")), Qt::LeftButton);
+    QVERIFY(finished.wait(15000));
+    const auto request = captured->request();
+    QVERIFY(!request.messages.empty());
+    QCOMPARE(QString::fromStdString(request.messages.back().content), ownedComposerText());
 }
 
 void AgentPanelSessionTest::conversationAndComposerUseResizableSplitter() {
