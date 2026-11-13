@@ -4,19 +4,79 @@
 #pragma once
 
 #include <QHash>
+#include <QDeadlineTimer>
 #include <QList>
 #include <QString>
+#include <atomic>
+#include <memory>
+#include <optional>
 
 #include "model/ChatState.h"
 #include "model/RemoteIMGroup.h"
 
 struct sqlite3;
 
+// Ordinary query contract shared by pages and Agent adapters. Timestamps are
+// inclusive; continuation uses descending (created_at, id), independent of UI pages.
+// Each page reads the current local store; edits between pages are visible, and
+// continuation is not a retained snapshot of deleted or time-corrected records.
+// An empty query browses stored messages with the remaining filters.
+struct LocalMessageSearchRequest {
+    QString query;
+    QString peerId;
+    QString kind;
+    QString direction;
+    std::optional<qint64> sinceMillis;
+    std::optional<qint64> untilMillis;
+    int limit = 50;
+    QString cursor;
+};
+
+// Deliberately contains only public message content, never attachment paths,
+// approval tokens or any account authentication material.
+struct LocalMessageSearchMatch {
+    QString id;
+    QString peerId;
+    QString senderId;
+    QString text;
+    QString kind;
+    QString direction;
+    qint64 createdAtMillis = 0;
+};
+
+struct LocalMessageSearchResult {
+    QList<LocalMessageSearchMatch> matches;
+    QString errorCode;
+    QString coverage;
+    bool localAvailable = false;
+    bool hasMore = false;
+    bool noMatches = false;
+    int limit = 50;
+    QString nextCursor;
+};
+
+// Each request owns an independent read-only handle, so the worker neither uses
+// the UI connection nor reopens an old account path after its owner is destroyed.
+class LocalMessageSearchReader {
+public:
+    ~LocalMessageSearchReader();
+    LocalMessageSearchReader(const LocalMessageSearchReader&) = delete;
+    LocalMessageSearchReader& operator=(const LocalMessageSearchReader&) = delete;
+    LocalMessageSearchResult search(const LocalMessageSearchRequest& request,
+                                   const std::shared_ptr<std::atomic_bool>& canceled,
+                                   QDeadlineTimer deadline = QDeadlineTimer(5000)) const;
+private:
+    friend class LocalMessageDatabase;
+    LocalMessageSearchReader(sqlite3* database, QString identity);
+    sqlite3* db_ = nullptr;
+    QString identity_;
+};
+
 // 本地消息库（SQLite，每账号一个库文件）。
 //
 // Desktop IM 的历史消息不能依赖腾讯 IM SDK 的漫游拉取（只保留最近几条），
-// 因此所有通讯消息即时落库；登录后先从本库加载全部历史展示，SDK 漫游降级为
-// 补充源（消息 id 主键天然去重，INSERT OR IGNORE 合并）。
+// 因此所有通讯消息即时落库；登录只加载会话预览，打开会话后再分页读取，
+// 搜索独立读取本地完整范围。SDK 漫游作为补充源，按消息 id 主键去重合并。
 class LocalMessageDatabase {
 public:
     // dbFilePath: 库文件完整路径（父目录不存在会自动创建）。
@@ -27,6 +87,11 @@ public:
     LocalMessageDatabase& operator=(const LocalMessageDatabase&) = delete;
 
     bool isOpen() const;
+
+    // Open only: no schema migration, creation or account data changes. A null
+    // reader is an unavailable store, never an authoritative empty search.
+    // sessionIdentity scopes cursors to the caller's current account session.
+    std::shared_ptr<LocalMessageSearchReader> createSearchReader(const QString& sessionIdentity = {}) const;
 
     // 联系人 + 全部消息（按 created_at 升序）恢复进 ChatState。
     void loadInto(ChatState& state) const;
@@ -90,4 +155,5 @@ private:
     // 句柄由本对象独占；语句不跨方法逃逸。与原 Qt SQL 对象一样，调用方须串行使用。
     // 初始化/增量迁移失败时关闭句柄，isOpen() 不会把半迁移的库报告为可用。
     sqlite3* db_ = nullptr;
+    QString searchIdentity_;
 };

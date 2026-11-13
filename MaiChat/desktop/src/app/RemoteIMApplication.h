@@ -18,6 +18,7 @@
 #include "storage/LocalMessageDatabase.h"
 
 class QTimer;
+class QThreadPool;
 
 class RemoteIMApplication final : public QObject {
     Q_OBJECT
@@ -66,7 +67,8 @@ public:
         std::function<void(const QString&, RemoteIMCompletion)> remove;
     };
     // database 可空：不带本地库时行为与从前一致（仅内存 + SDK 漫游）。
-    // 带库时构造即加载全部本地历史；收发消息即时落库；SDK 漫游拉取降级为
+    // 普通消息查询与 Agent 查询始终要求本地库，不带库时显式返回不可用。
+    // 带库时构造只加载会话预览；收发消息即时落库；SDK 漫游拉取降级为
     // 补充源，按消息 id 去重合并。
     RemoteIMApplication(QString ownerUserId,
                         std::unique_ptr<RemoteIMClient> client,
@@ -77,6 +79,10 @@ public:
     ChatState& chatState();
     RemoteIMClient& client();
     bool isConnected() const;
+    // Automatic input/delivery must stop when logout begins, before the SDK's
+    // asynchronous disconnected signal. A generation never grants authority.
+    bool connectionReady() const { return connected_ && !disconnecting_; }
+    quint64 connectionGeneration() const { return connectionGeneration_; }
     RemoteIMContact selfProfile() const;
     void setAccountProfileProvider(std::function<AccountProfile()> provider);
     AccountProfile currentAccountProfile() const;
@@ -93,6 +99,22 @@ public:
     bool hasEarlierMessages(const QString& peerId) const;
     // 向上翻一页：从本地库取更早消息并入内存，返回本次加载条数。
     int loadEarlierMessages(const QString& peerId);
+    // Ordinary asynchronous database query used by both Agent message tools and
+    // other clients. Call on this object's thread; the database scan runs on a
+    // worker without reading/hydrating ChatState history. No database is an error.
+    // Callers that queue a handoff supply the original absolute deadline; it is
+    // never restarted when the UI receives the request or the SQL worker starts.
+    // Completion runs on this object's thread, unless it is destroyed.
+    using MessageSearchCompletion = std::function<void(const LocalMessageSearchResult&)>;
+    void queryLocalMessages(const LocalMessageSearchRequest& request,
+                             std::shared_ptr<std::atomic_bool> canceled,
+                             MessageSearchCompletion completion,
+                             QDeadlineTimer deadline = QDeadlineTimer(5000));
+    // Copy on the application thread. Tool workers may then read this owned
+    // generation lease without touching QObject/account state before dispatch.
+    std::shared_ptr<const std::atomic<quint64>> messageQueryGeneration() const {
+        return messageQueryGeneration_;
+    }
 
     QList<RemoteIMGroup> groups() const;
     QList<RemoteIMGroupMessage> groupMessages(const QString& groupId) const;
@@ -154,6 +176,22 @@ public:
     // 返回成功只表示消息已排队，尚不代表送达。
     bool sendTextTo(const QString& peerId, const QString& text,
                     const RemoteIMQuote& quote = RemoteIMQuote(), bool hasQuote = false);
+    // Automatic Session replies reuse the MultiAiCode machine-origin envelope.
+    // Queue into the named conversation, then report the SDK receipt; a stale
+    // account/connection callback cannot mutate the current account's history.
+    bool sendMachineTextTo(const QString& peerId, const QString& text,
+                           RemoteIMSendCompletion completion = {},
+                           std::function<bool()> canSend = {},
+                           const RemoteIMQuote& quote = RemoteIMQuote(), bool hasQuote = false);
+    // Reuses ordinary cached-file/video-cover preparation and existing Tencent
+    // image/file/video elements. Audio is sent as a file, never a fake voice.
+    // Video returns preparation admission; onDispatched reports the guarded SDK
+    // handoff separately from the eventual delivery receipt in completion.
+    bool sendMachineMediaTo(const QString& peerId, const QString& path, const QString& type,
+                            const QString& caption = {}, RemoteIMSendCompletion completion = {},
+                            std::function<bool()> canSend = {},
+                            const RemoteIMQuote& quote = RemoteIMQuote(), bool hasQuote = false,
+                            std::function<void(bool)> onDispatched = {});
     void setHumanTypingActive(bool active);
     // 用户确认的远程诊断流程使用明确且持久化的目标地址。
     // 发送后台报告时绝不能修改 selectedPeerId。
@@ -224,6 +262,12 @@ private:
     QHash<QString, QString> requestIdByImId_;
     void sendDiagnosticTo(const QString& peerId, const QString& text, const QString& path,
                           std::function<void(bool)> completion);
+    bool sendMachineMessageTo(const QString& peerId, RemoteIMMessage message,
+                              std::function<void(RemoteIMSendCompletion)> dispatch,
+                              RemoteIMSendCompletion completion, std::function<bool()> canSend);
+    bool prepareMachineVideoTo(const QString& peerId, const QString& path, const QString& caption,
+                               RemoteIMSendCompletion completion, std::function<bool()> canSend,
+                               const RemoteIMQuote& quote, bool hasQuote, std::function<void(bool)> onDispatched);
     void markMessage(const QString& messageId, RemoteIMMessageStatus status);
     void bindClientSignals();
     // 漫游/历史（live=false，不计红点）与实时推送（live=true，新入站消息计红点）
@@ -261,6 +305,9 @@ private:
     QString selectedGroupId_;
     std::unique_ptr<RemoteIMClient> client_;
     std::unique_ptr<LocalMessageDatabase> database_;
+    // Dedicated bounded pool: unrelated avatar/media jobs cannot starve queries.
+    QThreadPool* messageQueryPool_ = nullptr;
+    int pendingMessageQueries_ = 0;
     bool connected_ = false;
     bool disconnecting_ = false;
     std::vector<RemoteIMCompletion> disconnectCallbacks_;
@@ -274,4 +321,6 @@ private:
     void rememberClosedActivity(const QString& identity);
     QString typingPeerId_;
     QString typingActivityId_;
+    std::shared_ptr<std::atomic<quint64>> messageQueryGeneration_ =
+        std::make_shared<std::atomic<quint64>>(1);
 };

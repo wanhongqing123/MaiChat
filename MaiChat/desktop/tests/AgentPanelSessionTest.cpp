@@ -637,6 +637,8 @@ class AgentPanelSessionTest : public QObject {
 private slots:
     void newSessionAvoidsFilesystemRoot();
     void emptySessionShowsWelcomeAndFirstMessageHidesIt();
+    void welcomeToolRowsExplainEveryCategoryAndWrapAtNarrowWidths();
+    void welcomeToolRowsOnlyAppendSessionDrafts();
     void newSessionUsesAppWorkspaceInsteadOfProcessDirectory();
     void newSessionOffersWorkspaceChoice();
     void chosenWorkspaceKeepsCurrentSession();
@@ -764,6 +766,57 @@ struct Harness {
     }
 };
 
+// Product copy contract shared with the Desktop/Mac welcome-page review. These
+// are natural-language examples, not tool IDs or a promise of forced routing.
+struct WelcomeCopy {
+    QString name;
+    QString purpose;
+    QString example;
+};
+
+QList<WelcomeCopy> welcomeCopy() {
+    return {
+        {QStringLiteral("AI 问答"), QStringLiteral("解释问题、整理思路与起草文字。"),
+         QStringLiteral("使用 AI 问答帮我把这段想法整理成行动清单。")},
+        {QStringLiteral("图片创作"), QStringLiteral("根据描述或参考图片生成、修改图片。"),
+         QStringLiteral("使用图片创作工具帮我设计一张春日活动海报。")},
+        {QStringLiteral("视频创作"), QStringLiteral("根据文字或参考素材生成视频。"),
+         QStringLiteral("使用视频创作工具帮我制作一段日落海边的短片。")},
+        {QStringLiteral("文件处理"), QStringLiteral("查找、读取和编辑文件，整理本地资料。"),
+         QStringLiteral("使用文件处理工具（file_glob、file_read）帮我查找工作目录中的会议记录，读完后总结要点。")},
+        {QStringLiteral("桌面截屏"), QStringLiteral("截取桌面画面，查看当前屏幕内容。"),
+         QStringLiteral("使用桌面截屏工具（screenshot）帮我查看当前屏幕上的报错，说明报错内容。")},
+        {QStringLiteral("浏览器操作"), QStringLiteral("打开网页、查找页面内容并操作网页。"),
+         QStringLiteral("使用浏览器操作工具（desktop_browser）帮我打开指定网页并找到下载入口，先不要下载。")},
+        {QStringLiteral("终端与进程"), QStringLiteral("运行终端命令，查看和管理本机进程。"),
+         QStringLiteral("使用终端与进程工具（shell）帮我列出当前运行的进程名称和进程 ID。")},
+        {QStringLiteral("电脑操作"), QStringLiteral("通过屏幕定位、点击和键盘操作桌面应用。"),
+         QStringLiteral("使用电脑操作工具（desktop_computer）帮我双击打开桌面上的“软件名称”；找不到就明确告诉我，不要换其他方式反复尝试。")},
+        {QStringLiteral("会话定时任务"), QStringLiteral("安排本机会话任务在指定时间执行。"),
+         QStringLiteral("使用会话定时任务工具（maichat_session_task_create）帮我安排明天上午九点整理工作计划。")},
+        {QStringLiteral("日历导入"), QStringLiteral("准备日历事件，交给系统日历确认导入。"),
+         QStringLiteral("使用日历导入工具（maichat_calendar_create_event）帮我准备明天下午三点的项目评审日程，交给我确认导入。")},
+        {QStringLiteral("二维码生成"), QStringLiteral("将文字或网址生成可保存的二维码图片。"),
+         QStringLiteral("使用二维码生成工具（maichat_generate_qr_code）帮我把这个网址制作成 PNG 二维码。")},
+        {QStringLiteral("本地媒体处理"), QStringLiteral("查看媒体信息，转换、裁剪本地音视频。"),
+         QStringLiteral("使用本地媒体处理工具（ffprobe）帮我查看这段视频的时长和分辨率。")},
+        {QStringLiteral("拍照"), QStringLiteral("打开本机相机，由你点击快门拍照。"),
+         QStringLiteral("使用拍照工具（maichat_camera_command）帮我打开相机，我来点击快门拍照。")},
+        {QStringLiteral("音乐播放"), QStringLiteral("在 MaiChat 播放器中打开本地音乐。"),
+         QStringLiteral("使用音乐播放工具（maichat_play_local_music）帮我播放工作目录中的“音乐文件名”。")},
+        {QStringLiteral("我的云盘"), QStringLiteral("浏览云盘文件，上传、下载和整理资料。"),
+         QStringLiteral("使用我的云盘工具（maichat_cloud_drive_search_media）帮我查找云盘里的“项目资料”，列出匹配文件。")},
+        {QStringLiteral("MaiChat 消息"), QStringLiteral("查找聊天记录，按你的要求发送或回复消息。"),
+         QStringLiteral("使用 MaiChat 消息工具（maichat_search_messages）帮我查找本周提到“项目资料”的消息，列出匹配结果。")},
+        {QStringLiteral("联系人"), QStringLiteral("查找联系人，查看好友和群聊信息。"),
+         QStringLiteral("使用联系人工具（maichat_list_contacts）帮我查找名字中包含“小明”的好友，列出匹配联系人。")},
+        {QStringLiteral("账号资料与头像"), QStringLiteral("查看账号资料，按你的要求修改昵称或头像。"),
+         QStringLiteral("使用账号资料与头像工具（maichat_get_current_account）帮我查看当前账号的昵称和头像。")},
+        {QStringLiteral("跨设备会话"), QStringLiteral("查看其他在线设备的会话，管理会话工作区。"),
+         QStringLiteral("使用跨设备会话工具（maichat_remote_session_list）帮我查看其他在线设备上的会话，列出设备和会话名称。")},
+    };
+}
+
 }  // namespace
 
 void AgentPanelSessionTest::emptySessionShowsWelcomeAndFirstMessageHidesIt() {
@@ -775,44 +828,20 @@ void AgentPanelSessionTest::emptySessionShowsWelcomeAndFirstMessageHidesIt() {
     auto* editor = harness.panel->findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
     QVERIFY(welcome != nullptr && heading != nullptr && editor != nullptr);
     QCOMPARE(heading->text(), QStringLiteral("从这里开始创作"));
-    const auto welcomeCards = harness.panel->findChildren<QFrame*>(QStringLiteral("agentWelcomeFeature"));
-    // 账号资料与头像已加入正式能力展示，数量和明确条目一起覆盖，避免保留旧欢迎页预期。
-    QCOMPARE(welcomeCards.size(), 19);
-    QList<QString> titles;
-    for (const QFrame* card : welcomeCards) titles.append(card->accessibleName());
-    QVERIFY(titles.contains(QStringLiteral("终端与进程")));
-    QVERIFY(titles.contains(QStringLiteral("电脑操作")));
-    QVERIFY(titles.contains(QStringLiteral("日历导入")));
-    QVERIFY(titles.contains(QStringLiteral("账号资料与头像")));
-    QVERIFY(!titles.contains(QStringLiteral("当前位置")));
     QVERIFY(welcome->isVisibleTo(harness.panel.get()));
     QVERIFY(harness.view()->isEmpty());
-    QCOMPARE(welcome->property("welcomeColumns").toInt(), 4);
-    const auto titlesFit = [welcome] {
-        for (QFrame* card : welcome->findChildren<QFrame*>(QStringLiteral("agentWelcomeFeature"))) {
-            const QList<QLabel*> labels = card->findChildren<QLabel*>();
-            if (labels.size() < 2) return false;
-            const QLabel* title = labels.last();
-            if (title->fontMetrics().horizontalAdvance(title->text()) > title->width()) return false;
-        }
-        return true;
-    };
-    QVERIFY2(titlesFit(), "wide Desktop welcome cards must show complete titles");
     const QString capture = qEnvironmentVariable("MAICHAT_WELCOME_CAPTURE");
     if (!capture.isEmpty()) QVERIFY(harness.panel->grab().save(capture));
     harness.panel->resize(700, 500);
     QCoreApplication::processEvents();
     auto* scroll = qobject_cast<QScrollArea*>(welcome);
     QVERIFY(scroll != nullptr);
-    QCOMPARE(welcome->property("welcomeColumns").toInt(), 3);
-    QVERIFY2(titlesFit(), "medium Desktop welcome cards must show complete titles");
     QVERIFY(!scroll->horizontalScrollBar()->isVisible());
     QVERIFY(scroll->verticalScrollBar()->maximum() > 0);
     const QString compactCapture = qEnvironmentVariable("MAICHAT_WELCOME_COMPACT_CAPTURE");
     if (!compactCapture.isEmpty()) QVERIFY(harness.panel->grab().save(compactCapture));
     harness.panel->resize(550, 500);
     QCoreApplication::processEvents();
-    QCOMPARE(welcome->property("welcomeColumns").toInt(), 2);
     QVERIFY(scroll->verticalScrollBar()->maximum() > 0);
 
     editor->setPlainText(QStringLiteral("检查欢迎页切换"));
@@ -824,6 +853,141 @@ void AgentPanelSessionTest::emptySessionShowsWelcomeAndFirstMessageHidesIt() {
     QTRY_VERIFY_WITH_TIMEOUT(welcome->isVisibleTo(harness.panel.get()), 3000);
     harness.panel->openSession(harness.mine);
     QTRY_VERIFY_WITH_TIMEOUT(!welcome->isVisibleTo(harness.panel.get()), 3000);
+}
+
+void AgentPanelSessionTest::welcomeToolRowsExplainEveryCategoryAndWrapAtNarrowWidths() {
+    Harness harness;
+    QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
+    auto* welcome = harness.panel->findChild<QScrollArea*>(QStringLiteral("agentWelcomeView"));
+    QVERIFY(welcome);
+    QVERIFY(captureAgentFixture(*harness.panel, QStringLiteral("welcome-tool-directory")));
+    const auto rows = welcome->findChildren<QPushButton*>(QStringLiteral("agentWelcomeFeature"));
+    const auto copy = welcomeCopy();
+    QCOMPARE(rows.size(), copy.size());
+    QCOMPARE(rows.size(), 19);
+    auto* instruction = welcome->findChild<QLabel*>(QStringLiteral("agentWelcomeInstruction"));
+    auto* boundary = welcome->findChild<QLabel*>(QStringLiteral("agentWelcomeBoundary"));
+    QVERIFY(instruction && boundary);
+    QVERIFY(instruction->text().contains(QStringLiteral("使用某工具帮我完成")));
+    QVERIFY(instruction->text().contains(QStringLiteral("草稿")));
+    QVERIFY(boundary->text().contains(QStringLiteral("不支持")));
+    QVERIFY(boundary->text().contains(QStringLiteral("找不到")));
+
+    // Walk the real scroll area at each width. Complete labels must stay inside
+    // their single-column row and have enough height for their wrapped text.
+    for (const int width : {1100, 700, 550}) {
+        harness.panel->resize(width, 700);
+        QCoreApplication::processEvents();
+        QCOMPARE(welcome->verticalScrollBarPolicy(), Qt::ScrollBarAsNeeded);
+        QVERIFY(welcome->verticalScrollBar()->maximum() > 0);
+        QVERIFY(!welcome->horizontalScrollBar()->isVisible());
+        QCOMPARE(welcome->horizontalScrollBar()->maximum(), 0);
+        int previousBottom = -1;
+        for (int index = 0; index < rows.size(); ++index) {
+            auto* row = rows[index];
+            QCOMPARE(row->accessibleName(), copy[index].name);
+            auto* title = row->findChild<QLabel*>(QStringLiteral("agentWelcomeFeatureName"));
+            auto* purpose = row->findChild<QLabel*>(QStringLiteral("agentWelcomeFeaturePurpose"));
+            auto* example = row->findChild<QLabel*>(QStringLiteral("agentWelcomeFeatureExample"));
+            QVERIFY(title && purpose && example);
+            QCOMPARE(title->text(), copy[index].name);
+            QCOMPARE(purpose->text(), copy[index].purpose);
+            QCOMPARE(example->text(), copy[index].example);
+            QVERIFY(row->y() > previousBottom);
+            previousBottom = row->geometry().bottom();
+            welcome->ensureWidgetVisible(row, 0, 0);
+            QCoreApplication::processEvents();
+            QVERIFY(row->isVisibleTo(harness.panel.get()));
+            const QRect viewportRow(row->mapTo(welcome->viewport(), QPoint()), row->size());
+            QVERIFY(viewportRow.left() >= 0 && viewportRow.right() < welcome->viewport()->width());
+            QVERIFY(viewportRow.intersects(welcome->viewport()->rect()));
+            for (auto* label : {title, purpose, example}) {
+                QVERIFY(label->isVisibleTo(row));
+                const QRect labelRect(label->mapTo(row, QPoint()), label->size());
+                QVERIFY(row->rect().contains(labelRect));
+                const QRect textRect = label->fontMetrics().boundingRect(
+                    QRect(0, 0, label->contentsRect().width(), 10000), Qt::TextWordWrap, label->text());
+                QVERIFY2(textRect.height() <= label->contentsRect().height(),
+                         qPrintable(QStringLiteral("%1: clipped text at width %2").arg(copy[index].name).arg(width)));
+            }
+        }
+        welcome->verticalScrollBar()->setValue(0);
+        QCoreApplication::processEvents();
+        QCOMPARE(welcome->verticalScrollBar()->value(), 0);
+        QVERIFY(captureAgentFixture(*harness.panel, QStringLiteral("welcome-tool-list-%1").arg(width)));
+    }
+}
+
+void AgentPanelSessionTest::welcomeToolRowsOnlyAppendSessionDrafts() {
+    class CountingModel final : public MaiModelClient {
+    public:
+        MaiError stream(const MaiModelRequest&, const MaiStreamSink&, const std::atomic<bool>&) override {
+            ++calls;
+            return {};
+        }
+        MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+        std::atomic<int> calls{0};
+    };
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    auto model = std::make_unique<CountingModel>();
+    auto* counter = model.get();
+    AgentController controller(std::move(model), QString());
+    AgentChatPanel panel(controller);
+    panel.resize(700, 700);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    const QString first = controller.createSession(workspace.path());
+    const QString second = controller.createSession(workspace.path());
+    panel.openSession(first);
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    auto* welcome = panel.findChild<QScrollArea*>(QStringLiteral("agentWelcomeView"));
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(editor && welcome && view);
+    const auto rows = welcome->findChildren<QPushButton*>(QStringLiteral("agentWelcomeFeature"));
+    const auto copy = welcomeCopy();
+    QCOMPARE(rows.size(), copy.size());
+    const auto originalPolicy = controller.approvalPolicy();
+    QSignalSpy userMessages(&controller, &AgentController::userMessageAdded);
+    QSignalSpy completed(&controller, &AgentController::turnFinished);
+    QSignalSpy configurations(&panel, &AgentChatPanel::modelConfigurationRequested);
+    QString expected = QStringLiteral("Keep my original draft.");
+    editor->setPlainText(expected);
+    for (int index = 0; index < rows.size(); ++index) {
+        welcome->ensureWidgetVisible(rows[index], 0, 0);
+        QCoreApplication::processEvents();
+        auto* example = rows[index]->findChild<QLabel*>(QStringLiteral("agentWelcomeFeatureExample"));
+        QVERIFY(example);
+        // Use window hit testing over the visible text, so a child label that
+        // accidentally consumes pointer events cannot hide behind button::click.
+        QTest::mouseClick(panel.windowHandle(), Qt::LeftButton, Qt::NoModifier,
+                          example->mapTo(&panel, example->rect().center()));
+        expected += QLatin1Char('\n') + copy[index].example;
+        QCOMPARE(editor->toPlainText(), expected);
+        QCOMPARE(panel.sessionId(), first);
+        QVERIFY(welcome->isVisibleTo(&panel));
+        QVERIFY(view->isEmpty());
+        QVERIFY(controller.agent().listMessages(first.toStdString()).empty());
+    }
+    QTest::qWait(50);
+    QCOMPARE(counter->calls.load(), 0);
+    QCOMPARE(userMessages.count(), 0);
+    QCOMPARE(completed.count(), 0);
+    QCOMPARE(configurations.count(), 0);
+    QCOMPARE(controller.approvalPolicy(), originalPolicy);
+
+    // Returning to a conversation uses the ordinary composer draft store. The
+    // example must not change another session or start a turn after navigation.
+    panel.openSession(second);
+    QCOMPARE(editor->toPlainText(), QString());
+    editor->setPlainText(QStringLiteral("Independent second draft."));
+    panel.openSession(first);
+    QCOMPARE(editor->toPlainText(), expected);
+    panel.openSession(second);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Independent second draft."));
+    QCOMPARE(counter->calls.load(), 0);
+    QCOMPARE(userMessages.count(), 0);
+    QVERIFY(welcome->isVisibleTo(&panel));
 }
 
 void AgentPanelSessionTest::remotePromptAppearsInOpenOwnerSession() {

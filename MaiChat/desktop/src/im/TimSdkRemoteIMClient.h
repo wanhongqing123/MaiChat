@@ -53,6 +53,18 @@ public:
                               RemoteIMApprovalAction action,
                               RemoteIMSendCompletion completion) override;
     void sendMachineText(const QString& peerId, const QString& text, RemoteIMSendCompletion completion) override;
+    void sendMachineTextWithQuote(const QString& peerId, const QString& text,
+                                  const RemoteIMQuote& quote, bool hasQuote,
+                                  RemoteIMSendCompletion completion) override;
+    void sendMachineImageWithText(const QString& peerId, const QString& path, const QString& text,
+                                  bool captionAbove, const RemoteIMQuote& quote, bool hasQuote,
+                                  RemoteIMSendCompletion completion) override;
+    void sendMachineFileWithText(const QString& peerId, const QString& path, const QString& fileName,
+                                 const QString& text, bool captionAbove, const RemoteIMQuote& quote,
+                                 bool hasQuote, RemoteIMSendCompletion completion) override;
+    void sendMachineVideoWithText(const QString& peerId, const RemoteIMVideoPayload& video,
+                                  const QString& text, bool captionAbove, const RemoteIMQuote& quote,
+                                  bool hasQuote, RemoteIMSendCompletion completion) override;
     void sendImage(const QString& peerId, const QString& localPath, RemoteIMSendCompletion completion) override;
     void sendVoice(const QString& peerId, const QString& localPath, int durationSeconds,
                    RemoteIMCompletion completion) override;
@@ -75,6 +87,15 @@ private:
                             const QJsonObject& interaction = QJsonObject(),
                             const RemoteIMQuote& quote = RemoteIMQuote(),
                             bool hasQuote = false);
+    void sendImageWithOrigin(const QString& peerId, const QString& path, const QString& text, bool captionAbove,
+                              RemoteIMMessageOrigin origin, const RemoteIMQuote& quote, bool hasQuote,
+                              RemoteIMSendCompletion completion);
+    void sendFileWithOrigin(const QString& peerId, const QString& path, const QString& fileName,
+                             const QString& text, bool captionAbove, RemoteIMMessageOrigin origin,
+                             const RemoteIMQuote& quote, bool hasQuote, RemoteIMSendCompletion completion);
+    void sendVideoWithOrigin(const QString& peerId, const RemoteIMVideoPayload& video, const QString& text,
+                              bool captionAbove, RemoteIMMessageOrigin origin, const RemoteIMQuote& quote,
+                              bool hasQuote, RemoteIMSendCompletion completion);
     void syncInitialData();
     void handleSelfProfilePayload(const QString& payload);
     void fetchFriendList();

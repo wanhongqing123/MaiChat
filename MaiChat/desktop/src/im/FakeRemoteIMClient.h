@@ -37,6 +37,19 @@ public:
                                const QString& text, const QString& messageId);
     void removeGroupForTest(const QString& groupId);
     void sendText(const QString& peerId, const QString& text, RemoteIMSendCompletion completion) override;
+    void sendMachineText(const QString& peerId, const QString& text, RemoteIMSendCompletion completion) override;
+    void sendMachineTextWithQuote(const QString& peerId, const QString& text,
+                                  const RemoteIMQuote& quote, bool hasQuote,
+                                  RemoteIMSendCompletion completion) override;
+    void sendMachineImageWithText(const QString& peerId, const QString& path, const QString& text,
+                                  bool captionAbove, const RemoteIMQuote& quote, bool hasQuote,
+                                  RemoteIMSendCompletion completion) override;
+    void sendMachineFileWithText(const QString& peerId, const QString& path, const QString& fileName,
+                                 const QString& text, bool captionAbove, const RemoteIMQuote& quote,
+                                 bool hasQuote, RemoteIMSendCompletion completion) override;
+    void sendMachineVideoWithText(const QString& peerId, const RemoteIMVideoPayload& video,
+                                  const QString& text, bool captionAbove, const RemoteIMQuote& quote,
+                                  bool hasQuote, RemoteIMSendCompletion completion) override;
     void sendApprovalDecision(const QString& peerId,
                               const QString& token,
                               RemoteIMApprovalAction action,
@@ -54,6 +67,11 @@ public:
     QString lastFriendRequestId() const;
     QString lastTextPeerId() const;
     QString lastText() const;
+    RemoteIMMessageOrigin lastOrigin() const { return lastOrigin_; }
+    QString lastCaption() const { return lastCaption_; }
+    bool lastCaptionAbove() const { return lastCaptionAbove_; }
+    RemoteIMQuote lastQuote() const { return lastQuote_; }
+    bool lastHasQuote() const { return lastHasQuote_; }
     QString lastGroupId() const { return lastGroupId_; }
     QString lastGroupText() const { return lastGroupText_; }
     QString lastApprovalToken() const;
@@ -75,6 +93,7 @@ public:
 private:
     void complete(RemoteIMCompletion completion);
     void completeSend(RemoteIMSendCompletion completion);
+    void recordMessageMetadata(RemoteIMMessageOrigin origin, const QString& caption, bool captionAbove, const RemoteIMQuote& quote, bool hasQuote);
 
     QString connectedUserId_;
     quint64 sdkAppId_ = 0;
@@ -82,6 +101,11 @@ private:
     QString lastFriendRequestId_;
     QString lastTextPeerId_;
     QString lastText_;
+    RemoteIMMessageOrigin lastOrigin_ = RemoteIMMessageOrigin::Unknown;
+    QString lastCaption_;
+    bool lastCaptionAbove_ = false;
+    RemoteIMQuote lastQuote_;
+    bool lastHasQuote_ = false;
     QString lastGroupId_;
     QString lastGroupText_;
     QString lastMarkedGroupId_;

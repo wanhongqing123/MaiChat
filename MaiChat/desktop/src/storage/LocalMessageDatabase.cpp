@@ -5,16 +5,24 @@
 #include "storage/LocalMessageDatabase.h"
 
 #include "model/ContactGroups.h"
+#include "model/MessageSearch.h"
 
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QPair>
+#include <QScopeGuard>
 #include <QSet>
 #include <QStringList>
+#include <QThread>
+#include <QUuid>
 #include <QVariant>
 #include <sqlite3.h>
 
 #include <limits>
+#include <utility>
 
 namespace {
 
@@ -222,15 +230,199 @@ RemoteIMMessage messageFromQuery(const Statement& query) {
 
 }  // namespace
 
+namespace {
+
+QString searchScope(const QString& identity, const LocalMessageSearchRequest& request) {
+    const QJsonObject scope{{QStringLiteral("identity"), identity},
+        {QStringLiteral("query"), request.query.trimmed()},
+        {QStringLiteral("peer"), request.peerId}, {QStringLiteral("kind"), request.kind},
+        {QStringLiteral("direction"), request.direction},
+        {QStringLiteral("since"), request.sinceMillis ? QString::number(*request.sinceMillis) : QString()},
+        {QStringLiteral("until"), request.untilMillis ? QString::number(*request.untilMillis) : QString()}};
+    return QString::fromLatin1(QCryptographicHash::hash(
+        QJsonDocument(scope).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256).toHex());
+}
+
+QString searchCursor(const QString& scope, const LocalMessageSearchMatch& last) {
+    const QJsonObject cursor{{QStringLiteral("scope"), scope},
+        {QStringLiteral("at"), QString::number(last.createdAtMillis)}, {QStringLiteral("id"), last.id}};
+    return QString::fromLatin1(QJsonDocument(cursor).toJson(QJsonDocument::Compact)
+        .toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+}
+
+bool searchCanceled(const std::shared_ptr<std::atomic_bool>& canceled) {
+    return canceled && canceled->load();
+}
+
+bool validSearchRequest(const LocalMessageSearchRequest& request) {
+    return request.limit >= 1 && request.limit <= 200 &&
+        (request.kind.isEmpty() || QStringList{QStringLiteral("text"), QStringLiteral("image"),
+            QStringLiteral("video"), QStringLiteral("voice"), QStringLiteral("file")}.contains(request.kind)) &&
+        (request.direction.isEmpty() || request.direction == QStringLiteral("incoming") ||
+            request.direction == QStringLiteral("outgoing")) &&
+        (!request.sinceMillis || !request.untilMillis || *request.sinceMillis <= *request.untilMillis);
+}
+
+LocalMessageSearchResult failedSearch(const QString& error, int limit) {
+    LocalMessageSearchResult result;
+    result.errorCode = error;
+    result.limit = limit;
+    return result;
+}
+
+struct SearchControl {
+    std::shared_ptr<std::atomic_bool> canceled;
+    QDeadlineTimer deadline;
+    MessageSearch::PreparedQuery matcher;
+    bool stopped() const { return searchCanceled(canceled) || deadline.hasExpired(); }
+    QString error() const {
+        return searchCanceled(canceled) ? QStringLiteral("canceled") : deadline.hasExpired()
+            ? QStringLiteral("query_timeout") : QStringLiteral("local_storage_unavailable");
+    }
+};
+
+bool enableWal(sqlite3* database) {
+    Statement query(database);
+    if (!query.exec(QStringLiteral("PRAGMA journal_mode=WAL")) || !query.next() ||
+        query.value(0).toString() != QStringLiteral("wal")) return false;
+    query.next();
+    return query.succeeded();
+}
+
+}  // namespace
+
+LocalMessageSearchReader::LocalMessageSearchReader(sqlite3* database, QString identity)
+    : db_(database), identity_(std::move(identity)) {}
+
+LocalMessageSearchReader::~LocalMessageSearchReader() {
+    if (db_) sqlite3_close_v2(db_);
+}
+
+LocalMessageSearchResult LocalMessageSearchReader::search(
+        const LocalMessageSearchRequest& request,
+        const std::shared_ptr<std::atomic_bool>& canceled, QDeadlineTimer deadline) const {
+    const qint64 remaining = deadline.remainingTime();
+    SearchControl control{canceled, QDeadlineTimer(remaining < 0 ? 5000 : qMin<qint64>(5000, remaining)),
+                          MessageSearch::PreparedQuery(request.query)};
+    if (control.stopped()) return failedSearch(control.error(), request.limit);
+    if (!db_) return failedSearch(QStringLiteral("local_storage_unavailable"), request.limit);
+    if (!validSearchRequest(request)) return failedSearch(QStringLiteral("invalid_request"), request.limit);
+    const QString scope = searchScope(identity_, request);
+    qint64 afterTime = 0;
+    QString afterId;
+    if (!request.cursor.isEmpty()) {
+        if (request.cursor.size() > 4096)
+            return failedSearch(QStringLiteral("invalid_cursor"), request.limit);
+        const auto decoded = QByteArray::fromBase64(request.cursor.toLatin1(),
+            QByteArray::Base64UrlEncoding | QByteArray::AbortOnBase64DecodingErrors);
+        const auto document = QJsonDocument::fromJson(decoded);
+        const auto cursor = document.object();
+        bool timeOk = false;
+        afterTime = cursor.value(QStringLiteral("at")).toString().toLongLong(&timeOk);
+        afterId = cursor.value(QStringLiteral("id")).toString();
+        if (!document.isObject() || cursor.size() != 3 || !timeOk || afterId.isEmpty() ||
+            cursor.value(QStringLiteral("scope")).toString() != scope)
+            return failedSearch(QStringLiteral("invalid_cursor"), request.limit);
+    }
+    LocalMessageSearchResult result;
+    result.limit = request.limit;
+    result.localAvailable = true;
+    result.coverage = QStringLiteral("local_persisted");
+    {
+        // Progress and lock waits inspect the same owned cancellation token. No
+        // statement/handler is shared with the UI writer or another request.
+        sqlite3_progress_handler(db_, 256, [](void* opaque) {
+            return static_cast<SearchControl*>(opaque)->stopped() ? 1 : 0;
+        }, &control);
+        sqlite3_busy_handler(db_, [](void* opaque, int) {
+            if (static_cast<SearchControl*>(opaque)->stopped()) return 0;
+            QThread::msleep(5);
+            return 1;
+        }, &control);
+        const auto handlers = qScopeGuard([&] {
+            sqlite3_progress_handler(db_, 0, nullptr, nullptr);
+            sqlite3_busy_handler(db_, nullptr, nullptr);
+        });
+        if (sqlite3_create_function_v2(db_, "maichat_matches", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+            &control, [](sqlite3_context* context, int, sqlite3_value** values) {
+                auto* state = static_cast<SearchControl*>(sqlite3_user_data(context));
+                if (state->stopped()) {
+                    sqlite3_result_error_code(context, SQLITE_INTERRUPT);
+                    return;
+                }
+                const QString text = QString::fromUtf8(
+                    reinterpret_cast<const char*>(sqlite3_value_text(values[0])), sqlite3_value_bytes(values[0]));
+                sqlite3_result_int(context, state->matcher.matches(text));
+            }, nullptr, nullptr, nullptr) != SQLITE_OK)
+            return failedSearch(control.error(), request.limit);
+        const auto scalar = qScopeGuard([&] {
+            // The function's user data points to this call's prepared matcher;
+            // drop it after statement finalization, before that state is destroyed.
+            sqlite3_create_function_v2(db_, "maichat_matches", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                                      nullptr, nullptr, nullptr, nullptr, nullptr);
+        });
+        const QString kindSql = QStringLiteral(
+            "CASE WHEN has_image != 0 THEN 'image' WHEN has_video != 0 THEN 'video' "
+            "WHEN has_voice != 0 THEN 'voice' WHEN has_file != 0 THEN 'file' ELSE 'text' END");
+        QString sql = QStringLiteral("SELECT id,peer,from_user,direction,text,created_at,") + kindSql +
+                      QStringLiteral(" AS kind FROM messages WHERE 1=1");
+        if (!request.peerId.isEmpty()) sql += QStringLiteral(" AND peer = ?");
+        if (request.sinceMillis) sql += QStringLiteral(" AND created_at >= ?");
+        if (request.untilMillis) sql += QStringLiteral(" AND created_at <= ?");
+        if (!request.direction.isEmpty()) sql += QStringLiteral(" AND direction = ?");
+        if (!request.kind.isEmpty()) sql += QStringLiteral(" AND (") + kindSql + QStringLiteral(") = ?");
+        // Row-value comparison lets the existing (peer, created_at, id) index
+        // seek directly to a continuation instead of rescanning prior pages.
+        if (!request.cursor.isEmpty()) sql += QStringLiteral(
+            " AND (created_at, id) < (?, ?)");
+        if (!request.query.trimmed().isEmpty()) sql += QStringLiteral(" AND maichat_matches(text, ?)");
+        sql += QStringLiteral(" ORDER BY created_at DESC, id DESC LIMIT ?");
+        Statement query(db_);
+        query.prepare(sql);
+        if (!request.peerId.isEmpty()) query.addBindValue(request.peerId);
+        if (request.sinceMillis) query.addBindValue(*request.sinceMillis);
+        if (request.untilMillis) query.addBindValue(*request.untilMillis);
+        if (!request.direction.isEmpty()) query.addBindValue(request.direction == QStringLiteral("outgoing") ? 1 : 0);
+        if (!request.kind.isEmpty()) query.addBindValue(request.kind);
+        if (!request.cursor.isEmpty()) {
+            query.addBindValue(afterTime);
+            query.addBindValue(afterId);
+        }
+        if (!request.query.trimmed().isEmpty()) query.addBindValue(request.query.trimmed());
+        query.addBindValue(request.limit + 1);
+        query.exec();
+        while (query.next()) {
+            if (control.stopped()) return failedSearch(control.error(), request.limit);
+            result.matches.append({query.value(0).toString(), query.value(1).toString(),
+                query.value(2).toString(), query.value(4).toString(), query.value(6).toString(),
+                query.value(3).toInt() == 1 ? QStringLiteral("outgoing") : QStringLiteral("incoming"),
+                query.value(5).toLongLong()});
+        }
+        if (!query.succeeded()) return failedSearch(control.error(), request.limit);
+    }
+    if (control.stopped()) return failedSearch(control.error(), request.limit);
+    result.hasMore = result.matches.size() > request.limit;
+    if (result.hasMore) {
+        result.matches.removeLast();
+        result.nextCursor = searchCursor(scope, result.matches.last());
+    }
+    // Empty later pages and errors never prove
+    // that a message is absent from the account's complete local persisted set.
+    result.noMatches = result.localAvailable && request.cursor.isEmpty() && result.matches.isEmpty();
+    return result;
+}
+
 LocalMessageDatabase::LocalMessageDatabase(const QString& dbFilePath) {
+    searchIdentity_ = QUuid::createUuid().toString(QUuid::WithoutBraces);
     if (dbFilePath.contains(QChar(0))) return;
     if (!QDir().mkpath(QFileInfo(dbFilePath).absolutePath())) return;
     const QByteArray path = dbFilePath.toUtf8();
-    // 与原 QSQLITE 驱动保持私有 cache、可创建和 5000ms 锁等待，不改变 journal/schema。
+    // Private connections retain the existing write busy timeout. WAL prevents
+    // independent history readers from blocking UI-thread incoming-message writes.
     const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_PRIVATECACHE | SQLITE_OPEN_FULLMUTEX;
     if (sqlite3_open_v2(path.constData(), &db_, flags, nullptr) != SQLITE_OK ||
         sqlite3_busy_timeout(db_, 5000) != SQLITE_OK ||
-        sqlite3_extended_result_codes(db_, 1) != SQLITE_OK || !migrate()) {
+        sqlite3_extended_result_codes(db_, 1) != SQLITE_OK || !enableWal(db_) || !migrate()) {
         if (db_) sqlite3_close_v2(db_);
         db_ = nullptr;
     }
@@ -242,6 +434,28 @@ LocalMessageDatabase::~LocalMessageDatabase() {
 
 bool LocalMessageDatabase::isOpen() const {
     return db_ != nullptr;
+}
+
+std::shared_ptr<LocalMessageSearchReader> LocalMessageDatabase::createSearchReader(const QString& sessionIdentity) const {
+    if (!db_) return {};
+    int moved = 0;
+    if (sqlite3_file_control(db_, "main", SQLITE_FCNTL_HAS_MOVED, &moved) == SQLITE_OK && moved) return {};
+    const char* filename = sqlite3_db_filename(db_, "main");
+    if (!filename || !*filename) return {};
+    sqlite3* reader = nullptr;
+    if (sqlite3_open_v2(filename, &reader,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_PRIVATECACHE | SQLITE_OPEN_FULLMUTEX, nullptr) != SQLITE_OK) {
+        if (reader) sqlite3_close_v2(reader);
+        return {};
+    }
+    // If the open writer's file was replaced while opening the reader, reject
+    // the new path rather than silently searching another database's content.
+    if (sqlite3_file_control(db_, "main", SQLITE_FCNTL_HAS_MOVED, &moved) == SQLITE_OK && moved) {
+        sqlite3_close_v2(reader);
+        return {};
+    }
+    return std::shared_ptr<LocalMessageSearchReader>(
+        new LocalMessageSearchReader(reader, searchIdentity_ + QLatin1Char(':') + sessionIdentity));
 }
 
 // 作用：按数据库版本迁移本地消息表并保留旧记录。
@@ -342,6 +556,10 @@ bool LocalMessageDatabase::migrate() {
     // 索引和补列同处一个事务；任何失败都会保留原 schema 和旧时间索引。
     if (!query.exec(QStringLiteral(
         "CREATE INDEX IF NOT EXISTS idx_messages_peer_page ON messages(peer, created_at, id)"))) return false;
+    // Cross-peer searches need the same ordering index so LIMIT can stop the
+    // scan at the next matching page without materializing a global sort.
+    if (!query.exec(QStringLiteral(
+        "CREATE INDEX IF NOT EXISTS idx_messages_page ON messages(created_at, id)"))) return false;
     if (!query.exec(QStringLiteral("DROP INDEX IF EXISTS idx_messages_peer_time"))) return false;
     if (!query.exec(QStringLiteral(
         "CREATE TABLE IF NOT EXISTS im_groups ("

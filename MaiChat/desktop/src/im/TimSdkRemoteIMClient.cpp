@@ -193,22 +193,6 @@ void setMessageMetadata(QJsonObject& message,
         cloudCustomData(origin, interaction, captionAbove, quote);
 }
 
-void setMessageOriginWithQuote(QJsonObject& message,
-                               RemoteIMMessageOrigin origin,
-                               const RemoteIMQuote& quote) {
-    setMessageMetadata(message, origin, QJsonObject(), false, quoteObject(quote));
-}
-
-void setMessageOrigin(QJsonObject& message, RemoteIMMessageOrigin origin) {
-    setMessageMetadata(message, origin);
-}
-
-void setMessageOriginWithCaptionOrder(QJsonObject& message,
-                                      RemoteIMMessageOrigin origin,
-                                      bool captionAbove) {
-    setMessageMetadata(message, origin, QJsonObject(), captionAbove);
-}
-
 ParsedCloudMetadata messageMetadata(const QJsonObject& message) {
     ParsedCloudMetadata parsed;
     const QString raw = message.value(QString::fromLatin1(kCloudCustomDataKey)).toString();
@@ -1067,6 +1051,13 @@ void TimSdkRemoteIMClient::sendMachineText(const QString& peerId, const QString&
     sendTextWithOrigin(peerId, text, RemoteIMMessageOrigin::Machine, std::move(completion));
 }
 
+void TimSdkRemoteIMClient::sendMachineTextWithQuote(const QString& peerId, const QString& text,
+                                                    const RemoteIMQuote& quote, bool hasQuote,
+                                                    RemoteIMSendCompletion completion) {
+    sendTextWithOrigin(peerId, text, RemoteIMMessageOrigin::Machine, std::move(completion),
+                       QJsonObject(), quote, hasQuote);
+}
+
 void TimSdkRemoteIMClient::sendApprovalDecision(const QString& peerId,
                                                 const QString& token,
                                                 RemoteIMApprovalAction action,
@@ -1168,71 +1159,34 @@ void TimSdkRemoteIMClient::sendActivity(const QString& peerId,
 
 void TimSdkRemoteIMClient::sendImage(const QString& peerId, const QString& localPath,
                                      RemoteIMSendCompletion completion) {
-    const QString cleanPeerId = peerId.trimmed();
-    const QString cleanPath = localPath.trimmed();
-    if (cleanPeerId.isEmpty() || cleanPath.isEmpty()) {
-        if (completion) completion(false, QStringLiteral("图片消息缺少接收人或图片路径"), {});
-        return;
-    }
-
-    QJsonObject elem;
-    elem[QStringLiteral("elem_type")] = kElemImage;
-    elem[QStringLiteral("image_elem_orig_path")] = cleanPath;
-    elem[QStringLiteral("image_elem_level")] = kImageLevelOriginal;
-    QJsonObject message;
-    message[QStringLiteral("message_elem_array")] = QJsonArray{elem};
-    setMessageOrigin(message, RemoteIMMessageOrigin::Human);
-    api_->sendMessage(
-        cleanPeerId, kConversationTypeC2C, compactJson(message),
-        [completion = std::move(completion)](int code, const QString& description, const QString& jsonPayload) mutable {
-            if (!completion) return;
-            const bool ok = code == 0;
-            if (!ok) {
-                qWarning().noquote() << QStringLiteral("[im] send failed: code=%1 %2").arg(code).arg(description);
-            }
-            RemoteIMSendReceipt receipt = ok ? sentMessageReceipt(jsonPayload) : RemoteIMSendReceipt{};
-            completion(ok,
-                       ok ? QString()
-                          : (description.isEmpty() ? QStringLiteral("IM SDK 操作失败：%1").arg(code) : description),
-                       receipt);
-        });
+    sendImageWithOrigin(peerId, localPath, {}, false, RemoteIMMessageOrigin::Human, {}, false,
+                         std::move(completion));
 }
 
 void TimSdkRemoteIMClient::sendFile(const QString& peerId, const QString& localPath, const QString& fileName,
                                     RemoteIMSendCompletion completion) {
-    const QString cleanPeerId = peerId.trimmed();
-    const QString cleanPath = localPath.trimmed();
-    if (cleanPeerId.isEmpty() || cleanPath.isEmpty()) {
-        if (completion) completion(false, QStringLiteral("文件消息缺少接收人或文件路径"), {});
-        return;
-    }
-    const QString displayName = fileName.trimmed().isEmpty() ? QFileInfo(cleanPath).fileName() : fileName.trimmed();
-
-    QJsonObject elem;
-    elem[QStringLiteral("elem_type")] = kElemFile;
-    elem[QStringLiteral("file_elem_file_path")] = cleanPath;
-    elem[QStringLiteral("file_elem_file_name")] = displayName;
-    QJsonObject message;
-    message[QStringLiteral("message_elem_array")] = QJsonArray{elem};
-    setMessageOrigin(message, RemoteIMMessageOrigin::Human);
-    api_->sendMessage(
-        cleanPeerId, kConversationTypeC2C, compactJson(message),
-        [completion = std::move(completion)](int code, const QString& description, const QString& jsonPayload) mutable {
-            if (!completion) return;
-            const bool ok = code == 0;
-            if (!ok) {
-                qWarning().noquote() << QStringLiteral("[im] send failed: code=%1 %2").arg(code).arg(description);
-            }
-            RemoteIMSendReceipt receipt = ok ? sentMessageReceipt(jsonPayload) : RemoteIMSendReceipt{};
-            completion(ok,
-                       ok ? QString()
-                          : (description.isEmpty() ? QStringLiteral("IM SDK 操作失败：%1").arg(code) : description),
-                       receipt);
-        });
+    sendFileWithOrigin(peerId, localPath, fileName, {}, false, RemoteIMMessageOrigin::Human, {}, false,
+                        std::move(completion));
 }
 
 void TimSdkRemoteIMClient::sendImageWithText(const QString& peerId, const QString& imagePath, const QString& text,
                                              bool captionAbove, RemoteIMSendCompletion completion) {
+    sendImageWithOrigin(peerId, imagePath, text, captionAbove, RemoteIMMessageOrigin::Human, {}, false,
+                         std::move(completion));
+}
+
+void TimSdkRemoteIMClient::sendMachineImageWithText(const QString& peerId, const QString& imagePath,
+                                                    const QString& text, bool captionAbove,
+                                                    const RemoteIMQuote& quote, bool hasQuote,
+                                                    RemoteIMSendCompletion completion) {
+    sendImageWithOrigin(peerId, imagePath, text, captionAbove, RemoteIMMessageOrigin::Machine, quote, hasQuote,
+                         std::move(completion));
+}
+
+void TimSdkRemoteIMClient::sendImageWithOrigin(const QString& peerId, const QString& imagePath, const QString& text,
+                                               bool captionAbove, RemoteIMMessageOrigin origin,
+                                               const RemoteIMQuote& quote, bool hasQuote,
+                                               RemoteIMSendCompletion completion) {
     const QString cleanPeerId = peerId.trimmed();
     const QString cleanPath = imagePath.trimmed();
     const QString cleanText = text.trimmed();
@@ -1248,8 +1202,8 @@ void TimSdkRemoteIMClient::sendImageWithText(const QString& peerId, const QStrin
         textElem[QStringLiteral("text_elem_content")] = cleanText;
         elems.append(textElem);
     };
-    // 配文在上就先放文本元素。元素数组的顺序就是收发两端看到的排版顺序，
-    // 不需要额外的协议字段来描述它。
+    // Keep the attachment first for existing clients. Caption placement, quote
+    // and Human/Machine origin share the existing metadata envelope.
     {
         QJsonObject imageElem;
         imageElem[QStringLiteral("elem_type")] = kElemImage;
@@ -1260,7 +1214,8 @@ void TimSdkRemoteIMClient::sendImageWithText(const QString& peerId, const QStrin
     appendCaption();
     QJsonObject message;
     message[QStringLiteral("message_elem_array")] = elems;
-    setMessageOriginWithCaptionOrder(message, RemoteIMMessageOrigin::Human, captionAbove);
+    setMessageMetadata(message, origin, QJsonObject(), captionAbove,
+                       (hasQuote && !quote.digest.isEmpty()) ? quoteObject(quote) : QJsonObject());
     api_->sendMessage(
         cleanPeerId, kConversationTypeC2C, compactJson(message),
         [completion = std::move(completion)](int code, const QString& description, const QString& jsonPayload) mutable {
@@ -1279,6 +1234,22 @@ void TimSdkRemoteIMClient::sendImageWithText(const QString& peerId, const QStrin
 
 void TimSdkRemoteIMClient::sendFileWithText(const QString& peerId, const QString& localPath, const QString& fileName,
                                             const QString& text, bool captionAbove, RemoteIMSendCompletion completion) {
+    sendFileWithOrigin(peerId, localPath, fileName, text, captionAbove, RemoteIMMessageOrigin::Human, {}, false,
+                        std::move(completion));
+}
+
+void TimSdkRemoteIMClient::sendMachineFileWithText(const QString& peerId, const QString& localPath,
+                                                   const QString& fileName, const QString& text, bool captionAbove,
+                                                   const RemoteIMQuote& quote, bool hasQuote,
+                                                   RemoteIMSendCompletion completion) {
+    sendFileWithOrigin(peerId, localPath, fileName, text, captionAbove, RemoteIMMessageOrigin::Machine, quote, hasQuote,
+                        std::move(completion));
+}
+
+void TimSdkRemoteIMClient::sendFileWithOrigin(const QString& peerId, const QString& localPath, const QString& fileName,
+                                              const QString& text, bool captionAbove, RemoteIMMessageOrigin origin,
+                                              const RemoteIMQuote& quote, bool hasQuote,
+                                              RemoteIMSendCompletion completion) {
     const QString cleanPeerId = peerId.trimmed();
     const QString cleanPath = localPath.trimmed();
     const QString cleanText = text.trimmed();
@@ -1305,7 +1276,8 @@ void TimSdkRemoteIMClient::sendFileWithText(const QString& peerId, const QString
     appendCaption();
     QJsonObject message;
     message[QStringLiteral("message_elem_array")] = elems;
-    setMessageOriginWithCaptionOrder(message, RemoteIMMessageOrigin::Human, captionAbove);
+    setMessageMetadata(message, origin, QJsonObject(), captionAbove,
+                       (hasQuote && !quote.digest.isEmpty()) ? quoteObject(quote) : QJsonObject());
     api_->sendMessage(
         cleanPeerId, kConversationTypeC2C, compactJson(message),
         [completion = std::move(completion)](int code, const QString& description, const QString& jsonPayload) mutable {
@@ -1353,6 +1325,22 @@ void TimSdkRemoteIMClient::sendVideo(const QString& peerId, const RemoteIMVideoP
 void TimSdkRemoteIMClient::sendVideoWithText(const QString& peerId, const RemoteIMVideoPayload& video,
                                              const QString& text, bool captionAbove,
                                              RemoteIMSendCompletion completion) {
+    sendVideoWithOrigin(peerId, video, text, captionAbove, RemoteIMMessageOrigin::Human, {}, false,
+                         std::move(completion));
+}
+
+void TimSdkRemoteIMClient::sendMachineVideoWithText(const QString& peerId, const RemoteIMVideoPayload& video,
+                                                    const QString& text, bool captionAbove,
+                                                    const RemoteIMQuote& quote, bool hasQuote,
+                                                    RemoteIMSendCompletion completion) {
+    sendVideoWithOrigin(peerId, video, text, captionAbove, RemoteIMMessageOrigin::Machine, quote, hasQuote,
+                         std::move(completion));
+}
+
+void TimSdkRemoteIMClient::sendVideoWithOrigin(const QString& peerId, const RemoteIMVideoPayload& video,
+                                               const QString& text, bool captionAbove, RemoteIMMessageOrigin origin,
+                                               const RemoteIMQuote& quote, bool hasQuote,
+                                               RemoteIMSendCompletion completion) {
     const QString cleanPeerId = peerId.trimmed();
     const QString cleanText = text.trimmed();
     if (cleanPeerId.isEmpty()) {
@@ -1376,7 +1364,8 @@ void TimSdkRemoteIMClient::sendVideoWithText(const QString& peerId, const Remote
     appendCaption();
     QJsonObject message;
     message[QStringLiteral("message_elem_array")] = elems;
-    setMessageOriginWithCaptionOrder(message, RemoteIMMessageOrigin::Human, captionAbove);
+    setMessageMetadata(message, origin, QJsonObject(), captionAbove,
+                       (hasQuote && !quote.digest.isEmpty()) ? quoteObject(quote) : QJsonObject());
     api_->sendMessage(
         cleanPeerId, kConversationTypeC2C, compactJson(message),
         [completion = std::move(completion)](int code, const QString& description, const QString& jsonPayload) mutable {

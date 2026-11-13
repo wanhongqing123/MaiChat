@@ -38,15 +38,18 @@
 
 class SharingIndicatorBar;
 class AgentController;
+class MaiToolRegistry;
 class AgentChatPanel;
 class AgentSessionList;
 class DesktopSessionSyncCoordinator;
+class DesktopSessionImBridge;
 class DesktopScreenCaptureControl;
 class RemoteAgentPanel;
 class ReplySuggestionController;
 class RemoteDesktopViewPanel;
 class QButtonGroup;
 class QCheckBox;
+class QDialog;
 class QCloseEvent;
 class QMimeData;
 class QMenu;
@@ -83,6 +86,7 @@ public:
                std::function<QPair<QString, QString>()> wanCredentialsProvider,
                QWidget* parent = nullptr,
                DesktopScreenCaptureControl* captureControl = nullptr);
+    ~MainWindow() override;
 
     // 开始回复某条消息：右键菜单调它，测试也直接调它。
     void beginReplyTo(const RemoteIMMessage& message);
@@ -108,6 +112,9 @@ public:
         std::function<void(const QString&, std::function<void(const QString&)>)> setter,
         std::function<QString()> sessionIdentity);
     AgentController* activeAgentController() const { return agentController_; }
+    // Main-thread setup for both the production registrar and ordinary hosts.
+    // Pins the configured/current account and this controller generation.
+    void registerSessionImBindingTool(MaiToolRegistry& registry);
     void setSessionSyncCoordinator(DesktopSessionSyncCoordinator* coordinator);
     // IM、创作中心和视频圈共用独立顶层窗口，不改变原页面布局与会话状态。
     bool openVideoWindow(const QString& path, const QStringList& playlist = {},
@@ -198,6 +205,12 @@ private:
     void showCloudDrivePage();
     void showAgentPage();
     void rebuildAgentPage();
+    void positionSessionBindingEntry();
+    void openSessionBindingDialog();
+    void refreshSessionBinding();
+    void saveSessionBindings();
+    void restoreSessionBindings();
+    QString sessionBindingSettingsKey();
     void probeVideoCircleAvailability();
     void probeCloudDriveAvailability();
     void openVideoCircle(const QString& completedCardJson = {}, const QString& sourcePath = {});
@@ -442,13 +455,22 @@ private:
     QWidget* remotePage_ = nullptr;
 
     // ---- AI 助手 ----
-    // 和 IM 那一侧完全不相干：不共用 RemoteIMClient，也不碰 chatState。
-    // 它自己拿着一个 agent 核心，跑在同一个进程里。
+    // 创作中心使用独立的 Agent 核心；只有用户显式选择的好友绑定，
+    // 才由 Session IM bridge 在普通消息与该核心之间传递输入和回复。
     QWidget* agentPage_ = nullptr;
     // 进程本机采集状态不归属于任何本地或远端会话；重建会话面板时保留。
     DesktopScreenCaptureControl* screenCaptureControl_ = nullptr;
     QPushButton* agentNavButton_ = nullptr;
     AgentController* agentController_ = nullptr;
+    // The bridge borrows the controller and is explicitly destroyed first.
+    // Settings keep only account-scoped peer/Session choices; live work stays
+    // in the adapter and is revoked on controller rebuild or account logout.
+    DesktopSessionImBridge* sessionImBridge_ = nullptr;
+    QPointer<QPushButton> sessionBindingAgentSend_;
+    QPointer<QTextEdit> sessionBindingAgentEditor_;
+    QPointer<QDialog> sessionBindingDialog_;
+    bool restoringSessionBindings_ = false;
+    QString sessionBindingSettingsScope_;
     AgentChatPanel* agentPanel_ = nullptr;
     RemoteAgentPanel* agentRemotePanel_ = nullptr;
     QStackedWidget* agentPanelStack_ = nullptr;
@@ -529,6 +551,10 @@ private:
     QString replySuggestionLatestMessageId_;
     QPushButton* commandButton_ = nullptr;
     QMenu* commandMenu_ = nullptr;
+    QPushButton* sessionBindingButton_ = nullptr;
+    QWidget* sessionBindingBar_ = nullptr;
+    QLabel* sessionBindingName_ = nullptr;
+    QPushButton* sessionBindingUnbind_ = nullptr;
     // 「保存到本地」上次使用的目录：同一会话内多次保存不必每次从下载目录重新翻。
     QString lastAttachmentSaveDir_;
     // 图片预览只允许存在一个实例，避免重复点击或平台窗口事件重入后叠出多个预览。

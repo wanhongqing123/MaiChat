@@ -155,11 +155,13 @@
 
 #include "MaiChatTools/MaiChatHostTools.h"
 #include "MaiChatTools/DesktopCloudDriveTools.h"
+#include "MaiChatTools/DesktopSessionImBindingTools.h"
 #include "MaiSshTool.h"
 #include "agent/AgentChatPanel.h"
 #include "agent/AgentController.h"
 #include "agent/AgentSessionList.h"
 #include "agent/DesktopSessionSyncCoordinator.h"
+#include "agent/DesktopSessionImBridge.h"
 #include "agent/DesktopSessionAttachments.h"
 #include "agent/DesktopScreenCaptureBar.h"
 #include "agent/DesktopScreenCaptureControl.h"
@@ -2171,8 +2173,16 @@ void MainWindow::closeEvent(QCloseEvent *event) {
   });
 }
 
+MainWindow::~MainWindow() {
+  // QObject destroys children after this body. The bridge must release its
+  // controller subscriptions while that borrowed controller is still alive.
+  delete sessionImBridge_;
+  sessionImBridge_ = nullptr;
+}
+
 void MainWindow::prepareForAccountDisconnect(std::function<void()> completion) {
   accountDisconnectPending_ = true;
+  if (sessionImBridge_) sessionImBridge_->suspend();
   if (passwordChangeRequests_) passwordChangeRequests_->cancelForAccountChange();
   ++videoCircleProbeGeneration_;
   videoCircleAvailable_ = false;
@@ -2203,6 +2213,32 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event) {
       event->type() == QEvent::Show))
     QTimer::singleShot(0, this, [this] { updateWindowCaptionControls(); });
 #endif
+  if ((watched == messageEditor_ || watched == commandButton_) &&
+      (event->type() == QEvent::Resize || event->type() == QEvent::Move ||
+       event->type() == QEvent::Show)) {
+    // ComposerTextEdit positions its two shared actions during resize; anchor
+    // this IM-only action after that ordinary layout pass has completed.
+    QTimer::singleShot(0, this, [this] { positionSessionBindingEntry(); });
+  }
+  if (sessionImBridge_ && agentPanel_ &&
+      (watched == sessionBindingAgentSend_ || watched == sessionBindingAgentEditor_)) {
+    bool takesOver = watched == sessionBindingAgentSend_ &&
+        event->type() == QEvent::MouseButtonPress &&
+        static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton;
+    if (event->type() == QEvent::KeyPress) {
+      const auto* key = static_cast<QKeyEvent*>(event);
+      takesOver = (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter ||
+                   (watched == sessionBindingAgentSend_ && key->key() == Qt::Key_Space)) &&
+          !(key->modifiers() & Qt::ShiftModifier);
+    }
+    if (takesOver && agentController_ &&
+        (agentController_->agent().isBusy(agentPanel_->sessionId().toStdString()) ||
+         (sessionBindingAgentEditor_ && !sessionBindingAgentEditor_->toPlainText().trimmed().isEmpty()))) {
+      // Revoke forwarding before the ordinary local Send/Stop handler runs.
+      // This does not interrupt a model or consume the user's composer draft.
+      sessionImBridge_->localTakeover(agentPanel_->sessionId());
+    }
+  }
   if (watched == videoDockSlot_ &&
       (event->type() == QEvent::Resize || event->type() == QEvent::Move))
     QTimer::singleShot(0, this, [this] { syncVideoDock(); });
@@ -2736,6 +2772,22 @@ void MainWindow::buildUi() {
         [this, command = definition.command] { sendSlashCommand(command); });
   }
 
+  sessionBindingButton_ = new QPushButton(messageEditor_);
+  sessionBindingButton_->setObjectName(QStringLiteral("composerSessionBindingButton"));
+  sessionBindingButton_->setAccessibleName(QStringLiteral("绑定创作中心会话"));
+  sessionBindingButton_->setToolTip(QStringLiteral("绑定创作中心会话"));
+  sessionBindingButton_->setIcon(makeNavIcon(LineIconKind::Link, QColor(QStringLiteral("#64748b"))));
+  sessionBindingButton_->setIconSize(QSize(UiZoom::s(18), UiZoom::s(18)));
+  sessionBindingButton_->setFixedSize(UiZoom::s(30), UiZoom::s(30));
+  sessionBindingButton_->setCursor(Qt::PointingHandCursor);
+  sessionBindingButton_->setCheckable(true);
+  UiZoom::setStyle(sessionBindingButton_, QStringLiteral(
+      "QPushButton{background:transparent;border:0;border-radius:8px;padding:0;}"
+      "QPushButton:hover{background:#edf2f7;}"
+      "QPushButton:checked{background:#e8f3ff;}"));
+  connect(sessionBindingButton_, &QPushButton::clicked, this, &MainWindow::openSessionBindingDialog);
+  positionSessionBindingEntry();
+
   replySuggestionBar_ = new QWidget(composer);
   replySuggestionBar_->setObjectName(QStringLiteral("replySuggestionBar"));
   auto *suggestionLayout = new QVBoxLayout(replySuggestionBar_);
@@ -2824,6 +2876,33 @@ void MainWindow::buildUi() {
 
   // 待回复提示条：显示「正在回复谁的哪句话」，右侧 ✕ 取消。
   // 放在输入框**上方**而不是下方——用户视线从提示条落到输入框，顺序才对。
+  sessionBindingBar_ = new QWidget(composer);
+  sessionBindingBar_->setObjectName(QStringLiteral("imSessionBindingBar"));
+  auto* bindingRow = new QHBoxLayout(sessionBindingBar_);
+  bindingRow->setContentsMargins(UiZoom::s(10), UiZoom::s(5), UiZoom::s(6), UiZoom::s(5));
+  bindingRow->setSpacing(UiZoom::s(8));
+  sessionBindingName_ = new QLabel(sessionBindingBar_);
+  sessionBindingName_->setObjectName(QStringLiteral("imSessionBindingName"));
+  sessionBindingName_->setTextFormat(Qt::PlainText);
+  sessionBindingName_->setWordWrap(true);
+  sessionBindingName_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+  sessionBindingUnbind_ = new QPushButton(QStringLiteral("解除绑定"), sessionBindingBar_);
+  sessionBindingUnbind_->setObjectName(QStringLiteral("imSessionBindingUnbind"));
+  sessionBindingUnbind_->setCursor(Qt::PointingHandCursor);
+  bindingRow->addWidget(sessionBindingName_, 1);
+  bindingRow->addWidget(sessionBindingUnbind_);
+  UiZoom::setStyle(sessionBindingBar_, QStringLiteral(
+      "QWidget#imSessionBindingBar{background:#f1f7fd;border:1px solid #dceaf7;border-radius:8px;}"
+      "QLabel#imSessionBindingName{background:transparent;color:#375a7f;font-size:@metadata;}"
+      "QPushButton#imSessionBindingUnbind{background:transparent;border:0;color:#0b67b7;"
+      "font-size:@metadata;padding:4px 6px;}"
+      "QPushButton#imSessionBindingUnbind:hover{background:#e2effb;border-radius:5px;}"));
+  connect(sessionBindingUnbind_, &QPushButton::clicked, this, [this] {
+    if (sessionImBridge_) sessionImBridge_->unbind(app_.chatState().selectedPeerId());
+  });
+  sessionBindingBar_->hide();
+  composerLayout->addWidget(sessionBindingBar_);
+
   pendingReplyBar_ = new QWidget(composer);
   pendingReplyBar_->setObjectName(QStringLiteral("pendingReplyBar"));
   auto *replyBarLayout = new QHBoxLayout(pendingReplyBar_);
@@ -3886,6 +3965,8 @@ void MainWindow::bindSignals() {
         }
         updateConnectionIndicator();
         refreshSettings();
+        if (connected) restoreSessionBindings();
+        refreshSessionBinding();
       });
   connect(
       &app_, &RemoteIMApplication::errorMessage, this,
@@ -4129,6 +4210,7 @@ void MainWindow::refresh() {
   refreshSettings();
   refreshMessages();
   updateRemoteDesktopButton();
+  refreshSessionBinding();
 }
 
 void MainWindow::refreshSelectedConversation() {
@@ -5083,6 +5165,197 @@ void MainWindow::wireRemoteAgentPanel() {
   });
 }
 
+void MainWindow::positionSessionBindingEntry() {
+  if (!sessionBindingButton_ || !commandButton_) return;
+  sessionBindingButton_->move(commandButton_->x() + commandButton_->width() + UiZoom::s(8),
+                               commandButton_->y());
+  sessionBindingButton_->raise();
+}
+
+QString MainWindow::sessionBindingSettingsKey() {
+  if (accountDisconnectPending_) return {};
+  const auto account = app_.client().currentAccount();
+  if (account.isValid() && account.ownerUserId != app_.chatState().ownerUserId()) return {};
+  if (account.isValid() && account.ownerUserId == app_.chatState().ownerUserId()) {
+    const QString identity = QString::number(account.sdkAppId) + QLatin1Char(':') + account.ownerUserId;
+    sessionBindingSettingsScope_ = QStringLiteral("imSessionBindings/") + QString::fromLatin1(
+        QCryptographicHash::hash(identity.toUtf8(), QCryptographicHash::Sha256).toHex());
+  }
+  // Keep the already established account scope during a temporary disconnect,
+  // so an explicit offline unbind is saved instead of returning on reconnect.
+  return sessionBindingSettingsScope_;
+}
+
+void MainWindow::saveSessionBindings() {
+  if (!sessionImBridge_ || restoringSessionBindings_) return;
+  const QString key = sessionBindingSettingsKey();
+  if (key.isEmpty()) return;
+  QVariantMap stored;
+  const auto bindings = sessionImBridge_->bindings();
+  for (auto it = bindings.constBegin(); it != bindings.constEnd(); ++it)
+    stored.insert(it.key(), it.value());
+  QSettings settings;
+  settings.setValue(key, stored);
+}
+
+void MainWindow::restoreSessionBindings() {
+  if (!sessionImBridge_ || accountDisconnectPending_ || !app_.connectionReady()) return;
+  const auto account = app_.client().currentAccount();
+  if (!account.isValid() || account.ownerUserId != app_.chatState().ownerUserId()) return;
+  const QString key = sessionBindingSettingsKey();
+  if (key.isEmpty()) return;
+  const QVariantMap stored = QSettings().value(key).toMap();
+  restoringSessionBindings_ = true;
+  for (auto it = stored.constBegin(); it != stored.constEnd(); ++it) {
+    QString ignored;
+    sessionImBridge_->bind(it.key(), it.value().toString(), &ignored);
+  }
+  restoringSessionBindings_ = false;
+  // Remove stale/deleted/non-local Session choices with the same validator used
+  // by an explicit selection. Restoration does not replay any IM history.
+  saveSessionBindings();
+  refreshSessionBinding();
+}
+
+void MainWindow::refreshSessionBinding() {
+  if (!sessionBindingButton_ || !sessionBindingBar_) return;
+  const QString peer = app_.chatState().selectedPeerId();
+  const auto account = app_.client().currentAccount();
+  const bool eligible = activeGroupId_.isEmpty() && !peer.isEmpty() &&
+      peer != app_.chatState().ownerUserId() && app_.isAcceptedFriend(peer);
+  sessionBindingButton_->setEnabled(eligible && sessionImBridge_ && app_.connectionReady() &&
+                                    account.isValid() && account.ownerUserId == app_.chatState().ownerUserId() &&
+                                    !accountDisconnectPending_);
+  const QString sessionId = eligible && sessionImBridge_ ? sessionImBridge_->boundSession(peer) : QString();
+  MaiSession session;
+  const bool hasBinding = !sessionId.isEmpty() && agentController_ &&
+      agentController_->agent().getSession(sessionId.toStdString(), session) && session.isRoot();
+  const QSignalBlocker blocked(sessionBindingButton_);
+  sessionBindingButton_->setChecked(hasBinding);
+  sessionBindingBar_->setVisible(hasBinding);
+  if (!hasBinding) {
+    sessionBindingName_->clear();
+    sessionBindingButton_->setToolTip(QStringLiteral("绑定创作中心会话"));
+    return;
+  }
+  const QString title = session.isUntitled() ? QStringLiteral("新对话") : QString::fromStdString(session.title);
+  sessionBindingName_->setText(QStringLiteral("已绑定创作中心：%1").arg(title));
+  sessionBindingButton_->setToolTip(QStringLiteral("已绑定：%1\n点击更换创作中心会话").arg(title));
+}
+
+void MainWindow::openSessionBindingDialog() {
+  if (sessionBindingDialog_) {
+    sessionBindingDialog_->raise();
+    sessionBindingDialog_->activateWindow();
+    return;
+  }
+  if (!sessionImBridge_ || !agentController_ || !sessionBindingButton_->isEnabled()) {
+    refreshSessionBinding();
+    return;
+  }
+  const QString peer = app_.chatState().selectedPeerId();
+  const auto account = app_.client().currentAccount();
+  const QString selected = sessionImBridge_->boundSession(peer);
+  auto* dialog = new QDialog(this);
+  sessionBindingDialog_ = dialog;
+  dialog->setObjectName(QStringLiteral("imSessionBindingDialog"));
+  dialog->setWindowTitle(QStringLiteral("绑定创作中心会话"));
+  dialog->setMinimumWidth(UiZoom::s(360));
+  dialog->resize(UiZoom::s(500), UiZoom::s(420));
+  auto* layout = new QVBoxLayout(dialog);
+  layout->setContentsMargins(UiZoom::s(20), UiZoom::s(18), UiZoom::s(20), UiZoom::s(16));
+  layout->setSpacing(UiZoom::s(12));
+  auto* introduction = new QLabel(
+      QStringLiteral("绑定后，对方新发来的消息会交给所选本机会话处理，回复会自动发回此好友。历史消息不会补发。"), dialog);
+  introduction->setWordWrap(true);
+  introduction->setTextFormat(Qt::PlainText);
+  layout->addWidget(introduction);
+  auto* list = new QListWidget(dialog);
+  list->setObjectName(QStringLiteral("imSessionBindingSessions"));
+  list->setSelectionMode(QAbstractItemView::SingleSelection);
+  layout->addWidget(list, 1);
+  const auto bindings = sessionImBridge_->bindings();
+  for (const auto& session : agentController_->agent().listSessions()) {
+    if (!session.isRoot()) continue;
+    const QString id = QString::fromStdString(session.id);
+    const QString title = session.isUntitled() ? QStringLiteral("新对话") : QString::fromStdString(session.title);
+    QString otherPeer;
+    for (auto it = bindings.constBegin(); it != bindings.constEnd(); ++it)
+      if (it.key() != peer && it.value() == id) { otherPeer = it.key(); break; }
+    auto* item = new QListWidgetItem(otherPeer.isEmpty() ? title : title + QStringLiteral("（已绑定其他好友）"), list);
+    item->setData(Qt::UserRole, id);
+    if (!otherPeer.isEmpty()) item->setFlags(item->flags() & ~Qt::ItemIsEnabled & ~Qt::ItemIsSelectable);
+    if (id == selected && otherPeer.isEmpty()) list->setCurrentItem(item);
+  }
+  auto* error = new QLabel(dialog);
+  error->setObjectName(QStringLiteral("imSessionBindingError"));
+  error->setTextFormat(Qt::PlainText);
+  error->setWordWrap(true);
+  UiZoom::setStyle(error, QStringLiteral("color:#b42318;font-size:@metadata;"));
+  error->setVisible(list->count() == 0);
+  if (list->count() == 0) error->setText(QStringLiteral("还没有本机会话，请先到创作中心新建会话。"));
+  layout->addWidget(error);
+  auto* buttons = new QHBoxLayout;
+  buttons->addStretch(1);
+  auto* cancel = new QPushButton(QStringLiteral("取消"), dialog);
+  auto* confirm = new QPushButton(QStringLiteral("绑定此会话"), dialog);
+  confirm->setObjectName(QStringLiteral("imSessionBindingConfirm"));
+  confirm->setEnabled(list->currentItem() != nullptr);
+  buttons->addWidget(cancel);
+  buttons->addWidget(confirm);
+  layout->addLayout(buttons);
+  connect(cancel, &QPushButton::clicked, dialog, &QDialog::reject);
+  connect(list, &QListWidget::currentItemChanged, dialog, [confirm](QListWidgetItem* item) {
+    confirm->setEnabled(item && (item->flags() & Qt::ItemIsEnabled));
+  });
+  const QPointer<MainWindow> window(this);
+  connect(confirm, &QPushButton::clicked, dialog, [window, dialog, list, error, peer, account] {
+    if (!window || !window->sessionImBridge_ || !list->currentItem()) return;
+    if (window->accountDisconnectPending_ || !window->app_.connectionReady() ||
+        window->app_.client().currentAccount() != account || window->app_.chatState().selectedPeerId() != peer) {
+      error->setText(QStringLiteral("账号或好友会话已改变，请重新选择。"));
+      error->show();
+      return;
+    }
+    QString failure;
+    if (!window->sessionImBridge_->bind(peer, list->currentItem()->data(Qt::UserRole).toString(), &failure)) {
+      error->setText(failure);
+      error->show();
+      return;
+    }
+    dialog->accept();
+  });
+  const QPointer<QDialog> guard(dialog);
+  dialog->exec();
+  if (!window) return;
+  sessionBindingDialog_.clear();
+  if (guard) delete guard.data();
+  refreshSessionBinding();
+}
+
+void MainWindow::registerSessionImBindingTool(MaiToolRegistry& registry) {
+  if (QThread::currentThread() != thread()) return;
+  auto registrationAccount = app_.client().currentAccount();
+  // Real startup constructs the window before IM login. Only the trusted
+  // configured SDK app and owner may fill that initially absent identity; a
+  // later arbitrary connection must never become an old tool's registration.
+  if (!registrationAccount.isValid() && imSdkAppId_ > 0 && !app_.chatState().ownerUserId().isEmpty())
+    registrationAccount = {quint64(imSdkAppId_), app_.chatState().ownerUserId()};
+  const auto registrationGeneration = agentControllerGeneration_;
+  const QPointer<MainWindow> window(this);
+  registerDesktopSessionImBindingTools(registry, this,
+      [window, registrationAccount, registrationGeneration]() -> DesktopSessionImBridge* {
+        if (!window || window->thread() != QThread::currentThread() || !registrationAccount.isValid() ||
+            window->accountDisconnectPending_ || !window->app_.connectionReady() ||
+            window->agentControllerGeneration_ != registrationGeneration)
+          return nullptr;
+        const auto account = window->app_.client().currentAccount();
+        if (account != registrationAccount || account.ownerUserId != window->app_.chatState().ownerUserId())
+          return nullptr;
+        return window->sessionImBridge_;
+      });
+}
+
 void MainWindow::rebuildAgentPage() {
   if (agentPage_ == nullptr)
     return;
@@ -5093,6 +5366,10 @@ void MainWindow::rebuildAgentPage() {
 
   ++agentControllerGeneration_;
   pendingModelSelections_.clear();
+  delete sessionImBridge_;
+  sessionImBridge_ = nullptr;
+  sessionBindingAgentSend_.clear();
+  sessionBindingAgentEditor_.clear();
 
   const QString sessionToRestore =
       agentPanel_ == nullptr ? QString() : agentPanel_->sessionId();
@@ -5141,6 +5418,7 @@ void MainWindow::rebuildAgentPage() {
   agentController_ = new AgentController(
       modelConfig, agentDatabasePath(app_.chatState().ownerUserId()),
       [this](MaiToolRegistry &registry) {
+        registerSessionImBindingTool(registry);
         registerMaiChatHostTools(registry, app_);
         QPointer<MainWindow> cloudPresenter(this);
         registerDesktopCloudDriveTools(
@@ -5240,9 +5518,26 @@ void MainWindow::rebuildAgentPage() {
 #endif
       },
       this);
+  sessionImBridge_ = new DesktopSessionImBridge(app_, *agentController_, this);
+  connect(sessionImBridge_, &DesktopSessionImBridge::bindingChanged, this, [this](const QString&) {
+    saveSessionBindings();
+    refreshSessionBinding();
+  });
+  connect(sessionImBridge_, &DesktopSessionImBridge::relayError, this,
+          [this](const QString& peer, const QString& message) {
+            showToast(QStringLiteral("%1：%2").arg(contactName(peer), message), 13, 3500);
+          });
+  connect(agentController_, &AgentController::sessionTitleChanged, this,
+          [this](const QString&, const QString&) { refreshSessionBinding(); });
+  connect(agentController_, &AgentController::sessionStructureChanged, this,
+          [this] { refreshSessionBinding(); });
   agentSessions_ = new AgentSessionList(*agentController_, agentSplitter);
   agentPanelStack_ = new QStackedWidget(agentSplitter);
   agentPanel_ = new AgentChatPanel(*agentController_, agentPanelStack_);
+  sessionBindingAgentSend_ = agentPanel_->findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+  sessionBindingAgentEditor_ = agentPanel_->findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+  if (sessionBindingAgentSend_) sessionBindingAgentSend_->installEventFilter(this);
+  if (sessionBindingAgentEditor_) sessionBindingAgentEditor_->installEventFilter(this);
   // 远端待发内容与本地 Agent 使用同一账号私有目录，避免账号切换共享出站记录。
   agentRemotePanel_ = new RemoteAgentPanel(agentPanelStack_,
       QDir(accountAgentDirectory(app_.chatState().ownerUserId()))
@@ -5453,6 +5748,8 @@ void MainWindow::rebuildAgentPage() {
     agentRemotePanel_->openSession(remoteToRestore);
     agentSessions_->setCurrentRemote(remoteToRestore);
   }
+  restoreSessionBindings();
+  refreshSessionBinding();
 }
 
 void MainWindow::requestAgentModelChange(const QString& model) {
@@ -8216,6 +8513,7 @@ void MainWindow::updateComposerState() {
   }
   if (commandButton_)
     commandButton_->setEnabled(hasPeer);
+  refreshSessionBinding();
   sendButton_->setEnabled(hasPeer && (hasText || hasAttachments));
 }
 

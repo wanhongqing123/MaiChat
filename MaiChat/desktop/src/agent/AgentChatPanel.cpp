@@ -25,7 +25,6 @@
 #include <QFrame>
 #include <QFutureWatcher>
 #include <QGuiApplication>
-#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -536,48 +535,35 @@ QLabel* makeLabel(const QString& text, UiZoom::TextRole role, const char* color,
     return label;
 }
 
-class WelcomeScrollArea final : public QScrollArea {
+// Native buttons provide keyboard/accessibility behavior; their size must come
+// from the wrapping child labels instead of QPushButton's single-line text hint.
+class WelcomeToolRow final : public QPushButton {
 public:
-    explicit WelcomeScrollArea(QWidget* parent) : QScrollArea(parent) {}
-
-    void setFeatures(QGridLayout* grid, const QList<QWidget*>& cards) {
-        grid_ = grid;
-        cards_ = cards;
-        arrangeFeatures();
+    explicit WelcomeToolRow(QWidget* parent) : QPushButton(parent) {
+        QSizePolicy policy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        policy.setHeightForWidth(true);
+        setSizePolicy(policy);
+        setAutoDefault(false);
     }
 
-protected:
-    void resizeEvent(QResizeEvent* event) override {
-        QScrollArea::resizeEvent(event);
-        arrangeFeatures();
+    QSize sizeHint() const override {
+        return layout() ? layout()->totalSizeHint() : QPushButton::sizeHint();
     }
-
-private:
-    void arrangeFeatures() {
-        if (!grid_) return;
-        const int width = viewport()->width();
-        const int columns = width >= UiZoom::s(900) ? 4 : width >= UiZoom::s(650) ? 3 : 2;
-        if (columns == columns_) return;
-        for (QWidget* card : cards_) grid_->removeWidget(card);
-        for (int column = 0; column < 4; ++column) grid_->setColumnStretch(column, column < columns ? 1 : 0);
-        for (int index = 0; index < cards_.size(); ++index)
-            grid_->addWidget(cards_[index], index / columns, index % columns);
-        columns_ = columns;
-        setProperty("welcomeColumns", columns);
+    QSize minimumSizeHint() const override {
+        return layout() ? layout()->totalMinimumSize() : QPushButton::minimumSizeHint();
     }
-
-    QGridLayout* grid_ = nullptr;
-    QList<QWidget*> cards_;
-    int columns_ = 0;
+    int heightForWidth(int width) const override {
+        return layout() ? layout()->totalHeightForWidth(width) : QPushButton::heightForWidth(width);
+    }
 };
 
-QWidget* makeWelcomeView(QWidget* parent) {
-    auto* scroll = new WelcomeScrollArea(parent);
+QWidget* makeWelcomeView(QWidget* parent, const std::function<void(const QString&)>& fillDraft) {
+    auto* scroll = new QScrollArea(parent);
     scroll->setObjectName(QStringLiteral("agentWelcomeView"));
     scroll->setFrameShape(QFrame::NoFrame);
     scroll->setWidgetResizable(true);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     scroll->setStyleSheet(QStringLiteral("QScrollArea#agentWelcomeView{background:#ffffff;border:0;}"));
 
     auto* canvas = new QWidget(scroll);
@@ -585,7 +571,6 @@ QWidget* makeWelcomeView(QWidget* parent) {
     auto* canvasLayout = new QVBoxLayout(canvas);
     canvasLayout->setSizeConstraint(QLayout::SetMinimumSize);
     canvasLayout->setContentsMargins(UiZoom::s(20), UiZoom::s(24), UiZoom::s(20), UiZoom::s(24));
-    canvasLayout->addStretch(1);
     auto* centered = new QHBoxLayout;
     centered->addStretch(0);
     auto* content = new QWidget(canvas);
@@ -599,77 +584,134 @@ QWidget* makeWelcomeView(QWidget* parent) {
     auto* sparkle = makeLabel(QStringLiteral("✦"), UiZoom::TextRole::Display, kAccent, true);
     sparkle->setObjectName(QStringLiteral("agentWelcomeSparkle"));
     sparkle->setAlignment(Qt::AlignCenter);
-    sparkle->setFixedSize(UiZoom::s(52), UiZoom::s(52));
+    sparkle->setFixedSize(UiZoom::s(36), UiZoom::s(36));
     sparkle->setTextInteractionFlags(Qt::NoTextInteraction);
     UiZoom::setStyle(
         sparkle, QStringLiteral("QLabel#agentWelcomeSparkle{background:#e4f4ff;color:#168bd4;border-radius:15px;}"));
     contentLayout->addWidget(sparkle, 0, Qt::AlignHCenter);
-    auto* heading = makeLabel(QStringLiteral("从这里开始创作"), UiZoom::TextRole::Display, kInk, true);
+    auto* heading = makeLabel(QStringLiteral("从这里开始创作"), UiZoom::TextRole::Title, kInk, true);
     heading->setObjectName(QStringLiteral("agentWelcomeHeading"));
     heading->setAlignment(Qt::AlignCenter);
     heading->setTextInteractionFlags(Qt::NoTextInteraction);
-    contentLayout->addSpacing(UiZoom::s(18));
+    contentLayout->addSpacing(UiZoom::s(10));
     contentLayout->addWidget(heading);
-    contentLayout->addSpacing(UiZoom::s(28));
+    contentLayout->addSpacing(UiZoom::s(12));
 
-    auto* grid = new QGridLayout;
-    grid->setContentsMargins(0, 0, 0, 0);
-    grid->setHorizontalSpacing(UiZoom::s(10));
-    grid->setVerticalSpacing(UiZoom::s(10));
-    QList<QWidget*> cards;
-    const QList<QPair<QString, QString>> features = {
-        {QStringLiteral("AI 问答"), QStringLiteral("AI")},
-        {QStringLiteral("图片创作"), QStringLiteral("图")},
-        {QStringLiteral("视频创作"), QStringLiteral("视")},
-        {QStringLiteral("文件处理"), QStringLiteral("文")},
-        {QStringLiteral("桌面截屏"), QStringLiteral("屏")},
-        {QStringLiteral("浏览器操作"), QStringLiteral("网")},
-        {QStringLiteral("终端与进程"), QStringLiteral("终")},
-        {QStringLiteral("电脑操作"), QStringLiteral("控")},
-        {QStringLiteral("会话定时任务"), QStringLiteral("时")},
-        {QStringLiteral("日历导入"), QStringLiteral("历")},
-        {QStringLiteral("二维码生成"), QStringLiteral("码")},
-        {QStringLiteral("本地媒体处理"), QStringLiteral("媒")},
-        {QStringLiteral("拍照"), QStringLiteral("拍")},
-        {QStringLiteral("音乐播放"), QStringLiteral("音")},
-        {QStringLiteral("我的云盘"), QStringLiteral("云")},
-        {QStringLiteral("MaiChat 消息"), QStringLiteral("聊")},
-        {QStringLiteral("联系人"), QStringLiteral("人")},
-        {QStringLiteral("账号资料与头像"), QStringLiteral("像")},
-        {QStringLiteral("跨设备会话"), QStringLiteral("跨")},
+    auto* instruction = makeLabel(
+        QStringLiteral("可以直接说“使用某工具帮我完成……”；写清工具名、目标和完成条件。点击条目只填入草稿，编辑后再发送。"),
+        UiZoom::TextRole::Detail, kInkSoft);
+    instruction->setObjectName(QStringLiteral("agentWelcomeInstruction"));
+    instruction->setTextInteractionFlags(Qt::NoTextInteraction);
+    contentLayout->addWidget(instruction);
+    contentLayout->addSpacing(UiZoom::s(6));
+    auto* boundary = makeLabel(
+        QStringLiteral("工具是否可用取决于当前平台与配置；不支持或找不到目标时，请说明原因，不要换其他方式反复尝试。"),
+        UiZoom::TextRole::Metadata, kInkSoft);
+    boundary->setObjectName(QStringLiteral("agentWelcomeBoundary"));
+    boundary->setTextInteractionFlags(Qt::NoTextInteraction);
+    contentLayout->addWidget(boundary);
+    contentLayout->addSpacing(UiZoom::s(14));
+
+    struct WelcomeFeature {
+        QString name;
+        QString symbol;
+        QString purpose;
+        QString example;
     };
-    for (int index = 0; index < features.size(); ++index) {
-        auto* card = new QFrame(content);
-        card->setObjectName(QStringLiteral("agentWelcomeFeature"));
-        card->setAccessibleName(features[index].first);
-        card->setAccessibleDescription(QStringLiteral("功能介绍"));
-        card->setMinimumHeight(UiZoom::s(58));
-        card->setStyleSheet(
-            UiZoom::scaleQss(QStringLiteral("QFrame#agentWelcomeFeature{background:#ffffff;border:1px solid #e5edf5;"
-                                            "border-radius:13px;}")));
-        auto* row = new QHBoxLayout(card);
-        row->setContentsMargins(UiZoom::s(14), UiZoom::s(8), UiZoom::s(14), UiZoom::s(8));
-        row->setSpacing(UiZoom::s(10));
-        auto* symbol = makeLabel(features[index].second, UiZoom::TextRole::Detail, kAccent, true);
+    // Keep the existing Desktop families and platform/configuration gates. IDs
+    // below are task-specific examples audited against the actual registry, not
+    // category-to-tool routing rules. AI Q&A uses ordinary chat; media families
+    // span providers, so their examples do not select a provider implicitly.
+    const QList<WelcomeFeature> features = {
+        {QStringLiteral("AI 问答"), QStringLiteral("AI"), QStringLiteral("解释问题、整理思路与起草文字。"),
+         QStringLiteral("使用 AI 问答帮我把这段想法整理成行动清单。")},
+        {QStringLiteral("图片创作"), QStringLiteral("图"), QStringLiteral("根据描述或参考图片生成、修改图片。"),
+         QStringLiteral("使用图片创作工具帮我设计一张春日活动海报。")},
+        {QStringLiteral("视频创作"), QStringLiteral("视"), QStringLiteral("根据文字或参考素材生成视频。"),
+         QStringLiteral("使用视频创作工具帮我制作一段日落海边的短片。")},
+        {QStringLiteral("文件处理"), QStringLiteral("文"), QStringLiteral("查找、读取和编辑文件，整理本地资料。"),
+         QStringLiteral("使用文件处理工具（file_glob、file_read）帮我查找工作目录中的会议记录，读完后总结要点。")},
+        {QStringLiteral("桌面截屏"), QStringLiteral("屏"), QStringLiteral("截取桌面画面，查看当前屏幕内容。"),
+         QStringLiteral("使用桌面截屏工具（screenshot）帮我查看当前屏幕上的报错，说明报错内容。")},
+        {QStringLiteral("浏览器操作"), QStringLiteral("网"), QStringLiteral("打开网页、查找页面内容并操作网页。"),
+         QStringLiteral("使用浏览器操作工具（desktop_browser）帮我打开指定网页并找到下载入口，先不要下载。")},
+        {QStringLiteral("终端与进程"), QStringLiteral("终"), QStringLiteral("运行终端命令，查看和管理本机进程。"),
+         QStringLiteral("使用终端与进程工具（shell）帮我列出当前运行的进程名称和进程 ID。")},
+        {QStringLiteral("电脑操作"), QStringLiteral("控"), QStringLiteral("通过屏幕定位、点击和键盘操作桌面应用。"),
+         QStringLiteral("使用电脑操作工具（desktop_computer）帮我双击打开桌面上的“软件名称”；找不到就明确告诉我，不要换其他方式反复尝试。")},
+        {QStringLiteral("会话定时任务"), QStringLiteral("时"), QStringLiteral("安排本机会话任务在指定时间执行。"),
+         QStringLiteral("使用会话定时任务工具（maichat_session_task_create）帮我安排明天上午九点整理工作计划。")},
+        {QStringLiteral("日历导入"), QStringLiteral("历"), QStringLiteral("准备日历事件，交给系统日历确认导入。"),
+         QStringLiteral("使用日历导入工具（maichat_calendar_create_event）帮我准备明天下午三点的项目评审日程，交给我确认导入。")},
+        {QStringLiteral("二维码生成"), QStringLiteral("码"), QStringLiteral("将文字或网址生成可保存的二维码图片。"),
+         QStringLiteral("使用二维码生成工具（maichat_generate_qr_code）帮我把这个网址制作成 PNG 二维码。")},
+        {QStringLiteral("本地媒体处理"), QStringLiteral("媒"), QStringLiteral("查看媒体信息，转换、裁剪本地音视频。"),
+         QStringLiteral("使用本地媒体处理工具（ffprobe）帮我查看这段视频的时长和分辨率。")},
+        {QStringLiteral("拍照"), QStringLiteral("拍"), QStringLiteral("打开本机相机，由你点击快门拍照。"),
+         QStringLiteral("使用拍照工具（maichat_camera_command）帮我打开相机，我来点击快门拍照。")},
+        {QStringLiteral("音乐播放"), QStringLiteral("音"), QStringLiteral("在 MaiChat 播放器中打开本地音乐。"),
+         QStringLiteral("使用音乐播放工具（maichat_play_local_music）帮我播放工作目录中的“音乐文件名”。")},
+        {QStringLiteral("我的云盘"), QStringLiteral("云"), QStringLiteral("浏览云盘文件，上传、下载和整理资料。"),
+         QStringLiteral("使用我的云盘工具（maichat_cloud_drive_search_media）帮我查找云盘里的“项目资料”，列出匹配文件。")},
+        {QStringLiteral("MaiChat 消息"), QStringLiteral("聊"), QStringLiteral("查找聊天记录，按你的要求发送或回复消息。"),
+         QStringLiteral("使用 MaiChat 消息工具（maichat_search_messages）帮我查找本周提到“项目资料”的消息，列出匹配结果。")},
+        {QStringLiteral("联系人"), QStringLiteral("人"), QStringLiteral("查找联系人，查看好友和群聊信息。"),
+         QStringLiteral("使用联系人工具（maichat_list_contacts）帮我查找名字中包含“小明”的好友，列出匹配联系人。")},
+        {QStringLiteral("账号资料与头像"), QStringLiteral("像"), QStringLiteral("查看账号资料，按你的要求修改昵称或头像。"),
+         QStringLiteral("使用账号资料与头像工具（maichat_get_current_account）帮我查看当前账号的昵称和头像。")},
+        {QStringLiteral("跨设备会话"), QStringLiteral("跨"), QStringLiteral("查看其他在线设备的会话，管理会话工作区。"),
+         QStringLiteral("使用跨设备会话工具（maichat_remote_session_list）帮我查看其他在线设备上的会话，列出设备和会话名称。")},
+    };
+    for (const WelcomeFeature& feature : features) {
+        auto* button = new WelcomeToolRow(content);
+        button->setObjectName(QStringLiteral("agentWelcomeFeature"));
+        button->setAccessibleName(feature.name);
+        button->setAccessibleDescription(feature.purpose + QLatin1Char('\n') + feature.example);
+        button->setCursor(Qt::PointingHandCursor);
+        UiZoom::setStyle(button, QStringLiteral(
+            "QPushButton#agentWelcomeFeature{background:#ffffff;border:1px solid #e5edf5;border-radius:10px;}"
+            "QPushButton#agentWelcomeFeature:hover{background:#f6faff;border-color:#c7dff2;}"
+            "QPushButton#agentWelcomeFeature:focus{border-color:#0b67b7;}"
+            "QPushButton#agentWelcomeFeature:pressed{background:#eaf5ff;}"));
+        auto* rowLayout = new QHBoxLayout(button);
+        rowLayout->setContentsMargins(UiZoom::s(14), UiZoom::s(10), UiZoom::s(14), UiZoom::s(10));
+        rowLayout->setSpacing(UiZoom::s(12));
+        auto* symbol = makeLabel(feature.symbol, UiZoom::TextRole::Detail, kAccent, true);
         symbol->setAlignment(Qt::AlignCenter);
         symbol->setTextInteractionFlags(Qt::NoTextInteraction);
+        symbol->setAttribute(Qt::WA_TransparentForMouseEvents);
         symbol->setFixedSize(UiZoom::s(28), UiZoom::s(28));
         symbol->setStyleSheet(
             UiZoom::scaleQss(QStringLiteral("QLabel{background:#eaf5ff;color:#168bd4;border-radius:7px;}")));
-        row->addWidget(symbol);
-        auto* label = makeLabel(features[index].first, UiZoom::TextRole::Detail, kInk, true);
-        label->setWordWrap(false);
-        label->setTextInteractionFlags(Qt::NoTextInteraction);
-        row->addWidget(label, 1);
-        cards.append(card);
+        rowLayout->addWidget(symbol, 0, Qt::AlignTop);
+        auto* textLayout = new QVBoxLayout;
+        textLayout->setSpacing(UiZoom::s(3));
+        auto* name = makeLabel(feature.name, UiZoom::TextRole::Detail, kInk, true);
+        name->setObjectName(QStringLiteral("agentWelcomeFeatureName"));
+        auto* purpose = makeLabel(feature.purpose, UiZoom::TextRole::Detail, kInkSoft);
+        purpose->setObjectName(QStringLiteral("agentWelcomeFeaturePurpose"));
+        auto* example = makeLabel(feature.example, UiZoom::TextRole::Metadata, kAccent);
+        example->setObjectName(QStringLiteral("agentWelcomeFeatureExample"));
+        for (QLabel* label : {name, purpose, example}) {
+            label->setMinimumWidth(0);
+            label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            label->setTextInteractionFlags(Qt::NoTextInteraction);
+            // Text belongs to the button's hit target, including after wrapping.
+            label->setAttribute(Qt::WA_TransparentForMouseEvents);
+            textLayout->addWidget(label);
+        }
+        rowLayout->addLayout(textLayout, 1);
+        QObject::connect(button, &QPushButton::clicked, button, [fillDraft, text = feature.example] {
+            if (fillDraft) fillDraft(text);
+        });
+        contentLayout->addWidget(button);
+        contentLayout->addSpacing(UiZoom::s(6));
     }
-    contentLayout->addLayout(grid);
     centered->addWidget(content, 1);
     centered->addStretch(0);
     canvasLayout->addLayout(centered);
     canvasLayout->addStretch(1);
     scroll->setWidget(canvas);
-    scroll->setFeatures(grid, cards);
     return scroll;
 }
 
@@ -1525,7 +1567,20 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     conversationColumn->addWidget(runtime_->olderMessages);
     conversationColumn->addWidget(runtime_->view, 1);
     conversationLayers->addWidget(conversationContent);
-    runtime_->welcomeView = makeWelcomeView(conversationSurface);
+    runtime_->welcomeView = makeWelcomeView(conversationSurface, [this](const QString& example) {
+        if (!runtime_->editor) return;
+        // The old welcome grid was passive. Selecting a list example now only
+        // appends an editable draft; keep existing text/media and session policy,
+        // and let the ordinary Send action decide when to start a model turn.
+        QTextCursor cursor(runtime_->editor->document());
+        cursor.movePosition(QTextCursor::End);
+        cursor.beginEditBlock();
+        if (!runtime_->editor->document()->isEmpty()) cursor.insertBlock();
+        cursor.insertText(example);
+        cursor.endEditBlock();
+        runtime_->editor->setTextCursor(cursor);
+        runtime_->editor->setFocus(Qt::OtherFocusReason);
+    });
     conversationLayers->addWidget(runtime_->welcomeView);
 
     runtime_->flushTimer = new QTimer(this);

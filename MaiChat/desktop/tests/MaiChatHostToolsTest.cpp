@@ -6,9 +6,21 @@
 #include <QImage>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QThread>
+#include <QSet>
+#include <QSemaphore>
+#include <QScopeGuard>
+#include <QThreadPool>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QtTest>
 
 #include <memory>
+#include <atomic>
+#include <future>
+#include <chrono>
+#include <thread>
+#include <utility>
 
 #include "MaiTool.h"
 #include "MaiChatTools/MaiChatHostTools.h"
@@ -23,6 +35,16 @@ private slots:
   void nicknameToolUsesTheAccountUpdater();
   void accountToolsExposeOnlyPublicProfileAndGateAvatarWrites();
   void readsContactsMessagesSearchAndUnreadState();
+  void searchesPersistedHistoryOutsidePreviewAndOpenConversationPage();
+  void searchPagesPersistedHistoryWithFiltersAndStableTies();
+  void searchRejectsUnsupportedArgumentsAndHonorsCancellation();
+  void messageQueriesRequireAnAvailableDatabase();
+  void ordinarySearchIsAsynchronousAndRejectsChangedAccountOrCancellation();
+  void databaseQueryDoesNotWaitForTheGlobalThreadPool();
+  void messageQueryChecksCancellationBeforePublishing();
+  void blockedApplicationQueueDoesNotHoldMessageQueries_data();
+  void blockedApplicationQueueDoesNotHoldMessageQueries();
+  void preCanceledMessageQueriesNeverEnterTheDatabasePath();
   void sendsAndRepliesOnlyThroughApprovalGatedTools();
   void sendsAgentImageAsPersistentMediaMessage();
   void groupToolsUseTheSameApplicationFlowAndApprovalRules();
@@ -291,9 +313,12 @@ void MaiChatHostToolsTest::sendsAgentImageAsPersistentMediaMessage() {
 }
 
 void MaiChatHostToolsTest::readsContactsMessagesSearchAndUnreadState() {
+  QTemporaryDir directory;
+  QVERIFY(directory.isValid());
   auto client = std::make_unique<FakeRemoteIMClient>();
   auto *fake = client.get();
-  RemoteIMApplication app(QStringLiteral("owner"), std::move(client));
+  RemoteIMApplication app(QStringLiteral("owner"), std::move(client),
+                          std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("messages.sqlite"))));
   app.addContact(QStringLiteral("alice"), QStringLiteral("Alice"));
   app.addContact(QStringLiteral("bob"), QStringLiteral("Bob"));
   app.selectPeer(QStringLiteral("alice"));
@@ -336,6 +361,454 @@ void MaiChatHostToolsTest::readsContactsMessagesSearchAndUnreadState() {
       QJsonDocument::fromJson(QByteArray::fromStdString(unread.output()))
           .object();
   QCOMPARE(unreadObject.value(QStringLiteral("total_unread")).toInt(), 1);
+}
+
+// Search must inspect the private fixture database even when the UI deliberately
+// keeps only a preview or a recent page in memory.
+void MaiChatHostToolsTest::searchesPersistedHistoryOutsidePreviewAndOpenConversationPage() {
+  QTemporaryDir directory;
+  QVERIFY(directory.isValid());
+  const QString path = directory.filePath(QStringLiteral("messages.sqlite"));
+  {
+    LocalMessageDatabase database(path);
+    QVERIFY(database.isOpen());
+    database.upsertContact({QStringLiteral("alice"), QStringLiteral("Alice")});
+    for (int index = 0; index < 65; ++index) {
+      RemoteIMMessage message;
+      message.id = QStringLiteral("persisted-%1").arg(index, 3, 10, QLatin1Char('0'));
+      message.fromUserId = QStringLiteral("alice");
+      message.toUserId = QStringLiteral("owner");
+      message.createdAtMillis = index + 1000;
+      message.text = index == 0 ? QStringLiteral("ancient UNIQUE_NEEDLE")
+                                : QStringLiteral("recent ordinary entry");
+      QVERIFY(database.insertMessageIfAbsent(message, QStringLiteral("alice")));
+    }
+  }
+  RemoteIMApplication app(QStringLiteral("owner"), std::make_unique<FakeRemoteIMClient>(),
+                          std::make_unique<LocalMessageDatabase>(path));
+  QCOMPARE(app.chatState().messagesWith(QStringLiteral("alice")).size(), 1);
+  MaiToolRegistry registry;
+  registerMaiChatHostTools(registry, app);
+  MaiToolContext context;
+  auto checkSearch = [&] {
+    const auto result = registry.find("maichat_search_messages")->execute(
+        R"({"query":"UNIQUE_NEEDLE","peer_id":"alice","limit":10})", context);
+    QVERIFY2(!result.hasError(), result.error().message().c_str());
+    const auto output = QJsonDocument::fromJson(QByteArray::fromStdString(result.output())).object();
+    const auto matches = output.value(QStringLiteral("matches")).toArray();
+    QCOMPARE(matches.size(), 1);
+    QCOMPARE(matches.first().toObject().value(QStringLiteral("id")).toString(),
+             QStringLiteral("persisted-000"));
+    const auto fetched = registry.find("maichat_get_messages")->execute(
+        R"({"peer_id":"alice","limit":10})", context);
+    QVERIFY2(!fetched.hasError(), fetched.error().message().c_str());
+    const auto fetchedBody = QJsonDocument::fromJson(QByteArray::fromStdString(fetched.output())).object();
+    const auto messages = fetchedBody.value(QStringLiteral("messages")).toArray();
+    QCOMPARE(messages.size(), 10);
+    QCOMPARE(messages.first().toObject().value(QStringLiteral("id")).toString(),
+             QStringLiteral("persisted-064"));
+    QVERIFY(fetchedBody.value(QStringLiteral("has_more")).toBool());
+    QSet<QString> ids;
+    for (const auto &message : messages) ids.insert(message.toObject().value(QStringLiteral("id")).toString());
+    auto page = fetchedBody;
+    int pageCount = 1;
+    while (page.value(QStringLiteral("has_more")).toBool() && pageCount++ < 10) {
+      const QJsonObject arguments{{QStringLiteral("peer_id"), QStringLiteral("alice")},
+          {QStringLiteral("limit"), 10}, {QStringLiteral("cursor"), page.value(QStringLiteral("next_cursor"))}};
+      const auto next = registry.find("maichat_get_messages")->execute(
+          QJsonDocument(arguments).toJson(QJsonDocument::Compact).toStdString(), context);
+      QVERIFY2(!next.hasError(), next.error().message().c_str());
+      page = QJsonDocument::fromJson(QByteArray::fromStdString(next.output())).object();
+      for (const auto &message : page.value(QStringLiteral("messages")).toArray()) {
+        const QString id = message.toObject().value(QStringLiteral("id")).toString();
+        QVERIFY(!ids.contains(id));
+        ids.insert(id);
+      }
+    }
+    QCOMPARE(ids.size(), 65);
+    QVERIFY(ids.contains(QStringLiteral("persisted-000")));
+    QVERIFY(!page.value(QStringLiteral("has_more")).toBool());
+  };
+  checkSearch();
+  QCOMPARE(app.chatState().messagesWith(QStringLiteral("alice")).size(), 1);
+  app.selectPeer(QStringLiteral("alice"));
+  QCOMPARE(app.chatState().messagesWith(QStringLiteral("alice")).size(), 40);
+  checkSearch();
+  QCOMPARE(app.chatState().messagesWith(QStringLiteral("alice")).size(), 40);
+}
+
+void MaiChatHostToolsTest::searchPagesPersistedHistoryWithFiltersAndStableTies() {
+  QTemporaryDir directory;
+  QVERIFY(directory.isValid());
+  const QString path = directory.filePath(QStringLiteral("messages.sqlite"));
+  {
+    LocalMessageDatabase database(path);
+    QVERIFY(database.isOpen());
+    for (const QString &peer : {QStringLiteral("alice"), QStringLiteral("bob")}) {
+      database.upsertContact({peer, peer});
+      for (int index = 0; index < 6; ++index) {
+        RemoteIMMessage message;
+        message.id = peer + QString::number(index);
+        message.direction = index == 5 ? RemoteIMMessageDirection::Incoming
+                                        : RemoteIMMessageDirection::Outgoing;
+        message.fromUserId = index == 5 ? peer : QStringLiteral("owner");
+        message.toUserId = index == 5 ? QStringLiteral("owner") : peer;
+        message.createdAtMillis = index == 0 ? 100 : 200;
+        message.text = QStringLiteral("Release NOTE");
+        message.hasFile = index != 4;
+        QVERIFY(database.insertMessageIfAbsent(message, peer));
+      }
+    }
+  }
+  RemoteIMApplication app(QStringLiteral("owner"), std::make_unique<FakeRemoteIMClient>(),
+                          std::make_unique<LocalMessageDatabase>(path));
+  MaiToolRegistry registry;
+  registerMaiChatHostTools(registry, app);
+  MaiToolContext context;
+  QJsonObject arguments{{QStringLiteral("query"), QStringLiteral("note release")},
+                        {QStringLiteral("peer_id"), QStringLiteral("alice")},
+                        {QStringLiteral("kind"), QStringLiteral("file")},
+                        {QStringLiteral("direction"), QStringLiteral("outgoing")},
+                        {QStringLiteral("since_ms"), QStringLiteral("200")},
+                        {QStringLiteral("until_ms"), QStringLiteral("200")},
+                        {QStringLiteral("limit"), 2}};
+  auto search = [&](const QJsonObject &input) {
+    return registry.find("maichat_search_messages")->execute(
+        QJsonDocument(input).toJson(QJsonDocument::Compact).toStdString(), context);
+  };
+  const auto first = search(arguments);
+  QVERIFY2(!first.hasError(), first.error().message().c_str());
+  const auto firstBody = QJsonDocument::fromJson(QByteArray::fromStdString(first.output())).object();
+  const auto firstRows = firstBody.value(QStringLiteral("matches")).toArray();
+  QCOMPARE(firstRows.size(), 2);
+  QCOMPARE(firstRows.at(0).toObject().value(QStringLiteral("id")).toString(), QStringLiteral("alice3"));
+  QCOMPARE(firstRows.at(1).toObject().value(QStringLiteral("id")).toString(), QStringLiteral("alice2"));
+  QCOMPARE(firstBody.value(QStringLiteral("coverage")).toString(), QStringLiteral("local_persisted"));
+  QVERIFY(firstBody.value(QStringLiteral("local_available")).toBool());
+  QVERIFY(!firstBody.value(QStringLiteral("cloud_history_complete")).toBool(true));
+  QVERIFY(firstBody.value(QStringLiteral("has_more")).toBool());
+  QVERIFY(!firstBody.value(QStringLiteral("no_matches")).toBool(true));
+  QCOMPARE(firstBody.value(QStringLiteral("limit")).toInt(), 2);
+  QCOMPARE(firstBody.value(QStringLiteral("order")).toString(), QStringLiteral("created_at_ms_desc_id_desc"));
+  QVERIFY(!firstBody.value(QStringLiteral("snapshot")).toBool(true));
+  const QString cursor = firstBody.value(QStringLiteral("next_cursor")).toString();
+  QVERIFY(!cursor.isEmpty());
+  arguments.insert(QStringLiteral("cursor"), cursor);
+  const auto second = search(arguments);
+  QVERIFY2(!second.hasError(), second.error().message().c_str());
+  const auto secondBody = QJsonDocument::fromJson(QByteArray::fromStdString(second.output())).object();
+  const auto secondRows = secondBody.value(QStringLiteral("matches")).toArray();
+  QCOMPARE(secondRows.size(), 1);
+  QCOMPARE(secondRows.first().toObject().value(QStringLiteral("id")).toString(), QStringLiteral("alice1"));
+  QVERIFY(!secondBody.value(QStringLiteral("has_more")).toBool(true));
+  QVERIFY(!secondBody.value(QStringLiteral("no_matches")).toBool(true));
+  QVERIFY(secondBody.value(QStringLiteral("next_cursor")).toString().isEmpty());
+  arguments.insert(QStringLiteral("peer_id"), QStringLiteral("bob"));
+  QVERIFY(search(arguments).hasError()); // A continuation cannot cross filter/account scopes.
+  arguments.insert(QStringLiteral("peer_id"), QStringLiteral("alice"));
+  app.connectToService(123456, QStringLiteral("synthetic-signature"));
+  QVERIFY(search(arguments).hasError()); // A reconnect invalidates an earlier session's cursor.
+  arguments.remove(QStringLiteral("cursor"));
+  arguments.insert(QStringLiteral("query"), QStringLiteral("absent-token-4937"));
+  const auto empty = search(arguments);
+  QVERIFY2(!empty.hasError(), empty.error().message().c_str());
+  const auto emptyBody = QJsonDocument::fromJson(QByteArray::fromStdString(empty.output())).object();
+  QVERIFY(emptyBody.value(QStringLiteral("no_matches")).toBool());
+  QVERIFY(!emptyBody.value(QStringLiteral("has_more")).toBool(true));
+  arguments.remove(QStringLiteral("query"));
+  arguments.insert(QStringLiteral("peer_id"), QStringLiteral("alice"));
+  const auto fetched = registry.find("maichat_get_messages")->execute(
+      QJsonDocument(arguments).toJson(QJsonDocument::Compact).toStdString(), context);
+  QVERIFY2(!fetched.hasError(), fetched.error().message().c_str());
+  const auto fetchedBody = QJsonDocument::fromJson(QByteArray::fromStdString(fetched.output())).object();
+  const auto fetchedRows = fetchedBody.value(QStringLiteral("messages")).toArray();
+  QCOMPARE(fetchedRows.size(), 2);
+  QCOMPARE(fetchedRows.first().toObject().value(QStringLiteral("id")).toString(), QStringLiteral("alice3"));
+  arguments.insert(QStringLiteral("cursor"), fetchedBody.value(QStringLiteral("next_cursor")));
+  const auto fetchedNext = registry.find("maichat_get_messages")->execute(
+      QJsonDocument(arguments).toJson(QJsonDocument::Compact).toStdString(), context);
+  QVERIFY2(!fetchedNext.hasError(), fetchedNext.error().message().c_str());
+  QCOMPARE(QJsonDocument::fromJson(QByteArray::fromStdString(fetchedNext.output())).object()
+      .value(QStringLiteral("messages")).toArray().size(), 1);
+}
+
+void MaiChatHostToolsTest::searchRejectsUnsupportedArgumentsAndHonorsCancellation() {
+  QTemporaryDir directory;
+  QVERIFY(directory.isValid());
+  RemoteIMApplication app(QStringLiteral("owner"), std::make_unique<FakeRemoteIMClient>(),
+                          std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("messages.sqlite"))));
+  MaiToolRegistry registry;
+  registerMaiChatHostTools(registry, app);
+  MaiToolContext context;
+  auto *tool = registry.find("maichat_search_messages");
+  QVERIFY(registry.find("maichat_get_messages")->execute(
+      R"({"peer_id":"alice","query":"needle"})", context).hasError());
+  for (const char *arguments : {
+           R"({"query":"needle","unsupported_filter":true})",
+           R"({"query":"needle","direction":"sideways"})",
+           R"({"query":"needle","kind":"unknown"})",
+           R"({"query":"needle","limit":0})",
+           R"({"query":"needle","limit":2.5})",
+           R"({"query":"needle","since_ms":"broken"})",
+           R"({"query":"needle","since_ms":"20","until_ms":"10"})",
+           R"({"query":"needle","cursor":"broken"})"}) {
+    QVERIFY2(tool->execute(arguments, context).hasError(), arguments);
+  }
+  std::atomic_bool canceled{true};
+  context.cancel = &canceled;
+  const auto result = tool->execute(R"({"query":"needle"})", context);
+  QVERIFY(result.hasError());
+  QCOMPARE(result.error().code(), MaiErrorCode::Canceled);
+}
+
+void MaiChatHostToolsTest::messageQueriesRequireAnAvailableDatabase() {
+  MaiToolContext context;
+  RemoteIMApplication memoryApp(QStringLiteral("owner"), std::make_unique<FakeRemoteIMClient>());
+  MaiToolRegistry memoryRegistry;
+  registerMaiChatHostTools(memoryRegistry, memoryApp);
+  QVERIFY(memoryRegistry.find("maichat_search_messages")->execute(
+      R"({"query":"needle"})", context).hasError());
+  QVERIFY(memoryRegistry.find("maichat_get_messages")->execute(
+      R"({"peer_id":"alice"})", context).hasError());
+  RemoteIMApplication unavailableApp(
+      QStringLiteral("owner"), std::make_unique<FakeRemoteIMClient>(),
+      std::make_unique<LocalMessageDatabase>(QString(QChar(0))));
+  MaiToolRegistry unavailableRegistry;
+  registerMaiChatHostTools(unavailableRegistry, unavailableApp);
+  QVERIFY(unavailableRegistry.find("maichat_search_messages")->execute(
+      R"({"query":"needle"})", context).hasError());
+  QVERIFY(unavailableRegistry.find("maichat_get_messages")->execute(
+      R"({"peer_id":"alice"})", context).hasError());
+}
+
+void MaiChatHostToolsTest::ordinarySearchIsAsynchronousAndRejectsChangedAccountOrCancellation() {
+  QTemporaryDir directory;
+  QVERIFY(directory.isValid());
+  auto client = std::make_unique<FakeRemoteIMClient>();
+  auto *fake = client.get();
+  RemoteIMApplication app(QStringLiteral("owner"), std::move(client),
+                          std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("messages.sqlite"))));
+  app.addContact(QStringLiteral("alice"), QStringLiteral("Alice"));
+  fake->emitIncomingText(QStringLiteral("alice"), QStringLiteral("private needle"));
+  QString account = QStringLiteral("account-a");
+  app.setAccountProfileProvider([&] {
+    return RemoteIMApplication::AccountProfile{true, account, QStringLiteral("owner"), {}, {}, {}};
+  });
+  LocalMessageSearchRequest request;
+  request.query = QStringLiteral("needle");
+  bool finished = false;
+  LocalMessageSearchResult result;
+  app.queryLocalMessages(request, {}, [&](const auto &searched) {
+    result = searched;
+    finished = true;
+    QCOMPARE(QThread::currentThread(), app.thread());
+  });
+  QVERIFY(!finished);
+  account = QStringLiteral("account-b");
+  QTRY_VERIFY(finished);
+  QCOMPARE(result.errorCode, QStringLiteral("identity_changed"));
+  QVERIFY(result.matches.isEmpty());
+  finished = false;
+  auto canceled = std::make_shared<std::atomic_bool>(false);
+  app.queryLocalMessages(request, canceled, [&](const auto &searched) {
+    result = searched;
+    finished = true;
+  });
+  canceled->store(true);
+  QTRY_VERIFY(finished);
+  QCOMPARE(result.errorCode, QStringLiteral("canceled"));
+  QVERIFY(result.matches.isEmpty());
+  finished = false;
+  app.setAccountProfileProvider([] { return RemoteIMApplication::AccountProfile{}; });
+  app.queryLocalMessages(request, {}, [&](const auto &searched) {
+    result = searched;
+    finished = true;
+  });
+  QTRY_VERIFY(finished);
+  QCOMPARE(result.errorCode, QStringLiteral("account_unavailable"));
+  QVERIFY(result.matches.isEmpty());
+}
+
+void MaiChatHostToolsTest::databaseQueryDoesNotWaitForTheGlobalThreadPool() {
+  QTemporaryDir directory;
+  QVERIFY(directory.isValid());
+  auto client = std::make_unique<FakeRemoteIMClient>();
+  auto *fake = client.get();
+  RemoteIMApplication app(QStringLiteral("owner"), std::move(client),
+                          std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("messages.sqlite"))));
+  app.addContact(QStringLiteral("alice"), QStringLiteral("Alice"));
+  fake->emitIncomingText(QStringLiteral("alice"), QStringLiteral("needle"));
+  auto* global = QThreadPool::globalInstance();
+  const int originalThreads = global->maxThreadCount();
+  QSemaphore entered;
+  QSemaphore release;
+  global->setMaxThreadCount(1);
+  const auto restore = qScopeGuard([&] {
+    release.release();
+    global->waitForDone(1000);
+    global->setMaxThreadCount(originalThreads);
+  });
+  global->start([&] {
+    entered.release();
+    release.tryAcquire(1, 2000);
+  });
+  QVERIFY(entered.tryAcquire(1, 1000));
+  LocalMessageSearchRequest request;
+  request.query = QStringLiteral("needle");
+  bool finished = false;
+  LocalMessageSearchResult result;
+  QElapsedTimer elapsed;
+  elapsed.start();
+  app.queryLocalMessages(request, {}, [&](const auto &searched) {
+    result = searched;
+    finished = true;
+  });
+  QTRY_VERIFY_WITH_TIMEOUT(finished, 1000);
+  qInfo() << "database query with global pool blocked ms:" << elapsed.elapsed();
+  QVERIFY(result.errorCode.isEmpty());
+  QCOMPARE(result.matches.size(), 1);
+}
+
+void MaiChatHostToolsTest::messageQueryChecksCancellationBeforePublishing() {
+  QTemporaryDir directory;
+  QVERIFY(directory.isValid());
+  RemoteIMApplication app(QStringLiteral("owner"), std::make_unique<FakeRemoteIMClient>(),
+                          std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("messages.sqlite"))));
+  MaiToolRegistry registry;
+  registerMaiChatHostTools(registry, app);
+  std::atomic_bool canceled{false};
+  int profileReads = 0;
+  app.setAccountProfileProvider([&] {
+    // The second identity check runs in the completion callback, immediately
+    // before publication and between cancellation-poll timer ticks.
+    if (++profileReads == 2) canceled.store(true);
+    return RemoteIMApplication::AccountProfile{true, QStringLiteral("account"), QStringLiteral("owner"), {}, {}, {}};
+  });
+  MaiToolContext context;
+  context.cancel = &canceled;
+  const auto result = registry.find("maichat_search_messages")->execute(R"({"query":"needle"})", context);
+  QCOMPARE(profileReads, 2);
+  QVERIFY(canceled.load());
+  QVERIFY(result.hasError());
+  QCOMPARE(result.error().code(), MaiErrorCode::Canceled);
+}
+
+void MaiChatHostToolsTest::blockedApplicationQueueDoesNotHoldMessageQueries_data() {
+  QTest::addColumn<QString>("toolName");
+  QTest::addColumn<QString>("termination");
+  for (const QString &tool : {QStringLiteral("maichat_search_messages"), QStringLiteral("maichat_get_messages")}) {
+    for (const QString &mode : {QStringLiteral("cancel"), QStringLiteral("deadline"), QStringLiteral("account")}) {
+      const QByteArray name = (tool + QLatin1Char('-') + mode).toUtf8();
+      QTest::newRow(name.constData()) << tool << mode;
+    }
+  }
+}
+
+void MaiChatHostToolsTest::blockedApplicationQueueDoesNotHoldMessageQueries() {
+  QFETCH(QString, toolName);
+  QFETCH(QString, termination);
+  QTemporaryDir directory;
+  QVERIFY(directory.isValid());
+  RemoteIMApplication app(QStringLiteral("owner"), std::make_unique<FakeRemoteIMClient>(),
+                          std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("messages.sqlite"))));
+  int profileReads = 0;
+  auto profile = [&] {
+    ++profileReads;
+    return RemoteIMApplication::AccountProfile{true, QStringLiteral("account-a"), QStringLiteral("owner"), {}, {}, {}};
+  };
+  app.setAccountProfileProvider(profile);
+  MaiToolRegistry registry;
+  registerMaiChatHostTools(registry, app);
+  auto *tool = registry.find(toolName.toStdString());
+  QVERIFY(tool);
+  const std::string arguments = toolName == QStringLiteral("maichat_search_messages")
+      ? R"({"query":"needle"})" : R"({"peer_id":"alice"})";
+  auto nativeCancel = std::make_unique<std::atomic_bool>(false);
+  auto *cancelWhilePending = nativeCancel.get();
+  QElapsedTimer elapsed;
+  elapsed.start();
+  auto future = std::async(std::launch::async,
+      [tool, arguments, nativeCancel = std::move(nativeCancel)]() mutable {
+        MaiToolContext context;
+        context.cancel = nativeCancel.get();
+        auto result = tool->execute(arguments, context);
+        // Any remaining queued callback must survive the native turn's cancel
+        // allocation being destroyed before the application's queue is released.
+        nativeCancel.reset();
+        return result;
+      });
+  // Blocking future waits deliberately keep this application's event queue
+  // stalled; QTest::qWait/processEvents would invalidate the regression.
+  const bool pendingBeforeTermination =
+      future.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout;
+  if (pendingBeforeTermination && termination == QStringLiteral("cancel"))
+    cancelWhilePending->store(true);
+  if (pendingBeforeTermination && termination == QStringLiteral("account")) {
+    app.setAccountProfileProvider([&] {
+      ++profileReads;
+      return RemoteIMApplication::AccountProfile{true, QStringLiteral("account-b"), QStringLiteral("owner"), {}, {}, {}};
+    });
+  }
+  const bool returnedWhileQueueBlocked = future.wait_for(std::chrono::milliseconds(
+      termination == QStringLiteral("deadline") ? 5500 : 500)) == std::future_status::ready;
+  if (!returnedWhileQueueBlocked) {
+    // Release an old implementation's blocking invocation before asserting RED,
+    // so a failed test never leaves a future destructor waiting on this UI thread.
+    QElapsedTimer rescue;
+    rescue.start();
+    while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready && rescue.elapsed() < 2500) {
+      QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+      qFatal("synthetic message-query worker did not release after draining the application queue");
+  }
+  const auto result = future.get();
+  QCoreApplication::sendPostedEvents();
+  QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+  qInfo() << toolName << termination << "returned with UI stalled:" << returnedWhileQueueBlocked
+          << "ms:" << elapsed.elapsed() << "database-path identity reads:" << profileReads;
+  QVERIFY(pendingBeforeTermination);
+  QVERIFY(returnedWhileQueueBlocked);
+  QVERIFY(result.hasError());
+  QCOMPARE(result.error().code(), termination == QStringLiteral("deadline") ? MaiErrorCode::Busy
+                                                                           : MaiErrorCode::Canceled);
+  QCOMPARE(profileReads, 0);
+}
+
+void MaiChatHostToolsTest::preCanceledMessageQueriesNeverEnterTheDatabasePath() {
+  QTemporaryDir directory;
+  QVERIFY(directory.isValid());
+  RemoteIMApplication app(QStringLiteral("owner"), std::make_unique<FakeRemoteIMClient>(),
+                          std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("messages.sqlite"))));
+  int profileReads = 0;
+  app.setAccountProfileProvider([&] {
+    ++profileReads;
+    return RemoteIMApplication::AccountProfile{true, QStringLiteral("account"), QStringLiteral("owner"), {}, {}, {}};
+  });
+  MaiToolRegistry registry;
+  registerMaiChatHostTools(registry, app);
+  std::atomic_bool canceled{true};
+  MaiToolContext context;
+  context.cancel = &canceled;
+  for (const auto &entry : {std::pair<const char*, const char*>{"maichat_search_messages", R"({"query":"needle"})"},
+                            {"maichat_get_messages", R"({"peer_id":"alice"})"}}) {
+    const auto result = registry.find(entry.first)->execute(entry.second, context);
+    QVERIFY(result.hasError());
+    QCOMPARE(result.error().code(), MaiErrorCode::Canceled);
+  }
+  QCOMPARE(profileReads, 0);
+  LocalMessageSearchRequest request;
+  request.query = QStringLiteral("needle");
+  bool finished = false;
+  LocalMessageSearchResult expired;
+  app.queryLocalMessages(request, {}, [&](const auto &result) {
+    expired = result;
+    finished = true;
+  }, QDeadlineTimer(0));
+  QVERIFY(finished);
+  QCOMPARE(expired.errorCode, QStringLiteral("query_timeout"));
+  QCOMPARE(profileReads, 0);
 }
 
 // 发送和回复工具都必须经过审批门槛；测试同时确认只读工具不会意外获得写入能力。

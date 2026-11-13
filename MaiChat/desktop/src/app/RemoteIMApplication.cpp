@@ -5,10 +5,15 @@
 #include "ui/DesktopRasterImage.h"
 
 #include <QSet>
+#include <QCoreApplication>
+#include <QDeadlineTimer>
 #include <QPointer>
 #include <QRegularExpression>
+#include <QScopeGuard>
 #include <QTimer>
+#include <QThreadPool>
 #include <QUuid>
+#include <QVariant>
 #include <memory>
 
 #include <QDir>
@@ -34,6 +39,60 @@
 #include "MaiSystemProxy.h"
 
 namespace {
+
+constexpr int kMachineVideoPreparationBudgetMs = 5000;
+
+std::atomic<int>& machineVideoPreparationAdmissions() {
+    static auto* count = new std::atomic<int>(0);
+    return *count;
+}
+
+QThreadPool* machineVideoPreparationPool() {
+    // Process-lifetime bounded service; QObject/window destruction must never
+    // join a native shell thumbnail call. Jobs own values/cancel/deadline only.
+    static QThreadPool* pool = [] {
+        auto* value = new QThreadPool;
+        value->setMaxThreadCount(2);
+        value->setObjectName(QStringLiteral("sessionImVideoPreparationPool"));
+        QCoreApplication::instance()->setProperty("sessionImVideoPreparationPool", QVariant::fromValue<QObject*>(value));
+        return value;
+    }();
+    return pool;
+}
+
+struct MachineVideoOutcome {
+    RemoteIMVideoPayload payload;
+    QString error;
+};
+
+MachineVideoOutcome prepareMachineVideo(const QString& path, const QString& coverDirectory,
+                                        const std::shared_ptr<std::atomic<bool>>& canceled,
+                                        const QDeadlineTimer& deadline) {
+    MachineVideoOutcome result;
+    if (canceled->load() || deadline.hasExpired()) return result;
+    const QFileInfo file(path);
+    if (!file.isFile() || !file.isReadable() || file.size() <= 0 || file.size() > 1024ll * 1024 * 1024 ||
+        !isSupportedVideoFile(path)) {
+        result.error = QStringLiteral("当前 IM 无法发送这种会话视频格式或大小");
+        return result;
+    }
+    VideoFileMetadata metadata = readVideoFileMetadata(path);
+    if (metadata.durationSeconds <= 0) metadata.durationSeconds = 1;
+    if (canceled->load() || deadline.hasExpired()) return result;
+    const VideoCoverImage cover = createVideoCoverImage(path, metadata, coverDirectory);
+    if (canceled->load() || deadline.hasExpired()) return result;
+    if (!cover.valid) { result.error = QStringLiteral("视频封面生成失败，无法发送会话视频"); return result; }
+    result.payload.videoPath = file.absoluteFilePath();
+    result.payload.videoType = metadata.containerType;
+    result.payload.videoSizeBytes = file.size();
+    result.payload.durationSeconds = metadata.durationSeconds;
+    result.payload.coverPath = cover.path;
+    result.payload.coverType = cover.type;
+    result.payload.coverSizeBytes = cover.sizeBytes;
+    result.payload.coverWidth = cover.width;
+    result.payload.coverHeight = cover.height;
+    return result;
+}
 
 struct AvatarUploadOutcome {
     QString url;
@@ -171,6 +230,11 @@ RemoteIMApplication::RemoteIMApplication(QString ownerUserId,
         throw std::invalid_argument("RemoteIMClient is required");
     }
     client_->setParent(this);
+    connect(this, &QObject::destroyed, [generation = messageQueryGeneration_] {
+        generation->fetch_add(1);
+    });
+    messageQueryPool_ = new QThreadPool(this);
+    messageQueryPool_->setMaxThreadCount(2);
     typingHeartbeat_ = new QTimer(this);
     typingHeartbeat_->setInterval(3000);
     typingIdle_ = new QTimer(this);
@@ -200,6 +264,108 @@ RemoteIMApplication::RemoteIMApplication(QString ownerUserId,
                 groupMessages_.value(group.groupId).size();
         }
     }
+}
+
+void RemoteIMApplication::queryLocalMessages(const LocalMessageSearchRequest& query,
+        std::shared_ptr<std::atomic_bool> canceled, MessageSearchCompletion completion,
+        QDeadlineTimer deadline) {
+    if (!canceled) canceled = std::make_shared<std::atomic_bool>(false);
+    auto reject = [&](const QString& error) {
+        LocalMessageSearchResult result;
+        result.errorCode = error;
+        result.limit = query.limit;
+        if (completion) completion(result);
+    };
+    auto stopped = [&] {
+        if (canceled->load()) { reject(QStringLiteral("canceled")); return true; }
+        if (deadline.hasExpired()) { reject(QStringLiteral("query_timeout")); return true; }
+        return false;
+    };
+    if (stopped()) return;
+    if (pendingMessageQueries_ >= 4) {
+        LocalMessageSearchResult result;
+        result.errorCode = QStringLiteral("query_busy");
+        result.limit = query.limit;
+        if (completion) completion(result);
+        return;
+    }
+    const quint64 generation = connectionGeneration_;
+    const quint64 queryGeneration = messageQueryGeneration_->load();
+    const AccountProfile profile = currentAccountProfile();
+    if (stopped()) return;
+    if (messageQueryGeneration_->load() != queryGeneration) {
+        reject(QStringLiteral("identity_changed"));
+        return;
+    }
+    if (accountProfileProvider_ && !profile.loggedIn) {
+        LocalMessageSearchResult result;
+        result.errorCode = QStringLiteral("account_unavailable");
+        result.limit = query.limit;
+        if (completion) completion(result);
+        return;
+    }
+    const QString searchSession = QString::number(generation) + QLatin1Char(':') +
+        QString::number(queryGeneration) + QLatin1Char(':') +
+        profile.accountId + QLatin1Char(':') + profile.imUserId;
+    std::shared_ptr<LocalMessageSearchReader> reader;
+    if (database_) reader = database_->createSearchReader(searchSession);
+    if (!reader) {
+        LocalMessageSearchResult result;
+        result.errorCode = QStringLiteral("local_storage_unavailable");
+        result.limit = query.limit;
+        if (completion) completion(result);
+        return;
+    }
+    ++pendingMessageQueries_;
+    struct SearchOperation {
+        std::shared_ptr<std::atomic_bool> canceled;
+        MessageSearchCompletion completion;
+        QMetaObject::Connection destructionConnection;
+    };
+    auto operation = std::make_shared<SearchOperation>();
+    operation->canceled = canceled;
+    operation->completion = std::move(completion);
+    const QPointer<RemoteIMApplication> self(this);
+    operation->destructionConnection = connect(this, &QObject::destroyed, [operation] {
+        operation->canceled->store(true);
+        operation->completion = {};
+    });
+    auto* watcher = new QFutureWatcher<LocalMessageSearchResult>(this);
+    connect(watcher, &QFutureWatcher<LocalMessageSearchResult>::finished, this,
+        [self, watcher, operation, generation, queryGeneration, profile, deadline] {
+            auto result = watcher->result();
+            watcher->deleteLater();
+            QObject::disconnect(operation->destructionConnection);
+            if (!self) return;
+            --self->pendingMessageQueries_;
+            if (operation->canceled->load()) {
+                result = {};
+                result.errorCode = QStringLiteral("canceled");
+            } else if (deadline.hasExpired()) {
+                result = {};
+                result.errorCode = QStringLiteral("query_timeout");
+            } else if (self->messageQueryGeneration_->load() != queryGeneration ||
+                       self->connectionGeneration_ != generation) {
+                result = {};
+                result.errorCode = QStringLiteral("identity_changed");
+            } else {
+                const AccountProfile current = self->currentAccountProfile();
+                if (self->messageQueryGeneration_->load() != queryGeneration ||
+                    current.loggedIn != profile.loggedIn || current.accountId != profile.accountId ||
+                    current.imUserId != profile.imUserId) {
+                    result = {};
+                    result.errorCode = QStringLiteral("identity_changed");
+                }
+            }
+            auto done = std::move(operation->completion);
+            if (done) done(result);
+        });
+    watcher->setFuture(QtConcurrent::run(messageQueryPool_,
+        [reader = std::move(reader), query, canceled, deadline]() mutable {
+        auto result = reader->search(query, canceled, deadline);
+        reader.reset(); // Release the read lease before publishing completion.
+        return result;
+    }));
 }
 
 QList<RemoteIMGroup> RemoteIMApplication::groups() const { return groups_; }
@@ -692,6 +858,7 @@ int RemoteIMApplication::loadEarlierMessages(const QString& peerId) {
 
 void RemoteIMApplication::connectToService(int sdkAppId, const QString& userSig) {
     ++connectionGeneration_;
+    messageQueryGeneration_->fetch_add(1);
     client_->connectToService(sdkAppId, state_.ownerUserId(), userSig, [this](bool ok, const QString& error) {
         connected_ = ok;
         emit connectionChanged(connected_);
@@ -707,6 +874,7 @@ void RemoteIMApplication::disconnectFromService(RemoteIMCompletion completion) {
     if (disconnecting_) return;
     disconnecting_ = true;
     ++connectionGeneration_;
+    messageQueryGeneration_->fetch_add(1);
     const QPointer<RemoteIMApplication> self(this);
     client_->disconnectFromService([self](bool ok, const QString& error) {
         if (!self) return;
@@ -780,6 +948,7 @@ void RemoteIMApplication::setNicknameUpdater(
 }
 
 void RemoteIMApplication::setAccountProfileProvider(std::function<AccountProfile()> provider) {
+    messageQueryGeneration_->fetch_add(1);
     accountProfileProvider_ = std::move(provider);
 }
 
@@ -1184,6 +1353,207 @@ bool RemoteIMApplication::sendTextTo(const QString& peerId, const QString& text,
             }
             markMessage(effectiveId, ok ? RemoteIMMessageStatus::Sent : RemoteIMMessageStatus::Failed);
             if (!ok) emit errorMessage(error.isEmpty() ? QStringLiteral("文本消息发送失败") : error);
+        });
+    return true;
+}
+
+bool RemoteIMApplication::sendMachineTextTo(const QString& peerId, const QString& text,
+                                            RemoteIMSendCompletion completion, std::function<bool()> canSend,
+                                            const RemoteIMQuote& quote, bool hasQuote) {
+    const QString target = peerId.trimmed();
+    RemoteIMMessage message;
+    message.text = text.trimmed();
+    message.quote = quote;
+    message.hasQuote = hasQuote && !quote.digest.isEmpty();
+    return sendMachineMessageTo(target, message,
+        [this, target, text = message.text, quote, hasQuote = message.hasQuote](RemoteIMSendCompletion done) {
+            client_->sendMachineTextWithQuote(target, text, quote, hasQuote, std::move(done));
+        }, std::move(completion), std::move(canSend));
+}
+
+bool RemoteIMApplication::sendMachineMediaTo(const QString& peerId, const QString& path, const QString& type,
+                                             const QString& caption, RemoteIMSendCompletion completion,
+                                             std::function<bool()> canSend, const RemoteIMQuote& quote, bool hasQuote,
+                                             std::function<void(bool)> onDispatched) {
+    const QString target = peerId.trimmed();
+    if (type == QStringLiteral("video"))
+        return prepareMachineVideoTo(target, path, caption, std::move(completion), std::move(canSend),
+                                     quote, hasQuote, std::move(onDispatched));
+    const QFileInfo file(path);
+    const auto reject = [&completion, &onDispatched](const QString& error) {
+        if (completion) completion(false, error, {});
+        if (onDispatched) onDispatched(false);
+        return false;
+    };
+    if (!file.isFile() || !file.isReadable() || file.size() <= 0)
+        return reject(QStringLiteral("待发送的会话附件不存在或不可读取"));
+    RemoteIMMessage message;
+    message.text = caption.trimmed();
+    message.quote = quote;
+    message.hasQuote = hasQuote && !quote.digest.isEmpty();
+    const QString source = file.absoluteFilePath();
+    if (type == QStringLiteral("image")) {
+        if (file.size() > 32ll * 1024 * 1024) return reject(QStringLiteral("图片超过 IM 的现有大小限制"));
+        message.hasImage = true;
+        message.image = {source, 0, 0, file.size()};
+        const bool queued = sendMachineMessageTo(target, message,
+            [this, target, source, message](RemoteIMSendCompletion done) {
+                client_->sendMachineImageWithText(target, source, message.text, false, message.quote,
+                                                 message.hasQuote, std::move(done));
+            }, std::move(completion), std::move(canSend));
+        if (onDispatched) onDispatched(queued);
+        return queued;
+    }
+    if (type == QStringLiteral("audio") || type == QStringLiteral("file")) {
+        if (file.size() > 512ll * 1024 * 1024) return reject(QStringLiteral("文件超过 IM 的现有大小限制"));
+        message.hasFile = true;
+        message.file = {source, file.fileName(), QMimeDatabase().mimeTypeForFile(file).name(), file.size()};
+        const bool queued = sendMachineMessageTo(target, message,
+            [this, target, source, message](RemoteIMSendCompletion done) {
+                client_->sendMachineFileWithText(target, source, message.file.fileName, message.text, false,
+                                                message.quote, message.hasQuote, std::move(done));
+            }, std::move(completion), std::move(canSend));
+        if (onDispatched) onDispatched(queued);
+        return queued;
+    }
+    return reject(QStringLiteral("当前 IM 无法发送这种会话附件格式或大小"));
+}
+
+bool RemoteIMApplication::prepareMachineVideoTo(const QString& peerId, const QString& path, const QString& caption,
+                                                RemoteIMSendCompletion completion, std::function<bool()> canSend,
+                                                const RemoteIMQuote& quote, bool hasQuote,
+                                                std::function<void(bool)> onDispatched) {
+    const auto account = client_->currentAccount();
+    const quint64 generation = connectionGeneration_;
+    bool friendExists = false;
+    for (const auto& contact : state_.contacts()) if (contact.userId == peerId) friendExists = true;
+    if (!connectionReady() || !account.isValid() || account.ownerUserId != state_.ownerUserId() ||
+        peerId == account.ownerUserId || !friendExists || !isAcceptedFriend(peerId) ||
+        machineVideoPreparationAdmissions().load() >= 32 || (canSend && !canSend())) {
+        if (completion) completion(false, QStringLiteral("会话视频准备不可用或已达现有队列上限"), {});
+        if (onDispatched) onDispatched(false);
+        return false;
+    }
+    struct Preparation {
+        bool settled = false;
+        std::shared_ptr<std::atomic<bool>> canceled = std::make_shared<std::atomic<bool>>(false);
+    };
+    auto state = std::make_shared<Preparation>();
+    machineVideoPreparationAdmissions().fetch_add(1);
+    const QPointer<RemoteIMApplication> self(this);
+    const QDeadlineTimer deadline(kMachineVideoPreparationBudgetMs);
+    auto* watcher = new QFutureWatcher<MachineVideoOutcome>(this);
+    watcher->setObjectName(QStringLiteral("sessionImVideoPreparation"));
+    auto* timer = new QTimer(watcher);
+    timer->setObjectName(QStringLiteral("sessionImVideoPreparationDeadline"));
+    timer->setSingleShot(true);
+    const auto cancelOnDestroy = connect(this, &QObject::destroyed, [canceled = state->canceled] { canceled->store(true); });
+    auto fail = [state, completion, onDispatched](const QString& error) {
+        if (state->settled) return;
+        state->settled = true;
+        state->canceled->store(true);
+        if (completion) completion(false, error, {});
+        if (onDispatched) onDispatched(false);
+    };
+    connect(timer, &QTimer::timeout, this, [fail] { fail(QStringLiteral("会话视频准备超时，没有派发到 IM")); });
+    connect(watcher, &QFutureWatcher<MachineVideoOutcome>::finished, this,
+        [self, watcher, timer, state, account, generation, peerId, caption, quote, hasQuote,
+         completion, canSend, onDispatched, fail, deadline, cancelOnDestroy] {
+            timer->stop();
+            watcher->deleteLater();
+            QObject::disconnect(cancelOnDestroy);
+            if (state->settled) return;
+            if (!self || state->canceled->load() || deadline.hasExpired() || !self->connectionReady() ||
+                self->connectionGeneration_ != generation || self->client_->currentAccount() != account ||
+                (canSend && !canSend())) { fail(QStringLiteral("会话或账号已改变，视频没有派发到 IM")); return; }
+            const auto prepared = watcher->result();
+            if (!prepared.error.isEmpty() || !prepared.payload.isValid()) {
+                fail(prepared.error.isEmpty() ? QStringLiteral("会话视频准备未完成，没有派发到 IM") : prepared.error);
+                return;
+            }
+            state->settled = true;
+            const auto payload = prepared.payload;
+            RemoteIMMessage message;
+            message.text = caption.trimmed();
+            message.quote = quote;
+            message.hasQuote = hasQuote && !quote.digest.isEmpty();
+            message.hasVideo = true;
+            message.video = {payload.videoPath, QFileInfo(payload.videoPath).fileName(), payload.coverPath,
+                             payload.durationSeconds, payload.videoSizeBytes};
+            const bool queued = self->sendMachineMessageTo(peerId, message,
+                [self, peerId, payload, message](RemoteIMSendCompletion done) {
+                    if (self) self->client_->sendMachineVideoWithText(peerId, payload, message.text, false,
+                                                                     message.quote, message.hasQuote, std::move(done));
+                    else if (done) done(false, QStringLiteral("IM host was destroyed"), {});
+                }, completion, canSend);
+            if (onDispatched) onDispatched(queued);
+        });
+    const QString coverDirectory = QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation))
+        .filePath(QStringLiteral("RemoteIMVideoCovers"));
+    timer->start(kMachineVideoPreparationBudgetMs);
+    watcher->setFuture(QtConcurrent::run(machineVideoPreparationPool(),
+        [path, coverDirectory, canceled = state->canceled, deadline] {
+            const auto release = qScopeGuard([] { machineVideoPreparationAdmissions().fetch_sub(1); });
+            return prepareMachineVideo(path, coverDirectory, canceled, deadline);
+        }));
+    // Admission is distinct from SDK dispatch and delivery. The caller receives
+    // a separate dispatch callback after preparation's final owner/scope guard.
+    return true;
+}
+
+bool RemoteIMApplication::sendMachineMessageTo(const QString& peerId, RemoteIMMessage message,
+                                               std::function<void(RemoteIMSendCompletion)> dispatch,
+                                               RemoteIMSendCompletion completion, std::function<bool()> canSend) {
+    const QString target = peerId.trimmed();
+    const auto account = client_->currentAccount();
+    const quint64 generation = connectionGeneration_;
+    bool friendExists = false;
+    for (const auto& contact : state_.contacts()) if (contact.userId == target) friendExists = true;
+    if (!connectionReady() || !account.isValid() || account.ownerUserId != state_.ownerUserId() ||
+        target == account.ownerUserId || target.isEmpty() ||
+        (message.text.isEmpty() && !message.hasImage && !message.hasVideo && !message.hasFile) ||
+        !friendExists || !isAcceptedFriend(target) || (canSend && !canSend())) {
+        if (completion) completion(false, QStringLiteral("当前账号或好友会话已不可用"), {});
+        return false;
+    }
+    message.fromUserId = account.ownerUserId;
+    message.toUserId = target;
+    message.direction = RemoteIMMessageDirection::Outgoing;
+    message.status = RemoteIMMessageStatus::Pending;
+    message.origin = RemoteIMMessageOrigin::Machine;
+    message.createdAtMillis = (message.createdAtMillis / 1000) * 1000;
+    const QPointer<RemoteIMApplication> self(this);
+    state_.appendLiveMessage(message);
+    persistMessage(message);
+    emit stateChanged();
+    // stateChanged observers can synchronously begin logout. Recheck immediately
+    // before the SDK call as well as when its asynchronous receipt returns.
+    if (!self || !connectionReady() || connectionGeneration_ != generation || client_->currentAccount() != account ||
+        !isAcceptedFriend(target) || (canSend && !canSend())) {
+        if (self && client_->currentAccount() == account && state_.ownerUserId() == account.ownerUserId)
+            markMessage(message.id, RemoteIMMessageStatus::Failed);
+        if (completion) completion(false, QStringLiteral("账号连接已改变"), {});
+        return false;
+    }
+    dispatch(
+        [self, account, generation, localId = message.id, completion = std::move(completion)]
+        (bool ok, const QString& error, const RemoteIMSendReceipt& receipt) {
+            if (!self) return;
+            QTimer::singleShot(0, self, [self, account, generation, localId, ok, error, receipt, completion] {
+                if (!self) return;
+                if (!self->connectionReady() || self->connectionGeneration_ != generation ||
+                    self->client_->currentAccount() != account || self->state_.ownerUserId() != account.ownerUserId) {
+                    if (completion) completion(false, QStringLiteral("账号连接已改变"), {});
+                    return;
+                }
+                const QString effective = self->adoptRemoteMessageId(localId, ok ? receipt.remoteMessageId : QString());
+                if (ok) {
+                    self->state_.updateMessageTime(effective, receipt.createdAtMillis);
+                    if (self->database_) self->database_->updateMessageTime(effective, receipt.createdAtMillis);
+                }
+                self->markMessage(effective, ok ? RemoteIMMessageStatus::Sent : RemoteIMMessageStatus::Failed);
+                if (completion) completion(ok, error, receipt);
+            });
         });
     return true;
 }

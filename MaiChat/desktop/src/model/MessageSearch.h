@@ -5,6 +5,7 @@
 
 #include <QList>
 #include <QString>
+#include <QStringList>
 
 #include "model/RemoteIMMessage.h"
 
@@ -37,6 +38,20 @@ constexpr int PinyinInitial = 20;
 // 首字母查询的最短长度。实测（7340 条真实消息）：4 字母查询命中 0.2~0.7%，
 // 3 字母 0.9~1.7%，而 2 字母的「fb」命中 11.2%——太糙，没有意义。
 constexpr int kMinPinyinQueryLength = 3;
+
+// Normalize a query once for database scans and UI result lists. The matching
+// stages and scores are identical to score(); only query preparation is cached.
+class PreparedQuery {
+public:
+    explicit PreparedQuery(const QString& needle);
+    int score(const QString& text) const;
+    bool matches(const QString& text) const;
+private:
+    QString needle_;
+    QStringList tokens_;
+    QString folded_;
+    bool pinyin_ = false;
+};
 
 // 0 表示不匹配；分数越高越贴切。大小写不敏感。
 int score(const QString& text, const QString& needle);

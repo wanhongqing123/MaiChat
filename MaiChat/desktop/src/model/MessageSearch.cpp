@@ -96,40 +96,50 @@ bool matchesPinyinInitials(const QString& text, const QString& needle) {
 
 }  // namespace
 
-int score(const QString& text, const QString& needle) {
-    const QString cleanNeedle = needle.trimmed();
-    if (cleanNeedle.isEmpty() || text.isEmpty()) return NoMatch;
+PreparedQuery::PreparedQuery(const QString& needle)
+    : needle_(needle.trimmed()), tokens_(needle_.split(QLatin1Char(' '), Qt::SkipEmptyParts)),
+      folded_(needle_.toCaseFolded()), pinyin_(looksLikePinyinQuery(folded_)) {}
 
-    const int at = text.indexOf(cleanNeedle, 0, Qt::CaseInsensitive);
+int PreparedQuery::score(const QString& text) const {
+    if (needle_.isEmpty() || text.isEmpty()) return NoMatch;
+
+    const int at = text.indexOf(needle_, 0, Qt::CaseInsensitive);
     if (at == 0) return Prefix;
     if (at > 0) return Substring;
 
-    const QStringList tokens = cleanNeedle.split(QLatin1Char(' '), Qt::SkipEmptyParts);
-    if (tokens.size() > 1) {
+    if (tokens_.size() > 1) {
         bool all = true;
-        for (const QString& token : tokens) {
+        for (const QString& token : tokens_) {
             if (!text.contains(token, Qt::CaseInsensitive)) { all = false; break; }
         }
         if (all) return AllTokens;
     }
 
     // 单字查询不做子序列：一个「的」能命中几乎所有消息，那样的结果没有意义。
-    if (cleanNeedle.size() >= 2 && isSubsequenceWithinSpan(text, cleanNeedle)) return Subsequence;
+    if (needle_.size() >= 2 && isSubsequenceWithinSpan(text, needle_)) return Subsequence;
 
     // 字面全部落空之后才试拼音首字母，所以搜英文词不会被拼音干扰。
-    const QString folded = cleanNeedle.toCaseFolded();
-    if (looksLikePinyinQuery(folded) && matchesPinyinInitials(text, folded)) return PinyinInitial;
+    if (pinyin_ && matchesPinyinInitials(text, folded_)) return PinyinInitial;
     return NoMatch;
 }
 
+bool PreparedQuery::matches(const QString& text) const {
+    return score(text) != NoMatch;
+}
+
+int score(const QString& text, const QString& needle) {
+    return PreparedQuery(needle).score(text);
+}
+
 bool matches(const QString& text, const QString& needle) {
-    return score(text, needle) != NoMatch;
+    return PreparedQuery(needle).matches(text);
 }
 
 QList<int> matchIndexes(const QList<RemoteIMMessage>& messages, const QString& needle) {
     QList<int> hits;
+    const PreparedQuery query(needle);
     for (int i = 0; i < messages.size(); ++i) {
-        if (matches(messages.at(i).text, needle)) hits.append(i);
+        if (query.matches(messages.at(i).text)) hits.append(i);
     }
     return hits;
 }

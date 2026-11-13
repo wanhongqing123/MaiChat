@@ -254,6 +254,10 @@ private slots:
     void sendsImageWithTextAsSingleMultiElemMessage();
     void sendsVideoWithEverySdkRequiredField();
     void sendsVideoWithTextAsSingleMultiElemMessage();
+    void machineQuotedTextUsesExistingMetadataEnvelope();
+    void machineImageAndFilePreserveNativeElementsCaptionAndQuote();
+    void machineVideoPreservesRequiredFieldsAndQuote();
+    void unsupportedMachineMediaNeverFallsBackToHumanSend();
     void refusesVideoWithoutDurationOrCover();
     void deletesFriendAndConversationThroughSdk();
     void requestsAndAcceptsFriendThroughSdk();
@@ -642,6 +646,116 @@ void TimSdkRemoteIMClientTest::sendsVideoWithTextAsSingleMultiElemMessage() {
     QCOMPARE(elems.at(1).toObject().value(QStringLiteral("elem_type")).toInt(), 0);
     QCOMPARE(elems.at(1).toObject().value(QStringLiteral("text_elem_content")).toString(),
              QStringLiteral("录屏在这"));
+}
+
+void TimSdkRemoteIMClientTest::machineQuotedTextUsesExistingMetadataEnvelope() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    TimSdkRemoteIMClient client(std::move(api));
+    const RemoteIMQuote quote{QStringLiteral("owned-source#0"), QStringLiteral("owned-friend"),
+                              QStringLiteral("owned source text"), QStringLiteral("text")};
+    bool sent = false;
+    client.sendMachineTextWithQuote(QStringLiteral("owned-friend"), QStringLiteral("owned reply"), quote, true,
+        [&](bool ok, const QString&, const RemoteIMSendReceipt&) { sent = ok; });
+    QVERIFY(sent);
+    const QJsonObject metadata = messageMetadata(fake->lastJsonMessage);
+    QCOMPARE(metadata.value(QStringLiteral("namespace")).toString(), QStringLiteral("multi-ai-code"));
+    QCOMPARE(metadata.value(QStringLiteral("version")).toInt(), 2);
+    QCOMPARE(metadata.value(QStringLiteral("origin")).toString(), QStringLiteral("machine"));
+    const QJsonObject wireQuote = metadata.value(QStringLiteral("quote")).toObject();
+    QCOMPARE(wireQuote.value(QStringLiteral("msgId")).toString(), quote.msgId);
+    QCOMPARE(wireQuote.value(QStringLiteral("sender")).toString(), quote.senderId);
+    QCOMPARE(wireQuote.value(QStringLiteral("digest")).toString(), quote.digest);
+    QCOMPARE(firstElement(fake->lastJsonMessage).value(QStringLiteral("text_elem_content")).toString(),
+             QStringLiteral("owned reply"));
+}
+
+void TimSdkRemoteIMClientTest::machineImageAndFilePreserveNativeElementsCaptionAndQuote() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    TimSdkRemoteIMClient client(std::move(api));
+    const RemoteIMQuote quote{QStringLiteral("owned-source#0"), QStringLiteral("owned-friend"),
+                              QStringLiteral("owned source caption"), QStringLiteral("image")};
+    client.sendImageWithText(QStringLiteral("owned-friend"), QStringLiteral("/owned/result.png"),
+                            QStringLiteral("owned image caption"), true, {});
+    const QJsonObject humanImage = QJsonDocument::fromJson(fake->lastJsonMessage.toUtf8()).object();
+    QCOMPARE(messageMetadata(fake->lastJsonMessage).value(QStringLiteral("origin")).toString(), QStringLiteral("human"));
+    bool imageSent = false;
+    client.sendMachineImageWithText(QStringLiteral("owned-friend"), QStringLiteral("/owned/result.png"),
+        QStringLiteral("owned image caption"), true, quote, true,
+        [&](bool ok, const QString&, const RemoteIMSendReceipt&) { imageSent = ok; });
+    QVERIFY(imageSent);
+    const QJsonObject image = QJsonDocument::fromJson(fake->lastJsonMessage.toUtf8()).object();
+    QCOMPARE(image.value(QStringLiteral("message_elem_array")), humanImage.value(QStringLiteral("message_elem_array")));
+    auto metadata = messageMetadata(fake->lastJsonMessage);
+    QCOMPARE(metadata.value(QStringLiteral("origin")).toString(), QStringLiteral("machine"));
+    QVERIFY(metadata.value(QStringLiteral("captionAbove")).toBool());
+    QCOMPARE(metadata.value(QStringLiteral("quote")).toObject().value(QStringLiteral("msgId")).toString(), quote.msgId);
+
+    client.sendFileWithText(QStringLiteral("owned-friend"), QStringLiteral("/owned/report.pdf"),
+                           QStringLiteral("report.pdf"), QStringLiteral("owned file caption"), false, {});
+    const QJsonObject humanFile = QJsonDocument::fromJson(fake->lastJsonMessage.toUtf8()).object();
+    QCOMPARE(messageMetadata(fake->lastJsonMessage).value(QStringLiteral("origin")).toString(), QStringLiteral("human"));
+    bool fileSent = false;
+    client.sendMachineFileWithText(QStringLiteral("owned-friend"), QStringLiteral("/owned/report.pdf"),
+        QStringLiteral("report.pdf"), QStringLiteral("owned file caption"), false, quote, true,
+        [&](bool ok, const QString&, const RemoteIMSendReceipt&) { fileSent = ok; });
+    QVERIFY(fileSent);
+    const QJsonObject file = QJsonDocument::fromJson(fake->lastJsonMessage.toUtf8()).object();
+    QCOMPARE(file.value(QStringLiteral("message_elem_array")), humanFile.value(QStringLiteral("message_elem_array")));
+    metadata = messageMetadata(fake->lastJsonMessage);
+    QCOMPARE(metadata.value(QStringLiteral("origin")).toString(), QStringLiteral("machine"));
+    QVERIFY(!metadata.contains(QStringLiteral("captionAbove")));
+    QCOMPARE(metadata.value(QStringLiteral("quote")).toObject().value(QStringLiteral("digest")).toString(), quote.digest);
+    QCOMPARE(firstElement(fake->lastJsonMessage).value(QStringLiteral("file_elem_file_name")).toString(),
+             QStringLiteral("report.pdf"));
+}
+
+void TimSdkRemoteIMClientTest::machineVideoPreservesRequiredFieldsAndQuote() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    TimSdkRemoteIMClient client(std::move(api));
+    const RemoteIMQuote quote{QStringLiteral("owned-video-source#0"), QStringLiteral("owned-friend"),
+                              QStringLiteral("owned video request"), QStringLiteral("video")};
+    client.sendVideoWithText(QStringLiteral("owned-friend"), samplePayload(), QStringLiteral("owned video"), true, {});
+    const QJsonObject human = QJsonDocument::fromJson(fake->lastJsonMessage.toUtf8()).object();
+    QCOMPARE(messageMetadata(fake->lastJsonMessage).value(QStringLiteral("origin")).toString(), QStringLiteral("human"));
+    bool sent = false;
+    client.sendMachineVideoWithText(QStringLiteral("owned-friend"), samplePayload(), QStringLiteral("owned video"),
+        true, quote, true, [&](bool ok, const QString&, const RemoteIMSendReceipt&) { sent = ok; });
+    QVERIFY(sent);
+    const QJsonObject machine = QJsonDocument::fromJson(fake->lastJsonMessage.toUtf8()).object();
+    QCOMPARE(machine.value(QStringLiteral("message_elem_array")), human.value(QStringLiteral("message_elem_array")));
+    const QJsonObject metadata = messageMetadata(fake->lastJsonMessage);
+    QCOMPARE(metadata.value(QStringLiteral("origin")).toString(), QStringLiteral("machine"));
+    QVERIFY(metadata.value(QStringLiteral("captionAbove")).toBool());
+    QCOMPARE(metadata.value(QStringLiteral("quote")).toObject().value(QStringLiteral("msgId")).toString(), quote.msgId);
+    QCOMPARE(firstElement(fake->lastJsonMessage).value(QStringLiteral("video_elem_video_duration")).toInt(), 42);
+}
+
+void TimSdkRemoteIMClientTest::unsupportedMachineMediaNeverFallsBackToHumanSend() {
+    class HumanOnlyClient final : public RemoteIMClient {
+    public:
+        int humanCalls = 0;
+        void connectToService(int, const QString&, const QString&, RemoteIMCompletion) override {}
+        void disconnectFromService(RemoteIMCompletion) override {}
+        void deleteContact(const QString&, RemoteIMCompletion) override {}
+        void sendText(const QString&, const QString&, RemoteIMSendCompletion) override { ++humanCalls; }
+        void sendImage(const QString&, const QString&, RemoteIMSendCompletion) override { ++humanCalls; }
+        void sendVoice(const QString&, const QString&, int, RemoteIMCompletion) override { ++humanCalls; }
+    } client;
+    int failures = 0;
+    auto failure = [&](bool ok, const QString& error, const RemoteIMSendReceipt&) {
+        QVERIFY(!ok);
+        QVERIFY(!error.isEmpty());
+        ++failures;
+    };
+    client.sendMachineImageWithText(QStringLiteral("friend"), QStringLiteral("/owned/result.png"), {}, false, {}, false, failure);
+    client.sendMachineFileWithText(QStringLiteral("friend"), QStringLiteral("/owned/report.pdf"), {}, {}, false, {}, false, failure);
+    client.sendMachineVideoWithText(QStringLiteral("friend"), samplePayload(), {}, false, {}, false, failure);
+    client.sendMachineTextWithQuote(QStringLiteral("friend"), QStringLiteral("owned reply"), {}, false, failure);
+    QCOMPARE(failures, 4);
+    QCOMPARE(client.humanCalls, 0);
 }
 
 void TimSdkRemoteIMClientTest::refusesVideoWithoutDurationOrCover() {

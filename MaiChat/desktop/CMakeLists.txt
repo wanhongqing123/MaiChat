@@ -539,6 +539,10 @@ add_library(remote_im_desktop_ui
   src/ui/LoginDialog.cpp
   src/ui/MainWindow.h
   src/ui/MainWindow.cpp
+  src/agent/DesktopSessionImBridge.h
+  src/agent/DesktopSessionImBridge.cpp
+  src/MaiChatTools/DesktopSessionImBindingTools.h
+  src/MaiChatTools/DesktopSessionImBindingTools.cpp
   src/MaiChatTools/DesktopRemoteSessionTools.h
   src/MaiChatTools/DesktopRemoteSessionTools.cpp
   src/MaiChatTools/DesktopCloudDriveTools.h
@@ -1771,6 +1775,23 @@ target_compile_definitions(add_contact_dialog_test PRIVATE
 
 add_executable(main_window_layout_test tests/MainWindowLayoutTest.cpp)
 target_link_libraries(main_window_layout_test PRIVATE remote_im_desktop_ui remote_im_desktop_app remote_im_core Qt6::Widgets Qt6::Test)
+
+add_executable(desktop_session_im_bridge_test tests/DesktopSessionImBridgeTest.cpp)
+target_compile_definitions(desktop_session_im_bridge_test PRIVATE
+  MAICHAT_SESSION_IM_VIDEO_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../MaiAgent/Graphics/tests/fixtures/tiny-red.mp4")
+target_link_libraries(desktop_session_im_bridge_test PRIVATE
+  remote_im_desktop_ui remote_im_desktop_app remote_im_core maichat_agent Qt6::Widgets Qt6::Test)
+add_test(NAME desktop_session_im_bridge_test COMMAND desktop_session_im_bridge_test)
+
+add_executable(desktop_session_im_binding_ui_test tests/DesktopSessionImBindingUiTest.cpp)
+target_link_libraries(desktop_session_im_binding_ui_test PRIVATE
+  remote_im_desktop_ui remote_im_desktop_app remote_im_core maichat_agent Qt6::Widgets Qt6::Test)
+add_test(NAME desktop_session_im_binding_ui_test COMMAND desktop_session_im_binding_ui_test)
+
+add_executable(desktop_session_im_binding_tools_test tests/DesktopSessionImBindingToolsTest.cpp)
+target_link_libraries(desktop_session_im_binding_tools_test PRIVATE
+  remote_im_desktop_ui remote_im_desktop_app remote_im_core maichat_agent Qt6::Widgets Qt6::Test)
+add_test(NAME desktop_session_im_binding_tools_test COMMAND desktop_session_im_binding_tools_test)
 
 # Live QA probe uses a throwaway account and an isolated app identity. It is not part of ctest or normal builds.
 if(APPLE)

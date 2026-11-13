@@ -8,8 +8,12 @@
 #include <sqlite3.h>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QTimer>
+#include <QEventLoop>
 #include <limits>
 #include <cstdio>
+#include <future>
+#include <chrono>
 
 #include "model/ChatState.h"
 #include "storage/LocalMessageDatabase.h"
@@ -27,6 +31,11 @@ public:
             sqlite3_close_v2(db_);
             db_ = nullptr;
         }
+        // EXPLAIN resolves the production scalar name without executing it.
+        // Actual match behavior is exercised through LocalMessageSearchReader.
+        if (db_) sqlite3_create_function_v2(db_, "maichat_matches", 2, SQLITE_UTF8, nullptr,
+            [](sqlite3_context* context, int, sqlite3_value**) { sqlite3_result_int(context, 1); },
+            nullptr, nullptr, nullptr);
     }
     ~SqlFixture() { if (db_) sqlite3_close_v2(db_); }
     SqlFixture(const SqlFixture&) = delete;
@@ -108,10 +117,284 @@ private slots:
     void adoptionFailureKeepsTemporaryMessages();
     void groupAdoptionFailureKeepsTemporaryMessages();
     void groupStepFailuresRollBackMembers();
-    void commitFailureRollsBackAndKeepsConnectionUsable();
+    void lockedWriterPreservesBusinessStateAndConnectionUsability();
     void failedMigrationPreservesOldSchema();
     void pagesTimestampTiesAndRejectsEmptyBounds();
+    void searchReaderOutlivesWriterAndPreservesMessageMatching();
+    void searchReaderRejectsCrossDatabaseCursorAndBrokenSchema();
+    void searchReaderDeadlineAndCancellationAreExplicit();
+    void searchReadersDoNotBlockMessagePersistence();
+    void searchPlansAndRepresentativeHistoryPerformance_data();
+    void searchPlansAndRepresentativeHistoryPerformance();
 };
+
+void LocalMessageDatabaseTest::searchReadersDoNotBlockMessagePersistence() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("concurrent.sqlite"));
+    LocalMessageDatabase database(path);
+    QVERIFY(database.isOpen());
+    SqlFixture reader(path);
+    QVERIFY(reader.exec(QStringLiteral("BEGIN")));
+    QVERIFY(reader.exec(QStringLiteral("SELECT * FROM messages")));
+    const auto release = qScopeGuard([&] { reader.exec(QStringLiteral("ROLLBACK")); });
+    QElapsedTimer elapsed;
+    elapsed.start();
+    QVERIFY(database.insertMessageIfAbsent(makeTextMessage(
+        QStringLiteral("arriving-during-read"), QStringLiteral("peer"), QStringLiteral("owner"),
+        RemoteIMMessageDirection::Incoming, 1, QStringLiteral("arrived")), QStringLiteral("peer")));
+    qInfo() << "message write with active reader ms:" << elapsed.elapsed();
+    QVERIFY(elapsed.elapsed() < 500);
+}
+
+void LocalMessageDatabaseTest::searchPlansAndRepresentativeHistoryPerformance_data() {
+    QTest::addColumn<int>("recordCount");
+    QTest::newRow("10k") << 10000;
+    QTest::newRow("100k") << 100000;
+}
+
+void LocalMessageDatabaseTest::searchPlansAndRepresentativeHistoryPerformance() {
+    QFETCH(int, recordCount);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("representative.sqlite"));
+    LocalMessageDatabase database(path);
+    QVERIFY(database.isOpen());
+    SqlFixture fixture(path);
+    QVERIFY(fixture.exec(QStringLiteral("BEGIN IMMEDIATE")));
+    QVERIFY(fixture.exec(QStringLiteral(
+        "WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x+1 FROM n WHERE x+1 < ") +
+        QString::number(recordCount) + QStringLiteral(
+        ") "
+        "INSERT INTO messages(id,from_user,to_user,peer,direction,status,text,created_at) "
+        "SELECT printf('bulk-%06d',x),printf('peer-%d',x%100),'owner',printf('peer-%d',x%100),"
+        "x%2,0,CASE WHEN x=42 THEN 'unique needle' WHEN x%3=0 THEN '昨天失败了' "
+        "ELSE 'status update' END,1000+x/2 FROM n")));
+    QVERIFY(fixture.exec(QStringLiteral("COMMIT")));
+    const QString select = QStringLiteral(
+        "SELECT id,peer,from_user,direction,text,created_at FROM messages WHERE ");
+    QSet<QString> peerPlan;
+    QSet<QString> globalPlan;
+    QVERIFY(fixture.columnTexts(QStringLiteral("EXPLAIN QUERY PLAN ") + select + QStringLiteral(
+        "peer='peer-42' AND maichat_matches(text,'unique needle') ORDER BY created_at DESC,id DESC LIMIT 51"),
+        3, peerPlan));
+    QVERIFY(fixture.columnTexts(QStringLiteral("EXPLAIN QUERY PLAN ") + select + QStringLiteral(
+        "maichat_matches(text,'unique needle') ORDER BY created_at DESC,id DESC LIMIT 51"),
+        3, globalPlan));
+    const QString peerPlanText = peerPlan.values().join(QStringLiteral("; "));
+    const QString globalPlanText = globalPlan.values().join(QStringLiteral("; "));
+    qInfo().noquote() << recordCount << "peer plan:" << peerPlanText;
+    qInfo().noquote() << recordCount << "global plan:" << globalPlanText;
+    QVERIFY(peerPlanText.contains(QStringLiteral("idx_messages_peer_page")));
+    QVERIFY(globalPlanText.contains(QStringLiteral("idx_messages_page")));
+    QVERIFY(!peerPlanText.contains(QStringLiteral("TEMP B-TREE")));
+    QVERIFY(!globalPlanText.contains(QStringLiteral("TEMP B-TREE")));
+    const auto reader = database.createSearchReader();
+    QVERIFY(reader);
+    auto timed = [&](const char* label, const LocalMessageSearchRequest& request) {
+        QElapsedTimer elapsed;
+        elapsed.start();
+        const auto result = reader->search(request, {});
+        qInfo() << recordCount << label << "ms:" << elapsed.elapsed() << "returned:" << result.matches.size()
+                << "error:" << result.errorCode;
+        return result;
+    };
+    LocalMessageSearchRequest request;
+    request.query = QStringLiteral("unique needle");
+    request.peerId = QStringLiteral("peer-42");
+    auto result = timed("peer rare", request);
+    QVERIFY(result.errorCode.isEmpty());
+    QCOMPARE(result.matches.size(), 1);
+    request.peerId.clear();
+    result = timed("global rare", request);
+    QVERIFY(result.errorCode.isEmpty());
+    QCOMPARE(result.matches.size(), 1);
+    request.query = QStringLiteral("qxyz");
+    result = timed("global no-hit pinyin", request);
+    QVERIFY(result.errorCode.isEmpty());
+    QVERIFY(result.noMatches);
+    request.query = QStringLiteral("ZTSB");
+    result = timed("global pinyin", request);
+    QVERIFY(result.errorCode.isEmpty());
+    QCOMPARE(result.matches.size(), 50);
+    QVERIFY(result.hasMore);
+    request.peerId = QStringLiteral("peer-7");
+    request.query = QStringLiteral("status");
+    request.limit = 17;
+    QSet<QString> ids;
+    qint64 previousTime = std::numeric_limits<qint64>::max();
+    QString previousId;
+    for (int page = 0; page < 3; ++page) {
+        result = timed("DESC continuation", request);
+        QVERIFY(result.errorCode.isEmpty());
+        QCOMPARE(result.matches.size(), 17);
+        for (const auto& match : result.matches) {
+            QVERIFY(!ids.contains(match.id));
+            QVERIFY(match.createdAtMillis < previousTime ||
+                (match.createdAtMillis == previousTime && match.id < previousId));
+            ids.insert(match.id);
+            previousTime = match.createdAtMillis;
+            previousId = match.id;
+        }
+        QVERIFY(result.hasMore);
+        request.cursor = result.nextCursor;
+    }
+    QCOMPARE(ids.size(), 51);
+    if (recordCount == 100000) {
+        request.peerId.clear();
+        request.cursor.clear();
+        request.query = QStringLiteral("qxyz");
+        QElapsedTimer deadlineElapsed;
+        deadlineElapsed.start();
+        const auto expired = reader->search(request, {}, QDeadlineTimer(1));
+        qInfo() << "100k short deadline ms:" << deadlineElapsed.elapsed() << "error:" << expired.errorCode;
+        QCOMPARE(expired.errorCode, QStringLiteral("query_timeout"));
+        QVERIFY(!expired.noMatches);
+        QVERIFY(expired.matches.isEmpty());
+        QVERIFY(deadlineElapsed.elapsed() < 250);
+        auto canceled = std::make_shared<std::atomic_bool>(false);
+        auto cancelFuture = std::async(std::launch::async, [reader, request, canceled] {
+            return reader->search(request, canceled);
+        });
+        if (cancelFuture.wait_for(std::chrono::milliseconds(1)) == std::future_status::timeout) {
+            QElapsedTimer cancelElapsed;
+            cancelElapsed.start();
+            canceled->store(true);
+            QVERIFY(cancelFuture.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready);
+            const auto stopped = cancelFuture.get();
+            qInfo() << "100k running cancellation ms:" << cancelElapsed.elapsed() << "error:" << stopped.errorCode;
+            QCOMPARE(stopped.errorCode, QStringLiteral("canceled"));
+            QVERIFY(!stopped.noMatches);
+        } else {
+            QVERIFY(cancelFuture.get().errorCode.isEmpty());
+            qInfo() << "100k query completed before 1ms cancellation probe";
+        }
+        int heartbeats = 0;
+        qint64 maximumGap = 0;
+        qint64 previousTick = 0;
+        QElapsedTimer responsiveness;
+        responsiveness.start();
+        QTimer heartbeat;
+        heartbeat.setInterval(1);
+        QObject::connect(&heartbeat, &QTimer::timeout, [&] {
+            const qint64 now = responsiveness.elapsed();
+            maximumGap = qMax(maximumGap, now - previousTick);
+            previousTick = now;
+            ++heartbeats;
+        });
+        heartbeat.start();
+        auto future = std::async(std::launch::async, [reader, request] { return reader->search(request, {}); });
+        QTRY_VERIFY_WITH_TIMEOUT(future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready, 6000);
+        QVERIFY(future.get().errorCode.isEmpty());
+        qInfo() << "100k worker event-loop heartbeat count:" << heartbeats << "max gap ms:" << maximumGap
+                << "wall ms:" << responsiveness.elapsed();
+        QVERIFY(heartbeats > 0);
+        QVERIFY(maximumGap < 250);
+    }
+}
+
+void LocalMessageDatabaseTest::searchReaderOutlivesWriterAndPreservesMessageMatching() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    std::shared_ptr<LocalMessageSearchReader> reader;
+    {
+        LocalMessageDatabase database(directory.filePath(QStringLiteral("search.sqlite")));
+        QVERIFY(database.isOpen());
+        QVERIFY(database.insertMessageIfAbsent(makeTextMessage(
+            QStringLiteral("old"), QStringLiteral("peer"), QStringLiteral("owner"),
+            RemoteIMMessageDirection::Incoming, 1, QStringLiteral("发版了")), QStringLiteral("peer")));
+        QVERIFY(database.insertMessageIfAbsent(makeTextMessage(
+            QStringLiteral("quoted"), QStringLiteral("peer"), QStringLiteral("owner"),
+            RemoteIMMessageDirection::Incoming, 0,
+            QStringLiteral("O'Reilly %_ ") + QChar(0) + QStringLiteral("needle")), QStringLiteral("peer")));
+        for (int index = 0; index < 65; ++index) {
+            QVERIFY(database.insertMessageIfAbsent(makeTextMessage(
+                QStringLiteral("recent-%1").arg(index), QStringLiteral("peer"), QStringLiteral("owner"),
+                RemoteIMMessageDirection::Incoming, index + 2, QStringLiteral("ordinary")), QStringLiteral("peer")));
+        }
+        reader = database.createSearchReader();
+        QVERIFY(reader);
+    }
+    // The writer is gone. The worker-owned read handle still reads the same
+    // private database and retains the existing pinyin/case matching contract.
+    LocalMessageSearchRequest request;
+    request.query = QStringLiteral("FBL");
+    const auto result = reader->search(request, std::make_shared<std::atomic_bool>(false));
+    QVERIFY(result.errorCode.isEmpty());
+    QCOMPARE(result.matches.size(), 1);
+    QCOMPARE(result.matches.first().id, QStringLiteral("old"));
+    QVERIFY(result.localAvailable);
+    QVERIFY(!result.noMatches);
+    request.query = QStringLiteral("O'Reilly %_ ") + QChar(0) + QStringLiteral("needle");
+    const auto literal = reader->search(request, {});
+    QVERIFY(literal.errorCode.isEmpty());
+    QCOMPARE(literal.matches.size(), 1);
+    QCOMPARE(literal.matches.first().id, QStringLiteral("quoted"));
+    QCOMPARE(literal.matches.first().text, request.query);
+}
+
+void LocalMessageDatabaseTest::searchReaderRejectsCrossDatabaseCursorAndBrokenSchema() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("first.sqlite"));
+    LocalMessageDatabase first(path);
+    LocalMessageDatabase second(directory.filePath(QStringLiteral("second.sqlite")));
+    for (int index = 0; index < 3; ++index) {
+        const auto message = makeTextMessage(QString::number(index), QStringLiteral("peer"),
+            QStringLiteral("owner"), RemoteIMMessageDirection::Incoming, index, QStringLiteral("needle"));
+        QVERIFY(first.insertMessageIfAbsent(message, QStringLiteral("peer")));
+        QVERIFY(second.insertMessageIfAbsent(message, QStringLiteral("peer")));
+    }
+    LocalMessageSearchRequest request;
+    request.query = QStringLiteral("needle");
+    request.limit = 1;
+    auto canceled = std::make_shared<std::atomic_bool>(false);
+    const auto page = first.createSearchReader()->search(request, canceled);
+    QVERIFY(page.errorCode.isEmpty());
+    QVERIFY(page.hasMore);
+    request.cursor = page.nextCursor;
+    const auto crossed = second.createSearchReader()->search(request, canceled);
+    QCOMPARE(crossed.errorCode, QStringLiteral("invalid_cursor"));
+    QVERIFY(crossed.matches.isEmpty());
+    auto reader = first.createSearchReader();
+    QVERIFY(reader);
+    SqlFixture fixture(path);
+    QVERIFY(fixture.isOpen());
+    QVERIFY(fixture.exec(QStringLiteral("DROP TABLE messages")));
+    request.cursor.clear();
+    const auto broken = reader->search(request, canceled);
+    QCOMPARE(broken.errorCode, QStringLiteral("local_storage_unavailable"));
+    QVERIFY(!broken.noMatches);
+    QVERIFY(broken.matches.isEmpty());
+}
+
+void LocalMessageDatabaseTest::searchReaderDeadlineAndCancellationAreExplicit() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("deadline.sqlite"));
+    LocalMessageDatabase database(path);
+    QVERIFY(database.isOpen());
+    auto reader = database.createSearchReader();
+    QVERIFY(reader);
+    LocalMessageSearchRequest request;
+    request.query = QStringLiteral("needle");
+    auto canceled = std::make_shared<std::atomic_bool>(true);
+    const auto result = reader->search(request, canceled);
+    QCOMPARE(result.errorCode, QStringLiteral("canceled"));
+    QVERIFY(!result.noMatches);
+    const auto expired = reader->search(request, {}, QDeadlineTimer(0));
+    QCOMPARE(expired.errorCode, QStringLiteral("query_timeout"));
+    QVERIFY(!expired.noMatches);
+    SqlFixture writer(path);
+    QVERIFY(writer.exec(QStringLiteral("BEGIN EXCLUSIVE")));
+    const auto unlock = qScopeGuard([&] { writer.exec(QStringLiteral("ROLLBACK")); });
+    QElapsedTimer elapsed;
+    elapsed.start();
+    const auto concurrent = reader->search(request, {});
+    QVERIFY(concurrent.errorCode.isEmpty());
+    QVERIFY(concurrent.noMatches);
+    QVERIFY(elapsed.elapsed() < 500);
+}
 
 void LocalMessageDatabaseTest::groupHistoryPagesSeparatelyAndSurvivesMembershipRemoval() {
     QTemporaryDir dir;
@@ -885,18 +1168,18 @@ void LocalMessageDatabaseTest::groupStepFailuresRollBackMembers() {
     QCOMPARE(groupOf(db, "peer"), QStringLiteral("new"));
 }
 
-void LocalMessageDatabaseTest::commitFailureRollsBackAndKeepsConnectionUsable() {
+void LocalMessageDatabaseTest::lockedWriterPreservesBusinessStateAndConnectionUsability() {
     QTemporaryDir dir;
     const QString path = dir.filePath("messages.db");
     LocalMessageDatabase db(path);
     db.upsertContact({"peer", "Peer"});
     QVERIFY(db.createContactGroup("old"));
     db.setContactGroup("peer", "old");
-    // A child process holds the SHARED lock: the Qt baseline driver and our
-    // vendored sqlite library must contend through the OS, not two SQLite copies
-    // whose per-process POSIX-lock bookkeeping cannot coordinate with each other.
+    // WAL readers no longer block commits. A child writer instead holds the
+    // reservation: failed BEGIN must preserve both business tables and leave
+    // the connection usable, without falling through to statement autocommit.
     QProcess reader;
-    reader.start(QCoreApplication::applicationFilePath(), {QStringLiteral("--hold-storage-read-lock"), path});
+    reader.start(QCoreApplication::applicationFilePath(), {QStringLiteral("--hold-storage-write-lock"), path});
     const auto releaseReader = qScopeGuard([&] {
         if (reader.state() != QProcess::NotRunning) {
             reader.write("\n");
@@ -920,7 +1203,7 @@ void LocalMessageDatabaseTest::commitFailureRollsBackAndKeepsConnectionUsable() 
     reader.closeWriteChannel();
     QVERIFY(reader.waitForFinished(5000));
     QCOMPARE(reader.exitCode(), 0);
-    QVERIFY(db.createContactGroup("after-failed-commit"));
+    QVERIFY(db.createContactGroup("after-failed-write"));
     QVERIFY(db.renameContactGroup("old", "new"));
     QCOMPARE(groupOf(db, "peer"), QStringLiteral("new"));
 }
@@ -983,9 +1266,9 @@ void LocalMessageDatabaseTest::pagesTimestampTiesAndRejectsEmptyBounds() {
 
 int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
-    if (argc == 3 && QByteArray(argv[1]) == "--hold-storage-read-lock") {
+    if (argc == 3 && QByteArray(argv[1]) == "--hold-storage-write-lock") {
         SqlFixture reader(application.arguments().at(2));
-        if (!reader.exec("BEGIN") || !reader.exec("SELECT * FROM contact_groups")) return 2;
+        if (!reader.exec("BEGIN IMMEDIATE")) return 2;
         std::puts("locked");
         std::fflush(stdout);
         std::getc(stdin);

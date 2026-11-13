@@ -151,7 +151,37 @@ public:
     // 协议与控制帧即使复用腾讯文本接口，来源仍是机器。
     // 普通聊天界面继续调用 sendText()，不能把控制帧当成人类消息。
     virtual void sendMachineText(const QString& peerId, const QString& text, RemoteIMSendCompletion completion) {
-        sendText(peerId, text, std::move(completion));
+        Q_UNUSED(peerId);
+        Q_UNUSED(text);
+        if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持机器来源消息"), {});
+    }
+    virtual void sendMachineTextWithQuote(const QString& peerId, const QString& text,
+                                          const RemoteIMQuote& quote, bool hasQuote,
+                                          RemoteIMSendCompletion completion) {
+        Q_UNUSED(quote);
+        Q_UNUSED(hasQuote);
+        sendMachineText(peerId, text, std::move(completion));
+    }
+    // Machine replies must never fall back to ordinary Human media methods.
+    // An unsupported transport reports failure instead of creating a relay loop.
+    virtual void sendMachineImageWithText(const QString& peerId, const QString& path, const QString& text,
+                                          bool captionAbove, const RemoteIMQuote& quote, bool hasQuote,
+                                          RemoteIMSendCompletion completion) {
+        Q_UNUSED(peerId); Q_UNUSED(path); Q_UNUSED(text); Q_UNUSED(captionAbove); Q_UNUSED(quote); Q_UNUSED(hasQuote);
+        if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持机器来源图片消息"), {});
+    }
+    virtual void sendMachineFileWithText(const QString& peerId, const QString& path, const QString& fileName,
+                                         const QString& text, bool captionAbove, const RemoteIMQuote& quote,
+                                         bool hasQuote, RemoteIMSendCompletion completion) {
+        Q_UNUSED(peerId); Q_UNUSED(path); Q_UNUSED(fileName); Q_UNUSED(text);
+        Q_UNUSED(captionAbove); Q_UNUSED(quote); Q_UNUSED(hasQuote);
+        if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持机器来源文件消息"), {});
+    }
+    virtual void sendMachineVideoWithText(const QString& peerId, const RemoteIMVideoPayload& video,
+                                          const QString& text, bool captionAbove, const RemoteIMQuote& quote,
+                                          bool hasQuote, RemoteIMSendCompletion completion) {
+        Q_UNUSED(peerId); Q_UNUSED(video); Q_UNUSED(text); Q_UNUSED(captionAbove); Q_UNUSED(quote); Q_UNUSED(hasQuote);
+        if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持机器来源视频消息"), {});
     }
     virtual void sendImage(const QString& peerId, const QString& localPath, RemoteIMSendCompletion completion) = 0;
     virtual void sendVoice(const QString& peerId, const QString& localPath, int durationSeconds,

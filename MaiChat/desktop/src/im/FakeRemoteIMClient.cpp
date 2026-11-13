@@ -119,6 +119,64 @@ QString FakeRemoteIMClient::lastFriendRequestId() const {
 void FakeRemoteIMClient::sendText(const QString& peerId, const QString& text, RemoteIMSendCompletion completion) {
     lastTextPeerId_ = peerId.trimmed();
     lastText_ = text.trimmed();
+    recordMessageMetadata(RemoteIMMessageOrigin::Human, {}, false, {}, false);
+    completeSend(std::move(completion));
+}
+
+void FakeRemoteIMClient::recordMessageMetadata(RemoteIMMessageOrigin origin, const QString& caption, bool captionAbove,
+                                               const RemoteIMQuote& quote, bool hasQuote) {
+    lastOrigin_ = origin;
+    lastCaption_ = caption.trimmed();
+    lastCaptionAbove_ = captionAbove;
+    lastHasQuote_ = hasQuote && !quote.digest.isEmpty();
+    lastQuote_ = lastHasQuote_ ? quote : RemoteIMQuote{};
+}
+
+void FakeRemoteIMClient::sendMachineText(const QString& peerId, const QString& text,
+                                        RemoteIMSendCompletion completion) {
+    sendMachineTextWithQuote(peerId, text, {}, false, std::move(completion));
+}
+
+void FakeRemoteIMClient::sendMachineTextWithQuote(const QString& peerId, const QString& text,
+                                                 const RemoteIMQuote& quote, bool hasQuote,
+                                                 RemoteIMSendCompletion completion) {
+    lastTextPeerId_ = peerId.trimmed();
+    lastText_ = text.trimmed();
+    recordMessageMetadata(RemoteIMMessageOrigin::Machine, {}, false, quote, hasQuote);
+    completeSend(std::move(completion));
+}
+
+void FakeRemoteIMClient::sendMachineImageWithText(const QString& peerId, const QString& path, const QString& text,
+                                                 bool captionAbove, const RemoteIMQuote& quote, bool hasQuote,
+                                                 RemoteIMSendCompletion completion) {
+    lastImagePeerId_ = peerId.trimmed();
+    lastImagePath_ = path.trimmed();
+    lastTextPeerId_ = peerId.trimmed();
+    lastText_ = text.trimmed();
+    recordMessageMetadata(RemoteIMMessageOrigin::Machine, text, captionAbove, quote, hasQuote);
+    completeSend(std::move(completion));
+}
+
+void FakeRemoteIMClient::sendMachineFileWithText(const QString& peerId, const QString& path, const QString& fileName,
+                                                const QString& text, bool captionAbove, const RemoteIMQuote& quote,
+                                                bool hasQuote, RemoteIMSendCompletion completion) {
+    lastFilePeerId_ = peerId.trimmed();
+    lastFilePath_ = path.trimmed();
+    lastFileName_ = fileName.trimmed();
+    lastTextPeerId_ = peerId.trimmed();
+    lastText_ = text.trimmed();
+    recordMessageMetadata(RemoteIMMessageOrigin::Machine, text, captionAbove, quote, hasQuote);
+    completeSend(std::move(completion));
+}
+
+void FakeRemoteIMClient::sendMachineVideoWithText(const QString& peerId, const RemoteIMVideoPayload& video,
+                                                 const QString& text, bool captionAbove, const RemoteIMQuote& quote,
+                                                 bool hasQuote, RemoteIMSendCompletion completion) {
+    lastVideoPeerId_ = peerId.trimmed();
+    lastVideo_ = video;
+    lastTextPeerId_ = peerId.trimmed();
+    lastText_ = text.trimmed();
+    recordMessageMetadata(RemoteIMMessageOrigin::Machine, text, captionAbove, quote, hasQuote);
     completeSend(std::move(completion));
 }
 
@@ -130,16 +188,19 @@ void FakeRemoteIMClient::sendApprovalDecision(const QString& peerId,
     lastApprovalToken_ = token.trimmed();
     lastApprovalAction_ = action;
     lastText_ = QStringLiteral("审批操作：%1").arg(remoteIMApprovalActionTitle(action));
+    recordMessageMetadata(RemoteIMMessageOrigin::Human, {}, false, {}, false);
     completeSend(std::move(completion));
 }
 
 void FakeRemoteIMClient::sendImage(const QString& peerId, const QString& localPath, RemoteIMSendCompletion completion) {
     lastImagePeerId_ = peerId.trimmed();
     lastImagePath_ = localPath.trimmed();
+    recordMessageMetadata(RemoteIMMessageOrigin::Human, {}, false, {}, false);
     completeSend(std::move(completion));
 }
 
 void FakeRemoteIMClient::sendVoice(const QString&, const QString&, int, RemoteIMCompletion completion) {
+    recordMessageMetadata(RemoteIMMessageOrigin::Human, {}, false, {}, false);
     complete(std::move(completion));
 }
 
@@ -148,6 +209,7 @@ void FakeRemoteIMClient::sendFile(const QString& peerId, const QString& localPat
     lastFilePeerId_ = peerId.trimmed();
     lastFilePath_ = localPath.trimmed();
     lastFileName_ = fileName.trimmed();
+    recordMessageMetadata(RemoteIMMessageOrigin::Human, {}, false, {}, false);
     completeSend(std::move(completion));
 }
 
@@ -155,6 +217,7 @@ void FakeRemoteIMClient::sendVideo(const QString& peerId, const RemoteIMVideoPay
                                    RemoteIMSendCompletion completion) {
     lastVideoPeerId_ = peerId.trimmed();
     lastVideo_ = video;
+    recordMessageMetadata(RemoteIMMessageOrigin::Human, {}, false, {}, false);
     completeSend(std::move(completion));
 }
 

@@ -7,6 +7,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QCoreApplication>
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
@@ -22,7 +23,11 @@
 #include <QUuid>
 
 #include <algorithm>
+#include <cmath>
+#include <condition_variable>
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -151,12 +156,93 @@ MaiToolResult onApplicationThread(const QPointer<RemoteIMApplication> &app,
   return result;
 }
 
+LocalMessageSearchResult queryFailure(const QString &error, int limit) {
+  LocalMessageSearchResult result;
+  result.errorCode = error;
+  result.limit = limit;
+  return result;
+}
+
+// Query-only handoff. Native tool cancellation belongs to the synchronous
+// caller; queued callbacks/SQL retain only this owned state and absolute budget.
+// QCoreApplication outlives the host's tool registry and supplies a stable UI
+// receiver, so a queued callback need not dereference a deleted host off-thread.
+LocalMessageSearchResult awaitMessageQuery(
+    const QPointer<RemoteIMApplication> &app, const LocalMessageSearchRequest &request,
+    const std::shared_ptr<const std::atomic<quint64>> &generation, quint64 expectedGeneration,
+    QDeadlineTimer deadline, const MaiToolContext &context) {
+  struct PendingQuery {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::atomic_bool abandoned{false};
+    std::shared_ptr<std::atomic_bool> canceled = std::make_shared<std::atomic_bool>(false);
+    bool finished = false;
+    LocalMessageSearchResult result;
+  };
+  auto *dispatcher = QCoreApplication::instance();
+  if (!dispatcher) return queryFailure(QStringLiteral("host_unavailable"), request.limit);
+  if (context.isCanceled()) return queryFailure(QStringLiteral("canceled"), request.limit);
+  auto pending = std::make_shared<PendingQuery>();
+  auto finish = [pending](const LocalMessageSearchResult &result) {
+    std::lock_guard<std::mutex> lock(pending->mutex);
+    if (pending->abandoned.load()) return;
+    pending->result = result;
+    pending->finished = true;
+    pending->changed.notify_all();
+  };
+  auto begin = [app, request, generation, expectedGeneration, deadline, pending, finish] {
+    if (pending->abandoned.load()) return;
+    if (pending->canceled->load() || deadline.hasExpired() || generation->load() != expectedGeneration) {
+      finish(queryFailure(pending->canceled->load() ? QStringLiteral("canceled") :
+          generation->load() != expectedGeneration ? QStringLiteral("identity_changed") :
+                                                    QStringLiteral("query_timeout"), request.limit));
+      return;
+    }
+    if (!app || app->thread() != QThread::currentThread()) {
+      finish(queryFailure(QStringLiteral("host_unavailable"), request.limit));
+      return;
+    }
+    app->queryLocalMessages(request, pending->canceled, finish, deadline);
+  };
+  const bool applicationThread = QThread::currentThread() == dispatcher->thread();
+  if (applicationThread) begin();
+  else if (!QMetaObject::invokeMethod(dispatcher, begin, Qt::QueuedConnection))
+    return queryFailure(QStringLiteral("host_unavailable"), request.limit);
+
+  for (;;) {
+    const QString stopped = context.isCanceled() ? QStringLiteral("canceled") :
+        generation->load() != expectedGeneration ? QStringLiteral("identity_changed") :
+        deadline.hasExpired() ? QStringLiteral("query_timeout") : QString();
+    if (!stopped.isEmpty()) {
+      pending->abandoned.store(true);
+      pending->canceled->store(true);
+      return queryFailure(stopped, request.limit);
+    }
+    {
+      std::unique_lock<std::mutex> lock(pending->mutex);
+      if (pending->finished) return pending->result;
+      if (!applicationThread) {
+        pending->changed.wait_for(lock, std::chrono::milliseconds(10));
+        continue;
+      }
+    }
+    // Direct UI callers still process ordinary UI events; model workers use a
+    // cancelable condition wait independent of whether this event queue runs.
+    QEventLoop frame;
+    QTimer tick;
+    tick.setSingleShot(true);
+    QObject::connect(&tick, &QTimer::timeout, &frame, &QEventLoop::quit);
+    tick.start(10);
+    frame.exec();
+  }
+}
+
 class MaiChatHostTool final : public MaiTool {
 public:
   MaiChatHostTool(HostToolKind kind, const char *name, const char *description,
                   const char *schema, RemoteIMApplication &app, bool approval)
       : mKind(kind), mName(name), mDescription(description), mSchema(schema),
-        mApp(&app), mApproval(approval) {}
+        mApp(&app), mQueryGeneration(app.messageQueryGeneration()), mApproval(approval) {}
 
   std::string name() const override { return mName; }
   std::string description() const override { return mDescription; }
@@ -179,6 +265,8 @@ public:
       return MaiToolResult::failure(MaiErrorCode::Canceled, "group operation was canceled");
     if (mKind == HostToolKind::SendMedia)
       return sendMedia(arguments, context);
+    if (mKind == HostToolKind::SearchMessages || mKind == HostToolKind::GetMessages)
+      return queryMessages(arguments, context, mKind == HostToolKind::SearchMessages);
     return onApplicationThread(mApp, [&](RemoteIMApplication &app) {
       switch (mKind) {
       case HostToolKind::ListContacts:
@@ -190,9 +278,9 @@ public:
       case HostToolKind::ListConversations:
         return listConversations(app, arguments);
       case HostToolKind::GetMessages:
-        return getMessages(app, arguments);
+        break;
       case HostToolKind::SearchMessages:
-        return searchMessages(app, arguments);
+        break;
       case HostToolKind::GetUnreadSummary:
         return unreadSummary(app);
       case HostToolKind::SendText:
@@ -606,48 +694,104 @@ private:
                        {QStringLiteral("count"), result.size()}});
   }
 
-  static MaiToolResult getMessages(RemoteIMApplication &app,
-                                   const QJsonObject &arguments) {
-    const QString peerId =
-        arguments.value(QStringLiteral("peer_id")).toString().trimmed();
-    if (peerId.isEmpty())
-      return invalidInput(QStringLiteral("peer_id is required"));
-    const QList<RemoteIMMessage> all = app.chatState().messagesWith(peerId);
-    const int limit = boundedLimit(arguments);
-    const qsizetype begin = std::max<qsizetype>(0, all.size() - limit);
-    QJsonArray messages;
-    for (qsizetype i = begin; i < all.size(); ++i)
-      messages.append(messageJson(all.at(i), peerId));
-    return jsonResult({{QStringLiteral("peer_id"), peerId},
-                       {QStringLiteral("messages"), messages},
-                       {QStringLiteral("count"), messages.size()}});
-  }
-
-  static MaiToolResult searchMessages(RemoteIMApplication &app,
-                                      const QJsonObject &arguments) {
-    const QString query =
-        arguments.value(QStringLiteral("query")).toString().trimmed();
-    const QString onlyPeer =
-        arguments.value(QStringLiteral("peer_id")).toString().trimmed();
-    if (query.isEmpty())
-      return invalidInput(QStringLiteral("query is required"));
-    const int limit = boundedLimit(arguments);
-    QJsonArray matches;
-    for (const RemoteIMContact &contact : app.chatState().contacts()) {
-      if (!onlyPeer.isEmpty() && onlyPeer != contact.userId)
-        continue;
-      app.chatState().forEachMessageWith(
-          contact.userId, [&](const RemoteIMMessage &message) {
-            if (matches.size() < limit &&
-                MessageSearch::matches(message.text, query))
-              matches.append(messageJson(message, contact.userId));
-          });
-      if (matches.size() >= limit)
-        break;
+  MaiToolResult queryMessages(const QJsonObject &arguments,
+                              const MaiToolContext &context, bool textSearch) const {
+    const QDeadlineTimer deadline(5000);
+    const quint64 generation = mQueryGeneration->load();
+    if (context.isCanceled())
+      return MaiToolResult::failure(MaiErrorCode::Canceled, "message query was canceled");
+    static const QSet<QString> keys{QStringLiteral("query"), QStringLiteral("peer_id"),
+        QStringLiteral("kind"), QStringLiteral("direction"), QStringLiteral("since_ms"),
+        QStringLiteral("until_ms"), QStringLiteral("cursor"), QStringLiteral("limit")};
+    for (auto it = arguments.begin(); it != arguments.end(); ++it) {
+      if (!keys.contains(it.key()) || (!textSearch && it.key() == QStringLiteral("query")))
+        return invalidInput(QStringLiteral("unsupported message query argument: ") + it.key());
+      if (it.key() != QStringLiteral("limit") && it.key() != QStringLiteral("since_ms") &&
+          it.key() != QStringLiteral("until_ms") && !it.value().isString())
+        return invalidInput(it.key() + QStringLiteral(" must be a string"));
     }
-    return jsonResult({{QStringLiteral("query"), query},
-                       {QStringLiteral("matches"), matches},
-                       {QStringLiteral("count"), matches.size()}});
+    LocalMessageSearchRequest request;
+    request.query = arguments.value(QStringLiteral("query")).toString().trimmed();
+    request.peerId = arguments.value(QStringLiteral("peer_id")).toString().trimmed();
+    request.kind = arguments.value(QStringLiteral("kind")).toString();
+    request.direction = arguments.value(QStringLiteral("direction")).toString();
+    request.cursor = arguments.value(QStringLiteral("cursor")).toString();
+    if (textSearch && request.query.isEmpty()) return invalidInput(QStringLiteral("query is required"));
+    if (!textSearch && request.peerId.isEmpty()) return invalidInput(QStringLiteral("peer_id is required"));
+    if (arguments.contains(QStringLiteral("limit"))) {
+      const auto value = arguments.value(QStringLiteral("limit"));
+      const double limit = value.toDouble(-1);
+      if (!value.isDouble() || !std::isfinite(limit) || std::floor(limit) != limit || limit < 1 || limit > 200)
+        return invalidInput(QStringLiteral("limit must be an integer between 1 and 200"));
+      request.limit = static_cast<int>(limit);
+    }
+    auto timestamp = [&](const QString &key, std::optional<qint64> &target) {
+      if (!arguments.contains(key)) return true;
+      const auto value = arguments.value(key);
+      if (value.isString()) {
+        bool ok = false;
+        const qint64 millis = value.toString().toLongLong(&ok);
+        if (!ok || millis < 0) return false;
+        target = millis;
+        return true;
+      }
+      // JSON doubles are exact integers only through 2^53-1. Larger epochs
+      // must use the documented decimal string representation.
+      const double millis = value.toDouble(-1);
+      if (!value.isDouble() || !std::isfinite(millis) || millis < 0 ||
+          millis > 9007199254740991.0 || std::floor(millis) != millis) return false;
+      target = static_cast<qint64>(millis);
+      return true;
+    };
+    if (!timestamp(QStringLiteral("since_ms"), request.sinceMillis) ||
+        !timestamp(QStringLiteral("until_ms"), request.untilMillis))
+      return invalidInput(QStringLiteral("time bounds must be nonnegative integer milliseconds or decimal strings"));
+    // The same deadline starts before UI handoff and continues through the
+    // ordinary API, dedicated pool and SQL. No queued callback owns context.
+    const auto result = awaitMessageQuery(mApp, request, mQueryGeneration, generation, deadline, context);
+    if (context.isCanceled())
+      return MaiToolResult::failure(MaiErrorCode::Canceled, "message query was canceled");
+    if (!result.errorCode.isEmpty()) {
+      const MaiErrorCode code = result.errorCode == QStringLiteral("canceled") ||
+          result.errorCode == QStringLiteral("identity_changed") ? MaiErrorCode::Canceled :
+          result.errorCode.startsWith(QStringLiteral("invalid_")) ? MaiErrorCode::InvalidInput :
+          result.errorCode == QStringLiteral("account_unavailable") ? MaiErrorCode::NotConfigured :
+          result.errorCode == QStringLiteral("host_unavailable") ? MaiErrorCode::NotConfigured :
+          result.errorCode == QStringLiteral("query_busy") || result.errorCode == QStringLiteral("query_timeout")
+              ? MaiErrorCode::Busy :
+                                                                    MaiErrorCode::Internal;
+      return MaiToolResult::failure(code, toStdString(result.errorCode.toUtf8()));
+    }
+    QJsonArray matches;
+    for (const auto &match : result.matches) {
+      matches.append(QJsonObject{{QStringLiteral("id"), match.id},
+          {QStringLiteral("peer_id"), match.peerId}, {QStringLiteral("sender_id"), match.senderId},
+          {QStringLiteral("text"), match.text}, {QStringLiteral("kind"), match.kind},
+          {QStringLiteral("direction"), match.direction},
+          {QStringLiteral("created_at_ms"), QString::number(match.createdAtMillis)}});
+    }
+    QJsonObject output{{QStringLiteral("count"), matches.size()},
+        {QStringLiteral("coverage"), result.coverage},
+        {QStringLiteral("local_available"), result.localAvailable},
+        {QStringLiteral("cloud_history_complete"), false},
+        {QStringLiteral("no_matches"), result.noMatches}, {QStringLiteral("limit"), result.limit},
+        {QStringLiteral("has_more"), result.hasMore}, {QStringLiteral("next_cursor"), result.nextCursor},
+        {QStringLiteral("snapshot"), false},
+        {QStringLiteral("order"), QStringLiteral("created_at_ms_desc_id_desc")}};
+    if (textSearch) {
+      output.insert(QStringLiteral("query"), request.query);
+      output.insert(QStringLiteral("matches"), matches);
+    } else {
+      output.insert(QStringLiteral("peer_id"), request.peerId);
+      output.insert(QStringLiteral("messages"), matches);
+    }
+    if (context.isCanceled())
+      return MaiToolResult::failure(MaiErrorCode::Canceled, "message query was canceled");
+    if (mQueryGeneration->load() != generation)
+      return MaiToolResult::failure(MaiErrorCode::Canceled, "identity_changed");
+    if (deadline.hasExpired())
+      return MaiToolResult::failure(MaiErrorCode::Busy, "query_timeout");
+    return jsonResult(output);
   }
 
   static MaiToolResult unreadSummary(RemoteIMApplication &app) {
@@ -757,6 +901,7 @@ private:
   std::string mDescription;
   std::string mSchema;
   QPointer<RemoteIMApplication> mApp;
+  std::shared_ptr<const std::atomic<quint64>> mQueryGeneration;
   bool mApproval = false;
 };
 
@@ -886,15 +1031,29 @@ void registerMaiChatHostTools(MaiToolRegistry &registry,
       app);
   addTool(
       registry, HostToolKind::GetMessages, "maichat_get_messages",
-      "Read recent messages in a MaiChat conversation with a specific contact.",
+      "Read locally persisted direct messages in one MaiChat conversation, newest time and ID first, "
+      "including records outside the UI page. Inclusive time bounds; use next_cursor with unchanged filters. "
+      "Each page reflects the current local store; local coverage does not establish complete cloud history.",
       R"({"type":"object","properties":{"peer_id":{"type":"string"},"limit":{"type":"integer","minimum":1,)"
-          R"("maximum":200}},"required":["peer_id"]})",
+          R"("maximum":200},"kind":{"type":"string","enum":["text","image","video","voice","file"]},)"
+          R"("direction":{"type":"string","enum":["incoming","outgoing"]},)"
+          R"("since_ms":{"oneOf":[{"type":"integer","minimum":0},{"type":"string"}]},)"
+          R"("until_ms":{"oneOf":[{"type":"integer","minimum":0},{"type":"string"}]},)"
+          R"("cursor":{"type":"string"}},"required":["peer_id"],"additionalProperties":false})",
       app);
   addTool(
       registry, HostToolKind::SearchMessages, "maichat_search_messages",
-      "Search MaiChat message text across all contacts or within one contact.",
+      "Search locally persisted direct-message text across all peers or one peer, including history outside the UI page. "
+      "Case-insensitive text/token/fuzzy matching; inclusive time bounds; newest time and ID first. "
+      "Use next_cursor with unchanged filters to continue; each page reflects the current local store. "
+      "Local coverage does not establish complete cloud history.",
       R"({"type":"object","properties":{"query":{"type":"string"},"peer_id":{"type":"string"},)"
-          R"("limit":{"type":"integer","minimum":1,"maximum":200}},"required":["query"]})",
+          R"("kind":{"type":"string","enum":["text","image","video","voice","file"]},)"
+          R"("direction":{"type":"string","enum":["incoming","outgoing"]},)"
+          R"("since_ms":{"oneOf":[{"type":"integer","minimum":0},{"type":"string"}]},)"
+          R"("until_ms":{"oneOf":[{"type":"integer","minimum":0},{"type":"string"}]},)"
+          R"("cursor":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":200}},)"
+          R"("required":["query"],"additionalProperties":false})",
       app);
   addTool(registry, HostToolKind::GetUnreadSummary,
           "maichat_get_unread_summary",
