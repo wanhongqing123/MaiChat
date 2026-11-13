@@ -8,6 +8,7 @@ import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
+import android.os.CancellationSignal;
 import android.util.Log;
 
 import java.util.ArrayList;
@@ -21,10 +22,32 @@ import java.io.IOException;
 
 public final class AndroidChatHistoryStore extends SQLiteOpenHelper {
     private static final String DATABASE_NAME = "maichat-history.db";
-    private static final int DATABASE_VERSION = 8;
+    private static final int DATABASE_VERSION = 9;
     private static final String TAG = "MaiChat.im";
+    // 筛选和结果必须采用同一份存储元数据语义，旧路径能否恢复不应改变返回的 kind。
+    private static final String HISTORY_KIND_SQL = "CASE WHEN m.image_path <> '' THEN 'image'"
+        + " WHEN m.video_path <> '' THEN 'video' WHEN m.voice_path <> '' THEN 'voice'"
+        + " WHEN m.file_path <> '' THEN 'file' ELSE 'text' END";
 
     private final RemoteIMMediaPaths mediaPaths;
+    private final java.io.File databaseFile;
+    // 游标只属于当前打开的数据库实例；有界表避免把查询文字或账号信息编码到工具游标中。
+    private final java.util.LinkedHashMap<String, HistoryCursor> historyCursors = new java.util.LinkedHashMap<>();
+    private SQLiteDatabase historyDatabase;
+    private Object historyInstance;
+
+    private static final class HistoryCursor {
+        final String owner, loginScope, id;
+        final long createdAt;
+        final RemoteIMMessageHistory.Query filters;
+        final Object databaseInstance;
+        HistoryCursor(String owner, String loginScope, RemoteIMMessageHistory.Query filters,
+                      RemoteIMMessageHistory.Row last, Object databaseInstance) {
+            this.owner = owner; this.loginScope = loginScope; this.filters = filters;
+            this.id = last.id; this.createdAt = last.createdAtMs;
+            this.databaseInstance = databaseInstance;
+        }
+    }
 
     public static final class Page {
         private final List<RemoteIMMessage> messages;
@@ -52,6 +75,106 @@ public final class AndroidChatHistoryStore extends SQLiteOpenHelper {
         super(context.getApplicationContext(), databaseName, null, DATABASE_VERSION);
         // 媒体路径入库存相对形式，读出来再按当前根还原：数据目录换根时历史不会整片失效。
         this.mediaPaths = RemoteIMMediaPaths.forApp(context);
+        this.databaseFile = context.getDatabasePath(databaseName);
+        // 只读搜索使用独立连接，WAL 防止长扫描的读锁挡住主线程接收消息时的落库。
+        setWriteAheadLoggingEnabled(true);
+    }
+
+    @Override public void onOpen(SQLiteDatabase database) {
+        super.onOpen(database);
+        synchronized (historyCursors) {
+            historyCursors.clear(); historyDatabase = database; historyInstance = new Object();
+        }
+    }
+
+    @Override public synchronized void close() {
+        synchronized (historyCursors) {
+            historyCursors.clear(); historyDatabase = null; historyInstance = null;
+        }
+        super.close();
+    }
+
+    boolean isMessageHistoryCurrent(RemoteIMMessageHistory.Page page) {
+        synchronized (historyCursors) {
+            return page != null && historyInstance != null && page.databaseInstance == historyInstance;
+        }
+    }
+
+    /** 所有筛选和稳定分页均在 SQL 内完成，不能用 LIMIT 后的页面缓存筛选代替。 */
+    public RemoteIMMessageHistory.Page queryMessages(String ownerId, String loginScope,
+            RemoteIMMessageHistory.Query query, CancellationSignal cancellation) {
+        String owner = clean(ownerId);
+        if (owner.isEmpty() || clean(loginScope).isEmpty())
+            throw new IllegalArgumentException("Active history owner is required");
+        cancellation.throwIfCanceled();
+        // 查询不能通过 SQLiteOpenHelper 自动建空库，把数据库丢失误报为没有消息。
+        if (!databaseFile.isFile()) throw new IllegalStateException("Local history database is unavailable");
+        SQLiteDatabase database = getReadableDatabase();
+        Object databaseInstance;
+        synchronized (historyCursors) {
+            // helper 在拿到 handle 后可被另一调用关闭/重开，必须同时绑定 handle 和 epoch。
+            if (database != historyDatabase || historyInstance == null)
+                throw new IllegalStateException("Local history database changed");
+            databaseInstance = historyInstance;
+        }
+        HistoryCursor before = null;
+        if (!query.cursor.isEmpty()) {
+            synchronized (historyCursors) { before = historyCursors.get(query.cursor); }
+            if (before == null || !before.owner.equals(owner) || !before.loginScope.equals(loginScope)
+                    || before.databaseInstance != databaseInstance || !before.filters.sameFilters(query))
+                throw new IllegalArgumentException("History cursor is invalid or expired");
+        }
+        List<String> args = new ArrayList<>();
+        args.add(owner);
+        StringBuilder where = new StringBuilder("m.owner_id = ? AND m.peer_id <> ''");
+        if (!query.peerId.isEmpty()) { where.append(" AND m.peer_id = ?"); args.add(query.peerId); }
+        if (query.query != null) {
+            // 保留 instr 的文字匹配：%/_ 不是通配符，lower 只折叠 ASCII 大小写。
+            where.append(" AND m.body <> '' AND instr(lower(m.body), lower(?)) > 0");
+            args.add(query.query);
+        }
+        if (!query.kind.isEmpty()) {
+            where.append(" AND (").append(HISTORY_KIND_SQL).append(") = ?");
+            args.add(query.kind);
+        }
+        if (!query.direction.isEmpty()) {
+            where.append(" AND m.direction = ?");
+            args.add(query.direction.equals("incoming") ? "INCOMING" : "OUTGOING");
+        }
+        if (query.sinceMs != null) { where.append(" AND m.created_at >= ?"); args.add(query.sinceMs.toString()); }
+        if (query.untilMs != null) { where.append(" AND m.created_at <= ?"); args.add(query.untilMs.toString()); }
+        if (before != null) {
+            where.append(" AND (m.created_at < ? OR (m.created_at = ? AND m.id < ?))");
+            args.add(Long.toString(before.createdAt)); args.add(Long.toString(before.createdAt)); args.add(before.id);
+        }
+        args.add(Integer.toString(query.limit + 1));
+        List<RemoteIMMessageHistory.Row> matches = new ArrayList<>();
+        // 仅投影七项查询字段；完整 UI 消息的路径解析和无关损坏元数据都不能影响本机检索。
+        try (Cursor rows = database.rawQuery("SELECT m.id,m.peer_id,m.from_id,m.body," + HISTORY_KIND_SQL
+                + ",lower(m.direction),m.created_at FROM messages m WHERE "
+                + where + " ORDER BY m.created_at DESC, m.id DESC LIMIT ?", args.toArray(new String[0]), cancellation)) {
+            while (rows.moveToNext()) {
+                cancellation.throwIfCanceled();
+                matches.add(new RemoteIMMessageHistory.Row(rows.getString(0), rows.getString(1), rows.getString(2),
+                    rows.getString(3), rows.getString(4), rows.getString(5), rows.getLong(6)));
+            }
+        }
+        cancellation.throwIfCanceled();
+        boolean more = matches.size() > query.limit;
+        if (more) matches.remove(matches.size() - 1);
+        String next = null;
+        synchronized (historyCursors) {
+            // 不能让旧连接完成后往新连接的注册表发布游标；只锁发布，不锁整个 SQL 扫描。
+            if (database != historyDatabase || databaseInstance != historyInstance)
+                throw new IllegalStateException("Local history database changed");
+            if (more) {
+                next = java.util.UUID.randomUUID().toString();
+                historyCursors.put(next, new HistoryCursor(owner, loginScope, query,
+                    matches.get(matches.size() - 1), databaseInstance));
+                while (historyCursors.size() > 512) historyCursors.remove(historyCursors.keySet().iterator().next());
+            }
+        }
+        return new RemoteIMMessageHistory.Page(matches, more, next, owner, loginScope, databaseInstance);
     }
 
     /** 已获注销回执后的本地清理；共享数据库保留其他 owner，受管媒体也先排除其他账号引用。 */
@@ -151,6 +274,7 @@ public final class AndroidChatHistoryStore extends SQLiteOpenHelper {
         database.execSQL(
             "CREATE INDEX messages_remote_idx ON messages(owner_id, remote_id)"
         );
+        createOwnerHistoryIndex(database);
         createGroupTables(database);
         createGroupRemoteUniqueIndex(database);
     }
@@ -193,6 +317,10 @@ public final class AndroidChatHistoryStore extends SQLiteOpenHelper {
             createGroupRemoteUniqueIndex(database);
             version = 8;
         }
+        if (version < 9) {
+            createOwnerHistoryIndex(database);
+            version = 9;
+        }
         if (version != newVersion) {
             // 只有在没有可用迁移路径时才重建。重建会清空用户本地聊天记录，
             // 为了加几列而删历史，这个代价不该由用户承担，所以放在最后一步。
@@ -200,6 +328,12 @@ public final class AndroidChatHistoryStore extends SQLiteOpenHelper {
             database.execSQL("DROP TABLE IF EXISTS contacts");
             onCreate(database);
         }
+    }
+
+    private static void createOwnerHistoryIndex(SQLiteDatabase database) {
+        // 跨会话查询按账号和时间直接扫描，避免取少量命中也先排序当前账号全部历史。
+        database.execSQL("CREATE INDEX IF NOT EXISTS messages_owner_order_idx "
+            + "ON messages(owner_id,created_at DESC,id DESC)");
     }
 
     private static void addVideoColumns(SQLiteDatabase database) {

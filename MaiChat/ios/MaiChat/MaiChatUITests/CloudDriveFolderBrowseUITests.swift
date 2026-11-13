@@ -67,6 +67,46 @@ final class CloudDriveFolderBrowseUITests: XCTestCase {
     }
 
     @MainActor
+    func testRootCloudDriveDoesNotOfferManualUpload() async throws {
+        #if targetEnvironment(simulator)
+        continueAfterFailure = false
+        let app = try await launchFixture()
+        defer { app.terminate() }
+        XCTAssertFalse(app.buttons["cloud-drive-folder-root"].exists)
+        let image = XCTAttachment(screenshot: app.screenshot())
+        image.name = "cloud-drive-root-upload-entry"
+        image.lifetime = .keepAlways
+        add(image)
+        XCTAssertFalse(app.descendants(matching: .any)
+            .matching(identifier: "cloud-drive-upload").firstMatch.exists,
+            "我的云盘根页面不再提供手工上传加号")
+        #else
+        throw XCTSkip("仅运行于隔离模拟器，不修改真机云盘")
+        #endif
+    }
+
+    @MainActor
+    func testChildCloudFolderDoesNotOfferManualRootUpload() async throws {
+        #if targetEnvironment(simulator)
+        continueAfterFailure = false
+        let app = try await launchFixture()
+        defer { app.terminate() }
+        enterChild(in: app)
+        XCTAssertTrue(app.buttons["cloud-drive-play-123e4567-e89b-42d3-a456-426614174000"]
+            .waitForExistence(timeout: 20))
+        let image = XCTAttachment(screenshot: app.screenshot())
+        image.name = "cloud-drive-child-upload-entry"
+        image.lifetime = .keepAlways
+        add(image)
+        XCTAssertFalse(app.descendants(matching: .any)
+            .matching(identifier: "cloud-drive-upload").firstMatch.exists,
+            "子目录也不再提供上传到根目录的加号")
+        #else
+        throw XCTSkip("仅运行于隔离模拟器，不修改真机云盘")
+        #endif
+    }
+
+    @MainActor
     func testFolderNavigationScopesMediaAndSupportsEmptyRefreshAndRemoteRemoval() async throws {
         #if targetEnvironment(simulator)
         continueAfterFailure = false
@@ -82,7 +122,8 @@ final class CloudDriveFolderBrowseUITests: XCTestCase {
         let play = app.buttons["cloud-drive-play-" + mediaID]
         XCTAssertTrue(play.waitForExistence(timeout: 20))
         XCTAssertFalse(app.staticTexts["cloud-drive-folder-upload-notice"].exists)
-        XCTAssertTrue(app.buttons["上传到根目录"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)
+            .matching(identifier: "cloud-drive-upload").firstMatch.exists)
         let child = XCTAttachment(screenshot: app.screenshot())
         child.name = "ios-cloud-folder-child-media"
         child.lifetime = .keepAlways

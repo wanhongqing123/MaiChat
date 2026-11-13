@@ -615,6 +615,27 @@ public final class AIAssistantController {
             }
         }
 
+        if (tool.equals("maichat_get_messages") || tool.equals("maichat_search_messages")) {
+            if (Looper.myLooper() == Looper.getMainLooper())
+                return hostToolFailure("本机消息查询须在 Agent worker 执行", "internal");
+            try {
+                JSONObject input = new JSONObject(arguments);
+                if (!accountToolScopeMatches(accountUserId, accountToolLoginGeneration,
+                        input.optString("workspace_path"), input.optString("session_id")))
+                    return hostToolFailure("登录账号或工作区已变化", "canceled");
+                // 只读数据库调用在独立查询 worker 执行，绝不进入下方主线程同步桥。
+                input.put("_account_im_user_id", accountUserId)
+                    .put("_account_auth_generation", accountToolLoginGeneration);
+                Object output = target.execute(tool, input);
+                if (!accountToolIdentityMatches(accountUserId, accountToolLoginGeneration))
+                    return hostToolFailure("登录账号已变化", "canceled");
+                return new JSONObject().put("ok", true).put("output", output)
+                    .toString().getBytes(StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException invalid) {
+                return hostToolFailure(safeMessage(invalid), "invalid_input");
+            } catch (Throwable failure) { return hostToolFailure(safeMessage(failure)); }
+        }
+
         // Cloud callbacks post their result to MAIN. Calling the host on MAIN
         // and then waiting for that callback would deadlock every cloud tool.
         if (tool.startsWith("maichat_cloud_drive_")) {

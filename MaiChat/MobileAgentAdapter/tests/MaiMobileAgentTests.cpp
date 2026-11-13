@@ -88,6 +88,76 @@ static void releaseHostToolContext(void* context) {
     static_cast<HostToolProbe*>(context)->released = true;
 }
 
+// 数据库查询不执行媒体导出；取消前不能进入宿主，取消后不能把旧账号结果当成功交回模型。
+// 宿主内部查询的实时中断由平台 reader deadline 负责，这里只验证共用转发边界。
+static void messageHistoryHostContract() {
+    struct Probe {
+        int calls = 0;
+        bool cancelInHost = false;
+        std::atomic<bool> canceled{false};
+    } probe;
+    const auto handler = [](void* raw, const char*, const char*) -> const char* {
+        auto& state = *static_cast<Probe*>(raw);
+        ++state.calls;
+        if (state.cancelInHost) state.canceled = true;
+        const std::string response = R"({"ok":true,"output":{"count":0,"has_more":false,"coverage":"local_persisted"}})";
+        char* owned = static_cast<char*>(std::malloc(response.size() + 1));
+        CHECK(owned != nullptr);
+        std::memcpy(owned, response.c_str(), response.size() + 1);
+        return owned;
+    };
+    auto dispatcher = makeMaiMobileHostDispatcher();
+    CHECK(setMaiMobileHostToolHandler(dispatcher, &probe, handler, freeHostToolResponse,
+                                      [](void*) {}));
+    MaiToolRegistry registry;
+    registerMaiChatHostTools(registry, dispatcher);
+    MaiToolContext context;
+    context.cancel = &probe.canceled;
+    for (const char* name : {"maichat_search_messages", "maichat_get_messages"}) {
+        MaiTool* tool = registry.findForModel(name);
+        CHECK(tool != nullptr);
+        const Json schema = Json::parse(tool->parametersSchema());
+        CHECK(schema.value("additionalProperties", true) == false);
+        for (const char* field : {"peer_id", "limit", "kind", "direction", "since_ms",
+                                  "until_ms", "cursor"})
+            CHECK(schema.at("properties").contains(field));
+        CHECK(schema["properties"]["limit"]["maximum"] == 200);
+        const bool search = std::strcmp(name, "maichat_search_messages") == 0;
+        CHECK(schema["properties"].contains("query") == search);
+        const std::string arguments = search ? R"({"query":"owned"})" : R"({"peer_id":"owned-peer"})";
+        probe.canceled = true;
+        probe.cancelInHost = false;
+        const int before = probe.calls;
+        auto result = tool->execute(arguments, context);
+        CHECK(result.error().code() == MaiErrorCode::Canceled);
+        CHECK(probe.calls == before);
+        CHECK(result.execution().has_value());
+        CHECK(result.execution()->effectStatus == MaiToolEffectStatus::None);
+        CHECK(result.execution()->started == false);
+
+        probe.canceled = false;
+        probe.cancelInHost = true;
+        result = tool->execute(arguments, context);
+        CHECK(probe.calls == before + 1);
+        CHECK(result.error().code() == MaiErrorCode::Canceled);
+        CHECK(result.execution().has_value());
+        CHECK(result.execution()->canceled);
+        CHECK(result.execution()->started == true);
+        CHECK(result.execution()->effectStatus == MaiToolEffectStatus::None);
+
+        probe.canceled = false;
+        probe.cancelInHost = false;
+        result = tool->execute(arguments, context);
+        CHECK(!result.hasError());
+        CHECK(Json::parse(result.output())["coverage"] == "local_persisted");
+        CHECK(result.execution().has_value());
+        CHECK(result.execution()->status == MaiToolExecutionStatus::Completed);
+        CHECK(result.execution()->effectStatus == MaiToolEffectStatus::None);
+    }
+    clearMaiMobileHostToolHandler(dispatcher);
+    std::puts("PASS: persisted message schemas and pre/post host cancellation");
+}
+
 // 相册 ID 不能冒充已知工作区文件；只测普通校验和分发，不访问系统相册。
 static void libraryExportDomainContract() {
     const auto root = MaiFileSystem::temporaryDirectory().append(
@@ -1286,6 +1356,15 @@ static void toolOutputRegistrationContract() {
 
 // 按真实调用顺序检查输入和可观察结果，失败时保留定位所需的上下文。
 int main(int argc, char** argv) {
+    const bool historyOnly = argc == 2 && std::strcmp(argv[1], "--message-history-host-only") == 0;
+    if (argc == 1 || historyOnly) {
+        try { messageHistoryHostContract(); }
+        catch (const std::exception& error) {
+            std::fprintf(stderr, "FAIL: Mobile message history host: %s\n", error.what());
+            return 1;
+        }
+        if (historyOnly) return 0;
+    }
     const bool outputOnly = argc == 2 && std::strcmp(argv[1], "--tool-output-registration-only") == 0;
     if (argc == 1 || outputOnly) {
         try { toolOutputRegistrationContract(); }
@@ -1305,7 +1384,7 @@ int main(int argc, char** argv) {
             "usage: MaiMobileAgentTests "
             "[--capture-contract-only|--camera-routing-contract-only|--tool-detail-contract-only|"
             "--tool-detail-binding-contract-only|--tool-detail-call-id-contract-only|"
-            "--tool-output-registration-only]\n",
+            "--tool-output-registration-only|--message-history-host-only]\n",
             stderr);
         return 2;
     }

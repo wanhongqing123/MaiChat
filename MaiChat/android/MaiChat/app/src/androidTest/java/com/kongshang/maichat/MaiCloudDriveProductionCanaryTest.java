@@ -3,6 +3,7 @@ package com.kongshang.maichat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import android.content.Context;
@@ -330,10 +331,8 @@ public final class MaiCloudDriveProductionCanaryTest {
                 assertNotNull("Account B cloud page did not report unavailable", denied.get());
                 screen.onActivity(activity -> {
                     View root = activity.getWindow().getDecorView();
-                    View upload = byText(root, "上传图片或视频");
-                    assertNotNull(upload);
-                    assertFalse("Account B must not upload to unavailable cloud",
-                        upload.isEnabled());
+                    assertNull("Cloud browser must not expose manual upload when unavailable",
+                        byText(root, "上传图片或视频"));
                     screenshotView(context, root, "cloud-drive-canary-b-unavailable.png");
                 });
             }

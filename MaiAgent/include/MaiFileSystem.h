@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 #include "MaiError.h"
@@ -42,6 +43,39 @@ struct MaiRegularFileInfo {
     std::string identity;
 };
 
+// 本次句柄的实际系统 I/O 统计，供诊断普通代码中的分页/块读取开销。
+// bytesRead 只计系统返回的字节，不以文件元数据大小或历史缓存页冒充本次读取量。
+struct MaiFileReadStats {
+    std::uint64_t openOperations = 0;
+    std::uint64_t readOperations = 0;
+    std::uint64_t bytesRead = 0;
+};
+
+// 持有单个不跟随末段链接的原生普通文件句柄；不复制、不共享，不在内部反复打开路径。
+// Windows 以宽字符路径打开且不共享删除，持有期间阻止路径替换；POSIX 使用 O_NOFOLLOW，
+// validate 另以 lstat 核对路径仍指向该句柄文件。父目录授权由调用方负责。
+// 同一实例仅供一个线程同步使用；析构关闭句柄。snapshot/validate 均查询已打开句柄。
+// 元数据大小可能是零或过期，readAt 仍实际读到系统返回零字节才设置 eof=true。
+// 本类型不是文件锁，无法防御读取后恢复全部文件元数据的恶意并发写入者。
+class MaiFileReadHandle {
+public:
+    static MaiResult<std::unique_ptr<MaiFileReadHandle>> open(const MaiFilePath& path);
+    ~MaiFileReadHandle();
+    MaiFileReadHandle(const MaiFileReadHandle&) = delete;
+    MaiFileReadHandle& operator=(const MaiFileReadHandle&) = delete;
+    MaiError readAt(std::uint64_t offset, std::uint64_t maxBytes, std::string& contents,
+                    bool* eof = nullptr);
+    MaiResult<MaiRegularFileInfo> snapshot() const;
+    MaiError validate(const MaiRegularFileInfo& expected) const;
+    MaiFileReadStats stats() const;
+
+private:
+    MaiFileReadHandle(std::intptr_t nativeHandle, MaiFilePath path);
+    std::intptr_t mNativeHandle = -1;
+    MaiFilePath mPath;
+    MaiFileReadStats mStats;
+};
+
 // 遍历时对每一项的处置。
 enum class MaiWalkAction {
     Continue,       // 接着走
@@ -69,6 +103,14 @@ public:
     // 超过就读到上限为止并把 truncated 置位——工具层要据此告诉模型"你看到的不是全部"。
     static MaiError readFile(const MaiFilePath& path, std::string& contents,
                              std::uint64_t maxBytes = 0, bool* truncated = nullptr);
+
+    // 从原始字节偏移读取有界文件块，参考 Chromium File::Read(offset, ...)。
+    // maxBytes 为 1..1MiB；offset 必须能由有符号 64 位文件偏移表示。偏移越过 EOF 返回空串。
+    // 不跟随末段符号链接，只接受磁盘普通文件；读取前后核对身份、大小及修改/变更时间。
+    // 文件发生变化则返回 InvalidInput，失败清空 contents，不交付混合版本或半截结果。
+    // 本操作阻塞线程；调用方仍须验证父目录授权边界，并为多块读取保留自己的文件快照。
+    static MaiError readFileRange(const MaiFilePath& path, std::uint64_t offset,
+                                  std::uint64_t maxBytes, std::string& contents);
 
     // 覆盖写。父目录不会自动创建，调用方自己先 createDirectories。
     static MaiError writeFile(const MaiFilePath& path, const std::string& contents);
@@ -100,8 +142,12 @@ public:
     // 换过来不会改变现有语义。
     //
     // 遍历顺序不保证，和 chromium 的 FileEnumerator 一样。glob 要排序的话自己排。
+    // 与 Chromium FileEnumerator 的错误状态一样，onError 允许调用方区分真正空目录与遍历失败。
+    // 目录打开、枚举和条目元数据失败时同步报告失败路径及错误，然后继续其它目录；
+    // 正常空目录不报告错误。回调不被保留，省略时维持原先尽力遍历的行为。
     static void walk(const MaiFilePath& root,
-                     const std::function<MaiWalkAction(const MaiFileEntry&)>& visit);
+                     const std::function<MaiWalkAction(const MaiFileEntry&)>& visit,
+                     const std::function<void(const MaiFilePath&, const MaiError&)>& onError = {});
 
     // ── 其它 ────────────────────────────────────────────────────
     // 解析成真实路径：消掉 "."/".."，并且**解析符号链接**。

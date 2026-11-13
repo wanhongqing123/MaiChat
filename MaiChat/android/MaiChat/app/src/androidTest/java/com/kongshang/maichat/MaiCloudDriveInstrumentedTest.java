@@ -1070,14 +1070,9 @@ public final class MaiCloudDriveInstrumentedTest {
             // The child row proves that the parent directory was restored;
             // returning to root would expose UI trip instead.
             waitPageDescription(screen, "UI day，文件夹", false);
-            clickPageDescription(screen, "云盘更多操作");
-            AccessibilityNodeInfo menu = InstrumentationRegistry.getInstrumentation()
-                .getUiAutomation().getRootInActiveWindow();
-            assertNotNull(menu);
-            assertNotNull(textNode(menu, "新建文件夹"));
-            assertNotNull(textNode(menu, "上传图片或视频到根目录"));
-            InstrumentationRegistry.getInstrumentation().getUiAutomation()
-                .performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
+            // Folder browsing stays available without the removed manual add/upload menu.
+            screen.onActivity(activity -> assertNull(byDescription(
+                activity.getWindow().getDecorView(), "云盘更多操作")));
             screen.onActivity(activity -> assertTrue(activity.currentCloudDriveDialog().navigateBack()));
             waitPageDescription(screen, "UI trip，文件夹", false);
             screen.onActivity(activity -> assertFalse(activity.currentCloudDriveDialog().navigateBack()));

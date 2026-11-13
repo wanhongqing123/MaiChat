@@ -34,7 +34,14 @@ struct AIMaiChatHostToolExecution: Sendable, Equatable {
 final class AIMobileHostToolProvider {
     static let shared = AIMobileHostToolProvider()
 
-    weak var appState: RemoteIMAppState?
+    fileprivate nonisolated static let imQueryAdmission = AIMaiChatIMQueryAdmissionRegistry()
+    weak var appState: RemoteIMAppState? {
+        didSet {
+            if oldValue !== appState { oldValue?.persistedIMQueryAdmission.invalidate() }
+            appState?.refreshPersistedIMQueryAdmission()
+            Self.imQueryAdmission.replace(appState?.persistedIMQueryAdmission)
+        }
+    }
     private var smsDelegate: AITextMessageDelegate?
     // 取消通知可先于上传 Task 到达；唯一请求 ID 的有界墓碑避免随后开始副作用。
     private var canceledAvatarIDs = Set<String>()
@@ -42,7 +49,20 @@ final class AIMobileHostToolProvider {
 
     /// 校验 Agent 工具名与参数，再分派到对应 iOS 宿主能力。
     /// 所有失败分支返回明确错误码；播放器和媒体工具不得把仅受理误报为完成。
-    func execute(name: String, argumentsJSON: String) async -> AIMaiChatHostToolExecution {
+    func execute(name: String, argumentsJSON: String,
+        messageQueryDeadline: UInt64? = nil,
+        messageQueryAdmission: LocalChatMessageQueryAdmission.Lease? = nil) async -> AIMaiChatHostToolExecution {
+        if name == "maichat_search_messages" || name == "maichat_get_messages" {
+            guard !Task.isCancelled else { return .failure(code: "canceled", message: "IM query was canceled before admission.") }
+            if let messageQueryDeadline, DispatchTime.now().uptimeNanoseconds >= messageQueryDeadline {
+                return .failure(code: "busy", message: "IM query admission exceeded its deadline.")
+            }
+            if let messageQueryAdmission {
+                guard let appState else { return .failure(code: "not_configured", message: "IM account is unavailable.") }
+                do { try appState.validatePersistedIMQueryAdmission(messageQueryAdmission) }
+                catch { return .failure(code: "canceled", message: "The queued IM account changed.") }
+            }
+        }
         guard let arguments = Self.parseArguments(argumentsJSON) else {
             return .failure(code: "invalid_input", message: "arguments must be a JSON object")
         }
@@ -695,9 +715,11 @@ final class AIMobileHostToolProvider {
         case "maichat_list_conversations":
             return Self.listConversations(appState: appState, arguments: arguments)
         case "maichat_get_messages":
-            return await getMessages(appState: appState, arguments: arguments)
+            return await getMessages(appState: appState, arguments: arguments, deadline: messageQueryDeadline,
+                                     admission: messageQueryAdmission)
         case "maichat_search_messages":
-            return await searchMessages(appState: appState, arguments: arguments)
+            return await searchMessages(appState: appState, arguments: arguments, deadline: messageQueryDeadline,
+                                        admission: messageQueryAdmission)
         case "maichat_get_unread_summary":
             return Self.unreadSummary(appState: appState)
         case "maichat_send_text":
@@ -1384,16 +1406,63 @@ private final class AITextMessageDelegate: NSObject, @preconcurrency MFMessageCo
     }
 }
 
-final class AIMaiChatHostToolCallbackContext: @unchecked Sendable {}
+// registry 只持有线程安全身份盒，不延长 AppState/账号界面的生命周期。
+fileprivate final class AIMaiChatIMQueryAdmissionRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var admission: LocalChatMessageQueryAdmission?
+    private var currentContextID: UUID?
+    func replace(_ admission: LocalChatMessageQueryAdmission?) {
+        lock.lock(); self.admission = admission; lock.unlock()
+    }
+    // AIAssistantModel.shared 只拥有一个普通 Backend。换号会重建 Backend/context；
+    // 旧 Agent 即使尚未销毁，也不能把换号后才发起的 callback 当成新账号请求。
+    func register(_ contextID: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        if let currentContextID, currentContextID != contextID { admission?.advanceRevision() }
+        currentContextID = contextID
+    }
+    func unregister(_ contextID: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        if currentContextID == contextID { currentContextID = nil; admission?.advanceRevision() }
+    }
+    func capture(contextID: UUID) throws -> LocalChatMessageQueryAdmission.Lease {
+        // context 检查与 lease 捕获保持同一锁序；不能解锁后再捕获新 revision。
+        lock.lock(); defer { lock.unlock() }
+        guard currentContextID == contextID else { throw LocalChatMessageQueryError.changed }
+        guard let lease = admission?.capture() else { throw LocalChatMessageQueryError.unavailable }
+        return lease
+    }
+}
+
+final class AIMaiChatHostToolCallbackContext: @unchecked Sendable {
+    fileprivate let id = UUID()
+    init() { AIMobileHostToolProvider.imQueryAdmission.register(id) }
+    deinit { AIMobileHostToolProvider.imQueryAdmission.unregister(id) }
+#if DEBUG && targetEnvironment(simulator)
+    // 仅供自有队列交错用例，在 native admission 点通知阻塞中的 Main。
+    var queryAdmissionForUITesting: (@Sendable () -> Void)?
+#endif
+}
 
 private final class AIMaiChatHostToolResponseBox: @unchecked Sendable {
     private let lock = NSLock()
     private var value = ""
+    private var abandoned = false
 
-    func store(_ value: String) {
+    @discardableResult func store(_ value: String) -> Bool {
         lock.lock()
+        guard !abandoned else { lock.unlock(); return false }
         self.value = value
         lock.unlock()
+        return true
+    }
+
+    func abandon() {
+        lock.lock(); abandoned = true; value = ""; lock.unlock()
+    }
+
+    var isAbandoned: Bool {
+        lock.lock(); let result = abandoned; lock.unlock(); return result
     }
 
     func load() -> String {
@@ -1444,13 +1513,54 @@ let aiMaiChatHostToolHandler: @convention(c) (
             #"{"ok":false,"errorCode":"internal","error":"host callback ran on the main thread"}"#
         )
     }
-    _ = Unmanaged<AIMaiChatHostToolCallbackContext>
+    let callbackContext = Unmanaged<AIMaiChatHostToolCallbackContext>
         .fromOpaque(context!)
         .takeUnretainedValue()
     let name = String(cString: toolName)
     let arguments = String(cString: argumentsJSON)
     let response = AIMaiChatHostToolResponseBox()
     let finished = DispatchSemaphore(value: 0)
+    if name == "maichat_search_messages" || name == "maichat_get_messages" {
+        // 可信身份在进入 Main 队列之前取得；不是模型可提供的 JSON 参数。
+        let admission: LocalChatMessageQueryAdmission.Lease
+        do {
+            admission = try AIMobileHostToolProvider.imQueryAdmission.capture(contextID: callbackContext.id)
+        } catch let error as LocalChatMessageQueryError {
+            return aiMaiChatOwnedCString(aiMaiChatHostToolEnvelope(.failure(code: error.code, message: error.message)))
+        } catch {
+            return aiMaiChatOwnedCString(aiMaiChatHostToolEnvelope(.failure(code: "internal",
+                message: "Failed to capture the active IM admission.")))
+        }
+#if DEBUG && targetEnvironment(simulator)
+        callbackContext.queryAdmissionForUITesting?()
+#endif
+        // 期限在等待 MainActor 抓取账号 scope 之前开始；超时等待与取消均不依赖 Main。
+        // SQLite progress handler/Swift Task 为协作取消，不声称能抢占一次阻塞 OS I/O。
+        let deadline = DispatchTime.now() + .seconds(5)
+        // name/arguments 已复制成 owned String。Task 只持有 ARC box/semaphore，
+        // 不捕获 C context、borrowed 字符串或 callback 栈上的 out 指针。
+        let operation = Task.detached(priority: .userInitiated) {
+            guard !response.isAbandoned, !Task.isCancelled else { return }
+            let result = await AIMobileHostToolProvider.shared.execute(name: name,
+                argumentsJSON: arguments, messageQueryDeadline: deadline.uptimeNanoseconds,
+                messageQueryAdmission: admission)
+            let final = Task.isCancelled || !admission.isCurrent
+                ? AIMaiChatHostToolExecution.failure(code: "canceled", message: "IM query completed after cancellation.")
+                : result
+            if response.store(aiMaiChatHostToolEnvelope(final)) { finished.signal() }
+        }
+        guard finished.wait(timeout: deadline) == .success else {
+            response.abandon()
+            operation.cancel()
+            return aiMaiChatOwnedCString(aiMaiChatHostToolEnvelope(.failure(code: "busy",
+                message: "Local IM query exceeded its five-second admission/queue/SQL deadline.")))
+        }
+        guard admission.isCurrent else {
+            return aiMaiChatOwnedCString(aiMaiChatHostToolEnvelope(.failure(code: "canceled",
+                message: "The queued IM account changed.")))
+        }
+        return aiMaiChatOwnedCString(response.load())
+    }
     Task { @MainActor in
         let result = await AIMobileHostToolProvider.shared.execute(
             name: name,

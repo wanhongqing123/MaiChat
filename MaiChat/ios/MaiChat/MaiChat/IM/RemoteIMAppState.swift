@@ -76,7 +76,12 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
 
     @Published var sdkAppIDText = ""
     @Published var masterUserID = "" {
-        didSet { if oldValue != masterUserID { cancelAvatarMutations() } }
+        didSet {
+            if oldValue != masterUserID {
+                cancelAvatarMutations()
+                refreshPersistedIMQueryAdmission()
+            }
+        }
     }
     @Published var maiChatAccountID = "" {
         didSet {
@@ -105,7 +110,11 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     @Published var connectionState: ConnectionState = .disconnected
     // 仅本机用户主动发送入队时发布；历史回灌和投递状态变化不触发此标识。
     @Published private(set) var locallyQueuedMessageID: UUID?
-    @Published var chatState: MasterChatState
+    @Published var chatState: MasterChatState {
+        didSet {
+            if oldValue.ownerUserID != chatState.ownerUserID { refreshPersistedIMQueryAdmission() }
+        }
+    }
     @Published private(set) var groups: [RemoteIMGroup] = []
     @Published private(set) var groupCreationRecovery: RemoteIMGroup? {
         didSet {
@@ -122,7 +131,9 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         }
     }
     @Published var hasCompletedInitialLogin = false
-    @Published private(set) var hasUnifiedAccount = false
+    @Published private(set) var hasUnifiedAccount = false {
+        didSet { if oldValue != hasUnifiedAccount { refreshPersistedIMQueryAdmission() } }
+    }
     // 登录短信的截止时间按号码保留在账号状态中，返回、切换登录方式或重建页面不会重置。
     // 只限制发送短信；验证码校验和密码登录不经过此门禁。
     @Published private var accountCodeCooldown = AccountCodeCooldown()
@@ -194,9 +205,14 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     // 搜索与引用可定位旧消息，但只给界面一个有界的目标窗口。
     private var focusedMessageIDByUserID: [String: UUID] = [:]
     private var conversationHistoryLoadGenerationByUserID: [String: UInt64] = [:]
-    private var historyAccountGeneration: UInt64 = 0
+    nonisolated let persistedIMQueryAdmission = LocalChatMessageQueryAdmission()
+    private var historyAccountGeneration: UInt64 = 0 {
+        didSet { refreshPersistedIMQueryAdmission() }
+    }
     private var accountRebuildRequestGeneration: UInt64 = 0
-    private var chatHistorySDKAppID: Int?
+    private var chatHistorySDKAppID: Int? {
+        didSet { if oldValue != chatHistorySDKAppID { refreshPersistedIMQueryAdmission() } }
+    }
     private var pendingHistoryMutations: [LocalChatHistoryMutation] = []
     private var historySaveTask: Task<Void, Never>?
     private var pendingIncomingRemoteIDs = Set<String>()
@@ -374,6 +390,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         Task { [weak self] in
             await self?.loadStoredGroupsForCurrentAccount()
         }
+        refreshPersistedIMQueryAdmission()
     }
 
     var selectedContact: RemoteIMContact? {
@@ -993,6 +1010,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     private func clearLocalAccountPresentation() async {
+        // 首个 await 之前作废旧 native 排队租约；身份发布后新调用再获取新租约。
+        persistedIMQueryAdmission.invalidate()
         cancelAvatarMutations()
         try? await AIMobileSMSInbox.shared.disableAndClear()
         AICloudCredentialSync.invalidateAccountModelCredentials()
@@ -1017,6 +1036,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     private func finishAccountLogin(_ session: MaiChatAuthSession) async throws {
+        persistedIMQueryAdmission.invalidate()
+        defer { refreshPersistedIMQueryAdmission() }
         // 所有调用点均在 password/SMS/social/bind/reset 成功 adopt 后进入，普通 refresh 不调用此处。
         // 在首次 await 前推进，让旧账号密码/PDF request 即刻失效；不触发整套聊天状态重置。
         cancelAvatarMutations()
@@ -2247,6 +2268,77 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
             recordHistoryLoadFailure(error, operation: "message-search")
             return []
         }
+    }
+
+    // Agent 查询只读持久化 IM 数据，不合并进 UI 缓存或改变未读状态。
+    // pending 入库先完成；之后查询使用独立 worker，新的保存无需等待查询结束。
+    var persistedIMQueryIdentity: LocalChatMessageQueryIdentity {
+        LocalChatMessageQueryIdentity(sdk: chatHistorySDKAppID, owner: chatState.ownerUserID,
+            generation: historyAccountGeneration,
+            authenticated: hasUnifiedAccount && masterUserID == chatState.ownerUserID)
+    }
+
+    func refreshPersistedIMQueryAdmission() {
+        persistedIMQueryAdmission.update(persistedIMQueryIdentity)
+    }
+
+    func validatePersistedIMQueryAdmission(_ lease: LocalChatMessageQueryAdmission.Lease) throws {
+        guard lease.belongs(to: persistedIMQueryAdmission), lease.isCurrent,
+              persistedIMQueryIdentity == lease.identity else { throw LocalChatMessageQueryError.changed }
+    }
+
+#if DEBUG && targetEnvironment(simulator)
+    private(set) var persistedIMReadCountForUITesting = 0
+#endif
+
+    func queryPersistedIMMessages(_ request: LocalChatMessageQuery,
+        admission: LocalChatMessageQueryAdmission.Lease) async throws -> LocalChatMessageQueryPage {
+        try validatePersistedIMQueryAdmission(admission)
+        let deadline = min(request.deadlineUptimeNanoseconds ?? UInt64.max,
+                           DispatchTime.now().uptimeNanoseconds + 5_000_000_000)
+        let account = LocalChatHistoryAccount(sdkAppID: chatHistorySDKAppID,
+                                              ownerUserID: chatState.ownerUserID)
+        let generation = historyAccountGeneration
+        guard hasUnifiedAccount, !account.ownerUserID.isEmpty,
+              masterUserID == account.ownerUserID else { throw LocalChatMessageQueryError.unavailable }
+        try Task.checkCancellation()
+        startHistorySaveTaskIfNeeded()
+        // 不等待一个可被持续新消息无限续长的 flush；这段等待与 SQL 共用总截止时间。
+        while historySaveTask != nil {
+            try Task.checkCancellation()
+            try validatePersistedIMQueryAdmission(admission)
+            guard generation == historyAccountGeneration, account.ownerUserID == chatState.ownerUserID,
+                  account.sdkAppID == chatHistorySDKAppID, hasUnifiedAccount else {
+                throw LocalChatMessageQueryError.changed
+            }
+            guard DispatchTime.now().uptimeNanoseconds < deadline else {
+                throw LocalChatMessageQueryError(code: "busy", message: "Pending IM persistence exceeded the query deadline.")
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        guard pendingHistoryMutations.isEmpty else { throw LocalChatMessageQueryError.unavailable }
+        try validatePersistedIMQueryAdmission(admission)
+        guard generation == historyAccountGeneration, account.ownerUserID == chatState.ownerUserID,
+              account.sdkAppID == chatHistorySDKAppID, hasUnifiedAccount else {
+            throw LocalChatMessageQueryError.changed
+        }
+        var boundedRequest = request
+        boundedRequest.deadlineUptimeNanoseconds = deadline
+#if DEBUG && targetEnvironment(simulator)
+        persistedIMReadCountForUITesting += 1
+#endif
+        let page = try await historyPersistence.queryMessages(sdkAppID: account.sdkAppID,
+            ownerUserID: account.ownerUserID, generation: generation, request: boundedRequest)
+        try Task.checkCancellation()
+        try validatePersistedIMQueryAdmission(admission)
+        guard DispatchTime.now().uptimeNanoseconds < deadline else {
+            throw LocalChatMessageQueryError(code: "busy", message: "The local IM query deadline elapsed.")
+        }
+        guard generation == historyAccountGeneration, account.ownerUserID == chatState.ownerUserID,
+              account.sdkAppID == chatHistorySDKAppID, hasUnifiedAccount else {
+            throw LocalChatMessageQueryError.changed
+        }
+        return page
     }
 
     func messagesForHostTool(peerUserID: String, limit: Int) async -> [RemoteIMMessage] {

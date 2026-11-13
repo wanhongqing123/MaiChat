@@ -124,6 +124,169 @@ std::string args(const json& j) {
     return j.dump();
 }
 
+// 新检索合同的回归使用系统文件 API，且只操作本用例拥有的临时目录。
+struct SearchWorkspace {
+    MaiFilePath root = MaiFileSystem::temporaryDirectory().append(MaiFilePath::fromUtf8(
+        "maiagent-search-regression-" + std::to_string(std::rand())));
+
+    SearchWorkspace() { CHECK(!MaiFileSystem::createDirectories(root).hasError()); }
+    ~SearchWorkspace() { MaiFileSystem::removeRecursively(root); }
+    void write(const std::string& name, const std::string& text) {
+        CHECK(!MaiFileSystem::writeFile(root.append(MaiFilePath::fromUtf8(name)), text).hasError());
+    }
+    MaiToolContext context() const {
+        MaiToolContext result;
+        result.sessionId = "ses_search_regression";
+        result.root = root.toUtf8();
+        return result;
+    }
+};
+
+json fileResultMetadata(const MaiToolResult& result) {
+    const std::string marker = "\n\n[file_result]\n";
+    const auto position = result.output().rfind(marker);
+    if (position == std::string::npos) return json::object();
+    const auto parsed = json::parse(result.output().substr(position + marker.size()), nullptr,
+                                    /*allow_exceptions=*/false);
+    return parsed.is_object() ? parsed : json::object();
+}
+
+void test_search_long_line_is_matched_before_display_clipping() {
+    SearchWorkspace workspace;
+    workspace.write("long.txt", std::string(480, 'x') + "OWNED_TAIL_NEEDLE\n");
+    auto grep = makeMaiGrepTool();
+    const auto found = grep->execute(args({{"path", "long.txt"},
+                                          {"pattern", "OWNED_TAIL_NEEDLE"},
+                                          {"mode", "literal"}}), workspace.context());
+    CHECK(!found.hasError());
+    CHECK(found.output().find("long.txt:1:") != std::string::npos);
+    CHECK(found.output().find("No content matches") == std::string::npos);
+    CHECK(fileResultMetadata(found).value("complete", false));
+}
+
+void test_read_offset_reaches_beyond_the_old_eight_mebibyte_prefix() {
+    SearchWorkspace workspace;
+    workspace.write("large.txt", std::string(8u * 1024 * 1024 + 17, 'x') +
+                                     "\nOWNED_AFTER_PREFIX\n");
+    auto read = makeMaiReadTool();
+    const auto found = read->execute(args({{"path", "large.txt"}, {"offset", 2}, {"limit", 1}}),
+                                     workspace.context());
+    CHECK(!found.hasError());
+    CHECK(found.output().find("2\tOWNED_AFTER_PREFIX") != std::string::npos);
+    CHECK(found.output().find("no content at or after") == std::string::npos);
+}
+
+void test_search_continuation_and_unknown_arguments_are_not_silent_replays() {
+    SearchWorkspace workspace;
+    std::string contents;
+    for (int line = 1; line <= 260; ++line)
+        contents += "OWNED_HIT_" + std::to_string(line) + "\n";
+    workspace.write("hits.txt", contents);
+    auto grep = makeMaiGrepTool();
+    json query = {{"path", "hits.txt"}, {"pattern", "OWNED_HIT_"},
+                  {"mode", "literal"}, {"limit", 100}};
+    const auto first = grep->execute(args(query), workspace.context());
+    const auto metadata = fileResultMetadata(first);
+    CHECK(!first.hasError());
+    const std::string cursor = metadata.value("next_cursor", std::string());
+    CHECK(!cursor.empty());
+    if (!cursor.empty()) {
+        query["cursor"] = cursor;
+        const auto second = grep->execute(args(query), workspace.context());
+        CHECK(!second.hasError());
+        CHECK(second.output().find("hits.txt:101:") != std::string::npos);
+        CHECK(second.output().find("hits.txt:1:") == std::string::npos);
+        CHECK(second.execution().has_value());
+        if (second.execution())
+            CHECK(second.execution()->effectStatus == MaiToolEffectStatus::None);
+    }
+    const auto unsupported = grep->execute(
+        args({{"path", "hits.txt"}, {"pattern", "OWNED_HIT_"}, {"offset", 200}}),
+        workspace.context());
+    CHECK(unsupported.error().code() == MaiErrorCode::InvalidInput);
+}
+
+void test_filename_query_finds_ranked_names_without_guessing_a_glob() {
+    SearchWorkspace workspace;
+    workspace.write("MaiCloudDriveDialog.java", "class Owned {}\n");
+    auto glob = makeMaiGlobTool();
+    const auto found = glob->execute(args({{"query", "CloudDriveDialog"}}), workspace.context());
+    CHECK(!found.hasError());
+    CHECK(found.output().find("MaiCloudDriveDialog.java") != std::string::npos);
+}
+
+void test_read_cursor_reassembles_utf8_and_is_bound_to_its_session_and_source() {
+    SearchWorkspace workspace;
+    std::string original;
+    for (int index = 0; index < 4000; ++index) original += "\u4f60\U0001f642";
+    workspace.write("long-utf8.txt", original);
+    auto reader = makeMaiReadTool();
+    auto context = workspace.context();
+    json request = {{"path", "long-utf8.txt"}, {"limit", 1}, {"max_bytes", 4096}};
+    std::string assembled;
+    std::string firstCursor;
+    for (int page = 0; page < 100; ++page) {
+        const auto result = reader->execute(args(request), context);
+        CHECK(!result.hasError());
+        if (result.hasError()) break;
+        const auto metadata = fileResultMetadata(result);
+        CHECK(metadata.value("first_line_utf8_offset", std::size_t{}) == assembled.size());
+        const auto end = result.output().find('\n');
+        CHECK(result.output().compare(0, 2, "1\t") == 0 && end != std::string::npos);
+        if (end == std::string::npos) break;
+        assembled += result.output().substr(2, end - 2);
+        const auto cursor = metadata.value("next_cursor", std::string());
+        if (cursor.empty()) {
+            CHECK(metadata.value("eof", false));
+            break;
+        }
+        if (firstCursor.empty()) firstCursor = cursor;
+        request["cursor"] = cursor;
+    }
+    CHECK(assembled == original);
+    CHECK(!firstCursor.empty());
+    request["cursor"] = firstCursor;
+    auto other = context;
+    other.sessionId = "ses_other_search_reader";
+    CHECK(reader->execute(args(request), other).error().code() == MaiErrorCode::InvalidInput);
+    workspace.write("long-utf8.txt", "owned changed source");
+    CHECK(reader->execute(args(request), context).error().code() == MaiErrorCode::InvalidInput);
+}
+
+void test_file_queries_reject_wrong_types_and_unsupported_arguments() {
+    SearchWorkspace workspace;
+    workspace.write("one.txt", "owned\n");
+    const auto context = workspace.context();
+    for (const auto& request : {json{{"path", "one.txt"}, {"max_bytes", true}},
+                                json{{"path", "one.txt"}, {"encoding", json::array()}},
+                                json{{"path", "one.txt"}, {"after", 3}}})
+        CHECK(makeMaiReadTool()->execute(args(request), context).error().code() == MaiErrorCode::InvalidInput);
+    CHECK(makeMaiGlobTool()->execute(args({{"query", "one"}, {"pattern", "*.txt"}}), context)
+              .error().code() == MaiErrorCode::InvalidInput);
+    CHECK(makeMaiGrepTool()->execute(args({{"pattern", "owned"}, {"limit", 1001}}), context)
+              .error().code() == MaiErrorCode::InvalidInput);
+}
+
+void test_search_context_does_not_repeat_long_paths_for_each_context_line() {
+    SearchWorkspace workspace;
+    std::string text;
+    for (int line = 1; line <= 25; ++line)
+        text += (line == 12 ? "OWNED_CONTEXT_NEEDLE " : "owned context ") +
+                std::string(300, 'x') + "\n";
+    workspace.write("context.txt", text);
+    const auto result = makeMaiGrepTool()->execute(args({{"path", "context.txt"},
+        {"pattern", "OWNED_CONTEXT_NEEDLE"}, {"mode", "literal"},
+        {"context_before", 10}, {"context_after", 10}}), workspace.context());
+    CHECK(!result.hasError());
+    const auto first = result.output().find("context.txt");
+    CHECK(first != std::string::npos);
+    CHECK(first == std::string::npos || result.output().find("context.txt", first + 1) == std::string::npos);
+    CHECK(result.output().find("  2- owned context") != std::string::npos);
+    CHECK(result.output().find("context.txt:12: OWNED_CONTEXT_NEEDLE") != std::string::npos);
+    CHECK(result.output().find("  22- owned context") != std::string::npos);
+    CHECK(fileResultMetadata(result).value("complete", false));
+}
+
 // ── 1. 路径边界 ─────────────────────────────────────────────────
 
 void test_path_escape_is_blocked() {
@@ -724,9 +887,9 @@ void test_registry() {
         CHECK(!parsed.is_discarded());
         if (!parsed.is_discarded()) {
             CHECK(parsed.contains("properties"));
-            // 有参数的工具要在顶层 required 或 oneOf 中表达必填条件。
+            // 有参数的工具要声明必填条件；文件名定位可在 pattern/query 中选择一种。
             if (!parsed["properties"].empty())
-                CHECK(parsed.contains("required") || parsed.contains("oneOf"));
+                CHECK(parsed.contains("required") || parsed.contains("oneOf") || parsed.contains("anyOf"));
         }
     }
 
@@ -997,6 +1160,13 @@ void test_tool_detail_utf8_and_invalid_queries() {
     } while (0)
 
 int main() {
+    RUN(test_search_long_line_is_matched_before_display_clipping);
+    RUN(test_read_offset_reaches_beyond_the_old_eight_mebibyte_prefix);
+    RUN(test_search_continuation_and_unknown_arguments_are_not_silent_replays);
+    RUN(test_filename_query_finds_ranked_names_without_guessing_a_glob);
+    RUN(test_read_cursor_reassembles_utf8_and_is_bound_to_its_session_and_source);
+    RUN(test_file_queries_reject_wrong_types_and_unsupported_arguments);
+    RUN(test_search_context_does_not_repeat_long_paths_for_each_context_line);
     RUN(test_tool_detail_pages_and_revision_binding);
     RUN(test_tool_detail_utf8_and_invalid_queries);
     RUN(test_path_escape_is_blocked);

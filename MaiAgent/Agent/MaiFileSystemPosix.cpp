@@ -14,6 +14,8 @@
 #if defined(__ANDROID__)
 #include <atomic>
 #endif
+#include <algorithm>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -92,24 +94,24 @@ std::string MaiFilePath::toGenericUtf8() const {
 // ── MaiFileSystem ───────────────────────────────────────────────
 
 bool MaiFileSystem::exists(const MaiFilePath& path) {
-    struct stat info {};
+    struct stat info{};
     return statOf(path, info);
 }
 
 bool MaiFileSystem::isDirectory(const MaiFilePath& path) {
-    struct stat info {};
+    struct stat info{};
     if (!statOf(path, info)) return false;
     return S_ISDIR(info.st_mode);
 }
 
 bool MaiFileSystem::isSymbolicLink(const MaiFilePath& path) {
     if (path.isEmpty()) return false;
-    struct stat info {};
+    struct stat info{};
     return ::lstat(path.value().c_str(), &info) == 0 && S_ISLNK(info.st_mode);
 }
 
 bool MaiFileSystem::fileSize(const MaiFilePath& path, std::uint64_t& size) {
-    struct stat info {};
+    struct stat info{};
     if (!statOf(path, info)) return false;
     if (S_ISDIR(info.st_mode)) return false;
     size = static_cast<std::uint64_t>(info.st_size);
@@ -118,16 +120,14 @@ bool MaiFileSystem::fileSize(const MaiFilePath& path, std::uint64_t& size) {
 
 bool MaiFileSystem::modifiedTime(const MaiFilePath& path, std::int64_t& seconds) {
     if (path.isEmpty()) return false;
-    struct stat info {};
+    struct stat info{};
     if (::lstat(path.value().c_str(), &info) != 0) return false;
     seconds = static_cast<std::int64_t>(info.st_mtime);
     return true;
 }
 
-bool MaiFileSystem::regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo& out) {
-    struct stat info{};
-    if (path.isEmpty() || ::lstat(path.value().c_str(), &info) != 0 || !S_ISREG(info.st_mode))
-        return false;
+namespace {
+MaiRegularFileInfo readStatInfo(const struct stat& info) {
 #if defined(__APPLE__)
     const auto modified = info.st_mtimespec;
     const auto changed = info.st_ctimespec;
@@ -141,8 +141,95 @@ bool MaiFileSystem::regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo&
     result.identity = std::to_string(info.st_dev) + ":" + std::to_string(info.st_ino) + ":" +
                       std::to_string(modified.tv_sec) + ":" + std::to_string(modified.tv_nsec) +
                       ":" + std::to_string(changed.tv_sec) + ":" + std::to_string(changed.tv_nsec);
-    out = std::move(result);
+    return result;
+}
+}  // namespace
+
+bool MaiFileSystem::regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo& out) {
+    struct stat info{};
+    if (path.isEmpty() || ::lstat(path.value().c_str(), &info) != 0 || !S_ISREG(info.st_mode))
+        return false;
+    out = readStatInfo(info);
     return true;
+}
+
+MaiFileReadHandle::MaiFileReadHandle(std::intptr_t nativeHandle, MaiFilePath path)
+    : mNativeHandle(nativeHandle), mPath(std::move(path)) {
+    mStats.openOperations = 1;
+}
+
+MaiFileReadHandle::~MaiFileReadHandle() {
+    if (mNativeHandle != -1) ::close(static_cast<int>(mNativeHandle));
+}
+
+MaiResult<std::unique_ptr<MaiFileReadHandle>> MaiFileReadHandle::open(const MaiFilePath& path) {
+    if (path.isEmpty()) return {MaiErrorCode::InvalidInput, "empty file path"};
+    maiAssertBlockingAllowed("MaiFileReadHandle::open");
+    // 非阻塞打开先守住可能被替换成 FIFO 的路径，再通过 fstat 确认普通文件。
+    const int descriptor =
+        ::open(path.value().c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (descriptor < 0) return errnoAs("cannot open file for reading");
+    struct stat info{};
+    if (::fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode)) {
+        ::close(descriptor);
+        return {MaiErrorCode::InvalidInput, "reading requires a non-link regular file"};
+    }
+    return std::unique_ptr<MaiFileReadHandle>(new MaiFileReadHandle(descriptor, path));
+}
+
+MaiResult<MaiRegularFileInfo> MaiFileReadHandle::snapshot() const {
+    struct stat info{};
+    if (::fstat(static_cast<int>(mNativeHandle), &info) != 0)
+        return errnoAs("cannot stat opened file");
+    if (!S_ISREG(info.st_mode)) return {MaiErrorCode::InvalidInput, "opened file is not regular"};
+    return readStatInfo(info);
+}
+
+MaiError MaiFileReadHandle::validate(const MaiRegularFileInfo& expected) const {
+    const auto current = snapshot();
+    if (!current) return current.error();
+    MaiRegularFileInfo pathInfo;
+    if (!MaiFileSystem::regularFileInfo(mPath, pathInfo) ||
+        expected.bytes != current.value().bytes || expected.modified != current.value().modified ||
+        expected.identity != current.value().identity || expected.bytes != pathInfo.bytes ||
+        expected.modified != pathInfo.modified || expected.identity != pathInfo.identity)
+        return {MaiErrorCode::InvalidInput, "file changed during reading; restart the read"};
+    return {};
+}
+
+MaiFileReadStats MaiFileReadHandle::stats() const {
+    return mStats;
+}
+
+MaiError MaiFileReadHandle::readAt(std::uint64_t offset, std::uint64_t maxBytes,
+                                   std::string& contents, bool* eof) {
+    contents.clear();
+    if (eof) *eof = false;
+    if (maxBytes == 0 || maxBytes > 1024 * 1024 ||
+        offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) - maxBytes)
+        return {MaiErrorCode::InvalidInput, "invalid file range"};
+    maiAssertBlockingAllowed("MaiFileReadHandle::readAt");
+    std::string bytes(static_cast<std::size_t>(maxBytes), '\0');
+    std::size_t done = 0;
+    while (done < bytes.size()) {
+        const auto chunk = std::min<std::size_t>(64 * 1024, bytes.size() - done);
+        ++mStats.readOperations;
+        const ssize_t got = ::pread(static_cast<int>(mNativeHandle), bytes.data() + done, chunk,
+                                    static_cast<off_t>(offset + done));
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            return errnoAs("cannot read file range");
+        }
+        mStats.bytesRead += static_cast<std::uint64_t>(got);
+        if (got == 0) {
+            if (eof) *eof = true;
+            break;
+        }
+        done += static_cast<std::size_t>(got);
+    }
+    bytes.resize(done);
+    contents = std::move(bytes);
+    return {};
 }
 
 MaiError MaiFileSystem::readFile(const MaiFilePath& path, std::string& contents,
@@ -155,7 +242,7 @@ MaiError MaiFileSystem::readFile(const MaiFilePath& path, std::string& contents,
     const int fd = ::open(path.value().c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return errnoAs("cannot open file for reading");
 
-    struct stat info {};
+    struct stat info{};
     if (::fstat(fd, &info) != 0) {
         const MaiError error = errnoAs("cannot stat file");
         ::close(fd);
@@ -189,6 +276,20 @@ MaiError MaiFileSystem::readFile(const MaiFilePath& path, std::string& contents,
     contents.resize(static_cast<std::size_t>(done));
     ::close(fd);
     return {};
+}
+
+MaiError MaiFileSystem::readFileRange(const MaiFilePath& path, std::uint64_t offset,
+                                      std::uint64_t maxBytes, std::string& contents) {
+    contents.clear();
+    auto opened = MaiFileReadHandle::open(path);
+    if (!opened) return opened.error();
+    const auto before = opened.value()->snapshot();
+    if (!before) return before.error();
+    const auto error = opened.value()->readAt(offset, maxBytes, contents);
+    if (error) return error;
+    const auto validated = opened.value()->validate(before.value());
+    if (validated) contents.clear();
+    return validated;
 }
 
 MaiError MaiFileSystem::writeFile(const MaiFilePath& path, const std::string& contents) {
@@ -270,7 +371,8 @@ MaiError MaiFileSystem::createDirectories(const MaiFilePath& path) {
 }
 
 void MaiFileSystem::walk(const MaiFilePath& root,
-                         const std::function<MaiWalkAction(const MaiFileEntry&)>& visit) {
+                         const std::function<MaiWalkAction(const MaiFileEntry&)>& visit,
+                         const std::function<void(const MaiFilePath&, const MaiError&)>& onError) {
     if (root.isEmpty() || !visit) return;
 
     std::vector<MaiFilePath> pending{root};
@@ -279,9 +381,24 @@ void MaiFileSystem::walk(const MaiFilePath& root,
         pending.pop_back();
 
         DIR* handle = ::opendir(directory.value().c_str());
-        if (!handle) continue;  // 没权限之类，跳过
+        if (!handle) {
+            const auto error = errnoAs("cannot open directory for enumeration");
+            if (onError) onError(directory, error);
+            continue;
+        }
 
-        while (struct dirent* item = ::readdir(handle)) {
+        while (true) {
+            // readdir 的空返回同时表示结束和失败；每次清 errno，避免访问回调或 lstat
+            // 留下的旧错误把正常空目录误报为扫描失败。
+            errno = 0;
+            struct dirent* item = ::readdir(handle);
+            if (!item) {
+                if (errno != 0) {
+                    const auto error = errnoAs("directory enumeration failed");
+                    if (onError) onError(directory, error);
+                }
+                break;
+            }
             const std::string name = item->d_name;
             if (name == "." || name == "..") continue;
 
@@ -291,8 +408,12 @@ void MaiFileSystem::walk(const MaiFilePath& root,
 
             // lstat 不是 stat：要看的是这一项**自身**是不是符号链接，而不是它指向的东西。
             // 用 stat 的话符号链接会被当成它的目标，于是指回上级的链接会让遍历无限转下去。
-            struct stat info {};
-            if (::lstat(entry.path.value().c_str(), &info) != 0) continue;
+            struct stat info{};
+            if (::lstat(entry.path.value().c_str(), &info) != 0) {
+                const auto error = errnoAs("cannot inspect directory entry");
+                if (onError) onError(entry.path, error);
+                continue;
+            }
             const bool isSymlink = S_ISLNK(info.st_mode);
             entry.isDirectory = S_ISDIR(info.st_mode);
             entry.size = static_cast<std::uint64_t>(info.st_size);

@@ -1,110 +1,5 @@
 // Account-private media cloud drive. The page never exposes an upload publicly.
-import ImageIO
-import PhotosUI
 import SwiftUI
-import UniformTypeIdentifiers
-
-private final class MaiCloudPhotoStream {
-    let file: FileHandle
-    init(url: URL) throws { file = try FileHandle(forReadingFrom: url) }
-    deinit { try? file.close() }
-}
-
-private let maiCloudPhotoReadNext: MaiCloudDriveReadNext = {
-    context, output, capacity, bytesRead in
-    guard let context, let output, let bytesRead else { return 0 }
-    do {
-        let stream = Unmanaged<MaiCloudPhotoStream>.fromOpaque(context).takeUnretainedValue()
-        let bytes = try stream.file.read(upToCount: capacity) ?? Data()
-        bytes.withUnsafeBytes { raw in
-            if let base = raw.baseAddress {
-                output.update(from: base.assumingMemoryBound(to: UInt8.self),
-                              count: bytes.count)
-            }
-        }
-        bytesRead.pointee = bytes.count
-        return 1
-    } catch { return 0 }
-}
-
-private struct MaiCloudPhotoMedia: Transferable, Sendable {
-    let url: URL
-    let displayName: String
-
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(contentType: .movie) { media in
-            SentTransferredFile(media.url)
-        } importing: { received in
-            try stage(source: received.file, isImage: false)
-        }
-        FileRepresentation(contentType: .image) { media in
-            SentTransferredFile(media.url)
-        } importing: { received in
-            try stage(source: received.file, isImage: true)
-        }
-    }
-
-    private static func stage(source: URL, isImage: Bool) throws -> MaiCloudPhotoMedia {
-        let extensionName: String
-        if isImage {
-            guard let imageSource = CGImageSourceCreateWithURL(source as CFURL, nil),
-                  let imageType = CGImageSourceGetType(imageSource) as String?,
-                  let type = UTType(imageType) else {
-                throw MaiCloudDriveError(status: 0, httpStatus: 0,
-                                         detail: "无法识别选中的相册图片")
-            }
-            if type.conforms(to: .jpeg) { extensionName = "jpg" }
-            else if type.conforms(to: .png) { extensionName = "png" }
-            else if type.conforms(to: .heic) { extensionName = "heic" }
-            else if let webp = UTType(filenameExtension: "webp"),
-                    type.conforms(to: webp) { extensionName = "webp" }
-            else {
-                throw MaiCloudDriveError(status: 0, httpStatus: 0,
-                                         detail: "云盘支持 JPEG、PNG、WebP 和 HEIC 图片")
-            }
-        } else {
-            extensionName = source.pathExtension.lowercased() == "mp4" ? "mp4" : "mov"
-        }
-        let size = try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        let limit = isImage ? 20_000_000 : 2_000_000_000
-        guard size > 0, size <= limit else {
-            throw MaiCloudDriveError(status: 0, httpStatus: 0,
-                                     detail: isImage ? "相册图片必须在 20 MB 以内"
-                                                     : "相册视频必须在 2 GB 以内")
-        }
-        let directory = FileManager.default.urls(for: .applicationSupportDirectory,
-            in: .userDomainMask)[0]
-            .appendingPathComponent("MaiCloudDrivePhotoImports", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory,
-                                                withIntermediateDirectories: true)
-        let target = directory.appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension(extensionName)
-        let stream = try MaiCloudPhotoStream(url: source)
-        var result = MaiCloudDriveResult()
-        target.path.withCString { path in
-            mai_cloud_drive_stage_stream(path, UInt64(size),
-                maiCloudPhotoReadNext, Unmanaged.passUnretained(stream).toOpaque(),
-                nil, nil, nil, &result)
-        }
-        let status = result.status
-        mai_cloud_drive_result_free(&result)
-        guard status == MAI_CLOUD_DRIVE_OK else {
-            throw MaiCloudDriveError(status: Int32(status.rawValue), httpStatus: 0,
-                                     detail: "无法准备相册文件")
-        }
-        let sourceName = source.lastPathComponent
-        let sourceStem = source.deletingPathExtension().lastPathComponent
-        let usefulName = sourceName.utf8.count <= 240 &&
-            UUID(uuidString: sourceStem) == nil &&
-            sourceName.rangeOfCharacter(from: CharacterSet(charactersIn: "/\\")) == nil &&
-            source.pathExtension.lowercased() == extensionName
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd_HHmmss"
-        let name = usefulName ? sourceName :
-            "相册\(isImage ? "图片" : "视频")_\(formatter.string(from: Date())).\(extensionName)"
-        return MaiCloudPhotoMedia(url: target, displayName: name)
-    }
-}
 
 private struct MaiCloudDrivePreview: Identifiable {
     let id = UUID().uuidString
@@ -316,11 +211,6 @@ private struct MaiCloudDriveSwipeRow<Content: View>: View {
 struct MaiCloudDriveView: View {
     @EnvironmentObject private var appState: RemoteIMAppState
     @ObservedObject private var model = MaiCloudDriveModel.shared
-    @State private var importing = false
-    @State private var fileSelectionAccountID = ""
-    @State private var showingPhotoPicker = false
-    @State private var photoSelectionAccountID = ""
-    @State private var photoItem: PhotosPickerItem?
     @State private var deletingID: String?
     @State private var revealedMediaID: String?
     @State private var discardingTaskID: String?
@@ -396,7 +286,7 @@ struct MaiCloudDriveView: View {
                         ForEach(model.videos) { media in
                             MaiCloudDriveSwipeRow(id: media.id,
                                 enabled: preview == nil && deletingID == nil &&
-                                    discardingTaskID == nil && !importing && !showingPhotoPicker,
+                                    discardingTaskID == nil,
                                 revealedID: $revealedMediaID,
                                 delete: { deletingID = media.id }) {
                                 mediaCard(media)
@@ -439,66 +329,10 @@ struct MaiCloudDriveView: View {
         .background(Color(uiColor: .systemGroupedBackground))
         .appNavigationTitle("我的云盘")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button(model.currentFolderID == nil ? "从文件选择" : "从文件选择并上传到根目录",
-                           systemImage: "folder") {
-                        fileSelectionAccountID = appState.maiChatAccountID
-                        importing = true
-                    }
-                    Button(model.currentFolderID == nil ? "从相册选择" : "从相册选择并上传到根目录",
-                           systemImage: "photo.on.rectangle") {
-                        photoSelectionAccountID = appState.maiChatAccountID
-                        showingPhotoPicker = true
-                    }
-                } label: {
-                    Image(systemName: "plus")
-                        .font(AppTypography.symbol(size: 18, weight: .semibold))
-                        .frame(width: 36, height: 36)
-                }
-                .accessibilityLabel(model.currentFolderID == nil ? "上传图片或视频" : "上传到根目录")
-                .accessibilityIdentifier("cloud-drive-upload")
-                .disabled(model.availability != .available)
-            }
-            #if DEBUG && targetEnvironment(simulator)
-            MaiCloudDriveUITestToolbar(model: model, appState: appState)
-            #endif
-        }
-        .fileImporter(isPresented: $importing,
-                      allowedContentTypes: filePickerTypes) { result in
-            switch result {
-            case let .success(file):
-                let expected = fileSelectionAccountID
-                Task { await model.addFile(file, expectedAccountID: expected) }
-            case let .failure(error):
-                let nsError = error as NSError
-                if nsError.domain != NSCocoaErrorDomain ||
-                    nsError.code != NSUserCancelledError {
-                    model.showError(error.localizedDescription)
-                }
-            }
-        }
-        .photosPicker(isPresented: $showingPhotoPicker,
-                      selection: $photoItem, matching: .any(of: [.images, .videos]),
-                      preferredItemEncoding: .current)
-        .onChange(of: photoItem) { item in
-            guard let item else { return }
-            let expected = photoSelectionAccountID
-            Task {
-                defer { photoItem = nil }
-                do {
-                    guard let media = try await item.loadTransferable(
-                        type: MaiCloudPhotoMedia.self) else {
-                        model.showError("无法读取选中的相册文件")
-                        return
-                    }
-                    await model.addStagedPhoto(media.url,
-                                               displayName: media.displayName,
-                                               expectedAccountID: expected)
-                } catch { model.showError(error.localizedDescription) }
-            }
-        }
+        // 手机端只保留浏览与已有任务控制；上传由 Agent 复用普通 model API 发起。
+        #if DEBUG && targetEnvironment(simulator)
+        .toolbar { MaiCloudDriveUITestToolbar(model: model, appState: appState) }
+        #endif
         .refreshable { await model.reload() }
         .task(id: appState.maiChatAccountID) {
             model.activate(accountID: appState.maiChatAccountID)
@@ -661,12 +495,6 @@ struct MaiCloudDriveView: View {
     private func sectionTitle(_ title: String) -> some View {
         Text(title).font(AppTypography.heading).foregroundStyle(RemoteIMStyle.textPrimary)
             .padding(.horizontal, 2)
-    }
-
-    private var filePickerTypes: [UTType] {
-        var types: [UTType] = [.mpeg4Movie, .quickTimeMovie, .jpeg, .png, .heic]
-        if let webp = UTType(filenameExtension: "webp") { types.append(webp) }
-        return types
     }
 
     private func uploadCard(_ task: MaiCloudDriveLocalTask) -> some View {

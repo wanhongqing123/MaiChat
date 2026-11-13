@@ -2,6 +2,8 @@
 // 主要实现：exists、isDirectory、isSymbolicLink；对应公开接口中的状态和错误处理。
 #include <windows.h>
 
+#include <algorithm>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -144,20 +146,14 @@ bool MaiFileSystem::modifiedTime(const MaiFilePath& path, std::int64_t& seconds)
     return true;
 }
 
-bool MaiFileSystem::regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo& out) {
-    if (path.isEmpty()) return false;
-    const HANDLE handle = ::CreateFileW(
-        path.value().c_str(), FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) return false;
+namespace {
+bool readHandleInfo(HANDLE handle, MaiRegularFileInfo& out) {
     BY_HANDLE_FILE_INFORMATION info{};
     FILE_BASIC_INFO basic{};
     const bool valid =
         ::GetFileType(handle) == FILE_TYPE_DISK && ::GetFileInformationByHandle(handle, &info) &&
         ::GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic)) &&
         !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
-    ::CloseHandle(handle);
     constexpr std::uint64_t kEpochOffset = 116444736000000000ull;
     if (!valid || static_cast<std::uint64_t>(basic.LastWriteTime.QuadPart) < kEpochOffset)
         return false;
@@ -171,6 +167,103 @@ bool MaiFileSystem::regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo&
                       std::to_string(basic.ChangeTime.QuadPart);
     out = std::move(result);
     return true;
+}
+}  // namespace
+
+bool MaiFileSystem::regularFileInfo(const MaiFilePath& path, MaiRegularFileInfo& out) {
+    if (path.isEmpty()) return false;
+    const HANDLE handle = ::CreateFileW(
+        path.value().c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    const bool valid = readHandleInfo(handle, out);
+    ::CloseHandle(handle);
+    return valid;
+}
+
+MaiFileReadHandle::MaiFileReadHandle(std::intptr_t nativeHandle, MaiFilePath path)
+    : mNativeHandle(nativeHandle), mPath(std::move(path)) {
+    mStats.openOperations = 1;
+}
+
+MaiFileReadHandle::~MaiFileReadHandle() {
+    if (mNativeHandle != -1) ::CloseHandle(reinterpret_cast<HANDLE>(mNativeHandle));
+}
+
+MaiResult<std::unique_ptr<MaiFileReadHandle>> MaiFileReadHandle::open(const MaiFilePath& path) {
+    if (path.isEmpty()) return {MaiErrorCode::InvalidInput, "empty file path"};
+    maiAssertBlockingAllowed("MaiFileReadHandle::open");
+    // 不共享删除使已验证的最后一级路径在整个分页期间不能被重命名或替换。
+    const HANDLE handle = ::CreateFileW(
+        path.value().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return lastErrorAs("cannot open file for reading");
+    MaiRegularFileInfo info;
+    if (!readHandleInfo(handle, info)) {
+        ::CloseHandle(handle);
+        return {MaiErrorCode::InvalidInput, "reading requires a non-link regular file"};
+    }
+    return std::unique_ptr<MaiFileReadHandle>(
+        new MaiFileReadHandle(reinterpret_cast<std::intptr_t>(handle), path));
+}
+
+MaiResult<MaiRegularFileInfo> MaiFileReadHandle::snapshot() const {
+    MaiRegularFileInfo info;
+    if (!readHandleInfo(reinterpret_cast<HANDLE>(mNativeHandle), info))
+        return {MaiErrorCode::InvalidInput, "cannot query the opened regular file"};
+    return info;
+}
+
+MaiError MaiFileReadHandle::validate(const MaiRegularFileInfo& expected) const {
+    const auto current = snapshot();
+    if (!current) return current.error();
+    const auto& actual = current.value();
+    // 原生句柄不共享删除，路径替换由 Windows 在持有期间拒绝；再检查原路径存在，
+    // 使父目录被外部改名等路径失效也不能作为成功分页交付。
+    if (expected.bytes != actual.bytes || expected.modified != actual.modified ||
+        expected.identity != actual.identity || !MaiFileSystem::exists(mPath) ||
+        MaiFileSystem::isSymbolicLink(mPath))
+        return {MaiErrorCode::InvalidInput, "file changed during reading; restart the read"};
+    return {};
+}
+
+MaiFileReadStats MaiFileReadHandle::stats() const {
+    return mStats;
+}
+
+MaiError MaiFileReadHandle::readAt(std::uint64_t offset, std::uint64_t maxBytes,
+                                   std::string& contents, bool* eof) {
+    contents.clear();
+    if (eof) *eof = false;
+    if (maxBytes == 0 || maxBytes > 1024 * 1024 ||
+        offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - maxBytes)
+        return {MaiErrorCode::InvalidInput, "invalid file range"};
+    maiAssertBlockingAllowed("MaiFileReadHandle::readAt");
+    LARGE_INTEGER position{};
+    position.QuadPart = static_cast<LONGLONG>(offset);
+    if (!::SetFilePointerEx(reinterpret_cast<HANDLE>(mNativeHandle), position, nullptr, FILE_BEGIN))
+        return lastErrorAs("cannot seek file range");
+    std::string bytes(static_cast<std::size_t>(maxBytes), '\0');
+    std::size_t done = 0;
+    while (done < bytes.size()) {
+        DWORD got = 0;
+        const auto chunk =
+            static_cast<DWORD>(std::min<std::size_t>(64 * 1024, bytes.size() - done));
+        ++mStats.readOperations;
+        if (!::ReadFile(reinterpret_cast<HANDLE>(mNativeHandle), bytes.data() + done, chunk, &got,
+                        nullptr))
+            return lastErrorAs("cannot read file range");
+        mStats.bytesRead += got;
+        if (got == 0) {
+            if (eof) *eof = true;
+            break;
+        }
+        done += got;
+    }
+    bytes.resize(done);
+    contents = std::move(bytes);
+    return {};
 }
 
 MaiError MaiFileSystem::readFile(const MaiFilePath& path, std::string& contents,
@@ -218,6 +311,20 @@ MaiError MaiFileSystem::readFile(const MaiFilePath& path, std::string& contents,
     contents.resize(static_cast<std::size_t>(done));
     ::CloseHandle(handle);
     return {};
+}
+
+MaiError MaiFileSystem::readFileRange(const MaiFilePath& path, std::uint64_t offset,
+                                      std::uint64_t maxBytes, std::string& contents) {
+    contents.clear();
+    auto opened = MaiFileReadHandle::open(path);
+    if (!opened) return opened.error();
+    const auto before = opened.value()->snapshot();
+    if (!before) return before.error();
+    const auto error = opened.value()->readAt(offset, maxBytes, contents);
+    if (error) return error;
+    const auto validated = opened.value()->validate(before.value());
+    if (validated) contents.clear();
+    return validated;
 }
 
 MaiError MaiFileSystem::writeFile(const MaiFilePath& path, const std::string& contents) {
@@ -292,7 +399,8 @@ MaiError MaiFileSystem::createDirectories(const MaiFilePath& path) {
 }
 
 void MaiFileSystem::walk(const MaiFilePath& root,
-                         const std::function<MaiWalkAction(const MaiFileEntry&)>& visit) {
+                         const std::function<MaiWalkAction(const MaiFileEntry&)>& visit,
+                         const std::function<void(const MaiFilePath&, const MaiError&)>& onError) {
     if (root.isEmpty() || !visit) return;
 
     // 自己维护待遍历队列，不用递归：目录树可能很深，
@@ -310,7 +418,17 @@ void MaiFileSystem::walk(const MaiFilePath& root,
         const HANDLE handle =
             ::FindFirstFileExW(pattern.value().c_str(), FindExInfoBasic, &data,
                                FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
-        if (handle == INVALID_HANDLE_VALUE) continue;  // 没权限之类，跳过这个目录
+        if (handle == INVALID_HANDLE_VALUE) {
+            const DWORD saved = ::GetLastError();
+            // FindFirstFile 在正常空目录返回 FILE_NOT_FOUND；须另查目录仍存在，
+            // 不能把已消失或无权访问的目录也误报为成功扫描。
+            const bool empty = (saved == ERROR_FILE_NOT_FOUND || saved == ERROR_NO_MORE_FILES) &&
+                               isDirectory(directory);
+            if (!empty && onError)
+                onError(directory,
+                        {toErrorCode(saved), "cannot enumerate directory: " + describe(saved)});
+            continue;
+        }
 
         do {
             const std::wstring name = data.cFileName;
@@ -336,7 +454,11 @@ void MaiFileSystem::walk(const MaiFilePath& root,
             pending.push_back(entry.path);
         } while (::FindNextFileW(handle, &data));
 
+        const DWORD saved = ::GetLastError();
         ::FindClose(handle);
+        if (saved != ERROR_NO_MORE_FILES && onError)
+            onError(directory,
+                    {toErrorCode(saved), "directory enumeration failed: " + describe(saved)});
     }
 }
 

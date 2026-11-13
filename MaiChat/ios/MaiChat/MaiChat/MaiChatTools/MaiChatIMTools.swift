@@ -197,43 +197,106 @@ extension AIMobileHostToolProvider {
         return jsonSuccess(["conversations": conversations, "count": conversations.count])
     }
 
-    func getMessages(
-        appState: RemoteIMAppState,
-        arguments: [String: Any]
-    ) async -> AIMaiChatHostToolExecution {
-        let peerID = Self.string(arguments, key: "peer_id")
-        guard Self.hasContact(appState, peerID: peerID) else {
-            return .failure(code: "invalid_input", message: "peer_id is not a MaiChat contact")
-        }
-        let messages = await appState.messagesForHostTool(
-            peerUserID: peerID,
-            limit: Self.boundedLimit(arguments)
-        )
-        let values = messages.map { Self.messageJSON($0, peerID: peerID, includeImagePath: true) }
-        return Self.jsonSuccess(["peer_id": peerID, "messages": values, "count": values.count])
+    func getMessages(appState: RemoteIMAppState, arguments: [String: Any], deadline: UInt64? = nil,
+        admission: LocalChatMessageQueryAdmission.Lease? = nil) async -> AIMaiChatHostToolExecution {
+        await persistedIMPage(appState: appState, arguments: arguments, search: false, deadline: deadline, admission: admission)
     }
 
-    func searchMessages(
-        appState: RemoteIMAppState,
-        arguments: [String: Any]
-    ) async -> AIMaiChatHostToolExecution {
-        let query = Self.string(arguments, key: "query")
-        let peerID = Self.string(arguments, key: "peer_id")
-        guard !query.isEmpty else {
-            return .failure(code: "invalid_input", message: "query is required")
+    func searchMessages(appState: RemoteIMAppState, arguments: [String: Any], deadline: UInt64? = nil,
+        admission: LocalChatMessageQueryAdmission.Lease? = nil) async -> AIMaiChatHostToolExecution {
+        await persistedIMPage(appState: appState, arguments: arguments, search: true, deadline: deadline, admission: admission)
+    }
+
+    // 参数只选择当前账号的持久数据；不信任模型提供 owner/SDK 或数据库路径。
+    private func persistedIMPage(appState: RemoteIMAppState, arguments: [String: Any],
+        search: Bool, deadline: UInt64?, admission: LocalChatMessageQueryAdmission.Lease?) async -> AIMaiChatHostToolExecution {
+        do {
+            guard let admission = admission ?? appState.persistedIMQueryAdmission.capture() else {
+                throw LocalChatMessageQueryError.unavailable
+            }
+            try appState.validatePersistedIMQueryAdmission(admission)
+            var allowed: Set<String> = ["peer_id", "limit", "kind", "direction", "since_ms", "until_ms", "cursor"]
+            if search { allowed.insert("query") }
+            guard Set(arguments.keys).isSubset(of: allowed) else {
+                throw LocalChatMessageQueryError.invalid("Unknown local IM query parameter.")
+            }
+            func string(_ key: String) throws -> String {
+                guard let raw = arguments[key] else { return "" }
+                guard let text = raw as? String else {
+                    throw LocalChatMessageQueryError.invalid(key + " must be a string.")
+                }
+                return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            func integer(_ key: String, strings: Bool) throws -> Int64? {
+                guard let raw = arguments[key] else { return nil }
+                if strings, let text = raw as? String {
+                    let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let digits = value.hasPrefix("-") ? value.dropFirst() : Substring(value)
+                    guard !digits.isEmpty, value.utf8.count <= 20,
+                          digits.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }), let result = Int64(value) else {
+                        throw LocalChatMessageQueryError.invalid(key + " must be integer milliseconds.")
+                    }
+                    return result
+                }
+                guard let number = raw as? NSNumber,
+                      CFGetTypeID(number) != CFBooleanGetTypeID() else {
+                    throw LocalChatMessageQueryError.invalid(key + " must be an integer.")
+                }
+                let type = String(cString: number.objCType)
+                if ["q", "i", "s", "l", "c"].contains(type) { return number.int64Value }
+                if ["Q", "I", "S", "L", "C"].contains(type), number.uint64Value <= UInt64(Int64.max) {
+                    return Int64(number.uint64Value)
+                }
+                let value = number.doubleValue
+                guard value.isFinite, value.rounded() == value, abs(value) <= 9_007_199_254_740_991 else {
+                    throw LocalChatMessageQueryError.invalid(key + " must be an exactly represented integer.")
+                }
+                return Int64(value)
+            }
+            let peer = try string("peer_id")
+            guard search || !peer.isEmpty else { throw LocalChatMessageQueryError.invalid("peer_id is required.") }
+            let query = search ? try string("query") : nil
+            var filters = LocalChatMessageFilters(query: query, peerID: peer,
+                kind: try string("kind"), direction: try string("direction"),
+                sinceMS: try integer("since_ms", strings: true), untilMS: try integer("until_ms", strings: true))
+            filters = try filters.normalized()
+            let limit = min(max(try integer("limit", strings: false) ?? 50, 1), 200)
+            let cursor = try string("cursor")
+            let identity = appState.persistedIMQueryIdentity
+            let page = try await appState.queryPersistedIMMessages(LocalChatMessageQuery(
+                filters: filters, limit: Int(limit), cursor: cursor.isEmpty ? nil : cursor,
+                deadlineUptimeNanoseconds: deadline), admission: admission)
+            // 只序列化持久化的七字段，不初始化 Agent、不触碰媒体文件或工作区。
+            let normalizedFilters = filters
+            let encoded = try await RemoteIMBackgroundWork.parse {
+                let values: [[String: Any]] = page.hits.map { hit in
+                    ["id": hit.id, "peer_id": hit.peerUserID, "sender_id": hit.senderID,
+                     "text": hit.text, "kind": hit.kind, "direction": hit.direction,
+                     "created_at_ms": String(hit.createdAtMilliseconds)]
+                }
+                var result: [String: Any] = [
+                    search ? "matches" : "messages": values,
+                    "count": values.count, "limit": page.limit, "has_more": page.hasMore,
+                    "next_cursor": page.nextCursor.map { $0 as Any } ?? NSNull(),
+                    "coverage": "local_persisted", "local_available": true,
+                    "cloud_history_complete": false, "snapshot": false,
+                    "scope": "direct", "order": "created_at_ms_desc_id_desc"
+                ]
+                if search { result["query"] = normalizedFilters.query! } else { result["peer_id"] = peer }
+                if page.isFirstPage && page.hits.isEmpty { result["no_matches"] = true }
+                return String(decoding: try JSONSerialization.data(withJSONObject: result), as: UTF8.self)
+            }
+            try Task.checkCancellation()
+            try appState.validatePersistedIMQueryAdmission(admission)
+            guard appState.persistedIMQueryIdentity == identity else { throw LocalChatMessageQueryError.changed }
+            return .success(encoded)
+        } catch is CancellationError {
+            return .failure(code: "canceled", message: "The local IM query was canceled.")
+        } catch let error as LocalChatMessageQueryError {
+            return .failure(code: error.code, message: error.message)
+        } catch {
+            return .failure(code: "internal", message: "Local persisted IM query failed.")
         }
-        if !peerID.isEmpty, !Self.hasContact(appState, peerID: peerID) {
-            return .failure(code: "invalid_input", message: "peer_id is not a MaiChat contact")
-        }
-        let limit = Self.boundedLimit(arguments)
-        let hits = Array(await appState.searchMessages(query, limit: 200)
-            .filter { peerID.isEmpty || $0.peerUserID == peerID }
-            .prefix(limit))
-        appState.chatState.mergeMessages(hits.map(\.message))
-        let values = hits.map {
-            Self.messageJSON($0.message, peerID: $0.peerUserID, includeImagePath: true)
-        }
-        return Self.jsonSuccess(["query": query, "matches": values, "count": values.count])
     }
 
     static func unreadSummary(appState: RemoteIMAppState) -> AIMaiChatHostToolExecution {

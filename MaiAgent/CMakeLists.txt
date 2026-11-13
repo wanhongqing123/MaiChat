@@ -390,6 +390,9 @@ add_library(maiagent STATIC
   # 按平台各一份。形状参考 chromium 的 base/files。
   Agent/MaiBlockingCheck.cpp
   Agent/MaiFilePath.cpp
+  # 普通读取/搜索 API 与工具适配器共用；不经 shell、Qt 或模型协议调用。
+  Agent/MaiTextFileReader.cpp
+  Agent/MaiFileSearch.cpp
   Agent/MaiAppStorage.cpp
   AgentTools/MaiPathGuard.cpp
   AgentTools/MaiTool.cpp
@@ -530,7 +533,8 @@ else()
   target_link_libraries(maiagent PRIVATE OpenSSL::Crypto)
 endif()
 if(APPLE)
-  target_link_libraries(maiagent PRIVATE iconv)
+  # 系统 iconv 的 GB18030 表在部分 Apple 版本缺补充平面；严格 CF 回退共用平台解码后端。
+  target_link_libraries(maiagent PRIVATE iconv "-framework CoreFoundation")
 endif()
 
 # qpdf 头不进入公开 API；生成器和普通调用共同使用这一份密码保护实现。
@@ -606,6 +610,8 @@ if(MAIAGENT_BUILD_TESTS)
       MaiInputQueueTests    # 所属端持续接收、收尾排队、幂等与普通/工具入口
       MaiSessionRenameTests # 当前会话改名、普通入口、显式命名与持久化
       MaiFilePathTests      # 路径词法 + 文件系统（走系统 API，不用 std::filesystem）
+      MaiTextFileReaderTests # 单句柄流式分页、真实 EOF、编码和字节游标
+      MaiFileSearchTests    # 热目录快照、完整行检索、安全正则和可续页结果
       MaiStoreTests         # 存储契约：内存和 SQLite 行为必须一致
       MaiToolOutputStoreTests # 会话输出的保留、分页、配额及重开恢复
       MaiToolOutputReadTests # 原命令只执行一次，模型补读及重开后尾部恢复
@@ -657,6 +663,18 @@ if(MAIAGENT_BUILD_TESTS)
     endif()
     add_test(NAME ${test_name} COMMAND ${test_name})
   endforeach()
+  # 直接使用正常 factory + 当前 Qwen 模板/grammar，不加载权重或执行推理。
+  # 不能只验 JSON Schema 合法：根 union 在 XML 模板中会丢掉所有参数。
+  add_executable(MaiFileToolSchemaTests tests/MaiFileToolSchemaTests.cpp)
+  target_link_libraries(MaiFileToolSchemaTests PRIVATE maiagent mai_llama_chat)
+  target_include_directories(MaiFileToolSchemaTests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/common"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/vendor")
+  target_compile_definitions(MaiFileToolSchemaTests PRIVATE
+    MAI_AGENT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(NAME MaiFileToolSchemaTests COMMAND MaiFileToolSchemaTests)
   if(WIN32)
     # 纯像素/时间与失效资源契约，不读取实际桌面像素。
     add_executable(MaiDesktopDuplicationTests tests/MaiDesktopDuplicationTests.cpp)

@@ -71,6 +71,10 @@ public final class RemoteIMSessionController {
 
     public interface AccountTask { void cancel(); }
 
+    public interface MessageHistoryCompletion {
+        void onFinished(RemoteIMMessageHistory.Page page, String error);
+    }
+
     public interface CodeCompletion {
         void onFinished(String challengeId, String error);
     }
@@ -118,6 +122,23 @@ public final class RemoteIMSessionController {
     private volatile int accountGeneration;
     private volatile MaiChatAcceptedAccountCleanup.Pending acceptedAccountDeletion;
     private final java.util.Set<AccountRequest> accountRequests = new java.util.HashSet<>();
+    private final java.util.Set<MessageHistoryRequest> messageHistoryRequests = new java.util.HashSet<>();
+    // 历史查询不能排在网络、上传或媒体任务后；队列有界，每次请求同时限制排队和 SQL 时间。
+    private static final long MESSAGE_HISTORY_TIMEOUT_MS = 5_000L;
+    private static final java.util.concurrent.ScheduledThreadPoolExecutor MESSAGE_HISTORY_TIMEOUTS =
+        createMessageHistoryTimeouts();
+
+    private static java.util.concurrent.ScheduledThreadPoolExecutor createMessageHistoryTimeouts() {
+        // 全进程只保留一个独立时钟；主线程繁忙时仍能取消 SQLite 和清除排队任务。
+        java.util.concurrent.ScheduledThreadPoolExecutor timers = new java.util.concurrent.ScheduledThreadPoolExecutor(1,
+            action -> { Thread thread = new Thread(action, "MaiChat-HistoryTimeout"); thread.setDaemon(true); return thread; });
+        timers.setRemoveOnCancelPolicy(true);
+        return timers;
+    }
+
+    private final java.util.concurrent.ThreadPoolExecutor messageHistoryExecutor =
+        new java.util.concurrent.ThreadPoolExecutor(1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+            new java.util.concurrent.ArrayBlockingQueue<>(8));
     // 由主线程保留到 SDK 回执或超时；上传 worker 返回不代表头像资料写入已经结束。
     private AccountRequest avatarRequest;
     private volatile String selfAvatarUrl;
@@ -601,6 +622,123 @@ public final class RemoteIMSessionController {
     private void cancelAccountRequests() {
         for (AccountRequest request : new ArrayList<>(accountRequests))
             request.cancelOnMain("登录账号已变化，请重新操作");
+        for (MessageHistoryRequest request : new ArrayList<>(messageHistoryRequests))
+            request.reject("登录账号已变化，请重新操作");
+    }
+
+    /** 普通业务与 Agent 共用：主线程捕获账号，独立 worker 查询，主线程校验后交付。 */
+    public AccountTask queryPersistedMessages(RemoteIMMessageHistory.Query query,
+            MessageHistoryCompletion completion) {
+        return queryPersistedMessages(query, () -> true, completion);
+    }
+
+    public AccountTask queryPersistedMessages(RemoteIMMessageHistory.Query query,
+            java.util.function.BooleanSupplier scope, MessageHistoryCompletion completion) {
+        MessageHistoryRequest request = new MessageHistoryRequest(query, scope, completion);
+        // 在主线程交接前计时，普通代码调用也不能依靠 Agent 的七秒等待来兜底。
+        request.timeoutFuture = MESSAGE_HISTORY_TIMEOUTS.schedule(
+            () -> request.reject("本机消息查询超时"), MESSAGE_HISTORY_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        runHistoryCompletion(() -> {
+            if (request.finished.get()) return;
+            if (request.cancellation.isCanceled()) { request.finish(null, "本机消息查询已取消"); return; }
+            if (destroyed || requiresLogin() || historyStore == null || !scope.getAsBoolean()) {
+                request.finish(null, "本机消息数据库或登录账号不可用"); return;
+            }
+            request.owner = settings.loginUserId();
+            request.loginScope = messageHistoryLoginScope();
+            messageHistoryRequests.add(request);
+            long remaining = request.deadline - android.os.SystemClock.uptimeMillis();
+            if (remaining <= 0) { request.reject("本机消息查询超时"); return; }
+            try {
+                request.future = messageHistoryExecutor.submit(() -> {
+                    if (!request.current()) { request.reject("登录账号已变化或查询已取消"); return; }
+                    try {
+                        RemoteIMMessageHistory.Page page = historyStore.queryMessages(request.owner,
+                            request.loginScope, query, request.cancellation);
+                        runHistoryCompletion(() -> request.finish(page, null));
+                    } catch (IllegalArgumentException invalid) {
+                        request.reject("消息筛选或分页游标无效");
+                    } catch (android.os.OperationCanceledException canceled) {
+                        request.reject("本机消息查询已取消");
+                    } catch (Exception failure) {
+                        // 数据库异常不能成为成功的空结果，也不能把 SQL/消息内容写入日志。
+                        request.reject("本机消息数据库查询失败");
+                    }
+                });
+            } catch (java.util.concurrent.RejectedExecutionException busy) {
+                request.reject("本机消息查询繁忙，请稍后重试");
+            }
+        });
+        return request;
+    }
+
+    private String messageHistoryLoginScope() {
+        return accountGeneration + ":" + (authClient == null ? -1 : authClient.accountSessionGeneration());
+    }
+
+    /** 保留页面供普通业务使用时也可检查账号；不读取可变的聊天窗口或联系人缓存。 */
+    public boolean isMessageHistoryCurrent(RemoteIMMessageHistory.Page page) {
+        return page != null && !destroyed && !requiresLogin() && page.owner.equals(settings.loginUserId())
+            && page.loginScope.equals(messageHistoryLoginScope()) && historyStore != null
+            && historyStore.isMessageHistoryCurrent(page);
+    }
+
+    private void runHistoryCompletion(Runnable completion) {
+        // 销毁和取消仍须结束等待者；runOnMain 的 destroyed 丢弃规则不适用于只读查询清理。
+        if (mainHandler == null || Looper.myLooper() == Looper.getMainLooper()) completion.run();
+        else mainHandler.post(completion);
+    }
+
+    private final class MessageHistoryRequest implements AccountTask {
+        final android.os.CancellationSignal cancellation = new android.os.CancellationSignal();
+        final java.util.concurrent.atomic.AtomicBoolean finished = new java.util.concurrent.atomic.AtomicBoolean();
+        final java.util.function.BooleanSupplier scope;
+        final MessageHistoryCompletion completion;
+        final long deadline = android.os.SystemClock.uptimeMillis() + MESSAGE_HISTORY_TIMEOUT_MS;
+        volatile java.util.concurrent.ScheduledFuture<?> timeoutFuture;
+        volatile java.util.concurrent.Future<?> future;
+        volatile String owner, loginScope;
+
+        MessageHistoryRequest(RemoteIMMessageHistory.Query query,
+                java.util.function.BooleanSupplier scope, MessageHistoryCompletion completion) {
+            if (query == null || scope == null || completion == null)
+                throw new IllegalArgumentException("History query and completion are required");
+            this.scope = scope; this.completion = completion;
+        }
+
+        boolean current() {
+            return !finished.get() && !cancellation.isCanceled() && !destroyed && !requiresLogin()
+                && android.os.SystemClock.uptimeMillis() < deadline && scope.getAsBoolean()
+                && owner != null && owner.equals(settings.loginUserId())
+                && loginScope.equals(messageHistoryLoginScope());
+        }
+
+        void finish(RemoteIMMessageHistory.Page page, String error) {
+            if (error == null && (!current() || !isMessageHistoryCurrent(page)))
+                error = "登录账号或数据库已变化，或查询已超时";
+            if (!finished.compareAndSet(false, true)) return;
+            cancelTimeout();
+            messageHistoryRequests.remove(this);
+            completion.onFinished(error == null ? page : null, error);
+        }
+
+        void reject(String error) {
+            cancelTimeout();
+            cancellation.cancel();
+            java.util.concurrent.Future<?> task = future;
+            if (task != null) {
+                task.cancel(true);
+                if (task instanceof Runnable) messageHistoryExecutor.remove((Runnable) task);
+            }
+            runHistoryCompletion(() -> finish(null, error));
+        }
+
+        void cancelTimeout() {
+            java.util.concurrent.ScheduledFuture<?> timer = timeoutFuture;
+            if (timer != null) { timer.cancel(false); timeoutFuture = null; }
+        }
+
+        @Override public void cancel() { reject("本机消息查询已取消"); }
     }
 
     private void releaseAvatarRequest(AccountRequest request) {
@@ -2237,6 +2375,7 @@ public final class RemoteIMSessionController {
         }
         if (remoteDesktop != null) remoteDesktop.destroy();
         destroyed = true;
+        messageHistoryExecutor.shutdownNow();
         client.destroy();
         ioExecutor.execute(historyStore::close);
         ioExecutor.shutdown();

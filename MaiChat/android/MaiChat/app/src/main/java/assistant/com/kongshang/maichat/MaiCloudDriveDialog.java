@@ -66,7 +66,7 @@ final class MaiCloudDriveDialog {
     private boolean embedded;
     private LinearLayout page, uploads, library;
     private TextView quota, quotaNote, status;
-    private View upload, back;
+    private View back;
     private Button next;
     private ProgressBar progress, quotaProgress;
     private String cursor = "";
@@ -202,13 +202,7 @@ final class MaiCloudDriveDialog {
             Gravity.START | Gravity.CENTER_VERTICAL);
         backParams.leftMargin = dp(10);
         bar.addView(back, backParams);
-        upload = symbolButton(MaiChatSymbolView.Symbol.PLUS, "云盘更多操作", this::showAddMenu);
-        upload.setBackground(MaiChatTheme.bordered(Color.WHITE,
-            Color.rgb(232, 232, 236), 22, activity));
-        FrameLayout.LayoutParams addParams = new FrameLayout.LayoutParams(dp(44), dp(44),
-            Gravity.END | Gravity.CENTER_VERTICAL);
-        addParams.rightMargin = dp(18);
-        bar.addView(upload, addParams);
+        // 根目录和文件夹顶栏都仅保留导航；既有 Agent 能力及其他媒体操作独立保留。
         updateNavigation();
         return bar;
     }
@@ -379,15 +373,13 @@ final class MaiCloudDriveDialog {
                     "文件夹已不存在，请返回上级或根目录" : MaiCloudDrive.errorText(result);
                 setStatus(listError);
                 if (quota.getText().length() == 0) quota.setText("暂不可用");
-                upload.setEnabled(result.httpStatus != 404 || !directory.currentId().isEmpty());
                 next.setText("重试");
-                // 根目录尚未开通时仍保留重试；加号会被禁用，不能依赖其中的刷新菜单恢复。
+                // 手动添加菜单已移除，尚未开通或暂时失败时仍保留独立重试。
                 next.setVisibility(View.VISIBLE);
                 renderMedia(requestGeneration);
                 loadUploads(requestGeneration);
                 return;
             }
-            upload.setEnabled(true);
             JSONObject body = result.json();
             JSONObject usage = body.optJSONObject("quota");
             if (usage != null) {
@@ -435,25 +427,6 @@ final class MaiCloudDriveDialog {
             return;
         }
         refresh();
-    }
-
-    private void showAddMenu() {
-        PopupMenu menu = new PopupMenu(activity, upload);
-        menu.getMenu().add(directory.currentId().isEmpty() ? "上传图片或视频" :
-            "上传图片或视频到根目录").setOnMenuItemClickListener(item -> {
-                activity.pickCloudDriveMedia(this);
-                return true;
-            });
-        menu.getMenu().add("新建文件夹").setEnabled(!loading && !folderLoading)
-            .setOnMenuItemClickListener(item -> {
-                promptName("新建文件夹", "", name -> mutate("正在创建文件夹…",
-                    done -> folderClient.createFolder(name, directory.currentId(), done)));
-                return true;
-            });
-        menu.getMenu().add("刷新云盘").setOnMenuItemClickListener(item -> {
-            refresh(); return true;
-        });
-        menu.show();
     }
 
     private View folderRow(JSONObject folder) {
@@ -574,12 +547,10 @@ final class MaiCloudDriveDialog {
         if (!canEdit()) return;
         int expected = generation;
         saving = true;
-        upload.setEnabled(false);
         setStatus(message);
         operation.accept(result -> {
             if (!live(expected)) return;
             saving = false;
-            upload.setEnabled(true);
             if (!result.ok()) { setStatus(MaiCloudDrive.errorText(result)); return; }
             refresh();
         });
@@ -660,7 +631,6 @@ final class MaiCloudDriveDialog {
         try {
             File checkpoint = resumeCheckpoint == null ? client.newCheckpoint() : resumeCheckpoint;
             uploading = true;
-            upload.setEnabled(false);
             progress.setVisibility(View.VISIBLE);
             progress.setProgress(0);
             setStatus("准备上传 " + source.name + "…");
@@ -668,7 +638,6 @@ final class MaiCloudDriveDialog {
                 client.cancel();
                 setStatus("已暂停，可稍后续传");
                 uploading = false;
-                upload.setEnabled(true);
                 progress.setVisibility(View.GONE);
                 refresh();
             });
@@ -686,7 +655,6 @@ final class MaiCloudDriveDialog {
                 if (!isShowing()) return;
                 uploading = false;
                 progress.setVisibility(View.GONE);
-                upload.setEnabled(true);
                 if (result.ok()) {
                     new File(checkpoint.getAbsolutePath() + ".source").delete();
                     setStatus("已保存到我的云盘");
@@ -1071,7 +1039,7 @@ final class MaiCloudDriveDialog {
         button.setMinimumHeight(0);
         button.setElevation(0);
         button.setStateListAnimator(null);
-        boolean primary = title.equals("上传图片或视频") || title.equals("继续上传");
+        boolean primary = title.equals("继续上传");
         boolean destructive = title.equals("删除") || title.equals("放弃");
         button.setTextColor(primary ? Color.WHITE :
             destructive ? MaiChatTheme.RED : MaiChatTheme.BLUE_DARK);

@@ -974,7 +974,7 @@ struct MaiCloudDriveUITestRoot: View {
 #endif
 
 #if targetEnvironment(simulator)
-// 样本上传按钮只属于本机验收，正式云盘保留普通上传入口。
+// 样本上传按钮只属于本机验收；正式云盘的上传由 Agent 复用普通 model API 发起。
 struct MaiCloudDriveUITestToolbar: ToolbarContent {
     @ObservedObject var model: MaiCloudDriveModel
     @ObservedObject var appState: RemoteIMAppState

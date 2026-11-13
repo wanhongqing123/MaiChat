@@ -581,6 +581,31 @@ public:
     bool requiresPerCallApproval(const std::string&) const override { return mApproval; }
     MaiToolResult execute(const std::string& argumentsJson,
                           const MaiToolContext& context) override {
+        // 两个历史查询只读取账号持久化记录，不触发媒体导出或 UI 状态变化。
+        // 宿主内部有独立 reader/deadline；同步 ABI 暂不能传递即时 interrupt，
+        // 因而必须在跨宿主前后都核取消，避免停止后仍把过期查询结果当作成功。
+        if (mName == "maichat_search_messages" || mName == "maichat_get_messages") {
+            const auto observed = [](MaiToolResult result, bool started) {
+                MaiToolExecution execution;
+                execution.started = started;
+                execution.effectStatus = MaiToolEffectStatus::None;
+                execution.canceled = result.error().code() == MaiErrorCode::Canceled;
+                execution.status = execution.canceled ? MaiToolExecutionStatus::Canceled
+                    : result.hasError() ? MaiToolExecutionStatus::Failed
+                                        : MaiToolExecutionStatus::Completed;
+                if (result.error().code() == MaiErrorCode::InvalidInput)
+                    execution.nextAction = MaiToolNextAction::ReviseArguments;
+                return result.withExecution(std::move(execution));
+            };
+            if (context.isCanceled())
+                return observed(MaiToolResult::failure(MaiErrorCode::Canceled,
+                                                       "message history query was canceled"), false);
+            MaiToolResult result = mDispatcher->call(mName, argumentsJson);
+            if (context.isCanceled())
+                return observed(MaiToolResult::failure(MaiErrorCode::Canceled,
+                                                       "message history query was canceled"), true);
+            return observed(std::move(result), true);
+        }
         // 相册导出的 id 与工作区路径属于不同参数域；只在文件确实位于本工作区时拒绝。
         // 不扫描目录、不探测越界文件，也不替模型自动选择或执行另一个工具。
         if ((mName == "mobile_export_photo_original" || mName == "mobile_export_media_original") &&
@@ -1066,15 +1091,27 @@ void registerMaiChatHostTools(MaiToolRegistry& tools,
         // 会话按最新消息排序；limit 只限制返回条数，未读数来自会话记录。
         R"({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":200}}})");
     add("maichat_get_messages",
-        "Read recent messages in a MaiChat conversation with a specific contact.",
-        // peer_id 必须是指定联系人；limit 限这一次读取的最近消息条数。
-        R"({"type":"object","properties":{"peer_id":{"type":"string"},"limit":{"type":"integer","minimum":1,)"
-            R"("maximum":200}},"required":["peer_id"]})");
+        "Page local persisted direct IM messages for one contact, newest first. "
+        "Reuse next_cursor with the same filters for more; this is not cloud-wide history.",
+        // 页大小不是历史窗口；peer/time/kind/direction 在持久化查询内先过滤，再取这一页。
+        R"({"type":"object","properties":{"peer_id":{"type":"string"},)"
+            R"("limit":{"type":"integer","minimum":1,"maximum":200},)"
+            R"("kind":{"type":"string","enum":["text","image","video","voice","file"]},)"
+            R"("direction":{"type":"string","enum":["incoming","outgoing"]},)"
+            R"("since_ms":{"oneOf":[{"type":"integer","minimum":0},{"type":"string"}]},)"
+            R"("until_ms":{"oneOf":[{"type":"integer","minimum":0},{"type":"string"}]},)"
+            R"("cursor":{"type":"string"}},"required":["peer_id"],"additionalProperties":false})");
     add("maichat_search_messages",
-        "Search MaiChat message text across all contacts or within one contact.",
-        // query 是必需的检索词；peer_id 可选，传入后只查该联系人。
+        "Search local persisted direct IM text across contacts or within peer_id, newest first. "
+        "Reuse next_cursor with the same filters for more; DB errors are not no matches.",
+        // 不读当前 UI 缓存、不下载媒体；cursor 绑定查询与当前账号/数据库代际。
         R"({"type":"object","properties":{"query":{"type":"string"},"peer_id":{"type":"string"},)"
-            R"("limit":{"type":"integer","minimum":1,"maximum":200}},"required":["query"]})");
+            R"("limit":{"type":"integer","minimum":1,"maximum":200},)"
+            R"("kind":{"type":"string","enum":["text","image","video","voice","file"]},)"
+            R"("direction":{"type":"string","enum":["incoming","outgoing"]},)"
+            R"("since_ms":{"oneOf":[{"type":"integer","minimum":0},{"type":"string"}]},)"
+            R"("until_ms":{"oneOf":[{"type":"integer","minimum":0},{"type":"string"}]},)"
+            R"("cursor":{"type":"string"}},"required":["query"],"additionalProperties":false})");
     add("maichat_get_unread_summary", "Summarize unread MaiChat messages by contact.",
         // 不收参数，按联系人汇总未读消息。
         R"({"type":"object","properties":{}})");

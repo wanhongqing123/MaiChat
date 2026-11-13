@@ -18,7 +18,7 @@ import com.kongshang.maichat.RemoteIMContact;
 import com.kongshang.maichat.RemoteIMGroup;
 import com.kongshang.maichat.RemoteIMGroupMessage;
 import com.kongshang.maichat.RemoteIMMessage;
-import com.kongshang.maichat.RemoteIMMessageSearchHit;
+import com.kongshang.maichat.RemoteIMMessageHistory;
 import com.kongshang.maichat.RemoteIMMediaPaths;
 import com.kongshang.maichat.RemoteIMMediaStore;
 import com.kongshang.maichat.RemoteIMQuote;
@@ -319,29 +319,81 @@ final class MaiChatIMTools {
         return new JSONObject().put("conversations", values).put("count", values.length());
     }
 
-    private JSONObject hostGetMessages(JSONObject arguments) throws JSONException {
-        String peer = arguments.optString("peer_id").trim();
-        if (peer.isEmpty()) throw new IllegalArgumentException("peer_id 不能为空");
-        List<RemoteIMMessage> all = session.chatState().messagesWith(peer);
-        int begin = Math.max(0, all.size() - hostToolLimit(arguments));
-        JSONArray values = new JSONArray();
-        for (int index = begin; index < all.size(); index += 1)
-            values.put(hostMessageJson(all.get(index), peer, true));
-        return new JSONObject().put("peer_id", peer).put("messages", values)
-            .put("count", values.length());
+    private JSONObject hostGetMessages(JSONObject arguments) throws Exception {
+        if (arguments.has("query")) throw new IllegalArgumentException("get_messages 不接受 query");
+        return hostPersistedMessages(arguments, false);
     }
 
-    private JSONObject hostSearchMessages(JSONObject arguments) throws JSONException {
-        String query = arguments.optString("query").trim();
-        String peer = arguments.optString("peer_id").trim();
-        if (query.isEmpty()) throw new IllegalArgumentException("query 不能为空");
-        JSONArray values = new JSONArray();
-        for (RemoteIMMessageSearchHit hit : session.searchMessages(query, hostToolLimit(arguments))) {
-            if (!peer.isEmpty() && !peer.equals(hit.peerUserId())) continue;
-            values.put(hostMessageJson(hit.message(), hit.peerUserId(), true));
+    private JSONObject hostSearchMessages(JSONObject arguments) throws Exception {
+        return hostPersistedMessages(arguments, true);
+    }
+
+    private JSONObject hostPersistedMessages(JSONObject arguments, boolean search) throws Exception {
+        if (Looper.myLooper() == Looper.getMainLooper())
+            throw new IllegalStateException("本机消息查询不能阻塞界面线程");
+        String peer = historyString(arguments, "peer_id");
+        String text = search ? historyString(arguments, "query") : null;
+        Long rawLimit = historyInteger(arguments, "limit", false);
+        if (rawLimit != null && rawLimit < 1) throw new IllegalArgumentException("limit 必须大于零");
+        RemoteIMMessageHistory.Query query = new RemoteIMMessageHistory.Query(peer, text,
+            rawLimit == null ? 50 : (int) Math.min(200L, rawLimit), historyString(arguments, "kind"),
+            historyString(arguments, "direction"), historyInteger(arguments, "since_ms", true),
+            historyInteger(arguments, "until_ms", true), historyString(arguments, "cursor"));
+        java.util.function.BooleanSupplier scope = arguments.has("_account_im_user_id")
+            ? accountScope(arguments) : () -> true;
+        CountDownLatch completed = new CountDownLatch(1);
+        AtomicReference<RemoteIMMessageHistory.Page> result = new AtomicReference<>();
+        AtomicReference<String> error = new AtomicReference<>();
+        RemoteIMSessionController.AccountTask task = session.queryPersistedMessages(query, scope, (page, failure) -> {
+            result.set(page); error.set(failure); completed.countDown();
+        });
+        try {
+            // 包含主线程交接、数据库排队和执行；超时取消 SQLite，不能无限等待 CountDownLatch。
+            if (!completed.await(7, TimeUnit.SECONDS)) throw new IllegalStateException("本机消息查询超时");
+            if (error.get() != null) throw new IllegalStateException(error.get());
+            RemoteIMMessageHistory.Page page = result.get();
+            if (!scope.getAsBoolean() || !session.isMessageHistoryCurrent(page))
+                throw new IllegalStateException("登录账号已变化");
+            JSONArray values = new JSONArray();
+            // 持久化查询只序列化已有字段，图片也不能初始化 Agent、读取媒体或物化工作区文件。
+            for (RemoteIMMessageHistory.Row row : page.rows)
+                values.put(new JSONObject().put("id", row.id).put("peer_id", row.peerId)
+                    .put("sender_id", row.senderId).put("text", row.text).put("kind", row.kind)
+                    .put("direction", row.direction).put("created_at_ms", Long.toString(row.createdAtMs)));
+            if (!scope.getAsBoolean() || !session.isMessageHistoryCurrent(page))
+                throw new IllegalStateException("登录账号已变化");
+            JSONObject output = new JSONObject().put(search ? "query" : "peer_id", search ? text : peer)
+                .put(search ? "matches" : "messages", values).put("count", values.length())
+                .put("limit", query.limit).put("has_more", page.hasMore)
+                .put("next_cursor", page.nextCursor == null ? JSONObject.NULL : page.nextCursor)
+                .put("coverage", "local_persisted").put("local_available", true)
+                .put("cloud_history_complete", false).put("snapshot", false).put("scope", "direct")
+                .put("order", "created_at_ms_desc_id_desc")
+                .put("status", values.length() == 0 && query.cursor.isEmpty() ? "no_matches" : "ok");
+            return output;
+        } catch (InterruptedException canceled) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("本机消息查询已取消");
+        } finally { task.cancel(); }
+    }
+
+    private static String historyString(JSONObject input, String key) {
+        if (!input.has(key)) return "";
+        Object raw = input.opt(key);
+        if (!(raw instanceof String)) throw new IllegalArgumentException(key + " 必须是字符串");
+        return ((String) raw).trim();
+    }
+
+    private static Long historyInteger(JSONObject input, String key, boolean allowString) {
+        if (!input.has(key)) return null;
+        Object raw = input.opt(key);
+        if (raw instanceof Integer || raw instanceof Long || raw instanceof Short || raw instanceof Byte)
+            return ((Number) raw).longValue();
+        if (allowString && raw instanceof String && ((String) raw).matches("-?[0-9]+")) {
+            try { return Long.parseLong((String) raw); }
+            catch (NumberFormatException overflow) { throw new IllegalArgumentException(key + " 超出整数范围"); }
         }
-        return new JSONObject().put("query", query).put("matches", values)
-            .put("count", values.length());
+        throw new IllegalArgumentException(key + " 必须是整数毫秒或十进制字符串");
     }
 
     private JSONObject hostUnreadSummary() throws JSONException {
@@ -661,6 +713,12 @@ final class MaiChatIMTools {
 
     private JSONObject hostMessageJson(RemoteIMMessage message, String peer,
                                        boolean includeImagePath) throws JSONException {
+        return hostMessageJson(message, peer, includeImagePath,
+            includeImagePath ? AIAssistantController.initializedAccountToolOwner() : null);
+    }
+
+    private JSONObject hostMessageJson(RemoteIMMessage message, String peer,
+            boolean includeImagePath, AIAssistantController controller) throws JSONException {
         JSONObject result = new JSONObject()
             .put("id", message.id())
             .put("peer_id", peer)
@@ -671,7 +729,7 @@ final class MaiChatIMTools {
             .put("kind", MessageQuote.kind(message))
             .put("created_at_ms", message.createdAtMillis());
         if (includeImagePath) {
-            String path = imageWorkspaceReference(message);
+            String path = imageWorkspaceReference(message, controller);
             if (path != null) {
                 result.put("workspace_path", path);
                 int dot = path.lastIndexOf('.');
@@ -683,9 +741,8 @@ final class MaiChatIMTools {
         return result;
     }
 
-    private String imageWorkspaceReference(RemoteIMMessage message) {
-        if (message.imageAttachment() == null) return null;
-        AIAssistantController controller = AIAssistantController.shared(activity);
+    private String imageWorkspaceReference(RemoteIMMessage message, AIAssistantController controller) {
+        if (message.imageAttachment() == null || controller == null) return null;
         File source = controller.workspaceFile(message.imageAttachment().localPath());
         if (source == null || !source.isFile() || source.length() < 1
                 || source.length() > 20L * 1024 * 1024) return null;

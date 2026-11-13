@@ -1,6 +1,69 @@
 import XCTest
 
 final class AccountToolsUITests: XCTestCase {
+    @MainActor func testIMDatabaseRejectsRetiredNativeContextAfterAccountSwitch() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-account-tools-ui-test", "--im-group-ui-test",
+                               "--im-query-contract-ui-test"]
+        app.launchEnvironment["MAICHAT_IM_QUERY_CASE"] = "old-context"
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["account-tools-test-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 15))
+        let finished = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label BEGINSWITH 'PASS IM QUERY' OR label BEGINSWITH 'FAIL IM QUERY'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 15), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS IM QUERY"), status.label)
+    }
+
+    @MainActor func testIMDatabaseNativeAdmissionRejectsQueuedPreviousAccount() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-account-tools-ui-test", "--im-group-ui-test",
+                               "--im-query-contract-ui-test"]
+        app.launchEnvironment["MAICHAT_IM_QUERY_CASE"] = "switch-admission"
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["account-tools-test-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 15))
+        let finished = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label BEGINSWITH 'PASS IM QUERY' OR label BEGINSWITH 'FAIL IM QUERY'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 15), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS IM QUERY"), status.label)
+    }
+
+    @MainActor func testIMDatabaseCallbackDeadlineStartsBeforeMainActorAdmission() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-account-tools-ui-test", "--im-group-ui-test",
+                               "--im-query-contract-ui-test"]
+        app.launchEnvironment["MAICHAT_IM_QUERY_CASE"] = "main-budget"
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["account-tools-test-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 15))
+        let finished = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label BEGINSWITH 'PASS IM QUERY' OR label BEGINSWITH 'FAIL IM QUERY'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 15), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS IM QUERY"), status.label)
+    }
+
+    @MainActor func testPersistedIMToolsDoNotDependOnLoadedWindow() {
+        for mode in ["peer", "page", "closed", "get", "owner", "validation"] {
+            let app = XCUIApplication()
+            app.launchArguments = ["--ai-ui-test", "--ai-account-tools-ui-test", "--im-group-ui-test",
+                                   "--im-query-contract-ui-test"]
+            app.launchEnvironment["MAICHAT_IM_QUERY_CASE"] = mode
+            app.launch()
+            let status = app.staticTexts["account-tools-test-status"]
+            XCTAssertTrue(status.waitForExistence(timeout: 15))
+            let finished = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "label BEGINSWITH 'PASS IM QUERY' OR label BEGINSWITH 'FAIL IM QUERY'"),
+                object: status)
+            XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 15), .completed)
+            XCTAssertTrue(status.label.hasPrefix("PASS IM QUERY"), status.label)
+            app.terminate()
+        }
+    }
+
     @MainActor func testCurrentAccountAndAvatarRespectConfirmationAndAccountBoundaries() {
         continueAfterFailure = false
         let app = XCUIApplication()

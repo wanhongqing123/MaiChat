@@ -7,15 +7,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <regex>
+#include <mutex>
+#include <unordered_map>
 #include <sstream>
 #include <system_error>
-
-#if defined(_WIN32)
-#include <windows.h>
-#elif !defined(__ANDROID__)
-#include <iconv.h>
-#endif
 
 #include <json.hpp>
 
@@ -23,6 +18,9 @@
 #include "MaiEditTool.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
+#include "MaiFileSearch.h"
+#include "MaiIdGenerator.h"
+#include "MaiTextFileReader.h"
 
 namespace {
 
@@ -33,22 +31,6 @@ using json = nlohmann::json;
 // grep 一个大仓库能返回几 MB —— 不设限的话内存、请求体、费用一起炸。这是计划里的二号性能风险。
 constexpr std::size_t kMaxOutputBytes = 64 * 1024;
 constexpr std::size_t kMaxReadBytes = 256 * 1024;
-constexpr int kMaxGrepMatches = 200;
-// 单个文件最多读这么多。几百兆的文件读全了既没意义又会把内存吃光；截断了会告诉模型，
-// 它可以用 offset 继续读。
-constexpr std::uint64_t kMaxFileBytes = 8u * 1024 * 1024;
-
-constexpr int kMaxGlobResults = 300;
-constexpr int kMaxGlobVisitedEntries = 50000;
-constexpr auto kMaxGlobDuration = std::chrono::seconds(5);
-
-// grep 的结果上限不能限制“没有命中”的大目录扫描，另行限制总工作量。
-// 时间预算是协作式的：在目录项、读取/解码返回及每行之间检查，不能抢占一次阻塞 I/O 或 regex_search。
-constexpr std::size_t kMaxGrepVisitedEntries = 50000;
-constexpr std::uint64_t kMaxGrepFileBytes = 2u * 1024 * 1024;
-constexpr std::uint64_t kMaxGrepReadBytes = 32u * 1024 * 1024;
-constexpr auto kMaxGrepDuration = std::chrono::seconds(5);
-
 // 截断时要落在 UTF-8 字符边界上，不然会切出半个汉字，后面 JSON 序列化会失败或者产生乱码。
 void truncateUtf8(std::string& text, std::size_t maxBytes) {
     if (text.size() <= maxBytes) return;
@@ -175,57 +157,8 @@ std::string normalizedEncoding(const std::string& name) {
 // 转码失败返回错误，不以损坏文本覆盖源文件。
 MaiResult<std::string> decodeLegacy(const std::string& bytes, const std::string& encoding,
                                     const MaiToolContext& context) {
-    if (context.decodeText) return context.decodeText(bytes, encoding);
-#if defined(_WIN32)
-    UINT codePage = 0;
-    if (encoding == "auto" || encoding == "system")
-        codePage = CP_ACP;
-    else if (encoding == "gb18030")
-        codePage = 54936;
-    else if (encoding == "gbk" || encoding == "cp936")
-        codePage = 936;
-    else if (encoding == "windows-1252")
-        codePage = 1252;
-    else if (encoding == "latin1" || encoding == "iso-8859-1")
-        codePage = 28591;
-    else if (encoding == "shift-jis" || encoding == "shift-jis-2004")
-        codePage = 932;
-    else
-        return {MaiErrorCode::InvalidInput, "unsupported file encoding: " + encoding};
-    const int length = ::MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS, bytes.data(),
-                                             static_cast<int>(bytes.size()), nullptr, 0);
-    if (length <= 0)
-        return {MaiErrorCode::InvalidInput, "file could not be decoded as " + encoding};
-    std::wstring wide(static_cast<std::size_t>(length), L'\0');
-    ::MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS, bytes.data(),
-                          static_cast<int>(bytes.size()), wide.data(), length);
-    const int utf8Length =
-        ::WideCharToMultiByte(CP_UTF8, 0, wide.data(), length, nullptr, 0, nullptr, nullptr);
-    if (utf8Length <= 0)
-        return {MaiErrorCode::InvalidInput, "file could not be converted to UTF-8"};
-    std::string output(static_cast<std::size_t>(utf8Length), '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, wide.data(), length, output.data(), utf8Length, nullptr,
-                          nullptr);
-    return output;
-#elif !defined(__ANDROID__)
-    const std::string source = encoding == "auto" ? "GB18030" : encoding;
-    iconv_t converter = ::iconv_open("UTF-8", source.c_str());
-    if (converter == reinterpret_cast<iconv_t>(-1))
-        return {MaiErrorCode::InvalidInput, "unsupported file encoding: " + encoding};
-    std::string output(bytes.size() * 4 + 4, '\0');
-    char* input = const_cast<char*>(bytes.data());
-    std::size_t remaining = bytes.size();
-    char* destination = output.data();
-    std::size_t capacity = output.size();
-    const std::size_t converted = ::iconv(converter, &input, &remaining, &destination, &capacity);
-    ::iconv_close(converter);
-    if (converted == static_cast<std::size_t>(-1) || remaining != 0)
-        return {MaiErrorCode::InvalidInput, "file could not be decoded as " + source};
-    output.resize(output.size() - capacity);
-    return output;
-#else
-    return {MaiErrorCode::NotConfigured, "this Android host has no legacy text decoder configured"};
-#endif
+    // 整文件检索与流式读取共用同一个平台后端，Apple 编码补充不能只修普通 reader。
+    return MaiTextFileReader::decodeLegacyText(bytes, encoding, context.decodeText);
 }
 
 MaiResult<std::string> decodeFileText(const std::string& bytes, const std::string& requested,
@@ -287,117 +220,6 @@ Resolved resolveOrFail(const MaiToolContext& context, const std::string& rawPath
     return {resolved, {}, true};
 }
 
-// glob 匹配。**不用 std::regex。**
-//
-// 第一版是把 glob 转成正则再交给 std::regex，结果整个进程崩了
-// （STATUS_STACK_BUFFER_OVERRUN）。原因是 `**/*.cpp` 会转成`.*[^/\\]*\.cpp` 这种形状，
-// 两个贪婪量词挨着会产生灾难性回溯，
-// 而 MSVC 的 std::regex 是递归实现的，回溯深度直接把栈打穿。
-//
-// 手写的这个是迭代式的：记住最近一次 `*` 的位置，失配就回到那里让 `*`多吃一个字符。最坏 O(n*m)，
-// 不递归、不分配、没有栈风险。
-//
-// 语义：
-//   *   匹配任意字符，但不跨路径分隔符
-//   **  匹配任意字符，跨分隔符
-//   ?   匹配单个非分隔符字符
-// 大小写不敏感，只对 ASCII 做折叠——中文没有大小写，不需要处理。
-bool isSeparator(char character) {
-    return character == '/' || character == '\\';
-}
-
-char fold(char character) {
-    return (character >= 'A' && character <= 'Z') ? static_cast<char>(character - 'A' + 'a')
-                                                  : character;
-}
-
-bool globMatch(const std::string& pattern, const std::string& text) {
-    std::size_t cursor = 0, textCursor = 0;
-    std::size_t starPattern = std::string::npos, starText = 0;
-    bool starCrossesSeparator = false;
-
-    while (textCursor < text.size()) {
-        if (cursor < pattern.size() && pattern[cursor] == '*') {
-            const bool doubled = (cursor + 1 < pattern.size() && pattern[cursor + 1] == '*');
-            starPattern = cursor;
-            starCrossesSeparator = doubled;
-            cursor += doubled ? 2 : 1;
-            // `**/` 里的那个分隔符是可选的：`**/*.cpp` 也该匹配根目录下的 a.cpp
-            if (doubled && cursor < pattern.size() && isSeparator(pattern[cursor])) ++cursor;
-            starText = textCursor;
-            continue;
-        }
-        if (cursor < pattern.size() &&
-            (fold(pattern[cursor]) == fold(text[textCursor]) ||
-             (pattern[cursor] == '?' && !isSeparator(text[textCursor])) ||
-             (isSeparator(pattern[cursor]) && isSeparator(text[textCursor])))) {
-            ++cursor;
-            ++textCursor;
-            continue;
-        }
-        // 失配：退回最近的 `*`，让它多吃一个字符。
-        if (starPattern != std::string::npos) {
-            // 单星不跨分隔符，遇到分隔符就彻底失败。
-            if (!starCrossesSeparator && isSeparator(text[starText])) return false;
-            ++starText;
-            textCursor = starText;
-            cursor = starPattern + (starCrossesSeparator ? 2 : 1);
-            if (starCrossesSeparator && cursor < pattern.size() && isSeparator(pattern[cursor]))
-                ++cursor;
-            continue;
-        }
-        return false;
-    }
-    // 文本吃完了，剩下的模式必须全是 `*`
-    while (cursor < pattern.size() && pattern[cursor] == '*') ++cursor;
-    return cursor == pattern.size();
-}
-
-// 花括号展开只覆盖常见扩展名组合，并严格限制展开数量；
-// 不能让模型通过一个模式意外产生无界的搜索任务。
-bool expandGlobBraces(const std::string& pattern, std::vector<std::string>& expanded) {
-    if (pattern.size() > 512) return false;
-    expanded = {pattern};
-    for (std::size_t index = 0; index < expanded.size(); ++index) {
-        const std::size_t open = expanded[index].find('{');
-        if (open == std::string::npos) {
-            if (expanded[index].find('}') != std::string::npos) return false;
-            continue;
-        }
-        const std::size_t close = expanded[index].find('}', open + 1);
-        if (close == std::string::npos || expanded[index].find('{', open + 1) < close) return false;
-        const std::string prefix = expanded[index].substr(0, open);
-        const std::string suffix = expanded[index].substr(close + 1);
-        const std::string alternatives = expanded[index].substr(open + 1, close - open - 1);
-        expanded.erase(expanded.begin() + static_cast<std::ptrdiff_t>(index));
-        std::size_t start = 0;
-        do {
-            const std::size_t comma = alternatives.find(',', start);
-            const std::string choice = alternatives.substr(start, comma - start);
-            if (choice.empty() || choice.find('{') != std::string::npos ||
-                choice.find('}') != std::string::npos || expanded.size() >= 32)
-                return false;
-            expanded.push_back(prefix + choice + suffix);
-            if (comma == std::string::npos) break;
-            start = comma + 1;
-        } while (true);
-        index = static_cast<std::size_t>(-1);
-    }
-    return true;
-}
-
-// 跳过这些目录：它们体量巨大而且几乎肯定不是模型要找的东西。
-// 不跳过的话 glob 一个前端仓库会在 node_modules 里走几十万个文件。
-bool shouldSkipDirectory(const std::string& name) {
-    static const char* kSkip[] = {".git", "node_modules", "target",      "build", "dist",
-                                  "out",  ".venv",        "__pycache__", ".cache"};
-    for (const char* text : kSkip)
-        if (name == text) return true;
-    return false;
-}
-
-// path 相对于 root 的写法。算不出来（不在 root 下）就返回完整路径。
-//
 // 自己按段算，不调系统的 PathRelativePathToW：那个 API 在两边不同盘时行为古怪，
 // root 内的路径逐段裁成相对路径；宿主允许 root 外访问时保留完整绝对路径。
 //
@@ -417,113 +239,298 @@ std::string toRelativePath(const std::string& root, const MaiFilePath& path) {
 }
 
 // ── file_read ───────────────────────────────────────────────────
+// 文件工具只适配 JSON；普通宿主直接使用 MaiTextFileReader/MaiFileSearch。
+// 输出保留可读的路径/行号，footer 单独声明覆盖范围和真实可续用的游标。
+MaiToolResult observedRead(MaiToolResult result, bool started = true,
+                           const std::string& recovery = {}) {
+    MaiToolExecution execution;
+    execution.started = started;
+    execution.effectStatus = MaiToolEffectStatus::None;
+    execution.canceled = result.error().code() == MaiErrorCode::Canceled;
+    execution.status = execution.canceled ? MaiToolExecutionStatus::Canceled
+        : result.hasError() ? MaiToolExecutionStatus::Failed : MaiToolExecutionStatus::Completed;
+    execution.outputTruncated = result.isTruncated();
+    if (result.error().code() == MaiErrorCode::InvalidInput)
+        execution.nextAction = MaiToolNextAction::ReviseArguments;
+    else if (!recovery.empty()) {
+        execution.nextAction = MaiToolNextAction::ReadOutput;
+        execution.recoveryTool = recovery;
+    }
+    return result.withExecution(std::move(execution));
+}
+
+std::string validateSearchArguments(const json& args,
+                                     std::initializer_list<const char*> allowed) {
+    if (!args.is_object()) return "arguments must be a JSON object";
+    for (auto it = args.begin(); it != args.end(); ++it) {
+        bool known = false;
+        for (const char* key : allowed) known = known || it.key() == key;
+        if (!known) return "unsupported argument: " + it.key();
+        const auto& value = it.value();
+        const std::string key = it.key();
+        if (key == "limit" || key == "offset" || key == "max_bytes" ||
+            key == "context_before" || key == "context_after") {
+            const std::uint64_t minimum = key.compare(0, 8, "context_") == 0 ? 0 : 1;
+            const std::uint64_t maximum = key == "max_bytes" ? 1048576
+                : key == "limit" ? 10000 : key == "offset" ? 1000000000 : 10;
+            if (!value.is_number_integer() ||
+                (!value.is_number_unsigned() && value.get<std::int64_t>() < 0) ||
+                value.get<std::uint64_t>() < minimum || value.get<std::uint64_t>() > maximum)
+                return key + " is outside its supported integer range";
+        } else if (key == "case_sensitive" || key == "include_hidden" ||
+                   key == "include_ignored" || key == "refresh") {
+            if (!value.is_boolean()) return key + " must be a boolean";
+        } else if (key == "exclude") {
+            if (!value.is_array() || value.size() > 32) return "exclude must be at most 32 globs";
+            for (const auto& item : value)
+                if (!item.is_string() || item.get_ref<const std::string&>().size() > 4096)
+                    return "exclude must contain string globs of at most 4096 bytes";
+        } else {
+            const std::size_t maximum = key == "path" ? 32768 : key == "cursor" ? 256 : 4096;
+            if (!value.is_string() || value.get_ref<const std::string&>().size() > maximum)
+                return key + " must be a bounded string";
+        }
+    }
+    return {};
+}
+
+std::string fileScope(const MaiToolContext& context, const std::string& encoding) {
+    // 不保存回调/上下文指针；会话、访问边界或编码配置变化都不能复用旧查询。
+    return json::array({context.sessionId, context.root, context.fileAccessRoot,
+                        context.allowOutsideWorkingDirectory, normalizedEncoding(encoding)}).dump();
+}
+
+MaiFileSearch& sharedFileSearch() {
+    static MaiFileSearch service;
+    return service;
+}
+
+MaiFileSearchCallbacks searchCallbacks(const MaiToolContext& context, const std::string& encoding) {
+    MaiFileSearchCallbacks callbacks;
+    callbacks.isCanceled = [&context] { return context.isCanceled(); };
+    callbacks.pathAllowed = [&context](const MaiFilePath& path) {
+        return !context.resolvePath(path.toUtf8()).empty();
+    };
+    callbacks.decodeText = [&context, encoding](const MaiFilePath&, const std::string& bytes) {
+        return decodeFileText(bytes, encoding, context);
+    };
+    return callbacks;
+}
+
+void configureSearchFilter(const json& args, MaiFileSearchFilter& filter) {
+    filter.includeHidden = args.value("include_hidden", false);
+    const bool ignored = args.value("include_ignored", false);
+    filter.respectGitIgnore = !ignored;
+    filter.useDefaultExcludes = !ignored;
+    if (args.contains("exclude")) filter.excludeGlobs = args["exclude"].get<std::vector<std::string>>();
+    const auto glob = stringArgument(args, "glob");
+    if (!glob.empty()) filter.includeGlobs.push_back(glob);
+}
+
+std::string displayedSearchPath(const std::string& root, const MaiFilePath& base,
+                                 bool directory, const std::string& relative) {
+    return toRelativePath(root, directory
+        ? base.append(MaiFilePath::fromUtf8(relative)) : base);
+}
+
+MaiToolResult renderSearchPage(const MaiFileSearchPage& page, const MaiToolContext& context,
+                                const MaiFilePath& base, const std::string& tool,
+                                MaiFileContentSearchMode mode = MaiFileContentSearchMode::Lines) {
+    json metadata = {{"complete", !page.error.hasError() && !page.partial && !page.hasMore && !page.canceled},
+        {"partial", page.partial}, {"has_more", page.hasMore},
+        {"count", page.files.size() + page.matches.size()},
+        {"coverage", "filesystem_snapshot"}, {"snapshot_id", page.snapshotId},
+        {"snapshot_age_ms", page.snapshotAgeMilliseconds}, {"cache_reused", page.cacheReused},
+        {"visited_entries", page.visitedEntries}, {"searched_files", page.searchedFiles},
+        {"read_bytes", page.readBytes}, {"matched_lines", page.matchedLines}};
+    if (!page.nextCursor.empty()) metadata["next_cursor"] = page.nextCursor;
+    json issues = json::array();
+    for (const auto& issue : page.issues) {
+        if (issues.size() == 8) break;
+        std::string path = issue.path;
+        truncateUtf8(path, 256);
+        issues.push_back({{"reason", issue.reason}, {"path", path}, {"count", issue.count}});
+    }
+    metadata["issues"] = std::move(issues);
+    metadata["issues_omitted"] = page.issues.size() > 8 ? page.issues.size() - 8 : 0;
+    std::string output;
+    const bool directory = MaiFileSystem::isDirectory(base);
+    for (const auto& file : page.files)
+        output += displayedSearchPath(context.root, base, directory, file.path) + "\n";
+    std::size_t clipped = 0;
+    for (const auto& match : page.matches) {
+        const auto path = displayedSearchPath(context.root, base, directory, match.path);
+        if (mode == MaiFileContentSearchMode::Files) output += path + "\n";
+        else if (mode == MaiFileContentSearchMode::Count)
+            output += path + ": " + std::to_string(match.count) + "\n";
+        else {
+            const auto append = [&](std::size_t line, const std::string& text, char separator) {
+                // 上下文与本命中成组，只在命中行写完整路径。否则深路径会在 20 行
+                // 上下文中反复放大，超过普通搜索已预留的输出预算且游标已经前进。
+                output += separator == ':' ? path + ":" : "  ";
+                output += std::to_string(line) + separator + " " + text + "\n";
+            };
+            for (const auto& line : match.before) append(line.line, line.text, '-');
+            append(match.line, match.text, ':');
+            for (const auto& line : match.after) append(line.line, line.text, '-');
+            if (match.truncated) {
+                ++clipped;
+                output += "[line preview starts at UTF-8 byte " + std::to_string(match.displayOffsetBytes) +
+                          "; use file_read for the full line]\n";
+            }
+        }
+    }
+    metadata["clipped_line_previews"] = clipped;
+    if (output.empty()) output = page.error.hasError() ? "Search failed; results are unavailable."
+        : page.partial || page.canceled ? "Search is partial; no match in the scanned portion."
+        : page.hasMore ? "No match in this page; the search has more pages."
+                       : "No content matches in this filesystem snapshot.";
+    if (tool == "file_glob" && page.files.empty() && !page.error.hasError() &&
+        !page.partial && !page.canceled && !page.hasMore)
+        output = "No files match in this filesystem snapshot.";
+    if (page.partial)
+        output += "\nSearch stopped at a scan limit or skipped files; narrow path/glob or inspect issues.";
+    if (page.hasMore)
+        output += "\nContinue with next_cursor and the same arguments. Use refresh=true without a cursor for a new snapshot.";
+    output += "\n\n[file_result]\n" + metadata.dump();
+    // 绝不在游标已经推进后裁掉结果。预算在交给普通搜索前为行号、路径前缀及 footer 预留。
+    if (output.size() > kMaxOutputBytes)
+        return observedRead(MaiToolResult::failure(MaiErrorCode::Internal,
+            "file search rendering exceeded its reserved output budget; narrow path or lower limit"));
+    const bool truncated = page.partial || page.hasMore || clipped != 0;
+    if (page.error.hasError())
+        return observedRead(MaiToolResult::failure(page.error.code(), page.error.message() + "\n" + output, truncated));
+    if (page.canceled || context.isCanceled())
+        return observedRead(MaiToolResult::failure(MaiErrorCode::Canceled, "File search canceled.\n" + output, true));
+    return observedRead(MaiToolResult::success(std::move(output), truncated), true,
+                         page.hasMore ? tool : clipped != 0 ? "file_read" : "");
+}
+
+std::size_t renderedPageLimit(const MaiToolContext& context, const MaiFilePath& base,
+                               std::size_t requested, std::size_t contextLines) {
+    const std::size_t prefix = toRelativePath(context.root, base).size() + 80;
+    return std::max<std::size_t>(1, std::min(requested, (kMaxOutputBytes / 4) /
+                                                      (prefix * (contextLines + 1))));
+}
+
 class ReadTool final : public MaiTool {
 public:
-    std::string name() const override {
-        return "file_read";
-    }
+    std::string name() const override { return "file_read"; }
     std::string description() const override {
-        // 以行号读取文本；自动识别 UTF-8 与带 BOM 的 UTF-16，旧编码歧义时显式指定。
-        return "Read a text file as UTF-8 with line numbers. UTF-8 and BOM-marked UTF-16 are "
-               "detected automatically; for ambiguous legacy text, set encoding explicitly "
-               "(for example gb18030, gbk, or windows-1252). Relative paths use the session "
-               "working directory.";
+        return "Read a text file with line numbers and bounded streaming. Offset is a 1-based line, "
+               "not a prefix byte limit. Use next_cursor without offset to continue a long line or scan. "
+               "UTF-8/BOM UTF-16 are automatic; specify encoding for ambiguous legacy text.";
     }
     std::string parametersSchema() const override {
-        // 读取：path 是目标文件；encoding 可覆盖自动识别；offset/limit 控制返回行段，
-        // 避免一次把大文件全文塞进模型上下文。
-        return R"({"type":"object","properties":{)"
-               R"("path":{"type":"string","description":"Absolute path or path relative to the wor)"
-                   R"(king directory"},)"
-               R"("encoding":{"type":"string","description":"Source text encoding; default auto. E)"
-                   R"(xamples: utf-8, utf-16le, utf-16be, gb18030, gbk, windows-1252"},)"
-               R"("offset":{"type":"integer","description":"1-based line to start from,)"
-                   R"( default 1"},)"
-               R"("limit":{"type":"integer","description":"Maximum number of lines to read,)"
-                   R"( default 500"}},)"
-               R"("required":["path"]})";
+        return R"({"type":"object","properties":{"path":{"type":"string"},"encoding":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":10000},"max_bytes":{"type":"integer","minimum":4096,"maximum":1048576},"cursor":{"type":"string"}},"required":["path"],"additionalProperties":false})";
     }
-
-    // 解析模型提供的参数并读取或管理工作区文件。
-    // 成功和失败都转成明确的工具结果；中间状态不能冒充最终产物。
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
-        const json args = parseArguments(raw);
-        if (args.contains("encoding") && !args["encoding"].is_string())
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "encoding must be a string");
+        const auto args = json::parse(raw, nullptr, false);
+        auto invalid = validateSearchArguments(args, {"path", "encoding", "offset", "limit", "max_bytes", "cursor"});
+        if (!invalid.empty()) return observedRead(MaiToolResult::failure(MaiErrorCode::InvalidInput, invalid), false);
+        if (context.isCanceled())
+            return observedRead(MaiToolResult::failure(MaiErrorCode::Canceled, "File read canceled."), false);
         auto resolved = resolveOrFail(context, stringArgument(args, "path"));
-        if (!resolved.ok) return resolved.error;
-
-        const MaiFilePath target = MaiFilePath::fromUtf8(resolved.path);
-        if (!MaiFileSystem::exists(target))
-            return MaiToolResult::failure(MaiErrorCode::NotFound,
-                                          "file does not exist: " + stringArgument(args, "path"));
-        if (MaiFileSystem::isDirectory(target))
-            return MaiToolResult::failure(
-                MaiErrorCode::InvalidInput,
-                "That is a directory, not a file. Use file_glob to list its contents.");
-
-        // 一次读进来，再自己按行切。以前用 std::getline 一行行读，
-        // 每行一次系统调用；一次读完再切，大文件上差别明显。读多少有上限，
-        // 免得一个几百兆的文件把内存吃光。
-        std::string blob;
-        bool readTruncated = false;
-        const MaiError readError =
-            MaiFileSystem::readFile(target, blob, kMaxFileBytes, &readTruncated);
-        if (readError.hasError())
-            return MaiToolResult::failure(readError.code(), readError.message());
-        const MaiResult<std::string> decoded =
-            decodeFileText(blob, stringArgument(args, "encoding"), context);
-        if (!decoded)
-            return MaiToolResult::failure(decoded.error().code(), decoded.error().message());
-        blob = decoded.value();
-
-        const int offset = std::max(1, args.value("offset", 1));
-        const int limit = std::max(1, args.value("limit", 500));
-
-        std::string out;
-        std::string line;
-        int lineno = 0;
-        int emitted = 0;
-        bool truncated = readTruncated;
-        std::size_t cursor = 0;
-        while (cursor <= blob.size()) {
-            const std::size_t newlineAt = blob.find('\n', cursor);
-            if (newlineAt == std::string::npos) {
-                if (cursor >= blob.size()) break;
-                line = blob.substr(cursor);
-                cursor = blob.size() + 1;
-            } else {
-                line = blob.substr(cursor, newlineAt - cursor);
-                cursor = newlineAt + 1;
-            }
-            ++lineno;
-            if (lineno < offset) continue;
-            if (emitted >= limit) {
-                truncated = true;
-                break;
-            }
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            out += std::to_string(lineno);
-            out += "\t";
-            out += line;
-            out += "\n";
-            ++emitted;
-            if (out.size() > kMaxReadBytes) {
-                truncated = true;
-                break;
-            }
+        if (!resolved.ok) return observedRead(std::move(resolved.error), false);
+        const auto path = MaiFilePath::fromUtf8(resolved.path);
+        if (MaiFileSystem::isDirectory(path))
+            return observedRead(MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                "That is a directory, not a file. Use file_glob to list its contents."), false);
+        MaiTextFileReadOptions options;
+        options.offset = args.value("offset", std::uint64_t{1});
+        options.encoding = stringArgument(args, "encoding");
+        options.isCanceled = [&context] { return context.isCanceled(); };
+        // 只借用已有宿主解码器；空回调让普通 reader 选择共用的平台后端。
+        options.decodeText = context.decodeText;
+        const auto requestedBytes = args.value("max_bytes", kMaxReadBytes);
+        if (requestedBytes < 4096)
+            return observedRead(MaiToolResult::failure(MaiErrorCode::InvalidInput, "max_bytes must be at least 4096"), false);
+        options.limit = std::min(args.value("limit", std::size_t{500}), (requestedBytes - 2048) / 160);
+        options.maxOutputBytes = requestedBytes - 2048 - options.limit * 80;
+        const auto binding = json::array({fileScope(context, options.encoding), resolved.path}).dump();
+        const std::string token = stringArgument(args, "cursor");
+        if (!token.empty()) {
+            if (options.offset != 1)
+                return observedRead(MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                    "cursor resumes its saved position; omit offset"), false);
+            std::lock_guard<std::mutex> lock(mMutex);
+            prune();
+            const auto found = mCursors.find(token);
+            if (found == mCursors.end() || found->second.binding != binding)
+                return observedRead(MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                    "file read cursor expired or belongs to another path, encoding or Session"), false);
+            found->second.touched = std::chrono::steady_clock::now();
+            options.cursor = found->second.cursor;
         }
-
-        if (out.empty()) {
-            return MaiToolResult::success(lineno == 0 ? "(empty file)"
-                                                      : "(no content at or after line " +
-                                                            std::to_string(offset) + ")");
+        const auto result = MaiTextFileReader::read(path, options);
+        if (!result) {
+            const auto message = result.error().code() == MaiErrorCode::NotFound
+                ? "file does not exist: " + stringArgument(args, "path") + "; " + result.error().message()
+                : result.error().message();
+            return observedRead(MaiToolResult::failure(result.error().code(), message));
         }
-        truncateUtf8(out, kMaxReadBytes);
-        if (truncated) out += "\n...Output truncated. Use the offset parameter to read further.";
-        return MaiToolResult::success(std::move(out), truncated);
+        const auto& page = result.value();
+        json metadata = {{"complete", page.eof}, {"eof", page.eof}, {"encoding", page.encoding},
+                          {"count", page.lines.size()}, {"coverage", "file_snapshot"},
+                          {"open_operations", page.io.openOperations},
+                          {"read_operations", page.io.readOperations}, {"read_bytes", page.io.bytesRead}};
+        std::string output;
+        for (const auto& line : page.lines)
+            output += std::to_string(line.number) + "\t" + line.text + "\n";
+        if (!page.lines.empty()) {
+            metadata["first_line"] = page.lines.front().number;
+            metadata["first_line_utf8_offset"] = page.lines.front().byteOffset;
+            metadata["last_line"] = page.lines.back().number;
+            metadata["last_line_complete"] = page.lines.back().complete;
+        }
+        if (page.nextCursor) {
+            const auto next = MaiIdGenerator::generate("file_read_");
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                prune();
+                while (mCursors.size() >= 128) {
+                    auto oldest = mCursors.begin();
+                    for (auto it = mCursors.begin(); it != mCursors.end(); ++it)
+                        if (it->second.touched < oldest->second.touched) oldest = it;
+                    mCursors.erase(oldest);
+                }
+                mCursors.emplace(next, StoredCursor{*page.nextCursor, binding, std::chrono::steady_clock::now()});
+            }
+            metadata["next_cursor"] = next;
+            metadata["next_line"] = page.nextCursor->lineNumber;
+            metadata["next_line_utf8_offset"] = page.nextCursor->lineUtf8Offset;
+        }
+        switch (page.stopReason) {
+            case MaiTextFileStopReason::EndOfFile: metadata["stop_reason"] = "eof"; break;
+            case MaiTextFileStopReason::LineLimit: metadata["stop_reason"] = "line_limit"; break;
+            case MaiTextFileStopReason::OutputLimit: metadata["stop_reason"] = "output_limit"; break;
+            case MaiTextFileStopReason::ScanLimit: metadata["stop_reason"] = "scan_limit"; break;
+            case MaiTextFileStopReason::TimeLimit: metadata["stop_reason"] = "time_limit"; break;
+        }
+        if (output.empty()) output = page.eof ? "(empty file or no content at the requested line)"
+                                             : "(scan budget reached before the requested line; continue with next_cursor)";
+        if (!page.eof) output += "\n...Output truncated. Continue with next_cursor; omit offset.";
+        output += "\n\n[file_result]\n" + metadata.dump();
+        if (context.isCanceled())
+            return observedRead(MaiToolResult::failure(MaiErrorCode::Canceled, "File read canceled."));
+        return observedRead(MaiToolResult::success(std::move(output), !page.eof), true,
+                             page.nextCursor ? "file_read" : "");
     }
+private:
+    struct StoredCursor {
+        MaiTextFileCursor cursor;
+        std::string binding;
+        std::chrono::steady_clock::time_point touched;
+    };
+    void prune() {
+        const auto oldest = std::chrono::steady_clock::now() - std::chrono::seconds(120);
+        for (auto it = mCursors.begin(); it != mCursors.end();)
+            if (it->second.touched < oldest) it = mCursors.erase(it); else ++it;
+    }
+    std::mutex mMutex;
+    std::unordered_map<std::string, StoredCursor> mCursors;
 };
+
 
 // ── explicit file and directory mutations ─────────────────────
 class CreateFileTool final : public MaiTool {
@@ -744,339 +751,95 @@ public:
     }
 };
 
-// ── file_glob ───────────────────────────────────────────────────
+// ── file_glob / file_grep ───────────────────────────────────────
 class GlobTool final : public MaiTool {
 public:
-    std::string name() const override {
-        return "file_glob";
-    }
+    std::string name() const override { return "file_glob"; }
     std::string description() const override {
-        // 按文件名模式查找，支持跨目录通配和扩展名列表；范围过大时应收窄目录。
-        return "Find files by name pattern. Relative paths use the working directory. Supports *, "
-               "?, ** to "
-               "cross directories, and brace lists such as *.{png,jpg}. For a broad search, "
-               "provide a subdirectory in path.";
+        return "Find files using either pattern (glob *, **, ?, [] and {a,b}) or query (ranked fuzzy name). "
+               "Path limits the directory. Results use a bounded path snapshot, reused up to 5 seconds; "
+               "refresh starts a new snapshot, next_cursor continues the current one.";
     }
     std::string parametersSchema() const override {
-        // pattern 是文件名通配模式；path 限定起始目录，省略时从工作目录搜索。
-        return R"({"type":"object","properties":{)"
-               R"("pattern":{"type":"string","description":"For example **/*.cpp or src/*.h"},)"
-               R"("path":{"type":"string","description":"Subdirectory to search from,)"
-                   R"( defaults to the working directory root"}},)"
-               R"("required":["pattern"]})";
+        // 当前 Qwen XML 模板只从 object 根提取参数；根 union 会抹掉 properties。
+        // 两个可选字段的互斥/必选规则由 execute 严格执行，不能为表达 XOR 破坏工具线格式。
+        return R"({"type":"object","properties":{"pattern":{"type":"string","description":"Glob; provide exactly one of pattern or query"},"query":{"type":"string","description":"Fuzzy name; provide exactly one of pattern or query"},"path":{"type":"string"},"case_sensitive":{"type":"boolean"},"include_hidden":{"type":"boolean"},"include_ignored":{"type":"boolean","description":"Include gitignored and dependency/build directories"},"exclude":{"type":"array","items":{"type":"string"},"maxItems":32},"limit":{"type":"integer","minimum":1,"maximum":1000},"cursor":{"type":"string"},"refresh":{"type":"boolean"}},"required":[],"additionalProperties":false})";
     }
-
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
-        const json args = parseArguments(raw);
-        const std::string pattern = stringArgument(args, "pattern");
-        if (pattern.empty())
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "missing required parameter: pattern");
-        std::vector<std::string> patterns;
-        if (!expandGlobBraces(pattern, patterns))
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "invalid or overly broad glob brace pattern");
-
-        std::string base = context.root;
-        if (args.contains("path") && args["path"].is_string() &&
-            !args["path"].get<std::string>().empty()) {
-            auto resolved = resolveOrFail(context, args["path"].get<std::string>());
-            if (!resolved.ok) return resolved.error;
-            base = resolved.path;
-        }
-
-        const MaiFilePath basePath = MaiFilePath::fromUtf8(base);
-        if (!MaiFileSystem::isDirectory(basePath))
-            return MaiToolResult::failure(MaiErrorCode::NotFound,
-                                          "could not read directory: " + base);
-        if (basePath == basePath.dirName() && pattern.find("**") != std::string::npos)
-            return MaiToolResult::failure(
-                MaiErrorCode::InvalidInput,
-                "Searching an entire filesystem root is too broad. Set path to a specific "
-                "directory, such as the user's Documents folder, and retry.");
-
-        std::vector<std::string> hits;
-        int visitedEntries = 0;
-        bool budgetExceeded = false;
-        const auto deadline = std::chrono::steady_clock::now() + kMaxGlobDuration;
-        MaiFileSystem::walk(basePath, [&](const MaiFileEntry& entry) {
-            if (context.isCanceled()) return MaiWalkAction::Stop;
-            ++visitedEntries;
-            if (visitedEntries > kMaxGlobVisitedEntries ||
-                (visitedEntries % 128 == 0 && std::chrono::steady_clock::now() >= deadline)) {
-                budgetExceeded = true;
-                return MaiWalkAction::Stop;
-            }
-            if (entry.isDirectory) {
-                return shouldSkipDirectory(entry.nameUtf8) ? MaiWalkAction::SkipDirectory
-                                                           : MaiWalkAction::Continue;
-            }
-            const std::string relative = toRelativePath(context.root, entry.path);
-            const bool matches =
-                std::any_of(patterns.begin(), patterns.end(), [&](const auto& item) {
-                    return globMatch(item, relative) || globMatch(item, entry.nameUtf8);
-                });
-            if (matches) {
-                hits.push_back(relative);
-                if (static_cast<int>(hits.size()) >= kMaxGlobResults) return MaiWalkAction::Stop;
-            }
-            return MaiWalkAction::Continue;
-        });
-
-        if (budgetExceeded && hits.empty())
-            return MaiToolResult::success(
-                "Search stopped after the scan limit without finding a match. Set path to a "
-                "smaller directory and retry.",
-                true);
-        if (hits.empty()) return MaiToolResult::success("No files match " + pattern);
-        std::sort(hits.begin(), hits.end());
-        std::string out;
-        for (const auto& hit : hits) {
-            out += hit;
-            out += "\n";
-        }
-        const bool truncated = budgetExceeded || static_cast<int>(hits.size()) >= kMaxGlobResults;
-        if (truncated)
-            out +=
-                "...Search was limited. Set path to a smaller directory or use a more "
-                "specific pattern to find other matches.";
-        return MaiToolResult::success(std::move(out), truncated);
+        const auto args = json::parse(raw, nullptr, false);
+        auto invalid = validateSearchArguments(args, {"path", "pattern", "query", "case_sensitive", "include_hidden", "include_ignored", "exclude", "limit", "cursor", "refresh"});
+        const auto pattern = stringArgument(args, "pattern"), query = stringArgument(args, "query");
+        if (invalid.empty() && (pattern.empty() == query.empty())) invalid = "provide exactly one nonempty pattern or query";
+        if (invalid.empty() && args.value("limit", std::size_t{300}) > 1000)
+            invalid = "limit must not exceed 1000";
+        if (!invalid.empty()) return observedRead(MaiToolResult::failure(MaiErrorCode::InvalidInput, invalid), false);
+        auto resolved = resolveOrFail(context, args.value("path", std::string(".")));
+        if (!resolved.ok) return observedRead(std::move(resolved.error), false);
+        MaiFileNameSearchOptions options;
+        options.root = MaiFilePath::fromUtf8(resolved.path);
+        if (options.root == options.root.dirName())
+            return observedRead(MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                "Searching an entire filesystem root is too broad. Set path to a specific directory."), false);
+        options.scopeKey = fileScope(context, "");
+        options.mode = pattern.empty() ? MaiFileNameSearchMode::Fuzzy : MaiFileNameSearchMode::Glob;
+        options.query = pattern.empty() ? query : pattern;
+        options.caseSensitive = args.value("case_sensitive", false);
+        options.pageSize = renderedPageLimit(context, options.root, std::min<std::size_t>(1000, args.value("limit", std::size_t{300})), 0);
+        options.budget.maxOutputBytes = kMaxOutputBytes / 2;
+        options.cursor = stringArgument(args, "cursor");
+        options.refresh = args.value("refresh", false);
+        configureSearchFilter(args, options.filter);
+        return renderSearchPage(sharedFileSearch().findFiles(options, searchCallbacks(context, "")), context, options.root, name());
     }
 };
 
-// ── file_grep ───────────────────────────────────────────────────
 class GrepTool final : public MaiTool {
 public:
-    std::string name() const override {
-        return "file_grep";
-    }
+    std::string name() const override { return "file_grep"; }
     std::string description() const override {
-        // 对文本内容做正则搜索；已知文件时直接指定该文件，避免扩大到整个源码树。
-        // 编码先转成 UTF-8；预算耗尽返回明确的部分结果，取消返回 Canceled。
-        return "Search text files with a regular expression. Source bytes are converted to "
-               "UTF-8 before matching; set encoding for ambiguous legacy text. Relative paths "
-               "use the working directory. When a specific file is known, set path to that file "
-               "instead of searching its parent directory. Returns the file, line number and "
-               "matching line. Regular files up to 2 MiB are searched, with cooperative scan "
-               "limits of 5 seconds, 50000 entries and 32 MiB read. Limited results are partial; "
-               "narrow path or glob before retrying.";
+        return "Search full text lines before clipping previews. Prefer mode=literal for exact text; "
+               "default regex is a bounded nonbacktracking subset (no lookarounds/backreferences). "
+               "Path may be one file. Pages disclose skipped/partial coverage and next_cursor; "
+               "read clipped lines with file_read. Scan budgets: 5 seconds, 50000 entries, 32 MiB total, 2 MiB per file.";
     }
     std::string parametersSchema() const override {
-        // pattern 是内容正则，path 可精确指定一个文件或限定目录；encoding 处理旧文本。
-        return R"({"type":"object","properties":{)"
-               R"("pattern":{"type":"string","description":"Regular expression"},)"
-               R"("path":{"type":"string","description":"Exact file or directory to search;)"
-               R"( prefer the supplied file path. Defaults to the working directory root"},)"
-               R"("encoding":{"type":"string","description":"Source text encoding; default auto"},)"
-               R"("glob":{"type":"string","description":"Only search files matching this pattern,)"
-               R"( for example *.cpp"}},)"
-               R"("required":["pattern"]})";
+        return R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"mode":{"type":"string","enum":["literal","regex"]},"encoding":{"type":"string"},"glob":{"type":"string"},"exclude":{"type":"array","items":{"type":"string"},"maxItems":32},"case_sensitive":{"type":"boolean"},"output_mode":{"type":"string","enum":["lines","files","count"]},"context_before":{"type":"integer","minimum":0,"maximum":10},"context_after":{"type":"integer","minimum":0,"maximum":10},"include_hidden":{"type":"boolean"},"include_ignored":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":1000},"cursor":{"type":"string"},"refresh":{"type":"boolean"}},"required":["pattern"],"additionalProperties":false})";
     }
-
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
-        const json args = parseArguments(raw);
-        if (args.contains("encoding") && !args["encoding"].is_string())
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput, "encoding must be a string");
-        const std::string pattern = stringArgument(args, "pattern");
-        if (pattern.empty())
-            return MaiToolResult::failure(MaiErrorCode::InvalidInput,
-                                          "missing required parameter: pattern");
-        if (context.isCanceled())
-            return MaiToolResult::failure(MaiErrorCode::Canceled, "File search canceled.");
-        const auto deadline = std::chrono::steady_clock::now() + kMaxGrepDuration;
-
-        std::string base = context.root;
-        if (args.contains("path") && args["path"].is_string() &&
-            !args["path"].get<std::string>().empty()) {
-            auto resolved = resolveOrFail(context, args["path"].get<std::string>());
-            if (!resolved.ok) return resolved.error;
-            base = resolved.path;
-        }
-
-        std::regex re;
-        try {
-            re = std::regex(pattern, std::regex::ECMAScript);
-        } catch (const std::regex_error& regexError) {
-            return MaiToolResult::failure(
-                MaiErrorCode::InvalidInput,
-                std::string("could not parse the regular expression: ") + regexError.what());
-        }
-
-        const std::string globPattern = stringArgument(args, "glob");
-        const bool hasFilter = !globPattern.empty();
-
-        std::string out;
-        int matches = 0;
-        int undecodable = 0;
-        MaiError singleFileFailure;
-        std::size_t visitedEntries = 0;
-        std::uint64_t readBytes = 0;
-        bool scanLimited = false;
-
-        const auto shouldStop = [&] {
-            if (context.isCanceled()) return true;
-            if (std::chrono::steady_clock::now() >= deadline) {
-                scanLimited = true;
-                return true;
-            }
-            return false;
-        };
-
-        const MaiFilePath basePath = MaiFilePath::fromUtf8(base);
-        const bool searchDirectory = MaiFileSystem::isDirectory(basePath);
-        MaiRegularFileInfo singleFile;
-        if (!searchDirectory && !MaiFileSystem::regularFileInfo(basePath, singleFile))
-            return MaiToolResult::failure(
-                MaiFileSystem::exists(basePath) ? MaiErrorCode::InvalidInput
-                                                : MaiErrorCode::NotFound,
-                "path must name an accessible regular file or directory: " + base);
-
-        const auto visit = [&](const MaiFileEntry& entry) {
-            if (shouldStop() || matches >= kMaxGrepMatches) return MaiWalkAction::Stop;
-            if (++visitedEntries > kMaxGrepVisitedEntries) {
-                scanLimited = true;
-                return MaiWalkAction::Stop;
-            }
-            if (entry.isDirectory) {
-                return shouldSkipDirectory(entry.nameUtf8) ? MaiWalkAction::SkipDirectory
-                                                           : MaiWalkAction::Continue;
-            }
-            const std::string relative = toRelativePath(context.root, entry.path);
-            if (hasFilter && !globMatch(globPattern, relative) &&
-                !globMatch(globPattern, entry.nameUtf8))
-                return MaiWalkAction::Continue;
-
-            // walk 也会给出 FIFO、socket 和文件链接；不能按 size=0 当普通文件打开。
-            // 再核普通文件，并在实际读取时传上限，避免枚举后文件增长导致无界分配。
-            MaiRegularFileInfo info;
-            if (!MaiFileSystem::regularFileInfo(entry.path, info)) {
-                if (!searchDirectory)
-                    singleFileFailure = MaiError::make(
-                        MaiErrorCode::NotFound,
-                        "The requested file is no longer an accessible regular file.");
-                return MaiWalkAction::Continue;
-            }
-            if (info.bytes > kMaxGrepFileBytes) {
-                if (!searchDirectory)
-                    singleFileFailure = MaiError::make(
-                        MaiErrorCode::InvalidInput,
-                        "The requested file exceeds the 2 MiB file search limit. Use file_read "
-                        "with a bounded range instead.");
-                return MaiWalkAction::Continue;
-            }
-            if (readBytes == kMaxGrepReadBytes || info.bytes > kMaxGrepReadBytes - readBytes) {
-                scanLimited = true;
-                return MaiWalkAction::Stop;
-            }
-
-            std::string blob;
-            bool readTruncated = false;
-            const std::uint64_t readLimit =
-                std::min(kMaxGrepFileBytes, kMaxGrepReadBytes - readBytes);
-            const MaiError readError =
-                MaiFileSystem::readFile(entry.path, blob, readLimit, &readTruncated);
-            if (readError.hasError()) {
-                // 目录搜索保持逐项跳过；精确文件没有其它候选，必须保留真实读取失败。
-                if (!searchDirectory) singleFileFailure = readError;
-                return MaiWalkAction::Continue;
-            }
-            readBytes += blob.size();
-            if (readTruncated) {
-                scanLimited = true;
-                return MaiWalkAction::Stop;
-            }
-            if (shouldStop()) return MaiWalkAction::Stop;
-            const MaiResult<std::string> decoded =
-                decodeFileText(blob, stringArgument(args, "encoding"), context);
-            if (shouldStop()) return MaiWalkAction::Stop;
-            if (!decoded) {
-                ++undecodable;
-                return MaiWalkAction::Continue;
-            }
-            blob = decoded.value();
-
-            std::string line;
-            int lineno = 0;
-            std::size_t cursor = 0;
-            while (cursor <= blob.size() && matches < kMaxGrepMatches) {
-                if (shouldStop()) return MaiWalkAction::Stop;
-                const std::size_t newlineAt = blob.find('\n', cursor);
-                if (newlineAt == std::string::npos) {
-                    if (cursor >= blob.size()) break;
-                    line = blob.substr(cursor);
-                    cursor = blob.size() + 1;
-                } else {
-                    line = blob.substr(cursor, newlineAt - cursor);
-                    cursor = newlineAt + 1;
-                }
-                ++lineno;
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                // 含 NUL 的当二进制跳过整个文件。
-                if (line.find('\0') != std::string::npos) break;
-                // 先截断再匹配。用户给的正则可能有灾难性回溯，
-                // 行越长越容易把栈打穿——glob 那边已经因此崩过一次，这里不重蹈覆辙。
-                if (line.size() > 400) {
-                    std::size_t cut = 400;
-                    while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0) == 0x80) --cut;
-                    line.resize(cut);
-                }
-                if (!std::regex_search(line, re)) continue;
-                out += relative;
-                out += ":";
-                out += std::to_string(lineno);
-                out += ": ";
-                out += line;
-                out += "\n";
-                ++matches;
-                if (out.size() > kMaxOutputBytes) break;
-            }
-            return out.size() > kMaxOutputBytes ? MaiWalkAction::Stop : MaiWalkAction::Continue;
-        };
-        if (searchDirectory) {
-            MaiFileSystem::walk(basePath, visit);
-        } else {
-            MaiFileEntry entry;
-            entry.path = basePath;
-            entry.nameUtf8 = basePath.baseName().toUtf8();
-            entry.size = singleFile.bytes;
-            visit(entry);
-        }
-
-        // 取消不是成功的“没有匹配”：Runner 必须收到 Canceled，不能把卡片记为 Completed。
-        if (context.isCanceled())
-            return MaiToolResult::failure(MaiErrorCode::Canceled, "File search canceled.");
-        if (singleFileFailure.hasError())
-            return MaiToolResult::failure(singleFileFailure.code(), singleFileFailure.message());
-
-        if (matches == 0) {
-            if (scanLimited)
-                return MaiToolResult::success(
-                    "Search stopped at the scan limit without finding a match in the scanned "
-                    "files. This is a partial search. Set path to the exact file or a smaller "
-                    "directory, or add glob to narrow the search.",
-                    true);
-            const std::string message = "No content matches " + pattern;
-            if (undecodable == 0) return MaiToolResult::success(message);
-            return MaiToolResult::success(
-                message + "; skipped " + std::to_string(undecodable) +
-                    " files that could not be decoded. Retry with an explicit encoding.",
-                true);
-        }
-        const bool outputLimited = matches >= kMaxGrepMatches || out.size() > kMaxOutputBytes;
-        const bool truncated = outputLimited || undecodable > 0 || scanLimited;
-        truncateUtf8(out, kMaxOutputBytes);
-        if (undecodable > 0)
-            out += "\n...Skipped " + std::to_string(undecodable) +
-                   " files that could not be decoded; specify encoding to search them.";
-        if (scanLimited)
-            out +=
-                "\n...Search stopped at the scan limit; only scanned files are represented. "
-                "Set path to the exact file or a smaller directory, or add glob.";
-        if (outputLimited)
-            out +=
-                "\n...Too many matches; showing the first ones only. Use a more specific "
-                "regular expression, or add the glob parameter to narrow the search.";
-        return MaiToolResult::success(std::move(out), truncated);
+        const auto args = json::parse(raw, nullptr, false);
+        auto invalid = validateSearchArguments(args, {"path", "pattern", "mode", "encoding", "glob", "exclude", "case_sensitive", "output_mode", "context_before", "context_after", "include_hidden", "include_ignored", "limit", "cursor", "refresh"});
+        if (invalid.empty() && args.value("limit", std::size_t{200}) > 1000)
+            invalid = "limit must not exceed 1000";
+        if (!invalid.empty()) return observedRead(MaiToolResult::failure(MaiErrorCode::InvalidInput, invalid), false);
+        const auto pattern = stringArgument(args, "pattern");
+        const auto matchMode = args.value("mode", std::string("regex"));
+        const auto outputMode = args.value("output_mode", std::string("lines"));
+        if (pattern.empty() || (matchMode != "literal" && matchMode != "regex") ||
+            (outputMode != "lines" && outputMode != "files" && outputMode != "count"))
+            return observedRead(MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                "provide pattern, mode literal/regex, and output_mode lines/files/count"), false);
+        auto resolved = resolveOrFail(context, args.value("path", std::string(".")));
+        if (!resolved.ok) return observedRead(std::move(resolved.error), false);
+        MaiFileContentSearchOptions options;
+        options.root = MaiFilePath::fromUtf8(resolved.path);
+        if (options.root == options.root.dirName())
+            return observedRead(MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                "Searching an entire filesystem root is too broad. Set path to a file or specific directory."), false);
+        const auto encoding = stringArgument(args, "encoding");
+        options.scopeKey = fileScope(context, encoding);
+        options.pattern = pattern;
+        options.isRegex = matchMode == "regex";
+        options.caseSensitive = args.value("case_sensitive", true);
+        options.mode = outputMode == "files" ? MaiFileContentSearchMode::Files
+            : outputMode == "count" ? MaiFileContentSearchMode::Count : MaiFileContentSearchMode::Lines;
+        options.contextBefore = args.value("context_before", std::size_t{0});
+        options.contextAfter = args.value("context_after", std::size_t{0});
+        options.pageSize = renderedPageLimit(context, options.root, std::min<std::size_t>(1000, args.value("limit", std::size_t{200})), options.contextBefore + options.contextAfter);
+        options.budget.maxOutputBytes = kMaxOutputBytes / 2;
+        options.cursor = stringArgument(args, "cursor");
+        options.refresh = args.value("refresh", false);
+        configureSearchFilter(args, options.filter);
+        return renderSearchPage(sharedFileSearch().searchText(options, searchCallbacks(context, encoding)), context, options.root, name(), options.mode);
     }
 };
 

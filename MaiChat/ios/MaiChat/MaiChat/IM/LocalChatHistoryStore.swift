@@ -4,6 +4,225 @@
 import Foundation
 import MaiChatCore
 import SQLite3
+import CryptoKit
+
+struct LocalChatMessageQueryError: LocalizedError, Sendable {
+    let code: String
+    let message: String
+    var errorDescription: String? { message }
+    static func invalid(_ message: String) -> Self { Self(code: "invalid_input", message: message) }
+    static let unavailable = Self(code: "not_configured", message: "Local persisted IM database is unavailable.")
+    static let changed = Self(code: "canceled", message: "The active IM account or database changed.")
+}
+
+struct LocalChatMessageFilters: Codable, Equatable, Sendable {
+    var query: String? = nil
+    var peerID = ""
+    var kind = ""
+    var direction = ""
+    var sinceMS: Int64? = nil
+    var untilMS: Int64? = nil
+
+    func normalized() throws -> Self {
+        var value = self
+        value.query = query?.trimmingCharacters(in: .whitespacesAndNewlines)
+        value.peerID = peerID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.query == nil || value.query?.isEmpty == false,
+              (value.query?.utf8.count ?? 0) <= 8192, value.peerID.utf8.count <= 128,
+              ["", "text", "image", "video", "voice", "file"].contains(kind),
+              ["", "incoming", "outgoing"].contains(direction),
+              sinceMS == nil || untilMS == nil || sinceMS! <= untilMS! else {
+            throw LocalChatMessageQueryError.invalid("Invalid local IM query filters.")
+        }
+        guard (try JSONEncoder().encode(value)).count <= 16000 else {
+            throw LocalChatMessageQueryError.invalid("Local IM query filters exceed the continuation budget.")
+        }
+        return value
+    }
+}
+
+struct LocalChatMessageQuery: Sendable {
+    var filters = LocalChatMessageFilters()
+    var limit = 50
+    var cursor: String? = nil
+    var deadlineUptimeNanoseconds: UInt64? = nil
+}
+
+struct LocalChatMessageQueryHit: Sendable {
+    let id: String
+    let peerUserID: String
+    let senderID: String
+    let text: String
+    let kind: String
+    let direction: String
+    let createdAtMilliseconds: Int64
+    var storedID: String { id }
+}
+
+struct LocalChatMessageQueryPage: Sendable {
+    let hits: [LocalChatMessageQueryHit]
+    let limit: Int
+    let hasMore: Bool
+    let nextCursor: String?
+    let isFirstPage: Bool
+}
+
+struct LocalChatMessageQueryIdentity: Equatable, Sendable {
+    let sdk: Int?
+    let owner: String
+    let generation: UInt64
+    let authenticated: Bool
+}
+
+// Main 发布账号身份，native 在排队前取得 owned 租约；后台回调不读取 MainActor 状态。
+// 每次身份/代际变更都废弃旧租约，即使 A→B→A，也不能重新接受旧 A 的调用。
+final class LocalChatMessageQueryAdmission: @unchecked Sendable {
+    struct Lease: Sendable {
+        fileprivate let source: LocalChatMessageQueryAdmission
+        fileprivate let revision: UInt64
+        let identity: LocalChatMessageQueryIdentity
+        var isCurrent: Bool { source.accepts(self) }
+        func belongs(to admission: LocalChatMessageQueryAdmission) -> Bool { source === admission }
+    }
+
+    private let lock = NSLock()
+    private var identity: LocalChatMessageQueryIdentity?
+    private var revision: UInt64 = 0
+
+    func update(_ identity: LocalChatMessageQueryIdentity) {
+        lock.lock()
+        if self.identity != identity { revision &+= 1; self.identity = identity }
+        lock.unlock()
+    }
+
+    func invalidate() {
+        lock.lock(); revision &+= 1; identity = nil; lock.unlock()
+    }
+
+    // 共享 Backend 被替换/释放时保留当前账号，但废弃该 bridge 尚未交付的租约。
+    func advanceRevision() {
+        lock.lock(); revision &+= 1; lock.unlock()
+    }
+
+    func capture() -> Lease? {
+        lock.lock(); defer { lock.unlock() }
+        guard let identity, identity.authenticated, !identity.owner.isEmpty else { return nil }
+        return Lease(source: self, revision: revision, identity: identity)
+    }
+
+    private func accepts(_ lease: Lease) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return revision == lease.revision && identity == lease.identity
+    }
+}
+
+private struct LocalChatMessagePageCursor: Codable {
+    let version: Int
+    let database: String
+    let sdk: String
+    let owner: String
+    let generation: UInt64
+    let filters: LocalChatMessageFilters
+    let milliseconds: Int64
+    let id: String
+}
+
+// 索引和查询共用毫秒/对端表达式，保持 wire 时间、同毫秒 ID 排序与旧 REAL 秒存储一致。
+enum LocalChatMessageSQL {
+    static let milliseconds = "CAST(ROUND(created_at * 1000.0) AS INTEGER)"
+    static let peer = "CASE WHEN peer_user_id IS NULL OR peer_user_id='' THEN CASE WHEN from_user=owner_user_id THEN to_user ELSE from_user END ELSE peer_user_id END"
+    static let kind = "CASE WHEN image_attachment IS NOT NULL AND image_attachment<>'' AND image_attachment<>'null' THEN 'image' WHEN video_attachment IS NOT NULL AND video_attachment<>'' AND video_attachment<>'null' THEN 'video' WHEN voice_attachment IS NOT NULL AND voice_attachment<>'' AND voice_attachment<>'null' THEN 'voice' WHEN file_attachment IS NOT NULL AND file_attachment<>'' AND file_attachment<>'null' THEN 'file' ELSE 'text' END"
+}
+
+fileprivate final class LocalChatMessageQueryControl: @unchecked Sendable {
+    let deadline: UInt64
+    private let lock = NSLock()
+    private var canceled = false
+    init(deadline: UInt64? = nil) {
+        self.deadline = min(deadline ?? UInt64.max, DispatchTime.now().uptimeNanoseconds + 5_000_000_000)
+    }
+    func cancel() { lock.lock(); canceled = true; lock.unlock() }
+    func check() throws {
+        lock.lock(); let value = canceled; lock.unlock()
+        if value { throw CancellationError() }
+        if DispatchTime.now().uptimeNanoseconds >= deadline {
+            throw LocalChatMessageQueryError(code: "busy", message: "Local IM query exceeded its five-second deadline.")
+        }
+    }
+    func interrupted() -> Bool { (try? check()) == nil }
+}
+
+// 排队、取消、SQL 运行共用一个截止时间；完成只交付一次，过期任务不阻塞调用方。
+private final class LocalChatMessageQueryCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<LocalChatMessageQueryPage, Error>?
+    private var pending: Result<LocalChatMessageQueryPage, Error>?
+    private var finished = false
+    func attach(_ value: CheckedContinuation<LocalChatMessageQueryPage, Error>) {
+        lock.lock()
+        if let pending { self.pending = nil; lock.unlock(); value.resume(with: pending) }
+        else { continuation = value; lock.unlock() }
+    }
+    func finish(_ result: Result<LocalChatMessageQueryPage, Error>) {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        finished = true
+        let callback = continuation
+        continuation = nil
+        if callback == nil { pending = result }
+        lock.unlock()
+        callback?.resume(with: result)
+    }
+}
+
+// 独立的两个只读 worker，不占用写入 actor；每次只读 handle/decoder 均由本任务独占。
+private final class LocalChatMessageQueryReader: @unchecked Sendable {
+    private let directory: URL
+    private let instance = UUID().uuidString
+    private let queue = OperationQueue()
+    private let lock = NSLock()
+    private var admitted = 0
+    init(directory: URL) {
+        self.directory = directory
+        queue.name = "MaiChat.IMDatabaseQuery"
+        queue.maxConcurrentOperationCount = 2
+        queue.qualityOfService = .userInitiated
+    }
+    func page(sdkAppID: Int?, owner: String, generation: UInt64,
+              request: LocalChatMessageQuery) async throws -> LocalChatMessageQueryPage {
+        let control = LocalChatMessageQueryControl(deadline: request.deadlineUptimeNanoseconds)
+        let completion = LocalChatMessageQueryCompletion()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                completion.attach(continuation)
+                lock.lock()
+                guard admitted < 32 else {
+                    lock.unlock()
+                    completion.finish(.failure(LocalChatMessageQueryError(code: "busy", message: "Local IM query workers are busy.")))
+                    return
+                }
+                admitted += 1
+                lock.unlock()
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: DispatchTime(uptimeNanoseconds: control.deadline)) {
+                    do { try control.check() } catch { completion.finish(.failure(error)) }
+                }
+                queue.addOperation { [self] in
+                    defer { lock.lock(); admitted -= 1; lock.unlock() }
+                    completion.finish(Result {
+                        try control.check()
+                        let store = LocalChatHistoryStore(baseDirectoryURL: directory)
+                        return try store.readMessageQuery(sdkAppID: sdkAppID, ownerUserID: owner,
+                            generation: generation, instance: instance, request: request, control: control)
+                    })
+                }
+            }
+        } onCancel: {
+            control.cancel()
+            completion.finish(.failure(CancellationError()))
+        }
+    }
+}
 
 /// 单条后台音频线程还维护运行循环，以接收 AVFoundation 和 SDK 回调。
 final class RemoteIMAudioWorkQueue: @unchecked Sendable {
@@ -345,6 +564,157 @@ final class LocalChatHistoryStore {
 
     func makePersistence() -> LocalChatHistoryPersistence {
         LocalChatHistoryPersistence(baseDirectoryURL: baseDirectoryURL)
+    }
+
+    // 不走会创建/迁移数据库的 withDatabase；仅读取已经由普通持久化路径初始化的库。
+    // WAL 允许查询与消息写入并行；毫秒表达式索引保证分页无需全表排序。
+    fileprivate func readMessageQuery(sdkAppID: Int?, ownerUserID: String, generation: UInt64,
+        instance: String, request: LocalChatMessageQuery, control: LocalChatMessageQueryControl)
+        throws -> LocalChatMessageQueryPage {
+        try control.check()
+        let filters = try request.filters.normalized()
+        let limit = min(max(request.limit, 1), 200)
+        let owner = ownerUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !owner.isEmpty else { throw LocalChatMessageQueryError.unavailable }
+        func identity() throws -> String {
+            guard let attributes = try? fileManager.attributesOfItem(atPath: databaseURL.path),
+                  attributes[.type] as? FileAttributeType == .typeRegular,
+                  let inode = attributes[.systemFileNumber] as? NSNumber,
+                  let device = attributes[.systemNumber] as? NSNumber else {
+                throw LocalChatMessageQueryError.unavailable
+            }
+            let raw = "\(instance)|\(databaseURL.standardizedFileURL.path)|\(device)|\(inode)"
+            return SHA256.hash(data: Data(raw.utf8)).map { String(format: "%02x", $0) }.joined()
+        }
+        let databaseIdentity = try identity()
+        let sdk = accountKey(for: sdkAppID)
+        var cursor: LocalChatMessagePageCursor?
+        if let raw = request.cursor, !raw.isEmpty {
+            guard raw.utf8.count <= 32768, let bytes = Data(base64Encoded: raw),
+                  let decoded = try? JSONDecoder().decode(LocalChatMessagePageCursor.self, from: bytes),
+                  decoded.version == 1, decoded.database == databaseIdentity, decoded.sdk == sdk,
+                  decoded.owner == owner, decoded.generation == generation, decoded.filters == filters,
+                  !decoded.id.isEmpty && decoded.id.utf8.count <= 128 else {
+                throw LocalChatMessageQueryError.invalid("The IM cursor does not match this account, database or query.")
+            }
+            cursor = decoded
+        }
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &handle,
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK, let database = handle else {
+            if let handle { sqlite3_close(handle) }
+            throw LocalChatMessageQueryError.unavailable
+        }
+        defer { sqlite3_close(database) }
+        sqlite3_busy_timeout(database, 150)
+        sqlite3_progress_handler(database, 1000, { context in
+            guard let context else { return 1 }
+            return Unmanaged<LocalChatMessageQueryControl>.fromOpaque(context).takeUnretainedValue().interrupted() ? 1 : 0
+        }, Unmanaged.passUnretained(control).toOpaque())
+        defer { sqlite3_progress_handler(database, 0, nil, nil) }
+        do {
+            let journal = try prepare(database, sql: "PRAGMA journal_mode")
+            let journalReady = sqlite3_step(journal) == SQLITE_ROW && textColumn(journal, at: 0) == "wal"
+            sqlite3_finalize(journal)
+            guard journalReady else { throw LocalChatMessageQueryError.unavailable }
+            let index = try prepare(database, sql: "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_im_query_ms','idx_im_query_peer_ms')")
+            let indexed = sqlite3_step(index) == SQLITE_ROW && sqlite3_column_int(index, 0) == 2
+            sqlite3_finalize(index)
+            guard indexed else { throw LocalChatMessageQueryError.unavailable }
+
+            let ms = LocalChatMessageSQL.milliseconds
+            let peer = LocalChatMessageSQL.peer
+            let kind = LocalChatMessageSQL.kind
+            var whereSQL = ["sdk_app_id=?", "owner_user_id=?", "group_id IS NULL"]
+            enum Binding { case text(String), integer(Int64) }
+            var bindings: [Binding] = [.text(sdk), .text(owner)]
+            if let query = filters.query {
+                whereSQL.append("instr(lower(text),lower(?))>0"); bindings.append(.text(query))
+            }
+            if !filters.peerID.isEmpty { whereSQL.append("(\(peer))=?"); bindings.append(.text(filters.peerID)) }
+            if !filters.kind.isEmpty { whereSQL.append("(\(kind))=?"); bindings.append(.text(filters.kind)) }
+            if !filters.direction.isEmpty { whereSQL.append("direction=?"); bindings.append(.text(filters.direction)) }
+            if let since = filters.sinceMS { whereSQL.append("\(ms)>=?"); bindings.append(.integer(since)) }
+            if let until = filters.untilMS { whereSQL.append("\(ms)<=?"); bindings.append(.integer(until)) }
+            if let cursor {
+                whereSQL.append("(\(ms),id)<(?,?)")
+                bindings += [.integer(cursor.milliseconds), .text(cursor.id)]
+            }
+            bindings.append(.integer(Int64(limit + 1)))
+            let sql = """
+                SELECT id,\(peer),from_user,text,\(kind),direction,\(ms)
+                FROM messages WHERE \(whereSQL.joined(separator: " AND "))
+                ORDER BY \(ms) DESC,id DESC LIMIT ?
+                """
+            let statement = try prepare(database, sql: sql)
+            defer { sqlite3_finalize(statement) }
+            for (offset, binding) in bindings.enumerated() {
+                let position = Int32(offset + 1)
+                switch binding {
+                case .text(let value):
+                    guard value.utf8.count <= Int(Int32.max) else { throw LocalChatMessageQueryError.unavailable }
+                    let status = value.withCString { pointer in
+                        sqlite3_bind_text(statement, position, pointer, Int32(value.utf8.count),
+                                          unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                    }
+                    guard status == SQLITE_OK else { throw LocalChatMessageQueryError.unavailable }
+                case .integer(let value):
+                    guard sqlite3_bind_int64(statement, position, value) == SQLITE_OK else {
+                        throw LocalChatMessageQueryError.unavailable
+                    }
+                }
+            }
+            var hits: [LocalChatMessageQueryHit] = []
+            func field(_ column: Int32) throws -> String {
+                let count = Int(sqlite3_column_bytes(statement, column))
+                if count == 0 { return "" }
+                guard let pointer = sqlite3_column_text(statement, column),
+                      let text = String(bytes: UnsafeBufferPointer(start: pointer, count: count), encoding: .utf8) else {
+                    throw LocalChatMessageQueryError(code: "internal", message: "Invalid UTF-8 in persisted IM data.")
+                }
+                return text
+            }
+            while true {
+                try control.check()
+                let result = sqlite3_step(statement)
+                if result == SQLITE_DONE { break }
+                guard result == SQLITE_ROW else {
+                    try control.check()
+                    throw LocalChatMessageQueryError(code: result == SQLITE_BUSY || result == SQLITE_LOCKED ? "busy" : "internal",
+                                                    message: "The local IM database could not finish this query.")
+                }
+                let id = try field(0)
+                let peerID = try field(1)
+                let direction = try field(5)
+                guard !id.isEmpty, id.utf8.count <= 128, !peerID.isEmpty,
+                      ["incoming", "outgoing"].contains(direction) else {
+                    throw LocalChatMessageQueryError(code: "internal", message: "The local IM database contains an invalid message row.")
+                }
+                hits.append(LocalChatMessageQueryHit(id: id, peerUserID: peerID,
+                    senderID: try field(2), text: try field(3),
+                    kind: try field(4), direction: direction,
+                    createdAtMilliseconds: sqlite3_column_int64(statement, 6)))
+            }
+            try control.check()
+            guard try identity() == databaseIdentity else { throw LocalChatMessageQueryError.changed }
+            let hasMore = hits.count > limit
+            if hasMore { hits.removeLast() }
+            var next: String?
+            if hasMore, let last = hits.last {
+                next = try JSONEncoder().encode(LocalChatMessagePageCursor(version: 1,
+                    database: databaseIdentity, sdk: sdk, owner: owner, generation: generation,
+                    filters: filters, milliseconds: last.createdAtMilliseconds, id: last.storedID)).base64EncodedString()
+            }
+            return LocalChatMessageQueryPage(hits: hits, limit: limit, hasMore: hasMore,
+                nextCursor: next, isFirstPage: cursor == nil)
+        } catch let error as LocalChatMessageQueryError { throw error }
+        catch {
+            try control.check()
+            if [SQLITE_BUSY, SQLITE_LOCKED].contains(sqlite3_errcode(database)) {
+                throw LocalChatMessageQueryError(code: "busy", message: "The local IM database is busy.")
+            }
+            throw LocalChatMessageQueryError.unavailable
+        }
     }
 
     func purgeAccount(ownerUserID: String, sdkAppID: Int? = nil) throws {
@@ -1385,6 +1755,17 @@ final class LocalChatHistoryStore {
         if previousSchemaVersion < 10 {
             try execute(database, sql: "PRAGMA user_version = 10")
         }
+        // 普通启动/写入时一次性建立只读 IM 查询索引；query worker 不改 schema 或 journal。
+        try execute(database, sql: """
+            CREATE INDEX IF NOT EXISTS idx_im_query_ms
+            ON messages(sdk_app_id,owner_user_id,\(LocalChatMessageSQL.milliseconds) DESC,id DESC)
+            WHERE group_id IS NULL
+            """)
+        try execute(database, sql: """
+            CREATE INDEX IF NOT EXISTS idx_im_query_peer_ms
+            ON messages(sdk_app_id,owner_user_id,(\(LocalChatMessageSQL.peer)),\(LocalChatMessageSQL.milliseconds) DESC,id DESC)
+            WHERE group_id IS NULL
+            """)
     }
 
     private func databaseUserVersion(_ database: OpaquePointer) throws -> Int {
@@ -1604,9 +1985,18 @@ final class LocalChatHistoryStore {
 
 actor LocalChatHistoryPersistence {
     private let store: LocalChatHistoryStore
+    private nonisolated let messageQueryReader: LocalChatMessageQueryReader
 
     init(baseDirectoryURL: URL) {
         self.store = LocalChatHistoryStore(baseDirectoryURL: baseDirectoryURL)
+        self.messageQueryReader = LocalChatMessageQueryReader(directory: baseDirectoryURL)
+    }
+
+    // 不在历史写入 actor 执行 SQL；普通调用方与 Agent 共用同一独立只读 worker。
+    nonisolated func queryMessages(sdkAppID: Int?, ownerUserID: String, generation: UInt64,
+                                  request: LocalChatMessageQuery) async throws -> LocalChatMessageQueryPage {
+        try await messageQueryReader.page(sdkAppID: sdkAppID, owner: ownerUserID,
+                                         generation: generation, request: request)
     }
 
     func purgeAccount(ownerUserID: String, sdkAppID: Int?) throws {

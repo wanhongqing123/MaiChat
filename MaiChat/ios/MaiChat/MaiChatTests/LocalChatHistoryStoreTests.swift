@@ -6,6 +6,166 @@ import XCTest
 import SQLite3
 
 final class LocalChatHistoryStoreTests: XCTestCase {
+    func testPersistedIMQueryLargeHistoryUsesIndexesAndAllowsConcurrentWrites() async throws {
+        let root = makeTemporaryDirectoryURL()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LocalChatHistoryStore(baseDirectoryURL: root)
+        let rows = (0..<100_000).map { index in
+            RemoteIMMessage(id: UUID(uuidString: String(format: "20000000-0000-0000-0000-%012d", index))!,
+                fromUserID: index % 8 == 0 ? "target" : "other", toUserID: "ios-master",
+                text: (index % 1000 == 0 ? "rare common " : "common ") + String(repeating: "owned ", count: 12),
+                direction: .incoming, status: .received,
+                createdAt: Date(timeIntervalSince1970: 1000 + Double(index) / 1000))
+        }
+        try persist(rows, in: store)
+        let reader = store.makePersistence()
+        let scenarios = [("global", "common", ""), ("peer", "common", "target"),
+                         ("rare", "rare", ""), ("nohit", "not-present", "")]
+        for (name, query, peer) in scenarios {
+            let start = DispatchTime.now().uptimeNanoseconds
+            let page = try await reader.queryMessages(sdkAppID: 1_600_148_979,
+                ownerUserID: "ios-master", generation: 1,
+                request: LocalChatMessageQuery(filters: LocalChatMessageFilters(query: query, peerID: peer)))
+            let milliseconds = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            print("OWNED IM 100k \(name) \(milliseconds)ms count=\(page.hits.count) more=\(page.hasMore)")
+            XCTAssertLessThan(milliseconds, 5000)
+            XCTAssertEqual(page.hits.count, name == "nohit" ? 0 : 50)
+            if let cursor = page.nextCursor {
+                let second = try await reader.queryMessages(sdkAppID: 1_600_148_979,
+                    ownerUserID: "ios-master", generation: 1,
+                    request: LocalChatMessageQuery(filters: LocalChatMessageFilters(query: query, peerID: peer), cursor: cursor))
+                XCTAssertTrue(Set(page.hits.map(\.storedID)).isDisjoint(with: second.hits.map(\.storedID)))
+            }
+        }
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(root.appendingPathComponent("messages.sqlite3").path, &handle,
+                                      SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil), SQLITE_OK)
+        let database = try XCTUnwrap(handle)
+        defer { sqlite3_close(database) }
+        for peerScoped in [false, true] {
+            let sql = """
+                EXPLAIN QUERY PLAN SELECT id,text FROM messages
+                WHERE sdk_app_id='1600148979' AND owner_user_id='ios-master' AND group_id IS NULL
+                  AND instr(lower(text),lower('common'))>0
+                  \(peerScoped ? "AND (" + LocalChatMessageSQL.peer + ")='target'" : "")
+                ORDER BY \(LocalChatMessageSQL.milliseconds) DESC,id DESC LIMIT 51
+                """
+            var statement: OpaquePointer?
+            XCTAssertEqual(sqlite3_prepare_v2(database, sql, -1, &statement, nil), SQLITE_OK)
+            let planStatement = try XCTUnwrap(statement)
+            var plan: [String] = []
+            while sqlite3_step(planStatement) == SQLITE_ROW {
+                if let text = sqlite3_column_text(planStatement, 3) { plan.append(String(cString: text)) }
+            }
+            sqlite3_finalize(planStatement)
+            print("OWNED IM PLAN \(peerScoped ? "peer" : "global") \(plan)")
+            XCTAssertTrue(plan.contains { $0.contains(peerScoped ? "idx_im_query_peer_ms" : "idx_im_query_ms") })
+            XCTAssertFalse(plan.contains { $0.contains("TEMP B-TREE") })
+        }
+        // 持有一个真实只读事务期间，普通持久化 actor 仍能写入；不靠测试 hook 假造并发。
+        try executeSQLite(database, sql: "BEGIN; SELECT COUNT(*) FROM messages;")
+        let start = DispatchTime.now().uptimeNanoseconds
+        _ = try await reader.persist(mutations: [.upsert([
+            RemoteIMMessage(fromUserID: "writer", toUserID: "ios-master", text: "concurrent write",
+                            direction: .incoming, status: .received, createdAt: Date(timeIntervalSince1970: 2000))
+        ], sdkAppID: 1_600_148_979, ownerUserID: "ios-master")])
+        let writerMS = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        print("OWNED IM WAL held-reader writer \(writerMS)ms")
+        XCTAssertLessThan(writerMS, 5000)
+        try executeSQLite(database, sql: "ROLLBACK")
+    }
+
+    func testPersistedIMQueryFiltersBeforeLimitAndPaginatesEqualMilliseconds() async throws {
+        let root = makeTemporaryDirectoryURL()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LocalChatHistoryStore(baseDirectoryURL: root)
+        let target = (1...3).map { index in
+            RemoteIMMessage(id: UUID(uuidString: String(format: "10000000-0000-0000-0000-%012d", index))!,
+                fromUserID: "target", toUserID: "ios-master", text: "OWNED_QUERY 100%_literal",
+                direction: .incoming, status: .received, createdAt: Date(timeIntervalSince1970: 10))
+        }
+        let noise = (0..<205).map { index in
+            RemoteIMMessage(fromUserID: "other-peer", toUserID: "ios-master", text: "OWNED_QUERY noise",
+                direction: .incoming, status: .received, createdAt: Date(timeIntervalSince1970: Double(100 + index)))
+        }
+        try persist(target + noise, in: store)
+        try persist(target, in: store, ownerUserID: "other-owner")
+        let reader = store.makePersistence()
+        let filters = LocalChatMessageFilters(query: "OWNED_QUERY", peerID: "target",
+            kind: "text", direction: "incoming", sinceMS: 10000, untilMS: 10000)
+        let first = try await reader.queryMessages(sdkAppID: 1_600_148_979,
+            ownerUserID: "ios-master", generation: 7,
+            request: LocalChatMessageQuery(filters: filters, limit: 2))
+        XCTAssertEqual(first.hits.map(\.id), [target[2].id.uuidString, target[1].id.uuidString])
+        XCTAssertTrue(first.hasMore)
+        let next = try XCTUnwrap(first.nextCursor)
+        let second = try await reader.queryMessages(sdkAppID: 1_600_148_979,
+            ownerUserID: "ios-master", generation: 7,
+            request: LocalChatMessageQuery(filters: filters, limit: 200, cursor: next))
+        XCTAssertEqual(second.hits.map(\.id), [target[0].id.uuidString])
+        XCTAssertFalse(second.hasMore)
+        XCTAssertNil(second.nextCursor)
+        XCTAssertFalse(second.isFirstPage)
+        for (owner, generation) in [("other-owner", UInt64(7)), ("ios-master", UInt64(8))] {
+            do {
+                _ = try await reader.queryMessages(sdkAppID: 1_600_148_979, ownerUserID: owner,
+                    generation: generation, request: LocalChatMessageQuery(filters: filters, cursor: next))
+                XCTFail("Cursor accepted a different account/generation")
+            } catch let error as LocalChatMessageQueryError { XCTAssertEqual(error.code, "invalid_input") }
+        }
+        let literal = try await reader.queryMessages(sdkAppID: 1_600_148_979,
+            ownerUserID: "ios-master", generation: 7,
+            request: LocalChatMessageQuery(filters: LocalChatMessageFilters(query: "100%_literal")))
+        XCTAssertEqual(literal.hits.count, 3)
+    }
+
+    func testPersistedIMQueryMissingDatabaseAndExpiredDeadlineAreErrors() async throws {
+        let root = makeTemporaryDirectoryURL()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let reader = LocalChatHistoryStore(baseDirectoryURL: root).makePersistence()
+        do {
+            _ = try await reader.queryMessages(sdkAppID: nil, ownerUserID: "owner", generation: 1,
+                request: LocalChatMessageQuery(filters: LocalChatMessageFilters(query: "absent")))
+            XCTFail("Missing database reported empty success")
+        } catch let error as LocalChatMessageQueryError { XCTAssertEqual(error.code, "not_configured") }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+        do {
+            _ = try await reader.queryMessages(sdkAppID: nil, ownerUserID: "owner", generation: 1,
+                request: LocalChatMessageQuery(deadlineUptimeNanoseconds: 0))
+            XCTFail("Expired queue/SQL deadline was ignored")
+        } catch let error as LocalChatMessageQueryError { XCTAssertEqual(error.code, "busy") }
+        let canceled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await reader.queryMessages(sdkAppID: nil, ownerUserID: "owner", generation: 1,
+                request: LocalChatMessageQuery())
+        }
+        do { _ = try await canceled.value; XCTFail("Canceled query succeeded") }
+        catch is CancellationError {}
+    }
+
+    func testPersistedIMQueryRejectsReplacedDatabaseCursor() async throws {
+        let root = makeTemporaryDirectoryURL()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LocalChatHistoryStore(baseDirectoryURL: root)
+        let rows = (0..<3).map { index in
+            RemoteIMMessage(fromUserID: "peer", toUserID: "ios-master", text: "query",
+                direction: .incoming, status: .received, createdAt: Date(timeIntervalSince1970: Double(index)))
+        }
+        try persist(rows, in: store)
+        let reader = store.makePersistence()
+        let first = try await reader.queryMessages(sdkAppID: 1_600_148_979, ownerUserID: "ios-master",
+            generation: 1, request: LocalChatMessageQuery(filters: LocalChatMessageFilters(query: "query"), limit: 1))
+        let cursor = try XCTUnwrap(first.nextCursor)
+        try FileManager.default.moveItem(at: root.appendingPathComponent("messages.sqlite3"),
+                                        to: root.appendingPathComponent("previous.sqlite3"))
+        try persist(rows, in: LocalChatHistoryStore(baseDirectoryURL: root))
+        do {
+            _ = try await reader.queryMessages(sdkAppID: 1_600_148_979, ownerUserID: "ios-master",
+                generation: 1, request: LocalChatMessageQuery(filters: LocalChatMessageFilters(query: "query"), cursor: cursor))
+            XCTFail("Old cursor accepted a replaced SQLite file")
+        } catch let error as LocalChatMessageQueryError { XCTAssertEqual(error.code, "invalid_input") }
+    }
+
     func testGroupHistoryIsPersistedAndDoesNotLeakIntoDirectPeerHistory() throws {
         let directoryURL = makeTemporaryDirectoryURL()
         defer { try? FileManager.default.removeItem(at: directoryURL) }

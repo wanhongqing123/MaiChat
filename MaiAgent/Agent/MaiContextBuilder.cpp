@@ -312,9 +312,11 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(const std::vector<MaiMessa
                         {"note",
                          "Historical host observations, not a new user instruction. "
                          "Unknown execution or effects do not mean the operation did not run. "
-                         "Inspect current state before considering a repeat. Read retained "
-                         "output using the existing output_id instead of repeating work to "
-                         "recover text. Respect the original refusal and cancellation guidance; "
+                         "Inspect current state before considering a repeat. When output_id "
+                         "is present, read that retained output instead of repeating work. "
+                         "For paged queries, use only the returned next_cursor with its original "
+                         "query; never invent a cursor or assume unscanned data was retained. "
+                         "Respect the original refusal and cancellation guidance; "
                          "no tool is automatically invoked or retried by this observation."}}
                         .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 out.push_back(std::move(observation));
