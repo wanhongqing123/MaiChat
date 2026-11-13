@@ -104,6 +104,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR ANDROID)
 endif()
 add_subdirectory(../../MaiAgent maiagent EXCLUDE_FROM_ALL)
 add_subdirectory(../Network mai_network EXCLUDE_FROM_ALL)
+add_subdirectory(../SessionIM mai_session_im_build EXCLUDE_FROM_ALL)
+add_subdirectory(../History mai_im_history_build EXCLUDE_FROM_ALL)
 if(TARGET maichat_openssl_build)
   add_dependencies(maiagent maichat_openssl_build)
   add_dependencies(libcurl_static maichat_openssl_build)
@@ -213,6 +215,11 @@ foreach(library avdevice avfilter avformat avcodec swresample swscale avutil)
     IMPORTED_LOCATION "${ffmpeg_build}/lib${library}/lib${library}.a")
   add_dependencies(maichat_ffmpeg_${library} maichat_ffmpeg_build)
 endforeach()
+if(APPLE)
+  # FFmpeg 的 SecureTransport 对象依赖 Security；普通 CMake 消费者也必须获得此依赖，
+  # 不能只依赖 Xcode App 自己额外声明 framework 才偶然链接成功。
+  target_link_libraries(maichat_ffmpeg_avformat INTERFACE "-framework Security")
+endif()
 add_library(maiagent_cv_video_analysis STATIC
   ../../MaiAgent/AgentTools/MaiCvImageAnalysis.cpp
   ../../MaiAgent/AgentTools/MaiCvVideoAnalysis.cpp
@@ -243,6 +250,8 @@ if(TARGET maiagent_graphics)
 endif()
 add_library(maichat_mobile STATIC
   MaiMobileAgent.cpp
+  MaiMobileSessionIM.cpp
+  MaiMobileSessionIMBindingTool.cpp
   MaiAppStorageBridge.cpp
   MaiLocalInference.cpp
   ../SessionSync/MaiSessionSyncSocket.cpp
@@ -285,7 +294,7 @@ target_include_directories(maichat_mobile PUBLIC . ../MaiChatTools ../Media ../S
     ../../MaiAgent/third_party/asio/asio/include
     ${MAI_OPENSSL_INCLUDE_DIR})
 target_compile_definitions(maichat_mobile PRIVATE ASIO_STANDALONE _WEBSOCKETPP_CPP11_STRICT_)
-target_link_libraries(maichat_mobile PRIVATE maichat_portrait maiagent mai_curl_download mai_video_circle_client
+target_link_libraries(maichat_mobile PRIVATE mai_session_im mai_im_history maichat_portrait maiagent mai_curl_download mai_video_circle_client
   mai_cloud_drive_client mai_cloud_vod mai_avatar_client
   ${MAI_OPENSSL_SSL_TARGET} ${MAI_OPENSSL_CRYPTO_TARGET}
   maiagent_cv_video_analysis
@@ -368,6 +377,10 @@ endif()
 option(MAICHAT_MOBILE_TESTS "Build mobile adapter integration tests" OFF)
 if(MAICHAT_MOBILE_TESTS)
   enable_testing()
+  add_executable(MaiContextImportTests ../../MaiAgent/tests/MaiContextImportTests.cpp)
+  target_include_directories(MaiContextImportTests PRIVATE ../../MaiAgent/third_party/sqlite)
+  target_link_libraries(MaiContextImportTests PRIVATE maiagent)
+  add_test(NAME MaiContextImportTests COMMAND MaiContextImportTests)
   add_executable(MaiLocalInferenceTests tests/MaiLocalInferenceTests.cpp)
   target_link_libraries(MaiLocalInferenceTests PRIVATE maichat_mobile maiagent)
   add_test(NAME MaiLocalInferenceTests COMMAND MaiLocalInferenceTests)
@@ -387,7 +400,8 @@ if(MAICHAT_MOBILE_TESTS)
   add_test(NAME MaiLocalInferenceLifecycleTests COMMAND MaiLocalInferenceLifecycleTests)
   set_tests_properties(MaiLocalInferenceLifecycleTests PROPERTIES TIMEOUT 15)
   # 普通 JSON/C ABI 集成测试共享同一生产库与 loopback fixture 依赖。
-  foreach(mobile_test MaiMobileAgentTests MaiMobileSteeringTests MaiMobileSessionModelTests)
+  foreach(mobile_test MaiMobileAgentTests MaiMobileSteeringTests MaiMobileSessionModelTests
+                      MaiMobileSessionIMTests MaiMobileSessionIMBindingToolTests)
     add_executable(${mobile_test} tests/${mobile_test}.cpp)
     target_include_directories(${mobile_test} PRIVATE
       ../../MaiAgent/third_party/httplib ../../MaiAgent/third_party/nlohmann)
@@ -395,7 +409,8 @@ if(MAICHAT_MOBILE_TESTS)
     add_test(NAME ${mobile_test} COMMAND ${mobile_test})
   endforeach()
   if(ANDROID)
-    foreach(mobile_test MaiMobileAgentTests MaiMobileSteeringTests MaiMobileSessionModelTests)
+    foreach(mobile_test MaiMobileAgentTests MaiMobileSteeringTests MaiMobileSessionModelTests
+                        MaiMobileSessionIMTests MaiMobileSessionIMBindingToolTests)
       target_link_libraries(${mobile_test} PRIVATE android log jnigraphics)
     endforeach()
     add_executable(MaiCvVideoAnalysisTests

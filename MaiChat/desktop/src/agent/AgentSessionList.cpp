@@ -213,6 +213,7 @@ struct AgentSessionList::Runtime {
     QJsonArray remoteSessions;
     QJsonArray remoteDevices;
     QSet<QString> collapsedDevices;
+    QStringList projectedLocalRoots;
 };
 
 AgentSessionList::AgentSessionList(AgentController& controller, QWidget* parent)
@@ -401,6 +402,8 @@ void AgentSessionList::showLocalSessionMenu(const QString& sessionId,
     menu->popup(position);
 }
 
+QStringList AgentSessionList::projectedLocalRootIds() const { return runtime_->projectedLocalRoots; }
+
 void AgentSessionList::refresh() {
     const int scroll = runtime_->list->verticalScrollBar()->value();
     runtime_->list->clear();
@@ -424,6 +427,11 @@ void AgentSessionList::refresh() {
     };
     // listSessions 已经按 updated 倒序，最近动过的在最上面——和 IM 那边的会话列表一致。
     const auto localSessions = runtime_->controller->agent().listSessions();
+    const auto previousRoots = runtime_->projectedLocalRoots;
+    runtime_->projectedLocalRoots.clear();
+    for (const auto& session : localSessions)
+        if (session.isRoot()) runtime_->projectedLocalRoots.append(fromUtf8(session.id));
+    if (previousRoots != runtime_->projectedLocalRoots) emit localRootIdsProjected(runtime_->projectedLocalRoots);
     const QString localGroup = QStringLiteral("local");
     // 空账户也保留本机标题和 +，首次新建与已有会话使用同一个入口。
 #ifdef Q_OS_WIN

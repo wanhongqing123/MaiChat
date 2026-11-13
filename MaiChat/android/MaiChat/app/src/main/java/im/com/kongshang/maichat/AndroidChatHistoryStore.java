@@ -802,6 +802,38 @@ public final class AndroidChatHistoryStore extends SQLiteOpenHelper {
         }
     }
 
+    /** 普通入站第一阶段：事务中判断真实 SDK ID 是否已存在，只插入安全元数据，不把重复当新消息。 */
+    public RemoteIMIngress.Stored insertInitialMetadata(String ownerId, RemoteIMMessage initial) {
+        String owner = clean(ownerId), peer = initial.fromUserId();
+        if (owner.isEmpty() || peer.isEmpty() || !owner.equals(initial.toUserId())
+                || initial.direction() != RemoteIMMessage.Direction.INCOMING)
+            throw new IllegalArgumentException("Invalid incoming metadata owner");
+        SQLiteDatabase database = getWritableDatabase();
+        database.beginTransactionNonExclusive();
+        try {
+            if (!initial.remoteId().isEmpty()) try (Cursor rows = database.query("messages",
+                    new String[]{"id", "remote_id", "created_at"}, "owner_id=? AND peer_id=? AND remote_id=?",
+                    new String[]{owner, peer, initial.remoteId()}, null, null, "created_at DESC,id DESC", "1")) {
+                if (rows.moveToFirst()) {
+                    RemoteIMIngress.Stored existing = new RemoteIMIngress.Stored(rows.getString(0), rows.getString(1), rows.getLong(2), false);
+                    database.setTransactionSuccessful(); return existing;
+                }
+            }
+            // 第一阶段只保留安全历史元数据；即使普通调用者传入完整对象，也不提前落审批控制令牌。
+            RemoteIMMessage safe = new RemoteIMMessage(initial.id(), initial.remoteId(), initial.fromUserId(), initial.toUserId(),
+                initial.text(), initial.direction(), initial.status(), initial.createdAtMillis(), initial.imageAttachment(),
+                initial.voiceAttachment(), initial.fileAttachment(), initial.videoAttachment(), initial.origin());
+            safe.setQuote(initial.quote()); safe.setCaptionAbove(initial.captionAbove());
+            upsertMessage(owner, safe);
+            try (Cursor check = database.rawQuery("SELECT 1 FROM messages WHERE owner_id=? AND id=?",
+                    new String[]{owner, initial.id()})) {
+                if (!check.moveToFirst()) throw new IllegalStateException("Incoming metadata was not persisted");
+            }
+            database.setTransactionSuccessful();
+            return new RemoteIMIngress.Stored(initial.id(), initial.remoteId(), initial.createdAtMillis(), true);
+        } finally { database.endTransaction(); }
+    }
+
     // 作用：按账号和消息稳定标识插入或更新本地记录。
     public void upsertMessage(String ownerId, RemoteIMMessage message) {
         String owner = clean(ownerId);

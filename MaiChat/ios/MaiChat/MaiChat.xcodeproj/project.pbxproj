@@ -173,6 +173,10 @@
 		FDA2578FF477E1ECA48FF2E7 /* Pods_MaiChat.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 214646A398A175538DB4E41C /* Pods_MaiChat.framework */; };
 		FEA124404840D00F968F232A /* RemoteDesktopView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96C6084AAC26D9F252151972 /* RemoteDesktopView.swift */; };
 		FFAF8D81EC77F8653412DEEE /* AIMobileSMSInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94C41D820ED78119CDF742EC /* AIMobileSMSInbox.swift */; };
+		4A5C933328E8682CB902209F /* IMSessionBinding.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA5166D8977135BFEE1CA069 /* IMSessionBinding.swift */; };
+		6E2821272D1EED42D4514585 /* IMSessionBindingUITestFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62F81069A9866944392256C4 /* IMSessionBindingUITestFixture.swift */; };
+		43CB001F7BE8793B746B3B1A /* IMIngressPersistenceFence.swift in Sources */ = {isa = PBXBuildFile; fileRef = D65E11DAE5DE348A9B594930 /* IMIngressPersistenceFence.swift */; };
+		DEBAA169689B377980F0F664 /* IMIngressPersistenceFence.swift in Sources */ = {isa = PBXBuildFile; fileRef = D65E11DAE5DE348A9B594930 /* IMIngressPersistenceFence.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -385,6 +389,9 @@
 		FAC1BDC1E5B9CFCEB0211160 /* AppTypographyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTypographyTests.swift; sourceTree = "<group>"; };
 		FBCF1B230D1ACE9CD4748EE4 /* RemoteDesktopSignal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteDesktopSignal.swift; sourceTree = "<group>"; };
 		FBE546568A0B3FFA1551D803 /* SpeechRecognizing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechRecognizing.swift; sourceTree = "<group>"; };
+		AA5166D8977135BFEE1CA069 /* IMSessionBinding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMSessionBinding.swift; sourceTree = "<group>"; };
+		62F81069A9866944392256C4 /* IMSessionBindingUITestFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMSessionBindingUITestFixture.swift; sourceTree = "<group>"; };
+		D65E11DAE5DE348A9B594930 /* IMIngressPersistenceFence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMIngressPersistenceFence.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -422,6 +429,7 @@
 			isa = PBXGroup;
 			children = (
 				A45963E1F6BECDABFBE96C68 /* AccountToolsUITestFixture.swift */,
+				62F81069A9866944392256C4 /* IMSessionBindingUITestFixture.swift */,
 				5581AF6F742B813887C927BF /* AIAssistantModel+UITesting.swift */,
 				EE811292FBDC9F5C915A62AD /* AIAssistantUITestFixtures.swift */,
 				69CDC9A44DA7E05B9516BCDD /* AILocalInferenceUITestFixture.swift */,
@@ -514,6 +522,8 @@
 		54465CEE1C20AEE9267E6E5E /* IM */ = {
 			isa = PBXGroup;
 			children = (
+				AA5166D8977135BFEE1CA069 /* IMSessionBinding.swift */,
+				D65E11DAE5DE348A9B594930 /* IMIngressPersistenceFence.swift */,
 				131DCE635A48A9FA78E58E2E /* LocalChatHistoryStore.swift */,
 				B96C8AF4A3B38EE7F6C29E03 /* MaiAccountProfile.swift */,
 				D1D43CB045C50EED65F90E94 /* MaiChatAttachmentDownloader.swift */,
@@ -1131,6 +1141,7 @@
 				ECFA3017473738D476B0EF28 /* AppTypographyTests.swift in Sources */,
 				0B2637847F5454F182126805 /* ComposerDraftState.swift in Sources */,
 				F0D9326831C7925F6C4FC5D6 /* DiagnosticLogTests.swift in Sources */,
+				DEBAA169689B377980F0F664 /* IMIngressPersistenceFence.swift in Sources */,
 				B3C7936F82D3E8A8FCE2998D /* LocalChatHistoryStore.swift in Sources */,
 				9647FC458C5CF43214B64E71 /* LocalChatHistoryStoreTests.swift in Sources */,
 				E33E3494243A3DDB309C0D94 /* MarkdownInlineStyling.swift in Sources */,
@@ -1174,6 +1185,7 @@
 				E5FB8A9EA66B3B9094AD2DE2 /* AIPrimaryModelUITestSupport.swift in Sources */,
 				4C4477065297E131AF9D8B52 /* AISessionDrawerDiagnostics.swift in Sources */,
 				4C7BEDAB56558EA2A532AE0B /* AccountToolsUITestFixture.swift in Sources */,
+				6E2821272D1EED42D4514585 /* IMSessionBindingUITestFixture.swift in Sources */,
 				DF6DB710A7BAB0AD6FA5093B /* AgentDocumentTools.swift in Sources */,
 				3FC629E94BB3651A605079B8 /* AliyunRealtimeSpeechRecognizer.swift in Sources */,
 				26497B03C9AD2C69921B8501 /* AliyunSpeechTranscript.swift in Sources */,
@@ -1196,6 +1208,8 @@
 				D153C2A4F2F5D6211CEB78B5 /* DesktopLoginScanView.swift in Sources */,
 				799B5E67647F1FD4B5F3874B /* GroupChatUITestData.swift in Sources */,
 				85FCBAC4610F6234A4215930 /* KeychainSecretStore.swift in Sources */,
+				4A5C933328E8682CB902209F /* IMSessionBinding.swift in Sources */,
+				43CB001F7BE8793B746B3B1A /* IMIngressPersistenceFence.swift in Sources */,
 				A61181A92420CE7BED70E67C /* LocalChatHistoryStore.swift in Sources */,
 				CAE5C1AEEBE80B9A14E59DAE /* LocalSettingsStore.swift in Sources */,
 				F6872878C23C1B83C4CDFC28 /* MaiAccountProfile.swift in Sources */,

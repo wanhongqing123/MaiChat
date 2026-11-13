@@ -395,6 +395,48 @@ Java_com_kongshang_maichat_AIAssistantController_nativeRequest(
   return result;
 }
 
+// 即时撤销/SDK 派发核准不进入 Agent 串行队列，避免 Main/SDK 回调递归等待自身。
+// 使用标准 UTF-8 bytes 而非 JNI modified UTF-8，晚到回调也不保存 raw native handle。
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_kongshang_maichat_AIAssistantController_nativeSessionIMControl(
+    JNIEnv* env, jclass, jbyteArray data) {
+  if (data == nullptr) return nullptr;
+  const jsize size = env->GetArrayLength(data);
+  if (size <= 0 || size > 256 * 1024) return nullptr;
+  std::string request(static_cast<std::size_t>(size), '\0');
+  env->GetByteArrayRegion(data, 0, size, reinterpret_cast<jbyte*>(&request[0]));
+  if (env->ExceptionCheck()) return nullptr;
+  if (request.find('\0') != std::string::npos) return nullptr;
+  char* response = maiMobileSessionIMControl(request.c_str());
+  if (response == nullptr) return nullptr;
+  const auto count = static_cast<jsize>(std::strlen(response));
+  jbyteArray result = env->NewByteArray(count);
+  if (result != nullptr)
+    env->SetByteArrayRegion(result, 0, count, reinterpret_cast<const jbyte*>(response));
+  maiMobileAgentFree(response);
+  return result;
+}
+
+// 与控制入口区分：此函数会读本地 SQLite，Java 只能在普通准备 I/O worker 调用。
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_kongshang_maichat_AIAssistantController_nativeIMHistorySnapshot(
+    JNIEnv* env, jclass, jbyteArray data) {
+  if (data == nullptr) return nullptr;
+  const jsize size = env->GetArrayLength(data);
+  if (size <= 0 || size > 1024 * 1024) return nullptr;
+  std::string request(static_cast<std::size_t>(size), '\0');
+  env->GetByteArrayRegion(data, 0, size, reinterpret_cast<jbyte*>(&request[0]));
+  if (env->ExceptionCheck() || request.find('\0') != std::string::npos) return nullptr;
+  char* response = maiMobileIMHistorySnapshot(request.c_str());
+  if (response == nullptr) return nullptr;
+  const auto count = static_cast<jsize>(std::strlen(response));
+  jbyteArray result = env->NewByteArray(count);
+  if (result != nullptr)
+    env->SetByteArrayRegion(result, 0, count, reinterpret_cast<const jbyte*>(response));
+  maiMobileAgentFree(response);
+  return result;
+}
+
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_kongshang_maichat_AIAssistantController_nativeMatteVideo(
     JNIEnv *env, jclass, jbyteArray arguments, jbyteArray workspace,

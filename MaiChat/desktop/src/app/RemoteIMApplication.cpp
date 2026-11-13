@@ -266,6 +266,135 @@ RemoteIMApplication::RemoteIMApplication(QString ownerUserId,
     }
 }
 
+struct RemoteIMApplication::MetadataReceipt {
+    RemoteDiagnostics::AccountTag account;
+    quint64 generation = 0;
+    QString id, sender, recipient;
+};
+
+struct RemoteIMApplication::IMHistoryFence {
+    IMHistorySource source;
+    quint64 sequence = 0;
+    std::shared_ptr<std::atomic_bool> canceled;
+    IMHistoryFenceCompletion completion;
+    QPointer<QTimer> timer;
+    QDeadlineTimer deadline{30000};
+    bool done = false;
+};
+
+std::optional<RemoteIMApplication::IMHistorySource> RemoteIMApplication::imHistorySource(
+    const QString& peer, QString* error) const {
+    const auto account = client_->currentAccount();
+    const auto reject = [error](const QString& value) -> std::optional<IMHistorySource> {
+        if (error) *error = value;
+        return std::nullopt;
+    };
+    if (!connectionReady() || !account.isValid() || account.ownerUserId != state_.ownerUserId() ||
+        !acceptedFriendsReady() || peer.isEmpty() || peer == account.ownerUserId || !isAcceptedFriend(peer))
+        return reject(QStringLiteral("当前账号或好友资料尚未准备好，不能导入历史。"));
+    const QString path = database_ ? database_->historyDatabasePath() : QString();
+    if (path.isEmpty()) return reject(QStringLiteral("当前账号的本地消息库不可用，无法完整导入聊天历史。"));
+    if (error) error->clear();
+    RemoteIMClient::LiveMetadataBoundary boundary;
+    client_->withLiveMetadataBoundary([&](auto value) { boundary = value; });
+    return IMHistorySource{path, account, connectionGeneration_, boundary.generation};
+}
+
+void RemoteIMApplication::awaitIMHistoryMetadataFence(const IMHistorySource& source,
+    std::shared_ptr<std::atomic_bool> canceled, IMHistoryFenceCompletion completion) {
+    auto fence = std::make_shared<IMHistoryFence>();
+    fence->source = source;
+    client_->withLiveMetadataBoundary([&](auto boundary) { fence->sequence = boundary.sequence; });
+    fence->canceled = canceled ? std::move(canceled) : std::make_shared<std::atomic_bool>(false);
+    fence->completion = std::move(completion);
+    auto* timer = new QTimer(this);
+    fence->timer = timer;
+    timer->setObjectName(QStringLiteral("sessionImHistoryMetadataFence"));
+    timer->setInterval(25);
+    connect(timer, &QTimer::timeout, this, &RemoteIMApplication::drainIMHistoryFences);
+    historyFences_.append(fence);
+    timer->start();
+    // Provisional routing is already published. Even an empty immediate fence
+    // yields once so reentrant live metadata keeps its original binding epoch.
+    QTimer::singleShot(0, this, &RemoteIMApplication::drainIMHistoryFences);
+}
+
+void RemoteIMApplication::drainIMHistoryFences() {
+    const auto fences = historyFences_;
+    QPointer<RemoteIMApplication> lifetime(this);
+    for (const auto& fence : fences) {
+        if (fence->done) continue;
+        QString error;
+        RemoteIMClient::LiveMetadataBoundary boundary;
+        client_->withLiveMetadataBoundary([&](auto value) { boundary = value; });
+        if (fence->canceled->load()) error = QStringLiteral("历史导入已取消。");
+        else if (!connectionReady() || client_->currentAccount() != fence->source.account ||
+            connectionGeneration_ != fence->source.connectionGeneration || boundary.generation != fence->source.rawGeneration || !database_ ||
+            database_->historyDatabasePath() != fence->source.databasePath)
+            error = QStringLiteral("账号或本地消息库已改变，历史导入已取消。");
+        else if (!metadataPersistenceError_.isEmpty()) error = QStringLiteral("原始消息未能完整保存到本地，历史导入没有完成。");
+        else if (fence->deadline.hasExpired()) error = QStringLiteral("等待原始消息保存超时，历史导入没有完成。");
+        else if (metadataCompletedSequence_ < fence->sequence) continue;
+        fence->done = true;
+        if (fence->timer) { fence->timer->stop(); fence->timer->deleteLater(); }
+        historyFences_.removeOne(fence);
+        auto complete = std::move(fence->completion);
+        if (complete) complete(error.isEmpty(), error);
+        if (!lifetime) return;
+    }
+}
+
+void RemoteIMApplication::announceIMMetadata(quint64 ingress, const RemoteIMMessage& message,
+    quint64 rawSequence, quint64 rawGeneration) {
+    const auto account = client_->currentAccount();
+    const quint64 generation = connectionGeneration_;
+    RemoteIMClient::LiveMetadataBoundary boundary;
+    client_->withLiveMetadataBoundary([&](auto value) { boundary = value; });
+    if (!connectionReady() || !account.isValid() || account.ownerUserId != state_.ownerUserId() ||
+        message.toUserId != account.ownerUserId || message.direction != RemoteIMMessageDirection::Incoming ||
+        message.fromUserId == account.ownerUserId || (rawGeneration && rawGeneration != boundary.generation) ||
+        RemoteDesktopSignals::isSignalText(message.text)) return;
+    const QPointer<RemoteIMApplication> lifetime(this);
+    emit sessionImMessageAnnounced(ingress, message, rawSequence, rawGeneration);
+    if (!lifetime || !connectionReady() || generation != connectionGeneration_ || client_->currentAccount() != account) return;
+    const auto receipt = database_ ? database_->persistMessageMetadata(message, message.fromUserId) :
+        LocalMessagePersistenceResult{false, false, QStringLiteral("Local message database is unavailable")};
+    if (receipt.ok) {
+        auto metadata = std::make_shared<MetadataReceipt>();
+        metadata->account = account;
+        metadata->generation = generation;
+        metadata->id = message.id;
+        metadata->sender = message.fromUserId;
+        metadata->recipient = message.toUserId;
+        metadataReceipts_.insert(ingress, metadata);
+        if (receipt.inserted) firstMetadataRows_.insert(message.id);
+    } else metadataPersistenceError_ = receipt.error;
+    emit sessionImMessagePersisted(ingress, receipt.ok, receipt.inserted, message.id, receipt.error);
+}
+
+void RemoteIMApplication::readyIMMetadata(quint64 ingress, const RemoteIMMessage& message) {
+    const auto receipt = metadataReceipts_.value(ingress);
+    if (!receipt || !connectionReady() || receipt->generation != connectionGeneration_ ||
+        client_->currentAccount() != receipt->account || receipt->id != message.id ||
+        receipt->sender != message.fromUserId || receipt->recipient != message.toUserId) return;
+    metadataReceipts_.remove(ingress);
+    const auto enriched = database_ ? database_->enrichMessageAttachments(message, message.fromUserId) :
+        LocalMessagePersistenceResult{false, false, QStringLiteral("Local message database is unavailable")};
+    if (!enriched.ok) {
+        metadataPersistenceError_ = enriched.error;
+        firstMetadataRows_.remove(message.id);
+        emit sessionImMessageFailed(ingress, QStringLiteral("收到的附件未能保存到原始消息记录，没有提交给创作中心。"));
+        return;
+    }
+    emit sessionImMessageReady(ingress, message);
+}
+
+void RemoteIMApplication::failIMMetadata(quint64 ingress, const QString& error) {
+    const auto receipt = metadataReceipts_.take(ingress);
+    if (receipt) firstMetadataRows_.remove(receipt->id);
+    if (connectionReady()) emit sessionImMessageFailed(ingress, error);
+}
+
 void RemoteIMApplication::queryLocalMessages(const LocalMessageSearchRequest& query,
         std::shared_ptr<std::atomic_bool> canceled, MessageSearchCompletion completion,
         QDeadlineTimer deadline) {
@@ -857,13 +986,30 @@ int RemoteIMApplication::loadEarlierMessages(const QString& peerId) {
 }
 
 void RemoteIMApplication::connectToService(int sdkAppId, const QString& userSig) {
-    ++connectionGeneration_;
+    const quint64 generation = ++connectionGeneration_;
     messageQueryGeneration_->fetch_add(1);
-    client_->connectToService(sdkAppId, state_.ownerUserId(), userSig, [this](bool ok, const QString& error) {
-        connected_ = ok;
-        emit connectionChanged(connected_);
-        if (connected_) refreshGroups();
-        if (!ok) emit errorMessage(error.isEmpty() ? QStringLiteral("IM 连接失败") : error);
+    connected_ = false;
+    acceptedFriendsLoaded_ = false;
+    metadataReceipts_.clear();
+    firstMetadataRows_.clear();
+    metadataCompletedSequence_ = 0;
+    completedMetadataBatches_.clear();
+    metadataPersistenceError_.clear();
+    const QPointer<RemoteIMApplication> self(this);
+    emit connectionChanged(false);
+    if (!self) return;
+    drainIMHistoryFences();
+    if (!self) return;
+    client_->connectToService(sdkAppId, state_.ownerUserId(), userSig, [self, generation](bool ok, const QString& error) {
+        if (!self) return;
+        QMetaObject::invokeMethod(self, [self, generation, ok, error] {
+            if (!self || self->connectionGeneration_ != generation || self->disconnecting_) return;
+            self->connected_ = ok;
+            emit self->connectionChanged(ok);
+            if (!self) return;
+            if (ok) { self->refreshGroups(); self->refreshFriendList(); }
+            if (self && !ok) emit self->errorMessage(error.isEmpty() ? QStringLiteral("IM 连接失败") : error);
+        }, Qt::AutoConnection);
     });
 }
 
@@ -876,6 +1022,11 @@ void RemoteIMApplication::disconnectFromService(RemoteIMCompletion completion) {
     ++connectionGeneration_;
     messageQueryGeneration_->fetch_add(1);
     const QPointer<RemoteIMApplication> self(this);
+    acceptedFriendsLoaded_ = false;
+    metadataReceipts_.clear();
+    firstMetadataRows_.clear();
+    drainIMHistoryFences();
+    if (!self) return;
     client_->disconnectFromService([self](bool ok, const QString& error) {
         if (!self) return;
         QMetaObject::invokeMethod(self, [self, ok, error] {
@@ -939,6 +1090,7 @@ void RemoteIMApplication::setFriendAccountResolver(FriendAccountResolver resolve
 
 void RemoteIMApplication::setAccountFriendOperations(AccountFriendOperations operations) {
     accountFriendOperations_ = std::move(operations);
+    acceptedFriendsLoaded_ = false;
     refreshFriendList();
 }
 
@@ -1137,15 +1289,17 @@ void RemoteIMApplication::requestFriendById(const QString& userId,
 void RemoteIMApplication::refreshFriendList() {
     if (accountFriendOperations_.list) {
         QPointer<RemoteIMApplication> self(this);
-        accountFriendOperations_.list([self](const QList<AccountFriend>& friends,
+        const auto generation = connectionGeneration_;
+        accountFriendOperations_.list([self, generation](const QList<AccountFriend>& friends,
                                              const QString& error) {
             if (!self) return;
             if (!error.isEmpty()) {
                 emit self->errorMessage(QStringLiteral("好友列表加载失败：%1").arg(error));
                 return;
             }
-            QMetaObject::invokeMethod(self, [self, friends] {
-                if (!self) return;
+            QMetaObject::invokeMethod(self, [self, generation, friends] {
+                if (!self || self->connectionGeneration_ != generation) return;
+                self->acceptedFriendsLoaded_ = true;
                 self->acceptedFriendIds_.clear();
                 self->friendAccountByImId_.clear();
                 self->friendDisplayByImId_.clear();
@@ -1173,6 +1327,7 @@ void RemoteIMApplication::refreshFriendList() {
                     if (self->database_) self->database_->upsertContact(current);
                 }
                 emit self->stateChanged();
+                if (self) emit self->acceptedFriendsChanged();
             }, Qt::AutoConnection);
         });
         return;
@@ -2018,7 +2173,35 @@ void RemoteIMApplication::bindClientSignals() {
     connect(client_.get(), &RemoteIMClient::groupMembershipChanged, this,
             [this] { refreshGroups(); });
     connect(client_.get(), &RemoteIMClient::liveMessagesReceived, this, [this](const QList<RemoteIMMessage>& messages) {
+        // Immediate transports announce and become ready in this same call.
+        // The SDK announces earlier, before media downloads, on its own channel.
+        if (!client_->hasExplicitLiveReadiness()) {
+            const auto generation = connectionGeneration_;
+            const QPointer<RemoteIMApplication> self(this);
+            for (const auto& message : messages) {
+                if (RemoteDesktopSignals::isSignalText(message.text)) continue;
+                const quint64 ingressId = ++immediateLiveIngressId_;
+                announceIMMetadata(ingressId, message);
+                if (!self || generation != connectionGeneration_) return;
+                readyIMMetadata(ingressId, message);
+                if (!self || generation != connectionGeneration_) return;
+            }
+        }
         ingestMessages(messages, /*live=*/true);
+    });
+    connect(client_.get(), &RemoteIMClient::liveMessageAnnounced, this, &RemoteIMApplication::announceIMMetadata);
+    connect(client_.get(), &RemoteIMClient::liveMessageReady, this, &RemoteIMApplication::readyIMMetadata);
+    connect(client_.get(), &RemoteIMClient::liveMessageFailed, this, &RemoteIMApplication::failIMMetadata);
+    connect(client_.get(), &RemoteIMClient::liveMetadataBatchFinished, this, [this](quint64 sequence, bool parsed, quint64 generation) {
+        RemoteIMClient::LiveMetadataBoundary boundary;
+        client_->withLiveMetadataBoundary([&](auto value) { boundary = value; });
+        if (!connectionReady() || (generation && generation != boundary.generation)) return;
+        if (!parsed) metadataPersistenceError_ = QStringLiteral("Raw IM metadata could not be parsed");
+        // Nested Qt event loops can finish a later parsed batch first. A fence
+        // advances only over a contiguous prefix, never over a missing raw row.
+        if (sequence > metadataCompletedSequence_) completedMetadataBatches_.insert(sequence);
+        while (completedMetadataBatches_.remove(metadataCompletedSequence_ + 1)) ++metadataCompletedSequence_;
+        drainIMHistoryFences();
     });
     connect(client_.get(), &RemoteIMClient::activityReceived, this,
             [this](const QString& fromUserId, const RemoteIMActivitySignal& signal) {
@@ -2092,9 +2275,11 @@ void RemoteIMApplication::ingestMessages(const QList<RemoteIMMessage>& messages,
         // 首次入库才算「新消息」。漫游和实时两条路会投递同一条消息，
         // 没有库时退化成「实时的都算新」——那种模式下本来也没有历史可重复。
         bool firstTimeSeen = true;
+        const bool metadataInserted = live && firstMetadataRows_.remove(message.id);
         if (database_) {
             database_->upsertContact(RemoteIMContact{peerId, peerId});
             firstTimeSeen = database_->insertMessageIfAbsent(message, peerId);
+            firstTimeSeen = firstTimeSeen || metadataInserted;
         }
         if (live) {
             state_.appendLiveMessage(message);

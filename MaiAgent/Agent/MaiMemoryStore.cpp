@@ -5,14 +5,176 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <variant>
+
+#include "MaiIdGenerator.h"
 
 namespace {
 
 class MemoryStore final : public MaiSessionStore {
 public:
+    MaiResult<MaiContextImportProgress> beginContextImport(
+        const MaiContextImportSpec& spec) override {
+        if (const auto error = maiValidateContextImportSpec(spec)) return error;
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mSessions.count(spec.sessionId) == 0)
+            return {MaiErrorCode::NotFound, "Context import session is unavailable."};
+        for (const auto& entry : mImports)
+            if (!entry.second.progress.committed && !entry.second.aborted &&
+                entry.second.spec.sessionId == spec.sessionId &&
+                entry.second.spec.sourceKey == spec.sourceKey)
+                return {MaiErrorCode::Busy, "A context snapshot is already being staged."};
+        ImportSnapshot snapshot;
+        snapshot.spec = spec;
+        snapshot.progress = {MaiIdGenerator::generate("imp"),
+                             spec.sessionId,
+                             spec.sourceKey,
+                             spec.snapshotId,
+                             0,
+                             0,
+                             false};
+        const auto progress = snapshot.progress;
+        mImports.emplace(progress.importId, std::move(snapshot));
+        return progress;
+    }
+
+    MaiResult<MaiContextImportProgress> appendContextImport(
+        const std::string& importId, std::uint64_t sequence,
+        const std::vector<MaiContextImportRecord>& records) override {
+        if (const auto error = maiValidateContextImportBatch(records)) return error;
+        const auto digest = maiContextImportBatchDigest(records);
+        if (digest.empty()) return {MaiErrorCode::Internal, "Cannot fingerprint context batch."};
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mImports.find(importId);
+        if (found == mImports.end())
+            return {MaiErrorCode::NotFound, "Context import is unavailable."};
+        auto& snapshot = found->second;
+        if (snapshot.aborted) return {MaiErrorCode::NotFound, "Context import was aborted."};
+        if (snapshot.progress.committed)
+            return {MaiErrorCode::InvalidInput, "Context import is already committed."};
+        const auto prior = snapshot.chunks.find(sequence);
+        if (prior != snapshot.chunks.end()) {
+            if (prior->second == digest) return snapshot.progress;
+            return {MaiErrorCode::InvalidInput, "Context batch retry has different content."};
+        }
+        if (sequence != snapshot.progress.nextSequence ||
+            sequence >= static_cast<std::uint64_t>(INT64_MAX) ||
+            (snapshot.progress.recordCount &&
+             records.front().originalCreatedAtMillis < snapshot.lastCreated))
+            return {MaiErrorCode::InvalidInput, "Context batch sequence or chronology is invalid."};
+        for (const auto& record : records)
+            if (snapshot.sourceIds.count(record.sourceId))
+                return {MaiErrorCode::InvalidInput, "Context source record is duplicated."};
+        // 全批验证后才改变暂存，普通读仍只跟随可见来源指针。
+        for (const auto& record : records) {
+            MaiMessage message;
+            message.id = MaiIdGenerator::newMessageId();
+            message.created = record.originalCreatedAtMillis;
+            message.completed = std::max<std::int64_t>(1, message.created);
+            message.parts.push_back(
+                {MaiIdGenerator::newPartId(), MaiTextPart{record.text}, message.created});
+            snapshot.messages.emplace(message.id, std::move(message));
+            snapshot.sourceIds.insert(record.sourceId);
+        }
+        snapshot.lastCreated = records.back().originalCreatedAtMillis;
+        snapshot.chunks.emplace(sequence, digest);
+        ++snapshot.progress.nextSequence;
+        snapshot.progress.recordCount += records.size();
+        return snapshot.progress;
+    }
+
+    MaiResult<MaiContextImportProgress> inspectContextImport(
+        const std::string& importId) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mImports.find(importId);
+        if (found == mImports.end() || found->second.aborted)
+            return {MaiErrorCode::NotFound, "Context import is unavailable."};
+        return found->second.progress;
+    }
+
+    MaiResult<MaiContextImportProgress> commitContextImport(const std::string& importId) override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mImports.find(importId);
+        if (found == mImports.end())
+            return {MaiErrorCode::NotFound, "Context import is unavailable."};
+        auto& snapshot = found->second;
+        if (snapshot.aborted) return {MaiErrorCode::NotFound, "Context import was aborted."};
+        if (snapshot.progress.committed) return snapshot.progress;
+        mCurrentImports[{snapshot.spec.sessionId, snapshot.spec.sourceKey}] = importId;
+        mContextCheckpoints.erase(snapshot.spec.sessionId);
+        snapshot.progress.committed = true;
+        return snapshot.progress;
+    }
+
+    MaiError abortContextImport(const std::string& importId) override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto found = mImports.find(importId);
+        if (found == mImports.end() || found->second.aborted)
+            return {MaiErrorCode::NotFound, "Context import is unavailable."};
+        if (found->second.progress.committed)
+            return {MaiErrorCode::InvalidInput, "Published context cannot be aborted."};
+        found->second.aborted = true;
+        return {};
+    }
+
+    MaiResult<MaiContextImportPurgeResult> purgeContextImports(const std::string& sessionId,
+                                                               std::size_t maxMessages) override {
+        if (maxMessages == 0 || maxMessages > kMaiContextImportMaxPurgeMessages)
+            return {MaiErrorCode::InvalidInput, "Context maintenance budget is invalid."};
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!mSessions.count(sessionId))
+            return {MaiErrorCode::NotFound, "Context session is unavailable."};
+        const auto eligible = [&](const ImportSnapshot& snapshot) {
+            const auto current =
+                mCurrentImports.find({snapshot.spec.sessionId, snapshot.spec.sourceKey});
+            return snapshot.spec.sessionId == sessionId &&
+                   (snapshot.aborted || snapshot.progress.committed) &&
+                   (current == mCurrentImports.end() ||
+                    current->second != snapshot.progress.importId);
+        };
+        MaiContextImportPurgeResult result;
+        std::size_t metadataBudget = maxMessages;
+        for (auto it = mImports.begin(); it != mImports.end();) {
+            if (!eligible(it->second)) {
+                ++it;
+                continue;
+            }
+            while (!it->second.messages.empty() && result.removed < maxMessages) {
+                it->second.messages.erase(it->second.messages.begin());
+                ++result.removed;
+            }
+            // 空来源也有独立配额，避免很多空快照令单次维护无限扫描/释放。
+            if (it->second.messages.empty()) {
+                while (!it->second.sourceIds.empty() && metadataBudget != 0) {
+                    it->second.sourceIds.erase(it->second.sourceIds.begin());
+                    --metadataBudget;
+                }
+                while (!it->second.chunks.empty() && metadataBudget != 0) {
+                    it->second.chunks.erase(it->second.chunks.begin());
+                    --metadataBudget;
+                }
+                if (it->second.sourceIds.empty() && it->second.chunks.empty() &&
+                    metadataBudget != 0) {
+                    --metadataBudget;
+                    it = mImports.erase(it);
+                } else
+                    ++it;
+            } else
+                ++it;
+            if (result.removed == maxMessages && metadataBudget == 0) break;
+        }
+        for (const auto& entry : mImports) {
+            if (eligible(entry.second)) {
+                result.hasMore = true;
+                break;
+            }
+        }
+        return result;
+    }
+
     void putSession(const MaiSession& session) override {
         std::lock_guard<std::mutex> lock(mMutex);
         mSessions[session.id] = session;
@@ -46,6 +208,7 @@ public:
     bool removeSession(const std::string& id) override {
         std::lock_guard<std::mutex> lock(mMutex);
         mMessages.erase(id);
+        clearImportsLocked(id);
         mContextCheckpoints.erase(id);
         clearToolOutputsLocked(id);
         for (auto it = mSpecialistTasks.begin(); it != mSpecialistTasks.end();) {
@@ -61,6 +224,7 @@ public:
         std::lock_guard<std::mutex> lock(mMutex);
         if (mSessions.find(sessionId) == mSessions.end()) return false;
         mMessages.erase(sessionId);
+        clearImportsLocked(sessionId);
         mContextCheckpoints.erase(sessionId);
         clearToolOutputsLocked(sessionId);
         for (auto it = mSpecialistTasks.begin(); it != mSpecialistTasks.end();) {
@@ -142,12 +306,12 @@ public:
         const auto found = mContextCheckpoints.find(sessionId);
         const std::uint64_t revision =
             found == mContextCheckpoints.end() ? 0 : found->second.revision;
-        const auto history = mMessages.find(sessionId);
-        if (mSessions.count(sessionId) == 0 || history == mMessages.end())
+        const auto history = visibleMessagesLocked(sessionId);
+        if (mSessions.count(sessionId) == 0 || history.empty())
             return {MaiErrorCode::NotFound, "Session history no longer exists."};
         if (revision != expectedRevision || checkpoint.revision == 0 ||
             checkpoint.revision - 1 != expectedRevision ||
-            !maiContextCheckpointMatches(checkpoint, sessionId, history->second))
+            !maiContextCheckpointMatches(checkpoint, sessionId, history))
             return {MaiErrorCode::Busy, "Context source changed while preparing its summary."};
         mContextCheckpoints[sessionId] = checkpoint;
         return {};
@@ -392,20 +556,19 @@ public:
 
     std::vector<MaiMessage> listMessages(const std::string& sessionId) const override {
         std::lock_guard<std::mutex> lock(mMutex);
-        auto it = mMessages.find(sessionId);
-        if (it == mMessages.end()) return {};
-        return it->second;
+        return visibleMessagesLocked(sessionId);
     }
 
     bool getMessage(const std::string& sessionId, const std::string& messageId,
                     MaiMessage& out) const override {
         std::lock_guard<std::mutex> lock(mMutex);
         const auto session = mMessages.find(sessionId);
-        if (session == mMessages.end()) return false;
+        if (session == mMessages.end()) return importedMessageLocked(sessionId, messageId, out);
         const auto message =
             std::find_if(session->second.begin(), session->second.end(),
                          [&](const MaiMessage& value) { return value.id == messageId; });
-        if (message == session->second.end()) return false;
+        if (message == session->second.end())
+            return importedMessageLocked(sessionId, messageId, out);
         out = *message;
         return true;
     }
@@ -417,13 +580,26 @@ public:
         std::vector<MaiMessage> page;
         if (limit == 0) return page;
         auto it = mMessages.find(sessionId);
-        if (it == mMessages.end()) return page;
-        page.reserve(std::min(limit, it->second.size()));
-        for (auto message = it->second.rbegin(); message != it->second.rend(); ++message) {
-            if (!beforeId.empty() && message->id >= beforeId) continue;
-            page.push_back(*message);
-            if (page.size() == limit) break;
+        if (it != mMessages.end()) {
+            page.reserve(std::min(limit, it->second.size()));
+            for (auto message = it->second.rbegin(); message != it->second.rend(); ++message) {
+                if (!beforeId.empty() && message->id >= beforeId) continue;
+                page.push_back(*message);
+                if (page.size() == limit) break;
+            }
         }
+        for (const auto& source : mCurrentImports) {
+            if (source.first.first != sessionId) continue;
+            const auto& messages = mImports.at(source.second).messages;
+            auto cursor = beforeId.empty() ? messages.end() : messages.lower_bound(beforeId);
+            for (std::size_t count = 0; cursor != messages.begin() && count < limit; ++count) {
+                --cursor;
+                page.push_back(cursor->second);
+            }
+        }
+        std::sort(page.begin(), page.end(),
+                  [](const auto& left, const auto& right) { return left.id > right.id; });
+        if (page.size() > limit) page.resize(limit);
         return page;
     }
 
@@ -465,6 +641,62 @@ public:
     }
 
 private:
+    struct ImportSnapshot {
+        MaiContextImportSpec spec;
+        MaiContextImportProgress progress;
+        std::map<std::uint64_t, std::string> chunks;
+        std::set<std::string> sourceIds;
+        std::map<std::string, MaiMessage> messages;
+        std::int64_t lastCreated = 0;
+        bool aborted = false;
+    };
+
+    void clearImportsLocked(const std::string& sessionId) {
+        for (auto it = mCurrentImports.begin(); it != mCurrentImports.end();)
+            if (it->first.first == sessionId)
+                it = mCurrentImports.erase(it);
+            else
+                ++it;
+        for (auto it = mImports.begin(); it != mImports.end();)
+            if (it->second.spec.sessionId == sessionId)
+                it = mImports.erase(it);
+            else
+                ++it;
+    }
+
+    std::vector<MaiMessage> visibleMessagesLocked(const std::string& sessionId) const {
+        std::vector<MaiMessage> result;
+        const auto ordinary = mMessages.find(sessionId);
+        if (ordinary != mMessages.end()) result = ordinary->second;
+        bool imported = false;
+        for (const auto& source : mCurrentImports)
+            if (source.first.first == sessionId)
+                for (const auto& message : mImports.at(source.second).messages) {
+                    result.push_back(message.second);
+                    imported = true;
+                }
+        if (imported)
+            std::sort(result.begin(), result.end(),
+                      [](const auto& left, const auto& right) { return left.id < right.id; });
+        return result;
+    }
+
+    bool importedMessageLocked(const std::string& sessionId, const std::string& messageId,
+                               MaiMessage& out) const {
+        for (const auto& source : mCurrentImports) {
+            if (source.first.first != sessionId) continue;
+            const auto& messages = mImports.at(source.second).messages;
+            const auto found = messages.find(messageId);
+            if (found != messages.end()) {
+                out = found->second;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::map<std::string, ImportSnapshot> mImports;
+    std::map<std::pair<std::string, std::string>, std::string> mCurrentImports;
     // 锁内核验当前源片段；保留快照不能绕过消息或 callId 后续变更。
     bool ownsToolOutputLocked(const MaiToolOutputRecord& output) const {
         if (mSessions.count(output.sessionId) == 0) return false;

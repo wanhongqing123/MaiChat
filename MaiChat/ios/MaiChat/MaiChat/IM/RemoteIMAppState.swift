@@ -74,10 +74,13 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         }
     }
 
-    @Published var sdkAppIDText = ""
+    @Published var sdkAppIDText = "" {
+        didSet { if oldValue != sdkAppIDText { invalidateIMSessionBinding() } }
+    }
     @Published var masterUserID = "" {
         didSet {
             if oldValue != masterUserID {
+                invalidateIMSessionBinding()
                 cancelAvatarMutations()
                 refreshPersistedIMQueryAdmission()
             }
@@ -107,7 +110,14 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
                 to: agentVideoPresentation?.path)
         }
     }
-    @Published var connectionState: ConnectionState = .disconnected
+    @Published var connectionState: ConnectionState = .disconnected {
+        didSet {
+            if oldValue != connectionState && connectionState != .connected {
+                imSessionAcceptedFriendsLoaded = false
+                invalidateIMSessionBinding()
+            }
+        }
+    }
     // 仅本机用户主动发送入队时发布；历史回灌和投递状态变化不触发此标识。
     @Published private(set) var locallyQueuedMessageID: UUID?
     @Published var chatState: MasterChatState {
@@ -142,7 +152,32 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     @Published private var accountAuthenticationGeneration: UInt64 = 0
     @Published var presenceStatusByUserID: [String: RemoteIMPresenceStatus] = [:]
     @Published private(set) var pendingFriendRequests: [RemoteIMFriendRequest] = []
-    @Published private(set) var acceptedFriendIMIDs: Set<String> = []
+    @Published private(set) var acceptedFriendIMIDs: Set<String> = [] {
+        didSet {
+            IMSessionBindingCaptureRegistry.shared.setAcceptedFriends(acceptedFriendIMIDs)
+            for peer in oldValue.subtracting(acceptedFriendIMIDs) {
+                IMSessionBindingCaptureRegistry.shared.withdraw(peerID: peer)
+            }
+            if oldValue != acceptedFriendIMIDs, connectionState == .connected {
+                Task { @MainActor [weak self] in await self?.refreshIMSessionBindings() }
+            }
+        }
+    }
+    @Published private(set) var imSessionBindingSessions: [IMSessionBindingSession] = []
+    @Published private(set) var imSessionBindings: [IMSessionBindingItem] = []
+    @Published var imSessionBindingError: String?
+    @Published var imSessionBindingIsPreparing = false
+    @Published private(set) var imSessionBindingLease: IMSessionBindingLease?
+    private var imSessionController: IMSessionBindingController?
+    private var imSessionHostEpoch: UInt64 = 0
+    @Published private(set) var imSessionAcceptedFriendsLoaded = false {
+        didSet {
+            if imSessionAcceptedFriendsLoaded && !oldValue && connectionState == .connected {
+                Task { @MainActor [weak self] in await self?.refreshIMSessionBindings() }
+            }
+        }
+    }
+
     @Published private(set) var pendingFriendSyncIMIDs: Set<String> = []
     private var friendAccountByIMID: [String: String] = [:]
     private var friendDisplayByIMID: [String: String] = [:]
@@ -183,6 +218,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     private var accountInvalidationReason: MaiChatAuthError?
     private let historyPersistence: LocalChatHistoryPersistence
     private let client: RemoteIMClient
+    private let historyDatabasePath: String
     private let shouldConnectOnLaunch: Bool
     private var reconnectOnLaunch: Bool
     private var connectionAttemptGate = RemoteIMConnectionAttemptGate()
@@ -207,13 +243,15 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     private var conversationHistoryLoadGenerationByUserID: [String: UInt64] = [:]
     nonisolated let persistedIMQueryAdmission = LocalChatMessageQueryAdmission()
     private var historyAccountGeneration: UInt64 = 0 {
-        didSet { refreshPersistedIMQueryAdmission() }
+        didSet { invalidateIMSessionBinding(); refreshPersistedIMQueryAdmission() }
     }
     private var accountRebuildRequestGeneration: UInt64 = 0
     private var chatHistorySDKAppID: Int? {
         didSet { if oldValue != chatHistorySDKAppID { refreshPersistedIMQueryAdmission() } }
     }
     private var pendingHistoryMutations: [LocalChatHistoryMutation] = []
+    private var historyEnqueuedSequence: UInt64 = 0
+    private var historyCommittedSequence: UInt64 = 0
     private var historySaveTask: Task<Void, Never>?
     private var pendingIncomingRemoteIDs = Set<String>()
     private var replyPreparationTask: Task<Void, Never>?
@@ -243,6 +281,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     ) {
         self.settingsStore = settingsStore
         self.client = client
+        self.historyDatabasePath = historyStore.persistentDatabasePath
         self.avatarUploader = avatarUploader
         self.remoteDesktop = RemoteDesktopSession(client: client)
 
@@ -311,6 +350,18 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
                 totalUnreadCount: self.totalUnreadCount
             )
         )
+        self.client.onIncomingMetadata = { [weak self] metadata in
+            await self?.persistIncomingMetadata(metadata)
+        }
+        self.client.onSessionIMInput = { [weak self] payload in
+            Task { @MainActor [weak self] in
+                guard let self else { IMSessionBindingControl.abandon(payload.ticket); return }
+                guard let controller = self.imSessionController else {
+                    IMSessionBindingControl.abandon(payload.ticket); return
+                }
+                await controller.receive(payload)
+            }
+        }
         self.client.onIncomingText = { [weak self] event in
             Task { @MainActor in
                 await self?.receive(event)
@@ -427,6 +478,12 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         }
     }
 
+    func setSessionBindingFriendLoadForUITest(loaded: Bool, friends: Set<String>) {
+        guard ProcessInfo.processInfo.arguments.contains("--im-session-binding-host-ui-test") else { return }
+        imSessionAcceptedFriendsLoaded = loaded
+        acceptedFriendIMIDs = friends
+    }
+
     func configureGroupUITestFixture() {
         let arguments = ProcessInfo.processInfo.arguments
         guard arguments.contains("--im-group-ui-test") ||
@@ -435,7 +492,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         groupUIFixtureGeneration &+= 1
         groupUIFixtureActivationFailure = arguments.contains("--im-group-activation-fail-ui-test")
         historyAccountGeneration &+= 1
-        chatHistorySDKAppID = nil
+        sdkAppIDText = "1"
+        chatHistorySDKAppID = 1
         masterUserID = GroupChatUITestData.ownerID
         maiChatAccountID = GroupChatUITestData.ownerID
         maiChatNickname = GroupChatUITestData.nickname
@@ -444,7 +502,13 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         connectionState = .connected
         let contacts = GroupChatUITestData.contacts
         chatState = MasterChatState(ownerUserID: masterUserID, contacts: contacts, messages: [])
+        imSessionAcceptedFriendsLoaded = true
         acceptedFriendIMIDs = Set(contacts.map(\.userID))
+        if let fence = client.incomingPersistenceFence,
+           (try? fence.capture(accountTag: RemoteDiagnosticsProtocol.accountTag(sdkAppID: 1, ownerUserID: masterUserID),
+                               peerID: "sim-friend-a")) == nil {
+            fence.activate(accountTag: RemoteDiagnosticsProtocol.accountTag(sdkAppID: 1, ownerUserID: masterUserID), generation: UUID())
+        }
         friendDisplayByIMID = Dictionary(uniqueKeysWithValues: contacts.map { ($0.userID, $0.displayName) })
         userProfileByUserID = Dictionary(uniqueKeysWithValues: contacts.map {
             ($0.userID, RemoteIMUserProfile(userID: $0.userID, displayName: $0.displayName, avatarURL: nil))
@@ -481,6 +545,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         groupCreationRecovery = nil
         unreadCountByGroupID = [:]
         unreadCountByUserID = [:]
+        imSessionAcceptedFriendsLoaded = false
         acceptedFriendIMIDs = []
         friendDisplayByIMID = [:]
         userProfileByUserID = [:]
@@ -1011,6 +1076,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
 
     private func clearLocalAccountPresentation() async {
         // 首个 await 之前作废旧 native 排队租约；身份发布后新调用再获取新租约。
+        invalidateIMSessionBinding()
         persistedIMQueryAdmission.invalidate()
         cancelAvatarMutations()
         try? await AIMobileSMSInbox.shared.disableAndClear()
@@ -1021,6 +1087,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         maiChatAccountID = ""
         maiChatNickname = ""
         maiChatPhoneMasked = nil
+        imSessionAcceptedFriendsLoaded = false
         acceptedFriendIMIDs = []
         pendingFriendSyncIMIDs = []
         blockedIMUserIDs = []
@@ -1036,6 +1103,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     private func finishAccountLogin(_ session: MaiChatAuthSession) async throws {
+        invalidateIMSessionBinding()
         persistedIMQueryAdmission.invalidate()
         defer { refreshPersistedIMQueryAdmission() }
         // 所有调用点均在 password/SMS/social/bind/reset 成功 adopt 后进入，普通 refresh 不调用此处。
@@ -1087,6 +1155,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         // 账号已经落地后领取主聊天 Key；失败不撤销 IM 登录，进入创作中心时可重试。
         _ = try? await AICloudCredentialSync.refreshAccountModelKeysIfAvailable()
         if wasConnected && previousUserID == session.user.imUserId {
+            await refreshAcceptedFriends()
+            await refreshIMSessionBindings()
             return
         }
         await requestConnection()
@@ -1222,6 +1292,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
             )
             await refreshProfilesForCurrentUsers()
             await refreshAcceptedFriends()
+            await refreshIMSessionBindings()
             Task { @MainActor [weak self] in
                 await self?.refreshJoinedGroups()
             }
@@ -1266,6 +1337,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     func disconnect() async {
+        invalidateIMSessionBinding()
         cancelAvatarMutations()
         let startedAt = ProcessInfo.processInfo.systemUptime
         // 在异步断开前先保存用户意图；即使 iOS 此刻终止进程，
@@ -1471,6 +1543,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         do {
             let friends = try await accountAuth.friends()
             guard remoteDiagnosticsIdentity == identity else { return }
+            imSessionAcceptedFriendsLoaded = true
             acceptedFriendIMIDs = Set(friends.map(\.imUserId))
             pendingFriendSyncIMIDs = Set(friends.filter {
                 $0.pendingImAction == "add"
@@ -2877,6 +2950,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
         approvalDecision: RemoteIMApprovalDecision? = nil,
         quote: RemoteIMQuote? = nil,
         to recipient: String? = nil,
+        sessionPermit: IMSessionDispatchPermit? = nil,
         deliver: (String, String) async throws -> RemoteIMSendReceipt
     ) async -> Bool {
         guard let peerID = outgoingRecipient(recipient) else { return false }   // 连接 + 已选联系人；正文非空由调用方保证
@@ -2895,9 +2969,10 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
             enqueueHistoryUpsert(message)
             try await MarkdownPreparation.prepare([message.text])
             guard remoteDiagnosticsIdentity == identity else { return false }
-            locallyQueuedMessageID = message.id
+            if sessionPermit == nil { locallyQueuedMessageID = message.id }
             let receipt = try await deliver(message.toUserID, message.text)
             guard remoteDiagnosticsIdentity == identity else { return false }
+            try validateIMSessionReceipt(receipt, permit: sessionPermit)
             try chatState.updateMessageDelivery(
                 id: message.id,
                 remoteID: receipt.remoteID,
@@ -2912,6 +2987,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
                 try? chatState.updateMessageStatus(id: queuedMessageID, status: .failed)
                 enqueueCurrentMessage(id: queuedMessageID)
             }
+            // 用户撤销绑定/本地接管是有意放弃；不把 CancellationError 技术信息当发送故障。
+            if sessionPermit != nil, error is CancellationError { return false }
             errorMessage = error.localizedDescription
             return false
         }
@@ -2962,7 +3039,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
 
     @discardableResult
     func sendImageFile(_ image: RemoteIMImageFile, to recipient: String? = nil,
-                       caption: String? = nil, captionAbove: Bool = false) async -> Bool {
+                       caption: String? = nil, captionAbove: Bool = false,
+                       sessionPermit: IMSessionDispatchPermit? = nil) async -> Bool {
         guard let peerID = outgoingRecipient(recipient) else { return false }
 
         let identity = remoteDiagnosticsIdentity
@@ -2978,10 +3056,16 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
                 captionAbove: captionAbove
             )
             queuedMessageID = message.id
-            locallyQueuedMessageID = message.id
+            if sessionPermit == nil { locallyQueuedMessageID = message.id }
             enqueueHistoryUpsert(message)
-            let receipt = try await client.sendImage(to: message.toUserID, image: image,
+            let receipt: RemoteIMSendReceipt
+            if let sessionPermit {
+                receipt = try await client.sendSessionReply(.image(image, caption), to: message.toUserID, permit: sessionPermit)
+            } else {
+            receipt = try await client.sendImage(to: message.toUserID, image: image,
                 caption: caption, captionAbove: captionAbove, origin: .human)
+            }
+            try validateIMSessionReceipt(receipt, permit: sessionPermit)
             guard remoteDiagnosticsIdentity == identity else { return false }
             try chatState.updateMessageDelivery(
                 id: message.id,
@@ -2997,6 +3081,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
                 try? chatState.updateMessageStatus(id: queuedMessageID, status: .failed)
                 enqueueCurrentMessage(id: queuedMessageID)
             }
+            // 用户撤销绑定/本地接管是有意放弃；不把 CancellationError 技术信息当发送故障。
+            if sessionPermit != nil, error is CancellationError { return false }
             errorMessage = error.localizedDescription
             return false
         }
@@ -3004,7 +3090,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
 
     @discardableResult
     func sendVideoFile(_ video: RemoteIMVideoFile, to recipient: String? = nil,
-                       caption: String? = nil, captionAbove: Bool = false) async -> Bool {
+                       caption: String? = nil, captionAbove: Bool = false,
+                       sessionPermit: IMSessionDispatchPermit? = nil) async -> Bool {
         guard let peerID = outgoingRecipient(recipient) else { return false }
 
         let identity = remoteDiagnosticsIdentity
@@ -3022,10 +3109,16 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
                 captionAbove: captionAbove
             )
             queuedMessageID = message.id
-            locallyQueuedMessageID = message.id
+            if sessionPermit == nil { locallyQueuedMessageID = message.id }
             enqueueHistoryUpsert(message)
-            let receipt = try await client.sendVideo(to: message.toUserID, video: video,
+            let receipt: RemoteIMSendReceipt
+            if let sessionPermit {
+                receipt = try await client.sendSessionReply(.video(video, caption), to: message.toUserID, permit: sessionPermit)
+            } else {
+            receipt = try await client.sendVideo(to: message.toUserID, video: video,
                 caption: caption, captionAbove: captionAbove, origin: .human)
+            }
+            try validateIMSessionReceipt(receipt, permit: sessionPermit)
             guard remoteDiagnosticsIdentity == identity else { return false }
             try chatState.updateMessageDelivery(
                 id: message.id,
@@ -3041,6 +3134,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
                 try? chatState.updateMessageStatus(id: queuedMessageID, status: .failed)
                 enqueueCurrentMessage(id: queuedMessageID)
             }
+            // 用户撤销绑定/本地接管是有意放弃；不把 CancellationError 技术信息当发送故障。
+            if sessionPermit != nil, error is CancellationError { return false }
             errorMessage = error.localizedDescription
             return false
         }
@@ -3048,7 +3143,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
 
     @discardableResult
     func sendFile(_ file: RemoteIMFile, to recipient: String? = nil,
-                  caption: String? = nil, captionAbove: Bool = false) async -> Bool {
+                  caption: String? = nil, captionAbove: Bool = false,
+                       sessionPermit: IMSessionDispatchPermit? = nil) async -> Bool {
         guard let peerID = outgoingRecipient(recipient) else { return false }
 
         let identity = remoteDiagnosticsIdentity
@@ -3064,10 +3160,16 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
                 captionAbove: captionAbove
             )
             queuedMessageID = message.id
-            locallyQueuedMessageID = message.id
+            if sessionPermit == nil { locallyQueuedMessageID = message.id }
             enqueueHistoryUpsert(message)
-            let receipt = try await client.sendFile(to: message.toUserID, file: file,
+            let receipt: RemoteIMSendReceipt
+            if let sessionPermit {
+                receipt = try await client.sendSessionReply(.file(file, caption), to: message.toUserID, permit: sessionPermit)
+            } else {
+            receipt = try await client.sendFile(to: message.toUserID, file: file,
                 caption: caption, captionAbove: captionAbove, origin: .human)
+            }
+            try validateIMSessionReceipt(receipt, permit: sessionPermit)
             guard remoteDiagnosticsIdentity == identity else { return false }
             try chatState.updateMessageDelivery(
                 id: message.id,
@@ -3083,6 +3185,8 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
                 try? chatState.updateMessageStatus(id: queuedMessageID, status: .failed)
                 enqueueCurrentMessage(id: queuedMessageID)
             }
+            // 用户撤销绑定/本地接管是有意放弃；不把 CancellationError 技术信息当发送故障。
+            if sessionPermit != nil, error is CancellationError { return false }
             errorMessage = error.localizedDescription
             return false
         }
@@ -3136,6 +3240,12 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     private func receive(_ event: IncomingRemoteIMText) async {
+        if event.metadataReceipt != nil {
+            // 下载只使同一条已持久化 metadata 的本机引用可用，不重新判定首次 live 资格。
+            mediaFileRevision &+= 1
+            objectWillChange.send()
+            return
+        }
         guard shouldAcceptIncomingSender(event.fromUserID, kind: "text") else { return }
         let receivingIdentity = remoteDiagnosticsIdentity
         if await remoteDesktop.handleIncomingText(from: event.fromUserID, text: event.text,
@@ -3214,6 +3324,12 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     private func receive(_ event: IncomingRemoteIMVoice) async {
+        if event.metadataReceipt != nil {
+            // 下载只使同一条已持久化 metadata 的本机引用可用，不重新判定首次 live 资格。
+            mediaFileRevision &+= 1
+            objectWillChange.send()
+            return
+        }
         guard shouldAcceptIncomingSender(event.fromUserID, kind: "voice") else { return }
         guard await shouldAcceptIncomingMessage(remoteID: event.remoteID) else { return }
         let previousCount = chatState.messages.count
@@ -3247,6 +3363,12 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     private func receive(_ event: IncomingRemoteIMImage) async {
+        if event.metadataReceipt != nil {
+            // 下载只使同一条已持久化 metadata 的本机引用可用，不重新判定首次 live 资格。
+            mediaFileRevision &+= 1
+            objectWillChange.send()
+            return
+        }
         mediaFileRevision &+= 1
         guard shouldAcceptIncomingSender(event.fromUserID, kind: "image") else { return }
         guard await shouldAcceptIncomingMessage(remoteID: event.remoteID) else { return }
@@ -3289,6 +3411,12 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     private func receive(_ event: IncomingRemoteIMFile) async {
+        if event.metadataReceipt != nil {
+            // 下载只使同一条已持久化 metadata 的本机引用可用，不重新判定首次 live 资格。
+            mediaFileRevision &+= 1
+            objectWillChange.send()
+            return
+        }
         mediaFileRevision &+= 1
         guard !remoteDiagnosticsAccountTag.isEmpty, event.accountTag == remoteDiagnosticsAccountTag else { return }
         guard shouldAcceptIncomingSender(event.fromUserID, kind: "file") else { return }
@@ -3336,6 +3464,13 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     /// 先校验发送者和去重状态，再更新附件、保存历史和触发媒体视图刷新；
     /// 下载或封面尚未完成时保留消息行，避免整个聊天页重新布局。
     private func receive(_ event: IncomingRemoteIMVideo) async {
+        if event.metadataReceipt != nil {
+            updateVideoDownloadState(for: event)
+            // 下载只使同一条已持久化 metadata 的本机引用可用，不重新判定首次 live 资格。
+            mediaFileRevision &+= 1
+            objectWillChange.send()
+            return
+        }
         mediaFileRevision &+= 1
         guard shouldAcceptIncomingSender(event.fromUserID, kind: "video") else { return }
         let existingMessage = chatState.message(remoteID: event.remoteID)
@@ -3797,6 +3932,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     }
 
     private func enqueueHistoryMutation(_ mutation: LocalChatHistoryMutation) {
+        historyEnqueuedSequence &+= 1
         pendingHistoryMutations.append(mutation)
         startHistorySaveTaskIfNeeded()
     }
@@ -3823,6 +3959,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
     private func drainPendingHistoryMutations() async {
         while !pendingHistoryMutations.isEmpty {
             let mutations = pendingHistoryMutations
+            let committedThrough = historyEnqueuedSequence
             pendingHistoryMutations.removeAll(keepingCapacity: true)
             var saveResult: LocalChatHistorySaveResult?
             var saveError: Error?
@@ -3840,6 +3977,7 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
             }
 
             if let result = saveResult {
+                historyCommittedSequence = max(historyCommittedSequence, committedThrough)
                 if result.durationMilliseconds >= 50, mutations.allSatisfy({
                     $0.account.sdkAppID == chatHistorySDKAppID && $0.account.ownerUserID == chatState.ownerUserID
                 }) {
@@ -4179,5 +4317,169 @@ final class RemoteIMAppState: ObservableObject, RemoteDiagnosticsContextProvider
             return nil
         }
         return cleanValue
+    }
+}
+
+// 绑定桥是普通 AppState 能力；模型入口复用 Native kernel，Swift 只提供可信账号和 SDK 适配。
+extension RemoteIMAppState {
+    var imSessionHistorySource: [String: IMSessionJSON] {
+        ["profile": .string("ios"), "path": .string(historyDatabasePath), "provenance": .string("owner_sdk")]
+    }
+    func awaitIMHistoryPersistenceFence(_ task: IMSessionHistoryTask) async throws {
+        guard let scope = task.scope, let host = imSessionHostIdentity,
+              host.ownerID == scope.ownerID, host.sdkAppID == scope.sdkAppID,
+              host.generation == scope.authGeneration,
+              let sdk = Int(scope.sdkAppID), let fence = client.incomingPersistenceFence,
+              IMSessionBindingCaptureRegistry.shared.isCurrent(task) else { throw LocalChatMessageQueryError.changed }
+        let identity = remoteDiagnosticsIdentity
+        let capture = try fence.capture(accountTag: RemoteDiagnosticsProtocol.accountTag(sdkAppID: sdk, ownerUserID: scope.ownerID),
+                                        peerID: task.string("peer_id"))
+        let deadline = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+        try await fence.wait(capture, deadline: deadline)
+        try await awaitHistoryCommit(through: historyEnqueuedSequence, identity: identity, deadline: deadline)
+        guard imSessionHostIdentity == host, IMSessionBindingCaptureRegistry.shared.isCurrent(task) else {
+            throw LocalChatMessageQueryError.changed
+        }
+    }
+    private func awaitHistoryCommit(through sequence: UInt64, identity: String,
+                                    deadline: UInt64) async throws {
+        startHistorySaveTaskIfNeeded()
+        while historyCommittedSequence < sequence {
+            try Task.checkCancellation()
+            guard remoteDiagnosticsIdentity == identity else { throw LocalChatMessageQueryError.changed }
+            guard DispatchTime.now().uptimeNanoseconds < deadline, historySaveTask != nil else {
+                throw LocalChatMessageQueryError(code: "history_persistence_failed", message: "本地消息尚未保存，请重试")
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+    private func persistIncomingMetadata(_ metadata: IncomingRemoteIMMetadata) async -> RemoteIMMetadataReceipt? {
+        let identity = remoteDiagnosticsIdentity
+        guard connectionState == .connected, metadata.accountTag == remoteDiagnosticsAccountTag,
+              metadata.message.toUserID == masterUserID, masterUserID == chatState.ownerUserID,
+              shouldAcceptIncomingSender(metadata.message.fromUserID, kind: "metadata") else { return nil }
+        let sdk = chatHistorySDKAppID, owner = chatState.ownerUserID
+        do {
+            let deadline = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+            try await awaitHistoryCommit(through: historyEnqueuedSequence, identity: identity, deadline: deadline)
+            let result = try await historyPersistence.insertIncomingMetadata(metadata.message, sdkAppID: sdk, ownerUserID: owner)
+            guard remoteDiagnosticsIdentity == identity, chatHistorySDKAppID == sdk else { return nil }
+            if result.inserted {
+                chatState.mergeMessages([result.message])
+                updateUnreadAfterReceiving(from: result.message.fromUserID, wasInserted: true)
+                settingsStore.save(currentStoredSettings())
+                Task { @MainActor [weak self] in
+                    guard let self, self.remoteDiagnosticsIdentity == identity else { return }
+                    try? await MarkdownPreparation.prepare([result.message.text])
+                    guard self.remoteDiagnosticsIdentity == identity else { return }
+                    await self.postSystemNotificationIfNeeded(message: result.message,
+                        from: result.message.fromUserID, wasInserted: true)
+                    self.refreshProfileIfNeeded(userID: result.message.fromUserID)
+                }
+            }
+            return RemoteIMMetadataReceipt(localID: result.message.id, wasInserted: result.inserted,
+                persisted: true, createdAt: result.message.createdAt, message: result.message)
+        } catch {
+            if remoteDiagnosticsIdentity == identity { errorMessage = "本地消息保存失败，请重试" }
+            return nil
+        }
+    }
+
+    var imSessionHostIdentity: IMSessionBindingHostIdentity? {
+        guard connectionState == .connected, hasUnifiedAccount, !masterUserID.isEmpty,
+              masterUserID == chatState.ownerUserID else { return nil }
+        var sdk = currentSDKAppID()
+        #if DEBUG && targetEnvironment(simulator)
+        if groupUIFixtureMode { sdk = 1 }
+        #endif
+        guard let sdk, sdk > 0 else { return nil }
+        return IMSessionBindingHostIdentity(sdkAppID: String(sdk), ownerID: masterUserID,
+            // 同账号 SDK 重连也重新授权；Native 禁止复活已 logout 的同一个 auth_generation。
+            generation: String(imSessionHostEpoch + 1), epoch: imSessionHostEpoch)
+    }
+    func showIMSessionBindingWarning(_ message: String) {
+        showTransientError(message)
+    }
+    func publishIMSessionBinding(_ projection: IMSessionBindingProjection?) {
+        let lease = projection.flatMap { value in
+            value.bridgeID.flatMap { bridge in value.scope.map { IMSessionBindingLease(bridgeID: bridge, scope: $0) } }
+        }
+        if imSessionBindingLease != lease { imSessionBindingLease = lease }
+        if projection == nil { imSessionBindingIsPreparing = false }
+        let sessions = projection?.sessions ?? [], bindings = projection?.bindings ?? []
+        if imSessionBindingSessions != sessions { imSessionBindingSessions = sessions }
+        if imSessionBindings != bindings { imSessionBindings = bindings }
+    }
+    private func invalidateIMSessionBinding() {
+        // 首个 await 前关掉重新激活的入口；断开中的旧 change Task 不可复活 authority。
+        imSessionAcceptedFriendsLoaded = false
+        imSessionHostEpoch &+= 1
+        IMSessionBindingCaptureRegistry.shared.authorizeHost(nil)
+        imSessionController?.invalidate()
+    }
+    func imSessionBinding(for peer: String) -> IMSessionBindingItem? {
+        imSessionBindings.first { $0.peerID == peer }
+    }
+    func refreshIMSessionBindings() async {
+        guard imSessionHostIdentity != nil else {
+            imSessionBindingError = "请先连接已登录的 MaiChat 账号"; return
+        }
+        guard imSessionAcceptedFriendsLoaded else {
+            imSessionBindingError = "正在读取可信好友列表，请稍后重试"; return
+        }
+        do { try await historyPersistence.prepareDatabase() }
+        catch { imSessionBindingError = "本地聊天数据库暂不可用，请重试"; return }
+        if imSessionController == nil { imSessionController = IMSessionBindingController(appState: self) }
+        await imSessionController?.refresh()
+    }
+    func bindIMSession(peer: String, session: String, displayedLease: IMSessionBindingLease? = nil, expectedWorkspaceKey: String? = nil) async -> Bool {
+        await imSessionController?.bind(peer: peer, session: session, displayedLease: displayedLease, expectedWorkspaceKey: expectedWorkspaceKey) ?? false
+    }
+    func unbindIMSession(peer: String) async {
+        _ = await imSessionController?.bind(peer: peer, session: nil)
+    }
+    private func validateIMSessionReceipt(_ receipt: RemoteIMSendReceipt, permit: IMSessionDispatchPermit?) throws {
+        guard permit != nil else { return }
+        guard let id = receipt.remoteID, !id.isEmpty, receipt.createdAt != nil else {
+            throw AIBackendError(message: "回复送达状态未知，未自动重发")
+        }
+    }
+    func sendIMSessionDelivery(_ delivery: IMSessionDelivery, permit: IMSessionDispatchPermit) async {
+        guard let scope = delivery.scope, let identity = imSessionHostIdentity,
+              identity.ownerID == scope.ownerID, identity.sdkAppID == scope.sdkAppID,
+              identity.generation == scope.authGeneration, acceptedFriendIMIDs.contains(delivery.peerID),
+              IMSessionBindingCaptureRegistry.shared.allows(delivery) else { return }
+        let peer = delivery.peerID, caption = delivery.string("caption")
+        do {
+            switch delivery.string("kind") {
+            case "text":
+                let text = delivery.string("text")
+                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                _ = await sendQueuedText(text, to: peer, sessionPermit: permit) { [client] user, body in
+                    try await client.sendSessionReply(.text(body), to: user, permit: permit)
+                }
+            case "image":
+                let image = try await AIMobileHostToolProvider.prepareAgentImage(URL(fileURLWithPath: delivery.string("path")))
+                guard imSessionHostIdentity == identity else { return }
+                _ = await sendImageFile(image, to: peer, caption: caption, sessionPermit: permit)
+            case "video":
+                let video = try await AIMobileHostToolProvider.prepareAgentVideo(URL(fileURLWithPath: delivery.string("path")))
+                guard imSessionHostIdentity == identity else { return }
+                _ = await sendVideoFile(video, to: peer, caption: caption, sessionPermit: permit)
+            case "file":
+                let source = URL(fileURLWithPath: delivery.string("path"))
+                let copied = try await AIMobileHostToolProvider.copyAgentMedia(source, category: .outgoingFiles)
+                let size = try await RemoteIMBackgroundWork.metadata {
+                    try copied.resourceValues(forKeys: [.fileSizeKey]).fileSize
+                }
+                guard imSessionHostIdentity == identity else { return }
+                _ = await sendFile(RemoteIMFile(fileURL: copied, fileName: source.lastPathComponent,
+                    mimeType: delivery.string("mime_type"), sizeBytes: size), to: peer,
+                    caption: caption, sessionPermit: permit)
+            default: throw AIBackendError(message: "会话回复类型无效")
+            }
+        } catch {
+            if imSessionHostIdentity == identity { imSessionBindingError = error.localizedDescription }
+        }
     }
 }

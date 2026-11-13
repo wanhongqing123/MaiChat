@@ -49,6 +49,17 @@ void maiMobileAgentDestroy(void* handle);
 char* maiMobileAgentRequest(void* handle, const char* request);
 void maiMobileAgentFree(char* response);
 
+// Session IM 的即时控制边界，不借用 backend handle，也不访问 Agent/数据库/宿主回调。
+// request 是 owned delivery 的 claim/ack，或带 bridge_id/scope 的 admit/abandon_input/
+// takeover/logout。admit 只接收 live metadata，在 SDK 下载前保留原到达顺序；正文另走普通 worker。
+// 任意 SDK 线程均可调用；过期/已销毁的弱注册实例拒绝旧票据。返回 JSON 由调用方持有，
+// 仍用 maiMobileAgentFree 释放。claim 仅授权一次真实 SDK 派发，不承诺撤回已发出的消息。
+char* maiMobileSessionIMControl(const char* request);
+// 只读 IM 历史快照的 open/read/close，参数是原 owned history_task 或 snapshot_id。
+// 可执行 SQLite I/O，必须在既有准备 worker 上调用；不能在 Main、SDK callback 或 Agent 串行队列调用。
+// 不借用 backend handle；响应由 maiMobileAgentFree 释放。来源/旧账号/绑定代际由共同协调器校验。
+char* maiMobileIMHistorySnapshot(const char* request);
+
 // 普通 PDF 密码保护入口，与 generate_pdf 共用进程内核心，不调用模型工具。
 // source/output 为已授权的绝对 UTF-8 路径。password 是借用的原始 UTF-8 bytes，
 // 长度显式传入以拒绝 NUL 和非法编码，避免 JNI modified UTF-8 改写密码。

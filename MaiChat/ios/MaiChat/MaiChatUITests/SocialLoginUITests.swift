@@ -2,6 +2,152 @@
 import XCTest
 
 final class SocialLoginUITests: XCTestCase {
+    /// 仅用既有隔离 IM 夹具走普通私聊入口；不点击旧回复生成按钮或调用模型。
+    @MainActor func testSessionBindingReplacesIndependentAIReplyEntry() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--im-group-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let conversation = app.buttons["im-conversation-sim-friend-a"]
+        XCTAssertTrue(conversation.waitForExistence(timeout: 20))
+        conversation.tap()
+        let more = app.buttons["展开更多功能"]
+        XCTAssertTrue(more.waitForExistence(timeout: 8))
+        more.tap()
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "owned-im-session-binding-entry"
+        capture.lifetime = .keepAlways
+        add(capture)
+        XCTAssertFalse(app.buttons["AI 帮我回复"].exists,
+                       "独立回复建议入口仍存在，应由绑定创作会话替代")
+        let binding = app.buttons["im-session-binding-entry"]
+        XCTAssertTrue(binding.waitForExistence(timeout: 5))
+        XCTAssertTrue(binding.isHittable)
+    }
+
+    /// 同一个普通私聊 Sheet 覆盖取消/确认/解绑；不触发 IM send 或模型请求。
+    @MainActor func testSessionBindingSelectionPreservesIMDraft() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--im-group-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let conversation = app.buttons["im-conversation-sim-friend-a"]
+        XCTAssertTrue(conversation.waitForExistence(timeout: 20)); conversation.tap()
+        let draft = app.textViews["message-composer-text-view"]
+        XCTAssertTrue(draft.waitForExistence(timeout: 8))
+        draft.tap(); draft.typeText("binding draft stays here")
+        func openPicker() {
+            app.buttons["展开更多功能"].tap()
+            app.buttons["im-session-binding-entry"].tap()
+            XCTAssertTrue(app.navigationBars["绑定会话"].waitForExistence(timeout: 10))
+        }
+        openPicker()
+        app.buttons["取消"].tap()
+        XCTAssertEqual(draft.value as? String, "binding draft stays here")
+        openPicker()
+        let choice = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "im-session-choice-")).firstMatch
+        XCTAssertTrue(choice.waitForExistence(timeout: 20), app.debugDescription)
+        choice.tap()
+        let selectedChoice = XCTNSPredicateExpectation(predicate: NSPredicate(format: "selected == true"), object: choice)
+        XCTAssertEqual(XCTWaiter.wait(for: [selectedChoice], timeout: 3), .completed)
+        let pickerCapture = XCTAttachment(screenshot: app.screenshot())
+        pickerCapture.name = "owned-im-session-binding-picker-selected"
+        pickerCapture.lifetime = .keepAlways; add(pickerCapture)
+        app.buttons["im-session-binding-confirm"].tap()
+        let unbind = app.buttons["im-session-binding-unbind"]
+        XCTAssertTrue(unbind.waitForExistence(timeout: 10), app.debugDescription)
+        XCTAssertEqual(draft.value as? String, "binding draft stays here")
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "owned-im-session-bound-draft"; capture.lifetime = .keepAlways; add(capture)
+        unbind.tap()
+        XCTAssertTrue(NSPredicate(format: "exists == false").evaluate(with: unbind) ||
+            XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: unbind)], timeout: 8) == .completed)
+        XCTAssertEqual(draft.value as? String, "binding draft stays here")
+    }
+
+    /// 普通 App 的自有 SDK/本机模型宿主，不登录或发送真实网络消息。
+    @MainActor func testSessionBindingNativeHostBoundaries() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--im-group-ui-test", "--im-session-binding-host-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launchEnvironment["MAICHAT_LOCAL_UI_MODEL_PORT"] = ProcessInfo.processInfo.environment["MAICHAT_BINDING_MODEL_PORT"] ?? "18667"
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["im-session-host-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        let completed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH 'PASS' OR label BEGINSWITH 'FAIL'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [completed], timeout: 75), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS"), status.label)
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "owned-session-im-host-contract"; capture.lifetime = .keepAlways; add(capture)
+    }
+
+    @MainActor func testSessionBindingPreparationRecovers() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--im-group-ui-test", "--im-session-binding-host-ui-test", "--im-session-binding-open-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["im-session-host-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        let finished = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH 'PASS' OR label BEGINSWITH 'FAIL'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 40), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS"), status.label)
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "owned-session-binding-preparation"; capture.lifetime = .keepAlways; add(capture)
+    }
+
+    @MainActor func testSessionBindingImportsHistoryBeforeLive() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--im-group-ui-test", "--im-session-binding-host-ui-test", "--im-session-history-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launchEnvironment["MAICHAT_LOCAL_UI_MODEL_PORT"] = "18667"
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["im-session-host-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        let completed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH 'PASS' OR label BEGINSWITH 'FAIL'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [completed], timeout: 90), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS"), status.label)
+        let capture = XCTAttachment(screenshot: app.screenshot())
+        capture.name = "owned-history-bootstrap"; capture.lifetime = .keepAlways; add(capture)
+    }
+
+    @MainActor func testSessionBindingMaintenanceWarningIsLocal() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--im-group-ui-test", "--im-session-binding-host-ui-test", "--im-session-maintenance-warning-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["im-session-host-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        let done = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH 'PASS' OR label BEGINSWITH 'FAIL'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [done], timeout: 20), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS"), status.label)
+    }
+
+    @MainActor func testRawSDKMetadataPersistsBeforeDownload() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--im-group-ui-test", "--im-session-binding-host-ui-test", "--im-raw-metadata-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["im-session-host-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        let done = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH 'PASS' OR label BEGINSWITH 'FAIL'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [done], timeout: 40), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS"), status.label)
+    }
+
     /// 在干净的模拟器安装中验证服务选择默认值及重启后的持久化；只使用本机假账号。
     @MainActor func testSpeechProviderSelectionSurvivesRelaunch() async throws {
         #if DEBUG && targetEnvironment(simulator)

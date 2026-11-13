@@ -4,6 +4,20 @@
 import Foundation
 import MaiChatCore
 
+/// 原 SDK metadata 必须先走普通持久化，随后才启动下载/ready。所有字段均 owned。
+struct IncomingRemoteIMMetadata: Sendable {
+    let accountTag: String
+    let fenceTicket: IMIngressPersistenceFence.Ticket
+    let message: RemoteIMMessage
+}
+struct RemoteIMMetadataReceipt: Sendable, Equatable {
+    let localID: UUID
+    let wasInserted: Bool
+    let persisted: Bool
+    let createdAt: Date
+    let message: RemoteIMMessage
+}
+
 struct IncomingRemoteIMText: Equatable {
     let fromUserID: String
     let text: String
@@ -13,6 +27,7 @@ struct IncomingRemoteIMText: Equatable {
     let approvalDecision: RemoteIMApprovalDecision?
     var quote: RemoteIMQuote? = nil
     let createdAt: Date
+    var metadataReceipt: RemoteIMMetadataReceipt? = nil
 }
 
 struct IncomingRemoteIMActivity: Equatable {
@@ -28,6 +43,7 @@ struct IncomingRemoteIMVoice: Equatable {
     let origin: RemoteIMMessageOrigin?
     var quote: RemoteIMQuote? = nil
     let createdAt: Date
+    var metadataReceipt: RemoteIMMetadataReceipt? = nil
 }
 
 struct IncomingRemoteIMImage: Equatable {
@@ -42,6 +58,7 @@ struct IncomingRemoteIMImage: Equatable {
     let origin: RemoteIMMessageOrigin?
     var quote: RemoteIMQuote? = nil
     let createdAt: Date
+    var metadataReceipt: RemoteIMMetadataReceipt? = nil
 }
 
 struct IncomingRemoteIMFile: Equatable {
@@ -58,6 +75,7 @@ struct IncomingRemoteIMFile: Equatable {
     let origin: RemoteIMMessageOrigin?
     var quote: RemoteIMQuote? = nil
     let createdAt: Date
+    var metadataReceipt: RemoteIMMetadataReceipt? = nil
 }
 
 struct IncomingRemoteIMVideo: Equatable {
@@ -75,6 +93,7 @@ struct IncomingRemoteIMVideo: Equatable {
     var quote: RemoteIMQuote? = nil
     let createdAt: Date
     let stage: RemoteIMVideoDownloadStage
+    var metadataReceipt: RemoteIMMetadataReceipt? = nil
 }
 
 struct RemoteIMVoiceRecording: Equatable, Sendable {
@@ -106,7 +125,7 @@ struct RemoteIMVideoFile: Equatable, Sendable {
     let sizeBytes: Int64
 }
 
-struct RemoteIMSendReceipt: Equatable {
+struct RemoteIMSendReceipt: Equatable, Sendable {
     let remoteID: String?
     let createdAt: Date?
 }
@@ -170,6 +189,9 @@ enum RemoteIMClientError: Error, LocalizedError {
 
 @MainActor
 protocol RemoteIMClient: AnyObject {
+    var onIncomingMetadata: ((IncomingRemoteIMMetadata) async -> RemoteIMMetadataReceipt?)? { get set }
+    var incomingPersistenceFence: IMIngressPersistenceFence? { get }
+    var onSessionIMInput: ((IMSessionIncomingPayload) -> Void)? { get set }
     var onIncomingText: ((IncomingRemoteIMText) -> Void)? { get set }
     var onIncomingActivity: ((IncomingRemoteIMActivity) -> Void)? { get set }
     var onIncomingVoice: ((IncomingRemoteIMVoice) -> Void)? { get set }
@@ -189,6 +211,8 @@ protocol RemoteIMClient: AnyObject {
         origin: RemoteIMMessageOrigin,
         quote: RemoteIMQuote?
     ) async throws -> RemoteIMSendReceipt
+    func sendSessionReply(_ payload: IMSessionOutgoingPayload, to userID: String,
+                          permit: IMSessionDispatchPermit) async throws -> RemoteIMSendReceipt
     func createGroup(name: String, memberUserIDs: [String]) async throws -> RemoteIMGroup
     func joinedGroups() async throws -> [RemoteIMGroup]
     func sendGroupText(to groupID: String, text: String) async throws -> RemoteIMSendReceipt
@@ -232,6 +256,16 @@ protocol RemoteIMClient: AnyObject {
 }
 
 extension RemoteIMClient {
+    var onIncomingMetadata: ((IncomingRemoteIMMetadata) async -> RemoteIMMetadataReceipt?)? { get { nil } set {} }
+    var incomingPersistenceFence: IMIngressPersistenceFence? { nil }
+    var onSessionIMInput: ((IMSessionIncomingPayload) -> Void)? { get { nil } set {} }
+    func sendSessionReply(_ payload: IMSessionOutgoingPayload, to userID: String,
+                          permit: IMSessionDispatchPermit) async throws -> RemoteIMSendReceipt {
+        // 未提供真实派发边界的 SDK 不得提前 claim 后再转发成普通 Human 发送。
+        permit.acknowledge()
+        throw RemoteIMClientError.sdkNotIntegrated
+    }
+
     var onSelfProfileChanged: ((RemoteIMUserProfile) -> Void)? {
         get { nil }
         set {}

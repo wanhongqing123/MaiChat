@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QSignalSpy>
 #include <QTest>
+#include <QCoreApplication>
 #include <memory>
 
 #include "im/TimSdkApi.h"
@@ -177,9 +178,13 @@ public:
     void removeReceiveMessageCallback() override { receiveCallback = nullptr; }
 
     void emitMessages(const QJsonArray& messages) {
+        emitPayload(QString::fromUtf8(QJsonDocument(messages).toJson(QJsonDocument::Compact)));
+    }
+    void emitPayload(const QString& payload) {
         if (receiveCallback) {
-            receiveCallback(QString::fromUtf8(QJsonDocument(messages).toJson(QJsonDocument::Compact)));
+            receiveCallback(payload);
         }
+        QCoreApplication::processEvents();
     }
 
     int initResult = 0;
@@ -277,6 +282,8 @@ private slots:
     void updatesGroupUnreadAfterConversationSyncCompletes();
     void pagesGroupTextHistoryBySequence();
     void reportsCreatedGroupWhenActivationFailsWithoutCreatingAgain();
+    void liveReadinessPreservesEnvelopeOrderAndRejectsOldConnection();
+    void rawMetadataBoundaryPrecedesQueuedParseAndCompletesWithoutMediaDownload();
 };
 
 void TimSdkRemoteIMClientTest::avatarUpdateWaitsForSdkAndRejectsOldLoginCallbacks() {
@@ -405,7 +412,7 @@ void TimSdkRemoteIMClientTest::activityUsesOnlineCustomTransportWithoutHistory()
         ++activityCount;
     });
     QSignalSpy messages(&client, &RemoteIMClient::liveMessagesReceived);
-    fake->receiveCallback(QString::fromUtf8(QJsonDocument(QJsonArray{wire}).toJson()));
+    fake->emitPayload(QString::fromUtf8(QJsonDocument(QJsonArray{wire}).toJson()));
     QCOMPARE(activityCount, 1);
     QCOMPARE(messages.size(), 0);
 
@@ -416,14 +423,14 @@ void TimSdkRemoteIMClientTest::activityUsesOnlineCustomTransportWithoutHistory()
         "\"startedAtMs\":1700000000000,\"taskStartedAtMs\":1699999995000,"
         "\"ttlMs\":12000}");
     wire[QStringLiteral("message_elem_array")] = QJsonArray{element};
-    fake->receiveCallback(QString::fromUtf8(QJsonDocument(QJsonArray{wire}).toJson()));
+    fake->emitPayload(QString::fromUtf8(QJsonDocument(QJsonArray{wire}).toJson()));
     QCOMPARE(activityCount, 1);
 
     element[QStringLiteral("custom_elem_data")] = QStringLiteral(
         "{\"namespace\":\"multi-ai-code-activity\",\"version\":2,\"activityId\":\"machine:incomplete\","
         "\"sequence\":1,\"kind\":\"machine-thinking\",\"active\":true,\"ttlMs\":12000}");
     wire[QStringLiteral("message_elem_array")] = QJsonArray{element};
-    fake->receiveCallback(QString::fromUtf8(QJsonDocument(QJsonArray{wire}).toJson()));
+    fake->emitPayload(QString::fromUtf8(QJsonDocument(QJsonArray{wire}).toJson()));
     QCOMPARE(activityCount, 1);
 }
 
@@ -1211,6 +1218,9 @@ void TimSdkRemoteIMClientTest::loadsGenericFileFromHistory() {
             {QStringLiteral("message_sender"), QStringLiteral("phone-user")},
             {QStringLiteral("message_conv_id"), QStringLiteral("phone-user")},
             {QStringLiteral("message_msg_id"), QStringLiteral("sdk-history-file")},
+            {QStringLiteral("message_cloud_custom_str"), QStringLiteral(
+                "{\"namespace\":\"multi-ai-code\",\"version\":2,\"origin\":\"human\","
+                "\"quote\":{\"msgId\":\"history-quote\",\"sender\":\"owner\",\"kind\":\"text\",\"digest\":\"owned history context\"}}")},
             {QStringLiteral("message_server_time"), 1700000000},
             {QStringLiteral("message_elem_array"), QJsonArray{
                 QJsonObject{
@@ -1224,6 +1234,7 @@ void TimSdkRemoteIMClientTest::loadsGenericFileFromHistory() {
     }).toJson(QJsonDocument::Compact));
     TimSdkRemoteIMClient client(std::move(api));
     QSignalSpy messagesSpy(&client, &RemoteIMClient::messagesReceived);
+    QSignalSpy announcements(&client, &RemoteIMClient::liveMessageAnnounced);
 
     client.connectToService(123456, QStringLiteral("desktop-user"), QStringLiteral("sig-value"), nullptr);
 
@@ -1237,6 +1248,9 @@ void TimSdkRemoteIMClientTest::loadsGenericFileFromHistory() {
     QCOMPARE(file.file.fileName, QStringLiteral("report.pdf"));
     QCOMPARE(file.file.mimeType, QStringLiteral("application/pdf"));
     QCOMPARE(file.text, QStringLiteral("[文件消息] report.pdf"));
+    QVERIFY(file.hasQuote);
+    QCOMPARE(file.quote.digest, QStringLiteral("owned history context"));
+    QCOMPARE(announcements.size(), 0);
 }
 
 // 语音入站此前完全没有分支：elem_type 2 一个 if 都匹配不上，整条消息静默消失，
@@ -1558,6 +1572,82 @@ void TimSdkRemoteIMClientTest::reportsCreatedGroupWhenActivationFailsWithoutCrea
     QVERIFY(!succeeded);
     QCOMPARE(created.groupId, QStringLiteral("@TGS#partial"));
     QCOMPARE(created.name, QStringLiteral("Partial"));
+}
+
+void TimSdkRemoteIMClientTest::liveReadinessPreservesEnvelopeOrderAndRejectsOldConnection() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    TimSdkRemoteIMClient client(std::move(api));
+    client.connectToService(123456, QStringLiteral("owner"), QStringLiteral("owned-sig"), {});
+    QStringList events;
+    QList<RemoteIMMessage> announced;
+    connect(&client, &RemoteIMClient::liveMessageAnnounced, this,
+        [&](quint64 id, const RemoteIMMessage& message) {
+            QCOMPARE(message.origin, RemoteIMMessageOrigin::Human);
+            announced.append(message);
+            events.append(QStringLiteral("announce:%1:%2").arg(id).arg(message.id));
+        });
+    connect(&client, &RemoteIMClient::liveMessageReady, this,
+        [&](quint64 id, const RemoteIMMessage& message) {
+            events.append(QStringLiteral("ready:%1:%2").arg(id).arg(message.id));
+        });
+    const QJsonObject metadata{{QStringLiteral("namespace"), QStringLiteral("multi-ai-code")},
+                               {QStringLiteral("version"), 2}, {QStringLiteral("origin"), QStringLiteral("human")},
+                               {QStringLiteral("quote"), QJsonObject{{QStringLiteral("msgId"), QStringLiteral("quoted-id")},
+                                   {QStringLiteral("sender"), QStringLiteral("owner")},
+                                   {QStringLiteral("kind"), QStringLiteral("text")},
+                                   {QStringLiteral("digest"), QStringLiteral("owned quoted context")}}}};
+    QJsonObject wire{{QStringLiteral("message_sender"), QStringLiteral("friend")},
+                     {QStringLiteral("message_msg_id"), QStringLiteral("owned-ready-order")},
+                     {QStringLiteral("message_cloud_custom_str"), QString::fromUtf8(QJsonDocument(metadata).toJson())},
+                     {QStringLiteral("message_elem_array"), QJsonArray{
+                         QJsonObject{{QStringLiteral("elem_type"), 1},
+                                     {QStringLiteral("image_elem_orig_path"), QStringLiteral("owned-image.png")}},
+                         QJsonObject{{QStringLiteral("elem_type"), 4},
+                                     {QStringLiteral("file_elem_file_path"), QStringLiteral("owned-file.txt")}}}}};
+    fake->emitMessages({wire});
+    QCOMPARE(announced.size(), 2);
+    QVERIFY(announced.front().hasQuote);
+    QCOMPARE(announced.front().quote.digest, QStringLiteral("owned quoted context"));
+    QCOMPARE(events, QStringList({QStringLiteral("announce:1:owned-ready-order#0"),
+                                  QStringLiteral("ready:1:owned-ready-order#0"),
+                                  QStringLiteral("announce:2:owned-ready-order#1"),
+                                  QStringLiteral("ready:2:owned-ready-order#1")}));
+    const auto stale = fake->receiveCallback;
+    client.disconnectFromService({});
+    client.connectToService(456789, QStringLiteral("owner"), QStringLiteral("owned-second-sig"), {});
+    stale(QString::fromUtf8(QJsonDocument(QJsonArray{wire}).toJson()));
+    QCoreApplication::processEvents();
+    QCOMPARE(events.size(), 4);
+}
+
+void TimSdkRemoteIMClientTest::rawMetadataBoundaryPrecedesQueuedParseAndCompletesWithoutMediaDownload() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    TimSdkRemoteIMClient client(std::move(api));
+    client.connectToService(123, QStringLiteral("owner"), QStringLiteral("owned-unused-signature"), {});
+    QSignalSpy announced(&client, &RemoteIMClient::liveMessageAnnounced);
+    QSignalSpy finished(&client, &RemoteIMClient::liveMetadataBatchFinished);
+    QSignalSpy ready(&client, &RemoteIMClient::liveMessageReady);
+    const QJsonObject wire{{QStringLiteral("message_sender"), QStringLiteral("friend")},
+        {QStringLiteral("message_msg_id"), QStringLiteral("owned-raw-metadata")},
+        {QStringLiteral("message_cloud_custom_str"), QStringLiteral("{\"namespace\":\"multi-ai-code\",\"version\":2,\"origin\":\"human\"}")},
+        {QStringLiteral("message_elem_array"), QJsonArray{QJsonObject{{QStringLiteral("elem_type"), 1}}}}};
+    // Invoke the actual raw SDK boundary without the Fake helper's event flush.
+    fake->receiveCallback(QString::fromUtf8(QJsonDocument(QJsonArray{wire}).toJson()));
+    RemoteIMClient::LiveMetadataBoundary boundary;
+    client.withLiveMetadataBoundary([&](auto value) { boundary = value; });
+    QCOMPARE(boundary.sequence, quint64(1));
+    QVERIFY(boundary.generation > 0);
+    QCOMPARE(announced.size(), 0);
+    QCOMPARE(finished.size(), 0);
+    QCoreApplication::processEvents();
+    QCOMPARE(announced.size(), 1);
+    QCOMPARE(announced.first().at(2).toULongLong(), boundary.sequence);
+    QCOMPARE(announced.first().at(3).toULongLong(), boundary.generation);
+    QCOMPARE(finished.size(), 1);
+    QCOMPARE(finished.first().at(0).toULongLong(), boundary.sequence);
+    QCOMPARE(ready.size(), 0); // No URL/local file: metadata fence never waits on a download.
 }
 
 QTEST_MAIN(TimSdkRemoteIMClientTest)

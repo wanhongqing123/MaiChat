@@ -160,6 +160,7 @@ public final class AIAssistantController {
             }
         }
         if (shared != null) {
+            shared.sessionIMPublications.incrementAndGet();
             shared.close();
             shared = null;
         }
@@ -229,10 +230,15 @@ public final class AIAssistantController {
     }
     private static native long nativeCreate();
     private static synchronized void onNativeSessionChanged(String sessionId) {
-        if (shared != null && shared.sessionSync != null) shared.queueNativeSessionChange(sessionId);
+        if (shared != null) {
+            shared.wakeSessionIM();
+            if (shared.sessionSync != null) shared.queueNativeSessionChange(sessionId);
+        }
     }
     private static native void nativeDestroy(long handle);
     private static native byte[] nativeRequest(long handle, byte[] request);
+    private static native byte[] nativeSessionIMControl(byte[] request);
+    private static native byte[] nativeIMHistorySnapshot(byte[] request);
     static native byte[] nativeMatteVideo(byte[] arguments, byte[] workspace,
         byte[] modelPath, byte[] runtimePath);
     private static native boolean nativeSetHostToolHandler(long handle, AIAssistantController owner);
@@ -245,7 +251,7 @@ public final class AIAssistantController {
     private final HandlerThread thread = new HandlerThread("MaiChat-Agent");
     private final Handler worker;
     private final AIAssistantPreparationJobs preparations;
-    private long nativeEpoch;
+    private volatile long nativeEpoch;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final String testEndpoint;
     private final String accountUserId;
@@ -347,17 +353,49 @@ public final class AIAssistantController {
     private final Map<String, JSONArray> mediaMentionCache = new HashMap<>();
     private boolean ready;
     private volatile boolean closed;
+    private volatile MaiSessionIMBindingService.Backend.Observer sessionIMObserver;
+    private volatile JSONObject sessionIMAuthority = new JSONObject();
+    private boolean sessionIMHasBindings;
+    private int sessionIMPending;
+    private boolean sessionIMCleanupPending;
+    private final java.util.concurrent.atomic.AtomicBoolean sessionIMWakePosted = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile long sessionIMConfiguredEpoch;
+    private MaiSessionIMBindingService.Backend sessionIMBackendInstance;
+    private final java.util.concurrent.atomic.AtomicLong sessionIMPublications = new java.util.concurrent.atomic.AtomicLong();
+    private volatile JSONObject sessionIMLatestProjection = new JSONObject();
+    private static final class SessionIMPublication extends JSONObject {
+        final AIAssistantController owner;
+        final long epoch, serial;
+        SessionIMPublication(AIAssistantController owner, JSONObject value, long epoch, long serial) throws org.json.JSONException {
+            super(value.toString()); this.owner = owner; this.epoch = epoch; this.serial = serial;
+        }
+    }
+    /** 单次调用拥有已消费的 one-shot 回执；它只随现有发布重试传递，不调度历史执行。 */
+    private static final class SessionIMReceived {
+        final long epoch;
+        final JSONObject value;
+        SessionIMReceived(long epoch, JSONObject seed) {
+            this.epoch = epoch; value = MaiSessionIMBindingService.copy(seed);
+        }
+        void receive(JSONObject response) throws org.json.JSONException {
+            if (!value.has("scope") && response.has("scope") && response.has("bridge_id")) {
+                value.put("scope", response.get("scope")); value.put("bridge_id", response.get("bridge_id"));
+            }
+            mergeSessionIMTasks(value, response);
+        }
+    }
     private final Runnable poll = new Runnable() {
         @Override
         public void run() {
-            if (closed || listener == null)
+            if (closed || listener == null && !sessionIMHasBindings && sessionIMPending <= 0 && !sessionIMCleanupPending)
                 return;
             if (ready) {
                 refreshSeedanceCredential(false);
                 refreshBailianCredential(false);
-                refresh(false);
+                if (listener != null) refresh(false);
+                if (sessionIMHasBindings || sessionIMPending > 0 || sessionIMCleanupPending) pumpSessionIM();
             }
-            worker.postDelayed(this, data.optBoolean("busy") ? 100 : 500);
+            worker.postDelayed(this, data.optBoolean("busy") || sessionIMPending > 0 ? 100 : 500);
         }
     };
 
@@ -410,8 +448,8 @@ public final class AIAssistantController {
         listener = next;
         worker.post(() -> {
             worker.removeCallbacks(poll);
-            if (next != null && !closed) {
-                publishState();
+            if ((next != null || sessionIMHasBindings || sessionIMPending > 0 || sessionIMCleanupPending) && !closed) {
+                if (next != null) publishState();
                 poll.run();
             }
         });
@@ -422,6 +460,457 @@ public final class AIAssistantController {
     }
     void setHostToolHandler(HostToolHandler handler) {
         hostToolHandler = handler;
+    }
+
+    private void wakeSessionIM() {
+        if (closed || !sessionIMWakePosted.compareAndSet(false, true)) return;
+        worker.postDelayed(() -> {
+            sessionIMWakePosted.set(false);
+            if (closed || !ready || sessionIMObserver == null || !sessionIMAuthority.has("scope")) return;
+            pumpSessionIM();
+            worker.removeCallbacks(poll); worker.post(poll);
+        }, 100);
+    }
+
+    /** 只调用弱寿命控制 ABI；在 SDK 和 Core 宿主回调里也不重入串行 backend。 */
+    static JSONObject sessionIMControl(JSONObject request) {
+        try {
+            byte[] response = nativeSessionIMControl(request.toString().getBytes(StandardCharsets.UTF_8));
+            if (response == null) throw new IOException("会话绑定控制未返回结果");
+            return new JSONObject(new String(response, StandardCharsets.UTF_8));
+        } catch (Exception | LinkageError failure) {
+            JSONObject result = new JSONObject();
+            MaiSessionIMBindingService.put(result, "ok", false);
+            MaiSessionIMBindingService.put(result, "error", "会话绑定控制不可用");
+            return result;
+        }
+    }
+
+    synchronized MaiSessionIMBindingService.Backend sessionIMBackend() {
+        if (sessionIMBackendInstance != null) return sessionIMBackendInstance;
+        sessionIMBackendInstance = new MaiSessionIMBindingService.Backend() {
+            @Override public boolean current() {
+                return !closed && ownsModelConfiguration()
+                    && (!sessionIMAuthority.has("scope") || sessionIMConfiguredEpoch == nativeEpoch);
+            }
+            @Override public void observe(Observer observer) {
+                if (observer == null) return;
+                sessionIMPublications.incrementAndGet();
+                sessionIMObserver = observer;
+            }
+            @Override public void clearObserver(Observer expected) {
+                if (sessionIMObserver != expected) return;
+                sessionIMObserver = null;
+                long serial = sessionIMPublications.incrementAndGet(), epoch = nativeEpoch;
+                worker.post(() -> {
+                    if (sessionIMObserver != null || serial != sessionIMPublications.get() || epoch != nativeEpoch) return;
+                    sessionIMHasBindings = false; sessionIMPending = 0; sessionIMCleanupPending = false; sessionIMAuthority = new JSONObject();
+                    sessionIMLatestProjection = new JSONObject();
+                });
+            }
+            @Override public boolean ownsObserver(Observer expected) { return expected != null && sessionIMObserver == expected; }
+            @Override public boolean publicationCurrent(JSONObject value) {
+                return sessionIMPublicationCurrent(value);
+            }
+            @Override public JSONObject control(JSONObject value) {
+                JSONObject result = sessionIMControl(value);
+                String action = value.optString("action");
+                if (action.equals("ack") || action.equals("abandon_input") || action.equals("persisted_input") || action.equals("admit")) wakeSessionIM();
+                if (action.equals("takeover") && result.optBoolean("ok") && result.optBoolean("revoked"))
+                    sessionIMDidTakeover(value);
+                return result;
+            }
+            @Override public void request(JSONObject value, java.util.function.BiConsumer<JSONObject, String> completion) {
+                sessionIMRequest(value).whenComplete((response, failure) -> main.post(() -> {
+                    if (failure == null && !sessionIMPublicationCurrent(response)) completion.accept(null, "会话绑定状态已变化，请重试");
+                    else completion.accept(response, failure == null ? null : safeMessage(failure));
+                }));
+            }
+            @Override public void historyTask(JSONObject task, RemoteIMIngress.Fence fence) { startSessionIMHistory(task, fence); }
+            @Override public void incoming(JSONObject admission, RemoteIMMessage message,
+                    java.util.function.BiConsumer<JSONObject, String> completion) {
+                JSONObject owned = MaiSessionIMBindingService.copy(admission);
+                RemoteIMMessage ready = message.snapshot();
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                worker.post(() -> prepareSessionIMIncoming(owned, ready, deadline, completion));
+            }
+        };
+        return sessionIMBackendInstance;
+    }
+
+    private CompletableFuture<JSONObject> sessionIMRequest(JSONObject value) {
+        return sessionIMRequest(value, () -> true);
+    }
+    private CompletableFuture<JSONObject> sessionIMRequest(JSONObject value, java.util.function.BooleanSupplier current) {
+        JSONObject owned = MaiSessionIMBindingService.copy(value);
+        CompletableFuture<JSONObject> completion = new CompletableFuture<>();
+        if (!worker.post(() -> {
+            SessionIMReceived received = new SessionIMReceived(nativeEpoch, new JSONObject());
+            try {
+                requireModelOwner();
+                if (!current.getAsBoolean()) throw new java.util.concurrent.CancellationException("历史任务身份已变化");
+                JSONObject result = invokeNativeAgent(owned.put("op", "im_session_binding"));
+                received.receive(result);
+                updateSessionIMAuthority(result, owned.optString("action").equals("activate"));
+                SessionIMPublication fresh = freshSessionIMProjection(received);
+                copySessionIMProjection(result, fresh);
+                SessionIMPublication publication = new SessionIMPublication(this, result, fresh.epoch, fresh.serial);
+                publishSessionIMProjection(publication);
+                worker.removeCallbacks(poll); worker.post(poll);
+                completion.complete(publication);
+            } catch (Exception failure) {
+                retainSessionIMTasks(received, 0);
+                completion.completeExceptionally(failure);
+            }
+        })) completion.completeExceptionally(new java.util.concurrent.CancellationException("Agent 控制队列已关闭"));
+        return completion;
+    }
+
+    private void publishSessionIMProjection(SessionIMPublication publication) {
+        publishSessionIMProjection(publication, 0);
+    }
+    private void publishSessionIMProjection(SessionIMPublication publication, int attempt) {
+        MaiSessionIMBindingService.Backend.Observer observer = sessionIMObserver;
+        main.post(() -> {
+            if (closed || publication.epoch != nativeEpoch
+                    || !MaiSessionIMBindingService.sameAuthority(publication, sessionIMAuthority)) return;
+            if (observer == null || observer != sessionIMObserver) {
+                failUnpublishedSessionIMTasks(publication, publication.epoch, observer); return;
+            }
+            if (sessionIMPublicationCurrent(publication)) { observer.projection(publication); return; }
+            JSONArray tasks = MaiSessionIMBindingService.historyTasks(publication);
+            if (tasks.length() == 0) return;
+            // 用户接管可能让旧 UI 发布失效；保留 one-shot 原任务，改用新的实际投影再交接。
+            if (attempt < 4) worker.postDelayed(() -> {
+                SessionIMReceived received = new SessionIMReceived(publication.epoch, publication);
+                try {
+                    SessionIMPublication fresh = freshSessionIMProjection(received);
+                    publishSessionIMProjection(fresh, attempt + 1);
+                } catch (Exception unavailable) { retainSessionIMTasks(received, attempt + 1); }
+            }, 50);
+            else failUnpublishedSessionIMTasks(publication, publication.epoch, observer);
+        });
+    }
+
+    private void retainSessionIMTasks(SessionIMReceived received, int attempt) {
+        if (closed || received.epoch != nativeEpoch || !MaiSessionIMBindingService.sameAuthority(received.value, sessionIMAuthority)
+                || MaiSessionIMBindingService.historyTasks(received.value).length() == 0) return;
+        try {
+            // -1 禁止旧状态作为成功 UI 投影发布；任务仍进入原有的有限刷新重试。
+            publishSessionIMProjection(new SessionIMPublication(this, received.value, received.epoch, -1), attempt);
+        } catch (org.json.JSONException malformed) {
+            failUnpublishedSessionIMTasks(received.value, received.epoch, sessionIMObserver);
+        }
+    }
+
+    private void failUnpublishedSessionIMTasks(JSONObject value, long epoch, MaiSessionIMBindingService.Backend.Observer observer) {
+        JSONArray tasks = MaiSessionIMBindingService.historyTasks(value);
+        for (int index = 0; index < tasks.length(); index++) {
+            JSONObject task = tasks.optJSONObject(index);
+            if (task != null && (observer == null || !observer.historyTaskKnown(task))) {
+                JSONObject owned = MaiSessionIMBindingService.copy(task);
+                worker.post(() -> failSessionIMHistory(owned, epoch));
+            }
+        }
+    }
+
+    private JSONObject sessionIMSnapshot(JSONObject request) throws Exception {
+        if (Looper.myLooper() == Looper.getMainLooper() || Looper.myLooper() == worker.getLooper())
+            throw new IllegalStateException("历史快照只能在附件 I/O worker 执行");
+        try {
+            byte[] response = nativeIMHistorySnapshot(request.toString().getBytes(StandardCharsets.UTF_8));
+            if (response == null) throw new IOException("Native 历史快照未返回结果");
+            return new JSONObject(new String(response, StandardCharsets.UTF_8));
+        } catch (LinkageError missing) { throw new IOException("Native 历史快照不可用", missing); }
+    }
+
+    private void startSessionIMHistory(JSONObject value, RemoteIMIngress.Fence fence) {
+        JSONObject task = MaiSessionIMBindingService.copy(value);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(300);
+        worker.post(() -> {
+            long epoch = nativeEpoch;
+            MaiSessionIMBindingService.Backend.Observer observer = sessionIMObserver;
+            String owner = "session-im-history:" + task.optString("session_id") + ":" + task.optString("bridge_id") + ":" + task.optString("task_id");
+            java.util.function.BooleanSupplier current = () -> !closed && epoch == nativeEpoch && fence.isCurrent()
+                && MaiSessionIMBindingService.sameAuthority(task, sessionIMAuthority);
+            boolean started = preparations.start(owner, epoch, () -> nativeEpoch,
+                cancellation -> MaiSessionIMHistoryJob.run(task, fence, cancellation, current,
+                    AIAssistantController.this::sessionIMSnapshot, request -> sessionIMRequest(request, current), deadline),
+                (result, failure) -> {
+                    if (failure == null) return;
+                    failSessionIMHistory(task, epoch);
+                    if (!preparationCanceled(failure)) postSessionIMWarning(observer, epoch, "本机历史导入失败，本次绑定未启用");
+                });
+            if (!started) {
+                failSessionIMHistory(task, epoch);
+                postSessionIMWarning(observer, epoch, "本机历史准备繁忙，本次绑定未启用");
+            }
+        });
+    }
+
+    private void failSessionIMHistory(JSONObject task, long epoch) {
+        if (closed || epoch != nativeEpoch || !MaiSessionIMBindingService.sameAuthority(task, sessionIMAuthority)) return;
+        try {
+            JSONObject failed = MaiSessionIMHistoryJob.request("history_failed", task).put("reason", "source_preparation_failed");
+            sessionIMRequest(failed);
+        } catch (Exception invalid) { /* 旧任务不能改用新 scope 或新 task 发送。 */ }
+    }
+
+    private static boolean preparationCanceled(Throwable failure) {
+        Throwable value = failure;
+        while ((value instanceof java.util.concurrent.ExecutionException || value instanceof java.util.concurrent.CompletionException)
+                && value.getCause() != null) value = value.getCause();
+        return value instanceof java.util.concurrent.CancellationException;
+    }
+
+    private void updateSessionIMAuthority(JSONObject value) {
+        updateSessionIMAuthority(value, false);
+    }
+
+    private boolean sessionIMInputCurrent(JSONObject admission, long epoch) {
+        if (closed || epoch != nativeEpoch || !MaiSessionIMBindingService.sameAuthority(admission, sessionIMAuthority)) return false;
+        JSONArray bindings = sessionIMLatestProjection.optJSONArray("bindings");
+        if (bindings != null) for (int index = 0; index < bindings.length(); index++) {
+            JSONObject route = bindings.optJSONObject(index);
+            if (route != null && admission.optString("peer_id").equals(route.optString("peer_id")))
+                return admission.optString("expected_session_id").equals(route.optString("session_id"))
+                    && admission.optString("expected_binding_epoch").equals(route.optString("epoch"));
+        }
+        return false;
+    }
+
+    private void prepareSessionIMIncoming(JSONObject admission, RemoteIMMessage message, long deadline,
+            java.util.function.BiConsumer<JSONObject, String> completion) {
+        long epoch = nativeEpoch;
+        MaiSessionIMBindingService.Backend.Observer observer = sessionIMObserver;
+        if (!sessionIMInputCurrent(admission, epoch)) {
+            completion.accept(null, "绑定输入已失效"); return;
+        }
+        boolean media = message.imageAttachment() != null || message.videoAttachment() != null
+            || message.voiceAttachment() != null || message.fileAttachment() != null;
+        if (!media) {
+            try { finishSessionIMIncoming(admission, sessionIMInput(admission, message, null, () -> true, deadline), epoch, completion); }
+            catch (Exception failure) { completion.accept(null, "绑定输入准备失败"); }
+            return;
+        }
+        String owner = "session-im:" + admission.optString("expected_session_id") + ":" + admission.optString("input_id");
+        Runnable timeout = () -> preparations.cancel(owner);
+        boolean started = preparations.start(owner, epoch, () -> nativeEpoch,
+            cancellation -> sessionIMInput(admission, message, cancellation,
+                () -> sessionIMInputCurrent(admission, epoch), deadline), (value, failure) -> {
+                worker.removeCallbacks(timeout);
+                if (failure != null || !sessionIMInputCurrent(admission, epoch)) {
+                    completion.accept(null, "绑定附件准备已取消或失败");
+                    if (!closed && epoch == nativeEpoch) postSessionIMWarning(observer, epoch, "收到的附件无法加入绑定会话，本条消息未自动处理");
+                } else finishSessionIMIncoming(admission, value, epoch, completion);
+            });
+        if (!started) {
+            completion.accept(null, "附件准备繁忙，本条消息未自动处理");
+            postSessionIMWarning(observer, epoch, "附件准备繁忙，本条消息未自动处理");
+        } else worker.postDelayed(timeout, Math.max(0, TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())));
+    }
+
+    private JSONObject sessionIMInput(JSONObject admission, RemoteIMMessage message,
+            AIAssistantPreparationJobs.Cancellation cancellation, java.util.function.BooleanSupplier current, long deadline) throws Exception {
+        JSONObject value = MaiSessionIMBindingService.copy(admission);
+        String text = message.text();
+        JSONArray images = new JSONArray(), videos = new JSONArray();
+        File file = null;
+        if (message.imageAttachment() != null) file = new File(message.imageAttachment().localPath());
+        else if (message.videoAttachment() != null) file = new File(message.videoAttachment().localPath());
+        else if (message.voiceAttachment() != null) file = new File(message.voiceAttachment().localPath());
+        else if (message.fileAttachment() != null) file = new File(message.fileAttachment().localPath());
+        if (file != null) {
+            if (cancellation == null || !file.isFile() || file.length() < 1) throw new IOException("入站附件尚未准备好");
+            cancellation.check();
+            ImportedFile imported;
+            try (InputStream input = AIAssistantPreparationJobs.guard(new java.io.FileInputStream(file), cancellation, current, deadline)) {
+                if (message.imageAttachment() != null) {
+                    MaiCloudDrive.MediaInfo info = MaiSessionAttachments.mediaInfo(file.getName());
+                    if (info == null) throw new IOException("入站图片格式无效");
+                    imported = importStream(input, info.contentType, file.getName());
+                } else imported = copySessionFile(input, file.getName());
+            }
+            cancellation.check();
+            if (!current.getAsBoolean() || System.nanoTime() >= deadline) {
+                File canceled = workspaceFile(imported.relativePath); if (canceled != null) canceled.delete();
+                throw new IOException("绑定附件准备已取消");
+            }
+            text = RemoteIMAttachmentCaptionPolicy.caption(message);
+            JSONObject entry = new JSONObject().put("path", imported.relativePath).put("mimeType", imported.mimeType);
+            if (message.imageAttachment() != null) images.put(entry);
+            else if (message.videoAttachment() != null) videos.put(entry);
+            else text += (text.isEmpty() ? "" : "\n\n") + "附件：" + imported.relativePath;
+        }
+        if (message.quote() != null && !message.quote().digest().isEmpty())
+            text = "引用：" + message.quote().digest() + "\n\n" + text;
+        return value.put("text", text).put("images", images).put("videos", videos).put("op", "im_session_binding");
+    }
+
+    private void finishSessionIMIncoming(JSONObject admission, JSONObject prepared, long epoch,
+            java.util.function.BiConsumer<JSONObject, String> completion) {
+        if (!sessionIMInputCurrent(admission, epoch)) { completion.accept(null, "绑定输入已失效"); return; }
+        sessionIMRequest(prepared).whenComplete((result, failure) -> completion.accept(result, failure == null ? null : "消息未能加入绑定会话"));
+    }
+    private void updateSessionIMAuthority(JSONObject value, boolean activate) {
+        if (!value.has("scope") || !value.has("bridge_id")) return;
+        if (!activate && sessionIMAuthority.has("scope") && !MaiSessionIMBindingService.sameAuthority(sessionIMAuthority, value))
+            throw new IllegalStateException("会话绑定回执属于旧控制器");
+        JSONObject authority = new JSONObject();
+        MaiSessionIMBindingService.put(authority, "bridge_id", value.optString("bridge_id"));
+        MaiSessionIMBindingService.put(authority, "scope", value.optJSONObject("scope"));
+        sessionIMAuthority = MaiSessionIMBindingService.copy(authority);
+        sessionIMConfiguredEpoch = nativeEpoch;
+        if (value.has("has_bindings")) sessionIMHasBindings = value.optBoolean("has_bindings");
+        if (value.has("pending_count")) sessionIMPending = value.optInt("pending_count");
+        sessionIMCleanupPending = value.optBoolean("history_cleanup_pending", false);
+        if (value.has("bindings")) sessionIMLatestProjection = MaiSessionIMBindingService.copy(value);
+    }
+
+    private boolean sessionIMPublicationCurrent(JSONObject value) {
+        if (!(value instanceof SessionIMPublication)) return false;
+        SessionIMPublication publication = (SessionIMPublication) value;
+        return publication.owner == this && !closed && publication.epoch == nativeEpoch
+            && publication.serial == sessionIMPublications.get()
+            && MaiSessionIMBindingService.sameAuthority(publication, sessionIMAuthority);
+    }
+
+    private SessionIMPublication freshSessionIMProjection(SessionIMReceived received) throws Exception {
+        long epoch = received.epoch;
+        for (int attempt = 0; attempt < 4; attempt++) {
+            long serial = sessionIMPublications.get();
+            JSONObject request = MaiSessionIMBindingService.copy(sessionIMAuthority).put("op", "im_session_binding").put("action", "list");
+            JSONObject result = invokeNativeAgent(request);
+            received.receive(result);
+            if (epoch != nativeEpoch || closed || !MaiSessionIMBindingService.sameAuthority(request, result))
+                throw new IOException("会话绑定控制器已变化");
+            if (serial != sessionIMPublications.get()) continue;
+            mergeSessionIMTasks(result, received.value);
+            updateSessionIMAuthority(result);
+            return new SessionIMPublication(this, result, epoch, serial);
+        }
+        throw new IOException("会话绑定状态正在变化，请重试");
+    }
+
+    private static void copySessionIMProjection(JSONObject target, JSONObject source) throws org.json.JSONException {
+        for (String key : new String[]{"bridge_id", "scope", "sessions", "bindings", "has_bindings", "pending_count"})
+            target.put(key, source.get(key));
+        if (source.has("history_progress_all")) target.put("history_progress_all", source.get("history_progress_all"));
+        target.put("history_cleanup_pending", source.optBoolean("history_cleanup_pending", false));
+        mergeSessionIMTasks(target, source);
+    }
+
+    private static void mergeSessionIMTasks(JSONObject target, JSONObject source) throws org.json.JSONException {
+        JSONArray result = new JSONArray(); java.util.HashSet<String> seen = new java.util.HashSet<>();
+        for (JSONObject value : new JSONObject[]{target, source}) {
+            JSONArray tasks = MaiSessionIMBindingService.historyTasks(value);
+            for (int index = 0; index < tasks.length(); index++) {
+                JSONObject task = tasks.getJSONObject(index);
+                if (seen.add(MaiSessionIMBindingService.historyTaskKey(task))) result.put(MaiSessionIMBindingService.copy(task));
+            }
+        }
+        if (result.length() > 0) target.put("history_tasks", result);
+    }
+
+    private void prepareSessionIMReplacement() throws Exception {
+        if (!sessionIMAuthority.has("scope")) return;
+        requireModelOwner();
+        sessionIMPublications.incrementAndGet();
+        preparations.cancelPrefix("session-im:");
+        preparations.cancelPrefix("session-im-history:");
+        SessionIMReceived received = new SessionIMReceived(nativeEpoch, new JSONObject());
+        SessionIMPublication snapshot;
+        try { snapshot = freshSessionIMProjection(received); }
+        catch (Exception unavailable) { retainSessionIMTasks(received, 0); throw unavailable; }
+        publishSessionIMProjection(snapshot);
+        if (!MaiSessionIMBindingService.persistProjection(context, snapshot,
+                () -> sessionIMPublicationCurrent(snapshot) && ownsModelConfiguration()))
+            throw new IOException("会话绑定状态未保存，原配置已保留");
+    }
+
+    private void sessionIMDidTakeover(JSONObject authority) {
+        sessionIMPublications.incrementAndGet();
+        String session = authority.optString("session_id");
+        preparations.cancelPrefix("session-im:" + session + ":");
+        preparations.cancelPrefix("session-im-history:" + session + ":");
+        long epoch = nativeEpoch;
+        MaiSessionIMBindingService.removeSessionPreference(context, authority.optJSONObject("scope"), session,
+            () -> !closed && epoch == nativeEpoch && ownsModelConfiguration()
+                && MaiSessionIMBindingService.sameAuthority(authority, sessionIMAuthority));
+        wakeSessionIM();
+    }
+
+    private void pumpSessionIM() {
+        if (sessionIMObserver == null || !sessionIMAuthority.has("scope")) return;
+        long epoch = nativeEpoch;
+        MaiSessionIMBindingService.Backend.Observer observer = sessionIMObserver;
+        SessionIMReceived received = new SessionIMReceived(epoch, new JSONObject());
+        try {
+            JSONObject request = MaiSessionIMBindingService.copy(sessionIMAuthority).put("op", "im_session_binding").put("action", "pump");
+            JSONObject result = invokeNativeAgent(request);
+            received.receive(result);
+            updateSessionIMAuthority(result);
+            JSONArray deliveries = result.optJSONArray("deliveries");
+            if (deliveries != null) for (int index = 0; index < deliveries.length(); index++) {
+                JSONObject delivery = MaiSessionIMBindingService.copy(deliveries.getJSONObject(index));
+                main.post(() -> {
+                    if (!closed && epoch == nativeEpoch && observer != null && sessionIMObserver == observer
+                            && MaiSessionIMBindingService.sameAuthority(delivery, sessionIMAuthority)) observer.delivery(delivery);
+                    else sessionIMControl(controlDelivery("ack", delivery));
+                });
+            }
+            JSONArray warnings = result.optJSONArray("warnings");
+            if (warnings != null) for (int index = 0; index < warnings.length(); index++) {
+                JSONObject warning = warnings.optJSONObject(index); if (warning == null) continue;
+                String code = warning.optString("code");
+                if (code.equals("history_cleanup_failed") && warning.optString("outcome").equals("retry_local_cleanup")) {
+                    // 旧历史副本由内核继续维护；无需用户操作，也不能误报为本次入站提交失败。
+                    Log.i("MaiChatAgent", "Session IM local history cleanup will retry");
+                    continue;
+                }
+                String message = code.equals("input_timeout") ? "附件准备超时，本条消息未自动处理"
+                    : code.equals("delivery_timeout") ? "绑定回复交付未确认，未自动重发"
+                    : "消息未能加入绑定会话，请在创作中心查看";
+                postSessionIMWarning(observer, epoch, message);
+            }
+            // 状态投影单独获取，不能把 dispatch 交接绑在 UI 发布是否稳定上。
+            SessionIMPublication projection = freshSessionIMProjection(received);
+            publishSessionIMProjection(projection);
+        } catch (Exception failure) {
+            retainSessionIMTasks(received, 0);
+            if (nativeEpoch != sessionIMConfiguredEpoch) {
+                long changedEpoch = nativeEpoch;
+                JSONObject reset = new JSONObject(); MaiSessionIMBindingService.put(reset, "reactivate", true);
+                main.post(() -> {
+                    if (observer != null && sessionIMObserver == observer && nativeEpoch == changedEpoch
+                            && sessionIMConfiguredEpoch != nativeEpoch) observer.projection(reset);
+                });
+            }
+            // 内核失败不伪装成空绑定、成功发送或可重放的输入。
+        }
+    }
+
+    private void postSessionIMWarning(MaiSessionIMBindingService.Backend.Observer observer, long epoch, String message) {
+        main.post(() -> {
+            if (!closed && nativeEpoch == epoch && observer != null && sessionIMObserver == observer)
+                observer.warning(message.length() > 200 ? message.substring(0, 200) : message);
+        });
+    }
+
+    static JSONObject controlDelivery(String action, JSONObject delivery) {
+        JSONObject request = new JSONObject();
+        MaiSessionIMBindingService.put(request, "action", action);
+        MaiSessionIMBindingService.put(request, "delivery", MaiSessionIMBindingService.copy(delivery));
+        return request;
+    }
+
+    private void takeOverSessionIM(String session) {
+        if (session == null || session.isEmpty() || !sessionIMAuthority.has("scope")) return;
+        JSONObject request = MaiSessionIMBindingService.copy(sessionIMAuthority);
+        MaiSessionIMBindingService.put(request, "action", "takeover");
+        MaiSessionIMBindingService.put(request, "session_id", session);
+        JSONObject result = sessionIMControl(request);
+        if (result.optBoolean("ok") && result.optBoolean("revoked")) sessionIMDidTakeover(request);
     }
     @SuppressWarnings("unused") // Called from MaiAgentJni.cpp on an agent worker thread.
     // 原生 Agent 工具回调在这里按名称分派到手机宿主。
@@ -808,6 +1297,7 @@ public final class AIAssistantController {
             throw new IllegalStateException("Native agent on UI thread");
         if (handle == 0)
             throw new IllegalStateException("AI 核心尚未初始化");
+        if (request.optString("op").equals("configure")) prepareSessionIMReplacement();
         byte[] response = nativeRequest(handle, request.toString().getBytes(StandardCharsets.UTF_8));
         if (response == null)
             throw new IllegalStateException("AI 核心未返回结果");
@@ -2494,22 +2984,6 @@ public final class AIAssistantController {
     void send(String text, Consumer<Boolean> completion) {
         send(text, java.util.Collections.emptyList(), completion);
     }
-    void suggestReplies(JSONArray messages, java.util.function.BiConsumer<JSONObject, String> completion) {
-        JSONArray context = messages == null ? new JSONArray() : messages;
-        worker.post(() -> {
-            JSONObject suggestions = null;
-            String failure = null;
-            try {
-                suggestions = invokeNativeAgent(new JSONObject().put("op", "suggest_replies")
-                    .put("messages", context));
-            } catch (Exception e) {
-                failure = safeMessage(e);
-            }
-            JSONObject result = suggestions;
-            String errorMessage = failure;
-            main.post(() -> completion.accept(result, errorMessage));
-        });
-    }
     void send(String text, java.util.List<ImportedFile> attachments, Consumer<Boolean> completion) {
         send(state.selected, text, attachments, "", completion);
     }
@@ -2561,6 +3035,7 @@ public final class AIAssistantController {
             String owner = outgoingOwner(intendedSession, remote);
             JSONObject recovery = new JSONObject(outgoingPreferences.getString("recovery", "{}"));
             if (owner.equals(recovery.optString("owner"))) payload.put("recoveryId", recovery.optString("id"));
+            if (remote == null) takeOverSessionIM(intendedSession);
             outgoingQueue.enqueue(owner, payload);
             worker.post(() -> { publishState(); drainOutgoing(owner); });
             return true;
@@ -2834,6 +3309,8 @@ public final class AIAssistantController {
         AIAssistantSubmission stopBinding = AIAssistantSubmission.capture(target,
             clicked.remoteSession, clicked.runtime(target));
         JSONObject clickedRemote = stopBinding.remoteOwner();
+        if (clickedRemote == null && (operation.equals("stop") || operation.equals("clear") || operation.equals("delete")))
+            takeOverSessionIM(target);
         worker.post(() -> {
             if (operation.equals("delete") || operation.equals("clear"))
                 cancelPreparationsForSession(target, clickedRemote);

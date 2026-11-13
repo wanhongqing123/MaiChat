@@ -74,6 +74,42 @@ public final class RemoteIMMediaStore {
         );
     }
 
+    /** 普通发送与 Agent/绑定发送复用的 Android 视频元数据和封面准备；调用方在工作线程执行。 */
+    public RemoteIMVideoAttachment prepareVideo(File file) throws IOException {
+        android.media.MediaMetadataRetriever retriever = new android.media.MediaMetadataRetriever();
+        android.graphics.Bitmap cover = null;
+        File poster = null;
+        try {
+            retriever.setDataSource(file.getAbsolutePath());
+            int width = mediaNumber(retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
+            int height = mediaNumber(retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
+            int duration = mediaNumber(retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION));
+            if (width <= 0 || height <= 0 || duration <= 0) throw new IOException("视频没有可播放的画面或时长");
+            if (android.os.Build.VERSION.SDK_INT >= 27)
+                cover = retriever.getScaledFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                    480, Math.max(1, Math.min(480, height * 480 / width)));
+            if (cover == null) cover = retriever.getFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            if (cover == null) throw new IOException("无法生成视频封面");
+            poster = new File(outgoing(RemoteIMMediaPaths.VIDEO_COVERS), "machine-cover-" + java.util.UUID.randomUUID() + ".jpg");
+            try (FileOutputStream output = new FileOutputStream(poster)) {
+                if (!cover.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, output)) throw new IOException("无法保存视频封面");
+            }
+            return new RemoteIMVideoAttachment(file.getAbsolutePath(), poster.getAbsolutePath(),
+                Math.max(1, (duration + 999) / 1000), width, height, file.length());
+        } catch (Exception failure) {
+            if (poster != null) poster.delete();
+            if (failure instanceof IOException) throw (IOException) failure;
+            throw new IOException("视频准备失败", failure);
+        } finally {
+            if (cover != null) cover.recycle();
+            retriever.release();
+        }
+    }
+
+    private static int mediaNumber(String value) {
+        try { return Integer.parseInt(value); } catch (NumberFormatException invalid) { return 0; }
+    }
+
     private File outgoing(String kind) throws IOException {
         return paths.directory(RemoteIMMediaPaths.OUTGOING, kind);
     }

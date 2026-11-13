@@ -413,7 +413,8 @@ extension AIMobileHostToolProvider {
         }
     }
 
-    private static func prepareAgentImage(_ source: URL) async throws -> RemoteIMImageFile {
+    // 普通 Session 绑定回发复用同一份沙盒媒体准备；授权仍在最终 SDK 边界核验。
+    static func prepareAgentImage(_ source: URL) async throws -> RemoteIMImageFile {
         try await RemoteIMBackgroundWork.file {
             let size = try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
             guard size > 0, size <= 20 * 1024 * 1024 else {
@@ -428,7 +429,8 @@ extension AIMobileHostToolProvider {
         }
     }
 
-    private static func copyAgentMedia(
+    // 普通 Session 绑定回发复用同一份沙盒媒体准备；授权仍在最终 SDK 边界核验。
+    static func copyAgentMedia(
         _ source: URL, category: RemoteIMMediaStorage.Category
     ) async throws -> URL {
         try await RemoteIMBackgroundWork.file {
@@ -455,7 +457,8 @@ extension AIMobileHostToolProvider {
         }
     }
 
-    private static func prepareAgentVideo(_ source: URL) async throws -> RemoteIMVideoFile {
+    // 普通 Session 绑定回发复用同一份沙盒媒体准备；授权仍在最终 SDK 边界核验。
+    static func prepareAgentVideo(_ source: URL) async throws -> RemoteIMVideoFile {
         let copied = try await copyAgentMedia(source, category: .outgoingVideos)
         let asset = AVURLAsset(url: copied)
         let duration = try await asset.load(.duration)

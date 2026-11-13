@@ -484,47 +484,8 @@ final class MaiChatIMTools {
             .put("message_id", queued.id()).put("caption_queued", captionQueued);
     }
 
-    private static RemoteIMVideoAttachment prepareAgentVideo(
-        File file, RemoteIMMediaStore store
-    ) throws IOException {
-        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-        Bitmap cover = null;
-        try {
-            retriever.setDataSource(file.getAbsolutePath());
-            int width = mediaNumber(retriever.extractMetadata(
-                MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
-            int height = mediaNumber(retriever.extractMetadata(
-                MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
-            int duration = mediaNumber(retriever.extractMetadata(
-                MediaMetadataRetriever.METADATA_KEY_DURATION));
-            if (width <= 0 || height <= 0 || duration <= 0)
-                throw new IOException("视频没有可播放的画面或时长");
-            if (Build.VERSION.SDK_INT >= 27)
-                cover = retriever.getScaledFrameAtTime(0,
-                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC, 480,
-                    Math.max(1, Math.min(480, height * 480 / width)));
-            if (cover == null)
-                cover = retriever.getFrameAtTime(0,
-                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
-            if (cover == null) throw new IOException("无法生成视频封面");
-            File poster = store.createOutgoingFile("agent-cover-"
-                + java.util.UUID.randomUUID() + ".jpg");
-            try (FileOutputStream output = new FileOutputStream(poster)) {
-                if (!cover.compress(Bitmap.CompressFormat.JPEG, 85, output))
-                    throw new IOException("无法保存视频封面");
-            }
-            return new RemoteIMVideoAttachment(file.getAbsolutePath(),
-                poster.getAbsolutePath(), Math.max(1, (duration + 999) / 1000),
-                width, height, file.length());
-        } finally {
-            if (cover != null) cover.recycle();
-            retriever.release();
-        }
-    }
-
-    private static int mediaNumber(String value) {
-        try { return Integer.parseInt(value); }
-        catch (NumberFormatException error) { return 0; }
+    private static RemoteIMVideoAttachment prepareAgentVideo(File file, RemoteIMMediaStore store) throws IOException {
+        return store.prepareVideo(file);
     }
 
     private static String audioMimeType(String name) {

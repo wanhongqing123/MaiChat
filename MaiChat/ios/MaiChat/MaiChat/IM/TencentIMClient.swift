@@ -92,6 +92,18 @@ private final class AvatarSDKCompletion: @unchecked Sendable {
     }
 }
 
+/// SDK 网络 callback 可能迟到或缺失；只影响普通历史行，不阻塞已 ack 的内核 FIFO。
+private final class IMSessionSDKCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<RemoteIMSendReceipt, Error>?
+    init(_ continuation: CheckedContinuation<RemoteIMSendReceipt, Error>) { self.continuation = continuation }
+    var isPending: Bool { lock.lock(); defer { lock.unlock() }; return continuation != nil }
+    func finish(_ result: Result<RemoteIMSendReceipt, Error>) {
+        lock.lock(); let current = continuation; continuation = nil; lock.unlock()
+        current?.resume(with: result)
+    }
+}
+
 final class TencentIMClient:
     NSObject,
     RemoteIMClient,
@@ -101,6 +113,11 @@ final class TencentIMClient:
     V2TIMGroupListener,
     V2TIMAPNSListener
 {
+    var onIncomingMetadata: ((IncomingRemoteIMMetadata) async -> RemoteIMMetadataReceipt?)?
+    var incomingPersistenceFence: IMIngressPersistenceFence? { persistenceFence }
+    private nonisolated let persistenceFence = IMIngressPersistenceFence()
+    private nonisolated let rawIngressLock = NSLock()
+    var onSessionIMInput: ((IMSessionIncomingPayload) -> Void)?
     var onIncomingText: ((IncomingRemoteIMText) -> Void)?
     var onIncomingActivity: ((IncomingRemoteIMActivity) -> Void)?
     var onIncomingVoice: ((IncomingRemoteIMVoice) -> Void)?
@@ -121,11 +138,23 @@ final class TencentIMClient:
 
     /// 使用服务端签发的 IM 凭证连接腾讯 IM SDK。
     /// 连接阶段分别处理初始化、登录和回调注册，失败向上层返回可定位错误。
+    #if DEBUG && targetEnvironment(simulator)
+    /// 自有 raw-envelope 验收仅设置原 SDK 身份镜像，不调用 init/login 或网络 API。
+    func configureRawIngressIdentityForUITest(sdkAppID: Int, owner: String) throws {
+        guard ProcessInfo.processInfo.arguments.contains("--im-raw-metadata-ui-test") else { throw CancellationError() }
+        profileAccountSnapshot.begin(userID: owner)
+        let tag = RemoteDiagnosticsProtocol.accountTag(sdkAppID: sdkAppID, ownerUserID: owner)
+        Self.diagnosticAccountSnapshot.store(tag)
+        persistenceFence.activate(accountTag: tag, generation: profileAccountSnapshot.load().generation)
+    }
+    #endif
+
     func connect(sdkAppID: Int, userID: String, userSig: String) async throws {
         attachmentDownloads.cancelAll()
         profileAccountSnapshot.begin(userID: userID)
         let diagnosticAccount = RemoteDiagnosticsProtocol.accountTag(sdkAppID: sdkAppID, ownerUserID: userID)
         Self.diagnosticAccountSnapshot.store(diagnosticAccount)
+        persistenceFence.activate(accountTag: diagnosticAccount, generation: profileAccountSnapshot.load().generation)
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let state = lifecycleState
             Self.sdkQueue.async {
@@ -210,6 +239,7 @@ final class TencentIMClient:
 
     func disconnect() async {
         attachmentDownloads.cancelAll()
+        persistenceFence.invalidate()
         profileAccountSnapshot.begin(userID: nil)
         Self.diagnosticAccountSnapshot.store(nil)
         await withCheckedContinuation { continuation in
@@ -266,10 +296,16 @@ final class TencentIMClient:
     }
 
     @objc nonisolated func onKickedOffline() {
+        persistenceFence.invalidate()
+        profileAccountSnapshot.begin(userID: nil)
+        Self.diagnosticAccountSnapshot.store(nil)
         Self.logSDK(level: .error, event: "sdk-kicked-offline")
     }
 
     @objc nonisolated func onUserSigExpired() {
+        persistenceFence.invalidate()
+        profileAccountSnapshot.begin(userID: nil)
+        Self.diagnosticAccountSnapshot.store(nil)
         Self.logSDK(level: .error, event: "sdk-user-sig-expired")
     }
 
@@ -410,6 +446,42 @@ final class TencentIMClient:
             metadata: ["content_bytes": String(text.lengthOfBytes(using: .utf8))],
             failureDescription: "send text failed"
         )
+    }
+
+    func sendSessionReply(_ payload: IMSessionOutgoingPayload, to userID: String,
+                          permit: IMSessionDispatchPermit) async throws -> RemoteIMSendReceipt {
+        let loginGeneration = profileAccountSnapshot.load().generation
+        let kind: String
+        let prepared: PreparedSDKMessage?
+        switch payload {
+        case .text(let text):
+            kind = "text"
+            prepared = try await Self.makeMessage { V2TIMManager.sharedInstance().createTextMessage(text: text) }
+        case .image(let image, let text):
+            kind = "image"
+            prepared = try await Self.makeMessage {
+                let message = V2TIMManager.sharedInstance().createImageMessage(imagePath: image.fileURL.path)
+                return Self.attachCaption(text, to: message, firstElem: message?.imageElem)
+            }
+        case .video(let video, let text):
+            kind = "video"
+            prepared = try await Self.makeMessage {
+                let message = V2TIMManager.sharedInstance().createVideoMessage(videoFilePath: video.fileURL.path,
+                    type: video.fileType, duration: Int32(clamping: video.durationSeconds), snapshotPath: video.coverFileURL.path)
+                return Self.attachCaption(text, to: message, firstElem: message?.videoElem)
+            }
+        case .file(let file, let text):
+            kind = "file"
+            prepared = try await Self.makeMessage {
+                let message = V2TIMManager.sharedInstance().createFileMessage(filePath: file.fileURL.path, fileName: file.fileName)
+                return Self.attachCaption(text, to: message, firstElem: message?.fileElem)
+            }
+        }
+        guard let prepared else { permit.acknowledge(); throw RemoteIMClientError.operationFailed(
+            code: -1, description: "无法创建会话回复") }
+        return try await send(message: prepared, to: userID, kind: kind, origin: .machine,
+            cloudMetadata: RemoteIMCloudMetadata(origin: .machine, captionAbove: false),
+            metadata: [:], failureDescription: "会话回复发送失败", sessionPermit: permit, expectedLoginGeneration: loginGeneration)
     }
 
     func createGroup(name: String, memberUserIDs: [String]) async throws -> RemoteIMGroup {
@@ -1135,7 +1207,9 @@ final class TencentIMClient:
         origin: RemoteIMMessageOrigin,
         cloudMetadata: RemoteIMCloudMetadata? = nil,
         metadata: [String: String],
-        failureDescription: String
+        failureDescription: String,
+        sessionPermit: IMSessionDispatchPermit? = nil,
+        expectedLoginGeneration: UUID? = nil
     ) async throws -> RemoteIMSendReceipt {
         let startedAt = ProcessInfo.processInfo.systemUptime
         var startFields = metadata
@@ -1149,10 +1223,25 @@ final class TencentIMClient:
         Self.logSDK(level: .info, event: "message-send-start", fields: startFields)
         let fieldsSnapshot = startFields
         return try await withCheckedThrowingContinuation { continuation in
-            Self.sdkQueue.async {
-                guard message.account == Self.diagnosticAccountSnapshot.load() else {
-                    continuation.resume(throwing: CancellationError()); return
+            let completion = IMSessionSDKCompletion(continuation)
+            if sessionPermit != nil {
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 30) {
+                    completion.finish(.failure(RemoteIMClientError.operationFailed(code: -1,
+                        description: "回复送达状态未知，未自动重发")))
                 }
+            }
+            Self.sdkQueue.async {
+                guard completion.isPending, message.account == Self.diagnosticAccountSnapshot.load(),
+                      expectedLoginGeneration == nil || expectedLoginGeneration == self.profileAccountSnapshot.load().generation else {
+                    sessionPermit?.acknowledge()
+                    completion.finish(.failure(CancellationError())); return
+                }
+                // 最后一次 claim 与真实 SDK send 之间无 await/准备工作；撤销后的迟到媒体只能放弃。
+                guard sessionPermit == nil || sessionPermit!.claim(accountTag: message.account) else {
+                    sessionPermit?.acknowledge()
+                    completion.finish(.failure(CancellationError())); return
+                }
+                defer { sessionPermit?.acknowledge() }
                     message.value.cloudCustomData = RemoteIMCloudMetadataCodec.encode(
                         cloudMetadata ?? RemoteIMCloudMetadata(origin: origin))
                     V2TIMManager.sharedInstance().sendMessage(
@@ -1170,7 +1259,7 @@ final class TencentIMClient:
                         fields["duration_ms"] = Self.elapsedMilliseconds(since: startedAt)
                         fields["message"] = Self.messageTag(receipt.remoteID)
                         Self.logSDK(level: .info, event: "message-send-finished", fields: fields)
-                        continuation.resume(returning: receipt)
+                        completion.finish(.success(receipt))
                     },
                     fail: { code, desc in
                         var fields = fieldsSnapshot
@@ -1178,12 +1267,8 @@ final class TencentIMClient:
                         fields["code"] = String(code)
                         fields["duration_ms"] = Self.elapsedMilliseconds(since: startedAt)
                         Self.logSDK(level: .error, event: "message-send-finished", fields: fields)
-                        continuation.resume(
-                            throwing: RemoteIMClientError.operationFailed(
-                                code: code,
-                                description: desc ?? failureDescription
-                            )
-                        )
+                        completion.finish(.failure(RemoteIMClientError.operationFailed(
+                            code: code, description: desc ?? failureDescription)))
                     }
                 )
             }
@@ -1230,132 +1315,8 @@ final class TencentIMClient:
     }
 
     nonisolated func onRecvC2CTextMessage(msgID: String, sender: V2TIMUserInfo, text: String?) {
-        let sender = SDKCallbackValue(value: sender)
-        let account = Self.diagnosticAccountSnapshot.load()
-        Self.incomingQueue.async { [weak self] in
-            guard account == Self.diagnosticAccountSnapshot.load() else { return }
-            self?.processIncomingText(msgID: msgID, sender: sender.value, text: text)
-        }
-    }
-
-    /// 解析入站文本与结构化业务消息。
-    /// 只在协议字段满足要求时生成应用消息，异常载荷保留诊断信息。
-    private nonisolated func processIncomingText(msgID: String, sender: V2TIMUserInfo, text: String?) {
-        dispatchPrecondition(condition: .onQueue(Self.incomingQueue))
-        guard let userID = sender.userID, !userID.isEmpty, let text, !text.isEmpty else {
-            let hasSender = !(sender.userID ?? "").isEmpty
-            Self.logSDK(
-                level: .warning,
-                event: "message-dropped",
-                fields: [
-                    "kind": "text",
-                    "reason": hasSender ? "empty-text" : "no-sender",
-                    "message": Self.messageTag(msgID)
-                ]
-            )
-            return
-        }
-        let loginUserID = V2TIMManager.sharedInstance().getLoginUser() ?? ""
-        guard RemoteIMPeerPolicy.isValidPeer(
-            userID: userID,
-            ownerUserID: loginUserID
-        ) else {
-            Self.logSDK(
-                level: .debug,
-                event: "message-dropped",
-                fields: [
-                    "kind": "text",
-                    "reason": "sender-is-current-user",
-                    "message": Self.messageTag(msgID),
-                ]
-            )
-            return
-        }
-        Self.logIncomingMessage(
-            kind: "text",
-            peerUserID: userID,
-            messageID: msgID,
-            metadata: ["content_bytes": String(text.lengthOfBytes(using: .utf8))]
-        )
-        let fallbackDate = Date()
-        V2TIMManager.sharedInstance().findMessages(
-            messageIDList: [msgID],
-            succ: { [weak self] messages in
-                let message = messages?.first
-                guard message?.isSelf != true else {
-                    Self.logSDK(
-                        level: .debug,
-                        event: "message-dropped",
-                        fields: [
-                            "kind": "text",
-                            "reason": "sdk-self-message",
-                            "message": Self.messageTag(msgID),
-                        ]
-                    )
-                    return
-                }
-                let createdAt = message?.timestamp ?? fallbackDate
-                let metadata = message.flatMap(Self.messageMetadata(for:))
-                if metadata?.approvalRequest != nil {
-                    Self.logSDK(
-                        level: .info,
-                        event: "approval-metadata-resolved",
-                        fields: [
-                            "kind": "text",
-                            "peer": Self.peerTag(userID),
-                            "message": Self.messageTag(msgID),
-                            "result": "ok",
-                            "interaction": "approval-request",
-                        ]
-                    )
-                }
-                if metadata?.approvalDecision != nil {
-                    Self.logSDK(
-                        level: .info,
-                        event: "approval-metadata-resolved",
-                        fields: [
-                            "kind": "text",
-                            "peer": Self.peerTag(userID),
-                            "message": Self.messageTag(msgID),
-                            "result": "ok",
-                            "interaction": "approval-resolved",
-                        ]
-                    )
-                }
-                self?.emitIncomingText(
-                    fromUserID: userID,
-                    text: text,
-                    remoteID: msgID,
-                    origin: metadata?.origin,
-                    approvalRequest: metadata?.approvalRequest,
-                    approvalDecision: metadata?.approvalDecision,
-                    quote: metadata?.quote,
-                    createdAt: createdAt
-                )
-            },
-            fail: { [weak self] code, _ in
-                Self.logSDK(
-                    level: .warning,
-                    event: "text-metadata-resolve-failed",
-                    fields: [
-                        "kind": "text",
-                        "peer": Self.peerTag(userID),
-                        "message": Self.messageTag(msgID),
-                        "code": String(code),
-                    ]
-                )
-                self?.emitIncomingText(
-                    fromUserID: userID,
-                    text: text,
-                    remoteID: msgID,
-                    origin: nil,
-                    approvalRequest: nil,
-                    approvalDecision: nil,
-                    quote: nil,
-                    createdAt: fallbackDate
-                )
-            }
-        )
+        // AdvancedMsgListener 提供完整的原始 metadata；同一条文本只走一次持久化/ready 路径。
+        // 不再另发 findMessages lookup，也不从迟到回调重新捕获绑定。
     }
 
     private struct IncomingElementParts {
@@ -1403,18 +1364,107 @@ final class TencentIMClient:
         return parts
     }
 
+    private nonisolated static func initialMetadata(_ msg: V2TIMMessage, owner: String, localID: UUID) -> RemoteIMMessage? {
+        guard !msg.isSelf, nonEmpty(msg.groupID) == nil, let peer = nonEmpty(msg.sender) ?? nonEmpty(msg.userID),
+              !owner.isEmpty, peer != owner, msg.customElem == nil else { return nil }
+        let parts = incomingElementParts(from: msg), metadata = messageMetadata(for: msg)
+        let text = msg.textElem?.text ?? parts.caption ?? ""
+        guard RemoteDesktopSignal.decodeText(text) == nil else { return nil }
+        let id = localID, remoteID = nonEmpty(msg.msgID), date = msg.timestamp ?? Date()
+        var voice: RemoteIMVoiceAttachment?, image: RemoteIMImageAttachment?
+        var file: RemoteIMFileAttachment?, video: RemoteIMVideoAttachment?
+        var display = text
+        if let sound = parts.sound {
+            let duration = max(1, Int(sound.duration))
+            voice = RemoteIMVoiceAttachment(localFilePath: voiceCacheURL(remoteID: sound.uuid ?? msg.msgID,
+                messageID: msg.msgID).path, durationSeconds: duration, remoteID: remoteID)
+            display = "[语音消息 \(duration)s]"
+        } else if let item = parts.image {
+            let resource = preferredImage(from: item.imageList)
+            image = RemoteIMImageAttachment(localFilePath: imageCacheURL(remoteID: resource?.uuid ?? msg.msgID ?? id.uuidString,
+                messageID: msg.msgID, imageURL: resource?.url).path, remoteID: remoteID,
+                width: resource.flatMap { $0.width > 0 ? Int($0.width) : nil },
+                height: resource.flatMap { $0.height > 0 ? Int($0.height) : nil },
+                sizeBytes: resource.flatMap { $0.size > 0 ? Int($0.size) : nil })
+            if display.isEmpty { display = "[图片消息]" }
+        } else if let item = parts.video {
+            let mediaID = nonEmpty(item.videoUUID) ?? remoteID ?? id.uuidString
+            let hasCover = nonEmpty(item.snapshotUUID) != nil || item.snapshotSize > 0 || item.snapshotWidth > 0 || item.snapshotHeight > 0
+            video = RemoteIMVideoAttachment(localPath: videoCacheURL(remoteID: mediaID, videoType: item.videoType).path,
+                coverPath: hasCover ? videoCoverCacheURL(remoteID: mediaID).path : nil,
+                durationSeconds: max(0, Int(item.duration)), width: max(0, Int(item.snapshotWidth)),
+                height: max(0, Int(item.snapshotHeight)), sizeBytes: max(0, Int64(item.videoSize)))
+            if display.isEmpty { display = "[视频消息]" }
+        } else if let item = parts.file {
+            let name = cleanFileName(item.filename)
+            file = RemoteIMFileAttachment(localFilePath: fileCacheURL(remoteID: item.uuid ?? msg.msgID,
+                messageID: msg.msgID, fileName: name).path, fileName: name, mimeType: mimeType(for: name),
+                remoteID: remoteID, sizeBytes: item.fileSize > 0 ? Int(item.fileSize) : nil)
+            if display.isEmpty { display = "[文件] " + name }
+        } else if display.isEmpty { return nil }
+        return RemoteIMMessage(id: id, remoteID: remoteID, fromUserID: peer, toUserID: owner,
+            text: display, mediaCaption: (voice != nil || image != nil || file != nil || video != nil) ? parts.caption : nil,
+            captionAbove: metadata?.captionAbove == true, quote: metadata?.quote,
+            voiceAttachment: voice, imageAttachment: image, fileAttachment: file, videoAttachment: video,
+            approvalRequest: metadata?.approvalRequest, approvalDecision: metadata?.approvalDecision,
+            direction: .incoming, status: .received, createdAt: date)
+    }
+
     nonisolated func onRecvNewMessage(msg: V2TIMMessage) {
+        // 原 SDK 入口先登记持久化序列并固定只读 epoch；解析/排队不能让旧未绑定消息改投新绑定。
+        // 多线程 SDK 回调只在这个纯 metadata 区间串行化，不跨 SQL/下载/await 持锁。
+        rawIngressLock.lock(); defer { rawIngressLock.unlock() }
         let value = SDKCallbackValue(value: msg)
         let account = Self.diagnosticAccountSnapshot.load()
-        Self.incomingQueue.async { [weak self] in
-            guard account == Self.diagnosticAccountSnapshot.load() else { return }
-            self?.processIncomingMessage(value.value)
+        let login = profileAccountSnapshot.load()
+        let peer = Self.nonEmpty(msg.sender) ?? Self.nonEmpty(msg.userID) ?? ""
+        let direct = Self.nonEmpty(msg.groupID) == nil && !msg.isSelf
+        let localID = UUID()
+        let sourceID = Self.nonEmpty(msg.msgID).map { "sdk:" + $0 } ?? "local:" + localID.uuidString
+        let fenceTicket = direct ? persistenceFence.begin(accountTag: account, generation: login.generation,
+            peerID: peer, sourceID: sourceID) : nil
+        let captured = IMSessionBindingCaptureRegistry.shared.captureIngress(accountTag: account,
+            peerID: peer, messageID: msg.msgID ?? "", recipientID: login.userID ?? "")
+        let parts = Self.incomingElementParts(from: msg)
+        let metadata = Self.messageMetadata(for: msg)
+        let text = parts.caption ?? ""
+        let ticket = IMSessionBindingCaptureRegistry.shared.admit(captured, origin: metadata?.origin,
+            group: !direct, controlFrame: metadata?.approvalRequest != nil || metadata?.approvalDecision != nil ||
+                msg.customElem != nil || RemoteDesktopSignal.decodeText(text) != nil,
+            hasContent: !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                parts.image != nil || parts.sound != nil || parts.video != nil || parts.file != nil)
+        let initial = Self.initialMetadata(msg, owner: login.userID ?? "", localID: localID)
+        Task { @MainActor [weak self] in
+            guard let self, account == Self.diagnosticAccountSnapshot.load(), self.profileAccountSnapshot.load() == login else {
+                IMSessionBindingControl.abandon(ticket)
+                if let fenceTicket { self?.persistenceFence.finish(fenceTicket, persisted: false) }
+                return
+            }
+            var receipt: RemoteIMMetadataReceipt?
+            if let initial, let fenceTicket, let account, let persist = self.onIncomingMetadata {
+                receipt = await persist(IncomingRemoteIMMetadata(accountTag: account, fenceTicket: fenceTicket, message: initial))
+            }
+            var eligible = initial == nil || (receipt?.persisted == true && receipt?.wasInserted == true)
+            if let ticket, let receipt, receipt.persisted {
+                let confirmed = IMSessionBindingControl.persistedInput(ticket, receipt: receipt, remoteID: initial?.remoteID)
+                eligible = eligible && confirmed
+            } else if initial != nil { IMSessionBindingControl.abandon(ticket, reason: "persistence_failed") }
+            if let fenceTicket { self.persistenceFence.finish(fenceTicket, persisted: initial == nil || receipt?.persisted == true) }
+            guard account == Self.diagnosticAccountSnapshot.load(), self.profileAccountSnapshot.load() == login else { return }
+            // 重复 SDK delivery 已在普通 DB 核实；不要再启动第二次下载/原 live 输入。
+            if initial != nil && (receipt?.persisted != true || receipt?.wasInserted != true) { return }
+            let persistedReceipt = receipt
+            Self.incomingQueue.async { [weak self] in
+                guard let self, account == Self.diagnosticAccountSnapshot.load() else { return }
+                self.processIncomingMessage(value.value, sessionTicket: eligible ? ticket : nil,
+                                            metadataReceipt: persistedReceipt)
+            }
         }
     }
 
     /// 把 SDK 消息分派给文本、语音、文件、图片或视频处理器。
     /// 分派前确认消息身份和方向，防止重复回执形成重复气泡。
-    private nonisolated func processIncomingMessage(_ msg: V2TIMMessage) {
+    private nonisolated func processIncomingMessage(_ msg: V2TIMMessage, sessionTicket: IMSessionIngressTicket?, metadataReceipt: RemoteIMMetadataReceipt?) {
         dispatchPrecondition(condition: .onQueue(Self.incomingQueue))
         if let groupID = Self.nonEmpty(msg.groupID) {
             if let activationData = msg.customElem?.data,
@@ -1466,7 +1516,7 @@ final class TencentIMClient:
         // 多元素消息必须先找附件，不能因为存在 textElem 就提前 return；否则
         // [文本, 图片] 会只收到文字、整张图静默消失。
         if let soundElem = parts.sound {
-            handleIncomingSound(msg: msg, soundElem: soundElem, fromUserID: fromUserID)
+            handleIncomingSound(msg: msg, soundElem: soundElem, fromUserID: fromUserID, sessionTicket: sessionTicket, metadataReceipt: metadataReceipt)
             return
         }
 
@@ -1476,7 +1526,7 @@ final class TencentIMClient:
                 imageElem: imageElem,
                 fromUserID: fromUserID,
                 caption: parts.caption,
-                captionAbove: captionAbove
+                captionAbove: captionAbove, sessionTicket: sessionTicket, metadataReceipt: metadataReceipt
             )
             return
         }
@@ -1487,7 +1537,7 @@ final class TencentIMClient:
                 videoElem: videoElem,
                 fromUserID: fromUserID,
                 caption: parts.caption,
-                captionAbove: captionAbove
+                captionAbove: captionAbove, sessionTicket: sessionTicket, metadataReceipt: metadataReceipt
             )
             return
         }
@@ -1498,13 +1548,21 @@ final class TencentIMClient:
                 fileElem: fileElem,
                 fromUserID: fromUserID,
                 caption: parts.caption,
-                captionAbove: captionAbove
+                captionAbove: captionAbove, sessionTicket: sessionTicket, metadataReceipt: metadataReceipt
             )
             return
         }
 
-        // 纯文本消息仍由 SimpleMsgListener 入库，避免高级回调重复投递。
-        if parts.caption != nil { return }
+        // 文本也沿唯一 advanced metadata→持久化→ready 链交付，不再并行 lookup。
+        if let text = msg.textElem?.text ?? parts.caption {
+            emitIncomingText(fromUserID: fromUserID, text: text, remoteID: msg.msgID,
+                origin: metadata?.origin, approvalRequest: metadata?.approvalRequest,
+                approvalDecision: metadata?.approvalDecision, quote: metadata?.quote,
+                createdAt: metadataReceipt?.createdAt ?? msg.timestamp ?? Date(), metadataReceipt: metadataReceipt)
+            emitSessionIMInput(ticket: sessionTicket, text: text, kind: "text", fileURL: nil, quote: metadata?.quote)
+            return
+        }
+        IMSessionBindingControl.abandon(sessionTicket)
 
         // 一个分支都没命中就说明这类消息本端不认，而且原来是悄悄丢掉的——桌面端那次
         // 语音消息丢失就是死在同样的静默里。elem_type 是这条日志的关键：光知道
@@ -1527,16 +1585,17 @@ final class TencentIMClient:
     private nonisolated func handleIncomingSound(
         msg: V2TIMMessage,
         soundElem: V2TIMSoundElem,
-        fromUserID: String
+        fromUserID: String, sessionTicket: IMSessionIngressTicket?, metadataReceipt: RemoteIMMetadataReceipt?
     ) {
-        let createdAt = msg.timestamp ?? Date()
+        let createdAt = metadataReceipt?.createdAt ?? msg.timestamp ?? Date()
         let durationSeconds = max(1, Int(soundElem.duration))
         let mediaID = soundElem.uuid ?? msg.msgID
-        let remoteID = Self.nonEmpty(msg.msgID) ?? mediaID
+        let remoteID = Self.nonEmpty(msg.msgID)
         let metadata = Self.messageMetadata(for: msg)
         let origin = metadata?.origin
         let quote = metadata?.quote
-        let targetURL = Self.voiceCacheURL(remoteID: mediaID, messageID: msg.msgID)
+        let targetURL = metadataReceipt?.message.voiceAttachment.map { URL(fileURLWithPath: $0.localFilePath) } ??
+            Self.voiceCacheURL(remoteID: mediaID, messageID: msg.msgID)
         let transferGeneration = attachmentDownloads.generation
         let startedAt = ProcessInfo.processInfo.systemUptime
         let diagnosticFields = Self.messageDiagnosticFields(
@@ -1563,13 +1622,14 @@ final class TencentIMClient:
                         fields["code"] = String(result.curlCode)
                         fields["download_status"] = String(result.status)
                         Self.logSDK(level: .warning, event: "media-download-finished", fields: fields)
+                        IMSessionBindingControl.abandon(sessionTicket, reason: "preparation_failed")
                         return
                     }
                     fields["result"] = "ok"
                     Self.logSDK(level: .info, event: "media-download-finished", fields: fields)
                     Task {
                         @MainActor [
-                            weak self, fromUserID, targetURL, durationSeconds, remoteID, origin, quote, createdAt
+                            weak self, sessionTicket, fromUserID, targetURL, durationSeconds, remoteID, origin, quote, createdAt
                         ] in
                         guard diagnosticFields["account"] == Self.diagnosticAccountSnapshot.load() else { return }
                         let event = IncomingRemoteIMVoice(
@@ -1579,9 +1639,10 @@ final class TencentIMClient:
                             remoteID: remoteID,
                             origin: origin,
                             quote: quote,
-                            createdAt: createdAt
+                            createdAt: createdAt, metadataReceipt: metadataReceipt
                         )
                         self?.onIncomingVoice?(event)
+                        self?.emitSessionIMInput(ticket: sessionTicket, text: "", kind: "voice", fileURL: targetURL, quote: quote)
                     }
                 }
             }
@@ -1595,16 +1656,17 @@ final class TencentIMClient:
         fileElem: V2TIMFileElem,
         fromUserID: String,
         caption: String?,
-        captionAbove: Bool
+        captionAbove: Bool, sessionTicket: IMSessionIngressTicket?, metadataReceipt: RemoteIMMetadataReceipt?
     ) {
         let fileName = Self.cleanFileName(fileElem.filename)
-        let createdAt = msg.timestamp ?? Date()
+        let createdAt = metadataReceipt?.createdAt ?? msg.timestamp ?? Date()
         let mediaID = fileElem.uuid ?? msg.msgID
-        let remoteID = Self.nonEmpty(msg.msgID) ?? mediaID
+        let remoteID = Self.nonEmpty(msg.msgID)
         let metadata = Self.messageMetadata(for: msg)
         let origin = metadata?.origin
         let quote = metadata?.quote
-        let targetURL = Self.fileCacheURL(remoteID: mediaID, messageID: msg.msgID, fileName: fileName)
+        let targetURL = metadataReceipt?.message.fileAttachment.map { URL(fileURLWithPath: $0.localFilePath) } ??
+            Self.fileCacheURL(remoteID: mediaID, messageID: msg.msgID, fileName: fileName)
         let transferGeneration = attachmentDownloads.generation
         let mimeType = Self.mimeType(for: fileName)
         let sizeBytes = fileElem.fileSize > 0 ? Int(fileElem.fileSize) : nil
@@ -1640,13 +1702,14 @@ final class TencentIMClient:
                         fields["code"] = String(result.curlCode)
                         fields["download_status"] = String(result.status)
                         Self.logSDK(level: .warning, event: "media-download-finished", fields: fields)
+                        IMSessionBindingControl.abandon(sessionTicket, reason: "preparation_failed")
                         return
                     }
                     fields["result"] = "ok"
                     Self.logSDK(level: .info, event: "media-download-finished", fields: fields)
                     Task {
                         @MainActor [
-                            weak self, fromUserID, targetURL, fileName, mimeType, remoteID, sizeBytes, origin,
+                            weak self, sessionTicket, fromUserID, targetURL, fileName, mimeType, remoteID, sizeBytes, origin,
                             quote, createdAt, caption, captionAbove
                         ] in
                         guard diagnosticFields["account"] == Self.diagnosticAccountSnapshot.load() else { return }
@@ -1662,9 +1725,10 @@ final class TencentIMClient:
                             captionAbove: captionAbove,
                             origin: origin,
                             quote: quote,
-                            createdAt: createdAt
+                            createdAt: createdAt, metadataReceipt: metadataReceipt
                         )
                         self?.onIncomingFile?(event)
+                        self?.emitSessionIMInput(ticket: sessionTicket, text: caption ?? "", kind: "file", fileURL: targetURL, quote: quote)
                     }
                 }
             }
@@ -1678,16 +1742,17 @@ final class TencentIMClient:
         imageElem: V2TIMImageElem,
         fromUserID: String,
         caption: String?,
-        captionAbove: Bool
+        captionAbove: Bool, sessionTicket: IMSessionIngressTicket?, metadataReceipt: RemoteIMMetadataReceipt?
     ) {
-        guard let image = Self.preferredImage(from: imageElem.imageList) else { return }
-        let createdAt = msg.timestamp ?? Date()
+        guard let image = Self.preferredImage(from: imageElem.imageList) else { IMSessionBindingControl.abandon(sessionTicket); return }
+        let createdAt = metadataReceipt?.createdAt ?? msg.timestamp ?? Date()
         let mediaID = image.uuid ?? msg.msgID
-        let remoteID = Self.nonEmpty(msg.msgID) ?? mediaID
+        let remoteID = Self.nonEmpty(msg.msgID)
         let metadata = Self.messageMetadata(for: msg)
         let origin = metadata?.origin
         let quote = metadata?.quote
-        let targetURL = Self.imageCacheURL(remoteID: mediaID, messageID: msg.msgID, imageURL: image.url)
+        let targetURL = metadataReceipt?.message.imageAttachment.map { URL(fileURLWithPath: $0.localFilePath) } ??
+            Self.imageCacheURL(remoteID: mediaID, messageID: msg.msgID, imageURL: image.url)
         let transferGeneration = attachmentDownloads.generation
         let width = image.width > 0 ? Int(image.width) : nil
         let height = image.height > 0 ? Int(image.height) : nil
@@ -1719,13 +1784,14 @@ final class TencentIMClient:
                         fields["code"] = String(result.curlCode)
                         fields["download_status"] = String(result.status)
                         Self.logSDK(level: .warning, event: "media-download-finished", fields: fields)
+                        IMSessionBindingControl.abandon(sessionTicket, reason: "preparation_failed")
                         return
                     }
                     fields["result"] = "ok"
                     Self.logSDK(level: .info, event: "media-download-finished", fields: fields)
                     Task {
                         @MainActor [
-                            weak self, fromUserID, targetURL, remoteID, width, height, sizeBytes, origin, quote,
+                            weak self, sessionTicket, fromUserID, targetURL, remoteID, width, height, sizeBytes, origin, quote,
                             createdAt, caption, captionAbove
                         ] in
                         guard diagnosticFields["account"] == Self.diagnosticAccountSnapshot.load() else { return }
@@ -1740,9 +1806,10 @@ final class TencentIMClient:
                             captionAbove: captionAbove,
                             origin: origin,
                             quote: quote,
-                            createdAt: createdAt
+                            createdAt: createdAt, metadataReceipt: metadataReceipt
                         )
                         self?.onIncomingImage?(event)
+                        self?.emitSessionIMInput(ticket: sessionTicket, text: caption ?? "", kind: "image", fileURL: targetURL, quote: quote)
                     }
                 }
             }
@@ -1755,11 +1822,11 @@ final class TencentIMClient:
         videoElem: V2TIMVideoElem,
         fromUserID: String,
         caption: String?,
-        captionAbove: Bool
+        captionAbove: Bool, sessionTicket: IMSessionIngressTicket?, metadataReceipt: RemoteIMMetadataReceipt?
     ) {
-        let createdAt = msg.timestamp ?? Date()
+        let createdAt = metadataReceipt?.createdAt ?? msg.timestamp ?? Date()
         let mediaID = Self.nonEmpty(videoElem.videoUUID) ?? Self.nonEmpty(msg.msgID) ?? UUID().uuidString
-        let remoteID = Self.nonEmpty(msg.msgID) ?? mediaID
+        let remoteID = Self.nonEmpty(msg.msgID)
         let metadata = Self.messageMetadata(for: msg)
         let origin = metadata?.origin
         let quote = metadata?.quote
@@ -1767,16 +1834,13 @@ final class TencentIMClient:
         let width = max(0, Int(videoElem.snapshotWidth))
         let height = max(0, Int(videoElem.snapshotHeight))
         let sizeBytes = max(0, Int64(videoElem.videoSize))
-        let videoURL = Self.videoCacheURL(
-            remoteID: mediaID,
-            videoType: videoElem.videoType
-        )
+        let videoURL = metadataReceipt?.message.videoAttachment.map { URL(fileURLWithPath: $0.localPath) } ??
+            Self.videoCacheURL(remoteID: mediaID, videoType: videoElem.videoType)
         let transferGeneration = attachmentDownloads.generation
         let hasSnapshot = Self.nonEmpty(videoElem.snapshotUUID) != nil ||
             videoElem.snapshotSize > 0 || width > 0 || height > 0
-        let coverURL = hasSnapshot
-            ? Self.videoCoverCacheURL(remoteID: mediaID)
-            : nil
+        let coverURL = metadataReceipt?.message.videoAttachment?.coverPath.map { URL(fileURLWithPath: $0) } ??
+            (hasSnapshot ? Self.videoCoverCacheURL(remoteID: mediaID) : nil)
         let diagnosticFields = Self.messageDiagnosticFields(
             kind: "video",
             peerUserID: fromUserID,
@@ -1805,7 +1869,7 @@ final class TencentIMClient:
             origin: origin,
             quote: quote,
             createdAt: createdAt,
-            stage: .metadata
+            sessionTicket: sessionTicket, metadataReceipt: metadataReceipt, stage: .metadata
         )
 
         // 封面可先于视频到达。下载到临时路径，验证成功后再原子替换正式缓存。
@@ -1825,7 +1889,7 @@ final class TencentIMClient:
                     origin: origin,
                     quote: quote,
                     createdAt: createdAt,
-                    stage: .coverReady
+                    sessionTicket: sessionTicket, metadataReceipt: metadataReceipt, stage: .coverReady
                 )
             } else {
                 var coverFields = diagnosticFields
@@ -1866,7 +1930,7 @@ final class TencentIMClient:
                                 origin: origin,
                                 quote: quote,
                                 createdAt: createdAt,
-                                stage: .coverReady
+                                sessionTicket: sessionTicket, metadataReceipt: metadataReceipt, stage: .coverReady
                             )
                         }
                     }
@@ -1890,7 +1954,7 @@ final class TencentIMClient:
                 origin: origin,
                 quote: quote,
                 createdAt: createdAt,
-                stage: .videoReady
+                sessionTicket: sessionTicket, metadataReceipt: metadataReceipt, stage: .videoReady
             )
             return
         }
@@ -1929,7 +1993,7 @@ final class TencentIMClient:
                             origin: origin,
                             quote: quote,
                             createdAt: createdAt,
-                            stage: .videoFailed
+                            sessionTicket: sessionTicket, metadataReceipt: metadataReceipt, stage: .videoFailed
                         )
                         return
                     }
@@ -1950,7 +2014,7 @@ final class TencentIMClient:
                         origin: origin,
                         quote: quote,
                         createdAt: createdAt,
-                        stage: .videoReady
+                        sessionTicket: sessionTicket, metadataReceipt: metadataReceipt, stage: .videoReady
                     )
                 }
             }
@@ -1991,8 +2055,13 @@ final class TencentIMClient:
         origin: RemoteIMMessageOrigin?,
         quote: RemoteIMQuote?,
         createdAt: Date,
+        sessionTicket: IMSessionIngressTicket?, metadataReceipt: RemoteIMMetadataReceipt?,
         stage: RemoteIMVideoDownloadStage
     ) {
+        if stage == .videoFailed { IMSessionBindingControl.abandon(sessionTicket, reason: "preparation_failed") }
+        if stage == .videoReady {
+            emitSessionIMInput(ticket: sessionTicket, text: caption ?? "", kind: "video", fileURL: videoFileURL, quote: quote)
+        }
         let account = Self.diagnosticAccountSnapshot.load()
         Task { @MainActor [weak self] in
             guard account == Self.diagnosticAccountSnapshot.load() else { return }
@@ -2011,9 +2080,23 @@ final class TencentIMClient:
                     origin: origin,
                     quote: quote,
                     createdAt: createdAt,
-                    stage: stage
+                    stage: stage, metadataReceipt: metadataReceipt
                 )
             )
+        }
+    }
+
+    private nonisolated func emitSessionIMInput(ticket: IMSessionIngressTicket?, text: String,
+                                               kind: String, fileURL: URL?, quote: RemoteIMQuote?) {
+        guard let ticket else { return }
+        let payload = IMSessionIncomingPayload(ticket: ticket, text: text, kind: kind,
+            fileURL: fileURL, quoteText: quote?.digest)
+        Task { @MainActor [weak self] in
+            guard let self, IMSessionBindingCaptureRegistry.shared.isCurrent(ticket) else {
+                IMSessionBindingControl.abandon(ticket); return
+            }
+            guard let receive = self.onSessionIMInput else { IMSessionBindingControl.abandon(ticket); return }
+            receive(payload)
         }
     }
 
@@ -2025,7 +2108,7 @@ final class TencentIMClient:
         approvalRequest: RemoteIMApprovalRequest?,
         approvalDecision: RemoteIMApprovalDecision?,
         quote: RemoteIMQuote?,
-        createdAt: Date
+        createdAt: Date, metadataReceipt: RemoteIMMetadataReceipt? = nil
     ) {
         let account = Self.diagnosticAccountSnapshot.load()
             Task {
@@ -2041,7 +2124,7 @@ final class TencentIMClient:
                 approvalRequest: approvalRequest,
                 approvalDecision: approvalDecision,
                 quote: quote,
-                createdAt: createdAt
+                createdAt: createdAt, metadataReceipt: metadataReceipt
             )
             self?.onIncomingText?(event)
         }
@@ -2305,6 +2388,7 @@ final class TencentIMClient:
 }
 #else
 final class TencentIMClient: RemoteIMClient {
+    var onSessionIMInput: ((IMSessionIncomingPayload) -> Void)?
     var onIncomingText: ((IncomingRemoteIMText) -> Void)?
     var onIncomingActivity: ((IncomingRemoteIMActivity) -> Void)?
     var onIncomingVoice: ((IncomingRemoteIMVoice) -> Void)?

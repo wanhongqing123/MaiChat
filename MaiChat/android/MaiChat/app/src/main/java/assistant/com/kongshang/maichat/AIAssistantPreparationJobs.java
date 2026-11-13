@@ -5,6 +5,10 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
+import java.util.function.BooleanSupplier;
+import java.io.InputStream;
+import java.io.FilterInputStream;
+import java.io.IOException;
 import org.json.JSONObject;
 
 final class AIAssistantPreparationJobs {
@@ -35,6 +39,22 @@ final class AIAssistantPreparationJobs {
     private final Map<String, Job> active = new HashMap<>();
     private boolean closed;
     AIAssistantPreparationJobs(Executor control, ExecutorService io) { this.control = control; this.io = io; }
+
+    /** 普通附件流的身份、协作式期限与关闭取消；只用于现有 I/O worker，绝不在控制队列读文件。 */
+    static InputStream guard(InputStream input, Cancellation cancellation, BooleanSupplier current, long deadlineNanos) {
+        cancellation.onCancel(() -> { try { input.close(); } catch (IOException ignored) { } });
+        return new FilterInputStream(input) {
+            private void check() throws IOException {
+                cancellation.check();
+                if (!current.getAsBoolean()) throw new CancellationException("附件所属会话已变化");
+                if (System.nanoTime() >= deadlineNanos) throw new IOException("附件准备超时");
+            }
+            @Override public int read() throws IOException { check(); int value = in.read(); check(); return value; }
+            @Override public int read(byte[] bytes, int offset, int count) throws IOException {
+                check(); int value = in.read(bytes, offset, count); check(); return value;
+            }
+        };
+    }
 
     synchronized boolean start(String owner, long epoch, LongSupplier currentEpoch, Work work, Completion completion) {
         if (closed || active.containsKey(owner) || active.size() >= 128) return false;
@@ -72,6 +92,11 @@ final class AIAssistantPreparationJobs {
     synchronized void cancel(String owner) {
         Job job = active.get(owner);
         if (job != null) job.cancellation.cancel();
+    }
+    /** 只取消同一普通附件所有者组，不保存或排列任何 IM 路由任务。 */
+    synchronized void cancelPrefix(String prefix) {
+        for (Map.Entry<String, Job> item : active.entrySet())
+            if (item.getKey().startsWith(prefix)) item.getValue().cancellation.cancel();
     }
     synchronized CompletableFuture<Void> close() {
         closed = true;

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "MaiError.h"
+#include "MaiContextImport.h"
 #include "MaiContextCheckpoint.h"
 #include "MaiMessage.h"
 #include "MaiSession.h"
@@ -40,6 +41,23 @@ public:
 
     virtual void putMessage(const std::string& sessionId, const MaiMessage& message) = 0;
     virtual std::vector<MaiMessage> listMessages(const std::string& sessionId) const = 0;
+
+    // 暂存批次在 commit 前对普通读取与模型不可见。seq 从 0 连续递增，完整相同重试幂等。
+    // commit 原子替换同 Session/sourceKey 快照并废弃压缩检查点；Agent 负责空闲互斥。
+    // 自定义后端默认 NotSupported，不能退化为部分可见的 putMessage 循环。
+    virtual MaiResult<MaiContextImportProgress> beginContextImport(
+        const MaiContextImportSpec& spec);
+    virtual MaiResult<MaiContextImportProgress> appendContextImport(
+        const std::string& importId, std::uint64_t sequence,
+        const std::vector<MaiContextImportRecord>& records);
+    virtual MaiResult<MaiContextImportProgress> inspectContextImport(
+        const std::string& importId) const;
+    virtual MaiResult<MaiContextImportProgress> commitContextImport(const std::string& importId);
+    virtual MaiError abortContextImport(const std::string& importId);
+    // 只回收已撤销或已被替代的导入副本，最多删除 maxMessages 条消息；不改普通/当前/暂存内容。
+    // 事务和元数据回收均有界，hasMore 让普通后台 worker 继续维护，无独立清理线程。
+    virtual MaiResult<MaiContextImportPurgeResult> purgeContextImports(
+        const std::string& sessionId, std::size_t maxMessages = kMaiContextImportMaxPurgeMessages);
 
     // 保存已结束捕获的工具原始字节快照；与消息共享后端锁/事务。
     // 精确核对已落库的会话、消息、工具片段和 callId；不接受未落库或跨会话归属。

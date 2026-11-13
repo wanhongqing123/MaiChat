@@ -64,9 +64,11 @@ public:
 
 struct Fixture {
     QTemporaryDir workspace;
+    QTemporaryDir historyDirectory;
     FakeRemoteIMClient* im = new FakeRemoteIMClient;
     OwnedModel* model = new OwnedModel;
-    RemoteIMApplication app{QStringLiteral("owned-tool-owner"), std::unique_ptr<RemoteIMClient>(im)};
+    RemoteIMApplication app{QStringLiteral("owned-tool-owner"), std::unique_ptr<RemoteIMClient>(im),
+        std::make_unique<LocalMessageDatabase>(historyDirectory.filePath(QStringLiteral("owned-tool-history.db")))};
     AgentController controller{std::unique_ptr<MaiModelClient>(model), QString()};
     DesktopSessionImBridge bridge{app, controller};
     DesktopSessionImBridge* currentBridge = &bridge;
@@ -188,7 +190,8 @@ void DesktopSessionImBindingToolsTest::actualHostRegistrarPinsConfiguredStartupI
     QTemporaryDir workspace;
     auto client = std::make_unique<FakeRemoteIMClient>();
     auto* im = client.get();
-    RemoteIMApplication app(QStringLiteral("owned-startup-owner"), std::move(client));
+    RemoteIMApplication app(QStringLiteral("owned-startup-owner"), std::move(client),
+        std::make_unique<LocalMessageDatabase>(workspace.filePath(QStringLiteral("owned-startup-history.db"))));
     app.addContact(QStringLiteral("owned-startup-friend"), QStringLiteral("Owned Startup Friend"));
     // Match main.cpp: construct the real host with trusted SDK configuration
     // before its ordinary IM connection establishes currentAccount().

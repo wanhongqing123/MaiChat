@@ -1510,11 +1510,6 @@ struct AIAssistantOpenResult: Sendable {
     let workspacePath: String
     var configurationError: String? = nil
 }
-struct AIReplySuggestions: Codable, Sendable, Equatable {
-    let natural: String
-    let casual: String
-    let professional: String
-}
 struct AIResponse: Codable, Sendable {
     let ok: Bool
     var id: String?
@@ -1546,14 +1541,10 @@ struct AIResponse: Codable, Sendable {
     var localGpuSelected: Bool?
     var localGpuModelBytes: UInt64?
     var localGpuBackend: String?
-    var natural: String?
-    var casual: String?
-    var professional: String?
 
     enum CodingKeys: String, CodingKey {
         case ok, id, path, error, errorCode, changed, sessions, messages, messageUpdates, hasMessageUpdates, questionMessages, rootSessionId, permissions, questions
         case busy, turnId, configured, model, reasoningEffort, defaultReasoningEffort, session, selectedModel, selectedReasoningEffort, selectedWire, wire, localGpuSelected, localGpuModelBytes, localGpuBackend
-        case natural, casual, professional
         case userMessageID = "user_message_id"
         case questionID = "question_id"
     }
@@ -1634,11 +1625,17 @@ actor AIAssistantBackend {
     private var root: URL?
     private var initialized = false
     private var configurationInProgress = false
+    // IM 绑定与创作页可能同时打开同一账号；共享一次准备，等待者不重复 configure 或误报 busy。
+    private var openingTask: Task<AIAssistantOpenResult, Error>?
+    private var openingAccountID: String?
+    private var imSessionActivation: (request: IMSessionBindingRequest, host: IMSessionBindingHostIdentity)?
+    private var imSessionProjection: IMSessionBindingProjection?
     private var permanentlyInvalidated = false
 
     // 账号删除只影响此实例；普通换号不调用它，旧账号已接受的发送收据仍可正常落盘。
     func invalidatePermanently() {
         permanentlyInvalidated = true
+        openingTask?.cancel()
     }
 
     private func checkLifecycle() throws {
@@ -1712,7 +1709,7 @@ actor AIAssistantBackend {
         request["op"] = operation
         // tool_detail has a strict read-only allowlist; snapshot's force flag
         // is not part of that operation and must not leak through the common ABI.
-        if operation != "tool_detail" { request["force"] = force }
+        if operation != "tool_detail" && operation != "im_session_binding" { request["force"] = force }
         let data = try JSONSerialization.data(withJSONObject: request)
         guard let text = String(data: data, encoding: .utf8),
             let response = text.withCString({ maiMobileAgentRequest(UnsafeMutableRawPointer(bitPattern: address), $0) })
@@ -1728,6 +1725,33 @@ actor AIAssistantBackend {
     /// 已初始化时复用同一后端，避免页面反复进入时重建数据库连接和任务状态。
     /// 任一必需目录或配置失败时抛错，由页面保留原画面并显示可恢复的错误。
     func open(accountUserID: String) async throws -> AIAssistantOpenResult {
+        try checkLifecycle()
+        guard openingAccountID == nil || openingAccountID == accountUserID else {
+            throw AIBackendError(message: "账号已变更，请重新打开创作中心", code: "stale_scope")
+        }
+        if let task = openingTask {
+            let result = try await task.value
+            try checkLifecycle()
+            return result
+        }
+        if initialized { return try await performOpen(accountUserID: accountUserID) }
+        openingAccountID = accountUserID
+        let task = Task { try await self.performOpen(accountUserID: accountUserID) }
+        openingTask = task
+        do {
+            let result = try await task.value
+            openingTask = nil
+            if !initialized { openingAccountID = nil }
+            try checkLifecycle()
+            return result
+        } catch {
+            openingTask = nil
+            if !initialized { openingAccountID = nil }
+            throw error
+        }
+    }
+
+    private func performOpen(accountUserID: String) async throws -> AIAssistantOpenResult {
         try checkLifecycle()
         if initialized {
             return AIAssistantOpenResult(
@@ -1864,8 +1888,20 @@ actor AIAssistantBackend {
                 subdirectory: "MaiAgentModels")?.path ?? ""]
         nativeConfiguration["localModelName"] = "local:" + AILocalModelStore.bundledPrimaryID
         nativeConfiguration.merge(routeURLs) { _, supplied in supplied }
+        // 同一 serial worker 在真正替换 router 前读回当前权威关系。
+        // 同步 control/tool 解绑后立即重配也不能从尚未更新的 Main 偏好复活旧关系。
+        if let activation = imSessionActivation, let old = imSessionProjection,
+           IMSessionBindingCaptureRegistry.shared.isHostCurrent(activation.host),
+           let bridge = old.bridgeID, let scope = old.scope {
+            let latest = try imSessionBinding(IMSessionBindingRequest("list", bridgeID: bridge, scope: scope), host: activation.host)
+            IMSessionBindingPreferences.persist(latest, host: activation.host)
+        }
         _ = try requestAgentOperation("configure", values: nativeConfiguration)
         agentEpoch = UUID().uuidString
+        // configure 会替换 Native router；同一可信账号立即重新 activate，绝不复用旧 bridge。
+        if let activation = imSessionActivation, IMSessionBindingCaptureRegistry.shared.isHostCurrent(activation.host) {
+            _ = try imSessionBinding(activation.request, host: activation.host)
+        }
     }
 
     private var preparedLocalEpoch = ""
@@ -1918,6 +1954,34 @@ actor AIAssistantBackend {
     func request(_ operation: String, values: [String: String] = [:], force: Bool = false) throws -> AIResponse {
         try requestAgentOperation(operation, values: values.mapValues { $0 as Any }, force: force)
     }
+
+    func imSessionBinding(_ request: IMSessionBindingRequest, host: IMSessionBindingHostIdentity) throws -> IMSessionBindingProjection {
+        guard IMSessionBindingCaptureRegistry.shared.isHostCurrent(host) else { throw CancellationError() }
+        let encoded = try JSONEncoder().encode(request.fields)
+        let values = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] ?? [:]
+        var result = try JSONDecoder().decode(IMSessionBindingProjection.self,
+            from: requestAgentData("im_session_binding", values: values))
+        guard result.ok else { throw AIBackendError(message: result.error ?? "会话绑定操作失败", code: result.errorCode) }
+        if request.fields["action"] == .string("activate") { imSessionActivation = (request, host) }
+        if let bridge = result.bridgeID, let scope = result.scope {
+            guard let revision = IMSessionBindingCaptureRegistry.shared.publish(bridgeID: bridge, scope: scope,
+                bindings: result.bindings, hostIdentity: host) else { throw CancellationError() }
+            result.hostPublication = revision
+        }
+        imSessionProjection = result
+        return result
+    }
+
+    #if DEBUG && targetEnvironment(simulator)
+    func unbindAndReconfigureIMSessionForUITest(peer: String) async throws {
+        guard ProcessInfo.processInfo.arguments.contains("--im-session-binding-host-ui-test"),
+              let activation = imSessionActivation, let old = imSessionProjection else { throw CancellationError() }
+        var unbind = IMSessionBindingRequest("unbind", bridgeID: old.bridgeID, scope: old.scope)
+        unbind.set("peer_id", peer)
+        _ = try imSessionBinding(unbind, host: activation.host)
+        _ = try await save(settings)
+    }
+    #endif
 
     func snapshot(session: String, limit: Int, force: Bool) throws -> AIResponse {
         try requestAgentOperation("snapshot", values: ["session": session, "messageLimit": limit,
@@ -2018,23 +2082,6 @@ actor AIAssistantBackend {
             "path": file.relativePath, "requestId": requestID, "attachmentId": attachmentID])
         guard let path = result.path else { throw AIBackendError(message: "无法保存会话附件") }
         return AIImportedFile(relativePath: path, mimeType: file.mimeType, isImage: file.isImage)
-    }
-
-    func suggestReplies(messages: [[String: String]], accountUserID: String) async throws
-        -> AIReplySuggestions {
-        _ = try await open(accountUserID: accountUserID)
-        let response = try requestAgentOperation("suggest_replies", values: ["messages": messages])
-        guard let natural = response.natural?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let casual = response.casual?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let professional = response.professional?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !natural.isEmpty, !casual.isEmpty, !professional.isEmpty else {
-            throw AIBackendError(message: "模型返回的三种回复不完整，请重试。")
-        }
-        return AIReplySuggestions(
-            natural: natural,
-            casual: casual,
-            professional: professional
-        )
     }
 
     func importDocument(_ source: URL) throws -> AIImportedFile {
@@ -2144,6 +2191,7 @@ final class AIAssistantModel: ObservableObject {
     private static let lifecycleSessionID = "session_lifecycle"
 
     static func resetForAccountSwitch() {
+        IMSessionBindingCaptureRegistry.shared.revoke("logout")
         shared.submissionGeneration &+= 1
         shared.outgoingPump?.stop()
         let pending = Array(shared.pendingAttachments.values).flatMap { $0 } +
@@ -2674,11 +2722,6 @@ final class AIAssistantModel: ObservableObject {
     func setComposerTyping(_ active: Bool) { composerTyping = active }
 
 
-    func suggestReplies(messages: [[String: String]]) async throws -> AIReplySuggestions {
-        let owner = AIMobileHostToolProvider.shared.appState?.masterUserID ?? ""
-        return try await backend.suggestReplies(messages: messages, accountUserID: owner)
-    }
-
     func showTransientError(_ message: String, duration: Duration = .seconds(3)) {
         transientErrorTask?.cancel()
         error = message
@@ -2689,6 +2732,30 @@ final class AIAssistantModel: ObservableObject {
             self.transientErrorTask = nil
         }
     }
+
+    /// 绑定列表走同一个普通后端，但不改变创作页选择、草稿或恢复待发输入。
+    func imSessionBindingRequest(_ request: IMSessionBindingRequest, host: IMSessionBindingHostIdentity) async throws
+        -> IMSessionBindingProjection {
+        guard self === Self.shared, !outgoingPermanentlyInvalidated else { throw CancellationError() }
+        guard IMSessionBindingCaptureRegistry.shared.isHostCurrent(host) else { throw CancellationError() }
+        _ = try await backend.open(accountUserID: host.ownerID)
+        guard self === Self.shared, IMSessionBindingCaptureRegistry.shared.isHostCurrent(host) else { throw CancellationError() }
+        return try await backend.imSessionBinding(request, host: host)
+    }
+    func importIMSessionInput(_ source: URL, kind: String) async throws -> AIImportedFile {
+        guard self === Self.shared else { throw CancellationError() }
+        if kind == "image" { return try await backend.importDocument(source) }
+        if kind == "video" { return try await backend.importVideo(source) }
+        return try await backend.importSessionFile(source)
+    }
+
+    #if DEBUG && targetEnvironment(simulator)
+    func reconfigureIMSessionBackendForUITest(unbindPeer: String? = nil) async throws {
+        guard ProcessInfo.processInfo.arguments.contains("--im-session-binding-host-ui-test") else { throw CancellationError() }
+        if let unbindPeer { try await backend.unbindAndReconfigureIMSessionForUITest(peer: unbindPeer) }
+        else { _ = try await backend.save(AIModelSettings()) }
+    }
+    #endif
 
     func prepareFirstPage() async {
         if ready && pendingInitialPage != nil { return }
@@ -2816,6 +2883,7 @@ final class AIAssistantModel: ObservableObject {
     }
 
     fileprivate func localSessionChanged(_ sessionID: String) {
+        IMSessionBindingChanges.onChange?()
         guard ready else { return }
         pendingRemotePushSessions.insert(sessionID)
         guard remotePushTask == nil else { return }
@@ -4970,6 +5038,9 @@ final class AIAssistantModel: ObservableObject {
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftFiles.isEmpty else {
             return Task { false }
         }
+        if selectedRemote == nil {
+            IMSessionBindingCaptureRegistry.shared.revoke("takeover", sessionID: session)
+        }
         let intakeID = UUID()
         let conversation = outgoingConversationID(session: session, remote: selectedRemote)
         let queuedQuestionIDs = Set(outgoingEntries.filter {
@@ -5453,6 +5524,9 @@ final class AIAssistantModel: ObservableObject {
     }
 
     func action(_ op: String, values: [String: String] = [:]) async {
+        if selectedRemote == nil && ["stop", "delete", "clear"].contains(op) {
+            IMSessionBindingCaptureRegistry.shared.revoke("takeover", sessionID: selected)
+        }
         if let remote = selectedRemote {
             guard remoteIsOnline(remote) else {
                 showTransientError("所属设备离线，无法执行操作")

@@ -106,7 +106,7 @@ private:
     void handleHistoryMessagesPayload(const QString& jsonPayload);
     qint64 orderedMessageTime(const QString& peerId, qint64 sdkTimeMillis);
     QString sdkConfigJson() const;
-    void handleIncomingMessages(const QString& jsonMessages);
+    bool handleIncomingMessages(const QString& jsonMessages);
     void handleIncomingMessage(const QJsonObject& message);
     static RemoteIMGroupMessage groupTextMessage(const QJsonObject& message, const QString& groupId,
                                                  const QString& ownerUserId);
@@ -115,14 +115,18 @@ private:
     // 下载完经 messagesReceived 通道送出，保持稳定 id 供本地库去重。
     // live=true 表示来自实时推送（RecvNewMsg），送 liveMessagesReceived（计未读红点）；
     // false 表示漫游/历史解析，送 messagesReceived。下载助手被两条链路共用，须透传。
-    void handleIncomingImageUrl(RemoteIMMessage message, const QString& url, bool live);
-    void handleIncomingFileUrl(RemoteIMMessage message, const QString& url, bool live);
+    void handleIncomingImageUrl(RemoteIMMessage message, const QString& url, bool live, quint64 ingressId = 0);
+    void handleIncomingFileUrl(RemoteIMMessage message, const QString& url, bool live, quint64 ingressId = 0);
     // 视频要下两个文件（视频本体 + 封面）。封面失败不阻塞：气泡会退化成深色底 +
     // 播放角标，仍然能点开播放。
     // 语音：SDK 给的是 HTTPS URL，本端下载后才有本地文件可播。
-    void handleIncomingVoiceUrl(RemoteIMMessage message, const QString& url, bool live);
+    void handleIncomingVoiceUrl(RemoteIMMessage message, const QString& url, bool live, quint64 ingressId = 0);
     void handleIncomingVideoUrls(RemoteIMMessage message, const QString& videoUrl,
-                                 const QString& coverUrl, bool live);
+                                 const QString& coverUrl, bool live, quint64 ingressId = 0);
+    bool deliverIncomingMessage(const RemoteIMMessage& message, bool live,
+                                const RemoteDiagnostics::AccountTag& origin,
+                                quint64 ingressId, quint64 profileSession);
+    void rejectLiveIngress(quint64 ingressId, quint64 profileSession);
     void fetchAttachment(const QString& url, const QString& targetPath, qint64 maximumBytes,
                          std::function<void(DesktopCurlAttachmentResult)> completion);
     // origin 有效时表示「这批消息是某次异步请求发起时那个账号的」。
@@ -140,6 +144,8 @@ private:
     static QString compactJson(const QJsonObject& object);
 
     std::unique_ptr<TimSdkApi> api_;
+    struct MetadataIngress;
+    std::shared_ptr<MetadataIngress> metadataIngress_;
     QByteArray attachmentCaPem_;
     std::shared_ptr<MaiDownloadCancel> downloadsCanceled_;
     QString currentUserId_;
@@ -151,10 +157,16 @@ private:
     QHash<QString, int> nextOrderInSecondByPeer_;
     bool connected_ = false;
     quint64 profileSession_ = 0;
+    quint64 liveIngressId_ = 0;
+    quint64 currentRawSequence_ = 0;
+    quint64 currentRawGeneration_ = 0;
     quint64 selfProfileRevision_ = 0;
     quint64 conversationRevision_ = 0;
     quint64 conversationFetchGeneration_ = 0;
 
 public:
     RemoteDiagnostics::AccountTag currentAccount() const override;
+    bool hasExplicitLiveReadiness() const override { return true; }
+    quint64 liveMetadataSequence() const override;
+    void withLiveMetadataBoundary(const std::function<void(LiveMetadataBoundary)>& publish) override;
 };

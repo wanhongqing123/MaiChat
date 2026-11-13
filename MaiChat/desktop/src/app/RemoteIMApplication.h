@@ -83,6 +83,18 @@ public:
     // asynchronous disconnected signal. A generation never grants authority.
     bool connectionReady() const { return connected_ && !disconnecting_; }
     quint64 connectionGeneration() const { return connectionGeneration_; }
+    struct IMHistorySource {
+        QString databasePath;
+        RemoteDiagnostics::AccountTag account;
+        quint64 connectionGeneration = 0;
+        quint64 rawGeneration = 0;
+    };
+    using IMHistoryFenceCompletion = std::function<void(bool, const QString&)>;
+    // Call on the application thread. This only captures attached writer/owner
+    // identity; all history SELECT/open/close work belongs to preparation I/O.
+    std::optional<IMHistorySource> imHistorySource(const QString& peerId, QString* error = nullptr) const;
+    void awaitIMHistoryMetadataFence(const IMHistorySource& source,
+        std::shared_ptr<std::atomic_bool> canceled, IMHistoryFenceCompletion completion);
     RemoteIMContact selfProfile() const;
     void setAccountProfileProvider(std::function<AccountProfile()> provider);
     AccountProfile currentAccountProfile() const;
@@ -150,6 +162,7 @@ public:
     bool isAcceptedFriend(const QString& imUserId) const {
         return !accountFriendOperations_.list || acceptedFriendIds_.contains(imUserId);
     }
+    bool acceptedFriendsReady() const { return !accountFriendOperations_.list || acceptedFriendsLoaded_; }
     QString maiChatAccountForImId(const QString& imUserId) const {
         return friendAccountByImId_.value(imUserId);
     }
@@ -233,6 +246,13 @@ signals:
     // 应用层只判断「这是不是一条值得通知的新消息」，不判断「现在该不该打扰用户」——
     // 后者取决于窗口是否激活、当前开着谁的会话，那是 UI 才知道的事。
     void incomingMessageArrived(const QString& peerId, const RemoteIMMessage& message);
+    void sessionImMessageAnnounced(quint64 ingressId, const RemoteIMMessage& message,
+                                   quint64 rawSequence = 0, quint64 rawGeneration = 0);
+    void sessionImMessageReady(quint64 ingressId, const RemoteIMMessage& message);
+    void sessionImMessageFailed(quint64 ingressId, const QString& error);
+    void sessionImMessagePersisted(quint64 ingressId, bool ok, bool inserted,
+                                   const QString& rowId, const QString& error);
+    void acceptedFriendsChanged();
     // 纯会话切换只更新当前会话区域，避免重建通讯录、设置页和整个会话列表。
     void selectionChanged(const QString& peerId);
     void connectionChanged(bool connected);
@@ -246,9 +266,23 @@ signals:
     void activityChanged(const QString& peerId);
 
 private:
+    struct MetadataReceipt;
+    struct IMHistoryFence;
+    QHash<quint64, std::shared_ptr<MetadataReceipt>> metadataReceipts_;
+    QSet<QString> firstMetadataRows_;
+    QList<std::shared_ptr<IMHistoryFence>> historyFences_;
+    quint64 metadataCompletedSequence_ = 0;
+    QSet<quint64> completedMetadataBatches_;
+    QString metadataPersistenceError_;
+    void announceIMMetadata(quint64 ingressId, const RemoteIMMessage& message,
+                             quint64 rawSequence = 0, quint64 rawGeneration = 0);
+    void readyIMMetadata(quint64 ingressId, const RemoteIMMessage& message);
+    void failIMMetadata(quint64 ingressId, const QString& error);
+    void drainIMHistoryFences();
     std::function<AccountProfile()> accountProfileProvider_;
     std::function<AvatarAccess()> avatarAccessProvider_;
     quint64 connectionGeneration_ = 0;
+    quint64 immediateLiveIngressId_ = 0;
     quint64 avatarUpdateGeneration_ = 0;
     bool avatarUpdateInFlight_ = false;
     void requestFriendById(const QString& userId, const QString& displayName);
@@ -257,6 +291,7 @@ private:
     std::function<void(const QString&, RemoteIMCompletion)> nicknameUpdater_;
     std::function<QJsonObject(const QJsonObject&)> passwordChangeHandler_;
     QSet<QString> acceptedFriendIds_;
+    bool acceptedFriendsLoaded_ = false;
     QHash<QString, QString> friendAccountByImId_;
     QHash<QString, QString> friendDisplayByImId_;
     QHash<QString, QString> requestIdByImId_;

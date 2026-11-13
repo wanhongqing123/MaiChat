@@ -216,7 +216,8 @@ public:
                 for (const QString& peer : peers) {
                     if (items.size() >= 100) break;
                     items.append(QJsonObject{{QStringLiteral("peer_id"), peer},
-                                             {QStringLiteral("session_id"), bindings.value(peer)}});
+                                             {QStringLiteral("session_id"), bindings.value(peer)},
+                                             {QStringLiteral("history_state"), bridge->historyPending(peer) ? QStringLiteral("pending") : QStringLiteral("ready")}});
                 }
                 complete(operation, success({{QStringLiteral("action"), command.action},
                     {QStringLiteral("bindings"), items}, {QStringLiteral("count"), int(items.size())},
@@ -247,6 +248,8 @@ public:
             }
             complete(operation, success({{QStringLiteral("action"), command.action},
                 {QStringLiteral("peer_id"), command.peer}, {QStringLiteral("session_id"), after},
+                {QStringLiteral("accepted"), true},
+                {QStringLiteral("history_state"), after.isEmpty() ? QStringLiteral("none") : bridge->historyPending(command.peer) ? QStringLiteral("pending") : QStringLiteral("ready")},
                 {QStringLiteral("bound"), !after.isEmpty()}, {QStringLiteral("changed"), before != after}}, before != after));
         };
         if (QThread::currentThread() == main->thread()) run();

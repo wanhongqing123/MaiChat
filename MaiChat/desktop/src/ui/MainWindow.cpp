@@ -166,7 +166,6 @@
 #include "agent/DesktopScreenCaptureBar.h"
 #include "agent/DesktopScreenCaptureControl.h"
 #include "agent/RemoteAgentPanel.h"
-#include "agent/ReplySuggestionController.h"
 
 namespace {
 
@@ -1929,14 +1928,6 @@ MainWindow::MainWindow(
   screenCaptureControl_ = captureControl;
   buildUi();
   applyStyle();
-  const AgentController::ModelConfig replyModel = loadAgentModelConfig(modelApiKeys_);
-  ReplySuggestionController::Config replyConfig;
-  replyConfig.baseUrl = replyModel.baseUrl;
-  replyConfig.apiKey = replyModel.apiKey;
-  replyConfig.modelName = replyModel.modelName;
-  replySuggestionController_ = new ReplySuggestionController(replyConfig, this);
-  replySuggestionController_->setObjectName(
-      QStringLiteral("replySuggestionController"));
   bindSignals();
   // 必须在 buildUi 之后：设置页的控件已建好，这里创建控制器并把当前配置
   // 回填到界面上。
@@ -2216,8 +2207,8 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event) {
   if ((watched == messageEditor_ || watched == commandButton_) &&
       (event->type() == QEvent::Resize || event->type() == QEvent::Move ||
        event->type() == QEvent::Show)) {
-    // ComposerTextEdit positions its two shared actions during resize; anchor
-    // this IM-only action after that ordinary layout pass has completed.
+    // Refresh the shared binding and console slots after the ordinary composer
+    // layout pass; neither action maintains a separate manual position.
     QTimer::singleShot(0, this, [this] { positionSessionBindingEntry(); });
   }
   if (sessionImBridge_ && agentPanel_ &&
@@ -2296,13 +2287,6 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event) {
       showSlashCommandMenu();
       return true;
     }
-  }
-  if (watched == aiReplyButton_ && event->type() == QEvent::Enter) {
-    aiReplyHint_->show();
-    aiReplyHint_->raise();
-    static_cast<ComposerTextEdit *>(messageEditor_)->positionCornerAction();
-  } else if (watched == aiReplyButton_ && event->type() == QEvent::Leave) {
-    aiReplyHint_->hide();
   }
   if (watched == messageEditor_ && event->type() == QEvent::FocusOut) {
     app_.setHumanTypingActive(false);
@@ -2698,51 +2682,6 @@ void MainWindow::buildUi() {
   sendButton_->setCursor(Qt::PointingHandCursor);
   static_cast<ComposerTextEdit *>(messageEditor_)->setCornerAction(sendButton_);
 
-  aiReplyButton_ = new QPushButton(messageEditor_);
-  aiReplyButton_->setObjectName(QStringLiteral("aiReplyButton"));
-  aiReplyButton_->setIcon(
-      makeNavIcon(LineIconKind::Assistant, QColor(QStringLiteral("#6254c7"))));
-  aiReplyButton_->setIconSize(QSize(UiZoom::s(17), UiZoom::s(17)));
-  aiReplyButton_->setFixedSize(UiZoom::s(30), UiZoom::s(30));
-  aiReplyButton_->setCursor(Qt::PointingHandCursor);
-  aiReplyButton_->setAccessibleName(QStringLiteral("AI 回复"));
-  aiReplyButton_->installEventFilter(this);
-  UiZoom::setStyle(aiReplyButton_, QStringLiteral(R"(
-        QPushButton#aiReplyButton {
-            background: transparent;
-            border: none;
-            border-radius: 8px;
-            padding: 0;
-            color: #574ba7;
-            font-size: @metadata;
-            font-weight: 600;
-        }
-        QPushButton#aiReplyButton:hover { background: #f0edff; }
-        QPushButton#aiReplyButton:pressed { background: #e2dcff; }
-        QPushButton#aiReplyButton:disabled { background: transparent; }
-    )"));
-  static_cast<ComposerTextEdit *>(messageEditor_)
-      ->setLeadingAction(aiReplyButton_);
-
-  aiReplyHint_ = new QLabel(QStringLiteral("AI 回复"), messageEditor_);
-  aiReplyHint_->setObjectName(QStringLiteral("aiReplyHint"));
-  aiReplyHint_->setAlignment(Qt::AlignCenter);
-  aiReplyHint_->setFixedSize(UiZoom::s(54), UiZoom::s(22));
-  aiReplyHint_->setAttribute(Qt::WA_TransparentForMouseEvents);
-  UiZoom::setStyle(aiReplyHint_, QStringLiteral(R"(
-        QLabel#aiReplyHint {
-            background: #ffffff;
-            border: 1px solid #d7dde6;
-            border-radius: 4px;
-            color: #344054;
-            font-size: @metadata;
-            font-weight: 500;
-            padding: 0;
-        }
-    )"));
-  aiReplyHint_->hide();
-  static_cast<ComposerTextEdit *>(messageEditor_)->setLeadingHint(aiReplyHint_);
-
   commandButton_ = new QPushButton(messageEditor_);
   commandButton_->setIcon(
       QIcon(QStringLiteral(":/maichat/icons/terminal-2.svg")));
@@ -2776,106 +2715,21 @@ void MainWindow::buildUi() {
   sessionBindingButton_->setObjectName(QStringLiteral("composerSessionBindingButton"));
   sessionBindingButton_->setAccessibleName(QStringLiteral("绑定创作中心会话"));
   sessionBindingButton_->setToolTip(QStringLiteral("绑定创作中心会话"));
-  sessionBindingButton_->setIcon(makeNavIcon(LineIconKind::Link, QColor(QStringLiteral("#64748b"))));
-  sessionBindingButton_->setIconSize(QSize(UiZoom::s(18), UiZoom::s(18)));
+  // The sole assistant entry reuses iOS's three-sparkles identity. Binding
+  // selects an existing Session; it does not start a separate suggestion model.
+  sessionBindingButton_->setIcon(QIcon(QStringLiteral(":/maichat/icons/ai-sparkles.svg")));
+  sessionBindingButton_->setIconSize(QSize(UiZoom::s(21), UiZoom::s(21)));
   sessionBindingButton_->setFixedSize(UiZoom::s(30), UiZoom::s(30));
   sessionBindingButton_->setCursor(Qt::PointingHandCursor);
   sessionBindingButton_->setCheckable(true);
   UiZoom::setStyle(sessionBindingButton_, QStringLiteral(
-      "QPushButton{background:transparent;border:0;border-radius:8px;padding:0;}"
-      "QPushButton:hover{background:#edf2f7;}"
-      "QPushButton:checked{background:#e8f3ff;}"));
+      "QPushButton{background:rgba(130,92,224,23);border:0;border-radius:10px;padding:0;}"
+      "QPushButton:hover{background:rgba(130,92,224,38);}"
+      "QPushButton:checked{background:rgba(130,92,224,51);}"));
   connect(sessionBindingButton_, &QPushButton::clicked, this, &MainWindow::openSessionBindingDialog);
+  static_cast<ComposerTextEdit *>(messageEditor_)->setLeadingAction(sessionBindingButton_);
   positionSessionBindingEntry();
 
-  replySuggestionBar_ = new QWidget(composer);
-  replySuggestionBar_->setObjectName(QStringLiteral("replySuggestionBar"));
-  auto *suggestionLayout = new QVBoxLayout(replySuggestionBar_);
-  suggestionLayout->setContentsMargins(UiZoom::s(10), UiZoom::s(8),
-                                       UiZoom::s(8), UiZoom::s(8));
-  suggestionLayout->setSpacing(UiZoom::s(6));
-  auto *suggestionHeader = new QHBoxLayout();
-  suggestionHeader->setContentsMargins(0, 0, 0, 0);
-  replySuggestionStatus_ =
-      new QLabel(QStringLiteral("正在生成回复建议…"), replySuggestionBar_);
-  replySuggestionStatus_->setObjectName(
-      QStringLiteral("replySuggestionStatus"));
-  auto *refreshSuggestionButton =
-      new QPushButton(QStringLiteral("换一批"), replySuggestionBar_);
-  refreshSuggestionButton->setObjectName(
-      QStringLiteral("refreshReplySuggestions"));
-  auto *closeSuggestionButton =
-      new QPushButton(QStringLiteral("×"), replySuggestionBar_);
-  closeSuggestionButton->setObjectName(QStringLiteral("closeReplySuggestions"));
-  closeSuggestionButton->setFixedSize(UiZoom::s(24), UiZoom::s(24));
-  suggestionHeader->addWidget(replySuggestionStatus_, 1);
-  suggestionHeader->addWidget(refreshSuggestionButton);
-  suggestionHeader->addWidget(closeSuggestionButton);
-  suggestionLayout->addLayout(suggestionHeader);
-
-  auto *choices = new QHBoxLayout();
-  choices->setContentsMargins(0, 0, 0, 0);
-  choices->setSpacing(UiZoom::s(8));
-  auto makeSuggestionButton = [this, choices](const QString &name,
-                                              const QString &label) {
-    auto *button = new QPushButton(replySuggestionBar_);
-    button->setObjectName(name);
-    button->setProperty("styleLabel", label);
-    button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    button->setCursor(Qt::PointingHandCursor);
-    button->setEnabled(false);
-    choices->addWidget(button, 1);
-    connect(button, &QPushButton::clicked, this, [this, button] {
-      applyReplySuggestion(button->property("replyText").toString());
-    });
-    return button;
-  };
-  naturalReplyButton_ = makeSuggestionButton(
-      QStringLiteral("naturalReplySuggestion"), QStringLiteral("自然"));
-  casualReplyButton_ = makeSuggestionButton(
-      QStringLiteral("casualReplySuggestion"), QStringLiteral("轻松"));
-  professionalReplyButton_ = makeSuggestionButton(
-      QStringLiteral("professionalReplySuggestion"), QStringLiteral("专业"));
-  suggestionLayout->addLayout(choices);
-  connect(refreshSuggestionButton, &QPushButton::clicked, this,
-          &MainWindow::requestReplySuggestions);
-  connect(closeSuggestionButton, &QPushButton::clicked, this,
-          &MainWindow::clearReplySuggestions);
-  UiZoom::setStyle(replySuggestionBar_, QStringLiteral(R"(
-        #replySuggestionBar {
-            background: #f8fbff;
-            border: 1px solid #cfe5fb;
-            border-radius: 10px;
-        }
-        #replySuggestionStatus {
-            color: #52677d;
-            font-size: @metadata;
-            background: transparent;
-        }
-        #replySuggestionBar QPushButton {
-            background: #ffffff;
-            border: 1px solid #d8e7f6;
-            border-radius: 8px;
-            color: #24364b;
-            padding: 6px 10px;
-            text-align: left;
-        }
-        #replySuggestionBar QPushButton:hover { border-color: #1597e5; background: #f2f9ff; }
-        #replySuggestionBar QPushButton:disabled { color: #8da0b5; background: #f5f8fb; }
-        #replySuggestionBar QPushButton#refreshReplySuggestions,
-        #replySuggestionBar QPushButton#closeReplySuggestions {
-            border: none;
-            background: transparent;
-            color: #168ad1;
-            text-align: center;
-            padding: 2px 6px;
-        }
-    )"));
-  replySuggestionBar_->hide();
-  composerLayout->addWidget(replySuggestionBar_);
-
-  // 待回复提示条：显示「正在回复谁的哪句话」，右侧 ✕ 取消。
-  // 放在输入框**上方**而不是下方——用户视线从提示条落到输入框，顺序才对。
   sessionBindingBar_ = new QWidget(composer);
   sessionBindingBar_->setObjectName(QStringLiteral("imSessionBindingBar"));
   auto* bindingRow = new QHBoxLayout(sessionBindingBar_);
@@ -3968,6 +3822,10 @@ void MainWindow::bindSignals() {
         if (connected) restoreSessionBindings();
         refreshSessionBinding();
       });
+  connect(&app_, &RemoteIMApplication::acceptedFriendsChanged, this, [this] {
+    restoreSessionBindings();
+    refreshSessionBinding();
+  });
   connect(
       &app_, &RemoteIMApplication::errorMessage, this,
       [this](const QString &message) {
@@ -4090,46 +3948,6 @@ void MainWindow::bindSignals() {
           [this] { syncNavigationSelection(); });
   connect(sendButton_, &QPushButton::clicked, this,
           [this] { sendCurrentText(); });
-  connect(aiReplyButton_, &QPushButton::clicked, this,
-          &MainWindow::requestReplySuggestions);
-  connect(replySuggestionController_,
-          &ReplySuggestionController::suggestionsReady, this,
-          [this](quint64 requestId, const QString &accountId,
-                 const QString &peerId, const QString &latestMessageId,
-                 const QString &natural, const QString &casual,
-                 const QString &professional) {
-            if (requestId != activeReplySuggestionRequest_ ||
-                accountId != app_.chatState().ownerUserId() ||
-                peerId != app_.chatState().selectedPeerId() ||
-                latestMessageId != latestSelectedMessageId()) {
-              return;
-            }
-            replySuggestionStatus_->setText(
-                QStringLiteral("选择一条填入输入框，仍需手动发送"));
-            const auto update = [](QPushButton *button, const QString &text) {
-              const QString label = button->property("styleLabel").toString();
-              button->setProperty("replyText", text);
-              button->setText(QStringLiteral("%1 · %2").arg(label, text));
-              button->setToolTip(text);
-              button->setEnabled(true);
-            };
-            update(naturalReplyButton_, natural);
-            update(casualReplyButton_, casual);
-            update(professionalReplyButton_, professional);
-          });
-  connect(replySuggestionController_,
-          &ReplySuggestionController::suggestionsFailed, this,
-          [this](quint64 requestId, const QString &accountId,
-                 const QString &peerId, const QString &latestMessageId,
-                 const QString &message) {
-            if (requestId != activeReplySuggestionRequest_ ||
-                accountId != app_.chatState().ownerUserId() ||
-                peerId != app_.chatState().selectedPeerId() ||
-                latestMessageId != latestSelectedMessageId()) {
-              return;
-            }
-            replySuggestionStatus_->setText(message);
-          });
   connect(messageEditor_, &QTextEdit::textChanged, this, [this] {
     RemoteDiagnostics::PerformanceSpan performance("composer-change");
     updateComposerState();
@@ -4885,14 +4703,6 @@ void MainWindow::setAccountModelKeys(QHash<QString, QString> keys,
       agentPanel_->setModelLabel(label, ready);
     }
   }
-  if (replySuggestionController_) {
-    const AgentController::ModelConfig selected = loadAgentModelConfig(modelApiKeys_);
-    ReplySuggestionController::Config reply;
-    reply.baseUrl = selected.baseUrl;
-    reply.apiKey = selected.apiKey;
-    reply.modelName = selected.modelName;
-    replySuggestionController_->setConfig(reply);
-  }
   refreshSettings();
 }
 
@@ -5166,10 +4976,10 @@ void MainWindow::wireRemoteAgentPanel() {
 }
 
 void MainWindow::positionSessionBindingEntry() {
-  if (!sessionBindingButton_ || !commandButton_) return;
-  sessionBindingButton_->move(commandButton_->x() + commandButton_->width() + UiZoom::s(8),
-                               commandButton_->y());
-  sessionBindingButton_->raise();
+  // Binding and console use the shared composer's two leading slots. There is
+  // no separate suggestion action or manually positioned third action.
+  if (messageEditor_)
+    static_cast<ComposerTextEdit *>(messageEditor_)->positionCornerAction();
 }
 
 QString MainWindow::sessionBindingSettingsKey() {
@@ -5191,7 +5001,7 @@ void MainWindow::saveSessionBindings() {
   const QString key = sessionBindingSettingsKey();
   if (key.isEmpty()) return;
   QVariantMap stored;
-  const auto bindings = sessionImBridge_->bindings();
+  const auto bindings = sessionImBridge_->readyBindings();
   for (auto it = bindings.constBegin(); it != bindings.constEnd(); ++it)
     stored.insert(it.key(), it.value());
   QSettings settings;
@@ -5199,7 +5009,7 @@ void MainWindow::saveSessionBindings() {
 }
 
 void MainWindow::restoreSessionBindings() {
-  if (!sessionImBridge_ || accountDisconnectPending_ || !app_.connectionReady()) return;
+  if (!sessionImBridge_ || accountDisconnectPending_ || !app_.connectionReady() || !app_.acceptedFriendsReady()) return;
   const auto account = app_.client().currentAccount();
   if (!account.isValid() || account.ownerUserId != app_.chatState().ownerUserId()) return;
   const QString key = sessionBindingSettingsKey();
@@ -5224,6 +5034,7 @@ void MainWindow::refreshSessionBinding() {
   const bool eligible = activeGroupId_.isEmpty() && !peer.isEmpty() &&
       peer != app_.chatState().ownerUserId() && app_.isAcceptedFriend(peer);
   sessionBindingButton_->setEnabled(eligible && sessionImBridge_ && app_.connectionReady() &&
+                                    app_.acceptedFriendsReady() &&
                                     account.isValid() && account.ownerUserId == app_.chatState().ownerUserId() &&
                                     !accountDisconnectPending_);
   const QString sessionId = eligible && sessionImBridge_ ? sessionImBridge_->boundSession(peer) : QString();
@@ -5239,7 +5050,8 @@ void MainWindow::refreshSessionBinding() {
     return;
   }
   const QString title = session.isUntitled() ? QStringLiteral("新对话") : QString::fromStdString(session.title);
-  sessionBindingName_->setText(QStringLiteral("已绑定创作中心：%1").arg(title));
+  sessionBindingName_->setText((sessionImBridge_->historyPending(peer)
+      ? QStringLiteral("正在导入聊天历史：%1") : QStringLiteral("已绑定创作中心：%1")).arg(title));
   sessionBindingButton_->setToolTip(QStringLiteral("已绑定：%1\n点击更换创作中心会话").arg(title));
 }
 
@@ -5256,6 +5068,9 @@ void MainWindow::openSessionBindingDialog() {
   const QString peer = app_.chatState().selectedPeerId();
   const auto account = app_.client().currentAccount();
   const QString selected = sessionImBridge_->boundSession(peer);
+  const auto connectionGeneration = app_.connectionGeneration();
+  const auto controllerGeneration = agentControllerGeneration_;
+  const QPointer<AgentController> controller(agentController_);
   auto* dialog = new QDialog(this);
   sessionBindingDialog_ = dialog;
   dialog->setObjectName(QStringLiteral("imSessionBindingDialog"));
@@ -5266,7 +5081,7 @@ void MainWindow::openSessionBindingDialog() {
   layout->setContentsMargins(UiZoom::s(20), UiZoom::s(18), UiZoom::s(20), UiZoom::s(16));
   layout->setSpacing(UiZoom::s(12));
   auto* introduction = new QLabel(
-      QStringLiteral("绑定后，对方新发来的消息会交给所选本机会话处理，回复会自动发回此好友。历史消息不会补发。"), dialog);
+      QStringLiteral("绑定时会将本机已保存的双向聊天记录作为历史上下文导入此会话，不为旧消息发起任务。完成后，新收到的好友消息才会交给它处理，回复自动发回原好友。"), dialog);
   introduction->setWordWrap(true);
   introduction->setTextFormat(Qt::PlainText);
   layout->addWidget(introduction);
@@ -5274,26 +5089,12 @@ void MainWindow::openSessionBindingDialog() {
   list->setObjectName(QStringLiteral("imSessionBindingSessions"));
   list->setSelectionMode(QAbstractItemView::SingleSelection);
   layout->addWidget(list, 1);
-  const auto bindings = sessionImBridge_->bindings();
-  for (const auto& session : agentController_->agent().listSessions()) {
-    if (!session.isRoot()) continue;
-    const QString id = QString::fromStdString(session.id);
-    const QString title = session.isUntitled() ? QStringLiteral("新对话") : QString::fromStdString(session.title);
-    QString otherPeer;
-    for (auto it = bindings.constBegin(); it != bindings.constEnd(); ++it)
-      if (it.key() != peer && it.value() == id) { otherPeer = it.key(); break; }
-    auto* item = new QListWidgetItem(otherPeer.isEmpty() ? title : title + QStringLiteral("（已绑定其他好友）"), list);
-    item->setData(Qt::UserRole, id);
-    if (!otherPeer.isEmpty()) item->setFlags(item->flags() & ~Qt::ItemIsEnabled & ~Qt::ItemIsSelectable);
-    if (id == selected && otherPeer.isEmpty()) list->setCurrentItem(item);
-  }
   auto* error = new QLabel(dialog);
   error->setObjectName(QStringLiteral("imSessionBindingError"));
   error->setTextFormat(Qt::PlainText);
   error->setWordWrap(true);
   UiZoom::setStyle(error, QStringLiteral("color:#b42318;font-size:@metadata;"));
-  error->setVisible(list->count() == 0);
-  if (list->count() == 0) error->setText(QStringLiteral("还没有本机会话，请先到创作中心新建会话。"));
+  error->hide();
   layout->addWidget(error);
   auto* buttons = new QHBoxLayout;
   buttons->addStretch(1);
@@ -5309,16 +5110,80 @@ void MainWindow::openSessionBindingDialog() {
     confirm->setEnabled(item && (item->flags() & Qt::ItemIsEnabled));
   });
   const QPointer<MainWindow> window(this);
-  connect(confirm, &QPushButton::clicked, dialog, [window, dialog, list, error, peer, account] {
+  const auto current = [window, controller, controllerGeneration, connectionGeneration, account, peer] {
+    return window && controller && window->agentController_ == controller && window->sessionImBridge_ &&
+        window->agentControllerGeneration_ == controllerGeneration &&
+        window->app_.connectionGeneration() == connectionGeneration &&
+        !window->accountDisconnectPending_ && window->app_.connectionReady() &&
+        window->app_.acceptedFriendsReady() && window->app_.isAcceptedFriend(peer) &&
+        window->app_.client().currentAccount() == account && window->app_.chatState().selectedPeerId() == peer;
+  };
+  const auto initialized = std::make_shared<bool>(false);
+  const auto refresh = [window, controller, dialog, list, confirm, error, selected, initialized, peer, current] {
+    if (!current()) { dialog->reject(); return; }
+    const bool first = !*initialized;
+    *initialized = true;
+    const QString chosen = first ? selected : list->currentItem() ? list->currentItem()->data(Qt::UserRole).toString() : QString();
+    const QString previousWorkspace = first || !list->currentItem() ? QString() : list->currentItem()->data(Qt::UserRole + 1).toString();
+    const int scroll = list->verticalScrollBar()->value();
+    const QSignalBlocker block(list);
+    list->clear();
+    QListWidgetItem* restored = nullptr;
+    bool workspaceChanged = false;
+    const auto bindings = window->sessionImBridge_->bindings();
+    for (const auto& session : controller->agent().listSessions()) {
+      if (!session.isRoot()) continue;
+      const QString id = QString::fromStdString(session.id);
+      const QString workspace = QFileInfo(QString::fromStdString(session.directory)).canonicalFilePath();
+      const QString title = session.isUntitled() ? QStringLiteral("新对话") : QString::fromStdString(session.title);
+      QString otherPeer;
+      for (auto it = bindings.constBegin(); it != bindings.constEnd(); ++it)
+        if (it.key() != peer && it.value() == id) { otherPeer = it.key(); break; }
+      auto* item = new QListWidgetItem(otherPeer.isEmpty() ? title : title + QStringLiteral("（已绑定其他好友）"), list);
+      item->setData(Qt::UserRole, id);
+      item->setData(Qt::UserRole + 1, workspace);
+      if (!otherPeer.isEmpty() || workspace.isEmpty()) item->setFlags(item->flags() & ~Qt::ItemIsEnabled & ~Qt::ItemIsSelectable);
+      if (id == chosen && otherPeer.isEmpty() && !workspace.isEmpty()) {
+        workspaceChanged = !previousWorkspace.isEmpty() && previousWorkspace != workspace;
+        if (!workspaceChanged) restored = item;
+      }
+    }
+    list->setCurrentItem(restored);
+    list->verticalScrollBar()->setValue(scroll);
+    confirm->setEnabled(restored != nullptr);
+    if (workspaceChanged || (!first && !chosen.isEmpty() && !restored)) {
+      error->setText(workspaceChanged ? QStringLiteral("所选会话的工作目录已变化，请重新选择。") : QStringLiteral("所选会话已不可用，请重新选择。"));
+      error->show();
+    } else if (list->count() == 0) {
+      error->setText(QStringLiteral("还没有本机会话，请先到创作中心新建会话。"));
+      error->show();
+    }
+  };
+  connect(controller, &AgentController::sessionStructureChanged, dialog, refresh);
+  connect(controller, &AgentController::sessionTitleChanged, dialog, [refresh](const QString&, const QString&) { refresh(); });
+  connect(sessionImBridge_, &DesktopSessionImBridge::bindingChanged, dialog, [refresh](const QString&) { refresh(); });
+  connect(controller, &QObject::destroyed, dialog, &QDialog::reject);
+  connect(&app_, &RemoteIMApplication::selectionChanged, dialog, [dialog, current](const QString&) { if (!current()) dialog->reject(); });
+  connect(&app_, &RemoteIMApplication::connectionChanged, dialog, [dialog, current](bool) { if (!current()) dialog->reject(); });
+  refresh();
+  connect(confirm, &QPushButton::clicked, dialog, [window, controller, dialog, list, error, peer, current] {
     if (!window || !window->sessionImBridge_ || !list->currentItem()) return;
-    if (window->accountDisconnectPending_ || !window->app_.connectionReady() ||
-        window->app_.client().currentAccount() != account || window->app_.chatState().selectedPeerId() != peer) {
+    if (!current()) {
       error->setText(QStringLiteral("账号或好友会话已改变，请重新选择。"));
       error->show();
       return;
     }
+    MaiSession chosen;
+    const QString id = list->currentItem()->data(Qt::UserRole).toString();
+    if (!controller->agent().getSession(id.toStdString(), chosen) || !chosen.isRoot() ||
+        QFileInfo(QString::fromStdString(chosen.directory)).canonicalFilePath() != list->currentItem()->data(Qt::UserRole + 1).toString()) {
+      list->setCurrentItem(nullptr);
+      error->setText(QStringLiteral("所选会话或工作目录已变化，请重新选择。"));
+      error->show();
+      return;
+    }
     QString failure;
-    if (!window->sessionImBridge_->bind(peer, list->currentItem()->data(Qt::UserRole).toString(), &failure)) {
+    if (!window->sessionImBridge_->bind(peer, id, &failure)) {
       error->setText(failure);
       error->show();
       return;
@@ -5407,14 +5272,6 @@ void MainWindow::rebuildAgentPage() {
   modelConfig.arkApiKeyProvider = arkApiKeyProvider_;
   modelConfig.wanCredentialsProvider = wanCredentialsProvider_;
   modelConfig.mediaServiceAccessProvider = mediaServiceAccessProvider_;
-  if (replySuggestionController_) {
-    ReplySuggestionController::Config replyConfig;
-    replyConfig.baseUrl = modelConfig.baseUrl;
-    replyConfig.apiKey = modelConfig.apiKey;
-    replyConfig.modelName = modelConfig.modelName;
-    clearReplySuggestions();
-    replySuggestionController_->setConfig(replyConfig);
-  }
   agentController_ = new AgentController(
       modelConfig, agentDatabasePath(app_.chatState().ownerUserId()),
       [this](MaiToolRegistry &registry) {
@@ -5532,10 +5389,18 @@ void MainWindow::rebuildAgentPage() {
   connect(agentController_, &AgentController::sessionStructureChanged, this,
           [this] { refreshSessionBinding(); });
   agentSessions_ = new AgentSessionList(*agentController_, agentSplitter);
+  connect(agentSessions_, &AgentSessionList::localRootIdsProjected, sessionImBridge_,
+          &DesktopSessionImBridge::scheduleHistoryMaintenance);
+  sessionImBridge_->scheduleHistoryMaintenance(agentSessions_->projectedLocalRootIds());
   agentPanelStack_ = new QStackedWidget(agentSplitter);
   agentPanel_ = new AgentChatPanel(*agentController_, agentPanelStack_);
   sessionBindingAgentSend_ = agentPanel_->findChild<QPushButton*>(QStringLiteral("agentSendButton"));
   sessionBindingAgentEditor_ = agentPanel_->findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+  connect(agentController_, &AgentController::contextImported, this, [this](const QString& session) {
+    // Refresh through the ordinary page path; imported context is never
+    // announced as a submitted user message or an assistant/turn receipt.
+    if (agentPanel_ && agentPanel_->sessionId() == session) agentPanel_->openSession(session);
+  });
   if (sessionBindingAgentSend_) sessionBindingAgentSend_->installEventFilter(this);
   if (sessionBindingAgentEditor_) sessionBindingAgentEditor_->installEventFilter(this);
   // 远端待发内容与本地 Agent 使用同一账号私有目录，避免账号切换共享出站记录。
@@ -6027,7 +5892,6 @@ void MainWindow::syncComposerPeer(const QString &peerId) {
   }
 
   composerPeerId_ = peerId;
-  clearReplySuggestions();
   messageEditor_->clear();
   cancelPendingReply();
   if (composerDrafts_.contains(peerId)) {
@@ -6056,11 +5920,6 @@ void MainWindow::refreshMessages() {
 
   const QList<RemoteIMMessage> messages =
       app_.chatState().messagesWith(selectedPeer);
-  if (replySuggestionBar_ && replySuggestionBar_->isVisible() &&
-      (selectedPeer != replySuggestionPeerId_ ||
-       latestSelectedMessageId() != replySuggestionLatestMessageId_)) {
-    clearReplySuggestions();
-  }
   sentApprovalTokens_.clear();
   resolvedApprovalTokens_.clear();
   autoDeclinedApprovalTokens_.clear();
@@ -8420,85 +8279,6 @@ void MainWindow::sendCurrentText() {
   }
 }
 
-QString MainWindow::latestSelectedMessageId() const {
-  const QString peerId = app_.chatState().selectedPeerId();
-  if (peerId.isEmpty())
-    return QString();
-  RemoteIMMessage latest;
-  return app_.chatState().latestMessageWith(peerId, &latest) ? latest.id
-                                                             : QString();
-}
-
-void MainWindow::requestReplySuggestions() {
-  const QString peerId = app_.chatState().selectedPeerId();
-  const QList<RemoteIMMessage> messages = app_.chatState().messagesWith(peerId);
-  if (peerId.isEmpty() || messages.isEmpty()) {
-    showToast(QStringLiteral("当前会话还没有可参考的消息"), 13, 1800);
-    return;
-  }
-
-  QVector<ReplySuggestionTurn> turns;
-  const qsizetype begin = std::max<qsizetype>(0, messages.size() - 24);
-  turns.reserve(messages.size() - begin);
-  for (qsizetype i = begin; i < messages.size(); ++i) {
-    const RemoteIMMessage &message = messages.at(i);
-    if (message.hasApprovalRequest || message.hasApprovalDecision)
-      continue;
-    QString text = message.text.trimmed();
-    if (text.isEmpty() && (message.hasImage || message.hasFile ||
-                           message.hasVideo || message.hasVoice)) {
-      text = MessageQuote::digestOf(message);
-    }
-    if (text.isEmpty())
-      continue;
-    turns.append(
-        {message.direction == RemoteIMMessageDirection::Outgoing, text});
-  }
-  if (turns.isEmpty()) {
-    showToast(QStringLiteral("当前会话没有可用于生成回复的文字"), 13, 1800);
-    return;
-  }
-
-  replySuggestionPeerId_ = peerId;
-  replySuggestionLatestMessageId_ = latestSelectedMessageId();
-  replySuggestionStatus_->setText(
-      QStringLiteral("正在生成自然、轻松和专业回复…"));
-  for (QPushButton *button :
-       {naturalReplyButton_, casualReplyButton_, professionalReplyButton_}) {
-    button->setText(button->property("styleLabel").toString());
-    button->setProperty("replyText", QString());
-    button->setToolTip(QString());
-    button->setEnabled(false);
-  }
-  replySuggestionBar_->show();
-  activeReplySuggestionRequest_ =
-      replySuggestionController_->requestSuggestions(
-          app_.chatState().ownerUserId(), peerId,
-          replySuggestionLatestMessageId_, turns);
-}
-
-void MainWindow::clearReplySuggestions() {
-  if (replySuggestionController_)
-    replySuggestionController_->cancel();
-  activeReplySuggestionRequest_ = 0;
-  replySuggestionPeerId_.clear();
-  replySuggestionLatestMessageId_.clear();
-  if (replySuggestionBar_)
-    replySuggestionBar_->hide();
-}
-
-void MainWindow::applyReplySuggestion(const QString &text) {
-  const QString suggestion = text.trimmed();
-  if (suggestion.isEmpty() || !messageEditor_)
-    return;
-  messageEditor_->setPlainText(suggestion);
-  QTextCursor cursor = messageEditor_->textCursor();
-  cursor.movePosition(QTextCursor::End);
-  messageEditor_->setTextCursor(cursor);
-  messageEditor_->setFocus();
-  clearReplySuggestions();
-}
-
 void MainWindow::updateComposerState() {
   const bool hasPeer = !app_.chatState().selectedPeerId().isEmpty();
   QString plain = messageEditor_ ? messageEditor_->toPlainText() : QString();
@@ -8506,11 +8286,6 @@ void MainWindow::updateComposerState() {
   const bool hasText = !plain.trimmed().isEmpty();
   const bool hasAttachments = composerHasAttachments();
   messageEditor_->setEnabled(hasPeer);
-  if (aiReplyButton_) {
-    aiReplyButton_->setEnabled(hasPeer &&
-                               app_.chatState().messageCountWith(
-                                   app_.chatState().selectedPeerId()) > 0);
-  }
   if (commandButton_)
     commandButton_->setEnabled(hasPeer);
   refreshSessionBinding();
@@ -8627,14 +8402,14 @@ void MainWindow::applyScaledFixedGeometry() {
   }
   if (messageEditor_)
     messageEditor_->setMinimumHeight(UiZoom::s(64));
-  if (aiReplyButton_) {
-    aiReplyButton_->setFixedSize(UiZoom::s(30), UiZoom::s(30));
-    aiReplyButton_->setIconSize(QSize(UiZoom::s(17), UiZoom::s(17)));
-  }
-  if (commandButton_)
+  if (commandButton_) {
     commandButton_->setFixedSize(UiZoom::s(30), UiZoom::s(30));
-  if (aiReplyHint_)
-    aiReplyHint_->setFixedSize(UiZoom::s(54), UiZoom::s(22));
+    commandButton_->setIconSize(QSize(UiZoom::s(18), UiZoom::s(18)));
+  }
+  if (sessionBindingButton_) {
+    sessionBindingButton_->setFixedSize(UiZoom::s(30), UiZoom::s(30));
+    sessionBindingButton_->setIconSize(QSize(UiZoom::s(21), UiZoom::s(21)));
+  }
   if (sendButton_) {
     sendButton_->setFixedSize(UiZoom::s(36), UiZoom::s(36));
     sendButton_->setIconSize(QSize(UiZoom::s(18), UiZoom::s(18)));

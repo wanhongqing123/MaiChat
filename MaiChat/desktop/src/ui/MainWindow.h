@@ -45,7 +45,6 @@ class DesktopSessionSyncCoordinator;
 class DesktopSessionImBridge;
 class DesktopScreenCaptureControl;
 class RemoteAgentPanel;
-class ReplySuggestionController;
 class RemoteDesktopViewPanel;
 class QButtonGroup;
 class QCheckBox;
@@ -292,10 +291,6 @@ private:
     QWidget* createSettingsRow(const QString& title, QLabel* valueLabel, const QString& helperText);
     void sendCurrentText();
     void updateComposerState();
-    void requestReplySuggestions();
-    void clearReplySuggestions();
-    void applyReplySuggestion(const QString& text);
-    QString latestSelectedMessageId() const;
     void showSlashCommandMenu();
     void sendSlashCommand(const QString& command);
     // 会话列表右键：只提供「删除消息」（清空聊天记录、好友保留）。
@@ -537,18 +532,7 @@ private:
     bool renderedEmptyView_ = false;
     QPushButton* addContactButton_ = nullptr;
     QPushButton* sendButton_ = nullptr;
-    QPushButton* aiReplyButton_ = nullptr;
-    QLabel* aiReplyHint_ = nullptr;
     QTextEdit* messageEditor_ = nullptr;
-    ReplySuggestionController* replySuggestionController_ = nullptr;
-    QWidget* replySuggestionBar_ = nullptr;
-    QLabel* replySuggestionStatus_ = nullptr;
-    QPushButton* naturalReplyButton_ = nullptr;
-    QPushButton* casualReplyButton_ = nullptr;
-    QPushButton* professionalReplyButton_ = nullptr;
-    quint64 activeReplySuggestionRequest_ = 0;
-    QString replySuggestionPeerId_;
-    QString replySuggestionLatestMessageId_;
     QPushButton* commandButton_ = nullptr;
     QMenu* commandMenu_ = nullptr;
     QPushButton* sessionBindingButton_ = nullptr;

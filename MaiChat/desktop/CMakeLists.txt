@@ -10,7 +10,7 @@ if(CMAKE_HOST_APPLE)
   endif()
 endif()
 # C 用于 MaiAgent/third_party/md4c（Markdown 解析，纯 C 实现）。
-project(MaiChatDesktop VERSION 2.2.59 LANGUAGES C CXX)
+project(MaiChatDesktop VERSION 2.2.60 LANGUAGES C CXX)
 if(MSVC AND MSVC_VERSION LESS 1930)
   message(FATAL_ERROR "The source Qt 6 desktop build requires MSVC 2022 or later")
 endif()
@@ -370,6 +370,9 @@ elseif(WIN32)
 endif()
 
 add_subdirectory(../Network "${CMAKE_CURRENT_BINARY_DIR}/maichat_network" EXCLUDE_FROM_ALL)
+# 三端只共享路由控制与因果凭据；文件准备、SDK 派发和 UI 仍由各平台适配。
+add_subdirectory(../SessionIM "${CMAKE_CURRENT_BINARY_DIR}/maichat_session_im" EXCLUDE_FROM_ALL)
+add_subdirectory(../History "${CMAKE_CURRENT_BINARY_DIR}/maichat_im_history" EXCLUDE_FROM_ALL)
 
 add_library(remote_im_core
   src/model/RemoteIMContact.h
@@ -506,7 +509,7 @@ target_include_directories(remote_im_desktop_app PUBLIC src PRIVATE ../MaiChatTo
   ../../MaiAgent/third_party/nlohmann)
 # Qt6::Gui：视频封面要用 QImage/QPainter 画（并在 Windows 上把系统缩略图的 HBITMAP
 # 转成 QImage）。remote_im_core 保持无 GUI 依赖，封面这层留在应用层。
-target_link_libraries(remote_im_desktop_app PUBLIC remote_im_core Qt6::Gui maiagent
+target_link_libraries(remote_im_desktop_app PUBLIC remote_im_core Qt6::Gui maiagent mai_session_im mai_im_history
   PRIVATE Qt6::Concurrent CURL::libcurl mai_avatar_client maichat_image_presentation)
 if(WIN32)
   # IShellItemImageFactory（资源管理器的缩略图提供程序）取视频首帧。
@@ -906,8 +909,6 @@ add_library(maichat_agent
   src/agent/RemoteAgentPanel.cpp
   src/agent/AgentSessionList.h
   src/agent/AgentSessionList.cpp
-  src/agent/ReplySuggestionController.h
-  src/agent/ReplySuggestionController.cpp
 )
 target_compile_features(maichat_agent PRIVATE c_std_11)
 if(APPLE)
@@ -1640,13 +1641,6 @@ if(WIN32 AND MAICHAT_ENABLE_OPENCV)
     maichat_agent Qt6::Widgets Qt6::Test)
 endif()
 
-# maichat_agent's PDF password prompt uses UiZoom; this isolated test does not link the desktop UI.
-add_executable(reply_suggestion_controller_test
-  tests/ReplySuggestionControllerTest.cpp
-  src/ui/UiZoom.cpp)
-target_link_libraries(reply_suggestion_controller_test PRIVATE
-  remote_im_desktop_ui remote_im_desktop_app maichat_agent Qt6::Test)
-
 add_executable(remote_diagnostics_controller_test tests/RemoteDiagnosticsControllerTest.cpp)
 target_link_libraries(remote_diagnostics_controller_test PRIVATE remote_im_desktop_app Qt6::Test)
 target_compile_definitions(remote_diagnostics_controller_test PRIVATE
@@ -1897,6 +1891,72 @@ include(cmake/MaiNativeComponents.cmake)
 
 enable_testing()
 
+# 移动模型入口的参数/审批适配不依赖平台 SDK，复用普通 MaiAgent 库做本机定点验证。
+add_executable(mobile_session_im_binding_tool_test
+  ../MobileAgentAdapter/tests/MaiMobileSessionIMBindingToolTests.cpp
+  ../MobileAgentAdapter/MaiMobileSessionIMBindingTool.cpp)
+target_include_directories(mobile_session_im_binding_tool_test PRIVATE
+  ../MobileAgentAdapter ../../MaiAgent/include ../../MaiAgent/third_party/nlohmann)
+target_link_libraries(mobile_session_im_binding_tool_test PRIVATE maiagent)
+add_test(NAME mobile_session_im_binding_tool_test COMMAND mobile_session_im_binding_tool_test)
+add_executable(mobile_session_im_test
+  ../MobileAgentAdapter/tests/MaiMobileSessionIMTests.cpp
+  ../MobileAgentAdapter/MaiMobileSessionIM.cpp)
+target_include_directories(mobile_session_im_test PRIVATE
+  ../MobileAgentAdapter ../../MaiAgent/include ../../MaiAgent/third_party/nlohmann
+  ../../MaiAgent/third_party/sqlite)
+target_link_libraries(mobile_session_im_test PRIVATE maiagent mai_session_im mai_im_history mai_sqlite)
+add_test(NAME mobile_session_im_test COMMAND mobile_session_im_test)
+add_executable(MaiSessionIMRouterTests ../SessionIM/tests/MaiSessionIMRouterTest.cpp)
+target_link_libraries(MaiSessionIMRouterTests PRIVATE mai_session_im)
+add_test(NAME MaiSessionIMRouterTests COMMAND MaiSessionIMRouterTests)
+add_executable(MaiIMHistoryFormatTest ../History/tests/MaiIMHistoryFormatTest.cpp)
+target_include_directories(MaiIMHistoryFormatTest PRIVATE ../../MaiAgent/third_party/nlohmann)
+target_link_libraries(MaiIMHistoryFormatTest PRIVATE mai_im_history)
+add_test(NAME MaiIMHistoryFormatTest COMMAND MaiIMHistoryFormatTest)
+add_executable(MaiIMHistorySnapshotTest ../History/tests/MaiIMHistorySnapshotTest.cpp)
+target_include_directories(MaiIMHistorySnapshotTest PRIVATE ../../MaiAgent/third_party/sqlite)
+target_link_libraries(MaiIMHistorySnapshotTest PRIVATE mai_im_history mai_sqlite)
+add_test(NAME MaiIMHistorySnapshotTest COMMAND MaiIMHistorySnapshotTest)
+add_executable(MaiContextImportTests ../../MaiAgent/tests/MaiContextImportTests.cpp)
+target_include_directories(MaiContextImportTests PRIVATE
+  ../../MaiAgent/include ../../MaiAgent/third_party/sqlite)
+target_link_libraries(MaiContextImportTests PRIVATE maiagent)
+add_test(NAME MaiContextImportTests COMMAND MaiContextImportTests)
+add_executable(MaiContextImportPurgeTests ../../MaiAgent/tests/MaiContextImportPurgeTests.cpp)
+target_include_directories(MaiContextImportPurgeTests PRIVATE ../../MaiAgent/third_party/sqlite)
+target_link_libraries(MaiContextImportPurgeTests PRIVATE maiagent)
+add_test(NAME MaiContextImportPurgeTests COMMAND MaiContextImportPurgeTests)
+# 共享存储/启动边界的既有回归只链接正式 Core，复用同一缓存，不另建产品后端。
+add_library(mai_context_regression_support STATIC ../../MaiAgent/tests/support/MaiFakeModelClient.cpp)
+target_include_directories(mai_context_regression_support PUBLIC ../../MaiAgent/tests/support)
+target_link_libraries(mai_context_regression_support PUBLIC maiagent)
+foreach(context_regression MaiCoreTests MaiStoreTests MaiInputQueueTests MaiToolOutputStoreTests
+        MaiContextCompactorTests MaiSpecialistNotificationTests MaiSubAgentTests MaiTurnRunnerTests
+        MaiContextBuilderImageTests)
+  add_executable(${context_regression} ../../MaiAgent/tests/${context_regression}.cpp)
+  target_include_directories(${context_regression} PRIVATE ../../MaiAgent/third_party/sqlite
+    ../../MaiAgent/third_party/nlohmann ../../MaiAgent/third_party/httplib)
+  target_link_libraries(${context_regression} PRIVATE maiagent mai_context_regression_support)
+  if(WIN32)
+    target_compile_definitions(${context_regression} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(${context_regression} PRIVATE ws2_32 crypt32)
+  endif()
+  add_test(NAME ${context_regression} COMMAND ${context_regression})
+endforeach()
+
+# Core 存储变更沿既有控制台真实 stdin/stdout 验证，仍复用正式库和当前缓存。
+if(NOT TARGET MaiModelClientTests)
+  add_executable(MaiModelClientTests ../../MaiAgent/tests/MaiModelClientTests.cpp)
+  target_include_directories(MaiModelClientTests PRIVATE
+    ../../MaiAgent/third_party/nlohmann ../../MaiAgent/third_party/httplib)
+  target_link_libraries(MaiModelClientTests PRIVATE maiagent)
+  if(WIN32)
+    target_compile_definitions(MaiModelClientTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(MaiModelClientTests PRIVATE ws2_32 crypt32)
+  endif()
+endif()
+
 # Runtime validation of the pinned source SDK, with no native capture or provider calls.
 qt6_add_executable(qt_source_runtime_test tests/QtSourceRuntimeTest.cpp)
 target_link_libraries(qt_source_runtime_test PRIVATE Qt6::Widgets Qt6::Svg Qt6::Test)
@@ -1933,7 +1993,6 @@ if(WIN32 AND MAICHAT_ENABLE_OPENCV)
     "${MAICHAT_OPENCV_SOURCE}/samples/data/lena.jpg")
   add_test(NAME desktop_vision_tools_test COMMAND desktop_vision_tools_test)
 endif()
-add_test(NAME reply_suggestion_controller_test COMMAND reply_suggestion_controller_test)
 add_test(NAME performance_log_test COMMAND performance_log_test)
 add_test(NAME remote_diagnostics_controller_test COMMAND remote_diagnostics_controller_test)
 add_test(NAME attachment_download_evidence_test COMMAND attachment_download_evidence_test -o "${CMAKE_CURRENT_BINARY_DIR}/attachment_download_evidence_test.txt,txt")

@@ -526,6 +526,11 @@ struct LocalChatHistoryMutation: Sendable {
     }
 }
 
+struct LocalChatIncomingMetadataResult: Sendable {
+    let message: RemoteIMMessage
+    let inserted: Bool
+}
+
 final class LocalChatHistoryStore {
     private struct StoredChatHistory: Codable {
         let schemaVersion: Int
@@ -560,6 +565,52 @@ final class LocalChatHistoryStore {
         self.encoder = encoder
         self.decoder = decoder
         self.baseDirectoryURL = baseDirectoryURL ?? Self.defaultBaseDirectoryURL(fileManager: fileManager)
+    }
+
+    func prepareDatabase() throws { try withDatabase { _ in () } }
+
+    // 可信来源路径只由普通数据库 owner 提供；导入 reader 不接收模型传来的任意文件路径。
+    var persistentDatabasePath: String { databaseURL.path }
+
+    /// 同一写事务完成 remote/local ID 的实际成员检查与首次插入；UI 工作集不能代替数据库回执。
+    func insertIncomingMetadata(_ message: RemoteIMMessage, sdkAppID: Int?, ownerUserID: String)
+        throws -> LocalChatIncomingMetadataResult {
+        guard message.direction == .incoming, message.groupID == nil,
+              message.toUserID == ownerUserID, !ownerUserID.isEmpty,
+              !message.fromUserID.isEmpty, message.fromUserID != ownerUserID else {
+            throw LocalChatMessageQueryError.invalid("Incoming metadata does not match this account.")
+        }
+        return try withDatabase { database in
+            try execute(database, sql: "BEGIN IMMEDIATE TRANSACTION")
+            do {
+                let hasRemote = message.remoteID?.isEmpty == false
+                let statement = try prepare(database, sql: """
+                    SELECT id,remote_id,from_user,to_user,text,direction,status,created_at,
+                           voice_attachment,image_attachment,file_attachment,video_attachment,
+                           approval_request,approval_decision,caption_above,quote,media_caption,group_id
+                    FROM messages WHERE sdk_app_id=? AND owner_user_id=? AND group_id IS NULL
+                      AND \(hasRemote ? "remote_id=?" : "id=?") LIMIT 1
+                    """)
+                defer { sqlite3_finalize(statement) }
+                try bindText(accountKey(for: sdkAppID), to: statement, at: 1, database: database)
+                try bindText(ownerUserID, to: statement, at: 2, database: database)
+                try bindText(hasRemote ? message.remoteID! : message.id.uuidString, to: statement, at: 3, database: database)
+                let step = sqlite3_step(statement)
+                if step == SQLITE_ROW {
+                    guard let stored = decodeMessage(from: statement), stored.fromUserID == message.fromUserID,
+                          stored.toUserID == ownerUserID else { throw databaseError(database) }
+                    try execute(database, sql: "COMMIT")
+                    return LocalChatIncomingMetadataResult(message: stored, inserted: false)
+                }
+                guard step == SQLITE_DONE else { throw databaseError(database) }
+                try insertMessages([message], into: database, sdkAppID: sdkAppID, ownerUserID: ownerUserID, updateExisting: false)
+                guard sqlite3_changes(database) == 1 else {
+                    throw LocalChatMessageQueryError.invalid("Incoming local message ID conflicts with a stored row.")
+                }
+                try execute(database, sql: "COMMIT")
+                return LocalChatIncomingMetadataResult(message: message, inserted: true)
+            } catch { try? execute(database, sql: "ROLLBACK"); throw error }
+        }
     }
 
     func makePersistence() -> LocalChatHistoryPersistence {
@@ -1990,6 +2041,13 @@ actor LocalChatHistoryPersistence {
     init(baseDirectoryURL: URL) {
         self.store = LocalChatHistoryStore(baseDirectoryURL: baseDirectoryURL)
         self.messageQueryReader = LocalChatMessageQueryReader(directory: baseDirectoryURL)
+    }
+
+    func prepareDatabase() throws { try store.prepareDatabase() }
+
+    func insertIncomingMetadata(_ message: RemoteIMMessage, sdkAppID: Int?, ownerUserID: String)
+        throws -> LocalChatIncomingMetadataResult {
+        try store.insertIncomingMetadata(message, sdkAppID: sdkAppID, ownerUserID: ownerUserID)
     }
 
     // 不在历史写入 actor 执行 SQL；普通调用方与 Agent 共用同一独立只读 worker。

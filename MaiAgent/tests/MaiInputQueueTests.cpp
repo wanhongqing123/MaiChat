@@ -64,8 +64,29 @@ public:
         std::vector<std::string> users;
         if (!requests.empty())
             for (const auto& item : requests.back().messages)
-                if (item.role == MaiModelRole::User) users.push_back(item.content);
+                if (item.role == MaiModelRole::User) {
+                    const auto value = nlohmann::json::parse(item.content, nullptr, false);
+                    // 线格式中的宿主执行观察使用 User 角色，但不是队列接收的人类输入。
+                    // 仅在测试投影中排除准确类型；下面两处用例另行核对观察确实保留。
+                    if (value.is_object() && value.contains("type") && value["type"].is_string() &&
+                        value["type"] == "tool_execution_observation")
+                        continue;
+                    users.push_back(item.content);
+                }
         return users;
+    }
+    std::vector<nlohmann::json> lastToolObservations() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<nlohmann::json> observations;
+        if (!requests.empty())
+            for (const auto& item : requests.back().messages) {
+                if (item.role != MaiModelRole::User) continue;
+                auto value = nlohmann::json::parse(item.content, nullptr, false);
+                if (value.is_object() && value.contains("type") && value["type"].is_string() &&
+                    value["type"] == "tool_execution_observation")
+                    observations.push_back(std::move(value));
+            }
+        return observations;
     }
 };
 
@@ -297,6 +318,20 @@ static void inputDuringModelReplySkipsAllUnstartedTools() {
     CHECK(observed->requests.size() == 2);
     CHECK(observed->lastUsers() ==
           (std::vector<std::string>{"Run three steps", "Reconsider every step"}));
+    const auto observations = observed->lastToolObservations();
+    CHECK(observations.size() == 1);
+    if (observations.size() == 1) {
+        CHECK(observations[0].at("type") == "tool_execution_observation");
+        CHECK(observations[0].at("executions").size() == 3);
+        const auto calls = inputSteps();
+        if (observations[0].at("executions").size() == 3)
+            for (std::size_t index = 0; index < calls.size(); ++index) {
+                const auto& execution = observations[0].at("executions")[index];
+                CHECK(execution.at("call_id") == calls[index].id);
+                CHECK(execution.at("tool") == "input_step");
+                CHECK(execution.at("execution").at("canceled") == true);
+            }
+    }
     if (observed->requests.size() >= 2) {
         const auto& request = observed->requests[1];
         std::size_t results = 0;
@@ -472,6 +507,18 @@ static void finalBoundaryStartsTheNextQueuedTurn() {
     agent.waitIdle();
     CHECK(observed->lastUsers() ==
           (std::vector<std::string>{"Original task", "Input during final response"}));
+    const auto observations = observed->lastToolObservations();
+    CHECK(observations.size() == 1);
+    if (observations.size() == 1) {
+        CHECK(observations[0].at("type") == "tool_execution_observation");
+        CHECK(observations[0].at("executions").size() == 1);
+        if (observations[0].at("executions").size() == 1) {
+            const auto& execution = observations[0].at("executions")[0];
+            CHECK(execution.at("call_id") == "fixture_call");
+            CHECK(execution.at("tool") == "fixture_noop");
+            CHECK(execution.at("execution").at("canceled") == false);
+        }
+    }
     CHECK(observed->requests.size() >= 3);
 }
 

@@ -3,10 +3,12 @@
 #include <QApplication>
 #include <QDialog>
 #include <QDir>
+#include <QFile>
 #include <QLabel>
 #include <QListWidget>
 #include <QPushButton>
 #include <QSettings>
+#include <QScopeGuard>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTextEdit>
@@ -17,6 +19,7 @@
 #include <memory>
 
 #include "agent/AgentController.h"
+#include "agent/DesktopSessionImBridge.h"
 #include "agent/AgentChatPanel.h"
 #include "app/RemoteIMApplication.h"
 #include "im/FakeRemoteIMClient.h"
@@ -57,8 +60,10 @@ private:
 struct Fixture {
     OwnedSettings settings;
     QTemporaryDir workspace;
+    QTemporaryDir historyDirectory;
     FakeRemoteIMClient* im = new FakeRemoteIMClient;
-    RemoteIMApplication app{QStringLiteral("owned-ui-owner"), std::unique_ptr<RemoteIMClient>(im)};
+    RemoteIMApplication app{QStringLiteral("owned-ui-owner"), std::unique_ptr<RemoteIMClient>(im),
+        std::make_unique<LocalMessageDatabase>(historyDirectory.filePath(QStringLiteral("owned-ui-history.db")))};
     std::unique_ptr<MainWindow> window;
 
     Fixture() {
@@ -99,7 +104,11 @@ struct Fixture {
         });
         entry()->click();
         QCoreApplication::processEvents();
-        return selected && captured;
+        auto* bridge = window->findChild<DesktopSessionImBridge*>();
+        return selected && captured && bridge && QTest::qWaitFor([&] {
+            return bridge->boundSession(QStringLiteral("owned-ui-friend")) == sessionId &&
+                !bridge->historyPending(QStringLiteral("owned-ui-friend"));
+        }, 10000);
     }
 };
 
@@ -114,6 +123,8 @@ private slots:
     void savedBindingDoesNotActivateForAnotherAccount();
     void anotherPeerCannotReuseTheBoundSession();
     void localComposerSendRevokesAutomaticReplyBeforeSubmission();
+    void openPickerTracksSessionsTitlesAndDeletionWithoutChangingDraft();
+    void peerChangeInvalidatesOpenPicker();
 };
 
 void DesktopSessionImBindingUiTest::pickerBindsExistingSessionWithoutSubmitting() {
@@ -124,11 +135,14 @@ void DesktopSessionImBindingUiTest::pickerBindsExistingSessionWithoutSubmitting(
     const QString session = f.session();
     auto* command = f.window->findChild<QPushButton*>(QStringLiteral("composerCommandButton"));
     QVERIFY(f.entry() && command && f.boundName());
+    QVERIFY(QFile::exists(QStringLiteral(":/maichat/icons/ai-sparkles.svg")));
     QVERIFY(!f.boundName()->isVisible());
     for (const QSize size : {QSize(1100, 750), QSize(850, 650)}) {
         f.window->resize(size);
         QCoreApplication::processEvents();
-        QTRY_VERIFY(f.entry()->x() >= command->x() + command->width());
+        QTRY_VERIFY(f.entry()->x() + f.entry()->width() <= command->x());
+        QVERIFY(f.window->findChild<QObject*>(QStringLiteral("aiReplyButton")) == nullptr);
+        QVERIFY(f.window->findChild<QObject*>(QStringLiteral("replySuggestionController")) == nullptr);
         QVERIFY(f.entry()->geometry().right() < f.entry()->parentWidget()->width());
         QVERIFY(captureOwnedWidget(*f.window, QStringLiteral("session-binding-blank-%1").arg(f.window->width())));
     }
@@ -176,11 +190,23 @@ void DesktopSessionImBindingUiTest::savedBindingReturnsForTheSameAccountAndPeer(
     QTRY_VERIFY(f.app.isConnected());
     f.show();
     QVERIFY(QTest::qWaitForWindowExposed(f.window.get()));
+    QVERIFY2(f.window->activeAgentController()->openError().isEmpty(),
+             qPrintable(f.window->activeAgentController()->openError()));
     const QString session = f.session();
     QVERIFY(f.bind(session));
+    bool saved = false;
+    for (const auto& key : QSettings().allKeys())
+        if (key.startsWith(QStringLiteral("imSessionBindings/")))
+            saved |= QSettings().value(key).toMap().value(QStringLiteral("owned-ui-friend")).toString() == session;
+    QVERIFY(saved);
     f.window.reset();
     f.show();
     QVERIFY(QTest::qWaitForWindowExposed(f.window.get()));
+    MaiSession restored;
+    QVERIFY(f.window->activeAgentController()->agent().getSession(session.toStdString(), restored));
+    auto* bridge = f.window->findChild<DesktopSessionImBridge*>();
+    QVERIFY(bridge);
+    QCOMPARE(bridge->boundSession(QStringLiteral("owned-ui-friend")), session);
     QTRY_VERIFY(f.boundName() && f.boundName()->isVisible());
     QVERIFY(f.boundName()->text().contains(QStringLiteral("Owned UI Session")));
     f.app.selectPeer(QStringLiteral("owned-ui-other"));
@@ -255,6 +281,66 @@ void DesktopSessionImBindingUiTest::localComposerSendRevokesAutomaticReplyBefore
     editor->setPlainText(QStringLiteral("Owned local draft"));
     QTest::keyClick(editor, Qt::Key_Return);
     QTRY_VERIFY(!f.boundName()->isVisible());
+    QVERIFY(f.im->lastText().isEmpty());
+}
+
+void DesktopSessionImBindingUiTest::openPickerTracksSessionsTitlesAndDeletionWithoutChangingDraft() {
+    Fixture f;
+    QTRY_VERIFY(f.app.connectionReady());
+    f.show();
+    QVERIFY(QTest::qWaitForWindowExposed(f.window.get()));
+    const QString first = f.session(QStringLiteral("Owned dynamic first"));
+    auto* editor = f.window->findChild<QTextEdit*>(QStringLiteral("messageEditor"));
+    QVERIFY(editor);
+    editor->setPlainText(QStringLiteral("Owned IM draft stays untouched"));
+    QTimer::singleShot(0, f.window.get(), [&] {
+        auto* dialog = f.window->findChild<QDialog*>(QStringLiteral("imSessionBindingDialog"));
+        QVERIFY(dialog);
+        const auto close = qScopeGuard([&] { dialog->reject(); });
+        auto* list = dialog->findChild<QListWidget*>(QStringLiteral("imSessionBindingSessions"));
+        auto* confirm = dialog->findChild<QPushButton*>(QStringLiteral("imSessionBindingConfirm"));
+        QVERIFY(list && confirm);
+        const auto find = [&](const QString& id) -> QListWidgetItem* {
+            for (int index = 0; index < list->count(); ++index)
+                if (list->item(index)->data(Qt::UserRole).toString() == id) return list->item(index);
+            return nullptr;
+        };
+        QVERIFY(find(first));
+        list->setCurrentItem(find(first));
+        const QString second = f.session(QStringLiteral("Owned dynamic second"));
+        QVERIFY(QTest::qWaitFor([&] { return find(second) != nullptr; }, 1000));
+        QCOMPARE(list->currentItem()->data(Qt::UserRole).toString(), first);
+        QVERIFY(f.window->activeAgentController()->agent().submit(
+            MaiUpdateSession{first.toStdString(), "Owned renamed while picker open", "", ""}));
+        QVERIFY(QTest::qWaitFor([&] { return find(first) && find(first)->text().contains(QStringLiteral("renamed")); }, 1000));
+        QCOMPARE(list->currentItem()->data(Qt::UserRole).toString(), first);
+        QVERIFY(f.window->activeAgentController()->agent().submit(MaiDeleteSession{first.toStdString()}));
+        QVERIFY(QTest::qWaitFor([&] { return find(first) == nullptr; }, 1000));
+        QVERIFY(!confirm->isEnabled());
+    });
+    f.entry()->click();
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Owned IM draft stays untouched"));
+    QVERIFY(f.im->lastText().isEmpty());
+}
+
+void DesktopSessionImBindingUiTest::peerChangeInvalidatesOpenPicker() {
+    Fixture f;
+    QTRY_VERIFY(f.app.connectionReady());
+    f.show();
+    QVERIFY(QTest::qWaitForWindowExposed(f.window.get()));
+    f.session();
+    auto* editor = f.window->findChild<QTextEdit*>(QStringLiteral("messageEditor"));
+    editor->setPlainText(QStringLiteral("Owned peer-specific draft"));
+    QTimer::singleShot(0, f.window.get(), [&] {
+        auto* dialog = f.window->findChild<QDialog*>(QStringLiteral("imSessionBindingDialog"));
+        QVERIFY(dialog);
+        const auto close = qScopeGuard([&] { dialog->reject(); });
+        f.app.selectPeer(QStringLiteral("owned-ui-other"));
+        QVERIFY(QTest::qWaitFor([&] { return !dialog->isVisible(); }, 1000));
+    });
+    f.entry()->click();
+    f.app.selectPeer(QStringLiteral("owned-ui-friend"));
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Owned peer-specific draft"));
     QVERIFY(f.im->lastText().isEmpty());
 }
 

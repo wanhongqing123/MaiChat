@@ -5827,7 +5827,7 @@ struct ComposerAttachmentPanel: View {
     let openCamera: () -> Void
     let openFile: () -> Void
     let openVoiceInput: () -> Void
-    let suggestReply: (() -> Void)?
+    let bindSession: (() -> Void)?
     var openMusic: (() -> Void)? = nil
     var openScreenShare: (() -> Void)? = nil
     var screenShareTitle = "共享屏幕"
@@ -5884,13 +5884,14 @@ struct ComposerAttachmentPanel: View {
                     action: openVoiceInput
                 )
             }
-            if let suggestReply {
+            if let bindSession {
                 actionButton(
-                    title: "AI 帮我回复",
+                    title: "绑定会话",
                     systemImage: "sparkles",
                     enabled: true,
-                    action: suggestReply
+                    action: bindSession
                 )
+                .accessibilityIdentifier("im-session-binding-entry")
             }
         }
         .padding(.horizontal, 18)
@@ -5966,17 +5967,30 @@ private struct ComposerView: View {
     @State private var keyboardVisibleHeight = UIScreen.main.bounds.height
     @State private var composerEditingController = ComposerTextEditingController()
     @State private var composerEditMenuState: ComposerEditMenuState?
-    @State private var replySuggestions: AIReplySuggestions?
-    @State private var replySuggestionsLoading = false
-    @State private var replySuggestionError: String?
-    @State private var replySuggestionTask: Task<Void, Never>?
-    @ObservedObject private var aiAssistant = AIAssistantModel.shared
+    @State private var isSessionBindingPresented = false
 
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 8) {
-                if replySuggestionsLoading || replySuggestions != nil || replySuggestionError != nil {
-                    aiReplySuggestionView
+                if let binding = appState.imSessionBinding(for: peerUserID) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "sparkles").foregroundStyle(Color(red: 0.51, green: 0.36, blue: 0.88))
+                        Text(binding.isHistoryReady ? "已绑定：\(binding.displayTitle)" : "正在导入历史：\(binding.displayTitle)")
+                            .lineLimit(1)
+                            .accessibilityIdentifier("im-session-binding-status")
+                        Spacer(minLength: 8)
+                        Button("解除绑定") { Task { await appState.unbindIMSession(peer: peerUserID) } }
+                            .accessibilityIdentifier("im-session-binding-unbind")
+                    }
+                    .font(AppTypography.metadata)
+                    .padding(10)
+                    .background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 10))
+                }
+                if appState.imSessionBinding(for: peerUserID) != nil,
+                   let error = appState.imSessionBindingError {
+                    Text(error).font(AppTypography.metadata).foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("im-session-binding-local-error")
                 }
                 if !isVoiceMode && !commandSuggestions.isEmpty {
                     RemoteIMSlashCommandBar(
@@ -6017,8 +6031,9 @@ private struct ComposerView: View {
                     openVoiceInput: {
                         setVoiceMode(true)
                     },
-                    suggestReply: {
-                        requestAIReplySuggestions()
+                    bindSession: {
+                        isAttachmentPanelPresented = false
+                        isSessionBindingPresented = true
                     }
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -6030,13 +6045,11 @@ private struct ComposerView: View {
                 composerFocusRequestGeneration &+= 1
             }
         }
-        .onChange(of: latestMessageID) { _ in
-            replySuggestionTask?.cancel()
-            replySuggestionTask = nil
-            replySuggestions = nil
-            replySuggestionsLoading = false
-            replySuggestionError = nil
+        .sheet(isPresented: $isSessionBindingPresented) {
+            IMSessionBindingPicker(peerID: peerUserID)
+                .environmentObject(appState)
         }
+        .onChange(of: peerUserID) { _ in isSessionBindingPresented = false }
         .remoteIMBarBackground(edges: .bottom, opacity: RemoteIMStyle.conversationBarOpacity)
         .overlay(alignment: .top) {
             RemoteIMBarSeparator()
@@ -6113,10 +6126,6 @@ private struct ComposerView: View {
             realtimeStartTask?.cancel()
             realtimeStartTask = nil
             realtimeSpeechRecognizer.cancel()
-            replySuggestionTask?.cancel()
-            replySuggestionTask = nil
-            replySuggestions = nil
-            replySuggestionsLoading = false
             voiceRecorder.cancel()
             transcriptionPresentation.reset()
             isAttachmentPanelPresented = false
@@ -6309,115 +6318,6 @@ private struct ComposerView: View {
     private func dismissComposerEditMenu() {
         guard composerEditMenuState != nil else { return }
         withAnimation(.easeOut(duration: 0.08)) { composerEditMenuState = nil }
-    }
-
-    @ViewBuilder
-    private var aiReplySuggestionView: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 8) {
-                if replySuggestionsLoading {
-                    ProgressView().controlSize(.small)
-                    Text("正在生成自然、轻松和专业回复…")
-                } else if let error = replySuggestionError {
-                    Text(error)
-                } else {
-                    Text("AI 回复建议 · 点击后仍需手动发送")
-                }
-                Spacer(minLength: 4)
-                if !replySuggestionsLoading {
-                    Button("换一批", action: requestAIReplySuggestions)
-                        .buttonStyle(.plain)
-                        .foregroundStyle(RemoteIMStyle.blue)
-                }
-                Button {
-                    replySuggestionTask?.cancel()
-                    replySuggestionTask = nil
-                    replySuggestions = nil
-                    replySuggestionsLoading = false
-                    replySuggestionError = nil
-                } label: {
-                    Image(systemName: "xmark")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(RemoteIMStyle.textSecondary)
-            }
-            .font(AppTypography.symbol(size: 12, weight: .medium))
-
-            if let suggestions = replySuggestions {
-                suggestionButton("自然", text: suggestions.natural)
-                suggestionButton("轻松", text: suggestions.casual)
-                suggestionButton("专业", text: suggestions.professional)
-            }
-        }
-        .padding(10)
-        .background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 11))
-        .overlay(
-            RoundedRectangle(cornerRadius: 11)
-                .stroke(RemoteIMStyle.border, lineWidth: 1)
-        )
-    }
-
-    private func suggestionButton(_ label: String, text: String) -> some View {
-        Button {
-            draft.text = text
-            replySuggestions = nil
-            replySuggestionError = nil
-            composerFocusRequestGeneration &+= 1
-        } label: {
-            Text("\(label) · \(text)")
-                .font(AppTypography.detail)
-                .foregroundStyle(RemoteIMStyle.textPrimary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 11)
-                .padding(.vertical, 8)
-                .background(RemoteIMStyle.panelBackground, in: RoundedRectangle(cornerRadius: 9))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9)
-                        .stroke(RemoteIMStyle.border, lineWidth: 1)
-                )
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var latestMessageID: UUID? {
-        appState.chatState.latestMessage(with: peerUserID)?.id
-    }
-
-    private func requestAIReplySuggestions() {
-        isAttachmentPanelPresented = false
-        // The visible window may point at an old search result. Suggestions
-        // use the newest loaded conversation messages, capped to 24 texts.
-        let messages = appState.chatState.messages(with: peerUserID).suffix(24)
-        let context = messages.compactMap { message -> [String: String]? in
-            let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty, message.approvalRequest == nil,
-                  message.approvalDecision == nil else { return nil }
-            return [
-                "speaker": message.direction == .outgoing ? "me" : "friend",
-                "text": text
-            ]
-        }
-        guard !context.isEmpty else {
-            replySuggestionError = "当前会话没有可用于生成回复的文字"
-            replySuggestions = nil
-            return
-        }
-        let requestLatest = latestMessageID
-        replySuggestionTask?.cancel()
-        replySuggestions = nil
-        replySuggestionError = nil
-        replySuggestionsLoading = true
-        replySuggestionTask = Task {
-            do {
-                let result = try await aiAssistant.suggestReplies(messages: context)
-                guard !Task.isCancelled, requestLatest == latestMessageID else { return }
-                replySuggestions = result
-            } catch {
-                guard !Task.isCancelled, requestLatest == latestMessageID else { return }
-                replySuggestionError = error.localizedDescription
-            }
-            replySuggestionsLoading = false
-        }
     }
 
     private var commandSuggestions: [RemoteIMSlashCommand] {

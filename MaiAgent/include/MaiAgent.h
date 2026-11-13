@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "MaiError.h"
+#include "MaiContextImport.h"
 #include "MaiEventBus.h"
 #include "MaiMessage.h"
 #include "MaiModelClient.h"
@@ -265,6 +266,22 @@ public:
     bool getSession(const std::string& id, MaiSession& out) const;
     // 按生成顺序。会话不存在时返回空 vector，和"会话存在但没有消息"分不开——要分清先用 getSession。
     std::vector<MaiMessage> listMessages(const std::string& sessionId) const;
+
+    // 不执行模型的外部引用上下文。begin/append 可与活动轮次并发，暂存不可见；
+    // commit 要求该 Session 没有活动或启动轮次，Busy 可在轮次结束后重试。
+    // seq 从 0 连续递增，同批完整相同重试幂等；每批和单条上限见 MaiContextImport.h。
+    // 成功 commit 原子替换同 sourceKey 快照，仅发布 ContextImported，不产生发送回执。
+    // 同步存储调用，宿主必须在普通工作线程分页调用，不能从事件或 UI 回调调用。
+    MaiResult<MaiContextImportProgress> beginContextImport(const MaiContextImportSpec& spec);
+    MaiResult<MaiContextImportProgress> appendContextImport(
+        const std::string& importId, std::uint64_t sequence,
+        const std::vector<MaiContextImportRecord>& records);
+    MaiResult<MaiContextImportProgress> commitContextImport(const std::string& importId);
+    MaiError abortContextImport(const std::string& importId);
+    // 与上面的普通导入方法共用同一实现；可复制能力给既有后台任务，避免捕获裸门面。
+    MaiContextImportWorker contextImportWorker() const;
+    MaiResult<MaiContextImportPurgeResult> purgeContextImports(const std::string& sessionId,
+                                                               std::size_t maxMessages);
     // 按新到旧读取一个会话的一页已落库消息。空 beforeId 从最新开始，非空游标
     // 不包含自身；limit 为 0 或会话不存在时返回空列表。纯读，可与运行中的轮次
     // 并发调用；返回值归调用方持有。只用于界面分页，不改变模型轮次读取完整历史。
@@ -358,5 +375,6 @@ private:
     //
     // 前向声明必须跟着写 struct（实现体内部全公开），否则 MSVC 报 C4099。
     struct Runtime;
-    std::unique_ptr<Runtime> mRuntime;
+    std::shared_ptr<Runtime> mRuntime;
+    friend class MaiContextImportWorker;
 };

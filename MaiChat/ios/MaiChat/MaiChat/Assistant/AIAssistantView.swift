@@ -3514,7 +3514,7 @@ private struct AIComposer: View, Equatable {
                         importing = true
                     },
                     openVoiceInput: {},
-                    suggestReply: nil,
+                    bindSession: nil,
                     openMusic: {
                         isAttachmentPanelPresented = false
                         musicSelectionReceived = false

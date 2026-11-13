@@ -255,10 +255,9 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
     private int groupWindowSize = 20;
     private String activeFriendProfileUserId;
     private String draftText = "";
-    private List<String> aiReplySuggestions = new ArrayList<>();
-    private boolean aiReplySuggestionsLoading;
-    private String aiReplySuggestionsPeer = "";
-    private String aiReplySuggestionsLatestId = "";
+    private MaiSessionIMBindingService sessionIMBindings;
+    private LinearLayout sessionIMBindingBar;
+    private AlertDialog sessionIMBindingDialog;
     private RemoteIMQuote pendingQuote;
     private String messageSearchTargetId;
     private boolean stickToLatestMessage = true;
@@ -392,6 +391,12 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         session = new RemoteIMSessionController(this, this);
         maiChatHostTools = new MaiChatHostTools(this, session);
         AIAssistantController.shared(this).setHostToolHandler(maiChatHostTools::execute);
+        sessionIMBindings = new MaiSessionIMBindingService(this, session, () -> {
+            AIAssistantController controller = AIAssistantController.shared(this);
+            controller.setHostToolHandler(maiChatHostTools::execute);
+            return controller.sessionIMBackend();
+        }, () -> runOnUiThread(this::refreshSessionIMBindingBar));
+        session.setSessionIMBindings(sessionIMBindings);
         createMessageNotificationChannel();
         if (MaiChatPreferences.doNotDisturb(this)) cancelNewMessageNotifications();
         showInitialLogin = session.requiresLogin();
@@ -505,6 +510,9 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
     @Override
     protected void onDestroy() {
         destroyed = true;
+        if (sessionIMBindingDialog != null) sessionIMBindingDialog.dismiss();
+        if (sessionIMBindings != null) sessionIMBindings.close();
+        if (session != null) session.setSessionIMBindings(null);
         clearAvatarSelection();
         closeSettingsSubpages();
         passwordRequests.cancelActive("identity_changed");
@@ -3194,6 +3202,12 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         wrapper.setClipToPadding(false);
         wrapper.setBackgroundColor(MaiChatTheme.PANEL);
 
+        sessionIMBindingBar = new LinearLayout(this);
+        sessionIMBindingBar.setOrientation(LinearLayout.HORIZONTAL);
+        sessionIMBindingBar.setGravity(Gravity.CENTER_VERTICAL);
+        wrapper.addView(sessionIMBindingBar, matchWrap());
+        refreshSessionIMBindingBar();
+
         if (pendingQuote != null) {
             wrapper.addView(pendingQuoteBar(pendingQuote), match(dp(42)));
         }
@@ -3204,11 +3218,6 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         speechPreview.setBackground(MaiChatTheme.rounded(MaiChatTheme.BLUE_SOFT, 12, this));
         speechPreview.setVisibility(holdingVoice ? View.VISIBLE : View.GONE);
         wrapper.addView(speechPreview, matchWrap());
-
-        LinearLayout replySuggestions = new LinearLayout(this);
-        replySuggestions.setOrientation(LinearLayout.VERTICAL);
-        renderAiReplySuggestions(replySuggestions);
-        wrapper.addView(replySuggestions, matchWrap());
 
         LinearLayout suggestions = new LinearLayout(this);
         suggestions.setOrientation(LinearLayout.VERTICAL);
@@ -3352,7 +3361,7 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
                 case CAMERA: requestCamera(); break;
                 case FILE: openFilePicker(); break;
                 case VOICE_INPUT: setIMVoiceMode(true); break;
-                case AI_REPLY: requestAiReplySuggestions(); break;
+                case SESSION_BINDING: showSessionIMBindingDialog(); break;
             }
         });
         imAttachmentPanel.setVisibility(View.GONE);
@@ -3360,6 +3369,51 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
         panelParams.setMargins(-dp(16), dp(10), -dp(16), -dp(10));
         wrapper.addView(imAttachmentPanel, panelParams);
         return wrapper;
+    }
+
+    private void showSessionIMBindingDialog() {
+        if (destroyed || sessionIMBindings == null || session == null || activeChatUserId == null || activeGroupId != null) return;
+        if (sessionIMBindingDialog != null && sessionIMBindingDialog.isShowing()) return;
+        rememberDraft(); hideKeyboard();
+        String peer = activeChatUserId, identity = session.passwordChangeIdentity();
+        java.util.function.BooleanSupplier current = () -> !destroyed && peer.equals(activeChatUserId)
+            && identity.equals(session.passwordChangeIdentity());
+        sessionIMBindingDialog = MaiSessionIMBindingDialog.show(this, sessionIMBindings.forPeer(peer), current,
+            this::refreshSessionIMBindingBar);
+    }
+
+    private void refreshSessionIMBindingBar() {
+        LinearLayout bar = sessionIMBindingBar;
+        if (bar == null || destroyed) return;
+        bar.removeAllViews();
+        JSONObject binding = sessionIMBindings == null || activeChatUserId == null || activeGroupId != null
+            ? null : sessionIMBindings.binding(activeChatUserId);
+        if (binding == null) { bar.setVisibility(View.GONE); return; }
+        bar.setVisibility(View.VISIBLE);
+        bar.setPadding(dp(10), dp(6), dp(10), dp(6));
+        bar.setBackground(MaiChatTheme.rounded(Color.argb(23, 130, 92, 224), 10, this));
+        ImageView icon = new ImageView(this); icon.setImageResource(R.drawable.ic_ai_sparkles);
+        icon.setColorFilter(Color.rgb(130, 92, 224));
+        bar.addView(icon, new LinearLayout.LayoutParams(dp(20), dp(20)));
+        String title = binding.optString("session_title").trim();
+        String phase = binding.optString("history_state");
+        String prefix = phase.equals("ready") ? "已绑定：" : phase.equals("failed") ? "历史导入未完成：" : "正在导入历史：";
+        TextView label = MaiChatTheme.text(this, prefix + (title.isEmpty() ? "未命名会话" : title),
+            MaiChatTypographyTokens.Role.METADATA, Color.rgb(130, 92, 224));
+        label.setSingleLine(true); label.setEllipsize(TextUtils.TruncateAt.END);
+        label.setPadding(dp(8), 0, dp(8), 0); label.setOnClickListener(view -> showSessionIMBindingDialog());
+        bar.addView(label, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView unbind = MaiChatTheme.text(this, "解除绑定", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
+        unbind.setContentDescription("解除会话绑定"); unbind.setPadding(dp(8), dp(8), 0, dp(8));
+        String peer = activeChatUserId, identity = session.passwordChangeIdentity();
+        unbind.setOnClickListener(view -> {
+            if (!peer.equals(activeChatUserId) || !identity.equals(session.passwordChangeIdentity())) return;
+            sessionIMBindings.forPeer(peer).unbind((value, error) -> {
+                if (destroyed || !peer.equals(activeChatUserId) || !identity.equals(session.passwordChangeIdentity())) return;
+                if (error != null) toast(error); else refreshSessionIMBindingBar();
+            });
+        });
+        bar.addView(unbind);
     }
 
     private void setIMVoiceMode(boolean enabled) {
@@ -3376,105 +3430,6 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
             ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
                 .showSoftInput(messageInput, InputMethodManager.SHOW_IMPLICIT);
         }
-    }
-
-    private void renderAiReplySuggestions(LinearLayout container) {
-        String latestId = latestMessageId(activeChatUserId);
-        if (!java.util.Objects.equals(aiReplySuggestionsPeer, activeChatUserId)
-            || !java.util.Objects.equals(aiReplySuggestionsLatestId, latestId)) {
-            aiReplySuggestions = new ArrayList<>();
-            aiReplySuggestionsLoading = false;
-        }
-        if (!aiReplySuggestionsLoading && aiReplySuggestions.isEmpty()) return;
-
-        TextView title = MaiChatTheme.text(
-            this,
-            aiReplySuggestionsLoading ? "正在生成自然、轻松和专业回复…" : "AI 回复建议 · 点击后仍需手动发送", MaiChatTypographyTokens.Role.METADATA,
-            MaiChatTheme.SECONDARY
-        );
-        title.setPadding(dp(4), dp(4), dp(4), dp(5));
-        container.addView(title, matchWrap());
-        String[] labels = {"自然", "轻松", "专业"};
-        for (int index = 0; index < aiReplySuggestions.size(); index += 1) {
-            String suggestion = aiReplySuggestions.get(index);
-            TextView row = MaiChatTheme.text(
-                this,
-                labels[Math.min(index, labels.length - 1)] + " · " + suggestion, MaiChatTypographyTokens.Role.DETAIL,
-                MaiChatTheme.TEXT
-            );
-            row.setPadding(dp(12), dp(8), dp(12), dp(8));
-            row.setBackground(MaiChatTheme.bordered(Color.WHITE, MaiChatTheme.BORDER, 10, this));
-            row.setOnClickListener(view -> {
-                draftText = suggestion;
-                rememberDraft();
-                aiReplySuggestions = new ArrayList<>();
-                aiReplySuggestionsLoading = false;
-                if (messageInput != null) {
-                    messageInput.setText(draftText);
-                    messageInput.setSelection(messageInput.length());
-                    messageInput.requestFocus();
-                }
-                render();
-            });
-            LinearLayout.LayoutParams params = matchWrap();
-            params.setMargins(0, 0, 0, dp(6));
-            container.addView(row, params);
-        }
-    }
-
-    private String latestMessageId(String peerId) {
-        if (session == null || peerId == null) return "";
-        List<RemoteIMMessage> messages = session.chatState().messagesWith(peerId);
-        return messages.isEmpty() ? "" : messages.get(messages.size() - 1).id();
-    }
-
-    private void requestAiReplySuggestions() {
-        if (session == null || activeChatUserId == null) return;
-        List<RemoteIMMessage> messages = session.chatState().recentMessagesWith(activeChatUserId, 24);
-        if (messages.isEmpty()) {
-            toast("当前会话还没有可参考的消息");
-            return;
-        }
-        JSONArray context = new JSONArray();
-        for (RemoteIMMessage message : messages) {
-            String text = message.text().trim();
-            if (text.isEmpty() || message.approvalRequest() != null ||
-                message.approvalDecision() != null) continue;
-            try {
-                context.put(new JSONObject()
-                    .put("speaker", message.direction() == RemoteIMMessage.Direction.OUTGOING ? "me" : "friend")
-                    .put("text", text));
-            } catch (JSONException ignored) {
-                // 键和值都是本地字符串，此分支仅作防御性处理。
-            }
-        }
-        if (context.length() == 0) {
-            toast("当前会话没有可用于生成回复的文字");
-            return;
-        }
-        String peer = activeChatUserId;
-        String latestId = latestMessageId(peer);
-        aiReplySuggestionsPeer = peer;
-        aiReplySuggestionsLatestId = latestId;
-        aiReplySuggestions = new ArrayList<>();
-        aiReplySuggestionsLoading = true;
-        render();
-        AIAssistantController.shared(this).suggestReplies(context, (result, error) -> {
-            if (destroyed || !java.util.Objects.equals(peer, activeChatUserId)
-                || !java.util.Objects.equals(latestId, latestMessageId(peer))) return;
-            aiReplySuggestionsLoading = false;
-            if (result == null) {
-                toast(error == null || error.isEmpty() ? "AI 回复建议生成失败" : error);
-            } else {
-                aiReplySuggestions = new ArrayList<>(java.util.Arrays.asList(
-                    result.optString("natural"),
-                    result.optString("casual"),
-                    result.optString("professional")
-                ));
-                aiReplySuggestions.removeIf(String::isEmpty);
-            }
-            render();
-        });
     }
 
     private void renderCommandSuggestions(LinearLayout container, String value) {

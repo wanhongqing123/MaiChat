@@ -24,6 +24,9 @@
 #include <QUrl>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
+#include <atomic>
+#include <limits>
+#include <mutex>
 
 #include "im/DynamicTimSdkApi.h"
 
@@ -474,6 +477,24 @@ RemoteIMSendReceipt sentMessageReceipt(const QString& jsonPayload) {
 
 }  // namespace
 
+struct TimSdkRemoteIMClient::MetadataIngress {
+    quint64 generation = 0;
+    std::mutex posting;
+    std::atomic<quint64> received{0};
+};
+
+quint64 TimSdkRemoteIMClient::liveMetadataSequence() const {
+    return metadataIngress_ ? metadataIngress_->received.load() : 0;
+}
+
+void TimSdkRemoteIMClient::withLiveMetadataBoundary(
+    const std::function<void(LiveMetadataBoundary)>& publish) {
+    const auto ingress = metadataIngress_;
+    if (!ingress) { publish({}); return; }
+    std::lock_guard<std::mutex> lock(ingress->posting);
+    publish({ingress->generation, ingress->received.load()});
+}
+
 TimSdkRemoteIMClient::TimSdkRemoteIMClient(QObject* parent)
     : TimSdkRemoteIMClient(std::make_unique<DynamicTimSdkApi>(), parent) {}
 
@@ -532,6 +553,8 @@ void TimSdkRemoteIMClient::connectToService(int sdkAppId, const QString& userId,
     selfAvatarUrl_.clear();
     sdkAppId_ = static_cast<quint64>(sdkAppId);
     const quint64 profileSession = ++profileSession_;
+    metadataIngress_ = std::make_shared<MetadataIngress>();
+    metadataIngress_->generation = profileSession;
 
     qInfo().noquote()
         << QStringLiteral("[im] connect: sdkAppId=%1 user=%2").arg(sdkAppId).arg(currentUserId_);
@@ -543,11 +566,28 @@ void TimSdkRemoteIMClient::connectToService(int sdkAppId, const QString& userId,
     }
 
     const QPointer<TimSdkRemoteIMClient> self(this);
-    api_->addReceiveMessageCallback([self](const QString& jsonMessages) {
+    const auto ingress = metadataIngress_;
+    api_->addReceiveMessageCallback([self, profileSession, ingress](const QString& jsonMessages) {
         if (!self) return;
-        QMetaObject::invokeMethod(self, [self, jsonMessages] {
-            if (self) self->handleIncomingMessages(jsonMessages);
-        }, Qt::AutoConnection);
+        // Order only raw receipt+post, never SDK/Main/I/O work under this lock.
+        // This closes raw-before-bind / parse-after-snapshot without a second
+        // routing queue, even if SDK callbacks use different threads.
+        std::lock_guard<std::mutex> lock(ingress->posting);
+        if (ingress->received.load() == std::numeric_limits<quint64>::max()) return;
+        const quint64 sequence = ingress->received.fetch_add(1) + 1;
+        QMetaObject::invokeMethod(self, [self, jsonMessages, profileSession, sequence] {
+            if (!self || !self->connected_ || self->profileSession_ != profileSession) return;
+            const auto previousSequence = self->currentRawSequence_;
+            const auto previousGeneration = self->currentRawGeneration_;
+            self->currentRawSequence_ = sequence;
+            self->currentRawGeneration_ = profileSession;
+            const bool parsed = self->handleIncomingMessages(jsonMessages);
+            if (self && self->connected_ && self->profileSession_ == profileSession) {
+                self->currentRawSequence_ = previousSequence;
+                self->currentRawGeneration_ = previousGeneration;
+                emit self->liveMetadataBatchFinished(sequence, parsed, profileSession);
+            }
+        }, Qt::QueuedConnection);
     });
     const auto account = currentAccount();
     api_->setConversationEventCallback([self, account, profileSession](int event,
@@ -576,7 +616,8 @@ void TimSdkRemoteIMClient::connectToService(int sdkAppId, const QString& userId,
     });
     api_->login(
         userId.trimmed(), userSig.trimmed(),
-        [this, completion = std::move(completion)](int code, const QString& description, const QString&) mutable {
+        [this, self, profileSession, completion = std::move(completion)](int code, const QString& description, const QString&) mutable {
+            if (!self || self->profileSession_ != profileSession) return;
             connected_ = code == 0;
             if (connected_) {
                 qInfo().noquote() << QStringLiteral("[im] login ok: %1").arg(currentUserId_);
@@ -1650,6 +1691,8 @@ void TimSdkRemoteIMClient::handleHistoryMessagesPayload(const QString& jsonPaylo
             message.direction = isFromSelf ? RemoteIMMessageDirection::Outgoing : RemoteIMMessageDirection::Incoming;
             message.status = isFromSelf ? RemoteIMMessageStatus::Sent : RemoteIMMessageStatus::Received;
             message.origin = origin;
+            message.quote = metadata.quote;
+            message.hasQuote = metadata.hasQuote;
             message.createdAtMillis = orderedMessageTime(peerId, sdkTimeMillis);
             return message;
         };
@@ -1794,17 +1837,23 @@ QString TimSdkRemoteIMClient::sdkConfigJson() const {
     return compactJson(config);
 }
 
-void TimSdkRemoteIMClient::handleIncomingMessages(const QString& jsonMessages) {
+bool TimSdkRemoteIMClient::handleIncomingMessages(const QString& jsonMessages) {
+    const QPointer<TimSdkRemoteIMClient> lifetime(this);
+    const quint64 profile = profileSession_;
     const QJsonDocument doc = QJsonDocument::fromJson(jsonMessages.toUtf8());
     if (doc.isNull()) {
         qWarning().noquote() << "[im] recv: callback JSON is not parseable; whole batch dropped";
-        return;
+        return false;
     }
     const QJsonArray messages = doc.isArray() ? doc.array() : QJsonArray{doc.object()};
     qInfo().noquote() << QStringLiteral("[im] recv: %1 pushed by SDK").arg(messages.size());
+    bool parsed = true;
     for (const QJsonValue& value : messages) {
+        if (!value.isObject()) { parsed = false; continue; }
         handleIncomingMessage(value.toObject());
+        if (!lifetime || lifetime->profileSession_ != profile) return false;
     }
+    return parsed;
 }
 
 // 作用：解析入站消息类型、元数据和附件后更新会话。
@@ -1845,7 +1894,7 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
     const qint64 sdkTimeMillis = messageTimeMillis(message);
     const ParsedCloudMetadata metadata = messageMetadata(message);
     const RemoteIMMessageOrigin origin = metadata.origin;
-    const auto baseMessage = [this, &fromUserId, &sdkId, sdkTimeMillis, origin](int elemIndex) {
+    const auto baseMessage = [this, &fromUserId, &sdkId, sdkTimeMillis, origin, &metadata](int elemIndex) {
         RemoteIMMessage result;
         const QString stableId = sdkElemMessageId(sdkId, elemIndex);
         if (!stableId.isEmpty()) result.id = stableId;
@@ -1854,6 +1903,8 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
         result.direction = RemoteIMMessageDirection::Incoming;
         result.status = RemoteIMMessageStatus::Received;
         result.origin = origin;
+        result.quote = metadata.quote;
+        result.hasQuote = metadata.hasQuote;
         result.createdAtMillis = orderedMessageTime(fromUserId, sdkTimeMillis);
         return result;
     };
@@ -1898,6 +1949,19 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
     // 那是为了不让旧客户端丢附件。
     const bool attachmentCaptionAbove = hasAttachment && metadata.captionAbove;
 
+    const quint64 ingressSession = profileSession_;
+    const QPointer<TimSdkRemoteIMClient> self(this);
+    const auto announce = [self, ingressSession](const RemoteIMMessage& value) -> quint64 {
+        if (!self || !self->connected_ || self->profileSession_ != ingressSession) return 0;
+        const quint64 id = ++self->liveIngressId_;
+        emit self->liveMessageAnnounced(id, value, self->currentRawSequence_, self->currentRawGeneration_);
+        return self && self->profileSession_ == ingressSession && self->connected_ ? id : 0;
+    };
+    const auto ready = [self, ingressSession](quint64 id, const RemoteIMMessage& value) {
+        if (!self || self->profileSession_ != ingressSession || !self->connected_) return false;
+        emit self->liveMessageReady(id, value);
+        return self && self->profileSession_ == ingressSession && self->connected_;
+    };
     QList<RemoteIMMessage> received;
     bool captionConsumed = false;
     for (int elemIndex = 0; elemIndex < elems.size(); ++elemIndex) {
@@ -1918,6 +1982,8 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
                 textMessage.approvalDecision = metadata.approvalDecision;
                 textMessage.hasApprovalDecision = true;
             }
+            const auto ingressId = announce(textMessage);
+            if (!ingressId || !ready(ingressId, textMessage)) return;
             received.append(textMessage);
             continue;
         }
@@ -1935,9 +2001,12 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
                 imageMessage.captionAbove = attachmentCaptionAbove;
                 captionConsumed = true;
             }
+            const auto ingressId = announce(imageMessage);
+            if (!ingressId) return;
             if (!localPath.isEmpty()) {
                 if (imageMessage.text.trimmed().isEmpty())
                     imageMessage.text = QStringLiteral("[图片消息] ") + QFileInfo(localPath).fileName();
+                if (!ready(ingressId, imageMessage)) return;
                 received.append(imageMessage);
                 continue;
             }
@@ -1946,7 +2015,9 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
                 QStringLiteral("image_elem_orig_url"),
                 QStringLiteral("image_elem_thumb_url")
             });
-            if (!url.isEmpty()) handleIncomingImageUrl(imageMessage, url, /*live=*/true);
+            if (!url.isEmpty()) handleIncomingImageUrl(imageMessage, url, /*live=*/true, ingressId);
+            else rejectLiveIngress(ingressId, ingressSession);
+            if (!self || self->profileSession_ != ingressSession) return;
             continue;
         }
         if (elemType == kElemSound) {
@@ -1963,11 +2034,15 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
                 voiceMessage.text = QStringLiteral("[语音消息]");
             }
             voiceMessage.voice = RemoteIMVoiceAttachment{localPath, duration > 0 ? duration : 1};
+            const auto ingressId = announce(voiceMessage);
+            if (!ingressId) return;
             if (!localPath.isEmpty()) {
+                if (!ready(ingressId, voiceMessage)) return;
                 received.append(voiceMessage);
             } else if (!url.isEmpty()) {
-                handleIncomingVoiceUrl(voiceMessage, url, /*live=*/true);
-            }
+                handleIncomingVoiceUrl(voiceMessage, url, /*live=*/true, ingressId);
+            } else rejectLiveIngress(ingressId, ingressSession);
+            if (!self || self->profileSession_ != ingressSession) return;
             continue;
         }
         if (elemType == kElemVideo) {
@@ -1988,11 +2063,15 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
                 videoMessage.text = QStringLiteral("[视频消息] ") + displayName;
             }
             videoMessage.video = RemoteIMVideoAttachment{localPath, displayName, QString(), duration, sizeBytes};
+            const auto ingressId = announce(videoMessage);
+            if (!ingressId) return;
             if (!localPath.isEmpty()) {
+                if (!ready(ingressId, videoMessage)) return;
                 received.append(videoMessage);
             } else if (!videoUrl.isEmpty()) {
-                handleIncomingVideoUrls(videoMessage, videoUrl, coverUrl, /*live=*/true);
-            }
+                handleIncomingVideoUrls(videoMessage, videoUrl, coverUrl, /*live=*/true, ingressId);
+            } else rejectLiveIngress(ingressId, ingressSession);
+            if (!self || self->profileSession_ != ingressSession) return;
             continue;
         }
         if (elemType == kElemFile) {
@@ -2012,9 +2091,13 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
             } else {
                 fileMessage.text = QStringLiteral("[文件消息] ") + displayName;
             }
+            fileMessage.file = RemoteIMFileAttachment{localPath, displayName, mimeTypeForFileName(displayName), sizeBytes};
+            const auto ingressId = announce(fileMessage);
+            if (!ingressId) return;
             if (!localPath.isEmpty()) {
                 fileMessage.file =
                     RemoteIMFileAttachment{localPath, displayName, mimeTypeForFileName(displayName), sizeBytes};
+                if (!ready(ingressId, fileMessage)) return;
                 received.append(fileMessage);
                 continue;
             }
@@ -2022,8 +2105,9 @@ void TimSdkRemoteIMClient::handleIncomingMessage(const QJsonObject& message) {
             if (!url.isEmpty()) {
                 fileMessage.file =
                     RemoteIMFileAttachment{QString(), displayName, mimeTypeForFileName(displayName), sizeBytes};
-                handleIncomingFileUrl(fileMessage, url, /*live=*/true);
-            }
+                handleIncomingFileUrl(fileMessage, url, /*live=*/true, ingressId);
+            } else rejectLiveIngress(ingressId, ingressSession);
+            if (!self || self->profileSession_ != ingressSession) return;
         }
     }
     // 把「收到哪些元素类型」与「产出几条消息」一起记下来：某个 elem_type 没有
@@ -2071,32 +2155,35 @@ void TimSdkRemoteIMClient::fetchAttachment(const QString& url, const QString& ta
     }));
 }
 
-void TimSdkRemoteIMClient::handleIncomingImageUrl(RemoteIMMessage message, const QString& url, bool live) {
+void TimSdkRemoteIMClient::handleIncomingImageUrl(RemoteIMMessage message, const QString& url, bool live, quint64 ingressId) {
     const QString targetPath = cacheImagePathForUrl(url);
     message.image.localPath = targetPath;
     if (message.text.trimmed().isEmpty())
         message.text = QStringLiteral("[图片消息] ") + QFileInfo(targetPath).fileName();
     const auto origin = currentAccount();
+    const auto profileSession = profileSession_;
     if (QFileInfo(targetPath).isFile() && QFileInfo(targetPath).isReadable()) {
-        emitReceivedMessages({message}, live, origin);
+        deliverIncomingMessage(message, live, origin, ingressId, profileSession);
         return;
     }
     fetchAttachment(url, targetPath, kMaximumImageBytes,
-                    [this, message, live, origin](DesktopCurlAttachmentResult result) {
-        if (currentAccount() != origin || !connected_) return;
+                    [this, message, live, origin, ingressId, profileSession](DesktopCurlAttachmentResult result) {
+        if (currentAccount() != origin || !connected_ || profileSession_ != profileSession) return;
         if (!result.ok()) {
+            rejectLiveIngress(ingressId, profileSession);
             qWarning() << "[im] image download failed:" << int(result.status) << result.transferCode;
             return;
         }
-        emitReceivedMessages({message}, live, origin);
+        deliverIncomingMessage(message, live, origin, ingressId, profileSession);
     });
 }
 
 // 作用：将 SDK 文件地址与原消息附件绑定并处理下载状态。
-void TimSdkRemoteIMClient::handleIncomingFileUrl(RemoteIMMessage message, const QString& url, bool live) {
+void TimSdkRemoteIMClient::handleIncomingFileUrl(RemoteIMMessage message, const QString& url, bool live, quint64 ingressId) {
     // 账号标签在**发起时**捕获，跟着这次下载走。回调里再取「当前账号」是错的：
     // 下载完成时用户可能已经换号，那样旧账号的附件会被算到新账号头上。
     const RemoteDiagnostics::AccountTag origin = currentAccount();
+    const auto profileSession = profileSession_;
     recordAttachmentPhase(origin, message, RemoteDiagnostics::AttachmentPhase::MetadataReceived);
 
     const QString targetPath = cacheFilePathForUrl(url, message.file.fileName);
@@ -2104,27 +2191,30 @@ void TimSdkRemoteIMClient::handleIncomingFileUrl(RemoteIMMessage message, const 
     if (QFileInfo(targetPath).isFile() && QFileInfo(targetPath).isReadable()) {
         recordAttachmentPhase(origin, message, RemoteDiagnostics::AttachmentPhase::CacheHit);
         // 缓存命中也要走同一套判定：真的发出去才算交付。
-        recordAttachmentPhase(origin, message,
-                              emitReceivedMessages({message}, live, origin)
-                                  ? RemoteDiagnostics::AttachmentPhase::Delivered
-                                  : RemoteDiagnostics::AttachmentPhase::DroppedForAccountSwitch);
+        const QPointer<TimSdkRemoteIMClient> self(this);
+        const bool delivered = deliverIncomingMessage(message, live, origin, ingressId, profileSession);
+        if (!self) return;
+        recordAttachmentPhase(origin, message, delivered ? RemoteDiagnostics::AttachmentPhase::Delivered
+                                                        : RemoteDiagnostics::AttachmentPhase::DroppedForAccountSwitch);
         return;
     }
 
     recordAttachmentPhase(origin, message, RemoteDiagnostics::AttachmentPhase::DownloadStarted);
     fetchAttachment(url, targetPath, kMaximumFileBytes,
-                    [this, message, live, origin](DesktopCurlAttachmentResult result) {
-        if (currentAccount() != origin) {
+                    [this, message, live, origin, ingressId, profileSession](DesktopCurlAttachmentResult result) {
+        if (currentAccount() != origin || profileSession_ != profileSession) {
             recordAttachmentPhase(origin, message,
                                   RemoteDiagnostics::AttachmentPhase::DroppedForAccountSwitch);
             return;
         }
         if (result.status == DesktopCurlAttachmentResult::Status::WriteError) {
+            rejectLiveIngress(ingressId, profileSession);
             recordAttachmentPhase(origin, message,
                                   RemoteDiagnostics::AttachmentPhase::WriteFailed);
             return;
         }
         if (!result.ok() || !connected_) {
+            rejectLiveIngress(ingressId, profileSession);
             recordAttachmentPhase(origin, message,
                                   RemoteDiagnostics::AttachmentPhase::DownloadFailed,
                                   result.transferCode);
@@ -2132,10 +2222,11 @@ void TimSdkRemoteIMClient::handleIncomingFileUrl(RemoteIMMessage message, const 
                        << result.transferCode;
             return;
         }
-        recordAttachmentPhase(origin, message,
-                              emitReceivedMessages({message}, live, origin)
-                                  ? RemoteDiagnostics::AttachmentPhase::Delivered
-                                  : RemoteDiagnostics::AttachmentPhase::DroppedForAccountSwitch);
+        const QPointer<TimSdkRemoteIMClient> self(this);
+        const bool delivered = deliverIncomingMessage(message, live, origin, ingressId, profileSession);
+        if (!self) return;
+        recordAttachmentPhase(origin, message, delivered ? RemoteDiagnostics::AttachmentPhase::Delivered
+                                                        : RemoteDiagnostics::AttachmentPhase::DroppedForAccountSwitch);
     });
 }
 
@@ -2144,30 +2235,32 @@ void TimSdkRemoteIMClient::handleIncomingFileUrl(RemoteIMMessage message, const 
 void TimSdkRemoteIMClient::handleIncomingVideoUrls(RemoteIMMessage message,
                                                    const QString& videoUrl,
                                                    const QString& coverUrl,
-                                                   bool live) {
+                                                   bool live, quint64 ingressId) {
     const QString videoPath = cacheVideoPathForUrl(videoUrl, QStringLiteral(".mp4"));
     message.video.localPath = videoPath;
     const auto origin = currentAccount();
+    const auto profileSession = profileSession_;
 
     // 先把封面拿下来（小、快），再下视频本体。封面失败只是没有缩略图，
     // 不能因此把整条视频消息拦住——气泡会退化成深色底 + 播放角标，仍可播放。
     // message 必须按参数传进来：如果在这里按值捕获，封面回调里补上的 coverPath
     // 改的是外层那一份，拷贝进 lambda 的那份永远是空的，封面白下了。
-    const auto fetchVideo = [this, videoUrl, videoPath, live, origin](RemoteIMMessage message) {
-        if (currentAccount() != origin || !connected_) return;
+    const auto fetchVideo = [this, videoUrl, videoPath, live, origin, ingressId, profileSession](RemoteIMMessage message) {
+        if (currentAccount() != origin || !connected_ || profileSession_ != profileSession) return;
         if (QFileInfo(videoPath).isFile() && QFileInfo(videoPath).isReadable()) {
-            emitReceivedMessages({message}, live, origin);
+            deliverIncomingMessage(message, live, origin, ingressId, profileSession);
             return;
         }
         fetchAttachment(videoUrl, videoPath, kMaximumVideoBytes,
-                        [this, message, live, origin](DesktopCurlAttachmentResult result) {
-            if (currentAccount() != origin || !connected_) return;
+                        [this, message, live, origin, ingressId, profileSession](DesktopCurlAttachmentResult result) {
+            if (currentAccount() != origin || !connected_ || profileSession_ != profileSession) return;
             if (!result.ok()) {
+                rejectLiveIngress(ingressId, profileSession);
                 qWarning() << "[im] video download failed:" << int(result.status)
                            << result.transferCode;
                 return;
             }
-            emitReceivedMessages({message}, live, origin);
+            deliverIncomingMessage(message, live, origin, ingressId, profileSession);
         });
     };
 
@@ -2182,31 +2275,49 @@ void TimSdkRemoteIMClient::handleIncomingVideoUrls(RemoteIMMessage message,
         return;
     }
     fetchAttachment(coverUrl, coverPath, kMaximumVideoCoverBytes,
-                    [this, origin, coverPath, message, fetchVideo](DesktopCurlAttachmentResult result) mutable {
-        if (currentAccount() != origin || !connected_) return;
+                    [this, origin, coverPath, message, fetchVideo, profileSession](DesktopCurlAttachmentResult result) mutable {
+        if (currentAccount() != origin || !connected_ || profileSession_ != profileSession) return;
         if (result.ok()) message.video.coverPath = coverPath;
         fetchVideo(message);
     });
 }
 
-void TimSdkRemoteIMClient::handleIncomingVoiceUrl(RemoteIMMessage message, const QString& url, bool live) {
+void TimSdkRemoteIMClient::handleIncomingVoiceUrl(RemoteIMMessage message, const QString& url, bool live, quint64 ingressId) {
     const QString targetPath = cacheVoicePathForUrl(url);
     message.voice.localPath = targetPath;
     const auto origin = currentAccount();
+    const auto profileSession = profileSession_;
     if (QFileInfo(targetPath).isFile() && QFileInfo(targetPath).isReadable()) {
-        emitReceivedMessages({message}, live, origin);
+        deliverIncomingMessage(message, live, origin, ingressId, profileSession);
         return;
     }
     fetchAttachment(url, targetPath, kMaximumVoiceBytes,
-                    [this, message, live, origin](DesktopCurlAttachmentResult result) {
-        if (currentAccount() != origin || !connected_) return;
+                    [this, message, live, origin, ingressId, profileSession](DesktopCurlAttachmentResult result) {
+        if (currentAccount() != origin || !connected_ || profileSession_ != profileSession) return;
         if (!result.ok()) {
+            rejectLiveIngress(ingressId, profileSession);
             qWarning() << "[im] voice download failed:" << int(result.status)
                        << result.transferCode;
             return;
         }
-        emitReceivedMessages({message}, live, origin);
+        deliverIncomingMessage(message, live, origin, ingressId, profileSession);
     });
+}
+
+bool TimSdkRemoteIMClient::deliverIncomingMessage(const RemoteIMMessage& message, bool live,
+                                                    const RemoteDiagnostics::AccountTag& origin,
+                                                    quint64 ingressId, quint64 profileSession) {
+    if (ingressId && (profileSession_ != profileSession || !connected_ || currentAccount() != origin)) return false;
+    const QPointer<TimSdkRemoteIMClient> self(this);
+    if (!emitReceivedMessages({message}, live, origin)) return false;
+    if (live && ingressId && self && self->connected_ && self->profileSession_ == profileSession &&
+        self->currentAccount() == origin) emit self->liveMessageReady(ingressId, message);
+    return bool(self);
+}
+
+void TimSdkRemoteIMClient::rejectLiveIngress(quint64 ingressId, quint64 profileSession) {
+    if (ingressId && connected_ && profileSession_ == profileSession)
+        emit liveMessageFailed(ingressId, QStringLiteral("\u9644\u4ef6\u4e0b\u8f7d\u5931\u8d25\uff0c\u8fd9\u6761\u6d88\u606f\u6ca1\u6709\u63d0\u4ea4\u7ed9\u521b\u4f5c\u4e2d\u5fc3\u3002"));
 }
 
 RemoteDiagnostics::AccountTag TimSdkRemoteIMClient::currentAccount() const {

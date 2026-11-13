@@ -72,6 +72,14 @@ private:
     QString identity_;
 };
 
+// Ordinary writer receipt: duplicate delivery and failed storage are distinct.
+// Metadata is committed before a live attachment download or history fence.
+struct LocalMessagePersistenceResult {
+    bool ok = false;
+    bool inserted = false;
+    QString error;
+};
+
 // 本地消息库（SQLite，每账号一个库文件）。
 //
 // Desktop IM 的历史消息不能依赖腾讯 IM SDK 的漫游拉取（只保留最近几条），
@@ -87,6 +95,12 @@ public:
     LocalMessageDatabase& operator=(const LocalMessageDatabase&) = delete;
 
     bool isOpen() const;
+    // Attached writer identity only; does not open/read history on the UI thread.
+    QString historyDatabasePath() const;
+    LocalMessagePersistenceResult persistMessageMetadata(const RemoteIMMessage& message,
+                                                         const QString& peer);
+    LocalMessagePersistenceResult enrichMessageAttachments(const RemoteIMMessage& message,
+                                                           const QString& peer);
 
     // Open only: no schema migration, creation or account data changes. A null
     // reader is an unavailable store, never an authoritative empty search.

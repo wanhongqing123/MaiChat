@@ -79,7 +79,6 @@
 #include <dwmapi.h>
 #endif
 
-#include "agent/ReplySuggestionController.h"
 #include "app/RemoteIMApplication.h"
 #include "im/FakeRemoteIMClient.h"
 #include "markdown/MarkdownDocument.h"
@@ -271,7 +270,7 @@ private slots:
     void conversationPreviewUsesPlainMarkdown_data();
     void conversationPreviewUsesPlainMarkdown();
     void composerUsesEmbeddedIconSendAction();
-    void aiReplySuggestionOnlyFillsComposer();
+    void sessionBindingReplacesIndependentReplySuggestions();
     void exposesResizableSplitters();
     void agentConversationListUsesResizableSplitter();
     void localSessionCreationLivesInTheDeviceHeader_data();
@@ -1730,65 +1729,47 @@ void MainWindowLayoutTest::composerUsesEmbeddedIconSendAction() {
     }
 }
 
-// AI 回复建议只填入输入框供用户审阅，不能自动发送或悄悄改变选中会话。
-void MainWindowLayoutTest::aiReplySuggestionOnlyFillsComposer() {
+// Session binding is the sole assistant entry; selecting it never invokes the
+// retired independent suggestion model or submits the current IM draft.
+void MainWindowLayoutTest::sessionBindingReplacesIndependentReplySuggestions() {
+    ScopedNotificationSettings settings;
     auto client = std::make_unique<FakeRemoteIMClient>();
     auto* fake = client.get();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
     app.addContact(QStringLiteral("phone-user"), QStringLiteral("iPhone"));
     app.addContact(QStringLiteral("other-user"), QStringLiteral("Other"));
     app.selectPeer(QStringLiteral("phone-user"));
-    fake->emitIncomingText(QStringLiteral("phone-user"), QStringLiteral("今天能审核完吗？"));
-    const QString latestId = app.chatState().messagesWith(QStringLiteral("phone-user")).last().id;
+    app.connectToService(123, QStringLiteral("owned-unused-signature"));
+    QTRY_VERIFY(app.connectionReady());
 
     MainWindow window(app);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     auto* editor = window.findChild<QTextEdit*>(QStringLiteral("messageEditor"));
-    auto* aiButton = window.findChild<QPushButton*>(QStringLiteral("aiReplyButton"));
-    auto* aiHint = window.findChild<QLabel*>(QStringLiteral("aiReplyHint"));
-    auto* bar = window.findChild<QWidget*>(QStringLiteral("replySuggestionBar"));
-    auto* professional = window.findChild<QPushButton*>(QStringLiteral("professionalReplySuggestion"));
-    auto* controller = window.findChild<ReplySuggestionController*>(QStringLiteral("replySuggestionController"));
+    auto* binding = window.findChild<QPushButton*>(QStringLiteral("composerSessionBindingButton"));
+    auto* command = window.findChild<QPushButton*>(QStringLiteral("composerCommandButton"));
     QVERIFY(editor != nullptr);
-    QVERIFY(aiButton != nullptr);
-    QVERIFY(aiHint != nullptr);
-    QVERIFY(bar != nullptr);
-    QVERIFY(professional != nullptr);
-    QVERIFY(controller != nullptr);
-    QCOMPARE(aiButton->parentWidget(), editor);
-    QCOMPARE(aiButton->toolTip(), QString());
-    QVERIFY(aiHint->isHidden());
-    QVERIFY(editor->rect().contains(aiButton->geometry().bottomLeft()));
-
-    QEvent enterEvent(QEvent::Enter);
-    QApplication::sendEvent(aiButton, &enterEvent);
-    QVERIFY(aiHint->isVisible());
-    QVERIFY(aiHint->height() < aiButton->height());
-    QVERIFY(aiHint->geometry().bottom() < aiButton->geometry().top());
-    QEvent leaveEvent(QEvent::Leave);
-    QApplication::sendEvent(aiButton, &leaveEvent);
-    QVERIFY(aiHint->isHidden());
-
-    aiButton->click();
-    QVERIFY(bar->isVisible());
-    QVERIFY(QMetaObject::invokeMethod(controller, "suggestionsReady", Qt::DirectConnection, Q_ARG(quint64, quint64(1)),
-                                      Q_ARG(QString, QStringLiteral("desktop-user")),
-                                      Q_ARG(QString, QStringLiteral("phone-user")), Q_ARG(QString, latestId),
-                                      Q_ARG(QString, QStringLiteral("好，我晚点看")),
-                                      Q_ARG(QString, QStringLiteral("收到，马上看 😄")),
-                                      Q_ARG(QString, QStringLiteral("已收到，我会在今天完成审核。"))));
-    QVERIFY(professional->isEnabled());
-    QCOMPARE(fake->lastText(), QString());
-
-    professional->click();
-    QCOMPARE(editor->toPlainText(), QStringLiteral("已收到，我会在今天完成审核。"));
-    QCOMPARE(fake->lastText(), QString());
-    QVERIFY(bar->isHidden());
+    QVERIFY(binding && command);
+    for (const auto& retired : {"aiReplyButton", "aiReplyHint", "replySuggestionBar", "replySuggestionController",
+                                "naturalReplySuggestion", "casualReplySuggestion", "professionalReplySuggestion"})
+        QVERIFY(window.findChild<QObject*>(QString::fromLatin1(retired)) == nullptr);
+    QCOMPARE(binding->parentWidget(), editor);
+    QTRY_VERIFY(binding->x() + binding->width() <= command->x());
+    QVERIFY(!binding->icon().isNull());
+    const QString draft = QStringLiteral("Owned draft stays in this conversation.");
+    editor->setPlainText(draft);
+    QTimer::singleShot(0, &window, [&] {
+        auto* picker = window.findChild<QDialog*>(QStringLiteral("imSessionBindingDialog"));
+        QVERIFY(picker);
+        picker->reject();
+    });
+    binding->click();
+    QCOMPARE(editor->toPlainText(), draft);
+    QVERIFY(fake->lastText().isEmpty());
     app.selectPeer(QStringLiteral("other-user"));
     QCOMPARE(editor->toPlainText(), QString());
     app.selectPeer(QStringLiteral("phone-user"));
-    QCOMPARE(editor->toPlainText(), QStringLiteral("已收到，我会在今天完成审核。"));
+    QCOMPARE(editor->toPlainText(), draft);
 }
 
 void MainWindowLayoutTest::conversationPreviewUsesPlainMarkdown_data() {

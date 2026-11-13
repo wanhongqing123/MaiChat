@@ -1,6 +1,8 @@
 // 文件作用：移动端 C++ Agent 适配层；MaiMobileAgent 负责移动 Agent 生命周期、工具注册和宿主回调，本文件给出其实现。
 // 直接依赖：MaiMobileHostTools.h、MaiAgent.h、MaiAgentSendMediaTool.h、MaiAppStorageTool.h；实现与这些接口协作。
 #include "MaiMobileAgent.h"
+#include "MaiMobileSessionIM.h"
+#include "MaiMobileSessionIMBindingTool.h"
 #include "MaiMobileHostTools.h"
 #include "MaiCloudDriveTools.h"
 #include "MaiQrCode.h"
@@ -539,7 +541,7 @@ struct MaiMobileAgent {
     std::string workspace;
     std::string model;
     MaiWireApi primaryWire = MaiWireApi::ChatCompletions;
-    // 普通建议与 Agent 使用同一种已配置客户端；本地模式不能绕回云端生成。
+    // 本地主模型探针与 Agent 使用同一种已配置客户端；不另开回复建议模型链。
     std::function<std::unique_ptr<MaiModelClient>()> modelClientFactory;
     std::vector<MaiToolSpec> modelProbeTools;
     std::string modelProbeInstructions;
@@ -553,6 +555,8 @@ struct MaiMobileAgent {
     std::string fileAccessRoot;
     const void* ortApiBase = nullptr;
     std::shared_ptr<MaiMobileHostDispatcher> hostTools = makeMaiMobileHostDispatcher();
+    // 工具工作线程只取 owned shared_ptr；configure/destroy 先撤授权，再等待旧 Agent 退出。
+    std::shared_ptr<MaiMobileSessionIM> sessionIM;
     MaiMobileAgentChangeHandler changeHandler = nullptr;
     std::shared_ptr<MaiSessionScheduleStore> scheduleStore;
     std::unique_ptr<MaiSessionScheduleRunner> scheduleRunner;
@@ -571,6 +575,8 @@ struct MaiMobileAgent {
 
     ~MaiMobileAgent() {
         stopSchedulePolling();
+        auto previous = std::atomic_exchange(&sessionIM, std::shared_ptr<MaiMobileSessionIM>{});
+        if (previous) previous->invalidate();
         agent.reset();
         clearMaiMobileHostToolHandler(hostTools);
     }
@@ -936,6 +942,20 @@ struct MaiMobileAgent {
                 return requestPrivatePdfPassword(dispatcher, cancel);
             }));
         registerMaiChatHostTools(*tools, hostTools);
+        tools->add(makeMaiMobileSessionIMBindingTool([this](const std::string& arguments,
+                                                           const MaiToolContext& context) {
+            const auto routing = std::atomic_load(&sessionIM);
+            if (!routing) {
+                MaiToolExecution execution;
+                execution.status = MaiToolExecutionStatus::NotStarted;
+                execution.started = false;
+                execution.effectStatus = MaiToolEffectStatus::None;
+                return MaiToolResult::failure(MaiErrorCode::NotConfigured,
+                                               "The local Session binding runtime is unavailable.")
+                    .withExecution(std::move(execution));
+            }
+            return routing->executeBindingTool(arguments, context);
+        }));
         registerMaiQrCodeTools(*tools);
 #if defined(__ANDROID__)
         const std::string scheduleDevice = request.value("scheduleDeviceName", "Android");
@@ -1017,6 +1037,8 @@ struct MaiMobileAgent {
             startSchedulePolling();
             throw std::runtime_error("Stop active tasks before changing the model.");
         }
+        auto previousRouting = std::atomic_exchange(&sessionIM, std::shared_ptr<MaiMobileSessionIM>{});
+        if (previousRouting) previousRouting->invalidate();
         agent.reset();
         scheduleRunner.reset();
         scheduleStore = nextScheduleStore;
@@ -1041,6 +1063,18 @@ struct MaiMobileAgent {
         localRouteState = std::move(nextLocalState);
         fileAccessRoot = options.fileAccessRoot;
         configured = !model.empty();
+        auto routing = std::make_shared<MaiMobileSessionIM>(
+            *agent, workspace, [this](const std::string& selectedModel) {
+                requireConfiguredModel(selectedModel.empty() ? model : selectedModel);
+            });
+        routing->setInputValidator([this](const std::string& selectedModel, bool hasVision) {
+            requireSupportedInput(selectedModel.empty() ? model : selectedModel, hasVision);
+        });
+        // 只复制 immutable 函数指针并唤醒既有 worker；迟到通知不捕获 backend raw this。
+        routing->setChangeHandler([handler = changeHandler](const std::string& sessionId) {
+            if (handler != nullptr) handler(sessionId.c_str());
+        });
+        std::atomic_store(&sessionIM, std::move(routing));
         dirty = true;
         structureChanged = true;
         cachedSession.clear();
@@ -1323,6 +1357,15 @@ struct MaiMobileAgent {
             key.find('\0') != std::string::npos)
             throw NativeOperationFailure(
                 {MaiErrorCode::NotConfigured, "The selected provider is not configured for this account."});
+    }
+
+    // 手动发送和 IM 自动转入复用同一实际模型能力校验；本地无 projector 也只能接收文本。
+    void requireSupportedInput(const std::string& selectedModel, bool hasVision) const {
+        const auto capability = maiCloudModelInfo(selectedModel);
+        if (hasVision && ((capability && !capability->supportsImages) ||
+                          (selectedModel == localModelName && !localSupportsImages)))
+            throw NativeOperationFailure({MaiErrorCode::NotSupported,
+                                          "The target session model accepts text only; its input was preserved."});
     }
 
     // 作用：读取指定会话的有限消息快照和任务状态。
@@ -1642,6 +1685,13 @@ struct MaiMobileAgent {
         }
         if (op == "tool_detail") return toolDetail(r);
         if (!agent) throw std::runtime_error("Agent is not initialized.");
+        if (op == "im_session_binding") {
+            const auto routing = std::atomic_load(&sessionIM);
+            if (!routing)
+                throw NativeOperationFailure({MaiErrorCode::NotConfigured,
+                                              "The local Session binding runtime is unavailable."});
+            return Json::parse(routing->request(r.dump()));
+        }
         if (op == "pin_input_file") {
             // 图片转换留在平台；转换后的私有临时文件统一由 C++ 交付到稳定路径。
             // 同一请求/附件跨传输重试不换路径，避免接收凭据因随机导入文件名而冲突。
@@ -1776,47 +1826,6 @@ struct MaiMobileAgent {
             return {{"ok", true},
                     {"messages", serializeMessages(page, before.empty() && agent->isBusy(session), session)}};
         }
-        if (op == "suggest_replies") {
-            requireConfiguredModel(model);
-            if (!r.contains("messages") || !r["messages"].is_array() || r["messages"].empty() ||
-                r["messages"].size() > 30)
-                throw std::runtime_error("Messages must contain between 1 and 30 items.");
-            MaiModelRequest modelRequest;
-            modelRequest.model = model;
-            modelRequest.temperature = 0.5;
-            modelRequest.baseInstructions =
-                "You generate reply suggestions for a private chat. Return only one "
-                "JSON object "
-                "with exactly these string fields: natural, casual, professional. "
-                "Each value must "
-                "be a short reply in the conversation language. Do not send a "
-                "message, call a "
-                "tool, use Markdown fences, or include explanations.";
-            MaiModelMessage context;
-            context.role = MaiModelRole::User;
-            context.content = "Recent conversation, oldest first:\n" + r["messages"].dump();
-            modelRequest.messages.push_back(std::move(context));
-            std::string response;
-            MaiStreamSink sink;
-            sink.onText = [&](std::string_view delta) { response.append(delta.data(), delta.size()); };
-            std::atomic<bool> cancel{false};
-            const MaiError error = modelClientFactory()->stream(modelRequest, sink, cancel);
-            if (error) throw std::runtime_error(error.message());
-            std::string clean = response;
-            const auto firstLine = clean.find('\n');
-            const auto closingFence = clean.rfind("```");
-            if (clean.rfind("```", 0) == 0 && firstLine != std::string::npos && closingFence > firstLine)
-                clean = clean.substr(firstLine + 1, closingFence - firstLine - 1);
-            const Json suggestions = Json::parse(clean);
-            for (const char* key : {"natural", "casual", "professional"})
-                if (!suggestions.contains(key) || !suggestions[key].is_string() ||
-                    suggestions[key].get<std::string>().empty())
-                    throw std::runtime_error("The model returned incomplete reply suggestions.");
-            return {{"ok", true},
-                    {"natural", suggestions["natural"]},
-                    {"casual", suggestions["casual"]},
-                    {"professional", suggestions["professional"]}};
-        }
         std::string id;
         std::string acceptedUserId;
         std::string acceptedTurnId;
@@ -1830,6 +1839,8 @@ struct MaiMobileAgent {
             if (r.contains("model")) requireConfiguredModel(selectedModel);
             id = result(agent->submit(MaiCreateSession{workspace, "", selectedModel, effort}));
         } else if (op == "send" || op == "steer" || op == "enqueue") {
+            // 所有普通手动入口都先撤回该 Session 的自动回复授权；路由自身直接使用 MaiSendPrompt。
+            if (const auto routing = std::atomic_load(&sessionIM)) routing->revokeSession(session);
             const auto target = requireSession(session);
             const auto selectedModel = target.model.empty() ? model : target.model;
             requireConfiguredModel(selectedModel);
@@ -1862,11 +1873,7 @@ struct MaiMobileAgent {
                     videos.push_back({value["path"].get<std::string>(), value["mimeType"].get<std::string>()});
                 }
             }
-            const auto capability = maiCloudModelInfo(selectedModel);
-            if ((!images.empty() || !videos.empty()) && ((capability && !capability->supportsImages) ||
-                                                         (selectedModel == localModelName && !localSupportsImages)))
-                throw NativeOperationFailure({MaiErrorCode::NotSupported,
-                                              "The target session model accepts text only; its draft was preserved."});
+            requireSupportedInput(selectedModel, !images.empty() || !videos.empty());
             if (r.contains("quoteMessageId") && !r["quoteMessageId"].is_string())
                 throw std::runtime_error("quoteMessageId must be a string.");
             if (op == "enqueue") {
@@ -1897,6 +1904,7 @@ struct MaiMobileAgent {
                 if (!previous.empty() && previous.front().role == MaiRole::User) acceptedUserId = previous.front().id;
             }
         } else if (op == "stop") {
+            if (const auto routing = std::atomic_load(&sessionIM)) routing->revokeSession(session);
             // 可选轮次来自点击时的所有者快照；兼容旧调用，但不能让迟到取消影响新任务。
             if (r.contains("turnId") && !r["turnId"].is_string())
                 throw NativeOperationFailure(
@@ -1904,11 +1912,13 @@ struct MaiMobileAgent {
             const auto expectedTurn = r.value("turnId", std::string{});
             result(agent->interruptTurn(session, expectedTurn));
             if (scheduleRunner) scheduleRunner->finish(session, "Interrupted by user");
-        } else if (op == "delete")
+        } else if (op == "delete") {
+            if (const auto routing = std::atomic_load(&sessionIM)) routing->revokeSession(session);
             result(agent->submit(MaiDeleteSession{session}));
-        else if (op == "clear")
+        } else if (op == "clear") {
+            if (const auto routing = std::atomic_load(&sessionIM)) routing->revokeSession(session);
             result(agent->submit(MaiClearMessages{session}));
-        else if (op == "rename")
+        } else if (op == "rename")
             result(agent->submit(MaiUpdateSession{session, r.at("title"), "", ""}));
         else if (op == "permission") {
             MaiPermissionDecision decision = MaiPermissionDecision::Denied;
@@ -1940,7 +1950,7 @@ struct MaiMobileAgent {
             if (r.contains("requestId") && r["requestId"].is_string()) receipt["requestId"] = r["requestId"];
             return receipt;
         } else
-            throw std::runtime_error("Unknown operation.");
+            throw NativeOperationFailure({MaiErrorCode::InvalidInput, "Unknown operation."});
         Json response{{"ok", true}, {"id", id}};
         if (op == "send" || op == "steer") {
             response["user_message_id"] = acceptedUserId;
@@ -2047,4 +2057,26 @@ char* maiMobileAgentRequest(void* handle, const char* request) {
 }
 void maiMobileAgentFree(char* response) {
     std::free(response);
+}
+
+char* maiMobileSessionIMControl(const char* request) {
+    try {
+        if (request == nullptr || std::strlen(request) > 256 * 1024)
+            return ownedResponse(R"({"ok":false,"errorCode":"invalid_input","error":"Invalid Session IM control."})");
+        return ownedResponse(MaiMobileSessionIM::control(request));
+    } catch (...) {
+        // 控制请求不泄漏 owned delivery 正文或路径；失败即禁止派发，不跨 C ABI 抛异常。
+        return ownedResponse(R"({"ok":false,"errorCode":"internal","error":"Session IM control failed."})");
+    }
+}
+
+char* maiMobileIMHistorySnapshot(const char* request) {
+    try {
+        if (request == nullptr || std::strlen(request) > 1024 * 1024)
+            return ownedResponse(R"({"ok":false,"errorCode":"invalid_input","error":"Invalid history snapshot request."})");
+        // 调用者须使用既有 I/O 准备 worker；这里不经过普通 Agent 请求队列或宿主工具回调。
+        return ownedResponse(MaiMobileSessionIM::historySnapshot(request));
+    } catch (...) {
+        return ownedResponse(R"({"ok":false,"errorCode":"internal","error":"History snapshot operation failed."})");
+    }
 }

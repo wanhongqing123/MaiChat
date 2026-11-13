@@ -436,6 +436,60 @@ bool LocalMessageDatabase::isOpen() const {
     return db_ != nullptr;
 }
 
+QString LocalMessageDatabase::historyDatabasePath() const {
+    if (!db_) return {};
+    int moved = 0;
+    const int status = sqlite3_file_control(db_, "main", SQLITE_FCNTL_HAS_MOVED, &moved);
+    if ((status == SQLITE_OK && moved) || (status != SQLITE_OK && status != SQLITE_NOTFOUND)) return {};
+    const char* path = sqlite3_db_filename(db_, "main");
+    return path && *path ? QDir::fromNativeSeparators(QString::fromUtf8(path)) : QString();
+}
+
+LocalMessagePersistenceResult LocalMessageDatabase::enrichMessageAttachments(
+    const RemoteIMMessage& message, const QString& peer) {
+    if (!db_ || message.id.isEmpty() || peer.isEmpty())
+        return {false, false, QStringLiteral("Local message attachment storage is unavailable")};
+    Transaction transaction(db_);
+    if (!transaction) return {false, false, QStringLiteral("Local message attachment transaction could not start")};
+    // Metadata owns the immutable row/participants/kind. Readiness only fills
+    // missing safe fields; a late duplicate never clears an existing good cache.
+    const QList<QPair<QString, QString>> textFields{
+        {QStringLiteral("text"), message.text}, {QStringLiteral("image_path"), message.image.localPath},
+        {QStringLiteral("voice_path"), message.voice.localPath}, {QStringLiteral("file_path"), message.file.localPath},
+        {QStringLiteral("file_name"), message.file.fileName}, {QStringLiteral("file_mime"), message.file.mimeType},
+        {QStringLiteral("video_path"), message.video.localPath}, {QStringLiteral("video_name"), message.video.fileName},
+        {QStringLiteral("video_cover"), message.video.coverPath}};
+    const QList<QPair<QString, qint64>> numberFields{
+        {QStringLiteral("image_w"), message.image.width}, {QStringLiteral("image_h"), message.image.height},
+        {QStringLiteral("image_bytes"), message.image.sizeBytes}, {QStringLiteral("voice_seconds"), message.voice.durationSeconds},
+        {QStringLiteral("file_bytes"), message.file.sizeBytes}, {QStringLiteral("video_seconds"), message.video.durationSeconds},
+        {QStringLiteral("video_bytes"), message.video.sizeBytes}};
+    QStringList assignments;
+    for (const auto& field : textFields)
+        assignments.append(field.first + QStringLiteral("=CASE WHEN COALESCE(") + field.first +
+            QStringLiteral(",'')='' THEN ? ELSE ") + field.first + QStringLiteral(" END"));
+    for (const auto& field : numberFields)
+        assignments.append(field.first + QStringLiteral("=CASE WHEN COALESCE(") + field.first +
+            QStringLiteral(",0)=0 THEN ? ELSE ") + field.first + QStringLiteral(" END"));
+    Statement update(db_);
+    update.prepare(QStringLiteral("UPDATE messages SET ") + assignments.join(QLatin1Char(',')) +
+        QStringLiteral(" WHERE id=? AND peer=? AND from_user=? AND to_user=? AND direction=? AND has_image=? AND has_voice=? AND has_file=? AND has_video=?"));
+    for (const auto& field : textFields) update.addBindValue(field.second.isNull() ? QStringLiteral("") : field.second);
+    for (const auto& field : numberFields) update.addBindValue(field.second);
+    update.addBindValue(message.id);
+    update.addBindValue(peer);
+    update.addBindValue(message.fromUserId);
+    update.addBindValue(message.toUserId);
+    update.addBindValue(message.direction == RemoteIMMessageDirection::Outgoing ? 1 : 0);
+    update.addBindValue(message.hasImage ? 1 : 0);
+    update.addBindValue(message.hasVoice ? 1 : 0);
+    update.addBindValue(message.hasFile ? 1 : 0);
+    update.addBindValue(message.hasVideo ? 1 : 0);
+    if (!update.exec() || update.numRowsAffected() != 1 || !transaction.commit())
+        return {false, false, QStringLiteral("Local message attachment enrichment did not confirm the original row")};
+    return {true, false, {}};
+}
+
 std::shared_ptr<LocalMessageSearchReader> LocalMessageDatabase::createSearchReader(const QString& sessionIdentity) const {
     if (!db_) return {};
     int moved = 0;
@@ -809,9 +863,12 @@ void LocalMessageDatabase::removeContactCascade(const QString& userId) {
 }
 
 // 作用：以稳定消息标识写入新记录并避免重复消息。
-bool LocalMessageDatabase::insertMessageIfAbsent(const RemoteIMMessage& message, const QString& peer) {
+LocalMessagePersistenceResult LocalMessageDatabase::persistMessageMetadata(const RemoteIMMessage& message, const QString& peer) {
     RemoteDiagnostics::PerformanceSpan performance("history-write");
-    if (!isOpen() || message.id.isEmpty()) return false;
+    if (!isOpen() || message.id.isEmpty() || message.fromUserId.isEmpty() || message.toUserId.isEmpty() || peer.isEmpty())
+        return {false, false, QStringLiteral("Local message metadata storage is unavailable or identity is invalid")};
+    Transaction transaction(db_);
+    if (!transaction) return {false, false, QStringLiteral("Local message metadata transaction could not start")};
     Statement query(db_);
     query.prepare(QStringLiteral(
         "INSERT OR IGNORE INTO messages("
@@ -829,7 +886,7 @@ bool LocalMessageDatabase::insertMessageIfAbsent(const RemoteIMMessage& message,
     query.addBindValue(peer);
     query.addBindValue(message.direction == RemoteIMMessageDirection::Outgoing ? 1 : 0);
     query.addBindValue(static_cast<int>(message.status));
-    query.addBindValue(message.text);
+    query.addBindValue(message.text.isNull() ? QStringLiteral("") : message.text);
     query.addBindValue(message.createdAtMillis);
     query.addBindValue(message.hasImage ? 1 : 0);
     query.addBindValue(message.image.localPath);
@@ -867,16 +924,36 @@ bool LocalMessageDatabase::insertMessageIfAbsent(const RemoteIMMessage& message,
     query.addBindValue(message.hasQuote ? message.quote.senderId : QStringLiteral(""));
     query.addBindValue(message.hasQuote ? message.quote.digest : QStringLiteral(""));
     query.addBindValue(message.hasQuote ? message.quote.kind : QStringLiteral(""));
-    if (!query.exec()) return false;
+    if (!query.exec()) return {false, false, QStringLiteral("Local message metadata insert failed")};
     const bool inserted = query.numRowsAffected() > 0;
+    if (!inserted) {
+        Statement exists(db_);
+        exists.prepare(QStringLiteral("SELECT 1 FROM messages WHERE id=? AND peer=? AND from_user=? AND to_user=? AND direction=?"));
+        exists.addBindValue(message.id);
+        exists.addBindValue(peer);
+        exists.addBindValue(message.fromUserId);
+        exists.addBindValue(message.toUserId);
+        exists.addBindValue(message.direction == RemoteIMMessageDirection::Outgoing ? 1 : 0);
+        if (!exists.exec() || !exists.next())
+            return {false, false, QStringLiteral("Local message metadata was not inserted or confirmed as the same row")};
+    }
     if (!inserted && message.createdAtMillis > 0) {
         Statement enrich(db_);
         enrich.prepare(QStringLiteral("UPDATE messages SET created_at = ? WHERE id = ?"));
         enrich.addBindValue(message.createdAtMillis);
         enrich.addBindValue(message.id);
-        enrich.exec();
+        if (!enrich.exec()) return {false, false, QStringLiteral("Local message metadata time update failed")};
     }
-    return inserted;
+    if (!transaction.commit()) return {false, false, QStringLiteral("Local message metadata transaction did not commit")};
+    return {true, inserted, {}};
+}
+
+bool LocalMessageDatabase::insertMessageIfAbsent(const RemoteIMMessage& message, const QString& peer) {
+    // Preserve the ordinary legacy NULL-versus-empty contract. Raw attachment
+    // metadata deliberately uses the explicit metadata API with an empty body.
+    if (message.text.isNull()) return false;
+    const auto receipt = persistMessageMetadata(message, peer);
+    return receipt.ok && receipt.inserted;
 }
 
 void LocalMessageDatabase::adoptMessageId(const QString& oldId, const QString& newId) {

@@ -6,6 +6,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QString>
+#include <QStringList>
 #include <QWidget>
 #include <memory>
 
@@ -34,6 +35,9 @@ public:
 
     // 从存储重新拉一遍并重画。轮次结束、标题变了、新建会话之后都要调。
     void refresh();
+    // IDs from the last ordinary local-root projection, including collapsed
+    // groups. This getter does not query SQL or inspect visible widget rows.
+    QStringList projectedLocalRootIds() const;
     void setRemoteSessions(const QJsonArray& sessions);
     void setRemoteDevices(const QJsonArray& devices);
 
@@ -42,6 +46,9 @@ public:
     void setCurrentRemote(const QJsonObject& session);
 
 signals:
+    // Emitted on the GUI thread after the existing ordinary refresh projected
+    // all local roots; includes collapsed groups and adds no database query.
+    void localRootIdsProjected(const QStringList& sessionIds);
     // 用户挑了一个会话。
     void selected(const QString& sessionId);
     void remoteSelected(const QJsonObject& session);

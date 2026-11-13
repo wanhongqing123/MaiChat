@@ -6,6 +6,7 @@ import static org.junit.Assert.*;
 import android.app.Activity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ImageView;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -13,12 +14,13 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.Robolectric;
 import org.robolectric.RobolectricTestRunner;
+import org.robolectric.Shadows;
 import org.robolectric.annotation.Config;
 
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34, qualifiers = "mdpi")
 public class MaiIMAttachmentPanelTest {
-    @Test public void showsTwoRowsOfFourColumnsWithOnlyReplyOnTheSecondRow() {
+    @Test public void showsTwoRowsOfFourColumnsWithOnlyBindingOnTheSecondRow() {
         Activity activity = Robolectric.buildActivity(Activity.class).setup().get();
         List<MaiIMAttachmentPanel.Action> actions = new ArrayList<>();
         View panel = MaiIMAttachmentPanel.create(activity, actions::add);
@@ -38,7 +40,7 @@ public class MaiIMAttachmentPanelTest {
             assertTrue(tile.getWidth() >= 44 && tile.getHeight() >= 44);
             assertEquals(first.getChildAt(0).getWidth(), tile.getWidth());
         }
-        assertEquals(MaiIMAttachmentPanel.Action.AI_REPLY, second.getChildAt(0).getTag());
+        assertEquals("SESSION_BINDING", ((MaiIMAttachmentPanel.Action) second.getChildAt(0).getTag()).name());
         for (int index = 1; index < 4; index++) assertFalse(second.getChildAt(index).isClickable());
         // Captions adapt to platform font metrics and user font scale; the
         // legacy JVM renderer gives CJK a 35px line even at 12sp/mdpi. Verify
@@ -50,6 +52,29 @@ public class MaiIMAttachmentPanelTest {
             View.MeasureSpec.makeMeasureSpec(700, View.MeasureSpec.AT_MOST));
         assertTrue("Attachment panel must leave the conversation visible", panel.getMeasuredHeight() < 350);
         assertTrue(actions.isEmpty());
+    }
+
+    @Test public void bindingReplacesStandaloneReplyAndKeepsTheIosSparklesIcon() {
+        Activity activity = Robolectric.buildActivity(Activity.class).setup().get();
+        ViewGroup panel = (ViewGroup) MaiIMAttachmentPanel.create(activity, action -> {});
+        ViewGroup tile = (ViewGroup) ((ViewGroup) panel.getChildAt(1)).getChildAt(0);
+        assertEquals("绑定会话", tile.getContentDescription().toString());
+        assertEquals("SESSION_BINDING", ((MaiIMAttachmentPanel.Action) tile.getTag()).name());
+        assertThrows(IllegalArgumentException.class, () -> MaiIMAttachmentPanel.Action.valueOf("AI_REPLY"));
+        ImageView icon = (ImageView) ((ViewGroup) tile.getChildAt(0)).getChildAt(0);
+        assertEquals(R.drawable.ic_ai_sparkles, Shadows.shadowOf(icon.getDrawable()).getCreatedFromResId());
+        assertEquals(25, icon.getLayoutParams().width);
+        assertEquals(25, icon.getLayoutParams().height);
+    }
+
+    @Test public void independentReplyBackendAndSuggestionStateAreRemoved() {
+        assertFalse(Arrays.stream(AIAssistantController.class.getDeclaredMethods())
+            .anyMatch(method -> method.getName().equals("suggestReplies")));
+        assertFalse(Arrays.stream(MainActivity.class.getDeclaredMethods())
+            .anyMatch(method -> method.getName().equals("requestAiReplySuggestions")
+                || method.getName().equals("renderAiReplySuggestions")));
+        assertFalse(Arrays.stream(MainActivity.class.getDeclaredFields())
+            .anyMatch(field -> field.getName().startsWith("aiReplySuggestions")));
     }
 
     @Test public void everyTileDispatchesItsOwnActionOnceAndDisabledPanelDispatchesNothing() {

@@ -12,6 +12,7 @@
 
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
+#include "MaiIdGenerator.h"
 #include "MaiSqliteStore.h"
 
 // SQLite 落库。
@@ -160,6 +161,370 @@ public:
         sqlite3_close(mDatabase);
     }
 
+    MaiResult<MaiContextImportProgress> beginContextImport(
+        const MaiContextImportSpec& spec) override {
+        if (const auto error = maiValidateContextImportSpec(spec)) return error;
+        std::lock_guard<std::mutex> lock(mMutex);
+        ImportErrorScope handledError(mLastWriteError);
+        if (!executeTransactionStatement("BEGIN IMMEDIATE")) return importErrorLocked();
+        auto* check = prepareLocked("SELECT 1 FROM sessions WHERE id=?1");
+        bool exists = false;
+        if (check) {
+            Reset reset(check);
+            bindText(check, 1, spec.sessionId);
+            exists = sqlite3_step(check) == SQLITE_ROW;
+        }
+        if (!exists) {
+            executeTransactionStatement("ROLLBACK");
+            return {MaiErrorCode::NotFound, "Context import session is unavailable."};
+        }
+        auto* pending = prepareLocked(
+            "SELECT 1 FROM context_imports WHERE session_id=?1 AND source_key=?2 AND state=0");
+        bool busy = false;
+        if (pending) {
+            Reset reset(pending);
+            bindText(pending, 1, spec.sessionId);
+            bindText(pending, 2, spec.sourceKey);
+            busy = sqlite3_step(pending) == SQLITE_ROW;
+        }
+        if (!pending) return rollbackImportLocked();
+        if (busy) {
+            executeTransactionStatement("ROLLBACK");
+            return {MaiErrorCode::Busy, "A context snapshot is already being staged."};
+        }
+        MaiContextImportProgress progress{MaiIdGenerator::generate("imp"),
+                                          spec.sessionId,
+                                          spec.sourceKey,
+                                          spec.snapshotId,
+                                          0,
+                                          0,
+                                          false};
+        auto* insert = prepareLocked(
+            "INSERT INTO context_imports(id,session_id,source_key,snapshot_id,label) "
+            "VALUES(?1,?2,?3,?4,?5)");
+        bool ok = false;
+        if (insert) {
+            Reset reset(insert);
+            bindText(insert, 1, progress.importId);
+            bindText(insert, 2, spec.sessionId);
+            bindText(insert, 3, spec.sourceKey);
+            bindText(insert, 4, spec.snapshotId);
+            bindText(insert, 5, spec.label);
+            ok = executePreparedStatement(insert);
+        }
+        if (!ok || !executeTransactionStatement("COMMIT")) return rollbackImportLocked();
+        return progress;
+    }
+
+    MaiResult<MaiContextImportProgress> inspectContextImport(
+        const std::string& importId) const override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return inspectImportLocked(importId);
+    }
+
+    MaiResult<MaiContextImportProgress> appendContextImport(
+        const std::string& importId, std::uint64_t sequence,
+        const std::vector<MaiContextImportRecord>& records) override {
+        if (const auto error = maiValidateContextImportBatch(records)) return error;
+        if (sequence >= static_cast<std::uint64_t>(INT64_MAX))
+            return {MaiErrorCode::InvalidInput, "Context batch sequence is too large."};
+        const auto digest = maiContextImportBatchDigest(records);
+        if (digest.empty()) return {MaiErrorCode::Internal, "Cannot fingerprint context batch."};
+        std::lock_guard<std::mutex> lock(mMutex);
+        ImportErrorScope handledError(mLastWriteError);
+        if (!executeTransactionStatement("BEGIN IMMEDIATE")) return importErrorLocked();
+        auto inspected = inspectImportLocked(importId);
+        if (!inspected) {
+            executeTransactionStatement("ROLLBACK");
+            return inspected.error();
+        }
+        auto progress = inspected.value();
+        if (progress.committed) {
+            executeTransactionStatement("ROLLBACK");
+            return {MaiErrorCode::InvalidInput, "Context import is already committed."};
+        }
+        auto* prior = prepareLocked(
+            "SELECT digest FROM context_import_chunks WHERE import_id=?1 AND sequence=?2");
+        bool hasPrior = false;
+        std::string priorDigest;
+        if (prior) {
+            Reset reset(prior);
+            bindText(prior, 1, importId);
+            sqlite3_bind_int64(prior, 2, static_cast<sqlite3_int64>(sequence));
+            const int code = sqlite3_step(prior);
+            hasPrior = code == SQLITE_ROW;
+            if (hasPrior)
+                priorDigest = textColumn(prior, 0);
+            else if (code != SQLITE_DONE)
+                return rollbackImportLocked();
+        }
+        if (!prior) return rollbackImportLocked();
+        if (hasPrior) {
+            executeTransactionStatement("ROLLBACK");
+            if (priorDigest == digest) return progress;
+            return {MaiErrorCode::InvalidInput, "Context batch retry has different content."};
+        }
+        auto* chronology = prepareLocked("SELECT last_created FROM context_imports WHERE id=?1");
+        std::int64_t lastCreated = 0;
+        if (chronology) {
+            Reset reset(chronology);
+            bindText(chronology, 1, importId);
+            if (sqlite3_step(chronology) == SQLITE_ROW)
+                lastCreated = sqlite3_column_int64(chronology, 0);
+            else
+                return rollbackImportLocked();
+        }
+        if (!chronology) return rollbackImportLocked();
+        if (sequence != progress.nextSequence ||
+            (progress.recordCount && records.front().originalCreatedAtMillis < lastCreated)) {
+            executeTransactionStatement("ROLLBACK");
+            return {MaiErrorCode::InvalidInput, "Context batch sequence or chronology is invalid."};
+        }
+        auto* duplicate = prepareLocked(
+            "SELECT 1 FROM messages WHERE context_import_id=?1 AND context_source_id=?2");
+        if (!duplicate) return rollbackImportLocked();
+        for (const auto& record : records) {
+            Reset reset(duplicate);
+            bindText(duplicate, 1, importId);
+            bindText(duplicate, 2, record.sourceId);
+            const int code = sqlite3_step(duplicate);
+            if (code == SQLITE_ROW) {
+                executeTransactionStatement("ROLLBACK");
+                return {MaiErrorCode::InvalidInput, "Context source record is duplicated."};
+            }
+            if (code != SQLITE_DONE) return rollbackImportLocked();
+        }
+        for (const auto& record : records) {
+            const auto messageId = MaiIdGenerator::newMessageId();
+            auto* message = prepareLocked(
+                "INSERT INTO "
+                "messages(id,session_id,role,created,completed,context_import_id,context_source_id)"
+                " VALUES(?1,?2,0,?3,?4,?5,?6)");
+            bool ok = false;
+            if (message) {
+                Reset reset(message);
+                bindText(message, 1, messageId);
+                bindText(message, 2, progress.sessionId);
+                sqlite3_bind_int64(message, 3, record.originalCreatedAtMillis);
+                sqlite3_bind_int64(message, 4,
+                                   std::max<std::int64_t>(1, record.originalCreatedAtMillis));
+                bindText(message, 5, importId);
+                bindText(message, 6, record.sourceId);
+                ok = executePreparedStatement(message);
+            }
+            if (!ok) return rollbackImportLocked();
+            MaiMessagePart part{MaiIdGenerator::newPartId(), MaiTextPart{record.text},
+                                record.originalCreatedAtMillis};
+            if (!writeImportPartLocked(messageId, part)) return rollbackImportLocked();
+        }
+        auto* chunk = prepareLocked(
+            "INSERT INTO context_import_chunks(import_id,sequence,digest) VALUES(?1,?2,?3)");
+        bool ok = false;
+        if (chunk) {
+            Reset reset(chunk);
+            bindText(chunk, 1, importId);
+            sqlite3_bind_int64(chunk, 2, static_cast<sqlite3_int64>(sequence));
+            bindText(chunk, 3, digest);
+            ok = executePreparedStatement(chunk);
+        }
+        if (!ok) return rollbackImportLocked();
+        auto* advance = prepareLocked(
+            "UPDATE context_imports SET "
+            "next_sequence=next_sequence+1,record_count=record_count+?2,last_created=?3 WHERE "
+            "id=?1");
+        if (advance) {
+            Reset reset(advance);
+            bindText(advance, 1, importId);
+            sqlite3_bind_int64(advance, 2, static_cast<sqlite3_int64>(records.size()));
+            sqlite3_bind_int64(advance, 3, records.back().originalCreatedAtMillis);
+            ok = executePreparedStatement(advance);
+        } else
+            ok = false;
+        if (!ok || !executeTransactionStatement("COMMIT")) return rollbackImportLocked();
+        ++progress.nextSequence;
+        progress.recordCount += records.size();
+        return progress;
+    }
+
+    MaiResult<MaiContextImportProgress> commitContextImport(const std::string& importId) override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        ImportErrorScope handledError(mLastWriteError);
+        if (!executeTransactionStatement("BEGIN IMMEDIATE")) return importErrorLocked();
+        auto inspected = inspectImportLocked(importId);
+        if (!inspected) {
+            executeTransactionStatement("ROLLBACK");
+            return inspected.error();
+        }
+        auto progress = inspected.value();
+        if (progress.committed) {
+            executeTransactionStatement("ROLLBACK");
+            return progress;
+        }
+        auto* publish = prepareLocked(
+            "INSERT INTO context_import_sources(session_id,source_key,import_id) VALUES(?1,?2,?3) "
+            "ON CONFLICT(session_id,source_key) DO UPDATE SET import_id=excluded.import_id");
+        bool ok = false;
+        if (publish) {
+            Reset reset(publish);
+            bindText(publish, 1, progress.sessionId);
+            bindText(publish, 2, progress.sourceKey);
+            bindText(publish, 3, importId);
+            ok = executePreparedStatement(publish);
+        }
+        ok = ok && executeStatementWithTextArgument(
+                       "UPDATE context_imports SET state=1 WHERE id=?1", importId);
+        ok = ok && executeStatementWithTextArgument(
+                       "DELETE FROM context_checkpoints WHERE session_id=?1", progress.sessionId);
+        if (!ok || !executeTransactionStatement("COMMIT")) return rollbackImportLocked();
+        progress.committed = true;
+        return progress;
+    }
+
+    MaiError abortContextImport(const std::string& importId) override {
+        std::lock_guard<std::mutex> lock(mMutex);
+        ImportErrorScope handledError(mLastWriteError);
+        if (!executeTransactionStatement("BEGIN IMMEDIATE")) return importErrorLocked();
+        const auto inspected = inspectImportLocked(importId);
+        if (!inspected) {
+            executeTransactionStatement("ROLLBACK");
+            return inspected.error();
+        }
+        if (inspected.value().committed) {
+            executeTransactionStatement("ROLLBACK");
+            return {MaiErrorCode::InvalidInput, "Published context cannot be aborted."};
+        }
+        // 先常量时间撤销资格；大量隐藏副本由有界普通维护回收，不能在取消/UI 收尾里长扫。
+        const bool ok = executeStatementWithTextArgument(
+            "UPDATE context_imports SET state=2 WHERE id=?1 AND state=0", importId);
+        if (!ok || !executeTransactionStatement("COMMIT")) return rollbackImportLocked();
+        return {};
+    }
+
+    MaiResult<MaiContextImportPurgeResult> purgeContextImports(const std::string& sessionId,
+                                                               std::size_t maxMessages) override {
+        if (maxMessages == 0 || maxMessages > kMaiContextImportMaxPurgeMessages)
+            return {MaiErrorCode::InvalidInput, "Context maintenance budget is invalid."};
+        std::lock_guard<std::mutex> lock(mMutex);
+        ImportErrorScope handledError(mLastWriteError);
+        if (!executeTransactionStatement("BEGIN IMMEDIATE")) return importErrorLocked();
+        auto* session = prepareLocked("SELECT 1 FROM sessions WHERE id=?1");
+        if (!session) return rollbackImportLocked();
+        {
+            Reset reset(session);
+            bindText(session, 1, sessionId);
+            const int code = sqlite3_step(session);
+            if (code != SQLITE_ROW) {
+                if (code != SQLITE_DONE) return rollbackImportLocked();
+                executeTransactionStatement("ROLLBACK");
+                return {MaiErrorCode::NotFound, "Context session is unavailable."};
+            }
+        }
+        const char* eligible =
+            "SELECT i.id FROM context_imports i WHERE i.session_id=?1 AND i.state IN(1,2) "
+            "AND NOT EXISTS(SELECT 1 FROM context_import_sources s WHERE s.import_id=i.id) LIMIT "
+            "?2";
+        auto* groups = prepareLocked(eligible);
+        if (!groups) return rollbackImportLocked();
+        std::vector<std::string> imports;
+        {
+            Reset reset(groups);
+            bindText(groups, 1, sessionId);
+            sqlite3_bind_int64(groups, 2, static_cast<sqlite3_int64>(maxMessages));
+            int code;
+            while ((code = sqlite3_step(groups)) == SQLITE_ROW)
+                imports.push_back(textColumn(groups, 0));
+            if (code != SQLITE_DONE) return rollbackImportLocked();
+        }
+        MaiContextImportPurgeResult result;
+        std::size_t metadataBudget = maxMessages;
+        for (const auto& importId : imports) {
+            std::vector<std::string> ids;
+            auto* candidates = prepareLocked(
+                "SELECT id FROM messages WHERE context_import_id=?1 ORDER BY id LIMIT ?2");
+            if (!candidates) return rollbackImportLocked();
+            {
+                Reset reset(candidates);
+                bindText(candidates, 1, importId);
+                sqlite3_bind_int64(candidates, 2,
+                                   static_cast<sqlite3_int64>(maxMessages - result.removed));
+                int code;
+                while ((code = sqlite3_step(candidates)) == SQLITE_ROW)
+                    ids.push_back(textColumn(candidates, 0));
+                if (code != SQLITE_DONE) return rollbackImportLocked();
+            }
+            for (const auto& id : ids) {
+                if (!executeStatementWithTextArgument("DELETE FROM parts WHERE message_id=?1", id))
+                    return rollbackImportLocked();
+                auto* remove =
+                    prepareLocked("DELETE FROM messages WHERE id=?1 AND context_import_id=?2");
+                if (!remove) return rollbackImportLocked();
+                Reset reset(remove);
+                bindText(remove, 1, id);
+                bindText(remove, 2, importId);
+                if (!executePreparedStatement(remove) || sqlite3_changes(mDatabase) != 1)
+                    return rollbackImportLocked();
+                ++result.removed;
+            }
+            auto* remaining =
+                prepareLocked("SELECT 1 FROM messages WHERE context_import_id=?1 LIMIT 1");
+            if (!remaining) return rollbackImportLocked();
+            bool hasMessages;
+            {
+                Reset reset(remaining);
+                bindText(remaining, 1, importId);
+                const int code = sqlite3_step(remaining);
+                if (code != SQLITE_ROW && code != SQLITE_DONE) return rollbackImportLocked();
+                hasMessages = code == SQLITE_ROW;
+            }
+            if (!hasMessages && metadataBudget != 0) {
+                auto* chunks = prepareLocked(
+                    "DELETE FROM context_import_chunks WHERE rowid IN(SELECT rowid FROM "
+                    "context_import_chunks "
+                    "WHERE import_id=?1 LIMIT ?2)");
+                if (!chunks) return rollbackImportLocked();
+                {
+                    Reset reset(chunks);
+                    bindText(chunks, 1, importId);
+                    sqlite3_bind_int64(chunks, 2, static_cast<sqlite3_int64>(metadataBudget));
+                    if (!executePreparedStatement(chunks)) return rollbackImportLocked();
+                    metadataBudget -= static_cast<std::size_t>(sqlite3_changes(mDatabase));
+                }
+                auto* chunkLeft =
+                    prepareLocked("SELECT 1 FROM context_import_chunks WHERE import_id=?1 LIMIT 1");
+                if (!chunkLeft) return rollbackImportLocked();
+                bool hasChunks;
+                {
+                    Reset reset(chunkLeft);
+                    bindText(chunkLeft, 1, importId);
+                    const int code = sqlite3_step(chunkLeft);
+                    if (code != SQLITE_ROW && code != SQLITE_DONE) return rollbackImportLocked();
+                    hasChunks = code == SQLITE_ROW;
+                }
+                if (!hasChunks && metadataBudget != 0) {
+                    if (!executeStatementWithTextArgument("DELETE FROM context_imports WHERE id=?1",
+                                                          importId))
+                        return rollbackImportLocked();
+                    --metadataBudget;
+                }
+            }
+            if (result.removed == maxMessages && metadataBudget == 0) break;
+        }
+        auto* more = prepareLocked(
+            "SELECT 1 FROM context_imports i WHERE i.session_id=?1 AND i.state IN(1,2) "
+            "AND NOT EXISTS(SELECT 1 FROM context_import_sources s WHERE s.import_id=i.id) LIMIT "
+            "1");
+        if (!more) return rollbackImportLocked();
+        {
+            Reset reset(more);
+            bindText(more, 1, sessionId);
+            const int code = sqlite3_step(more);
+            if (code != SQLITE_ROW && code != SQLITE_DONE) return rollbackImportLocked();
+            result.hasMore = code == SQLITE_ROW;
+        }
+        if (!executeTransactionStatement("COMMIT")) return rollbackImportLocked();
+        return result;
+    }
+
     void putSession(const MaiSession& session) override {
         std::lock_guard<std::mutex> lock(mMutex);
         writeSessionLocked(session);
@@ -210,6 +575,7 @@ public:
                        "DELETE FROM context_checkpoints WHERE session_id = ?1", id);
         ok = ok && executeStatementWithTextArgument(
                        "DELETE FROM specialist_tasks WHERE owner_session_id = ?1", id);
+        ok = ok && clearImportsLocked(id);
         ok = ok && executeStatementWithTextArgument("DELETE FROM sessions WHERE id = ?1", id);
         const int removed = sqlite3_changes(mDatabase);
 
@@ -244,6 +610,7 @@ public:
                        "DELETE FROM context_checkpoints WHERE session_id = ?1", sessionId);
         ok = ok && executeStatementWithTextArgument(
                        "DELETE FROM specialist_tasks WHERE owner_session_id = ?1", sessionId);
+        ok = ok && clearImportsLocked(sessionId);
         if (ok && executeTransactionStatement("COMMIT")) return true;
         executeTransactionStatement("ROLLBACK");
         return false;
@@ -790,13 +1157,116 @@ public:
     }
 
 private:
+    // 导入接口直接返回事务错误，不让已处理且回滚的导入失败污染后续普通轮次。
+    // 进入前已存在的普通写入错误仍保留。
+    class ImportErrorScope {
+    public:
+        explicit ImportErrorScope(MaiError& target) : mTarget(target), mBefore(target) {}
+        ~ImportErrorScope() {
+            mTarget = mBefore;
+        }
+
+    private:
+        MaiError& mTarget;
+        MaiError mBefore;
+    };
+
+    bool appendMessagePageLocked(std::vector<MaiMessage>& page, const std::string& sessionId,
+                                 const std::string& beforeId, std::size_t limit,
+                                 const std::string& importId) const {
+        // 两个索引分开查询，隐藏的旧快照再大也不影响普通消息或当前快照的 keyset 分页。
+        auto* statement = prepareLocked(
+            importId.empty()
+                ? "SELECT id,role,created,completed,input_request_id,pending_input FROM messages "
+                  "WHERE session_id=?1 AND context_import_id IS NULL AND id<?2 ORDER BY id DESC "
+                  "LIMIT ?3"
+                : "SELECT id,role,created,completed,input_request_id,pending_input FROM messages "
+                  "WHERE context_import_id=?1 AND id<?2 ORDER BY id DESC LIMIT ?3");
+        if (!statement) return false;
+        Reset reset(statement);
+        bindText(statement, 1, importId.empty() ? sessionId : importId);
+        bindText(statement, 2, beforeId.empty() ? std::string(1, '\x7f') : beforeId);
+        sqlite3_bind_int64(
+            statement, 3,
+            static_cast<sqlite3_int64>(std::min(limit, static_cast<std::size_t>(INT64_MAX))));
+        int code = SQLITE_ROW;
+        while ((code = sqlite3_step(statement)) == SQLITE_ROW) {
+            MaiMessage message;
+            message.id = textColumn(statement, 0);
+            message.role = columnToRole(sqlite3_column_int(statement, 1));
+            message.created = sqlite3_column_int64(statement, 2);
+            message.completed = sqlite3_column_int64(statement, 3);
+            message.inputRequestId = textColumn(statement, 4);
+            message.pendingInput = sqlite3_column_int(statement, 5) != 0;
+            page.push_back(std::move(message));
+        }
+        return code == SQLITE_DONE;
+    }
+
+    MaiError importErrorLocked() const {
+        return {MaiErrorCode::Internal,
+                "Context import storage failed: " + std::string(sqlite3_errmsg(mDatabase))};
+    }
+
+    MaiError rollbackImportLocked() {
+        const auto error = importErrorLocked();
+        executeTransactionStatement("ROLLBACK");
+        return error;
+    }
+
+    MaiResult<MaiContextImportProgress> inspectImportLocked(const std::string& importId) const {
+        auto* query = prepareLocked(
+            "SELECT "
+            "i.id,i.session_id,i.source_key,i.snapshot_id,i.next_sequence,i.record_count,i.state "
+            "FROM context_imports i JOIN sessions s ON s.id=i.session_id WHERE i.id=?1 AND "
+            "i.state<>2");
+        if (!query) return importErrorLocked();
+        Reset reset(query);
+        bindText(query, 1, importId);
+        const int code = sqlite3_step(query);
+        if (code == SQLITE_DONE) return {MaiErrorCode::NotFound, "Context import is unavailable."};
+        if (code != SQLITE_ROW) return importErrorLocked();
+        return MaiContextImportProgress{textColumn(query, 0),
+                                        textColumn(query, 1),
+                                        textColumn(query, 2),
+                                        textColumn(query, 3),
+                                        static_cast<std::uint64_t>(sqlite3_column_int64(query, 4)),
+                                        static_cast<std::uint64_t>(sqlite3_column_int64(query, 5)),
+                                        sqlite3_column_int(query, 6) == 1};
+    }
+
+    bool writeImportPartLocked(const std::string& messageId, const MaiMessagePart& part) {
+        auto* insert = prepareLocked(
+            "INSERT INTO parts(id,message_id,kind,created,text) VALUES(?1,?2,0,?3,?4)");
+        if (!insert) return false;
+        Reset reset(insert);
+        bindText(insert, 1, part.id);
+        bindText(insert, 2, messageId);
+        sqlite3_bind_int64(insert, 3, part.created);
+        bindText(insert, 4, std::get<MaiTextPart>(part.body).text);
+        return executePreparedStatement(insert);
+    }
+
+    bool clearImportsLocked(const std::string& sessionId) {
+        bool ok = executeStatementWithTextArgument(
+            "DELETE FROM context_import_chunks WHERE import_id IN (SELECT id FROM context_imports "
+            "WHERE session_id=?1)",
+            sessionId);
+        ok = ok && executeStatementWithTextArgument(
+                       "DELETE FROM context_import_sources WHERE session_id=?1", sessionId);
+        return ok && executeStatementWithTextArgument(
+                         "DELETE FROM context_imports WHERE session_id=?1", sessionId);
+    }
+
     std::vector<MaiMessage> listMessagesLocked(const std::string& sessionId,
                                                std::size_t limit) const {
         std::vector<MaiMessage> out;
 
         sqlite3_stmt* statement = prepareLocked(
             "SELECT id, role, created, completed, input_request_id, pending_input FROM messages "
-            "WHERE session_id = ?1 ORDER BY id LIMIT ?2");
+            "WHERE session_id = ?1 AND (context_import_id IS NULL OR context_import_id IN "
+            "(SELECT import_id FROM context_import_sources WHERE session_id=?1)) ORDER BY id LIMIT "
+            "?2");
         if (!statement) return out;
         {
             Reset guard(statement);
@@ -859,7 +1329,9 @@ public:
         std::lock_guard<std::mutex> lock(mMutex);
         sqlite3_stmt* statement = prepareLocked(
             "SELECT id, role, created, completed, input_request_id, pending_input FROM messages "
-            "WHERE session_id = ?1 AND id = ?2");
+            "WHERE session_id = ?1 AND id = ?2 AND (context_import_id IS NULL OR "
+            "context_import_id IN (SELECT import_id FROM context_import_sources WHERE "
+            "session_id=?1))");
         if (!statement) return false;
         MaiMessage message;
         {
@@ -888,34 +1360,24 @@ public:
         std::lock_guard<std::mutex> lock(mMutex);
         std::vector<MaiMessage> page;
         if (limit == 0) return page;
-        const bool hasCursor = !beforeId.empty();
-        sqlite3_stmt* statement =
-            prepareLocked(hasCursor ? "SELECT id, role, created, completed, input_request_id, "
-                                      "pending_input FROM messages "
-                                      "WHERE session_id = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
-                                    : "SELECT id, role, created, completed, input_request_id, "
-                                      "pending_input FROM messages "
-                                      "WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2");
-        if (!statement) return page;
+        if (!appendMessagePageLocked(page, sessionId, beforeId, limit, {})) return {};
+        auto* sources =
+            prepareLocked("SELECT import_id FROM context_import_sources WHERE session_id=?1");
+        if (!sources) return {};
         {
-            Reset guard(statement);
-            bindText(statement, 1, sessionId);
-            if (hasCursor) bindText(statement, 2, beforeId);
-            const auto boundedLimit = std::min(
-                limit, static_cast<std::size_t>(std::numeric_limits<sqlite3_int64>::max()));
-            sqlite3_bind_int64(statement, hasCursor ? 3 : 2,
-                               static_cast<sqlite3_int64>(boundedLimit));
-            while (sqlite3_step(statement) == SQLITE_ROW) {
-                MaiMessage message;
-                message.id = textColumn(statement, 0);
-                message.role = columnToRole(sqlite3_column_int(statement, 1));
-                message.created = sqlite3_column_int64(statement, 2);
-                message.completed = sqlite3_column_int64(statement, 3);
-                message.inputRequestId = textColumn(statement, 4);
-                message.pendingInput = sqlite3_column_int(statement, 5) != 0;
-                page.push_back(std::move(message));
-            }
+            Reset reset(sources);
+            bindText(sources, 1, sessionId);
+            int code = SQLITE_ROW;
+            while ((code = sqlite3_step(sources)) == SQLITE_ROW)
+                if (!appendMessagePageLocked(page, sessionId, beforeId, limit,
+                                             textColumn(sources, 0)))
+                    return {};
+            if (code != SQLITE_DONE) return {};
         }
+        // 每个来源只读 limit 个候选，不扫描或排序整份历史快照。
+        std::sort(page.begin(), page.end(),
+                  [](const auto& left, const auto& right) { return left.id > right.id; });
+        if (page.size() > limit) page.resize(limit);
         for (auto& message : page) message.parts = readPartsLocked(message.id);
         return page;
     }
@@ -1783,6 +2245,74 @@ MaiResult<std::unique_ptr<MaiSessionStore>> makeMaiSqliteStore(
             return {MaiErrorCode::Internal, "cannot migrate schema to v11: " + what};
         }
         sqlite3_free(migrationError);
+    }
+    if (readUserVersion(database) < 12) {
+        // 和既有升级保持一致：写锁内检查附加列，兼容并发打开和旧版本门禁回放。
+        char* migrationError = nullptr;
+        bool ok = sqlite3_exec(database, "BEGIN IMMEDIATE", nullptr, nullptr, &migrationError) ==
+                  SQLITE_OK;
+        bool hasImport = false;
+        bool hasSource = false;
+        sqlite3_stmt* columns = nullptr;
+        if (ok)
+            ok = sqlite3_prepare_v2(database, "PRAGMA table_info(messages)", -1, &columns,
+                                    nullptr) == SQLITE_OK;
+        if (ok) {
+            int code;
+            while ((code = sqlite3_step(columns)) == SQLITE_ROW) {
+                const auto name = textColumn(columns, 1);
+                if (name == "context_import_id") hasImport = true;
+                if (name == "context_source_id") hasSource = true;
+            }
+            ok = code == SQLITE_DONE;
+        }
+        sqlite3_finalize(columns);
+        if (ok && !hasImport)
+            ok = sqlite3_exec(database, "ALTER TABLE messages ADD COLUMN context_import_id TEXT",
+                              nullptr, nullptr, &migrationError) == SQLITE_OK;
+        if (ok && !hasSource)
+            ok = sqlite3_exec(database, "ALTER TABLE messages ADD COLUMN context_source_id TEXT",
+                              nullptr, nullptr, &migrationError) == SQLITE_OK;
+        const char* migration =
+            "CREATE TABLE IF NOT EXISTS context_imports(id TEXT PRIMARY KEY,session_id TEXT NOT "
+            "NULL,"
+            "source_key TEXT NOT NULL,snapshot_id TEXT NOT NULL,label TEXT NOT NULL,"
+            "next_sequence INTEGER NOT NULL DEFAULT 0,record_count INTEGER NOT NULL DEFAULT 0,"
+            "last_created INTEGER NOT NULL DEFAULT 0,state INTEGER NOT NULL DEFAULT 0);"
+            "CREATE INDEX IF NOT EXISTS context_imports_source ON "
+            "context_imports(session_id,source_key,state);"
+            "CREATE TABLE IF NOT EXISTS context_import_sources(session_id TEXT NOT NULL,source_key "
+            "TEXT NOT NULL,"
+            "import_id TEXT NOT NULL UNIQUE,PRIMARY KEY(session_id,source_key));"
+            "CREATE TABLE IF NOT EXISTS context_import_chunks(import_id TEXT NOT NULL,sequence "
+            "INTEGER NOT NULL,"
+            "digest TEXT NOT NULL,PRIMARY KEY(import_id,sequence));"
+            "CREATE UNIQUE INDEX IF NOT EXISTS messages_context_source ON "
+            "messages(context_import_id,context_source_id) "
+            "WHERE context_import_id IS NOT NULL;"
+            "CREATE INDEX IF NOT EXISTS messages_context_order ON messages(context_import_id,id) "
+            "WHERE context_import_id IS NOT NULL;"
+            "CREATE INDEX IF NOT EXISTS messages_ordinary_order ON messages(session_id,id) "
+            "WHERE context_import_id IS NULL;"
+            "PRAGMA user_version=12;COMMIT;";
+        if (ok)
+            ok = sqlite3_exec(database, migration, nullptr, nullptr, &migrationError) == SQLITE_OK;
+        if (!ok) {
+            const std::string what = migrationError ? migrationError : sqlite3_errmsg(database);
+            sqlite3_free(migrationError);
+            sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
+            sqlite3_close(database);
+            return {MaiErrorCode::Internal, "cannot migrate schema to v12: " + what};
+        }
+        sqlite3_free(migrationError);
+    }
+    // 进程退出前未发布的快照没有完整来源证明。启动后仅撤销暂存资格，
+    // 正在使用的旧快照指针保留；隐藏数据可由后续普通存储维护回收。
+    if (sqlite3_exec(database, "UPDATE context_imports SET state=2 WHERE state=0", nullptr, nullptr,
+                     nullptr) != SQLITE_OK) {
+        const std::string what = sqlite3_errmsg(database);
+        sqlite3_close(database);
+        return {MaiErrorCode::Internal, "cannot invalidate abandoned context imports: " + what};
     }
     return std::unique_ptr<MaiSessionStore>(new SqliteStore(database));
 }

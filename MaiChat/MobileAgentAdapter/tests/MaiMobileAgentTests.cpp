@@ -60,6 +60,20 @@ static Json call(void* agent, const Json& value) {
     maiMobileAgentFree(response);
     return parsed;
 }
+static Json callSessionIMControl(const Json& value) {
+    char* response = maiMobileSessionIMControl(value.dump().c_str());
+    CHECK(response);
+    const auto parsed = Json::parse(response);
+    maiMobileAgentFree(response);
+    return parsed;
+}
+static Json callIMHistorySnapshot(const Json& value) {
+    char* response = maiMobileIMHistorySnapshot(value.dump().c_str());
+    CHECK(response);
+    const auto parsed = Json::parse(response);
+    maiMobileAgentFree(response);
+    return parsed;
+}
 struct HostToolProbe {
     std::atomic<int> calls{0};
     std::atomic<bool> released{false};
@@ -1355,7 +1369,113 @@ static void toolOutputRegistrationContract() {
 }
 
 // 按真实调用顺序检查输入和可观察结果，失败时保留定位所需的上下文。
+// 真正经过 C ABI 的无模型调用合同；只用自有内存 SQLite 和临时工作目录。
+// 入站仅入队，立即 takeover 后再 pump，不能连到 dummy 模型地址或发真实 IM。
+static void sessionIMCabiContract() {
+    const auto workspace = MaiFileSystem::temporaryDirectory().append(
+        MaiFilePath::fromUtf8(MaiIdGenerator::generate("mobile_session_im_cabi_")));
+    CHECK(!MaiFileSystem::createDirectories(workspace));
+    const std::string historyPath = workspace.append(MaiFilePath::fromUtf8("owned-im.db")).toUtf8();
+    sqlite3* history = nullptr;
+    CHECK(sqlite3_open(historyPath.c_str(), &history) == SQLITE_OK);
+    CHECK(sqlite3_exec(history,
+        "PRAGMA journal_mode=WAL; CREATE TABLE messages(id TEXT PRIMARY KEY,from_user TEXT,to_user TEXT,"
+        "peer TEXT,direction INTEGER,status INTEGER,text TEXT,created_at INTEGER,"
+        "caption_above INTEGER DEFAULT 0,has_image INTEGER DEFAULT 0,image_path TEXT DEFAULT '',"
+        "image_w INTEGER DEFAULT 0,image_h INTEGER DEFAULT 0,image_bytes INTEGER DEFAULT 0,"
+        "has_voice INTEGER DEFAULT 0,voice_path TEXT DEFAULT '',voice_seconds INTEGER DEFAULT 0,"
+        "has_file INTEGER DEFAULT 0,file_path TEXT DEFAULT '',file_name TEXT DEFAULT '',"
+        "file_mime TEXT DEFAULT '',file_bytes INTEGER DEFAULT 0,has_video INTEGER DEFAULT 0,"
+        "video_path TEXT DEFAULT '',video_name TEXT DEFAULT '',video_cover TEXT DEFAULT '',"
+        "video_seconds INTEGER DEFAULT 0,video_bytes INTEGER DEFAULT 0,"
+        "quote_msg_id TEXT DEFAULT '',quote_sender TEXT DEFAULT '',quote_digest TEXT DEFAULT '',quote_kind TEXT DEFAULT '');",
+        nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(history);
+    void* mobile = maiMobileAgentCreate();
+    CHECK(mobile != nullptr);
+    const auto cleanup = [&] {
+        maiMobileAgentDestroy(mobile);
+        MaiFileSystem::removeRecursively(workspace);
+    };
+    try {
+        CHECK(call(mobile, {{"op", "configure"}, {"database", ":memory:"}, {"workspace", workspace.toUtf8()},
+                            {"baseUrl", "http://127.0.0.1:1"}, {"apiKey", "owned-unused"}, {"model", "test"}})["ok"] == true);
+        const auto activated = call(mobile, {{"op", "im_session_binding"}, {"action", "activate"},
+            {"sdk_app_id", "100"}, {"owner_id", "owned-account"}, {"auth_generation", "1"},
+            {"friends", Json::array({"owned-peer"})},
+            {"history_source", {{"profile", "desktop"}, {"path", historyPath}, {"provenance", "owner_only_legacy"}}}});
+        CHECK(activated["ok"] == true && activated["has_bindings"] == false);
+        const auto scope = activated.at("scope");
+        const auto bridge = activated.at("bridge_id");
+        const auto request = [&](Json values) {
+            values["op"] = "im_session_binding";
+            values["scope"] = scope;
+            values["bridge_id"] = bridge;
+            return call(mobile, values);
+        };
+        const std::string session = call(mobile, {{"op", "create"}}).at("id");
+        const auto bound = request({{"action", "bind"}, {"peer_id", "owned-peer"}, {"session_id", session},
+                                    {"expected_workspace_key", MaiFileSystem::resolve(workspace).toUtf8()}});
+        CHECK(bound["ok"] == true && bound["has_bindings"] == true);
+        CHECK(bound["bindings"].size() == 1);
+        const auto epoch = bound["bindings"][0].at("epoch");
+        CHECK(bound["history_tasks"].size() == 1);
+        const auto task = bound["history_tasks"][0];
+        const auto snapshot = callIMHistorySnapshot({{"action", "open"}, {"task", task}});
+        CHECK(snapshot["ok"] == true);
+        const auto snapshotId = snapshot.at("snapshot_id");
+        CHECK(request({{"action", "history_opened"}, {"task", task}, {"snapshot_id", snapshotId}})["ok"] == true);
+        const auto page = callIMHistorySnapshot({{"action", "read"}, {"snapshot_id", snapshotId}});
+        CHECK(page["ok"] == true && page["records"].empty() && page["has_more"] == false);
+        CHECK(request({{"action", "history_chunk"}, {"task", task}, {"page", page}})["page_accepted"] == true);
+        CHECK(callIMHistorySnapshot({{"action", "close"}, {"snapshot_id", snapshotId}})["ok"] == true);
+        CHECK(request({{"action", "list"}})["bindings"][0]["history_state"] == "ready");
+        Json input{{"action", "admit"}, {"bridge_id", bridge}, {"scope", scope}, {"peer_id", "owned-peer"},
+            {"message_id", "owned-live-message"}, {"sender_id", "owned-peer"}, {"recipient_id", "owned-account"},
+            {"expected_binding_epoch", epoch}, {"expected_session_id", session}, {"origin", "human"},
+            {"live", true}, {"group", false}, {"control_frame", false}, {"has_content", true}};
+        const auto admitted = callSessionIMControl(input);
+        CHECK(admitted["ok"] == true && admitted["accepted"] == true);
+        CHECK(sqlite3_open(historyPath.c_str(), &history) == SQLITE_OK);
+        CHECK(sqlite3_exec(history,
+            "INSERT INTO messages(id,from_user,to_user,peer,direction,status,text,created_at) "
+            "VALUES('owned-live-message','owned-peer','owned-account','owned-peer',0,1,"
+            "'owned input, never submitted',1);", nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(history);
+        CHECK(callSessionIMControl({{"action", "persisted_input"}, {"bridge_id", bridge}, {"scope", scope},
+            {"input_id", admitted.at("input_id")}, {"inserted", true}, {"source_row_id", "owned-live-message"}})["ok"] == true);
+        input["action"] = "receive";
+        input["input_id"] = admitted.at("input_id");
+        input["text"] = "owned input, never submitted";
+        input.erase("has_content");
+        CHECK(request(input)["accepted"] == true);
+        CHECK(request({{"action", "list"}})["pending_count"] == 1);
+        const auto revoked = callSessionIMControl({{"action", "takeover"}, {"bridge_id", bridge},
+            {"scope", scope}, {"session_id", session}});
+        CHECK(revoked["ok"] == true);
+        const auto pumped = request({{"action", "pump"}});
+        CHECK(pumped["ok"] == true && pumped["has_bindings"] == false && pumped["pending_count"] == 0);
+        CHECK(pumped["deliveries"].empty());
+        CHECK(call(mobile, {{"op", "messages_page"}, {"session", session}, {"limit", 1}})["messages"].empty());
+        CHECK(call(mobile, {{"op", "suggest_replies"}, {"messages", Json::array({{{"text", "unused"}}})}})["errorCode"] == "invalid_input");
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+    cleanup();
+    std::puts("PASS: Session IM C ABI scope, live admission and immediate no-handle takeover without model or SDK calls");
+}
+
 int main(int argc, char** argv) {
+    const bool sessionIMOnly = argc == 2 && std::strcmp(argv[1], "--session-im-binding-only") == 0;
+    if (argc == 1 || sessionIMOnly) {
+        try { sessionIMCabiContract(); }
+        catch (const std::exception& error) {
+            std::fprintf(stderr, "FAIL: Session IM C ABI contract: %s\n", error.what());
+            return 1;
+        }
+        if (sessionIMOnly) return 0;
+    }
     const bool historyOnly = argc == 2 && std::strcmp(argv[1], "--message-history-host-only") == 0;
     if (argc == 1 || historyOnly) {
         try { messageHistoryHostContract(); }
@@ -1481,18 +1601,6 @@ int main(int argc, char** argv) {
         const Json body = Json::parse(request.body);
         CHECK(request.get_header_value("Authorization") == "Bearer test-key");
         CHECK(body["messages"].front()["role"] == "system");
-        const bool replySuggestion = body["messages"].front()["content"].get<std::string>().find(
-                                         "reply suggestions") != std::string::npos;
-        if (replySuggestion) {
-            CHECK(!body.contains("tools"));
-            response.set_content(
-                frame({{"content",
-                        R"({"natural":"好的","casual":"收到 😄","professional":"已收到，我会尽快处理。"})"}},
-                      "stop") +
-                    "data: [DONE]\n\n",
-                "text/event-stream");
-            return;
-        }
         CHECK(body["messages"].front()["content"].get<std::string>().find(
                   "GitHub-Flavored Markdown") != std::string::npos);
         const std::string instructions = body["messages"].front()["content"].get<std::string>();
@@ -1798,13 +1906,13 @@ int main(int argc, char** argv) {
         config["supportsScreenCapture"] = true;
 #endif
         CHECK(call(agent, config)["ok"] == true);
-        const Json suggestions = call(
+        // 旧独立回复生成链已删除：不得绕开 Session/普通审批另发模型请求。
+        const Json removedSuggestion = call(
             agent,
             {{"op", "suggest_replies"},
              {"messages", Json::array({{{"speaker", "friend"}, {"text", "今天能完成吗？"}}})}});
-        CHECK(suggestions["natural"] == "好的");
-        CHECK(suggestions["casual"] == "收到 😄");
-        CHECK(suggestions["professional"] == "已收到，我会尽快处理。");
+        CHECK(removedSuggestion["ok"] == false);
+        CHECK(removedSuggestion["errorCode"] == "invalid_input");
         const int initialHostCalls = hostProbe.calls.load();
         std::string session = call(agent, {{"op", "create"}}).at("id");
         CHECK(localSessionChanges.load() > 0);

@@ -6,6 +6,126 @@ import XCTest
 import SQLite3
 
 final class LocalChatHistoryStoreTests: XCTestCase {
+    func testSameSDKMessageRetryClearsOnlyItsFailureDebt() async throws {
+        let fence = IMIngressPersistenceFence(), generation = UUID()
+        fence.activate(accountTag: "owned", generation: generation)
+        let failed = try XCTUnwrap(fence.begin(accountTag: "owned", generation: generation, peerID: "target", sourceID: "sdk:one"))
+        fence.finish(failed, persisted: false)
+        // Re-registering the same trusted source is idempotent, not a magic success reset.
+        fence.activate(accountTag: "owned", generation: generation)
+        let other = try XCTUnwrap(fence.begin(accountTag: "owned", generation: generation, peerID: "target", sourceID: "sdk:two"))
+        fence.finish(other, persisted: true)
+        XCTAssertThrowsError(try fence.capture(accountTag: "owned", peerID: "target"))
+        let repaired = try XCTUnwrap(fence.begin(accountTag: "owned", generation: generation, peerID: "target", sourceID: "sdk:one"))
+        fence.finish(repaired, persisted: true)
+        let complete = try fence.capture(accountTag: "owned", peerID: "target")
+        try await fence.wait(complete, deadline: DispatchTime.now().uptimeNanoseconds + 100_000_000)
+    }
+
+    func testMetadataFailureBeforeCaptureRemainsDebtUntilActualWriterRepair() async throws {
+        let directory = makeTemporaryDirectoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let writer = LocalChatHistoryStore(baseDirectoryURL: directory).makePersistence()
+        try await writer.prepareDatabase()
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(directory.appendingPathComponent("messages.sqlite3").path, &handle), SQLITE_OK)
+        let blocker = try XCTUnwrap(handle)
+        defer { sqlite3_close(blocker) }
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN IMMEDIATE", nil, nil, nil), SQLITE_OK)
+        let fence = IMIngressPersistenceFence(), generation = UUID()
+        fence.activate(accountTag: "owned", generation: generation)
+        let ticket = try XCTUnwrap(fence.begin(accountTag: "owned", generation: generation, peerID: "target"))
+        let message = RemoteIMMessage(remoteID: "owned-failed-write", fromUserID: "target", toUserID: "owner",
+            text: "owned metadata", direction: .incoming, status: .received, createdAt: Date())
+        do {
+            _ = try await writer.insertIncomingMetadata(message, sdkAppID: 1, ownerUserID: "owner")
+            XCTFail("owned failure writer unexpectedly committed")
+        } catch { fence.finish(ticket, persisted: false) }
+        // Failure happened before capture, not only while an existing waiter was already active.
+        do {
+            let capture = try fence.capture(accountTag: "owned", peerID: "target")
+            try await fence.wait(capture, deadline: DispatchTime.now().uptimeNanoseconds + 100_000_000)
+            XCTFail("failed metadata before capture disappeared from persistence debt")
+        } catch {}
+        XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK", nil, nil, nil), SQLITE_OK)
+        let committed = try await writer.insertIncomingMetadata(message, sdkAppID: 1, ownerUserID: "owner")
+        XCTAssertTrue(committed.inserted)
+        fence.finish(ticket, persisted: true)
+        let repaired = try fence.capture(accountTag: "owned", peerID: "target")
+        try await fence.wait(repaired, deadline: DispatchTime.now().uptimeNanoseconds + 100_000_000)
+    }
+
+    func testMetadataFenceWaitsForEarlierRowsAndRejectsOldLogin() async throws {
+        let fence = IMIngressPersistenceFence(), generation = UUID()
+        fence.activate(accountTag: "owned-A", generation: generation)
+        let first = try XCTUnwrap(fence.begin(accountTag: "owned-A", generation: generation, peerID: "target"))
+        let captured = try fence.capture(accountTag: "owned-A", peerID: "target")
+        let later = try XCTUnwrap(fence.begin(accountTag: "owned-A", generation: generation, peerID: "target"))
+        fence.finish(first, persisted: true)
+        // A later raw message may remain pending; the captured watermark must not wait for an endless stream.
+        try await fence.wait(captured, deadline: DispatchTime.now().uptimeNanoseconds + 100_000_000)
+        let awaitingLater = try fence.capture(accountTag: "owned-A", peerID: "target")
+        fence.finish(later, persisted: false)
+        do {
+            try await fence.wait(awaitingLater, deadline: DispatchTime.now().uptimeNanoseconds + 100_000_000)
+            XCTFail("failed DB metadata was treated as a complete fence")
+        } catch {}
+        fence.finish(later, persisted: true)
+        let old = try fence.capture(accountTag: "owned-A", peerID: "target")
+        fence.activate(accountTag: "owned-B", generation: UUID())
+        do {
+            try await fence.wait(old, deadline: DispatchTime.now().uptimeNanoseconds + 100_000_000)
+            XCTFail("old login fence adopted new owner")
+        } catch {}
+    }
+
+    func testRawMetadataWriterUsesActualDatabaseMembershipAcrossUIReload() async throws {
+        let root = makeTemporaryDirectoryURL()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LocalChatHistoryStore(baseDirectoryURL: root), sdk = 1_600_148_979
+        let first = RemoteIMMessage(remoteID: "owned-sdk-stable", fromUserID: "target", toUserID: "ios-master",
+            text: "owned original", direction: .incoming, status: .received,
+            createdAt: Date(timeIntervalSince1970: 1000.123))
+        let initial = try await store.makePersistence().insertIncomingMetadata(first, sdkAppID: sdk, ownerUserID: "ios-master")
+        XCTAssertTrue(initial.inserted)
+        // A separate reader/writer object and an empty UI cache must still classify replay from SQLite.
+        let replay = RemoteIMMessage(remoteID: first.remoteID, fromUserID: "target", toUserID: "ios-master",
+            text: "must not overwrite original", direction: .incoming, status: .received, createdAt: Date())
+        let second = try await LocalChatHistoryStore(baseDirectoryURL: root).makePersistence()
+            .insertIncomingMetadata(replay, sdkAppID: sdk, ownerUserID: "ios-master")
+        XCTAssertFalse(second.inserted)
+        XCTAssertEqual(second.message.id, first.id)
+        XCTAssertEqual(second.message.text, first.text)
+        let page = try await store.makePersistence().queryMessages(sdkAppID: sdk, ownerUserID: "ios-master", generation: 1,
+            request: LocalChatMessageQuery(filters: LocalChatMessageFilters(peerID: "target")))
+        XCTAssertEqual(page.hits.count, 1)
+        let other = RemoteIMMessage(remoteID: first.remoteID, fromUserID: "target", toUserID: "other-owner",
+            text: "owned B", direction: .incoming, status: .received, createdAt: Date())
+        let otherResult = try await store.makePersistence().insertIncomingMetadata(other, sdkAppID: sdk, ownerUserID: "other-owner")
+        XCTAssertTrue(otherResult.inserted)
+    }
+
+    func testRawMetadataKeepsUnavailableMediaAndLocalIDWithoutInventingRemoteID() async throws {
+        let root = makeTemporaryDirectoryURL()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let missing = root.appendingPathComponent("not-downloaded.png")
+        let message = RemoteIMMessage(fromUserID: "target", toUserID: "ios-master", text: "[图片消息]",
+            imageAttachment: RemoteIMImageAttachment(localFilePath: missing.path, width: 600, height: 400, sizeBytes: 123),
+            direction: .incoming, status: .received, createdAt: Date())
+        let store = LocalChatHistoryStore(baseDirectoryURL: root)
+        let receipt = try await store.makePersistence().insertIncomingMetadata(message, sdkAppID: 1_600_148_979, ownerUserID: "ios-master")
+        XCTAssertTrue(receipt.inserted)
+        XCTAssertNil(receipt.message.remoteID)
+        XCTAssertEqual(receipt.message.id, message.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+        let replay = try await store.makePersistence().insertIncomingMetadata(message, sdkAppID: 1_600_148_979, ownerUserID: "ios-master")
+        XCTAssertFalse(replay.inserted)
+        XCTAssertEqual(replay.message.imageAttachment?.width, 600)
+        let page = try await store.makePersistence().queryMessages(sdkAppID: 1_600_148_979, ownerUserID: "ios-master", generation: 1,
+            request: LocalChatMessageQuery(filters: LocalChatMessageFilters(peerID: "target")))
+        XCTAssertEqual(page.hits.map(\.kind), ["image"])
+    }
+
     func testPersistedIMQueryLargeHistoryUsesIndexesAndAllowsConcurrentWrites() async throws {
         let root = makeTemporaryDirectoryURL()
         defer { try? FileManager.default.removeItem(at: root) }

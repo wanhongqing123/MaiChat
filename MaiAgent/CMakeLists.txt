@@ -613,6 +613,8 @@ if(MAIAGENT_BUILD_TESTS)
       MaiTextFileReaderTests # 单句柄流式分页、真实 EOF、编码和字节游标
       MaiFileSearchTests    # 热目录快照、完整行检索、安全正则和可续页结果
       MaiStoreTests         # 存储契约：内存和 SQLite 行为必须一致
+      MaiContextImportTests # 外部上下文隐藏暂存、幂等和原子来源替换，不执行模型
+      MaiContextImportPurgeTests # 只回收过时导入副本，保留当前/普通消息
       MaiToolOutputStoreTests # 会话输出的保留、分页、配额及重开恢复
       MaiToolOutputReadTests # 原命令只执行一次，模型补读及重开后尾部恢复
       MaiToolExecutionTests # 执行事实、恢复动作、回灌顺序及元数据身份
@@ -694,6 +696,10 @@ if(MAIAGENT_BUILD_TESTS)
   endif()
   target_link_libraries(MaiLlamaModelCapabilitiesTests PRIVATE mai_llama)
   target_include_directories(MaiStoreTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
+  target_include_directories(MaiContextImportTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
+  target_include_directories(MaiContextImportPurgeTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)
   target_include_directories(MaiToolOutputStoreTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite)

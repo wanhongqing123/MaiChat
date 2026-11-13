@@ -14,8 +14,10 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
-public final class RemoteIMSessionController {
+public final class RemoteIMSessionController implements MaiSessionIMBindingService.Host {
     static final String FALLBACK_OWNER_USER_ID = "android-user";
     static final String DEFAULT_CONTACT_USER_ID = "mac-office";
     private static final long SESSION_CHECK_INTERVAL_MS = 30_000L;
@@ -101,6 +103,7 @@ public final class RemoteIMSessionController {
     private final MaiChatAuthClient authClient;
     private final LocalChatHistoryStore legacyHistoryStore;
     private final AndroidChatHistoryStore historyStore;
+    private final AndroidIMIngressWriter ingressWriter;
     private final TencentIMClient client;
     private final RemoteIMGroupCreationCoordinator groupCreation;
     private final RemoteDesktopController remoteDesktop;
@@ -158,6 +161,9 @@ public final class RemoteIMSessionController {
     private final Map<String, Integer> pageRequests = new HashMap<>();
     private final Map<String, Integer> peerEpochs = new HashMap<>();
     private final java.util.Set<String> acceptedFriendUserIds = new java.util.HashSet<>();
+    private volatile java.util.Set<String> bindingFriendSnapshot = Collections.emptySet();
+    private volatile boolean acceptedFriendsLoaded;
+    private volatile MaiSessionIMBindingService sessionIMBindings;
     private final java.util.Set<String> pendingFriendSyncUserIds = new java.util.HashSet<>();
     private final Map<String, String> friendAccountByIm = new HashMap<>();
     private final Map<String, String> friendDisplayByIm = new HashMap<>();
@@ -223,6 +229,7 @@ public final class RemoteIMSessionController {
         this.authClient = null;
         this.legacyHistoryStore = historyStore;
         this.historyStore = null;
+        this.ingressWriter = null;
         this.client = null;
         this.groupCreation = null;
         this.remoteDesktop = null;
@@ -243,6 +250,7 @@ public final class RemoteIMSessionController {
         this.authClient = MaiChatAuthClient.shared(applicationContext);
         this.legacyHistoryStore = null;
         this.historyStore = new AndroidChatHistoryStore(applicationContext);
+        this.ingressWriter = new AndroidIMIngressWriter(this.historyStore, ioExecutor);
         this.listener = listener;
         this.mainHandler = new Handler(Looper.getMainLooper());
         this.productionMode = true;
@@ -348,6 +356,7 @@ public final class RemoteIMSessionController {
         settings = next;
         imCredential = null;
         acceptedFriendUserIds.clear();
+        bindingFriendSnapshot = Collections.emptySet(); acceptedFriendsLoaded = false;
         pendingFriendSyncUserIds.clear();
         friendAccountByIm.clear();
         friendDisplayByIm.clear();
@@ -1592,6 +1601,7 @@ public final class RemoteIMSessionController {
                 List<MaiChatAuthClient.FriendInfo> friends = authClient.friends();
                 runOnMain(() -> {
                     if (generation != accountGeneration || requiresLogin()) return;
+                    acceptedFriendsLoaded = true;
                     List<String> added = new ArrayList<>();
                     acceptedFriendUserIds.clear();
                     pendingFriendSyncUserIds.clear();
@@ -1951,18 +1961,61 @@ public final class RemoteIMSessionController {
         return message;
     }
 
-    public void sendMachineText(String userId, String text) {
-        if (!productionMode) return;
-        client.sendText(userId, text, RemoteIMOrigin.MACHINE, new TencentIMClient.SendCompletion() {
-            @Override
-            public void onSuccess(String remoteId, long createdAtMillis) {
-            }
-
-            @Override
-            public void onError(int code, String message) {
-                reportError(message);
-            }
-        });
+    /** SDK 交付适配：Native claim/dispatch ack 与网络回执分开，绝不重发不确定结果。 */
+    @Override public void delivery(JSONObject value, MaiSessionIMBindingService.Backend backend) {
+        JSONObject owned = MaiSessionIMBindingService.copy(value);
+        JSONObject scope = owned.optJSONObject("scope");
+        String peer = owned.optString("peer_id");
+        int generation = accountGeneration;
+        java.util.concurrent.atomic.AtomicBoolean acknowledged = new java.util.concurrent.atomic.AtomicBoolean();
+        Runnable ack = () -> {
+            if (acknowledged.compareAndSet(false, true)) backend.control(AIAssistantController.controlDelivery("ack", owned));
+        };
+        java.util.function.BooleanSupplier current = () -> generation == accountGeneration && current(scope, peer);
+        if (!current.getAsBoolean() || client == null) { ack.run(); return; }
+        long sdkEpoch = client.sessionIMLoginEpoch();
+        try {
+            ioExecutor.execute(() -> MaiSessionIMOutgoing.prepareAndDispatch(appContext, owned, current, ack,
+                error -> runHistoryCompletion(() -> { if (current.getAsBoolean()) reportError(error); }), prepared -> {
+                java.util.concurrent.atomic.AtomicBoolean issued = new java.util.concurrent.atomic.AtomicBoolean();
+                client.sendSessionIM(scope.optString("owner_id"), sdkEpoch, current,
+                    () -> {
+                        JSONObject claim = backend.control(AIAssistantController.controlDelivery("claim", owned));
+                        return claim.optBoolean("ok") && claim.optBoolean("allowed");
+                    }, prepared.message, prepared.exactBody,
+                    () -> {
+                        issued.set(true);
+                        runHistoryCompletion(() -> {
+                            if (!current.getAsBoolean()) return;
+                            chatState.mergeMessages(Collections.singletonList(prepared.message));
+                            persistMessage(prepared.message); notifyStateChanged();
+                        });
+                    }, ack,
+                    new TencentIMClient.SendCompletion() {
+                        @Override public void onSuccess(String remoteId, long createdAtMillis) {
+                            runHistoryCompletion(() -> {
+                                if (!current.getAsBoolean()) return;
+                                RemoteIMMessage source = prepared.message;
+                                RemoteIMMessage sent = new RemoteIMMessage(source.id(), remoteId, source.fromUserId(),
+                                    source.toUserId(), source.text(), RemoteIMMessage.Direction.OUTGOING, RemoteIMMessage.Status.SENT,
+                                    createdAtMillis, source.imageAttachment(), null, source.fileAttachment(), source.videoAttachment(),
+                                    RemoteIMOrigin.MACHINE);
+                                chatState.updateMessageDelivery(source.id(), remoteId);
+                                persistMessage(sent); notifyStateChanged();
+                            });
+                        }
+                        @Override public void onError(int code, String error) {
+                            if (!issued.get()) { prepared.discard(); return; }
+                            runHistoryCompletion(() -> {
+                                if (!current.getAsBoolean()) return;
+                                if (code != -2) chatState.updateMessageStatus(prepared.message.id(), RemoteIMMessage.Status.FAILED);
+                                persistMessage(prepared.message); notifyStateChanged();
+                                reportError(error);
+                            });
+                        }
+                    });
+            }));
+        } catch (java.util.concurrent.RejectedExecutionException closed) { ack.run(); }
     }
 
     public RemoteIMMessage sendImageMessage(
@@ -2468,12 +2521,61 @@ public final class RemoteIMSessionController {
         };
     }
 
-    private void receive(RemoteIMMessage incoming) {
-        if (incoming == null || requiresLogin()) return;
-        if (!chatState.ownerUserId().equals(incoming.toUserId())) return;
+    private void receive(RemoteIMMessage incoming) { receive(incoming, null); }
+
+    private boolean ingressCurrent(RemoteIMIngress.Metadata metadata, int generation, long authGeneration) {
+        return productionMode && !destroyed && !requiresLogin() && generation == accountGeneration && authClient != null
+            && authGeneration == authClient.accountSessionGeneration() && settings.loginUserId().equals(metadata.scope.ownerId)
+            && currentSdkAppId() == metadata.scope.sdkAppId && client != null && client.isIngressScopeCurrent(metadata.scope);
+    }
+
+    private java.util.concurrent.CompletableFuture<RemoteIMIngress.Stored> persistRawIncoming(RemoteIMIngress.Metadata metadata) {
+        java.util.concurrent.CompletableFuture<RemoteIMIngress.Stored> unavailable = new java.util.concurrent.CompletableFuture<>();
+        if (ingressWriter == null || authClient == null) {
+            unavailable.completeExceptionally(new IllegalStateException("本机历史 writer 不可用")); return unavailable;
+        }
+        int generation = accountGeneration; long authGeneration = authClient.accountSessionGeneration();
+        java.util.function.BooleanSupplier current = () -> ingressCurrent(metadata, generation, authGeneration);
+        java.util.concurrent.CompletableFuture<RemoteIMIngress.Stored> saved = ingressWriter.initial(metadata, current);
+        saved.thenAccept(receipt -> {
+            if (!receipt.inserted) return;
+            runHistoryCompletion(() -> {
+                if (!current.getAsBoolean() || !receipt.isCurrent()) return;
+                RemoteIMMessage initial = metadata.message();
+                applyIncomingMessage(initial, activities.get(initial.fromUserId()), true);
+            });
+        });
+        return saved;
+    }
+
+    private void receiveTracked(RemoteIMMessage incoming, TencentIMClient.IncomingTicket ticket) {
+        ticket.stored.whenComplete((receipt, failure) -> {
+            if (failure != null || receipt == null || ingressWriter == null) return;
+            java.util.function.BooleanSupplier current = () -> !destroyed && !requiresLogin() && receipt.isCurrent()
+                && client != null && client.isIngressScopeCurrent(ticket.metadata.scope)
+                && settings.loginUserId().equals(ticket.metadata.scope.ownerId) && currentSdkAppId() == ticket.metadata.scope.sdkAppId;
+            if (!current.getAsBoolean()) { ticket.abandoned("canceled"); return; }
+            ingressWriter.enrich(ticket.metadata, receipt, incoming.snapshot(), current).whenComplete((ready, error) -> {
+                if (error != null) { ticket.abandoned("preparation_failed"); return; }
+                runHistoryCompletion(() -> {
+                    if (!current.getAsBoolean()) return;
+                    if (chatState.enrichPersistedMessage(ready)) notifyStateChanged();
+                });
+            });
+        });
+    }
+
+    private void receive(RemoteIMMessage incoming, TencentIMClient.LiveAdmission admission) {
+        if (admission instanceof TencentIMClient.IncomingTicket) {
+            receiveTracked(incoming, (TencentIMClient.IncomingTicket) admission); return;
+        }
+        if (incoming == null || requiresLogin() || !chatState.ownerUserId().equals(incoming.toUserId())) {
+            if (admission != null) admission.abandoned(); return;
+        }
         if (incoming.text() != null
             && remoteDesktop != null
             && remoteDesktop.handleIncomingText(incoming.fromUserId(), incoming.text())) {
+            if (admission != null) admission.abandoned();
             return;
         }
         String owner = chatState.ownerUserId();
@@ -2481,20 +2583,29 @@ public final class RemoteIMSessionController {
         int peerEpoch = peerEpochs.getOrDefault(incoming.fromUserId(), 0);
         RemoteIMActivitySignal replacedActivity = activities.get(incoming.fromUserId());
         enqueueIO(() -> {
-            boolean duplicate =
-                    !incoming.remoteId().isEmpty() && historyStore.containsRemoteId(owner, incoming.remoteId());
+            boolean duplicate;
+            try { duplicate = !incoming.remoteId().isEmpty() && historyStore.containsRemoteId(owner, incoming.remoteId()); }
+            catch (Exception failed) {
+                if (admission != null) admission.abandoned();
+                throw failed;
+            }
             runOnMain(() -> {
                 if (duplicate || generation != accountGeneration
-                    || peerEpoch != peerEpochs.getOrDefault(incoming.fromUserId(), 0)) return;
-                if (!incoming.remoteId().isEmpty() && chatState.messageWithRemoteId(incoming.remoteId()) != null)
-                    return;
+                    || peerEpoch != peerEpochs.getOrDefault(incoming.fromUserId(), 0)
+                    || !incoming.remoteId().isEmpty() && chatState.messageWithRemoteId(incoming.remoteId()) != null) {
+                    if (admission != null) admission.abandoned(); return;
+                }
                 applyIncomingMessage(incoming, replacedActivity);
+                if (admission != null) admission.persisted(acceptedFriendUserIds.contains(incoming.fromUserId()));
             });
         });
     }
 
     // 作用：将入站消息与会话历史、未读数和活动状态合并。
     private void applyIncomingMessage(RemoteIMMessage incoming, RemoteIMActivitySignal replacedActivity) {
+        applyIncomingMessage(incoming, replacedActivity, false);
+    }
+    private void applyIncomingMessage(RemoteIMMessage incoming, RemoteIMActivitySignal replacedActivity, boolean persisted) {
         RemoteIMVideoAttachment preparedVideo = pendingVideoMedia.remove(incoming.remoteId());
         if (preparedVideo != null && incoming.videoAttachment() != null)
             incoming = incoming.withVideoAttachment(preparedVideo);
@@ -2507,7 +2618,10 @@ public final class RemoteIMSessionController {
         int previousMessageCount = chatState.messages().size();
 
         RemoteIMMessage message;
-        if (incoming.imageAttachment() != null) {
+        if (persisted) {
+            if (!knownContact) chatState.upsertContact(new RemoteIMContact(incoming.fromUserId(), incoming.fromUserId()));
+            chatState.addRestoredMessage(incoming); message = incoming;
+        } else if (incoming.imageAttachment() != null) {
             RemoteIMImageAttachment image = incoming.imageAttachment();
             message = chatState.receiveImage(
                 image.localPath(),
@@ -2576,8 +2690,8 @@ public final class RemoteIMSessionController {
         boolean wasInserted = chatState.messages().size() > previousMessageCount;
         RemoteIMContact contact = findContact(incoming.fromUserId());
         persistContact(contact);
-        persistMessage(message);
-        if (!visibleConversationUserId.equals(incoming.fromUserId())) {
+        if (!persisted) persistMessage(message);
+        if (wasInserted && !visibleConversationUserId.equals(incoming.fromUserId())) {
             unreadByUserId.put(
                 incoming.fromUserId(),
                 unreadByUserId.getOrDefault(incoming.fromUserId(), 0) + 1
@@ -2665,6 +2779,8 @@ public final class RemoteIMSessionController {
     }
 
     private void notifyStateChanged() {
+        if (mainHandler == null || Looper.myLooper() == Looper.getMainLooper()) publishSessionIMIdentity();
+        else mainHandler.post(this::publishSessionIMIdentity);
         if (listener == null) return;
         if (mainHandler == null) {
             listener.onStateChanged();
@@ -2680,6 +2796,62 @@ public final class RemoteIMSessionController {
         };
         if (Looper.myLooper() == Looper.getMainLooper()) schedule.run();
         else mainHandler.post(schedule);
+    }
+
+    private void publishSessionIMIdentity() {
+        bindingFriendSnapshot = Collections.unmodifiableSet(new java.util.HashSet<>(acceptedFriendUserIds));
+        MaiSessionIMBindingService target = sessionIMBindings;
+        if (target != null) target.updateAccount();
+    }
+
+    public void setSessionIMBindings(MaiSessionIMBindingService bindings) {
+        sessionIMBindings = bindings;
+        if (bindings != null) publishSessionIMIdentity();
+    }
+
+    public JSONObject activation() {
+        if (!productionMode || destroyed || requiresLogin() || !acceptedFriendsLoaded || currentSdkAppId() <= 0
+                || authClient.accountSessionGeneration() <= 0 || !client.isLoggedInAs(settings.loginUserId())) return null;
+        JSONObject value = new JSONObject();
+        MaiSessionIMBindingService.put(value, "sdk_app_id", Integer.toString(currentSdkAppId()));
+        MaiSessionIMBindingService.put(value, "owner_id", settings.loginUserId());
+        MaiSessionIMBindingService.put(value, "auth_generation", Long.toString(authClient.accountSessionGeneration()));
+        List<String> friends = new ArrayList<>(bindingFriendSnapshot);
+        Collections.sort(friends);
+        MaiSessionIMBindingService.put(value, "friends", new JSONArray(friends));
+        JSONObject source = new JSONObject();
+        MaiSessionIMBindingService.put(source, "profile", "android");
+        MaiSessionIMBindingService.put(source, "path", appContext.getDatabasePath(historyStore.getDatabaseName()).getAbsolutePath());
+        MaiSessionIMBindingService.put(source, "provenance", "owner_only_legacy");
+        MaiSessionIMBindingService.put(value, "history_source", source);
+        return value;
+    }
+
+    @Override public void publishIngressState(Runnable publication) {
+        if (client == null) publication.run(); else client.publishIngressState(publication);
+    }
+
+    @Override public RemoteIMIngress.Fence historyFence(JSONObject task) {
+        JSONObject scope = task.optJSONObject("scope"); String peer = task.optString("peer_id");
+        if (ingressWriter == null || client == null || !current(scope, peer))
+            throw new java.util.concurrent.CancellationException("历史绑定身份已变化");
+        int generation = accountGeneration; long epoch = client.sessionIMLoginEpoch();
+        RemoteIMIngress.Scope sdk = new RemoteIMIngress.Scope(currentSdkAppId(), settings.loginUserId(), epoch);
+        java.util.function.BooleanSupplier current = () -> generation == accountGeneration && current(scope, peer)
+            && client.isIngressScopeCurrent(sdk);
+        return client.captureIngressFence(sdk).afterWriter(() -> ingressWriter.fence(current)).requireCurrent(current);
+    }
+
+    public boolean current(JSONObject scope, String peer) {
+        return scope != null && productionMode && !destroyed && !requiresLogin() && acceptedFriendsLoaded
+            && settings.loginUserId().equals(scope.optString("owner_id"))
+            && Integer.toString(currentSdkAppId()).equals(scope.optString("sdk_app_id"))
+            && Long.toString(authClient.accountSessionGeneration()).equals(scope.optString("auth_generation"))
+            && (peer.isEmpty() || bindingFriendSnapshot.contains(peer));
+    }
+
+    @Override public void warning(String value) {
+        reportError(value == null ? "会话绑定处理未完成" : value.substring(0, Math.min(200, value.length())));
     }
 
     private void reportError(String message) {
@@ -2787,6 +2959,30 @@ public final class RemoteIMSessionController {
         @Override
         public void onIncomingMessage(RemoteIMMessage message) {
             runOnMain(() -> receive(message));
+        }
+
+        @Override public TencentIMClient.LiveAdmission captureLiveAdmission(String sender, String recipient,
+                String messageId, RemoteIMOrigin origin, boolean controlFrame, boolean hasContent) {
+            MaiSessionIMBindingService target = sessionIMBindings;
+            return target == null ? null : target.capture(sender, recipient, messageId, origin, controlFrame, hasContent);
+        }
+
+        @Override public TencentIMClient.LiveAuthority captureLiveAuthority() {
+            MaiSessionIMBindingService target = sessionIMBindings;
+            return target == null ? (sender, recipient, id, origin, control, content) -> null : target.captureAuthority();
+        }
+
+        @Override public java.util.concurrent.CompletableFuture<RemoteIMIngress.Stored> persistRawMetadata(RemoteIMIngress.Metadata metadata) {
+            return persistRawIncoming(metadata);
+        }
+
+        @Override public void onRawPersistenceFailure(RemoteIMIngress.Scope scope) {
+            if (!destroyed && !requiresLogin() && client != null && client.isIngressScopeCurrent(scope)
+                    && settings.loginUserId().equals(scope.ownerId)) reportError("本机消息元数据保存失败，请检查本机存储");
+        }
+
+        @Override public void onIncomingMessage(RemoteIMMessage message, TencentIMClient.LiveAdmission admission) {
+            runOnMain(() -> receive(message, admission));
         }
 
         @Override public void onGroupMembershipChanged() {

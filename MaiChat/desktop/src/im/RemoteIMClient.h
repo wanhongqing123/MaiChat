@@ -253,6 +253,15 @@ signals:
     // 实时推送通道（RecvNewMsg）：与 messagesReceived 同构（携带稳定 SDK 消息 id
     // 供落库去重），区别是真正的新入站消息会累计会话未读红点。
     void liveMessagesReceived(const QList<RemoteIMMessage>& messages);
+    // Live C2C metadata is announced before an attachment download. Readiness
+    // carries the same opaque ingress id; history never uses this channel.
+    void liveMessageAnnounced(quint64 ingressId, const RemoteIMMessage& message,
+                               quint64 rawSequence = 0, quint64 rawGeneration = 0);
+    void liveMessageReady(quint64 ingressId, const RemoteIMMessage& message);
+    void liveMessageFailed(quint64 ingressId, const QString& error);
+    // Captured at raw SDK callback ingress, before queued Main parsing. A batch
+    // completes only after every supported element's metadata signal returned.
+    void liveMetadataBatchFinished(quint64 sequence, bool parsed, quint64 rawGeneration = 0);
     void activityReceived(const QString& fromUserId, const RemoteIMActivitySignal& signal);
     void incomingText(const QString& fromUserId, const QString& text);
     void incomingImage(const QString& fromUserId, const QString& localPath, int width, int height, qint64 sizeBytes);
@@ -263,4 +272,16 @@ signals:
 
 protected:
     RemoteDiagnostics::EvidenceLog evidence_;
+
+public:
+    struct LiveMetadataBoundary { quint64 generation = 0; quint64 sequence = 0; };
+    // Immediate transports use the application's synchronous announce/ready
+    // adapter. SDK transports override this when media becomes ready later.
+    virtual bool hasExplicitLiveReadiness() const { return false; }
+    virtual quint64 liveMetadataSequence() const { return 0; }
+    // Transport provenance only. SDK implementations share their tiny raw
+    // receipt/post mutex with publication; callbacks must do no SQL/signals/I/O.
+    virtual void withLiveMetadataBoundary(const std::function<void(LiveMetadataBoundary)>& publish) {
+        publish({0, liveMetadataSequence()});
+    }
 };

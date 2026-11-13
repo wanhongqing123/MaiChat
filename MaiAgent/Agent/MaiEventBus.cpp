@@ -26,6 +26,7 @@ const char* maiEventTypeToString(MaiEventType type) {
         case MaiEventType::PermissionReplied: return "permission.replied";
         case MaiEventType::QuestionAsked: return "question.asked";
         case MaiEventType::QuestionAnswered: return "question.answered";
+        case MaiEventType::ContextImported: return "session.context.imported";
     }
     return "session.status";
 }

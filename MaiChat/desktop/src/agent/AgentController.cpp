@@ -975,6 +975,10 @@ void AgentController::onEventQueued(const MaiEvent& event) {
             return;
         }
 
+        case MaiEventType::ContextImported:
+            emit contextImported(sessionId);
+            return;
+
         case MaiEventType::SessionIdle:
             // 一轮结束，这一轮的片段表可以丢了。不丢的话长会话会一直涨。
             runtime_->partKindsBySession.remove(sessionId);

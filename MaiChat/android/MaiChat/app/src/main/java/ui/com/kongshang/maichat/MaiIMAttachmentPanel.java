@@ -17,7 +17,7 @@ import java.util.function.Consumer;
 
 /** Mirrors the iOS IM attachment grid; the host owns dismissal, permissions and account checks. */
 public final class MaiIMAttachmentPanel extends LinearLayout {
-    public enum Action { ALBUM, CAMERA, FILE, VOICE_INPUT, AI_REPLY }
+    public enum Action { ALBUM, CAMERA, FILE, VOICE_INPUT, SESSION_BINDING }
 
     private final EnumMap<Action, View> tiles = new EnumMap<>(Action.class);
     private final Consumer<Action> listener;
@@ -38,7 +38,7 @@ public final class MaiIMAttachmentPanel extends LinearLayout {
             new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         LayoutParams second = new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
         second.topMargin = dp(14);
-        addView(row(Action.AI_REPLY), second);
+        addView(row(Action.SESSION_BINDING), second);
     }
 
     private LinearLayout row(Action... actions) {
@@ -85,10 +85,13 @@ public final class MaiIMAttachmentPanel extends LinearLayout {
         ImageView icon = new ImageView(getContext());
         icon.setImageResource(icon(action));
         icon.setColorFilter(color, PorterDuff.Mode.SRC_IN);
-        icon.setPadding(dp(2), dp(2), dp(2), dp(2));
+        int inset = action == Action.SESSION_BINDING ? 0 : dp(2);
+        icon.setPadding(inset, inset, inset, inset);
         icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
         icon.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
-        iconBox.addView(icon, new FrameLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+        // 绑定入口沿用 iOS 旧回复入口的三颗星、25dp 图标及同一紫色背景，不保留旧独立回复能力。
+        int iconSize = action == Action.SESSION_BINDING ? dp(25) : LayoutParams.MATCH_PARENT;
+        iconBox.addView(icon, new FrameLayout.LayoutParams(iconSize, iconSize, Gravity.CENTER));
         tile.addView(iconBox, new LayoutParams(dp(36), dp(36)));
         TextView label = MaiChatTheme.text(getContext(), title(action), MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
         label.setGravity(Gravity.CENTER);
@@ -117,7 +120,7 @@ public final class MaiIMAttachmentPanel extends LinearLayout {
             case CAMERA: return "拍摄";
             case FILE: return "文件";
             case VOICE_INPUT: return "语音输入";
-            case AI_REPLY: return "AI 帮我回复";
+            case SESSION_BINDING: return "绑定会话";
             default: throw new IllegalArgumentException("Unknown IM attachment action");
         }
     }
@@ -128,7 +131,7 @@ public final class MaiIMAttachmentPanel extends LinearLayout {
             case CAMERA: return R.drawable.ic_feature_camera;
             case FILE: return R.drawable.ic_ai_file;
             case VOICE_INPUT: return R.drawable.ic_im_attachment_voice;
-            case AI_REPLY: return R.drawable.ic_ai_sparkles;
+            case SESSION_BINDING: return R.drawable.ic_ai_sparkles;
             default: throw new IllegalArgumentException("Unknown IM attachment action");
         }
     }
@@ -139,7 +142,7 @@ public final class MaiIMAttachmentPanel extends LinearLayout {
             case CAMERA: return Color.rgb(20, 166, 125);
             case FILE: return Color.rgb(232, 143, 59);
             case VOICE_INPUT: return Color.rgb(10, 161, 184);
-            case AI_REPLY: return Color.rgb(130, 92, 224);
+            case SESSION_BINDING: return Color.rgb(130, 92, 224);
             default: throw new IllegalArgumentException("Unknown IM attachment action");
         }
     }

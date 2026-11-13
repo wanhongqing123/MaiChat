@@ -210,6 +210,8 @@ signals:
     // 会话标题变了（第一轮结束后会用用户那句话自动填上）。
     void sessionTitleChanged(const QString& sessionId, const QString& title);
     void sessionStructureChanged();
+    // Imported quoted context is a store refresh, never a live user/turn receipt.
+    void contextImported(const QString& sessionId);
 
 private:
     bool submitPrompt(const QString& sessionId, const QString& text, const QStringList& imagePaths,

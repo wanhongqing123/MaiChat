@@ -8,6 +8,51 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public final class AIAssistantPreparationJobsTest {
+    @Test public void guardedLocalCopyKeepsControlResponsiveAndPrefixCancelClosesTheSource() throws Exception {
+        ExecutorService control = Executors.newSingleThreadExecutor(), io = Executors.newSingleThreadExecutor();
+        AIAssistantPreparationJobs jobs = new AIAssistantPreparationJobs(control, io);
+        CountDownLatch reading = new CountDownLatch(1), closed = new CountDownLatch(1), tick = new CountDownLatch(1), completed = new CountDownLatch(1);
+        AtomicInteger submitted = new AtomicInteger();
+        java.io.InputStream blocked = new java.io.InputStream() {
+            @Override public int read() throws java.io.IOException {
+                reading.countDown();
+                try { if (!closed.await(3, TimeUnit.SECONDS)) throw new java.io.IOException("fixture read timed out"); }
+                catch (InterruptedException canceled) { throw new java.io.IOException(canceled); }
+                throw new java.io.IOException("fixture stream closed");
+            }
+            @Override public void close() { closed.countDown(); }
+        };
+        try {
+            jobs.start("session-im:session:1", 1, () -> 1, cancel -> {
+                try (java.io.InputStream input = AIAssistantPreparationJobs.guard(blocked, cancel, () -> true,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(30))) { input.read(); }
+                return new JSONObject();
+            }, (value, failure) -> { if (failure == null) submitted.incrementAndGet(); completed.countDown(); });
+            assertTrue(reading.await(2, TimeUnit.SECONDS));
+            control.execute(tick::countDown); assertTrue(tick.await(500, TimeUnit.MILLISECONDS));
+            jobs.cancelPrefix("session-im:session:");
+            assertTrue(closed.await(500, TimeUnit.MILLISECONDS)); assertTrue(completed.await(2, TimeUnit.SECONDS));
+            assertEquals(0, submitted.get());
+        } finally { blocked.close(); jobs.close().get(2, TimeUnit.SECONDS); control.shutdownNow(); }
+    }
+
+    @Test public void expiredPreparationDeadlineCannotReadOrMarkMediaReady() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        java.io.InputStream source = new java.io.InputStream() { @Override public int read() { reads.incrementAndGet(); return -1; } };
+        try (java.io.InputStream guarded = AIAssistantPreparationJobs.guard(source,
+                new AIAssistantPreparationJobs.Cancellation(), () -> true, System.nanoTime() - 1)) {
+            assertThrows(java.io.IOException.class, guarded::read); assertEquals(0, reads.get());
+        }
+    }
+
+    @Test public void changedPreparationOwnerCannotReadTheSource() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        java.io.InputStream source = new java.io.InputStream() { @Override public int read() { reads.incrementAndGet(); return -1; } };
+        try (java.io.InputStream guarded = AIAssistantPreparationJobs.guard(source,
+                new AIAssistantPreparationJobs.Cancellation(), () -> false, Long.MAX_VALUE)) {
+            assertThrows(CancellationException.class, guarded::read); assertEquals(0, reads.get());
+        }
+    }
     @Test public void blockedUploadDoesNotBlockStopOrAnotherInputOnTheControlQueue() throws Exception {
         ExecutorService control = Executors.newSingleThreadExecutor(), io = Executors.newFixedThreadPool(2);
         AIAssistantPreparationJobs jobs = new AIAssistantPreparationJobs(control, io);

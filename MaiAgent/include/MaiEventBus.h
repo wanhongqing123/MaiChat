@@ -32,6 +32,8 @@ enum class MaiEventType {
     // 模型中途问了用户一句，正等着回答。
     QuestionAsked,
     QuestionAnswered,
+    // 外部上下文快照已原子发布。不是新用户输入/assistant 回执，不触发自动执行。
+    ContextImported,
 };
 
 // 转成 "message.part.delta" 这类线上字符串。

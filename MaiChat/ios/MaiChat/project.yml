@@ -85,6 +85,7 @@ targets:
     sources:
       - path: MaiChatTests
       - path: MaiChat/IM/LocalChatHistoryStore.swift
+      - path: MaiChat/IM/IMIngressPersistenceFence.swift
       - path: MaiChat/Chat/MarkdownInlineStyling.swift
       - path: MaiChat/Settings/AppTypography.swift
       - path: MaiChat/Settings/AppFontAssets.swift

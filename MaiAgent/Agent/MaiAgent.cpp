@@ -239,10 +239,18 @@ struct MaiAgent::Runtime {
     size_t liveWorkers = 0;
     std::unordered_map<std::string, std::shared_ptr<ActiveTurn>> active;
     std::set<std::string> startingSessions;
+    // commit 仅短暂预占启动边界；磁盘事务在 Runtime 锁外执行。
+    std::set<std::string> contextCommittingSessions;
     std::unordered_map<std::string, std::deque<MaiMessage>> inputQueues;
     std::set<std::string> loadedInputQueues;
     std::set<std::string> pausedInputs;
     bool stopping = false;
+    // 可复制的导入能力只弱引用 Runtime。关闭标志在门面析构的第一步撤销，
+    // 不等待已开始的数据库操作；事件计数仅覆盖快速同步回调交接。
+    std::atomic<bool> contextImportOwnerOpen{true};
+    std::mutex contextImportEventMutex;
+    std::condition_variable contextImportEventFinished;
+    std::size_t contextImportEvents = 0;
     // 结束后的请求仍能幂等重试，但凭据不能随聊天历史无限增长。
     std::deque<SteeringReceipt> recentSteering;
     // 被 close_agent 收掉的子 Agent。只是不再占名额，消息一条不删。
@@ -259,9 +267,105 @@ struct MaiAgent::Runtime {
         stopActiveTurns();
     }
 
+    bool canImportContext() const {
+        if (!contextImportOwnerOpen.load(std::memory_order_acquire)) return false;
+        std::lock_guard<std::mutex> lock(mutex);
+        return !stopping && contextImportOwnerOpen.load(std::memory_order_acquire);
+    }
+
+    void revokeContextImportOwner() {
+        std::unique_lock<std::mutex> lock(contextImportEventMutex);
+        contextImportOwnerOpen.store(false, std::memory_order_release);
+        contextImportEventFinished.wait(lock, [this] { return contextImportEvents == 0; });
+    }
+
+    void emitContextImported(const std::string& sessionId, const std::string& importId) {
+        {
+            std::lock_guard<std::mutex> lock(contextImportEventMutex);
+            if (!contextImportOwnerOpen.load(std::memory_order_acquire)) return;
+            ++contextImportEvents;
+        }
+        struct EventHandoff {
+            Runtime& runtime;
+            ~EventHandoff() {
+                std::lock_guard<std::mutex> lock(runtime.contextImportEventMutex);
+                --runtime.contextImportEvents;
+                runtime.contextImportEventFinished.notify_all();
+            }
+        } handoff{*this};
+        // 不持有 Runtime、存储或事件交接锁调用订阅者。门面关闭先撤销新交接，
+        // 再等待已经进入的短回调完成；不会为等待 SQLite 而阻塞门面关闭。
+        emitter.emitSession(MaiEventType::ContextImported, sessionId, importId);
+    }
+
+    MaiResult<MaiContextImportProgress> beginContextImport(const MaiContextImportSpec& spec) {
+        if (!canImportContext()) return {MaiErrorCode::Canceled, "Context import owner is closed."};
+        if (const auto error = maiValidateContextImportSpec(spec)) return error;
+        MaiSession session;
+        if (!store->getSession(spec.sessionId, session))
+            return {MaiErrorCode::NotFound, "Context import session is unavailable."};
+        if (!session.isRoot())
+            return {MaiErrorCode::InvalidInput, "External context requires a root session."};
+        auto result = store->beginContextImport(spec);
+        if (result && !contextImportOwnerOpen.load(std::memory_order_acquire)) {
+            // 重建者可能已完成启动清理；不能把迟到的 stage0 留给新 owner 永久等待。
+            store->abortContextImport(result.value().importId);
+            return {MaiErrorCode::Canceled, "Context import owner closed while staging began."};
+        }
+        return result;
+    }
+
+    MaiResult<MaiContextImportProgress> appendContextImport(
+        const std::string& importId, std::uint64_t sequence,
+        const std::vector<MaiContextImportRecord>& records) {
+        if (!canImportContext()) return {MaiErrorCode::Canceled, "Context import owner is closed."};
+        auto result = store->appendContextImport(importId, sequence, records);
+        if (result && !contextImportOwnerOpen.load(std::memory_order_acquire)) {
+            store->abortContextImport(importId);
+            return {MaiErrorCode::Canceled, "Context import owner closed while staging a batch."};
+        }
+        return result;
+    }
+
+    MaiResult<MaiContextImportProgress> commitContextImport(const std::string& importId) {
+        if (!canImportContext()) return {MaiErrorCode::Canceled, "Context import owner is closed."};
+        const auto before = store->inspectContextImport(importId);
+        if (!before || before.value().committed) return before;
+        const auto sessionId = before.value().sessionId;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!contextImportOwnerOpen.load(std::memory_order_acquire) || stopping)
+                return {MaiErrorCode::Canceled, "Context import owner is closed."};
+            if (active.count(sessionId) || startingSessions.count(sessionId))
+                return {MaiErrorCode::Busy,
+                        "Stop the active turn before publishing external context."};
+            startingSessions.insert(sessionId);
+            contextCommittingSessions.insert(sessionId);
+        }
+        auto result = store->commitContextImport(importId);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            contextCommittingSessions.erase(sessionId);
+            startingSessions.erase(sessionId);
+        }
+        if (result) emitContextImported(sessionId, importId);
+        return result;
+    }
+
+    MaiError abortContextImport(const std::string& importId) {
+        if (!canImportContext()) return {MaiErrorCode::Canceled, "Context import owner is closed."};
+        return store->abortContextImport(importId);
+    }
+
+    MaiResult<MaiContextImportPurgeResult> purgeContextImports(const std::string& sessionId,
+                                                               std::size_t maxMessages) {
+        if (!canImportContext()) return {MaiErrorCode::Canceled, "Context import owner is closed."};
+        return store->purgeContextImports(sessionId, maxMessages);
+    }
+
     void stopActiveTurns() {
-        // unique_ptr 析构会先清空 MaiAgent::mRuntime，再执行 Runtime 析构。
-        // 因此 MaiAgent 析构体里也要先调用这里，让工作线程仍能安全访问 mRuntime。
+        // 门面析构先显式停掉原有轮次，让捕获门面的旧 worker 在门面仍有效时结束。
+        // 暂存能力只能延长单次存储依赖，不能留下仍调用门面的模型/Host 任务。
         std::vector<std::shared_ptr<ActiveTurn>> pending;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -465,13 +569,60 @@ struct MaiAgent::Runtime {
     }
 };
 
+struct MaiContextImportWorker::Impl {
+    std::weak_ptr<MaiAgent::Runtime> runtime;
+    explicit Impl(const std::shared_ptr<MaiAgent::Runtime>& value) : runtime(value) {}
+};
+
+MaiContextImportWorker::MaiContextImportWorker(std::shared_ptr<Impl> implementation)
+    : mImplementation(std::move(implementation)) {}
+
+MaiResult<MaiContextImportProgress> MaiContextImportWorker::beginContextImport(
+    const MaiContextImportSpec& spec) const {
+    const auto runtime = mImplementation ? mImplementation->runtime.lock() : nullptr;
+    if (!runtime) return {MaiErrorCode::Canceled, "Context import owner is closed."};
+    return runtime->beginContextImport(spec);
+}
+
+MaiResult<MaiContextImportProgress> MaiContextImportWorker::appendContextImport(
+    const std::string& importId, std::uint64_t sequence,
+    const std::vector<MaiContextImportRecord>& records) const {
+    const auto runtime = mImplementation ? mImplementation->runtime.lock() : nullptr;
+    if (!runtime) return {MaiErrorCode::Canceled, "Context import owner is closed."};
+    return runtime->appendContextImport(importId, sequence, records);
+}
+
+MaiResult<MaiContextImportProgress> MaiContextImportWorker::commitContextImport(
+    const std::string& importId) const {
+    const auto runtime = mImplementation ? mImplementation->runtime.lock() : nullptr;
+    if (!runtime) return {MaiErrorCode::Canceled, "Context import owner is closed."};
+    return runtime->commitContextImport(importId);
+}
+
+MaiError MaiContextImportWorker::abortContextImport(const std::string& importId) const {
+    const auto runtime = mImplementation ? mImplementation->runtime.lock() : nullptr;
+    if (!runtime) return {MaiErrorCode::Canceled, "Context import owner is closed."};
+    return runtime->abortContextImport(importId);
+}
+
+MaiResult<MaiContextImportPurgeResult> MaiContextImportWorker::purgeContextImports(
+    const std::string& sessionId, std::size_t maxMessages) const {
+    const auto runtime = mImplementation ? mImplementation->runtime.lock() : nullptr;
+    if (!runtime) return {MaiErrorCode::Canceled, "Context import owner is closed."};
+    return runtime->purgeContextImports(sessionId, maxMessages);
+}
+
+MaiContextImportWorker MaiAgent::contextImportWorker() const {
+    return MaiContextImportWorker(std::make_shared<MaiContextImportWorker::Impl>(mRuntime));
+}
+
 MaiAgent::MaiAgent(std::unique_ptr<MaiSessionStore> store, std::unique_ptr<MaiModelClient> model,
                    std::unique_ptr<MaiToolRegistry> tools)
     : MaiAgent(std::move(store), std::move(model), std::move(tools), Options{}) {}
 
 MaiAgent::MaiAgent(std::unique_ptr<MaiSessionStore> store, std::unique_ptr<MaiModelClient> model,
                    std::unique_ptr<MaiToolRegistry> tools, Options options)
-    : mRuntime(std::make_unique<Runtime>()) {
+    : mRuntime(std::make_shared<Runtime>()) {
     // 这个指针在构造函数里就设好：turn runner 每次都从 Runtime 现取依赖，
     // 设晚了会有一轮拿到空的。
     mRuntime->owner = this;
@@ -500,13 +651,20 @@ MaiAgent::MaiAgent(std::unique_ptr<MaiSessionStore> store, std::unique_ptr<MaiMo
                 // 第三方工具也可能抛出非标准异常，仍须隔离在本次查询内。
             }
             std::unique_lock<std::mutex> lock(mRuntime->specialistMutex);
-            mRuntime->specialistWake.wait_for(lock, std::chrono::seconds(15));
+            // 关闭可能发生在 poll 内：在同一等待锁下检查再入睡，不能丢掉关闭通知。
+            // 普通任务通知仍能提前结束等待，不能改成只接受 stop 的谓词等待。
+            if (!mRuntime->stopSpecialists.load(std::memory_order_relaxed))
+                mRuntime->specialistWake.wait_for(lock, std::chrono::seconds(15));
         }
     });
 }
 
 MaiAgent::~MaiAgent() {
-    mRuntime->stopSpecialists.store(true, std::memory_order_relaxed);
+    mRuntime->revokeContextImportOwner();
+    {
+        std::lock_guard<std::mutex> lock(mRuntime->specialistMutex);
+        mRuntime->stopSpecialists.store(true, std::memory_order_relaxed);
+    }
     mRuntime->specialistWake.notify_all();
     if (mRuntime->specialistWorker.joinable()) mRuntime->specialistWorker.join();
     mRuntime->stopActiveTurns();
@@ -638,7 +796,10 @@ void MaiAgent::forwardSpecialistReply(const MaiSpecialistTask& task) {
     auto turn = std::make_shared<ActiveTurn>();
     {
         std::lock_guard<std::mutex> lock(mRuntime->mutex);
-        if (mRuntime->active.count(task.ownerSessionId)) return;
+        // 后台通知同样必须尊重普通发送/上下文发布的启动预占，不能绕过 Session 空闲边界。
+        if (mRuntime->stopping || mRuntime->active.count(task.ownerSessionId) ||
+            mRuntime->startingSessions.count(task.ownerSessionId))
+            return;
         mRuntime->active[task.ownerSessionId] = turn;
     }
     const auto reservation = mRuntime->store->reserveSpecialistNotification(
@@ -924,6 +1085,29 @@ bool MaiAgent::getSession(const std::string& id, MaiSession& out) const {
 
 std::vector<MaiMessage> MaiAgent::listMessages(const std::string& sessionId) const {
     return mRuntime->store->listMessages(sessionId);
+}
+
+MaiResult<MaiContextImportProgress> MaiAgent::beginContextImport(const MaiContextImportSpec& spec) {
+    return contextImportWorker().beginContextImport(spec);
+}
+
+MaiResult<MaiContextImportProgress> MaiAgent::appendContextImport(
+    const std::string& importId, std::uint64_t sequence,
+    const std::vector<MaiContextImportRecord>& records) {
+    return contextImportWorker().appendContextImport(importId, sequence, records);
+}
+
+MaiResult<MaiContextImportProgress> MaiAgent::commitContextImport(const std::string& importId) {
+    return contextImportWorker().commitContextImport(importId);
+}
+
+MaiError MaiAgent::abortContextImport(const std::string& importId) {
+    return contextImportWorker().abortContextImport(importId);
+}
+
+MaiResult<MaiContextImportPurgeResult> MaiAgent::purgeContextImports(const std::string& sessionId,
+                                                                     std::size_t maxMessages) {
+    return contextImportWorker().purgeContextImports(sessionId, maxMessages);
 }
 
 std::vector<MaiMessage> MaiAgent::listMessagesPage(const std::string& sessionId,
@@ -1334,6 +1518,8 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                     std::lock_guard<std::mutex> lock(mRuntime->mutex);
                     if (mRuntime->stopping)
                         return {MaiErrorCode::Canceled, "the Agent is stopping"};
+                    if (mRuntime->contextCommittingSessions.count(prompt.sessionId))
+                        return {MaiErrorCode::Busy, "External context is being published."};
                     if (!mRuntime->store->getSession(prompt.sessionId, session))
                         return {MaiErrorCode::NotFound, "session not found"};
                     MaiMessage previous;
@@ -1404,9 +1590,10 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
 
                 {
                     std::lock_guard<std::mutex> lock(mRuntime->mutex);
-                    if (mRuntime->options.rejectWhenBusy &&
-                        (mRuntime->active.count(operation.sessionId) ||
-                         mRuntime->startingSessions.count(operation.sessionId)))
+                    if (mRuntime->contextCommittingSessions.count(operation.sessionId) ||
+                        (mRuntime->options.rejectWhenBusy &&
+                         (mRuntime->active.count(operation.sessionId) ||
+                          mRuntime->startingSessions.count(operation.sessionId))))
                         return {MaiErrorCode::Busy, "a turn is already running for this session"};
                     mRuntime->startingSessions.insert(operation.sessionId);
                 }

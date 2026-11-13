@@ -44,6 +44,7 @@
     <file alias="settings-filled.svg">icons/tabler/settings-filled.svg</file>
     <file alias="arrow-up.svg">icons/tabler/arrow-up.svg</file>
     <file alias="terminal-2.svg">icons/tabler/terminal-2.svg</file>
+    <file alias="ai-sparkles.svg">icons/ai-sparkles.svg</file>
     <file alias="player-play.svg">icons/player-play.svg</file>
     <file alias="player-pause.svg">icons/player-pause.svg</file>
     <file alias="player-next.svg">icons/player-next.svg</file>

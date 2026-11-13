@@ -711,6 +711,14 @@ public final class ChatState {
         messages.add(message);
     }
 
+    /** 已持久化的同记录就绪丰富不新增气泡、未读或窗口项；旧消息已离开窗口时只由普通历史加载恢复。 */
+    boolean enrichPersistedMessage(RemoteIMMessage message) {
+        for (int index = 0; index < messages.size(); index++) {
+            if (messages.get(index).id().equals(message.id())) { messages.set(index, message); return true; }
+        }
+        return false;
+    }
+
     public RemoteIMMessage updateVideoMedia(String remoteId, RemoteIMVideoAttachment attachment) {
         for (int index = 0; index < messages.size(); index++) {
             RemoteIMMessage message = messages.get(index);

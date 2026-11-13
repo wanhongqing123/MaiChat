@@ -3,6 +3,7 @@
 #include <QSet>
 #include <QElapsedTimer>
 #include <QCoreApplication>
+#include <QFileInfo>
 #include <QProcess>
 #include <QScopeGuard>
 #include <sqlite3.h>
@@ -92,6 +93,8 @@ class LocalMessageDatabaseTest : public QObject {
     Q_OBJECT
 
 private slots:
+    void metadataReceiptPrecedesReadyAndEnrichesSameRow();
+    void metadataFailureIsNotReportedAsDuplicate();
     void insertsAndDeduplicatesById();
     void persistsAcrossReopen();
     void loadsMessagesSortedByTime();
@@ -1277,4 +1280,48 @@ int main(int argc, char** argv) {
     LocalMessageDatabaseTest test;
     return QTest::qExec(&test, argc, argv);
 }
+void LocalMessageDatabaseTest::metadataReceiptPrecedesReadyAndEnrichesSameRow() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("owned-metadata.db"));
+    LocalMessageDatabase database(path);
+    QVERIFY(database.isOpen());
+    QVERIFY(!database.historyDatabasePath().isEmpty());
+    QCOMPARE(QFileInfo(database.historyDatabasePath()).canonicalFilePath(), QFileInfo(path).canonicalFilePath());
+    auto message = makeTextMessage(QStringLiteral("raw-media"), QStringLiteral("peer"), QStringLiteral("owner"),
+                                  RemoteIMMessageDirection::Incoming, 1000, QString());
+    message.hasImage = true;
+    auto inserted = database.persistMessageMetadata(message, QStringLiteral("peer"));
+    QVERIFY2(inserted.ok, qPrintable(inserted.error));
+    QVERIFY(inserted.inserted);
+    auto duplicate = database.persistMessageMetadata(message, QStringLiteral("peer"));
+    QVERIFY(duplicate.ok && !duplicate.inserted);
+    auto rows = database.loadRecentMessages(QStringLiteral("peer"), 10);
+    QCOMPARE(rows.size(), 1);
+    QVERIFY(rows.front().hasImage && rows.front().image.localPath.isEmpty());
+    message.image = {QStringLiteral("/owned/no-file-read.png"), 32, 24, 50};
+    auto ready = database.enrichMessageAttachments(message, QStringLiteral("peer"));
+    QVERIFY2(ready.ok, qPrintable(ready.error));
+    QVERIFY(!ready.inserted);
+    rows = database.loadRecentMessages(QStringLiteral("peer"), 10);
+    QCOMPARE(rows.size(), 1);
+    QCOMPARE(rows.front().image.localPath, message.image.localPath);
+    QCOMPARE(rows.front().image.width, 32);
+    message.fromUserId = QStringLiteral("different-peer");
+    QVERIFY(!database.enrichMessageAttachments(message, QStringLiteral("peer")).ok);
+    QCOMPARE(database.loadRecentMessages(QStringLiteral("peer"), 10).front().fromUserId, QStringLiteral("peer"));
+}
+
+void LocalMessageDatabaseTest::metadataFailureIsNotReportedAsDuplicate() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("owned-metadata-failure.db"));
+    LocalMessageDatabase database(path);
+    QVERIFY(database.isOpen());
+    SqlFixture schema(path);
+    QVERIFY(schema.exec(QStringLiteral("DROP TABLE messages")));
+    auto message = makeTextMessage(QStringLiteral("missing-table"), QStringLiteral("peer"), QStringLiteral("owner"),
+                                  RemoteIMMessageDirection::Incoming, 1000, QStringLiteral("owned"));
+    const auto failed = database.persistMessageMetadata(message, QStringLiteral("peer"));
+    QVERIFY(!failed.ok && !failed.inserted && !failed.error.isEmpty());
+}
+
 #include "LocalMessageDatabaseTest.moc"

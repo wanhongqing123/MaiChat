@@ -43,6 +43,51 @@ import java.util.Map;
 import java.util.UUID;
 
 public final class TencentIMClient {
+    /** 只携带最初 live 消息的宿主身份和媒体就绪条件；不承载路由、重试或发送队列。 */
+    public interface LiveAdmission {
+        void persisted(boolean inserted);
+        default void metadataPersisted(RemoteIMIngress.Stored stored) { persisted(stored.inserted); }
+        default void persistenceFailed() { abandoned(); }
+        void mediaReady(RemoteIMMessage message);
+        default void abandoned() { persisted(false); }
+        default void abandoned(String reason) { abandoned(); }
+    }
+    public interface LiveAuthority {
+        LiveAdmission admit(String sender, String recipient, String messageId,
+            RemoteIMOrigin origin, boolean controlFrame, boolean hasContent);
+    }
+
+    /** 原始 SDK 身份、实际 DB 首写回执与后续就绪回调共用的票据；不持有路由队列。 */
+    public static final class IncomingTicket implements LiveAdmission {
+        public final RemoteIMIngress.Metadata metadata;
+        public final java.util.concurrent.CompletableFuture<RemoteIMIngress.Stored> stored;
+        private final LiveAdmission binding;
+        private final java.util.function.BooleanSupplier current;
+        IncomingTicket(RemoteIMIngress.Metadata metadata, RemoteIMIngress.Registration registration, LiveAdmission binding,
+                java.util.function.BooleanSupplier current) {
+            this.metadata = metadata; this.stored = registration.persisted; this.binding = binding; this.current = current;
+        }
+        @Override public void persisted(boolean ignored) { /* 兼容普通就绪回调；首写资格只能由 metadataPersisted 的事务回执决定。 */ }
+        @Override public void metadataPersisted(RemoteIMIngress.Stored record) {
+            try {
+                if (binding != null) {
+                    if (record.isCurrent() && current.getAsBoolean()) binding.metadataPersisted(record); else binding.abandoned("canceled");
+                }
+            }
+            finally { stored.complete(record); }
+        }
+        @Override public void persistenceFailed() {
+            if (binding != null) binding.persistenceFailed();
+        }
+        @Override public void mediaReady(RemoteIMMessage message) {
+            RemoteIMIngress.Stored receipt = stored.getNow(null);
+            if (binding != null) {
+                if (receipt != null && receipt.isCurrent() && current.getAsBoolean()) binding.mediaReady(message);
+                else binding.abandoned("canceled");
+            }
+        }
+        @Override public void abandoned() { if (binding != null) binding.abandoned(); }
+    }
     public enum ConnectionState {
         DISCONNECTED,
         CONNECTING,
@@ -59,6 +104,17 @@ public final class TencentIMClient {
     public interface Listener {
         void onConnectionStateChanged(ConnectionState state, String detail);
         void onIncomingMessage(RemoteIMMessage message);
+        default LiveAdmission captureLiveAdmission(String sender, String recipient, String messageId,
+                RemoteIMOrigin origin, boolean controlFrame, boolean hasContent) { return null; }
+        default LiveAuthority captureLiveAuthority() { return this::captureLiveAdmission; }
+        default void onIncomingMessage(RemoteIMMessage message, LiveAdmission admission) {
+            onIncomingMessage(message);
+        }
+        default java.util.concurrent.CompletableFuture<RemoteIMIngress.Stored> persistRawMetadata(RemoteIMIngress.Metadata metadata) {
+            java.util.concurrent.CompletableFuture<RemoteIMIngress.Stored> failed = new java.util.concurrent.CompletableFuture<>();
+            failed.completeExceptionally(new IllegalStateException("No ordinary history writer is attached")); return failed;
+        }
+        default void onRawPersistenceFailure(RemoteIMIngress.Scope scope) { }
         default void onIncomingActivity(String sender, String recipient, RemoteIMActivitySignal signal) { }
         default void onVideoMediaUpdated(
                 String sender, String recipient, String remoteId, RemoteIMVideoAttachment attachment) {}
@@ -75,6 +131,12 @@ public final class TencentIMClient {
     public interface SendCompletion {
         void onSuccess(String remoteId, long createdAtMillis);
         void onError(int code, String message);
+    }
+
+    /** 普通 SDK 传输适配，可由离线宿主提供；不包含绑定、重试或模型策略。 */
+    interface MachineSdk {
+        V2TIMMessage create(RemoteIMMessage source, String exactBody);
+        void send(V2TIMMessage message, String peer, String metadata, V2TIMSendCallback<V2TIMMessage> completion);
     }
 
     public interface OperationCompletion {
@@ -167,13 +229,27 @@ public final class TencentIMClient {
     private volatile MaiChatAttachmentDownload.Scope mediaScope = new MaiChatAttachmentDownload.Scope();
     private final Listener listener;
     private final SelfProfileSdk selfProfileSdk;
+    private final MachineSdk machineSdk;
     private final java.util.concurrent.atomic.AtomicLong selfProfileEpoch =
         new java.util.concurrent.atomic.AtomicLong();
+    private final RemoteIMIngress.Tracker ingress = new RemoteIMIngress.Tracker();
     private final V2TIMAdvancedMsgListener messageListener = new V2TIMAdvancedMsgListener() {
         @Override
         public void onRecvNewMessage(V2TIMMessage message) {
             String owner = currentUserId;
-            sdkHandler.post(() -> { if (!closed && owner.equals(currentUserId)) handleIncomingMessage(message); });
+            long epoch = selfProfileEpoch.get();
+            IncomingTicket ticket;
+            try { ticket = captureRawIncoming(message); }
+            catch (RuntimeException invalid) { return; }
+            if (ticket == null) sdkHandler.post(() -> {
+                if (!closed && epoch == selfProfileEpoch.get() && owner.equals(currentUserId)) handleIncomingMessage(message, null);
+            });
+            else ticket.stored.whenComplete((record, failure) -> {
+                if (failure == null) sdkHandler.post(() -> {
+                    if (record.isCurrent() && isIngressScopeCurrent(ticket.metadata.scope)) handleIncomingMessage(message, ticket);
+                    else ticket.abandoned();
+                });
+            });
         }
     };
     private final V2TIMGroupListener groupListener = new V2TIMGroupListener() {
@@ -243,7 +319,7 @@ public final class TencentIMClient {
         }
     };
 
-    private Integer initializedSdkAppId;
+    private volatile Integer initializedSdkAppId;
     private volatile String currentUserId = "";
     private volatile boolean loginAcknowledged;
     private String profileRequestKey = "";
@@ -272,19 +348,223 @@ public final class TencentIMClient {
 
     TencentIMClient(Context context, Listener listener,
                     MaiChatAttachmentDownload.Transport mediaDownloader, SelfProfileSdk profileSdk) {
+        this(context, listener, mediaDownloader, profileSdk, ordinaryMachineSdk());
+    }
+
+    TencentIMClient(Context context, Listener listener,
+            MaiChatAttachmentDownload.Transport mediaDownloader, SelfProfileSdk profileSdk, MachineSdk machineSdk) {
         sdkThread.start(); sdkHandler = new android.os.Handler(sdkThread.getLooper());
         this.context = context.getApplicationContext();
         this.listener = listener;
         this.selfProfileSdk = profileSdk;
+        this.machineSdk = machineSdk;
         this.mediaDownloader = mediaDownloader;
         // 收到的媒体必须落在持久目录：放缓存目录的话，系统清缓存或用户手动清除之后，
         // 聊天记录里的图片视频就永远打不开了。
         this.mediaPaths = RemoteIMMediaPaths.forApp(context);
     }
 
+    private static MachineSdk ordinaryMachineSdk() {
+        return new MachineSdk() {
+            @Override public V2TIMMessage create(RemoteIMMessage source, String exactBody) {
+                V2TIMMessage message;
+                V2TIMElem attachment;
+                if (source.imageAttachment() != null) {
+                    message = V2TIMManager.getMessageManager().createImageMessage(source.imageAttachment().localPath());
+                    attachment = message == null ? null : message.getImageElem();
+                } else if (source.videoAttachment() != null) {
+                    RemoteIMVideoAttachment video = source.videoAttachment();
+                    String path = video.localPath(); int dot = path.lastIndexOf('.');
+                    message = V2TIMManager.getMessageManager().createVideoMessage(path,
+                        dot < 0 ? "mp4" : path.substring(dot + 1), video.durationSeconds(), video.coverPath());
+                    attachment = message == null ? null : message.getVideoElem();
+                } else if (source.fileAttachment() != null) {
+                    RemoteIMFileAttachment file = source.fileAttachment();
+                    message = V2TIMManager.getMessageManager().createFileMessage(file.localPath(), file.fileName());
+                    attachment = message == null ? null : message.getFileElem();
+                } else return V2TIMManager.getMessageManager().createTextMessage(exactBody);
+                if (attachment != null && !exactBody.isEmpty()) {
+                    V2TIMMessage caption = V2TIMManager.getMessageManager().createTextMessage(exactBody);
+                    if (caption == null || caption.getTextElem() == null) throw new IllegalStateException("媒体说明创建失败");
+                    attachment.appendElem(caption.getTextElem());
+                }
+                return message;
+            }
+            @Override public void send(V2TIMMessage message, String peer, String metadata,
+                    V2TIMSendCallback<V2TIMMessage> completion) {
+                message.setCloudCustomData(metadata);
+                V2TIMManager.getMessageManager().sendMessage(message, peer, null,
+                    V2TIMMessage.V2TIM_PRIORITY_DEFAULT, false, null, completion);
+            }
+        };
+    }
+
+    public long sessionIMLoginEpoch() { return selfProfileEpoch.get(); }
+
+    public boolean isIngressScopeCurrent(RemoteIMIngress.Scope scope) {
+        Integer sdk = initializedSdkAppId;
+        return scope != null && !closed && sdk != null && sdk == scope.sdkAppId
+            && scope.loginEpoch == selfProfileEpoch.get() && scope.ownerId.equals(currentUserId);
+    }
+
+    public RemoteIMIngress.Fence captureIngressFence(RemoteIMIngress.Scope scope) {
+        if (!isIngressScopeCurrent(scope)) throw new java.util.concurrent.CancellationException("SDK 入站身份已变化");
+        return ingress.fence(scope, () -> isIngressScopeCurrent(scope));
+    }
+
+    public void publishIngressState(Runnable publication) { ingress.publish(publication); }
+
+    private IncomingTicket captureRawIncoming(V2TIMMessage sdkMessage) {
+        Integer sdk = initializedSdkAppId;
+        RemoteIMIngress.Scope scope = sdk == null ? null : new RemoteIMIngress.Scope(sdk, currentUserId, selfProfileEpoch.get());
+        if (sdkMessage == null || scope == null || scope.sdkAppId <= 0 || scope.ownerId.isEmpty() || !isIngressScopeCurrent(scope)) return null;
+        RemoteIMIngress.Registration registration;
+        LiveAuthority authority;
+        synchronized (ingress) {
+            if (!isIngressScopeCurrent(scope)) return null;
+            registration = ingress.register(scope);
+            // 与 provisional 投影发布和 fence 捕获同一临界区，解析/DB/Native admit 均留在区外。
+            authority = listener.captureLiveAuthority();
+        }
+        LiveAdmission binding = null;
+        try {
+            IncomingElementParts parts = incomingElementParts(sdkMessage);
+            if (!clean(sdkMessage.getGroupID()).isEmpty() || sdkMessage.isSelf()
+                    || sdkMessage.getElemType() == V2TIMMessage.V2TIM_ELEM_TYPE_CUSTOM
+                    || RemoteDesktopSignal.isSignal(parts.caption)) {
+                registration.persisted.complete(new RemoteIMIngress.Stored("", "", 0, false)); return null;
+            }
+            String sender = clean(sdkMessage.getSender()); if (sender.isEmpty()) sender = clean(sdkMessage.getUserID());
+            boolean content = !parts.caption.isEmpty() || parts.image != null || parts.sound != null || parts.video != null || parts.file != null;
+            if (sender.isEmpty() || !content) {
+                registration.persisted.complete(new RemoteIMIngress.Stored("", "", 0, false)); return null;
+            }
+            String remoteId = clean(sdkMessage.getMsgID()), localId = UUID.randomUUID().toString();
+            long seconds = sdkMessage.getTimestamp();
+            long createdAt = seconds > 0 && seconds <= Long.MAX_VALUE / 1000 ? seconds * 1000L : System.currentTimeMillis();
+            RemoteIMProtocolMetadata.Metadata protocol = RemoteIMProtocolMetadata.decodeMetadata(sdkMessage.getCloudCustomData());
+            RemoteIMImageAttachment image = null; RemoteIMVoiceAttachment voice = null;
+            RemoteIMVideoAttachment video = null; RemoteIMFileAttachment file = null;
+            String mediaId = remoteId.isEmpty() ? localId : remoteId;
+            String text = parts.caption;
+            if (parts.image != null) {
+                V2TIMImageElem.V2TIMImage selected = null;
+                if (parts.image.getImageList() != null) for (V2TIMImageElem.V2TIMImage candidate : parts.image.getImageList())
+                    if (selected == null || imageScore(candidate) > imageScore(selected)) selected = candidate;
+                String id = selected == null ? mediaId : clean(selected.getUUID()); if (id.isEmpty()) id = mediaId;
+                File target = plannedMediaFile(RemoteIMMediaPaths.IMAGES, id, selected == null ? "jpg" : extension(selected.getUrl(), "jpg"));
+                image = new RemoteIMImageAttachment(target.getAbsolutePath(), selected == null ? 0 : selected.getWidth(),
+                    selected == null ? 0 : selected.getHeight(), selected == null ? 0 : selected.getSize());
+                if (text.isEmpty()) text = "[图片消息] " + target.getName();
+            } else if (parts.sound != null) {
+                String id = clean(parts.sound.getUUID()); if (id.isEmpty()) id = mediaId;
+                int duration = (int) Math.min(Integer.MAX_VALUE, Math.max(0L, parts.sound.getDuration()));
+                voice = new RemoteIMVoiceAttachment(plannedMediaFile(RemoteIMMediaPaths.VOICES, id, "m4a").getAbsolutePath(), duration);
+                if (text.isEmpty()) text = "[语音消息 " + duration + "s]";
+            } else if (parts.video != null) {
+                String id = clean(parts.video.getVideoUUID()); if (id.isEmpty()) id = mediaId;
+                video = new RemoteIMVideoAttachment(plannedMediaFile(RemoteIMMediaPaths.VIDEOS, id,
+                    extension(parts.video.getVideoPath(), "mp4")).getAbsolutePath(),
+                    plannedMediaFile(RemoteIMMediaPaths.VIDEO_COVERS, id + "-cover", "jpg").getAbsolutePath(),
+                    (int) Math.min(Integer.MAX_VALUE, Math.max(0L, parts.video.getDuration())),
+                    parts.video.getSnapshotWidth(), parts.video.getSnapshotHeight(), parts.video.getVideoSize());
+                if (text.isEmpty()) text = "[视频消息 " + video.durationSeconds() + "s]";
+            } else if (parts.file != null) {
+                String id = clean(parts.file.getUUID()); if (id.isEmpty()) id = mediaId;
+                String name = safeFileName(parts.file.getFileName(), "remote-im-file.bin");
+                file = new RemoteIMFileAttachment(plannedMediaFile(RemoteIMMediaPaths.FILES, id, extension(name, "bin")).getAbsolutePath(),
+                    name, mimeType(name), Math.max(0L, parts.file.getFileSize()));
+                if (text.isEmpty()) text = "[文件消息] " + name;
+            }
+            RemoteIMMessage initial = new RemoteIMMessage(localId, remoteId, sender, scope.ownerId, text,
+                RemoteIMMessage.Direction.INCOMING, RemoteIMMessage.Status.RECEIVED, createdAt, image, voice, file, video, protocol.origin());
+            initial.setQuote(protocol.quote()); initial.setCaptionAbove(protocol.captionAbove());
+            RemoteIMIngress.Metadata metadata = new RemoteIMIngress.Metadata(scope, registration.sequence, initial);
+            binding = authority.admit(sender, scope.ownerId, remoteId, protocol.origin(),
+                protocol.approvalRequest() != null || protocol.approvalDecision() != null, content);
+            IncomingTicket ticket = new IncomingTicket(metadata, registration, binding, () -> isIngressScopeCurrent(scope));
+            listener.persistRawMetadata(metadata).whenComplete((record, failure) -> {
+                if (failure != null || record == null || record.sourceRowId.isEmpty() || !isIngressScopeCurrent(scope)) {
+                    if (failure == null) failure = new java.util.concurrent.CancellationException("SDK 入站已变化");
+                    ticket.persistenceFailed(); registration.persisted.completeExceptionally(failure);
+                    if (!(failure instanceof java.util.concurrent.CancellationException)) listener.onRawPersistenceFailure(scope);
+                } else ticket.metadataPersisted(record);
+            });
+            return ticket;
+        } catch (Exception failure) {
+            if (binding != null) binding.persistenceFailed();
+            registration.persisted.completeExceptionally(failure); listener.onRawPersistenceFailure(scope);
+            throw new IllegalStateException("Raw incoming metadata was not persisted", failure);
+        }
+    }
+
+    private File plannedMediaFile(String kind, String remoteId, String extension) {
+        return new File(new File(new File(mediaPaths.root(), RemoteIMMediaPaths.INCOMING), kind),
+            safeFileName(remoteId, UUID.randomUUID().toString()) + "." + extension);
+    }
+
+    private File incomingMediaFile(LiveAdmission admission, String kind, String remoteId, String extension) {
+        if (!(admission instanceof IncomingTicket)) return mediaFile(kind, remoteId, extension);
+        RemoteIMMessage initial = ((IncomingTicket) admission).metadata.message();
+        String path = kind.equals(RemoteIMMediaPaths.IMAGES) && initial.imageAttachment() != null ? initial.imageAttachment().localPath()
+            : kind.equals(RemoteIMMediaPaths.VOICES) && initial.voiceAttachment() != null ? initial.voiceAttachment().localPath()
+            : kind.equals(RemoteIMMediaPaths.VIDEOS) && initial.videoAttachment() != null ? initial.videoAttachment().localPath()
+            : kind.equals(RemoteIMMediaPaths.VIDEO_COVERS) && initial.videoAttachment() != null ? initial.videoAttachment().coverPath()
+            : kind.equals(RemoteIMMediaPaths.FILES) && initial.fileAttachment() != null ? initial.fileAttachment().localPath() : "";
+        if (mediaPaths.toStoredPath(path).isEmpty()) return mediaFile(kind, remoteId, extension);
+        try { mediaPaths.directory(RemoteIMMediaPaths.INCOMING, kind); }
+        catch (IOException failed) { /* 普通下载回调报告失败；不能把目标改到另一个目录。 */ }
+        return new File(path);
+    }
+
+    /** claim 在线程内紧贴实际 SDK create/send；异步准备期间改号、好友移除或接管均不能发送。 */
+    public void sendSessionIM(String owner, long loginEpoch, java.util.function.BooleanSupplier current,
+            java.util.function.BooleanSupplier claim, RemoteIMMessage source, String exactBody,
+            Runnable sending, Runnable dispatched, SendCompletion completion) {
+        AtomicBoolean finished = new AtomicBoolean();
+        AtomicBoolean acknowledged = new AtomicBoolean();
+        Runnable acknowledge = () -> { if (acknowledged.compareAndSet(false, true)) dispatched.run(); };
+        Runnable dispatch = () -> {
+            try {
+                if (!current.getAsBoolean() || !selfProfileIdentityMatches(owner, loginEpoch)
+                        || source.origin() != RemoteIMOrigin.MACHINE || !claim.getAsBoolean()) {
+                    if (finished.compareAndSet(false, true)) completion.onError(-1, "会话绑定发送已失效"); return;
+                }
+                V2TIMMessage message = machineSdk.create(source, exactBody);
+                if (message == null || !current.getAsBoolean() || !selfProfileIdentityMatches(owner, loginEpoch)) {
+                    if (finished.compareAndSet(false, true)) completion.onError(-1, "登录身份或媒体已变化"); return;
+                }
+                sending.run();
+                machineSdk.send(message, source.toUserId(), RemoteIMProtocolMetadata.encode(RemoteIMOrigin.MACHINE),
+                    new V2TIMSendCallback<V2TIMMessage>() {
+                        @Override public void onProgress(int progress) { }
+                        @Override public void onSuccess(V2TIMMessage returned) {
+                            if (!finished.compareAndSet(false, true)) return;
+                            V2TIMMessage receipt = returned == null ? message : returned;
+                            String id = clean(receipt.getMsgID()); long seconds = receipt.getTimestamp();
+                            if (!current.getAsBoolean() || !selfProfileIdentityMatches(owner, loginEpoch)
+                                    || id.isEmpty() || seconds <= 0 || seconds > Long.MAX_VALUE / 1000)
+                                completion.onError(-2, "SDK 发送结果未知，未自动重发");
+                            else completion.onSuccess(id, seconds * 1000L);
+                        }
+                        @Override public void onError(int code, String description) {
+                            if (finished.compareAndSet(false, true)) completion.onError(code, safeError(description, "发送失败"));
+                        }
+                    });
+            } catch (Exception | LinkageError failure) {
+                if (finished.compareAndSet(false, true)) completion.onError(-1, "SDK 发送未完成");
+            } finally { acknowledge.run(); }
+        };
+        if (closed || !sdkHandler.post(dispatch)) {
+            if (finished.compareAndSet(false, true)) completion.onError(-1, "IM 已关闭");
+            acknowledge.run();
+        }
+    }
+
     public void connect(int sdkAppId, String userId, String userSig) {
         if (closed) return;
         final long epoch = selfProfileEpoch.incrementAndGet();
+        ingress.invalidate();
         loginAcknowledged = false;
         if (android.os.Looper.myLooper() != sdkThread.getLooper()) {
             sdkHandler.post(() -> connectOnSdk(sdkAppId, userId, userSig, epoch)); return;
@@ -357,6 +637,7 @@ public final class TencentIMClient {
     public void disconnect(OperationCompletion completion) {
         if (closed) return;
         selfProfileEpoch.incrementAndGet();
+        ingress.invalidate();
         loginAcknowledged = false;
         mediaScope.cancel();
         if (android.os.Looper.myLooper() != sdkThread.getLooper()) {
@@ -373,6 +654,7 @@ public final class TencentIMClient {
 
     public void destroy() {
         selfProfileEpoch.incrementAndGet();
+        ingress.invalidate();
         closed = true; currentUserId = "";
         loginAcknowledged = false;
         mediaScope.cancel();
@@ -1198,6 +1480,19 @@ public final class TencentIMClient {
     }
 
     void handleIncomingMessage(V2TIMMessage sdkMessage) {
+        IncomingTicket ticket;
+        try { ticket = captureRawIncoming(sdkMessage); }
+        catch (RuntimeException invalid) { return; }
+        if (ticket == null) handleIncomingMessage(sdkMessage, null);
+        else ticket.stored.whenComplete((record, failure) -> {
+            if (failure == null) sdkHandler.post(() -> {
+                if (record.isCurrent() && isIngressScopeCurrent(ticket.metadata.scope)) handleIncomingMessage(sdkMessage, ticket);
+                else ticket.abandoned("canceled");
+            });
+        });
+    }
+
+    private void handleIncomingMessage(V2TIMMessage sdkMessage, IncomingTicket ticket) {
         if (sdkMessage == null) {
             Log.w(TAG, "recv: null message from SDK; dropped");
             return;
@@ -1228,7 +1523,7 @@ public final class TencentIMClient {
             }
             return;
         }
-        long createdAt = sdkMessage.getTimestamp() > 0
+        long createdAt = ticket != null ? ticket.metadata.message().createdAtMillis() : sdkMessage.getTimestamp() > 0
             ? sdkMessage.getTimestamp() * 1000L
             : System.currentTimeMillis();
         String recipientUserId = currentUserId;
@@ -1237,34 +1532,36 @@ public final class TencentIMClient {
             RemoteIMProtocolMetadata.decodeMetadata(sdkMessage.getCloudCustomData());
         RemoteIMOrigin origin = metadata.origin();
         IncomingElementParts parts = incomingElementParts(sdkMessage);
+        // 必须在下载前捕获最初绑定 epoch，不能把旧图片/视频的迟到回调交给后来重新绑定的会话。
+        LiveAdmission admission = ticket;
 
         // 先遍历完整消息元素链再决定分支。文字排在前面的多元素消息仍可能有附件；
         // 只看 getTextElem() 就返回会静默丢失该附件。
         if (parts.image != null) {
             downloadImage(
                 sdkMessage, parts.image, fromUserId, recipientUserId, createdAt, origin,
-                parts.caption, metadata.captionAbove(), metadata.quote()
+                parts.caption, metadata.captionAbove(), metadata.quote(), admission
             );
             return;
         }
         if (parts.sound != null) {
             downloadVoice(
                 sdkMessage, parts.sound, fromUserId, recipientUserId, createdAt, origin,
-                metadata.quote()
+                metadata.quote(), admission
             );
             return;
         }
         if (parts.video != null) {
             downloadVideo(
                 sdkMessage, parts.video, fromUserId, recipientUserId, createdAt, origin,
-                parts.caption, metadata.captionAbove(), metadata.quote()
+                parts.caption, metadata.captionAbove(), metadata.quote(), admission
             );
             return;
         }
         if (parts.file != null) {
             downloadFile(
                 sdkMessage, parts.file, fromUserId, recipientUserId, createdAt, origin,
-                parts.caption, metadata.captionAbove(), metadata.quote()
+                parts.caption, metadata.captionAbove(), metadata.quote(), admission
             );
             return;
         }
@@ -1292,7 +1589,7 @@ public final class TencentIMClient {
                 metadata.approvalDecision()
             );
             incoming.setQuote(metadata.quote());
-            listener.onIncomingMessage(incoming);
+            deliverIncoming(incoming, admission);
             return;
         }
         // 一个分支都没命中就说明这类消息 Android 端根本不认，而且原来是悄悄丢掉的。
@@ -1303,6 +1600,11 @@ public final class TencentIMClient {
             + " id=" + messageId
             + " elemType=" + sdkMessage.getElemType()
             + " <- no branch matched; this message type is not implemented");
+    }
+
+    private void deliverIncoming(RemoteIMMessage message, LiveAdmission admission) {
+        listener.onIncomingMessage(message, admission);
+        if (admission != null) admission.mediaReady(message.snapshot());
     }
 
     static final class IncomingElementParts {
@@ -1351,13 +1653,15 @@ public final class TencentIMClient {
         RemoteIMOrigin origin,
         String caption,
         boolean captionAbove,
-        RemoteIMQuote quote
+        RemoteIMQuote quote,
+        LiveAdmission admission
     ) {
         V2TIMImageElem.V2TIMImage selected = null;
         for (V2TIMImageElem.V2TIMImage image : elem.getImageList()) {
             if (selected == null || imageScore(image) > imageScore(selected)) selected = image;
         }
         if (selected == null) {
+            if (admission != null) admission.abandoned();
             Log.w(TAG, "recv image: elem carries no image entry; dropped id="
                 + clean(message.getMsgID()));
             return;
@@ -1367,12 +1671,12 @@ public final class TencentIMClient {
         String messageId = clean(message.getMsgID());
         if (messageId.isEmpty()) messageId = mediaId;
         String imageUrl = selected.getUrl();
-        File target = mediaFile(RemoteIMMediaPaths.IMAGES, mediaId, extension(imageUrl, "jpg"));
+        File target = incomingMediaFile(admission, RemoteIMMediaPaths.IMAGES, mediaId, extension(imageUrl, "jpg"));
         V2TIMImageElem.V2TIMImage image = selected;
         String finalMessageId = messageId;
         MaiChatAttachmentDownload.Scope scope = mediaScope;
         downloadMedia(imageUrl, target, MaiChatAttachmentDownload.MAX_IMAGE_BYTES,
-            recipientUserId, scope, result -> {
+            recipientUserId, scope, admission, result -> {
                 if (result.ok()) {
                     RemoteIMImageAttachment attachment = new RemoteIMImageAttachment(
                         target.getAbsolutePath(), image.getWidth(), image.getHeight(), image.getSize());
@@ -1383,9 +1687,10 @@ public final class TencentIMClient {
                         createdAt, attachment, null, null, null, origin);
                     incoming.setCaptionAbove(!caption.isEmpty() && captionAbove);
                     incoming.setQuote(quote);
-                    listener.onIncomingMessage(incoming);
+                    deliverIncoming(incoming, admission);
                 } else {
                     logMediaFailure("image", result);
+                    if (admission != null) admission.abandoned();
                 }
         });
     }
@@ -1397,23 +1702,25 @@ public final class TencentIMClient {
         String recipientUserId,
         long createdAt,
         RemoteIMOrigin origin,
-        RemoteIMQuote quote
+        RemoteIMQuote quote,
+        LiveAdmission admission
     ) {
         String mediaId = clean(elem.getUUID());
         if (mediaId.isEmpty()) mediaId = clean(message.getMsgID());
         String messageId = clean(message.getMsgID());
         if (messageId.isEmpty()) messageId = mediaId;
-        File target = mediaFile(RemoteIMMediaPaths.VOICES, mediaId, "m4a");
+        File target = incomingMediaFile(admission, RemoteIMMediaPaths.VOICES, mediaId, "m4a");
         int duration = Math.max(1, elem.getDuration());
         String finalMessageId = messageId;
         MaiChatAttachmentDownload.Scope scope = mediaScope;
         elem.getUrl(new V2TIMValueCallback<String>() {
             @Override public void onSuccess(String url) {
-                if (!isCurrentDownload(recipientUserId, scope)) return;
+                if (!isCurrentDownload(recipientUserId, scope)) { if (admission != null) admission.abandoned(); return; }
                 downloadMedia(url, target, MaiChatAttachmentDownload.MAX_VOICE_BYTES,
-                    recipientUserId, scope, result -> {
+                    recipientUserId, scope, admission, result -> {
                         if (!result.ok()) {
                             logMediaFailure("voice", result);
+                    if (admission != null) admission.abandoned();
                             return;
                         }
                         RemoteIMMessage incoming = new RemoteIMMessage(
@@ -1424,10 +1731,11 @@ public final class TencentIMClient {
                             new RemoteIMVoiceAttachment(target.getAbsolutePath(), duration),
                             null, null, origin);
                         incoming.setQuote(quote);
-                        listener.onIncomingMessage(incoming);
+                        deliverIncoming(incoming, admission);
                 });
             }
             @Override public void onError(int code, String description) {
+                if (admission != null) admission.abandoned();
                 if (isCurrentDownload(recipientUserId, scope))
                     Log.w(TAG, "voice URL failed: code=" + code + " " + description);
             }
@@ -1443,7 +1751,8 @@ public final class TencentIMClient {
         RemoteIMOrigin origin,
         String caption,
         boolean captionAbove,
-        RemoteIMQuote quote
+        RemoteIMQuote quote,
+        LiveAdmission admission
     ) {
         String mediaId = clean(elem.getVideoUUID());
         if (mediaId.isEmpty()) mediaId = clean(message.getMsgID());
@@ -1451,8 +1760,8 @@ public final class TencentIMClient {
         if (messageId.isEmpty()) messageId = mediaId;
         final String finalMessageId = messageId;
 
-        final File videoTarget = mediaFile(RemoteIMMediaPaths.VIDEOS, mediaId, extension(elem.getVideoPath(), "mp4"));
-        final File coverTarget = mediaFile(RemoteIMMediaPaths.VIDEO_COVERS, mediaId + "-cover", "jpg");
+        final File videoTarget = incomingMediaFile(admission, RemoteIMMediaPaths.VIDEOS, mediaId, extension(elem.getVideoPath(), "mp4"));
+        final File coverTarget = incomingMediaFile(admission, RemoteIMMediaPaths.VIDEO_COVERS, mediaId + "-cover", "jpg");
 
         final int duration = Math.max(0, (int) elem.getDuration());
         final int width = Math.max(0, elem.getSnapshotWidth());
@@ -1468,9 +1777,9 @@ public final class TencentIMClient {
 
         elem.getSnapshotUrl(new V2TIMValueCallback<String>() {
             @Override public void onSuccess(String url) {
-                if (!isCurrentDownload(recipientUserId, scope)) return;
+                if (!isCurrentDownload(recipientUserId, scope)) { if (admission != null) admission.abandoned(); return; }
                 downloadMedia(url, coverTarget, MaiChatAttachmentDownload.MAX_VIDEO_COVER_BYTES,
-                    recipientUserId, scope, result -> {
+                    recipientUserId, scope, admission, result -> {
                         if (!result.ok()) {
                             logMediaFailure("video cover", result);
                             return;
@@ -1479,7 +1788,7 @@ public final class TencentIMClient {
                         emitVideoMessage(finalMessageId, fromUserId, recipientUserId, createdAt, origin,
                             videoTarget.getAbsolutePath(), coverTarget.getAbsolutePath(),
                             duration, width, height, sizeBytes, caption, captionAbove, quote,
-                            delivered.compareAndSet(false, true));
+                            delivered.compareAndSet(false, true), admission, false);
                 });
             }
             @Override public void onError(int code, String description) {
@@ -1490,21 +1799,23 @@ public final class TencentIMClient {
 
         elem.getVideoUrl(new V2TIMValueCallback<String>() {
             @Override public void onSuccess(String url) {
-                if (!isCurrentDownload(recipientUserId, scope)) return;
+                if (!isCurrentDownload(recipientUserId, scope)) { if (admission != null) admission.abandoned(); return; }
                 downloadMedia(url, videoTarget, MaiChatAttachmentDownload.MAX_VIDEO_BYTES,
-                    recipientUserId, scope, result -> {
+                    recipientUserId, scope, admission, result -> {
                         if (result.ok()) {
                             emitVideoMessage(finalMessageId, fromUserId, recipientUserId, createdAt, origin,
                                 videoTarget.getAbsolutePath(),
                                 coverDownloaded.get() ? coverTarget.getAbsolutePath() : "",
                                 duration, width, height, sizeBytes, caption, captionAbove, quote,
-                                delivered.compareAndSet(false, true));
+                                delivered.compareAndSet(false, true), admission, true);
                         } else {
                             logMediaFailure("video", result);
+                    if (admission != null) admission.abandoned();
                         }
                 });
             }
             @Override public void onError(int code, String description) {
+                if (admission != null) admission.abandoned();
                 if (isCurrentDownload(recipientUserId, scope))
                     Log.w(TAG, "video URL failed: code=" + code + " " + description);
             }
@@ -1526,7 +1837,9 @@ public final class TencentIMClient {
         String caption,
         boolean captionAbove,
         RemoteIMQuote quote,
-        boolean initial
+        boolean initial,
+        LiveAdmission admission,
+        boolean mediaReady
     ) {
         RemoteIMVideoAttachment attachment = new RemoteIMVideoAttachment(
             videoPath, coverPath, duration, width, height, sizeBytes
@@ -1548,8 +1861,9 @@ public final class TencentIMClient {
         );
         incoming.setCaptionAbove(!caption.isEmpty() && captionAbove);
         incoming.setQuote(quote);
-        if (initial) listener.onIncomingMessage(incoming);
+        if (initial || admission instanceof IncomingTicket) listener.onIncomingMessage(incoming, admission);
         else listener.onVideoMediaUpdated(fromUserId, recipientUserId, remoteId, attachment);
+        if (mediaReady && admission != null) admission.mediaReady(incoming.snapshot());
     }
 
     private void downloadFile(
@@ -1561,7 +1875,8 @@ public final class TencentIMClient {
         RemoteIMOrigin origin,
         String caption,
         boolean captionAbove,
-        RemoteIMQuote quote
+        RemoteIMQuote quote,
+        LiveAdmission admission
     ) {
         String mediaId = clean(elem.getUUID());
         if (mediaId.isEmpty()) mediaId = clean(message.getMsgID());
@@ -1576,16 +1891,17 @@ public final class TencentIMClient {
             Log.w(TAG, "Diagnostic attachment exceeds the protocol size limit");
             return;
         }
-        File target = mediaFile(RemoteIMMediaPaths.FILES, mediaId, extension(fileName, "bin"));
+        File target = incomingMediaFile(admission, RemoteIMMediaPaths.FILES, mediaId, extension(fileName, "bin"));
         String finalMessageId = messageId;
         MaiChatAttachmentDownload.Scope scope = mediaScope;
         elem.getUrl(new V2TIMValueCallback<String>() {
             @Override public void onSuccess(String url) {
-                if (!isCurrentDownload(recipientUserId, scope)) return;
+                if (!isCurrentDownload(recipientUserId, scope)) { if (admission != null) admission.abandoned(); return; }
                 downloadMedia(url, target, maximumBytes,
-                    recipientUserId, scope, result -> {
+                    recipientUserId, scope, admission, result -> {
                         if (!result.ok()) {
                             logMediaFailure("file", result);
+                    if (admission != null) admission.abandoned();
                             return;
                         }
                         RemoteIMFileAttachment attachment = new RemoteIMFileAttachment(
@@ -1597,10 +1913,11 @@ public final class TencentIMClient {
                             createdAt, null, null, attachment, null, origin);
                         incoming.setCaptionAbove(!caption.isEmpty() && captionAbove);
                         incoming.setQuote(quote);
-                        listener.onIncomingMessage(incoming);
+                        deliverIncoming(incoming, admission);
                 });
             }
             @Override public void onError(int code, String description) {
+                if (admission != null) admission.abandoned();
                 if (isCurrentDownload(recipientUserId, scope))
                     Log.w(TAG, "file URL failed: code=" + code + " " + description);
             }
@@ -1613,12 +1930,13 @@ public final class TencentIMClient {
     }
 
     private void downloadMedia(String url, File target, long maximumBytes, String account,
-                               MaiChatAttachmentDownload.Scope scope,
+                               MaiChatAttachmentDownload.Scope scope, LiveAdmission admission,
                                MaiChatAttachmentDownload.Completion completion) {
-        if (!isCurrentDownload(account, scope)) return;
+        if (!isCurrentDownload(account, scope)) { if (admission != null) admission.abandoned(); return; }
         mediaDownloader.download(url, target, maximumBytes, scope, result ->
             sdkHandler.post(() -> {
                 if (isCurrentDownload(account, scope)) completion.finished(result);
+                else if (admission != null) admission.abandoned();
             }));
     }
 
