@@ -49,3 +49,38 @@ Windows 普通消息页选择好友，点击输入框底部命令按钮右侧的
 原始构建命令、退出码、测试日志、前后源码与二进制哈希见 `.cache/session-im-bridge-20261113/verification/`。已查看 owned QWidget 的选择列表、未绑定/已绑定窗口、宽窄尺寸、欢迎列表及纯文本 MIME 截图。主窗口窄尺寸实际受现有最小宽度约束为 980 逻辑像素，未将其表述为 850。
 
 本轮仅完成合成 IM/模型和实际 Qt 组件验收。真实双账号 SDK 收发、真实模型端到端以及最终 staging/ZIP 解压目录 smoke 由最终集成流程另行记录，不能以本记录替代。
+
+## Windows 完整候选门禁
+
+产品源已提交 `761b00bffd6eb43f628abd6c627a8ec7f097bd41`，Desktop 树
+`47dfde2d9cc4277920f18eb0544e0e4186f5a440`；Core/iOS 保持移动搜索提交 `12d5cd36...` 的已验树。
+正常 NativeClient EXE SHA `1fdc7aa7c796cdec1dc85ce4a205ecb9176b62d4ecdf1b4c7a065615a37591e3`。
+完整 staging 与真实 ZIP 解压目录各用裸系统 PATH 启动自有 `--smoke`，均 exit0；PID 分别 3632/44876，
+日志里的版本、实际进程路径和 EXE 哈希与候选一致，五个必要 Qt 模块分别来自各自包目录。
+81 个 stage/ZIP 文件逐字节 SHA 相等，真实 ZIP 为 241,855,035B，SHA
+`bcbde7d834c7b82c6b03e90a95c9b6f8d8b890c7e638c9557284bbec5d62020d`。
+
+候选位于 `.cache/session-im-release-20261113/windows/`，门禁在 `candidate-gates.json`。
+仅启动两个自有 smoke 子进程，私有 profile 与日志路径已核准；未停止用户程序、启用真实绑定或发消息，未发布 Release。
+以上闭合 Windows 包门禁，不能代替 Mac 正常消费者或真实双账号流程。
+
+## Mac 普通消费者
+
+同一 `761b00bf...` 产品树在原 normal Qt 6.12 cache 编译 App 与四个新增/SDK 测试 target，均 exit0。
+使用 Cocoa、私有 CF home 及既有自有 sandbox 运行：Bridge 31/0、原生工具 22/0、UI 8/0、SDK 33/0，
+合计 94/0、无跳过；选择列表、1100/实际980宽绑定条/解除按钮的原 PNG 已在本机及回传后查看。
+Mac 视频测试日志封面来自 placeholder，证明后台调度/取消/FIFO/SDK 契约，不代表原生视频帧提取已验。
+
+现装 App 尚未替换或重启。没有证实现成的两专用测试登录或无付费真实模型服务，故上述仍是
+正常组件与合成 IM/模型验收，不能冒充真实双账号端到端。
+
+Mac app-only 候选也已准备并核准：原脚本仅在本轮私有副本中把同卷 ditto 复制改为 clone，原共享脚本未改；
+打包 30.669 秒、exit0，26 个 arm64 MachO 的正常依赖门禁通过。五个模型共 53,898,648B 逐 SHA 相同且
+APFS 全块共享，无模型物理复制。候选 EXE SHA
+`80e4a9805a6c5053698430976d4c9ae8966b1df2313226037d7e57f46c27d4f0`。
+现装/候选均为 `com.kongshang.maichat`、2.2.58/2.2.58、adHoc、Team 未设置、entitlements `{}`，
+strict deep 签名均 exit0；现装 EXE `9d29c92f...` 与 PID45041 尚保持。
+
+候选路径为 `/private/tmp/maichat-desktop-binding-mac-20261113-xk_u8rvz/candidate/MaiChat-macos-arm64/MaiChat.app`。
+已完成全部授权的准备和校验；替换/正常退出重启需依仓库约定取得最后明确授权，未将清理磁盘或 iOS 安装授权
+扩大解释为 Mac 退出授权。没有启用真实好友绑定、读取私密凭据或声称真实双账号/真实模型 E2E 已通过。

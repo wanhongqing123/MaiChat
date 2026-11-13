@@ -141,3 +141,7 @@ cmake --build E:/OpenSource/MaiChat/MaiChat/desktop/.cache/build-qt6-ui-20261109
 未启动或停止用户的主 App，也未裸跑 `build/bin/maichat.exe`；检查时没有运行中的 `maichat` 进程。
 完整 staging 与实际 ZIP 解压目录的 `--smoke` 仍须等待主流程的打包产物就绪，不能据组件测试宣称安装产物和真实账号流程已经验收。
 未对真实账号库执行 WAL 或索引迁移。macOS、iOS、Android 的实现及设备验收由对应平台验证单独记录。
+
+Windows 包门禁已随后完成：产品源 `761b00bf...`，完整 staging / 实际 ZIP 的自有 `--smoke` 均 exit0，
+81 文件逐 SHA 一致，实际进程/版本/路径及包内 Qt 模块都已核对。证据在
+`.cache/session-im-release-20261113/windows/candidate-gates.json`；没有真实登录或迁移用户库。
