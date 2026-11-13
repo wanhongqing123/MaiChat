@@ -71,3 +71,22 @@ SDK 原入口先登记身份/ingress 序列和不可变绑定 epoch，随后才�
 | SessionIM | `f3d3bff0cd3c12c1bb2e8ea3075df622cc233036` |
 
 以上覆盖自有数据功能回归及真机正常安装/启动；真实双账号、真实模型消息往返和用户实际好友历史内容未操作，继续保留现场 E2E 未验边界。Mac 现装程序未退出或替换；GitHub 桌面发布仍待最终组合版本。
+
+
+## 最后维护修正与真机 209
+
+对已装 208 的正常库追加真实 SQLite 写锁定点验证：在隐藏暂存 200 条后，独立连接持有写锁 6500ms，超过既有 busy_timeout。旧 Native 的 reap 先 swap 掉待 abort，失败后没有保留任务，出现隐藏行仍 200 而 cleanup_pending 为 false 的实际 RED。最后窄修保留同一待撤销任务、每普通请求最多尝试一次、1 秒 backoff；NotFound/Canceled 终结撤销步骤，但仍安排同 Session 的有界 purge。维护 bool 包含待 abort 队列。
+
+Apple 普通 Native 同 24 组通过，原锁例读到 unbind5290ms、first_rows200、pending_honest1、final_rows0；原 IM 450 条和模型调用0也通过。真实 wrapper selector 通过，没有改变 Core、reader 或公开 CABI 字段。
+
+Swift 原 warning 槽实际 RED：维护重试被显示为“消息未提交”；只将 history_cleanup_failed 分类为本地固定维护日志，pending=false 重置该维护类别，真实 live 告警仍显示并保留。同一测试字节 RED1→GREEN1，最终普通新 Native App 再跑该槽0失败，没有重跑其它 iOS 组。日志不含账号、消息内容或对象名；测试入口仍仅 Debug。
+
+2026-11-14 最终交付：装前实际读回 2.2.4/208，选择 override209，版本源不改；复用原 normal generic Release cache，build exit0/108.689s。strict 签名/profile/10项升级 entitlement、20个真实 normal Native 对象与合库/Ld、9个 Release MachO 的测试入口负检、7个模型 inode/bytes 复用均核合。
+
+- 保数据覆盖 install exit0/11.424s，装后版本 **2.2.4/209**。
+- 普通 launch exit0/0.563s、PID59100；3秒后进程 exe 与装后 bundle URL 一致。
+- 本地署名构建 exe SHA256：`e4d331ccfab09cafdda4d1a7e8ef7c265fcb45ae38497970eb9143b9b395704b`；没有从设备容器重新读取字节，没有查询设备 DB。
+- 实际 build source 为 d2d4 加精确 overlay；5个产品树与最终组合提交 `32a606d307636be06a715ada7f64ae7d0ff49761` 逐项相同，随后安全 ff，不为相同 iOS 产品树重建。
+- 最终 iOS tree `3425d8abf24fc07ab2c4ed978c14503cf80c43af`，Mobile tree `a16a042dc839402940c95e64281ac8aacb47dd9b`；Core/History/SessionIM 仍为上表值。
+
+208 与其原验证记录保留为前一实际安装，不倒填为含最终维护修正。真实双账号/模型网络 E2E 仍未操作，Mac 现装仍未退出或替换。

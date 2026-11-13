@@ -1,12 +1,12 @@
 # Session binding across desktop and mobile
 
-Current delivery state: iOS2.2.4/208 is installed with preserved data and normal
-launch/process correspondence verified; the final maintenance update is being
-built as209. Android Java60/0 and the ordinary arm64 Release2.2.33/275 build,
-artifact consumption and private signing pass, with no new Android installation.
-Desktop's complete history/maintenance gates are closed, including real SQLite
-abort, restart and writer-lock recovery. Windows/macOS publication remains held
-until the combined source and real packages are frozen and checked.
+Current delivery state: Windows/macOS2.2.60 is published as the latest release;
+all eight assets and four downloaded metadata files passed unauthenticated
+verification. iOS2.2.4/209 is installed with preserved data and normal
+launch/process correspondence verified. Android Java60/0 and the ordinary
+arm64 Release2.2.33/275 build, artifact consumption and private signing pass,
+with no new Android installation. Desktop history/maintenance gates are closed,
+including real SQLite abort, restart and writer-lock recovery.
 
 Base source is
 `d2d4ffb33eb338244240831c5cf3fc7fffe9dd0c`; no new release has been published.
@@ -308,3 +308,58 @@ All known findings from these scoped reviews are closed in source. This does
 not expand the real-network/device verification boundaries above. The next
 stage freezes the unified2.2.60 code commit and verifies actual desktop packages;
 the final209 install and release publication are recorded separately.
+
+## Published delivery (2026-11-14 local time)
+
+[MaiChat2.2.60](https://github.com/wanhongqing123/MaiChat/releases/tag/v2.2.60)
+is public/latest, release ID444789500, published2026-11-13T22:28:19Z.
+The immutable code commit is `32a606d307636be06a715ada7f64ae7d0ff49761`;
+annotated tag object is `b3648b7a7d53b3670192d82230ab7532c9b4f666`.
+This diagnostics follow-up changes documentation only; the released product
+trees stay MaiChat `59c0924db35057933d823ecc188bc74a2908371e`, Desktop
+`0caac66328fbd79e0ccdf2d638e248e85220e848`, Core
+`37e6783a52494fe76fef9df981af92290ca5fa3b`.
+
+Windows normal native-client Release configure/build both exit0. Normal
+windeploy and the114-import runtime gate pass before any App launch. Actual ZIP
+and extracted NSIS each contain the same81 application files, with six NSIS
+support files separate; all three recursive PE closures and five pinned models
+pass. Three real copies each pass ordinary and plugin-debug smoke with private
+USERPROFILE/AppLog and package-local Qt modules, six independent PIDs in total.
+No installer or existing user App was executed or replaced. Source executable
+SHA256 is `0c77561479c065eb1623c1487c6011b5b85076e0a925958378854a5b3fa84d31`.
+
+Mac's local staging, read-only mounted DMG and actual ZIP extraction agree on
+338 files and37 symlinks. The26-MachO dependency/arm64/strict-signature gates,
+five cross-platform models and six independent ordinary/debug package smokes
+pass. Per-PID raw AppLogs use each private CFFIXED_USER_HOME; HOME/XDG were not
+set and no historical env dump is claimed. Actual driver parameters and sandbox
+rules are retained. Subsequent non-App read-open probes are EPERM; the directory
+write-open probe is EISDIR and is not called a sandbox-write denial. Twenty-two
+commands in the final successful formal cohort exit0. Two earlier private
+venv/helper wrapper failures remain separate, without rebuilding frozen payloads.
+The signed executable SHA256 is
+`48427bf4dd19c12c87ad54a97e144138818cba1b3748b77e368e56eb2b6bc93a`.
+
+Root's draft readiness check passes before publication. The subsequent public
+check passes at2026-11-13T22:28:20Z using GET only, without authentication or
+cookies: exact eight asset names/bytes/server SHA256/state, tag peeling/source
+trees/body/latest ID, four actual metadata downloads and checksum contents,
+five cross-platform model identities, and the previous2.2.58 formal body/assets/
+tag unchanged. The held2.2.59 tag/draft was not repurposed or populated.
+
+The final iOS209 upgrade over208 succeeds (install0/11.424s, ordinary launch0,
+PID59100 and three-second process/bundle correspondence). Normal Release exits0/
+108.689s, built signed SHA256
+`e4d331ccfab09cafdda4d1a7e8ef7c265fcb45ae38497970eb9143b9b395704b`.
+Twenty ordinary Native objects, nine release-marker negatives with Debug
+positives, signature/profile and ten compatible upgrade entitlements are checked.
+Its d2d4-plus-overlay build matches the five product trees in the released32a
+commit; it is not claimed to have been built after changing that checkout HEAD.
+No uninstall, container/DB read or credential access occurred.
+
+Delivery limits remain explicit: Mac is adHoc/not notarized and tested on27.2;
+some bundled dependencies declare minimum26 despite the App's14.4 declaration.
+Windows binaries are not Authenticode signed. Android's verified candidate is
+arm64 only and not installed. Real dual-account network binding E2E and the
+physical local-model empty-answer cause remain outside these completed checks.
