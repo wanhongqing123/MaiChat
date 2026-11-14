@@ -358,28 +358,33 @@ extension AIMobileHostToolProvider {
         ])
     }
 
-    /// 将 Agent 选择的图片、视频或文件发送到指定 IM 会话。
+    /// 将 Agent 选择的图片、视频、音频或通用文件发送到指定 IM 会话。
     /// 先核对账号、联系人与本地路径，发送成功后才返回可引用的消息标识。
     func sendMedia(
         appState: RemoteIMAppState,
         arguments: [String: Any]
     ) async -> AIMaiChatHostToolExecution {
+        guard !Task.isCancelled else {
+            return .failure(code: "canceled", message: "Media send was canceled before preparation")
+        }
         let peerID = Self.string(arguments, key: "peer_id")
         let kind = Self.string(arguments, key: "type")
         let requestedPath = Self.string(arguments, key: "file_path")
         let caption = Self.string(arguments, key: "caption")
+        let identity = appState.remoteDiagnosticsIdentity
+        let workspace = AIAssistantModel.shared.workspacePath
         guard Self.hasContact(appState, peerID: peerID),
               appState.connectionState == .connected else {
             return .failure(code: "invalid_input", message: "peer_id must be a connected MaiChat contact")
         }
-        guard ["image", "video", "audio"].contains(kind),
+        guard ["image", "video", "audio", "file"].contains(kind),
               let source = AIAssistantPathPolicy.resolve(
-                requestedPath, workspacePath: AIAssistantModel.shared.workspacePath
+                requestedPath, workspacePath: workspace
               ), FileManager.default.fileExists(atPath: source.path) else {
             return .failure(code: "invalid_input", message: "type and accessible file_path are required")
         }
         let fileType = UTType(filenameExtension: source.pathExtension)
-        guard (kind == "image" && fileType?.conforms(to: .image) == true) ||
+        guard kind == "file" || (kind == "image" && fileType?.conforms(to: .image) == true) ||
               (kind == "video" && fileType?.conforms(to: .movie) == true) ||
               (kind == "audio" && fileType?.conforms(to: .audio) == true) else {
             return .failure(code: "invalid_input", message: "file extension does not match type")
@@ -394,6 +399,20 @@ extension AIMobileHostToolProvider {
             case "video":
                 let video = try await Self.prepareAgentVideo(source)
                 sent = await appState.sendVideoFile(video, to: peerID, caption: caption)
+            case "file":
+                let file = try await Self.prepareAgentFile(source)
+                #if DEBUG && targetEnvironment(simulator)
+                await FileSendPreparedUITestGate.pauseIfArmed(file.fileURL)
+                #endif
+                // 文件复制在后台完成；SDK 派发前必须仍属于原账号、工作区和好友。
+                // 已派发后的回执/失败行仍由普通 sendFile 负责，不误删其持久附件。
+                guard !Task.isCancelled, appState.remoteDiagnosticsIdentity == identity,
+                      AIAssistantModel.shared.workspacePath == workspace,
+                      Self.hasContact(appState, peerID: peerID), appState.connectionState == .connected else {
+                    await Self.removeUnsubmittedAgentFile(file.fileURL)
+                    return .failure(code: "canceled", message: "The file send context changed during preparation")
+                }
+                sent = await appState.sendFile(file, to: peerID, caption: caption)
             default:
                 let audio = try await Self.prepareAgentAudio(source)
                 sent = await appState.sendFile(audio, to: peerID, caption: caption)
@@ -405,9 +424,11 @@ extension AIMobileHostToolProvider {
             let mediaMessageID = appState.locallyQueuedMessageID?.uuidString ?? ""
             return Self.jsonSuccess([
                 "sent": true, "peer_id": peerID, "type": kind,
-                "message_kind": kind == "audio" ? "file" : kind,
+                "message_kind": kind == "audio" || kind == "file" ? "file" : kind,
                 "message_id": mediaMessageID, "caption_attached": !caption.isEmpty,
             ])
+        } catch is CancellationError {
+            return .failure(code: "canceled", message: "Media send was canceled during preparation")
         } catch {
             return .failure(code: "internal", message: error.localizedDescription)
         }
@@ -434,9 +455,10 @@ extension AIMobileHostToolProvider {
         _ source: URL, category: RemoteIMMediaStorage.Category
     ) async throws -> URL {
         try await RemoteIMBackgroundWork.file {
-            let size = try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-            guard size > 0, size <= 1024 * 1024 * 1024 else {
-                throw AIBackendError(message: "媒体文件必须小于 1 GB")
+            let values = try source.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            let size = values.fileSize ?? 0
+            guard values.isRegularFile == true, size > 0, size <= 1024 * 1024 * 1024 else {
+                throw AIBackendError(message: "必须是非空的普通文件，且不超过 1 GB")
             }
             let target = RemoteIMMediaStorage.fileURL(
                 category: category,
@@ -449,6 +471,9 @@ extension AIMobileHostToolProvider {
             )
             do {
                 try FileManager.default.copyItem(at: source, to: target)
+                #if DEBUG && targetEnvironment(simulator)
+                FileSendCopyUITestGate.shared.pauseIfArmed(target)
+                #endif
             } catch {
                 try? FileManager.default.removeItem(at: target)
                 throw error
@@ -499,6 +524,42 @@ extension AIMobileHostToolProvider {
             height: max(0, Int(abs(rect.height).rounded())),
             sizeBytes: Int64(bytes)
         )
+    }
+
+    // 普通文件沿已有文件卡片链发送，保留名称、字节和可识别的 MIME，不做媒体解码。
+    static func prepareAgentFile(_ source: URL) async throws -> RemoteIMFile {
+        let cancellation = RemoteIMBackgroundWork.Cancellation()
+        // 原文件队列在返回前检查调用方取消；复制已完成时会因此丢失返回 URL。
+        // 仅此准备任务持有副本直到清理或交付，仍复用原文件队列，不改变全局取消语义。
+        return try await withTaskCancellationHandler {
+            try await Task.detached(priority: .userInitiated) {
+                try cancellation.check()
+                let copied = try await copyAgentMedia(source, category: .outgoingFiles)
+                do {
+                    try cancellation.check()
+                    let bytes = try copied.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                    return RemoteIMFile(
+                        fileURL: copied, fileName: source.lastPathComponent,
+                        mimeType: UTType(filenameExtension: source.pathExtension.lowercased())?
+                            .preferredMIMEType ?? "application/octet-stream",
+                        sizeBytes: bytes
+                    )
+                } catch {
+                    await removeUnsubmittedAgentFile(copied)
+                    throw error
+                }
+            }.value
+        } onCancel: { cancellation.cancel() }
+    }
+
+    // 派发前的副本只由本调用拥有。即使父任务已取消，也必须把清理提交到原文件队列；
+    // 一旦调用 sendFile，副本归普通消息行管理，失败回执也不能从这里删除附件。
+    private static func removeUnsubmittedAgentFile(_ url: URL) async {
+        await Task.detached(priority: .userInitiated) {
+            try? await RemoteIMBackgroundWork.file {
+                try FileManager.default.removeItem(at: url)
+            }
+        }.value
     }
 
     private static func prepareAgentAudio(_ source: URL) async throws -> RemoteIMFile {

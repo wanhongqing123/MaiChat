@@ -1775,10 +1775,10 @@ struct AIMessageRow: View, Equatable {
                     .ignoresSafeArea()
                     .statusBarHidden()
             }
-            .alert("无法预览 PDF", isPresented: $pdfPreviewError) {
+            .alert("无法预览文件", isPresented: $pdfPreviewError) {
                 Button("知道了", role: .cancel) {}
             } message: {
-                Text("文件不存在、已移出 AI 工作区，或内容不是 PDF。")
+                Text("文件可能已移动、变化，或不是可预览的格式。")
             }
             .alert("无法保存媒体", isPresented: Binding(
                 get: { mediaSaveError != nil },
@@ -1852,6 +1852,32 @@ struct AIMessageRow: View, Equatable {
                         in: RoundedRectangle(cornerRadius: 8))
         }
         ForEach(toolParts) { tool in
+            if let file = AIAssistantFileArtifactPolicy.artifact(tool: tool.tool, state: tool.state,
+                output: tool.output, workspacePath: workspacePath) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Button {
+                        Task { @MainActor in
+                            let root = workspacePath
+                            let url = try? await RemoteIMBackgroundWork.file {
+                                AIAssistantFileArtifactPolicy.existingURL(file, workspacePath: root)
+                            }
+                            if let url { pdfPreview = AIPDFPreviewItem(url: url) }
+                            else { pdfPreviewError = true }
+                        }
+                    } label: {
+                        FileBubbleContent(attachment: RemoteIMFileAttachment(
+                            localFilePath: file.url.path, fileName: file.name, mimeType: file.mimeType,
+                            sizeBytes: Int(file.bytes)))
+                            .padding(12)
+                            .background(RemoteIMStyle.blueSoft, in: RoundedRectangle(cornerRadius: 12))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("agent-file-artifact-" + tool.id)
+                    if !file.caption.isEmpty {
+                        Text(file.caption).font(AppTypography.metadata).foregroundStyle(.secondary)
+                    }
+                }
+            }
             if let path = pdfArtifactPath(for: tool) {
                 AIPDFArtifactButton(path: path) {
                     if let url = validatedPDFURL(path: path) {
@@ -2504,6 +2530,7 @@ private struct AIPDFPreviewScreen: View {
                     }
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("关闭", action: close)
+                            .accessibilityIdentifier("ai-file-preview-close")
                     }
                 }
         }

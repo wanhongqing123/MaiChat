@@ -90,6 +90,10 @@ public:
     // 开始回复某条消息：右键菜单调它，测试也直接调它。
     void beginReplyTo(const RemoteIMMessage& message);
 
+    // GUI 线程的普通文件预览/另存为入口；IM 和 AI 文件卡片复用同一实现。
+    // 调用方须先核当前账号/工作区及 localPath；不发送或自动执行文件。
+    void openFilePreview(const RemoteIMFileAttachment& attachment);
+
     // 通知点击统一入口：定位会话并唤起窗口，保留最大化/全屏状态。
     void openConversationFromNotification(const QString& peerId);
     // 会话失效时先把远程桌面 stop 信令交给 IM，再由调用方登出 IM SDK。
@@ -267,7 +271,6 @@ private:
     QLabel* pendingReplyLabel_ = nullptr;
     void openImagePreview(const QString& imagePath, QWidget* source = nullptr,
                           const QPixmap* decodedImage = nullptr);
-    void openFilePreview(const RemoteIMFileAttachment& attachment);
     void openVideoPreview(const RemoteIMVideoAttachment& attachment);
     void syncVideoDock();
     void forwardLocalVideo(const QString& path);

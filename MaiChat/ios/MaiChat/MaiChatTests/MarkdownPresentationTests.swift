@@ -10,6 +10,99 @@ import UniformTypeIdentifiers
 @testable import MaiChatCore
 
 final class MarkdownPresentationTests: XCTestCase {
+    func testAgentFileArtifactRequiresNativeStringAndIntegerJSONTokens() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 直接保留 JSON 数字词法；用 Swift 字典再序列化会把 1.0 等夹具先规范成整数。
+        func raw(_ bytes: String, caption: String? = #""""#) -> String {
+            #"{"delivery":"current_ai_session","type":"file","path":"owned.bin","name":"owned.bin","mime_type":"application/octet-stream","bytes": v"#
+                .replacingOccurrences(of: ": v", with: ": " + bytes) +
+                (caption.map { ",\"caption\":" + $0 } ?? "") + "}"
+        }
+        func parse(_ text: String) -> AIAssistantFileArtifact? {
+            AIAssistantFileArtifactPolicy.artifact(tool: "agent_send_file", state: "completed",
+                output: text, workspacePath: root.path)
+        }
+        XCTAssertNotNil(parse(raw("1")))
+        XCTAssertNotNil(parse(raw("536870912")))
+        for bytes in ["0", "-1", "536870913", "true", #""1""#, "1.0", "1e0",
+                      "1.0000000000000000001", "536870912.0000000001"] {
+            XCTAssertNil(parse(raw(bytes)), "bytes token: " + bytes)
+        }
+        XCTAssertNil(parse(raw("1", caption: nil)))
+        for caption in ["null", "false", "1", "{}", "[]"] {
+            XCTAssertNil(parse(raw("1", caption: caption)), "caption token: " + caption)
+        }
+        let original = raw("1")
+        for field in ["delivery", "type", "path", "name", "mime_type", "caption"] {
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(original.utf8)) as? [String: Any])
+            for replacement in [NSNull(), NSNumber(value: 1)] as [Any] {
+                var bad = object; bad[field] = replacement
+                let data = try JSONSerialization.data(withJSONObject: bad)
+                XCTAssertNil(parse(String(decoding: data, as: UTF8.self)), field)
+            }
+            var missing = object; missing.removeValue(forKey: field)
+            XCTAssertNil(parse(String(decoding: try JSONSerialization.data(withJSONObject: missing), as: UTF8.self)), field)
+        }
+    }
+    func testAgentFileArtifactKeepsMetadataAndRechecksFileBeforeOpening() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("报告.pdf")
+        let bytes = Data("%PDF-owned".utf8)
+        try bytes.write(to: file)
+        let value: [String: Any] = ["delivery": "current_ai_session", "type": "file", "path": "报告.pdf",
+            "name": "报告.pdf", "mime_type": "application/pdf", "bytes": bytes.count, "caption": "本轮文件"]
+        let output = String(decoding: try JSONSerialization.data(withJSONObject: value), as: UTF8.self)
+        let artifact = try XCTUnwrap(AIAssistantFileArtifactPolicy.artifact(tool: "agent_send_file",
+            state: "completed", output: output, workspacePath: directory.path))
+        XCTAssertEqual(artifact.name, "报告.pdf")
+        XCTAssertEqual(artifact.caption, "本轮文件")
+        XCTAssertEqual(artifact.bytes, Int64(bytes.count))
+        XCTAssertEqual(AIAssistantFileArtifactPolicy.existingURL(artifact, workspacePath: directory.path), file)
+        try Data("changed length".utf8).write(to: file)
+        XCTAssertNil(AIAssistantFileArtifactPolicy.existingURL(artifact, workspacePath: directory.path))
+        try FileManager.default.removeItem(at: file)
+        XCTAssertNotNil(AIAssistantFileArtifactPolicy.artifact(tool: "agent_send_file",
+            state: "completed", output: output, workspacePath: directory.path))
+        XCTAssertNil(AIAssistantFileArtifactPolicy.existingURL(artifact, workspacePath: directory.path))
+    }
+
+    func testAgentFileArtifactRejectsOtherDeliveryAndWorkspaceEscapes() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let root = base.appendingPathComponent("workspace")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let outside = base.appendingPathComponent("outside.bin")
+        try Data([1]).write(to: outside)
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("link.bin"),
+                                                   withDestinationURL: outside)
+        let original: [String: Any] = ["delivery": "current_ai_session", "type": "file", "path": "inside.bin",
+            "name": "inside.bin", "mime_type": "application/octet-stream", "bytes": 1, "caption": ""]
+        let output: ([String: Any]) throws -> String = {
+            String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self)
+        }
+        for path in ["../outside.bin", outside.path, "link.bin"] {
+            var bad = original
+            bad["path"] = path
+            bad["name"] = (path as NSString).lastPathComponent
+            XCTAssertNil(AIAssistantFileArtifactPolicy.artifact(tool: "agent_send_file", state: "completed",
+                output: try output(bad), workspacePath: root.path))
+        }
+        let mutations: [(String, Any)] = [("delivery", "another_session"), ("type", "image"),
+            ("bytes", 0), ("bytes", 512 * 1024 * 1024 + 1), ("bytes", true), ("name", "spoofed.exe")]
+        for pair in mutations {
+            var bad = original
+            bad[pair.0] = pair.1
+            XCTAssertNil(AIAssistantFileArtifactPolicy.artifact(tool: "agent_send_file", state: "completed",
+                output: try output(bad), workspacePath: root.path))
+        }
+        XCTAssertNil(AIAssistantFileArtifactPolicy.artifact(tool: "another_tool", state: "completed",
+            output: try output(original), workspacePath: root.path))
+    }
+
     @MainActor
     func testBundledCodeFaceUsesCompatibleLatinCjkAndBoxWidths() throws {
         // This standalone unit-test bundle has no UIApplication/UIAppFonts

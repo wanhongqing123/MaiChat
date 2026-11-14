@@ -430,6 +430,7 @@ add_library(maiagent STATIC
   AgentTools/MaiMiniMaxMediaTools.cpp
   AgentTools/MaiModelStudioTools.cpp
   AgentTools/MaiAgentSendMediaTool.cpp
+  AgentTools/MaiAgentSendFileTool.cpp
   AgentTools/MaiRvmMatting.cpp
   AgentTools/MaiRvmComposite.cpp
   AgentTools/MaiVideoMattingTool.cpp

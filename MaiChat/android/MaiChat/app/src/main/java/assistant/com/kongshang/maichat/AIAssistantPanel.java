@@ -2471,6 +2471,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         final Map<String, ImageView> imageParts = new HashMap<>();
         final Map<String, LinearLayout> videoParts = new HashMap<>();
         final Map<String, Button> pdfCards = new HashMap<>();
+        final Map<String, Button> fileCards = new HashMap<>();
         final Map<String, Button> diagnosticCards = new HashMap<>();
         final Map<String, LinearLayout> mediaCards = new HashMap<>();
         TextView status;
@@ -2495,6 +2496,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     imageParts.clear();
                     videoParts.clear();
                     pdfCards.clear();
+                    fileCards.clear();
                     diagnosticCards.clear();
                     mediaCards.clear();
                     status = null;
@@ -2527,7 +2529,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             for (int i = 0; i < array.length(); i++) {
                 JSONObject part = array.optJSONObject(i);
                 String kind = part == null ? "" : part.optString("kind");
-                kinds[i] = kind.equals("tool") && mediaFromToolOutput(part) != null ? "media" : kind;
+                kinds[i] = kind.equals("tool") &&
+                    (mediaFromToolOutput(part) != null || fileFromToolOutput(part) != null) ? "media" : kind;
             }
             int[] groupStarts = AIAssistantPartGroups.starts(kinds);
             String[] toolGroupIds = new String[array.length()];
@@ -2556,7 +2559,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 if (part == null || part.optString("kind").equals("reasoning")) continue;
                 structure.append(part.optString("id")).append(part.optString("kind"))
                     .append(expanded.contains(part.optString("id")))
-                    .append(mediaFromToolOutput(part) != null);
+                    .append(mediaFromToolOutput(part) != null).append(fileFromToolOutput(part) != null);
             }
             JSONArray inlineMedia = value.optJSONArray("inline_media");
             if (inlineMedia != null)
@@ -2573,6 +2576,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 imageParts.clear();
                 videoParts.clear();
                 pdfCards.clear();
+                fileCards.clear();
                 diagnosticCards.clear();
                 mediaCards.clear();
                 status = null;
@@ -2665,7 +2669,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                         if (part == null) continue;
                         String id = part.optString("id"), kind = part.optString("kind");
                         boolean deliveredMedia = kind.equals("tool") &&
-                            mediaFromToolOutput(part) != null;
+                            (mediaFromToolOutput(part) != null || fileFromToolOutput(part) != null);
                         // 思考正文不创建视图；本行底部的状态文字已足够提示进度。
                         if (kind.equals("reasoning"))
                             continue;
@@ -2785,6 +2789,43 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             LayoutParams diagnosticLayout = matchWrap();
                             diagnosticLayout.bottomMargin = dp(12);
                             addView(diagnostic, diagnosticLayout);
+                            Button fileCard = button("文件", "查看或保存本轮文件", clicked -> {
+                                Object stored = clicked.getTag();
+                                if (!(stored instanceof JSONObject)) return;
+                                JSONObject artifact = (JSONObject) stored;
+                                File file = validatedAgentFile(artifact);
+                                if (file == null) {
+                                    Toast.makeText(activity, "文件已移动或不可用", Toast.LENGTH_SHORT).show();
+                                    return;
+                                }
+                                if (artifact.optString("mime_type").equals("application/pdf")) {
+                                    PdfPreviewDialog.show(activity, file, controller.workspaceDirectoryForPreview());
+                                } else {
+                                    // 与普通附件一样显式选择打开/保存；交付卡片本身不执行或上传文件。
+                                    try {
+                                        Uri uri = FileProvider.getUriForFile(activity,
+                                            activity.getPackageName() + ".files", file);
+                                        Intent share = new Intent(Intent.ACTION_SEND);
+                                        share.setType(artifact.optString("mime_type", "application/octet-stream"));
+                                        share.putExtra(Intent.EXTRA_STREAM, uri);
+                                        share.setClipData(ClipData.newUri(activity.getContentResolver(), file.getName(), uri));
+                                        share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                                        activity.startActivity(Intent.createChooser(share, "打开或保存文件"));
+                                    } catch (Exception failure) {
+                                        Toast.makeText(activity, "无法打开文件", Toast.LENGTH_SHORT).show();
+                                    }
+                                }
+                            });
+                            fileCard.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+                            fileCard.setAllCaps(false);
+                            fileCard.setPadding(dp(12), dp(10), dp(12), dp(10));
+                            fileCard.setBackground(MaiChatTheme.bordered(
+                                MaiChatTheme.BLUE_SOFT, MaiChatTheme.BORDER, 10, activity));
+                            fileCard.setVisibility(GONE);
+                            fileCards.put(id, fileCard);
+                            LayoutParams fileLayout = matchWrap();
+                            fileLayout.bottomMargin = dp(12);
+                            addView(fileCard, fileLayout);
                             LinearLayout media = column();
                             media.setVisibility(GONE);
                             mediaCards.put(id, media);
@@ -2933,6 +2974,23 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                                 diagnosticCard.setText("排障日志  " + report.getName() + "  ·  分享");
                             }
                         }
+                        Button fileCard = fileCards.get(id);
+                        if (fileCard != null) {
+                            JSONObject artifact = fileFromToolOutput(part);
+                            fileCard.setVisibility(artifact == null ? GONE : VISIBLE);
+                            if (artifact != null) {
+                                boolean available = validatedAgentFile(artifact) != null;
+                                String name = artifact.optString("name");
+                                String caption = artifact.optString("caption");
+                                fileCard.setText(name + "\n" + android.text.format.Formatter.formatFileSize(
+                                    activity, artifact.optLong("bytes")) +
+                                    (available ? " · 查看或保存" : " · 文件已移动或不可用") +
+                                    (caption.isEmpty() ? "" : "\n" + caption));
+                                fileCard.setContentDescription("文件 " + name);
+                                fileCard.setTag(artifact);
+                                fileCard.setEnabled(available);
+                            }
+                        }
                         LinearLayout mediaCard = mediaCards.get(id);
                         if (mediaCard != null) {
                             JSONObject artifact = mediaFromToolOutput(part);
@@ -3022,7 +3080,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (parts == null) return result;
         for (int index = 0; index < parts.length(); index++) {
             JSONObject part = parts.optJSONObject(index);
-            if (part == null || !part.optString("kind").equals("tool") || mediaFromToolOutput(part) != null) {
+            if (part == null || !part.optString("kind").equals("tool") ||
+                mediaFromToolOutput(part) != null || fileFromToolOutput(part) != null) {
                 run = null;
                 continue;
             }
@@ -3044,7 +3103,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         for (int i = 0; i < parts.length(); i++) {
             JSONObject part = parts.optJSONObject(i);
             if (part == null || !part.optString("kind").equals("tool") ||
-                mediaFromToolOutput(part) != null) continue;
+                mediaFromToolOutput(part) != null || fileFromToolOutput(part) != null) continue;
             count++;
             String name = part.optString("tool", "工具");
             names.put(name, names.getOrDefault(name, 0) + 1);
@@ -3153,6 +3212,41 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 && artifact.optString("mime_type").startsWith(type + "/")) return artifact;
         } catch (org.json.JSONException ignored) { }
         return null;
+    }
+
+    static JSONObject fileFromToolOutput(JSONObject part) {
+        if (!part.optString("tool").equals("agent_send_file") ||
+            !part.optString("state").equals("completed")) return null;
+        try {
+            JSONObject artifact = toolJson.read(part.optString("output"));
+            // 七个契约字段须保留原生类型，不能把畸形历史输出强转为文件路径或说明。
+            // 附加字段不参与本地文件授权；实际访问仍在点击时重新解析当前工作区。
+            for (String field : new String[]{"delivery", "type", "path", "name", "mime_type", "caption"})
+                if (!(artifact.opt(field) instanceof String)) return null;
+            String path = artifact.getString("path");
+            Object rawBytes = artifact.opt("bytes");
+            if (!artifact.optString("delivery").equals("current_ai_session") ||
+                !artifact.optString("type").equals("file") || path.isEmpty() ||
+                // Core 返回通用相对路径，检查不能依赖运行 JVM 的 Windows/Android 差异。
+                path.startsWith("/") || path.indexOf('\\') >= 0 || path.matches("[A-Za-z]:/.*") ||
+                new File(path).isAbsolute() || path.indexOf(0) >= 0 ||
+                !new File(path).getName().equals(artifact.optString("name")) ||
+                artifact.optString("mime_type").isEmpty() ||
+                (!(rawBytes instanceof Integer) && !(rawBytes instanceof Long))) return null;
+            for (String component : path.split("/")) if (component.equals("..")) return null;
+            Number bytes = (Number) rawBytes;
+            if (bytes.longValue() <= 0 || bytes.longValue() > 512L * 1024 * 1024) return null;
+            return artifact;
+        } catch (org.json.JSONException ignored) { return null; }
+    }
+
+    private File validatedAgentFile(JSONObject artifact) {
+        try {
+            File file = controller.workspaceMediaForHost(artifact.optString("path"));
+            if (!file.getName().equals(artifact.optString("name")) ||
+                file.length() != artifact.optLong("bytes")) return null;
+            return file;
+        } catch (Exception failure) { return null; }
     }
     private List<MainActivity.GalleryItem> mediaPlaylist() {
         List<MainActivity.GalleryItem> result = new ArrayList<>();

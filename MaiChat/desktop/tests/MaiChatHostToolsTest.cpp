@@ -2,6 +2,11 @@
 // 运行边界：由测试进程驱动实际组件或替身，不作为正式 App 的用户入口。
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
+#include <QFile>
+#include <QDir>
+#include <QCoreApplication>
+#include <QUuid>
 #include <QFileInfo>
 #include <QImage>
 #include <QTemporaryDir>
@@ -47,6 +52,8 @@ private slots:
   void preCanceledMessageQueriesNeverEnterTheDatabasePath();
   void sendsAndRepliesOnlyThroughApprovalGatedTools();
   void sendsAgentImageAsPersistentMediaMessage();
+  void sendsAgentFileAsPersistentMessage();
+  void fileMediaRejectsUnavailableOrEscapedFilesBeforeQueueing();
   void groupToolsUseTheSameApplicationFlowAndApprovalRules();
   void groupMessageToolWaitsForInitialHistoryInsteadOfReportingEmpty();
   void createGroupToolReturnsExistingPendingGroupWithoutDuplicating();
@@ -310,6 +317,95 @@ void MaiChatHostToolsTest::sendsAgentImageAsPersistentMediaMessage() {
       R"({"peer_id":"alice","file_path":"../picture.png","type":"image"})",
       context);
   QVERIFY(denied.hasError());
+}
+
+void MaiChatHostToolsTest::sendsAgentFileAsPersistentMessage() {
+  const QString originalApplication = QCoreApplication::applicationName();
+  QCoreApplication::setApplicationName(QStringLiteral("owned-file-tool-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces)));
+  const auto restoreApplication = qScopeGuard([&] { QCoreApplication::setApplicationName(originalApplication); });
+  QTemporaryDir workspace;
+  QVERIFY(workspace.isValid());
+  const QByteArray bytes("Owned file attachment\n");
+  const QString source = workspace.filePath(QStringLiteral("report.txt"));
+  QFile input(source);
+  QVERIFY(input.open(QIODevice::WriteOnly));
+  QCOMPARE(input.write(bytes), qint64(bytes.size()));
+  input.close();
+  auto client = std::make_unique<FakeRemoteIMClient>();
+  auto* fake = client.get();
+  RemoteIMApplication app(QStringLiteral("owner"), std::move(client),
+      std::make_unique<LocalMessageDatabase>(workspace.filePath(QStringLiteral("owned-im.sqlite"))));
+  app.addContact(QStringLiteral("alice"), QStringLiteral("Alice"));
+  app.connectToService(123, QStringLiteral("owned-unused-signature"));
+  QTRY_VERIFY(app.connectionReady());
+  MaiToolRegistry registry;
+  registerMaiChatHostTools(registry, app);
+  auto* tool = registry.find("maichat_send_media");
+  QVERIFY(tool);
+  const auto schema = QJsonDocument::fromJson(QByteArray::fromStdString(tool->parametersSchema())).object();
+  const auto types = schema.value(QStringLiteral("properties")).toObject()
+      .value(QStringLiteral("type")).toObject().value(QStringLiteral("enum")).toArray();
+  QVERIFY(types.contains(QStringLiteral("file")));
+  const std::string arguments =
+      R"({"peer_id":"alice","file_path":"report.txt","type":"file","caption":"Owned report"})";
+  QVERIFY(tool->requiresApproval(arguments));
+  QVERIFY(tool->requiresPerCallApproval(arguments));
+  MaiToolContext context;
+  context.root = workspace.path().toUtf8().toStdString();
+  const auto sent = tool->execute(arguments, context);
+  QVERIFY2(!sent.hasError(), sent.error().message().c_str());
+  const auto body = QJsonDocument::fromJson(QByteArray::fromStdString(sent.output())).object();
+  const auto removeOwnedCopy = qScopeGuard([&] { QFile::remove(body.value(QStringLiteral("path")).toString()); });
+  QVERIFY(body.value(QStringLiteral("queued")).toBool());
+  QCOMPARE(body.value(QStringLiteral("type")).toString(), QStringLiteral("file"));
+  QCOMPARE(body.value(QStringLiteral("message_kind")).toString(), QStringLiteral("file"));
+  QVERIFY(body.value(QStringLiteral("caption_attached")).toBool());
+  const auto messages = app.chatState().messagesWith(QStringLiteral("alice"));
+  QCOMPARE(messages.size(), 1);
+  QVERIFY(messages.last().hasFile);
+  QVERIFY(!messages.last().hasImage && !messages.last().hasVideo && !messages.last().hasVoice);
+  QCOMPARE(messages.last().text, QStringLiteral("Owned report"));
+  QCOMPARE(messages.last().file.fileName, QStringLiteral("report.txt"));
+  QVERIFY(messages.last().file.localPath != source);
+  QFile stored(messages.last().file.localPath);
+  QVERIFY(stored.open(QIODevice::ReadOnly));
+  QCOMPARE(stored.readAll(), bytes);
+  QCOMPARE(fake->lastFilePeerId(), QStringLiteral("alice"));
+  QCOMPARE(fake->lastFilePath(), messages.last().file.localPath);
+  QCOMPARE(fake->lastFileName(), messages.last().file.fileName);
+}
+
+void MaiChatHostToolsTest::fileMediaRejectsUnavailableOrEscapedFilesBeforeQueueing() {
+  QTemporaryDir directory;
+  QVERIFY(directory.isValid());
+  QVERIFY(QDir(directory.path()).mkdir(QStringLiteral("workspace")));
+  const QString workspace = directory.filePath(QStringLiteral("workspace"));
+  QFile empty(QDir(workspace).filePath(QStringLiteral("empty.txt")));
+  QVERIFY(empty.open(QIODevice::WriteOnly));
+  empty.close();
+  QFile outside(directory.filePath(QStringLiteral("outside.txt")));
+  QVERIFY(outside.open(QIODevice::WriteOnly));
+  QCOMPARE(outside.write("owned"), qint64(5));
+  outside.close();
+  auto client = std::make_unique<FakeRemoteIMClient>();
+  auto* fake = client.get();
+  RemoteIMApplication app(QStringLiteral("owner"), std::move(client),
+      std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("owned-im.sqlite"))));
+  app.addContact(QStringLiteral("alice"), QStringLiteral("Alice"));
+  MaiToolRegistry registry;
+  registerMaiChatHostTools(registry, app);
+  MaiToolContext context;
+  context.root = workspace.toUtf8().toStdString();
+  for (const auto& path : {QStringLiteral("missing.txt"), QStringLiteral("empty.txt"),
+                           QStringLiteral("../outside.txt")}) {
+    const auto arguments = QJsonObject{{QStringLiteral("peer_id"), QStringLiteral("alice")},
+        {QStringLiteral("file_path"), path}, {QStringLiteral("type"), QStringLiteral("file")}};
+    const auto denied = registry.find("maichat_send_media")->execute(
+        QJsonDocument(arguments).toJson(QJsonDocument::Compact).toStdString(), context);
+    QVERIFY2(denied.hasError(), qPrintable(path));
+    QVERIFY(app.chatState().messagesWith(QStringLiteral("alice")).isEmpty());
+    QVERIFY(fake->lastFilePath().isEmpty());
+  }
 }
 
 void MaiChatHostToolsTest::readsContactsMessagesSearchAndUnreadState() {

@@ -1,6 +1,65 @@
 import XCTest
 
 final class AccountToolsUITests: XCTestCase {
+    @MainActor func testAgentFileCancellationAfterCopyCleansUnsubmittedFile() {
+        checkOwnedFileCancellation(point: "copy")
+    }
+    @MainActor func testAgentFileCancellationBeforeSDKCleansUnsubmittedFile() {
+        checkOwnedFileCancellation(point: "prepared")
+    }
+    @MainActor private func checkOwnedFileCancellation(point: String) {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-account-tools-ui-test", "--im-group-ui-test"]
+        app.launchEnvironment["MAICHAT_ACCOUNT_TOOLS_CASE"] = "file-send"
+        app.launchEnvironment["MAICHAT_FILE_CANCEL_POINT"] = point
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["account-tools-test-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 20))
+        let finished = XCTNSPredicateExpectation(predicate: NSPredicate(
+            format: "label BEGINSWITH 'PASS FILE CANCEL' OR label BEGINSWITH 'FAIL FILE CANCEL'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 20), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS FILE CANCEL"), status.label)
+    }
+
+    @MainActor func testCurrentAIFileCardsCanPreviewPDF() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-file-artifact-ui-test"]
+        app.launch()
+        defer { app.terminate() }
+        let pdf = app.buttons["agent-file-artifact-owned-file-pdf-part"]
+        let archive = app.buttons["agent-file-artifact-owned-file-zip-part"]
+        XCTAssertTrue(pdf.waitForExistence(timeout: 20))
+        XCTAssertTrue(archive.exists)
+        let cardImage = XCTAttachment(screenshot: app.screenshot())
+        cardImage.name = "owned-current-AI-file-cards"
+        cardImage.lifetime = .keepAlways
+        add(cardImage)
+        pdf.tap()
+        XCTAssertTrue(app.buttons["ai-file-preview-close"].waitForExistence(timeout: 10))
+        let previewImage = XCTAttachment(screenshot: app.screenshot())
+        previewImage.name = "owned-current-AI-PDF-preview"
+        previewImage.lifetime = .keepAlways
+        add(previewImage)
+        app.buttons["ai-file-preview-close"].tap()
+        XCTAssertTrue(pdf.waitForExistence(timeout: 5))
+    }
+
+    @MainActor func testAgentSendsOwnedGenericFilesThroughNormalHost() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--ai-account-tools-ui-test", "--im-group-ui-test"]
+        app.launchEnvironment["MAICHAT_ACCOUNT_TOOLS_CASE"] = "file-send"
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["account-tools-test-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 20))
+        let finished = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label BEGINSWITH 'PASS FILE SEND' OR label BEGINSWITH 'FAIL FILE SEND'"),
+            object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [finished], timeout: 20), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS FILE SEND"), status.label)
+    }
+
     @MainActor func testIMDatabaseRejectsRetiredNativeContextAfterAccountSwitch() {
         let app = XCUIApplication()
         app.launchArguments = ["--ai-ui-test", "--ai-account-tools-ui-test", "--im-group-ui-test",

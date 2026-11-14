@@ -9,6 +9,7 @@
 #include "MaiProcess.h"
 #include "MaiCurlTools.h"
 #include "MaiFileTools.h"
+#include "MaiAgentSendFileTool.h"
 #include "MaiLlamaTools.h"
 #include "MaiOpenSslTool.h"
 #include "MaiOpenSslCliTool.h"
@@ -219,6 +220,7 @@ std::vector<MaiSpecialistInfo> MaiToolRegistry::specialists() const {
 
 void registerMaiBuiltinTools(MaiToolRegistry& registry) {
     registerMaiFileTools(registry);
+    registry.add(makeMaiAgentSendFileTool());
     registry.add(makeMaiTodoWriteTool());
     registerMaiCurlTools(registry);
     // 仅注册本地推理入口；不在注册阶段加载模型或访问网络。

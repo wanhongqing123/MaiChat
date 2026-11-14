@@ -2,6 +2,7 @@
 // 校验创作中心工具可访问的工作区路径。
 // 路径解析拒绝越界与不可信别名，文件操作由具体工具执行。
 import Foundation
+import CoreFoundation
 
 public enum AIAssistantPathPolicy {
     public static func appRoot(workspacePath: String) -> String {
@@ -64,6 +65,50 @@ public enum AIAssistantPhotoArtifactPolicy {
         // policy used by imported media must not admit a sibling or symlink escape.
         return AIAssistantPathPolicy.resolve(path, workspacePath: workspacePath,
                                              appRootPath: workspacePath)
+    }
+}
+
+public struct AIAssistantFileArtifact: Equatable, Sendable {
+    public let url: URL
+    public let name: String
+    public let mimeType: String
+    public let bytes: Int64
+    public let caption: String
+}
+
+/// 文件卡片只消费 Core 已完成的交付元数据；不把文件内容传给模型或自动打开文件。
+/// 文件移动后仍保留原卡片标题，点击时再检查当前工作区中的普通文件和大小。
+public enum AIAssistantFileArtifactPolicy {
+    public static func artifact(tool: String?, state: String?, output: String?,
+                                workspacePath: String) -> AIAssistantFileArtifact? {
+        guard tool == "agent_send_file", state == "completed",
+              let output, output.utf8.count <= 100_000,
+              let data = output.data(using: .utf8),
+              let value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              value["delivery"] as? String == "current_ai_session", value["type"] as? String == "file",
+              let path = value["path"] as? String, !path.isEmpty, !(path as NSString).isAbsolutePath,
+              let url = AIAssistantPathPolicy.resolve(path, workspacePath: workspacePath,
+                                                     appRootPath: workspacePath),
+              let name = value["name"] as? String, name == url.lastPathComponent,
+              let mime = value["mime_type"] as? String, !mime.isEmpty,
+              let caption = value["caption"] as? String,
+              let bytes = value["bytes"] as? NSNumber,
+              // 保留 JSON 的整数类型边界；1.0/1e0 或精度折叠的 fraction 不能当成原生整数。
+              CFGetTypeID(bytes) != CFBooleanGetTypeID(),
+              ["c", "s", "i", "l", "q", "C", "S", "I", "L", "Q"].contains(String(cString: bytes.objCType)),
+              bytes.int64Value > 0, bytes.int64Value <= 512 * 1024 * 1024 else { return nil }
+        return AIAssistantFileArtifact(url: url, name: name, mimeType: mime,
+            bytes: bytes.int64Value, caption: caption)
+    }
+
+    // 点击前在后台执行；历史卡片不能用另一工作区、越界链接或已变化的文件替换原附件。
+    public static func existingURL(_ artifact: AIAssistantFileArtifact, workspacePath: String) -> URL? {
+        guard let candidate = AIAssistantPathPolicy.resolve(artifact.url.path, workspacePath: workspacePath,
+                                                           appRootPath: workspacePath),
+              candidate == artifact.url, candidate.lastPathComponent == artifact.name,
+              let info = try? candidate.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              info.isRegularFile == true, Int64(info.fileSize ?? 0) == artifact.bytes else { return nil }
+        return candidate
     }
 }
 

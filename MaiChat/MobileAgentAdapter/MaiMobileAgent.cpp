@@ -12,6 +12,7 @@
 #include "MaiAgent.h"
 #include "MaiAgentProgressInstructions.h"
 #include "MaiAgentSendMediaTool.h"
+#include "MaiAgentSendFileTool.h"
 #include "MaiAppStorageTool.h"
 #include "MaiArkAssetTools.h"
 #include "MaiArkMediaTools.h"
@@ -188,6 +189,9 @@ MaiResult<std::string> requestPrivatePdfPassword(const std::shared_ptr<MaiMobile
 }
 
 constexpr auto kMarkdownBaseInstructions =
+    // 文件交付只回传当前会话可见的持久卡片元数据，正文读取仍走独立普通文件工具。
+    "Use agent_send_file to deliver existing workspace documents/files as persistent "
+    "cards in the current reply. The delivery result contains only metadata, not file contents. "
     // 工具名和 description 只用于初筛；推荐前必须逐个调用候选视频工具的
     // discover， 读取 tool_status 和输入组合限制。厂商宣称支持不等于当前 App
     // 已接通。
@@ -799,6 +803,7 @@ struct MaiMobileAgent {
         };
         tools->add(makeMaiSshTool(sshPassword, sshTrust));
         tools->add(makeMaiAgentSendMediaTool());
+        tools->add(makeMaiAgentSendFileTool());
         tools->add(makeMaiQuestionTool());
         tools->add(makeMaiCurrentTimeTool());
         tools->add(makeMaiTodoWriteTool());

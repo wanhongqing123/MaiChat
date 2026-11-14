@@ -629,7 +629,9 @@ enum MaiChatUITestSupport {
 private struct MaiChatSimulatorUITestEntry: View {
     var body: some View {
         if ProcessInfo.processInfo.arguments.contains("--ai-ui-test") {
-            if ProcessInfo.processInfo.arguments.contains("--im-session-binding-host-ui-test") {
+            if ProcessInfo.processInfo.arguments.contains("--ai-file-artifact-ui-test") {
+                AgentFileArtifactUITestRoot()
+            } else if ProcessInfo.processInfo.arguments.contains("--im-session-binding-host-ui-test") {
                 IMSessionBindingUITestRoot()
             } else if ProcessInfo.processInfo.arguments.contains("--ai-account-tools-ui-test") {
                 AccountToolsUITestRoot()

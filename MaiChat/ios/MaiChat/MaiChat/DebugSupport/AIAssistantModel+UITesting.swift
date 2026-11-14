@@ -899,6 +899,30 @@ extension AIAssistantModel {
         historyLoaded = true
     }
 
+    // 普通消息行展示合同，自有文件元数据与 Core envelope 一致，不触发模型或 IM。
+    func installFileArtifactUITestFixture(workspace: URL, files: [URL]) {
+        installSessionSwitchUITestFixture()
+        applyUITestMutation(.workspace(workspace.path))
+        selected = "owned-file-artifact-session"
+        sessions = [AISession(id: selected, title: "本轮文件", busy: false)]
+        let parts = files.enumerated().compactMap { index, file -> AIPart? in
+            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            let value: [String: Any] = ["delivery": "current_ai_session", "type": "file",
+                "path": file.lastPathComponent, "name": file.lastPathComponent,
+                "mime_type": index == 0 ? "application/pdf" : "application/zip", "bytes": size,
+                "caption": index == 0 ? "本轮报告，点击可预览或分享。" : "整理后的资料归档。"]
+            guard let data = try? JSONSerialization.data(withJSONObject: value) else { return nil }
+            return AIPart(id: index == 0 ? "owned-file-pdf-part" : "owned-file-zip-part", kind: "tool",
+                tool: "agent_send_file", input: "{}", output: String(decoding: data, as: UTF8.self),
+                state: "completed")
+        }
+        messages = [AIMessage(id: "owned-file-artifact-message", role: "assistant", created: 1,
+                              completed: 2, active: false, parts: parts)]
+        configured = true
+        ready = true
+        historyLoaded = true
+    }
+
     func installWelcomeUITestFixture() {
         sessions = []
         selected = ""

@@ -16,6 +16,7 @@
 #include <QPointer>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QScopeGuard>
 #include <QSet>
 #include <QStandardPaths>
 #include <QThread>
@@ -347,8 +348,8 @@ private:
     const QString caption = arguments.value(QStringLiteral("caption")).toString().trimmed();
     if (peerId.isEmpty() || requested.isEmpty() ||
         (kind != QStringLiteral("image") && kind != QStringLiteral("video") &&
-         kind != QStringLiteral("audio"))) {
-      return invalidInput(QStringLiteral("peer_id, file_path, and type=image|video|audio are required"));
+         kind != QStringLiteral("audio") && kind != QStringLiteral("file"))) {
+      return invalidInput(QStringLiteral("peer_id, file_path, and type=image|video|audio|file are required"));
     }
     const std::string path = context.resolvePath(toStdString(requested.toUtf8()));
     if (path.empty())
@@ -388,9 +389,17 @@ private:
     if (!QDir().mkpath(directory))
       return MaiToolResult::failure(MaiErrorCode::Internal,
                                     "cannot create MaiChat media storage");
-    const QString copiedPath = QDir(directory).filePath(
-        QUuid::createUuid().toString(QUuid::WithoutBraces) +
-        QStringLiteral("-") + source.fileName());
+    const QString unique = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // 通用文件用独立目录去重，保留 SDK 文件卡片上的真实 basename。
+    const QString copiedDirectory = kind == QStringLiteral("file")
+        ? QDir(directory).filePath(unique) : directory;
+    if (!QDir().mkpath(copiedDirectory))
+      return MaiToolResult::failure(MaiErrorCode::Internal, "cannot create attachment storage");
+    const QString copiedPath = QDir(copiedDirectory).filePath(kind == QStringLiteral("file")
+        ? source.fileName() : unique + QStringLiteral("-") + source.fileName());
+    const auto removeEmptyDirectory = qScopeGuard([copiedDirectory, kind] {
+      if (kind == QStringLiteral("file")) QDir().rmdir(copiedDirectory);
+    });
     QFile input(source.filePath());
     QSaveFile output(copiedPath);
     if (!input.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly))
@@ -1068,11 +1077,12 @@ void registerMaiChatHostTools(MaiToolRegistry &registry,
       app, true);
   addTool(
       registry, HostToolKind::SendMedia, "maichat_send_media",
-      "Send an Agent workspace image or video as a persistent MaiChat message "
-      "bubble, or audio as a file card. Optional caption is kept with the media. "
+      "Send an accessible workspace image or video as a persistent MaiChat message "
+      "bubble, or audio/generic files as file cards. Use type=file for PDF, documents, "
+      "archives and other ordinary files. Optional caption is kept with the attachment. "
       "This changes external state; approval follows the Agent policy.",
       R"({"type":"object","properties":{"peer_id":{"type":"string"},"file_path":{"type":"string"},)"
-          R"("type":{"type":"string","enum":["image","video","audio"]},"caption":{"type":"string"}},)"
+          R"("type":{"type":"string","enum":["image","video","audio","file"]},"caption":{"type":"string"}},)"
           R"("required":["peer_id","file_path","type"],"additionalProperties":false})",
       app, true);
   addTool(

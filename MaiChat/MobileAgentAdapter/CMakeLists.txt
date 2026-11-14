@@ -403,8 +403,11 @@ if(MAICHAT_MOBILE_TESTS)
   foreach(mobile_test MaiMobileAgentTests MaiMobileSteeringTests MaiMobileSessionModelTests
                       MaiMobileSessionIMTests MaiMobileSessionIMBindingToolTests)
     add_executable(${mobile_test} tests/${mobile_test}.cpp)
+    # 测试直接建立自有 SQLite 历史库；头文件与正常 Core 的随附引擎保持一致，
+    # 仅向测试目标公开此 include，不添加第二份库或改变生产后端。
     target_include_directories(${mobile_test} PRIVATE
-      ../../MaiAgent/third_party/httplib ../../MaiAgent/third_party/nlohmann)
+      ../../MaiAgent/third_party/httplib ../../MaiAgent/third_party/nlohmann
+      ../../MaiAgent/third_party/sqlite)
     target_link_libraries(${mobile_test} PRIVATE maichat_mobile maiagent)
     add_test(NAME ${mobile_test} COMMAND ${mobile_test})
   endforeach()

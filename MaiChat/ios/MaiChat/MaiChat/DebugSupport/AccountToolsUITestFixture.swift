@@ -6,6 +6,44 @@ import SwiftUI
 import UIKit
 import Darwin
 
+// 仅显式 file-cancel 自有样本安装的门闩，不改变普通队列或发布构建。
+final class FileSendCopyUITestGate: @unchecked Sendable {
+    static let shared = FileSendCopyUITestGate()
+    private let condition = NSCondition()
+    private var armed = false
+    private var released = false
+    private var copied: URL?
+    func arm() { condition.lock(); armed = true; released = false; copied = nil; condition.unlock() }
+    func copiedURL() -> URL? { condition.lock(); defer { condition.unlock() }; return copied }
+    func release() { condition.lock(); released = true; armed = false; condition.broadcast(); condition.unlock() }
+    func pauseIfArmed(_ url: URL) {
+        condition.lock()
+        defer { condition.unlock() }
+        guard armed else { return }
+        copied = url
+        let deadline = Date().addingTimeInterval(4)
+        while !released { if !condition.wait(until: deadline) { break } }
+    }
+}
+
+@MainActor
+enum FileSendPreparedUITestGate {
+    static var armed = false
+    static var copiedURL: URL?
+    private static var continuation: CheckedContinuation<Void, Never>?
+    static func arm() { armed = true; copiedURL = nil }
+    static func pauseIfArmed(_ url: URL) async {
+        guard armed else { return }
+        await withCheckedContinuation { value in copiedURL = url; continuation = value }
+    }
+    static func release() {
+        armed = false
+        let value = continuation
+        continuation = nil
+        value?.resume()
+    }
+}
+
 private actor AccountTestAvatarUploader: MaiAccountAvatarUploading {
     var shouldDelay = false
     private var starts = 0
@@ -33,6 +71,15 @@ private final class AccountTestIMClient: RemoteIMClient {
     var rejectsAvatar = false
     var avatarCommits = 0
     var avatarDispatches = 0
+    struct FileDispatch {
+        let peerID: String
+        let file: RemoteIMFile
+        let bytes: Data
+        let caption: String?
+    }
+    var allowsOwnedFileSend = false
+    var rejectsOwnedFileSend = false
+    var fileDispatches: [FileDispatch] = []
     func setSelfAvatar(url: String, expectedUserID: String, request: MaiAvatarMutationRequest) async throws {
         guard request.beginSDKMutation() else { throw CancellationError() }
         avatarDispatches += 1
@@ -60,13 +107,56 @@ private final class AccountTestIMClient: RemoteIMClient {
     func sendVideo(to userID: String, video: RemoteIMVideoFile, caption: String?, captionAbove: Bool,
                    origin: RemoteIMMessageOrigin) async throws -> RemoteIMSendReceipt { throw CancellationError() }
     func sendFile(to userID: String, file: RemoteIMFile, caption: String?, captionAbove: Bool,
-                  origin: RemoteIMMessageOrigin) async throws -> RemoteIMSendReceipt { throw CancellationError() }
+                  origin: RemoteIMMessageOrigin) async throws -> RemoteIMSendReceipt {
+        guard allowsOwnedFileSend else { throw CancellationError() }
+        fileDispatches.append(FileDispatch(peerID: userID, file: file,
+            bytes: try Data(contentsOf: file.fileURL), caption: caption))
+        if rejectsOwnedFileSend { throw AIBackendError(message: "Owned SDK rejected the file") }
+        return RemoteIMSendReceipt(remoteID: "owned-file-receipt-\(fileDispatches.count)",
+                                   createdAt: Date(timeIntervalSince1970: 1700000000))
+    }
     func deleteContact(userID: String) async throws {}
     func clearHistory(userID: String) async throws {}
     func refreshUserProfiles(userIDs: [String]) async throws -> [RemoteIMUserProfile] { [] }
     func refreshPresenceStatuses(userIDs: [String]) async throws -> [String: RemoteIMPresenceStatus] { [:] }
     func subscribePresenceStatuses(userIDs: [String]) async throws {}
     func updateApplicationBadgeCount(_ count: Int) {}
+}
+
+struct AgentFileArtifactUITestRoot: View {
+    @StateObject private var state: RemoteIMAppState
+    @State private var started = false
+
+    init() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("owned-file-card-" + UUID().uuidString)
+        let defaults = UserDefaults(suiteName: "owned-file-card-" + UUID().uuidString)!
+        _state = StateObject(wrappedValue: RemoteIMAppState(settingsStore: LocalSettingsStore(defaults: defaults),
+            historyStore: LocalChatHistoryStore(baseDirectoryURL: directory), client: AccountTestIMClient(),
+            avatarUploader: AccountTestAvatarUploader(), loadedSettings: .empty))
+    }
+
+    var body: some View {
+        AIAssistantView().environmentObject(state).onAppear {
+            guard !started else { return }
+            started = true
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("owned-file-artifacts-" + UUID().uuidString)
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let pdf = directory.appendingPathComponent("本轮报告.pdf")
+                let bytes = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 320, height: 440)).pdfData { context in
+                    context.beginPage()
+                    ("Owned file preview" as NSString).draw(at: CGPoint(x: 30, y: 50),
+                        withAttributes: [.font: UIFont.systemFont(ofSize: 20)])
+                }
+                try bytes.write(to: pdf)
+                let archive = directory.appendingPathComponent("资料归档.zip")
+                try Data("PK-owned-ui-fixture".utf8).write(to: archive)
+                AIAssistantModel.shared.installFileArtifactUITestFixture(workspace: directory, files: [pdf, archive])
+            } catch {
+                AIAssistantModel.shared.showTransientError("自有文件卡片样本准备失败")
+            }
+        }
+    }
 }
 
 struct AccountToolsUITestRoot: View {
@@ -104,6 +194,10 @@ struct AccountToolsUITestRoot: View {
                 Task {
                     if ProcessInfo.processInfo.arguments.contains("--im-query-contract-ui-test") {
                         await runIMQueryContract()
+                    } else if ProcessInfo.processInfo.environment["MAICHAT_ACCOUNT_TOOLS_CASE"] == "file-send" {
+                        if let point = ProcessInfo.processInfo.environment["MAICHAT_FILE_CANCEL_POINT"] {
+                            await runOwnedFileCancellation(point: point)
+                        } else { await runOwnedFileSendContract() }
                     } else { await run() }
                 }
             }
@@ -121,6 +215,123 @@ struct AccountToolsUITestRoot: View {
         if result.errorCode != nil { throw AIBackendError(message: result.errorMessage ?? "host failed") }
         let data = Data((result.output ?? "").utf8)
         return try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    }
+
+    // 只走正常宿主/普通文件发送与自有 SDK 替身；不连接服务、不创建真实好友或读真实库。
+    @MainActor private func runOwnedFileSendContract() async {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("owned-agent-file-send-" + UUID().uuidString)
+        defer {
+            for dispatch in client.fileDispatches { try? FileManager.default.removeItem(at: dispatch.file.fileURL) }
+            try? FileManager.default.removeItem(at: directory)
+        }
+        do {
+            state.configureGroupUITestFixture()
+            AIMobileHostToolProvider.shared.appState = state
+            client.allowsOwnedFileSend = true
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            AIAssistantModel.shared.installVideoToolTestWorkspace(directory.path)
+            guard let peer = state.chatState.contacts.first?.userID else {
+                throw AIBackendError(message: "Owned fixture needs a contact")
+            }
+            let samples: [(String, Data, String)] = [
+                ("自有报告.pdf", Data("%PDF-1.4\nowned fixture bytes\n%%EOF".utf8), "application/pdf"),
+                ("owned.payload", Data([0, 1, 255, 128, 0, 42]), "application/octet-stream"),
+            ]
+            for (name, bytes, mime) in samples {
+                let source = directory.appendingPathComponent(name)
+                try bytes.write(to: source)
+                let result = try object(await call("maichat_send_media",
+                    ["peer_id": peer, "type": "file", "file_path": source.path, "caption": "Owned file caption"]))
+                try check(result["sent"] as? Bool == true && result["message_kind"] as? String == "file",
+                          "普通文件没有作为文件消息返回成功")
+                guard let dispatch = client.fileDispatches.last else {
+                    throw AIBackendError(message: "Normal file SDK was not called")
+                }
+                try check(dispatch.peerID == peer && dispatch.bytes == bytes && dispatch.file.fileName == name &&
+                          dispatch.file.mimeType == mime && dispatch.caption == "Owned file caption",
+                          "文件字节、名称、类型、好友或说明丢失")
+                try check(dispatch.file.fileURL != source && (try Data(contentsOf: source)) == bytes,
+                          "发送没有保留独立持久副本或修改了原文件")
+            }
+            let count = client.fileDispatches.count
+            let empty = directory.appendingPathComponent("empty.zip")
+            try Data().write(to: empty)
+            for path in [directory.path, empty.path, directory.appendingPathComponent("missing.pdf").path] {
+                let rejected = await call("maichat_send_media", ["peer_id": peer, "type": "file", "file_path": path])
+                try check(rejected.errorCode != nil && client.fileDispatches.count == count,
+                          "目录、空文件或缺失文件进入了 SDK")
+            }
+            let source = directory.appendingPathComponent(samples[0].0)
+            let unknown = await call("maichat_send_media",
+                ["peer_id": "owned-non-contact", "type": "file", "file_path": source.path])
+            try check(unknown.errorCode != nil && client.fileDispatches.count == count,
+                      "非联系人被接受为收件人")
+            let canceled = Task { @MainActor in
+                await call("maichat_send_media", ["peer_id": peer, "type": "file", "file_path": source.path])
+            }
+            canceled.cancel()
+            let canceledResult = await canceled.value
+            try check(canceledResult.errorCode != nil && client.fileDispatches.count == count,
+                      "已取消的发送进入了 SDK")
+            client.rejectsOwnedFileSend = true
+            let failed = await call("maichat_send_media",
+                ["peer_id": peer, "type": "file", "file_path": source.path])
+            try check(failed.errorCode != nil && client.fileDispatches.count == count + 1,
+                      "SDK 明确失败被误报为成功")
+            try check(client.fileDispatches.last.map { FileManager.default.fileExists(atPath: $0.file.fileURL.path) } == true,
+                      "SDK 已派发失败行的附件被误清理")
+            status = "PASS FILE SEND: bytes/name/MIME/caption, validation, cancellation and SDK failure"
+            print(status)
+        } catch {
+            status = "FAIL FILE SEND: \(error.localizedDescription)"
+            print(status)
+        }
+    }
+
+    @MainActor private func runOwnedFileCancellation(point: String) async {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("owned-file-cancel-" + UUID().uuidString)
+        var copied: URL?
+        defer {
+            FileSendCopyUITestGate.shared.release()
+            FileSendPreparedUITestGate.release()
+            if let copied { try? FileManager.default.removeItem(at: copied) }
+            try? FileManager.default.removeItem(at: directory)
+        }
+        do {
+            state.configureGroupUITestFixture()
+            AIMobileHostToolProvider.shared.appState = state
+            client.allowsOwnedFileSend = true
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            AIAssistantModel.shared.installVideoToolTestWorkspace(directory.path)
+            let source = directory.appendingPathComponent("owned.bin")
+            let bytes = Data([0, 1, 2, 255])
+            try bytes.write(to: source)
+            let peer = state.chatState.contacts.first!.userID
+            if point == "copy" { FileSendCopyUITestGate.shared.arm() }
+            else { FileSendPreparedUITestGate.arm() }
+            let send = Task { @MainActor in
+                await call("maichat_send_media", ["peer_id": peer, "type": "file", "file_path": source.path])
+            }
+            for _ in 0..<200 {
+                copied = point == "copy" ? FileSendCopyUITestGate.shared.copiedURL() : FileSendPreparedUITestGate.copiedURL
+                if copied != nil { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            guard let target = copied else { send.cancel(); throw AIBackendError(message: "Owned cancellation gate was not reached") }
+            send.cancel()
+            FileSendCopyUITestGate.shared.release()
+            FileSendPreparedUITestGate.release()
+            let result = await send.value
+            try check(result.errorCode != nil && client.fileDispatches.isEmpty, "取消后仍进入 SDK")
+            try check(!FileManager.default.fileExists(atPath: target.path), "取消后遗留未派发的文件副本")
+            try check(try Data(contentsOf: source) == bytes, "用户原文件被改写")
+            status = "PASS FILE CANCEL: " + point
+            print(status)
+        } catch {
+            status = "FAIL FILE CANCEL: " + point + " " + error.localizedDescription
+            print(status)
+        }
     }
 
     @MainActor private func blockOwnedMainForBudgetProbe() { Thread.sleep(forTimeInterval: 5.3) }

@@ -1150,6 +1150,14 @@ target_compile_definitions(agent_panel_session_test PRIVATE
 target_link_libraries(agent_panel_session_test PRIVATE remote_im_desktop_ui remote_im_desktop_app
   remote_im_core maichat_agent maichat_markdown Qt6::Widgets Qt6::Test)
 
+add_executable(agent_file_delivery_ui_test tests/AgentFileDeliveryUiTest.cpp)
+if(APPLE)
+  target_sources(agent_file_delivery_ui_test PRIVATE tests/AgentFileDeliveryUiTestMac.mm)
+  target_link_libraries(agent_file_delivery_ui_test PRIVATE "-framework PDFKit")
+endif()
+target_link_libraries(agent_file_delivery_ui_test PRIVATE remote_im_desktop_ui Qt6::Test)
+add_test(NAME agent_file_delivery_ui_test COMMAND agent_file_delivery_ui_test)
+
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_executable(video_circle_dialog_test tests/VideoCircleDialogTest.cpp)
 target_compile_definitions(video_circle_dialog_test PRIVATE

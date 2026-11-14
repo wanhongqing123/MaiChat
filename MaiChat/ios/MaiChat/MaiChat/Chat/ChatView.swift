@@ -4736,7 +4736,8 @@ struct ImageBubbleContent: View {
     }
 }
 
-private struct FileBubbleContent: View {
+// IM 与创作中心复用文件内容行，按真实类型和大小展示普通文件。
+struct FileBubbleContent: View {
     let attachment: RemoteIMFileAttachment
 
     var body: some View {
@@ -4755,11 +4756,7 @@ private struct FileBubbleContent: View {
                     .foregroundStyle(RemoteIMStyle.textPrimary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(
-                    isGitDiff
-                        ? "代码 Diff · 点击查看"
-                        : attachment.mimeType == "text/html" ? "HTML 文件" : "Markdown 文件"
-                )
+                Text(detail)
                     .font(AppTypography.metadata.weight(.medium))
                     .foregroundStyle(RemoteIMStyle.textSecondary)
             }
@@ -4770,6 +4767,21 @@ private struct FileBubbleContent: View {
 
     private var isGitDiff: Bool {
         RemoteIMGitDiffDisplayPolicy.isGitDiff(attachment)
+    }
+
+    private var detail: String {
+        let kind: String
+        if isGitDiff { kind = "代码 Diff" }
+        else if attachment.mimeType == "text/html" { kind = "HTML 文件" }
+        else if attachment.mimeType == "text/markdown" { kind = "Markdown 文件" }
+        else {
+            let ext = (attachment.fileName as NSString).pathExtension.uppercased()
+            kind = ext.isEmpty ? "文件" : ext + " 文件"
+        }
+        if let bytes = attachment.sizeBytes, bytes > 0 {
+            return kind + " · " + ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+        }
+        return kind + " · 点击查看"
     }
 }
 

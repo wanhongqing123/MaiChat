@@ -1164,11 +1164,12 @@ void registerMaiChatHostTools(MaiToolRegistry& tools,
         true);
     add("maichat_send_media",
         "Send an accessible Agent workspace image or video as a persistent media bubble, "
-        "or audio as a file card. The optional caption stays in the same media message. "
+        "or audio/generic files as file cards. Use type=file for PDF, documents, archives "
+        "and other ordinary files. The optional caption is preserved by the normal host sender. "
         "Approval follows the Agent policy.",
-        // file_path 指 Agent 可访问媒体；type 为 image/video/audio；caption 另发文本。
+        // file_path 指 Agent 可访问的文件；平台复用普通 sender 保留附件与说明。
         R"({"type":"object","properties":{"peer_id":{"type":"string"},"file_path":{"type":"string"},)"
-            R"("type":{"type":"string","enum":["image","video","audio"]},"caption":{"type":"string"}},)"
+            R"("type":{"type":"string","enum":["image","video","audio","file"]},"caption":{"type":"string"}},)"
             R"("required":["peer_id","file_path","type"],"additionalProperties":false})",
         true);
     add("maichat_reply_message",

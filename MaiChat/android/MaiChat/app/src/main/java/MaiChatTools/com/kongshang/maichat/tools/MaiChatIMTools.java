@@ -445,8 +445,9 @@ final class MaiChatIMTools {
             if (peer.equals(contact.userId())) contactExists = true;
         if (!contactExists || source == null || !source.isFile())
             throw new IllegalArgumentException("peer_id 和工作区 file_path 必须有效");
-        if (!kind.equals("image") && !kind.equals("video") && !kind.equals("audio"))
-            throw new IllegalArgumentException("type 只能是 image、video 或 audio");
+        if (!kind.equals("image") && !kind.equals("video") && !kind.equals("audio")
+                && !kind.equals("file"))
+            throw new IllegalArgumentException("type 只能是 image、video、audio 或 file");
         if (source.length() <= 0 || source.length() > (kind.equals("image")
             ? 20L * 1024 * 1024 : 1024L * 1024 * 1024))
             throw new IllegalArgumentException("媒体文件为空或超出大小限制");
@@ -471,8 +472,10 @@ final class MaiChatIMTools {
         } else if (kind.equals("video")) {
             queued = session.sendVideoMessageTo(peer, prepareAgentVideo(copied, store));
         } else {
+            // 普通附件和音频共用既有文件发送，但文档不能伪装成音频 MIME。
             queued = session.sendFileMessageTo(peer, copied.getAbsolutePath(),
-                source.getName(), audioMimeType(source.getName()), copied.length());
+                source.getName(), kind.equals("audio") ? audioMimeType(source.getName())
+                    : fileMimeType(source.getName()), copied.length());
         }
         boolean captionQueued = true;
         if (!caption.isEmpty()) {
@@ -494,6 +497,14 @@ final class MaiChatIMTools {
         if (lower.endsWith(".wav")) return "audio/wav";
         if (lower.endsWith(".ogg")) return "audio/ogg";
         return "audio/mpeg";
+    }
+
+    /** 只标注文件类型，不解码文档；未知后缀仍按普通二进制附件发送。 */
+    private static String fileMimeType(String name) {
+        int dot = name.lastIndexOf('.');
+        String extension = dot < 0 ? "" : name.substring(dot + 1).toLowerCase(Locale.ROOT);
+        String mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension);
+        return mime == null ? "application/octet-stream" : mime;
     }
 
     private JSONObject hostBroadcastText(JSONObject arguments) throws Exception {

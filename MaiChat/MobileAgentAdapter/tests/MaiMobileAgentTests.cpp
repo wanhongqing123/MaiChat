@@ -1467,11 +1467,11 @@ static void sessionIMCabiContract() {
 }
 
 // 消费正常 configure/send 发出的真实模型请求，只连接自有环回 SSE 端点。
-// 暂停视频不能连带移除图片或可灵，也不能继续在系统提示里推荐万相付费重试。
-static void wanVideoPausedRequestContract() {
+// 万相视频及付费图片生成暂停后不能向模型公开；保留其它视频和本地免费图像处理。
+static void paidMediaPausedRequestContract() {
     struct Fixture {
         MaiFilePath root = MaiFileSystem::temporaryDirectory().append(
-            MaiFilePath::fromUtf8("mai-mobile-wan-paused-" + MaiIdGenerator::newEventId()));
+            MaiFilePath::fromUtf8("mai-mobile-media-paused-" + MaiIdGenerator::newEventId()));
         httplib::Server server;
         std::thread listener;
         void* agent = nullptr;
@@ -1490,20 +1490,43 @@ static void wanVideoPausedRequestContract() {
         try {
             const Json body = Json::parse(request.body);
             bool wanVideo = false, wanImage = false, klingVideo = false, klingImage = false;
+            bool miniMaxImage = false, glmImage = false, seedreamImage = false;
+            bool viewImage = false, localTransform = false, fileDelivery = false;
             for (const auto& tool : body.at("tools")) {
                 const auto name = tool.at("function").at("name").get<std::string>();
                 wanVideo |= name == "wan_video";
                 wanImage |= name == "wan_image";
                 klingVideo |= name == "kling_bailian_video";
                 klingImage |= name == "kling_bailian_image";
+                miniMaxImage |= name == "minimax_image";
+                glmImage |= name == "glm_image";
+                seedreamImage |= name == "seedream_image";
+                viewImage |= name == "view_image";
+                localTransform |= name == "mobile_transform_image";
+                if (name == "agent_send_file") {
+                    const auto& schema = tool.at("function").at("parameters");
+                    const auto& properties = schema.at("properties");
+                    fileDelivery = properties.size() == 2 && properties.contains("file_path") &&
+                                   properties.contains("caption") &&
+                                   schema.at("required") == Json::array({"file_path"});
+                }
             }
             const auto& system = body.at("messages").front();
             const std::string prompt = system.at("content").get<std::string>();
-            valid = system.at("role") == "system" && !wanVideo && wanImage && klingVideo && klingImage &&
-                    prompt.find("Wan video generation (wan_video) is temporarily disabled to control costs.") !=
-                        std::string::npos &&
-                    prompt.find("Do not submit or revise Wan video tasks") != std::string::npos &&
-                    prompt.find("silently choose a replacement model") != std::string::npos;
+            std::fprintf(
+                stderr,
+                "OBSERVE owned catalog: wan_video=%d wan_image=%d kling_image=%d minimax_image=%d "
+                "glm_image=%d seedream_image=%d kling_video=%d view_image=%d local_transform=%d agent_file=%d\n",
+                wanVideo, wanImage, klingImage, miniMaxImage, glmImage, seedreamImage, klingVideo, viewImage,
+                localTransform, fileDelivery);
+            valid =
+                system.at("role") == "system" && !wanVideo && !wanImage && klingVideo && !klingImage && !miniMaxImage &&
+                !glmImage && !seedreamImage && viewImage && localTransform && fileDelivery &&
+                prompt.find("Wan video generation (wan_video) is temporarily disabled to control costs.") !=
+                    std::string::npos &&
+                prompt.find("Paid image generation is temporarily disabled to control costs.") != std::string::npos &&
+                prompt.find("Do not submit or revise Wan video tasks") != std::string::npos &&
+                prompt.find("silently choose a replacement model") != std::string::npos;
             ++requests;
             response.set_content(frame({{"content", "owned catalog verified"}}, "stop") + "data: [DONE]\n\n",
                                  "text/event-stream");
@@ -1542,24 +1565,27 @@ static void wanVideoPausedRequestContract() {
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
     CHECK(finished && requests.load() == 1 && valid.load());
-    std::puts("PASS: normal Mobile model request hides Wan video, retains Wan image/Kling and explains cost pause");
+    std::puts(
+        "PASS: normal Mobile model request hides Wan video and paid images, retains local image tools and Kling video");
 }
 
 int main(int argc, char** argv) {
     const bool wanPausedOnly = argc == 2 && std::strcmp(argv[1], "--wan-video-paused-only") == 0;
-    if (argc == 1 || wanPausedOnly) {
+    const bool imagePausedOnly = argc == 2 && std::strcmp(argv[1], "--paid-image-paused-only") == 0;
+    if (argc == 1 || wanPausedOnly || imagePausedOnly) {
         try {
-            wanVideoPausedRequestContract();
+            paidMediaPausedRequestContract();
         } catch (const std::exception& error) {
-            std::fprintf(stderr, "FAIL: Wan video paused request contract: %s\n", error.what());
+            std::fprintf(stderr, "FAIL: paid media paused request contract: %s\n", error.what());
             return 1;
         }
-        if (wanPausedOnly) return 0;
+        if (wanPausedOnly || imagePausedOnly) return 0;
     }
     const bool sessionIMOnly = argc == 2 && std::strcmp(argv[1], "--session-im-binding-only") == 0;
     if (argc == 1 || sessionIMOnly) {
-        try { sessionIMCabiContract(); }
-        catch (const std::exception& error) {
+        try {
+            sessionIMCabiContract();
+        } catch (const std::exception& error) {
             std::fprintf(stderr, "FAIL: Session IM C ABI contract: %s\n", error.what());
             return 1;
         }

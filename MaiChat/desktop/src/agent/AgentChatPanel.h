@@ -174,6 +174,8 @@ private:
     void refreshToolCard(const QString& messageId, const QString& partId);
     void appendPdfPreview(const QString& messageId, const QString& partId, const QString& output,
                           const QString& workspace);
+    bool appendAgentFileCard(const QString& messageId, const QString& partId, const QString& output,
+                             const QString& workspace);
     bool appendAgentMediaCard(const QString& messageId, const QString& partId, const QString& output,
                               const QString& workspace);
     void appendTextMediaCards(const QString& messageId, const QString& text,

@@ -31,6 +31,7 @@
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QLocale>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
@@ -77,6 +78,7 @@
 #include <variant>
 
 #include "MaiPathGuard.h"
+#include "MaiAgentSendFileTool.h"
 #include "MaiQuestionTranscript.h"
 #include "agent/AgentController.h"
 #include "agent/AgentToolGroupWidget.h"
@@ -84,6 +86,7 @@
 #include "ui/ComposerResizeSplitter.h"
 #include "ui/ComposerTextEdit.h"
 #include "ui/ImagePreviewDialog.h"
+#include "ui/MainWindow.h"
 #include "ui/MessageImageLoader.h"
 #include "ui/PdfPreviewDialog.h"
 #include "ui/UiZoom.h"
@@ -2868,9 +2871,13 @@ bool AgentChatPanel::appendStoredMessage(const MaiMessage& message, const MaiSes
                 (tool->state == MaiToolState::Pending || tool->state == MaiToolState::Running))
                 activeAssistantHasVisibleActivity = true;
             if (appendQuestionPart(runtime_->sessionId, messageId, part)) continue;
-            if (tool->tool == "agent_send_media" && tool->state == MaiToolState::Completed &&
-                appendAgentMediaCard(fromUtf8(message.id), partId, fromUtf8(tool->output),
-                                     fromUtf8(selectedSession.directory))) {
+            if (tool->state == MaiToolState::Completed &&
+                ((tool->tool == "agent_send_media" &&
+                  appendAgentMediaCard(fromUtf8(message.id), partId, fromUtf8(tool->output),
+                                       fromUtf8(selectedSession.directory))) ||
+                 (tool->tool == "agent_send_file" &&
+                  appendAgentFileCard(fromUtf8(message.id), partId, fromUtf8(tool->output),
+                                      fromUtf8(selectedSession.directory))))) {
                 // A pending generic tool card may have become a media card
                 // while this conversation was hidden. Reuse the normal live
                 // transition to remove that obsolete generic card.
@@ -3238,7 +3245,8 @@ AgentChatPanel::ToolGroupCard* AgentChatPanel::toolGroupFor(const QString& partI
         }
         // 这些工具在正文流中插入问答或独立产物，后续工具不能跨过它合组。
         const bool separateArtifact =
-            tool->tool == "agent_send_media" || tool->tool == "generate_pdf" || tool->tool == "question" ||
+            tool->tool == "agent_send_media" || tool->tool == "agent_send_file" ||
+            tool->tool == "generate_pdf" || tool->tool == "question" ||
             tool->tool == "spawn_agent";
         if (separateArtifact || firstTool.isEmpty()) firstTool = fromUtf8(part.id);
         if (fromUtf8(part.id) == partId) {
@@ -3302,10 +3310,13 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
                 return;
             }
 
-            if (tool->tool == "agent_send_media" && tool->state == MaiToolState::Completed) {
+            if ((tool->tool == "agent_send_media" || tool->tool == "agent_send_file") &&
+                tool->state == MaiToolState::Completed) {
                 MaiSession session;
                 if (runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), session) &&
-                    appendAgentMediaCard(messageId, partId, fromUtf8(tool->output), fromUtf8(session.directory))) {
+                    (tool->tool == "agent_send_file"
+                         ? appendAgentFileCard(messageId, partId, fromUtf8(tool->output), fromUtf8(session.directory))
+                         : appendAgentMediaCard(messageId, partId, fromUtf8(tool->output), fromUtf8(session.directory)))) {
                     ToolCard* existing = runtime_->toolCards.take(partId);
                     ToolGroupCard* group = runtime_->toolCardGroups.take(partId);
                     if (existing && group) group->removeCard(existing);
@@ -3343,6 +3354,109 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
         }
         return;
     }
+}
+
+bool AgentChatPanel::appendAgentFileCard(const QString& messageId, const QString& partId,
+                                        const QString& output, const QString& workspace) {
+    const QString id = partId + QStringLiteral("-agent-file");
+    if (runtime_->view->contains(id)) return true;
+    const auto artifact = QJsonDocument::fromJson(output.toUtf8()).object();
+    const QString relative = artifact.value(QStringLiteral("path")).toString();
+    const QString name = artifact.value(QStringLiteral("name")).toString();
+    const QString mime = artifact.value(QStringLiteral("mime_type")).toString();
+    const qint64 bytes = artifact.value(QStringLiteral("bytes")).toInteger(-1);
+    if (artifact.value(QStringLiteral("delivery")).toString() != QStringLiteral("current_ai_session") ||
+        artifact.value(QStringLiteral("type")).toString() != QStringLiteral("file") ||
+        relative.isEmpty() || QFileInfo(relative).isAbsolute() || name.isEmpty() || mime.isEmpty() ||
+        bytes <= 0 || bytes > 512LL * 1024 * 1024) return false;
+
+    auto* card = new QWidget;
+    card->setObjectName(QStringLiteral("agentFileCard"));
+    auto* column = new QVBoxLayout(card);
+    column->setContentsMargins(0, 0, 0, 0);
+    auto* open = new QPushButton(card);
+    open->setObjectName(QStringLiteral("agentFileOpen"));
+    open->setAccessibleName(QStringLiteral("打开文件 %1").arg(name));
+    open->setCursor(Qt::PointingHandCursor);
+    open->setFixedWidth(UiZoom::s(340));
+    UiZoom::setStyle(open, QStringLiteral("QPushButton{background:#f3f8ff;border:1px solid #c9ddf7;"
+        "border-radius:12px;text-align:left;color:#175a9e;} QPushButton:hover{background:#e9f3ff;}"));
+    auto* row = new QHBoxLayout(open);
+    row->setContentsMargins(14, 12, 14, 12);
+    auto* symbol = new QLabel(QStringLiteral("▤"), open);
+    UiZoom::setStyle(symbol, QStringLiteral("font-size:@heading3;color:#1687d4;background:transparent;"));
+    row->addWidget(symbol);
+    auto* labels = new QVBoxLayout;
+    auto* title = new QLabel(name, open);
+    title->setObjectName(QStringLiteral("agentFileName"));
+    UiZoom::setStyle(title, QStringLiteral("font-size:@detail;color:#172033;background:transparent;"));
+    title->setToolTip(name);
+    title->setText(title->fontMetrics().elidedText(name, Qt::ElideMiddle, UiZoom::s(270)));
+    labels->addWidget(title);
+    auto* detail = new QLabel(QStringLiteral("正在检查文件…"), open);
+    detail->setObjectName(QStringLiteral("agentFileDetail"));
+    UiZoom::setStyle(detail, QStringLiteral("font-size:@metadata;color:#667085;background:transparent;"));
+    labels->addWidget(detail);
+    row->addLayout(labels, 1);
+    // QPushButton 的原生 sizeHint 不包含自有两行布局；让内容决定最小高度，
+    // 否则 Cocoa 会按普通单行按钮裁掉文件名和大小，只留下空白边框。
+    open->setMinimumHeight(row->sizeHint().height());
+    column->addWidget(open);
+    const QString caption = artifact.value(QStringLiteral("caption")).toString();
+    if (!caption.isEmpty()) {
+        auto* label = new QLabel(caption, card);
+        label->setWordWrap(true);
+        UiZoom::setStyle(label, QStringLiteral("font-size:@metadata;color:#667085;"));
+        column->addWidget(label);
+    }
+
+    const QPointer<AgentChatPanel> panel(this);
+    const QPointer<QWidget> cardGuard(card);
+    const QString ownerSession = runtime_->sessionId;
+    const auto ownsWorkspace = [panel, ownerSession, workspace] {
+        MaiSession current;
+        return panel && panel->runtime_->controller->agent().getSession(toUtf8(ownerSession), current) &&
+            current.directory == toUtf8(workspace);
+    };
+    // 首次展示与点击都复用普通 Core 校验，元数据 I/O 不挤占 GUI 或模型事件回调。
+    const auto validate = [panel, cardGuard, open, detail, workspace, relative, name, mime, bytes, ownerSession, ownsWorkspace](bool preview) {
+        if (!panel || !cardGuard) return;
+        open->setEnabled(false);
+        // 同一个 session 可换工作区；排队前和回填时都核对所属 session 的原始目录。
+        if (!ownsWorkspace()) {
+            detail->setText(QStringLiteral("文件已移动或不可用"));
+            return;
+        }
+        auto* watcher = new QFutureWatcher<MaiResult<MaiAgentFile>>(cardGuard);
+        QObject::connect(watcher, &QFutureWatcher<MaiResult<MaiAgentFile>>::finished, cardGuard,
+            [watcher, panel, cardGuard, open, detail, workspace, name, mime, bytes, preview, ownerSession, ownsWorkspace] {
+                const auto result = watcher->result();
+                watcher->deleteLater();
+                if (!panel || !cardGuard) return;
+                const bool valid = ownsWorkspace() && result && result.value().name == toUtf8(name) &&
+                    result.value().mimeType == toUtf8(mime) && result.value().bytes == std::uint64_t(bytes);
+                detail->setText(valid ? QStringLiteral("%1 · 预览或另存为").arg(
+                    QLocale().formattedDataSize(bytes)) : QStringLiteral("文件已移动或不可用"));
+                open->setEnabled(valid);
+                // A 的存活卡片即使暂时切到 B，也应完成元数据回填；只有预览要求 A 可见。
+                if (!valid || !preview || panel->sessionId() != ownerSession) return;
+                const QString path = QDir(workspace).filePath(fromUtf8(result.value().relativePath));
+                // 与 IM 文件卡片共用现有 PDF/Markdown/HTML 预览和其它类型的另存为。
+                if (auto* main = dynamic_cast<MainWindow*>(panel->window()))
+                    main->openFilePreview(RemoteIMFileAttachment{path, name, mime, bytes});
+            });
+        watcher->setFuture(QtConcurrent::run([workspace, relative] {
+            MaiToolContext context;
+            context.root = toUtf8(workspace);
+            return maiPrepareAgentFile(toUtf8(relative), context);
+        }));
+    };
+    connect(open, &QPushButton::clicked, card, [validate] { validate(true); });
+    validate(false);
+    runtime_->view->addWidget(id, card);
+    recordMessageItem(messageId, id);
+    scrollToBottom();
+    return true;
 }
 
 void AgentChatPanel::appendPdfPreview(const QString& messageId, const QString& partId, const QString& output,
