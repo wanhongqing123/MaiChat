@@ -45,6 +45,11 @@
 #include <QFontMetrics>
 #include <QFontDatabase>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QPainter>
+#include <QSaveFile>
 #include <QInputMethodEvent>
 #include <QMimeData>
 #include <QTemporaryDir>
@@ -361,6 +366,7 @@ private slots:
     void maximizedImageBubbleOpensOnlyOnePreview();
     void imagePreviewKeepsConversationBackgroundStable_data();
     void imagePreviewKeepsConversationBackgroundStable();
+    void imagePreviewNativeHandoffRecording();
     void copyAttachmentToPathCopiesOverwritesAndReportsErrors();
     void ctrlShortcutsZoomWholeUi();
     void settingsPanelBorderIsNotCoveredByRows();
@@ -5043,6 +5049,172 @@ void MainWindowLayoutTest::maximizedImageBubbleOpensOnlyOnePreview() {
     reopened->close();
     QTRY_VERIFY(window.findChildren<ImagePreviewDialog*>().isEmpty());
     QTRY_VERIFY(imageLabel->graphicsEffect() == nullptr);
+}
+
+void MainWindowLayoutTest::imagePreviewNativeHandoffRecording() {
+    const QString prefix = qEnvironmentVariable("MAICHAT_PREVIEW_RECORD_PREFIX");
+    if (prefix.isEmpty()) QSKIP("Owned visual recording fixture requires an explicit private evidence path");
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("owned-preview.png"));
+    QImage pixels(2000, 1200, QImage::Format_RGB32);
+    pixels.fill(QColor(220, 40, 60));
+    {
+        QPainter painter(&pixels);
+        painter.fillRect(QRect(0, 0, 2000, 40), QColor(30, 220, 90));
+        painter.fillRect(QRect(0, 1160, 2000, 40), QColor(30, 90, 220));
+        painter.fillRect(QRect(980, 0, 40, 1200), QColor(250, 210, 30));
+        // Fine detail distinguishes a low-resolution thumbnail stretched to full size
+        // from the original bitmap that the native preview eventually presents.
+        for (int y = 300; y < 900; y += 2)
+            for (int x = 1400; x < 1900; x += 2)
+                painter.fillRect(QRect(x, y, 2, 2), ((x + y) / 2) % 2 ? Qt::black : Qt::white);
+    }
+    QVERIFY(pixels.save(path));
+    auto database = std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("owned-im.db")));
+    RemoteIMApplication app(QStringLiteral("owned-preview-user"), std::make_unique<FakeRemoteIMClient>(),
+                            std::move(database));
+    app.addContact(QStringLiteral("owned-preview-peer"), QStringLiteral("Owned preview peer"));
+    app.chatState().receiveImage(QStringLiteral("owned-preview-peer"), path, pixels.width(), pixels.height(),
+                                 QFileInfo(path).size());
+    MainWindow window(app);
+    window.setWindowTitle(QStringLiteral("MaiChat owned preview recording"));
+    window.setScreen(QGuiApplication::primaryScreen());
+    window.setWindowFlag(Qt::WindowStaysOnTopHint);
+    window.showMaximized();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    if (window.screen()->geometry().topLeft() != QPoint())
+        QSKIP("This physical-pixel fixture requires the primary screen at the native origin");
+    window.raise();
+    window.activateWindow();
+    auto* label = window.findChild<QLabel*>(QStringLiteral("messageImageLabel"));
+    QVERIFY(label);
+    QTRY_VERIFY(!label->pixmap().isNull());
+    QTest::qWait(400);
+
+    QJsonObject evidence;
+    QJsonArray gestures;
+    const auto rectangle = [](const QRect& rect) {
+        return QJsonArray{rect.x(), rect.y(), rect.width(), rect.height()};
+    };
+    const qreal dpr = window.devicePixelRatioF();
+    const QRect capture = window.frameGeometry().intersected(window.screen()->availableGeometry());
+    evidence.insert(QStringLiteral("capturePhysical"),
+                    QJsonArray{qRound(capture.x() * dpr), qRound(capture.y() * dpr), qRound(capture.width() * dpr),
+                               qRound(capture.height() * dpr)});
+    evidence.insert(QStringLiteral("dpr"), dpr);
+    evidence.insert(QStringLiteral("sourceLogical"), rectangle(QRect(label->mapToGlobal(QPoint()), label->size())));
+    evidence.insert(QStringLiteral("sourceFile"), path);
+    evidence.insert(QStringLiteral("ready"), true);
+    const auto save = [&] {
+        evidence.insert(QStringLiteral("gestures"), gestures);
+        QSaveFile file(prefix + QStringLiteral(".json"));
+        if (!file.open(QIODevice::WriteOnly)) return false;
+        file.write(QJsonDocument(evidence).toJson());
+        return file.commit();
+    };
+    QVERIFY(save());
+    // An external desktop compositor recorder starts after the owned window is exposed.
+    // Do not QWidget::grab() while animating: it repaints synchronously and misses native handoff.
+    QTest::qWait(2500);
+#ifdef Q_OS_WIN
+    const QPoint probeLogical = label->mapToGlobal(QPoint(label->width() / 4, label->height() / 2));
+    const POINT probe{qRound(probeLogical.x() * dpr), qRound(probeLogical.y() * dpr)};
+    const DWORD processId = GetCurrentProcessId();
+    struct PixelSample {
+        qint64 ms;
+        int phase;
+        COLORREF color;
+    };
+    std::vector<PixelSample> samples;
+    std::atomic<bool> sampling{true};
+    std::atomic<int> phase{0};
+    std::atomic<int> occluded{0};
+    const HDC initialDc = GetDC(nullptr);
+    const COLORREF expected = GetPixel(initialDc, probe.x, probe.y);
+    ReleaseDC(nullptr, initialDc);
+    QElapsedTimer sampleClock;
+    sampleClock.start();
+    std::thread sampler([&] {
+        const HDC dc = GetDC(nullptr);
+        while (sampling.load()) {
+            const int currentPhase = phase.load();
+            if (currentPhase) {
+                DWORD owner = 0;
+                GetWindowThreadProcessId(WindowFromPoint(probe), &owner);
+                if (owner == processId)
+                    samples.push_back({sampleClock.elapsed(), currentPhase, GetPixel(dc, probe.x, probe.y)});
+                else
+                    ++occluded;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        ReleaseDC(nullptr, dc);
+    });
+    auto stopSampler = qScopeGuard([&] {
+        sampling = false;
+        if (sampler.joinable()) sampler.join();
+    });
+#endif
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        gestures.append(QJsonObject{{QStringLiteral("cycle"), cycle},
+                                    {QStringLiteral("kind"), QStringLiteral("open")},
+                                    {QStringLiteral("unixMs"), QDateTime::currentMSecsSinceEpoch()}});
+        QVERIFY(save());
+#ifdef Q_OS_WIN
+        phase = 1;
+#endif
+        QTest::mouseClick(label, Qt::LeftButton);
+        QTest::qWait(700);
+#ifdef Q_OS_WIN
+        phase = 0;
+#endif
+        auto* preview = window.findChild<ImagePreviewDialog*>(QStringLiteral("imagePreviewDialog"));
+        QVERIFY(preview && preview->isVisible());
+        evidence.insert(QStringLiteral("previewLogical"), rectangle(preview->geometry()));
+        QVERIFY(save());
+        QTest::qWait(500);
+        gestures.append(QJsonObject{{QStringLiteral("cycle"), cycle},
+                                    {QStringLiteral("kind"), QStringLiteral("close")},
+                                    {QStringLiteral("unixMs"), QDateTime::currentMSecsSinceEpoch()}});
+        QVERIFY(save());
+#ifdef Q_OS_WIN
+        phase = 2;
+#endif
+        QTest::mouseClick(preview, Qt::LeftButton);
+        QTRY_VERIFY(window.findChildren<ImagePreviewDialog*>().isEmpty());
+        QTest::qWait(500);
+#ifdef Q_OS_WIN
+        phase = 0;
+#endif
+    }
+#ifdef Q_OS_WIN
+    sampling = false;
+    sampler.join();
+    QJsonArray badPixels;
+    for (const auto& sample : samples) {
+        if (sample.color == CLR_INVALID || qAbs(int(GetRValue(sample.color)) - int(GetRValue(expected))) > 8 ||
+            qAbs(int(GetGValue(sample.color)) - int(GetGValue(expected))) > 8 ||
+            qAbs(int(GetBValue(sample.color)) - int(GetBValue(expected))) > 8)
+            badPixels.append(QJsonObject{{QStringLiteral("ms"), sample.ms},
+                                         {QStringLiteral("phase"), sample.phase},
+                                         {QStringLiteral("rgb"), qint64(sample.color)}});
+    }
+    evidence.insert(QStringLiteral("probePhysical"), QJsonArray{int(probe.x), int(probe.y)});
+    evidence.insert(QStringLiteral("expectedRgb"), qint64(expected));
+    evidence.insert(QStringLiteral("pixelSampleCount"), int(samples.size()));
+    evidence.insert(QStringLiteral("occludedSamples"), occluded.load());
+    evidence.insert(QStringLiteral("badPixels"), badPixels);
+#endif
+    evidence.insert(QStringLiteral("done"), true);
+    QVERIFY(save());
+    // Keep the owned window covering the capture rectangle until the recorder has stopped.
+    QTest::qWait(2000);
+#ifdef Q_OS_WIN
+    QVERIFY2(occluded == 0, "Owned image probe became occluded; do not classify that as a product failure");
+    QVERIFY2(badPixels.isEmpty(),
+             qPrintable(QString::fromUtf8(QJsonDocument(badPixels).toJson(QJsonDocument::Compact))));
+#endif
 }
 
 void MainWindowLayoutTest::imagePreviewKeepsConversationBackgroundStable_data() {

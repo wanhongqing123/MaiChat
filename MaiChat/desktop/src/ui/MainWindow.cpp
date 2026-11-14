@@ -7081,11 +7081,19 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
         sourceForRestore->graphicsEffect() == sourceOpacity->data())
       sourceForRestore->setGraphicsEffect(nullptr);
   });
+  const auto transitionPixmap = [dialog] {
+    if (dialog->sourceImage().isNull()) return QPixmap();
+    const qreal dpr = dialog->devicePixelRatioF();
+    QPixmap pixels = dialog->sourceImage().scaled(
+        (QSizeF(dialog->size()) * dpr).toSize(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    pixels.setDevicePixelRatio(dpr);
+    return pixels;
+  };
 
   if (source) {
     QPointer<QWidget> sourceGuard(source);
     auto closing = std::make_shared<bool>(false);
-    dialog->setCloseHandler([this, dialog, sourceGuard, sourceOpacity, closing] {
+    dialog->setCloseHandler([this, dialog, sourceGuard, sourceOpacity, closing, transitionPixmap] {
       if (*closing) return true;
       if (!sourceGuard || !sourceGuard->isVisible() || dialog->sourceImage().isNull())
         return false;
@@ -7118,11 +7126,14 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
       inputBlocker->raise();
       auto *snapshot = new QLabel(this);
       snapshot->setObjectName(QStringLiteral("imagePreviewTransitionSnapshot"));
-      snapshot->setPixmap(dialog->sourceImage());
+      snapshot->setPixmap(transitionPixmap());
       snapshot->setScaledContents(true);
       snapshot->setGeometry(start);
       snapshot->show();
       snapshot->raise();
+      // 先把接手的图片提交到主窗 backing store。show/raise 只排队绘制，
+      // 此时就移走原生预览会露出尚未绘制的会话背景一帧。
+      snapshot->repaint();
       dialog->setWindowOpacity(0.0);
       dialog->hide();
       auto *shrink = new QPropertyAnimation(snapshot, "geometry", snapshot);
@@ -7176,7 +7187,10 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
       inputBlocker->raise();
       auto *snapshot = new QLabel(this);
       snapshot->setObjectName(QStringLiteral("imagePreviewTransitionSnapshot"));
-      snapshot->setPixmap(thumbnail);
+      // 只预缩放一次到最终屏幕像素尺寸，避免每帧重采样超大原图，
+      // 也避免放大末尾从低清缩略图突然切换到原图。
+      const QPixmap originalFrame = transitionPixmap();
+      snapshot->setPixmap(originalFrame.isNull() ? thumbnail : originalFrame);
       snapshot->setScaledContents(true);
       snapshot->setGeometry(start);
       snapshot->show();
@@ -7193,6 +7207,10 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
       connect(expand, &QPropertyAnimation::finished, this,
               [this, dialog, inputBlocker, snapshot] {
                 if (imagePreviewDialog_ == dialog) {
+                  // 最后一帧直接显示同一屏幕像素图，和独立预览的首次绘制对齐。
+                  snapshot->setScaledContents(false);
+                  snapshot->setAlignment(Qt::AlignCenter);
+                  snapshot->repaint();
                   dialog->show();
                   dialog->raise();
                   dialog->activateWindow();
