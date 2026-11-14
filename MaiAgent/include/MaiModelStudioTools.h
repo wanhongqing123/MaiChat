@@ -37,12 +37,14 @@ std::unique_ptr<MaiTool> makeMaiBailianKlingVideoTool(
 
 // Wan2.7-Image 接受文本及最多九张本地参考图；图片先上传私有 OSS，模型只收到 HTTPS
 // 地址。同步生成一张工作区 PNG，原图不修改；调用可能阻塞，必须在工具工作线程执行。
+// 当前因费用暂停新增生成和修订，在读取凭据、上传及 HTTP 前拒绝；原旧任务查询仍保留。
 std::unique_ptr<MaiTool> makeMaiWanImageTool(MaiWanCredentialsProvider credentials,
                                              std::string caBundlePath = {},
                                              MaiCreativeMediaUploadProvider uploadMedia = {});
 
 // 百炼可灵图像：标准版文生/单图，Omni 支持多图。异步任务保存 ID 并由 continue
 // 下载 PNG；只生成一张，原图不修改。本地参考图使用与万相一致的私有 OSS 回调。
+// 当前新图生成和参考图生成均因费用暂停，保留代码及已实现的旧任务查询路径。
 std::unique_ptr<MaiTool> makeMaiBailianKlingImageTool(
     MaiWanCredentialsProvider credentials, std::string caBundlePath = {},
     MaiCreativeMediaUploadProvider uploadMedia = {});

@@ -124,6 +124,19 @@ MaiToolResult maiCreativeInvalid(const std::string& message) {
     return maiCreativeFailure(MaiErrorCode::InvalidInput, "invalid_input", message);
 }
 
+MaiToolResult maiCreativeImageGenerationPaused() {
+    MaiToolExecution execution;
+    execution.status = MaiToolExecutionStatus::NotStarted;
+    execution.effectStatus = MaiToolEffectStatus::None;
+    execution.started = false;
+    return maiCreativeFailure(MaiErrorCode::NotSupported, "temporarily_disabled",
+                              "Paid image generation is temporarily disabled to control costs. "
+                              "Text-to-image generation, image editing, references, and paid image "
+                              "revisions are unavailable. "
+                              "No task was submitted. Do not retry or switch models silently.")
+        .withExecution(execution);
+}
+
 bool maiCreativeValidId(const std::string& id) {
     return !id.empty() && id.size() <= 128 &&
            std::all_of(id.begin(), id.end(), [](unsigned char character) {

@@ -19,6 +19,8 @@ using MaiMiniMaxApiKeyProvider = std::function<std::string()>;
 std::unique_ptr<MaiTool> makeMaiMiniMaxVideoTool(MaiMiniMaxApiKeyProvider apiKey,
                                                  std::string caBundlePath = {},
                                                  MaiCreativeMediaUploadProvider uploadMedia = {});
+// 仅图像分支当前因费用暂停；文生图和参考图生成在凭据、上传及 HTTP 之前拒绝。
+// 上方视频工厂的付费确认、执行和旧任务管理不受图像暂停影响。
 std::unique_ptr<MaiTool> makeMaiMiniMaxImageTool(MaiMiniMaxApiKeyProvider apiKey,
                                                  std::string caBundlePath = {},
                                                  MaiCreativeMediaUploadProvider uploadMedia = {});

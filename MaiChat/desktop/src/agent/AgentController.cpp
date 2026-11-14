@@ -95,12 +95,15 @@ short-lived private OSS HTTPS URLs to the provider. If OSS upload fails, stop be
 submission and do not embed local media bytes as Base64.
 For Kling video, use kling_bailian_video with the Beijing Wan API Key and Workspace. Confirm its
 Turbo, Standard, or Omni variant before paid submission.
-For Kling images use kling_bailian_image with the same credentials; for Wan images use wan_image.
-For MiniMax images use minimax_image: text alone is text-to-image; one image_path or image_url
-is character-reference image-to-image, not arbitrary pixel-preserving editing.
+Paid image generation is temporarily disabled to control costs. This includes text-to-image,
+image editing, reference generation, and paid revisions through every image specialist. Do not
+submit, revise, retry, or substitute another paid image model. Existing supported task recovery
+remains available internally. Local image viewing, cropping, and format conversion remain available.
+The later provider retry guidance applies only after image generation is explicitly re-enabled;
+it never authorizes a currently paused image call.
 Wan video generation (wan_video) is temporarily disabled to control costs. Do not submit or
 revise Wan video tasks, retry them, or silently choose a replacement model. Existing submitted
-tasks can still be recovered internally. Wan image and other listed video models are separate;
+tasks can still be recovered internally. Other listed video models are separate;
 ask the user to choose before using a different video model.
 Do not default to
 flipping or oil-painting a real face to evade review. For other image issues, if an image edit is
@@ -367,12 +370,13 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     const auto glmKey = [provider = credentials.glmApiKeyProvider, key = toUtf8(credentials.glmApiKey)] {
         return provider ? toUtf8(provider()) : key;
     };
-    tools->add(makeMaiGlmImageTool(glmKey));
+    // 费用暂停只隐藏付费图像生成；保留实例供已接线的旧任务恢复，普通工厂同样受执行闸门约束。
+    tools->addInternal(makeMaiGlmImageTool(glmKey));
     const auto miniMaxKey = [provider = credentials.miniMaxApiKeyProvider, key = toUtf8(credentials.miniMaxApiKey)] {
         return provider ? toUtf8(provider()) : key;
     };
     tools->add(makeMaiMiniMaxVideoTool(miniMaxKey, {}, miniMaxUploadMedia));
-    tools->add(makeMaiMiniMaxImageTool(miniMaxKey, {}, miniMaxUploadMedia));
+    tools->addInternal(makeMaiMiniMaxImageTool(miniMaxKey, {}, miniMaxUploadMedia));
     const auto wanCredentials = [provider = credentials.wanCredentialsProvider, key = toUtf8(credentials.wanApiKey),
                                  workspace = toUtf8(credentials.wanWorkspaceId)] {
         if (provider) {
@@ -384,8 +388,8 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     // 因费用暂停万相视频的新任务；后台仍按原名字查询和回收已提交任务。
     tools->addInternal(makeMaiWanVideoTool(wanCredentials, {}, wanUploadMedia));
     tools->add(makeMaiBailianKlingVideoTool(wanCredentials, {}, klingUploadMedia));
-    tools->add(makeMaiWanImageTool(wanCredentials, {}, wanUploadMedia));
-    tools->add(makeMaiBailianKlingImageTool(wanCredentials, {}, klingUploadMedia));
+    tools->addInternal(makeMaiWanImageTool(wanCredentials, {}, wanUploadMedia));
+    tools->addInternal(makeMaiBailianKlingImageTool(wanCredentials, {}, klingUploadMedia));
 #if defined(MAICHAT_EMBEDDED_FFMPEG)
     tools->add(makeMaiViewImageTool(makeMaiFfmpegImagePreview(ffmpegEngine)));
     tools->add(makeMaiFfmpegTool(ffmpegEngine));

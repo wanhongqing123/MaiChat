@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "MaiBlockingCheck.h"
+#include "MaiCreativeMediaSupport.h"
 #include "MaiDownloadFileTool.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
@@ -236,12 +237,11 @@ public:
         return "glm_image";
     }
     std::string description() const override {
-        // 仅保留 glm-image 文生图。该异步接口不接入已有图片，也不能编辑已有视频；
-        // discover 查真实能力，delegate 付费提交，continue 查询并下载结果。
-        return "GLM-Image specialist for paid text-to-image. Use discover to inspect "
-               "capabilities, delegate after confirmation, and continue to check a saved task. "
-               "Existing-image editing and video generation are not provided by this tool. "
-               "The App automatically reports and downloads a completed image.";
+        // 保留供应商协议与实现，说明暂停事实而不是引导付费重试。
+        return "Paid image generation is temporarily disabled to control costs. "
+               "This includes text-to-image, edits, references, and paid revisions. "
+               "Use discover for retained capabilities and existing supported task recovery; "
+               "do not retry or switch models silently. GLM-Image implementation is retained.";
     }
     std::string parametersSchema() const override {
         const std::string raw =
@@ -255,7 +255,8 @@ public:
         // 这些英文描述会直接给主模型。图片生成只使用文字，不接受 image_path；
         // 不要因 GLM 同平台还有视频型号，就推断此工具能生成视频。
         fields["action"]["description"] =
-            "discover reads capabilities; delegate starts a paid image task; continue checks it";
+            "discover reads paused capabilities; new generation is disabled; continue checks an "
+            "existing task";
         fields["message"]["description"] = "Required description of the new image";
         fields["context"]["description"] = "Only relevant visual constraints";
         fields["size"]["description"] =
@@ -270,8 +271,7 @@ public:
     }
     std::optional<MaiSpecialistInfo> specialistInfo() const override {
         const bool configured = mKey && !mKey().empty();
-        const auto status = configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                       : MaiSpecialistCapabilityStatus::NotConfigured;
+        const auto status = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
         MaiSpecialistInfo info;
         info.toolName = name();
         info.modelId = kImageModel;
@@ -289,15 +289,18 @@ public:
     bool requiresPerCallApproval(const std::string& raw) const override {
         const Json args = Json::parse(raw, nullptr, false);
         const std::string action = value(args, "action");
-        return action != "discover" && action != "continue";
+        return action != "delegate" && action != "revise" && action != "discover" &&
+               action != "continue";
     }
-    bool requiresPaidApproval(const std::string& raw) const override {
-        const Json args = Json::parse(raw, nullptr, false);
-        return args.is_object() && value(args, "action") == "delegate";
+    bool requiresPaidApproval(const std::string&) const override {
+        return false;
     }
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
         const Json args = Json::parse(raw, nullptr, false);
         if (!args.is_object()) return invalid("arguments must be a JSON object");
+        const std::string action = value(args, "action");
+        // 费用闸门先于字段、凭据、素材和网络，旧工厂实例也不能绕过。
+        if (action == "delegate" || action == "revise") return maiCreativeImageGenerationPaused();
         const Json schema = Json::parse(parametersSchema());
         for (auto field = args.begin(); field != args.end(); ++field) {
             if (!schema["properties"].contains(field.key()))
@@ -310,7 +313,6 @@ public:
         }
         if (args.contains("poll_once") && !args["poll_once"].is_boolean())
             return invalid("poll_once must be boolean");
-        const std::string action = value(args, "action");
         if (action == "discover") {
             const MaiSpecialistInfo info = *specialistInfo();
             Json capabilities = Json::array();
@@ -321,12 +323,16 @@ public:
                      {"api_support", capability.apiSupported},
                      {"tool_status", maiSpecialistCapabilityStatusToString(capability.status)},
                      {"limitation", capability.limitation}});
-            return MaiToolResult::success(Json{{"tool_kind", "model_backed"},
-                                               {"bound_model", kImageModel},
-                                               {"configured", info.configured},
-                                               {"capabilities", std::move(capabilities)},
-                                               {"reply", "GLM image capabilities listed"}}
-                                              .dump());
+            return MaiToolResult::success(
+                Json{{"tool_kind", "model_backed"},
+                     {"bound_model", kImageModel},
+                     {"configured", info.configured},
+                     {"generation_enabled", false},
+                     {"capabilities", std::move(capabilities)},
+                     {"reply",
+                      "GLM image generation is temporarily disabled to control costs; "
+                      "existing supported task recovery remains available."}}
+                    .dump());
         }
         if (action != "delegate" && action != "continue")
             return invalid("action must be discover, delegate, or continue");

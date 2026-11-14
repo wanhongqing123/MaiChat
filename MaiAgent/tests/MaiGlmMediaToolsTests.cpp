@@ -35,19 +35,19 @@ void testImageDiscoveryAndApproval() {
     CHECK(schema["properties"]["action"]["enum"].dump().find("delete") == std::string::npos);
     CHECK(!image->requiresPerCallApproval(R"({"action":"discover"})"));
     CHECK(!image->requiresPerCallApproval(R"({"action":"continue"})"));
-    CHECK(image->requiresPerCallApproval(R"({"action":"delegate"})"));
-    CHECK(image->requiresPaidApproval(R"({"action":"delegate"})"));
+    CHECK(!image->requiresPerCallApproval(R"({"action":"delegate"})"));
+    CHECK(!image->requiresPaidApproval(R"({"action":"delegate"})"));
     CHECK(!image->requiresPaidApproval(R"({"action":"continue"})"));
     auto info = nlohmann::json::parse(image->execute(R"({"action":"discover"})", context).output());
     CHECK(info.at("bound_model") == "glm-image");
     CHECK(!info.at("configured").get<bool>());
-    CHECK(info.at("capabilities")[0].at("tool_status") == "not_configured");
+    CHECK(info.at("capabilities")[0].at("tool_status") == "temporarily_disabled");
     CHECK(info.dump().find("existing_image_edit") != std::string::npos);
     CHECK(info.dump().find("cogvideox") == std::string::npos);
     key = "test-key";
     info = nlohmann::json::parse(image->execute(R"({"action":"discover"})", context).output());
     CHECK(info.at("configured").get<bool>());
-    CHECK(info.at("capabilities")[0].at("tool_status") == "implemented_unverified");
+    CHECK(info.at("capabilities")[0].at("tool_status") == "temporarily_disabled");
     CHECK(info.dump().find(key) == std::string::npos);
 }
 

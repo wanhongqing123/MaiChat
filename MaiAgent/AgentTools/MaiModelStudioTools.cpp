@@ -1586,24 +1586,22 @@ public:
         return "wan_image";
     }
     bool requiresApproval(const std::string& raw) const override {
-        return isPaidGenerationAction(raw);
+        return requiresPerCallApproval(raw);
     }
     bool requiresPerCallApproval(const std::string& raw) const override {
-        return isPaidGenerationAction(raw);
+        // 被暂停的生成动作不请求批准，其它调用继续使用原有确认边界。
+        return !isBillableSubmissionAction(raw) && isPaidGenerationAction(raw);
     }
-    bool requiresPaidApproval(const std::string& raw) const override {
-        return isBillableSubmissionAction(raw);
+    bool requiresPaidApproval(const std::string&) const override {
+        return false;
     }
 
     std::optional<MaiSpecialistInfo> specialistInfo() const override {
         const MaiWanCredentials credentials = mCredentials ? mCredentials() : MaiWanCredentials{};
         const bool configured = hasCredentials(credentials);
-        const auto status = configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                       : MaiSpecialistCapabilityStatus::NotConfigured;
-        const auto mediaStatus = !configured ? MaiSpecialistCapabilityStatus::NotConfigured
-                                 : mUploadMedia
-                                     ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                     : MaiSpecialistCapabilityStatus::UploadNotConfigured;
+        // 配置仍如实读取，图像生成与修订当前因费用暂停。
+        const auto status = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
+        const auto mediaStatus = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
         return MaiSpecialistInfo{
             name(),
             kWanImageModel,
@@ -1619,17 +1617,11 @@ public:
     }
 
     std::string description() const override {
-        // Wan2.7-Image 英文描述的对应含义：discover 查能力，diagnose 只读
-        // 检查访问权限。delegate 异步提交文生图或 1–9 张图片编辑，continue 查询并下载。
-        // revise 需同一会话的 conversation_id 和新反馈。输入不变，新 PNG 存在
-        // Agent 工作区，最后用 agent_send_media 交付。
-        return "Wan2.7-Image model-backed image specialist. Use discover for capabilities "
-               "and diagnose for a read-only model access check. Delegate a text goal with no "
-               "input for a new PNG, or pass one to "
-               "nine local image_paths to edit or combine images. Continue the async task with "
-               "its conversation_id; revise a previous result with new feedback. Input files "
-               "are unchanged; the new PNG is saved in the Agent workspace. Use "
-               "agent_send_media to deliver it.";
+        // 保留供应商协议与实现，说明暂停事实而不是引导付费重试。
+        return "Paid image generation is temporarily disabled to control costs. "
+               "This includes text-to-image, edits, references, and paid revisions. "
+               "Use discover for retained capabilities and existing supported task recovery; "
+               "do not retry or switch models silently. Wan implementation is retained.";
     }
 
     std::string parametersSchema() const override {
@@ -1654,6 +1646,9 @@ public:
         // 新 PNG 成功发布后才向主模型回报完成，原输入保留。
         Json args = Json::parse(raw, nullptr, false);
         if (!args.is_object()) return invalid("arguments must be an object");
+        const std::string action = value(args, "action");
+        // 费用闸门先于字段、凭据、素材和网络，旧工厂实例也不能绕过。
+        if (action == "delegate" || action == "revise") return maiCreativeImageGenerationPaused();
         if (auto error = rejectUnknownFields(args, parametersSchema())) return *error;
         if (args.contains("poll_once") && !args["poll_once"].is_boolean())
             return invalid("poll_once must be boolean");
@@ -1662,7 +1657,6 @@ public:
             if (args.contains(field) && !args[field].is_string())
                 return invalid(std::string(field) + " must be a string");
         }
-        const std::string action = value(args, "action");
         const std::string message = value(args, "message");
         if (message.empty() && (action == "delegate" || action == "revise"))
             return invalid("message is required to start or revise a task");
@@ -1684,9 +1678,12 @@ public:
                 Json{{"tool_kind", "model_backed"},
                      {"bound_model", kWanImageModel},
                      {"configured", info.configured},
+                     {"generation_enabled", false},
                      {"missing_configuration", missing},
                      {"capabilities", capabilities},
-                     {"reply", "I create or edit PNG images with Wan2.7-Image."}}
+                     {"reply",
+                      "Wan image generation is temporarily disabled to control costs; "
+                      "existing supported task recovery remains available."}}
                     .dump());
         }
         if (!hasCredentials(credentials))
@@ -1907,23 +1904,20 @@ public:
         return "kling_bailian_image";
     }
     bool requiresApproval(const std::string& raw) const override {
-        return isPaidGenerationAction(raw);
+        return requiresPerCallApproval(raw);
     }
     bool requiresPerCallApproval(const std::string& raw) const override {
-        return isPaidGenerationAction(raw);
+        // 被暂停的生成动作不请求批准，其它调用继续使用原有确认边界。
+        return !isBillableSubmissionAction(raw) && isPaidGenerationAction(raw);
     }
-    bool requiresPaidApproval(const std::string& raw) const override {
-        return isBillableSubmissionAction(raw);
+    bool requiresPaidApproval(const std::string&) const override {
+        return false;
     }
     std::optional<MaiSpecialistInfo> specialistInfo() const override {
         const MaiWanCredentials credentials = mCredentials ? mCredentials() : MaiWanCredentials{};
         const bool configured = hasCredentials(credentials);
-        const auto ready = configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                      : MaiSpecialistCapabilityStatus::NotConfigured;
-        const auto mediaReady = !configured ? MaiSpecialistCapabilityStatus::NotConfigured
-                                : mUploadMedia
-                                    ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                    : MaiSpecialistCapabilityStatus::UploadNotConfigured;
+        const auto ready = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
+        const auto mediaReady = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
         return MaiSpecialistInfo{
             name(),
             kBailianKlingImageModel,
@@ -1939,15 +1933,12 @@ public:
               "This tool currently produces one PNG; series_amount is not exposed"}}};
     }
     std::string description() const override {
-        // 百炼可灵图片异步提交、自动查询、下载；仅保留一次一张 PNG 的付费边界。
-        // 普通 V3 支持文生/单图，Omni 接多图；本地素材先上传 OSS，不传 Base64。
-        return "Kling image generation through Beijing Alibaba Model Studio, using the Wan "
-               "regional API Key and Workspace. Use discover, read-only diagnose, paid delegate, "
-               "or continue an existing task. Standard V3 accepts text or one image; Omni "
-               "accepts up to ten images. Local JPEG/PNG references are uploaded to private OSS, "
-               "never embedded as Base64. Confirm model, 1k/2k/4k resolution, and ratio before "
-               "paid submission. This tool generates one PNG, not a storyboard series. Deliver "
-               "the completed image with agent_send_media.";
+        // 保留供应商协议与实现，说明暂停事实而不是引导付费重试。
+        return "Paid image generation is temporarily disabled to control costs. "
+               "This includes text-to-image, edits, references, and paid revisions. "
+               "Use discover for retained capabilities and existing supported task recovery; "
+               "do not retry or switch models silently. Bailian Kling image implementation is "
+               "retained.";
     }
     std::string parametersSchema() const override {
         // discover/diagnose 不扣费；delegate 提交异步付费任务；continue 仅查旧任务。
@@ -1966,6 +1957,9 @@ public:
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
         const Json args = Json::parse(raw, nullptr, false);
         if (!args.is_object()) return invalid("arguments must be an object");
+        const std::string action = value(args, "action");
+        // 费用闸门先于字段、凭据、素材和网络，旧工厂实例也不能绕过。
+        if (action == "delegate" || action == "revise") return maiCreativeImageGenerationPaused();
         if (auto error = rejectUnknownFields(args, parametersSchema())) return *error;
         for (const char* field : {"action", "model", "message", "context", "image_path", "ratio",
                                   "resolution", "conversation_id"}) {
@@ -1974,7 +1968,6 @@ public:
         }
         if (args.contains("poll_once") && !args["poll_once"].is_boolean())
             return invalid("poll_once must be boolean");
-        const std::string action = value(args, "action");
         const MaiWanCredentials credentials = mCredentials ? mCredentials() : MaiWanCredentials{};
         if (action == "discover") {
             const MaiSpecialistInfo info = *specialistInfo();
@@ -1990,8 +1983,11 @@ public:
                 Json{{"tool_kind", "model_backed"},
                      {"bound_model", info.modelId},
                      {"configured", info.configured},
+                     {"generation_enabled", false},
                      {"capabilities", capabilities},
-                     {"reply", "Kling image models are available through Bailian."}}
+                     {"reply",
+                      "Bailian Kling image generation is temporarily disabled to control costs; "
+                      "existing supported task recovery remains available."}}
                     .dump());
         }
         if (!hasCredentials(credentials))

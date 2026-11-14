@@ -28,6 +28,7 @@ std::unique_ptr<MaiTool> makeMaiSeedanceVideoTool(MaiArkApiKeyProvider apiKey,
 
 // 跨平台 Seedream 图像工具：读取可访问的输入图，调用方舟，在工作区创建新的 PNG。
 // 原图不修改；线程、取消和密钥生命周期与 Seedance 视频工具相同。
+// 当前因费用暂停文生图、参考图编辑和付费修订；工厂和实现保留，旧调用也不能绕过。
 std::unique_ptr<MaiTool> makeMaiSeedreamImageTool(MaiArkApiKeyProvider apiKey,
                                                   std::string caBundlePath = {},
                                                   MaiCreativeMediaUploadProvider uploadMedia = {});

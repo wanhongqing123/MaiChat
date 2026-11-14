@@ -74,13 +74,13 @@ void testDynamicCredentialAndToolIdentity() {
     CHECK(nlohmann::json::parse(image->parametersSchema()).at("required") ==
           nlohmann::json::array({"action"}));
     CHECK(video->description().find("not configured") != std::string::npos);
-    CHECK(image->description().find("not configured") != std::string::npos);
+    CHECK(image->description().find("temporarily disabled") != std::string::npos);
     const std::string discover = R"({"action":"discover","message":"capabilities"})";
     CHECK(!video->requiresPerCallApproval(discover));
     CHECK(!image->requiresPerCallApproval(discover));
     CHECK(video->requiresPerCallApproval(R"({"action":"delegate","message":"create"})"));
     CHECK(video->requiresPaidApproval(R"({"action":"delegate","message":"create"})"));
-    CHECK(image->requiresPaidApproval(R"({"action":"revise","message":"adjust"})"));
+    CHECK(!image->requiresPaidApproval(R"({"action":"revise","message":"adjust"})"));
     CHECK(!video->requiresPaidApproval(R"({"action":"cancel"})"));
     CHECK(!video->requiresPerCallApproval(
         R"({"action":"delegate","mode":"edit","video_path":"clip.mp4"})"));
@@ -90,7 +90,7 @@ void testDynamicCredentialAndToolIdentity() {
         R"({"action":"delegate","mode":"reference","local_image_paths":["first.jpg"]})"));
     CHECK(!video->requiresPerCallApproval(R"({"action":"delegate","mode":"reference",)"
                                           R"("video_url":"https://example.com/source.mp4"})"));
-    CHECK(image->requiresPerCallApproval(R"({"action":"revise","message":"adjust"})"));
+    CHECK(!image->requiresPerCallApproval(R"({"action":"revise","message":"adjust"})"));
     CHECK(!video->requiresPerCallApproval(R"({"action":"continue"})"));
     auto videoInfo = nlohmann::json::parse(video->execute(discover, context).output());
     auto imageInfo = nlohmann::json::parse(image->execute(discover, context).output());
@@ -106,10 +106,10 @@ void testDynamicCredentialAndToolIdentity() {
     CHECK(videoInfo.dump().find("local_portrait_asset_registration") != std::string::npos);
     CHECK(imageInfo.at("capabilities").is_array());
     CHECK(videoInfo.at("capabilities")[0].at("tool_status") == "not_configured");
-    CHECK(imageInfo.at("capabilities")[0].at("tool_status") == "not_configured");
+    CHECK(imageInfo.at("capabilities")[0].at("tool_status") == "temporarily_disabled");
     key = "test-key";
     CHECK(video->description().find("not configured") == std::string::npos);
-    CHECK(image->description().find("not configured") == std::string::npos);
+    CHECK(image->description().find("temporarily disabled") != std::string::npos);
     videoInfo = nlohmann::json::parse(video->execute(discover, context).output());
     imageInfo = nlohmann::json::parse(image->execute(discover, context).output());
     CHECK(videoInfo.at("configured").get<bool>());
@@ -161,7 +161,7 @@ void testDynamicCredentialAndToolIdentity() {
     CHECK(specialists[1].toolName == "seedream_image");
     CHECK(specialists[1].capabilities[2].id == "multi_image_edit");
     CHECK(specialists[1].capabilities[2].status ==
-          MaiSpecialistCapabilityStatus::UploadNotConfigured);
+          MaiSpecialistCapabilityStatus::TemporarilyDisabled);
     MaiToolRegistry internal;
     internal.addInternal(makeMaiSeedanceVideoTool([&] { return key; }));
     internal.addInternal(makeMaiSeedreamImageTool([&] { return key; }));
@@ -540,7 +540,8 @@ void testRevisionRejectsAnotherConversation() {
         {"action", "revise"}, {"message", "Make it brighter"}, {"parent_task_id", imageTask.id}};
     const MaiToolResult imageResult = image->execute(imageRevision.dump(), context);
     CHECK(imageResult.hasError());
-    CHECK(imageResult.error().code() == MaiErrorCode::NotFound);
+    CHECK(imageResult.error().code() == MaiErrorCode::NotSupported);
+    CHECK(imageResult.error().message().find("temporarily_disabled") != std::string::npos);
 }
 
 void testLocalVideoUploadHandoffWithoutArkSubmission() {

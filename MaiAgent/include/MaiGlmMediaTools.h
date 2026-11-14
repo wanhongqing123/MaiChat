@@ -15,5 +15,6 @@ using MaiGlmApiKeyProvider = std::function<std::string()>;
 // 仅提供 glm-image 异步文生图：delegate 提交并记录任务 ID，continue 查询后下载到
 // Agent 工作区。网络调用会阻塞，必须在工具线程执行并响应取消；空 Key 仍可 discover。
 // 该接口不接受已有图片或视频，不应由主模型当作图像编辑、视频生成工具。
+// 当前因费用暂停新生成，执行在读取凭据和 HTTP 之前返回明确暂停；旧任务查询保留。
 std::unique_ptr<MaiTool> makeMaiGlmImageTool(MaiGlmApiKeyProvider apiKey,
                                              std::string caBundlePath = {});

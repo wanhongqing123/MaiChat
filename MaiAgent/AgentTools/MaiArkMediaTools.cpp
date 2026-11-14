@@ -106,7 +106,8 @@ std::string stringValue(const Json& object, const char* key) {
     return object[key].get<std::string>();
 }
 
-MaiToolResult discoverSpecialist(const MaiSpecialistInfo& info, const std::string& reply) {
+MaiToolResult discoverSpecialist(const MaiSpecialistInfo& info, const std::string& reply,
+                                 std::optional<bool> generationEnabled = std::nullopt) {
     // 模型理论能力、API 开放情况、工具真正接线状态分开返回；
     // limitation 原样保留具体限制，让主模型不会把“支持”理解成“任意输入都可用”。
     Json capabilities = Json::array();
@@ -118,13 +119,14 @@ MaiToolResult discoverSpecialist(const MaiSpecialistInfo& info, const std::strin
                  {"tool_status", maiSpecialistCapabilityStatusToString(capability.status)},
                  {"limitation", capability.limitation}});
     }
-    return MaiToolResult::success(Json{
-        {"tool_kind", "model_backed"},
-        {"bound_model", info.modelId},
-        {"configured", info.configured},
-        {"reply", reply},
-        {"capabilities",
-         std::move(capabilities)}}.dump());
+    Json output{{"tool_kind", "model_backed"},
+                {"bound_model", info.modelId},
+                {"configured", info.configured},
+                {"reply", reply},
+                {"capabilities", std::move(capabilities)}};
+    // 仅显式的图像暂停调用增加此字段，视频发现结果保持原样。
+    if (generationEnabled.has_value()) output["generation_enabled"] = *generationEnabled;
+    return MaiToolResult::success(output.dump());
 }
 
 MaiToolResult fail(MaiErrorCode error, const char* code, const std::string& message) {
@@ -1601,30 +1603,26 @@ public:
         return "seedream_image";
     }
     bool requiresApproval(const std::string& raw) const override {
-        return isPaidGenerationAction(raw);
+        return requiresPerCallApproval(raw);
     }
     bool requiresPerCallApproval(const std::string& raw) const override {
-        return isPaidGenerationAction(raw);
+        // 暂停的生成动作直接拒绝，不能先弹出无意义的付费确认。
+        return !isBillableSubmissionAction(raw) && isPaidGenerationAction(raw);
     }
-    bool requiresPaidApproval(const std::string& raw) const override {
-        return isBillableSubmissionAction(raw);
+    bool requiresPaidApproval(const std::string&) const override {
+        return false;
     }
     std::optional<MaiSpecialistInfo> specialistInfo() const override {
-        // configured 只表示取到了 API Key。unverified 表示工具已接线，但当前账号的
-        // 每项能力尚未全部完成付费实盘验证，不能把它展示成“已确认可用”。
+        // 配置仍如实读取；费用暂停不能伪报成缺少配置或实现。
         const bool configured = mKey && !mKey().empty();
-        const auto unverified = configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                           : MaiSpecialistCapabilityStatus::NotConfigured;
-        const auto mediaStatus = !configured ? MaiSpecialistCapabilityStatus::NotConfigured
-                                 : mUploadMedia
-                                     ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                     : MaiSpecialistCapabilityStatus::UploadNotConfigured;
+        const auto status = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
+        const auto mediaStatus = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
         return MaiSpecialistInfo{
             name(),
             kImageModel,
             configured,
             // text_to_image：仅凭文本描述生成一张新图片。
-            {{"text_to_image", true, true, unverified, {}},
+            {{"text_to_image", true, true, status, "Temporarily disabled to control costs"},
              // single_image_edit：接一张已有图片并按提示词编辑，原图片不覆盖。
              {"single_image_edit", true, true, mediaStatus,
               "Local image is uploaded to private OSS before paid generation"},
@@ -1643,25 +1641,11 @@ public:
               "This model does not provide sequential image series output"}}};
     }
     std::string description() const override {
-        // 未配置分支：仍允许主模型调用 discover 查看能力，但不能付费提交任务。
-        if (!specialistInfo()->configured)
-            return "Seedream image specialist bound to doubao-seedream-5-0-flash-260915. Ark API "
-                   "Key is not configured on this device. Use discover for capabilities, or ask "
-                   "the user to configure the key before delegating.";
-        // discover 查询能力；delegate 开新任务；revise 必须带已有 parent_task_id，
-        // 并把本次修改意见放进 message，不能凭空继承别的会话。
-        return "A model-backed Seedream image specialist. Use discover for capabilities, delegate "
-               "a new goal, or revise with parent_task_id set to a previous specialist_task_id "
-               "and new feedback. "
-               // 不传图是文生图；image_path 是单图编辑；image_paths 为 2–10 图融合。
-               // 三条路径都生成新的 PNG，输入原图不改动。
-               "It can create from text, edit one image_path, or combine 2 to "
-               "10 image_paths into one new PNG. "
-               // 主模型描述“要改什么、希望得到什么”；具体模型请求由工具负责构造。
-               // 成品须由 agent_send_media 交付给用户，不能只回复一个文件名。
-               "Describe edits and desired output in the message, leaving creative details to "
-               "Seedream; this specialist handles model "
-               "request details. Use agent_send_media to deliver the result.";
+        // 原协议、能力限制和供应商实现保留；描述不能继续引导新的付费生成。
+        return "Paid image generation is temporarily disabled to control costs. "
+               "This includes text-to-image, edits, references, and paid revisions. "
+               "Use discover for retained capabilities; do not retry or switch models silently. "
+               "Seedream implementation is retained.";
     }
     std::string parametersSchema() const override {
         // 顶层是对象；只允许下面列出的字段，不能把任意模型私有参数塞进来。
@@ -1687,6 +1671,9 @@ public:
         // 修订任务归属和输出新文件，全部通过后才允许调用付费接口。
         Json args = Json::parse(raw, nullptr, false);
         if (!args.is_object()) return invalid("arguments must be an object");
+        const std::string action = stringValue(args, "action");
+        // 在任何凭据、旧任务查询、素材上传和网络之前返回，旧工厂实例也不能绕过。
+        if (action == "delegate" || action == "revise") return maiCreativeImageGenerationPaused();
         for (const char* field : {"action", "message", "context", "image_path", "parent_task_id",
                                   "output_path", "size"}) {
             if (args.contains(field) && !args[field].is_string())
@@ -1694,16 +1681,14 @@ public:
         }
         if (args.contains("image_paths") && !args["image_paths"].is_array())
             return invalid("image_paths must be an array of 2 to 10 paths");
-        const std::string action = stringValue(args, "action");
         const std::string message = stringValue(args, "message");
         if (message.empty() && (action == "delegate" || action == "revise"))
             return invalid("message is required to start or revise a task");
         if (action == "discover") {
-            // Seedream 发现能力不扣费：说明文生图、单图和多图融合，明确分层输出未接线。
-            return discoverSpecialist(*specialistInfo(),
-                                      "I can create a PNG from text, edit one accessible image, "
-                                      "or combine multiple accessible reference images into one. "
-                                      "Layer splitting is not wired yet.");
+            // 保留原能力及未接线边界，但明确所有新增图像生成都暂停。
+            return discoverSpecialist(
+                *specialistInfo(),
+                "Seedream image generation is temporarily disabled to control costs.", false);
         }
         const std::string key = mKey ? mKey() : std::string{};
         if (action != "delegate" && action != "revise")

@@ -238,21 +238,21 @@ constexpr auto kMarkdownBaseInstructions =
     "Workspace. Confirm its Turbo, "
     "Standard, "
     "or Omni variant before paid submission. "
-    "For Kling images use kling_bailian_image with the same Beijing "
-    "credentials; "
-    "for Wan images use wan_image. "
-    // MiniMax image-01 的图生图是人物主体参考，不是任意局部修图。
-    "For MiniMax images use minimax_image: no reference is text-to-image; one "
-    "image_path or image_url is character-reference image-to-image. Do not "
-    "describe "
-    "that path as pixel-preserving editing or use it for arbitrary object "
-    "replacement. "
+    // 暂停所有供应商付费图像生成，包括带图参考和付费修订；本地免费处理仍可使用。
+    // 后面的供应商重试规则仅在显式恢复生成后适用，不能成为绕过费用暂停的授权。
+    "Paid image generation is temporarily disabled to control costs. "
+    "This includes text-to-image, image editing, reference generation, and paid "
+    "revisions through every image specialist. Do not submit, revise, retry, or "
+    "substitute another paid image model. Existing supported task recovery remains "
+    "available internally. Local image viewing, cropping, and format conversion "
+    "remain available. The later provider retry guidance applies only after image "
+    "generation is explicitly re-enabled; it never authorizes a currently paused image call. "
     // 万相视频因费用暂停新建与修订；不能误导主模型重试或静默换另一种收费模型。
-    // 已提交任务仍由后台恢复，万相图片和其余已列出视频模型保持各自入口。
+    // 已提交任务仍由后台恢复；其余已列出视频模型保持各自入口，图像遵循上方暂停规则。
     "Wan video generation (wan_video) is temporarily disabled to control costs. "
     "Do not submit or revise Wan video tasks, retry them, or silently choose a "
     "replacement model. Existing submitted tasks can still be recovered internally. "
-    "Wan image and other listed video models are separate; ask the user to choose "
+    "Other listed video models are separate; ask the user to choose "
     "before using a different video model. "
     // 仅在允许的前提下处理图像：轻度处理优先，油画化是兜底；记录损失并补偿描述。
     "Do not default to "
@@ -870,7 +870,8 @@ struct MaiMobileAgent {
                        ? response["key"].get<std::string>()
                        : std::string{};
         };
-        tools->add(makeMaiGlmImageTool(glmKey, config.caBundlePath));
+        // 仅停止付费图像入口对模型公开；已有实例和执行层保留，历史恢复仍可按名字查找。
+        tools->addInternal(makeMaiGlmImageTool(glmKey, config.caBundlePath));
         const auto miniMaxKey = [dispatcher = hostTools]() -> std::string {
             const MaiToolResult result = callMaiMobileHostTool(dispatcher, "minimax_api_key", "{}");
             if (result.hasError()) return {};
@@ -880,7 +881,7 @@ struct MaiMobileAgent {
                        : std::string{};
         };
         tools->add(makeMaiMiniMaxVideoTool(miniMaxKey, config.caBundlePath, miniMaxUploadMedia));
-        tools->add(makeMaiMiniMaxImageTool(miniMaxKey, config.caBundlePath, miniMaxUploadMedia));
+        tools->addInternal(makeMaiMiniMaxImageTool(miniMaxKey, config.caBundlePath, miniMaxUploadMedia));
         const auto wanCredentials = [dispatcher = hostTools]() -> MaiWanCredentials {
             const MaiToolResult result = callMaiMobileHostTool(dispatcher, "wan_credentials", "{}");
             if (result.hasError()) return {};
@@ -891,8 +892,8 @@ struct MaiMobileAgent {
         // 暂停公开万相视频入口，保留内部实例查询和回收已经付费的任务。
         tools->addInternal(makeMaiWanVideoTool(wanCredentials, config.caBundlePath, wanUploadMedia));
         tools->add(makeMaiBailianKlingVideoTool(wanCredentials, config.caBundlePath, klingUploadMedia));
-        tools->add(makeMaiWanImageTool(wanCredentials, config.caBundlePath, wanUploadMedia));
-        tools->add(makeMaiBailianKlingImageTool(wanCredentials, config.caBundlePath, klingUploadMedia));
+        tools->addInternal(makeMaiWanImageTool(wanCredentials, config.caBundlePath, wanUploadMedia));
+        tools->addInternal(makeMaiBailianKlingImageTool(wanCredentials, config.caBundlePath, klingUploadMedia));
         const std::string rvmModel = request.value("rvmModelPath", "");
         const std::string lamaModel = request.value("lamaModelPath", "");
         const std::string ortRuntime = request.value("ortRuntimePath", "");

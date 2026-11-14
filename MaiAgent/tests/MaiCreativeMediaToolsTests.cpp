@@ -2,17 +2,23 @@
 // 验证入口：testFailedTaskIsStableWithoutProviderRequest、testH3ContentRolesAndRequiredFields、
 // testH3RejectsUnsupportedOutputBeforePaidApproval；检查可观察结果而非实现细节。
 #include <cstdio>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <json.hpp>
 
-#include "MaiMiniMaxMediaTools.h"
+#include "MaiArkMediaTools.h"
 #include "MaiCreativeMediaSupport.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
+#include "MaiGlmMediaTools.h"
 #include "MaiIdGenerator.h"
 #include "MaiMemoryStore.h"
+#include "MaiMiniMaxMediaTools.h"
+#include "MaiModelStudioTools.h"
 #include "MaiTime.h"
+#include "MaiViewImageTool.h"
 
 namespace {
 
@@ -26,6 +32,158 @@ int failures = 0;
         }                                                                   \
     } while (0)
 
+// 直接保留工厂实例来模拟旧调用，暂停必须先于凭据、上传和任务变更。
+// 空凭据也保证旧实现的 RED 不会触达供应商；已存在任务仅放在自有内存存储。
+void testPaidImagesArePausedBeforeCredentialsOrUpload() {
+    using Json = nlohmann::json;
+    int credentialReads = 0;
+    int uploads = 0;
+    const auto key = [&] {
+        ++credentialReads;
+        return std::string{};
+    };
+    const auto wanCredentials = [&] {
+        ++credentialReads;
+        return MaiWanCredentials{};
+    };
+    const MaiCreativeMediaUploadProvider upload =
+        [&](const std::string&, const MaiToolContext&) -> MaiResult<std::string> {
+        ++uploads;
+        return {MaiErrorCode::Network, "Synthetic upload must not be reached"};
+    };
+    std::vector<std::unique_ptr<MaiTool>> images;
+    images.push_back(makeMaiWanImageTool(wanCredentials, {}, upload));
+    images.push_back(makeMaiBailianKlingImageTool(wanCredentials, {}, upload));
+    images.push_back(makeMaiMiniMaxImageTool(key, {}, upload));
+    images.push_back(makeMaiGlmImageTool(key));
+    images.push_back(makeMaiSeedreamImageTool(key, {}, upload));
+
+    auto store = makeMaiMemoryStore();
+    MaiSession owner;
+    owner.id = "owned-paused-image-session";
+    store->putSession(owner);
+    MaiToolContext context;
+    context.root = MaiFileSystem::temporaryDirectory().toUtf8();
+    context.sessionId = owner.id;
+    context.specialistTasks = store.get();
+    // 存储会把带已有产物的记录规范化为成功；暂停前后都应比较实际存储基线。
+    // 另保留一条没有产物的活跃任务，防止只验证已完成任务而漏掉活跃账本变化。
+    MaiSpecialistTask active;
+    active.id = MaiIdGenerator::generate("spt_");
+    active.ownerSessionId = owner.id;
+    active.specialistName = "wan_image";
+    active.providerTaskId = "owned-active-image-provider";
+    active.status = MaiSpecialistTaskStatus::Running;
+    active.created = 1;
+    CHECK(!store->insertSpecialistTask(active));
+    MaiSpecialistTask activeBaseline;
+    CHECK(store->getSpecialistTask(active.id, owner.id, activeBaseline));
+    const std::size_t activeCountBaseline = store->listActiveSpecialistTasks(10).size();
+    CHECK(activeCountBaseline == 1);
+    std::vector<MaiSpecialistTask> completedBaselines;
+    for (const auto& image : images) {
+        MaiSpecialistTask previous;
+        previous.id = MaiIdGenerator::generate("spt_");
+        previous.ownerSessionId = owner.id;
+        previous.specialistName = image->name();
+        previous.providerTaskId = "owned-provider-" + image->name();
+        previous.outputPath = "owned-previous.png";
+        previous.created = 1;
+        CHECK(!store->insertSpecialistTask(previous));
+        MaiSpecialistTask previousBaseline;
+        CHECK(store->getSpecialistTask(previous.id, owner.id, previousBaseline));
+        completedBaselines.push_back(previousBaseline);
+        const std::size_t activeCountBefore = store->listActiveSpecialistTasks(10).size();
+        const auto checkPaused = [&](const Json& arguments) {
+            const std::string raw = arguments.dump();
+            CHECK(!image->requiresApproval(raw));
+            CHECK(!image->requiresPerCallApproval(raw));
+            CHECK(!image->requiresPaidApproval(raw));
+            const MaiToolResult result = image->execute(raw, context);
+            CHECK(result.hasError());
+            const Json error = Json::parse(result.error().message(), nullptr, false);
+            CHECK(error.is_object() && error.value("code", "") == "temporarily_disabled");
+            CHECK(result.execution().has_value());
+            if (result.execution()) {
+                CHECK(result.execution()->status == MaiToolExecutionStatus::NotStarted);
+                CHECK(result.execution()->effectStatus == MaiToolEffectStatus::None);
+                CHECK(result.execution()->started == false);
+            }
+            CHECK(credentialReads == 0);
+            CHECK(uploads == 0);
+            MaiSpecialistTask unchanged;
+            CHECK(store->getSpecialistTask(previous.id, owner.id, unchanged));
+            CHECK(unchanged.providerTaskId == previousBaseline.providerTaskId);
+            CHECK(unchanged.outputPath == previousBaseline.outputPath);
+            CHECK(unchanged.status == previousBaseline.status);
+            CHECK(unchanged.notifiedAt == previousBaseline.notifiedAt);
+            MaiSpecialistTask activeAfter;
+            CHECK(store->getSpecialistTask(active.id, owner.id, activeAfter));
+            CHECK(activeAfter.providerTaskId == activeBaseline.providerTaskId);
+            CHECK(activeAfter.outputPath == activeBaseline.outputPath);
+            CHECK(activeAfter.status == activeBaseline.status);
+            CHECK(store->listActiveSpecialistTasks(10).size() == activeCountBefore);
+        };
+        checkPaused({{"action", "delegate"}, {"message", "Create an owned image"}});
+        if (image->name() != "glm_image") {
+            checkPaused({{"action", "delegate"},
+                         {"message", "Edit an owned reference"},
+                         {"image_path", "owned-reference.png"}});
+        }
+        if (image->name() == "wan_image" || image->name() == "kling_bailian_image" ||
+            image->name() == "seedream_image") {
+            checkPaused({{"action", "delegate"},
+                         {"message", "Combine owned references"},
+                         {"image_paths", Json::array({"owned-one.png", "owned-two.png"})}});
+        }
+        // 仅现有 Wan/Seedream 接线了付费修订；不为其它同步图片接口虚构管理动作。
+        if (image->name() == "wan_image" || image->name() == "seedream_image") {
+            Json revision = {{"action", "revise"}, {"message", "Revise the owned image"}};
+            revision[image->name() == "wan_image" ? "conversation_id" : "parent_task_id"] =
+                previous.id;
+            checkPaused(revision);
+        }
+    }
+    CHECK(store->listActiveSpecialistTasks(10).size() == activeCountBaseline);
+    for (const auto& baseline : completedBaselines) {
+        MaiSpecialistTask unchanged;
+        CHECK(store->getSpecialistTask(baseline.id, owner.id, unchanged));
+        CHECK(unchanged.providerTaskId == baseline.providerTaskId);
+        CHECK(unchanged.outputPath == baseline.outputPath);
+        CHECK(unchanged.status == baseline.status);
+        CHECK(unchanged.notifiedAt == baseline.notifiedAt);
+    }
+    // 图像暂停不能把共享 MiniMax 分支或百炼可灵视频的付费确认一并关掉。
+    auto miniMaxVideo = makeMaiMiniMaxVideoTool(key);
+    auto klingVideo = makeMaiBailianKlingVideoTool(wanCredentials);
+    CHECK(miniMaxVideo->requiresPaidApproval(R"({"action":"delegate"})"));
+    CHECK(klingVideo->requiresPaidApproval(R"({"action":"delegate"})"));
+    CHECK(credentialReads == 0);
+    CHECK(uploads == 0);
+    for (const auto& image : images) {
+        const auto info = image->specialistInfo();
+        CHECK(info.has_value());
+        if (!info) continue;
+        CHECK(!info->configured);
+        bool hasTextToImage = false;
+        for (const auto& capability : info->capabilities) {
+            if (capability.id != "text_to_image") continue;
+            hasTextToImage = true;
+            CHECK(capability.status == MaiSpecialistCapabilityStatus::TemporarilyDisabled);
+        }
+        CHECK(hasTextToImage);
+        const MaiToolResult discovered = image->execute(R"({"action":"discover"})", context);
+        CHECK(!discovered.hasError());
+        const Json output = Json::parse(discovered.output(), nullptr, false);
+        CHECK(output.is_object() && output.value("generation_enabled", true) == false);
+    }
+    // 本地查看仍按原模型能力暴露，既不属于供应商生成，也不需要付费确认。
+    MaiToolRegistry local;
+    local.add(makeMaiViewImageTool());
+    CHECK(local.findForModel("view_image", "glm-5.3-flash") != nullptr);
+    CHECK(!local.find("view_image")->requiresPaidApproval(R"({"path":"owned.png"})"));
+}
+
 void checkTool(MaiTool& tool, const std::string& expectedName, const std::string& expectedModel,
                bool video) {
     MaiToolContext context;
@@ -35,15 +193,16 @@ void checkTool(MaiTool& tool, const std::string& expectedName, const std::string
     CHECK(!tool.requiresPerCallApproval(R"({"action":"discover"})"));
     CHECK(!tool.requiresPerCallApproval(R"({"action":"continue"})"));
     CHECK(tool.requiresPerCallApproval(R"({"action":"delegate"})") ==
-          (expectedName != "minimax_video"));
-    CHECK(tool.requiresPaidApproval(R"({"action":"delegate"})"));
+          (video && expectedName != "minimax_video"));
+    CHECK(tool.requiresPaidApproval(R"({"action":"delegate"})") == video);
     CHECK(!tool.requiresPaidApproval(R"({"action":"continue"})"));
     CHECK(tool.requiresPerCallApproval("broken json"));
     const auto discovered =
         nlohmann::json::parse(tool.execute(R"({"action":"discover"})", context).output());
     CHECK(discovered.at("bound_model") == expectedModel);
     CHECK(discovered.at("configured") == false);
-    CHECK(discovered.at("capabilities")[0].at("tool_status") == "not_configured");
+    CHECK(discovered.at("capabilities")[0].at("tool_status") ==
+          (video ? "not_configured" : "temporarily_disabled"));
     CHECK(discovered.dump().find("secret") == std::string::npos);
     if (expectedName == "minimax_video") {
         CHECK(discovered.dump().find("Hailuo-2.3") == std::string::npos);
@@ -257,6 +416,7 @@ void testH3LocalValidationChecksAllReferencePathsWithoutBilling() {
 
 // 使用假服务验证付费生成前的本地检查、任务状态转换和结果交付，不创建真实云任务。
 int main() {
+    testPaidImagesArePausedBeforeCredentialsOrUpload();
     CHECK(maiCreativeHttpsUrl("https://example.com/object.jpg?signature=abc"));
     CHECK(!maiCreativeHttpsUrl("http://example.com/object.jpg"));
     CHECK(!maiCreativeHttpsUrl("https://name@example.com/object.jpg"));
@@ -313,7 +473,8 @@ int main() {
         const auto discovered =
             nlohmann::json::parse(tool->execute(R"({"action":"discover"})", context).output());
         CHECK(discovered.at("configured") == true);
-        CHECK(discovered.at("capabilities")[0].at("tool_status") == "implemented_unverified");
+        CHECK(discovered.at("capabilities")[0].at("tool_status") ==
+              (tool == miniMaxVideo.get() ? "implemented_unverified" : "temporarily_disabled"));
         CHECK(discovered.dump().find(key) == std::string::npos);
         CHECK(tool->execute(R"({"action":"delegate","message":"A cat","video_path":"old.mp4"})",
                             context)

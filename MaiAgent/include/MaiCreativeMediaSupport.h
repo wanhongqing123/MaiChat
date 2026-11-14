@@ -23,6 +23,10 @@ struct MaiCreativeHttpResult {
 
 MaiToolResult maiCreativeFailure(MaiErrorCode error, const char* code, const std::string& message);
 MaiToolResult maiCreativeInvalid(const std::string& message);
+// 图像生成因费用暂停时返回统一失败与可信 NotStarted/None 事实；自身不读凭据或外部状态。
+// 只能在凭据、上传、网络及任务写入之前调用，不能把已经受理的任务改写成未开始。
+// 工具实现仍保留，调用方的已实现旧任务查询/管理分支不得被此结果替代。
+MaiToolResult maiCreativeImageGenerationPaused();
 bool maiCreativeValidId(const std::string& id);
 // 上传回调应返回没有用户信息、带有效主机名的 HTTPS 地址；检查失败时不得提交付费任务。
 bool maiCreativeHttpsUrl(const std::string& url);

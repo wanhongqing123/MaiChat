@@ -464,6 +464,12 @@ public:
         return mVideo ? "minimax_video" : "minimax_image";
     }
     std::string description() const override {
+        // 共享类只暂停图像，原 H3 视频描述、付费确认与任务管理继续保留。
+        if (!mVideo)
+            return "Paid image generation is temporarily disabled to control costs. "
+                   "This includes text-to-image and character-reference generation. "
+                   "Do not retry or switch models silently. MiniMax image implementation is "
+                   "retained.";
         // 视频分支英文描述的对应含义：MiniMax H3 为付费视频工具，接文本、首尾帧，
         // 也接图片/视频/音频的多模态参考。content[] 的图片角色用 reference_image；
         // 工具兼容 reference 或省略角色的旧写法，文本条目的 role 会忽略。
@@ -530,9 +536,11 @@ public:
     }
     std::optional<MaiSpecialistInfo> specialistInfo() const override {
         const bool configured = mKey && !mKey().empty();
-        const auto ready = configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                      : MaiSpecialistCapabilityStatus::NotConfigured;
-        const auto mediaReady = !configured ? MaiSpecialistCapabilityStatus::NotConfigured
+        const auto ready = !mVideo      ? MaiSpecialistCapabilityStatus::TemporarilyDisabled
+                           : configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
+                                        : MaiSpecialistCapabilityStatus::NotConfigured;
+        const auto mediaReady = !mVideo       ? MaiSpecialistCapabilityStatus::TemporarilyDisabled
+                                : !configured ? MaiSpecialistCapabilityStatus::NotConfigured
                                 : mUploadMedia
                                     ? MaiSpecialistCapabilityStatus::ImplementedUnverified
                                     : MaiSpecialistCapabilityStatus::UploadNotConfigured;
@@ -613,6 +621,7 @@ public:
     bool requiresPerCallApproval(const std::string& argumentsJson) const override {
         const Json args = Json::parse(argumentsJson, nullptr, false);
         const std::string action = value(args, "action");
+        if (!mVideo && (action == "delegate" || action == "revise")) return false;
         if (mVideo && action == "delegate" && args.is_object()) {
             const std::string model =
                 value(args, "model").empty() ? "MiniMax-H3" : value(args, "model");
@@ -622,7 +631,7 @@ public:
     }
     bool requiresPaidApproval(const std::string& raw) const override {
         const Json args = Json::parse(raw, nullptr, false);
-        return args.is_object() && value(args, "action") == "delegate";
+        return mVideo && args.is_object() && value(args, "action") == "delegate";
     }
     // 根据 action 分派 MiniMax 参数校验、图片生成、视频委托与状态查询。
     // 本地校验不触发付费请求；异步查询沿用受理时返回的云任务标识。
@@ -632,6 +641,10 @@ public:
         // content[] 先按 type/role 归一化，完成后以原 task ID 查询和下载。
         const Json args = Json::parse(argumentsJson, nullptr, false);
         if (!args.is_object()) return maiCreativeInvalid("arguments must be a JSON object");
+        const std::string action = value(args, "action");
+        // 在任何凭据、旧任务查询、素材上传和网络之前返回，旧工厂实例也不能绕过。
+        if (!mVideo && (action == "delegate" || action == "revise"))
+            return maiCreativeImageGenerationPaused();
         // 模型即使带旧字段直调 execute，也要拒绝而非遗漏图片后付费提交。
         const Json schema = Json::parse(parametersSchema(), nullptr, false);
         for (auto field = args.begin(); field != args.end(); ++field) {
@@ -658,7 +671,6 @@ public:
         }
         if (args.contains("poll_once") && !args["poll_once"].is_boolean())
             return maiCreativeInvalid("poll_once must be boolean");
-        const std::string action = value(args, "action");
         if (action == "discover") {
             const MaiSpecialistInfo info = *specialistInfo();
             Json capabilities = Json::array();
@@ -669,13 +681,18 @@ public:
                      {"api_support", capability.apiSupported},
                      {"tool_status", maiSpecialistCapabilityStatusToString(capability.status)},
                      {"limitation", capability.limitation}});
-            return MaiToolResult::success(Json{{"tool_kind", "model_backed"},
-                                               {"bound_model", info.modelId},
-                                               {"configured", info.configured},
-                                               {"local_validation", mVideo},
-                                               {"capabilities", std::move(capabilities)},
-                                               {"reply", "MiniMax capabilities listed"}}
-                                              .dump());
+            Json output = {{"tool_kind", "model_backed"},
+                           {"bound_model", info.modelId},
+                           {"configured", info.configured},
+                           {"local_validation", mVideo},
+                           {"capabilities", std::move(capabilities)},
+                           {"reply", "MiniMax capabilities listed"}};
+            if (!mVideo) {
+                output["generation_enabled"] = false;
+                output["reply"] =
+                    "MiniMax image generation is temporarily disabled to control costs.";
+            }
+            return MaiToolResult::success(output.dump());
         }
         if (action == "validate")
             return mVideo ? validate(args, context)

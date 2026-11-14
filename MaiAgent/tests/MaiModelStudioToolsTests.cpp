@@ -122,9 +122,9 @@ void testOtherSpecialistBoundaries() {
     auto video = makeMaiWanVideoTool([&] { return credentials; });
     auto image = makeMaiWanImageTool([&] { return credentials; });
     CHECK(!video->requiresPerCallApproval(R"({"action":"delegate"})"));
-    CHECK(image->requiresPerCallApproval(R"({"action":"delegate"})"));
+    CHECK(!image->requiresPerCallApproval(R"({"action":"delegate"})"));
     CHECK(!video->requiresPaidApproval(R"({"action":"delegate"})"));
-    CHECK(image->requiresPaidApproval(R"({"action":"revise"})"));
+    CHECK(!image->requiresPaidApproval(R"({"action":"revise"})"));
     CHECK(!video->requiresPaidApproval(R"({"action":"cancel"})"));
     CHECK(!image->requiresPaidApproval(R"({"action":"continue"})"));
     CHECK(!video->requiresPerCallApproval(R"({"action":"continue"})"));
@@ -467,8 +467,8 @@ void testWanAndKlingImageToolsValidateBeforePaidSubmission() {
               "maxItems") == 9);
     CHECK(nlohmann::json::parse(kling->parametersSchema())["properties"].contains("poll_once"));
     CHECK(!kling->requiresPerCallApproval(R"({"action":"discover"})"));
-    CHECK(kling->requiresPerCallApproval(R"({"action":"delegate"})"));
-    CHECK(kling->requiresPaidApproval(R"({"action":"delegate"})"));
+    CHECK(!kling->requiresPerCallApproval(R"({"action":"delegate"})"));
+    CHECK(!kling->requiresPaidApproval(R"({"action":"delegate"})"));
     CHECK(wan->execute(R"({"action":"delegate","message":"Draw a cat","negative_prompt":"dog"})",
                        context)
               .hasError());
@@ -476,17 +476,17 @@ void testWanAndKlingImageToolsValidateBeforePaidSubmission() {
         R"({"action":"delegate","message":"Edit image","image_path":"missing.jpg","size":"2K"})",
         context);
     CHECK(missingReference.hasError());
-    CHECK(missingReference.error().message().find("Media file") != std::string::npos);
+    CHECK(missingReference.error().message().find("temporarily_disabled") != std::string::npos);
     const MaiToolResult unsupportedMulti = kling->execute(
         R"({"action":"delegate","message":"Blend two pictures","model":"kling/kling-v3-image-gener)"
             R"(ation","image_paths":["a.jpg","b.jpg"],"ratio":"1:1","resolution":"1k"})",
         context);
     CHECK(unsupportedMulti.hasError());
-    CHECK(unsupportedMulti.error().message().find("require Kling Omni") != std::string::npos);
+    CHECK(unsupportedMulti.error().message().find("temporarily_disabled") != std::string::npos);
     const MaiToolResult unsupported4k = kling->execute(
         R"({"action":"delegate","message":"Draw a cat","ratio":"1:1","resolution":"4k"})", context);
     CHECK(unsupported4k.hasError());
-    CHECK(unsupported4k.error().message().find("resolution") != std::string::npos);
+    CHECK(unsupported4k.error().message().find("temporarily_disabled") != std::string::npos);
 }
 
 void testVideoTaskManagementNeverDiscardsActiveOrForeignTasks() {
