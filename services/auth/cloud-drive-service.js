@@ -135,8 +135,19 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
   const imageBinding = row => ({ owner_slot:row.owner_slot,
     owner_login_session_id:row.owner_login_session_id,session_id:row.session_id,
     message_id:row.message_id,part_id:row.part_id });
+  const renewalTable = 'session_image_publication_generations';
+  const publicationIdentity = (body,principal) => [principal.user_id,body.owner_slot,
+    body.owner_login_session_id,body.session_id,body.message_id,body.part_id];
+  const publicationWhere = `owner_user_id=? AND owner_slot=? AND owner_login_session_id=?
+    AND session_id=? AND message_id=? AND part_id=?`;
+  const logicalPublicationWhere = `owner_user_id=? AND owner_slot=? AND session_id=? AND message_id=? AND part_id=?`;
+  const logicalPublicationIdentity = (body,principal) => [principal.user_id,body.owner_slot,
+    body.session_id,body.message_id,body.part_id];
+  const imageGeneration = row => db.prepare(`SELECT generation FROM ${renewalTable}
+    WHERE attachment_id=?`).get(row.id)?.generation || 0;
   const temporaryMetadata = row => temporary(row) ? {
-    retention:'temporary',expires_at:row.object_expires_at,...imageBinding(row) } : {};
+    retention:'temporary',expires_at:row.object_expires_at,...imageBinding(row),
+    ...(imageGeneration(row) > 0 ? {generation:imageGeneration(row)} : {}) } : {};
   async function authorizeImage(operation,row,headers) {
     if (typeof authorizeAttachment !== 'function')
       return result(503,{ error:'Session ownership verification is unavailable' });
@@ -144,7 +155,14 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       const accepted = await authorizeAttachment({ operation,...imageBinding(row),
         ...(operation === 'read' ? { attachment_id:row.id,
           expires_at:row.object_expires_at } : {}) },headers);
-      return accepted === true ? null : result(404,{ error:'Session image not found' });
+      if (operation !== 'create')
+        return accepted === true ? null : result(404,{ error:'Session image not found' });
+      // Boolean callbacks and old loopback replies retain generation zero. Client
+      // JSON never supplies this value, and malformed grants never become zero.
+      const generation = accepted === true ? 0 : accepted?.ok === true
+        ? accepted.generation === undefined ? 0 : accepted.generation : null;
+      return Number.isSafeInteger(generation) && generation >= 0 ? {generation} :
+        result(404,{ error:'Session image not found' });
     } catch { return result(503,{ error:'Session ownership verification is unavailable' }); }
   }
   function initialReceipt(row) {
@@ -153,13 +171,10 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       ...temporaryMetadata(row),part_size:PART_BYTES,parts_total:partsTotal(row),
       upload_expires_at:expiresISO(row.upload_expires_at),quota:quota(row.owner_user_id) };
   }
-  function previousImage(body,principal) {
-    const receipt = db.prepare(`SELECT * FROM session_image_publications WHERE
-      owner_user_id=? AND owner_slot=? AND owner_login_session_id=?
-      AND session_id=? AND message_id=? AND part_id=?`).get(principal.user_id,
-      body.owner_slot,body.owner_login_session_id,body.session_id,body.message_id,body.part_id);
+  function imageReceiptResult(receipt,body,principal) {
     if (!receipt) return null;
-    if (receipt.name !== body.name || receipt.size_bytes !== body.size_bytes ||
+    if (receipt.generation > 0 && receipt.owner_login_session_id !== body.owner_login_session_id ||
+        receipt.name !== body.name || receipt.size_bytes !== body.size_bytes ||
         receipt.content_type !== body.content_type)
       return result(409,{ error:'Image publication identity was reused' });
     if (receipt.expires_at <= now()) return imageExpired();
@@ -171,6 +186,27 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     if (row.status === 'ready') return result(201,initialReceipt(row));
     return row.upload_id ? result(201,initialReceipt(row)) :
       result(409,{ error:'Image publication is starting' });
+  }
+  function previousImage(body,principal,generation) {
+    const receipt = generation === 0 ? db.prepare(`SELECT * FROM session_image_publications
+      WHERE ${publicationWhere}`).get(...publicationIdentity(body,principal)) :
+      db.prepare(`SELECT * FROM ${renewalTable} WHERE ${logicalPublicationWhere} AND generation=?`)
+        .get(...logicalPublicationIdentity(body,principal),generation);
+    return imageReceiptResult(receipt,body,principal);
+  }
+  function latestImage(body,principal) {
+    const renewed = db.prepare(`SELECT * FROM ${renewalTable} WHERE ${publicationWhere}
+      ORDER BY generation DESC LIMIT 1`).get(...publicationIdentity(body,principal));
+    return renewed ? imageReceiptResult(renewed,body,principal) : previousImage(body,principal,0);
+  }
+  async function authorizeImageUpload(row,principal,headers) {
+    if (!temporary(row)) return null;
+    if (principal.device_slot !== row.owner_slot || principal.id !== row.owner_login_session_id)
+      return result(403,{error:'Only the image owner can publish it'});
+    const grant = await authorizeImage('create',row,headers);
+    if (grant.statusCode) return grant;
+    return grant.generation === imageGeneration(row) ? null :
+      result(409,{error:'Image publication generation changed'});
   }
 
   function quota(owner) {
@@ -339,6 +375,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     const bytes = body.size_bytes;
     const binding = mode === 'session' ? roomKey(body) : null;
     const isTemporary = mode === 'session' && body.purpose === 'temporary_session_image';
+    let generation = 0;
     if (mode === 'session' && !binding)
       return result(400,{ error:'Invalid Session binding' });
     if (mode === 'session' && body.purpose !== undefined && !isTemporary)
@@ -356,10 +393,14 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
         return result(400,{ error:'Invalid temporary image publication' });
       if (principal.device_slot !== body.owner_slot || principal.id !== body.owner_login_session_id)
         return result(403,{ error:'Only the image owner can publish it' });
-      const previous = previousImage(body,principal);
+      const grant = await authorizeImage('create',body,headers);
+      // A completed/pending receipt remains idempotent after Sync moves to ready
+      // or becomes unavailable. This fallback only returns existing state; it
+      // never authorizes a new object or changes an expired lifetime.
+      if (grant.statusCode) return latestImage(body,principal) || grant;
+      generation = grant.generation;
+      const previous = previousImage(body,principal,generation);
       if (previous) return previous;
-      const rejected = await authorizeImage('create',body,headers);
-      if (rejected) return rejected;
     }
     if (!storageReady(startUpload,abortUpload))
       return result(503,{ error:'Cloud video upload is unavailable' });
@@ -376,8 +417,15 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       if (isTemporary) {
         // Another request can finish the ownership check while this one awaits
         // Sync. Reserve one immutable identity in the same quota transaction.
-        const previous = previousImage(body,principal);
+        const previous = previousImage(body,principal,generation);
         if (previous) return previous;
+        const latest = db.prepare(`SELECT MAX(generation) AS generation FROM ${renewalTable}
+          WHERE ${logicalPublicationWhere}`).get(...logicalPublicationIdentity(body,principal));
+        if (latest.generation > generation)
+          return result(409,{error:'Image publication generation changed'});
+        const reused = db.prepare(`SELECT 1 FROM session_image_publications WHERE attachment_id=?
+          UNION ALL SELECT 1 FROM ${renewalTable} WHERE attachment_id=? LIMIT 1`).get(id,id);
+        if (reused) return result(409,{error:'Image publication object identity was reused'});
       }
       const available = quota(principal.user_id);
       if (available.used_bytes+available.reserved_bytes+bytes > quotaBytes)
@@ -398,11 +446,15 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
           owner_slot=?,owner_login_session_id=?,session_id=?,message_id=?,part_id=? WHERE id=?`)
           .run(expires,body.owner_slot,body.owner_login_session_id,body.session_id,
             body.message_id,body.part_id,id);
-        db.prepare(`INSERT INTO session_image_publications
+        // Table/column names come from the server-owned generation, never JSON.
+        const receiptTable = generation > 0 ? renewalTable : 'session_image_publications';
+        db.prepare(`INSERT INTO ${receiptTable}
           (owner_user_id,owner_slot,owner_login_session_id,session_id,message_id,part_id,
-          attachment_id,expires_at,name,size_bytes,content_type) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+          attachment_id,expires_at,name,size_bytes,content_type${generation > 0 ? ',generation' : ''})
+          VALUES(?,?,?,?,?,?,?,?,?,?,?${generation > 0 ? ',?' : ''})`)
           .run(principal.user_id,body.owner_slot,body.owner_login_session_id,body.session_id,
-            body.message_id,body.part_id,id,expires,body.name,bytes,media.contentType);
+            body.message_id,body.part_id,id,expires,body.name,bytes,media.contentType,
+            ...(generation > 0 ? [generation] : []));
       }
       return null;
     })();
@@ -462,12 +514,14 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     return row;
   }
 
-  async function signOne(id,number,body,principal) {
+  async function signOne(id,number,body,principal,headers) {
     const row = uploadRow(id,principal);
     if (row.statusCode) return row;
     if (signingExpired(row)) return imageExpired();
     if (row.status !== 'uploading')
       return result(409,{ error:'Upload is completing' });
+    const authorization = await authorizeImageUpload(row,principal,headers);
+    if (authorization) return authorization;
     const partNumber = Number(number);
     if (!/^[1-9][0-9]{0,3}$/.test(number) ||
         !Number.isInteger(partNumber) || partNumber > partsTotal(row) ||
@@ -481,6 +535,8 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       partNumber,expected,body.content_md5_base64,temporary(row) ? row.object_expires_at : undefined); }
     catch { return signingExpired(row) ? imageExpired() : result(502,{ error:'Could not sign upload part' }); }
     if (signingExpired(row)) return imageExpired();
+    const currentAuthorization = await authorizeImageUpload(row,principal,headers);
+    if (currentAuthorization) return currentAuthorization;
     if (typeof signed?.upload_url !== 'string' ||
         !signed.upload_url.startsWith('https://') ||
         signed.upload_headers?.['Content-Length'] !== String(expected) ||
@@ -497,7 +553,7 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       expires_in:temporary(row) ? Math.min(300,Math.floor((row.object_expires_at-now())/1000)) : 300 });
   }
 
-  async function uploadedParts(id,principal) {
+  async function uploadedParts(id,principal,headers) {
     if (validID(id)) {
       const completed = own(id,principal.user_id);
       if (expired(completed)) return imageExpired();
@@ -508,11 +564,15 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     }
     const row = uploadRow(id,principal);
     if (row.statusCode) return row;
+    const authorization = await authorizeImageUpload(row,principal,headers);
+    if (authorization) return authorization;
     if (!storageReady(listParts))
       return result(503,{ error:'Upload resume is unavailable' });
     let parts;
     try { parts = await listParts(principal.account_id,row.object_key,row.upload_id); }
     catch { return result(502,{ error:'Could not list uploaded parts' }); }
+    const currentAuthorization = await authorizeImageUpload(row,principal,headers);
+    if (currentAuthorization) return currentAuthorization;
     if (!Array.isArray(parts) || parts.some(part =>
         !Number.isInteger(part.part_number) || part.part_number < 1 ||
         !Number.isSafeInteger(part.size_bytes) || part.size_bytes < 1 ||
@@ -525,13 +585,15 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       upload_expires_at:expiresISO(row.upload_expires_at),...temporaryMetadata(row) });
   }
 
-  async function complete(id,principal) {
+  async function complete(id,principal,headers) {
     if (!validID(id)) return result(404,{ error:'Video not found' });
     const row = own(id,principal.user_id);
     if (expired(row)) return imageExpired();
     if (!row || row.status === 'deleted')
       return result(404,{ error:'Video not found' });
     if (row.status === 'ready') return result(200,publicReady(row));
+    const authorization = await authorizeImageUpload(row,principal,headers);
+    if (authorization) return authorization;
     if (row.upload_expires_at <= now())
       return result(410,{ error:'Upload expired' });
     if (!row.upload_id || !storageReady(listParts,completeUpload,verifyObject))
@@ -554,6 +616,8 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       if (expired(row)) { await remove(id,principal); return imageExpired(); }
       if (head?.exists === true && head.size_bytes === row.size_bytes &&
           head.content_type === row.content_type) {
+        const currentAuthorization = await authorizeImageUpload(row,principal,headers);
+        if (currentAuthorization) return currentAuthorization;
         const changed = prepare(`UPDATE cloud_drive_videos SET status='ready',ready_at=?
           WHERE id=? AND owner_user_id=? AND status='completing'`)
           .run(now(),id,principal.user_id).changes;
@@ -594,6 +658,8 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       return result(409,{ error:'Video parts are incomplete' });
     }
     if (expired(row)) { await remove(id,principal); return imageExpired(); }
+    const currentAuthorization = await authorizeImageUpload(row,principal,headers);
+    if (currentAuthorization) return currentAuthorization;
     try {
       await completeUpload(principal.account_id,row.object_key,row.upload_id,parts);
     } catch {
@@ -622,6 +688,8 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       await sweep();
       return result(502,{ error:'Completed video size or type mismatch' });
     }
+    const readyAuthorization = await authorizeImageUpload(row,principal,headers);
+    if (readyAuthorization) return readyAuthorization;
     const changed = prepare(`UPDATE cloud_drive_videos SET status='ready',ready_at=?
       WHERE id=? AND owner_user_id=? AND status='completing'`)
       .run(now(),id,principal.user_id).changes;
@@ -661,7 +729,9 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     const row = own(id,principal.user_id);
     if (!row && mode === 'session') {
       const receipt = db.prepare(`SELECT expires_at FROM session_image_publications
-        WHERE owner_user_id=? AND attachment_id=?`).get(principal.user_id,id);
+        WHERE owner_user_id=? AND attachment_id=? UNION ALL
+        SELECT expires_at FROM ${renewalTable} WHERE owner_user_id=? AND attachment_id=? LIMIT 1`)
+        .get(principal.user_id,id,principal.user_id,id);
       if (receipt?.expires_at <= now()) return imageExpired();
     }
     if (expired(row)) return imageExpired();
@@ -835,9 +905,10 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       // Explicit room removal ends the deduplication scope, after every
       // corresponding object row has passed the existing absence/race gates.
       // Ordinary expiry retains its receipt and can never recreate the image.
-      db.prepare(`DELETE FROM session_image_publications WHERE room_deleted_at IS NOT NULL
-        AND NOT EXISTS(SELECT 1 FROM session_attachments
-          WHERE session_attachments.id=session_image_publications.attachment_id)`).run();
+      for (const receipts of ['session_image_publications',renewalTable])
+        db.prepare(`DELETE FROM ${receipts} WHERE room_deleted_at IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM session_attachments
+            WHERE session_attachments.id=${receipts}.attachment_id)`).run();
     }
     return { cleaned,pending:rows.length-cleaned };
   }
@@ -860,8 +931,10 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
     const binding = roomKey(body);
     if (!binding) return result(400,{ error:'Invalid Session binding' });
     const publications = db.prepare(`SELECT 1 FROM session_image_publications
-      WHERE owner_user_id=? AND owner_slot=? AND session_id=? LIMIT 1`)
-      .get(principal.user_id,body.owner_slot,body.session_id);
+      WHERE owner_user_id=? AND owner_slot=? AND session_id=? UNION ALL
+      SELECT 1 FROM ${renewalTable} WHERE owner_user_id=? AND owner_slot=? AND session_id=? LIMIT 1`)
+      .get(principal.user_id,body.owner_slot,body.session_id,
+        principal.user_id,body.owner_slot,body.session_id);
     if (publications) {
       if (typeof authorizeAttachment !== 'function')
         return result(503,{error:'Session ownership verification is unavailable'});
@@ -872,9 +945,10 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       } catch { return result(503,{error:'Session ownership verification is unavailable'}); }
     }
     const current = now();
-    db.prepare(`UPDATE session_image_publications SET room_deleted_at=?
-      WHERE owner_user_id=? AND owner_slot=? AND session_id=?`)
-      .run(current,principal.user_id,body.owner_slot,body.session_id);
+    for (const receipts of ['session_image_publications',renewalTable])
+      db.prepare(`UPDATE ${receipts} SET room_deleted_at=?
+        WHERE owner_user_id=? AND owner_slot=? AND session_id=?`)
+        .run(current,principal.user_id,body.owner_slot,body.session_id);
     const changed = prepare(`UPDATE cloud_drive_videos SET status='deleted',
       deleted_at=?,cleanup_pending=1,cleanup_after=?,
       cleanup_hold_until=CASE WHEN status='completing' OR
@@ -905,12 +979,12 @@ function createCloudDriveService({ db, now = Date.now, startUpload, signPart,
       return list(principal,query?.get('before'),
         query?.has('folder_id') ? query.get('folder_id') : undefined);
     const part = path.match(new RegExp(`^${root}/uploads/([^/]+)/parts/([^/]+)/sign$`));
-    if (part && method === 'POST') return signOne(part[1],part[2],body,principal);
+    if (part && method === 'POST') return signOne(part[1],part[2],body,principal,headers);
     const upload = path.match(new RegExp(`^${root}/uploads/([^/]+)(/parts|/complete)?$`));
     if (upload && upload[2] === '/parts' && method === 'GET')
-      return uploadedParts(upload[1],principal);
+      return uploadedParts(upload[1],principal,headers);
     if (upload && upload[2] === '/complete' && method === 'POST')
-      return complete(upload[1],principal);
+      return complete(upload[1],principal,headers);
     if (upload && !upload[2] && method === 'DELETE')
       return remove(upload[1],principal);
     const item = path.match(new RegExp(`^${root}/([^/]+)(/play-link|/thumbnail-link)?$`));

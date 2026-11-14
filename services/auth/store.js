@@ -344,6 +344,23 @@ function openStore(filename) {
     ON session_attachments(retention,object_expires_at,status);`);
   if (!db.pragma('table_info(session_image_publications)').some(column => column.name === 'room_deleted_at'))
     db.exec('ALTER TABLE session_image_publications ADD COLUMN room_deleted_at INTEGER');
+  // Renewal is additive: old binaries keep the original generation-zero table and
+  // receipts unchanged. Every explicitly authorized later lifetime has its own
+  // permanent identity mapping, even after its OSS object row is cleaned up.
+  db.exec(`CREATE TABLE IF NOT EXISTS session_image_publication_generations (
+    owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    owner_slot TEXT NOT NULL,owner_login_session_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,message_id TEXT NOT NULL,part_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation>0 AND generation<=9007199254740991),
+    attachment_id TEXT NOT NULL UNIQUE,expires_at INTEGER NOT NULL,
+    name TEXT NOT NULL,size_bytes INTEGER NOT NULL,content_type TEXT NOT NULL,
+    room_deleted_at INTEGER,
+    PRIMARY KEY(owner_user_id,owner_slot,owner_login_session_id,session_id,message_id,part_id,generation)
+  );
+  CREATE INDEX IF NOT EXISTS session_image_publication_generations_room
+    ON session_image_publication_generations(owner_user_id,owner_slot,session_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS session_image_publication_generations_identity
+    ON session_image_publication_generations(owner_user_id,owner_slot,session_id,message_id,part_id,generation);`);
   const cloudColumns = new Set(db.pragma('table_info(cloud_drive_videos)')
     .map(column => column.name));
   if (!cloudColumns.has('cleanup_hold_until'))

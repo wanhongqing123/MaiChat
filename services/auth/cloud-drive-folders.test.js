@@ -205,9 +205,15 @@ test('account deletion clears nested folder metadata after required media cleanu
 
 test('folder migration preserves an existing image schema and survives reopening', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(),'cloud-folder-schema-'));
-  t.after(() => fs.rmSync(directory,{ recursive:true,force:true }));
+  let old,migrated,reopened;
+  // Node runs these hooks in registration order; Windows cannot remove an open
+  // SQLite file. One closure also closes whichever handle an early assertion left open.
+  t.after(() => {
+    for (const database of [reopened,migrated,old]) if (database?.open) database.close();
+    fs.rmSync(directory,{ recursive:true,force:true });
+  });
   const filename = path.join(directory,'auth.sqlite');
-  const old = openStore(filename);
+  old = openStore(filename);
   old.prepare(`INSERT INTO users(id,account_id,im_user_id,created_at,updated_at)
     VALUES('owner','account_a','account_a',1,1)`).run();
   const id = randomUUID();
@@ -220,15 +226,14 @@ test('folder migration preserves an existing image schema and survives reopening
   old.exec('ALTER TABLE cloud_drive_videos DROP COLUMN folder_id');
   old.exec('DROP TABLE cloud_drive_folders');
   old.close();
-  const migrated = openStore(filename);
+  migrated = openStore(filename);
   assert.equal(migrated.prepare('SELECT folder_id FROM cloud_drive_videos WHERE id=?')
     .get(id).folder_id,null);
   const folder = randomUUID();
   migrated.prepare(`INSERT INTO cloud_drive_folders VALUES(?,'owner','Saved',NULL,1,1)`).run(folder);
   migrated.prepare('UPDATE cloud_drive_videos SET folder_id=? WHERE id=?').run(folder,id);
   migrated.close();
-  const reopened = openStore(filename);
-  t.after(() => reopened.close());
+  reopened = openStore(filename);
   assert.equal(reopened.prepare('SELECT folder_id FROM cloud_drive_videos WHERE id=?')
     .get(id).folder_id,folder);
   assert.equal(reopened.pragma('foreign_key_check').length,0);

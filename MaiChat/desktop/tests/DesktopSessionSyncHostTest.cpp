@@ -253,6 +253,10 @@ private slots:
     void imagePublicationJournalKeepsTerminalReceipt();
     void remoteTemporaryImagesKeepOrderedStateRows();
     void coordinatorWaitsForPendingImagePublishBeforeUpload();
+    void explicitImagePreparationWaitsForPendingAckWithoutModelOrHistoryScan();
+    void explicitImageJournalRenewsByGenerationAndRejectsOldCompletion();
+    void explicitImageSourceUsesOwnedCorePartAndRevokesOnClear();
+    void explicitImagePendingOldLoginMustSettleBeforeRenew();
     void historyImagesNeverEnrollForUpload();
     void temporaryImageLocalTlsCachesAcrossExpiryAndOwnerOffline();
     void assistantToolImagePublishesPendingWhileTheTurnIsStillRunning();
@@ -447,6 +451,328 @@ void DesktopSessionSyncHostTest::coordinatorWaitsForPendingImagePublishBeforeUpl
     coordinator.connectionReady();
     QTest::qWait(400);
     QCOMPARE(state(), QStringLiteral("failed"));
+}
+
+void DesktopSessionSyncHostTest::explicitImagePreparationWaitsForPendingAckWithoutModelOrHistoryScan() {
+    class NoModelCall final : public MaiModelClient {
+    public:
+        int calls = 0;
+        MaiError stream(const MaiModelRequest&, const MaiStreamSink&, const std::atomic<bool>&) override {
+            ++calls;
+            return MaiError::make(MaiErrorCode::Internal, "No model may be called to prepare an image");
+        }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
+    };
+    QTemporaryDir workspace;
+    const QString database = workspace.filePath(QStringLiteral("owned-image-command.sqlite"));
+    const QString source = workspace.filePath(QStringLiteral("old-owned.png"));
+    QImage image(8, 8, QImage::Format_RGB32);
+    image.fill(Qt::blue);
+    QVERIFY(image.save(source));
+    auto model = std::make_unique<NoModelCall>();
+    auto* observed = model.get();
+    AgentController controller(std::move(model), database);
+    const QString session = controller.createSession(workspace.path(), QStringLiteral("Old single image"));
+    MaiMessage message;
+    message.id = "message_a";
+    message.role = MaiRole::User;
+    message.created = message.completed = 1000;
+    const std::string part = "part_a";
+    message.parts.push_back({part, MaiImagePart{source.toUtf8().toStdString(), "image/png"}, 1000});
+    {
+        auto store = makeMaiSqliteStore(database.toUtf8().toStdString());
+        QVERIFY(store);
+        store.value()->putMessage(session.toUtf8().toStdString(), message);
+        QVERIFY(!store.value()->lastWriteError().hasError());
+    }
+    const QString account = publicationTestAccount();
+    QList<DesktopSessionSyncCoordinator::Completion> pendingAcks;
+    QList<QJsonObject> results;
+    QList<DesktopSessionSyncCoordinator::Completion> settledAcks;
+    QString ownerLogin = QStringLiteral("login_a");
+    bool recovering = false;
+    const auto endpoint = qEnvironmentVariable("MAICHAT_IMAGE_TEST_ENDPOINT");
+    const bool localTls = !endpoint.isEmpty();
+    DesktopVideoCircleAccess access;
+    access.accountId = account;
+    if (localTls) {
+        QVERIFY(endpoint.startsWith(QStringLiteral("https://localhost:")));
+        QFile certificate(qEnvironmentVariable("MAICHAT_IMAGE_TEST_CA"));
+        QVERIFY(certificate.open(QIODevice::ReadOnly));
+        access.authBaseUrl = endpoint + QStringLiteral("/auth");
+        access.mediaBaseUrl = endpoint;
+        access.accountToken = QStringLiteral("author-token");
+        access.caPem = certificate.readAll();
+        access.proxyUrl = QStringLiteral("");
+        access.signedUploadHostSuffix = QStringLiteral("localhost");
+    }
+    DesktopSessionSyncCoordinator coordinator(
+        [&](const QString& path, const QByteArray&, const QJsonObject& body,
+            DesktopSessionSyncCoordinator::Completion completion) {
+            if (path == QStringLiteral("session-sync/presence")) {
+                completion({{QStringLiteral("login_session_id"), ownerLogin}}, {});
+                return;
+            }
+            if (path == QStringLiteral("session-sync/send")) {
+                const auto chunk = body.value(QStringLiteral("payload")).toObject();
+                QCOMPARE(chunk.value(QStringLiteral("chunk_count")).toInt(), 1);
+                const auto bytes =
+                    QByteArray::fromBase64(chunk.value(QStringLiteral("data_base64")).toString().toLatin1());
+                QCOMPARE(QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()),
+                         chunk.value(QStringLiteral("sha256")).toString());
+                const auto response = QJsonDocument::fromJson(bytes).object();
+                if (response.value(QStringLiteral("type")).toString() == QStringLiteral("command_result"))
+                    results.append(response.value(QStringLiteral("result")).toObject());
+            }
+            for (const auto& row : body.value(QStringLiteral("messages")).toArray())
+                for (const auto& value : row.toObject().value(QStringLiteral("parts")).toArray()) {
+                    const auto metadata = value.toObject().value(QStringLiteral("remoteImage")).toObject();
+                    if (recovering && metadata.value(QStringLiteral("state")).toString() == QStringLiteral("failed") &&
+                        metadata.value(QStringLiteral("generation")).toInteger(0) == 1) {
+                        settledAcks.append(std::move(completion));
+                        return;
+                    }
+                    if (metadata.value(QStringLiteral("state")).toString() == QStringLiteral("pending") &&
+                        (!recovering || metadata.value(QStringLiteral("generation")).toInteger(0) >= 2)) {
+                        QVERIFY(!QJsonDocument(body).toJson().contains(workspace.path().toUtf8()));
+                        pendingAcks.append(std::move(completion));
+                        return;
+                    }
+                }
+            completion({}, {});
+        },
+        [&] { return &controller; });
+    coordinator.setAttachmentAccessProvider([&] { return access; });
+    coordinator.start();
+    coordinator.connectionReady();
+    const auto room = coordinator.localRoom(session);
+    QVERIFY(DesktopSessionAttachments::imagePublication(account, room, QString::fromStdString(message.id),
+                                                        QString::fromStdString(part))
+                .isEmpty());
+    coordinator.acceptInbox(QJsonArray{QJsonObject{
+        {QStringLiteral("id"), 401},
+        {QStringLiteral("kind"), QStringLiteral("command")},
+        {QStringLiteral("session_id"), session},
+        {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
+        {QStringLiteral("from_login_session_id"), QStringLiteral("phone-login")},
+        {QStringLiteral("client_message_id"), QStringLiteral("prepare-one")},
+        {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"), QStringLiteral("prepare_image")},
+                                                {QStringLiteral("requestId"), QStringLiteral("prepare-one")},
+                                                {QStringLiteral("messageId"), QString::fromStdString(message.id)},
+                                                {QStringLiteral("partId"), QString::fromStdString(part)}}}}});
+    QTRY_VERIFY_WITH_TIMEOUT(!pendingAcks.isEmpty(), 3000);
+    QVERIFY(results.isEmpty());
+    QCOMPARE(observed->calls, 0);
+    QCOMPARE(DesktopSessionAttachments::imagePublication(account, room, QString::fromStdString(message.id),
+                                                         QString::fromStdString(part))
+                 .value(QStringLiteral("state"))
+                 .toString(),
+             QStringLiteral("pending"));
+    pendingAcks.takeFirst()({}, {});
+    QTRY_COMPARE_WITH_TIMEOUT(results.size(), 1, 3000);
+    if (localTls) {
+        QVERIFY2(results.first().value(QStringLiteral("ok")).toBool(),
+                 qPrintable(results.first().value(QStringLiteral("error")).toString()));
+        const auto ready = results.first().value(QStringLiteral("remoteImage")).toObject();
+        QCOMPARE(ready.value(QStringLiteral("state")).toString(), QStringLiteral("ready"));
+        QVERIFY(!ready.contains(QStringLiteral("generation")));
+        const auto downloaded = DesktopSessionAttachments::downloadTemporaryImage(
+            access, room, QString::fromStdString(message.id), QString::fromStdString(part), ready);
+        QVERIFY2(downloaded.ok(), qPrintable(downloaded.error));
+        QCOMPARE(QImage(downloaded.path).size(), QSize(8, 8));
+    } else {
+        QVERIFY(!results.first().value(QStringLiteral("ok")).toBool());  // No credentials: local failure after ACK.
+        QCOMPARE(results.first().value(QStringLiteral("errorCode")).toString(), QStringLiteral("image_upload_failed"));
+        // Abandon a pending A publication, then request under current B. The
+        // failed A generation must be ACKed before a B +1 pending can appear.
+        QVERIFY(DesktopSessionAttachments::prepareTemporaryImage(account, room, QString::fromStdString(message.id),
+                                                                 QString::fromStdString(part),
+                                                                 QStringLiteral("abandoned-a"))
+                    .ok());
+        coordinator.connectionLost();
+        ownerLogin = QStringLiteral("replacement-login");
+        recovering = true;
+        coordinator.connectionReady();
+        const auto replacement = coordinator.localRoom(session);
+        coordinator.acceptInbox(QJsonArray{QJsonObject{
+            {QStringLiteral("id"), 402},
+            {QStringLiteral("kind"), QStringLiteral("command")},
+            {QStringLiteral("session_id"), session},
+            {QStringLiteral("from_slot"), QStringLiteral("ios_phone")},
+            {QStringLiteral("from_login_session_id"), QStringLiteral("phone-login")},
+            {QStringLiteral("client_message_id"), QStringLiteral("prepare-recovery")},
+            {QStringLiteral("payload"), QJsonObject{{QStringLiteral("action"), QStringLiteral("prepare_image")},
+                                                    {QStringLiteral("requestId"), QStringLiteral("prepare-recovery")},
+                                                    {QStringLiteral("messageId"), QString::fromStdString(message.id)},
+                                                    {QStringLiteral("partId"), QString::fromStdString(part)}}}}});
+        QTRY_VERIFY_WITH_TIMEOUT(!settledAcks.isEmpty(), 3000);
+        QCOMPARE(DesktopSessionAttachments::imagePublication(account, replacement, QString::fromStdString(message.id),
+                                                             QString::fromStdString(part))
+                     .value(QStringLiteral("generation"))
+                     .toInteger(),
+                 qint64(1));
+        QCOMPARE(results.size(), 1);
+        settledAcks.takeFirst()({}, {});
+        QTRY_VERIFY_WITH_TIMEOUT(!pendingAcks.isEmpty(), 3000);
+        const auto newPending = DesktopSessionAttachments::imagePublication(
+            account, replacement, QString::fromStdString(message.id), QString::fromStdString(part));
+        QCOMPARE(newPending.value(QStringLiteral("generation")).toInteger(), qint64(2));
+        QCOMPARE(newPending.value(QStringLiteral("owner_login_session_id")).toString(), ownerLogin);
+        QCOMPARE(results.size(), 1);
+        pendingAcks.takeFirst()({}, {});
+        QTRY_COMPARE_WITH_TIMEOUT(results.size(), 2, 3000);
+        QCOMPARE(results.last().value(QStringLiteral("errorCode")).toString(), QStringLiteral("image_upload_failed"));
+    }
+    QCOMPARE(observed->calls, 0);
+    QCOMPARE(controller.agent().listMessages(session.toUtf8().toStdString()).size(), std::size_t(1));
+}
+
+void DesktopSessionSyncHostTest::explicitImageJournalRenewsByGenerationAndRejectsOldCompletion() {
+    const QString account = publicationTestAccount();
+    const DesktopSessionRoom room{QStringLiteral("windows"), QStringLiteral("owned-login"),
+                                  QStringLiteral("owned-session")};
+    const QString message = QStringLiteral("owned-message"), part = QStringLiteral("owned-part");
+    auto first =
+        DesktopSessionAttachments::prepareTemporaryImage(account, room, message, part, QStringLiteral("request-one"));
+    QVERIFY(first.ok());
+    QCOMPARE(first.generation, qint64(0));
+    QVERIFY(!first.metadata.contains(QStringLiteral("generation")));
+    DesktopVideoCircleAccess access;
+    access.accountId = account;
+    auto failed = DesktopSessionAttachments::uploadTemporaryImage(access, room, message, part, {}, 0);
+    QVERIFY(!failed.ok());
+    QCOMPARE(failed.metadata.value(QStringLiteral("state")).toString(), QStringLiteral("failed"));
+    QVERIFY(
+        !DesktopSessionAttachments::prepareTemporaryImage(account, room, message, part, QStringLiteral("request-one"))
+             .ok());
+    auto renewed =
+        DesktopSessionAttachments::prepareTemporaryImage(account, room, message, part, QStringLiteral("request-two"));
+    QVERIFY(renewed.ok());
+    QCOMPARE(renewed.generation, qint64(1));
+    QCOMPARE(renewed.metadata.value(QStringLiteral("generation")).toInteger(), qint64(1));
+    QCOMPARE(renewed.metadata.value(QStringLiteral("owner_login_session_id")).toString(), room.login);
+    QVERIFY(!DesktopSessionAttachments::uploadTemporaryImage(access, room, message, part, {}, 0).ok());
+    const auto canceled = DesktopSessionAttachments::uploadTemporaryImage(access, room, message, part, {}, 1, nullptr,
+                                                                          [] { return false; });
+    QCOMPARE(canceled.errorCode, QStringLiteral("image_scope_changed"));
+    const auto current = DesktopSessionAttachments::imagePublication(account, room, message, part);
+    QCOMPARE(current, renewed.metadata);  // Old generation/canceled worker cannot settle the new pending journal.
+    const auto samePending = DesktopSessionAttachments::prepareTemporaryImage(account, room, message, part,
+                                                                              QStringLiteral("request-concurrent"));
+    QCOMPARE(samePending.metadata, current);
+    QCOMPARE(samePending.generation, qint64(1));
+    const QString liveMessage = QStringLiteral("live-message"), livePart = QStringLiteral("live-part");
+    QVERIFY(DesktopSessionAttachments::enrollTemporaryImage(account, room, liveMessage, livePart));
+    bool attached = false;
+    const auto overlapped =
+        DesktopSessionAttachments::uploadTemporaryImage(access, room, liveMessage, livePart, {}, 0, nullptr, [&] {
+            if (!attached) {
+                attached = true;
+                const auto request = DesktopSessionAttachments::prepareTemporaryImage(
+                    account, room, liveMessage, livePart, QStringLiteral("attached-live-request"));
+                if (!request.ok()) return false;
+            }
+            return true;
+        });
+    QVERIFY(attached && !overlapped.ok());
+    // The worker's older journal snapshot must not discard a request that
+    // attached while I/O was outside the publication mutex.
+    const auto duplicate = DesktopSessionAttachments::prepareTemporaryImage(account, room, liveMessage, livePart,
+                                                                            QStringLiteral("attached-live-request"));
+    QVERIFY(!duplicate.ok());
+    QCOMPARE(duplicate.generation, qint64(0));
+}
+
+void DesktopSessionSyncHostTest::explicitImageSourceUsesOwnedCorePartAndRevokesOnClear() {
+    QTemporaryDir workspace, managed;
+    const QString source = managed.filePath(QStringLiteral("owned-old-workspace.png"));
+    QImage pixels(8, 8, QImage::Format_RGB32);
+    pixels.fill(Qt::green);
+    QVERIFY(pixels.save(source));
+    const QString database = workspace.filePath(QStringLiteral("owned-path.sqlite"));
+    AgentController controller(AgentController::ModelConfig{}, database);
+    const QString session = controller.createSession(workspace.path(), QStringLiteral("Stored image authority"));
+    MaiMessage image;
+    image.id = MaiIdGenerator::newMessageId();
+    image.role = MaiRole::Assistant;
+    image.created = image.completed = 1000;
+    const auto part = MaiIdGenerator::newPartId();
+    image.parts.push_back({part, MaiImagePart{source.toUtf8().toStdString(), "image/png"}, 1001});
+    {
+        auto store = makeMaiSqliteStore(database.toUtf8().toStdString());
+        QVERIFY(store);
+        store.value()->putMessage(session.toUtf8().toStdString(), image);
+        QVERIFY(!store.value()->lastWriteError().hasError());
+    }
+    std::function<bool()> afterDestruction;
+    {
+        DesktopSessionSyncHost host(controller);
+        host.setImagePublicationScope(publicationTestAccount(), QStringLiteral("windows"),
+                                      QStringLiteral("owned-login"));
+        auto prepared = host.prepareImage(session, QString::fromStdString(image.id), QString::fromStdString(part),
+                                          QStringLiteral("prepare-owned"));
+        QVERIFY2(prepared.ok(), qPrintable(prepared.error));
+        QCOMPARE(QFileInfo(prepared.path).canonicalFilePath(), QFileInfo(source).canonicalFilePath());
+        QVERIFY(!host.prepareImage(session, QString::fromStdString(image.id), QStringLiteral("wrong-part"),
+                                   QStringLiteral("wrong"))
+                     .ok());
+        auto workspaceLease = prepared.canCommit;
+        QVERIFY(workspaceLease());
+        QVERIFY(controller.setSessionDirectory(session, managed.path()));
+        QVERIFY(!workspaceLease());
+        auto oldAbsolute = host.prepareImage(session, QString::fromStdString(image.id), QString::fromStdString(part),
+                                             QStringLiteral("prepare-again"));
+        QVERIFY2(oldAbsolute.ok(), qPrintable(oldAbsolute.error));
+        auto clearLease = oldAbsolute.canCommit;
+        QVERIFY(clearLease());
+        QVERIFY(controller.agent().submit(MaiClearMessages{session.toUtf8().toStdString()}));
+        QVERIFY(!clearLease());
+        QVERIFY(!host.prepareImage(session, QString::fromStdString(image.id), QString::fromStdString(part),
+                                   QStringLiteral("after-clear"))
+                     .ok());
+        afterDestruction =
+            host.imagePreparationGuard(session, QString::fromStdString(image.id), QString::fromStdString(part));
+        QVERIFY(afterDestruction());
+    }
+    QVERIFY(!afterDestruction());
+}
+
+void DesktopSessionSyncHostTest::explicitImagePendingOldLoginMustSettleBeforeRenew() {
+    const QString account = publicationTestAccount();
+    const DesktopSessionRoom original{QStringLiteral("windows"), QStringLiteral("login-a"), QStringLiteral("session")};
+    const QString message = QStringLiteral("message"), part = QStringLiteral("part");
+    QVERIFY(
+        DesktopSessionAttachments::prepareTemporaryImage(account, original, message, part, QStringLiteral("request-a"))
+            .ok());
+    DesktopVideoCircleAccess access;
+    access.accountId = account;
+    const auto old = DesktopSessionAttachments::uploadTemporaryImage(access, original, message, part, {}, 0, nullptr,
+                                                                     [] { return false; });
+    QCOMPARE(old.errorCode, QStringLiteral("image_scope_changed"));
+    DesktopSessionRoom replacement = original;
+    replacement.login = QStringLiteral("login-b");
+    const auto prepared = DesktopSessionAttachments::prepareTemporaryImage(account, replacement, message, part,
+                                                                           QStringLiteral("request-b"));
+    QVERIFY2(prepared.ok(),
+             "New authorized owner must explicitly settle abandoned pending, not stay permanently unpreparable");
+    QCOMPARE(prepared.generation, qint64(0));
+    QCOMPARE(prepared.metadata.value(QStringLiteral("state")).toString(), QStringLiteral("failed"));
+    QVERIFY(prepared.requiresSettledAck);
+    const auto stillWaiting = DesktopSessionAttachments::prepareTemporaryImage(account, replacement, message, part,
+                                                                               QStringLiteral("concurrent-b"));
+    QVERIFY(stillWaiting.requiresSettledAck);
+    QCOMPARE(stillWaiting.generation, qint64(0));
+    const auto renewed = DesktopSessionAttachments::prepareTemporaryImage(account, replacement, message, part,
+                                                                          QStringLiteral("request-b"), true, 0);
+    QVERIFY2(renewed.ok(), qPrintable(renewed.error));
+    QCOMPARE(renewed.generation, qint64(1));
+    QCOMPARE(renewed.metadata.value(QStringLiteral("state")).toString(), QStringLiteral("pending"));
+    QCOMPARE(renewed.metadata.value(QStringLiteral("owner_login_session_id")).toString(), replacement.login);
+    // Late A cannot write its old generation even without the retired worker's runtime lease.
+    QVERIFY(!DesktopSessionAttachments::uploadTemporaryImage(access, original, message, part, {}, 0).ok());
+    QCOMPARE(DesktopSessionAttachments::imagePublication(account, replacement, message, part), renewed.metadata);
 }
 
 void DesktopSessionSyncHostTest::historyImagesNeverEnrollForUpload() {

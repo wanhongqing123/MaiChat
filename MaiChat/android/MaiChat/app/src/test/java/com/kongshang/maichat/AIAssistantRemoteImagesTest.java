@@ -46,15 +46,16 @@ public final class AIAssistantRemoteImagesTest {
         assertEquals("The shared temporary-image receipt is previewable like iOS", 1, parts.length());
     }
 
-    @Test public void unavailableOwnerOnlyMediaStillShowsItsExistingPlaceholder() throws Exception {
+    @Test public void ownerOnlyImageKeepsRealIdentityForExplicitPublicationWithoutInventedMetadata() throws Exception {
         JSONObject part = part(); part.remove("remoteImage");
         JSONArray parts = new JSONArray().put(part);
         Method sanitize = AIAssistantController.class.getDeclaredMethod("sanitizeRemoteMedia", JSONArray.class);
         sanitize.setAccessible(true);
         sanitize.invoke(null, new JSONArray().put(new JSONObject().put("parts", parts)));
         assertFalse(part.has("path"));
-        assertEquals(2, parts.length());
-        assertTrue(parts.getJSONObject(1).getString("text").contains("暂不可跨设备预览"));
+        assertEquals(1, parts.length());
+        assertEquals("part", part.getString("id"));
+        assertFalse(part.has("remoteImage"));
     }
 
     @Test public void downloadUsesOriginalPublicationLoginAndExactMessagePartIdentity() throws Exception {
@@ -142,5 +143,30 @@ public final class AIAssistantRemoteImagesTest {
         File committed = cache.commit(staged, request);
         assertEquals(committed.getCanonicalFile(), committed);
         assertEquals(committed, cache.cached(request));
+    }
+
+    @Test public void completeRetryableReceiptCanIdentifyLocalCacheWithoutAuthorizingDownload() throws Exception {
+        JSONObject part = part(); AIAssistantRemoteImages.Request ready = request("account", owner(), "message", part);
+        for (String state : new String[] {"pending", "failed"}) {
+            JSONObject retryable = new JSONObject(part.toString()); retryable.getJSONObject("remoteImage").put("state", state);
+            assertNull(request("account", owner(), "message", retryable));
+            AIAssistantRemoteImages.Request cached = AIAssistantRemoteImages.Request.forCache("account", owner(), "message", retryable,
+                AIAssistantRemoteImagesTest::info);
+            assertNotNull(cached); assertEquals(ready.signature, cached.signature);
+        }
+    }
+
+    @Test public void generationZeroKeepsInstalledCacheIdentityAndNewGenerationNeverLeaksIntoDownloadPayload() throws Exception {
+        JSONObject part = part(); AIAssistantRemoteImages.Request legacy = request("account", owner(), "message", part);
+        part.getJSONObject("remoteImage").put("generation", 0);
+        assertEquals(legacy.signature, request("account", owner(), "message", part).signature);
+        part.getJSONObject("remoteImage").put("generation", 1);
+        AIAssistantRemoteImages.Request renewed = request("account", owner(), "message", part);
+        assertNotEquals(legacy.signature, renewed.signature); assertEquals(legacy.cacheKey, renewed.cacheKey);
+        assertFalse(renewed.downloadRequest().has("generation"));
+        for (Object invalid : new Object[] {-1, "1", 1.5, 9_007_199_254_740_992L}) {
+            part.getJSONObject("remoteImage").put("generation", invalid);
+            assertNull(String.valueOf(invalid), request("account", owner(), "message", part));
+        }
     }
 }

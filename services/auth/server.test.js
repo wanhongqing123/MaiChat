@@ -12,19 +12,49 @@ const { createServer, start, requireDeviceSlotFromEnv,
 test('temporary image ownership connector uses fixed Sync loopback and only forwards the authenticated Bearer',async () => {
   const calls = [];
   const verify = sessionAttachmentAuthorizerFromEnv({ MAICHAT_SESSION_SYNC_PORT:'9123' },async (url,options) => {
-    calls.push({url,options}); return {status:200,json:async () => ({ok:true})};
+    calls.push({url,options}); return {status:200,json:async () => ({ok:true,generation:0})};
   });
   const binding = {operation:'create',owner_slot:'mac',owner_login_session_id:'login_mac',
     session_id:'session_a',message_id:'message_a',part_id:'part_a'};
-  assert.equal(await verify(binding,{authorization:'Bearer account-test-token',cookie:'private'}),true);
+  assert.deepEqual(await verify(binding,{authorization:'Bearer account-test-token',cookie:'private'}),{ok:true,generation:0});
   assert.equal(calls[0].url,'http://127.0.0.1:9123/v1/session-sync/authorize-attachment');
   assert.equal(calls[0].options.headers.Authorization,'Bearer account-test-token');
   assert.equal(calls[0].options.headers.cookie,undefined);
+  assert.equal(calls[0].options.headers['X-MaiChat-Image-Generation'],'1');
   assert.deepEqual(JSON.parse(calls[0].options.body),binding);
   assert.equal(calls[0].options.redirect,'error');
   assert.throws(() => sessionAttachmentAuthorizerFromEnv({MAICHAT_SESSION_SYNC_PORT:'https://caller.example'}),/port/);
   const denied = sessionAttachmentAuthorizerFromEnv({},async () => ({status:404}));
   assert.equal(await denied(binding,{authorization:'Bearer account-test-token'}),false);
+});
+
+test('generation capability is server-owned rather than forwarded from a public caller',async () => {
+  let forwarded;
+  const verify = sessionAttachmentAuthorizerFromEnv({},async (_url,options) => {
+    forwarded = options.headers;return {status:200,json:async () => ({ok:true,generation:1})};
+  });
+  await verify({operation:'create'},{authorization:'Bearer fixture-only-account-token',
+    'X-MaiChat-Image-Generation':'0','x-maichat-image-generation':'attacker'});
+  assert.equal(forwarded['X-MaiChat-Image-Generation'],'1');
+  assert.equal(forwarded['x-maichat-image-generation'],undefined);
+});
+
+test('temporary image ownership connector preserves only trusted publication generation grants',async () => {
+  let response = {ok:true,generation:2};
+  const verify = sessionAttachmentAuthorizerFromEnv({},async () => ({status:200,json:async () => response}));
+  const binding = {operation:'create',owner_slot:'mac',owner_login_session_id:'login_mac',
+    session_id:'session_a',message_id:'message_a',part_id:'part_a'};
+  const headers = {authorization:'Bearer fixture-only-account-token'};
+  assert.deepEqual(await verify(binding,headers),{ok:true,generation:2});
+  for (const generation of [-1,1.5,'1',true,null,Number.MAX_SAFE_INTEGER+1]) {
+    response = {ok:true,generation};
+    assert.equal(await verify(binding,headers),false);
+  }
+  response = {ok:true};
+  assert.equal(await verify(binding,headers),false);
+  assert.equal(await verify({...binding,operation:'read'},headers),true);
+  response = {ok:false,generation:1};
+  assert.equal(await verify(binding,headers),false);
 });
 
 test('cloud signer control carries absolute expiry only for temporary image requests',async () => {

@@ -63,6 +63,11 @@ public final class AIAssistantController {
         MaiCloudDrive.MediaInfo mediaInfo(String name);
         void download(JSONObject request, File target, AIAssistantPreparationJobs.Cancellation cancellation) throws Exception;
     }
+    // Explicit publication can upload a single owner image. It must never use the read-only SessionReads seam.
+    interface ImagePublicationCommands {
+        String send(JSONObject owner, JSONObject request, java.util.function.BiConsumer<String, String> sent,
+                    java.util.function.BiConsumer<JSONObject, JSONObject> received) throws Exception;
+    }
     static final class State {
         final JSONObject data;
         final JSONObject remoteSession;
@@ -337,9 +342,26 @@ public final class AIAssistantController {
     private int remoteSelectionGeneration;
     private final AIAssistantRemoteImages.Cache remoteImageCache;
     private final RemoteImageReads remoteImageReads;
+    private final ImagePublicationCommands imagePublicationCommands;
     private final Map<String, File> remoteImageFiles = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String, List<java.util.function.BiConsumer<File, String>>> remoteImageCallbacks = new HashMap<>();
     private String remoteImageSelection = "";
+    private final Map<String, ImagePublication> imagePublications = new HashMap<>();
+    private final Map<String, ImagePublication> imagePublicationCommandsById = new HashMap<>();
+    private static final class ImagePublication {
+        final State owner;
+        final String message, key;
+        final JSONObject source, request;
+        final List<java.util.function.BiConsumer<File, String>> callbacks = new ArrayList<>();
+        String command = "";
+        JSONObject deliveredPart;
+        ImagePublication(State owner, String message, JSONObject source, String key) throws Exception {
+            this.owner = owner; this.message = message; this.source = source; this.key = key;
+            deliveredPart = source;
+            request = new JSONObject().put("action", "prepare_image").put("requestId", UUID.randomUUID().toString())
+                .put("messageId", message).put("partId", source.getString("id"));
+        }
+    }
     private JSONObject remoteData = new JSONObject();
     private String remoteCommandStatus = "";
     private String remoteRestoreDraft = "";
@@ -416,8 +438,13 @@ public final class AIAssistantController {
         this(context, testEndpoint, sessionReads, null);
     }
     AIAssistantController(Context context, String testEndpoint, SessionReads sessionReads, RemoteImageReads imageReads) {
+        this(context, testEndpoint, sessionReads, imageReads, null);
+    }
+    AIAssistantController(Context context, String testEndpoint, SessionReads sessionReads, RemoteImageReads imageReads,
+                          ImagePublicationCommands imageCommands) {
         this.context = context.getApplicationContext();
         this.sessionReads = sessionReads;
+        this.imagePublicationCommands = imageCommands;
         accountAuth = MaiChatAuthClient.shared(this.context);
         accountToolLoginGeneration = accountAuth.accountSessionGeneration();
         if (testEndpoint != null && !BuildConfig.DEBUG)
@@ -1675,6 +1702,8 @@ public final class AIAssistantController {
         String imageSelection = remoteSelectionGeneration + ":" + (selectedRemote == null ? "" : pageOwner(selectedRemote));
         if (!imageSelection.equals(remoteImageSelection)) {
             preparations.cancelPrefix("remote-image:");
+            for (ImagePublication pending : new ArrayList<>(imagePublications.values()))
+                finishImagePublication(pending, null, "会话已切换");
             remoteImageSelection = imageSelection;
         }
         JSONObject visible = selectedRemote == null ? data : remoteData;
@@ -2633,6 +2662,7 @@ public final class AIAssistantController {
         worker.post(() -> {
             if (payload.optString("type").equals("command_result")) {
                 String command = payload.optString("command_id");
+                if (acceptImagePublicationResult(envelope, payload)) return;
                 if (toolDetails.handles(command)) {
                     if (ownsModelConfiguration() && toolDetails.acceptCommandResult(envelope, payload)) publishState();
                     return; // A mismatched ACK leaves the original read pending.
@@ -2743,6 +2773,8 @@ public final class AIAssistantController {
                 part.remove("path");
                 // Temporary image receipts are independently downloadable; their original-device paths stay private.
                 if (!part.optString("attachment_id").isEmpty() || part.optJSONObject("remoteImage") != null) continue;
+                // An old image keeps its real IDs for explicit single-image publication; the UI owns its action card.
+                if (kind.equals("image")) continue;
                 try {
                     parts.put(new JSONObject().put("id", part.optString("id") + "-remote-placeholder")
                         .put("kind", "text").put("text", kind.equals("image")
@@ -3707,15 +3739,14 @@ public final class AIAssistantController {
         }
     }
 
-    private boolean currentRemoteImage(State owner, String messageID, JSONObject part) {
+    private JSONObject currentRemoteImagePart(State owner, String messageID, JSONObject part, boolean matchMetadata) {
         State current = state;
         if (owner == null || messageID == null || messageID.isEmpty() || part == null || !ownsModelConfiguration() || owner.remoteSession == null
             || !accountUserId.equals(owner.data.optString("remoteImageAccountId"))
             || owner.data.optLong("remoteImageAccountGeneration", -1) != accountToolLoginGeneration
             || !sameRemote(owner.remoteSession, current.remoteSession)
-            || owner.data.optInt("remoteSelectionGeneration") != current.data.optInt("remoteSelectionGeneration")) return false;
+            || owner.data.optInt("remoteSelectionGeneration") != current.data.optInt("remoteSelectionGeneration")) return null;
         JSONObject metadata = part.optJSONObject("remoteImage");
-        if (metadata == null) return false;
         for (String field : new String[] {"messages", "messageDisplayUpdates", "questionMessages"}) {
             JSONArray messages = current.data.optJSONArray(field);
             if (messages == null) continue;
@@ -3726,21 +3757,187 @@ public final class AIAssistantController {
                 if (parts == null) continue;
                 for (int j = 0; j < parts.length(); j++) {
                     JSONObject candidate = parts.optJSONObject(j);
-                    if (candidate != null && part.optString("id").equals(candidate.optString("id"))
-                        && metadata.toString().equals(String.valueOf(candidate.optJSONObject("remoteImage")))) return true;
+                    if (candidate != null && candidate.optString("kind").equals("image")
+                        && part.optString("kind").equals("image") && !part.optString("id").isEmpty()
+                        && part.optString("id").equals(candidate.optString("id"))
+                        && (!matchMetadata || String.valueOf(metadata).equals(String.valueOf(candidate.optJSONObject("remoteImage")))))
+                        return candidate;
                 }
             }
         }
-        return false;
+        return null;
+    }
+    private boolean currentRemoteImage(State owner, String messageID, JSONObject part) {
+        return part != null && part.optJSONObject("remoteImage") != null
+            && currentRemoteImagePart(owner, messageID, part, true) != null;
     }
 
     /** UI lookup uses only previously verified completions; cache hashing and all downloads stay off the main thread. */
     String cachedRemoteImagePath(State owner, String messageID, JSONObject part) {
         if (!currentRemoteImage(owner, messageID, part)) return null;
-        AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.parse(
+        AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.forCache(
             accountUserId, owner.remoteSession, messageID, part, remoteImageReads::mediaInfo);
         File file = request == null ? null : remoteImageFiles.get(request.signature);
         return file != null && file.isFile() ? file.getAbsolutePath() : null;
+    }
+
+    /** A user gesture prepares one persisted source part only; ordinary binds never call this entry. */
+    void requestRemoteImagePublication(State owner, String messageID, JSONObject part,
+                                       java.util.function.BiConsumer<File, String> completion) {
+        final JSONObject captured;
+        try { captured = part == null ? null : new JSONObject(part.toString()); }
+        catch (Exception invalid) { main.post(() -> completion.accept(null, "图片暂不可用")); return; }
+        worker.post(() -> {
+            ImagePublication pending = null;
+            try {
+                if (currentRemoteImagePart(owner, messageID, captured, true) == null) throw new IOException("会话已切换");
+                String key = new JSONArray().put(accountUserId).put(accountToolLoginGeneration)
+                    .put(owner.data.optInt("remoteSelectionGeneration")).put(pageOwner(owner.remoteSession))
+                    .put(messageID).put(captured.optString("id")).toString();
+                pending = imagePublications.get(key);
+                if (pending != null) { pending.callbacks.add(completion); return; }
+                pending = new ImagePublication(owner, messageID, captured, key);
+                pending.callbacks.add(completion); imagePublications.put(key, pending);
+                final ImagePublication ticket = pending;
+                AIAssistantRemoteImages.Request cachedRequest = AIAssistantRemoteImages.Request.forCache(
+                    accountUserId, owner.remoteSession, messageID, captured, remoteImageReads::mediaInfo);
+                if (!preparations.start("remote-image:publication-cache:" + key, nativeEpoch, () -> nativeEpoch,
+                    cancellation -> {
+                        File cached = cachedRequest == null ? null : remoteImageCache.cached(cachedRequest);
+                        cancellation.check();
+                        return cached == null ? new JSONObject() : new JSONObject().put("path", cached.getAbsolutePath());
+                    }, (prepared, failure) -> {
+                        if (imagePublications.get(key) != ticket) return;
+                        try {
+                            if (failure != null) throw failure;
+                            if (currentRemoteImagePart(owner, messageID, captured, true) == null) throw new IOException("会话已切换");
+                            String cached = prepared == null ? "" : prepared.optString("path");
+                            if (!cached.isEmpty()) {
+                                File file = new File(cached); remoteImageFiles.put(cachedRequest.signature, file);
+                                finishImagePublication(ticket, file, "");
+                            } else sendImagePublication(ticket);
+                        } catch (Exception failed) { finishImagePublication(ticket, null, safeMessage(failed)); }
+                    })) throw new IOException("图片正在准备，请稍后重试");
+            } catch (Exception failure) {
+                if (pending != null) finishImagePublication(pending, null, safeMessage(failure));
+                else main.post(() -> completion.accept(null, safeMessage(failure)));
+            }
+        });
+    }
+
+    private void sendImagePublication(ImagePublication ticket) throws Exception {
+        // Re-read the current catalog tuple after cache I/O. The clicked object's online flag is only presentation.
+        JSONObject destination;
+        try { destination = outgoingRuntime(ticket.owner.selected, ticket.owner.remoteSession); }
+        catch (IOException offline) { throw new IOException("所属设备离线，请上线后重新加载图片"); }
+        if (imagePublicationCommands == null && sessionSync == null) throw new IOException("设备同步暂时不可用");
+        java.util.function.BiConsumer<String, String> sent = (command, failure) -> worker.post(() -> {
+            if (!failure.isEmpty() && imagePublications.get(ticket.key) == ticket)
+                finishImagePublication(ticket, null, "所属设备暂不可达，请上线后重新加载");
+        });
+        ticket.command = imagePublicationCommands != null
+            ? imagePublicationCommands.send(AIAssistantToolDetails.copy(destination), AIAssistantToolDetails.copy(ticket.request),
+                sent, this::acceptRemotePayload)
+            : sessionSync.sendToRemote(destination, "command", ticket.request, sent);
+        if (ticket.command == null || ticket.command.isEmpty()) throw new IOException("所属设备未接受图片请求");
+        imagePublicationCommandsById.put(ticket.command, ticket);
+        // One bounded command, no polling or automatic source retry. A later explicit gesture creates a new requestId.
+        worker.postDelayed(() -> {
+            if (imagePublications.get(ticket.key) == ticket && imagePublicationCommandsById.get(ticket.command) == ticket)
+                finishImagePublication(ticket, null, "所属设备重新加载图片超时，请稍后重试");
+        }, 120_000);
+    }
+
+    private boolean acceptImagePublicationResult(JSONObject envelope, JSONObject payload) {
+        ImagePublication ticket = imagePublicationCommandsById.get(payload.optString("command_id"));
+        if (ticket == null) return false;
+        if (!AIAssistantSessionModels.Remote.matchesOwner(ticket.owner.remoteSession, envelope)) return true;
+        if (currentRemoteImagePart(ticket.owner, ticket.message, ticket.source, false) == null) {
+            finishImagePublication(ticket, null, "会话已切换"); return true;
+        }
+        JSONObject result = payload.optJSONObject("result");
+        if (result == null || !(result.opt("ok") instanceof Boolean)) return true;
+        String code = result.optString("errorCode"), error = result.optString("error");
+        boolean unsupported = code.equals("unsupported") || code.equals("not_supported") || code.equals("unsupported_action")
+            || code.isEmpty() && (error.equals("不支持的远端操作") || error.equals("不支持的跨设备操作"));
+        if (!result.optBoolean("ok") && unsupported) {
+            // Older owners have no echoed image tuple. The authenticated envelope and exact command ID bind this rejection.
+            finishImagePublication(ticket, null, "所属设备版本不支持重新加载图片，请更新所属设备"); return true;
+        }
+        for (String field : new String[] {"requestId", "messageId", "partId"})
+            if (!(result.opt(field) instanceof String) || !ticket.request.optString(field).equals(result.optString(field))) return true;
+        if (!result.optBoolean("ok")) {
+            finishImagePublication(ticket, null, error.isEmpty() ? "所属设备未能重新加载图片，请重试" : error); return true;
+        }
+        JSONObject metadata = result.optJSONObject("remoteImage");
+        try {
+            JSONObject preparedPart = new JSONObject(ticket.source.toString()).put("remoteImage", metadata);
+            preparedPart.remove("path");
+            if (metadata == null || !metadata.optString("state").equals("ready")
+                || AIAssistantRemoteImages.Request.parse(accountUserId, ticket.owner.remoteSession,
+                    ticket.message, preparedPart, remoteImageReads::mediaInfo) == null) return true;
+            JSONObject current = currentRemoteImagePart(ticket.owner, ticket.message, ticket.source, false);
+            JSONObject observed = current == null ? null : current.optJSONObject("remoteImage");
+            JSONObject previous = ticket.source.optJSONObject("remoteImage");
+            long requestedGeneration = AIAssistantRemoteImages.generation(previous);
+            long returnedGeneration = AIAssistantRemoteImages.generation(metadata);
+            long observedGeneration = AIAssistantRemoteImages.generation(observed);
+            if (requestedGeneration < 0 || returnedGeneration < requestedGeneration
+                || returnedGeneration - requestedGeneration > 1) return true;
+            if (observedGeneration < requestedGeneration || observedGeneration > returnedGeneration) {
+                finishImagePublication(ticket, null, "图片已更新，请重新加载当前图片"); return true;
+            }
+            // The source can broadcast its pending/ready publication before the command receipt arrives. Another
+            // different terminal receipt wins; this late command must never replace it or download its old object.
+            if (!String.valueOf(observed).equals(String.valueOf(previous))
+                && !String.valueOf(observed).equals(metadata.toString())
+                && !(observed != null && observed.optString("state").equals("pending")
+                    && observedGeneration == returnedGeneration)) {
+                finishImagePublication(ticket, null, "图片已更新，请重新加载当前图片"); return true;
+            }
+            if (!replaceRemoteImageMetadata(ticket.message, ticket.source.optString("id"), metadata)) {
+                finishImagePublication(ticket, null, "图片已不可用"); return true;
+            }
+            ticket.deliveredPart = preparedPart;
+            imagePublicationCommandsById.remove(ticket.command, ticket);
+            publishState();
+            loadRemoteImage(state, ticket.message, preparedPart, (file, failure) -> worker.post(() -> {
+                finishImagePublication(ticket, file, failure);
+            }));
+        } catch (Exception invalid) { finishImagePublication(ticket, null, "所属设备图片回执无效，请重试"); }
+        return true;
+    }
+
+    private boolean replaceRemoteImageMetadata(String messageID, String partID, JSONObject metadata) throws Exception {
+        boolean replaced = false;
+        for (String field : new String[] {"messages", "messageDisplayUpdates", "questionMessages"}) {
+            JSONArray messages = remoteData.optJSONArray(field);
+            if (messages == null) continue;
+            for (int i = 0; i < messages.length(); i++) {
+                JSONObject message = messages.optJSONObject(i);
+                if (message == null || !messageID.equals(message.optString("id"))) continue;
+                JSONArray parts = message.optJSONArray("parts");
+                if (parts == null) continue;
+                for (int j = 0; j < parts.length(); j++) {
+                    JSONObject candidate = parts.optJSONObject(j);
+                    if (candidate != null && candidate.optString("kind").equals("image") && partID.equals(candidate.optString("id"))) {
+                        candidate.put("remoteImage", new JSONObject(metadata.toString())); candidate.remove("path"); replaced = true;
+                    }
+                }
+            }
+        }
+        return replaced;
+    }
+
+    private void finishImagePublication(ImagePublication ticket, File file, String failure) {
+        if (!imagePublications.remove(ticket.key, ticket)) return;
+        imagePublicationCommandsById.remove(ticket.command, ticket);
+        for (java.util.function.BiConsumer<File, String> callback : ticket.callbacks)
+            main.post(() -> {
+                boolean current = currentRemoteImagePart(ticket.owner, ticket.message, ticket.deliveredPart, file != null) != null;
+                callback.accept(current ? file : null, current ? failure : "会话已切换");
+            });
+        ticket.callbacks.clear();
     }
 
     /** Repeated row binds share one read; callers own explicit retry and keep errors on the image card. */
@@ -3754,12 +3951,14 @@ public final class AIAssistantController {
                 if (!currentRemoteImage(owner, messageID, captured)) throw new IOException("会话已切换");
                 JSONObject metadata = captured.optJSONObject("remoteImage");
                 String status = AIAssistantRemoteImages.text(metadata, "state");
-                if (status.equals("pending")) throw new IOException("图片正在同步");
-                if (status.equals("failed")) throw new IOException(metadata.optLong("expires_at") > 0
-                    && metadata.optLong("expires_at") <= System.currentTimeMillis() ? "图片已过期" : "图片同步失败");
-                AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.parse(
+                AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.forCache(
                     accountUserId, owner.remoteSession, messageID, captured, remoteImageReads::mediaInfo);
-                if (request == null) throw new IOException("图片暂不可用");
+                if (request == null) {
+                    if (status.equals("pending")) throw new IOException("图片正在同步");
+                    if (status.equals("failed")) throw new IOException(metadata.optLong("expires_at") > 0
+                        && metadata.optLong("expires_at") <= System.currentTimeMillis() ? "图片已过期" : "图片同步失败");
+                    throw new IOException("图片暂不可用");
+                }
                 String key = "remote-image:" + owner.data.optInt("remoteSelectionGeneration") + ":" + request.signature;
                 List<java.util.function.BiConsumer<File, String>> callbacks = remoteImageCallbacks.get(key);
                 if (callbacks != null) { callbacks.add(completion); return; }
@@ -3770,6 +3969,10 @@ public final class AIAssistantController {
                     if (!currentRemoteImage(owner, messageID, captured)) throw new IOException("会话已切换");
                     if (cached != null) return new JSONObject().put("path", cached.getAbsolutePath());
                     remoteImageFiles.remove(request.signature);
+                    // A retryable publication state may identify a retained complete file, but never authorizes HTTP.
+                    if (status.equals("pending")) throw new IOException("图片正在同步");
+                    if (status.equals("failed")) throw new IOException(request.expired(System.currentTimeMillis())
+                        ? "图片已过期" : "图片同步失败");
                     if (request.expired(System.currentTimeMillis())) throw new IOException("图片已过期");
                     File staged = remoteImageCache.staging(request);
                     try {

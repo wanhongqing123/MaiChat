@@ -26,7 +26,8 @@ function fixture(t) {
   let starts = 0, authorized = true, failDelete = false,completionHook = null,readHook = null,partHook = null;
   const service = createCloudDriveService({ db,mode:'session',now:() => now,
     authorizeAttachment:async (request,headers) => {
-      authorizations.push({ request,headers }); return authorized;
+      authorizations.push({ request,headers });
+      return request.operation === 'create' ? authorized : authorized === true || authorized?.ok === true;
     },
     startUpload:async (_account,key) => { ++starts; uploads.set('upload_a',key); return 'upload_a'; },
     signPart:async (_account,_key,_upload,_number,bytes,md5) => {
@@ -58,6 +59,7 @@ function fixture(t) {
   const read = (id,principal = viewer,expected = binding) =>
     call('GET',`${ROOT}/${id}/play-link`,{},principal,new URLSearchParams(expected));
   return { db,owner,viewer,other,objects,uploads,authorizations,reads,begin,complete,read,signPart,service,
+    parts:id => call('GET',`${ROOT}/uploads/${id}/parts`),
     starts:() => starts,now:() => now,advance:ms => { now += ms; },
     authorize:value => { authorized = value; },failDelete:value => { failDelete = value; },
     onComplete:callback => { completionHook = callback; },onRead:callback => { readHook = callback; },
@@ -91,6 +93,94 @@ test('temporary image publication reserves one fixed lifetime and complete owner
   assert.equal(readyRepeat.body.expires_at,first.body.expires_at);
 });
 
+test('trusted image generation creates one new lifetime without replacing its expired original receipt',async t => {
+  const f = fixture(t);
+  const original = await f.begin();await f.complete(original.body.attachment_id);
+  const oldReceipt = f.db.prepare('SELECT * FROM session_image_publications').get();
+  f.advance(DAY);
+  assert.equal((await f.begin()).statusCode,410);
+  f.authorize({ok:true,generation:1});
+  const renewed = await f.begin();
+  assert.equal(renewed.statusCode,201);
+  assert.notEqual(renewed.body.attachment_id,original.body.attachment_id);
+  assert.equal(renewed.body.generation,1);
+  assert.equal(renewed.body.expires_at,f.now()+DAY);
+  assert.deepEqual(f.db.prepare('SELECT * FROM session_image_publications').get(),oldReceipt);
+  assert.equal(f.db.prepare('SELECT generation FROM session_image_publication_generations').get().generation,1);
+  const repeated = await f.begin();
+  assert.equal(repeated.body.attachment_id,renewed.body.attachment_id);
+  assert.equal(f.starts(),2);
+  await f.complete(renewed.body.attachment_id);
+  f.authorize(false);
+  assert.equal((await f.begin()).body.attachment_id,renewed.body.attachment_id);
+  f.authorize(true); // A rolled-back legacy authorizer sees generation zero, never resets that receipt.
+  assert.equal((await f.begin()).statusCode,410);
+  assert.equal(f.starts(),2);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM session_image_publication_generations').get().n,1);
+});
+
+test('a fixed trusted generation is idempotent under concurrent init and cannot recreate itself after expiry',async t => {
+  const f = fixture(t);f.authorize({ok:true,generation:1});
+  const replies = await Promise.all([f.begin(),f.begin(),f.begin()]);
+  const created = replies.find(reply => reply.statusCode === 201);
+  assert.ok(created);
+  assert.equal(f.starts(),1);
+  assert.equal((await f.begin()).body.attachment_id,created.body.attachment_id);
+  f.advance(DAY);
+  assert.equal((await f.begin()).statusCode,410);
+  assert.equal(f.starts(),1);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM session_image_publication_generations').get().n,1);
+});
+
+test('a new owner login cannot use a legacy boolean grant to allocate generation zero after renewal',async t => {
+  const f = fixture(t);f.authorize({ok:true,generation:1});
+  const created = await f.begin();assert.equal(created.statusCode,201);
+  const nextOwner = {...f.owner,id:'login_new'};
+  f.authorize(true);
+  assert.equal((await f.begin({...image,owner_login_session_id:'login_new'},nextOwner)).statusCode,409);
+  assert.equal(f.starts(),1);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM session_image_publications').get().n,0);
+});
+
+test('caller generation and server-owned upload fields cannot select a new image publication',async t => {
+  const f = fixture(t);f.authorize({ok:true,generation:1});
+  for (const field of ['generation','publication_generation','attachment_id','object_key','expires_at','retention'])
+    assert.equal((await f.begin({...image,[field]:1})).statusCode,400);
+  assert.equal(f.starts(),0);
+  for (const generation of [-1,1.25,'1',true,null,Number.MAX_SAFE_INTEGER+1]) {
+    f.authorize({ok:true,generation});
+    assert.equal((await f.begin()).statusCode,404);
+  }
+  assert.equal(f.starts(),0);
+});
+
+test('an old multipart upload cannot sign list or complete while another generation owns the pending part',async t => {
+  const f = fixture(t);
+  const original = await f.begin();
+  f.authorize({ok:true,generation:1});
+  assert.equal((await f.signPart(original.body.attachment_id)).statusCode,409);
+  assert.equal((await f.parts(original.body.attachment_id)).statusCode,409);
+  assert.equal((await f.complete(original.body.attachment_id)).statusCode,409);
+  assert.equal(f.objects.size,0);
+  assert.equal(f.db.prepare('SELECT status FROM session_attachments WHERE id=?')
+    .get(original.body.attachment_id).status,'uploading');
+});
+
+test('renewed image receipts participate in room scope and proven object cleanup',async t => {
+  const f = fixture(t);f.authorize({ok:true,generation:1});
+  const created = await f.begin();assert.equal(created.statusCode,201);
+  await f.complete(created.body.attachment_id);
+  f.authorize(false);
+  assert.equal((await f.service.handle('POST',`${ROOT}/cleanup-room`,binding,f.owner)).statusCode,409);
+  f.authorize(true);f.failDelete(true);
+  assert.equal((await f.service.handle('POST',`${ROOT}/cleanup-room`,binding,f.owner)).statusCode,202);
+  await f.service.sweep();
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM session_image_publication_generations').get().n,1);
+  f.failDelete(false);await f.service.sweep();
+  assert.equal(f.objects.size,0);
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM session_image_publication_generations').get().n,0);
+});
+
 test('temporary creation requires actual owner authorization and never accepts media paths or caller expiry', async t => {
   const f = fixture(t);
   f.authorize(false);
@@ -121,7 +211,7 @@ test('ready image readers require exact room and part while owner presence is ir
   assert.equal(f.reads.length,1);
   assert.equal(f.authorizations[0].request.operation,'create');
   assert.equal(f.authorizations[0].headers.authorization,'Bearer fixture-account-token');
-  assert.equal(f.authorizations[1].request.operation,'read');
+  assert.equal(f.authorizations.find(entry => entry.request.operation === 'read').request.operation,'read');
 });
 
 test('expiry denies reads before sweep and deletion is proved before metadata removal without resurrection', async t => {

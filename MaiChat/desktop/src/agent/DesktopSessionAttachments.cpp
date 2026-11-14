@@ -16,6 +16,7 @@
 #include <QMutex>
 #include <QMutexLocker>
 #include <QUuid>
+#include <cmath>
 
 static QByteArray trustedRoots(const DesktopVideoCircleAccess& access) {
     if (!access.caPem.isEmpty()) return access.caPem;
@@ -79,6 +80,16 @@ QString directory(const QString& name, const QString& account, bool cache = fals
 
 QMutex journalMutex;
 
+qint64 publicationGeneration(const QJsonObject& image) {
+    if (!image.contains(QStringLiteral("generation"))) return 0;
+    const auto value = image.value(QStringLiteral("generation"));
+    const double number = value.toDouble(-1);
+    if (!value.isDouble() || !std::isfinite(number) || number < 0 || number > 9007199254740991.0 ||
+        number != double(qint64(number)))
+        return -1;
+    return qint64(number);
+}
+
 QString imageKey(const DesktopSessionRoom& room, const QString& message, const QString& part) {
     // The original login is stored in the immutable journal binding. This
     // lookup survives owner relogin so later text cannot erase a ready receipt.
@@ -140,9 +151,89 @@ QJsonObject DesktopSessionAttachments::imagePublication(const QString& account, 
         ? journal.value(QStringLiteral("remoteImage")).toObject() : QJsonObject{};
 }
 
+DesktopSessionAttachmentResult DesktopSessionAttachments::prepareTemporaryImage(
+    const QString& account, const DesktopSessionRoom& room, const QString& messageId, const QString& partId,
+    const QString& requestId, bool settledAcknowledged, qint64 expectedGeneration) {
+    DesktopSessionAttachmentResult result;
+    const auto fail = [&](const QString& code, const QString& error) {
+        result.errorCode = code;
+        result.error = error;
+        return result;
+    };
+    if (account.isEmpty() || room.slot.isEmpty() || room.login.isEmpty() || room.session.isEmpty() ||
+        messageId.isEmpty() || partId.isEmpty() || requestId.isEmpty())
+        return fail(QStringLiteral("image_scope_changed"), QStringLiteral("图片所属设备会话不可用"));
+    QMutexLocker lock(&journalMutex);
+    const auto path = journalPath(account, room, messageId, partId);
+    QJsonObject journal = readJournal(path);
+    const bool exists = QFileInfo::exists(path);
+    if (exists && !matchesBinding(journal, room, messageId, partId))
+        return fail(QStringLiteral("image_scope_changed"), QStringLiteral("图片发布身份不匹配"));
+    result.metadata = journal.value(QStringLiteral("remoteImage")).toObject();
+    result.generation = publicationGeneration(result.metadata);
+    if (result.generation < 0) return fail(QStringLiteral("image_publish_failed"), QStringLiteral("图片发布代次无效"));
+    if (expectedGeneration >= 0 && result.generation != expectedGeneration)
+        return fail(QStringLiteral("image_scope_changed"), QStringLiteral("图片发布代次已变化"));
+    const QString state = result.metadata.value(QStringLiteral("state")).toString();
+    if (exists && state == QStringLiteral("ready") &&
+        result.metadata.value(QStringLiteral("expires_at")).toDouble() > QDateTime::currentMSecsSinceEpoch())
+        return result;  // Preserve the original publication login while it remains healthy.
+    if (exists && state == QStringLiteral("pending")) {
+        if (journal.value(QStringLiteral("owner_login_session_id")).toString() != room.login) {
+            // Explicit current-owner recovery must first settle the abandoned
+            // pending generation under its original identity. A later publish
+            // ACK, not this local write, authorizes the +1 pending phase.
+            result.metadata.insert(QStringLiteral("state"), QStringLiteral("failed"));
+            result.metadata.insert(QStringLiteral("error_code"), QStringLiteral("owner_replaced"));
+            journal.insert(QStringLiteral("remoteImage"), result.metadata);
+            journal.insert(QStringLiteral("prepare_retry_id"), requestId);
+            if (!writeJournal(path, journal))
+                return fail(QStringLiteral("image_publish_failed"), QStringLiteral("无法保存图片恢复状态"));
+            result.requiresSettledAck = true;
+            return result;
+        }
+        if (!journal.contains(QStringLiteral("prepare_request_id"))) {
+            journal.insert(QStringLiteral("prepare_request_id"), requestId);
+            if (!writeJournal(path, journal))
+                return fail(QStringLiteral("image_publish_failed"), QStringLiteral("无法登记图片发布"));
+        }
+        return result;
+    }
+    if (exists && journal.contains(QStringLiteral("prepare_retry_id")) && !settledAcknowledged) {
+        result.requiresSettledAck = true;
+        return result;
+    }
+    if (exists && !journal.contains(QStringLiteral("prepare_retry_id")) &&
+        journal.value(QStringLiteral("prepare_request_id")).toString() == requestId)
+        return fail(QStringLiteral("image_upload_failed"), QStringLiteral("本次图片发布已结束，请重新点击重试"));
+    if (exists && state != QStringLiteral("failed") && state != QStringLiteral("expired") &&
+        state != QStringLiteral("ready"))
+        return fail(QStringLiteral("image_publish_failed"), QStringLiteral("图片发布状态无效"));
+    if (exists && result.generation >= Q_INT64_C(9007199254740991))
+        return fail(QStringLiteral("image_publish_failed"), QStringLiteral("图片发布代次已达到上限"));
+    if (exists) ++result.generation;
+    result.metadata = {{QStringLiteral("state"), QStringLiteral("pending")},
+                       {QStringLiteral("retention"), QStringLiteral("temporary")}};
+    if (result.generation > 0) {
+        result.metadata.insert(QStringLiteral("generation"), result.generation);
+        result.metadata.insert(QStringLiteral("owner_login_session_id"), room.login);
+    }
+    journal = {{QStringLiteral("owner_slot"), room.slot},
+               {QStringLiteral("owner_login_session_id"), room.login},
+               {QStringLiteral("session_id"), room.session},
+               {QStringLiteral("message_id"), messageId},
+               {QStringLiteral("part_id"), partId},
+               {QStringLiteral("prepare_request_id"), requestId},
+               {QStringLiteral("remoteImage"), result.metadata}};
+    if (!writeJournal(path, journal))
+        return fail(QStringLiteral("image_publish_failed"), QStringLiteral("无法登记图片发布"));
+    return result;
+}
+
 DesktopSessionAttachmentResult DesktopSessionAttachments::uploadTemporaryImage(
-    const DesktopVideoCircleAccess& access, const DesktopSessionRoom& room,
-    const QString& messageId, const QString& partId, const QString& source) {
+    const DesktopVideoCircleAccess& access, const DesktopSessionRoom& room, const QString& messageId,
+    const QString& partId, const QString& source, qint64 expectedGeneration, const MaiCloudDriveCancel* cancel,
+    std::function<bool()> canCommit) {
     const auto path = journalPath(access.accountId, room, messageId, partId);
     QJsonObject journal;
     {
@@ -152,9 +243,16 @@ DesktopSessionAttachmentResult DesktopSessionAttachments::uploadTemporaryImage(
     if (!matchesBinding(journal, room, messageId, partId))
         return {{}, {}, QStringLiteral("图片尚未发布")};
     const auto previous = journal.value(QStringLiteral("remoteImage")).toObject();
+    const qint64 generation = publicationGeneration(previous);
+    if (generation < 0 || (expectedGeneration >= 0 && generation != expectedGeneration) || (canCommit && !canCommit()))
+        return {{}, {}, QStringLiteral("图片发布身份已变化"), generation, QStringLiteral("image_scope_changed")};
     if (previous.value(QStringLiteral("state")).toString() != QStringLiteral("pending"))
-        return {previous, {}, previous.value(QStringLiteral("state")).toString() == QStringLiteral("ready")
-            ? QString() : QStringLiteral("图片发布已结束")};
+        return {previous,
+                {},
+                previous.value(QStringLiteral("state")).toString() == QStringLiteral("ready")
+                    ? QString()
+                    : QStringLiteral("图片发布已结束"),
+                generation};
     DesktopSessionAttachmentResult reply;
     const QFileInfo file(source);
     MaiCloudDriveMediaInfo media{};
@@ -166,14 +264,17 @@ DesktopSessionAttachmentResult DesktopSessionAttachments::uploadTemporaryImage(
     } else {
         Call call(access, room);
         call.temporary(messageId, partId);
-        const auto checkpoint = (path + QStringLiteral(".maicloud.json")).toUtf8();
+        const auto checkpoint = (path + (generation == 0 ? QString() : QStringLiteral(".g%1").arg(generation)) +
+                                 QStringLiteral(".maicloud.json"))
+                                    .toUtf8();
         const auto sourcePath = file.absoluteFilePath().toUtf8();
         MaiCloudDriveResult raw{};
         mai_cloud_drive_upload_resumable(&call.options, sourcePath.constData(), checkpoint.constData(),
-            name.constData(), media.content_type_utf8, nullptr, nullptr, nullptr, &raw);
+                                         name.constData(), media.content_type_utf8, cancel, nullptr, nullptr, &raw);
         reply = parse(&raw);
     }
     QJsonObject image{{QStringLiteral("retention"), QStringLiteral("temporary")}};
+    if (generation > 0) image.insert(QStringLiteral("generation"), generation);
     if (reply.ok()) {
         // Only the fixed receipt enters WS metadata. Paths, signed URLs, OSS
         // keys and multipart state remain confined to the local transfer core.
@@ -186,16 +287,30 @@ DesktopSessionAttachmentResult DesktopSessionAttachments::uploadTemporaryImage(
         image.insert(QStringLiteral("error_code"), QStringLiteral("upload_failed"));
         // A failed attempt also retains a server-assigned expiry when its init
         // receipt reached the durable checkpoint before the transport failed.
-        const auto checkpoint = readJournal(path + QStringLiteral(".maicloud.json"));
+        const auto checkpoint =
+            readJournal(path + (generation == 0 ? QString() : QStringLiteral(".g%1").arg(generation)) +
+                        QStringLiteral(".maicloud.json"));
         if (checkpoint.value(QStringLiteral("expires_at")).toDouble() > 0)
             image.insert(QStringLiteral("expires_at"), checkpoint.value(QStringLiteral("expires_at")));
     }
-    journal.insert(QStringLiteral("remoteImage"), image);
     {
         QMutexLocker lock(&journalMutex);
-        if (!writeJournal(path, journal)) reply.error = QStringLiteral("无法保存图片发布回执");
+        auto current = readJournal(path);
+        if (!matchesBinding(current, room, messageId, partId) ||
+            current.value(QStringLiteral("owner_login_session_id")).toString() != room.login ||
+            publicationGeneration(current.value(QStringLiteral("remoteImage")).toObject()) != generation ||
+            current.value(QStringLiteral("remoteImage")).toObject().value(QStringLiteral("state")).toString() !=
+                QStringLiteral("pending") ||
+            (canCommit && !canCommit()))
+            return {{}, {}, QStringLiteral("图片发布身份已变化"), generation, QStringLiteral("image_scope_changed")};
+        // A pending observer can attach request bookkeeping while I/O is in
+        // flight. Commit only this receipt into the current CAS-checked journal.
+        current.insert(QStringLiteral("remoteImage"), image);
+        if (!writeJournal(path, current)) reply.error = QStringLiteral("无法保存图片发布回执");
     }
     reply.metadata = image;
+    reply.generation = generation;
+    if (!reply.ok()) reply.errorCode = QStringLiteral("image_upload_failed");
     return reply;
 }
 

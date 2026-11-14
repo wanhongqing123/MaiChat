@@ -68,11 +68,19 @@ function sessionAttachmentAuthorizerFromEnv(env,fetcher = fetch) {
     if (typeof bearer !== 'string' || !bearer.startsWith('Bearer ')) return false;
     const response = await fetcher(`http://127.0.0.1:${port}/v1/session-sync/authorize-attachment`,{
       method:'POST',redirect:'error',signal:AbortSignal.timeout(5000),
-      headers:{'Content-Type':'application/json',Authorization:bearer},body:JSON.stringify(binding)
+      headers:{'Content-Type':'application/json',Authorization:bearer,
+        'X-MaiChat-Image-Generation':'1'},body:JSON.stringify(binding)
     });
     if ([400,401,403,404,409,410].includes(response.status)) return false;
     if (response.status !== 200) throw new Error('Session ownership verification unavailable');
-    return (await response.json()).ok === true;
+    const grant = await response.json();
+    if (grant?.ok !== true) return false;
+    if (binding.operation !== 'create') return true;
+    // A fixed-capability HTTP grant must prove its generation, including zero.
+    // An old Sync process can see persisted next-generation pending data; treating
+    // its untyped ok:true as zero would allocate the wrong lifetime after rollback.
+    const generation = grant.generation;
+    return Number.isSafeInteger(generation) && generation >= 0 ? {ok:true,generation} : false;
   };
 }
 

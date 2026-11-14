@@ -7,8 +7,10 @@
 #include <QString>
 
 #include <memory>
+#include <functional>
 
 class AgentController;
+struct DesktopSessionAttachmentResult;
 
 class DesktopSessionSyncHost final {
 public:
@@ -20,6 +22,14 @@ public:
     // History serialization reads journal receipts and never creates uploads.
     void enrollLiveImages(const QString& sessionId, const QString& messageId, const QString& partId = {});
     QString imageSource(const QString& sessionId, const QString& messageId, const QString& partId) const;
+    // Ordinary, single-part preparation. IDs identify an actual stored image;
+    // local source, account and room are always resolved by this owner Host.
+    DesktopSessionAttachmentResult prepareImage(const QString& sessionId, const QString& messageId,
+                                                const QString& partId, const QString& requestId,
+                                                bool settledAcknowledged = false, qint64 expectedGeneration = -1);
+    // Pure shared-state lease for workers; no QObject/Core/database access.
+    std::function<bool()> imagePreparationGuard(const QString& sessionId, const QString& messageId,
+                                                const QString& partId) const;
 
     QJsonArray rootSessions() const;
     QJsonObject historyPage(const QString& sessionId, const QString& beforeId, int limit) const;

@@ -22,6 +22,11 @@
 #include "MaiQuestionTranscript.h"
 #include "MaiCloudModelCatalog.h"
 #include "MaiToolDetail.h"
+#include "MaiFilePath.h"
+#include "MaiFileSystem.h"
+#include "MaiPathGuard.h"
+#include "MaiCloudDriveClient.h"
+#include "MaiAgentSendMediaTool.h"
 #include "agent/AgentController.h"
 #include "agent/DesktopSessionAttachments.h"
 
@@ -140,6 +145,10 @@ struct DesktopSessionSyncHost::Runtime {
     std::mutex cacheMutex;
     std::uint64_t cachedRevision = 0;
     std::unordered_map<std::string, std::vector<MaiQuestionTranscriptMessage>> childQuestionCache;
+    std::atomic<bool> imageAlive{true};
+    std::atomic<std::uint64_t> imageScopeRevision{1};
+    std::mutex imageMutex;
+    std::unordered_map<std::string, std::uint64_t> imageRevisions;
 };
 
 DesktopSessionSyncHost::DesktopSessionSyncHost(AgentController& controller)
@@ -151,10 +160,24 @@ DesktopSessionSyncHost::DesktopSessionSyncHost(AgentController& controller)
         // 仅增加 revision，实际查询留在 historyPage 的宿主线程中完成。
         if (event.type != MaiEventType::MessagePartDelta && event.type != MaiEventType::SessionStatus)
             state->questionRevision.fetch_add(1, std::memory_order_relaxed);
+        std::string key;
+        if ((event.type == MaiEventType::SessionUpdated && (event.field == "workspace" || event.field == "clear")) ||
+            event.type == MaiEventType::SessionDeleted || event.type == MaiEventType::ContextImported)
+            key = event.sessionId;
+        else if (event.type == MaiEventType::MessageRemoved)
+            key = event.sessionId + '\0' + event.messageId;
+        else if (event.type == MaiEventType::MessagePartUpdated || event.type == MaiEventType::MessagePartRemoved)
+            key = event.sessionId + '\0' + event.messageId + '\0' + event.partId;
+        if (!key.empty()) {
+            std::lock_guard<std::mutex> lock(state->imageMutex);
+            const auto watched = state->imageRevisions.find(key);
+            if (watched != state->imageRevisions.end()) ++watched->second;
+        }
     });
 }
 
 DesktopSessionSyncHost::~DesktopSessionSyncHost() {
+    runtime_->imageAlive = false;
     if (runtime_->subscribedController)
         runtime_->subscribedController->agent().eventBus().unsubscribe(runtime_->eventToken);
 }
@@ -165,6 +188,7 @@ void DesktopSessionSyncHost::setDefaultWorkspaceDirectory(const QString& directo
 
 void DesktopSessionSyncHost::setImagePublicationScope(const QString& account, const QString& slot,
                                                      const QString& login) {
+    if (imageAccount_ != account || imageSlot_ != slot || imageLogin_ != login) ++runtime_->imageScopeRevision;
     imageAccount_ = account; imageSlot_ = slot; imageLogin_ = login;
     if (account.isEmpty() || slot.isEmpty() || login.isEmpty()) return;
     const auto pending = runtime_->pendingLiveImages;
@@ -197,12 +221,103 @@ void DesktopSessionSyncHost::enrollLiveImages(const QString& sessionId, const QS
 
 QString DesktopSessionSyncHost::imageSource(const QString& sessionId, const QString& messageId,
                                            const QString& partId) const {
+    MaiSession session;
     MaiMessage message;
-    if (!controller_.agent().getMessage(sessionId.toStdString(), messageId.toStdString(), message)) return {};
+    if (!controller_.agent().getSession(sessionId.toUtf8().toStdString(), session) || !session.isRoot() ||
+        session.directory.empty() ||
+        !controller_.agent().getMessage(session.id, messageId.toUtf8().toStdString(), message) ||
+        (message.role != MaiRole::User && message.role != MaiRole::Assistant))
+        return {};
     for (const auto& part : message.parts)
         if (text(part.id) == partId)
-            if (const auto* image = std::get_if<MaiImagePart>(&part.body)) return text(image->path);
+            if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
+                const auto original = MaiFilePath::fromUtf8(image->path);
+                // The stored Core image part is the authority, including owned
+                // ComposerMedia and absolute images from an earlier workspace.
+                // Only relative parts use the current workspace boundary.
+                const auto resolved =
+                    original.isAbsolute()
+                        ? MaiFileSystem::resolve(original)
+                        : MaiFilePath::fromUtf8(maiResolvePathWithinRoot(session.directory, image->path));
+                const auto path = resolved.toUtf8();
+                MaiRegularFileInfo info;
+                if (path.empty() || !MaiFileSystem::regularFileInfo(MaiFilePath::fromUtf8(path), info)) return {};
+                MaiCloudDriveMediaInfo media{};
+                const auto name = MaiFilePath::fromUtf8(path).baseName().toUtf8();
+                if (!mai_session_attachment_media_info(name.c_str(), &media) ||
+                    QByteArray(media.media_type_utf8) != "image" || !info.bytes || info.bytes > media.max_size_bytes)
+                    return {};
+                MaiToolContext context;
+                context.root = resolved.dirName().toUtf8();
+                if (!maiPrepareAgentMedia(name, "image", context)) return {};
+                QFile readable(text(path));
+                if (!readable.open(QIODevice::ReadOnly)) return {};
+                return text(path);
+            }
     return {};
+}
+
+std::function<bool()> DesktopSessionSyncHost::imagePreparationGuard(const QString& sessionId, const QString& messageId,
+                                                                    const QString& partId) const {
+    const auto state = runtime_;
+    const auto session = sessionId.toUtf8().toStdString(), message = messageId.toUtf8().toStdString(),
+               part = partId.toUtf8().toStdString();
+    const std::vector<std::string> keys{session, session + '\0' + message, session + '\0' + message + '\0' + part};
+    const auto scope = state->imageScopeRevision.load();
+    std::vector<std::uint64_t> revisions;
+    {
+        std::lock_guard<std::mutex> lock(state->imageMutex);
+        for (const auto& key : keys) revisions.push_back(state->imageRevisions[key]);
+    }
+    return [state, keys, revisions, scope] {
+        if (!state->imageAlive.load() || state->imageScopeRevision.load() != scope) return false;
+        std::lock_guard<std::mutex> lock(state->imageMutex);
+        for (std::size_t i = 0; i < keys.size(); ++i)
+            if (state->imageRevisions[keys[i]] != revisions[i]) return false;
+        return true;
+    };
+}
+
+DesktopSessionAttachmentResult DesktopSessionSyncHost::prepareImage(const QString& sessionId, const QString& messageId,
+                                                                    const QString& partId, const QString& requestId,
+                                                                    bool settledAcknowledged,
+                                                                    qint64 expectedGeneration) {
+    DesktopSessionAttachmentResult result;
+    static const QRegularExpression valid(QStringLiteral("^[A-Za-z0-9_-]{1,128}$"));
+    if (requestId.size() > 96 || !valid.match(requestId).hasMatch() || !valid.match(messageId).hasMatch() ||
+        !valid.match(partId).hasMatch()) {
+        result.errorCode = QStringLiteral("invalid_input");
+        result.error = QStringLiteral("图片请求身份无效");
+        return result;
+    }
+    result.canCommit = imagePreparationGuard(sessionId, messageId, partId);
+    if (imageAccount_.isEmpty() || imageLogin_.isEmpty()) {
+        result.errorCode = QStringLiteral("image_scope_changed");
+        result.error = QStringLiteral("所属设备会话尚未就绪");
+        return result;
+    }
+    const auto source = imageSource(sessionId, messageId, partId);
+    if (source.isEmpty()) {
+        result.errorCode = QStringLiteral("image_source_unavailable");
+        result.error = QStringLiteral("原图片文件不存在或当前会话无法读取");
+        return result;
+    }
+    if (!result.canCommit()) {
+        result.errorCode = QStringLiteral("image_scope_changed");
+        result.error = QStringLiteral("图片所属会话已变化");
+        return result;
+    }
+    const auto guard = result.canCommit;
+    result =
+        DesktopSessionAttachments::prepareTemporaryImage(imageAccount_, {imageSlot_, imageLogin_, sessionId}, messageId,
+                                                         partId, requestId, settledAcknowledged, expectedGeneration);
+    result.path = source;
+    result.canCommit = guard;
+    if (!guard()) {
+        result.errorCode = QStringLiteral("image_scope_changed");
+        result.error = QStringLiteral("图片所属会话已变化");
+    }
+    return result;
 }
 
 QJsonObject DesktopSessionSyncHost::decorateImages(QJsonObject message, const QString& sessionId) const {

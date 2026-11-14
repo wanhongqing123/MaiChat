@@ -98,6 +98,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     // 图片请求按账号、会话读取代次和元数据去重；失败只由显式重试重新发起。
     private final Set<String> requestedRemoteImages = new HashSet<>();
     private final Map<String, String> remoteImageErrors = new HashMap<>();
+    // 重新发布按逻辑图片去重，回执更新不能让同一在途请求重新开放点击。
+    private final Set<String> remoteImagePublications = new HashSet<>(), remoteImageDecodeFailures = new HashSet<>();
+    private final Map<String, String> remoteImagePublicationErrors = new HashMap<>();
     // 只供只读的卡片/阶段元数据使用；折叠工具的原始输入输出不会在 bind 时反复解 JSON。
     private static final AIAssistantToolJsonCache toolJson =
         new AIAssistantToolJsonCache(256 * 1024, JSONObject::new);
@@ -628,6 +631,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             invalidateVoiceTranscription();
             requestedRemoteImages.clear();
             remoteImageErrors.clear();
+            remoteImagePublications.clear(); remoteImagePublicationErrors.clear(); remoteImageDecodeFailures.clear();
             String previous = selected;
             drafts.put(previous, composer.getText().toString());
             boolean firstSend = previous.isEmpty() && !next.selected.isEmpty()
@@ -675,6 +679,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         updateAttachments();
         updateQuote();
         updateMessages();
+        refreshVisibleRemoteImages();
         updatePending();
         refreshSessionDrawer();
         updateActionMenu();
@@ -2808,7 +2813,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 JSONObject part = array.optJSONObject(i);
                 if (part == null || part.optString("kind").equals("reasoning")) continue;
                 structure.append(part.optString("id")).append(part.optString("kind"))
-                    .append(part.has("remoteImage"))
+                    .append(isRemoteImagePart(part))
                     .append(expanded.contains(part.optString("id")))
                     .append(mediaFromToolOutput(part) != null).append(fileFromToolOutput(part) != null);
             }
@@ -2849,7 +2854,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     bubble.addView(body, matchWrap());
                     for (int i = 0; i < array.length(); i++) {
                         JSONObject part = array.optJSONObject(i);
-                        if (part != null && part.optString("kind").equals("image") && part.has("remoteImage")) {
+                        if (isRemoteImagePart(part)) {
                             RemoteImageCard card = new RemoteImageCard();
                             bubble.addView(card, matchWrap());
                             remoteImageCards.put(part.optString("id"), card);
@@ -2926,7 +2931,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                         JSONObject part = array.optJSONObject(i);
                         if (part == null) continue;
                         String id = part.optString("id"), kind = part.optString("kind");
-                        if (kind.equals("image") && part.has("remoteImage")) {
+                        if (isRemoteImagePart(part)) {
                             RemoteImageCard card = new RemoteImageCard();
                             remoteImageCards.put(id, card);
                             addView(card, matchWrap());
@@ -3163,7 +3168,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 }
                 TextView userText = parts.get("user");
                 String visible = mediaDisplayText(body.toString(),
-                    !imageParts.isEmpty() || !videoParts.isEmpty());
+                    !imageParts.isEmpty() || !videoParts.isEmpty() || !remoteImageCards.isEmpty());
                 userText.setText(visible);
                 userText.setVisibility(visible.isEmpty() ? GONE : VISIBLE);
             } else
@@ -3576,6 +3581,18 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             result.add(new MainActivity.GalleryItem(file.getAbsolutePath(), video));
     }
 
+    private boolean isRemoteImagePart(JSONObject part) {
+        return part != null && part.optString("kind").equals("image")
+            && (part.has("remoteImage") || state != null && state.remoteSession != null
+                && part.optString("attachment_id").isEmpty());
+    }
+    private void refreshVisibleRemoteImages() {
+        // 在线状态和重新发布进度不一定改变消息指纹；仅刷新现有图片卡，不改列表位置或草稿。
+        for (int i = 0; i < list.getChildCount(); i++) {
+            View row = list.getChildAt(i);
+            if (row instanceof MessageRow) ((MessageRow) row).bindRemoteImages();
+        }
+    }
     private final class RemoteImageCard extends LinearLayout {
         String signature = "", rendered = "";
         RemoteImageCard() { super(activity); setOrientation(VERTICAL); setContentDescription("会话图片"); }
@@ -3586,33 +3603,38 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             .put(messageOwner(owner)).put(owner.remoteSession == null ? "" : owner.remoteSession.optString("device_id"))
             .put(owner.data.optInt("remoteSelectionGeneration")).toString();
     }
+    private String remoteImagePublicationKey(String scope, String messageID, JSONObject part) {
+        return new JSONArray().put(scope).put(messageID).put(part.optString("id")).toString();
+    }
     private void bindRemoteImage(RemoteImageCard card, AIAssistantController.State owner,
                                  String messageID, JSONObject part) {
         String scope = remoteImageScope(owner);
         String signature = new JSONArray().put(scope).put(messageID).put(part.optString("id"))
             .put(part.optJSONObject("remoteImage")).toString();
+        String publicationKey = remoteImagePublicationKey(scope, messageID, part);
         card.signature = signature;
         String cached = controller.cachedRemoteImagePath(owner, messageID, part);
-        String failure = remoteImageErrors.get(signature);
-        if (failure != null) {
-            JSONObject metadata = part.optJSONObject("remoteImage");
-            boolean expired = metadata != null && metadata.optString("state").equals("expired");
-            showRemoteImageState(card, signature, failure,
-                expired ? null : () -> startRemoteImage(card, owner, messageID, part, scope, signature));
+        if (cached != null && !cached.isEmpty() && !remoteImageDecodeFailures.contains(signature)) {
+            showRemoteImageFile(card, owner, messageID, part, scope, signature, new File(cached));
             return;
         }
-        if (cached != null && !cached.isEmpty()) {
-            showRemoteImageFile(card, owner, messageID, part, scope, signature, new File(cached));
+        String failure = remoteImagePublicationErrors.get(publicationKey);
+        if (failure == null) failure = remoteImageErrors.get(signature);
+        if (remoteImagePublications.contains(publicationKey) || failure != null) {
+            showRemoteImagePublicationState(card, owner, messageID, part, scope, signature,
+                failure == null ? "正在从所属设备重新加载…" : failure);
             return;
         }
         JSONObject metadata = part.optJSONObject("remoteImage");
         String status = metadata == null ? "" : metadata.optString("state");
         boolean expired = status.equals("expired");
         String label = status.equals("pending") ? "图片同步中…" : expired ? "图片已过期，未保留本地副本"
-            : status.equals("failed") ? "图片同步失败，请在所属设备重试" : status.equals("ready") ? "正在加载图片…" : "图片暂不可用";
-        showRemoteImageState(card, signature, label, null);
-        // 到期元数据仍先查控制器的完整磁盘副本；pending/failed不会反复触发下载。
-        if ((status.equals("ready") || expired) && requestedRemoteImages.add(signature))
+            : status.equals("failed") ? "图片同步失败" : status.equals("ready") ? "正在加载图片…" : "图片尚未同步到这台设备";
+        if (status.equals("ready")) showRemoteImageState(card, signature, label, null);
+        else showRemoteImagePublicationState(card, owner, messageID, part, scope, signature, label);
+        // 自动读取只查已有回执；非ready状态仅探测完整本地缓存，不下载/续期。
+        if ((status.equals("ready") || expired || status.equals("pending") || status.equals("failed"))
+                && requestedRemoteImages.add(signature))
             startRemoteImage(card, owner, messageID, part, scope, signature);
     }
     private void startRemoteImage(RemoteImageCard card, AIAssistantController.State owner,
@@ -3622,7 +3644,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         requestedRemoteImages.add(signature);
         boolean expired = part.optJSONObject("remoteImage") != null
             && part.optJSONObject("remoteImage").optString("state").equals("expired");
-        showRemoteImageState(card, signature, expired ? "图片已过期，未保留本地副本" : "正在加载图片…", null);
+        if (part.optJSONObject("remoteImage") != null
+                && part.optJSONObject("remoteImage").optString("state").equals("ready"))
+            showRemoteImageState(card, signature, "正在加载图片…", null);
         controller.loadRemoteImage(owner, messageID, part, (file, error) -> {
             if (!scope.equals(remoteImageScope(state))) return;
             String failure = expired ? "图片已过期，未保留本地副本"
@@ -3630,25 +3654,62 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             if (file == null) remoteImageErrors.put(signature, failure);
             if (signature.equals(card.signature)) {
                 if (file != null) showRemoteImageFile(card, owner, messageID, part, scope, signature, file);
-                else showRemoteImageState(card, signature, failure, expired ? null
-                    : () -> startRemoteImage(card, owner, messageID, part, scope, signature));
+                else showRemoteImagePublicationState(card, owner, messageID, part, scope, signature, failure);
             }
-            // 同一图片可能因ListView复用换过容器；只更新匹配卡片，不重绑整条消息或列表。
-            for (int i = 0; i < list.getChildCount(); i++) {
-                View row = list.getChildAt(i);
-                if (row instanceof MessageRow) ((MessageRow) row).bindRemoteImages();
+            refreshVisibleRemoteImages();
+        });
+    }
+    private void showRemoteImagePublicationState(RemoteImageCard card, AIAssistantController.State owner,
+            String messageID, JSONObject part, String scope, String signature, String label) {
+        boolean online = owner.remoteSession != null && owner.remoteSession.optBoolean("online");
+        boolean pending = remoteImagePublications.contains(remoteImagePublicationKey(scope, messageID, part));
+        showRemoteImageState(card, signature, pending ? "正在从所属设备重新加载…" : label,
+            () -> requestRemoteImagePublication(card, owner, messageID, part, scope, signature),
+            online && !pending, online ? "" : "所属设备离线，联网后可重新加载");
+    }
+    private void requestRemoteImagePublication(RemoteImageCard card, AIAssistantController.State owner,
+            String messageID, JSONObject part, String scope, String signature) {
+        if (!scope.equals(remoteImageScope(state)) || !signature.equals(card.signature)
+                || state.remoteSession == null || !state.remoteSession.optBoolean("online")) return;
+        String key = remoteImagePublicationKey(scope, messageID, part);
+        if (!remoteImagePublications.add(key)) return;
+        remoteImageErrors.remove(signature); remoteImageDecodeFailures.remove(signature);
+        remoteImagePublicationErrors.remove(key);
+        showRemoteImagePublicationState(card, owner, messageID, part, scope, signature, "正在从所属设备重新加载…");
+        refreshVisibleRemoteImages();
+        // 只交原消息/片段身份；不从文件名、路径或URL推断请求，也不启动模型或扫描历史。
+        controller.requestRemoteImagePublication(owner, messageID, part, (file, error) -> {
+            remoteImagePublications.remove(key);
+            if (!scope.equals(remoteImageScope(state))) return;
+            String failure = error == null || error.isEmpty() ? "从所属设备重新加载失败，请重试" : error;
+            if (file == null) remoteImagePublicationErrors.put(key, failure);
+            if (signature.equals(card.signature)) {
+                if (file != null) showRemoteImageFile(card, owner, messageID, part, scope, signature, file);
+                else showRemoteImagePublicationState(card, owner, messageID, part, scope, signature, failure);
             }
+            // 新回执可能已经发布并更换了签名；错误和在途状态按逻辑图片关联，缩略图沿当前回执绑定。
+            refreshVisibleRemoteImages();
         });
     }
     private void showRemoteImageState(RemoteImageCard card, String signature, String label, Runnable retry) {
-        String rendered = signature + label + (retry != null);
+        showRemoteImageState(card, signature, label, retry, true, "");
+    }
+    private void showRemoteImageState(RemoteImageCard card, String signature, String label, Runnable retry,
+                                      boolean requestEnabled, String disabledReason) {
+        String rendered = signature + label + (retry != null) + requestEnabled + disabledReason;
         if (rendered.equals(card.rendered)) return;
         card.rendered = rendered;
         card.removeAllViews();
         TextView status = text(label, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
         status.setPadding(0, dp(12), 0, dp(12));
         card.addView(status, matchWrap());
-        if (retry != null) card.addView(button("重试加载图片", "重试加载图片", v -> retry.run()), matchWrap());
+        if (!disabledReason.isEmpty()) card.addView(text(disabledReason,
+            MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY), matchWrap());
+        if (retry != null) {
+            Button action = button("从所属设备重新加载", "从所属设备重新加载", v -> retry.run());
+            action.setEnabled(requestEnabled);
+            card.addView(action, matchWrap());
+        }
     }
     private void showRemoteImageFile(RemoteImageCard card, AIAssistantController.State owner,
                                      String messageID, JSONObject part, String scope, String signature, File file) {
@@ -3658,9 +3719,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         showAgentMediaCard(card, file, "image", "", null, () -> {
             if (!scope.equals(remoteImageScope(state)) || !signature.equals(card.signature)) return;
             String failure = "图片无法显示，请重试";
+            remoteImageDecodeFailures.add(signature);
             remoteImageErrors.put(signature, failure);
-            showRemoteImageState(card, signature, failure,
-                () -> startRemoteImage(card, owner, messageID, part, scope, signature));
+            showRemoteImagePublicationState(card, owner, messageID, part, scope, signature, failure);
         });
     }
 

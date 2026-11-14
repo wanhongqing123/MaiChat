@@ -18,20 +18,22 @@ final class AIAssistantRemoteImages {
     /** The original publication login can differ from today's catalog login after the owner signs in again. */
     static final class Request {
         final String account, slot, login, session, message, part, attachment, name, contentType;
-        final long size, expiry;
+        final long size, expiry, generation;
         final String accountKey, cacheKey, signature;
 
         private Request(String account, String slot, String login, String session, String message, String part,
-                        String attachment, String name, String contentType, long size, long expiry) throws Exception {
+                        String attachment, String name, String contentType, long size, long expiry, long generation) throws Exception {
             this.account = account; this.slot = slot; this.login = login; this.session = session;
             this.message = message; this.part = part; this.attachment = attachment;
-            this.name = name; this.contentType = contentType; this.size = size; this.expiry = expiry;
+            this.name = name; this.contentType = contentType; this.size = size; this.expiry = expiry; this.generation = generation;
             accountKey = digest(account.getBytes(StandardCharsets.UTF_8));
             JSONArray identity = new JSONArray().put(account).put(slot).put(login).put(session)
                 .put(message).put(part).put(attachment);
             cacheKey = digest(identity.toString().getBytes(StandardCharsets.UTF_8));
-            signature = digest(identity.put(name).put(contentType).put(size).put(expiry)
-                .toString().getBytes(StandardCharsets.UTF_8));
+            identity.put(name).put(contentType).put(size).put(expiry);
+            // Generation zero preserves the completed-cache signature shipped before explicit renewal existed.
+            if (generation != 0) identity.put(generation);
+            signature = digest(identity.toString().getBytes(StandardCharsets.UTF_8));
         }
 
         boolean expired(long now) { return expiry <= now; }
@@ -60,11 +62,26 @@ final class AIAssistantRemoteImages {
                     || !attachment.matches("[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
                     || !text(image, "room_key").equals(slot + ":" + session)
                     || !"image".equals(text(image, "media_type"))) return null;
-                long size = integer(image, "size_bytes"), expiry = integer(image, "expires_at");
+                long size = integer(image, "size_bytes"), expiry = integer(image, "expires_at"), generation = generation(image);
                 MaiCloudDrive.MediaInfo info = mediaInfo.apply(name);
                 if (info == null || !"image".equals(info.mediaType) || !type.equals(info.contentType)
-                    || size <= 0 || size > info.maxBytes || expiry <= 0 || expiry > 9_007_199_254_740_991L) return null;
-                return new Request(account, slot, login, session, messageID, id, attachment, name, type, size, expiry);
+                    || size <= 0 || size > info.maxBytes || expiry <= 0 || expiry > 9_007_199_254_740_991L || generation < 0) return null;
+                return new Request(account, slot, login, session, messageID, id, attachment, name, type, size, expiry, generation);
+            } catch (Exception invalid) { return null; }
+        }
+
+        // A complete fixed receipt may still identify a valid local copy while its publisher reports retryable state.
+        // This normalization is for local integrity lookup only, never permission to download or renew an object.
+        static Request forCache(String account, JSONObject owner, String messageID, JSONObject part,
+                                Function<String, MaiCloudDrive.MediaInfo> mediaInfo) {
+            try {
+                JSONObject image = part == null ? null : part.optJSONObject("remoteImage");
+                if (image == null) return null;
+                String state = text(image, "state");
+                if (!state.equals("pending") && !state.equals("failed")) return parse(account, owner, messageID, part, mediaInfo);
+                JSONObject copy = new JSONObject(part.toString());
+                copy.getJSONObject("remoteImage").put("state", "ready");
+                return parse(account, owner, messageID, copy, mediaInfo);
             } catch (Exception invalid) { return null; }
         }
     }
@@ -72,6 +89,12 @@ final class AIAssistantRemoteImages {
     static String text(JSONObject value, String key) {
         Object raw = value == null ? null : value.opt(key);
         return raw instanceof String ? (String) raw : "";
+    }
+
+    static long generation(JSONObject image) {
+        if (image == null || !image.has("generation")) return 0;
+        long value = integer(image, "generation");
+        return value >= 0 && value <= 9_007_199_254_740_991L ? value : -1;
     }
 
     private static long integer(JSONObject value, String key) {

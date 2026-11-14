@@ -19,7 +19,7 @@ async function fixture(t,role = 'assistant') {
     replacement:{ accountId:'account_a',slot:'mac',loginSessionId:'login_new' },
     other:{ accountId:'account_b',slot:'ios_phone',loginSessionId:'login_other' } };
   const service = createSessionSyncService({ db,now:() => now,authorize:async headers => principals[headers.authorization] });
-  const call = (token,method,path,body = {}) => service.handle({method,path,body,headers:{authorization:token}});
+  const call = (token,method,path,body = {},extraHeaders = {}) => service.handle({method,path,body,headers:{authorization:token,...extraHeaders}});
   const presence = token => call(token,'POST',`${ROOT}/presence`,{device_id:'install_mac',name:'Mac',
     sessions:[{id:binding.session_id,title:'Session',updated_at:now}]});
   await presence('mac');
@@ -32,10 +32,10 @@ async function fixture(t,role = 'assistant') {
     {id:binding.part_id,kind:'image',mimeType:'image/png',remotePartId:binding.part_id,
       ...(remoteImage ? {remoteImage} : {})},
     {id:'part_after',kind:'text',text:'After'}]});
-  const publish = remoteImage => call('mac','POST',`${ROOT}/publish`,{session_id:binding.session_id,
+  const publish = (remoteImage,token = 'mac') => call(token,'POST',`${ROOT}/publish`,{session_id:binding.session_id,
     messages:[message(remoteImage)]});
-  const authorize = (token,operation,patch = {}) => call(token,'POST',`${ROOT}/authorize-attachment`,{
-    operation,...binding,...(operation === 'read' ? {attachment_id:attachmentId,expires_at:ready.expires_at} : {}),...patch});
+  const authorize = (token,operation,patch = {},headers = {}) => call(token,'POST',`${ROOT}/authorize-attachment`,{
+    operation,...binding,...(operation === 'read' ? {attachment_id:attachmentId,expires_at:ready.expires_at} : {}),...patch},headers);
   return {db,call,presence,publish,authorize,pending,ready,message,advance:ms => {now += ms;}};
 }
 
@@ -75,4 +75,67 @@ test('ready image cannot change object identity or regain pending state on repub
   assert.equal((await f.publish(f.pending)).statusCode,200);
   const history = await f.call('phone','GET',`${ROOT}/history?owner_slot=mac&session_id=session_a`);
   assert.deepEqual(history.body.messages[0].parts[1].remoteImage,f.ready);
+});
+
+test('explicit generation renews only settled or server-expired image and authorizes its pending upload',async t => {
+  const f = await fixture(t);
+  await f.publish(f.ready);
+  const next = {...f.pending,generation:1,owner_login_session_id:'login_mac'};
+  assert.equal((await f.publish(next)).statusCode,409); // Healthy ready must retain its original object.
+  f.advance(86400000);
+  assert.equal((await f.publish(next)).statusCode,200);
+  assert.equal((await f.authorize('mac','create',{}, {'X-MaiChat-Image-Generation':'1'})).statusCode,200);
+  const ready = {...f.ready,generation:1,attachment_id:'123e4567-e89b-42d3-a456-426614174001',
+    expires_at:f.ready.expires_at+86400000};
+  assert.equal((await f.publish(ready)).statusCode,200);
+  assert.equal((await f.publish(f.ready)).statusCode,200); // Late generation 0 cannot roll back generation 1.
+  const history = await f.call('phone','GET',`${ROOT}/history?owner_slot=mac&session_id=session_a`);
+  assert.deepEqual(history.body.messages[0].parts[1].remoteImage,{...next,...ready});
+  assert.equal((await f.authorize('phone','read')).statusCode,404);
+  assert.equal((await f.authorize('phone','read',{attachment_id:ready.attachment_id,expires_at:ready.expires_at})).statusCode,200);
+});
+
+test('generation rejects skips, malformed values, pending restarts and expired new receipts',async t => {
+  const f = await fixture(t);
+  await f.publish({...f.pending,state:'failed'});
+  for (const generation of [-1,0.5,Number.MAX_SAFE_INTEGER+1,'1'])
+    assert.equal((await f.publish({...f.pending,generation})).statusCode,400);
+  assert.equal((await f.publish({...f.pending,generation:2})).statusCode,409);
+  assert.equal((await f.publish({...f.pending,generation:1,owner_login_session_id:'wrong'})).statusCode,409);
+  assert.equal((await f.publish({...f.pending,generation:1,owner_slot:'windows'})).statusCode,409);
+  assert.equal((await f.publish({...f.pending,generation:1,part_id:'part_before'})).statusCode,409);
+  assert.equal((await f.publish({...f.pending,generation:1})).statusCode,200);
+  assert.equal((await f.publish({...f.pending,generation:2})).statusCode,409);
+  assert.equal((await f.publish({...f.ready,generation:1,expires_at:1})).statusCode,409);
+  assert.equal((await f.publish({...f.ready,generation:1,owner_login_session_id:'wrong'})).statusCode,409);
+});
+
+test('only current owner can renew after relogin and legacy no-generation semantics stay unchanged',async t => {
+  const f = await fixture(t,'user');
+  await f.publish({...f.pending,state:'failed'});
+  await f.presence('replacement');
+  const next = {...f.pending,generation:1};
+  assert.equal((await f.publish(next)).statusCode,409);
+  assert.notEqual((await f.publish(next,'phone')).statusCode,200);
+  assert.notEqual((await f.publish(next,'other')).statusCode,200);
+  assert.equal((await f.publish(next,'replacement')).statusCode,200);
+  const history = await f.call('phone','GET',`${ROOT}/history?owner_slot=mac&session_id=session_a`);
+  assert.equal(history.body.messages[0].parts[1].remoteImage.owner_login_session_id,'login_new');
+  assert.equal((await f.authorize('replacement','create',{owner_login_session_id:'login_new'}, {'x-maichat-image-generation':'1'})).statusCode,200);
+  assert.equal((await f.publish({...f.ready,generation:1,owner_login_session_id:'login_mac'},'replacement')).statusCode,409);
+});
+
+test('new image generations require the fixed connector capability, not a caller body hint',async t => {
+  const f = await fixture(t);
+  await f.publish({...f.pending,state:'failed'});
+  await f.presence('replacement');
+  await f.publish({...f.pending,generation:1},'replacement');
+  for (const value of [undefined,'0','01','1, 1',1,['1']]) {
+    const headers = value === undefined ? {} : {'x-maichat-image-generation':value};
+    const denied = await f.authorize('replacement','create',{owner_login_session_id:'login_new'},headers);
+    assert.equal(denied.statusCode,409);
+    assert.equal(denied.body.errorCode,'image_generation_unsupported');
+  }
+  assert.equal((await f.authorize('replacement','create',{owner_login_session_id:'login_new',generation:1})).statusCode,409);
+  assert.equal((await f.authorize('replacement','create',{owner_login_session_id:'login_new'}, {'X-MaiChat-Image-Generation':'1'})).statusCode,200);
 });

@@ -21,6 +21,7 @@
 #include "agent/DesktopSessionSyncHost.h"
 #include "MaiQuestionTranscript.h"
 #include "agent/DesktopSessionAttachments.h"
+#include "MaiCloudDriveClient.h"
 
 namespace {
 
@@ -86,9 +87,13 @@ DesktopSessionSyncCoordinator::DesktopSessionSyncCoordinator(Requester requester
     backfillTimer_.setSingleShot(true);
     backfillTimer_.setInterval(5000);
     connect(&backfillTimer_, &QTimer::timeout, this, [this] { processBackfillPage(); });
+    imageWorkTimer_.setInterval(100);
+    connect(&imageWorkTimer_, &QTimer::timeout, this, [this] { checkImageWork(); });
 }
 
-DesktopSessionSyncCoordinator::~DesktopSessionSyncCoordinator() = default;
+DesktopSessionSyncCoordinator::~DesktopSessionSyncCoordinator() {
+    cancelImageWork();
+}
 
 void DesktopSessionSyncCoordinator::start() {
     if (started_ || !requester_ || !agentProvider_) return;
@@ -101,6 +106,8 @@ void DesktopSessionSyncCoordinator::connectionReady() {
 }
 
 void DesktopSessionSyncCoordinator::connectionLost() {
+    cancelImageWork();
+    if (host_) host_->setImagePublicationScope({}, {}, {});
     // A prior successful callback must not be projected into a fresh viewer read
     // after reconnect, or consume its in-flight live-tool protection.
     latestRemoteHistoryRequests_.clear();
@@ -395,6 +402,7 @@ DesktopSessionSyncHost* DesktopSessionSyncCoordinator::host() {
     messagePublishRevisions_.clear();
     roomStateRestoresPending_.clear();
     roomStateRestoresInFlight_.clear();
+    cancelImageWork();
     host_.reset();
     agent_ = current;
     if (!current) return nullptr;
@@ -555,6 +563,10 @@ void DesktopSessionSyncCoordinator::handleEnvelope(const QJsonObject& received) 
     if (kind == QStringLiteral("command")) {
         const QJsonObject payload = envelope.value(QStringLiteral("payload")).toObject();
         const QString action = payload.value(QStringLiteral("action")).toString();
+        if (action == QStringLiteral("prepare_image")) {
+            startPrepareImageCommand(envelope);
+            return;
+        }
         if (action == QStringLiteral("prompt") || action == QStringLiteral("steer")) {
             if (pendingInputEnvelopeIds_.contains(id)) return;
             auto& queue = inputCommands_[session];
@@ -1126,6 +1138,8 @@ void DesktopSessionSyncCoordinator::publishPage(const QString& sessionId, const 
                     guard->initiallyPublishedSessions_.remove(sessionId);
                 }
                 if (error.isEmpty()) guard->startPublishedImageUploads(sessionId, message);
+                guard->completePreparedImages(sessionId, message, error);
+                if (!guard) return;
                 // 失败也释放计数；旧 ACK 不写新的 digest，只在全批次结束后补最新状态。
                 guard->pendingMessagePublishes_[sessionId] =
                     qMax(0, guard->pendingMessagePublishes_.value(sessionId) - 1);
@@ -1140,6 +1154,231 @@ void DesktopSessionSyncCoordinator::configureImagePublicationScope() {
     const auto access = attachmentAccessProvider_();
     const auto room = localRoom(QString());
     host_->setImagePublicationScope(access.accountId, room.slot, room.login);
+}
+
+void DesktopSessionSyncCoordinator::cancelImageWork() {
+    imageWorkTimer_.stop();
+    for (const auto& upload : uploadingImages_) {
+        upload->active->store(false);
+        mai_cloud_drive_cancel_request(upload->cancel.get());
+    }
+    uploadingImages_.clear();
+    preparingImages_.clear();
+    preparingImageEnvelopeIds_.clear();
+}
+
+void DesktopSessionSyncCoordinator::startPrepareImageCommand(const QJsonObject& envelope, bool settledAcknowledged,
+                                                             qint64 previousGeneration) {
+    const int id = envelope.value(QStringLiteral("id")).toInt();
+    if (preparingImageEnvelopeIds_.contains(id)) return;
+    const auto payload = envelope.value(QStringLiteral("payload")).toObject();
+    const QString session = envelope.value(QStringLiteral("session_id")).toString();
+    const QString message = payload.value(QStringLiteral("messageId")).toString();
+    const QString part = payload.value(QStringLiteral("partId")).toString();
+    const QString request = payload.value(QStringLiteral("requestId")).toString();
+    const auto rejected = [&](const QString& code, const QString& error) {
+        respondToCommand(envelope, {{QStringLiteral("ok"), false},
+                                    {QStringLiteral("requestId"), request},
+                                    {QStringLiteral("messageId"), message},
+                                    {QStringLiteral("partId"), part},
+                                    {QStringLiteral("errorCode"), code},
+                                    {QStringLiteral("error"), error}});
+    };
+    static const QRegularExpression valid(QStringLiteral("^[A-Za-z0-9_-]{1,128}$"));
+    const QSet<QString> fields{QStringLiteral("action"), QStringLiteral("requestId"), QStringLiteral("messageId"),
+                               QStringLiteral("partId")};
+    for (auto it = payload.begin(); it != payload.end(); ++it)
+        if (!fields.contains(it.key()) || !it.value().isString()) {
+            rejected(QStringLiteral("invalid_input"), QStringLiteral("图片请求字段无效"));
+            return;
+        }
+    if (request.size() > 96 || !valid.match(request).hasMatch() || !valid.match(message).hasMatch() ||
+        !valid.match(part).hasMatch()) {
+        rejected(QStringLiteral("invalid_input"), QStringLiteral("图片请求身份无效"));
+        return;
+    }
+    auto* current = host();
+    configureImagePublicationScope();
+    if (!current || !attachmentAccessProvider_ || localLoginSession_.isEmpty()) {
+        rejected(QStringLiteral("image_scope_changed"), QStringLiteral("所属设备会话不可用"));
+        return;
+    }
+    const auto account = attachmentAccessProvider_().accountId;
+    const auto prepared =
+        current->prepareImage(session, message, part, request, settledAcknowledged, previousGeneration);
+    if (!prepared.ok()) {
+        rejected(prepared.errorCode, prepared.error);
+        return;
+    }
+    const auto room = localRoom(session);
+    const auto key = account + QLatin1Char(':') + room.key() + QLatin1Char(':') + message + QLatin1Char(':') + part;
+    if (preparingImageEnvelopeIds_.size() >= 256 || preparingImages_.value(key).size() >= 64) {
+        rejected(QStringLiteral("image_busy"), QStringLiteral("图片请求正在处理中，请稍后重试"));
+        return;
+    }
+    if (uploadingImages_.contains(key) && uploadingImages_.value(key)->generation != prepared.generation) {
+        const auto old = uploadingImages_.take(key);
+        old->active->store(false);
+        mai_cloud_drive_cancel_request(old->cancel.get());
+    }
+    const bool alreadyWaiting =
+        !preparingImages_.value(key).isEmpty() && preparingImages_.value(key).first().generation == prepared.generation;
+    if (!alreadyWaiting && preparingImages_.contains(key)) {
+        const auto old = preparingImages_.take(key);
+        const QPointer<DesktopSessionSyncCoordinator> alive(this);
+        for (const auto& command : old) {
+            preparingImageEnvelopeIds_.remove(command.envelope.value(QStringLiteral("id")).toInt());
+            QJsonObject result{{QStringLiteral("ok"), false},
+                               {QStringLiteral("errorCode"), QStringLiteral("image_scope_changed")},
+                               {QStringLiteral("error"), QStringLiteral("图片发布代次已变化")}};
+            const auto p = command.envelope.value(QStringLiteral("payload")).toObject();
+            for (const auto& field : {"requestId", "messageId", "partId"})
+                result.insert(QLatin1String(field), p.value(QLatin1String(field)));
+            respondToCommand(command.envelope, result);
+            if (!alive) return;
+        }
+    }
+    if (!prepared.canCommit || !prepared.canCommit()) {
+        rejected(QStringLiteral("image_scope_changed"), QStringLiteral("图片所属会话已变化"));
+        return;
+    }
+    ImageCommand command;
+    command.envelope = envelope;
+    command.account = account;
+    command.login = room.login;
+    command.message = message;
+    command.part = part;
+    command.epoch = publishEpoch_;
+    command.generation = prepared.generation;
+    command.canCommit = prepared.canCommit;
+    command.requiresSettledAck = prepared.requiresSettledAck;
+    preparingImages_[key].append(command);
+    preparingImageEnvelopeIds_.insert(id);
+    imageWorkTimer_.start();
+    if (!alreadyWaiting) publishImageMessage(session, message);
+}
+
+void DesktopSessionSyncCoordinator::publishImageMessage(const QString& sessionId, const QString& messageId) {
+    auto* current = host();
+    if (!current) return;
+    const auto exact = current->messageUpdate(sessionId, messageId);
+    if (exact.isEmpty()) {
+        checkImageWork();
+        return;
+    }
+    auto page = current->historyPage(sessionId, {}, 1);  // One state row, never scan/enroll old image history.
+    if (!page.value(QStringLiteral("ok")).toBool()) return;
+    page.insert(QStringLiteral("messages"), QJsonArray{exact});
+    publishedMessageDigests_.remove(sessionId + QLatin1Char(':') + messageId);
+    publishPage(sessionId, page);
+}
+
+void DesktopSessionSyncCoordinator::completePreparedImages(const QString& sessionId, const QJsonObject& message,
+                                                           const QString& publishError) {
+    QList<QPair<QJsonObject, QJsonObject>> replies;
+    QHash<QString, QList<ImageCommand>> continuations;
+    for (const auto& key : preparingImages_.keys()) {
+        auto pending = preparingImages_.take(key);
+        QList<ImageCommand> retained;
+        for (const auto& command : pending) {
+            if (command.message != message.value(QStringLiteral("id")).toString() ||
+                command.envelope.value(QStringLiteral("session_id")).toString() != sessionId) {
+                retained.append(command);
+                continue;
+            }
+            QJsonObject image;
+            for (const auto& value : message.value(QStringLiteral("parts")).toArray())
+                if (value.toObject().value(QStringLiteral("id")).toString() == command.part)
+                    image = value.toObject().value(QStringLiteral("remoteImage")).toObject();
+            if (image.isEmpty() || image.value(QStringLiteral("generation")).toInteger(0) != command.generation ||
+                (publishError.isEmpty() &&
+                 image.value(QStringLiteral("state")).toString() == QStringLiteral("pending"))) {
+                retained.append(command);
+                continue;
+            }
+            preparingImageEnvelopeIds_.remove(command.envelope.value(QStringLiteral("id")).toInt());
+            if (command.epoch != publishEpoch_ || !attachmentAccessProvider_ ||
+                attachmentAccessProvider_().accountId != command.account || localLoginSession_ != command.login)
+                continue;
+            const bool valid = command.canCommit && command.canCommit();
+            if (valid && publishError.isEmpty() && command.requiresSettledAck &&
+                image.value(QStringLiteral("state")).toString() == QStringLiteral("failed")) {
+                continuations[key].append(command);
+                continue;
+            }
+            const bool ready = valid && publishError.isEmpty() &&
+                               image.value(QStringLiteral("state")).toString() == QStringLiteral("ready");
+            QJsonObject result{{QStringLiteral("ok"), ready}};
+            const auto payload = command.envelope.value(QStringLiteral("payload")).toObject();
+            for (const auto& field : {"requestId", "messageId", "partId"})
+                result.insert(QLatin1String(field), payload.value(QLatin1String(field)));
+            if (ready)
+                result.insert(QStringLiteral("remoteImage"), image);
+            else {
+                result.insert(QStringLiteral("errorCode"), !valid ? QStringLiteral("image_scope_changed")
+                                                           : !publishError.isEmpty()
+                                                               ? QStringLiteral("image_publish_failed")
+                                                               : QStringLiteral("image_upload_failed"));
+                result.insert(QStringLiteral("error"), !valid ? QStringLiteral("图片所属会话已变化")
+                                                              : QStringLiteral("图片未能重新发布，请重试"));
+            }
+            replies.append(qMakePair(command.envelope, result));
+        }
+        if (!retained.isEmpty()) preparingImages_.insert(key, retained);
+    }
+    const QPointer<DesktopSessionSyncCoordinator> alive(this);
+    for (const auto& reply : replies) {
+        respondToCommand(reply.first, reply.second);
+        if (!alive) return;
+    }
+    for (const auto& group : continuations) {
+        bool first = true;
+        for (const auto& command : group) {
+            startPrepareImageCommand(command.envelope, first, first ? command.generation : -1);
+            first = false;
+            if (!alive) return;
+        }
+    }
+}
+
+void DesktopSessionSyncCoordinator::checkImageWork() {
+    for (const auto& upload : uploadingImages_)
+        if (!upload->canCommit()) {
+            upload->active->store(false);
+            mai_cloud_drive_cancel_request(upload->cancel.get());
+        }
+    QList<QPair<QJsonObject, QJsonObject>> replies;
+    for (const auto& key : preparingImages_.keys()) {
+        const auto pending = preparingImages_.take(key);
+        QList<ImageCommand> retained;
+        for (const auto& command : pending) {
+            const bool scope = command.epoch == publishEpoch_ && attachmentAccessProvider_ &&
+                               attachmentAccessProvider_().accountId == command.account &&
+                               localLoginSession_ == command.login;
+            if (scope && command.canCommit && command.canCommit() && !command.deadline.hasExpired()) {
+                retained.append(command);
+                continue;
+            }
+            preparingImageEnvelopeIds_.remove(command.envelope.value(QStringLiteral("id")).toInt());
+            if (!scope) continue;
+            QJsonObject result{
+                {QStringLiteral("ok"), false},
+                {QStringLiteral("errorCode"), command.deadline.hasExpired() ? QStringLiteral("image_publish_failed")
+                                                                            : QStringLiteral("image_scope_changed")},
+                {QStringLiteral("error"), QStringLiteral("图片所属会话已变化或请求超时，请重试")}};
+            const auto payload = command.envelope.value(QStringLiteral("payload")).toObject();
+            for (const auto& field : {"requestId", "messageId", "partId"})
+                result.insert(QLatin1String(field), payload.value(QLatin1String(field)));
+            replies.append(qMakePair(command.envelope, result));
+        }
+        if (!retained.isEmpty()) preparingImages_.insert(key, retained);
+    }
+    if (uploadingImages_.isEmpty() && preparingImages_.isEmpty()) imageWorkTimer_.stop();
+    const QPointer<DesktopSessionSyncCoordinator> alive(this);
+    for (const auto& reply : replies) {
+        respondToCommand(reply.first, reply.second);
+        if (!alive) return;
+    }
 }
 
 void DesktopSessionSyncCoordinator::startPublishedImageUploads(const QString& sessionId,
@@ -1159,23 +1398,48 @@ void DesktopSessionSyncCoordinator::startPublishedImageUploads(const QString& se
         if (current.value(QStringLiteral("state")).toString() != QStringLiteral("pending")) continue;
         const auto key = access.accountId + QLatin1Char(':') + room.key() + QLatin1Char(':') + messageId +
                          QLatin1Char(':') + partId;
+        const qint64 generation = current.value(QStringLiteral("generation")).toInteger(0);
+        if (generation !=
+            part.value(QStringLiteral("remoteImage")).toObject().value(QStringLiteral("generation")).toInteger(0))
+            continue;
         if (uploadingImages_.contains(key)) continue;
-        uploadingImages_.insert(key);
+        auto upload = std::make_shared<ImageUpload>();
+        upload->generation = generation;
+        upload->cancel =
+            std::shared_ptr<MaiCloudDriveCancel>(mai_cloud_drive_cancel_create(), mai_cloud_drive_cancel_destroy);
+        upload->active = std::make_shared<std::atomic<bool>>(true);
+        const auto sourceLease = host_->imagePreparationGuard(sessionId, messageId, partId);
+        upload->canCommit = [active = upload->active, sourceLease] { return active->load() && sourceLease(); };
+        uploadingImages_.insert(key, upload);
+        imageWorkTimer_.start();
         const auto source = host_->imageSource(sessionId, messageId, partId);
         const auto epoch = publishEpoch_;
         auto* watcher = new QFutureWatcher<DesktopSessionAttachmentResult>(this);
-        connect(watcher, &QFutureWatcher<DesktopSessionAttachmentResult>::finished, this,
-            [this, watcher, key, access, sessionId, messageId, epoch] {
+        connect(
+            watcher, &QFutureWatcher<DesktopSessionAttachmentResult>::finished, this,
+            [this, watcher, key, access, sessionId, messageId, epoch, upload] {
+                const auto result = watcher->result();
                 watcher->deleteLater();
-                uploadingImages_.remove(key);
+                if (uploadingImages_.value(key) == upload) uploadingImages_.remove(key);
                 if (epoch != publishEpoch_ || !attachmentAccessProvider_ ||
-                    attachmentAccessProvider_().accountId != access.accountId) return;
+                    attachmentAccessProvider_().accountId != access.accountId)
+                    return;
+                if (!upload->canCommit()) {
+                    checkImageWork();
+                    if (preparingImages_.contains(key)) publishImageMessage(sessionId, messageId);
+                    return;
+                }
                 // Receipt persistence precedes notification. Later text only
                 // republishes that fixed receipt, including after a restart.
-                scheduleSnapshot(sessionId, messageId);
+                if (result.errorCode == QStringLiteral("image_scope_changed")) {
+                    checkImageWork();
+                    return;
+                }
+                publishImageMessage(sessionId, messageId);
             });
-        watcher->setFuture(QtConcurrent::run([access, room, messageId, partId, source] {
-            return DesktopSessionAttachments::uploadTemporaryImage(access, room, messageId, partId, source);
+        watcher->setFuture(QtConcurrent::run([access, room, messageId, partId, source, upload] {
+            return DesktopSessionAttachments::uploadTemporaryImage(
+                access, room, messageId, partId, source, upload->generation, upload->cancel.get(), upload->canCommit);
         }));
     }
 }

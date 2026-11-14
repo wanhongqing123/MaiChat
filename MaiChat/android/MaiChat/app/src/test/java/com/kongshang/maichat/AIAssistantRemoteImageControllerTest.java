@@ -33,12 +33,14 @@ import org.robolectric.annotation.Implements;
 public final class AIAssistantRemoteImageControllerTest {
     private AIAssistantController controller;
     private Images images;
+    private Commands commands;
     private JSONObject image;
 
     @Before public void setup() throws Exception {
         Context context = ApplicationProvider.getApplicationContext();
         images = new Images();
-        controller = new AIAssistantController(context, "http://owned.invalid", null, images);
+        commands = new Commands();
+        controller = new AIAssistantController(context, "http://owned.invalid", null, images, commands);
         field("accountUserId").set(controller, "owned-" + UUID.randomUUID());
         image = AIAssistantRemoteImagesTest.part();
         page(AIAssistantRemoteImagesTest.owner(), image, 1);
@@ -147,6 +149,161 @@ public final class AIAssistantRemoteImageControllerTest {
         assertEquals(0, images.reads.get());
     }
 
+    @Test public void explicitPublicationUsesCompleteExpiredCopyEvenWhileOwnerIsOffline() throws Exception {
+        image.getJSONObject("remoteImage").put("state", "expired").put("expires_at", 1L);
+        AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.parse(
+            (String) field("accountUserId").get(controller), AIAssistantRemoteImagesTest.owner(), "message", image, images::mediaInfo);
+        AIAssistantRemoteImages.Cache cache = (AIAssistantRemoteImages.Cache) field("remoteImageCache").get(controller);
+        File staged = cache.staging(request); Files.write(staged.toPath(), new byte[] {1, 2, 3, 4});
+        File retained = cache.commit(staged, request);
+        page(AIAssistantRemoteImagesTest.owner().put("online", false), image, 2);
+        CompletableFuture<Reply> completed = new CompletableFuture<>();
+        try {
+            Method prepare = AIAssistantController.class.getDeclaredMethod("requestRemoteImagePublication",
+                AIAssistantController.State.class, String.class, JSONObject.class, java.util.function.BiConsumer.class);
+            prepare.setAccessible(true);
+            java.util.function.BiConsumer<File, String> callback = (file, failure) -> completed.complete(new Reply(file, failure));
+            prepare.invoke(controller, controller.state, "message", image, callback);
+        } catch (NoSuchMethodException missing) {
+            throw new AssertionError("Explicit single-image publication entry must check complete local copies before contacting the owner", missing);
+        }
+        Reply shown = await(completed);
+        assertEquals("", shown.error); assertEquals(retained, shown.file); assertEquals(0, images.reads.get());
+        assertEquals(0, commands.sent.get());
+    }
+
+    @Test public void automaticCacheProbeKeepsCompletePendingAndFailedCopiesVisibleOfflineWithoutPublication() throws Exception {
+        AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.parse(
+            (String) field("accountUserId").get(controller), AIAssistantRemoteImagesTest.owner(), "message", image, images::mediaInfo);
+        AIAssistantRemoteImages.Cache cache = (AIAssistantRemoteImages.Cache) field("remoteImageCache").get(controller);
+        File staged = cache.staging(request); Files.write(staged.toPath(), new byte[] {1, 2, 3, 4});
+        File retained = cache.commit(staged, request);
+        for (String status : new String[] {"pending", "failed"}) {
+            image.getJSONObject("remoteImage").put("state", status);
+            page(AIAssistantRemoteImagesTest.owner().put("online", false), image, 1);
+            Reply shown = await(load(controller.state, image));
+            assertEquals(status, "", shown.error); assertEquals(status, retained, shown.file);
+        }
+        assertEquals(0, images.reads.get()); assertEquals(0, commands.sent.get());
+    }
+
+    @Test public void explicitLegacyImageCoalescesOneExactOwnerCommandThenDownloadsItsReadyReceipt() throws Exception {
+        image.remove("remoteImage"); page(AIAssistantRemoteImagesTest.owner(), image, 1);
+        AIAssistantController.State clicked = controller.state;
+        CompletableFuture<Reply> first = prepare(clicked, image), duplicate = prepare(clicked, image);
+        waitForCommands(1);
+        assertEquals(4, commands.request.length());
+        assertEquals("prepare_image", commands.request.getString("action"));
+        assertEquals("message", commands.request.getString("messageId")); assertEquals("part", commands.request.getString("partId"));
+        assertFalse(commands.request.has("path")); assertFalse(commands.request.has("account_id")); assertFalse(commands.request.has("url"));
+        assertEquals("today-login", commands.owner.getString("login_session_id"));
+        assertEquals(0, images.reads.get()); assertFalse(first.isDone());
+        JSONObject metadata = ready(0);
+        commands.reply(envelope(), success(metadata));
+        Reply one = await(first), two = await(duplicate);
+        assertEquals("", one.error); assertNotNull(one.file); assertEquals(one.file, two.file);
+        assertEquals(1, commands.sent.get()); assertEquals(1, images.reads.get());
+        assertEquals(metadata.toString(), visiblePart().getJSONObject("remoteImage").toString());
+        assertFalse(visiblePart().has("path")); assertEquals(1, controller.state.data.getInt("remoteSelectionGeneration"));
+    }
+
+    @Test public void publicationRejectsWrongOwnerAndRequestTupleWithoutConsumingTheValidReply() throws Exception {
+        image.remove("remoteImage"); page(AIAssistantRemoteImagesTest.owner(), image, 1);
+        CompletableFuture<Reply> pending = prepare(controller.state, image); waitForCommands(1);
+        commands.reply(envelope().put("from_login_session_id", "other-login"), success(ready(0)));
+        for (String field : new String[] {"requestId", "messageId", "partId"})
+            commands.reply(envelope(), success(ready(0)).put(field, "another"));
+        drainWorker(); assertFalse(pending.isDone()); assertEquals(0, images.reads.get());
+        commands.reply(envelope(), success(ready(0))); assertNotNull(await(pending).file);
+    }
+
+    @Test public void publicationOfflineAndOldClientUnsupportedAreExplicitAndNeverPoll() throws Exception {
+        image.remove("remoteImage"); page(AIAssistantRemoteImagesTest.owner().put("online", false), image, 1);
+        assertEquals("所属设备离线，请上线后重新加载图片", await(prepare(controller.state, image)).error);
+        assertEquals(0, commands.sent.get());
+        page(AIAssistantRemoteImagesTest.owner(), image, 1);
+        CompletableFuture<Reply> pending = prepare(controller.state, image); waitForCommands(1);
+        commands.reply(envelope(), new JSONObject().put("ok", false).put("error", "不支持的远端操作"));
+        assertTrue(await(pending).error.contains("版本不支持"));
+        drainWorker(); assertEquals(1, commands.sent.get()); assertEquals(0, images.reads.get());
+        CompletableFuture<Reply> retry = prepare(controller.state, image); waitForCommands(2);
+        commands.reply(envelope(), success(ready(0))); assertNotNull(await(retry).file);
+    }
+
+    @Test public void publicationLeaveAndReturnDiscardsLateAcknowledgmentWithoutChangingNewState() throws Exception {
+        image.remove("remoteImage"); page(AIAssistantRemoteImagesTest.owner(), image, 1);
+        CompletableFuture<Reply> pending = prepare(controller.state, image); waitForCommands(1);
+        page(null, null, 2); page(AIAssistantRemoteImagesTest.owner(), image, 3);
+        assertEquals("会话已切换", await(pending).error);
+        commands.reply(envelope(), success(ready(0))); drainWorker();
+        assertFalse(visiblePart().has("remoteImage")); assertEquals(0, images.reads.get());
+    }
+
+    @Test public void publicationAcceptsOnlySameOrNextGenerationAndHandlesItsPendingBroadcastBeforeAck() throws Exception {
+        image.getJSONObject("remoteImage").put("state", "expired").put("expires_at", 1L);
+        page(AIAssistantRemoteImagesTest.owner(), image, 1);
+        CompletableFuture<Reply> pending = prepare(controller.state, image); waitForCommands(1);
+        commands.reply(envelope(), success(ready(2))); drainWorker();
+        assertFalse(pending.isDone()); assertEquals(0, images.reads.get());
+        JSONObject progress = new JSONObject(image.toString()).put("remoteImage", new JSONObject()
+            .put("state", "pending").put("retention", "temporary").put("generation", 1));
+        page(AIAssistantRemoteImagesTest.owner(), progress, 1);
+        commands.reply(envelope(), success(ready(1)));
+        assertNotNull(await(pending).file); assertEquals(1, images.reads.get());
+        assertEquals(1, visiblePart().getJSONObject("remoteImage").getInt("generation"));
+    }
+
+    @Test public void publicationCannotOverwriteAnotherNewerReadyReceipt() throws Exception {
+        image.getJSONObject("remoteImage").put("state", "expired").put("expires_at", 1L);
+        page(AIAssistantRemoteImagesTest.owner(), image, 1);
+        CompletableFuture<Reply> pending = prepare(controller.state, image); waitForCommands(1);
+        JSONObject newer = ready(2); page(AIAssistantRemoteImagesTest.owner(), new JSONObject(image.toString()).put("remoteImage", newer), 1);
+        commands.reply(envelope(), success(ready(1)));
+        Reply refused = await(pending); assertNull(refused.file); assertTrue(refused.error.contains("图片已更新"));
+        assertEquals(newer.toString(), visiblePart().getJSONObject("remoteImage").toString()); assertEquals(0, images.reads.get());
+    }
+
+    @Test public void publicationNewMetadataDuringDownloadRejectsOldBytesAndDiscardsStage() throws Exception {
+        images.block = true; image.remove("remoteImage"); page(AIAssistantRemoteImagesTest.owner(), image, 1);
+        CompletableFuture<Reply> pending = prepare(controller.state, image); waitForCommands(1);
+        commands.reply(envelope(), success(ready(0)));
+        assertTrue(images.started.await(3, TimeUnit.SECONDS));
+        JSONObject newer = ready(1); page(AIAssistantRemoteImagesTest.owner(), new JSONObject(image.toString()).put("remoteImage", newer), 1);
+        images.release.countDown(); Reply refused = await(pending);
+        assertNull(refused.file); assertEquals("会话已切换", refused.error); assertFalse(images.target.exists());
+        assertEquals(newer.toString(), visiblePart().getJSONObject("remoteImage").toString());
+    }
+
+    private CompletableFuture<Reply> prepare(AIAssistantController.State owner, JSONObject part) {
+        CompletableFuture<Reply> reply = new CompletableFuture<>();
+        controller.requestRemoteImagePublication(owner, "message", part, (file, failure) -> reply.complete(new Reply(file, failure)));
+        return reply;
+    }
+    private JSONObject visiblePart() throws Exception { return controller.state.data.getJSONArray("messages").getJSONObject(0).getJSONArray("parts").getJSONObject(0); }
+    private JSONObject ready(int generation) throws Exception {
+        JSONObject metadata = AIAssistantRemoteImagesTest.part().getJSONObject("remoteImage");
+        metadata.put("generation", generation); return metadata;
+    }
+    private JSONObject success(JSONObject metadata) throws Exception {
+        return new JSONObject().put("ok", true).put("requestId", commands.request.getString("requestId"))
+            .put("messageId", "message").put("partId", "part").put("remoteImage", metadata);
+    }
+    private JSONObject envelope() throws Exception {
+        return new JSONObject().put("session_id", "session").put("from_slot", "windows").put("from_login_session_id", "today-login");
+    }
+    private void waitForCommands(int count) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(4);
+        while (commands.sent.get() < count && System.nanoTime() < deadline) {
+            Shadows.shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(25)); Thread.sleep(5);
+        }
+        assertEquals(count, commands.sent.get()); drainWorker();
+    }
+    private void drainWorker() throws Exception {
+        CompletableFuture<Void> done = new CompletableFuture<>();
+        ((Handler) field("worker").get(controller)).post(() -> done.complete(null)); done.get(3, TimeUnit.SECONDS);
+        Shadows.shadowOf(Looper.getMainLooper()).idle();
+    }
+
     private JSONObject message(String id) throws Exception {
         return new JSONObject().put("id", id).put("role", "assistant")
             .put("parts", new JSONArray().put(new JSONObject(image.toString())));
@@ -169,6 +326,7 @@ public final class AIAssistantRemoteImageControllerTest {
         ((Handler) field("worker").get(controller)).post(() -> {
             try {
                 field("selectedRemote").set(controller, owner);
+                field("remoteSessions").set(controller, owner == null ? new JSONArray() : new JSONArray().put(owner));
                 field("remoteSelectionGeneration").setInt(controller, generation);
                 JSONArray messages = new JSONArray();
                 if (image != null) messages.put(new JSONObject().put("id", "message").put("role", "assistant")
@@ -199,6 +357,21 @@ public final class AIAssistantRemoteImageControllerTest {
             this.request = request; this.target = target; reads.incrementAndGet(); started.countDown();
             if (block) { cancellation.onCancel(release::countDown); assertTrue(release.await(3, TimeUnit.SECONDS)); }
             cancellation.check(); Files.write(target.toPath(), new byte[] {1, 2, 3, 4});
+        }
+    }
+    private static final class Commands implements AIAssistantController.ImagePublicationCommands {
+        final AtomicInteger sent = new AtomicInteger();
+        volatile JSONObject owner, request;
+        volatile String command;
+        volatile java.util.function.BiConsumer<JSONObject, JSONObject> received;
+        @Override public String send(JSONObject owner, JSONObject request, java.util.function.BiConsumer<String, String> sent,
+                                     java.util.function.BiConsumer<JSONObject, JSONObject> received) {
+            assertNotEquals(Looper.getMainLooper(), Looper.myLooper());
+            this.owner = owner; this.request = request; this.received = received; command = "prepare-" + this.sent.incrementAndGet();
+            sent.accept(command, ""); return command;
+        }
+        void reply(JSONObject envelope, JSONObject result) throws Exception {
+            received.accept(envelope, new JSONObject().put("type", "command_result").put("command_id", command).put("result", result));
         }
     }
     @Implements(value = AIAssistantController.class, isInAndroidSdk = false)

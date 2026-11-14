@@ -181,7 +181,11 @@ FLAC、OGG；其他安全后缀文件以 `application/octet-stream` 保存。
 `room_key`、`name`、`media_type:image`、`content_type`、`size_bytes`、
 `retention:temporary` 和 `expires_at`（Unix 毫秒）。Sync 不接收图片路径、签名 URL 或图片字节。
 后续文字快照保留同一 part 的图片回执，不能更换对象或延长到期时间。
-历史回填和查看图片不触发上传，也没有 `image_prepare` 或过期重传操作。
+历史回填和普通查看不触发重新发布。用户显式点击单张图片的重新加载入口时，
+查看端才向当前所属设备发送 `prepare_image`；不扫描历史、不调用模型。
+`remoteImage.generation` 省略时为旧代 0。Sync 仅允许已结束的 failed/expired 或
+服务端确认已过期的 ready 图片，递增一代并先 ACK 当前所属登录绑定的 pending；
+未过期 ready、pending 重启、跳代及旧代迟到覆盖均不取得新发布权限。
 
 所属端先发布 pending part，再调用已有 `POST /v1/session-attachments/uploads`，
 在原上传字段外传 `purpose:temporary_session_image`、`message_id`、`part_id`。
@@ -189,11 +193,25 @@ FLAC、OGG；其他安全后缀文件以 `application/octet-stream` 保存。
 通过固定 loopback 调用 `POST /v1/session-sync/authorize-attachment`，在 Sync 数据库中核对
 同账号、所属 Session、消息和具体 pending 图片 part。控制请求不接受路径、对象键或调用方到期时间。
 `MAICHAT_SESSION_SYNC_PORT` 默认为 9102，账号服务与 Sync 进程必须配置一致。
+固定 loopback 适配器自行添加 `X-MaiChat-Image-Generation: 1`，只转发已鉴权
+Bearer，不转发公网调用者的 capability 标记。Sync 的 create 授权返回
+`{ok:true,generation}`，包括代 0 都必须显式给出。固定标记的 HTTP 请求收到旧 Sync
+的缺代际 `{ok:true}` 时拒绝任何新分配，不能把未知 pending 解释成代 0。
+仅可信进程内普通 API 的既定旧布尔回调仍按代 0 处理。
+客户端 upload body 仍不得提交 generation 等服务端字段；共享原生上传/下载的
+七字段载荷不增加 generation。新代来自受信 Sync 响应，不能由客户端选择。
 
 临时对象写入独立的 `session-temp-images/<账号>/...`，首次预留起固定 24 小时到期；
 Multipart 初始化、完成和读取回执均返回完整 owner/Session/message/part 身份及原始 `expires_at`。
 数据库保留小型 `session_image_publications` 身份回执，保证重试、重启及对象清理后
-同一身份仍不会新建对象。普通持久会话附件的存储和七天未完成上传期限保持既有行为。
+同一代际身份仍不会新建对象。普通持久会话附件的存储和七天未完成上传期限保持既有行为。
+代 0 原表与原回执不作续期更新；后续代通过增量迁移新增
+`session_image_publication_generations`，每个逻辑图片与 generation 唯一，所属登录
+作为不可变事实保留。同代初始化幂等，同代过期仍返回 410，不再创建第二个对象；
+只有下一代 pending 的受信授权才能预留独立的固定 24 小时对象。Multipart 的
+签名、未完成分片查询和完成均重新核对附件映射代与当前授权，旧在途上传不能冒充新代。
+已完成上传的原有幂等回执保持可返回。两代际表都沿用原有账号、房间和 OSS 已确认
+清理规则；普通对象到期清理不会删除身份回执。
 包含临时图片的 `cleanup-room` 还会通过同一 Sync 授权路由的 `operation:cleanup-room`
 核对当前所属登录、会话目录与房间消息均已删除；仍存在的房间返回 409，防止清理操作重置发布身份。
 
@@ -215,6 +233,12 @@ OSS 生命周期为异步兜底，仓库代码和本地测试不代表线上规�
 `node --test session-temp-images.test.js session-temp-image-sync.test.js session-temp-image-integration.test.js`。
 测试使用注入时钟、fake OSS 和实际本机 Auth/Sync HTTP，覆盖固定过期、幂等、实际删除事实、
 完成跨过到期、两个消息角色、所属端离线及精确消息/part 授权。真实 OSS 和目标客户端需另行验收。
+升级须先保留带代际与 capability 校验的新 Sync，再部署新 Auth。新 Sync 对缺失或错误
+capability 的代大于 0 create 返回 409，防止热回滚后的旧 Auth 把代际授权压成布尔值
+而误建代 0；旧代 0、read 和 cleanup-room 维持原行为。回滚 Auth 时不删除新映射表或
+历史回执。新 Auth 遇到回滚后旧 Sync 的缺代际授权也拒绝新分配，只允许已有回执的
+幂等返回；这是安全降级，不保证新分配可用。Auth/Sync 应作为配对版本切换，不能
+以可信进程内布尔兼容推断任意旧二进制组合都能承载已进入新代的请求。
 
 缩略图由 OSS 按需处理，处理参数纳入 V4 签名，不在账号服务保存或转发媒体字节。
 图片缩图源文件上限为 20 MB；视频截帧仅支持 H.264/H.265，其他编码应显示占位图。

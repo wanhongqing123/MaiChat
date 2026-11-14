@@ -12,15 +12,18 @@
 #include <QSet>
 #include <QString>
 #include <QTimer>
+#include <QDeadlineTimer>
 
 #include <functional>
 #include <memory>
+#include <atomic>
 
 #include "auth/DesktopVideoCircleAccess.h"
 
 class AgentController;
 class DesktopSessionSyncHost;
 struct DesktopSessionRoom;
+struct MaiCloudDriveCancel;
 
 class DesktopSessionSyncCoordinator final : public QObject {
 public:
@@ -105,6 +108,12 @@ private:
     void publishPage(const QString& sessionId, const QJsonObject& page);
     void configureImagePublicationScope();
     void startPublishedImageUploads(const QString& sessionId, const QJsonObject& message);
+    void startPrepareImageCommand(const QJsonObject& envelope, bool settledAcknowledged = false,
+                                  qint64 previousGeneration = -1);
+    void completePreparedImages(const QString& sessionId, const QJsonObject& message, const QString& publishError = {});
+    void publishImageMessage(const QString& sessionId, const QString& messageId);
+    void checkImageWork();
+    void cancelImageWork();
     void restorePublishedRoomState(const QString& sessionId);
     void processBackfillPage();
 
@@ -158,7 +167,25 @@ private:
     DeviceHandler deviceHandler_;
     PayloadHandler payloadHandler_;
     AttachmentAccessProvider attachmentAccessProvider_;
-    QSet<QString> uploadingImages_;
+    struct ImageUpload {
+        qint64 generation = 0;
+        std::shared_ptr<MaiCloudDriveCancel> cancel;
+        std::shared_ptr<std::atomic<bool>> active;
+        std::function<bool()> canCommit;
+    };
+    struct ImageCommand {
+        QJsonObject envelope;
+        QString account, login, message, part;
+        quint64 epoch = 0;
+        qint64 generation = 0;
+        std::function<bool()> canCommit;
+        QDeadlineTimer deadline{120000};
+        bool requiresSettledAck = false;
+    };
+    QHash<QString, std::shared_ptr<ImageUpload>> uploadingImages_;
+    QHash<QString, QList<ImageCommand>> preparingImages_;
+    QSet<int> preparingImageEnvelopeIds_;
+    QTimer imageWorkTimer_;
     QQueue<Outgoing> outbound_;
     bool started_ = false;
     bool sending_ = false;

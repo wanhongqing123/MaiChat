@@ -39,12 +39,13 @@ function validRemoteImage(part,slot,sessionId) {
   if (image === undefined) return true;
   const fields = new Set(['state','retention','attachment_id','owner_login_session_id',
     'room_key','name','media_type','content_type','size_bytes','expires_at','error_code',
-    'owner_slot','session_id','message_id','part_id']);
+    'owner_slot','session_id','message_id','part_id','generation']);
   if (part.kind !== 'image' || part.remotePartId !== part.id || !image ||
       typeof image !== 'object' || Array.isArray(image) ||
       Object.keys(image).some(key => !fields.has(key)) || image.retention !== 'temporary' ||
       !['pending','ready','failed','expired'].includes(image.state)) return false;
   if (image.expires_at !== undefined && (!Number.isSafeInteger(image.expires_at) || image.expires_at <= 0)) return false;
+  if (image.generation !== undefined && (!Number.isSafeInteger(image.generation) || image.generation < 0)) return false;
   if (image.state !== 'ready') return true;
   return /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(image.attachment_id || '') &&
     validId(image.owner_login_session_id) && image.room_key === `${slot}:${sessionId}` &&
@@ -54,17 +55,44 @@ function validRemoteImage(part,slot,sessionId) {
     Buffer.byteLength(image.name) <= 240 && !/[\u0000-\u001f\u007f-\u009f/\\]/u.test(image.name);
 }
 
-// Later text snapshots can precede the image receipt reaching the host. Keep
-// one immutable image publication for either role, in the original part slot.
-function mergeRemoteImage(previous,part) {
+// Same-generation snapshots retain the original immutable receipt. An explicit
+// next generation is a control-plane lease, never a caller-chosen object key or expiry.
+function mergeRemoteImage(previous,part,principal,sessionId,messageId,serverNow) {
   const saved = previous?.remoteImage;
   const next = part.remoteImage;
-  if (!saved || part.kind !== 'image') return part;
+  const conflict = () => {
+    const error = new Error('Image publication identity changed');
+    error.code = 'IMAGE_PUBLICATION_CONFLICT'; throw error;
+  };
+  const currentGeneration = saved?.generation ?? 0;
+  const nextGeneration = next?.generation ?? 0;
+  if (!saved || part.kind !== 'image') {
+    if (next && nextGeneration !== 0) conflict();
+    return part;
+  }
+  if (!next) return { ...part,remoteImage:saved };
+  // A delayed old owner snapshot must not overwrite or reopen the newer lease.
+  if (nextGeneration < currentGeneration) return { ...part,remoteImage:saved };
+  if (nextGeneration > currentGeneration) {
+    const settled = saved.state === 'failed' || saved.state === 'expired' ||
+      (saved.state === 'ready' && saved.expires_at <= serverNow);
+    if (!settled || nextGeneration !== currentGeneration+1 || next.state !== 'pending') conflict();
+    for (const key of ['attachment_id','room_key','name','media_type','content_type','size_bytes','expires_at','error_code'])
+      if (next[key] !== undefined) conflict();
+    if (next.owner_login_session_id !== undefined && next.owner_login_session_id !== principal.loginSessionId) conflict();
+    for (const [key,value] of Object.entries({owner_slot:principal.slot,session_id:sessionId,message_id:messageId,part_id:part.id}))
+      if (next[key] !== undefined && next[key] !== value) conflict();
+    return { ...part,remoteImage:{...next,owner_login_session_id:principal.loginSessionId} };
+  }
+  if (currentGeneration > 0) {
+    for (const [key,value] of Object.entries({owner_slot:principal.slot,session_id:sessionId,message_id:messageId,part_id:part.id}))
+      if (next[key] !== undefined && next[key] !== value) conflict();
+    if (saved.state === 'pending' && next.state === 'ready' && next.expires_at <= serverNow) conflict();
+  }
   if (next) for (const key of ['attachment_id','owner_login_session_id','room_key',
     'name','media_type','content_type','size_bytes','expires_at']) {
     if (saved[key] !== undefined && next[key] !== undefined && saved[key] !== next[key]) {
-      const error = new Error('Image publication identity changed');
-      error.code = 'IMAGE_PUBLICATION_CONFLICT'; throw error;
+      conflict();
     }
   }
   if (!next || (saved.state !== 'pending' && next.state === 'pending') ||
@@ -248,11 +276,9 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
     for (const message of messages) {
       const previous = existing.get(principal.accountId, principal.slot,
         sessionId, message.id);
-      let merged = message;
-      if (previous) {
-        const byId = new Map(JSON.parse(previous.payload).parts.map(part => [part.id,part]));
-        merged = { ...message,parts:message.parts.map(part => mergeRemoteImage(byId.get(part.id),part)) };
-      }
+      const byId = new Map(previous ? JSON.parse(previous.payload).parts.map(part => [part.id,part]) : []);
+      let merged = { ...message,parts:message.parts.map(part =>
+        mergeRemoteImage(byId.get(part.id),part,principal,sessionId,message.id,now())) };
       if (previous && message.role === 'user') {
         const retained = JSON.parse(previous.payload).parts.filter(part =>
           typeof part?.attachment_id === 'string');
@@ -359,8 +385,15 @@ function createSessionSyncService({ db, authorize, now = Date.now }) {
       const image = part?.remoteImage;
       if (part?.kind !== 'image' || image?.retention !== 'temporary')
         return reply(404,{ error:'Session image not found' });
-      if (body.operation === 'create') return image.state === 'pending' ?
-        reply(200,{ok:true}) : reply(409,{error:'Image publication already settled'});
+      if (body.operation === 'create' && (image.generation ?? 0) > 0) {
+        const capability = Object.entries(headers || {}).find(([name]) => name.toLowerCase() === 'x-maichat-image-generation')?.[1];
+        // A legacy connector collapses a typed grant to bool. Refuse a renewed
+        // generation unless the fixed loopback adapter preserves that grant.
+        if (capability !== '1') return reply(409,{error:'Image generation connector is unsupported',errorCode:'image_generation_unsupported'});
+      }
+      if (body.operation === 'create') return image.state === 'pending' &&
+          (image.owner_login_session_id === undefined || image.owner_login_session_id === principal.loginSessionId) ?
+        reply(200,{ok:true,generation:image.generation ?? 0}) : reply(409,{error:'Image publication already settled'});
       if (image.attachment_id !== body.attachment_id || image.expires_at !== body.expires_at ||
           image.owner_login_session_id !== body.owner_login_session_id)
         return reply(404,{error:'Session image not found'});

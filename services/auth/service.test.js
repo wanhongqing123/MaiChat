@@ -1411,6 +1411,52 @@ test('late SMS completion cannot supersede a newer delivered code', async () => 
   setup.db.close();
 });
 
+test('image generation migration is additive and legacy rollback queries retain both receipt histories', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'maichat-image-generation-migration-'));
+  const filename = join(directory,'auth.sqlite');
+  let db;
+  try {
+    db = openStore(filename);
+    db.exec('DROP TABLE IF EXISTS session_image_publication_generations');
+    db.prepare(`INSERT INTO users(id,account_id,im_user_id,created_at,updated_at)
+      VALUES('generation-owner','generation_owner','generation-im',1,1)`).run();
+    db.prepare(`INSERT INTO session_image_publications
+      (owner_user_id,owner_slot,owner_login_session_id,session_id,message_id,part_id,
+       attachment_id,expires_at,name,size_bytes,content_type)
+      VALUES('generation-owner','mac','login_a','session_a','message_a','part_a',
+       '10000000-0000-4000-8000-000000000001',1000,'image.png',1024,'image/png')`).run();
+    const original = db.prepare('SELECT * FROM session_image_publications').get();
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE name='session_image_publications'").get().sql;
+    db.close();db = openStore(filename);
+    assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE name='session_image_publication_generations'").get(),
+      'The new mapping must be added without rebuilding the generation-zero table');
+    assert.deepEqual(db.prepare('SELECT * FROM session_image_publications').get(),original);
+    assert.equal(db.prepare("SELECT sql FROM sqlite_master WHERE name='session_image_publications'").get().sql,schema);
+    const insert = db.prepare(`INSERT INTO session_image_publication_generations
+      (owner_user_id,owner_slot,owner_login_session_id,session_id,message_id,part_id,generation,
+       attachment_id,expires_at,name,size_bytes,content_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const identity = ['generation-owner','mac','login_a','session_a','message_a','part_a'];
+    insert.run(...identity,1,'10000000-0000-4000-8000-000000000002',2000,'image.png',1024,'image/png');
+    assert.throws(() => insert.run(...identity,1,'10000000-0000-4000-8000-000000000003',3000,'image.png',1024,'image/png'),/UNIQUE/);
+    const relogged = [...identity];relogged[2] = 'login_new';
+    assert.throws(() => insert.run(...relogged,1,'10000000-0000-4000-8000-000000000005',3000,'image.png',1024,'image/png'),/UNIQUE/);
+    assert.throws(() => insert.run(...identity,0,'10000000-0000-4000-8000-000000000004',3000,'image.png',1024,'image/png'),/CHECK/);
+    db.close();db = new Database(filename);
+    // Old binaries use only the old table. Their original reads and writes remain valid after rollback.
+    assert.deepEqual(db.prepare('SELECT * FROM session_image_publications').get(),original);
+    db.prepare(`UPDATE session_image_publications SET room_deleted_at=? WHERE attachment_id=?`)
+      .run(1234,original.attachment_id);
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM session_image_publication_generations').get().n,1);
+    db.close();db = openStore(filename);
+    assert.equal(db.prepare('SELECT room_deleted_at FROM session_image_publications').get().room_deleted_at,1234);
+    assert.equal(db.prepare('SELECT generation FROM session_image_publication_generations').get().generation,1);
+    assert.equal(db.pragma('foreign_key_check').length,0);
+  } finally {
+    if (db?.open) db.close();
+    rmSync(directory,{recursive:true,force:true});
+  }
+});
+
 test('existing SQLite session and QR tables migrate without losing rows', () => {
   const directory = mkdtempSync(join(tmpdir(), 'maichat-auth-test-'));
   const filename = join(directory, 'auth.sqlite');
