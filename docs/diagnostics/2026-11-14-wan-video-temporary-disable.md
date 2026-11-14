@@ -68,3 +68,36 @@ MaiSpecialistNotificationTests。直接链接的当前正常 App `maiagent.lib` 
 八源薄件共28882B，SHA256为 `43df5aebf98b4209db7521ab509a5d124a1f1dd1d9f2d85fc6208352dee9be51`，
 已交给 Mac 在独立视频测试自然结束后按 previous/new/canonical 核合。
 Apple/Mobile 普通消费者与后续实际安装结果需按真实回执补记；本节不宣称现装 App 已更新。
+
+## Apple 普通消费者与 211 安装
+
+Mac 在独立视频测试自然结束后核合八源，普通 Qt Core 库必要增量0/40.959s。
+原 ModelStudio 测试使用该正常库和依赖编译、链接、离线运行全部0；子进程清除全部
+live/recovery opt-in，sandbox 拒绝出网。Core 测试源29020B、SHA256
+`8553eafe6289c7ee8e61ba9ba5e78a3a31a05988072fa936b2db57236fbe3076`。
+
+Mobile 新增唯一 `--wan-video-paused-only` 槽，经过普通 CABI configure/create/send，
+从自有127.0.0.1 SSE端点捕获真实HTTP请求的 tools 和 system message，确认没有wan_video，
+仍有wan_image、kling_bailian_video/image，提示明确费用暂停且不静默换模型。
+旧缓存实际RED1；normalMobile build0/71.082s后，同槽GREEN0/0.608s。
+dummy key 仅用于自有环回请求，回复没有 tool_calls，不调用供应商。
+新增测试源canonical126397B、SHA256
+`70020c7b7c4196ab67de9a341830f6e30acba298ff5a4a592a393ccffac4461d`，
+Root已按previous/new blob与bytes核合；Core和Mobile两组源哈希分别对应各自回执。
+
+该轮普通消费者构建来源仍为beee29f4加精确八源overlay。GitHub fetch因TLS连接错误128而
+未改HEAD，随后用10786B、SHA256 `e03d0e56eee0335abaf29dc5409e9cb76179b043f197bfbcfecda48e01c8d39a`
+的两提交bundle，在cohort结束后安全ff到a701，不能将之前构建来源倒填为新HEAD。
+
+211正常generic Release实际基于 `a7012733abf19ff00055d06bf8745397a188e70f` 生产输入，
+视频Desktop overlay和Mobile测试源均不进入iOS Release目标。前置私有清单helper曾把测试源
+当生产输入而assert，该次没有启动xcodebuild，原失败保留；按真实目标分组后正常Release
+exit0/93.375s，strict签名、profile、10项升级entitlement、22个实际合库对象
+（含Wan相关两cpp）及9个Release MachO的测试marker负检通过。
+本地署名构建exe SHA256为
+`e32fee203f07bb5d887dbc604e2724e4a2ba3342f084f62c42a222c6cab0416c`，不是设备容器读回SHA。
+
+装前fresh实际210，保数据覆盖install0/17.945s，装后为 **2.2.4/211**。
+首次普通launch实际exit1/10.745s，CoreDevice10002下层FBS7明确Locked，当前没有可确认的新PID。
+这是设备锁定导致的启动未完成；安装不重做，等待用户解锁后仅补普通launch与进程路径回读。
+未卸载、清数据或读取容器/真实DB，未调用付费模型或真实双账号消息流程。

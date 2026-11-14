@@ -1466,7 +1466,96 @@ static void sessionIMCabiContract() {
     std::puts("PASS: Session IM C ABI scope, live admission and immediate no-handle takeover without model or SDK calls");
 }
 
+// 消费正常 configure/send 发出的真实模型请求，只连接自有环回 SSE 端点。
+// 暂停视频不能连带移除图片或可灵，也不能继续在系统提示里推荐万相付费重试。
+static void wanVideoPausedRequestContract() {
+    struct Fixture {
+        MaiFilePath root = MaiFileSystem::temporaryDirectory().append(
+            MaiFilePath::fromUtf8("mai-mobile-wan-paused-" + MaiIdGenerator::newEventId()));
+        httplib::Server server;
+        std::thread listener;
+        void* agent = nullptr;
+        ~Fixture() {
+            maiMobileAgentDestroy(agent);
+            server.stop();
+            if (listener.joinable()) listener.join();
+            MaiFileSystem::removeRecursively(root);
+        }
+    };
+    std::atomic<int> requests{0};
+    std::atomic<bool> valid{false};
+    // Destroy the Agent/listener before the callback state they capture.
+    Fixture fixture;
+    fixture.server.Post("/chat/completions", [&](const httplib::Request& request, httplib::Response& response) {
+        try {
+            const Json body = Json::parse(request.body);
+            bool wanVideo = false, wanImage = false, klingVideo = false, klingImage = false;
+            for (const auto& tool : body.at("tools")) {
+                const auto name = tool.at("function").at("name").get<std::string>();
+                wanVideo |= name == "wan_video";
+                wanImage |= name == "wan_image";
+                klingVideo |= name == "kling_bailian_video";
+                klingImage |= name == "kling_bailian_image";
+            }
+            const auto& system = body.at("messages").front();
+            const std::string prompt = system.at("content").get<std::string>();
+            valid = system.at("role") == "system" && !wanVideo && wanImage && klingVideo && klingImage &&
+                    prompt.find("Wan video generation (wan_video) is temporarily disabled to control costs.") !=
+                        std::string::npos &&
+                    prompt.find("Do not submit or revise Wan video tasks") != std::string::npos &&
+                    prompt.find("silently choose a replacement model") != std::string::npos;
+            ++requests;
+            response.set_content(frame({{"content", "owned catalog verified"}}, "stop") + "data: [DONE]\n\n",
+                                 "text/event-stream");
+        } catch (...) {
+            response.status = 500;
+            response.set_content("owned request shape mismatch", "text/plain");
+        }
+    });
+    const int port = fixture.server.bind_to_any_port("127.0.0.1");
+    CHECK(port > 0);
+    CHECK(!MaiFileSystem::createDirectories(fixture.root));
+    fixture.agent = maiMobileAgentCreate();
+    CHECK(fixture.agent);
+    CHECK(call(fixture.agent, {{"op", "configure"},
+                               {"model", "owned-model"},
+                               {"apiKey", "test-key"},
+                               {"wire", "chat_completions"},
+                               {"policy", "never"},
+                               {"baseUrl", "http://127.0.0.1:" + std::to_string(port)},
+                               {"workspace", fixture.root.toUtf8()},
+                               {"database", fixture.root.toUtf8() + "/sessions.db"}})
+              .at("ok") == true);
+    const std::string session = call(fixture.agent, {{"op", "create"}}).at("id");
+    fixture.listener = std::thread([&] { fixture.server.listen_after_bind(); });
+    fixture.server.wait_until_ready();
+    CHECK(fixture.server.is_running());
+    CHECK(call(fixture.agent, {{"op", "send"}, {"session", session}, {"text", "Check the owned tool catalog."}})
+              .at("ok") == true);
+    bool finished = false;
+    for (int index = 0; index < 160; ++index) {
+        const auto snapshot = call(fixture.agent, {{"op", "snapshot"}, {"session", session}, {"force", true}});
+        if (!snapshot.at("busy").get<bool>()) {
+            finished = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    CHECK(finished && requests.load() == 1 && valid.load());
+    std::puts("PASS: normal Mobile model request hides Wan video, retains Wan image/Kling and explains cost pause");
+}
+
 int main(int argc, char** argv) {
+    const bool wanPausedOnly = argc == 2 && std::strcmp(argv[1], "--wan-video-paused-only") == 0;
+    if (argc == 1 || wanPausedOnly) {
+        try {
+            wanVideoPausedRequestContract();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "FAIL: Wan video paused request contract: %s\n", error.what());
+            return 1;
+        }
+        if (wanPausedOnly) return 0;
+    }
     const bool sessionIMOnly = argc == 2 && std::strcmp(argv[1], "--session-im-binding-only") == 0;
     if (argc == 1 || sessionIMOnly) {
         try { sessionIMCabiContract(); }
