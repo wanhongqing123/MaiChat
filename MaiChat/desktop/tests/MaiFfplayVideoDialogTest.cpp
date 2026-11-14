@@ -18,6 +18,8 @@
 #include <QLabel>
 #include <QMouseEvent>
 #include <QMenu>
+#include <QHelpEvent>
+#include <QToolTip>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QFile>
@@ -69,6 +71,10 @@ void activateFfplayTestWindow(QWidget* widget);
 bool ffplayTestWindowInteractive(QWidget* widget);
 QString ffplayTestNativeState(QWidget* widget);
 QJsonObject ffplayTestVideoLayerGeometry(QWidget* widget);
+void resizeFfplayTestNativeWindow(QWidget* widget, QSize size);
+void* beginOwnedFfplayDrawableProbe(QWidget* widget);
+void endOwnedFfplayDrawableProbe(void* value);
+QImage copyOwnedFfplayDrawable(void* value);
 bool cancelFfplayTestNativePanel();
 void observeFfplayTestNativePanel();
 bool clickFfplayTestNativeButton(QWidget* widget);
@@ -338,6 +344,14 @@ private slots:
     void windowedVideoFillsViewportAndKeepsUserSize();
     void windowEdgesResizeThroughNativeVideoAndHud();
     void ownedHudTracksOwnerAndForwardsKeys();
+    void macVideoResizeKeepsActualNativeLayerAligned();
+    void macResizeKeepsActualDrawableContent_data();
+    void macResizeKeepsActualDrawableContent();
+    void playerControlsDoNotShowHoverTooltips();
+    void macHdrResizeTracksNativeVideoRect();
+    void macVideoHudsDoNotOfferIndependentNativeResize();
+    void macVideoHudFollowsAnotherOwnedWindowActivation();
+    void creationVideoClosesWithoutShowingWindowedPlayer();
     void closingOwnerWithOpenMoreMenuIsSafe();
     void volumeControlsTrackCoreAndSurvivePlaybackChanges();
     void volumePopupKeepsVerticalReadoutAndKeyboardControls();
@@ -686,7 +700,8 @@ void MaiFfplayVideoDialogTest::windowEdgesResizeThroughNativeVideoAndHud() {
                                 {Qt::TopEdge | Qt::LeftEdge, QPoint(-20, -20), Qt::SizeFDiagCursor},
                                 {Qt::TopEdge | Qt::RightEdge, QPoint(20, -20), Qt::SizeBDiagCursor},
                                 {Qt::BottomEdge | Qt::LeftEdge, QPoint(-20, 20), Qt::SizeBDiagCursor},
-                                {Qt::BottomEdge | Qt::RightEdge, QPoint(20, 20), Qt::SizeFDiagCursor}};
+                                {Qt::BottomEdge | Qt::RightEdge, QPoint(20, 20), Qt::SizeFDiagCursor},
+                                {Qt::BottomEdge | Qt::RightEdge, QPoint(600, 350), Qt::SizeFDiagCursor}};
     const QRect available = player.screen()->availableGeometry();
     const QRect baseline(available.topLeft() + QPoint(70, 70), QSize(660, 430));
     for (const auto& sample : cases) {
@@ -705,6 +720,11 @@ void MaiFfplayVideoDialogTest::windowEdgesResizeThroughNativeVideoAndHud() {
         qInfo() << "[player-edge]" << int(sample.edges) << "widget" << player.geometry() << "native-window"
                 << player.windowHandle()->geometry() << "point" << global << "hit" << hit << "hit-window"
                 << (hit ? hit->window() : nullptr);
+#if defined(Q_OS_MAC)
+        qInfo() << "[edge-native-owner]" << ffplayTestVideoLayerGeometry(&player)
+                << "[edge-native-header]" << ffplayTestVideoLayerGeometry(header)
+                << "[edge-native-footer]" << ffplayTestVideoLayerGeometry(footer);
+#endif
 #if defined(Q_OS_WIN)
         const HWND nativePlayer = reinterpret_cast<HWND>(player.winId());
         RECT nativeRect{};
@@ -749,6 +769,17 @@ void MaiFfplayVideoDialogTest::windowEdgesResizeThroughNativeVideoAndHud() {
         if (sample.edges & Qt::BottomEdge) expected.setBottom(expected.bottom() + sample.delta.y());
         QTRY_COMPARE(player.geometry(), expected);
         QCOMPARE(surface->geometry(), player.rect());
+#if defined(Q_OS_MAC)
+        QTest::qWait(80);
+        const auto layerGeometry = ffplayTestVideoLayerGeometry(surface);
+        qInfo() << "[owned-edge-metal]" << int(sample.edges) << layerGeometry;
+        QCOMPARE(layerGeometry.value("nativeWidth").toInt(), surface->width());
+        QCOMPARE(layerGeometry.value("nativeHeight").toInt(), surface->height());
+        QCOMPARE(layerGeometry.value("metalLayerWidth").toInt(), surface->width());
+        QCOMPARE(layerGeometry.value("metalLayerHeight").toInt(), surface->height());
+        QTRY_COMPARE(ffplayTestVideoLayerGeometry(surface).value("shownMetalWidth").toInt(), surface->width());
+        QTRY_COMPARE(ffplayTestVideoLayerGeometry(surface).value("shownMetalHeight").toInt(), surface->height());
+#endif
     }
     QVERIFY(maiFfplayGetPlaybackStatus(&status) && status.paused);
     QVERIFY(std::abs(status.position_us - position) < 100'000);
@@ -756,6 +787,354 @@ void MaiFfplayVideoDialogTest::windowEdgesResizeThroughNativeVideoAndHud() {
 }
 
 // 真正的透明 owner 窗口保留输入路径，最小化/切到同 App 其它窗口时不能遗留浮层。
+void MaiFfplayVideoDialogTest::playerControlsDoNotShowHoverTooltips() {
+    MaiFfplayVideoDialog player(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE));
+    player.findChild<QSlider*>(QStringLiteral("ffplayVolumeSlider"))->setValue(0);
+    // 明确允许测试窗口在非前台呈现 Qt tooltip，避免环境恰好不弹就假通过。
+    player.setAttribute(Qt::WA_AlwaysShowToolTips);
+    showOwnTestWindow(&player);
+    for (const char* name : {"ffplayCloseButton", "videoMoreButton"}) {
+        auto* control = player.findChild<QWidget*>(QString::fromLatin1(name));
+        QVERIFY(control && !control->accessibleName().isEmpty());
+        QToolTip::hideText();
+        const QPoint point = control->rect().center();
+        QHelpEvent hover(QEvent::ToolTip, point, control->mapToGlobal(point));
+        QCoreApplication::sendEvent(control, &hover);
+        QTest::qWait(50);
+        const bool visible = QToolTip::isVisible();
+        QToolTip::hideText();
+        QVERIFY2(!visible, "Player hover tooltip is still shown");
+    }
+    player.close();
+}
+
+void MaiFfplayVideoDialogTest::macVideoHudsDoNotOfferIndependentNativeResize() {
+#if defined(Q_OS_MAC)
+    MaiFfplayVideoDialog player(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE));
+    player.findChild<QSlider*>(QStringLiteral("ffplayVolumeSlider"))->setValue(0);
+    showOwnTestWindow(&player);
+    QTRY_VERIFY_WITH_TIMEOUT(player.presentedFrames() > 0, 10000);
+    QVERIFY(ffplayTestVideoLayerGeometry(&player).value("nativeResizable").toBool());
+    for (const char* name : {"ffplayTitleBar", "ffplayOverlay"}) {
+        auto* hud = player.findChild<QWidget*>(QString::fromLatin1(name));
+        QVERIFY(hud);
+        const auto native = ffplayTestVideoLayerGeometry(hud);
+        qInfo() << "[owned-native-hud-resize-capability]" << name << native;
+        QVERIFY2(!native.value("nativeResizable").toBool(), "HUD can be resized by Cocoa independently of its video owner");
+    }
+    player.close();
+#else
+    QSKIP("Own Cocoa HUD capability regression");
+#endif
+}
+
+void MaiFfplayVideoDialogTest::macHdrResizeTracksNativeVideoRect() {
+#if defined(Q_OS_MAC)
+    QTemporaryDir directory;
+    const QString file = directory.filePath(QStringLiteral("owned-resize-hlg.mov"));
+    QProcess generate;
+    generate.start(QStringLiteral("ffmpeg"),
+        {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-f"), QStringLiteral("lavfi"),
+         QStringLiteral("-i"), QStringLiteral("testsrc2=size=192x108:rate=24:duration=2"),
+         QStringLiteral("-vf"), QStringLiteral("format=yuv420p10le"), QStringLiteral("-c:v"),
+         QStringLiteral("libx265"), QStringLiteral("-preset"), QStringLiteral("ultrafast"),
+         QStringLiteral("-x265-params"),
+         QStringLiteral("log-level=error:pools=1:frame-threads=1:colorprim=9:transfer=18:colormatrix=9"),
+         QStringLiteral("-color_primaries"), QStringLiteral("bt2020"), QStringLiteral("-colorspace"),
+         QStringLiteral("bt2020nc"), QStringLiteral("-color_trc"), QStringLiteral("arib-std-b67"),
+         QStringLiteral("-tag:v"), QStringLiteral("hvc1"), QStringLiteral("-an"), file});
+    QVERIFY(generate.waitForFinished(15000));
+    QCOMPARE(generate.exitCode(), 0);
+    MaiFfplayVideoDialog player(file);
+    player.findChild<QSlider*>(QStringLiteral("ffplayVolumeSlider"))->setValue(0);
+    showOwnTestWindow(&player);
+    QTRY_VERIFY_WITH_TIMEOUT(player.hasPresentedHdrFrame(), 10000);
+    // HDR 首帧 ready 早于普通定尺寸任务；等其完成，避免 fixture 自己与首次布局竞争。
+    QTRY_VERIFY_WITH_TIMEOUT(std::abs(player.width() * 9 - player.height() * 16) <= 16, 2000);
+    QVERIFY(player.sendCommand(QStringLiteral("pause")));
+    auto* surface = player.findChild<QWidget*>(QStringLiteral("ffplayVideoSurface"));
+    QVERIFY(surface);
+    for (QSize size : {QSize(640, 400), QSize(1040, 680), QSize(520, 360), QSize(900, 580)}) {
+        resizeFfplayTestNativeWindow(&player, size);
+        QTRY_COMPARE(player.size(), size);
+        QTRY_COMPARE(surface->size(), size);
+        QTest::qWait(100);
+        QJsonObject native;
+        QTRY_VERIFY2_WITH_TIMEOUT(([&] {
+            native = ffplayTestVideoLayerGeometry(surface);
+            const QSizeF expected = QSizeF(192, 108).scaled(QSizeF(size), Qt::KeepAspectRatio);
+            return native.contains("videoRectWidth") &&
+                std::abs(native.value("videoBoundsWidth").toDouble() - size.width()) < 1 &&
+                std::abs(native.value("videoBoundsHeight").toDouble() - size.height()) < 1 &&
+                std::abs(native.value("videoRectWidth").toDouble() - expected.width()) < 1 &&
+                std::abs(native.value("videoRectHeight").toDouble() - expected.height()) < 1;
+        })(), qPrintable(QString::fromUtf8(QJsonDocument(native).toJson(QJsonDocument::Compact))), 3000);
+        qInfo() << "[owned-actual-HDR-video-rect]" << size << native;
+    }
+    player.close();
+#else
+    QSKIP("Own native HDR layer regression");
+#endif
+}
+
+void MaiFfplayVideoDialogTest::macResizeKeepsActualDrawableContent_data() {
+    QTest::addColumn<bool>("paused");
+    QTest::newRow("paused") << true;
+    QTest::newRow("playing-rapid-resize") << false;
+}
+
+void MaiFfplayVideoDialogTest::macResizeKeepsActualDrawableContent() {
+#if defined(Q_OS_MAC)
+    QFETCH(bool, paused);
+    QTemporaryDir directory;
+    const QString file = directory.filePath(QStringLiteral("owned-quadrants.mp4"));
+    QProcess encoder;
+    encoder.start(QStringLiteral("ffmpeg"), {QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"),
+        QStringLiteral("error"), QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+        QStringLiteral("color=c=red:size=640x360:rate=30:duration=8,"
+            "drawbox=x=iw/2:y=0:w=iw/2:h=ih/2:color=green:t=fill,"
+            "drawbox=x=0:y=ih/2:w=iw/2:h=ih/2:color=blue:t=fill,"
+            "drawbox=x=iw/2:y=ih/2:w=iw/2:h=ih/2:color=white:t=fill"),
+        QStringLiteral("-c:v"), QStringLiteral("libx264"), QStringLiteral("-preset"),
+        QStringLiteral("ultrafast"), file});
+    QVERIFY(encoder.waitForFinished(15000));
+    QCOMPARE(encoder.exitCode(), 0);
+    MaiFfplayVideoDialog player(file);
+    player.findChild<QSlider*>(QStringLiteral("ffplayVolumeSlider"))->setValue(0);
+    showOwnTestWindow(&player);
+    QTRY_VERIFY_WITH_TIMEOUT(player.presentedFrames() > 0, 10000);
+    if (paused) {
+        QVERIFY(player.sendCommand(QStringLiteral("pause")));
+        MaiFfplayPlaybackStatus status{};
+        QTRY_VERIFY_WITH_TIMEOUT(maiFfplayGetPlaybackStatus(&status) && status.paused, 2000);
+    }
+    auto* surface = player.findChild<QWidget*>(QStringLiteral("ffplayVideoSurface"));
+    QVERIFY(surface);
+    std::unique_ptr<void, decltype(&endOwnedFfplayDrawableProbe)> probe(
+        beginOwnedFfplayDrawableProbe(surface), endOwnedFfplayDrawableProbe);
+    QVERIFY2(probe.get(), "Actual playback CAMetalLayer was unavailable");
+    resizeFfplayTestNativeWindow(&player, QSize(640, 400));
+    QTRY_COMPARE(player.size(), QSize(640, 400));
+    QTRY_COMPARE(surface->size(), player.size());
+    QTest::qWait(150);
+    QImage reference;
+    const auto colorEnergy = [](const QImage& image) {
+        int sum = 0;
+        if (!image.isNull()) for (int row = 1; row < 4; ++row)
+            for (int column = 1; column < 4; ++column) {
+                const QColor pixel = image.pixelColor(column * image.width() / 4, row * image.height() / 4);
+                sum += pixel.red() + pixel.green() + pixel.blue();
+            }
+        return sum;
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(([&] {
+        reference = copyOwnedFfplayDrawable(probe.get());
+        return reference.size() == surface->size() && colorEnergy(reference) > 500;
+    })(), 4000);
+    // 可选负对照仅用于证明观测能识别“窗口/子视图已扩大，渲染器仍留旧尺寸”。
+    // 正常例从不阻断 resize，不改正式 Graphics 或 Media 实现。
+    class StaleRenderResizeControl final : public QObject {
+    public:
+        QWidget* surface = nullptr;
+        bool eventFilter(QObject* owner, QEvent* event) override {
+            if (event->type() != QEvent::Resize) return false;
+            surface->setGeometry(static_cast<QWidget*>(owner)->rect());
+            return true;
+        }
+    } staleResize;
+    staleResize.surface = surface;
+    if (qEnvironmentVariableIntValue("MAICHAT_TEST_STALE_DRAWABLE_NEGATIVE_CONTROL") == 1)
+        player.installEventFilter(&staleResize);
+    const auto matches = [](const QImage& first, const QImage& second) {
+        if (first.isNull() || second.isNull()) return false;
+        const auto sample = [](const QImage& image, double u, double v) {
+            const double scale = std::min(image.width() / 16.0, image.height() / 9.0);
+            return image.pixelColor(int((image.width() - 16 * scale) / 2 + u * 16 * scale),
+                int((image.height() - 9 * scale) / 2 + v * 9 * scale));
+        };
+        int error = 0;
+        for (double v : {0.2, 0.5, 0.8}) for (double u : {0.15, 0.35, 0.65, 0.85}) {
+            const QColor a = sample(first, u, v), b = sample(second, u, v);
+            error += std::abs(a.red() - b.red()) + std::abs(a.green() - b.green()) + std::abs(a.blue() - b.blue());
+        }
+        return error < 12 * 3 * 25;
+    };
+    for (QSize size : {QSize(1040, 680), QSize(520, 360), QSize(900, 580)}) {
+        const uint64_t before = player.presentedFrames();
+        if (!paused) {
+            for (int i = 0; i < 32; ++i) {
+                resizeFfplayTestNativeWindow(&player, QSize(520 + i * 15, 360 + i * 8));
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 3);
+            }
+        }
+        resizeFfplayTestNativeWindow(&player, size);
+        QTRY_COMPARE(player.size(), size);
+        QTRY_COMPARE(surface->size(), size);
+        QImage rendered;
+        QTRY_VERIFY2_WITH_TIMEOUT(([&] {
+            rendered = copyOwnedFfplayDrawable(probe.get());
+            return rendered.size() == surface->size() && matches(reference, rendered);
+        })(), qPrintable(QStringLiteral("Actual drawable %1x%2; video surface %3x%4")
+            .arg(rendered.width()).arg(rendered.height()).arg(surface->width()).arg(surface->height())), 4000);
+        if (!paused) QTRY_VERIFY_WITH_TIMEOUT(player.presentedFrames() > before, 2000);
+        qInfo() << "[owned-actual-drawable]" << rendered.size() << "content scaled across actual video area";
+    }
+    probe.reset();
+    player.close();
+#else
+    QSKIP("Own Cocoa/Metal drawable regression");
+#endif
+}
+
+void MaiFfplayVideoDialogTest::macVideoResizeKeepsActualNativeLayerAligned() {
+#if defined(Q_OS_MAC)
+    MaiFfplayVideoDialog player(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE));
+    auto* volume = player.findChild<QSlider*>(QStringLiteral("ffplayVolumeSlider"));
+    QVERIFY(volume);
+    volume->setValue(0);
+    showOwnTestWindow(&player);
+    QTRY_VERIFY_WITH_TIMEOUT(player.presentedFrames() > 0, 10000);
+    auto* surface = player.findChild<QWidget*>(QStringLiteral("ffplayVideoSurface"));
+    QVERIFY(surface);
+    for (const QSize size : {QSize(640, 400), QSize(1040, 680), QSize(520, 360), QSize(900, 580)}) {
+        resizeFfplayTestNativeWindow(&player, size);
+        QTRY_COMPARE(player.size(), size);
+        QTRY_COMPARE(surface->size(), player.size());
+        QTest::qWait(100);
+        const auto native = ffplayTestVideoLayerGeometry(surface);
+        qInfo() << "[owned-native-resize]" << size << native;
+        QVERIFY2(native.contains("metalLayerWidth"), "Owned SDR MKV must use the real Metal layer");
+        QCOMPARE(native.value("nativeWidth").toInt(), surface->width());
+        QCOMPARE(native.value("nativeHeight").toInt(), surface->height());
+        QCOMPARE(native.value("metalLayerWidth").toInt(), surface->width());
+        QCOMPARE(native.value("metalLayerHeight").toInt(), surface->height());
+        QCOMPARE(native.value("shownMetalWidth").toInt(), surface->width());
+        QCOMPARE(native.value("shownMetalHeight").toInt(), surface->height());
+    }
+    player.close();
+#else
+    QSKIP("Own Cocoa/Metal geometry regression");
+#endif
+}
+
+void MaiFfplayVideoDialogTest::macVideoHudFollowsAnotherOwnedWindowActivation() {
+#if defined(Q_OS_MAC)
+    RemoteIMApplication app(QStringLiteral("owned-resize-user"), std::make_unique<FakeRemoteIMClient>());
+    MainWindow main(app);
+    main.resize(1100, 760);
+    showOwnTestWindow(&main);
+    MaiFfplayVideoDialog player(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE), &main);
+    auto* volume = player.findChild<QSlider*>(QStringLiteral("ffplayVolumeSlider"));
+    QVERIFY(volume);
+    volume->setValue(0);
+    showOwnTestWindow(&player);
+    QTRY_VERIFY_WITH_TIMEOUT(player.presentedFrames() > 0, 10000);
+    player.resize(900, 580);
+    auto* header = player.findChild<QWidget*>(QStringLiteral("ffplayTitleBar"));
+    auto* footer = player.findChild<QWidget*>(QStringLiteral("ffplayOverlay"));
+    QVERIFY(header && footer);
+    QTRY_VERIFY(header->isVisible() && footer->isVisible());
+    main.raise();
+    QTest::qWait(200);
+    const auto nativeMain = ffplayTestVideoLayerGeometry(&main);
+    const auto nativePlayer = ffplayTestVideoLayerGeometry(&player);
+    const auto nativeHeader = ffplayTestVideoLayerGeometry(header);
+    const auto nativeFooter = ffplayTestVideoLayerGeometry(footer);
+    qInfo() << "[owned-hud-native-zorder] main" << nativeMain << "player" << nativePlayer
+            << "header" << nativeHeader << "footer" << nativeFooter;
+    if (nativeMain.value("windowOrder").toInt() < nativePlayer.value("windowOrder").toInt()) {
+        QVERIFY(nativeHeader.value("windowOrder").toInt() >= 0);
+        QVERIFY(nativeFooter.value("windowOrder").toInt() >= 0);
+        QVERIFY2(!header->isVisible() || nativeHeader.value("windowOrder").toInt() >
+                     nativeMain.value("windowOrder").toInt(), "Header floated above a window covering its owner");
+        QVERIFY2(!footer->isVisible() || nativeFooter.value("windowOrder").toInt() >
+                     nativeMain.value("windowOrder").toInt(), "Footer floated above a window covering its owner");
+    }
+    activateOwnTestWindow(&main);
+    QTRY_VERIFY(QApplication::activeWindow() == &main);
+    QTest::qWait(300);
+    qInfo() << "[owned-hud-main-activation]" << QApplication::activeWindow()
+            << "header" << header->isVisible() << "footer" << footer->isVisible();
+    QVERIFY(!header->isVisible() && !footer->isVisible());
+    QVERIFY(player.isVisible() && player.isStarted());
+    activateOwnTestWindow(&player);
+    QTRY_VERIFY(header->isVisible() && footer->isVisible());
+    player.close();
+    main.close();
+#else
+    QSKIP("Own Cocoa window ownership regression");
+#endif
+}
+
+// 创作中心普通入口与 IM 使用同一个 Dialog；稳定全屏的关闭不能先展示还原窗口。
+void MaiFfplayVideoDialogTest::creationVideoClosesWithoutShowingWindowedPlayer() {
+#if defined(Q_OS_MAC)
+    RemoteIMApplication app(QStringLiteral("owned-creation-close"), std::make_unique<FakeRemoteIMClient>());
+    MainWindow main(app);
+    showOwnTestWindow(&main);
+    const QString file = QFileInfo(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE))
+                             .dir().filePath(QStringLiteral("../../../desktop/tests/fixtures/video-circle-61s.mp4"));
+    QVERIFY(main.openVideoWindow(file, {}));
+    QPointer<MaiFfplayVideoDialog> player = MaiFfplayVideoDialog::activeDialog();
+    QVERIFY(player);
+    player->findChild<QSlider*>(QStringLiteral("ffplayVolumeSlider"))->setValue(0);
+    QTRY_VERIFY_WITH_TIMEOUT(player->presentedFrames() > 0, 10000);
+    activateOwnTestWindow(player);
+    qInfo() << "[creation-activation]" << ffplayTestNativeState(player) << ffplayTestVideoLayerGeometry(player);
+    QTRY_VERIFY2_WITH_TIMEOUT(ownTestWindowIsForeground(player), qPrintable(ffplayTestNativeState(player)), 3000);
+    int entered = 0;
+    void* observer = maiObserveMacVideoFullscreen(player, &entered,
+        [](void* value, MaiMacFullscreenPhase phase) {
+            if (phase == MaiMacFullscreenPhase::DidEnter) ++*static_cast<int*>(value);
+        });
+    QVERIFY(observer);
+    const auto release = qScopeGuard([&] { maiReleaseMacVideoFullscreenObserver(observer); });
+    qInfo() << "[creation-fullscreen-precondition]" << ffplayTestNativeState(player)
+            << ffplayTestVideoLayerGeometry(player);
+    player->findChild<QPushButton*>(QStringLiteral("ffplayFullscreenButton"))->click();
+    QTRY_VERIFY_WITH_TIMEOUT(entered == 1, 7000);
+    QTest::qWait(100);
+    QVERIFY(ffplayTestVideoLayerGeometry(player).value("nativeFullscreen").toBool());
+    player->findChild<QPushButton*>(QStringLiteral("ffplayCloseButton"))->click();
+    const bool immediatelyHidden = !player || !ffplayTestVideoLayerGeometry(player).value("windowVisible").toBool();
+    qInfo() << "[creation-close-native] immediatelyHidden" << immediatelyHidden
+            << "logicalVisible" << (player && player->isVisible());
+    // 即使旧实现失败，也先自然完成原关闭流程，不能让 fixture 析构打断 AppKit 转场。
+    QTRY_VERIFY_WITH_TIMEOUT(player.isNull(), 7000);
+    QVERIFY2(immediatelyHidden, "Close restored a visible window before closing it");
+    maiReleaseMacVideoFullscreenObserver(observer);
+    observer = nullptr;
+    // 同进程再次打开并等待真实 DidEnter，防止直接关闭破坏下一播放器的 AppKit 生命周期。
+    QVERIFY(main.openVideoWindow(file, {}));
+    player = MaiFfplayVideoDialog::activeDialog();
+    QVERIFY(player);
+    player->findChild<QSlider*>(QStringLiteral("ffplayVolumeSlider"))->setValue(0);
+    QTRY_VERIFY_WITH_TIMEOUT(player->presentedFrames() > 0, 10000);
+    activateOwnTestWindow(player);
+    qInfo() << "[creation-activation]" << ffplayTestNativeState(player) << ffplayTestVideoLayerGeometry(player);
+    QTRY_VERIFY2_WITH_TIMEOUT(ownTestWindowIsForeground(player), qPrintable(ffplayTestNativeState(player)), 3000);
+    entered = 0;
+    observer = maiObserveMacVideoFullscreen(player, &entered,
+        [](void* value, MaiMacFullscreenPhase phase) {
+            if (phase == MaiMacFullscreenPhase::DidEnter) ++*static_cast<int*>(value);
+        });
+    QVERIFY(observer);
+    qInfo() << "[creation-fullscreen-precondition]" << ffplayTestNativeState(player)
+            << ffplayTestVideoLayerGeometry(player);
+    player->findChild<QPushButton*>(QStringLiteral("ffplayFullscreenButton"))->click();
+    QTRY_VERIFY_WITH_TIMEOUT(entered == 1, 7000);
+    QTest::qWait(100);
+    QVERIFY(ffplayTestVideoLayerGeometry(player).value("nativeFullscreen").toBool());
+    player->findChild<QPushButton*>(QStringLiteral("ffplayCloseButton"))->click();
+    QVERIFY(!player || !ffplayTestVideoLayerGeometry(player).value("windowVisible").toBool());
+    QTRY_VERIFY_WITH_TIMEOUT(player.isNull(), 7000);
+    QVERIFY(main.isVisible());
+    main.close();
+#else
+    QSKIP("Own Cocoa fullscreen close regression");
+#endif
+}
+
 void MaiFfplayVideoDialogTest::ownedHudTracksOwnerAndForwardsKeys() {
     const QString path = QFileInfo(QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE))
                              .dir()

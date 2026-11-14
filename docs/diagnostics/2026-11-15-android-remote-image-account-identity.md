@@ -58,5 +58,6 @@ server-side renewal success. The earlier 63 passing client tests were insufficie
 establish the real account-domain boundary.
 
 The subsequent scalar-only observation reported `FILE_ERROR`, HTTP 200 and curl code 0.
-The separate Android atomic-file cause is recorded in
-`2026-11-15-android-image-atomic-save.md`; the generic UI text did not identify that cause.
+The separate Android atomic-file cause and the successful ordinary279 image/preview
+verification are recorded in `2026-11-15-android-image-atomic-save.md`; the generic UI
+text did not identify that cause. Both fixes are needed for the real image path.

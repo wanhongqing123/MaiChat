@@ -47,7 +47,16 @@ flush/fsync, size verification and cancellation retain their existing behavior.
   the new late-writer and canceled-new-file cases. Normal desktop libraries were read
   only and remained byte-identical.
 
-These checks include the actual run-as file policy but do not substitute for a normal
-zygote App process. Normal 279 / 2.2.37 build, installation and the original image retry
-remain the final verification step at this source checkpoint. No Android security
-policy or user file was changed.
+Normal 279 / 2.2.37 was then built from
+`af855aa8de85f1e630eef24f03dc46ce3eb026f0` and installed with data retained.
+APK SHA-256: `c577fa12e23ca138ee2260d7d5f43fda91c2b65fd64c21fbc25d297ccfc83f35`.
+The new Agent JNI exactly matches the stripped normal build output, retains its exported
+ABI and runtime dependencies, and does not import the API30 wrapper. The other 25 native
+libraries, model bytes and signing certificate match the verified baseline.
+
+The ordinary zygote App at PID 29462 displayed multiple existing remote conversation
+images and opened their normal image preview. This closes the actual Android App-policy
+boundary left by the run-as probe. Evidence:
+`.cache/android-native-noreplace-20261115/normal279/rendered.png`, `preview.xml` and
+`runtime-physical.json`. No security policy or user file was changed. Existing valid
+publication reads do not alone prove a production24h expiry or every republication path.

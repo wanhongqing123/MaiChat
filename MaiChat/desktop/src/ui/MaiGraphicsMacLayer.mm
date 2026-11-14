@@ -101,6 +101,62 @@ extern "C" void maiGraphicsStyleMacVideoWindow(QWidget *widget) {
   window.backgroundColor = [NSColor colorWithCalibratedRed:0.03 green:0.05 blue:0.08 alpha:1.0];
 }
 
+extern "C" void maiGraphicsAlignMacVideoHuds(QWidget *owner, QWidget *header, QWidget *footer) {
+  if (!owner || !header || !footer || QGuiApplication::platformName() != QStringLiteral("cocoa"))
+    return;
+  NSWindow *ownerWindow = reinterpret_cast<NSView *>(owner->winId()).window;
+  NSWindow *headerWindow = reinterpret_cast<NSView *>(header->winId()).window;
+  NSWindow *footerWindow = reinterpret_cast<NSView *>(footer->winId()).window;
+  if (!ownerWindow || !headerWindow || !footerWindow)
+    return;
+  // Qt::Tool 默认浮在 App 所有普通窗之上；QObject/transient owner 并不限制该层级。
+  // 保留 Qt 管理的同一对窗口，以 owner 的层级和相邻顺序显示，不重建或重设 parent。
+  headerWindow.level = footerWindow.level = ownerWindow.level;
+  // Cocoa 的 Qt::Tool 默认还带 Resizable。原生边角可先截获拖动，只拉大 HUD，
+  // 视频 owner 完全收不到 resize；HUD 只能由 owner 布局，拖动仍交还共用 Qt 处理。
+  for (NSWindow *hud : @[headerWindow, footerWindow]) {
+    if (hud.styleMask & NSWindowStyleMaskResizable)
+      hud.styleMask &= ~NSWindowStyleMaskResizable;
+  }
+  NSArray<NSNumber *> *windows = [NSWindow windowNumbersWithOptions:0];
+  const NSUInteger ownerOrder = [windows indexOfObject:@(ownerWindow.windowNumber)];
+  if (ownerOrder == NSNotFound)
+    return;
+  bool realign = false;
+  for (NSWindow *hud : @[headerWindow, footerWindow]) {
+    const NSUInteger hudOrder = [windows indexOfObject:@(hud.windowNumber)];
+    if (hudOrder == NSNotFound)
+      continue;
+    if (hudOrder > ownerOrder) {
+      realign = true;
+      continue;
+    }
+    for (NSUInteger index = hudOrder + 1; index < ownerOrder; ++index) {
+      if (![windows[index] isEqualToNumber:@(headerWindow.windowNumber)] &&
+          ![windows[index] isEqualToNumber:@(footerWindow.windowNumber)])
+        realign = true;
+    }
+  }
+  // 只修复 owner/HUD 倒序或被其它主窗隔开的次序。相邻于 owner 上方，不能抢到
+  // 盖住 owner 的主窗、菜单或其它应用之前；正常鼠标移动不重复 raise。
+  if (realign) {
+    [headerWindow orderWindow:NSWindowAbove relativeTo:ownerWindow.windowNumber];
+    [footerWindow orderWindow:NSWindowAbove relativeTo:ownerWindow.windowNumber];
+  }
+}
+
+extern "C" void maiGraphicsHideMacClosingVideoWindow(QWidget *widget) {
+  if (!widget || QGuiApplication::platformName() != QStringLiteral("cocoa"))
+    return;
+  NSWindow *window = reinterpret_cast<NSView *>(widget->winId()).window;
+  if (!window)
+    return;
+  // 关闭已请求退出全屏后立即撤出显示，窗口和 Qt delegate 继续存活到 DidExit。
+  // 不销毁原生宿主，也不展示 showNormal 的中间窗口。
+  window.animationBehavior = NSWindowAnimationBehaviorNone;
+  [window orderOut:nil];
+}
+
 extern "C" void maiGraphicsShareMacVideo(QWidget *anchor, const char *utf8Path) {
   if (!anchor || !utf8Path || !*utf8Path)
     return;

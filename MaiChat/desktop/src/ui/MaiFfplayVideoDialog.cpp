@@ -51,6 +51,7 @@
 #include <QThread>
 #include <QTimer>
 #include <QToolButton>
+#include <QToolTip>
 #include <QUrl>
 #include <QVBoxLayout>
 
@@ -69,6 +70,8 @@ extern "C" void maiGraphicsResizeMacLayer(void* nativeLayer, QWidget* widget);
 extern "C" void maiGraphicsRetainMacLayer(void* nativeLayer);
 extern "C" void maiGraphicsReleaseMacLayer(void* nativeLayer);
 extern "C" void maiGraphicsStyleMacVideoWindow(QWidget* widget);
+extern "C" void maiGraphicsAlignMacVideoHuds(QWidget* owner, QWidget* header, QWidget* footer);
+extern "C" void maiGraphicsHideMacClosingVideoWindow(QWidget* widget);
 extern "C" void maiGraphicsShareMacVideo(QWidget* anchor, const char* utf8Path);
 #endif
 
@@ -258,7 +261,8 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     const QString flatButton = QStringLiteral(
         "QPushButton,QToolButton { color:#f4f4f4;background:transparent;border:0;"
         "border-radius:5px;padding:0; }"
-        "QPushButton:hover,QToolButton:hover { background:#2b2b2b; }"
+        // 悬停不绘制色块；保留按压反馈及原有无障碍名称。
+        "QPushButton:hover,QToolButton:hover { background:transparent; }"
         "QPushButton:pressed,QToolButton:pressed { background:#3a3a3a; }"
         "QToolButton::menu-indicator { image:none;width:0; }");
     const auto tool = [&](const char* name, const char* icon, const QString& tip) {
@@ -335,7 +339,6 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
     auto* minimize = button(titleBar_, "ffplayMinimizeButton", "minimize", QStringLiteral("最小化"));
     maximizeButton_ = button(titleBar_, "ffplayMaximizeButton", "maximize", QStringLiteral("最大化"));
     auto* close = button(titleBar_, "ffplayCloseButton", "close", QStringLiteral("关闭视频"));
-    close->setStyleSheet(flatButton + QStringLiteral("QPushButton:hover {background:#c42b1c;}"));
     header->addWidget(minimize);
     header->addWidget(maximizeButton_);
     header->addWidget(close);
@@ -597,7 +600,10 @@ void MaiFfplayVideoDialog::updateControlLayout() {
     if (!overlay_ || !titleBar_ || !surface_) return;
     const int controlsHeight = 84;
     // 普通窗口与全屏均覆盖完整视频，控件显隐不改变画面比例或引入固定黑色 footer。
-    const bool shown = isVisible() && !isMinimized() && hudOwnerActive_ && (!isFullScreen() || controlsVisible_);
+    bool shown = isVisible() && !isMinimized() && hudOwnerActive_ && (!isFullScreen() || controlsVisible_);
+#if defined(Q_OS_MAC)
+    shown = shown && !closeAfterFullscreen_;
+#endif
     const QPoint origin = mapToGlobal(QPoint());
     titleBar_->setGeometry(QRect(origin, QSize(width(), 46)));
     titleBar_->setStyleSheet(
@@ -614,13 +620,16 @@ void MaiFfplayVideoDialog::updateControlLayout() {
     titleBar_->setVisible(shown);
     overlay_->setVisible(shown);
 #if defined(Q_OS_MAC)
+    if (shown) {
+        maiGraphicsAlignMacVideoHuds(this, titleBar_, overlay_);
+    }
     // 保留两个 Tool 窗口和焦点关系；只在 AppKit 转场中令其不可见，避免旧尺寸
     // HUD 叠在窗口转场快照上。不能 orderOut，否则会打断原生 Space 的窗口组转场。
     const qreal opacity = nativeFullscreenTransition_ ? 0.0 : 1.0;
     titleBar_->setWindowOpacity(opacity);
     overlay_->setWindowOpacity(opacity);
 #endif
-    // 原生 owner 关系保证 HUD 位于播放器之上；不反复 raise，否则会把 Popup 压回 owner 后面。
+    // HUD 跟随播放器显示与排序；不置顶整个 App，否则会盖住其它主窗或 Popup。
     errorLabel_->setGeometry(40, std::max(0, (surface_->height() - 64) / 2), std::max(1, width() - 80), 64);
     if (errorLabel_->isVisible()) errorLabel_->raise();
     bufferingIndicator_->move(surface_->rect().center() - bufferingIndicator_->rect().center());
@@ -727,7 +736,10 @@ void MaiFfplayVideoDialog::updatePlayButton() {
 
 void MaiFfplayVideoDialog::revealControls() {
     controlsVisible_ = true;
-    const bool shown = isVisible() && !isMinimized() && hudOwnerActive_;
+    bool shown = isVisible() && !isMinimized() && hudOwnerActive_;
+#if defined(Q_OS_MAC)
+    shown = shown && !closeAfterFullscreen_;
+#endif
     if (titleBar_) {
         titleBar_->setVisible(shown);
     }
@@ -735,6 +747,11 @@ void MaiFfplayVideoDialog::revealControls() {
     if (overlay_) {
         overlay_->setVisible(shown);
     }
+#if defined(Q_OS_MAC)
+    if (shown) {
+        maiGraphicsAlignMacVideoHuds(this, titleBar_, overlay_);
+    }
+#endif
     for (QWidget* widget : {static_cast<QWidget*>(this), surface_, titleBar_, overlay_})
         if (widget) widget->unsetCursor();
     scheduleControlHide();
@@ -824,12 +841,11 @@ void MaiFfplayVideoDialog::minimizeWindow() {
 
 #if defined(Q_OS_MAC)
 void MaiFfplayVideoDialog::applyMacFullscreenRequest() {
-    if (!fullscreenRequestPending_ || nativeFullscreenTransition_ || !isVisible()) return;
+    if (!fullscreenRequestPending_ || nativeFullscreenTransition_ || (!isVisible() && !closeAfterFullscreen_)) return;
     if (requestedFullscreen_ == isFullScreen()) {
         fullscreenRequestPending_ = false;
         if (!requestedFullscreen_ && closeAfterFullscreen_) {
             // 直到 DidExit 之后才允许 Qt 真正关闭/删除窗口，保留转场期间的原生宿主。
-            closeAfterFullscreen_ = false;
             QMetaObject::invokeMethod(this, [this] { close(); }, Qt::QueuedConnection);
             return;
         }
@@ -856,6 +872,8 @@ void MaiFfplayVideoDialog::applyMacFullscreenRequest() {
     if (requestedFullscreen_) showFullScreen();
     else if (hasPendingWindowedState_ ? pendingWindowedMaximized_ : windowWasMaximized_) showMaximized();
     else showNormal();
+    if (closeAfterFullscreen_ && !requestedFullscreen_)
+        maiGraphicsHideMacClosingVideoWindow(this);
 }
 
 void MaiFfplayVideoDialog::onMacFullscreenPhase(MaiMacFullscreenPhase phase) {
@@ -874,7 +892,7 @@ void MaiFfplayVideoDialog::onMacFullscreenPhase(MaiMacFullscreenPhase phase) {
     if (!fullscreenRequestPending_) requestedFullscreen_ = entering;
     // 等 Qt 的原生 delegate 也完成本次状态同步，再处理最后的排队意图。
     QMetaObject::invokeMethod(this, [this] {
-        if (!isVisible()) return;
+        if (!isVisible() && !closeAfterFullscreen_) return;
         applyMacFullscreenRequest();
         updateControlLayout();
         revealControls();
@@ -1508,14 +1526,15 @@ void MaiFfplayVideoDialog::showEvent(QShowEvent* event) {
 
 void MaiFfplayVideoDialog::closeEvent(QCloseEvent* event) {
 #if defined(Q_OS_MAC)
-    if (fullscreenObserver_ && (nativeFullscreenTransition_ || isFullScreen())) {
+    if (fullscreenObserver_ && (nativeFullscreenTransition_ || fullscreenRequestPending_ || isFullScreen())) {
         // 进入全屏尚未结束时直接销毁 NSWindow，会使后续窗口也收不到 DidEnter。
-        // 合并为退出再关闭；视频图层保持存活，关闭期间不额外重建或隐藏它。
+        // 已稳定全屏也必须完成 DidExit，否则后续窗口会丢 DidEnter；关闭期间撤出显示。
         closeAfterFullscreen_ = true;
         minimizeAfterFullscreen_ = false;
         hasPendingWindowedState_ = false;
         windowWasMaximized_ = false;
         applyFullscreen(false);
+        if (!isFullScreen()) maiGraphicsHideMacClosingVideoWindow(this);
         event->ignore();
         return;
     }
@@ -1527,6 +1546,9 @@ void MaiFfplayVideoDialog::closeEvent(QCloseEvent* event) {
     if (controlsHideTimer_) controlsHideTimer_->stop();
     stopPlayback(true);
     QDialog::closeEvent(event);
+#if defined(Q_OS_MAC)
+    closeAfterFullscreen_ = false;
+#endif
 }
 
 void MaiFfplayVideoDialog::resizeEvent(QResizeEvent* event) {
@@ -1642,6 +1664,18 @@ bool MaiFfplayVideoDialog::handleFrameMouse(QObject* watched, QEvent* event) {
 }
 
 bool MaiFfplayVideoDialog::eventFilter(QObject* watched, QEvent* event) {
+    if (event->type() == QEvent::ToolTip) {
+        // 播放器悬停不弹文字提示；控件仍保留 accessibleName 和动作说明，供无障碍读取。
+        QToolTip::hideText();
+        event->accept();
+        return true;
+    }
+#if defined(Q_OS_MAC)
+    if (watched == this && (event->type() == QEvent::ZOrderChange || event->type() == QEvent::WindowActivate)) {
+        // 等 AppKit 完成 owner 的排序，再恢复已有窗口组内部次序；不抢回前台。
+        QTimer::singleShot(0, this, [this] { updateControlLayout(); });
+    }
+#endif
     if (event->type() == QEvent::WindowStateChange && watched == this) {
         updateControlLayout();
         revealControls();
