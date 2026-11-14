@@ -5075,21 +5075,59 @@ void MainWindow::openSessionBindingDialog() {
   sessionBindingDialog_ = dialog;
   dialog->setObjectName(QStringLiteral("imSessionBindingDialog"));
   dialog->setWindowTitle(QStringLiteral("绑定创作中心会话"));
-  dialog->setMinimumWidth(UiZoom::s(360));
-  dialog->resize(UiZoom::s(500), UiZoom::s(420));
-  auto* layout = new QVBoxLayout(dialog);
-  layout->setContentsMargins(UiZoom::s(20), UiZoom::s(18), UiZoom::s(20), UiZoom::s(16));
+  // 沿用 App 输入/消息弹窗的白色圆角面板，避免系统列表和按钮与主界面割裂。
+  // 只调整呈现层；选择身份、工作目录 pin 与下面的刷新/确认守卫保持同一条路径。
+  dialog->setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint);
+  dialog->setAttribute(Qt::WA_TranslucentBackground, true);
+  dialog->setMinimumWidth(UiZoom::s(420));
+  dialog->resize(UiZoom::s(520), UiZoom::s(480));
+  auto* rootLayout = new QVBoxLayout(dialog);
+  rootLayout->setContentsMargins(UiZoom::s(18), UiZoom::s(18), UiZoom::s(18), UiZoom::s(18));
+  rootLayout->setSpacing(0);
+  auto* panel = new QFrame(dialog);
+  panel->setObjectName(QStringLiteral("imSessionBindingPanel"));
+  rootLayout->addWidget(panel);
+  auto* layout = new QVBoxLayout(panel);
+  layout->setContentsMargins(UiZoom::s(28), UiZoom::s(24), UiZoom::s(28), UiZoom::s(22));
   layout->setSpacing(UiZoom::s(12));
+  auto* heading = new QHBoxLayout;
+  auto* title = new QLabel(QStringLiteral("绑定会话"), panel);
+  title->setObjectName(QStringLiteral("imSessionBindingTitle"));
+  heading->addWidget(title);
+  heading->addStretch(1);
+  auto* close = new QPushButton(QStringLiteral("×"), panel);
+  close->setObjectName(QStringLiteral("imSessionBindingClose"));
+  close->setAccessibleName(QStringLiteral("关闭绑定会话"));
+  close->setToolTip(QStringLiteral("关闭"));
+  close->setFixedSize(UiZoom::s(30), UiZoom::s(30));
+  close->setAutoDefault(false);
+  close->setFocusPolicy(Qt::NoFocus);
+  close->setCursor(Qt::PointingHandCursor);
+  connect(close, &QPushButton::clicked, dialog, &QDialog::reject);
+  heading->addWidget(close);
+  layout->addLayout(heading);
   auto* introduction = new QLabel(
-      QStringLiteral("绑定时会将本机已保存的双向聊天记录作为历史上下文导入此会话，不为旧消息发起任务。完成后，新收到的好友消息才会交给它处理，回复自动发回原好友。"), dialog);
+      QStringLiteral("先导入本机聊天记录，再由此会话处理新消息并回复好友。"), panel);
+  introduction->setObjectName(QStringLiteral("imSessionBindingIntroduction"));
   introduction->setWordWrap(true);
   introduction->setTextFormat(Qt::PlainText);
   layout->addWidget(introduction);
-  auto* list = new QListWidget(dialog);
+  auto* section = new QLabel(QStringLiteral("选择创作中心会话"), panel);
+  section->setObjectName(QStringLiteral("imSessionBindingSection"));
+  layout->addWidget(section);
+  auto* list = new QListWidget(panel);
   list->setObjectName(QStringLiteral("imSessionBindingSessions"));
   list->setSelectionMode(QAbstractItemView::SingleSelection);
+  list->setUniformItemSizes(true);
+  list->setSpacing(UiZoom::s(4));
+  list->setTextElideMode(Qt::ElideRight);
+  list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   layout->addWidget(list, 1);
-  auto* error = new QLabel(dialog);
+  auto* note = new QLabel(QStringLiteral("旧消息仅作上下文，不触发任务。"), panel);
+  note->setObjectName(QStringLiteral("imSessionBindingNote"));
+  note->setWordWrap(true);
+  layout->addWidget(note);
+  auto* error = new QLabel(panel);
   error->setObjectName(QStringLiteral("imSessionBindingError"));
   error->setTextFormat(Qt::PlainText);
   error->setWordWrap(true);
@@ -5097,14 +5135,47 @@ void MainWindow::openSessionBindingDialog() {
   error->hide();
   layout->addWidget(error);
   auto* buttons = new QHBoxLayout;
+  buttons->setContentsMargins(0, UiZoom::s(6), 0, 0);
+  buttons->setSpacing(UiZoom::s(12));
   buttons->addStretch(1);
-  auto* cancel = new QPushButton(QStringLiteral("取消"), dialog);
-  auto* confirm = new QPushButton(QStringLiteral("绑定此会话"), dialog);
+  auto* cancel = new QPushButton(QStringLiteral("取消"), panel);
+  cancel->setObjectName(QStringLiteral("imSessionBindingCancel"));
+  auto* confirm = new QPushButton(QStringLiteral("导入历史并绑定"), panel);
   confirm->setObjectName(QStringLiteral("imSessionBindingConfirm"));
+  for (auto* button : {cancel, confirm}) {
+    button->setMinimumSize(UiZoom::s(104), UiZoom::s(40));
+    button->setCursor(Qt::PointingHandCursor);
+  }
   confirm->setEnabled(list->currentItem() != nullptr);
   buttons->addWidget(cancel);
   buttons->addWidget(confirm);
   layout->addLayout(buttons);
+  UiZoom::setStyle(dialog, QStringLiteral(
+      "QDialog#imSessionBindingDialog{background:transparent;}"
+      "QFrame#imSessionBindingPanel{background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;}"
+      "QLabel#imSessionBindingTitle{color:#0f172a;font-size:@heading3;font-weight:700;}"
+      "QLabel#imSessionBindingIntroduction{background:#eff8ff;border:1px solid #dceefb;"
+      "border-radius:10px;color:#48657d;font-size:@detail;padding:12px 14px;}"
+      "QLabel#imSessionBindingSection{color:#475569;font-size:@metadata;font-weight:600;}"
+      "QLabel#imSessionBindingNote{color:#66758c;font-size:@metadata;}"
+      "QListWidget#imSessionBindingSessions{background:#f8fafc;border:1px solid #e2e8f0;"
+      "border-radius:10px;padding:6px;color:#172033;font-size:@detail;outline:0;}"
+      "QListWidget#imSessionBindingSessions::item{background:#ffffff;border:1px solid transparent;"
+      "border-radius:8px;min-height:24px;padding:10px 12px;}"
+      "QListWidget#imSessionBindingSessions::item:hover{background:#edf5fc;}"
+      "QListWidget#imSessionBindingSessions::item:selected{background:#e3f3ff;"
+      "border-color:#b8def7;color:#0b67a7;}"
+      "QListWidget#imSessionBindingSessions::item:disabled{background:transparent;color:#94a3b8;}"
+      "QPushButton#imSessionBindingClose{background:transparent;border:0;border-radius:8px;"
+      "color:#64748b;font-size:@heading2;}"
+      "QPushButton#imSessionBindingClose:hover{background:#f1f5f9;color:#334155;}"
+      "QPushButton#imSessionBindingCancel,QPushButton#imSessionBindingConfirm{"
+      "border-radius:10px;font-size:@detail;font-weight:700;padding:10px 22px;}"
+      "QPushButton#imSessionBindingCancel{color:#66758c;background:#f6f9fc;border:1px solid #d8e2f0;}"
+      "QPushButton#imSessionBindingCancel:hover{background:#edf4fb;}"
+      "QPushButton#imSessionBindingConfirm{background:#0f8dde;color:#ffffff;border:0;}"
+      "QPushButton#imSessionBindingConfirm:hover{background:#087fc9;}"
+      "QPushButton#imSessionBindingConfirm:disabled{background:#acd2ea;color:#e8f4fb;}"));
   connect(cancel, &QPushButton::clicked, dialog, &QDialog::reject);
   connect(list, &QListWidget::currentItemChanged, dialog, [confirm](QListWidgetItem* item) {
     confirm->setEnabled(item && (item->flags() & Qt::ItemIsEnabled));

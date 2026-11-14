@@ -99,6 +99,11 @@ struct Fixture {
                 if (list->item(row)->data(Qt::UserRole).toString() == sessionId) list->setCurrentRow(row);
             selected = list->currentItem() && confirm->isEnabled();
             captured = captureOwnedWidget(*picker, QStringLiteral("session-binding-picker"));
+            if (!qEnvironmentVariableIsEmpty("MAICHAT_SESSION_IM_UI_EVIDENCE_DIR") && list->count() > 1) {
+                list->scrollToTop();
+                captured = captureOwnedWidget(*picker, QStringLiteral("session-binding-picker-long-list")) && captured;
+                if (list->currentItem()) list->scrollToItem(list->currentItem());
+            }
             if (selected) confirm->click();
             else picker->reject();
         });
@@ -133,6 +138,13 @@ void DesktopSessionImBindingUiTest::pickerBindsExistingSessionWithoutSubmitting(
     f.show();
     QVERIFY(QTest::qWaitForWindowExposed(f.window.get()));
     const QString session = f.session();
+    // 静态视觉取证用普通会话入口准备多行和长标题，不改绑定断言或触发模型请求。
+    if (!qEnvironmentVariableIsEmpty("MAICHAT_SESSION_IM_UI_EVIDENCE_DIR")) {
+        for (const auto& title : {QStringLiteral("自有会话 · 周计划"), QStringLiteral("自有会话 · 资料整理"),
+                                  QStringLiteral("自有会话 · 产品需求、问题跟踪与本周回归验证的较长标题"),
+                                  QStringLiteral("自有会话 · 旅行笔记")})
+            f.session(title);
+    }
     auto* command = f.window->findChild<QPushButton*>(QStringLiteral("composerCommandButton"));
     QVERIFY(f.entry() && command && f.boundName());
     QVERIFY(QFile::exists(QStringLiteral(":/maichat/icons/ai-sparkles.svg")));
@@ -246,6 +258,7 @@ void DesktopSessionImBindingUiTest::anotherPeerCannotReuseTheBoundSession() {
     QVERIFY(f.bind(session));
     f.app.selectPeer(QStringLiteral("owned-ui-other"));
     bool unavailable = false;
+    bool captured = true;
     QTimer::singleShot(0, f.window.get(), [&] {
         auto* picker = f.window->findChild<QDialog*>(QStringLiteral("imSessionBindingDialog"));
         QVERIFY(picker);
@@ -254,10 +267,12 @@ void DesktopSessionImBindingUiTest::anotherPeerCannotReuseTheBoundSession() {
         for (int row = 0; row < list->count(); ++row)
             if (list->item(row)->data(Qt::UserRole).toString() == session)
                 unavailable = !(list->item(row)->flags() & Qt::ItemIsEnabled);
+        captured = captureOwnedWidget(*picker, QStringLiteral("session-binding-unavailable-picker"));
         picker->reject();
     });
     f.entry()->click();
     QVERIFY(unavailable);
+    QVERIFY(captured);
     QVERIFY(!f.boundName()->isVisible());
     QVERIFY(f.im->lastText().isEmpty());
 }
