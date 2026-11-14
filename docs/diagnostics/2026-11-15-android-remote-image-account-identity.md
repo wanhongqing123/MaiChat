@@ -42,6 +42,21 @@ the account guard or uploading an otherwise healthy image again.
 
 ## Verification boundary
 
-At this evidence checkpoint, the physical failure and the three regression failures are
-confirmed. The corrected normal APK, same-card physical retry and any server-side renewal
-acceptance are still pending; no success is inferred from the earlier 63 passing client tests.
+The correction in `23f8ee74747f8480f0a4c78ede469a9aea854952` passed 43 targeted
+Controller/cache/adapter cases and 28 affected drawer/history cases, with no failures or
+skips. Normal version 278 / 2.2.36 built successfully; its APK SHA-256 is
+`806397e6360c85e505eb9007c1f2e6d759e008260356464f41e41ea1eb157c5f`.
+The signature matches the installed baseline and all 26 native libraries and the bundled
+model match the previously verified normal package. Data-preserving installation succeeded;
+ordinary launch was verified at PID 21925.
+
+Physical old-image reads no longer fail with the account-switch error. They next reached
+a generic network/service failure, preserved in
+`.cache/android-image-auth-identity-20261115/normal278/images.png`. That remaining failure
+is being diagnosed separately; this checkpoint does not claim visible-image acceptance or
+server-side renewal success. The earlier 63 passing client tests were insufficient to
+establish the real account-domain boundary.
+
+The subsequent scalar-only observation reported `FILE_ERROR`, HTTP 200 and curl code 0.
+The separate Android atomic-file cause is recorded in
+`2026-11-15-android-image-atomic-save.md`; the generic UI text did not identify that cause.

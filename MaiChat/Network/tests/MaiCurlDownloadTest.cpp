@@ -46,11 +46,15 @@ bool exists(const std::string& path) {
 
 struct ProxyCalls {
     std::vector<std::string> urls;
+    std::string publishTarget;
 };
 
 int resolveProxy(const char* url, void* context, MaiDownloadProxy* output) {
     auto* calls = static_cast<ProxyCalls*>(context);
     calls->urls.emplace_back(url);
+    // The target appears after the downloader has created its sibling temp file.
+    // Commit must reject this real late writer atomically, without replacing it.
+    if (!calls->publishTarget.empty()) write(calls->publishTarget, "late workspace writer");
     *output = {"", nullptr, nullptr};
     return 1;
 }
@@ -100,6 +104,18 @@ int main(int argc, char** argv) {
     mai_download_new_file(&options, expected, nullptr, &result);
     require(result.status == MAI_DOWNLOAD_WRITE_ERROR && read(fresh) == "keep existing",
             "original download replaced a workspace file");
+
+    const std::string raced = directory + "/late-original.bin";
+    ProxyCalls lateWriter;
+    lateWriter.publishTarget = raced;
+    options.target_path_utf8 = raced.c_str();
+    options.proxy_resolver = resolveProxy;
+    options.proxy_context = &lateWriter;
+    mai_download_new_file(&options, expected, nullptr, &result);
+    require(result.status == MAI_DOWNLOAD_WRITE_ERROR && read(raced) == "late workspace writer",
+            "original commit replaced a target created while its download was starting");
+    options.proxy_resolver = nullptr;
+    options.proxy_context = nullptr;
     options.target_path_utf8 = target.c_str();
 
     options.ca_pem = nullptr;
@@ -183,6 +199,20 @@ int main(int argc, char** argv) {
     mai_download_cancel_destroy(cancel);
     require(result.status == MAI_DOWNLOAD_CANCELED, "in-flight cancel not reported");
     require(read(target) == "old", "canceled transfer changed existing file");
+
+    const std::string canceledNew = directory + "/canceled-new-original.bin";
+    options.target_path_utf8 = canceledNew.c_str();
+    std::remove(marker.c_str());
+    cancel = mai_download_cancel_create();
+    require(cancel != nullptr, "new-file cancellation handle allocation failed");
+    std::thread newWorker([&] { mai_download_new_file(&options, 1024, cancel, &result); });
+    for (int i = 0; i < 100 && !exists(marker); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    require(exists(marker), "new-file slow response never started");
+    mai_download_cancel_request(cancel);
+    newWorker.join();
+    mai_download_cancel_destroy(cancel);
+    require(result.status == MAI_DOWNLOAD_CANCELED && !exists(canceledNew),
+            "canceled new-file download published a partial target");
     std::cout << "local TLS downloader cases passed" << std::endl;
     return 0;
 }

@@ -18,6 +18,11 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#ifdef __ANDROID__
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/syscall.h>
+#endif
 #endif
 
 struct MaiDownloadCancel {
@@ -241,10 +246,20 @@ public:
         if (replaceExisting) {
             if (rename(path_.c_str(), finalPath_.c_str()) != 0) return false;
         } else {
+#ifdef __ANDROID__
+            // Android app-data policy can forbid hard links. The no-replace rename
+            // publishes the complete sibling file atomically and rejects EEXIST.
+            // Use the syscall because bionic's wrapper requires API 30 while the
+            // product supports API 26. Unsupported/denied filesystems fail closed;
+            // exists()+rename() would overwrite a competing file in the race.
+            if (syscall(__NR_renameat2, AT_FDCWD, path_.c_str(), AT_FDCWD, finalPath_.c_str(), RENAME_NOREPLACE) != 0)
+                return false;
+#else
             // link publishes the complete inode atomically and rejects EEXIST;
             // a preceding exists() check would race another workspace writer.
             if (link(path_.c_str(), finalPath_.c_str()) != 0) return false;
             unlink(path_.c_str());
+#endif
         }
 #endif
         path_.clear();
