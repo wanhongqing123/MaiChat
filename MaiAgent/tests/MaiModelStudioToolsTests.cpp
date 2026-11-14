@@ -1,6 +1,6 @@
 // 文件作用：验证“封装阿里云百炼媒体模型任务与状态查询”的正确行为和边界条件。
-// 验证入口：testRevisionIsSessionBound、testOtherSpecialistBoundaries、
-// testLiveWan3WhenExplicitlyConfigured；检查可观察结果而非实现细节。
+// 验证入口：testWanVideoGenerationIsTemporarilyDisabled、testOtherSpecialistBoundaries；
+// 暂停必须先于凭据和上传；其他媒体与已提交任务的管理边界保持可观察。
 #include "MaiModelStudioTools.h"
 
 #include <json.hpp>
@@ -28,7 +28,70 @@ int failures = 0;
         }                                                                                \
     } while (false)
 
-void testRevisionIsSessionBound() {
+// 暂停必须发生在宿主凭据与素材上传之前，旧工厂指针也不能继续创建费用。
+// 空凭据使原实现的 RED 也不会触达网络；真实任务仅存在于自有内存存储。
+void testWanVideoGenerationIsTemporarilyDisabled() {
+    int credentialReads = 0;
+    int uploads = 0;
+    auto tool = makeMaiWanVideoTool(
+        [&] {
+            ++credentialReads;
+            return MaiWanCredentials{};
+        },
+        {},
+        [&](const std::string&, const MaiToolContext&) -> MaiResult<std::string> {
+            ++uploads;
+            return {MaiErrorCode::Network, "Synthetic upload must not be reached"};
+        });
+    auto store = makeMaiMemoryStore();
+    MaiSession owner;
+    owner.id = "disabled-wan-owner";
+    store->putSession(owner);
+    MaiSpecialistTask previous;
+    previous.id = MaiIdGenerator::generate("spt_");
+    previous.ownerSessionId = owner.id;
+    previous.specialistName = "wan_video";
+    previous.providerTaskId = "owned-provider-task";
+    CHECK(!store->insertSpecialistTask(previous));
+    MaiToolContext context;
+    context.root = MaiFileSystem::temporaryDirectory().toUtf8();
+    context.sessionId = owner.id;
+    context.specialistTasks = store.get();
+    const auto checkDisabled = [&](const nlohmann::json& request) {
+        const std::string raw = request.dump();
+        CHECK(!tool->requiresApproval(raw));
+        CHECK(!tool->requiresPerCallApproval(raw));
+        CHECK(!tool->requiresPaidApproval(raw));
+        const MaiToolResult result = tool->execute(raw, context);
+        CHECK(result.hasError());
+        const auto error = nlohmann::json::parse(result.error().message(), nullptr, false);
+        CHECK(error.is_object() && error.value("code", "") == "temporarily_disabled");
+        CHECK(result.execution().has_value());
+        if (result.execution()) {
+            CHECK(result.execution()->status == MaiToolExecutionStatus::NotStarted);
+            CHECK(result.execution()->effectStatus == MaiToolEffectStatus::None);
+            CHECK(result.execution()->started == false);
+        }
+        CHECK(credentialReads == 0);
+        CHECK(uploads == 0);
+    };
+    for (const char* mode : {"create", "edit", "extend", "reference"}) {
+        checkDisabled({{"action", "delegate"},
+                       {"message", "Owned video request"},
+                       {"mode", mode},
+                       {"duration", 5},
+                       {"resolution", "720P"},
+                       {"ratio", "adaptive"}});
+    }
+    checkDisabled(
+        {{"action", "revise"}, {"message", "Owned revision"}, {"conversation_id", previous.id}});
+    MaiSpecialistTask after;
+    CHECK(store->getSpecialistTask(previous.id, owner.id, after));
+    CHECK(after.providerTaskId == previous.providerTaskId);
+    CHECK(after.status == previous.status);
+}
+
+void testDisabledWanRevisionCannotReadForeignTask() {
     auto store = makeMaiMemoryStore();
     MaiSession owner;
     owner.id = "owner";
@@ -49,7 +112,7 @@ void testRevisionIsSessionBound() {
                                           .dump(),
                                       context);
     CHECK(result.hasError());
-    CHECK(result.error().message().find("not_found") != std::string::npos);
+    CHECK(result.error().message().find("temporarily_disabled") != std::string::npos);
 }
 
 // 验证百炼各媒体专家的输入限制、工具身份和任务状态边界。
@@ -58,9 +121,9 @@ void testOtherSpecialistBoundaries() {
     MaiWanCredentials credentials;
     auto video = makeMaiWanVideoTool([&] { return credentials; });
     auto image = makeMaiWanImageTool([&] { return credentials; });
-    CHECK(video->requiresPerCallApproval(R"({"action":"delegate"})"));
+    CHECK(!video->requiresPerCallApproval(R"({"action":"delegate"})"));
     CHECK(image->requiresPerCallApproval(R"({"action":"delegate"})"));
-    CHECK(video->requiresPaidApproval(R"({"action":"delegate"})"));
+    CHECK(!video->requiresPaidApproval(R"({"action":"delegate"})"));
     CHECK(image->requiresPaidApproval(R"({"action":"revise"})"));
     CHECK(!video->requiresPaidApproval(R"({"action":"cancel"})"));
     CHECK(!image->requiresPaidApproval(R"({"action":"continue"})"));
@@ -78,9 +141,12 @@ void testOtherSpecialistBoundaries() {
     CHECK(nlohmann::json::parse(videoInfo.output()).at("bound_model") == "wan3.0-video");
     CHECK(nlohmann::json::parse(imageInfo.output()).at("bound_model") == "wan2.7-image");
     CHECK(nlohmann::json::parse(videoInfo.output()).at("missing_configuration").size() == 2);
+    CHECK(nlohmann::json::parse(videoInfo.output()).at("generation_enabled") == false);
     CHECK(nlohmann::json::parse(imageInfo.output()).at("missing_configuration").size() == 2);
     credentials = {"test-key", "ws-test123"};
     CHECK(video->specialistInfo()->configured);
+    CHECK(video->specialistInfo()->capabilities.front().status ==
+          MaiSpecialistCapabilityStatus::TemporarilyDisabled);
     CHECK(image->specialistInfo()->configured);
     const nlohmann::json wanSchema = nlohmann::json::parse(video->parametersSchema());
     CHECK(wanSchema["properties"].contains("file_path"));
@@ -110,8 +176,7 @@ void testOtherSpecialistBoundaries() {
                                      {"prompt_extend", false}};
     const MaiToolResult invalidFileExtend = video->execute(filePlan.dump(), context);
     CHECK(invalidFileExtend.hasError());
-    CHECK(invalidFileExtend.error().message().find("prompt_extend must be true") !=
-          std::string::npos);
+    CHECK(invalidFileExtend.error().message().find("temporarily_disabled") != std::string::npos);
     nlohmann::json fileWithLink = filePlan;
     fileWithLink["link_url"] = "https://example.com/article";
     CHECK(video->execute(fileWithLink.dump(), context).hasError());
@@ -126,7 +191,7 @@ void testOtherSpecialistBoundaries() {
     const auto missingVideoPlan =
         video->execute(R"({"action":"delegate","message":"Create","mode":"create"})", context);
     CHECK(missingVideoPlan.hasError());
-    CHECK(missingVideoPlan.error().message().find("confirm duration") != std::string::npos);
+    CHECK(missingVideoPlan.error().message().find("temporarily_disabled") != std::string::npos);
     CHECK(video->execute(R"({"action":"delegate","message":"Edit","mode":"edit"})", context)
               .hasError());
     CHECK(
@@ -271,7 +336,7 @@ void testExistingPaidTasksCanBeRecoveredWithoutResubmission() {
     MaiFileSystem::removeRecursively(directory);
 }
 
-void testLocalMediaStopsBeforeWanSubmissionWhenOssFails() {
+void testDisabledWanNeverUploadsLocalMedia() {
     const MaiFilePath source = MaiFileSystem::temporaryDirectory().append(
         MaiFilePath::fromUtf8(MaiIdGenerator::generate("wan_oss_input_") + ".mp4"));
     CHECK(!MaiFileSystem::writeFile(source, "synthetic video fixture"));
@@ -295,12 +360,12 @@ void testLocalMediaStopsBeforeWanSubmissionWhenOssFails() {
                                     {"resolution", "720P"}};
     const MaiToolResult result = tool->execute(request.dump(), context);
     CHECK(result.hasError());
-    CHECK(result.error().message().find("upload_failed") != std::string::npos);
-    CHECK(uploads == 1);
+    CHECK(result.error().message().find("temporarily_disabled") != std::string::npos);
+    CHECK(uploads == 0);
     (void)MaiFileSystem::removeFile(source);
 }
 
-void testWan3VideoLimits() {
+void testDisabledWanRetainsVideoSchema() {
     const auto credentials = [] { return MaiWanCredentials{"test-key", "ws-test123"}; };
     MaiToolContext context;
     context.root = MaiFileSystem::temporaryDirectory().toUtf8();
@@ -335,7 +400,7 @@ void testWan3VideoLimits() {
                                   {"source_duration_seconds", 15.2}};
     const MaiToolResult tooLong = wan3->execute(replacement.dump(), context);
     CHECK(tooLong.hasError());
-    CHECK(tooLong.error().message().find("1-15 seconds") != std::string::npos);
+    CHECK(tooLong.error().message().find("temporarily_disabled") != std::string::npos);
 }
 
 void testBailianKlingUsesWanCredentialsAndRequiresOssForMedia() {
@@ -471,13 +536,14 @@ void testVideoTaskManagementNeverDiscardsActiveOrForeignTasks() {
 }  // namespace
 
 int main() {
+    testWanVideoGenerationIsTemporarilyDisabled();
     testOtherSpecialistBoundaries();
-    testRevisionIsSessionBound();
+    testDisabledWanRevisionCannotReadForeignTask();
     testLiveWan3WhenExplicitlyConfigured();
     testLiveDiagnosticsWhenExplicitlyConfigured();
     testExistingPaidTasksCanBeRecoveredWithoutResubmission();
-    testLocalMediaStopsBeforeWanSubmissionWhenOssFails();
-    testWan3VideoLimits();
+    testDisabledWanNeverUploadsLocalMedia();
+    testDisabledWanRetainsVideoSchema();
     testBailianKlingUsesWanCredentialsAndRequiresOssForMedia();
     testWanAndKlingImageToolsValidateBeforePaidSubmission();
     testVideoTaskManagementNeverDiscardsActiveOrForeignTasks();

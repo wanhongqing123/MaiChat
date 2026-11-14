@@ -3597,7 +3597,17 @@ void AgentPanelSessionTest::desktopAgentSuppliesMarkdownSystemPrompt() {
     const MaiModelRequest request = observer->request();
     QVERIFY(!request.messages.empty());
     QCOMPARE(request.messages.front().role, MaiModelRole::User);
+    // 核对普通 Desktop 工厂的实际模型请求，暂停万相视频不应误伤图片或其他视频专家。
+    const auto hasTool = [&request](const std::string& name) {
+        return std::any_of(request.tools.begin(), request.tools.end(),
+                           [&name](const MaiToolSpec& tool) { return tool.name == name; });
+    };
+    QVERIFY(!hasTool("wan_video"));
+    QVERIFY(hasTool("wan_image"));
+    QVERIFY(hasTool("kling_bailian_video"));
     const QString prompt = QString::fromStdString(request.baseInstructions);
+    QVERIFY(prompt.contains(QStringLiteral("Wan video generation (wan_video) is temporarily disabled")));
+    QVERIFY(!prompt.contains(QStringLiteral("wan_video mode=")));
     QVERIFY(prompt.contains(QStringLiteral("GitHub Flavored Markdown")));
     QVERIFY(prompt.contains(QStringLiteral("table row")));
     QVERIFY(prompt.contains(QStringLiteral("delimiter row")));

@@ -21,6 +21,9 @@ using MaiWanCredentialsProvider = std::function<MaiWanCredentials()>;
 // Wan3.0 根据文本、首尾帧或参考素材生成视频；一张人物图加一段参考视频可用提示词
 // 引导人物替换或动作模仿，不能保证逐帧一致。本地素材经私有 OSS 上传；参考视频
 // 最长 15 秒，输入与输出总时长不超过 30 秒。任务异步提交，continue 下载 MP4。
+// 当前因费用暂停 delegate/revise，普通调用与模型调用均在读取凭据、上传和 HTTP 前拒绝。
+// 工厂和供应商实现保留供恢复使用；内部 continue/cancel/delete 仍能处理已有任务。
+// 宿主只作内部注册，不向主模型公开新的万相视频入口。
 std::unique_ptr<MaiTool> makeMaiWanVideoTool(MaiWanCredentialsProvider credentials,
                                              std::string caBundlePath = {},
                                              MaiCreativeMediaUploadProvider uploadMedia = {});

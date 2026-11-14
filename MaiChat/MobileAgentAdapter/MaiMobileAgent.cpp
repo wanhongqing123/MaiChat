@@ -247,36 +247,13 @@ constexpr auto kMarkdownBaseInstructions =
     "describe "
     "that path as pixel-preserving editing or use it for arbitrary object "
     "replacement. "
-    // 旧专用入口已停止新任务。Wan3 使用一张人物参考图和一段视频，
-    // 通过提示词分别引导换人或动作模仿，但不能保证逐帧还原或严格保留背景。
-    // 本地源视频先测时长，超过 Wan3 的 15 秒上限不能静默截短或付费提交。
-    "For Wan person replacement use wan_video mode=edit, set video_path to the "
-    "source "
-    "video and local_image_paths to an array containing one person image. In "
-    "message, "
-    "ask to replace Video 1's person with Image 1 while preserving the scene. "
-    "For "
-    "motion guided by a source video use wan_video mode=reference with the "
-    "same media "
-    "fields; ask Image 1's person to follow Video 1's motion and expressions "
-    "while "
-    "keeping Image 1's background. These "
-    "are prompt-guided approximations, not guaranteed "
-    "frame-accurate replacement or motion transfer. Measure "
-    "source_duration_seconds "
-    "with ffprobe: Wan3 accepts at most 15 seconds of reference video, and "
-    "input plus output must be at most 30 seconds. Use ratio=adaptive to "
-    "preserve framing unless the user requests another ratio. Do not silently "
-    "trim longer source footage. Use only wan_video for new Wan person "
-    "replacement or "
-    "motion-guided generation. "
-    // Wan3 视频延长用 reference_video 和明确延长意图；比例必须 adaptive，
-    // 付费前先测源片时长并核对输入与输出合计不超过 30 秒。
-    "For Wan3 extension use wan_video mode=extend with one source video, an "
-    "explicit "
-    "extension direction in the message, ratio=adaptive, and measured "
-    "source_duration_seconds. Input plus requested output must be at most 30 "
-    "seconds. "
+    // 万相视频因费用暂停新建与修订；不能误导主模型重试或静默换另一种收费模型。
+    // 已提交任务仍由后台恢复，万相图片和其余已列出视频模型保持各自入口。
+    "Wan video generation (wan_video) is temporarily disabled to control costs. "
+    "Do not submit or revise Wan video tasks, retry them, or silently choose a "
+    "replacement model. Existing submitted tasks can still be recovered internally. "
+    "Wan image and other listed video models are separate; ask the user to choose "
+    "before using a different video model. "
     // 仅在允许的前提下处理图像：轻度处理优先，油画化是兜底；记录损失并补偿描述。
     "Do not default to "
     "flipping or oil-painting a real face to evade review. For other image "
@@ -911,7 +888,8 @@ struct MaiMobileAgent {
             if (!response.is_object()) return {};
             return {response.value("key", std::string{}), response.value("workspace_id", std::string{})};
         };
-        tools->add(makeMaiWanVideoTool(wanCredentials, config.caBundlePath, wanUploadMedia));
+        // 暂停公开万相视频入口，保留内部实例查询和回收已经付费的任务。
+        tools->addInternal(makeMaiWanVideoTool(wanCredentials, config.caBundlePath, wanUploadMedia));
         tools->add(makeMaiBailianKlingVideoTool(wanCredentials, config.caBundlePath, klingUploadMedia));
         tools->add(makeMaiWanImageTool(wanCredentials, config.caBundlePath, wanUploadMedia));
         tools->add(makeMaiBailianKlingImageTool(wanCredentials, config.caBundlePath, klingUploadMedia));

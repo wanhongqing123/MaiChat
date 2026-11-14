@@ -13,6 +13,8 @@ enum class MaiSpecialistCapabilityStatus {
     NotConfigured,
     NotImplemented,
     UploadNotConfigured,
+    // 实现和账号配置保留，但产品策略暂停新生成；补凭据或重试不能解除。
+    TemporarilyDisabled,
 };
 
 // 带模型工具的稳定能力条目，不是供应商 HTTP 字段，也不是直接交给主模型的

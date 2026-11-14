@@ -140,7 +140,8 @@ bool MaiTool::isAvailableForModel(const std::string& model) const {
 const char* maiSpecialistCapabilityStatusToString(MaiSpecialistCapabilityStatus status) {
     // 能力状态是给主模型的可执行性信号：available 已验证可用；
     // implemented_unverified 已接线待实测；not_configured 缺账号配置；
-    // not_implemented 没有工具路径；upload_not_configured 只缺上传通道。
+    // not_implemented 没有工具路径；upload_not_configured 只缺上传通道；
+    // temporarily_disabled 是产品策略暂停，不能靠重试或补配置恢复。
     // 不得把“模型理论上支持”直接翻译成 available。
     switch (status) {
         case MaiSpecialistCapabilityStatus::Available: return "available";
@@ -148,6 +149,7 @@ const char* maiSpecialistCapabilityStatusToString(MaiSpecialistCapabilityStatus 
         case MaiSpecialistCapabilityStatus::NotConfigured: return "not_configured";
         case MaiSpecialistCapabilityStatus::NotImplemented: return "not_implemented";
         case MaiSpecialistCapabilityStatus::UploadNotConfigured: return "upload_not_configured";
+        case MaiSpecialistCapabilityStatus::TemporarilyDisabled: return "temporarily_disabled";
     }
     return "not_implemented";
 }

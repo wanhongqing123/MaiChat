@@ -588,13 +588,15 @@ public:
         return "wan_video";
     }
     bool requiresApproval(const std::string& raw) const override {
-        return isPaidGenerationAction(raw);
+        return requiresPerCallApproval(raw);
     }
     bool requiresPerCallApproval(const std::string& raw) const override {
-        return isPaidGenerationAction(raw);
+        // 新建和修订会直接返回暂停，不能让用户批准一个实际不会执行的付费动作。
+        // 取消与本地删除仍保留原逐次确认，非法输入保持原先的保守方向。
+        return !isBillableSubmissionAction(raw) && isPaidGenerationAction(raw);
     }
-    bool requiresPaidApproval(const std::string& raw) const override {
-        return isBillableSubmissionAction(raw);
+    bool requiresPaidApproval(const std::string&) const override {
+        return false;
     }
 
     // 描述这个媒体专家的能力、限制和调用身份，供委托路由使用。
@@ -602,12 +604,11 @@ public:
     std::optional<MaiSpecialistInfo> specialistInfo() const override {
         const MaiWanCredentials credentials = mCredentials ? mCredentials() : MaiWanCredentials{};
         const bool configured = hasCredentials(credentials);
-        const auto status = configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                       : MaiSpecialistCapabilityStatus::NotConfigured;
-        const auto mediaStatus = !configured ? MaiSpecialistCapabilityStatus::NotConfigured
-                                 : mUploadMedia
-                                     ? MaiSpecialistCapabilityStatus::ImplementedUnverified
-                                     : MaiSpecialistCapabilityStatus::UploadNotConfigured;
+        const auto accountStatus = configured ? MaiSpecialistCapabilityStatus::ImplementedUnverified
+                                              : MaiSpecialistCapabilityStatus::NotConfigured;
+        // 账号和实现均保留，暂停不应被误报成未配置或未实现；旧任务管理不随新生成停用。
+        const auto status = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
+        const auto mediaStatus = MaiSpecialistCapabilityStatus::TemporarilyDisabled;
         return MaiSpecialistInfo{
             name(),
             kWanVideoModel,
@@ -658,7 +659,7 @@ public:
               MaiSpecialistCapabilityStatus::NotImplemented,
               "Wan3 API allows several reference videos; this tool wires only one video_path"},
              // 百炼通用任务接口只能取消排队任务；本地记录删除不属于模型/API 能力。
-             {"cloud_task_cancel", false, true, status,
+             {"cloud_task_cancel", false, true, accountStatus,
               "cancel works only while PENDING; a RUNNING cloud job cannot be canceled"},
              // cloud_task_delete：百炼没有当前视频任务的云端删除接口，
              // 即使本地可隐藏记录，也不能向用户声称云端任务已经删除。
@@ -682,7 +683,11 @@ public:
         // App 自动查询并报告结果，continue 只用于手动排障；revise 在同一会话
         // 对完成任务追加反馈。cancel 只取消 PENDING，delete 只移除已交付本地记录。
         // 云端仍可能审核拒绝，不能把已提交当作已完成。
-        return "Wan3.0 video through Beijing Model Studio. Call discover before choosing it; "
+        // 暂停事实必须先于保留的能力说明，旧工具实例也不能宣称自己能提交新任务。
+        return "Wan video generation (wan_video) is temporarily disabled to control costs. "
+               "Delegate and revise are unavailable; do not retry or switch models silently. "
+               "Existing task continue, cancel, and local delete remain supported internally. "
+               "Legacy Wan3.0 video capabilities through Beijing Model Studio: "
                "diagnose checks model visibility without generating. Output: 2-30 seconds or "
                "duration=-1, 480P/720P/1080P, adaptive or explicit ratio, optional audio. "
                "Modes: create=text or one strict first frame or first+last frame; "
@@ -819,6 +824,19 @@ public:
         // 数量和可访问路径，云端受理后保存任务 ID 等待异步交付。
         const Json args = Json::parse(raw, nullptr, false);
         if (!args.is_object()) return invalid("arguments must be an object");
+        const std::string action = value(args, "action");
+        if (action == "delegate" || action == "revise") {
+            // 不能只隐藏 UI 或注销工具：旧工厂指针和历史调用仍可直接进入 execute。
+            // revise 也会先查旧任务再重提，所以在任何凭据、素材上传或供应商 I/O 前拒绝。
+            MaiToolExecution execution;
+            execution.status = MaiToolExecutionStatus::NotStarted;
+            execution.effectStatus = MaiToolEffectStatus::None;
+            execution.started = false;
+            return failure(MaiErrorCode::NotSupported, "temporarily_disabled",
+                           "Wan video generation is temporarily disabled to control costs. "
+                           "No task was submitted. Do not retry or switch models silently.")
+                .withExecution(std::move(execution));
+        }
         if (auto error = rejectUnknownFields(args, parametersSchema())) return *error;
         if (args.contains("poll_once") && !args["poll_once"].is_boolean())
             return invalid("poll_once must be boolean");
@@ -828,7 +846,6 @@ public:
             if (args.contains(field) && !args[field].is_string())
                 return invalid(std::string(field) + " must be a string");
         }
-        const std::string action = value(args, "action");
         const std::string message = value(args, "message");
         if (message.empty() && (action == "delegate" || action == "revise"))
             return invalid("message is required to start or revise a task");
@@ -850,9 +867,12 @@ public:
                 Json{{"tool_kind", "model_backed"},
                      {"bound_model", kWanVideoModel},
                      {"configured", info.configured},
+                     {"generation_enabled", false},
                      {"missing_configuration", missing},
                      {"capabilities", capabilities},
-                     {"reply", "I can create or edit a video using Wan3.0."}}
+                     {"reply",
+                      "Wan video generation is temporarily disabled to control costs; "
+                      "existing tasks can still be queried, canceled, or removed locally."}}
                     .dump());
         }
         if (action == "delete")

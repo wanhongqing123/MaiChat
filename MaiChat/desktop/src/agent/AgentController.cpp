@@ -98,18 +98,10 @@ Turbo, Standard, or Omni variant before paid submission.
 For Kling images use kling_bailian_image with the same credentials; for Wan images use wan_image.
 For MiniMax images use minimax_image: text alone is text-to-image; one image_path or image_url
 is character-reference image-to-image, not arbitrary pixel-preserving editing.
-For Wan person replacement use wan_video mode=edit, set video_path to the source video and
-local_image_paths to an array containing one person image. In message, ask to replace Video 1's
-person with Image 1 while preserving the scene. For motion guided by a source video, use wan_video
-mode=reference with the same media fields and ask Image 1's person to follow Video 1's motion and
-expressions while keeping Image 1's background. These
-are prompt-guided approximations, not guaranteed frame-accurate replacement or motion transfer.
-Measure source_duration_seconds: Wan3 accepts at most 15 seconds of reference video, with input
-plus output at most 30 seconds. Use ratio=adaptive to preserve framing unless the user requests
-another ratio. Do not silently trim longer footage. For Wan3 video extension use
-wan_video mode=extend with one source video,
-an explicit extension direction, ratio=adaptive, and measured source_duration_seconds; input
-plus requested output must not exceed 30 seconds.
+Wan video generation (wan_video) is temporarily disabled to control costs. Do not submit or
+revise Wan video tasks, retry them, or silently choose a replacement model. Existing submitted
+tasks can still be recovered internally. Wan image and other listed video models are separate;
+ask the user to choose before using a different video model.
 Do not default to
 flipping or oil-painting a real face to evade review. For other image issues, if an image edit is
 allowed and still serves the user's goal, preserve the original, make a light
@@ -389,7 +381,8 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
         }
         return MaiWanCredentials{key, workspace};
     };
-    tools->add(makeMaiWanVideoTool(wanCredentials, {}, wanUploadMedia));
+    // 因费用暂停万相视频的新任务；后台仍按原名字查询和回收已提交任务。
+    tools->addInternal(makeMaiWanVideoTool(wanCredentials, {}, wanUploadMedia));
     tools->add(makeMaiBailianKlingVideoTool(wanCredentials, {}, klingUploadMedia));
     tools->add(makeMaiWanImageTool(wanCredentials, {}, wanUploadMedia));
     tools->add(makeMaiBailianKlingImageTool(wanCredentials, {}, klingUploadMedia));
