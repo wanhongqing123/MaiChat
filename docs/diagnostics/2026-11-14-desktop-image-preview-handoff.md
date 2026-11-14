@@ -72,3 +72,36 @@ CGPreflightScreenCaptureAccess=false，未申请权限、未设置抓屏/record�
 
 无真实账号登录、聊天库读取、剪贴板操作、模型或付费请求。此次只覆盖预览转场，
 原有UI线程完整原图解码耗时没有另行重构；不把关闭白帧证据混写成解码性能结论。
+
+## 正式 2.2.61 交付
+
+发布源码固定为 `ffc1102f6d2bf20b9cb5b4ce2ddfd67af0d4bf02`，annotated tag
+`v2.2.61` 对象为 `589ba4525e9c598a6cb68925ddd20fa9af533f5b`，peel 精确回该源码。
+后续本诊断补记只归档证据，不移动标签，也不把归档提交倒填为构建源码。
+
+Windows 正常 Release 在该提交上 configure0/8.417s、build0/11.562s，实际 exe SHA256
+`ac5a108c3560d13b310f690a3a2c640ac54cc6331051e1317f811951d4db7778`。
+Setup、便携 ZIP 和实际解压副本均完成依赖闭包与五模型校验；六个独立普通/debug smoke
+实际版本2.2.61，使用各自包内Qt和私有AppLog，未运行安装器或替换用户现装。
+打包后的私有脚本曾因旧固定数字60的版本断言退出1；实际安装器版本为2.2.61.0。
+该失败及部分metadata原件保留，修正为从目标版本读取数字分量后仅续签名检查和metadata，
+两个payload前后SHA相同，没有重打包或倒填原退出码。
+
+Mac 同源码正常版本/Git元数据增量后产出DMG/ZIP。staging、只读DMG与实际ZIP解压副本
+338个文件及37个符号链接逐项相同，26个MachO依赖与strict签名检查通过；
+22条正式命令退出0，六个独立普通/debug smoke实际版本2.2.61，原Popen环境、私有CFhome的
+实际AppLog/PID及sandbox规则均保存。五模型与Windows及先前锁定版本逐SHA/bytes一致。
+Mac为adHoc签名、未公证；App声明14.4但部分依赖声明15或26，仅实际验证本机27.2。
+这些启动检查不补足前述原生动画录屏边界。
+
+Root在Mac四次串行上传完成且窗口归还后，GET核对8个uploaded资产的size/digest，
+并实际下载两个manifest与两个SHA256SUMS，草稿门禁PASS才单次发布。
+Release `445007211` 于 `2026-11-14T04:30:59Z` 发布为非draft、非prerelease。
+随后在无Authorization、无Cookie的14次GET回验中，8资产、4份实际metadata下载、
+源码/tag peel、跨平台模型和网页入口全部PASS，official latest精确指向同一Release。
+先前2.2.60的body/assets/tag保持原样。Mac另行只读GET回验得到相同发布与latest结果。
+
+正式下载：[MaiChat 2.2.61](https://github.com/wanhongqing123/MaiChat/releases/tag/v2.2.61)。
+原始交付证据位于 `.cache/release-2.2.61-20261114/`，包括
+`draft-readiness-01.json`、`publish-response-01.json`、`public-verification-01.json`，
+以及两平台handoff和四份实际下载的metadata。未替换或重启用户当前Mac App。
