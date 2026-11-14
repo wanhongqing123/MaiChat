@@ -405,6 +405,7 @@ private slots:
     void fileBubbleOffersContextMenu();
     void imageBubbleOffersContextMenu();
     void imageBubbleUsesNativePixmapPreview();
+    void imagePreviewUsesWhiteCanvasOnlyForActualTransparency();
     void maximizedImageBubbleOpensOnlyOnePreview();
     void imagePreviewKeepsConversationBackgroundStable_data();
     void imagePreviewKeepsConversationBackgroundStable();
@@ -5106,6 +5107,45 @@ void MainWindowLayoutTest::imageBubbleOffersContextMenu() {
     QVERIFY(imageLabel != nullptr);
     // 自定义右键菜单（复制 / 预览 / 保存到本地）挂在图片缩略图上。
     QCOMPARE(imageLabel->contextMenuPolicy(), Qt::CustomContextMenu);
+}
+
+// 静态像素回归使用真实预览 Dialog；Alpha 通道容器不能直接等同于透明内容。
+void MainWindowLayoutTest::imagePreviewUsesWhiteCanvasOnlyForActualTransparency() {
+    const QColor foreground(32, 160, 64);
+    const auto check = [&](const QImage& input, const QColor& canvas) {
+        const QPixmap original = QPixmap::fromImage(input, Qt::NoOpaqueDetection);
+        QVERIFY(original.hasAlphaChannel());
+        const QImage before = original.toImage();
+        ImagePreviewDialog preview(original);
+        QCOMPARE(preview.canvasColor(), canvas);
+        preview.resize(360, 240);
+        preview.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&preview));
+        QCoreApplication::processEvents();
+        preview.resize(362, 242);
+        QCoreApplication::processEvents();
+        preview.resize(360, 240);
+        QCoreApplication::processEvents();
+        const QPixmap capture = preview.grab();
+        const QImage pixels = capture.toImage();
+        const qreal dpr = capture.devicePixelRatioF();
+        QCOMPARE(pixels.pixelColor(qRound(6 * dpr), qRound(6 * dpr)), canvas);
+        QCOMPARE(pixels.pixelColor(qRound(180 * dpr), qRound(120 * dpr)), foreground);
+        QCOMPARE(preview.sourceImage().toImage(), before);
+        QCOMPARE(original.toImage(), before);
+        QCOMPARE(preview.canvasColor(), canvas);
+        preview.close();
+    };
+    QImage transparent(256, 192, QImage::Format_RGBA8888);
+    transparent.fill(Qt::transparent);
+    {
+        QPainter painter(&transparent);
+        painter.fillRect(QRect(32, 24, 192, 144), foreground);
+    }
+    check(transparent, Qt::white);
+    QImage opaque(256, 192, QImage::Format_RGBA8888);
+    opaque.fill(foreground);
+    check(opaque, QColor(8, 9, 11));
 }
 
 void MainWindowLayoutTest::imageBubbleUsesNativePixmapPreview() {

@@ -7203,6 +7203,9 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
       inputBlocker->raise();
       auto *snapshot = new QLabel(this);
       snapshot->setObjectName(QStringLiteral("imagePreviewTransitionSnapshot"));
+      // 透明图与独立预览使用同一衬底，接手画面时不露出后面的会话内容。
+      snapshot->setStyleSheet(QStringLiteral("background:%1;border:none;")
+                                 .arg(dialog->canvasColor().name()));
       snapshot->setPixmap(transitionPixmap());
       snapshot->setScaledContents(true);
       snapshot->setGeometry(start);
@@ -7264,6 +7267,9 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
       inputBlocker->raise();
       auto *snapshot = new QLabel(this);
       snapshot->setObjectName(QStringLiteral("imagePreviewTransitionSnapshot"));
+      // 放大和缩回都沿用预览画布，避免透明留白在转场末尾突然变色。
+      snapshot->setStyleSheet(QStringLiteral("background:%1;border:none;")
+                                 .arg(dialog->canvasColor().name()));
       // 只预缩放一次到最终屏幕像素尺寸，避免每帧重采样超大原图，
       // 也避免放大末尾从低清缩略图突然切换到原图。
       const QPixmap originalFrame = transitionPixmap();

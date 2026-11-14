@@ -3,6 +3,7 @@
 // 对外边界：本文件给出 ImagePreviewDialog 的类型和函数声明；参数、返回值和对象生命周期以此为准。
 #pragma once
 
+#include <QColor>
 #include <QDialog>
 #include <QLabel>
 #include <QPixmap>
@@ -17,7 +18,12 @@ public:
     explicit ImagePreviewDialog(const QString& imagePath, QWidget* parent = nullptr);
     explicit ImagePreviewDialog(const QPixmap& image, QWidget* parent = nullptr);
     void setCloseHandler(std::function<bool()> handler);
-    const QPixmap& sourceImage() const { return image_; }
+    const QPixmap& sourceImage() const {
+        return image_;
+    }
+    // 根据实际像素 Alpha 在构造时选择一次衬底；只读查询不再扫描图片。
+    // 主窗口转场应复用同一颜色，避免透明区域在交接时露出不同背景。
+    QColor canvasColor() const;
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -30,5 +36,6 @@ private:
 
     QLabel* imageLabel_ = nullptr;
     QPixmap image_;
+    QColor canvasColor_{8, 9, 11};
     std::function<bool()> closeHandler_;
 };
