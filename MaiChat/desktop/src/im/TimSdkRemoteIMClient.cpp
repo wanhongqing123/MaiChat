@@ -24,6 +24,7 @@
 #include <QUrl>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
+#include <algorithm>
 #include <atomic>
 #include <limits>
 #include <mutex>
@@ -1127,6 +1128,44 @@ void TimSdkRemoteIMClient::sendApprovalDecision(const QString& peerId,
         RemoteIMMessageOrigin::Human,
         std::move(completion),
         interaction);
+}
+
+void TimSdkRemoteIMClient::sendMachineApprovalRequest(const QString& peerId, const QString& text,
+                                                      const RemoteIMApprovalRequest& request,
+                                                      RemoteIMSendCompletion completion) {
+    // 先限制枚举再调用现有模型校验；普通调用方也可能传入未知枚举，不能当作放行。
+    const bool knownActions =
+        std::all_of(request.actions.cbegin(), request.actions.cend(), [](RemoteIMApprovalAction action) {
+            return action == RemoteIMApprovalAction::ApproveOnce || action == RemoteIMApprovalAction::ApprovePrefix ||
+                   action == RemoteIMApprovalAction::Reject;
+        });
+    if (!knownActions || !request.isValid()) {
+        if (completion) completion(false, QStringLiteral("审批请求标识或动作无效"), {});
+        return;
+    }
+    QJsonArray actions;
+    for (const auto action : request.actions) actions.append(remoteIMApprovalActionWireName(action));
+    const QJsonObject interaction{{QStringLiteral("kind"), QStringLiteral("approval-request")},
+                                  {QStringLiteral("token"), request.token},
+                                  {QStringLiteral("actions"), actions}};
+    sendTextWithOrigin(peerId, text, RemoteIMMessageOrigin::Machine, std::move(completion), interaction);
+}
+
+void TimSdkRemoteIMClient::sendMachineApprovalResolved(const QString& peerId, const QString& text,
+                                                       const RemoteIMApprovalDecision& resolution,
+                                                       RemoteIMSendCompletion completion) {
+    if (!resolution.isValid() || (resolution.action != RemoteIMApprovalAction::Resolved &&
+                                  resolution.action != RemoteIMApprovalAction::AutoDeclined)) {
+        if (completion) completion(false, QStringLiteral("审批结束状态无效"), {});
+        return;
+    }
+    // 结束通知不替用户作决定；只关闭同 token 卡片，不能写入人工 action/actions。
+    const QString outcome = resolution.action == RemoteIMApprovalAction::AutoDeclined ? QStringLiteral("auto-declined")
+                                                                                      : QStringLiteral("resolved");
+    const QJsonObject interaction{{QStringLiteral("kind"), QStringLiteral("approval-resolved")},
+                                  {QStringLiteral("token"), resolution.token},
+                                  {QStringLiteral("outcome"), outcome}};
+    sendTextWithOrigin(peerId, text, RemoteIMMessageOrigin::Machine, std::move(completion), interaction);
 }
 
 void TimSdkRemoteIMClient::sendTextWithOrigin(const QString& peerId,

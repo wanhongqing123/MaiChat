@@ -81,6 +81,11 @@ struct MaiSendPrompt {
     std::vector<MaiModelImage> images;
     std::vector<MaiVideoPart> videos;
     std::string quotedMessageId;
+    // 可选的受理前置条件：精确匹配 MaiSession.directory 的原始值，不是规范化路径。
+    // 非空时在 Runtime 锁内重新读取、核对后才保存首条用户消息；失配拒绝且不留启动占位。
+    // 空值保持普通本地调用的既有语义。绑定宿主在准备/授权之后仍须提供此原始快照。
+    // 此字段仅用于直接提交；持久化 MaiEnqueuePrompt 不支持非空目录 guard。
+    std::string expectedDirectory = {};
 
     MaiSendPrompt(std::string sessionId, std::string text);
     MaiSendPrompt(std::string sessionId, std::string text, std::vector<MaiModelImage> images);
@@ -98,6 +103,8 @@ struct MaiSendPrompt {
 // 同 sessionId + turnId + requestId 的相同内容重试返回原 ID；改内容返回 InvalidInput。
 // 最近 128 份接收凭据在本 Agent 生命周期内保留，活动轮自身另保留全部凭据。
 // 每轮至多接受 64 条补充，文本至多 64 KiB，图片/视频各至多 10 项。
+// 尚未在安全点消费的显式补充组至多含 10 张图片；超额返回 Busy 且不创建消息/接收凭据。
+// 调用方保留原输入及 requestId，待当前组消费后可对同一活动轮次重试；文字仍可正常接收。
 // 空输入、失配的 turnId 返回 InvalidInput；idle 返回 NotFound；停止中返回 Canceled；
 // 已封闭输入的收尾阶段返回 Busy。拒绝时宿主须保留草稿，不得自动回退成 MaiSendPrompt。
 // 停止或模型失败后，已接受消息仍保留历史，但不会为它们自动再启动模型请求。
@@ -109,6 +116,9 @@ struct MaiSteerPrompt {
     std::vector<MaiModelImage> images = {};
     std::vector<MaiVideoPart> videos = {};
     std::string quotedMessageId = {};
+    // 可选的同锁目录 CAS，与 MaiSendPrompt 相同；属于 requestId 的幂等内容。
+    // 已接受的完全相同请求仍返回原接收凭据；失配拒绝不创建消息或占用 requestId。
+    std::string expectedDirectory = {};
 };
 
 // 接收会话输入而不要求调用方观察 busy/turnId。先持久化用户消息，再返回 user ID；
@@ -136,6 +146,9 @@ struct MaiInterrupt {
 struct MaiReplyPermission {
     std::string permissionId;
     MaiPermissionDecision decision = MaiPermissionDecision::Denied;
+    // 自动绑定控制可要求真实 pending 请求所属会话目录在受理时仍精确匹配。
+    // 非空时 Runtime 锁内检查后才唤醒 Gate；错误目录不消费请求。空值保留本地 UI 语义。
+    std::string expectedDirectory = {};
 };
 
 // 回答模型中途问的那句话。
@@ -145,6 +158,8 @@ struct MaiReplyPermission {
 struct MaiReplyQuestion {
     std::string questionId;
     std::string answer;
+    // 与权限回答相同的可选目录 CAS；按 qst 的真实所属会话核对，不信外部 session ID。
+    std::string expectedDirectory = {};
 };
 
 using MaiOperation = std::variant<MaiCreateSession, MaiUpdateSession, MaiDeleteSession,

@@ -6,6 +6,7 @@
 //
 // 这是 agent 之所以是 agent 的地方，也是 M3 唯一真正需要证明的东西。
 // 假模型按脚本依次返回"要调工具"和"最终回答"，所以整个闭环是确定的。
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -27,6 +28,7 @@
 #include "MaiFileTools.h"
 #include "MaiFakeModelClient.h"
 #include "MaiIdGenerator.h"
+#include "MaiQuestionTool.h"
 #include "MaiScreenshotTool.h"
 #include "MaiViewImageTool.h"
 
@@ -1095,8 +1097,9 @@ void test_model_exception_becomes_a_session_error() {
 // 条件变量卡住真实工具边界，证明补充输入不会用 cancel 打断已开始的工具。
 class SteeringHeldTool final : public MaiTool {
 public:
+    explicit SteeringHeldTool(std::string toolName = "held_work") : mName(std::move(toolName)) {}
     std::string name() const override {
-        return "held_work";
+        return mName;
     }
     std::string description() const override {
         return "Wait for the local test gate.";
@@ -1126,11 +1129,381 @@ public:
     std::atomic<bool> canceled{false};
 
 private:
+    std::string mName;
     std::mutex mutex;
     std::condition_variable entered;
     std::condition_variable wake;
     bool ready = false;
 };
+
+void test_steering_image_group_backpressure_keeps_rejected_input_retryable() {
+    Workspace workspace;
+    auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+        callTurn("held_work", "{}", "held-budget-one"),
+        callTurn("held_next", "{}", "held-budget-two"), sayTurn("All accepted images inspected")});
+    auto* observed = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    auto held = std::make_unique<SteeringHeldTool>();
+    auto* firstGate = held.get();
+    tools->add(std::move(held));
+    auto next = std::make_unique<SteeringHeldTool>("held_next");
+    auto* secondGate = next.get();
+    tools->add(std::move(next));
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+    const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    const auto started = agent.submit(MaiSendPrompt{session, "Start bounded image work"});
+    CHECK(firstGate->waitEntered());
+    std::vector<MaiModelImage> images;
+    for (int index = 0; index < 10; ++index)
+        images.push_back({"owned-" + std::to_string(index) + ".png", "image/png"});
+    const MaiSteerPrompt full{session, started.value(), "budget-ten", "Inspect this group", images};
+    const auto accepted = agent.submit(full);
+    CHECK(accepted);
+    CHECK(agent.submit(full).value() == accepted.value());
+    const MaiSteerPrompt overflow{session,
+                                  started.value(),
+                                  "budget-overflow",
+                                  "Inspect the last image",
+                                  {{"owned-last.png", "image/png"}}};
+    const auto deferred = agent.submit(overflow);
+    CHECK(!deferred);
+    if (!deferred) CHECK(deferred.error().code() == MaiErrorCode::Busy);
+    bool overflowWasStored = false;
+    for (const auto& message : agent.listMessages(session))
+        overflowWasStored |= message.role == MaiRole::User && message.text() == overflow.text;
+    CHECK(!overflowWasStored);
+    // 满图片组仍能接受文字；同一 request 的精确重试也不能被图片背压误拒绝。
+    CHECK(
+        agent.submit(MaiSteerPrompt{session, started.value(), "budget-text", "Keep every image"}));
+    CHECK(agent.submit(full).value() == accepted.value());
+    firstGate->release();
+    CHECK(secondGate->waitEntered());
+    const auto retried = agent.submit(overflow);
+    CHECK(retried);
+    if (retried) CHECK(agent.submit(overflow).value() == retried.value());
+    secondGate->release();
+    agent.waitIdle();
+    CHECK(observed->requestCount() == 3);
+    if (observed->requestCount() == 3) {
+        std::size_t firstCount = 0;
+        for (const auto& message : observed->request(1).messages)
+            firstCount += message.images.size();
+        CHECK(firstCount == 10);
+        std::vector<std::string> finalPaths;
+        for (const auto& message : observed->request(2).messages)
+            for (const auto& image : message.images) finalPaths.push_back(image.path);
+        CHECK(finalPaths == std::vector<std::string>{"owned-last.png"});
+    }
+}
+
+void test_committed_text_is_persisted_and_announced_before_a_blocking_tool() {
+    Workspace workspace;
+    auto progress = callTurn("held_work", "{}", "held-progress");
+    progress.textChunks = {"Committed ", "progress"};
+    progress.reasoning = "Private reasoning is not committed reply text";
+    auto model = std::make_unique<MaiFakeModelClient>(
+        std::vector<MaiFakeModelClient::Turn>{progress, sayTurn("Committed final")});
+    auto tools = std::make_unique<MaiToolRegistry>();
+    auto held = std::make_unique<SteeringHeldTool>();
+    auto* gate = held.get();
+    tools->add(std::move(held));
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+    const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    std::mutex mutex;
+    std::vector<MaiEvent> committed;
+    std::vector<std::string> committedBodies;
+    bool persistedBeforeEvent = true;
+    const auto subscription = agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (std::string(maiEventTypeToString(event.type)) != "message.text.committed") return;
+        MaiMessage stored;
+        std::string body;
+        bool persisted = agent.getMessage(event.sessionId, event.messageId, stored) &&
+                         stored.role == MaiRole::Assistant;
+        const auto part =
+            std::find_if(stored.parts.begin(), stored.parts.end(),
+                         [&](const MaiMessagePart& value) { return value.id == event.partId; });
+        if (part == stored.parts.end())
+            persisted = false;
+        else if (const auto* text = std::get_if<MaiTextPart>(&part->body))
+            body = text->text;
+        else
+            persisted = false;
+        std::lock_guard<std::mutex> lock(mutex);
+        persistedBeforeEvent &= persisted && !body.empty();
+        committed.push_back(event);
+        committedBodies.push_back(std::move(body));
+    });
+    const auto started = agent.submit(MaiSendPrompt{session, "Work with a progress update"});
+    CHECK(started);
+    CHECK(gate->waitEntered());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        CHECK(committedBodies == std::vector<std::string>{"Committed progress"});
+        CHECK(persistedBeforeEvent);
+        if (!committed.empty()) {
+            CHECK(committed.front().sessionId == session);
+            CHECK(committed.front().messageId == started.value());
+            CHECK(committed.front().turnId == started.value());
+            CHECK(committed.front().delta.empty());
+        }
+    }
+    CHECK(agent.isBusy(session));
+    gate->release();
+    agent.waitIdle();
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        CHECK(committedBodies ==
+              (std::vector<std::string>{"Committed progress", "Committed final"}));
+        CHECK(persistedBeforeEvent);
+        if (committed.size() == 2) CHECK(committed[0].partId != committed[1].partId);
+    }
+    agent.eventBus().unsubscribe(subscription);
+}
+
+void test_committed_text_covers_complete_response_items_without_early_or_duplicate_events() {
+    class ItemModel final : public MaiModelClient {
+    public:
+        explicit ItemModel(const std::atomic<int>& committed) : mCommitted(committed) {}
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::Responses;
+        }
+        MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
+                        const std::atomic<bool>&) override {
+            const MaiModelTextItem progress{"owned-progress", MaiModelTextPhase::Commentary, 0};
+            const MaiModelTextItem final{"owned-final", MaiModelTextPhase::FinalAnswer, 1};
+            sink.onReasoning("Private item reasoning");
+            sink.onTextItemStarted(progress);
+            sink.onTextItemDelta(progress, "Working");
+            sink.onTextItemCompleted(progress);
+            sink.onTextItemStarted(final);
+            sink.onTextItemDelta(final, "Finished");
+            sink.onTextItemCompleted(final);
+            // 完整响应快照可补此前 item 的尾部；提交凭据必须等这些实际字节全部落库。
+            sink.onTextItemDelta(progress, " now");
+            sink.onTextItemCompleted(progress);
+            committedDuringStream = mCommitted.load();
+            return {};
+        }
+        int committedDuringStream = -1;
+
+    private:
+        const std::atomic<int>& mCommitted;
+    };
+    Workspace workspace;
+    std::atomic<int> committed{0};
+    auto model = std::make_unique<ItemModel>(committed);
+    auto* observed = model.get();
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), nullptr);
+    const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    std::vector<std::string> bodies;
+    const auto subscription = agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type != MaiEventType::MessageTextCommitted) return;
+        MaiMessage stored;
+        if (!agent.getMessage(event.sessionId, event.messageId, stored)) return;
+        for (const auto& part : stored.parts)
+            if (part.id == event.partId)
+                if (const auto* text = std::get_if<MaiTextPart>(&part.body))
+                    bodies.push_back(text->text);
+        ++committed;
+    });
+    CHECK(agent.submit(MaiSendPrompt{session, "Show complete response items"}));
+    agent.waitIdle();
+    CHECK(observed->committedDuringStream == 0);
+    CHECK(committed.load() == 2);
+    CHECK(bodies == (std::vector<std::string>{"Working now", "Finished"}));
+    agent.eventBus().unsubscribe(subscription);
+}
+
+void test_failed_or_canceled_partial_text_does_not_produce_a_commit_receipt() {
+    class PartialFailureModel final : public MaiModelClient {
+    public:
+        explicit PartialFailureModel(MaiErrorCode code) : mCode(code) {}
+        MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
+                        const std::atomic<bool>&) override {
+            // 通用 Fake 的 error 在输出前返回；这里必须先真实流出正文，再模拟中途失败。
+            if (sink.onText) sink.onText("Partial response remains local");
+            return MaiError::make(mCode, "owned incomplete response");
+        }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
+
+    private:
+        MaiErrorCode mCode;
+    };
+    Workspace workspace;
+    for (const auto code : {MaiErrorCode::Network, MaiErrorCode::Canceled}) {
+        MaiAgent agent(makeMaiMemoryStore(), std::make_unique<PartialFailureModel>(code), nullptr);
+        Recorder recorder;
+        recorder.attach(agent);
+        const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+        CHECK(agent.submit(MaiSendPrompt{session, "Incomplete response"}));
+        agent.waitIdle();
+        CHECK(agent.listMessages(session).back().text() == "Partial response remains local");
+        int visibleDeltas = 0;
+        for (const auto& event : recorder.all()) {
+            if (event.type == MaiEventType::MessagePartDelta && event.field == "text" &&
+                event.delta == "Partial response remains local")
+                ++visibleDeltas;
+            CHECK(event.type != MaiEventType::MessageTextCommitted);
+        }
+        CHECK(visibleDeltas == 1);
+    }
+}
+
+void test_image_steering_survives_a_later_text_input_at_the_same_safe_boundary() {
+    Workspace workspace;
+    const auto oldImage = workspace.utf8Root() + "/earlier.png";
+    const auto freshImage = workspace.utf8Root() + "/fresh.png";
+    CHECK(!MaiFileSystem::writeFile(MaiFilePath::fromUtf8(oldImage), "owned old image"));
+    CHECK(!MaiFileSystem::writeFile(MaiFilePath::fromUtf8(freshImage), "owned new image"));
+    auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+        sayTurn("Earlier image inspected"), callTurn("held_work", "{}", "held-image"),
+        sayTurn("New image and text inspected"), sayTurn("A later text-only turn")});
+    auto* observed = model.get();
+    auto tools = std::make_unique<MaiToolRegistry>();
+    auto held = std::make_unique<SteeringHeldTool>();
+    auto* gate = held.get();
+    tools->add(std::move(held));
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+    const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    CHECK(agent.submit(MaiSendPrompt{session, "Earlier image", {{oldImage, "image/png"}}}));
+    agent.waitIdle();
+    const auto started = agent.submit(MaiSendPrompt{session, "Start owned work"});
+    CHECK(started);
+    CHECK(gate->waitEntered());
+    const auto image = agent.submit(
+        MaiSteerPrompt{session, started.value(), "owned-image", "", {{freshImage, "image/png"}}});
+    CHECK(image);
+    CHECK(
+        agent.submit(MaiSteerPrompt{session, started.value(), "owned-text", "Inspect that image"}));
+    gate->release();
+    agent.waitIdle();
+    CHECK(observed->requestCount() == 3);
+    if (observed->requestCount() == 3) {
+        const auto request = observed->request(2);
+        std::vector<std::string> paths;
+        bool hasText = false;
+        for (const auto& message : request.messages) {
+            hasText |= message.content == "Inspect that image";
+            for (const auto& attached : message.images) paths.push_back(attached.path);
+        }
+        CHECK(paths == std::vector<std::string>{freshImage});
+        CHECK(hasText);
+    }
+    CHECK(agent.submit(MaiSendPrompt{session, "Continue without another image"}));
+    agent.waitIdle();
+    CHECK(observed->requestCount() == 4);
+    if (observed->requestCount() == 4)
+        for (const auto& message : observed->request(3).messages) CHECK(message.images.empty());
+}
+
+void test_steering_receipt_precedes_new_assistant_update_and_names_consumed_inputs() {
+    Workspace workspace;
+    auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+        callTurn("held_work", "{}", "held-receipt"), sayTurn("Continued reply")});
+    auto tools = std::make_unique<MaiToolRegistry>();
+    auto held = std::make_unique<SteeringHeldTool>();
+    auto* gate = held.get();
+    tools->add(std::move(held));
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+    const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    Recorder recorder;
+    recorder.attach(agent);
+    std::atomic<bool> persistedBeforeReceipt{false};
+    const auto subscription = agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (std::string(maiEventTypeToString(event.type)) != "turn.steering.applied") return;
+        MaiMessage stored;
+        bool persisted = agent.getMessage(event.sessionId, event.messageId, stored) &&
+                         stored.role == MaiRole::Assistant;
+        const auto& inputs = event.inputMessageIds;
+        persisted &= !inputs.empty();
+        for (const auto& id : inputs) {
+            MaiMessage user;
+            persisted &= agent.getMessage(event.sessionId, id, user) &&
+                         user.role == MaiRole::User && !user.pendingInput;
+        }
+        persistedBeforeReceipt = persisted;
+    });
+    const auto started = agent.submit(MaiSendPrompt{session, "Start owned work"});
+    CHECK(started);
+    CHECK(gate->waitEntered());
+    const auto first =
+        agent.submit(MaiSteerPrompt{session, started.value(), "receipt-one", "First change"});
+    const auto second =
+        agent.submit(MaiSteerPrompt{session, started.value(), "receipt-two", "Second change"});
+    CHECK(first && second);
+    gate->release();
+    agent.waitIdle();
+    const auto events = recorder.all();
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < events.size(); ++index) {
+        const auto& event = events[index];
+        if (std::string(maiEventTypeToString(event.type)) != "turn.steering.applied") continue;
+        ++count;
+        CHECK(event.sessionId == session);
+        CHECK(event.turnId == started.value());
+        CHECK(event.messageId != started.value());
+        CHECK(event.inputMessageIds == (std::vector<std::string>{first.value(), second.value()}));
+        const auto update = std::find_if(events.begin(), events.end(), [&](const MaiEvent& value) {
+            return value.type == MaiEventType::MessageUpdated && value.messageId == event.messageId;
+        });
+        CHECK(update != events.end());
+        CHECK(update == events.end() || static_cast<std::size_t>(update - events.begin()) > index);
+    }
+    CHECK(count == 1);
+    CHECK(persistedBeforeReceipt.load());
+    agent.eventBus().unsubscribe(subscription);
+}
+
+void test_steering_receipt_can_arrive_before_the_submission_returns() {
+    Workspace workspace;
+    auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+        callTurn("held_work", "{}", "held-admission-race"), sayTurn("Race supplement consumed")});
+    auto tools = std::make_unique<MaiToolRegistry>();
+    auto held = std::make_unique<SteeringHeldTool>();
+    auto* gate = held.get();
+    tools->add(std::move(held));
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+    const auto session = agent.submit(MaiCreateSession{workspace.utf8Root(), "", ""}).value();
+    const auto started = agent.submit(MaiSendPrompt{session, "Start admission race"});
+    CHECK(gate->waitEntered());
+    std::mutex mutex;
+    std::condition_variable wake;
+    MaiEvent receipt;
+    bool received = false;
+    bool waitedForReceipt = false;
+    bool receivedBeforeReturn = false;
+    std::atomic<bool> returned{false};
+    const auto subscription = agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type == MaiEventType::TurnSteeringApplied) {
+            std::lock_guard<std::mutex> lock(mutex);
+            receipt = event;
+            received = true;
+            receivedBeforeReturn = !returned.load();
+            wake.notify_all();
+        } else if (event.type == MaiEventType::MessageUpdated) {
+            MaiMessage message;
+            if (!agent.getMessage(event.sessionId, event.messageId, message) ||
+                message.role != MaiRole::User || message.text() != "Owned race supplement")
+                return;
+            gate->release();
+            // 仅测试故意暂停提交线程的同步通知，强制 worker 先消费；生产观察者不应等待。
+            std::unique_lock<std::mutex> lock(mutex);
+            waitedForReceipt =
+                wake.wait_for(lock, std::chrono::seconds(5), [&] { return received; });
+        }
+    });
+    const auto accepted = agent.submit(
+        MaiSteerPrompt{session, started.value(), "owned-admission-race", "Owned race supplement"});
+    returned = true;
+    agent.waitIdle();
+    CHECK(accepted);
+    CHECK(waitedForReceipt && receivedBeforeReturn);
+    CHECK(receipt.turnId == started.value());
+    CHECK(receipt.inputMessageIds == std::vector<std::string>{accepted.value()});
+    agent.eventBus().unsubscribe(subscription);
+}
 
 void test_steer_waits_for_all_tool_results_and_reaches_the_next_model_request() {
     Workspace workspace;
@@ -1352,6 +1725,194 @@ void test_steer_during_final_text_is_consumed_before_turn_completion() {
     agent.eventBus().unsubscribe(subscription);
 }
 
+void test_directory_admission_guards_reject_stale_send_and_steer_without_store() {
+    Workspace original;
+    Workspace replacement;
+    {
+        auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+            sayTurn("Legacy input accepted"), sayTurn("Matching input accepted")});
+        auto* observed = model.get();
+        MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::make_unique<MaiToolRegistry>());
+        const auto session = agent.submit(MaiCreateSession{original.utf8Root(), "", ""}).value();
+        CHECK(agent.submit(MaiUpdateSession{session, "", "", "", replacement.utf8Root()}));
+        MaiSendPrompt stale{session, "Do not store this stale input"};
+        stale.expectedDirectory = original.utf8Root();
+        const auto rejected = agent.submit(stale);
+        CHECK(!rejected && rejected.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(agent.listMessages(session).empty() && observed->requestCount() == 0);
+        // 拒绝必须释放 startingSessions；空 guard 的普通旧调用仍可立即受理。
+        CHECK(agent.submit(MaiSendPrompt{session, "Legacy empty guard"}));
+        agent.waitIdle();
+        MaiSendPrompt matching{session, "Matching raw directory"};
+        matching.expectedDirectory = replacement.utf8Root();
+        CHECK(agent.submit(matching));
+        agent.waitIdle();
+        CHECK(observed->requestCount() == 2 && agent.listMessages(session).size() == 4);
+    }
+    {
+        auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+            callTurn("held_work", "{}", "directory-held"), sayTurn("Accepted legacy steering")});
+        auto* observed = model.get();
+        auto tools = std::make_unique<MaiToolRegistry>();
+        auto held = std::make_unique<SteeringHeldTool>();
+        auto* gate = held.get();
+        tools->add(std::move(held));
+        MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+        const auto session = agent.submit(MaiCreateSession{original.utf8Root(), "", ""}).value();
+        const auto started = agent.submit(MaiSendPrompt{session, "Start owned work"});
+        CHECK(started && gate->waitEntered());
+        CHECK(agent.submit(MaiUpdateSession{session, "", "", "", replacement.utf8Root()}));
+        MaiSteerPrompt stale{session, started.value(), "directory-cas-retry",
+                             "A scoped supplement"};
+        stale.expectedDirectory = original.utf8Root();
+        const auto rejected = agent.submit(stale);
+        CHECK(!rejected && rejected.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(agent.listMessages(session).size() == 2 && observed->requestCount() == 1);
+        stale.expectedDirectory.clear();
+        const auto accepted = agent.submit(stale);
+        CHECK(accepted && agent.submit(stale).value() == accepted.value());
+        // 同 requestId 的目录 guard 也是内容，不能换 guard 冒充幂等重试。
+        stale.expectedDirectory = replacement.utf8Root();
+        CHECK(agent.submit(stale).error().code() == MaiErrorCode::InvalidInput);
+        stale.requestId = "directory-cas-matching";
+        CHECK(agent.submit(stale));
+        CHECK(agent.listMessages(session).size() == 4 && observed->requestCount() == 1);
+        gate->release();
+        agent.waitIdle();
+        CHECK(observed->requestCount() == 2);
+    }
+}
+
+class DirectoryApprovalTool final : public MaiTool {
+public:
+    std::string name() const override {
+        return "directory_approval";
+    }
+    std::string description() const override {
+        return "An offline action requiring exact per-call approval";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object","properties":{}})";
+    }
+    bool requiresApproval(const std::string&) const override {
+        return true;
+    }
+    bool requiresPaidApproval(const std::string&) const override {
+        return true;
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext&) override {
+        ++calls;
+        return MaiToolResult::success("Owned approved action");
+    }
+    std::atomic<int> calls{0};
+};
+
+void test_reply_directory_guards_do_not_consume_the_real_pending_gates() {
+    Workspace original;
+    Workspace replacement;
+    {
+        auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+            callTurn("directory_approval", "{}", "approval-directory-cas"),
+            sayTurn("Approved current action"),
+            callTurn("directory_approval", "{}", "approval-directory-legacy"),
+            sayTurn("Approved local action")});
+        auto* observed = model.get();
+        auto tools = std::make_unique<MaiToolRegistry>();
+        auto tool = std::make_unique<DirectoryApprovalTool>();
+        auto* action = tool.get();
+        tools->add(std::move(tool));
+        MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+        const auto session = agent.submit(MaiCreateSession{original.utf8Root(), "", ""}).value();
+        CHECK(agent.submit(MaiSendPrompt{session, "Ask for an owned approval"}));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (agent.listPendingPermissions().empty() &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const auto pending = agent.listPendingPermissions();
+        CHECK(!pending.empty());
+        if (pending.empty()) {
+            agent.submit(MaiInterrupt{session});
+            agent.waitIdle();
+            return;
+        }
+        CHECK(agent.submit(MaiUpdateSession{session, "", "", "", replacement.utf8Root()}));
+        const auto rejected = agent.submit(MaiReplyPermission{
+            pending.front().id, MaiPermissionDecision::Approved, original.utf8Root()});
+        CHECK(!rejected && rejected.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(agent.listPendingPermissions().size() == 1 && action->calls == 0 &&
+              observed->requestCount() == 1);
+        CHECK(agent.submit(MaiReplyPermission{pending.front().id, MaiPermissionDecision::Approved,
+                                              replacement.utf8Root()}));
+        agent.waitIdle();
+        CHECK(action->calls == 1 && observed->requestCount() == 2 &&
+              agent.listPendingPermissions().empty());
+        CHECK(agent.submit(MaiSendPrompt{session, "Ask for another owned approval"}));
+        const auto nextDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (agent.listPendingPermissions().empty() &&
+               std::chrono::steady_clock::now() < nextDeadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const auto next = agent.listPendingPermissions();
+        CHECK(!next.empty());
+        if (next.empty()) {
+            agent.submit(MaiInterrupt{session});
+            agent.waitIdle();
+            return;
+        }
+        CHECK(agent.submit(MaiReplyPermission{next.front().id, MaiPermissionDecision::Approved}));
+        agent.waitIdle();
+        CHECK(action->calls == 2 && observed->requestCount() == 4);
+    }
+    {
+        auto model = std::make_unique<MaiFakeModelClient>(std::vector<MaiFakeModelClient::Turn>{
+            callTurn("question", R"({"question":"Choose an owned option","options":["A","B"]})",
+                     "question-directory-cas"),
+            sayTurn("The owned answer was received"),
+            callTurn("question", R"({"question":"Choose another owned option"})",
+                     "question-directory-legacy"),
+            sayTurn("The local answer was received")});
+        auto* observed = model.get();
+        auto tools = std::make_unique<MaiToolRegistry>();
+        tools->add(makeMaiQuestionTool());
+        MaiAgent agent(makeMaiMemoryStore(), std::move(model), std::move(tools));
+        const auto session = agent.submit(MaiCreateSession{original.utf8Root(), "", ""}).value();
+        CHECK(agent.submit(MaiSendPrompt{session, "Ask an owned question"}));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (agent.listPendingQuestions().empty() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const auto pending = agent.listPendingQuestions();
+        CHECK(!pending.empty());
+        if (pending.empty()) {
+            agent.submit(MaiInterrupt{session});
+            agent.waitIdle();
+            return;
+        }
+        CHECK(agent.submit(MaiUpdateSession{session, "", "", "", replacement.utf8Root()}));
+        const auto rejected =
+            agent.submit(MaiReplyQuestion{pending.front().id, "A", original.utf8Root()});
+        CHECK(!rejected && rejected.error().code() == MaiErrorCode::InvalidInput);
+        CHECK(agent.listPendingQuestions().size() == 1 && observed->requestCount() == 1);
+        CHECK(agent.submit(MaiReplyQuestion{pending.front().id, "A", replacement.utf8Root()}));
+        agent.waitIdle();
+        CHECK(observed->requestCount() == 2 && agent.listPendingQuestions().empty());
+        CHECK(agent.submit(MaiSendPrompt{session, "Ask another owned question"}));
+        const auto nextDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (agent.listPendingQuestions().empty() &&
+               std::chrono::steady_clock::now() < nextDeadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const auto next = agent.listPendingQuestions();
+        CHECK(!next.empty());
+        if (next.empty()) {
+            agent.submit(MaiInterrupt{session});
+            agent.waitIdle();
+            return;
+        }
+        // 普通本地 UI 的空 guard 不新增授权要求，仍可回答同一个真实 pending qst。
+        CHECK(agent.submit(MaiReplyQuestion{next.front().id, "B"}));
+        agent.waitIdle();
+        CHECK(observed->requestCount() == 4 && agent.listPendingQuestions().empty());
+    }
+}
+
 void test_specialist_reply_keeps_existing_history_and_new_steering_in_order() {
     Workspace workspace;
     auto store = makeMaiMemoryStore();
@@ -1455,9 +2016,18 @@ int main() {
     test_repeated_tool_results_stop_before_hard_limit();
     test_no_tools_means_no_tool_field();
     test_model_exception_becomes_a_session_error();
+    test_steering_image_group_backpressure_keeps_rejected_input_retryable();
+    test_committed_text_is_persisted_and_announced_before_a_blocking_tool();
+    test_committed_text_covers_complete_response_items_without_early_or_duplicate_events();
+    test_failed_or_canceled_partial_text_does_not_produce_a_commit_receipt();
+    test_image_steering_survives_a_later_text_input_at_the_same_safe_boundary();
+    test_steering_receipt_precedes_new_assistant_update_and_names_consumed_inputs();
+    test_steering_receipt_can_arrive_before_the_submission_returns();
     test_steer_waits_for_all_tool_results_and_reaches_the_next_model_request();
     test_steer_rejects_empty_wrong_turn_and_stopped_work_without_restarting();
     test_steer_during_final_text_is_consumed_before_turn_completion();
+    test_directory_admission_guards_reject_stale_send_and_steer_without_store();
+    test_reply_directory_guards_do_not_consume_the_real_pending_gates();
     test_specialist_reply_keeps_existing_history_and_new_steering_in_order();
     if (failures == 0) std::printf("tool loop tests passed\n");
     return failures == 0 ? 0 : 1;

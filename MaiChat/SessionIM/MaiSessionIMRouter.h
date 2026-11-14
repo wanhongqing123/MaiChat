@@ -96,12 +96,22 @@ public:
         bool operator==(const TurnReceipt& other) const;
         bool operator!=(const TurnReceipt& other) const { return !(*this == other); }
     };
+    struct AcceptedInput {
+        QueuedInput input;
+        std::string userMessageId;
+    };
+    struct OutputAllocation {
+        Status status = Status::NotActive;
+        std::uint32_t firstIndex = 0;
+    };
     struct ActiveRoute {
         Reservation reservation;
         Phase phase = Phase::Reserved;
         std::optional<TurnReceipt> receipt;
         std::uint32_t dispatchCount = 0;
         std::uint32_t acknowledgedDispatches = 0;
+        // 原输入保留在 reservation；这里仅保存已被同一活动轮接收的补充输入元数据。
+        std::vector<AcceptedInput> followups;
     };
     struct Snapshot {
         Status status = Status::NotActive;
@@ -151,6 +161,25 @@ public:
     // 仅绑定普通 submit 的准确 user/assistant/turn 回执，绝不选择最新消息。
     Status bindReceipt(std::uint64_t token, const TurnReceipt& receipt,
                        const AccountScope& scope, const std::string& currentWorkspaceKey);
+    // 运行中只预约当前队首，不另建轮次。未准备好的队首仍阻挡后续媒体/文字。
+    // 预约不出队；Core 明确接收后 commitFollowup，Busy 收尾则原样 releaseFollowup。
+    ReservationResult reserveFollowup(std::uint64_t token, const AccountScope& scope,
+                                      const std::string& currentWorkspaceKey);
+    Status releaseFollowup(std::uint64_t token, std::uint64_t inputId, const AccountScope& scope,
+                           const std::string& currentWorkspaceKey);
+    Status commitFollowup(std::uint64_t token, std::uint64_t inputId, const std::string& userMessageId,
+                          const AccountScope& scope, const std::string& currentWorkspaceKey);
+    // 仅接受 Core 可信事件给出的同 turn 新段及其实际已消费 user IDs，绝不猜最新消息。
+    Status bindContinuation(std::uint64_t token, const std::string& turnId, const std::string& assistantMessageId,
+                            const std::vector<std::string>& consumedUserIds, const AccountScope& scope,
+                            const std::string& currentWorkspaceKey);
+    std::optional<QueuedInput> inputForReceipt(std::uint64_t token, const TurnReceipt& receipt,
+                                               const AccountScope& scope, const std::string& currentWorkspaceKey) const;
+    // 阶段输出分配单调、不复用的 index；ack 不结束 Running。整轮结束后由 sealOutput 封口。
+    OutputAllocation appendOutput(std::uint64_t token, const TurnReceipt& receipt, const AccountScope& scope,
+                                  const std::string& currentWorkspaceKey, std::uint32_t dispatchCount);
+    Status sealOutput(std::uint64_t token, const TurnReceipt& receipt, const AccountScope& scope,
+                      const std::string& currentWorkspaceKey);
     // Host 先核对 canonical assistant 已结束、正文/媒体可交付，再声明 SDK 派发数。
     // 重复调用不会重置已确认项；只有首次 Ok 才应开始派发。
     Status beginOutput(std::uint64_t token, const TurnReceipt& receipt,

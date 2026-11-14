@@ -173,6 +173,8 @@ public:
     // 使尚未落盘的最新文字仍显示在所属会话中。
     QString livePartText(const QString& sessionId, const QString& partId) const;
 
+    // Returns a value snapshot shared by GUI validation and worker Stop errors.
+    // Copying this diagnostic is thread-safe; it does not make other GUI APIs so.
     QString lastError() const;
 
 signals:
@@ -184,6 +186,12 @@ signals:
 
     // 模型说给用户听的话，一次一小段。**不带全量**，界面自己往后追加。
     void textDelta(const QString& sessionId, const QString& messageId, const QString& partId, const QString& delta);
+    // 一次模型响应的公开正文已经落库；不等于整个活动轮次结束，也不包含推理或工具原始输出。
+    void textCommitted(const QString& sessionId, const QString& messageId, const QString& partId,
+                       const QString& turnId);
+    // Core 在同一稳定 turn 中消费了准确补充输入并建立新 assistant 段。
+    void steeringApplied(const QString& sessionId, const QString& assistantMessageId, const QString& turnId,
+                         const QStringList& inputMessageIds);
 
     // 模型的思考过程。界面通常折叠显示，或者干脆不显示——但**至少要让用户知道它在想**：
     // 真实的推理模型思考期能有十几秒，这段时间里一个正文字符都不会来，屏幕上没反应和卡死分不开。
@@ -205,6 +213,9 @@ signals:
 
     // 这一轮结束了。界面据此收起"正在输入"，并把输入框解锁。
     void turnFinished(const QString& sessionId);
+    // Only a successful exact-turn Stop emits this signal. Receivers may connect
+    // directly across threads solely to revoke thread-safe ownership markers.
+    void turnInterrupted(const QString& sessionId, const QString& turnId);
     // 这一轮出错了。**用户主动中断不会走这里**——那不是故障。
     void turnFailed(const QString& sessionId, const QString& message);
     // 会话标题变了（第一轮结束后会用用户那句话自动填上）。

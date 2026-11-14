@@ -249,11 +249,79 @@ public class MaiSessionIMBindingServiceTest {
         ticket.metadataPersisted(new RemoteIMIngress.Stored("row-" + remote, remote, 100, inserted));
     }
 
+    private JSONObject approvalDelivery(String token) throws Exception {
+        return new JSONObject().put("bridge_id", "bridge").put("scope", backend.scope()).put("peer_id", "peer")
+            .put("session_id", "session").put("workspace_key", "/workspace").put("token", "9").put("dispatch_index", "3")
+            .put("turn_id", "msg_original").put("kind", "text").put("text", "Review operation")
+            .put("opaque_future", new JSONObject().put("proof", "retained"))
+            .put("interaction", new JSONObject().put("kind", "approval-request").put("token", token)
+                .put("actions", new JSONArray().put("approve-once").put("reject")));
+    }
+
+    @Test public void approvalUsesImmutableOriginalOnlyAfterActualFirstWriteAndNeverBecomesPrompt() throws Exception {
+        try (MaiSessionIMBindingService service = service()) {
+            service.forPeer("peer").bind("session", (value, error) -> assertNull(error));
+            JSONObject original = approvalDelivery("approval-first"); String immutable = original.toString();
+            backend.observer.delivery(original); original.put("turn_id", "msg_mutated");
+            TencentIMClient.LiveAuthority authority = service.captureAuthority();
+            RemoteIMApprovalDecision decision = new RemoteIMApprovalDecision("approval-first", RemoteIMApprovalAction.APPROVE_ONCE);
+            TencentIMClient.LiveAdmission duplicate = authority.approvalDecision("peer", "owner", "duplicate", RemoteIMOrigin.HUMAN, decision);
+            assertNotNull(duplicate); stored(duplicate, "duplicate", false);
+            assertEquals(0, backend.controlCount("approval_decision"));
+            TencentIMClient.LiveAdmission ticket = authority.approvalDecision("peer", "owner", "actual-sdk", RemoteIMOrigin.HUMAN, decision);
+            assertNotNull(ticket); assertEquals(0, backend.controlCount("approval_decision"));
+            stored(ticket, "actual-sdk", true); stored(ticket, "actual-sdk", true);
+            assertEquals(1, backend.controlCount("approval_decision"));
+            JSONObject sent = backend.controls.stream().filter(v -> "approval_decision".equals(v.optString("action"))).findFirst().orElseThrow();
+            assertEquals(immutable, sent.getJSONObject("approval").toString());
+            assertEquals("actual-sdk", sent.getString("message_id")); assertEquals("peer", sent.getString("sender_id"));
+            assertEquals("owner", sent.getString("recipient_id")); assertTrue(sent.getBoolean("live")); assertFalse(sent.getBoolean("group"));
+            assertEquals(0, backend.controlCount("admit")); assertTrue(backend.incoming.isEmpty());
+            assertNull(authority.approvalDecision("peer", "owner", "repeat", RemoteIMOrigin.HUMAN, decision));
+        }
+    }
+
+    @Test public void approvalRejectsWrongPeerMachineUnlistedActionStaleScopeAndResolution() throws Exception {
+        try (MaiSessionIMBindingService service = service()) {
+            service.forPeer("peer").bind("session", (value, error) -> {});
+            JSONObject original = approvalDelivery("approval-guarded"); backend.observer.delivery(original);
+            TencentIMClient.LiveAuthority authority = service.captureAuthority();
+            RemoteIMApprovalDecision yes = new RemoteIMApprovalDecision("approval-guarded", RemoteIMApprovalAction.APPROVE_ONCE);
+            assertNull(authority.approvalDecision("other", "owner", "wrong-peer", RemoteIMOrigin.HUMAN, yes));
+            assertNull(authority.approvalDecision("peer", "another-owner", "wrong-owner", RemoteIMOrigin.HUMAN, yes));
+            assertNull(authority.approvalDecision("peer", "owner", "machine", RemoteIMOrigin.MACHINE, yes));
+            assertNull(authority.approvalDecision("peer", "owner", "prefix", RemoteIMOrigin.HUMAN,
+                new RemoteIMApprovalDecision(yes.token(), RemoteIMApprovalAction.APPROVE_PREFIX)));
+            TencentIMClient.LiveAdmission stale = authority.approvalDecision("peer", "owner", "stale", RemoteIMOrigin.HUMAN, yes);
+            backend.workspace = "/changed"; backend.observer.projection(backend.projection()); stored(stale, "stale", true);
+            assertEquals(0, backend.controlCount("approval_decision"));
+            backend.workspace = "/workspace"; backend.observer.projection(backend.projection()); backend.observer.delivery(original);
+            JSONObject resolved = new JSONObject(original.toString()).put("interaction", new JSONObject()
+                .put("kind", "approval-resolved").put("token", yes.token()).put("outcome", "resolved"));
+            backend.observer.delivery(resolved);
+            assertNull(service.captureAuthority().approvalDecision("peer", "owner", "resolved", RemoteIMOrigin.HUMAN, yes));
+            assertNotNull(service.capture("peer", "owner", "plain-A", RemoteIMOrigin.HUMAN, false, true));
+            assertEquals(1, backend.controlCount("admit"));
+        }
+    }
+
+    @Test public void activitiesUseIndependentLaneAndPreserveCompleteOwnershipEnvelope() throws Exception {
+        try (MaiSessionIMBindingService service = service()) {
+            JSONObject activity = new JSONObject().put("bridge_id", "bridge").put("scope", backend.scope())
+                .put("peer_id", "peer").put("opaque_future", "keep").put("signal", new JSONObject().put("activityId", "evt_one"));
+            String original = activity.toString(); backend.observer.activity(activity);
+            assertEquals(original, host.activities.get(0).toString());
+            assertEquals(original, MaiSessionIMBindingService.activityControl("claim_activity", activity).getJSONObject("activity").toString());
+            assertEquals(0, backend.controlCount("admit"));
+        }
+    }
+
     private static RemoteIMMessage message(String id, String from, String to, RemoteIMOrigin origin) {
         return new RemoteIMMessage("local-" + id, id, from, to, "exact body", RemoteIMMessage.Direction.INCOMING,
             RemoteIMMessage.Status.RECEIVED, 100, null, null, null, null, origin);
     }
     private static final class Host implements MaiSessionIMBindingService.Host {
+        final List<JSONObject> activities = new ArrayList<>();
         boolean active = true;
         String sdk = "123";
         int fences;
@@ -271,6 +339,7 @@ public class MaiSessionIMBindingServiceTest {
             return false;
         }
         @Override public void delivery(JSONObject value, MaiSessionIMBindingService.Backend backend) { }
+        @Override public void activity(JSONObject value, MaiSessionIMBindingService.Backend backend) { activities.add(value); }
         @Override public RemoteIMIngress.Fence historyFence(JSONObject task) {
             assertTrue("Provisional admission projection must be published before fence capture", published.getAsBoolean());
             fences++;
@@ -322,6 +391,7 @@ public class MaiSessionIMBindingServiceTest {
             if (value.optString("action").equals("admit")) {
                 put(result, "accepted", true); put(result, "input_id", Integer.toString(++inputs));
             }
+            if (value.optString("action").equals("approval_decision")) put(result, "accepted", true);
             return result;
         }
         @Override public void historyTask(JSONObject task, RemoteIMIngress.Fence fence) {

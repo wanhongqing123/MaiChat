@@ -2,6 +2,19 @@
 import XCTest
 
 final class SocialLoginUITests: XCTestCase {
+    @MainActor func testSessionBindingConsumesActivityAndApprovalWireV2() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ai-ui-test", "--im-group-ui-test", "--im-session-binding-host-ui-test", "--im-session-wire-v2-ui-test"]
+        app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
+        app.launch()
+        defer { app.terminate() }
+        let status = app.staticTexts["im-session-host-status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        let complete = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH 'PASS' OR label BEGINSWITH 'FAIL'"), object: status)
+        XCTAssertEqual(XCTWaiter.wait(for: [complete], timeout: 15), .completed)
+        XCTAssertTrue(status.label.hasPrefix("PASS"), status.label)
+    }
     /// 仅用既有隔离 IM 夹具走普通私聊入口；不点击旧回复生成按钮或调用模型。
     @MainActor func testSessionBindingReplacesIndependentAIReplyEntry() {
         continueAfterFailure = false

@@ -63,6 +63,14 @@ private final class SessionBindingTestIMClient: RemoteIMClient {
     var beforeClaim: (() -> Void)?
     var heldReceipt: CheckedContinuation<RemoteIMSendReceipt, Error>?
     var rejectedClaims = 0
+    var sessionActivities: [RemoteIMActivitySignal] = []
+    func sendSessionActivity(_ signal: RemoteIMActivitySignal, to userID: String,
+                             permit: IMSessionActivityPermit) async throws {
+        guard permit.claim(accountTag: RemoteDiagnosticsProtocol.accountTag(
+            sdkAppID: 1, ownerUserID: GroupChatUITestData.ownerID)) else { throw CancellationError() }
+        defer { permit.acknowledge() }
+        sessionActivities.append(signal)
+    }
     func sendSessionReply(_ payload: IMSessionOutgoingPayload, to userID: String,
                           permit: IMSessionDispatchPermit) async throws -> RemoteIMSendReceipt {
         beforeClaim?(); beforeClaim = nil
@@ -131,7 +139,9 @@ struct IMSessionBindingUITestRoot: View {
             }
             .task {
                 guard !started else { return }; started = true
-                if ProcessInfo.processInfo.arguments.contains("--im-session-maintenance-warning-ui-test") {
+                if ProcessInfo.processInfo.arguments.contains("--im-session-wire-v2-ui-test") {
+                    runWireV2Contract()
+                } else if ProcessInfo.processInfo.arguments.contains("--im-session-maintenance-warning-ui-test") {
                     runMaintenanceWarningContract()
                 } else if ProcessInfo.processInfo.arguments.contains("--im-raw-metadata-ui-test") {
                     await runRawSDKMetadata()
@@ -144,6 +154,40 @@ struct IMSessionBindingUITestRoot: View {
     }
     @MainActor private func check(_ value: Bool, _ message: String) throws {
         if !value { throw AIBackendError(message: message) }
+    }
+    @MainActor private func runWireV2Contract() {
+        do {
+            // 字段直接来自 producer 冻结 wire contract；不重造 claim/ack ownership。
+            let raw = #"""
+            {"ok":true,"activities":[{"bridge_id":"owned-wire","scope":{"sdk_app_id":"1","owner_id":"owner","auth_generation":"1","controller_generation":"1"},"peer_id":"peer","session_id":"ses_owned","workspace_key":"workspace","binding_epoch":"2","token":"token","turn_id":"msg_owned","future":{"owned":true},"signal":{"namespace":"multi-ai-code-activity","version":2,"activityId":"evt_owned","sequence":3,"kind":"machine-waiting","active":true,"startedAtMs":1000,"taskStartedAtMs":900,"ttlMs":12000}}],"deliveries":[{"bridge_id":"owned-wire","scope":{"sdk_app_id":"1","owner_id":"owner","auth_generation":"1","controller_generation":"1"},"peer_id":"peer","session_id":"ses_owned","token":"token","dispatch_index":"4","kind":"text","text":"Approve this paid call?","question_id":"qst_owned","future":{"retained":true},"interaction":{"kind":"approval-request","token":"approval-owned","actions":["approve-once","reject"]}}]}
+            """#
+            let projection = try JSONDecoder().decode(IMSessionBindingProjection.self, from: Data(raw.utf8))
+            guard let activity = projection.activities.first, let delivery = projection.deliveries.first,
+                  let signal = activity.signal, case .approvalRequest(let request) = delivery.interaction,
+                  let scope = delivery.scope else { throw AIBackendError(message: "v2 wire 未被消费") }
+            try check(signal.kind == .machineWaiting && signal.sequence == 3 && signal.ttlMilliseconds == 12000,
+                      "activity 字段或类型错误")
+            try check(try IMSessionJSON.value(activity) == .object(activity.fields), "activity 原字段丢失")
+            try check(try IMSessionJSON.value(delivery) == .object(delivery.fields), "delivery 原字段丢失")
+            try check(delivery.string("question_id") == "qst_owned" && !request.allows(.approvePrefix),
+                      "普通 question/逐次 paid actions 被改写")
+            for action in ["claim_activity", "ack_activity", "approval_decision"] {
+                try check(!IMSessionBindingControl.accepts(action: action, response: ["ok": .bool(true)]),
+                          "缺失控制回执被放行: " + action)
+            }
+            let requests = IMSessionApprovalRequests()
+            requests.recordClaimed(delivery)
+            defer { requests.clear(scope: scope) }
+            let decision = RemoteIMApprovalDecision(token: request.token, action: .approveOnce)!
+            try check(!requests.receive(decision, accountTag: nil, peerID: "peer", messageID: "sdk-1",
+                recipientID: "owner", origin: .human, group: false), "错误账号可审批")
+            try check(!requests.receive(decision, accountTag: nil, peerID: "peer", messageID: "sdk-1",
+                recipientID: "owner", origin: .machine, group: false), "Machine 可审批")
+            let ordinary = RemoteIMCloudMetadata(origin: .human)
+            try check(RemoteIMCloudMetadataCodec.decode(RemoteIMCloudMetadataCodec.encode(ordinary))?.interaction == nil,
+                      "普通文字被当成审批")
+            status = "PASS v2 wire: activity/immutable envelopes/paid actions/control replies"
+        } catch { status = "FAIL v2 wire: " + error.localizedDescription }
     }
     @MainActor private func wait(_ condition: () -> Bool, _ message: String) async throws {
         let deadline = Date().addingTimeInterval(15)
@@ -416,6 +460,10 @@ struct IMSessionBindingUITestRoot: View {
             try await wait({ client.dispatched.count >= 2 }, "原 FIFO/网络回执分离未前进")
             try check(client.dispatched[0].contains("first-media-A") && client.dispatched[1].contains("second-text-B"),
                       "回复顺序或 exact receipt 归属错误")
+            try await wait({ !client.sessionActivities.isEmpty }, "Native activity 未经独立 SDK 边界发送")
+            try check(client.sessionActivities.allSatisfy {
+                $0.kind != .humanTyping && $0.sequence > 0 && $0.ttlMilliseconds == 12_000
+            }, "绑定活动与既有 v2 SDK 信号不一致")
             try check(client.heldReceipt != nil, "第一条回执没有被独立保留")
             client.heldReceipt?.resume(returning: RemoteIMSendReceipt(remoteID: nil, createdAt: nil))
             client.heldReceipt = nil

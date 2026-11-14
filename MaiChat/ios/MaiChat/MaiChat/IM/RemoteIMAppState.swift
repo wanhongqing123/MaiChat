@@ -4482,4 +4482,13 @@ extension RemoteIMAppState {
             if imSessionHostIdentity == identity { imSessionBindingError = error.localizedDescription }
         }
     }
+
+    func sendIMSessionActivity(_ activity: IMSessionActivity, permit: IMSessionActivityPermit) async {
+        guard let scope = activity.scope, let identity = imSessionHostIdentity,
+              identity.ownerID == scope.ownerID, identity.sdkAppID == scope.sdkAppID,
+              identity.generation == scope.authGeneration, connectionState == .connected,
+              acceptedFriendIMIDs.contains(activity.peerID), let signal = activity.signal else { return }
+        // 工作状态是短期后台信号；失败依赖 Native heartbeat/接收端 TTL，不污染消息发送错误。
+        try? await client.sendSessionActivity(signal, to: activity.peerID, permit: permit)
+    }
 }

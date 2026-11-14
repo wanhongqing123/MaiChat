@@ -365,6 +365,83 @@ void historyOverlapWaitsForActualPersistenceAndKeepsBenignReplay() {
     CHECK(next.input.persistenceKnown && next.input.persistedRowId == "fresh-local");
 }
 
+void progressAcksKeepTheOwnedTurnAndContinuationReceipts() {
+    Fixture f;
+    CHECK(f.router.accept(f.message("first")).status == Status::Ok);
+    const auto followup = f.router.accept(f.message("followup"));
+    CHECK(followup.input);
+    const auto reservation = f.reserve();
+    const auto initial = f.receipt();
+    CHECK(f.router.bindReceipt(reservation.token, initial, f.scope, "workspace-one") == Status::Ok);
+    const auto progress = f.router.appendOutput(reservation.token, initial, f.scope, "workspace-one", 1);
+    CHECK(progress.status == Status::Ok && progress.firstIndex == 0);
+    CHECK(f.router.acknowledgeDispatch(reservation.token, initial, f.scope, "workspace-one", 0) == Status::Ok);
+    CHECK(f.router.snapshot(f.scope).active.front().phase == Router::Phase::Running);
+    CHECK(f.router.snapshot(f.scope).pendingCount == 1);
+    CHECK(f.router.reserveNext(f.scope, "session", "workspace-one", true).status == Status::Busy);
+    const auto steering = f.router.reserveFollowup(reservation.token, f.scope, "workspace-one");
+    CHECK(steering.reservation && steering.reservation->input.inputId == followup.input->inputId);
+    CHECK(f.router.reserveFollowup(reservation.token, f.scope, "workspace-one").status == Status::Busy);
+    CHECK(f.router.commitFollowup(reservation.token, followup.input->inputId, "steered-user", f.scope,
+                                  "workspace-one") == Status::Ok);
+    CHECK(f.router.snapshot(f.scope).pendingCount == 0);
+    CHECK(f.router.bindContinuation(reservation.token, initial.turnId, "continued-assistant", {"foreign-user"}, f.scope,
+                                    "workspace-one") == Status::InvalidReceipt);
+    CHECK(f.router.bindContinuation(reservation.token, "wrong-turn", "continued-assistant", {"steered-user"}, f.scope,
+                                    "workspace-one") == Status::InvalidReceipt);
+    CHECK(f.router.bindContinuation(reservation.token, initial.turnId, "continued-assistant", {"steered-user"}, f.scope,
+                                    "workspace-one") == Status::Ok);
+    const auto continued = *f.router.snapshot(f.scope).active.front().receipt;
+    CHECK(continued.userMessageId == "steered-user" && continued.assistantMessageId == "continued-assistant");
+    CHECK(f.router.inputForReceipt(reservation.token, continued, f.scope, "workspace-one")->source.messageId ==
+          "followup");
+    CHECK(f.router.isOutputCurrent(reservation.token, initial, f.scope, "workspace-one"));
+    const auto final = f.router.appendOutput(reservation.token, continued, f.scope, "workspace-one", 1);
+    CHECK(final.status == Status::Ok && final.firstIndex == 1);
+    CHECK(f.router.sealOutput(reservation.token, initial, f.scope, "workspace-one") == Status::InvalidReceipt);
+    CHECK(f.router.sealOutput(reservation.token, continued, f.scope, "workspace-one") == Status::Ok);
+    CHECK(f.router.acknowledgeDispatch(reservation.token, initial, f.scope, "workspace-one", 1) ==
+          Status::InvalidReceipt);
+    CHECK(f.router.acknowledgeDispatch(reservation.token, continued, f.scope, "workspace-one", 1) == Status::Ok);
+    CHECK(f.router.snapshot(f.scope).active.empty());
+}
+
+void followupBusyReleaseAndEmptyFinalKeepExactPendingWork() {
+    Fixture f;
+    CHECK(f.router.accept(f.message("first")).status == Status::Ok);
+    const auto followup = f.router.accept(f.message("second"));
+    const auto reservation = f.reserve();
+    const auto receipt = f.receipt();
+    CHECK(f.router.bindReceipt(reservation.token, receipt, f.scope, "workspace-one") == Status::Ok);
+    const auto reserved = f.router.reserveFollowup(reservation.token, f.scope, "workspace-one");
+    CHECK(reserved.reservation && reserved.reservation->input.inputId == followup.input->inputId);
+    CHECK(f.router.releaseFollowup(reservation.token, followup.input->inputId, f.scope, "workspace-one") == Status::Ok);
+    CHECK(f.router.snapshot(f.scope).pending.front().inputId == followup.input->inputId);
+    CHECK(f.router.appendOutput(reservation.token, receipt, f.scope, "workspace-one", 1).status == Status::Ok);
+    CHECK(f.router.finishWithoutOutput(reservation.token, receipt, f.scope, "workspace-one") == Status::Ok);
+    CHECK(f.router.snapshot(f.scope).active.size() == 1);
+    CHECK(f.router.acknowledgeDispatch(reservation.token, receipt, f.scope, "workspace-one", 0) == Status::Ok);
+    CHECK(f.router.snapshot(f.scope).active.empty());
+    const auto next = f.reserve();
+    CHECK(next.input.inputId == followup.input->inputId);
+}
+
+void discardedReservedFollowupDoesNotLatchTheTurn() {
+    Fixture f;
+    CHECK(f.router.accept(f.message("first")).status == Status::Ok);
+    const auto reservation = f.reserve();
+    const auto receipt = f.receipt();
+    CHECK(f.router.bindReceipt(reservation.token, receipt, f.scope, "workspace-one") == Status::Ok);
+    const auto canceled = f.router.accept(f.message("canceled-media"));
+    CHECK(f.router.reserveFollowup(reservation.token, f.scope, "workspace-one").reservation);
+    CHECK(f.router.discardInput(f.scope, canceled.input->inputId) == Status::Ok);
+    const auto next = f.router.accept(f.message("later"));
+    const auto ready = f.router.reserveFollowup(reservation.token, f.scope, "workspace-one");
+    CHECK(ready.reservation && ready.reservation->input.inputId == next.input->inputId);
+    CHECK(f.router.releaseFollowup(reservation.token, next.input->inputId, f.scope, "workspace-one") == Status::Ok);
+    CHECK(f.router.sealOutput(reservation.token, receipt, f.scope, "workspace-one") == Status::Ok);
+}
+
 }  // namespace
 
 int main() {
@@ -375,6 +452,9 @@ int main() {
         {"pending bound and overflow dedupe", pendingLimitIncludesPreparationAndOverflowDoesNotReplay},
         {"Busy FIFO retry", busyRetryKeepsExactInputAtFrontButRenewsReservation},
         {"exact receipts and dispatch FIFO", exactReceiptsAndUniqueDispatchAcksHoldFifo},
+        {"progress and continuation receipts", progressAcksKeepTheOwnedTurnAndContinuationReceipts},
+        {"followup Busy and empty final", followupBusyReleaseAndEmptyFinalKeepExactPendingWork},
+        {"discard reserved followup", discardedReservedFollowupDoesNotLatchTheTurn},
         {"failed canonical turn", failedCanonicalTurnReleasesWithoutOutput},
         {"revocation in every phase", everyRevocationPhaseRemovesAuthorityAndKeepsOtherSession},
         {"bounded account-aware dedupe", rememberedInputsStayBoundedAndSeparatePeersAndOwners},

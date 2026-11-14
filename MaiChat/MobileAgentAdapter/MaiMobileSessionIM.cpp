@@ -3,9 +3,11 @@
 #include "MaiSessionIMRouter.h"
 #include "MaiAgent.h"
 #include "MaiAgentSendMediaTool.h"
+#include "MaiAgentSendFileTool.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiPathGuard.h"
+#include "MaiIdGenerator.h"
 #include "MaiTool.h"
 #include "MaiIMHistorySnapshot.h"
 #include "MaiIMHistoryFormat.h"
@@ -153,6 +155,34 @@ struct Watch {
     const std::thread::id submitThread = std::this_thread::get_id();
     bool capturing = true;
     std::vector<std::string> ids;
+    std::string turnId;
+    std::string directory;
+    bool admitting = false;
+    std::thread::id admissionThread;
+    std::vector<std::string> admissionIds;
+    struct Text {
+        std::string messageId, partId, turnId;
+    };
+    struct Continuation {
+        std::string messageId, turnId;
+        std::vector<std::string> inputs;
+    };
+    std::vector<Text> committed;
+    std::vector<Continuation> continuations;
+    std::set<std::string> provisionalAssistants;
+    std::map<std::string, Router::TurnReceipt> segments;
+    std::set<std::string> sentParts;
+    std::set<std::string> sentMedia;
+    std::set<std::string> sentQuestions;
+    std::string questionId;
+    std::string permissionId;
+    std::map<std::string, std::string> resolvedPermissions;
+    bool activityDirty = true;
+    std::string activityId = MaiIdGenerator::newEventId();
+    std::string activityKind = "machine-working";
+    std::uint64_t activitySequence = 0;
+    MaiMillis taskStartedAt = 0, phaseStartedAt = 0;
+    Clock::time_point lastActivity{};
     std::atomic<bool> valid{true};
     std::atomic<bool> failed{false};
 };
@@ -182,6 +212,7 @@ struct InputRecord {
     Router::QueuedInput input;
     Clock::time_point admitted = Clock::now();
     std::optional<Payload> payload;
+    std::string questionId;
 };
 
 struct DeliveryRecord {
@@ -192,6 +223,34 @@ struct DeliveryRecord {
     std::shared_ptr<Signal> signal;
     std::shared_ptr<Watch> receiptWatch;
     std::uint64_t revision = 0;
+    bool claimed = false;
+    Clock::time_point expires;
+    bool terminalControl = false;
+    bool committedText = false;
+};
+
+struct ApprovalRecord {
+    Router::Binding binding;
+    Router::TurnReceipt receipt;
+    std::uint64_t token = 0;
+    MaiPermissionRequest permission;
+    std::shared_ptr<Watch> watch;
+    std::shared_ptr<Signal> signal;
+    std::uint64_t revision = 0;
+    Json envelope;
+    std::optional<MaiPermissionDecision> decision;
+    bool submitted = false;
+    bool resolved = false;
+};
+
+struct ActivityRecord {
+    Json value;
+    Router::Binding binding;
+    std::uint64_t token = 0;
+    std::shared_ptr<Watch> watch;
+    std::shared_ptr<Signal> signal;
+    std::uint64_t revision = 0;
+    bool terminal = false;
     bool claimed = false;
     Clock::time_point expires;
 };
@@ -238,6 +297,8 @@ struct Authority {
     std::set<std::string> acceptedFriends;
     std::map<std::uint64_t, InputRecord> inputs;
     std::map<std::pair<std::uint64_t, std::uint32_t>, DeliveryRecord> deliveries;
+    std::map<std::string, ActivityRecord> activities;
+    std::map<std::string, ApprovalRecord> approvals;
     std::set<std::string> changed;
     std::vector<Json> warnings;
     std::optional<HistorySource> historySource;
@@ -318,6 +379,8 @@ void clearLocked(Authority& state) {
     state.scope.reset();
     state.inputs.clear();
     state.deliveries.clear();
+    state.activities.clear();
+    state.approvals.clear();
     state.warnings.clear();
     for (const auto& item : state.history) {
         item.second->canceled->store(true);
@@ -333,14 +396,53 @@ void clearLocked(Authority& state) {
     state.observers->sessions.clear();
 }
 
+void terminalApprovalLocked(Authority& state, const std::string& publicToken, const ApprovalRecord& approval) {
+    if (!state.scope || approval.envelope.empty()) return;
+    auto allocation =
+        state.router.appendOutput(approval.token, approval.receipt, *state.scope, approval.binding.workspaceKey, 1);
+    std::uint64_t index = allocation.firstIndex;
+    if (allocation.status != Router::Status::Ok) {
+        // 已退役的路由只允许清理其私有记录中的原随机审批 token，不能恢复普通输出权限。
+        index = number(approval.envelope.at("dispatch_index"), true);
+        for (const auto& item : state.deliveries)
+            if (item.first.first == approval.token) index = std::max(index, std::uint64_t(item.first.second));
+        if (index >= std::numeric_limits<std::uint32_t>::max()) return;
+        ++index;
+    }
+    auto value = approval.envelope;
+    value["dispatch_index"] = std::to_string(index);
+    value["text"] = "Approval is no longer pending.";
+    value["interaction"] = {{"kind", "approval-resolved"}, {"token", publicToken}, {"outcome", "resolved"}};
+    DeliveryRecord delivery{value,
+                            approval.receipt,
+                            approval.binding.workspaceKey,
+                            approval.binding.sessionId,
+                            approval.signal,
+                            approval.watch,
+                            approval.revision,
+                            false,
+                            Clock::now() + state.outputBudget};
+    delivery.terminalControl = true;
+    state.deliveries[{approval.token, std::uint32_t(index)}] = std::move(delivery);
+}
+
 void revokeLocked(Authority& state, const std::string& session) {
     state.cleanupSessions.insert(session);
     cancelHistoryLocked(state, session);
+    for (auto it = state.approvals.begin(); it != state.approvals.end();) {
+        const auto& approval = it->second;
+        if (approval.binding.sessionId != session) {
+            ++it;
+            continue;
+        }
+        terminalApprovalLocked(state, it->first, approval);
+        it = state.approvals.erase(it);
+    }
     if (state.scope) state.router.revokeSession(*state.scope, session);
     for (auto it = state.inputs.begin(); it != state.inputs.end();)
         it = it->second.input.binding.sessionId == session ? state.inputs.erase(it) : std::next(it);
     for (auto it = state.deliveries.begin(); it != state.deliveries.end();)
-        it = it->second.session == session ? state.deliveries.erase(it) : std::next(it);
+        it = it->second.session == session && !it->second.terminalControl ? state.deliveries.erase(it) : std::next(it);
     state.changed.insert(session);
 }
 
@@ -355,7 +457,11 @@ void observe(const std::weak_ptr<Authority>& weak, const MaiEvent& event) {
     const auto signal = signalFor(state, event.sessionId);
     if (!signal) return;
     if (event.type == MaiEventType::SessionUpdated) {
-        ++signal->revision;
+        if (event.field != "title" && event.field != "input") {
+            ++signal->revision;
+            std::lock_guard<std::mutex> lock(signal->mutex);
+            if (signal->watch) signal->watch->valid = false;
+        }
         return;
     }
     std::shared_ptr<Watch> watch;
@@ -371,9 +477,51 @@ void observe(const std::weak_ptr<Authority>& weak, const MaiEvent& event) {
     }
     if (watch) {
         std::lock_guard<std::mutex> lock(watch->mutex);
+        const bool known = std::find(watch->ids.begin(), watch->ids.end(), event.messageId) != watch->ids.end() ||
+                           watch->provisionalAssistants.count(event.messageId);
+        if (event.type == MaiEventType::MessageTextCommitted) {
+            if ((!watch->turnId.empty() && watch->turnId != event.turnId) || !known)
+                watch->valid = false;
+            else
+                watch->committed.push_back({event.messageId, event.partId, event.turnId});
+            return;
+        }
+        if (event.type == MaiEventType::TurnSteeringApplied) {
+            if (watch->turnId != event.turnId || event.inputMessageIds.empty())
+                watch->valid = false;
+            else {
+                watch->provisionalAssistants.insert(event.messageId);
+                watch->continuations.push_back({event.messageId, event.turnId, event.inputMessageIds});
+            }
+            return;
+        }
+        if (event.type == MaiEventType::QuestionAsked && known) {
+            watch->questionId = event.questionId;
+            watch->activityDirty = true;
+            return;
+        }
+        if (event.type == MaiEventType::QuestionAnswered && watch->questionId == event.questionId) {
+            watch->questionId.clear();
+            watch->activityDirty = true;
+            return;
+        }
+        if (event.type == MaiEventType::PermissionAsked && known) {
+            watch->permissionId = event.permissionId;
+            watch->activityDirty = true;
+            return;
+        }
+        if (event.type == MaiEventType::PermissionReplied && watch->permissionId == event.permissionId) {
+            watch->resolvedPermissions[event.permissionId] = event.detail;
+            watch->permissionId.clear();
+            watch->activityDirty = true;
+            return;
+        }
+        if (event.type == MaiEventType::MessagePartUpdated && known) {
+            watch->activityDirty = true;
+            return;
+        }
         if (watch->capturing && watch->submitThread == std::this_thread::get_id()) {
-            if (event.type == MaiEventType::MessageUpdated && !event.messageId.empty() &&
-                std::find(watch->ids.begin(), watch->ids.end(), event.messageId) == watch->ids.end()) {
+            if (event.type == MaiEventType::MessageUpdated && !event.messageId.empty() && !known) {
                 if (watch->ids.size() < 2)
                     watch->ids.push_back(event.messageId);
                 else
@@ -383,9 +531,15 @@ void observe(const std::weak_ptr<Authority>& weak, const MaiEvent& event) {
                 watch->valid = false;
             return;
         }
-        if (event.type == MaiEventType::MessageUpdated &&
-            std::find(watch->ids.begin(), watch->ids.end(), event.messageId) != watch->ids.end())
-            return;
+        if (event.type == MaiEventType::MessageUpdated) {
+            if (known) return;
+            if (watch->admitting && watch->admissionThread == std::this_thread::get_id() &&
+                watch->admissionIds.empty()) {
+                watch->admissionIds.push_back(event.messageId);
+                watch->ids.push_back(event.messageId);
+                return;
+            }
+        }
     } else if (event.type == MaiEventType::MessageUpdated && prior)
         return;
     if (event.type != MaiEventType::MessageUpdated && event.type != MaiEventType::MessageRemoved &&
@@ -721,8 +875,8 @@ struct MaiMobileSessionIM::Impl {
                 {"pending_count", snapshot.pendingCount},
                 {"history_tasks", tasks},
                 {"history_progress_all", progress},
-                {"history_cleanup_pending", state->cleanupRestorePending || !state->cleanupSessions.empty() ||
-                    !state->historyReap.empty()}};
+                {"history_cleanup_pending",
+                 state->cleanupRestorePending || !state->cleanupSessions.empty() || !state->historyReap.empty()}};
     }
 
     void bind(const Json& request, const std::function<void()>& beforeMutation = {}) {
@@ -809,9 +963,9 @@ struct MaiMobileSessionIM::Impl {
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             auto& jobs = state->historyReap;
-            jobs.erase(std::remove_if(jobs.begin(), jobs.end(), [](const auto& item) {
-                return item->importId.empty() || item->committed;
-            }), jobs.end());
+            jobs.erase(std::remove_if(jobs.begin(), jobs.end(),
+                                      [](const auto& item) { return item->importId.empty() || item->committed; }),
+                       jobs.end());
             if (!agent || jobs.empty() || historyAbortAttempts == 0 || Clock::now() < state->nextHistoryAbortAttempt)
                 return;
             job = jobs.front();
@@ -832,8 +986,9 @@ struct MaiMobileSessionIM::Impl {
         state->nextHistoryAbortAttempt = Clock::now() + std::chrono::seconds(1);
         historyAbortFailedThisRequest = true;
         if (state->cleanupWarned.insert(job->binding.sessionId).second)
-            state->warnings.push_back({{"code", "history_cleanup_failed"}, {"session_id", job->binding.sessionId},
-                {"outcome", "retry_local_cleanup"}});
+            state->warnings.push_back({{"code", "history_cleanup_failed"},
+                                       {"session_id", job->binding.sessionId},
+                                       {"outcome", "retry_local_cleanup"}});
     }
 
     void purgeRetiredHistory() {
@@ -927,7 +1082,8 @@ struct MaiMobileSessionIM::Impl {
         for (const auto& session : expiredHistory) failHistoryLocked(*state, session, "history_timeout");
         std::vector<std::uint64_t> expiredInputs;
         for (const auto& item : state->inputs)
-            if ((!item.second.payload || !item.second.input.persistenceKnown) && now - item.second.admitted >= readiness)
+            if ((!item.second.payload || !item.second.input.persistenceKnown) &&
+                now - item.second.admitted >= readiness)
                 expiredInputs.push_back(item.first);
         for (const auto id : expiredInputs) {
             const auto input = state->inputs.find(id);
@@ -938,8 +1094,10 @@ struct MaiMobileSessionIM::Impl {
                 continue;
             }
             state->router.discardInput(scope, id);
-            state->warnings.push_back({{"code", "input_timeout"}, {"input_id", std::to_string(id)},
-                {"session_id", input->second.input.binding.sessionId}, {"outcome", "not_submitted"}});
+            state->warnings.push_back({{"code", "input_timeout"},
+                                       {"input_id", std::to_string(id)},
+                                       {"session_id", input->second.input.binding.sessionId},
+                                       {"outcome", "not_submitted"}});
             state->changed.insert(input->second.input.binding.sessionId);
             state->inputs.erase(input);
         }
@@ -1168,6 +1326,444 @@ struct MaiMobileSessionIM::Impl {
         return before == after;
     }
 
+    bool appendDelivery(const Router::Binding& binding, const std::shared_ptr<Signal>& signal,
+                        const std::shared_ptr<Watch>& watch, std::uint64_t token, const Router::TurnReceipt& receipt,
+                        Json output, std::uint64_t revision, Json* projected = nullptr, bool committed = false) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->active || !state->scope || *state->scope != binding.account || !watch->valid ||
+            (!committed && watch->failed))
+            return false;
+        const auto source = state->router.inputForReceipt(token, receipt, binding.account, binding.workspaceKey);
+        if (!source) return false;
+        const auto allocation = state->router.appendOutput(token, receipt, binding.account, binding.workspaceKey, 1);
+        if (allocation.status != Router::Status::Ok) return false;
+        Json value = {{"bridge_id", state->bridgeId},
+                      {"scope", scopeJson(binding.account)},
+                      {"token", std::to_string(token)},
+                      {"dispatch_index", std::to_string(allocation.firstIndex)},
+                      {"input_id", std::to_string(source->inputId)},
+                      {"source_message_id", source->source.messageId},
+                      {"peer_id", binding.peerId},
+                      {"session_id", binding.sessionId},
+                      {"workspace_key", binding.workspaceKey},
+                      {"user_message_id", receipt.userMessageId},
+                      {"assistant_message_id", receipt.assistantMessageId},
+                      {"turn_id", receipt.turnId}};
+        value.update(output);
+        if (projected) *projected = value;
+        state->deliveries[{token, allocation.firstIndex}] = {value,
+                                                             receipt,
+                                                             binding.workspaceKey,
+                                                             binding.sessionId,
+                                                             signal,
+                                                             watch,
+                                                             revision,
+                                                             false,
+                                                             Clock::now() + state->outputBudget};
+        state->deliveries.at({token, allocation.firstIndex}).committedText = committed;
+        return true;
+    }
+
+    void publishActivity(const Router::Binding& binding, const std::shared_ptr<Watch>& watch,
+                         const Router::ActiveRoute& route) {
+        std::string kind;
+        bool dirty;
+        {
+            std::lock_guard<std::mutex> lock(watch->mutex);
+            dirty = watch->activityDirty;
+            watch->activityDirty = false;
+            kind = watch->activityKind;
+            if (!watch->questionId.empty() || !watch->permissionId.empty()) kind = "machine-waiting";
+        }
+        if (dirty && route.receipt && kind != "machine-waiting") {
+            MaiMessage current;
+            if (agent->getMessage(binding.sessionId, route.receipt->assistantMessageId, current) &&
+                !current.parts.empty()) {
+                const auto& part = current.parts.back();
+                if (const auto* tool = std::get_if<MaiToolPart>(&part.body))
+                    kind = tool->state == MaiToolState::Pending   ? "machine-waiting"
+                           : tool->state == MaiToolState::Running ? "machine-tool"
+                                                                  : "machine-working";
+                else
+                    kind = std::get_if<MaiReasoningPart>(&part.body) ? "machine-thinking" : "machine-working";
+            }
+        }
+        const auto now = Clock::now();
+        Json signal;
+        {
+            std::lock_guard<std::mutex> lock(watch->mutex);
+            if (watch->activitySequence && kind == watch->activityKind &&
+                now - watch->lastActivity < std::chrono::seconds(2))
+                return;
+            const auto wall = MaiTime::getCurrentTime();
+            if (!watch->taskStartedAt) watch->taskStartedAt = wall;
+            if (!watch->phaseStartedAt || kind != watch->activityKind) watch->phaseStartedAt = wall;
+            watch->activityKind = kind;
+            watch->lastActivity = now;
+            signal = {{"namespace", "multi-ai-code-activity"},
+                      {"version", 2},
+                      {"activityId", watch->activityId},
+                      {"sequence", ++watch->activitySequence},
+                      {"kind", kind},
+                      {"active", true},
+                      {"startedAtMs", watch->phaseStartedAt},
+                      {"taskStartedAtMs", watch->taskStartedAt},
+                      {"ttlMs", 12000}};
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->active || !state->scope || *state->scope != binding.account || !watch->valid || watch->failed ||
+            !state->router.isCurrent(route.reservation.token, binding.account, binding.workspaceKey))
+            return;
+        Json value = {{"bridge_id", state->bridgeId},
+                      {"scope", scopeJson(binding.account)},
+                      {"peer_id", binding.peerId},
+                      {"session_id", binding.sessionId},
+                      {"workspace_key", binding.workspaceKey},
+                      {"binding_epoch", std::to_string(binding.epoch)},
+                      {"token", std::to_string(route.reservation.token)},
+                      {"turn_id", route.receipt->turnId},
+                      {"signal", signal}};
+        const auto ownerSignal = signalFor(state, binding.sessionId);
+        state->activities[watch->activityId] = {value, binding,     route.reservation.token,
+                                                watch, ownerSignal, ownerSignal ? ownerSignal->revision.load() : 0,
+                                                false, false,       now + std::chrono::seconds(12)};
+    }
+
+    void retireActivities() {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->scope) return;
+        const auto active = state->router.snapshot(*state->scope).active;
+        for (auto it = state->approvals.begin(); it != state->approvals.end();)
+            if (std::none_of(active.begin(), active.end(), [&](const Router::ActiveRoute& route) {
+                    return route.reservation.token == it->second.token;
+                })) {
+                if (!it->second.resolved) terminalApprovalLocked(*state, it->first, it->second);
+                it = state->approvals.erase(it);
+            } else
+                ++it;
+        for (auto it = state->activities.begin(); it != state->activities.end();) {
+            auto& activity = it->second;
+            if (Clock::now() >= activity.expires) {
+                it = state->activities.erase(it);
+                continue;
+            }
+            if (!activity.terminal && std::none_of(active.begin(), active.end(), [&](const Router::ActiveRoute& route) {
+                    return route.reservation.token == activity.token;
+                })) {
+                std::lock_guard<std::mutex> watch(activity.watch->mutex);
+                activity.value["signal"]["sequence"] = ++activity.watch->activitySequence;
+                activity.value["signal"]["active"] = false;
+                activity.terminal = true;
+                activity.claimed = false;
+                activity.expires = Clock::now() + std::chrono::seconds(12);
+            }
+            ++it;
+        }
+    }
+
+    void flushOutput(const Router::Binding& binding, const std::shared_ptr<Signal>& signal,
+                     const std::shared_ptr<Watch>& watch, const Router::ActiveRoute& route, std::uint64_t revision) {
+        if (!route.receipt || !watch->valid) return;
+        std::vector<Watch::Continuation> continuations;
+        std::vector<Watch::Text> texts;
+        std::map<std::string, Router::TurnReceipt> segments;
+        std::string questionId;
+        {
+            std::lock_guard<std::mutex> lock(watch->mutex);
+            if (watch->admitting) return;
+            continuations.swap(watch->continuations);
+            texts.swap(watch->committed);
+            questionId = watch->questionId;
+        }
+        for (const auto& continuation : continuations) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->active || !state->scope || *state->scope != binding.account) return;
+            const auto status =
+                state->router.bindContinuation(route.reservation.token, continuation.turnId, continuation.messageId,
+                                               continuation.inputs, binding.account, binding.workspaceKey);
+            if (status != Router::Status::Ok && status != Router::Status::Duplicate) {
+                watch->valid = false;
+                revokeLocked(*state, binding.sessionId);
+                return;
+            }
+            std::lock_guard<std::mutex> observed(watch->mutex);
+            watch->segments.emplace(
+                continuation.messageId,
+                Router::TurnReceipt{continuation.inputs.back(), continuation.messageId, continuation.turnId});
+        }
+        {
+            std::lock_guard<std::mutex> lock(watch->mutex);
+            segments = watch->segments;
+        }
+        for (const auto& text : texts) {
+            const auto receipt = segments.find(text.messageId);
+            if (receipt == segments.end() || receipt->second.turnId != text.turnId) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                watch->valid = false;
+                revokeLocked(*state, binding.sessionId);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(watch->mutex);
+                if (watch->sentParts.count(text.partId)) continue;
+            }
+            MaiMessage message;
+            if (!agent->getMessage(binding.sessionId, text.messageId, message) || message.role != MaiRole::Assistant)
+                continue;
+            for (const auto& part : message.parts)
+                if (part.id == text.partId)
+                    if (const auto* body = std::get_if<MaiTextPart>(&part.body)) {
+                        if (body->text.empty() ||
+                            appendDelivery(binding, signal, watch, route.reservation.token, receipt->second,
+                                           {{"kind", "text"}, {"text", body->text}}, revision, nullptr, true)) {
+                            std::lock_guard<std::mutex> lock(watch->mutex);
+                            watch->sentParts.insert(part.id);
+                        }
+                        break;
+                    }
+        }
+        if (!questionId.empty()) {
+            bool sent;
+            {
+                std::lock_guard<std::mutex> lock(watch->mutex);
+                sent = watch->sentQuestions.count(questionId);
+            }
+            if (!sent)
+                for (const auto& question : agent->listPendingQuestions()) {
+                    const auto receipt = segments.find(question.messageId);
+                    if (question.id != questionId || question.sessionId != binding.sessionId ||
+                        receipt == segments.end())
+                        continue;
+                    std::string text = question.question;
+                    for (const auto& option : question.options) text += "\n- " + option;
+                    if (appendDelivery(binding, signal, watch, route.reservation.token, receipt->second,
+                                       {{"kind", "text"}, {"text", text}, {"question_id", question.id}}, revision)) {
+                        std::lock_guard<std::mutex> lock(watch->mutex);
+                        watch->sentQuestions.insert(question.id);
+                    }
+                }
+        }
+    }
+
+    void publishApprovals(const Router::Binding& binding, const std::shared_ptr<Signal>& signal,
+                          const std::shared_ptr<Watch>& watch, const Router::ActiveRoute& route,
+                          std::uint64_t revision) {
+        if (!route.receipt || !watch->valid || watch->failed) return;
+        const auto pending = agent->listPendingPermissions();
+        std::map<std::string, Router::TurnReceipt> segments;
+        std::map<std::string, std::string> outcomes;
+        std::string currentPermission;
+        {
+            std::lock_guard<std::mutex> lock(watch->mutex);
+            segments = watch->segments;
+            outcomes = watch->resolvedPermissions;
+            currentPermission = watch->permissionId;
+        }
+        for (const auto& permission : pending) {
+            const auto segment = segments.find(permission.messageId);
+            if (permission.id != currentPermission || permission.sessionId != binding.sessionId ||
+                segment == segments.end())
+                continue;
+            bool known = false;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                for (const auto& item : state->approvals)
+                    if (item.second.permission.id == permission.id && item.second.token == route.reservation.token)
+                        known = true;
+            }
+            if (known) continue;
+            const auto publicToken = "approval-" + MaiIdGenerator::newEventId();
+            Json actions = Json::array({"approve-once"});
+            if (permission.allowForSession) actions.push_back("approve-prefix");
+            actions.push_back("reject");
+            // 不发送原始参数 JSON；记住权限只沿 Core 已有的当前会话 approval keys。
+            std::string body = "工具 " + permission.toolName + " 请求操作授权。";
+            if (permission.allowForSession) body += "记住授权仅作用于本会话的相同审批目标。";
+            Json envelope;
+            if (!appendDelivery(
+                    binding, signal, watch, route.reservation.token, segment->second,
+                    {{"kind", "text"},
+                     {"text", body},
+                     {"interaction", {{"kind", "approval-request"}, {"token", publicToken}, {"actions", actions}}}},
+                    revision, &envelope))
+                continue;
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->active && state->scope && *state->scope == binding.account && watch->valid &&
+                state->router.isCurrent(route.reservation.token, binding.account, binding.workspaceKey))
+                state->approvals.emplace(publicToken, ApprovalRecord{binding, segment->second, route.reservation.token,
+                                                                     permission, watch, signal, revision, envelope});
+        }
+        std::vector<std::pair<std::string, ApprovalRecord>> records;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            for (const auto& item : state->approvals)
+                if (item.second.token == route.reservation.token && !item.second.resolved) records.push_back(item);
+        }
+        for (const auto& item : records) {
+            const auto& approval = item.second;
+            const auto waiting = std::find_if(pending.begin(), pending.end(), [&](const MaiPermissionRequest& value) {
+                return value.id == approval.permission.id && value.sessionId == binding.sessionId &&
+                       value.messageId == approval.permission.messageId && value.partId == approval.permission.partId;
+            });
+            if (waiting != pending.end() && approval.decision && !approval.submitted) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                auto current = state->approvals.find(item.first);
+                if (current == state->approvals.end() || !state->active || !state->scope ||
+                    *state->scope != binding.account || !watch->valid ||
+                    !state->router.isCurrent(approval.token, binding.account, binding.workspaceKey) ||
+                    signal->revision.load() != approval.revision)
+                    continue;
+                const auto submitted = agent->submit(
+                    MaiReplyPermission{approval.permission.id, *approval.decision, approval.watch->directory});
+                current->second.submitted = bool(submitted);
+            }
+            if (waiting != pending.end() && !approval.submitted) continue;
+            const auto outcome = outcomes.find(approval.permission.id);
+            const std::string wireOutcome =
+                outcome != outcomes.end() && outcome->second == "timed_out" ? "auto-declined" : "resolved";
+            if (appendDelivery(
+                    binding, signal, watch, approval.token, approval.receipt,
+                    {{"kind", "text"},
+                     {"text", "Approval is no longer pending."},
+                     {"interaction", {{"kind", "approval-resolved"}, {"token", item.first}, {"outcome", wireOutcome}}}},
+                    revision)) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                const auto current = state->approvals.find(item.first);
+                if (current != state->approvals.end()) current->second.resolved = true;
+            }
+        }
+    }
+
+    void followup(const Router::Binding& binding, const std::shared_ptr<Signal>& signal,
+                  const std::shared_ptr<Watch>& watch, const Router::ActiveRoute& route, std::uint64_t revision) {
+        if (!route.receipt || !watch->valid || watch->failed ||
+            agent->activeTurnId(binding.sessionId) != route.receipt->turnId)
+            return;
+        std::optional<InputRecord> input;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->active || !state->scope || *state->scope != binding.account) return;
+            const auto reservation =
+                state->router.reserveFollowup(route.reservation.token, binding.account, binding.workspaceKey);
+            if (!reservation.reservation) return;
+            const auto found = state->inputs.find(reservation.reservation->input.inputId);
+            if (found == state->inputs.end() || !found->second.payload) {
+                state->router.releaseFollowup(route.reservation.token, reservation.reservation->input.inputId,
+                                              binding.account, binding.workspaceKey);
+                return;
+            }
+            input = found->second;
+        }
+        const auto release = [&] {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->router.releaseFollowup(route.reservation.token, input->input.inputId, binding.account,
+                                          binding.workspaceKey);
+        };
+        try {
+            MaiSession session;
+            if (!agent->getSession(binding.sessionId, session)) {
+                release();
+                return;
+            }
+            if (canonical(session.directory) != binding.workspaceKey || session.directory != watch->directory) {
+                release();
+                std::lock_guard<std::mutex> lock(state->mutex);
+                revokeLocked(*state, binding.sessionId);
+                return;
+            }
+            if (requireModel) requireModel(session.model);
+            if (inputValidator)
+                inputValidator(session.model, !input->payload->images.empty() || !input->payload->videos.empty());
+        } catch (const std::exception&) {
+            release();
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->router.discardInput(binding.account, input->input.inputId);
+            state->inputs.erase(input->input.inputId);
+            state->warnings.push_back({{"code", "input_rejected"},
+                                       {"input_id", std::to_string(input->input.inputId)},
+                                       {"session_id", binding.sessionId},
+                                       {"outcome", "not_submitted"}});
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(watch->mutex);
+            watch->admitting = true;
+            watch->admissionThread = std::this_thread::get_id();
+            watch->admissionIds.clear();
+        }
+        std::optional<MaiResult<std::string>> submitted;
+        {
+            // 与纯控制撤销共用短受理锁；文件、凭据和模型执行均在锁外。
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->active && state->scope && *state->scope == binding.account &&
+                state->router.isCurrent(route.reservation.token, binding.account, binding.workspaceKey)) {
+                if (!watch->valid || !signal || signal->revision.load() != revision)
+                    revokeLocked(*state, binding.sessionId);
+                else
+                    submitted = agent->submit(MaiSteerPrompt{binding.sessionId,
+                                                             route.receipt->turnId,
+                                                             state->bridgeId + "-" + std::to_string(binding.epoch) +
+                                                                 "-" + std::to_string(input->input.inputId),
+                                                             input->payload->text,
+                                                             input->payload->images,
+                                                             input->payload->videos,
+                                                             {},
+                                                             watch->directory});
+            }
+        }
+        bool known;
+        {
+            std::lock_guard<std::mutex> lock(watch->mutex);
+            watch->admitting = false;
+            known = submitted && *submitted &&
+                    std::find(watch->ids.begin(), watch->ids.end(), submitted->value()) != watch->ids.end() &&
+                    (watch->admissionIds.empty() ||
+                     (watch->admissionIds.size() == 1 && watch->admissionIds.front() == submitted->value()));
+        }
+        if (!submitted) return;
+        const auto& result = *submitted;
+        if (!result) {
+            release();
+            if (result.error().code() != MaiErrorCode::Busy && result.error().code() != MaiErrorCode::NotFound) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->router.discardInput(binding.account, input->input.inputId);
+                state->inputs.erase(input->input.inputId);
+                state->warnings.push_back({{"code", "submit_rejected"},
+                                           {"input_id", std::to_string(input->input.inputId)},
+                                           {"session_id", binding.sessionId},
+                                           {"outcome", "not_submitted"}});
+            }
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->active || !state->scope || *state->scope != binding.account) return;
+            if (!known || state->router.commitFollowup(route.reservation.token, input->input.inputId, result.value(),
+                                                       binding.account, binding.workspaceKey) != Router::Status::Ok) {
+                watch->valid = false;
+                revokeLocked(*state, binding.sessionId);
+                return;
+            }
+            state->inputs.erase(input->input.inputId);
+        }
+        if (!input->questionId.empty() && input->payload->images.empty() && input->payload->videos.empty()) {
+            std::map<std::string, Router::TurnReceipt> segments;
+            {
+                std::lock_guard<std::mutex> lock(watch->mutex);
+                segments = watch->segments;
+            }
+            for (const auto& question : agent->listPendingQuestions())
+                if (question.id == input->questionId && question.sessionId == binding.sessionId &&
+                    segments.count(question.messageId)) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    if (state->active && state->scope && *state->scope == binding.account && watch->valid &&
+                        state->router.isCurrent(route.reservation.token, binding.account, binding.workspaceKey))
+                        agent->submit(MaiReplyQuestion{question.id, input->payload->text, watch->directory});
+                    break;
+                }
+        }
+    }
+
     void pump(const Json& request) {
         reapHistory();
         std::vector<std::shared_ptr<HistoryJob>> jobs;
@@ -1205,15 +1801,19 @@ struct MaiMobileSessionIM::Impl {
             std::uint64_t revision = 0;
             if (!validateWorkspace(binding, signal, revision)) continue;
             std::optional<Router::ActiveRoute> route;
-            for (const auto& active : state->router.snapshot(scope).active)
-                if (active.reservation.input.binding.sessionId == binding.sessionId) route = active;
-            if (!route) {
-                const auto reserved = state->router.reserveNext(scope, binding.sessionId, binding.workspaceKey,
-                                                                !agent->isBusy(binding.sessionId));
-                if (reserved.reservation) {
-                    Router::ActiveRoute active;
-                    active.reservation = *reserved.reservation;
-                    route = active;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (!state->active || !state->scope || *state->scope != scope) continue;
+                for (const auto& active : state->router.snapshot(scope).active)
+                    if (active.reservation.input.binding.sessionId == binding.sessionId) route = active;
+                if (!route) {
+                    const auto reserved = state->router.reserveNext(scope, binding.sessionId, binding.workspaceKey,
+                                                                    !agent->isBusy(binding.sessionId));
+                    if (reserved.reservation) {
+                        Router::ActiveRoute active;
+                        active.reservation = *reserved.reservation;
+                        route = active;
+                    }
                 }
             }
             if (!route) continue;
@@ -1227,6 +1827,7 @@ struct MaiMobileSessionIM::Impl {
                 if (!prepared || agent->isBusy(binding.sessionId)) continue;
                 MaiSession session;
                 if (!agent->getSession(binding.sessionId, session)) continue;
+                const auto admissionRevision = revision;
                 try {
                     if (requireModel) requireModel(session.model);
                     if (inputValidator)
@@ -1244,7 +1845,13 @@ struct MaiMobileSessionIM::Impl {
                 }
                 // 凭据和文件检查不持有控制锁；最终普通 submit 仅跨快速 Core 受理边界。
                 if (!validateWorkspace(binding, signal, revision)) continue;
+                if (revision != admissionRevision) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    revokeLocked(*state, binding.sessionId);
+                    continue;
+                }
                 auto watch = std::make_shared<Watch>();
+                watch->directory = session.directory;
                 {
                     std::lock_guard<std::mutex> lock(signal->mutex);
                     signal->watch = watch;
@@ -1253,11 +1860,16 @@ struct MaiMobileSessionIM::Impl {
                 std::vector<std::string> ids;
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
-                    if (!state->active || !state->scope || *state->scope != scope ||
-                        !state->router.isCurrent(route->reservation.token, scope, binding.workspaceKey))
+                    if (!state->active || !state->scope || *state->scope != scope || !watch->valid || !signal ||
+                        signal->revision.load() != revision ||
+                        !state->router.isCurrent(route->reservation.token, scope, binding.workspaceKey)) {
+                        if (state->active && state->scope && *state->scope == scope)
+                            revokeLocked(*state, binding.sessionId);
                         continue;
-                    submitted = agent->submit(
-                        MaiSendPrompt{binding.sessionId, prepared->text, prepared->images, prepared->videos});
+                    }
+                    MaiSendPrompt prompt{binding.sessionId, prepared->text, prepared->images, prepared->videos};
+                    prompt.expectedDirectory = watch->directory;
+                    submitted = agent->submit(prompt);
                     {
                         std::lock_guard<std::mutex> capture(watch->mutex);
                         watch->capturing = false;
@@ -1282,6 +1894,10 @@ struct MaiMobileSessionIM::Impl {
                     MaiMessage message;
                     if (agent->getMessage(binding.sessionId, id, message) && message.role == MaiRole::User) user = id;
                 }
+                MaiMessage initial;
+                const auto started = agent->getMessage(binding.sessionId, result.value(), initial)
+                                         ? initial.created
+                                         : MaiTime::getCurrentTime();
                 std::lock_guard<std::mutex> lock(state->mutex);
                 if (!state->active || !state->scope || *state->scope != scope) continue;
                 if (!watch->valid || user.empty() || std::find(ids.begin(), ids.end(), result.value()) == ids.end()) {
@@ -1290,83 +1906,123 @@ struct MaiMobileSessionIM::Impl {
                 }
                 accepted(state->router.bindReceipt(route->reservation.token, {user, result.value(), result.value()},
                                                    scope, binding.workspaceKey));
+                {
+                    std::lock_guard<std::mutex> observed(watch->mutex);
+                    watch->turnId = result.value();
+                    watch->segments.emplace(result.value(), Router::TurnReceipt{user, result.value(), result.value()});
+                    watch->taskStartedAt = started;
+                }
                 state->inputs.erase(route->reservation.input.inputId);
                 continue;
             }
-            if (route->phase != Router::Phase::Running || !route->receipt || agent->isBusy(binding.sessionId)) continue;
-            MaiMessage reply;
-            if (!agent->getMessage(binding.sessionId, route->receipt->assistantMessageId, reply) ||
-                reply.role != MaiRole::Assistant || !reply.completed)
-                continue;
+            if (route->phase != Router::Phase::Running || !route->receipt) continue;
             std::shared_ptr<Watch> watch;
             if (signal) {
                 std::lock_guard<std::mutex> lock(signal->mutex);
                 watch = signal->watch;
             }
-            if (!watch || !watch->valid || watch->failed) {
+            if (!watch || !watch->valid) {
+                std::lock_guard<std::mutex> lock(state->mutex);
                 state->router.finishWithoutOutput(route->reservation.token, *route->receipt, scope,
                                                   binding.workspaceKey);
                 continue;
             }
-            std::vector<Json> output;
-            if (!reply.text().empty()) output.push_back({{"kind", "text"}, {"text", reply.text()}});
-            MaiToolContext context;
-            context.root = binding.workspaceKey;
-            context.sessionId = binding.sessionId;
+            flushOutput(binding, signal, watch, *route, revision);
+            route.reset();
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                for (const auto& active : state->router.snapshot(scope).active)
+                    if (active.reservation.input.binding.sessionId == binding.sessionId) {
+                        route = active;
+                        break;
+                    }
+            }
+            if (!route || !route->receipt || !watch->valid) continue;
+            if (watch->failed) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->router.finishWithoutOutput(route->reservation.token, *route->receipt, scope,
+                                                  binding.workspaceKey);
+                continue;
+            }
+            publishApprovals(binding, signal, watch, *route, revision);
+            if (agent->isBusy(binding.sessionId)) {
+                followup(binding, signal, watch, *route, revision);
+                publishActivity(binding, watch, *route);
+                continue;
+            }
+            MaiMessage reply;
+            if (!agent->getMessage(binding.sessionId, route->receipt->assistantMessageId, reply) ||
+                reply.role != MaiRole::Assistant || !reply.completed)
+                continue;
+            std::map<std::string, Router::TurnReceipt> segments;
+            {
+                std::lock_guard<std::mutex> lock(watch->mutex);
+                segments = watch->segments;
+            }
             std::set<std::string> mediaPaths;
-            for (const auto& part : reply.parts) {
-                const auto* tool = std::get_if<MaiToolPart>(&part.body);
-                if (!tool || tool->tool != "agent_send_media" || tool->state != MaiToolState::Completed) continue;
-                const auto value = Json::parse(tool->output, nullptr, false);
-                if (!value.is_object() || value.value("delivery", "") != "current_ai_session") continue;
-                const auto prepared = maiPrepareAgentMedia(value.value("path", ""), value.value("type", ""), context);
-                if (!prepared || value.value("mime_type", "") != prepared.value().mimeType ||
-                    !value.contains("bytes") || !value["bytes"].is_number_unsigned() ||
-                    value["bytes"].get<std::uint64_t>() != prepared.value().bytes)
-                    continue;
-                const auto absolute = maiResolvePathWithinRoot(binding.workspaceKey, prepared.value().relativePath);
-                if (!mediaPaths.insert(absolute).second) continue;
-                output.push_back({{"kind", prepared.value().type == "audio" ? "file" : prepared.value().type},
+            for (const auto& segment : segments) {
+                MaiMessage message;
+                if (!agent->getMessage(binding.sessionId, segment.first, message)) continue;
+                MaiToolContext context;
+                context.root = binding.workspaceKey;
+                context.sessionId = binding.sessionId;
+                for (const auto& part : message.parts) {
+                    const auto* tool = std::get_if<MaiToolPart>(&part.body);
+                    if (!tool || (tool->tool != "agent_send_media" && tool->tool != "agent_send_file") ||
+                        tool->state != MaiToolState::Completed)
+                        continue;
+                    {
+                        std::lock_guard<std::mutex> lock(watch->mutex);
+                        if (watch->sentMedia.count(part.id)) continue;
+                    }
+                    const auto value = Json::parse(tool->output, nullptr, false);
+                    if (!value.is_object() || value.value("delivery", "") != "current_ai_session") continue;
+                    Json output;
+                    std::string absolute;
+                    if (tool->tool == "agent_send_file") {
+                        const auto prepared = maiPrepareAgentFile(value.value("path", ""), context);
+                        if (!prepared || value.value("type", "") != "file" ||
+                            value.value("name", "") != prepared.value().name ||
+                            value.value("mime_type", "") != prepared.value().mimeType || !value.contains("bytes") ||
+                            !value["bytes"].is_number_unsigned() ||
+                            value["bytes"].get<std::uint64_t>() != prepared.value().bytes)
+                            continue;
+                        absolute = maiResolvePathWithinRoot(binding.workspaceKey, prepared.value().relativePath);
+                        output = {{"kind", "file"},
                                   {"path", absolute},
                                   {"mime_type", prepared.value().mimeType},
-                                  {"caption", value.value("caption", "")}});
+                                  {"name", prepared.value().name},
+                                  {"caption", value.value("caption", "")}};
+                    } else {
+                        const auto prepared =
+                            maiPrepareAgentMedia(value.value("path", ""), value.value("type", ""), context);
+                        if (!prepared || value.value("mime_type", "") != prepared.value().mimeType ||
+                            !value.contains("bytes") || !value["bytes"].is_number_unsigned() ||
+                            value["bytes"].get<std::uint64_t>() != prepared.value().bytes)
+                            continue;
+                        absolute = maiResolvePathWithinRoot(binding.workspaceKey, prepared.value().relativePath);
+                        output = {{"kind", prepared.value().type == "audio" ? "file" : prepared.value().type},
+                                  {"path", absolute},
+                                  {"mime_type", prepared.value().mimeType},
+                                  {"caption", value.value("caption", "")}};
+                    }
+                    if (!mediaPaths.insert(absolute).second) continue;
+                    if (appendDelivery(binding, signal, watch, route->reservation.token, segment.second, output,
+                                       revision)) {
+                        std::lock_guard<std::mutex> lock(watch->mutex);
+                        watch->sentMedia.insert(part.id);
+                    }
+                }
             }
             if (!validateWorkspace(binding, signal, revision)) continue;
-            std::lock_guard<std::mutex> lock(state->mutex);
-            if (!state->active || !state->scope || *state->scope != scope || !watch->valid) continue;
-            if (watch->failed) {
-                state->router.finishWithoutOutput(route->reservation.token, *route->receipt, scope,
-                                                  binding.workspaceKey);
-                continue;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->active && state->scope && *state->scope == scope && watch->valid)
+                    state->router.sealOutput(route->reservation.token, *route->receipt, scope, binding.workspaceKey);
             }
-            if (output.empty()) {
-                state->router.finishWithoutOutput(route->reservation.token, *route->receipt, scope,
-                                                  binding.workspaceKey);
-                continue;
-            }
-            if (state->router.beginOutput(route->reservation.token, *route->receipt, scope, binding.workspaceKey,
-                                          static_cast<std::uint32_t>(output.size())) != Router::Status::Ok)
-                continue;
-            for (std::uint32_t index = 0; index < output.size(); ++index) {
-                Json delivery = {{"bridge_id", state->bridgeId},
-                                 {"scope", scopeJson(scope)},
-                                 {"token", std::to_string(route->reservation.token)},
-                                 {"dispatch_index", std::to_string(index)},
-                                 {"input_id", std::to_string(route->reservation.input.inputId)},
-                                 {"source_message_id", route->reservation.input.source.messageId},
-                                 {"peer_id", binding.peerId},
-                                 {"session_id", binding.sessionId},
-                                 {"workspace_key", binding.workspaceKey},
-                                 {"user_message_id", route->receipt->userMessageId},
-                                 {"assistant_message_id", route->receipt->assistantMessageId},
-                                 {"turn_id", route->receipt->turnId}};
-                delivery.update(output[index]);
-                state->deliveries[{route->reservation.token, index}] = {
-                    delivery,          *route->receipt, binding.workspaceKey,
-                    binding.sessionId, signal,          watch,
-                    revision,          false,           Clock::now() + state->outputBudget};
-            }
+            publishActivity(binding, watch, *route);
         }
+        retireActivities();
         purgeRetiredHistory();
     }
 
@@ -1435,9 +2091,14 @@ struct MaiMobileSessionIM::Impl {
         if (action == "receive") receive(request, response);
         if (action == "pump") {
             response["deliveries"] = Json::array();
+            response["activities"] = Json::array();
             std::lock_guard<std::mutex> lock(state->mutex);
+            std::set<std::uint64_t> projected;
             for (const auto& item : state->deliveries)
-                if (!item.second.claimed) response["deliveries"].push_back(item.second.value);
+                if (projected.insert(item.first.first).second && !item.second.claimed)
+                    response["deliveries"].push_back(item.second.value);
+            for (const auto& item : state->activities)
+                if (!item.second.claimed) response["activities"].push_back(item.second.value);
             response["warnings"] = state->warnings;
             state->warnings.clear();
         }
@@ -1630,7 +2291,12 @@ std::string MaiMobileSessionIM::control(const std::string& raw) {
         const auto request = parse(raw);
         const auto action = text(request, "action");
         const bool deliveryAction = action == "claim" || action == "ack";
-        const auto& owner = deliveryAction ? request.at("delivery") : request;
+        const bool activityAction = action == "claim_activity" || action == "ack_activity";
+        const bool approvalAction = action == "approval_decision";
+        const auto& owner = deliveryAction   ? request.at("delivery")
+                            : activityAction ? request.at("activity")
+                            : approvalAction ? request.at("approval")
+                                             : request;
         const auto bridge = text(owner, "bridge_id");
         std::shared_ptr<Authority> state;
         {
@@ -1641,6 +2307,39 @@ std::string MaiMobileSessionIM::control(const std::string& raw) {
         require(bool(state), "stale_bridge", "Native binding lifetime is unavailable");
         std::lock_guard<std::mutex> lock(state->mutex);
         checkLocked(*state, owner);
+        if (approvalAction) {
+            const auto publicToken = text(owner.at("interaction"), "token");
+            const auto found = state->approvals.find(publicToken);
+            if (found == state->approvals.end() || found->second.envelope != owner)
+                return Json{{"ok", true}, {"accepted", false}, {"reason", "stale_approval"}}.dump();
+            auto& approval = found->second;
+            const auto& binding = approval.binding;
+            const auto current = state->router.bindingForPeer(*state->scope, binding.peerId);
+            const auto actionName = text(request, "decision");
+            bool samePending = false;
+            {
+                std::lock_guard<std::mutex> observed(approval.watch->mutex);
+                samePending = approval.watch->permissionId == approval.permission.id;
+            }
+            const bool allowedAction = actionName == "approve-once" || actionName == "reject" ||
+                                       (actionName == "approve-prefix" && approval.permission.allowForSession);
+            const bool authorized =
+                current && current->epoch == binding.epoch && current->sessionId == binding.sessionId &&
+                current->workspaceKey == binding.workspaceKey && state->acceptedFriends.count(binding.peerId) &&
+                text(request, "peer_id") == binding.peerId && text(request, "sender_id") == binding.peerId &&
+                text(request, "recipient_id") == state->scope->ownerUserId && text(request, "origin") == "human" &&
+                flag(request, "live") && !flag(request, "group") && !text(request, "message_id").empty() &&
+                approval.watch->valid && !approval.watch->failed && approval.signal &&
+                approval.signal->revision.load() == approval.revision &&
+                state->router.isCurrent(approval.token, *state->scope, binding.workspaceKey) && !approval.resolved &&
+                !approval.submitted && !approval.decision && allowedAction && samePending;
+            if (authorized)
+                approval.decision = actionName == "approve-once"     ? MaiPermissionDecision::Approved
+                                    : actionName == "approve-prefix" ? MaiPermissionDecision::ApprovedForSession
+                                                                     : MaiPermissionDecision::Denied;
+            return Json{{"ok", true}, {"accepted", authorized}, {"reason", authorized ? "accepted" : "stale_approval"}}
+                .dump();
+        }
         if (action == "admit") {
             const auto input = incoming(request, *state->scope, flag(request, "has_content"));
             if (!state->acceptedFriends.count(input.peerId))
@@ -1651,6 +2350,18 @@ std::string MaiMobileSessionIM::control(const std::string& raw) {
                         {"reason", statusName(accepted.status)}};
             if (accepted.input) {
                 state->inputs.emplace(accepted.input->inputId, InputRecord{*accepted.input, Clock::now(), {}});
+                const auto signal = signalFor(state, accepted.input->binding.sessionId);
+                if (signal) {
+                    std::shared_ptr<Watch> watch;
+                    {
+                        std::lock_guard<std::mutex> lock(signal->mutex);
+                        watch = signal->watch;
+                    }
+                    if (watch) {
+                        std::lock_guard<std::mutex> lock(watch->mutex);
+                        state->inputs.at(accepted.input->inputId).questionId = watch->questionId;
+                    }
+                }
                 result["input_id"] = std::to_string(accepted.input->inputId);
             }
             if (accepted.status == Router::Status::QueueFull) {
@@ -1711,6 +2422,32 @@ std::string MaiMobileSessionIM::control(const std::string& raw) {
             clearLocked(*state);
             return Json{{"ok", true}, {"revoked", true}}.dump();
         }
+        if (activityAction) {
+            const auto id = text(owner.at("signal"), "activityId");
+            const auto found = state->activities.find(id);
+            if (found == state->activities.end() || found->second.value != owner)
+                return Json{{"ok", true}, {"allowed", false}, {"acknowledged", false}, {"reason", "stale_activity"}}
+                    .dump();
+            auto& activity = found->second;
+            const auto& binding = activity.binding;
+            const auto current = state->router.bindingForPeer(*state->scope, binding.peerId);
+            const bool bound = current && current->epoch == binding.epoch && current->sessionId == binding.sessionId &&
+                               current->workspaceKey == binding.workspaceKey;
+            // 终态仅清理同一随机 activity ID；撤销后不能再启动旧工作状态。
+            const bool authorized =
+                state->acceptedFriends.count(binding.peerId) && Clock::now() < activity.expires &&
+                (activity.terminal || (bound && activity.watch->valid && !activity.watch->failed && activity.signal &&
+                                       activity.signal->revision.load() == activity.revision &&
+                                       state->router.isCurrent(activity.token, *state->scope, binding.workspaceKey)));
+            if (action == "claim_activity") {
+                const bool allowed = authorized && !activity.claimed;
+                if (allowed) activity.claimed = true;
+                return Json{{"ok", true}, {"allowed", allowed}}.dump();
+            }
+            const bool acknowledged = authorized && activity.claimed;
+            if (acknowledged && activity.terminal) state->activities.erase(found);
+            return Json{{"ok", true}, {"acknowledged", acknowledged}}.dump();
+        }
         require(deliveryAction, "invalid_input", "Unknown binding control action");
         const auto token = number(owner.at("token"));
         const auto index64 = number(owner.at("dispatch_index"), true);
@@ -1721,17 +2458,23 @@ std::string MaiMobileSessionIM::control(const std::string& raw) {
             return Json{{"ok", true}, {"allowed", false}, {"acknowledged", false}, {"reason", "stale_delivery"}}.dump();
         require(found->second.value == owner, "stale_delivery", "Delivery is not the exact immutable native value");
         auto& delivery = found->second;
+        const bool terminal = delivery.terminalControl && state->acceptedFriends.count(text(owner, "peer_id"));
         const bool current =
-            state->router.isOutputCurrent(token, delivery.receipt, *state->scope, delivery.workspace) &&
-            delivery.signal && delivery.signal->revision.load() == delivery.revision && delivery.receiptWatch &&
-            delivery.receiptWatch->valid && !delivery.receiptWatch->failed && Clock::now() < delivery.expires;
+            Clock::now() < delivery.expires &&
+            (terminal ||
+             (state->router.isOutputCurrent(token, delivery.receipt, *state->scope, delivery.workspace) &&
+              delivery.signal && delivery.signal->revision.load() == delivery.revision && delivery.receiptWatch &&
+              delivery.receiptWatch->valid && (delivery.committedText || !delivery.receiptWatch->failed)));
         if (action == "claim") {
             const bool allowed = current && !delivery.claimed;
             if (allowed) delivery.claimed = true;
             return Json{{"ok", true}, {"allowed", allowed}}.dump();
         }
-        const auto status =
-            state->router.acknowledgeDispatch(token, delivery.receipt, *state->scope, delivery.workspace, index);
+        if (terminal && (!current || !delivery.claimed))
+            return Json{{"ok", true}, {"acknowledged", false}, {"reason", "stale_delivery"}}.dump();
+        const auto status = terminal ? Router::Status::Ok
+                                     : state->router.acknowledgeDispatch(token, delivery.receipt, *state->scope,
+                                                                         delivery.workspace, index);
         state->deliveries.erase(found);
         return Json{{"ok", true}, {"acknowledged", status == Router::Status::Ok}}.dump();
     } catch (const Failure& failure) {

@@ -34,6 +34,14 @@ struct MaiSessionIMRouter::Impl {
     struct State {
         ActiveRoute route;
         std::set<std::uint32_t> acknowledged;
+        std::vector<TurnReceipt> receipts;
+        std::map<std::uint32_t, TurnReceipt> outputReceipts;
+        std::set<std::string> consumedUsers;
+        std::uint64_t reservedFollowup = 0;
+
+        bool knows(const TurnReceipt& receipt) const {
+            return std::find(receipts.begin(), receipts.end(), receipt) != receipts.end();
+        }
     };
     using InputKey = std::tuple<std::uint64_t, std::string, std::string, std::string>;
     mutable std::mutex mutex;
@@ -232,6 +240,17 @@ MaiSessionIMRouter::Admission MaiSessionIMRouter::accept(const Incoming& input) 
     if (!input.expectedBindingEpoch || !hasValue(input.expectedSessionId)) return {Status::InvalidArgument, {}};
     if (input.expectedBindingEpoch != binding->second.epoch || input.expectedSessionId != binding->second.sessionId)
         return {Status::StaleScope, {}};
+    for (const auto& active : impl_->active) {
+        const auto same = [&](const QueuedInput& accepted) {
+            return accepted.source.account.sdkAppId == input.account.sdkAppId &&
+                   accepted.source.account.ownerUserId == input.account.ownerUserId &&
+                   accepted.source.peerId == input.peerId && accepted.source.messageId == input.messageId;
+        };
+        if (same(active.second.route.reservation.input) ||
+            std::any_of(active.second.route.followups.begin(), active.second.route.followups.end(),
+                        [&](const AcceptedInput& accepted) { return same(accepted.input); }))
+            return {Status::Duplicate, {}};
+    }
     if (!impl_->remember(input)) return {Status::Duplicate, {}};
     // 满队列也是一次明确拒绝，不能稍后把同一 SDK 回调当新指令自动重放。
     if (impl_->pendingCount >= kPendingLimit) return {Status::QueueFull, {}};
@@ -344,6 +363,9 @@ MaiSessionIMRouter::Status MaiSessionIMRouter::discardInput(const AccountScope& 
             return item.inputId == inputId;
         });
         if (found == queue->second.end()) continue;
+        const auto active = impl_->active.find(queue->first);
+        if (active != impl_->active.end() && active->second.reservedFollowup == inputId)
+            active->second.reservedFollowup = 0;
         queue->second.erase(found);
         --impl_->pendingCount;
         if (queue->second.empty()) impl_->queues.erase(queue);
@@ -388,8 +410,135 @@ MaiSessionIMRouter::Status MaiSessionIMRouter::bindReceipt(std::uint64_t token, 
     if (found->route.receipt) return *found->route.receipt == receipt ? Status::Duplicate : Status::InvalidReceipt;
     if (found->route.phase != Phase::Reserved) return Status::InvalidPhase;
     found->route.receipt = receipt;
+    found->receipts.push_back(receipt);
     found->route.phase = Phase::Running;
     --impl_->pendingCount;
+    return Status::Ok;
+}
+
+MaiSessionIMRouter::ReservationResult MaiSessionIMRouter::reserveFollowup(std::uint64_t token,
+                                                                          const AccountScope& scope,
+                                                                          const std::string& workspace) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto status = impl_->authority(token, scope, workspace);
+    if (status != Status::Ok) return {status, {}};
+    auto* found = impl_->state(token);
+    if (found->route.phase != Phase::Running || !found->route.receipt || found->reservedFollowup ||
+        found->route.followups.size() >= 64)
+        return {Status::Busy, {}};
+    const auto queue = impl_->queues.find(found->route.reservation.input.binding.sessionId);
+    if (queue == impl_->queues.end() || queue->second.empty()) return {Status::Ok, {}};
+    const auto& input = queue->second.front();
+    if (!input.persistenceKnown) return {Status::Busy, {}};
+    found->reservedFollowup = input.inputId;
+    return {Status::Ok, Reservation{token, input}};
+}
+
+MaiSessionIMRouter::Status MaiSessionIMRouter::releaseFollowup(std::uint64_t token, std::uint64_t inputId,
+                                                               const AccountScope& scope,
+                                                               const std::string& workspace) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto status = impl_->authority(token, scope, workspace);
+    if (status != Status::Ok) return status;
+    auto* found = impl_->state(token);
+    if (found->reservedFollowup != inputId) return Status::InvalidToken;
+    found->reservedFollowup = 0;
+    return Status::Ok;
+}
+
+MaiSessionIMRouter::Status MaiSessionIMRouter::commitFollowup(std::uint64_t token, std::uint64_t inputId,
+                                                              const std::string& userMessageId,
+                                                              const AccountScope& scope, const std::string& workspace) {
+    if (!hasValue(userMessageId)) return Status::InvalidReceipt;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto status = impl_->authority(token, scope, workspace);
+    if (status != Status::Ok) return status;
+    auto* found = impl_->state(token);
+    if (found->route.phase != Phase::Running || found->reservedFollowup != inputId) return Status::InvalidPhase;
+    auto queue = impl_->queues.find(found->route.reservation.input.binding.sessionId);
+    if (queue == impl_->queues.end() || queue->second.empty() || queue->second.front().inputId != inputId)
+        return Status::InvalidToken;
+    for (const auto& previous : found->route.followups)
+        if (previous.userMessageId == userMessageId) return Status::InvalidReceipt;
+    found->route.followups.push_back({queue->second.front(), userMessageId});
+    queue->second.pop_front();
+    if (queue->second.empty()) impl_->queues.erase(queue);
+    --impl_->pendingCount;
+    found->reservedFollowup = 0;
+    return Status::Ok;
+}
+
+MaiSessionIMRouter::Status MaiSessionIMRouter::bindContinuation(std::uint64_t token, const std::string& turnId,
+                                                                const std::string& assistantMessageId,
+                                                                const std::vector<std::string>& consumedUserIds,
+                                                                const AccountScope& scope,
+                                                                const std::string& workspace) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto status = impl_->authority(token, scope, workspace);
+    if (status != Status::Ok) return status;
+    auto* found = impl_->state(token);
+    if (found->route.phase != Phase::Running || !found->route.receipt || found->route.receipt->turnId != turnId ||
+        consumedUserIds.empty())
+        return Status::InvalidReceipt;
+    const TurnReceipt receipt{consumedUserIds.back(), assistantMessageId, turnId};
+    if (!validReceipt(receipt)) return Status::InvalidReceipt;
+    if (found->knows(receipt)) return Status::Duplicate;
+    std::set<std::string> unique;
+    for (const auto& user : consumedUserIds) {
+        if (!unique.insert(user).second || found->consumedUsers.count(user) ||
+            std::none_of(found->route.followups.begin(), found->route.followups.end(),
+                         [&](const AcceptedInput& input) { return input.userMessageId == user; }))
+            return Status::InvalidReceipt;
+    }
+    found->consumedUsers.insert(unique.begin(), unique.end());
+    found->receipts.push_back(receipt);
+    found->route.receipt = receipt;
+    return Status::Ok;
+}
+
+std::optional<MaiSessionIMRouter::QueuedInput> MaiSessionIMRouter::inputForReceipt(std::uint64_t token,
+                                                                                   const TurnReceipt& receipt,
+                                                                                   const AccountScope& scope,
+                                                                                   const std::string& workspace) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->authority(token, scope, workspace) != Status::Ok) return {};
+    const auto* found = impl_->state(token);
+    if (!found->knows(receipt)) return {};
+    for (const auto& input : found->route.followups)
+        if (input.userMessageId == receipt.userMessageId) return input.input;
+    return found->route.reservation.input;
+}
+
+MaiSessionIMRouter::OutputAllocation MaiSessionIMRouter::appendOutput(std::uint64_t token, const TurnReceipt& receipt,
+                                                                      const AccountScope& scope,
+                                                                      const std::string& workspace,
+                                                                      std::uint32_t count) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto status = impl_->authority(token, scope, workspace);
+    if (status != Status::Ok) return {status, 0};
+    auto* found = impl_->state(token);
+    if (!found->knows(receipt)) return {Status::InvalidReceipt, 0};
+    if (found->route.phase != Phase::Running) return {Status::InvalidPhase, 0};
+    if (!count) return {Status::InvalidArgument, 0};
+    const auto first = found->route.dispatchCount;
+    if (count > std::numeric_limits<std::uint32_t>::max() - first) return {Status::Exhausted, 0};
+    found->route.dispatchCount += count;
+    for (auto index = first; index < found->route.dispatchCount; ++index) found->outputReceipts.emplace(index, receipt);
+    return {Status::Ok, first};
+}
+
+MaiSessionIMRouter::Status MaiSessionIMRouter::sealOutput(std::uint64_t token, const TurnReceipt& receipt,
+                                                          const AccountScope& scope, const std::string& workspace) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto status = impl_->authority(token, scope, workspace);
+    if (status != Status::Ok) return status;
+    auto* found = impl_->state(token);
+    if (!found->route.receipt || *found->route.receipt != receipt) return Status::InvalidReceipt;
+    if (found->route.phase == Phase::Finishing) return Status::Duplicate;
+    if (found->route.phase != Phase::Running || found->reservedFollowup) return Status::InvalidPhase;
+    found->route.phase = Phase::Finishing;
+    if (found->route.acknowledgedDispatches == found->route.dispatchCount)
+        impl_->eraseRoute(found->route.reservation.input.binding.sessionId);
     return Status::Ok;
 }
 
@@ -401,9 +550,10 @@ MaiSessionIMRouter::Status MaiSessionIMRouter::beginOutput(std::uint64_t token, 
     auto* found = impl_->state(token);
     if (!found->route.receipt || *found->route.receipt != receipt) return Status::InvalidReceipt;
     if (!dispatchCount) return Status::InvalidArgument;
-    if (found->route.phase != Phase::Running) return Status::Busy;
+    if (found->route.phase != Phase::Running || found->route.dispatchCount) return Status::Busy;
     found->route.phase = Phase::Finishing;
     found->route.dispatchCount = dispatchCount;
+    for (std::uint32_t index = 0; index < dispatchCount; ++index) found->outputReceipts.emplace(index, receipt);
     return Status::Ok;
 }
 
@@ -412,7 +562,8 @@ bool MaiSessionIMRouter::isOutputCurrent(std::uint64_t token, const TurnReceipt&
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->authority(token, scope, workspace) != Status::Ok) return false;
     const auto* found = impl_->state(token);
-    return found->route.phase == Phase::Finishing && found->route.receipt && *found->route.receipt == receipt;
+    return (found->route.phase == Phase::Running || found->route.phase == Phase::Finishing) &&
+           found->route.dispatchCount && found->knows(receipt);
 }
 
 MaiSessionIMRouter::Status MaiSessionIMRouter::acknowledgeDispatch(std::uint64_t token, const TurnReceipt& receipt,
@@ -421,12 +572,13 @@ MaiSessionIMRouter::Status MaiSessionIMRouter::acknowledgeDispatch(std::uint64_t
     const auto status = impl_->authority(token, scope, workspace);
     if (status != Status::Ok) return status;
     auto* found = impl_->state(token);
-    if (!found->route.receipt || *found->route.receipt != receipt) return Status::InvalidReceipt;
-    if (found->route.phase != Phase::Finishing) return Status::InvalidPhase;
+    if (!found->knows(receipt)) return Status::InvalidReceipt;
+    if (found->route.phase != Phase::Running && found->route.phase != Phase::Finishing) return Status::InvalidPhase;
     if (index >= found->route.dispatchCount) return Status::InvalidArgument;
+    if (found->outputReceipts.at(index) != receipt) return Status::InvalidReceipt;
     if (!found->acknowledged.insert(index).second) return Status::Duplicate;
     found->route.acknowledgedDispatches = static_cast<std::uint32_t>(found->acknowledged.size());
-    if (found->route.acknowledgedDispatches == found->route.dispatchCount)
+    if (found->route.phase == Phase::Finishing && found->route.acknowledgedDispatches == found->route.dispatchCount)
         impl_->eraseRoute(found->route.reservation.input.binding.sessionId);
     return Status::Ok;
 }
@@ -436,10 +588,12 @@ MaiSessionIMRouter::Status MaiSessionIMRouter::finishWithoutOutput(std::uint64_t
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto status = impl_->authority(token, scope, workspace);
     if (status != Status::Ok) return status;
-    const auto* found = impl_->state(token);
+    auto* found = impl_->state(token);
     if (found->route.phase != Phase::Running) return Status::InvalidPhase;
     if (!found->route.receipt || *found->route.receipt != receipt) return Status::InvalidReceipt;
-    impl_->eraseRoute(found->route.reservation.input.binding.sessionId);
+    found->route.phase = Phase::Finishing;
+    if (found->route.acknowledgedDispatches == found->route.dispatchCount)
+        impl_->eraseRoute(found->route.reservation.input.binding.sessionId);
     return Status::Ok;
 }
 

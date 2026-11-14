@@ -60,9 +60,13 @@ public:
         std::function<MaiResult<std::string>(const std::string&, const std::string&)> decodeText;
         // 内部输入闸门：工具结束后若有补充，先给本批未执行项补齐取消回执，
         // 再在下次模型请求前原子消费并切换 assistant 持久化分段。
-        // closeIfEmpty 为真时，没有待消费输入便封闭本轮接收。
+        // closeIfEmpty 为真时，没有待消费输入便封闭本轮接收。返回 true 时，
+        // currentUserMessageIds 输出本次实际消费的显式 steering ID 组，保持其图片到下组输入。
+        // 旧 durable inbox 不扩展新的 fresh 图片语义，完整消费凭据仍由 Core 单独发布。
         // 回调不得持锁广播事件；轮次和回调捕获对象均须活到 run 返回。
-        std::function<MaiResult<bool>(MaiMessage&, bool closeIfEmpty)> advanceSteering;
+        std::function<MaiResult<bool>(MaiMessage&, bool closeIfEmpty,
+                                      std::vector<std::string>& currentUserMessageIds)>
+            advanceSteering;
         // 工具开始前检查这份 ID 列表，发现输入便让模型重新规划剩余项。
         // 构造请求时先读历史快照再取列表，避免尚未消费的 user 提前进入模型请求。
         std::function<std::vector<std::string>()> pendingSteering;
@@ -121,6 +125,8 @@ private:
     // 流式增量每积累约 1 KiB 就写一次，结束/中断时强制写尾巴。**就地填**，
     // 不是新建——part 在第一个 chunk 到达时就已经占位入库了。
     void commitStreamedParts();
+    // 仅在本次完整响应 commit 后调用；每个正文 part 一次，早于任何实际工具执行。
+    void announceCommittedTextParts(const std::atomic<bool>& cancel);
     void checkpointStreamedParts(bool force);
     void fillStreamedPart(const std::string& partId, const std::string& buffer);
     void finish(const std::atomic<bool>& cancel);
@@ -128,6 +134,8 @@ private:
     Dependencies mDependencies;
     std::string mSessionId;
     std::string mInitialAssistantId;
+    // 只保存当前显式补充组，下一组替换；不累积历史图片，也不另建待执行输入队列。
+    std::vector<std::string> mCurrentUserMessageIds;
     // 专业通知可能重用较旧的消息 ID；不能按这个 ID 把既存的新用户历史移到回复之后。
     std::set<std::string> mSpecialistHistoryIds;
     MaiMessage mAssistant;
@@ -143,6 +151,8 @@ private:
     std::string mTextPartId;
     std::string mReasoningPartId;
     std::size_t mLastPersistedStreamBytes = 0;
+    // Responses 可在一次响应内产出多个正文 part；完成事件必须覆盖它们而非只看最后缓冲。
+    std::size_t mResponseFirstPart = 0;
     // item 切换会更换当前正文缓冲，整次响应是否有可见正文须独立记录。
     bool mResponseHasVisibleText = false;
     // 真实 usage 高于启发式计数时，保守校正本轮后续请求；它不是供应商实际用量。

@@ -14,6 +14,17 @@ import org.junit.Test;
 import java.util.List;
 
 public class RemoteIMProtocolMetadataTest {
+    @Test public void machineResolutionHasExactExistingWireAndRejectsHumanActions() {
+        assertEquals("{\"namespace\":\"multi-ai-code\",\"version\":2,\"origin\":\"machine\","
+            + "\"interaction\":{\"kind\":\"approval-resolved\",\"token\":\"approval-one\",\"outcome\":\"resolved\"}}",
+            RemoteIMProtocolMetadata.encodeApprovalResolved(new RemoteIMApprovalDecision("approval-one", RemoteIMApprovalAction.RESOLVED)));
+        for (RemoteIMApprovalAction action : List.of(RemoteIMApprovalAction.APPROVE_ONCE, RemoteIMApprovalAction.APPROVE_PREFIX,
+                RemoteIMApprovalAction.REJECT)) {
+            try { RemoteIMProtocolMetadata.encodeApprovalResolved(new RemoteIMApprovalDecision("approval-one", action));
+                throw new AssertionError("Machine cannot submit human decision"); }
+            catch (IllegalArgumentException expected) { }
+        }
+    }
     @Test
     public void encodesVersionTwoHumanMessagesFromMaiChatUi() {
         String value = RemoteIMProtocolMetadata.encode(RemoteIMOrigin.HUMAN);

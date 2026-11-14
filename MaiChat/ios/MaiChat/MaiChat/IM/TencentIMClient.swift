@@ -450,6 +450,7 @@ final class TencentIMClient:
 
     func sendSessionReply(_ payload: IMSessionOutgoingPayload, to userID: String,
                           permit: IMSessionDispatchPermit) async throws -> RemoteIMSendReceipt {
+        guard userID == permit.delivery.peerID else { permit.acknowledge(); throw CancellationError() }
         let loginGeneration = profileAccountSnapshot.load().generation
         let kind: String
         let prepared: PreparedSDKMessage?
@@ -480,7 +481,8 @@ final class TencentIMClient:
         guard let prepared else { permit.acknowledge(); throw RemoteIMClientError.operationFailed(
             code: -1, description: "无法创建会话回复") }
         return try await send(message: prepared, to: userID, kind: kind, origin: .machine,
-            cloudMetadata: RemoteIMCloudMetadata(origin: .machine, captionAbove: false),
+            cloudMetadata: RemoteIMCloudMetadata(origin: .machine, interaction: permit.delivery.interaction,
+                captionAbove: false),
             metadata: [:], failureDescription: "会话回复发送失败", sessionPermit: permit, expectedLoginGeneration: loginGeneration)
     }
 
@@ -744,6 +746,20 @@ final class TencentIMClient:
     }
 
     func sendActivity(to userID: String, signal: RemoteIMActivitySignal) async throws {
+        try await sendActivity(to: userID, signal: signal, sessionPermit: nil)
+    }
+
+    func sendSessionActivity(_ signal: RemoteIMActivitySignal, to userID: String,
+                             permit: IMSessionActivityPermit) async throws {
+        guard userID == permit.activity.peerID, signal == permit.activity.signal else {
+            permit.acknowledge(); throw CancellationError()
+        }
+        try await sendActivity(to: userID, signal: signal, sessionPermit: permit)
+    }
+
+    private func sendActivity(to userID: String, signal: RemoteIMActivitySignal,
+                              sessionPermit: IMSessionActivityPermit?) async throws {
+        let loginGeneration = profileAccountSnapshot.load().generation
         guard let message = try await Self.makeMessage({
             V2TIMManager.sharedInstance().createCustomMessage(
                 data: RemoteIMActivityCodec.encode(signal)
@@ -758,9 +774,15 @@ final class TencentIMClient:
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<Void, Error>) in
             Self.sdkQueue.async {
-                guard message.account == Self.diagnosticAccountSnapshot.load() else {
+                guard message.account == Self.diagnosticAccountSnapshot.load(),
+                      loginGeneration == self.profileAccountSnapshot.load().generation else {
                     continuation.resume(throwing: CancellationError()); return
                 }
+                guard sessionPermit == nil || sessionPermit!.claim(accountTag: message.account) else {
+                    sessionPermit?.acknowledge()
+                    continuation.resume(throwing: CancellationError()); return
+                }
+                defer { sessionPermit?.acknowledge() }
                 message.value.isExcludedFromUnreadCount = true
                 message.value.isExcludedFromLastMessage = true
                 V2TIMManager.sharedInstance().sendMessage(
@@ -1421,6 +1443,7 @@ final class TencentIMClient:
         let direct = Self.nonEmpty(msg.groupID) == nil && !msg.isSelf
         let localID = UUID()
         let sourceID = Self.nonEmpty(msg.msgID).map { "sdk:" + $0 } ?? "local:" + localID.uuidString
+        let incomingMessageID = msg.msgID ?? ""
         let fenceTicket = direct ? persistenceFence.begin(accountTag: account, generation: login.generation,
             peerID: peer, sourceID: sourceID) : nil
         let captured = IMSessionBindingCaptureRegistry.shared.captureIngress(accountTag: account,
@@ -1453,6 +1476,13 @@ final class TencentIMClient:
             guard account == Self.diagnosticAccountSnapshot.load(), self.profileAccountSnapshot.load() == login else { return }
             // 重复 SDK delivery 已在普通 DB 核实；不要再启动第二次下载/原 live 输入。
             if initial != nil && (receipt?.persisted != true || receipt?.wasInserted != true) { return }
+            // 仅原 SDK 新到且已持久化的 Human v2 控制帧可回复审批；普通正文不参与猜测。
+            // 保存原 SDK ID、收发身份和原不可变请求，纯 control 不直接调用 Core。
+            if eligible, initial != nil, let decision = metadata?.approvalDecision {
+                IMSessionApprovalRequests.shared.receive(decision, accountTag: account, peerID: peer,
+                    messageID: incomingMessageID, recipientID: login.userID ?? "",
+                    origin: metadata?.origin, group: !direct)
+            }
             let persistedReceipt = receipt
             Self.incomingQueue.async { [weak self] in
                 guard let self, account == Self.diagnosticAccountSnapshot.load() else { return }

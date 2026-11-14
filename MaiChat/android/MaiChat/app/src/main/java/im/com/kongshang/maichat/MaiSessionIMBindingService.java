@@ -16,6 +16,7 @@ public final class MaiSessionIMBindingService implements AutoCloseable {
         interface Observer {
             void projection(JSONObject value);
             void delivery(JSONObject value);
+            default void activity(JSONObject value) { }
             default void warning(String value) { }
             default boolean historyTaskKnown(JSONObject task) { return false; }
         }
@@ -33,6 +34,9 @@ public final class MaiSessionIMBindingService implements AutoCloseable {
         JSONObject activation();
         boolean current(JSONObject scope, String peer);
         void delivery(JSONObject value, Backend backend);
+        default void activity(JSONObject value, Backend backend) {
+            backend.control(activityControl("ack_activity", value));
+        }
         default void warning(String value) { }
         default void publishIngressState(Runnable publication) { publication.run(); }
         default RemoteIMIngress.Fence historyFence(JSONObject task) { throw new IllegalStateException("No ordinary history writer is attached"); }
@@ -64,6 +68,15 @@ public final class MaiSessionIMBindingService implements AutoCloseable {
     private String controllerHighwater = "";
     private final java.util.concurrent.CopyOnWriteArrayList<Consumer<JSONObject>> projectionListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final java.util.LinkedHashSet<String> consumedHistoryTasks = new java.util.LinkedHashSet<>();
+    // 只保留进程内原始交接串；用户按钮不能重建授权 envelope 或泄露 Core permission ID。
+    private static final class ApprovalEnvelope {
+        final String original, epoch; final Backend backend;
+        ApprovalEnvelope(JSONObject value, String epoch, Backend backend) {
+            original = value.toString(); this.epoch = epoch; this.backend = backend;
+        }
+        JSONObject value() { try { return new JSONObject(original); } catch (Exception invalid) { throw new IllegalStateException(invalid); } }
+    }
+    private final java.util.concurrent.ConcurrentHashMap<String, ApprovalEnvelope> approvals = new java.util.concurrent.ConcurrentHashMap<>();
 
     public MaiSessionIMBindingService(Context context, Host host, Supplier<Backend> backendFactory, Runnable changed) {
         this.context = context.getApplicationContext(); this.host = host;
@@ -101,8 +114,17 @@ public final class MaiSessionIMBindingService implements AutoCloseable {
                     else accept(value, true);
                 }
                 @Override public void delivery(JSONObject value) {
-                    if (owns(next, captured)) host.delivery(copy(value), captured);
+                    if (owns(next, captured)) {
+                        rememberApproval(value, captured);
+                        host.delivery(copy(value), captured);
+                    }
                     else acknowledge(captured, value);
+                }
+                @Override public void activity(JSONObject value) {
+                    if (owns(next, captured) && sameAuthority(value, projection)
+                            && host.current(value.optJSONObject("scope"), value.optString("peer_id")))
+                        host.activity(copy(value), captured);
+                    else captured.control(activityControl("ack_activity", value));
                 }
                 @Override public void warning(String value) { if (owns(next, captured)) host.warning(value); }
                 @Override public boolean historyTaskKnown(JSONObject task) {
@@ -188,6 +210,7 @@ public final class MaiSessionIMBindingService implements AutoCloseable {
         controllerHighwater = generation;
         JSONObject ownedProjection = copy(value);
         host.publishIngressState(() -> projection = ownedProjection);
+        approvals.entrySet().removeIf(entry -> !approvalCurrent(entry.getValue(), captured, identity));
         if (save && !restoring) {
             persistProjection(context, value, () -> captured == backend && captured.publicationCurrent(value)
                 && host.current(scope, "") && sameAuthority(projection, value));
@@ -343,8 +366,80 @@ public final class MaiSessionIMBindingService implements AutoCloseable {
 
     public TencentIMClient.LiveAuthority captureAuthority() {
         Backend captured = backend; JSONObject current = projection; String ownerIdentity = identity;
-        return (sender, recipient, messageId, origin, control, hasContent) ->
-            capture(current, captured, ownerIdentity, sender, recipient, messageId, origin, control, hasContent);
+        return new TencentIMClient.LiveAuthority() {
+            @Override public TencentIMClient.LiveAdmission admit(String sender, String recipient, String messageId,
+                    RemoteIMOrigin origin, boolean control, boolean hasContent) {
+                return capture(current, captured, ownerIdentity, sender, recipient, messageId, origin, control, hasContent);
+            }
+            @Override public TencentIMClient.LiveAdmission approvalDecision(String sender, String recipient, String messageId,
+                    RemoteIMOrigin origin, RemoteIMApprovalDecision decision) {
+                return captureApproval(captured, ownerIdentity, sender, recipient, messageId, origin, decision);
+            }
+        };
+    }
+
+    private void rememberApproval(JSONObject delivery, Backend captured) {
+        if (!"text".equals(delivery.optString("kind")) || !sameAuthority(delivery, projection)) return;
+        JSONObject interaction = delivery.optJSONObject("interaction");
+        if (interaction == null) return;
+        try {
+            RemoteIMProtocolMetadata.Metadata metadata = RemoteIMProtocolMetadata.decodeMachineInteraction(interaction.toString());
+            if (metadata.approvalDecision() != null) {
+                ApprovalEnvelope prior = approvals.get(metadata.approvalDecision().token());
+                if (prior != null && prior.backend == captured) {
+                    JSONObject original = prior.value();
+                    if (original.optString("peer_id").equals(delivery.optString("peer_id"))
+                            && original.optString("turn_id").equals(delivery.optString("turn_id")))
+                        approvals.remove(metadata.approvalDecision().token(), prior);
+                }
+                return;
+            }
+            RemoteIMApprovalRequest request = metadata.approvalRequest();
+            JSONObject route = binding(projection, delivery.optString("peer_id"));
+            if (request == null || route == null || !route.optString("session_id").equals(delivery.optString("session_id"))) return;
+            if (approvals.size() >= 256) approvals.entrySet().removeIf(entry -> !approvalCurrent(entry.getValue(), captured, identity));
+            if (approvals.size() < 256) approvals.putIfAbsent(request.token(), new ApprovalEnvelope(delivery, route.optString("epoch"), captured));
+        } catch (Exception invalid) { /* 无效交互仍由普通发送适配拒绝，不授予按钮响应能力。 */ }
+    }
+
+    private boolean approvalCurrent(ApprovalEnvelope approval, Backend captured, String ownerIdentity) {
+        if (closed || captured == null || approval.backend != captured || !owns(ownerIdentity, captured)) return false;
+        JSONObject value = approval.value(), route = binding(projection, value.optString("peer_id"));
+        JSONObject session = session(projection, value.optString("session_id"));
+        return sameAuthority(value, projection) && host.current(value.optJSONObject("scope"), value.optString("peer_id"))
+            && route != null && route.optString("session_id").equals(value.optString("session_id"))
+            && route.optString("epoch").equals(approval.epoch) && session != null
+            && session.optString("workspace_key").equals(value.optString("workspace_key"));
+    }
+
+    private TencentIMClient.LiveAdmission captureApproval(Backend captured, String ownerIdentity, String sender,
+            String recipient, String messageId, RemoteIMOrigin origin, RemoteIMApprovalDecision decision) {
+        if (decision == null || origin != RemoteIMOrigin.HUMAN || messageId.isEmpty()
+                || (decision.action() != RemoteIMApprovalAction.APPROVE_ONCE
+                    && decision.action() != RemoteIMApprovalAction.APPROVE_PREFIX && decision.action() != RemoteIMApprovalAction.REJECT)) return null;
+        ApprovalEnvelope approval = approvals.get(decision.token());
+        if (approval == null || !approvalCurrent(approval, captured, ownerIdentity)) return null;
+        JSONObject original = approval.value(), scope = original.optJSONObject("scope");
+        if (!sender.equals(original.optString("peer_id")) || scope == null || !recipient.equals(scope.optString("owner_id"))) return null;
+        RemoteIMApprovalRequest request = RemoteIMProtocolMetadata.decodeMachineInteraction(original.optJSONObject("interaction").toString()).approvalRequest();
+        if (request == null || !request.allows(decision.action())) return null;
+        java.util.concurrent.atomic.AtomicBoolean consumed = new java.util.concurrent.atomic.AtomicBoolean();
+        return new TencentIMClient.LiveAdmission() {
+            @Override public void persisted(boolean ignored) { }
+            @Override public void mediaReady(RemoteIMMessage ignored) { }
+            @Override public void metadataPersisted(RemoteIMIngress.Stored receipt) {
+                if (!consumed.compareAndSet(false, true) || receipt == null || !receipt.inserted || !receipt.isCurrent()
+                        || receipt.sourceRowId.isEmpty() || !messageId.equals(receipt.remoteId)
+                        || approvals.get(decision.token()) != approval || !approvalCurrent(approval, captured, ownerIdentity)) return;
+                JSONObject control = new JSONObject(); put(control, "action", "approval_decision");
+                put(control, "approval", approval.value()); put(control, "decision", decision.action().wireValue());
+                put(control, "message_id", messageId); put(control, "peer_id", sender); put(control, "sender_id", sender);
+                put(control, "recipient_id", recipient); put(control, "origin", "human"); put(control, "live", true); put(control, "group", false);
+                JSONObject response = captured.control(control);
+                if (response.optBoolean("ok") && response.optBoolean("accepted")) approvals.remove(decision.token(), approval);
+            }
+            @Override public void abandoned() { consumed.set(true); }
+        };
     }
 
     private TencentIMClient.LiveAdmission capture(JSONObject current, Backend captured, String ownerIdentity,
@@ -422,10 +517,12 @@ public final class MaiSessionIMBindingService implements AutoCloseable {
     }
     private void takeover(JSONObject route) {
         if (route == null || backend == null) return;
+        approvals.entrySet().removeIf(entry -> route.optString("session_id").equals(entry.getValue().value().optString("session_id")));
         JSONObject control = request("takeover"); put(control, "session_id", route.optString("session_id"));
         backend.control(control);
     }
     private void revoke() {
+        approvals.clear();
         Backend captured = backend;
         if (captured != null && captured.ownsObserver(observer)) {
             if (projection.has("scope")) captured.control(request("logout"));
@@ -436,6 +533,9 @@ public final class MaiSessionIMBindingService implements AutoCloseable {
     private static void acknowledge(Backend captured, JSONObject delivery) {
         JSONObject request = new JSONObject(); put(request, "action", "ack"); put(request, "delivery", copy(delivery));
         captured.control(request);
+    }
+    static JSONObject activityControl(String action, JSONObject activity) {
+        JSONObject request = new JSONObject(); put(request, "action", action); put(request, "activity", copy(activity)); return request;
     }
     @Override public void close() {
         if (closed) return; revoke(); closed = true; identity = ""; accountIdentity = "";

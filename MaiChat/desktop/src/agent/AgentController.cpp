@@ -61,6 +61,7 @@
 #include <QStandardPaths>
 #include <QTimer>
 #include <cstddef>
+#include <mutex>
 #include <utility>
 #include <variant>
 
@@ -144,6 +145,8 @@ and type=image;
 reuse that same file. Do not write shell scripts to recapture the screen or bypass a failed native
 capture. If the primary model cannot accept images, explain that limitation and use only supported
 image-free observations; never claim to have inspected pixels that were not provided.
+Use agent_send_file to deliver existing workspace documents/files as persistent cards in the current
+reply. Its delivery result contains metadata only, not file contents.
 Do not invent model quality, policy, or price claims.
 Before calling delegate or revise on any paid image or video generation specialist, show the
 user the concrete plan and let the tool's per-call approval be the final confirmation. For
@@ -205,13 +208,25 @@ enum class PartKind { Unknown, Text, Reasoning, Tool };
 
 struct AgentController::Runtime {
     Runtime(QString model, QString effort)
-        : initialDefaultModel(std::move(model)), initialDefaultReasoningEffort(std::move(effort)),
+        : initialDefaultModel(std::move(model)),
+          initialDefaultReasoningEffort(std::move(effort)),
           newSessionDefaultModel(initialDefaultModel) {}
 
     bool supportsModel(const QString& model) const {
         if (!modelClient) return maiCloudModelInfo(toUtf8(model)).has_value();
         const auto wire = modelClient->wireApiForModel(toUtf8(model));
         return wire && *wire != MaiWireApi::Mixed;
+    }
+
+    // Worker Stop failures and GUI validation share one diagnostic snapshot.
+    // Hold only for the QString move/copy; never call Core, I/O or GUI work here.
+    void setError(QString value) {
+        std::lock_guard<std::mutex> lock(errorMutex);
+        errorValue = std::move(value);
+    }
+    QString errorSnapshot() const {
+        std::lock_guard<std::mutex> lock(errorMutex);
+        return errorValue;
     }
 
     std::unique_ptr<MaiAgent> agent;
@@ -224,7 +239,6 @@ struct AgentController::Runtime {
     QTimer scheduleTimer;
     MaiEventBus::Token token = 0;
     QString openError;
-    QString lastError;
     // 只有主线程碰它：所有事件都排队到主线程之后才分类。
     QHash<QString, QHash<QString, PartKind>> partKindsBySession;
     QHash<QString, QHash<QString, QString>> livePartTextBySession;
@@ -232,6 +246,10 @@ struct AgentController::Runtime {
     const QString initialDefaultModel;
     const QString initialDefaultReasoningEffort;
     QString newSessionDefaultModel;
+
+private:
+    mutable std::mutex errorMutex;
+    QString errorValue;
 };
 
 namespace {
@@ -580,7 +598,7 @@ QString AgentController::openError() const {
 }
 
 QString AgentController::lastError() const {
-    return runtime_->lastError;
+    return runtime_->errorSnapshot();
 }
 
 MaiAgent& AgentController::agent() {
@@ -595,7 +613,7 @@ QString AgentController::createSession(const QString& directory, const QString& 
         MaiCreateSession{toUtf8(directory), toUtf8(title), toUtf8(runtime_->newSessionDefaultModel),
                          toUtf8(runtime_->initialDefaultReasoningEffort)});
     if (!created) {
-        runtime_->lastError = fromUtf8(created.error().message());
+        runtime_->setError(fromUtf8(created.error().message()));
         return QString();
     }
     return fromUtf8(created.value());
@@ -605,23 +623,23 @@ bool AgentController::setSessionDirectory(const QString& sessionId, const QStrin
     const QFileInfo selected(directory);
     const QString canonical = selected.canonicalFilePath();
     if (sessionId.isEmpty() || !selected.isDir() || canonical.isEmpty()) {
-        runtime_->lastError = QStringLiteral("工作目录不存在或不可访问。");
+        runtime_->setError(QStringLiteral("工作目录不存在或不可访问。"));
         return false;
     }
     MaiSession session;
     if (!runtime_->agent->getSession(toUtf8(sessionId), session)) {
-        runtime_->lastError = QStringLiteral("当前会话不存在。");
+        runtime_->setError(QStringLiteral("当前会话不存在。"));
         return false;
     }
     if (QDir(fromUtf8(session.directory)).canonicalPath() == canonical) return true;
     if (runtime_->agent->isBusy(toUtf8(sessionId))) {
-        runtime_->lastError = QStringLiteral("任务进行中，请结束后再切换工作目录。");
+        runtime_->setError(QStringLiteral("任务进行中，请结束后再切换工作目录。"));
         return false;
     }
     MaiResult<std::string> updated =
         runtime_->agent->submit(MaiUpdateSession{toUtf8(sessionId), "", "", "", toUtf8(canonical)});
     if (!updated) {
-        runtime_->lastError = fromUtf8(updated.error().message());
+        runtime_->setError(fromUtf8(updated.error().message()));
         return false;
     }
     return true;
@@ -649,7 +667,7 @@ bool AgentController::steerPrompt(const QString& sessionId, const QString& turnI
                                   const QString& text, const QStringList& imagePaths, const QStringList& videoPaths,
                                   const QString& quotedMessageId) {
     if (turnId.isEmpty() || requestId.isEmpty()) {
-        runtime_->lastError = QStringLiteral("补充消息需要绑定原任务与请求编号，内容已保留。");
+        runtime_->setError(QStringLiteral("补充消息需要绑定原任务与请求编号，内容已保留。"));
         return false;
     }
     return submitPrompt(sessionId, text, imagePaths, videoPaths, quotedMessageId, turnId, requestId);
@@ -659,7 +677,7 @@ bool AgentController::submitPrompt(const QString& sessionId, const QString& text
                                    const QStringList& videoPaths, const QString& quotedMessageId, const QString& turnId,
                                    const QString& requestId) {
     if (imagePaths.size() + videoPaths.size() > 10) {
-        runtime_->lastError = QStringLiteral("每条消息最多添加 10 项图片或视频。");
+        runtime_->setError(QStringLiteral("每条消息最多添加 10 项图片或视频。"));
         return false;
     }
     std::vector<MaiModelImage> images;
@@ -669,7 +687,7 @@ bool AgentController::submitPrompt(const QString& sessionId, const QString& text
         const QString mimeType = mimeDatabase.mimeTypeForFile(path).name().toLower();
         if (mimeType != QStringLiteral("image/jpeg") && mimeType != QStringLiteral("image/png") &&
             mimeType != QStringLiteral("image/webp") && mimeType != QStringLiteral("image/gif")) {
-            runtime_->lastError = QStringLiteral("暂不支持这种图片格式：%1").arg(mimeType);
+            runtime_->setError(QStringLiteral("暂不支持这种图片格式：%1").arg(mimeType));
             return false;
         }
         images.push_back({toUtf8(path), toUtf8(mimeType)});
@@ -679,7 +697,7 @@ bool AgentController::submitPrompt(const QString& sessionId, const QString& text
     for (const QString& path : videoPaths) {
         const QFileInfo file(path);
         if (!file.isFile()) {
-            runtime_->lastError = QStringLiteral("视频文件不存在：%1").arg(file.fileName());
+            runtime_->setError(QStringLiteral("视频文件不存在：%1").arg(file.fileName()));
             return false;
         }
         QString mimeType = mimeDatabase.mimeTypeForFile(path).name().toLower();
@@ -691,7 +709,7 @@ bool AgentController::submitPrompt(const QString& sessionId, const QString& text
         else if (suffix == QStringLiteral("webm"))
             mimeType = QStringLiteral("video/webm");
         if (!mimeType.startsWith(QStringLiteral("video/"))) {
-            runtime_->lastError = QStringLiteral("暂不支持这种视频格式：%1").arg(mimeType);
+            runtime_->setError(QStringLiteral("暂不支持这种视频格式：%1").arg(mimeType));
             return false;
         }
         videos.push_back({toUtf8(file.absoluteFilePath()), toUtf8(mimeType)});
@@ -704,7 +722,7 @@ bool AgentController::submitPrompt(const QString& sessionId, const QString& text
             : runtime_->agent->submit(MaiSteerPrompt{toUtf8(sessionId), toUtf8(turnId), toUtf8(requestId), toUtf8(text),
                                                      std::move(images), std::move(videos), toUtf8(quotedMessageId)});
     if (!sent) {
-        runtime_->lastError = fromUtf8(sent.error().message());
+        runtime_->setError(fromUtf8(sent.error().message()));
         return false;
     }
     return true;
@@ -716,8 +734,8 @@ bool AgentController::sessionModelConfiguration(const QString& sessionId, Sessio
     if (!runtime_->agent->getSession(toUtf8(sessionId), session)) return false;
     SessionModelConfiguration resolved;
     resolved.model = session.model.empty() ? runtime_->initialDefaultModel : fromUtf8(session.model);
-    resolved.reasoningEffort = session.reasoningEffort.empty() ? runtime_->initialDefaultReasoningEffort
-                                                              : fromUtf8(session.reasoningEffort);
+    resolved.reasoningEffort =
+        session.reasoningEffort.empty() ? runtime_->initialDefaultReasoningEffort : fromUtf8(session.reasoningEffort);
     if (runtime_->modelClient) {
         const auto wire = runtime_->modelClient->wireApiForModel(toUtf8(resolved.model));
         if (!wire || *wire == MaiWireApi::Mixed) return false;
@@ -736,60 +754,60 @@ bool AgentController::sessionModelConfiguration(const QString& sessionId, Sessio
 }
 
 bool AgentController::setSessionModelConfiguration(const QString& sessionId, const QString& model,
-                                                    std::optional<QString> reasoningEffort) {
+                                                   std::optional<QString> reasoningEffort) {
     const QString selected = model.trimmed();
     if (sessionId.isEmpty() || selected.isEmpty()) {
-        runtime_->lastError = QStringLiteral("模型名称不能为空。");
+        runtime_->setError(QStringLiteral("模型名称不能为空。"));
         return false;
     }
     if (!runtime_->supportsModel(selected)) {
-        runtime_->lastError = QStringLiteral("当前客户端不支持此模型。");
+        runtime_->setError(QStringLiteral("当前客户端不支持此模型。"));
         return false;
     }
     if (reasoningEffort && !maiIsValidReasoningEffort(toUtf8(*reasoningEffort))) {
-        runtime_->lastError = QStringLiteral("思考强度仅支持 low、high、max 或继承默认。");
+        runtime_->setError(QStringLiteral("思考强度仅支持 low、high、max 或继承默认。"));
         return false;
     }
     MaiSession session;
     if (!runtime_->agent->getSession(toUtf8(sessionId), session)) {
-        runtime_->lastError = QStringLiteral("当前会话不存在。");
+        runtime_->setError(QStringLiteral("当前会话不存在。"));
         return false;
     }
     const QString currentModel = session.model.empty() ? runtime_->initialDefaultModel : fromUtf8(session.model);
-    const QString currentEffort = session.reasoningEffort.empty() ? runtime_->initialDefaultReasoningEffort
-                                                                 : fromUtf8(session.reasoningEffort);
+    const QString currentEffort =
+        session.reasoningEffort.empty() ? runtime_->initialDefaultReasoningEffort : fromUtf8(session.reasoningEffort);
     QString requestedEffort = currentEffort;
     if (reasoningEffort)
         requestedEffort = reasoningEffort->isEmpty() ? runtime_->initialDefaultReasoningEffort : *reasoningEffort;
     if (runtime_->agent->isBusy(toUtf8(sessionId))) {
         if (selected != currentModel || requestedEffort != currentEffort) {
-            runtime_->lastError = QStringLiteral("任务进行中，请结束后再切换模型或思考强度。");
+            runtime_->setError(QStringLiteral("任务进行中，请结束后再切换模型或思考强度。"));
             return false;
         }
         // 有效值未变化时不把 legacy 空值物化，避免向活动轮次提交任何 mutation。
-        runtime_->lastError.clear();
+        runtime_->setError({});
         return true;
     }
-    const std::optional<std::string> storedEffort = reasoningEffort
-        ? std::make_optional(toUtf8(*reasoningEffort)) : std::nullopt;
+    const std::optional<std::string> storedEffort =
+        reasoningEffort ? std::make_optional(toUtf8(*reasoningEffort)) : std::nullopt;
     if (toUtf8(selected) == session.model && (!storedEffort || *storedEffort == session.reasoningEffort)) {
-        runtime_->lastError.clear();
+        runtime_->setError({});
         return true;
     }
     // 仅明确装配的普通客户端允许 custom/local 型号；空转实例不能把选择保存成已配置。
     // 账号侧只读所选供应商的缓存，不取另一个 Key，也不在这里发凭据或模型请求。
     if (!runtime_->modelClient ||
         (runtime_->accountClient && !runtime_->accountClient->isConfiguredForModel(toUtf8(selected)))) {
-        runtime_->lastError = QStringLiteral("所选模型尚未配置可用凭据或客户端，当前会话配置未修改。");
+        runtime_->setError(QStringLiteral("所选模型尚未配置可用凭据或客户端，当前会话配置未修改。"));
         return false;
     }
     MaiResult<std::string> updated =
         runtime_->agent->submit(MaiUpdateSession{toUtf8(sessionId), "", toUtf8(selected), "", "", storedEffort});
     if (!updated) {
-        runtime_->lastError = fromUtf8(updated.error().message());
+        runtime_->setError(fromUtf8(updated.error().message()));
         return false;
     }
-    runtime_->lastError.clear();
+    runtime_->setError({});
     return true;
 }
 
@@ -800,15 +818,15 @@ bool AgentController::setModel(const QString& sessionId, const QString& model) {
 bool AgentController::setDefaultModel(const QString& model) {
     const QString selected = model.trimmed();
     if (selected.isEmpty()) {
-        runtime_->lastError = QStringLiteral("模型名称不能为空。");
+        runtime_->setError(QStringLiteral("模型名称不能为空。"));
         return false;
     }
     if (!runtime_->supportsModel(selected)) {
-        runtime_->lastError = QStringLiteral("当前客户端不支持此模型。");
+        runtime_->setError(QStringLiteral("当前客户端不支持此模型。"));
         return false;
     }
     runtime_->newSessionDefaultModel = selected;
-    runtime_->lastError.clear();
+    runtime_->setError({});
     return true;
 }
 
@@ -817,18 +835,27 @@ bool AgentController::interrupt(const QString& sessionId) {
 }
 
 bool AgentController::interrupt(const QString& sessionId, const QString& expectedTurn) {
-    MaiResult<std::string> stopped = runtime_->agent->interruptTurn(toUtf8(sessionId), toUtf8(expectedTurn));
-    if (!stopped) {
-        runtime_->lastError = fromUtf8(stopped.error().message());
+    // Even the legacy session-only API targets the turn observed at entry. A
+    // later replacement must not be canceled or lose IM ownership by this Stop.
+    const std::string turn =
+        expectedTurn.isEmpty() ? runtime_->agent->activeTurnId(toUtf8(sessionId)) : toUtf8(expectedTurn);
+    if (turn.empty()) {
+        runtime_->setError(QStringLiteral("当前会话没有正在执行的任务。"));
         return false;
     }
+    MaiResult<std::string> stopped = runtime_->agent->interruptTurn(toUtf8(sessionId), turn);
+    if (!stopped) {
+        runtime_->setError(fromUtf8(stopped.error().message()));
+        return false;
+    }
+    emit turnInterrupted(sessionId, fromUtf8(turn));
     if (runtime_->scheduleRunner) runtime_->scheduleRunner->finish(toUtf8(sessionId), "Interrupted by user");
     return true;
 }
 
 bool AgentController::setApprovalPolicy(MaiApprovalPolicy policy) {
     if (!runtime_->agent->setApprovalPolicy(policy)) {
-        runtime_->lastError = QStringLiteral("请先停止正在执行的任务，再切换批准方式。");
+        runtime_->setError(QStringLiteral("请先停止正在执行的任务，再切换批准方式。"));
         return false;
     }
     return true;
@@ -843,7 +870,7 @@ bool AgentController::approvePermission(const QString& permissionId, bool approv
         approveForSession ? MaiPermissionDecision::ApprovedForSession : MaiPermissionDecision::Approved;
     MaiResult<std::string> replied = runtime_->agent->submit(MaiReplyPermission{toUtf8(permissionId), decision});
     if (!replied) {
-        runtime_->lastError = fromUtf8(replied.error().message());
+        runtime_->setError(fromUtf8(replied.error().message()));
         return false;
     }
     return true;
@@ -853,7 +880,7 @@ bool AgentController::denyPermission(const QString& permissionId) {
     MaiResult<std::string> replied =
         runtime_->agent->submit(MaiReplyPermission{toUtf8(permissionId), MaiPermissionDecision::Denied});
     if (!replied) {
-        runtime_->lastError = fromUtf8(replied.error().message());
+        runtime_->setError(fromUtf8(replied.error().message()));
         return false;
     }
     return true;
@@ -862,7 +889,7 @@ bool AgentController::denyPermission(const QString& permissionId) {
 bool AgentController::answerQuestion(const QString& questionId, const QString& answer) {
     MaiResult<std::string> replied = runtime_->agent->submit(MaiReplyQuestion{toUtf8(questionId), toUtf8(answer)});
     if (!replied) {
-        runtime_->lastError = fromUtf8(replied.error().message());
+        runtime_->setError(fromUtf8(replied.error().message()));
         return false;
     }
     return true;
@@ -969,6 +996,17 @@ void AgentController::onEventQueued(const MaiEvent& event) {
             } else {
                 emit textDelta(sessionId, messageId, partId, delta);
             }
+            return;
+        }
+
+        case MaiEventType::MessageTextCommitted:
+            emit textCommitted(sessionId, messageId, partId, fromUtf8(event.turnId));
+            return;
+
+        case MaiEventType::TurnSteeringApplied: {
+            QStringList inputs;
+            for (const auto& input : event.inputMessageIds) inputs.append(fromUtf8(input));
+            emit steeringApplied(sessionId, messageId, fromUtf8(event.turnId), inputs);
             return;
         }
 

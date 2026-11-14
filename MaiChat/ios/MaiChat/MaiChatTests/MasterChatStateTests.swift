@@ -13,6 +13,19 @@ final class AppDiagnosticLog: @unchecked Sendable {
 }
 
 final class MasterChatStateTests: XCTestCase {
+    func testMachineApprovalTerminalEncodesAsResolvedWireFrame() throws {
+        for action in [RemoteIMApprovalAction.resolved, .autoDeclined] {
+            let metadata = RemoteIMCloudMetadata(origin: .machine,
+                interaction: .approvalDecision(token: "approval-owned-terminal", action: action))
+            let data = RemoteIMCloudMetadataCodec.encode(metadata)
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let interaction = try XCTUnwrap(object["interaction"] as? [String: Any])
+            XCTAssertEqual(interaction["kind"] as? String, "approval-resolved")
+            XCTAssertEqual(interaction["outcome"] as? String, action.rawValue)
+            XCTAssertNil(interaction["action"])
+            XCTAssertEqual(RemoteIMCloudMetadataCodec.decode(data), metadata)
+        }
+    }
     func testGroupActivationMarkerHasExactWirePayload() {
         let payload = Data(#"{"type":"maichat_group_activation","v":1}"#.utf8)
         XCTAssertEqual(RemoteIMGroupActivationCodec.encode(), payload)

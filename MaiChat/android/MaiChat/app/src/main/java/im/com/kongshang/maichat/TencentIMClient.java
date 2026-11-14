@@ -55,6 +55,8 @@ public final class TencentIMClient {
     public interface LiveAuthority {
         LiveAdmission admit(String sender, String recipient, String messageId,
             RemoteIMOrigin origin, boolean controlFrame, boolean hasContent);
+        default LiveAdmission approvalDecision(String sender, String recipient, String messageId,
+                RemoteIMOrigin origin, RemoteIMApprovalDecision decision) { return null; }
     }
 
     /** 原始 SDK 身份、实际 DB 首写回执与后续就绪回调共用的票据；不持有路由队列。 */
@@ -137,6 +139,8 @@ public final class TencentIMClient {
     interface MachineSdk {
         V2TIMMessage create(RemoteIMMessage source, String exactBody);
         void send(V2TIMMessage message, String peer, String metadata, V2TIMSendCallback<V2TIMMessage> completion);
+        default V2TIMMessage createActivity(byte[] signal) { throw new UnsupportedOperationException("No activity transport"); }
+        default void sendActivity(V2TIMMessage message, String peer) { throw new UnsupportedOperationException("No activity transport"); }
     }
 
     public interface OperationCompletion {
@@ -396,6 +400,14 @@ public final class TencentIMClient {
                 V2TIMManager.getMessageManager().sendMessage(message, peer, null,
                     V2TIMMessage.V2TIM_PRIORITY_DEFAULT, false, null, completion);
             }
+            @Override public V2TIMMessage createActivity(byte[] signal) {
+                return V2TIMManager.getMessageManager().createCustomMessage(signal);
+            }
+            @Override public void sendActivity(V2TIMMessage message, String peer) {
+                message.setExcludedFromUnreadCount(true); message.setExcludedFromLastMessage(true);
+                V2TIMManager.getMessageManager().sendMessage(message, peer, null,
+                    V2TIMMessage.V2TIM_PRIORITY_DEFAULT, true, null, null);
+            }
         };
     }
 
@@ -480,8 +492,9 @@ public final class TencentIMClient {
                 RemoteIMMessage.Direction.INCOMING, RemoteIMMessage.Status.RECEIVED, createdAt, image, voice, file, video, protocol.origin());
             initial.setQuote(protocol.quote()); initial.setCaptionAbove(protocol.captionAbove());
             RemoteIMIngress.Metadata metadata = new RemoteIMIngress.Metadata(scope, registration.sequence, initial);
-            binding = authority.admit(sender, scope.ownerId, remoteId, protocol.origin(),
-                protocol.approvalRequest() != null || protocol.approvalDecision() != null, content);
+            binding = protocol.approvalDecision() != null
+                ? authority.approvalDecision(sender, scope.ownerId, remoteId, protocol.origin(), protocol.approvalDecision())
+                : authority.admit(sender, scope.ownerId, remoteId, protocol.origin(), protocol.approvalRequest() != null, content);
             IncomingTicket ticket = new IncomingTicket(metadata, registration, binding, () -> isIngressScopeCurrent(scope));
             listener.persistRawMetadata(metadata).whenComplete((record, failure) -> {
                 if (failure != null || record == null || record.sourceRowId.isEmpty() || !isIngressScopeCurrent(scope)) {
@@ -530,12 +543,24 @@ public final class TencentIMClient {
                         || source.origin() != RemoteIMOrigin.MACHINE || !claim.getAsBoolean()) {
                     if (finished.compareAndSet(false, true)) completion.onError(-1, "会话绑定发送已失效"); return;
                 }
+                if (!source.fromUserId().equals(owner) || source.toUserId().isEmpty())
+                    throw new IllegalArgumentException("Mismatched machine source");
+                String metadata = RemoteIMProtocolMetadata.encode(RemoteIMOrigin.MACHINE);
+                if (source.approvalRequest() != null || source.approvalDecision() != null) {
+                    if (source.imageAttachment() != null || source.voiceAttachment() != null
+                            || source.fileAttachment() != null || source.videoAttachment() != null
+                            || source.approvalRequest() != null && source.approvalDecision() != null)
+                        throw new IllegalArgumentException("Approval must be one text interaction");
+                    metadata = source.approvalRequest() != null
+                        ? RemoteIMProtocolMetadata.encodeApprovalRequest(source.approvalRequest())
+                        : RemoteIMProtocolMetadata.encodeApprovalResolved(source.approvalDecision());
+                }
                 V2TIMMessage message = machineSdk.create(source, exactBody);
                 if (message == null || !current.getAsBoolean() || !selfProfileIdentityMatches(owner, loginEpoch)) {
                     if (finished.compareAndSet(false, true)) completion.onError(-1, "登录身份或媒体已变化"); return;
                 }
                 sending.run();
-                machineSdk.send(message, source.toUserId(), RemoteIMProtocolMetadata.encode(RemoteIMOrigin.MACHINE),
+                machineSdk.send(message, source.toUserId(), metadata,
                     new V2TIMSendCallback<V2TIMMessage>() {
                         @Override public void onProgress(int progress) { }
                         @Override public void onSuccess(V2TIMMessage returned) {
@@ -1171,12 +1196,27 @@ public final class TencentIMClient {
             sdkHandler.post(() -> sendActivity(peerId, signal)); return;
         }
         if (currentUserId.isEmpty() || clean(peerId).isEmpty()) return;
-        V2TIMMessage message = V2TIMManager.getMessageManager().createCustomMessage(signal.encode());
+        V2TIMMessage message = machineSdk.createActivity(signal.encode());
         if (message == null) return;
-        message.setExcludedFromUnreadCount(true);
-        message.setExcludedFromLastMessage(true);
-        V2TIMManager.getMessageManager().sendMessage(message, clean(peerId), null,
-            V2TIMMessage.V2TIM_PRIORITY_DEFAULT, true, null, null);
+        machineSdk.sendActivity(message, clean(peerId));
+    }
+
+    /** 绑定活动与普通输入共用在线自定义协议；授权在排队后的 SDK 边界复查，不持久化。 */
+    public void sendSessionIMActivity(String owner, long loginEpoch, java.util.function.BooleanSupplier current,
+            java.util.function.BooleanSupplier claim, String peer, RemoteIMActivitySignal signal, Runnable dispatched) {
+        AtomicBoolean acknowledged = new AtomicBoolean();
+        Runnable ack = () -> { if (acknowledged.compareAndSet(false, true)) dispatched.run(); };
+        Runnable dispatch = () -> {
+            try {
+                if (signal == null || clean(peer).isEmpty() || !current.getAsBoolean()
+                        || !selfProfileIdentityMatches(owner, loginEpoch) || !claim.getAsBoolean()) return;
+                V2TIMMessage message = machineSdk.createActivity(signal.encode());
+                if (message == null || !current.getAsBoolean() || !selfProfileIdentityMatches(owner, loginEpoch)) return;
+                machineSdk.sendActivity(message, peer);
+            } catch (Exception | LinkageError failed) { /* 活动租约过期即收起；不伪造远端状态或自动重发。 */ }
+            finally { ack.run(); }
+        };
+        if (closed || !sdkHandler.post(dispatch)) ack.run();
     }
 
     private void send(

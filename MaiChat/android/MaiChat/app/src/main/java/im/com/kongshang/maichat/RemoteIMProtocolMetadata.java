@@ -105,6 +105,33 @@ public final class RemoteIMProtocolMetadata {
         return encode(RemoteIMOrigin.HUMAN, null, decision, null);
     }
 
+    /** 机器结束通知只关闭原 token，不把机器状态伪装成人工决定。 */
+    public static String encodeApprovalResolved(RemoteIMApprovalDecision resolution) {
+        if (resolution == null || (resolution.action() != RemoteIMApprovalAction.RESOLVED
+                && resolution.action() != RemoteIMApprovalAction.AUTO_DECLINED))
+            throw new IllegalArgumentException("invalid approval resolution");
+        return encode(RemoteIMOrigin.MACHINE, null, resolution, null);
+    }
+
+    /** Native 普通 text 的唯一交互适配；保留原交接对象，线格式只由既有 typed codec 生成。 */
+    static Metadata decodeMachineInteraction(String raw) {
+        Object parsed = GSON.fromJson(raw, Object.class);
+        if (!(parsed instanceof Map)) throw new IllegalArgumentException("invalid machine interaction");
+        Map<?, ?> value = (Map<?, ?>) parsed;
+        Object token = value.get("token"), kind = value.get("kind");
+        if (!(token instanceof String) || !token.equals(((String) token).trim())
+                || !RemoteIMApprovalRequest.isValidToken((String) token))
+            throw new IllegalArgumentException("invalid approval token");
+        WireMetadata wire = new WireMetadata(); wire.namespace = NAMESPACE; wire.version = VERSION;
+        wire.origin = "machine"; wire.interaction = GSON.fromJson(raw, WireInteraction.class);
+        Metadata result = decodeMetadata(GSON.toJson(wire));
+        if ("approval-request".equals(kind) && result.approvalRequest() != null) return result;
+        if ("approval-resolved".equals(kind) && result.approvalDecision() != null
+                && ("resolved".equals(value.get("outcome")) || "auto-declined".equals(value.get("outcome"))))
+            return result;
+        throw new IllegalArgumentException("unsupported machine interaction");
+    }
+
     public static RemoteIMOrigin decode(String value) {
         return decodeMetadata(value).origin();
     }
@@ -222,9 +249,11 @@ public final class RemoteIMProtocolMetadata {
             wire.interaction = interaction;
         } else if (decision != null) {
             WireInteraction interaction = new WireInteraction();
-            interaction.kind = "approval-decision";
+            interaction.kind = origin == RemoteIMOrigin.MACHINE ? "approval-resolved" : "approval-decision";
             interaction.token = decision.token();
-            interaction.action = decision.action().wireValue();
+            if (origin == RemoteIMOrigin.MACHINE)
+                interaction.outcome = decision.action() == RemoteIMApprovalAction.AUTO_DECLINED ? "auto-declined" : "resolved";
+            else interaction.action = decision.action().wireValue();
             wire.interaction = interaction;
         }
         if (quote != null && !quote.digest().isEmpty()) {

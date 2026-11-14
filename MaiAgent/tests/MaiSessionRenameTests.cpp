@@ -3,6 +3,7 @@
 #include "MaiSessionTools.h"
 
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -11,6 +12,7 @@
 #include <sqlite3.h>
 
 #include "MaiAgent.h"
+#include "MaiEventEmitter.h"
 #include "MaiFakeModelClient.h"
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
@@ -68,6 +70,7 @@ void test_current_only_validation_and_noop() {
     bool persistedBeforeEvent = false;
     agent.eventBus().subscribe([&](const MaiEvent& event) {
         if (event.type != MaiEventType::SessionUpdated || event.sessionId != id) return;
+        CHECK(event.field == "title");
         ++updated;
         MaiSession stored;
         persistedBeforeEvent =
@@ -132,6 +135,77 @@ void test_current_only_validation_and_noop() {
     context.sessionAgent = nullptr;
     CHECK(rename->execute(R"({"title":"Unavailable"})", context).error().code() ==
           MaiErrorCode::NotSupported);
+}
+
+void test_session_update_fields_keep_workspace_priority_and_clear_distinct() {
+    MaiEventBus bus;
+    MaiEventEmitter emitter(bus);
+    std::string unknownField = "unexpected";
+    bus.subscribe([&](const MaiEvent& event) { unknownField = event.field; });
+    emitter.emitSession(MaiEventType::SessionUpdated, "session-unclassified", "Old title");
+    CHECK(unknownField.empty());  // Unclassified updates must not inherit title authority.
+
+    MaiAgent agent(makeMaiMemoryStore(), nullptr, nullptr);
+    const auto id = agent.submit(MaiCreateSession{"/tmp/work", "Original", "test"}).value();
+    std::vector<MaiEvent> updates;
+    agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type == MaiEventType::SessionUpdated && event.sessionId == id)
+            updates.push_back(event);
+    });
+    CHECK(agent.submit(MaiUpdateSession{id, "Renamed", "", "", ""}));
+    CHECK(agent.submit(MaiUpdateSession{id, "Moved and renamed", "", "", "/tmp/other"}));
+    CHECK(agent.submit(MaiUpdateSession{id, "Same workspace", "", "", "/tmp/other"}));
+    CHECK(agent.submit(MaiUpdateSession{id, "", "next-model", "", ""}));
+    CHECK(agent.submit(MaiUpdateSession{id, "", "third-model", "", "/tmp/final"}));
+    CHECK(agent.submit(MaiClearMessages{id}));
+    CHECK(updates.size() == 6);
+    if (updates.size() == 6) {
+        CHECK(updates[0].field == "title" && updates[0].detail == "Renamed");
+        CHECK(updates[1].field == "workspace" && updates[1].detail == "Moved and renamed");
+        CHECK(updates[2].field == "title");
+        CHECK(updates[3].field.empty());
+        CHECK(updates[4].field == "workspace");
+        CHECK(updates[5].field == "clear" && updates[5].detail.empty());
+    }
+    CHECK(agent.submit(MaiUpdateSession{id, "", "third-model", "", "/tmp/final"}));
+    CHECK(updates.size() == 6);  // No-op updates do not invalidate a bound turn.
+}
+
+void test_input_updates_and_automatic_title_have_distinct_fields() {
+    class InputModel final : public MaiModelClient {
+    public:
+        MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
+                        const std::atomic<bool>&) override {
+            if (++requests == 1) firstRequest();
+            if (sink.onText) sink.onText("Reply");
+            return {};
+        }
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::ChatCompletions;
+        }
+        std::function<void()> firstRequest;
+        int requests = 0;
+    };
+    auto model = std::make_unique<InputModel>();
+    auto* observed = model.get();
+    MaiAgent agent(makeMaiMemoryStore(), std::move(model), nullptr);
+    const auto id = agent.submit(MaiCreateSession{"/tmp/work", "", ""}).value();
+    bool steered = false, enqueued = false;
+    observed->firstRequest = [&] {
+        const auto turn = agent.activeTurnId(id);
+        steered = agent.submit(MaiSteerPrompt{id, turn, "field-steer", "Supplement"}).isOk();
+        enqueued =
+            agent.submit(MaiEnqueuePrompt{MaiSendPrompt{id, "Queued input"}, "field-queue"}).isOk();
+    };
+    std::vector<std::string> fields;
+    agent.eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type == MaiEventType::SessionUpdated && event.sessionId == id)
+            fields.push_back(event.field);
+    });
+    CHECK(agent.submit(MaiSendPrompt{id, "Initial input"}));
+    agent.waitIdle();
+    CHECK(steered && enqueued);
+    CHECK(fields == (std::vector<std::string>{"input", "input", "title"}));
 }
 
 void test_running_rename_keeps_explicit_placeholder_title() {
@@ -243,6 +317,8 @@ void test_sqlite_v5_migration_explicit_name_reopen_and_clear() {
 
 int main() {
     test_current_only_validation_and_noop();
+    test_session_update_fields_keep_workspace_priority_and_clear_distinct();
+    test_input_updates_and_automatic_title_have_distinct_fields();
     test_running_rename_keeps_explicit_placeholder_title();
     test_sqlite_v5_migration_explicit_name_reopen_and_clear();
     if (failures == 0) std::puts("session rename tests passed");

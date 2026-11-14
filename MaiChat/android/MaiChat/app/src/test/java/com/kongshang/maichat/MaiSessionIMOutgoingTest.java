@@ -18,6 +18,24 @@ import org.robolectric.annotation.Config;
 @RunWith(RobolectricTestRunner.class)
 @Config(sdk = 34)
 public class MaiSessionIMOutgoingTest {
+    @Test public void textApprovalKeepsTypedInteractionAndOriginalEnvelope() throws Exception {
+        Context context = ApplicationProvider.getApplicationContext();
+        JSONObject value = new JSONObject().put("scope", new JSONObject().put("owner_id", "owner"))
+            .put("kind", "text").put("peer_id", "peer").put("text", "  Review this operation  ")
+            .put("opaque_future_field", new JSONObject().put("proof", 7))
+            .put("interaction", new JSONObject().put("kind", "approval-request").put("token", "approval-owned")
+                .put("actions", new org.json.JSONArray().put("approve-once").put("reject")));
+        String original = value.toString();
+        MaiSessionIMOutgoing prepared = MaiSessionIMOutgoing.prepare(context, value, () -> true);
+        assertNotNull(prepared.message.approvalRequest());
+        assertEquals("approval-owned", prepared.message.approvalRequest().token());
+        assertEquals("  Review this operation  ", prepared.exactBody);
+        assertEquals(original, value.toString());
+        value.put("interaction", new JSONObject().put("kind", "approval-resolved").put("token", "approval-owned")
+            .put("outcome", "auto-declined"));
+        prepared = MaiSessionIMOutgoing.prepare(context, value, () -> true);
+        assertEquals(RemoteIMApprovalAction.AUTO_DECLINED, prepared.message.approvalDecision().action());
+    }
     @Test public void reusedProcessLocalDeliveryTokensCannotCollideInPersistedRowIds() throws Exception {
         Context context = ApplicationProvider.getApplicationContext();
         JSONObject scope = new JSONObject().put("sdk_app_id", "123").put("owner_id", "owner")
@@ -30,6 +48,23 @@ public class MaiSessionIMOutgoingTest {
         String stable = firstProcess.message.id();
         firstProcess.message.setRemoteId("real-sdk-id"); firstProcess.message.setStatus(RemoteIMMessage.Status.SENT);
         assertEquals(stable, firstProcess.message.id()); assertEquals(stable, firstProcess.message.snapshot().id());
+    }
+    @Test public void malformedInteractionNeverFallsBackToPlainMachineText() throws Exception {
+        Context context = ApplicationProvider.getApplicationContext();
+        for (String interaction : new String[]{"{}", "{\"kind\":\"approval-decision\",\"token\":\"approval-one\",\"action\":\"approve-once\"}",
+                "{\"kind\":\"approval-resolved\",\"token\":\"approval-one\",\"outcome\":\"approved\"}"}) {
+            JSONObject value = new JSONObject().put("scope", new JSONObject().put("owner_id", "owner"))
+                .put("kind", "text").put("peer_id", "peer").put("text", "Review").put("interaction", new JSONObject(interaction));
+            try { MaiSessionIMOutgoing.prepare(context, value, () -> true); fail("Must reject invalid control"); }
+            catch (java.io.IOException expected) { assertTrue(expected.getMessage().contains("审批")); }
+        }
+        JSONObject question = new JSONObject().put("scope", new JSONObject().put("owner_id", "owner"))
+            .put("kind", "text").put("peer_id", "peer").put("text", "Choose A or B").put("question_id", "qst_owned");
+        MaiSessionIMOutgoing prepared = MaiSessionIMOutgoing.prepare(context, question, () -> true);
+        assertEquals("Choose A or B", prepared.exactBody); assertNull(prepared.message.approvalRequest());
+        question.put("interaction", "{\"kind\":\"approval-request\",\"token\":\"approval-one\",\"actions\":[\"approve-once\",\"reject\"]}");
+        try { MaiSessionIMOutgoing.prepare(context, question, () -> true); fail("String cannot replace interaction object"); }
+        catch (java.io.IOException expected) { assertTrue(expected.getMessage().contains("审批")); }
     }
     @Test public void missingMediaAcknowledgesWithoutSdkSendAndReportsOneLocalError() throws Exception {
         Context context = ApplicationProvider.getApplicationContext();

@@ -6,15 +6,13 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "MaiTime.h"
 
 // ── 事件类型 ────────────────────────────────────────────────────
-// 只做第一阶段要的 13 种。openapi.json 里有 89 种，
-// 其余 76 种属于 pty / tui / lsp / mcp / vcs / workspace 这些第一阶段不做的子系统。
-//
-// 另外 spec 里有两套并行的流式协议：session.next.* 和 message.part.*。翻过界面的消费端，
-// 它吃的是后者（session.next.* 全仓只有 2 处引用），所以这里只产出 message.part.* 那一套。
+// 已有枚举值的顺序是原生宿主接口的一部分；新增事件只追加，不能挪动旧值。
+// 流式增量供本地显示，完整正文及补充消费凭据则提供独立的已持久化边界。
 enum class MaiEventType {
     SessionCreated,
     SessionUpdated,
@@ -34,6 +32,10 @@ enum class MaiEventType {
     QuestionAnswered,
     // 外部上下文快照已原子发布。不是新用户输入/assistant 回执，不触发自动执行。
     ContextImported,
+    // 一次完整成功的模型响应已落库；每个非空正文 part 一次，可能仍在同轮执行工具。
+    MessageTextCommitted,
+    // 补充已在安全点消费，新 assistant 已落库；先于其 MessageUpdated 广播。
+    TurnSteeringApplied,
 };
 
 // 转成 "message.part.delta" 这类线上字符串。
@@ -71,6 +73,14 @@ struct MaiEvent {
     // 其它事件的附带信息（错误文本、标题、权限裁决等）。
     std::string detail;
     MaiMillis time = 0;
+
+    // 上述两种提交凭据使用最初 activeTurnId；assistant 分段变化不改变此身份。
+    // MessageTextCommitted 的 messageId/partId 指向完整正文，不代表轮次已经结束，
+    // 也不把失败/取消的半截响应、推理或工具输出当作已提交正文。
+    std::string turnId;
+    // 仅 TurnSteeringApplied 使用，按实际消费顺序列出 user ID；messageId 是新 assistant。
+    // 发布前用户状态及新 assistant 均已持久化。事件可早于提交线程返回，不提供历史重放。
+    std::vector<std::string> inputMessageIds;
 };
 
 // ── 事件总线 ────────────────────────────────────────────────────

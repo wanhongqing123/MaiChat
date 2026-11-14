@@ -515,7 +515,8 @@ public final class AIAssistantController {
             @Override public JSONObject control(JSONObject value) {
                 JSONObject result = sessionIMControl(value);
                 String action = value.optString("action");
-                if (action.equals("ack") || action.equals("abandon_input") || action.equals("persisted_input") || action.equals("admit")) wakeSessionIM();
+                if (action.equals("ack") || action.equals("abandon_input") || action.equals("persisted_input")
+                        || action.equals("admit") || action.equals("approval_decision")) wakeSessionIM();
                 if (action.equals("takeover") && result.optBoolean("ok") && result.optBoolean("revoked"))
                     sessionIMDidTakeover(value);
                 return result;
@@ -850,6 +851,15 @@ public final class AIAssistantController {
             JSONObject result = invokeNativeAgent(request);
             received.receive(result);
             updateSessionIMAuthority(result);
+            JSONArray activities = result.optJSONArray("activities");
+            if (activities != null) for (int index = 0; index < activities.length(); index++) {
+                JSONObject activity = MaiSessionIMBindingService.copy(activities.getJSONObject(index));
+                main.post(() -> {
+                    if (!closed && epoch == nativeEpoch && observer != null && sessionIMObserver == observer
+                            && MaiSessionIMBindingService.sameAuthority(activity, sessionIMAuthority)) observer.activity(activity);
+                    else sessionIMControl(MaiSessionIMBindingService.activityControl("ack_activity", activity));
+                });
+            }
             JSONArray deliveries = result.optJSONArray("deliveries");
             if (deliveries != null) for (int index = 0; index < deliveries.length(); index++) {
                 JSONObject delivery = MaiSessionIMBindingService.copy(deliveries.getJSONObject(index));

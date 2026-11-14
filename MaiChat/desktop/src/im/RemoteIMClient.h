@@ -148,6 +148,24 @@ public:
         Q_UNUSED(action);
         if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持审批按钮"), {});
     }
+    // 机器审批卡复用持久文本和既有 v2 interaction；调用方先核对准确绑定/轮次授权。
+    // 不支持时必须失败，不能丢掉审批元数据或回退成人类文本；不附带聊天引用。
+    virtual void sendMachineApprovalRequest(const QString& peerId, const QString& text,
+                                            const RemoteIMApprovalRequest& request, RemoteIMSendCompletion completion) {
+        Q_UNUSED(peerId);
+        Q_UNUSED(text);
+        Q_UNUSED(request);
+        if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持机器审批请求"), {});
+    }
+    // 仅接受 Resolved/AutoDeclined 结束状态；用户决定仍走 sendApprovalDecision。
+    virtual void sendMachineApprovalResolved(const QString& peerId, const QString& text,
+                                             const RemoteIMApprovalDecision& resolution,
+                                             RemoteIMSendCompletion completion) {
+        Q_UNUSED(peerId);
+        Q_UNUSED(text);
+        Q_UNUSED(resolution);
+        if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持机器审批结束状态"), {});
+    }
     // 协议与控制帧即使复用腾讯文本接口，来源仍是机器。
     // 普通聊天界面继续调用 sendText()，不能把控制帧当成人类消息。
     virtual void sendMachineText(const QString& peerId, const QString& text, RemoteIMSendCompletion completion) {

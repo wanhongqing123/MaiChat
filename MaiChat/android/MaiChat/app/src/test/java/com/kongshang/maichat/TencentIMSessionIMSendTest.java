@@ -40,12 +40,19 @@ public class TencentIMSessionIMSendTest {
         final CountDownLatch sent = new CountDownLatch(1);
         volatile V2TIMSendCallback<V2TIMMessage> callback;
         volatile String body, metadata;
+        volatile byte[] activity;
         Runnable duringCreate = () -> {};
         @Override public V2TIMMessage create(RemoteIMMessage source, String exactBody) {
             creates.incrementAndGet(); body = exactBody; duringCreate.run(); return new Receipt("", 0);
         }
         @Override public void send(V2TIMMessage message, String peer, String metadata, V2TIMSendCallback<V2TIMMessage> callback) {
             assertEquals(PEER, peer); this.metadata = metadata; this.callback = callback; sends.incrementAndGet(); sent.countDown();
+        }
+        @Override public V2TIMMessage createActivity(byte[] signal) {
+            creates.incrementAndGet(); activity = signal.clone(); duringCreate.run(); return new Receipt("", 0);
+        }
+        @Override public void sendActivity(V2TIMMessage message, String peer) {
+            assertEquals(PEER, peer); sends.incrementAndGet(); sent.countDown();
         }
     }
     private static class Listener implements TencentIMClient.Listener {
@@ -99,6 +106,98 @@ public class TencentIMSessionIMSendTest {
             assertEquals(321_000, completion.millis); assertEquals(1, acks.get());
             sdk.callback.onError(99, "late duplicate"); sdk.callback.onSuccess(new Receipt("duplicate", 999));
             assertEquals(1, completion.callbacks.get()); assertEquals(1, sdk.sends.get());
+        } finally { client.destroy(); }
+    }
+
+    @Test public void machineApprovalUsesExistingWireWithoutQuoteOrHumanDecision() throws Exception {
+        Transport sdk = new Transport(); TencentIMClient client = client(sdk, new Listener());
+        RemoteIMApprovalRequest request = new RemoteIMApprovalRequest("approval-owned", List.of(
+            RemoteIMApprovalAction.APPROVE_ONCE, RemoteIMApprovalAction.REJECT));
+        RemoteIMMessage source = new RemoteIMMessage("request-local", "", OWNER, PEER, "Review",
+            RemoteIMMessage.Direction.OUTGOING, RemoteIMMessage.Status.PENDING, 100,
+            null, null, null, null, RemoteIMOrigin.MACHINE, request, null);
+        try {
+            client.sendSessionIM(OWNER, client.sessionIMLoginEpoch(), () -> true, () -> true,
+                source, "Review", () -> {}, () -> {}, new Completion());
+            assertTrue(sdk.sent.await(3, TimeUnit.SECONDS));
+            org.json.JSONObject wire = new org.json.JSONObject(sdk.metadata);
+            assertEquals("machine", wire.getString("origin"));
+            assertEquals(2, wire.getInt("version"));
+            org.json.JSONObject interaction = wire.getJSONObject("interaction");
+            assertEquals("approval-request", interaction.getString("kind"));
+            assertEquals("approval-owned", interaction.getString("token"));
+            assertEquals("[\"approve-once\",\"reject\"]", interaction.getJSONArray("actions").toString());
+            assertFalse(wire.has("quote")); assertFalse(interaction.has("action"));
+        } finally { client.destroy(); }
+    }
+
+    private static RemoteIMActivitySignal activity() {
+        String wire = "{\"namespace\":\"multi-ai-code-activity\",\"version\":2,\"activityId\":\"evt_owned\","
+            + "\"sequence\":7,\"kind\":\"machine-tool\",\"active\":true,\"startedAtMs\":1700000001000,"
+            + "\"taskStartedAtMs\":1700000000000,\"ttlMs\":12000}";
+        return RemoteIMActivitySignal.decode(wire.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    @Test public void boundActivityUsesExistingVersionTwoSignalAndAcknowledgesDispatch() throws Exception {
+        Transport sdk = new Transport(); TencentIMClient client = client(sdk, new Listener());
+        CountDownLatch ack = new CountDownLatch(1); AtomicInteger claims = new AtomicInteger();
+        try {
+            client.sendSessionIMActivity(OWNER, client.sessionIMLoginEpoch(), () -> true,
+                () -> { claims.incrementAndGet(); return true; }, PEER, activity(), ack::countDown);
+            assertTrue(ack.await(3, TimeUnit.SECONDS)); assertEquals(1, claims.get()); assertEquals(1, sdk.sends.get());
+            org.json.JSONObject wire = new org.json.JSONObject(new String(sdk.activity, java.nio.charset.StandardCharsets.UTF_8));
+            assertEquals("multi-ai-code-activity", wire.getString("namespace")); assertEquals(2, wire.getInt("version"));
+            assertEquals("evt_owned", wire.getString("activityId")); assertEquals(7, wire.getLong("sequence"));
+            assertEquals(1700000001000L, wire.getLong("startedAtMs")); assertEquals(1700000000000L, wire.getLong("taskStartedAtMs"));
+            assertFalse(wire.has("scope")); assertFalse(wire.has("bridge_id"));
+        } finally { client.destroy(); }
+    }
+
+    @Test public void activityQueuedOwnerOrLoginEpochChangeCannotClaimCreateOrSend() throws Exception {
+        for (boolean epoch : new boolean[]{false, true}) {
+            Transport sdk = new Transport(); TencentIMClient client = client(sdk, new Listener());
+            CountDownLatch release = new CountDownLatch(1), occupied = new CountDownLatch(1), ack = new CountDownLatch(1);
+            AtomicInteger claims = new AtomicInteger();
+            try {
+                ((Handler) field(client, "sdkHandler")).post(() -> { occupied.countDown(); try { release.await(); } catch (InterruptedException ignored) {} });
+                assertTrue(occupied.await(3, TimeUnit.SECONDS));
+                client.sendSessionIMActivity(OWNER, client.sessionIMLoginEpoch(), () -> true,
+                    () -> { claims.incrementAndGet(); return true; }, PEER, activity(), ack::countDown);
+                if (epoch) ((AtomicLong) field(client, "selfProfileEpoch")).incrementAndGet();
+                else set(client, "currentUserId", "other-owner");
+                release.countDown(); assertTrue(ack.await(3, TimeUnit.SECONDS));
+                assertEquals(0, claims.get()); assertEquals(0, sdk.creates.get()); assertEquals(0, sdk.sends.get());
+            } finally { release.countDown(); client.destroy(); }
+        }
+    }
+
+    @Test public void activityDeniedClaimAndRevocationDuringCreationCannotSend() throws Exception {
+        for (boolean denied : new boolean[]{true, false}) {
+            Transport sdk = new Transport(); TencentIMClient client = client(sdk, new Listener());
+            CountDownLatch ack = new CountDownLatch(1); AtomicBoolean current = new AtomicBoolean(true);
+            sdk.duringCreate = () -> current.set(false);
+            try {
+                client.sendSessionIMActivity(OWNER, client.sessionIMLoginEpoch(), current::get,
+                    () -> !denied, PEER, activity(), ack::countDown);
+                assertTrue(ack.await(3, TimeUnit.SECONDS)); assertEquals(denied ? 0 : 1, sdk.creates.get());
+                assertEquals(0, sdk.sends.get());
+            } finally { client.destroy(); }
+        }
+    }
+
+    @Test public void resolutionWireRemainsMachineAndCannotBecomeHumanApproval() throws Exception {
+        Transport sdk = new Transport(); TencentIMClient client = client(sdk, new Listener());
+        RemoteIMMessage source = new RemoteIMMessage("resolution", "", OWNER, PEER, "Ended",
+            RemoteIMMessage.Direction.OUTGOING, RemoteIMMessage.Status.PENDING, 100,
+            null, null, null, null, RemoteIMOrigin.MACHINE, null,
+            new RemoteIMApprovalDecision("approval-owned", RemoteIMApprovalAction.AUTO_DECLINED));
+        try {
+            client.sendSessionIM(OWNER, client.sessionIMLoginEpoch(), () -> true, () -> true,
+                source, "Ended", () -> {}, () -> {}, new Completion());
+            assertTrue(sdk.sent.await(3, TimeUnit.SECONDS));
+            org.json.JSONObject wire = new org.json.JSONObject(sdk.metadata), interaction = wire.getJSONObject("interaction");
+            assertEquals("machine", wire.getString("origin")); assertEquals("approval-resolved", interaction.getString("kind"));
+            assertEquals("auto-declined", interaction.getString("outcome")); assertFalse(interaction.has("action"));
         } finally { client.destroy(); }
     }
 

@@ -1525,10 +1525,62 @@ bool RemoteIMApplication::sendMachineTextTo(const QString& peerId, const QString
     message.text = text.trimmed();
     message.quote = quote;
     message.hasQuote = hasQuote && !quote.digest.isEmpty();
-    return sendMachineMessageTo(target, message,
+    return sendMachineMessageTo(
+        target, message,
         [this, target, text = message.text, quote, hasQuote = message.hasQuote](RemoteIMSendCompletion done) {
             client_->sendMachineTextWithQuote(target, text, quote, hasQuote, std::move(done));
-        }, std::move(completion), std::move(canSend));
+        },
+        std::move(completion), std::move(canSend));
+}
+
+bool RemoteIMApplication::sendMachineApprovalRequestTo(const QString& peerId, const QString& text,
+                                                       const RemoteIMApprovalRequest& request,
+                                                       RemoteIMSendCompletion completion,
+                                                       std::function<bool()> canSend) {
+    // Validate through a known-action set before isValid(), including unknown enum values.
+    for (const auto action : request.actions)
+        if (action != RemoteIMApprovalAction::ApproveOnce && action != RemoteIMApprovalAction::ApprovePrefix &&
+            action != RemoteIMApprovalAction::Reject) {
+            if (completion) completion(false, QStringLiteral("审批请求无效"), {});
+            return false;
+        }
+    if (!request.isValid()) {
+        if (completion) completion(false, QStringLiteral("审批请求无效"), {});
+        return false;
+    }
+    const auto target = peerId.trimmed();
+    RemoteIMMessage message;
+    message.text = text.trimmed();
+    message.hasApprovalRequest = true;
+    message.approvalRequest = request;
+    return sendMachineMessageTo(
+        target, message,
+        [this, target, request, body = message.text](RemoteIMSendCompletion done) {
+            client_->sendMachineApprovalRequest(target, body, request, std::move(done));
+        },
+        std::move(completion), std::move(canSend));
+}
+
+bool RemoteIMApplication::sendMachineApprovalResolvedTo(const QString& peerId, const QString& text,
+                                                        const RemoteIMApprovalDecision& resolution,
+                                                        RemoteIMSendCompletion completion,
+                                                        std::function<bool()> canSend) {
+    if (!resolution.isValid() || (resolution.action != RemoteIMApprovalAction::Resolved &&
+                                  resolution.action != RemoteIMApprovalAction::AutoDeclined)) {
+        if (completion) completion(false, QStringLiteral("审批终态无效"), {});
+        return false;
+    }
+    const auto target = peerId.trimmed();
+    RemoteIMMessage message;
+    message.text = text.trimmed();
+    message.hasApprovalDecision = true;
+    message.approvalDecision = resolution;
+    return sendMachineMessageTo(
+        target, message,
+        [this, target, resolution, body = message.text](RemoteIMSendCompletion done) {
+            client_->sendMachineApprovalResolved(target, body, resolution, std::move(done));
+        },
+        std::move(completion), std::move(canSend));
 }
 
 bool RemoteIMApplication::sendMachineMediaTo(const QString& peerId, const QString& path, const QString& type,
@@ -1537,8 +1589,8 @@ bool RemoteIMApplication::sendMachineMediaTo(const QString& peerId, const QStrin
                                              std::function<void(bool)> onDispatched) {
     const QString target = peerId.trimmed();
     if (type == QStringLiteral("video"))
-        return prepareMachineVideoTo(target, path, caption, std::move(completion), std::move(canSend),
-                                     quote, hasQuote, std::move(onDispatched));
+        return prepareMachineVideoTo(target, path, caption, std::move(completion), std::move(canSend), quote, hasQuote,
+                                     std::move(onDispatched));
     const QFileInfo file(path);
     const auto reject = [&completion, &onDispatched](const QString& error) {
         if (completion) completion(false, error, {});

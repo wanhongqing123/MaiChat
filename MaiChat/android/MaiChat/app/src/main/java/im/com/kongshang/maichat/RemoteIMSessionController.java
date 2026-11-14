@@ -1961,6 +1961,21 @@ public final class RemoteIMSessionController implements MaiSessionIMBindingServi
         return message;
     }
 
+    /** 独立临时活动通道；只把原 signal 发给 SDK，完整授权 envelope 仅交回 Native。 */
+    @Override public void activity(JSONObject value, MaiSessionIMBindingService.Backend backend) {
+        JSONObject owned = MaiSessionIMBindingService.copy(value), scope = owned.optJSONObject("scope");
+        String peer = owned.optString("peer_id"); int generation = accountGeneration;
+        Runnable ack = () -> backend.control(MaiSessionIMBindingService.activityControl("ack_activity", owned));
+        java.util.function.BooleanSupplier current = () -> generation == accountGeneration && current(scope, peer);
+        if (!current.getAsBoolean() || client == null) { ack.run(); return; }
+        JSONObject signalValue = owned.optJSONObject("signal");
+        RemoteIMActivitySignal signal = signalValue == null ? null
+            : RemoteIMActivitySignal.decode(signalValue.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        client.sendSessionIMActivity(scope.optString("owner_id"), client.sessionIMLoginEpoch(), current,
+            () -> { JSONObject claim = backend.control(MaiSessionIMBindingService.activityControl("claim_activity", owned));
+                return claim.optBoolean("ok") && claim.optBoolean("allowed"); }, peer, signal, ack);
+    }
+
     /** SDK 交付适配：Native claim/dispatch ack 与网络回执分开，绝不重发不确定结果。 */
     @Override public void delivery(JSONObject value, MaiSessionIMBindingService.Backend backend) {
         JSONObject owned = MaiSessionIMBindingService.copy(value);
@@ -1999,7 +2014,7 @@ public final class RemoteIMSessionController implements MaiSessionIMBindingServi
                                 RemoteIMMessage sent = new RemoteIMMessage(source.id(), remoteId, source.fromUserId(),
                                     source.toUserId(), source.text(), RemoteIMMessage.Direction.OUTGOING, RemoteIMMessage.Status.SENT,
                                     createdAtMillis, source.imageAttachment(), null, source.fileAttachment(), source.videoAttachment(),
-                                    RemoteIMOrigin.MACHINE);
+                                    RemoteIMOrigin.MACHINE, source.approvalRequest(), source.approvalDecision());
                                 chatState.updateMessageDelivery(source.id(), remoteId);
                                 persistMessage(sent); notifyStateChanged();
                             });

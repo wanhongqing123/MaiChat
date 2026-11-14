@@ -77,6 +77,8 @@ struct ActiveTurn {
     std::string id;
     bool acceptingSteering = false;
     std::vector<std::string> pendingSteering;
+    // 只统计尚未消费的显式 steering 图片；幂等重试不重复计数，消费后给下一组让出预算。
+    std::size_t pendingSteeringImageCount = 0;
     std::vector<SteeringReceipt> steeringReceipts;
 
     void waitReady() {
@@ -102,7 +104,8 @@ std::string steeringFingerprint(const MaiSteerPrompt& prompt) {
     return Json{{"text", prompt.text},
                 {"images", images},
                 {"videos", videos},
-                {"quote", prompt.quotedMessageId}}
+                {"quote", prompt.quotedMessageId},
+                {"expected_directory", prompt.expectedDirectory}}
         .dump();
 }
 
@@ -434,8 +437,11 @@ struct MaiAgent::Runtime {
             turn->acceptingSteering = false;
         };
         dependencies.advanceSteering =
-            [this, sessionId, turn](MaiMessage& assistant, bool closeIfEmpty) -> MaiResult<bool> {
+            [this, sessionId, turn](
+                MaiMessage& assistant, bool closeIfEmpty,
+                std::vector<std::string>& currentUserMessageIds) -> MaiResult<bool> {
             std::string completedId;
+            std::vector<std::string> consumedIds;
             {
                 std::lock_guard<std::mutex> runtimeLock(mutex);
                 std::lock_guard<std::mutex> lock(turn->steeringMutex);
@@ -469,10 +475,22 @@ struct MaiAgent::Runtime {
                 }
                 completedId = completed.id;
                 assistant = std::move(next);
+                consumedIds = turn->pendingSteering;
+                currentUserMessageIds.clear();
+                for (const auto& id : consumedIds)
+                    if (std::any_of(turn->steeringReceipts.begin(), turn->steeringReceipts.end(),
+                                    [&](const SteeringReceipt& receipt) {
+                                        return receipt.messageId == id;
+                                    }))
+                        currentUserMessageIds.push_back(id);
                 // 新 assistant 的 ID 已在同一把锁内生成并落库。之后到来的 user
                 // 必定位于新段之后，下一次安全边界前仍由 pending 过滤。
                 turn->pendingSteering.clear();
+                turn->pendingSteeringImageCount = 0;
             }
+            // 消费凭据先于新 assistant 的普通更新；宿主可在 submit 尚未返回时，
+            // 仍用稳定轮次及实际 user ID 归属这次工作线程推进，不必猜最新消息。
+            emitter.emitSteeringApplied(sessionId, turn->id, assistant.id, consumedIds);
             emitter.emitMessage(MaiEventType::MessageUpdated, sessionId, completedId);
             emitter.emitMessage(MaiEventType::MessageUpdated, sessionId, assistant.id);
             return true;
@@ -1245,6 +1263,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                     return {MaiErrorCode::InvalidInput, "The selected model is not configured."};
                 std::string title;
                 bool changed = false;
+                std::string updateField = "title";
                 std::unique_lock<std::mutex> runtimeLock(mRuntime->mutex);
                 if ((!operation.model.empty() || operation.reasoningEffort.has_value()) &&
                     (mRuntime->active.count(operation.sessionId) ||
@@ -1264,20 +1283,25 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                         if (!operation.model.empty() && session.model != operation.model) {
                             session.model = operation.model;
                             changed = true;
+                            updateField.clear();
                         }
                         if (operation.reasoningEffort &&
                             session.reasoningEffort != *operation.reasoningEffort) {
                             session.reasoningEffort = *operation.reasoningEffort;
                             changed = true;
+                            updateField.clear();
                         }
                         if (!operation.agent.empty() && session.agent != operation.agent) {
                             session.agent = operation.agent;
                             changed = true;
+                            updateField.clear();
                         }
                         if (!operation.directory.empty() &&
                             session.directory != operation.directory) {
                             session.directory = operation.directory;
                             changed = true;
+                            // 同一次 mutation 可同时改名/模型；工作区变化必须优先撤销旧授权。
+                            updateField = "workspace";
                         }
                         if (changed) session.updated = MaiTime::getCurrentTime();
                         title = session.title;
@@ -1288,7 +1312,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 if (!changed) return operation.sessionId;
                 runtimeLock.unlock();
                 mRuntime->emitter.emitSession(MaiEventType::SessionUpdated, operation.sessionId,
-                                              title);
+                                              title, updateField);
                 return operation.sessionId;
 
             } else if constexpr (std::is_same_v<T, MaiDeleteSession>) {
@@ -1339,7 +1363,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 // 而界面要做的只有一件事：把列表清空。发一条会话级的更新，
                 // 界面照常去 listMessages 拉全量（这次拉到的是空的）。
                 mRuntime->emitter.emitSession(MaiEventType::SessionUpdated, operation.sessionId,
-                                              title);
+                                              title, "clear");
                 return operation.sessionId;
 
             } else if constexpr (std::is_same_v<T, MaiSteerPrompt>) {
@@ -1423,6 +1447,18 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                         return {MaiErrorCode::Busy, "the target turn is finishing"};
                     if (turn.steeringReceipts.size() >= 64)
                         return {MaiErrorCode::Busy, "the target turn reached its steering limit"};
+                    // 必须在幂等查重之后、创建用户消息之前背压；拒绝不能占用 requestId，
+                    // 也不能为了张数预算把已接受而尚未见到的图片静默降为历史路径描述。
+                    if (turn.pendingSteeringImageCount + operation.images.size() > 10)
+                        return {MaiErrorCode::Busy,
+                                "the pending steering group reached its 10-image limit"};
+                    // 与目录变更共用 Runtime 锁；准备完成到普通 submit 之间的旧工作区
+                    // 不能仅靠迟到的 SessionUpdated 通知发现。先查幂等凭据，再核新增输入。
+                    if (!operation.expectedDirectory.empty() &&
+                        (!mRuntime->store->getSession(operation.sessionId, session) ||
+                         session.directory != operation.expectedDirectory))
+                        return {MaiErrorCode::InvalidInput,
+                                "the expected session directory changed"};
                     user.id = MaiIdGenerator::newMessageId();
                     user.role = MaiRole::User;
                     user.created = MaiTime::getCurrentTime();
@@ -1441,6 +1477,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                         addPart(MaiImagePart{image.path, image.mimeType});
                     for (const auto& video : operation.videos) addPart(video);
                     turn.pendingSteering.push_back(user.id);
+                    turn.pendingSteeringImageCount += operation.images.size();
                     mRuntime->store->putMessage(operation.sessionId, user);
                     mRuntime->store->mutateSession(operation.sessionId, [](MaiSession& value) {
                         value.updated = MaiTime::getCurrentTime();
@@ -1457,10 +1494,14 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 }
                 mRuntime->emitter.emitMessage(MaiEventType::MessageUpdated, operation.sessionId,
                                               user.id);
-                mRuntime->emitter.emitSession(MaiEventType::SessionUpdated, operation.sessionId);
+                mRuntime->emitter.emitSession(MaiEventType::SessionUpdated, operation.sessionId, {},
+                                              "input");
                 return user.id;
 
             } else if constexpr (std::is_same_v<T, MaiEnqueuePrompt>) {
+                if (!operation.prompt.expectedDirectory.empty())
+                    return {MaiErrorCode::InvalidInput,
+                            "directory guards require direct send or steering input"};
                 const auto& prompt = operation.prompt;
                 if (operation.requestId.empty() || operation.requestId.size() > 128 ||
                     !std::all_of(operation.requestId.begin(), operation.requestId.end(),
@@ -1558,7 +1599,8 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                 }
                 mRuntime->emitter.emitMessage(MaiEventType::MessageUpdated, prompt.sessionId,
                                               user.id);
-                mRuntime->emitter.emitSession(MaiEventType::SessionUpdated, prompt.sessionId);
+                mRuntime->emitter.emitSession(MaiEventType::SessionUpdated, prompt.sessionId, {},
+                                              "input");
                 if (started) {
                     mRuntime->emitter.emitMessage(MaiEventType::MessageUpdated, prompt.sessionId,
                                                   assistant.id);
@@ -1588,6 +1630,17 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                     quoted = page.front();
                 }
 
+                struct StartingReservation {
+                    Runtime* runtime;
+                    std::string sessionId;
+                    bool armed = false;
+                    ~StartingReservation() {
+                        if (armed) {
+                            std::lock_guard<std::mutex> lock(runtime->mutex);
+                            runtime->startingSessions.erase(sessionId);
+                        }
+                    }
+                } reservation{mRuntime.get(), operation.sessionId};
                 {
                     std::lock_guard<std::mutex> lock(mRuntime->mutex);
                     if (mRuntime->contextCommittingSessions.count(operation.sessionId) ||
@@ -1596,6 +1649,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                           mRuntime->startingSessions.count(operation.sessionId))))
                         return {MaiErrorCode::Busy, "a turn is already running for this session"};
                     mRuntime->startingSessions.insert(operation.sessionId);
+                    reservation.armed = true;
                 }
 
                 // 用户消息先落库并广播，界面立刻看到自己发的话。
@@ -1632,7 +1686,17 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                     videoPart.created = user.created;
                     user.parts.push_back(std::move(videoPart));
                 }
-                mRuntime->store->putMessage(operation.sessionId, user);
+                {
+                    // CAS 与首条用户消息保存是同一受理边界，广播必须留在锁外。
+                    std::lock_guard<std::mutex> lock(mRuntime->mutex);
+                    if (!operation.expectedDirectory.empty() &&
+                        (!mRuntime->store->getSession(operation.sessionId, session) ||
+                         session.directory != operation.expectedDirectory))
+                        return {MaiErrorCode::InvalidInput,
+                                "the expected session directory changed"};
+                    mRuntime->store->putMessage(operation.sessionId, user);
+                    if (const auto error = mRuntime->store->lastWriteError()) return error;
+                }
                 mRuntime->emitter.emitMessage(MaiEventType::MessageUpdated, operation.sessionId,
                                               user.id);
 
@@ -1656,6 +1720,7 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                     std::lock_guard<std::mutex> lock(mRuntime->mutex);
                     mRuntime->active[operation.sessionId] = turn;
                     mRuntime->startingSessions.erase(operation.sessionId);
+                    reservation.armed = false;
                     mRuntime->offerInputsLocked(operation.sessionId, turn);
                 }
 
@@ -1683,6 +1748,22 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
             } else if constexpr (std::is_same_v<T, MaiReplyQuestion>) {
                 if (operation.questionId.empty())
                     return {MaiErrorCode::InvalidInput, "questionId is required"};
+                std::unique_lock<std::mutex> owner(mRuntime->mutex, std::defer_lock);
+                if (!operation.expectedDirectory.empty()) {
+                    owner.lock();
+                    const auto pending = mRuntime->questions->listPending();
+                    const auto found = std::find_if(pending.begin(), pending.end(),
+                                                    [&](const MaiQuestionRequest& request) {
+                                                        return request.id == operation.questionId;
+                                                    });
+                    if (found == pending.end())
+                        return {MaiErrorCode::NotFound, "question is no longer pending"};
+                    MaiSession session;
+                    if (!mRuntime->store->getSession(found->sessionId, session) ||
+                        session.directory != operation.expectedDirectory)
+                        return {MaiErrorCode::InvalidInput,
+                                "the expected session directory changed"};
+                }
                 // 找不到就是找不到：界面重复回答、或者对着已经被中断的提问回答，
                 // 都会走到这里。不是故障，但也不能假装成功。
                 if (!mRuntime->questions->reply(operation.questionId, operation.answer))
@@ -1692,6 +1773,22 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
             } else if constexpr (std::is_same_v<T, MaiReplyPermission>) {
                 if (operation.permissionId.empty())
                     return {MaiErrorCode::InvalidInput, "permissionId is required"};
+                std::unique_lock<std::mutex> owner(mRuntime->mutex, std::defer_lock);
+                if (!operation.expectedDirectory.empty()) {
+                    owner.lock();
+                    const auto pending = mRuntime->permissions->listPending();
+                    const auto found = std::find_if(pending.begin(), pending.end(),
+                                                    [&](const MaiPermissionRequest& request) {
+                                                        return request.id == operation.permissionId;
+                                                    });
+                    if (found == pending.end())
+                        return {MaiErrorCode::NotFound, "permission request is no longer pending"};
+                    MaiSession session;
+                    if (!mRuntime->store->getSession(found->sessionId, session) ||
+                        session.directory != operation.expectedDirectory)
+                        return {MaiErrorCode::InvalidInput,
+                                "the expected session directory changed"};
+                }
                 // 找不到就是找不到：界面重复点、或者对着已经被中断的请求点，都会走到这里。
                 // 不是故障，但也不能假装成功——界面要据此把那个已经过期的对话框收掉。
                 if (!mRuntime->permissions->reply(operation.permissionId, operation.decision))

@@ -9,6 +9,8 @@
 #include <QStringList>
 #include <memory>
 
+#include "MaiSessionIMRouter.h"
+
 class AgentController;
 class RemoteIMApplication;
 struct RemoteIMMessage;
@@ -41,8 +43,8 @@ signals:
     void historyImported(const QString& peerId, quint64 records, qint64 maximumStepMillis);
 
 private:
-    void acceptLive(quint64 ingressId, const RemoteIMMessage& message,
-                    quint64 rawSequence = 0, quint64 rawGeneration = 0);
+    void acceptLive(quint64 ingressId, const RemoteIMMessage& message, quint64 rawSequence = 0,
+                    quint64 rawGeneration = 0);
     void persistedLive(quint64 ingressId, bool ok, bool inserted, const QString& rowId, const QString& error);
     void readyLive(quint64 ingressId, const RemoteIMMessage& message);
     void failLive(quint64 ingressId, const QString& error);
@@ -52,8 +54,20 @@ private:
     void syncScope();
     void dispatch(const QString& sessionId);
     void processReservation(quint64 token);
+    void processFollowup(quint64 token);
+    void publishCommittedOutput(const QString& sessionId);
+    void publishQuestion(const QString& questionId, const QString& sessionId);
+    void publishApproval(const QString& permissionId, const QString& sessionId);
+    void resolveApproval(const QString& permissionId, const QString& decision);
+    bool receiveApprovalDecision(const RemoteIMMessage& message);
+    void publishMedia(const QString& sessionId, const QString& messageId);
+    void dispatchOutput(quint64 token);
+    void setActivity(const QString& sessionId, int kind);
+    void heartbeatActivities();
+    void sendTextOutput(quint64 token, const MaiSessionIMRouter::TurnReceipt& receipt, const QString& text,
+                        bool committed = false);
     void finish(const QString& sessionId);
-    void acknowledgeDispatch(quint64 token, quint32 index);
+    void acknowledgeDispatch(quint64 token, quint32 index, const MaiSessionIMRouter::TurnReceipt& receipt);
     void prunePlatformWork();
     void pruneSessions();
     struct Runtime;

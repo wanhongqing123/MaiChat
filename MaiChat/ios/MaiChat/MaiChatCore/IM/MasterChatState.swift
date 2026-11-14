@@ -399,12 +399,12 @@ public enum RemoteIMCloudMetadataCodec {
                 outcome: nil
             )
         case let .approvalDecision(token, action):
+            // Machine 终态沿既有 v2 resolved 帧发送；不能编码为仅 Human 可发的 decision。
+            let resolved = metadata.origin == .machine && (action == .resolved || action == .autoDeclined)
             wireInteraction = WireInteraction(
-                kind: "approval-decision",
-                token: token,
-                actions: nil,
-                action: action.rawValue,
-                outcome: nil
+                kind: resolved ? "approval-resolved" : "approval-decision",
+                token: token, actions: nil, action: resolved ? nil : action.rawValue,
+                outcome: resolved ? action.rawValue : nil
             )
         case nil:
             wireInteraction = nil

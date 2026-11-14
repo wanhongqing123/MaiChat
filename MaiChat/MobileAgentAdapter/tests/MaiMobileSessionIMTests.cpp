@@ -1,6 +1,8 @@
 #include "MaiMobileSessionIM.h"
 #include "MaiAgent.h"
 #include "MaiAgentSendMediaTool.h"
+#include "MaiAgentSendFileTool.h"
+#include "MaiQuestionTool.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
 #include "MaiMemoryStore.h"
@@ -34,10 +36,42 @@ namespace {
 struct ModelState {
     std::atomic<int> calls{0};
     bool media = false;
+    bool file = false;
+    bool stages = false;
+    bool failAfterProgress = false;
+    bool question = false;
+    bool permission = false;
+    std::atomic<int> approvedExecutions{0};
     bool fail = false;
+    std::atomic<bool> toolEntered{false};
+    std::atomic<bool> toolReleased{false};
     std::atomic<bool> hold{false};
     std::mutex mutex;
     std::vector<MaiModelRequest> requests;
+};
+
+class OwnedWaitTool final : public MaiTool {
+public:
+    explicit OwnedWaitTool(std::shared_ptr<ModelState> state) : state_(std::move(state)) {}
+    std::string name() const override {
+        return "owned_wait";
+    }
+    std::string description() const override {
+        return "Wait inside an owned offline test";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object","properties":{}})";
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
+        state_->toolEntered = true;
+        const auto deadline = Clock::now() + std::chrono::seconds(3);
+        while (!state_->toolReleased && !context.isCanceled() && Clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return MaiToolResult::success("owned tool completed");
+    }
+
+private:
+    std::shared_ptr<ModelState> state_;
 };
 
 class ScriptedModel final : public MaiModelClient {
@@ -56,15 +90,74 @@ public:
         const auto deadline = Clock::now() + std::chrono::seconds(3);
         while (state_->hold && !cancel && Clock::now() < deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (state_->permission && call == 1) {
+            if (sink.onToolCall) sink.onToolCall({"owned-permission", "owned_paid_action", "{}"});
+            return {};
+        }
+        if (state_->stages && call == 1) {
+            if (sink.onReasoning) sink.onReasoning("PRIVATE-REASONING");
+            if (sink.onText) sink.onText("public progress before owned tool");
+            if (sink.onToolCall) sink.onToolCall({"owned-wait", "owned_wait", "{}"});
+            return {};
+        }
+        if (state_->question && call == 1) {
+            if (sink.onToolCall)
+                sink.onToolCall(
+                    {"owned-question", "question", R"({"question":"Choose an owned option","options":["A","B"]})"});
+            return {};
+        }
+        if (state_->file && call == 1) {
+            if (sink.onToolCall)
+                sink.onToolCall(
+                    {"owned-file", "agent_send_file", R"({"file_path":"owned.txt","caption":"owned attachment"})"});
+            return {};
+        }
         if (state_->media && call == 1) {
             if (sink.onToolCall)
                 sink.onToolCall({"owned-media", "agent_send_media",
                                  R"({"file_path":"owned.png","type":"image","caption":"owned caption"})"});
             return {};
         }
+        if (state_->failAfterProgress && call > 1) {
+            if (sink.onText) sink.onText("UNCOMMITTED-TAIL");
+            return {MaiErrorCode::Network, "owned later response failed"};
+        }
         if (sink.onReasoning) sink.onReasoning("PRIVATE-REASONING");
-        if (sink.onText) sink.onText(state_->media ? "owned final body" : "reply:" + request.messages.back().content);
+        std::string latestUser;
+        for (auto item = request.messages.rbegin(); item != request.messages.rend(); ++item)
+            if (item->role == MaiModelRole::User) {
+                latestUser = item->content;
+                break;
+            }
+        if (sink.onText) sink.onText(state_->media || state_->file ? "owned final body" : "reply:" + latestUser);
         return state_->fail ? MaiError{MaiErrorCode::Network, "PRIVATE-PROVIDER-ERROR"} : MaiError{};
+    }
+
+private:
+    std::shared_ptr<ModelState> state_;
+};
+
+class OwnedApprovalTool final : public MaiTool {
+public:
+    explicit OwnedApprovalTool(std::shared_ptr<ModelState> state) : state_(std::move(state)) {}
+    std::string name() const override {
+        return "owned_paid_action";
+    }
+    std::string description() const override {
+        return "An offline test action with a real per-call gate";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object","properties":{}})";
+    }
+    bool requiresApproval(const std::string&) const override {
+        return true;
+    }
+    bool requiresPaidApproval(const std::string&) const override {
+        return true;
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext&) override {
+        ++state_->approvedExecutions;
+        return MaiToolResult::success("owned approved action");
     }
 
 private:
@@ -275,6 +368,10 @@ struct Fixture {
             "CREATE INDEX messages_peer_page ON messages(peer,created_at,id);");
         auto tools = std::make_unique<MaiToolRegistry>();
         tools->add(makeMaiAgentSendMediaTool());
+        tools->add(makeMaiAgentSendFileTool());
+        tools->add(makeMaiQuestionTool());
+        tools->add(std::make_unique<OwnedWaitTool>(model));
+        tools->add(std::make_unique<OwnedApprovalTool>(model));
         agent = std::make_unique<MaiAgent>(store ? std::move(store) : makeMaiMemoryStore(),
                                            std::make_unique<ScriptedModel>(model), std::move(tools));
         const auto created = agent->submit(MaiCreateSession{directory.toUtf8(), "Owned root", "owned-model"});
@@ -294,7 +391,10 @@ struct Fixture {
         if (bootstrap) complete(initialTask);
     }
     ~Fixture() {
+        model->toolReleased = true;
+        model->hold = false;
         if (bridge) bridge->invalidate();
+        if (agent && !session.empty()) agent->submit(MaiInterrupt{session});
         if (agent) agent->waitIdle();
         bridge.reset();
         agent.reset();
@@ -479,6 +579,268 @@ struct Fixture {
 
 Json control(const char* action, const Json& delivery) {
     return Json::parse(MaiMobileSessionIM::control(Json{{"action", action}, {"delivery", delivery}}.dump()));
+}
+
+Json activityControl(const char* action, const Json& activity) {
+    return Json::parse(MaiMobileSessionIM::control(Json{{"action", action}, {"activity", activity}}.dump()));
+}
+
+void waitUntil(const std::function<bool()>& predicate) {
+    const auto deadline = Clock::now() + std::chrono::seconds(2);
+    while (!predicate() && Clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(predicate());
+}
+
+void committedStageAckKeepsBusySteeringAndExactSourceReceipts() {
+    Fixture f;
+    f.model->stages = true;
+    auto first = f.metadata("stage-source");
+    const auto admitted = f.admit(first);
+    CHECK(f.ready(first, admitted, "first").value("accepted", false));
+    const auto stage = f.delivery();
+    waitUntil([&] { return f.model->toolEntered.load(); });
+    CHECK(f.agent->isBusy(f.session));
+    CHECK(stage.at("text") == "public progress before owned tool");
+    CHECK(stage.dump().find("PRIVATE-REASONING") == std::string::npos);
+    CHECK(control("claim", stage).value("allowed", false));
+    CHECK(control("ack", stage).value("acknowledged", false));
+    CHECK(f.agent->submit(MaiUpdateSession{f.session, "A normal title update"}));
+    CHECK(f.list().at("bindings").size() == 1);
+
+    auto second = f.metadata("steer-source");
+    const auto followup = f.admit(second);
+    CHECK(followup.value("accepted", false));
+    CHECK(f.ready(second, followup, "do not use scripts").value("accepted", false));
+    CHECK(f.pump().value("ok", false));
+    std::size_t users = 0;
+    for (const auto& message : f.agent->listMessages(f.session))
+        if (message.role == MaiRole::User) ++users;
+    CHECK(users == 2 && f.agent->isBusy(f.session) && f.model->calls == 1);
+    f.model->toolReleased = true;
+    f.agent->waitIdle();
+    const auto final = f.delivery();
+    CHECK(final.at("text") == "reply:do not use scripts");
+    CHECK(final.at("source_message_id") == "steer-source");
+    CHECK(final.at("turn_id") == stage.at("turn_id"));
+    CHECK(final.at("assistant_message_id") != stage.at("assistant_message_id"));
+    CHECK(std::stoull(final.at("dispatch_index").get<std::string>()) >
+          std::stoull(stage.at("dispatch_index").get<std::string>()));
+    CHECK(control("claim", final).value("allowed", false));
+    CHECK(control("ack", final).value("acknowledged", false));
+    CHECK(f.pump().at("deliveries").empty());
+    CHECK(!f.admit(second).value("accepted", true));
+}
+
+void changedWorkspaceDuringFollowupValidationCannotStoreAnOwnedUser() {
+    Fixture f;
+    f.model->stages = true;
+    const auto first = f.metadata("validator-workspace-first");
+    const auto admitted = f.admit(first);
+    CHECK(f.ready(first, admitted, "owned first turn").value("accepted", false));
+    const auto progress = f.delivery();
+    waitUntil([&] { return f.model->toolEntered.load(); });
+    CHECK(control("claim", progress).value("allowed", false));
+    CHECK(control("ack", progress).value("acknowledged", false));
+    const auto second = f.metadata("validator-workspace-followup");
+    const auto followup = f.admit(second);
+    CHECK(f.ready(second, followup, "must remain in original workspace").value("accepted", false));
+    std::promise<void> validatorEntered, validatorReleased;
+    auto entered = validatorEntered.get_future();
+    auto released = validatorReleased.get_future().share();
+    f.bridge->setInputValidator([&](const std::string&, bool) {
+        validatorEntered.set_value();
+        released.wait_for(std::chrono::seconds(3));
+    });
+    auto pumping = std::async(std::launch::async, [&] { return f.pump(); });
+    const bool reached = entered.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    const auto replacement = f.directory.append(MaiFilePath::fromUtf8("changed-while-validating"));
+    const auto created = MaiFileSystem::createDirectories(replacement);
+    const auto changed = f.agent->submit(MaiUpdateSession{f.session, "", "", "", replacement.toUtf8()});
+    validatorReleased.set_value();
+    const auto result = pumping.get();
+    CHECK(reached && !created && changed && result.value("ok", false));
+    std::size_t users = 0;
+    for (const auto& message : f.agent->listMessages(f.session))
+        if (message.role == MaiRole::User) ++users;
+    CHECK(users == 1 && f.model->calls == 1);
+    CHECK(f.pump().at("bindings").empty());
+}
+
+void committedStageSurvivesLaterFailureWithoutPublishingUncommittedTail() {
+    Fixture f;
+    f.model->stages = true;
+    f.model->failAfterProgress = true;
+    const auto source = f.metadata("committed-before-error");
+    const auto admitted = f.admit(source);
+    CHECK(f.ready(source, admitted, "work then fail").value("accepted", false));
+    CHECK(f.pump().value("ok", false));
+    waitUntil([&] { return f.model->toolEntered.load(); });
+    f.model->toolReleased = true;
+    f.agent->waitIdle();
+    const auto stage = f.delivery();
+    CHECK(stage.at("text") == "public progress before owned tool");
+    CHECK(stage.dump().find("UNCOMMITTED-TAIL") == std::string::npos);
+    CHECK(control("claim", stage).value("allowed", false));
+    CHECK(control("ack", stage).value("acknowledged", false));
+    CHECK(f.pump().at("deliveries").empty());
+}
+
+void activityClaimsUseExactRunAndTerminalSequenceWithoutADataDeliveryKind() {
+    Fixture f;
+    f.model->stages = true;
+    const auto source = f.metadata("activity-source");
+    const auto admitted = f.admit(source);
+    CHECK(f.ready(source, admitted, "activity").value("accepted", false));
+    const auto stage = f.delivery();
+    const auto projection = f.pump();
+    CHECK(!projection.at("activities").empty());
+    const auto activity = projection.at("activities").at(0);
+    const auto& signal = activity.at("signal");
+    CHECK(signal.at("namespace") == "multi-ai-code-activity" && signal.at("version") == 2);
+    CHECK(signal.at("active") == true && signal.at("ttlMs") == 12000);
+    CHECK(activity.at("turn_id") == stage.at("turn_id"));
+    auto forged = activity;
+    forged["signal"]["activityId"] = "another-run";
+    CHECK(!activityControl("claim_activity", forged).value("allowed", true));
+    CHECK(activityControl("claim_activity", activity).value("allowed", false));
+    CHECK(!activityControl("claim_activity", activity).value("allowed", true));
+    CHECK(activityControl("ack_activity", activity).value("acknowledged", false));
+    CHECK(f.call(f.scoped({{"action", "unbind"}, {"peer_id", "peer"}})).value("ok", false));
+    const auto stopped = f.pump();
+    CHECK(stopped.at("deliveries").empty() && stopped.at("activities").size() == 1);
+    const auto terminal = stopped.at("activities").at(0);
+    CHECK(terminal.at("signal").at("active") == false);
+    CHECK(terminal.at("signal").at("activityId") == signal.at("activityId"));
+    CHECK(terminal.at("signal").at("sequence").get<std::uint64_t>() > signal.at("sequence").get<std::uint64_t>());
+    CHECK(!activityControl("claim_activity", activity).value("allowed", true));
+    CHECK(activityControl("claim_activity", terminal).value("allowed", false));
+    CHECK(activityControl("ack_activity", terminal).value("acknowledged", false));
+    CHECK(f.pump().at("activities").empty());
+}
+
+void ownedQuestionAcceptsATextFollowupWithoutBecomingPermissionApproval() {
+    Fixture f;
+    f.model->question = true;
+    const auto source = f.metadata("question-source");
+    const auto admitted = f.admit(source);
+    CHECK(f.ready(source, admitted, "ask me").value("accepted", false));
+    const auto question = f.delivery();
+    CHECK(question.at("text") == "Choose an owned option\n- A\n- B");
+    CHECK(question.at("question_id").get<std::string>().find("qst_") == 0);
+    CHECK(f.agent->listPendingQuestions().size() == 1 && f.agent->isBusy(f.session));
+    CHECK(control("claim", question).value("allowed", false));
+    CHECK(control("ack", question).value("acknowledged", false));
+    const auto answer = f.metadata("question-answer-source");
+    const auto input = f.admit(answer);
+    CHECK(f.ready(answer, input, "A").value("accepted", false));
+    CHECK(f.pump().value("ok", false));
+    waitUntil([&] { return !f.agent->isBusy(f.session); });
+    const auto final = f.delivery();
+    CHECK(final.at("text") == "reply:A" && final.at("source_message_id") == "question-answer-source");
+    CHECK(final.at("turn_id") == question.at("turn_id"));
+    CHECK(f.agent->listPendingQuestions().empty() && f.agent->listPendingPermissions().empty());
+}
+
+void explicitFileUsesTheOrdinaryWorkspacePreparationAndDispatchOrder() {
+    Fixture f;
+    f.model->file = true;
+    CHECK(!MaiFileSystem::writeFile(f.directory.append(MaiFilePath::fromUtf8("owned.txt")), "owned attachment bytes"));
+    const auto source = f.metadata("file-source");
+    const auto admitted = f.admit(source);
+    CHECK(f.ready(source, admitted, "send owned file").value("accepted", false));
+    const auto text = f.delivery();
+    CHECK(text.at("kind") == "text" && text.at("text") == "owned final body");
+    CHECK(control("claim", text).value("allowed", false));
+    CHECK(f.pump().at("deliveries").empty());
+    CHECK(control("ack", text).value("acknowledged", false));
+    const auto file = f.delivery();
+    CHECK(file.at("kind") == "file" && file.at("name") == "owned.txt");
+    CHECK(file.at("caption") == "owned attachment" && file.at("source_message_id") == "file-source");
+    CHECK(file.at("path") == f.directory.append(MaiFilePath::fromUtf8("owned.txt")).toUtf8());
+    CHECK(control("claim", file).value("allowed", false));
+    CHECK(control("ack", file).value("acknowledged", false));
+    CHECK(f.pump().at("deliveries").empty());
+}
+
+Json approvalDecision(const Json& approval, const std::string& decision, const std::string& peer = "peer") {
+    return Json::parse(MaiMobileSessionIM::control(Json{
+        {"action", "approval_decision"},
+        {"approval", approval},
+        {"decision", decision},
+        {"peer_id", peer},
+        {"sender_id", peer},
+        {"recipient_id", "owner"},
+        {"origin", "human"},
+        {"message_id", "owned-decision-sdk-id"},
+        {"live", true},
+        {"group", false}}.dump()));
+}
+
+void permissionDecisionIsAnExactOwnedControlAndNeverOrdinaryText() {
+    Fixture f;
+    f.model->permission = true;
+    const auto source = f.metadata("approval-source");
+    const auto admitted = f.admit(source);
+    CHECK(f.ready(source, admitted, "run offline approved tool").value("accepted", false));
+    const auto request = f.delivery();
+    CHECK(request.at("kind") == "text" && request.at("interaction").at("kind") == "approval-request");
+    const auto token = request.at("interaction").at("token").get<std::string>();
+    CHECK(token.find("approval-") == 0 && request.dump().find("per_") == std::string::npos);
+    CHECK(request.at("interaction").at("actions") == Json::array({"approve-once", "reject"}));
+    CHECK(control("claim", request).value("allowed", false));
+    CHECK(control("ack", request).value("acknowledged", false));
+    CHECK(!approvalDecision(request, "approve-prefix").value("accepted", true));
+    CHECK(!approvalDecision(request, "approve-once", "other").value("accepted", true));
+    auto forged = request;
+    forged["turn_id"] = "msg_someone_else";
+    CHECK(!approvalDecision(forged, "approve-once").value("accepted", true));
+    const auto text = f.metadata("ordinary-A-is-not-approval");
+    const auto input = f.admit(text);
+    CHECK(f.ready(text, input, "A").value("accepted", false));
+    CHECK(f.pump().value("ok", false));
+    CHECK(f.agent->listPendingPermissions().size() == 1 && f.model->approvedExecutions == 0);
+    CHECK(approvalDecision(request, "approve-once").value("accepted", false));
+    CHECK(!approvalDecision(request, "approve-once").value("accepted", true));
+    CHECK(f.agent->listPendingPermissions().size() == 1 && f.model->approvedExecutions == 0);
+    CHECK(f.pump().value("ok", false));
+    waitUntil([&] { return !f.agent->isBusy(f.session); });
+    bool resolved = false, final = false;
+    for (unsigned index = 0; index < 3; ++index) {
+        const auto item = f.delivery();
+        if (item.contains("interaction")) {
+            CHECK(item.at("interaction").at("kind") == "approval-resolved");
+            CHECK(item.at("interaction").at("token") == token);
+            resolved = true;
+        } else {
+            CHECK(item.at("text") == "reply:A");
+            final = true;
+        }
+        CHECK(control("claim", item).value("allowed", false));
+        CHECK(control("ack", item).value("acknowledged", false));
+        if (resolved && final) break;
+    }
+    CHECK(resolved && final && f.agent->listPendingPermissions().empty());
+    CHECK(!approvalDecision(request, "approve-once").value("accepted", true));
+}
+
+void revokeCanOnlyResolveItsOriginalApprovalAndCannotPermitItsAction() {
+    Fixture f;
+    f.model->permission = true;
+    const auto source = f.metadata("revoked-approval-source");
+    const auto admitted = f.admit(source);
+    CHECK(f.ready(source, admitted, "ask permission").value("accepted", false));
+    const auto request = f.delivery();
+    CHECK(control("claim", request).value("allowed", false));
+    CHECK(control("ack", request).value("acknowledged", false));
+    CHECK(f.call(f.scoped({{"action", "unbind"}, {"peer_id", "peer"}})).value("ok", false));
+    CHECK(!approvalDecision(request, "approve-once").value("accepted", true));
+    const auto terminal = f.delivery();
+    CHECK(terminal.at("interaction").at("kind") == "approval-resolved");
+    CHECK(terminal.at("interaction").at("token") == request.at("interaction").at("token"));
+    CHECK(!control("ack", terminal).value("acknowledged", true));
+    CHECK(control("claim", terminal).value("allowed", false));
+    CHECK(control("ack", terminal).value("acknowledged", false));
+    CHECK(f.model->approvedExecutions == 0 && f.pump().at("deliveries").empty());
 }
 
 void exactReceiptBodyAndOneShotClaimAck() {
@@ -690,7 +1052,7 @@ void modelToolAgentIdentityAndPostCancelEffectsStayHonest() {
           after.execution()->nextAction == MaiToolNextAction::InspectState);
 }
 
-void lateSessionErrorDeniesAnAlreadyPreparedDelivery() {
+void lateSessionErrorPreservesCommittedTextButDeniesPreparedMedia() {
     Fixture f;
     const auto metadata = f.metadata("late-error");
     const auto admitted = f.admit(metadata);
@@ -701,7 +1063,27 @@ void lateSessionErrorDeniesAnAlreadyPreparedDelivery() {
     failed.sessionId = f.session;
     failed.detail = "PRIVATE-LATE-ERROR";
     f.agent->eventBus().publish(failed);
-    CHECK(!control("claim", delivery).value("allowed", true));
+    // The completed response emitted a typed commit before this later error.
+    // Its public text remains authorized; the error detail is never a body.
+    CHECK(delivery.at("text") == "reply:completed body");
+    CHECK(delivery.dump().find("PRIVATE-LATE-ERROR") == std::string::npos);
+    CHECK(control("claim", delivery).value("allowed", false));
+    CHECK(control("ack", delivery).value("acknowledged", false));
+
+    Fixture media;
+    media.model->file = true;
+    CHECK(!MaiFileSystem::writeFile(media.directory.append(MaiFilePath::fromUtf8("owned.txt")), "owned file bytes"));
+    const auto source = media.metadata("late-media-error");
+    const auto input = media.admit(source);
+    CHECK(media.ready(source, input, "deliver owned file").value("accepted", false));
+    const auto text = media.delivery();
+    CHECK(control("claim", text).value("allowed", false));
+    CHECK(control("ack", text).value("acknowledged", false));
+    const auto file = media.delivery();
+    CHECK(file.at("kind") == "file");
+    failed.sessionId = media.session;
+    media.agent->eventBus().publish(failed);
+    CHECK(!control("claim", file).value("allowed", true));
 }
 
 void persistedImageAndVideoPathsSurviveWorkspaceMigration() {
@@ -1050,7 +1432,9 @@ void deferredHistoryCommitChecksReadinessBeforePublishingAtIdle() {
     f.model->hold = true;
     struct Release {
         std::shared_ptr<ModelState> model;
-        ~Release() { model->hold = false; }
+        ~Release() {
+            model->hold = false;
+        }
     } release{f.model};
     CHECK(f.agent->submit(MaiSendPrompt{f.session, "owned busy caller"}));
     const auto deadline = Clock::now() + std::chrono::seconds(1);
@@ -1059,13 +1443,15 @@ void deferredHistoryCommitChecksReadinessBeforePublishingAtIdle() {
     const auto bound = f.call(f.scoped({{"action", "bind"}, {"peer_id", "peer"}, {"session_id", f.session}}));
     CHECK(bound.value("ok", false) && bound.at("history_tasks").size() == 1);
     const auto task = bound.at("history_tasks")[0];
-    const auto opened = f.open(task); const auto terminal = f.read(opened);
+    const auto opened = f.open(task);
+    const auto terminal = f.read(opened);
     CHECK(f.admit(f.metadata("expires-before-idle-commit")).value("accepted", false));
     const auto staged = f.chunk(task, terminal);
     CHECK(staged.value("ok", false) && staged.at("bindings")[0].at("history_state") == "pending");
     CHECK(!staged.at("history_progress").at("committed").get<bool>());
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
-    f.model->hold = false; f.agent->waitIdle();
+    f.model->hold = false;
+    f.agent->waitIdle();
     const auto pumped = f.pump();
     CHECK(pumped.at("bindings").empty() && !pumped.at("warnings").empty());
     CHECK(f.model->calls == 1 && f.agent->listMessages(f.session).size() == 2);
@@ -1076,7 +1462,8 @@ void historyCommitCannotReleaseBarrierWhenLiveExpiresDuringStoreCommit() {
     auto* gate = store.get();
     Fixture f(500, 30000, {}, false, 0, std::move(store));
     f.insertHistory("prior-context", "complete context may publish under the started lease", 1);
-    const auto opened = f.open(f.initialTask); const auto terminal = f.read(opened);
+    const auto opened = f.open(f.initialTask);
+    const auto terminal = f.read(opened);
     CHECK(f.admit(f.metadata("expires-during-core-commit")).value("accepted", false));
     gate->armCommit();
     auto committed = std::async(std::launch::async, [&] { return f.chunk(f.initialTask, terminal); });
@@ -1158,7 +1545,21 @@ int main() {
         {"Core bypass takeover", unexpectedOrdinaryCoreInputAndWorkspaceChangeRevokeDelivery},
         {"tool context and effect receipt", modelToolAgentIdentityAndPostCancelEffectsStayHonest}};
     auto allTests = tests;
-    allTests.push_back({"late SessionError claim denial", lateSessionErrorDeniesAnAlreadyPreparedDelivery});
+    allTests.push_back({"committed stage and busy steering", committedStageAckKeepsBusySteeringAndExactSourceReceipts});
+    allTests.push_back(
+        {"followup validation workspace race", changedWorkspaceDuringFollowupValidationCannotStoreAnOwnedUser});
+    allTests.push_back(
+        {"committed stage before error", committedStageSurvivesLaterFailureWithoutPublishingUncommittedTail});
+    allTests.push_back(
+        {"activity exact run terminal", activityClaimsUseExactRunAndTerminalSequenceWithoutADataDeliveryKind});
+    allTests.push_back(
+        {"owned question text response", ownedQuestionAcceptsATextFollowupWithoutBecomingPermissionApproval});
+    allTests.push_back({"explicit file dispatch", explicitFileUsesTheOrdinaryWorkspacePreparationAndDispatchOrder});
+    allTests.push_back({"owned permission control", permissionDecisionIsAnExactOwnedControlAndNeverOrdinaryText});
+    allTests.push_back(
+        {"revoked permission terminal", revokeCanOnlyResolveItsOriginalApprovalAndCannotPermitItsAction});
+    allTests.push_back({"late SessionError committed text and media denial",
+                        lateSessionErrorPreservesCommittedTextButDeniesPreparedMedia});
     allTests.push_back({"relative media workspace migration", persistedImageAndVideoPathsSurviveWorkspaceMigration});
     allTests.push_back({"history streamed atomic context", historyStreamsAllRowsAtomicallyBeforeOneLiveTurn});
     allTests.push_back(
@@ -1172,9 +1573,12 @@ int main() {
     allTests.push_back({"projection takeover during Session read", projectionRechecksTakeoverAfterOrdinarySessionRead});
     allTests.push_back({"history GC rebind abort restart", historyCleanupReclaimsRebindAbortAndRestartPayloads});
     allTests.push_back({"history EOF rejects expired live", terminalHistoryPageCannotPublishAfterLiveReadinessExpired});
-    allTests.push_back({"history deferred EOF checks expired live", deferredHistoryCommitChecksReadinessBeforePublishingAtIdle});
-    allTests.push_back({"history expiry during Core commit", historyCommitCannotReleaseBarrierWhenLiveExpiresDuringStoreCommit});
-    allTests.push_back({"history abort retries real SQLite lock", failedHistoryAbortRetainsPendingUntilWriteLockIsReleased});
+    allTests.push_back(
+        {"history deferred EOF checks expired live", deferredHistoryCommitChecksReadinessBeforePublishingAtIdle});
+    allTests.push_back(
+        {"history expiry during Core commit", historyCommitCannotReleaseBarrierWhenLiveExpiresDuringStoreCommit});
+    allTests.push_back(
+        {"history abort retries real SQLite lock", failedHistoryAbortRetainsPendingUntilWriteLockIsReleased});
     int failed = 0;
     for (const auto& test : allTests) {
         try {

@@ -187,24 +187,30 @@ public:
                   bool hasQuote = false);
     // 向指定联系人发送而不切换当前会话。目标或文本无效时返回 false；
     // 返回成功只表示消息已排队，尚不代表送达。
-    bool sendTextTo(const QString& peerId, const QString& text,
-                    const RemoteIMQuote& quote = RemoteIMQuote(), bool hasQuote = false);
+    bool sendTextTo(const QString& peerId, const QString& text, const RemoteIMQuote& quote = RemoteIMQuote(),
+                    bool hasQuote = false);
     // Automatic Session replies reuse the MultiAiCode machine-origin envelope.
     // Queue into the named conversation, then report the SDK receipt; a stale
     // account/connection callback cannot mutate the current account's history.
-    bool sendMachineTextTo(const QString& peerId, const QString& text,
-                           RemoteIMSendCompletion completion = {},
-                           std::function<bool()> canSend = {},
-                           const RemoteIMQuote& quote = RemoteIMQuote(), bool hasQuote = false);
+    bool sendMachineTextTo(const QString& peerId, const QString& text, RemoteIMSendCompletion completion = {},
+                           std::function<bool()> canSend = {}, const RemoteIMQuote& quote = RemoteIMQuote(),
+                           bool hasQuote = false);
+    // Existing v2 interactions follow the same named-peer persistence and final
+    // account/route guard as ordinary machine replies; they never add a quote.
+    bool sendMachineApprovalRequestTo(const QString& peerId, const QString& text,
+                                      const RemoteIMApprovalRequest& request, RemoteIMSendCompletion completion = {},
+                                      std::function<bool()> canSend = {});
+    bool sendMachineApprovalResolvedTo(const QString& peerId, const QString& text,
+                                       const RemoteIMApprovalDecision& resolution,
+                                       RemoteIMSendCompletion completion = {}, std::function<bool()> canSend = {});
     // Reuses ordinary cached-file/video-cover preparation and existing Tencent
     // image/file/video elements. Audio is sent as a file, never a fake voice.
     // Video returns preparation admission; onDispatched reports the guarded SDK
     // handoff separately from the eventual delivery receipt in completion.
     bool sendMachineMediaTo(const QString& peerId, const QString& path, const QString& type,
                             const QString& caption = {}, RemoteIMSendCompletion completion = {},
-                            std::function<bool()> canSend = {},
-                            const RemoteIMQuote& quote = RemoteIMQuote(), bool hasQuote = false,
-                            std::function<void(bool)> onDispatched = {});
+                            std::function<bool()> canSend = {}, const RemoteIMQuote& quote = RemoteIMQuote(),
+                            bool hasQuote = false, std::function<void(bool)> onDispatched = {});
     void setHumanTypingActive(bool active);
     // 用户确认的远程诊断流程使用明确且持久化的目标地址。
     // 发送后台报告时绝不能修改 selectedPeerId。

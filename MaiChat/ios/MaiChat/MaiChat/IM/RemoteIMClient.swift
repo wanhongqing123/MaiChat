@@ -213,6 +213,8 @@ protocol RemoteIMClient: AnyObject {
     ) async throws -> RemoteIMSendReceipt
     func sendSessionReply(_ payload: IMSessionOutgoingPayload, to userID: String,
                           permit: IMSessionDispatchPermit) async throws -> RemoteIMSendReceipt
+    func sendSessionActivity(_ signal: RemoteIMActivitySignal, to userID: String,
+                             permit: IMSessionActivityPermit) async throws
     func createGroup(name: String, memberUserIDs: [String]) async throws -> RemoteIMGroup
     func joinedGroups() async throws -> [RemoteIMGroup]
     func sendGroupText(to groupID: String, text: String) async throws -> RemoteIMSendReceipt
@@ -262,6 +264,12 @@ extension RemoteIMClient {
     func sendSessionReply(_ payload: IMSessionOutgoingPayload, to userID: String,
                           permit: IMSessionDispatchPermit) async throws -> RemoteIMSendReceipt {
         // 未提供真实派发边界的 SDK 不得提前 claim 后再转发成普通 Human 发送。
+        permit.acknowledge()
+        throw RemoteIMClientError.sdkNotIntegrated
+    }
+    func sendSessionActivity(_ signal: RemoteIMActivitySignal, to userID: String,
+                             permit: IMSessionActivityPermit) async throws {
+        // 每个 SDK 必须在真实发送边界 claim，不能先授权再异步转成无 permit 的普通发送。
         permit.acknowledge()
         throw RemoteIMClientError.sdkNotIntegrated
     }

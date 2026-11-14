@@ -49,10 +49,14 @@ public:
     // preserveReasoning 用于 GLM 等要求工具跟进回传原思考的协议：仅填独立 reasoning，
     // 不把它复制成可见 content。默认 false 保持旧契约；原显式字节策略仍适用，
     // 产品默认各预算为零，因此原始片段字节及其 call/result 归属保持不变。
-    std::vector<MaiModelMessage> build(const std::vector<MaiMessage>& history,
-                                       std::size_t firstMessage = 0, std::size_t firstPart = 0,
-                                       const std::string& preservedUserMessageId = {},
-                                       bool preserveReasoning = false) const;
+    // currentUserMessageIds 是本次安全点消费的显式补充组，和默认最新输入按 ID 合并去重。
+    // 该组先前的图片不能因为同组最后一条只有文字而省略。调用方必须在接收阶段限制组预算，
+    // 下一组替换此集合；默认空集合保持既有历史像素省略及工具图片预算。
+    std::vector<MaiModelMessage> build(
+        const std::vector<MaiMessage>& history, std::size_t firstMessage = 0,
+        std::size_t firstPart = 0, const std::string& preservedUserMessageId = {},
+        bool preserveReasoning = false,
+        const std::vector<std::string>& currentUserMessageIds = {}) const;
 
 private:
     Options mOptions;

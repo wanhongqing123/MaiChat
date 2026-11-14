@@ -82,6 +82,40 @@ struct IMSessionDelivery: Codable, Equatable, Sendable {
         guard let value = fields["scope"], let data = try? JSONEncoder().encode(value) else { return nil }
         return try? JSONDecoder().decode(IMSessionBindingScope.self, from: data)
     }
+    var interaction: RemoteIMTextInteraction? {
+        guard let raw = fields["interaction"], string("kind") == "text" else { return nil }
+        let metadata: IMSessionJSON = .object([
+            "namespace": .string(RemoteIMCloudMetadataCodec.namespace),
+            "version": .integer(Int64(RemoteIMCloudMetadataCodec.version)),
+            "origin": .string("machine"), "interaction": raw,
+        ])
+        return RemoteIMCloudMetadataCodec.decode(try? JSONEncoder().encode(metadata))?.interaction
+    }
+    var isApprovalResolution: Bool {
+        guard case .approvalDecision(_, let action) = interaction else { return false }
+        return action == .resolved || action == .autoDeclined
+    }
+}
+
+/// Activity 走独立 claim/ack，不占用普通 delivery FIFO；原始 ownership 字段完整往返。
+struct IMSessionActivity: Codable, Sendable {
+    let fields: [String: IMSessionJSON]
+    init(from decoder: Decoder) throws { fields = try decoder.singleValueContainer().decode([String: IMSessionJSON].self) }
+    func encode(to encoder: Encoder) throws { var c = encoder.singleValueContainer(); try c.encode(fields) }
+    var peerID: String { fields["peer_id"]?.string ?? "" }
+    var scope: IMSessionBindingScope? {
+        guard let value = fields["scope"], let data = try? JSONEncoder().encode(value) else { return nil }
+        return try? JSONDecoder().decode(IMSessionBindingScope.self, from: data)
+    }
+    var signal: RemoteIMActivitySignal? {
+        guard let value = fields["signal"], let data = try? JSONEncoder().encode(value),
+              let signal = RemoteIMActivityCodec.decode(data), signal.kind != .humanTyping else { return nil }
+        return signal
+    }
+    var identity: String {
+        (fields["bridge_id"]?.string ?? "") + ":" + (fields["token"]?.string ?? "") + ":" +
+            (signal.map { $0.activityID + ":" + String($0.sequence) } ?? "invalid")
+    }
 }
 
 /// Native 单次发出的原始 task 全程不改写，import_id 的新值只来自 progress。
@@ -132,6 +166,7 @@ struct IMSessionBindingProjection: Decodable, Sendable {
     let historyCleanupPending: Bool
     let pendingCount: Int
     let deliveries: [IMSessionDelivery]
+    let activities: [IMSessionActivity]
     let error: String?
     let errorCode: String?
     let warnings: [[String: IMSessionJSON]]
@@ -143,7 +178,7 @@ struct IMSessionBindingProjection: Decodable, Sendable {
     // 仅 Swift worker→Main 的本地发布序号，不增加 Native JSON 字段。
     var hostPublication: UInt64 = 0
     enum CodingKeys: String, CodingKey {
-        case ok, scope, sessions, bindings, deliveries, error, errorCode, warnings, accepted, reason
+        case ok, scope, sessions, bindings, deliveries, activities, error, errorCode, warnings, accepted, reason
         case historyTasks = "history_tasks", historyProgress = "history_progress", pageAccepted = "page_accepted"
         case bridgeID = "bridge_id", hasBindings = "has_bindings", pendingCount = "pending_count"
         case historyCleanupPending = "history_cleanup_pending"
@@ -159,6 +194,7 @@ struct IMSessionBindingProjection: Decodable, Sendable {
         historyCleanupPending = try c.decodeIfPresent(Bool.self, forKey: .historyCleanupPending) ?? false
         pendingCount = try c.decodeIfPresent(Int.self, forKey: .pendingCount) ?? 0
         deliveries = try c.decodeIfPresent([IMSessionDelivery].self, forKey: .deliveries) ?? []
+        activities = try c.decodeIfPresent([IMSessionActivity].self, forKey: .activities) ?? []
         error = try c.decodeIfPresent(String.self, forKey: .error)
         errorCode = try c.decodeIfPresent(String.self, forKey: .errorCode)
         warnings = try c.decodeIfPresent([[String: IMSessionJSON]].self, forKey: .warnings) ?? []
@@ -271,6 +307,7 @@ final class IMSessionBindingCaptureRegistry: @unchecked Sendable {
             self.bridgeID = nil; self.scope = nil; bindings = [:]; authoritativeBindings = [:]
         }
         lock.unlock()
+        IMSessionApprovalRequests.shared.clear(scope: scope)
         // 清理的是所属旧 bridge，不能顺便清掉新 configure 发布的 authority。
         IMSessionBindingControl.revoke("logout", bridgeID: bridgeID, scope: scope)
     }
@@ -347,8 +384,10 @@ final class IMSessionBindingCaptureRegistry: @unchecked Sendable {
     }
     func allows(_ delivery: IMSessionDelivery) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard let scope, self.bridgeID == delivery.bridgeID, scope == delivery.scope,
-              let binding = bindings[delivery.peerID] else { return false }
+        guard let scope, self.bridgeID == delivery.bridgeID, scope == delivery.scope else { return false }
+        // 解绑后只允许同账号好友的旧审批终态进入 Native 精确 claim；不会恢复普通交付权。
+        if delivery.isApprovalResolution { return acceptedFriends.contains(delivery.peerID) }
+        guard let binding = bindings[delivery.peerID] else { return false }
         return binding.sessionID == delivery.sessionID
     }
 }
@@ -364,7 +403,12 @@ enum IMSessionBindingControl {
     }
     static func accepts(action: String?, response: [String: IMSessionJSON]) -> Bool {
         guard response["ok"] == .bool(true) else { return false }
-        return action == "claim" ? response["allowed"] == .bool(true) : true
+        switch action {
+        case "claim", "claim_activity": return response["allowed"] == .bool(true)
+        case "ack", "ack_activity": return response["acknowledged"] == .bool(true)
+        case "approval_decision": return response["accepted"] == .bool(true)
+        default: return true
+        }
     }
     static func call(_ request: [String: IMSessionJSON]) -> Bool {
         guard let value = response(request) else { return false }
@@ -387,6 +431,9 @@ enum IMSessionBindingControl {
     static func delivery(_ action: String, _ delivery: IMSessionDelivery) -> Bool {
         call(["action": .string(action), "delivery": .object(delivery.fields)])
     }
+    static func activity(_ action: String, _ activity: IMSessionActivity) -> Bool {
+        call(["action": .string(action), "activity": .object(activity.fields)])
+    }
     static func revoke(_ action: String, bridgeID: String, scope: IMSessionBindingScope, sessionID: String? = nil) {
         var value: [String: IMSessionJSON] = ["action": .string(action), "bridge_id": .string(bridgeID)]
         value["scope"] = try? IMSessionJSON.value(scope)
@@ -404,7 +451,9 @@ final class IMSessionDispatchPermit: @unchecked Sendable {
         guard let scope = delivery.scope, let sdk = Int(scope.sdkAppID),
               accountTag == RemoteDiagnosticsProtocol.accountTag(sdkAppID: sdk, ownerUserID: scope.ownerID),
               IMSessionBindingCaptureRegistry.shared.allows(delivery) else { return false }
-        return IMSessionBindingControl.delivery("claim", delivery)
+        guard IMSessionBindingControl.delivery("claim", delivery) else { return false }
+        IMSessionApprovalRequests.shared.recordClaimed(delivery)
+        return true
     }
     /// ack 仅确认 SDK 调用已发起或已放弃，不代表网络送达。多层清理仍只确认一次。
     func acknowledge() {
@@ -412,6 +461,62 @@ final class IMSessionDispatchPermit: @unchecked Sendable {
         guard !acknowledged else { lock.unlock(); return }
         acknowledged = true; lock.unlock()
         _ = IMSessionBindingControl.delivery("ack", delivery)
+    }
+}
+
+final class IMSessionActivityPermit: @unchecked Sendable {
+    let activity: IMSessionActivity
+    private let lock = NSLock()
+    private var acknowledged = false
+    init(activity: IMSessionActivity) { self.activity = activity }
+    func claim(accountTag: String?) -> Bool {
+        guard let scope = activity.scope, let sdk = Int(scope.sdkAppID),
+              accountTag == RemoteDiagnosticsProtocol.accountTag(sdkAppID: sdk, ownerUserID: scope.ownerID)
+        else { return false }
+        // Native 同时核对 active authority，或仅允许旧 random ID 的终态清理。
+        return IMSessionBindingControl.activity("claim_activity", activity)
+    }
+    func acknowledge() {
+        lock.lock()
+        guard !acknowledged else { lock.unlock(); return }
+        acknowledged = true; lock.unlock()
+        _ = IMSessionBindingControl.activity("ack_activity", activity)
+    }
+}
+
+/// 只缓存已在 SDK 边界成功 claim 的原审批请求；公开 token 不代替 Native 私有权限。
+final class IMSessionApprovalRequests: @unchecked Sendable {
+    static let shared = IMSessionApprovalRequests()
+    private let lock = NSLock()
+    private var requests: [String: IMSessionDelivery] = [:]
+    func clear(scope: IMSessionBindingScope) {
+        lock.lock(); defer { lock.unlock() }
+        requests = requests.filter { $0.value.scope != scope }
+    }
+    func recordClaimed(_ delivery: IMSessionDelivery) {
+        lock.lock(); defer { lock.unlock() }
+        switch delivery.interaction {
+        case .approvalRequest(let request): requests[request.token] = delivery
+        case .approvalDecision(let token, _): requests.removeValue(forKey: token)
+        case nil: break
+        }
+    }
+    @discardableResult
+    func receive(_ decision: RemoteIMApprovalDecision, accountTag: String?, peerID: String,
+                 messageID: String, recipientID: String, origin: RemoteIMMessageOrigin?, group: Bool) -> Bool {
+        guard origin == .human, !group, !messageID.isEmpty,
+              [.approveOnce, .approvePrefix, .reject].contains(decision.action) else { return false }
+        lock.lock(); let original = requests[decision.token]; lock.unlock()
+        guard let original, original.peerID == peerID, let scope = original.scope,
+              scope.ownerID == recipientID, let sdk = Int(scope.sdkAppID),
+              accountTag == RemoteDiagnosticsProtocol.accountTag(sdkAppID: sdk, ownerUserID: scope.ownerID)
+        else { return false }
+        return IMSessionBindingControl.call([
+            "action": .string("approval_decision"), "approval": .object(original.fields),
+            "decision": .string(decision.action.rawValue), "message_id": .string(messageID),
+            "peer_id": .string(peerID), "sender_id": .string(peerID), "recipient_id": .string(recipientID),
+            "origin": .string("human"), "live": .bool(true), "group": .bool(false),
+        ])
     }
 }
 
@@ -462,6 +567,7 @@ final class IMSessionBindingController {
     private var operationFailure = false
     private var locallyCanceledPeers = Set<String>()
     private var inFlight = Set<String>()
+    private var activitiesInFlight = Set<String>()
     private var historyPreparations: [String: Task<Void, Never>] = [:]
     private var restoredBridge = ""
     init(appState: RemoteIMAppState) {
@@ -772,7 +878,8 @@ final class IMSessionBindingController {
     }
 
     private func startPolling() {
-        guard poll == nil, projection?.hasBindings == true || projection?.historyCleanupPending == true else { return }
+        guard poll == nil, projection?.hasBindings == true || projection?.historyCleanupPending == true ||
+            projection?.activities.isEmpty == false || projection?.deliveries.isEmpty == false else { return }
         poll = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self, let appState = self.appState, let expected = self.identity,
@@ -781,6 +888,13 @@ final class IMSessionBindingController {
                     let value = try self.request("pump")
                     let result = try await AIAssistantModel.shared.imSessionBindingRequest(value, host: expected)
                     try self.accept(result, expected: expected)
+                    for activity in result.activities where self.activitiesInFlight.insert(activity.identity).inserted {
+                        Task { @MainActor [weak self, weak appState] in
+                            let permit = IMSessionActivityPermit(activity: activity)
+                            defer { permit.acknowledge(); self?.activitiesInFlight.remove(activity.identity) }
+                            await appState?.sendIMSessionActivity(activity, permit: permit)
+                        }
+                    }
                     for delivery in result.deliveries where self.inFlight.insert(delivery.identity).inserted {
                         // 只追踪 SDK callback 生命周期；内核仍是唯一 FIFO 与 dispatch authority。
                         Task { @MainActor [weak self, weak appState] in
@@ -789,7 +903,8 @@ final class IMSessionBindingController {
                             await appState?.sendIMSessionDelivery(delivery, permit: permit)
                         }
                     }
-                    if !result.hasBindings && result.pendingCount == 0 && !result.historyCleanupPending { break }
+                    if !result.hasBindings && result.pendingCount == 0 && !result.historyCleanupPending &&
+                        result.activities.isEmpty && result.deliveries.isEmpty { break }
                 } catch {
                     guard appState.imSessionHostIdentity == expected else { break }
                     appState.imSessionBindingError = error.localizedDescription

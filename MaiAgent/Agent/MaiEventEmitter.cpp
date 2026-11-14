@@ -22,9 +22,10 @@ MaiEvent makeEvent(MaiEventType type, const std::string& sessionId) {
 }  // namespace
 
 void MaiEventEmitter::emitSession(MaiEventType type, const std::string& sessionId,
-                                  const std::string& detail) {
+                                  const std::string& detail, const std::string& field) {
     MaiEvent event = makeEvent(type, sessionId);
     event.detail = detail;
+    if (type == MaiEventType::SessionUpdated) event.field = field;
     mBus.publish(event);
 }
 
@@ -40,6 +41,25 @@ void MaiEventEmitter::emitPart(MaiEventType type, const std::string& sessionId,
     MaiEvent event = makeEvent(type, sessionId);
     event.messageId = messageId;
     event.partId = partId;
+    mBus.publish(event);
+}
+
+void MaiEventEmitter::emitTextCommitted(const std::string& sessionId, const std::string& turnId,
+                                        const std::string& messageId, const std::string& partId) {
+    MaiEvent event = makeEvent(MaiEventType::MessageTextCommitted, sessionId);
+    event.turnId = turnId;
+    event.messageId = messageId;
+    event.partId = partId;
+    mBus.publish(event);
+}
+
+void MaiEventEmitter::emitSteeringApplied(const std::string& sessionId, const std::string& turnId,
+                                          const std::string& messageId,
+                                          const std::vector<std::string>& inputMessageIds) {
+    MaiEvent event = makeEvent(MaiEventType::TurnSteeringApplied, sessionId);
+    event.turnId = turnId;
+    event.messageId = messageId;
+    event.inputMessageIds = inputMessageIds;
     mBus.publish(event);
 }
 

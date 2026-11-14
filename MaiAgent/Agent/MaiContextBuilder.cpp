@@ -88,11 +88,10 @@ MaiContextBuilder::MaiContextBuilder(Options options) : mOptions(std::move(optio
 // 把持久化会话历史转换为模型请求的上下文消息。
 // 文本、媒体、工具调用和工具回执按原事件顺序组装。
 // 默认保留全部原文；只有宿主显式指定的有损预算会改变请求副本，不改存储。
-std::vector<MaiModelMessage> MaiContextBuilder::build(const std::vector<MaiMessage>& history,
-                                                      std::size_t firstMessage,
-                                                      std::size_t firstPart,
-                                                      const std::string& preservedUserMessageId,
-                                                      bool preserveReasoning) const {
+std::vector<MaiModelMessage> MaiContextBuilder::build(
+    const std::vector<MaiMessage>& history, std::size_t firstMessage, std::size_t firstPart,
+    const std::string& preservedUserMessageId, bool preserveReasoning,
+    const std::vector<std::string>& currentUserMessageIds) const {
     std::vector<MaiModelMessage> out;
     if (firstMessage > history.size()) return out;
     if (firstPart != 0 &&
@@ -109,6 +108,15 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(const std::vector<MaiMessa
         if (history[index].role == MaiRole::User && !history[index].pendingInput)
             latestUserIndex = index;
     }
+    const auto isFreshInput = [&](std::size_t index) {
+        return !history[index].id.empty() &&
+               std::find(currentUserMessageIds.begin(), currentUserMessageIds.end(),
+                         history[index].id) != currentUserMessageIds.end();
+    };
+    const auto isCurrentInput = [&](std::size_t index) {
+        // 每条 user 只遍历一次，最新输入若也在补充组中不会重复注入其像素。
+        return index == latestUserIndex || isFreshInput(index);
+    };
     std::size_t currentToolImages = 0;
     for (std::size_t index = std::max(latestUserIndex, firstMessage); index < history.size();
          ++index) {
@@ -127,7 +135,8 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(const std::vector<MaiMessa
     std::size_t userImageCount = 0;
     for (std::size_t index = 0; index < history.size(); ++index) {
         const MaiMessage& message = history[index];
-        if (index < firstMessage && message.id != preservedUserMessageId) continue;
+        if (index < firstMessage && message.id != preservedUserMessageId && !isFreshInput(index))
+            continue;
         if (message.role != MaiRole::User || message.pendingInput) continue;
         for (const MaiMessagePart& part : message.parts)
             if (std::holds_alternative<MaiImagePart>(part.body)) ++userImageCount;
@@ -140,7 +149,9 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(const std::vector<MaiMessa
 
     for (std::size_t messageIndex = 0; messageIndex < history.size(); ++messageIndex) {
         const auto& message = history[messageIndex];
-        if (messageIndex < firstMessage && message.id != preservedUserMessageId) continue;
+        if (messageIndex < firstMessage && message.id != preservedUserMessageId &&
+            !isFreshInput(messageIndex))
+            continue;
         if (message.pendingInput) continue;
         if (message.role == MaiRole::User) {
             // 用户消息的文字、图片、视频和引用共享同一模型消息。
@@ -152,7 +163,7 @@ std::vector<MaiModelMessage> MaiContextBuilder::build(const std::vector<MaiMessa
             for (const auto& part : message.parts) {
                 if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
                     ++attachmentIndex;
-                    const bool current = messageIndex == latestUserIndex;
+                    const bool current = isCurrentInput(messageIndex);
                     const bool recent = userImageIndex++ >= skippedUserReferences;
                     if ((current || recent) && !image->path.empty()) {
                         if (!modelMessage.content.empty()) modelMessage.content += "\n";

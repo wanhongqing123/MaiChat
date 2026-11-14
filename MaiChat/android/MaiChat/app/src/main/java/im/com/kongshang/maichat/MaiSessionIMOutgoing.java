@@ -27,6 +27,16 @@ final class MaiSessionIMOutgoing {
         String body = delivery.optString(kind.equals("text") ? "text" : "caption");
         JSONObject scope = delivery.optJSONObject("scope");
         if (scope == null || !current.getAsBoolean()) throw new IOException("交付账号已变化");
+        RemoteIMApprovalRequest approvalRequest = null; RemoteIMApprovalDecision approvalResolution = null;
+        if (delivery.has("interaction")) {
+            if (!kind.equals("text") || delivery.optJSONObject("interaction") == null)
+                throw new IOException("审批交互必须是文本交付中的对象");
+            try {
+                RemoteIMProtocolMetadata.Metadata metadata = RemoteIMProtocolMetadata.decodeMachineInteraction(
+                    delivery.get("interaction").toString());
+                approvalRequest = metadata.approvalRequest(); approvalResolution = metadata.approvalDecision();
+            } catch (Exception invalid) { throw new IOException("审批交互无效", invalid); }
+        }
         List<File> owned = new ArrayList<>();
         RemoteIMImageAttachment image = null; RemoteIMVideoAttachment video = null; RemoteIMFileAttachment file = null;
         try {
@@ -68,7 +78,7 @@ final class MaiSessionIMOutgoing {
             String id = UUID.randomUUID().toString();
             RemoteIMMessage message = new RemoteIMMessage(id, null, scope.optString("owner_id"), delivery.optString("peer_id"),
                 body, RemoteIMMessage.Direction.OUTGOING, RemoteIMMessage.Status.PENDING, System.currentTimeMillis(),
-                image, null, file, video, RemoteIMOrigin.MACHINE);
+                image, null, file, video, RemoteIMOrigin.MACHINE, approvalRequest, approvalResolution);
             return new MaiSessionIMOutgoing(message, body, owned);
         } catch (Exception failure) {
             for (File item : owned) item.delete();

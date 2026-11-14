@@ -27,6 +27,8 @@ const char* maiEventTypeToString(MaiEventType type) {
         case MaiEventType::QuestionAsked: return "question.asked";
         case MaiEventType::QuestionAnswered: return "question.answered";
         case MaiEventType::ContextImported: return "session.context.imported";
+        case MaiEventType::MessageTextCommitted: return "message.text.committed";
+        case MaiEventType::TurnSteeringApplied: return "turn.steering.applied";
     }
     return "session.status";
 }

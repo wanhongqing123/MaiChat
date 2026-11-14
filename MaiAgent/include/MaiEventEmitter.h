@@ -22,13 +22,25 @@ class MaiEventEmitter {
 public:
     explicit MaiEventEmitter(MaiEventBus& bus);
 
+    // field 仅用于 SessionUpdated；缺省空值表示未分类，宿主必须按未知更新撤销旧授权。
+    // 标题须显式传 title，输入受理传 input，工作区变更传 workspace；其它变更传空值或明确类别，
+    // 不得伪装成标题/输入更新，否则宿主会错误保留旧工作区授权。
     void emitSession(MaiEventType type, const std::string& sessionId,
-                     const std::string& detail = {});
+                     const std::string& detail = {}, const std::string& field = {});
 
     void emitMessage(MaiEventType type, const std::string& sessionId, const std::string& messageId);
 
     void emitPart(MaiEventType type, const std::string& sessionId, const std::string& messageId,
                   const std::string& partId);
+
+    // 只能在完整成功响应的正文落库后调用；不改变轮次/工具状态，不携带正文副本。
+    void emitTextCommitted(const std::string& sessionId, const std::string& turnId,
+                           const std::string& messageId, const std::string& partId);
+
+    // 新 assistant 及用户消费状态落库后、普通 MessageUpdated 前调用；ID 顺序不能改写。
+    void emitSteeringApplied(const std::string& sessionId, const std::string& turnId,
+                             const std::string& messageId,
+                             const std::vector<std::string>& inputMessageIds);
 
     // 增量。**只带这次新增的内容**，不重推全量——流式期间每秒几十条，全量重推是纯烧 CPU。
     void emitDelta(const std::string& sessionId, const std::string& messageId,

@@ -173,11 +173,14 @@ bool MaiTurnRunner::hasVisibleText() const {
 
 bool MaiTurnRunner::advanceSteering(bool closeIfEmpty) {
     if (!mDependencies.advanceSteering) return false;
-    const auto advanced = mDependencies.advanceSteering(mAssistant, closeIfEmpty);
+    std::vector<std::string> currentUserMessageIds;
+    const auto advanced =
+        mDependencies.advanceSteering(mAssistant, closeIfEmpty, currentUserMessageIds);
     if (!advanced) {
         mError = advanced.error();
         return false;
     }
+    if (advanced.value()) mCurrentUserMessageIds = std::move(currentUserMessageIds);
     return advanced.value();
 }
 
@@ -245,6 +248,7 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         if (!mError && !cancel.load(std::memory_order_relaxed) &&
             (!finalCalls.empty() || !hasFinalText))
             mError = MaiError::make(MaiErrorCode::Internal, failure);
+        announceCommittedTextParts(cancel);
     };
     for (int iteration = 0; iteration < mDependencies.maxIterations; ++iteration) {
         if (cancel.load(std::memory_order_relaxed)) break;
@@ -261,6 +265,7 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
         const auto calls = requestCompletion(built.value(), cancel);
         const bool producedVisibleText = mResponseHasVisibleText;
         commitStreamedParts();
+        announceCommittedTextParts(cancel);
 
         if (mError) break;
         if (calls.empty()) {
@@ -374,7 +379,8 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
         }
         if (mDependencies.specialistReply.empty())
             return mDependencies.context->build(modelHistory, firstMessage, firstPart,
-                                                preservedUserMessageId, preserveReasoning);
+                                                preservedUserMessageId, preserveReasoning,
+                                                mCurrentUserMessageIds);
         // 子模型回复应排在本轮工具调用之前。若每次迭代都把它追加在工具结果之后，
         // 主模型会把旧回复误认为用户刚刚发来的最新输入。
         std::vector<MaiMessage> earlier;
@@ -416,8 +422,8 @@ MaiResult<MaiModelRequest> MaiTurnRunner::buildRequest(const std::string& modelN
         messages.push_back(std::move(reply));
         // steer 产生新 assistant 段时，旧专业回复仍固定在本轮最初分段之前，
         // 不能越过新的用户指令重新变成“最新输入”。
-        const auto current =
-            mDependencies.context->build(continuation, 0, 0, {}, preserveReasoning);
+        const auto current = mDependencies.context->build(continuation, 0, 0, {}, preserveReasoning,
+                                                          mCurrentUserMessageIds);
         messages.insert(messages.end(), current.begin(), current.end());
         return messages;
     };
@@ -461,6 +467,7 @@ std::vector<MaiToolInvocation> MaiTurnRunner::requestCompletion(const MaiModelRe
     // 混成一个 part 会让界面把工具卡夹在一段文字中间。
     mText.clear();
     mReasoning.clear();
+    mResponseFirstPart = mAssistant.parts.size();
     mLastPersistedStreamBytes = 0;
     mResponseHasVisibleText = false;
     mTextPartId = MaiIdGenerator::newPartId();
@@ -888,6 +895,23 @@ void MaiTurnRunner::commitStreamedParts() {
     mLastPersistedStreamBytes = 0;
 }
 
+void MaiTurnRunner::announceCommittedTextParts(const std::atomic<bool>& cancel) {
+    // 只有完整成功的模型响应才能成为可交付正文。finish 仍保存失败/取消时的尾部，
+    // 但不把它冒充已完成的响应；推理、工具载荷和增量也不产生此凭据。
+    if (mError || cancel.load(std::memory_order_relaxed)) return;
+    if (const MaiError error = mDependencies.store->lastWriteError()) {
+        mError = error;
+        return;
+    }
+    for (std::size_t index = mResponseFirstPart; index < mAssistant.parts.size(); ++index) {
+        const auto& part = mAssistant.parts[index];
+        const auto* text = std::get_if<MaiTextPart>(&part.body);
+        if (!text || text->text.empty()) continue;
+        mDependencies.emitter->emitTextCommitted(mSessionId, mInitialAssistantId, mAssistant.id,
+                                                 part.id);
+    }
+}
+
 void MaiTurnRunner::checkpointStreamedParts(bool force) {
     // UI 可以接收每个流式增量，但持久化不能等到 HTTP 流关闭才开始。
     // 按有界片段落库，流卡住或进程退出时最多损失一小段尾部内容。
@@ -928,7 +952,8 @@ void MaiTurnRunner::finish(const std::atomic<bool>& cancel) {
     if (mDependencies.titler) {
         const std::string title = mDependencies.titler->apply(*mDependencies.store, mSessionId);
         if (!title.empty()) {
-            mDependencies.emitter->emitSession(MaiEventType::SessionUpdated, mSessionId, title);
+            mDependencies.emitter->emitSession(MaiEventType::SessionUpdated, mSessionId, title,
+                                               "title");
         }
     }
 

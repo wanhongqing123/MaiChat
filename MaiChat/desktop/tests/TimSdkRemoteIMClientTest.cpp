@@ -265,6 +265,8 @@ private slots:
     void activityUsesOnlineCustomTransportWithoutHistory();
     void connectsThroughSdkAndSendsTextAndImage();
     void sendsApprovalDecisionAsV2CloudInteraction();
+    void sendsMachineApprovalRequestAndResolutionAsV2CloudInteractions();
+    void refusesInvalidMachineApprovalBeforeSdkDispatch();
     void sendsImageWithTextAsSingleMultiElemMessage();
     void sendsVideoWithEverySdkRequiredField();
     void sendsVideoWithTextAsSingleMultiElemMessage();
@@ -529,6 +531,114 @@ void TimSdkRemoteIMClientTest::sendsApprovalDecisionAsV2CloudInteraction() {
              QStringLiteral("approve-once"));
 }
 
+void TimSdkRemoteIMClientTest::sendsMachineApprovalRequestAndResolutionAsV2CloudInteractions() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    TimSdkRemoteIMClient client(std::move(api));
+    const RemoteIMApprovalRequest request{
+        QStringLiteral("approval-owned-1"),
+        {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::ApprovePrefix, RemoteIMApprovalAction::Reject}};
+    fake->sendPayload = QStringLiteral("{\"message_msg_id\":\"sdk-approval-1\",\"message_server_time\":1700000001}");
+    bool sent = false;
+    RemoteIMSendReceipt sentReceipt;
+    client.sendMachineApprovalRequest(QStringLiteral("owned-peer"), QStringLiteral("Review the pending operation"),
+                                      request, [&](bool ok, const QString&, const RemoteIMSendReceipt& receipt) {
+                                          sent = ok;
+                                          sentReceipt = receipt;
+                                      });
+    QVERIFY(sent);
+    QCOMPARE(sentReceipt.remoteMessageId, QStringLiteral("sdk-approval-1#0"));
+    QCOMPARE(sentReceipt.createdAtMillis, Q_INT64_C(1700000001) * 1000);
+    QCOMPARE(fake->lastConversationId, QStringLiteral("owned-peer"));
+    QCOMPARE(fake->lastConversationType, 1);
+    QCOMPARE(firstElement(fake->lastJsonMessage).value(QStringLiteral("elem_type")).toInt(), 0);
+    QCOMPARE(firstElement(fake->lastJsonMessage).value(QStringLiteral("text_elem_content")).toString(),
+             QStringLiteral("Review the pending operation"));
+    // 独立协议样本锁定机器来源、动作集合及持久文本；不能自编码再自解码掩盖字段错误。
+    const auto expected = QJsonDocument::fromJson(R"({"namespace":"multi-ai-code","version":2,
+        "origin":"machine","interaction":{"kind":"approval-request","token":"approval-owned-1",
+        "actions":["approve-once","approve-prefix","reject"]}})")
+                              .object();
+    QCOMPARE(messageMetadata(fake->lastJsonMessage), expected);
+    const auto wire = QJsonDocument::fromJson(fake->lastJsonMessage.toUtf8()).object();
+    QCOMPARE(wire.value(QStringLiteral("message_elem_array")).toArray().size(), 1);
+    QVERIFY(!wire.value(QStringLiteral("message_is_online_msg")).toBool());
+
+    const RemoteIMApprovalRequest onceOnly{QStringLiteral("approval-once-only"),
+                                           {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::Reject}};
+    client.sendMachineApprovalRequest(QStringLiteral("owned-peer"), QStringLiteral("Review once"), onceOnly, {});
+    QCOMPARE(messageMetadata(fake->lastJsonMessage)
+                 .value(QStringLiteral("interaction"))
+                 .toObject()
+                 .value(QStringLiteral("actions"))
+                 .toArray(),
+             QJsonArray({QStringLiteral("approve-once"), QStringLiteral("reject")}));
+
+    for (const auto action : {RemoteIMApprovalAction::Resolved, RemoteIMApprovalAction::AutoDeclined}) {
+        client.sendMachineApprovalResolved(QStringLiteral("owned-peer"), QStringLiteral("Pending approval has ended"),
+                                           {request.token, action}, {});
+        const QString outcome =
+            action == RemoteIMApprovalAction::Resolved ? QStringLiteral("resolved") : QStringLiteral("auto-declined");
+        const auto expectedResolution =
+            QJsonDocument::fromJson(
+                QStringLiteral("{\"namespace\":\"multi-ai-code\",\"version\":2,\"origin\":\"machine\","
+                               "\"interaction\":{\"kind\":\"approval-resolved\",\"token\":\"approval-owned-1\","
+                               "\"outcome\":\"%1\"}}")
+                    .arg(outcome)
+                    .toUtf8())
+                .object();
+        QCOMPARE(messageMetadata(fake->lastJsonMessage), expectedResolution);
+    }
+
+    fake->sendCode = 17;
+    bool failed = false;
+    client.sendMachineApprovalRequest(QStringLiteral("owned-peer"), QStringLiteral("Review once"), onceOnly,
+                                      [&](bool ok, const QString& error, const RemoteIMSendReceipt& receipt) {
+                                          failed = !ok && !error.isEmpty() && receipt.remoteMessageId.isEmpty();
+                                      });
+    QVERIFY(failed);
+}
+
+void TimSdkRemoteIMClientTest::refusesInvalidMachineApprovalBeforeSdkDispatch() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    TimSdkRemoteIMClient client(std::move(api));
+    const RemoteIMApprovalRequest valid{QStringLiteral("approval-owned-2"),
+                                        {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::Reject}};
+    int failures = 0;
+    const auto rejected = [&](bool ok, const QString& error, const RemoteIMSendReceipt& receipt) {
+        QVERIFY(!ok);
+        QVERIFY(!error.isEmpty());
+        QVERIFY(receipt.remoteMessageId.isEmpty());
+        ++failures;
+    };
+    const QList<RemoteIMApprovalRequest> invalid{
+        {QStringLiteral("approval-"), valid.actions},
+        {QStringLiteral("approval-bad.token"), valid.actions},
+        {QStringLiteral("approval-") + QString(192, QLatin1Char('x')), valid.actions},
+        {valid.token, {RemoteIMApprovalAction::Reject}},
+        {valid.token,
+         {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::Reject}},
+        {valid.token, {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::Resolved}},
+        {valid.token, {RemoteIMApprovalAction::ApproveOnce, static_cast<RemoteIMApprovalAction>(999)}}};
+    for (const auto& request : invalid) {
+        client.sendMachineApprovalRequest(QStringLiteral("owned-peer"), QStringLiteral("Review"), request, rejected);
+        QVERIFY(fake->lastJsonMessage.isEmpty());
+    }
+    for (const auto action : {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::ApprovePrefix,
+                              RemoteIMApprovalAction::Reject, static_cast<RemoteIMApprovalAction>(999)}) {
+        client.sendMachineApprovalResolved(QStringLiteral("owned-peer"), QStringLiteral("Ended"), {valid.token, action},
+                                           rejected);
+        QVERIFY(fake->lastJsonMessage.isEmpty());
+    }
+    client.sendMachineApprovalResolved(QStringLiteral("owned-peer"), QStringLiteral("Ended"),
+                                       {QStringLiteral("bad-token"), RemoteIMApprovalAction::Resolved}, rejected);
+    client.sendMachineApprovalRequest({}, QStringLiteral("Review"), valid, rejected);
+    client.sendMachineApprovalRequest(QStringLiteral("owned-peer"), QStringLiteral("  "), valid, rejected);
+    QCOMPARE(failures, invalid.size() + 7);
+    QVERIFY(fake->lastJsonMessage.isEmpty());
+}
+
 // 图片和配文必须作为同一 SDK 消息提交，避免收件人看到两张分离卡片。
 void TimSdkRemoteIMClientTest::sendsImageWithTextAsSingleMultiElemMessage() {
     auto api = std::make_unique<FakeTimSdkApi>();
@@ -771,7 +881,14 @@ void TimSdkRemoteIMClientTest::unsupportedMachineMediaNeverFallsBackToHumanSend(
     client.sendMachineFileWithText(QStringLiteral("friend"), QStringLiteral("/owned/report.pdf"), {}, {}, false, {}, false, failure);
     client.sendMachineVideoWithText(QStringLiteral("friend"), samplePayload(), {}, false, {}, false, failure);
     client.sendMachineTextWithQuote(QStringLiteral("friend"), QStringLiteral("owned reply"), {}, false, failure);
-    QCOMPARE(failures, 4);
+    client.sendMachineApprovalRequest(
+        QStringLiteral("friend"), QStringLiteral("Review"),
+        {QStringLiteral("approval-unsupported"), {RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::Reject}},
+        failure);
+    client.sendMachineApprovalResolved(QStringLiteral("friend"), QStringLiteral("Ended"),
+                                       {QStringLiteral("approval-unsupported"), RemoteIMApprovalAction::Resolved},
+                                       failure);
+    QCOMPARE(failures, 6);
     QCOMPARE(client.humanCalls, 0);
 }
 

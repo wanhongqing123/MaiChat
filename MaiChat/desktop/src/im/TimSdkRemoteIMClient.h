@@ -52,6 +52,11 @@ public:
                               const QString& token,
                               RemoteIMApprovalAction action,
                               RemoteIMSendCompletion completion) override;
+    void sendMachineApprovalRequest(const QString& peerId, const QString& text, const RemoteIMApprovalRequest& request,
+                                    RemoteIMSendCompletion completion) override;
+    void sendMachineApprovalResolved(const QString& peerId, const QString& text,
+                                     const RemoteIMApprovalDecision& resolution,
+                                     RemoteIMSendCompletion completion) override;
     void sendMachineText(const QString& peerId, const QString& text, RemoteIMSendCompletion completion) override;
     void sendMachineTextWithQuote(const QString& peerId, const QString& text,
                                   const RemoteIMQuote& quote, bool hasQuote,

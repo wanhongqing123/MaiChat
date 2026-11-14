@@ -10,6 +10,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSemaphore>
+#include <QScopeGuard>
 #include <QSettings>
 #include <QSignalSpy>
 #include <QStandardPaths>
@@ -21,6 +22,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <atomic>
+#include <thread>
 #include <algorithm>
 #include <memory>
 #include <mutex>
@@ -30,6 +32,7 @@
 #include "agent/DesktopSessionImBridge.h"
 #include "app/RemoteIMApplication.h"
 #include "im/RemoteIMClient.h"
+#include "MaiTool.h"
 #include "../../../MaiAgent/third_party/sqlite/sqlite3.h"
 
 namespace {
@@ -37,26 +40,32 @@ struct OwnedCoreWriteLock {
     sqlite3* database = nullptr;
     bool acquire(const QString& path) {
         const auto file = path.toUtf8();
-        return sqlite3_open_v2(file.constData(), &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, nullptr) == SQLITE_OK &&
-            sqlite3_exec(database, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK;
+        return sqlite3_open_v2(file.constData(), &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, nullptr) ==
+                   SQLITE_OK &&
+               sqlite3_exec(database, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK;
     }
     void release() {
         if (!database) return;
         sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
-        sqlite3_close_v2(database); database = nullptr;
+        sqlite3_close_v2(database);
+        database = nullptr;
     }
-    ~OwnedCoreWriteLock() { release(); }
+    ~OwnedCoreWriteLock() {
+        release();
+    }
 };
 qint64 ownedCoreCount(const QString& path, const char* sql) {
     sqlite3* database = nullptr;
     const auto filename = path.toUtf8();
-    if (sqlite3_open_v2(filename.constData(), &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr) != SQLITE_OK) {
+    if (sqlite3_open_v2(filename.constData(), &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr) !=
+        SQLITE_OK) {
         if (database) sqlite3_close_v2(database);
         return -1;
     }
     sqlite3_stmt* statement = nullptr;
     qint64 value = -1;
-    if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) == SQLITE_OK && sqlite3_step(statement) == SQLITE_ROW)
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_ROW)
         value = sqlite3_column_int64(statement, 0);
     if (statement) sqlite3_finalize(statement);
     sqlite3_close_v2(database);
@@ -66,13 +75,15 @@ qint64 ownedCoreCount(const QString& path, const char* sql) {
 QString ownedCoreText(const QString& path, const char* sql) {
     sqlite3* database = nullptr;
     const auto filename = path.toUtf8();
-    if (sqlite3_open_v2(filename.constData(), &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr) != SQLITE_OK) {
+    if (sqlite3_open_v2(filename.constData(), &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr) !=
+        SQLITE_OK) {
         if (database) sqlite3_close_v2(database);
         return {};
     }
     sqlite3_stmt* statement = nullptr;
     QString value;
-    if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) == SQLITE_OK && sqlite3_step(statement) == SQLITE_ROW) {
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_ROW) {
         const auto* bytes = reinterpret_cast<const char*>(sqlite3_column_text(statement, 0));
         value = QString::fromUtf8(bytes, sqlite3_column_bytes(statement, 0));
     }
@@ -91,6 +102,8 @@ public:
         QString path;
         RemoteIMQuote quote;
         bool hasQuote = false;
+        RemoteIMApprovalRequest approval;
+        RemoteIMApprovalDecision resolution;
     };
     QList<Sent> sent;
     RemoteDiagnostics::AccountTag account;
@@ -100,15 +113,21 @@ public:
     std::mutex rawPosting;
     std::atomic<quint64> rawSequence{0};
     quint64 rawGeneration = 0;
-    quint64 liveMetadataSequence() const override { return rawSequence.load(); }
+    quint64 liveMetadataSequence() const override {
+        return rawSequence.load();
+    }
     void withLiveMetadataBoundary(const std::function<void(LiveMetadataBoundary)>& publish) override {
         std::lock_guard<std::mutex> lock(rawPosting);
         publish({rawGeneration, rawSequence.load()});
     }
-    bool hasExplicitLiveReadiness() const override { return phasedLive; }
+    bool hasExplicitLiveReadiness() const override {
+        return phasedLive;
+    }
     bool deferDisconnect = false;
     RemoteIMCompletion deferredDisconnect;
-    RemoteDiagnostics::AccountTag currentAccount() const override { return account; }
+    RemoteDiagnostics::AccountTag currentAccount() const override {
+        return account;
+    }
     void connectToService(int app, const QString& owner, const QString&, RemoteIMCompletion done) override {
         ++rawGeneration;
         rawSequence = 0;
@@ -116,34 +135,52 @@ public:
         if (done) done(true, {});
     }
     void disconnectFromService(RemoteIMCompletion done) override {
-        if (deferDisconnect) { deferredDisconnect = std::move(done); return; }
+        if (deferDisconnect) {
+            deferredDisconnect = std::move(done);
+            return;
+        }
         account = {};
         emit disconnected();
         if (done) done(true, {});
     }
-    void deleteContact(const QString&, RemoteIMCompletion done) override { if (done) done(true, {}); }
+    void deleteContact(const QString&, RemoteIMCompletion done) override {
+        if (done) done(true, {});
+    }
     void sendText(const QString& peer, const QString& text, RemoteIMSendCompletion done) override {
         send(peer, text, RemoteIMMessageOrigin::Human, std::move(done));
     }
     void sendMachineText(const QString& peer, const QString& text, RemoteIMSendCompletion done) override {
         send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done));
     }
-    void sendMachineTextWithQuote(const QString& peer, const QString& text, const RemoteIMQuote& quote,
-                                  bool hasQuote, RemoteIMSendCompletion done) override {
+    void sendMachineTextWithQuote(const QString& peer, const QString& text, const RemoteIMQuote& quote, bool hasQuote,
+                                  RemoteIMSendCompletion done) override {
         send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done), QStringLiteral("text"), {}, quote, hasQuote);
     }
+    void sendMachineApprovalRequest(const QString& peer, const QString& text, const RemoteIMApprovalRequest& request,
+                                    RemoteIMSendCompletion done) override {
+        send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done), QStringLiteral("approval-request"));
+        sent.last().approval = request;
+    }
+    void sendMachineApprovalResolved(const QString& peer, const QString& text,
+                                     const RemoteIMApprovalDecision& resolution, RemoteIMSendCompletion done) override {
+        send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done), QStringLiteral("approval-resolved"));
+        sent.last().resolution = resolution;
+    }
     void sendMachineImageWithText(const QString& peer, const QString& path, const QString& text, bool,
-                                   const RemoteIMQuote& quote, bool hasQuote, RemoteIMSendCompletion done) override {
-        send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done), QStringLiteral("image"), path, quote, hasQuote);
+                                  const RemoteIMQuote& quote, bool hasQuote, RemoteIMSendCompletion done) override {
+        send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done), QStringLiteral("image"), path, quote,
+             hasQuote);
     }
     void sendMachineFileWithText(const QString& peer, const QString& path, const QString&, const QString& text, bool,
-                                  const RemoteIMQuote& quote, bool hasQuote, RemoteIMSendCompletion done) override {
-        send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done), QStringLiteral("file"), path, quote, hasQuote);
+                                 const RemoteIMQuote& quote, bool hasQuote, RemoteIMSendCompletion done) override {
+        send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done), QStringLiteral("file"), path, quote,
+             hasQuote);
     }
     void sendMachineVideoWithText(const QString& peer, const RemoteIMVideoPayload& video, const QString& text, bool,
-                                   const RemoteIMQuote& quote, bool hasQuote, RemoteIMSendCompletion done) override {
+                                  const RemoteIMQuote& quote, bool hasQuote, RemoteIMSendCompletion done) override {
         QVERIFY(video.isValid());
-        send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done), QStringLiteral("video"), video.videoPath, quote, hasQuote);
+        send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done), QStringLiteral("video"), video.videoPath,
+             quote, hasQuote);
     }
     void sendImage(const QString&, const QString&, RemoteIMSendCompletion done) override {
         if (done) done(false, QStringLiteral("owned unsupported image"), {});
@@ -159,8 +196,10 @@ public:
         message.toUserId = account.ownerUserId;
         message.text = std::move(text);
         message.origin = origin;
-        if (live) emit liveMessagesReceived({message});
-        else emit messagesReceived({message});
+        if (live)
+            emit liveMessagesReceived({message});
+        else
+            emit messagesReceived({message});
     }
     quint64 queueRaw(RemoteIMMessage message, bool ready) {
         phasedLive = true;
@@ -171,18 +210,25 @@ public:
         QTimer::singleShot(0, this, [this, message, ready, sequence, generation, owner] {
             if (generation != rawGeneration || owner != account) return;
             emit liveMessageAnnounced(10000 + sequence, message, sequence, generation);
-            if (ready) { emit liveMessageReady(10000 + sequence, message); emit liveMessagesReceived({message}); }
+            if (ready) {
+                emit liveMessageReady(10000 + sequence, message);
+                emit liveMessagesReceived({message});
+            }
             emit liveMetadataBatchFinished(sequence, true, generation);
         });
         return 10000 + sequence;
     }
+
 private:
     void send(const QString& peer, const QString& text, RemoteIMMessageOrigin origin, RemoteIMSendCompletion done,
-              const QString& kind = QStringLiteral("text"), const QString& path = {},
-              const RemoteIMQuote& quote = {}, bool hasQuote = false) {
+              const QString& kind = QStringLiteral("text"), const QString& path = {}, const RemoteIMQuote& quote = {},
+              bool hasQuote = false) {
         sent.append({peer, text, origin, kind, path, quote, hasQuote});
-        if (defer) { defer = false; deferred = std::move(done); }
-        else if (done) done(true, {}, {QStringLiteral("owned-receipt-%1").arg(sent.size()), 1000 + sent.size()});
+        if (defer) {
+            defer = false;
+            deferred = std::move(done);
+        } else if (done)
+            done(true, {}, {QStringLiteral("owned-receipt-%1").arg(sent.size()), 1000 + sent.size()});
     }
 };
 
@@ -191,8 +237,15 @@ struct ModelState {
     std::atomic<bool> blockFirst{false};
     std::atomic<bool> failFirst{false};
     std::atomic<bool> emptyReply{false};
+    std::atomic<bool> progressBeforeTool{false};
+    std::atomic<bool> failAfterProgress{false};
+    std::atomic<bool> permission{false};
+    std::atomic<int> approvedExecutions{0};
+    std::atomic<bool> toolExited{false};
     QSemaphore release;
     QSemaphore entered;
+    QSemaphore toolEntered;
+    QSemaphore toolRelease;
     std::mutex mutex;
     std::vector<MaiModelRequest> requests;
     QString mediaPath;
@@ -200,10 +253,36 @@ struct ModelState {
     QString observationPath;
 };
 
+// 自有无副作用工具将运行阶段固定住，让断言不依赖生产进度 API 或工具计时。
+class OwnedWaitTool final : public MaiTool {
+public:
+    explicit OwnedWaitTool(std::shared_ptr<ModelState> state) : state_(std::move(state)) {}
+    std::string name() const override {
+        return "owned_wait";
+    }
+    std::string description() const override {
+        return "Wait for the owned test release";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object","properties":{},"additionalProperties":false})";
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext&) override {
+        state_->toolEntered.release();
+        state_->toolRelease.acquire();
+        state_->toolExited = true;
+        return MaiToolResult::success("owned tool completed");
+    }
+
+private:
+    std::shared_ptr<ModelState> state_;
+};
+
 class OwnedModel final : public MaiModelClient {
 public:
     explicit OwnedModel(std::shared_ptr<ModelState> state) : state_(std::move(state)) {}
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                     const std::atomic<bool>& canceled) override {
         const int call = ++state_->calls;
@@ -214,7 +293,31 @@ public:
         state_->entered.release();
         if (call == 1 && state_->blockFirst) state_->release.tryAcquire(1, 5000);
         if (canceled) return {};
+        if (state_->permission && call == 1) {
+            if (sink.onToolCall) sink.onToolCall({"owned-permission", "owned_paid_action", "{}"});
+            return {};
+        }
         if (state_->emptyReply) return {};
+        if (state_->progressBeforeTool) {
+            if (sink.onReasoning) sink.onReasoning("private progress reasoning must stay local");
+            if (call == 1) {
+                if (sink.onText) sink.onText("owned public progress before tool");
+                if (sink.onToolCall) sink.onToolCall({"owned-wait-call", "owned_wait", "{}"});
+            } else {
+                if (state_->failAfterProgress) {
+                    if (sink.onText) sink.onText("UNCOMMITTED-TAIL");
+                    return {MaiErrorCode::Network, "owned response failed"};
+                }
+                std::string latestUser;
+                for (auto item = request.messages.rbegin(); item != request.messages.rend(); ++item)
+                    if (item->role == MaiModelRole::User) {
+                        latestUser = item->content;
+                        break;
+                    }
+                if (sink.onText) sink.onText("owned final: " + latestUser);
+            }
+            return {};
+        }
         if (call == 1 && (!state_->mediaPath.isEmpty() || !state_->observationPath.isEmpty())) {
             QJsonObject input;
             QString tool;
@@ -233,11 +336,41 @@ public:
             return {};
         }
         if (sink.onReasoning) sink.onReasoning("private reasoning must stay local");
-        if (sink.onText) sink.onText(!state_->mediaPath.isEmpty() || !state_->observationPath.isEmpty()
-                                        ? "owned completed response" : "reply: " + request.messages.back().content);
+        if (sink.onText)
+            sink.onText(!state_->mediaPath.isEmpty() || !state_->observationPath.isEmpty()
+                            ? "owned completed response"
+                            : "reply: " + request.messages.back().content);
         if (call == 1 && state_->failFirst) return {MaiErrorCode::Network, "owned private failure detail"};
         return {};
     }
+
+private:
+    std::shared_ptr<ModelState> state_;
+};
+
+class OwnedApprovalTool final : public MaiTool {
+public:
+    explicit OwnedApprovalTool(std::shared_ptr<ModelState> state) : state_(std::move(state)) {}
+    std::string name() const override {
+        return "owned_paid_action";
+    }
+    std::string description() const override {
+        return "An offline action guarded by real per-call approval";
+    }
+    std::string parametersSchema() const override {
+        return R"({"type":"object","properties":{}})";
+    }
+    bool requiresApproval(const std::string&) const override {
+        return true;
+    }
+    bool requiresPaidApproval(const std::string&) const override {
+        return true;
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext&) override {
+        ++state_->approvedExecutions;
+        return MaiToolResult::success("owned approved action");
+    }
+
 private:
     std::shared_ptr<ModelState> state_;
 };
@@ -249,9 +382,15 @@ struct Fixture {
     std::shared_ptr<ModelState> model = std::make_shared<ModelState>();
     OwnedIm* im = new OwnedIm;
     LocalMessageDatabase* history = new LocalMessageDatabase(historyDirectory.filePath(QStringLiteral("owned-im.db")));
-    RemoteIMApplication app{QStringLiteral("owner"), std::unique_ptr<RemoteIMClient>(im), std::unique_ptr<LocalMessageDatabase>(history)};
-    AgentController controller{std::make_unique<OwnedModel>(model), sqliteCore ?
-        historyDirectory.filePath(QStringLiteral("owned-session-core.db")) : QString()};
+    RemoteIMApplication app{QStringLiteral("owner"), std::unique_ptr<RemoteIMClient>(im),
+                            std::unique_ptr<LocalMessageDatabase>(history)};
+    AgentController controller{
+        std::make_unique<OwnedModel>(model),
+        sqliteCore ? historyDirectory.filePath(QStringLiteral("owned-session-core.db")) : QString(),
+        [state = model](MaiToolRegistry& registry) {
+            registry.add(std::make_unique<OwnedWaitTool>(state));
+            registry.add(std::make_unique<OwnedApprovalTool>(state));
+        }};
     DesktopSessionImBridge bridge{app, controller};
     QString session;
     explicit Fixture(bool useSqliteCore = false) : sqliteCore(useSqliteCore) {
@@ -273,9 +412,14 @@ struct Fixture {
     bool bind(const QString& peer, const QString& target, QString* error = nullptr) {
         if (!bridge.bind(peer, target, error)) return false;
         if (controller.agent().isBusy(target.toStdString())) return true;
-        return QTest::qWaitFor([&] { return bridge.boundSession(peer) == target && !bridge.historyPending(peer); }, 10000);
+        return QTest::qWaitFor([&] { return bridge.boundSession(peer) == target && !bridge.historyPending(peer); },
+                               10000);
     }
-    ~Fixture() { model->release.release(); }
+    ~Fixture() {
+        model->release.release();
+        model->toolRelease.release();
+        if (!session.isEmpty()) controller.agent().submit(MaiInterrupt{session.toStdString()});
+    }
 };
 
 class OwnedPoolBlocker {
@@ -287,8 +431,12 @@ public:
             state->released.acquire();
         });
     }
-    ~OwnedPoolBlocker() { release(); }
-    bool entered() { return state_->entered.tryAcquire(1, 1000); }
+    ~OwnedPoolBlocker() {
+        release();
+    }
+    bool entered() {
+        return state_->entered.tryAcquire(1, 1000);
+    }
     void release() {
         if (released_) return;
         released_ = true;
@@ -296,8 +444,12 @@ public:
         pool_->setMaxThreadCount(previousMax_);
         future_.waitForFinished();  // Only this test's released blocker, never the pool.
     }
+
 private:
-    struct State { QSemaphore entered; QSemaphore released; };
+    struct State {
+        QSemaphore entered;
+        QSemaphore released;
+    };
     QThreadPool* pool_;
     int previousMax_;
     bool released_ = false;
@@ -317,6 +469,16 @@ private slots:
     void logoutBeginningRejectsInputBeforeSdkDisconnectCompletes();
     void bindingIsExplicitAndExclusive();
     void liveHumanMessageRepliesOnlyToItsOriginalPeer();
+    void committedProgressArrivesBeforeToolFinishesWithoutLosingQueuedInput();
+    void committedStageSurvivesLaterNetworkFailureButNotItsPartialTail();
+    void permissionCardsUseExactOwnedControlAndRejectOrdinaryA();
+    void revokedPermissionOnlyClearsItsOriginalPublicToken();
+    void successfulStopRevokesUndispatchedCommittedText_data();
+    void successfulStopRevokesUndispatchedCommittedText();
+    void concurrentWorkspaceChangeDuringOwnedFollowupPreparationStoresNoUser();
+    void approvalResolutionSurvivesLaterErrorWithoutLeakingPartialTail();
+    void workerStopFailuresShareCoherentErrorSnapshotsWithGuiValidation_data();
+    void workerStopFailuresShareCoherentErrorSnapshotsWithGuiValidation();
     void cachedImageVideoAndFileUseExistingSessionInputs_data();
     void cachedImageVideoAndFileUseExistingSessionInputs();
     void explicitOwnedMediaUsesMachineDelivery_data();
@@ -350,6 +512,7 @@ private slots:
     void partialHistoryFailureNeverPublishesStagedRows_data();
     void metadataFailureBeforeFenceCaptureAbortsBootstrap();
     void reopenedStartupProjectionReclaimsAbandonedContextPayload();
+
 private:
     QString previousOrganization_, previousApplication_;
     QSettings::Format previousFormat_ = QSettings::NativeFormat;
@@ -383,7 +546,10 @@ void DesktopSessionImBridgeTest::machineSendUsesMachineOriginAndRejectsLateAccou
     int callbacks = 0;
     bool delivered = true;
     QVERIFY(f.app.sendMachineTextTo(QStringLiteral("friend"), QStringLiteral("owned response"),
-        [&](bool ok, const QString&, const RemoteIMSendReceipt&) { ++callbacks; delivered = ok; }));
+                                    [&](bool ok, const QString&, const RemoteIMSendReceipt&) {
+                                        ++callbacks;
+                                        delivered = ok;
+                                    }));
     QCOMPARE(f.im->sent.size(), 1);
     QCOMPARE(f.im->sent.first().origin, RemoteIMMessageOrigin::Machine);
     QCOMPARE(f.app.chatState().messagesWith(QStringLiteral("friend")).last().origin, RemoteIMMessageOrigin::Machine);
@@ -403,8 +569,12 @@ void DesktopSessionImBridgeTest::machineSendRevocationLeavesNoPendingRow() {
     connect(&f.app, &RemoteIMApplication::stateChanged, &f.app, [&] { allowed = false; });
     bool delivered = true;
     int completed = 0;
-    QVERIFY(!f.app.sendMachineTextTo(QStringLiteral("friend"), QStringLiteral("revoked before dispatch"),
-        [&](bool ok, const QString&, const RemoteIMSendReceipt&) { delivered = ok; ++completed; },
+    QVERIFY(!f.app.sendMachineTextTo(
+        QStringLiteral("friend"), QStringLiteral("revoked before dispatch"),
+        [&](bool ok, const QString&, const RemoteIMSendReceipt&) {
+            delivered = ok;
+            ++completed;
+        },
         [&] { return allowed; }));
     QCOMPARE(completed, 1);
     QVERIFY(!delivered);
@@ -468,10 +638,351 @@ void DesktopSessionImBridgeTest::liveHumanMessageRepliesOnlyToItsOriginalPeer() 
     QCOMPARE(f.im->sent.first().peer, QStringLiteral("friend"));
     QCOMPARE(f.im->sent.first().origin, RemoteIMMessageOrigin::Machine);
     QCOMPARE(f.im->sent.first().text, QStringLiteral("reply: owned task"));
-    QVERIFY(f.im->sent.first().hasQuote);
-    QCOMPARE(f.im->sent.first().quote.digest, QStringLiteral("owned task"));
+    // 自动绑定回复不替用户创建引用；输入身份和去重断言仍保留原 SDK 来源。
+    QVERIFY(!f.im->sent.first().hasQuote);
+    QVERIFY(f.im->sent.first().quote.msgId.isEmpty());
+    QVERIFY(f.im->sent.first().quote.digest.isEmpty());
     QVERIFY(!f.im->sent.first().text.contains(QStringLiteral("private reasoning")));
     QCOMPARE(f.app.chatState().selectedPeerId(), QStringLiteral("other"));
+}
+
+void DesktopSessionImBridgeTest::committedProgressArrivesBeforeToolFinishesWithoutLosingQueuedInput() {
+    Fixture f;
+    const auto release = qScopeGuard([&] { f.model->toolRelease.release(); });
+    f.model->progressBeforeTool = true;
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    f.im->incoming(QStringLiteral("owned-progress-source"), QStringLiteral("owned first input"));
+    QTRY_VERIFY_WITH_TIMEOUT(f.model->toolEntered.available() > 0, 3000);
+    QVERIFY(f.controller.agent().isBusy(f.session.toStdString()));
+    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 1, 3000);
+    QCOMPARE(f.im->sent.first().text, QStringLiteral("owned public progress before tool"));
+    QVERIFY(!f.im->sent.first().hasQuote);
+    QVERIFY(!f.model->toolExited.load());
+
+    // 阶段文字的 SDK 派发确认不能结束当前输入，后来的准确输入仍须被核心消费。
+    f.im->incoming(QStringLiteral("owned-followup-source"), QStringLiteral("owned followup input"));
+    QCOMPARE(f.model->calls.load(), 1);
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
+    f.model->toolRelease.release();
+    QTRY_VERIFY_WITH_TIMEOUT(
+        std::any_of(f.im->sent.cbegin(), f.im->sent.cend(),
+                    [](const auto& sent) { return sent.text.contains(QStringLiteral("owned followup input")); }),
+        5000);
+    QTRY_VERIFY_WITH_TIMEOUT(!f.controller.agent().isBusy(f.session.toStdString()), 5000);
+    int progressCount = 0;
+    int followupCount = 0;
+    for (const auto& sent : f.im->sent) {
+        progressCount += sent.text.contains(QStringLiteral("owned public progress before tool"));
+        followupCount += sent.text.contains(QStringLiteral("owned followup input"));
+        QVERIFY(!sent.text.contains(QStringLiteral("private progress reasoning")));
+        QCOMPARE(sent.peer, QStringLiteral("friend"));
+        QCOMPARE(sent.origin, RemoteIMMessageOrigin::Machine);
+        QVERIFY(!sent.hasQuote);
+    }
+    QCOMPARE(progressCount, 1);
+    QCOMPARE(followupCount, 1);
+}
+
+void DesktopSessionImBridgeTest::committedStageSurvivesLaterNetworkFailureButNotItsPartialTail() {
+    Fixture f;
+    const auto release = qScopeGuard([&] { f.model->toolRelease.release(); });
+    f.model->progressBeforeTool = true;
+    f.model->failAfterProgress = true;
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    QSignalSpy errors(&f.bridge, &DesktopSessionImBridge::relayError);
+    f.im->incoming(QStringLiteral("owned-stage-then-error"), QStringLiteral("work then fail"));
+    // No Qt delivery pump until both responses have finished. Only the first
+    // complete committed response remains authorized after the later error.
+    QVERIFY(f.model->toolEntered.tryAcquire(1, 3000));
+    f.model->toolRelease.release();
+    f.controller.agent().waitIdle();
+    QTRY_COMPARE(f.im->sent.size(), 1);
+    QCOMPARE(f.im->sent.first().text, QStringLiteral("owned public progress before tool"));
+    QVERIFY(!f.im->sent.first().hasQuote);
+    QTRY_VERIFY(!errors.isEmpty());
+    QTest::qWait(20);
+    QCOMPARE(f.im->sent.size(), 1);
+    for (const auto& message : f.im->sent) {
+        QVERIFY(!message.text.contains(QStringLiteral("UNCOMMITTED-TAIL")));
+        QVERIFY(!message.text.contains(QStringLiteral("private progress reasoning")));
+    }
+}
+
+void DesktopSessionImBridgeTest::permissionCardsUseExactOwnedControlAndRejectOrdinaryA() {
+    Fixture f;
+    f.model->permission = true;
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    f.im->incoming(QStringLiteral("owned-approval-source"), QStringLiteral("ask permission"));
+    QTRY_COMPARE(f.im->sent.size(), 1);
+    const auto request = f.im->sent.first();
+    QCOMPARE(request.kind, QStringLiteral("approval-request"));
+    QVERIFY(request.approval.isValid());
+    QCOMPARE(request.approval.actions,
+             QList<RemoteIMApprovalAction>({RemoteIMApprovalAction::ApproveOnce, RemoteIMApprovalAction::Reject}));
+    QVERIFY(!request.text.contains(QStringLiteral("per_")));
+    QVERIFY(!request.hasQuote);
+    auto decision = [&](const QString& id, RemoteIMApprovalAction action,
+                        const QString& peer = QStringLiteral("friend")) {
+        RemoteIMMessage message;
+        message.id = id;
+        message.fromUserId = peer;
+        message.toUserId = QStringLiteral("owner");
+        message.origin = RemoteIMMessageOrigin::Human;
+        message.hasApprovalDecision = true;
+        message.approvalDecision = {request.approval.token, action};
+        emit f.im->liveMessagesReceived({message});
+    };
+    decision(QStringLiteral("owned-wrong-peer"), RemoteIMApprovalAction::ApproveOnce, QStringLiteral("other"));
+    decision(QStringLiteral("owned-bad-prefix"), RemoteIMApprovalAction::ApprovePrefix);
+    f.im->incoming(QStringLiteral("owned-A-is-not-approval"), QStringLiteral("A"));
+    QCOMPARE(f.model->approvedExecutions.load(), 0);
+    QCOMPARE(f.controller.agent().listPendingPermissions().size(), std::size_t(1));
+    decision(QStringLiteral("owned-valid-decision"), RemoteIMApprovalAction::ApproveOnce);
+    QTRY_VERIFY(!f.controller.agent().isBusy(f.session.toStdString()));
+    QTRY_VERIFY(f.im->sent.size() >= 3);
+    int resolved = 0, finals = 0;
+    for (const auto& sent : f.im->sent) {
+        QCOMPARE(sent.peer, QStringLiteral("friend"));
+        QVERIFY(!sent.hasQuote);
+        if (sent.kind == QStringLiteral("approval-resolved")) {
+            QCOMPARE(sent.resolution.token, request.approval.token);
+            ++resolved;
+        } else if (sent.kind == QStringLiteral("text")) {
+            QCOMPARE(sent.text, QStringLiteral("reply: A"));
+            ++finals;
+        }
+    }
+    QCOMPARE(resolved, 1);
+    QCOMPARE(finals, 1);
+    QCOMPARE(f.model->calls.load(), 2);
+    decision(QStringLiteral("owned-replayed-decision"), RemoteIMApprovalAction::ApproveOnce);
+    QTest::qWait(20);
+    QCOMPARE(f.im->sent.size(), 3);
+}
+
+void DesktopSessionImBridgeTest::revokedPermissionOnlyClearsItsOriginalPublicToken() {
+    Fixture f;
+    f.model->permission = true;
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    f.im->incoming(QStringLiteral("owned-revoked-approval"), QStringLiteral("ask permission"));
+    QTRY_COMPARE(f.im->sent.size(), 1);
+    const auto token = f.im->sent.first().approval.token;
+    QVERIFY(!token.isEmpty());
+    f.bridge.unbind(QStringLiteral("friend"));
+    QTRY_COMPARE(f.im->sent.size(), 2);
+    QCOMPARE(f.im->sent.last().kind, QStringLiteral("approval-resolved"));
+    QCOMPARE(f.im->sent.last().resolution.token, token);
+    RemoteIMMessage decision;
+    decision.id = QStringLiteral("owned-revoked-decision");
+    decision.fromUserId = QStringLiteral("friend");
+    decision.toUserId = QStringLiteral("owner");
+    decision.origin = RemoteIMMessageOrigin::Human;
+    decision.hasApprovalDecision = true;
+    decision.approvalDecision = {token, RemoteIMApprovalAction::ApproveOnce};
+    emit f.im->liveMessagesReceived({decision});
+    QCOMPARE(f.model->approvedExecutions.load(), 0);
+    QCOMPARE(f.controller.agent().listPendingPermissions().size(), std::size_t(1));
+}
+
+void DesktopSessionImBridgeTest::successfulStopRevokesUndispatchedCommittedText_data() {
+    QTest::addColumn<bool>("fromWorker");
+    QTest::newRow("ordinary-GUI-controller") << false;
+    QTest::newRow("ordinary-worker-controller") << true;
+}
+
+void DesktopSessionImBridgeTest::successfulStopRevokesUndispatchedCommittedText() {
+    QFETCH(bool, fromWorker);
+    Fixture f;
+    const auto release = qScopeGuard([&] { f.model->toolRelease.release(); });
+    f.model->progressBeforeTool = true;
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    f.im->incoming(QStringLiteral("owned-stop-before-dispatch"), QStringLiteral("work until stopped"));
+    QVERIFY(f.model->toolEntered.tryAcquire(1, 3000));
+    const auto turn = QString::fromStdString(f.controller.agent().activeTurnId(f.session.toStdString()));
+    QVERIFY(!turn.isEmpty());
+    QVERIFY(f.im->sent.isEmpty());
+    QSignalSpy interrupted(&f.controller, &AgentController::turnInterrupted);
+    QVERIFY(!f.controller.interrupt(f.session, turn + QStringLiteral("-stale")));
+    QCOMPARE(interrupted.count(), 0);
+    QVERIFY(f.im->sent.isEmpty());
+    if (fromWorker) {
+        // A native thread join keeps the GUI pump stopped. Some task/future
+        // wait implementations may dispatch Windows STA work while waiting.
+        bool stopped = false;
+        std::thread worker([&] { stopped = f.controller.interrupt(f.session, turn); });
+        worker.join();
+        QVERIFY(stopped);
+    } else
+        QVERIFY(f.controller.interrupt(f.session, turn));
+    QCOMPARE(interrupted.count(), 1);
+    QCOMPARE(interrupted.first().at(0).toString(), f.session);
+    QCOMPARE(interrupted.first().at(1).toString(), turn);
+    QVERIFY(f.im->sent.isEmpty());
+    // The committed-text GUI event predates queued Stop cleanup. Direct exact
+    // ownership revocation must reject its final SDK permit before that event.
+    f.model->toolRelease.release();
+    QTRY_VERIFY(!f.controller.agent().isBusy(f.session.toStdString()));
+    QTRY_VERIFY(f.bridge.boundSession(QStringLiteral("friend")).isEmpty());
+    QTest::qWait(20);
+    QVERIFY(f.im->sent.isEmpty());
+}
+
+void DesktopSessionImBridgeTest::concurrentWorkspaceChangeDuringOwnedFollowupPreparationStoresNoUser() {
+    Fixture f;
+    const auto release = qScopeGuard([&] { f.model->toolRelease.release(); });
+    f.model->progressBeforeTool = true;
+    QTemporaryDir cache;
+    QTemporaryDir replacement;
+    const auto path = cache.filePath(QStringLiteral("owned-followup.txt"));
+    {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write("owned input"), qint64(11));
+    }
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    f.incomingFile(QStringLiteral("owned-initial-before-workspace-race"), path);
+    QTRY_VERIFY(f.model->toolEntered.available() > 0);
+    QTRY_VERIFY(f.bridge.findChildren<QObject*>(QStringLiteral("sessionImAttachmentPreparation")).isEmpty());
+    auto* pool = qobject_cast<QThreadPool*>(qApp->property("sessionImAttachmentPreparationPool").value<QObject*>());
+    QVERIFY(pool);
+    OwnedPoolBlocker held(pool);
+    QVERIFY(held.entered());
+    f.incomingFile(QStringLiteral("owned-followup-must-not-cross-directory"), path);
+    QVERIFY(f.bridge.findChild<QObject*>(QStringLiteral("sessionImAttachmentPreparation")));
+    bool changed = false;
+    std::thread updater([&] {
+        changed = bool(f.controller.agent().submit(
+            MaiUpdateSession{f.session.toStdString(), "", "", "", replacement.path().toStdString()}));
+    });
+    updater.join();
+    QVERIFY(changed);
+    held.release();
+    QTRY_VERIFY(f.bridge.boundSession(QStringLiteral("friend")).isEmpty());
+    QTRY_VERIFY(f.bridge.findChildren<QObject*>(QStringLiteral("sessionImAttachmentPreparation")).isEmpty());
+    std::size_t users = 0;
+    for (const auto& message : f.controller.agent().listMessages(f.session.toStdString()))
+        if (message.role == MaiRole::User) ++users;
+    QCOMPARE(users, std::size_t(1));
+    QCOMPARE(f.model->calls.load(), 1);
+    // 宿主例覆盖真实准备窗口；Core CAS 例另外覆盖最终 check 到 store 的同锁边界。
+    f.model->toolRelease.release();
+    QTRY_VERIFY(!f.controller.agent().isBusy(f.session.toStdString()));
+}
+
+void DesktopSessionImBridgeTest::approvalResolutionSurvivesLaterErrorWithoutLeakingPartialTail() {
+    Fixture f;
+    f.model->permission = true;
+    f.model->progressBeforeTool = true;
+    f.model->failAfterProgress = true;
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    QSignalSpy errors(&f.bridge, &DesktopSessionImBridge::relayError);
+    f.im->incoming(QStringLiteral("owned-approval-before-error"), QStringLiteral("ask then fail"));
+    QTRY_COMPARE(f.im->sent.size(), 1);
+    const auto request = f.im->sent.first();
+    QCOMPARE(request.kind, QStringLiteral("approval-request"));
+    QVERIFY(request.approval.isValid());
+    RemoteIMMessage decision;
+    decision.id = QStringLiteral("owned-approve-before-later-error");
+    decision.fromUserId = QStringLiteral("friend");
+    decision.toUserId = QStringLiteral("owner");
+    decision.origin = RemoteIMMessageOrigin::Human;
+    decision.hasApprovalDecision = true;
+    decision.approvalDecision = {request.approval.token, RemoteIMApprovalAction::ApproveOnce};
+    emit f.im->liveMessagesReceived({decision});
+    // Hold queued Qt permission resolution until the real second response has
+    // emitted partial text and failed. The card must still clear exactly once.
+    f.controller.agent().waitIdle();
+    QCOMPARE(f.model->calls.load(), 2);
+    QCOMPARE(f.model->approvedExecutions.load(), 1);
+    QCOMPARE(f.im->sent.size(), 1);
+    QTRY_COMPARE(f.im->sent.size(), 2);
+    QCOMPARE(f.im->sent.last().kind, QStringLiteral("approval-resolved"));
+    QCOMPARE(f.im->sent.last().resolution.token, request.approval.token);
+    QTRY_VERIFY(!errors.isEmpty());
+    QTest::qWait(20);
+    QCOMPARE(f.im->sent.size(), 2);
+    for (const auto& sent : f.im->sent) {
+        QVERIFY(!sent.text.contains(QStringLiteral("UNCOMMITTED-TAIL")));
+        QVERIFY(!sent.text.contains(QStringLiteral("private progress reasoning")));
+        QVERIFY(sent.path.isEmpty());
+        QVERIFY(!sent.hasQuote);
+    }
+}
+
+void DesktopSessionImBridgeTest::workerStopFailuresShareCoherentErrorSnapshotsWithGuiValidation_data() {
+    QTest::addColumn<bool>("hasActiveTurn");
+    QTest::newRow("worker-stale-turn") << true;
+    QTest::newRow("worker-no-active-turn") << false;
+}
+
+void DesktopSessionImBridgeTest::workerStopFailuresShareCoherentErrorSnapshotsWithGuiValidation() {
+    QFETCH(bool, hasActiveTurn);
+    Fixture f;
+    const auto release = qScopeGuard([&] { f.model->toolRelease.release(); });
+    QString turn;
+    if (hasActiveTurn) {
+        f.model->progressBeforeTool = true;
+        QVERIFY(f.controller.agent().submit(MaiSendPrompt{f.session.toStdString(), "owned error snapshot turn"}));
+        QVERIFY(f.model->toolEntered.tryAcquire(1, 3000));
+        turn = QString::fromStdString(f.controller.agent().activeTurnId(f.session.toStdString()));
+        QVERIFY(!turn.isEmpty());
+    }
+    const auto stale = hasActiveTurn ? turn + QStringLiteral("-stale") : QString();
+    QVERIFY(!f.controller.interrupt(f.session, stale));
+    const QString workerError = f.controller.lastError();
+    QVERIFY(!workerError.isEmpty());
+    QVERIFY(!f.controller.setDefaultModel(QString()));
+    const QString guiError = f.controller.lastError();
+    QVERIFY(!guiError.isEmpty() && guiError != workerError);
+    QVERIFY(f.controller.setDefaultModel(QStringLiteral("owned-model")));
+    QVERIFY(f.controller.lastError().isEmpty());
+    const QStringList acceptedSnapshots{QString(), workerError, guiError};
+    std::atomic<bool> start{false};
+    bool workerStoppedUnexpectedly = false;
+    bool workerSawInvalidSnapshot = false;
+    std::thread worker([&] {
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        for (int iteration = 0; iteration < 2048; ++iteration) {
+            if (f.controller.interrupt(f.session, stale)) workerStoppedUnexpectedly = true;
+            if (!acceptedSnapshots.contains(f.controller.lastError())) workerSawInvalidSnapshot = true;
+            if (iteration % 16 == 0) std::this_thread::yield();
+        }
+    });
+    start.store(true, std::memory_order_release);
+    bool guiValidationChanged = false;
+    bool guiSawInvalidSnapshot = false;
+    // Assert only after join: a failed GUI assertion must never destroy a
+    // joinable worker or skip release of the owned tool gate.
+    for (int iteration = 0; iteration < 2048; ++iteration) {
+        if (f.controller.setDefaultModel(QString())) guiValidationChanged = true;
+        if (!acceptedSnapshots.contains(f.controller.lastError())) guiSawInvalidSnapshot = true;
+        if (!f.controller.setDefaultModel(QStringLiteral("owned-model"))) guiValidationChanged = true;
+        if (!acceptedSnapshots.contains(f.controller.lastError())) guiSawInvalidSnapshot = true;
+    }
+    worker.join();
+    QVERIFY(!workerStoppedUnexpectedly && !workerSawInvalidSnapshot);
+    QVERIFY(!guiValidationChanged && !guiSawInvalidSnapshot);
+    // An already returned value remains valid while the shared diagnostic is replaced.
+    QVERIFY(!f.controller.setDefaultModel(QString()));
+    const auto retained = f.controller.lastError();
+    QVERIFY(f.controller.setDefaultModel(QStringLiteral("owned-model")));
+    QCOMPARE(retained, guiError);
+    QVERIFY(f.controller.lastError().isEmpty());
+    if (hasActiveTurn) {
+        QSignalSpy interrupted(&f.controller, &AgentController::turnInterrupted);
+        QVERIFY(f.controller.interrupt(f.session, turn));
+        QCOMPARE(interrupted.count(), 1);
+        QCOMPARE(interrupted.first().at(1).toString(), turn);
+        f.model->toolRelease.release();
+        QTRY_VERIFY(!f.controller.agent().isBusy(f.session.toStdString()));
+    }
 }
 
 void DesktopSessionImBridgeTest::cachedImageVideoAndFileUseExistingSessionInputs_data() {
@@ -487,8 +998,9 @@ void DesktopSessionImBridgeTest::cachedImageVideoAndFileUseExistingSessionInputs
     Fixture f;
     QTRY_VERIFY(f.app.connectionReady());
     QTemporaryDir cache;
-    const QString path = cache.filePath(kind == QStringLiteral("image") ? QStringLiteral("owned.png") :
-        kind == QStringLiteral("video") ? QStringLiteral("owned.mp4") : QStringLiteral("owned.txt"));
+    const QString path = cache.filePath(kind == QStringLiteral("image")   ? QStringLiteral("owned.png")
+                                        : kind == QStringLiteral("video") ? QStringLiteral("owned.mp4")
+                                                                          : QStringLiteral("owned.txt"));
     if (kind == QStringLiteral("image")) {
         QImage image(24, 18, QImage::Format_RGB32);
         image.fill(Qt::cyan);
@@ -509,10 +1021,20 @@ void DesktopSessionImBridgeTest::cachedImageVideoAndFileUseExistingSessionInputs
     incoming.text = QStringLiteral("inspect owned attachment");
     incoming.hasQuote = true;
     incoming.quote = {{}, QStringLiteral("friend"), QStringLiteral("owned quoted context"), QStringLiteral("text")};
-    if (kind == QStringLiteral("image")) { incoming.hasImage = true; incoming.image.localPath = path; }
-    else if (kind == QStringLiteral("video")) { incoming.hasVideo = true; incoming.video.localPath = path; }
-    else if (kind == QStringLiteral("audio")) { incoming.hasVoice = true; incoming.voice.localPath = path; }
-    else { incoming.hasFile = true; incoming.file.localPath = path; incoming.file.fileName = QStringLiteral("owned.txt"); }
+    if (kind == QStringLiteral("image")) {
+        incoming.hasImage = true;
+        incoming.image.localPath = path;
+    } else if (kind == QStringLiteral("video")) {
+        incoming.hasVideo = true;
+        incoming.video.localPath = path;
+    } else if (kind == QStringLiteral("audio")) {
+        incoming.hasVoice = true;
+        incoming.voice.localPath = path;
+    } else {
+        incoming.hasFile = true;
+        incoming.file.localPath = path;
+        incoming.file.fileName = QStringLiteral("owned.txt");
+    }
     emit f.im->liveMessagesReceived({incoming});
     QTRY_COMPARE(f.im->sent.size(), 1);
     MaiModelRequest request;
@@ -526,20 +1048,22 @@ void DesktopSessionImBridgeTest::cachedImageVideoAndFileUseExistingSessionInputs
     if (kind == QStringLiteral("image")) {
         QCOMPARE(input.images.size(), std::size_t(1));
         const QString staged = QString::fromStdString(input.images.front().path);
-        QVERIFY(QFileInfo(staged).canonicalFilePath().startsWith(
-            QFileInfo(f.workspace.path()).canonicalFilePath() + QLatin1Char('/')));
+        QVERIFY(QFileInfo(staged).canonicalFilePath().startsWith(QFileInfo(f.workspace.path()).canonicalFilePath() +
+                                                                 QLatin1Char('/')));
         QVERIFY(QFileInfo(staged).isFile());
         QVERIFY(staged != path);
     } else if (kind == QStringLiteral("video")) {
-        QVERIFY(QString::fromStdString(input.content).contains(QStringLiteral("Attached video in the Agent workspace:")));
+        QVERIFY(
+            QString::fromStdString(input.content).contains(QStringLiteral("Attached video in the Agent workspace:")));
         bool found = false;
         for (const auto& message : f.controller.agent().listMessages(f.session.toStdString())) {
             if (message.role != MaiRole::User) continue;
             for (const auto& part : message.parts)
                 if (const auto* video = std::get_if<MaiVideoPart>(&part.body)) {
                     found = true;
-                    QVERIFY(QFileInfo(QString::fromStdString(video->path)).canonicalFilePath().startsWith(
-                        QFileInfo(f.workspace.path()).canonicalFilePath() + QLatin1Char('/')));
+                    QVERIFY(QFileInfo(QString::fromStdString(video->path))
+                                .canonicalFilePath()
+                                .startsWith(QFileInfo(f.workspace.path()).canonicalFilePath() + QLatin1Char('/')));
                     QVERIFY(QFileInfo(QString::fromStdString(video->path)).isFile());
                 }
         }
@@ -562,18 +1086,21 @@ void DesktopSessionImBridgeTest::explicitOwnedMediaUsesMachineDelivery() {
     QFETCH(QString, kind);
     Fixture f;
     QTRY_VERIFY(f.app.connectionReady());
-    const QString name = kind == QStringLiteral("image") ? QStringLiteral("delivered.png") :
-        kind == QStringLiteral("video") ? QStringLiteral("delivered.mp4") : QStringLiteral("delivered.wav");
+    const QString name = kind == QStringLiteral("image")   ? QStringLiteral("delivered.png")
+                         : kind == QStringLiteral("video") ? QStringLiteral("delivered.mp4")
+                                                           : QStringLiteral("delivered.wav");
     const QString path = f.workspace.filePath(name);
     if (kind == QStringLiteral("image")) {
-        QImage image(24, 18, QImage::Format_RGB32); image.fill(Qt::green);
+        QImage image(24, 18, QImage::Format_RGB32);
+        image.fill(Qt::green);
         QVERIFY(image.save(path, "PNG"));
     } else if (kind == QStringLiteral("video")) {
         QVERIFY(QFile::copy(QString::fromUtf8(MAICHAT_SESSION_IM_VIDEO_FIXTURE), path));
     } else {
         QFile file(path);
         QVERIFY(file.open(QIODevice::WriteOnly));
-        const QByteArray wave = QByteArray::fromHex("524946462c00000057415645666d74201000000001000100401f0000803e00000200100064617461080000000000000000000000");
+        const QByteArray wave = QByteArray::fromHex(
+            "524946462c00000057415645666d74201000000001000100401f0000803e00000200100064617461080000000000000000000000");
         QCOMPARE(file.write(wave), qint64(wave.size()));
     }
     f.model->mediaPath = name;
@@ -585,15 +1112,20 @@ void DesktopSessionImBridgeTest::explicitOwnedMediaUsesMachineDelivery() {
     QCOMPARE(f.im->sent.last().origin, RemoteIMMessageOrigin::Machine);
     QCOMPARE(f.im->sent.last().text, QStringLiteral("owned media caption"));
     QCOMPARE(QFileInfo(f.im->sent.last().path).canonicalFilePath(), QFileInfo(path).canonicalFilePath());
-    QVERIFY(f.im->sent.last().hasQuote);
-    QCOMPARE(f.im->sent.last().quote.msgId, QStringLiteral("owned-delivery-source"));
+    // 正文和媒体都属于普通自动交付，不应把任务来源强制变成聊天引用块。
+    for (const auto& sent : f.im->sent) {
+        QVERIFY(!sent.hasQuote);
+        QVERIFY(sent.quote.msgId.isEmpty());
+        QVERIFY(sent.quote.digest.isEmpty());
+    }
 }
 
 void DesktopSessionImBridgeTest::toolObservationImageIsNeverAutomaticallyDelivered() {
     Fixture f;
     QTRY_VERIFY(f.app.connectionReady());
     const QString path = f.workspace.filePath(QStringLiteral("private-observation.png"));
-    QImage image(24, 18, QImage::Format_RGB32); image.fill(Qt::red);
+    QImage image(24, 18, QImage::Format_RGB32);
+    image.fill(Qt::red);
     QVERIFY(image.save(path, "PNG"));
     QVERIFY(f.controller.setModel(f.session, QStringLiteral("glm-5.3-flash")));
     f.model->observationPath = path;
@@ -606,8 +1138,7 @@ void DesktopSessionImBridgeTest::toolObservationImageIsNeverAutomaticallyDeliver
     bool hasObservation = false;
     for (const auto& message : f.controller.agent().listMessages(f.session.toStdString()))
         if (message.role == MaiRole::Assistant)
-            for (const auto& part : message.parts)
-                hasObservation |= std::holds_alternative<MaiImagePart>(part.body);
+            for (const auto& part : message.parts) hasObservation |= std::holds_alternative<MaiImagePart>(part.body);
     QVERIFY(hasObservation);
 }
 
@@ -654,7 +1185,11 @@ void DesktopSessionImBridgeTest::workspaceChangeDuringPreparationRejectsTheStage
     QTemporaryDir cache;
     QTemporaryDir replacement;
     const QString path = cache.filePath(QStringLiteral("owned-staging.txt"));
-    { QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); QCOMPARE(file.write("owned file"), qint64(10)); }
+    {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write("owned file"), qint64(10));
+    }
     QVERIFY(f.bind(QStringLiteral("friend"), f.session));
     QSignalSpy errors(&f.bridge, &DesktopSessionImBridge::relayError);
     RemoteIMMessage message;
@@ -677,7 +1212,8 @@ void DesktopSessionImBridgeTest::workspaceChangeBeforeIdleDoesNotSendAnotherDire
     QTRY_VERIFY(f.app.connectionReady());
     QTemporaryDir replacement;
     const QString name = QStringLiteral("owned-same-name.png");
-    QImage image(20, 16, QImage::Format_RGB32); image.fill(Qt::cyan);
+    QImage image(20, 16, QImage::Format_RGB32);
+    image.fill(Qt::cyan);
     QVERIFY(image.save(f.workspace.filePath(name), "PNG"));
     QVERIFY(QFile::copy(f.workspace.filePath(name), replacement.filePath(name)));
     f.model->mediaPath = name;
@@ -766,7 +1302,7 @@ void DesktopSessionImBridgeTest::synchronousTakeoverBeforeSdkDispatchRevokesTheR
         // row when its timestamp is rounded to the same second as the input.
         const bool pendingReply = std::any_of(rows.begin(), rows.end(), [](const RemoteIMMessage& row) {
             return row.origin == RemoteIMMessageOrigin::Machine && row.status == RemoteIMMessageStatus::Pending &&
-                row.text == QStringLiteral("reply: remote answer is revoked");
+                   row.text == QStringLiteral("reply: remote answer is revoked");
         });
         if (!pendingReply) return;
         tookOver = true;
@@ -779,7 +1315,8 @@ void DesktopSessionImBridgeTest::synchronousTakeoverBeforeSdkDispatchRevokesTheR
     QVERIFY(f.im->sent.isEmpty());
     const auto rows = f.app.chatState().messagesWith(QStringLiteral("friend"));
     const auto revoked = std::find_if(rows.begin(), rows.end(), [](const RemoteIMMessage& row) {
-        return row.origin == RemoteIMMessageOrigin::Machine && row.text == QStringLiteral("reply: remote answer is revoked");
+        return row.origin == RemoteIMMessageOrigin::Machine &&
+               row.text == QStringLiteral("reply: remote answer is revoked");
     });
     QVERIFY(revoked != rows.end());
     QCOMPARE(revoked->status, RemoteIMMessageStatus::Failed);
@@ -857,9 +1394,25 @@ void DesktopSessionImBridgeTest::unsupportedPayloadAndPendingLimitFailExplicitly
     QCOMPARE(errors.count(), 1);
     f.im->incoming(QStringLiteral("owned-oversized"), QString(65537, QLatin1Char('x')));
     QCOMPARE(errors.count(), 2);
-    for (int index = 0; index < 33; ++index)
-        f.im->incoming(QStringLiteral("owned-pending-%1").arg(index), QStringLiteral("pending %1").arg(index));
-    QCOMPARE(errors.count(), 3);
+    // Ready busy followups now enter the current owned turn. Keep an actual
+    // unready attachment at the FIFO head to exercise the separate queue bound.
+    QSignalSpy persisted(&f.app, &RemoteIMApplication::sessionImMessagePersisted);
+    RemoteIMMessage waiting;
+    waiting.id = QStringLiteral("owned-pending-media-head");
+    waiting.fromUserId = QStringLiteral("friend");
+    waiting.toUserId = QStringLiteral("owner");
+    waiting.origin = RemoteIMMessageOrigin::Human;
+    waiting.hasImage = true;
+    f.im->queueRaw(waiting, false);
+    QTRY_COMPARE(persisted.count(), 1);
+    for (int index = 0; index < 32; ++index) {
+        auto queued = waiting;
+        queued.id = QStringLiteral("owned-pending-%1").arg(index);
+        queued.text = QStringLiteral("pending %1").arg(index);
+        queued.hasImage = false;
+        f.im->queueRaw(queued, true);
+    }
+    QTRY_COMPARE(errors.count(), 3);
     QCOMPARE(f.model->calls.load(), 1);
     f.bridge.unbind(QStringLiteral("friend"));
     f.model->release.release();
@@ -874,7 +1427,11 @@ void DesktopSessionImBridgeTest::attachmentPreparationIgnoresGlobalWorkAndExpire
     QTRY_VERIFY(f.app.connectionReady());
     QTemporaryDir cache;
     const QString path = cache.filePath(QStringLiteral("owned-pool.txt"));
-    { QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); QCOMPARE(file.write("owned"), qint64(5)); }
+    {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write("owned"), qint64(5));
+    }
     QVERIFY(f.bind(QStringLiteral("friend"), f.session));
     OwnedPoolBlocker global(QThreadPool::globalInstance());
     QVERIFY(global.entered());
@@ -912,7 +1469,8 @@ void DesktopSessionImBridgeTest::asynchronousVideoPreparationKeepsHeartbeatAndRe
     QTRY_VERIFY(f.app.connectionReady());
     const QString path = f.workspace.filePath(QStringLiteral("owned-async-video.mp4"));
     QVERIFY(QFile::copy(QString::fromUtf8(MAICHAT_SESSION_IM_VIDEO_FIXTURE), path));
-    QVERIFY(f.app.sendMachineMediaTo(QStringLiteral("friend"), path, QStringLiteral("video"), QStringLiteral("owned warm-up")));
+    QVERIFY(f.app.sendMachineMediaTo(QStringLiteral("friend"), path, QStringLiteral("video"),
+                                     QStringLiteral("owned warm-up")));
     QTRY_COMPARE(f.im->sent.size(), 1);
     QTRY_VERIFY(f.app.findChildren<QObject*>(QStringLiteral("sessionImVideoPreparation")).isEmpty());
     auto* pool = qobject_cast<QThreadPool*>(qApp->property("sessionImVideoPreparationPool").value<QObject*>());
@@ -927,7 +1485,7 @@ void DesktopSessionImBridgeTest::asynchronousVideoPreparationKeepsHeartbeatAndRe
     connect(&heartbeat, &QTimer::timeout, &heartbeat, [&] { ++heartbeats; });
     heartbeat.start(5);
     f.im->incoming(QStringLiteral("owned-slow-video-request"), QStringLiteral("deliver video"));
-    QTRY_COMPARE(f.im->sent.size(), 2); // warm-up plus the owned text; video prep is held.
+    QTRY_COMPARE(f.im->sent.size(), 2);  // warm-up plus the owned text; video prep is held.
     f.im->incoming(QStringLiteral("owned-after-slow-video"), QStringLiteral("next owned input"));
     QTest::qWait(40);
     QVERIFY(heartbeats > 0);
@@ -945,7 +1503,8 @@ void DesktopSessionImBridgeTest::lateSessionErrorDuringVideoPreparationPreventsS
     QTRY_VERIFY(f.app.connectionReady());
     const QString path = f.workspace.filePath(QStringLiteral("owned-late-error-video.mp4"));
     QVERIFY(QFile::copy(QString::fromUtf8(MAICHAT_SESSION_IM_VIDEO_FIXTURE), path));
-    QVERIFY(f.app.sendMachineMediaTo(QStringLiteral("friend"), path, QStringLiteral("video"), QStringLiteral("owned warm-up")));
+    QVERIFY(f.app.sendMachineMediaTo(QStringLiteral("friend"), path, QStringLiteral("video"),
+                                     QStringLiteral("owned warm-up")));
     QTRY_COMPARE(f.im->sent.size(), 1);
     QTRY_VERIFY(f.app.findChildren<QObject*>(QStringLiteral("sessionImVideoPreparation")).isEmpty());
     auto* pool = qobject_cast<QThreadPool*>(qApp->property("sessionImVideoPreparationPool").value<QObject*>());
@@ -968,13 +1527,12 @@ void DesktopSessionImBridgeTest::lateSessionErrorDuringVideoPreparationPreventsS
     slow.release();
     QTRY_VERIFY(f.app.findChildren<QObject*>(QStringLiteral("sessionImVideoPreparation")).isEmpty());
     QTRY_COMPARE(f.model->calls.load(), 3);
-    QTRY_COMPARE(std::count_if(f.im->sent.cbegin(), f.im->sent.cend(), [](const OwnedIm::Sent& row) {
-        return row.kind == QStringLiteral("text");
-    }), 2);
+    QTRY_COMPARE(std::count_if(f.im->sent.cbegin(), f.im->sent.cend(),
+                               [](const OwnedIm::Sent& row) { return row.kind == QStringLiteral("text"); }),
+                 2);
     QCOMPARE(f.im->sent.size(), 3);
-    QVERIFY(std::none_of(f.im->sent.cbegin() + 1, f.im->sent.cend(), [](const OwnedIm::Sent& row) {
-        return row.kind == QStringLiteral("video");
-    }));
+    QVERIFY(std::none_of(f.im->sent.cbegin() + 1, f.im->sent.cend(),
+                         [](const OwnedIm::Sent& row) { return row.kind == QStringLiteral("video"); }));
     QCOMPARE(errors.size(), 1);
     QVERIFY(!errors.first().last().toString().contains(QStringLiteral("owned late private failure detail")));
     QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
@@ -985,7 +1543,8 @@ void DesktopSessionImBridgeTest::unbindDuringVideoPreparationPreventsLateSdkDisp
     QTRY_VERIFY(f.app.connectionReady());
     const QString path = f.workspace.filePath(QStringLiteral("owned-revoked-video.mp4"));
     QVERIFY(QFile::copy(QString::fromUtf8(MAICHAT_SESSION_IM_VIDEO_FIXTURE), path));
-    QVERIFY(f.app.sendMachineMediaTo(QStringLiteral("friend"), path, QStringLiteral("video"), QStringLiteral("owned warm-up")));
+    QVERIFY(f.app.sendMachineMediaTo(QStringLiteral("friend"), path, QStringLiteral("video"),
+                                     QStringLiteral("owned warm-up")));
     QTRY_COMPARE(f.im->sent.size(), 1);
     QTRY_VERIFY(f.app.findChildren<QObject*>(QStringLiteral("sessionImVideoPreparation")).isEmpty());
     auto* pool = qobject_cast<QThreadPool*>(qApp->property("sessionImVideoPreparationPool").value<QObject*>());
@@ -1139,9 +1698,11 @@ void DesktopSessionImBridgeTest::allPersistedHistoryImportsBeforeOneLaterLivePro
     std::lock_guard<std::mutex> lock(f.model->mutex);
     QCOMPARE(f.model->requests.size(), std::size_t(1));
     const auto& request = f.model->requests.front();
-    QCOMPARE(std::count_if(request.messages.cbegin(), request.messages.cend(), [](const MaiModelMessage& row) {
-        return row.content.find("persisted-history-owned-") != std::string::npos;
-    }), 451);
+    QCOMPARE(std::count_if(request.messages.cbegin(), request.messages.cend(),
+                           [](const MaiModelMessage& row) {
+                               return row.content.find("persisted-history-owned-") != std::string::npos;
+                           }),
+             451);
 }
 
 void DesktopSessionImBridgeTest::unavailableHistorySourceDoesNotEnableAutomaticForwarding() {
@@ -1167,10 +1728,12 @@ void DesktopSessionImBridgeTest::queuedPrebindRawMediaStaysContextAndPostbindFra
     Fixture f;
     RemoteIMMessage old;
     old.id = QStringLiteral("queued-before-bind");
-    old.fromUserId = QStringLiteral("friend"); old.toUserId = QStringLiteral("owner");
+    old.fromUserId = QStringLiteral("friend");
+    old.toUserId = QStringLiteral("owner");
     old.origin = RemoteIMMessageOrigin::Human;
-    old.text = QStringLiteral("prebind raw media prior context"); old.hasImage = true;
-    const auto ticket = f.im->queueRaw(old, false); // Actual raw receipt, queued Main parse is still pending.
+    old.text = QStringLiteral("prebind raw media prior context");
+    old.hasImage = true;
+    const auto ticket = f.im->queueRaw(old, false);  // Actual raw receipt, queued Main parse is still pending.
     QVERIFY(f.bridge.bind(QStringLiteral("friend"), f.session));
     QVERIFY(f.bridge.historyPending(QStringLiteral("friend")));
     QVERIFY(QTest::qWaitFor([&] { return !f.bridge.historyPending(QStringLiteral("friend")); }, 10000));
@@ -1184,7 +1747,9 @@ void DesktopSessionImBridgeTest::queuedPrebindRawMediaStaysContextAndPostbindFra
     QTest::qWait(30);
     QCOMPARE(f.model->calls.load(), 0);
     RemoteIMMessage live = old;
-    live.id = QStringLiteral("postbind-raw"); live.hasImage = false; live.image = {};
+    live.id = QStringLiteral("postbind-raw");
+    live.hasImage = false;
+    live.image = {};
     live.text = QStringLiteral("postbind raw executes once");
     f.im->queueRaw(live, true);
     QTRY_COMPARE(f.im->sent.size(), 1);
@@ -1200,8 +1765,10 @@ void DesktopSessionImBridgeTest::liveOverlapIsExcludedFromSnapshotUsingConfirmed
     OwnedPoolBlocker held(pool);
     QVERIFY(held.entered());
     RemoteIMMessage prior;
-    prior.id = QStringLiteral("persisted-before-overlap"); prior.fromUserId = QStringLiteral("friend");
-    prior.toUserId = QStringLiteral("owner"); prior.text = QStringLiteral("unique old history context");
+    prior.id = QStringLiteral("persisted-before-overlap");
+    prior.fromUserId = QStringLiteral("friend");
+    prior.toUserId = QStringLiteral("owner");
+    prior.text = QStringLiteral("unique old history context");
     QVERIFY(f.history->insertMessageIfAbsent(prior, QStringLiteral("friend")));
     QVERIFY(f.bridge.bind(QStringLiteral("friend"), f.session));
     f.im->incoming(QStringLiteral("actual-live-overlap"), QStringLiteral("unique overlapped new prompt"));
@@ -1212,17 +1779,21 @@ void DesktopSessionImBridgeTest::liveOverlapIsExcludedFromSnapshotUsingConfirmed
     QCOMPARE(f.model->calls.load(), 1);
     std::lock_guard<std::mutex> lock(f.model->mutex);
     const auto& request = f.model->requests.front();
-    QCOMPARE(std::count_if(request.messages.begin(), request.messages.end(), [](const MaiModelMessage& message) {
-        return message.content.find("unique overlapped new prompt") != std::string::npos;
-    }), 1);
-    QCOMPARE(std::count_if(request.messages.begin(), request.messages.end(), [](const MaiModelMessage& message) {
-        return message.content.find("unique old history context") != std::string::npos;
-    }), 1);
+    QCOMPARE(std::count_if(request.messages.begin(), request.messages.end(),
+                           [](const MaiModelMessage& message) {
+                               return message.content.find("unique overlapped new prompt") != std::string::npos;
+                           }),
+             1);
+    QCOMPARE(std::count_if(request.messages.begin(), request.messages.end(),
+                           [](const MaiModelMessage& message) {
+                               return message.content.find("unique old history context") != std::string::npos;
+                           }),
+             1);
 }
 
 void DesktopSessionImBridgeTest::overflowDuringHistoryAbortsBindingAndRetainsImRows() {
     Fixture f;
-    f.im->rawSequence = 1; // Owned SDK raw frame has not reached its ordinary metadata writer yet.
+    f.im->rawSequence = 1;  // Owned SDK raw frame has not reached its ordinary metadata writer yet.
     QSignalSpy errors(&f.bridge, &DesktopSessionImBridge::relayError);
     QVERIFY(f.bridge.bind(QStringLiteral("friend"), f.session));
     QVERIFY(f.bridge.historyPending(QStringLiteral("friend")));
@@ -1254,37 +1825,41 @@ void DesktopSessionImBridgeTest::partialHistoryFailureNeverPublishesStagedRows()
     for (int index = 0; index < 202; ++index) {
         RemoteIMMessage row;
         row.id = QStringLiteral("partial-%1").arg(index, 5, 10, QLatin1Char('0'));
-        row.fromUserId = QStringLiteral("friend"); row.toUserId = QStringLiteral("owner");
+        row.fromUserId = QStringLiteral("friend");
+        row.toUserId = QStringLiteral("owner");
         row.createdAtMillis = index;
-        row.text = index == 201 ? QString(256 * 1024 + 1, QLatin1Char('x')) : QStringLiteral("owned staged prior context");
+        row.text =
+            index == 201 ? QString(256 * 1024 + 1, QLatin1Char('x')) : QStringLiteral("owned staged prior context");
         QVERIFY(f.history->insertMessageIfAbsent(row, QStringLiteral("friend")));
     }
     QSignalSpy errors(&f.bridge, &DesktopSessionImBridge::relayError);
     const auto core = f.historyDirectory.filePath(QStringLiteral("owned-session-core.db"));
     const auto storageLock = std::make_shared<OwnedCoreWriteLock>();
-    if (lockDuringAbort) connect(&f.bridge, &DesktopSessionImBridge::relayError, &f.controller,
-        [storageLock, core] {
+    if (lockDuringAbort)
+        connect(&f.bridge, &DesktopSessionImBridge::relayError, &f.controller, [storageLock, core] {
             QVERIFY(storageLock->acquire(core));
             QTimer::singleShot(6500, qApp, [storageLock] { storageLock->release(); });
         });
-    if (abortBeforeDtor) connect(&f.bridge, &DesktopSessionImBridge::relayError, &f.controller,
-        [core, worker = f.controller.agent().contextImportWorker()] {
-            // The signal still owns the failed HistoryJob. Reproduce the
-            // existing canceled begin/append worker's earlier successful abort
-            // before that job's destructor schedules its own maintenance.
-            const auto id = ownedCoreText(core, "SELECT id FROM context_imports WHERE state=0 LIMIT 1");
-            QVERIFY(!id.isEmpty());
-            auto aborted = QtConcurrent::run([worker, id] {
-                const auto first = worker.abortContextImport(id.toStdString());
-                const auto repeated = worker.abortContextImport(id.toStdString());
-                return std::make_pair(first, repeated);
-            });
-            QTRY_VERIFY(aborted.isFinished());
-            QVERIFY(!aborted.result().first);
-            QCOMPARE(aborted.result().second.code(), MaiErrorCode::NotFound);
-            QCOMPARE(ownedCoreCount(core, "SELECT COUNT(*) FROM context_imports WHERE state=2"), qint64(1));
-            QCOMPARE(ownedCoreCount(core, "SELECT COUNT(*) FROM messages WHERE context_import_id IS NOT NULL"), qint64(200));
-        });
+    if (abortBeforeDtor)
+        connect(&f.bridge, &DesktopSessionImBridge::relayError, &f.controller,
+                [core, worker = f.controller.agent().contextImportWorker()] {
+                    // The signal still owns the failed HistoryJob. Reproduce the
+                    // existing canceled begin/append worker's earlier successful abort
+                    // before that job's destructor schedules its own maintenance.
+                    const auto id = ownedCoreText(core, "SELECT id FROM context_imports WHERE state=0 LIMIT 1");
+                    QVERIFY(!id.isEmpty());
+                    auto aborted = QtConcurrent::run([worker, id] {
+                        const auto first = worker.abortContextImport(id.toStdString());
+                        const auto repeated = worker.abortContextImport(id.toStdString());
+                        return std::make_pair(first, repeated);
+                    });
+                    QTRY_VERIFY(aborted.isFinished());
+                    QVERIFY(!aborted.result().first);
+                    QCOMPARE(aborted.result().second.code(), MaiErrorCode::NotFound);
+                    QCOMPARE(ownedCoreCount(core, "SELECT COUNT(*) FROM context_imports WHERE state=2"), qint64(1));
+                    QCOMPARE(ownedCoreCount(core, "SELECT COUNT(*) FROM messages WHERE context_import_id IS NOT NULL"),
+                             qint64(200));
+                });
     QVERIFY(f.bridge.bind(QStringLiteral("friend"), f.session));
     QVERIFY(QTest::qWaitFor([&] { return f.bridge.boundSession(QStringLiteral("friend")).isEmpty(); }, 10000));
     QCOMPARE(errors.size(), 1);
@@ -1292,8 +1867,10 @@ void DesktopSessionImBridgeTest::partialHistoryFailureNeverPublishesStagedRows()
     QCOMPARE(f.history->loadRecentMessages(QStringLiteral("friend"), 300).size(), 202);
     qInfo() << "owned failed snapshot hidden payload before idle GC="
             << ownedCoreCount(core, "SELECT COUNT(*) FROM messages WHERE context_import_id IS NOT NULL");
-    QTRY_COMPARE_WITH_TIMEOUT(ownedCoreCount(core, "SELECT COUNT(*) FROM messages WHERE context_import_id IS NOT NULL"), qint64(0), lockDuringAbort ? 12000 : 3000);
-    QTRY_COMPARE_WITH_TIMEOUT(ownedCoreCount(core, "SELECT COUNT(*) FROM context_imports WHERE state=2"), qint64(0), 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(ownedCoreCount(core, "SELECT COUNT(*) FROM messages WHERE context_import_id IS NOT NULL"),
+                              qint64(0), lockDuringAbort ? 12000 : 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(ownedCoreCount(core, "SELECT COUNT(*) FROM context_imports WHERE state=2"), qint64(0),
+                              3000);
     QCOMPARE(f.controller.agent().listMessages(f.session.toStdString()).size(), ordinaryCount);
 }
 
@@ -1320,10 +1897,12 @@ void DesktopSessionImBridgeTest::reopenedStartupProjectionReclaimsAbandonedConte
         session = controller.createSession(directory.path(), QStringLiteral("Owned existing root"));
         const auto worker = controller.agent().contextImportWorker();
         auto seeded = QtConcurrent::run([worker, session] {
-            const auto begun = worker.beginContextImport({session.toStdString(), "owned-orphan-source", "owned-abandoned-snapshot", "owned prior context"});
+            const auto begun = worker.beginContextImport(
+                {session.toStdString(), "owned-orphan-source", "owned-abandoned-snapshot", "owned prior context"});
             if (!begun) return false;
             std::vector<MaiContextImportRecord> records;
-            for (int index = 0; index < 23; ++index) records.push_back({"orphan-" + std::to_string(index), "owned orphan payload", index});
+            for (int index = 0; index < 23; ++index)
+                records.push_back({"orphan-" + std::to_string(index), "owned orphan payload", index});
             return bool(worker.appendContextImport(begun.value().importId, 0, records));
         });
         QTRY_VERIFY(seeded.isFinished());
@@ -1332,16 +1911,18 @@ void DesktopSessionImBridgeTest::reopenedStartupProjectionReclaimsAbandonedConte
     }
     OwnedIm* im = new OwnedIm;
     RemoteIMApplication app(QStringLiteral("owner"), std::unique_ptr<RemoteIMClient>(im),
-        std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("owned-im.db"))));
+                            std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("owned-im.db"))));
     app.connectToService(123, QStringLiteral("owned-unused-signature"));
     auto state = std::make_shared<ModelState>();
     AgentController controller(std::make_unique<OwnedModel>(state), core);
     DesktopSessionImBridge bridge(app, controller);
     AgentSessionList projection(controller);
-    connect(&projection, &AgentSessionList::localRootIdsProjected, &bridge, &DesktopSessionImBridge::scheduleHistoryMaintenance);
+    connect(&projection, &AgentSessionList::localRootIdsProjected, &bridge,
+            &DesktopSessionImBridge::scheduleHistoryMaintenance);
     bridge.scheduleHistoryMaintenance(projection.projectedLocalRootIds());
-    projection.refresh(); // Actual MainWindow first ordinary refresh lifecycle.
-    QTRY_COMPARE_WITH_TIMEOUT(ownedCoreCount(core, "SELECT COUNT(*) FROM messages WHERE context_import_id IS NOT NULL"), qint64(0), 3000);
+    projection.refresh();  // Actual MainWindow first ordinary refresh lifecycle.
+    QTRY_COMPARE_WITH_TIMEOUT(ownedCoreCount(core, "SELECT COUNT(*) FROM messages WHERE context_import_id IS NOT NULL"),
+                              qint64(0), 3000);
     QVERIFY(controller.agent().listMessages(session.toStdString()).empty());
     QCOMPARE(state->calls.load(), 0);
     QVERIFY(im->sent.isEmpty());
