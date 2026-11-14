@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSignalSpy>
+#include <QSet>
 #include <QTest>
 #include <QCoreApplication>
 #include <QThread>
@@ -100,7 +101,11 @@ public:
 
     int getUserProfiles(const QString& request, TimSdkCompletion completion) override {
         profileRequest = request;
-        if (completion) completion(0, {}, profilePayload);
+        profileRequests.append(QJsonDocument::fromJson(request.toUtf8()).object());
+        if (deferUserProfiles)
+            deferredUserProfiles.append(std::move(completion));
+        else if (completion)
+            completion(profileCode, {}, profilePayload);
         return 0;
     }
 
@@ -117,6 +122,10 @@ public:
     }
 
     QString profileRequest;
+    QList<QJsonObject> profileRequests;
+    QList<TimSdkCompletion> deferredUserProfiles;
+    bool deferUserProfiles = false;
+    int profileCode = 0;
     QString selfProfileRequest;
     int selfProfileModificationCount = 0;
     int profileModificationCode = 0;
@@ -279,6 +288,8 @@ private slots:
     void requestsAndAcceptsFriendThroughSdk();
     void fetchesContactsConversationsAndHistoryAfterLogin();
     void friendAvatarCallbacksStayOnOwnerAndIgnoreStaleWork();
+    void explicitPeerProfilesAreForcedBoundedAndRestrictedToRequestedIds();
+    void explicitPeerProfileGenerationsAndAuthorityStayWithinLogin();
     void emitsIncomingTextAndImageFromSdkMessages();
     void emitsIncomingApprovalRequestFromV2CloudMetadata();
     void emitsIncomingApprovalResolutionFromV2CloudMetadata();
@@ -1148,6 +1159,145 @@ void TimSdkRemoteIMClientTest::friendAvatarCallbacksStayOnOwnerAndIgnoreStaleWor
 }
 
 // SDK 入站文本和图片转换为相同会话的两类消息，并保留方向及时间顺序。
+void TimSdkRemoteIMClientTest::explicitPeerProfilesAreForcedBoundedAndRestrictedToRequestedIds() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    TimSdkRemoteIMClient client(std::move(api));
+    client.connectToService(123456, QStringLiteral("owner"), QStringLiteral("owned-signature"), nullptr);
+    fake->profileRequests.clear();
+    fake->deferUserProfiles = true;
+    QSignalSpy contacts(&client, &RemoteIMClient::contactsReceived);
+    std::atomic<bool> wrongThread{false};
+    connect(
+        &client, &RemoteIMClient::contactsReceived, &client,
+        [&](const QList<RemoteIMContact>&) {
+            if (QThread::currentThread() != client.thread()) wrongThread = true;
+        },
+        Qt::DirectConnection);
+    QStringList ids{QString(), QStringLiteral("owner"), QStringLiteral(" peer-0 "), QStringLiteral("peer-0")};
+    for (int index = 1; index <= 100; ++index) ids.append(QStringLiteral("peer-%1").arg(index));
+    std::thread caller([&] { client.refreshUserProfiles(ids); });
+    caller.join();
+    QTRY_COMPARE(fake->profileRequests.size(), 2);
+    QSet<QString> sent;
+    for (const auto& request : fake->profileRequests) {
+        QVERIFY(request.value(QStringLiteral("friendship_getprofilelist_param_force_update")).toBool());
+        const auto batch = request.value(QStringLiteral("friendship_getprofilelist_param_identifier_array")).toArray();
+        QVERIFY(!batch.isEmpty() && batch.size() <= 100);
+        for (const auto& value : batch) {
+            const QString id = value.toString();
+            QVERIFY(!id.isEmpty() && id != QStringLiteral("owner") && !sent.contains(id));
+            sent.insert(id);
+        }
+    }
+    QCOMPARE(sent.size(), 101);
+    const QString fresh = QStringLiteral("https://avatar.example.invalid/explicit.png");
+    QJsonArray profiles;
+    for (const QString& id : {QStringLiteral("peer-0"), QStringLiteral("not-requested"), QStringLiteral("owner")})
+        profiles.append(QJsonObject{{QStringLiteral("user_profile_identifier"), id},
+                                    {QStringLiteral("user_profile_face_url"), fresh}});
+    auto completion = fake->deferredUserProfiles.takeFirst();
+    const QString payload = QString::fromUtf8(QJsonDocument(profiles).toJson(QJsonDocument::Compact));
+    std::thread worker([completion, payload] { completion(0, {}, payload); });
+    worker.join();
+    QTRY_COMPARE(contacts.size(), 1);
+    const auto received = qvariant_cast<QList<RemoteIMContact>>(contacts.last().at(0));
+    QCOMPARE(received.size(), 1);
+    QCOMPARE(received.first().userId, QStringLiteral("peer-0"));
+    QCOMPARE(received.first().avatarUrl, fresh);
+    QVERIFY(!wrongThread.load());
+    // 同步回调期间登出也必须阻断下一批；只在入口核对一次不足以保护旧 peer 名单。
+    fake->deferUserProfiles = false;
+    fake->profilePayload = payload;
+    fake->profileRequests.clear();
+    connect(
+        &client, &RemoteIMClient::contactsReceived, &client,
+        [&client](const QList<RemoteIMContact>&) { client.disconnectFromService(nullptr); }, Qt::DirectConnection);
+    client.refreshUserProfiles(ids);
+    QCOMPARE(fake->profileRequests.size(), 1);
+}
+
+void TimSdkRemoteIMClientTest::explicitPeerProfileGenerationsAndAuthorityStayWithinLogin() {
+    const QString peer = QStringLiteral("phone-user");
+    const QString fresh = QStringLiteral("https://avatar.example.invalid/forced.png");
+    const QString stale = QStringLiteral("https://avatar.example.invalid/stale.png");
+    const QString fallback = QStringLiteral("https://avatar.example.invalid/new-login.png");
+    const auto profile = [peer](const QString& avatar) {
+        return QString::fromUtf8(
+            QJsonDocument(QJsonArray{QJsonObject{{QStringLiteral("user_profile_identifier"), peer},
+                                                 {QStringLiteral("user_profile_face_url"), avatar}}})
+                .toJson(QJsonDocument::Compact));
+    };
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    fake->deferFriendList = true;
+    fake->conversationListPayload =
+        QString::fromUtf8(QJsonDocument(QJsonArray{QJsonObject{{QStringLiteral("conv_id"), peer},
+                                                               {QStringLiteral("conv_type"), 1},
+                                                               {QStringLiteral("conv_face_url"), stale}}})
+                              .toJson(QJsonDocument::Compact));
+    TimSdkRemoteIMClient client(std::move(api));
+    QSignalSpy contacts(&client, &RemoteIMClient::contactsReceived);
+    const auto latest = [&] { return qvariant_cast<QList<RemoteIMContact>>(contacts.last().at(0)).first().avatarUrl; };
+    client.connectToService(123456, QStringLiteral("owner-a"), QStringLiteral("owned-signature"), nullptr);
+    QTRY_COMPARE(contacts.size(), 1);
+    QCOMPARE(latest(), stale);
+    fake->deferUserProfiles = true;
+    client.refreshUserProfiles({peer});
+    client.refreshUserProfiles({peer});
+    QCOMPARE(fake->deferredUserProfiles.size(), 2);
+    auto older = fake->deferredUserProfiles.takeFirst();
+    auto newest = fake->deferredUserProfiles.takeFirst();
+    newest(0, {}, profile(fresh));
+    QTRY_COMPARE(contacts.size(), 2);
+    QCOMPARE(latest(), fresh);
+    older(0, {}, profile(stale));
+    QCoreApplication::processEvents();
+    QCOMPARE(contacts.size(), 2);
+    auto friendSnapshot = fake->deferredFriendLists.takeFirst();
+    friendSnapshot(
+        0, {},
+        QString::fromUtf8(
+            QJsonDocument(QJsonArray{QJsonObject{{QStringLiteral("friend_profile_identifier"), peer},
+                                                 {QStringLiteral("friend_profile_user_profile"),
+                                                  QJsonObject{{QStringLiteral("user_profile_face_url"), stale}}}}})
+                .toJson(QJsonDocument::Compact)));
+    QTRY_COMPARE(contacts.size(), 3);
+    QCOMPARE(latest(), fresh);
+    fake->conversationEventCallback(4, {});
+    QTRY_COMPARE(contacts.size(), 4);
+    QCOMPARE(latest(), fresh);
+    client.refreshUserProfiles({peer});
+    fake->deferredUserProfiles.takeFirst()(0, {}, profile(QString()));
+    QTRY_COMPARE(contacts.size(), 5);
+    QCOMPARE(latest(), fresh);  // Empty profiles do not clear the last nonempty explicit URL.
+    client.refreshUserProfiles({peer});
+    fake->deferredUserProfiles.takeFirst()(17, {}, profile(stale));
+    QCoreApplication::processEvents();
+    QCOMPARE(contacts.size(), 5);
+    client.refreshUserProfiles({peer});
+    auto removedFromList = fake->deferredUserProfiles.takeFirst();
+    client.refreshUserProfiles({});
+    removedFromList(0, {}, profile(stale));
+    QCoreApplication::processEvents();
+    QCOMPARE(contacts.size(), 5);
+    client.refreshUserProfiles({peer});
+    auto previousLogin = fake->deferredUserProfiles.takeFirst();
+    client.disconnectFromService(nullptr);
+    fake->deferUserProfiles = false;
+    fake->conversationListPayload.replace(stale, fallback);
+    client.connectToService(123456, QStringLiteral("owner-b"), QStringLiteral("owned-signature"), nullptr);
+    QTRY_COMPARE(contacts.size(), 6);
+    QCOMPARE(latest(), fallback);
+    previousLogin(0, {}, profile(fresh));
+    QCoreApplication::processEvents();
+    QCOMPARE(contacts.size(), 6);
+    fake->profileCode = 17;
+    client.refreshUserProfiles({peer});
+    QCoreApplication::processEvents();
+    QCOMPARE(contacts.size(), 6);  // Failed new-login metadata can keep its ordinary conversation fallback.
+}
+
 void TimSdkRemoteIMClientTest::emitsIncomingTextAndImageFromSdkMessages() {
     auto api = std::make_unique<FakeTimSdkApi>();
     auto* fake = api.get();

@@ -8,6 +8,7 @@
 #include <QObject>
 #include <QList>
 #include <QString>
+#include <QStringList>
 #include <functional>
 
 #include "model/RemoteIMContact.h"
@@ -82,6 +83,11 @@ public:
         if (completion) completion(false, QStringLiteral("当前 IM 客户端不支持好友申请"));
     }
     virtual void refreshFriendList() {}
+    // 普通资料刷新不要求目标是 TIM 好友，不改变好友关系；失败继续使用现有元数据。
+    // 调用方传入当前授权联系人，具体客户端负责去重、分批及登录/请求代际检查。
+    virtual void refreshUserProfiles(const QStringList& userIds) {
+        Q_UNUSED(userIds);
+    }
     // 普通资料更新入口；成功必须来自 SDK 回执，不能把排队当作已修改。
     // canCommit 在 SDK 派发前及发布回执前检查原账号代际，不持有工具上下文裸指针。
     virtual void setSelfAvatar(const QString &avatarUrl, RemoteIMCompletion completion,

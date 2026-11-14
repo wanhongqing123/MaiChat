@@ -29,6 +29,7 @@ public:
     void deleteContact(const QString& userId, RemoteIMCompletion completion) override;
     void requestFriend(const QString& userId, RemoteIMCompletion completion) override;
     void refreshFriendList() override;
+    void refreshUserProfiles(const QStringList& userIds) override;
     void setSelfAvatar(const QString &avatarUrl, RemoteIMCompletion completion,
                        std::function<bool()> canCommit = {}) override;
     void joinedGroups(RemoteIMGroupsCompletion completion) override;
@@ -159,6 +160,8 @@ private:
     // QObject owner-thread only. Nonempty friend profile URLs outrank cached
     // conversation avatars within this login; empty/missing URLs do not clear.
     QHash<QString, QString> friendAvatarUrls_;
+    // 显式强制查询的 peer 资料高于随后到达的好友/会话快照；空值不撤销本次登录的权威值。
+    QHash<QString, QString> peerProfileAvatarUrls_;
     // AccountTag 的另一半。以前没存过——只有连接日志里出现过一次。
     quint64 sdkAppId_ = 0;
     QHash<QString, qint64> orderedSecondByPeer_;
@@ -172,6 +175,7 @@ private:
     quint64 conversationRevision_ = 0;
     quint64 conversationFetchGeneration_ = 0;
     quint64 friendFetchGeneration_ = 0;
+    quint64 peerProfileFetchGeneration_ = 0;
 
 public:
     RemoteDiagnostics::AccountTag currentAccount() const override;

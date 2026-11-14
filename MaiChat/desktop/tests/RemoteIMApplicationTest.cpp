@@ -48,6 +48,7 @@ public:
         return 0;
     }
     int getUserProfiles(const QString& request, TimSdkCompletion completion) override {
+        profileRequests.append(QJsonDocument::fromJson(request.toUtf8()).object());
         QJsonArray profiles;
         const auto ids = QJsonDocument::fromJson(request.toUtf8())
                              .object()
@@ -59,7 +60,9 @@ public:
             profiles.append(QJsonObject{
                 {QStringLiteral("user_profile_identifier"), user},
                 {QStringLiteral("user_profile_nick_name"), QStringLiteral("SDK profile")},
-                {QStringLiteral("user_profile_face_url"), user == QStringLiteral("peer") ? friendAvatar : QString()}});
+                {QStringLiteral("user_profile_face_url"),
+                 user == QStringLiteral("peer") ? (peerProfileAvatar.isNull() ? friendAvatar : peerProfileAvatar)
+                                                : QString()}});
         }
         if (completion) completion(0, {}, encode(profiles));
         return 0;
@@ -86,7 +89,8 @@ public:
     void removeReceiveMessageCallback() override {}
 
     void finishFriends() {
-        QJsonArray rows{friendRow(QStringLiteral("peer"), friendAvatar)};
+        QJsonArray rows;
+        if (includeAcceptedPeer) rows.append(friendRow(QStringLiteral("peer"), friendAvatar));
         if (includeUnacceptedFriend)
             rows.append(friendRow(QStringLiteral("unaccepted-peer"),
                                   QStringLiteral("https://avatar.example.invalid/unaccepted.png")));
@@ -107,9 +111,12 @@ public:
     }
 
     QString friendAvatar = QStringLiteral("https://avatar.example.invalid/fresh-profile.png");
+    QString peerProfileAvatar;
     int friendRequests = 0;
     int peerProfileRequests = 0;
     bool includeUnacceptedFriend = false;
+    bool includeAcceptedPeer = true;
+    QList<QJsonObject> profileRequests;
     QList<TimSdkCompletion> friends, conversations;
 
 private:
@@ -160,6 +167,7 @@ private slots:
     void friendAvatarRemainsAuthoritativeAcrossConversationArrival_data();
     void friendAvatarRemainsAuthoritativeAcrossConversationArrival();
     void accountFriendRefreshAlsoRefreshesSdkAvatar();
+    void acceptedPeerProfileRefreshDoesNotDependOnSdkFriendship();
     void friendRequestWaitsForRemoteAcceptance();
     void maiChatFriendListFiltersHistoryAndDeletionKeepsMessages();
     void activityIsIndependentFromContentAndExplicitStopClosesIt();
@@ -291,6 +299,46 @@ void RemoteIMApplicationTest::accountFriendRefreshAlsoRefreshesSdkAvatar() {
     ChatState restored(QStringLiteral("owner"));
     reopened.loadRecentInto(restored, 1);
     QCOMPARE(contactAvatar(restored, QStringLiteral("peer")), fresh);
+}
+
+void RemoteIMApplicationTest::acceptedPeerProfileRefreshDoesNotDependOnSdkFriendship() {
+    const QString oldAvatar = QStringLiteral("https://avatar.example.invalid/old-nonfriend.png");
+    const QString fresh = QStringLiteral("https://avatar.example.invalid/fresh-nonfriend.png");
+    auto api = std::make_unique<AvatarTimSdkApi>();
+    auto* sdk = api.get();
+    sdk->includeAcceptedPeer = false;  // 合法的账号已接受、TIM 异步同步尚未完成状态。
+    sdk->friendAvatar = oldAvatar;
+    sdk->peerProfileAvatar = oldAvatar;
+    RemoteIMApplication app(QStringLiteral("owner"), std::make_unique<TimSdkRemoteIMClient>(std::move(api)));
+    app.chatState().upsertContact({QStringLiteral("peer"), QStringLiteral("Cached peer"), oldAvatar});
+    RemoteIMApplication::AccountFriendOperations operations;
+    operations.list = [](auto completion) {
+        completion({{QStringLiteral("m_peer"), QStringLiteral("Account Friend"), QStringLiteral("peer")}}, {});
+    };
+    app.setAccountFriendOperations(std::move(operations));
+    app.connectToService(123456, QStringLiteral("owned-unused-signature"));
+    QVERIFY(app.connectionReady());
+    sdk->finishFriends();
+    QCOMPARE(contactAvatar(app.chatState(), QStringLiteral("peer")), oldAvatar);
+    const int before = sdk->peerProfileRequests;
+    sdk->peerProfileAvatar = fresh;
+    app.refreshFriendList();
+    QVERIFY2(sdk->peerProfileRequests > before, "Accepted non-SDK friends need an explicit profile refresh");
+    QCOMPARE(contactAvatar(app.chatState(), QStringLiteral("peer")), fresh);
+    QVERIFY(sdk->profileRequests.last().value(QStringLiteral("friendship_getprofilelist_param_force_update")).toBool());
+    QCOMPARE(
+        sdk->profileRequests.last().value(QStringLiteral("friendship_getprofilelist_param_identifier_array")).toArray(),
+        QJsonArray{QStringLiteral("peer")});
+    sdk->finishConversations(oldAvatar);
+    QCOMPARE(contactAvatar(app.chatState(), QStringLiteral("peer")), fresh);
+    // 后到的 SDK 好友快照也不能把已显式刷新的一般 profile 降级为旧头像。
+    sdk->includeAcceptedPeer = true;
+    app.client().refreshFriendList();
+    sdk->finishFriends();
+    QCOMPARE(contactAvatar(app.chatState(), QStringLiteral("peer")), fresh);
+    QVERIFY(app.isAcceptedFriend(QStringLiteral("peer")));
+    for (const auto& contact : app.chatState().contacts())
+        if (contact.userId == QStringLiteral("peer")) QCOMPARE(contact.displayName, QStringLiteral("Account Friend"));
 }
 
 void RemoteIMApplicationTest::

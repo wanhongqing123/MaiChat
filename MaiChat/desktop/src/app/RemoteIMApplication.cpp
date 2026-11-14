@@ -1328,11 +1328,15 @@ void RemoteIMApplication::refreshFriendList() {
                 }
                 emit self->stateChanged();
                 if (self) emit self->acceptedFriendsChanged();
-                // Account service owns friendship and display names; it has no
-                // SDK face URL. Refresh that independent metadata through the
-                // ordinary client path after publishing the current relation.
-                if (self && self->connectionReady() && self->connectionGeneration_ == generation)
+                // Account 关系可能仍在异步投影到 TIM；按已发布的 accepted ID 独立查询资料，
+                // 不能只查 TIM 好友列表，否则合法 pending 联系人没有头像刷新来源。
+                if (self && self->connectionReady() && self->connectionGeneration_ == generation) {
+                    QStringList profileIds = self->acceptedFriendIds_.values();
+                    profileIds.sort();
+                    self->client_->refreshUserProfiles(profileIds);
+                    if (!self || !self->connectionReady() || self->connectionGeneration_ != generation) return;
                     self->client_->refreshFriendList();
+                }
             }, Qt::AutoConnection);
         });
         return;

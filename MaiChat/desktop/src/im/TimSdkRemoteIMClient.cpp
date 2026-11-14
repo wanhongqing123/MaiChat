@@ -18,6 +18,7 @@
 #include <QJsonObject>
 #include <QPointer>
 #include <QRegularExpression>
+#include <QSet>
 #include <QtMath>
 #include <QStandardPaths>
 #include <QThread>
@@ -553,6 +554,7 @@ void TimSdkRemoteIMClient::connectToService(int sdkAppId, const QString& userId,
     selfDisplayName_.clear();
     selfAvatarUrl_.clear();
     friendAvatarUrls_.clear();
+    peerProfileAvatarUrls_.clear();
     sdkAppId_ = static_cast<quint64>(sdkAppId);
     const quint64 profileSession = ++profileSession_;
     metadataIngress_ = std::make_shared<MetadataIngress>();
@@ -650,6 +652,7 @@ void TimSdkRemoteIMClient::disconnectFromService(RemoteIMCompletion completion) 
     // Revoke old completions before any SDK cleanup can reenter the owner loop.
     ++profileSession_;
     friendAvatarUrls_.clear();
+    peerProfileAvatarUrls_.clear();
     if (!api_) {
         if (completion) completion(true, QString());
         return;
@@ -781,6 +784,76 @@ void TimSdkRemoteIMClient::requestFriend(const QString& userId, RemoteIMCompleti
 
 void TimSdkRemoteIMClient::refreshFriendList() {
     if (connected_ && api_) fetchFriendList();
+}
+
+void TimSdkRemoteIMClient::refreshUserProfiles(const QStringList& userIds) {
+    const QPointer<TimSdkRemoteIMClient> self(this);
+    QMetaObject::invokeMethod(
+        this,
+        [self, userIds] {
+            if (!self || !self->connected_ || !self->api_) return;
+            QStringList ids;
+            QSet<QString> unique;
+            for (const QString& raw : userIds) {
+                const QString id = raw.trimmed();
+                if (id.isEmpty() || id == self->currentUserId_ || unique.contains(id)) continue;
+                unique.insert(id);
+                ids.append(id);
+            }
+            const auto account = self->currentAccount();
+            const quint64 session = self->profileSession_;
+            // 一次调用是同一批名单；新名单（含空名单）使旧批次失效，不撤销独立的 self 读回执。
+            const quint64 generation = ++self->peerProfileFetchGeneration_;
+            // 本机 SDK V2TIMManager.h GetUsersInfo 建议每批最多 100，后台包上限 1 MiB。
+            constexpr qsizetype batchSize = 100;
+            for (qsizetype offset = 0; offset < ids.size(); offset += batchSize) {
+                // SDK 替身或信号可同步重入切号；后续批次仍须属于原请求，不能跨账号继续查询旧名单。
+                if (!self || !self->connected_ || self->currentAccount() != account ||
+                    self->profileSession_ != session || self->peerProfileFetchGeneration_ != generation)
+                    return;
+                QJsonArray batch;
+                QSet<QString> requested;
+                for (qsizetype index = offset; index < qMin(offset + batchSize, ids.size()); ++index) {
+                    batch.append(ids[index]);
+                    requested.insert(ids[index]);
+                }
+                const QJsonObject request{{QStringLiteral("friendship_getprofilelist_param_identifier_array"), batch},
+                                          {QStringLiteral("friendship_getprofilelist_param_force_update"), true}};
+                self->api_->getUserProfiles(
+                    compactJson(request),
+                    [self, account, session, generation, requested](int code, const QString&, const QString& payload) {
+                        if (!self) return;
+                        QMetaObject::invokeMethod(
+                            self,
+                            [self, account, session, generation, requested, code, payload] {
+                                if (!self || !self->connected_ || code != 0 || self->currentAccount() != account ||
+                                    self->profileSession_ != session || self->peerProfileFetchGeneration_ != generation)
+                                    return;
+                                QList<RemoteIMContact> contacts;
+                                QSet<QString> seen;
+                                for (const auto& value : arrayPayload(payload)) {
+                                    const QJsonObject profile = value.toObject();
+                                    const QString id =
+                                        firstNonEmpty(profile, {QStringLiteral("user_profile_identifier"),
+                                                                QStringLiteral("result_info_identifier")});
+                                    // SDK 回包也不能扩大本批名单或伪造新联系人。
+                                    if (!requested.contains(id) || seen.contains(id)) continue;
+                                    seen.insert(id);
+                                    const QString avatar =
+                                        profile.value(QStringLiteral("user_profile_face_url")).toString().trimmed();
+                                    if (!avatar.isEmpty()) self->peerProfileAvatarUrls_.insert(id, avatar);
+                                    const QString authoritative =
+                                        self->peerProfileAvatarUrls_.value(id, self->friendAvatarUrls_.value(id));
+                                    const QString display = userProfileDisplayName(profile).trimmed();
+                                    contacts.append({id, display.isEmpty() ? id : display, authoritative});
+                                }
+                                if (!contacts.isEmpty()) emit self->contactsReceived(contacts);
+                            },
+                            Qt::AutoConnection);
+                    });
+            }
+        },
+        Qt::AutoConnection);
 }
 
 void TimSdkRemoteIMClient::joinedGroups(RemoteIMGroupsCompletion completion) {
@@ -1621,7 +1694,8 @@ void TimSdkRemoteIMClient::handleFriendListPayload(const QString& jsonPayload) {
         // A missing/empty field preserves the existing non-clearing contract.
         // Only a current-login nonempty friend URL can displace a fallback.
         if (!avatarUrl.isEmpty()) friendAvatarUrls_.insert(userId, avatarUrl);
-        contacts.append(RemoteIMContact{userId, displayName.isEmpty() ? userId : displayName, avatarUrl});
+        contacts.append(RemoteIMContact{userId, displayName.isEmpty() ? userId : displayName,
+                                        peerProfileAvatarUrls_.value(userId, avatarUrl)});
     }
     qInfo().noquote()
         << QStringLiteral("[im] friend list: %1 raw -> %2 contacts")
@@ -1651,7 +1725,8 @@ void TimSdkRemoteIMClient::handleConversationListPayload(const QString& jsonPayl
             });
             // Conversation sync can carry an older face URL than friend data.
             // It fills a gap, but must not roll back a known friend avatar.
-            const QString avatarUrl = friendAvatarUrls_.value(conversationId, conversationAvatar);
+            const QString avatarUrl = peerProfileAvatarUrls_.value(
+                conversationId, friendAvatarUrls_.value(conversationId, conversationAvatar));
             contacts.append(RemoteIMContact{
                 conversationId,
                 displayName.isEmpty() ? conversationId : displayName,
