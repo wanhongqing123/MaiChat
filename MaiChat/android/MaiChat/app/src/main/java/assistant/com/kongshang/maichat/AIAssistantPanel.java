@@ -116,6 +116,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private String pendingMediaSession, pendingFileSession, pendingCameraSession;
     private SessionDrawerHost sessionDrawerHost;
     private FrameLayout sessionConversationCard;
+    private LinearLayout sessionConversation;
+    private View bottomNavigation;
     private LinearLayout sessionDrawer;
     private View sessionDrawerReturn, sessionDrawerShade;
     private TextView sessionDrawerStatus;
@@ -1948,6 +1950,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     /** 目录与会话留在同一容器；拖动不重建消息、输入和滚动位置。 */
     private void installSessionDrawer() {
         LinearLayout conversation = column();
+        sessionConversation = conversation;
         while (getChildCount() > 0) {
             View child = getChildAt(0);
             ViewGroup.LayoutParams params = child.getLayoutParams();
@@ -2005,6 +2008,16 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         sessionDrawerHost.addView(sessionConversationCard, new FrameLayout.LayoutParams(-1, -1));
         addView(sessionDrawerHost, new LayoutParams(-1, -1));
         applySessionDrawerDistance(0);
+    }
+    /** 主导航与消息、输入同属移动页；目录展开时共用同一返回遮罩和无障碍互锁。 */
+    void setBottomNavigation(View navigation) {
+        if (bottomNavigation == navigation) return;
+        if (bottomNavigation != null) sessionConversation.removeView(bottomNavigation);
+        bottomNavigation = navigation;
+        if (navigation == null) return;
+        if (navigation.getParent() instanceof ViewGroup)
+            ((ViewGroup) navigation.getParent()).removeView(navigation);
+        sessionConversation.addView(navigation, new LayoutParams(-1, dp(66)));
     }
     private int sessionDrawerWidth() {
         return Math.min(dp(360), Math.round(sessionDrawerHost.getWidth() * .78f));
@@ -2195,11 +2208,13 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         List<JSONObject> local = new ArrayList<>();
         Map<String, JSONObject> owners = new LinkedHashMap<>();
         Map<String, List<JSONObject>> groups = new LinkedHashMap<>();
+        Map<String, Boolean> displayPresence = new LinkedHashMap<>();
         if (devices != null) for (int i = 0; i < devices.length(); i++) {
             JSONObject device = devices.optJSONObject(i);
             if (device == null) continue;
             String key = sessionDeviceKey(device);
             owners.put(key, device); groups.put(key, new ArrayList<>());
+            displayPresence.put(key, device.optBoolean("online"));
         }
         for (int i = 0; i < items.length(); i++) {
             JSONObject session = items.optJSONObject(i);
@@ -2208,8 +2223,11 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             String key = sessionDeviceKey(session);
             owners.putIfAbsent(key, session);
             groups.computeIfAbsent(key, ignored -> new ArrayList<>()).add(session);
+            // The catalog's two display projections can arrive at different moments.
+            // Match iOS's header aggregation without changing the command-owner lease.
+            displayPresence.put(key, displayPresence.getOrDefault(key, false) || session.optBoolean("online"));
         }
-        addSessionDeviceHeader("这台设备", "local", local.size() + (blankDraft ? 1 : 0), null);
+        addSessionDeviceHeader("这台设备", "local", local.size() + (blankDraft ? 1 : 0), null, false);
         if (!collapsedSessionDevices.contains("local")) {
             if (blankDraft) sessionDrawerList.addView(sessionDrawerRow("未发送草稿", "",
                 selected.isEmpty() && state.remoteSession == null, v -> {
@@ -2222,7 +2240,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         for (Map.Entry<String, List<JSONObject>> entry : groups.entrySet()) {
             JSONObject device = owners.get(entry.getKey());
             String name = device.optString("device_name", "所属设备");
-            addSessionDeviceHeader(name, entry.getKey(), entry.getValue().size(), device);
+            addSessionDeviceHeader(name, entry.getKey(), entry.getValue().size(), device,
+                displayPresence.getOrDefault(entry.getKey(), false));
             if (collapsedSessionDevices.contains(entry.getKey())) continue;
             for (JSONObject session : entry.getValue()) addSessionDrawerConversation(session);
             if (entry.getValue().isEmpty()) addEmptySessionGroup("暂无对话");
@@ -2232,7 +2251,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private static String sessionDeviceKey(JSONObject device) {
         return new JSONArray().put(device.optString("device_slot")).put(device.optString("device_id")).toString();
     }
-    private void addSessionDeviceHeader(String name, String key, int count, JSONObject device) {
+    private void addSessionDeviceHeader(String name, String key, int count, JSONObject device, boolean online) {
         boolean collapsed = collapsedSessionDevices.contains(key);
         LinearLayout header = row();
         header.setGravity(Gravity.CENTER_VERTICAL);
@@ -2240,7 +2259,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         TextView label = text((collapsed ? "▸  " : "▾  ") + name, MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
         label.setSingleLine(true); label.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
         label.setGravity(Gravity.CENTER_VERTICAL); label.setPadding(dp(12), 0, dp(4), 0);
-        label.setContentDescription(name + "，" + (device == null ? "本机" : device.optBoolean("online") ? "在线" : "离线")
+        label.setContentDescription(name + "，" + (device == null ? "本机" : online ? "在线" : "离线")
             + "，" + count + " 个对话");
         label.setOnClickListener(v -> {
             if (sessionActionsBlocked()) return;
@@ -2249,7 +2268,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             refreshSessionDrawer();
         });
         header.addView(label, new LayoutParams(0, dp(34), 1));
-        TextView status = text((device == null ? "" : device.optBoolean("online") ? "● 在线  " : "● 离线  ")
+        TextView status = text((device == null ? "" : online ? "● 在线  " : "● 离线  ")
             + (count > 0 ? count : ""), MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
         header.addView(status, new LayoutParams(-2, -2));
         if (device != null) {
@@ -2258,6 +2277,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 requestRemoteNewConversation(device);
             });
             create.setBackgroundColor(Color.TRANSPARENT);
+            create.setColorFilter(MaiChatTheme.BLUE);
             create.setEnabled(device.optBoolean("online") && !navigationPending);
             header.addView(create, new LayoutParams(dp(34), dp(34)));
         }

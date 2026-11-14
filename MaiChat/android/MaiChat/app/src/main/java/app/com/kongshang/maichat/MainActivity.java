@@ -1320,7 +1320,11 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
             || (activeTab == RemoteIMTab.REMOTE && session.remoteDesktop().isActive());
         if (!hideTabs) {
             renderedTabBar = bottomTabBar();
-            root.addView(renderedTabBar, match(dp(66)));
+            if (activeTab == RemoteIMTab.ASSISTANT && aiAssistant != null) {
+                // As on iOS, Creation owns its navigation inside the same moving page.
+                // Other tabs keep the ordinary root bar and its existing inset handling.
+                aiAssistant.setBottomNavigation(renderedTabBar);
+            } else root.addView(renderedTabBar, match(dp(66)));
             renderedPrimaryTab = activeTab;
         }
     }

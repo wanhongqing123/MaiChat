@@ -124,6 +124,29 @@ public final class AIAssistantSessionDrawerTest {
         assertNotNull(text(panel, "本机对话"));
     }
 
+    @Test public void deviceHeaderKeepsTheCatalogNameAndAggregatesSessionPresenceLikeIOS() throws Exception {
+        JSONObject device = new JSONObject().put("device_slot", "windows").put("device_id", "pc")
+            .put("device_name", "hongqingwan").put("online", false);
+        JSONObject remote = new JSONObject(device.toString()).put("id", "remote-one")
+            .put("title", "电脑上的对话").put("login_session_id", "login").put("online", true);
+        JSONObject data = new JSONObject().put("devices", new JSONArray().put(device))
+            .put("sessions", new JSONArray().put(remote)).put("messages", new JSONArray());
+        panel.onState(new AIAssistantController.State(data, null, "", "", "deepseek-flash",
+            "on-request", "", "", "", 0, false, true));
+        named(panel, "打开对话列表").performClick(); settle(); layout();
+        assertNotNull("The same device_name is displayed on iOS, with presence from either catalog projection",
+            named(panel, "hongqingwan，在线，1 个对话"));
+        assertFalse("Display aggregation must not grant a new command lease to a stale device catalog",
+            named(panel, "在hongqingwan上新建对话").isEnabled());
+    }
+
+    @Test public void remoteCreateUsesTheIOSBlueActionColor() {
+        named(panel, "打开对话列表").performClick(); settle(); layout();
+        android.widget.ImageButton create = (android.widget.ImageButton) named(panel, "在我的电脑上新建对话");
+        assertEquals(MaiChatTheme.BLUE,
+            Shadows.shadowOf((android.graphics.PorterDuffColorFilter) create.getColorFilter()).getColor());
+    }
+
     @Test public void expandedDrawerClosesByDraggingTheConversationAndByAndroidBack() {
         named(panel, "打开对话列表").performClick(); settle(); layout();
         View card = named(panel, "创作中心会话页面");

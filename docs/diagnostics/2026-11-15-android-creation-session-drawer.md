@@ -23,3 +23,28 @@ Root installed 276 in place, without clearing/uninstalling the normal App or rea
 Evidence is retained under `.cache/android-creation-parity-20261115/normal276/`, including the physical screenshots, package and runtime receipts. Early attempts while a system installer was covering the App are excluded from gesture acceptance. Root observed the active App before the accepted runs.
 
 Actual live remote-image display is a separate gate from the verified UI/control actions. Image parts with a valid temporary publication are supported by the new downloader. Historical images with no publication or expired publications without a retained copy remain source-device placeholders, as on iOS; the client does not silently scan and upload user history. Local fixtures and this distinction must not be reported as a live image row being accepted on the normal account.
+
+## Follow-up: bottom bar and displayed device information
+
+The later user screenshot exposed a remaining layout difference. iOS injects its
+`RootTabBar` into the same `AIAssistantView` page inset that receives the drawer
+scale/offset. Android had kept that bar outside the transformed page. The normal
+bar is now mounted inside the existing conversation page for Creation Center;
+other tabs retain their original root bar. Touching the exposed page/bar while
+the drawer is open closes the drawer without changing tabs.
+
+Both iOS and Android display the catalog `device_name`. The desktop production
+constructor uses `QSysInfo::machineHostName()` unless explicitly overridden; the
+observed Windows hostname was `HONGQINGWAN`. It is device information, not a
+contact nickname. That field and the icon-only bottom navigation contract remain
+unchanged. Header presence now follows iOS's device/session display OR, while
+creation and commands still use the authoritative device-online gate. The new
+session glyph matches iOS blue.
+
+The exact final attached-window fixture failed four assertions with the original
+two production files, then passed all 26 Drawer/MainNavigation cases with the
+candidate. Unattached-window and initial color-accessor fixture failures are
+retained separately. Independent source review found no important issue. Normal
+280 / 2.2.38 installation and physical page/bar motion remain the final check at
+this source checkpoint. The separate image path has already passed ordinary279
+image display and preview; this layout change does not replace that evidence.
