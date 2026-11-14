@@ -39,7 +39,7 @@ public class MaiSessionAttachmentsTemporaryImageTest {
     @Before public void setUp() throws Exception {
         directory = Files.createTempDirectory("owned-session-image-adapter");
         Context context = ApplicationProvider.getApplicationContext();
-        OwnedAuth.account = "reader-account"; OwnedAuth.accessCalls = 0; OwnedAuth.duringAccess = null;
+        OwnedAuth.account = "reader-account"; OwnedAuth.generation = 7; OwnedAuth.accessCalls = 0; OwnedAuth.duringAccess = null;
         OwnedAuth.client = ReflectionHelpers.callConstructor(MaiChatAuthClient.class,
             ClassParameter.from(Context.class, context));
         OwnedNative.reset();
@@ -81,6 +81,23 @@ public class MaiSessionAttachmentsTemporaryImageTest {
         OwnedAuth.duringAccess = () -> OwnedAuth.account = "replacement-account";
         assertThrows(IOException.class, () -> download(request(), directory.resolve("renewed.bin").toFile(), null));
         assertEquals(1, OwnedAuth.accessCalls); assertTrue(OwnedNative.events.isEmpty());
+    }
+
+    @Test public void sameAccountReloginDuringCredentialRefreshNeverReachesNative() throws Exception {
+        OwnedAuth.duringAccess = () -> OwnedAuth.generation++;
+        File target = directory.resolve("relogged-before-native.bin").toFile();
+        assertThrows(IOException.class, () -> download(request(), target, null));
+        assertEquals(1, OwnedAuth.accessCalls); assertEquals(0, OwnedNative.downloads);
+        assertFalse(target.exists());
+    }
+
+    @Test public void sameAccountReloginDuringNativeReturnDiscardsOnlyNewStage() throws Exception {
+        File retained = Files.write(directory.resolve("retained.bin"), new byte[] {7, 8}).toFile();
+        File target = directory.resolve("relogged-after-native.bin").toFile();
+        OwnedNative.duringDownload = () -> OwnedAuth.generation++;
+        assertThrows(IOException.class, () -> download(request(), target, null));
+        assertEquals(1, OwnedNative.downloads); assertFalse(target.exists());
+        assertArrayEquals(new byte[] {7, 8}, Files.readAllBytes(retained.toPath()));
     }
 
     @Test public void nativeReturnAccountChangeDeletesOnlyThisNewUnpublishedTarget() throws Exception {
@@ -175,10 +192,11 @@ public class MaiSessionAttachmentsTemporaryImageTest {
 
     @Implements(value = MaiChatAuthClient.class, isInAndroidSdk = false)
     public static class OwnedAuth {
-        static MaiChatAuthClient client; static String account; static int accessCalls; static Runnable duringAccess;
+        static MaiChatAuthClient client; static String account; static long generation; static int accessCalls; static Runnable duringAccess;
         @Implementation protected void __constructor__(Context ignored) { }
         @Implementation public static MaiChatAuthClient shared(Context ignored) { return client; }
         @Implementation public String accountId() { return account; }
+        @Implementation public long accountSessionGeneration() { return generation; }
         @Implementation public MaiChatAuthClient.CloudDriveAccess cloudDriveAccess() {
             accessCalls++; if (duringAccess != null) duringAccess.run();
             return new MaiChatAuthClient.CloudDriveAccess("https://owned.example.invalid/api", "owned-fixture-token");
@@ -192,6 +210,9 @@ public class MaiSessionAttachmentsTemporaryImageTest {
 
     @Implements(value = MaiSessionAttachments.class, isInAndroidSdk = false)
     public static class OwnedNative {
+        @Implementation protected static MaiCloudDrive.MediaInfo mediaInfo(String name) {
+            return AIAssistantRemoteImagesTest.info(name);
+        }
         static final List<String> events = new ArrayList<>();
         static int downloads; static boolean active; static String base; static List<String> tuple;
         static JSONObject payload; static Runnable duringDownload; static Consumer<JSONObject> mutateReceipt;

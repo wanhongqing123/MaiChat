@@ -341,6 +341,9 @@ public final class AIAssistantController {
     private JSONObject pendingRemoteSelection;
     private int remoteSelectionGeneration;
     private final AIAssistantRemoteImages.Cache remoteImageCache;
+    // Auth's public account ID owns media/cache; accountUserId remains the IM/workspace owner.
+    // Retain this snapshot with accountToolLoginGeneration so a same-account relogin cannot adopt old work.
+    private final String remoteImageAuthAccountId;
     private final RemoteImageReads remoteImageReads;
     private final ImagePublicationCommands imagePublicationCommands;
     private final Map<String, File> remoteImageFiles = new java.util.concurrent.ConcurrentHashMap<>();
@@ -447,6 +450,7 @@ public final class AIAssistantController {
         this.imagePublicationCommands = imageCommands;
         accountAuth = MaiChatAuthClient.shared(this.context);
         accountToolLoginGeneration = accountAuth.accountSessionGeneration();
+        remoteImageAuthAccountId = accountAuth.accountId();
         if (testEndpoint != null && !BuildConfig.DEBUG)
             throw new IllegalArgumentException("Test endpoint in release build");
         this.testEndpoint = testEndpoint;
@@ -456,8 +460,11 @@ public final class AIAssistantController {
             @Override public MaiCloudDrive.MediaInfo mediaInfo(String name) { return MaiSessionAttachments.mediaInfo(name); }
             @Override public void download(JSONObject request, File target,
                 AIAssistantPreparationJobs.Cancellation cancellation) throws Exception {
-                new MaiSessionAttachments(AIAssistantController.this.context, accountUserId)
+                if (!ownsRemoteImageAccount()) throw new IOException("原图片账号已切换");
+                new MaiSessionAttachments(AIAssistantController.this.context, remoteImageAuthAccountId,
+                    accountToolLoginGeneration)
                     .downloadTemporaryImage(request, target, cancellation);
+                if (!ownsRemoteImageAccount()) throw new IOException("原图片账号已切换");
             }
         };
         try {
@@ -1727,6 +1734,7 @@ public final class AIAssistantController {
             visible.put("remoteSelectionGeneration", remoteSelectionGeneration);
             // A clicked State must belong to this account generation, even if another account has the same remote IDs.
             visible.put("remoteImageAccountId", accountUserId);
+            visible.put("remoteImageAuthAccountId", remoteImageAuthAccountId);
             visible.put("remoteImageAccountGeneration", accountToolLoginGeneration);
             toolDetails.select(accountUserId, accountToolLoginGeneration, shown, selectedRemote);
             toolDetails.observeMessages(visible.optJSONArray("messages"));
@@ -3739,10 +3747,19 @@ public final class AIAssistantController {
         }
     }
 
+    private boolean ownsRemoteImageAccount() {
+        // Keep the existing IM/workspace owner lease and independently verify Auth's identity/epoch,
+        // including test transports and completed-cache reads. Access-token renewal preserves the epoch.
+        return ownsModelConfiguration() && !remoteImageAuthAccountId.isEmpty()
+            && remoteImageAuthAccountId.equals(accountAuth.accountId())
+            && accountToolLoginGeneration == accountAuth.accountSessionGeneration();
+    }
+
     private JSONObject currentRemoteImagePart(State owner, String messageID, JSONObject part, boolean matchMetadata) {
         State current = state;
-        if (owner == null || messageID == null || messageID.isEmpty() || part == null || !ownsModelConfiguration() || owner.remoteSession == null
+        if (owner == null || messageID == null || messageID.isEmpty() || part == null || !ownsRemoteImageAccount() || owner.remoteSession == null
             || !accountUserId.equals(owner.data.optString("remoteImageAccountId"))
+            || !remoteImageAuthAccountId.equals(owner.data.optString("remoteImageAuthAccountId"))
             || owner.data.optLong("remoteImageAccountGeneration", -1) != accountToolLoginGeneration
             || !sameRemote(owner.remoteSession, current.remoteSession)
             || owner.data.optInt("remoteSelectionGeneration") != current.data.optInt("remoteSelectionGeneration")) return null;
@@ -3776,7 +3793,7 @@ public final class AIAssistantController {
     String cachedRemoteImagePath(State owner, String messageID, JSONObject part) {
         if (!currentRemoteImage(owner, messageID, part)) return null;
         AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.forCache(
-            accountUserId, owner.remoteSession, messageID, part, remoteImageReads::mediaInfo);
+            remoteImageAuthAccountId, owner.remoteSession, messageID, part, remoteImageReads::mediaInfo);
         File file = request == null ? null : remoteImageFiles.get(request.signature);
         return file != null && file.isFile() ? file.getAbsolutePath() : null;
     }
@@ -3791,7 +3808,7 @@ public final class AIAssistantController {
             ImagePublication pending = null;
             try {
                 if (currentRemoteImagePart(owner, messageID, captured, true) == null) throw new IOException("会话已切换");
-                String key = new JSONArray().put(accountUserId).put(accountToolLoginGeneration)
+                String key = new JSONArray().put(remoteImageAuthAccountId).put(accountUserId).put(accountToolLoginGeneration)
                     .put(owner.data.optInt("remoteSelectionGeneration")).put(pageOwner(owner.remoteSession))
                     .put(messageID).put(captured.optString("id")).toString();
                 pending = imagePublications.get(key);
@@ -3800,7 +3817,7 @@ public final class AIAssistantController {
                 pending.callbacks.add(completion); imagePublications.put(key, pending);
                 final ImagePublication ticket = pending;
                 AIAssistantRemoteImages.Request cachedRequest = AIAssistantRemoteImages.Request.forCache(
-                    accountUserId, owner.remoteSession, messageID, captured, remoteImageReads::mediaInfo);
+                    remoteImageAuthAccountId, owner.remoteSession, messageID, captured, remoteImageReads::mediaInfo);
                 if (!preparations.start("remote-image:publication-cache:" + key, nativeEpoch, () -> nativeEpoch,
                     cancellation -> {
                         File cached = cachedRequest == null ? null : remoteImageCache.cached(cachedRequest);
@@ -3874,7 +3891,7 @@ public final class AIAssistantController {
             JSONObject preparedPart = new JSONObject(ticket.source.toString()).put("remoteImage", metadata);
             preparedPart.remove("path");
             if (metadata == null || !metadata.optString("state").equals("ready")
-                || AIAssistantRemoteImages.Request.parse(accountUserId, ticket.owner.remoteSession,
+                || AIAssistantRemoteImages.Request.parse(remoteImageAuthAccountId, ticket.owner.remoteSession,
                     ticket.message, preparedPart, remoteImageReads::mediaInfo) == null) return true;
             JSONObject current = currentRemoteImagePart(ticket.owner, ticket.message, ticket.source, false);
             JSONObject observed = current == null ? null : current.optJSONObject("remoteImage");
@@ -3952,7 +3969,7 @@ public final class AIAssistantController {
                 JSONObject metadata = captured.optJSONObject("remoteImage");
                 String status = AIAssistantRemoteImages.text(metadata, "state");
                 AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.forCache(
-                    accountUserId, owner.remoteSession, messageID, captured, remoteImageReads::mediaInfo);
+                    remoteImageAuthAccountId, owner.remoteSession, messageID, captured, remoteImageReads::mediaInfo);
                 if (request == null) {
                     if (status.equals("pending")) throw new IOException("图片正在同步");
                     if (status.equals("failed")) throw new IOException(metadata.optLong("expires_at") > 0

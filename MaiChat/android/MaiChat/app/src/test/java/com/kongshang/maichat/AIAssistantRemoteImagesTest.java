@@ -73,6 +73,16 @@ public final class AIAssistantRemoteImagesTest {
         assertEquals(request.signature, request("account", owner().put("login_session_id", "future-login"), "message", partCopy(request)).signature);
     }
 
+    @Test public void authAccountPartitionsImageCacheIndependentlyOfImIdentity() throws Exception {
+        JSONObject catalog = owner().put("im_user_id", "different-im-login");
+        AIAssistantRemoteImages.Request first = request("public-auth-account", catalog, "message", part());
+        AIAssistantRemoteImages.Request other = request("other-auth-account", catalog, "message", partCopy(first));
+        assertEquals("public-auth-account", first.downloadRequest().getString("account_id"));
+        assertNotEquals(first.accountKey, other.accountKey); assertNotEquals(first.cacheKey, other.cacheKey);
+        assertEquals("different-im-login", catalog.getString("im_user_id"));
+        assertEquals("original-login", first.downloadRequest().getString("owner_login_session_id"));
+    }
+
     private JSONObject partCopy(AIAssistantRemoteImages.Request request) throws Exception {
         JSONObject part = part(); part.getJSONObject("remoteImage").put("expires_at", request.expiry); return part;
     }

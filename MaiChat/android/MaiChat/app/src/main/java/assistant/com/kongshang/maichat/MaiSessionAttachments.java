@@ -43,6 +43,7 @@ final class MaiSessionAttachments {
     private final Context context;
     private final MaiChatAuthClient auth;
     private final String expectedAccount;
+    private final long expectedGeneration;
     private static final MaiChatAttachmentDownload.NativeTransport DOWNLOAD =
         new MaiChatAttachmentDownload.NativeTransport();
 
@@ -78,9 +79,17 @@ final class MaiSessionAttachments {
     }
 
     MaiSessionAttachments(Context context, String expectedAccount) {
+        this(context, expectedAccount,
+            MaiChatAuthClient.shared(context.getApplicationContext()).accountSessionGeneration());
+    }
+
+    // Callers with an existing media lease must pass its original epoch, rather than
+    // capturing a replacement login while an older Controller is still unwinding.
+    MaiSessionAttachments(Context context, String expectedAccount, long expectedGeneration) {
         this.context = context.getApplicationContext();
         auth = MaiChatAuthClient.shared(this.context);
         this.expectedAccount = expectedAccount;
+        this.expectedGeneration = expectedGeneration;
     }
 
     static MaiCloudDrive.MediaInfo mediaInfo(String name) {
@@ -246,7 +255,10 @@ final class MaiSessionAttachments {
     }
 
     private void requireImageAccount(String account) throws IOException {
-        if (account.isEmpty() || !account.equals(expectedAccount) || !account.equals(auth.accountId()))
+        // Called before credentials, after a possible token refresh and after Native returns.
+        // A same-account login replacement is a new lease; ordinary token refresh is not.
+        if (account.isEmpty() || !account.equals(expectedAccount) || !account.equals(auth.accountId())
+                || expectedGeneration != auth.accountSessionGeneration())
             throw new IOException("原图片账号已切换");
     }
 

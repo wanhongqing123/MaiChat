@@ -24,12 +24,17 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestRunner;
 import org.robolectric.Shadows;
+import org.robolectric.util.ReflectionHelpers;
+import org.robolectric.util.ReflectionHelpers.ClassParameter;
 import org.robolectric.annotation.Config;
 import org.robolectric.annotation.Implementation;
 import org.robolectric.annotation.Implements;
 
 @RunWith(RobolectricTestRunner.class)
-@Config(sdk = 34, shadows = AIAssistantRemoteImageControllerTest.OwnedNative.class)
+@Config(sdk = 34, shadows = {AIAssistantRemoteImageControllerTest.OwnedNative.class,
+    MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.class,
+    MaiSessionAttachmentsTemporaryImageTest.OwnedTrust.class,
+    MaiSessionAttachmentsTemporaryImageTest.OwnedNative.class})
 public final class AIAssistantRemoteImageControllerTest {
     private AIAssistantController controller;
     private Images images;
@@ -38,6 +43,13 @@ public final class AIAssistantRemoteImageControllerTest {
 
     @Before public void setup() throws Exception {
         Context context = ApplicationProvider.getApplicationContext();
+        MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.account = "public-" + UUID.randomUUID();
+        MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.generation = 7;
+        MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.accessCalls = 0;
+        MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.duringAccess = null;
+        MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.client = ReflectionHelpers.callConstructor(
+            MaiChatAuthClient.class, ClassParameter.from(Context.class, context));
+        MaiSessionAttachmentsTemporaryImageTest.OwnedNative.reset();
         images = new Images();
         commands = new Commands();
         controller = new AIAssistantController(context, "http://owned.invalid", null, images, commands);
@@ -45,7 +57,68 @@ public final class AIAssistantRemoteImageControllerTest {
         image = AIAssistantRemoteImagesTest.part();
         page(AIAssistantRemoteImagesTest.owner(), image, 1);
     }
-    @After public void close() { images.release.countDown(); controller.close(); }
+    @After public void close() {
+        images.release.countDown(); controller.close();
+        MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.client = null;
+        MaiSessionAttachmentsTemporaryImageTest.OwnedNative.reset();
+    }
+
+    @Test public void defaultImageReadUsesAuthAccountWithoutChangingImStorageOwner() throws Exception {
+        String imOwner = (String) field("accountUserId").get(controller);
+        controller.close();
+        controller = new AIAssistantController(ApplicationProvider.getApplicationContext(), "http://owned.invalid", null, null, commands);
+        field("accountUserId").set(controller, imOwner);
+        MaiSessionAttachmentsTemporaryImageTest.OwnedNative.fileBytes = new byte[] {1, 2, 3, 4};
+        page(AIAssistantRemoteImagesTest.owner(), image, 1);
+        Reply read = await(load(controller.state, image));
+        assertEquals("", read.error); assertNotNull(read.file);
+        assertNotEquals(imOwner, MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.account);
+        assertEquals(imOwner, field("accountUserId").get(controller));
+        assertEquals(1, MaiSessionAttachmentsTemporaryImageTest.OwnedNative.downloads);
+        AIAssistantRemoteImages.Request expected = AIAssistantRemoteImages.Request.parse(
+            MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.account, controller.state.remoteSession, "message", image,
+            AIAssistantRemoteImagesTest::info);
+        AIAssistantRemoteImages.Cache cache = (AIAssistantRemoteImages.Cache) field("remoteImageCache").get(controller);
+        assertEquals(read.file, cache.cached(expected));
+    }
+
+    @Test public void completedCacheRejectsAnotherAuthAccountEvenWithSameImOwner() throws Exception {
+        AIAssistantController.State clicked = controller.state;
+        Reply read = await(load(clicked, image)); assertNotNull(read.file);
+        MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.account = "another-public-account";
+        assertNull(controller.cachedRemoteImagePath(clicked, "message", image));
+        Reply refused = await(load(clicked, image));
+        assertNull(refused.file); assertEquals("会话已切换", refused.error); assertEquals(1, images.reads.get());
+    }
+
+    @Test public void completedCacheRejectsSameAuthAccountReloginEpoch() throws Exception {
+        AIAssistantController.State clicked = controller.state;
+        Reply read = await(load(clicked, image)); assertNotNull(read.file);
+        MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.generation++;
+        assertNull(controller.cachedRemoteImagePath(clicked, "message", image));
+        Reply refused = await(load(clicked, image));
+        assertNull(refused.file); assertEquals("会话已切换", refused.error); assertEquals(1, images.reads.get());
+    }
+
+    @Test public void inflightReadRejectsSameAuthAccountReloginBeforeCacheCommit() throws Exception {
+        images.block = true;
+        CompletableFuture<Reply> pending = load(controller.state, image);
+        assertTrue(images.started.await(3, TimeUnit.SECONDS));
+        MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.generation++;
+        images.release.countDown(); Reply refused = await(pending);
+        assertNull(refused.file); assertEquals("会话已切换", refused.error);
+        assertFalse(images.target.exists());
+    }
+
+    @Test public void inflightReadRejectsAuthAccountChangeBeforeCacheCommit() throws Exception {
+        images.block = true;
+        CompletableFuture<Reply> pending = load(controller.state, image);
+        assertTrue(images.started.await(3, TimeUnit.SECONDS));
+        MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.account = "another-public-account";
+        images.release.countDown(); Reply refused = await(pending);
+        assertNull(refused.file); assertEquals("会话已切换", refused.error);
+        assertFalse(images.target.exists());
+    }
 
     @Test public void coalescedReadUsesOriginalOwnerAndPublishesOnlyCompletedPrivateBytes() throws Exception {
         images.block = true;
@@ -82,7 +155,7 @@ public final class AIAssistantRemoteImageControllerTest {
         // Model a complete copy retained before this process started, with the server's fixed expiry now in the past.
         image.getJSONObject("remoteImage").put("state", "expired").put("expires_at", 1L);
         AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.parse(
-            (String) field("accountUserId").get(controller), AIAssistantRemoteImagesTest.owner(), "message", image, images::mediaInfo);
+            MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.account, AIAssistantRemoteImagesTest.owner(), "message", image, images::mediaInfo);
         AIAssistantRemoteImages.Cache cache = (AIAssistantRemoteImages.Cache) field("remoteImageCache").get(controller);
         File staged = cache.staging(request); Files.write(staged.toPath(), new byte[] {1, 2, 3, 4});
         File retained = cache.commit(staged, request);
@@ -137,9 +210,9 @@ public final class AIAssistantRemoteImageControllerTest {
 
     @Test public void identicalRemoteTupleFromAnotherAccountOrLoginGenerationCannotStartARead() throws Exception {
         AIAssistantController.State current = controller.state;
-        for (String field : new String[] {"remoteImageAccountId", "remoteImageAccountGeneration"}) {
+        for (String field : new String[] {"remoteImageAccountId", "remoteImageAuthAccountId", "remoteImageAccountGeneration"}) {
             JSONObject snapshot = new JSONObject(current.data.toString());
-            snapshot.put(field, field.equals("remoteImageAccountId") ? "another-account"
+            snapshot.put(field, !field.equals("remoteImageAccountGeneration") ? "another-account"
                 : current.data.optLong(field) + 1);
             AIAssistantController.State foreign = new AIAssistantController.State(snapshot, current.remoteSession,
                 current.selected, current.baseUrl, current.model, current.policy, "", "", "", 0, false, true);
@@ -152,7 +225,7 @@ public final class AIAssistantRemoteImageControllerTest {
     @Test public void explicitPublicationUsesCompleteExpiredCopyEvenWhileOwnerIsOffline() throws Exception {
         image.getJSONObject("remoteImage").put("state", "expired").put("expires_at", 1L);
         AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.parse(
-            (String) field("accountUserId").get(controller), AIAssistantRemoteImagesTest.owner(), "message", image, images::mediaInfo);
+            MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.account, AIAssistantRemoteImagesTest.owner(), "message", image, images::mediaInfo);
         AIAssistantRemoteImages.Cache cache = (AIAssistantRemoteImages.Cache) field("remoteImageCache").get(controller);
         File staged = cache.staging(request); Files.write(staged.toPath(), new byte[] {1, 2, 3, 4});
         File retained = cache.commit(staged, request);
@@ -174,7 +247,7 @@ public final class AIAssistantRemoteImageControllerTest {
 
     @Test public void automaticCacheProbeKeepsCompletePendingAndFailedCopiesVisibleOfflineWithoutPublication() throws Exception {
         AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.parse(
-            (String) field("accountUserId").get(controller), AIAssistantRemoteImagesTest.owner(), "message", image, images::mediaInfo);
+            MaiSessionAttachmentsTemporaryImageTest.OwnedAuth.account, AIAssistantRemoteImagesTest.owner(), "message", image, images::mediaInfo);
         AIAssistantRemoteImages.Cache cache = (AIAssistantRemoteImages.Cache) field("remoteImageCache").get(controller);
         File staged = cache.staging(request); Files.write(staged.toPath(), new byte[] {1, 2, 3, 4});
         File retained = cache.commit(staged, request);
