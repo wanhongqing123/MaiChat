@@ -27,11 +27,11 @@ final class SocialLoginUITests: XCTestCase {
         XCTAssertTrue(binding.isHittable)
     }
 
-    /// 同一个普通私聊 Sheet 覆盖取消/确认/解绑；不触发 IM send 或模型请求。
+    /// 同一个普通私聊 Sheet 覆盖右侧反选/取消/确认/解绑，保持草稿且不发送真实消息。
     @MainActor func testSessionBindingSelectionPreservesIMDraft() {
         continueAfterFailure = false
         let app = XCUIApplication()
-        app.launchArguments = ["--ai-ui-test", "--im-group-ui-test"]
+        app.launchArguments = ["--ai-ui-test", "--im-group-ui-test", "--im-session-picker-refresh-ui-test"]
         app.launchEnvironment["MAICHAT_AI_TEST_ID"] = UUID().uuidString
         app.launch()
         defer { app.terminate() }
@@ -51,18 +51,54 @@ final class SocialLoginUITests: XCTestCase {
         openPicker()
         let choice = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "im-session-choice-")).firstMatch
         XCTAssertTrue(choice.waitForExistence(timeout: 20), app.debugDescription)
-        choice.tap()
+        let checkmark = choice.coordinate(withNormalizedOffset: CGVector(dx: 0.94, dy: 0.5))
+        checkmark.tap()
         let selectedChoice = XCTNSPredicateExpectation(predicate: NSPredicate(format: "selected == true"), object: choice)
         XCTAssertEqual(XCTWaiter.wait(for: [selectedChoice], timeout: 3), .completed)
         let pickerCapture = XCTAttachment(screenshot: app.screenshot())
         pickerCapture.name = "owned-im-session-binding-picker-selected"
         pickerCapture.lifetime = .keepAlways; add(pickerCapture)
+        checkmark.tap()
+        let deselectedChoice = XCTNSPredicateExpectation(predicate: NSPredicate(format: "selected == false"), object: choice)
+        XCTAssertEqual(XCTWaiter.wait(for: [deselectedChoice], timeout: 3), .completed)
+        XCTAssertFalse(app.buttons["im-session-binding-confirm"].isEnabled,
+                       "再次点击右侧对勾应清空选择，不能继续确认旧选择")
+        let deselectedCapture = XCTAttachment(screenshot: app.screenshot())
+        deselectedCapture.name = "owned-im-session-binding-picker-deselected"
+        deselectedCapture.lifetime = .keepAlways; add(deselectedCapture)
+        checkmark.tap()
+        let selectedAgain = XCTNSPredicateExpectation(predicate: NSPredicate(format: "selected == true"), object: choice)
+        XCTAssertEqual(XCTWaiter.wait(for: [selectedAgain], timeout: 3), .completed)
+        let boundChoiceID = choice.identifier
         app.buttons["im-session-binding-confirm"].tap()
         let unbind = app.buttons["im-session-binding-unbind"]
         XCTAssertTrue(unbind.waitForExistence(timeout: 10), app.debugDescription)
         XCTAssertEqual(draft.value as? String, "binding draft stays here")
         let capture = XCTAttachment(screenshot: app.screenshot())
         capture.name = "owned-im-session-bound-draft"; capture.lifetime = .keepAlways; add(capture)
+        // 已有真实 Native 绑定时，后台正常 projection 更新不得撤销用户明确的空选择。
+        openPicker()
+        let boundChoice = app.buttons[boundChoiceID]
+        XCTAssertTrue(boundChoice.waitForExistence(timeout: 10))
+        XCTAssertTrue(boundChoice.isSelected)
+        boundChoice.coordinate(withNormalizedOffset: CGVector(dx: 0.94, dy: 0.5)).tap()
+        let boundDeselected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "selected == false"), object: boundChoice)
+        XCTAssertEqual(XCTWaiter.wait(for: [boundDeselected], timeout: 3), .completed)
+        XCTAssertFalse(app.buttons["im-session-binding-confirm"].isEnabled)
+        app.buttons["im-session-picker-refresh-fixture"].tap()
+        let renamed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@", "已刷新绑定标题"), object: boundChoice)
+        XCTAssertEqual(XCTWaiter.wait(for: [renamed], timeout: 10), .completed)
+        XCTAssertFalse(boundChoice.isSelected, "普通绑定标题刷新不得把用户已取消的选择恢复")
+        XCTAssertFalse(app.buttons["im-session-binding-confirm"].isEnabled)
+        let refreshedCapture = XCTAttachment(screenshot: app.screenshot())
+        refreshedCapture.name = "owned-bound-picker-deselected-after-projection"
+        refreshedCapture.lifetime = .keepAlways; add(refreshedCapture)
+        app.buttons["取消"].tap()
+        XCTAssertTrue(unbind.exists, "反选只改变待确认选择，不应解除已有绑定")
+        XCTAssertEqual(draft.value as? String, "binding draft stays here")
+        openPicker()
+        XCTAssertTrue(app.buttons[boundChoiceID].isSelected, "重新打开时已有绑定仍应默认选中原会话")
+        app.buttons["取消"].tap()
         unbind.tap()
         XCTAssertTrue(NSPredicate(format: "exists == false").evaluate(with: unbind) ||
             XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: unbind)], timeout: 8) == .completed)

@@ -851,7 +851,12 @@ struct IMSessionBindingPicker: View {
                                         let occupied = appState.imSessionBindings.contains {
                                             $0.sessionID == session.id && $0.peerID != peerID
                                         }
-                                        Button { selected = session.id; selectedWorkspace = session.workspaceKey } label: {
+                                        Button {
+                                            // 重复点选只取消待确认选择，同时清掉旧 workspace pin。
+                                            let deselecting = selected == session.id
+                                            selected = deselecting ? "" : session.id
+                                            selectedWorkspace = deselecting ? "" : session.workspaceKey
+                                        } label: {
                                             HStack(spacing: 12) {
                                                 VStack(alignment: .leading, spacing: 5) {
                                                     Text(session.displayTitle).font(AppTypography.detail.weight(.medium))
@@ -928,6 +933,23 @@ struct IMSessionBindingPicker: View {
                     } else { dismiss() }
                 }
             } }
+            #if DEBUG && targetEnvironment(simulator)
+            .toolbar {
+                if ProcessInfo.processInfo.arguments.contains("--im-session-picker-refresh-ui-test") {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("刷新测试标题") {
+                            Task {
+                                guard let bound = appState.imSessionBinding(for: peerID) else { return }
+                                // 走普通会话选择/改名/查询链路，不直接注入显示数组或更改绑定。
+                                await AIAssistantModel.shared.selectConversation(bound.sessionID)
+                                await AIAssistantModel.shared.action("rename", values: ["title": "已刷新绑定标题"])
+                                await appState.refreshIMSessionBindings()
+                            }
+                        }.accessibilityIdentifier("im-session-picker-refresh-fixture")
+                    }
+                }
+            }
+            #endif
             .interactiveDismissDisabled(saving)
             .tint(RemoteIMStyle.blue)
             .task {
@@ -942,8 +964,8 @@ struct IMSessionBindingPicker: View {
             }
             .onChange(of: appState.imSessionBindings) { _ in
                 if !selectionAvailable {
-                    selected = appState.imSessionBinding(for: peerID)?.sessionID ?? ""
-                    selectedWorkspace = appState.imSessionBindingSessions.first(where: { $0.id == selected })?.workspaceKey ?? ""
+                    // 已有绑定只在首次打开时默认选中；后续投影不能撤销用户明确的反选。
+                    selected = ""; selectedWorkspace = ""
                 }
             }
             .onChange(of: appState.imSessionBindingSessions) { _ in
