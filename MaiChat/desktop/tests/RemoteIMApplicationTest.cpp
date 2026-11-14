@@ -3,6 +3,9 @@
 #include <QFile>
 #include <QSignalSpy>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QPainter>
 #include <QTemporaryDir>
 #include <QTest>
@@ -11,9 +14,122 @@
 
 #include "app/RemoteIMApplication.h"
 #include "im/FakeRemoteIMClient.h"
+#include "im/TimSdkApi.h"
+#include "im/TimSdkRemoteIMClient.h"
 #include "storage/LocalMessageDatabase.h"
 
 namespace {
+// Hold only SDK completions so the real parser and application can consume both
+// arrival orders. No avatar downloader, account service or real SDK is invoked.
+class AvatarTimSdkApi final : public TimSdkApi {
+public:
+    int init(quint64, const QString&) override {
+        return 0;
+    }
+    void uninit() override {}
+    int login(const QString&, const QString&, TimSdkCompletion completion) override {
+        if (completion) completion(0, {}, {});
+        return 0;
+    }
+    int logout(TimSdkCompletion completion) override {
+        if (completion) completion(0, {}, {});
+        return 0;
+    }
+    int sendMessage(const QString&, int, const QString&, TimSdkCompletion) override {
+        return -1;
+    }
+    int getConversationList(TimSdkCompletion completion) override {
+        conversations.append(std::move(completion));
+        return 0;
+    }
+    int getFriendList(TimSdkCompletion completion) override {
+        ++friendRequests;
+        friends.append(std::move(completion));
+        return 0;
+    }
+    int getUserProfiles(const QString& request, TimSdkCompletion completion) override {
+        QJsonArray profiles;
+        const auto ids = QJsonDocument::fromJson(request.toUtf8())
+                             .object()
+                             .value(QStringLiteral("friendship_getprofilelist_param_identifier_array"))
+                             .toArray();
+        for (const auto& id : ids) {
+            const QString user = id.toString();
+            if (user == QStringLiteral("peer")) ++peerProfileRequests;
+            profiles.append(QJsonObject{
+                {QStringLiteral("user_profile_identifier"), user},
+                {QStringLiteral("user_profile_nick_name"), QStringLiteral("SDK profile")},
+                {QStringLiteral("user_profile_face_url"), user == QStringLiteral("peer") ? friendAvatar : QString()}});
+        }
+        if (completion) completion(0, {}, encode(profiles));
+        return 0;
+    }
+    int modifySelfProfile(const QString&, TimSdkCompletion completion) override {
+        if (completion) completion(0, {}, {});
+        return 0;
+    }
+    int getJoinedGroupList(TimSdkCompletion completion) override {
+        if (completion) completion(0, {}, QStringLiteral("[]"));
+        return 0;
+    }
+    int deleteFriend(const QString&, TimSdkCompletion) override {
+        return -1;
+    }
+    int deleteConversation(const QString&, int, TimSdkCompletion) override {
+        return -1;
+    }
+    int getMessageList(const QString&, int, const QString&, TimSdkCompletion completion) override {
+        if (completion) completion(0, {}, QStringLiteral("[]"));
+        return 0;
+    }
+    void addReceiveMessageCallback(TimSdkReceiveMessagesCallback) override {}
+    void removeReceiveMessageCallback() override {}
+
+    void finishFriends() {
+        QJsonArray rows{friendRow(QStringLiteral("peer"), friendAvatar)};
+        if (includeUnacceptedFriend)
+            rows.append(friendRow(QStringLiteral("unaccepted-peer"),
+                                  QStringLiteral("https://avatar.example.invalid/unaccepted.png")));
+        auto pending = std::move(friends);
+        friends.clear();
+        for (auto& completion : pending)
+            if (completion) completion(0, {}, encode(rows));
+    }
+    void finishConversations(const QString& avatar) {
+        const QJsonArray rows{QJsonObject{{QStringLiteral("conv_id"), QStringLiteral("peer")},
+                                          {QStringLiteral("conv_type"), 1},
+                                          {QStringLiteral("conv_show_name"), QStringLiteral("Cached conversation")},
+                                          {QStringLiteral("conv_face_url"), avatar}}};
+        auto pending = std::move(conversations);
+        conversations.clear();
+        for (auto& completion : pending)
+            if (completion) completion(0, {}, encode(rows));
+    }
+
+    QString friendAvatar = QStringLiteral("https://avatar.example.invalid/fresh-profile.png");
+    int friendRequests = 0;
+    int peerProfileRequests = 0;
+    bool includeUnacceptedFriend = false;
+    QList<TimSdkCompletion> friends, conversations;
+
+private:
+    static QString encode(const QJsonArray& values) {
+        return QString::fromUtf8(QJsonDocument(values).toJson(QJsonDocument::Compact));
+    }
+    static QJsonObject friendRow(const QString& user, const QString& avatar) {
+        return {{QStringLiteral("friend_profile_identifier"), user},
+                {QStringLiteral("friend_profile_user_profile"),
+                 QJsonObject{{QStringLiteral("user_profile_nick_name"), QStringLiteral("SDK friend")},
+                             {QStringLiteral("user_profile_face_url"), avatar}}}};
+    }
+};
+
+QString contactAvatar(const ChatState& state, const QString& user) {
+    for (const auto& contact : state.contacts())
+        if (contact.userId == user) return contact.avatarUrl;
+    return {};
+}
+
 bool seedPagedHistory(const QString& path) {
     LocalMessageDatabase database(path);
     if (!database.isOpen()) return false;
@@ -41,6 +157,9 @@ private slots:
     void avatarPreparationReadsTinyWebp();
     void avatarPreparationPreservesHundredMegapixelPolicy();
     void avatarUpdateRejectsCanceledOrInvalidAccountBeforeSdk();
+    void friendAvatarRemainsAuthoritativeAcrossConversationArrival_data();
+    void friendAvatarRemainsAuthoritativeAcrossConversationArrival();
+    void accountFriendRefreshAlsoRefreshesSdkAvatar();
     void friendRequestWaitsForRemoteAcceptance();
     void maiChatFriendListFiltersHistoryAndDeletionKeepsMessages();
     void activityIsIndependentFromContentAndExplicitStopClosesIt();
@@ -80,6 +199,99 @@ private slots:
     void mixedLocalAndServerGroupSequencesHaveStableOrder();
     void groupUnreadAndPreviewArriveBeforeLazyHistoryAndClearOnOpen();
 };
+
+void RemoteIMApplicationTest::friendAvatarRemainsAuthoritativeAcrossConversationArrival_data() {
+    QTest::addColumn<bool>("friendFirst");
+    QTest::newRow("fresh-friend-before-stale-conversation") << true;
+    QTest::newRow("stale-conversation-before-fresh-friend") << false;
+}
+
+void RemoteIMApplicationTest::friendAvatarRemainsAuthoritativeAcrossConversationArrival() {
+    QFETCH(bool, friendFirst);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("owned-avatar.sqlite"));
+    const QString fresh = QStringLiteral("https://avatar.example.invalid/fresh-profile.png");
+    const QString stale = QStringLiteral("https://avatar.example.invalid/stale-conversation.png");
+    {
+        auto api = std::make_unique<AvatarTimSdkApi>();
+        auto* sdk = api.get();
+        auto client = std::make_unique<TimSdkRemoteIMClient>(std::move(api));
+        RemoteIMApplication app(QStringLiteral("owner"), std::move(client),
+                                std::make_unique<LocalMessageDatabase>(path));
+        app.connectToService(123456, QStringLiteral("owned-unused-signature"));
+        QVERIFY(app.connectionReady());
+        QVERIFY(!sdk->friends.isEmpty() && !sdk->conversations.isEmpty());
+        if (friendFirst) {
+            sdk->finishFriends();
+            QCOMPARE(contactAvatar(app.chatState(), QStringLiteral("peer")), fresh);
+            sdk->finishConversations(stale);
+        } else {
+            sdk->finishConversations(stale);
+            QCOMPARE(contactAvatar(app.chatState(), QStringLiteral("peer")), stale);
+            sdk->finishFriends();
+        }
+        // Check the real final application state, rather than each SDK signal
+        // separately: a stale conversation avatar must stay a fallback.
+        QCOMPARE(contactAvatar(app.chatState(), QStringLiteral("peer")), fresh);
+    }
+    LocalMessageDatabase reopened(path);
+    QVERIFY(reopened.isOpen());
+    ChatState restored(QStringLiteral("owner"));
+    reopened.loadRecentInto(restored, 1);
+    QCOMPARE(contactAvatar(restored, QStringLiteral("peer")), fresh);
+}
+
+void RemoteIMApplicationTest::accountFriendRefreshAlsoRefreshesSdkAvatar() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("owned-account-avatar.sqlite"));
+    const QString oldAvatar = QStringLiteral("https://avatar.example.invalid/old-profile.png");
+    const QString fresh = QStringLiteral("https://avatar.example.invalid/refreshed-profile.png");
+    {
+        auto api = std::make_unique<AvatarTimSdkApi>();
+        auto* sdk = api.get();
+        sdk->friendAvatar = oldAvatar;
+        sdk->includeUnacceptedFriend = true;
+        auto client = std::make_unique<TimSdkRemoteIMClient>(std::move(api));
+        RemoteIMApplication app(QStringLiteral("owner"), std::move(client),
+                                std::make_unique<LocalMessageDatabase>(path));
+        int accountRequests = 0;
+        RemoteIMApplication::AccountFriendOperations operations;
+        operations.list = [&accountRequests](auto completion) {
+            ++accountRequests;
+            completion({RemoteIMApplication::AccountFriend{QStringLiteral("m_peer"), QStringLiteral("Account Friend"),
+                                                           QStringLiteral("peer")}},
+                       {});
+        };
+        app.setAccountFriendOperations(std::move(operations));
+        app.connectToService(123456, QStringLiteral("owned-unused-signature"));
+        QVERIFY(app.connectionReady());
+        sdk->finishFriends();
+        sdk->finishConversations(oldAvatar);
+        QCOMPARE(contactAvatar(app.chatState(), QStringLiteral("peer")), oldAvatar);
+        const int beforeAccount = accountRequests;
+        const int beforeSdk = sdk->friendRequests + sdk->peerProfileRequests;
+        sdk->friendAvatar = fresh;
+        app.refreshFriendList();
+        QCOMPARE(accountRequests, beforeAccount + 1);
+        QVERIFY2(sdk->friendRequests + sdk->peerProfileRequests > beforeSdk,
+                 "Account friendship refresh must also refresh SDK profile avatars");
+        sdk->finishFriends();
+        QCOMPARE(contactAvatar(app.chatState(), QStringLiteral("peer")), fresh);
+        QVERIFY(app.isAcceptedFriend(QStringLiteral("peer")));
+        QVERIFY(!app.isAcceptedFriend(QStringLiteral("unaccepted-peer")));
+        QCOMPARE(app.maiChatAccountForImId(QStringLiteral("peer")), QStringLiteral("m_peer"));
+        for (const auto& contact : app.chatState().contacts())
+            if (contact.userId == QStringLiteral("peer"))
+                QCOMPARE(contact.displayName, QStringLiteral("Account Friend"));
+    }
+    LocalMessageDatabase reopened(path);
+    QVERIFY(reopened.isOpen());
+    ChatState restored(QStringLiteral("owner"));
+    reopened.loadRecentInto(restored, 1);
+    QCOMPARE(contactAvatar(restored, QStringLiteral("peer")), fresh);
+}
 
 void RemoteIMApplicationTest::
     avatarPreparationCropsWithoutChangingOriginalAndRejectsOversizedInput() {

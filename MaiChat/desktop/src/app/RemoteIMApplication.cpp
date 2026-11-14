@@ -1328,6 +1328,11 @@ void RemoteIMApplication::refreshFriendList() {
                 }
                 emit self->stateChanged();
                 if (self) emit self->acceptedFriendsChanged();
+                // Account service owns friendship and display names; it has no
+                // SDK face URL. Refresh that independent metadata through the
+                // ordinary client path after publishing the current relation.
+                if (self && self->connectionReady() && self->connectionGeneration_ == generation)
+                    self->client_->refreshFriendList();
             }, Qt::AutoConnection);
         });
         return;

@@ -151,6 +151,9 @@ private:
     QString currentUserId_;
     QString selfDisplayName_;
     QString selfAvatarUrl_;
+    // QObject owner-thread only. Nonempty friend profile URLs outrank cached
+    // conversation avatars within this login; empty/missing URLs do not clear.
+    QHash<QString, QString> friendAvatarUrls_;
     // AccountTag 的另一半。以前没存过——只有连接日志里出现过一次。
     quint64 sdkAppId_ = 0;
     QHash<QString, qint64> orderedSecondByPeer_;
@@ -163,6 +166,7 @@ private:
     quint64 selfProfileRevision_ = 0;
     quint64 conversationRevision_ = 0;
     quint64 conversationFetchGeneration_ = 0;
+    quint64 friendFetchGeneration_ = 0;
 
 public:
     RemoteDiagnostics::AccountTag currentAccount() const override;

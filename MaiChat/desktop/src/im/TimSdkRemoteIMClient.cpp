@@ -551,6 +551,7 @@ void TimSdkRemoteIMClient::connectToService(int sdkAppId, const QString& userId,
     currentUserId_ = userId.trimmed();
     selfDisplayName_.clear();
     selfAvatarUrl_.clear();
+    friendAvatarUrls_.clear();
     sdkAppId_ = static_cast<quint64>(sdkAppId);
     const quint64 profileSession = ++profileSession_;
     metadataIngress_ = std::make_shared<MetadataIngress>();
@@ -645,6 +646,9 @@ void TimSdkRemoteIMClient::connectToService(int sdkAppId, const QString& userId,
 
 void TimSdkRemoteIMClient::disconnectFromService(RemoteIMCompletion completion) {
     mai_download_cancel_request(downloadsCanceled_.get());
+    // Revoke old completions before any SDK cleanup can reenter the owner loop.
+    ++profileSession_;
+    friendAvatarUrls_.clear();
     if (!api_) {
         if (completion) completion(true, QString());
         return;
@@ -652,7 +656,6 @@ void TimSdkRemoteIMClient::disconnectFromService(RemoteIMCompletion completion) 
     api_->removeReceiveMessageCallback();
     api_->setConversationEventCallback({});
     api_->setSelfInfoUpdatedCallback({});
-    ++profileSession_;
     api_->logout(
         [this, completion = std::move(completion)](int code, const QString& description, const QString&) mutable {
             connected_ = false;
@@ -1470,18 +1473,41 @@ void TimSdkRemoteIMClient::handleSelfProfilePayload(const QString& payload) {
 }
 
 void TimSdkRemoteIMClient::fetchFriendList() {
-    api_->getFriendList([this](int code, const QString& description, const QString& jsonPayload) {
-        if (code != 0) {
-            qWarning().noquote()
-                << QStringLiteral("[im] fetch friend list failed: code=%1 %2").arg(code).arg(description);
-            return;
-        }
-        if (jsonPayload.trimmed().isEmpty()) {
-            qInfo().noquote() << QStringLiteral("[im] friend list: empty payload");
-            return;
-        }
-        handleFriendListPayload(jsonPayload);
-    });
+    const QPointer<TimSdkRemoteIMClient> self(this);
+    // Login completion and SDK responses may use vendor threads. Keep both the
+    // request generation and the avatar authority cache on this QObject's owner.
+    QMetaObject::invokeMethod(
+        this,
+        [self] {
+            if (!self || !self->connected_ || !self->api_) return;
+            const auto account = self->currentAccount();
+            const quint64 session = self->profileSession_;
+            const quint64 generation = ++self->friendFetchGeneration_;
+            self->api_->getFriendList(
+                [self, account, session, generation](int code, const QString& description, const QString& jsonPayload) {
+                    if (!self) return;
+                    QMetaObject::invokeMethod(
+                        self,
+                        [self, account, session, generation, code, description, jsonPayload] {
+                            if (!self || !self->connected_ || self->currentAccount() != account ||
+                                self->profileSession_ != session || self->friendFetchGeneration_ != generation)
+                                return;
+                            if (code != 0) {
+                                qWarning().noquote() << QStringLiteral("[im] fetch friend list failed: code=%1 %2")
+                                                            .arg(code)
+                                                            .arg(description);
+                                return;
+                            }
+                            if (jsonPayload.trimmed().isEmpty()) {
+                                qInfo().noquote() << QStringLiteral("[im] friend list: empty payload");
+                                return;
+                            }
+                            self->handleFriendListPayload(jsonPayload);
+                        },
+                        Qt::AutoConnection);
+                });
+        },
+        Qt::AutoConnection);
 }
 
 void TimSdkRemoteIMClient::fetchConversationList() {
@@ -1553,6 +1579,9 @@ void TimSdkRemoteIMClient::handleFriendListPayload(const QString& jsonPayload) {
         const QString avatarUrl = firstNonEmpty(userProfile, {
             QStringLiteral("user_profile_face_url")
         });
+        // A missing/empty field preserves the existing non-clearing contract.
+        // Only a current-login nonempty friend URL can displace a fallback.
+        if (!avatarUrl.isEmpty()) friendAvatarUrls_.insert(userId, avatarUrl);
         contacts.append(RemoteIMContact{userId, displayName.isEmpty() ? userId : displayName, avatarUrl});
     }
     qInfo().noquote()
@@ -1578,9 +1607,12 @@ void TimSdkRemoteIMClient::handleConversationListPayload(const QString& jsonPayl
         });
         if (conversationType == kConversationTypeC2C) {
             if (!includeDirectChats) continue;
-            const QString avatarUrl = firstNonEmpty(conversation, {
+            const QString conversationAvatar = firstNonEmpty(conversation, {
                 QStringLiteral("conv_face_url")
             });
+            // Conversation sync can carry an older face URL than friend data.
+            // It fills a gap, but must not roll back a known friend avatar.
+            const QString avatarUrl = friendAvatarUrls_.value(conversationId, conversationAvatar);
             contacts.append(RemoteIMContact{
                 conversationId,
                 displayName.isEmpty() ? conversationId : displayName,

@@ -6,7 +6,10 @@
 #include <QSignalSpy>
 #include <QTest>
 #include <QCoreApplication>
+#include <QThread>
+#include <atomic>
 #include <memory>
+#include <thread>
 
 #include "im/TimSdkApi.h"
 #include "im/TimSdkRemoteIMClient.h"
@@ -87,6 +90,10 @@ public:
 
     int getFriendList(TimSdkCompletion completion) override {
         friendListRequested = true;
+        if (deferFriendList) {
+            deferredFriendLists.append(std::move(completion));
+            return 0;
+        }
         if (completion) completion(0, QString(), friendListPayload);
         return 0;
     }
@@ -212,6 +219,8 @@ public:
     bool conversationListRequested = false;
     int conversationListRequestCount = 0;
     bool friendListRequested = false;
+    bool deferFriendList = false;
+    QList<TimSdkCompletion> deferredFriendLists;
     int deleteFriendCode = 0;
     int deleteConversationCode = 0;
     QString deleteFriendRequest;
@@ -267,6 +276,7 @@ private slots:
     void deletesFriendAndConversationThroughSdk();
     void requestsAndAcceptsFriendThroughSdk();
     void fetchesContactsConversationsAndHistoryAfterLogin();
+    void friendAvatarCallbacksStayOnOwnerAndIgnoreStaleWork();
     void emitsIncomingTextAndImageFromSdkMessages();
     void emitsIncomingApprovalRequestFromV2CloudMetadata();
     void emitsIncomingApprovalResolutionFromV2CloudMetadata();
@@ -925,7 +935,7 @@ void TimSdkRemoteIMClientTest::fetchesContactsConversationsAndHistoryAfterLogin(
     QCOMPARE(conversationContacts.size(), 1);
     QCOMPARE(conversationContacts.first().userId, QStringLiteral("phone-user"));
     QCOMPARE(conversationContacts.first().avatarUrl,
-             QStringLiteral("https://example.com/conversation.png"));
+             QStringLiteral("https://example.com/iphone.png"));
     QCOMPARE(messagesSpy.count(), 1);
     const QList<RemoteIMMessage> messages = qvariant_cast<QList<RemoteIMMessage>>(messagesSpy.takeFirst().at(0));
     QCOMPARE(messages.size(), 2);
@@ -937,6 +947,87 @@ void TimSdkRemoteIMClientTest::fetchesContactsConversationsAndHistoryAfterLogin(
     QCOMPARE(messages.at(1).toUserId, QStringLiteral("phone-user"));
     QCOMPARE(messages.at(1).text, QStringLiteral("我发过的历史"));
     QVERIFY(messages.at(0).createdAtMillis < messages.at(1).createdAtMillis);
+}
+
+// SDK completions may arrive on a vendor worker or after a newer request/login.
+// Consume actual contact signals so stale work cannot poison the owner-thread cache.
+void TimSdkRemoteIMClientTest::friendAvatarCallbacksStayOnOwnerAndIgnoreStaleWork() {
+    auto api = std::make_unique<FakeTimSdkApi>();
+    auto* fake = api.get();
+    fake->deferFriendList = true;
+    TimSdkRemoteIMClient client(std::move(api));
+    QSignalSpy contactsSpy(&client, &RemoteIMClient::contactsReceived);
+    std::atomic<bool> wrongThread{false};
+    connect(
+        &client, &RemoteIMClient::contactsReceived, &client,
+        [&client, &wrongThread](const QList<RemoteIMContact>&) {
+            if (QThread::currentThread() != client.thread()) wrongThread = true;
+        },
+        Qt::DirectConnection);
+    const auto payload = [](const QString& avatar) {
+        return QString::fromUtf8(
+            QJsonDocument(
+                QJsonArray{QJsonObject{{QStringLiteral("friend_profile_identifier"), QStringLiteral("phone-user")},
+                                       {QStringLiteral("friend_profile_user_profile"),
+                                        QJsonObject{{QStringLiteral("user_profile_face_url"), avatar}}}}})
+                .toJson(QJsonDocument::Compact));
+    };
+    const auto latestAvatar = [&contactsSpy] {
+        return qvariant_cast<QList<RemoteIMContact>>(contactsSpy.last().at(0)).first().avatarUrl;
+    };
+    const QString fresh = QStringLiteral("https://avatar.example.invalid/latest-request.png");
+    const QString stale = QStringLiteral("https://avatar.example.invalid/stale-request.png");
+    const QString fallback = QStringLiteral("https://avatar.example.invalid/new-login-fallback.png");
+    const QString nextProfile = QStringLiteral("https://avatar.example.invalid/new-login-profile.png");
+
+    client.connectToService(123456, QStringLiteral("owner-a"), QStringLiteral("owned-signature"), nullptr);
+    client.refreshFriendList();
+    QCOMPARE(fake->deferredFriendLists.size(), 2);
+    auto older = fake->deferredFriendLists.takeFirst();
+    auto newest = fake->deferredFriendLists.takeFirst();
+    std::thread completed([newest, freshPayload = payload(fresh)] { newest(0, {}, freshPayload); });
+    completed.join();
+    QTRY_COMPARE(contactsSpy.count(), 1);
+    QCOMPARE(latestAvatar(), fresh);
+    older(0, {}, payload(stale));
+    QCoreApplication::processEvents();
+    QCOMPARE(contactsSpy.count(), 1);
+    QCOMPARE(latestAvatar(), fresh);
+
+    client.refreshFriendList();
+    QCOMPARE(fake->deferredFriendLists.size(), 1);
+    auto oldLogin = fake->deferredFriendLists.takeFirst();
+    client.disconnectFromService(nullptr);
+    fake->conversationListPayload = QString::fromUtf8(
+        QJsonDocument(QJsonArray{QJsonObject{{QStringLiteral("conv_id"), QStringLiteral("phone-user")},
+                                             {QStringLiteral("conv_type"), 1},
+                                             {QStringLiteral("conv_face_url"), fallback}}})
+            .toJson(QJsonDocument::Compact));
+    client.connectToService(123456, QStringLiteral("owner-b"), QStringLiteral("owned-signature"), nullptr);
+    QCOMPARE(fake->deferredFriendLists.size(), 1);
+    QTRY_COMPARE(contactsSpy.count(), 2);
+    // A new login cannot inherit the prior login's authoritative avatar.
+    QCOMPARE(latestAvatar(), fallback);
+    oldLogin(0, {}, payload(stale));
+    QCoreApplication::processEvents();
+    QCOMPARE(contactsSpy.count(), 2);
+    auto currentLogin = fake->deferredFriendLists.takeFirst();
+    std::thread nextCompleted([currentLogin, nextPayload = payload(nextProfile)] { currentLogin(0, {}, nextPayload); });
+    nextCompleted.join();
+    QTRY_COMPARE(contactsSpy.count(), 3);
+    QCOMPARE(latestAvatar(), nextProfile);
+    client.refreshFriendList();
+    QCOMPARE(fake->deferredFriendLists.size(), 1);
+    auto missingAvatar = fake->deferredFriendLists.takeFirst();
+    missingAvatar(0, {}, payload(QString()));
+    QTRY_COMPARE(contactsSpy.count(), 4);
+    // Empty friend data is still non-clearing; later conversation sync cannot
+    // undo the last nonempty friend avatar from this login.
+    QVERIFY(fake->conversationEventCallback);
+    fake->conversationEventCallback(4, {});
+    QTRY_COMPARE(contactsSpy.count(), 5);
+    QCOMPARE(latestAvatar(), nextProfile);
+    QVERIFY(!wrongThread.load());
 }
 
 // SDK 入站文本和图片转换为相同会话的两类消息，并保留方向及时间顺序。

@@ -49,6 +49,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QPainter>
+#include <QPaintEvent>
 #include <QSaveFile>
 #include <QInputMethodEvent>
 #include <QMimeData>
@@ -76,6 +77,7 @@
 #include <memory>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 
@@ -153,12 +155,13 @@ public:
 
     bool listen() {
         server_.Get(".*", [this](const httplib::Request&, httplib::Response& response) {
+            ++requests;
             std::string bytes;
             {
-                std::lock_guard<std::mutex> lock(pngMutex_);
+                std::unique_lock<std::mutex> lock(pngMutex_);
+                responseReady_.wait(lock, [this] { return !holdResponses_; });
                 bytes = png_;
             }
-            ++requests;
             response.set_content(bytes, "image/png");
             response.set_header("Connection", "close");
         });
@@ -182,11 +185,25 @@ public:
         png_ = png.toStdString();
     }
 
+    void holdResponses() {
+        std::lock_guard<std::mutex> lock(pngMutex_);
+        holdResponses_ = true;
+    }
+
+    void releaseResponses() {
+        {
+            std::lock_guard<std::mutex> lock(pngMutex_);
+            holdResponses_ = false;
+        }
+        responseReady_.notify_all();
+    }
+
     int serverPort() const {
         return port_;
     }
 
     void close() {
+        releaseResponses();
         server_.stop();
         if (worker_.joinable()) worker_.join();
     }
@@ -198,8 +215,31 @@ private:
     std::thread worker_;
     std::atomic<bool> listenerExited_{false};
     std::mutex pngMutex_;
+    std::condition_variable responseReady_;
+    bool holdResponses_ = false;
     std::string png_;
     int port_ = 0;
+};
+
+// Observe ordinary viewport painting after the owned download has been decoded
+// and persisted. No grab/repaint is allowed to manufacture this paint event.
+class AvatarViewportPaintObserver final : public QObject {
+public:
+    AvatarViewportPaintObserver(QString cachePath, QPoint avatarPoint)
+        : cachePath_(std::move(cachePath)), avatarPoint_(avatarPoint) {}
+    int readyPaints = 0;
+
+protected:
+    bool eventFilter(QObject*, QEvent* event) override {
+        if (event->type() == QEvent::Paint &&
+            static_cast<QPaintEvent*>(event)->region().contains(avatarPoint_) &&
+            QFileInfo::exists(cachePath_)) ++readyPaints;
+        return false;
+    }
+
+private:
+    QString cachePath_;
+    QPoint avatarPoint_;
 };
 
 // 消息及窗口标题栏可视回归使用正常 App 随包字体；结束后恢复，避免影响其他套件。
@@ -305,6 +345,8 @@ private slots:
     void settingsNavigationShowsAccountWithoutDiagnostics();
     void remoteDesktopSettingsHaveNoDeviceList();
     void settingsAvatarUpdatesWhenSelfProfileArrives();
+    void conversationAvatarLoadsWhenWindowIsCreatedAfterConnection();
+    void conversationAvatarRepaintsViewportAfterColdDownload();
     void settingsAvatarReadsTinyWebpFromMemory();
     void settingsAvatarSurvivesNetworkLossAfterRestart();
     void settingsAvatarLoadsRealProfileUrl();
@@ -3177,6 +3219,108 @@ void MainWindowLayoutTest::settingsNavigationShowsAccountWithoutDiagnostics() {
     }
     // 设置页的值应是只读标签而非输入框；导航栏的搜索框是唯一合法的 QLineEdit。
     QVERIFY(settingsPage->findChildren<QLineEdit*>().isEmpty());
+}
+
+void MainWindowLayoutTest::conversationAvatarLoadsWhenWindowIsCreatedAfterConnection() {
+    ScopedNotificationSettings settings;
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    AvatarHttpServer server;
+    QVERIFY(server.listen());
+    QImage red(32, 32, QImage::Format_RGB32);
+    red.fill(QColor(230, 20, 20));
+    QByteArray png;
+    QBuffer buffer(&png);
+    QVERIFY(buffer.open(QIODevice::WriteOnly));
+    QVERIFY(red.save(&buffer, "PNG"));
+    server.servePng(png);
+    const QString url = QStringLiteral("http://127.0.0.1:%1/owned-late-window-%2.png")
+                            .arg(server.serverPort())
+                            .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const QString cache = QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation)).filePath(
+        QStringLiteral("avatars/") +
+        QString::fromLatin1(QCryptographicHash::hash(url.toUtf8(), QCryptographicHash::Sha256).toHex()) +
+        QStringLiteral(".png"));
+    QVERIFY(!QFileInfo::exists(cache));
+    const auto cleanup = qScopeGuard([&] { QFile::remove(cache); });
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    auto* fake = client.get();
+    RemoteIMApplication app(QStringLiteral("owned-late-avatar-user"), std::move(client),
+                            std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("owned-im.db"))));
+    app.connectToService(123, QStringLiteral("owned-unused-signature"));
+    QTRY_VERIFY(app.connectionReady());
+    fake->contactsReceived({RemoteIMContact{QStringLiteral("owned-avatar-peer"), QStringLiteral("Owned photo"), url}});
+    MainWindow window(app);
+    window.show();
+    const auto drain = qScopeGuard([&] {
+        if (server.requests.load() > 0)
+            (void)QTest::qWaitFor([&] { return QFileInfo::exists(cache); }, 3000);
+    });
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* conversations = window.findChild<QListWidget*>(QStringLiteral("conversationList"));
+    QVERIFY(conversations && conversations->count() == 1);
+    // The ordinary window must initialize request admission from the current
+    // connection; no future connectionChanged signal is promised.
+    QTRY_VERIFY_WITH_TIMEOUT(server.requests.load() > 0, 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(cache), 3000);
+}
+
+void MainWindowLayoutTest::conversationAvatarRepaintsViewportAfterColdDownload() {
+    ScopedNotificationSettings settings;
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    AvatarHttpServer server;
+    QVERIFY(server.listen());
+    server.holdResponses();
+    QImage red(32, 32, QImage::Format_RGB32);
+    red.fill(QColor(230, 20, 20));
+    QByteArray png;
+    QBuffer buffer(&png);
+    QVERIFY(buffer.open(QIODevice::WriteOnly));
+    QVERIFY(red.save(&buffer, "PNG"));
+    server.servePng(png);
+    const QString url = QStringLiteral("http://127.0.0.1:%1/owned-viewport-%2.png")
+                            .arg(server.serverPort())
+                            .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    const QString cache = QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation)).filePath(
+        QStringLiteral("avatars/") +
+        QString::fromLatin1(QCryptographicHash::hash(url.toUtf8(), QCryptographicHash::Sha256).toHex()) +
+        QStringLiteral(".png"));
+    QVERIFY(!QFileInfo::exists(cache));
+    const auto cleanup = qScopeGuard([&] { QFile::remove(cache); });
+    auto client = std::make_unique<FakeRemoteIMClient>();
+    auto* fake = client.get();
+    RemoteIMApplication app(QStringLiteral("owned-viewport-avatar-user"), std::move(client),
+                            std::make_unique<LocalMessageDatabase>(directory.filePath(QStringLiteral("owned-im.db"))));
+    MainWindow window(app);
+    window.show();
+    const auto drain = qScopeGuard([&] {
+        server.releaseResponses();
+        if (server.requests.load() > 0)
+            (void)QTest::qWaitFor([&] { return QFileInfo::exists(cache); }, 3000);
+    });
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    app.connectToService(123, QStringLiteral("owned-unused-signature"));
+    QTRY_VERIFY(app.connectionReady());
+    fake->contactsReceived({RemoteIMContact{QStringLiteral("owned-avatar-peer"), QStringLiteral("Owned photo"), url}});
+    auto* conversations = window.findChild<QListWidget*>(QStringLiteral("conversationList"));
+    QVERIFY(conversations && conversations->count() == 1);
+    QTRY_VERIFY_WITH_TIMEOUT(server.requests.load() > 0, 3000);
+    QTest::qWait(150); // Let the initial fallback/connection layout settle while HTTP is held.
+    QVERIFY(!QFileInfo::exists(cache));
+    const QRect row = conversations->visualItemRect(conversations->item(0));
+    const QPoint avatarPoint(row.left() + UiZoom::s(32), row.top() + 2 + UiZoom::s(30));
+    AvatarViewportPaintObserver observer(cache, avatarPoint);
+    conversations->viewport()->installEventFilter(&observer);
+    server.releaseResponses();
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(cache), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(observer.readyPaints > 0, 3000);
+    // Only after observing a real paint, inspect one static frame. Polling grab()
+    // above would itself repaint the viewport and hide a missed-update defect.
+    const QPixmap frame = conversations->viewport()->grab();
+    const QColor actual = frame.toImage().pixelColor(
+        qRound(avatarPoint.x() * frame.devicePixelRatioF()), qRound(avatarPoint.y() * frame.devicePixelRatioF()));
+    QVERIFY(actual.red() > 200 && actual.green() < 80 && actual.blue() < 80);
 }
 
 void MainWindowLayoutTest::settingsAvatarUpdatesWhenSelfProfileArrives() {

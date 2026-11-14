@@ -3793,35 +3793,41 @@ void MainWindow::bindSignals() {
   });
   connect(&app_, &RemoteIMApplication::selectionChanged, this,
           [this](const QString &) { refreshSelectedConversation(); });
+  // 窗口可能在登录完成后才创建，不能只等下一次 connectionChanged 才启用冷头像。
+  // 将头像准入和预取单独同步，避免初始化时重放绑定恢复等连接事件的业务副作用。
+  const auto updateAvatarConnection = [this](bool connected) {
+    auto *logo = findChild<QLabel *>(QStringLiteral("navLogo"));
+    if (logo)
+      logo->setProperty("avatarRequestsEnabled", connected);
+    if (conversationList_) {
+      conversationList_->setProperty("avatarRequestsEnabled", connected);
+      conversationList_->viewport()->setProperty("avatarRequestsEnabled",
+                                                 connected);
+    }
+    if (contactsList_) {
+      contactsList_->setProperty("avatarRequestsEnabled", connected);
+      contactsList_->viewport()->setProperty("avatarRequestsEnabled",
+                                             connected);
+    }
+    if (connected) {
+      failedAvatarUrls().clear();
+      requestAvatarPixmap(app_.selfProfile().avatarUrl, logo);
+      for (const RemoteIMContact &contact : app_.chatState().contacts()) {
+        requestAvatarPixmap(contact.avatarUrl, conversationList_);
+        requestAvatarPixmap(contact.avatarUrl, contactsList_);
+      }
+    }
+  };
   connect(
       &app_, &RemoteIMApplication::connectionChanged, this,
-      [this](bool connected) {
-        auto *logo = findChild<QLabel *>(QStringLiteral("navLogo"));
-        if (logo)
-          logo->setProperty("avatarRequestsEnabled", connected);
-        if (conversationList_) {
-          conversationList_->setProperty("avatarRequestsEnabled", connected);
-          conversationList_->viewport()->setProperty("avatarRequestsEnabled",
-                                                     connected);
-        }
-        if (contactsList_) {
-          contactsList_->setProperty("avatarRequestsEnabled", connected);
-          contactsList_->viewport()->setProperty("avatarRequestsEnabled",
-                                                 connected);
-        }
-        if (connected) {
-          failedAvatarUrls().clear();
-          requestAvatarPixmap(app_.selfProfile().avatarUrl, logo);
-          for (const RemoteIMContact &contact : app_.chatState().contacts()) {
-            requestAvatarPixmap(contact.avatarUrl, conversationList_);
-            requestAvatarPixmap(contact.avatarUrl, contactsList_);
-          }
-        }
+      [this, updateAvatarConnection](bool connected) {
+        updateAvatarConnection(connected);
         updateConnectionIndicator();
         refreshSettings();
         if (connected) restoreSessionBindings();
         refreshSessionBinding();
       });
+  updateAvatarConnection(app_.isConnected());
   connect(&app_, &RemoteIMApplication::acceptedFriendsChanged, this, [this] {
     restoreSessionBindings();
     refreshSessionBinding();
