@@ -578,6 +578,9 @@ public final class MainActivity extends MaiChatBaseActivity implements RemoteIMS
             render();
             return;
         }
+        // 创作目录优先收起；闭合时继续使用原有的返回消息页行为。
+        if (activeTab == RemoteIMTab.ASSISTANT && aiAssistant != null
+                && aiAssistant.closeSessionDrawerOnBack()) return;
         if (activeTab != RemoteIMTab.MESSAGES && !session.requiresLogin()) {
             activeTab = RemoteIMTab.MESSAGES;
             render();

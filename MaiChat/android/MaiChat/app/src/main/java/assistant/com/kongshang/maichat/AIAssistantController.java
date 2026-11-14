@@ -58,6 +58,11 @@ public final class AIAssistantController {
                        java.util.function.BiConsumer<String, String> sent,
                        java.util.function.BiConsumer<JSONObject, JSONObject> received) throws Exception;
     }
+    // Ordinary, read-only image transport; fixture hosts replace only I/O, never the owner or receipt checks.
+    interface RemoteImageReads {
+        MaiCloudDrive.MediaInfo mediaInfo(String name);
+        void download(JSONObject request, File target, AIAssistantPreparationJobs.Cancellation cancellation) throws Exception;
+    }
     static final class State {
         final JSONObject data;
         final JSONObject remoteSession;
@@ -330,6 +335,11 @@ public final class AIAssistantController {
     private JSONObject selectedRemote;
     private JSONObject pendingRemoteSelection;
     private int remoteSelectionGeneration;
+    private final AIAssistantRemoteImages.Cache remoteImageCache;
+    private final RemoteImageReads remoteImageReads;
+    private final Map<String, File> remoteImageFiles = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, List<java.util.function.BiConsumer<File, String>>> remoteImageCallbacks = new HashMap<>();
+    private String remoteImageSelection = "";
     private JSONObject remoteData = new JSONObject();
     private String remoteCommandStatus = "";
     private String remoteRestoreDraft = "";
@@ -403,6 +413,9 @@ public final class AIAssistantController {
         this(context, testEndpoint, null);
     }
     AIAssistantController(Context context, String testEndpoint, SessionReads sessionReads) {
+        this(context, testEndpoint, sessionReads, null);
+    }
+    AIAssistantController(Context context, String testEndpoint, SessionReads sessionReads, RemoteImageReads imageReads) {
         this.context = context.getApplicationContext();
         this.sessionReads = sessionReads;
         accountAuth = MaiChatAuthClient.shared(this.context);
@@ -411,6 +424,15 @@ public final class AIAssistantController {
             throw new IllegalArgumentException("Test endpoint in release build");
         this.testEndpoint = testEndpoint;
         accountUserId = testEndpoint == null ? currentAccountUserId : "";
+        remoteImageCache = new AIAssistantRemoteImages.Cache(new File(this.context.getCacheDir(), "MaiSessionTemporaryImages"));
+        remoteImageReads = imageReads != null ? imageReads : new RemoteImageReads() {
+            @Override public MaiCloudDrive.MediaInfo mediaInfo(String name) { return MaiSessionAttachments.mediaInfo(name); }
+            @Override public void download(JSONObject request, File target,
+                AIAssistantPreparationJobs.Cancellation cancellation) throws Exception {
+                new MaiSessionAttachments(AIAssistantController.this.context, accountUserId)
+                    .downloadTemporaryImage(request, target, cancellation);
+            }
+        };
         try {
             android.content.SharedPreferences saved = this.context.getSharedPreferences(
                 "maichat-agent-outgoing-" + accountUserId, Context.MODE_PRIVATE);
@@ -1650,6 +1672,11 @@ public final class AIAssistantController {
         }
     }
     private void publishState() {
+        String imageSelection = remoteSelectionGeneration + ":" + (selectedRemote == null ? "" : pageOwner(selectedRemote));
+        if (!imageSelection.equals(remoteImageSelection)) {
+            preparations.cancelPrefix("remote-image:");
+            remoteImageSelection = imageSelection;
+        }
         JSONObject visible = selectedRemote == null ? data : remoteData;
         String shown = selectedRemote == null ? selected : selectedRemote.optString("id");
         JSONObject visibleOwner = selectedRemote;
@@ -1668,6 +1695,10 @@ public final class AIAssistantController {
             }
             visible.put("sessions", combined);
             visible.put("devices", new JSONArray(remoteDevices.toString()));
+            visible.put("remoteSelectionGeneration", remoteSelectionGeneration);
+            // A clicked State must belong to this account generation, even if another account has the same remote IDs.
+            visible.put("remoteImageAccountId", accountUserId);
+            visible.put("remoteImageAccountGeneration", accountToolLoginGeneration);
             toolDetails.select(accountUserId, accountToolLoginGeneration, shown, selectedRemote);
             toolDetails.observeMessages(visible.optJSONArray("messages"));
             toolDetails.observeMessages(visible.optJSONArray("messageDisplayUpdates"));
@@ -2661,6 +2692,8 @@ public final class AIAssistantController {
                 if (payload.has("turnId")) owner.put("turnId", payload.optString("turnId"));
             } catch (Exception ignored) { /* 原快照继续由目录更新，不猜测轮次。 */ }
             sanitizeRemoteMedia(received);
+            sanitizeRemoteMedia(payload.optJSONArray("messageUpdates"));
+            sanitizeRemoteMedia(payload.optJSONArray("questionMessages"));
             if (pendingRemoteSelection != null) {
                 if (!sameRemote(selectedRemote, pendingRemoteSelection)) {
                     pendingRemoteCommandIds.clear();
@@ -2708,7 +2741,8 @@ public final class AIAssistantController {
                 String kind = part.optString("kind");
                 if (!kind.equals("image") && !kind.equals("video")) continue;
                 part.remove("path");
-                if (!part.optString("attachment_id").isEmpty()) continue;
+                // Temporary image receipts are independently downloadable; their original-device paths stay private.
+                if (!part.optString("attachment_id").isEmpty() || part.optJSONObject("remoteImage") != null) continue;
                 try {
                     parts.put(new JSONObject().put("id", part.optString("id") + "-remote-placeholder")
                         .put("kind", "text").put("text", kind.equals("image")
@@ -3671,6 +3705,98 @@ public final class AIAssistantController {
                 ? importStream(input,downloaded.contentType,downloaded.name)
                 : copySessionFile(input,downloaded.name);
         }
+    }
+
+    private boolean currentRemoteImage(State owner, String messageID, JSONObject part) {
+        State current = state;
+        if (owner == null || messageID == null || messageID.isEmpty() || part == null || !ownsModelConfiguration() || owner.remoteSession == null
+            || !accountUserId.equals(owner.data.optString("remoteImageAccountId"))
+            || owner.data.optLong("remoteImageAccountGeneration", -1) != accountToolLoginGeneration
+            || !sameRemote(owner.remoteSession, current.remoteSession)
+            || owner.data.optInt("remoteSelectionGeneration") != current.data.optInt("remoteSelectionGeneration")) return false;
+        JSONObject metadata = part.optJSONObject("remoteImage");
+        if (metadata == null) return false;
+        for (String field : new String[] {"messages", "messageDisplayUpdates", "questionMessages"}) {
+            JSONArray messages = current.data.optJSONArray(field);
+            if (messages == null) continue;
+            for (int i = 0; i < messages.length(); i++) {
+                JSONObject message = messages.optJSONObject(i);
+                if (message == null || !messageID.equals(message.optString("id"))) continue;
+                JSONArray parts = message.optJSONArray("parts");
+                if (parts == null) continue;
+                for (int j = 0; j < parts.length(); j++) {
+                    JSONObject candidate = parts.optJSONObject(j);
+                    if (candidate != null && part.optString("id").equals(candidate.optString("id"))
+                        && metadata.toString().equals(String.valueOf(candidate.optJSONObject("remoteImage")))) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** UI lookup uses only previously verified completions; cache hashing and all downloads stay off the main thread. */
+    String cachedRemoteImagePath(State owner, String messageID, JSONObject part) {
+        if (!currentRemoteImage(owner, messageID, part)) return null;
+        AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.parse(
+            accountUserId, owner.remoteSession, messageID, part, remoteImageReads::mediaInfo);
+        File file = request == null ? null : remoteImageFiles.get(request.signature);
+        return file != null && file.isFile() ? file.getAbsolutePath() : null;
+    }
+
+    /** Repeated row binds share one read; callers own explicit retry and keep errors on the image card. */
+    void loadRemoteImage(State owner, String messageID, JSONObject part,
+                         java.util.function.BiConsumer<File, String> completion) {
+        final JSONObject captured;
+        try { captured = part == null ? null : new JSONObject(part.toString()); }
+        catch (Exception invalid) { main.post(() -> completion.accept(null, "图片暂不可用")); return; }
+        worker.post(() -> {
+            try {
+                if (!currentRemoteImage(owner, messageID, captured)) throw new IOException("会话已切换");
+                JSONObject metadata = captured.optJSONObject("remoteImage");
+                String status = AIAssistantRemoteImages.text(metadata, "state");
+                if (status.equals("pending")) throw new IOException("图片正在同步");
+                if (status.equals("failed")) throw new IOException(metadata.optLong("expires_at") > 0
+                    && metadata.optLong("expires_at") <= System.currentTimeMillis() ? "图片已过期" : "图片同步失败");
+                AIAssistantRemoteImages.Request request = AIAssistantRemoteImages.Request.parse(
+                    accountUserId, owner.remoteSession, messageID, captured, remoteImageReads::mediaInfo);
+                if (request == null) throw new IOException("图片暂不可用");
+                String key = "remote-image:" + owner.data.optInt("remoteSelectionGeneration") + ":" + request.signature;
+                List<java.util.function.BiConsumer<File, String>> callbacks = remoteImageCallbacks.get(key);
+                if (callbacks != null) { callbacks.add(completion); return; }
+                callbacks = new ArrayList<>(); callbacks.add(completion); remoteImageCallbacks.put(key, callbacks);
+                boolean started = preparations.start(key, nativeEpoch, () -> nativeEpoch, cancellation -> {
+                    File cached = remoteImageCache.cached(request);
+                    cancellation.check();
+                    if (!currentRemoteImage(owner, messageID, captured)) throw new IOException("会话已切换");
+                    if (cached != null) return new JSONObject().put("path", cached.getAbsolutePath());
+                    remoteImageFiles.remove(request.signature);
+                    if (request.expired(System.currentTimeMillis())) throw new IOException("图片已过期");
+                    File staged = remoteImageCache.staging(request);
+                    try {
+                        remoteImageReads.download(request.downloadRequest(), staged, cancellation);
+                        cancellation.check();
+                        if (!currentRemoteImage(owner, messageID, captured)) throw new IOException("会话已切换");
+                        if (request.expired(System.currentTimeMillis())) throw new IOException("图片已过期");
+                        return new JSONObject().put("path", remoteImageCache.commit(staged, request).getAbsolutePath());
+                    } finally { remoteImageCache.discard(staged); }
+                }, (prepared, failure) -> {
+                    boolean current = currentRemoteImage(owner, messageID, captured);
+                    File ready = failure == null && current && prepared != null ? new File(prepared.optString("path")) : null;
+                    String failed = !current ? "会话已切换" : failure == null ? "" : safeMessage(failure);
+                    if (ready != null) remoteImageFiles.put(request.signature, ready);
+                    List<java.util.function.BiConsumer<File, String>> waiting = remoteImageCallbacks.remove(key);
+                    if (waiting != null) for (java.util.function.BiConsumer<File, String> callback : waiting)
+                        main.post(() -> {
+                            boolean currentAtDelivery = currentRemoteImage(owner, messageID, captured);
+                            callback.accept(currentAtDelivery ? ready : null, currentAtDelivery ? failed : "会话已切换");
+                        });
+                });
+                if (!started) {
+                    remoteImageCallbacks.remove(key);
+                    throw new IOException("图片正在准备，请稍后重试");
+                }
+            } catch (Exception failure) { main.post(() -> completion.accept(null, safeMessage(failure))); }
+        });
     }
 
     void downloadRemoteAttachment(JSONObject part,

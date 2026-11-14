@@ -5,10 +5,13 @@ import android.content.Context;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.security.MessageDigest;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CancellationException;
 import org.json.JSONObject;
 
 final class MaiSessionAttachments {
@@ -43,13 +46,23 @@ final class MaiSessionAttachments {
     private static final MaiChatAttachmentDownload.NativeTransport DOWNLOAD =
         new MaiChatAttachmentDownload.NativeTransport();
 
+    private static final class NativeLibrary {
+        static { System.loadLibrary("maichat_agent"); }
+        static void ensureLoaded() { }
+    }
+
+    private static long createCancel() {
+        NativeLibrary.ensureLoaded();
+        return nativeCreateCancel();
+    }
+
     // 与共享云盘 cancel 句柄同生命周期；cancel 可从控制线程调用，释放只在 native 返回后发生。
     static final class Scope {
         private long handle;
         private boolean canceled;
         synchronized long acquire() {
             if (canceled) return 0;
-            handle = nativeCreateCancel(); return handle;
+            handle = createCancel(); return handle;
         }
         synchronized void cancel() {
             canceled = true;
@@ -167,6 +180,89 @@ final class MaiSessionAttachments {
         } finally { scope.cancel(); }
     }
 
+    /** 调用方只传自有的新缓存路径；共享核心负责完整临时身份、期限、HTTPS 和原子下载。 */
+    JSONObject downloadTemporaryImage(JSONObject request, File target,
+            AIAssistantPreparationJobs.Cancellation cancellation) throws Exception {
+        if (cancellation != null) cancellation.check();
+        if (target == null || !target.isAbsolute() || target.getPath().indexOf(0) >= 0
+                || Files.exists(target.toPath(), LinkOption.NOFOLLOW_LINKS)
+                || target.getParentFile() == null || !target.getParentFile().isDirectory())
+            throw new IOException("图片缓存必须是调用方准备的新路径");
+        String account = imageString(request, "account_id");
+        requireImageAccount(account);
+        Room room = new Room(imageString(request, "owner_slot"),
+            imageString(request, "owner_login_session_id"), imageString(request, "session_id"));
+        String message = imageString(request, "message_id"), part = imageString(request, "part_id");
+        String id = imageString(request, "attachment_id"), name = imageString(request, "name");
+        String type = imageString(request, "content_type");
+        long bytes = imageInteger(request, "size_bytes"), expiry = imageInteger(request, "expires_at");
+        JSONObject payload = new JSONObject().put("attachment_id", id).put("name", name)
+            .put("content_type", type).put("media_type", "image").put("size_bytes", bytes)
+            .put("expires_at", expiry).put("output_path", target.getAbsolutePath());
+        MaiChatAuthClient.CloudDriveAccess access = auth.cloudDriveAccess();
+        if (access == null) throw new IOException("会话附件空间不可用");
+        // 取凭据可能刷新登录态；房间原发布者 tuple 不能替代当前读者账号。
+        requireImageAccount(account);
+        if (cancellation != null) cancellation.check();
+        Scope scope = new Scope();
+        long handle = 0;
+        boolean delivered = false;
+        try {
+            if (cancellation != null) { cancellation.onCancel(scope::cancel); cancellation.check(); }
+            handle = scope.acquire();
+            if (handle == 0) {
+                if (cancellation != null) cancellation.check();
+                throw new IOException("无法准备图片下载");
+            }
+            MaiCloudDrive.Result result = nativeDownloadTemporaryImage(access.authBaseUrl, access.accountToken,
+                SystemCertificateBundle.currentPem(), payload.toString(), room.slot, room.login, room.session,
+                message, part, handle);
+            if (cancellation != null) cancellation.check();
+            requireImageAccount(account);
+            if (result == null || !result.ok()) {
+                if (result != null && result.status == MaiCloudDrive.CANCELED)
+                    throw new CancellationException("图片下载已取消");
+                throw new IOException(result != null && result.httpStatus == 410
+                    ? "图片已过期" : MaiCloudDrive.errorText(result));
+            }
+            JSONObject receipt = result.json();
+            if (receipt.length() != 7 || !Boolean.TRUE.equals(receipt.opt("downloaded"))
+                    || !id.equals(receipt.opt("attachment_id"))
+                    || !target.getAbsolutePath().equals(receipt.opt("path"))
+                    || imageInteger(receipt, "size_bytes") != bytes
+                    || imageInteger(receipt, "expires_at") != expiry
+                    || !type.equals(receipt.opt("content_type")) || !"image".equals(receipt.opt("media_type"))
+                    || !target.isFile() || target.length() != bytes)
+                throw new IOException("临时图片下载回执不匹配");
+            delivered = true;
+            return receipt;
+        } catch (LinkageError unavailable) {
+            throw new IOException("本地图片下载组件不可用", unavailable);
+        } finally {
+            // Native 借用 cancel 到同步返回；取消/失败只丢弃本调用独占的新暂存文件。
+            scope.release(handle);
+            if (!delivered) target.delete();
+        }
+    }
+
+    private void requireImageAccount(String account) throws IOException {
+        if (account.isEmpty() || !account.equals(expectedAccount) || !account.equals(auth.accountId()))
+            throw new IOException("原图片账号已切换");
+    }
+
+    private static String imageString(JSONObject value, String key) throws IOException {
+        Object raw = value == null ? null : value.opt(key);
+        if (!(raw instanceof String) || ((String) raw).isEmpty() || ((String) raw).indexOf(0) >= 0)
+            throw new IOException("临时图片身份或元数据无效");
+        return (String) raw;
+    }
+
+    private static long imageInteger(JSONObject value, String key) throws IOException {
+        Object raw = value.opt(key);
+        if (!(raw instanceof Integer) && !(raw instanceof Long)) throw new IOException("临时图片数值无效");
+        return ((Number) raw).longValue();
+    }
+
     void cleanupRoom(Room room) throws Exception {
         MaiChatAuthClient.CloudDriveAccess access = auth.cloudDriveAccess();
         if (access == null) throw new IOException("会话附件空间不可用");
@@ -195,6 +291,9 @@ final class MaiSessionAttachments {
     private static native void nativeDestroyCancel(long handle);
     private static native MaiCloudDrive.Result nativeReadLink(String base, String token,
         byte[] pem, String attachmentId, String slot, String login, String session);
+    private static native MaiCloudDrive.Result nativeDownloadTemporaryImage(String base, String token,
+        byte[] pem, String payload, String slot, String login, String session,
+        String message, String part, long cancel);
     private static native MaiCloudDrive.Result nativeCleanupRoom(String base, String token,
         byte[] pem, String slot, String login, String session);
 }

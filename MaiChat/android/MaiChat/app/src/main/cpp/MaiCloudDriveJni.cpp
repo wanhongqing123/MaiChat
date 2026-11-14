@@ -117,7 +117,7 @@ bool configureProxy(JNIEnv* env, ProxyContext* context) {
 
 struct Call {
     std::string base, token, payload, suffix, path, checkpoint, name, type, stableId;
-    std::string ownerSlot, ownerLogin, sessionId;
+    std::string ownerSlot, ownerLogin, sessionId, messageId, partId;
     std::vector<char> pem;
     ProxyContext proxy;
     MaiCloudDriveOptions options{};
@@ -329,6 +329,29 @@ extern "C" JNIEXPORT jobject JNICALL Java_com_kongshang_maichat_MaiSessionAttach
             call.payload.c_str(), cancel, &result);
         mai_cloud_drive_cancel_destroy(cancel);
     }
+    return complete(env, &call, &result);
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_kongshang_maichat_MaiSessionAttachments_nativeDownloadTemporaryImage(
+    JNIEnv* env, jclass, jstring base, jstring token, jbyteArray pem,
+    jstring payload, jstring slot, jstring login, jstring session,
+    jstring message, jstring part, jlong handle) {
+    MaiCloudDriveResult result{};
+    result.status = MAI_CLOUD_DRIVE_INVALID_ARGUMENT;
+    Call call;
+    if (!handle || !readCall(env, base, token, pem, nullptr, &call) ||
+        !readSessionRoom(env, slot, login, session, &call) ||
+        !readString(env, payload, &call.payload) ||
+        !readString(env, message, &call.messageId) || !readString(env, part, &call.partId))
+        return complete(env, &call, &result);
+    // 原发布者的 room/message/part 与当前读者账号凭据分别传入；签名链接和
+    // 完整文件提交仍由共享普通 API 校验，宿主不取得 URL 或自行转发媒体字节。
+    call.options.temporary_session_image = 1;
+    call.options.message_id_utf8 = call.messageId.c_str();
+    call.options.part_id_utf8 = call.partId.c_str();
+    mai_cloud_drive_request(&call.options, MAI_SESSION_IMAGE_DOWNLOAD, call.payload.c_str(),
+        reinterpret_cast<MaiCloudDriveCancel*>(handle), &result);
     return complete(env, &call, &result);
 }
 

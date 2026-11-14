@@ -34,6 +34,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+import android.view.VelocityTracker;
 import android.view.inputmethod.EditorInfo;
 import android.widget.*;
 import androidx.core.content.FileProvider;
@@ -94,6 +95,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private final Set<String> deletedSessions = new HashSet<>();
     private final Set<String> remoteAttachmentTargets = new HashSet<>();
     private final Set<String> expanded = new HashSet<>();
+    // 图片请求按账号、会话读取代次和元数据去重；失败只由显式重试重新发起。
+    private final Set<String> requestedRemoteImages = new HashSet<>();
+    private final Map<String, String> remoteImageErrors = new HashMap<>();
     // 只供只读的卡片/阶段元数据使用；折叠工具的原始输入输出不会在 bind 时反复解 JSON。
     private static final AIAssistantToolJsonCache toolJson =
         new AIAssistantToolJsonCache(256 * 1024, JSONObject::new);
@@ -107,7 +111,18 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private Consumer<String> pendingAgentCamera, pendingAgentMusic;
     private boolean agentCameraRequestActive, agentMusicRequestActive;
     private String pendingMediaSession, pendingFileSession, pendingCameraSession;
-    private PopupWindow sessionDrawerPopup;
+    private SessionDrawerHost sessionDrawerHost;
+    private FrameLayout sessionConversationCard;
+    private LinearLayout sessionDrawer;
+    private View sessionDrawerReturn, sessionDrawerShade;
+    private TextView sessionDrawerStatus;
+    private ImageButton sessionDrawerCreate;
+    private String sessionNavigationStatus = "";
+    private float sessionDrawerDistance;
+    private boolean sessionDrawerExpanded, sessionDrawerSettling;
+    private android.animation.ValueAnimator sessionDrawerAnimator;
+    private int sessionDrawerMotionGeneration;
+    private final Set<String> collapsedSessionDevices = new HashSet<>();
     private PopupWindow actionPopup;
     private AIAssistantActionMenu actionMenu;
     private ScrollView actionScroll;
@@ -228,7 +243,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         setBackgroundColor(MaiChatTheme.PANEL);
         MarkdownRenderer.initialize(activity);
         FrameLayout header = new FrameLayout(activity);
-        ImageButton sessionsButton = headerIcon(R.drawable.ic_ai_sidebar, "对话列表", v -> sessions());
+        ImageButton sessionsButton = headerIcon(R.drawable.ic_ai_sidebar, "打开对话列表", v -> sessions());
         FrameLayout.LayoutParams sessionsParams = new FrameLayout.LayoutParams(dp(44), dp(44),
             Gravity.START | Gravity.CENTER_VERTICAL);
         sessionsParams.setMarginStart(dp(16));
@@ -527,6 +542,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         attachmentPanel.setVisibility(GONE);
         composerArea.addView(attachmentPanel, matchWrap());
         addView(composerArea, matchWrap());
+        installSessionDrawer();
     }
 
     /** 按最终可用宽度测量草稿，连续 EDIT 不继承上次单行高度和内部滚动。 */
@@ -578,7 +594,14 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     void setForeground(boolean value) {
         visibleToUser = value;
         if (browser != null) browser.setVisible(value);
-        if (!value && sessionDrawerPopup != null) sessionDrawerPopup.dismiss();
+        if (!value && sessionDrawerHost != null) {
+            cancelSessionDrawerAnimation();
+            sessionDrawerExpanded = false;
+            sessionDrawerSettling = false;
+            sessionDrawerHost.cancelTracking();
+            applySessionDrawerDistance(0);
+        }
+        updateSessionDrawerGestureExclusion();
         if (!value) dismissActionMenu();
         if (!value) {
             invalidateVoiceTranscription();
@@ -603,6 +626,8 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (changedSession) {
             // 切走后即使又切回同一会话，也不能接收旧录音的迟到 final。
             invalidateVoiceTranscription();
+            requestedRemoteImages.clear();
+            remoteImageErrors.clear();
             String previous = selected;
             drafts.put(previous, composer.getText().toString());
             boolean firstSend = previous.isEmpty() && !next.selected.isEmpty()
@@ -643,6 +668,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         lastRemoteRestoreGeneration = next.restoreGeneration;
         syncStatus.setText(next.syncStatus);
         syncStatus.setVisibility(next.syncStatus.isEmpty() ? GONE : VISIBLE);
+        updateSessionDrawerStatus();
         error.setText(next.error);
         error.setVisibility(next.error.isEmpty() ? GONE : VISIBLE);
         updateSend();
@@ -1914,123 +1940,353 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             for (JSONObject message : messages) if (quote.equals(message.optString("id"))) quotedMessage = message;
         }
     }
+    /** 目录与会话留在同一容器；拖动不重建消息、输入和滚动位置。 */
+    private void installSessionDrawer() {
+        LinearLayout conversation = column();
+        while (getChildCount() > 0) {
+            View child = getChildAt(0);
+            ViewGroup.LayoutParams params = child.getLayoutParams();
+            removeViewAt(0);
+            conversation.addView(child, params);
+        }
+        sessionDrawerHost = new SessionDrawerHost();
+        sessionDrawer = column();
+        sessionDrawer.setContentDescription("对话列表");
+        sessionDrawer.setBackgroundColor(MaiChatTheme.PANEL);
+        LinearLayout header = row();
+        header.setPadding(dp(20), 0, dp(12), 0);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = text("对话", MaiChatTypographyTokens.Role.TITLE, MaiChatTheme.TEXT);
+        title.setTypeface(MaiChatTypography.semibold());
+        header.addView(title, new LayoutParams(0, dp(60), 1));
+        ImageButton create = headerIcon(R.drawable.ic_ai_add, "新对话", v -> {
+            if (sessionActionsBlocked()) return;
+            settleSessionDrawer(false);
+            requestNewConversation();
+        });
+        sessionDrawerCreate = create;
+        header.addView(create, new LayoutParams(dp(40), dp(40)));
+        sessionDrawer.addView(header, matchWrap());
+        sessionDrawerStatus = text("", MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.BLUE);
+        sessionDrawerStatus.setPadding(dp(16), dp(8), dp(16), dp(8));
+        sessionDrawerStatus.setVisibility(GONE);
+        sessionDrawer.addView(sessionDrawerStatus, matchWrap());
+        sessionDrawerScroll = new ScrollView(activity);
+        sessionDrawerList = column();
+        sessionDrawerList.setPadding(dp(12), dp(16), dp(12), dp(16));
+        sessionDrawerScroll.addView(sessionDrawerList);
+        sessionDrawer.addView(sessionDrawerScroll, new LayoutParams(-1, 0, 1));
+        sessionDrawerHost.addView(sessionDrawer, new FrameLayout.LayoutParams(0, -1, Gravity.START));
+        sessionDrawerShade = new View(activity);
+        sessionDrawerShade.setBackgroundColor(Color.BLACK);
+        sessionDrawerHost.addView(sessionDrawerShade, new FrameLayout.LayoutParams(0, -1, Gravity.START));
+        sessionConversationCard = new FrameLayout(activity);
+        sessionConversationCard.setContentDescription("创作中心会话页面");
+        sessionConversationCard.setBackgroundColor(MaiChatTheme.PANEL);
+        sessionConversationCard.setOutlineProvider(new android.view.ViewOutlineProvider() {
+            @Override public void getOutline(View view, android.graphics.Outline outline) {
+                outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(),
+                    dp(50) * Math.min(1, sessionDrawerDistance / Math.max(1, dp(12))));
+            }
+        });
+        sessionConversationCard.setClipToOutline(true);
+        sessionConversationCard.addView(conversation, new FrameLayout.LayoutParams(-1, -1));
+        sessionDrawerReturn = new View(activity);
+        sessionDrawerReturn.setContentDescription("收起对话列表");
+        sessionDrawerReturn.setOnClickListener(v -> {
+            if (!sessionActionsBlocked()) settleSessionDrawer(false);
+        });
+        sessionConversationCard.addView(sessionDrawerReturn, new FrameLayout.LayoutParams(-1, -1));
+        sessionDrawerHost.addView(sessionConversationCard, new FrameLayout.LayoutParams(-1, -1));
+        addView(sessionDrawerHost, new LayoutParams(-1, -1));
+        applySessionDrawerDistance(0);
+    }
+    private int sessionDrawerWidth() {
+        return Math.min(dp(360), Math.round(sessionDrawerHost.getWidth() * .78f));
+    }
+    private boolean sessionActionsBlocked() {
+        return sessionDrawerSettling || sessionDrawerHost.tracking || navigationPending;
+    }
     private void sessions() {
-        if (navigationPending) return;
-        if (state == null) return;
-        if (sessionDrawerPopup != null && sessionDrawerPopup.isShowing()) return;
-        FrameLayout overlay = new FrameLayout(activity);
-        overlay.setBackgroundColor(Color.argb(42, 0, 0, 0));
-        LinearLayout drawer = column();
-        drawer.setBackgroundColor(MaiChatTheme.PANEL);
-        drawer.setElevation(dp(18));
-        LinearLayout drawerHeader = row();
-        drawerHeader.setPadding(dp(18), 0, dp(12), 0);
-        TextView drawerTitle = text("对话", MaiChatTypographyTokens.Role.HEADING3, MaiChatTheme.TEXT);
-        drawerTitle.setTypeface(MaiChatTypography.semibold());
-        drawerHeader.addView(drawerTitle, new LayoutParams(0, dp(54), 1));
-        ImageButton create = circularIcon(R.drawable.ic_ai_add, "新对话", false, null);
-        drawerHeader.addView(create, new LayoutParams(dp(40), dp(40)));
-        drawer.addView(drawerHeader, matchWrap());
-        ScrollView scroll = new ScrollView(activity);
-        LinearLayout sessionList = column();
-        sessionList.setPadding(dp(10), dp(6), dp(10), dp(18));
-        scroll.addView(sessionList);
-        drawer.addView(scroll, new LayoutParams(LayoutParams.MATCH_PARENT, 0, 1));
-        int drawerWidth = Math.min(dp(360),
-            Math.round(activity.getResources().getDisplayMetrics().widthPixels * 0.86f));
-        FrameLayout.LayoutParams drawerParams = new FrameLayout.LayoutParams(
-            drawerWidth, LayoutParams.MATCH_PARENT, Gravity.START);
-        overlay.addView(drawer, drawerParams);
-        PopupWindow popup = new PopupWindow(
-            overlay, LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT, true);
-        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-        popup.setOutsideTouchable(true);
-        overlay.setOnClickListener(v -> popup.dismiss());
-        drawer.setOnClickListener(v -> {});
-        create.setOnClickListener(v -> {
-            popup.dismiss();
-            chooseDeviceForNewConversation();
-        });
-        sessionDrawerPopup = popup;
-        sessionDrawerList = sessionList;
-        sessionDrawerScroll = scroll;
-        sessionDrawerSignature = "";
-        popup.setOnDismissListener(() -> {
-            if (sessionDrawerPopup != popup) return;
-            sessionDrawerPopup = null;
-            sessionDrawerList = null;
-            sessionDrawerScroll = null;
-            sessionDrawerSignature = "";
-        });
+        if (state == null || sessionActionsBlocked()) return;
+        prepareSessionDrawer();
+        settleSessionDrawer(true);
+    }
+    private void prepareSessionDrawer() {
+        hideKeyboard();
+        hideAttachmentPanel();
+        dismissActionMenu();
         refreshSessionDrawer();
-        popup.showAtLocation(this, Gravity.START | Gravity.TOP, 0, 0);
-        drawer.setTranslationX(-drawerWidth);
-        drawer.animate().translationX(0).setDuration(180).start();
+    }
+    private void applySessionDrawerDistance(float distance) {
+        int width = sessionDrawerWidth();
+        sessionDrawerDistance = Math.max(0, Math.min(width, distance));
+        float progress = width == 0 ? 0 : sessionDrawerDistance / width;
+        sessionDrawer.setTranslationX(sessionDrawerDistance - width);
+        sessionDrawerShade.setTranslationX(sessionDrawerDistance - width);
+        sessionDrawerShade.setAlpha(.22f * (1 - progress));
+        sessionConversationCard.setTranslationX(sessionDrawerDistance);
+        sessionConversationCard.setPivotX(0);
+        sessionConversationCard.setPivotY(sessionConversationCard.getHeight() / 2f);
+        sessionConversationCard.setScaleX(1 - .05f * progress);
+        sessionConversationCard.setScaleY(1 - .05f * progress);
+        sessionConversationCard.setElevation(dp(18) * progress);
+        sessionConversationCard.invalidateOutline();
+        boolean blocksConversation = sessionDrawerDistance > 0 || sessionDrawerSettling || sessionDrawerHost.tracking;
+        sessionDrawerReturn.setVisibility(blocksConversation ? VISIBLE : GONE);
+        sessionDrawer.setVisibility(sessionDrawerDistance > 0 ? VISIBLE : INVISIBLE);
+        sessionDrawerShade.setVisibility(sessionDrawerDistance > 0 ? VISIBLE : INVISIBLE);
+        sessionDrawer.setImportantForAccessibility(sessionDrawerExpanded
+            ? IMPORTANT_FOR_ACCESSIBILITY_AUTO : IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+        sessionConversationCard.getChildAt(0).setImportantForAccessibility(blocksConversation
+            ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS : IMPORTANT_FOR_ACCESSIBILITY_AUTO);
+    }
+    private void settleSessionDrawer(boolean expanded) {
+        cancelSessionDrawerAnimation();
+        sessionDrawerExpanded = expanded;
+        int generation = sessionDrawerMotionGeneration;
+        float destination = expanded ? sessionDrawerWidth() : 0;
+        sessionDrawerSettling = true;
+        android.animation.ValueAnimator animation = android.animation.ValueAnimator.ofFloat(sessionDrawerDistance, destination);
+        sessionDrawerAnimator = animation;
+        animation.setDuration(Math.max(100, Math.round(240 * Math.abs(destination - sessionDrawerDistance)
+            / Math.max(1, sessionDrawerWidth()))));
+        animation.setInterpolator(new android.view.animation.DecelerateInterpolator());
+        animation.addUpdateListener(value -> applySessionDrawerDistance((Float) value.getAnimatedValue()));
+        animation.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(android.animation.Animator value) {
+                if (sessionDrawerAnimator != animation) return;
+                sessionDrawerAnimator = null;
+                // 互锁保留至本次抬手结束，防止点击穿透到会话内容。
+                post(() -> { if (sessionDrawerAnimator == null && generation == sessionDrawerMotionGeneration) {
+                    sessionDrawerSettling = false;
+                    applySessionDrawerDistance(destination);
+                }});
+            }
+        });
+        animation.start();
+    }
+    private void cancelSessionDrawerAnimation() {
+        android.animation.ValueAnimator previous = sessionDrawerAnimator;
+        // 先移交代次；被取消动画的完成回调不能在新拖动中套用旧端点。
+        sessionDrawerAnimator = null;
+        sessionDrawerMotionGeneration++;
+        if (previous != null) previous.cancel();
+    }
+    private void updateSessionDrawerGestureExclusion() {
+        if (Build.VERSION.SDK_INT < 29) return;
+        // 系统仅允许每侧200dp的手势排除区；只保留左侧居中的目录入口，其他边缘仍可返回。
+        int height = visibleToUser ? Math.min(getHeight(), dp(200)) : 0;
+        int top = (getHeight() - height) / 2;
+        setSystemGestureExclusionRects(height <= 0 ? Collections.emptyList()
+            : Collections.singletonList(new android.graphics.Rect(0, top, dp(32), top + height)));
+    }
+    boolean closeSessionDrawerOnBack() {
+        if (!sessionDrawerExpanded && !sessionDrawerSettling && !sessionDrawerHost.tracking) return false;
+        sessionDrawerHost.cancelTracking();
+        settleSessionDrawer(false);
+        return true;
+    }
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && (sessionDrawerExpanded || sessionDrawerSettling)) {
+            if (event.getAction() == KeyEvent.ACTION_UP) closeSessionDrawerOnBack();
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+    /** 开始12dp锁定方向；闭合态仅左32dp开目录，正文与媒体内部横滑保留原语义。 */
+    private final class SessionDrawerHost extends FrameLayout {
+        private float downX, downY, origin;
+        private boolean candidate, directionLocked, tracking, originalExpanded;
+        private VelocityTracker velocity;
+        SessionDrawerHost() { super(activity); setClipChildren(true); }
+        void cancelTracking() {
+            candidate = false; directionLocked = false; tracking = false;
+            if (velocity != null) { velocity.recycle(); velocity = null; }
+        }
+        @Override protected void onMeasure(int widthSpec, int heightSpec) {
+            // onSizeChanged发生在子视图测量之后，目录宽度必须先于本轮measure提交。
+            int width = Math.min(dp(360), Math.round(MeasureSpec.getSize(widthSpec) * .78f));
+            sessionDrawer.getLayoutParams().width = width;
+            sessionDrawerShade.getLayoutParams().width = width;
+            super.onMeasure(widthSpec, heightSpec);
+        }
+        @Override protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+            super.onSizeChanged(w, h, oldw, oldh);
+            int width = Math.min(dp(360), Math.round(w * .78f));
+            // 收键盘只改变高度，当前横拖仍须跟手；仅旋转等宽度变化重新采用开合端点。
+            if (w != oldw) {
+                cancelSessionDrawerAnimation();
+                sessionDrawerSettling = false;
+                cancelTracking();
+                applySessionDrawerDistance(sessionDrawerExpanded ? width : 0);
+            } else applySessionDrawerDistance(sessionDrawerDistance);
+            sessionConversationCard.setPivotY(h / 2f);
+            updateSessionDrawerGestureExclusion();
+        }
+        @Override public boolean onInterceptTouchEvent(MotionEvent event) {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                downX = event.getX(); downY = event.getY();
+                candidate = sessionDrawerExpanded || downX <= dp(32);
+                directionLocked = false; tracking = false;
+                origin = sessionDrawerDistance; originalExpanded = sessionDrawerExpanded;
+                if (velocity != null) velocity.recycle();
+                velocity = VelocityTracker.obtain(); velocity.addMovement(event);
+            } else if (event.getActionMasked() == MotionEvent.ACTION_MOVE && candidate && !directionLocked) {
+                float dx = event.getX() - downX, dy = event.getY() - downY;
+                if (Math.max(Math.abs(dx), Math.abs(dy)) >= dp(12)) {
+                    directionLocked = true;
+                    tracking = Math.abs(dx) > Math.abs(dy) && (sessionDrawerExpanded || dx > 0);
+                    if (tracking) {
+                        cancelSessionDrawerAnimation();
+                        sessionDrawerSettling = false;
+                        prepareSessionDrawer();
+                        getParent().requestDisallowInterceptTouchEvent(true);
+                        // 首个被截获的 MOVE 会转换为子视图 CANCEL；这里先同步这一帧位移。
+                        velocity.addMovement(event);
+                        applySessionDrawerDistance(origin + dx);
+                    }
+                }
+            }
+            return tracking;
+        }
+        @Override public boolean onTouchEvent(MotionEvent event) {
+            if (velocity != null) velocity.addMovement(event);
+            if (!tracking) return candidate;
+            if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
+                applySessionDrawerDistance(origin + event.getX() - downX);
+            } else if (event.getActionMasked() == MotionEvent.ACTION_UP
+                    || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+                boolean expanded = originalExpanded;
+                if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                    applySessionDrawerDistance(origin + event.getX() - downX);
+                    velocity.computeCurrentVelocity(1000);
+                    expanded = sessionDrawerDistance + velocity.getXVelocity() * .2f > sessionDrawerWidth() * .5f;
+                }
+                tracking = false;
+                velocity.recycle(); velocity = null;
+                settleSessionDrawer(expanded);
+            }
+            return true;
+        }
     }
 
     private void refreshSessionDrawer() {
-        if (sessionDrawerList == null || sessionDrawerScroll == null || state == null) return;
+        if (sessionDrawerList == null || state == null) return;
         JSONArray items = state.data.optJSONArray("sessions");
-        if (items == null) return;
-        // 尚未发送的空白会话也要能从列表返回，否则创建新对话会让草稿失去入口。
+        if (items == null) items = new JSONArray();
         boolean blankDraft = !attachments.getOrDefault("", Collections.emptyList()).isEmpty()
             || pendingMediaImports.getOrDefault("", 0) > 0
             || !(selected.isEmpty() ? composer.getText().toString()
                 : drafts.getOrDefault("", "")).trim().isEmpty();
-        StringBuilder signature = new StringBuilder().append(blankDraft).append('|')
-            .append(selected).append('|').append(state.remoteSession != null);
         JSONArray devices = state.data.optJSONArray("devices");
-        if (devices != null) signature.append('|').append(devices.toString());
-        for (int i = 0; i < items.length(); i++) {
-            JSONObject item = items.optJSONObject(i);
-            if (item == null) continue;
-            signature.append('\u001f').append(item.optString("id"))
-                .append('\u001f').append(item.optString("title"))
-                .append('\u001f').append(item.optString("device_slot"))
-                .append('\u001f').append(item.optString("device_id"))
-                .append('\u001f').append(item.optString("login_session_id"))
-                .append('\u001f').append(item.optString("device_name"))
-                .append('\u001f').append(item.optBoolean("online"))
-                .append('\u001f').append(item.optBoolean("busy"));
-        }
-        String nextSignature = signature.toString();
-        if (nextSignature.equals(sessionDrawerSignature)) return;
-        sessionDrawerSignature = nextSignature;
+        String signature = blankDraft + "|" + messageOwner(state) + "|" + items + "|" + devices
+            + "|" + collapsedSessionDevices + "|" + navigationPending;
+        if (signature.equals(sessionDrawerSignature)) return;
+        sessionDrawerCreate.setEnabled(!navigationPending);
+        sessionDrawerSignature = signature;
         int scrollY = sessionDrawerScroll.getScrollY();
         sessionDrawerList.removeAllViews();
-        if (blankDraft)
-            sessionDrawerList.addView(sessionDrawerRow("未发送草稿", "", selected.isEmpty(), v -> {
-                sessionDrawerPopup.dismiss();
-                requestConversation("");
-            }), matchWrap());
+        List<JSONObject> local = new ArrayList<>();
+        Map<String, JSONObject> owners = new LinkedHashMap<>();
+        Map<String, List<JSONObject>> groups = new LinkedHashMap<>();
+        if (devices != null) for (int i = 0; i < devices.length(); i++) {
+            JSONObject device = devices.optJSONObject(i);
+            if (device == null) continue;
+            String key = sessionDeviceKey(device);
+            owners.put(key, device); groups.put(key, new ArrayList<>());
+        }
         for (int i = 0; i < items.length(); i++) {
             JSONObject session = items.optJSONObject(i);
             if (session == null) continue;
-            String id = session.optString("id");
-            String title = session.optString("title");
-            if (title.equals("New session")) title = "新对话";
-            boolean remote = session.has("device_slot");
-            String detail = remote ? session.optString("device_name") + " · " +
-                (session.optBoolean("online") ? "在线" : "离线") :
-                session.optBoolean("busy") ? "正在处理" : "";
-            boolean chosen = id.equals(selected) &&
-                (remote == (state.remoteSession != null));
-            sessionDrawerList.addView(sessionDrawerRow(title, detail, chosen, v -> {
-                sessionDrawerPopup.dismiss();
-                if (remote) requestRemoteConversation(session);
-                else requestConversation(id);
-            }, v -> {
-                if (remote && !session.optBoolean("online")) {
-                    Toast.makeText(activity, "所属设备离线，暂时无法删除", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-                confirmDeleteConversation(session);
-            }), matchWrap());
+            if (!session.has("device_slot")) { local.add(session); continue; }
+            String key = sessionDeviceKey(session);
+            owners.putIfAbsent(key, session);
+            groups.computeIfAbsent(key, ignored -> new ArrayList<>()).add(session);
         }
-        ScrollView scroll = sessionDrawerScroll;
-        scroll.post(() -> {
-            if (sessionDrawerScroll == scroll) scroll.scrollTo(0, scrollY);
+        addSessionDeviceHeader("这台设备", "local", local.size() + (blankDraft ? 1 : 0), null);
+        if (!collapsedSessionDevices.contains("local")) {
+            if (blankDraft) sessionDrawerList.addView(sessionDrawerRow("未发送草稿", "",
+                selected.isEmpty() && state.remoteSession == null, v -> {
+                    if (sessionActionsBlocked()) return;
+                    settleSessionDrawer(false); requestConversation("");
+                }), matchWrap());
+            for (JSONObject session : local) addSessionDrawerConversation(session);
+            if (local.isEmpty() && !blankDraft) addEmptySessionGroup("暂无本机对话");
+        }
+        for (Map.Entry<String, List<JSONObject>> entry : groups.entrySet()) {
+            JSONObject device = owners.get(entry.getKey());
+            String name = device.optString("device_name", "所属设备");
+            addSessionDeviceHeader(name, entry.getKey(), entry.getValue().size(), device);
+            if (collapsedSessionDevices.contains(entry.getKey())) continue;
+            for (JSONObject session : entry.getValue()) addSessionDrawerConversation(session);
+            if (entry.getValue().isEmpty()) addEmptySessionGroup("暂无对话");
+        }
+        sessionDrawerScroll.post(() -> sessionDrawerScroll.scrollTo(0, scrollY));
+    }
+    private static String sessionDeviceKey(JSONObject device) {
+        return new JSONArray().put(device.optString("device_slot")).put(device.optString("device_id")).toString();
+    }
+    private void addSessionDeviceHeader(String name, String key, int count, JSONObject device) {
+        boolean collapsed = collapsedSessionDevices.contains(key);
+        LinearLayout header = row();
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        LayoutParams params = matchWrap(); params.topMargin = sessionDrawerList.getChildCount() == 0 ? 0 : dp(16);
+        TextView label = text((collapsed ? "▸  " : "▾  ") + name, MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
+        label.setSingleLine(true); label.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        label.setGravity(Gravity.CENTER_VERTICAL); label.setPadding(dp(12), 0, dp(4), 0);
+        label.setContentDescription(name + "，" + (device == null ? "本机" : device.optBoolean("online") ? "在线" : "离线")
+            + "，" + count + " 个对话");
+        label.setOnClickListener(v -> {
+            if (sessionActionsBlocked()) return;
+            if (collapsedSessionDevices.contains(key)) collapsedSessionDevices.remove(key);
+            else collapsedSessionDevices.add(key);
+            refreshSessionDrawer();
         });
+        header.addView(label, new LayoutParams(0, dp(34), 1));
+        TextView status = text((device == null ? "" : device.optBoolean("online") ? "● 在线  " : "● 离线  ")
+            + (count > 0 ? count : ""), MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY);
+        header.addView(status, new LayoutParams(-2, -2));
+        if (device != null) {
+            ImageButton create = headerIcon(R.drawable.ic_ai_add, "在" + name + "上新建对话", v -> {
+                if (sessionActionsBlocked()) return;
+                requestRemoteNewConversation(device);
+            });
+            create.setBackgroundColor(Color.TRANSPARENT);
+            create.setEnabled(device.optBoolean("online") && !navigationPending);
+            header.addView(create, new LayoutParams(dp(34), dp(34)));
+        }
+        sessionDrawerList.addView(header, params);
+    }
+    private void addEmptySessionGroup(String title) {
+        TextView empty = text(title, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
+        empty.setPadding(dp(34), dp(12), dp(12), dp(12));
+        sessionDrawerList.addView(empty, matchWrap());
+    }
+    private void addSessionDrawerConversation(JSONObject session) {
+        String id = session.optString("id");
+        String title = session.optString("title");
+        if (title.isEmpty() || title.equals("New session")) title = "新对话";
+        boolean remote = session.has("device_slot");
+        boolean chosen = remote ? state.remoteSession != null
+            && id.equals(state.remoteSession.optString("id"))
+            && sessionDeviceKey(session).equals(sessionDeviceKey(state.remoteSession))
+            && session.optString("login_session_id").equals(state.remoteSession.optString("login_session_id"))
+            : state.remoteSession == null && id.equals(selected);
+        String detail = session.optBoolean("busy") && (!remote || session.optBoolean("online")) ? "正在处理" : "";
+        View row = sessionDrawerRow(title, detail, chosen, v -> {
+            if (sessionActionsBlocked()) return;
+            settleSessionDrawer(false);
+            if (remote) requestRemoteConversation(session); else requestConversation(id);
+        }, v -> {
+            if (sessionActionsBlocked()) return;
+            if (remote && !session.optBoolean("online")) {
+                Toast.makeText(activity, "所属设备离线，暂时无法删除", Toast.LENGTH_SHORT).show(); return;
+            }
+            confirmDeleteConversation(session);
+        });
+        row.setAlpha(remote && !session.optBoolean("online") ? .8f : 1f);
+        sessionDrawerList.addView(row, matchWrap());
     }
     private void requestNewConversation() {
         if (navigationPending) return;
@@ -2040,40 +2296,22 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         updateSend();
         controller.create(success -> finishNavigation(generation));
     }
-    private void chooseDeviceForNewConversation() {
-        if (state == null || navigationPending) return;
-        JSONArray devices = state.data.optJSONArray("devices");
-        List<JSONObject> online = new ArrayList<>();
-        if (devices != null) for (int i = 0; i < devices.length(); i++) {
-            JSONObject device = devices.optJSONObject(i);
-            if (device != null && device.optBoolean("online")) online.add(device);
-        }
-        if (online.isEmpty()) {
-            requestNewConversation();
-            return;
-        }
-        String[] labels = new String[online.size() + 1];
-        labels[0] = "这台设备";
-        for (int i = 0; i < online.size(); i++) {
-            JSONObject device = online.get(i);
-            String name = device.optString("device_name").trim();
-            labels[i + 1] = name.isEmpty() ? device.optString("device_slot") : name;
-        }
-        new AlertDialog.Builder(activity).setTitle("新对话创建在哪台设备？")
-            .setItems(labels, (dialog, which) -> {
-                if (which == 0) requestNewConversation();
-                else requestRemoteNewConversation(online.get(which - 1));
-            }).show();
-    }
     private void requestRemoteNewConversation(JSONObject device) {
         if (navigationPending) return;
         navigationPending = true;
         int generation = ++navigationGeneration;
+        sessionNavigationStatus = "正在" + device.optString("device_name", "所属设备") + "上新建对话…";
+        updateSessionDrawerStatus();
+        refreshSessionDrawer();
         updateSend();
         controller.createOnDevice(device, "", success -> {
             finishNavigation(generation);
-            if (!success) Toast.makeText(activity, controller.state.error,
-                Toast.LENGTH_LONG).show();
+            if (success) settleSessionDrawer(false);
+            else {
+                String failure = controller.state == null ? "" : controller.state.error;
+                sessionNavigationStatus = failure.isEmpty() ? "新建对话失败，请重试" : failure;
+                updateSessionDrawerStatus();
+            }
         });
     }
     private void confirmDeleteConversation(JSONObject session) {
@@ -2116,7 +2354,17 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     private void finishNavigation(int generation) {
         if (navigationGeneration != generation) return;
         navigationPending = false;
+        sessionNavigationStatus = "";
+        updateSessionDrawerStatus();
+        refreshSessionDrawer();
         updateSend();
+    }
+    private void updateSessionDrawerStatus() {
+        if (sessionDrawerStatus == null) return;
+        String status = !sessionNavigationStatus.isEmpty() ? sessionNavigationStatus
+            : state == null ? "" : !state.error.isEmpty() ? state.error : state.syncStatus;
+        sessionDrawerStatus.setText(status);
+        sessionDrawerStatus.setVisibility(status.isEmpty() ? GONE : VISIBLE);
     }
     private void menu(View anchor) {
         if (navigationPending) return;
@@ -2469,6 +2717,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         // 正文独立保留混排容器；用户气泡、工具摘要和展开详情继续使用既有 TextView 路径。
         final Map<String, MarkdownContentView> markdownParts = new HashMap<>();
         final Map<String, ImageView> imageParts = new HashMap<>();
+        final Map<String, RemoteImageCard> remoteImageCards = new HashMap<>();
         final Map<String, LinearLayout> videoParts = new HashMap<>();
         final Map<String, Button> pdfCards = new HashMap<>();
         final Map<String, Button> fileCards = new HashMap<>();
@@ -2494,6 +2743,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     parts.clear();
                     markdownParts.clear();
                     imageParts.clear();
+                    remoteImageCards.clear();
                     videoParts.clear();
                     pdfCards.clear();
                     fileCards.clear();
@@ -2558,6 +2808,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 JSONObject part = array.optJSONObject(i);
                 if (part == null || part.optString("kind").equals("reasoning")) continue;
                 structure.append(part.optString("id")).append(part.optString("kind"))
+                    .append(part.has("remoteImage"))
                     .append(expanded.contains(part.optString("id")))
                     .append(mediaFromToolOutput(part) != null).append(fileFromToolOutput(part) != null);
             }
@@ -2574,6 +2825,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 parts.clear();
                 markdownParts.clear();
                 imageParts.clear();
+                remoteImageCards.clear();
                 videoParts.clear();
                 pdfCards.clear();
                 fileCards.clear();
@@ -2597,6 +2849,12 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     bubble.addView(body, matchWrap());
                     for (int i = 0; i < array.length(); i++) {
                         JSONObject part = array.optJSONObject(i);
+                        if (part != null && part.optString("kind").equals("image") && part.has("remoteImage")) {
+                            RemoteImageCard card = new RemoteImageCard();
+                            bubble.addView(card, matchWrap());
+                            remoteImageCards.put(part.optString("id"), card);
+                            continue;
+                        }
                         if (part == null || !part.optString("kind").equals("image") ||
                             !part.optString("attachment_id").isEmpty()) continue;
                         ImageView image = new ImageView(activity);
@@ -2668,6 +2926,12 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                         JSONObject part = array.optJSONObject(i);
                         if (part == null) continue;
                         String id = part.optString("id"), kind = part.optString("kind");
+                        if (kind.equals("image") && part.has("remoteImage")) {
+                            RemoteImageCard card = new RemoteImageCard();
+                            remoteImageCards.put(id, card);
+                            addView(card, matchWrap());
+                            continue;
+                        }
                         boolean deliveredMedia = kind.equals("tool") &&
                             (mediaFromToolOutput(part) != null || fileFromToolOutput(part) != null);
                         // 思考正文不创建视图；本行底部的状态文字已足够提示进度。
@@ -3012,6 +3276,16 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                     }
                 }
             updateTime();
+            bindRemoteImages();
+        }
+        private void bindRemoteImages() {
+            JSONArray values = message == null ? null : message.optJSONArray("parts");
+            if (values == null || state == null) return;
+            for (int i = 0; i < values.length(); i++) {
+                JSONObject part = values.optJSONObject(i);
+                RemoteImageCard card = part == null ? null : remoteImageCards.get(part.optString("id"));
+                if (card != null) bindRemoteImage(card, state, message.optString("id"), part);
+            }
         }
         private JSONObject currentToolPart(String id) {
             JSONArray values = message == null ? null : message.optJSONArray("parts");
@@ -3302,6 +3576,94 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             result.add(new MainActivity.GalleryItem(file.getAbsolutePath(), video));
     }
 
+    private final class RemoteImageCard extends LinearLayout {
+        String signature = "", rendered = "";
+        RemoteImageCard() { super(activity); setOrientation(VERTICAL); setContentDescription("会话图片"); }
+    }
+    private String remoteImageScope(AIAssistantController.State owner) {
+        return owner == null ? "" : new JSONArray()
+            .put(MaiChatAuthClient.shared(activity).accountSessionGeneration())
+            .put(messageOwner(owner)).put(owner.remoteSession == null ? "" : owner.remoteSession.optString("device_id"))
+            .put(owner.data.optInt("remoteSelectionGeneration")).toString();
+    }
+    private void bindRemoteImage(RemoteImageCard card, AIAssistantController.State owner,
+                                 String messageID, JSONObject part) {
+        String scope = remoteImageScope(owner);
+        String signature = new JSONArray().put(scope).put(messageID).put(part.optString("id"))
+            .put(part.optJSONObject("remoteImage")).toString();
+        card.signature = signature;
+        String cached = controller.cachedRemoteImagePath(owner, messageID, part);
+        String failure = remoteImageErrors.get(signature);
+        if (failure != null) {
+            JSONObject metadata = part.optJSONObject("remoteImage");
+            boolean expired = metadata != null && metadata.optString("state").equals("expired");
+            showRemoteImageState(card, signature, failure,
+                expired ? null : () -> startRemoteImage(card, owner, messageID, part, scope, signature));
+            return;
+        }
+        if (cached != null && !cached.isEmpty()) {
+            showRemoteImageFile(card, owner, messageID, part, scope, signature, new File(cached));
+            return;
+        }
+        JSONObject metadata = part.optJSONObject("remoteImage");
+        String status = metadata == null ? "" : metadata.optString("state");
+        boolean expired = status.equals("expired");
+        String label = status.equals("pending") ? "图片同步中…" : expired ? "图片已过期，未保留本地副本"
+            : status.equals("failed") ? "图片同步失败，请在所属设备重试" : status.equals("ready") ? "正在加载图片…" : "图片暂不可用";
+        showRemoteImageState(card, signature, label, null);
+        // 到期元数据仍先查控制器的完整磁盘副本；pending/failed不会反复触发下载。
+        if ((status.equals("ready") || expired) && requestedRemoteImages.add(signature))
+            startRemoteImage(card, owner, messageID, part, scope, signature);
+    }
+    private void startRemoteImage(RemoteImageCard card, AIAssistantController.State owner,
+                                  String messageID, JSONObject part, String scope, String signature) {
+        if (!scope.equals(remoteImageScope(state)) || !signature.equals(card.signature)) return;
+        remoteImageErrors.remove(signature);
+        requestedRemoteImages.add(signature);
+        boolean expired = part.optJSONObject("remoteImage") != null
+            && part.optJSONObject("remoteImage").optString("state").equals("expired");
+        showRemoteImageState(card, signature, expired ? "图片已过期，未保留本地副本" : "正在加载图片…", null);
+        controller.loadRemoteImage(owner, messageID, part, (file, error) -> {
+            if (!scope.equals(remoteImageScope(state))) return;
+            String failure = expired ? "图片已过期，未保留本地副本"
+                : error == null || error.isEmpty() ? "图片加载失败，请重试" : error;
+            if (file == null) remoteImageErrors.put(signature, failure);
+            if (signature.equals(card.signature)) {
+                if (file != null) showRemoteImageFile(card, owner, messageID, part, scope, signature, file);
+                else showRemoteImageState(card, signature, failure, expired ? null
+                    : () -> startRemoteImage(card, owner, messageID, part, scope, signature));
+            }
+            // 同一图片可能因ListView复用换过容器；只更新匹配卡片，不重绑整条消息或列表。
+            for (int i = 0; i < list.getChildCount(); i++) {
+                View row = list.getChildAt(i);
+                if (row instanceof MessageRow) ((MessageRow) row).bindRemoteImages();
+            }
+        });
+    }
+    private void showRemoteImageState(RemoteImageCard card, String signature, String label, Runnable retry) {
+        String rendered = signature + label + (retry != null);
+        if (rendered.equals(card.rendered)) return;
+        card.rendered = rendered;
+        card.removeAllViews();
+        TextView status = text(label, MaiChatTypographyTokens.Role.DETAIL, MaiChatTheme.SECONDARY);
+        status.setPadding(0, dp(12), 0, dp(12));
+        card.addView(status, matchWrap());
+        if (retry != null) card.addView(button("重试加载图片", "重试加载图片", v -> retry.run()), matchWrap());
+    }
+    private void showRemoteImageFile(RemoteImageCard card, AIAssistantController.State owner,
+                                     String messageID, JSONObject part, String scope, String signature, File file) {
+        String rendered = signature + "|file|" + file.getAbsolutePath();
+        if (rendered.equals(card.rendered)) return;
+        card.rendered = rendered;
+        showAgentMediaCard(card, file, "image", "", null, () -> {
+            if (!scope.equals(remoteImageScope(state)) || !signature.equals(card.signature)) return;
+            String failure = "图片无法显示，请重试";
+            remoteImageErrors.put(signature, failure);
+            showRemoteImageState(card, signature, failure,
+                () -> startRemoteImage(card, owner, messageID, part, scope, signature));
+        });
+    }
+
     static int[] videoCardSize(int width, int height) {
         if (width <= 0 || height <= 0) return new int[] {280, 181};
         double scale = Math.min(280.0 / width, 320.0 / height);
@@ -3317,6 +3679,10 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     }
     private void showAgentMediaCard(LinearLayout container, File file, String type,
                                     String caption, JSONObject completedPart) {
+        showAgentMediaCard(container, file, type, caption, completedPart, null);
+    }
+    private void showAgentMediaCard(LinearLayout container, File file, String type,
+                                    String caption, JSONObject completedPart, Runnable imageFailure) {
         container.removeAllViews();
         if (type.equals("image") || type.equals("video")) {
             boolean video = type.equals("video");
@@ -3338,7 +3704,10 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             MessageImageLoader.load(file.getAbsolutePath(),
                 video ? dp(280) : dp(220), video ? dp(320) : dp(240), cover,
-                () -> cover.setContentDescription("媒体无法显示"));
+                () -> {
+                    cover.setContentDescription("媒体无法显示");
+                    if (imageFailure != null) imageFailure.run();
+                });
             if (video) {
                 TextView play = text("▶", MaiChatTypographyTokens.Role.TITLE, Color.WHITE);
                 play.setGravity(Gravity.CENTER);
