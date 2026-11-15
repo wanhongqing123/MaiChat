@@ -3768,7 +3768,10 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (type.equals("image") || type.equals("video")) {
             boolean video = type.equals("video");
             int[] initialSize = video ? videoCardSize(0, 0) : new int[] {220, 240};
-            FrameLayout preview = new FrameLayout(activity);
+            // Images share the existing bounds-aware thumbnail row with IM:
+            // reserve the decoded aspect-ratio height, including narrow parents,
+            // rather than centering a landscape image in a fixed 240dp frame.
+            ViewGroup preview = video ? new FrameLayout(activity) : new MaiImageMessageRow(activity);
             if (video) {
                 preview.setContentDescription("播放视频 " + file.getName());
                 android.graphics.drawable.GradientDrawable background =
@@ -3779,10 +3782,13 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 preview.setBackground(background);
                 preview.setClipToOutline(true);
             }
-            ImageView cover = new ImageView(activity);
+            ImageView cover = video ? new ImageView(activity)
+                : new MaiImageThumbnailView(activity, initialSize[0], initialSize[1]);
             cover.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            preview.addView(cover, new FrameLayout.LayoutParams(
+            cover.setClipToOutline(false);
+            if (video) preview.addView(cover, new FrameLayout.LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+            else preview.addView(cover, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
             MessageImageLoader.load(file.getAbsolutePath(),
                 video ? dp(280) : dp(220), video ? dp(320) : dp(240), cover,
                 () -> {
@@ -3862,7 +3868,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                             file.getAbsolutePath(), false, mediaPlaylist(), cover);
                 });
             }
-            container.addView(preview, new LayoutParams(dp(initialSize[0]), dp(initialSize[1])));
+            container.addView(preview, new LayoutParams(
+                video ? dp(initialSize[0]) : LayoutParams.WRAP_CONTENT,
+                video ? dp(initialSize[1]) : LayoutParams.WRAP_CONTENT));
             preview.setOnLongClickListener(view -> {
                 showAgentMediaMenu(view, file, type); return true;
             });
