@@ -1613,7 +1613,7 @@ public final class AIAssistantController {
                 if (remote) {
                     int selection = remoteSelectionGeneration;
                     sessionSync.readRemoteHistory(clicked.remoteSession, ticket.before,
-                        AIAssistantMessagePages.OLDER_LIMIT, (page, failure) -> worker.post(() -> {
+                pages.olderLimit(), (page, failure) -> worker.post(() -> {
                         boolean accepted = false;
                         if (!closed && selection == remoteSelectionGeneration
                             && sameRemote(clicked.remoteSession, selectedRemote) && pages.matches(ticket)) {

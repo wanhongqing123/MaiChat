@@ -2188,6 +2188,9 @@ final class AIAssistantModel: ObservableObject {
     static var shared = AIAssistantModel()
     private static let recentMessageCount = 8
     private static let olderPageCount = 20
+    // Remote history is one response frame: eight complete 95 KiB messages plus
+    // bounded control state fit the shared 1 MiB receiver. Local SQLite keeps 20.
+    private static let remoteHistoryPageCount = 8
     private static let lifecycleSessionID = "session_lifecycle"
 
     static func resetForAccountSwitch() {
@@ -3305,10 +3308,10 @@ final class AIAssistantModel: ObservableObject {
             if ProcessInfo.processInfo.arguments.contains("--ai-remote-session-model-ui-test"),
                let handler = uiTestSupport.sessionModelHistoryHandler { data = try await handler(remote) }
             else { data = try await remoteTransport.history(ownerSlot: remote.deviceSlot,
-                sessionID: remote.sessionID, before: "", limit: Self.recentMessageCount) }
+                sessionID: remote.sessionID, before: "", limit: Self.remoteHistoryPageCount) }
             #else
             data = try await remoteTransport.history(ownerSlot: remote.deviceSlot,
-                sessionID: remote.sessionID, before: "", limit: Self.recentMessageCount)
+                sessionID: remote.sessionID, before: "", limit: Self.remoteHistoryPageCount)
             #endif
             guard generation == submissionGeneration, account == screenFrameCurrentAccountID,
                   selection == selectionGeneration, pendingRemoteSelection?.id == remote.id,
@@ -3606,9 +3609,9 @@ final class AIAssistantModel: ObservableObject {
                 permissions = page.permissions ?? []
                 questions = page.questions ?? []
                 quotedMessage = nil
-                visibleMessageLimit = Self.recentMessageCount
+                visibleMessageLimit = Self.remoteHistoryPageCount
                 historyLoaded = true
-                hasOlderMessages = received.count == Self.recentMessageCount
+                hasOlderMessages = received.count == Self.remoteHistoryPageCount
                 scrollRequest += 1
             }
         } else if selectedRemote?.id == source.id {
@@ -3618,7 +3621,7 @@ final class AIAssistantModel: ObservableObject {
             if let projections = page.questionMessages { questionMessages = projections.map(remoteDisplayMessage) }
             if older {
                 visibleMessageLimit += received.count
-                hasOlderMessages = received.count == Self.olderPageCount
+                hasOlderMessages = received.count == Self.remoteHistoryPageCount
             }
         }
         reconcileQuestionAnswerEchoes()
@@ -4648,9 +4651,10 @@ final class AIAssistantModel: ObservableObject {
     func loadOlderMessages() async {
         guard !loadingOlderMessages, hasOlderVisibleMessages,
               let oldest = messages.first?.id, !selected.isEmpty else { return }
+        let pageCount = selectedRemote == nil ? Self.olderPageCount : Self.remoteHistoryPageCount
         if messages.count > visibleMessageLimit {
             visibleMessageLimit = min(messages.count,
-                                      visibleMessageLimit + Self.olderPageCount)
+                                      visibleMessageLimit + pageCount)
             return
         }
         loadingOlderMessages = true
@@ -4659,7 +4663,7 @@ final class AIAssistantModel: ObservableObject {
         if let remote = selectedRemote {
             do {
                 let data = try await remoteTransport.history(ownerSlot: remote.deviceSlot,
-                    sessionID: remote.sessionID, before: oldest, limit: Self.olderPageCount)
+                    sessionID: remote.sessionID, before: oldest, limit: Self.remoteHistoryPageCount)
                 guard selectedRemote?.id == remote.id else { return }
                 applyRemoteHistory(data, source: remote, older: true)
             } catch {

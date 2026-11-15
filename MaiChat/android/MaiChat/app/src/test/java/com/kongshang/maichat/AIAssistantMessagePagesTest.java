@@ -7,6 +7,27 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public final class AIAssistantMessagePagesTest {
+    @Test public void remoteHistoryUsesEightRowPagesWithoutEndingAtAFullPage() throws Exception {
+        AIAssistantMessagePages remote = new AIAssistantMessagePages(true);
+        AIAssistantMessagePages.Ticket current = remote.select("remote:bounded-history");
+        remote.acceptSnapshot(current, snapshot(24, 8).put("initialHistoryPage", true));
+        AIAssistantMessagePages.Ticket first = remote.beginOlder();
+        assertEquals(8, remote.pageRequest("owned", first).getInt("limit"));
+        remote.acceptOlder(first, descending(16, 8));
+        assertTrue("A complete eight-row wire page must still permit older history", remote.hasOlder());
+        AIAssistantMessagePages.Ticket last = remote.beginOlder();
+        assertEquals("msg_0009", remote.pageRequest("owned", last).getString("before"));
+        remote.acceptOlder(last, descending(8, 4));
+        assertFalse(remote.hasOlder());
+        assertEquals(20, remote.messages().length());
+
+        AIAssistantMessagePages local = new AIAssistantMessagePages();
+        current = local.select("local:ordinary-history");
+        local.acceptSnapshot(current, snapshot(48, 8));
+        assertEquals("The native local page does not share the WS response limit", 20,
+            local.pageRequest("local", local.beginOlder()).getInt("limit"));
+    }
+
     @Test public void ordinaryLiveSnapshotKeepsAlreadyAcceptedCompletedBody() throws Exception {
         AIAssistantMessagePages pages = new AIAssistantMessagePages(true);
         AIAssistantMessagePages.Ticket current = pages.select("owned-source");

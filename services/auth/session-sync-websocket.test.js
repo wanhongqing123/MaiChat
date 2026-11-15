@@ -38,6 +38,65 @@ function connected(url, token) {
   return { socket, next, request, received };
 }
 
+test('large complete replies use bounded history pages without truncation or disconnect', async () => {
+  const db = openSessionSyncStore(':memory:');
+  const principals = new Map([
+    ['owner', { accountId:'large-history',slot:'windows',loginSessionId:'owner-login' }],
+    ['phone', { accountId:'large-history',slot:'android_phone',loginSessionId:'phone-login' }]
+  ]);
+  const authorize = async headers => principals.get(headers.authorization?.slice(7)) || null;
+  const server = createServer(createSessionSyncService({ db,authorize }),authorize);
+  server.listen(0,'127.0.0.1'); await once(server,'listening');
+  const url = `ws://127.0.0.1:${server.address().port}/v1/session-sync/ws`;
+  const owner = connected(url,'owner'), phone = connected(url,'phone');
+  let maximumFrame = 0;
+  phone.socket.on('message', bytes => { maximumFrame = Math.max(maximumFrame,bytes.length); });
+  try {
+    await Promise.all([once(owner.socket,'open'),once(phone.socket,'open')]);
+    assert.equal((await owner.request('owner-presence','presence',{
+      device_id:'owner-install',name:'Owner',sessions:[{ id:'ses_large',title:'Complete reports',updated_at:Date.now() }]
+    })).status,200);
+    assert.equal((await phone.request('phone-presence','presence',{
+      device_id:'phone-install',name:'Phone',sessions:[]
+    })).status,200);
+    const messages = Array.from({ length:20 },(_,index) => ({
+      id:`msg_${String(index).padStart(3,'0')}`,role:'assistant',created:index+1,completed:index+2,active:false,
+      parts:[{ id:`part_${index}`,kind:'text',text:`Complete report ${index}: `+'R'.repeat(70*1024) }]
+    }));
+    for (let index=0;index<messages.length;index++) {
+      const body = { session_id:'ses_large',messages:[messages[index]],busy:false,turnId:'' };
+      assert.ok(Buffer.byteLength(JSON.stringify(body)) < 95*1024);
+      assert.equal((await owner.request(`publish-${index}`,'publish',body)).status,200);
+    }
+    const tooLarge = await phone.request('large-page','history',{
+      owner_slot:'windows',session_id:'ses_large',before:'',limit:20
+    });
+    assert.equal(tooLarge.status,413,'An oversized response must be explicit, never silently shortened');
+    assert.equal(tooLarge.body.errorCode,'HISTORY_RESPONSE_TOO_LARGE');
+    assert.equal(phone.socket.readyState,WebSocket.OPEN);
+    const received = [], pageSizes = [];
+    let before = '';
+    for (let index=0;index<3;index++) {
+      const page = await phone.request(`bounded-page-${index}`,'history',{
+        owner_slot:'windows',session_id:'ses_large',before,limit:8
+      });
+      assert.equal(page.status,200);
+      pageSizes.push(page.body.messages.length);
+      received.push(...page.body.messages);
+      before = page.body.messages.at(-1).id;
+    }
+    assert.deepEqual(pageSizes,[8,8,4]);
+    assert.deepEqual(received,messages.toReversed());
+    assert.ok(maximumFrame <= 1024*1024,'Every response and inbox frame must fit installed shared sockets');
+  } finally {
+    const active = [owner,phone].filter(client => client.socket.readyState !== WebSocket.CLOSED);
+    const closed = active.map(client => once(client.socket,'close'));
+    active.forEach(client => client.socket.terminate()); await Promise.all(closed);
+    await new Promise(resolve => server.close(resolve));
+    await new Promise(resolve => setTimeout(resolve,20)); db.close();
+  }
+});
+
 test('busy owner receives every new input before acknowledging earlier commands', async () => {
   const db = openSessionSyncStore(':memory:');
   const principals = new Map([

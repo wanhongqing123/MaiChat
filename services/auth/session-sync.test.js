@@ -218,6 +218,36 @@ test('later owner snapshots retain durable Session attachment references', async
   } finally { setup.db.close(); }
 });
 
+test('completed owner replies within the desktop publish budget replace old running snapshots', async () => {
+  const setup = fixture();
+  try {
+    await setup.macPresence();
+    await setup.phonePresence();
+    const running = { id:'msg_large_reply',role:'assistant',created:1,completed:0,active:true,
+      parts:[{ id:'tool_part',kind:'tool',tool:'owned_tool',state:'running' }] };
+    assert.equal((await setup.call('mac-token','POST','/v1/session-sync/publish',
+      { session_id:'ses_mac_1',messages:[running],busy:true,turnId:running.id })).statusCode,200);
+    const completed = { ...running,completed:2,active:false,parts:[
+      { ...running.parts[0],state:'completed' },
+      { id:'final_part',kind:'text',text:'Owned completed report: \u5b8c\u6574\u56de\u590d\n' }
+    ] };
+    // Same byte size as the on-site report's conservative wire projection.
+    // The entire existing request remains below Desktop's 95 KiB body budget.
+    completed.parts[1].text += 'R'.repeat(53_402 - Buffer.byteLength(JSON.stringify(completed)));
+    assert.equal(Buffer.byteLength(JSON.stringify(completed)),53_402);
+    const publication = { session_id:'ses_mac_1',messages:[completed],busy:false,turnId:'' };
+    assert.ok(Buffer.byteLength(JSON.stringify(publication)) < 95 * 1024);
+    const result = await setup.call('mac-token','POST','/v1/session-sync/publish',publication);
+    assert.equal(result.statusCode,200,'A complete report inside the existing frame budget must not leave the old running copy');
+    const history = await setup.call('phone-token','GET',
+      '/v1/session-sync/history?owner_slot=mac&session_id=ses_mac_1&limit=8');
+    assert.equal(history.statusCode,200);
+    assert.equal(history.body.busy,false);
+    assert.equal(history.body.turnId,'');
+    assert.deepEqual(history.body.messages,[completed]);
+  } finally { setup.db.close(); }
+});
+
 test('retaining an attachment never silently drops an oversized owner snapshot', async () => {
   const setup = fixture();
   try {
@@ -229,7 +259,7 @@ test('retaining an attachment never silently drops an oversized owner snapshot',
     assert.equal((await setup.call('mac-token','POST','/v1/session-sync/publish',
       { session_id:'ses_mac_1',messages:[original] })).statusCode,200);
     const oversizedAfterMerge = { ...original,parts:[
-      { id:'text_part',kind:'text',text:'x'.repeat(48 * 1024 - 200) }] };
+      { id:'text_part',kind:'text',text:'x'.repeat(95 * 1024 - 200) }] };
     assert.equal((await setup.call('mac-token','POST','/v1/session-sync/publish',
       { session_id:'ses_mac_1',messages:[oversizedAfterMerge] })).statusCode,413);
     const history = await setup.call('mac-token','GET',
@@ -496,7 +526,7 @@ test('owner publishes one canonical room log for all device slots with shared pa
     })).statusCode, 404);
     assert.equal((await setup.call('mac-token', 'POST', '/v1/session-sync/publish', {
       session_id: 'ses_mac_1', messages: [{ id: 'msg_oversized', role: 'assistant',
-        parts: [{ kind: 'text', text: 'x'.repeat(49 * 1024) }] }]
+        parts: [{ kind: 'text', text: 'x'.repeat(96 * 1024) }] }]
     })).statusCode, 400);
     assert.equal((await setup.call('other-token', 'GET',
       '/v1/session-sync/history?owner_slot=mac&session_id=ses_mac_1')).statusCode, 404);

@@ -11,6 +11,7 @@ import org.json.JSONObject;
 final class AIAssistantMessagePages {
     static final int LATEST_LIMIT = 8;
     static final int OLDER_LIMIT = 20;
+    static final int REMOTE_OLDER_LIMIT = 8;
     static final class Ticket {
         final String owner, before;
         final long generation;
@@ -36,6 +37,12 @@ final class AIAssistantMessagePages {
 
     AIAssistantMessagePages() { this(false); }
     AIAssistantMessagePages(boolean isolateOldUpdates) { this.isolateOldUpdates = isolateOldUpdates; }
+    int olderLimit() {
+        // The remote lane receives complete WS responses, including temporary
+        // image receipts and control state. Eight 95 KiB messages fit the shared
+        // 1 MiB receive limit; local native history keeps its twenty-row page.
+        return isolateOldUpdates ? REMOTE_OLDER_LIMIT : OLDER_LIMIT;
+    }
     JSONArray displayUpdates() {
         JSONArray result = new JSONArray();
         for (JSONObject message : displayUpdates.values()) result.put(message);
@@ -99,7 +106,7 @@ final class AIAssistantMessagePages {
         if (!matches(ticket) || ticket.before.isEmpty())
             throw new IllegalStateException("The historical page belongs to a different view");
         return new JSONObject().put("op", "messages_page").put("session", session)
-            .put("before", ticket.before).put("limit", OLDER_LIMIT);
+            .put("before", ticket.before).put("limit", olderLimit());
     }
     boolean acceptSnapshot(Ticket ticket, JSONObject snapshot) throws JSONException {
         if (!matches(ticket)) return false;
@@ -224,7 +231,7 @@ final class AIAssistantMessagePages {
         merge(messages, true);
         String oldest = oldestPageId(messages);
         if (!oldest.isEmpty()) oldestPageCursor = oldest;
-        hasOlder = messages != null && messages.length() >= OLDER_LIMIT;
+        hasOlder = messages != null && messages.length() >= olderLimit();
         loading = false; pending = null;
         return true;
     }

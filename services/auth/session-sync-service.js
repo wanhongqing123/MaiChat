@@ -12,7 +12,10 @@ const MAX_PAYLOAD_BYTES = 64 * 1024;
 const MAX_SESSIONS = 200;
 const MAX_PENDING = 1000;
 const RECEIPT_LIFETIME_MS = 30 * 24 * 60 * 60_000;
-const MAX_ROOM_MESSAGE_BYTES = 48 * 1024;
+// Match the existing clients' complete publish-body budget. Image receipts and
+// tool metadata can push a finished report past 48 KiB without exceeding that
+// transport contract; rejecting it would leave the older running copy stored.
+const MAX_ROOM_MESSAGE_BYTES = 95 * 1024;
 const MAX_QUESTION_MESSAGES = 64;
 const MAX_QUESTION_MESSAGES_BYTES = 48 * 1024;
 const SESSION_LIFECYCLE_ID = 'session_lifecycle';

@@ -122,3 +122,13 @@ normal package will update that installation retaining data, without uninstall
 or clear. At this source checkpoint the phone still reports 280/2.2.38. Local
 Robolectric results are not a completed physical two-device deployment; package,
 installation and actual UI receipts must be recorded after those actions.
+
+## Actual installation and remaining on-site failure
+
+Normal 281/2.2.39 was subsequently installed retaining data and verified against
+the installed APK hash/process. The original remote session still lacked its
+owner's completed report, so this consumer repair was not declared the complete
+scene fix. Bounded live evidence then established a separate service size-budget
+gap. See [the message-budget investigation](2026-11-15-session-sync-message-budget.md)
+for actual artifacts, byte counts, server repair, frame-safe pagination and the
+remaining deployment/physical-acceptance boundary.

@@ -6,6 +6,9 @@ const { openSessionSyncStore } = require('./session-sync-store');
 const { createSessionSyncService } = require('./session-sync-service');
 
 const MAX_BODY_BYTES = 96 * 1024;
+// Installed shared sockets accept at most 1 MiB per complete WS message.
+// Live events are chunked, but a history response is one correlated message.
+const MAX_HISTORY_RESPONSE_BYTES = 1024 * 1024;
 
 function createServer(service, authorize = async () => null) {
   const server = http.createServer(async (request, response) => {
@@ -182,7 +185,16 @@ function attachWebSocket(server, service, authorize = async () => null) {
           ? `/v1/session-sync/history?${new URLSearchParams(frame.body)}`
           : `/v1/session-sync/${op === 'catalog' ? 'sessions' : op}`;
         const result = await call(method, path, frame.body);
-        send(socket, { type: 'response', id, status: result.statusCode, body: result.body });
+        let response = { type:'response',id,status:result.statusCode,body:result.body };
+        if (op === 'history' && Buffer.byteLength(JSON.stringify(response)) > MAX_HISTORY_RESPONSE_BYTES) {
+          // Preserve the request and the socket. Shortening the successful page
+          // would make count-based clients falsely mark history as exhausted.
+          response = { type:'response',id,status:413,body:{
+            error:'History response is too large; request fewer messages.',
+            errorCode:'HISTORY_RESPONSE_TOO_LARGE'
+          } };
+        }
+        send(socket,response);
         if (op === 'presence' && result.statusCode === 200) {
           announced = true;
           await pushInbox();

@@ -301,6 +301,7 @@ private slots:
     void remoteLateInputReceiptDoesNotReplaceNewerOwnerTurn();
     void remotePanelRoutesAttachmentLinkToVerifiedDownload();
     void remotePanelDoesNotRepeatPendingHistory();
+    void remotePanelKeepsCompleteHistoryAcrossEightMessagePages();
     void remotePanelReconcilesAfterReconnect();
     void remotePanelKeepsOwnPromptWhenRoomBroadcastsCanonicalMessage();
     void remotePanelPushCanArriveBeforeInitialPage();
@@ -3718,7 +3719,7 @@ void DesktopSessionSyncHostTest::remotePanelDoesNotRepeatPendingHistory() {
     panel.setHistoryHandler(
         [&](const QJsonObject&, const QString&, int limit, RemoteAgentPanel::Completion completion) {
             ++requests;
-            QCOMPARE(limit, 10);
+            QCOMPARE(limit, 8);
             completion({});
         });
     panel.show();
@@ -3726,6 +3727,60 @@ void DesktopSessionSyncHostTest::remotePanelDoesNotRepeatPendingHistory() {
     QCOMPARE(requests, 1);
     QTest::qWait(5500);
     QCOMPARE(requests, 1);
+}
+
+void DesktopSessionSyncHostTest::remotePanelKeepsCompleteHistoryAcrossEightMessagePages() {
+    QTemporaryDir spool;
+    QVERIFY(spool.isValid());
+    RemoteAgentPanel panel(nullptr, spool.filePath(QStringLiteral("outbox.json")));
+    const QJsonObject remote{{QStringLiteral("id"), QStringLiteral("ses_owned_pages")},
+                             {QStringLiteral("device_slot"), QStringLiteral("windows")},
+                             {QStringLiteral("login_session_id"), QStringLiteral("owned_login")},
+                             {QStringLiteral("online"), true}};
+    QList<int> limits;
+    QStringList cursors;
+    panel.setHistoryHandler([&](const QJsonObject&, const QString& before, int limit,
+                                RemoteAgentPanel::Completion completion) {
+        limits.append(limit);
+        cursors.append(before);
+        QJsonArray page;
+        // Keep the ordinary keyset contract: every returned message is complete,
+        // and the last ID continues at the next older page without gaps.
+        for (int index = 17; index >= 1 && page.size() < limit; --index) {
+            const QString id = QStringLiteral("msg_%1").arg(index, 3, 10, QLatin1Char('0'));
+            if (!before.isEmpty() && id >= before) continue;
+            page.append(QJsonObject{{QStringLiteral("id"), id},
+                                     {QStringLiteral("role"), QStringLiteral("assistant")},
+                                     {QStringLiteral("completed"), index},
+                                     {QStringLiteral("parts"), QJsonArray{QJsonObject{
+                                         {QStringLiteral("id"), QStringLiteral("part_%1").arg(index)},
+                                         {QStringLiteral("kind"), QStringLiteral("text")},
+                                         {QStringLiteral("text"), QStringLiteral("Owned final report %1").arg(index)}}}}});
+        }
+        panel.receivePayload(remote, QStringLiteral("history_page"),
+                             {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), page}});
+        completion({});
+    });
+    panel.show();
+    panel.openSession(remote);
+    QCOMPARE(limits, QList<int>{8});
+    QPushButton* older = nullptr;
+    for (auto* button : panel.findChildren<QPushButton*>())
+        if (button->text() == QStringLiteral("查看更早消息")) older = button;
+    QVERIFY(older);
+    QVERIFY(older->isVisible());
+    QVERIFY(older->isEnabled());
+    older->click();
+    QCOMPARE(limits, (QList<int>{8, 8}));
+    QVERIFY(older->isVisible());
+    older->click();
+    QCOMPARE(limits, (QList<int>{8, 8, 8}));
+    QCOMPARE(cursors, (QStringList{QString(), QStringLiteral("msg_010"), QStringLiteral("msg_002")}));
+    QVERIFY(!older->isVisible());
+    auto* transcript = panel.findChild<MarkdownView*>();
+    QVERIFY(transcript);
+    for (int index = 1; index <= 17; ++index)
+        QVERIFY(transcript->contains(QStringLiteral("msg_%1").arg(index, 3, 10, QLatin1Char('0'))));
 }
 
 void DesktopSessionSyncHostTest::remotePanelReconcilesAfterReconnect() {
@@ -3759,12 +3814,12 @@ void DesktopSessionSyncHostTest::remotePanelReconcilesAfterReconnect() {
     });
     panel.show();
     panel.openSession(remote);
-    QCOMPARE(limits, QList<int>{10});
+    QCOMPARE(limits, QList<int>{8});
     QJsonObject offline = remote;
     offline.insert(QStringLiteral("online"), false);
     panel.updateSession(offline);
     panel.updateSession(remote);
-    QCOMPARE(limits, (QList<int>{10, 10}));
+    QCOMPARE(limits, (QList<int>{8, 8}));
     auto* transcript = panel.findChild<MarkdownView*>();
     QVERIFY(transcript != nullptr);
     QVERIFY(transcript->contains(QStringLiteral("msg_user")));
@@ -3796,7 +3851,7 @@ void DesktopSessionSyncHostTest::remotePanelKeepsOwnPromptWhenRoomBroadcastsCano
         });
     panel.show();
     panel.openSession(remote);
-    QCOMPARE(limits, QList<int>{10});
+    QCOMPARE(limits, QList<int>{8});
     auto* composer = panel.findChild<QTextEdit*>(QStringLiteral("remoteAgentComposer"));
     auto* send = panel.findChild<QPushButton*>(QStringLiteral("remoteAgentSendButton"));
     QVERIFY(composer && send);
@@ -3829,7 +3884,7 @@ void DesktopSessionSyncHostTest::remotePanelKeepsOwnPromptWhenRoomBroadcastsCano
                                                          {QStringLiteral("text"), QStringLiteral("收到")}}}}};
     panel.receivePayload(remote, QStringLiteral("event"),
                          {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{assistant, user}}});
-    QCOMPARE(limits, QList<int>{10});
+    QCOMPARE(limits, QList<int>{8});
     QCOMPARE(transcript->itemCount(), 2);
     QVERIFY(transcript->contains(QStringLiteral("msg_user")));
     QVERIFY(transcript->contains(QStringLiteral("msg_assistant")));
@@ -3851,7 +3906,7 @@ void DesktopSessionSyncHostTest::remotePanelPushCanArriveBeforeInitialPage() {
         });
     panel.show();
     panel.openSession(remote);
-    QCOMPARE(limits, QList<int>{10});
+    QCOMPARE(limits, QList<int>{8});
     const QJsonObject user{
         {QStringLiteral("id"), QStringLiteral("msg_user")},
         {QStringLiteral("role"), QStringLiteral("user")},
@@ -3871,7 +3926,7 @@ void DesktopSessionSyncHostTest::remotePanelPushCanArriveBeforeInitialPage() {
                                                          {QStringLiteral("text"), QStringLiteral("旧消息")}}}}};
     panel.receivePayload(remote, QStringLiteral("history_page"),
                          {{QStringLiteral("ok"), true}, {QStringLiteral("messages"), QJsonArray{older}}});
-    QCOMPARE(limits, QList<int>{10});
+    QCOMPARE(limits, QList<int>{8});
     QCOMPARE(transcript->itemCount(), 2);
     QVERIFY(transcript->contains(QStringLiteral("msg_older")));
     QVERIFY(transcript->contains(QStringLiteral("msg_user")));

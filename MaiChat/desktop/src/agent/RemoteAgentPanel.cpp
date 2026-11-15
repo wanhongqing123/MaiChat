@@ -55,6 +55,10 @@
 
 namespace {
 
+// Eight complete 95 KiB messages plus bounded control state fit the shared
+// 1 MiB response receiver. Requests and end-of-history detection must agree.
+constexpr int kRemoteHistoryPageSize = 8;
+
 struct ImageCancellation {
     std::atomic_bool canceled{false};
     MaiCloudDriveCancel* transfer = mai_cloud_drive_cancel_create();
@@ -1034,7 +1038,7 @@ RemoteAgentPanel::RemoteAgentPanel(QWidget* parent, const QString& outboxFile)
         updateControls();
     });
     connect(runtime_->older, &QPushButton::clicked, this, [this] {
-        if (!runtime_->oldest.isEmpty()) requestHistory(runtime_->oldest, 20);
+        if (!runtime_->oldest.isEmpty()) requestHistory(runtime_->oldest, kRemoteHistoryPageSize);
     });
     connect(runtime_->view, &MarkdownView::linkActivated, this, [this](const QString& href) {
         const QString retryPrefix = QStringLiteral("maichat-input-retry:");
@@ -1607,7 +1611,7 @@ void RemoteAgentPanel::openSession(const QJsonObject& remote) {
     }
     showStatus(remote.value(QStringLiteral("online")).toBool() ? QStringLiteral("正在读取所属设备的会话…")
                                                                : QStringLiteral("所属设备离线；输入保留为草稿"));
-    requestHistory({}, 10);
+    requestHistory({}, kRemoteHistoryPageSize);
     requestSessionModel();
 }
 
@@ -1650,7 +1654,7 @@ void RemoteAgentPanel::updateSession(const QJsonObject& remote) {
 }
 
 void RemoteAgentPanel::refreshHistory() {
-    requestHistory({}, 10);
+    requestHistory({}, kRemoteHistoryPageSize);
 }
 
 void RemoteAgentPanel::requestHistory(const QString& before, int limit) {
@@ -2239,7 +2243,7 @@ void RemoteAgentPanel::receivePayload(const QJsonObject& remote, const QString& 
         const bool initial = runtime_->oldest.isEmpty();
         if (initial || oldest < runtime_->oldest) {
             runtime_->oldest = oldest;
-            runtime_->older->setVisible(received.size() >= (initial ? 10 : 20));
+            runtime_->older->setVisible(received.size() >= kRemoteHistoryPageSize);
         }
         // A live point read can precede the first SQL page. Once its actual
         // cursor is known, keep unknown older owners in the same bounded bypass.
