@@ -2923,6 +2923,10 @@ bool AgentChatPanel::appendStoredMessage(const MaiMessage& message, const MaiSes
         } else if (std::get_if<MaiReasoningPart>(&part.body)) {
             // 历史思考正文不进入界面；仍在执行的会话统一显示短状态。
             continue;
+        } else if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
+            const bool shown = appendStoredImagePart(fromUtf8(message.id), partId, fromUtf8(image->path),
+                                                     fromUtf8(selectedSession.directory));
+            if (message.completed == 0 && shown) activeAssistantHasVisibleActivity = true;
         } else if (const auto* tool = std::get_if<MaiToolPart>(&part.body)) {
             if (message.completed == 0 &&
                 (tool->state == MaiToolState::Pending || tool->state == MaiToolState::Running))
@@ -3363,6 +3367,17 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
     {
         for (const MaiMessagePart& part : message.parts) {
             if (fromUtf8(part.id) != partId) continue;
+            if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
+                // Screen/tool observations are durable typed images, not tool JSON.
+                // Forwarding does not consume them; render the same part locally too.
+                if (message.role != MaiRole::Assistant || message.contextImportOrigin) return;
+                MaiSession session;
+                if (runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), session)) {
+                    appendStoredImagePart(messageId, partId, fromUtf8(image->path), fromUtf8(session.directory));
+                    scrollToBottom();
+                }
+                return;
+            }
             const auto* tool = std::get_if<MaiToolPart>(&part.body);
             if (tool == nullptr) return;
             if (appendQuestionPart(runtime_->sessionId, messageId, part)) {
@@ -3376,7 +3391,8 @@ void AgentChatPanel::refreshToolCard(const QString& messageId, const QString& pa
                 if (runtime_->controller->agent().getSession(toUtf8(runtime_->sessionId), session) &&
                     (tool->tool == "agent_send_file"
                          ? appendAgentFileCard(messageId, partId, fromUtf8(tool->output), fromUtf8(session.directory))
-                         : appendAgentMediaCard(messageId, partId, fromUtf8(tool->output), fromUtf8(session.directory)))) {
+                         : appendAgentMediaCard(messageId, partId, fromUtf8(tool->output),
+                                                fromUtf8(session.directory)))) {
                     ToolCard* existing = runtime_->toolCards.take(partId);
                     ToolGroupCard* group = runtime_->toolCardGroups.take(partId);
                     if (existing && group) group->removeCard(existing);
@@ -3568,6 +3584,49 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
     const QString path = fromUtf8(maiResolvePathWithinRoot(toUtf8(workspace), toUtf8(relative)));
     if (path.isEmpty() || !QFileInfo(path).isFile()) return false;
 
+    // Only the explicit completed-video receipt establishes publication eligibility.
+    // The shared renderer itself accepts ordinary resolved media without tool JSON.
+    std::function<void()> publishVideo;
+    if (type == QStringLiteral("video")) {
+        const QJsonObject completedCard{{QStringLiteral("tool"), QStringLiteral("agent_send_media")},
+                                        {QStringLiteral("state"), QStringLiteral("completed")},
+                                        {QStringLiteral("output"), artifact}};
+        const QByteArray cardBytes = QJsonDocument(completedCard).toJson(QJsonDocument::Compact);
+        MaiVideoCircleResult eligibility{};
+        mai_video_circle_inspect_card(cardBytes.constData(), &eligibility);
+        if (eligibility.status == MAI_VIDEO_CIRCLE_OK)
+            publishVideo = [this, cardBytes, path] {
+                emit videoCirclePublishRequested(QString::fromUtf8(cardBytes), path);
+            };
+        mai_video_circle_result_free(&eligibility);
+    }
+    return appendResolvedMediaCard(messageId, partId, path, type, artifact.value(QStringLiteral("caption")).toString(),
+                                   publishVideo);
+}
+
+bool AgentChatPanel::appendStoredImagePart(const QString& messageId, const QString& partId, const QString& stored,
+                                           const QString& workspace) {
+    const QString id = partId + QStringLiteral("-agent-media");
+    if (runtime_->view->contains(id)) return true;
+    // This path comes from an ordinary stored MaiImagePart. Never discover images
+    // by scanning tool arguments or historical import envelopes for file names.
+    const QFileInfo file(QFileInfo(stored).isAbsolute() ? stored : QDir(workspace).absoluteFilePath(stored));
+    if (!file.isFile() || !file.isReadable() || file.size() <= 0 || file.size() > 32ll * 1024 * 1024) {
+        auto* unavailable = new QLabel(QStringLiteral("图片暂不可用"));
+        unavailable->setObjectName(QStringLiteral("agentStoredImageUnavailable"));
+        runtime_->view->addWidget(id, unavailable);
+        recordMessageItem(messageId, id);
+        return true;
+    }
+    return appendResolvedMediaCard(messageId, partId, file.canonicalFilePath(), QStringLiteral("image"), {});
+}
+
+bool AgentChatPanel::appendResolvedMediaCard(const QString& messageId, const QString& partId, const QString& path,
+                                             const QString& type, const QString& caption,
+                                             const std::function<void()>& publishVideo) {
+    const QString id = partId + QStringLiteral("-agent-media");
+    if (runtime_->view->contains(id)) return true;
+
     auto* card = new QWidget;
     auto* layout = new QVBoxLayout(card);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -3585,11 +3644,13 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
         cover->setGeometry(QRect(QPoint(0, 0), previewSize));
         cover->setAlignment(Qt::AlignCenter);
         MessageImageLoader::instance().load(
-            path, previewSize * 3, cover, [cover, previewSize, video](const QPixmap& pixels) {
+            path, previewSize * 3, cover,
+            [cover, previewSize, video](const QPixmap& pixels) {
                 cover->setPixmap(pixels.scaled(previewSize,
                                                video ? Qt::KeepAspectRatioByExpanding : Qt::KeepAspectRatio,
                                                Qt::SmoothTransformation));
-            }, {}, video);
+            },
+            {}, video);
         if (type == QStringLiteral("image")) {
             auto* open = new QPushButton(preview);
             open->setObjectName(QStringLiteral("agentMediaImageOpen"));
@@ -3701,7 +3762,6 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
         audio->setSource(path);
         layout->addWidget(audioCard);
     }
-    const QString caption = artifact.value(QStringLiteral("caption")).toString();
     if (!caption.isEmpty()) {
         auto* label = new QLabel(caption, card);
         label->setWordWrap(true);
@@ -3720,15 +3780,7 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
         runtime_->cloudDriveSaveButtons.append(saveCloud);
         connect(saveCloud, &QPushButton::clicked, this, [this, path] { emit cloudDriveSaveRequested(path); });
         layout->addWidget(saveCloud, 0, Qt::AlignLeft);
-        const QJsonObject completedCard{{QStringLiteral("tool"), QStringLiteral("agent_send_media")},
-                                        {QStringLiteral("state"), QStringLiteral("completed")},
-                                        {QStringLiteral("output"), artifact}};
-        const QByteArray cardBytes = QJsonDocument(completedCard).toJson(QJsonDocument::Compact);
-        MaiVideoCircleResult eligibility{};
-        mai_video_circle_inspect_card(cardBytes.constData(), &eligibility);
-        const bool eligible = eligibility.status == MAI_VIDEO_CIRCLE_OK;
-        mai_video_circle_result_free(&eligibility);
-        if (eligible) {
+        if (publishVideo) {
             auto* publish = new QPushButton(QStringLiteral("发布到视频圈"), card);
             publish->setObjectName(QStringLiteral("agentMediaVideoCirclePublish"));
             publish->setAccessibleName(QStringLiteral("发布这个已完成的 AI 视频到视频圈"));
@@ -3739,8 +3791,7 @@ bool AgentChatPanel::appendAgentMediaCard(const QString& messageId, const QStrin
                                "QPushButton:hover{background:#dceefb;}"));
             publish->setVisible(runtime_->videoCircleAvailable);
             runtime_->videoCirclePublishButtons.append(publish);
-            connect(publish, &QPushButton::clicked, this,
-                    [this, cardBytes, path] { emit videoCirclePublishRequested(QString::fromUtf8(cardBytes), path); });
+            connect(publish, &QPushButton::clicked, this, [publishVideo] { publishVideo(); });
             layout->addWidget(publish, 0, Qt::AlignLeft);
         }
     }

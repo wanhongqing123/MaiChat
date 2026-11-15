@@ -207,8 +207,8 @@ signals:
     void reasoningDelta(const QString& sessionId, const QString& messageId, const QString& partId,
                         const QString& delta);
 
-    // 某个工具片段的状态变了（建卡 / 放行 / 跑完）。事件只带 id，工具名、参数、
-    // 输出用 agent().getMessage(sessionId, messageId) 读取所属消息，再按 partId 定位。
+    // 工具状态或原生媒体片段已落库。保留原信号名；接收方按实际 MaiMessagePart.body 分派，
+    // 不能把截图等 MaiImagePart 当成工具正文丢弃。事件只带 id，再点取所属消息与准确 part。
     void toolPartChanged(const QString& sessionId, const QString& messageId, const QString& partId);
 
     // 有一次工具调用在等用户点头。详情同样去查：agent().listPendingPermissions()。

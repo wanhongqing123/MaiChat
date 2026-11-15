@@ -1363,23 +1363,31 @@ void DesktopSessionImBridgeTest::explicitOwnedMediaUsesMachineDelivery() {
 
 void DesktopSessionImBridgeTest::visibleSessionImageIsDeliveredBeforeNextModelResponse_data() {
     QTest::addColumn<bool>("localInput");
-    QTest::newRow("friend-input") << false;
-    QTest::newRow("creation-input") << true;
+    QTest::addColumn<bool>("bound");
+    QTest::newRow("friend-input") << false << true;
+    QTest::newRow("creation-input") << true << true;
+    QTest::newRow("unbound-creation") << true << false;
 }
 
 void DesktopSessionImBridgeTest::visibleSessionImageIsDeliveredBeforeNextModelResponse() {
     QFETCH(bool, localInput);
+    QFETCH(bool, bound);
     Fixture f;
     const auto release = qScopeGuard([&] { f.model->toolRelease.release(); });
     QTRY_VERIFY(f.app.connectionReady());
     const QString path = f.workspace.filePath(QStringLiteral("visible-session-image.png"));
-    QImage image(24, 18, QImage::Format_RGB32);
+    QImage image(320, 180, QImage::Format_RGB32);
     image.fill(Qt::red);
     QVERIFY(image.save(path, "PNG"));
     QVERIFY(f.controller.setModel(f.session, QStringLiteral("glm-5.3-flash")));
     f.model->observationPath = path;
     f.model->blockAfterObservation = true;
-    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    if (bound) QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    AgentChatPanel panel(f.controller);
+    panel.resize(850, 620);
+    panel.openSession(f.session);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
     if (localInput)
         QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("show the owned image")));
     else
@@ -1387,8 +1395,12 @@ void DesktopSessionImBridgeTest::visibleSessionImageIsDeliveredBeforeNextModelRe
     QTRY_VERIFY_WITH_TIMEOUT(f.model->toolEntered.available() > 0, 3000);
     QTRY_COMPARE(f.model->calls.load(), 2);
     QVERIFY(f.controller.agent().isBusy(f.session.toStdString()));
-    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 1, 2000);
-    QCOMPARE(f.im->sent.first().kind, QStringLiteral("image"));
+    if (bound) {
+        QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 1, 2000);
+        QCOMPARE(f.im->sent.first().kind, QStringLiteral("image"));
+    } else {
+        QVERIFY(f.im->sent.isEmpty());
+    }
     QString visiblePath;
     for (const auto& message : f.controller.agent().listMessages(f.session.toStdString()))
         if (message.role == MaiRole::Assistant)
@@ -1396,22 +1408,56 @@ void DesktopSessionImBridgeTest::visibleSessionImageIsDeliveredBeforeNextModelRe
                 if (const auto* visible = std::get_if<MaiImagePart>(&part.body))
                     visiblePath = QString::fromStdString(visible->path);
     QVERIFY(!visiblePath.isEmpty());
-    QCOMPARE(QFileInfo(f.im->sent.first().path).canonicalFilePath(), QFileInfo(visiblePath).canonicalFilePath());
-    const QImage shown(f.im->sent.first().path);
+    if (bound)
+        QCOMPARE(QFileInfo(f.im->sent.first().path).canonicalFilePath(), QFileInfo(visiblePath).canonicalFilePath());
+    const QImage shown(visiblePath);
     QVERIFY(!shown.isNull());
     QVERIFY(shown.pixelColor(shown.width() / 2, shown.height() / 2).red() > 200);
+    // Core persistence plus successful IM delivery does not prove the Session
+    // rendered its own observation. Inspect actual owned panel pixels too.
+    const auto redPixels = [](AgentChatPanel& target) {
+        const QImage pixels = target.grab().toImage();
+        int red = 0;
+        for (int y = 0; y < pixels.height(); ++y)
+            for (int x = 0; x < pixels.width(); ++x) {
+                const QColor color = pixels.pixelColor(x, y);
+                if (color.red() > 220 && color.green() < 45 && color.blue() < 45) ++red;
+            }
+        return red;
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(redPixels(panel) > 3000, 2000);
+    QCOMPARE(panel.findChildren<QPushButton*>(QStringLiteral("agentMediaImageOpen")).size(), 1);
+    const QString other = f.controller.createSession(f.workspace.path());
+    panel.openSession(other);
+    QTRY_VERIFY(redPixels(panel) < 3000);
+    panel.openSession(f.session);
+    QTRY_VERIFY_WITH_TIMEOUT(redPixels(panel) > 3000, 2000);
+    QCOMPARE(panel.findChildren<QPushButton*>(QStringLiteral("agentMediaImageOpen")).size(), 1);
     f.model->toolRelease.release();
-    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 2, 3000);
-    QCOMPARE(f.im->sent.last().text, QStringLiteral("owned completed response"));
+    if (bound) {
+        QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 2, 3000);
+        QCOMPARE(f.im->sent.last().text, QStringLiteral("owned completed response"));
+    }
+    QTRY_VERIFY_WITH_TIMEOUT(!f.controller.agent().isBusy(f.session.toStdString()), 3000);
     const auto rows = f.app.chatState().messagesWith(QStringLiteral("friend"));
-    QCOMPARE(std::count_if(rows.cbegin(), rows.cend(), [](const RemoteIMMessage& row) {
-        return row.origin == RemoteIMMessageOrigin::Machine && row.hasImage;
-    }), 1);
+    QCOMPARE(std::count_if(rows.cbegin(), rows.cend(),
+                           [](const RemoteIMMessage& row) {
+                               return row.origin == RemoteIMMessageOrigin::Machine && row.hasImage;
+                           }),
+             bound ? 1 : 0);
     bool hasObservation = false;
     for (const auto& message : f.controller.agent().listMessages(f.session.toStdString()))
         if (message.role == MaiRole::Assistant)
             for (const auto& part : message.parts) hasObservation |= std::holds_alternative<MaiImagePart>(part.body);
     QVERIFY(hasObservation);
+    panel.hide();
+    AgentChatPanel restored(f.controller);
+    restored.resize(850, 620);
+    restored.openSession(f.session);
+    restored.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&restored));
+    QTRY_VERIFY_WITH_TIMEOUT(redPixels(restored) > 3000, 2000);
+    QCOMPARE(restored.findChildren<QPushButton*>(QStringLiteral("agentMediaImageOpen")).size(), 1);
 }
 
 void DesktopSessionImBridgeTest::suspendRejectsNewIngressBeforeDisconnectStarts() {

@@ -178,8 +178,16 @@ private:
                              const QString& workspace);
     bool appendAgentMediaCard(const QString& messageId, const QString& partId, const QString& output,
                               const QString& workspace);
-    void appendTextMediaCards(const QString& messageId, const QString& text,
-                              const QString& workspace);
+    // Live updates and history render the same persisted image part exactly once.
+    // Imported history remains passive; callers must exclude its reference-only projection.
+    bool appendStoredImagePart(const QString& messageId, const QString& partId, const QString& path,
+                               const QString& workspace);
+    // Ordinary typed parts and explicit delivery receipts share only the renderer,
+    // not a fabricated tool receipt or a second media transport.
+    bool appendResolvedMediaCard(const QString& messageId, const QString& partId, const QString& path,
+                                 const QString& type, const QString& caption,
+                                 const std::function<void()>& publishVideo = {});
+    void appendTextMediaCards(const QString& messageId, const QString& text, const QString& workspace);
     QStringList currentVideoPaths() const;
     void showApproval(const QString& permissionId);
 
