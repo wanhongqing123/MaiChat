@@ -108,3 +108,27 @@ tracked/untracked 源内容摘要，避免 dirty SDK 在恢复源码后冒充 cl
 超 2MiB 图片出站预览的全部验收。实际输入全部限自有窗口/私有浏览器；正常用户 App 和
 Chrome profile 保持不变，没有服务重启。源码提交、完整候选包、DLL/EXE 以及裸 PATH
 staging/ZIP smoke 回执在冻结后补记，运行中 App 的替换仍待此前已询问的用户确认。
+
+## 冻结候选与交付状态
+
+源码提交 `40d92ed15c9ac37fe1a4827f88b8e92a59d80027`（包含前一轮播放器修复），正常
+Windows 目标构建及运行依赖门通过。候选继续沿用 2.2.65，仅为私有修复验证包，未覆盖
+公共 v2.2.65 Release，也未替换当前用户进程。
+
+- ZIP `MaiChat-win64-v2.2.65-20261116-40d92ed1.zip`，242131535 bytes，SHA256
+  `33cd47edc380748f2c3b1f75ba8be85186a771e081643054b9e09cf288778b55`。
+- EXE 166899200 bytes，SHA256
+  `659a5504a393970a048b73b4dea68ba1c2d83a674e6fb0184859912e94e24938`。
+- staging 与实际 ZIP 解压目录 81 文件逐字节核等，EXE 与本次正常 build/bin 相同；
+  qwindows/Qt6Gui 与受控 SDK、最终原生测试实际加载文件摘要一致。
+- 两份目录均通过 3 binaries / 114 PE imports 门，裸 PATH / 隔离账号数据 `--smoke`
+  各 exit 0，实际新进程 PID 50704、58160。原用户进程 PID 56404 未停止或覆盖。
+
+候选生成时核验 Qt 两个 postimage 后，仅恢复本任务修改的两个受控源文件至锁定上游，
+没有修改 submodule commit 或清除其他工作。今后 bootstrap 会先依据 tracked overlay
+重新应用，再计算 source fingerprint；不靠恢复 clean 状态复用无法追溯的 dirty SDK。
+当前仓库只剩任务开始前原有三路径 WIP，摘要保持，未混入交付。
+
+完整证据和候选 receipt 位于 `.cache/windows-computer-chain-20261116/`。
+Android 2.2.43 / 285 的两项 UI 问题已实际更新并验证；Windows 更新和 Sync 服务 R2
+部署仍是各自独立、此前已询问但尚未收到明确答复的授权，不能由本轮测试指令推定同意。
