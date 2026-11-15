@@ -96,3 +96,35 @@ ordinary cases (media card 9, thumbnail 2, image row 6, summary 4, original draw
 24) in 30.967 seconds. The next normal phone version is 284/2.2.42; its final
 installed visual acceptance remains pending here. The server deployment remains
 separately unapproved.
+
+## Final installed Android acceptance
+
+The iOS-spacing correction was committed as
+`246d5d9e0a22c8b90a7733ee5a4f7f07b60e69e3`. The normal 284/2.2.42 Debug
+build completed with exit 0 in 28.827 seconds; signature/alignment, the 41 native
+ELF/build-ID matches and pinned model assets passed. The APK is 1,689,012,806
+bytes, SHA-256
+`efcaf10ca97d16b54a6d503e961d6b4062f1784f30c009749b8ae64a965b5f35`.
+Data-preserving `adb install -r` exited 0 in 65.582 seconds. The installed APK
+hash matched, version read back as 284/2.2.42 and MainActivity launched as PID
+15489. Original account and session access remained available.
+
+In that same existing remote session, actual loaded image cards measured 440 by
+275 pixels, retaining the corrected aspect ratio. Consecutive cards had bounds
+`[48,680]-[672,955]` and `[48,983]-[672,1258]`: the image-to-image gap was
+28 pixels. The following text began at y=1286, likewise 28 pixels after the
+image. Another image-to-text edge measured the same gap. On this device those
+28 pixels are the configured 14dp, matching the iOS 14pt logical interval.
+
+The actual screenshot was inspected. A fully visible loaded image was tapped,
+its complete fullscreen preview inspected, and Back returned to the same
+conversation/scroll position. The image-to-image gap remained 28 pixels after
+return. Evidence and the bounded numeric receipt are in
+`.cache/android-agent-image-spacing-20261115/ios-gap-scrolled*`,
+`ios-gap-preview*`, `ios-gap-return*` and `final-device-verification.json`.
+No model/tool request or attachment upload was performed for this acceptance.
+
+This closes the Android image-height and iOS-spacing UI issue for the installed
+normal build. It does not claim that the separate pending SessionSync service
+deployment has occurred or that the original missing-report server issue is
+closed.
