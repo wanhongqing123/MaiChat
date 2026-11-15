@@ -128,3 +128,41 @@ Auth, Media, feature gates and the Windows App remain running. Rollback removes
 only the verified task override and restores the old code entry, without restoring
 or editing a database. Deployment still requires its explicit operational go-ahead
 and a final same-session physical comparison. Local passes do not close the scene.
+
+## Verified client and deployment-package checkpoint
+
+The complete repair was committed and pushed as
+`2f92e555f9bce7e227b9262afc084f13af67a8ce`. Independent Mac Node 22.19.0
+verification then passed the same complete 221 tests in 10.654 seconds. An
+initial private test copy omitted an unchanged signing dependency; its module-load
+failures were retained separately, then the complete baseline copy passed. No
+production change was used to obtain that result.
+
+The connected phone was subsequently updated in place to **2.2.40 / 282** from
+that exact source. Normal Debug build completed with exit 0 in 33.103 seconds;
+package signature/alignment, 41 ELF/source build IDs and pinned models passed.
+The APK is 1,689,012,354 bytes, SHA-256
+`51a197dfc3c82bc132842eba3988bb54bd1410206613b215539554db5de8d80b`.
+`adb install -r` exited 0 in 64.013 seconds, installed APK SHA matched, version
+read back as 282/2.2.40, and MainActivity launched as PID 5572. No uninstall,
+data clear or additional permission grant was performed. This verifies the client
+update; it does not assert that the server's missing report has been repaired.
+
+Independent deployment preflight found that a proposed `92-...` override would
+precede the existing `99-prepare-image-generation-20261115-57b92599.conf`.
+That package was superseded before any remote write. The corrected task override
+is `99-z-message-budget-2f92e555.conf`, ordered after the existing 90 and 99
+overrides, both of which remain intact. The exact two changed JS files, unchanged
+store and ExecStart contents remain byte-identical to the reviewed candidate.
+
+The corrected six-file regular-only package is 15,417 bytes, SHA-256
+`4b3c0593a191b96e7032235e24e9606e2f5ec7581a5d0d2a09afca4b3f384eb1`.
+Its manifest requires the new override to remain lexically last and supersedes
+the earlier package. Independent package review passed without repeating
+unchanged tests. The payload contains no credentials, environment or database.
+
+At this checkpoint the user has been asked for the operational go-ahead for the
+brief online Sync restart. No approval has yet been received. No remote upload,
+directory creation, unit write or restart has occurred. Auth, Sync, Media and the
+original Windows App remain running. Final same-session acceptance is pending
+the server update and ordinary owner retry.
