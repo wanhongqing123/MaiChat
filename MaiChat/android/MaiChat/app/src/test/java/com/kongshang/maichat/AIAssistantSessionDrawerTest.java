@@ -235,10 +235,53 @@ public final class AIAssistantSessionDrawerTest {
         assertEquals("Repeated visible binds must share the same automatic load", 1, OwnedController.imageLoads);
         OwnedController.imageCompletion.accept(null, "图片下载失败，请重试");
         assertNotNull(text(row, "图片下载失败，请重试"));
-        View retry = named(row, "从所属设备重新加载"); assertNotNull(retry);
+        View retry = named(row, "会话图片"); assertNotNull(retry); assertTrue(retry.isClickable());
         retry.performClick();
         assertEquals(1, OwnedController.imagePublications);
-        assertNotNull(text(row, "正在从所属设备重新加载…"));
+        assertNotNull(text(row, "正在加载图片…"));
+    }
+
+    @Test public void imageRetryUsesTheCardWithoutAnOwnerDeviceReloadPrompt() throws Exception {
+        View row = remoteImageRow("ready", "plain-retry");
+        OwnedController.imageCompletion.accept(null, "图片下载失败，请重试");
+        assertNull("Do not expose a device reload button in the conversation", named(row, "从所属设备重新加载"));
+        View card = named(row, "会话图片"); assertNotNull(card);
+        assertTrue("Image retry remains available on the image placeholder", card.isClickable());
+        card.performClick();
+        assertEquals(1, OwnedController.imagePublications);
+        assertNotNull(text(row, "正在加载图片…"));
+        assertNull(text(row, "正在从所属设备重新加载…"));
+    }
+
+    @Test public void visibleQuestionAndItsPersistedUserAnswerHaveOnlyOneAnswerBubble() throws Exception {
+        String answer = "Use this text";
+        JSONObject owner = new JSONObject().put("id", "remote-one").put("device_slot", "windows")
+            .put("device_id", "pc").put("login_session_id", "login").put("online", true);
+        JSONObject question = new JSONObject().put("id", "question-part").put("kind", "tool")
+            .put("tool", "question").put("state", "completed").put("created", 20)
+            .put("input", new JSONObject().put("question", "Which text should I use?").toString()).put("output", answer);
+        JSONObject assistant = new JSONObject().put("id", "assistant-one").put("role", "assistant")
+            .put("sessionId", "remote-one").put("created", 10).put("completed", 25)
+            .put("parts", new JSONArray().put(question));
+        JSONObject user = new JSONObject().put("id", "user-one").put("role", "user").put("sessionId", "remote-one")
+            .put("created", 30).put("completed", 30).put("parts", new JSONArray().put(new JSONObject()
+                .put("id", "user-text").put("kind", "text").put("text", answer)));
+        JSONObject data = new JSONObject().put("sessions", new JSONArray().put(owner))
+            .put("messages", new JSONArray().put(assistant).put(user));
+        panel.onState(new AIAssistantController.State(data, owner, "remote-one", "", "deepseek-flash",
+            "on-request", "", "", "", 0, false, true));
+        layout();
+        assertEquals("The actual visible list must not repeat the answer", 1, visibleTextCount(list(panel), answer));
+        assertEquals("The canonical user message keeps its original parts", answer,
+            user.getJSONArray("parts").getJSONObject(0).getString("text"));
+    }
+
+    private static int visibleTextCount(View view, String value) {
+        if (view.getVisibility() != View.VISIBLE) return 0;
+        int count = view instanceof TextView && value.contentEquals(((TextView) view).getText()) ? 1 : 0;
+        if (view instanceof ViewGroup) for (int i = 0; i < ((ViewGroup) view).getChildCount(); i++)
+            count += visibleTextCount(((ViewGroup) view).getChildAt(i), value);
+        return count;
     }
 
     @Test public void completedRemoteImageReusesTheExistingImagePreviewCard() throws Exception {
@@ -259,7 +302,8 @@ public final class AIAssistantSessionDrawerTest {
         View row = remoteImageRow("ready", "image-broken");
         Shadows.shadowOf(Looper.getMainLooper()).idle();
         assertNotNull(text(row, "图片无法显示，请重试"));
-        assertNotNull(named(row, "从所属设备重新加载"));
+        assertTrue(named(row, "会话图片").isClickable());
+        assertNull(named(row, "从所属设备重新加载"));
     }
 
     @Test public void pendingAndExpiredRemoteImagesHaveVisibleStatusWithoutDownloadLoops() throws Exception {
@@ -271,7 +315,7 @@ public final class AIAssistantSessionDrawerTest {
     @Test public void legacyRemoteImageOffersAnExplicitSinglePartRequestWithoutAutomaticPublication() throws Exception {
         View row = remoteImageRow(null, "legacy-one");
         assertNotNull(text(row, "图片尚未同步到这台设备"));
-        View action = named(row, "从所属设备重新加载"); assertNotNull(action); assertTrue(action.isEnabled());
+        View action = named(row, "会话图片"); assertNotNull(action); assertTrue(action.isClickable());
         assertEquals(0, OwnedController.imageLoads); assertEquals(0, OwnedController.imagePublications);
         action.performClick();
         assertEquals(1, OwnedController.imagePublications);
@@ -283,26 +327,27 @@ public final class AIAssistantSessionDrawerTest {
 
     @Test public void publicationInFlightDisablesDuplicateRequestsAndFailureRequiresAnotherClick() throws Exception {
         View row = remoteImageRow("failed", "failed-one");
-        View action = named(row, "从所属设备重新加载"); assertNotNull(action);
+        View action = named(row, "会话图片"); assertNotNull(action);
         action.performClick(); action.performClick();
         assertEquals(1, OwnedController.imagePublications);
-        assertNotNull(text(row, "正在从所属设备重新加载…"));
-        assertFalse(named(row, "从所属设备重新加载").isEnabled());
+        assertNotNull(text(row, "正在加载图片…"));
+        assertFalse(named(row, "会话图片").isClickable());
         OwnedController.publicationCompletion.accept(null, "原设备图片已移动，请检查后重试");
         assertNotNull(text(row, "原设备图片已移动，请检查后重试"));
-        View retry = named(row, "从所属设备重新加载"); assertTrue(retry.isEnabled());
+        View retry = named(row, "会话图片"); assertTrue(retry.isClickable());
         assertEquals(1, OwnedController.imagePublications);
         retry.performClick(); assertEquals(2, OwnedController.imagePublications);
     }
 
-    @Test public void offlineLegacyImageExplainsTheDeviceStateAndUpdatesWithoutAChangedMessage() throws Exception {
+    @Test public void offlineLegacyImageHasNoDevicePromptAndRetryFollowsConnectivity() throws Exception {
         View row = remoteImageRow(null, "offline-one", false, 3);
-        View action = named(row, "从所属设备重新加载"); assertNotNull(action);
-        assertFalse(action.isEnabled());
-        assertNotNull(text(row, "所属设备离线，联网后可重新加载"));
+        View action = named(row, "会话图片"); assertNotNull(action);
+        assertFalse(action.isClickable());
+        assertNull(named(row, "从所属设备重新加载"));
+        assertNull(text(row, "所属设备离线，联网后可重新加载"));
         action.performClick(); assertEquals(0, OwnedController.imagePublications);
         row = remoteImageRow(null, "offline-one", true, 3);
-        assertTrue(named(row, "从所属设备重新加载").isEnabled());
+        assertTrue(named(row, "会话图片").isClickable());
     }
 
     @Test public void completeExpiredCacheRemainsPreviewableWhenTheOwnerIsOffline() throws Exception {
@@ -334,15 +379,15 @@ public final class AIAssistantSessionDrawerTest {
     @Test public void theLegacyCardSurvivesNewReceiptPublicationWithoutReplacingItsContainer() throws Exception {
         View row = remoteImageRow(null, "stable-one");
         View card = named(row, "会话图片"); assertNotNull(card);
-        named(row, "从所属设备重新加载").performClick();
+        card.performClick();
         row = remoteImageRow("ready", "stable-one");
         assertSame(card, named(row, "会话图片"));
         assertEquals("The explicit publication already owns the following download", 0, OwnedController.imageLoads);
-        assertFalse(named(row, "从所属设备重新加载").isEnabled());
+        assertFalse(card.isClickable());
         OwnedController.publicationCompletion.accept(null, "重新发布失败，请重试");
         assertNotNull(text(row, "重新发布失败，请重试"));
-        assertTrue(named(row, "从所属设备重新加载").isEnabled());
-        named(row, "从所属设备重新加载").performClick();
+        assertTrue(card.isClickable());
+        card.performClick();
         java.io.File file = new java.io.File(activity.getCacheDir(), "republished-image.png");
         java.nio.file.Files.write(file.toPath(), new byte[]{1, 2, 3});
         OwnedController.cachedImage = file.getAbsolutePath();
@@ -350,11 +395,13 @@ public final class AIAssistantSessionDrawerTest {
         assertSame(card, named(row, "会话图片"));
         assertTrue(hasImage(card));
         assertNull(named(row, "从所属设备重新加载"));
+        assertFalse("Loaded images must drop the placeholder's old retry listener", card.isClickable());
+        card.performClick(); assertEquals(2, OwnedController.imagePublications);
     }
 
     @Test public void legacyUserImageKeepsTheSameSinglePartRecoveryEntry() throws Exception {
         View row = remoteImageRow(null, "legacy-user", true, 3, "user");
-        View action = named(row, "从所属设备重新加载"); assertNotNull(action);
+        View action = named(row, "会话图片"); assertNotNull(action);
         action.performClick();
         assertEquals(1, OwnedController.imagePublications);
         assertEquals("legacy-user", OwnedController.publicationPart.optString("id"));
@@ -363,7 +410,7 @@ public final class AIAssistantSessionDrawerTest {
 
     @Test public void stalePublicationFailureCannotReplaceTheCurrentImageOrChangeTheDrawerAndDraft() throws Exception {
         View row = remoteImageRow(null, "stale-one");
-        View action = named(row, "从所属设备重新加载"); assertNotNull(action); action.performClick();
+        View action = named(row, "会话图片"); assertNotNull(action); action.performClick();
         java.util.function.BiConsumer<java.io.File, String> old = OwnedController.publicationCompletion;
         row = remoteImageRow(null, "stale-one", true, 4);
         panel.composer.setText("继续保留的草稿");

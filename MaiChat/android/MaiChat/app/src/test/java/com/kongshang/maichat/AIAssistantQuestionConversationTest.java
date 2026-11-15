@@ -35,6 +35,89 @@ public final class AIAssistantQuestionConversationTest {
         assertEquals("after", visible.getJSONObject(2).getString("id"));
         assertEquals(visible.toString(), AIAssistantQuestionConversation.parts(new JSONArray().put(source).put(after)).toString());
     }
+
+    private JSONObject answeredQuestionRow(String answer) throws Exception {
+        return new JSONObject().put("id", "assistant-question").put("role", "assistant")
+            .put("sessionId", "session-one").put("created", 10)
+            .put("parts", new JSONArray().put(question("completed").put("created", 20).put("output", answer)));
+    }
+    private JSONObject userRow(String id, String answer, long created) throws Exception {
+        return new JSONObject().put("id", id).put("role", "user").put("sessionId", "session-one")
+            .put("created", created).put("parts", new JSONArray().put(new JSONObject()
+                .put("id", id + "-text").put("kind", "text").put("text", answer)));
+    }
+    private int answerBubbles(JSONArray rows, String answer) throws Exception {
+        int count = 0;
+        for (int i = 0; i < rows.length(); i++) {
+            JSONObject row = rows.getJSONObject(i);
+            JSONArray parts = AIAssistantQuestionConversation.parts(row.optJSONArray("parts"), row.optJSONArray("questionAnswerEchoes"));
+            for (int j = 0; j < parts.length(); j++) {
+                JSONObject part = parts.getJSONObject(j);
+                if (answer.equals(part.optString("text")) && (row.optString("role").equals("user")
+                    || part.optString("kind").equals("question_answer"))) count++;
+            }
+        }
+        return count;
+    }
+    @Test public void persistedUserAnswerReplacesOnlyTheAdjacentQuestionAnswerProjection() throws Exception {
+        JSONObject question = answeredQuestionRow("Use the app folder");
+        JSONArray rows = AIAssistantQuestionConversation.messages(new JSONArray().put(question)
+            .put(userRow("canonical-user", "Use the app folder", 30)), new JSONArray(), new JSONArray());
+        assertEquals("The answer must appear as one user bubble", 1, answerBubbles(rows, "Use the app folder"));
+        assertEquals("Both persisted messages remain in the transcript", 2, rows.length());
+        assertEquals("canonical-user", rows.getJSONObject(1).getString("id"));
+        assertEquals("Source tool history must remain intact", "Use the app folder",
+            question.getJSONArray("parts").getJSONObject(0).getString("output"));
+        assertEquals(2, AIAssistantQuestionConversation.parts(question.getJSONArray("parts")).length());
+    }
+    @Test public void repeatedActualUserMessagesRemainSeparateAfterAQuestion() throws Exception {
+        JSONArray rows = AIAssistantQuestionConversation.messages(new JSONArray().put(answeredQuestionRow("Yes"))
+            .put(userRow("user-one", "Yes", 30)).put(userRow("user-two", "Yes", 40)), new JSONArray(), new JSONArray());
+        assertEquals("Only the generated answer echo disappears; both real sends stay", 2, answerBubbles(rows, "Yes"));
+        assertEquals(3, rows.length());
+    }
+    @Test public void anotherSessionOrAnInterveningResponseKeepsTheOriginalAnswerEcho() throws Exception {
+        JSONObject another = userRow("another-session-user", "Yes", 30).put("sessionId", "session-two");
+        JSONArray rows = AIAssistantQuestionConversation.messages(new JSONArray().put(answeredQuestionRow("Yes"))
+            .put(another), new JSONArray(), new JSONArray());
+        assertEquals(2, answerBubbles(rows, "Yes"));
+        JSONObject response = new JSONObject().put("id", "next-response").put("role", "assistant")
+            .put("sessionId", "session-one").put("created", 25).put("parts", new JSONArray()
+                .put(new JSONObject().put("id", "response-text").put("kind", "text").put("text", "Continuing")));
+        rows = AIAssistantQuestionConversation.messages(new JSONArray().put(answeredQuestionRow("Yes"))
+            .put(response).put(userRow("later-repeat", "Yes", 30)), new JSONArray(), new JSONArray());
+        assertEquals(2, answerBubbles(rows, "Yes"));
+    }
+    @Test public void acknowledgedQuestionAnswerAlsoYieldsToItsAdjacentCanonicalUserMessage() throws Exception {
+        JSONObject pending = answeredQuestionRow("");
+        pending.getJSONArray("parts").getJSONObject(0).put("state", "running");
+        JSONArray echo = new JSONArray().put(new JSONObject().put("partId", "part-question").put("answer", "Yes"));
+        JSONArray before = AIAssistantQuestionConversation.messages(new JSONArray().put(pending), new JSONArray(), new JSONArray(), echo);
+        assertEquals(1, answerBubbles(before, "Yes"));
+        JSONArray after = AIAssistantQuestionConversation.messages(new JSONArray().put(pending)
+            .put(userRow("canonical-user", "Yes", 30)), new JSONArray(), new JSONArray(), echo);
+        assertEquals(1, answerBubbles(after, "Yes"));
+        assertFalse(pending.getJSONArray("parts").getJSONObject(0).optBoolean("answerShownInUserMessage"));
+    }
+    @Test public void questionAnswerDeduplicationPreservesTheLaterAssistantFragment() throws Exception {
+        JSONObject source = answeredQuestionRow("Yes");
+        source.getJSONArray("parts").put(new JSONObject().put("id", "later-text").put("created", 40)
+            .put("kind", "text").put("text", "After the answer"));
+        JSONArray rows = AIAssistantQuestionConversation.messages(new JSONArray().put(source)
+            .put(userRow("canonical-user", "Yes", 30)), new JSONArray(), new JSONArray());
+        assertEquals(3, rows.length());
+        assertEquals(1, answerBubbles(rows, "Yes"));
+        assertEquals("After the answer", AIAssistantQuestionConversation.copyText(rows.getJSONObject(2)));
+        assertTrue(rows.getJSONObject(0).optBoolean("fragmentContinues"));
+    }
+    @Test public void hiddenTrailingReasoningDoesNotBringBackTheQuestionAnswerBubble() throws Exception {
+        JSONObject question = answeredQuestionRow("Yes");
+        question.getJSONArray("parts").put(new JSONObject().put("id", "reasoning-metadata").put("kind", "reasoning")
+            .put("created", 21).put("text", ""));
+        JSONArray rows = AIAssistantQuestionConversation.messages(new JSONArray().put(question)
+            .put(userRow("canonical-user", "Yes", 30)), new JSONArray(), new JSONArray());
+        assertEquals(1, answerBubbles(rows, "Yes"));
+    }
     @Test public void canceledOrPartialQuestionNeverInventsAUserAnswer() throws Exception {
         JSONArray canceled = AIAssistantQuestionConversation.parts(new JSONArray().put(question("failed").put("output", "ignored")));
         assertEquals(1, canceled.length());

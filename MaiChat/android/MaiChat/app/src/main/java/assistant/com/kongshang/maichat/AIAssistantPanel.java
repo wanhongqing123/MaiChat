@@ -3695,7 +3695,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (failure == null) failure = remoteImageErrors.get(signature);
         if (remoteImagePublications.contains(publicationKey) || failure != null) {
             showRemoteImagePublicationState(card, owner, messageID, part, scope, signature,
-                failure == null ? "正在从所属设备重新加载…" : failure);
+                failure == null ? "正在加载图片…" : failure);
             return;
         }
         JSONObject metadata = part.optJSONObject("remoteImage");
@@ -3736,9 +3736,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
             String messageID, JSONObject part, String scope, String signature, String label) {
         boolean online = owner.remoteSession != null && owner.remoteSession.optBoolean("online");
         boolean pending = remoteImagePublications.contains(remoteImagePublicationKey(scope, messageID, part));
-        showRemoteImageState(card, signature, pending ? "正在从所属设备重新加载…" : label,
+        showRemoteImageState(card, signature, pending ? "正在加载图片…" : label,
             () -> requestRemoteImagePublication(card, owner, messageID, part, scope, signature),
-            online && !pending, online ? "" : "所属设备离线，联网后可重新加载");
+            online && !pending, "");
     }
     private void requestRemoteImagePublication(RemoteImageCard card, AIAssistantController.State owner,
             String messageID, JSONObject part, String scope, String signature) {
@@ -3748,13 +3748,13 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (!remoteImagePublications.add(key)) return;
         remoteImageErrors.remove(signature); remoteImageDecodeFailures.remove(signature);
         remoteImagePublicationErrors.remove(key);
-        showRemoteImagePublicationState(card, owner, messageID, part, scope, signature, "正在从所属设备重新加载…");
+        showRemoteImagePublicationState(card, owner, messageID, part, scope, signature, "正在加载图片…");
         refreshVisibleRemoteImages();
         // 只交原消息/片段身份；不从文件名、路径或URL推断请求，也不启动模型或扫描历史。
         controller.requestRemoteImagePublication(owner, messageID, part, (file, error) -> {
             remoteImagePublications.remove(key);
             if (!scope.equals(remoteImageScope(state))) return;
-            String failure = error == null || error.isEmpty() ? "从所属设备重新加载失败，请重试" : error;
+            String failure = error == null || error.isEmpty() ? "图片加载失败，请重试" : error;
             if (file == null) remoteImagePublicationErrors.put(key, failure);
             if (signature.equals(card.signature)) {
                 if (file != null) showRemoteImageFile(card, owner, messageID, part, scope, signature, file);
@@ -3778,17 +3778,18 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         card.addView(status, matchWrap());
         if (!disabledReason.isEmpty()) card.addView(text(disabledReason,
             MaiChatTypographyTokens.Role.METADATA, MaiChatTheme.SECONDARY), matchWrap());
-        if (retry != null) {
-            Button action = button("从所属设备重新加载", "从所属设备重新加载", v -> retry.run());
-            action.setEnabled(requestEnabled);
-            card.addView(action, matchWrap());
-        }
+        // Keep recovery on the image placeholder, without exposing the source
+        // device/publication mechanism as another conversation button.
+        card.setOnClickListener(retry != null && requestEnabled ? v -> retry.run() : null);
+        card.setClickable(retry != null && requestEnabled);
     }
     private void showRemoteImageFile(RemoteImageCard card, AIAssistantController.State owner,
                                      String messageID, JSONObject part, String scope, String signature, File file) {
         String rendered = signature + "|file|" + file.getAbsolutePath();
         if (rendered.equals(card.rendered)) return;
         card.rendered = rendered;
+        card.setOnClickListener(null);
+        card.setClickable(false);
         showAgentMediaCard(card, file, "image", "", null, () -> {
             if (!scope.equals(remoteImageScope(state)) || !signature.equals(card.signature)) return;
             String failure = "图片无法显示，请重试";

@@ -57,7 +57,51 @@ final class AIAssistantQuestionConversation {
         java.util.List<JSONObject> ordered = new java.util.ArrayList<>(rows.values());
         ordered.sort(java.util.Comparator.comparingLong((JSONObject row) -> row.optLong("created"))
             .thenComparing(row -> row.optString("id")));
-        return interleaveParts(ordered);
+        return reconcileQuestionAnswers(interleaveParts(ordered));
+    }
+
+    // A completed question can be followed by a real user message carrying the
+    // same answer. Suppress only that adjacent generated bubble, never either
+    // persisted message or later independent sends with equal text.
+    private static JSONArray reconcileQuestionAnswers(JSONArray rows) {
+        for (int i = 0; i + 1 < rows.length(); i++) {
+            JSONObject row = rows.optJSONObject(i), next = rows.optJSONObject(i + 1);
+            if (row == null || next == null || !row.optString("role").equals("assistant")
+                || !next.optString("role").equals("user")
+                || !row.optString("sessionId").equals(next.optString("sessionId"))) continue;
+            JSONArray userParts = next.optJSONArray("parts");
+            StringBuilder body = new StringBuilder();
+            boolean plain = userParts != null && userParts.length() > 0;
+            if (userParts != null) for (int j = 0; j < userParts.length(); j++) {
+                JSONObject part = userParts.optJSONObject(j);
+                if (part == null || !part.optString("kind").equals("text")) { plain = false; break; }
+                body.append(part.optString("text"));
+            }
+            if (!plain || body.length() == 0) continue;
+            JSONArray visible = parts(row.optJSONArray("parts"), row.optJSONArray("questionAnswerEchoes"));
+            JSONObject last = null;
+            for (int j = 0; j < visible.length(); j++) {
+                JSONObject part = visible.optJSONObject(j);
+                // Match the Panel: reasoning metadata has no visible message child.
+                if (part != null && !part.optString("kind").equals("reasoning")
+                    && !(part.optString("kind").equals("text") && part.optString("text").isEmpty()))
+                    last = part;
+            }
+            if (last == null || !last.optString("kind").equals("question_answer")
+                || !body.toString().equals(last.optString("text"))) continue;
+            String answerId = last.optString("id");
+            try {
+                JSONObject display = new JSONObject(row.toString());
+                JSONArray source = display.getJSONArray("parts");
+                for (int j = 0; j < source.length(); j++) {
+                    JSONObject part = source.optJSONObject(j);
+                    if (part != null && answerId.equals(part.optString("id") + ":answer"))
+                        part.put("answerShownInUserMessage", true);
+                }
+                rows.put(i, display);
+            } catch (Exception impossible) { throw new IllegalStateException("Invalid answer display projection", impossible); }
+        }
+        return rows;
     }
 
     static JSONArray messages(JSONArray roots, JSONArray children, JSONArray pending, JSONArray echoes, JSONArray updates) {
@@ -228,7 +272,8 @@ final class AIAssistantQuestionConversation {
                     JSONObject echo = echoes.optJSONObject(j);
                     if (echo != null && id.equals(echo.optString("partId"))) { answer = echo.optString("answer"); break; }
                 }
-                if (!answer.isEmpty()) visible.put(new JSONObject().put("id", id + ":answer").put("kind", "question_answer")
+                if (!answer.isEmpty() && !part.optBoolean("answerShownInUserMessage"))
+                    visible.put(new JSONObject().put("id", id + ":answer").put("kind", "question_answer")
                     .put("text", answer));
             } catch (Exception impossible) { throw new IllegalStateException("Invalid question projection", impossible); }
         }
