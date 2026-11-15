@@ -92,3 +92,24 @@ Mac 运行结果来自协作者，不声称为 Root 本机 Mac 验证，也不�
 原有 `.gitignore`、MobileAgentAdapter 两路径未提交工作保持原字节，未混入产品构建。
 本次没有服务端部署、账号修改或用户数据清理。此前 Sync 服务 R2 部署授权仍待用户明确答复，
 与播放器和坐标工作无关。Windows 正常用户 App 的替换需在候选完整可审阅后按仓库运行进程约定处理。
+
+## 冻结候选与替换授权
+
+产品源码提交：`267723bf24c08abfcb7f77b86ca097cee4c0de5c`。该提交后只补验收记录。
+Windows 完整候选仍沿用 2.2.65 版本号，仅为私有修复验证包，未覆盖或发布公共 v2.2.65。
+
+- ZIP：`MaiChat-win64-v2.2.65-20261115-267723bf.zip`，242130230 bytes，
+  SHA256 `409108b394f78c91ad7def337fb8dd785b68f74a64889b40783c68c033f264d3`。
+- 主程序：166898688 bytes，
+  SHA256 `0d6e83c18c9c619a72a0e569086794a2fdb7b2083d6cc6794128dc7845fd16c8`。
+- staging 与实际 ZIP 解压目录共 81 个文件逐 SHA 相同，主程序也与本次正常 build/bin 逐字节相同。
+- 两份目录分别通过 3 binaries / 114 PE imports 检查，并在裸 PATH、隔离 AppData 下正常
+  `--smoke` 退出 0；实际新进程 PID 28204、57728，无正常账号登录、模型任务或用户进程替换。
+- 冻结后新 Win 组 4/0、PNG 必须实际保存成功；原 7 selectors 为 9/0。
+- Mac 最终必要消费者正常 build 0 / 21.377s，native-order 与取消失败两槽为 4/0/0；
+  最终 22 次原生排序中 early HUD / bad animation 都为 0。source 两 blob 与 Root 逐 Git blob
+  相同，原 Mac tests 两 blob 保持。回执 `1794753106-35336279.json`。
+
+已在候选全部备妥后询问是否关闭、更新并重新打开当前 Windows App，说明会短暂中断会话，
+以及该确认来自用户提供的 AGENTS.md 运行进程约定。收到工具的 accepted 回执不代表用户同意。
+截至本条记录，用户现装 PID 56404 未停止或覆盖；真实用户账号上的更新后复验尚待此授权。
