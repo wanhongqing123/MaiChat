@@ -36,11 +36,21 @@ void MaiEventEmitter::emitMessage(MaiEventType type, const std::string& sessionI
     mBus.publish(event);
 }
 
+void MaiEventEmitter::emitTurnError(const std::string& sessionId, const std::string& turnId,
+                                    const std::string& detail) {
+    MaiEvent event = makeEvent(MaiEventType::SessionError, sessionId);
+    event.turnId = turnId;
+    event.detail = detail;
+    mBus.publish(event);
+}
+
 void MaiEventEmitter::emitPart(MaiEventType type, const std::string& sessionId,
-                               const std::string& messageId, const std::string& partId) {
+                               const std::string& messageId, const std::string& partId,
+                               const std::string& turnId) {
     MaiEvent event = makeEvent(type, sessionId);
     event.messageId = messageId;
     event.partId = partId;
+    event.turnId = turnId;
     mBus.publish(event);
 }
 

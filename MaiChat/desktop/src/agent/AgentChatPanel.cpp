@@ -79,6 +79,7 @@
 
 #include "MaiPathGuard.h"
 #include "MaiAgentSendFileTool.h"
+#include "MaiIMHistoryFormat.h"
 #include "MaiQuestionTranscript.h"
 #include "agent/AgentController.h"
 #include "agent/AgentToolGroupWidget.h"
@@ -162,6 +163,11 @@ QByteArray storedMessageFingerprint(const MaiMessage& message) {
     number(static_cast<int>(message.role));
     number(message.created);
     number(message.completed);
+    number(message.contextImportOrigin.has_value());
+    if (message.contextImportOrigin) {
+        text(message.contextImportOrigin->sourceKey);
+        text(message.contextImportOrigin->sourceId);
+    }
     number(static_cast<qint64>(message.parts.size()));
     for (const MaiMessagePart& part : message.parts) {
         text(part.id);
@@ -2843,6 +2849,47 @@ bool AgentChatPanel::appendStoredMessage(const MaiMessage& message, const MaiSes
         runtime_->unfinishedMessages.remove(messageId);
     bool activeAssistantHasVisibleActivity = false;
 
+    const auto historical = maiProjectIMHistoryForDisplay(message);
+    if (historical.state != MaiIMHistoryDisplayState::NotImported) {
+        // Imported model context stays byte-for-byte in Core. Only this passive
+        // presentation is decoded; it cannot create live/tool/media deliveries.
+        const auto label = [&](const QString& suffix, const QString& value) {
+            const QString id = messageId + suffix;
+            auto* text = new QLabel(value);
+            text->setObjectName(QStringLiteral("agentHistoryMetadata"));
+            text->setTextFormat(Qt::PlainText);
+            text->setWordWrap(true);
+            text->setStyleSheet(QStringLiteral("color:#667085;padding:2px 0;"));
+            runtime_->view->addWidget(id, text);
+            recordMessageItem(messageId, id);
+        };
+        if (historical.state == MaiIMHistoryDisplayState::Unavailable) {
+            runtime_->view->addItem(messageId, MarkdownView::Style::Document,
+                                    QStringLiteral("历史消息暂不可显示"));
+            recordMessageItem(messageId, messageId);
+        } else {
+            const auto& record = historical.record;
+            if (!record.text.empty()) {
+                runtime_->view->addItem(messageId, MarkdownView::Style::Document, fromUtf8(record.text));
+                recordMessageItem(messageId, messageId);
+            }
+            if (record.quote)
+                label(QStringLiteral("-history-quote"), QStringLiteral("引用摘要：%1").arg(fromUtf8(record.quote->digest)));
+            for (std::size_t index = 0; index < record.media.size(); ++index) {
+                const auto& media = record.media[index];
+                const QString name = media.name.empty() ? QStringLiteral("附件") : fromUtf8(media.name);
+                label(QStringLiteral("-history-media-%1").arg(index),
+                      QStringLiteral("历史附件 · %1（仅保留引用信息）").arg(name));
+            }
+            if (record.text.empty() && !record.quote && record.media.empty()) {
+                runtime_->view->addItem(messageId, MarkdownView::Style::Document, QStringLiteral("历史消息"));
+                recordMessageItem(messageId, messageId);
+            }
+        }
+        updateWelcomeVisibility();
+        return false;
+    }
+
     if (message.role == MaiRole::User) {
         appendStoredUserMessage(message, selectedSession);
         return false;
@@ -3166,6 +3213,9 @@ void AgentChatPanel::positionQuestionTranscript() {
 void AgentChatPanel::beginQuote(const QString& messageId) {
     MaiMessage message;
     if (!runtime_->controller->agent().getMessage(toUtf8(runtime_->sessionId), toUtf8(messageId), message)) return;
+    // History is passive source data, not a fresh user/assistant message. Do not
+    // let an old cached action insert its internal model envelope into composer.
+    if (maiProjectIMHistoryForDisplay(message).state != MaiIMHistoryDisplayState::NotImported) return;
     {
         QStringList media;
         for (const MaiMessagePart& part : message.parts) {

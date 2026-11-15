@@ -2211,25 +2211,8 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event) {
     // layout pass; neither action maintains a separate manual position.
     QTimer::singleShot(0, this, [this] { positionSessionBindingEntry(); });
   }
-  if (sessionImBridge_ && agentPanel_ &&
-      (watched == sessionBindingAgentSend_ || watched == sessionBindingAgentEditor_)) {
-    bool takesOver = watched == sessionBindingAgentSend_ &&
-        event->type() == QEvent::MouseButtonPress &&
-        static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton;
-    if (event->type() == QEvent::KeyPress) {
-      const auto* key = static_cast<QKeyEvent*>(event);
-      takesOver = (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter ||
-                   (watched == sessionBindingAgentSend_ && key->key() == Qt::Key_Space)) &&
-          !(key->modifiers() & Qt::ShiftModifier);
-    }
-    if (takesOver && agentController_ &&
-        (agentController_->agent().isBusy(agentPanel_->sessionId().toStdString()) ||
-         (sessionBindingAgentEditor_ && !sessionBindingAgentEditor_->toPlainText().trimmed().isEmpty()))) {
-      // Revoke forwarding before the ordinary local Send/Stop handler runs.
-      // This does not interrupt a model or consume the user's composer draft.
-      sessionImBridge_->localTakeover(agentPanel_->sessionId());
-    }
-  }
+  // Local Send/Return uses the ordinary controller. The persistent Session
+  // binding remains active; the bridge tracks typed Core commits and Stop.
   if (watched == videoDockSlot_ &&
       (event->type() == QEvent::Resize || event->type() == QEvent::Move))
     QTimer::singleShot(0, this, [this] { syncVideoDock(); });
@@ -7005,10 +6988,7 @@ bool MainWindow::openVideoWindow(const QString& path, const QStringList& playlis
     if (app_.chatState().ownerUserId() != owner) dialog->close();
   });
   ownerGuard->start();
-  dialog->show();
-  dialog->raise();
-  dialog->activateWindow();
-  if (dialog->isStarted()) return true;
+  if (dialog->prepareAndShow()) return true;
   dialog->close();
   return false;
 #else
@@ -7036,9 +7016,7 @@ bool MainWindow::openCloudVideo(const QString& name, std::shared_ptr<MaiCloudVod
     if (!maiChatAccountIdProvider_ || maiChatAccountIdProvider_() != owner) dialog->close();
   });
   guard->start();
-  dialog->show();
-  dialog->raise();
-  if (dialog->isStarted()) return true;
+  if (dialog->prepareAndShow()) return true;
   dialog->close();
   return false;
 #else
@@ -7148,166 +7126,70 @@ void MainWindow::openImagePreview(const QString &imagePath, QWidget *source,
   dialog->setAttribute(Qt::WA_DeleteOnClose);
   dialog->setWindowModality(Qt::ApplicationModal);
   connect(dialog, &QObject::destroyed, this, [this, dialog] {
-    if (imagePreviewDialog_ == dialog)
-      imagePreviewDialog_ = nullptr;
+      if (imagePreviewDialog_ == dialog) imagePreviewDialog_ = nullptr;
   });
-  auto sourceOpacity = std::make_shared<QPointer<QGraphicsOpacityEffect>>();
-  QPointer<QWidget> sourceForRestore(source);
-  connect(dialog, &QObject::destroyed, this, [sourceOpacity, sourceForRestore] {
-    if (sourceForRestore && *sourceOpacity &&
-        sourceForRestore->graphicsEffect() == sourceOpacity->data())
-      sourceForRestore->setGraphicsEffect(nullptr);
-  });
-  const auto transitionPixmap = [dialog] {
-    if (dialog->sourceImage().isNull()) return QPixmap();
-    const qreal dpr = dialog->devicePixelRatioF();
-    QPixmap pixels = dialog->sourceImage().scaled(
-        (QSizeF(dialog->size()) * dpr).toSize(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    pixels.setDevicePixelRatio(dpr);
-    return pixels;
-  };
-
-  if (source) {
-    QPointer<QWidget> sourceGuard(source);
-    auto closing = std::make_shared<bool>(false);
-    dialog->setCloseHandler([this, dialog, sourceGuard, sourceOpacity, closing, transitionPixmap] {
-      if (*closing) return true;
-      if (!sourceGuard || !sourceGuard->isVisible() || dialog->sourceImage().isNull())
-        return false;
-      QRect destination(mapFromGlobal(sourceGuard->mapToGlobal(QPoint(0, 0))),
-                        sourceGuard->size());
-      const auto *label = qobject_cast<QLabel *>(sourceGuard.data());
-      const QPixmap sourcePixmap = label ? label->pixmap() : QPixmap();
-      if (!sourcePixmap.isNull()) {
-        QSize fitted = (QSizeF(sourcePixmap.size()) /
-                        sourcePixmap.devicePixelRatioF()).toSize();
-        fitted.scale(sourceGuard->size(), Qt::KeepAspectRatio);
-        const QPoint inset((sourceGuard->width() - fitted.width()) / 2,
-                           (sourceGuard->height() - fitted.height()) / 2);
-        destination = QRect(mapFromGlobal(sourceGuard->mapToGlobal(inset)), fitted);
+  QPointer<QWidget> origin(source);
+  const auto sourceGeometry = [this, origin]() -> QRect {
+      if (!origin || !origin->isVisible() || origin->size().isEmpty()) return {};
+      QRect local(QPoint(), origin->size());
+      if (const auto* label = qobject_cast<QLabel*>(origin.data()); label && !label->pixmap().isNull()) {
+          QSize size = (QSizeF(label->pixmap().size()) / label->pixmap().devicePixelRatioF()).toSize();
+          size.scale(origin->size(), Qt::KeepAspectRatio);
+          local = QRect(QPoint((origin->width() - size.width()) / 2, (origin->height() - size.height()) / 2), size);
       }
-      if (!rect().intersects(destination)) return false;
-      *closing = true;
-      QSize visibleImage = (QSizeF(dialog->sourceImage().size()) /
-                            dialog->sourceImage().devicePixelRatioF()).toSize();
-      visibleImage.scale(dialog->size(), Qt::KeepAspectRatio);
-      const QPoint imageInset((dialog->width() - visibleImage.width()) / 2,
-                              (dialog->height() - visibleImage.height()) / 2);
-      const QRect start(mapFromGlobal(dialog->mapToGlobal(imageInset)), visibleImage);
-      // 只让图片本身缩回来源。原会话不参与遮罩/亮度过渡，避免整窗暗亮闪动。
-      // 透明层只拦截动画期间的底页点击，保留原来的模态操作边界。
-      auto *inputBlocker = new QWidget(this);
-      inputBlocker->setGeometry(rect());
-      inputBlocker->setStyleSheet(QStringLiteral("background:transparent;border:none;"));
-      inputBlocker->show();
-      inputBlocker->raise();
-      auto *snapshot = new QLabel(this);
-      snapshot->setObjectName(QStringLiteral("imagePreviewTransitionSnapshot"));
-      // 透明图与独立预览使用同一衬底，接手画面时不露出后面的会话内容。
-      snapshot->setStyleSheet(QStringLiteral("background:%1;border:none;")
-                                 .arg(dialog->canvasColor().name()));
-      snapshot->setPixmap(transitionPixmap());
-      snapshot->setScaledContents(true);
-      snapshot->setGeometry(start);
-      snapshot->show();
-      snapshot->raise();
-      // 先把接手的图片提交到主窗 backing store。show/raise 只排队绘制，
-      // 此时就移走原生预览会露出尚未绘制的会话背景一帧。
-      snapshot->repaint();
-      dialog->setWindowOpacity(0.0);
-      dialog->hide();
-      auto *shrink = new QPropertyAnimation(snapshot, "geometry", snapshot);
-      shrink->setDuration(220);
-      shrink->setEasingCurve(QEasingCurve::OutCubic);
-      shrink->setStartValue(start);
-      shrink->setEndValue(destination);
-      QPointer<ImagePreviewDialog> previewGuard(dialog);
-      connect(shrink, &QPropertyAnimation::finished, this,
-              [previewGuard, sourceOpacity, inputBlocker, snapshot] {
-                inputBlocker->deleteLater();
-                snapshot->deleteLater();
-                if (*sourceOpacity) (*sourceOpacity)->setOpacity(1.0);
-                if (previewGuard) {
-                  previewGuard->setCloseHandler({});
-                  previewGuard->accept();
-                }
-              });
-      QTimer::singleShot(50, this, [shrink] {
-        shrink->start(QAbstractAnimation::DeleteWhenStopped);
+      // 源图被滚动裁切时直接开/关，不让独立窗口越过原视口补画原本不可见的部分。
+      QRect visible(QPoint(), origin->size());
+      for (QWidget* ancestor = origin->parentWidget(); ancestor; ancestor = ancestor->parentWidget()) {
+          visible &= QRect(origin->mapFrom(ancestor, QPoint()), ancestor->size());
+          if (ancestor == this) break;
+      }
+      // 只测祖先视口的裁切，不把当前预览本身对缩略图的遮挡当成来源失效。
+      if (!visible.contains(local)) return {};
+      const QRect global(origin->mapToGlobal(local.topLeft()), local.size());
+      return QRect(mapToGlobal(QPoint()), size()).intersects(global) ? global : QRect{};
+  };
+  const QRect finalGeometry(mapToGlobal(rect().center() - QPoint(dialog->width() / 2, dialog->height() / 2)),
+                            dialog->size());
+  const QRect start = sourceGeometry();
+  auto opening = std::make_shared<QPointer<QPropertyAnimation>>();
+  auto closing = std::make_shared<bool>(false);
+  if (!start.isEmpty() && !dialog->sourceImage().isNull()) {
+      dialog->setCloseHandler([dialog, sourceGeometry, opening, closing] {
+          if (*closing) return true;
+          const QRect destination = sourceGeometry();
+          if (destination.isEmpty()) return false;
+          *closing = true;
+          if (*opening) (*opening)->stop();
+          // 始终移动当前同一窗口；原缩略图留在原位置，终点不会露出等待重绘的空洞。
+          auto* shrink = new QPropertyAnimation(dialog, "geometry", dialog);
+          shrink->setDuration(220);
+          shrink->setEasingCurve(QEasingCurve::OutCubic);
+          shrink->setStartValue(dialog->geometry());
+          shrink->setEndValue(destination);
+          const QPointer<ImagePreviewDialog> preview(dialog);
+          connect(shrink, &QPropertyAnimation::finished, dialog, [preview] {
+              if (!preview) return;
+              preview->setCloseHandler({});
+              preview->accept();
+          });
+          shrink->start(QAbstractAnimation::DeleteWhenStopped);
+          return true;
       });
-      return true;
-    });
-  }
-
-  // 独立无系统边框窗口；仅图片从来源过渡，主窗内容及亮度保持不变。
-  if (source && source->isVisible() && !source->size().isEmpty()) {
-    QPixmap thumbnail;
-    QRect start;
-    if (auto *label = qobject_cast<QLabel *>(source); label &&
-        !label->pixmap().isNull()) {
-      thumbnail = label->pixmap();
-      QSize imageSize = (QSizeF(thumbnail.size()) / thumbnail.devicePixelRatioF()).toSize();
-      imageSize.scale(source->size(), Qt::KeepAspectRatio);
-      const QPoint inset((source->width() - imageSize.width()) / 2,
-                         (source->height() - imageSize.height()) / 2);
-      start = QRect(mapFromGlobal(source->mapToGlobal(inset)), imageSize);
-    } else {
-      thumbnail = source->grab();
-      start = QRect(mapFromGlobal(source->mapToGlobal(QPoint(0, 0))), source->size());
-    }
-    if (!thumbnail.isNull()) {
-      const QRect target(rect().center().x() - dialog->width() / 2,
-                         rect().center().y() - dialog->height() / 2,
-                         dialog->width(), dialog->height());
-      dialog->move(mapToGlobal(target.topLeft()));
-      auto *inputBlocker = new QWidget(this);
-      inputBlocker->setGeometry(rect());
-      inputBlocker->setStyleSheet(QStringLiteral("background:transparent;border:none;"));
-      inputBlocker->show();
-      inputBlocker->raise();
-      auto *snapshot = new QLabel(this);
-      snapshot->setObjectName(QStringLiteral("imagePreviewTransitionSnapshot"));
-      // 放大和缩回都沿用预览画布，避免透明留白在转场末尾突然变色。
-      snapshot->setStyleSheet(QStringLiteral("background:%1;border:none;")
-                                 .arg(dialog->canvasColor().name()));
-      // 只预缩放一次到最终屏幕像素尺寸，避免每帧重采样超大原图，
-      // 也避免放大末尾从低清缩略图突然切换到原图。
-      const QPixmap originalFrame = transitionPixmap();
-      snapshot->setPixmap(originalFrame.isNull() ? thumbnail : originalFrame);
-      snapshot->setScaledContents(true);
-      snapshot->setGeometry(start);
-      snapshot->show();
-      snapshot->raise();
-      auto *effect = new QGraphicsOpacityEffect(source);
-      effect->setOpacity(0.0);
-      source->setGraphicsEffect(effect);
-      *sourceOpacity = effect;
-      auto *expand = new QPropertyAnimation(snapshot, "geometry", snapshot);
+      // 真实预览从第一帧起就是这一个窗口；不在动画末尾切换 native window 或定时删快照。
+      dialog->setGeometry(start);
+      dialog->show();
+      dialog->raise();
+      dialog->activateWindow();
+      auto* expand = new QPropertyAnimation(dialog, "geometry", dialog);
+      *opening = expand;
       expand->setDuration(220);
       expand->setEasingCurve(QEasingCurve::OutCubic);
       expand->setStartValue(start);
-      expand->setEndValue(target);
-      connect(expand, &QPropertyAnimation::finished, this,
-              [this, dialog, inputBlocker, snapshot] {
-                if (imagePreviewDialog_ == dialog) {
-                  // 最后一帧直接显示同一屏幕像素图，和独立预览的首次绘制对齐。
-                  snapshot->setScaledContents(false);
-                  snapshot->setAlignment(Qt::AlignCenter);
-                  snapshot->repaint();
-                  dialog->show();
-                  dialog->raise();
-                  dialog->activateWindow();
-                }
-                QTimer::singleShot(100, this, [inputBlocker, snapshot] {
-                  inputBlocker->deleteLater();
-                  snapshot->deleteLater();
-                });
-              });
+      expand->setEndValue(finalGeometry);
       expand->start(QAbstractAnimation::DeleteWhenStopped);
       return;
-    }
   }
-  // 无可见源气泡时直接显示，避免对缓存失效或右键打开制造空过渡。
+  dialog->setGeometry(finalGeometry);
   dialog->show();
   dialog->raise();
   dialog->activateWindow();

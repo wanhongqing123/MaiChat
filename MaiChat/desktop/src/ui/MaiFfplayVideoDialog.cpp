@@ -449,7 +449,7 @@ MaiFfplayVideoDialog::MaiFfplayVideoDialog(const QString& path, QWidget* parent,
             updatePlayButton();
             return;
         }
-        if (macPlayback_ && macPlayback_->ready() && !initialVideoSizeQueued_.load()) {
+        if (macPlayback_ && !initialVideoSizeQueued_.load()) {
             const QSize videoSize = macPlayback_->videoSize();
             if (videoSize.isValid() && !initialVideoSizeQueued_.exchange(true))
                 setSize(this, videoSize.width(), videoSize.height());
@@ -668,6 +668,11 @@ void MaiFfplayVideoDialog::setBuffering(bool buffering) {
 }
 
 void MaiFfplayVideoDialog::showPlaybackError(const QString& message) {
+    if (initialShowPending_) {
+        // 错误也是准备的终态；不能因没有首帧而留下永不出现、无法关闭的隐藏窗口。
+        initialVideoSizeApplied_ = true;
+        finishPreparedShow();
+    }
     setBuffering(false);
     errorLabel_->setText(message);
     errorLabel_->show();
@@ -775,10 +780,16 @@ void MaiFfplayVideoDialog::toggleFullscreen() {
 }
 
 void MaiFfplayVideoDialog::applyFullscreen(bool enabled) {
+    if (initialShowPending_) {
+        if (enabled && !isFullScreen()) windowWasMaximized_ = isMaximized();
+        setWindowState(enabled ? Qt::WindowFullScreen : windowWasMaximized_ ? Qt::WindowMaximized : Qt::WindowNoState);
+        return;
+    }
 #if defined(Q_OS_MAC)
     if (closeAfterFullscreen_ && enabled) return;
     if (fullscreenObserver_) {
-        const bool previous = fullscreenRequestPending_ || nativeFullscreenTransition_ ? requestedFullscreen_ : isFullScreen();
+        const bool previous =
+            fullscreenRequestPending_ || nativeFullscreenTransition_ ? requestedFullscreen_ : isFullScreen();
         if (enabled && !previous)
             windowWasMaximized_ = hasPendingWindowedState_ ? pendingWindowedMaximized_ : isMaximized();
         if (enabled) {
@@ -807,16 +818,20 @@ void MaiFfplayVideoDialog::applyFullscreen(bool enabled) {
 }
 
 void MaiFfplayVideoDialog::toggleMaximized() {
+    if (initialShowPending_) {
+        setWindowState(isMaximized() ? Qt::WindowNoState : Qt::WindowMaximized);
+        return;
+    }
 #if defined(Q_OS_MAC)
     if (closeAfterFullscreen_) return;
     minimizeAfterFullscreen_ = false;
     if (fullscreenObserver_ && (isFullScreen() || fullscreenRequestPending_ || nativeFullscreenTransition_)) {
         // 全屏时 isMaximized() 为 false，不能据此排队“最大化”，否则 DidExit
         // 后会再次铺满。若 Esc 等已请求退出，则这次点击仍是窗口态的正常最大化操作。
-        const bool fullscreen = fullscreenRequestPending_ || nativeFullscreenTransition_
-                                    ? requestedFullscreen_ : isFullScreen();
-        pendingWindowedMaximized_ = hasPendingWindowedState_ ? !pendingWindowedMaximized_
-                                                           : (!fullscreen && !isMaximized());
+        const bool fullscreen =
+            fullscreenRequestPending_ || nativeFullscreenTransition_ ? requestedFullscreen_ : isFullScreen();
+        pendingWindowedMaximized_ =
+            hasPendingWindowedState_ ? !pendingWindowedMaximized_ : (!fullscreen && !isMaximized());
         hasPendingWindowedState_ = true;
         applyFullscreen(false);
         return;
@@ -826,6 +841,10 @@ void MaiFfplayVideoDialog::toggleMaximized() {
 }
 
 void MaiFfplayVideoDialog::minimizeWindow() {
+    if (initialShowPending_) {
+        setWindowState(Qt::WindowMinimized);
+        return;
+    }
 #if defined(Q_OS_MAC)
     if (closeAfterFullscreen_) return;
     if (fullscreenObserver_ && (isFullScreen() || nativeFullscreenTransition_ || fullscreenRequestPending_)) {
@@ -865,6 +884,15 @@ void MaiFfplayVideoDialog::applyMacFullscreenRequest() {
     }
     // Qt 的逻辑状态可能先改变；完成条件来自原生 DidEnter/DidExit 通知。
     nativeFullscreenTransition_ = true;
+    if (closeAfterFullscreen_ && !requestedFullscreen_) {
+        // 仅在真正发起退出时撤去像素；进入转场未完成时先改透明度会令 DidEnter 丢失。
+        // 在 AppKit 取得还原快照之前执行，不能等 showNormal 之后才 orderOut。
+        if (!closingOpacitySuppressed_) {
+            opacityBeforeClosing_ = windowOpacity();
+            closingOpacitySuppressed_ = true;
+        }
+        setWindowOpacity(0.0);
+    }
     movingFrame_ = false;
     resizingFrame_ = {};
     if (QWidget::mouseGrabber() == this) releaseMouse();
@@ -1040,20 +1068,33 @@ int MaiFfplayVideoDialog::readCloudInput(void* userData, uint64_t offset, uint8_
 
 void MaiFfplayVideoDialog::setTitle(void* userData, const char* title) {
     auto* dialog = static_cast<MaiFfplayVideoDialog*>(userData);
+    const uint64_t generation = dialog->playbackOpenGeneration_.load();
     Q_UNUSED(title);
     const QString value = QFileInfo(dialog->path_).fileName();
-    QMetaObject::invokeMethod(dialog, [dialog, value] { dialog->setWindowTitle(value); }, Qt::QueuedConnection);
+    QMetaObject::invokeMethod(
+        dialog,
+        [dialog, value, generation] {
+            if (generation == dialog->playbackOpenGeneration_ && !dialog->stopRequested_) dialog->setWindowTitle(value);
+        },
+        Qt::QueuedConnection);
 }
 
 void MaiFfplayVideoDialog::setSize(void* userData, int width, int height) {
     auto* dialog = static_cast<MaiFfplayVideoDialog*>(userData);
+    const uint64_t generation = dialog->playbackOpenGeneration_.load();
     QMetaObject::invokeMethod(
         dialog,
-        [dialog, width, height] {
-            if (width <= 0 || height <= 0 || dialog->initialVideoSizeApplied_) return;
-            dialog->initialVideoSizeApplied_ = true;
-            if (dialog->docked_ || dialog->isFullScreen() || dialog->isMaximized() || dialog->windowGeometryCustomized_)
+        [dialog, width, height, generation] {
+            if (generation != dialog->playbackOpenGeneration_ || dialog->stopRequested_ || width <= 0 || height <= 0 ||
+                dialog->initialVideoSizeApplied_)
                 return;
+            dialog->initialVideoSizeApplied_ = true;
+            const bool preparing = dialog->initialShowPending_;
+            if (dialog->docked_ || dialog->windowGeometryCustomized_ ||
+                (!preparing && (dialog->isFullScreen() || dialog->isMaximized()))) {
+                dialog->finishPreparedShow();
+                return;
+            }
 #if defined(Q_OS_MAC)
             if (dialog->nativeFullscreenTransition_ || dialog->fullscreenRequestPending_) return;
 #endif
@@ -1068,17 +1109,24 @@ void MaiFfplayVideoDialog::setSize(void* userData, int width, int height) {
             const double maximumScale = std::min(double(limit.width()) / width, double(limit.height()) / height);
             const double scale = std::min(std::max(1.0, minimumScale), maximumScale);
             const QSize size(qRound(width * scale), qRound(height * scale));
+            const auto requestedState = dialog->windowState();
+            // 隐藏期间排队的最大化/全屏意图保留；正常还原尺寸也先准备为源视频比例。
+            if (preparing && requestedState != Qt::WindowNoState) dialog->setWindowState(Qt::WindowNoState);
             dialog->resize(size.expandedTo(dialog->minimumSize()));
             dialog->move(available.center() - QPoint(dialog->width() / 2, dialog->height() / 2));
+            if (preparing && requestedState != Qt::WindowNoState) dialog->setWindowState(requestedState);
+            dialog->finishPreparedShow();
         },
         Qt::QueuedConnection);
 }
 
 void MaiFfplayVideoDialog::setPosition(void* userData, int x, int y) {
     auto* dialog = static_cast<MaiFfplayVideoDialog*>(userData);
+    const uint64_t generation = dialog->playbackOpenGeneration_.load();
     QMetaObject::invokeMethod(
         dialog,
-        [dialog, x, y] {
+        [dialog, x, y, generation] {
+            if (generation != dialog->playbackOpenGeneration_ || dialog->stopRequested_) return;
             if (dialog->docked_ || dialog->isFullScreen() || dialog->isMaximized() || dialog->initialPositionApplied_ ||
                 dialog->windowGeometryCustomized_)
                 return;
@@ -1095,12 +1143,18 @@ void MaiFfplayVideoDialog::setPosition(void* userData, int x, int y) {
 
 void MaiFfplayVideoDialog::setFullscreen(void* userData, int enabled) {
     auto* dialog = static_cast<MaiFfplayVideoDialog*>(userData);
+    const uint64_t generation = dialog->playbackOpenGeneration_.load();
     QMetaObject::invokeMethod(
-        dialog, [dialog, enabled] { dialog->applyFullscreen(enabled != 0); }, Qt::QueuedConnection);
+        dialog,
+        [dialog, enabled, generation] {
+            if (generation == dialog->playbackOpenGeneration_ && !dialog->stopRequested_)
+                dialog->applyFullscreen(enabled != 0);
+        },
+        Qt::QueuedConnection);
 }
 
 void MaiFfplayVideoDialog::showWindow(void* userData) {
-    // 宿主在 showEvent 中创建播放会话；解码线程的 SDL_ShowWindow 不能重新排列
+    // 显式准备入口或首次 show 启动同一播放会话；SDL_ShowWindow 不能重新排列
     // owner/HUD/Popup 的 Z 序，也不能把用户切走的播放器抢回其它窗口上方。
     Q_UNUSED(userData);
 }
@@ -1176,11 +1230,9 @@ bool MaiFfplayVideoDialog::startPlayback() {
     const int64_t startPositionUs = startPositionUs_;
     audioStartupSettings_ = (audioIntentRevision_ << 8) | (volumePercent_ * 2 + (audioMuted_ ? 1 : 0));
     audioStartupConsumedRevision_ = 0;
+    const uint64_t openGeneration = ++playbackOpenGeneration_;
 #if defined(Q_OS_MAC)
     macPlaybackRequested_ = false;
-    const uint64_t openGeneration = ++playbackOpenGeneration_;
-#else
-    const uint64_t openGeneration = 0;
 #endif
     playbackThread_ = std::thread([this, sourcePath, speed, startPositionUs, openGeneration] {
         char name[] = "ffplay";
@@ -1250,10 +1302,13 @@ bool MaiFfplayVideoDialog::startPlayback() {
         playbackFinished_ = true;
         QMetaObject::invokeMethod(
             this,
-            [this, result] {
-                if (result != 0) {
+            [this, result, openGeneration] {
+                if (openGeneration != playbackOpenGeneration_ || stopRequested_ || !started_) return;
+                if (result != 0)
                     showPlaybackError(QStringLiteral("无法播放该视频（FFplay 状态 %1）").arg(result));
-                }
+                else if (initialShowPending_)
+                    // 完成通知排在该次 worker 的尺寸通知后；不靠轮询首帧而错判极短素材。
+                    showPlaybackError(QStringLiteral("无法读取该视频的画面尺寸。"));
             },
             Qt::QueuedConnection);
     });
@@ -1261,6 +1316,8 @@ bool MaiFfplayVideoDialog::startPlayback() {
 }
 
 void MaiFfplayVideoDialog::stopPlayback(bool cancelCloudSource) {
+    initialShowPending_ = false;
+    ++playbackOpenGeneration_;
     setBuffering(false);
     stopRequested_ = true;
     syncAudioControls();
@@ -1271,7 +1328,6 @@ void MaiFfplayVideoDialog::stopPlayback(bool cancelCloudSource) {
     pauseAfterFirstFrame_ = false;
     firstFramePauseQueued_ = false;
 #if defined(Q_OS_MAC)
-    ++playbackOpenGeneration_;
     macPlayback_.reset();
     macPlaybackRequested_ = false;
 #endif
@@ -1509,8 +1565,32 @@ bool MaiFfplayVideoDialog::navigateVideo(int direction) {
     return true;
 }
 
+bool MaiFfplayVideoDialog::prepareAndShow() {
+    if (initialShowPending_) return started_;
+    if (initialPresentationDone_ || isVisible()) {
+        show();
+        raise();
+        activateWindow();
+        return started_;
+    }
+    initialShowPending_ = true;
+    if (startPlayback()) return true;
+    initialShowPending_ = false;
+    return false;
+}
+
+void MaiFfplayVideoDialog::finishPreparedShow() {
+    if (!initialShowPending_ || !started_ || stopRequested_) return;
+    initialShowPending_ = false;
+    initialPresentationDone_ = true;
+    show();
+    raise();
+    activateWindow();
+}
+
 void MaiFfplayVideoDialog::showEvent(QShowEvent* event) {
     QDialog::showEvent(event);
+    initialPresentationDone_ = true;
     updateControlLayout();
     revealControls();
     if (windowHandle()) windowHandle()->installEventFilter(this);
@@ -1525,6 +1605,7 @@ void MaiFfplayVideoDialog::showEvent(QShowEvent* event) {
 }
 
 void MaiFfplayVideoDialog::closeEvent(QCloseEvent* event) {
+    initialShowPending_ = false;
 #if defined(Q_OS_MAC)
     if (fullscreenObserver_ && (nativeFullscreenTransition_ || fullscreenRequestPending_ || isFullScreen())) {
         // 进入全屏尚未结束时直接销毁 NSWindow，会使后续窗口也收不到 DidEnter。
@@ -1548,6 +1629,11 @@ void MaiFfplayVideoDialog::closeEvent(QCloseEvent* event) {
     QDialog::closeEvent(event);
 #if defined(Q_OS_MAC)
     closeAfterFullscreen_ = false;
+    // 已完成 DidExit 且 Qt 现已隐藏；保留普通 close/show 可复用同一组件的语义。
+    if (closingOpacitySuppressed_) {
+        setWindowOpacity(opacityBeforeClosing_);
+        closingOpacitySuppressed_ = false;
+    }
 #endif
 }
 

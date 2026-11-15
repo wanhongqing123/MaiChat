@@ -442,10 +442,46 @@ void discardedReservedFollowupDoesNotLatchTheTurn() {
     CHECK(f.router.sealOutput(reservation.token, receipt, f.scope, "workspace-one") == Status::Ok);
 }
 
+void cancelInputsPreservesBindingHistoryDedupeAndOtherSessions() {
+    Fixture f;
+    CHECK(f.router.bind(f.scope, "other-peer", "other-session", "other-workspace", true, true) == Status::Ok);
+    const auto binding = *f.router.bindingForPeer(f.scope, "peer");
+    CHECK(f.router.accept(f.message("active")).status == Status::Ok);
+    const auto old = f.reserve();
+    const auto receipt = f.receipt();
+    CHECK(f.router.bindReceipt(old.token, receipt, f.scope, "workspace-one") == Status::Ok);
+    CHECK(f.router.appendOutput(old.token, receipt, f.scope, "workspace-one", 1).status == Status::Ok);
+    CHECK(f.router.accept(f.message("pending")).status == Status::Ok);
+    CHECK(f.router.accept(f.message("other-pending", "other-peer")).status == Status::Ok);
+    CHECK(f.router.cancelSessionInputs(f.scope, "session", "wrong-workspace") == Status::StaleScope);
+    CHECK(f.router.isOutputCurrent(old.token, receipt, f.scope, "workspace-one"));
+    CHECK(f.router.cancelSessionInputs(f.scope, "session", "workspace-one") == Status::Ok);
+    CHECK(!f.router.isOutputCurrent(old.token, receipt, f.scope, "workspace-one"));
+    CHECK(f.router.acknowledgeDispatch(old.token, receipt, f.scope, "workspace-one", 0) == Status::InvalidToken);
+    const auto retained = *f.router.bindingForPeer(f.scope, "peer");
+    CHECK(retained.epoch == binding.epoch && retained.sessionId == binding.sessionId);
+    CHECK(f.router.accept(f.message("active")).status == Status::Duplicate);
+    CHECK(f.router.accept(f.message("pending")).status == Status::Duplicate);
+    CHECK(f.router.snapshot(f.scope).pending.size() == 1);
+    CHECK(f.router.snapshot(f.scope).pending.front().binding.sessionId == "other-session");
+    CHECK(f.router.beginHistory(f.scope, "peer", binding.epoch) == Status::Ok);
+    CHECK(f.router.accept(f.message("history-pending")).status == Status::Ok);
+    CHECK(f.router.cancelSessionInputs(f.scope, "session", "workspace-one") == Status::Ok);
+    CHECK(f.router.bindingForPeer(f.scope, "peer")->historyPending);
+    CHECK(f.router.completeHistory(f.scope, "peer", binding.epoch) == Status::Ok);
+    CHECK(f.router.accept(f.message("next-turn")).status == Status::Ok);
+    CHECK(f.reserve().input.source.messageId == "next-turn");
+    CHECK(f.router.accept(f.message("keep-queued-after-local-input")).status == Status::Ok);
+    CHECK(f.router.cancelSessionInputs(f.scope, "session", "workspace-one", false) == Status::Ok);
+    CHECK(f.router.snapshot(f.scope).pending.size() == 2); // This Session plus the untouched neighbour.
+    CHECK(f.reserve().input.source.messageId == "keep-queued-after-local-input");
+}
+
 }  // namespace
 
 int main() {
     const std::vector<std::pair<const char*, std::function<void()>>> tests{
+        {"cancel input without unbinding", cancelInputsPreservesBindingHistoryDedupeAndOtherSessions},
         {"scope boundaries", scopesAreExplicitAndStaleCallsCannotChangeNewAccount},
         {"binding eligibility and epochs", bindingEligibilityExclusivityAndEpochs},
         {"live Human C2C filter", onlyLiveHumanC2CContentCanEnter},

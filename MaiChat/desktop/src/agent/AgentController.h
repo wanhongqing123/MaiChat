@@ -116,6 +116,12 @@ public:
     // 历史显示使用 listMessagesPage 有界分页，避免在主线程扫描整个会话。
     // 核心事件回调本身只允许排队，查询在 Qt 主线程接收后进行。
     MaiAgent& agent();
+    // GUI-only read-only title projection. Legacy imported titles are checked
+    // in bounded pages on later GUI turns; manual and other titles do no history
+    // read. A completed projection emits sessionStructureChanged, never writes
+    // Core data and never keeps a background raw Agent pointer alive. Pending
+    // checks use the existing new-conversation placeholder.
+    QString sessionDisplayTitle(const MaiSession& session);
 
     // ---- 变更 ----都是立刻返回的。失败时返回空串 / false，错误文本从
     // lastError() 取。
@@ -225,6 +231,7 @@ signals:
     void contextImported(const QString& sessionId);
 
 private:
+    void advanceSessionDisplayTitle(const QString& sessionId);
     bool submitPrompt(const QString& sessionId, const QString& text, const QStringList& imagePaths,
                       const QStringList& videoPaths, const QString& quotedMessageId, const QString& turnId,
                       const QString& requestId);

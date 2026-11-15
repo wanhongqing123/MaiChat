@@ -29,9 +29,16 @@ public:
                      const std::string& detail = {}, const std::string& field = {});
 
     void emitMessage(MaiEventType type, const std::string& sessionId, const std::string& messageId);
+    // 轮次失败必须携带最初的 turn ID，宿主不能把新轮次的失败归给仍在发送的旧回复。
+    // 不改变普通会话错误的缺省语义；未知归属的错误不得由宿主猜测轮次。
+    void emitTurnError(const std::string& sessionId, const std::string& turnId,
+                       const std::string& detail);
 
+    // Runner 在落库后传最初的 turn ID，后续 assistant 分段不改变该身份。
+    // 旧调用缺省为空，不可据此推测活动轮次；宿主仍须读取准确的 typed part，
+    // 不把工具参数、推理或未提交正文当成媒体/正文交付。同步发布不增加 I/O。
     void emitPart(MaiEventType type, const std::string& sessionId, const std::string& messageId,
-                  const std::string& partId);
+                  const std::string& partId, const std::string& turnId = {});
 
     // 只能在完整成功响应的正文落库后调用；不改变轮次/工具状态，不携带正文副本。
     void emitTextCommitted(const std::string& sessionId, const std::string& turnId,

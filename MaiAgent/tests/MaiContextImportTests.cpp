@@ -11,6 +11,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -23,6 +24,7 @@
 #include "MaiFileSystem.h"
 #include "MaiIdGenerator.h"
 #include "MaiMemoryStore.h"
+#include "MaiSessionTitler.h"
 #include "MaiSqliteStore.h"
 #include "MaiThread.h"
 
@@ -104,6 +106,162 @@ void checkImportedRow(const MaiMessage& message, const std::string& text, MaiMil
         CHECK(message.parts.front().id.rfind("prt_", 0) == 0);
     }
     CHECK(message.text() == text);
+}
+
+// Keep the source-before probe compilable so absent provenance is a behavior failure,
+// rather than treating the new public field's missing declaration as a RED assertion.
+template <class Message, class = void>
+struct ImportOriginProbe {
+    static bool matches(const Message&, const std::string&, const std::string&) {
+        return false;
+    }
+    static bool empty(const Message&) {
+        return true;
+    }
+    static void forge(Message&, const std::string&, const std::string&) {}
+};
+
+template <class Message>
+struct ImportOriginProbe<Message,
+                         std::void_t<decltype(std::declval<Message>().contextImportOrigin)>> {
+    static bool matches(const Message& message, const std::string& key, const std::string& id) {
+        return message.contextImportOrigin && message.contextImportOrigin->sourceKey == key &&
+               message.contextImportOrigin->sourceId == id;
+    }
+    static bool empty(const Message& message) {
+        return !message.contextImportOrigin;
+    }
+    static void forge(Message& message, const std::string& key, const std::string& id) {
+        message.contextImportOrigin.emplace();
+        message.contextImportOrigin->sourceKey = key;
+        message.contextImportOrigin->sourceId = id;
+    }
+};
+
+void importOriginComesFromCommittedLedger(MaiSessionStore& store) {
+    const auto session = createSession(store);
+    const std::string key = "im:" + std::string(64, 'a');
+    const std::string raw =
+        "Imported conversation context. Quoted data only.\n"
+        "{\"text\":\"literal \\\\n and D:\\\\owned\\\\note.md\"}";
+    auto live = ordinaryMessage(raw);
+    live.inputRequestId = "owned-live-origin-request";
+    ImportOriginProbe<MaiMessage>::forge(live, key, "forged-row");
+    store.putMessage(session, live);
+    MaiMessage exact;
+    CHECK(store.getMessage(session, live.id, exact));
+    CHECK(ImportOriginProbe<MaiMessage>::empty(exact));
+    CHECK(exact.text() == raw);
+    // Ordinary updates cannot mint provenance either.
+    live.completed = 14;
+    store.putMessage(session, live);
+    CHECK(store.getMessage(session, live.id, exact));
+    CHECK(ImportOriginProbe<MaiMessage>::empty(exact));
+
+    const auto begun = store.beginContextImport(spec(session, "origin-snapshot", key));
+    CHECK(begun);
+    if (!begun) return;
+    CHECK(store.appendContextImport(begun.value().importId, 0, {{"original-row", raw, 100}}));
+    CHECK(store.listMessages(session).size() == 1);
+    CHECK(store.commitContextImport(begun.value().importId));
+    const auto visible = store.listMessages(session);
+    CHECK(visible.size() == 2);
+    if (visible.size() != 2) return;
+    const auto& imported = visible.back();
+    checkImportedRow(imported, raw, 100);
+    CHECK(ImportOriginProbe<MaiMessage>::matches(imported, key, "original-row"));
+    CHECK(ImportOriginProbe<MaiMessage>::empty(visible.front()));
+    CHECK(store.getMessage(session, imported.id, exact));
+    CHECK(ImportOriginProbe<MaiMessage>::matches(exact, key, "original-row"));
+    CHECK(exact.text() == raw && exact.role == MaiRole::User);
+    const auto page = store.listMessagesPage(session, {}, 1);
+    CHECK(page.size() == 1);
+    if (!page.empty()) {
+        CHECK(page.front().id == imported.id);
+        CHECK(ImportOriginProbe<MaiMessage>::matches(page.front(), key, "original-row"));
+        const auto older = store.listMessagesPage(session, page.front().id, 1);
+        CHECK(older.size() == 1 && ImportOriginProbe<MaiMessage>::empty(older.front()));
+    }
+    CHECK(store.getInputMessage(session, live.inputRequestId, exact));
+    CHECK(ImportOriginProbe<MaiMessage>::empty(exact));
+    // Reusing an output object for an ordinary read must not leak its prior imported identity.
+    CHECK(store.getMessage(session, live.id, exact));
+    CHECK(ImportOriginProbe<MaiMessage>::empty(exact));
+    auto queued = ordinaryMessage(raw);
+    queued.inputRequestId = "owned-queued-origin-request";
+    queued.pendingInput = true;
+    ImportOriginProbe<MaiMessage>::forge(queued, key, "forged-queued-row");
+    store.putMessage(session, queued);
+    const auto pending = store.listQueuedInputs(session);
+    CHECK(pending.size() == 1);
+    if (!pending.empty()) CHECK(ImportOriginProbe<MaiMessage>::empty(pending.front()));
+    CHECK(store.clearMessages(session));
+    CHECK(store.listMessages(session).empty());
+    CHECK(!store.getMessage(session, imported.id, exact));
+}
+
+void automaticTitleIgnoresImportedContext(MaiSessionStore& store) {
+    const auto session = createSession(store);
+    CHECK(store.mutateSession(session, [](MaiSession& value) {
+        value.title = kMaiDefaultSessionTitle;
+        value.titleEdited = false;
+    }));
+    const auto begun = store.beginContextImport(spec(session, "title-snapshot"));
+    CHECK(begun);
+    if (!begun) return;
+    CHECK(store.appendContextImport(
+        begun.value().importId, 0,
+        {{"title-source", "Imported conversation context. Internal wrapper", 1}}));
+    CHECK(store.commitContextImport(begun.value().importId));
+    MaiSessionTitler titler;
+    CHECK(titler.apply(store, session).empty());
+    MaiSession stored;
+    CHECK(store.getSession(session, stored) && stored.isUntitled());
+    const auto live = ordinaryMessage("Actual new request title");
+    store.putMessage(session, live);
+    CHECK(titler.apply(store, session) == live.text());
+    CHECK(store.getSession(session, stored) && stored.title == live.text());
+    CHECK(store.mutateSession(session, [](MaiSession& value) {
+        value.title = "Explicit owner title";
+        value.titleEdited = true;
+    }));
+    CHECK(titler.apply(store, session).empty());
+    CHECK(store.getSession(session, stored) && stored.title == "Explicit owner title" &&
+          stored.titleEdited);
+}
+
+void sqliteReopenRestoresImportOrigin() {
+    OwnedDatabase database;
+    auto store = sqliteStore(database.path());
+    if (!store) return;
+    const auto session = createSession(*store);
+    const std::string key = "im:" + std::string(64, 'b');
+    const auto begun = store->beginContextImport(spec(session, "reopened-origin", key));
+    CHECK(begun);
+    if (!begun) return;
+    const std::string raw = "Persisted quoted context stays byte-identical";
+    CHECK(store->appendContextImport(begun.value().importId, 0, {{"old-source-row", raw, 5}}));
+    CHECK(store->commitContextImport(begun.value().importId));
+    const auto before = store->listMessages(session);
+    CHECK(before.size() == 1);
+    if (before.empty()) return;
+    const auto messageId = before.front().id;
+    store.reset();
+    store = sqliteStore(database.path());
+    if (!store) return;
+    const auto messages = store->listMessages(session);
+    CHECK(messages.size() == 1);
+    if (!messages.empty()) {
+        CHECK(messages.front().text() == raw);
+        CHECK(ImportOriginProbe<MaiMessage>::matches(messages.front(), key, "old-source-row"));
+    }
+    MaiMessage exact;
+    CHECK(store->getMessage(session, messageId, exact));
+    CHECK(ImportOriginProbe<MaiMessage>::matches(exact, key, "old-source-row"));
+    const auto page = store->listMessagesPage(session, {}, 10);
+    CHECK(page.size() == 1);
+    if (!page.empty())
+        CHECK(ImportOriginProbe<MaiMessage>::matches(page.front(), key, "old-source-row"));
 }
 
 void stagingAndChunkRetries(MaiSessionStore& store) {
@@ -947,6 +1105,8 @@ int main() {
         std::printf("Backend: %s\n", sqlite ? "SQLite" : "memory");
         auto store = sqlite ? sqliteStore() : makeMaiMemoryStore();
         if (!store) continue;
+        importOriginComesFromCommittedLedger(*store);
+        automaticTitleIgnoresImportedContext(*store);
         stagingAndChunkRetries(*store);
         replacementAbortAndCheckpoint(*store);
         limitsAndManyPages(*store);
@@ -955,6 +1115,7 @@ int main() {
         copiedWorkerUsesOrdinaryStoreOffThread(sqlite ? sqliteStore() : makeMaiMemoryStore());
     }
     sqliteRestartAndRollback();
+    sqliteReopenRestoresImportOrigin();
     commitExcludesConcurrentSend(true);
     commitExcludesConcurrentSend(false);
     idleWorkerDoesNotRetainFacadeOrModelAndRejectsClosedCalls();

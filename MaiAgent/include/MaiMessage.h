@@ -137,6 +137,14 @@ enum class MaiRole {
 
 const char* maiRoleToString(MaiRole role);
 
+// 由存储的已发布上下文导入账本恢复的只读来源事实。
+// 仅说明这条消息来自哪个来源/来源记录；不改变正文、角色，也不是执行或文件访问授权。
+// 普通 putMessage 的同名输入字段不建立此事实，宿主不得从正文形状自行补造。
+struct MaiContextImportOrigin {
+    std::string sourceKey;
+    std::string sourceId;
+};
+
 struct MaiMessage {
     std::string id;  // msg_...
     MaiRole role = MaiRole::User;
@@ -151,6 +159,10 @@ struct MaiMessage {
     // requestId 在会话内唯一；pendingInput=true 时仍向界面展示，但不能提前进入模型上下文。
     std::string inputRequestId;
     bool pendingInput = false;
+
+    // 仅标准存储的导入读取路径赋值；普通消息保持无值。追加在数据尾部，保留原聚合字段顺序。
+    // 模型上下文仍使用原 role/parts；宿主可据此选择单独的显示投影，不能把导入资料升为真实回复。
+    std::optional<MaiContextImportOrigin> contextImportOrigin;
 
     bool isInProgress() const;
 

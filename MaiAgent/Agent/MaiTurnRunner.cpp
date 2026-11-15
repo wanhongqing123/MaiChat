@@ -622,7 +622,7 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         // 等授权更是以分钟计，这个窗口期足够用户刷新一次。
         mDependencies.store->putMessage(mSessionId, mAssistant);
         mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId, mAssistant.id,
-                                        part.id);
+                                        part.id, mInitialAssistantId);
 
         MaiToolResult result;
         bool enteredExecution = false;
@@ -679,7 +679,8 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
                     mDependencies.store->putMessage(mSessionId, mAssistant);
                     if (needsApproval)
                         mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated,
-                                                        mSessionId, mAssistant.id, part.id);
+                                                        mSessionId, mAssistant.id, part.id,
+                                                        mInitialAssistantId);
                     enteredExecution = true;
                     result = tool->execute(call.arguments, context);
                 }
@@ -749,12 +750,13 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
         // 每执行完一个工具就落一次库：工具可能跑很久，中途崩了不该丢掉已完成的部分。
         mDependencies.store->putMessage(mSessionId, mAssistant);
         mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId, mAssistant.id,
-                                        part.id);
+                                        part.id, mInitialAssistantId);
     }
 
     // 一次模型响应可能同时请求多个工具。各 MaiToolPart 要相邻保存，方便上下文构造器
     // 还原同一批 tool_calls；图片观察放在文本工具结果之后，避免打乱调用顺序。
     if (!resultImages.empty()) {
+        const auto firstImage = mAssistant.parts.size();
         for (const MaiToolImage& image : resultImages) {
             MaiMessagePart imagePart;
             imagePart.id = MaiIdGenerator::newPartId();
@@ -763,6 +765,12 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
             mAssistant.parts.push_back(std::move(imagePart));
         }
         mDependencies.store->putMessage(mSessionId, mAssistant);
+        // 图片先持久化，再立即通知界面与绑定输出，不等待下一次模型响应或整轮工具结束。
+        // 宿主只按准确 ID 读取 typed part，不把任意工具 JSON 中的路径当作媒体。
+        for (auto index = firstImage; index < mAssistant.parts.size(); ++index)
+            mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId,
+                                            mAssistant.id, mAssistant.parts[index].id,
+                                            mInitialAssistantId);
     }
 }
 
@@ -885,7 +893,7 @@ void MaiTurnRunner::beginStreamedPart(const std::string& partId, MaiMessagePartB
     // 会把模型的草稿当答案显示出来。
     mDependencies.store->putMessage(mSessionId, mAssistant);
     mDependencies.emitter->emitPart(MaiEventType::MessagePartUpdated, mSessionId, mAssistant.id,
-                                    partId);
+                                    partId, mInitialAssistantId);
 }
 
 void MaiTurnRunner::commitStreamedParts() {
@@ -967,7 +975,6 @@ void MaiTurnRunner::finish(const std::atomic<bool>& cancel) {
     const bool canceled =
         cancel.load(std::memory_order_relaxed) || mError.code() == MaiErrorCode::Canceled;
     if (mError && !canceled) {
-        mDependencies.emitter->emitSession(MaiEventType::SessionError, mSessionId,
-                                           mError.message());
+        mDependencies.emitter->emitTurnError(mSessionId, mInitialAssistantId, mError.message());
     }
 }

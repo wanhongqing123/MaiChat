@@ -76,6 +76,9 @@ public:
             message.completed = std::max<std::int64_t>(1, message.created);
             message.parts.push_back(
                 {MaiIdGenerator::newPartId(), MaiTextPart{record.text}, message.created});
+            // 来源取自已验证的导入 spec/record，不从普通消息或其正文推测；暂存行仍不可见。
+            message.contextImportOrigin =
+                MaiContextImportOrigin{snapshot.spec.sourceKey, record.sourceId};
             snapshot.messages.emplace(message.id, std::move(message));
             snapshot.sourceIds.insert(record.sourceId);
         }
@@ -542,15 +545,18 @@ public:
 
     void putMessage(const std::string& sessionId, const MaiMessage& message) override {
         std::lock_guard<std::mutex> lock(mMutex);
+        // 公开数据结构可被调用方填充；普通写入必须丢弃该字段，不能铸造导入账本事实。
+        MaiMessage ordinary = message;
+        ordinary.contextImportOrigin.reset();
         auto& list = mMessages[sessionId];
         // 同 id 视为更新：流式期间同一条消息会被反复写回。
         auto it = std::find_if(list.begin(), list.end(), [&](const MaiMessage& existing) {
             return existing.id == message.id;
         });
         if (it != list.end()) {
-            *it = message;
+            *it = std::move(ordinary);
         } else {
-            list.push_back(message);
+            list.push_back(std::move(ordinary));
         }
     }
 

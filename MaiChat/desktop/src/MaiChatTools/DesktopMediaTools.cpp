@@ -149,8 +149,7 @@ public:
                 // 工具调用的备用宿主也使用播放器自绘标题栏，与 IM/云盘入口保持一致。
                 dialog->setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
                 dialog->setAttribute(Qt::WA_DeleteOnClose);
-                dialog->show();
-                opened = dialog->isStarted();
+                opened = dialog->prepareAndShow();
                 if (!opened) dialog->close();
             }
             if (opened) {

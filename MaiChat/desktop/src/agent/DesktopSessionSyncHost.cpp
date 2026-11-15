@@ -27,6 +27,7 @@
 #include "MaiPathGuard.h"
 #include "MaiCloudDriveClient.h"
 #include "MaiAgentSendMediaTool.h"
+#include "MaiIMHistoryFormat.h"
 #include "agent/AgentController.h"
 #include "agent/DesktopSessionAttachments.h"
 
@@ -122,16 +123,64 @@ QJsonObject serializePart(const MaiMessagePart& part) {
     return value;
 }
 
+QJsonObject historyDisplayJson(const MaiIMHistoryDisplay& display) {
+    QJsonObject value{{QStringLiteral("state"), display.state == MaiIMHistoryDisplayState::Available
+                                                     ? QStringLiteral("available") : QStringLiteral("unavailable")},
+                      {QStringLiteral("readOnly"), true}};
+    if (display.state != MaiIMHistoryDisplayState::Available) return value;
+    const auto& record = display.record;
+    const QString direction = record.direction == MaiIMHistoryDirection::Incoming ? QStringLiteral("incoming")
+                              : record.direction == MaiIMHistoryDirection::Outgoing ? QStringLiteral("outgoing")
+                                                                                  : QStringLiteral("unknown");
+    value.insert(QStringLiteral("direction"), direction);
+    value.insert(QStringLiteral("kind"), text(record.kind));
+    value.insert(QStringLiteral("captionAbove"), record.captionAbove);
+    if (record.quote)
+        value.insert(QStringLiteral("quote"), QJsonObject{{QStringLiteral("digest"), text(record.quote->digest)},
+                                                         {QStringLiteral("kind"), text(record.quote->kind)}});
+    QJsonArray media;
+    for (const auto& item : record.media) {
+        media.append(QJsonObject{{QStringLiteral("kind"), text(item.kind)},
+                                 {QStringLiteral("name"), text(item.name)},
+                                 {QStringLiteral("mimeType"), text(item.mimeType)},
+                                 {QStringLiteral("sizeBytes"), QString::number(item.sizeBytes)},
+                                 {QStringLiteral("durationMillis"), QString::number(item.durationMillis)},
+                                 {QStringLiteral("width"), static_cast<double>(item.width)},
+                                 {QStringLiteral("height"), static_cast<double>(item.height)},
+                                 {QStringLiteral("referenceMetadataPresent"), item.referenceMetadataPresent},
+                                 {QStringLiteral("metadataUnavailable"), item.metadataUnavailable}});
+    }
+    value.insert(QStringLiteral("media"), media);
+    return value;
+}
+
 QJsonObject serializeMessage(const MaiMessage& message, bool busy, const std::string& sessionId) {
     QJsonArray parts;
-    for (const auto& part : message.parts) parts.append(serializePart(part));
-    return {{QStringLiteral("id"), text(message.id)},
-            {QStringLiteral("sessionId"), text(sessionId)},
-            {QStringLiteral("role"), QString::fromLatin1(maiRoleToString(message.role))},
-            {QStringLiteral("created"), double(message.created)},
-            {QStringLiteral("completed"), double(message.completed)},
-            {QStringLiteral("active"), busy && message.isInProgress()},
-            {QStringLiteral("parts"), parts}};
+    const auto history = maiProjectIMHistoryForDisplay(message);
+    if (history.state == MaiIMHistoryDisplayState::NotImported) {
+        for (const auto& part : message.parts) parts.append(serializePart(part));
+    } else {
+        // These snapshots feed UI only, never MaiContextBuilder. Collapse even
+        // malformed imported parts so no old path/tool payload survives failure.
+        // A missing-part corruption uses the message ID as a display anchor only.
+        const QString partId = text(message.parts.empty() ? message.id : message.parts.front().id);
+        parts.append(QJsonObject{{QStringLiteral("id"), partId}, {QStringLiteral("kind"), QStringLiteral("text")},
+                                 {QStringLiteral("text"), history.state == MaiIMHistoryDisplayState::Available
+                                                              ? text(history.record.text)
+                                                              : QStringLiteral("Historical message unavailable")},
+                                 {QStringLiteral("created"), double(message.created)}});
+    }
+    QJsonObject value{{QStringLiteral("id"), text(message.id)},
+                      {QStringLiteral("sessionId"), text(sessionId)},
+                      {QStringLiteral("role"), QString::fromLatin1(maiRoleToString(message.role))},
+                      {QStringLiteral("created"), double(message.created)},
+                      {QStringLiteral("completed"), double(message.completed)},
+                      {QStringLiteral("active"), history.state == MaiIMHistoryDisplayState::NotImported &&
+                                                     busy && message.isInProgress()},
+                      {QStringLiteral("parts"), parts}};
+    if (history.state != MaiIMHistoryDisplayState::NotImported)
+        value.insert(QStringLiteral("historyDisplay"), historyDisplayJson(history));
+    return value;
 }
 
 }  // namespace
@@ -340,8 +389,9 @@ QJsonArray DesktopSessionSyncHost::rootSessions() const {
     QJsonArray result;
     for (const MaiSession& session : controller_.agent().listSessions()) {
         if (!session.isRoot()) continue;
+        const auto displayTitle = controller_.sessionDisplayTitle(session);
         result.append(QJsonObject{{QStringLiteral("id"), text(session.id)},
-                                  {QStringLiteral("title"), text(session.title)},
+                                  {QStringLiteral("title"), displayTitle},
                                   {QStringLiteral("updated_at"), double(session.updated)},
                                   {QStringLiteral("turnId"), text(controller_.agent().activeTurnId(session.id))},
                                   {QStringLiteral("busy"), controller_.agent().isBusy(session.id)}});

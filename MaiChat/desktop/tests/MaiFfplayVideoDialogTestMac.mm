@@ -1,5 +1,6 @@
 // 测试宿主走真实 macOS 前台激活，避免后台 QtTest 的逻辑窗口状态代替屏幕状态。
 #import <AppKit/AppKit.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/CALayer.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
@@ -10,6 +11,7 @@
 #include <QString>
 #include <QDebug>
 #include <QWidget>
+#include <QWindow>
 #include <vector>
 
 namespace {
@@ -116,11 +118,27 @@ QJsonObject ffplayTestVideoLayerGeometry(QWidget* widget) {
     value.insert("rootLayerHeight", CGRectGetHeight(root.frame));
     value.insert("rootAnimationCount", int(root.animationKeys.count));
     value.insert("windowLevel", double(view.window.level));
+    value.insert("windowAlpha", double(view.window.alphaValue));
+    value.insert("windowOnActiveSpace", bool([view.window isOnActiveSpace]));
+    value.insert("windowKey", bool(view.window.keyWindow));
+    value.insert("windowMain", bool(view.window.mainWindow));
+    value.insert("windowCollectionBehavior", double(view.window.collectionBehavior));
+    value.insert("windowOcclusionVisible", bool(view.window.occlusionState & NSWindowOcclusionStateVisible));
+    value.insert("windowClass", QString::fromUtf8(NSStringFromClass(view.window.class).UTF8String));
+    value.insert("windowFrameX", NSMinX(view.window.frame));
+    value.insert("windowFrameY", NSMinY(view.window.frame));
+    value.insert("windowFrameWidth", NSWidth(view.window.frame));
+    value.insert("windowFrameHeight", NSHeight(view.window.frame));
+
     value.insert("nativeResizable", bool(view.window.styleMask & NSWindowStyleMaskResizable));
     value.insert("windowVisible", bool(view.window.visible));
     value.insert("windowFrame", QString::fromUtf8(NSStringFromRect(view.window.frame).UTF8String));
     value.insert("windowNumber", double(view.window.windowNumber));
     value.insert("parentWindowNumber", double(view.window.parentWindow.windowNumber));
+    QWindow* transient = widget->window()->windowHandle()->transientParent();
+    NSWindow* transientWindow = transient ? reinterpret_cast<NSView*>(transient->winId()).window : nil;
+    value.insert("transientParentWindowNumber", double(transientWindow.windowNumber));
+
     // orderedWindows excludes panels. Query only this test process's visible
     // native windows so Tool HUDs participate in the same real z-order sample.
     const NSUInteger order = [[NSWindow windowNumbersWithOptions:0]
@@ -207,19 +225,21 @@ QString ffplayTestNativeState(QWidget* widget) {
 static NSMenu* sTrackedShareMenu = nil;
 
 bool clickFfplayTestNativeButton(QWidget* widget) {
-    NSView* root = reinterpret_cast<NSView*>(widget->window()->winId());
-    NSWindow* window = root.window;
-    if (!window) return false;
-    const QPoint center = widget->mapTo(widget->window(), widget->rect().center());
-    const NSPoint local = NSMakePoint(center.x(), root.flipped ? center.y() : NSHeight(root.bounds) - center.y());
-    const NSPoint point = [root convertPoint:local toView:nil];
-    for (NSEventType type : {NSEventTypeLeftMouseDown, NSEventTypeLeftMouseUp}) {
-        NSEvent* event = [NSEvent mouseEventWithType:type location:point modifierFlags:0
-            timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil
-            eventNumber:0 clickCount:1 pressure:type == NSEventTypeLeftMouseDown ? 1.0 : 0.0];
-        [NSApp postEvent:event atStart:NO];
+    @autoreleasepool {
+        NSView* root = reinterpret_cast<NSView*>(widget->window()->winId());
+        NSWindow* window = root.window;
+        if (!window) return false;
+        const QPoint center = widget->mapTo(widget->window(), widget->rect().center());
+        const NSPoint local = NSMakePoint(center.x(), root.flipped ? center.y() : NSHeight(root.bounds) - center.y());
+        const NSPoint point = [root convertPoint:local toView:nil];
+        for (NSEventType type : {NSEventTypeLeftMouseDown, NSEventTypeLeftMouseUp}) {
+            NSEvent* event = [NSEvent mouseEventWithType:type location:point modifierFlags:0
+                timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil
+                eventNumber:0 clickCount:1 pressure:type == NSEventTypeLeftMouseDown ? 1.0 : 0.0];
+            [NSApp postEvent:event atStart:NO];
+        }
+        return true;
     }
-    return true;
 }
 
 void* scheduleFfplayTestSaveCancel(bool* observed) {
@@ -282,4 +302,52 @@ bool cancelFfplayTestNativePanel() {
         characters:@"\x1b" charactersIgnoringModifiers:@"\x1b" isARepeat:NO keyCode:53];
     [NSApp postEvent:escape atStart:YES];
     return true;
+}
+
+// 只检查本测试进程的原生窗口身份；不枚举或操作用户 App。
+bool ffplayTestNativeWindowNumberExists(int number) {
+    // NSApp.windows 的 autoreleased 数组会持有窗口；探针不能延长被检查窗口的生命。
+    @autoreleasepool {
+        for (NSWindow* window in NSApp.windows)
+            if (window.windowNumber == number) {
+                static int logged = 0;
+                if (logged != number) {
+                    logged = number;
+                    NSMutableArray* children = [NSMutableArray array];
+                    for (NSWindow* child in window.childWindows) [children addObject:@(child.windowNumber)];
+                    qInfo() << "[closed-hud-native-identity]" << number << "visible" << bool(window.visible)
+                            << "parent" << window.parentWindow.windowNumber
+                            << "children" << QString::fromUtf8(children.description.UTF8String)
+                            << "controller" << bool(window.windowController) << "contentView" << bool(window.contentView)
+                            << "delegate" << QString::fromUtf8(NSStringFromClass(window.delegate.class).UTF8String)
+                            << "key" << bool(window.keyWindow) << "main" << bool(window.mainWindow);
+                }
+                break;
+            }
+        CFArrayRef raw = CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID);
+        bool present = false;
+        for (NSDictionary* item in (NSArray*)raw)
+            if ([item[(id)kCGWindowOwnerPID] intValue] == NSProcessInfo.processInfo.processIdentifier &&
+                [item[(id)kCGWindowNumber] intValue] == number)
+                present = true;
+        if (raw) CFRelease(raw);
+        return present;
+    }
+}
+
+// 初始 fixture 主窗就位后恢复普通主窗策略，后续切换不能把主窗拉进视频的全屏 Space。
+void restoreFfplayTestMainWindowSpacePolicy(QWidget* widget) {
+    NSWindow* window = reinterpret_cast<NSView*>(widget->winId()).window;
+    window.collectionBehavior &= ~NSWindowCollectionBehaviorMoveToActiveSpace;
+}
+
+// 普通 Qt SDK 会保留已关闭、contentView 为 nil 的 NSWindowController 缓存；
+// 只检查旧窗口是否仍持有可显示的 UI 或原生 owner 关联，不将该缓存当作残留播放器。
+bool ffplayTestNativeWindowRetainsUi(int number) {
+    @autoreleasepool {
+        for (NSWindow* window in NSApp.windows)
+            if (window.windowNumber == number)
+                return window.contentView || window.visible || window.parentWindow;
+        return false;
+    }
 }

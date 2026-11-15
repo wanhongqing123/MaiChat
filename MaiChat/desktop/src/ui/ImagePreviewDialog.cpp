@@ -10,6 +10,8 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QScreen>
+#include <QShowEvent>
+#include <QLayout>
 #include <QSizePolicy>
 #include <QVBoxLayout>
 #include <QWindow>
@@ -98,6 +100,12 @@ QColor ImagePreviewDialog::canvasColor() const {
     return canvasColor_;
 }
 
+void ImagePreviewDialog::showEvent(QShowEvent* event) {
+    QDialog::showEvent(event);
+    if (layout()) layout()->setGeometry(contentsRect());
+    updateImage();
+}
+
 void ImagePreviewDialog::keyPressEvent(QKeyEvent* event) {
     if (event->key() == Qt::Key_Escape || event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
         if (closeHandler_ && closeHandler_()) return;
@@ -126,6 +134,8 @@ void ImagePreviewDialog::closeEvent(QCloseEvent* event) {
 
 void ImagePreviewDialog::resizeEvent(QResizeEvent* event) {
     QDialog::resizeEvent(event);
+    // 同一个 native window 的每个几何帧先更新真实图像视口，再缩放像素。
+    if (layout()) layout()->setGeometry(contentsRect());
     updateImage();
 }
 

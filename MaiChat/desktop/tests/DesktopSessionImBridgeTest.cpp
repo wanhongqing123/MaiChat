@@ -106,6 +106,7 @@ public:
         RemoteIMApprovalDecision resolution;
     };
     QList<Sent> sent;
+    QList<QPair<QString, RemoteIMActivitySignal>> activities;
     RemoteDiagnostics::AccountTag account;
     RemoteIMSendCompletion deferred;
     bool defer = false;
@@ -151,6 +152,11 @@ public:
     }
     void sendMachineText(const QString& peer, const QString& text, RemoteIMSendCompletion done) override {
         send(peer, text, RemoteIMMessageOrigin::Machine, std::move(done));
+    }
+    void sendActivity(const QString& peer, const RemoteIMActivitySignal& activity,
+                      RemoteIMCompletion done) override {
+        activities.append({peer, activity});
+        if (done) done(true, {});
     }
     void sendMachineTextWithQuote(const QString& peer, const QString& text, const RemoteIMQuote& quote, bool hasQuote,
                                   RemoteIMSendCompletion done) override {
@@ -236,6 +242,7 @@ struct ModelState {
     std::atomic<int> calls{0};
     std::atomic<bool> blockFirst{false};
     std::atomic<bool> failFirst{false};
+    std::atomic<int> failOnCall{0};
     std::atomic<bool> emptyReply{false};
     std::atomic<bool> progressBeforeTool{false};
     std::atomic<bool> failAfterProgress{false};
@@ -251,6 +258,7 @@ struct ModelState {
     QString mediaPath;
     QString mediaType;
     QString observationPath;
+    bool blockAfterObservation = false;
 };
 
 // 自有无副作用工具将运行阶段固定住，让断言不依赖生产进度 API 或工具计时。
@@ -286,12 +294,18 @@ public:
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                     const std::atomic<bool>& canceled) override {
         const int call = ++state_->calls;
+        if (call == state_->failOnCall.load())
+            return {MaiErrorCode::Network, "owned new local turn failed before any output"};
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
             state_->requests.push_back(request);
         }
         state_->entered.release();
         if (call == 1 && state_->blockFirst) state_->release.tryAcquire(1, 5000);
+        if (call == 2 && state_->blockAfterObservation) {
+            state_->toolEntered.release();
+            state_->toolRelease.acquire();
+        }
         if (canceled) return {};
         if (state_->permission && call == 1) {
             if (sink.onToolCall) sink.onToolCall({"owned-permission", "owned_paid_action", "{}"});
@@ -468,6 +482,10 @@ private slots:
     void machineSendRevocationLeavesNoPendingRow();
     void logoutBeginningRejectsInputBeforeSdkDisconnectCompletes();
     void bindingIsExplicitAndExclusive();
+    void locallyStartedBoundTurnPublishesCommittedProgressBeforeToolCompletes();
+    void bindingBusyLocalTurnPublishesOnlyCommitsAfterCutover();
+    void localTurnStopUnbindAndRebindDiscardOldOutput();
+    void localCommittedStageSurvivesFailureWithoutPublishingItsPartialTail();
     void liveHumanMessageRepliesOnlyToItsOriginalPeer();
     void committedProgressArrivesBeforeToolFinishesWithoutLosingQueuedInput();
     void committedStageSurvivesLaterNetworkFailureButNotItsPartialTail();
@@ -483,7 +501,8 @@ private slots:
     void cachedImageVideoAndFileUseExistingSessionInputs();
     void explicitOwnedMediaUsesMachineDelivery_data();
     void explicitOwnedMediaUsesMachineDelivery();
-    void toolObservationImageIsNeverAutomaticallyDelivered();
+    void visibleSessionImageIsDeliveredBeforeNextModelResponse_data();
+    void visibleSessionImageIsDeliveredBeforeNextModelResponse();
     void suspendRejectsNewIngressBeforeDisconnectStarts();
     void unbindDuringAttachmentPreparationNeverSubmitsLateInput();
     void workspaceChangeDuringPreparationRejectsTheStagedInput();
@@ -498,8 +517,13 @@ private slots:
     void unsupportedPayloadAndPendingLimitFailExplicitly();
     void attachmentPreparationIgnoresGlobalWorkAndExpiresWithoutBlockingLaterText();
     void asynchronousVideoPreparationKeepsHeartbeatAndReplyFifo();
-    void lateSessionErrorDuringVideoPreparationPreventsSdkMediaAndAdvancesFifo();
+    void committedMediaSurvivesLaterModelErrorAndKeepsFifo();
     void unbindDuringVideoPreparationPreventsLateSdkDispatch();
+    void failureOfNewLocalTurnKeepsPriorCommittedVideo();
+    void failureOfNewLocalTurnKeepsPriorCommittedVideo_data();
+    void ordinaryConfigurationChangeKeepsBoundOutput_data();
+    void ordinaryConfigurationChangeKeepsBoundOutput();
+    void clearingHistoryRevokesPendingOutputAndUpdatesBinding();
     void localTakeoverRevokesEverySdkScopedBindingForTheSession();
     void metadataAdmissionKeepsMediaAheadOfLaterReadyText();
     void readinessCannotAdoptReboundSessionAndFailureReleasesHead();
@@ -638,12 +662,105 @@ void DesktopSessionImBridgeTest::liveHumanMessageRepliesOnlyToItsOriginalPeer() 
     QCOMPARE(f.im->sent.first().peer, QStringLiteral("friend"));
     QCOMPARE(f.im->sent.first().origin, RemoteIMMessageOrigin::Machine);
     QCOMPARE(f.im->sent.first().text, QStringLiteral("reply: owned task"));
+    const auto localRows = f.app.chatState().messagesWith(QStringLiteral("friend"));
+    QCOMPARE(std::count_if(localRows.cbegin(), localRows.cend(), [](const RemoteIMMessage& row) {
+        return row.origin == RemoteIMMessageOrigin::Machine && row.text == QStringLiteral("reply: owned task");
+    }), 1);
     // 自动绑定回复不替用户创建引用；输入身份和去重断言仍保留原 SDK 来源。
     QVERIFY(!f.im->sent.first().hasQuote);
     QVERIFY(f.im->sent.first().quote.msgId.isEmpty());
     QVERIFY(f.im->sent.first().quote.digest.isEmpty());
     QVERIFY(!f.im->sent.first().text.contains(QStringLiteral("private reasoning")));
     QCOMPARE(f.app.chatState().selectedPeerId(), QStringLiteral("other"));
+}
+
+// The ordinary Creation Center controller starts this turn. No incoming IM
+// reservation may be required to publish a bound Session's visible output.
+void DesktopSessionImBridgeTest::locallyStartedBoundTurnPublishesCommittedProgressBeforeToolCompletes() {
+    Fixture f;
+    const auto release = qScopeGuard([&] { f.model->toolRelease.release(); });
+    f.model->progressBeforeTool = true;
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("owned local input")));
+    QTRY_VERIFY_WITH_TIMEOUT(f.model->toolEntered.available() > 0, 3000);
+    QVERIFY(!f.model->toolExited.load());
+    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 1, 3000);
+    QCOMPARE(f.im->sent.first().text, QStringLiteral("owned public progress before tool"));
+    QCOMPARE(f.im->sent.first().peer, QStringLiteral("friend"));
+    QCOMPARE(f.im->sent.first().origin, RemoteIMMessageOrigin::Machine);
+    QVERIFY(!f.im->sent.first().hasQuote);
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
+    QVERIFY(std::any_of(f.im->activities.cbegin(), f.im->activities.cend(), [](const auto& item) {
+        return item.first == QStringLiteral("friend") && item.second.active;
+    }));
+    f.model->toolRelease.release();
+    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 2, 3000);
+    QCOMPARE(f.im->sent.last().text, QStringLiteral("owned final: owned local input"));
+    const auto localRows = f.app.chatState().messagesWith(QStringLiteral("friend"));
+    for (const auto& sent : f.im->sent)
+        QCOMPARE(std::count_if(localRows.cbegin(), localRows.cend(), [&](const RemoteIMMessage& row) {
+            return row.origin == RemoteIMMessageOrigin::Machine && row.text == sent.text;
+        }), 1);
+    for (const auto& message : f.im->sent)
+        QVERIFY(!message.text.contains(QStringLiteral("private progress reasoning")));
+}
+
+void DesktopSessionImBridgeTest::bindingBusyLocalTurnPublishesOnlyCommitsAfterCutover() {
+    Fixture f;
+    const auto release = qScopeGuard([&] { f.model->toolRelease.release(); });
+    f.model->progressBeforeTool = true;
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("local turn already running")));
+    QVERIFY(f.model->toolEntered.tryAcquire(1, 3000));
+    // The first typed commit already happened, but its Qt notification has not
+    // been delivered. Binding must use the Core event boundary, never replay it.
+    QVERIFY(f.bridge.bind(QStringLiteral("friend"), f.session));
+    QCoreApplication::processEvents();
+    QVERIFY(f.im->sent.isEmpty());
+    f.model->toolRelease.release();
+    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 1, 3000);
+    QCOMPARE(f.im->sent.first().text, QStringLiteral("owned final: local turn already running"));
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
+}
+
+void DesktopSessionImBridgeTest::localTurnStopUnbindAndRebindDiscardOldOutput() {
+    Fixture f;
+    QTRY_VERIFY(f.app.connectionReady());
+    f.model->blockFirst = true;
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("old local turn")));
+    QTRY_COMPARE(f.model->calls.load(), 1);
+    f.bridge.unbind(QStringLiteral("friend"));
+    QVERIFY(f.bridge.bind(QStringLiteral("other"), f.session));
+    QVERIFY(f.controller.interrupt(f.session));
+    f.model->release.release();
+    QTRY_VERIFY(!f.controller.agent().isBusy(f.session.toStdString()));
+    QCoreApplication::processEvents();
+    QVERIFY(f.im->sent.isEmpty());
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("other")), f.session);
+    QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("next local turn")));
+    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 1, 3000);
+    QCOMPARE(f.im->sent.first().peer, QStringLiteral("other"));
+    QCOMPARE(f.im->sent.first().text, QStringLiteral("reply: next local turn"));
+}
+
+void DesktopSessionImBridgeTest::localCommittedStageSurvivesFailureWithoutPublishingItsPartialTail() {
+    Fixture f;
+    const auto release = qScopeGuard([&] { f.model->toolRelease.release(); });
+    f.model->progressBeforeTool = true;
+    f.model->failAfterProgress = true;
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("local work then fail")));
+    QVERIFY(f.model->toolEntered.tryAcquire(1, 3000));
+    f.model->toolRelease.release();
+    f.controller.agent().waitIdle();
+    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 1, 3000);
+    QCOMPARE(f.im->sent.first().text, QStringLiteral("owned public progress before tool"));
+    QVERIFY(!f.im->sent.first().text.contains(QStringLiteral("UNCOMMITTED-TAIL")));
+    QVERIFY(!f.im->sent.first().text.contains(QStringLiteral("private progress reasoning")));
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
 }
 
 void DesktopSessionImBridgeTest::committedProgressArrivesBeforeToolFinishesWithoutLosingQueuedInput() {
@@ -827,7 +944,7 @@ void DesktopSessionImBridgeTest::successfulStopRevokesUndispatchedCommittedText(
     // ownership revocation must reject its final SDK permit before that event.
     f.model->toolRelease.release();
     QTRY_VERIFY(!f.controller.agent().isBusy(f.session.toStdString()));
-    QTRY_VERIFY(f.bridge.boundSession(QStringLiteral("friend")).isEmpty());
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
     QTest::qWait(20);
     QVERIFY(f.im->sent.isEmpty());
 }
@@ -1108,10 +1225,11 @@ void DesktopSessionImBridgeTest::explicitOwnedMediaUsesMachineDelivery() {
     QVERIFY(f.bind(QStringLiteral("friend"), f.session));
     f.im->incoming(QStringLiteral("owned-delivery-source#0"), QStringLiteral("deliver owned media"));
     QTRY_COMPARE(f.im->sent.size(), 2);
-    QCOMPARE(f.im->sent.last().kind, kind == QStringLiteral("audio") ? QStringLiteral("file") : kind);
-    QCOMPARE(f.im->sent.last().origin, RemoteIMMessageOrigin::Machine);
-    QCOMPARE(f.im->sent.last().text, QStringLiteral("owned media caption"));
-    QCOMPARE(QFileInfo(f.im->sent.last().path).canonicalFilePath(), QFileInfo(path).canonicalFilePath());
+    QCOMPARE(f.im->sent.first().kind, kind == QStringLiteral("audio") ? QStringLiteral("file") : kind);
+    QCOMPARE(f.im->sent.first().origin, RemoteIMMessageOrigin::Machine);
+    QCOMPARE(f.im->sent.first().text, QStringLiteral("owned media caption"));
+    QCOMPARE(QFileInfo(f.im->sent.first().path).canonicalFilePath(), QFileInfo(path).canonicalFilePath());
+    QCOMPARE(f.im->sent.last().text, QStringLiteral("owned completed response"));
     // 正文和媒体都属于普通自动交付，不应把任务来源强制变成聊天引用块。
     for (const auto& sent : f.im->sent) {
         QVERIFY(!sent.hasQuote);
@@ -1120,21 +1238,52 @@ void DesktopSessionImBridgeTest::explicitOwnedMediaUsesMachineDelivery() {
     }
 }
 
-void DesktopSessionImBridgeTest::toolObservationImageIsNeverAutomaticallyDelivered() {
+void DesktopSessionImBridgeTest::visibleSessionImageIsDeliveredBeforeNextModelResponse_data() {
+    QTest::addColumn<bool>("localInput");
+    QTest::newRow("friend-input") << false;
+    QTest::newRow("creation-input") << true;
+}
+
+void DesktopSessionImBridgeTest::visibleSessionImageIsDeliveredBeforeNextModelResponse() {
+    QFETCH(bool, localInput);
     Fixture f;
+    const auto release = qScopeGuard([&] { f.model->toolRelease.release(); });
     QTRY_VERIFY(f.app.connectionReady());
-    const QString path = f.workspace.filePath(QStringLiteral("private-observation.png"));
+    const QString path = f.workspace.filePath(QStringLiteral("visible-session-image.png"));
     QImage image(24, 18, QImage::Format_RGB32);
     image.fill(Qt::red);
     QVERIFY(image.save(path, "PNG"));
     QVERIFY(f.controller.setModel(f.session, QStringLiteral("glm-5.3-flash")));
     f.model->observationPath = path;
+    f.model->blockAfterObservation = true;
     QVERIFY(f.bind(QStringLiteral("friend"), f.session));
-    f.im->incoming(QStringLiteral("owned-observation-source"), QStringLiteral("inspect privately"));
+    if (localInput)
+        QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("show the owned image")));
+    else
+        f.im->incoming(QStringLiteral("owned-visible-image"), QStringLiteral("show the owned image"));
+    QTRY_VERIFY_WITH_TIMEOUT(f.model->toolEntered.available() > 0, 3000);
     QTRY_COMPARE(f.model->calls.load(), 2);
-    QTRY_COMPARE(f.im->sent.size(), 1);
-    QCOMPARE(f.im->sent.first().kind, QStringLiteral("text"));
-    QCOMPARE(f.im->sent.first().text, QStringLiteral("owned completed response"));
+    QVERIFY(f.controller.agent().isBusy(f.session.toStdString()));
+    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 1, 2000);
+    QCOMPARE(f.im->sent.first().kind, QStringLiteral("image"));
+    QString visiblePath;
+    for (const auto& message : f.controller.agent().listMessages(f.session.toStdString()))
+        if (message.role == MaiRole::Assistant)
+            for (const auto& part : message.parts)
+                if (const auto* visible = std::get_if<MaiImagePart>(&part.body))
+                    visiblePath = QString::fromStdString(visible->path);
+    QVERIFY(!visiblePath.isEmpty());
+    QCOMPARE(QFileInfo(f.im->sent.first().path).canonicalFilePath(), QFileInfo(visiblePath).canonicalFilePath());
+    const QImage shown(f.im->sent.first().path);
+    QVERIFY(!shown.isNull());
+    QVERIFY(shown.pixelColor(shown.width() / 2, shown.height() / 2).red() > 200);
+    f.model->toolRelease.release();
+    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 2, 3000);
+    QCOMPARE(f.im->sent.last().text, QStringLiteral("owned completed response"));
+    const auto rows = f.app.chatState().messagesWith(QStringLiteral("friend"));
+    QCOMPARE(std::count_if(rows.cbegin(), rows.cend(), [](const RemoteIMMessage& row) {
+        return row.origin == RemoteIMMessageOrigin::Machine && row.hasImage;
+    }), 1);
     bool hasObservation = false;
     for (const auto& message : f.controller.agent().listMessages(f.session.toStdString()))
         if (message.role == MaiRole::Assistant)
@@ -1247,11 +1396,11 @@ void DesktopSessionImBridgeTest::busyLocalTurnIsNotSteeredAndPendingInputStaysOr
         if (message.role == MaiRole::User) ++users;
     QCOMPARE(users, 1);
     f.model->release.release();
-    QTRY_COMPARE(f.im->sent.size(), 2);
+    QTRY_COMPARE(f.im->sent.size(), 3);
     QCOMPARE(f.model->calls.load(), 3);
-    QCOMPARE(f.im->sent[0].text, QStringLiteral("reply: first remote task"));
-    QCOMPARE(f.im->sent[1].text, QStringLiteral("reply: second remote task"));
-    for (const auto& sent : f.im->sent) QVERIFY(!sent.text.contains(QStringLiteral("local owner task")));
+    QCOMPARE(f.im->sent[0].text, QStringLiteral("reply: local owner task"));
+    QCOMPARE(f.im->sent[1].text, QStringLiteral("reply: first remote task"));
+    QCOMPARE(f.im->sent[2].text, QStringLiteral("reply: second remote task"));
 }
 
 void DesktopSessionImBridgeTest::priorQueuedIdleCannotRetireAnUnfinishedOwnedReply() {
@@ -1285,8 +1434,9 @@ void DesktopSessionImBridgeTest::delayedPreBindingUserReceiptDoesNotCountAsTakeo
     QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
     QCOMPARE(f.model->calls.load(), 1);
     f.model->release.release();
-    QTRY_COMPARE(f.im->sent.size(), 1);
-    QCOMPARE(f.im->sent.first().text, QStringLiteral("reply: remote after local"));
+    QTRY_COMPARE(f.im->sent.size(), 2);
+    QCOMPARE(f.im->sent.first().text, QStringLiteral("reply: already accepted local input"));
+    QCOMPARE(f.im->sent.last().text, QStringLiteral("reply: remote after local"));
 }
 
 void DesktopSessionImBridgeTest::synchronousTakeoverBeforeSdkDispatchRevokesTheReply() {
@@ -1306,6 +1456,9 @@ void DesktopSessionImBridgeTest::synchronousTakeoverBeforeSdkDispatchRevokesTheR
         });
         if (!pendingReply) return;
         tookOver = true;
+        // Revocation is explicit. A local Send alone now preserves binding
+        // and forwards that local turn, as the ordinary Creation Center does.
+        f.bridge.localTakeover(f.session);
         QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("local takeover before SDK dispatch")));
     });
     f.im->incoming(QStringLiteral("delivery-race"), QStringLiteral("remote answer is revoked"));
@@ -1320,8 +1473,8 @@ void DesktopSessionImBridgeTest::synchronousTakeoverBeforeSdkDispatchRevokesTheR
     });
     QVERIFY(revoked != rows.end());
     QCOMPARE(revoked->status, RemoteIMMessageStatus::Failed);
-    QVERIFY(!errors.isEmpty());
-    QVERIFY(errors.first().last().toString().contains(QStringLiteral("发送失败")));
+    // Explicit unbinding is a normal action. The pending local row records its
+    // failed dispatch; the SDK must receive no old output after revocation.
 }
 
 void DesktopSessionImBridgeTest::failedModelDoesNotForwardPartialOutputOrRetry() {
@@ -1370,6 +1523,7 @@ void DesktopSessionImBridgeTest::unbindAndLocalTakeoverDiscardLateReplies() {
     QVERIFY(f.im->sent.isEmpty());
 
     QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    f.bridge.localTakeover(f.session);
     QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("owner takes over")));
     QTRY_VERIFY(f.bridge.boundSession(QStringLiteral("friend")).isEmpty());
     QTRY_VERIFY(!f.controller.agent().isBusy(f.session.toStdString()));
@@ -1485,20 +1639,21 @@ void DesktopSessionImBridgeTest::asynchronousVideoPreparationKeepsHeartbeatAndRe
     connect(&heartbeat, &QTimer::timeout, &heartbeat, [&] { ++heartbeats; });
     heartbeat.start(5);
     f.im->incoming(QStringLiteral("owned-slow-video-request"), QStringLiteral("deliver video"));
-    QTRY_COMPARE(f.im->sent.size(), 2);  // warm-up plus the owned text; video prep is held.
+    QTRY_VERIFY(f.app.findChild<QObject*>(QStringLiteral("sessionImVideoPreparation")));
+    QCOMPARE(f.im->sent.size(), 1);  // Later text stays behind the earlier video.
     f.im->incoming(QStringLiteral("owned-after-slow-video"), QStringLiteral("next owned input"));
     QTest::qWait(40);
     QVERIFY(heartbeats > 0);
     QCOMPARE(f.model->calls.load(), 2);
     slow.release();
     QTRY_COMPARE(f.im->sent.size(), 4);
-    QCOMPARE(f.im->sent[1].kind, QStringLiteral("text"));
-    QCOMPARE(f.im->sent[2].kind, QStringLiteral("video"));
+    QCOMPARE(f.im->sent[1].kind, QStringLiteral("video"));
+    QCOMPARE(f.im->sent[2].kind, QStringLiteral("text"));
     QCOMPARE(f.im->sent[3].kind, QStringLiteral("text"));
     QCOMPARE(f.model->calls.load(), 3);
 }
 
-void DesktopSessionImBridgeTest::lateSessionErrorDuringVideoPreparationPreventsSdkMediaAndAdvancesFifo() {
+void DesktopSessionImBridgeTest::committedMediaSurvivesLaterModelErrorAndKeepsFifo() {
     Fixture f;
     QTRY_VERIFY(f.app.connectionReady());
     const QString path = f.workspace.filePath(QStringLiteral("owned-late-error-video.mp4"));
@@ -1514,14 +1669,21 @@ void DesktopSessionImBridgeTest::lateSessionErrorDuringVideoPreparationPreventsS
     f.model->mediaPath = QStringLiteral("owned-late-error-video.mp4");
     f.model->mediaType = QStringLiteral("video");
     QVERIFY(f.bind(QStringLiteral("friend"), f.session));
-    QSignalSpy errors(&f.bridge, &DesktopSessionImBridge::relayError);
+    QSignalSpy errors(&f.controller, &AgentController::turnFailed);
     f.im->incoming(QStringLiteral("owned-late-error-request"), QStringLiteral("deliver video before late error"));
-    QTRY_COMPARE(f.im->sent.size(), 2);  // Warm-up and exact completed text; media preparation is still held.
-    QVERIFY(f.app.findChild<QObject*>(QStringLiteral("sessionImVideoPreparation")));
+    QTRY_VERIFY(f.app.findChild<QObject*>(QStringLiteral("sessionImVideoPreparation")));
+    QCOMPARE(f.im->sent.size(), 1);
     f.im->incoming(QStringLiteral("owned-after-late-error"), QStringLiteral("next owned input"));
     MaiEvent failure;
     failure.type = MaiEventType::SessionError;
     failure.sessionId = f.session.toStdString();
+    for (const auto& message : f.controller.agent().listMessages(f.session.toStdString()))
+        if (message.role == MaiRole::Assistant)
+            for (const auto& part : message.parts)
+                if (const auto* tool = std::get_if<MaiToolPart>(&part.body);
+                    tool && tool->callId == "owned-media-call")
+                    failure.turnId = message.id;
+    QVERIFY(!failure.turnId.empty());
     failure.detail = "owned late private failure detail";
     f.controller.agent().eventBus().publish(failure);
     slow.release();
@@ -1530,11 +1692,11 @@ void DesktopSessionImBridgeTest::lateSessionErrorDuringVideoPreparationPreventsS
     QTRY_COMPARE(std::count_if(f.im->sent.cbegin(), f.im->sent.cend(),
                                [](const OwnedIm::Sent& row) { return row.kind == QStringLiteral("text"); }),
                  2);
-    QCOMPARE(f.im->sent.size(), 3);
-    QVERIFY(std::none_of(f.im->sent.cbegin() + 1, f.im->sent.cend(),
-                         [](const OwnedIm::Sent& row) { return row.kind == QStringLiteral("video"); }));
-    QCOMPARE(errors.size(), 1);
-    QVERIFY(!errors.first().last().toString().contains(QStringLiteral("owned late private failure detail")));
+    QCOMPARE(f.im->sent.size(), 4);
+    QCOMPARE(f.im->sent[1].kind, QStringLiteral("video"));
+    QTRY_COMPARE(errors.size(), 1);
+    for (const auto& sent : f.im->sent)
+        QVERIFY(!sent.text.contains(QStringLiteral("owned late private failure detail")));
     QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
 }
 
@@ -1555,7 +1717,8 @@ void DesktopSessionImBridgeTest::unbindDuringVideoPreparationPreventsLateSdkDisp
     f.model->mediaType = QStringLiteral("video");
     QVERIFY(f.bind(QStringLiteral("friend"), f.session));
     f.im->incoming(QStringLiteral("owned-revoked-video-request"), QStringLiteral("deliver video then revoke"));
-    QTRY_COMPARE(f.im->sent.size(), 2);
+    QTRY_VERIFY(f.app.findChild<QObject*>(QStringLiteral("sessionImVideoPreparation")));
+    QCOMPARE(f.im->sent.size(), 1);
     auto* watcher = f.app.findChild<QObject*>(QStringLiteral("sessionImVideoPreparation"));
     QVERIFY(watcher);
     auto* deadline = watcher->findChild<QTimer*>(QStringLiteral("sessionImVideoPreparationDeadline"));
@@ -1565,9 +1728,110 @@ void DesktopSessionImBridgeTest::unbindDuringVideoPreparationPreventsLateSdkDisp
     QTest::qWait(40);
     slow.release();
     QTRY_VERIFY(f.app.findChildren<QObject*>(QStringLiteral("sessionImVideoPreparation")).isEmpty());
-    QCOMPARE(f.im->sent.size(), 2);
+    QCOMPARE(f.im->sent.size(), 1);
     QCOMPARE(f.model->calls.load(), 2);
     QVERIFY(f.bridge.boundSession(QStringLiteral("friend")).isEmpty());
+}
+
+void DesktopSessionImBridgeTest::failureOfNewLocalTurnKeepsPriorCommittedVideo() {
+    QFETCH(bool, queuedRemote);
+    Fixture f;
+    QTRY_VERIFY(f.app.connectionReady());
+    const QString path = f.workspace.filePath(QStringLiteral("owned-prior-video.mp4"));
+    QVERIFY(QFile::copy(QString::fromUtf8(MAICHAT_SESSION_IM_VIDEO_FIXTURE), path));
+    QVERIFY(f.app.sendMachineMediaTo(QStringLiteral("friend"), path, QStringLiteral("video")));
+    QTRY_COMPARE(f.im->sent.size(), 1);
+    QTRY_VERIFY(f.app.findChildren<QObject*>(QStringLiteral("sessionImVideoPreparation")).isEmpty());
+    auto* pool = qobject_cast<QThreadPool*>(qApp->property("sessionImVideoPreparationPool").value<QObject*>());
+    QVERIFY(pool);
+    OwnedPoolBlocker slow(pool);
+    QVERIFY(slow.entered());
+    f.model->mediaPath = QStringLiteral("owned-prior-video.mp4");
+    f.model->mediaType = QStringLiteral("video");
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    f.im->incoming(QStringLiteral("owned-prior-commit"), QStringLiteral("deliver owned video"));
+    QTRY_VERIFY(f.app.findChild<QObject*>(QStringLiteral("sessionImVideoPreparation")));
+    QTRY_VERIFY(!f.controller.agent().isBusy(f.session.toStdString()));
+    QCOMPARE(f.model->calls.load(), 2);
+    if (queuedRemote)
+        f.im->incoming(QStringLiteral("owned-pending-after-video"), QStringLiteral("next remote input survives"));
+    f.model->failOnCall = 3;
+    QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("new local turn fails immediately")));
+    f.controller.agent().waitIdle();
+    QCOMPARE(f.model->calls.load(), 3);
+    slow.release();
+    QTRY_VERIFY(f.app.findChildren<QObject*>(QStringLiteral("sessionImVideoPreparation")).isEmpty());
+    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), queuedRemote ? 4 : 3, 2000);
+    QTRY_COMPARE(f.model->calls.load(), queuedRemote ? 4 : 3);
+    QCOMPARE(f.im->sent[1].kind, QStringLiteral("video"));
+    QCOMPARE(f.im->sent[2].text, QStringLiteral("owned completed response"));
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
+}
+
+void DesktopSessionImBridgeTest::failureOfNewLocalTurnKeepsPriorCommittedVideo_data() {
+    QTest::addColumn<bool>("queuedRemote");
+    QTest::newRow("prior-video-only") << false;
+    QTest::newRow("queued-remote-retained") << true;
+}
+
+void DesktopSessionImBridgeTest::ordinaryConfigurationChangeKeepsBoundOutput_data() {
+    QTest::addColumn<bool>("effortOnly");
+    QTest::newRow("model") << false;
+    QTest::newRow("reasoning-effort") << true;
+}
+
+void DesktopSessionImBridgeTest::ordinaryConfigurationChangeKeepsBoundOutput() {
+    QFETCH(bool, effortOnly);
+    Fixture f;
+    QTRY_VERIFY(f.app.connectionReady());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    MaiSession before;
+    QVERIFY(f.controller.agent().getSession(f.session.toStdString(), before));
+    if (effortOnly) {
+        MaiUpdateSession update;
+        update.sessionId = f.session.toStdString();
+        update.reasoningEffort = before.reasoningEffort == "high" ? "low" : "high";
+        QVERIFY(f.controller.agent().submit(update));
+    } else {
+        const auto model = before.model == "glm-5.3" ? QStringLiteral("glm-5.3-flash") : QStringLiteral("glm-5.3");
+        QVERIFY(f.controller.setModel(f.session, model));
+    }
+    QCoreApplication::processEvents();
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
+    QVERIFY(f.controller.sendPrompt(f.session, QStringLiteral("local after configuration change")));
+    QTRY_COMPARE_WITH_TIMEOUT(f.im->sent.size(), 1, 2000);
+    QCOMPARE(f.im->sent.first().text, QStringLiteral("reply: local after configuration change"));
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
+}
+
+void DesktopSessionImBridgeTest::clearingHistoryRevokesPendingOutputAndUpdatesBinding() {
+    Fixture f;
+    QTRY_VERIFY(f.app.connectionReady());
+    const QString path = f.workspace.filePath(QStringLiteral("owned-cleared-video.mp4"));
+    QVERIFY(QFile::copy(QString::fromUtf8(MAICHAT_SESSION_IM_VIDEO_FIXTURE), path));
+    QVERIFY(f.app.sendMachineMediaTo(QStringLiteral("friend"), path, QStringLiteral("video")));
+    QTRY_COMPARE(f.im->sent.size(), 1);
+    QTRY_VERIFY(f.app.findChildren<QObject*>(QStringLiteral("sessionImVideoPreparation")).isEmpty());
+    auto* pool = qobject_cast<QThreadPool*>(qApp->property("sessionImVideoPreparationPool").value<QObject*>());
+    QVERIFY(pool);
+    OwnedPoolBlocker slow(pool);
+    QVERIFY(slow.entered());
+    f.model->mediaPath = QStringLiteral("owned-cleared-video.mp4");
+    f.model->mediaType = QStringLiteral("video");
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    QSignalSpy changes(&f.bridge, &DesktopSessionImBridge::bindingChanged);
+    f.im->incoming(QStringLiteral("owned-before-clear"), QStringLiteral("prepare owned video"));
+    QTRY_VERIFY(f.app.findChild<QObject*>(QStringLiteral("sessionImVideoPreparation")));
+    QTRY_VERIFY(!f.controller.agent().isBusy(f.session.toStdString()));
+    f.im->incoming(QStringLiteral("owned-queued-before-clear"), QStringLiteral("must not reappear after clearing"));
+    QVERIFY(f.controller.agent().submit(MaiClearMessages{f.session.toStdString()}));
+    QTRY_VERIFY(f.bridge.boundSession(QStringLiteral("friend")).isEmpty());
+    QVERIFY(!changes.isEmpty());
+    slow.release();
+    QTRY_VERIFY(f.app.findChildren<QObject*>(QStringLiteral("sessionImVideoPreparation")).isEmpty());
+    QCOMPARE(f.im->sent.size(), 1);
+    QCOMPARE(f.model->calls.load(), 2);
+    QVERIFY(f.controller.agent().listMessages(f.session.toStdString()).empty());
 }
 
 void DesktopSessionImBridgeTest::localTakeoverRevokesEverySdkScopedBindingForTheSession() {

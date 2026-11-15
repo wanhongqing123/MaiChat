@@ -84,6 +84,7 @@ struct InputReceipt {
     std::vector<std::string> admissionIds;
     struct Text {
         std::string messageId, partId, turnId;
+        bool media = false;
     };
     struct Continuation {
         std::string messageId, turnId;
@@ -98,9 +99,25 @@ struct InputReceipt {
 
 // Cross-thread Stop touches only this weak ownership registry and a receipt's
 // mutex/atomic flag. GUI ledgers, storage and SDK calls stay on their owner.
+struct BindingOutputWatch {
+    std::mutex mutex;
+    MaiSessionIMRouter::Binding binding;
+    std::atomic<bool> valid{true};
+    MaiEventBus::Token subscription = 0;
+    std::vector<InputReceipt::Text> committed;
+    std::set<std::string> sentParts;
+    std::set<std::string> blockedTurns;
+    std::set<std::string> removedMessages;
+    std::string turnId;
+    RemoteIMActivitySignal activity;
+    qint64 lastActivityAt = 0;
+    bool dispatching = false;
+};
+
 struct InterruptionWatches {
     std::mutex mutex;
     std::map<std::string, std::weak_ptr<InputReceipt>> sessions;
+    std::map<std::string, std::weak_ptr<BindingOutputWatch>> outputs;
 };
 
 void observeInput(const std::shared_ptr<InputReceipt>& observed, const MaiEvent& event) {
@@ -110,6 +127,10 @@ void observeInput(const std::shared_ptr<InputReceipt>& observed, const MaiEvent&
         return;
     }
     if (event.type == MaiEventType::SessionError) {
+        std::lock_guard<std::mutex> lock(observed->mutex);
+        if (!event.turnId.empty() && event.turnId != observed->turnId &&
+            std::find(observed->ids.begin(), observed->ids.end(), event.turnId) == observed->ids.end())
+            return;
         observed->failed = true;
         return;
     }
@@ -317,8 +338,9 @@ QList<OutputMedia> deliveredMedia(const MaiMessage& reply, const MaiSession& own
                 {absolute, type, receipt.value(QStringLiteral("caption")).toString(), QString::fromStdString(part.id)});
         }
     }
-    // MaiImagePart can be a private tool observation (for example a screenshot),
-    // and arbitrary tool JSON/Markdown paths are not delivery authority.
+    // This helper validates explicit file/media receipts only. Visible typed
+    // image/video parts are mirrored by the persistent binding subscription;
+    // arbitrary paths inside other tool JSON/Markdown remain ordinary text.
     return result;
 }
 
@@ -512,6 +534,7 @@ struct DesktopSessionImBridge::Runtime {
     // phases and dispatch accounting exist exclusively in MaiSessionIMRouter.
     QHash<quint64, Payload> payloads;
     QHash<quint64, CoreLease> coreLeases;
+    QHash<QString, std::shared_ptr<BindingOutputWatch>> boundOutputs;
     std::shared_ptr<InterruptionWatches> interruptionWatches = std::make_shared<InterruptionWatches>();
     QHash<quint64, std::shared_ptr<std::atomic<bool>>> preparing;
     QHash<QString, QSet<QString>> priorCoreUserReceipts;
@@ -579,6 +602,23 @@ struct DesktopSessionImBridge::Runtime {
                friendCurrent(route.reservation.input.binding.peerId) &&
                router.isOutputCurrent(route.reservation.token, *route.receipt, *live,
                                       workspace(route.reservation.input.binding.sessionId).toStdString());
+    }
+    bool boundOutputCurrent(const std::shared_ptr<BindingOutputWatch>& watch,
+                            const std::string& turn = {}, bool checkWorkspace = true,
+                            const std::string& message = {}) const {
+        if (!watch->valid.load() ||
+            boundOutputs.value(QString::fromStdString(watch->binding.sessionId)) != watch)
+            return false;
+        const auto live = liveScope();
+        if (!live || *live != watch->binding.account || !friendCurrent(watch->binding.peerId)) return false;
+        const auto binding = router.bindingForPeer(*live, watch->binding.peerId);
+        if (!binding || binding->epoch != watch->binding.epoch ||
+            binding->sessionId != watch->binding.sessionId || binding->workspaceKey != watch->binding.workspaceKey ||
+            (checkWorkspace && workspace(binding->sessionId).toStdString() != binding->workspaceKey))
+            return false;
+        std::lock_guard<std::mutex> lock(watch->mutex);
+        return (turn.empty() || !watch->blockedTurns.count(turn)) &&
+               (message.empty() || !watch->removedMessages.count(message));
     }
     bool sameHistory(const std::shared_ptr<HistoryJob>& job) const {
         return historyJobs.value(QString::fromStdString(job->binding.peerId)) == job;
@@ -663,10 +703,19 @@ DesktopSessionImBridge::DesktopSessionImBridge(RemoteIMApplication& app, AgentCo
         &controller, &AgentController::turnInterrupted, this,
         [watches = runtime_->interruptionWatches](const QString& session, const QString& turn) {
             std::shared_ptr<InputReceipt> observed;
+            std::shared_ptr<BindingOutputWatch> output;
             {
                 std::lock_guard<std::mutex> lock(watches->mutex);
                 const auto found = watches->sessions.find(session.toStdString());
                 if (found != watches->sessions.end()) observed = found->second.lock();
+                const auto bound = watches->outputs.find(session.toStdString());
+                if (bound != watches->outputs.end()) output = bound->second.lock();
+            }
+            if (output) {
+                // Stop is synchronous even when the GUI is busy. It blocks
+                // exactly this turn, not the next local turn or the binding.
+                std::lock_guard<std::mutex> lock(output->mutex);
+                output->blockedTurns.insert(turn.toStdString());
             }
             if (!observed) return;
             std::lock_guard<std::mutex> lock(observed->mutex);
@@ -685,7 +734,7 @@ DesktopSessionImBridge::DesktopSessionImBridge(RemoteIMApplication& app, AgentCo
             for (const auto& route : runtime_->router.snapshot(*scope).active)
                 if (route.reservation.input.binding.sessionId == session.toStdString() && route.receipt &&
                     route.receipt->turnId == turn.toStdString()) {
-                    localTakeover(session);
+                    cancelSessionInputs(session);
                     return;
                 }
         },
@@ -713,7 +762,7 @@ DesktopSessionImBridge::DesktopSessionImBridge(RemoteIMApplication& app, AgentCo
         if (std::find(runtime_->recentUserReceipts.begin(), runtime_->recentUserReceipts.end(),
                       std::make_pair(session, user)) != runtime_->recentUserReceipts.end())
             return;
-        localTakeover(session);
+        cancelSessionInputs(session, false);
     });
     connect(&controller, &AgentController::textCommitted, this,
             [this](const QString& session, const QString&, const QString&, const QString&) {
@@ -797,6 +846,17 @@ void DesktopSessionImBridge::prunePlatformWork() {
     QSet<quint64> inputs;
     QSet<quint64> tokens;
     QSet<QString> sessions;
+    QStringList revokedPeers;
+    // Clearing/deleting a Session ends the imported-history binding as well as
+    // its output watch. Never leave a visible "bound" row with no subscription.
+    const auto watched = runtime_->boundOutputs;
+    for (const auto& watch : watched) {
+        if (watch->valid) continue;
+        const auto binding = runtime_->router.bindingForPeer(watch->binding.account, watch->binding.peerId);
+        if (binding && binding->epoch == watch->binding.epoch &&
+            runtime_->router.unbind(watch->binding.account, watch->binding.peerId) == Router::Status::Ok)
+            revokedPeers.append(QString::fromStdString(watch->binding.peerId));
+    }
     if (runtime_->scope) {
         const auto snapshot = runtime_->router.snapshot(*runtime_->scope);
         for (const auto& binding : snapshot.bindings) sessions.insert(QString::fromStdString(binding.sessionId));
@@ -805,6 +865,29 @@ void DesktopSessionImBridge::prunePlatformWork() {
             tokens.insert(route.reservation.token);
             inputs.insert(route.reservation.input.inputId);
         }
+    }
+    for (auto it = runtime_->boundOutputs.begin(); it != runtime_->boundOutputs.end();) {
+        const auto watch = it.value();
+        // Pruning owns only routing values. Do not wait on the Core SQLite
+        // mutex while a background import/maintenance transaction is running.
+        if (runtime_->boundOutputCurrent(watch, {}, false)) {
+            ++it;
+            continue;
+        }
+        {
+            // A Core callback may be posting its GUI notification. Finish that
+            // post before this QObject can be destroyed, then reject new posts.
+            std::lock_guard<std::mutex> lock(watch->mutex);
+            watch->valid = false;
+        }
+        runtime_->controller.agent().eventBus().unsubscribe(watch->subscription);
+        {
+            std::lock_guard<std::mutex> lock(runtime_->interruptionWatches->mutex);
+            const auto found = runtime_->interruptionWatches->outputs.find(watch->binding.sessionId);
+            if (found != runtime_->interruptionWatches->outputs.end() && found->second.lock() == watch)
+                runtime_->interruptionWatches->outputs.erase(found);
+        }
+        it = runtime_->boundOutputs.erase(it);
     }
     for (auto it = runtime_->historyJobs.begin(); it != runtime_->historyJobs.end();) {
         const auto job = it.value();
@@ -850,6 +933,11 @@ void DesktopSessionImBridge::prunePlatformWork() {
             it = runtime_->priorCoreUserReceipts.erase(it);
         else
             ++it;
+    const QPointer<DesktopSessionImBridge> lifetime(this);
+    for (const auto& peer : revokedPeers) {
+        emit bindingChanged(peer);
+        if (!lifetime) return;
+    }
 }
 
 bool DesktopSessionImBridge::bind(const QString& peerId, const QString& sessionId, QString* error) {
@@ -899,6 +987,63 @@ bool DesktopSessionImBridge::bind(const QString& peerId, const QString& sessionI
                                  "\u53cb\uff0c\u8bf7\u5148\u89e3\u9664\u539f\u7ed1\u5b9a\u3002")
                 : QStringLiteral(
                       "\u5f53\u524d\u8d26\u53f7\u6216\u4f1a\u8bdd\u7ed1\u5b9a\u5df2\u4e0d\u53ef\u7528\u3002"));
+    // This subscription is the cutover: only new typed Core commits are
+    // eligible. A delayed pre-binding Qt signal cannot replay old history.
+    auto watch = std::make_shared<BindingOutputWatch>();
+    watch->binding = job->binding;
+    const QPointer<DesktopSessionImBridge> outputHost(this);
+    const auto watches = runtime_->interruptionWatches;
+    watch->subscription = runtime_->controller.agent().eventBus().subscribe(
+        [watch, watches, outputHost, sessionId](const MaiEvent& event) {
+            if (!watch->valid || event.sessionId != watch->binding.sessionId) return;
+            if (event.type == MaiEventType::SessionDeleted ||
+                (event.type == MaiEventType::SessionUpdated && event.field == "clear")) {
+                std::lock_guard<std::mutex> lock(watch->mutex);
+                if (!watch->valid) return;
+                watch->valid = false;
+                if (outputHost)
+                    QMetaObject::invokeMethod(outputHost, [outputHost] {
+                        if (outputHost) outputHost->prunePlatformWork();
+                    }, Qt::QueuedConnection);
+                return;
+            }
+            if (event.type == MaiEventType::MessageRemoved) {
+                std::lock_guard<std::mutex> lock(watch->mutex);
+                watch->removedMessages.insert(event.messageId);
+                return;
+            }
+            // Model/effort/agent changes do not remove a Session's output
+            // subscription. Workspace/root identity is checked afresh at the
+            // SDK boundary and the ordinary structure notification prunes it.
+            const bool media = event.type == MaiEventType::MessagePartUpdated;
+            if ((!media && event.type != MaiEventType::MessageTextCommitted) || event.turnId.empty()) return;
+            // The binding mirrors new visible output regardless of who started
+            // the turn. Input receipts continue to govern incoming prompts and
+            // approval decisions, not whether Session output is copied to IM.
+            {
+                std::lock_guard<std::mutex> lock(watch->mutex);
+                if (!watch->valid) return;
+                watch->turnId = event.turnId;
+                if (watch->blockedTurns.count(event.turnId)) return;
+                watch->committed.push_back({event.messageId, event.partId, event.turnId, media});
+                if (outputHost)
+                    QMetaObject::invokeMethod(outputHost, [outputHost, sessionId] {
+                        if (outputHost) outputHost->publishBoundOutput(sessionId);
+                    }, Qt::QueuedConnection);
+            }
+        });
+    if (const auto previous = runtime_->boundOutputs.value(sessionId)) {
+        {
+            std::lock_guard<std::mutex> lock(previous->mutex);
+            previous->valid = false;
+        }
+        runtime_->controller.agent().eventBus().unsubscribe(previous->subscription);
+    }
+    runtime_->boundOutputs.insert(sessionId, watch);
+    {
+        std::lock_guard<std::mutex> lock(watches->mutex);
+        watches->outputs[sessionId.toStdString()] = watch;
+    }
     if (error) error->clear();
     if (const auto previous = runtime_->historyJobs.value(peer)) {
         previous->canceled->store(true);
@@ -1236,6 +1381,7 @@ void DesktopSessionImBridge::advanceHistory(const QString& peer) {
             emit historyImported(peer, job->imported, job->maximumStepMillis);
             if (!lifetime) return;
             emit bindingChanged(peer);
+            if (lifetime) publishBoundOutput(QString::fromStdString(job->binding.sessionId));
             if (lifetime) dispatch(QString::fromStdString(job->binding.sessionId));
         });
 }
@@ -1301,6 +1447,14 @@ void DesktopSessionImBridge::localTakeover(const QString& session) {
         emit bindingChanged(peer);
         if (!lifetime) return;
     }
+}
+
+void DesktopSessionImBridge::cancelSessionInputs(const QString& session, bool discardPending) {
+    const auto scope = runtime_->liveScope();
+    if (!scope) return;
+    runtime_->router.cancelSessionInputs(*scope, session.toStdString(),
+                                         runtime_->workspace(session.toStdString()).toStdString(), discardPending);
+    prunePlatformWork();
 }
 
 void DesktopSessionImBridge::suspend() {
@@ -1512,6 +1666,10 @@ void DesktopSessionImBridge::failLive(quint64 ingressId, const QString& error) {
 }
 
 void DesktopSessionImBridge::dispatch(const QString& session) {
+    if (const auto watch = runtime_->boundOutputs.value(session)) {
+        std::lock_guard<std::mutex> lock(watch->mutex);
+        if (watch->dispatching || !watch->committed.empty()) return;
+    }
     QPointer<DesktopSessionImBridge> lifetime(this);
     const auto scope = runtime_->liveScope();
     if (!scope) return;
@@ -1726,7 +1884,9 @@ void DesktopSessionImBridge::processReservation(quint64 token) {
     runtime_->rememberUser(session, QString::fromStdString(user));
     setActivity(session, int(RemoteIMActivityKind::MachineWorking));
     if (!lifetime) return;
-    publishCommittedOutput(session);
+    // The controller's queued typed-commit notification publishes the text.
+    // Do not opportunistically send a fast worker's commit before that GUI
+    // boundary; an intervening synchronous Stop must revoke the SDK permit.
 }
 
 void DesktopSessionImBridge::processFollowup(quint64 token) {
@@ -1741,7 +1901,7 @@ void DesktopSessionImBridge::processFollowup(quint64 token) {
     const auto activeTurn = runtime_->controller.agent().activeTurnId(binding.sessionId);
     if (activeTurn.empty()) return;
     if (activeTurn != route->receipt->turnId) {
-        localTakeover(QString::fromStdString(binding.sessionId));
+        cancelSessionInputs(QString::fromStdString(binding.sessionId), false);
         return;
     }
     const auto reserved = runtime_->router.reserveFollowup(token, *scope, binding.workspaceKey);
@@ -1823,6 +1983,8 @@ void DesktopSessionImBridge::processFollowup(quint64 token) {
 
 void DesktopSessionImBridge::publishCommittedOutput(const QString& session) {
     const QPointer<DesktopSessionImBridge> lifetime(this);
+    publishBoundOutput(session);
+    if (!lifetime) return;
     const auto scope = runtime_->liveScope();
     if (!scope) return;
     for (const auto& route : runtime_->router.snapshot(*scope).active) {
@@ -1848,7 +2010,7 @@ void DesktopSessionImBridge::publishCommittedOutput(const QString& session) {
                                                                   continuation.messageId, continuation.inputs, *scope,
                                                                   route.reservation.input.binding.workspaceKey);
             if (status != Router::Status::Ok && status != Router::Status::Duplicate) {
-                localTakeover(session);
+                cancelSessionInputs(session, false);
                 return;
             }
             lease->segments.emplace(
@@ -1874,7 +2036,11 @@ void DesktopSessionImBridge::publishCommittedOutput(const QString& session) {
                 if (part.id == text.partId)
                     if (const auto* value = std::get_if<MaiTextPart>(&part.body)) {
                         lease->sentParts.insert(text.partId);
-                        if (!QString::fromStdString(value->text).trimmed().isEmpty())
+                        // A persistent binding publishes the same typed commit
+                        // for both local and incoming-IM turns. Keep the input
+                        // ledger's exact receipts without sending a second copy.
+                        if (!runtime_->boundOutputs.contains(session) &&
+                            !QString::fromStdString(value->text).trimmed().isEmpty())
                             sendTextOutput(route.reservation.token, receipt->second,
                                            QString::fromStdString(value->text), true);
                         if (!lifetime) return;
@@ -1883,6 +2049,118 @@ void DesktopSessionImBridge::publishCommittedOutput(const QString& session) {
         }
         return;
     }
+}
+
+void DesktopSessionImBridge::publishBoundOutput(const QString& session) {
+    const auto watch = runtime_->boundOutputs.value(session);
+    if (!watch) return;
+    {
+        std::lock_guard<std::mutex> lock(watch->mutex);
+        if (watch->dispatching || watch->committed.empty()) return;
+    }
+    if (!runtime_->boundOutputCurrent(watch)) return;
+    const auto binding = runtime_->router.bindingForPeer(watch->binding.account, watch->binding.peerId);
+    if (!binding || binding->historyPending) return;
+    std::vector<InputReceipt::Text> texts;
+    {
+        std::lock_guard<std::mutex> lock(watch->mutex);
+        texts.swap(watch->committed);
+    }
+    const QPointer<DesktopSessionImBridge> lifetime(this);
+    for (std::size_t index = 0; index < texts.size(); ++index) {
+        const auto& text = texts[index];
+        if (!runtime_->boundOutputCurrent(watch, text.turnId, true, text.messageId)) continue;
+        {
+            std::lock_guard<std::mutex> lock(watch->mutex);
+            if (watch->sentParts.count(text.partId)) continue;
+        }
+        MaiMessage message;
+        if (!runtime_->controller.agent().getMessage(watch->binding.sessionId, text.messageId, message) ||
+            message.role != MaiRole::Assistant || message.contextImportOrigin)
+            continue;
+        for (const auto& part : message.parts) {
+            if (part.id != text.partId) continue;
+            const auto completion = [lifetime, watch, turn = text.turnId, message = text.messageId](
+                                        bool ok, const QString&, const RemoteIMSendReceipt&) {
+                if (!ok && lifetime && lifetime->runtime_->boundOutputCurrent(watch, turn, true, message))
+                    emit lifetime->relayError(QString::fromStdString(watch->binding.peerId),
+                                              QStringLiteral("一项阶段回复发送失败，系统不会自动重发。"));
+            };
+            if (text.media) {
+                QList<OutputMedia> media;
+                QString kind;
+                QString path;
+                if (const auto* image = std::get_if<MaiImagePart>(&part.body)) {
+                    kind = QStringLiteral("image");
+                    path = QString::fromStdString(image->path);
+                } else if (const auto* video = std::get_if<MaiVideoPart>(&part.body)) {
+                    kind = QStringLiteral("video");
+                    path = QString::fromStdString(video->path);
+                } else if (std::holds_alternative<MaiToolPart>(part.body)) {
+                    MaiMessage single;
+                    single.role = MaiRole::Assistant;
+                    single.parts.push_back(part);
+                    MaiSession owner;
+                    owner.id = watch->binding.sessionId;
+                    owner.directory = watch->binding.workspaceKey;
+                    QString error;
+                    media = deliveredMedia(single, owner, &error);
+                }
+                if (!path.isEmpty()) {
+                    const QFileInfo file(QDir(QString::fromStdString(watch->binding.workspaceKey)).absoluteFilePath(path));
+                    const auto mime = QMimeDatabase().mimeTypeForFile(file, QMimeDatabase::MatchContent).name();
+                    const auto limit = kind == QStringLiteral("image") ? 32ll * 1024 * 1024 : 1024ll * 1024 * 1024;
+                    if (file.isFile() && file.isReadable() && file.size() > 0 && file.size() <= limit &&
+                        mime.startsWith(kind + QLatin1Char('/')))
+                        media.append({file.canonicalFilePath(), kind, {}, QString::fromStdString(part.id)});
+                }
+                if (media.isEmpty()) break;
+                {
+                    std::lock_guard<std::mutex> lock(watch->mutex);
+                    watch->sentParts.insert(text.partId);
+                    watch->dispatching = true;
+                    // The ordinary SDK media preparation is asynchronous. Hold
+                    // later text/images behind it so both chat views preserve
+                    // the Session's order without a second transport path.
+                    watch->committed.insert(watch->committed.begin(), texts.begin() + index + 1, texts.end());
+                }
+                // A later model error does not retract a completed, visible
+                // media result. Only the binding, exact Stop/message or clear
+                // boundary can revoke an already committed output.
+                const auto canSend = [lifetime, watch, turn = text.turnId, message = text.messageId] {
+                    return lifetime && lifetime->runtime_->boundOutputCurrent(watch, turn, true, message);
+                };
+                const auto& item = media.front();
+                runtime_->app.sendMachineMediaTo(
+                    QString::fromStdString(watch->binding.peerId), item.path, item.type, item.caption, completion, canSend,
+                    {}, false, [lifetime, watch, session](bool) {
+                        {
+                            std::lock_guard<std::mutex> lock(watch->mutex);
+                            watch->dispatching = false;
+                        }
+                        if (lifetime)
+                            QMetaObject::invokeMethod(lifetime, [lifetime, session] {
+                                if (lifetime) lifetime->publishBoundOutput(session);
+                            }, Qt::QueuedConnection);
+                    });
+                return;
+            }
+            const auto* body = std::get_if<MaiTextPart>(&part.body);
+            if (!body || body->text.empty()) break;
+            {
+                std::lock_guard<std::mutex> lock(watch->mutex);
+                watch->sentParts.insert(text.partId);
+            }
+            const auto canSend = [lifetime, watch, turn = text.turnId, message = text.messageId] {
+                return lifetime && lifetime->runtime_->boundOutputCurrent(watch, turn, true, message);
+            };
+            runtime_->app.sendMachineTextTo(QString::fromStdString(watch->binding.peerId),
+                                           QString::fromStdString(body->text), completion, canSend);
+            if (!lifetime) return;
+            break;
+        }
+    }
+    if (lifetime) QTimer::singleShot(0, this, [this, session] { dispatch(session); });
 }
 
 void DesktopSessionImBridge::sendTextOutput(quint64 token, const Router::TurnReceipt& receipt, const QString& text,
@@ -1989,6 +2267,12 @@ void DesktopSessionImBridge::publishMedia(const QString& session, const QString&
             lease = runtime_->coreLeases.find(route.reservation.token);
             if (lease == runtime_->coreLeases.end()) return;
             if (lease->sentMedia.contains(item.partId)) continue;
+            if (const auto watch = runtime_->boundOutputs.value(session)) {
+                std::lock_guard<std::mutex> lock(watch->mutex);
+                if (watch->binding.epoch == route.reservation.input.binding.epoch &&
+                    watch->sentParts.count(item.partId.toStdString()))
+                    continue;
+            }
             const auto allocated =
                 runtime_->router.appendOutput(route.reservation.token, receipt, *scope, owner.directory, 1);
             if (allocated.status != Router::Status::Ok) return;
@@ -2140,6 +2424,7 @@ void DesktopSessionImBridge::resolveApproval(const QString& permissionId, const 
 void DesktopSessionImBridge::setActivity(const QString& session, int value) {
     const auto scope = runtime_->liveScope();
     if (!scope) return;
+    setBoundActivity(session, value);
     const auto now = QDateTime::currentMSecsSinceEpoch();
     for (const auto& route : runtime_->router.snapshot(*scope).active) {
         if (route.reservation.input.binding.sessionId != session.toStdString()) continue;
@@ -2161,10 +2446,55 @@ void DesktopSessionImBridge::setActivity(const QString& session, int value) {
     }
 }
 
+void DesktopSessionImBridge::setBoundActivity(const QString& session, int value) {
+    const auto watch = runtime_->boundOutputs.value(session);
+    if (!watch) return;
+    for (const auto& route : runtime_->router.snapshot(watch->binding.account).active) {
+        if (route.reservation.input.binding.sessionId != watch->binding.sessionId) continue;
+        const auto lease = runtime_->coreLeases.constFind(route.reservation.token);
+        if (lease != runtime_->coreLeases.constEnd() && lease->observed->valid) return;
+    }
+    if (!runtime_->boundOutputCurrent(watch)) return;
+    const auto turn = runtime_->controller.agent().activeTurnId(watch->binding.sessionId);
+    const auto now = QDateTime::currentMSecsSinceEpoch();
+    RemoteIMActivitySignal signal;
+    {
+        std::lock_guard<std::mutex> lock(watch->mutex);
+        const bool active = value >= 0 && !turn.empty() && !watch->blockedTurns.count(turn);
+        if (!active && !watch->activity.active) return;
+        const auto kind = static_cast<RemoteIMActivityKind>(qMax(0, value));
+        if (active && watch->activity.active && watch->activity.kind == kind &&
+            now - watch->lastActivityAt < 2000)
+            return;
+        if (active && (watch->turnId != turn || watch->activity.activityId.isEmpty())) {
+            watch->activity = {};
+            watch->activity.activityId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            watch->activity.taskStartedAtMs = now;
+        }
+        if (!turn.empty()) watch->turnId = turn;
+        if (active && (!watch->activity.active || watch->activity.kind != kind))
+            watch->activity.startedAtMs = now;
+        watch->activity.kind = kind;
+        watch->activity.active = active;
+        ++watch->activity.sequence;
+        watch->lastActivityAt = now;
+        signal = watch->activity;
+    }
+    // Reuse the existing activity control channel; no reasoning or tool body
+    // becomes a chat message and the selected IM conversation never changes.
+    if (runtime_->boundOutputCurrent(watch))
+        runtime_->app.client().sendActivity(QString::fromStdString(watch->binding.peerId), signal, {});
+}
+
 void DesktopSessionImBridge::heartbeatActivities() {
     const auto scope = runtime_->liveScope();
     if (!scope) return;
     const QPointer<DesktopSessionImBridge> lifetime(this);
+    const auto local = runtime_->boundOutputs;
+    for (auto it = local.cbegin(); it != local.cend(); ++it) {
+        setBoundActivity(it.key(), int(it.value()->activity.kind));
+        if (!lifetime) return;
+    }
     for (const auto& route : runtime_->router.snapshot(*scope).active) {
         const auto lease = runtime_->coreLeases.constFind(route.reservation.token);
         if (lease == runtime_->coreLeases.constEnd()) continue;
@@ -2179,6 +2509,8 @@ void DesktopSessionImBridge::finish(const QString& session) {
     const QPointer<DesktopSessionImBridge> lifetime(this);
     const auto scope = runtime_->liveScope();
     if (!scope || runtime_->controller.agent().isBusy(session.toStdString())) return;
+    setBoundActivity(session, -1);
+    if (!lifetime) return;
     publishCommittedOutput(session);
     if (!lifetime) return;
     std::optional<Router::ActiveRoute> route;
@@ -2197,7 +2529,10 @@ void DesktopSessionImBridge::finish(const QString& session) {
     const auto input = route->reservation.input;
     auto lease = runtime_->coreLeases.find(token);
     if (!runtime_->current(route->reservation) || lease == runtime_->coreLeases.end() || !lease->observed->valid) {
-        localTakeover(session);
+        // A queued completion can belong to the earlier IM turn while a new
+        // local turn has already started. Retire that input authority only;
+        // the persistent binding still owns both turns' committed output.
+        cancelSessionInputs(session, false);
         return;
     }
     if (lease->observed->failed) {

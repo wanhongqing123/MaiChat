@@ -40,6 +40,11 @@ public:
     MaiFfplayVideoDialog(const QString& displayName, std::shared_ptr<MaiCloudVod> source, QWidget* parent = nullptr);
     ~MaiFfplayVideoDialog() override;
 
+    // 正式打开入口：启动同一播放会话，取得真实视频尺寸后才首次显示窗口。
+    // 返回启动是否已接受，不代表首帧已呈现；解码失败会显示原有错误状态。
+    // 隐藏准备可由普通 close 取消，不阻塞 GUI 等待媒体或等待可见后的首帧。
+    bool prepareAndShow();
+
     static QPointer<MaiFfplayVideoDialog> activeDialog();
     bool sendCommand(const QString& command);
     bool seekPercent(double fraction);
@@ -91,6 +96,7 @@ private:
     static void setFullscreen(void* userData, int enabled);
     static void showWindow(void* userData);
     bool startPlayback();
+    void finishPreparedShow();
     void stopPlayback(bool cancelCloudSource = false);
     void saveCopy();
     void updatePlayButton();
@@ -136,6 +142,10 @@ private:
     void* nativeView_ = nullptr;
     uint64_t viewId_ = 0;
     bool started_ = false;
+    bool initialShowPending_ = false;
+    bool initialPresentationDone_ = false;
+    // GUI 变更、worker 快照；旧排队尺寸/标题/全屏回调不得恢复已取消或被替换的打开。
+    std::atomic<uint64_t> playbackOpenGeneration_{0};
     bool playing_ = true;
     // 倍速重建后须等新会话实际呈现首帧，再恢复暂停，不能按固定延时冻结未初始化的时钟。
     bool pauseAfterFirstFrame_ = false;
@@ -187,12 +197,13 @@ private:
     bool requestedFullscreen_ = false;
     // AppKit 的全屏转场结束前保留窗口，避免销毁原生窗口打断整个 Space 转场。
     bool closeAfterFullscreen_ = false;
+    bool closingOpacitySuppressed_ = false;
+    qreal opacityBeforeClosing_ = 1.0;
     bool hasPendingWindowedState_ = false;
     bool pendingWindowedMaximized_ = false;
     bool minimizeAfterFullscreen_ = false;
     std::unique_ptr<MaiMacVideoPlayback> macPlayback_;
     std::atomic<bool> macPlaybackRequested_{false};
-    uint64_t playbackOpenGeneration_ = 0;
 #endif
     std::function<void(const QString&)> forwardAction_;
 };

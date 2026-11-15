@@ -48,6 +48,8 @@
 #include <variant>
 
 #include "MaiSqliteStore.h"
+#include "MaiIMHistoryFormat.h"
+#include "MaiSessionTitler.h"
 #include "agent/AgentChatPanel.h"
 #include "agent/AgentController.h"
 #include "agent/AgentSessionList.h"
@@ -717,6 +719,9 @@ private slots:
     void audioArtifactUsesCompactPlaybackCard();
     void inlineAudioPausesWhenSwitchingSessions();
     void quotedMessageIsSentAndShownInTheComposer();
+    void importedHistoryShowsPassiveOriginalTextAcrossRestore();
+    void importedHistoryUnavailableNeverShowsInternalEnvelope();
+    void ordinaryHistoryLookalikeRemainsLiveUserText();
     void remotePromptAppearsInOpenOwnerSession();
     void localPromptKeepsOneBubbleAfterUserMessageEvent();
 };
@@ -1216,6 +1221,150 @@ void AgentPanelSessionTest::quotedMessageIsSentAndShownInTheComposer() {
                 if (const auto* quoted = std::get_if<MaiQuotePart>(&part.body))
                     saved |= QString::fromStdString(quoted->messageId) == quotedId;
     QVERIFY(saved);
+}
+
+void AgentPanelSessionTest::importedHistoryShowsPassiveOriginalTextAcrossRestore() {
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    const QString referenced = workspace.filePath(QStringLiteral("metadata-only-reference.png"));
+    const QString mentioned = workspace.filePath(QStringLiteral("historical-text-reference.png"));
+    QImage image(2, 2, QImage::Format_ARGB32);
+    image.fill(Qt::blue);
+    QVERIFY(image.save(referenced));
+    QVERIFY(image.save(mentioned));
+    AgentController controller(std::make_unique<SilentModel>(), QString());
+    MaiIMHistorySource source;
+    source.profile = MaiIMHistoryProfile::Desktop;
+    source.ownerUserId = "owned-history-owner";
+    source.peerUserId = "owned-history-peer";
+    source.provenance = "owner_only_legacy";
+    source.coverage = "local_persisted";
+    MaiIMHistoryRecord original;
+    original.rowId = "owned-history-row";
+    original.fromUserId = source.ownerUserId;
+    original.toUserId = source.peerUserId;
+    original.direction = MaiIMHistoryDirection::Outgoing;
+    original.createdAtMillis = 123456789;
+    original.kind = "text";
+    original.text = std::string("Owned original message\nSecond line\n") +
+                    R"(literal \n remains literal)" + "\n" + mentioned.toUtf8().toStdString();
+    original.media.push_back({"image", "metadata-only-reference.png", "image/png",
+                              referenced.toUtf8().toStdString(), {}, 4, 0, 2, 2, true, false});
+    const auto formatted = maiFormatIMHistoryContextRecord(original, source);
+    QVERIFY(formatted);
+    const auto oldTitle = MaiSessionTitler{}.makeTitle(formatted.value().text);
+    const QString session = controller.createSession(workspace.path(), QString::fromStdString(oldTitle));
+    const auto begun = controller.agent().beginContextImport(
+        {session.toStdString(), "im:" + std::string(64, 'a'), "owned-history-snapshot", "Owned history"});
+    QVERIFY(begun);
+    std::vector<MaiContextImportRecord> history{formatted.value()};
+    for (int index = 1; index < 40; ++index) {
+        auto extra = original;
+        extra.rowId = "owned-extra-history-" + std::to_string(index);
+        extra.text = "Owned older background message";
+        extra.kind = "text";
+        extra.media.clear();
+        const auto record = maiFormatIMHistoryContextRecord(extra, source);
+        QVERIFY(record);
+        history.push_back(record.value());
+    }
+    QVERIFY(controller.agent().appendContextImport(begun.value().importId, 0, history));
+    QVERIFY(controller.agent().commitContextImport(begun.value().importId));
+    const auto stored = controller.agent().listMessages(session.toStdString());
+    QCOMPARE(stored.size(), std::size_t(40));
+    const QString id = QString::fromStdString(stored.front().id);
+    const std::string modelEnvelope = stored.front().text();
+    QVERIFY(modelEnvelope.find("Imported conversation context.") == 0);
+    AgentChatPanel panel(controller);
+    panel.resize(850, 650);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    panel.openSession(session);
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    view->selectAll();
+    const QString shown = view->selectedText();
+    QVERIFY(shown.contains(QStringLiteral("Owned original message\nSecond line")));
+    QVERIFY(shown.contains(QStringLiteral("literal \\n remains literal")));
+    QVERIFY(!shown.contains(QStringLiteral("Imported conversation context.")));
+    QVERIFY(!shown.contains(QStringLiteral("historical_record")));
+    QVERIFY(!shown.contains(QStringLiteral("owner_user_id")));
+    QVERIFY(!shown.contains(referenced));
+    QVERIFY(panel.findChildren<QPushButton*>(QStringLiteral("agentTextMediaBubble")).isEmpty());
+    for (auto* quote : panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")))
+        QVERIFY(quote->property("messageId").toString() != id);
+    const QString other = controller.createSession(workspace.path());
+    panel.openSession(other);
+    panel.openSession(session);
+    view->selectAll();
+    QVERIFY(!view->selectedText().contains(QStringLiteral("Imported conversation context.")));
+    MaiMessage unchanged;
+    QVERIFY(controller.agent().getMessage(session.toStdString(), stored.front().id, unchanged));
+    QCOMPARE(unchanged.text(), modelEnvelope);
+    QCOMPARE(unchanged.role, MaiRole::User);
+    AgentSessionList sessions(controller);
+    connect(&controller, &AgentController::sessionStructureChanged, &sessions, &AgentSessionList::refresh);
+    sessions.refresh();
+    auto* rows = sessions.findChild<QListWidget*>();
+    QVERIFY(rows);
+    const auto projected = [&] {
+        for (int index = 0; index < rows->count(); ++index)
+            if (rows->item(index)->data(Qt::UserRole).toString() == session)
+                return rows->item(index)->text() == QStringLiteral("新对话");
+        return false;
+    };
+    QTRY_VERIFY(projected());
+    MaiSession unchangedSession;
+    QVERIFY(controller.agent().getSession(session.toStdString(), unchangedSession));
+    QCOMPARE(unchangedSession.title, oldTitle);
+    view->verticalScrollBar()->setValue(0);
+    QVERIFY(captureAgentFixture(panel, QStringLiteral("imported-history-passive-display")));
+    QVERIFY(controller.sendPrompt(session, QStringLiteral("First actual current request")));
+    controller.agent().waitIdle();
+    const auto liveTitle = [&] {
+        for (int index = 0; index < rows->count(); ++index)
+            if (rows->item(index)->data(Qt::UserRole).toString() == session)
+                return rows->item(index)->text() == QStringLiteral("First actual current request");
+        return false;
+    };
+    QTRY_VERIFY(liveTitle());
+    QVERIFY(controller.agent().getSession(session.toStdString(), unchangedSession));
+    QCOMPARE(unchangedSession.title, oldTitle);
+}
+
+void AgentPanelSessionTest::importedHistoryUnavailableNeverShowsInternalEnvelope() {
+    AgentController controller(std::make_unique<SilentModel>(), QString());
+    const QString session = controller.createSession(QDir::currentPath());
+    const auto begun = controller.agent().beginContextImport(
+        {session.toStdString(), "im:" + std::string(64, 'b'), "owned-bad-history", "Owned history"});
+    QVERIFY(begun);
+    const std::string raw = "Imported conversation context. INTERNAL-BROKEN-RECORD";
+    QVERIFY(controller.agent().appendContextImport(begun.value().importId, 0, {{"owned-invalid", raw, 1}}));
+    QVERIFY(controller.agent().commitContextImport(begun.value().importId));
+    AgentChatPanel panel(controller);
+    panel.openSession(session);
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    view->selectAll();
+    QVERIFY(!view->selectedText().contains(QStringLiteral("INTERNAL-BROKEN-RECORD")));
+    QVERIFY(!view->selectedText().contains(QStringLiteral("Imported conversation context.")));
+    QVERIFY(!view->isEmpty());
+    QVERIFY(panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")).isEmpty());
+}
+
+void AgentPanelSessionTest::ordinaryHistoryLookalikeRemainsLiveUserText() {
+    AgentController controller(std::make_unique<SilentModel>(), QString());
+    const QString session = controller.createSession(QDir::currentPath());
+    const std::string raw = "Imported conversation context. {\"historical_record\":{\"text\":\"not an import\"}}";
+    QVERIFY(controller.sendPrompt(session, QString::fromStdString(raw)));
+    controller.agent().waitIdle();
+    AgentChatPanel panel(controller);
+    panel.openSession(session);
+    auto* view = panel.findChild<MarkdownView*>();
+    QVERIFY(view);
+    view->selectAll();
+    QVERIFY(view->selectedText().contains(QStringLiteral("Imported conversation context.")));
+    QVERIFY(!panel.findChildren<QPushButton*>(QStringLiteral("agentQuoteAction")).isEmpty());
 }
 
 void AgentPanelSessionTest::newSessionAvoidsFilesystemRoot() {

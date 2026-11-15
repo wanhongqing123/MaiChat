@@ -36,6 +36,7 @@
 #include "MaiTool.h"
 #include "MaiIdGenerator.h"
 #include "MaiSqliteStore.h"
+#include "MaiIMHistoryFormat.h"
 #include "MaiSessionSchedule.h"
 #include "MaiChatTools/DesktopRemoteSessionTools.h"
 #include "agent/AgentController.h"
@@ -275,6 +276,8 @@ private slots:
     void remotePromptCreatesScheduledTaskOnItsOwner();
     void resolvedSessionFileStaysInsideItsOwnerWorkspace();
     void omitsLocalMediaPathsFromRemoteHistory();
+    void importedHistorySnapshotExposesOnlyDisplayProjection();
+    void malformedImportedHistorySnapshotFailsToSafePlaceholder();
     void projectsOnlySafeCurlFailureSummaries_data();
     void projectsOnlySafeCurlFailureSummaries();
     void remoteToolDetailReadsPersistedFieldsWithoutExecuting();
@@ -1890,6 +1893,119 @@ void DesktopSessionSyncHostTest::coordinatorModelCommandKeepsOwnerTupleAndReject
                                   [&](const QJsonObject&, const QString& failure) { error = failure; });
     QVERIFY(!error.isEmpty());
     QCOMPARE(sent.size(), 1);
+}
+
+void DesktopSessionSyncHostTest::importedHistorySnapshotExposesOnlyDisplayProjection() {
+    QTemporaryDir workspace;
+    QVERIFY(workspace.isValid());
+    const QString database = workspace.filePath(QStringLiteral("owned-history-display.sqlite"));
+    AgentController::ModelConfig model;
+    AgentController controller(model, database);
+    const QString session = controller.createSession({});
+    MaiIMHistorySource source;
+    source.profile = MaiIMHistoryProfile::Desktop;
+    source.ownerUserId = "owned-owner";
+    source.peerUserId = "owned-peer";
+    source.provenance = "owner_only_legacy";
+    source.coverage = "local_persisted";
+    MaiIMHistoryRecord record;
+    record.rowId = "owned-display-row";
+    record.fromUserId = source.peerUserId;
+    record.toUserId = source.ownerUserId;
+    record.direction = MaiIMHistoryDirection::Incoming;
+    record.createdAtMillis = 42;
+    record.kind = "file";
+    record.text = "Owned original text\nSecond line; literal \\n";
+    record.quote = MaiIMHistoryQuote{"original-not-core-message", "quoted-owner", "Quoted digest", "text"};
+    record.media.push_back({"file", "metadata-only.bin", "application/octet-stream",
+                            "/never-read/owned-private-file.bin", "/never-read/owned-private-cover.png",
+                            UINT64_C(9007199254740993), 0, 0, 0, true, false});
+    const auto formatted = maiFormatIMHistoryContextRecord(record, source);
+    QVERIFY(formatted);
+    const auto begun = controller.agent().beginContextImport(
+        {session.toStdString(), "im:" + std::string(64, 'c'), "owned-display-snapshot", "Owned history"});
+    QVERIFY(begun);
+    QVERIFY(controller.agent().appendContextImport(begun.value().importId, 0, {formatted.value()}));
+    QVERIFY(controller.agent().commitContextImport(begun.value().importId));
+    const auto originals = controller.agent().listMessages(session.toStdString());
+    QCOMPARE(originals.size(), std::size_t(1));
+    DesktopSessionSyncHost host(controller);
+    const auto assertProjection = [&](const QJsonObject& shown) {
+        QCOMPARE(shown.value(QStringLiteral("id")).toString(), QString::fromStdString(originals.front().id));
+        QCOMPARE(shown.value(QStringLiteral("role")).toString(), QStringLiteral("user"));
+        const auto parts = shown.value(QStringLiteral("parts")).toArray();
+        QCOMPARE(parts.size(), 1);
+        QCOMPARE(parts.first().toObject().value(QStringLiteral("id")).toString(),
+                 QString::fromStdString(originals.front().parts.front().id));
+        QCOMPARE(parts.first().toObject().value(QStringLiteral("kind")).toString(), QStringLiteral("text"));
+        QCOMPARE(parts.first().toObject().value(QStringLiteral("text")).toString(), QString::fromStdString(record.text));
+        const auto hint = shown.value(QStringLiteral("historyDisplay")).toObject();
+        QCOMPARE(hint.value(QStringLiteral("state")).toString(), QStringLiteral("available"));
+        QVERIFY(hint.value(QStringLiteral("readOnly")).toBool());
+        QCOMPARE(hint.value(QStringLiteral("direction")).toString(), QStringLiteral("incoming"));
+        QCOMPARE(hint.value(QStringLiteral("quote")).toObject().value(QStringLiteral("digest")).toString(),
+                 QStringLiteral("Quoted digest"));
+        const auto media = hint.value(QStringLiteral("media")).toArray();
+        QCOMPARE(media.size(), 1);
+        QCOMPARE(media.first().toObject().value(QStringLiteral("sizeBytes")).toString(), QStringLiteral("9007199254740993"));
+        const QByteArray wire = QJsonDocument(shown).toJson(QJsonDocument::Compact);
+        QVERIFY(!wire.contains("Imported conversation context."));
+        QVERIFY(!wire.contains("historical_record"));
+        QVERIFY(!wire.contains("/never-read/"));
+        QVERIFY(!wire.contains("owner_user_id"));
+        QVERIFY(!wire.contains("stored_status"));
+    };
+    const auto page = host.historyPage(session, {}, 20).value(QStringLiteral("messages")).toArray();
+    QCOMPARE(page.size(), 1);
+    assertProjection(page.first().toObject());
+    assertProjection(host.historyMessage(session, QString::fromStdString(originals.front().id)));
+    MaiMessage unchanged;
+    QVERIFY(controller.agent().getMessage(session.toStdString(), originals.front().id, unchanged));
+    QCOMPARE(unchanged.text(), formatted.value().text);
+
+    MaiMessage live;
+    live.id = MaiIdGenerator::newMessageId();
+    live.created = live.completed = 43;
+    live.parts.push_back({MaiIdGenerator::newPartId(), MaiTextPart{formatted.value().text}, 43});
+    {
+        auto store = makeMaiSqliteStore(database.toStdString());
+        QVERIFY(store);
+        store.value()->putMessage(session.toStdString(), live);
+        QVERIFY(!store.value()->lastWriteError().hasError());
+    }
+    const auto all = host.historyPage(session, {}, 20).value(QStringLiteral("messages")).toArray();
+    bool sawLive = false;
+    for (const auto& value : all) {
+        const auto message = value.toObject();
+        if (message.value(QStringLiteral("id")).toString() == QString::fromStdString(originals.front().id)) continue;
+        sawLive |= !message.contains(QStringLiteral("historyDisplay")) &&
+                   message.value(QStringLiteral("parts")).toArray().first().toObject()
+                       .value(QStringLiteral("text")).toString() == QString::fromStdString(formatted.value().text);
+    }
+    QVERIFY(sawLive);
+}
+
+void DesktopSessionSyncHostTest::malformedImportedHistorySnapshotFailsToSafePlaceholder() {
+    AgentController::ModelConfig model;
+    AgentController controller(model, {});
+    const QString session = controller.createSession({});
+    const auto begun = controller.agent().beginContextImport(
+        {session.toStdString(), "im:" + std::string(64, 'd'), "owned-malformed-display", "Owned history"});
+    QVERIFY(begun);
+    QVERIFY(controller.agent().appendContextImport(begun.value().importId, 0,
+        {{"owned-invalid-row", "INTERNAL-UNAVAILABLE-WRAPPER", 1}}));
+    QVERIFY(controller.agent().commitContextImport(begun.value().importId));
+    DesktopSessionSyncHost host(controller);
+    const auto messages = host.historyPage(session, {}, 20).value(QStringLiteral("messages")).toArray();
+    QCOMPARE(messages.size(), 1);
+    const auto shown = messages.first().toObject();
+    QCOMPARE(shown.value(QStringLiteral("historyDisplay")).toObject().value(QStringLiteral("state")).toString(),
+             QStringLiteral("unavailable"));
+    const auto parts = shown.value(QStringLiteral("parts")).toArray();
+    QCOMPARE(parts.size(), 1);
+    QCOMPARE(parts.first().toObject().value(QStringLiteral("kind")).toString(), QStringLiteral("text"));
+    QVERIFY(!parts.first().toObject().value(QStringLiteral("text")).toString().isEmpty());
+    QVERIFY(!QJsonDocument(shown).toJson(QJsonDocument::Compact).contains("INTERNAL-UNAVAILABLE-WRAPPER"));
 }
 
 void DesktopSessionSyncHostTest::appliesRemotePromptToTheExistingLocalSession() {

@@ -1236,8 +1236,14 @@ void test_history_index_recovery_preserves_failure_guards() {
                                       : mode == 2              ? MaiErrorCode::Canceled
                                       : mode == 3              ? MaiErrorCode::Internal
                                       : mode >= 4 && mode <= 7 ? MaiErrorCode::Busy
+                                      : mode == 8              ? MaiErrorCode::InvalidInput
                                                                : MaiErrorCode::Protocol;
                 CHECK(result.error().code() == expected);
+                if (mode == 8) {
+                    CHECK(model.requests().empty());
+                    CHECK(result.error().message().find("current instruction") !=
+                          std::string::npos);
+                }
             }
         }
     }
@@ -2899,9 +2905,275 @@ void test_summary_format_retry_guards() {
     CHECK(maiContextSourceFingerprint(id, store->listMessages(id), history.size()) == fingerprint);
 }
 
+void test_summary_format_and_size_share_one_retry_budget() {
+    std::puts(
+        "   format and valid-oversize failures share two attempts without replaying bad text");
+    auto oversized = Json::parse(summaryJson());
+    oversized["source_notes"] = {"UNACCEPTED_SIZE_RESPONSE_" + std::string(1700, 's')};
+    for (int mode = 0; mode < 4; ++mode) {
+        auto store = makeMaiMemoryStore();
+        const auto id = newSession(*store);
+        populateSoftHistory(*store, id);
+        const auto history = store->listMessages(id);
+        const auto fingerprint = maiContextSourceFingerprint(id, history, history.size());
+        SummaryModel model;
+        model.limits = {8192, 1024};
+        model.interleave = [&](int call) {
+            if (call == 1)
+                model.response = mode == 0 ? "not JSON" : oversized.dump();
+            else
+                model.response = mode == 1   ? "not JSON"
+                                 : mode == 2 ? summaryJson()
+                                             : oversized.dump();
+        };
+        auto input = request();
+        input.reasoningEffort = "high";
+        input.messages = MaiContextBuilder{}.build(history);
+        const std::atomic<bool> cancel{false};
+        const auto prepared = MaiContextCompactor{}.prepare(*store, model, MaiContextBuilder{}, id,
+                                                            history, input, cancel);
+        CHECK(prepared);
+        const auto attempts = model.requests();
+        CHECK(attempts.size() == 2);
+        for (const auto& attempt : attempts) {
+            CHECK(attempt.reasoningEffort == "high" && attempt.maxOutputTokens == 1024);
+            CHECK(requestSnapshot(attempt).find("UNACCEPTED_SIZE_RESPONSE_") == std::string::npos);
+        }
+        if (prepared) {
+            CHECK(prepared.value().advancedCheckpoint == (mode == 2));
+            if (mode != 2) {
+                CHECK(prepared.value().deferredCompaction);
+                CHECK(requestSnapshot(prepared.value().request) == requestSnapshot(input));
+            }
+        }
+        CHECK(maiContextSourceFingerprint(id, store->listMessages(id), history.size()) ==
+              fingerprint);
+    }
+}
+
+void test_metadata_history_index_is_bounded_by_the_assembled_request() {
+    std::puts(
+        "   metadata-only fallback stays bounded while omitted originals remain exactly readable");
+    auto store = makeMaiMemoryStore();
+    const auto id = newSession(*store);
+    MaiMessage omitted;
+    for (int index = 0; index < 300; ++index) {
+        const std::string text =
+            "Original user source " + std::to_string(index) + ": " + std::string(400, 'u');
+        appendRound(*store, id, text);
+        if (index == 250) omitted = store->listMessages(id)[500];
+    }
+    const auto current =
+        message(MaiRole::User, "CURRENT_USER_REMAINS_COMPLETE: continue the saved work.");
+    store->putMessage(id, current);
+    const auto history = store->listMessages(id);
+    const auto fingerprint = maiContextSourceFingerprint(id, history, history.size());
+    SummaryModel model;
+    model.limits = {16384, 2048};
+    model.response = "not JSON";
+    MaiContextCompactor::Options options;
+    options.allowHistoryIndexRecovery = true;
+    const std::atomic<bool> cancel{false};
+    const auto prepared = MaiContextCompactor(options).prepare(*store, model, MaiContextBuilder{},
+                                                               id, history, request(), cancel);
+    CHECK(prepared && prepared.value().advancedCheckpoint &&
+          prepared.value().usedHistoryIndexRecovery);
+    CHECK(model.requests().size() == 2);
+    if (prepared) {
+        CHECK(prepared.value().inputEstimate.tokens <= 13312);
+        CHECK(requestSnapshot(prepared.value().request).find(current.text()) != std::string::npos);
+    }
+    MaiContextCheckpoint checkpoint;
+    CHECK(store->getContextCheckpoint(id, checkpoint));
+    bool partialMetadata = false;
+    const auto summary = Json::parse(checkpoint.summary, nullptr, false);
+    if (summary.is_object()) {
+        for (const auto& note : summary["source_notes"]) {
+            const auto record = Json::parse(note.get<std::string>(), nullptr, false);
+            if (record.is_object() &&
+                record.value("type", std::string{}) == "host_source_metadata_index") {
+                partialMetadata = record.value("has_more", false);
+                CHECK(record["included_records"] < record["total_records"]);
+            }
+        }
+    }
+    CHECK(partialMetadata);
+    MaiConversationHistoryQuery query;
+    query.messageId = omitted.id;
+    query.partId = omitted.parts.front().id;
+    query.maxBytes = 1024;
+    const auto original = maiReadConversationHistory(*store, id, query);
+    CHECK(original && original.value().excerpts.size() == 1);
+    if (original && original.value().excerpts.size() == 1)
+        CHECK(original.value().excerpts.front().text == omitted.text());
+    CHECK(maiContextSourceFingerprint(id, store->listMessages(id), history.size()) == fingerprint);
+}
+
+void test_oversized_summary_recovery_continues_the_same_runner() {
+    std::puts("   over-budget semantic summaries cannot strand a recoverable persisted task");
+    auto store = makeMaiMemoryStore();
+    auto* rawStore = store.get();
+    const auto id = newSession(*store);
+    store->mutateSession(id, [](MaiSession& session) {
+        session.directory = MaiFileSystem::temporaryDirectory().toUtf8();
+    });
+    const auto earlier = message(
+        MaiRole::User, std::string(48000, 'u') + "EXACT_OLDER_USER_CONSTRAINT_DO_NOT_REPLAY");
+    store->putMessage(id, earlier);
+    auto completed = message(MaiRole::Assistant, "The earlier action already ran.");
+    completed.parts.push_back(
+        {MaiIdGenerator::newPartId(),
+         MaiToolPart{"owned_already_executed", "owned_already_executed_call", "{}",
+                     std::string(58000, 'r') + "EXACT_PERSISTED_TOOL_RESULT", "",
+                     MaiToolState::Completed},
+         1});
+    store->putMessage(id, completed);
+    const auto current = message(MaiRole::User, "CURRENT_USER_MUST_STAY_COMPLETE: continue once.");
+    store->putMessage(id, current);
+    auto assistant = message(MaiRole::Assistant, {});
+    assistant.parts.clear();
+    assistant.completed = 0;
+    store->putMessage(id, assistant);
+    const auto original = store->listMessages(id);
+    const auto fingerprint = maiContextSourceFingerprint(id, original, original.size());
+    MaiAgent agent(std::move(store), nullptr);
+    MaiToolRegistry registry;
+    registerMaiSessionTools(registry, false);
+    class OversizeModel final : public MaiModelClient {
+    public:
+        int summaries = 0;
+        int mainCalls = 0;
+        bool readOriginalUser = false;
+        bool readOriginalTool = false;
+        MaiWireApi wireApi() const override {
+            return MaiWireApi::Responses;
+        }
+        MaiModelContextLimits contextLimits(const std::string&) const override {
+            return {16384, 2048};
+        }
+        MaiError stream(const MaiModelRequest& input, const MaiStreamSink& sink,
+                        const std::atomic<bool>&) override {
+            if (input.baseInstructions.find("Summarize earlier conversation") !=
+                std::string::npos) {
+                ++summaries;
+                // Valid JSON and below generation allowance, but above the accepted summary budget.
+                auto oversized = Json::parse(summaryJson());
+                oversized["source_notes"] = {"UNACCEPTED_OVER_BUDGET_" + std::string(4500, 's')};
+                sink.onText(oversized.dump());
+                return {};
+            }
+            ++mainCalls;
+            CHECK(estimateInputTokens(input).tokens <= 13312);
+            const auto snapshot = requestSnapshot(input);
+            CHECK(snapshot.find("CURRENT_USER_MUST_STAY_COMPLETE: continue once.") !=
+                  std::string::npos);
+            CHECK(snapshot.find("UNACCEPTED_OVER_BUDGET_") == std::string::npos);
+            if (mainCalls == 1) {
+                std::string userMessage, userPart, toolMessage, toolPart;
+                for (const auto& item : input.messages) {
+                    const auto data = Json::parse(item.content, nullptr, false);
+                    if (!data.is_object() || !data.contains("summary")) continue;
+                    for (const auto& note : data["summary"]["source_notes"]) {
+                        const auto record = Json::parse(note.get<std::string>(), nullptr, false);
+                        if (!record.is_object() || !record.contains("source")) continue;
+                        const auto& source = record["source"];
+                        if (source.value("role", std::string{}) == "user") {
+                            userMessage = source.value("message_id", std::string{});
+                            userPart = source.value("part_id", std::string{});
+                        }
+                        if (source.value("call_id", std::string{}) ==
+                            "owned_already_executed_call") {
+                            CHECK(source.value("state", std::string{}) == "completed");
+                            toolMessage = source.value("message_id", std::string{});
+                            toolPart = source.value("part_id", std::string{});
+                        }
+                    }
+                }
+                CHECK(!userMessage.empty() && !userPart.empty());
+                CHECK(!toolMessage.empty() && !toolPart.empty());
+                if (userMessage.empty() || toolMessage.empty()) return {};
+                sink.onToolCall({"read_original_user", "session_history",
+                                 Json{{"message_id", userMessage},
+                                      {"part_id", userPart},
+                                      {"field", "text"},
+                                      {"offset_bytes", 48000},
+                                      {"max_bytes", 64}}
+                                     .dump()});
+                sink.onToolCall({"read_original_tool", "session_history",
+                                 Json{{"message_id", toolMessage},
+                                      {"part_id", toolPart},
+                                      {"field", "tool_output"},
+                                      {"offset_bytes", 58000},
+                                      {"max_bytes", 64}}
+                                     .dump()});
+                return {};
+            }
+            for (const auto& item : input.messages) {
+                if (item.toolCallId == "read_original_user" &&
+                    item.content.find("EXACT_OLDER_USER_CONSTRAINT_DO_NOT_REPLAY") !=
+                        std::string::npos)
+                    readOriginalUser = true;
+                if (item.toolCallId == "read_original_tool" &&
+                    item.content.find("EXACT_PERSISTED_TOOL_RESULT") != std::string::npos)
+                    readOriginalTool = true;
+            }
+            CHECK(readOriginalUser && readOriginalTool);
+            sink.onText("Continued from exact persisted user and tool evidence.");
+            return {};
+        }
+    } model;
+    MaiContextBuilder builder;
+    MaiEventBus bus;
+    MaiEventEmitter emitter(bus);
+    int errors = 0;
+    const auto token = bus.subscribe([&](const MaiEvent& event) {
+        if (event.type == MaiEventType::SessionError) ++errors;
+    });
+    MaiTurnRunner::Dependencies dependencies;
+    dependencies.store = rawStore;
+    dependencies.model = &model;
+    dependencies.tools = &registry;
+    dependencies.context = &builder;
+    dependencies.emitter = &emitter;
+    dependencies.sessionAgent = &agent;
+    dependencies.defaultModel = "fixture";
+    dependencies.baseInstructions = "Continue the actual user task without repeating actions.";
+    MaiTurnRunner runner(dependencies, id, assistant);
+    const std::atomic<bool> cancel{false};
+    runner.run(cancel);
+    bus.unsubscribe(token);
+    CHECK(runner.succeeded() && errors == 0);
+    CHECK(model.summaries == 2 && model.mainCalls == 2);
+    CHECK(model.readOriginalUser && model.readOriginalTool);
+    MaiMessage saved;
+    CHECK(rawStore->getMessage(id, assistant.id, saved));
+    CHECK(saved.text() == "Continued from exact persisted user and tool evidence.");
+    CHECK(rawStore->getMessage(id, earlier.id, saved) && saved.text() == earlier.text());
+    CHECK(rawStore->getMessage(id, completed.id, saved) &&
+          std::get<MaiToolPart>(saved.parts.back().body).output ==
+              std::get<MaiToolPart>(completed.parts.back().body).output);
+    const auto after = rawStore->listMessages(id);
+    CHECK(maiContextSourceFingerprint(id, after, original.size() - 1) ==
+          maiContextSourceFingerprint(id, original, original.size() - 1));
+    CHECK(!fingerprint.empty());
+    std::printf("     oversized summaries=%d main=%d errors=%d exact-user=%d exact-tool=%d\n",
+                model.summaries, model.mainCalls, errors, model.readOriginalUser,
+                model.readOriginalTool);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--summary-budget-guards") {
+        test_summary_format_and_size_share_one_retry_budget();
+        test_metadata_history_index_is_bounded_by_the_assembled_request();
+        test_history_index_recovery_preserves_failure_guards();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--summary-budget-recovery") {
+        test_oversized_summary_recovery_continues_the_same_runner();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--index-capacity") {
         test_history_index_preserves_long_user_text_within_the_real_request_budget();
         return failures == 0 ? 0 : 1;
@@ -2948,6 +3220,9 @@ int main(int argc, char** argv) {
     test_soft_defer_continues_one_runner_without_replaying_tools();
     test_summary_format_through_real_wire();
     test_summary_format_retry_guards();
+    test_oversized_summary_recovery_continues_the_same_runner();
+    test_summary_format_and_size_share_one_retry_budget();
+    test_metadata_history_index_is_bounded_by_the_assembled_request();
     test_compaction_keeps_frozen_effort_and_glm_tool_reasoning();
     test_empty_history_with_oversized_instructions_or_tools();
     test_group_observation_provenance_uses_bounded_exact_range();

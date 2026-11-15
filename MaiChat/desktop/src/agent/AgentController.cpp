@@ -10,6 +10,7 @@
 #include "MaiArkMediaTools.h"
 #include "MaiGlmMediaTools.h"
 #include "MaiMemoryStore.h"
+#include "MaiIMHistoryFormat.h"
 #include "MaiMiniMaxMediaTools.h"
 #include "MaiModelStudioTools.h"
 #include "MaiOpenAiClient.h"
@@ -242,6 +243,19 @@ struct AgentController::Runtime {
     // 只有主线程碰它：所有事件都排队到主线程之后才分类。
     QHash<QString, QHash<QString, PartKind>> partKindsBySession;
     QHash<QString, QHash<QString, QString>> livePartTextBySession;
+    struct TitleRead {
+        MaiSession snapshot;
+        std::string before;
+        std::optional<MaiMessage> firstUser;
+        std::optional<MaiMessage> firstLiveUser;
+        bool restartIfEmpty = false;
+    };
+    struct TitleDisplay {
+        std::string storedTitle;
+        std::string text;
+    };
+    QHash<QString, TitleRead> titleReads;
+    QHash<QString, TitleDisplay> titleDisplays;
     // 旧空值只继承初始默认；改未来默认不能重新解释已有会话。
     const QString initialDefaultModel;
     const QString initialDefaultReasoningEffort;
@@ -605,6 +619,60 @@ MaiAgent& AgentController::agent() {
     return *runtime_->agent;
 }
 
+QString AgentController::sessionDisplayTitle(const MaiSession& session) {
+    const auto id = fromUtf8(session.id);
+    if (!maiNeedsIMHistoryTitleProjection(session)) {
+        runtime_->titleDisplays.remove(id);
+        return fromUtf8(session.title);
+    }
+    const auto cached = runtime_->titleDisplays.constFind(id);
+    if (cached != runtime_->titleDisplays.constEnd() && cached->storedTitle == session.title)
+        return fromUtf8(cached->text);
+    if (!runtime_->titleReads.contains(id) && runtime_->titleReads.size() < 4) {
+        runtime_->titleReads.insert(id, Runtime::TitleRead{session});
+        QTimer::singleShot(0, this, [this, id] { advanceSessionDisplayTitle(id); });
+    }
+    return {};
+}
+
+void AgentController::advanceSessionDisplayTitle(const QString& id) {
+    auto found = runtime_->titleReads.find(id);
+    if (found == runtime_->titleReads.end()) return;
+    // Do not scan a long imported conversation in one UI callback. The two
+    // oldest User candidates are sufficient for the shared identity check.
+    const auto page = agent().listMessagesPage(found->snapshot.id, found->before, 16);
+    const auto firstUser = std::find_if(page.rbegin(), page.rend(), [](const MaiMessage& message) {
+        return message.role == MaiRole::User;
+    });
+    if (firstUser != page.rend()) found->firstUser = *firstUser;
+    const auto firstLive = std::find_if(page.rbegin(), page.rend(), [](const MaiMessage& message) {
+        return message.role == MaiRole::User && !message.contextImportOrigin;
+    });
+    if (firstLive != page.rend()) found->firstLiveUser = *firstLive;
+    if (page.size() == 16) {
+        found->before = page.back().id;
+        QTimer::singleShot(0, this, [this, id] { advanceSessionDisplayTitle(id); });
+        return;
+    }
+    const auto read = std::move(found.value());
+    runtime_->titleReads.erase(found);
+    MaiSession current;
+    if (!agent().getSession(read.snapshot.id, current) || current.titleEdited ||
+        current.title != read.snapshot.title)
+        return;
+    if (read.restartIfEmpty && !read.firstLiveUser) {
+        sessionDisplayTitle(current);
+        return;
+    }
+    std::vector<MaiMessage> candidates;
+    if (read.firstUser) candidates.push_back(*read.firstUser);
+    if (read.firstLiveUser && (!read.firstUser || read.firstLiveUser->id != read.firstUser->id))
+        candidates.push_back(*read.firstLiveUser);
+    const auto title = maiProjectIMHistoryTitleForDisplay(current, candidates);
+    runtime_->titleDisplays.insert(id, {current.title, title});
+    emit sessionStructureChanged();
+}
+
 // ---- 变更 ----
 
 QString AgentController::createSession(const QString& directory, const QString& title) {
@@ -945,7 +1013,15 @@ void AgentController::onEventQueued(const MaiEvent& event) {
             MaiMessage message;
             if (runtime_->agent->getMessage(event.sessionId, event.messageId, message)) {
                 emit storedMessageUpdated(sessionId, messageId);
-                if (message.role == MaiRole::User) emit userMessageAdded(sessionId, messageId);
+                if (message.role == MaiRole::User) {
+                    auto titleRead = runtime_->titleReads.find(sessionId);
+                    if (titleRead != runtime_->titleReads.end()) titleRead->restartIfEmpty = true;
+                    const auto title = runtime_->titleDisplays.constFind(sessionId);
+                    const bool refreshTitle = title != runtime_->titleDisplays.constEnd() && title->text.empty();
+                    if (refreshTitle) runtime_->titleDisplays.remove(sessionId);
+                    emit userMessageAdded(sessionId, messageId);
+                    if (refreshTitle) emit sessionStructureChanged();
+                }
             }
             return;
         }

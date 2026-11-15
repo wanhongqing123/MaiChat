@@ -226,6 +226,23 @@ MaiSessionIMRouter::Status MaiSessionIMRouter::revokeSession(const AccountScope&
     return Status::Ok;
 }
 
+MaiSessionIMRouter::Status MaiSessionIMRouter::cancelSessionInputs(const AccountScope& scope,
+        const std::string& session, const std::string& workspace, bool discardPending) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto status = impl_->scopeStatus(scope);
+    if (status != Status::Ok) return status;
+    const auto peer = impl_->peerBySession.find(session);
+    if (peer == impl_->peerBySession.end()) return Status::NotBound;
+    if (impl_->bindings.at(peer->second).workspaceKey != workspace) return Status::StaleScope;
+    const auto queue = impl_->queues.find(session);
+    if (discardPending && queue != impl_->queues.end()) {
+        impl_->pendingCount -= queue->second.size();
+        impl_->queues.erase(queue);
+    }
+    impl_->eraseRoute(session);
+    return Status::Ok;
+}
+
 MaiSessionIMRouter::Admission MaiSessionIMRouter::accept(const Incoming& input) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto status = impl_->scopeStatus(input.account);

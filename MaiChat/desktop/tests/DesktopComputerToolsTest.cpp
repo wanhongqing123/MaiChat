@@ -12,9 +12,14 @@
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QWindow>
+#include <QMouseEvent>
+#include <QPainter>
 
 #include <algorithm>
 #include <cstdio>
+#include <atomic>
+#include <optional>
+#include <thread>
 
 #if defined(Q_OS_WIN)
 #ifndef NOMINMAX
@@ -40,10 +45,147 @@ int unavailable(const char* reason) {
     return 77;
 }
 
+#if defined(Q_OS_WIN)
+class OwnedDragCanvas final : public QWidget {
+public:
+    QPoint down, up;
+    std::vector<QPoint> samples;
+    bool pressed = false, released = false;
+    static QPoint physicalPointer() {
+        POINT point{};
+        GetPhysicalCursorPos(&point);
+        return {point.x, point.y};
+    }
+protected:
+    bool nativeEvent(const QByteArray&, void* message, qintptr*) override {
+        const auto* event = static_cast<MSG*>(message);
+        if (event->message == WM_LBUTTONDOWN || event->message == WM_LBUTTONUP ||
+            (event->message == WM_MOUSEMOVE && (event->wParam & MK_LBUTTON))) {
+            POINT point{short(LOWORD(event->lParam)), short(HIWORD(event->lParam))};
+            ClientToScreen(event->hwnd, &point);
+            const QPoint position(point.x, point.y);
+            if (event->message == WM_LBUTTONDOWN) down = position;
+            else if (event->message == WM_LBUTTONUP) up = position;
+            else samples.push_back(position);
+        }
+        return false;
+    }
+    void mousePressEvent(QMouseEvent* event) override {
+        // Read the native event position, not the cursor's later live position:
+        // another drag step can happen before the GUI delivers this callback.
+        pressed = true;
+        event->accept();
+    }
+    void mouseMoveEvent(QMouseEvent* event) override {
+        update();
+        event->accept();
+    }
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        released = true;
+        event->accept();
+    }
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.fillRect(rect(), QColor(235, 245, 255));
+        painter.setPen(QColor(15, 65, 110));
+        painter.drawText(rect(), Qt::AlignCenter,
+                         QStringLiteral("Owned coordinate test — no browser or verification challenge"));
+    }
+};
+
+template <class Work> auto nativeWork(QApplication& app, Work work) {
+    using Result = decltype(work());
+    std::optional<Result> result;
+    std::atomic<bool> done{false};
+    std::thread worker([&] { result.emplace(work()); done.store(true); });
+    while (!done.load()) {
+        app.processEvents(QEventLoop::AllEvents, 10);
+        QThread::msleep(1);
+    }
+    worker.join();
+    return std::move(*result);
+}
+
+int probeDragCoordinates(QApplication& app) {
+    const auto priorPointer = OwnedDragCanvas::physicalPointer();
+    const HWND priorForeground = GetForegroundWindow();
+    OwnedDragCanvas window;
+    window.setWindowTitle(QStringLiteral("MaiChat owned coordinate probe"));
+    window.setMouseTracking(true);
+    window.showFullScreen();
+    window.raise();
+    window.activateWindow();
+    for (int index = 0; index < 20; ++index) {
+        app.processEvents(QEventLoop::AllEvents, 10);
+        QThread::msleep(10);
+    }
+    const HWND owned = reinterpret_cast<HWND>(window.winId());
+    if (GetForegroundWindow() != owned) return unavailable("owned coordinate probe is not foreground");
+    DesktopComputerController controller;
+    const auto displays = controller.displays();
+    CHECK(displays);
+    const auto display = std::find_if(displays.value().begin(), displays.value().end(),
+                                     [](const DesktopNativeDisplay& item) { return item.primary; });
+    CHECK(display != displays.value().end());
+    QTemporaryDir workspace;
+    CHECK(workspace.isValid());
+    const auto canceled = [owned] { return GetForegroundWindow() != owned; };
+    const auto observation = nativeWork(app, [&] {
+        return controller.observeDisplay("owned-coordinate-probe", workspace.path().toUtf8().toStdString(),
+                                         display->id, canceled);
+    });
+    CHECK(observation);
+    const auto metadata = nlohmann::json::parse(observation.value().json);
+    DesktopComputerAction action;
+    action.action = "drag";
+    action.desktopScope = true;
+    action.displayId = display->id;
+    action.workspace = workspace.path().toUtf8().toStdString();
+    action.snapshotId = metadata["snapshot_id"].get<std::string>();
+    action.xRatio = .2;
+    action.yRatio = .45;
+    action.toXRatio = .7;
+    action.toYRatio = .45;
+    action.durationMs = 800;
+    action.isCanceled = canceled;
+    const auto result = nativeWork(app, [&] { return controller.perform("owned-coordinate-probe", action); });
+    app.processEvents(QEventLoop::AllEvents, 100);
+    CHECK(result && result.value().dispatched && window.pressed && window.released);
+    const QPoint expectedDown(qRound(display->x + action.xRatio * (display->width - 1)),
+                              qRound(display->y + action.yRatio * (display->height - 1)));
+    const QPoint expectedUp(qRound(display->x + action.toXRatio * (display->width - 1)),
+                            qRound(display->y + action.toYRatio * (display->height - 1)));
+    const int error = std::max((expectedDown - window.down).manhattanLength(),
+                               (expectedUp - window.up).manhattanLength());
+    int lineError = 0;
+    for (const auto& point : window.samples)
+        lineError = std::max(lineError, std::abs(point.y() - expectedDown.y()));
+    const auto report = nlohmann::json{{"native_width", display->width}, {"native_height", display->height},
+        {"png_width", metadata["image_width"]}, {"png_height", metadata["image_height"]},
+        {"dpr", window.devicePixelRatioF()}, {"expected_down", {expectedDown.x(), expectedDown.y()}},
+        {"actual_down", {window.down.x(), window.down.y()}}, {"expected_up", {expectedUp.x(), expectedUp.y()}},
+        {"actual_up", {window.up.x(), window.up.y()}}, {"maximum_endpoint_error", error},
+        {"sample_count", window.samples.size()}, {"maximum_cross_track_error", lineError}};
+    std::fprintf(stderr, "%s\n", report.dump().c_str());
+    if (GetForegroundWindow() == owned) {
+        SetPhysicalCursorPos(priorPointer.x(), priorPointer.y());
+        window.hide();
+        if (IsWindow(priorForeground)) SetForegroundWindow(priorForeground);
+    }
+    CHECK(error <= 1);
+    CHECK(lineError <= 1);
+    return 0;
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+#if defined(Q_OS_WIN)
+    if (QCoreApplication::arguments().contains(QStringLiteral("--coordinate-probe")))
+        return probeDragCoordinates(app);
+#endif
 #if defined(Q_OS_WIN)
     if (QApplication::platformName() != QStringLiteral("windows"))
         return unavailable("a real Windows QPA session is required");

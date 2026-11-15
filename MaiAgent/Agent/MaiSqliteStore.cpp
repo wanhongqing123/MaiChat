@@ -85,6 +85,14 @@ std::string textColumn(sqlite3_stmt* statement, int index) {
                        static_cast<std::size_t>(sqlite3_column_bytes(statement, index)));
 }
 
+// 两列仅来自同一会话已提交导入账本的 join；不从正文或普通 putMessage 输入推测来源。
+void restoreImportOrigin(sqlite3_stmt* statement, MaiMessage& message) {
+    const auto sourceKey = textColumn(statement, 6);
+    const auto sourceId = textColumn(statement, 7);
+    if (!sourceKey.empty() && !sourceId.empty())
+        message.contextImportOrigin = MaiContextImportOrigin{sourceKey, sourceId};
+}
+
 // SQLite 接口要求有效 UTF-8；逐段保留合法字节，并把非法序列替换掉，避免一条坏消息破坏整次写入。
 std::string sanitizeUtf8(const std::string& value) {
     constexpr char kReplacement[] = "\xEF\xBF\xBD";
@@ -1041,6 +1049,7 @@ public:
         std::lock_guard<std::mutex> lock(mMutex);
         if (!executeTransactionStatement("BEGIN IMMEDIATE")) return;
 
+        // context_* 只能由导入事务建立；公开快照中的只读 origin 不参与普通写入。
         sqlite3_stmt* upsert = prepareLocked(
             "INSERT INTO messages(id, session_id, role, created, completed, input_request_id, "
             "pending_input) "
@@ -1177,11 +1186,14 @@ private:
         // 两个索引分开查询，隐藏的旧快照再大也不影响普通消息或当前快照的 keyset 分页。
         auto* statement = prepareLocked(
             importId.empty()
-                ? "SELECT id,role,created,completed,input_request_id,pending_input FROM messages "
+                ? "SELECT id,role,created,completed,input_request_id,pending_input,NULL,NULL FROM "
+                  "messages "
                   "WHERE session_id=?1 AND context_import_id IS NULL AND id<?2 ORDER BY id DESC "
                   "LIMIT ?3"
-                : "SELECT id,role,created,completed,input_request_id,pending_input FROM messages "
-                  "WHERE context_import_id=?1 AND id<?2 ORDER BY id DESC LIMIT ?3");
+                : "SELECT m.id,m.role,m.created,m.completed,m.input_request_id,m.pending_input,"
+                  "i.source_key,m.context_source_id FROM messages m JOIN context_imports i "
+                  "ON i.id=m.context_import_id AND i.session_id=m.session_id AND i.state=1 "
+                  "WHERE m.context_import_id=?1 AND m.id<?2 ORDER BY m.id DESC LIMIT ?3");
         if (!statement) return false;
         Reset reset(statement);
         bindText(statement, 1, importId.empty() ? sessionId : importId);
@@ -1198,6 +1210,7 @@ private:
             message.completed = sqlite3_column_int64(statement, 3);
             message.inputRequestId = textColumn(statement, 4);
             message.pendingInput = sqlite3_column_int(statement, 5) != 0;
+            restoreImportOrigin(statement, message);
             page.push_back(std::move(message));
         }
         return code == SQLITE_DONE;
@@ -1263,9 +1276,13 @@ private:
         std::vector<MaiMessage> out;
 
         sqlite3_stmt* statement = prepareLocked(
-            "SELECT id, role, created, completed, input_request_id, pending_input FROM messages "
-            "WHERE session_id = ?1 AND (context_import_id IS NULL OR context_import_id IN "
-            "(SELECT import_id FROM context_import_sources WHERE session_id=?1)) ORDER BY id LIMIT "
+            "SELECT m.id,m.role,m.created,m.completed,m.input_request_id,m.pending_input,"
+            "i.source_key,m.context_source_id FROM messages m LEFT JOIN context_imports i "
+            "ON i.id=m.context_import_id AND i.session_id=m.session_id AND i.state=1 "
+            "WHERE m.session_id = ?1 AND (m.context_import_id IS NULL OR "
+            "(i.id IS NOT NULL AND m.context_import_id IN "
+            "(SELECT import_id FROM context_import_sources WHERE session_id=?1))) ORDER BY m.id "
+            "LIMIT "
             "?2");
         if (!statement) return out;
         {
@@ -1283,6 +1300,7 @@ private:
                 message.completed = sqlite3_column_int64(statement, 3);
                 message.inputRequestId = textColumn(statement, 4);
                 message.pendingInput = sqlite3_column_int(statement, 5) != 0;
+                restoreImportOrigin(statement, message);
                 out.push_back(std::move(message));
             }
         }
@@ -1328,10 +1346,12 @@ public:
                     MaiMessage& out) const override {
         std::lock_guard<std::mutex> lock(mMutex);
         sqlite3_stmt* statement = prepareLocked(
-            "SELECT id, role, created, completed, input_request_id, pending_input FROM messages "
-            "WHERE session_id = ?1 AND id = ?2 AND (context_import_id IS NULL OR "
-            "context_import_id IN (SELECT import_id FROM context_import_sources WHERE "
-            "session_id=?1))");
+            "SELECT m.id,m.role,m.created,m.completed,m.input_request_id,m.pending_input,"
+            "i.source_key,m.context_source_id FROM messages m LEFT JOIN context_imports i "
+            "ON i.id=m.context_import_id AND i.session_id=m.session_id AND i.state=1 "
+            "WHERE m.session_id = ?1 AND m.id = ?2 AND (m.context_import_id IS NULL OR "
+            "(i.id IS NOT NULL AND m.context_import_id IN "
+            "(SELECT import_id FROM context_import_sources WHERE session_id=?1)))");
         if (!statement) return false;
         MaiMessage message;
         {
@@ -1345,6 +1365,7 @@ public:
             message.completed = sqlite3_column_int64(statement, 3);
             message.inputRequestId = textColumn(statement, 4);
             message.pendingInput = sqlite3_column_int(statement, 5) != 0;
+            restoreImportOrigin(statement, message);
         }
         // 仅对精确命中的消息加载片段；失败路径不修改调用方原有快照。
         bool partsRead = false;
@@ -1400,6 +1421,8 @@ public:
         out.completed = sqlite3_column_int64(query, 3);
         out.inputRequestId = textColumn(query, 4);
         out.pendingInput = sqlite3_column_int(query, 5) != 0;
+        // 接收凭据属于普通实时输入，复用输出对象时不能残留上一条导入消息的来源。
+        out.contextImportOrigin.reset();
         out.parts = readPartsLocked(out.id);
         return true;
     }

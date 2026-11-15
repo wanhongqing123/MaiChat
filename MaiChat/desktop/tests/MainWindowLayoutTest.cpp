@@ -407,6 +407,7 @@ private slots:
     void imageBubbleUsesNativePixmapPreview();
     void imagePreviewUsesWhiteCanvasOnlyForActualTransparency();
     void maximizedImageBubbleOpensOnlyOnePreview();
+    void imagePreviewKeepsTheSameVisibleWindowDuringAnimation();
     void imagePreviewKeepsConversationBackgroundStable_data();
     void imagePreviewKeepsConversationBackgroundStable();
     void imagePreviewNativeHandoffRecording();
@@ -5170,6 +5171,85 @@ void MainWindowLayoutTest::imageBubbleUsesNativePixmapPreview() {
     QVERIFY(label->findChild<QWidget*>(QStringLiteral("maiGraphicsImageOverlay")) == nullptr);
 }
 
+// 放大与缩回全程只由同一可见窗口承载像素，不在末尾移交给另一个原生窗口。
+void MainWindowLayoutTest::imagePreviewKeepsTheSameVisibleWindowDuringAnimation() {
+    QTemporaryDir directory;
+    const QString path = directory.filePath(QStringLiteral("owned-transition.png"));
+    QImage image(960, 540, QImage::Format_RGB32);
+    image.fill(Qt::red);
+    {
+        QPainter painter(&image);
+        painter.fillRect(QRect(0, 0, 960, 16), QColor(20, 220, 80));
+        painter.fillRect(QRect(0, 524, 960, 16), QColor(20, 80, 230));
+        for (int y = 40; y < 200; y += 4)
+            for (int x = 700; x < 900; x += 4) painter.fillRect(QRect(x, y, 4, 4), (x + y) % 8 ? Qt::white : Qt::black);
+    }
+    QVERIFY(image.save(path));
+    RemoteIMApplication app(QStringLiteral("owned-same-preview"), std::make_unique<FakeRemoteIMClient>());
+    app.addContact(QStringLiteral("owned-peer"), QStringLiteral("Owned"));
+    app.chatState().receiveImage(QStringLiteral("owned-peer"), path, image.width(), image.height(), 100);
+    app.selectPeer(QStringLiteral("owned-peer"));
+    MainWindow window(app);
+    window.resize(1200, 800);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* source = window.findChild<QLabel*>(QStringLiteral("messageImageLabel"));
+    QVERIFY(source);
+    QTRY_VERIFY(!source->pixmap().isNull());
+    QTRY_VERIFY(source->isVisible());
+    QTRY_VERIFY2_WITH_TIMEOUT(!source->visibleRegion().isEmpty(),
+        "The source thumbnail must be actually exposed before a user can click it", 5000);
+    const auto cleanup = qScopeGuard([&] {
+        for (auto* dialog : window.findChildren<ImagePreviewDialog*>()) {
+            dialog->setCloseHandler({});
+            dialog->close();
+        }
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    });
+    QTest::mouseClick(source, Qt::LeftButton);
+    QPointer<ImagePreviewDialog> preview = window.findChild<ImagePreviewDialog*>(QStringLiteral("imagePreviewDialog"));
+    QVERIFY(preview);
+    QVERIFY2(preview->isVisible(), "The image must already belong to its final native window while expanding");
+    const auto identity = preview->winId();
+    const QRect initialGeometry = preview->geometry();
+    const QString evidence = qEnvironmentVariable("MAICHAT_OWN_MEDIA_EVIDENCE_DIR");
+    if (!evidence.isEmpty()) QVERIFY(QDir().mkpath(evidence));
+    for (int frame = 0; frame < 18; ++frame) {
+        QVERIFY(preview && preview->isVisible());
+        QCOMPARE(preview->winId(), identity);
+        const QImage pixels = preview->grab().toImage();
+        const QColor center = pixels.pixelColor(pixels.width() / 2, pixels.height() / 2);
+        QVERIFY(center.red() > 220 && center.green() < 35 && center.blue() < 35);
+        if (!evidence.isEmpty() && (frame == 0 || frame == 5 || frame == 17))
+            QVERIFY(pixels.save(QDir(evidence).filePath(QStringLiteral("same-preview-%1.png").arg(frame))));
+        QTest::qWait(20);
+    }
+    qInfo() << "[same-preview-native-window]" << identity << "initial" << initialGeometry << "settled"
+            << preview->geometry();
+    QVERIFY(initialGeometry != preview->geometry());
+    QTest::mouseClick(preview, Qt::LeftButton);
+    QVERIFY(preview && preview->isVisible());
+    int closingFrames = 0;
+    bool closingMoved = false;
+    const QRect closingStart = preview->geometry();
+    QElapsedTimer timeout;
+    timeout.start();
+    while (preview && timeout.elapsed() < 1500) {
+        if (preview->isVisible()) {
+            ++closingFrames;
+            closingMoved = closingMoved || preview->geometry() != closingStart;
+            QCOMPARE(preview->winId(), identity);
+            const QImage pixels = preview->grab().toImage();
+            const QColor center = pixels.pixelColor(pixels.width() / 2, pixels.height() / 2);
+            QVERIFY(center.red() > 220 && center.green() < 35 && center.blue() < 35);
+        }
+        QTest::qWait(20);
+    }
+    QVERIFY(preview.isNull());
+    QVERIFY(closingFrames >= 2 && closingMoved);
+    QVERIFY(source->isVisible() && source->graphicsEffect() == nullptr);
+}
+
 void MainWindowLayoutTest::maximizedImageBubbleOpensOnlyOnePreview() {
     QTemporaryDir dir;
     const QString imagePath = dir.filePath(QStringLiteral("shot.png"));
@@ -5184,18 +5264,24 @@ void MainWindowLayoutTest::maximizedImageBubbleOpensOnlyOnePreview() {
     app.chatState().receiveImage(QStringLiteral("phone-user"), imagePath, originalSize.width(), originalSize.height(),
                                  100);
 
+    app.selectPeer(QStringLiteral("phone-user"));
     MainWindow window(app);
     window.showMaximized();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
     auto* imageLabel = window.findChild<QLabel*>(QStringLiteral("messageImageLabel"));
     QVERIFY(imageLabel != nullptr);
+    QTRY_VERIFY(!imageLabel->pixmap().isNull());
+    QTRY_VERIFY(imageLabel->isVisible());
+    // 新窗口从第一帧即显示；不能像旧快照路径那样依靠 220ms 等待偷偷稳定源缩略图。
+    QCoreApplication::processEvents();
 
     // 连续到达的点击事件也只能复用当前预览，不能叠出多个预览窗口。
     QCOMPARE(window.findChildren<ImagePreviewDialog*>().size(), 0);
     QTest::mouseClick(imageLabel, Qt::LeftButton);
     QCOMPARE(window.findChildren<ImagePreviewDialog*>().size(), 1);
     QTest::mouseClick(imageLabel, Qt::LeftButton);
-    QVERIFY(window.findChild<QLabel*>(QStringLiteral("imagePreviewTransitionSnapshot")) != nullptr);
+    QVERIFY(window.findChild<QLabel*>(QStringLiteral("imagePreviewTransitionSnapshot")) == nullptr);
+    QVERIFY(window.findChild<ImagePreviewDialog*>(QStringLiteral("imagePreviewDialog"))->isVisible());
     const QByteArray capture = qgetenv("MAICHAT_TEST_CAPTURE_PATH");
     if (!capture.isEmpty()) {
         QTest::qWait(100);
@@ -5209,14 +5295,16 @@ void MainWindowLayoutTest::maximizedImageBubbleOpensOnlyOnePreview() {
     QTRY_VERIFY(preview->isVisible());
     QVERIFY(!(preview->windowState() & Qt::WindowFullScreen));
     QVERIFY(preview->windowFlags().testFlag(Qt::FramelessWindowHint));
-    QCOMPARE(preview->size(), originalSize);
+    QTRY_COMPARE(preview->size(), originalSize);
+    QTest::qWait(20);
 
     const QSize resizedPreview(420, 260);
     preview->resize(resizedPreview);
     QTRY_COMPARE(preview->size(), resizedPreview);
 
     QTest::mouseClick(preview, Qt::LeftButton);
-    QVERIFY(window.findChild<QLabel*>(QStringLiteral("imagePreviewTransitionSnapshot")) != nullptr);
+    // 来源已被布局/滚动裁切时允许直接关闭；不能为了旧快照断言强行补画不可见来源。
+    QVERIFY(window.findChild<QLabel*>(QStringLiteral("imagePreviewTransitionSnapshot")) == nullptr);
     if (!capture.isEmpty()) {
         QTest::qWait(100);
         QVERIFY(window.screen()

@@ -1,6 +1,8 @@
 // Explicit friend-to-local-Session bindings reuse the existing IM origin
 // protocol. MaiSessionIMRouter owns binding/queue/receipt authority; this class
-// only adapts Qt, ordinary Core execution, media preparation and native SDK I/O.
+// adapts ordinary Core execution and mirrors new visible output through the
+// existing named-peer SDK APIs. Output follows the persistent binding even
+// when a turn was started locally rather than by one incoming IM receipt.
 #pragma once
 
 #include <QHash>
@@ -30,8 +32,8 @@ public:
     // Pass the existing ordinary Session-list projection at startup. Cleanup
     // runs bounded Core maintenance on preparation I/O, never on the UI thread.
     void scheduleHistoryMaintenance(const QStringList& localRootSessionIds);
-    // Local input/stop takes ownership of the Session. Unbinding never stops
-    // its model or tools; it only revokes pending/late automatic IM delivery.
+    // Explicitly revoke a binding (for deletion/workspace changes). Ordinary
+    // local input and Stop retain the binding and revoke only old input work.
     void localTakeover(const QString& sessionId);
     // Latches new input off immediately; a later ready IM connection may resume
     // new live input. Pending work is never replayed after this boundary.
@@ -56,6 +58,9 @@ private:
     void processReservation(quint64 token);
     void processFollowup(quint64 token);
     void publishCommittedOutput(const QString& sessionId);
+    void publishBoundOutput(const QString& sessionId);
+    void setBoundActivity(const QString& sessionId, int kind);
+    void cancelSessionInputs(const QString& sessionId, bool discardPending = true);
     void publishQuestion(const QString& questionId, const QString& sessionId);
     void publishApproval(const QString& permissionId, const QString& sessionId);
     void resolveApproval(const QString& permissionId, const QString& decision);

@@ -110,8 +110,24 @@ extern "C" void maiGraphicsAlignMacVideoHuds(QWidget *owner, QWidget *header, QW
   if (!ownerWindow || !headerWindow || !footerWindow)
     return;
   // Qt::Tool 默认浮在 App 所有普通窗之上；QObject/transient owner 并不限制该层级。
-  // 保留 Qt 管理的同一对窗口，以 owner 的层级和相邻顺序显示，不重建或重设 parent。
+  // 保留 Qt 管理的同一对窗口，以 owner 的层级和相邻顺序显示，不重建 Qt 对象或更改 Qt 父链。
   headerWindow.level = footerWindow.level = ownerWindow.level;
+  // QObject/transient owner 不会建立 AppKit 窗口组。独立 Tool 会留在原 Space，
+  // 即使 Qt/native visible 均为 true，视频进入原生全屏后也看不到控制栏。
+  // 持久绑定同一 native owner，随该窗口进入/退出 Space，不追随其它激活的主窗。
+  for (NSWindow *hud : @[headerWindow, footerWindow]) {
+    const NSWindowCollectionBehavior behavior =
+        (hud.collectionBehavior &
+         ~(NSWindowCollectionBehaviorMoveToActiveSpace | NSWindowCollectionBehaviorFullScreenPrimary)) |
+        NSWindowCollectionBehaviorFullScreenAuxiliary;
+    if (hud.collectionBehavior != behavior)
+      hud.collectionBehavior = behavior;
+    if (hud.parentWindow != ownerWindow) {
+      if (hud.parentWindow)
+        [hud.parentWindow removeChildWindow:hud];
+      [ownerWindow addChildWindow:hud ordered:NSWindowAbove];
+    }
+  }
   // Cocoa 的 Qt::Tool 默认还带 Resizable。原生边角可先截获拖动，只拉大 HUD，
   // 视频 owner 完全收不到 resize；HUD 只能由 owner 布局，拖动仍交还共用 Qt 处理。
   for (NSWindow *hud : @[headerWindow, footerWindow]) {

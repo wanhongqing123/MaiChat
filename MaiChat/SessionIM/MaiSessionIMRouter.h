@@ -147,6 +147,11 @@ public:
                               const std::string& senderId, const std::string& recipientId) const;
     // 本地接管、Session 删除或工作目录改变共用此撤销；不停止模型/工具。
     Status revokeSession(const AccountScope& scope, const std::string& sessionId);
+    // Local input/Stop invalidates input receipts without removing the user's
+    // persistent output binding. Dedupe and a pending history import survive.
+    // Local replacement keeps pending friend messages; Stop may discard them.
+    Status cancelSessionInputs(const AccountScope& scope, const std::string& sessionId,
+                               const std::string& currentWorkspaceKey, bool discardPending = true);
 
     Admission accept(const Incoming& input);
     // 下载/准备失败只丢弃准确输入；Running/Finishing 已提交输入不能经此接口取消。

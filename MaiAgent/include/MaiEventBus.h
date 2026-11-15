@@ -74,7 +74,9 @@ struct MaiEvent {
     std::string detail;
     MaiMillis time = 0;
 
-    // 上述两种提交凭据使用最初 activeTurnId；assistant 分段变化不改变此身份。
+    // 提交凭据及 Runner 的 MessagePartUpdated/SessionError 使用最初 activeTurnId；
+    // assistant 分段变化不改变此身份。片段更新只证明该 ID 已落库，不能把
+    // 尚未提交的正文、推理或工具参数当作可交付正文。
     // MessageTextCommitted 的 messageId/partId 指向完整正文，不代表轮次已经结束，
     // 也不把失败/取消的半截响应、推理或工具输出当作已提交正文。
     std::string turnId;

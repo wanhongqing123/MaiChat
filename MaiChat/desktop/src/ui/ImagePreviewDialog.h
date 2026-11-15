@@ -11,6 +11,7 @@
 #include <functional>
 
 class QCloseEvent;
+class QShowEvent;
 
 class ImagePreviewDialog final : public QDialog {
     Q_OBJECT
@@ -26,6 +27,7 @@ public:
     QColor canvasColor() const;
 
 protected:
+    void showEvent(QShowEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;

@@ -21,7 +21,8 @@ std::string MaiSessionTitler::apply(MaiSessionStore& store, const std::string& s
 
     std::string title;
     for (const auto& message : store.listMessages(sessionId)) {
-        if (message.role != MaiRole::User) continue;
+        // 导入资料虽以 User 保存以维持不可信背景语义，但不是本次用户发起的请求或标题来源。
+        if (message.role != MaiRole::User || message.contextImportOrigin) continue;
         title = makeTitle(message.text());
         break;
     }

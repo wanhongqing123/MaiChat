@@ -444,8 +444,9 @@ void AgentSessionList::refresh() {
             const QString sessionId = fromUtf8(session.id);
             const QString directory = fromUtf8(session.directory);
             // 未命名的会话核心会填一个占位标题，第一轮结束后换成用户那句话。
-            const QString title =
-                session.isUntitled() ? QStringLiteral("新对话") : fromUtf8(session.title);
+            const auto displayTitle = runtime_->controller->sessionDisplayTitle(session);
+            const QString title = session.isUntitled() || displayTitle.isEmpty()
+                ? QStringLiteral("新对话") : displayTitle;
 
             auto* item = new QListWidgetItem(title);
             item->setData(Qt::UserRole, sessionId);
