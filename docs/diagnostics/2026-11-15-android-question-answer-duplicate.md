@@ -70,3 +70,31 @@ RemoteSessionSync 21、MessagePages 14、MediaCardLayout 9、ImageMessageRow 6�
 目标安装为同 applicationId / buildType / 签名的正常 285 / 2.2.43 覆盖更新，不卸载或清数据。
 用户此前明确授予的 Android 正常更新授权继续适用，不再次请求手机安装确认。
 Windows 播放器替换及服务端 R2 部署仍是各自独立的待授权动作。
+
+## 正常包与手机实际验收
+
+产品源码 `1389cfd1174dd6ddf5f981a947694aabffad67c3`，独立静态 review 精确核最终
+Question blob `186324e8` / test `83560dbd`，尾 reasoning P2 正式关闭，未见新增具体 P1/P2。
+最终回执 `1794758002-88265397.json`；Mac 未代替 Root 操作 Android 设备。
+
+正常 Debug 从干净构建专用 checkout `.cache/a281` 构建，26.960 秒 exit 0，原始 Adapter WIP
+排除且 native 输入树不变。285 / 2.2.43 APK 1689013274 bytes，SHA256：
+`4741fbf544372d9894011c3651502663caab2c26f77584e474a890082cdf7a50`。
+签名、applicationId、非 testOnly/非本地夹具账号、对齐、41 ELF 及 6 模型资源均核验通过。
+
+2026-11-15 15:51:14Z，正常 `adb install -r` exit 0 / 61.891 秒，未卸载、清数据或新授权限；
+安装后 base.apk SHA 与候选相同，版本 285 / 2.2.43，实际进程 PID 24698。
+重新进入创作中心，选择原 Windows 远端 Imported 会话，读取更早消息使 question owner 和
+真实 user 同时存在后，实际相同 24 字答案的可见 TextView 为 1，bounds
+`[128,826][648,914]`。截图中问题选项、原 389 秒 footer 和唯一用户答案同时可见，
+已人工查看，不能仅用初始 8 条历史缺少 question owner 时的单条计数作为验收。
+
+点击该处已加载截图，实际进入全屏图片预览；等待稳定图像后查看 PNG，原图正常显示。
+第一次截图在预览首帧前为空白，保留但不将其称为预览已验；后续稳定截图已确认。
+Back 后返回原滚动位置，答案仍为 1、来源设备重新加载提示计数为 0。实际未制造 pending/
+过期回执来触发发布请求，这些恢复分支由普通 UI/controller 回归覆盖。
+
+现场证据集中在 `.cache/android-question-answer-20261115/`：
+`before-question-10*`、`after-question-context*`、`after-image-preview-settled*`、
+`final-question-return*`；设备 XML 临时文件已逐一移除。新源码/安装/运行产物一致，
+原三路径 WIP 保持，未部署服务或替换 Windows 用户程序。
