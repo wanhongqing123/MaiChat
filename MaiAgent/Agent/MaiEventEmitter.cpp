@@ -36,6 +36,13 @@ void MaiEventEmitter::emitMessage(MaiEventType type, const std::string& sessionI
     mBus.publish(event);
 }
 
+void MaiEventEmitter::emitTurnStarted(const std::string& sessionId, const std::string& turnId) {
+    MaiEvent event = makeEvent(MaiEventType::SessionStatus, sessionId);
+    event.turnId = turnId;
+    event.detail = "running";
+    mBus.publish(event);
+}
+
 void MaiEventEmitter::emitTurnError(const std::string& sessionId, const std::string& turnId,
                                     const std::string& detail) {
     MaiEvent event = makeEvent(MaiEventType::SessionError, sessionId);

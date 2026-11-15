@@ -1724,6 +1724,10 @@ MaiResult<std::string> MaiAgent::submit(const MaiOperation& operation) {
                     mRuntime->offerInputsLocked(operation.sessionId, turn);
                 }
 
+                // 所有入口共用受理后的开始通知；在锁外、工作线程前发布，
+                // 保证宿主先看到等待状态，再收到任何模型/工具输出。
+                mRuntime->emitter.emitTurnStarted(operation.sessionId, turn->id);
+
                 // 单独线程跑，submit 立刻返回——同步等会让 HTTP 请求挂几十秒。
                 const std::string sessionId = operation.sessionId;
                 auto dependencies = mRuntime->dependencies(sessionId, turn);

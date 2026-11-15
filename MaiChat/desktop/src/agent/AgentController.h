@@ -184,6 +184,9 @@ public:
     QString lastError() const;
 
 signals:
+    // Core 已受理并登记活动轮次；所有输入入口统一通知，不依赖首 token 或本地发送按钮。
+    // GUI 消费时还须核对 activeTurnId，过期的开始事件不能恢复已结束/被替换的等待状态。
+    void turnStarted(const QString& sessionId, const QString& turnId);
     // 已切到 Qt 宿主线程的持久化消息更新，包含 assistant 最终完成及 user 落库。
     // 同步宿主据此点取原消息 ID，不暴露内部 Core 事件桥。
     void storedMessageUpdated(const QString& sessionId, const QString& messageId);

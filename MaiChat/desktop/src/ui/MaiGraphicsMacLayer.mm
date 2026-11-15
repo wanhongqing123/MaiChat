@@ -2,6 +2,7 @@
 // 实现边界：与 MaiGraphicsMacLayer 的公开声明配套，调用方通过相应接口进入。
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CATransaction.h>
 
 #include <QWidget>
 #include <QGuiApplication>
@@ -75,8 +76,19 @@ extern "C" void maiGraphicsResizeMacLayer(void *nativeLayer, QWidget *widget) {
     return;
   NSView *view = reinterpret_cast<NSView *>(widget->winId());
   CAMetalLayer *layer = static_cast<CAMetalLayer *>(nativeLayer);
-  layer.frame = view.bounds;
+  // QWidget 的 resizeEvent 先于 Cocoa 子 NSView 的待处理几何提交。这里再读
+  // view.bounds 会把旧的 480x270 写回 Metal，首个可见帧只覆盖窗口的一角。
+  // 使用同一轮 Qt 已确定的客户区尺寸，并在映射前提交，不等待下一轮隐式事务。
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  // Cocoa Qt 把 Metal 放在 QContainerLayer 中。其首次 layoutSublayers 也必须
+  // 在同一轮完成，否则稍后的容器布局会暂时把内容层写回旧边界。
+  [view layoutSubtreeIfNeeded];
+  [view.layer layoutIfNeeded];
+  layer.frame = CGRectMake(0, 0, widget->width(), widget->height());
   layer.contentsScale = view.window ? view.window.backingScaleFactor : 1.0;
+  [CATransaction commit];
+  [CATransaction flush];
 }
 
 extern "C" void maiGraphicsRetainMacLayer(void *nativeLayer) {
@@ -96,6 +108,9 @@ extern "C" void maiGraphicsStyleMacVideoWindow(QWidget *widget) {
   NSWindow *window = view.window;
   if (!window)
     return;
+  // Qt 的最终几何准备好后直接映射同一窗口；不再叠加 AppKit 默认的弹出缩放，
+  // 否则窗口服务器仍可先显示中间大小，Qt/native frame 检查却始终是目标矩形。
+  window.animationBehavior = NSWindowAnimationBehaviorNone;
   window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
   window.titlebarAppearsTransparent = YES;
   window.backgroundColor = [NSColor colorWithCalibratedRed:0.03 green:0.05 blue:0.08 alpha:1.0];

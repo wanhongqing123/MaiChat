@@ -19,6 +19,7 @@ enum class MaiEventType {
     SessionDeleted,
     SessionIdle,
     SessionError,
+    // detail=running 携带本轮准确 turnId；已登记活动轮次，尚未启动模型工作线程。
     SessionStatus,
     MessageUpdated,
     MessageRemoved,
@@ -74,7 +75,7 @@ struct MaiEvent {
     std::string detail;
     MaiMillis time = 0;
 
-    // 提交凭据及 Runner 的 MessagePartUpdated/SessionError 使用最初 activeTurnId；
+    // 提交凭据、running 状态及 Runner 的 MessagePartUpdated/SessionError 使用最初 activeTurnId；
     // assistant 分段变化不改变此身份。片段更新只证明该 ID 已落库，不能把
     // 尚未提交的正文、推理或工具参数当作可交付正文。
     // MessageTextCommitted 的 messageId/partId 指向完整正文，不代表轮次已经结束，

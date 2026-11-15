@@ -2161,6 +2161,16 @@ AgentChatPanel::AgentChatPanel(AgentController& controller, QWidget* parent)
     // 而用户看到的是「AI 自己说了些我没问的话」。
     //
     // 以前只有一个会话在跑，忽略 sessionId 是无害的；现在不是了。
+    connect(&controller, &AgentController::turnStarted, this, [this](const QString& sessionId, const QString& turnId) {
+        if (!isCurrentSession(sessionId) ||
+            runtime_->controller->agent().activeTurnId(toUtf8(sessionId)) != toUtf8(turnId))
+            return;
+        // 绑定/调度等入口不经过 onSend；由实际受理轮次开启同一等待 UI。
+        // 本地 onSend 的即时反馈仍可保留，startPendingThinking 本身去重。
+        setRunning(true);
+        startPendingThinking();
+        scrollToBottom();
+    });
     connect(&controller, &AgentController::textDelta, this,
             [this](const QString& sessionId, const QString& messageId, const QString& partId, const QString& delta) {
                 if (!isCurrentSession(sessionId)) {

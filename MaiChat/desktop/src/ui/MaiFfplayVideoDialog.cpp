@@ -1101,7 +1101,9 @@ void MaiFfplayVideoDialog::setSize(void* userData, int width, int height) {
             const QScreen* screen = dialog->screen();
             if (!screen) screen = QGuiApplication::primaryScreen();
             const QRect available = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 800);
-            const QSize limit = available.size() * 0.85;
+            // 各桌面端以同一逻辑尺寸上限打开普通窗口。大素材不能因屏幕/DPI
+            // 差异近似铺满桌面；小屏再按可用区域缩小，显式最大化/全屏意图仍由上方处理。
+            const QSize limit = (available.size() * 0.75).boundedTo(QSize(960, 540));
             // 用同一个比例因子满足普通素材的最小尺寸与屏幕上限，不分别拉宽/拉高源比例。
             // 极端长宽比受控件最小宽高约束时仍由 Presenter fit，绝不裁剪或变形内容。
             const double minimumScale =
@@ -1584,6 +1586,11 @@ void MaiFfplayVideoDialog::finishPreparedShow() {
     initialShowPending_ = false;
     initialPresentationDone_ = true;
     show();
+#if defined(Q_OS_MAC)
+    // show() 才将隐藏期间的 Qt 尺寸同步到 Cocoa。首次返回事件循环前完成
+    // 同一原生视口/内容层的布局事务，避免先显示旧 480x270 子层再铺满窗口。
+    maiGraphicsResizeMacLayer(nativeView_, surface_);
+#endif
     raise();
     activateWindow();
 }

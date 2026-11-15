@@ -357,6 +357,7 @@ private slots:
     void macCreationVideoHudStaysInNativeFullscreenSpace();
     void videoOpensAtPreparedGeometry_data();
     void videoOpensAtPreparedGeometry();
+    void preparedVideoKeepsFirstNativeViewport();
     void preparedVideoCanFailOrCancelWithoutLateShow();
     void closedPreparedVideoCanBeShownAgain();
     void macClosingVideoIsTransparentBeforeNativeExit();
@@ -1245,16 +1246,33 @@ void MaiFfplayVideoDialogTest::macCreationVideoHudStaysInNativeFullscreenSpace()
 // 第一张可见窗口就应具有已准备好的尺寸，不能把稍后的异步 resize 暴露给用户。
 void MaiFfplayVideoDialogTest::videoOpensAtPreparedGeometry_data() {
     QTest::addColumn<bool>("nativeHdr");
-    QTest::newRow("sdr") << false;
+    QTest::addColumn<QSize>("sdrSize");
+    QTest::newRow("sdr") << false << QSize();
+    QTest::newRow("sdr-720p") << false << QSize(1280, 720);
+    QTest::newRow("sdr-1080p") << false << QSize(1920, 1080);
 #if defined(Q_OS_MAC)
-    QTest::newRow("native-hdr") << true;
+    QTest::newRow("native-hdr") << true << QSize();
 #endif
 }
 
 void MaiFfplayVideoDialogTest::videoOpensAtPreparedGeometry() {
     QFETCH(bool, nativeHdr);
+    QFETCH(QSize, sdrSize);
     QTemporaryDir fixtureDirectory;
     QString file = QStringLiteral(MAICHAT_FFPLAY_VIDEO_FIXTURE);
+    if (sdrSize.isValid()) {
+        file = fixtureDirectory.filePath(QStringLiteral("prepared-owned-hd.mp4"));
+        QProcess generate;
+        generate.start(QStringLiteral("ffmpeg"),
+                       {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-f"),
+                        QStringLiteral("lavfi"), QStringLiteral("-i"),
+                        QStringLiteral("testsrc2=size=%1x%2:rate=24:duration=2")
+                            .arg(sdrSize.width()).arg(sdrSize.height()),
+                        QStringLiteral("-c:v"), QStringLiteral("libx264"), QStringLiteral("-preset"),
+                        QStringLiteral("ultrafast"), QStringLiteral("-an"), file});
+        QVERIFY(generate.waitForFinished(15000));
+        QCOMPARE(generate.exitCode(), 0);
+    }
     if (nativeHdr) {
         file = fixtureDirectory.filePath(QStringLiteral("prepared-owned-hlg.mov"));
         QProcess generate;
@@ -1319,7 +1337,87 @@ void MaiFfplayVideoDialogTest::videoOpensAtPreparedGeometry() {
             << probe.shows;
     QCOMPARE(probe.shows, 1);
     QCOMPARE(probe.geometry, player->geometry());
+    if (sdrSize.isValid()) {
+        // Large sources share a moderate, ordinary default on every desktop;
+        // source pixels are not a request to nearly fill a logical screen.
+        QVERIFY(player->width() <= 960);
+        QVERIFY(player->height() <= 540);
+        QCOMPARE(player->windowState(), Qt::WindowNoState);
+    }
     if (nativeHdr) QVERIFY(player->hasPresentedHdrFrame());
+}
+
+// The first Qt Show geometry does not prove the Cocoa/Metal presentation is
+// already at that size. Sample the actual owned native layers from first map.
+void MaiFfplayVideoDialogTest::preparedVideoKeepsFirstNativeViewport() {
+#if defined(Q_OS_MAC)
+    const QString fixture = qEnvironmentVariable("MAICHAT_FFPLAY_OPEN_TRACE_VIDEO");
+    if (fixture.isEmpty()) QSKIP("Explicit owned HD opening fixture required");
+    QVERIFY(QFileInfo(fixture).isFile());
+    RemoteIMApplication app(QStringLiteral("owned-native-open-trace"), std::make_unique<FakeRemoteIMClient>());
+    MainWindow main(app);
+    showOwnTestWindow(&main);
+    QPointer<MaiFfplayVideoDialog> player;
+    QJsonArray samples;
+    QElapsedTimer elapsed;
+    elapsed.start();
+    const auto sample = [&] {
+        if (!player) return;
+        auto* surface = player->findChild<QWidget*>(QStringLiteral("ffplayVideoSurface"));
+        if (!surface) return;
+        QJsonObject value = ffplayTestVideoLayerGeometry(surface);
+        value.insert(QStringLiteral("ms"), double(elapsed.elapsed()));
+        value.insert(QStringLiteral("qtVisible"), player->isVisible());
+        value.insert(QStringLiteral("qtWidth"), player->width());
+        value.insert(QStringLiteral("qtHeight"), player->height());
+        value.insert(QStringLiteral("surfaceWidth"), surface->width());
+        value.insert(QStringLiteral("surfaceHeight"), surface->height());
+        value.insert(QStringLiteral("presentedFrames"), double(player->presentedFrames()));
+        samples.append(value);
+    };
+    QTimer sampler;
+    sampler.setInterval(8);
+    connect(&sampler, &QTimer::timeout, this, sample);
+    sampler.start();
+    QVERIFY(main.openVideoWindow(fixture, {}));
+    player = MaiFfplayVideoDialog::activeDialog();
+    QVERIFY(player);
+    const auto close = qScopeGuard([&] {
+        sampler.stop();
+        if (player) player->close();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    });
+    sample();
+    QTRY_VERIFY_WITH_TIMEOUT(player->hasPresentedFrame() && player->isVisible(), 10000);
+    QTest::qWait(800);
+    sampler.stop();
+    const QString output = qEnvironmentVariable("MAICHAT_FFPLAY_OPEN_TRACE_JSON");
+    if (!output.isEmpty()) {
+        QFile file(output);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QVERIFY(file.write(QJsonDocument(samples).toJson()) > 0);
+    }
+    int visible = 0;
+    int mismatched = 0;
+    int nativeOpeningAnimations = 0;
+    for (const auto& entry : samples) {
+        const auto value = entry.toObject();
+        if (!value.value("windowVisible").toBool()) continue;
+        if (visible++ == 0) qInfo() << "[first-native-open]" << value;
+        if (!value.value("windowOpeningAnimationDisabled").toBool()) ++nativeOpeningAnimations;
+        if (std::abs(value.value("shownMetalWidth").toDouble() - value.value("surfaceWidth").toDouble()) > 1 ||
+            std::abs(value.value("shownMetalHeight").toDouble() - value.value("surfaceHeight").toDouble()) > 1 ||
+            std::abs(value.value("shownViewportWidth").toDouble() - value.value("surfaceWidth").toDouble()) > 1 ||
+            std::abs(value.value("shownViewportHeight").toDouble() - value.value("surfaceHeight").toDouble()) > 1)
+            ++mismatched;
+    }
+    qInfo() << "[native-open-summary] samples" << samples.size() << "visible" << visible << "mismatched" << mismatched;
+    QVERIFY(visible > 0);
+    QCOMPARE(mismatched, 0);
+    QCOMPARE(nativeOpeningAnimations, 0);
+#else
+    QSKIP("Native Cocoa presentation sample");
+#endif
 }
 
 void MaiFfplayVideoDialogTest::preparedVideoCanFailOrCancelWithoutLateShow() {

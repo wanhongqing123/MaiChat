@@ -1009,6 +1009,10 @@ void AgentController::onEventQueued(const MaiEvent& event) {
     }
 
     switch (event.type) {
+        case MaiEventType::SessionStatus:
+            if (event.detail == "running" && !event.turnId.empty()) emit turnStarted(sessionId, fromUtf8(event.turnId));
+            return;
+
         case MaiEventType::MessageUpdated: {
             MaiMessage message;
             if (runtime_->agent->getMessage(event.sessionId, event.messageId, message)) {
@@ -1123,7 +1127,7 @@ void AgentController::onEventQueued(const MaiEvent& event) {
 
         default:
             // SessionCreated / SessionDeleted / MessageUpdated / MessageRemoved /
-            // MessagePartRemoved / SessionStatus：界面拿不到新信息。
+            // MessagePartRemoved：界面拿不到新信息。
             // 建会话和发消息的返回值里已经有 id 了，删除由发起那一侧自己知道。
             return;
     }

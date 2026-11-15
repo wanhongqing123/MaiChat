@@ -119,6 +119,8 @@ QJsonObject ffplayTestVideoLayerGeometry(QWidget* widget) {
     value.insert("rootAnimationCount", int(root.animationKeys.count));
     value.insert("windowLevel", double(view.window.level));
     value.insert("windowAlpha", double(view.window.alphaValue));
+    value.insert("windowAnimationBehavior", int(view.window.animationBehavior));
+    value.insert("windowOpeningAnimationDisabled", view.window.animationBehavior == NSWindowAnimationBehaviorNone);
     value.insert("windowOnActiveSpace", bool([view.window isOnActiveSpace]));
     value.insert("windowKey", bool(view.window.keyWindow));
     value.insert("windowMain", bool(view.window.mainWindow));

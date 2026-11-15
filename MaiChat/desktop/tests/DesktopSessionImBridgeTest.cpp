@@ -2,6 +2,7 @@
 // accounts, network requests, OS clipboard access or a running user application.
 #include <QApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QFuture>
@@ -9,6 +10,7 @@
 #include <QImage>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QPushButton>
 #include <QSemaphore>
 #include <QScopeGuard>
 #include <QSettings>
@@ -16,6 +18,7 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QTextEdit>
 #include <QThreadPool>
 #include <QUuid>
 #include <QtTest>
@@ -28,6 +31,7 @@
 #include <mutex>
 
 #include "agent/AgentController.h"
+#include "agent/AgentChatPanel.h"
 #include "agent/AgentSessionList.h"
 #include "agent/DesktopSessionImBridge.h"
 #include "app/RemoteIMApplication.h"
@@ -482,6 +486,10 @@ private slots:
     void machineSendRevocationLeavesNoPendingRow();
     void logoutBeginningRejectsInputBeforeSdkDisconnectCompletes();
     void bindingIsExplicitAndExclusive();
+    void acceptedInputShowsThinkingBeforeFirstModelOutput_data();
+    void acceptedInputShowsThinkingBeforeFirstModelOutput();
+    void boundInputThinkingFollowsSessionSwitchAndStop();
+    void finishedTurnCannotReopenThinkingFromQueuedStart();
     void locallyStartedBoundTurnPublishesCommittedProgressBeforeToolCompletes();
     void bindingBusyLocalTurnPublishesOnlyCommitsAfterCutover();
     void localTurnStopUnbindAndRebindDiscardOldOutput();
@@ -561,6 +569,121 @@ void DesktopSessionImBridgeTest::cleanupTestCase() {
     QStandardPaths::setTestModeEnabled(previousTestMode_);
     QCoreApplication::setOrganizationName(previousOrganization_);
     QCoreApplication::setApplicationName(previousApplication_);
+}
+
+void DesktopSessionImBridgeTest::acceptedInputShowsThinkingBeforeFirstModelOutput_data() {
+    QTest::addColumn<bool>("boundInput");
+    QTest::newRow("local-composer") << false;
+    QTest::newRow("bound-friend") << true;
+}
+
+void DesktopSessionImBridgeTest::acceptedInputShowsThinkingBeforeFirstModelOutput() {
+    QFETCH(bool, boundInput);
+    Fixture f;
+    QTRY_VERIFY(f.app.isConnected());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    AgentChatPanel panel(f.controller);
+    panel.resize(850, 620);
+    panel.openSession(f.session);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    auto* editor = panel.findChild<QTextEdit*>();
+    auto* send = panel.findChild<QPushButton*>(QStringLiteral("agentSendButton"));
+    auto* stop = panel.findChild<QPushButton*>(QStringLiteral("agentStopButton"));
+    QVERIFY(editor && send && stop);
+    f.model->blockFirst = true;
+    std::atomic<int> starts{0};
+    std::atomic<bool> registeredBeforeOutput{false};
+    const auto started = f.controller.agent().eventBus().subscribe([&](const MaiEvent& event) {
+        if (event.type != MaiEventType::SessionStatus || event.detail != "running" ||
+            event.sessionId != f.session.toStdString())
+            return;
+        ++starts;
+        registeredBeforeOutput = !event.turnId.empty() && f.model->calls.load() == 0 &&
+                                 f.controller.agent().isBusy(event.sessionId) &&
+                                 f.controller.agent().activeTurnId(event.sessionId) == event.turnId;
+    });
+    const auto unsubscribe = qScopeGuard([&] { f.controller.agent().eventBus().unsubscribe(started); });
+    editor->setPlainText(boundInput ? QStringLiteral("Unsent local draft") : QStringLiteral("owned same prompt"));
+    QElapsedTimer elapsed;
+    elapsed.start();
+    if (boundInput)
+        f.im->incoming(QStringLiteral("owned-thinking-start"), QStringLiteral("owned same prompt"));
+    else
+        send->click();
+    QTRY_VERIFY_WITH_TIMEOUT(f.model->entered.available() > 0, 1500);
+    QVERIFY(f.controller.agent().isBusy(f.session.toStdString()));
+    QCOMPARE(starts.load(), 1);
+    QVERIFY(registeredBeforeOutput.load());
+    auto hasThinking = [&] {
+        for (QWidget* card : panel.findChildren<QWidget*>(QStringLiteral("agentThinkingCard")))
+            if (card->isVisibleTo(&panel)) return true;
+        return false;
+    };
+    const bool thinkingBeforeOutput = QTest::qWaitFor(hasThinking, 300);
+    qInfo() << "[accepted-input-thinking]" << boundInput << "elapsedMs" << elapsed.elapsed() << "beforeFirstOutput"
+            << thinkingBeforeOutput << "stopVisible" << stop->isVisibleTo(&panel);
+    QVERIFY2(thinkingBeforeOutput, "Accepted bound input must show thinking while the first model output is withheld");
+    QVERIFY(stop->isVisibleTo(&panel));
+    QCOMPARE(editor->toPlainText(), boundInput ? QStringLiteral("Unsent local draft") : QString());
+    const QString capture = qEnvironmentVariable("MAICHAT_THINKING_START_CAPTURE");
+    if (!capture.isEmpty() && boundInput) QVERIFY(panel.grab().save(capture));
+    f.model->release.release();
+    QTRY_VERIFY_WITH_TIMEOUT(!f.controller.agent().isBusy(f.session.toStdString()), 2000);
+    QTRY_VERIFY(!hasThinking() && !stop->isVisibleTo(&panel));
+    QCOMPARE(f.model->calls.load(), 1);
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
+}
+
+void DesktopSessionImBridgeTest::boundInputThinkingFollowsSessionSwitchAndStop() {
+    Fixture f;
+    QTRY_VERIFY(f.app.isConnected());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    AgentChatPanel panel(f.controller);
+    panel.resize(850, 620);
+    const QString other = f.controller.createSession(f.workspace.path());
+    panel.openSession(other);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    auto* stop = panel.findChild<QPushButton*>(QStringLiteral("agentStopButton"));
+    QVERIFY(stop);
+    const auto hasThinking = [&] {
+        for (QWidget* card : panel.findChildren<QWidget*>(QStringLiteral("agentThinkingCard")))
+            if (card->isVisibleTo(&panel)) return true;
+        return false;
+    };
+    f.model->blockFirst = true;
+    f.im->incoming(QStringLiteral("owned-background-start"), QStringLiteral("owned background input"));
+    QTRY_VERIFY_WITH_TIMEOUT(f.model->entered.available() > 0, 1500);
+    QCoreApplication::processEvents();
+    QVERIFY(!hasThinking() && !stop->isVisibleTo(&panel));
+    panel.openSession(f.session);
+    QVERIFY(hasThinking() && stop->isVisibleTo(&panel));
+    stop->click();
+    f.model->release.release();
+    QTRY_VERIFY_WITH_TIMEOUT(!f.controller.agent().isBusy(f.session.toStdString()), 2000);
+    QTRY_VERIFY(!hasThinking() && !stop->isVisibleTo(&panel));
+    QCOMPARE(f.bridge.boundSession(QStringLiteral("friend")), f.session);
+}
+
+void DesktopSessionImBridgeTest::finishedTurnCannotReopenThinkingFromQueuedStart() {
+    Fixture f;
+    QTRY_VERIFY(f.app.isConnected());
+    QVERIFY(f.bind(QStringLiteral("friend"), f.session));
+    AgentChatPanel panel(f.controller);
+    panel.resize(850, 620);
+    panel.openSession(f.session);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    QSignalSpy starts(&f.controller, &AgentController::turnStarted);
+    QVERIFY(f.controller.agent().submit(MaiSendPrompt{f.session.toStdString(), "owned fast input"}));
+    f.controller.agent().waitIdle();  // Hold GUI delivery until this owned turn has already finished.
+    QTRY_COMPARE(starts.count(), 1);
+    QVERIFY(!f.controller.agent().isBusy(f.session.toStdString()));
+    for (QWidget* card : panel.findChildren<QWidget*>(QStringLiteral("agentThinkingCard")))
+        QVERIFY(!card->isVisibleTo(&panel));
+    QVERIFY(!panel.findChild<QPushButton*>(QStringLiteral("agentStopButton"))->isVisibleTo(&panel));
+    QCOMPARE(f.model->calls.load(), 1);
 }
 
 void DesktopSessionImBridgeTest::machineSendUsesMachineOriginAndRejectsLateAccountReceipt() {
