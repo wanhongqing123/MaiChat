@@ -3302,6 +3302,59 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 }
             updateTime();
             bindRemoteImages();
+            if (!outgoing) updateImagePartSpacing();
+        }
+        private boolean isImagePartView(View view) {
+            if (view instanceof RemoteImageCard) return true;
+            if (!(view instanceof ViewGroup)) return false;
+            ViewGroup group = (ViewGroup) view;
+            return group.getChildCount() > 0 && group.getChildAt(0) instanceof MaiImageMessageRow;
+        }
+        private void updateImagePartSpacing() {
+            // AIMessageRow on iOS uses one 14pt outer gap. Keep that space
+            // outside the fitted image, and fill only what a preceding text's
+            // existing bottom margin does not already provide.
+            int gap = dp(14);
+            View previous = null;
+            boolean previousImage = false;
+            for (int index = 0; index < getChildCount(); index++) {
+                View child = getChildAt(index);
+                if (child.getVisibility() == GONE) continue;
+                boolean image = isImagePartView(child);
+                LayoutParams layout = (LayoutParams) child.getLayoutParams();
+                if (image) {
+                    int top = previous == null || previousImage ? 0
+                        : Math.max(0, gap - ((LayoutParams) previous.getLayoutParams()).bottomMargin);
+                    if (layout.topMargin != top) {
+                        layout.topMargin = top;
+                        child.setLayoutParams(layout);
+                    }
+                } else if (mediaCards.containsValue(child)
+                        && (layout.topMargin != 0 || layout.bottomMargin != dp(12))) {
+                    // Rebinding an image artifact as other media restores the
+                    // ordinary media block margins rather than retaining a gap.
+                    layout.topMargin = 0;
+                    layout.bottomMargin = dp(12);
+                    child.setLayoutParams(layout);
+                }
+                if (previousImage) {
+                    LayoutParams before = (LayoutParams) previous.getLayoutParams();
+                    int bottom = Math.max(0, gap - layout.topMargin);
+                    if (before.bottomMargin != bottom) {
+                        before.bottomMargin = bottom;
+                        previous.setLayoutParams(before);
+                    }
+                }
+                previous = child;
+                previousImage = image;
+            }
+            if (previousImage) {
+                LayoutParams last = (LayoutParams) previous.getLayoutParams();
+                if (last.bottomMargin != 0) {
+                    last.bottomMargin = 0;
+                    previous.setLayoutParams(last);
+                }
+            }
         }
         private void bindRemoteImages() {
             JSONArray values = message == null ? null : message.optJSONArray("parts");
@@ -3961,7 +4014,9 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
         if (!caption.isEmpty()) {
             TextView description = MaiChatTypography.body(activity);
             description.setText(caption);
-            container.addView(description, matchWrap());
+            LayoutParams descriptionLayout = matchWrap();
+            if (type.equals("image")) descriptionLayout.topMargin = dp(8);
+            container.addView(description, descriptionLayout);
         }
         if (type.equals("video") && completedPart != null && videoCircleAvailable &&
             MaiVideoCircle.inspectCard(completedPart).ok()) {

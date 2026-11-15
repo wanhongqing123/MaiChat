@@ -62,3 +62,37 @@ excludes the original MobileAgentAdapter WIP. The user's existing instruction to
 install normal fixes on the phone remains in force. The installed artifact,
 process and actual image/text geometry must be checked after that update; the
 separate server deployment still requires its pending operational go-ahead.
+
+## User feedback on 283 and iOS spacing reference
+
+Normal 283/2.2.41 from source
+`176b819ed05a28541097d28ed09b490582319212` was installed retaining data, exit 0
+in 65.034 seconds. Local/installed APK SHA-256 matched
+`41a4ffc68c3d2aec774f040fa907c1ea611b48ac06731d102d716bcbd168a0ac`;
+the new process was 12519. Actual loaded image/card heights became 275 pixels
+instead of 480 pixels, so aspect-ratio sizing was correct. The actual image
+rectangles `[48,806]-[488,1081]` and `[48,1081]-[488,1338]` also exposed the
+remaining problem: consecutive parts now touched. The user reported that 283
+was too tight and explicitly requested the iOS spacing. This version was not
+declared final visual acceptance.
+
+The actual iOS `AIMessageRow` root VStack uses 14pt at
+`AIAssistantView.swift:1635`; ordered assistant parts are flattened directly into
+it. Loaded `AIWorkspaceImage` adds no outer padding. A tool-generated image's
+internal caption gap is separately 8pt. The 24pt message/fragment interval and
+tool disclosure padding are not added to image-part spacing.
+
+The Android correction keeps the fitted image geometry and applies one 14dp
+outer gap at assistant image boundaries. Existing text margins contribute to
+that gap rather than stacking another 14dp. A final image does not append an
+extra part gap outside the message, and generated-image captions use the
+separate 8dp internal interval. User bubbles, decoder/cache request identity,
+preview source and video geometry retain their existing paths.
+
+Four new real-Panel measured-layout cases first failed on 283: image/image and
+image/text gaps were 0 instead of 14, preceding text contributed 12 instead of
+14, and image caption spacing was 0 instead of 8. The candidate passed **45/0**
+ordinary cases (media card 9, thumbnail 2, image row 6, summary 4, original drawer
+24) in 30.967 seconds. The next normal phone version is 284/2.2.42; its final
+installed visual acceptance remains pending here. The server deployment remains
+separately unapproved.
