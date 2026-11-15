@@ -1287,6 +1287,11 @@ if(WIN32)
   target_link_libraries(DesktopComputerDragNativeTest PRIVATE maichat_agent Qt6::Widgets Qt6::Test)
   target_include_directories(DesktopComputerDragNativeTest PRIVATE ../../MaiAgent/third_party/nlohmann)
   add_test(NAME DesktopComputerDragNativeTest COMMAND DesktopComputerDragNativeTest)
+  add_executable(DesktopComputerScreenshotChainNativeTest tests/DesktopComputerScreenshotChainNativeTest.cpp
+    src/agent/DesktopScreenCaptureControl.cpp src/agent/DesktopScreenCaptureControl.h)
+  target_link_libraries(DesktopComputerScreenshotChainNativeTest PRIVATE maichat_agent Qt6::Widgets Qt6::Test Qt6::Concurrent dwmapi)
+  target_include_directories(DesktopComputerScreenshotChainNativeTest PRIVATE ../../MaiAgent/third_party/nlohmann)
+  add_test(NAME DesktopComputerScreenshotChainNativeTest COMMAND DesktopComputerScreenshotChainNativeTest)
 endif()
 
 # Whole-display capture/input uses a separate opt-in owned fullscreen fixture.

@@ -1,0 +1,49 @@
+diff --git a/src/gui/text/qinputcontrol.cpp b/src/gui/text/qinputcontrol.cpp
+index d5f52905..29924055 100644
+--- a/src/gui/text/qinputcontrol.cpp
++++ b/src/gui/text/qinputcontrol.cpp
+@@ -48,7 +48,9 @@ bool QInputControl::isAcceptableInput(const QKeyEvent *event) const
+     if (c.isHighSurrogate() && text.size() > 1 && text.at(1).isLowSurrogate())
+         return true;
+ 
+-    if (m_type == TextEdit && c == u'\t')
++    // A literal LF from native Unicode text injection is text, not an Enter
++    // command. Multiline controls must accept it without submitting the form.
++    if (m_type == TextEdit && (c == u'\t' || c == u'\n'))
+         return true;
+ 
+     return false;
+diff --git a/src/plugins/platforms/windows/qwindowskeymapper.cpp b/src/plugins/platforms/windows/qwindowskeymapper.cpp
+index ce90169a..75789622 100644
+--- a/src/plugins/platforms/windows/qwindowskeymapper.cpp
++++ b/src/plugins/platforms/windows/qwindowskeymapper.cpp
+@@ -1144,7 +1144,14 @@ bool QWindowsKeyMapper::translateKeyEventInternal(QWindow *window, MSG msg,
+                 return true;
+             }
+             if (uch.isLowSurrogate() && !m_lastHighSurrogate.isNull()) {
+-                if (QObject *focusObject = QGuiApplication::focusObject()) {
++                if (msg.wParam == VK_PACKET) {
++                    // Packet text must share the WSI queue with preceding BMP
++                    // keys. A synchronous IM commit overtakes those key events.
++                    const QChar chars[2] = {m_lastHighSurrogate, uch};
++                    sendExtendedPressRelease(receiver, msg.time, Qt::Key_unknown,
++                                             Qt::KeyboardModifiers(state), scancode,
++                                             quint32(msg.wParam), nModifiers, QString(chars, 2));
++                } else if (QObject *focusObject = QGuiApplication::focusObject()) {
+                     const QChar chars[2] = {m_lastHighSurrogate, uch};
+                     QInputMethodEvent event;
+                     event.setCommitString(QString(chars, 2));
+@@ -1219,6 +1226,13 @@ bool QWindowsKeyMapper::translateKeyEventInternal(QWindow *window, MSG msg,
+         if (code == Qt::Key_Tab && (state & Qt::ShiftModifier) == Qt::ShiftModifier)
+             code = Qt::Key_Backtab;
+ 
++        // VK_PACKET is shared by different Unicode characters. A retained
++        // record must not replay the preceding packet's text for a new one.
++        if (msg.wParam == VK_PACKET && rec && rec->text != QString(uch)) {
++            key_recorder.findKey(int(msg.wParam), true);
++            rec = nullptr;
++        }
++
+         // If we have a record, it means that the key is already pressed, the state is the same
+         // so, we have an auto-repeating key
+         if (rec) {

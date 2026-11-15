@@ -400,8 +400,9 @@ int runEditor(const QString& title, const QString& statePath) {
             QCoreApplication::exit(1);
         }
     };
-    QObject::connect(editor, &QPlainTextEdit::textChanged, &window, [&] { save(); });
-    QObject::connect(editor, &QPlainTextEdit::selectionChanged, &window, save);
+    // The heartbeat below publishes actual control state. Flushing the complete
+    // native-key journal to disk for every character/selection stalls this GUI
+    // and turns the receiver itself into the bottleneck under test.
     editor->plainEnter = [&] {
         ++enterCount;
         confirmed->setText(editor->toPlainText());
@@ -625,7 +626,7 @@ private:
     int exitCode_ = 0;
 };
 
-int runParent() {
+int runParent(bool physicalKeyCatalog = true) {
 #if defined(Q_OS_WIN)
     if (QApplication::platformName() != QStringLiteral("windows"))
         return unavailable("a real Windows QPA session is required");
@@ -734,8 +735,9 @@ int runParent() {
     };
 
     if (!workflow.action("focus", Json::object(), QStringLiteral("focus"))) return workflow.exitCode();
-    if (!workflow.action("click", Json::object(), QStringLiteral("click-key-recorder"), InputPosition::RecorderCenter)) return workflow.exitCode();
+    if (physicalKeyCatalog && !workflow.action("click", Json::object(), QStringLiteral("click-key-recorder"), InputPosition::RecorderCenter)) return workflow.exitCode();
 #if defined(Q_OS_WIN)
+    if (physicalKeyCatalog) {
     // A real receiver must distinguish right Ctrl from the existing generic
     // left-Ctrl dispatch. F24 has no shell action in this owned editor.
     const std::size_t rightControlStart = readJson(statePath).value("native_keys", Json::array()).size();
@@ -867,6 +869,7 @@ int runParent() {
             return down && up;
         }, "cancel after modifier down did not release the injected right Control")) return workflow.exitCode();
     if (!workflow.expect(waitUntil(allPhysicalInputReleased), "native key probes left input held")) return workflow.exitCode();
+    }
 #endif
     if (!workflow.action("click", Json::object(), QStringLiteral("click-editor"), InputPosition::Center)) return workflow.exitCode();
     if (!workflow.action("type", {{"text", draft}}, QStringLiteral("type-chinese")) ||
@@ -920,6 +923,10 @@ int main(int argc, char** argv) {
     if (arguments.size() == 2 && arguments[1] == QStringLiteral("--key-mapping"))
         return verifyWindowsMappingsWithoutInput();
 #endif
+    if (arguments.size() == 2 && arguments[1] == QStringLiteral("--text-pointer")) {
+        std::fprintf(stderr, "native scope=text-pointer; exhaustive physical key catalog remains a separate workflow\n");
+        return runParent(false);
+    }
     if (arguments.size() != 1) return 1;
     return runParent();
 }

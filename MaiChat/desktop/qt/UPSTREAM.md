@@ -44,9 +44,23 @@ use curl, WebSockets use WebSocket++, database access uses shared SQLite, and
 media uses FFmpeg/FFplay plus native camera adapters.
 
 Upstream source and its license texts are preserved in each module, including
-`LICENSES/` and third-party notices. Qt is built as shared libraries. No upstream
-source patches are applied. Local tracked source edits cause the incremental
-bootstrap to rebuild, while a different commit requires updating the lock file.
+`LICENSES/` and third-party notices. Qt is built as shared libraries. The pinned
+Windows packet-text overlay in `patches/` keeps complete Unicode pairs in
+the same WSI event queue as preceding BMP characters, prevents a retained packet
+record from replaying a different character, and accepts literal LF text in
+multiline controls without turning it into an Enter command. Normal IME handling
+is unchanged. Its digest and exact file pre/postimage Git blobs are locked in
+`sources.lock.json`. Bootstrap applies it once or verifies the already-applied
+postimage, preserving unrelated work and rejecting mismatched preimages. Other
+platforms do not apply this overlay.
+The patch directory pins LF with `.gitattributes` so a clean Windows Git checkout
+with `core.autocrlf=true` retains the exact digest-locked application bytes.
+
+SDK fingerprints include applied patch digests plus tracked diff and untracked
+source content digests. A dirty-source SDK cannot be reused as a clean-source
+SDK after edits are reverted. Local tracked source edits still force incremental
+Ninja; a different upstream commit requires updating the lock file. Validate the
+overlay rules with `python3 MaiChat/desktop/tests/test_qt_source_patches.py`.
 
 References:
 

@@ -6,7 +6,26 @@
       "name": "qtbase",
       "repository": "https://github.com/qt/qtbase.git",
       "tag": "v6.12.0",
-      "commit": "025bdad181de241e81bf853c8a2d7bf3d19261a9"
+      "commit": "025bdad181de241e81bf853c8a2d7bf3d19261a9",
+      "patches": [
+        {
+          "platform": "windows",
+          "file": "patches/windows-packet-surrogate-order.patch",
+          "sha256": "a66f64b74b19c5b10e2a0f6892451bd8617d05be18429c401174d8ecb97e67de",
+          "files": [
+            {
+              "path": "src/plugins/platforms/windows/qwindowskeymapper.cpp",
+              "before": "ce90169a8da0ff4980bdd38bf389691ca820b96a",
+              "after": "757896222235654e8b4210316dfb88136c45b965"
+            },
+            {
+              "path": "src/gui/text/qinputcontrol.cpp",
+              "before": "d5f5290527b9c80be85d9c706cb462f51d8930b5",
+              "after": "2992405548e5f0c8eebc4a307b7dcacd02015905"
+            }
+          ]
+        }
+      ]
     },
     {
       "name": "qtsvg",

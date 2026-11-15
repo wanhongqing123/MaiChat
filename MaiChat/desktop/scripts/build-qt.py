@@ -26,6 +26,53 @@ def git(source, *args):
     return subprocess.check_output(["git", "-C", str(source), *args], text=True).strip()
 
 
+def apply_source_patches(source_root, source, module, system):
+    """Apply only digest-locked overlays to exact preimages, preserving other work."""
+    applied = []
+    for entry in module.get("patches", []):
+        if entry["platform"] != system:
+            continue
+        patch = (source_root / entry["file"]).resolve()
+        if not patch.is_relative_to(source_root.resolve()):
+            raise RuntimeError("Qt patch path leaves the locked source root")
+        digest = hashlib.sha256(patch.read_bytes()).hexdigest()
+        if digest != entry["sha256"]:
+            raise RuntimeError(f"Qt patch digest mismatch: {entry['file']}")
+        images = [git(source, "hash-object", "--", item["path"]) for item in entry["files"]]
+        before = [item["before"] for item in entry["files"]]
+        after = [item["after"] for item in entry["files"]]
+        command = ["git", "-C", str(source), "apply"]
+        if images == before:
+            subprocess.run(command + ["--check", str(patch)], check=True)
+            subprocess.run(command + [str(patch)], check=True)
+        elif images == after:
+            subprocess.run(command + ["--reverse", "--check", str(patch)], check=True)
+        else:
+            raise RuntimeError(f"Qt patch preimage mismatch; existing work preserved: {entry['file']}")
+        if [git(source, "hash-object", "--", item["path"]) for item in entry["files"]] != after:
+            raise RuntimeError(f"Qt patch postimage mismatch: {entry['file']}")
+        applied.append({"module": module["name"], "file": entry["file"], "sha256": digest})
+    return applied
+
+
+def source_state_fingerprint(source):
+    """Dirty SDK outputs must never acquire the cache identity of clean sources."""
+    diff = subprocess.check_output(["git", "-C", str(source), "diff", "--binary", "HEAD"])
+    untracked = hashlib.sha256()
+    names = subprocess.check_output(["git", "-C", str(source), "ls-files", "--others", "--exclude-standard", "-z"])
+    for name in sorted(item for item in names.split(b"\0") if item):
+        untracked.update(name + b"\0")
+        path = source / name.decode("utf-8", errors="surrogateescape")
+        if path.is_symlink():
+            untracked.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+        else:
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    untracked.update(chunk)
+        untracked.update(b"\0")
+    return {"trackedDiffSHA256": hashlib.sha256(diff).hexdigest(), "untrackedSHA256": untracked.hexdigest()}
+
+
 def parse_msvc_include_prefix(output):
     """Use the compiler's actual bytes rather than CMake's localized decoding."""
     try:
@@ -96,6 +143,8 @@ def main():
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     sources = []
+    patches = []
+    source_states = {}
     dirty = False
     for module in lock["modules"]:
         source = source_root / module["name"]
@@ -104,6 +153,8 @@ def main():
         actual = git(source, "rev-parse", "HEAD")
         if actual != module["commit"]:
             parser.error(f"{module['name']} is {actual}, expected locked {module['commit']}")
+        patches.extend(apply_source_patches(source_root, source, module, system))
+        source_states[module["name"]] = source_state_fingerprint(source)
         # A dirty source checkout always runs Ninja, including untracked files.
         # It must never be hidden by the installed SDK's otherwise valid stamp.
         dirty = dirty or bool(git(source, "status", "--porcelain"))
@@ -118,6 +169,8 @@ def main():
     fingerprint = {
         "sdk_profile": profile,
         "sources": sources,
+        "sourceStates": source_states,
+        "sourcePatches": patches,
         "arch": arch,
         "cmake": str(Path(args.cmake).resolve()),
         "c": args.c_compiler,

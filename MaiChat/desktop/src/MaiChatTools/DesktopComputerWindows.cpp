@@ -694,6 +694,20 @@ MaiError maiDesktopActivateWindow(const DesktopNativeWindow& window) {
     if (!windowMatchesProcess(window) || !IsWindowVisible(selected) || IsIconic(selected))
         return {MaiErrorCode::NotFound, "selected Windows window is no longer visible"};
     SetForegroundWindow(selected);
+    // Cross-input-queue activation is asynchronous. Wait only for the real
+    // foreground transition after this one normal request; a message round trip
+    // alone can still precede it. Do not grant rights or attach input queues.
+    // Same-thread activation is already synchronous.
+    if (GetWindowThreadProcessId(selected, nullptr) != GetCurrentThreadId()) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        while (GetForegroundWindow() != selected && std::chrono::steady_clock::now() < deadline) {
+            if (!windowMatchesProcess(window) || !IsWindowVisible(selected) || IsIconic(selected))
+                return {MaiErrorCode::NotFound, "selected Windows window changed while becoming foreground"};
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    if (!windowMatchesProcess(window) || !IsWindowVisible(selected) || IsIconic(selected))
+        return {MaiErrorCode::NotFound, "selected Windows window changed while becoming foreground"};
     if (GetForegroundWindow() != selected)
         return {MaiErrorCode::Busy, "Windows did not allow the selected window to become foreground"};
     return {};

@@ -1943,6 +1943,8 @@ void verifyPublicContract() {
     CHECK(text.value("type", std::string()) == "string");
     CHECK(text.value("minLength", 0) == 0);
     const std::string description = tool->description();
+    CHECK(description.find("whole-display screenshot ratios") != std::string::npos);
+    CHECK(description.find("screenshot does not refresh") != std::string::npos);
     CHECK(description.find("clear only forgets") != std::string::npos);
     CHECK(description.find("does not clear input text") != std::string::npos);
 
