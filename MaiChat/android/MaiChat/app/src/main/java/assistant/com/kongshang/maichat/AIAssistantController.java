@@ -340,6 +340,10 @@ public final class AIAssistantController {
     private JSONObject selectedRemote;
     private JSONObject pendingRemoteSelection;
     private int remoteSelectionGeneration;
+    // Worker-confined receive version for a single bounded read-only reconciliation.
+    private long remotePayloadRevision;
+    private long remoteConfirmationToken;
+    private String remoteConfirmationOwner = "";
     private final AIAssistantRemoteImages.Cache remoteImageCache;
     // Auth's public account ID owns media/cache; accountUserId remains the IM/workspace owner.
     // Retain this snapshot with accountToolLoginGeneration so a same-account relogin cannot adopt old work.
@@ -1806,14 +1810,38 @@ public final class AIAssistantController {
             first.optString("login_session_id").equals(second.optString("login_session_id")) &&
             first.optString("id").equals(second.optString("id"));
     }
+    private static String remoteRuntimeStamp(JSONObject owner) {
+        return owner == null ? "" : new JSONArray().put(pageOwner(owner)).put(owner.optBoolean("online"))
+            .put(owner.optBoolean("busy")).put(owner.optString("turnId")).toString();
+    }
 
     void acceptRemoteCatalog(JSONArray entries, JSONArray devices, String ownSlot) {
         worker.post(() -> {
+            final String beforeRuntime = remoteRuntimeStamp(selectedRemote);
+            boolean confirmIdle = false;
             JSONArray next = new JSONArray();
             if (entries != null) for (int i = 0; i < entries.length(); i++) {
                 JSONObject entry = entries.optJSONObject(i);
-                if (entry != null && !ownSlot.equals(entry.optString("device_slot")))
+                if (entry != null && !ownSlot.equals(entry.optString("device_slot"))) {
+                    boolean selectedOwner = sameRemote(selectedRemote, entry);
+                    boolean oldBusy = selectedOwner && entry.optBoolean("busy") &&
+                        (remotePages.isConfirmedEndedTurn(entry.optString("turnId")) ||
+                         olderInitialTurn(entry.optString("turnId"), selectedRemote.optString("turnId")));
+                    boolean uncertainIdle = selectedOwner && pendingRemoteSelection == null &&
+                        selectedRemote.optBoolean("busy") && !entry.optBoolean("busy");
+                    if (oldBusy || uncertainIdle) {
+                        // Catalog and room messages are independent async inputs.
+                        // Adopt fresh labels/configuration, but never revive an
+                        // ended initial turn or overwrite a genuinely newer one.
+                        try {
+                            entry = AIAssistantToolDetails.copy(entry)
+                                .put("busy", selectedRemote.optBoolean("busy"))
+                                .put("turnId", selectedRemote.optString("turnId"));
+                        } catch (Exception invalid) { continue; }
+                        confirmIdle |= uncertainIdle;
+                    }
                     next.put(entry);
+                }
             }
             long now = System.currentTimeMillis();
             java.util.Iterator<Map.Entry<String, Long>> pending =
@@ -1894,8 +1922,13 @@ public final class AIAssistantController {
                     } catch (Exception ignored) { /* Keep the prior offline view. */ }
                 }
             }
+            if (!beforeRuntime.equals(remoteRuntimeStamp(selectedRemote))) ++remotePayloadRevision;
             publishState();
+            if (confirmIdle && selectedRemote != null) confirmRemoteHistory(selectedRemote);
         });
+    }
+    private static boolean olderInitialTurn(String incoming, String current) {
+        return !incoming.isEmpty() && !current.isEmpty() && incoming.compareTo(current) < 0;
     }
 
     void markRemoteCatalogOffline() {
@@ -2667,7 +2700,15 @@ public final class AIAssistantController {
     }
 
     void acceptRemotePayload(JSONObject envelope, JSONObject payload) {
+        acceptRemotePayload(envelope, payload, -1, -1);
+    }
+    private void acceptRemotePayload(JSONObject envelope, JSONObject payload,
+                                    long expectedRevision, int expectedSelection) {
         worker.post(() -> {
+            boolean initialCutover = payload.optBoolean("initialHistoryPage") && pendingRemoteSelection == null
+                && expectedSelection + 1 == remoteSelectionGeneration;
+            if (closed || expectedRevision >= 0 && expectedRevision != remotePayloadRevision
+                || expectedSelection >= 0 && expectedSelection != remoteSelectionGeneration && !initialCutover) return;
             if (payload.optString("type").equals("command_result")) {
                 String command = payload.optString("command_id");
                 if (acceptImagePublicationResult(envelope, payload)) return;
@@ -2717,6 +2758,27 @@ public final class AIAssistantController {
             }
             JSONArray received = payload.optJSONArray("messages");
             if (!payload.optBoolean("ok") || received == null) return;
+            final AIAssistantMessagePages.Ticket snapshotTicket = remotePages.select(pageOwner(owner));
+            if (payload.optBoolean("busy") && olderInitialTurn(payload.optString("turnId"), owner.optString("turnId")))
+                for (String name : new String[] {"busy", "turnId", "permissions", "questions", "questionMessages"})
+                    payload.remove(name); // A later initial turn is already known, even if the intervening idle was missed.
+            final boolean mailboxSnapshot = expectedSelection < 0 && !payload.optBoolean("initialHistoryPage");
+            if (mailboxSnapshot && (!remotePages.admitMailboxEnvelope(envelope.optLong("id")) ||
+                payload.optBoolean("busy") && remotePages.isConfirmedEndedTurn(payload.optString("turnId"))))
+                return; // A persisted old live receipt cannot revive a turn already confirmed idle by this owner.
+            if (mailboxSnapshot && pendingRemoteSelection == null && payload.has("busy")
+                && !payload.optBoolean("busy") && owner.optBoolean("busy")
+                && !remotePages.initialHistoryAdvancesCurrent(payload, owner.optString("turnId"))) {
+                // An old/state-only idle cannot terminate a newer known turn. Confirm
+                // through the same bounded read API; never infer turn idle from a segment.
+                confirmRemoteHistory(owner);
+                return;
+            }
+            final boolean initialAfterLive = payload.optBoolean("initialHistoryPage") && pendingRemoteSelection == null;
+            if (initialAfterLive && !remotePages.initialHistoryAdvancesCurrent(payload, owner.optString("turnId")))
+                for (String name : new String[] {"busy", "turnId", "permissions", "questions", "questionMessages"})
+                    payload.remove(name);
+            ++remotePayloadRevision;
             // 群历史/状态事件比 15 秒 presence 更新更快；busy 与 turnId 必须一起更新所有者快照。
             try {
                 for (int i = 0; i < remoteSessions.length(); i++) {
@@ -2747,8 +2809,9 @@ public final class AIAssistantController {
                 remoteData = payload;
             }
             try {
-                AIAssistantMessagePages.Ticket ticket = remotePages.select(pageOwner(owner));
-                remotePages.acceptSnapshot(ticket, payload);
+                remotePages.acceptSnapshot(snapshotTicket, payload);
+                if (payload.has("busy") && !payload.optBoolean("busy") && payload.optString("turnId").isEmpty())
+                    remotePages.observeOwnerIdle(received);
                 applyMessagePages(remoteData, remotePages);
                 if (payload.has("permissions")) remoteData.put("permissions", payload.optJSONArray("permissions"));
                 if (payload.has("questions")) remoteData.put("questions", payload.optJSONArray("questions"));
@@ -2763,6 +2826,7 @@ public final class AIAssistantController {
                     || !observed.isEmpty() && !observed.equals(known))
                     requestRemoteModel(owner, null, null, null);
             } catch (Exception failure) { /* Existing history stays visible if metadata is unavailable. */ }
+            if (initialAfterLive) confirmRemoteHistory(owner);
         });
     }
 
@@ -2957,14 +3021,22 @@ public final class AIAssistantController {
                             publishState();
                         }
                         if (failure.isEmpty() && page != null) {
-                            try { page.put("initialHistoryPage", true); }
-                            catch (Exception ignored) { /* Only the first history response sets its old-page boundary. */ }
+                            final JSONObject history;
+                            try {
+                                history = AIAssistantToolDetails.copy(page);
+                                history.put("initialHistoryPage", true);
+                            } catch (Exception invalid) {
+                                error = safeMessage(invalid);
+                                publishState();
+                                main.post(() -> completion.accept(false));
+                                return;
+                            }
                             JSONObject envelope = new JSONObject();
                             try { envelope.put("session_id", remote.optString("id"))
                                 .put("from_slot", remote.optString("device_slot"))
                                 .put("from_login_session_id", remote.optString("login_session_id")); }
                             catch (Exception ignored) { /* Fixed fields. */ }
-                            acceptRemotePayload(envelope, page);
+                            acceptRemotePayload(envelope, history, -1, generation);
                         }
                         main.post(() -> completion.accept(failure.isEmpty()));
                     });
@@ -2979,6 +3051,49 @@ public final class AIAssistantController {
                 main.post(() -> completion.accept(false));
             }
         });
+    }
+
+    private void confirmRemoteHistory(JSONObject owner) {
+        if (closed || !sameRemote(selectedRemote, owner)) return;
+        final int generation = remoteSelectionGeneration;
+        final long revision = remotePayloadRevision;
+        final JSONObject target = AIAssistantToolDetails.copy(owner);
+        final String key = generation + ":" + pageOwner(target);
+        if (key.equals(remoteConfirmationOwner)) return;
+        final long token = ++remoteConfirmationToken;
+        remoteConfirmationOwner = key;
+        java.util.function.BiConsumer<JSONObject, String> completed = (page, failure) -> worker.post(() -> {
+            if (token != remoteConfirmationToken) return;
+            if (closed || generation != remoteSelectionGeneration || revision != remotePayloadRevision
+                || !sameRemote(selectedRemote, target) || !failure.isEmpty() || page == null) {
+                remoteConfirmationOwner = "";
+                return;
+            }
+            JSONObject envelope = new JSONObject();
+            try {
+                JSONObject confirmed = AIAssistantToolDetails.copy(page);
+                confirmed.remove("initialHistoryPage");
+                envelope.put("session_id", target.optString("id"))
+                    .put("from_slot", target.optString("device_slot"))
+                    .put("from_login_session_id", target.optString("login_session_id"));
+                // 最终写入仍在统一 worker 入口重核；回调后到排队应用前也可能有新直播。
+                acceptRemotePayload(envelope, confirmed, revision, generation);
+            } catch (Exception invalid) { Log.w("MaiChatAgent", "Remote Session confirmation was invalid"); }
+            // Coalesce until the queued application (including its final fence)
+            // has run, not merely until the transport callback was delivered.
+            worker.post(() -> {
+                if (token == remoteConfirmationToken) remoteConfirmationOwner = "";
+            });
+        });
+        try {
+            if (sessionReads != null)
+                sessionReads.history(target, "", AIAssistantMessagePages.LATEST_LIMIT, completed);
+            else if (sessionSync != null)
+                sessionSync.readRemoteHistory(target, "", AIAssistantMessagePages.LATEST_LIMIT, completed);
+        } catch (Exception unavailable) {
+            if (token == remoteConfirmationToken) remoteConfirmationOwner = "";
+            Log.w("MaiChatAgent", "Remote Session confirmation was unavailable");
+        }
     }
 
     private boolean hasRemoteModelOwner(JSONObject owner) {

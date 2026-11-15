@@ -7,6 +7,48 @@ import org.json.JSONObject;
 import org.junit.Test;
 
 public final class AIAssistantMessagePagesTest {
+    @Test public void ordinaryLiveSnapshotKeepsAlreadyAcceptedCompletedBody() throws Exception {
+        AIAssistantMessagePages pages = new AIAssistantMessagePages(true);
+        AIAssistantMessagePages.Ticket current = pages.select("owned-source");
+        JSONObject complete = message(2, "Owned final answer");
+        complete.getJSONArray("parts").put(new JSONObject().put("id", "tool_owned")
+            .put("kind", "tool").put("tool", "owned_tool").put("state", "completed"));
+        pages.acceptSnapshot(current, new JSONObject().put("messages", new JSONArray().put(complete)));
+        JSONObject old = message(2, "Owned ").put("completed", 0);
+        old.getJSONArray("parts").put(new JSONObject().put("id", "tool_owned")
+            .put("kind", "tool").put("tool", "owned_tool").put("state", "running"));
+        pages.acceptSnapshot(current, new JSONObject().put("messages", new JSONArray().put(old)));
+        JSONObject shown = pages.messages().getJSONObject(0);
+        assertEquals("Owned final answer", shown.getJSONArray("parts").getJSONObject(0).getString("text"));
+        assertEquals("completed", shown.getJSONArray("parts").getJSONObject(1).getString("state"));
+    }
+
+    @Test public void delayedInitialHistoryCannotReplaceNewerCompletedTool() throws Exception {
+        AIAssistantMessagePages pages = new AIAssistantMessagePages(true);
+        AIAssistantMessagePages.Ticket current = pages.select("owned-windows-session");
+        JSONObject completed = new JSONObject().put("id", "msg_0002").put("role", "assistant")
+            .put("completed", 2000).put("active", false)
+            .put("parts", new JSONArray().put(new JSONObject().put("id", "prt_tool")
+                .put("kind", "tool").put("tool", "owned_tool").put("state", "completed")));
+        pages.acceptSnapshot(current, new JSONObject().put("messages", new JSONArray().put(completed)));
+        JSONObject captured = new JSONObject(completed.toString()).put("completed", 0).put("active", true);
+        captured.getJSONArray("parts").getJSONObject(0).put("state", "running");
+        pages.acceptSnapshot(current, new JSONObject().put("initialHistoryPage", true)
+            .put("messages", new JSONArray().put(captured).put(message(1, "Original user request"))));
+        JSONObject visible = null;
+        boolean olderPresent = false;
+        JSONArray loaded = pages.messages();
+        for (int i = 0; i < loaded.length(); i++) {
+            JSONObject row = loaded.getJSONObject(i);
+            if (row.optString("id").equals("msg_0002")) visible = row;
+            if (row.optString("id").equals("msg_0001")) olderPresent = true;
+        }
+        assertNotNull(visible);
+        assertEquals("A delayed initial read must retain the later tool completion", "completed",
+            visible.getJSONArray("parts").getJSONObject(0).getString("state"));
+        assertTrue("Previously unseen historical rows are still useful", olderPresent);
+    }
+
     private static JSONObject message(int number, String text) throws Exception {
         return new JSONObject().put("id", String.format(java.util.Locale.ROOT, "msg_%04d", number))
             .put("role", "assistant").put("completed", 1)
