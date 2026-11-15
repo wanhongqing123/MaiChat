@@ -602,7 +602,9 @@ void MaiFfplayVideoDialog::updateControlLayout() {
     // 普通窗口与全屏均覆盖完整视频，控件显隐不改变画面比例或引入固定黑色 footer。
     bool shown = isVisible() && !isMinimized() && hudOwnerActive_ && (!isFullScreen() || controlsVisible_);
 #if defined(Q_OS_MAC)
-    shown = shown && !closeAfterFullscreen_;
+    shown = shown && !closeAfterFullscreen_ && !initialShowPending_;
+#elif defined(Q_OS_WIN)
+    shown = shown && !windowsOwnerMapping_;
 #endif
     const QPoint origin = mapToGlobal(QPoint());
     titleBar_->setGeometry(QRect(origin, QSize(width(), 46)));
@@ -743,7 +745,9 @@ void MaiFfplayVideoDialog::revealControls() {
     controlsVisible_ = true;
     bool shown = isVisible() && !isMinimized() && hudOwnerActive_;
 #if defined(Q_OS_MAC)
-    shown = shown && !closeAfterFullscreen_;
+    shown = shown && !closeAfterFullscreen_ && !initialShowPending_;
+#elif defined(Q_OS_WIN)
+    shown = shown && !windowsOwnerMapping_;
 #endif
     if (titleBar_) {
         titleBar_->setVisible(shown);
@@ -1567,6 +1571,24 @@ bool MaiFfplayVideoDialog::navigateVideo(int direction) {
     return true;
 }
 
+#if defined(Q_OS_WIN)
+void MaiFfplayVideoDialog::setVisible(bool visible) {
+    if (!visible || isVisible() || windowsOwnerMapping_) {
+        QDialog::setVisible(visible);
+        return;
+    }
+    // ShowEvent still sees the pre-map origin on Windows. The platform may
+    // choose the final owner position later in this synchronous show call;
+    // showing the Tool HUDs there would leave them at that obsolete origin.
+    windowsOwnerMapping_ = true;
+    QDialog::setVisible(true);
+    windowsOwnerMapping_ = false;
+    if (!isVisible() || isMinimized()) return;
+    updateControlLayout();
+    revealControls();
+}
+#endif
+
 bool MaiFfplayVideoDialog::prepareAndShow() {
     if (initialShowPending_) return started_;
     if (initialPresentationDone_ || isVisible()) {
@@ -1583,13 +1605,29 @@ bool MaiFfplayVideoDialog::prepareAndShow() {
 
 void MaiFfplayVideoDialog::finishPreparedShow() {
     if (!initialShowPending_ || !started_ || stopRequested_) return;
+#if defined(Q_OS_MAC)
+    if (initialOwnerMapping_) return;
+    initialOwnerMapping_ = true;
+#else
     initialShowPending_ = false;
+#endif
     initialPresentationDone_ = true;
+#if defined(Q_OS_MAC)
+    maiGraphicsStyleMacVideoWindow(this);
+#endif
+    // ShowEvent precedes Cocoa's native geometry synchronization. Keep the
+    // independent HUDs hidden until show() has mapped the prepared owner;
+    // otherwise they first appear against its old 480x270 native frame.
     show();
 #if defined(Q_OS_MAC)
     // show() 才将隐藏期间的 Qt 尺寸同步到 Cocoa。首次返回事件循环前完成
     // 同一原生视口/内容层的布局事务，避免先显示旧 480x270 子层再铺满窗口。
     maiGraphicsResizeMacLayer(nativeView_, surface_);
+    initialShowPending_ = false;
+    initialOwnerMapping_ = false;
+    if (!started_ || stopRequested_ || !isVisible()) return;
+    updateControlLayout();
+    revealControls();
 #endif
     raise();
     activateWindow();
@@ -1598,11 +1636,15 @@ void MaiFfplayVideoDialog::finishPreparedShow() {
 void MaiFfplayVideoDialog::showEvent(QShowEvent* event) {
     QDialog::showEvent(event);
     initialPresentationDone_ = true;
+#if defined(Q_OS_MAC)
+    // Direct QWidget::show keeps its ordinary behavior, with native styling
+    // established before any owned Tool window can be ordered on screen.
+    maiGraphicsStyleMacVideoWindow(this);
+#endif
     updateControlLayout();
     revealControls();
     if (windowHandle()) windowHandle()->installEventFilter(this);
 #if defined(Q_OS_MAC)
-    maiGraphicsStyleMacVideoWindow(this);
     if (!fullscreenObserver_)
         fullscreenObserver_ = maiObserveMacVideoFullscreen(this, this, [](void* context, MaiMacFullscreenPhase phase) {
             static_cast<MaiFfplayVideoDialog*>(context)->onMacFullscreenPhase(phase);

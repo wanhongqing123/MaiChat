@@ -76,6 +76,8 @@ QString ffplayTestNativeState(QWidget* widget);
 QJsonObject ffplayTestVideoLayerGeometry(QWidget* widget);
 void resizeFfplayTestNativeWindow(QWidget* widget, QSize size);
 void* beginOwnedFfplayDrawableProbe(QWidget* widget);
+void* beginOwnedFfplayWindowOrderProbe(QWidget* widget);
+QJsonArray endOwnedFfplayWindowOrderProbe(void* value);
 void endOwnedFfplayDrawableProbe(void* value);
 QImage copyOwnedFfplayDrawable(void* value);
 bool cancelFfplayTestNativePanel();
@@ -358,6 +360,7 @@ private slots:
     void videoOpensAtPreparedGeometry_data();
     void videoOpensAtPreparedGeometry();
     void preparedVideoKeepsFirstNativeViewport();
+    void preparedVideoConfiguresBeforeNativeWindowOrders();
     void preparedVideoCanFailOrCancelWithoutLateShow();
     void closedPreparedVideoCanBeShownAgain();
     void macClosingVideoIsTransparentBeforeNativeExit();
@@ -1417,6 +1420,61 @@ void MaiFfplayVideoDialogTest::preparedVideoKeepsFirstNativeViewport() {
     QCOMPARE(nativeOpeningAnimations, 0);
 #else
     QSKIP("Native Cocoa presentation sample");
+#endif
+}
+
+void MaiFfplayVideoDialogTest::preparedVideoConfiguresBeforeNativeWindowOrders() {
+#if defined(Q_OS_MAC)
+    const QString fixture = qEnvironmentVariable("MAICHAT_FFPLAY_OPEN_TRACE_VIDEO");
+    if (fixture.isEmpty()) QSKIP("Explicit owned opening fixture required");
+    RemoteIMApplication app(QStringLiteral("owned-window-order"), std::make_unique<FakeRemoteIMClient>());
+    MainWindow main(app);
+    showOwnTestWindow(&main);
+    QTest::qWait(100);
+    QVERIFY(main.openVideoWindow(fixture, {}));
+    QPointer<MaiFfplayVideoDialog> player = MaiFfplayVideoDialog::activeDialog();
+    QVERIFY(player);
+    void* probe = beginOwnedFfplayWindowOrderProbe(player);
+    QVERIFY(probe);
+    const auto cleanup = qScopeGuard([&] {
+        if (probe) endOwnedFfplayWindowOrderProbe(probe);
+        if (player) player->close();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    });
+    player->findChild<QSlider*>(QStringLiteral("ffplayVolumeSlider"))->setValue(0);
+    QTRY_VERIFY_WITH_TIMEOUT(player->hasPresentedFrame() && player->isVisible(), 10000);
+    QTest::qWait(100);
+    const QJsonArray records = endOwnedFfplayWindowOrderProbe(probe);
+    probe = nullptr;
+    QFile file(qEnvironmentVariable("MAICHAT_FFPLAY_ORDER_TRACE_JSON"));
+    if (!file.fileName().isEmpty()) {
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QVERIFY(file.write(QJsonDocument(records).toJson()) > 0);
+    }
+    qInfo() << "[native-window-order-count]" << records.size();
+    QVERIFY(!records.isEmpty());
+    int earlyAnimation = 0;
+    int earlySize = 0;
+    int earlyHud = 0;
+    int hudOrders = 0;
+    for (const auto& value : records) {
+        const auto row = value.toObject();
+        if (!row.value("ownerAnimationDisabled").toBool()) ++earlyAnimation;
+        if (row.value("sender") != row.value("owner")) {
+            ++hudOrders;
+            if (!row.value("ownerVisible").toBool()) ++earlyHud;
+        }
+        if (row.value("ownerVisible").toBool() &&
+            (std::abs(row.value("ownerFrameWidth").toDouble() - row.value("qtWidth").toInt()) > 1 ||
+             std::abs(row.value("ownerFrameHeight").toDouble() - row.value("qtHeight").toInt()) > 1)) ++earlySize;
+    }
+    qInfo() << "[native-window-order-intermediate] animation" << earlyAnimation << "geometry" << earlySize << "earlyHud" << earlyHud;
+    QCOMPARE(earlyAnimation, 0);
+    QCOMPARE(earlySize, 0);
+    QCOMPARE(earlyHud, 0);
+    QVERIFY(hudOrders > 0);
+#else
+    QSKIP("Owned AppKit ordering regression");
 #endif
 }
 

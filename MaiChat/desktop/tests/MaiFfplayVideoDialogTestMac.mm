@@ -8,6 +8,8 @@
 #import <objc/runtime.h>
 #include <QImage>
 #include <QJsonObject>
+#include <QJsonArray>
+#include <QPointer>
 #include <QString>
 #include <QDebug>
 #include <QWidget>
@@ -352,4 +354,90 @@ bool ffplayTestNativeWindowRetainsUi(int number) {
                 return window.contentView || window.visible || window.parentWindow;
         return false;
     }
+}
+
+// Observe only this test process's native ordering calls. Original AppKit
+// implementations always run; no screen capture or user-process access occurs.
+namespace {
+struct OwnedWindowOrderProbe {
+    QPointer<QWidget> owner;
+    NSWindow* window;
+    QJsonArray records;
+};
+OwnedWindowOrderProbe* windowOrderProbe = nullptr;
+using OrderWindowMethod = void (*)(id, SEL, NSWindowOrderingMode, NSInteger);
+OrderWindowMethod originalOrderWindowMethod = nullptr;
+using OrderFrontMethod = void (*)(id, SEL, id);
+OrderFrontMethod originalOrderFrontMethod = nullptr;
+OrderFrontMethod originalMakeKeyOrderFrontMethod = nullptr;
+void recordOwnedOrder(NSWindow* sender, const char* phase) {
+    if (!windowOrderProbe || !windowOrderProbe->owner || windowOrderProbe->records.size() >= 128) return;
+    auto* probe = windowOrderProbe;
+    bool owned = sender == probe->window;
+    for (const auto* name : {"ffplayTitleBar", "ffplayOverlay"}) {
+        auto* hud = probe->owner->findChild<QWidget*>(QString::fromLatin1(name));
+        if (!hud || !hud->testAttribute(Qt::WA_WState_Created)) continue;
+        NSView* native = reinterpret_cast<NSView*>(hud->effectiveWinId());
+        if (native.window == sender) owned = true;
+    }
+    if (!owned) return;
+    const NSRect frame = probe->window.frame;
+    probe->records.append(QJsonObject{
+        {"phase", QString::fromLatin1(phase)}, {"sender", double(sender.windowNumber)},
+        {"owner", double(probe->window.windowNumber)}, {"ownerVisible", bool(probe->window.visible)},
+        {"ownerAnimation", int(probe->window.animationBehavior)},
+        {"ownerAnimationDisabled", probe->window.animationBehavior == NSWindowAnimationBehaviorNone},
+        {"ownerFrameWidth", NSWidth(frame)}, {"ownerFrameHeight", NSHeight(frame)},
+        {"ownerFrameX", NSMinX(frame)}, {"ownerFrameY", NSMinY(frame)},
+        {"qtWidth", probe->owner->width()}, {"qtHeight", probe->owner->height()}});
+}
+void observedOwnedOrderWindow(id window, SEL selector, NSWindowOrderingMode mode, NSInteger relative) {
+    recordOwnedOrder((NSWindow*)window, "before");
+    originalOrderWindowMethod(window, selector, mode, relative);
+    recordOwnedOrder((NSWindow*)window, "after");
+}
+void observedOwnedOrderFront(id window, SEL selector, id sender) {
+    recordOwnedOrder((NSWindow*)window, "before-order-front");
+    originalOrderFrontMethod(window, selector, sender);
+    recordOwnedOrder((NSWindow*)window, "after-order-front");
+}
+void observedOwnedMakeKeyOrderFront(id window, SEL selector, id sender) {
+    recordOwnedOrder((NSWindow*)window, "before-key-order-front");
+    originalMakeKeyOrderFrontMethod(window, selector, sender);
+    recordOwnedOrder((NSWindow*)window, "after-key-order-front");
+}
+}
+
+void* beginOwnedFfplayWindowOrderProbe(QWidget* owner) {
+    if (windowOrderProbe) return nullptr;
+    NSWindow* window = reinterpret_cast<NSView*>(owner->winId()).window;
+    if (!window) return nullptr;
+    auto* probe = new OwnedWindowOrderProbe{owner, [window retain], {}};
+    windowOrderProbe = probe;
+    Method method = class_getInstanceMethod(NSWindow.class, @selector(orderWindow:relativeTo:));
+    originalOrderWindowMethod = (OrderWindowMethod)method_getImplementation(method);
+    method_setImplementation(method, (IMP)observedOwnedOrderWindow);
+    method = class_getInstanceMethod(NSWindow.class, @selector(orderFront:));
+    originalOrderFrontMethod = (OrderFrontMethod)method_getImplementation(method);
+    method_setImplementation(method, (IMP)observedOwnedOrderFront);
+    method = class_getInstanceMethod(NSWindow.class, @selector(makeKeyAndOrderFront:));
+    originalMakeKeyOrderFrontMethod = (OrderFrontMethod)method_getImplementation(method);
+    method_setImplementation(method, (IMP)observedOwnedMakeKeyOrderFront);
+    return probe;
+}
+
+QJsonArray endOwnedFfplayWindowOrderProbe(void* value) {
+    auto* probe = static_cast<OwnedWindowOrderProbe*>(value);
+    if (!probe) return {};
+    Method method = class_getInstanceMethod(NSWindow.class, @selector(orderWindow:relativeTo:));
+    method_setImplementation(method, (IMP)originalOrderWindowMethod);
+    method = class_getInstanceMethod(NSWindow.class, @selector(orderFront:));
+    method_setImplementation(method, (IMP)originalOrderFrontMethod);
+    method = class_getInstanceMethod(NSWindow.class, @selector(makeKeyAndOrderFront:));
+    method_setImplementation(method, (IMP)originalMakeKeyOrderFrontMethod);
+    windowOrderProbe = nullptr;
+    const auto records = probe->records;
+    [probe->window release];
+    delete probe;
+    return records;
 }

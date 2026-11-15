@@ -44,6 +44,11 @@ public:
     // 返回启动是否已接受，不代表首帧已呈现；解码失败会显示原有错误状态。
     // 隐藏准备可由普通 close 取消，不阻塞 GUI 等待媒体或等待可见后的首帧。
     bool prepareAndShow();
+#if defined(Q_OS_WIN)
+    // The native owner may move during QWidget mapping, after ShowEvent.
+    // Keep its independent HUDs hidden until that transaction has returned.
+    void setVisible(bool visible) override;
+#endif
 
     static QPointer<MaiFfplayVideoDialog> activeDialog();
     bool sendCommand(const QString& command);
@@ -143,6 +148,13 @@ private:
     uint64_t viewId_ = 0;
     bool started_ = false;
     bool initialShowPending_ = false;
+#if defined(Q_OS_WIN)
+    bool windowsOwnerMapping_ = false;
+#endif
+#if defined(Q_OS_MAC)
+    // Cocoa may flush queued completions inside show(); do not reenter owner mapping.
+    bool initialOwnerMapping_ = false;
+#endif
     bool initialPresentationDone_ = false;
     // GUI 变更、worker 快照；旧排队尺寸/标题/全屏回调不得恢复已取消或被替换的打开。
     std::atomic<uint64_t> playbackOpenGeneration_{0};

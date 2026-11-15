@@ -1282,6 +1282,13 @@ target_include_directories(desktop_computer_native_integration_test PRIVATE ../.
 add_test(NAME desktop_computer_native_integration COMMAND desktop_computer_native_integration_test)
 set_tests_properties(desktop_computer_native_integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
 
+if(WIN32)
+  add_executable(DesktopComputerDragNativeTest tests/DesktopComputerDragNativeTest.cpp)
+  target_link_libraries(DesktopComputerDragNativeTest PRIVATE maichat_agent Qt6::Widgets Qt6::Test)
+  target_include_directories(DesktopComputerDragNativeTest PRIVATE ../../MaiAgent/third_party/nlohmann)
+  add_test(NAME DesktopComputerDragNativeTest COMMAND DesktopComputerDragNativeTest)
+endif()
+
 # Whole-display capture/input uses a separate opt-in owned fullscreen fixture.
 # Default runs skip; a failed action after input starts remains a failure.
 add_executable(desktop_computer_display_native_test tests/DesktopComputerDisplayNativeTest.cpp)
@@ -1571,6 +1578,13 @@ if(WIN32 AND MAICHAT_ENABLE_FFMPEG)
   set_tests_properties(MaiFfplayVideoDialogTest PROPERTIES
     PASS_REGULAR_EXPRESSION "Seek to 50([.][0-9]+)?%"
     FAIL_REGULAR_EXPRESSION "Seek to (inf|nan)%")
+  add_executable(MaiFfplayWindowsGeometryTest tests/MaiFfplayWindowsGeometryTest.cpp)
+  add_dependencies(MaiFfplayWindowsGeometryTest maichat_ffplay_test_runtime)
+  target_compile_definitions(MaiFfplayWindowsGeometryTest PRIVATE
+    MAICHAT_WINDOWS_VIDEO_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/video-circle-61s.mp4")
+  target_include_directories(MaiFfplayWindowsGeometryTest PRIVATE ../Media/FfplayCompat)
+  target_link_libraries(MaiFfplayWindowsGeometryTest PRIVATE remote_im_desktop_ui Qt6::Test)
+  add_test(NAME MaiFfplayWindowsGeometryTest COMMAND MaiFfplayWindowsGeometryTest)
 endif()
 
 if(WIN32)
