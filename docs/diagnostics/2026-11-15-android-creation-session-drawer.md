@@ -45,6 +45,17 @@ The exact final attached-window fixture failed four assertions with the original
 two production files, then passed all 26 Drawer/MainNavigation cases with the
 candidate. Unattached-window and initial color-accessor fixture failures are
 retained separately. Independent source review found no important issue. Normal
-280 / 2.2.38 installation and physical page/bar motion remain the final check at
-this source checkpoint. The separate image path has already passed ordinary279
-image display and preview; this layout change does not replace that evidence.
+280 / 2.2.38 was then built from `d01453ebecc08d16237dfd4ff6f9bde05035da36`,
+verified and installed with data retained. APK SHA-256:
+`76ab46397ca68ea35e85541fa021916fe1caf0ef54159eb11a51a94ad8c9b942`.
+The ordinary App at PID 32622 passed the original physical edge swipe. The page
+moved from x=0 to x=562 and the first bottom item from x=32 to x=592, including
+the same page scale. Tapping the exposed bottom item closed the drawer while
+remaining in Creation Center; Back did the same. With the drawer closed, the
+Messages tab and return to Creation Center both worked. Old conversation images
+also displayed after this data-preserving update.
+
+Evidence: `.cache/android-drawer-display-parity-20261115/normal280/` contains
+`closed.xml`, `drawer.xml`, `return.xml`, `back.xml`, `messages.xml`, `drawer.png`
+and `images.png`. The separate image path had already passed ordinary279 image
+display and preview; this layout check does not replace that evidence.
