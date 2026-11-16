@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,7 +39,35 @@ struct DesktopNativeDisplay {
     bool primary = false;
 };
 
-enum class DesktopNativeInputKind { Click, DoubleClick, RightClick, Drag, Type, Key, ReplaceFocusedText, Scroll, Move };
+enum class DesktopNativeInputKind {
+    Click,
+    DoubleClick,
+    RightClick,
+    Drag,
+    Type,
+    Key,
+    ReplaceFocusedText,
+    Scroll,
+    Move,
+    MouseDown,
+    MouseUp,
+    KeyDown,
+    KeyUp
+};
+
+enum class DesktopMouseButton { Left, Right, Middle, Back, Forward };
+enum class DesktopScrollAxis { Vertical, Horizontal };
+
+// The ledger describes this session's synthetic holds, not physical hardware
+// state or acknowledgement from the receiving application.
+struct DesktopNativeInputState {
+    std::vector<std::string> buttonsDown;
+    std::vector<std::string> keysDown;
+    std::int64_t idleRemainingMs = 0;
+    bool empty() const {
+        return buttonsDown.empty() && keysDown.empty();
+    }
+};
 
 // The controller resolves observed window coordinates before native dispatch.
 // Cancellation is checked throughout gestures; native code always releases its
@@ -53,6 +82,8 @@ struct DesktopNativeInput {
     std::string key;
     int lines = 0;
     int durationMs = 200;
+    DesktopMouseButton button = DesktopMouseButton::Left;
+    DesktopScrollAxis scrollAxis = DesktopScrollAxis::Vertical;
     // New controller calls bind dispatch to the observed native identity. Zero
     // keeps the older free function wrappers scoped to their initial foreground.
     std::uint64_t expectedWindowId = 0;
@@ -64,11 +95,31 @@ struct DesktopNativeInput {
     std::function<bool()> isCanceled;
 };
 
+// Ordinary native sessions pair only their own downs with ups. Implementations
+// serialize these methods and preserve native source/held state across input()
+// calls. Per-call cancellation callbacks MUST be cleared before returning.
+// releaseAll and targeted ups remain usable after focus loss/cancellation;
+// destructor cleanup is independent of the caller's observation token.
+class DesktopNativeInputSession {
+public:
+    virtual ~DesktopNativeInputSession() = default;
+    virtual MaiError input(const DesktopNativeInput& input) = 0;
+    virtual DesktopNativeInputState state() const = 0;
+    // Read-only target/permission validation for the owner's watchdog; no
+    // per-call cancellation callback is retained or consulted here.
+    virtual MaiError validate() const = 0;
+    virtual MaiError releaseAll() = 0;
+};
+
+std::shared_ptr<DesktopNativeInputSession> maiDesktopCreateInputSession();
+
 MaiResult<std::vector<DesktopNativeWindow>> maiDesktopWindows();
 MaiResult<std::vector<DesktopNativeDisplay>> maiDesktopDisplays();
-MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(
-    const DesktopNativeWindow& window);
+MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(const DesktopNativeWindow& window);
 MaiError maiDesktopActivateWindow(const DesktopNativeWindow& window);
+// Callback is valid only during this synchronous call. Queued platform work
+// must abandon activation and clear its callback before the waiter returns.
+MaiError maiDesktopActivateWindow(const DesktopNativeWindow& window, std::function<bool()> isCanceled);
 MaiError maiDesktopClick(double x, double y);
 MaiError maiDesktopType(const std::string& text);
 MaiError maiDesktopKey(const std::string& key);
@@ -96,6 +147,6 @@ struct DesktopWindowsKeyBinding {
     std::vector<DesktopKeyModifier> impliedModifiers;
 };
 
-MaiResult<DesktopWindowsKeyBinding> maiDesktopWindowsResolveKey(
-    const DesktopKeyChord& chord, std::uintptr_t keyboardLayout);
+MaiResult<DesktopWindowsKeyBinding> maiDesktopWindowsResolveKey(const DesktopKeyChord& chord,
+                                                                std::uintptr_t keyboardLayout);
 #endif

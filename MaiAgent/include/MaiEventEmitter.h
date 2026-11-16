@@ -32,6 +32,8 @@ public:
     // 用户/assistant 已落库且活动轮次已登记后、工作线程启动前发布 running 状态。
     // 不携带推理内容；宿主按准确 turn ID 展示等待状态，不能等模型首段才发现任务已开始。
     void emitTurnStarted(const std::string& sessionId, const std::string& turnId);
+    // 结束事件保留准确轮次，宿主不得用旧 idle 清理替代轮次的跨调用资源。
+    void emitTurnIdle(const std::string& sessionId, const std::string& turnId);
     // 轮次失败必须携带最初的 turn ID，宿主不能把新轮次的失败归给仍在发送的旧回复。
     // 不改变普通会话错误的缺省语义；未知归属的错误不得由宿主猜测轮次。
     void emitTurnError(const std::string& sessionId, const std::string& turnId,

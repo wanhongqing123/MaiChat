@@ -34,6 +34,11 @@ struct DesktopComputerAction {
     std::string expectedText;
     int scrollLines = 0;
     int durationMs = 200;
+    DesktopMouseButton button = DesktopMouseButton::Left;
+    DesktopScrollAxis scrollAxis = DesktopScrollAxis::Vertical;
+    // Stable task identity supplied by the host. Queued completion for an older
+    // task must never release a newer task's holds in the same session.
+    std::string turnId;
     bool dryRun = false;
     std::function<bool()> isCanceled;
 };
@@ -46,6 +51,7 @@ struct DesktopComputerActionResult {
     std::string actualText;
     DesktopComputerObservation observation;
     std::string observationError;
+    DesktopNativeInputState inputState;
 };
 
 // Session-owned observed window state. A later action must match the same
@@ -62,7 +68,8 @@ public:
     MaiResult<DesktopComputerObservation> observe(const std::string& sessionId, const std::string& windowTitle,
                                                   const std::string& workspace, bool includeElements,
                                                   std::uint64_t windowId = 0, bool includeImage = true,
-                                                  std::function<bool()> isCanceled = {});
+                                                  std::function<bool()> isCanceled = {},
+                                                  const std::string& turnId = {});
     MaiResult<std::vector<DesktopNativeWindow>> windows();
     MaiResult<std::vector<DesktopNativeDisplay>> displays();
     // Observe a whole display using the resident capture worker. The token binds
@@ -71,13 +78,18 @@ public:
     MaiResult<DesktopComputerObservation> observeDisplay(const std::string& sessionId, const std::string& workspace,
                                                          std::uint64_t displayId, std::function<bool()> isCanceled = {},
                                                          std::uint64_t afterFrameSequence = 0,
-                                                         std::int64_t afterFrameReceivedAtMs = 0, int waitMs = 0);
+                                                         std::int64_t afterFrameReceivedAtMs = 0, int waitMs = 0,
+                                                         const std::string& turnId = {});
     MaiResult<DesktopComputerActionResult> perform(const std::string& sessionId, const DesktopComputerAction& action);
     MaiError act(const std::string& sessionId, const std::string& action, const std::string& snapshotId,
                  std::uint64_t windowId, double xRatio, double yRatio, const std::string& text, const std::string& key,
                  int scrollLines);
     // Forget the selected window and snapshot; this never edits input text.
     MaiError clear(const std::string& sessionId);
+    DesktopNativeInputState inputState(const std::string& sessionId) const;
+    // Empty expectedTurn releases this ordinary caller's session state. Hosts
+    // pass the actual completed/interrupted turn to protect a replacement task.
+    MaiError releaseInput(const std::string& sessionId, const std::string& expectedTurn = {});
 
 private:
     struct Impl;

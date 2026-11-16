@@ -21,6 +21,7 @@
 #include <json.hpp>
 
 #include "MaiChatTools/DesktopComputerPlatform.h"
+#include "MaiChatTools/DesktopComputerInputOwnership.h"
 #include "MaiCloudModelCatalog.h"
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
@@ -28,6 +29,7 @@
 #include "MaiPathGuard.h"
 #include "MaiScreenshot.h"
 #include "MaiTime.h"
+#include <QScopeGuard>
 #include "MaiTool.h"
 
 namespace {
@@ -42,6 +44,8 @@ struct ObservedWindow {
     std::uint64_t frameSequence = 0;
     std::uint64_t inputGeneration = 0;
     std::string token;
+    std::string turnId;
+    std::atomic<bool> invalidated{false};
     std::chrono::steady_clock::time_point observedAt;
     std::mutex mutex;
 };
@@ -135,6 +139,9 @@ public:
     MaiError activate(const DesktopNativeWindow& window) override {
         return maiDesktopActivateWindow(window);
     }
+    MaiError activate(const DesktopNativeWindow& window, const std::function<bool()>& canceled) override {
+        return maiDesktopActivateWindow(window, canceled);
+    }
     MaiResult<bool> isFocused(const DesktopNativeWindow& window) override {
         return maiDesktopWindowIsFocused(window);
     }
@@ -142,6 +149,12 @@ public:
         const auto ready = maiDesktopWindowAcceptsInput(window);
         if (!ready) return ready.error();
         return ready.value() ? MaiError{} : activate(window);
+    }
+    MaiError activateForInput(const DesktopNativeWindow& window, const std::function<bool()>& canceled) override {
+        if (canceled && canceled()) return {MaiErrorCode::Canceled, "window activation canceled"};
+        const auto ready = maiDesktopWindowAcceptsInput(window);
+        if (!ready) return ready.error();
+        return ready.value() ? MaiError{} : activate(window, canceled);
     }
     MaiResult<bool> inputFocused(const DesktopNativeWindow& window) override {
         return maiDesktopWindowAcceptsInput(window);
@@ -151,6 +164,9 @@ public:
     }
     MaiError input(const DesktopNativeInput& input) override {
         return maiDesktopInput(input);
+    }
+    std::shared_ptr<DesktopNativeInputSession> createInputSession() override {
+        return maiDesktopCreateInputSession();
     }
     MaiResult<std::string> focusedText(const DesktopNativeWindow& window) override {
         return maiDesktopFocusedText(window);
@@ -167,13 +183,15 @@ MaiError inputDispatchFailure(const MaiError& error) {
     // A native error can follow a successful down/character and a failed up,
     // focus check or cancellation. Preserve the code/detail, but do not tell
     // callers that nothing happened or encourage repeating a state-changing key.
-    return {error.code(), "Input may have been partially delivered. Observe the current application state "
-                          "before deciding whether to retry. Native error: " + error.message()};
+    return {error.code(),
+            "Input may have been partially delivered. Observe the current application state "
+            "before deciding whether to retry. Native error: " +
+                error.message()};
 }
 
 bool desktopLauncherKey(const DesktopKeyChord& chord) {
-    if (chord.modifiers.size() != 1 ||
-        maiDesktopModifierFamily(chord.modifiers.front()) != DesktopKeyModifier::Meta) return false;
+    if (chord.modifiers.size() != 1 || maiDesktopModifierFamily(chord.modifiers.front()) != DesktopKeyModifier::Meta)
+        return false;
     // Shell launchers are valid even when there is no focused AX/UIA control.
     // Keep the exception exact: arbitrary Meta chords may still edit or paste.
 #if defined(Q_OS_MAC)
@@ -206,10 +224,68 @@ Json windowJson(const DesktopNativeWindow& window) {
             {"bounds", {{"x", window.x}, {"y", window.y}, {"width", window.width}, {"height", window.height}}}};
 }
 
+Json inputStateJson(const DesktopNativeInputState& state) {
+    return {{"buttons_down", state.buttonsDown},
+            {"keys_down", state.keysDown},
+            {"scope", "owned_synthetic_inputs"},
+            {"idle_release_ms", 120000},
+            {"idle_remaining_ms", state.idleRemainingMs}};
+}
+
+MaiResult<DesktopMouseButton> mouseButtonFrom(const Json& value) {
+    if (!value.is_string()) return {MaiErrorCode::InvalidInput, "button must be a mouse button name"};
+    const std::string name = value.get<std::string>();
+    if (name == "left") return DesktopMouseButton::Left;
+    if (name == "right") return DesktopMouseButton::Right;
+    if (name == "middle") return DesktopMouseButton::Middle;
+    if (name == "back") return DesktopMouseButton::Back;
+    if (name == "forward") return DesktopMouseButton::Forward;
+    return {MaiErrorCode::InvalidInput, "button must be left, right, middle, back or forward"};
+}
+
+MaiResult<DesktopScrollAxis> scrollAxisFrom(const Json& value) {
+    if (!value.is_string()) return {MaiErrorCode::InvalidInput, "axis must be vertical or horizontal"};
+    if (value == "vertical") return DesktopScrollAxis::Vertical;
+    if (value == "horizontal") return DesktopScrollAxis::Horizontal;
+    return {MaiErrorCode::InvalidInput, "axis must be vertical or horizontal"};
+}
+
+bool ownsRequestedUp(const DesktopNativeInputState& state, const DesktopComputerAction& request) {
+    if (request.action == "mouse_up") {
+        return std::any_of(state.buttonsDown.begin(), state.buttonsDown.end(), [&](const auto& name) {
+            const auto button = mouseButtonFrom(Json(name));
+            return button && button.value() == request.button;
+        });
+    }
+    const auto requested = maiDesktopParseKey(request.key);
+    if (!requested) return false;
+    return std::any_of(state.keysDown.begin(), state.keysDown.end(), [&](const auto& name) {
+        const auto held = maiDesktopParseKey(name);
+        return held && held.value().modifiers.empty() && held.value().key == requested.value().key &&
+               held.value().character == requested.value().character &&
+               held.value().function == requested.value().function;
+    });
+}
+
 }  // namespace
 
 MaiError DesktopComputerBackend::activateForInput(const DesktopNativeWindow& window) {
     return activate(window);
+}
+
+MaiError DesktopComputerBackend::activate(const DesktopNativeWindow& window, const std::function<bool()>& canceled) {
+    if (canceled && canceled()) return {MaiErrorCode::Canceled, "window activation canceled"};
+    const auto result = activate(window);
+    if (!result && canceled && canceled()) return {MaiErrorCode::Canceled, "window activation canceled"};
+    return result;
+}
+
+MaiError DesktopComputerBackend::activateForInput(const DesktopNativeWindow& window,
+                                                  const std::function<bool()>& canceled) {
+    if (canceled && canceled()) return {MaiErrorCode::Canceled, "window activation canceled"};
+    const auto result = activateForInput(window);
+    if (!result && canceled && canceled()) return {MaiErrorCode::Canceled, "window activation canceled"};
+    return result;
 }
 
 MaiResult<bool> DesktopComputerBackend::inputFocused(const DesktopNativeWindow& window) {
@@ -224,11 +300,19 @@ struct DesktopComputerController::Impl {
     std::shared_ptr<DesktopComputerBackend> backend;
     std::mutex mutex;
     std::map<std::string, std::shared_ptr<ObservedWindow>> sessions;
+    std::unique_ptr<DesktopComputerInputOwnership> inputOwnership;
 
     std::shared_ptr<ObservedWindow> get(const std::string& sessionId) {
         std::lock_guard<std::mutex> lock(mutex);
         const auto found = sessions.find(sessionId);
         return found == sessions.end() ? nullptr : found->second;
+    }
+    void invalidate(const std::string& session, const std::string& turn) {
+        const auto selected = get(session);
+        // Never wait for a worker's state lock on the GUI thread. Platform
+        // layout/activation may await that same GUI; revocation is atomic.
+        if (selected && (turn.empty() || selected->turnId.empty() || selected->turnId == turn))
+            selected->invalidated.store(true);
     }
 };
 
@@ -236,8 +320,28 @@ DesktopComputerController::DesktopComputerController() : DesktopComputerControll
 DesktopComputerController::DesktopComputerController(std::shared_ptr<DesktopComputerBackend> backend)
     : impl_(std::make_unique<Impl>()) {
     impl_->backend = backend ? std::move(backend) : makeDesktopComputerBackend();
+    impl_->inputOwnership =
+        std::make_unique<DesktopComputerInputOwnership>(impl_->backend, [] { desktopInputGeneration.fetch_add(2); });
 }
 DesktopComputerController::~DesktopComputerController() = default;
+
+std::shared_ptr<DesktopNativeInputSession> DesktopComputerBackend::createInputSession() {
+    return {};
+}
+
+DesktopNativeInputState DesktopComputerController::inputState(const std::string& sessionId) const {
+    return impl_->inputOwnership->state(sessionId);
+}
+
+MaiError DesktopComputerController::releaseInput(const std::string& sessionId, const std::string& expectedTurn) {
+    bool released = false;
+    const auto result = impl_->inputOwnership->release(sessionId, expectedTurn, &released);
+    // Release is callable without a valid snapshot. Only invalidate an observed
+    // token when cleanup concerns the current task; a late old-turn event must
+    // not disturb a replacement task's input state or token.
+    if (released) impl_->invalidate(sessionId, expectedTurn);
+    return result;
+}
 
 MaiResult<std::vector<DesktopNativeDisplay>> DesktopComputerBackend::displays() {
     return {MaiErrorCode::NotSupported, "display observation is unavailable in this backend"};
@@ -265,9 +369,13 @@ MaiResult<std::vector<DesktopNativeDisplay>> DesktopComputerController::displays
 
 MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
     const std::string& sessionId, const std::string& workspace, std::uint64_t displayId,
-    std::function<bool()> isCanceled, std::uint64_t afterFrameSequence, std::int64_t afterFrameReceivedAtMs,
-    int waitMs) {
+    std::function<bool()> isCanceled, std::uint64_t afterFrameSequence, std::int64_t afterFrameReceivedAtMs, int waitMs,
+    const std::string& turnId) {
+    impl_->inputOwnership->touch(sessionId, turnId);
     const auto canceled = [&] { return isCanceled && isCanceled(); };
+    const auto cleanupOnCancel = qScopeGuard([&] {
+        if (canceled()) releaseInput(sessionId, turnId);
+    });
     if (canceled()) return {MaiErrorCode::Canceled, "desktop observation canceled"};
     if (sessionId.empty() || workspace.empty() || displayId == 0)
         return {MaiErrorCode::InvalidInput, "Session, workspace and display ID are required"};
@@ -356,6 +464,7 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observeDisplay(
     state->frameSequence = screenshot.frameSequence;
     state->inputGeneration = inputGeneration;
     state->token = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+    state->turnId = turnId;
     state->observedAt = std::chrono::steady_clock::now();
     Json output = displayJson(selected);
     output["target"] = "display";
@@ -379,14 +488,15 @@ MaiResult<std::vector<DesktopNativeWindow>> DesktopComputerController::windows()
     return impl_->backend->windows();
 }
 
-MaiResult<DesktopComputerObservation> DesktopComputerController::observe(const std::string& sessionId,
-                                                                         const std::string& windowTitle,
-                                                                         const std::string& workspace,
-                                                                         bool includeElements, std::uint64_t windowId,
-                                                                         bool includeImage,
-                                                                         std::function<bool()> isCanceled) {
+MaiResult<DesktopComputerObservation> DesktopComputerController::observe(
+    const std::string& sessionId, const std::string& windowTitle, const std::string& workspace, bool includeElements,
+    std::uint64_t windowId, bool includeImage, std::function<bool()> isCanceled, const std::string& turnId) {
+    impl_->inputOwnership->touch(sessionId, turnId);
     // Cancellation is checked synchronously and never retained with session state.
     const auto canceled = [&] { return isCanceled && isCanceled(); };
+    const auto cleanupOnCancel = qScopeGuard([&] {
+        if (canceled()) releaseInput(sessionId, turnId);
+    });
     if (canceled()) return {MaiErrorCode::Canceled, "computer observation canceled"};
     if (sessionId.empty() || (windowTitle.empty() == (windowId == 0)) || windowTitle.size() > 500 || workspace.empty())
         return {MaiErrorCode::InvalidInput, "Session, exact window title and workspace are required"};
@@ -419,10 +529,9 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(const s
             return {MaiErrorCode::InvalidInput, "screenshot directory leaves the Session workspace"};
         const std::string name = MaiIdGenerator::generate("computer_") + ".png";
         relativeImagePath = "computer/" + name;
-        const std::string resolved = maiResolvePathWithinRoot(workspace,
-            MaiFilePath::fromUtf8(captureDirectory).append(MaiFilePath::fromUtf8(name)).toUtf8());
-        if (resolved.empty())
-            return {MaiErrorCode::InvalidInput, "screenshot path leaves the Session workspace"};
+        const std::string resolved = maiResolvePathWithinRoot(
+            workspace, MaiFilePath::fromUtf8(captureDirectory).append(MaiFilePath::fromUtf8(name)).toUtf8());
+        if (resolved.empty()) return {MaiErrorCode::InvalidInput, "screenshot path leaves the Session workspace"};
         imageFile = MaiFilePath::fromUtf8(resolved);
         const MaiError created = MaiFileSystem::createDirectories(imageFile.dirName());
         if (created) return created;
@@ -506,6 +615,7 @@ MaiResult<DesktopComputerObservation> DesktopComputerController::observe(const s
     auto state = std::make_shared<ObservedWindow>();
     state->window = selected;
     state->token = QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString();
+    state->turnId = turnId;
     state->observedAt = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -535,10 +645,59 @@ MaiError DesktopComputerController::act(const std::string& sessionId, const std:
 MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const std::string& sessionId,
                                                                           const DesktopComputerAction& request) {
     const std::string& action = request.action;
+    if (action == "mouse_up" || action == "key_up") {
+        if (action == "mouse_up" && (int(request.button) < int(DesktopMouseButton::Left) ||
+                                     int(request.button) > int(DesktopMouseButton::Forward)))
+            return {MaiErrorCode::InvalidInput, "invalid mouse button"};
+        if (request.isCanceled && request.isCanceled()) releaseInput(sessionId, request.turnId);
+        if (action == "key_up") {
+            const auto parsed = maiDesktopParseKey(request.key);
+            if (!parsed) return parsed.error();
+            if (!parsed.value().modifiers.empty())
+                return {MaiErrorCode::InvalidInput, "key_up needs one physical key, not a chord"};
+        }
+        std::lock_guard<std::mutex> desktopLock(desktopOperationMutex);
+        const auto native = impl_->inputOwnership->prepare(sessionId, request, false, true);
+        if (!native) return native.error();
+        DesktopComputerActionResult receipt;
+        receipt.state = "released";
+        if (request.dryRun) {
+            receipt.state = "validated";
+            receipt.dryRun = true;
+        } else if (native.value() && ownsRequestedUp(native.value()->state(), request)) {
+            DesktopNativeInput input;
+            input.kind = action == "mouse_up" ? DesktopNativeInputKind::MouseUp : DesktopNativeInputKind::KeyUp;
+            input.button = request.button;
+            input.key = request.key;
+            DesktopInputBatch batch;
+            const auto result = native.value()->input(input);
+            impl_->invalidate(sessionId, request.turnId);
+            if (result) return inputDispatchFailure(result);
+            receipt.dispatched = true;
+        }
+        receipt.inputState = inputState(sessionId);
+        return receipt;
+    }
+    bool completed = false;
+    const auto cleanupOnFailure = qScopeGuard([&] {
+        if (!completed && !request.dryRun) releaseInput(sessionId, request.turnId);
+    });
+    const auto success = [&](DesktopComputerActionResult receipt) -> MaiResult<DesktopComputerActionResult> {
+        receipt.inputState = inputState(sessionId);
+        completed = true;
+        return receipt;
+    };
     const bool positioned = action == "click" || action == "double_click" || action == "right_click" ||
-                            action == "drag" || action == "scroll" || action == "move";
+                            action == "drag" || action == "scroll" || action == "move" || action == "mouse_down";
     const bool writesText = action == "type" || action == "replace_text";
-    if (action != "focus" && !positioned && !writesText && action != "key" && action != "verify")
+    if (positioned &&
+        (int(request.button) < int(DesktopMouseButton::Left) || int(request.button) > int(DesktopMouseButton::Forward)))
+        return {MaiErrorCode::InvalidInput, "invalid mouse button"};
+    if (action == "scroll" && request.scrollAxis != DesktopScrollAxis::Vertical &&
+        request.scrollAxis != DesktopScrollAxis::Horizontal)
+        return {MaiErrorCode::InvalidInput, "invalid scroll axis"};
+    if (action != "focus" && !positioned && !writesText && action != "key" && action != "key_down" &&
+        action != "verify")
         return {MaiErrorCode::InvalidInput, "unknown computer action"};
     if (positioned && (!ratio(request.xRatio) || !ratio(request.yRatio)))
         return {MaiErrorCode::InvalidInput, "window coordinates must be fractions from 0 to 1"};
@@ -551,17 +710,31 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     if (action == "verify" && !validText(request.expectedText, true))
         return {MaiErrorCode::InvalidInput, "expected text must be valid UTF-8 within 4000 bytes"};
     bool keyNeedsInputCheck = false;
-    if (action == "key") {
+    if (action == "key" || action == "key_down") {
         const auto parsed = maiDesktopParseKey(request.key);
         if (!parsed) return parsed.error();
+        if (action == "key_down" && !parsed.value().modifiers.empty())
+            return {MaiErrorCode::InvalidInput, "key_down needs one physical key, not a chord"};
         // A shortcut can write through the clipboard or delete a protected
         // value just like type(). Only navigation away is exempt from the
         // same secure-input check; raw character keys cannot bypass it.
         const auto key = parsed.value().key;
         DesktopKeyModifier modifier;
-        keyNeedsInputCheck = key != DesktopKeyCode::Tab && key != DesktopKeyCode::Escape &&
-                             !maiDesktopKeyModifier(key, modifier);
-        if (request.desktopScope && desktopLauncherKey(parsed.value())) keyNeedsInputCheck = false;
+        keyNeedsInputCheck =
+            key != DesktopKeyCode::Tab && key != DesktopKeyCode::Escape && !maiDesktopKeyModifier(key, modifier);
+        if (request.desktopScope) {
+            auto effective = parsed.value();
+            for (const auto& held : inputState(sessionId).keysDown) {
+                const auto physical = maiDesktopParseKey(held);
+                DesktopKeyModifier modifier;
+                if (!physical || !maiDesktopKeyModifier(physical.value().key, modifier)) continue;
+                const auto family = maiDesktopModifierFamily(modifier);
+                if (std::none_of(effective.modifiers.begin(), effective.modifiers.end(),
+                                 [&](const auto existing) { return maiDesktopModifierFamily(existing) == family; }))
+                    effective.modifiers.push_back(modifier);
+            }
+            if (desktopLauncherKey(effective)) keyNeedsInputCheck = false;
+        }
     }
     if (action == "scroll" && (request.scrollLines == 0 || request.scrollLines < -10 || request.scrollLines > 10))
         return {MaiErrorCode::InvalidInput, "scroll lines must be -10..10, excluding zero"};
@@ -570,13 +743,29 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     const auto state = impl_->get(sessionId);
     if (!state) return {MaiErrorCode::NotFound, "observe a window in this Session first"};
     std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->token.empty() || state->token != request.snapshotId || state->desktopScope != request.desktopScope ||
+    if (state->invalidated.load() || state->token.empty() || state->token != request.snapshotId ||
+        state->desktopScope != request.desktopScope ||
         (state->desktopScope ? state->display.id != request.displayId : state->window.id != request.windowId) ||
         std::chrono::steady_clock::now() - state->observedAt > std::chrono::minutes(5))
         return {MaiErrorCode::InvalidInput, "window observation expired; observe again"};
     // Only one controller may manipulate the physical desktop at a time. The
     // native layer also checks target identity between multi-event inputs.
     std::lock_guard<std::mutex> desktopLock(desktopOperationMutex);
+    if (state->invalidated.load()) return {MaiErrorCode::Canceled, "input observation was revoked"};
+    const auto inputCanceled = [&request, state] {
+        return state->invalidated.load() || (request.isCanceled && request.isCanceled());
+    };
+    const auto allowed = impl_->inputOwnership->prepare(sessionId, request, false);
+    if (!allowed) return allowed.error();
+    if (writesText) {
+        for (const auto& key : inputState(sessionId).keysDown) {
+            const auto parsed = maiDesktopParseKey(key);
+            DesktopKeyModifier modifier;
+            if (parsed && maiDesktopKeyModifier(parsed.value().key, modifier))
+                return {MaiErrorCode::Busy,
+                        "literal text needs released modifiers; use key for composed physical input"};
+        }
+    }
     if (state->desktopScope) {
         if (state->inputGeneration != desktopInputGeneration.load())
             return {MaiErrorCode::InvalidInput, "desktop input changed since this snapshot; observe again"};
@@ -594,7 +783,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         if (request.dryRun) {
             receipt.state = "validated";
             receipt.dryRun = true;
-            return receipt;
+            return success(std::move(receipt));
         }
         if (writesText || keyNeedsInputCheck) {
             const auto secure = impl_->backend->secureInput();
@@ -609,7 +798,9 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         input.key = request.key;
         input.lines = request.scrollLines;
         input.durationMs = request.durationMs;
-        input.isCanceled = request.isCanceled;
+        input.button = request.button;
+        input.scrollAxis = request.scrollAxis;
+        input.isCanceled = inputCanceled;
         input.x = state->display.x + request.xRatio * (std::max)(1.0, state->display.width - 1);
         input.y = state->display.y + request.yRatio * (std::max)(1.0, state->display.height - 1);
         input.toX = state->display.x + request.toXRatio * (std::max)(1.0, state->display.width - 1);
@@ -622,23 +813,33 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
                      : action == "type"         ? DesktopNativeInputKind::Type
                      : action == "replace_text" ? DesktopNativeInputKind::ReplaceFocusedText
                      : action == "key"          ? DesktopNativeInputKind::Key
+                     : action == "mouse_down"   ? DesktopNativeInputKind::MouseDown
+                     : action == "key_down"     ? DesktopNativeInputKind::KeyDown
                                                 : DesktopNativeInputKind::Scroll;
+        auto native = allowed.value();
+        if (action == "mouse_down" || action == "key_down") {
+            const auto created = impl_->inputOwnership->prepare(sessionId, request, true);
+            if (!created) return created.error();
+            native = created.value();
+        }
         state->token.clear();
         DesktopInputBatch inputBatch;
-        const MaiError sent = impl_->backend->input(input);
+        const MaiError sent = native ? native->input(input) : impl_->backend->input(input);
         if (sent) return inputDispatchFailure(sent);
         inputBatch.finish();
         receipt.state = "dispatched";
         receipt.dispatched = true;
+        receipt.inputState = inputState(sessionId);
         const auto next = observeDisplay(sessionId, state->workspace, state->display.id, request.isCanceled,
-                                         state->frameSequence, MaiTime::getCurrentTime());
+                                         state->frameSequence, MaiTime::getCurrentTime(), 0, request.turnId);
         if (next)
             receipt.observation = next.value();
         else {
             receipt.state = "dispatched_observation_failed";
             receipt.observationError = next.error().message();
         }
-        return receipt;
+        if (canceled()) impl_->inputOwnership->release(sessionId, request.turnId);
+        return success(std::move(receipt));
     }
     const auto listed = impl_->backend->windows();
     if (!listed) return listed.error();
@@ -655,7 +856,7 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     if (request.dryRun) {
         receipt.state = "validated";
         receipt.dryRun = true;
-        return receipt;  // No activation, input, focused text read or token consumption.
+        return success(std::move(receipt));  // No activation, input, focused text read or token consumption.
     }
     if (action == "verify") {
         const auto focused = impl_->backend->isFocused(state->window);
@@ -675,24 +876,24 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
         };
         receipt.verified = normalized(actual.value()) == normalized(request.expectedText);
         receipt.state = receipt.verified ? "verified" : "mismatch";
-        return receipt;
+        return success(std::move(receipt));
     }
     // Once an OS operation is attempted its outcome may be partial. Require a
     // new observation even when activation or an input batch reports failure.
     state->token.clear();
     DesktopInputBatch inputBatch;
-    const MaiError activated = action == "focus" ? impl_->backend->activate(state->window)
-                                                : impl_->backend->activateForInput(state->window);
+    const MaiError activated = action == "focus" ? impl_->backend->activate(state->window, inputCanceled)
+                                                 : impl_->backend->activateForInput(state->window, inputCanceled);
     if (activated) return activated;
     if (canceled()) return {MaiErrorCode::Canceled, "computer operation canceled"};
-    const auto focused = action == "focus" ? impl_->backend->isFocused(state->window)
-                                           : impl_->backend->inputFocused(state->window);
+    const auto focused =
+        action == "focus" ? impl_->backend->isFocused(state->window) : impl_->backend->inputFocused(state->window);
     if (!focused) return focused.error();
     if (!focused.value()) return {MaiErrorCode::Busy, "selected window did not become focused"};
     if (action == "focus") {
         receipt.state = "focused";
         receipt.dispatched = true;
-        return receipt;
+        return success(std::move(receipt));
     }
     if (writesText || keyNeedsInputCheck) {
         const auto secure = impl_->backend->secureInput();
@@ -703,11 +904,13 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
     DesktopNativeInput input;
     input.expectedWindowId = state->window.id;
     input.expectedProcessId = state->window.processId;
-    input.isCanceled = request.isCanceled;
+    input.isCanceled = inputCanceled;
     input.text = request.text;
     input.key = request.key;
     input.lines = request.scrollLines;
     input.durationMs = request.durationMs;
+    input.button = request.button;
+    input.scrollAxis = request.scrollAxis;
     input.x = state->window.x + request.xRatio * (std::max)(1.0, state->window.width - 1);
     input.y = state->window.y + request.yRatio * (std::max)(1.0, state->window.height - 1);
     input.toX = state->window.x + request.toXRatio * (std::max)(1.0, state->window.width - 1);
@@ -720,17 +923,28 @@ MaiResult<DesktopComputerActionResult> DesktopComputerController::perform(const 
                  : action == "type"         ? DesktopNativeInputKind::Type
                  : action == "replace_text" ? DesktopNativeInputKind::ReplaceFocusedText
                  : action == "key"          ? DesktopNativeInputKind::Key
+                 : action == "mouse_down"   ? DesktopNativeInputKind::MouseDown
+                 : action == "key_down"     ? DesktopNativeInputKind::KeyDown
                                             : DesktopNativeInputKind::Scroll;
-    const MaiError sent = impl_->backend->input(input);
+    auto native = allowed.value();
+    if (action == "mouse_down" || action == "key_down") {
+        const auto created = impl_->inputOwnership->prepare(sessionId, request, true);
+        if (!created) return created.error();
+        native = created.value();
+    }
+    const MaiError sent = native ? native->input(input) : impl_->backend->input(input);
     if (sent) return inputDispatchFailure(sent);
     if (canceled())
         return inputDispatchFailure({MaiErrorCode::Canceled, "computer operation canceled after input dispatch"});
     receipt.state = "dispatched";
     receipt.dispatched = true;
-    return receipt;
+    receipt.inputState = inputState(sessionId);
+    return success(std::move(receipt));
 }
 
 MaiError DesktopComputerController::clear(const std::string& sessionId) {
+    const auto released = releaseInput(sessionId);
+    if (released) return released;
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->sessions.erase(sessionId) == 0) return {MaiErrorCode::NotFound, "this Session has no selected window"};
     return {};
@@ -745,14 +959,22 @@ public:
     std::string name() const override {
         return "desktop_computer";
     }
+    MaiError onTurnFinished(const std::string& session, const std::string& turn) override {
+        return controller_->releaseInput(session, turn);
+    }
     std::string description() const override {
         // Keep image scope, native bounds and token lifetime together: the model
         // must not infer window coordinates from an unrelated whole-screen image.
-        return "Operate the desktop through native mouse/keyboard input.\n"
-               "SCREEN WORKFLOW (preferred for visual/cross-application work): call list_displays, "
-               "choose a display_id, then observe with target=display and that display_id. Inspect "
-               "the returned whole-screen image. For input use the same target, display_id and its "
-               "snapshot_id. Always specify target on observe/input; omission defaults to window.\n"
+        return "Operate the desktop through native mouse/keyboard input. Choose operations and "
+               "observation timing from the task and current state; no fixed click/type sequence is required.\n"
+               "CAPABILITIES: list discovers windows, list_displays discovers displays, and list_keys "
+               "lists named keys. target=display observe provides a whole-screen image and native "
+               "bounds; target=window observe provides window bounds and Accessibility/UIA elements "
+               "without a window image. Prefer display scope for visual/cross-application work. "
+               "Specify target explicitly on observe/input; omitted target means window. Click, "
+               "double_click and drag accept a mouse button; right_click is a fixed right-button alias. "
+               "move positions the pointer, scroll supports either axis, key taps a key/chord, and type "
+               "inserts Unicode text. These actions may be selected independently as needed.\n"
                "COORDINATES: x_ratio/y_ratio and drag destination to_x_ratio/to_y_ratio are fractions "
                "0..1 of the selected target bounds, never pixels. Top-left is (0,0), bottom-right "
                "(1,1), center (0.5,0.5); x increases right, y down. For target=display, a point "
@@ -761,38 +983,42 @@ public:
                "when viewing a scaled preview; do not divide preview pixels by original dimensions "
                "or apply an extra DPI/zoom factor. A crop or browser viewport has a different origin "
                "and cannot supply screen ratios directly. Never mix monitors or image/token pairs.\n"
-               "WINDOW WORKFLOW: call list, then observe with target=window and one window_id "
-               "(or exact window_title). This returns window bounds, Accessibility/UIA elements "
-               "and snapshot_id, not a window image. Use the returned window_id and snapshot_id "
-               "for that window's input. Element center_x_ratio/center_y_ratio are already "
-               "window-relative; use them directly. Other window coordinates refer to the entire "
-               "observed window bounds, not just web content. Window input activates and checks "
-               "the selected window; this does not freeze its position.\n"
+               "WINDOW COORDINATES AND FOCUS: window observations identify one exact window_id "
+               "or window_title. Element center_x_ratio/center_y_ratio are already window-relative; "
+               "use them directly. Other window coordinates refer to the full observed window bounds, "
+               "not just web content. Window input activates/checks that window, without freezing "
+               "its position. Display move does not focus; display key/type uses the current keyboard "
+               "focus. Establish focus only when needed; a screenshot alone is not proof of focus.\n"
                "CROSS-SCOPE CONVERSION: never apply whole-display screenshot ratios directly to "
                "a window. Only with known matching display/window bounds, first compute u=px/(Iw-1), "
                "v=py/(Ih-1) from the actual full-display image. For native display bounds D and window "
                "bounds W, window x_ratio=(D.x+u*(D.width-1)-W.x)/(W.width-1), and "
                "y_ratio=(D.y+v*(D.height-1)-W.y)/(W.height-1). Native bounds can differ from image "
                "pixels and have negative origins. If bounds are unknown, changed, degenerate or the "
-               "point is outside 0..1, re-observe rather than guess/clamp. Prefer the screen workflow.\n"
-               "IMAGES, SNAPSHOTS AND FOCUS: standalone screenshot captures the display under the "
-               "pointer, which may be another monitor. A screenshot does not refresh a computer "
-               "snapshot_id or bind an input target. After using it, obtain and inspect a new bound "
-               "display observation before visual input. Each input attempt, including window focus, "
-               "consumes its snapshot; do not reuse it for click then type. For display actions, inspect "
-               "the returned image and use observation.snapshot_id for the next action. For window "
-               "actions, observe again. Re-observe after stale/changed-target errors. If input was "
-               "dispatched but observation failed, observe again without blindly repeating the input. "
-               "Display move does not focus a window; display key/type goes to the current keyboard "
-               "focus. Verify focus after clicking or a foreground change; taking a screenshot is "
-               "not proof of focus. Display observe accepts wait_ms=0..5000 for paint/loading; a fresh "
-               "frame alone does not prove the application handled input. Inspect before retrying.\n"
-               "DRAG BOUNDARY: drag presses, moves to the supplied endpoint and releases before "
-               "returning its next image. It does not check visual alignment before release. "
-               "Capture/observe does not itself release mouse buttons, but separate mouse-down/up "
-               "actions are not exposed here, so this interface cannot pause a drag while you "
-               "inspect an image and then adjust it with the button held. Repeated screenshots "
-               "do not extend a completed drag.\n"
+               "point is outside 0..1, re-observe rather than guess/clamp.\n"
+               "OBSERVATION AND TOKENS: use a fresh snapshot bound to the same session, target "
+               "and coordinate space. A mutating action consumes it. Display action results include "
+               "a new image and observation.snapshot_id; use this observation when sufficient. "
+               "Window actions require a renewed observation for further input. Observe when the "
+               "target/token is unknown, expired or changed, or when more evidence is needed. "
+               "A screenshot does not refresh a computer snapshot_id or bind an input target; "
+               "standalone screenshot captures the display under the pointer, which may be another "
+               "monitor. Do not substitute unrelated images for a bound visual observation. "
+               "If input was dispatched but observation failed, inspect the current state before "
+               "retrying the mutation. Display observe accepts wait_ms=0..5000 for paint/loading; "
+               "a fresh frame alone does not prove application completion.\n"
+               "INPUT STATE: mouse_down/mouse_up and key_down/key_up control independent holds; "
+               "key_down/key_up accept a single physical key, not a chord. Held modifiers combine "
+               "with pointer, wheel and key input; move preserves held mouse buttons. Capture and "
+               "observe do not release inputs. Click/key taps and complete drag release only their "
+               "own transient presses. drag moves to a supplied endpoint and releases; it does not "
+               "check visual alignment. input_state reports this caller's buttons_down/keys_down. "
+               "mouse_up, key_up and release_all pair only owned presses, remain usable without a "
+               "fresh snapshot or foreground focus, and do not adopt/release physical user holds. "
+               "One session/task/target owns held input at a time. Release before changing target. "
+               "Owned holds are released at task end/cancel, dispatch failure, clear/destruction or "
+               "120 seconds of owner inactivity. Inspect state after interruption/expiry; do not "
+               "assume an earlier hold remains active.\n"
                "KEYBOARD AND READBACK: Meta taps the Windows launcher; Cmd+Space can open Spotlight. "
                "list_keys returns the accepted shared keyboard names without observing or injecting input. "
                "Native platform support is checked before dispatch; an unavailable key is not replaced "
@@ -800,7 +1026,8 @@ public:
                "Ctrl+Shift, ControlRight+F4 or Ctrl+Plus. Named Equal/Minus refer to physical keys; "
                "literal punctuation resolves through the current layout. NumpadEnter is distinct "
                "from Enter. type enters Unicode text, including Chinese and emoji; use it for text "
-               "instead of spelling characters as hardware keys. "
+               "instead of spelling characters as hardware keys. Literal type/replace_text requires no owned "
+               "Control/Shift/Alt/Meta holds; use key for composed physical input. "
                "replace_text selects all in the focused editable control then types the replacement "
                "(an empty string deletes its text). Window-only verify reads the focused non-password "
                "control and compares expected_text; "
@@ -809,18 +1036,20 @@ public:
                "Approval follows the Agent policy; OS focus, interactive-desktop and platform "
                "permissions still apply. If focus or permissions are refused, explain the condition "
                "and wait for user assistance instead of repeatedly retrying or inventing shell scripts. "
-               "clear only forgets the selected window and snapshot; "
+               "clear only forgets the selected window and snapshot and releases owned inputs; "
                "it does not clear input text. After clear, observe again.";
     }
     std::string parametersSchema() const override {
         return R"({"type":"object","properties":{
-          "action":{"type":"string","enum":["list","list_displays","list_keys","observe","focus","move","click","double_click","right_click","drag","type","replace_text","key","scroll","verify","clear"]},
+          "action":{"type":"string","enum":["list","list_displays","list_keys","observe","focus","move","click","double_click","right_click","drag","mouse_down","mouse_up","type","replace_text","key","key_down","key_up","scroll","input_state","release_all","verify","clear"]},
+          "button":{"type":"string","enum":["left","right","middle","back","forward"],"description":"Button for click/double_click/drag/mouse_down/mouse_up; default left. right_click always means right."},
+          "axis":{"type":"string","enum":["vertical","horizontal"],"description":"Scroll axis, default vertical. Positive lines mean up vertically or right horizontally."},
           "target":{"type":"string","enum":["window","display"],"description":"Set explicitly on observe/input. display: selected whole screen and its bound image (preferred for visual work). window: selected window bounds/UIA, no window image. Omitted means window."},
           "display_id":{"type":"string","description":"Exact ID from list_displays; required for display observe/input. Keep the image, display_id and snapshot_id from the same observation."},
           "window_title":{"type":"string","maxLength":500,"description":"Exact title for window observe; supply this OR window_id, not both."},
           "window_id":{"type":"string","description":"ID from list/window observe. Required for window input; coordinates refer to this window's full observed bounds."},
           "include_elements":{"type":"boolean","description":"Window observe only: include Accessibility/UIA elements. Their center_x_ratio/center_y_ratio can be used directly for window input."},
-          "snapshot_id":{"type":"string","description":"Fresh token for this session and target. Initial observe returns snapshot_id; display input returns the next token at observation.snapshot_id. Input consumes it; standalone screenshot never renews it."},
+          "snapshot_id":{"type":"string","description":"Fresh token for this session and target. Observe returns snapshot_id; display input returns the next token at observation.snapshot_id. Mutations consume it; owned up/release actions need no token. Standalone screenshot never renews it."},
           "wait_ms":{"type":"integer","minimum":0,"maximum":5000,"description":"Display observe only: wait before acquiring a fresh frame, e.g. for application paint/loading."},
           "x_ratio":{"type":"number","minimum":0,"maximum":1,"description":"Horizontal fraction of selected display/window bounds: 0 left, 1 right. For the bound full-display image use px/(inspected image width-1), never raw pixels or browser-viewport ratios."},
           "y_ratio":{"type":"number","minimum":0,"maximum":1,"description":"Vertical fraction of selected display/window bounds: 0 top, 1 bottom. For the bound full-display image use py/(inspected image height-1). Whole-screen ratios are not window ratios."},
@@ -828,7 +1057,7 @@ public:
           "to_y_ratio":{"type":"number","minimum":0,"maximum":1,"description":"Drag destination y in the SAME target coordinate space as y_ratio; never a pixel offset."},
           "duration_ms":{"type":"integer","minimum":1,"maximum":5000},
           "text":{"type":"string","minLength":0,"maxLength":4000},
-          "key":{"type":"string","minLength":1,"maxLength":128,"description":"Single key or modifier chord; list_keys gives accepted names. Examples: Ctrl+A, Cmd+A, Ctrl+Shift, ControlRight+F4, Ctrl+Plus, NumpadEnter"},
+          "key":{"type":"string","minLength":1,"maxLength":128,"description":"key accepts a single key or modifier chord; key_down/key_up accept one physical key only. list_keys gives accepted names. Examples: Ctrl+A, Cmd+A, Ctrl+Shift, ControlRight+F4, Ctrl+Plus, NumpadEnter"},
           "lines":{"type":"integer","minimum":-10,"maximum":10},
           "expected_text":{"type":"string","maxLength":4000},"dry_run":{"type":"boolean"}
         },"required":["action"],"additionalProperties":false})";
@@ -839,26 +1068,95 @@ public:
     bool requiresPerCallApproval(const std::string& raw) const override {
         const Json args = Json::parse(raw, nullptr, false);
         if (!args.is_object() || !args.value("action", Json{}).is_string()) return true;
-        return args["action"].get<std::string>() != "clear";
+        const auto action = args["action"].get<std::string>();
+        // Cleanup cannot depend on a new approval dialog or a still-valid
+        // observation; these operations only release this caller's own ledger.
+        return action != "clear" && action != "release_all" && action != "mouse_up" && action != "key_up" &&
+               action != "input_state";
     }
     MaiToolResult execute(const std::string& raw, const MaiToolContext& context) override {
-        if (context.isCanceled()) return MaiToolResult::failure(MaiErrorCode::Canceled, "computer operation canceled");
+        Json args = Json::parse(raw, nullptr, false);
+        const bool cleanup = args.is_object() && args.value("action", Json{}).is_string() &&
+                             (args["action"] == "release_all" || args["action"] == "mouse_up" ||
+                              args["action"] == "key_up" || args["action"] == "input_state");
+        if (context.isCanceled()) {
+            controller_->releaseInput(context.sessionId, context.turnId);
+            if (!cleanup) return MaiToolResult::failure(MaiErrorCode::Canceled, "computer operation canceled");
+        }
         if (context.sessionId.empty())
             return MaiToolResult::failure(MaiErrorCode::NotConfigured, "a local Desktop Session is required");
-        Json args = Json::parse(raw, nullptr, false);
         if (!args.is_object() || !args.value("action", Json{}).is_string())
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "computer action is required");
+        if (args["action"] == "input_state" || args["action"] == "release_all") {
+            if (args.size() != 1)
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput,
+                                              "owned input state actions have no other parameters");
+            if (args["action"] == "release_all") {
+                const auto released =
+                    controller_->releaseInput(context.sessionId, context.isCanceled() ? context.turnId : std::string());
+                if (released) return failure(released);
+            }
+            return MaiToolResult::success(inputStateJson(controller_->inputState(context.sessionId)).dump());
+        }
+        if (args["action"] == "mouse_up" || args["action"] == "key_up") {
+            const bool mouse = args["action"] == "mouse_up";
+            for (auto field = args.begin(); field != args.end(); ++field) {
+                const auto& key = field.key();
+                if (key != "action" && key != "target" && key != "window_id" && key != "display_id" &&
+                    key != "snapshot_id" && key != "dry_run" && key != (mouse ? "button" : "key"))
+                    return MaiToolResult::failure(MaiErrorCode::InvalidInput, "unexpected input-release parameter");
+            }
+            if (args.contains("target") &&
+                (!args["target"].is_string() || (args["target"] != "display" && args["target"] != "window")))
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "target must be display or window");
+            if (args.contains("display_id") && args.contains("window_id"))
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "release refers to at most one input target");
+            DesktopComputerAction request;
+            request.action = args["action"].get<std::string>();
+            request.turnId = context.turnId;
+            if (args.contains("dry_run") && !args["dry_run"].is_boolean())
+                return MaiToolResult::failure(MaiErrorCode::InvalidInput, "dry_run must be boolean");
+            request.dryRun = args.value("dry_run", false);
+            request.isCanceled = [&context] { return context.isCanceled(); };
+            if (mouse) {
+                const auto button = mouseButtonFrom(args.value("button", Json("left")));
+                if (!button) return failure(button.error());
+                request.button = button.value();
+            } else {
+                if (!args.value("key", Json{}).is_string())
+                    return MaiToolResult::failure(MaiErrorCode::InvalidInput, "key_up needs one named key");
+                request.key = args["key"].get<std::string>();
+            }
+            request.desktopScope = args.value("target", std::string("window")) == "display";
+            for (const char* field : {"display_id", "window_id"})
+                if (args.contains(field)) {
+                    const auto id = windowIdFrom(args[field]);
+                    if (!id) return failure(id.error());
+                    if (std::string(field) == "display_id")
+                        request.displayId = id.value();
+                    else
+                        request.windowId = id.value();
+                }
+            const auto released = controller_->perform(context.sessionId, request);
+            if (!released) return failure(released.error());
+            Json output = inputStateJson(released.value().inputState);
+            output["state"] = released.value().state;
+            output["dry_run"] = released.value().dryRun;
+            output["dispatched"] = released.value().dispatched;
+            return MaiToolResult::success(output.dump());
+        }
         if (args["action"] == "list_keys") {
             if (args.size() != 1)
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "list_keys has no other parameters");
             // This ordinary immutable directory has no dependency on a selected
             // session window, permissions, capture, focus or native input state.
-            return MaiToolResult::success(Json{
-                {"key_names", maiDesktopKeyNames()},
-                {"key_action", "key"},
-                {"text_action", "type"},
-                {"native_support_checked_at_dispatch", true},
-                {"note", "Names describe the shared grammar. Unsupported native mappings fail explicitly; use type for Unicode text."}}
+            return MaiToolResult::success(Json{{"key_names", maiDesktopKeyNames()},
+                                               {"key_action", "key"},
+                                               {"text_action", "type"},
+                                               {"native_support_checked_at_dispatch", true},
+                                               {"note",
+                                                "Names describe the shared grammar. Unsupported native mappings fail "
+                                                "explicitly; use type for Unicode text."}}
                                               .dump());
         }
         if (args.contains("target")) {
@@ -912,10 +1210,10 @@ public:
                 if (!parsed) return failure(parsed.error());
                 id = parsed.value();
             }
-            const auto observed =
-                controller_->observe(context.sessionId, args.value("window_title", std::string()), context.root,
-                                     args.value("include_elements", true), id, false,
-                                     [&context] { return context.isCanceled(); });
+            const auto observed = controller_->observe(
+                context.sessionId, args.value("window_title", std::string()), context.root,
+                args.value("include_elements", true), id, false, [&context] { return context.isCanceled(); },
+                context.turnId);
             if (!observed) return failure(observed.error());
             return MaiToolResult::success(observed.value().json);
         }
@@ -935,7 +1233,9 @@ public:
         const auto id = windowIdFrom(args["window_id"]);
         if (!id) return failure(id.error());
         const bool positioned = action == "click" || action == "double_click" || action == "right_click" ||
-                                action == "drag" || action == "scroll";
+                                action == "drag" || action == "scroll" || action == "move" || action == "mouse_down";
+        const bool buttonAction =
+            action == "click" || action == "double_click" || action == "drag" || action == "mouse_down";
         const bool writesText = action == "type" || action == "replace_text";
         for (auto field = args.begin(); field != args.end(); ++field) {
             const std::string& name = field.key();
@@ -943,15 +1243,16 @@ public:
                 name == "action" || name == "snapshot_id" || name == "window_id" || name == "dry_run" ||
                 (positioned && (name == "x_ratio" || name == "y_ratio")) ||
                 (action == "drag" && (name == "to_x_ratio" || name == "to_y_ratio" || name == "duration_ms")) ||
-                (writesText && name == "text") || (action == "key" && name == "key") ||
-                (action == "scroll" && name == "lines") || (action == "verify" && name == "expected_text");
+                (writesText && name == "text") || ((action == "key" || action == "key_down") && name == "key") ||
+                (buttonAction && name == "button") || (action == "scroll" && (name == "lines" || name == "axis")) ||
+                (action == "verify" && name == "expected_text");
             if (!allowed)
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "unexpected computer action parameter");
         }
         if ((positioned &&
              (!args.value("x_ratio", Json{}).is_number() || !args.value("y_ratio", Json{}).is_number())) ||
             (writesText && !args.value("text", Json{}).is_string()) ||
-            (action == "key" && !args.value("key", Json{}).is_string()) ||
+            ((action == "key" || action == "key_down") && !args.value("key", Json{}).is_string()) ||
             (action == "scroll" && !args.value("lines", Json{}).is_number_integer()) ||
             (action == "verify" && !args.value("expected_text", Json{}).is_string()) ||
             (action == "drag" &&
@@ -977,6 +1278,17 @@ public:
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "drag duration must be 1..200 milliseconds");
         request.scrollLines = args.value("lines", 0);
         request.durationMs = args.value("duration_ms", 200);
+        request.turnId = context.turnId;
+        if (buttonAction) {
+            const auto button = mouseButtonFrom(args.value("button", Json("left")));
+            if (!button) return failure(button.error());
+            request.button = button.value();
+        }
+        if (action == "scroll") {
+            const auto axis = scrollAxisFrom(args.value("axis", Json("vertical")));
+            if (!axis) return failure(axis.error());
+            request.scrollAxis = axis.value();
+        }
         request.dryRun = args.value("dry_run", false);
         request.isCanceled = [&context] { return context.isCanceled(); };
         const auto acted = controller_->perform(context.sessionId, request);
@@ -992,6 +1304,7 @@ public:
              request.dryRun
                  ? "No input was sent; the snapshot remains available."
                  : "Observe the same window again before the next action. Verify business persistence separately."}};
+        output["input_state"] = inputStateJson(controller_->inputState(context.sessionId));
         if (action == "verify") {
             const QString actual =
                 QString::fromUtf8(acted.value().actualText.data(), int(acted.value().actualText.size()));
@@ -1026,9 +1339,12 @@ private:
         if (!parsedId) return failure(parsedId.error());
         const bool observing = action == "observe";
         const bool positioned = action == "move" || action == "click" || action == "double_click" ||
-                                action == "right_click" || action == "drag" || action == "scroll";
+                                action == "right_click" || action == "drag" || action == "scroll" || action == "move" ||
+                                action == "mouse_down";
+        const bool buttonAction =
+            action == "click" || action == "double_click" || action == "drag" || action == "mouse_down";
         const bool writesText = action == "type" || action == "replace_text";
-        if (!observing && !positioned && !writesText && action != "key")
+        if (!observing && !positioned && !writesText && action != "key" && action != "key_down")
             return MaiToolResult::failure(MaiErrorCode::InvalidInput, "unsupported desktop action");
         for (auto field = args.begin(); field != args.end(); ++field) {
             const std::string& name = field.key();
@@ -1037,8 +1353,8 @@ private:
                 (!observing && (name == "snapshot_id" || name == "dry_run")) ||
                 (positioned && (name == "x_ratio" || name == "y_ratio")) ||
                 (action == "drag" && (name == "to_x_ratio" || name == "to_y_ratio" || name == "duration_ms")) ||
-                (writesText && name == "text") || (action == "key" && name == "key") ||
-                (action == "scroll" && name == "lines");
+                (writesText && name == "text") || ((action == "key" || action == "key_down") && name == "key") ||
+                (buttonAction && name == "button") || (action == "scroll" && (name == "lines" || name == "axis"));
             if (!allowed)
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput,
                                               "unexpected desktop action parameter: " + name);
@@ -1049,7 +1365,7 @@ private:
                 return MaiToolResult::failure(MaiErrorCode::InvalidInput, "display observation wait must be 0..5000ms");
             const auto observed = controller_->observeDisplay(
                 context.sessionId, context.root, parsedId.value(), [&context] { return context.isCanceled(); }, 0, 0,
-                args.value("wait_ms", 0));
+                args.value("wait_ms", 0), context.turnId);
             if (!observed) return failure(observed.error());
             return MaiToolResult::successWithImages(observed.value().json,
                                                     {MaiToolImage{observed.value().imagePath, "image/png"}});
@@ -1058,7 +1374,7 @@ private:
             (positioned &&
              (!args.value("x_ratio", Json{}).is_number() || !args.value("y_ratio", Json{}).is_number())) ||
             (writesText && !args.value("text", Json{}).is_string()) ||
-            (action == "key" && !args.value("key", Json{}).is_string()) ||
+            ((action == "key" || action == "key_down") && !args.value("key", Json{}).is_string()) ||
             (action == "scroll" && !args.value("lines", Json{}).is_number_integer()) ||
             (action == "drag" &&
              (!args.value("to_x_ratio", Json{}).is_number() || !args.value("to_y_ratio", Json{}).is_number())) ||
@@ -1084,6 +1400,17 @@ private:
         request.key = args.value("key", std::string());
         request.scrollLines = args.value("lines", 0);
         request.durationMs = args.value("duration_ms", 200);
+        request.turnId = context.turnId;
+        if (buttonAction) {
+            const auto button = mouseButtonFrom(args.value("button", Json("left")));
+            if (!button) return failure(button.error());
+            request.button = button.value();
+        }
+        if (action == "scroll") {
+            const auto axis = scrollAxisFrom(args.value("axis", Json("vertical")));
+            if (!axis) return failure(axis.error());
+            request.scrollAxis = axis.value();
+        }
         request.dryRun = args.value("dry_run", false);
         request.isCanceled = [&context] { return context.isCanceled(); };
         const auto result = controller_->perform(context.sessionId, request);
@@ -1095,6 +1422,7 @@ private:
                     {"dispatched", result.value().dispatched},
                     {"verified", result.value().verified},
                     {"dry_run", result.value().dryRun}};
+        output["input_state"] = inputStateJson(controller_->inputState(context.sessionId));
         if (!result.value().observationError.empty()) {
             output["observation_error"] = result.value().observationError;
             output["next_step"] = "Input was dispatched. Observe again; do not blindly repeat the input.";

@@ -8,9 +8,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -30,6 +33,7 @@ std::string utf8(CFStringRef value) {
 }
 
 std::string attribute(AXUIElementRef element, CFStringRef name) {
+    if (element) AXUIElementSetMessagingTimeout(element, 0.1f);
     CFTypeRef value = nullptr;
     if (AXUIElementCopyAttributeValue(element, name, &value) != kAXErrorSuccess ||
         !value) return {};
@@ -39,6 +43,7 @@ std::string attribute(AXUIElementRef element, CFStringRef name) {
 }
 
 bool bounds(AXUIElementRef element, DesktopNativeElement& result) {
+    if (element) AXUIElementSetMessagingTimeout(element, 0.1f);
     CFTypeRef position = nullptr;
     CFTypeRef size = nullptr;
     const bool found = AXUIElementCopyAttributeValue(element, kAXPositionAttribute,
@@ -97,6 +102,7 @@ AXUIElementRef accessibilityWindow(const DesktopNativeWindow& window) {
     if (!currentWindowFrame(window, frame)) return nullptr;
     AXUIElementRef application = AXUIElementCreateApplication(pid_t(window.processId));
     if (!application) return nullptr;
+    AXUIElementSetMessagingTimeout(application, 0.1f);
     CFTypeRef value = nullptr;
     AXUIElementRef found = nullptr;
     if (AXUIElementCopyAttributeValue(application, kAXWindowsAttribute, &value) ==
@@ -183,6 +189,7 @@ struct ReleaseCFValue {
 using ScopedCFValue = std::unique_ptr<const void, ReleaseCFValue>;
 
 ScopedCFValue copiedAttribute(AXUIElementRef element, CFStringRef name) {
+    if (element) AXUIElementSetMessagingTimeout(element, 0.1f);
     CFTypeRef value = nullptr;
     const AXError result = AXUIElementCopyAttributeValue(element, name, &value);
     ScopedCFValue owned(value);
@@ -259,12 +266,271 @@ bool acceptsInputFromWindow(AXUIElementRef selected, AXUIElementRef focused,
 }
 
 class InputScope {
-public:
+  public:
     explicit InputScope(const DesktopNativeInput& input) : input_(input) {
-        // A remote-control source owns only its synthetic state table. Cleanup
-        // must never manufacture key-up events for the user's hardware state.
         source_ = CGEventSourceCreate(kCGEventSourceStatePrivate);
-        if (input.desktopScope) return;
+        bindTarget();
+    }
+    ~InputScope() {
+        while (!releases_.empty())
+            release();
+        clearTarget();
+        if (source_)
+            CFRelease(source_);
+    }
+    MaiError begin(const DesktopNativeInput& input) {
+        if (!releases_.empty() && !sameBinding(input))
+            return {MaiErrorCode::Busy, "release held input before changing its native target"};
+        const bool retained = !releases_.empty();
+        input_ = input;
+        if (!retained) {
+            clearTarget();
+            bindTarget();
+        }
+        return {};
+    }
+    void finish() {
+        // No context callback may survive this synchronous request.
+        input_.isCanceled = {};
+        input_.text.clear();
+    }
+    MaiError validate() const {
+        if (input_.isCanceled && input_.isCanceled())
+            return {MaiErrorCode::Canceled, "computer input canceled"};
+        const MaiError permission = accessPermission();
+        if (permission)
+            return permission;
+        if (!source_)
+            return {MaiErrorCode::Internal, "could not create a private computer input source"};
+        if (input_.desktopScope) {
+            if (!interactiveDesktopIsAvailable())
+                return {MaiErrorCode::NotConfigured,
+                        "an unlocked interactive macOS desktop is required for "
+                        "computer input"};
+            return validateDisplay(input_.display);
+        }
+        if (!window_ || !application_)
+            return {MaiErrorCode::NotFound,
+                    "selected window is unavailable to macOS Accessibility"};
+        bool front = false;
+        @autoreleasepool {
+            NSRunningApplication* app = [[NSWorkspace sharedWorkspace] frontmostApplication];
+            front = app && app.processIdentifier == process_;
+        }
+        if (!front)
+            return {MaiErrorCode::Busy,
+                    "selected application lost foreground focus during computer input"};
+        const ScopedCFValue focused = copiedAttribute(application_, kAXFocusedWindowAttribute);
+        if (!focused ||
+            !acceptsInputFromWindow(window_, static_cast<AXUIElementRef>(focused.get()), process_))
+            return {MaiErrorCode::Busy, "focused macOS window ownership is unproven; "
+                                        "explicitly observe or focus that window"};
+        return {};
+    }
+    const std::function<bool()>& cancellation() const { return input_.isCanceled; }
+    std::size_t heldCount() const { return releases_.size(); }
+    bool owns(bool keyboard, int code) const {
+        return std::any_of(releases_.begin(), releases_.end(), [=](const Pending& p) {
+            return p.keyboard == keyboard && p.code == code;
+        });
+    }
+    CGEventFlags ownedModifiers() const {
+        CGEventFlags flags = 0;
+        for (const auto& p : releases_)
+            flags |= p.modifier;
+        return flags;
+    }
+    bool hardwareConflict() const { return hardwareConflict_; }
+    bool containsTag(const std::string& tag) const {
+        return std::any_of(releases_.begin(), releases_.end(),
+                           [&](const Pending& p) { return p.tag == tag; });
+    }
+    DesktopNativeInputState state() const {
+        DesktopNativeInputState result;
+        for (const auto& p : releases_) {
+            if (p.name.empty())
+                continue;
+            (p.keyboard ? result.keysDown : result.buttonsDown).push_back(p.name);
+        }
+        return result;
+    }
+    void releaseTag(const std::string& tag) {
+        const auto found = std::find_if(releases_.begin(), releases_.end(),
+                                        [&](const Pending& p) { return p.tag == tag; });
+        if (found == releases_.end())
+            return;
+        releaseAt(std::size_t(found - releases_.begin()));
+        if (releases_.empty())
+            resetSource();
+    }
+    void releaseAll() {
+        finish();
+        while (!releases_.empty())
+            release();
+        // A skipped hardware-overlapping up must not leave our private source
+        // table alive. Never synthesize a replacement down on another source.
+        resetSource();
+    }
+    MaiError hold(CGEventRef down, CGEventRef up, CGEventFlags modifier = 0, CGEventFlags extra = 0,
+                  std::string name = {}, std::string tag = {}) {
+        const MaiError ready = validate();
+        if (ready)
+            return ready;
+        const CGEventType type = CGEventGetType(down);
+        const bool keyboard = type == kCGEventKeyDown || type == kCGEventFlagsChanged;
+        const int code = keyboard
+                             ? int(CGEventGetIntegerValueField(down, kCGKeyboardEventKeycode))
+                             : int(CGEventGetIntegerValueField(down, kCGMouseEventButtonNumber));
+        if (owns(keyboard, code))
+            return {MaiErrorCode::Busy, "atomic input conflicts with an owned hold"};
+        if (hardwareHeld(keyboard, code))
+            return {MaiErrorCode::Busy, "the requested input is already held by the user"};
+        // Allocate/copy before posting: an exception must never lose the up
+        // ledger after a synthetic down has reached the operating system.
+        Pending pending{up, modifier, extra, keyboard, code, std::move(name), std::move(tag)};
+        releases_.reserve(releases_.size() + 1);
+        CFRetain(up);
+        releases_.push_back(std::move(pending));
+        CGEventSetSource(down, source_);
+        CGEventSetFlags(down, effectiveFlags() | extra);
+        CGEventPost(kCGHIDEventTap, down);
+        return {};
+    }
+    void release() {
+        if (!releases_.empty())
+            releaseAt(releases_.size() - 1);
+    }
+    MaiError tap(CGEventRef down, CGEventRef up, CGEventFlags extra = 0) {
+        const std::size_t before = heldCount();
+        const MaiError sent = hold(down, up, 0, extra);
+        if (sent)
+            return sent;
+        if (heldCount() > before)
+            release();
+        return validate();
+    }
+    MaiError key(CGKeyCode code, CGEventFlags extra = 0, bool modifier = false,
+                 bool persistent = false, std::string name = {}, std::string tag = {}) {
+        if (owns(true, code)) {
+            if (persistent || modifier) return {};
+            return {MaiErrorCode::Busy, "atomic key tap conflicts with an owned hold"};
+        }
+
+        CGEventRef down = CGEventCreateKeyboardEvent(source_, code, true);
+        CGEventRef up = CGEventCreateKeyboardEvent(source_, code, false);
+        ScopedCFValue downOwner(down), upOwner(up);
+        if (!down || !up) {
+            return {MaiErrorCode::Internal, "could not create keyboard events"};
+        }
+        if (modifier) {
+            CGEventSetType(down, kCGEventFlagsChanged);
+            CGEventSetType(up, kCGEventFlagsChanged);
+        }
+        const MaiError sent = modifier || persistent
+                                  ? hold(down, up, modifier ? extra : 0, modifier ? 0 : extra,
+                                         std::move(name), std::move(tag))
+                                  : tap(down, up, extra);
+        return sent;
+    }
+    MaiError move(CGPoint point, bool = true) {
+        const MaiError ready = validate();
+        if (ready)
+            return ready;
+        if (input_.desktopScope && !displayContainsPoint(input_.display, point))
+            return {MaiErrorCode::InvalidInput,
+                    "pointer coordinates are outside the observed display"};
+        int button = -1;
+        for (auto it = releases_.rbegin(); it != releases_.rend(); ++it)
+            if (!it->keyboard) {
+                button = it->code;
+                break;
+            }
+        const CGEventType type = button < 0    ? kCGEventMouseMoved
+                                 : button == 0 ? kCGEventLeftMouseDragged
+                                 : button == 1 ? kCGEventRightMouseDragged
+                                               : kCGEventOtherMouseDragged;
+        CGEventRef event =
+            CGEventCreateMouseEvent(source_, type, point, CGMouseButton((std::max)(0, button)));
+        if (!event)
+            return {MaiErrorCode::Internal, "could not create pointer motion event"};
+        post(event);
+        CFRelease(event);
+        for (auto& pending : releases_)
+            if (!pending.keyboard)
+                CGEventSetLocation(pending.event, point);
+        return validate();
+    }
+    void post(CGEventRef event) const {
+        CGEventSetSource(event, source_);
+        CGEventSetFlags(event, effectiveFlags());
+        CGEventPost(kCGHIDEventTap, event);
+    }
+
+  private:
+    struct Pending {
+        CGEventRef event;
+        CGEventFlags modifier;
+        CGEventFlags extra;
+        bool keyboard;
+        int code;
+        std::string name;
+        std::string tag;
+    };
+    static bool hardwareHeld(bool keyboard, int code) {
+        return keyboard ? CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, CGKeyCode(code))
+                        : CGEventSourceButtonState(kCGEventSourceStateHIDSystemState,
+                                                   CGMouseButton(code));
+    }
+    void releaseAt(std::size_t index) {
+        Pending pending = std::move(releases_[index]);
+        releases_.erase(releases_.begin() + index);
+        if (!hardwareHeld(pending.keyboard, pending.code)) {
+            if (!pending.keyboard) {
+                if (CGEventRef current = CGEventCreate(nullptr)) {
+                    CGEventSetLocation(pending.event, CGEventGetLocation(current));
+                    CFRelease(current);
+                }
+            }
+            CGEventSetSource(pending.event, source_);
+            CGEventSetFlags(pending.event, effectiveFlags() | pending.extra);
+            CGEventPost(kCGHIDEventTap, pending.event);
+        } else {
+            hardwareConflict_ = true;
+        }
+        CFRelease(pending.event);
+    }
+    void resetSource() {
+        if (source_)
+            CFRelease(source_);
+        source_ = CGEventSourceCreate(kCGEventSourceStatePrivate);
+        hardwareConflict_ = false;
+    }
+    CGEventFlags effectiveFlags() const {
+        return CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) | ownedModifiers();
+    }
+    bool sameBinding(const DesktopNativeInput& other) const {
+        if (input_.desktopScope != other.desktopScope ||
+            input_.expectedWindowId != other.expectedWindowId ||
+            input_.expectedProcessId != other.expectedProcessId)
+            return false;
+        return !input_.desktopScope ||
+               (input_.display.id == other.display.id && input_.display.x == other.display.x &&
+                input_.display.y == other.display.y &&
+                input_.display.width == other.display.width &&
+                input_.display.height == other.display.height);
+    }
+    void clearTarget() {
+        if (window_)
+            CFRelease(window_);
+        if (application_)
+            CFRelease(application_);
+        window_ = application_ = nullptr;
+        process_ = 0;
+    }
+    void bindTarget() {
+        const auto& input = input_;
+        if (input.desktopScope)
+            return;
         if (input.expectedWindowId && input.expectedProcessId) {
             DesktopNativeWindow selected;
             selected.id = input.expectedWindowId;
@@ -274,157 +540,42 @@ public:
             application_ = AXUIElementCreateApplication(process_);
         } else {
             AXUIElementRef system = AXUIElementCreateSystemWide();
+            if (system)
+                AXUIElementSetMessagingTimeout(system, 0.1f);
+            if (system)
+                AXUIElementSetMessagingTimeout(system, 0.1f);
             CFTypeRef application = nullptr;
-            if (system && AXUIElementCopyAttributeValue(system,
-                    kAXFocusedApplicationAttribute, &application) == kAXErrorSuccess &&
+            if (system &&
+                AXUIElementCopyAttributeValue(system, kAXFocusedApplicationAttribute,
+                                              &application) == kAXErrorSuccess &&
                 application && CFGetTypeID(application) == AXUIElementGetTypeID()) {
                 application_ = static_cast<AXUIElementRef>(application);
+                AXUIElementSetMessagingTimeout(application_, 0.1f);
                 AXUIElementGetPid(application_, &process_);
                 CFTypeRef focused = nullptr;
                 if (AXUIElementCopyAttributeValue(application_, kAXFocusedWindowAttribute,
-                        &focused) == kAXErrorSuccess && focused &&
-                    CFGetTypeID(focused) == AXUIElementGetTypeID())
+                                                  &focused) == kAXErrorSuccess &&
+                    focused && CFGetTypeID(focused) == AXUIElementGetTypeID())
                     window_ = static_cast<AXUIElementRef>(focused);
-                else if (focused) CFRelease(focused);
-            } else if (application) CFRelease(application);
-            if (system) CFRelease(system);
+                else if (focused)
+                    CFRelease(focused);
+            } else if (application)
+                CFRelease(application);
+            if (system)
+                CFRelease(system);
         }
+        if (application_)
+            AXUIElementSetMessagingTimeout(application_, 0.1f);
+        if (window_)
+            AXUIElementSetMessagingTimeout(window_, 0.1f);
     }
-    ~InputScope() {
-        // CGEventPost has no delivery acknowledgement. Cleanup pairs our downs
-        // with ups after cancellation/focus changes, preserving hardware holds.
-        while (!releases_.empty()) release();
-        if (window_) CFRelease(window_);
-        if (application_) CFRelease(application_);
-        if (source_) CFRelease(source_);
-    }
-    MaiError validate() const {
-        if (input_.isCanceled && input_.isCanceled())
-            return {MaiErrorCode::Canceled, "computer input canceled"};
-        const MaiError permission = accessPermission();
-        if (permission) return permission;
-        if (!source_) return {MaiErrorCode::Internal, "could not create a private computer input source"};
-        if (input_.desktopScope) {
-            if (!interactiveDesktopIsAvailable())
-                return {MaiErrorCode::NotConfigured,
-                        "an unlocked interactive macOS desktop is required for computer input"};
-            return validateDisplay(input_.display);
-        }
-        if (!window_ || !application_)
-            return {MaiErrorCode::NotFound, "selected window is unavailable to macOS Accessibility"};
-        bool front = false;
-        @autoreleasepool {
-            NSRunningApplication* app = [[NSWorkspace sharedWorkspace] frontmostApplication];
-            front = app && app.processIdentifier == process_;
-        }
-        if (!front)
-            return {MaiErrorCode::Busy, "selected application lost foreground focus during computer input"};
-        const ScopedCFValue focused = copiedAttribute(application_, kAXFocusedWindowAttribute);
-        if (!focused || !acceptsInputFromWindow(window_,
-                static_cast<AXUIElementRef>(focused.get()), process_))
-            return {MaiErrorCode::Busy,
-                    "focused macOS window ownership is unproven; explicitly observe or focus that window"};
-        return {};
-    }
-    MaiError hold(CGEventRef down, CGEventRef up, CGEventFlags modifier = 0,
-                  CGEventFlags extra = 0) {
-        const MaiError ready = validate();
-        if (ready) return ready;
-        const CGEventType type = CGEventGetType(down);
-        const bool keyboard = type == kCGEventKeyDown || type == kCGEventFlagsChanged;
-        const int code = keyboard ? int(CGEventGetIntegerValueField(down, kCGKeyboardEventKeycode))
-                                  : int(CGEventGetIntegerValueField(down, kCGMouseEventButtonNumber));
-        if ((keyboard && CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, CGKeyCode(code))) ||
-            (!keyboard && CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, CGMouseButton(code))))
-            return {MaiErrorCode::Busy, "the requested input is already held by the user"};
-        CGEventSetSource(down, source_);
-        CGEventSetFlags(down, effectiveFlags() | modifier | extra);
-        CGEventPost(kCGHIDEventTap, down);
-        CFRetain(up);
-        releases_.push_back({up, modifier, extra, keyboard, code});
-        return {};
-    }
-    void release() {
-        const Pending pending = releases_.back();
-        releases_.pop_back();
-        // A physical key/button may have gone down after our synthetic down.
-        // Leave that hardware input held; releasing the private source still
-        // discards our private state when the action ends.
-        const bool userHeld =
-            pending.keyboard ? CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, CGKeyCode(pending.code))
-                             : CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, CGMouseButton(pending.code));
-        if (!userHeld) {
-            CGEventSetSource(pending.event, source_);
-            CGEventSetFlags(pending.event, effectiveFlags() | pending.extra);
-            CGEventPost(kCGHIDEventTap, pending.event);
-        }
-        CFRelease(pending.event);
-    }
-    MaiError tap(CGEventRef down, CGEventRef up, CGEventFlags extra = 0) {
-        const MaiError sent = hold(down, up, 0, extra);
-        if (sent) return sent;
-        release();
-        return validate();
-    }
-    MaiError key(CGKeyCode code, CGEventFlags extra = 0, bool holdModifier = false) {
-        CGEventRef down = CGEventCreateKeyboardEvent(source_, code, true);
-        CGEventRef up = CGEventCreateKeyboardEvent(source_, code, false);
-        if (!down || !up) {
-            if (down) CFRelease(down);
-            if (up) CFRelease(up);
-            return {MaiErrorCode::Internal, "could not create keyboard events"};
-        }
-        if (holdModifier) {
-            CGEventSetType(down, kCGEventFlagsChanged);
-            CGEventSetType(up, kCGEventFlagsChanged);
-        }
-        const MaiError sent = holdModifier ? hold(down, up, extra) : tap(down, up, extra);
-        CFRelease(down);
-        CFRelease(up);
-        return sent;
-    }
-    MaiError move(CGPoint point, bool dragging = true) {
-        const MaiError ready = validate();
-        if (ready) return ready;
-        if (input_.desktopScope && !displayContainsPoint(input_.display, point))
-            return {MaiErrorCode::InvalidInput, "pointer coordinates are outside the observed display"};
-        CGEventRef event = CGEventCreateMouseEvent(source_, dragging ? kCGEventLeftMouseDragged : kCGEventMouseMoved,
-                                                   point, kCGMouseButtonLeft);
-        if (!event) return {MaiErrorCode::Internal, "could not create pointer motion event"};
-        CGEventSetFlags(event, effectiveFlags());
-        CGEventPost(kCGHIDEventTap, event);
-        CFRelease(event);
-        if (dragging && !releases_.empty()) CGEventSetLocation(releases_.back().event, point);
-        return validate();
-    }
-    void post(CGEventRef event) const {
-        CGEventSetSource(event, source_);
-        CGEventSetFlags(event, effectiveFlags());
-        CGEventPost(kCGHIDEventTap, event);
-    }
-
-private:
-    CGEventFlags effectiveFlags() const {
-        // Both explicitly requested sides may belong to one modifier family.
-        // Recompute from the still-owned downs so releasing RightShift cannot
-        // clear Shift while our LeftShift remains down (or vice versa).
-        CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
-        for (const auto& pending : releases_) flags |= pending.modifier;
-        return flags;
-    }
-    struct Pending {
-        CGEventRef event;
-        CGEventFlags modifier;
-        CGEventFlags extra;
-        bool keyboard;
-        int code;
-    };
-    const DesktopNativeInput& input_;
+    DesktopNativeInput input_;
     CGEventSourceRef source_ = nullptr;
     AXUIElementRef application_ = nullptr;
     AXUIElementRef window_ = nullptr;
     pid_t process_ = 0;
     std::vector<Pending> releases_;
+    bool hardwareConflict_ = false;
 };
 
 struct NativeModifierFamily {
@@ -456,6 +607,103 @@ const NativeModifierFamily* nativeModifierFamily(DesktopKeyModifier modifier) {
     return nullptr;
 }
 
+// Every async main-queue block owns its values and ticket. The only borrowed
+// context callback lives behind the ticket mutex and is cleared before return.
+struct MainPayload {
+    MaiError error;
+    std::vector<UInt8> layout;
+    UInt32 keyboardType = 0;
+    bool activated = false;
+};
+struct MainTicket {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::function<bool()> canceled;
+    std::chrono::steady_clock::time_point deadline;
+    MainPayload payload;
+    MaiError error;
+    bool live = true;
+    bool started = false;
+    bool done = false;
+};
+MaiError ticketMayRun(const std::shared_ptr<MainTicket>& ticket, bool commit) {
+    std::lock_guard<std::mutex> lock(ticket->mutex);
+    if (!ticket->live || std::chrono::steady_clock::now() >= ticket->deadline)
+        return {MaiErrorCode::Busy, "native main-thread request expired before dispatch"};
+    if (ticket->canceled && ticket->canceled())
+        return {MaiErrorCode::Canceled, "native operation canceled before dispatch"};
+    if (commit) ticket->started = true;
+    return {};
+}
+MaiResult<MainPayload> onMain(std::function<MainPayload(std::shared_ptr<MainTicket>)> operation,
+                              const std::function<bool()>& canceled) {
+    auto ticket = std::make_shared<MainTicket>();
+    ticket->canceled = canceled;
+    ticket->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    struct ClearLiveness {
+        std::shared_ptr<MainTicket> ticket;
+        ~ClearLiveness() {
+            std::lock_guard<std::mutex> lock(ticket->mutex);
+            ticket->live = false;
+            ticket->canceled = {};
+        }
+    } clear{ticket};
+    if ([NSThread isMainThread]) {
+        const MaiError allowed = ticketMayRun(ticket, false);
+        if (allowed) return allowed;
+        MainPayload value = operation(ticket);
+        if (value.error) return value.error;
+        return value;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        MainPayload value;
+        MaiError error;
+        try {
+            error = ticketMayRun(ticket, false);
+            if (!error) {
+                value = operation(ticket);
+                error = value.error;
+            }
+        } catch (...) { error = {MaiErrorCode::Internal, "native main-thread operation failed"}; }
+        std::lock_guard<std::mutex> lock(ticket->mutex);
+        if (!ticket->live) return;
+        ticket->payload = std::move(value);
+        ticket->error = std::move(error);
+        ticket->done = true;
+        ticket->ready.notify_all();
+    });
+    for (;;) {
+        std::unique_lock<std::mutex> lock(ticket->mutex);
+        if (ticket->done) {
+            if (ticket->error) return ticket->error;
+            return std::move(ticket->payload);
+        }
+        if (ticket->canceled && ticket->canceled())
+            return {MaiErrorCode::Canceled, ticket->started
+                ? "native operation canceled; an already-started request may be partial"
+                : "native operation canceled before dispatch"};
+        if (std::chrono::steady_clock::now() >= ticket->deadline)
+            return {MaiErrorCode::Busy, ticket->started
+                ? "native operation timed out; an already-started request may be partial"
+                : "native main-thread request did not complete before its deadline"};
+        ticket->ready.wait_for(lock, std::chrono::milliseconds(5));
+    }
+}
+MainPayload copyKeyboardLayout() {
+    MainPayload result;
+    const ScopedCFValue source(TISCopyCurrentKeyboardLayoutInputSource());
+    if (!source) return result;
+    const auto data = static_cast<CFDataRef>(TISGetInputSourceProperty(
+        static_cast<TISInputSourceRef>(const_cast<void*>(source.get())), kTISPropertyUnicodeKeyLayoutData));
+    if (!data || CFGetTypeID(data) != CFDataGetTypeID()) return result;
+    const CFIndex length = CFDataGetLength(data);
+    if (length <= 0 || length > 4 * 1024 * 1024) return result;
+    const UInt8* bytes = CFDataGetBytePtr(data);
+    result.layout.assign(bytes, bytes + length);
+    result.keyboardType = UInt32(LMGetKbdType());
+    return result;
+}
+
 struct NativeKey {
     CGKeyCode code = 0;
     CGEventFlags extra = 0;
@@ -463,7 +711,7 @@ struct NativeKey {
     std::vector<DesktopKeyModifier> implicitModifiers;
 };
 
-MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key) {
+MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key, const std::function<bool()>& canceled = {}) {
     if (key.key == DesktopKeyCode::Character) {
         // Resolve logical characters through the active layout, including the
         // Command layer used by Dvorak-QWERTY shortcuts. Explicit modifiers keep
@@ -485,14 +733,14 @@ MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key) {
         for (const auto modifier : key.modifiers) {
             command = command || maiDesktopModifierFamily(modifier) == DesktopKeyModifier::Meta;
         }
-        __block int matched = -1;
-        __block UInt32 required = 0;
-        const auto resolve = ^{
-          TISInputSourceRef source = TISCopyCurrentKeyboardLayoutInputSource();
-          if (!source) return;
-          const auto data = static_cast<CFDataRef>(TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData));
-          if (data && CFGetTypeID(data) == CFDataGetTypeID()) {
-              const auto* layout = reinterpret_cast<const UCKeyboardLayout*>(CFDataGetBytePtr(data));
+        const auto snapshot = onMain([](auto) { return copyKeyboardLayout(); }, canceled);
+        if (!snapshot) return snapshot.error();
+        if (snapshot.value().layout.empty())
+            return {MaiErrorCode::NotSupported, "the current keyboard layout is unavailable"};
+        const auto* layout = reinterpret_cast<const UCKeyboardLayout*>(snapshot.value().layout.data());
+        const UInt32 keyboardType = snapshot.value().keyboardType;
+        int matched = -1;
+        UInt32 required = 0;
               const UInt32 combinations[] = {0, shiftKey, optionKey, shiftKey | optionKey};
               for (const UInt32 combination : combinations) {
                   for (const CGKeyCode code : positions) {
@@ -500,7 +748,7 @@ MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key) {
                       UniCharCount count = 0;
                       UniChar units[4]{};
                       const UInt32 modifiers = (combination | (command ? cmdKey : 0)) >> 8;
-                      if (UCKeyTranslate(layout, code, kUCKeyActionDown, modifiers, UInt32(LMGetKbdType()), 0, &dead, 4,
+                      if (UCKeyTranslate(layout, code, kUCKeyActionDown, modifiers, keyboardType, 0, &dead, 4,
                                          &count, units) != noErr ||
                           dead != 0 || count != 1)
                           continue;
@@ -520,12 +768,12 @@ MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key) {
                   // Resolve its glyph separately only when this exact key's
                   // unshifted identity is unchanged by Command. A layout
                   // that remaps the key must not borrow an ANSI substitute.
-                  const auto glyph = [layout](CGKeyCode code, UInt32 modifiers, UniChar& value) {
+                  const auto glyph = [layout, keyboardType](CGKeyCode code, UInt32 modifiers, UniChar& value) {
                       UInt32 dead = 0;
                       UniCharCount count = 0;
                       UniChar units[4]{};
                       const auto status = UCKeyTranslate(layout, code, kUCKeyActionDown, modifiers >> 8,
-                                                         UInt32(LMGetKbdType()), 0, &dead, 4, &count, units);
+                                                         keyboardType, 0, &dead, 4, &count, units);
                       if (status != noErr || dead || count != 1) return false;
                       value = units[0];
                       return true;
@@ -549,13 +797,6 @@ MaiResult<NativeKey> nativeKey(const DesktopKeyChord& key) {
                       if (matched >= 0) break;
                   }
               }
-          }
-          CFRelease(source);
-        };
-        if ([NSThread isMainThread])
-            resolve();
-        else
-            dispatch_sync(dispatch_get_main_queue(), resolve);
         if (matched >= 0) {
             NativeKey result{CGKeyCode(matched), 0};
             if (required & shiftKey) result.implicitModifiers.push_back(DesktopKeyModifier::Shift);
@@ -666,35 +907,48 @@ std::vector<DesktopKeyModifier> chordModifiers(const DesktopKeyChord& chord, con
 
 bool hasUnexpectedModifiers(const DesktopKeyChord* chord, const NativeKey* key = nullptr);
 
-MaiError sendChord(InputScope& scope, const DesktopKeyChord& chord) {
-    const auto key = nativeKey(chord);
-    if (!key) return key.error();
+MaiError sendChord(InputScope& scope, const DesktopKeyChord& requested,
+                   const NativeKey* resolved = nullptr) {
+    DesktopKeyChord chord = requested;
+    if ((scope.ownedModifiers() & kCGEventFlagMaskCommand) &&
+        std::none_of(chord.modifiers.begin(), chord.modifiers.end(), [](DesktopKeyModifier m) {
+            return maiDesktopModifierFamily(m) == DesktopKeyModifier::Meta;
+        }))
+        chord.modifiers.push_back(DesktopKeyModifier::Meta);
+    const auto key = resolved ? MaiResult<NativeKey>(*resolved) : nativeKey(chord, scope.cancellation());
+    if (!key)
+        return key.error();
     if (hasUnexpectedModifiers(&chord, &key.value()))
         return {MaiErrorCode::Busy, "release modifiers that are not part of the requested action"};
-    int held = 0;
+    const std::size_t heldBefore = scope.heldCount();
     for (const auto modifier : chordModifiers(chord, key.value())) {
         const auto* family = nativeModifierFamily(modifier);
-        if (!family) return {MaiErrorCode::InvalidInput, "unknown native modifier family"};
+        if (!family)
+            return {MaiErrorCode::InvalidInput, "unknown native modifier family"};
         const bool right = modifier == family->right;
         const CGKeyCode code = right ? family->rightCode : family->leftCode;
-        const bool heldByUser = modifier == family->generic
-                                    ? CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, family->leftCode) ||
-                                          CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, family->rightCode)
-                                    : CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, code);
-        if (heldByUser) continue;
-        const CGEventFlags flags = family->familyFlag | (right ? family->rightFlag : family->leftFlag);
+        const bool heldByUser =
+            modifier == family->generic
+                ? CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, family->leftCode) ||
+                      CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, family->rightCode)
+                : CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, code);
+        if (heldByUser)
+            continue;
+        const CGEventFlags flags =
+            family->familyFlag | (right ? family->rightFlag : family->leftFlag);
         const MaiError sent = scope.key(code, flags, true);
-        if (sent) return sent;
-        ++held;
+        if (sent)
+            return sent;
     }
     if (CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, key.value().code))
         return {MaiErrorCode::Busy, "the requested key is already held by the user"};
     const NativeKey mapped = key.value();
-    const MaiError sent =
-        mapped.modifier ? scope.key(mapped.code, mapped.modifier, true) : scope.key(mapped.code, mapped.extra);
-    if (sent) return sent;
-    if (mapped.modifier) ++held;
-    while (held-- > 0) scope.release();
+    const MaiError sent = mapped.modifier ? scope.key(mapped.code, mapped.modifier, true)
+                                          : scope.key(mapped.code, mapped.extra);
+    if (sent)
+        return sent;
+    while (scope.heldCount() > heldBefore)
+        scope.release();
     return scope.validate();
 }
 
@@ -704,23 +958,20 @@ MaiError sendText(InputScope& scope, const std::string& text) {
     // remains cancellable and never uses or overwrites the system clipboard.
     for (qsizetype index = 0; index < decoded.size();) {
         qsizetype count = (std::min)(qsizetype(20), decoded.size() - index);
-        if (index + count < decoded.size() &&
-            decoded.at(int(index + count - 1)).isHighSurrogate())
+        if (index + count < decoded.size() && decoded.at(int(index + count - 1)).isHighSurrogate())
             --count;
         CGEventRef down = CGEventCreateKeyboardEvent(nullptr, 0, true);
         CGEventRef up = CGEventCreateKeyboardEvent(nullptr, 0, false);
+        ScopedCFValue downOwner(down), upOwner(up);
         if (!down || !up) {
-            if (down) CFRelease(down);
-            if (up) CFRelease(up);
             return {MaiErrorCode::Internal, "could not create Unicode text events"};
         }
         const auto* units = reinterpret_cast<const UniChar*>(decoded.utf16() + index);
         CGEventKeyboardSetUnicodeString(down, UniCharCount(count), units);
         CGEventKeyboardSetUnicodeString(up, UniCharCount(count), units);
         const MaiError sent = scope.tap(down, up);
-        CFRelease(down);
-        CFRelease(up);
-        if (sent) return sent;
+        if (sent)
+            return sent;
         index += count;
     }
     return scope.validate();
@@ -882,36 +1133,47 @@ MaiResult<std::vector<DesktopNativeElement>> maiDesktopElements(
 }
 
 MaiError maiDesktopActivateWindow(const DesktopNativeWindow& window) {
+    return maiDesktopActivateWindow(window, {});
+}
+MaiError maiDesktopActivateWindow(const DesktopNativeWindow& window, std::function<bool()> isCanceled) {
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "native activation canceled"};
     const MaiError permission = accessPermission();
     if (permission) return permission;
-    AXUIElementRef selected = accessibilityWindow(window);
-    if (!selected)
-        return {MaiErrorCode::NotFound, "selected window is no longer available"};
-    __block bool activated = false;
-    const auto work = ^{
+    const ScopedCFValue selected(accessibilityWindow(window));
+    if (!selected) return {MaiErrorCode::NotFound, "selected window is no longer available"};
+    const auto activated = onMain([window](auto ticket) {
+        MainPayload result;
         @autoreleasepool {
-            NSRunningApplication* app = [NSRunningApplication
-                runningApplicationWithProcessIdentifier:pid_t(window.processId)];
-            activated = app && [app activateWithOptions:0];
+            CGRect frame{};
+            if (!currentWindowFrame(window, frame)) return result;
+            NSRunningApplication* app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid_t(window.processId)];
+            if (!app) return result;
+            // Recheck after all read-only preparation, immediately before the
+            // irreversible OS request. An expired queued job cannot activate.
+            result.error = ticketMayRun(ticket, true);
+            if (result.error) return result;
+            result.activated = [app activateWithOptions:0];
         }
-    };
-    if ([NSThread isMainThread]) work();
-    else dispatch_sync(dispatch_get_main_queue(), work);
-    if (!activated) {
-        CFRelease(selected);
-        return {MaiErrorCode::Busy, "macOS did not activate the selected application"};
+        return result;
+    }, isCanceled);
+    if (!activated) return activated.error();
+    if (!activated.value().activated) return {MaiErrorCode::Busy, "macOS did not activate the selected application"};
+    const auto element = static_cast<AXUIElementRef>(const_cast<void*>(selected.get()));
+    for (const auto attribute : {kAXMainAttribute, kAXFocusedAttribute}) {
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "activation canceled after dispatch; observe before retrying"};
+        AXUIElementSetAttributeValue(element, attribute, kCFBooleanTrue);
     }
-    AXUIElementSetAttributeValue(selected, kAXMainAttribute, kCFBooleanTrue);
-    AXUIElementSetAttributeValue(selected, kAXFocusedAttribute, kCFBooleanTrue);
-    AXUIElementPerformAction(selected, kAXRaiseAction);
-    CFRelease(selected);
-    for (int attempt = 0; attempt < 20; ++attempt) {
+    if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "activation canceled after dispatch; observe before retrying"};
+    AXUIElementPerformAction(element, kAXRaiseAction);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    do {
+        if (isCanceled && isCanceled()) return {MaiErrorCode::Canceled, "activation canceled after dispatch; observe before retrying"};
         const auto focused = maiDesktopWindowIsFocused(window);
         if (!focused) return focused.error();
         if (focused.value()) return {};
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    return {MaiErrorCode::Busy, "selected window did not become focused"};
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return {MaiErrorCode::Busy, "selected window did not become focused before its deadline"};
 }
 
 MaiError maiDesktopClick(double x, double y) {
@@ -992,124 +1254,421 @@ MaiResult<bool> maiDesktopWindowAcceptsInput(const DesktopNativeWindow& window) 
     return true;
 }
 
-MaiError maiDesktopInput(const DesktopNativeInput& input) {
+namespace {
+
+std::string keyTag(const DesktopKeyChord& key) {
+    return "key:" + std::to_string(int(key.key)) + ":" + std::to_string(int(key.character)) + ":" +
+           std::to_string(key.function);
+}
+std::string canonicalKey(const DesktopKeyChord& key) {
+    for (const auto& name : maiDesktopKeyNames()) {
+        const auto candidate = maiDesktopParseKey(name);
+        if (candidate && candidate.value().modifiers.empty() &&
+            keyTag(candidate.value()) == keyTag(key))
+            return name;
+    }
+    return {};
+}
+int mouseNumber(DesktopMouseButton button) {
+    switch (button) {
+    case DesktopMouseButton::Left:
+        return 0;
+    case DesktopMouseButton::Right:
+        return 1;
+    case DesktopMouseButton::Middle:
+        return 2;
+    case DesktopMouseButton::Back:
+        return 3;
+    case DesktopMouseButton::Forward:
+        return 4;
+    }
+    return -1;
+}
+std::string mouseName(DesktopMouseButton button) {
+    switch (button) {
+    case DesktopMouseButton::Left:
+        return "left";
+    case DesktopMouseButton::Right:
+        return "right";
+    case DesktopMouseButton::Middle:
+        return "middle";
+    case DesktopMouseButton::Back:
+        return "back";
+    case DesktopMouseButton::Forward:
+        return "forward";
+    }
+    return {};
+}
+MaiError performNativeInput(const DesktopNativeInput& input, InputScope& scope,
+                            const NativeKey* resolved = nullptr) {
+    switch (input.kind) {
+    case DesktopNativeInputKind::Click: case DesktopNativeInputKind::DoubleClick:
+    case DesktopNativeInputKind::RightClick: case DesktopNativeInputKind::Drag:
+    case DesktopNativeInputKind::Type: case DesktopNativeInputKind::Key:
+    case DesktopNativeInputKind::ReplaceFocusedText: case DesktopNativeInputKind::Scroll:
+    case DesktopNativeInputKind::Move: case DesktopNativeInputKind::MouseDown:
+    case DesktopNativeInputKind::KeyDown: break;
+    default: return {MaiErrorCode::InvalidInput, "unknown native input kind"};
+    }
+
     const MaiError permission = accessPermission();
-    if (permission) return permission;
+    if (permission)
+        return permission;
+    if (input.kind == DesktopNativeInputKind::Scroll &&
+        input.scrollAxis != DesktopScrollAxis::Vertical &&
+        input.scrollAxis != DesktopScrollAxis::Horizontal)
+        return {MaiErrorCode::InvalidInput, "unknown scroll axis"};
     if (input.kind == DesktopNativeInputKind::Type ||
         input.kind == DesktopNativeInputKind::ReplaceFocusedText) {
         if (input.text.size() > 4000 ||
             (input.kind == DesktopNativeInputKind::Type && input.text.empty()))
             return {MaiErrorCode::InvalidInput, "text must contain at most 4000 UTF-8 bytes"};
     }
-    const bool positioned =
-        input.kind == DesktopNativeInputKind::Click || input.kind == DesktopNativeInputKind::DoubleClick ||
-        input.kind == DesktopNativeInputKind::RightClick || input.kind == DesktopNativeInputKind::Drag ||
-        input.kind == DesktopNativeInputKind::Scroll || input.kind == DesktopNativeInputKind::Move;
+    const bool positioned = input.kind == DesktopNativeInputKind::Click ||
+                            input.kind == DesktopNativeInputKind::DoubleClick ||
+                            input.kind == DesktopNativeInputKind::RightClick ||
+                            input.kind == DesktopNativeInputKind::Drag ||
+                            input.kind == DesktopNativeInputKind::Scroll ||
+                            input.kind == DesktopNativeInputKind::Move ||
+                            input.kind == DesktopNativeInputKind::MouseDown;
     if (positioned && !validPoint(input.x, input.y))
         return {MaiErrorCode::InvalidInput, "pointer coordinates are invalid"};
     const int maximumDragMs = input.desktopScope ? 5000 : 200;
     if (input.kind == DesktopNativeInputKind::Drag &&
-        (!validPoint(input.toX, input.toY) || input.durationMs < 1 || input.durationMs > maximumDragMs))
-        return {MaiErrorCode::InvalidInput, input.desktopScope
-                                                ? "drag needs a valid destination and 1 to 5000 ms duration"
-                                                : "drag needs a valid destination and 1 to 200 ms duration"};
+        (!validPoint(input.toX, input.toY) || input.durationMs < 1 ||
+         input.durationMs > maximumDragMs))
+        return {MaiErrorCode::InvalidInput,
+                input.desktopScope ? "drag needs a valid destination and 1 to 5000 ms duration"
+                                   : "drag needs a valid destination and 1 to 200 ms duration"};
     if (input.kind == DesktopNativeInputKind::Scroll &&
         (input.lines == 0 || input.lines < -10 || input.lines > 10))
         return {MaiErrorCode::InvalidInput, "scroll needs -10 to 10 lines, excluding zero"};
     if ((input.expectedWindowId == 0) != (input.expectedProcessId == 0))
-        return {MaiErrorCode::InvalidInput, "expected window and process identities must be provided together"};
+        return {MaiErrorCode::InvalidInput,
+                "expected window and process identities must be provided together"};
     if (input.desktopScope) {
         const MaiError display = validateDisplay(input.display);
-        if (display) return display;
+        if (display)
+            return display;
         if ((positioned && !displayContainsPoint(input.display, CGPointMake(input.x, input.y))) ||
             (input.kind == DesktopNativeInputKind::Drag &&
              !displayContainsPoint(input.display, CGPointMake(input.toX, input.toY))))
-            return {MaiErrorCode::InvalidInput, "pointer coordinates are outside the observed display"};
+            return {MaiErrorCode::InvalidInput,
+                    "pointer coordinates are outside the observed display"};
     }
     DesktopKeyChord chord;
-    if (input.kind == DesktopNativeInputKind::Key) {
+    if (input.kind == DesktopNativeInputKind::Key ||
+        input.kind == DesktopNativeInputKind::KeyDown) {
         const auto parsed = maiDesktopParseKey(input.key);
-        if (!parsed) return parsed.error();
+        if (!parsed)
+            return parsed.error();
         chord = parsed.value();
     }
     // Chords check explicit sides and layout-inferred modifiers together in
     // sendChord. Other actions must never become modified gestures, and never
     // clear hardware modifiers by manufacturing key-up on the user's keys.
-    if (input.kind != DesktopNativeInputKind::Key && hasUnexpectedModifiers(nullptr))
+    if (input.kind != DesktopNativeInputKind::Key &&
+        input.kind != DesktopNativeInputKind::KeyDown && hasUnexpectedModifiers(nullptr))
         return {MaiErrorCode::Busy, "release modifiers that are not part of the requested action"};
-    InputScope scope(input);
     const MaiError ready = scope.validate();
-    if (ready) return ready;
-    if (input.kind == DesktopNativeInputKind::Key) return sendChord(scope, chord);
-    if (input.kind == DesktopNativeInputKind::Type) return sendText(scope, input.text);
+    if (ready)
+        return ready;
+    const CGEventFlags textModifiers = kCGEventFlagMaskControl | kCGEventFlagMaskShift |
+        kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand;
+    if ((input.kind == DesktopNativeInputKind::Type || input.kind == DesktopNativeInputKind::ReplaceFocusedText) &&
+        (scope.ownedModifiers() & textModifiers))
+        return {MaiErrorCode::Busy, "release held modifiers before literal text input"};
+    bool checkSecure = input.kind == DesktopNativeInputKind::Type ||
+                       input.kind == DesktopNativeInputKind::ReplaceFocusedText;
+    if (input.kind == DesktopNativeInputKind::Key ||
+        input.kind == DesktopNativeInputKind::KeyDown) {
+        DesktopKeyModifier modifier;
+        checkSecure = chord.key != DesktopKeyCode::Tab && chord.key != DesktopKeyCode::Escape &&
+                      !maiDesktopKeyModifier(chord.key, modifier);
+        const bool command =
+            (scope.ownedModifiers() & kCGEventFlagMaskCommand) ||
+            std::any_of(chord.modifiers.begin(), chord.modifiers.end(), [](DesktopKeyModifier m) {
+                return maiDesktopModifierFamily(m) == DesktopKeyModifier::Meta;
+            });
+        if (input.desktopScope && command && chord.key == DesktopKeyCode::Space)
+            checkSecure = false;
+    }
+    if (checkSecure) {
+        const auto secure = maiDesktopFocusedInputIsSecure();
+        if (!secure)
+            return secure.error();
+        if (secure.value())
+            return {MaiErrorCode::NotSupported, "secure inputs need manual user entry"};
+    }
+    if (input.kind == DesktopNativeInputKind::Key)
+        return sendChord(scope, chord, resolved);
+    if (input.kind == DesktopNativeInputKind::KeyDown) {
+        if (!chord.modifiers.empty())
+            return {MaiErrorCode::InvalidInput, "key_down needs one physical key, not a chord"};
+        if (scope.ownedModifiers() & kCGEventFlagMaskCommand)
+            chord.modifiers.push_back(DesktopKeyModifier::Meta);
+        const auto mapped = resolved ? MaiResult<NativeKey>(*resolved) : nativeKey(chord, scope.cancellation());
+        if (!mapped)
+            return mapped.error();
+        if (!mapped.value().implicitModifiers.empty())
+            return {MaiErrorCode::InvalidInput,
+                    "key_down needs a physical key; hold modifiers separately and "
+                    "use a named key"};
+        const auto parsed = maiDesktopParseKey(input.key);
+        const auto& key = mapped.value();
+        if (hasUnexpectedModifiers(&parsed.value(), &key))
+            return {MaiErrorCode::Busy,
+                    "release modifiers that are not part of the requested action"};
+        return scope.key(key.code, key.modifier ? key.modifier : key.extra, key.modifier != 0, true,
+                         canonicalKey(parsed.value()), keyTag(parsed.value()));
+    }
+    if ((input.kind == DesktopNativeInputKind::Type ||
+         input.kind == DesktopNativeInputKind::ReplaceFocusedText) &&
+        scope.owns(true, 0))
+        return {MaiErrorCode::Busy, "release the held physical A key before Unicode text input"};
+    if (input.kind == DesktopNativeInputKind::Type)
+        return sendText(scope, input.text);
     if (input.kind == DesktopNativeInputKind::ReplaceFocusedText) {
         const auto select = maiDesktopParseKey("Cmd+A");
-        const MaiError selected = sendChord(scope, select.value());
-        if (selected) return selected;
-        if (input.text.empty()) return scope.key(kVK_Delete);
+        const MaiError selected = sendChord(scope, select.value(), resolved);
+        if (selected)
+            return selected;
+        if (input.text.empty())
+            return scope.key(kVK_Delete);
         return sendText(scope, input.text);
     }
-    if (CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonLeft) ||
-        CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonRight) ||
-        CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonCenter))
-        return {MaiErrorCode::Busy, "a mouse button is already held by the user"};
-    if (input.kind == DesktopNativeInputKind::Move) return scope.move(CGPointMake(input.x, input.y), false);
+    for (int number = 0; number < 5; ++number)
+        if (CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, CGMouseButton(number)))
+            return {MaiErrorCode::Busy, "a mouse button is already held by the user"};
+    if (input.kind == DesktopNativeInputKind::Move)
+        return scope.move(CGPointMake(input.x, input.y), false);
     if (input.kind == DesktopNativeInputKind::Scroll) {
-        CGEventRef event = CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine,
-                                                         1, input.lines);
-        if (!event) return {MaiErrorCode::Internal, "could not create scroll event"};
+        CGEventRef event =
+            input.scrollAxis == DesktopScrollAxis::Horizontal
+                ? CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 2, 0, -input.lines)
+                : CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitLine, 1, input.lines);
+        if (!event)
+            return {MaiErrorCode::Internal, "could not create scroll event"};
         CGEventSetLocation(event, CGPointMake(input.x, input.y));
         const MaiError before = scope.validate();
-        if (!before) scope.post(event);
+        if (!before)
+            scope.post(event);
         CFRelease(event);
         return before ? before : scope.validate();
     }
-    const bool right = input.kind == DesktopNativeInputKind::RightClick;
-    const CGMouseButton button = right ? kCGMouseButtonRight : kCGMouseButtonLeft;
+    const DesktopMouseButton chosen =
+        input.kind == DesktopNativeInputKind::RightClick ? DesktopMouseButton::Right : input.button;
+    const int number = mouseNumber(chosen);
+    if (number < 0)
+        return {MaiErrorCode::InvalidInput, "unknown mouse button"};
+    const CGMouseButton button = CGMouseButton(number);
     const CGPoint point = CGPointMake(input.x, input.y);
-    CGEventRef down = CGEventCreateMouseEvent(nullptr,
-        right ? kCGEventRightMouseDown : kCGEventLeftMouseDown, point, button);
-    CGEventRef up = CGEventCreateMouseEvent(nullptr,
-        right ? kCGEventRightMouseUp : kCGEventLeftMouseUp, point, button);
+    const CGEventType downType = number == 0   ? kCGEventLeftMouseDown
+                                 : number == 1 ? kCGEventRightMouseDown
+                                               : kCGEventOtherMouseDown;
+    const CGEventType upType = number == 0   ? kCGEventLeftMouseUp
+                               : number == 1 ? kCGEventRightMouseUp
+                                             : kCGEventOtherMouseUp;
+    CGEventRef down = CGEventCreateMouseEvent(nullptr, downType, point, button);
+    CGEventRef up = CGEventCreateMouseEvent(nullptr, upType, point, button);
+    ScopedCFValue downOwner(down), upOwner(up);
     if (!down || !up) {
-        if (down) CFRelease(down);
-        if (up) CFRelease(up);
         return {MaiErrorCode::Internal, "could not create mouse events"};
     }
     CGEventSetIntegerValueField(down, kCGMouseEventClickState, 1);
     CGEventSetIntegerValueField(up, kCGMouseEventClickState, 1);
     MaiError result;
-    if (input.kind == DesktopNativeInputKind::Drag) {
+    if (input.kind == DesktopNativeInputKind::MouseDown) {
+        result = scope.hold(down, up, 0, 0, mouseName(chosen), "mouse:" + mouseName(chosen));
+    } else if (input.kind == DesktopNativeInputKind::Drag) {
         result = scope.hold(down, up);
         if (!result) {
             const int steps = (std::max)(1, input.durationMs / 10);
             const auto started = std::chrono::steady_clock::now();
             for (int step = 1; step <= steps; ++step) {
-                std::this_thread::sleep_until(started +
-                    std::chrono::milliseconds(input.durationMs * step / steps));
+                std::this_thread::sleep_until(
+                    started + std::chrono::milliseconds(input.durationMs * step / steps));
                 const double fraction = double(step) / steps;
                 result = scope.move(CGPointMake(input.x + (input.toX - input.x) * fraction,
-                    input.y + (input.toY - input.y) * fraction));
-                if (result) break;
+                                                input.y + (input.toY - input.y) * fraction));
+                if (result)
+                    break;
             }
             scope.release();
-            if (!result) result = scope.validate();
+            if (!result)
+                result = scope.validate();
         }
     } else {
         result = scope.tap(down, up);
         if (!result && input.kind == DesktopNativeInputKind::DoubleClick) {
             // AppKit derives double-click behavior from the Quartz click count.
             // Keep the two clicks within the configured system interval.
-            std::this_thread::sleep_for(std::chrono::duration<double>(
-                (std::min)(0.04, [NSEvent doubleClickInterval] / 4)));
+            std::this_thread::sleep_for(
+                std::chrono::duration<double>((std::min)(0.04, [NSEvent doubleClickInterval] / 4)));
             CGEventSetIntegerValueField(down, kCGMouseEventClickState, 2);
             CGEventSetIntegerValueField(up, kCGMouseEventClickState, 2);
             result = scope.tap(down, up);
         }
     }
-    CFRelease(down);
-    CFRelease(up);
     return result;
+}
+
+class MacNativeInputSession final : public DesktopNativeInputSession {
+  public:
+    ~MacNativeInputSession() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        scope_.reset();
+    }
+    MaiError input(const DesktopNativeInput& request) override {
+        const auto fail = [this](MaiError error) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return finish(std::move(error));
+        };
+        try {
+            if (request.kind == DesktopNativeInputKind::MouseUp ||
+                request.kind == DesktopNativeInputKind::KeyUp) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                std::string tag;
+                if (request.kind == DesktopNativeInputKind::MouseUp) {
+                    if (mouseNumber(request.button) < 0)
+                        return finish({MaiErrorCode::InvalidInput, "unknown mouse button"});
+                    tag = "mouse:" + mouseName(request.button);
+                } else {
+                    const auto key = maiDesktopParseKey(request.key);
+                    if (!key)
+                        return finish(key.error());
+                    if (!key.value().modifiers.empty())
+                        return finish({MaiErrorCode::InvalidInput,
+                                       "key_up needs one physical key, not a chord"});
+                    tag = keyTag(key.value());
+                }
+                if (scope_)
+                    scope_->releaseTag(tag);
+                return finish({});
+            }
+            if (request.isCanceled && request.isCanceled())
+                return fail({MaiErrorCode::Canceled, "computer operation canceled"});
+            const MaiError permission = accessPermission();
+            if (permission)
+                return fail(permission);
+            NativeKey resolved;
+            bool hasResolved = false;
+            CGEventFlags flagsAtResolution = 0;
+            const bool needsBinding = request.kind == DesktopNativeInputKind::Key ||
+                                      request.kind == DesktopNativeInputKind::KeyDown ||
+                                      request.kind == DesktopNativeInputKind::ReplaceFocusedText;
+            if (needsBinding) {
+                const auto parsed = maiDesktopParseKey(
+                    request.kind == DesktopNativeInputKind::ReplaceFocusedText ? "Cmd+A"
+                                                                               : request.key);
+                if (!parsed)
+                    return fail(parsed.error());
+                DesktopKeyChord chord = parsed.value();
+                if (request.kind == DesktopNativeInputKind::KeyDown && !chord.modifiers.empty())
+                    return fail({MaiErrorCode::InvalidInput,
+                                 "key_down needs one physical key, not a chord"});
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (scope_ && request.kind == DesktopNativeInputKind::KeyDown &&
+                        scope_->containsTag(keyTag(chord)))
+                        return finish(scope_->validate());
+                    flagsAtResolution = scope_ ? scope_->ownedModifiers() : 0;
+                }
+                if ((flagsAtResolution & kCGEventFlagMaskCommand) &&
+                    std::none_of(chord.modifiers.begin(), chord.modifiers.end(),
+                                 [](DesktopKeyModifier m) {
+                                     return maiDesktopModifierFamily(m) == DesktopKeyModifier::Meta;
+                                 }))
+                    chord.modifiers.push_back(DesktopKeyModifier::Meta);
+                const auto binding = nativeKey(chord, request.isCanceled);
+                if (!binding)
+                    return fail(binding.error());
+                resolved = binding.value();
+                hasResolved = true;
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (hasResolved && (scope_ ? scope_->ownedModifiers() : 0) != flagsAtResolution)
+                return finish({MaiErrorCode::Busy,
+                               "held modifiers changed while resolving the key; observe again"});
+            if (scope_ && request.kind == DesktopNativeInputKind::MouseDown &&
+                mouseNumber(request.button) >= 0 &&
+                scope_->containsTag("mouse:" + mouseName(request.button)))
+                return finish(scope_->validate());
+            if (scope_ && request.kind == DesktopNativeInputKind::KeyDown) {
+                const auto parsed = maiDesktopParseKey(request.key);
+                if (parsed && scope_->containsTag(keyTag(parsed.value())))
+                    return finish(scope_->validate());
+            }
+            if (!scope_)
+                scope_ = std::make_unique<InputScope>(request);
+            else {
+                const MaiError begin = scope_->begin(request);
+                if (begin)
+                    return finish(begin);
+            }
+            MaiError result =
+                performNativeInput(request, *scope_, hasResolved ? &resolved : nullptr);
+            if (!result)
+                result = scope_->validate();
+            return finish(std::move(result));
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (scope_) {
+                scope_->finish();
+                scope_->releaseAll();
+            }
+            return {MaiErrorCode::Internal,
+                    "native input failed; owned synthetic holds were released"};
+        }
+    }
+    DesktopNativeInputState state() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return scope_ ? scope_->state() : DesktopNativeInputState{};
+    }
+    MaiError validate() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return scope_ && scope_->heldCount() ? scope_->validate() : MaiError{};
+    }
+    MaiError releaseAll() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (scope_)
+            scope_->releaseAll();
+        return {};
+    }
+
+  private:
+    MaiError finish(MaiError result) {
+        if (scope_) {
+            scope_->finish();
+            if (!result && scope_->hardwareConflict())
+                result = {MaiErrorCode::Busy, "hardware input overlapped a synthetic "
+                                              "hold; owned holds were released"};
+            if (result)
+                scope_->releaseAll();
+        }
+        return result;
+    }
+    mutable std::mutex mutex_;
+    std::unique_ptr<InputScope> scope_;
+};
+} // namespace
+
+std::shared_ptr<DesktopNativeInputSession> maiDesktopCreateInputSession() {
+    return std::make_shared<MacNativeInputSession>();
+}
+
+MaiError maiDesktopInput(const DesktopNativeInput& input) {
+    if (input.kind == DesktopNativeInputKind::MouseDown ||
+        input.kind == DesktopNativeInputKind::MouseUp ||
+        input.kind == DesktopNativeInputKind::KeyDown ||
+        input.kind == DesktopNativeInputKind::KeyUp)
+        return {MaiErrorCode::InvalidInput,
+                "independent down/up requires a DesktopNativeInputSession"};
+    const MaiError permission = accessPermission();
+    if (permission)
+        return permission;
+    InputScope scope(input);
+    return performNativeInput(input, scope);
 }
 
 MaiResult<std::string> maiDesktopFocusedText(const DesktopNativeWindow& window) {
@@ -1120,6 +1679,7 @@ MaiResult<std::string> maiDesktopFocusedText(const DesktopNativeWindow& window) 
     AXUIElementRef selected = accessibilityWindow(window);
     if (!selected) return {MaiErrorCode::NotFound, "selected window is unavailable"};
     AXUIElementRef system = AXUIElementCreateSystemWide();
+    if (system) AXUIElementSetMessagingTimeout(system, 0.1f);
     CFTypeRef focusedValue = nullptr;
     const AXError found = system ? AXUIElementCopyAttributeValue(system,
         kAXFocusedUIElementAttribute, &focusedValue) : kAXErrorFailure;
@@ -1181,6 +1741,7 @@ MaiResult<bool> maiDesktopFocusedInputIsSecure() {
     const MaiError permission = accessPermission();
     if (permission) return permission;
     AXUIElementRef system = AXUIElementCreateSystemWide();
+    if (system) AXUIElementSetMessagingTimeout(system, 0.1f);
     if (!system) return {MaiErrorCode::Internal, "could not inspect focused input"};
     CFTypeRef focused = nullptr;
     const AXError result = AXUIElementCopyAttributeValue(system,

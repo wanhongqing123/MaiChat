@@ -3,6 +3,7 @@
 #include "MaiTool.h"
 
 #include <algorithm>
+#include <exception>
 
 #include "MaiFilePath.h"
 #include "MaiFileSystem.h"
@@ -138,6 +139,12 @@ bool MaiTool::isAvailableForModel(const std::string& model) const {
     return true;
 }
 
+MaiError MaiTool::onTurnFinished(const std::string& sessionId, const std::string& turnId) {
+    (void)sessionId;
+    (void)turnId;
+    return {};
+}
+
 const char* maiSpecialistCapabilityStatusToString(MaiSpecialistCapabilityStatus status) {
     // 能力状态是给主模型的可执行性信号：available 已验证可用；
     // implemented_unverified 已接线待实测；not_configured 缺账号配置；
@@ -216,6 +223,25 @@ std::vector<MaiSpecialistInfo> MaiToolRegistry::specialists() const {
         if (auto info = tool->specialistInfo()) out.push_back(std::move(*info));
     }
     return out;
+}
+
+MaiError MaiToolRegistry::finishTurn(const std::string& sessionId,
+                                     const std::string& turnId) const {
+    MaiError firstError;
+    for (const auto& tool : mTools) {
+        try {
+            const MaiError error = tool->onTurnFinished(sessionId, turnId);
+            if (error && !firstError) firstError = error;
+        } catch (const std::exception& error) {
+            if (!firstError)
+                firstError = {MaiErrorCode::Internal,
+                              std::string("tool turn cleanup exception: ") + error.what()};
+        } catch (...) {
+            if (!firstError)
+                firstError = {MaiErrorCode::Internal, "unknown tool turn cleanup exception"};
+        }
+    }
+    return firstError;
 }
 
 void registerMaiBuiltinTools(MaiToolRegistry& registry) {

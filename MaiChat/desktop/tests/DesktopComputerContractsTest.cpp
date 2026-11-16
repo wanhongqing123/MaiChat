@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,9 +41,13 @@ using Json = nlohmann::json;
 
 int failures = 0;
 
-#define CHECK(value) do { if (!(value)) { \
-    std::fprintf(stderr, "check failed: %s:%d: %s\n", __FILE__, __LINE__, #value); \
-    ++failures; } } while (false)
+#define CHECK(value)                                                                       \
+    do {                                                                                   \
+        if (!(value)) {                                                                    \
+            std::fprintf(stderr, "check failed: %s:%d: %s\n", __FILE__, __LINE__, #value); \
+            ++failures;                                                                    \
+        }                                                                                  \
+    } while (false)
 
 bool contains(const Json& values, const char* expected) {
     if (!values.is_array()) return false;
@@ -56,12 +62,60 @@ std::int64_t fixtureClockMs() {
         .count();
 }
 
+// The controller owns this recording session through the ordinary native seam.
+// Keep the watchdog's reads synchronized and never retain a per-call callback.
+class RecordingInputSession final : public DesktopNativeInputSession {
+public:
+    std::function<void()> beforeInput;
+    MaiError input(const DesktopNativeInput& request) override {
+        if (beforeInput) beforeInput();
+        if (request.isCanceled && request.isCanceled()) return {MaiErrorCode::Canceled, "fixture canceled"};
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++inputCalls_;
+        if (request.kind == DesktopNativeInputKind::KeyDown &&
+            std::find(held_.keysDown.begin(), held_.keysDown.end(), request.key) == held_.keysDown.end())
+            held_.keysDown.push_back(request.key);
+        if (request.kind == DesktopNativeInputKind::KeyUp)
+            held_.keysDown.erase(std::remove(held_.keysDown.begin(), held_.keysDown.end(), request.key),
+                                 held_.keysDown.end());
+        return {};
+    }
+    DesktopNativeInputState state() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return held_;
+    }
+    MaiError validate() const override {
+        return {};
+    }
+    MaiError releaseAll() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++releaseCalls_;
+        held_ = {};
+        return {};
+    }
+    int inputCalls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return inputCalls_;
+    }
+    int releaseCalls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return releaseCalls_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    DesktopNativeInputState held_;
+    int inputCalls_ = 0;
+    int releaseCalls_ = 0;
+};
+
 // This backend supplies actual PNG data and records the controller's native
 // boundary calls. It never enumerates, captures or injects into the user's OS.
 class RecordingBackend final : public DesktopComputerBackend {
 public:
-    std::vector<DesktopNativeWindow> visible{
-        {101, 5001, "Isolated editor", "Fixture", 100, 200, 400, 300}};
+    bool statefulInput = false;
+    std::shared_ptr<RecordingInputSession> lastInputSession;
+    std::vector<DesktopNativeWindow> visible{{101, 5001, "Isolated editor", "Fixture", 100, 200, 400, 300}};
     std::vector<DesktopNativeDisplay> availableDisplays{{11, 0, 0, 1600, 900, true},
                                                         {22, -1280, -120, 1280, 1024, false}};
     std::vector<DesktopNativeInput> inputs;
@@ -95,6 +149,12 @@ public:
     std::function<void()> onDisplayCapture;
     std::function<void()> onInput;
     std::function<MaiError(const CaptureOptions&)> onDisplayCaptureOptions;
+
+    std::shared_ptr<DesktopNativeInputSession> createInputSession() override {
+        if (!statefulInput) return {};
+        lastInputSession = std::make_shared<RecordingInputSession>();
+        return lastInputSession;
+    }
 
     MaiResult<std::vector<DesktopNativeWindow>> windows() override {
         ++windowsCount;
@@ -214,7 +274,10 @@ public:
         inputs.push_back(value);
         if (onInput) onInput();
         if (inputError) return inputError;
-        if (value.kind == DesktopNativeInputKind::RightClick) { ownedPopup = true; focused = false; }
+        if (value.kind == DesktopNativeInputKind::RightClick) {
+            ownedPopup = true;
+            focused = false;
+        }
         if (value.kind == DesktopNativeInputKind::Key && requirePopupForKey && !ownedPopup)
             return {MaiErrorCode::Busy, "fixture popup was dismissed before its key input"};
         if (value.kind == DesktopNativeInputKind::ReplaceFocusedText) textValue = value.text;
@@ -263,8 +326,8 @@ struct Fixture {
         action.toXRatio = 0.75;
         action.toYRatio = 0.75;
         CHECK(workspace.isValid());
-        const auto observed = controller.observe("owner", "",
-            workspace.path().toUtf8().toStdString(), true, action.windowId);
+        const auto observed =
+            controller.observe("owner", "", workspace.path().toUtf8().toStdString(), true, action.windowId);
         CHECK(observed);
         if (observed) {
             const Json output = Json::parse(observed.value().json, nullptr, false);
@@ -276,6 +339,297 @@ struct Fixture {
         return action;
     }
 };
+
+std::shared_ptr<RecordingInputSession> holdControl(Fixture& fixture, bool display,
+                                                   const std::string& turn = "turn-current") {
+    fixture.backend->statefulInput = true;
+    auto action = display ? fixture.observeDisplay("key_down") : fixture.observe("key_down");
+    action.key = "Ctrl";
+    action.turnId = turn;
+    CHECK(fixture.controller.perform("owner", action));
+    const auto native = fixture.backend->lastInputSession;
+    CHECK(native);
+    if (native) CHECK(native->state().keysDown == std::vector<std::string>{"Ctrl"});
+    return native;
+}
+
+void verifyCanceledPerformReleasesHeldInput() {
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        const auto native = holdControl(fixture, display);
+        if (!native) continue;
+        auto action = display ? fixture.observeDisplay("move") : fixture.observe("move");
+        action.turnId = "turn-current";
+        action.isCanceled = [] { return true; };
+        const int callsBefore = native->inputCalls();
+        const auto canceled = fixture.controller.perform("owner", action);
+        CHECK(!canceled);
+        if (!canceled) CHECK(canceled.error().code() == MaiErrorCode::Canceled);
+        CHECK(native->inputCalls() == callsBefore);
+        CHECK(native->state().empty());
+        CHECK(fixture.controller.inputState("owner").empty());
+        CHECK(native->releaseCalls() > 0);
+    }
+}
+
+void verifyRejectedPerformReleasesHeldInput() {
+    for (const bool display : {false, true}) {
+        for (const bool secureQueryFails : {false, true}) {
+            Fixture fixture;
+            const auto native = holdControl(fixture, display);
+            if (!native) continue;
+            auto action = display ? fixture.observeDisplay("key") : fixture.observe("key");
+            action.turnId = "turn-current";
+            action.key = "A";
+            fixture.backend->secure = !secureQueryFails;
+            if (secureQueryFails)
+                fixture.backend->secureInputError = {MaiErrorCode::Internal, "fixture secure-input query failed"};
+            const int callsBefore = native->inputCalls();
+            const auto rejected = fixture.controller.perform("owner", action);
+            CHECK(!rejected);
+            if (!rejected)
+                CHECK(rejected.error().code() ==
+                      (secureQueryFails ? MaiErrorCode::Internal : MaiErrorCode::NotSupported));
+            CHECK(native->inputCalls() == callsBefore);
+            CHECK(native->state().empty());
+            CHECK(fixture.controller.inputState("owner").empty());
+            CHECK(native->releaseCalls() > 0);
+        }
+    }
+}
+
+void verifyCanceledObservationReleasesOnlyItsSession() {
+    for (const bool display : {false, true}) {
+        for (const bool observingOwner : {false, true}) {
+            Fixture fixture;
+            const auto native = holdControl(fixture, display);
+            if (!native) continue;
+            const std::string session = observingOwner ? "owner" : "different-session";
+            const std::string workspace = fixture.workspace.path().toUtf8().toStdString();
+            const auto canceled =
+                display ? fixture.controller.observeDisplay(
+                              session, workspace, 22, [] { return true; }, 0, 0, 0, "turn-current")
+                        : fixture.controller.observe(
+                              session, "", workspace, false, 101, false, [] { return true; }, "turn-current");
+            CHECK(!canceled);
+            if (!canceled) CHECK(canceled.error().code() == MaiErrorCode::Canceled);
+            CHECK(native->state().empty() == observingOwner);
+            CHECK(fixture.controller.inputState("owner").empty() == observingOwner);
+            CHECK((native->releaseCalls() > 0) == observingOwner);
+        }
+    }
+}
+
+void verifyOldTurnCanceledObservationPreservesReplacementHold() {
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        const auto native = holdControl(fixture, display, "turn-new");
+        if (!native) continue;
+        const std::string workspace = fixture.workspace.path().toUtf8().toStdString();
+        const auto canceled = display ? fixture.controller.observeDisplay(
+                                            "owner", workspace, 22, [] { return true; }, 0, 0, 0, "turn-old")
+                                      : fixture.controller.observe(
+                                            "owner", "", workspace, false, 101, false, [] { return true; }, "turn-old");
+        CHECK(!canceled);
+        if (!canceled) CHECK(canceled.error().code() == MaiErrorCode::Canceled);
+        CHECK(native->state().keysDown == std::vector<std::string>{"Ctrl"});
+        CHECK(native->releaseCalls() == 0);
+    }
+}
+
+void verifyOldTurnCleanupPreservesReplacementHold() {
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        const auto native = holdControl(fixture, display, "turn-new");
+        if (!native) continue;
+        auto action = display ? fixture.observeDisplay("move") : fixture.observe("move");
+        action.turnId = "turn-old";
+        action.isCanceled = [] { return true; };
+        const auto canceled = fixture.controller.perform("owner", action);
+        CHECK(!canceled);
+        if (!canceled) CHECK(canceled.error().code() == MaiErrorCode::Canceled);
+        CHECK(!fixture.controller.releaseInput("owner", "turn-old"));
+        CHECK(native->state().keysDown == std::vector<std::string>{"Ctrl"});
+        CHECK(native->releaseCalls() == 0);
+
+        // A queued old task's release cannot invalidate the replacement's token
+        // either. The same fresh snapshot must still reach its native session.
+        action.turnId = "turn-new";
+        action.isCanceled = {};
+        CHECK(fixture.controller.perform("owner", action));
+        CHECK(native->state().keysDown == std::vector<std::string>{"Ctrl"});
+        CHECK(!fixture.controller.releaseInput("owner", "turn-new"));
+        CHECK(native->state().empty());
+    }
+}
+
+void verifyCanceledToolObservationReleasesOnlyItsTurn() {
+    for (const bool display : {false, true}) {
+        for (const bool observingCurrentTurn : {false, true}) {
+            Fixture fixture;
+            const auto native = holdControl(fixture, display, "turn-new");
+            if (!native) continue;
+            MaiToolRegistry registry;
+            auto controller =
+                std::shared_ptr<DesktopComputerController>(&fixture.controller, [](DesktopComputerController*) {});
+            registerDesktopComputerTools(registry, controller);
+            MaiTool* tool = registry.find("desktop_computer");
+            CHECK(tool);
+            if (!tool) continue;
+            std::atomic<bool> cancel{true};
+            MaiToolContext context;
+            context.sessionId = "owner";
+            context.turnId = observingCurrentTurn ? "turn-new" : "turn-old";
+            context.root = fixture.workspace.path().toUtf8().toStdString();
+            context.cancel = &cancel;
+            const auto canceled = tool->execute(display ? R"({"action":"observe","target":"display","display_id":"22"})"
+                                                        : R"({"action":"observe","target":"window","window_id":"101"})",
+                                                context);
+            CHECK(canceled.hasError());
+            if (canceled.hasError()) CHECK(canceled.error().code() == MaiErrorCode::Canceled);
+            CHECK(native->state().empty() == observingCurrentTurn);
+            CHECK((native->releaseCalls() > 0) == observingCurrentTurn);
+        }
+    }
+}
+
+void verifyIndependentUpDryRunKeepsOwnedInput() {
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        const auto native = holdControl(fixture, display);
+        if (!native) continue;
+        DesktopComputerAction up;
+        up.action = "key_up";
+        up.key = "Ctrl";
+        up.turnId = "turn-current";
+        up.dryRun = true;
+        const int callsBefore = native->inputCalls();
+        const auto planned = fixture.controller.perform("owner", up);
+        CHECK(planned && planned.value().dryRun && !planned.value().dispatched);
+        CHECK(native->inputCalls() == callsBefore);
+        CHECK(native->state().keysDown == std::vector<std::string>{"Ctrl"});
+        up.dryRun = false;
+        CHECK(fixture.controller.perform("owner", up));
+        CHECK(native->state().empty());
+    }
+}
+
+void verifyInvalidIndependentButtonCannotValidateWithoutAnOwner() {
+    Fixture fixture;
+    DesktopComputerAction up;
+    up.action = "mouse_up";
+    up.button = static_cast<DesktopMouseButton>(99);
+    for (const bool dryRun : {false, true}) {
+        up.dryRun = dryRun;
+        const auto invalid = fixture.controller.perform("no-owner", up);
+        CHECK(!invalid);
+        if (!invalid) CHECK(invalid.error().code() == MaiErrorCode::InvalidInput);
+    }
+    CHECK(fixture.backend->inputs.empty());
+}
+
+void verifyIndependentUpConsumesOnlyRealOwnedWindowToken() {
+    for (const bool display : {false, true}) {
+        for (int mode = 0; mode < 4; ++mode) {
+            Fixture fixture;
+            const auto native = holdControl(fixture, display);
+            if (!native) continue;
+            auto shift = display ? fixture.observeDisplay("key_down") : fixture.observe("key_down");
+            shift.key = "Shift";
+            shift.turnId = "turn-current";
+            CHECK(fixture.controller.perform("owner", shift));
+            auto after = display ? fixture.observeDisplay("move") : fixture.observe("move");
+            after.turnId = "turn-current";
+            DesktopComputerAction up;
+            up.action = "key_up";
+            up.key = mode == 3 ? "A" : "Ctrl";
+            up.turnId = mode == 2 ? "turn-old" : "turn-current";
+            up.dryRun = mode == 1;
+            const auto result = fixture.controller.perform("owner", up);
+            CHECK(result);
+            if (mode == 0) CHECK(native->state().keysDown == std::vector<std::string>{"Shift"});
+            const auto next = fixture.controller.perform("owner", after);
+            if (mode == 0) {
+                CHECK(!next);
+            } else {
+                CHECK(next);
+                CHECK(native->state().keysDown == (std::vector<std::string>{"Ctrl", "Shift"}));
+            }
+        }
+    }
+}
+
+void verifyHeldLauncherModifiersDoNotRequireEditableFocus() {
+    Fixture fixture;
+    fixture.backend->statefulInput = true;
+    auto down = fixture.observeDisplay("key_down");
+    down.key = "Meta";
+    down.turnId = "turn-launcher";
+    CHECK(fixture.controller.perform("owner", down));
+    const auto native = fixture.backend->lastInputSession;
+    CHECK(native);
+    if (!native) return;
+    fixture.backend->secureInputError = {MaiErrorCode::NotConfigured, "there is no focused editable control"};
+    auto shortcut = fixture.observeDisplay("key");
+    shortcut.turnId = "turn-launcher";
+#if defined(Q_OS_MAC)
+    shortcut.key = "Space";
+#else
+    shortcut.key = "E";
+#endif
+    CHECK(fixture.controller.perform("owner", shortcut));
+    CHECK(native->inputCalls() == 2);
+    CHECK(native->state().keysDown == std::vector<std::string>{"Meta"});
+}
+
+void verifyReleaseDoesNotWaitForObservedStateDuringPlatformWork() {
+    for (const bool display : {false, true}) {
+        Fixture fixture;
+        const auto native = holdControl(fixture, display);
+        if (!native) continue;
+        auto request = display ? fixture.observeDisplay("move") : fixture.observe("move");
+        request.turnId = "turn-current";
+        std::atomic<bool> canceled{false};
+        request.isCanceled = [&] { return canceled.load(); };
+        std::mutex gateMutex;
+        std::condition_variable gate;
+        bool waitingForGui = false;
+        bool guiMayReturn = false;
+        bool releaseDone = false;
+        native->beforeInput = [&] {
+            // A platform may await main-thread layout work without retaining
+            // its native ledger mutex. GUI Stop cannot await controller state.
+            std::unique_lock<std::mutex> lock(gateMutex);
+            waitingForGui = true;
+            gate.notify_all();
+            gate.wait(lock, [&] { return guiMayReturn; });
+        };
+        std::thread worker([&] { fixture.controller.perform("owner", request); });
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            CHECK(gate.wait_for(lock, std::chrono::seconds(2), [&] { return waitingForGui; }));
+        }
+        std::thread guiStop([&] {
+            canceled = true;
+            fixture.controller.releaseInput("owner", "turn-current");
+            std::lock_guard<std::mutex> lock(gateMutex);
+            releaseDone = true;
+            gate.notify_all();
+        });
+        bool completedWithoutGuiDispatch = false;
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            completedWithoutGuiDispatch =
+                gate.wait_for(lock, std::chrono::milliseconds(500), [&] { return releaseDone; });
+            guiMayReturn = true;  // Always unwind both threads on a failed baseline.
+        }
+        gate.notify_all();
+        worker.join();
+        guiStop.join();
+        CHECK(completedWithoutGuiDispatch);
+        CHECK(native->state().empty());
+    }
+}
 
 void verifyDisplayObservation() {
     Fixture fixture;
@@ -1166,8 +1520,8 @@ void verifySecureKeyboardInput() {
         CHECK(fixture.backend->inputs.empty());
     }
     // Navigating away from a protected field remains available without writing it.
-    for (const char* key : {"Tab", "Escape", "ControlRight", "ShiftLeft", "AltRight", "MetaRight",
-             "Ctrl+Shift", "ControlLeft+ControlRight"}) {
+    for (const char* key : {"Tab", "Escape", "ControlRight", "ShiftLeft", "AltRight", "MetaRight", "Ctrl+Shift",
+                            "ControlLeft+ControlRight"}) {
         Fixture fixture;
         auto action = fixture.observe("key");
         action.key = key;
@@ -1183,8 +1537,8 @@ void verifyNativeInputFailureRequiresObservation() {
         auto action = display ? fixture.observeDisplay("key") : fixture.observe("key");
         action.key = "Enter";
         const auto code = display ? MaiErrorCode::Internal : MaiErrorCode::Busy;
-        const std::string detail = display ? "owned display native error after input began"
-                                           : "owned window native error after input began";
+        const std::string detail =
+            display ? "owned display native error after input began" : "owned window native error after input began";
         // The native seam may fail after part of a key batch reached the OS.
         // Preserve that uncertainty so the next decision observes the current
         // application, instead of treating a tool error as proof of no input.
@@ -1193,8 +1547,9 @@ void verifyNativeInputFailureRequiresObservation() {
         CHECK(!failed);
         if (!failed) {
             CHECK(failed.error().code() == code);
-            CHECK(failed.error().message().find(
-                "Input may have been partially delivered. Observe the current application state before deciding whether to retry. Native error: ") == 0);
+            CHECK(failed.error().message().find("Input may have been partially delivered. Observe the current "
+                                                "application state before deciding whether to retry. Native error: ") ==
+                  0);
             CHECK(failed.error().message().find(detail) != std::string::npos);
         }
         CHECK(fixture.backend->inputs.size() == 1);
@@ -1234,11 +1589,30 @@ void verifyKeyGrammar() {
         CHECK(selection.value().key == DesktopKeyCode::Home);
         CHECK(selection.value().modifiers == std::vector<DesktopKeyModifier>{DesktopKeyModifier::Shift});
     }
-    for (const char* shortcut : {"Control+Shift+End", "Alt+F4", "Cmd+A", "Meta+A",
-                                  "Super+A", "Enter", "Tab", "Escape", "Delete",
-                                  "Backspace", "ArrowLeft", "ArrowRight", "ArrowUp",
-                                  "ArrowDown", "PageUp", "PageDown", "Space", "Insert",
-                                  "End", "F1", "F24", "9", "Ctrl+Shift", "Alt+Shift"}) {
+    for (const char* shortcut : {"Control+Shift+End",
+                                 "Alt+F4",
+                                 "Cmd+A",
+                                 "Meta+A",
+                                 "Super+A",
+                                 "Enter",
+                                 "Tab",
+                                 "Escape",
+                                 "Delete",
+                                 "Backspace",
+                                 "ArrowLeft",
+                                 "ArrowRight",
+                                 "ArrowUp",
+                                 "ArrowDown",
+                                 "PageUp",
+                                 "PageDown",
+                                 "Space",
+                                 "Insert",
+                                 "End",
+                                 "F1",
+                                 "F24",
+                                 "9",
+                                 "Ctrl+Shift",
+                                 "Alt+Shift"}) {
         const auto parsed = maiDesktopParseKey(shortcut);
         CHECK(parsed);
     }
@@ -1255,8 +1629,8 @@ void verifyKeyGrammar() {
     }
     for (const std::string& invalid :
          {std::string(), std::string("Ctrl+"), std::string("+A"), std::string("Ctrl++A"), std::string("Ctrl+Control+A"),
-           std::string("Cmd+Meta+A"), std::string("Ctrl+A+B"), std::string("F0"),
-          std::string("F25"), std::string("Hyper+A"), std::string("\xe4\xb8\xad")}) {
+          std::string("Cmd+Meta+A"), std::string("Ctrl+A+B"), std::string("F0"), std::string("F25"),
+          std::string("Hyper+A"), std::string("\xe4\xb8\xad")}) {
         const auto parsed = maiDesktopParseKey(invalid);
         CHECK(!parsed);
         if (!parsed) CHECK(parsed.error().code() == MaiErrorCode::InvalidInput);
@@ -1284,25 +1658,95 @@ void verifyExpandedKeyGrammar() {
         CHECK(plus.value().character == '+');
         CHECK(plus.value().modifiers == std::vector<DesktopKeyModifier>{DesktopKeyModifier::Control});
     }
-    for (const char* key : {"Plus", "Option+Return", "Win+R", "Windows+R", "Esc", "Del", "PgUp", "PgDn",
-             "Backquote", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "IntlBackslash",
-             "Semicolon", "Quote", "Comma", "Period", "Slash", "CapsLock", "NumLock", "ScrollLock",
-             "PrintScreen", "Pause", "ContextMenu", "Numpad0", "Numpad1", "Numpad2", "Numpad3",
-             "Numpad4", "Numpad5", "Numpad6", "Numpad7", "Numpad8", "Numpad9", "NumpadAdd",
-             "NumpadSubtract", "NumpadMultiply", "NumpadDivide", "NumpadDecimal", "NumpadEnter",
-             "NumpadEqual", "NumpadComma", "Clear", "Help", "Convert", "NonConvert", "KanaMode", "Eisu",
-             "IntlRo", "IntlYen", "ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "AltLeft",
-             "AltRight", "MetaLeft", "MetaRight", "Fn", "VolumeMute", "VolumeDown", "VolumeUp",
-             "MediaPlayPause", "MediaStop", "MediaNext", "MediaPrevious", "BrowserBack", "BrowserForward",
-             "BrowserRefresh", "BrowserStop", "BrowserSearch", "BrowserFavorites", "BrowserHome",
-             "LaunchMail", "LaunchMedia", "LaunchApp1", "LaunchApp2", "LeftCtrl+RightCtrl",
-             "ControlLeft+ControlRight+A", "LeftShift+RightAlt+Enter"}) {
+    for (const char* key : {"Plus",
+                            "Option+Return",
+                            "Win+R",
+                            "Windows+R",
+                            "Esc",
+                            "Del",
+                            "PgUp",
+                            "PgDn",
+                            "Backquote",
+                            "Minus",
+                            "Equal",
+                            "BracketLeft",
+                            "BracketRight",
+                            "Backslash",
+                            "IntlBackslash",
+                            "Semicolon",
+                            "Quote",
+                            "Comma",
+                            "Period",
+                            "Slash",
+                            "CapsLock",
+                            "NumLock",
+                            "ScrollLock",
+                            "PrintScreen",
+                            "Pause",
+                            "ContextMenu",
+                            "Numpad0",
+                            "Numpad1",
+                            "Numpad2",
+                            "Numpad3",
+                            "Numpad4",
+                            "Numpad5",
+                            "Numpad6",
+                            "Numpad7",
+                            "Numpad8",
+                            "Numpad9",
+                            "NumpadAdd",
+                            "NumpadSubtract",
+                            "NumpadMultiply",
+                            "NumpadDivide",
+                            "NumpadDecimal",
+                            "NumpadEnter",
+                            "NumpadEqual",
+                            "NumpadComma",
+                            "Clear",
+                            "Help",
+                            "Convert",
+                            "NonConvert",
+                            "KanaMode",
+                            "Eisu",
+                            "IntlRo",
+                            "IntlYen",
+                            "ControlLeft",
+                            "ControlRight",
+                            "ShiftLeft",
+                            "ShiftRight",
+                            "AltLeft",
+                            "AltRight",
+                            "MetaLeft",
+                            "MetaRight",
+                            "Fn",
+                            "VolumeMute",
+                            "VolumeDown",
+                            "VolumeUp",
+                            "MediaPlayPause",
+                            "MediaStop",
+                            "MediaNext",
+                            "MediaPrevious",
+                            "BrowserBack",
+                            "BrowserForward",
+                            "BrowserRefresh",
+                            "BrowserStop",
+                            "BrowserSearch",
+                            "BrowserFavorites",
+                            "BrowserHome",
+                            "LaunchMail",
+                            "LaunchMedia",
+                            "LaunchApp1",
+                            "LaunchApp2",
+                            "LeftCtrl+RightCtrl",
+                            "ControlLeft+ControlRight+A",
+                            "LeftShift+RightAlt+Enter"}) {
         const auto parsed = maiDesktopParseKey(key);
         if (!parsed) std::fprintf(stderr, "named key rejected: %s\n", key);
         CHECK(parsed);
     }
-    for (const char* invalid : {"Ctrl+++", "Ctrl++A", "Ctrl+ControlLeft+A", "ShiftLeft+ShiftLeft+A",
-             "MetaRight+RightCmd+A", "AltLeft+Option+A", "ControlLeft+Ctrl", "ControlRight+RightCtrl"}) {
+    for (const char* invalid :
+         {"Ctrl+++", "Ctrl++A", "Ctrl+ControlLeft+A", "ShiftLeft+ShiftLeft+A", "MetaRight+RightCmd+A",
+          "AltLeft+Option+A", "ControlLeft+Ctrl", "ControlRight+RightCtrl"}) {
         const auto parsed = maiDesktopParseKey(invalid);
         CHECK(!parsed);
         if (!parsed) CHECK(parsed.error().code() == MaiErrorCode::InvalidInput);
@@ -1330,11 +1774,11 @@ void verifyKeyIdentityAndCatalog() {
     }
     const std::pair<const char*, DesktopKeyCode> identities[] = {
         {"NumpadEnter", DesktopKeyCode::NumpadEnter}, {"Enter", DesktopKeyCode::Enter},
-        {"NumpadAdd", DesktopKeyCode::NumpadAdd}, {"Numpad0", DesktopKeyCode::Numpad0},
-        {"Numpad9", DesktopKeyCode::Numpad9}, {"CapsLock", DesktopKeyCode::CapsLock},
+        {"NumpadAdd", DesktopKeyCode::NumpadAdd},     {"Numpad0", DesktopKeyCode::Numpad0},
+        {"Numpad9", DesktopKeyCode::Numpad9},         {"CapsLock", DesktopKeyCode::CapsLock},
         {"PrintScreen", DesktopKeyCode::PrintScreen}, {"Pause", DesktopKeyCode::Pause},
-        {"IntlRo", DesktopKeyCode::IntlRo}, {"IntlYen", DesktopKeyCode::IntlYen},
-        {"VolumeUp", DesktopKeyCode::VolumeUp}, {"BrowserBack", DesktopKeyCode::BrowserBack},
+        {"IntlRo", DesktopKeyCode::IntlRo},           {"IntlYen", DesktopKeyCode::IntlYen},
+        {"VolumeUp", DesktopKeyCode::VolumeUp},       {"BrowserBack", DesktopKeyCode::BrowserBack},
         {"LaunchApp2", DesktopKeyCode::LaunchApp2}};
     for (const auto& identity : identities) {
         const auto parsed = maiDesktopParseKey(identity.first);
@@ -1432,8 +1876,8 @@ void verifyKeyCatalogTool() {
             CHECK(output.value("native_support_checked_at_dispatch", false));
         }
     }
-    for (const auto& extra : {Json{{"text", "do not type"}}, Json{{"key", "Enter"}},
-             Json{{"target", "display"}}, Json{{"window_id", "1"}}, Json{{"snapshot_id", "unused"}}}) {
+    for (const auto& extra : {Json{{"text", "do not type"}}, Json{{"key", "Enter"}}, Json{{"target", "display"}},
+                              Json{{"window_id", "1"}}, Json{{"snapshot_id", "unused"}}}) {
         Json arguments{{"action", "list_keys"}};
         arguments.update(extra);
         const auto rejected = tool->execute(arguments.dump(), context);
@@ -1474,13 +1918,13 @@ void verifyWindowSelection() {
         CHECK(listed.value()[1].title == "Isolated editor");
         CHECK(listed.value()[1].width == 400);
     }
-    const auto ambiguous = fixture.controller.observe("owner", duplicate.title,
-        fixture.workspace.path().toUtf8().toStdString(), true);
+    const auto ambiguous =
+        fixture.controller.observe("owner", duplicate.title, fixture.workspace.path().toUtf8().toStdString(), true);
     CHECK(!ambiguous);
     if (!ambiguous) CHECK(ambiguous.error().code() == MaiErrorCode::NotFound);
     CHECK(fixture.backend->captureCount == 0);
-    const auto selected = fixture.controller.observe("owner", "",
-        fixture.workspace.path().toUtf8().toStdString(), true, duplicate.id);
+    const auto selected =
+        fixture.controller.observe("owner", "", fixture.workspace.path().toUtf8().toStdString(), true, duplicate.id);
     CHECK(selected);
     if (selected) {
         const Json output = Json::parse(selected.value().json);
@@ -1784,10 +2228,14 @@ void verifyIdentityAndSyntaxFailures() {
         Fixture fixture;
         auto action = fixture.observe();
         auto& window = fixture.backend->visible.front();
-        if (changed == 0) ++window.id;
-        else if (changed == 1) ++window.processId;
-        else if (changed == 2) window.x += 20;
-        else window.title = "A different window title";
+        if (changed == 0)
+            ++window.id;
+        else if (changed == 1)
+            ++window.processId;
+        else if (changed == 2)
+            window.x += 20;
+        else
+            window.title = "A different window title";
         CHECK(!fixture.controller.perform("owner", action));
         CHECK(fixture.backend->activationCount == 0);
         CHECK(fixture.backend->inputs.empty());
@@ -1908,7 +2356,6 @@ void verifyFailureAndCancellationBoundaries() {
 }
 
 void verifyPublicContract() {
-
     MaiToolRegistry registry;
     auto controller = std::make_shared<DesktopComputerController>();
     registerDesktopComputerTools(registry, controller);
@@ -1924,9 +2371,8 @@ void verifyPublicContract() {
     const Json actions = properties.value("action", Json::object()).value("enum", Json{});
     // The public contract exposes routine desktop operations without needing a
     // native session. Native dispatch belongs to the separate fixture test.
-    for (const char* action : {"list", "observe", "focus", "click", "double_click",
-                               "right_click", "drag", "type", "key", "scroll",
-                               "replace_text", "verify", "clear"}) {
+    for (const char* action : {"list", "observe", "focus", "click", "double_click", "right_click", "drag", "type",
+                               "key", "scroll", "replace_text", "verify", "clear"}) {
         if (!contains(actions, action)) {
             std::fprintf(stderr, "desktop_computer schema is missing action: %s\n", action);
             ++failures;
@@ -1953,17 +2399,15 @@ void verifyPublicContract() {
     // These deliberately unknown snapshots must be rejected before any native
     // operation. NotFound proves valid empty replacement and shortcut arguments
     // reached the shared controller rather than being rejected by tool parsing.
-    const auto emptyReplacement = tool->execute(
-        R"({"action":"replace_text","snapshot_id":"missing","window_id":"1","text":""})",
-        context);
+    const auto emptyReplacement =
+        tool->execute(R"({"action":"replace_text","snapshot_id":"missing","window_id":"1","text":""})", context);
     CHECK(emptyReplacement.error().code() == MaiErrorCode::NotFound);
-    const auto shortcut = tool->execute(
-        R"({"action":"key","snapshot_id":"missing","window_id":"1","key":"Ctrl+A"})",
-        context);
+    const auto shortcut =
+        tool->execute(R"({"action":"key","snapshot_id":"missing","window_id":"1","key":"Ctrl+A"})", context);
     CHECK(shortcut.error().code() == MaiErrorCode::NotFound);
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
@@ -2008,6 +2452,17 @@ int main(int argc, char** argv) {
     verifyIdentityAndSyntaxFailures();
     verifyFailureAndCancellationBoundaries();
     verifyNativeInputFailureRequiresObservation();
+    verifyCanceledPerformReleasesHeldInput();
+    verifyRejectedPerformReleasesHeldInput();
+    verifyCanceledObservationReleasesOnlyItsSession();
+    verifyOldTurnCanceledObservationPreservesReplacementHold();
+    verifyOldTurnCleanupPreservesReplacementHold();
+    verifyCanceledToolObservationReleasesOnlyItsTurn();
+    verifyIndependentUpDryRunKeepsOwnedInput();
+    verifyInvalidIndependentButtonCannotValidateWithoutAnOwner();
+    verifyIndependentUpConsumesOnlyRealOwnedWindowToken();
+    verifyHeldLauncherModifiersDoNotRequireEditableFocus();
+    verifyReleaseDoesNotWaitForObservedStateDuringPlatformWork();
 
     if (failures != 0) {
         std::fprintf(stderr, "desktop computer contract failures: %d\n", failures);

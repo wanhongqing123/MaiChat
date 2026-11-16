@@ -1,8 +1,8 @@
 # desktop_computer 坐标与截图使用说明
 
-适用于模型调用桌面 `desktop_computer` 与独立 `screenshot` 工具。工具的模型描述和参数描述也包含这些规则；本文提供完整调用顺序与换算示例。
+适用于模型调用桌面 `desktop_computer` 与独立 `screenshot` 工具。工具的模型描述和参数描述也包含这些规则；本文说明能力、参数与状态约束；动作顺序和观察时机由任务与当前状态决定。
 
-## 先选操作范围
+## 操作范围
 
 | 需求 | 使用方式 | observe 返回什么 | 坐标基准 |
 | --- | --- | --- | --- |
@@ -13,29 +13,31 @@
 
 `list`、`list_displays`、`list_keys` 只传 `action`。
 
-## 推荐顺序：整屏观察 → 输入 → 检查新图
+## 通用能力与动作选择
 
-依次调用 `desktop_computer`，下面的 ID 和快照为占位符，必须替换为真实返回值。
+| 能力 | 动作与参数 | 语义 |
+| --- | --- | --- |
+| 发现与观察 | `list`、`list_displays`、`list_keys`、`observe` | 按需取得目标、键名、图片或控件信息 |
+| 指针移动 | `move`，位置比例 | 保留已持有的鼠标按钮和修饰键 |
+| 点击与完整拖动 | `click`、`double_click`、`drag`，可选 `button` | 一次动作内配对按下/松开；`right_click` 固定右键 |
+| 鼠标独立状态 | `mouse_down`、`mouse_up`，`button` | 支持 left/right/middle/back/forward，持有到明确松开或清理 |
+| 滚动 | `scroll`，`axis` 与 `lines` | 默认竖向；支持横向；正数分别表示向上/向右 |
+| 键盘 | `key`、`key_down`、`key_up` | `key` 敲击单键或组合键；down/up 控制单个物理键的持有 |
+| 文字编辑 | `type`、`replace_text` | 使用已有焦点；replace_text 全选替换，空串删除选中内容 |
+| 焦点与读回 | `focus`、`verify` | 按需激活选定窗口，或读回非密码输入值 |
+| 状态与清理 | `input_state`、`release_all`、`clear` | 查询或释放自己合成的输入；clear 同时忘记观察状态 |
 
-```json
-{"action":"list_displays"}
-```
+模型可以根据当前目标独立选择这些动作，也可以组合使用。已有正确焦点时可直接输入或使用快捷键；需要移动指针、点击或改变焦点时再执行对应动作。图片、控件读回或动作结果已足够时，可以据此决定下一步，无需套用固定的“观察、点击、输入”顺序。
 
-从结果中选择目标显示器，然后观察它：
+display 动作当前自动返回后续图片和 `observation.snapshot_id`，可直接使用该结果，不要求额外再截图。`observe` 用于需要获得或更新目标/画面证据的情况；`wait_ms` 是其可选等待参数（0～5000），新帧不等于应用已完成处理。
 
-```json
-{"action":"observe","target":"display","display_id":"<返回的显示器ID>"}
-```
+## 快照是接口约束
 
-查看这次返回的图片，在这张图上选点，并使用同一次结果中的 `snapshot_id`。例如点击整屏中心：
-
-```json
-{"action":"click","target":"display","display_id":"<同一显示器ID>","snapshot_id":"<observe返回的快照>","x_ratio":0.5,"y_ratio":0.5}
-```
-
-输入完成后检查返回的新图片。下一次操作使用新结果 **`observation.snapshot_id`**，不能继续用点击之前的 token。确认目标输入框已获得焦点后，再用新 token 执行 `type`。
-
-如果结果表明输入已经发送，但后续截图失败，重新 `observe` 确认现状，不要直接重复点击、拖动或输入。等待界面加载可使用 display `observe` 的 `wait_ms`（0～5000）；有新帧不等于应用已经处理完输入。
+- 普通输入使用同一会话、目标与坐标空间的有效 `snapshot_id`；不能重复使用已消耗的编号。
+- display 输入的新 token 位于 `observation.snapshot_id`；window 输入后需要更新观察才能取得下一个输入 token。
+- 目标未知、编号过期或目标已变化时更新观察；是否需要更多视觉/控件证据由任务状态决定。
+- `mouse_up`、`key_up` 和 `release_all` 只释放自己持有的输入，不要求有效快照或当前前台焦点，取消后也能清理。
+- 输入已发送而后续取图失败时，查看当前状态后再决定动作，避免重复执行同一次修改。
 
 ## 坐标统一用 0～1 比例
 
@@ -55,11 +57,7 @@ y_ratio = py / (Ih - 1)
 
 ## 窗口操作与跨范围换算
 
-窗口模式先 `list`，再观察一个确定窗口：
-
-```json
-{"action":"observe","target":"window","window_id":"<list返回的窗口ID>","include_elements":true}
-```
+窗口目标可用已知 `window_id` 或精确 `window_title` 指定；需要发现目标时使用 `list`。
 
 窗口 `observe` 中控件的 `center_x_ratio/center_y_ratio` 已经相对于窗口归一化，可以直接传给同窗口的点击，不要再除一次窗口尺寸。窗口输入同时传本次返回的 `window_id` 和 `snapshot_id`。
 
@@ -81,25 +79,27 @@ windowYRatio = (desktopY - W.y) / (W.height - 1)
 ## 独立 screenshot、快照与焦点
 
 - `screenshot` 抓取鼠标所在显示器，鼠标跨屏后可能换屏；它不返回 computer 的 `display_id/snapshot_id`，也不延长或恢复已有 token。
-- 看过独立 screenshot 后要进行视觉输入，应通过 `desktop_computer observe(target=display, display_id=...)` 获取绑定图片，并在这张新图上重新确认位置。
+- 选点图片必须与输入目标和坐标空间相对应；已有有效绑定观察可直接使用，独立 screenshot 不建立或恢复这种绑定。
 - 不把另一屏、另一时刻或另一裁剪区域的图片与旧 token 配对。`frame_sequence` 是图像帧信息，不是输入 token。
-- 输入快照按单次使用处理，包括窗口 `focus`；窗口操作后重新 `observe`。收到失效、目标变化等错误，也重新观察。
+- 快照按单次使用处理，包括窗口 `focus`；编号消耗、过期或目标变化时按接口要求更新观察。
 - display `move` 只移动鼠标，不聚焦窗口；`key/type` 发往当前键盘焦点。点击或前台切换后应确认焦点，不能因截图中看到了某窗口就认定它已获得输入焦点。
 - 操作系统拒绝激活窗口或权限不足时停止重试并说明原因。窗口 `verify` 可读取非密码输入控件并核对 `expected_text`，但 `verified=true` 只证明读回一致，不代表业务已保存或提交。
 
-## 拖动时何时截图
+## 输入状态与组合
 
-当前 `drag` 是一个完整动作：**在起点按下 → 持续按住移动到指定终点 → 松开 → 返回新图**。
-模型应在拖动前确认起点和终点，结束后检查返回图片。`dispatched=true` 只说明动作已发送，
-不会证明滑块对齐或目标应用判定成功。
+独立 `mouse_down`、`key_down` 可以跨调用保持状态；`move`、截图/观察、滚动和短键操作不会自动抬起已有持有的按键。按钮状态与修饰键可以组合，适用于通用多选、拖放、视图操作等 PC 交互，不绑定具体软件或任务。
 
-`screenshot` 和 display `observe` 本身不会松开鼠标，Windows 原生测试已确认按下期间仍能取图。
-但是当前模型接口没有单独的按下、保持移动、松开动作，因而无法在一次 `drag` 中途暂停，
-等模型看图后继续调整。连续调用截图也不能让已完成的 `drag` 继续保持按下。
+`key_down/key_up` 接收单个物理键，不接收组合键；需要隐含修饰键的字符也应使用明确的物理键与修饰键表达。文字使用 Unicode `type`，单次快捷键使用 `key`。键名和原生支持以 `list_keys` 及实际分派结果为准，不支持的系统键不会被替换为其它键。
 
-需要“保持按下 → 看图 → 微调 → 确认后松开”的任务，属于当前工具尚未提供的分步控制能力；
-不能把普通点击/输入的快照流程当作这种能力已存在。对应原生测试和 Sunshine 参考见
-[按住鼠标观察的验证记录](../diagnostics/2026-11-16-desktop-held-mouse-observation.md)。
+`type/replace_text` 表达字面文字，不表达快捷键；已有自有 Control/Shift/Alt/Meta 持有时返回 Busy 并回收自有输入，防止文字变成应用命令。物理键、鼠标和滚轮操作仍可与这些修饰键组合。
+
+完整 `drag` 按给定起点、终点和时长执行配对的按下/移动/松开，不判定应用结果；独立 down/move/up 则支持保持按住时观察、调整，模型根据状态选择合适原语。
+
+`input_state` 及输入结果中的同名字段描述本会话拥有的 `buttons_down/keys_down` 和剩余空闲时间，不表示硬件用户按键状态或业务成功。重复 owned down 和未知 up 不产生多余事件。一个会话/任务/目标拥有持有状态时，其它会话仍可观察，但不能插入输入。
+
+明确松开、任务结束/取消、原生分派失败、clear/析构或 120 秒无有效拥有者活动会清理自己的输入；窗口目标失焦、权限或显示器几何失效也触发清理。不会接管或批量释放用户原先按住的按键。观察不会松手；失效或中断后应检查当前输入状态。
+
+历史对照与 Sunshine 参考见 [输入状态验证记录](../diagnostics/2026-11-16-desktop-held-mouse-observation.md)，本次通用原语的回归另见对应诊断记录。
 
 ## 常见错误对照
 
@@ -107,8 +107,8 @@ windowYRatio = (desktopY - W.y) / (W.height - 1)
 | --- | --- |
 | 看整屏图，却把同一比例传给 `target=window` | 使用绑定的 display 模式；或依据实际原生 bounds 换算 |
 | 预览点坐标除以原图宽高，再乘 DPI | 使用实际查看图片的宽高计算比例 |
-| click 后用同一个 snapshot 继续 type | display 使用返回的新 observation token；window 重新 observe |
+| 下一次输入使用已消费的 snapshot | 使用可用的新 token；需要更新时重新 observe |
 | 重新 screenshot 后继续用已消耗 token | 获取新的 computer observe 并查看它的图片 |
 | 输入成功但截图失败，就重发输入 | 只重新 observe，先确认实际结果 |
 
-这些规则约束选点、目标身份和调用顺序；不会保证模型识别图片时必然选中正确控件。实际任务仍需逐步查看输入后的图片或控件读回。
+这些规则约束坐标、目标身份和输入状态；不会保证模型识别图片时必然选中正确控件。实际任务仍需逐步查看输入后的图片或控件读回。

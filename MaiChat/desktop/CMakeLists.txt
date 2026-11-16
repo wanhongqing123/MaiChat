@@ -884,6 +884,8 @@ add_library(maichat_agent
   src/MaiChatTools/DesktopComputerKeys.cpp
   src/MaiChatTools/DesktopComputerTools.h
   src/MaiChatTools/DesktopComputerTools.cpp
+  src/MaiChatTools/DesktopComputerInputOwnership.h
+  src/MaiChatTools/DesktopComputerInputOwnership.cpp
   ../third_party/qrcodegen/qrcodegen.c
   src/agent/DesktopSessionSyncHost.h
   src/agent/DesktopSessionSyncHost.cpp
@@ -903,6 +905,8 @@ add_library(maichat_agent
   src/MaiChatTools/DesktopPdfPasswordPrompt.cpp
   src/agent/AgentChatPanel.h
   src/agent/AgentChatPanel.cpp
+  src/agent/StarterCatalog.h
+  src/agent/StarterCatalog.cpp
   src/agent/AgentToolGroupWidget.h
   src/agent/AgentToolGroupWidget.cpp
   src/agent/RemoteAgentPanel.h
@@ -1121,6 +1125,7 @@ if(WIN32 AND MAICHAT_RVM_WINDOWS_ASSETS_AVAILABLE)
 endif()
 
 add_executable(agent_panel_session_test tests/AgentPanelSessionTest.cpp)
+target_include_directories(agent_panel_session_test PRIVATE ../MaiChatTools)
 
 # The capture lifecycle is independent of chat turns; owned backends exercise
 # blocking native-stop behavior without touching the user's desktop session.
@@ -1267,6 +1272,9 @@ add_executable(desktop_computer_contracts_test tests/DesktopComputerContractsTes
 target_link_libraries(desktop_computer_contracts_test PRIVATE maichat_agent Qt6::Core)
 target_include_directories(desktop_computer_contracts_test PRIVATE ../../MaiAgent/third_party/nlohmann)
 add_test(NAME desktop_computer_contracts COMMAND desktop_computer_contracts_test)
+add_executable(desktop_computer_input_ownership_test tests/DesktopComputerInputOwnershipTest.cpp)
+target_link_libraries(desktop_computer_input_ownership_test PRIVATE maichat_agent Qt6::Core)
+add_test(NAME desktop_computer_input_ownership COMMAND desktop_computer_input_ownership_test)
 
 add_executable(desktop_computer_agent_integration_test tests/DesktopComputerAgentIntegrationTest.cpp)
 target_link_libraries(desktop_computer_agent_integration_test PRIVATE remote_im_desktop_ui remote_im_desktop_app

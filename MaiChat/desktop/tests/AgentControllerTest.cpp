@@ -210,16 +210,20 @@ public:
         if (request.messages.back().content == "session A") {
             if (sink.onReasoning) sink.onReasoning("first");
             firstReasoningSent.store(true);
-            while (!release.load() && !cancel.load())
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            while (!release.load() && !cancel.load()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
             if (sink.onReasoning && !cancel.load()) sink.onReasoning("second");
+            // Core 在既有提交中已会补答纯推理响应；明确正文使此用例只测跨会话分类，
+            // 不让追加的补答 System 消息误入下面另一个会话的假应答分支。
+            if (sink.onText && !cancel.load()) sink.onText("session A done");
         } else if (sink.onText) {
             sink.onText("session B done");
         }
         return {};
     }
 
-    MaiWireApi wireApi() const override { return MaiWireApi::ChatCompletions; }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
 };
 
 // Record the actual request crossing the controller/Core boundary. Named
@@ -231,6 +235,7 @@ public:
 
     std::atomic<bool> heldRequestStarted{false};
     std::atomic<bool> releaseHeldRequest{false};
+    MaiError heldRequestError;
 
     MaiError stream(const MaiModelRequest& request, const MaiStreamSink& sink,
                     const std::atomic<bool>& cancel) override {
@@ -243,6 +248,7 @@ public:
             heldRequestStarted.store(true);
             while (!releaseHeldRequest.load() && !cancel.load())
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (!cancel.load() && heldRequestError) return heldRequestError;
         }
         if (!cancel.load() && sink.onText) sink.onText("session reply");
         return {};
@@ -371,6 +377,8 @@ private slots:
     void newSessionDoesNotInheritAnotherSessionSelection();
     void sqliteSessionModelsSurviveRestartAndNewDefault();
     void busySessionSelectionIsRejectedWhileAnotherSessionCanChange();
+    void staleTurnCompletionDoesNotFinishReplacement_data();
+    void staleTurnCompletionDoesNotFinishReplacement();
     void sessionEffortAndModelPersistTogetherAcrossRestart();
     void sessionConfigurationUsesFixedLegacyDefaultsAndAtomicValidation();
     void sessionConfigurationRejectsMissingProviderWithoutMutation();
@@ -559,6 +567,81 @@ void AgentControllerTest::sqliteSessionModelsSurviveRestartAndNewDefault() {
     QVERIFY(resumed.agent().getSession(second.toStdString(), secondStored));
     QCOMPARE(QString::fromStdString(firstStored.model), QStringLiteral("glm-5.3"));
     QCOMPARE(QString::fromStdString(secondStored.model), QStringLiteral("deepseek-v4-pro"));
+}
+
+void AgentControllerTest::staleTurnCompletionDoesNotFinishReplacement_data() {
+    QTest::addColumn<bool>("staleError");
+    QTest::addColumn<bool>("currentError");
+    QTest::newRow("old-idle-current-success") << false << false;
+    QTest::newRow("old-error-current-success") << true << false;
+    QTest::newRow("old-idle-current-error") << false << true;
+    QTest::newRow("old-error-current-error") << true << true;
+}
+
+void AgentControllerTest::staleTurnCompletionDoesNotFinishReplacement() {
+    QFETCH(bool, staleError);
+    QFETCH(bool, currentError);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto model = std::make_unique<SessionSelectionModel>();
+    auto* recorded = model.get();
+    if (currentError) recorded->heldRequestError = {MaiErrorCode::Network, "current turn fixture failure"};
+    AgentController controller(std::move(model), QString());
+    struct ReleaseOnExit {
+        std::atomic<bool>& release;
+        ~ReleaseOnExit() {
+            release.store(true);
+        }
+    } releaseOnExit{recorded->releaseHeldRequest};
+    const QString session = controller.createSession(directory.path(), QStringLiteral("turn lifecycle"));
+    QVERIFY(!session.isEmpty());
+    QSignalSpy finished(&controller, &AgentController::turnFinished);
+    QSignalSpy failed(&controller, &AgentController::turnFailed);
+    QVERIFY(controller.sendPrompt(session, QStringLiteral("complete the previous turn")));
+    QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 10'000);
+    QCOMPARE(failed.count(), 0);
+    std::string oldTurn;
+    for (const auto& message : controller.agent().listMessages(session.toStdString()))
+        if (message.role == MaiRole::Assistant) oldTurn = message.id;
+    QVERIFY(!oldTurn.empty());
+    finished.clear();
+
+    QVERIFY(controller.sendPrompt(session, QStringLiteral("hold first session")));
+    QTRY_VERIFY_WITH_TIMEOUT(recorded->heldRequestStarted.load(), 10'000);
+    const std::string currentTurn = controller.agent().activeTurnId(session.toStdString());
+    QVERIFY(!currentTurn.empty());
+    QVERIFY(currentTurn != oldTurn);
+    QVERIFY(controller.agent().isBusy(session.toStdString()));
+
+    // Deliver the queued terminal event for a real previous turn while the
+    // replacement is deterministically held in its own model request.
+    MaiEvent stale;
+    stale.type = staleError ? MaiEventType::SessionError : MaiEventType::SessionIdle;
+    stale.sessionId = session.toStdString();
+    stale.turnId = oldTurn;
+    stale.detail = "previous turn fixture failure";
+    QVERIFY(QMetaObject::invokeMethod(&controller, "onEventQueued", Qt::DirectConnection, Q_ARG(MaiEvent, stale)));
+    const int finishedAfterStale = finished.count();
+    const int failedAfterStale = failed.count();
+    const bool replacementStillBusy = controller.agent().isBusy(session.toStdString());
+    const std::string turnAfterStale = controller.agent().activeTurnId(session.toStdString());
+    // Keep observing the genuine current completion even on the RED baseline,
+    // so a stale-event failure cannot conceal a broken cleanup/release path.
+    finished.clear();
+    failed.clear();
+    recorded->releaseHeldRequest.store(true);
+    QTRY_COMPARE_WITH_TIMEOUT(finished.count(), 1, 10'000);
+    QCOMPARE(failed.count(), currentError ? 1 : 0);
+    if (currentError) {
+        QCOMPARE(failed.front().at(0).toString(), session);
+        QCOMPARE(failed.front().at(1).toString(), QStringLiteral("current turn fixture failure"));
+    }
+    QCOMPARE(finished.front().at(0).toString(), session);
+    QVERIFY(!controller.agent().isBusy(session.toStdString()));
+    QVERIFY(replacementStillBusy);
+    QCOMPARE(turnAfterStale, currentTurn);
+    QCOMPARE(finishedAfterStale, 0);
+    QCOMPARE(failedAfterStale, 0);
 }
 
 void AgentControllerTest::busySessionSelectionIsRejectedWhileAnotherSessionCanChange() {
@@ -1493,17 +1576,21 @@ void AgentControllerTest::finishingAnotherSessionDoesNotReclassifyReasoning() {
     }));
     controlled->release.store(true);
     controller.agent().waitIdle();
-    QTRY_VERIFY(std::any_of(finished.cbegin(), finished.cend(), [&](const QList<QVariant>& args) {
-        return args.first().toString() == firstSession;
-    }));
+    QTRY_VERIFY(std::any_of(finished.cbegin(), finished.cend(),
+                            [&](const QList<QVariant>& args) { return args.first().toString() == firstSession; }));
     int firstReasoningParts = 0;
     for (const QList<QVariant>& args : reasoning) {
         if (args.first().toString() == firstSession) ++firstReasoningParts;
     }
     QCOMPARE(firstReasoningParts, 2);
+    QString firstText;
     for (const QList<QVariant>& args : text) {
-        QVERIFY(args.first().toString() != firstSession);
+        const QString delta = args.at(3).toString();
+        QVERIFY(!delta.contains(QStringLiteral("first")));
+        QVERIFY(!delta.contains(QStringLiteral("second")));
+        if (args.first().toString() == firstSession) firstText += delta;
     }
+    QCOMPARE(firstText, QStringLiteral("session A done"));
 }
 
 void AgentControllerTest::messagePartEventsReadOnlyTheirOwner() {

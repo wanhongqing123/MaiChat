@@ -151,15 +151,53 @@ MaiTurnRunner::MaiTurnRunner(Dependencies dependencies, std::string sessionId, M
       mAssistant(std::move(assistant)) {}
 
 void MaiTurnRunner::run(const std::atomic<bool>& cancel) {
+    // 所有出口共用一次收尾。先封闭输入闸门，再清理工具资源，避免清理阻塞期间
+    // 接受已经没有后续模型请求的补充；资源回收不依赖存储、标题或界面回调成功。
+    const auto unexpected = [this](const std::string& detail) {
+        mError = {mError ? mError.code() : MaiErrorCode::Internal,
+                  mError ? mError.message() + "; " + detail : detail};
+    };
     try {
         runUnchecked(cancel);
     } catch (const std::exception& error) {
-        mError = MaiError::make(MaiErrorCode::Internal,
-                                std::string("unexpected agent failure: ") + error.what());
-        finish(cancel);
+        unexpected(std::string("unexpected agent failure: ") + error.what());
     } catch (...) {
-        mError = MaiError::make(MaiErrorCode::Internal, "unexpected agent failure");
+        unexpected("unexpected agent failure");
+    }
+    try {
+        if (mDependencies.closeSteering) mDependencies.closeSteering();
+    } catch (const std::exception& error) {
+        unexpected(std::string("unexpected input cleanup failure: ") + error.what());
+    } catch (...) {
+        unexpected("unexpected input cleanup failure");
+    }
+    const MaiError cleanupError =
+        mDependencies.tools ? mDependencies.tools->finishTurn(mSessionId, mInitialAssistantId)
+                            : MaiError{};
+    if (cleanupError) {
+        const std::string detail = "tool turn cleanup failed: " + cleanupError.message();
+        mError = {mError ? mError.code() : cleanupError.code(),
+                  mError ? mError.message() + "; " + detail : detail};
+    }
+    try {
         finish(cancel);
+    } catch (const std::exception& error) {
+        unexpected(std::string("unexpected agent finalization failure: ") + error.what());
+    } catch (...) {
+        unexpected("unexpected agent finalization failure");
+    }
+    // 主动取消仍然安静；但取消不能掩盖工具资源清理失败。
+    const bool canceled =
+        cancel.load(std::memory_order_relaxed) || mError.code() == MaiErrorCode::Canceled;
+    if (mError && (!canceled || cleanupError)) {
+        try {
+            mDependencies.emitter->emitTurnError(mSessionId, mInitialAssistantId, mError.message());
+        } catch (const std::exception& error) {
+            // 错误订阅方也可能抛异常，不能越过线程入口造成整个宿主 terminate。
+            unexpected(std::string("unexpected error notification failure: ") + error.what());
+        } catch (...) {
+            unexpected("unexpected error notification failure");
+        }
     }
 }
 
@@ -189,14 +227,12 @@ bool MaiTurnRunner::advanceSteering(bool closeIfEmpty) {
 void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
     if (!mDependencies.model) {
         mError = MaiError::make(MaiErrorCode::NotConfigured, "no model client configured");
-        finish(cancel);
         return;
     }
 
     MaiSession session;
     if (!mDependencies.store->getSession(mSessionId, session)) {
         mError = MaiError::make(MaiErrorCode::NotFound, "session not found");
-        finish(cancel);
         return;
     }
     mWorkingDirectory = session.directory;
@@ -209,7 +245,6 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
             : session.reasoningEffort;
     if (!maiIsValidReasoningEffort(mReasoningEffort)) {
         mError = {MaiErrorCode::InvalidInput, "Unsupported reasoning effort."};
-        finish(cancel);
         return;
     }
     if (!mDependencies.specialistReply.empty()) {
@@ -316,8 +351,6 @@ void MaiTurnRunner::runUnchecked(const std::atomic<bool>& cancel) {
             break;
         }
     }
-
-    finish(cancel);
 }
 
 // 从会话存储和当前内存中的 assistant 消息构造下一次模型请求。
@@ -555,6 +588,7 @@ void MaiTurnRunner::executeTools(const std::vector<MaiToolInvocation>& calls,
 
     MaiToolContext context;
     context.sessionId = mSessionId;
+    context.turnId = mInitialAssistantId;
     context.model = mModelName;
     context.root = session.directory;
     context.fileAccessRoot = mDependencies.fileAccessRoot;
@@ -948,8 +982,7 @@ void MaiTurnRunner::fillStreamedPart(const std::string& partId, const std::strin
     // 找不到对应的 part 说明占位那一步没跑过（理论上不可能：有内容就一定先有第一个 chunk）。
 }
 
-void MaiTurnRunner::finish(const std::atomic<bool>& cancel) {
-    if (mDependencies.closeSteering) mDependencies.closeSteering();
+void MaiTurnRunner::finish(const std::atomic<bool>&) {
     commitStreamedParts();  // 中断时可能还有没落库的半截内容
 
     mAssistant.completed = MaiTime::getCurrentTime();
@@ -970,11 +1003,4 @@ void MaiTurnRunner::finish(const std::atomic<bool>& cancel) {
     // 每次都检查会把代码淹掉（见 MaiSessionStore::lastWriteError）。
     const MaiError writeError = mDependencies.store->lastWriteError();
     if (writeError.hasError() && !mError.hasError()) mError = writeError;
-
-    // 主动中断不是故障：界面不该弹错误，已经吐出来的内容也照常保留。
-    const bool canceled =
-        cancel.load(std::memory_order_relaxed) || mError.code() == MaiErrorCode::Canceled;
-    if (mError && !canceled) {
-        mDependencies.emitter->emitTurnError(mSessionId, mInitialAssistantId, mError.message());
-    }
 }

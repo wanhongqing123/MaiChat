@@ -89,6 +89,11 @@ struct MaiToolContext {
     // 跑得久的工具（遍历大目录、搜大仓库）要在循环里定期查它，否则用户按了停还要等它跑完。
     const std::atomic<bool>* cancel = nullptr;
 
+    // 本轮最初的 assistant ID；后续工具循环和 assistant 分段保持同一身份。
+    // 宿主用它隔离跨调用资源，防止旧轮次的清理释放替代轮次的输入。
+    // 追加在既有数据字段后，保留旧聚合初始化的字段顺序。
+    std::string turnId;
+
     bool isCanceled() const;
 };
 
@@ -228,6 +233,13 @@ public:
     virtual MaiToolResult execute(const std::string& argumentsJson,
                                   const MaiToolContext& context) = 0;
 
+    // 每轮退出后由核心在线程上调用一次，覆盖正常、失败和取消，不依赖宿主界面事件。
+    // 默认无操作；有跨调用资源的实现只清理 sessionId/turnId 对应的所有权，旧轮次
+    // 不得影响同会话的新轮次。与 execute 一样可能跨会话并发，清理须幂等且自行同步。
+    // 不保留参数引用、MaiToolContext 或取消指针；无需模型参数、工作目录或再次批准。
+    // 返回错误表示资源清理失败；注册表继续其余工具，并由轮次发布明确失败事件。
+    virtual MaiError onTurnFinished(const std::string& sessionId, const std::string& turnId);
+
     // 当前实际主模型是否支持该工具的结果契约，默认 true。
     // 注册表用同一查询过滤模型声明与按名调用；工具仍须在直接 execute 时执行相同能力检查。
     // 这里只描述接收工具结果所需的模型能力，不替代参数、权限、路径或宿主接线检查。
@@ -260,6 +272,11 @@ public:
     // 在工作线程汇总带模型工具的能力快照。它可能读取宿主中的密钥配置状态，
     // 但不得把密钥值放进返回结果；该清单目前不会自动拼入主模型请求。
     std::vector<MaiSpecialistInfo> specialists() const;
+
+    // 对全部公开与内部工具执行幂等资源清理，不受当前模型可用性过滤。
+    // 单个回调返回错误或抛异常不跳过其余工具；返回首个错误，异常转为 Internal。
+    // 注册完成后可由多个轮次并发调用，调用期间不得修改注册表。
+    MaiError finishTurn(const std::string& sessionId, const std::string& turnId) const;
 
 private:
     std::vector<std::unique_ptr<MaiTool>> mTools;

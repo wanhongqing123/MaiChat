@@ -25,10 +25,12 @@ public:
     virtual MaiResult<std::vector<DesktopNativeElement>> elements(const DesktopNativeWindow& window) = 0;
     virtual MaiError capture(const DesktopNativeWindow& window, MaiScreenshot& output) = 0;
     virtual MaiError activate(const DesktopNativeWindow& window) = 0;
+    virtual MaiError activate(const DesktopNativeWindow& window, const std::function<bool()>& isCanceled);
     virtual MaiResult<bool> isFocused(const DesktopNativeWindow& window) = 0;
     // A native owned menu may be the input target. Explicit focus and text
     // verification still require the selected window itself.
     virtual MaiError activateForInput(const DesktopNativeWindow& window);
+    virtual MaiError activateForInput(const DesktopNativeWindow& window, const std::function<bool()>& isCanceled);
     virtual MaiResult<bool> inputFocused(const DesktopNativeWindow& window);
     virtual MaiResult<bool> secureInput() = 0;
     // An error may occur after part of a gesture/key sequence was dispatched.
@@ -36,6 +38,9 @@ public:
     // acknowledge that no input reached the target. Native scopes release only
     // their owned downs on failure and never promise application-level success.
     virtual MaiError input(const DesktopNativeInput& input) = 0;
+    // Optional ordinary stateful native seam. Legacy recording backends keep
+    // using input(); a missing session explicitly rejects independent holds.
+    virtual std::shared_ptr<DesktopNativeInputSession> createInputSession();
     virtual MaiResult<std::string> focusedText(const DesktopNativeWindow& window) = 0;
 };
 

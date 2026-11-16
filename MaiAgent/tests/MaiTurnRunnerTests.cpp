@@ -9,9 +9,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -191,6 +193,272 @@ AgentUnderTest makeAgent(MaiFakeModelClient::Turn repeating, MaiAgent::Options o
             observer};
 }
 
+// 资源归属独立保存，观察结束回调是否缺失、重复或误清替代轮次。
+class TurnResourceTool final : public MaiTool {
+public:
+    explicit TurnResourceTool(std::string toolName) : mName(std::move(toolName)) {}
+    std::map<std::string, std::string> owners;
+    std::vector<std::pair<std::string, std::string>> finished;
+    std::string executedTurn;
+    std::vector<std::string> executedTurns;
+    std::function<void()> beforeCleanup;
+    std::atomic<bool>* cancelAfterExecute = nullptr;
+    MaiError cleanupError;
+    int cleanupThrows = 0;
+    bool available = true;
+    int executions = 0;
+
+    std::string name() const override {
+        return mName;
+    }
+    std::string description() const override {
+        return "Hold a synthetic turn-owned resource.";
+    }
+    std::string parametersSchema() const override {
+        return "{}";
+    }
+    bool requiresWorkingDirectory(const std::string&) const override {
+        return false;
+    }
+    bool isAvailableForModel(const std::string&) const override {
+        return available;
+    }
+    MaiToolResult execute(const std::string&, const MaiToolContext& context) override {
+        ++executions;
+        executedTurn = context.turnId;
+        executedTurns.push_back(context.turnId);
+        owners[context.sessionId] = context.turnId;
+        if (cancelAfterExecute) cancelAfterExecute->store(true);
+        return MaiToolResult::success("Resource acquired.");
+    }
+    MaiError onTurnFinished(const std::string& sessionId, const std::string& turnId) override {
+        if (beforeCleanup) beforeCleanup();
+        finished.emplace_back(sessionId, turnId);
+        const auto owner = owners.find(sessionId);
+        if (owner != owners.end() && owner->second == turnId) owners.erase(owner);
+        if (cleanupThrows == 1) throw std::runtime_error("synthetic cleanup exception");
+        if (cleanupThrows == 2) throw 17;
+        return cleanupError;
+    }
+
+private:
+    std::string mName;
+};
+
+class TurnCleanupModel final : public MaiModelClient {
+public:
+    enum class Outcome { Success, Failure, Exception };
+    Outcome outcome = Outcome::Success;
+    std::function<void()> beforeAnswer;
+    int requests = 0;
+    int toolRequests = 1;
+    MaiError stream(const MaiModelRequest&, const MaiStreamSink& sink,
+                    const std::atomic<bool>&) override {
+        if (++requests <= toolRequests) {
+            sink.onToolCall({"call_turn_resource", "turn_resource", "{}"});
+            return {};
+        }
+        if (beforeAnswer) beforeAnswer();
+        if (outcome == Outcome::Failure) return {MaiErrorCode::Network, "synthetic model failure"};
+        if (outcome == Outcome::Exception) throw std::runtime_error("synthetic model exception");
+        sink.onText("Finished.");
+        return {};
+    }
+    MaiWireApi wireApi() const override {
+        return MaiWireApi::ChatCompletions;
+    }
+};
+
+struct TurnCleanupFixture {
+    std::unique_ptr<MaiSessionStore> store = makeMaiMemoryStore();
+    MaiEventBus bus;
+    MaiEventEmitter emitter{bus};
+    MaiContextBuilder context;
+    MaiToolRegistry tools;
+    MaiSession session;
+    MaiMessage assistant;
+    TurnCleanupModel model;
+    std::atomic<bool> cancel{false};
+    std::vector<MaiEvent> errors;
+    TurnResourceTool* resource = nullptr;
+    bool steeringClosed = false;
+    std::function<MaiResult<bool>(MaiMessage&, bool, std::vector<std::string>&)> advanceSteering;
+
+    TurnCleanupFixture() {
+        session.id = "ses_turn_cleanup";
+        store->putSession(session);
+        MaiMessage user;
+        user.id = "msg_cleanup_user";
+        user.role = MaiRole::User;
+        user.parts.push_back({"prt_cleanup_user", MaiTextPart{"Acquire and finish."}, 1});
+        store->putMessage(session.id, user);
+        assistant.id = "msg_cleanup_original";
+        assistant.role = MaiRole::Assistant;
+        store->putMessage(session.id, assistant);
+        auto tool = std::make_unique<TurnResourceTool>("turn_resource");
+        resource = tool.get();
+        tool->beforeCleanup = [this] { CHECK(steeringClosed); };
+        tools.add(std::move(tool));
+        bus.subscribe([this](const MaiEvent& event) {
+            if (event.type == MaiEventType::SessionError) errors.push_back(event);
+        });
+    }
+    bool run(bool modelConfigured = true, const std::string& sessionId = {},
+             const std::string& effort = {}) {
+        MaiTurnRunner::Dependencies dependencies;
+        dependencies.store = store.get();
+        dependencies.model = modelConfigured ? &model : nullptr;
+        dependencies.tools = &tools;
+        dependencies.emitter = &emitter;
+        dependencies.context = &context;
+        dependencies.defaultModel = "glm-5.3";
+        dependencies.reasoningEffort = effort;
+        dependencies.advanceSteering = advanceSteering;
+        dependencies.closeSteering = [this] { steeringClosed = true; };
+        MaiTurnRunner runner(dependencies, sessionId.empty() ? session.id : sessionId, assistant);
+        runner.run(cancel);
+        return runner.succeeded();
+    }
+};
+
+void test_turn_cleanup_covers_success_failure_and_cancel() {
+    for (int outcome = 0; outcome < 4; ++outcome) {
+        TurnCleanupFixture fixture;
+        if (outcome == 1) fixture.model.outcome = TurnCleanupModel::Outcome::Failure;
+        if (outcome == 2) fixture.resource->cancelAfterExecute = &fixture.cancel;
+        if (outcome == 3) fixture.model.outcome = TurnCleanupModel::Outcome::Exception;
+        const bool succeeded = fixture.run();
+        CHECK(fixture.resource->executions == 1);
+        CHECK(fixture.resource->executedTurn == fixture.assistant.id);
+        CHECK(fixture.resource->finished.size() == 1);
+        if (fixture.resource->finished.size() == 1) {
+            CHECK(fixture.resource->finished.front().first == fixture.session.id);
+            CHECK(fixture.resource->finished.front().second == fixture.assistant.id);
+        }
+        CHECK(fixture.resource->owners.empty());
+        if (outcome == 1 || outcome == 3) {
+            CHECK(!succeeded);
+            CHECK(fixture.errors.size() == 1);
+        } else {
+            CHECK(fixture.errors.empty());
+            if (outcome == 0) CHECK(succeeded);
+        }
+    }
+}
+
+void test_turn_cleanup_covers_early_returns() {
+    for (int outcome = 0; outcome < 4; ++outcome) {
+        TurnCleanupFixture fixture;
+        const std::string sessionId = outcome == 1 ? "ses_missing_cleanup" : fixture.session.id;
+        fixture.resource->owners[sessionId] = fixture.assistant.id;
+        if (outcome == 3) fixture.cancel.store(true);
+        const bool succeeded =
+            fixture.run(outcome != 0, sessionId, outcome == 2 ? "unknown-effort" : "");
+        CHECK(fixture.resource->executions == 0);
+        CHECK(fixture.resource->finished.size() == 1);
+        if (fixture.resource->finished.size() == 1) {
+            CHECK(fixture.resource->finished.front().first == sessionId);
+            CHECK(fixture.resource->finished.front().second == fixture.assistant.id);
+        }
+        CHECK(fixture.resource->owners.empty());
+        if (outcome != 3) CHECK(!succeeded);
+        CHECK(fixture.errors.size() == (outcome == 3 ? 0 : 1));
+    }
+}
+
+void test_turn_cleanup_uses_original_identity_after_steering() {
+    TurnCleanupFixture fixture;
+    fixture.model.toolRequests = 3;
+    int steered = 0;
+    fixture.advanceSteering = [&](MaiMessage& assistant, bool,
+                                  std::vector<std::string>&) -> MaiResult<bool> {
+        if (steered == fixture.resource->executions) return false;
+        ++steered;
+        assistant = {};
+        assistant.id = "msg_cleanup_steered_segment_" + std::to_string(steered);
+        assistant.role = MaiRole::Assistant;
+        fixture.store->putMessage(fixture.session.id, assistant);
+        return true;
+    };
+    CHECK(fixture.run());
+    CHECK(steered == 3);
+    CHECK(fixture.resource->executedTurns == std::vector<std::string>(3, fixture.assistant.id));
+    CHECK(fixture.resource->finished.size() == 1);
+    if (fixture.resource->finished.size() == 1)
+        CHECK(fixture.resource->finished.front().second == fixture.assistant.id);
+    CHECK(fixture.resource->owners.empty());
+
+    TurnCleanupFixture replacement;
+    replacement.model.beforeAnswer = [&] {
+        replacement.resource->owners[replacement.session.id] = "msg_cleanup_replacement";
+    };
+    CHECK(replacement.run());
+    CHECK(replacement.resource->finished.size() == 1);
+    if (replacement.resource->finished.size() == 1)
+        CHECK(replacement.resource->finished.front().second == replacement.assistant.id);
+    CHECK(replacement.resource->owners[replacement.session.id] == "msg_cleanup_replacement");
+}
+
+void test_turn_cleanup_reports_failure_and_continues_other_tools() {
+    for (int failure = 0; failure < 3; ++failure) {
+        for (int outcome = 0; outcome < 3; ++outcome) {
+            TurnCleanupFixture fixture;
+            if (failure == 0)
+                fixture.resource->cleanupError = {MaiErrorCode::Busy, "synthetic cleanup refusal"};
+            else
+                fixture.resource->cleanupThrows = failure;
+            if (outcome == 1) fixture.resource->cancelAfterExecute = &fixture.cancel;
+            if (outcome == 2) fixture.model.outcome = TurnCleanupModel::Outcome::Failure;
+            auto follower = std::make_unique<TurnResourceTool>("internal_cleanup_resource");
+            auto* observedFollower = follower.get();
+            follower->available = false;
+            follower->owners[fixture.session.id] = fixture.assistant.id;
+            fixture.tools.addInternal(std::move(follower));
+            CHECK(!fixture.run());
+            CHECK(fixture.resource->finished.size() == 1);
+            CHECK(observedFollower->finished.size() == 1);
+            CHECK(observedFollower->owners.empty());
+            CHECK(fixture.errors.size() == 1);
+            if (fixture.errors.size() == 1) {
+                CHECK(fixture.errors.front().turnId == fixture.assistant.id);
+                CHECK(fixture.errors.front().detail.find("cleanup") != std::string::npos);
+                if (outcome == 2)
+                    CHECK(fixture.errors.front().detail.find("synthetic model failure") !=
+                          std::string::npos);
+            }
+        }
+    }
+}
+
+void test_registry_turn_cleanup_preserves_first_error() {
+    MaiToolRegistry tools;
+    auto first = std::make_unique<TurnResourceTool>("first_cleanup");
+    auto* observedFirst = first.get();
+    first->cleanupError = {MaiErrorCode::Busy, "first cleanup refusal"};
+    tools.add(std::move(first));
+    auto second = std::make_unique<TurnResourceTool>("second_cleanup");
+    auto* observedSecond = second.get();
+    second->cleanupThrows = 1;
+    tools.addInternal(std::move(second));
+    auto third = std::make_unique<TurnResourceTool>("third_cleanup");
+    auto* observedThird = third.get();
+    tools.add(std::move(third));
+    const auto error = tools.finishTurn("ses_registry_cleanup", "msg_registry_cleanup");
+    CHECK(error.code() == MaiErrorCode::Busy);
+    CHECK(error.message() == "first cleanup refusal");
+    CHECK(observedFirst->finished.size() == 1);
+    CHECK(observedSecond->finished.size() == 1);
+    CHECK(observedThird->finished.size() == 1);
+}
+
+void test_turn_cleanup_contracts() {
+    test_turn_cleanup_covers_success_failure_and_cancel();
+    test_turn_cleanup_covers_early_returns();
+    test_turn_cleanup_uses_original_identity_after_steering();
+    test_turn_cleanup_reports_failure_and_continues_other_tools();
+    test_registry_turn_cleanup_preserves_first_error();
+}
+
 void test_prompt_images_reach_the_current_user_message() {
     auto underTest = makeAgent(defaultTurn());
     MaiAgent* agent = underTest.agent.get();
@@ -234,6 +502,8 @@ void test_full_turn() {
 
     // 2. part id 全程稳定 —— 换 id 会让界面重绘甚至闪屏
     const auto all = recorder.snapshot();
+    for (const auto& event : all)
+        if (event.type == MaiEventType::SessionIdle) CHECK(event.turnId == msg_id);
     std::string partId;
     for (const auto& e : all) {
         if (e.type != MaiEventType::MessagePartDelta) continue;
@@ -1502,6 +1772,8 @@ void test_accepted_task_failure_queries_existing_task_without_resubmission() {
             ++executions;
             CHECK(nlohmann::json::parse(input)["action"] == "continue");
             CHECK(context.callId == "call_existing_query");
+            CHECK(!context.turnId.empty());
+            CHECK(context.turnId == "msg_existing_query_answer");
             CHECK(context.toolOutputStore != nullptr);
             const auto runningHistory = context.toolOutputStore->listMessages(context.sessionId);
             const auto& running = std::get<MaiToolPart>(runningHistory.back().parts.back().body);
@@ -1766,6 +2038,12 @@ void test_untrusted_tool_output_cannot_claim_accepted_task_identity() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--turn-cleanup") {
+        test_turn_cleanup_contracts();
+        std::printf("turn cleanup checks: %d failure(s)\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+    test_turn_cleanup_contracts();
     if (argc == 2 && std::string(argv[1]) == "--untrusted-tool-recovery") {
         test_untrusted_tool_output_cannot_claim_accepted_task_identity();
         std::printf("untrusted tool recovery checks: %d failure(s)\n", failures);

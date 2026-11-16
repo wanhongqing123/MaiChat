@@ -68,9 +68,9 @@ public:
     // 更换当前会话的工作目录；没有打开会话时在选定目录新建。
     void openSessionInDirectory(const QString& directory);
 
-    // 空白页初始化由宿主给默认/凭据状态；已有会话通过下方普通 getter 刷新，
-    // 不从另一个会话的 label 或全局 UI 选择推断实际配置。
-    void setModelLabel(const QString& model, bool configured = true);
+    // 空白页可显示真实型号 ID 或连接状态；工具目录只用已确认的型号 ID 过滤。
+    // 已有会话始终读取其实际配置，不让展示文案或凭据状态改变工具能力。
+    void setModelLabel(const QString& label, bool configured = true);
     void setReasoningEffortLabel(const QString& effort);
     // 从当前会话的持久配置重投影；凭据刷新不会覆盖另一个会话的选择。
     void refreshModelConfiguration();

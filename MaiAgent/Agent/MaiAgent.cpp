@@ -576,7 +576,7 @@ struct MaiAgent::Runtime {
                 startError = store->lastWriteError();
             }
         }
-        emitter.emitSession(MaiEventType::SessionIdle, sessionId);
+        emitter.emitTurnIdle(sessionId, turn->id);
         if (next) {
             emitter.emitMessage(MaiEventType::MessageUpdated, sessionId, assistant.id);
             next->signalReady();

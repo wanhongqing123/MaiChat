@@ -49,11 +49,13 @@
 
 #include "MaiSqliteStore.h"
 #include "MaiIMHistoryFormat.h"
+#include "MaiCloudDriveTools.h"
 #include "MaiSessionTitler.h"
 #include "agent/AgentChatPanel.h"
 #include "agent/AgentController.h"
 #include "agent/AgentSessionList.h"
 #include "agent/DesktopSessionSyncHost.h"
+#include "MaiChatTools/DesktopMediaTools.h"
 #include "markdown/MarkdownView.h"
 #include "ui/ComposerTextEdit.h"
 #include "ui/DesktopAudioPlayback.h"
@@ -641,6 +643,11 @@ private slots:
     void emptySessionShowsWelcomeAndFirstMessageHidesIt();
     void welcomeToolRowsExplainEveryCategoryAndWrapAtNarrowWidths();
     void welcomeToolRowsOnlyAppendSessionDrafts();
+    void welcomeToolRowsHideInternalGenerationAndCoverPublicRegistry_data();
+    void welcomeToolRowsHideInternalGenerationAndCoverPublicRegistry();
+    void welcomeToolRowsFollowCurrentSessionModel();
+    void welcomeToolRowsUseModelIdsInsteadOfStatusLabels_data();
+    void welcomeToolRowsUseModelIdsInsteadOfStatusLabels();
     void newSessionUsesAppWorkspaceInsteadOfProcessDirectory();
     void newSessionOffersWorkspaceChoice();
     void chosenWorkspaceKeepsCurrentSession();
@@ -771,55 +778,11 @@ struct Harness {
     }
 };
 
-// Product copy contract shared with the Desktop/Mac welcome-page review. These
-// are natural-language examples, not tool IDs or a promise of forced routing.
-struct WelcomeCopy {
-    QString name;
-    QString purpose;
-    QString example;
-};
-
-QList<WelcomeCopy> welcomeCopy() {
-    return {
-        {QStringLiteral("AI 问答"), QStringLiteral("解释问题、整理思路与起草文字。"),
-         QStringLiteral("使用 AI 问答帮我把这段想法整理成行动清单。")},
-        {QStringLiteral("图片创作"), QStringLiteral("根据描述或参考图片生成、修改图片。"),
-         QStringLiteral("使用图片创作工具帮我设计一张春日活动海报。")},
-        {QStringLiteral("视频创作"), QStringLiteral("根据文字或参考素材生成视频。"),
-         QStringLiteral("使用视频创作工具帮我制作一段日落海边的短片。")},
-        {QStringLiteral("文件处理"), QStringLiteral("查找、读取和编辑文件，整理本地资料。"),
-         QStringLiteral("使用文件处理工具（file_glob、file_read）帮我查找工作目录中的会议记录，读完后总结要点。")},
-        {QStringLiteral("桌面截屏"), QStringLiteral("截取桌面画面，查看当前屏幕内容。"),
-         QStringLiteral("使用桌面截屏工具（screenshot）帮我查看当前屏幕上的报错，说明报错内容。")},
-        {QStringLiteral("浏览器操作"), QStringLiteral("打开网页、查找页面内容并操作网页。"),
-         QStringLiteral("使用浏览器操作工具（desktop_browser）帮我打开指定网页并找到下载入口，先不要下载。")},
-        {QStringLiteral("终端与进程"), QStringLiteral("运行终端命令，查看和管理本机进程。"),
-         QStringLiteral("使用终端与进程工具（shell）帮我列出当前运行的进程名称和进程 ID。")},
-        {QStringLiteral("电脑操作"), QStringLiteral("通过屏幕定位、点击和键盘操作桌面应用。"),
-         QStringLiteral("使用电脑操作工具（desktop_computer）帮我双击打开桌面上的“软件名称”；找不到就明确告诉我，不要换其他方式反复尝试。")},
-        {QStringLiteral("会话定时任务"), QStringLiteral("安排本机会话任务在指定时间执行。"),
-         QStringLiteral("使用会话定时任务工具（maichat_session_task_create）帮我安排明天上午九点整理工作计划。")},
-        {QStringLiteral("日历导入"), QStringLiteral("准备日历事件，交给系统日历确认导入。"),
-         QStringLiteral("使用日历导入工具（maichat_calendar_create_event）帮我准备明天下午三点的项目评审日程，交给我确认导入。")},
-        {QStringLiteral("二维码生成"), QStringLiteral("将文字或网址生成可保存的二维码图片。"),
-         QStringLiteral("使用二维码生成工具（maichat_generate_qr_code）帮我把这个网址制作成 PNG 二维码。")},
-        {QStringLiteral("本地媒体处理"), QStringLiteral("查看媒体信息，转换、裁剪本地音视频。"),
-         QStringLiteral("使用本地媒体处理工具（ffprobe）帮我查看这段视频的时长和分辨率。")},
-        {QStringLiteral("拍照"), QStringLiteral("打开本机相机，由你点击快门拍照。"),
-         QStringLiteral("使用拍照工具（maichat_camera_command）帮我打开相机，我来点击快门拍照。")},
-        {QStringLiteral("音乐播放"), QStringLiteral("在 MaiChat 播放器中打开本地音乐。"),
-         QStringLiteral("使用音乐播放工具（maichat_play_local_music）帮我播放工作目录中的“音乐文件名”。")},
-        {QStringLiteral("我的云盘"), QStringLiteral("浏览云盘文件，上传、下载和整理资料。"),
-         QStringLiteral("使用我的云盘工具（maichat_cloud_drive_search_media）帮我查找云盘里的“项目资料”，列出匹配文件。")},
-        {QStringLiteral("MaiChat 消息"), QStringLiteral("查找聊天记录，按你的要求发送或回复消息。"),
-         QStringLiteral("使用 MaiChat 消息工具（maichat_search_messages）帮我查找本周提到“项目资料”的消息，列出匹配结果。")},
-        {QStringLiteral("联系人"), QStringLiteral("查找联系人，查看好友和群聊信息。"),
-         QStringLiteral("使用联系人工具（maichat_list_contacts）帮我查找名字中包含“小明”的好友，列出匹配联系人。")},
-        {QStringLiteral("账号资料与头像"), QStringLiteral("查看账号资料，按你的要求修改昵称或头像。"),
-         QStringLiteral("使用账号资料与头像工具（maichat_get_current_account）帮我查看当前账号的昵称和头像。")},
-        {QStringLiteral("跨设备会话"), QStringLiteral("查看其他在线设备的会话，管理会话工作区。"),
-         QStringLiteral("使用跨设备会话工具（maichat_remote_session_list）帮我查看其他在线设备上的会话，列出设备和会话名称。")},
-    };
+QSet<QString> welcomeToolNames(const AgentChatPanel& panel) {
+    QSet<QString> names;
+    for (const auto* row : panel.findChildren<QPushButton*>(QStringLiteral("agentWelcomeFeature")))
+        for (const QString& name : row->property("toolNames").toStringList()) names.insert(name);
+    return names;
 }
 
 }  // namespace
@@ -860,6 +823,223 @@ void AgentPanelSessionTest::emptySessionShowsWelcomeAndFirstMessageHidesIt() {
     QTRY_VERIFY_WITH_TIMEOUT(!welcome->isVisibleTo(harness.panel.get()), 3000);
 }
 
+void AgentPanelSessionTest::welcomeToolRowsHideInternalGenerationAndCoverPublicRegistry_data() {
+    QTest::addColumn<QString>("model");
+    QTest::addColumn<QString>("expectedModel");
+    QTest::addColumn<bool>("imageToolsAvailable");
+    QTest::newRow("default-text-model") << QString() << QStringLiteral("glm-5.3") << false;
+    QTest::newRow("explicit-image-model") << QStringLiteral("glm-5.3-flash") << QStringLiteral("glm-5.3-flash") << true;
+}
+
+void AgentPanelSessionTest::welcomeToolRowsHideInternalGenerationAndCoverPublicRegistry() {
+    QFETCH(QString, model);
+    QFETCH(QString, expectedModel);
+    QFETCH(bool, imageToolsAvailable);
+    // Capture the production registry at its ordinary host-registration boundary.
+    // Its lifetime belongs to Controller's Agent. Read declarations for the
+    // actual Session model, not a different hard-coded model's capabilities.
+    // Reading declarations does not execute media tools or submit a model turn.
+    MaiToolRegistry* tools = nullptr;
+    QWidget mediaHost;
+    AgentController controller(std::make_unique<SilentModel>(), QString(),
+                               [&tools, &mediaHost](MaiToolRegistry& registry) {
+                                   registerDesktopMediaTools(registry, &mediaHost);
+                                   registerMaiCloudDriveTools(registry, {});
+                                   tools = &registry;
+                               });
+    AgentChatPanel panel(controller);
+    panel.resize(700, 700);
+    panel.show();
+    const QString sessionId = controller.createSession(QDir::currentPath());
+    if (!model.isEmpty()) QVERIFY(controller.setModel(sessionId, model));
+    panel.openSession(sessionId);
+    AgentController::SessionModelConfiguration configuration;
+    QVERIFY(controller.sessionModelConfiguration(sessionId, configuration));
+    QCOMPARE(configuration.model, expectedModel);
+    auto* welcome = panel.findChild<QScrollArea*>(QStringLiteral("agentWelcomeView"));
+    QVERIFY(welcome);
+    const auto rows = welcome->findChildren<QPushButton*>(QStringLiteral("agentWelcomeFeature"));
+    QSet<QString> listed;
+    QString allText;
+    for (const auto* row : rows) {
+        allText += row->accessibleName() + row->accessibleDescription();
+        QVERIFY(row->accessibleName() != QStringLiteral("图片创作"));
+        for (const QString& name : row->property("toolNames").toStringList()) {
+            QVERIFY2(!listed.contains(name), qPrintable(name));
+            listed.insert(name);
+            QVERIFY2(row->accessibleDescription().contains(name), qPrintable(name));
+        }
+    }
+    QVERIFY(!listed.contains(QStringLiteral("wan_video")));
+    QVERIFY(!listed.contains(QStringLiteral("seedance_video")));
+    for (const QString& name : {QStringLiteral("wan_image"), QStringLiteral("seedream_image"),
+                                QStringLiteral("glm_image"), QStringLiteral("minimax_image"),
+                                QStringLiteral("kling_bailian_image")}) {
+        QVERIFY(!listed.contains(name));
+        QVERIFY(!allText.contains(name));
+    }
+    QSet<QString> expected;
+    QVERIFY(tools);
+    for (const MaiToolSpec& tool : tools->specs(configuration.model.toStdString()))
+        expected.insert(QString::fromStdString(tool.name));
+    QCOMPARE(listed, expected);
+    // Existing files and local media remain independently available while paid
+    // creation tools are hidden; no provider selection is implied by the guide.
+    QCOMPARE(listed.contains(QStringLiteral("view_image")), imageToolsAvailable);
+    QCOMPARE(listed.contains(QStringLiteral("screenshot")), imageToolsAvailable);
+    QVERIFY(listed.contains(QStringLiteral("agent_send_media")));
+    QVERIFY(listed.contains(QStringLiteral("agent_send_file")));
+    QVERIFY(listed.contains(QStringLiteral("maichat_play_video")));
+    QVERIFY(listed.contains(QStringLiteral("maichat_play_local_music")));
+    QVERIFY(listed.contains(QStringLiteral("maichat_cloud_drive_upload_media")));
+    QVERIFY(listed.contains(QStringLiteral("maichat_cloud_drive_download_media")));
+    QVERIFY(listed.contains(QStringLiteral("minimax_video")));
+    QVERIFY(listed.contains(QStringLiteral("kling_bailian_video")));
+    QVERIFY(controller.agent().listMessages(panel.sessionId().toStdString()).empty());
+
+    // This fixture registers the real cloud/media families. Exercise their long
+    // tool-name list here; the base layout Harness intentionally has no cloud
+    // host tools and cannot prove that this multi-line row fits narrow widths.
+    QPushButton* cloudRow = nullptr;
+    for (auto* row : rows) {
+        if (row->property("toolNames").toStringList().contains(
+                QStringLiteral("maichat_cloud_drive_list_pending_uploads")))
+            cloudRow = row;
+    }
+    QVERIFY(cloudRow);
+    auto* cloudTools = cloudRow->findChild<QLabel*>(QStringLiteral("agentWelcomeFeatureTools"));
+    QVERIFY(cloudTools);
+    const QStringList cloudToolNames = cloudRow->property("toolNames").toStringList();
+    QVERIFY(cloudToolNames.size() >= 16);
+    QVERIFY(cloudTools->wordWrap());
+    for (const QString& name : cloudToolNames) QVERIFY(cloudTools->text().contains(name));
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    for (const int width : {1100, 700, 550}) {
+        panel.resize(width, 700);
+        QCoreApplication::processEvents();
+        welcome->ensureWidgetVisible(cloudTools, 0, 0);
+        QCoreApplication::processEvents();
+        QCOMPARE(welcome->horizontalScrollBar()->maximum(), 0);
+        QVERIFY(!welcome->horizontalScrollBar()->isVisible());
+        QVERIFY(cloudTools->height() > cloudTools->fontMetrics().lineSpacing());
+        const QRect viewportRow(cloudRow->mapTo(welcome->viewport(), QPoint()), cloudRow->size());
+        QVERIFY(viewportRow.left() >= 0 && viewportRow.right() < welcome->viewport()->width());
+        for (auto* label : cloudRow->findChildren<QLabel*>()) {
+            QVERIFY(label->isVisibleTo(cloudRow));
+            QVERIFY(cloudRow->rect().contains(QRect(label->mapTo(cloudRow, QPoint()), label->size())));
+            const QRect textRect = label->fontMetrics().boundingRect(
+                QRect(0, 0, label->contentsRect().width(), 10000), Qt::TextWordWrap, label->text());
+            QVERIFY2(textRect.height() <= label->contentsRect().height(),
+                     qPrintable(QStringLiteral("Cloud-drive label clipped at width %1: %2")
+                                    .arg(width).arg(label->objectName())));
+        }
+        QVERIFY(captureAgentFixture(panel,
+                    QStringLiteral("welcome-cloud-tools-%1-%2").arg(configuration.model).arg(width)));
+    }
+}
+
+void AgentPanelSessionTest::welcomeToolRowsFollowCurrentSessionModel() {
+    Harness harness;
+    QVERIFY(harness.controller->setModel(harness.mine, QStringLiteral("glm-5.3")));
+    QVERIFY(harness.controller->setModel(harness.other, QStringLiteral("glm-5.3-flash")));
+    harness.panel->refreshModelConfiguration();
+    auto* editor = harness.panel->findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    QVERIFY(editor);
+    editor->setPlainText(QStringLiteral("Keep the text-only session draft."));
+    const MaiApprovalPolicy policy = harness.controller->approvalPolicy();
+    QVERIFY(!welcomeToolNames(*harness.panel).contains(QStringLiteral("view_image")));
+    QVERIFY(!welcomeToolNames(*harness.panel).contains(QStringLiteral("screenshot")));
+    QSet<QString> textOnlyExpected;
+    for (const auto& tool : harness.controller->availableToolSpecs(QStringLiteral("glm-5.3")))
+        textOnlyExpected.insert(QString::fromStdString(tool.name));
+    QCOMPARE(welcomeToolNames(*harness.panel), textOnlyExpected);
+
+    harness.panel->openSession(harness.other);
+    QVERIFY(welcomeToolNames(*harness.panel).contains(QStringLiteral("view_image")));
+    QSet<QString> visionExpected;
+    for (const auto& tool : harness.controller->availableToolSpecs(QStringLiteral("glm-5.3-flash")))
+        visionExpected.insert(QString::fromStdString(tool.name));
+    QCOMPARE(welcomeToolNames(*harness.panel), visionExpected);
+    editor->setPlainText(QStringLiteral("Keep the image session draft."));
+
+    harness.panel->openSession(harness.mine);
+    QCOMPARE(welcomeToolNames(*harness.panel), textOnlyExpected);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Keep the text-only session draft."));
+    harness.panel->openSession(harness.other);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Keep the image session draft."));
+    QCOMPARE(harness.controller->approvalPolicy(), policy);
+    QVERIFY(harness.controller->agent().listMessages(harness.mine.toStdString()).empty());
+    QVERIFY(harness.controller->agent().listMessages(harness.other.toStdString()).empty());
+}
+
+void AgentPanelSessionTest::welcomeToolRowsUseModelIdsInsteadOfStatusLabels_data() {
+    QTest::addColumn<QString>("label");
+    QTest::addColumn<bool>("configured");
+    QTest::addColumn<QString>("sessionModel");
+    QTest::addColumn<QString>("expectedModel");
+    struct LabelCase {
+        const char* tag;
+        QString label;
+        bool configured;
+        QString blankModel;
+    };
+    const QList<LabelCase> labels = {
+        {"empty", QString(), false, QString()},
+        {"unconfigured", QStringLiteral("未配置模型"), false, QString()},
+        {"connecting", QStringLiteral("正在连接模型"), false, QString()},
+        {"not-enabled", QStringLiteral("模型未开通"), false, QString()},
+        {"connection-failed", QStringLiteral("模型连接失败"), false, QString()},
+        {"text-model", QStringLiteral("glm-5.3"), true, QStringLiteral("glm-5.3")},
+        {"image-model", QStringLiteral("glm-5.3-flash"), true, QStringLiteral("glm-5.3-flash")},
+        {"deepseek-model", QStringLiteral("deepseek-flash"), true, QStringLiteral("deepseek-flash")},
+        {"text-credentials-pending", QStringLiteral("glm-5.3"), false, QStringLiteral("glm-5.3")},
+    };
+    for (const auto& item : labels) {
+        const QByteArray blankTag = QByteArray(item.tag) + "-blank";
+        QTest::newRow(blankTag.constData()) << item.label << item.configured << QString() << item.blankModel;
+        for (const QString& model : {QStringLiteral("glm-5.3"), QStringLiteral("glm-5.3-flash")}) {
+            const QByteArray tag = QByteArray(item.tag) + "-session-" + model.toUtf8();
+            QTest::newRow(tag.constData()) << item.label << item.configured << model << model;
+        }
+    }
+}
+
+void AgentPanelSessionTest::welcomeToolRowsUseModelIdsInsteadOfStatusLabels() {
+    QFETCH(QString, label);
+    QFETCH(bool, configured);
+    QFETCH(QString, sessionModel);
+    QFETCH(QString, expectedModel);
+    AgentController controller(std::make_unique<SilentModel>(), QString());
+    AgentChatPanel panel(controller);
+    QString sessionId;
+    if (!sessionModel.isEmpty()) {
+        sessionId = controller.createSession(QDir::currentPath());
+        QVERIFY(controller.setModel(sessionId, sessionModel));
+        panel.openSession(sessionId);
+    }
+    auto* editor = panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor"));
+    auto* welcome = panel.findChild<QScrollArea*>(QStringLiteral("agentWelcomeView"));
+    QVERIFY(editor && welcome);
+    editor->setPlainText(QStringLiteral("Keep the pending draft and selected session."));
+    const auto policy = controller.approvalPolicy();
+
+    // MainWindow passes display-only connection states on the blank page. They
+    // must preserve the public directory; existing Sessions always use their
+    // own persisted model even if a different label arrives during refresh.
+    panel.setModelLabel(label, configured);
+    QSet<QString> expected;
+    for (const auto& tool : controller.availableToolSpecs(expectedModel))
+        expected.insert(QString::fromStdString(tool.name));
+    QCOMPARE(welcomeToolNames(panel), expected);
+    QCOMPARE(panel.sessionId(), sessionId);
+    QCOMPARE(panel.findChild<QScrollArea*>(QStringLiteral("agentWelcomeView")), welcome);
+    QCOMPARE(panel.findChild<QTextEdit*>(QStringLiteral("agentPromptEditor")), editor);
+    QCOMPARE(editor->toPlainText(), QStringLiteral("Keep the pending draft and selected session."));
+    QCOMPARE(controller.approvalPolicy(), policy);
+    QVERIFY(controller.agent().listMessages(sessionId.toStdString()).empty());
+    if (sessionId.isEmpty()) QVERIFY(controller.agent().listSessions().empty());
+}
+
 void AgentPanelSessionTest::welcomeToolRowsExplainEveryCategoryAndWrapAtNarrowWidths() {
     Harness harness;
     QVERIFY(QTest::qWaitForWindowExposed(harness.panel.get()));
@@ -867,9 +1047,7 @@ void AgentPanelSessionTest::welcomeToolRowsExplainEveryCategoryAndWrapAtNarrowWi
     QVERIFY(welcome);
     QVERIFY(captureAgentFixture(*harness.panel, QStringLiteral("welcome-tool-directory")));
     const auto rows = welcome->findChildren<QPushButton*>(QStringLiteral("agentWelcomeFeature"));
-    const auto copy = welcomeCopy();
-    QCOMPARE(rows.size(), copy.size());
-    QCOMPARE(rows.size(), 19);
+    QVERIFY(!rows.isEmpty());
     auto* instruction = welcome->findChild<QLabel*>(QStringLiteral("agentWelcomeInstruction"));
     auto* boundary = welcome->findChild<QLabel*>(QStringLiteral("agentWelcomeBoundary"));
     QVERIFY(instruction && boundary);
@@ -890,14 +1068,15 @@ void AgentPanelSessionTest::welcomeToolRowsExplainEveryCategoryAndWrapAtNarrowWi
         int previousBottom = -1;
         for (int index = 0; index < rows.size(); ++index) {
             auto* row = rows[index];
-            QCOMPARE(row->accessibleName(), copy[index].name);
             auto* title = row->findChild<QLabel*>(QStringLiteral("agentWelcomeFeatureName"));
             auto* purpose = row->findChild<QLabel*>(QStringLiteral("agentWelcomeFeaturePurpose"));
             auto* example = row->findChild<QLabel*>(QStringLiteral("agentWelcomeFeatureExample"));
             QVERIFY(title && purpose && example);
-            QCOMPARE(title->text(), copy[index].name);
-            QCOMPARE(purpose->text(), copy[index].purpose);
-            QCOMPARE(example->text(), copy[index].example);
+            QCOMPARE(title->text(), row->accessibleName());
+            QVERIFY(!purpose->text().isEmpty());
+            QVERIFY(!example->text().isEmpty());
+            QVERIFY(row->accessibleDescription().contains(purpose->text()));
+            QVERIFY(row->accessibleDescription().contains(example->text()));
             QVERIFY(row->y() > previousBottom);
             previousBottom = row->geometry().bottom();
             welcome->ensureWidgetVisible(row, 0, 0);
@@ -906,14 +1085,16 @@ void AgentPanelSessionTest::welcomeToolRowsExplainEveryCategoryAndWrapAtNarrowWi
             const QRect viewportRow(row->mapTo(welcome->viewport(), QPoint()), row->size());
             QVERIFY(viewportRow.left() >= 0 && viewportRow.right() < welcome->viewport()->width());
             QVERIFY(viewportRow.intersects(welcome->viewport()->rect()));
-            for (auto* label : {title, purpose, example}) {
+            // Include all dynamically filtered tool-name labels. Cloud-drive
+            // wrapping has a separate fixture with its real host registration.
+            for (auto* label : row->findChildren<QLabel*>()) {
                 QVERIFY(label->isVisibleTo(row));
                 const QRect labelRect(label->mapTo(row, QPoint()), label->size());
                 QVERIFY(row->rect().contains(labelRect));
                 const QRect textRect = label->fontMetrics().boundingRect(
                     QRect(0, 0, label->contentsRect().width(), 10000), Qt::TextWordWrap, label->text());
                 QVERIFY2(textRect.height() <= label->contentsRect().height(),
-                         qPrintable(QStringLiteral("%1: clipped text at width %2").arg(copy[index].name).arg(width)));
+                         qPrintable(QStringLiteral("%1: clipped text at width %2").arg(row->accessibleName()).arg(width)));
             }
         }
         welcome->verticalScrollBar()->setValue(0);
@@ -950,8 +1131,7 @@ void AgentPanelSessionTest::welcomeToolRowsOnlyAppendSessionDrafts() {
     auto* view = panel.findChild<MarkdownView*>();
     QVERIFY(editor && welcome && view);
     const auto rows = welcome->findChildren<QPushButton*>(QStringLiteral("agentWelcomeFeature"));
-    const auto copy = welcomeCopy();
-    QCOMPARE(rows.size(), copy.size());
+    QVERIFY(!rows.isEmpty());
     const auto originalPolicy = controller.approvalPolicy();
     QSignalSpy userMessages(&controller, &AgentController::userMessageAdded);
     QSignalSpy completed(&controller, &AgentController::turnFinished);
@@ -967,7 +1147,7 @@ void AgentPanelSessionTest::welcomeToolRowsOnlyAppendSessionDrafts() {
         // accidentally consumes pointer events cannot hide behind button::click.
         QTest::mouseClick(panel.windowHandle(), Qt::LeftButton, Qt::NoModifier,
                           example->mapTo(&panel, example->rect().center()));
-        expected += QLatin1Char('\n') + copy[index].example;
+        expected += QLatin1Char('\n') + example->text();
         QCOMPARE(editor->toPlainText(), expected);
         QCOMPARE(panel.sessionId(), first);
         QVERIFY(welcome->isVisibleTo(&panel));

@@ -31,7 +31,7 @@ enum class MaiErrorCode {
     RateLimited,    // 供应商额度耗尽或请求频率受限。界面应直接展示供应商给的原因
     Protocol,       // 对端返回了看不懂的东西（不是合法 SSE、缺字段）。HTTP 502
     // 用户主动中断，或者授权超时。**这不是故障**——界面不该弹错误，已经吐出来的内容也要照常保留。
-    // MaiTurnRunner::finish 专门判了这一条。
+    // MaiTurnRunner::run 的统一收尾专门判了这一条。
     Canceled,
     // 这个平台上就没有这个能力。**和 NotConfigured 分开**：那个是"没装好，装上就有"，
     // 这个是"装了也没有"。iOS 上跑不了外部进程（沙箱不允许 exec），

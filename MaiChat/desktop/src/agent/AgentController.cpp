@@ -133,11 +133,15 @@ path or ask the user to attach it.
 For local file work, prefer file_create, file_create_directory, file_delete, file_read, file_write,
 file_edit, and file_patch. file_create makes an empty file without overwriting; file_write sets content. Use
 shell only when the built-in tools cannot perform the task.
-For general desktop operation, use desktop_computer list_displays, then observe with target=display
-and a display_id. This returns a whole-screen image bound to a snapshot and native input bounds.
-Display-target actions can switch applications and return the resulting screen with a new snapshot;
-inspect that observation before deciding the next action or claiming completion. Window-target observe
-still returns only window metadata and Accessibility/UIA elements, without window image capture.
+Desktop computer tools provide general input primitives. Choose actions and observation timing from
+current task/application state; do not impose a fixed observe/click/type recipe. Display observations
+bind a whole-screen image, native bounds and a snapshot; window observations provide window metadata
+and Accessibility/UIA elements without a window image. Coordinates must match the selected target.
+Use an existing returned observation when it is sufficient, and refresh unknown, consumed, expired or
+changed targets/tokens as required by the tool. Keyboard input uses the current appropriate focus;
+click only when the task calls for it. Independent mouse/key downs persist across observations until
+owned ups/release, task cleanup or inactivity expiry; atomic taps and complete drag remain distinct.
+Check actual results before claiming task completion.
 For standalone screen images, screenshot reuses the same resident native capture session and has no
 window capture mode. Use screenshot action=stop when screen capture is no longer needed.
 To show a capture in this
@@ -231,6 +235,8 @@ struct AgentController::Runtime {
     }
 
     std::unique_ptr<MaiAgent> agent;
+    MaiToolRegistry* tools = nullptr;  // Owned by agent; immutable after buildAgent.
+    std::shared_ptr<DesktopComputerController> computer = std::make_shared<DesktopComputerController>();
     // 由 agent 持有，生命周期覆盖所有普通配置查询；不另建一份 wire/能力表。
     MaiModelClient* modelClient = nullptr;
     DesktopAccountModelClient* accountClient = nullptr;
@@ -305,7 +311,8 @@ std::unique_ptr<MaiAgent>
 buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStore> store, const QString& defaultModel,
            MaiApprovalPolicy approvalPolicy, const AgentController::ToolRegistrar& hostTools,
            const AgentController::ModelConfig& credentials, const QString& databasePath,
-           const std::shared_ptr<MaiSessionScheduleStore>& scheduleStore) {
+           const std::shared_ptr<MaiSessionScheduleStore>& scheduleStore,
+           const std::shared_ptr<DesktopComputerController>& computer, MaiToolRegistry*& publicTools) {
     // MaiAgent 内置工具总是装着；平台不支持的能力由核心在注册时排除。
     // 会话没有工作目录时工具层会明确拒绝，
     // 要不要把工具声明给模型看是 MaiContextBuilder 的事，不是这里的。
@@ -350,7 +357,7 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
 #endif
     registerDesktopProcessTools(*tools, std::make_shared<DesktopProcessManager>());
     registerDesktopBrowserTools(*tools, std::make_shared<DesktopBrowserManager>());
-    registerDesktopComputerTools(*tools, std::make_shared<DesktopComputerController>());
+    registerDesktopComputerTools(*tools, computer);
 #if defined(MAICHAT_EMBEDDED_FFMPEG)
     const MaiFfmpegEngine ffmpegEngine{mai_ffmpeg_execute,       mai_ffmpeg_set_cancel_check,
                                        mai_ffprobe_execute,      mai_ffprobe_set_cancel_check,
@@ -478,6 +485,7 @@ buildAgent(std::unique_ptr<MaiModelClient> model, std::unique_ptr<MaiSessionStor
     // 与移动端共用可见正文进度约定，使工具执行前后的说明保持一致。
     options.baseInstructions = kDesktopSystemPrompt + maiAgentProgressInstructions();
 
+    publicTools = tools.get();
     return std::make_unique<MaiAgent>(std::move(store), std::move(model), std::move(tools), options);
 }
 
@@ -501,7 +509,7 @@ AgentController::AgentController(std::unique_ptr<MaiModelClient> model, const QS
     runtime_->agent = buildAgent(std::move(model), openStore(databasePath, runtime_->openError),
                                  runtime_->initialDefaultModel,
                                  MaiApprovalPolicy::OnRequest, hostTools, AgentController::ModelConfig{}, databasePath,
-                                 runtime_->scheduleStore);
+                                 runtime_->scheduleStore, runtime_->computer, runtime_->tools);
 
     // **显式 QueuedConnection，不用 Auto。**
     //
@@ -564,7 +572,8 @@ AgentController::AgentController(const ModelConfig& model, const QString& databa
     runtime_->ordinaryConfigured = client && model.wire != MaiWireApi::Local && model.wire != MaiWireApi::Mixed;
     runtime_->agent = buildAgent(std::move(client), openStore(databasePath, runtime_->openError),
                                  runtime_->initialDefaultModel,
-                                 model.approvalPolicy, hostTools, model, databasePath, runtime_->scheduleStore);
+                                 model.approvalPolicy, hostTools, model, databasePath, runtime_->scheduleStore,
+                                 runtime_->computer, runtime_->tools);
 
     connect(this, &AgentController::eventQueued, this, &AgentController::onEventQueued, Qt::QueuedConnection);
     runtime_->token = runtime_->agent->eventBus().subscribe([this](const MaiEvent& event) { rawEvent(event); });
@@ -604,6 +613,7 @@ AgentController::~AgentController() {
     // 但析构过程中发出的最后几条事件会打到一个正在销毁的 QObject 上。
     runtime_->scheduleTimer.stop();
     runtime_->agent->eventBus().unsubscribe(runtime_->token);
+    runtime_->tools = nullptr;
     runtime_->agent.reset();
 }
 
@@ -917,6 +927,7 @@ bool AgentController::interrupt(const QString& sessionId, const QString& expecte
         return false;
     }
     emit turnInterrupted(sessionId, fromUtf8(turn));
+    runtime_->computer->releaseInput(toUtf8(sessionId), turn);
     if (runtime_->scheduleRunner) runtime_->scheduleRunner->finish(toUtf8(sessionId), "Interrupted by user");
     return true;
 }
@@ -931,6 +942,10 @@ bool AgentController::setApprovalPolicy(MaiApprovalPolicy policy) {
 
 MaiApprovalPolicy AgentController::approvalPolicy() const {
     return runtime_->agent->approvalPolicy();
+}
+
+std::vector<MaiToolSpec> AgentController::availableToolSpecs(const QString& model) const {
+    return runtime_->tools ? runtime_->tools->specs(toUtf8(model)) : std::vector<MaiToolSpec>{};
 }
 
 bool AgentController::approvePermission(const QString& permissionId, bool approveForSession) {
@@ -1095,6 +1110,11 @@ void AgentController::onEventQueued(const MaiEvent& event) {
             return;
 
         case MaiEventType::SessionIdle:
+            if (!event.turnId.empty()) runtime_->computer->releaseInput(event.sessionId, event.turnId);
+            if (!event.turnId.empty()) {
+                const auto active = runtime_->agent->activeTurnId(event.sessionId);
+                if (!active.empty() && active != event.turnId) return;
+            }
             // 一轮结束，这一轮的片段表可以丢了。不丢的话长会话会一直涨。
             runtime_->partKindsBySession.remove(sessionId);
             if (runtime_->scheduleRunner) runtime_->scheduleRunner->finish(event.sessionId);
@@ -1103,6 +1123,11 @@ void AgentController::onEventQueued(const MaiEvent& event) {
             return;
 
         case MaiEventType::SessionError:
+            if (!event.turnId.empty()) runtime_->computer->releaseInput(event.sessionId, event.turnId);
+            if (!event.turnId.empty()) {
+                const auto active = runtime_->agent->activeTurnId(event.sessionId);
+                if (!active.empty() && active != event.turnId) return;
+            }
             if (runtime_->scheduleRunner) runtime_->scheduleRunner->finish(event.sessionId, event.detail);
             emit turnFailed(sessionId, fromUtf8(event.detail));
             return;

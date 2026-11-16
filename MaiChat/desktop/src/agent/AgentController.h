@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "MaiAgent.h"
 
@@ -154,6 +155,9 @@ public:
     bool interrupt(const QString& sessionId, const QString& expectedTurn);
     bool setApprovalPolicy(MaiApprovalPolicy policy);
     MaiApprovalPolicy approvalPolicy() const;
+    // Actual public registry declarations, filtered as dispatch is for a model.
+    // Empty model returns the public directory; no discovery, credentials or execution.
+    std::vector<MaiToolSpec> availableToolSpecs(const QString& model = QString()) const;
 
     // approveForSession = true 表示"这个会话里这个工具以后别再问"。
     bool approvePermission(const QString& permissionId, bool approveForSession = false);
