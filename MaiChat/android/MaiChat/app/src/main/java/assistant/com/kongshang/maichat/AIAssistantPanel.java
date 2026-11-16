@@ -2589,7 +2589,7 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
                 Toast.LENGTH_LONG).show();
         });
     }
-    // 欢迎目录与 iOS 使用相同的能力顺序；卡片只填草稿，由用户补充要求后发送。
+    // 欢迎目录不重复展示普通聊天，也不宣传已禁用的图片/视频生成；其他工具卡保留原顺序。
     private LinearLayout welcomeContent() {
         LinearLayout welcome = column();
         welcome.setTag("ai-welcome");
@@ -2675,9 +2675,6 @@ final class AIAssistantPanel extends LinearLayout implements AIAssistantControll
     }
     private int welcomeFeatureIcon(AIAssistantWelcomeFeature feature) {
         switch (feature) {
-            case ASK: return R.drawable.ic_feature_ask;
-            case IMAGE: return R.drawable.ic_feature_image;
-            case VIDEO: return R.drawable.ic_feature_video;
             case FILE: return R.drawable.ic_feature_file;
             case SCREEN: return R.drawable.ic_feature_screen;
             case BROWSER: return R.drawable.ic_feature_browser;

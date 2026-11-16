@@ -104,6 +104,37 @@ public final class AIAssistantMainNavigationTest {
         assertEquals(1, countNamed(root, "消息"));
     }
 
+    @Test public void starterGridListsToolsWithoutDuplicatingOrdinaryChat() {
+        ViewGroup welcome = panel.findViewWithTag("ai-welcome");
+        assertNotNull("An empty creation conversation still shows the ordinary starter grid", welcome);
+        assertNull("Ordinary chat is a base capability, not another creation tool card",
+            welcome.findViewWithTag("ai-welcome-ask"));
+        assertNull("Disabled image generation must not be advertised as an available creation tool",
+            welcome.findViewWithTag("ai-welcome-image"));
+        assertNull("Disabled video generation must not be advertised as an available creation tool",
+            welcome.findViewWithTag("ai-welcome-video"));
+        String[] tools = {"file", "screen", "browser", "schedule", "calendar", "qr",
+            "location", "media", "camera", "music", "gallery", "drive", "messages", "contacts", "phone", "devices"};
+        assertEquals("Removing disabled generation cards must retain the existing usable tool cards", tools.length,
+            countStarterCards(welcome));
+        for (String tool : tools) {
+            View card = welcome.findViewWithTag("ai-welcome-" + tool);
+            assertNotNull("Missing tool card: " + tool, card);
+            assertFalse("The welcome catalog remains read-only", card.isClickable());
+        }
+        View file = welcome.findViewWithTag("ai-welcome-file");
+        ViewGroup firstRow = (ViewGroup) file.getParent();
+        ViewGroup grid = (ViewGroup) firstRow.getParent();
+        assertEquals(8, grid.getChildCount());
+        assertEquals("ai-welcome-file", firstRow.getChildAt(0).getTag());
+        assertEquals("ai-welcome-screen", firstRow.getChildAt(2).getTag());
+        for (int row = 0; row < grid.getChildCount(); row++) {
+            ViewGroup pair = (ViewGroup) grid.getChildAt(row);
+            assertNotNull("Every remaining row has two capability cards", pair.getChildAt(0).getTag());
+            assertNotNull("Removing the seed must not leave a trailing placeholder", pair.getChildAt(2).getTag());
+        }
+    }
+
     private void layout() {
         LinearLayout root = ReflectionHelpers.getField(host, "root");
         root.measure(View.MeasureSpec.makeMeasureSpec(400, View.MeasureSpec.EXACTLY),
@@ -138,6 +169,12 @@ public final class AIAssistantMainNavigationTest {
         int count = name.contentEquals(view.getContentDescription() == null ? "" : view.getContentDescription()) ? 1 : 0;
         if (view instanceof ViewGroup) for (int i = 0; i < ((ViewGroup) view).getChildCount(); i++)
             count += countNamed(((ViewGroup) view).getChildAt(i), name);
+        return count;
+    }
+    private static int countStarterCards(View view) {
+        int count = view.getTag() instanceof String && ((String) view.getTag()).startsWith("ai-welcome-") ? 1 : 0;
+        if (view instanceof ViewGroup) for (int i = 0; i < ((ViewGroup) view).getChildCount(); i++)
+            count += countStarterCards(((ViewGroup) view).getChildAt(i));
         return count;
     }
 }
