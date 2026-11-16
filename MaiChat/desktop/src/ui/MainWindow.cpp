@@ -1063,6 +1063,7 @@ enum class LineIconKind {
   ScreenDisconnect, // 已连接，点击断开：显示器内叉
   Send,
   Assistant, // 创作中心：带播放符号的场记板，强调图片和视频创作。
+  Preferences, // 应用设置齿轮；与既有“我的”图标及枚举值分开。
 };
 
 int lineIconKindValue(LineIconKind kind) { return static_cast<int>(kind); }
@@ -1088,6 +1089,7 @@ LineIconKind lineIconKindFromValue(int value) {
   case LineIconKind::ScreenDisconnect:
   case LineIconKind::Send:
   case LineIconKind::Assistant:
+  case LineIconKind::Preferences:
     return static_cast<LineIconKind>(value);
   }
   return LineIconKind::Messages;
@@ -1130,6 +1132,7 @@ QIcon makeLineIcon(LineIconKind kind, const QColor &color) {
     painter.drawArc(QRectF(27, 24, 16, 13), 20 * 16, 105 * 16);
     break;
   case LineIconKind::Settings:
+  case LineIconKind::Preferences:
     painter.drawEllipse(QRectF(17, 17, 14, 14));
     painter.drawLine(QPointF(24, 7), QPointF(24, 12));
     painter.drawLine(QPointF(24, 36), QPointF(24, 41));
@@ -1292,6 +1295,8 @@ QString navIconResource(LineIconKind kind) {
     return QStringLiteral(":/maichat/icons/device-desktop.svg");
   case LineIconKind::Settings:
     return QStringLiteral(":/maichat/icons/user-circle.svg");
+  case LineIconKind::Preferences:
+    return QStringLiteral(":/maichat/icons/settings.svg");
   case LineIconKind::Send:
     return QStringLiteral(":/maichat/icons/arrow-up.svg");
   default:
@@ -1302,6 +1307,7 @@ QString navIconResource(LineIconKind kind) {
 QColor navIconColor(LineIconKind kind, bool selected) {
   switch (kind) {
   case LineIconKind::Messages:
+  case LineIconKind::Preferences:
     return QColor(selected ? QStringLiteral("#0879c9")
                            : QStringLiteral("#1487d4"));
   case LineIconKind::Assistant:
@@ -2499,6 +2505,8 @@ void MainWindow::buildUi() {
       QStringLiteral("好友列表"), QStringLiteral("contactsNavButton"), navRail_);
   settingsNavButton_ = makeNavButton(
       QStringLiteral("我的"), QStringLiteral("settingsNavButton"), navRail_);
+  preferencesNavButton_ = makeNavButton(
+      QStringLiteral("设置"), QStringLiteral("preferencesNavButton"), navRail_);
   messageNavButton_->setProperty("navIconKind",
                                  lineIconKindValue(LineIconKind::Messages));
   cloudNavButton_->setProperty("navIconKind",
@@ -2509,10 +2517,12 @@ void MainWindow::buildUi() {
                                   lineIconKindValue(LineIconKind::Contacts));
   settingsNavButton_->setProperty("navIconKind",
                                   lineIconKindValue(LineIconKind::Settings));
+  preferencesNavButton_->setProperty("navIconKind",
+                                     lineIconKindValue(LineIconKind::Preferences));
   messageNavButton_->setProperty("selected", true);
   for (QPushButton *navButton :
        {messageNavButton_, cloudNavButton_, agentNavButton_,
-        contactsNavButton_, settingsNavButton_}) {
+        contactsNavButton_, settingsNavButton_, preferencesNavButton_}) {
     navButton->setIconSize(QSize(kNavRailIconPixels, kNavRailIconPixels));
   }
   applyNavButtonIcon(messageNavButton_, true);
@@ -2520,11 +2530,14 @@ void MainWindow::buildUi() {
   applyNavButtonIcon(agentNavButton_, false);
   applyNavButtonIcon(contactsNavButton_, false);
   applyNavButtonIcon(settingsNavButton_, false);
+  applyNavButtonIcon(preferencesNavButton_, false);
   navLayout->addWidget(messageNavButton_);
   navLayout->addWidget(cloudNavButton_);
   navLayout->addWidget(agentNavButton_);
   navLayout->addWidget(contactsNavButton_);
   navLayout->addWidget(settingsNavButton_);
+  // 设置与“我的”是并列入口，紧邻其下；不再把应用偏好藏进个人资料页。
+  navLayout->addWidget(preferencesNavButton_);
   navLayout->addStretch(1);
 
   auto *conversationPane = new QWidget(messagesPage_);
@@ -3017,51 +3030,64 @@ void MainWindow::buildUi() {
   contactsPageLayout->addWidget(contactsDirectoryPane);
   contactsPageLayout->addWidget(contactProfileStack_, 1);
 
-  settingsPage_ = new QWidget(contentStack_);
-  settingsPage_->setObjectName(QStringLiteral("settingsPage"));
-  // 设置项只会越加越多。不套滚动区的话，内容一超过页面高度 Qt 就按比例
-  // 压扁各行——「被控模式」那三个单选会叠在一起糊成一团（加「允许远程控制」
-  // 那行时就压过线了）。
-  auto *settingsPageLayout = new QVBoxLayout(settingsPage_);
-  settingsPageLayout->setContentsMargins(0, 0, 0, 0);
-  settingsPageLayout->setSpacing(0);
-#ifdef Q_OS_WIN
-  // Window actions share a fixed title row. Anchoring them to pageTitle inside
-  // settingsScroll would move them outside the window after scroll + resize.
-  auto *settingsHeader = new QWidget(settingsPage_);
-  settingsHeader->setObjectName(QStringLiteral("settingsHeader"));
-  settingsHeader->setFixedHeight(UiZoom::s(54));
-  auto *settingsHeaderLayout = new QHBoxLayout(settingsHeader);
-  settingsHeaderLayout->setContentsMargins(UiZoom::s(36), 0, UiZoom::s(36), 0);
-  settingsPageLayout->addWidget(settingsHeader);
-#endif
-  auto *settingsScroll = new QScrollArea(settingsPage_);
-  settingsScroll->setObjectName(QStringLiteral("settingsScroll"));
-  settingsScroll->setWidgetResizable(true);
-  settingsScroll->setFrameShape(QFrame::NoFrame);
-  settingsScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-  settingsPageLayout->addWidget(settingsScroll);
+  // 限制阅读列宽，宽窗口也不把字段和值拉到两端；小窗口仍随可用宽度收缩。
+  const auto makePersonalPageLayout = [](QWidget* content, const char* bodyName) {
+    auto* outer = new QVBoxLayout(content);
+    outer->setContentsMargins(UiZoom::s(32), UiZoom::s(28), UiZoom::s(32), UiZoom::s(28));
+    outer->setSpacing(0);
+    auto* center = new QHBoxLayout;
+    center->setContentsMargins(0, 0, 0, 0);
+    auto* body = new QWidget(content);
+    body->setObjectName(QString::fromLatin1(bodyName));
+    body->setMaximumWidth(UiZoom::s(840));
+    auto* column = new QVBoxLayout(body);
+    column->setContentsMargins(0, 0, 0, 0);
+    column->setSpacing(UiZoom::s(18));
+    center->addStretch(1);
+    center->addWidget(body, 100);
+    center->addStretch(1);
+    outer->addLayout(center);
+    outer->addStretch(1);
+    return column;
+  };
 
-  auto *settingsContent = new QWidget(settingsScroll);
-  settingsContent->setObjectName(QStringLiteral("settingsContent"));
-  settingsScroll->setWidget(settingsContent);
-  auto *settingsLayout = new QVBoxLayout(settingsContent);
-  settingsLayout->setContentsMargins(36, 30, 36, 30);
-  settingsLayout->setSpacing(18);
-
+  // 个人资料与本机偏好使用独立页面；往返只切换已有控件，不重建账号或偏好状态。
+  profilePage_ = new QWidget(contentStack_);
+  profilePage_->setObjectName(QStringLiteral("profilePage"));
+  auto* profilePageLayout = new QVBoxLayout(profilePage_);
+  profilePageLayout->setContentsMargins(0, 0, 0, 0);
+  profilePageLayout->setSpacing(0);
+  auto* profileHeader = new QWidget(profilePage_);
+  profileHeader->setObjectName(QStringLiteral("profileHeader"));
+  auto* profileHeaderLayout = new QHBoxLayout(profileHeader);
 #ifdef Q_OS_WIN
-  auto *settingsTitle = new QLabel(QStringLiteral("设置"), settingsHeader);
-  settingsHeaderLayout->addWidget(settingsTitle);
+  profileHeader->setFixedHeight(UiZoom::s(54));
+  profileHeaderLayout->setContentsMargins(UiZoom::s(36), 0, UiZoom::s(36), 0);
+  profilePageLayout->addWidget(profileHeader);
 #else
-  auto *settingsTitle = new QLabel(QStringLiteral("设置"), settingsContent);
+  profileHeaderLayout->setContentsMargins(0, 0, 0, 0);
 #endif
-  settingsTitle->setObjectName(QStringLiteral("pageTitle"));
-  auto *settingsSubtitle =
-      new QLabel(QStringLiteral("管理 MaiChat 账号和这台电脑的登录。"),
-                 settingsContent);
-  settingsSubtitle->setObjectName(QStringLiteral("settingsSubtitle"));
+  auto* profileTitle = new QLabel(QStringLiteral("我的"), profileHeader);
+  profileTitle->setObjectName(QStringLiteral("pageTitle"));
+  profileHeaderLayout->addWidget(profileTitle);
+  profileHeaderLayout->addStretch(1);
 
-  auto *profileCard = new QWidget(settingsContent);
+
+  auto* profileScroll = new QScrollArea(profilePage_);
+  profileScroll->setObjectName(QStringLiteral("profileScroll"));
+  profileScroll->setWidgetResizable(true);
+  profileScroll->setFrameShape(QFrame::NoFrame);
+  profileScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  profilePageLayout->addWidget(profileScroll);
+  auto* profileContent = new QWidget(profileScroll);
+  profileContent->setObjectName(QStringLiteral("profileContent"));
+  profileScroll->setWidget(profileContent);
+  auto* myPageLayout = makePersonalPageLayout(profileContent, "profileBody");
+#ifndef Q_OS_WIN
+  myPageLayout->addWidget(profileHeader);
+#endif
+
+  auto *profileCard = new QWidget(profileContent);
   profileCard->setObjectName(QStringLiteral("selfProfileCard"));
   auto *selfProfileLayout = new QHBoxLayout(profileCard);
   selfProfileLayout->setContentsMargins(UiZoom::s(18), UiZoom::s(16),
@@ -3070,7 +3096,7 @@ void MainWindow::buildUi() {
   settingsProfileAvatar_ = new AccountAvatarLabel(profileCard);
   settingsProfileAvatar_->setObjectName(QStringLiteral("selfProfileAvatar"));
   settingsProfileAvatar_->setProperty("avatarRequestsEnabled", true);
-  settingsProfileAvatar_->setFixedSize(UiZoom::s(60), UiZoom::s(60));
+  settingsProfileAvatar_->setFixedSize(UiZoom::s(72), UiZoom::s(72));
   selfProfileLayout->addWidget(settingsProfileAvatar_);
   auto *profileText = new QWidget(profileCard);
   auto *profileTextLayout = new QVBoxLayout(profileText);
@@ -3078,8 +3104,11 @@ void MainWindow::buildUi() {
   profileTextLayout->setSpacing(UiZoom::s(5));
   settingsProfileName_ = new QLabel(profileText);
   settingsProfileName_->setObjectName(QStringLiteral("selfProfileName"));
+  settingsProfileName_->setWordWrap(true);
   settingsProfileId_ = new QLabel(profileText);
   settingsProfileId_->setObjectName(QStringLiteral("selfProfileId"));
+  settingsProfileId_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  settingsProfileId_->setWordWrap(true);
   profileTextLayout->addWidget(settingsProfileName_);
   profileTextLayout->addWidget(settingsProfileId_);
   auto *connectionRow = new QWidget(profileText);
@@ -3099,7 +3128,7 @@ void MainWindow::buildUi() {
   profileTextLayout->addWidget(connectionRow);
   selfProfileLayout->addWidget(profileText, 1);
 
-  auto *settingsPanel = new QWidget(settingsContent);
+  auto *settingsPanel = new QWidget(profileContent);
   settingsPanel->setObjectName(QStringLiteral("settingsPanel"));
   auto *settingsPanelLayout = new QVBoxLayout(settingsPanel);
   // 上下留白：边距为 0 时首行标题会紧贴面板上边框，末行也贴着下边框。
@@ -3107,21 +3136,11 @@ void MainWindow::buildUi() {
   settingsPanelLayout->setContentsMargins(0, UiZoom::s(8), 0, UiZoom::s(8));
   settingsPanelLayout->setSpacing(0);
 
-  settingsAccountValue_ = new QLabel(settingsPanel);
-  settingsAccountValue_->setObjectName(QStringLiteral("settingsAccountValue"));
-  settingsNicknameValue_ = new QLabel(settingsPanel);
-  settingsNicknameValue_->setObjectName(QStringLiteral("settingsNicknameValue"));
-  settingsPanelLayout->addWidget(
-      createSettingsRow(QStringLiteral("当前账号"), settingsAccountValue_,
-                        QStringLiteral("MaiChat 账号 ID；与昵称分别显示。")));
-  auto* nicknameRow = createSettingsRow(
-      QStringLiteral("昵称"), settingsNicknameValue_,
-      QStringLiteral("MaiChat 账号的昵称；留空时显示 MaiChat ID。"));
-  settingsNicknameButton_ = new QPushButton(QStringLiteral("修改"), nicknameRow);
+  settingsNicknameButton_ = new QPushButton(QStringLiteral("编辑昵称"), profileCard);
   settingsNicknameButton_->setObjectName(QStringLiteral("settingsNicknameButton"));
   settingsNicknameButton_->setProperty("settingsRowButton", true);
   settingsNicknameButton_->setEnabled(false);
-  qobject_cast<QHBoxLayout*>(nicknameRow->layout())->addWidget(settingsNicknameButton_);
+  selfProfileLayout->addWidget(settingsNicknameButton_);
   connect(settingsNicknameButton_, &QPushButton::clicked, this, [this] {
     if (!maiChatNicknameUpdater_) return;
     AppTextInputDialog::Options options;
@@ -3159,10 +3178,11 @@ void MainWindow::buildUi() {
       self->refreshSettings();
     });
   });
-  settingsPanelLayout->addWidget(nicknameRow);
-  auto* passwordRow = createSettingsRow(QStringLiteral("登录密码"),
-      new QLabel(QStringLiteral("安全表单"), settingsPanel),
-      QStringLiteral("修改后其他设备会退出登录，此电脑保持登录。"));
+  auto* accountHeading = new QLabel(QStringLiteral("账号安全"), settingsPanel);
+  accountHeading->setObjectName(QStringLiteral("settingsSectionTitle"));
+  settingsPanelLayout->addWidget(accountHeading);
+  auto* passwordRow = createSettingsRow(QStringLiteral("登录密码"), nullptr, {});
+  passwordRow->setToolTip(QStringLiteral("修改后其他设备会退出登录，此电脑保持登录。"));
   settingsPasswordButton_ = new QPushButton(QStringLiteral("修改"), passwordRow);
   settingsPasswordButton_->setObjectName(QStringLiteral("settingsPasswordButton"));
   settingsPasswordButton_->setProperty("settingsRowButton", true);
@@ -3174,11 +3194,11 @@ void MainWindow::buildUi() {
   settingsPanelLayout->addWidget(passwordRow);
   auto *logoutValue = new QLabel(QStringLiteral("当前电脑"), settingsPanel);
   auto *logoutRow = createSettingsRow(
-      QStringLiteral("桌面登录"), logoutValue,
-      QStringLiteral("退出后可用手机扫码或 MaiChat 账号密码重新登录。"));
-  settingsLogoutButton_ = new QPushButton(QStringLiteral("退出登录 / 切换账号"), logoutRow);
+      QStringLiteral("当前登录"), logoutValue, {});
+  settingsLogoutButton_ = new QPushButton(QStringLiteral("退出登录"), logoutRow);
   settingsLogoutButton_->setObjectName(QStringLiteral("settingsLogoutButton"));
   settingsLogoutButton_->setProperty("settingsRowButton", true);
+  settingsLogoutButton_->setProperty("destructive", true);
   settingsLogoutButton_->setEnabled(false);
   qobject_cast<QHBoxLayout *>(logoutRow->layout())
       ->addWidget(settingsLogoutButton_);
@@ -3194,12 +3214,56 @@ void MainWindow::buildUi() {
   });
   settingsPanelLayout->addWidget(logoutRow);
 
-#ifndef Q_OS_WIN
-  settingsLayout->addWidget(settingsTitle);
+  myPageLayout->addWidget(profileCard);
+  myPageLayout->addWidget(settingsPanel);
+
+  myPageLayout->addStretch(1);
+
+  // 本机设置保留同一组控件、连接与持久化路径；个人资料不再混入偏好列表。
+  settingsPage_ = new QWidget(contentStack_);
+  settingsPage_->setObjectName(QStringLiteral("settingsPage"));
+  auto* settingsPageLayout = new QVBoxLayout(settingsPage_);
+  settingsPageLayout->setContentsMargins(0, 0, 0, 0);
+  settingsPageLayout->setSpacing(0);
+  auto* settingsHeader = new QWidget(settingsPage_);
+  settingsHeader->setObjectName(QStringLiteral("settingsHeader"));
+  auto* settingsHeaderLayout = new QHBoxLayout(settingsHeader);
+#ifdef Q_OS_WIN
+  // Windows 两页标题固定在滚动区外，切换页面不移动窗口控制。
+  settingsHeader->setFixedHeight(UiZoom::s(54));
+  settingsHeaderLayout->setContentsMargins(UiZoom::s(36), 0, UiZoom::s(36), 0);
+  settingsPageLayout->addWidget(settingsHeader);
+#else
+  settingsHeaderLayout->setContentsMargins(0, 0, 0, 0);
 #endif
-  settingsLayout->addWidget(settingsSubtitle);
-  settingsLayout->addWidget(profileCard);
-  settingsLayout->addWidget(settingsPanel);
+  auto* settingsTitle = new QLabel(QStringLiteral("设置"), settingsHeader);
+  settingsTitle->setObjectName(QStringLiteral("pageTitle"));
+  settingsHeaderLayout->addWidget(settingsTitle);
+  settingsHeaderLayout->addStretch(1);
+
+  // 设置项增多时始终滚动，不把各行压缩成重叠控件。
+  auto* settingsScroll = new QScrollArea(settingsPage_);
+  settingsScroll->setObjectName(QStringLiteral("settingsScroll"));
+  settingsScroll->setWidgetResizable(true);
+  settingsScroll->setFrameShape(QFrame::NoFrame);
+  settingsScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  settingsPageLayout->addWidget(settingsScroll);
+  auto* settingsContent = new QWidget(settingsScroll);
+  settingsContent->setObjectName(QStringLiteral("settingsContent"));
+  settingsScroll->setWidget(settingsContent);
+  auto* settingsLayout = makePersonalPageLayout(settingsContent, "settingsBody");
+#ifndef Q_OS_WIN
+  settingsLayout->addWidget(settingsHeader);
+#endif
+  auto* appearancePanel = new QWidget(settingsContent);
+  appearancePanel->setObjectName(QStringLiteral("settingsPanel"));
+  auto* appearanceLayout = new QVBoxLayout(appearancePanel);
+  appearanceLayout->setContentsMargins(0, UiZoom::s(8), 0, UiZoom::s(8));
+  appearanceLayout->setSpacing(0);
+  auto* appearanceHeading = new QLabel(QStringLiteral("通用"), appearancePanel);
+  appearanceHeading->setObjectName(QStringLiteral("settingsSectionTitle"));
+  appearanceLayout->addWidget(appearanceHeading);
+  settingsLayout->addWidget(appearancePanel);
 
   // This device's notification policy is independent of the signed-in account.
   // Keep the existing settings-row style and preserve message/unread processing.
@@ -3208,11 +3272,11 @@ void MainWindow::buildUi() {
   settingsDoNotDisturb_->setAccessibleName(QStringLiteral("免打扰模式"));
   settingsDoNotDisturb_->setChecked(MessageNotification::doNotDisturbEnabled());
   auto* doNotDisturbRow = createSettingsRow(
-      QStringLiteral("免打扰模式"), nullptr,
-      QStringLiteral("开启后不弹出新消息通知；消息仍会正常接收，未读数量保留。"));
+      QStringLiteral("免打扰模式"), nullptr, {});
+  settingsDoNotDisturb_->setToolTip(QStringLiteral("不弹出新消息通知，仍接收消息并保留未读数。"));
   doNotDisturbRow->setObjectName(QStringLiteral("settingsDoNotDisturbRow"));
   qobject_cast<QHBoxLayout*>(doNotDisturbRow->layout())->addWidget(settingsDoNotDisturb_);
-  settingsLayout->addWidget(doNotDisturbRow);
+  appearanceLayout->addWidget(doNotDisturbRow);
   connect(settingsDoNotDisturb_, &QCheckBox::toggled, this,
           &MainWindow::updateDoNotDisturbPreference);
 
@@ -3222,10 +3286,10 @@ void MainWindow::buildUi() {
   for (const QString& id : UiZoom::availableFontFamilyIds())
     familyChoice->addItem(UiZoom::fontFamilyTitle(id), id);
   familyChoice->setCurrentIndex(qMax(0, familyChoice->findData(UiZoom::fontFamilyId())));
-  auto *familyRow = createSettingsRow(QStringLiteral("字体"), nullptr,
-      QStringLiteral("普通文字使用所选字体；代码保持等宽"));
+  auto *familyRow = createSettingsRow(QStringLiteral("字体"), nullptr, {});
+  familyChoice->setToolTip(QStringLiteral("普通文字使用所选字体；代码保持等宽。"));
   qobject_cast<QHBoxLayout *>(familyRow->layout())->addWidget(familyChoice);
-  settingsLayout->addWidget(familyRow);
+  appearanceLayout->addWidget(familyRow);
   connect(familyChoice, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
       [this, familyChoice](int index) {
         UiZoom::setFontFamilyId(familyChoice->itemData(index).toString());
@@ -3239,17 +3303,16 @@ void MainWindow::buildUi() {
   fontChoice->addItem(QStringLiteral("大"), QStringLiteral("large"));
   fontChoice->addItem(QStringLiteral("特大"), QStringLiteral("extraLarge"));
   fontChoice->setCurrentIndex(qMax(0, fontChoice->findData(UiZoom::textPreset())));
-  auto *fontRow = createSettingsRow(QStringLiteral("字体大小"), nullptr,
-      QStringLiteral("统一调整应用文字和 Markdown；标题保留相对大小"));
+  auto *fontRow = createSettingsRow(QStringLiteral("字号"), nullptr, {});
+  fontChoice->setToolTip(QStringLiteral("调整应用文字和 Markdown，保留标题层级。"));
   qobject_cast<QHBoxLayout *>(fontRow->layout())->addWidget(fontChoice);
-  settingsLayout->addWidget(fontRow);
+  appearanceLayout->addWidget(fontRow);
   connect(fontChoice, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
       [this, fontChoice](int index) {
         UiZoom::setTextPreset(fontChoice->itemData(index).toString());
         applyUiZoom(false);
       });
 
-  settingsLayout->addSpacing(UiZoom::s(24));
   settingsLayout->addWidget(buildRemoteDesktopSettingsPanel(settingsContent));
   settingsLayout->addStretch(1);
 
@@ -3319,6 +3382,7 @@ void MainWindow::buildUi() {
   contentStack_->addWidget(cloudDrivePage_);
   contentStack_->addWidget(contactsPage_);
   contentStack_->addWidget(remotePage_);
+  contentStack_->addWidget(profilePage_);
   contentStack_->addWidget(settingsPage_);
   // **排在最后**。QStackedWidget 默认显示第 0 个，插在 messagesPage_ 前面会让
   // 应用一启动就停在 AI 页——原来的默认页就被我改掉了。
@@ -3423,7 +3487,7 @@ void MainWindow::applyStyle() {
         /* 纯图标：不再留文字的左内边距，图标居中，宽高一致，
            否则一列图标会因为各自的留白不同而看起来大小不一。 */
         #messagesNavButton, #cloudNavButton, #agentNavButton,
-        #contactsNavButton, #settingsNavButton {
+        #contactsNavButton, #settingsNavButton, #preferencesNavButton {
             min-width: 44px;
             max-width: 44px;
             min-height: 44px;
@@ -3438,9 +3502,10 @@ void MainWindow::applyStyle() {
         #agentNavButton[selected="false"]:hover { background: #e7e1ff; }
         #contactsNavButton[selected="false"]:hover { background: #daf1e8; }
         #settingsNavButton[selected="false"]:hover { background: #dfe6ef; }
+        #preferencesNavButton[selected="false"]:hover { background: #d9edfc; }
         #messagesNavButton[selected="true"], #cloudNavButton[selected="true"],
         #agentNavButton[selected="true"], #contactsNavButton[selected="true"],
-        #settingsNavButton[selected="true"] {
+        #settingsNavButton[selected="true"], #preferencesNavButton[selected="true"] {
             border: 0;
             background: transparent;
         }
@@ -3512,8 +3577,10 @@ void MainWindow::applyStyle() {
             background: #e1f5ff;
             border: 0;
         }
-        #contactsPage, #settingsPage, #settingsContent, #settingsScroll {
-            background: #ffffff;
+        #contactsPage { background: #ffffff; }
+        #profilePage, #profileContent, #profileScroll, #profileBody,
+        #settingsPage, #settingsContent, #settingsScroll, #settingsBody {
+            background: #f6f8fb;
         }
         #contactsDirectoryPane {
             background: #f8fafc;
@@ -3597,23 +3664,23 @@ void MainWindow::applyStyle() {
             font-size: @body;
             font-weight: 600;
         }
-        #contactHintSubtitle, #settingsSubtitle {
+        #contactHintSubtitle {
             color: #667085;
             font-size: @detail;
         }
         #selfProfileCard {
             background: #ffffff;
-            border: 1px solid #dae4f0;
-            border-radius: 12px;
+            border: 1px solid #e1e7f0;
+            border-radius: 16px;
         }
-        #selfProfileName { color: #172033; font-size: @body; font-weight: 400; }
+        #selfProfileName { color: #172033; font-size: @title; font-weight: 600; }
         #selfProfileId { color: #66758d; font-size: @detail; }
         #selfConnectionStatus { color: #667085; font-size: @metadata; }
         #selfConnectionStatus[connected="true"] { color: #14805b; }
         #settingsPanel {
             background: #ffffff;
-            border: 1px solid #dae4f0;
-            border-radius: 8px;
+            border: 1px solid #e1e7f0;
+            border-radius: 14px;
         }
         /* 左边距跟各行标题（行内边距 18px）对齐；上边距不能是 0，
            否则标题直接贴在面板上边框上，看着像挤在线上。 */
@@ -3621,14 +3688,14 @@ void MainWindow::applyStyle() {
             color: #0f172a;
             font-size: @body;
             font-weight: 700;
-            padding: 6px 0 12px 18px;
+            padding: 10px 0 10px 18px;
         }
         #settingsRadio {
             color: #334155;
             font-size: @detail;
             spacing: 8px;
         }
-        #settingsRowButton {
+        #settingsRowButton, QPushButton[settingsRowButton="true"] {
             background: #f1f5f9;
             border: 1px solid #d9e1ec;
             border-radius: 8px;
@@ -3637,8 +3704,18 @@ void MainWindow::applyStyle() {
             font-weight: 700;
             padding: 6px 16px;
         }
-        #settingsRowButton:hover {
+        #settingsRowButton:hover, QPushButton[settingsRowButton="true"]:hover {
             background: #e2e8f0;
+        }
+        QPushButton[settingsRowButton="true"][destructive="true"] {
+            color: #c43e4d;
+            background: #fff2f3;
+            border-color: #f2dce0;
+        }
+        QPushButton[settingsRowButton="true"]:disabled {
+            color: #98a2b3;
+            background: #f7f8fa;
+            border-color: #e7ebf0;
         }
         /* 背景必须透明：面板布局边距为 0，行控件正好铺在面板那 1px 边框上，
            行一旦有不透明背景就会把左右竖边整段盖掉（只剩标题区那一小截还在）。
@@ -3654,12 +3731,7 @@ void MainWindow::applyStyle() {
         }
         #settingsRowHelper {
             color: #667085;
-            font-size: @detail;
-        }
-        #settingsAccountValue {
-            color: #172033;
-            font-size: @detail;
-            font-weight: 500;
+            font-size: @metadata;
         }
         #chatContentPane {
             background: #ffffff;
@@ -3928,8 +4000,10 @@ void MainWindow::bindSignals() {
   connect(contactsNavButton_, &QPushButton::clicked, this,
           [this] { showContactsPage(); });
   connect(settingsNavButton_, &QPushButton::clicked, this,
-          [this] { showSettingsPage(); });
+          [this] { showProfilePage(); });
   connect(selfProfileButton_, &QPushButton::clicked, this,
+          [this] { showProfilePage(); });
+  connect(preferencesNavButton_, &QPushButton::clicked, this,
           [this] { showSettingsPage(); });
   connect(agentNavButton_, &QPushButton::clicked, this,
           [this] { showAgentPage(); });
@@ -4637,13 +4711,11 @@ void MainWindow::refreshSettings() {
   }
   const QString accountId = maiChatAccountIdProvider_ ?
       maiChatAccountIdProvider_() : app_.chatState().ownerUserId();
-  settingsAccountValue_->setText(accountId);
   const QString nickname = maiChatNicknameProvider_ ? maiChatNicknameProvider_().trimmed() :
       QString();
-  settingsNicknameValue_->setText(nickname.isEmpty() ? QStringLiteral("未设置") : nickname);
   const QString profileName = nickname.isEmpty() ? app_.selfProfile().displayName : nickname;
   settingsProfileName_->setText(profileName.isEmpty() ? accountId : profileName);
-  settingsProfileId_->setText(QStringLiteral("MaiChat ID  ") + accountId);
+  settingsProfileId_->setText(QStringLiteral("MaiChat 账号  ") + accountId);
   static_cast<AccountAvatarLabel *>(settingsProfileAvatar_)->setProfile(app_.selfProfile());
 }
 
@@ -5841,6 +5913,12 @@ void MainWindow::showContactsPage() {
   syncNavigationSelection();
 }
 
+void MainWindow::showProfilePage() {
+  refreshSettings();
+  contentStack_->setCurrentWidget(profilePage_);
+  syncNavigationSelection();
+}
+
 void MainWindow::showSettingsPage() {
   refreshSettings();
   contentStack_->setCurrentWidget(settingsPage_);
@@ -5891,8 +5969,12 @@ void MainWindow::syncNavigationSelection() {
     updateNavigationSelection(nullptr);
     return;
   }
-  if (contentStack_->currentWidget() == settingsPage_) {
+  if (contentStack_->currentWidget() == profilePage_) {
     updateNavigationSelection(settingsNavButton_);
+    return;
+  }
+  if (contentStack_->currentWidget() == settingsPage_) {
+    updateNavigationSelection(preferencesNavButton_);
     return;
   }
   updateNavigationSelection(messageNavButton_);
@@ -5901,7 +5983,7 @@ void MainWindow::syncNavigationSelection() {
 void MainWindow::updateNavigationSelection(QPushButton *selectedButton) {
   const QList<QPushButton *> buttons = {messageNavButton_, cloudNavButton_,
                                         agentNavButton_, contactsNavButton_,
-                                        settingsNavButton_};
+                                        settingsNavButton_, preferencesNavButton_};
   for (QPushButton *button : buttons) {
     if (!button)
       continue;
@@ -8186,7 +8268,7 @@ QWidget *MainWindow::createSettingsRow(const QString &title, QLabel *valueLabel,
   auto *row =
       new QWidget(valueLabel ? valueLabel->parentWidget() : settingsPage_);
   row->setObjectName(QStringLiteral("settingsRow"));
-  row->setMinimumHeight(UiZoom::s(72));
+  row->setMinimumHeight(UiZoom::s(64));
   auto *layout = new QHBoxLayout(row);
   layout->setContentsMargins(18, 12, 18, 12);
   layout->setSpacing(20);
@@ -8199,6 +8281,8 @@ QWidget *MainWindow::createSettingsRow(const QString &title, QLabel *valueLabel,
   auto *helperLabel = new QLabel(helperText, row);
   helperLabel->setObjectName(QStringLiteral("settingsRowHelper"));
   helperLabel->setWordWrap(true);
+  // 简洁行不保留空说明的高度；细节留在 tooltip 和实际操作表单。
+  helperLabel->setVisible(!helperText.isEmpty());
   textColumn->addWidget(titleLabel);
   textColumn->addWidget(helperLabel);
 
@@ -8346,9 +8430,11 @@ void MainWindow::applyScaledFixedGeometry() {
                                          UiZoom::s(28), UiZoom::s(8));
   }
 #ifdef Q_OS_WIN
-  if (auto *header = findChild<QWidget *>(QStringLiteral("settingsHeader"))) {
-    header->setFixedHeight(UiZoom::s(54));
-    header->layout()->setContentsMargins(UiZoom::s(36), 0, UiZoom::s(36), 0);
+  for (const char* name : {"profileHeader", "settingsHeader"}) {
+    if (auto* header = findChild<QWidget*>(QString::fromLatin1(name))) {
+      header->setFixedHeight(UiZoom::s(54));
+      header->layout()->setContentsMargins(UiZoom::s(36), 0, UiZoom::s(36), 0);
+    }
   }
 #endif
   // 必须和构造时一致地定宽。这里原先放的是 160~260（同样是带文字时代的遗留），
@@ -8398,10 +8484,16 @@ void MainWindow::applyScaledFixedGeometry() {
     sendButton_->setIconSize(QSize(UiZoom::s(18), UiZoom::s(18)));
     static_cast<ComposerTextEdit *>(messageEditor_)->positionCornerAction();
   }
+  for (const char* name : {"profileBody", "settingsBody"}) {
+    if (auto* body = findChild<QWidget*>(QString::fromLatin1(name)))
+      body->setMaximumWidth(UiZoom::s(840));
+  }
+  if (settingsProfileAvatar_)
+    settingsProfileAvatar_->setFixedSize(UiZoom::s(72), UiZoom::s(72));
   const QList<QWidget *> settingsRows =
       findChildren<QWidget *>(QStringLiteral("settingsRow"));
   for (QWidget *row : settingsRows)
-    row->setMinimumHeight(UiZoom::s(72));
+    row->setMinimumHeight(UiZoom::s(64));
   const QList<QLabel *> labels = findChildren<QLabel *>();
   for (QLabel *label : labels) {
     if (label->property("settingsRowValue").toBool())
@@ -8537,14 +8629,19 @@ QWidget *MainWindow::buildRemoteDesktopSettingsPanel(QWidget *parent) {
        QStringLiteral("每次收到请求都弹窗，60 秒无应答自动拒绝")},
       {RemoteDesktop::HostMode::Disabled, QStringLiteral("关闭"),
        QStringLiteral("拒绝一切远程请求")}};
+  auto* modeChoices = new QHBoxLayout;
+  modeChoices->setSpacing(UiZoom::s(22));
   for (const ModeOption &option : options) {
-    auto *radio = new QRadioButton(
-        QStringLiteral("%1 · %2").arg(option.label, option.hint), modeRow);
+    auto *radio = new QRadioButton(option.label, modeRow);
+    radio->setToolTip(option.hint);
+    radio->setAccessibleDescription(option.hint);
     radio->setObjectName(QStringLiteral("settingsRadio"));
     radio->setCursor(Qt::PointingHandCursor);
     remoteDesktopModeGroup_->addButton(radio, static_cast<int>(option.mode));
-    modeLayout->addWidget(radio);
+    modeChoices->addWidget(radio);
   }
+  modeChoices->addStretch(1);
+  modeLayout->addLayout(modeChoices);
   connect(remoteDesktopModeGroup_,
           &QButtonGroup::idClicked, this,
           [this](int id) {
@@ -8564,9 +8661,8 @@ QWidget *MainWindow::buildRemoteDesktopSettingsPanel(QWidget *parent) {
       QStringLiteral("settingsRowValue"));
   remoteDesktopPasswordValue_->setProperty("settingsRowValue", true);
   auto *passwordRow = createSettingsRow(
-      QStringLiteral("访问密码"), remoteDesktopPasswordValue_,
-      QStringLiteral(
-          "可选。无人值守时，设置后对方连入还需输入此密码。"));
+      QStringLiteral("访问密码"), remoteDesktopPasswordValue_, {});
+  passwordRow->setToolTip(QStringLiteral("可选；设置后，对方连入仍需输入密码。"));
   auto *passwordButton = new QPushButton(QStringLiteral("设置"), passwordRow);
   passwordButton->setObjectName(QStringLiteral("settingsRowButton"));
   passwordButton->setCursor(Qt::PointingHandCursor);
@@ -8592,11 +8688,13 @@ QWidget *MainWindow::buildRemoteDesktopSettingsPanel(QWidget *parent) {
 #endif
   auto *controlRow =
       createSettingsRow(QStringLiteral("允许远程控制"),
-                        remoteDesktopControlValue_, remoteControlHelp);
+                        remoteDesktopControlValue_, {});
+  controlRow->setToolTip(remoteControlHelp);
   remoteDesktopControlToggle_ =
       new QCheckBox(QStringLiteral("允许"), controlRow);
   remoteDesktopControlToggle_->setObjectName(
       QStringLiteral("remoteControlToggle"));
+  remoteDesktopControlToggle_->setAccessibleDescription(remoteControlHelp);
   const bool canInjectInput = RemoteInput::isInputInjectionSupported();
   remoteDesktopControlToggle_->setEnabled(canInjectInput);
   remoteDesktopControlToggle_->setCursor(canInjectInput ? Qt::PointingHandCursor
@@ -8631,9 +8729,9 @@ QWidget *MainWindow::buildRemoteDesktopSettingsPanel(QWidget *parent) {
   remoteDesktopProxyValue_->setObjectName(QStringLiteral("settingsRowValue"));
   remoteDesktopProxyValue_->setProperty("settingsRowValue", true);
   auto *proxyRow = createSettingsRow(
-      QStringLiteral("TRTC 网络代理"), remoteDesktopProxyValue_,
-      QStringLiteral(
-          "为远程桌面单独设置 SOCKS5，不影响 IM。保存后重启 MaiChat 生效。"));
+      QStringLiteral("网络代理"), remoteDesktopProxyValue_,
+      QStringLiteral("重启后生效"));
+  proxyRow->setToolTip(QStringLiteral("远程桌面独立 SOCKS5 代理，不影响消息连接。"));
   auto *proxyButton = new QPushButton(QStringLiteral("配置"), proxyRow);
   proxyButton->setObjectName(QStringLiteral("settingsRowButton"));
   proxyButton->setCursor(Qt::PointingHandCursor);

@@ -203,6 +203,7 @@ private:
     // MaiChat 正在前台且未最小化时不弹系统通知；失焦或最小化才需要提醒。
     bool appIsForegroundVisible() const;
     void showContactsPage();
+    void showProfilePage();
     void showSettingsPage();
     void showRemotePage();
     void showCloudDrivePage();
@@ -403,6 +404,7 @@ private:
     QPushButton* cloudNavButton_ = nullptr;
     QPushButton* contactsNavButton_ = nullptr;
     QPushButton* settingsNavButton_ = nullptr;
+    QPushButton* preferencesNavButton_ = nullptr;
     QStackedWidget* contentStack_ = nullptr;
     QWidget* videoDockSlot_ = nullptr;
     QWidget* videoDockPane_ = nullptr;
@@ -431,6 +433,7 @@ private:
     QPushButton* contactProfileMessageButton_ = nullptr;
     QPushButton* contactProfileDeleteButton_ = nullptr;
     QString selectedContactProfileUserId_;
+    QWidget* profilePage_ = nullptr;
     QWidget* settingsPage_ = nullptr;
     QLabel* settingsProfileAvatar_ = nullptr;
     QLabel* settingsProfileName_ = nullptr;
@@ -489,8 +492,6 @@ private:
     QLabel* remoteDesktopControlValue_ = nullptr;
     QCheckBox* remoteDesktopControlToggle_ = nullptr;
     QLabel* remoteDesktopProxyValue_ = nullptr;
-    QLabel* settingsAccountValue_ = nullptr;
-    QLabel* settingsNicknameValue_ = nullptr;
     QPushButton* settingsNicknameButton_ = nullptr;
     QPushButton* settingsPasswordButton_ = nullptr;
     DesktopPasswordChangeRequests* passwordChangeRequests_ = nullptr;

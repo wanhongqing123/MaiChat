@@ -346,6 +346,7 @@ private slots:
     void sentImageDoesNotReturnAsDraftDuringConversationChange();
     void contactsCurrentSelectionDoesNotLeaveContactsPage();
     void settingsNavigationShowsAccountWithoutDiagnostics();
+    void profileAndPreferencesHaveSeparateNavigation();
     void remoteDesktopSettingsHaveNoDeviceList();
     void settingsAvatarUpdatesWhenSelfProfileArrives();
     void conversationAvatarLoadsWhenWindowIsCreatedAfterConnection();
@@ -1331,8 +1332,11 @@ void MainWindowLayoutTest::settingsPanelBorderIsNotCoveredByRows() {
             .arg(QString::number(second & 0x00ffffff, 16).rightJustified(6, QLatin1Char('0')));
     };
     // 圆角边界会产生平台相关的抗锯齿像素，竖边检查应避开四个圆角。
-    const int cornerGuard = UiZoom::s(12);
-    for (int y = cornerGuard; y < painted.height() - cornerGuard; y += UiZoom::s(12)) {
+    // painted 使用物理像素；圆角和采样步长按 DPR 换算，避免把 Retina 圆角当缺边。
+    const qreal scale = painted.devicePixelRatio();
+    const int cornerGuard = qRound(UiZoom::s(18) * scale);
+    const int sampleStep = qMax(1, qRound(UiZoom::s(12) * scale));
+    for (int y = cornerGuard; y < painted.height() - cornerGuard; y += sampleStep) {
         ++sampled;
         const QRgb leftOuter = painted.pixel(0, y);
         const QRgb leftInner = painted.pixel(1, y);
@@ -1493,7 +1497,7 @@ void MainWindowLayoutTest::windowsCaptionStaysVisibleWhileSettingsScrolls() {
     window.resize(window.minimumSize());
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
-    auto* settings = window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"));
+    auto* settings = window.findChild<QPushButton*>(QStringLiteral("preferencesNavButton"));
     auto* scroll = window.findChild<QScrollArea*>(QStringLiteral("settingsScroll"));
     auto* controls = window.findChild<QWidget*>(QStringLiteral("windowCaptionControls"));
     QVERIFY(settings && scroll && controls);
@@ -3166,7 +3170,7 @@ void MainWindowLayoutTest::remoteDesktopSettingsHaveNoDeviceList() {
     ScopedNotificationSettings isolatedSettings;
     RemoteIMApplication app(QStringLiteral("remote-settings-test"), std::make_unique<FakeRemoteIMClient>());
     MainWindow window(app);
-    auto* settingsButton = window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"));
+    auto* settingsButton = window.findChild<QPushButton*>(QStringLiteral("preferencesNavButton"));
     QVERIFY(settingsButton);
     settingsButton->click();
 
@@ -3193,6 +3197,79 @@ void MainWindowLayoutTest::remoteDesktopSettingsHaveNoDeviceList() {
     }
 }
 
+// 同一个真实主窗口中往返个人与应用设置，不重建窗口或触碰账号状态。
+void MainWindowLayoutTest::profileAndPreferencesHaveSeparateNavigation() {
+    ScopedNotificationSettings isolatedSettings;
+    RemoteIMApplication app(QStringLiteral("profile-preferences-fixture"),
+                            std::make_unique<FakeRemoteIMClient>());
+    MainWindow window(app);
+    window.setMaiChatAccountIdProvider([] { return QStringLiteral("m_profile_fixture"); });
+    window.setMaiChatNicknameProvider([] { return QStringLiteral("个人资料样本"); });
+    window.setMaiChatNicknameUpdater([](const QString&, RemoteIMCompletion) {});
+    window.setMaiChatPasswordSetter(
+        [](const QString&, std::function<void(const QString&)>) {},
+        [] { return QStringLiteral("profile-fixture-session"); });
+    window.setLogoutHandler([] {});
+    window.resize(1100, 760);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    auto* myNav = window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"));
+    auto* stack = window.findChild<QStackedWidget*>(QStringLiteral("contentStack"));
+    QVERIFY(myNav && stack);
+    QTest::mouseClick(myNav, Qt::LeftButton);
+    const QString captures = QString::fromUtf8(qgetenv("MAICHAT_PROFILE_SETTINGS_CAPTURE_DIR"));
+    if (!captures.isEmpty()) QVERIFY(window.grab().save(captures + "/my-page.png"));
+    auto* profile = window.findChild<QWidget*>(QStringLiteral("profilePage"));
+    auto* preferences = window.findChild<QWidget*>(QStringLiteral("settingsPage"));
+    QVERIFY(profile && preferences);
+    QCOMPARE(stack->currentWidget(), profile);
+    QVERIFY(profile->findChild<QWidget*>(QStringLiteral("selfProfileCard")));
+    QVERIFY(profile->findChild<QLabel*>(QStringLiteral("selfProfileId")));
+    QVERIFY(!profile->findChild<QComboBox*>(QStringLiteral("settingsFontFamily")));
+    QVERIFY(!profile->findChild<QCheckBox*>(QStringLiteral("settingsDoNotDisturb")));
+    auto* settingsNav = window.findChild<QPushButton*>(QStringLiteral("preferencesNavButton"));
+    QVERIFY(settingsNav);
+    QVERIFY(settingsNav->isVisible());
+    QCOMPARE(settingsNav->accessibleName(), QStringLiteral("设置"));
+    QVERIFY(!settingsNav->icon().isNull());
+    QCOMPARE(settingsNav->size(), myNav->size());
+    QCOMPARE(settingsNav->x(), myNav->x());
+    QVERIFY(settingsNav->y() >= myNav->geometry().bottom());
+    QVERIFY(!profile->findChild<QPushButton*>(QStringLiteral("profileSettingsButton")));
+    QTest::mouseClick(settingsNav, Qt::LeftButton);
+    QCOMPARE(stack->currentWidget(), preferences);
+    QVERIFY(!preferences->findChild<QWidget*>(QStringLiteral("selfProfileCard")));
+    QVERIFY(!preferences->findChild<QPushButton*>(QStringLiteral("settingsLogoutButton")));
+    QVERIFY(preferences->findChild<QComboBox*>(QStringLiteral("settingsFontFamily")));
+    QVERIFY(preferences->findChild<QComboBox*>(QStringLiteral("settingsTextSize")));
+    QVERIFY(preferences->findChild<QCheckBox*>(QStringLiteral("settingsDoNotDisturb")));
+    QVERIFY(settingsNav->property("selected").toBool());
+    QVERIFY(!myNav->property("selected").toBool());
+    if (!captures.isEmpty()) QVERIFY(window.grab().save(captures + "/preferences-page.png"));
+    QTest::mouseClick(myNav, Qt::LeftButton);
+    QVERIFY(myNav->property("selected").toBool());
+    QVERIFY(!settingsNav->property("selected").toBool());
+    QCOMPARE(stack->currentWidget(), profile);
+    QCOMPARE(profile->findChild<QLabel*>(QStringLiteral("selfProfileId"))->text(),
+             QStringLiteral("MaiChat 账号  m_profile_fixture"));
+    auto* messages = window.findChild<QPushButton*>(QStringLiteral("messagesNavButton"));
+    QVERIFY(messages);
+    QTest::mouseClick(messages, Qt::LeftButton);
+    QTest::mouseClick(myNav, Qt::LeftButton);
+    QCOMPARE(stack->currentWidget(), profile);
+    window.resize(window.minimumSize());
+    QCoreApplication::processEvents();
+    auto* body = profile->findChild<QWidget*>(QStringLiteral("profileBody"));
+    auto* scroll = profile->findChild<QScrollArea*>(QStringLiteral("profileScroll"));
+    QVERIFY(body && scroll);
+    QVERIFY(body->width() <= scroll->viewport()->width());
+    for (const char* name : {"selfProfileId", "settingsNicknameButton", "settingsLogoutButton"}) {
+        auto* control = body->findChild<QWidget*>(QString::fromLatin1(name));
+        QVERIFY(control);
+        QVERIFY(body->rect().contains(QRect(control->mapTo(body, QPoint()), control->size())));
+    }
+}
+
 void MainWindowLayoutTest::settingsNavigationShowsAccountWithoutDiagnostics() {
     auto client = std::make_unique<FakeRemoteIMClient>();
     RemoteIMApplication app(QStringLiteral("desktop-user"), std::move(client));
@@ -3206,10 +3283,10 @@ void MainWindowLayoutTest::settingsNavigationShowsAccountWithoutDiagnostics() {
 
     settingsNavButton->click();
 
-    auto* settingsPage = window.findChild<QWidget*>(QStringLiteral("settingsPage"));
+    auto* settingsPage = window.findChild<QWidget*>(QStringLiteral("profilePage"));
     auto* contentStack = window.findChild<QStackedWidget*>(QStringLiteral("contentStack"));
-    auto* accountValue = window.findChild<QLabel*>(QStringLiteral("settingsAccountValue"));
-    auto* nicknameValue = window.findChild<QLabel*>(QStringLiteral("settingsNicknameValue"));
+    auto* accountValue = window.findChild<QLabel*>(QStringLiteral("selfProfileId"));
+    auto* nicknameValue = window.findChild<QLabel*>(QStringLiteral("selfProfileName"));
     auto* nicknameButton = window.findChild<QPushButton*>(QStringLiteral("settingsNicknameButton"));
     QVERIFY(settingsPage != nullptr);
     QVERIFY(contentStack != nullptr);
@@ -3217,7 +3294,7 @@ void MainWindowLayoutTest::settingsNavigationShowsAccountWithoutDiagnostics() {
     QVERIFY(accountValue != nullptr);
     QVERIFY(nicknameValue != nullptr);
     QVERIFY(nicknameButton != nullptr);
-    QCOMPARE(accountValue->text(), QStringLiteral("desktop-user"));
+    QCOMPARE(accountValue->text(), QStringLiteral("MaiChat 账号  desktop-user"));
     QCOMPARE(nicknameValue->text(), QStringLiteral("昵称测试"));
     QVERIFY(nicknameButton->isEnabled());
     const QByteArray capture = qgetenv("MAICHAT_CAPTURE_SETTINGS");
@@ -3480,7 +3557,7 @@ void MainWindowLayoutTest::settingsLogoutRequiresConfirmationAndCallsHandler() {
     MainWindow window(app);
     auto* button = window.findChild<QPushButton*>(QStringLiteral("settingsLogoutButton"));
     QVERIFY(button != nullptr);
-    QCOMPARE(button->text(), QStringLiteral("退出登录 / 切换账号"));
+    QCOMPARE(button->text(), QStringLiteral("退出登录"));
     QVERIFY(!button->isEnabled());
 
     bool loggedOut = false;
@@ -4124,7 +4201,7 @@ void MainWindowLayoutTest::doNotDisturbSwitchPersistsAndClearsNotificationDelive
         if (!qgetenv("MAICHAT_DND_CAPTURE").isEmpty()) {
             window.resize(1280, 820);
             window.showNormal();
-            window.findChild<QPushButton*>(QStringLiteral("settingsNavButton"))->click();
+            window.findChild<QPushButton*>(QStringLiteral("preferencesNavButton"))->click();
             QCoreApplication::processEvents();
             QVERIFY(window.grab().save(QString::fromUtf8(qgetenv("MAICHAT_DND_CAPTURE"))));
         }
@@ -4543,14 +4620,14 @@ void MainWindowLayoutTest::selfAvatarOpensProfileSettings() {
     auto* profileName = window.findChild<QLabel*>(QStringLiteral("selfProfileName"));
     auto* profileId = window.findChild<QLabel*>(QStringLiteral("selfProfileId"));
     auto* stack = window.findChild<QStackedWidget*>(QStringLiteral("contentStack"));
-    auto* settingsPage = window.findChild<QWidget*>(QStringLiteral("settingsPage"));
+    auto* settingsPage = window.findChild<QWidget*>(QStringLiteral("profilePage"));
     QVERIFY(avatarButton && profileCard && profileAvatar && profileName && profileId);
     QVERIFY(stack && settingsPage);
     QCOMPARE(app.chatState().selectedPeerId(), QStringLiteral("phone-user"));
     QTest::mouseClick(avatarButton, Qt::LeftButton);
     QCOMPARE(stack->currentWidget(), settingsPage);
     QCOMPARE(profileName->text(), QStringLiteral("我的昵称"));
-    QCOMPARE(profileId->text(), QStringLiteral("MaiChat ID  m_desktop"));
+    QCOMPARE(profileId->text(), QStringLiteral("MaiChat 账号  m_desktop"));
     QVERIFY(!profileAvatar->pixmap().isNull());
     QCOMPARE(app.chatState().selectedPeerId(), QStringLiteral("phone-user"));
     const QByteArray capture = qgetenv("MAICHAT_CAPTURE_SELF_PROFILE");
@@ -6040,6 +6117,10 @@ void MainWindowLayoutTest::ctrlShortcutsZoomWholeUi() {
     MainWindow window(app);
     window.show();
     QVERIFY(QTest::qWaitForWindowExposed(&window));
+    // Cocoa 的窗口快捷键要求活动窗口；先确认真实焦点，再发送键盘事件。
+    window.raise();
+    window.activateWindow();
+    QVERIFY(QTest::qWaitForWindowActive(&window));
 
     // Ctrl+= 放大一档并弹出百分比浮层。
     QTest::keyClick(&window, Qt::Key_Equal, Qt::ControlModifier);
